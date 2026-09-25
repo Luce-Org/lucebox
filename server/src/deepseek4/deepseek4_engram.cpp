@@ -210,53 +210,79 @@ bool DeepSeek4EngramTable::read(const uint32_t * row_ids, size_t count, float * 
 }
 
 
+void DeepSeek4EngramTable::prefetch(const uint32_t * row_ids, size_t count) const {
+    if (fd_ < 0) return;
+    for (size_t i = 0; i < count; ++i) {
+        if (row_ids[i] >= rows_) continue;
+        (void) posix_fadvise(fd_, (off_t) (offset_ + (uint64_t) row_ids[i] * kRowBytes), kRowBytes,
+                             POSIX_FADV_WILLNEED);
+    }
+}
+
 // ── host-side runtime ─────────────────────────────────────────────────────
 
-void DeepSeek4EngramRuntime::reset_slot(int slot) {
-    if (slot < 0) return;
-    if ((size_t) slot >= slots_.size()) slots_.resize((size_t) slot + 1);
-    slots_[(size_t) slot].reset();
+// Row ids of `count` tokens at first_pos.., [count][n_layers][cols], hashed in
+// the context `ctx` holds before first_pos.
+bool DeepSeek4EngramRuntime::row_ids(const DeepSeek4EngramTokens & ctx, const int32_t * tokens,
+                                     int first_pos, size_t count, std::vector<uint32_t> & ids,
+                                     std::string * err) const {
+    if (first_pos < 0) { if (err) *err = "engram: negative position"; return false; }
+    // The tokens before first_pos, most recent first; a position before the
+    // start of the sequence carries no token.
+    DeepSeek4EngramHistory history;
+    for (int j = 0; j < hasher_.max_ngram() - 1; ++j) {
+        const int p = first_pos - 1 - j;
+        if (p < 0) break;
+        const int32_t t = ctx.at(p);
+        if (t < 0) {
+            if (err) *err = "engram: the n-gram context before position " + std::to_string(first_pos) +
+                            " is not known";
+            return false;
+        }
+        history.tail[j] = hasher_.compress(t);
+    }
+    ids.resize(count * (size_t) hasher_.n_layers() * (size_t) hasher_.cols());
+    hasher_.hash(history, tokens, nullptr, count, ids.data());
+    return true;
 }
 
-DeepSeek4EngramHistory DeepSeek4EngramRuntime::snapshot(int slot) const {
-    if (slot < 0 || (size_t) slot >= slots_.size()) return DeepSeek4EngramHistory{};
-    return slots_[(size_t) slot];
+void DeepSeek4EngramRuntime::prefetch(const DeepSeek4EngramTokens & ctx, const int32_t * tokens,
+                                      int first_pos, size_t count) const {
+    std::vector<uint32_t> ids;
+    if (!row_ids(ctx, tokens, first_pos, count, ids, nullptr)) return;
+    const size_t cols = (size_t) hasher_.cols();
+    for (size_t t = 0; t < count; ++t) {
+        for (int l = 0; l < hasher_.n_layers(); ++l) {
+            tables_[(size_t) l].prefetch(&ids[(t * (size_t) hasher_.n_layers() + (size_t) l) * cols], cols);
+        }
+    }
 }
 
-void DeepSeek4EngramRuntime::restore(int slot, const DeepSeek4EngramHistory & h) {
-    if (slot < 0) return;
-    if ((size_t) slot >= slots_.size()) slots_.resize((size_t) slot + 1);
-    slots_[(size_t) slot] = h;
-}
-
-void DeepSeek4EngramRuntime::plan(int slot, const int32_t * tokens, const uint8_t * dead, size_t count,
-                                  std::vector<uint32_t> & out) {
-    out.resize(count * (size_t) hasher_.n_layers() * (size_t) hasher_.cols());
-    DeepSeek4EngramHistory h = snapshot(slot);   // planning never advances the slot
-    hasher_.hash(h, tokens, dead, count, out.data());
-}
-
-bool DeepSeek4EngramRuntime::prepare(int slot, const int32_t * tokens, const uint8_t * dead, size_t count,
-                                     std::vector<float> & keys, std::string * err) {
+bool DeepSeek4EngramRuntime::prepare(DeepSeek4EngramTokens & ctx, const int32_t * tokens, int first_pos,
+                                     size_t count, float * keys, std::string * err) const {
     const int n_layers = hasher_.n_layers();
     const size_t cols = (size_t) hasher_.cols();
-    if (slot < 0) { if (err) *err = "engram: negative slot"; return false; }
-    if ((size_t) slot >= slots_.size()) slots_.resize((size_t) slot + 1);
-    std::vector<uint32_t> ids(count * (size_t) n_layers * cols);
-    hasher_.hash(slots_[(size_t) slot], tokens, dead, count, ids.data());
-    keys.resize((size_t) n_layers * count * key_floats());
-    std::vector<uint32_t> layer_ids(count * cols);
+    std::vector<uint32_t> ids;
+    if (!row_ids(ctx, tokens, first_pos, count, ids, err)) return false;
+    for (size_t t = 0; t < count; ++t) ctx.put(first_pos + (int) t, tokens[t]);
+
+    // Split the rows per layer and start every read before waiting on any.
+    std::vector<std::vector<uint32_t>> layer_ids((size_t) n_layers, std::vector<uint32_t>(count * cols));
     for (int l = 0; l < n_layers; ++l) {
         for (size_t t = 0; t < count; ++t) {
-            std::memcpy(&layer_ids[t * cols], &ids[(t * (size_t) n_layers + (size_t) l) * cols], cols * sizeof(uint32_t));
+            std::memcpy(&layer_ids[(size_t) l][t * cols], &ids[(t * (size_t) n_layers + (size_t) l) * cols],
+                        cols * sizeof(uint32_t));
         }
-        float * dst = keys.data() + (size_t) l * count * key_floats();
-        if (!tables_[(size_t) l].read(layer_ids.data(), layer_ids.size(), dst, threads_)) {
+        tables_[(size_t) l].prefetch(layer_ids[(size_t) l].data(), count * cols);
+    }
+    for (int l = 0; l < n_layers; ++l) {
+        float * dst = keys + (size_t) l * count * key_floats();
+        if (!tables_[(size_t) l].read(layer_ids[(size_t) l].data(), count * cols, dst, threads_)) {
             if (err) *err = std::string("engram: table read failed for layer ") +
                             std::to_string(hasher_.layer_id(l)) + ": " + std::strerror(errno);
             return false;
         }
-        rows_read_ += layer_ids.size();
+        rows_read_.fetch_add(count * cols, std::memory_order_relaxed);
     }
     return true;
 }

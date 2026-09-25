@@ -38,6 +38,7 @@
 #include "deepseek4_image_spans.h"
 #include "common/concurrency/paged_kv_pool.h"
 #include "deepseek4_paged_cache.h"
+#include "deepseek4_engram.h"
 
 namespace luce::common {
 
@@ -94,6 +95,8 @@ struct DeepSeek4StepTelemetry {
     uint64_t full_graph_set_us = 0;
     uint64_t full_graph_compute_us = 0;
     uint64_t full_graph_read_us = 0;
+    uint64_t engram_read_us = 0;     // hashing and table reads
+    uint64_t engram_apply_us = 0;    // host-path apply graphs
     int hot_selected = 0;
     int cold_selected = 0;
 };
@@ -145,8 +148,8 @@ struct DeepSeek4Layer {
 
     // ── Engram (V4.1 engram layers only) ─────────────────────────────
     // The hash table itself (blk.N.engram_embd) is never loaded; its rows are
-    // read on demand (deepseek4_engram.h). TODO(deepseek41): apply on the
-    // layer input of every HC copy.
+    // read on demand (deepseek4_engram.h) and applied to every HC copy of
+    // the layer input, before its attention HC pre.
     ggml_tensor * engram_q             = nullptr;  // [n_embd, n_hc]
     ggml_tensor * engram_k             = nullptr;  // [n_embd, n_hc]
     ggml_tensor * engram_wkv           = nullptr;  // [n_hash_cols * key_len, n_embd * (n_hc + 1)]
@@ -307,6 +310,9 @@ struct DeepSeek4Weights {
         std::vector<Table>    tables;
         bool present() const { return !layer_ids.empty(); }
     } engram;
+    // The hash and the open tables (set by the backend after load; null when
+    // the model has no Engram layers). Every forward path applies it.
+    std::shared_ptr<const DeepSeek4EngramRuntime> engram_runtime;
 
     // RoPE
     float rope_freq_base        = 10000.0f;
@@ -447,6 +453,9 @@ struct DeepSeek4Cache {
     // HC residual streams: [n_hc * n_embd] persistent state
     ggml_tensor * hc_state    = nullptr;  // [n_hc * n_embd]
 
+    // The tokens the Engram hash of the next positions reads (V4.1).
+    DeepSeek4EngramTokens engram_tokens;
+
     // Lazily created on the first deepseek4_step_layer_range call.
     DeepSeek4LayerRangeCache * layer_range_cache = nullptr;
 
@@ -468,6 +477,8 @@ struct DeepSeek4PagedCache {
     // Dedicated bounded gathered-reference graph cache (opaque here because
     // its implementation shares the fused verifier's private machinery).
     void * gathered_runtime = nullptr;
+    // Per slot: the tokens the Engram hash of its next positions reads.
+    std::vector<DeepSeek4EngramTokens> engram_tokens;
 };
 
 struct DeepSeek4Snapshot;
@@ -522,6 +533,11 @@ ggml_tensor * deepseek4_preserve_raw_rows(
 // Keep a per-token indexer visibility mask aligned with the scored suffix.
 ggml_tensor * deepseek4_indexer_visibility_suffix(
     ggml_context * ctx, ggml_tensor * mask, int first_scored, int n_scored);
+
+// The Engram constants and table locations of a GGUF, without loading any
+// tensor (tools and tests).
+bool deepseek4_read_engram_metadata(const std::string & path, DeepSeek4Weights::Engram & out,
+                                    std::string * err);
 
 bool load_deepseek4_gguf(const std::string & path,
                           ggml_backend_t backend,
@@ -764,9 +780,11 @@ struct DeepSeek4Snapshot {
         DeepSeek4CompressorState indexer_compressor;
     };
     std::vector<LayerSnap> layers;
+    // The Engram n-gram context at cur_pos (host side).
+    DeepSeek4EngramTokens engram_tokens;
     // Optional serialization sidecars (ondisk prefix cache). Present when the
     // snapshot was saved with DeepSeek4SnapshotAux or adopted from disk.
-    //   meta_snap        I32 [kDeepSeek4SnapMetaBase + 2 * n_layer]
+    //   meta_snap        I32 [kDeepSeek4SnapMetaBase + 2 * n_layer + kDeepSeek4SnapMetaTail]
     //   last_logits_snap F32 [n_vocab]
     //   spec_feat_snap   F32 [1, max(1, n_spec_feat)]  (logical length in meta)
     ggml_tensor * meta_snap        = nullptr;

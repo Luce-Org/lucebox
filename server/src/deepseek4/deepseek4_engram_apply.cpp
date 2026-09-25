@@ -2,6 +2,10 @@
 #include "deepseek4_engram.h"
 #include "deepseek4_internal.h"
 
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -21,7 +25,6 @@ bool DeepSeek4EngramHasher::init(const DeepSeek4Weights & w, std::string * err) 
 
 bool DeepSeek4EngramRuntime::init(const DeepSeek4Weights & w, const std::string & gguf_path, std::string * err) {
     tables_.clear();
-    slots_.clear();
     rows_read_ = 0;
     if (!hasher_.init(w, err)) return false;
     if (!hasher_.present()) return true;
@@ -84,6 +87,56 @@ ggml_tensor * deepseek4_build_engram_apply(ggml_context * ctx,
     // h_c += gate_c * value
     ggml_tensor * value_rep = ggml_repeat(ctx, ggml_cont(ctx, value), h);    // [n_embd, n_hc, n_tokens]
     return ggml_add(ctx, h, ggml_mul(ctx, value_rep, gate));
+}
+
+void DeepSeek4EngramApplyRunner::release() {
+    if (alloc_) ggml_gallocr_free(alloc_);
+    alloc_ = nullptr;
+    alloc_backend_ = nullptr;
+}
+
+bool DeepSeek4EngramApplyRunner::run(ggml_backend_t backend, const DeepSeek4Layer & L, int n_embd, int n_hc,
+                                     float rms_eps, float * hc, const float * keys, int n_tokens) {
+    if (!backend || !L.engram_wkv || n_tokens <= 0) return false;
+    if (alloc_backend_ != backend) {
+        release();
+        alloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!alloc_) return false;
+        alloc_backend_ = backend;
+    }
+    const int64_t key_width = L.engram_wkv->ne[0];
+    const size_t hc_width = (size_t) n_embd * n_hc;
+    if (meta_.empty()) meta_.resize(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
+    for (int first = 0; first < n_tokens; first += kMaxTokens) {
+        const int count = std::min(kMaxTokens, n_tokens - first);
+        ggml_init_params params{};
+        params.mem_size = meta_.size();
+        params.mem_buffer = meta_.data();
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) return false;
+        ggml_tensor * h = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, count);
+        ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, key_width, count);
+        ggml_set_input(h);
+        ggml_set_input(k);
+        ggml_tensor * out = deepseek4_build_engram_apply(ctx, h, k, L, n_embd, n_hc, rms_eps);
+        if (!out) { ggml_free(ctx); return false; }
+        ggml_set_output(out);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
+        ggml_build_forward_expand(gf, out);
+        bool ok = ggml_gallocr_alloc_graph(alloc_, gf);
+        if (ok) {
+            ggml_backend_tensor_set(h, hc + (size_t) first * hc_width, 0, sizeof(float) * hc_width * count);
+            ggml_backend_tensor_set(k, keys + (size_t) first * key_width, 0, sizeof(float) * key_width * count);
+            ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        }
+        if (ok) {
+            ggml_backend_tensor_get(out, hc + (size_t) first * hc_width, 0, sizeof(float) * hc_width * count);
+        }
+        ggml_free(ctx);
+        if (!ok) return false;
+    }
+    return true;
 }
 
 }  // namespace luce::common

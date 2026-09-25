@@ -289,7 +289,8 @@ bool deepseek4_snapshot_declare(ggml_context * ctx,
     if (aux) {
         out.meta_snap = new_named(ctx,
             ggml_new_tensor_1d(ctx, GGML_TYPE_I32,
-                               kDeepSeek4SnapMetaBase + 2 * (int64_t) cache.n_layer),
+                               kDeepSeek4SnapMetaBase + 2 * (int64_t) cache.n_layer +
+                               kDeepSeek4SnapMetaTail),
             deepseek4_snapshot_tensor_name(name_prefix, kDeepSeek4SnapMetaName));
         if (!out.meta_snap || !declare_aux_payload(ctx, name_prefix, *aux, out)) return false;
     }
@@ -329,7 +330,8 @@ bool deepseek4_snapshot_fill(const DeepSeek4Cache & cache,
             (int64_t) std::max<size_t>(1, n_feat) != ggml_nelements(out.spec_feat_snap)) {
             return false;  // declared with a different aux
         }
-        std::vector<int32_t> meta((size_t) (kDeepSeek4SnapMetaBase + 2 * cache.n_layer), 0);
+        std::vector<int32_t> meta((size_t) (kDeepSeek4SnapMetaBase + 2 * cache.n_layer +
+                                            kDeepSeek4SnapMetaTail), 0);
         meta[0] = kDeepSeek4SnapMetaVersion;
         meta[1] = cache.n_layer;
         meta[2] = (int32_t) n_logits;
@@ -338,6 +340,10 @@ bool deepseek4_snapshot_fill(const DeepSeek4Cache & cache,
         for (int il = 0; il < cache.n_layer; ++il) {
             meta[(size_t) (kDeepSeek4SnapMetaBase + 2 * il)]     = cache.layers[(size_t) il].n_comp;
             meta[(size_t) (kDeepSeek4SnapMetaBase + 2 * il + 1)] = cache.layers[(size_t) il].n_index_comp;
+        }
+        for (int j = 0; j < kDeepSeek4SnapMetaTail; ++j) {
+            meta[(size_t) (kDeepSeek4SnapMetaBase + 2 * cache.n_layer + j)] =
+                cache.engram_tokens.at(cache.cur_pos - 1 - j);
         }
         ggml_backend_tensor_set(out.meta_snap, meta.data(), 0, meta.size() * sizeof(int32_t));
         if (n_logits > 0) {
@@ -354,6 +360,7 @@ bool deepseek4_snapshot_fill(const DeepSeek4Cache & cache,
         }
     }
     out.cur_pos = cache.cur_pos;
+    out.engram_tokens = cache.engram_tokens;
     return true;
 }
 
@@ -466,6 +473,7 @@ bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
         dst.n_index_comp = src.n_index_comp;
     }
     cache.cur_pos = snap.cur_pos;
+    cache.engram_tokens = snap.engram_tokens;
     return true;
 }
 
@@ -489,7 +497,7 @@ bool deepseek4_snapshot_bind(ggml_context * ctx,
     // Bound the meta length before allocating from it: a corrupt file must
     // not drive the read size.
     constexpr int64_t kMaxLayers = 4096;
-    constexpr int64_t kMaxMetaLen = kDeepSeek4SnapMetaBase + 2 * kMaxLayers;
+    constexpr int64_t kMaxMetaLen = kDeepSeek4SnapMetaBase + 2 * kMaxLayers + kDeepSeek4SnapMetaTail;
     ggml_tensor * meta = find_named(ctx, deepseek4_snapshot_tensor_name(name_prefix, kDeepSeek4SnapMetaName));
     if (!meta || meta->type != GGML_TYPE_I32 || ggml_n_dims(meta) != 1 ||
         meta->ne[0] < kDeepSeek4SnapMetaBase || meta->ne[0] > kMaxMetaLen || !meta->data) {
@@ -500,7 +508,7 @@ bool deepseek4_snapshot_bind(ggml_context * ctx,
     if (m[0] != kDeepSeek4SnapMetaVersion) return false;
     const int n_layer = m[1], n_vocab = m[2], n_spec_feat = m[3], cur_pos = m[4];
     if (n_layer <= 0 || n_layer > kMaxLayers || n_vocab < 0 || n_spec_feat < 0 || cur_pos < 0 ||
-        meta->ne[0] != (int64_t) (kDeepSeek4SnapMetaBase + 2 * n_layer)) {
+        meta->ne[0] != (int64_t) (kDeepSeek4SnapMetaBase + 2 * n_layer + kDeepSeek4SnapMetaTail)) {
         return false;
     }
 
@@ -541,6 +549,11 @@ bool deepseek4_snapshot_bind(ggml_context * ctx,
     // Every tensor must be backed by host memory (CPU snapshot buffer).
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
         if (!t->data) return false;
+    }
+
+    for (int j = 0; j < kDeepSeek4SnapMetaTail; ++j) {
+        const int32_t token = m[(size_t) (kDeepSeek4SnapMetaBase + 2 * n_layer + j)];
+        if (token >= 0 && cur_pos - 1 - j >= 0) tmp.engram_tokens.put(cur_pos - 1 - j, token);
     }
 
     out = tmp;

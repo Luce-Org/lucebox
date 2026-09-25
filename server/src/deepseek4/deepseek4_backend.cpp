@@ -623,6 +623,8 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.full_graph_set_us += src.full_graph_set_us;
     dst.full_graph_compute_us += src.full_graph_compute_us;
     dst.full_graph_read_us += src.full_graph_read_us;
+    dst.engram_read_us += src.engram_read_us;
+    dst.engram_apply_us += src.engram_apply_us;
     dst.hc_post_attn_us += src.hc_post_attn_us;
     dst.hc_pre_ffn_us += src.hc_pre_ffn_us;
     dst.ffn_build_us += src.ffn_build_us;
@@ -1023,7 +1025,7 @@ void log_deepseek4_step_telemetry(const char * phase,
         "ffn_hot_graph_build=%llu ffn_hot_graph_hit=%llu ffn_cold_graph_build=%llu ffn_cold_graph_hit=%llu "
         "hc_pre=%.1fms hc_pre_build=%.1fms hc_pre_input=%.1fms hc_pre_compute=%.1fms "
         "hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
-        "hot_sel=%d cold_sel=%d\n",
+        "engram_read=%.1fms engram_apply=%.1fms hot_sel=%d cold_sel=%d\n",
         phase, tokens, steps, wall_s, tok_s,
         ms(t.total_us), ms(t.embed_us), ms(t.attn_build_us), ms(t.attn_compute_us), ms(t.attn_read_us),
         ms(t.full_graph_build_us), ms(t.full_graph_set_us),
@@ -1040,6 +1042,7 @@ void log_deepseek4_step_telemetry(const char * phase,
         ms(t.hc_pre_compute_us),
         ms(t.hc_post_attn_us + t.hc_post_ffn_us),
         ms(t.output_us), ms(t.sample_us), ms(t.emit_us),
+        ms(t.engram_read_us), ms(t.engram_apply_us),
         t.hot_selected, t.cold_selected);
 }
 
@@ -1345,10 +1348,21 @@ bool DeepSeek4Backend::validate_model_features() const {
             }
         }
     }
-    if (w_.engram.present()) {
-        std::fprintf(stderr, "[deepseek4] %s: the Engram layers run without their n-gram memory "
-                     "and compressed attention is dense (see server/docs/DS41.md)\n", w_.arch.c_str());
+    return true;
+}
+
+// Opens the Engram tables of a V4.1 model: every forward path then applies
+// the n-gram memory at the Engram layers (deepseek4_engram.h).
+bool DeepSeek4Backend::init_engram() {
+    w_.engram_runtime.reset();
+    if (!w_.engram.present()) return true;
+    auto runtime = std::make_shared<DeepSeek4EngramRuntime>();
+    std::string err;
+    if (!runtime->init(w_, cfg_.model_path, &err)) {
+        std::fprintf(stderr, "[deepseek4] %s\n", err.c_str());
+        return false;
     }
+    w_.engram_runtime = std::move(runtime);
     return true;
 }
 
@@ -1991,7 +2005,7 @@ bool DeepSeek4Backend::init() {
 
     snap_backend_ = ggml_backend_init_by_name("cpu", nullptr);
 
-    if (!load_model() || !apply_routing_adjustments()) {
+    if (!load_model() || !apply_routing_adjustments() || !init_engram()) {
         return false;
     }
     if (!validate_prefill_mode() || !validate_model_features()) {

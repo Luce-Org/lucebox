@@ -23,6 +23,7 @@
 #include "common/layer_split_utils.h"
 #include "common/moe_hybrid_ffn_eval.h"
 #include "deepseek4/deepseek4_dspark.h"
+#include "deepseek4/deepseek4_engram.h"
 
 #include <filesystem>
 #include <memory>
@@ -1495,6 +1496,233 @@ static void test_indexer_mask_cpu(ggml_backend_t backend) {
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+// ─── Engram apply against DeepSeek's reference (inference/model.py) ─────
+
+// model.py Engram.forward in double precision, for one layer:
+//   kv = wkv(keys); key_c, value = split(kv); weight = q * k
+//   dot_c = sum_d h_c * weight_c * key_c * rstd(h_c) * rstd(key_c) / sqrt(dim)
+//   gate_c = sigmoid(sign(dot_c) * sqrt(max(|dot_c|, 1e-6))); h_c += gate_c * value
+// wkv is [n_out][key_width] (ggml row order), q and k are [n_hc][n_embd],
+// h is [n_tokens][n_hc][n_embd], keys [n_tokens][key_width].
+static void reference_engram_apply(const std::vector<float> & wkv, const std::vector<float> & q,
+                                   const std::vector<float> & k, int n_embd, int n_hc, int key_width,
+                                   double eps, int n_tokens, const std::vector<float> & keys,
+                                   std::vector<double> & h, std::vector<double> & gates) {
+    const int n_out = n_embd * (n_hc + 1);
+    gates.assign((size_t) n_tokens * n_hc, 0.0);
+    std::vector<double> kv((size_t) n_out);
+    for (int t = 0; t < n_tokens; ++t) {
+        const float * x = keys.data() + (size_t) t * key_width;
+        for (int o = 0; o < n_out; ++o) {
+            const float * row = wkv.data() + (size_t) o * key_width;
+            double sum = 0.0;
+            for (int i = 0; i < key_width; ++i) sum += (double) row[i] * (double) x[i];
+            kv[(size_t) o] = sum;
+        }
+        const double * value = kv.data() + (size_t) n_hc * n_embd;
+        for (int c = 0; c < n_hc; ++c) {
+            double * hc = h.data() + ((size_t) t * n_hc + c) * n_embd;
+            const double * key = kv.data() + (size_t) c * n_embd;
+            double hh = 0.0, kk = 0.0, dot = 0.0;
+            for (int d = 0; d < n_embd; ++d) {
+                hh += hc[d] * hc[d];
+                kk += key[d] * key[d];
+                dot += hc[d] * (double) q[(size_t) c * n_embd + d] * (double) k[(size_t) c * n_embd + d] * key[d];
+            }
+            dot *= 1.0 / std::sqrt(hh / n_embd + eps) / std::sqrt(kk / n_embd + eps) / std::sqrt((double) n_embd);
+            const double mag = std::sqrt(std::max(std::fabs(dot), 1e-6));
+            const double gate = 1.0 / (1.0 + std::exp(-(dot < 0 ? -mag : mag)));
+            gates[(size_t) t * n_hc + c] = gate;
+            for (int d = 0; d < n_embd; ++d) hc[d] += gate * value[d];
+        }
+    }
+}
+
+struct EngramApplyError {
+    double out_rel = 0.0;    // max |out - ref| / rms(ref update)
+    double gate_abs = 0.0;   // max |gate - ref gate|
+};
+
+// Runs deepseek4_build_engram_apply on `backend` and compares it with the
+// reference. wkv is uploaded as F16 (the released GGUF type).
+static EngramApplyError run_engram_apply_case(ggml_backend_t backend, const std::vector<ggml_fp16_t> & wkv16,
+                                              const std::vector<float> & q, const std::vector<float> & k,
+                                              int n_embd, int n_hc, int key_width, float eps, int n_tokens,
+                                              const std::vector<float> & keys, const std::vector<float> & h) {
+    EngramApplyError err;
+    const int n_out = n_embd * (n_hc + 1);
+    ggml_init_params params{};
+    params.mem_size = 64 * ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false);
+    params.no_alloc = true;
+    ggml_context * wctx = ggml_init(params);
+    ggml_tensor * wkv_t = ggml_new_tensor_2d(wctx, GGML_TYPE_F16, key_width, n_out);
+    ggml_tensor * q_t = ggml_new_tensor_2d(wctx, GGML_TYPE_F32, n_embd, n_hc);
+    ggml_tensor * k_t = ggml_new_tensor_2d(wctx, GGML_TYPE_F32, n_embd, n_hc);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+    TEST_ASSERT_MSG(wbuf != nullptr, "engram weight buffer");
+    if (!wbuf) { ggml_free(wctx); return {1e30, 1e30}; }
+    ggml_backend_tensor_set(wkv_t, wkv16.data(), 0, wkv16.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(q_t, q.data(), 0, q.size() * sizeof(float));
+    ggml_backend_tensor_set(k_t, k.data(), 0, k.size() * sizeof(float));
+    DeepSeek4Layer L{};
+    L.engram_wkv = wkv_t;
+    L.engram_q = q_t;
+    L.engram_k = k_t;
+
+    // The host-path runner (chunks of 256 tokens) and a graph with the gate.
+    std::vector<float> out = h;
+    DeepSeek4EngramApplyRunner runner;
+    TEST_ASSERT_MSG(runner.run(backend, L, n_embd, n_hc, eps, out.data(), keys.data(), n_tokens),
+                    "engram apply runner failed");
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * h_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+    ggml_tensor * keys_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, key_width, n_tokens);
+    ggml_set_input(h_t);
+    ggml_set_input(keys_t);
+    ggml_tensor * gate_t = nullptr;
+    ggml_tensor * out_t = deepseek4_build_engram_apply(ctx, h_t, keys_t, L, n_embd, n_hc, eps, &gate_t);
+    ggml_set_output(gate_t);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(gf, out_t);
+    ggml_build_forward_expand(gf, gate_t);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    TEST_ASSERT_MSG(ggml_gallocr_alloc_graph(alloc, gf), "engram gate graph alloc");
+    ggml_backend_tensor_set(h_t, h.data(), 0, h.size() * sizeof(float));
+    ggml_backend_tensor_set(keys_t, keys.data(), 0, keys.size() * sizeof(float));
+    TEST_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+    std::vector<float> gates((size_t) n_hc * n_tokens);
+    ggml_backend_tensor_get(gate_t, gates.data(), 0, gates.size() * sizeof(float));
+
+    std::vector<float> wkv32(wkv16.size());
+    ggml_fp16_to_fp32_row(wkv16.data(), wkv32.data(), (int64_t) wkv16.size());
+    std::vector<double> ref(h.begin(), h.end());
+    std::vector<double> ref_gates;
+    reference_engram_apply(wkv32, q, k, n_embd, n_hc, key_width, eps, n_tokens, keys, ref, ref_gates);
+    double update_sq = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) update_sq += (ref[i] - h[i]) * (ref[i] - h[i]);
+    const double update_rms = std::sqrt(update_sq / (double) ref.size());
+    for (size_t i = 0; i < ref.size(); ++i) {
+        err.out_rel = std::max(err.out_rel, std::fabs((double) out[i] - ref[i]) / update_rms);
+    }
+    for (size_t i = 0; i < gates.size(); ++i) {
+        err.gate_abs = std::max(err.gate_abs, std::fabs((double) gates[i] - ref_gates[i]));
+    }
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    runner.release();
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(wctx);
+    return err;
+}
+
+static void test_engram_apply_synthetic(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_engram_apply_synthetic (%s) ...", name);
+    constexpr int n_embd = 128, n_hc = 4, key_width = 6 * 32, n_tokens = 300;   // two runner parts
+    TestLcg rng(20260925u);
+    std::vector<ggml_fp16_t> wkv((size_t) key_width * n_embd * (n_hc + 1));
+    for (auto & v : wkv) v = ggml_fp32_to_fp16(0.08f * rng.next());
+    std::vector<float> q((size_t) n_embd * n_hc), k(q.size()), keys((size_t) key_width * n_tokens),
+                       h((size_t) n_embd * n_hc * n_tokens);
+    for (auto & v : q) v = 1.0f + 0.5f * rng.next();
+    for (auto & v : k) v = 1.0f + 0.5f * rng.next();
+    // Keys exactly representable in F16, as the released rows are.
+    for (auto & v : keys) v = ggml_fp16_to_fp32(ggml_fp32_to_fp16(2.0f * rng.next()));
+    for (auto & v : h) v = 3.0f * rng.next();
+    const EngramApplyError e = run_engram_apply_case(backend, wkv, q, k, n_embd, n_hc, key_width, 1e-20f,
+                                                     n_tokens, keys, h);
+    TEST_ASSERT_MSG(e.out_rel < 2e-3, "engram apply output");
+    TEST_ASSERT_MSG(e.gate_abs < 2e-4, "engram gate");
+    std::fprintf(stderr, " out %.2e gate %.2e %s\n", e.out_rel, e.gate_abs, g_failures ? "done" : "ok");
+}
+
+// The released tables and weights (LUCE_DS4_ENGRAM_GGUF=<V4.1 GGUF>): hash a
+// token run, read its rows through the runtime (in two chunks, carrying the
+// n-gram context), and apply each Engram layer on `backend` against the
+// reference. Reads 314 MB of weights per layer.
+static void test_engram_apply_released_weights(ggml_backend_t backend, const char * name) {
+    const char * path = std::getenv("LUCE_DS4_ENGRAM_GGUF");
+    if (!path || !*path) {
+        std::fprintf(stderr, "  test_engram_apply_released_weights skipped (LUCE_DS4_ENGRAM_GGUF unset)\n");
+        return;
+    }
+    std::fprintf(stderr, "  test_engram_apply_released_weights (%s) ...", name);
+    DeepSeek4Weights w;
+    std::string err;
+    TEST_ASSERT_MSG(deepseek4_read_engram_metadata(path, w.engram, &err), err.c_str());
+    if (!w.engram.present()) return;
+    w.n_vocab = (int) w.engram.token_map.size();
+    DeepSeek4EngramRuntime runtime;
+    TEST_ASSERT_MSG(runtime.init(w, path, &err), err.c_str());
+    if (!runtime.present()) return;
+
+    // A token run and its rows, prepared in two chunks from one context.
+    const std::vector<int32_t> tokens = {0, 128803, 3072, 14, 5871, 223, 3072, 14, 5871, 16, 1, 90210};
+    const int n_tokens = (int) tokens.size();
+    const size_t width = runtime.key_floats();
+    std::vector<float> keys((size_t) runtime.n_layers() * n_tokens * width), part((size_t) runtime.n_layers() * 7 * width);
+    DeepSeek4EngramTokens ctx, ctx2;
+    TEST_ASSERT(runtime.prepare(ctx, tokens.data(), 0, (size_t) n_tokens, keys.data(), &err));
+    TEST_ASSERT(runtime.prepare(ctx2, tokens.data(), 0, 5, part.data(), &err));
+    std::vector<float> rest((size_t) runtime.n_layers() * 7 * width);
+    TEST_ASSERT(runtime.prepare(ctx2, tokens.data() + 5, 5, 7, rest.data(), &err));
+    for (int l = 0; l < runtime.n_layers(); ++l) {
+        TEST_ASSERT(std::memcmp(part.data() + (size_t) l * 5 * width,
+                                keys.data() + (size_t) l * n_tokens * width, 5 * width * sizeof(float)) == 0);
+        TEST_ASSERT(std::memcmp(rest.data() + (size_t) l * 7 * width,
+                                keys.data() + ((size_t) l * n_tokens + 5) * width, 7 * width * sizeof(float)) == 0);
+    }
+    DeepSeek4EngramTokens unknown;
+    TEST_ASSERT(!runtime.prepare(unknown, tokens.data() + 5, 5, 1, part.data(), &err));
+
+    // Weights of each Engram layer, straight from the file.
+    ggml_context * meta = nullptr;
+    gguf_init_params gip{};
+    gip.no_alloc = true;
+    gip.ctx = &meta;
+    gguf_context * g = gguf_init_from_file(path, gip);
+    TEST_ASSERT(g != nullptr);
+    if (!g) return;
+    FILE * f = std::fopen(path, "rb");
+    auto read_tensor = [&](const std::string & tname, ggml_type type, void * dst, size_t bytes) {
+        const int64_t id = gguf_find_tensor(g, tname.c_str());
+        const ggml_tensor * t = ggml_get_tensor(meta, tname.c_str());
+        if (id < 0 || !t || t->type != type || ggml_nbytes(t) != bytes) return false;
+        const size_t off = gguf_get_data_offset(g) + gguf_get_tensor_offset(g, id);
+        return fseeko(f, (off_t) off, SEEK_SET) == 0 && std::fread(dst, 1, bytes, f) == bytes;
+    };
+    float eps = 1e-20f;   // config.json rms_norm_eps
+    for (const char * key : {"deepseek41.attention.layer_norm_rms_epsilon", "deepseek41.rms_norm_eps"}) {
+        const int64_t id = gguf_find_key(g, key);
+        if (id >= 0) eps = gguf_get_val_f32(g, id);
+    }
+    for (int l = 0; l < runtime.n_layers(); ++l) {
+        const std::string blk = "blk." + std::to_string(runtime.layer_id(l)) + ".";
+        const ggml_tensor * qn = ggml_get_tensor(meta, (blk + "engram_q_norm.weight").c_str());
+        TEST_ASSERT(qn != nullptr);
+        if (!qn) break;
+        const int n_embd = (int) qn->ne[0], n_hc = (int) qn->ne[1], key_width = (int) width;
+        std::vector<ggml_fp16_t> wkv((size_t) key_width * n_embd * (n_hc + 1));
+        std::vector<float> q((size_t) n_embd * n_hc), k(q.size());
+        TEST_ASSERT(read_tensor(blk + "engram_kv.weight", GGML_TYPE_F16, wkv.data(), wkv.size() * 2));
+        TEST_ASSERT(read_tensor(blk + "engram_q_norm.weight", GGML_TYPE_F32, q.data(), q.size() * 4));
+        TEST_ASSERT(read_tensor(blk + "engram_k_norm.weight", GGML_TYPE_F32, k.data(), k.size() * 4));
+        TestLcg rng(7u + (uint32_t) l);
+        std::vector<float> h((size_t) n_embd * n_hc * n_tokens);
+        for (auto & v : h) v = rng.next();
+        std::vector<float> layer_keys(keys.begin() + (ptrdiff_t) ((size_t) l * n_tokens * width),
+                                      keys.begin() + (ptrdiff_t) ((size_t) (l + 1) * n_tokens * width));
+        const EngramApplyError e = run_engram_apply_case(backend, wkv, q, k, n_embd, n_hc, key_width, eps,
+                                                         n_tokens, layer_keys, h);
+        TEST_ASSERT_MSG(e.out_rel < 1e-2, "released engram apply output");
+        TEST_ASSERT_MSG(e.gate_abs < 1e-3, "released engram gate");
+        std::fprintf(stderr, " layer %d: out %.2e gate %.2e;", runtime.layer_id(l), e.out_rel, e.gate_abs);
+    }
+    std::fclose(f);
+    gguf_free(g);
+    ggml_free(meta);
+    std::fprintf(stderr, " %s\n", g_failures ? "done" : "ok");
 }
 
 static void test_hash_routing_lookup() {
@@ -7915,6 +8143,8 @@ int main(int argc, char ** argv) {
     test_indexer_qat_cpu(backend);
     test_indexer_score_cpu(backend);
     test_indexer_mask_cpu(backend);
+    test_engram_apply_synthetic(backend, "cpu");
+    test_engram_apply_released_weights(backend, "cpu");
     test_ds4_ratio4_causal_visibility_formula();
     test_dspark_seed_row_restore_cpu();
     test_hash_routing_lookup();
@@ -7972,6 +8202,8 @@ int main(int argc, char ** argv) {
         auto gpu = ggml_backend_cuda_init(0);
         if (gpu) {
             for (int mode = 0; mode < 3; ++mode) test_dspark_compressor_rollback(gpu, mode);
+            test_engram_apply_synthetic(gpu, "gpu");
+            test_engram_apply_released_weights(gpu, "gpu");
             ggml_backend_free(gpu);
         } else {
             std::fprintf(stderr, "  test_dspark_compressor_rollback GPU skipped (no device)\n");

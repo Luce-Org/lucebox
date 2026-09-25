@@ -38,12 +38,16 @@ struct DeepSeek4SnapshotAux {
 
 // Layout of DeepSeek4Snapshot::meta_snap (I32):
 //   [0] version, [1] n_layer, [2] n_vocab, [3] n_spec_feat, [4] cur_pos,
-//   then per layer: n_comp, n_index_comp.
+//   then per layer: n_comp, n_index_comp,
+//   then the token ids at cur_pos - 1, cur_pos - 2, ... (kDeepSeek4SnapMetaTail
+//   of them, -1 where unknown): the Engram n-gram context.
 // Version 2 carries the per-layer geometry of shared compressed caches
 // (V4.1): compressed rows only at kv sources, no compressor state at ratio-1
-// sources, index rows at the kv sources that are index sources.
-constexpr int kDeepSeek4SnapMetaVersion = 2;
+// sources, index rows at the kv sources that are index sources. Version 3
+// adds the Engram context.
+constexpr int kDeepSeek4SnapMetaVersion = 3;
 constexpr int kDeepSeek4SnapMetaBase = 5;
+constexpr int kDeepSeek4SnapMetaTail = DeepSeek4EngramHistory::kMaxTail;
 
 // Metadata recovered by deepseek4_snapshot_bind().
 struct DeepSeek4SnapshotBindInfo {

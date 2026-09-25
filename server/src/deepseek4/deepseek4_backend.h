@@ -240,6 +240,7 @@ private:
     bool requires_monolithic_model() const;
     bool validate_prefill_mode() const;
     bool validate_model_features() const;
+    bool init_engram();
     bool load_routing_adjustments();
     bool apply_routing_adjustments();
     bool upload_protected_routing();

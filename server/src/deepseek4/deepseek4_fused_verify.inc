@@ -559,6 +559,12 @@ static bool ds4_build_fused_verify_graph(
 
     fg.inp_embed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, q);
     ggml_set_input(fg.inp_embed);
+    const DeepSeek4EngramRuntime * engram = w.engram_runtime.get();
+    if (engram) {
+        ex.engram_keys = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, (int64_t) engram->key_floats(), q,
+                                            engram->n_layers());
+        ggml_set_input(ex.engram_keys);
+    }
     ex.q = q;
     ex.pos_q = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);  ggml_set_input(ex.pos_q);
     ex.neg_q = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);  ggml_set_input(ex.neg_q);
@@ -684,6 +690,16 @@ static bool ds4_build_fused_verify_graph(
         const int lane_start = 0;
         const int lane_kv_start = kv_start + lane_start;
         const size_t hybrid_idx = (size_t) il;
+
+        // ── Engram: the n-gram memory enters the residual copies ──
+        if (const int e = engram ? engram->layer_index(il) : -1; e >= 0) {
+            ggml_tensor * keys = ggml_view_2d(ctx, ex.engram_keys, ex.engram_keys->ne[0], q,
+                                              ex.engram_keys->nb[1], (size_t) e * ex.engram_keys->nb[2]);
+            ggml_tensor * h3 = ggml_reshape_3d(ctx, ggml_cont(ctx, hc_cur), n_embd, n_hc, q);
+            ggml_tensor * updated = deepseek4_build_engram_apply(ctx, h3, keys, L, n_embd, n_hc, w.rms_eps);
+            if (!updated) return false;
+            hc_cur = ggml_reshape_2d(ctx, updated, (int64_t) n_embd * n_hc, q);
+        }
 
         // ── Batched HC pre (attention) ──
         ggml_tensor * hc_flat = hc_cur;
@@ -1503,6 +1519,7 @@ static bool ds4_build_fused_verify_graph(
         };
         for (ggml_tensor * context : attention_contexts) pin_main(context);
         pin_main(fg.inp_embed);
+        pin_main(ex.engram_keys);
         pin_main(ex.pos_q);
         pin_main(ex.neg_q);
         pin_main(ex.rawrows);
@@ -1786,6 +1803,13 @@ static int ds4_try_fused_verify_step(
     fg->last_use = vc.counter;
 
     // ── Fill inputs ──
+    if (ex->engram_keys) {
+        std::vector<float> keys;
+        if (!ds4_engram_read_keys(w, cache.engram_tokens, token_ids, kv_start, q, keys, telemetry)) {
+            return -1;
+        }
+        ds4_fv_set(ex->engram_keys, keys.data(), sizeof(float) * keys.size());
+    }
     const auto set_t0 = Ds4TimingClock::now();
     ds4_fv_set(fg->inp_embed, embed, sizeof(float) * (size_t) w.n_embd * q);
     std::vector<int32_t> iv(q);

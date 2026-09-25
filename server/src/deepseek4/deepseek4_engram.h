@@ -1,9 +1,9 @@
 // DeepSeek V4.1 Engram: the n-gram hash memory applied to the residual copies
 // at the two Engram layers (released checkpoint: 1 and 14).
 //
-// Status: addressing and the table read are tested bit-exact against the
-// reference (test/test_ds4_engram.cpp). The runtime and the apply subgraph are
-// not wired into the forward pass yet; see docs/DS41.md.
+// Addressing and the table read are tested bit-exact against the reference
+// (test/test_ds4_engram.cpp), the apply against the reference math on the
+// released weights (tests/test_deepseek4_unit.cpp); see docs/DS41.md.
 //
 // Three pieces, kept independent of the graph so each can be tested alone:
 //   1. addressing: the last four compressed token ids hash to `cols` rows per
@@ -21,6 +21,7 @@
 // engram.py (NgramHashState); antirez/ds4 ds4_engram.c as a second reading.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -28,6 +29,8 @@
 
 struct ggml_context;
 struct ggml_tensor;
+struct ggml_backend;
+struct ggml_gallocr;
 
 namespace luce::common {
 
@@ -127,6 +130,10 @@ public:
     // order with duplicates read once; batches of 256 rows or more use
     // `threads` readers. False (errno kept) on a short read or a bad code.
     bool read(const uint32_t * row_ids, size_t count, float * out, int threads = 16) const;
+    // Starts reading `count` rows into the page cache without waiting
+    // (POSIX_FADV_WILLNEED), so a later `read` of them does not wait on the
+    // drive one row at a time.
+    void prefetch(const uint32_t * row_ids, size_t count) const;
 
 private:
     int fd_ = -1;
@@ -137,12 +144,26 @@ private:
 
 // ── host-side runtime ─────────────────────────────────────────────────────
 
-// Owns the hasher, one table per Engram layer, and the n-gram history of each
-// sequence slot. `prepare` turns a run of token ids into the decoded key rows
-// the graph consumes: keys[layer][token][cols * kDim] floats, exactly the
-// `keys` input of deepseek4_build_engram_apply for that layer.
-// Histories are plain values: `snapshot` / `restore` back speculative verify
-// (a rejected draft block rewinds the tail).
+// The raw token ids at the most recent positions of one sequence: the n-gram
+// context the hash of the next position reads. Entries are keyed by position,
+// so rewinding a sequence (a rejected speculative suffix) needs no undo: the
+// positions before the rewind point still hold the tokens that were fed.
+struct DeepSeek4EngramTokens {
+    static constexpr int kSize = 64;
+    int32_t token[kSize];
+    int32_t pos[kSize];
+    DeepSeek4EngramTokens() { reset(); }
+    void reset() { for (int i = 0; i < kSize; ++i) { token[i] = -1; pos[i] = -1; } }
+    void put(int p, int32_t t) { token[p % kSize] = t; pos[p % kSize] = p; }
+    // The token at position p, or -1 when this context does not hold it.
+    int32_t at(int p) const { return p >= 0 && pos[p % kSize] == p ? token[p % kSize] : -1; }
+};
+
+// Owns the hasher and one table per Engram layer. `prepare` turns a run of
+// token ids into the decoded key rows the apply consumes:
+// keys[layer][token][cols * kDim] floats, exactly the `keys` input of
+// deepseek4_build_engram_apply for that layer. It keeps no per-sequence state:
+// the n-gram context comes from the caller's DeepSeek4EngramTokens.
 class DeepSeek4EngramRuntime {
 public:
     // Opens every embedded table recorded by the loader (w.engram.tables) on
@@ -157,27 +178,27 @@ public:
     // floats per token per layer
     size_t key_floats() const { return (size_t) hasher_.cols() * DeepSeek4EngramTable::kDim; }
 
-    void reset_slot(int slot);
-    DeepSeek4EngramHistory snapshot(int slot) const;
-    void restore(int slot, const DeepSeek4EngramHistory & h);
-
-    // Hashes `count` tokens of `slot` (advancing its history), reads the rows
-    // of every Engram layer and decodes them into `keys` (resized to
-    // n_layers * count * key_floats()). `dead` as in the hasher.
-    bool prepare(int slot, const int32_t * tokens, const uint8_t * dead, size_t count,
-                 std::vector<float> & keys, std::string * err);
-    // Row ids only (planning, prefetch): out[count][n_layers][cols].
-    void plan(int slot, const int32_t * tokens, const uint8_t * dead, size_t count,
-              std::vector<uint32_t> & out);
+    // Hashes `count` tokens at positions first_pos.. of the sequence whose
+    // context is `ctx` (recording them there), reads the rows of every Engram
+    // layer and decodes them into keys[n_layers][count][key_floats()]. Fails
+    // when `ctx` does not hold the tokens before first_pos.
+    bool prepare(DeepSeek4EngramTokens & ctx, const int32_t * tokens, int first_pos,
+                 size_t count, float * keys, std::string * err) const;
+    // Starts reading the rows `prepare` will need for the same arguments,
+    // without waiting and without recording the tokens.
+    void prefetch(const DeepSeek4EngramTokens & ctx, const int32_t * tokens, int first_pos,
+                  size_t count) const;
 
     // Rows read from the tables so far.
-    uint64_t rows_read() const { return rows_read_; }
+    uint64_t rows_read() const { return rows_read_.load(std::memory_order_relaxed); }
 
 private:
+    bool row_ids(const DeepSeek4EngramTokens & ctx, const int32_t * tokens, int first_pos,
+                 size_t count, std::vector<uint32_t> & ids, std::string * err) const;
+
     DeepSeek4EngramHasher hasher_;
     std::vector<DeepSeek4EngramTable> tables_;   // one per Engram layer, hasher order
-    std::vector<DeepSeek4EngramHistory> slots_;
-    uint64_t rows_read_ = 0;
+    mutable std::atomic<uint64_t> rows_read_{0};
     int threads_ = 16;
 };
 
@@ -203,5 +224,28 @@ ggml_tensor * deepseek4_build_engram_apply(ggml_context * ctx,
                                            int n_embd, int n_hc,
                                            float rms_eps,
                                            ggml_tensor ** gate_out = nullptr);
+
+// Runs the apply on residual copies kept in host memory (the host
+// hyper-connection paths): uploads them with their keys, computes on
+// `backend`, where the layer's Engram weights live, and reads them back in
+// place. Batches of more than kMaxTokens tokens run in parts.
+class DeepSeek4EngramApplyRunner {
+public:
+    static constexpr int kMaxTokens = 256;
+    DeepSeek4EngramApplyRunner() = default;
+    DeepSeek4EngramApplyRunner(const DeepSeek4EngramApplyRunner &) = delete;
+    DeepSeek4EngramApplyRunner & operator=(const DeepSeek4EngramApplyRunner &) = delete;
+    ~DeepSeek4EngramApplyRunner() { release(); }
+    void release();
+
+    // hc: [n_tokens][n_hc * n_embd], keys: [n_tokens][cols * key_len].
+    bool run(ggml_backend * backend, const DeepSeek4Layer & L, int n_embd, int n_hc, float rms_eps,
+             float * hc, const float * keys, int n_tokens);
+
+private:
+    ggml_gallocr * alloc_ = nullptr;
+    ggml_backend * alloc_backend_ = nullptr;
+    std::vector<uint8_t> meta_;
+};
 
 }  // namespace luce::common

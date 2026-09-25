@@ -5291,17 +5291,62 @@ struct DeepSeek4HybridRuntime {
     std::vector<HcLayerWeightsCpu> hc_layer_weights;
     HcWeightsCpu hc_output_weights;
     std::vector<HashRoutingTableCpu> hash_routing_tables;
+    DeepSeek4EngramApplyRunner engram_apply;
 
     void destroy() {
         reset_hc_layer_weights_cpu(hc_layer_weights);
         reset_hc_weights_cpu(hc_output_weights);
         hash_routing_tables.clear();
         hash_routing_tables.shrink_to_fit();
+        engram_apply.release();
         owner_ctx = nullptr;
     }
 };
 
 static thread_local DeepSeek4HybridRuntime ds4_hybrid_runtime;
+
+// ─── Engram on the host hyper-connection paths ──────────────────────────
+// A step reads the Engram rows of its tokens once, for every Engram layer;
+// each Engram layer then updates the residual copies entering it, before its
+// attention HC pre (model.py Transformer.forward), on the GPU that holds its
+// weights. `ctx` is the sequence's n-gram context (deepseek4_engram.h).
+static bool ds4_engram_read_keys(const DeepSeek4Weights & w, DeepSeek4EngramTokens & ctx,
+                                 const int32_t * token_ids, int kv_start, int n_tokens,
+                                 std::vector<float> & keys, DeepSeek4StepTelemetry * telemetry) {
+    const DeepSeek4EngramRuntime * engram = w.engram_runtime.get();
+    if (!engram) return true;
+    if (!token_ids) {
+        std::fprintf(stderr, "[deepseek4] engram: the step carries no token ids\n");
+        return false;
+    }
+    const auto t0 = Ds4TimingClock::now();
+    keys.resize((size_t) engram->n_layers() * (size_t) n_tokens * engram->key_floats());
+    std::string err;
+    if (!engram->prepare(ctx, token_ids, kv_start, (size_t) n_tokens, keys.data(), &err)) {
+        std::fprintf(stderr, "[deepseek4] %s\n", err.c_str());
+        return false;
+    }
+    if (telemetry) telemetry->engram_read_us += ds4_elapsed_us(t0, Ds4TimingClock::now());
+    return true;
+}
+
+static bool ds4_engram_apply_host(ggml_backend_t backend, const DeepSeek4Weights & w, int il,
+                                  const std::vector<float> & keys, float * hc_state, int n_tokens,
+                                  DeepSeek4EngramApplyRunner & runner,
+                                  DeepSeek4StepTelemetry * telemetry) {
+    const DeepSeek4EngramRuntime * engram = w.engram_runtime.get();
+    const int e = engram ? engram->layer_index(il) : -1;
+    if (e < 0) return true;
+    const auto t0 = Ds4TimingClock::now();
+    const float * layer_keys = keys.data() + (size_t) e * (size_t) n_tokens * engram->key_floats();
+    if (!runner.run(backend, w.layers[(size_t) il], w.n_embd, w.n_hc, w.rms_eps,
+                    hc_state, layer_keys, n_tokens)) {
+        std::fprintf(stderr, "[deepseek4] engram apply failed at layer %d\n", il);
+        return false;
+    }
+    if (telemetry) telemetry->engram_apply_us += ds4_elapsed_us(t0, Ds4TimingClock::now());
+    return true;
+}
 
 static const void * hc_fn_device_ptr(const HcWeightsCpu &, ggml_tensor * fn) {
     if (!fn) return nullptr;
@@ -5384,12 +5429,21 @@ static bool deepseek4_step_hybrid(
                      n_hc, n_tokens);
         return false;
     }
+    std::vector<float> engram_keys;
+    if (!ds4_engram_read_keys(w, cache.engram_tokens, token_ids, kv_start, n_tokens,
+                              engram_keys, telemetry)) {
+        return false;
+    }
 
     for (int il = 0; il < w.n_layer; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t) il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
         DeepSeek4LayerCache & comp_lc = ds4_comp_cache(cache, w, il);
         const HcLayerWeightsCpu & hc_lw = hc_layer_weights[(size_t)il];
+        if (!ds4_engram_apply_host(backend, w, il, engram_keys, hc_state.data(), n_tokens,
+                                   runtime.engram_apply, telemetry)) {
+            return false;
+        }
 
         // ── HC pre (attention) ──────────────────────────────────────
         // For decode (n_tokens=1): compute working vector from HC state
@@ -6082,6 +6136,7 @@ struct Ds4FusedVerifyCache {
         };
         ggml_tensor * pos_q = nullptr;    // i32 [q]
         ggml_tensor * neg_q = nullptr;    // i32 [q]
+        ggml_tensor * engram_keys = nullptr; // f32 [cols*key_len, q, n_engram_layers]
         ggml_tensor * rawrows = nullptr;  // i64 [1,q]
         ggml_tensor * saved_rawrows = nullptr; // i32 [q], gather before ring writes
         // Per distinct compress ratio: each token's APE row (i32 [q]) and
@@ -6178,6 +6233,7 @@ struct DeepSeek4LayerRangeCache {
     Ds4FusedVerifyCache fused_capture_graph_cache;
     Ds4DecodeSharedInputs decode_shared_inputs;
     DeepSeek4LayerRangeScratch scratch;
+    DeepSeek4EngramApplyRunner engram_apply;
 
     bool matches(const DeepSeek4Weights & w,
                  ggml_backend_t candidate_backend,
@@ -6280,6 +6336,7 @@ struct DeepSeek4LayerRangeCache {
         hash_routing_tables.clear();
         hash_routing_tables.shrink_to_fit();
         scratch.clear();
+        engram_apply.release();
         owner_weights = nullptr;
         owner_ctx = nullptr;
         backend = nullptr;
@@ -8821,6 +8878,27 @@ bool deepseek4_paged_gathered_step(
     fg->last_use = vc.counter;
     ds4_fv_set(fg->inp_embed, embeddings,
                sizeof(float) * (size_t) w.n_embd * lanes);
+    // Engram keys, lane by lane from each sequence's n-gram context. Rows of
+    // one slot come in position order, so each sees the tokens before it.
+    if (ex->engram_keys) {
+        const DeepSeek4EngramRuntime & engram = *w.engram_runtime;
+        const size_t width = engram.key_floats();
+        if (cache.engram_tokens.size() < cache.plan.slots) cache.engram_tokens.resize(cache.plan.slots);
+        std::vector<float> keys((size_t) engram.n_layers() * lanes * width, 0.0f);
+        std::vector<float> lane_keys;
+        for (uint32_t lane = 0; lane < lanes; ++lane) {
+            if (slots[lane] < 0) continue;
+            if (!ds4_engram_read_keys(w, cache.engram_tokens[(size_t) slots[lane]], token_ids ? token_ids + lane : nullptr,
+                                      (int) positions[lane], 1, lane_keys, telemetry)) {
+                return false;
+            }
+            for (int e = 0; e < engram.n_layers(); ++e) {
+                std::memcpy(keys.data() + ((size_t) e * lanes + lane) * width,
+                            lane_keys.data() + (size_t) e * width, width * sizeof(float));
+            }
+        }
+        ds4_fv_set(ex->engram_keys, keys.data(), sizeof(float) * keys.size());
+    }
     // The shared Q/KV prologue rotates all gathered lanes at once. Padding
     // lanes use position zero, matching their passive prepared row record.
     {
@@ -9525,6 +9603,12 @@ bool deepseek4_step_layer_range(
         shared_inputs = &decode_shared_inputs;
     }
 
+    std::vector<float> engram_keys;
+    if (!ds4_engram_read_keys(w, cache.engram_tokens, token_ids, kv_start, n_tokens,
+                              engram_keys, telemetry)) {
+        return false;
+    }
+
     bool backend_decode_hc_supported = true;
     for (int il = layer_begin; il < layer_end; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t)il];
@@ -9639,6 +9723,17 @@ bool deepseek4_step_layer_range(
             std::fprintf(stderr,
                          "[deepseek4-prefill-trace] layer=%d attention begin\n",
                          il);
+        }
+        // The residual copies stay in host memory on the staggered pre-mix
+        // paths, the only ones a model with Engram layers takes.
+        if (!engram_keys.empty() &&
+            (hc_state_backend ||
+             !ds4_engram_apply_host(backend, w, il, engram_keys, hc_state.data(), n_tokens,
+                                    layer_range_cache.engram_apply, telemetry))) {
+            if (hc_state_backend) {
+                std::fprintf(stderr, "[deepseek4] engram needs the host hyper-connection path\n");
+            }
+            return false;
         }
 
         // ── HC pre (attention) ──────────────────────────────────────
@@ -10846,6 +10941,7 @@ void free_deepseek4_cache(DeepSeek4Cache & c) {
 
 void reset_deepseek4_cache(DeepSeek4Cache & c) {
     c.cur_pos = 0;
+    c.engram_tokens.reset();
     for (DeepSeek4LayerCache & lc : c.layers) {
         lc.n_comp = 0;
         lc.n_index_comp = 0;

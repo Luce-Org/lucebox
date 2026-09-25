@@ -689,6 +689,35 @@ static bool read_deepseek4_engram(gguf_context * gctx, ggml_context * meta_ctx,
     return true;
 }
 
+bool deepseek4_read_engram_metadata(const std::string & path, DeepSeek4Weights::Engram & out,
+                                    std::string * err) {
+    out = DeepSeek4Weights::Engram{};
+    ggml_context * meta_ctx = nullptr;
+    gguf_init_params gip{};
+    gip.no_alloc = true;
+    gip.ctx      = &meta_ctx;
+    gguf_context * gctx = gguf_init_from_file(path.c_str(), gip);
+    if (!gctx) { if (err) *err = "gguf_init failed: " + path; return false; }
+    std::string why;
+    const int64_t aid = gguf_find_key(gctx, "general.architecture");
+    const std::string P = aid >= 0 ? std::string(gguf_get_val_str(gctx, aid)) + "." : std::string();
+    // llama.cpp and DwarfStar spellings of the layer count.
+    uint32_t n_layer = get_u32_or(gctx, (P + "block_count").c_str(), 0);
+    if (n_layer == 0) n_layer = get_u32_or(gctx, (P + "num_hidden_layers").c_str(), 0);
+    uint32_t n_vocab = get_u32_or(gctx, (P + "vocab_size").c_str(), 0);
+    const int64_t tokens_key = gguf_find_key(gctx, "tokenizer.ggml.tokens");
+    if (n_vocab == 0 && tokens_key >= 0 && gguf_get_kv_type(gctx, tokens_key) == GGUF_TYPE_ARRAY) {
+        n_vocab = (uint32_t) gguf_get_arr_n(gctx, tokens_key);
+    }
+    bool ok = aid >= 0 && n_layer > 0;
+    if (!ok) why = "not a DeepSeek4 GGUF: " + path;
+    ok = ok && read_deepseek4_engram(gctx, meta_ctx, P + "engram.", n_layer, n_vocab, out, why);
+    gguf_free(gctx);
+    if (meta_ctx) ggml_free(meta_ctx);
+    if (!ok && err) *err = why;
+    return ok;
+}
+
 // ─── Compute per-layer compression ratios (matches ds4.c logic) ─────────
 static std::vector<uint32_t> compute_compress_ratios(int n_layer) {
     std::vector<uint32_t> ratios(n_layer, 0);
