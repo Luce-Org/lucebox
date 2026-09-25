@@ -801,6 +801,13 @@ int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
     return std::max(1, safe);
 }
 
+// Row of a compressor state a token at `pos` writes: ratio 4 keeps the
+// previous window in rows 0..3 and the current one in rows 4..7, other
+// ratios hold only the current window.
+static int64_t ds4_compressor_state_row(int ratio, int pos) {
+    return (ratio == 4 ? ratio : 0) + pos % ratio;
+}
+
 // Advance the compressed-row counters of layer `il` to cover `next_pos`
 // tokens. Only the owner of the rows counts them (readers of a shared cache
 // own none and reach the source through ds4_comp_cache()); index rows
@@ -5856,6 +5863,8 @@ struct DeepSeek4FusedDecodeGraph {
     ggml_tensor * mask_bundle = nullptr;   // additive score mask (0 / -1e30), may be null
     std::vector<ggml_tensor *> hash_ids;
     std::vector<MoeHybridGraphInputs> hybrid_inputs;
+    // Posts of each layer's predicted next-layer routes (streamed mailbox).
+    std::vector<ggml_tensor *> stream_predict_posts;
     std::vector<AuthoritativeRouteOutput> authoritative_routes;
     ggml_tensor * logits = nullptr;
     ggml_backend_sched_t sched = nullptr;
@@ -5879,6 +5888,7 @@ struct DeepSeek4FusedDecodeGraph {
         hash_ids.clear();
         hybrid_inputs.clear();
         authoritative_routes.clear();
+        stream_predict_posts.clear();
         shape_key.clear();
         last_use = 0;
     }
@@ -6021,10 +6031,20 @@ struct Ds4FusedVerifyCache {
         ggml_tensor * neg_q = nullptr;    // i32 [q]
         ggml_tensor * rawrows = nullptr;  // i64 [1,q]
         ggml_tensor * saved_rawrows = nullptr; // i32 [q], gather before ring writes
-        ggml_tensor * ape4 = nullptr;     // i32 [q]
-        ggml_tensor * ape128 = nullptr;   // i32 [q]
-        ggml_tensor * st4 = nullptr;      // i64 [1,q]
-        ggml_tensor * st128 = nullptr;    // i64 [1,q]
+        // Per distinct compress ratio: each token's APE row (i32 [q]) and
+        // compressor state row (i64 [1,q]).
+        struct RatioRows {
+            int ratio = 0;
+            ggml_tensor * ape = nullptr;
+            ggml_tensor * state = nullptr;
+        };
+        std::vector<RatioRows> ratio_rows;
+        const RatioRows * rows_for(int ratio) const {
+            for (const RatioRows & rows : ratio_rows) {
+                if (rows.ratio == ratio) return &rows;
+            }
+            return nullptr;
+        }
         ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap,q], token-major
         ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy output
         DeepSeek4SpecBoundaryCheckpoint boundary_checkpoint;
@@ -6334,6 +6354,29 @@ static ggml_tensor * ds4_build_fused_hc_pre(
     return ggml_view_2d(ctx, pre, w.n_embd, n_tokens, pre->nb[1], 0);
 }
 
+// Staggered pre-mix in a graph (see ds4_hc_collapse): per token, the sum of
+// the HC copies of hc [n_embd*n_hc, T] weighted by pre [n_hc, T], the
+// previous sub-block's pre coefficients. A null pre is the identity mix that
+// precedes the first layer (copy 0).
+static ggml_tensor * ds4_build_hc_collapse(ggml_context * ctx, ggml_tensor * hc,
+                                           ggml_tensor * pre, int n_embd, int n_hc) {
+    const int64_t n_tokens = hc->ne[1];
+    if (!pre) {
+        return ggml_cont(ctx, ggml_view_2d(ctx, hc, n_embd, n_tokens, hc->nb[1], 0));
+    }
+    ggml_tensor * hc3 = ggml_reshape_3d(ctx, hc, n_embd, n_hc, n_tokens);
+    ggml_tensor * weighted = ggml_mul(
+        ctx, hc3, ggml_reshape_3d(ctx, ggml_cont(ctx, pre), 1, n_hc, n_tokens));
+    ggml_tensor * summed = ggml_sum_rows(
+        ctx, ggml_cont(ctx, ggml_permute(ctx, weighted, 1, 0, 2, 3)));
+    return ggml_reshape_2d(ctx, summed, n_embd, n_tokens);
+}
+
+// The pre coefficients of an HC split ([mix_dim] or [mix_dim, T]).
+static ggml_tensor * ds4_hc_split_pre(ggml_context * ctx, ggml_tensor * split, int n_hc) {
+    return ggml_view_2d(ctx, split, n_hc, split->ne[1], split->nb[1], 0);
+}
+
 static ggml_tensor * ds4_build_hash_routed_ffn(
         ggml_context * ctx,
         const DeepSeek4Weights & w,
@@ -6400,7 +6443,11 @@ static bool ds4_fused_ensure_fn_mirrors(
         const DeepSeek4Weights & w,
         const std::vector<HcLayerWeightsCpu> & hc_weights,
         const HcWeightsCpu & hc_out_weights) {
-    if (fc.fn_ctx && fc.fn_buf && fc.fn_attn_f16.size() == (size_t) w.n_layer && fc.fn_out_f16) {
+    // The staggered pre-mix has no output HC projection (the head collapses
+    // with the last FFN's coefficients).
+    const bool has_output_hc = !w.hc_staggered_pre;
+    if (fc.fn_ctx && fc.fn_buf && fc.fn_attn_f16.size() == (size_t) w.n_layer &&
+        (fc.fn_out_f16 || !has_output_hc)) {
         return true;
     }
     const int64_t hc_dim = (int64_t) w.n_embd * w.n_hc;
@@ -6416,7 +6463,7 @@ static bool ds4_fused_ensure_fn_mirrors(
             return false;
         }
     }
-    if ((int64_t) hc_out_weights.fn_data.size() != hc_dim * w.n_hc) {
+    if (has_output_hc && (int64_t) hc_out_weights.fn_data.size() != hc_dim * w.n_hc) {
         return false;
     }
 
@@ -6434,7 +6481,8 @@ static bool ds4_fused_ensure_fn_mirrors(
         fc.fn_attn_f16[(size_t) il] = ggml_new_tensor_2d(fc.fn_ctx, GGML_TYPE_F16, hc_dim, mix_dim);
         fc.fn_ffn_f16[(size_t) il] = ggml_new_tensor_2d(fc.fn_ctx, GGML_TYPE_F16, hc_dim, mix_dim);
     }
-    fc.fn_out_f16 = ggml_new_tensor_2d(fc.fn_ctx, GGML_TYPE_F16, hc_dim, w.n_hc);
+    fc.fn_out_f16 = has_output_hc
+        ? ggml_new_tensor_2d(fc.fn_ctx, GGML_TYPE_F16, hc_dim, w.n_hc) : nullptr;
     fc.fn_buf = ggml_backend_alloc_ctx_tensors(fc.fn_ctx, backend);
     if (!fc.fn_buf) {
         ggml_free(fc.fn_ctx);
@@ -6447,8 +6495,10 @@ static bool ds4_fused_ensure_fn_mirrors(
         ggml_backend_tensor_set(fc.fn_attn_f16[(size_t) il], a.data(), 0, a.size() * sizeof(uint16_t));
         ggml_backend_tensor_set(fc.fn_ffn_f16[(size_t) il], f.data(), 0, f.size() * sizeof(uint16_t));
     }
-    const auto & o = hc_out_weights.fn_data;
-    ggml_backend_tensor_set(fc.fn_out_f16, o.data(), 0, o.size() * sizeof(uint16_t));
+    if (has_output_hc) {
+        const auto & o = hc_out_weights.fn_data;
+        ggml_backend_tensor_set(fc.fn_out_f16, o.data(), 0, o.size() * sizeof(uint16_t));
+    }
     return true;
 }
 
@@ -8958,9 +9008,11 @@ bool deepseek4_step_layer_range(
     const bool wide_verify_candidate =
         n_tokens == DS4_Q5_VERIFY_TOKENS &&
         ds4_env_flag("LUCE_DS4_Q5_VERIFY");
+    // With the staggered pre-mix the fused graph serves single-token decode;
+    // verify batches take decode_tokenwise_verify below.
     const bool fused_verify_candidate =
         (!moe_hybrid || fused_hybrid_ready) &&
-        n_tokens >= 2 &&
+        n_tokens >= 2 && !w.hc_staggered_pre &&
         (n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS ||
          wide_verify_candidate) && verify_hooks &&
         layer_begin == 0 && is_last_shard && out_logits &&
@@ -9326,7 +9378,7 @@ bool deepseek4_step_layer_range(
         (fused_hybrid_decode && !verify_hooks)
             ? &fused_hybrid_decode_hooks : verify_hooks;
     if ((!moe_hybrid || fused_hybrid_ready) &&
-        ((n_tokens >= 2 &&
+        ((n_tokens >= 2 && !w.hc_staggered_pre &&
           (n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS ||
            wide_verify_candidate) && verify_hooks) ||
          fused_hybrid_decode) &&
@@ -11387,17 +11439,12 @@ static bool deepseek4_dspark_draft_forward_impl(
         // the head the last FFN's. prev_pre[p] is null before layer 0.
         const bool staggered = w.hc_staggered_pre;
         std::vector<ggml_tensor *> prev_pre((size_t) block, nullptr);
-        auto hc_collapse = [&](ggml_tensor * hcf, ggml_tensor * pre) -> ggml_tensor * {
-            ggml_tensor * hc2 = ggml_reshape_2d(ctx, hcf, n_embd, n_hc);
-            if (!pre) {
-                return ggml_reshape_2d(ctx, ggml_view_1d(ctx, hcf, n_embd, 0), n_embd, 1);
-            }
-            ggml_tensor * weighted = ggml_mul(ctx, hc2, ggml_reshape_2d(ctx, pre, 1, n_hc));
-            ggml_tensor * summed = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, weighted)));
-            return ggml_reshape_2d(ctx, summed, n_embd, 1);
+        auto hc_collapse = [&](ggml_tensor * hcf, ggml_tensor * pre) {
+            return ds4_build_hc_collapse(
+                ctx, ggml_reshape_2d(ctx, hcf, (int64_t) n_embd * n_hc, 1), pre, n_embd, n_hc);
         };
-        auto split_pre = [&](ggml_tensor * split) -> ggml_tensor * {
-            return ggml_view_1d(ctx, split, n_hc, 0);
+        auto split_pre = [&](ggml_tensor * split) {
+            return ds4_hc_split_pre(ctx, split, n_hc);
         };
 
         for (int il = 0; il < w.n_layer; il++) {

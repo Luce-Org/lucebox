@@ -1309,8 +1309,8 @@ bool DeepSeek4Backend::validate_model_features() const {
         unsupported = "--paged-attention";
     } else if (cfg_.fused_decode || env_flag_enabled("LUCE_DS4_FUSED_DECODE")) {
         unsupported = "fused decode";
-    } else if (cfg_.fused_verify_f16_kv || env_flag_enabled("LUCE_DS4_FUSED_VERIFY")) {
-        unsupported = "fused verify";
+    } else if (cfg_.fused_verify_f16_kv) {
+        unsupported = "the fused verifier's F16 K/V";
     } else if (cfg_.device.is_layer_split()) {
         unsupported = "layer split";
     } else if (!cfg_.mmproj_path.empty()) {

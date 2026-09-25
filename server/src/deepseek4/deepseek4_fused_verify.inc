@@ -156,17 +156,23 @@ static bool ds4_fused_verify_trace_node(
 // placement after allocation. Mask any hot/cold duplication defensively so
 // every selected route is evaluated exactly once. Mutable LRU placement is
 // rejected before this graph path is entered.
+// Local expert id of a route an owner does not hold: -1 masks it exactly in
+// the MUL_MAT_ID kernels; LUCE_DS4_TP_MASKED_ROUTES=0 restores the legacy
+// zero-weight route to local expert 0.
+static int32_t ds4_fused_invalid_route() {
+    const char * masked_routes =
+        std::getenv("LUCE_DS4_TP_MASKED_ROUTES");
+    return !masked_routes || !*masked_routes || std::strcmp(masked_routes, "0") != 0
+        ? -1
+        : 0;
+}
+
 static void ds4_fused_verify_refresh_hybrid_luts(
         const DeepSeek4Weights & w,
         MoeHybridStorage * hybrid,
         DeepSeek4FusedDecodeGraph & fg) {
     if (!hybrid) return;
-    const char * masked_routes =
-        std::getenv("LUCE_DS4_TP_MASKED_ROUTES");
-    const int32_t invalid_route =
-        !masked_routes || !*masked_routes || std::strcmp(masked_routes, "0") != 0
-            ? -1
-            : 0;
+    const int32_t invalid_route = ds4_fused_invalid_route();
     for (size_t hi = 0; hi < fg.hybrid_inputs.size(); ++hi) {
         const int il = (int) hi;
         const MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
@@ -209,6 +215,20 @@ static void ds4_fused_verify_refresh_hybrid_luts(
         ds4_fv_set_repeated_rows(inputs.cold_local_lut, cold_lut);
         ds4_fv_set_repeated_rows(inputs.cold_valid_lut, cold_valid);
     }
+}
+
+// Streamed experts of a fused graph run as a third owner over the device
+// cache's slot stacks. Each such layer posts its routes to the cache's host
+// mailbox in the graph and waits there for their slots; the mailbox resolver
+// pins and loads them meanwhile. Pins are released after the graph.
+static std::vector<MoeStreamedMailbox::Job> ds4_fused_stream_jobs(
+        const DeepSeek4FusedDecodeGraph & fg) {
+    std::vector<MoeStreamedMailbox::Job> jobs;
+    for (const auto & route : fg.authoritative_routes) {
+        if (!fg.hybrid_inputs[(size_t) route.layer].stream_post) continue;
+        jobs.push_back({route.layer, route.width * route.n_tokens, route.n_tokens});
+    }
+    return jobs;
 }
 
 template <typename T>
@@ -494,10 +514,13 @@ static bool ds4_build_fused_verify_graph(
     ex.rawrows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(ex.rawrows);
     ex.saved_rawrows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);
     ggml_set_input(ex.saved_rawrows);
-    ex.ape4 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);   ggml_set_input(ex.ape4);
-    ex.ape128 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q); ggml_set_input(ex.ape128);
-    ex.st4 = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(ex.st4);
-    ex.st128 = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(ex.st128);
+    for (uint32_t ratio : w.compress_ratios) {
+        if (ratio == 0 || ex.rows_for((int) ratio)) continue;
+        auto & rows = ex.ratio_rows.emplace_back();
+        rows.ratio = (int) ratio;
+        rows.ape = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);   ggml_set_input(rows.ape);
+        rows.state = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(rows.state);
+    }
     // Up to two compressor emissions per layer. q<=4 uses at most one; q=5
     // can touch two ratio-4 boundaries when it starts at position mod 4 == 3.
     fg.i32_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2 * (int64_t) w.n_layer);
@@ -582,6 +605,8 @@ static bool ds4_build_fused_verify_graph(
 
     std::vector<ggml_tensor *> capture_layers(capture_ids.size(), nullptr);
     std::vector<ggml_tensor *> attention_contexts;
+    // Staggered pre-mix: the pre coefficients of the previous sub-block.
+    ggml_tensor * carried_pre = nullptr;
 
     for (int il = 0; il < w.n_layer; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t) il];
@@ -607,7 +632,11 @@ static bool ds4_build_fused_verify_graph(
         if (!attn_working) return false;
         // HC-pre stores working and split values together per token. Materialize
         // the strided working view once, replacing q kernels and q-1 concats.
-        ggml_tensor * attn_in = ggml_cont(ctx, attn_working);
+        // The staggered pre-mix collapses with the previous sub-block's pre.
+        ggml_tensor * attn_in = w.hc_staggered_pre
+            ? ds4_build_hc_collapse(ctx, hc_flat, carried_pre, n_embd, n_hc)
+            : ggml_cont(ctx, attn_working);
+        if (w.hc_staggered_pre) carried_pre = ds4_hc_split_pre(ctx, split_attn, n_hc);
 
         // ── Attention ──
         ggml_tensor * attn_out = nullptr;
@@ -863,8 +892,8 @@ static bool ds4_build_fused_verify_graph(
                 if (((lane_kv_start + t + 1) % ratio) == 0) ++n_flush;
             }
             const int n_comp_inputs = std::max(1, n_flush);
-            ggml_tensor * ape_all = (ratio == 4) ? ex.ape4 : ex.ape128;
-            ggml_tensor * state_all = (ratio == 4) ? ex.st4 : ex.st128;
+            ggml_tensor * ape_all = ex.rows_for(ratio)->ape;
+            ggml_tensor * state_all = ex.rows_for(ratio)->state;
             ain.attn_ape_row = ape_all;
             ain.attn_state_rows = state_all;
             ain.attn_comp_pos = ggml_view_1d(
@@ -880,8 +909,8 @@ static bool ds4_build_fused_verify_graph(
                 if (((lane_kv_start + t + 1) % ratio) == 0) ++n_flush;
             }
             const int n_comp_inputs = std::max(1, n_flush);
-            ain.index_ape_row = ex.ape4;
-            ain.index_state_rows = ex.st4;
+            ain.index_ape_row = ex.rows_for(ratio)->ape;
+            ain.index_state_rows = ex.rows_for(ratio)->state;
             ain.index_comp_pos = ggml_view_1d(
                 ctx, fg.i32_bundle, n_comp_inputs,
                 (size_t) il * 2 * sizeof(int32_t));
@@ -950,7 +979,10 @@ static bool ds4_build_fused_verify_graph(
             ctx, w, hc_flat, mc.fn_ffn_f16[(size_t) il], L.hc_ffn_base,
             hlw.ffn, &split_ffn, projection_columns);
         if (!ffn_working) return false;
-        ggml_tensor * ffn_in = ggml_cont(ctx, ffn_working);
+        ggml_tensor * ffn_in = w.hc_staggered_pre
+            ? ds4_build_hc_collapse(ctx, hc_flat, carried_pre, n_embd, n_hc)
+            : ggml_cont(ctx, ffn_working);
+        if (w.hc_staggered_pre) carried_pre = ds4_hc_split_pre(ctx, split_ffn, n_hc);
 
         // ── Batched FFN ──
         ggml_tensor * ffn_normed = build_rms_norm(ctx, ffn_in, L.ffn_norm, w.rms_eps);
@@ -994,6 +1026,23 @@ static bool ds4_build_fused_verify_graph(
             selected = routing.selected;
             router_weights = routing.weights;
             router_nodes = routing.nodes;
+            // Predict the next layer's routes from this FFN input and post them
+            // ahead of this layer's own, so the streamed-expert resolver
+            // starts loading the next layer's misses one layer early.
+            MoeStreamedMailbox * mailbox =
+                hybrid->expert_cache ? hybrid->expert_cache->mailbox() : nullptr;
+            if (mailbox && il + 1 < w.n_layer && il + 1 >= w.n_hash_layer &&
+                hybrid->layers[(size_t) il + 1].n_streamed > 0) {
+                const DeepSeek4Layer & N = w.layers[(size_t) il + 1];
+                const MoeStreamedMailbox::Channel * ch = mailbox->channel(il + 1);
+                Ds4MoeRouting next = build_moe_routing(
+                    ctx, build_rms_norm(ctx, ffn_in, N.ffn_norm, w.rms_eps), w, N, lane_q);
+                ggml_tensor * post = ggml_host_mailbox_post(
+                    ctx, ggml_cont(ctx, next.selected), ch->step, ch->predicted,
+                    ch->predicted_ids);
+                fg.stream_predict_posts.push_back(post);
+                ggml_build_forward_expand(gf, post);
+            }
         } else {
             const int columns = moe_columns > 0 ? moe_columns : lane_q;
             for (int first = 0; first < lane_q; first += columns) {
@@ -1051,6 +1100,23 @@ static bool ds4_build_fused_verify_graph(
             hybrid_cfg.n_expert_used = (int) selected->ne[0];
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
             MoeHybridGraphInputs & inputs = fg.hybrid_inputs[hybrid_idx];
+            // Experts neither owner holds come from the streamed-expert
+            // cache, whose slots must live beside the secondary owner.
+            MoeStreamedOwner streamed_owner;
+            const MoeStreamedOwner * streamed = nullptr;
+            if (hybrid->layers[(size_t) il].n_streamed > 0) {
+                MoeStreamedExpertCache * cache = hybrid->expert_cache;
+                if (!cache || !cache->ready() || !cache->mailbox() ||
+                    cache->device() != ggml_backend_cuda_get_device_id(hybrid->cold_backend)) {
+                    return false;
+                }
+                const MoeStreamedMailbox * mailbox = cache->mailbox();
+                if (!mailbox) return false;
+                const MoeStreamedExpertCache::Stacks stacks = cache->stacks(il);
+                streamed_owner = {stacks.gate, stacks.up, stacks.down, stacks.gate_up,
+                                  mailbox->channel(il)};
+                streamed = &streamed_owner;
+            }
             inputs.router_nodes = router_nodes;
             const MoeHybridLayerStorage & hybrid_layer =
                 hybrid->layers[(size_t) il];
@@ -1067,9 +1133,10 @@ static bool ds4_build_fused_verify_graph(
             // six routes in one owner graph. Until then, retain the existing
             // head-plus-tail reduction order without padding the two-route
             // tail with duplicate zero-weight expert paths.
+            // A streamed layer posts its routes once, so it keeps them whole.
             const bool native_route_width =
                 !same_gpu_runtime ||
-                mixed_policy.native_route_width;
+                mixed_policy.native_route_width || streamed;
             if (lane_q > 1 && hybrid_cfg.n_expert_used > 4 && has_hot_routed &&
                 !native_route_width) {
                 const int route_width = hybrid_cfg.n_expert_used;
@@ -1089,7 +1156,7 @@ static bool ds4_build_fused_verify_graph(
                         routes.head_ids, routes.head_weights,
                         lane_q, inputs, true,
                         allow_fused_combine, join_mode,
-                        MoeHybridRouteBalance::Disabled)) {
+                        MoeHybridRouteBalance::Disabled, streamed)) {
                     return false;
                 }
                 ffn_out = inputs.output;
@@ -1103,7 +1170,7 @@ static bool ds4_build_fused_verify_graph(
                         routes.tail_ids, routes.tail_weights,
                         lane_q, inputs, false,
                         allow_fused_combine, join_mode,
-                        MoeHybridRouteBalance::Disabled)) {
+                        MoeHybridRouteBalance::Disabled, streamed)) {
                     return false;
                 }
                 ffn_out = ggml_add(ctx, ffn_out, inputs.output);
@@ -1115,7 +1182,10 @@ static bool ds4_build_fused_verify_graph(
                         hybrid->layers[(size_t) il],
                         ffn_normed, selected, router_weights,
                         lane_q, inputs, true, allow_fused_combine,
-                        join_mode)) {
+                        join_mode,
+                        streamed ? MoeHybridRouteBalance::Disabled
+                                 : MoeHybridRouteBalance::Allowed,
+                        streamed)) {
                     return false;
                 }
                 ffn_out = inputs.output;
@@ -1159,13 +1229,18 @@ static bool ds4_build_fused_verify_graph(
     GGML_ASSERT(mask_off == mask_total);
 
     // ── Batched output HC merge → out_norm + lm_head ──
-    ggml_tensor * onorm = ggml_rms_norm(ctx, hc_cur, w.hc_eps);
-    ggml_tensor * omix = ds4_mul_mat_columns(ctx, mc.fn_out_f16, onorm, projection_columns);
-    omix = ggml_reshape_2d(ctx, omix, ggml_nelements(omix) / q, q);
-    ggml_tensor * obase = ds4_fused_hc_base_f32(ctx, w.output_hc_base);
-    if (!obase || hc_out_weights.scale_data.empty()) return false;
-    ggml_tensor * final_all = ggml_ds4_hc_out(
-        ctx, omix, obase, hc_cur, n_hc, hc_out_weights.scale_data[0]);
+    ggml_tensor * final_all = nullptr;
+    if (w.hc_staggered_pre) {
+        final_all = ds4_build_hc_collapse(ctx, hc_cur, carried_pre, n_embd, n_hc);
+    } else {
+        ggml_tensor * onorm = ggml_rms_norm(ctx, hc_cur, w.hc_eps);
+        ggml_tensor * omix = ds4_mul_mat_columns(ctx, mc.fn_out_f16, onorm, projection_columns);
+        omix = ggml_reshape_2d(ctx, omix, ggml_nelements(omix) / q, q);
+        ggml_tensor * obase = ds4_fused_hc_base_f32(ctx, w.output_hc_base);
+        if (!obase || hc_out_weights.scale_data.empty()) return false;
+        final_all = ggml_ds4_hc_out(
+            ctx, omix, obase, hc_cur, n_hc, hc_out_weights.scale_data[0]);
+    }
     ggml_tensor * out_normed = build_rms_norm(ctx, final_all, w.out_norm, w.rms_eps);
     fg.logits = ds4_mul_mat_columns(ctx, w.output, out_normed, projection_columns);   // [n_vocab, q]
     ggml_set_output(fg.logits);
@@ -1306,10 +1381,10 @@ static bool ds4_build_fused_verify_graph(
         pin_main(ex.neg_q);
         pin_main(ex.rawrows);
         pin_main(ex.saved_rawrows);
-        pin_main(ex.ape4);
-        pin_main(ex.ape128);
-        pin_main(ex.st4);
-        pin_main(ex.st128);
+        for (const auto & rows : ex.ratio_rows) {
+            pin_main(rows.ape);
+            pin_main(rows.state);
+        }
         pin_main(fg.i32_bundle);
         pin_main(fg.i64_bundle);
         pin_main(fg.mask_bundle);
@@ -1323,6 +1398,7 @@ static bool ds4_build_fused_verify_graph(
             pin_main(px.state_row); pin_main(px.comp_pos);
         }
         for (ggml_tensor * hids : fg.hash_ids) pin_main(hids);
+        for (ggml_tensor * post : fg.stream_predict_posts) pin_peer(post);
         for (const MoeHybridGraphInputs & inputs : fg.hybrid_inputs) {
             if (mixed_policy.pin_route_weights) {
                 for (ggml_tensor * node : inputs.router_nodes) {
@@ -1341,6 +1417,8 @@ static bool ds4_build_fused_verify_graph(
             // remap, so keep it with that owner for every verifier width.
             pin_peer(inputs.cold_local_lut);
             pin_peer(inputs.cold_valid_lut);
+            pin_peer(inputs.stream_local_lut);
+            pin_peer(inputs.stream_valid_lut);
             for (ggml_tensor * node : inputs.hot_remap_nodes) {
                 pin_main(node);
             }
@@ -1467,8 +1545,9 @@ static int ds4_try_fused_verify_step(
     if (!hooks || !hooks->capture_layer_ids) return 0;
     if (n_tokens < 1 ||
         n_tokens > GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS) return 0;
-    if (!hc_out_weights.loaded || hc_out_weights.scale_data.empty() ||
-        !w.output_hc_fn || !w.output_hc_base) { vc.disabled = true; return 0; }
+    if (!w.hc_staggered_pre &&
+        (!hc_out_weights.loaded || hc_out_weights.scale_data.empty() ||
+         !w.output_hc_fn || !w.output_hc_base)) { vc.disabled = true; return 0; }
     for (int il = 0; il < w.n_layer; ++il) {
         const HcLayerWeightsCpu & hlw = hc_weights[(size_t) il];
         const DeepSeek4Layer & L = w.layers[(size_t) il];
@@ -1606,14 +1685,14 @@ static int ds4_try_fused_verify_step(
     ds4_fv_set(ex->rawrows, lv.data(), sizeof(int64_t) * q);
     for (int i = 0; i < q; ++i) iv[(size_t) i] = (int32_t) lv[(size_t) i];
     ds4_fv_set(ex->saved_rawrows, iv.data(), sizeof(int32_t) * q);
-    for (int i = 0; i < q; ++i) iv[(size_t) i] = (kv_start + i) % 4;
-    ds4_fv_set(ex->ape4, iv.data(), sizeof(int32_t) * q);
-    for (int i = 0; i < q; ++i) lv[(size_t) i] = 4 + (kv_start + i) % 4;
-    ds4_fv_set(ex->st4, lv.data(), sizeof(int64_t) * q);
-    for (int i = 0; i < q; ++i) iv[(size_t) i] = (kv_start + i) % 128;
-    ds4_fv_set(ex->ape128, iv.data(), sizeof(int32_t) * q);
-    for (int i = 0; i < q; ++i) lv[(size_t) i] = (kv_start + i) % 128;
-    ds4_fv_set(ex->st128, lv.data(), sizeof(int64_t) * q);
+    for (const auto & rows : ex->ratio_rows) {
+        for (int i = 0; i < q; ++i) iv[(size_t) i] = (kv_start + i) % rows.ratio;
+        ds4_fv_set(rows.ape, iv.data(), sizeof(int32_t) * q);
+        for (int i = 0; i < q; ++i) {
+            lv[(size_t) i] = ds4_compressor_state_row(rows.ratio, kv_start + i);
+        }
+        ds4_fv_set(rows.state, lv.data(), sizeof(int64_t) * q);
+    }
 
     std::vector<int32_t> i32v((size_t) w.n_layer * 2, 0);
     std::vector<int64_t> i64v((size_t) w.n_layer * 2, 0);
@@ -1810,9 +1889,22 @@ static int ds4_try_fused_verify_step(
         /*disable_graphs=*/capture_eager,
         /*mmvq_max_ncols=*/capture_cache && q == 1 ? 3 : 0,
         /*skip_property_check=*/force_verify_graph_replay);
-    const enum ggml_status compute_status = fg->sched
+    MoeStreamedMailbox * mailbox =
+        hybrid && hybrid->expert_cache ? hybrid->expert_cache->mailbox() : nullptr;
+    const std::vector<MoeStreamedMailbox::Job> stream_jobs =
+        mailbox ? ds4_fused_stream_jobs(*fg) : std::vector<MoeStreamedMailbox::Job>{};
+    if (!stream_jobs.empty()) mailbox->begin(stream_jobs, ds4_fused_invalid_route());
+    enum ggml_status compute_status = fg->sched
         ? ggml_backend_sched_graph_compute(fg->sched, fg->sg.gf)
         : ggml_backend_graph_compute(backend, fg->sg.gf);
+    if (!stream_jobs.empty()) {
+        std::string stream_error;
+        if (!mailbox->end(&stream_error)) {
+            std::fprintf(stderr, "[ds4-fused-verify] streamed experts: %s\n",
+                         stream_error.c_str());
+            compute_status = GGML_STATUS_FAILED;
+        }
+    }
     if (compute_status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[ds4-fused-verify] compute failed\n");
         return -1;
