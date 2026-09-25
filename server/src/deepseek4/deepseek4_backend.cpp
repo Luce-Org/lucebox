@@ -2174,6 +2174,21 @@ bool DeepSeek4Backend::init_streamed_expert_tier() {
             "expert ownership or the streamed expert cache\n");
         return false;
     }
+    if (promote_spare_rows_ > 0 && hybrid->expert_cache && hybrid->expert_cache->mailbox()) {
+        // The spare rows were reserved with the owner stacks; promotion only
+        // copies into them, it never allocates device memory while serving.
+        // Heat comes from the routes the fused graph posts to the mailbox.
+        MoeExpertPromoterOptions promote_opts;
+        promote_opts.device = cfg_.device.gpu;
+        if (expert_promoter_.init(*hybrid, w_.n_expert, promote_opts, &err)) {
+            hybrid->promoter = &expert_promoter_;
+            MoeExpertPromoter * promoter = &expert_promoter_;
+            hybrid->expert_cache->mailbox()->set_route_observer(
+                [promoter](int layer, const int32_t * ids, int n) { promoter->observe(layer, ids, n); });
+        } else {
+            std::fprintf(stderr, "[deepseek4] expert promotion disabled: %s\n", err.c_str());
+        }
+    }
     return true;
 }
 
@@ -2199,7 +2214,7 @@ bool DeepSeek4Backend::check_device_headroom() const {
     if (!ok) {
         std::fprintf(stderr, "[deepseek4] the configuration does not fit the devices with their "
                      "headroom; lower LUCE_EXPERT_BUDGET_MB / LUCE_EXPERT_SECONDARY_BUDGET_MB, "
-                     "--kv-pool-tokens or --max-ctx\n");
+                     "LUCE_EXPERT_PROMOTE_MB, --kv-pool-tokens or --max-ctx\n");
     }
     return ok;
 }
@@ -2614,6 +2629,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
 
     auto hybrid = std::make_shared<MoeHybridStorage>();
     const auto fail_hybrid_init = [&]() {
+        expert_promoter_.destroy();
         expert_cache_.destroy();
         stream_engine_.destroy();
         hybrid.reset();
@@ -2713,9 +2729,22 @@ bool DeepSeek4Backend::init_hybrid_model() {
         return fail_hybrid_init();
 #endif
     }
+    // LUCE_EXPERT_PROMOTE_MB reserves spare rows on the primary expert
+    // stacks (the same count in every layer) for experts that turn hot while
+    // serving (MoeExpertPromoter); 0 or unset keeps the placement static.
+    int spare_rows = 0;
+    if (const char * v = std::getenv("LUCE_EXPERT_PROMOTE_MB"); v && *v && inprocess_tp) {
+        size_t per_expert = 0;
+        for (const DeepSeek4Layer & L : w_.layers) {
+            for (const ggml_tensor * t : {L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps}) {
+                if (t) per_expert += ggml_nbytes(t) / (size_t) w_.n_expert;
+            }
+        }
+        if (per_expert > 0) spare_rows = (int) (((size_t) std::atoll(v) << 20) / per_expert);
+    }
     if (!build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
             cfg_.model_path, backend_, w_, moe_placement_, &hybrid_cfg,
-            *hybrid, &err, expert_backend_)) {
+            *hybrid, &err, expert_backend_, spare_rows)) {
         std::fprintf(stderr, "[deepseek4] failed to build hybrid expert storage: %s\n", err.c_str());
         return fail_hybrid_init();
     }
@@ -2831,6 +2860,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
         stream_cache_device_ = inprocess_tp && tp.secondary_backend == local_kind
             ? tp.secondary_gpu : cfg_.device.gpu;
     }
+    promote_spare_rows_ = spare_rows;
 
     moe_hybrid_ = std::move(hybrid);
     w_.moe_hybrid = true;
@@ -2888,6 +2918,7 @@ bool DeepSeek4Backend::park(ParkTarget target) {
     last_logits_pos_ = -1;
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
+    expert_promoter_.destroy();
     expert_cache_.destroy();
     stream_engine_.destroy();
     moe_hybrid_.reset();
@@ -2919,6 +2950,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
             vision_.reset();
             free_deepseek4_weights(w_);
+            expert_promoter_.destroy();
             expert_cache_.destroy();
             stream_engine_.destroy();
             moe_hybrid_.reset();
@@ -2939,6 +2971,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             free_deepseek4_cache(cache_);
             vision_.reset();
             free_deepseek4_weights(w_);
+            expert_promoter_.destroy();
             expert_cache_.destroy();
             stream_engine_.destroy();
             moe_hybrid_.reset();
@@ -2957,6 +2990,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             vision_.reset();
             free_deepseek4_weights(w_);
             expert_runtime_.reset();
+            expert_promoter_.destroy();
             expert_cache_.destroy();
             stream_engine_.destroy();
             moe_hybrid_.reset();
@@ -2976,6 +3010,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
     if (!validate_prefill_mode()) {
         vision_.reset();
         free_deepseek4_weights(w_);
+        expert_promoter_.destroy();
         expert_cache_.destroy();
         stream_engine_.destroy();
         moe_hybrid_.reset();
@@ -4160,6 +4195,7 @@ void DeepSeek4Backend::shutdown() {
     free_deepseek4_paged_cache(paged_cache_);
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
+    expert_promoter_.destroy();
     expert_cache_.destroy();
     stream_engine_.destroy();
     moe_hybrid_.reset();

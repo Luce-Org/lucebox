@@ -738,7 +738,8 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     const MoeHybridConfig *     cfg_override,
     MoeHybridStorage &          out,
     std::string *               err = nullptr,
-    ggml_backend_t              cold_gpu_backend = nullptr);
+    ggml_backend_t              cold_gpu_backend = nullptr,
+    int                         spare_rows = 0);
 
 // Attach each compact GPU owner tensor to the learned decode-table rows for
 // the global experts stored in that tensor.

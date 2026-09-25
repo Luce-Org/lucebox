@@ -5873,6 +5873,8 @@ struct DeepSeek4FusedDecodeGraph {
     ggml_tensor * mask_bundle = nullptr;   // additive score mask (0 / -1e30), may be null
     std::vector<ggml_tensor *> hash_ids;
     std::vector<MoeHybridGraphInputs> hybrid_inputs;
+    // Placement generation the owner lookup rows were last written for.
+    uint64_t lut_generation = 0;
     // Posts of each layer's predicted next-layer routes (streamed mailbox).
     std::vector<ggml_tensor *> stream_predict_posts;
     std::vector<AuthoritativeRouteOutput> authoritative_routes;
@@ -8650,16 +8652,6 @@ bool deepseek4_paged_gathered_step(
             physical_logical[(size_t)physical] = (int64_t)logical;
         }
     }
-    if (hybrid) {
-        for (size_t il = 0; il < hybrid->layers.size(); ++il) {
-            if (hybrid->layers[il].cache_slots > 0) {
-                std::fprintf(stderr,
-                    "[deepseek4-paged] layer %zu uses mutable expert-cache "
-                    "placement, which gathered serving cannot capture\n", il);
-                return false;
-            }
-        }
-    }
     const auto build_t0 = Ds4TimingClock::now();
     const DeepSeek4RoctxRange roctx_range(
         "ds4.paged_gathered_step",
@@ -8922,7 +8914,7 @@ bool deepseek4_paged_gathered_step(
         !hybrid ? GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS : 0,
         /*mmvq_batch_invariant=*/w.hc_staggered_pre);
     const enum ggml_status status =
-        ds4_fused_graph_compute(*fg, backend, hybrid, "deepseek4-paged");
+        ds4_fused_graph_compute(w, *fg, backend, hybrid, "deepseek4-paged");
     if (status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr,
             "[deepseek4-paged] gathered graph compute failed: status=%d\n",

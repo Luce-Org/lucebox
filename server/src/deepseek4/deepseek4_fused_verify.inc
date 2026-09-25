@@ -253,8 +253,17 @@ static std::vector<MoeStreamedMailbox::Job> ds4_fused_stream_jobs(
 // mailbox while it runs. A layer that could not be answered exactly fails
 // the launch.
 static enum ggml_status ds4_fused_graph_compute(
-        DeepSeek4FusedDecodeGraph & fg, ggml_backend_t backend, MoeHybridStorage * hybrid,
-        const char * who) {
+        const DeepSeek4Weights & w, DeepSeek4FusedDecodeGraph & fg, ggml_backend_t backend,
+        MoeHybridStorage * hybrid, const char * who) {
+    // Placement moves (MoeExpertPromoter) land between launches; the owner
+    // lookup rows follow them before this launch.
+    if (hybrid && hybrid->promoter) {
+        const uint64_t generation = hybrid->promoter->apply_pending();
+        if (generation != fg.lut_generation) {
+            ds4_fused_verify_refresh_hybrid_luts(w, hybrid, fg);
+            fg.lut_generation = generation;
+        }
+    }
     MoeStreamedMailbox * mailbox =
         hybrid && hybrid->expert_cache ? hybrid->expert_cache->mailbox() : nullptr;
     const std::vector<MoeStreamedMailbox::Job> jobs =
@@ -1609,6 +1618,7 @@ static bool ds4_build_fused_verify_graph(
         }
 
         ds4_fused_verify_refresh_hybrid_luts(w, hybrid, fg);
+        fg.lut_generation = hybrid->promoter ? hybrid->promoter->generation() : 0;
     } else {
         if (!fg.sg.alloc) {
             fg.sg.alloc = ggml_gallocr_new(
@@ -1673,21 +1683,6 @@ static int ds4_try_fused_verify_step(
             !L.hc_attn_fn || !L.hc_ffn_fn || !L.hc_attn_base || !L.hc_ffn_base) {
             vc.disabled = true;
             return 0;
-        }
-    }
-    // A fused graph snapshots the global-to-local expert LUTs when it is built.
-    // DeepSeek currently uses fixed placement, but the common storage type also
-    // supports mutable LRU slots for other models. Fail closed if that feature
-    // is ever enabled here until cache-generation invalidation is implemented.
-    if (hybrid) {
-        for (const MoeHybridLayerStorage & layer : hybrid->layers) {
-            if (layer.cache_slots > 0) {
-                std::fprintf(stderr,
-                    "[ds4-fused-verify] mutable expert cache unsupported; "
-                    "using dynamic verifier\n");
-                vc.disabled = true;
-                return 0;
-            }
         }
     }
     ggml_backend_t peer_backend = hybrid ? hybrid->cold_backend : nullptr;
@@ -2011,7 +2006,7 @@ static int ds4_try_fused_verify_step(
         /*ds4_mix_mmv_max_tokens=*/0,
         /*mmvq_batch_invariant=*/n_lanes > 1);
     const enum ggml_status compute_status =
-        ds4_fused_graph_compute(*fg, backend, hybrid, "ds4-fused-verify");
+        ds4_fused_graph_compute(w, *fg, backend, hybrid, "ds4-fused-verify");
     if (compute_status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[ds4-fused-verify] compute failed\n");
         return -1;

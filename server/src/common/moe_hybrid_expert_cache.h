@@ -29,8 +29,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -93,6 +95,12 @@ public:
     // Starts answering one launch: `jobs` in the graph's execution order.
     // Rows of experts that are not resident read `invalid_route`.
     void begin(const std::vector<Job> & jobs, int32_t invalid_route);
+    // Called by the resolver thread with each layer's posted routes
+    // ([n_expert_used * n_tokens] global ids), e.g. to learn expert heat.
+    // Set while no launch is being answered.
+    void set_route_observer(std::function<void(int layer, const int32_t * ids, int n)> fn) {
+        observer_ = std::move(fn);
+    }
     // After the launch completed (or failed): waits for the resolver and
     // releases the launch's slots. False with *err when a layer could not be
     // answered exactly (a load failed or its experts exceed the pool).
@@ -119,6 +127,7 @@ private:
     bool launch_done_ = false; // end() was called for it
     bool stopping_ = false;
     std::string error_;
+    std::function<void(int, const int32_t *, int)> observer_;
 };
 
 class MoeStreamedExpertCache {
@@ -300,6 +309,89 @@ private:
 
     std::map<std::tuple<int, int, int>, Graph> graphs_;
     MoeStreamedMailbox mailbox_;
+};
+
+// Moves experts that became hot onto the primary owner's spare rows (the
+// owner stack is allocated with `cache_slots` spare entries per layer, see
+// MoeHybridLayerStorage) and demotes ones that cooled down, in the
+// background. Heat is a decayed count of each expert's routes. A copy runs on
+// its own low-priority stream from the model file, rate limited; placement
+// changes (the owner maps) are applied only between graph launches
+// (apply_pending), so a launch always sees one consistent placement: the
+// routes a token takes never change, only which owner computes an expert.
+// Pinned experts (the calibration-placed primary set) never move.
+struct MoeExpertPromoterOptions {
+    int    device = 0;                 // GPU that holds the primary stacks
+    double max_bytes_per_s = 1.0e9;    // background copy budget
+    double decay = 0.97;               // heat kept per rebalance tick
+    int    tick_ms = 50;
+    double min_heat = 4.0;             // an expert must be at least this hot
+    double hysteresis = 1.5;           // challenger heat / resident heat to swap
+};
+
+class MoeExpertPromoter {
+public:
+    MoeExpertPromoter() = default;
+    ~MoeExpertPromoter();
+    MoeExpertPromoter(const MoeExpertPromoter &) = delete;
+    MoeExpertPromoter & operator=(const MoeExpertPromoter &) = delete;
+
+    // `storage` must have spare rows (cache_slots) on the primary stacks and
+    // the model file mapping; it must outlive the promoter.
+    bool init(MoeHybridStorage & storage, int n_expert, const MoeExpertPromoterOptions & opts,
+              std::string * err = nullptr);
+    void destroy();
+    bool ready() const { return storage_ != nullptr; }
+
+    // Any thread: routes one layer took (global expert ids, negatives skipped).
+    void observe(int layer, const int32_t * ids, int n);
+    // Launching thread, between graph launches: applies finished promotions
+    // and requested demotions to the owner maps. Returns the placement
+    // generation, which changes whenever the maps did.
+    uint64_t apply_pending();
+    uint64_t generation() const { return generation_; }
+
+    struct Stats {
+        uint64_t promoted = 0;
+        uint64_t demoted = 0;
+        uint64_t bytes = 0;
+        int      resident = 0;   // spare rows holding an expert
+    };
+    Stats stats() const;
+
+private:
+    enum class RowState : uint8_t { Free, Loading, Ready, Active, Leaving };
+    struct Row {
+        int32_t expert = -1;
+        RowState state = RowState::Free;
+    };
+    struct Change {
+        int layer = -1;
+        int row = -1;
+        bool promote = false;
+    };
+    void worker();
+    bool copy_expert(int layer, int row, int expert);
+
+    MoeHybridStorage * storage_ = nullptr;
+    MoeExpertPromoterOptions opts_;
+    int n_layer_ = 0;
+    int n_expert_ = 0;
+    std::unique_ptr<std::atomic<uint32_t>[]> hits_;   // [layer * n_expert]
+    std::vector<float> heat_;                         // worker only
+    std::vector<uint8_t> pinned_;                     // [layer * n_expert] calibration-placed
+    void * staging_ = nullptr;                        // pinned, one expert
+    size_t staging_bytes_ = 0;
+    void * stream_ = nullptr;                         // cudaStream_t
+
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    std::vector<std::vector<Row>> rows_;              // [layer][spare row]
+    std::vector<Change> pending_;
+    uint64_t generation_ = 0;
+    Stats stats_;
+    bool stopping_ = false;
+    std::thread thread_;
 };
 
 }  // namespace luce::common

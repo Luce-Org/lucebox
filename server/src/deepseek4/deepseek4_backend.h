@@ -240,7 +240,9 @@ private:
     MoeHybridPlacement                moe_decode_placement_;
     MoeHybridStreamEngine             stream_engine_;
     MoeStreamedExpertCache            expert_cache_;
+    MoeExpertPromoter                 expert_promoter_;
     int                               stream_cache_device_ = -1;
+    int                               promote_spare_rows_ = 0;
     MoeExpertComputeRuntime            expert_runtime_;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string                       routing_stats_out_path_;

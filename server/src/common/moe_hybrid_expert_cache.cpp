@@ -11,6 +11,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 #if !defined(_WIN32)
 #include <sys/mman.h>
@@ -983,6 +984,7 @@ bool MoeStreamedMailbox::answer(const Job & job, uint32_t step, std::string * er
     const Channel & c = channels_[(size_t) job.layer];
     const int n_routes = std::min(job.n_routes, n_expert_used_ * kMaxTokens);
     const int n_tokens = std::max(1, std::min(job.n_tokens, kMaxTokens));
+    if (observer_) observer_(job.layer, c.ids, n_routes);
     slot_of_.assign((size_t) n_expert_, -1);
     const bool ok = cache_->acquire(job.layer, c.ids, n_routes, slot_of_, err);
     for (int e = 0; e < n_expert_; ++e) {
@@ -996,6 +998,263 @@ bool MoeStreamedMailbox::answer(const Job & job, uint32_t step, std::string * er
     }
     mailbox_store(c.answered, step);
     return ok;
+}
+
+
+// ── Promoter ────────────────────────────────────────────────────────────
+
+MoeExpertPromoter::~MoeExpertPromoter() {
+    destroy();
+}
+
+bool MoeExpertPromoter::init(MoeHybridStorage & storage, int n_expert,
+                             const MoeExpertPromoterOptions & opts, std::string * err) {
+    destroy();
+    const auto fail = [&](const std::string & msg) {
+        if (err) *err = msg;
+        destroy();
+        return false;
+    };
+    if (!storage.has_mmap() || storage.layer_regions.size() != storage.layers.size() || n_expert <= 0) {
+        return fail("expert promotion needs the model file mapping and per-layer regions");
+    }
+    n_layer_ = (int) storage.layers.size();
+    n_expert_ = n_expert;
+    rows_.assign((size_t) n_layer_, {});
+    pinned_.assign((size_t) n_layer_ * n_expert, 0);
+    int total_rows = 0;
+    for (int il = 0; il < n_layer_; ++il) {
+        const MoeHybridLayerStorage & st = storage.layers[(size_t) il];
+        if (st.cache_slots <= 0 || st.hot_local_by_global.size() != (size_t) n_expert) continue;
+        if (!(st.gate_up_hot || (st.gate_hot && st.up_hot)) || !st.down_hot) continue;
+        rows_[(size_t) il].assign((size_t) st.cache_slots, Row{});
+        total_rows += st.cache_slots;
+        for (int e = 0; e < n_expert; ++e) {
+            pinned_[(size_t) il * n_expert + e] = st.hot_local_by_global[(size_t) e] >= 0;
+        }
+        const LayerExpertRegions & r = storage.layer_regions[(size_t) il];
+        staging_bytes_ = std::max(staging_bytes_, r.fused_gate_up
+            ? r.expert_bytes_gate_up + r.expert_bytes_down
+            : r.expert_bytes_gate + r.expert_bytes_up + r.expert_bytes_down);
+    }
+    if (total_rows == 0) return fail("no spare rows on the primary expert stacks");
+    storage_ = &storage;
+    opts_ = opts;
+    hits_.reset(new std::atomic<uint32_t>[(size_t) n_layer_ * n_expert]);
+    for (size_t i = 0; i < (size_t) n_layer_ * n_expert; ++i) hits_[i].store(0, std::memory_order_relaxed);
+    heat_.assign((size_t) n_layer_ * n_expert, 0.0f);
+    cudaSetDevice(opts_.device);
+    if (cudaMallocHost(&staging_, staging_bytes_) != cudaSuccess) {
+        staging_ = nullptr;
+        return fail("failed to allocate pinned promotion staging");
+    }
+    int lowest = 0, highest = 0;
+    cudaDeviceGetStreamPriorityRange(&lowest, &highest);
+    cudaStream_t stream = nullptr;
+    if (cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, lowest) != cudaSuccess) {
+        return fail("failed to create the promotion stream");
+    }
+    stream_ = stream;
+    stopping_ = false;
+    thread_ = std::thread(&MoeExpertPromoter::worker, this);
+    std::fprintf(stderr, "[moe-promote] %d spare rows on device %d, copy budget %.2f GB/s\n",
+                 total_rows, opts_.device, opts_.max_bytes_per_s / 1.0e9);
+    return true;
+}
+
+void MoeExpertPromoter::destroy() {
+    if (thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+    if (stream_) cudaStreamDestroy(static_cast<cudaStream_t>(stream_));
+    stream_ = nullptr;
+    if (staging_) cudaFreeHost(staging_);
+    staging_ = nullptr;
+    staging_bytes_ = 0;
+    hits_.reset();
+    heat_.clear();
+    pinned_.clear();
+    rows_.clear();
+    pending_.clear();
+    storage_ = nullptr;
+    stats_ = {};
+}
+
+void MoeExpertPromoter::observe(int layer, const int32_t * ids, int n) {
+    if (!hits_ || layer < 0 || layer >= n_layer_) return;
+    std::atomic<uint32_t> * row = hits_.get() + (size_t) layer * n_expert_;
+    for (int i = 0; i < n; ++i) {
+        if (ids[i] >= 0 && ids[i] < n_expert_) row[ids[i]].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+MoeExpertPromoter::Stats MoeExpertPromoter::stats() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return stats_;
+}
+
+uint64_t MoeExpertPromoter::apply_pending() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (pending_.empty()) return generation_;
+    for (const Change & c : pending_) {
+        MoeHybridLayerStorage & st = storage_->layers[(size_t) c.layer];
+        Row & row = rows_[(size_t) c.layer][(size_t) c.row];
+        const int32_t local = c.promote ? st.hot_active + c.row : -1;
+        st.hot_local_by_global[(size_t) row.expert] = local;
+        if (!st.decode_hot_local_by_global.empty()) {
+            st.decode_hot_local_by_global[(size_t) row.expert] = local;
+        }
+        st.spare_global[(size_t) c.row] = c.promote ? row.expert : -1;
+        if (c.promote) {
+            st.set_expert_hot(row.expert);
+            row.state = RowState::Active;
+            ++stats_.promoted;
+            ++stats_.resident;
+            if (stats_.promoted % 64 == 0) {
+                std::fprintf(stderr, "[moe-promote] promoted %llu, demoted %llu, resident %d, %.2f GiB copied\n",
+                             (unsigned long long) stats_.promoted, (unsigned long long) stats_.demoted,
+                             stats_.resident, stats_.bytes / 1073741824.0);
+            }
+        } else {
+            st.clear_expert_hot(row.expert);
+            row = Row{};
+            ++stats_.demoted;
+            --stats_.resident;
+        }
+    }
+    pending_.clear();
+    ++generation_;
+    cv_.notify_all();
+    return generation_;
+}
+
+// Copies one expert from the model file into a spare row of the primary
+// stacks. The row is not referenced by any owner map while this runs.
+bool MoeExpertPromoter::copy_expert(int layer, int row, int expert) {
+    const MoeHybridLayerStorage & st = storage_->layers[(size_t) layer];
+    const ExpertRanges r = expert_ranges(storage_->layer_regions[(size_t) layer], expert);
+    const auto * file = static_cast<const uint8_t *>(storage_->mmap_data);
+    ggml_tensor * dst_t[3] = {
+        st.gate_up_hot ? st.gate_up_hot : st.gate_hot,
+        st.gate_up_hot ? nullptr : st.up_hot,
+        st.down_hot,
+    };
+    auto * staging = static_cast<uint8_t *>(staging_);
+    const size_t hot_row = (size_t) st.hot_active + (size_t) row;
+    size_t at = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (r.size[i] == 0) continue;
+        if (!dst_t[i] || r.off[i] + r.size[i] > storage_->mmap_size ||
+            at + r.size[i] > staging_bytes_ || (hot_row + 1) * r.size[i] > ggml_nbytes(dst_t[i])) {
+            return false;
+        }
+        std::memcpy(staging + at, file + r.off[i], r.size[i]);
+        if (cudaMemcpyAsync(static_cast<uint8_t *>(dst_t[i]->data) + hot_row * r.size[i],
+                            staging + at, r.size[i], cudaMemcpyHostToDevice,
+                            static_cast<cudaStream_t>(stream_)) != cudaSuccess) {
+            return false;
+        }
+        at += r.size[i];
+    }
+    if (cudaStreamSynchronize(static_cast<cudaStream_t>(stream_)) != cudaSuccess) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    stats_.bytes += at;
+    return true;
+}
+
+// Each tick: fold the new route counts into the decayed heat, then make at
+// most one move: load the hottest non-resident expert of a layer into a free
+// row, or, when the layer has none, ask for its coolest promoted expert to
+// leave if the challenger is clearly hotter. Moves are paced to the copy
+// budget.
+void MoeExpertPromoter::worker() {
+    cudaSetDevice(opts_.device);
+    std::unique_lock<std::mutex> lk(mu_);
+    while (!stopping_) {
+        cv_.wait_for(lk, std::chrono::milliseconds(opts_.tick_ms));
+        if (stopping_) break;
+        if (!pending_.empty()) continue;   // wait until the last move is applied
+        lk.unlock();
+        const float decay = (float) opts_.decay;
+        for (size_t i = 0; i < heat_.size(); ++i) {
+            heat_[i] = heat_[i] * decay + (float) hits_[i].exchange(0, std::memory_order_relaxed);
+        }
+        lk.lock();
+        int best_layer = -1, best_expert = -1, target_row = -1;
+        bool evict = false;
+        float best_gain = 0.0f;
+        for (int il = 0; il < n_layer_; ++il) {
+            std::vector<Row> & rows = rows_[(size_t) il];
+            if (rows.empty()) continue;
+            int free_row = -1, cool_row = -1;
+            float cool_heat = 0.0f;
+            bool busy = false;
+            for (int k = 0; k < (int) rows.size(); ++k) {
+                const Row & row = rows[(size_t) k];
+                if (row.state == RowState::Free) {
+                    if (free_row < 0) free_row = k;
+                } else if (row.state == RowState::Active) {
+                    const float h = heat_[(size_t) il * n_expert_ + row.expert];
+                    if (cool_row < 0 || h < cool_heat) { cool_row = k; cool_heat = h; }
+                } else {
+                    busy = true;
+                }
+            }
+            if (busy) continue;
+            int cand = -1;
+            float cand_heat = (float) opts_.min_heat;
+            for (int e = 0; e < n_expert_; ++e) {
+                const size_t i = (size_t) il * n_expert_ + e;
+                if (pinned_[i] || heat_[i] <= cand_heat) continue;
+                bool resident = false;
+                for (const Row & row : rows) resident = resident || row.expert == e;
+                if (resident) continue;
+                cand = e;
+                cand_heat = heat_[i];
+            }
+            if (cand < 0) continue;
+            if (free_row >= 0) {
+                if (cand_heat > best_gain) {
+                    best_gain = cand_heat; best_layer = il; best_expert = cand;
+                    target_row = free_row; evict = false;
+                }
+            } else if (cool_row >= 0 && cand_heat > cool_heat * (float) opts_.hysteresis &&
+                       cand_heat - cool_heat > best_gain) {
+                best_gain = cand_heat - cool_heat; best_layer = il; best_expert = cand;
+                target_row = cool_row; evict = true;
+            }
+        }
+        if (best_layer < 0) continue;
+        Row & row = rows_[(size_t) best_layer][(size_t) target_row];
+        if (evict) {
+            row.state = RowState::Leaving;
+            pending_.push_back({best_layer, target_row, false});
+            continue;   // the row is free once the demotion is applied
+        }
+        row.expert = best_expert;
+        row.state = RowState::Loading;
+        lk.unlock();
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = copy_expert(best_layer, target_row, best_expert);
+        // Pace to the copy budget: one expert per bytes / budget seconds.
+        const double budget_s = (double) staging_bytes_ / opts_.max_bytes_per_s;
+        const double spent_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (spent_s < budget_s) {
+            std::this_thread::sleep_for(std::chrono::duration<double>(budget_s - spent_s));
+        }
+        lk.lock();
+        if (!ok) {
+            row = Row{};
+            continue;
+        }
+        row.state = RowState::Ready;
+        pending_.push_back({best_layer, target_row, true});
+    }
 }
 
 }  // namespace luce::common

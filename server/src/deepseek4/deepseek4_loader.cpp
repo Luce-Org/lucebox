@@ -2720,7 +2720,8 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
         const MoeHybridConfig * cfg_override,
         MoeHybridStorage & out,
         std::string * err,
-        ggml_backend_t cold_gpu_backend) {
+        ggml_backend_t cold_gpu_backend,
+        int spare_rows) {
     ggml_context * expert_meta = nullptr;
     gguf_init_params gip{};
     gip.no_alloc = true;
@@ -2788,7 +2789,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     const MoeHybridConfig cfg = cfg_override ? *cfg_override : make_ds4_moe_hybrid_config(w);
     const bool ok = build_moe_hybrid_storage_from_file_with_mmap(
         cfg, backend, placement, layer_descs, layer_file_data,
-        mmap.addr, mmap.len, out, err, 0, cold_gpu_backend
+        mmap.addr, mmap.len, out, err, spare_rows, cold_gpu_backend
 #if defined(__linux__)
         , ds4_image_capable(w) ? mmap.fd : -1
 #endif
