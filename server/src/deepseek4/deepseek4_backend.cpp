@@ -1547,12 +1547,13 @@ void DeepSeek4Backend::log_route_counts(const char * phase) {
         const MoeStreamedExpertCache::Stats cs = expert_cache_.stats();
         const double used = (double) std::max<uint64_t>(1, cs.experts);
         std::fprintf(stderr, "[deepseek4] %s routed calls: %" PRIu64 " primary %.1f%%, secondary %.1f%%, "
-                     "streamed %.1f%%; streamed %" PRIu64 " experts, cache hit %.1f%% (prefetched %.1f%%), "
+                     "streamed %.1f%%; streamed %" PRIu64 " experts, cache hit %.1f%% (prefetched %.1f%%, warm %.1f%%), "
                      "loaded %" PRIu64 " (%" PRIu64 " by prefetch) %.2f GiB: read %.0f ms, upload %.0f ms, "
                      "wait %.0f ms, compute %.0f ms; prefetch accuracy %.1f%% of %" PRIu64 "\n",
                      phase, c.total(), 100.0 * (double) c.primary / total,
                      100.0 * (double) c.secondary / total, 100.0 * (double) c.streamed / total,
                      cs.experts, 100.0 * (double) cs.hits / used, 100.0 * (double) cs.prefetch_hits / used,
+                     100.0 * (double) cs.warm_hits / used,
                      cs.loads, cs.prefetched, gib(cs.bytes), cs.read_us / 1000.0, cs.upload_us / 1000.0,
                      cs.wait_us / 1000.0, cs.compute_us / 1000.0,
                      100.0 * (double) cs.predicted_used / (double) std::max<uint64_t>(1, cs.predicted_of),
@@ -2736,6 +2737,14 @@ bool DeepSeek4Backend::init_hybrid_model() {
         if (!(cache_mb && *cache_mb && cache_opts.pool_bytes == 0)) {
             if (init_deepseek4_streamed_expert_cache(w_, *hybrid, cache_opts, expert_cache_, &err)) {
                 hybrid->expert_cache = &expert_cache_;
+                // Start with the most used streamed experts resident; the
+                // loaders fill the pool while the server comes up.
+                MoeHybridRoutingStats usage;
+                const char * usage_path = ds4_usage_profile_path();
+                std::string usage_err;
+                if (usage_path && MoeHybridRoutingStats::load_csv(usage_path, usage, &usage_err)) {
+                    expert_cache_.warm(usage);
+                }
             } else {
                 std::fprintf(stderr, "[deepseek4] streamed expert cache disabled: %s\n", err.c_str());
             }

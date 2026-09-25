@@ -11,9 +11,12 @@
 // its own stream, so reading one expert overlaps uploading another. Callers
 // can stage a layer's misses early and prefetch predicted experts of a later
 // layer; both only change when bytes move, never which experts are computed.
+// So does the warm start, which fills the empty pool after load with the
+// experts a usage profile ranks highest.
 
 #pragma once
 
+#include "moe_hybrid_routing_stats.h"
 #include "moe_hybrid_storage.h"
 #include "moe_hybrid_types.h"
 
@@ -21,6 +24,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -148,6 +152,12 @@ public:
     // eval() can report its accuracy.
     void prefetch(int layer, const int32_t * experts, int n);
 
+    // Fills empty slots in the background with the streamed experts `usage`
+    // counts most often, most used first. Loaders take these only while no
+    // other load waits, and a warm load never evicts a slot, so a request
+    // that starts meanwhile is only ever sped up. Returns the number queued.
+    int warm(const MoeHybridRoutingStats & usage);
+
     // Adds the weighted output of the streamed routes to out
     // ([n_embd, n_tokens], host). `selected` / `weights` are [n_used,
     // n_tokens]; routes the storage does not stream are skipped.
@@ -182,6 +192,7 @@ public:
         uint64_t experts       = 0;  // streamed experts computed
         uint64_t hits          = 0;  // ... already cached or prefetched when needed
         uint64_t prefetch_hits = 0;  // ... of which a prefetch loaded
+        uint64_t warm_hits     = 0;  // ... of which the warm start loaded
         uint64_t loads         = 0;  // experts loaded into a slot
         uint64_t bytes         = 0;  // bytes loaded
         uint64_t prefetched    = 0;  // loads issued by prefetch()
@@ -203,6 +214,7 @@ private:
         SlotState state = SlotState::Empty;
         bool      demand = false;      // loaded because a layer needed it, unused
         bool      prefetched = false;  // loaded by prefetch, unused
+        bool      warm = false;        // loaded by the warm start, unused
         int       pins = 0;
         uint64_t  last_use = 0;
     };
@@ -239,6 +251,9 @@ private:
     // Drops the pins stage() took for `layer`.
     void release_staged(int layer);
     int  evict_locked();
+    // Caller holds mu_. Claims an empty slot for the next warm expert and
+    // marks it loading; -1 when the warm list is done or no slot is empty.
+    int  next_warm_locked();
     void loader_main(Loader * self);
     bool load_slot(Loader & loader, int slot, uint64_t * read_us, uint64_t * upload_us);
     Graph * graph_for(int view, const MoeLayerDesc & desc, int n_routes, int n_tokens,
@@ -267,6 +282,11 @@ private:
     std::vector<Slot> slots_;
     std::unordered_map<uint64_t, int> slot_of_;
     std::deque<int> jobs_;
+    std::vector<uint64_t> warm_;       // warm start keys, most used first
+    size_t warm_next_ = 0;
+    int warm_loading_ = 0;
+    uint64_t warm_loads_ = 0, warm_bytes_ = 0;
+    std::chrono::steady_clock::time_point warm_t0_;
     uint64_t tick_ = 0;
     bool stopping_ = false;
     std::vector<std::vector<int32_t>> predicted_;  // per layer, until its eval

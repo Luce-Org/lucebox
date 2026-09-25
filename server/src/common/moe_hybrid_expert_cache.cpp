@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 
@@ -249,6 +250,10 @@ void MoeStreamedExpertCache::destroy() {
     slots_.clear();
     slot_of_.clear();
     jobs_.clear();
+    warm_.clear();
+    warm_next_ = 0;
+    warm_loading_ = 0;
+    warm_loads_ = warm_bytes_ = 0;
     predicted_.clear();
     staged_.clear();
     staged_layer_ = -1;
@@ -280,18 +285,47 @@ void MoeStreamedExpertCache::loader_main(Loader * self) {
     cudaStreamCreateWithFlags(&self->stream, cudaStreamNonBlocking);
     std::unique_lock<std::mutex> lk(mu_);
     while (true) {
-        cv_.wait(lk, [&] { return stopping_ || !jobs_.empty(); });
+        cv_.wait(lk, [&] { return stopping_ || !jobs_.empty() || warm_next_ < warm_.size(); });
         if (stopping_) break;
-        const int slot = jobs_.front();
-        jobs_.pop_front();
+        // Demand and prefetch loads first; the warm start only fills idle time.
+        const bool warm = jobs_.empty();
+        int slot;
+        const auto report_warm = [&] {
+            if (warm_loading_ > 0 || warm_next_ < warm_.size() || warm_loads_ == 0) return;
+            const double ms = elapsed_us(warm_t0_, Clock::now()) / 1000.0;
+            std::fprintf(stderr,
+                         "[moe-stream] warm start: %" PRIu64 " experts %.2f GiB in %.0f ms (%.2f GB/s)\n",
+                         warm_loads_, warm_bytes_ / 1073741824.0, ms,
+                         ms > 0 ? warm_bytes_ / (ms * 1e6) : 0.0);
+            warm_loads_ = 0;
+        };
+        if (warm) {
+            if ((slot = next_warm_locked()) < 0) {
+                report_warm();
+                continue;
+            }
+        } else {
+            slot = jobs_.front();
+            jobs_.pop_front();
+        }
         lk.unlock();
         uint64_t read_us = 0, upload_us = 0;
         const bool ok = load_slot(*self, slot, &read_us, &upload_us);
         lk.lock();
         slots_[(size_t) slot].state = SlotState::Ready;
-        stats_.read_us += read_us;
-        stats_.upload_us += upload_us;
-        if (!ok && failed_.empty()) {
+        if (warm) {
+            --warm_loading_;
+            report_warm();
+        } else {
+            stats_.read_us += read_us;
+            stats_.upload_us += upload_us;
+        }
+        Slot & s = slots_[(size_t) slot];
+        if (!ok && s.warm && s.pins == 0) {
+            // Nobody needs it yet: a failed warm load just leaves the slot empty.
+            slot_of_.erase(key(s.layer, s.expert));
+            s = Slot{};
+        } else if (!ok && failed_.empty()) {
             failed_ = "failed to load expert " + std::to_string(slots_[(size_t) slot].expert) +
                       " of layer " + std::to_string(slots_[(size_t) slot].layer);
         }
@@ -349,6 +383,70 @@ int MoeStreamedExpertCache::evict_locked() {
         if (best < 0 || s.last_use < slots_[(size_t) best].last_use) best = i;
     }
     return best;
+}
+
+int MoeStreamedExpertCache::warm(const MoeHybridRoutingStats & usage) {
+    if (!ready() || usage.n_layer != (int) storage_->layers.size() || usage.n_expert != cfg_.n_expert ||
+        usage.empty()) {
+        return 0;
+    }
+    struct Ranked { uint64_t count; int layer; int expert; };
+    std::vector<Ranked> ranked;
+    for (int il = 0; il < usage.n_layer; ++il) {
+        const MoeHybridLayerStorage & st = storage_->layers[(size_t) il];
+        if (st.n_streamed == 0) continue;
+        for (int e = 0; e < usage.n_expert; ++e) {
+            const uint64_t c = usage.count(il, e);
+            if (c > 0 && st.is_streamed(e)) ranked.push_back({c, il, e});
+        }
+    }
+    const size_t n = std::min(ranked.size(), (size_t) n_slots_);
+    std::partial_sort(ranked.begin(), ranked.begin() + (ptrdiff_t) n, ranked.end(),
+                      [](const Ranked & a, const Ranked & b) { return a.count > b.count; });
+    uint64_t all = 0, kept = 0;
+    for (size_t i = 0; i < ranked.size(); ++i) (i < n ? kept : all) += ranked[i].count;
+    all += kept;
+    std::fprintf(stderr,
+                 "[moe-stream] warm start: %zu of %zu profiled streamed experts, %.1f%% of their routes\n",
+                 n, ranked.size(), all ? 100.0 * (double) kept / (double) all : 0.0);
+    std::lock_guard<std::mutex> lk(mu_);
+    warm_.clear();
+    for (size_t i = 0; i < n; ++i) warm_.push_back(key(ranked[i].layer, ranked[i].expert));
+    warm_next_ = 0;
+    warm_loads_ = warm_bytes_ = 0;
+    warm_t0_ = Clock::now();
+    // Warm slots count as used before anything a request touches, the most
+    // used one last, so eviction takes the least used warm experts first.
+    tick_ = std::max<uint64_t>(tick_, warm_.size());
+    cv_.notify_all();
+    return (int) warm_.size();
+}
+
+int MoeStreamedExpertCache::next_warm_locked() {
+    while (warm_next_ < warm_.size()) {
+        const size_t rank = warm_next_++;
+        const uint64_t k = warm_[rank];
+        if (slot_of_.count(k)) continue;  // a request loaded it already
+        const int slot = evict_locked();
+        if (slot < 0 || slots_[(size_t) slot].state != SlotState::Empty) {
+            warm_next_ = warm_.size();  // the pool is full: never evict for it
+            return -1;
+        }
+        Slot & s = slots_[(size_t) slot];
+        s = Slot{};
+        s.layer = (int32_t) (k >> 32);
+        s.expert = (int32_t) (uint32_t) k;
+        s.state = SlotState::Loading;
+        s.warm = true;
+        s.last_use = warm_.size() - rank;
+        slot_of_[k] = slot;
+        const ExpertRanges r = expert_ranges(storage_->layer_regions[(size_t) s.layer], s.expert);
+        ++warm_loading_;
+        ++warm_loads_;
+        warm_bytes_ += r.size[0] + r.size[1] + r.size[2];
+        return slot;
+    }
+    return -1;
 }
 
 int MoeStreamedExpertCache::lookup_or_load_locked(int layer, int expert, bool front, bool * hit) {
@@ -492,7 +590,8 @@ bool MoeStreamedExpertCache::pin_ready_locked(std::unique_lock<std::mutex> & lk,
         ++s.pins;
         if (!s.demand) ++stats_.hits;
         if (s.prefetched) ++stats_.prefetch_hits;
-        s.demand = s.prefetched = false;
+        if (s.warm) ++stats_.warm_hits;
+        s.demand = s.prefetched = s.warm = false;
         slots.push_back(slot);
     }
     const auto t0 = Clock::now();
