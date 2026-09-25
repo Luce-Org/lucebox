@@ -3,6 +3,9 @@
 #include "common.cuh"
 #include "ggml-cuda.h"
 
+// Descriptors per kernel launch.
+constexpr int ggml_cuda_copy_batch_max = 48;
+
 // Stream-ordered copies of independent {src, dst, nbytes} descriptors, one
 // kernel launch per 48 descriptors. Destinations must not overlap each other
 // or any source in the same call.

@@ -3929,6 +3929,12 @@ static bool ggml_cuda_cluster_capture_allowed() {
     return allowed;
 }
 
+// View-like and empty nodes: the evaluation loops launch nothing for them.
+static bool ggml_cuda_node_launches_nothing(const ggml_tensor * node) {
+    return ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+        node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -3945,7 +3951,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_BIAS_BF16 || node->op == GGML_OP_RMS_NORM_VISION_F32 ||
             node->op == GGML_OP_SOFT_MAX_VISION_F32 || node->op == GGML_OP_MUL_MAT_VISION_AV_F32) return false;
 
-        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+        if (ggml_cuda_node_launches_nothing(node)) {
             continue;
         }
 
@@ -4649,11 +4655,15 @@ static bool ggml_cuda_byte_ranges_overlap(const void * a, size_t an, const void 
     return pa < pb + bn && pb < pa + an;
 }
 
-// Nodes that launch nothing; a copy run may step over them.
+// Nodes the evaluation loops skip; a copy run may step over them.
 static bool ggml_cuda_node_is_noop(const ggml_tensor * node) {
-    return ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-        node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
-        (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+    return ggml_cuda_node_launches_nothing(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+}
+
+static thread_local size_t g_copy_batch_run_count = 0;
+
+size_t ggml_backend_cuda_get_copy_batch_run_count(void) {
+    return g_copy_batch_run_count;
 }
 
 // Starting at plain copy node i, gather the following plain copies whose byte
@@ -4662,7 +4672,7 @@ static bool ggml_cuda_node_is_noop(const ggml_tensor * node) {
 // launch. Returns the index of the last node consumed, or -1 when the run has
 // a single copy and the normal path should handle it.
 static int ggml_cuda_try_batch_copies(ggml_cgraph * cgraph, int i, cudaStream_t stream) {
-    constexpr int kMaxRun = 96;
+    constexpr int kMaxRun = ggml_cuda_copy_batch_max;  // one run, one launch
     ggml_cuda_copy_desc descs[kMaxRun];
     int n = 0;
     int last = -1;
@@ -4694,6 +4704,7 @@ static int ggml_cuda_try_batch_copies(ggml_cgraph * cgraph, int i, cudaStream_t 
         return -1;
     }
     ggml_cuda_copy_batch(descs, n, stream);
+    ++g_copy_batch_run_count;
     return last;
 }
 
@@ -4835,7 +4846,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif
                 prev_i = i;
 
-                if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+                if (ggml_cuda_node_launches_nothing(node)) {
                     continue;
                 }
 

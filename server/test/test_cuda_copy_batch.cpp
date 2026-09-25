@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -98,7 +99,7 @@ int main() {
     // a -> x, b -> y, x -> z (depends on the first), c -> w.
     constexpr int64_t kN = 4099;
     ggml_init_params gp{};
-    gp.mem_size = 32 * ggml_tensor_overhead() + ggml_graph_overhead();
+    gp.mem_size = 256 * ggml_tensor_overhead() + ggml_graph_overhead();
     gp.no_alloc = true;
     ggml_context * gctx = ggml_init(gp);
     ggml_tensor * a = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, kN);
@@ -113,7 +114,22 @@ int main() {
     ggml_build_forward_expand(gf, ggml_cpy(gctx, b, y));
     ggml_build_forward_expand(gf, ggml_cpy(gctx, x, z));
     ggml_build_forward_expand(gf, ggml_cpy(gctx, c, w));
+    // A run longer than one launch: 60 independent small copies.
+    constexpr int kRun = 60;
+    ggml_tensor * run_src[kRun];
+    ggml_tensor * run_dst[kRun];
+    for (int r = 0; r < kRun; ++r) {
+        run_src[r] = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, 33 + r);
+        run_dst[r] = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, 33 + r);
+        ggml_build_forward_expand(gf, ggml_cpy(gctx, run_src[r], run_dst[r]));
+    }
     ggml_backend_buffer_t gbuf = ggml_backend_alloc_ctx_tensors(gctx, gpu);
+    if (!gbuf) {
+        std::fprintf(stderr, "[cuda-copy-batch] graph allocation failed\n");
+        ggml_free(gctx);
+        ggml_backend_free(gpu);
+        return 1;
+    }
     std::vector<float> va(kN), vb(kN), vc(kN), zero(kN, 0.0f);
     for (int64_t i = 0; i < kN; ++i) {
         va[i] = 1.0f + (float) i;
@@ -126,7 +142,14 @@ int main() {
     for (ggml_tensor * t : {x, y, z, w}) {
         ggml_backend_tensor_set(t, zero.data(), 0, sizeof(float) * kN);
     }
+    for (int r = 0; r < kRun; ++r) {
+        std::vector<float> v(33 + r, 3.0f + (float) r);
+        ggml_backend_tensor_set(run_src[r], v.data(), 0, sizeof(float) * v.size());
+        ggml_backend_tensor_set(run_dst[r], zero.data(), 0, sizeof(float) * v.size());
+    }
+    const size_t runs_before = ggml_backend_cuda_get_copy_batch_run_count();
     const bool computed = ggml_backend_graph_compute(gpu, gf) == GGML_STATUS_SUCCESS;
+    const size_t runs = ggml_backend_cuda_get_copy_batch_run_count() - runs_before;
     std::vector<float> out(kN);
     int64_t graph_bad = computed ? 0 : 1;
     const std::pair<ggml_tensor *, const std::vector<float> *> checks[] = {
@@ -137,9 +160,22 @@ int main() {
             graph_bad += out[i] != (*want)[i];
         }
     }
+    for (int r = 0; r < kRun; ++r) {
+        std::vector<float> v(33 + r);
+        ggml_backend_tensor_get(run_dst[r], v.data(), 0, sizeof(float) * v.size());
+        for (float f : v) {
+            graph_bad += f != 3.0f + (float) r;
+        }
+    }
     ggml_backend_buffer_free(gbuf);
     ggml_free(gctx);
     ggml_backend_free(gpu);
-    std::printf("[cuda-copy-batch] graph copies: %lld mismatched values\n", (long long) graph_bad);
-    return bad == 0 && graph_bad == 0 ? 0 : 1;
+    // The pass must fire unless it is switched off: the first run ends at the
+    // dependent copy, and the 61 later copies (c->w plus the 60-copy run)
+    // span at least two launches.
+    const bool disabled = std::getenv("GGML_CUDA_DISABLE_COPY_BATCH") != nullptr;
+    const bool runs_ok = disabled ? runs == 0 : runs >= 2;
+    std::printf("[cuda-copy-batch] graph copies: %lld mismatched values, %zu batched runs%s\n",
+                (long long) graph_bad, runs, disabled ? " (batching disabled)" : "");
+    return bad == 0 && graph_bad == 0 && runs_ok ? 0 : 1;
 }

@@ -92,13 +92,13 @@ jobs:
             test_paged_kv_pool test_rope_tail test_blocking_row_pool \
             test_model_smoke test_batched_gdn test_concat_transpose \
             test_kernel_qualification_core test_kernel_qualification_gdn \
-            test_kernel_qualification_moe_ds4 test_cuda_copy_batch -j$(nproc)
+            test_kernel_qualification_moe_ds4 -j$(nproc)
 
       - name: Run C++ server unit tests
         run: |
           cd server/build
           ctest --output-on-failure \
-            -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer|paged_kv_pool|blocking_row_pool|rope_tail|batched_gdn_cpu|test_kernel_qualification_core|test_cuda_copy_batch\." \
+            -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer|paged_kv_pool|blocking_row_pool|rope_tail|batched_gdn_cpu|test_kernel_qualification_core" \
             --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools
@@ -249,7 +249,7 @@ jobs:
           ./server/build/test_deepseek4_mmid_grouped_cuda
           ./server/build/test_deepseek4_unit
           ctest --test-dir server/build --output-on-failure \
-            -R 'cuda_pool_shutdown|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce|test_cuda_copy_batch\.'
+            -R 'cuda_pool_shutdown|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce|test_cuda_copy_batch$|test_cuda_copy_batch_disabled$'
 
       - name: Run GPU sampler and draft top-K tests
         run: |
@@ -391,7 +391,7 @@ jobs:
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|ds4_moe_combine_cuda|ds4_maskless_prefill|recurrent_snapshot|ChainRollbackPolicy|MmqTileSelection|MixedMmqPolicy|MoeHybridStorageFixture|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce|test_model_smoke\.PagedAttention\.|batched_gdn$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$|test_fattn_mma256$|test_paged_attn_wmma$|paged_attn_wmma_route$|test_cuda_copy_batch\.'
+            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|ds4_moe_combine_cuda|ds4_maskless_prefill|recurrent_snapshot|ChainRollbackPolicy|MmqTileSelection|MixedMmqPolicy|MoeHybridStorageFixture|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce|test_model_smoke\.PagedAttention\.|batched_gdn$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$|test_fattn_mma256$|test_paged_attn_wmma$|paged_attn_wmma_route$|test_cuda_copy_batch$|test_cuda_copy_batch_disabled$'
 
       - name: Run GPU draft top-K tests
         run: |

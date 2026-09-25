@@ -6,7 +6,7 @@
 
 namespace {
 
-constexpr int kCopyBatchMax = 48;
+constexpr int kCopyBatchMax = ggml_cuda_copy_batch_max;
 
 struct copy_batch_params {
     const char * src[kCopyBatchMax];
