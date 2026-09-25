@@ -2772,7 +2772,9 @@ extern "C" {
     // POST copies `src` into `payload`, then stores *step into *flag. WAIT
     // holds its stream until *flag == *step, then copies `payload` into a new
     // [ne0, ne1, ne2] tensor of `type`; `after` only orders it. The host bumps
-    // *step before each launch, so a captured graph replays unchanged.
+    // *step before each launch. On HIP the wait is a stream wait on the value
+    // read at launch (graphs holding it run eagerly); elsewhere a small kernel
+    // polls the flag.
     // Per token column of two [k, n_tokens] route selections: `native` when
     // it routes to an expert marked in `protected_mask` (I32 [n_expert]),
     // else `biased`. A router bias that moves routes toward resident experts

@@ -4064,6 +4064,13 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 #endif
         }
 
+        // A host mailbox wait enqueues a stream wait on the step it reads
+        // from host memory at launch, so its graph runs eagerly.
+        if (node->op == GGML_OP_MOE_FUSED &&
+            ggml_get_op_params_i32(node, 0) == GGML_MOE_FUSED_HOST_WAIT) {
+            use_cuda_graph = false;
+        }
+
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;

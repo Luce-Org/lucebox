@@ -484,6 +484,15 @@ static __global__ void host_mailbox_post_kernel(
     }
 }
 
+// Copies the host's answer once it is published (HIP: after a stream wait).
+static __global__ void host_mailbox_copy_kernel(
+        const uint32_t * payload, uint32_t * __restrict__ dst, int64_t n_words) {
+    for (int64_t i = threadIdx.x; i < n_words; i += blockDim.x) {
+        dst[i] = ((const volatile uint32_t *) payload)[i];
+    }
+}
+
+#if !defined(GGML_USE_HIP)
 // Waits for the host's answer to this step. The bound only turns a lost
 // answer (a host-side bug) into wrong output instead of a hung device.
 static __global__ void host_mailbox_wait_kernel(
@@ -502,6 +511,7 @@ static __global__ void host_mailbox_wait_kernel(
         dst[i] = ((const volatile uint32_t *) payload)[i];
     }
 }
+#endif // !defined(GGML_USE_HIP)
 
 template <typename T>
 static T host_mailbox_ptr(const ggml_tensor * t, int word) {
@@ -909,9 +919,21 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                 step, flag, payload, (int32_t *) dst->data);
         } else {
             GGML_ASSERT(ggml_is_contiguous(dst));
+#if defined(GGML_USE_HIP)
+            // A stream wait, not a spinning kernel: the command processor
+            // holds the queue with no waves in flight, so the scheduler can
+            // still preempt or evict it (a long-running spin kernel made the
+            // MES fail to remove the queue and reset the GPU). The step is
+            // read at launch, which keeps these graphs eager.
+            const uint32_t s = *(const volatile uint32_t *) step;
+            CUDA_CHECK(hipStreamWaitValue32(ctx.stream(), flag, s, hipStreamWaitValueEq, 0xFFFFFFFFu));
+            host_mailbox_copy_kernel<<<1, 256, 0, ctx.stream()>>>(
+                payload, (uint32_t *) dst->data, (int64_t) (ggml_nbytes(dst) / sizeof(uint32_t)));
+#else
             host_mailbox_wait_kernel<<<1, 256, 0, ctx.stream()>>>(
                 step, flag, payload, (uint32_t *) dst->data,
                 (int64_t) (ggml_nbytes(dst) / sizeof(uint32_t)));
+#endif
         }
         return;
     }
