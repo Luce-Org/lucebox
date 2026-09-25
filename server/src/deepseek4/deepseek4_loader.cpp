@@ -1994,9 +1994,17 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     }
     const bool sources_declared = gguf_find_key(gctx, key("attention.kv_source_layers").c_str()) >= 0;
     if (!sources_declared) {
-        // Infer from tensor presence (llama.cpp PR #28696 writes no lists).
+        // V4 shares no compressed cache: every compressing layer is its own
+        // kv source and every ratio-4 layer its own index source. V4.1 files
+        // without the lists (llama.cpp PR #28696 writes none) are inferred
+        // from tensor presence.
         for (uint32_t il = 0; il < n_layer; ++il) {
             if (compress_ratios[il] == 0) continue;
+            if (!is_v41) {
+                kv_source_ids.push_back((int32_t) il);
+                if (compress_ratios[il] == 4) index_source_ids.push_back((int32_t) il);
+                continue;
+            }
             char name[96];
             std::snprintf(name, sizeof(name), "blk.%u.attn_compressor_kv.weight", il);
             if (gguf_find_tensor(gctx, name) >= 0) kv_source_ids.push_back((int32_t) il);

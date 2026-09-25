@@ -2993,6 +2993,9 @@ static void test_dspark_compressor_rollback(ggml_backend_t backend, int copy_mod
             tensors.push_back(state->state_score);
         }
     }
+    // A V4 ratio-4 layer also owns index-key rows; its counter rolls back
+    // with the compressed rows.
+    cache.layers[0].index_comp_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 3, 4);
     auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     TEST_ASSERT(buffer != nullptr);
     if (!buffer) { ggml_free(ctx); return; }
