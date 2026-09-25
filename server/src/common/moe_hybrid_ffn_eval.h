@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "moe_hybrid_expert_cache.h"
 #include "moe_hybrid_types.h"
 #include "moe_hybrid_storage.h"
 #include "moe_expert_compute.h"
@@ -151,6 +152,12 @@ struct MoeHybridGraphInputs {
     ggml_tensor * hot_valid_lut = nullptr;
     ggml_tensor * cold_local_lut = nullptr;
     ggml_tensor * cold_valid_lut = nullptr;
+    // Streamed owner (see MoeStreamedOwner): the route post and the slot
+    // lookup rows the host answers in the graph; its nodes join the cold
+    // owner's lists because the slots live on the secondary device.
+    ggml_tensor * stream_post = nullptr;
+    ggml_tensor * stream_local_lut = nullptr;
+    ggml_tensor * stream_valid_lut = nullptr;
     ggml_tensor * output = nullptr;
     // Exact owner-local partials exposed for consumers that can fold the
     // hot+cold reduction into their own kernel.  peer_output is the stable
@@ -206,6 +213,19 @@ struct MoeHybridGraphPolicy {
 
 const MoeHybridGraphPolicy & moe_hybrid_graph_policy();
 
+// Slot stacks ([.., .., n_slots]) of experts that neither owner holds and
+// that a device cache streams in, computed as a third owner on the secondary
+// device. The graph posts the layer's routes to a host mailbox channel (see
+// MoeStreamedMailbox) ahead of the secondary branch and waits for the slot
+// lookup rows right before the streamed branch.
+struct MoeStreamedOwner {
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * up = nullptr;
+    ggml_tensor * down = nullptr;
+    ggml_tensor * gate_up = nullptr;
+    const MoeStreamedMailbox::Channel * channel = nullptr;
+};
+
 // Append a device-resident hot+cold+shared MoE FFN to an existing graph.
 // `global_ids` and `router_weights` are [n_expert_used, n_tokens]. Weight
 // tensors in `storage` determine scheduler placement on the two GPU backends.
@@ -231,7 +251,8 @@ bool build_moe_hybrid_ffn_graph(
     MoeHybridJoinMode              join_mode =
                                        MoeHybridJoinMode::OwnerPartialSums,
     MoeHybridRouteBalance          route_balance =
-                                       MoeHybridRouteBalance::Allowed);
+                                       MoeHybridRouteBalance::Allowed,
+    const MoeStreamedOwner *       streamed = nullptr);
 
 // Weighted routed experts of one stacked weight set, built like an owner
 // stack: out[:, t] = sum_k wts[k, t] * expert_{sel[k, t]}(inp[:, t]).

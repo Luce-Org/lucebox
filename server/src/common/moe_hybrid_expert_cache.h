@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <string>
@@ -40,6 +41,80 @@ struct MoeExpertCacheOptions {
     size_t pool_bytes  = 0;   // 0 = free memory on `device` minus reserve_bytes
     size_t reserve_bytes = (size_t) 2 << 30;
     int    n_loaders   = 4;
+};
+
+class MoeStreamedExpertCache;
+
+// Resolves a device graph's streamed routes without returning control to the
+// host. Per layer the graph posts its route ids to host-mapped memory
+// (ggml_host_mailbox_post) and later waits for the answer
+// (ggml_host_mailbox_wait): the slot lookup rows of the streamed experts. A
+// resolver thread answers the layers of each launch in order, pinning and
+// loading through the cache, so the device waits only where a load still
+// runs, and the rest of the graph keeps its devices busy meanwhile.
+class MoeStreamedMailbox {
+public:
+    static constexpr int kMaxTokens = 8;
+
+    // Host-mapped words of one layer, for building the graph.
+    struct Channel {
+        const uint32_t * step = nullptr;
+        uint32_t * posted = nullptr;
+        uint32_t * answered = nullptr;
+        int32_t * ids = nullptr;    // [n_expert_used * n_tokens]
+        int32_t * lut = nullptr;    // [n_expert * n_tokens] slot or invalid_route
+        float * valid = nullptr;    // [n_expert * n_tokens] 1 for a resident slot
+        // Optional: this layer's routes as predicted one layer early; the
+        // resolver prefetches them when it answers the previous layer.
+        uint32_t * predicted = nullptr;
+        int32_t * predicted_ids = nullptr;  // [n_expert_used * n_tokens]
+    };
+    struct Job {
+        int layer = -1;
+        int n_routes = 0;
+        int n_tokens = 0;
+    };
+
+    MoeStreamedMailbox() = default;
+    ~MoeStreamedMailbox();
+    MoeStreamedMailbox(const MoeStreamedMailbox &) = delete;
+    MoeStreamedMailbox & operator=(const MoeStreamedMailbox &) = delete;
+
+    bool init(MoeStreamedExpertCache * cache, int n_layers, int n_expert,
+              int n_expert_used, std::string * err);
+    void destroy();
+    bool ready() const { return base_ != nullptr; }
+    const Channel * channel(int layer) const;
+
+    // Starts answering one launch: `jobs` in the graph's execution order.
+    // Rows of experts that are not resident read `invalid_route`.
+    void begin(const std::vector<Job> & jobs, int32_t invalid_route);
+    // After the launch completed (or failed): waits for the resolver and
+    // releases the launch's slots. False with *err when a layer could not be
+    // answered exactly (a load failed or its experts exceed the pool).
+    bool end(std::string * err);
+
+private:
+    void resolver_main();
+    bool answer(const Job & job, uint32_t step, std::string * err);
+
+    MoeStreamedExpertCache * cache_ = nullptr;
+    int n_expert_ = 0;
+    int n_expert_used_ = 0;
+    void * base_ = nullptr;
+    uint32_t * step_ = nullptr;
+    std::vector<Channel> channels_;
+    std::vector<int32_t> slot_of_;
+
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::thread thread_;
+    std::vector<Job> jobs_;
+    int32_t invalid_route_ = -1;
+    bool pending_ = false;     // a launch is being answered
+    bool launch_done_ = false; // end() was called for it
+    bool stopping_ = false;
+    std::string error_;
 };
 
 class MoeStreamedExpertCache {
@@ -79,6 +154,29 @@ public:
     bool eval(int layer, const MoeLayerDesc & desc,
               const float * inp, const int32_t * selected, const float * weights,
               int n_used, int n_tokens, float * out, std::string * err = nullptr);
+
+    // For a graph that computes the streamed routes itself, with the slot
+    // stacks as one more expert owner: makes the streamed experts routed in
+    // `selected` resident, pinned until release_acquired(), waits for their
+    // loads and writes each one's slot to slot_of_expert ([n_expert]; other
+    // entries are left alone). Fails when they do not fit the pool at once.
+    bool acquire(int layer, const int32_t * selected, int n_routes,
+                 std::vector<int32_t> & slot_of_expert, std::string * err = nullptr);
+    void release_acquired();
+
+    // The slot stacks of a layer's weight types (gate/up or gate_up, down);
+    // all null for a layer without streamed experts.
+    struct Stacks {
+        ggml_tensor * gate = nullptr;
+        ggml_tensor * up = nullptr;
+        ggml_tensor * down = nullptr;
+        ggml_tensor * gate_up = nullptr;
+    };
+    Stacks stacks(int layer) const;
+
+    // Answers graphs that resolve their streamed routes in the device graph;
+    // null until init() succeeded.
+    MoeStreamedMailbox * mailbox() { return mailbox_.ready() ? &mailbox_ : nullptr; }
 
     struct Stats {
         uint64_t experts       = 0;  // streamed experts computed
@@ -133,6 +231,13 @@ private:
     // Caller holds mu_. Returns the slot of (layer, expert), starting a load
     // when it is not cached, or -1 when every slot is pinned or loading.
     int  lookup_or_load_locked(int layer, int expert, bool front, bool * hit);
+    // Caller holds lk on mu_. Pins a slot for each of `experts` (loading
+    // misses ahead of prefetches) and waits until they are ready; false on a
+    // load failure (slots stay pinned).
+    bool pin_ready_locked(std::unique_lock<std::mutex> & lk, int layer,
+                          const int32_t * experts, size_t n, std::vector<int> & slots);
+    // Drops the pins stage() took for `layer`.
+    void release_staged(int layer);
     int  evict_locked();
     void loader_main(Loader * self);
     bool load_slot(Loader & loader, int slot, uint64_t * read_us, uint64_t * upload_us);
@@ -166,6 +271,7 @@ private:
     bool stopping_ = false;
     std::vector<std::vector<int32_t>> predicted_;  // per layer, until its eval
     std::vector<int> staged_;          // slots stage() pinned for staged_layer_
+    std::vector<int> acquired_;        // slots acquire() pinned
     int staged_layer_ = -1;
     std::string failed_;               // first load failure
     std::vector<Loader *> loaders_;
@@ -173,6 +279,7 @@ private:
     Stats stats_;
 
     std::map<std::tuple<int, int, int>, Graph> graphs_;
+    MoeStreamedMailbox mailbox_;
 };
 
 }  // namespace luce::common

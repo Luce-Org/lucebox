@@ -1154,6 +1154,12 @@ static ggml_tensor * build_moe_owner_join(
         ggml_build_forward_expand(schedule_graph, router_weights);
     }
 
+    if (schedule_graph && out.stream_post) {
+        // Post the streamed routes ahead of the secondary branch: the host
+        // answers while that branch computes.
+        ggml_build_forward_expand(schedule_graph, out.stream_post);
+    }
+
     if (canonical_route_join) {
         if (schedule_graph && secondary_branch) {
             // Queue secondary expert work before the final graph traversal
@@ -1226,7 +1232,8 @@ bool build_moe_hybrid_ffn_graph(
     bool                           include_shared,
     bool                           allow_fused_combine,
     MoeHybridJoinMode              join_mode,
-    MoeHybridRouteBalance          route_balance) {
+    MoeHybridRouteBalance          route_balance,
+    const MoeStreamedOwner *       streamed) {
 
     out.output = nullptr;
     out.main_output = nullptr;
@@ -1332,6 +1339,42 @@ bool build_moe_hybrid_ffn_graph(
             });
     }
 
+    // The streamed owner's slot map changes every step; its lookup rows are
+    // runtime inputs, so the build-time map only sizes them.
+    const std::vector<int32_t> streamed_map(
+        streamed ? (size_t) cfg.n_expert : 0, -1);
+    MoeOwnerGraphSpec streamed_owner{
+        &streamed_map,
+        streamed ? streamed->gate : nullptr,
+        streamed ? streamed->up : nullptr,
+        streamed ? streamed->down : nullptr,
+        streamed ? streamed->gate_up : nullptr,
+        &out.stream_local_lut, &out.stream_valid_lut,
+        &out.cold_remap_nodes, &out.cold_nodes};
+    if (streamed && (dynamic_main_slots_x4 > 0 || canonical_route_join ||
+                     !streamed->channel ||
+                     n_tokens > MoeStreamedMailbox::kMaxTokens)) {
+        return false;
+    }
+    if (streamed) {
+        // The routes go out to the host and the slot rows come back inside
+        // the graph, so no host stop splits it.
+        const MoeStreamedMailbox::Channel & ch = *streamed->channel;
+        ggml_tensor * ids = ggml_is_contiguous(global_ids)
+            ? global_ids : ggml_cont(ctx, global_ids);
+        out.stream_post = ggml_host_mailbox_post(ctx, ids, ch.step, ch.posted, ch.ids);
+        out.stream_local_lut = ggml_host_mailbox_wait(
+            ctx, out.stream_post, GGML_TYPE_I32, 1, cfg.n_expert, n_tokens,
+            ch.step, ch.answered, ch.lut);
+        out.stream_valid_lut = ggml_host_mailbox_wait(
+            ctx, out.stream_local_lut, GGML_TYPE_F32, 1, cfg.n_expert, n_tokens,
+            ch.step, ch.answered, ch.valid);
+        if (ids != global_ids) out.cold_remap_nodes.push_back(ids);
+        out.cold_remap_nodes.push_back(out.stream_post);
+        out.cold_remap_nodes.push_back(out.stream_local_lut);
+        out.cold_remap_nodes.push_back(out.stream_valid_lut);
+    }
+
     // Keep graph construction order stable: both remaps, then both optional ID
     // alignments, then both expert branches.
     if (!prepare_moe_owner_branch(
@@ -1339,24 +1382,40 @@ bool build_moe_hybrid_ffn_graph(
             dynamic_main_slots_x4, true, primary_owner) ||
         !prepare_moe_owner_branch(
             ctx, cfg, global_ids, router_weights, n_tokens,
-            dynamic_main_slots_x4, false, secondary_owner)) {
+            dynamic_main_slots_x4, false, secondary_owner) ||
+        !prepare_moe_owner_branch(
+            ctx, cfg, global_ids, router_weights, n_tokens,
+            /*dynamic_main_slots_x4=*/0, false, streamed_owner)) {
         return false;
     }
     align_moe_owner_routes(ctx, n_tokens, primary_owner);
     align_moe_owner_routes(ctx, n_tokens, secondary_owner);
+    align_moe_owner_routes(ctx, n_tokens, streamed_owner);
     if (!build_moe_owner_branch(
             ctx, cfg, desc, inp, n_tokens, canonical_route_join,
             allow_fused_combine, primary_owner) ||
         !build_moe_owner_branch(
             ctx, cfg, desc, inp, n_tokens, canonical_route_join,
-            allow_fused_combine, secondary_owner)) {
+            allow_fused_combine, secondary_owner) ||
+        !build_moe_owner_branch(
+            ctx, cfg, desc, inp, n_tokens, canonical_route_join,
+            allow_fused_combine, streamed_owner)) {
         return false;
+    }
+    // Streamed routes join the secondary partial on the device that holds
+    // both the secondary stack and the slots.
+    ggml_tensor * secondary = secondary_owner.output;
+    if (streamed_owner.output) {
+        secondary = secondary
+            ? ggml_add(ctx, secondary, streamed_owner.output)
+            : streamed_owner.output;
+        out.cold_nodes.push_back(secondary);
     }
 
     ggml_tensor * combined = build_moe_owner_join(
         ctx, schedule_graph, cfg, desc, inp, global_ids, router_weights,
         n_tokens, include_shared, canonical_route_join,
-        primary_owner.output, secondary_owner.output, out);
+        primary_owner.output, secondary, out);
     if (!combined) return false;
 
     out.output = ggml_is_contiguous(combined) ? combined

@@ -210,6 +210,9 @@ bool MoeStreamedExpertCache::init(const MoeHybridConfig & cfg,
         }
     }
     for (Loader * l : loaders_) threads_.emplace_back(&MoeStreamedExpertCache::loader_main, this, l);
+    if (!mailbox_.init(this, (int) storage.layers.size(), cfg.n_expert, cfg.n_expert_used, err)) {
+        return fail(err ? *err : "failed to set up the streamed mailbox");
+    }
 
     std::fprintf(stderr,
                  "[moe-stream] expert cache on device %d: %d slots x %.2f MiB = %.2f GiB, "
@@ -220,6 +223,7 @@ bool MoeStreamedExpertCache::init(const MoeHybridConfig & cfg,
 }
 
 void MoeStreamedExpertCache::destroy() {
+    mailbox_.destroy();  // its resolver calls into the cache
     {
         std::lock_guard<std::mutex> lk(mu_);
         stopping_ = true;
@@ -473,6 +477,116 @@ MoeStreamedExpertCache::Graph * MoeStreamedExpertCache::graph_for(
     return &graphs_.emplace(k, g).first->second;
 }
 
+bool MoeStreamedExpertCache::pin_ready_locked(std::unique_lock<std::mutex> & lk, int layer,
+                                              const int32_t * experts, size_t n,
+                                              std::vector<int> & slots) {
+    slots.clear();
+    slots.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        bool hit = false;
+        int slot;
+        while ((slot = lookup_or_load_locked(layer, experts[i], /*front=*/true, &hit)) < 0) {
+            cv_.wait(lk);  // every slot pinned or loading
+        }
+        Slot & s = slots_[(size_t) slot];
+        ++s.pins;
+        if (!s.demand) ++stats_.hits;
+        if (s.prefetched) ++stats_.prefetch_hits;
+        s.demand = s.prefetched = false;
+        slots.push_back(slot);
+    }
+    const auto t0 = Clock::now();
+    cv_.wait(lk, [&] {
+        if (!failed_.empty()) return true;
+        for (int slot : slots) {
+            if (slots_[(size_t) slot].state != SlotState::Ready) return false;
+        }
+        return true;
+    });
+    stats_.wait_us += elapsed_us(t0, Clock::now());
+    stats_.experts += slots.size();
+    return failed_.empty();
+}
+
+void MoeStreamedExpertCache::release_staged(int layer) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (staged_layer_ != layer) return;
+    for (int slot : staged_) --slots_[(size_t) slot].pins;
+    staged_.clear();
+    staged_layer_ = -1;
+}
+
+bool MoeStreamedExpertCache::acquire(int layer, const int32_t * selected, int n_routes,
+                                     std::vector<int32_t> & slot_of_expert, std::string * err) {
+    if (!ready() || layer < 0 || (size_t) layer >= storage_->layers.size() ||
+        (int) slot_of_expert.size() != cfg_.n_expert) {
+        if (err) *err = "streamed expert cache not ready for this layer";
+        return false;
+    }
+    const MoeHybridLayerStorage & st = storage_->layers[(size_t) layer];
+    std::vector<int32_t> uniq;
+    std::vector<uint8_t> seen((size_t) cfg_.n_expert, 0);
+    for (int i = 0; i < n_routes; ++i) {
+        const int32_t e = selected[i];
+        if (e < 0 || e >= cfg_.n_expert || !st.is_streamed(e) || seen[(size_t) e]) continue;
+        seen[(size_t) e] = 1;
+        uniq.push_back(e);
+    }
+    if (uniq.empty()) {
+        release_staged(layer);
+        return true;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if ((int) (uniq.size() + acquired_.size()) > n_slots_) {
+            if (err) *err = "streamed experts of one graph exceed the slot pool";
+            return false;
+        }
+        std::vector<int32_t> & pred = predicted_[(size_t) layer];
+        if (!pred.empty()) {
+            stats_.predicted_of += uniq.size();
+            for (int32_t e : uniq) {
+                if (std::find(pred.begin(), pred.end(), e) != pred.end()) ++stats_.predicted_used;
+            }
+            pred.clear();
+        }
+    }
+    std::vector<int> slots;
+    bool ok = false;
+    {
+        std::unique_lock<std::mutex> lk(mu_);
+        ok = pin_ready_locked(lk, layer, uniq.data(), uniq.size(), slots);
+        acquired_.insert(acquired_.end(), slots.begin(), slots.end());
+        if (!ok && err) *err = failed_;
+    }
+    release_staged(layer);
+    for (size_t i = 0; i < uniq.size(); ++i) slot_of_expert[(size_t) uniq[i]] = slots[i];
+    return ok;
+}
+
+void MoeStreamedExpertCache::release_acquired() {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (int slot : acquired_) {
+        --slots_[(size_t) slot].pins;
+        slots_[(size_t) slot].last_use = ++tick_;
+    }
+    acquired_.clear();
+    cv_.notify_all();
+}
+
+MoeStreamedExpertCache::Stacks MoeStreamedExpertCache::stacks(int layer) const {
+    Stacks out;
+    if (layer < 0 || (size_t) layer >= view_of_layer_.size() || view_of_layer_[(size_t) layer] < 0) {
+        return out;
+    }
+    const PoolView & v = views_[(size_t) view_of_layer_[(size_t) layer]];
+    out.gate = v.gate;
+    out.up = v.up;
+    out.down = v.down;
+    out.gate_up = v.gate_up;
+    return out;
+}
+
 bool MoeStreamedExpertCache::eval(int layer, const MoeLayerDesc & desc,
                                   const float * inp, const int32_t * selected,
                                   const float * weights, int n_used, int n_tokens,
@@ -494,15 +608,8 @@ bool MoeStreamedExpertCache::eval(int layer, const MoeLayerDesc & desc,
         seen[(size_t) e] = 1;
         uniq.push_back(e);
     }
-    const auto release_staged = [&] {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (staged_layer_ != layer) return;
-        for (int slot : staged_) --slots_[(size_t) slot].pins;
-        staged_.clear();
-        staged_layer_ = -1;
-    };
     if (uniq.empty()) {
-        release_staged();
+        release_staged(layer);
         return true;
     }
 
@@ -524,37 +631,14 @@ bool MoeStreamedExpertCache::eval(int layer, const MoeLayerDesc & desc,
     for (size_t c0 = 0; c0 < uniq.size(); c0 += (size_t) chunk_cap) {
         const size_t c1 = std::min(uniq.size(), c0 + (size_t) chunk_cap);
         std::vector<int> slots;
-        slots.reserve(c1 - c0);
         {
             std::unique_lock<std::mutex> lk(mu_);
-            for (size_t i = c0; i < c1; ++i) {
-                bool hit = false;
-                int slot;
-                while ((slot = lookup_or_load_locked(layer, uniq[i], /*front=*/true, &hit)) < 0) {
-                    cv_.wait(lk);  // every slot pinned or loading
-                }
-                Slot & s = slots_[(size_t) slot];
-                ++s.pins;
-                if (!s.demand) ++stats_.hits;
-                if (s.prefetched) ++stats_.prefetch_hits;
-                s.demand = s.prefetched = false;
-                slots.push_back(slot);
-                slot_of_expert[(size_t) uniq[i]] = slot;
-            }
-            const auto t0 = Clock::now();
-            cv_.wait(lk, [&] {
-                if (!failed_.empty()) return true;
-                for (int slot : slots) {
-                    if (slots_[(size_t) slot].state != SlotState::Ready) return false;
-                }
-                return true;
-            });
-            stats_.wait_us += elapsed_us(t0, Clock::now());
-            stats_.experts += slots.size();
+            pin_ready_locked(lk, layer, uniq.data() + c0, c1 - c0, slots);
+            for (size_t i = c0; i < c1; ++i) slot_of_expert[(size_t) uniq[i]] = slots[i - c0];
         }
         // The staged loads have started and the first chunk holds its own
         // pins; later chunks must be able to use the staged slots' room.
-        if (c0 == 0) release_staged();
+        if (c0 == 0) release_staged(layer);
         const auto unpin = [&] {
             std::lock_guard<std::mutex> lk(mu_);
             for (int slot : slots) {
@@ -623,6 +707,196 @@ bool MoeStreamedExpertCache::eval(int layer, const MoeLayerDesc & desc,
         if (!ok) return false;
     }
     return true;
+}
+
+
+// ── Mailbox ─────────────────────────────────────────────────────────────
+
+namespace {
+
+constexpr size_t kMailboxLine = 64;
+
+void cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+}
+
+uint32_t mailbox_load(const uint32_t * p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
+void mailbox_store(uint32_t * p, uint32_t v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }
+
+}  // namespace
+
+MoeStreamedMailbox::~MoeStreamedMailbox() {
+    destroy();
+}
+
+bool MoeStreamedMailbox::init(MoeStreamedExpertCache * cache, int n_layers, int n_expert,
+                              int n_expert_used, std::string * err) {
+    destroy();
+    if (!cache || n_layers <= 0 || n_expert <= 0 || n_expert_used <= 0) {
+        if (err) *err = "invalid streamed mailbox geometry";
+        return false;
+    }
+    const size_t ids_bytes = align_up(sizeof(int32_t) * (size_t) n_expert_used * kMaxTokens, kMailboxLine);
+    const size_t row_bytes = align_up(sizeof(int32_t) * (size_t) n_expert * kMaxTokens, kMailboxLine);
+    const size_t layer_bytes = 3 * kMailboxLine + 2 * ids_bytes + 2 * row_bytes;
+    const size_t total = kMailboxLine + (size_t) n_layers * layer_bytes;
+    // Mapped and coherent: the device polls and writes these words while the
+    // resolver thread does, with no copy or cache flush between them.
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
+    const hipError_t rc = hipHostMalloc(&base_, total,
+        hipHostMallocMapped | hipHostMallocPortable | hipHostMallocCoherent);
+#else
+    const cudaError_t rc = cudaHostAlloc(&base_, total, cudaHostAllocMapped | cudaHostAllocPortable);
+#endif
+    if (rc != cudaSuccess) {
+        base_ = nullptr;
+        if (err) *err = "failed to allocate the mapped streamed mailbox";
+        return false;
+    }
+    std::memset(base_, 0, total);
+    cache_ = cache;
+    n_expert_ = n_expert;
+    n_expert_used_ = n_expert_used;
+    auto * at = static_cast<uint8_t *>(base_);
+    step_ = reinterpret_cast<uint32_t *>(at);
+    at += kMailboxLine;
+    channels_.assign((size_t) n_layers, Channel{});
+    for (Channel & c : channels_) {
+        c.step = step_;
+        c.posted = reinterpret_cast<uint32_t *>(at);
+        c.answered = reinterpret_cast<uint32_t *>(at + kMailboxLine);
+        c.ids = reinterpret_cast<int32_t *>(at + 2 * kMailboxLine);
+        c.lut = reinterpret_cast<int32_t *>(at + 2 * kMailboxLine + ids_bytes);
+        c.valid = reinterpret_cast<float *>(at + 2 * kMailboxLine + ids_bytes + row_bytes);
+        c.predicted = reinterpret_cast<uint32_t *>(at + 2 * kMailboxLine + ids_bytes + 2 * row_bytes);
+        c.predicted_ids = reinterpret_cast<int32_t *>(at + 3 * kMailboxLine + ids_bytes + 2 * row_bytes);
+        at += layer_bytes;
+    }
+    stopping_ = false;
+    thread_ = std::thread(&MoeStreamedMailbox::resolver_main, this);
+    return true;
+}
+
+void MoeStreamedMailbox::destroy() {
+    if (thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+    if (base_) cudaFreeHost(base_);
+    base_ = nullptr;
+    step_ = nullptr;
+    channels_.clear();
+    jobs_.clear();
+    pending_ = launch_done_ = stopping_ = false;
+    error_.clear();
+    cache_ = nullptr;
+}
+
+const MoeStreamedMailbox::Channel * MoeStreamedMailbox::channel(int layer) const {
+    return base_ && layer >= 0 && (size_t) layer < channels_.size()
+        ? &channels_[(size_t) layer] : nullptr;
+}
+
+void MoeStreamedMailbox::begin(const std::vector<Job> & jobs, int32_t invalid_route) {
+    std::lock_guard<std::mutex> lk(mu_);
+    uint32_t next = *step_ + 1;
+    if (next == 0) next = 1;  // 0 is the initial value of every flag
+    mailbox_store(step_, next);
+    jobs_ = jobs;
+    invalid_route_ = invalid_route;
+    error_.clear();
+    launch_done_ = false;
+    pending_ = true;
+    cv_.notify_all();
+}
+
+bool MoeStreamedMailbox::end(std::string * err) {
+    std::unique_lock<std::mutex> lk(mu_);
+    launch_done_ = true;
+    cv_.wait(lk, [&] { return !pending_; });
+    const bool ok = error_.empty();
+    if (!ok && err) *err = error_;
+    lk.unlock();
+    cache_->release_acquired();
+    return ok;
+}
+
+void MoeStreamedMailbox::resolver_main() {
+    std::unique_lock<std::mutex> lk(mu_);
+    while (true) {
+        cv_.wait(lk, [&] { return stopping_ || pending_; });
+        if (stopping_) break;
+        const std::vector<Job> jobs = jobs_;
+        const uint32_t step = mailbox_load(step_);
+        lk.unlock();
+        std::string error;
+        for (size_t j = 0; j < jobs.size(); ++j) {
+            const Job & job = jobs[j];
+            const Channel & c = channels_[(size_t) job.layer];
+            // A post that never comes means the launch skipped the layer
+            // (it failed); stop once end() says the launch is over.
+            bool posted = false;
+            for (uint32_t spin = 0;; ++spin) {
+                if (mailbox_load(c.posted) == step) { posted = true; break; }
+                if ((spin & 1023) == 1023) {
+                    std::lock_guard<std::mutex> g(mu_);
+                    if (launch_done_ || stopping_) break;
+                }
+                cpu_relax();
+            }
+            if (!posted) {
+                if (error.empty()) error = "layer " + std::to_string(job.layer) + " never posted its routes";
+                break;
+            }
+            // The next layer's prediction was posted ahead of these routes:
+            // queue its loads behind this layer's before blocking on them.
+            if (j + 1 < jobs.size() && jobs[j + 1].layer == job.layer + 1) {
+                const Channel & next = channels_[(size_t) jobs[j + 1].layer];
+                if (mailbox_load(next.predicted) == step) {
+                    cache_->prefetch(jobs[j + 1].layer, next.predicted_ids,
+                                     std::min(jobs[j + 1].n_routes, n_expert_used_ * kMaxTokens));
+                }
+            }
+            std::string layer_error;
+            if (!answer(job, step, &layer_error) && error.empty()) {
+                error = "layer " + std::to_string(job.layer) + ": " + layer_error;
+            }
+        }
+        lk.lock();
+        if (error_.empty()) error_ = error;
+        pending_ = false;
+        cv_.notify_all();
+    }
+}
+
+// Writes the layer's lookup rows and publishes them. Always publishes, so the
+// device never waits on a failed layer; the rows then drop its streamed routes
+// and end() reports the failure.
+bool MoeStreamedMailbox::answer(const Job & job, uint32_t step, std::string * err) {
+    const Channel & c = channels_[(size_t) job.layer];
+    const int n_routes = std::min(job.n_routes, n_expert_used_ * kMaxTokens);
+    const int n_tokens = std::max(1, std::min(job.n_tokens, kMaxTokens));
+    slot_of_.assign((size_t) n_expert_, -1);
+    const bool ok = cache_->acquire(job.layer, c.ids, n_routes, slot_of_, err);
+    for (int e = 0; e < n_expert_; ++e) {
+        const int32_t slot = ok ? slot_of_[(size_t) e] : -1;
+        c.lut[e] = slot >= 0 ? slot : invalid_route_;
+        c.valid[e] = slot >= 0 ? 1.0f : 0.0f;
+    }
+    for (int t = 1; t < n_tokens; ++t) {
+        std::memcpy(c.lut + (size_t) t * n_expert_, c.lut, sizeof(int32_t) * (size_t) n_expert_);
+        std::memcpy(c.valid + (size_t) t * n_expert_, c.valid, sizeof(float) * (size_t) n_expert_);
+    }
+    mailbox_store(c.answered, step);
+    return ok;
 }
 
 }  // namespace luce::common
