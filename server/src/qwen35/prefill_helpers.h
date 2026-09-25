@@ -58,14 +58,44 @@ inline void fill_qwen35_mrope_positions(int32_t * positions,
         positions, n_tokens, /*token_offset=*/0, base_pos, n_tokens);
 }
 
+// Upload a causal mask into a mask tensor sized for max_ctx. Flash attention
+// reads mask columns only inside the KV view, which is the window length
+// rounded up to at most 256; one more 256 stride covers a kernel's final
+// partial KV tile. Only those columns are built and copied (a strided 2-D
+// write), so the cost follows the live context instead of max_ctx. Columns
+// past them keep stale values that no kernel reads.
+// LUCE_QWEN35_MASK_FULL_WIDTH=1 restores the full-width upload.
+inline int qwen35_causal_mask_live_width(int kv_len, int full_width) {
+    return std::min(full_width, align_up(kv_len, 256) + 256);
+}
+
+inline void upload_qwen35_causal_mask_window(ggml_tensor * mask, int kv_len,
+                                             int n_tokens, int kv_start,
+                                             int kq_stride_pad, int win_start) {
+    if (!mask) return;
+    static const bool full_width = [] {
+        const char * e = std::getenv("LUCE_QWEN35_MASK_FULL_WIDTH");
+        return e && e[0] == '1';
+    }();
+    const int full = (int)mask->ne[0];
+    const int live = full_width ? full : qwen35_causal_mask_live_width(kv_len, full);
+    std::vector<uint16_t> data;
+    build_causal_mask(data, kv_len, n_tokens, kv_start, kq_stride_pad,
+                      win_start, live);
+    if (live == full) {
+        ggml_backend_tensor_set(mask, data.data(), 0,
+                                sizeof(uint16_t) * data.size());
+        return;
+    }
+    const size_t row_bytes = sizeof(uint16_t) * (size_t)live;
+    ggml_backend_tensor_set_2d(mask, data.data(), 0, row_bytes,
+                               data.size() / (size_t)live, mask->nb[1], row_bytes);
+}
+
 inline void upload_qwen35_causal_mask(ggml_tensor * mask, int kv_start,
                                        int n_tokens, int kq_stride_pad) {
-    if (!mask) return;
-    std::vector<uint16_t> data;
-    build_causal_mask(data, kv_start + n_tokens, n_tokens, kv_start,
-                      kq_stride_pad, /*win_start=*/0, (int)mask->ne[0]);
-    ggml_backend_tensor_set(mask, data.data(), 0,
-                            sizeof(uint16_t) * data.size());
+    upload_qwen35_causal_mask_window(mask, kv_start + n_tokens, n_tokens,
+                                     kv_start, kq_stride_pad, /*win_start=*/0);
 }
 
 }  // namespace luce::common
