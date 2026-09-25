@@ -369,6 +369,9 @@ static bool gdn_replay_log_commit_many_impl(
 
     if (!commit) return true;
     ggml_cuda_set_device(device);
+    // A null stream would be the legacy default stream; never launch on it.
+    cudaStream_t stream = commit_stream(device);
+    if (!stream) return false;
     constexpr int threads = 256;
     (void) cudaGetLastError();
     for (int layer = 0; layer < n_layers; ++layer) {
@@ -384,13 +387,13 @@ static bool gdn_replay_log_commit_many_impl(
             (unsigned int) heads, (unsigned int) n_seqs);
         if (state_size == 128 && replay_log_width == 2*state_size + 1 &&
             tokens <= 8) {
-            gdn_replay_log_commit_128_scalar_tile_kernel<<<state_grid, threads, 0, commit_stream(device)>>>(
+            gdn_replay_log_commit_128_scalar_tile_kernel<<<state_grid, threads, 0, stream>>>(
                 (const float *) replay_log->data, (float *) state->data,
                 (const int32_t *) accepted_prefixes->data,
                 (const int32_t *) active_slot_ids->data,
                 heads, tokens, (int) n_seqs, (int) state->ne[3]);
         } else {
-            gdn_replay_log_commit_kernel<<<state_grid, threads, 0, commit_stream(device)>>>(
+            gdn_replay_log_commit_kernel<<<state_grid, threads, 0, stream>>>(
                 (const float *) replay_log->data, (float *) state->data,
                 (const int32_t *) accepted_prefixes->data,
                 (const int32_t *) active_slot_ids->data,
@@ -406,7 +409,7 @@ static bool gdn_replay_log_commit_many_impl(
         const dim3 conv_grid(
             (unsigned int) ((conv_elements + threads - 1)/threads),
             (unsigned int) n_seqs, 1);
-        gdn_conv_replay_log_commit_kernel<<<conv_grid, threads, 0, commit_stream(device)>>>(
+        gdn_conv_replay_log_commit_kernel<<<conv_grid, threads, 0, stream>>>(
             (const float *) conv_input->data, (float *) conv_state->data,
             (const int32_t *) accepted_prefixes->data,
             (const int32_t *) active_slot_ids->data,
@@ -500,6 +503,9 @@ static bool tree_cache_commit_many_impl(
 
     if (!commit) return true;
     ggml_cuda_set_device(device);
+    // A null stream would be the legacy default stream; never launch on it.
+    cudaStream_t stream = commit_stream(device);
+    if (!stream) return false;
     constexpr int threads = 256;
     (void) cudaGetLastError();
     for (int index = 0; index < n_caches; ++index) {
@@ -507,7 +513,7 @@ static bool tree_cache_commit_many_impl(
         const dim3 grid(
             (unsigned int) ((cache->nb[1] + threads - 1)/threads),
             (unsigned int) n_rows, (unsigned int) cache->ne[2]);
-        tree_cache_commit_kernel<<<grid, threads, 0, commit_stream(device)>>>(
+        tree_cache_commit_kernel<<<grid, threads, 0, stream>>>(
             (uint8_t *) cache->data,
             (const int64_t *) commit_rows->data,
             (const int32_t *) active_slot_ids->data,
@@ -575,12 +581,15 @@ static bool tree_feature_commit_impl(
     }
     if (!commit) return true;
     ggml_cuda_set_device(device);
+    // A null stream would be the legacy default stream; never launch on it.
+    cudaStream_t stream = commit_stream(device);
+    if (!stream) return false;
     constexpr int threads = 256;
     const dim3 grid(
         (unsigned int) ((source->nb[1] + threads - 1)/threads),
         (unsigned int) n_rows, 1);
     (void) cudaGetLastError();
-    tree_feature_commit_kernel<<<grid, threads, 0, commit_stream(device)>>>(
+    tree_feature_commit_kernel<<<grid, threads, 0, stream>>>(
         (const uint8_t *) source->data, (uint8_t *) destination->data,
         (const int32_t *) destination_rows->data,
         source->nb[1], n_rows, (int) destination->ne[1]);

@@ -1722,8 +1722,11 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "[server] failed to set GGML_CUDA_DISABLE_GRAPHS for multi-model serving\n");
             return 2;
         }
+        const bool disabled = std::getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
         std::fprintf(stderr, "[server] %zu models in one process: GPU graph capture %s\n", options.size(),
-            keep_graphs ? "kept on (LUCE_MULTI_MODEL_GRAPHS=1)" : "disabled");
+            !disabled ? "kept on (LUCE_MULTI_MODEL_GRAPHS=1)"
+                      : keep_graphs ? "disabled (GGML_CUDA_DISABLE_GRAPHS is set, overriding LUCE_MULTI_MODEL_GRAPHS=1)"
+                                    : "disabled");
     }
     for (auto & option : options) {
         option.sconfig.host = listener_config.host;
