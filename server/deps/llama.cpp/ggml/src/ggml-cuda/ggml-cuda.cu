@@ -4846,11 +4846,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif
                 prev_i = i;
 
-                if (ggml_cuda_node_launches_nothing(node)) {
-                    continue;
-                }
-
-                if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                // Same predicate the copy-run gather uses to step over nodes.
+                if (ggml_cuda_node_is_noop(node)) {
                     continue;
                 }
 
