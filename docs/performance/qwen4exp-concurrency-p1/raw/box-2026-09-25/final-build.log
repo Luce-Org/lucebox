@@ -1,0 +1,12 @@
+[  1%] Built target libjpeg_turbo_external
+[  1%] Built target image_codec_png
+[  5%] Built target ggml-base
+[  8%] Built target ggml-cpu
+[ 63%] Built target ggml-hip
+[ 63%] Built target ggml
+[ 64%] Building CXX object CMakeFiles/luce_common.dir/src/qwen4exp/qwen4exp_graph.cpp.o
+[ 64%] Linking HIP static library libluce_common.a
+[100%] Built target luce_common
+[100%] Building CXX object CMakeFiles/smoke_qwen4exp_batched.dir/test/smoke_qwen4exp_batched.cpp.o
+[100%] Linking HIP executable smoke_qwen4exp_batched
+[100%] Built target smoke_qwen4exp_batched

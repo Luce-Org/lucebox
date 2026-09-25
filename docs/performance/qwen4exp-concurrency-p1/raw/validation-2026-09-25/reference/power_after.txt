@@ -1,0 +1,29 @@
+2026-09-25T16:38:44+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 784Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 52.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================

@@ -1,0 +1,65 @@
+[bench] url=http://127.0.0.1:8878  model=luce  suites=he,gsm,math,recall
+
+[bench] === HE (n=10) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  he_01              6.88s   1.090s    130.30      173      29.90  OK
+    2  he_02              8.63s   0.832s    161.00      230      29.48  OK
+    3  he_03              3.94s   0.804s    128.20       97      30.91  OK
+    4  he_04              6.02s   0.848s    161.50      157      30.38  OK
+    5  he_05              6.40s   0.806s    168.80      169      30.19  OK
+    6  he_06              5.91s   0.838s    133.60      154      30.34  OK
+    7  he_07              7.93s   0.785s    168.20      214      29.95  OK
+    8  he_08              4.44s   0.820s    136.60      112      30.90  OK
+    9  he_09              6.19s   0.806s    166.30      163      30.30  OK
+   10  he_10              6.07s   0.872s    133.00      158      30.41  OK
+
+  [summary] ok=10/10  wall=6.24s  TTFT=0.850s  prefill=148.80 tok/s  output=30.28 tok/s  accuracy=10/10 (100.0%)
+
+[bench] === GSM (n=10) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  gsm_01             8.77s   0.660s    124.20      236      29.10  OK
+    2  gsm_02             5.26s   0.383s    112.30      143      29.33  OK
+    3  gsm_03            14.18s   0.578s    124.50      398      29.26  OK
+    4  gsm_04             5.49s   0.422s    120.90      150      29.60  OK
+    5  gsm_05            10.42s   0.846s    147.80      282      29.46  OK
+    6  gsm_06            10.62s   0.546s    132.00      292      28.98  OK
+    7  gsm_07             7.77s   0.525s    110.50      216      29.80  OK
+    8  gsm_08            15.37s   0.632s    137.70      431      29.24  OK
+    9  gsm_09            17.74s   0.701s    137.00      500      29.34  OK
+   10  gsm_10            11.01s   0.618s    126.20      306      29.44  OK
+
+  [summary] ok=10/10  wall=10.66s  TTFT=0.591s  prefill=127.30 tok/s  output=29.36 tok/s  accuracy=10/10 (100.0%)
+
+[bench] === MATH (n=10) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  math_01           11.52s   0.463s    101.60      322      29.13  OK
+    2  math_02            7.72s   0.535s    130.80      211      29.36  OK
+    3  math_03           12.35s   0.614s    112.50      344      29.31  OK
+    4  math_04           26.21s   0.802s    127.20      734      28.88  OK
+    5  math_05           19.92s   0.464s    131.40      560      28.78  OK
+    6  math_06           12.04s   0.442s    115.50      334      28.80  OK
+    7  math_07           10.62s   0.486s    115.20      299      29.51  OK
+    8  math_08           27.58s   0.527s    121.50      783      28.95  OK
+    9  math_09           17.14s   0.449s     95.80      479      28.69  OK
+   10  math_10           71.26s   0.798s    129.10     2048      29.07  WRONG
+
+  [summary] ok=10/10  wall=21.64s  TTFT=0.558s  prefill=118.10 tok/s  output=29.05 tok/s  accuracy=9/10 (90.0%)
+
+[bench] === RECALL (n=2) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  recall_13k        15.57s  14.710s    928.90       28      32.57  OK
+    2  recall_24k        25.48s  24.585s    975.60       28      31.45  OK
+
+  [summary] ok=2/2  wall=20.52s  TTFT=19.647s  prefill=952.20 tok/s  output=32.01 tok/s  accuracy=2/2 (100.0%)
+
+[bench] === SUMMARY ===
+   Suite     OK     Wall     TTFT   Pf tok/s   Out tok/s   Out tok       Score
+      he  10/10    6.24s   0.850s     148.80       30.28      1627       10/10
+     gsm  10/10   10.66s   0.591s     127.30       29.36      2954       10/10
+    math  10/10   21.64s   0.558s     118.10       29.05      6114        9/10
+  recall    2/2   20.52s  19.647s     952.20       32.01        56         2/2
+wrote /tmp/qwen4exp-p1-validation/quality/quality.json

@@ -68,6 +68,7 @@ kill switches:
 | `QWEN4EXP_LAST_TOKEN_FFN` | `1` | Kill switch for final-row-only evaluation after the last layer has completed its state writes. |
 | `QWEN4EXP_DECODE_REUSE` | `1` | Kill switch for reuse of the T=1 ggml context and graph allocator. |
 | `QWEN4EXP_DECODE_STABLEGRAPH` | `1` | Kill switch for bucketed, pointer-stable T=1 graphs. HIP graph capture itself still depends on a `GGML_HIP_GRAPHS` build. |
+| `QWEN4EXP_BATCHED_DECODE` | `0` | Experimental opt-in for the exact-width independent-slot decode entry point. Excluded under `QWEN4EXP_UPSTREAM=1`; requires one shared `Qwen4ExpBatchedDecodeWorkspace`. Not enabled by the serving scheduler yet. |
 
 These variables are diagnostics and differential-test controls; they are not
 production tuning requirements:
@@ -82,6 +83,7 @@ production tuning requirements:
 | `QWEN4EXP_PROF`, `QWEN4EXP_FA_TELEMETRY`, `QWEN4EXP_STABLEGRAPH_TELEMETRY` | Print graph phase, attention route, or stable-graph telemetry. |
 | `QWEN4EXP_MM_LOG`, `QWEN4EXP_CUBLAS_LOG`, `LUCE_MMB_TELEMETRY` | Print matrix shape and dispatch telemetry. |
 | `QWEN4EXP_DUMP`, `QWEN4EXP_DUMP_BIN` | Materialize and dump internal graph activations for the differential harness. |
+| `QWEN4EXP_LAYER_TRACE`, `QWEN4EXP_TRACE_TAG` | Batched-path diagnostic: dump selected per-layer tensors (tagged by `QWEN4EXP_TRACE_TAG`) to `/tmp/q4trace_*` for layer-by-layer diffing. No effect when unset. |
 | `LUCE_HIP_NO_PINNED_STAGE`, `LUCE_HIP_NO_UMA_RING` | Disable pinned staging or the qwen4exp pinned input ring for diagnosis. |
 | `LUCE_GDN_NO_TILED`, `LUCE_GDN_FORCE_GROUPED_COLS`, `LUCE_GDN_NO_GROUPED_COLS` | Override GDN kernel dispatch for profiling and bisection. |
 

@@ -1,0 +1,26 @@
+-- Using the multi-header code from /home/duster/lucebox-qwen4exp/server/build-hip/_deps/json-src/include/
+-- Warning: ccache not found - consider installing it for faster compilation or disable this warning with GGML_CCACHE=OFF
+-- CMAKE_SYSTEM_PROCESSOR: x86_64
+-- GGML_SYSTEM_ARCH: x86
+-- Including CPU backend
+-- Found OpenMP_C: -fopenmp (found version "4.5") 
+-- Found OpenMP_CXX: -fopenmp (found version "4.5") 
+-- x86 detected
+-- Adding CPU backend variant ggml-cpu: -march=native 
+-- HIP and hipBLAS found
+-- Including HIP backend
+-- ggml version: 0.9.11
+-- ggml commit:  5812e8b0-dirty
+-- BSA on HIP is backed by the rocWMMA sparse-FA kernel (Phase 2). Build with -DDFLASH27B_HIP_SM80_EQUIV=ON to enable; disabling BSA for this Phase 1 HIP build.
+-- dflash: HIP Phase 1 - ggml q8 fallback for flashprefill
+-- Found OpenMP_C: -fopenmp (found version "4.5") 
+-- Found OpenMP_CXX: -fopenmp (found version "4.5") 
+CMake Warning at CMakeLists.txt:2589 (message):
+  CURL not found — building dflash_server without passthrough proxy
+
+
+-- Configuring done (0.2s)
+-- Generating done (0.1s)
+-- Build files have been written to: /home/duster/lucebox-qwen4exp/server/build-hip
+[1/2] Building CXX object CMakeFiles/qwen4exp_p0_memory_probe.dir/tmp/qwen4exp_p0_memory_probe.cpp.o
+[2/2] Linking HIP executable qwen4exp_p0_memory_probe

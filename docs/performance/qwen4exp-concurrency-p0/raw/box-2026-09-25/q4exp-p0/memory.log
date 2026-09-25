@@ -1,0 +1,61 @@
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 98304 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 98304 MiB
+[qwen4exp] qwen4exp trunk loaded: 48 layers (36 linear + 12 full), 1222 tensors 66.24 GiB from 3 shard(s), experts=10/512 hc=4/320 ple_layers=1 ngram=3 heads_per_ngram=8 table_rows=320001536 eos=248046
+[mem] weights_loaded seconds=38.543 layers=48 full=12 linear=36 vocab=248320
+[shape] n_embd=2560 kvheads=2 head_k=256 head_v=256 ssm_state=128 value_heads=48 inner=6144 conv=4 n_group=16 indexer_dim=128 ple_layers=1 ple_ngram=3 ple_kernel=4 hc=4
+[qtype] dense.hc_attn_down iq4_nl [10240,320,1]
+[qtype] dense.hc_ffn_down iq4_nl [10240,320,1]
+[qtype] moe.gate_exps iq4_nl [2560,640,512]
+[qtype] hc.gamma f32 [10240,1,1]
+[mem] weights VmHWM:	58371120 kB
+[mem] weights VmRSS:	  841292 kB
+[mem] weights ru_maxrss_kib=58371120
+[mem] weights gtt_used_bytes=71290454016
+[mem] weights MemAvailable:   57990876 kB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (DFLASH_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[cache] slot=0 ctx=32768 seconds=0.055 kv=805306368 indexer=50331648 ssm=113246208 conv=4423680 ple=368640 total=973676544
+[mem] cache VmHWM:	58371120 kB
+[mem] cache VmRSS:	  842060 kB
+[mem] cache ru_maxrss_kib=58371120
+[mem] cache gtt_used_bytes=72265629696
+[mem] cache MemAvailable:   57083012 kB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (DFLASH_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[cache] slot=1 ctx=32768 seconds=0.070 kv=805306368 indexer=50331648 ssm=113246208 conv=4423680 ple=368640 total=973676544
+[mem] cache VmHWM:	58371120 kB
+[mem] cache VmRSS:	  842060 kB
+[mem] cache ru_maxrss_kib=58371120
+[mem] cache gtt_used_bytes=73240805376
+[mem] cache MemAvailable:   56156416 kB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (DFLASH_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[cache] slot=2 ctx=32768 seconds=0.048 kv=805306368 indexer=50331648 ssm=113246208 conv=4423680 ple=368640 total=973676544
+[mem] cache VmHWM:	58371120 kB
+[mem] cache VmRSS:	  842060 kB
+[mem] cache ru_maxrss_kib=58371120
+[mem] cache gtt_used_bytes=74215981056
+[mem] cache MemAvailable:   55201500 kB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (DFLASH_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[cache] slot=3 ctx=32768 seconds=0.052 kv=805306368 indexer=50331648 ssm=113246208 conv=4423680 ple=368640 total=973676544
+[mem] cache VmHWM:	58371120 kB
+[mem] cache VmRSS:	  842060 kB
+[mem] cache ru_maxrss_kib=58371120
+[mem] cache gtt_used_bytes=75191156736
+[mem] cache MemAvailable:   54244304 kB
+[qwen4exp] context overflow: 32768 + 1 > 32768
+[overflow] request_ok=0 pos0=32768 n=1 max_ctx=32768 state_hash_before=7dbb4b8cf05c1183 state_hash_after=7dbb4b8cf05c1183 isolated=1
+[overflow] subsequent_valid_ok=1 logits=248320
+[mem] decode_workspace_ready VmHWM:	58371120 kB
+[mem] decode_workspace_ready VmRSS:	  949268 kB
+[mem] decode_workspace_ready ru_maxrss_kib=58371120
+[mem] decode_workspace_ready gtt_used_bytes=75221274624
+[mem] decode_workspace_ready MemAvailable:   54110200 kB
+[prefill] ok=1 tokens=16366 seconds=37.328 logits=248320 cache_pos=0
+[mem] prefill_done VmHWM:	58371120 kB
+[mem] prefill_done VmRSS:	 1666668 kB
+[mem] prefill_done ru_maxrss_kib=58371120
+[mem] prefill_done gtt_used_bytes=83521785856
+[mem] prefill_done MemAvailable:   38474608 kB
+probe_exit=0

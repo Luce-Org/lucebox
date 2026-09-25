@@ -1,0 +1,1188 @@
+2026-09-25T11:14:27+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 65.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (614Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 16.058
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 72265629696
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 614Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:29+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 79.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (1476Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 44.054
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905305088
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 1489Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:31+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 81.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2543Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 99.012
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905305088
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2544Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:33+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 83.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2715Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 107.029
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905305088
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2712Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:35+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 85.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2747Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 107.029
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905305088
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2747Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:37+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 81.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2491Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 102.035
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2492Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:39+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 86.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2689Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 108.075
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2688Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:41+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 83.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2749Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 106.026
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2750Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:43+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 84.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2525Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 91.061
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2528Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:45+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 87.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2699Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 102.045
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2698Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:48+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 85.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2687Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 100.005
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2686Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:50+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 84.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2691Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 100.01
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2691Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:52+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 87.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2694Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 101.062
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2693Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:54+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 88.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2680Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 100.004
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2680Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:56+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 86.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2676Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 100.004
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2676Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:14:58+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 87.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2644Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 103.038
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2644Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:15:00+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 88.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2674Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 100.027
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2674Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:15:02+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 86.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2658Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 100.016
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2658Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:15:05+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 86.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2548Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 98.028
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2552Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:15:07+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 87.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2668Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 100.055
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2668Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:15:09+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 91.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2663Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 100.017
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2662Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:15:11+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 80.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2435Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 91.05
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2436Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:15:13+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 86.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2672Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 100.083
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2673Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:15:15+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 86.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2669Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 99.073
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2670Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:15:17+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 93.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2670Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 100.011
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 74905509888
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2669Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:15:19+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 89.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk clock level: 6: (1850Mhz)
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2662Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 101.006
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 73729007616
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2660Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz *
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+2026-09-25T11:15:21+00:00
+platform_profile=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[1]		: Temperature (Sensor edge) (C): 89.0
+Exception caught: map::at
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[1]		: fclk current clock frequency not found
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 1: (2769Mhz)
+GPU[1]		: socclk current clock frequency not found
+====================================================================================
+============================== Show Performance Level ==============================
+GPU[1]		: Performance Level: auto
+====================================================================================
+================================ Power Consumption =================================
+, Not supported on the given system
+GPU[1]		: Average Graphics Package Power (W): 100.049
+====================================================================================
+=============================== Memory Usage (Bytes) ===============================
+GPU[1]		: GTT Total Memory (B): 103079215104
+GPU[1]		: GTT Total Used Memory (B): 73221562368
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+pp_dpm_sclk
+0: 600Mhz 
+1: 2770Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *

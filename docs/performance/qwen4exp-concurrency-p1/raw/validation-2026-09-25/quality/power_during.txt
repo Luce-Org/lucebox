@@ -1,0 +1,841 @@
+2026-09-25T16:26:43+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 623Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 32.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 40.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:26:58+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2844Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 32.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 58.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:27:13+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2895Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 59.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:27:28+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2882Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 65.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:27:43+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2889Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 32.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 67.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:27:58+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2871Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 32.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 72.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:28:14+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2887Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 74.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:28:29+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2893Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 75.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:28:44+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2883Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 77.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:28:59+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2890Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 32.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 80.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:29:14+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2885Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 83.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:29:29+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2888Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 85.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:29:44+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2789Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 95.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:29:59+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2886Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 90.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:30:14+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2890Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 90.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:30:29+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2865Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 94.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:30:44+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2877Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 95.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:31:00+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2881Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 94.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:31:15+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2863Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 93.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:31:30+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2887Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 93.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:31:45+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2861Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 96.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:32:00+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2858Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 92.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:32:15+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2893Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 91.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:32:30+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2891Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 93.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:32:45+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2886Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 32.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 92.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:33:00+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2896Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz *
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 32.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 91.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:33:15+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2583Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz *
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 32.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 98.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:33:30+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2566Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 32.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 96.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T16:33:46+00:00
+platform_profile=balanced
+pp_dpm_sclk
+0: 600Mhz 
+1: 2561Mhz *
+2: 2900Mhz 
+pp_dpm_fclk
+0: 400Mhz 
+1: 1000Mhz 
+2: 1200Mhz 
+3: 1400Mhz 
+4: 1600Mhz 
+5: 1700Mhz 
+6: 1850Mhz 
+7: 2000Mhz 
+pp_dpm_mclk
+0: 400Mhz 
+1: 800Mhz 
+2: 1000Mhz *
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 32.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 93.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================

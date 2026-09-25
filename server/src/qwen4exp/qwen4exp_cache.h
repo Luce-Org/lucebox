@@ -51,6 +51,16 @@ struct Qwen4ExpDecodeWorkspace {
     uint64_t stable_calls = 0;
 };
 
+// Shared arena for exact-width independent-sequence decode. Unlike the stable
+// single-slot graph, the graph is rebuilt for each call because its state
+// tensor edges depend on the active slot ordering. The metadata arena and
+// allocator backing storage are still shared across calls.
+struct Qwen4ExpBatchedDecodeWorkspace {
+    ggml_context * ctx = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    bool planned = false;
+};
+
 struct Qwen4ExpCache {
     ggml_context *        ctx     = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
@@ -100,6 +110,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
 void free_qwen4exp_cache(Qwen4ExpCache & c);
 
 void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace);
+void clear_qwen4exp_batched_decode_workspace(Qwen4ExpBatchedDecodeWorkspace & workspace);
 
 // Zero the recurrent state and conv history and reset cur_pos. KV is left
 // intact; callers that need a clean sequence also reset cur_pos themselves.
