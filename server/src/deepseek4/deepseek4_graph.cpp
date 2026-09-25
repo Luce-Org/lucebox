@@ -6433,7 +6433,9 @@ struct DeepSeek4LayerRangeCache {
         scratch.clear();
     }
 
-    void reset() {
+    // The index selection store is sized with the cache (create_deepseek4_cache)
+    // and survives a re-initialization for another layer range.
+    void reset(bool keep_index_selection = false) {
         for (auto & alloc : cached_attn_allocs) {
             alloc.free();
         }
@@ -6476,7 +6478,7 @@ struct DeepSeek4LayerRangeCache {
         hash_routing_tables.shrink_to_fit();
         scratch.clear();
         engram_apply.release();
-        index_selection.free();
+        if (!keep_index_selection) index_selection.free();
         owner_weights = nullptr;
         owner_ctx = nullptr;
         backend = nullptr;
@@ -8707,7 +8709,7 @@ static bool initialize_layer_range_cache(
         int layer_begin,
         int layer_end,
         bool owns_output) {
-    runtime.reset();
+    runtime.reset(/*keep_index_selection=*/true);
     if (layer_begin < 0 || layer_end < layer_begin || layer_end > w.n_layer) {
         std::fprintf(stderr,
                      "[deepseek4] invalid HC cache layer range [%d,%d) for %d layers\n",
@@ -11182,7 +11184,19 @@ bool create_deepseek4_cache(ggml_backend_t backend,
     }
 
     ggml_backend_buffer_clear(out.buf, 0);
-    const size_t total_bytes = ggml_backend_buffer_get_size(out.buf);
+    size_t total_bytes = ggml_backend_buffer_get_size(out.buf);
+    // A shared top-k selection (V4.1) is carried across a prompt's layer-major
+    // pass in a device store with a column per prompt token: size it for the
+    // whole context now, so the load-time fit check counts it.
+    if (w.shared_index_topk) {
+        if (!out.layer_range_cache) out.layer_range_cache = new DeepSeek4LayerRangeCache();
+        Ds4IndexSelectionStore & store = out.layer_range_cache->index_selection;
+        if (!store.ensure(backend, w, max_ctx)) {
+            std::fprintf(stderr, "[deepseek4] index selection store allocation failed (ctx=%d)\n", max_ctx);
+            return false;
+        }
+        total_bytes += ggml_nbytes(store.rows);
+    }
     std::fprintf(stderr, "[deepseek4] KV cache: %.1f MB for ctx=%d\n",
                  (double)total_bytes / (1024.0 * 1024.0), max_ctx);
     return true;
