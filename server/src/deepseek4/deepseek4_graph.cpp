@@ -2562,7 +2562,10 @@ static ggml_tensor * build_mla_attention_lane_core(
     // comp_kv: [head_dim, comp_cap] F16 compressed rows.
     // n_raw = min(kv_start + n_tokens, n_swa)
     const bool masked_kv = cached_inputs && cached_inputs->attn_row_mask;
-    const bool gathered_emits_comp = gathered_history && lane.write_comp &&
+    // A reader of a shared cache sees the row its kv source emitted for this
+    // token earlier in the graph, so the emit depends on the lane, not on
+    // whether this layer runs the compressor.
+    const bool gathered_emits_comp = gathered_history && lane.write_raw &&
         ratio > 0 && ((token_pos + 1) % ratio) == 0;
     const int n_comp_live = gathered_history
         ? lane.n_comp_history + (gathered_emits_comp ? 1 : 0) : lane.n_comp_live;
@@ -8690,20 +8693,21 @@ bool deepseek4_paged_gathered_step(
                                 bucket_history ? 1 : 0};
     for (uint32_t lane = 0; lane < lanes; ++lane) key.push_back(slots[lane]);
     // The gathered lane rows depend on the layer only through its compress
-    // ratio (0, 4, or 128), so prepare each ratio once per round and copy;
-    // the per-layer copies are still padded independently below.
-    std::vector<DeepSeek4GatheredLaneRows> rows_by_ratio[3];
-    bool rows_ready[3] = {false, false, false};
+    // ratio, so prepare each distinct ratio once per round and copy; the
+    // per-layer copies are still padded independently below.
+    std::vector<std::pair<uint32_t, std::vector<DeepSeek4GatheredLaneRows>>> rows_by_ratio;
     for (int il = 0; il < w.n_layer; ++il) {
         const uint32_t ratio = cache.layers[(size_t) il].ratio;
-        const int ri = ratio == 0 ? 0 : ratio == 4 ? 1 : 2;
-        if (!rows_ready[ri]) {
+        auto rows_it = std::find_if(rows_by_ratio.begin(), rows_by_ratio.end(),
+                                    [&](const auto & entry) { return entry.first == ratio; });
+        if (rows_it == rows_by_ratio.end()) {
+            rows_by_ratio.emplace_back(ratio, std::vector<DeepSeek4GatheredLaneRows>{});
+            rows_it = rows_by_ratio.end() - 1;
             if (!prepare_deepseek4_gathered_lane_rows(
                     slots, positions, lanes, block_tables, block_table_stride,
-                    cache.plan.physical_blocks, ratio, rows_by_ratio[ri])) return false;
-            rows_ready[ri] = true;
+                    cache.plan.physical_blocks, ratio, rows_it->second)) return false;
         }
-        prepared[(size_t) il] = rows_by_ratio[ri];
+        prepared[(size_t) il] = rows_it->second;
         for (auto & row : prepared[(size_t) il]) {
             if (bucket_history) {
                 row.raw_history.resize(
@@ -8715,7 +8719,8 @@ bool deepseek4_paged_gathered_step(
                 row.compressed_history.resize(
                     (size_t) ds4_padded_comp_rows(
                         (int) row.compressed_history_valid,
-                        (int) cache.layers[(size_t) il].physical_rows),
+                        // Readers pad to their kv source rows.
+                        (int) ds4_comp_cache(cache, w, il).physical_rows),
                     0);
             }
             key.push_back((int64_t) row.raw_history.size());
@@ -8910,12 +8915,14 @@ bool deepseek4_paged_gathered_step(
     // vector arithmetic. The default five-row cutoff sends eight-row prefill
     // parts to activation-quantized MMQ while four-client decode uses MMV,
     // which can change the next token for an identical prefix.
+    // V4.1 gathers under batch-invariant products, so a sequence decodes
+    // exactly as it does alone.
     ScopedCudaGraphOverrides monolithic_eager_scope(
         !hybrid, 0, false,
-        !hybrid ? GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS : 0);
-    const enum ggml_status status = fg->sched
-        ? ggml_backend_sched_graph_compute(fg->sched, fg->sg.gf)
-        : ggml_backend_graph_compute(backend, fg->sg.gf);
+        !hybrid ? GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS : 0,
+        /*mmvq_batch_invariant=*/w.hc_staggered_pre);
+    const enum ggml_status status =
+        ds4_fused_graph_compute(*fg, backend, hybrid, "deepseek4-paged");
     if (status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr,
             "[deepseek4-paged] gathered graph compute failed: status=%d\n",

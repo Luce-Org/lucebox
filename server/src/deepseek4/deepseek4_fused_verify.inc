@@ -249,6 +249,30 @@ static std::vector<MoeStreamedMailbox::Job> ds4_fused_stream_jobs(
     return jobs;
 }
 
+// Runs a fused graph, answering its streamed layers from the cache's
+// mailbox while it runs. A layer that could not be answered exactly fails
+// the launch.
+static enum ggml_status ds4_fused_graph_compute(
+        DeepSeek4FusedDecodeGraph & fg, ggml_backend_t backend, MoeHybridStorage * hybrid,
+        const char * who) {
+    MoeStreamedMailbox * mailbox =
+        hybrid && hybrid->expert_cache ? hybrid->expert_cache->mailbox() : nullptr;
+    const std::vector<MoeStreamedMailbox::Job> jobs =
+        mailbox ? ds4_fused_stream_jobs(fg) : std::vector<MoeStreamedMailbox::Job>{};
+    if (!jobs.empty()) mailbox->begin(jobs, ds4_fused_invalid_route());
+    enum ggml_status status = fg.sched
+        ? ggml_backend_sched_graph_compute(fg.sched, fg.sg.gf)
+        : ggml_backend_graph_compute(backend, fg.sg.gf);
+    if (!jobs.empty()) {
+        std::string error;
+        if (!mailbox->end(&error)) {
+            std::fprintf(stderr, "[%s] streamed experts: %s\n", who, error.c_str());
+            status = GGML_STATUS_FAILED;
+        }
+    }
+    return status;
+}
+
 template <typename T>
 static bool ds4_fused_read_route_matrix(
         ggml_tensor * tensor,
@@ -786,7 +810,7 @@ static bool ds4_build_fused_verify_graph(
                 if (comp_count > 0) {
                     indices = ggml_view_1d(ctx, ex.paged_gather, comp_count,
                         (size_t) comp_begin * sizeof(int32_t));
-                    comp_stage = ggml_get_rows(ctx, plc.comp_kv, indices);
+                    comp_stage = ggml_get_rows(ctx, cplc.comp_kv, indices);
                     ggml_build_forward_expand(gf, comp_stage);
                 }
             }
@@ -1269,8 +1293,9 @@ static bool ds4_build_fused_verify_graph(
                     return false;
                 }
                 ffn_out = inputs.output;
-                // Tokenwise lanes join like single-token decode.
-                if (lane_q > 1 && n_lanes == 1 && native_route_width &&
+                // The staggered pre-mix model joins like single-token decode
+                // (verify lanes and gathered sequences match it exactly).
+                if (lane_q > 1 && !w.hc_staggered_pre && native_route_width &&
                     mixed_policy.fused_hc_join &&
                     inputs.main_output && inputs.peer_output) {
                     fused_hc_join_inputs = &inputs;
@@ -1985,22 +2010,8 @@ static int ds4_try_fused_verify_step(
         /*skip_property_check=*/force_verify_graph_replay,
         /*ds4_mix_mmv_max_tokens=*/0,
         /*mmvq_batch_invariant=*/n_lanes > 1);
-    MoeStreamedMailbox * mailbox =
-        hybrid && hybrid->expert_cache ? hybrid->expert_cache->mailbox() : nullptr;
-    const std::vector<MoeStreamedMailbox::Job> stream_jobs =
-        mailbox ? ds4_fused_stream_jobs(*fg) : std::vector<MoeStreamedMailbox::Job>{};
-    if (!stream_jobs.empty()) mailbox->begin(stream_jobs, ds4_fused_invalid_route());
-    enum ggml_status compute_status = fg->sched
-        ? ggml_backend_sched_graph_compute(fg->sched, fg->sg.gf)
-        : ggml_backend_graph_compute(backend, fg->sg.gf);
-    if (!stream_jobs.empty()) {
-        std::string stream_error;
-        if (!mailbox->end(&stream_error)) {
-            std::fprintf(stderr, "[ds4-fused-verify] streamed experts: %s\n",
-                         stream_error.c_str());
-            compute_status = GGML_STATUS_FAILED;
-        }
-    }
+    const enum ggml_status compute_status =
+        ds4_fused_graph_compute(*fg, backend, hybrid, "ds4-fused-verify");
     if (compute_status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[ds4-fused-verify] compute failed\n");
         return -1;

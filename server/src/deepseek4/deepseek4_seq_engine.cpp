@@ -274,7 +274,12 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
 
     std::vector<float> logits;
     std::vector<int32_t> argmax;
-    const bool bucket_history = plan.prefills.empty() && b_.moe_hybrid_;
+    // Bucketed histories pad each lane's rows to a stride (masked), which
+    // changes the attention reduction. V4.1 buckets every hybrid step, so a
+    // sequence's arithmetic never depends on whether another one is still
+    // prefilling in the same step.
+    const bool bucket_history = b_.moe_hybrid_ &&
+        (plan.prefills.empty() || b_.w_.hc_staggered_pre);
     if (!deepseek4_paged_gathered_step(
             b_.backend_, b_.cfg_.device.gpu, b_.w_, b_.paged_cache_,
             embeddings.data(), lane_tokens.data(), lane_positions.data(),

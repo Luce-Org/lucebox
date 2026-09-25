@@ -1296,18 +1296,15 @@ bool DeepSeek4Backend::requires_monolithic_model() const {
            prefill_attention_mode_is_approximate(cfg_.prefill_mode);
 }
 
-// DeepSeek V4.1 runs on the host hyper-connection paths (hybrid token step
-// and layer-range step) with dense attention over its shared compressed
-// caches. The paths below do not implement its cache sharing or staggered
-// pre-mix yet, so refuse them instead of silently producing wrong tokens.
-// DSpark speculative decoding verifies through the layer-range step (see
-// deepseek4_step_layer_range), so it is allowed.
+// DeepSeek V4.1 runs with dense attention over its shared compressed caches
+// on the host hyper-connection paths, the fused whole-model graph (decode and
+// DSpark verify) and paged concurrent serving. The paths below do not
+// implement its cache sharing or staggered pre-mix yet, so refuse them
+// instead of silently producing wrong tokens.
 bool DeepSeek4Backend::validate_model_features() const {
     if (!w_.hc_staggered_pre) return true;
     const char * unsupported = nullptr;
-    if (cfg_.paged_attention) {
-        unsupported = "--paged-attention";
-    } else if (cfg_.fused_decode || env_flag_enabled("LUCE_DS4_FUSED_DECODE")) {
+    if (cfg_.fused_decode || env_flag_enabled("LUCE_DS4_FUSED_DECODE")) {
         unsupported = "fused decode";
     } else if (cfg_.fused_verify_f16_kv) {
         unsupported = "the fused verifier's F16 K/V";
@@ -2018,11 +2015,14 @@ bool DeepSeek4Backend::init() {
             "compute callback; select in-process LUCE_DS4_MOE_TP or disable paged attention\n");
         return false;
     }
+    // Streamed experts are served inside the gathered graph by the device
+    // cache (a third owner answered through its mailbox).
     if (cfg_.paged_attention && moe_hybrid_ &&
-        moe_hybrid_->streams_cold_experts()) {
+        moe_hybrid_->streams_cold_experts() && !moe_hybrid_->expert_cache) {
         std::fprintf(stderr,
             "[deepseek4] paged serving requires statically materialized "
-            "expert ownership; enable in-process LUCE_DS4_MOE_TP\n");
+            "expert ownership or the streamed expert cache; enable in-process "
+            "LUCE_DS4_MOE_TP\n");
         return false;
     }
 
