@@ -7,6 +7,7 @@
 #include "dflash_feature_ring.h"
 #include "dflash_capture.h"
 #include "attn_masks.h"
+#include "prefill_helpers.h"
 #include "common/kvflash_pager.h"
 
 #include "ggml.h"
@@ -240,7 +241,6 @@ bool run_qwen35_layer_split_forward(
     }
 
     Qwen35LayerSplitShard * current_shard = &shards.front();
-    std::vector<uint16_t> mask_buf;
     std::vector<int32_t> pos_buf;
     for (int il = 0; il < embed_source.n_layer; il++) {
         Qwen35LayerSplitShard * shard = find_layer_split_shard(shards, il);
@@ -335,10 +335,8 @@ bool run_qwen35_layer_split_forward(
                 const int win_start_l = (fa_window > 0 && kv_start > fa_window)
                                             ? (kv_start - fa_window) : 0;
                 const int win_len_l = kv_len - win_start_l;
-                const int kv_pad_override = (int)shard->layer_graph.attn_mask->ne[0];
-                build_causal_mask(mask_buf, win_len_l, n, kv_start, kq_stride_pad, win_start_l, kv_pad_override);
-                ggml_backend_tensor_set(shard->layer_graph.attn_mask, mask_buf.data(), 0,
-                                        sizeof(uint16_t) * mask_buf.size());
+                upload_qwen35_causal_mask_window(shard->layer_graph.attn_mask, win_len_l, n,
+                                                 kv_start, kq_stride_pad, win_start_l);
             }
             auto st = ggml_backend_graph_compute(shard->backend, shard->layer_graph.gf);
             if (st != GGML_STATUS_SUCCESS) {
@@ -438,7 +436,6 @@ bool run_qwen35_layer_split_layers_from_activation(
     ggml_tensor * act_in = acts.a;
     ggml_tensor * act_out = acts.b;
     Qwen35LayerSplitShard * current_shard = &shards.front();
-    std::vector<uint16_t> mask_buf;
     std::vector<int32_t> pos_buf;
 
     for (int il = shards.front().layer_begin; il < shards.back().layer_end; ++il) {
@@ -530,11 +527,8 @@ bool run_qwen35_layer_split_layers_from_activation(
                 const int win_start_l = (fa_window > 0 && kv_start > fa_window)
                                             ? (kv_start - fa_window) : 0;
                 const int win_len_l = kv_len - win_start_l;
-                const int kv_pad_override = (int)shard->layer_graph.attn_mask->ne[0];
-                build_causal_mask(mask_buf, win_len_l, n, kv_start, kq_stride_pad,
-                                  win_start_l, kv_pad_override);
-                ggml_backend_tensor_set(shard->layer_graph.attn_mask, mask_buf.data(), 0,
-                                        sizeof(uint16_t) * mask_buf.size());
+                upload_qwen35_causal_mask_window(shard->layer_graph.attn_mask, win_len_l, n,
+                                                 kv_start, kq_stride_pad, win_start_l);
             }
             if (tree_inputs && shard->layer_graph.parent_ids) {
                 if (!tree_inputs->parent_ids || tree_inputs->n_actual != n_tokens_total) {
