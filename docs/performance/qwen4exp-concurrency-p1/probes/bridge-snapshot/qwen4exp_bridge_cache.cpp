@@ -5,7 +5,7 @@
 #include <limits>
 #include <map>
 
-namespace dflash::common::qwen4exp_bridge {
+namespace luce::common::qwen4exp_bridge {
 namespace {
 
 using LiveTensors = std::map<std::string, ggml_tensor *>;
@@ -397,4 +397,4 @@ bool restore(ggml_backend_t backend, const Qwen4ExpWeights & w,
     return true;
 }
 
-} // namespace dflash::common::qwen4exp_bridge
+} // namespace luce::common::qwen4exp_bridge

@@ -3,8 +3,10 @@
 // production runtime mode. The public forward is renamed to avoid colliding
 // with dflash_common's production copy.
 #define qwen4exp_forward qwen4exp_forward_tail_replay_unused
+#define qwen4exp_forward_batched qwen4exp_forward_batched_tail_replay_unused
 #include "../src/qwen4exp/qwen4exp_graph.cpp"
 #undef qwen4exp_forward
+#undef qwen4exp_forward_batched
 
 #include "qwen4exp_tail_replay.h"
 
@@ -12,7 +14,7 @@
 #include <fstream>
 #include <limits>
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 constexpr int kBase = 992;
@@ -227,4 +229,4 @@ bool qwen4exp_tail_replay_992_100(ggml_backend_t backend,
     return true;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -493,6 +493,7 @@ add_library(luce_common STATIC
     src/qwen4exp/qwen4exp_loader.cpp
     src/qwen4exp/qwen4exp_cache.cpp
     src/qwen4exp/qwen4exp_graph.cpp
+    src/qwen4exp/qwen4exp_seq_engine.cpp
     src/qwen4exp/qwen4exp_backend.cpp
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
@@ -1768,6 +1769,11 @@ if(LUCE_TESTS)
         add_executable(smoke_qwen4exp_batched test/smoke_qwen4exp_batched.cpp)
         target_include_directories(smoke_qwen4exp_batched PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_qwen4exp_batched PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen4exp_seq_engine.cpp")
+        add_executable(test_qwen4exp_seq_engine test/test_qwen4exp_seq_engine.cpp)
+        target_include_directories(test_qwen4exp_seq_engine PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        target_link_libraries(test_qwen4exp_seq_engine PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_vs_oracle.cpp")
         add_executable(test_vs_oracle test/test_vs_oracle.cpp)

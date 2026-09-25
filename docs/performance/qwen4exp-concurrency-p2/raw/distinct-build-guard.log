@@ -1,0 +1,6 @@
+servers=
+GTT=18636800
+               total        used        free      shared  buff/cache   available
+Mem:             125          64          16           0          45          60
+Swap:              7           0           7
+GUARD_OK

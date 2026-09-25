@@ -7,7 +7,7 @@
 #include <set>
 #include <unordered_map>
 
-namespace dflash::common::qwen4exp_bridge {
+namespace luce::common::qwen4exp_bridge {
 namespace {
 
 constexpr char kMagic[] = "LBSNAP01";
@@ -399,4 +399,4 @@ bool compose_kv(const Checkpoint & native, const Checkpoint & donor,
     return true;
 }
 
-} // namespace dflash::common::qwen4exp_bridge
+} // namespace luce::common::qwen4exp_bridge

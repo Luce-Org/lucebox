@@ -19,8 +19,8 @@
 #include <string>
 #include <vector>
 
-using namespace dflash::common;
-using namespace dflash::common::qwen4exp_bridge;
+using namespace luce::common;
+using namespace luce::common::qwen4exp_bridge;
 
 namespace {
 
@@ -43,7 +43,7 @@ struct Runtime {
         }
         if (!load_qwen4exp_gguf(model, backend, weights)) {
             std::fprintf(stderr, "load_qwen4exp_gguf failed: %s\n",
-                         dflash27b_last_error());
+                         luce_last_error());
             return false;
         }
         if (!create_qwen4exp_cache(backend, weights, max_ctx,
@@ -65,10 +65,10 @@ struct Runtime {
 
 bool force_probe_environment() {
 #if defined(_WIN32)
-    return _putenv_s("DFLASH_HIP_NO_UMA_RING", "1") == 0 &&
+    return _putenv_s("LUCE_HIP_NO_UMA_RING", "1") == 0 &&
            _putenv_s("QWEN4EXP_DECODE_STABLEGRAPH", "0") == 0;
 #else
-    return setenv("DFLASH_HIP_NO_UMA_RING", "1", 1) == 0 &&
+    return setenv("LUCE_HIP_NO_UMA_RING", "1", 1) == 0 &&
            setenv("QWEN4EXP_DECODE_STABLEGRAPH", "0", 1) == 0;
 #endif
 }

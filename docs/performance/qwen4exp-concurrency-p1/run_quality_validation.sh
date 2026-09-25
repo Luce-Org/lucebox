@@ -47,13 +47,13 @@ flock -x /tmp/qwen-perf/gpu.lock bash -c 'set -euo pipefail
   pid=$!
   cleanup() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
   trap cleanup EXIT
-  tr "\0" "\n" < "/proc/$pid/environ" > "$OUT/server-environ.txt"
   for _ in $(seq 1 240); do
     if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/v1/models" > "$OUT/models.json"; then break; fi
     if ! kill -0 "$pid" 2>/dev/null; then tail -60 "$OUT/server.log"; exit 1; fi
     sleep 2
   done
   curl -fsS --max-time 2 "http://127.0.0.1:$PORT/v1/models" > "$OUT/models.json"
+  tr "\0" "\n" < "/proc/$pid/environ" > "$OUT/server-environ.txt"
   (while kill -0 "$pid" 2>/dev/null; do state; sleep 15; done) > "$OUT/power_during.txt" 2>&1 &
   mon=$!
   set +e

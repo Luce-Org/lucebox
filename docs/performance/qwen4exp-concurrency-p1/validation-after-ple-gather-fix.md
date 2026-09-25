@@ -39,3 +39,41 @@ result as evidence for those solo properties.
 
 Raw connection/build attempt context: this local report; the build tree and
 partial output, if any, remain under box `/tmp/qwen4exp-p1/`.
+
+## Completed validation rerun (supersedes E94's blocked status)
+
+The recovered box passed the pre-run guard: no exact-name `luce_server` or
+`dflash_server` process, card2 GTT 18,636,800 bytes, and 122 GiB available RAM.
+The source was copied into an isolated `/tmp/qwen4exp-p1-src`; the original box
+checkout was left untouched. A fresh Release build used
+`LUCE_GPU_BACKEND=hip`, gfx1151/ROCm 7.2.2, and `GGML_HIP_GRAPHS=OFF`, with
+`-j4`. `luce_server`, `smoke_qwen4exp_batched`, `smoke_qwen4exp_forward`, and
+the adapted bridge snapshot probe built successfully. The main build log is
+`raw/validation-2026-09-25/build.log`; probe build logs are alongside it.
+
+GPU gates serialized under `/tmp/qwen-perf/gpu.lock`, one IQ4_NL model at a
+time, with `HIP_VISIBLE_DEVICES=1` and `LUCE_HIP_NO_AUTO_UMA=1`. The platform
+profile remained `balanced`; the sampled pp_dpm state and temperatures are in
+the raw per-arm files. The `rocm-smi --showtemp` readings worked; the power
+selector was not used. `quality/server-environ.txt` is empty because its
+`/proc/PID/environ` read raced exec, but the run wrapper explicitly exported
+the delivered variables and its exact script is preserved locally.
+
+| Gate | Result |
+|---|---|
+| Solo quality | **PASS:** HE 10/10, GSM 10/10, Math 9/10, recall 2/2. The single Math miss is the known default-cap case; totals match the pre-fix baseline. |
+| `QWEN4EXP_UPSTREAM=1` reference differential | **PASS:** exit 0, no onset; expert-ID mismatches 0 across all 48 layers (160 choices/layer, final layer 10/10). Aligned activation ratios were 1.0000. |
+| C=1024 N=3 fresh-process snapshot | **PASS determinism; changed from pre-fix:** three 144,784,108-byte snapshots all hash to `05322458e34ee7b94be8cbdcb318f664a921bf699204426c6d8d20aec8a93596`. The pre-fix hash was `1f34fa0b724ae8ca93a1172077df1a02e8dc676b5d7b7c063a18b70a16bd926c`; same probe/format/config and size, so solo cache state changed, although it remains repeatable. |
+| Batched fixed-full probe | **PASS:** exit 0, `failures=0`; N=1 API logits and state are bit-identical to the single path; four identical rows remain bit-identical; `{3,1}` isolation, row permutation, and reset/reuse pass. |
+| Batched-vs-solo numerical margin | **Formal margin gate passes, but not suitable for serving:** max epsilon 1.96272445; distinct slot 2 changes 487→4876 at margin 0.163226 (<2ε=3.925449). Identical rows diverge from solo on decode step 3 (3710→13) at margin 0.146307 (<2ε=3.458492), while batch rows agree with each other. Keep the feature default-off. |
+
+The PLE serial-fallback fix therefore **does change the solo recurrent snapshot**
+relative to the old tree. It preserves N=3 byte repeatability and the quality
+suite and reference differential both pass. This establishes behavioral
+correction/compatibility for the measured gates, not byte identity to the old
+buggy solo state.
+
+Compact raw evidence (logs, environment, power samples, hashes; large `.lbsnap`
+payloads remain on the box under `/tmp/qwen4exp-p1-validation/snapshot/`) is in
+`raw/validation-2026-09-25/`. The adapted serializer probe source is under
+`probes/bridge-snapshot/`.

@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common::qwen4exp_bridge {
+namespace luce::common::qwen4exp_bridge {
 
 // Semantic state only. Runtime input rings and graph/workspace allocations are
 // deliberately recreated, not checkpointed.
@@ -39,4 +39,4 @@ bool compose_kv(const Checkpoint & native, const Checkpoint & donor,
                 Checkpoint & output, size_t * replacements = nullptr,
                 std::string * error = nullptr);
 
-} // namespace dflash::common::qwen4exp_bridge
+} // namespace luce::common::qwen4exp_bridge

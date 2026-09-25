@@ -4,7 +4,7 @@
 #include "qwen4exp/qwen4exp_cache.h"
 #include "qwen4exp/qwen4exp_internal.h"
 
-namespace dflash::common::qwen4exp_bridge {
+namespace luce::common::qwen4exp_bridge {
 
 bool validate_for_target(const Checkpoint & checkpoint,
                          const Qwen4ExpWeights & weights,
@@ -19,4 +19,4 @@ bool restore(ggml_backend_t backend, const Qwen4ExpWeights & weights,
              Qwen4ExpCache & cache, const Checkpoint & checkpoint,
              std::string * error = nullptr);
 
-} // namespace dflash::common::qwen4exp_bridge
+} // namespace luce::common::qwen4exp_bridge

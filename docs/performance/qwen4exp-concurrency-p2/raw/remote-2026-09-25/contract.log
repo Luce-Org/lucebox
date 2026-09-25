@@ -1,0 +1,22 @@
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 98304 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 98304 MiB
+[qwen4exp] qwen4exp trunk loaded: 48 layers (36 linear + 12 full), 1222 tensors 66.24 GiB from 3 shard(s), experts=10/512 hc=4/320 ple_layers=1 ngram=3 heads_per_ngram=8 table_rows=320001536 eos=248046
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[contract N=2] valid planned work must succeed: invalid or duplicate qwen4exp decode row
+[contract N=2] mixed prefill did not complete within bounded progress steps
+[contract N=2] both completed admissions must enter decode
+[contract N=2] valid planned work must succeed: invalid or duplicate qwen4exp decode row
+[contract N=4] valid planned work must succeed: invalid or duplicate qwen4exp decode row
+[contract N=4] mixed prefill did not complete within bounded progress steps
+[contract N=4] both completed admissions must enter decode
+[contract N=4] valid planned work must succeed: invalid or duplicate qwen4exp decode row
+[qwen4exp-seq] N=2 contract=FAIL soak=PASS
+[qwen4exp-seq] N=4 contract=FAIL soak=PASS
+EXIT=1

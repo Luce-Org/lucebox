@@ -38,7 +38,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `QWEN4EXP_HC_TILE16` | 1 | BURN-IN KILL SWITCH: =0 restores the original IQ4_NL hyper-connection tile. |
 | `QWEN4EXP_LAST_TOKEN_FFN` | 1 | BURN-IN KILL SWITCH: =0 evaluates all rows in the final FFN. |
 | `QWEN4EXP_DECODE_REUSE` / `QWEN4EXP_DECODE_STABLEGRAPH` | 1 | BURN-IN KILL SWITCHES: =0 disables T=1 context/allocator reuse or its stable bucketed graph. |
-| `QWEN4EXP_BATCHED_DECODE` | 0 | EXPERIMENTAL: =1 enables the independent-slot batched forward API. Default off; not wired into serving; excluded under `QWEN4EXP_UPSTREAM=1`. |
+| `QWEN4EXP_BATCHED_DECODE` | 0 | EXPERIMENTAL: =1 enables independent-slot batched decode; required with `LUCE_QWEN4EXP_SEQ_ENGINE=1`. Default off; excluded under `QWEN4EXP_UPSTREAM=1`. |
+| `LUCE_QWEN4EXP_SEQ_ENGINE` | unset | EXPERIMENTAL: =1 enables qwen4exp full-cache SeqEngine concurrency when paired with `QWEN4EXP_BATCHED_DECODE=1`, `--max-concurrency=2..4`, and `--max-ctx=32768`. No paging; excluded under upstream reference mode. |
 | `QWEN4EXP_RMS_SCALE_FUSED` | 1 | BURN-IN KILL SWITCH: =0 restores separate RMS-Norm and scale kernels. |
 | `QWEN4EXP_UPSTREAM` | unset | DEBUG: reference-compatible qwen4exp path used by the upstream differential harness. |
 | `QWEN4EXP_PROF` / `QWEN4EXP_FA_TELEMETRY` / `QWEN4EXP_STABLEGRAPH_TELEMETRY` | unset | DEBUG: qwen4exp phase, attention-route, and stable-graph telemetry. |

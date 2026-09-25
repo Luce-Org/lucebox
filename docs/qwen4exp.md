@@ -68,7 +68,8 @@ kill switches:
 | `QWEN4EXP_LAST_TOKEN_FFN` | `1` | Kill switch for final-row-only evaluation after the last layer has completed its state writes. |
 | `QWEN4EXP_DECODE_REUSE` | `1` | Kill switch for reuse of the T=1 ggml context and graph allocator. |
 | `QWEN4EXP_DECODE_STABLEGRAPH` | `1` | Kill switch for bucketed, pointer-stable T=1 graphs. HIP graph capture itself still depends on a `GGML_HIP_GRAPHS` build. |
-| `QWEN4EXP_BATCHED_DECODE` | `0` | Experimental opt-in for the exact-width independent-slot decode entry point. Excluded under `QWEN4EXP_UPSTREAM=1`; requires one shared `Qwen4ExpBatchedDecodeWorkspace`. Not enabled by the serving scheduler yet. |
+| `QWEN4EXP_BATCHED_DECODE` | `0` | Experimental opt-in for the exact-width independent-slot decode entry point. Excluded under `QWEN4EXP_UPSTREAM=1`; requires one shared `Qwen4ExpBatchedDecodeWorkspace`. |
+| `LUCE_QWEN4EXP_SEQ_ENGINE` | unset | Experimental full-cache sequence engine. Requires `QWEN4EXP_BATCHED_DECODE=1`, `--max-concurrency=2..4`, and `--max-ctx=32768`; reserves four F16 full caches at N=4 and does not use paging. |
 
 These variables are diagnostics and differential-test controls; they are not
 production tuning requirements:

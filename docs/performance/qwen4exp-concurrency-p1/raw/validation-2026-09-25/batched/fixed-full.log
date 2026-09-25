@@ -1,0 +1,46 @@
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 98304 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 98304 MiB
+[qwen4exp] qwen4exp trunk loaded: 48 layers (36 linear + 12 full), 1222 tensors 66.24 GiB from 3 shard(s), experts=10/512 hc=4/320 ple_layers=1 ngram=3 heads_per_ngram=8 table_rows=320001536 eos=248046
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[batch-probe] N=1-single-path=PASS
+[batch-probe] phase=identical N=4 ctx=32768 prefill=16
+[batch-probe] phase=identical step=0 slot=0 max_abs_delta=1.77092028 solo=13868 batch=13868 top2_margin=2.03042126 gate=pass
+[batch-probe] phase=identical step=0 slot=1 max_abs_delta=1.77092028 solo=13868 batch=13868 top2_margin=2.03042126 gate=pass
+[batch-probe] phase=identical step=0 slot=2 max_abs_delta=1.77092028 solo=13868 batch=13868 top2_margin=2.03042126 gate=pass
+[batch-probe] phase=identical step=0 slot=3 max_abs_delta=1.77092028 solo=13868 batch=13868 top2_margin=2.03042126 gate=pass
+[batch-probe] phase=identical step=0 epsilon_max=1.77092028
+[batch-probe] phase=identical step=1 slot=0 max_abs_delta=1.11633921 solo=271 batch=271 top2_margin=0.147638321 gate=pass
+[batch-probe] phase=identical step=1 slot=1 max_abs_delta=1.11633921 solo=271 batch=271 top2_margin=0.147638321 gate=pass
+[batch-probe] phase=identical step=1 slot=2 max_abs_delta=1.11633921 solo=271 batch=271 top2_margin=0.147638321 gate=pass
+[batch-probe] phase=identical step=1 slot=3 max_abs_delta=1.11633921 solo=271 batch=271 top2_margin=0.147638321 gate=pass
+[batch-probe] phase=identical step=1 epsilon_max=1.11633921
+[batch-probe] phase=identical step=2 slot=0 max_abs_delta=1.72924614 solo=3710 batch=13 top2_margin=0.146306992 gate=pass
+[batch-probe] phase=identical step=2 slot=1 max_abs_delta=1.72924614 solo=3710 batch=13 top2_margin=0.146306992 gate=pass
+[batch-probe] phase=identical step=2 slot=2 max_abs_delta=1.72924614 solo=3710 batch=13 top2_margin=0.146306992 gate=pass
+[batch-probe] phase=identical step=2 slot=3 max_abs_delta=1.72924614 solo=3710 batch=13 top2_margin=0.146306992 gate=pass
+[batch-probe] phase=identical step=2 epsilon_max=1.72924614
+[batch-probe] untouched-slot-isolation=PASS
+[batch-probe] row-permutation=PASS
+[batch-probe] cancel-reset-reuse=PASS reused_hash=d7957f92cc0f1673 fresh_cache_hash=d7957f92cc0f1673
+[batch-probe] N=1-single-path=PASS
+[batch-probe] phase=distinct N=4 ctx=32768 prefill=16
+[batch-probe] phase=distinct step=0 slot=0 max_abs_delta=1.77092028 solo=13868 batch=13868 top2_margin=2.03042126 gate=pass
+[batch-probe] phase=distinct step=0 slot=1 max_abs_delta=0.563452005 solo=271 batch=271 top2_margin=0.296365738 gate=pass
+[batch-probe] phase=distinct step=0 slot=2 max_abs_delta=1.96272445 solo=487 batch=4876 top2_margin=0.163226128 gate=pass
+[batch-probe] phase=distinct step=0 slot=3 max_abs_delta=1.5348742 solo=1249 batch=1249 top2_margin=1.09046555 gate=pass
+[batch-probe] phase=distinct step=0 epsilon_max=1.96272445
+[batch-probe] untouched-slot-isolation=PASS
+[batch-probe] row-permutation=PASS
+[batch-probe] cancel-reset-reuse=PASS reused_hash=d7957f92cc0f1673 fresh_cache_hash=d7957f92cc0f1673
+[batch-probe] PASS failures=0

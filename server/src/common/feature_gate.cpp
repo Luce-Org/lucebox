@@ -6,6 +6,8 @@
 #include "paged_attention_config.h"
 
 #include <climits>
+#include <cstdlib>
+#include <cstring>
 
 namespace luce::common {
 
@@ -273,9 +275,10 @@ std::string check_feature_compatibility(
         }
     }
 
-    // ── --max-concurrency × paged attention
-    // Concurrent decode slots are implemented by model-specific paged
-    // backends. The common scheduler does not require a particular
+    // ── --max-concurrency × model sequence-engine support
+    // Concurrent decode slots are implemented by model-specific engines.
+    // Most currently use paged K/V; qwen4exp v1 keeps full per-slot caches.
+    // The common scheduler does not require a particular
     // model-state representation; each backend owns whatever per-slot state
     // its graph needs alongside one block-table column per sequence.
     // Everything the paged cluster above rejects is transitively rejected,
@@ -285,7 +288,24 @@ std::string check_feature_compatibility(
     }
     if (args.max_concurrency > 1) {
         if (!args.paged_attention) {
-            return "--max-concurrency requires --paged-attention";
+            const char * seq = std::getenv("LUCE_QWEN4EXP_SEQ_ENGINE");
+            const char * batch = std::getenv("QWEN4EXP_BATCHED_DECODE");
+            const char * upstream = std::getenv("QWEN4EXP_UPSTREAM");
+            const bool qwen4exp_seq = arch == "qwen4exp" &&
+                seq && std::strcmp(seq, "1") == 0 &&
+                batch && std::strcmp(batch, "1") == 0 &&
+                !(upstream && std::atoi(upstream) != 0);
+            if (!qwen4exp_seq)
+                return "--max-concurrency requires --paged-attention";
+            if (args.max_concurrency > 4)
+                return "qwen4exp full-cache concurrency supports at most 4 slots";
+            if (args.kv_pool_tokens != 0)
+                return "qwen4exp full-cache concurrency does not use --kv-pool-tokens";
+            if (args.device.max_ctx != 32768)
+                return "qwen4exp v1 sequence engine requires --max-ctx 32768";
+            if (args.device.is_layer_split() || args.device.is_tensor_parallel() ||
+                args.remote_target_shard.enabled())
+                return "qwen4exp full-cache concurrency requires one local target device";
         }
         // Qwen's graph is qualified through 64 lanes. DeepSeek's gathered
         // whole-model graph has a smaller, separately qualified ceiling.
