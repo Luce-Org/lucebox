@@ -14,6 +14,7 @@
 #include <thread>
 
 #if !defined(_WIN32)
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -74,6 +75,23 @@ void advise_willneed(const void * map, size_t map_size, const ExpertRanges & ran
 }
 
 }  // namespace
+
+constexpr size_t kDirectAlign = 4096;
+
+// Reads [off, off + size) of `fd` (opened with O_DIRECT) into page-aligned
+// `buf` (capacity for size + 2 pages), returning where the bytes start.
+static const uint8_t * direct_read(int fd, uint8_t * buf, uint64_t off, size_t size) {
+    const uint64_t first = off & ~(uint64_t) (kDirectAlign - 1);
+    const uint64_t end = (off + size + kDirectAlign - 1) & ~(uint64_t) (kDirectAlign - 1);
+    size_t done = 0;
+    while (first + done < off + size) {
+        const ssize_t n = pread(fd, buf + done, (size_t) (end - first - done), (off_t) (first + done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return nullptr;
+        done += (size_t) n;
+    }
+    return buf + (off - first);
+}
 
 struct MoeStreamedExpertCache::Loader {
     void * staging = nullptr;  // pinned, one slot
@@ -206,10 +224,14 @@ bool MoeStreamedExpertCache::init(const MoeHybridConfig & cfg,
     for (int i = 0; i < n_loaders; ++i) {
         auto * l = new Loader();
         loaders_.push_back(l);
-        if (cudaMallocHost(&l->staging, slot_bytes_) != cudaSuccess) {
+        // Room for direct reads, which round each part out to whole pages.
+        if (cudaMallocHost(&l->staging, slot_bytes_ + 3 * 2 * kDirectAlign) != cudaSuccess) {
             l->staging = nullptr;
             return fail("failed to allocate pinned expert staging");
         }
+    }
+    if (!opts.direct_path.empty()) {
+        direct_fd_ = ::open(opts.direct_path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
     }
     for (Loader * l : loaders_) threads_.emplace_back(&MoeStreamedExpertCache::loader_main, this, l);
     if (!mailbox_.init(this, (int) storage.layers.size(), cfg.n_expert, cfg.n_expert_used, err)) {
@@ -238,6 +260,8 @@ void MoeStreamedExpertCache::destroy() {
         delete l;
     }
     loaders_.clear();
+    if (direct_fd_ >= 0) ::close(direct_fd_);
+    direct_fd_ = -1;
     for (auto & kv : graphs_) kv.second.free();
     graphs_.clear();
     views_.clear();
@@ -352,7 +376,17 @@ bool MoeStreamedExpertCache::load_slot(Loader & loader, int slot,
     const auto t0 = Clock::now();
     size_t at = 0;
     size_t staged_at[3] = {0, 0, 0};
-    for (int i = 0; i < 3; ++i) {
+    // Bulk loads read the drive directly into page-aligned staging.
+    bool direct = s.bulk && direct_fd_ >= 0;
+    for (int i = 0; i < 3 && direct; ++i) {
+        if (r.size[i] == 0) continue;
+        const uint8_t * src = direct_read(direct_fd_, staging + at, r.off[i], r.size[i]);
+        if (!src) { direct = false; break; }
+        staged_at[i] = (size_t) (src - staging);
+        at += (staged_at[i] - at + r.size[i] + kDirectAlign - 1) & ~(kDirectAlign - 1);
+    }
+    if (!direct) at = 0;
+    for (int i = 0; i < 3 && !direct; ++i) {
         if (r.size[i] == 0) continue;
         if (r.off[i] + r.size[i] > storage_->mmap_size) return false;
         std::memcpy(staging + at, file + r.off[i], r.size[i]);
@@ -375,15 +409,50 @@ bool MoeStreamedExpertCache::load_slot(Loader & loader, int slot,
 
 // ── Slots ───────────────────────────────────────────────────────────────
 
-int MoeStreamedExpertCache::evict_locked() {
-    int best = -1;
+int MoeStreamedExpertCache::evict_locked(bool refill) {
+    int best = -1, best_bulk = -1, n_bulk = 0;
     for (int i = 0; i < n_slots_; ++i) {
         const Slot & s = slots_[(size_t) i];
         if (s.state == SlotState::Empty) return i;
+        n_bulk += s.bulk ? 1 : 0;
         if (s.state != SlotState::Ready || s.pins > 0) continue;
         if (best < 0 || s.last_use < slots_[(size_t) best].last_use) best = i;
+        if (s.bulk && (best_bulk < 0 || s.last_use < slots_[(size_t) best_bulk].last_use)) best_bulk = i;
+    }
+    if (refill) return best_bulk;
+    // Bulk loads recycle their own slots once they hold half the pool.
+    if (bulk_ && n_bulk >= n_slots_ / 2 && best_bulk >= 0) return best_bulk;
+    if (bulk_ && best >= 0 && !slots_[(size_t) best].bulk) {
+        const Slot & s = slots_[(size_t) best];
+        evicted_hot_.push_back(key(s.layer, s.expert));
     }
     return best;
+}
+
+void MoeStreamedExpertCache::touch_locked(int slot) {
+    Slot & s = slots_[(size_t) slot];
+    s.last_use = ++tick_;
+    s.bulk = s.bulk && bulk_;
+}
+
+void MoeStreamedExpertCache::set_bulk(bool bulk) {
+    if (!ready()) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (bulk_ == bulk) return;
+    bulk_ = bulk;
+    if (bulk || evicted_hot_.empty()) return;
+    // Reload the evicted decode slots, most recently evicted first, after
+    // whatever the warm start still has to do.
+    if (warm_next_ >= warm_.size()) {
+        warm_.clear();
+        warm_next_ = 0;
+        warm_loads_ = warm_bytes_ = 0;
+        warm_t0_ = Clock::now();
+    }
+    refill_from_ = std::min(refill_from_, warm_.size());
+    warm_.insert(warm_.end(), evicted_hot_.rbegin(), evicted_hot_.rend());
+    evicted_hot_.clear();
+    cv_.notify_all();
 }
 
 int MoeStreamedExpertCache::warm(const MoeHybridRoutingStats & usage) {
@@ -428,18 +497,23 @@ int MoeStreamedExpertCache::next_warm_locked() {
         const size_t rank = warm_next_++;
         const uint64_t k = warm_[rank];
         if (slot_of_.count(k)) continue;  // a request loaded it already
-        const int slot = evict_locked();
-        if (slot < 0 || slots_[(size_t) slot].state != SlotState::Empty) {
+        // The warm start takes empty slots only; a refill also takes bulk
+        // slots nobody used since.
+        const bool refill = rank >= refill_from_;
+        const int slot = evict_locked(refill);
+        if (slot < 0 || (!refill && slots_[(size_t) slot].state != SlotState::Empty)) {
             warm_next_ = warm_.size();  // the pool is full: never evict for it
+            refill_from_ = SIZE_MAX;
             return -1;
         }
         Slot & s = slots_[(size_t) slot];
+        if (s.layer >= 0) slot_of_.erase(key(s.layer, s.expert));
         s = Slot{};
         s.layer = (int32_t) (k >> 32);
         s.expert = (int32_t) (uint32_t) k;
         s.state = SlotState::Loading;
         s.warm = true;
-        s.last_use = warm_.size() - rank;
+        s.last_use = refill ? ++tick_ : warm_.size() - rank;
         slot_of_[k] = slot;
         const ExpertRanges r = expert_ranges(storage_->layer_regions[(size_t) s.layer], s.expert);
         ++warm_loading_;
@@ -477,6 +551,7 @@ int MoeStreamedExpertCache::lookup_or_load_locked(int layer, int expert, bool fr
     s.state = SlotState::Loading;
     s.demand = front;
     s.prefetched = !front;
+    s.bulk = bulk_;
     s.last_use = ++tick_;
     slot_of_[k] = slot;
     const ExpertRanges r = expert_ranges(storage_->layer_regions[(size_t) layer], expert);
@@ -505,7 +580,7 @@ void MoeStreamedExpertCache::stage(int layer, const int32_t * selected, int n_ro
         if (slot < 0) break;  // eval waits for room instead
         if (std::find(staged_.begin(), staged_.end(), slot) != staged_.end()) continue;
         ++slots_[(size_t) slot].pins;
-        slots_[(size_t) slot].last_use = ++tick_;
+        touch_locked(slot);
         staged_.push_back(slot);
     }
 }
@@ -522,7 +597,7 @@ void MoeStreamedExpertCache::prefetch(int layer, const int32_t * experts, int n)
         bool hit = false;
         const int slot = lookup_or_load_locked(layer, experts[i], /*front=*/false, &hit);
         if (slot < 0) break;
-        if (hit) slots_[(size_t) slot].last_use = ++tick_;
+        if (hit) touch_locked(slot);
     }
 }
 
@@ -668,7 +743,7 @@ void MoeStreamedExpertCache::release_acquired() {
     std::lock_guard<std::mutex> lk(mu_);
     for (int slot : acquired_) {
         --slots_[(size_t) slot].pins;
-        slots_[(size_t) slot].last_use = ++tick_;
+        touch_locked(slot);
     }
     acquired_.clear();
     cv_.notify_all();
@@ -743,7 +818,7 @@ bool MoeStreamedExpertCache::eval(int layer, const MoeLayerDesc & desc,
             std::lock_guard<std::mutex> lk(mu_);
             for (int slot : slots) {
                 --slots_[(size_t) slot].pins;
-                slots_[(size_t) slot].last_use = ++tick_;
+                touch_locked(slot);
             }
         };
         {

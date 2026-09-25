@@ -12,7 +12,9 @@
 // can stage a layer's misses early and prefetch predicted experts of a later
 // layer; both only change when bytes move, never which experts are computed.
 // So does the warm start, which fills the empty pool after load with the
-// experts a usage profile ranks highest.
+// experts a usage profile ranks highest. A long prefill loads in bulk mode
+// (set_bulk): direct reads that bypass the page cache, recycled within half
+// the pool, so the decode working set and the page cache survive it.
 
 #pragma once
 
@@ -47,6 +49,9 @@ struct MoeExpertCacheOptions {
     size_t pool_bytes  = 0;   // 0 = free memory on `device` minus reserve_bytes
     size_t reserve_bytes = (size_t) 2 << 30;
     int    n_loaders   = 4;
+    // The file the storage maps from its first byte; bulk loads read it with
+    // O_DIRECT. Empty: bulk loads read through the mapping.
+    std::string direct_path;
 };
 
 class MoeStreamedExpertCache;
@@ -167,6 +172,15 @@ public:
     // that starts meanwhile is only ever sped up. Returns the number queued.
     int warm(const MoeHybridRoutingStats & usage);
 
+    // Bulk mode, for a long prefill that routes to most streamed experts.
+    // Its loads read the file with O_DIRECT (they neither go through nor
+    // evict the page cache the decode that follows relies on), and once bulk
+    // slots hold half the pool they recycle among themselves, so the slots
+    // decode used survive. Leaving bulk mode reloads, in the background and
+    // under the warm-start rules, the decode slots it evicted anyway (only
+    // into empty or bulk slots). Loads only move bytes: outputs never change.
+    void set_bulk(bool bulk);
+
     // Adds the weighted output of the streamed routes to out
     // ([n_embd, n_tokens], host). `selected` / `weights` are [n_used,
     // n_tokens]; routes the storage does not stream are skipped.
@@ -224,6 +238,7 @@ private:
         bool      demand = false;      // loaded because a layer needed it, unused
         bool      prefetched = false;  // loaded by prefetch, unused
         bool      warm = false;        // loaded by the warm start, unused
+        bool      bulk = false;        // loaded in bulk mode, not used outside it
         int       pins = 0;
         uint64_t  last_use = 0;
     };
@@ -259,7 +274,11 @@ private:
                           const int32_t * experts, size_t n, std::vector<int> & slots);
     // Drops the pins stage() took for `layer`.
     void release_staged(int layer);
-    int  evict_locked();
+    // `refill`: only an empty slot or a bulk slot nobody uses (warm loads).
+    int  evict_locked(bool refill = false);
+    // Caller holds mu_. Marks a slot used; outside bulk mode it joins the
+    // decode working set.
+    void touch_locked(int slot);
     // Caller holds mu_. Claims an empty slot for the next warm expert and
     // marks it loading; -1 when the warm list is done or no slot is empty.
     int  next_warm_locked();
@@ -293,6 +312,10 @@ private:
     std::deque<int> jobs_;
     std::vector<uint64_t> warm_;       // warm start keys, most used first
     size_t warm_next_ = 0;
+    size_t refill_from_ = SIZE_MAX;    // warm_ entries from here reload evicted decode slots
+    bool bulk_ = false;
+    int direct_fd_ = -1;               // the model file opened with O_DIRECT, or -1
+    std::vector<uint64_t> evicted_hot_; // decode slots bulk loads evicted, oldest first
     int warm_loading_ = 0;
     uint64_t warm_loads_ = 0, warm_bytes_ = 0;
     std::chrono::steady_clock::time_point warm_t0_;

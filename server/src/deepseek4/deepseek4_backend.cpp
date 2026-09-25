@@ -1579,8 +1579,10 @@ void DeepSeek4Backend::log_route_counts(const char * phase) {
     MoeHybridStorage::RouteCounts & c = moe_hybrid_->route_counts;
     const double total = (double) std::max<uint64_t>(1, c.total());
     const MoeHybridStreamEngine::Stats & st = stream_engine_.stats();
-    if (c.total() > 0 && expert_cache_.ready()) {
-        const MoeStreamedExpertCache::Stats cs = expert_cache_.stats();
+    const MoeStreamedExpertCache::Stats cs =
+        expert_cache_.ready() ? expert_cache_.stats() : MoeStreamedExpertCache::Stats{};
+    // The fused graph counts no host routes; its streamed loads still show.
+    if ((c.total() > 0 || cs.experts > 0) && expert_cache_.ready()) {
         const double used = (double) std::max<uint64_t>(1, cs.experts);
         std::fprintf(stderr, "[deepseek4] %s routed calls: %" PRIu64 " primary %.1f%%, secondary %.1f%%, "
                      "streamed %.1f%%; streamed %" PRIu64 " experts, cache hit %.1f%% (prefetched %.1f%%, warm %.1f%%), "
@@ -2154,6 +2156,7 @@ bool DeepSeek4Backend::init_streamed_expert_tier() {
         cache_opts.device = std::atoi(v);
     }
     cache_opts.reserve_bytes = ds4_device_headroom_bytes(cache_opts.device);
+    cache_opts.direct_path = cfg_.model_path;
     const char * cache_mb = std::getenv("LUCE_EXPERT_STREAM_CACHE_MB");
     const bool disabled = cache_mb && *cache_mb && std::atoll(cache_mb) == 0;
     if (!disabled) {
@@ -3221,6 +3224,18 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // retain the reference path there.  --chunk 1 is the explicit fallback.
     const int requested_chunk = cfg_.chunk > 0 ? cfg_.chunk : w_.n_swa;
     const int n_total = (int)tokens.size();
+    // A long prompt routes to most streamed experts: load them in bulk mode
+    // (direct reads, recycled within half the slot pool) so the decode that
+    // follows keeps its slots and the page cache.
+    constexpr int kBulkPrefillTokens = 256;
+    struct BulkLoads {
+        MoeStreamedExpertCache * cache = nullptr;
+        ~BulkLoads() { if (cache) cache->set_bulk(false); }
+    } bulk_loads;
+    if (expert_cache_.ready() && n_total >= kBulkPrefillTokens) {
+        expert_cache_.set_bulk(true);
+        bulk_loads.cache = &expert_cache_;
+    }
     // Bound the layer-major graph to the topology validated by the prefill
     // kernels. Smaller tail chunks use the same scheduler or its reference
     // fallback.
@@ -3907,6 +3922,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         std::fprintf(stderr, "[deepseek4] DSpark decode: %zu tok in %.3fs (%.1f tok/s) accept_rate=%.2f\n",
                      result.tokens.size(), result.decode_s,
                      result.decode_s > 0 ? result.tokens.size() / result.decode_s : 0.0, accept_rate);
+        log_route_counts("decode");
         maybe_save_routing_stats();
         return result;
     }
