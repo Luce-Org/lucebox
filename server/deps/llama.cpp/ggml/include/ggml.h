@@ -2884,6 +2884,12 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * input);
 
+    // The same blockwise FP4 round trip without the Hadamard rotation
+    // (DeepSeek V4.1 indexer queries and keys).
+    GGML_API struct ggml_tensor * ggml_ds4_indexer_qat_plain(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * input);
+
     // Compute the official ratio-4 indexer score matrix without materializing
     // [n_comp,n_head,n_tokens] per-head dots. q is F32
     // [128,n_head,n_tokens], head_weights is F32 [n_head,n_tokens], and

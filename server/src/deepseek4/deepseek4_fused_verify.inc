@@ -676,6 +676,9 @@ static bool ds4_build_fused_verify_graph(
     }
     // Staggered pre-mix: the pre coefficients of the previous sub-block.
     ggml_tensor * carried_pre = nullptr;
+    // The latest index source's top-k of each attention lane (paged: of each
+    // row), for the layers after it (w.shared_index_topk).
+    std::vector<ggml_tensor *> lane_selection((size_t) (paged_mode ? q : n_lanes), nullptr);
 
     for (int il = 0; il < w.n_layer; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t) il];
@@ -852,7 +855,10 @@ static bool ds4_build_fused_verify_graph(
                         rows.compressed_history.size(), comp_stage->nb[1],
                         (size_t) (px.comp_off - comp_begin) * comp_stage->nb[1])
                     : ggml_get_rows(ctx, cplc.comp_kv, px.comp_gather);
-                ggml_tensor * index_history = nullptr;
+                // V4.1 index sources score the index keys of the same rows.
+                ggml_tensor * index_history = w.shared_index_topk && cplc.index_comp_kv &&
+                        !rows.compressed_history.empty()
+                    ? ggml_get_rows(ctx, cplc.index_comp_kv, px.comp_gather) : nullptr;
                 // Stateless (ratio-1) sources carry no pooling state to view.
                 DeepSeek4CompressorState attn_state{}, index_state{};
                 if (ratio > 0 && rows.slot >= 0 && cplc.attn_compressor.state_kv) {
@@ -893,6 +899,7 @@ static bool ds4_build_fused_verify_graph(
                 lane.write_raw = rows.slot >= 0;
                 lane.write_comp = lane.write_raw && deepseek4_is_kv_source(w, il);
                 lane.attn_compressor = &attn_state; lane.indexer_compressor = &index_state;
+                lane.index_selection = &lane_selection[(size_t) t];
                 DeepSeek4AttentionGraphInputs ci{};
                 ci.rope_pos = px.pos; ci.neg_pos = px.neg_pos;
                 if (ratio == 4) {
@@ -1045,12 +1052,14 @@ static bool ds4_build_fused_verify_graph(
             lane_out = build_mla_attention(ctx, gf, normed, w, L, *lc, *comp_lc, il,
                                            a_kv_start, aq, &ain, i32b, i32ab, i64ab,
                                            &f32ab, attention_impl,
-                                           &ex.boundary_checkpoint.layers[(size_t) il]);
+                                           &ex.boundary_checkpoint.layers[(size_t) il], {},
+                                           &lane_selection[(size_t) lane]);
         } else {
             const DeepSeek4PreparedProjectedLane lane_proj =
                 ds4_slice_projected_lane(ctx, batched_lanes, w, a_start, ain.rope_pos);
-            const DeepSeek4MlaLaneBindings bindings = deepseek4_contiguous_lane_bindings(
+            DeepSeek4MlaLaneBindings bindings = deepseek4_contiguous_lane_bindings(
                 w, il, *lc, *comp_lc, a_token_pos);
+            bindings.index_selection = &lane_selection[(size_t) lane];
             if (!build_mla_attention_lane_core(
                     ctx, gf, normed, w, L, bindings, il, a_kv_start, aq, &ain,
                     i32b, i32ab, i64ab, &f32ab, attention_impl, &lane_proj, &lane_out)) {

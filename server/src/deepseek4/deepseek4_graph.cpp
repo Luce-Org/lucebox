@@ -313,11 +313,6 @@ struct DeepSeek4I32InputBinding {
     int32_t       value  = 0;
 };
 
-struct DeepSeek4I32ArrayBinding {
-    ggml_tensor *          tensor = nullptr;
-    std::vector<int32_t>   values;
-};
-
 struct DeepSeek4I64ArrayBinding {
     ggml_tensor *          tensor = nullptr;
     std::vector<int64_t>   values;
@@ -1152,6 +1147,7 @@ static bool build_compressor_prefill(
                                            1.0f, rope_attn,
                                            rope_yarn_beta_fast,
                                            rope_yarn_beta_slow, rope_orig_ctx);
+            index_key = ggml_ds4_indexer_qat_plain(ctx, ggml_cont(ctx, index_key));
         }
         pooled = build_tail_rope_2d(ctx, pooled, comp_pos, n_rot, head_dim,
                                     n_pooled,
@@ -1261,6 +1257,7 @@ static void build_compressor_step(
             index_key = build_tail_rope_2d(ctx, index_key, pos, n_rot, index_dim, n_emit,
                                            compress_rope_freq_base, r1_rope_scale, 1.0f, r1_rope_attn,
                                            rope_yarn_beta_fast, rope_yarn_beta_slow, rope_orig_ctx);
+            index_key = ggml_ds4_indexer_qat_plain(ctx, ggml_cont(ctx, index_key));
         }
         latent = build_tail_rope_2d(ctx, latent, pos, n_rot, head_dim, n_emit,
                                     compress_rope_freq_base, r1_rope_scale, 1.0f, r1_rope_attn,
@@ -1509,6 +1506,7 @@ static void build_compressor_step(
         index_key = build_tail_rope_2d(ctx, index_key, comp_pos, n_rot, index_dim, 1,
                                        compress_rope_freq_base, rope_scale, 1.0f, rope_attn,
                                        rope_yarn_beta_fast, rope_yarn_beta_slow, rope_orig_ctx);
+        index_key = ggml_ds4_indexer_qat_plain(ctx, ggml_cont(ctx, index_key));
     }
     pooled = build_tail_rope_2d(ctx, pooled, comp_pos, n_rot, head_dim, 1,
                                 compress_rope_freq_base, rope_scale, 1.0f, rope_attn,
@@ -1940,7 +1938,7 @@ ggml_tensor * deepseek4_indexer_visibility_suffix(
         (size_t) first_scored * mask->nb[1]));
 }
 
-static ggml_tensor * build_indexer_topk(
+ggml_tensor * deepseek4_build_indexer_topk(
         ggml_context * ctx,
         ggml_tensor * qr_norm,        // [n_lora_q, n_tokens]
         ggml_tensor * cur,            // [n_embd, n_tokens]
@@ -1950,6 +1948,7 @@ static ggml_tensor * build_indexer_topk(
         int n_comp,
         int kv_start,
         int n_tokens,
+        int ratio,
         ggml_tensor * rope_pos,
         ggml_tensor * visibility_mask,
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs) {
@@ -1965,10 +1964,10 @@ static ggml_tensor * build_indexer_topk(
     // A token with <= top_k visible compressed rows needs no ranking: selecting
     // [0,top_k) and retaining the ordinary causal mask is exactly equivalent.
     // Score only the suffix beginning with the first token that can see row
-    // top_k. For a zero-prefix ratio-4 2K request this shrinks 2164 score rows
-    // to just 113.
+    // top_k (position ratio * (top_k + 1) - 1). For a zero-prefix ratio-4 2K
+    // request this shrinks 2164 score rows to just 113.
     const int first_scored = std::max(
-        0, std::min(n_tokens, 4 * (top_k + 1) - 1 - kv_start));
+        0, std::min(n_tokens, ratio * (top_k + 1) - 1 - kv_start));
     const int n_scored = n_tokens - first_scored;
     if (n_scored <= 0) return nullptr;
 
@@ -1988,9 +1987,10 @@ static ggml_tensor * build_indexer_topk(
             (size_t) first_scored * rope_pos->nb[0]);
     }
 
-    // Official ratio-4 indexer graph: q_a-normalized query projection, tail
-    // RoPE, Hadamard+FP4 QAT, per-head scalar projection, ReLU dot products,
-    // weighted head reduction and top-512 selection for every query token.
+    // Official indexer graph: q_a-normalized query projection, tail RoPE,
+    // FP4 QAT (after a Hadamard rotation where w.indexer_rotate), per-head
+    // scalar projection, ReLU dot products, weighted head reduction and top-k
+    // selection for every query token.
     ggml_tensor * index_q = ggml_mul_mat(ctx, L.indexer_attn_q_b, qr_norm);
     index_q = ggml_reshape_3d(
         ctx, index_q, head_dim, n_indexer_head, n_scored);
@@ -2006,7 +2006,8 @@ static ggml_tensor * build_indexer_topk(
         n_scored, w.compress_rope_freq_base, rope_scale, 1.0f,
         rope_attn, w.rope_yarn_beta_fast, w.rope_yarn_beta_slow,
         (int) w.rope_orig_ctx);
-    index_q = ggml_ds4_indexer_qat(ctx, ggml_cont(ctx, index_q));
+    index_q = w.indexer_rotate ? ggml_ds4_indexer_qat(ctx, ggml_cont(ctx, index_q))
+                               : ggml_ds4_indexer_qat_plain(ctx, ggml_cont(ctx, index_q));
     // QAT emits power-of-two-scaled E2M1 values, all exactly representable in
     // FP16. For prefill-sized query batches, materializing that representation
     // once avoids converting the same query again in every compressed-row
@@ -2036,7 +2037,7 @@ static ggml_tensor * build_indexer_topk(
     // compressed rows are appended within the padding stride.
     ggml_tensor * scores = ggml_ds4_indexer_score_masked(
         ctx, index_q, head_weights, comp, visibility_mask,
-        kv_start + first_scored, 4);
+        kv_start + first_scored, ratio);
     ggml_tensor * selected = ggml_top_k(
         ctx, ggml_cont(ctx, scores), top_k);
     if (first_scored == 0) return selected;
@@ -2099,6 +2100,11 @@ struct DeepSeek4MlaLaneBindings {
     bool write_comp = true;
     DeepSeek4CompressorState * attn_compressor = nullptr;
     DeepSeek4CompressorState * indexer_compressor = nullptr;
+    // Top-k sharing (w.shared_index_topk): the selection of the latest index
+    // source ([top_k, n_tokens] I32, compressed-span indices, or null while
+    // every query sees at most top_k rows). An index source stores its own
+    // here; a layer after it attends over the one it finds.
+    ggml_tensor ** index_selection = nullptr;
     int n_comp_live = 0;
     int n_index_comp_live = 0;
     int n_comp_committed = 0;
@@ -2610,7 +2616,7 @@ static ggml_tensor * build_mla_attention_lane_core(
             ctx, comp_kv_source, lane.comp_read_rows);
         comp_history_source = lane.comp_history
             ? ggml_concat(ctx, lane.comp_history, emitted, 1) : emitted;
-        if (ratio == 4) {
+        if (ratio == 4 || (w.shared_index_topk && lane.index_comp_history)) {
             ggml_tensor * index_emitted = ggml_get_rows(
                 ctx, index_comp_kv_source, lane.index_comp_read_rows);
             index_comp_history_source = lane.index_comp_history
@@ -2619,13 +2625,37 @@ static ggml_tensor * build_mla_attention_lane_core(
         }
     }
     ggml_tensor * indexer_topk = nullptr;
-    if (attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
-        ratio == 4 && f32_array_inputs) {
+    // V4 runs its ratio-4 indexer on the sparse attention paths. With
+    // shared_index_topk (V4.1) an index source selects on every path and
+    // hands its selection to the layers after it (idx_src), which attend
+    // over exactly those rows (model.py Attention._compress_topk_idxs).
+    const bool shared_selection = w.shared_index_topk && ratio > 0;
+    const bool selects_topk = shared_selection
+        ? deepseek4_is_index_source(w, layer_idx)
+        : attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
+          ratio == 4 && f32_array_inputs;
+    if (shared_selection && !selects_topk && lane.index_selection) {
+        // A selection exists only while a query sees more than top_k rows,
+        // the same condition under which the index source built it.
+        ggml_tensor * selection = *lane.index_selection;
+        if (selection && n_comp_live > w.n_indexer_top_k && selection->ne[1] == n_tokens) {
+            indexer_topk = selection;
+        }
+    }
+    if (selects_topk) {
         int n_index_comp = 0;
         ggml_tensor * index_visibility_mask = nullptr;
         if (gathered_history) {
             n_index_comp = lane.n_index_comp_history +
                 (gathered_emits_comp ? 1 : 0);
+            if (masked_kv && n_index_comp > 0) {
+                // Bucketed histories pad the compressed rows; the lane's mask
+                // [raw history | current rows | compressed rows] hides them.
+                index_visibility_mask = ggml_cont(ctx, ggml_view_2d(
+                    ctx, cached_inputs->attn_row_mask, n_index_comp, n_tokens,
+                    cached_inputs->attn_row_mask->nb[1],
+                    (size_t) (lane.n_raw_history + n_tokens) * sizeof(float)));
+            }
         } else {
             const int n_index_comp_live = lane.n_index_comp_live;
             // Attention and index compression advance together at ratio 4.
@@ -2646,11 +2676,12 @@ static ggml_tensor * build_mla_attention_lane_core(
                     (size_t) w.n_swa * sizeof(float)));
             }
         }
-        indexer_topk = build_indexer_topk(
+        indexer_topk = deepseek4_build_indexer_topk(
             ctx, qr, cur, w, L, index_comp_history_source,
-            n_index_comp, kv_start, n_tokens, rope_pos,
+            n_index_comp, kv_start, n_tokens, ratio, rope_pos,
             index_visibility_mask,
             i32_array_inputs);
+        if (shared_selection && lane.index_selection) *lane.index_selection = indexer_topk;
     }
     // Maskless ratio-4 sparse prefill admission. This repeats the kernel's
     // ratio4_causal support check in fattn.cu exactly (indexed-row capacity,
@@ -2658,12 +2689,12 @@ static ggml_tensor * build_mla_attention_lane_core(
     // maskless op is only built when the kernel would accept it, otherwise
     // the explicit-mask path is built. Layer-major graphs execute directly,
     // so an op the kernel rejects would abort instead of falling back.
-    // indexer_topk only exists for ratio-4 layers, so `ratio` is 4 here.
+    // The kernel's analytic frontier is the ratio-4 one.
     constexpr int maskless_indexed_rows_cap = 512;  // fattn.cu top-k scan width
     const bool maskless_sparse_prefill =
         attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
         layer_major_batch && !gathered_history && !image_spans.size &&
-        indexer_topk && n_tokens > w.n_swa &&
+        indexer_topk && ratio == 4 && n_tokens > w.n_swa &&
         indexer_topk->ne[0] <= maskless_indexed_rows_cap &&
         n_prior_rows == std::min(kv_start, w.n_swa) &&
         n_comp_live == (kv_start + n_tokens) / ratio;
@@ -2864,7 +2895,7 @@ static ggml_tensor * build_mla_attention_lane_core(
     // row IDs. The CUDA/HIP kernel can derive the raw causal window and the
     // completed compressed-row frontier from kv_start and the query index.
     // Keep every other attention shape on the explicit mask contract.
-    const bool direct_indexer_topk = indexer_topk && !image_spans.size &&
+    const bool direct_indexer_topk = indexer_topk && ratio == 4 && !image_spans.size &&
         (maskless_sparse_prefill ||
          ds4_env_flag("LUCE_DS4_DIRECT_INDEXER_TOPK"));
     // Layer-major, non-indexed layers can skip the quadratic causal mask:
@@ -3004,8 +3035,9 @@ static ggml_tensor * build_mla_attention_lane_core(
             ctx, indexer_topk, n_comp_attn, n_old_rows);
     }
     // Preserve appended raw verifier rows as well as the learned top-k set.
-    if (indexer_topk) {
-        if (!score_mask && !direct_indexer_topk) {
+    // Numerical bands apply the selection to each band's own mask below.
+    if (indexer_topk && !exact_numerical_bands) {
+        if (!score_mask && !direct_indexer_topk && f32_array_inputs) {
             score_mask = ggml_new_tensor_2d(
                 ctx, GGML_TYPE_F32, n_attn, n_tokens);
             ggml_set_input(score_mask);
@@ -3013,6 +3045,14 @@ static ggml_tensor * build_mla_attention_lane_core(
                 score_mask,
                 std::vector<float>((size_t) n_attn * n_tokens, 0.0f),
             });
+        } else if (!score_mask && !direct_indexer_topk) {
+            // Graphs without host-filled inputs (cached and verify lanes)
+            // see every row: an all-zero base mask built in the graph.
+            ggml_tensor * zero = ggml_scale(
+                ctx, ggml_arange(ctx, 0.0f, (float) n_attn, 1.0f), 0.0f);
+            score_mask = ggml_repeat(
+                ctx, ggml_reshape_2d(ctx, zero, n_attn, 1),
+                ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_attn, n_tokens));
         }
         if (!direct_indexer_topk) {
             score_mask = ggml_ds4_indexer_mask(
@@ -3154,6 +3194,16 @@ static ggml_tensor * build_mla_attention_lane_core(
                 ggml_tensor * band_mask = make_band_mask(
                     band_pos, band_count, band_prior_count,
                     band_comp_count);
+                if (indexer_topk && band_comp_count > 0) {
+                    // The band's compressed rows are the same span the
+                    // selection indexes; keep only the selected ones.
+                    ggml_tensor * band_selection = ggml_cont(ctx, ggml_view_2d(
+                        ctx, indexer_topk, indexer_topk->ne[0], band_count,
+                        indexer_topk->nb[1], (size_t) band_start * indexer_topk->nb[1]));
+                    band_mask = ggml_ds4_indexer_mask(
+                        ctx, ggml_cont(ctx, band_mask), band_selection,
+                        band_prior_count + band_count);
+                }
                 ggml_tensor * band_context = make_flash(
                     view_q(band_start, band_count), band_kv, band_mask,
                     band_prior_count + band_count, band_pos);
@@ -3353,14 +3403,65 @@ static ggml_tensor * build_mla_attention(
         std::vector<DeepSeek4F32ArrayBinding> * f32_array_inputs = nullptr,
         DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit,
         DeepSeek4SpecBoundaryCheckpointLayer * boundary_checkpoint = nullptr,
-        vision::ImageSpanView image_spans = {}) {
+        vision::ImageSpanView image_spans = {},
+        ggml_tensor ** index_selection = nullptr) {
     DeepSeek4MlaLaneBindings lane = deepseek4_contiguous_lane_bindings(
         w, layer_idx, lc, comp_lc, kv_start + n_tokens - 1);
+    lane.index_selection = index_selection;
     return build_mla_attention_lane_core(
         ctx, gf, cur, w, L, lane, layer_idx, kv_start, n_tokens,
         cached_inputs, i32_inputs, i32_array_inputs, i64_array_inputs,
         f32_array_inputs, attention_impl, /*prepared=*/nullptr,
         /*out_attn_context=*/nullptr, boundary_checkpoint, image_spans);
+}
+
+// Carries an index source's top-k to the layers after it across the
+// per-layer attention graphs of the host paths (w.shared_index_topk): the
+// source's graph copies its selection into this device tensor, one column per
+// token of the step, and the next layers' graphs read it back. Sized once for
+// the widest step, so cached graphs never see it move.
+struct Ds4IndexSelectionStore {
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor * rows = nullptr;   // I32 [top_k, DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS]
+
+    bool ensure(ggml_backend_t backend, const DeepSeek4Weights & w) {
+        if (!w.shared_index_topk) return true;
+        if (rows) return true;
+        ggml_init_params params{};
+        params.mem_size = ggml_tensor_overhead();
+        params.no_alloc = true;
+        ctx = ggml_init(params);
+        if (!ctx) return false;
+        rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, w.n_indexer_top_k,
+                                  DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS);
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (!buf) { free(); return false; }
+        return true;
+    }
+    void free() {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+        buf = nullptr; ctx = nullptr; rows = nullptr;
+    }
+    // The carrier of tokens [first, first + count) in a graph under construction.
+    ggml_tensor * view(ggml_context * gctx, int first, int count) const {
+        if (!rows || first < 0 || first + count > rows->ne[1]) return nullptr;
+        return ggml_view_2d(gctx, rows, rows->ne[0], count, rows->nb[1], (size_t) first * rows->nb[1]);
+    }
+};
+
+// After an index source's attention graph is built: store the selection it
+// made (the carrier no longer points at the store view) for the next layers.
+static void ds4_publish_index_selection(ggml_context * ctx, ggml_cgraph * gf,
+                                        const DeepSeek4Weights & w, int il,
+                                        ggml_tensor * store_view, ggml_tensor * selection) {
+    if (!w.shared_index_topk || !deepseek4_is_index_source(w, il) || !store_view ||
+        !selection || selection == store_view) {
+        return;
+    }
+    GGML_ASSERT(ggml_are_same_shape(selection, store_view));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, selection, store_view));
 }
 
 struct DeepSeek4CachedDecodeHcPreGraph {
@@ -3611,7 +3712,8 @@ static bool build_cached_decode_attn_graph(
         int raw_attn_count,
         int comp_attn_count,
         int index_comp_count,
-        const Ds4DecodeSharedInputs * shared = nullptr) {
+        const Ds4DecodeSharedInputs * shared = nullptr,
+        const Ds4IndexSelectionStore * selection = nullptr) {
     out.free();
 
     const size_t ctx_size = 48 * 1024 * 1024;
@@ -3699,13 +3801,18 @@ static bool build_cached_decode_attn_graph(
     std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
     std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
     ggml_tensor * normed = build_rms_norm(out.sg.ctx, out.sg.inp_embed, L.attn_norm, w.rms_eps);
+    ggml_tensor * store_view = selection ? selection->view(out.sg.ctx, 0, 1) : nullptr;
+    ggml_tensor * index_selection = store_view;
     out.sg.hidden_states = build_mla_attention(out.sg.ctx, out.sg.gf, normed, w, L, lc, comp_lc, layer_idx,
                                                kv_start, 1, &out.inputs,
-                                               i32_inputs, i32_array_inputs, i64_array_inputs);
+                                               i32_inputs, i32_array_inputs, i64_array_inputs,
+                                               nullptr, DeepSeek4AttentionImpl::Explicit, nullptr, {},
+                                               &index_selection);
     if (!out.sg.hidden_states) {
         out.free();
         return false;
     }
+    ds4_publish_index_selection(out.sg.ctx, out.sg.gf, w, layer_idx, store_view, index_selection);
     ggml_set_output(out.sg.hidden_states);
     ggml_build_forward_expand(out.sg.gf, out.sg.hidden_states);
 
@@ -5292,6 +5399,7 @@ struct DeepSeek4HybridRuntime {
     HcWeightsCpu hc_output_weights;
     std::vector<HashRoutingTableCpu> hash_routing_tables;
     DeepSeek4EngramApplyRunner engram_apply;
+    Ds4IndexSelectionStore index_selection;
 
     void destroy() {
         reset_hc_layer_weights_cpu(hc_layer_weights);
@@ -5299,6 +5407,7 @@ struct DeepSeek4HybridRuntime {
         hash_routing_tables.clear();
         hash_routing_tables.shrink_to_fit();
         engram_apply.release();
+        index_selection.free();
         owner_ctx = nullptr;
     }
 };
@@ -5431,7 +5540,8 @@ static bool deepseek4_step_hybrid(
     }
     std::vector<float> engram_keys;
     if (!ds4_engram_read_keys(w, cache.engram_tokens, token_ids, kv_start, n_tokens,
-                              engram_keys, telemetry)) {
+                              engram_keys, telemetry) ||
+        !runtime.index_selection.ensure(backend, w)) {
         return false;
     }
 
@@ -5487,10 +5597,15 @@ static bool deepseek4_step_hybrid(
         ggml_cgraph * gf = ggml_new_graph(ctx);
 
         ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
+        ggml_tensor * store_view = runtime.index_selection.view(ctx, 0, n_tokens);
+        ggml_tensor * index_selection = store_view;
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, comp_lc, il,
                                                      kv_start, n_tokens, nullptr,
                                                      i32_inputs, i32_array_inputs,
-                                                     i64_array_inputs);
+                                                     i64_array_inputs, nullptr,
+                                                     DeepSeek4AttentionImpl::Explicit, nullptr, {},
+                                                     &index_selection);
+        ds4_publish_index_selection(ctx, gf, w, il, store_view, index_selection);
         // Output just attn_out (HC post handles the residual mixing)
         ggml_build_forward_expand(gf, attn_out);
         ggml_gallocr_t attn_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -6234,6 +6349,7 @@ struct DeepSeek4LayerRangeCache {
     Ds4DecodeSharedInputs decode_shared_inputs;
     DeepSeek4LayerRangeScratch scratch;
     DeepSeek4EngramApplyRunner engram_apply;
+    Ds4IndexSelectionStore index_selection;
 
     bool matches(const DeepSeek4Weights & w,
                  ggml_backend_t candidate_backend,
@@ -6337,6 +6453,7 @@ struct DeepSeek4LayerRangeCache {
         hash_routing_tables.shrink_to_fit();
         scratch.clear();
         engram_apply.release();
+        index_selection.free();
         owner_weights = nullptr;
         owner_ctx = nullptr;
         backend = nullptr;
@@ -7457,6 +7574,7 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
         DeepSeek4AttentionImpl attention_impl,
         std::vector<float> & attn_out_host,
         DeepSeek4CachedLayerAlloc & attn_alloc,
+        const Ds4IndexSelectionStore & selection,
         DeepSeek4StepTelemetry * telemetry) {
     if (!backend || !cur || n_tokens <= 1 || kv_start < 0) return false;
 
@@ -7479,10 +7597,13 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
         ggml_cgraph * gf = ggml_new_graph_custom(
             ctx, ds4_attn_step_graph_size(1), false);
         ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
+        ggml_tensor * store_view = selection.view(ctx, ti, 1);
+        ggml_tensor * index_selection = store_view;
         ggml_tensor * attn_out = build_mla_attention(
             ctx, gf, normed, w, L, lc, comp_lc, il, kv_start + ti, 1, nullptr,
             i32_inputs, i32_array_inputs, i64_array_inputs, &f32_array_inputs,
-            attention_impl);
+            attention_impl, nullptr, {}, &index_selection);
+        ds4_publish_index_selection(ctx, gf, w, il, store_view, index_selection);
         ggml_set_output(attn_out);
         ggml_build_forward_expand(gf, attn_out);
 
@@ -7575,6 +7696,7 @@ static bool ds4_run_verify_attention(
         std::vector<float> & attn_out_host,
         DeepSeek4CachedLayerAlloc & attn_alloc,
         Ds4VerifyWindowRows * window_rows,
+        const Ds4IndexSelectionStore & selection,
         DeepSeek4StepTelemetry * telemetry) {
     const auto build_t0 = Ds4TimingClock::now();
     const int n_embd = w.n_embd;
@@ -7647,8 +7769,11 @@ static bool ds4_run_verify_attention(
             ds4_slice_projected_lane(ctx, batched, w, t, inputs.rope_pos);
         ggml_tensor * lane_cur = ggml_view_2d(ctx, normed, n_embd, 1, normed->nb[1],
                                               (size_t) t * normed->nb[1]);
-        const DeepSeek4MlaLaneBindings lane =
+        DeepSeek4MlaLaneBindings lane =
             deepseek4_contiguous_lane_bindings(w, il, lc, comp_lc, pos);
+        ggml_tensor * store_view = selection.view(ctx, t, 1);
+        ggml_tensor * index_selection = store_view;
+        lane.index_selection = &index_selection;
         ggml_tensor * lane_context = nullptr;
         if (!build_mla_attention_lane_core(
                 ctx, gf, lane_cur, w, L, lane, il, pos, 1, &inputs,
@@ -7658,6 +7783,7 @@ static bool ds4_run_verify_attention(
             ggml_free(ctx);
             return false;
         }
+        ds4_publish_index_selection(ctx, gf, w, il, store_view, index_selection);
         ggml_build_forward_expand(gf, lane_context);
         context = context ? ggml_concat(ctx, context, lane_context, 1) : lane_context;
         if (keep_window_rows) {
@@ -9608,6 +9734,10 @@ bool deepseek4_step_layer_range(
                               engram_keys, telemetry)) {
         return false;
     }
+    if (!layer_range_cache.index_selection.ensure(backend, w)) {
+        std::fprintf(stderr, "[deepseek4] index selection store allocation failed\n");
+        return false;
+    }
 
     bool backend_decode_hc_supported = true;
     for (int il = layer_begin; il < layer_end; ++il) {
@@ -9864,7 +9994,7 @@ bool deepseek4_step_layer_range(
                 if (!ds4_run_verify_attention(
                         backend, w, L, lc, comp_lc, il, cur.data(), n_tokens, kv_start,
                         attn_out_host, cached_attn_allocs[(size_t) il],
-                        verify_hooks->window_rows, telemetry)) {
+                        verify_hooks->window_rows, layer_range_cache.index_selection, telemetry)) {
                     return false;
                 }
             } else if (exact_tokenwise_prefill) {
@@ -9875,7 +10005,8 @@ bool deepseek4_step_layer_range(
                 if (!ds4_run_exact_tokenwise_prefill_attention(
                         backend, w, L, lc, comp_lc, il, cur.data(), n_tokens, kv_start,
                         attention_impl, attn_out_host,
-                        cached_attn_allocs[(size_t) il], telemetry)) {
+                        cached_attn_allocs[(size_t) il], layer_range_cache.index_selection,
+                        telemetry)) {
                     return false;
                 }
             } else if (reuse_decode_attn) {
@@ -9918,7 +10049,7 @@ bool deepseek4_step_layer_range(
                     const auto attn_build_t0 = Ds4TimingClock::now();
                     if (!build_cached_decode_attn_graph(candidate, backend, w, L, lc, comp_lc, il, kv_start,
                                                         n_raw, n_comp_attn, n_index_comp,
-                                                        shared_inputs)) {
+                                                        shared_inputs, &layer_range_cache.index_selection)) {
                         // Out of memory (tight primary GPU in split mode):
                         // the decode attention graphs accumulate one ~16 MiB
                         // entry per (layer, shape) as n_comp grows. Evict all
@@ -9945,7 +10076,7 @@ bool deepseek4_step_layer_range(
                         if (!build_cached_decode_attn_graph(
                                 candidate2, backend, w, L, lc, comp_lc, il, kv_start,
                                 n_raw, n_comp_attn, n_index_comp,
-                                shared_inputs)) {
+                                shared_inputs, &layer_range_cache.index_selection)) {
                             std::fprintf(stderr,
                                          "[deepseek4] cached attn graph alloc failed layer %d "
                                          "after eviction\n", il);
@@ -10039,6 +10170,8 @@ bool deepseek4_step_layer_range(
                         : heterogeneous_batched_prefill
                             ? DeepSeek4AttentionImpl::DenseFlash
                             : DeepSeek4AttentionImpl::Explicit;
+                ggml_tensor * store_view = layer_range_cache.index_selection.view(ctx, 0, n_tokens);
+                ggml_tensor * index_selection = store_view;
                 attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, comp_lc, il,
                                                kv_start, n_tokens, nullptr,
                                                i32_inputs, i32_array_inputs,
@@ -10046,8 +10179,10 @@ bool deepseek4_step_layer_range(
                                                &f32_array_inputs,
                                                attention_impl,
                                                /*boundary_checkpoint=*/nullptr,
-                                               image_batch ? image_spans : vision::ImageSpanView{});
+                                               image_batch ? image_spans : vision::ImageSpanView{},
+                                               &index_selection);
                 if (!attn_out) { ggml_free(ctx); return false; }
+                ds4_publish_index_selection(ctx, gf, w, il, store_view, index_selection);
                 ggml_set_output(attn_out);
                 ggml_build_forward_expand(gf, attn_out);
 

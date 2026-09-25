@@ -1725,6 +1725,210 @@ static void test_engram_apply_released_weights(ggml_backend_t backend, const cha
     std::fprintf(stderr, " %s\n", g_failures ? "done" : "ok");
 }
 
+// ─── V4.1 indexer against DeepSeek's reference (inference/model.py) ─────
+
+// kernel.py fp4_act_quant(x, 32, inplace=True): per 32-block E8M0 scale
+// 2^ceil(log2(amax / 6)), values rounded to E2M1 (ties to even), no rotation.
+static void reference_fp4_round_trip(float * row, int width) {
+    for (int block = 0; block < width / 32; ++block) {
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(row[block * 32 + i]));
+        amax = std::max(amax, 7.052966104933725e-38f);
+        const float scale = std::exp2(std::ceil(std::log2(amax / 6.0f)));
+        for (int i = 0; i < 32; ++i) {
+            float & v = row[block * 32 + i];
+            v = reference_e2m1_round(std::clamp(v / scale, -6.0f, 6.0f)) * scale;
+        }
+    }
+}
+
+// model.py precompute_freqs_cis + apply_rotary_emb on the last n_rot dims
+// (YaRN with the compressed layers' base and the checkpoint's factor).
+static void reference_tail_rope(float * x, int width, int n_rot, int pos, const DeepSeek4Weights & w) {
+    const double base = w.compress_rope_freq_base, factor = w.rope_scale_factor;
+    const double orig = (double) w.rope_orig_ctx;
+    auto corrected = [&](double rotations) {
+        return n_rot * std::log(orig / (rotations * 2 * M_PI)) / (2 * std::log(base));
+    };
+    const double low = std::max(std::floor(corrected(w.rope_yarn_beta_fast)), 0.0);
+    const double high = std::min(std::ceil(corrected(w.rope_yarn_beta_slow)), (double) n_rot - 1);
+    float * tail = x + (width - n_rot);
+    for (int i = 0; i < n_rot / 2; ++i) {
+        double freq = 1.0 / std::pow(base, 2.0 * i / n_rot);
+        const double ramp = std::clamp((i - low) / std::max(high - low, 1e-3), 0.0, 1.0);
+        freq = freq / factor * ramp + freq * (1.0 - ramp);
+        const double a = pos * freq, c = std::cos(a), s = std::sin(a);
+        const double x0 = tail[2 * i], x1 = tail[2 * i + 1];
+        tail[2 * i] = (float) (x0 * c - x1 * s);
+        tail[2 * i + 1] = (float) (x0 * s + x1 * c);
+    }
+}
+
+// model.py Indexer.forward for `n_tokens` queries at kv_start.. over `n_comp`
+// index keys: fp4 queries (after RoPE) against the stored keys, ReLU, head
+// weights weights_proj(x) * (128^-0.5 * n_heads^-0.5), rows past the query's
+// compress_len masked, top-k. Returns the selected rows per token, sorted.
+static std::vector<std::vector<int>> reference_indexer_topk(
+        const DeepSeek4Weights & w, const std::vector<float> & wq_b, const std::vector<float> & proj,
+        const std::vector<float> & qr, const std::vector<float> & x, const std::vector<float> & keys,
+        int q_lora, int n_embd, int n_comp, int kv_start, int n_tokens, int ratio,
+        std::vector<double> * margins) {
+    const int H = w.n_indexer_head, D = w.n_indexer_head_dim, K = w.n_indexer_top_k;
+    std::vector<std::vector<int>> out((size_t) n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        const int visible = std::min(n_comp, (kv_start + t + 1) / ratio);
+        std::vector<double> score((size_t) n_comp, -1e300);
+        std::vector<float> q((size_t) H * D);
+        for (int o = 0; o < H * D; ++o) {
+            double acc = 0.0;
+            for (int i = 0; i < q_lora; ++i) acc += (double) wq_b[(size_t) o * q_lora + i] * qr[(size_t) t * q_lora + i];
+            q[(size_t) o] = (float) acc;
+        }
+        for (int h = 0; h < H; ++h) {
+            reference_tail_rope(q.data() + (size_t) h * D, D, w.n_rot, kv_start + t, w);
+            reference_fp4_round_trip(q.data() + (size_t) h * D, D);
+        }
+        std::vector<double> hw((size_t) H);
+        for (int h = 0; h < H; ++h) {
+            double acc = 0.0;
+            for (int i = 0; i < n_embd; ++i) acc += (double) proj[(size_t) h * n_embd + i] * x[(size_t) t * n_embd + i];
+            hw[(size_t) h] = acc / std::sqrt((double) D * H);
+        }
+        for (int c = 0; c < visible; ++c) {
+            double sc = 0.0;
+            for (int h = 0; h < H; ++h) {
+                double dot = 0.0;
+                for (int d = 0; d < D; ++d) dot += (double) q[(size_t) h * D + d] * keys[(size_t) c * D + d];
+                sc += std::max(dot, 0.0) * hw[(size_t) h];
+            }
+            score[(size_t) c] = sc;
+        }
+        std::vector<int> order((size_t) n_comp);
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return score[(size_t) a] > score[(size_t) b]; });
+        const int k = std::min(K, visible);
+        out[(size_t) t].assign(order.begin(), order.begin() + k);
+        std::sort(out[(size_t) t].begin(), out[(size_t) t].end());
+        if (margins) {
+            // Relative gap between the last selected and the first dropped row.
+            const double s1 = score[(size_t) order[(size_t) k - 1]];
+            margins->push_back(k < visible
+                ? (s1 - score[(size_t) order[(size_t) k]]) / std::max(std::fabs(s1), 1e-30) : 1e300);
+        }
+    }
+    return out;
+}
+
+// deepseek4_build_indexer_topk with the V4.1 geometry (32 heads x 128, top
+// 512, no rotation) on synthetic weights, against the reference: every
+// query's selection must match wherever the reference's 512th and 513th
+// scores are not a near tie; queries that see at most 512 rows select them
+// all, and a step where none sees more than 512 builds no selection (dense).
+static void test_v41_indexer_topk(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_v41_indexer_topk (%s) ...", name);
+    DeepSeek4Weights w;
+    w.n_indexer_head = 32;
+    w.n_indexer_head_dim = 128;
+    w.n_indexer_top_k = 512;
+    w.n_rot = 64;
+    w.indexer_rotate = false;
+    w.shared_index_topk = true;
+    w.compress_rope_freq_base = 160000.0f;
+    w.rope_scale_factor = 16.0f;
+    w.rope_yarn_beta_fast = 32.0f;
+    w.rope_yarn_beta_slow = 1.0f;
+    w.rope_orig_ctx = 65536;
+    constexpr int q_lora = 64, n_embd = 96, H = 32, D = 128;
+    TestLcg rng(41u);
+    std::vector<float> wq_b((size_t) H * D * q_lora), proj((size_t) H * n_embd);
+    for (auto & v : wq_b) v = 0.2f * rng.next();
+    for (auto & v : proj) v = rng.next();
+    int checked = 0, near_ties = 0;
+    struct Case { int ratio, n_comp, kv_start, n_tokens; bool dense; };
+    const Case cases[] = {
+        {1, 700, 697, 3, false},   // decode/verify-like rows past top_k
+        {2, 600, 1020, 6, false},  // ratio 2: the first tokens still see <= 512 rows
+        {1, 700, 505, 4, true},    // nobody sees more than 512 rows: dense
+    };
+    for (const Case & cs : cases) {
+        std::vector<float> keys((size_t) cs.n_comp * D), qr((size_t) cs.n_tokens * q_lora),
+                           x((size_t) cs.n_tokens * n_embd);
+        for (int c = 0; c < cs.n_comp; ++c) {
+            for (int d = 0; d < D; ++d) keys[(size_t) c * D + d] = rng.next();
+            reference_fp4_round_trip(keys.data() + (size_t) c * D, D);   // stored fp4
+        }
+        for (auto & v : qr) v = rng.next();
+        for (auto & v : x) v = rng.next();
+
+        ggml_init_params params{};
+        params.mem_size = 256 * ggml_tensor_overhead() + ggml_graph_overhead_custom(256, false);
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        DeepSeek4Layer L{};
+        L.indexer_attn_q_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_lora, H * D);
+        L.indexer_proj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, H);
+        ggml_tensor * comp = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D, cs.n_comp);
+        ggml_tensor * qr_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_lora, cs.n_tokens);
+        ggml_tensor * x_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, cs.n_tokens);
+        ggml_tensor * pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, cs.n_tokens);
+        for (ggml_tensor * t : {qr_t, x_t, pos_t}) ggml_set_input(t);
+        ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        std::vector<DeepSeek4I32ArrayBinding> arrays;
+        ggml_tensor * sel = deepseek4_build_indexer_topk(ctx, qr_t, x_t, w, L, comp, cs.n_comp, cs.kv_start,
+                                                         cs.n_tokens, cs.ratio, pos_t, nullptr, arrays);
+        if (cs.dense) {
+            TEST_ASSERT_MSG(sel == nullptr, "a step with <= top_k visible rows builds no selection");
+            ggml_backend_buffer_free(wbuf);
+            ggml_free(ctx);
+            continue;
+        }
+        TEST_ASSERT(sel != nullptr);
+        if (!sel || !wbuf) { ggml_free(ctx); continue; }
+        ggml_set_output(sel);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 256, false);
+        ggml_build_forward_expand(gf, sel);
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        TEST_ASSERT(ggml_gallocr_alloc_graph(alloc, gf));
+        ggml_backend_tensor_set(L.indexer_attn_q_b, wq_b.data(), 0, wq_b.size() * 4);
+        ggml_backend_tensor_set(L.indexer_proj, proj.data(), 0, proj.size() * 4);
+        std::vector<ggml_fp16_t> keys16(keys.size());
+        ggml_fp32_to_fp16_row(keys.data(), keys16.data(), (int64_t) keys.size());
+        ggml_backend_tensor_set(comp, keys16.data(), 0, keys16.size() * 2);
+        ggml_backend_tensor_set(qr_t, qr.data(), 0, qr.size() * 4);
+        ggml_backend_tensor_set(x_t, x.data(), 0, x.size() * 4);
+        std::vector<int32_t> pos((size_t) cs.n_tokens);
+        for (int t = 0; t < cs.n_tokens; ++t) pos[(size_t) t] = cs.kv_start + t;
+        ggml_backend_tensor_set(pos_t, pos.data(), 0, pos.size() * 4);
+        for (const auto & b : arrays) {
+            ggml_backend_tensor_set(b.tensor, b.values.data(), 0, b.values.size() * 4);
+        }
+        TEST_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        std::vector<int32_t> got((size_t) ggml_nelements(sel));
+        ggml_backend_tensor_get(sel, got.data(), 0, got.size() * 4);
+        std::vector<double> margins;
+        const auto want = reference_indexer_topk(w, wq_b, proj, qr, x, keys, q_lora, n_embd, cs.n_comp,
+                                                 cs.kv_start, cs.n_tokens, cs.ratio, &margins);
+        const int k = (int) sel->ne[0];
+        for (int t = 0; t < cs.n_tokens; ++t) {
+            const int visible = (cs.kv_start + t + 1) / cs.ratio;
+            std::vector<int> rows(got.begin() + (ptrdiff_t) t * k, got.begin() + (ptrdiff_t) (t + 1) * k);
+            // A query that sees <= top_k rows keeps [0, top_k); the causal
+            // mask hides the ones past its frontier.
+            std::vector<int> mine;
+            for (int r : rows) if (r < visible) mine.push_back(r);
+            std::sort(mine.begin(), mine.end());
+            if (margins[(size_t) t] < 1e-4) { ++near_ties; continue; }
+            TEST_ASSERT_MSG(mine == want[(size_t) t], "indexer selection differs from the reference");
+            ++checked;
+        }
+        ggml_gallocr_free(alloc);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx);
+    }
+    std::fprintf(stderr, " %d queries match, %d near ties skipped %s\n", checked, near_ties,
+                 g_failures ? "done" : "ok");
+}
+
 static void test_hash_routing_lookup() {
     std::fprintf(stderr, "  test_hash_routing_lookup ...");
 
@@ -8145,6 +8349,7 @@ int main(int argc, char ** argv) {
     test_indexer_mask_cpu(backend);
     test_engram_apply_synthetic(backend, "cpu");
     test_engram_apply_released_weights(backend, "cpu");
+    test_v41_indexer_topk(backend, "cpu");
     test_ds4_ratio4_causal_visibility_formula();
     test_dspark_seed_row_restore_cpu();
     test_hash_routing_lookup();
@@ -8204,6 +8409,7 @@ int main(int argc, char ** argv) {
             for (int mode = 0; mode < 3; ++mode) test_dspark_compressor_rollback(gpu, mode);
             test_engram_apply_synthetic(gpu, "gpu");
             test_engram_apply_released_weights(gpu, "gpu");
+            test_v41_indexer_topk(gpu, "gpu");
             ggml_backend_free(gpu);
         } else {
             std::fprintf(stderr, "  test_dspark_compressor_rollback GPU skipped (no device)\n");

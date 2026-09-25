@@ -9518,6 +9518,14 @@ struct ggml_tensor * ggml_ds4_indexer_qat(
     return result;
 }
 
+struct ggml_tensor * ggml_ds4_indexer_qat_plain(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * input) {
+    struct ggml_tensor * result = ggml_ds4_indexer_qat(ctx, input);
+    ggml_set_op_params_i32(result, 0, 1);   // skip the Hadamard rotation
+    return result;
+}
+
 struct ggml_tensor * ggml_ds4_indexer_score_masked(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,

@@ -2116,6 +2116,10 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     // pre-mix and normalizes the HC mixes with norm_eps (model.py hc_mixes).
     out.attn_q_head_norm = !is_v41;
     out.hc_staggered_pre = is_v41;
+    // V4.1 shares each index source's top-k with the layers after it and
+    // quantizes indexer queries and keys without a Hadamard rotation.
+    out.shared_index_topk = is_v41;
+    out.indexer_rotate = !is_v41;
     if (is_v41) out.hc_eps = rms_eps;
 
     {

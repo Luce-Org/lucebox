@@ -275,6 +275,12 @@ struct DeepSeek4Weights {
     // Forward-pass rules that differ between the families (set by the loader).
     bool attn_q_head_norm = true;    // unit-RMS per query head after wq_b (V4 only)
     bool hc_staggered_pre = false;   // V4.1 pre-mix: see ds4_hc_collapse in the graph
+    // Indexer. V4 selects per ratio-4 layer on the sparse attention paths and
+    // rotates queries and keys (Hadamard) before their FP4 round trip. V4.1
+    // selects at every index source on every path, hands the selection to the
+    // layers after it (idx_src), and quantizes without the rotation.
+    bool shared_index_topk = false;
+    bool indexer_rotate = true;
 
     // Candidate block pre-selection (V4.1): the index sources after
     // candidate_source_layer restrict their top-k to the candidate blocks
@@ -381,7 +387,7 @@ inline bool deepseek4_is_index_source(const DeepSeek4Weights & w, int il) {
 inline int deepseek4_kv_source_layer(const DeepSeek4Weights & w, int il) {
     return (il >= 0 && (size_t) il < w.kv_src.size()) ? w.kv_src[(size_t) il] : il;
 }
-// Layer whose top-k `il` reuses. TODO(deepseek41): carry the top-k.
+// Layer whose top-k `il` reuses (see DeepSeek4Weights::shared_index_topk).
 inline int deepseek4_index_source_layer(const DeepSeek4Weights & w, int il) {
     return (il >= 0 && (size_t) il < w.idx_src.size()) ? w.idx_src[(size_t) il] : il;
 }
@@ -529,6 +535,23 @@ ggml_tensor * deepseek4_indexed_attention_rows(
 // tensor before the ring writes; row indices are supplied again on each replay.
 ggml_tensor * deepseek4_preserve_raw_rows(
     ggml_context * ctx, ggml_tensor * raw_kv, ggml_tensor * rows);
+
+// An I32 graph input and the values the caller uploads before computing.
+struct DeepSeek4I32ArrayBinding {
+    ggml_tensor *          tensor = nullptr;
+    std::vector<int32_t>   values;
+};
+
+// The indexer's top-k compressed rows for every query token ([top_k,
+// n_tokens] I32, indices into index_comp), or null when no token sees more
+// than top_k rows (attention over every visible row is then the same). Tokens
+// that see at most top_k rows get [0, top_k) and rely on the causal mask.
+ggml_tensor * deepseek4_build_indexer_topk(
+    ggml_context * ctx, ggml_tensor * qr_norm, ggml_tensor * cur,
+    const DeepSeek4Weights & w, const DeepSeek4Layer & L,
+    ggml_tensor * index_comp, int n_comp, int kv_start, int n_tokens, int ratio,
+    ggml_tensor * rope_pos, ggml_tensor * visibility_mask,
+    std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs);
 
 // Keep a per-token indexer visibility mask aligned with the scored suffix.
 ggml_tensor * deepseek4_indexer_visibility_suffix(

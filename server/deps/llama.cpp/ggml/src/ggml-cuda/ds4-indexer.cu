@@ -72,7 +72,8 @@ static __global__ void ds4_indexer_qat_kernel(
         const float * src,
         int64_t       n_rows,
         int64_t       src_row_stride,
-        int64_t       dst_row_stride) {
+        int64_t       dst_row_stride,
+        bool          rotate) {
     constexpr int WIDTH = 128;
     constexpr float HADAMARD_SCALE = 0.08838834764831845f;
     const int64_t row = (int64_t) blockIdx.x;
@@ -86,7 +87,7 @@ static __global__ void ds4_indexer_qat_kernel(
     values[tid] = src_row[tid];
     __syncthreads();
 
-    for (int stride = 1; stride < WIDTH; stride <<= 1) {
+    for (int stride = 1; rotate && stride < WIDTH; stride <<= 1) {
         if ((tid & stride) == 0) {
             const int base =
                 (tid & ~(2 * stride - 1)) + (tid & (stride - 1));
@@ -98,7 +99,7 @@ static __global__ void ds4_indexer_qat_kernel(
         __syncthreads();
     }
 
-    const float value = values[tid] * HADAMARD_SCALE;
+    const float value = rotate ? values[tid] * HADAMARD_SCALE : values[tid];
     const int block = tid >> 5;
     const int lane = tid & 31;
     const int block_base = block * 32;
@@ -141,7 +142,8 @@ void ggml_cuda_op_ds4_indexer_qat(
     ds4_indexer_qat_kernel<<<(unsigned) n_rows, 128, 0, stream>>>(
         static_cast<float *>(dst->data),
         static_cast<const float *>(src->data),
-        n_rows, src_row_stride, dst_row_stride);
+        n_rows, src_row_stride, dst_row_stride,
+        ggml_get_op_params_i32(dst, 0) == 0);
     CUDA_CHECK(cudaGetLastError());
 }
 
