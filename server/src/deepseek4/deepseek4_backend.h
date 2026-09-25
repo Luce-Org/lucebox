@@ -236,6 +236,7 @@ private:
     bool init_hybrid_model();
     bool init_streamed_expert_tier();
     bool check_device_headroom() const;
+    bool log_device_memory(const char * when) const;
     void size_hybrid_prefill_chunk();
     bool requires_monolithic_model() const;
     bool validate_prefill_mode() const;

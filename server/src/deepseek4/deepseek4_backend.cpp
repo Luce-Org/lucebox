@@ -1608,6 +1608,9 @@ void DeepSeek4Backend::log_route_counts(const char * phase) {
     }
     c = {};
     stream_engine_.reset_stats();
+    // Runtime allocations (graph caches, prefill scratch) must stay inside
+    // the headroom the fit check left; report where each phase ends.
+    if (moe_hybrid_) log_device_memory(phase);
 }
 
 bool DeepSeek4Backend::validate_prefill_mode() const {
@@ -2213,10 +2216,12 @@ bool DeepSeek4Backend::init_streamed_expert_tier() {
     return true;
 }
 
-// Logs every device's memory once everything persistent is allocated and
-// refuses a configuration that leaves less than the device's headroom, rather
-// than let the driver overcommit it at the first request.
-bool DeepSeek4Backend::check_device_headroom() const {
+// Logs every device's used / total / free memory against its headroom.
+// At load (`when` null) every device must keep the whole headroom free; while
+// serving, the prefill chunk may spend half of it (size_hybrid_prefill_chunk)
+// and the decode/verify graphs the rest, so a phase only warns below half.
+// False when a device is below its limit.
+bool DeepSeek4Backend::log_device_memory(const char * when) const {
     std::vector<int> devices = {cfg_.device.gpu};
     if (stream_cache_device_ >= 0 && stream_cache_device_ != cfg_.device.gpu) {
         devices.push_back(stream_cache_device_);
@@ -2225,13 +2230,24 @@ bool DeepSeek4Backend::check_device_headroom() const {
     for (int device : devices) {
         size_t free_b = 0, total_b = 0;
         ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
-        const size_t need = ds4_device_headroom_bytes(device);
-        std::fprintf(stderr, "[deepseek4] device %d memory: %.2f of %.2f GiB used, %.2f GiB free "
-                     "(headroom %.2f GiB)%s\n", device, (total_b - free_b) / 1073741824.0,
-                     total_b / 1073741824.0, free_b / 1073741824.0, need / 1073741824.0,
-                     free_b < need ? ": does not fit" : "");
+        const size_t headroom = ds4_device_headroom_bytes(device);
+        const size_t need = when ? headroom / 2 : headroom;
+        std::fprintf(stderr, "[deepseek4] device %d memory%s%s: %.2f of %.2f GiB used, %.2f GiB free "
+                     "(headroom %.2f GiB)%s\n", device, when ? " " : "", when ? when : "",
+                     (total_b - free_b) / 1073741824.0,
+                     total_b / 1073741824.0, free_b / 1073741824.0, headroom / 1073741824.0,
+                     free_b < need ? (when ? ": runtime allocations ate more than half the headroom"
+                                           : ": does not fit") : "");
         ok = ok && free_b >= need;
     }
+    return ok;
+}
+
+// Logs every device's memory once everything persistent is allocated and
+// refuses a configuration that leaves less than the device's headroom, rather
+// than let the driver overcommit it at the first request.
+bool DeepSeek4Backend::check_device_headroom() const {
+    const bool ok = log_device_memory(nullptr);
     if (!ok) {
         std::fprintf(stderr, "[deepseek4] the configuration does not fit the devices with their "
                      "headroom; lower LUCE_EXPERT_BUDGET_MB / LUCE_EXPERT_SECONDARY_BUDGET_MB, "
