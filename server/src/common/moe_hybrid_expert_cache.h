@@ -323,10 +323,11 @@ private:
 struct MoeExpertPromoterOptions {
     int    device = 0;                 // GPU that holds the primary stacks
     double max_bytes_per_s = 1.0e9;    // background copy budget
-    double decay = 0.97;               // heat kept per rebalance tick
-    int    tick_ms = 50;
-    double min_heat = 4.0;             // an expert must be at least this hot
-    double hysteresis = 1.5;           // challenger heat / resident heat to swap
+    double decay = 0.995;              // heat kept per rebalance tick (~20 s memory)
+    int    tick_ms = 100;
+    int    move_interval_ms = 500;     // at most one move per interval
+    double min_heat = 32.0;            // an expert must be at least this hot
+    double hysteresis = 2.0;           // challenger heat / resident heat to swap
 };
 
 class MoeExpertPromoter {

@@ -1139,6 +1139,17 @@ bool MoeExpertPromoter::copy_expert(int layer, int row, int expert) {
     const MoeHybridLayerStorage & st = storage_->layers[(size_t) layer];
     const ExpertRanges r = expert_ranges(storage_->layer_regions[(size_t) layer], expert);
     const auto * file = static_cast<const uint8_t *>(storage_->mmap_data);
+    // An expert the secondary stack owns is copied device to device from it,
+    // so promotion never competes with streamed loads for the SSD.
+    const int cold_local = (size_t) expert < st.cold_local_by_global.size()
+        ? st.cold_local_by_global[(size_t) expert] : -1;
+    const ggml_tensor * src_t[3] = {
+        st.gate_up_cold ? st.gate_up_cold : st.gate_cold,
+        st.gate_up_cold ? nullptr : st.up_cold,
+        st.down_cold,
+    };
+    const bool from_peer = cold_local >= 0 && src_t[0] && src_t[2] &&
+        storage_->cold_backend_kind == MoeHybridColdBackend::Gpu;
     ggml_tensor * dst_t[3] = {
         st.gate_up_hot ? st.gate_up_hot : st.gate_hot,
         st.gate_up_hot ? nullptr : st.up_hot,
@@ -1153,11 +1164,19 @@ bool MoeExpertPromoter::copy_expert(int layer, int row, int expert) {
             at + r.size[i] > staging_bytes_ || (hot_row + 1) * r.size[i] > ggml_nbytes(dst_t[i])) {
             return false;
         }
-        std::memcpy(staging + at, file + r.off[i], r.size[i]);
-        if (cudaMemcpyAsync(static_cast<uint8_t *>(dst_t[i]->data) + hot_row * r.size[i],
-                            staging + at, r.size[i], cudaMemcpyHostToDevice,
-                            static_cast<cudaStream_t>(stream_)) != cudaSuccess) {
-            return false;
+        uint8_t * dst = static_cast<uint8_t *>(dst_t[i]->data) + hot_row * r.size[i];
+        if (from_peer && src_t[i]) {
+            const auto * src = static_cast<const uint8_t *>(src_t[i]->data) + (size_t) cold_local * r.size[i];
+            if (cudaMemcpyAsync(dst, src, r.size[i], cudaMemcpyDeviceToDevice,
+                                static_cast<cudaStream_t>(stream_)) != cudaSuccess) {
+                return false;
+            }
+        } else {
+            std::memcpy(staging + at, file + r.off[i], r.size[i]);
+            if (cudaMemcpyAsync(dst, staging + at, r.size[i], cudaMemcpyHostToDevice,
+                                static_cast<cudaStream_t>(stream_)) != cudaSuccess) {
+                return false;
+            }
         }
         at += r.size[i];
     }
@@ -1175,6 +1194,7 @@ bool MoeExpertPromoter::copy_expert(int layer, int row, int expert) {
 void MoeExpertPromoter::worker() {
     cudaSetDevice(opts_.device);
     std::unique_lock<std::mutex> lk(mu_);
+    auto next_move = std::chrono::steady_clock::now();
     while (!stopping_) {
         cv_.wait_for(lk, std::chrono::milliseconds(opts_.tick_ms));
         if (stopping_) break;
@@ -1229,7 +1249,8 @@ void MoeExpertPromoter::worker() {
                 target_row = cool_row; evict = true;
             }
         }
-        if (best_layer < 0) continue;
+        if (best_layer < 0 || std::chrono::steady_clock::now() < next_move) continue;
+        next_move = std::chrono::steady_clock::now() + std::chrono::milliseconds(opts_.move_interval_ms);
         Row & row = rows_[(size_t) best_layer][(size_t) target_row];
         if (evict) {
             row.state = RowState::Leaving;
