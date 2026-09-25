@@ -10,11 +10,14 @@
 
 #include "qwen4exp_internal.h"
 #include "qwen4exp_cache.h"
+#include "qwen4exp_seq_engine.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
 
 #include <string>
+#include <memory>
+#include <vector>
 
 namespace luce::common {
 
@@ -23,6 +26,7 @@ struct Qwen4ExpBackendConfig {
     DevicePlacement device;
     int             stream_fd = -1;
     int             chunk     = 2048;
+    int             max_concurrency = 1;
 };
 
 class Qwen4ExpBackend final : public ModelBackend {
@@ -59,12 +63,15 @@ public:
     void free_drafter() override;
 
     void shutdown() override;
+    SeqEngine * seq_engine() override { return seq_engine_.get(); }
 
 private:
     Qwen4ExpBackendConfig cfg_;
     ggml_backend_t        backend_ = nullptr;
     Qwen4ExpWeights       weights_;
     Qwen4ExpCache         cache_;
+    std::vector<Qwen4ExpCache> seq_caches_;
+    std::unique_ptr<Qwen4ExpSeqEngine> seq_engine_;
     bool                  parked_  = false;
 };
 

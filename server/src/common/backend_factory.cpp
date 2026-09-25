@@ -276,6 +276,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.device = placement.target;
         cfg.stream_fd = execution.stream_fd;
         if (execution.chunk > 0) cfg.chunk = execution.chunk;
+        cfg.max_concurrency = execution.max_concurrency;
 
         auto backend = std::make_unique<Qwen4ExpBackend>(std::move(cfg));
         if (!backend->init()) {
