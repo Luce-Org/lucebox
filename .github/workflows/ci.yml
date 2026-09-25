@@ -234,6 +234,7 @@ jobs:
             test_kernel_qualification_gdn
             test_kernel_qualification_moe_ds4
             test_concat_transpose
+            test_capture_safe_copies
           )
           if [[ "$RUN_SPARSE_ATTENTION_TEST" == "true" ]]; then
             targets+=(test_flash_attn_sparse)
@@ -248,7 +249,7 @@ jobs:
           ./server/build/test_deepseek4_mmid_grouped_cuda
           ./server/build/test_deepseek4_unit
           ctest --test-dir server/build --output-on-failure \
-            -R 'cuda_pool_shutdown|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce'
+            -R 'cuda_pool_shutdown|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce|test_capture_safe_copies$'
 
       - name: Run GPU sampler and draft top-K tests
         run: |
@@ -386,11 +387,11 @@ jobs:
               test_kernel_qualification_moe_ds4 \
               test_concat_transpose test_cuda_pool_shutdown test_fattn_mma256 \
               test_ggml_cluster_allreduce \
-              test_paged_attn_wmma \
+              test_paged_attn_wmma test_capture_safe_copies \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|ds4_moe_combine_cuda|ds4_maskless_prefill|recurrent_snapshot|ChainRollbackPolicy|MmqTileSelection|MixedMmqPolicy|MoeHybridStorageFixture|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce|test_model_smoke\.PagedAttention\.|batched_gdn$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$|test_fattn_mma256$|test_paged_attn_wmma$|paged_attn_wmma_route$'
+            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|ds4_moe_combine_cuda|ds4_maskless_prefill|recurrent_snapshot|ChainRollbackPolicy|MmqTileSelection|MixedMmqPolicy|MoeHybridStorageFixture|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce|test_model_smoke\.PagedAttention\.|batched_gdn$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$|test_fattn_mma256$|test_paged_attn_wmma$|paged_attn_wmma_route$|test_capture_safe_copies$'
 
       - name: Run GPU draft top-K tests
         run: |

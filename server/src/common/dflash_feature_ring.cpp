@@ -150,9 +150,10 @@ static bool convert_device_f32_to_feature_type(DraftFeatureMirror & mirror,
     std::vector<float> host(elems);
     cudaError_t err = cudaSetDevice(src_device);
     if (feature_cuda_failed("cudaSetDevice", err)) return false;
-    err = cudaMemcpy(host.data(), src, elems * sizeof(float),
-                     cudaMemcpyDeviceToHost);
-    if (feature_cuda_failed("cudaMemcpy", err)) return false;
+    err = cudaMemcpyAsync(host.data(), src, elems * sizeof(float),
+                          cudaMemcpyDeviceToHost, luce_copy_stream(src_device));
+    if (feature_cuda_failed("cudaMemcpyAsync", err)) return false;
+    if (!luce_copy_stream_sync(src_device)) return false;
 
     const size_t row_bytes = ggml_row_size(mirror.storage_type, (int64_t)elems);
     std::vector<uint8_t> tmp(row_bytes);
@@ -194,11 +195,12 @@ static bool convert_bf16_feature_to_storage(DraftFeatureMirror & mirror,
         if (chunk == 0) return false;
 
         std::vector<ggml_bf16_t> bf16_host(chunk);
-        err = cudaMemcpy(bf16_host.data(),
-                         (const char *)src + done * sizeof(ggml_bf16_t),
-                         chunk * sizeof(ggml_bf16_t),
-                         cudaMemcpyDeviceToHost);
-        if (feature_cuda_failed("cudaMemcpy", err)) return false;
+        err = cudaMemcpyAsync(bf16_host.data(),
+                              (const char *)src + done * sizeof(ggml_bf16_t),
+                              chunk * sizeof(ggml_bf16_t),
+                              cudaMemcpyDeviceToHost, luce_copy_stream(src_device));
+        if (feature_cuda_failed("cudaMemcpyAsync", err)) return false;
+        if (!luce_copy_stream_sync(src_device)) return false;
 
         std::vector<float> host(chunk);
         ggml_bf16_to_fp32_row(bf16_host.data(), host.data(), (int64_t)chunk);
@@ -238,7 +240,7 @@ static bool copy_feature_to_f32(DraftFeatureMirror & mirror,
     }
     cudaError_t err = cudaSetDevice(mirror.device);
     if (feature_cuda_failed("cudaSetDevice", err)) return false;
-    to_f32(src, dst, (int64_t)elems, nullptr);
+    to_f32(src, dst, (int64_t)elems, luce_copy_stream(mirror.device));
     err = cudaGetLastError();
     if (feature_cuda_failed("to_fp32_cuda", err)) return false;
     return true;
@@ -311,8 +313,8 @@ bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
         draft_feature_mirror_free(mirror);
         return false;
     }
-    err = cudaMemset(mirror.target_feat->data, 0, bytes);
-    if (feature_cuda_failed("cudaMemset", err)) {
+    err = cudaMemsetAsync(mirror.target_feat->data, 0, bytes, luce_copy_stream(device));
+    if (feature_cuda_failed("cudaMemsetAsync", err) || !luce_copy_stream_sync(device)) {
         draft_feature_mirror_free(mirror);
         return false;
     }
@@ -452,8 +454,13 @@ bool draft_feature_mirror_sync_range(const ggml_tensor * src_target_feat,
         if (feature_cuda_failed("cudaGetLastError", err)) return false;
         done += run;
     }
-    cudaError_t err = cudaDeviceSynchronize();
-    if (feature_cuda_failed("cudaDeviceSynchronize", err)) return false;
+    // Wait for this call's copies only; a device-wide sync would fail while
+    // another model's thread captures a graph.
+    if (!luce_copy_stream_sync(mirror.device) ||
+        !luce_copy_stream_sync(mirror.target_device)) {
+        std::fprintf(stderr, "[dflash-feature] copy stream sync failed\n");
+        return false;
+    }
     return true;
 }
 
@@ -498,8 +505,11 @@ bool copy_capture_slice_to_draft_ring(
             return false;
         }
     }
-    cudaError_t err = cudaDeviceSynchronize();
-    if (feature_cuda_failed("cudaDeviceSynchronize", err)) return false;
+    if (!luce_copy_stream_sync(feature_ring.device) ||
+        !luce_copy_stream_sync(src_device)) {
+        std::fprintf(stderr, "[dflash-feature] copy stream sync failed\n");
+        return false;
+    }
     return true;
 }
 
@@ -572,8 +582,10 @@ bool copy_feature_ring_range_to_tensor(
         }
         done += run;
     }
-    cudaError_t err = cudaDeviceSynchronize();
-    if (feature_cuda_failed("cudaDeviceSynchronize", err)) return false;
+    if (!luce_copy_stream_sync(feature_ring.device)) {
+        std::fprintf(stderr, "[dflash-feature] copy stream sync failed\n");
+        return false;
+    }
     return true;
 }
 

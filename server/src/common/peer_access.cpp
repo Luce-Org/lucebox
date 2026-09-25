@@ -58,31 +58,46 @@ bool cross_device_peer_memcpy_ok(int src_device, int dst_device) {
     return ok;
 }
 
+cudaStream_t luce_copy_stream(int device) {
+    constexpr int kMaxDevices = 16;
+    thread_local cudaStream_t streams[kMaxDevices] = {};
+    if (device < 0 || device >= kMaxDevices) return nullptr;
+    if (!streams[device]) {
+        if (cudaSetDevice(device) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&streams[device], cudaStreamNonBlocking) != cudaSuccess) {
+            streams[device] = nullptr;
+        }
+    }
+    return streams[device];
+}
+
+bool luce_copy_stream_sync(int device) {
+    cudaStream_t stream = luce_copy_stream(device);
+    if (!stream || cudaSetDevice(device) != cudaSuccess) return false;
+    return cudaStreamSynchronize(stream) == cudaSuccess;
+}
+
 bool copy_peer_async(void * dst, int dst_device,
                      const void * src, int src_device,
                      size_t bytes,
                      cudaStream_t stream) {
     if (bytes == 0) return true;
+    if (!stream) stream = luce_copy_stream(dst_device);
+    if (!stream) return false;
     cudaError_t err = cudaSuccess;
     if (dst_device == src_device) {
         err = cudaSetDevice(dst_device);
         if (err != cudaSuccess) return false;
         err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream);
         if (err != cudaSuccess) return false;
-        if (stream) {
-            return cudaStreamSynchronize(stream) == cudaSuccess;
-        }
-        return cudaDeviceSynchronize() == cudaSuccess;
+        return cudaStreamSynchronize(stream) == cudaSuccess;
     }
     if (cross_device_peer_memcpy_ok(src_device, dst_device)) {
         err = cudaSetDevice(dst_device);
         if (err != cudaSuccess) return false;
         err = cudaMemcpyPeerAsync(dst, dst_device, src, src_device, bytes, stream);
         if (err != cudaSuccess) return false;
-        if (stream) {
-            return cudaStreamSynchronize(stream) == cudaSuccess;
-        }
-        return cudaDeviceSynchronize() == cudaSuccess;
+        return cudaStreamSynchronize(stream) == cudaSuccess;
     }
     log_staged_cross_gpu_once();
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
@@ -90,13 +105,10 @@ bool copy_peer_async(void * dst, int dst_device,
     if (err != cudaSuccess) return false;
     err = cudaMemcpyPeerAsync(dst, dst_device, src, src_device, bytes, stream);
     if (err != cudaSuccess) return false;
-    if (stream) {
-        return cudaStreamSynchronize(stream) == cudaSuccess;
-    }
-    return cudaDeviceSynchronize() == cudaSuccess;
+    return cudaStreamSynchronize(stream) == cudaSuccess;
 #else
     return dflash_cuda_copy_between_devices(src_device, src, dst_device, dst, bytes,
-                                            nullptr, stream);
+                                            luce_copy_stream(src_device), stream);
 #endif
 }
 
