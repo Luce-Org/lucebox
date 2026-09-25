@@ -1,6 +1,10 @@
 #include "CppUnitTestFramework.hpp"
 #include "../src/qwen35/prefill_helpers.h"
 
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+
 #include <cstring>
 #include <vector>
 
@@ -11,6 +15,7 @@ struct Qwen35MaskUploadFixture {};
 using luce::common::align_up;
 using luce::common::build_causal_mask;
 using luce::common::qwen35_causal_mask_live_width;
+using luce::common::upload_qwen35_causal_mask_window;
 
 TEST_CASE(Qwen35MaskUploadFixture, live_width_covers_the_attention_view) {
     // The FA view is the window rounded up to at most 256 keys; the live
@@ -42,4 +47,44 @@ TEST_CASE(Qwen35MaskUploadFixture, live_rows_match_the_full_width_mask) {
                               sizeof(uint16_t) * (size_t)live) == 0);
         }
     }
+}
+
+TEST_CASE(Qwen35MaskUploadFixture, upload_writes_live_columns_and_keeps_the_rest) {
+    // A max_ctx-wide mask tensor: the upload must write the live columns of
+    // every row through the strided 2-D copy and leave the rest untouched.
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 2;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    const int full = 4096 + 64;
+    const int q_pad = 32;
+    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, full, q_pad);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    constexpr uint16_t kSentinel = 0x1234;
+    std::vector<uint16_t> got((size_t)full * q_pad, kSentinel);
+    ggml_backend_tensor_set(mask, got.data(), 0, sizeof(uint16_t) * got.size());
+
+    const int kv_start = 700, n_tokens = 16;
+    upload_qwen35_causal_mask_window(mask, kv_start + n_tokens, n_tokens, kv_start, 32, 0);
+    ggml_backend_tensor_get(mask, got.data(), 0, sizeof(uint16_t) * got.size());
+
+    std::vector<uint16_t> want;
+    build_causal_mask(want, kv_start + n_tokens, n_tokens, kv_start, 32, 0, full);
+    const int live = qwen35_causal_mask_live_width(kv_start + n_tokens, full);
+    CHECK(live < full);
+    CHECK(want.size() == got.size());
+    for (int r = 0; r < q_pad; ++r) {
+        CHECK(std::memcmp(got.data() + (size_t)r * full, want.data() + (size_t)r * full,
+                          sizeof(uint16_t) * (size_t)live) == 0);
+        bool untouched = true;
+        for (int c = live; c < full; ++c) {
+            untouched = untouched && got[(size_t)r * full + c] == kSentinel;
+        }
+        CHECK(untouched);
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(cpu);
 }
