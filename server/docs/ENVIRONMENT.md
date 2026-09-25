@@ -101,6 +101,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_KV_V` - kv_quant.cpp, laguna_backend.cpp
 - `LUCE_LM_HEAD_FIX` - http_server.cpp
 - `LUCE_PAGED_WMMA` - paged-attn.cu (ggml-cuda) (=1 routes paged full-attention layers to the WMMA kernel; RDNA4 only, F16/Q8_0/Q4_0, non-tree)
+- `LUCE_DS4_LATE_CONTEXT_BEGIN` - deepseek4/deepseek4_backend.cpp (hybrid prefill position where chunks shrink to 1K; default 32768)
+- `LUCE_DS4_LONG_CONTEXT_CHUNK` - deepseek4/deepseek4_backend.cpp (hybrid prefill chunk cap for prompts ending above 4K; default 2048)
 - `LUCE_PREFILL_UBATCH` - qwen35/prefill_helpers.h
 - `LUCE_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h
 - `LUCE_ADAPTIVE_K_TAU` - mmid_adaptive_k.h

@@ -2782,15 +2782,19 @@ int deepseek4_hybrid_prefill_chunk_tokens(
         int context_end,
         int current_cap) {
     constexpr int long_context_begin = 4096;
+    // 2048 holds through an 18K context on the R9700 + Strix Halo profile
+    // and prefills about 22% faster than 1024; positions past the late
+    // context bound still shrink to 1024 (deepseek4_hybrid_prefill_step_tokens).
+    constexpr int default_long_context_chunk = 2048;
     static const int long_context_chunk = [] {
         const char * raw = std::getenv("LUCE_DS4_LONG_CONTEXT_CHUNK");
-        if (!raw || !*raw) return 1024;
+        if (!raw || !*raw) return default_long_context_chunk;
         char * end = nullptr;
         const long parsed = std::strtol(raw, &end, 10);
         return end && end != raw && *end == '\0' && parsed > 0 &&
                        parsed <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS
             ? (int) parsed
-            : 1024;
+            : default_long_context_chunk;
     }();
     int bounded = std::max(1, requested_chunk);
     if (current_cap > 0) {
