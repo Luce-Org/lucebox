@@ -25,42 +25,44 @@ int main() {
     if (cudaSetDevice(0) != cudaSuccess) return 1;
     void * src = nullptr;
     void * dst = nullptr;
-    if (cudaMalloc(&src, kBytes) != cudaSuccess || cudaMalloc(&dst, kBytes) != cudaSuccess) {
-        std::fprintf(stderr, "[capture-safe-copies] allocation failed\n");
-        return 1;
-    }
+    cudaStream_t capture_stream = nullptr;
+    bool ok = false;
     std::vector<unsigned char> host(kBytes);
     for (size_t i = 0; i < kBytes; ++i) host[i] = (unsigned char) (i * 7 + 3);
-    if (cudaMemcpy(src, host.data(), kBytes, cudaMemcpyHostToDevice) != cudaSuccess) return 1;
-
-    cudaStream_t capture_stream = nullptr;
-    if (cudaStreamCreateWithFlags(&capture_stream, cudaStreamNonBlocking) != cudaSuccess) return 1;
-    std::atomic<bool> copied{false};
     std::atomic<bool> copy_ok{false};
+    bool capture_ok = false;
+    bool read_ok = false;
 
-    // Hold a relaxed capture open (as ggml-cuda does) while another thread
-    // runs a default-stream helper copy.
-    if (cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
-        std::fprintf(stderr, "[capture-safe-copies] begin capture failed\n");
-        return 1;
-    }
-    std::thread worker([&] {
-        copy_ok = copy_peer_async(dst, 0, src, 0, kBytes);
-        copied = true;
-    });
-    worker.join();
-    cudaGraph_t graph = nullptr;
-    const bool capture_ok = cudaStreamEndCapture(capture_stream, &graph) == cudaSuccess;
-    if (graph) cudaGraphDestroy(graph);
+    // Every failure falls through to the cleanup below.
+    do {
+        if (cudaMalloc(&src, kBytes) != cudaSuccess || cudaMalloc(&dst, kBytes) != cudaSuccess ||
+            cudaMemcpy(src, host.data(), kBytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&capture_stream, cudaStreamNonBlocking) != cudaSuccess) {
+            std::fprintf(stderr, "[capture-safe-copies] setup failed\n");
+            break;
+        }
+        // Hold a relaxed capture open (as ggml-cuda does) while another
+        // thread runs a default-stream helper copy.
+        if (cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
+            std::fprintf(stderr, "[capture-safe-copies] begin capture failed\n");
+            break;
+        }
+        std::thread worker([&] { copy_ok = copy_peer_async(dst, 0, src, 0, kBytes); });
+        worker.join();
+        cudaGraph_t graph = nullptr;
+        capture_ok = cudaStreamEndCapture(capture_stream, &graph) == cudaSuccess;
+        if (graph) cudaGraphDestroy(graph);
 
-    std::vector<unsigned char> back(kBytes, 0);
-    const bool read_ok =
-        cudaMemcpy(back.data(), dst, kBytes, cudaMemcpyDeviceToHost) == cudaSuccess && back == host;
+        std::vector<unsigned char> back(kBytes, 0);
+        read_ok = cudaMemcpy(back.data(), dst, kBytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  back == host;
+        ok = copy_ok && capture_ok && read_ok;
+    } while (false);
 
-    cudaStreamDestroy(capture_stream);
-    cudaFree(src);
-    cudaFree(dst);
+    if (capture_stream) cudaStreamDestroy(capture_stream);
+    if (src) cudaFree(src);
+    if (dst) cudaFree(dst);
     std::printf("[capture-safe-copies] copy=%d capture=%d data=%d\n",
                 (int) copy_ok.load(), (int) capture_ok, (int) read_ok);
-    return copied && copy_ok && capture_ok && read_ok ? 0 : 1;
+    return ok ? 0 : 1;
 }

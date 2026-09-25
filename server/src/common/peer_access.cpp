@@ -58,17 +58,32 @@ bool cross_device_peer_memcpy_ok(int src_device, int dst_device) {
     return ok;
 }
 
-cudaStream_t luce_copy_stream(int device) {
-    constexpr int kMaxDevices = 16;
-    thread_local cudaStream_t streams[kMaxDevices] = {};
-    if (device < 0 || device >= kMaxDevices) return nullptr;
-    if (!streams[device]) {
-        if (cudaSetDevice(device) != cudaSuccess ||
-            cudaStreamCreateWithFlags(&streams[device], cudaStreamNonBlocking) != cudaSuccess) {
-            streams[device] = nullptr;
+namespace {
+// Destroys a thread's copy streams when the thread exits.
+struct ThreadCopyStreams {
+    static constexpr int kMaxDevices = 16;
+    cudaStream_t streams[kMaxDevices] = {};
+    ~ThreadCopyStreams() {
+        for (int device = 0; device < kMaxDevices; ++device) {
+            if (streams[device] && cudaSetDevice(device) == cudaSuccess) {
+                (void) cudaStreamDestroy(streams[device]);
+            }
         }
     }
-    return streams[device];
+};
+}  // namespace
+
+cudaStream_t luce_copy_stream(int device) {
+    thread_local ThreadCopyStreams local;
+    if (device < 0 || device >= ThreadCopyStreams::kMaxDevices) return nullptr;
+    cudaStream_t & stream = local.streams[device];
+    if (!stream) {
+        if (cudaSetDevice(device) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+            stream = nullptr;
+        }
+    }
+    return stream;
 }
 
 bool luce_copy_stream_sync(int device) {
