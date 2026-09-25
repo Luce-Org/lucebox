@@ -4638,13 +4638,21 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 // A CPY node that ggml_cuda_cpy lowers to one device memcpy: same type and
 // both ends contiguous.
-static bool ggml_cuda_cpy_is_plain_copy(const ggml_tensor * node) {
+// The batched kernel treats both operands as one contiguous range in this
+// device's memory, so split and host buffers keep the per-node path.
+static bool ggml_cuda_tensor_on_device_buffer(const ggml_tensor * t, int device) {
+    return t->buffer && t->buffer->buft == ggml_backend_cuda_buffer_type(device);
+}
+
+static bool ggml_cuda_cpy_is_plain_copy(const ggml_tensor * node, int device) {
     if (node->op != GGML_OP_CPY) {
         return false;
     }
     const ggml_tensor * src = node->src[0];
     const ggml_tensor * dst = node->src[1];
     return src && dst && src->type == dst->type &&
+        ggml_cuda_tensor_on_device_buffer(src, device) &&
+        ggml_cuda_tensor_on_device_buffer(dst, device) &&
         ggml_is_contiguous(src) && ggml_is_contiguous(dst) &&
         ggml_nbytes(src) == ggml_nbytes(dst) && ggml_nbytes(src) > 0;
 }
@@ -4671,7 +4679,7 @@ size_t ggml_backend_cuda_get_copy_batch_run_count(void) {
 // overlaps another destination or any source), and issue them as one batched
 // launch. Returns the index of the last node consumed, or -1 when the run has
 // a single copy and the normal path should handle it.
-static int ggml_cuda_try_batch_copies(ggml_cgraph * cgraph, int i, cudaStream_t stream) {
+static int ggml_cuda_try_batch_copies(ggml_cgraph * cgraph, int i, int device, cudaStream_t stream) {
     constexpr int kMaxRun = ggml_cuda_copy_batch_max;  // one run, one launch
     ggml_cuda_copy_desc descs[kMaxRun];
     int n = 0;
@@ -4681,7 +4689,7 @@ static int ggml_cuda_try_batch_copies(ggml_cgraph * cgraph, int i, cudaStream_t 
         if (j > i && ggml_cuda_node_is_noop(node)) {
             continue;
         }
-        if (!ggml_cuda_cpy_is_plain_copy(node)) {
+        if (!ggml_cuda_cpy_is_plain_copy(node, device)) {
             break;
         }
         const void * src = node->src[0]->data;
@@ -4856,8 +4864,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // blit with its own dispatch) become one batched launch.
                 // GGML_CUDA_DISABLE_COPY_BATCH restores one memcpy per node.
                 static const bool batch_copies = getenv("GGML_CUDA_DISABLE_COPY_BATCH") == nullptr;
-                if (batch_copies && !should_launch_concurrent_events && ggml_cuda_cpy_is_plain_copy(node)) {
-                    const int last = ggml_cuda_try_batch_copies(cgraph, i, cuda_ctx->stream());
+                if (batch_copies && !should_launch_concurrent_events && ggml_cuda_cpy_is_plain_copy(node, cuda_ctx->device)) {
+                    const int last = ggml_cuda_try_batch_copies(cgraph, i, cuda_ctx->device, cuda_ctx->stream());
                     if (last >= 0) {
                         i = last;
                         continue;
