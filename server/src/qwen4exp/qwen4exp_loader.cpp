@@ -303,10 +303,10 @@ bool Qwen4ExpPleReader::gather(const int32_t * rows, int64_t n, float * dst) con
     std::vector<uint8_t> scratch(static_cast<size_t>(n) * static_cast<size_t>(row_size_));
     std::vector<std::exception_ptr> errs(static_cast<size_t>(n_threads_));
 
-    auto worker = [&](int w) {
+    auto worker = [&](int w, int n_workers) {
         try {
-            const int64_t begin = static_cast<int64_t>(n) * w / n_threads_;
-            const int64_t end   = static_cast<int64_t>(n) * (w + 1) / n_threads_;
+            const int64_t begin = static_cast<int64_t>(n) * w / n_workers;
+            const int64_t end   = static_cast<int64_t>(n) * (w + 1) / n_workers;
             uint8_t * buf = scratch.data() + static_cast<size_t>(begin) *
                             static_cast<size_t>(row_size_);
             for (int64_t k = begin; k < end; ++k, buf += row_size_) {
@@ -331,15 +331,18 @@ bool Qwen4ExpPleReader::gather(const int32_t * rows, int64_t n, float * dst) con
     };
 
     if (n_threads_ == 1 || n < 64) {
-        worker(0);
+        // A serial fallback must cover every row. Dividing the range by the
+        // configured pool size here used to process only the first 1/N chunk
+        // when a T=1 decode gathered fewer rows than the pool had workers.
+        worker(0, 1);
         if (errs[0]) return false;
         return true;
     }
 
     std::vector<std::thread> pool;
     pool.reserve(static_cast<size_t>(n_threads_ - 1));
-    for (int w = 1; w < n_threads_; ++w) pool.emplace_back(worker, w);
-    worker(0);
+    for (int w = 1; w < n_threads_; ++w) pool.emplace_back(worker, w, n_threads_);
+    worker(0, n_threads_);
     for (auto & th : pool) th.join();
 
     for (const std::exception_ptr & e : errs) {
