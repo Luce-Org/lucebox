@@ -4657,9 +4657,11 @@ static bool ggml_cuda_cpy_is_plain_copy(const ggml_tensor * node, int device) {
         ggml_nbytes(src) == ggml_nbytes(dst) && ggml_nbytes(src) > 0;
 }
 
+// Integer addresses: relational comparison of pointers into different
+// allocations is unspecified in C++.
 static bool ggml_cuda_byte_ranges_overlap(const void * a, size_t an, const void * b, size_t bn) {
-    const char * pa = (const char *) a;
-    const char * pb = (const char *) b;
+    const uintptr_t pa = (uintptr_t) a;
+    const uintptr_t pb = (uintptr_t) b;
     return pa < pb + bn && pb < pa + an;
 }
 
@@ -4867,7 +4869,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (batch_copies && !should_launch_concurrent_events && ggml_cuda_cpy_is_plain_copy(node, cuda_ctx->device)) {
                     const int last = ggml_cuda_try_batch_copies(cgraph, i, cuda_ctx->device, cuda_ctx->stream());
                     if (last >= 0) {
+#ifdef GGML_CUDA_DEBUG
+                        GGML_LOG_INFO("copy run batched: nodes %d-%d\n", i, last);
+#endif
+                        // A batched run is not a fused region: keep the
+                        // fusion accounting from counting its nodes.
                         i = last;
+                        prev_i = last;
                         continue;
                     }
                 }

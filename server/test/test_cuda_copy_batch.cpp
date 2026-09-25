@@ -87,39 +87,101 @@ TEST_CASE(CudaCopyBatchFixture, descriptor_batch) {
     REQUIRE(first_bad == -1);
 }
 
-// Graph pass: a run of plain CPY nodes is batched, but a copy that reads an
-// earlier copy's destination must still see the copied bytes.
-// a -> x, b -> y, x -> z (depends on the first), c -> w, then a run of 60
-// independent small copies (longer than one launch). The pass must fire
-// unless GGML_CUDA_DISABLE_COPY_BATCH is set.
-TEST_CASE(CudaCopyBatchFixture, graph_copy_runs) {
+namespace {
+constexpr int64_t kGraphN = 4099;
+
+std::vector<float> graph_pattern(float base, float step) {
+    std::vector<float> v(kGraphN);
+    for (int64_t i = 0; i < kGraphN; ++i) v[i] = base + step * (float) i;
+    return v;
+}
+
+int64_t graph_mismatches(ggml_tensor * t, const std::vector<float> & want) {
+    std::vector<float> got(want.size());
+    ggml_backend_tensor_get(t, got.data(), 0, sizeof(float) * got.size());
+    int64_t bad = 0;
+    for (size_t i = 0; i < got.size(); ++i) bad += got[i] != want[i];
+    return bad;
+}
+}  // namespace
+
+// Graph pass: every dependency must end a run so copies keep their order.
+//   1 a -> x   2 b -> y   3 x -> z   read after write (3 reads 1's dst)
+//   4 c -> w   5 d -> c              write after read (5 writes 4's src)
+//   6 e -> u   7 f -> u              write after write (7 writes 6's dst)
+//   8 h -> t
+// The pass issues exactly four runs: [1 2] [3 4] [5 6] [7 8]. Dropping any
+// one of the three independence checks merges two of them (three runs), so
+// the count pins each check even when a race would not show in the data.
+TEST_CASE(CudaCopyBatchFixture, graph_copy_dependencies) {
     if (ggml_backend_cuda_get_device_count() <= 0) {
         SKIP("CUDA/HIP device unavailable");
     }
     ggml_backend_t gpu = ggml_backend_cuda_init(0);
     REQUIRE(gpu != nullptr);
-
-    constexpr int64_t kN = 4099;
     ggml_init_params gp{};
-    gp.mem_size = 256 * ggml_tensor_overhead() + ggml_graph_overhead();
+    gp.mem_size = 64 * ggml_tensor_overhead() + ggml_graph_overhead();
     gp.no_alloc = true;
     ggml_context * gctx = ggml_init(gp);
     REQUIRE(gctx != nullptr);
-    ggml_tensor * a = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, kN);
-    ggml_tensor * b = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, kN);
-    ggml_tensor * c = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, kN);
-    ggml_tensor * x = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, kN);
-    ggml_tensor * y = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, kN);
-    ggml_tensor * z = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, kN);
-    ggml_tensor * w = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, kN);
+    auto tensor = [&] { return ggml_new_tensor_1d(gctx, GGML_TYPE_F32, kGraphN); };
+    ggml_tensor * a = tensor(); ggml_tensor * b = tensor(); ggml_tensor * c = tensor();
+    ggml_tensor * d = tensor(); ggml_tensor * e = tensor(); ggml_tensor * f = tensor();
+    ggml_tensor * h = tensor();
+    ggml_tensor * x = tensor(); ggml_tensor * y = tensor(); ggml_tensor * z = tensor();
+    ggml_tensor * w = tensor(); ggml_tensor * u = tensor(); ggml_tensor * t = tensor();
     ggml_cgraph * gf = ggml_new_graph(gctx);
-    ggml_build_forward_expand(gf, ggml_cpy(gctx, a, x));
-    ggml_build_forward_expand(gf, ggml_cpy(gctx, b, y));
-    ggml_build_forward_expand(gf, ggml_cpy(gctx, x, z));
-    ggml_build_forward_expand(gf, ggml_cpy(gctx, c, w));
+    const std::pair<ggml_tensor *, ggml_tensor *> order[] = {
+        {a, x}, {b, y}, {x, z}, {c, w}, {d, c}, {e, u}, {f, u}, {h, t}};
+    for (const auto & [src, dst] : order) {
+        ggml_build_forward_expand(gf, ggml_cpy(gctx, src, dst));
+    }
+    ggml_backend_buffer_t gbuf = ggml_backend_alloc_ctx_tensors(gctx, gpu);
+    REQUIRE(gbuf != nullptr);
+    const auto va = graph_pattern(1.0f, 1.0f), vb = graph_pattern(0.0f, -2.0f);
+    const auto vc = graph_pattern(0.0f, 0.5f), vd = graph_pattern(7.0f, -1.0f);
+    const auto ve = graph_pattern(2.0f, 0.25f), vf = graph_pattern(9.0f, 3.0f);
+    const auto vh = graph_pattern(-4.0f, 0.75f), zero = graph_pattern(0.0f, 0.0f);
+    const std::pair<ggml_tensor *, const std::vector<float> *> inputs[] = {
+        {a, &va}, {b, &vb}, {c, &vc}, {d, &vd}, {e, &ve}, {f, &vf}, {h, &vh},
+        {x, &zero}, {y, &zero}, {z, &zero}, {w, &zero}, {u, &zero}, {t, &zero}};
+    for (const auto & [tensor_in, values] : inputs) {
+        ggml_backend_tensor_set(tensor_in, values->data(), 0, sizeof(float) * kGraphN);
+    }
+    const size_t runs_before = ggml_backend_cuda_get_copy_batch_run_count();
+    const bool computed = ggml_backend_graph_compute(gpu, gf) == GGML_STATUS_SUCCESS;
+    const size_t runs = ggml_backend_cuda_get_copy_batch_run_count() - runs_before;
+    const std::pair<ggml_tensor *, const std::vector<float> *> checks[] = {
+        {x, &va}, {y, &vb}, {z, &va}, {w, &vc}, {c, &vd}, {u, &vf}, {t, &vh}};
+    int64_t bad = 0;
+    for (const auto & [tensor_out, want] : checks) bad += graph_mismatches(tensor_out, *want);
+    ggml_backend_buffer_free(gbuf);
+    ggml_free(gctx);
+    ggml_backend_free(gpu);
+    const bool disabled = std::getenv("GGML_CUDA_DISABLE_COPY_BATCH") != nullptr;
+    std::printf("[cuda-copy-batch] dependency graph: %lld mismatched values, %zu batched runs%s\n",
+                (long long) bad, runs, disabled ? " (batching disabled)" : "");
+    REQUIRE(computed);
+    REQUIRE(bad == 0);
+    REQUIRE(runs == (disabled ? 0u : 4u));
+}
+
+// A run of 60 independent small copies is longer than one launch.
+TEST_CASE(CudaCopyBatchFixture, graph_copy_long_run) {
+    if (ggml_backend_cuda_get_device_count() <= 0) {
+        SKIP("CUDA/HIP device unavailable");
+    }
+    ggml_backend_t gpu = ggml_backend_cuda_init(0);
+    REQUIRE(gpu != nullptr);
     constexpr int kRun = 60;
+    ggml_init_params gp{};
+    gp.mem_size = (4 * kRun) * ggml_tensor_overhead() + ggml_graph_overhead();
+    gp.no_alloc = true;
+    ggml_context * gctx = ggml_init(gp);
+    REQUIRE(gctx != nullptr);
     ggml_tensor * run_src[kRun];
     ggml_tensor * run_dst[kRun];
+    ggml_cgraph * gf = ggml_new_graph(gctx);
     for (int r = 0; r < kRun; ++r) {
         run_src[r] = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, 33 + r);
         run_dst[r] = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, 33 + r);
@@ -127,53 +189,29 @@ TEST_CASE(CudaCopyBatchFixture, graph_copy_runs) {
     }
     ggml_backend_buffer_t gbuf = ggml_backend_alloc_ctx_tensors(gctx, gpu);
     REQUIRE(gbuf != nullptr);
-    std::vector<float> va(kN), vb(kN), vc(kN), zero(kN, 0.0f);
-    for (int64_t i = 0; i < kN; ++i) {
-        va[i] = 1.0f + (float) i;
-        vb[i] = -2.0f * (float) i;
-        vc[i] = 0.5f * (float) i;
-    }
-    ggml_backend_tensor_set(a, va.data(), 0, sizeof(float) * kN);
-    ggml_backend_tensor_set(b, vb.data(), 0, sizeof(float) * kN);
-    ggml_backend_tensor_set(c, vc.data(), 0, sizeof(float) * kN);
-    for (ggml_tensor * t : {x, y, z, w}) {
-        ggml_backend_tensor_set(t, zero.data(), 0, sizeof(float) * kN);
-    }
     for (int r = 0; r < kRun; ++r) {
         std::vector<float> v(33 + r, 3.0f + (float) r);
+        std::vector<float> zero(33 + r, 0.0f);
         ggml_backend_tensor_set(run_src[r], v.data(), 0, sizeof(float) * v.size());
-        ggml_backend_tensor_set(run_dst[r], zero.data(), 0, sizeof(float) * v.size());
+        ggml_backend_tensor_set(run_dst[r], zero.data(), 0, sizeof(float) * zero.size());
     }
     const size_t runs_before = ggml_backend_cuda_get_copy_batch_run_count();
     const bool computed = ggml_backend_graph_compute(gpu, gf) == GGML_STATUS_SUCCESS;
     const size_t runs = ggml_backend_cuda_get_copy_batch_run_count() - runs_before;
-    std::vector<float> out(kN);
-    int64_t graph_bad = 0;
-    const std::pair<ggml_tensor *, const std::vector<float> *> checks[] = {
-        {x, &va}, {y, &vb}, {z, &va}, {w, &vc}};
-    for (const auto & [t, want] : checks) {
-        ggml_backend_tensor_get(t, out.data(), 0, sizeof(float) * kN);
-        for (int64_t i = 0; i < kN; ++i) {
-            graph_bad += out[i] != (*want)[i];
-        }
-    }
+    int64_t bad = 0;
     for (int r = 0; r < kRun; ++r) {
         std::vector<float> v(33 + r);
         ggml_backend_tensor_get(run_dst[r], v.data(), 0, sizeof(float) * v.size());
-        for (float f : v) {
-            graph_bad += f != 3.0f + (float) r;
-        }
+        for (float value : v) bad += value != 3.0f + (float) r;
     }
     ggml_backend_buffer_free(gbuf);
     ggml_free(gctx);
     ggml_backend_free(gpu);
     const bool disabled = std::getenv("GGML_CUDA_DISABLE_COPY_BATCH") != nullptr;
-    std::printf("[cuda-copy-batch] graph copies: %lld mismatched values, %zu batched runs%s\n",
-                (long long) graph_bad, runs, disabled ? " (batching disabled)" : "");
+    std::printf("[cuda-copy-batch] long run: %lld mismatched values, %zu batched runs%s\n",
+                (long long) bad, runs, disabled ? " (batching disabled)" : "");
     REQUIRE(computed);
-    REQUIRE(graph_bad == 0);
-    // The first run ends at the dependent copy; the 61 later copies (c->w
-    // plus the 60-copy run) span at least two launches.
+    REQUIRE(bad == 0);
     if (disabled) {
         REQUIRE(runs == 0);
     } else {
