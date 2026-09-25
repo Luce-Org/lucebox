@@ -2669,9 +2669,15 @@ static void test_hybrid_prefill_chunk_tokens() {
     std::fprintf(stderr, "  test_hybrid_prefill_chunk_tokens ...");
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 0) == 2048);
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 4096) == 2048);
-    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 4097) == 2048);
-    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(4096, 4097) == 2048);
-    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(8192, 18432) == 2048);
+    // Unqualified placements keep the 1K long-context guard.
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 4097) == 1024);
+    // The qualified R9700 + Strix Halo placement caps long contexts at 2K.
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(
+                    2048, 4097, 0, kDs4QualifiedLongContextChunk) == 2048);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(
+                    8192, 18432, 0, kDs4QualifiedLongContextChunk) == 2048);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(
+                    2048, 4096, 0, kDs4QualifiedLongContextChunk) == 2048);
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(1024, 8192) == 1024);
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(512, 8192) == 512);
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(0, 8192) == 1);

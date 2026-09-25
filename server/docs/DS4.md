@@ -850,9 +850,11 @@ Sparse heterogeneous prefill uses a reusable graph allocator with preferred
 128 MiB backing chunks. This avoids depending on one large contiguous HIP
 allocation on devices without virtual-memory-backed buffers. Individual
 tensors remain unsplit and may exceed the preferred chunk size. Prompts ending
-above 4K use at most a 2K-token prefill shape (`LUCE_DS4_LONG_CONTEXT_CHUNK`
-overrides it), and that cap remains sticky for later requests in the process
-so a later request cannot force a fragmented arena replacement. Positions past
+above 4K use at most a 2K-token prefill shape on the qualified R9700 (gfx1201)
+target with Strix Halo (gfx1151) cold experts and a 1K shape on other
+placements; `LUCE_DS4_LONG_CONTEXT_CHUNK` overrides either. The cap remains
+sticky for later requests in the process so a later request cannot force a
+fragmented arena replacement. Positions past
 the late-context bound (32K by default) still prefill in 1K chunks. On the
 qualified profile the 2K shape prefills 7.4K tokens in 33 s and 17.6K in 78 s,
 versus 44 s and 101 s with the old 1K shape. Reproducible decode graph caches are retired before

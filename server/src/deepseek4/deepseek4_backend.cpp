@@ -2622,6 +2622,15 @@ bool DeepSeek4Backend::init_hybrid_model() {
 
     moe_hybrid_ = std::move(hybrid);
     w_.moe_hybrid = true;
+    // 2K long-context prefill chunks are qualified on the R9700 (gfx1201)
+    // target with Strix Halo (gfx1151) cold experts; other placements keep
+    // the 1K guard against a fragmented attention-arena replacement.
+    hybrid_long_context_chunk_ =
+        tp.secondary_gpu != cfg_.device.gpu &&
+                is_gfx_device(cfg_.device.gpu, "gfx1201") &&
+                is_gfx_device(tp.secondary_gpu, "gfx1151")
+            ? kDs4QualifiedLongContextChunk
+            : kDs4DefaultLongContextChunk;
     const int total_cold = w_.n_layer * w_.n_expert - moe_placement_.total_hot;
     const char * cold_backend =
         moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu ? "gpu" : "cpu";
@@ -2780,22 +2789,23 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
 int deepseek4_hybrid_prefill_chunk_tokens(
         int requested_chunk,
         int context_end,
-        int current_cap) {
+        int current_cap,
+        int long_context_default) {
     constexpr int long_context_begin = 4096;
-    // 2048 holds through an 18K context on the R9700 + Strix Halo profile
-    // and prefills about 22% faster than 1024; positions past the late
-    // context bound still shrink to 1024 (deepseek4_hybrid_prefill_step_tokens).
-    constexpr int default_long_context_chunk = 2048;
-    static const int long_context_chunk = [] {
+    // LUCE_DS4_LONG_CONTEXT_CHUNK overrides the placement's default.
+    static const int long_context_override = [] {
         const char * raw = std::getenv("LUCE_DS4_LONG_CONTEXT_CHUNK");
-        if (!raw || !*raw) return default_long_context_chunk;
+        if (!raw || !*raw) return 0;
         char * end = nullptr;
         const long parsed = std::strtol(raw, &end, 10);
         return end && end != raw && *end == '\0' && parsed > 0 &&
                        parsed <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS
             ? (int) parsed
-            : default_long_context_chunk;
+            : 0;
     }();
+    const int long_context_chunk = long_context_override > 0
+        ? long_context_override
+        : std::max(1, long_context_default);
     int bounded = std::max(1, requested_chunk);
     if (current_cap > 0) {
         bounded = std::min(bounded, current_cap);
@@ -2903,7 +2913,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     const int chunk = bound_hybrid_scratch
         ? deepseek4_hybrid_prefill_chunk_tokens(
               base_chunk, kv_offset + n_total,
-              hybrid_prefill_chunk_cap_)
+              hybrid_prefill_chunk_cap_, hybrid_long_context_chunk_)
         : base_chunk;
     if (chunk < base_chunk) {
         hybrid_prefill_chunk_cap_ = hybrid_prefill_chunk_cap_ > 0
@@ -2918,7 +2928,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     }
     int pos = kv_offset;
     const int image_capacity = std::min(1024,
-        deepseek4_hybrid_prefill_chunk_tokens(layer_major_cap, kv_offset + n_total));
+        deepseek4_hybrid_prefill_chunk_tokens(layer_major_cap, kv_offset + n_total, 0,
+                                              hybrid_long_context_chunk_));
     const bool save_snapshot =
         !images && snap_slot >= 0 && snap_slot < PREFIX_SLOTS &&
         snap_pos > kv_offset && snap_pos <= kv_offset + n_total;

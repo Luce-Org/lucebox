@@ -37,10 +37,17 @@ class DeepSeek4ImagePrompt;
 
 // Bounds the sparse heterogeneous prefill arena once accumulated attention
 // context dominates its memory footprint. Decode batching is unaffected.
+// Long-context prefill chunk caps: kDs4QualifiedLongContextChunk on the
+// qualified R9700 + Strix Halo placement, kDs4DefaultLongContextChunk
+// elsewhere. LUCE_DS4_LONG_CONTEXT_CHUNK overrides either.
+inline constexpr int kDs4DefaultLongContextChunk = 1024;
+inline constexpr int kDs4QualifiedLongContextChunk = 2048;
+
 int deepseek4_hybrid_prefill_chunk_tokens(
     int requested_chunk,
     int context_end,
-    int current_cap = 0);
+    int current_cap = 0,
+    int long_context_default = kDs4DefaultLongContextChunk);
 
 // Selects the next sparse heterogeneous prefill batch. Large batches retain
 // their throughput through the memory-light part of the prompt, then shrink
@@ -171,6 +178,7 @@ private:
     // Once a long prompt selects the fragmentation-safe prefill shape, retain
     // it for later requests so the HIP arenas never switch back under load.
     int                            hybrid_prefill_chunk_cap_ = 0;
+    int                            hybrid_long_context_chunk_ = kDs4DefaultLongContextChunk;
 
     bool load_spec_drafter();
     void release_spec_drafter(bool mark_parked);
