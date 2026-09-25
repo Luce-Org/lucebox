@@ -911,10 +911,20 @@ static bool ds4_build_fused_verify_graph(
         } else {
         // ── Batched speculative attention ──
         // One lane for the batch, or one per token (ds4_fused_attention_lanes):
-        // each lane is the attention graph of a decode step at its position,
+        // each lane is the attention core of a decode step at its position,
         // built in position order, so its ring write, compressor step and
-        // attention see exactly the rows that decode step sees.
+        // attention see exactly the rows that decode step sees. Per-token
+        // lanes share the batched q/kv projections with their RoPE, and the
+        // inverse RoPE with the output projection (batch-invariant products),
+        // as the host verify does (ds4_run_verify_attention).
         ggml_tensor * normed_all = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
+        DeepSeek4PreparedProjectedLane batched_lanes{};
+        ggml_tensor * lane_contexts = nullptr;
+        if (n_lanes > 1) {
+            batched_lanes = build_mla_qkv_projection(ctx, normed_all, w, L, q);
+            build_mla_qkv_rope(ctx, batched_lanes, w, ds4_rope_params(w, ratio), q, ex.pos_q,
+                               /*fuse_q_rope=*/false);
+        }
         const int window_idx = [&] {
             const auto it = std::find(ex.window_layers.begin(), ex.window_layers.end(), il);
             return it == ex.window_layers.end() ? -1 : (int) (it - ex.window_layers.begin());
@@ -981,13 +991,23 @@ static bool ds4_build_fused_verify_graph(
         ggml_tensor * normed = n_lanes == 1 ? normed_all
             : ggml_view_2d(ctx, normed_all, n_embd, aq, normed_all->nb[1],
                            (size_t) a_start * normed_all->nb[1]);
-        ggml_tensor * lane_out = build_mla_attention(ctx, gf, normed, w, L, *lc, *comp_lc, il,
-                                                     a_kv_start, aq, &ain,
-                                                     i32b, i32ab, i64ab,
-                                                     &f32ab, attention_impl,
-                                                     n_lanes == 1
-                                                         ? &ex.boundary_checkpoint.layers[(size_t) il]
-                                                         : nullptr);
+        ggml_tensor * lane_out = nullptr;
+        if (n_lanes == 1) {
+            lane_out = build_mla_attention(ctx, gf, normed, w, L, *lc, *comp_lc, il,
+                                           a_kv_start, aq, &ain, i32b, i32ab, i64ab,
+                                           &f32ab, attention_impl,
+                                           &ex.boundary_checkpoint.layers[(size_t) il]);
+        } else {
+            const DeepSeek4PreparedProjectedLane lane_proj =
+                ds4_slice_projected_lane(ctx, batched_lanes, w, a_start, ain.rope_pos);
+            const DeepSeek4MlaLaneBindings bindings = deepseek4_contiguous_lane_bindings(
+                w, il, *lc, *comp_lc, a_token_pos);
+            if (!build_mla_attention_lane_core(
+                    ctx, gf, normed, w, L, bindings, il, a_kv_start, aq, &ain,
+                    i32b, i32ab, i64ab, &f32ab, attention_impl, &lane_proj, &lane_out)) {
+                lane_out = nullptr;
+            }
+        }
         if (!lane_out) return false;
         if (!i32b.empty() || !i32ab.empty() || !i64ab.empty() ||
             !f32ab.empty()) {
@@ -1008,8 +1028,23 @@ static bool ds4_build_fused_verify_graph(
             ggml_build_forward_expand(gf, window_kv_rows.back());
             ggml_build_forward_expand(gf, window_score_rows.back());
         }
-        if (n_lanes > 1) ggml_build_forward_expand(gf, lane_out);
-        attn_out = attn_out ? ggml_concat(ctx, attn_out, lane_out, 1) : lane_out;
+        if (n_lanes == 1) {
+            attn_out = lane_out;
+        } else {
+            ggml_build_forward_expand(gf, lane_out);
+            lane_contexts = lane_contexts ? ggml_concat(ctx, lane_contexts, lane_out, 1) : lane_out;
+        }
+        }
+        if (n_lanes > 1) {
+            const Ds4RopeParams rope = ds4_rope_params(w, ratio);
+            attn_out = build_tail_rope_3d(
+                ctx, ggml_reshape_3d(ctx, lane_contexts, w.head_dim, w.n_head, q), ex.neg_q,
+                w.n_rot, w.head_dim, w.n_head, q, rope.freq, rope.scale, rope.ext, rope.attn,
+                w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope.n_ctx_orig);
+            // The single-token decode graph never takes the grouped output kernel.
+            attn_out = build_mla_output_projection(
+                ctx, ggml_reshape_2d(ctx, attn_out, (int64_t) w.head_dim * w.n_head, q),
+                w, L, q, /*allow_grouped=*/false);
         }
         }
 
