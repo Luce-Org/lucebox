@@ -2663,6 +2663,16 @@ extern "C" {
         GGML_MOE_FUSED_ALIGN_IDS          = -5,
         GGML_MOE_FUSED_BALANCED_OWNER_IDS = -6,
         GGML_MOE_FUSED_CLUSTER_ALLREDUCE  = -7,
+        GGML_MOE_FUSED_HOST_POST          = -8,
+        GGML_MOE_FUSED_HOST_WAIT          = -9,
+    };
+
+    // Word offsets in ggml_tensor::op_params for the host mailbox pair. All
+    // three pointers start at naturally aligned 64-bit boundaries.
+    enum ggml_moe_fused_host_mailbox_param {
+        GGML_MOE_FUSED_HOST_STEP_WORD    = 2,
+        GGML_MOE_FUSED_HOST_FLAG_WORD    = 4,
+        GGML_MOE_FUSED_HOST_PAYLOAD_WORD = 6,
     };
 
     // Word offsets in ggml_tensor::op_params for the in-graph collective.
@@ -2755,6 +2765,31 @@ extern "C" {
     // Reorder a small [route, token] owner-local ID matrix so occurrences of
     // the same expert across verification tokens share a kernel block. Each
     // encoded ID retains its original route slot for exact output scatter.
+    // Exchange a small tensor with a host thread in the middle of a device
+    // graph, without returning control to the host. `step`, `flag` and
+    // `payload` must be host-mapped, coherent memory the device can reach.
+    // POST copies `src` into `payload`, then stores *step into *flag. WAIT
+    // holds its stream until *flag == *step, then copies `payload` into a new
+    // [ne0, ne1, ne2] tensor of `type`; `after` only orders it. The host bumps
+    // *step before each launch, so a captured graph replays unchanged.
+    GGML_API struct ggml_tensor * ggml_host_mailbox_post(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * src,
+            const uint32_t      * step,
+            uint32_t            * flag,
+            void                * payload);
+
+    GGML_API struct ggml_tensor * ggml_host_mailbox_wait(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * after,
+            enum ggml_type        type,
+            int64_t               ne0,
+            int64_t               ne1,
+            int64_t               ne2,
+            const uint32_t      * step,
+            const uint32_t      * flag,
+            const void          * payload);
+
     GGML_API struct ggml_tensor * ggml_ds4_moe_align_ids(
             struct ggml_context * ctx,
             struct ggml_tensor  * expert_ids);

@@ -9173,6 +9173,52 @@ struct ggml_tensor * ggml_ds4_moe_owner_split(
     return result;
 }
 
+static void ggml_host_mailbox_set_ptr(struct ggml_tensor * t, int word, const void * ptr) {
+    memcpy(&t->op_params[word], &ptr, sizeof(ptr));
+}
+
+struct ggml_tensor * ggml_host_mailbox_post(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * src,
+        const uint32_t      * step,
+        uint32_t            * flag,
+        void                * payload) {
+    GGML_ASSERT(src && ggml_is_contiguous(src));
+    GGML_ASSERT(ggml_nbytes(src) % sizeof(uint32_t) == 0);
+    GGML_ASSERT(step && flag && payload);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = src;
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_HOST_POST);
+    ggml_host_mailbox_set_ptr(result, GGML_MOE_FUSED_HOST_STEP_WORD, step);
+    ggml_host_mailbox_set_ptr(result, GGML_MOE_FUSED_HOST_FLAG_WORD, flag);
+    ggml_host_mailbox_set_ptr(result, GGML_MOE_FUSED_HOST_PAYLOAD_WORD, payload);
+    return result;
+}
+
+struct ggml_tensor * ggml_host_mailbox_wait(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * after,
+        enum ggml_type        type,
+        int64_t               ne0,
+        int64_t               ne1,
+        int64_t               ne2,
+        const uint32_t      * step,
+        const uint32_t      * flag,
+        const void          * payload) {
+    GGML_ASSERT(after);
+    GGML_ASSERT(step && flag && payload);
+    GGML_ASSERT(ggml_type_size(type) % sizeof(uint32_t) == 0 && ggml_blck_size(type) == 1);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, type, ne0, ne1, ne2);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = after;
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_HOST_WAIT);
+    ggml_host_mailbox_set_ptr(result, GGML_MOE_FUSED_HOST_STEP_WORD, step);
+    ggml_host_mailbox_set_ptr(result, GGML_MOE_FUSED_HOST_FLAG_WORD, flag);
+    ggml_host_mailbox_set_ptr(result, GGML_MOE_FUSED_HOST_PAYLOAD_WORD, payload);
+    return result;
+}
+
 struct ggml_tensor * ggml_ds4_moe_align_ids(
         struct ggml_context * ctx,
         struct ggml_tensor  * expert_ids) {
