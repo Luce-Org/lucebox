@@ -39,16 +39,14 @@ bool device_usable(int device) {
 
 TEST_CASE(CaptureSafeCopiesFixture, copies_during_relaxed_capture) {
     int n_devices = 0;
-    if (cudaGetDeviceCount(&n_devices) != cudaSuccess || n_devices <= 0) {
+    if (cudaGetDeviceCount(&n_devices) != cudaSuccess || n_devices <= 0 || !device_usable(0)) {
         SKIP("CUDA/HIP device unavailable");
     }
     constexpr size_t kBytes = 1 << 16;
     // With a second usable GPU, also copy device 1 -> device 0 (the
-    // target/draft split), which goes through the peer or pinned-staging path.
-    const bool cross = n_devices > 1 && device_usable(1);
-    if (n_devices > 1 && !cross) {
-        std::puts("[capture-safe-copies] device 1 unusable: same-device leg only");
-    }
+    // target/draft split), which goes through the peer or pinned-staging
+    // path. The leg runs only if that copy works outside a capture.
+    bool cross = n_devices > 1 && device_usable(1);
     void * src = nullptr;
     void * dst = nullptr;
     void * src_peer = nullptr;
@@ -77,6 +75,16 @@ TEST_CASE(CaptureSafeCopiesFixture, copies_during_relaxed_capture) {
                 cudaSetDevice(0) != cudaSuccess) {
                 break;
             }
+            if (!copy_peer_async(dst_peer, 0, src_peer, 1, kBytes) ||
+                cudaSetDevice(0) != cudaSuccess ||
+                cudaMemset(dst_peer, 0, kBytes) != cudaSuccess) {
+                (void) cudaGetLastError();
+                cross = false;
+                cross_ok = true;
+            }
+        }
+        if (n_devices > 1 && !cross) {
+            std::puts("[capture-safe-copies] no working device 1 -> 0 copy: same-device leg only");
         }
         setup_ok = true;
         // Hold a relaxed capture open (as ggml-cuda does) while another
