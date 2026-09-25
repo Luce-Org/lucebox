@@ -234,6 +234,7 @@ jobs:
             test_kernel_qualification_gdn
             test_kernel_qualification_moe_ds4
             test_concat_transpose
+            test_cuda_copy_batch
           )
           if [[ "$RUN_SPARSE_ATTENTION_TEST" == "true" ]]; then
             targets+=(test_flash_attn_sparse)
@@ -248,7 +249,7 @@ jobs:
           ./server/build/test_deepseek4_mmid_grouped_cuda
           ./server/build/test_deepseek4_unit
           ctest --test-dir server/build --output-on-failure \
-            -R 'cuda_pool_shutdown|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce'
+            -R 'cuda_pool_shutdown|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce|test_cuda_copy_batch$'
 
       - name: Run GPU sampler and draft top-K tests
         run: |

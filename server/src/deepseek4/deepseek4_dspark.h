@@ -209,6 +209,8 @@ struct DeepSeek4SpecRollback {
     // row. LUCE_DS4_DEVICE_ROLLBACK=0 keeps the pinned-host staging.
     ggml_backend_buffer_t device_buf = nullptr;
     uint8_t * device_base = nullptr;
+    ggml_backend_t device_backend = nullptr;  // owner of device_buf
+    std::size_t device_bytes = 0;             // layout device_buf was sized for
     ggml_backend_t async_backend = nullptr;
     bool uses_pinned_copy = false;
     bool uses_device_copy = false;

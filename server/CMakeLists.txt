@@ -1318,10 +1318,10 @@ if(LUCE_TESTS)
             ggml-cpu ggml ${LUCE_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_ds4_moe_combine_cuda)
     endif()
-    if(LUCE_GPU_BACKEND STREQUAL "hip")
+    # Host-only test of the ggml-cuda batched copy: plain C++ on both the CUDA
+    # and HIP builds.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_copy_batch.cpp")
         add_executable(test_cuda_copy_batch test/test_cuda_copy_batch.cpp)
-        set_source_files_properties(test/test_cuda_copy_batch.cpp PROPERTIES LANGUAGE HIP)
-        set_target_properties(test_cuda_copy_batch PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_include_directories(test_cuda_copy_batch PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(test_cuda_copy_batch PRIVATE ggml ${LUCE_GGML_BACKEND_TARGET})

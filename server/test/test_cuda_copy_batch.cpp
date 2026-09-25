@@ -27,9 +27,21 @@ int main() {
     ip.mem_size = 2 * ggml_tensor_overhead();
     ip.no_alloc = true;
     ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        std::fprintf(stderr, "[cuda-copy-batch] ggml_init failed\n");
+        ggml_backend_free(gpu);
+        return 1;
+    }
     ggml_tensor * src = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, kBytes);
     ggml_tensor * dst = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, kBytes);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, gpu);
+    if (!buf || !src->data || !dst->data) {
+        std::fprintf(stderr, "[cuda-copy-batch] device allocation failed\n");
+        if (buf) ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        ggml_backend_free(gpu);
+        return 1;
+    }
 
     std::vector<uint8_t> src_host(kBytes);
     for (int64_t i = 0; i < kBytes; ++i) {
@@ -49,6 +61,10 @@ int main() {
             src_off = (src_off + 15) & ~int64_t(15);
             dst_off = (dst_off + 15) & ~int64_t(15);
         }
+        if (src_off + n > kBytes || dst_off + n > kBytes) {
+            std::fprintf(stderr, "[cuda-copy-batch] test layout overflow\n");
+            return 1;
+        }
         descs.push_back({(const uint8_t *) src->data + src_off,
                          (uint8_t *) dst->data + dst_off, (size_t) n});
         for (int64_t j = 0; j < n; ++j) {
@@ -56,10 +72,6 @@ int main() {
         }
         src_off += n + 1;
         dst_off += n + 3;   // gaps between destinations must stay 0xEE
-    }
-    if (dst_off > kBytes || src_off > kBytes) {
-        std::fprintf(stderr, "[cuda-copy-batch] test layout overflow\n");
-        return 1;
     }
 
     ggml_backend_cuda_copy_batch_async(gpu, descs.data(), (int) descs.size());

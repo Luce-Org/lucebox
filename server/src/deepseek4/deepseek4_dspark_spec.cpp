@@ -422,7 +422,6 @@ bool rollback_tensor_on(const ggml_tensor * t, ggml_backend_buffer_type_t buft) 
 // because the batched copy runs as one kernel on that device.
 bool init_device_rollback(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb,
                           ggml_backend_t backend) {
-    if (rb.device_buf) return true;
     if (!backend || !ggml_backend_is_cuda(backend)) return false;
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
     if (!rollback_tensor_on(cache.hc_state, buft)) return false;
@@ -437,6 +436,19 @@ bool init_device_rollback(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & 
     }
     const size_t total = assign_rollback_spans(cache, rb);
     if (total == 0) return false;
+    if (rb.device_buf && rb.device_backend == backend && rb.device_bytes == total) {
+        return true;
+    }
+    // A different backend or cache layout: retire the old staging once its
+    // copies have drained, then allocate for the new one.
+    if (rb.device_buf) {
+        if (rb.device_backend) ggml_backend_synchronize(rb.device_backend);
+        ggml_backend_buffer_free(rb.device_buf);
+        rb.device_buf = nullptr;
+        rb.device_base = nullptr;
+        rb.device_backend = nullptr;
+        rb.device_bytes = 0;
+    }
     rb.device_buf = ggml_backend_alloc_buffer(backend, total);
     if (!rb.device_buf) return false;
     rb.device_base =
@@ -446,6 +458,8 @@ bool init_device_rollback(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & 
         rb.device_buf = nullptr;
         return false;
     }
+    rb.device_backend = backend;
+    rb.device_bytes = total;
     return true;
 }
 
@@ -524,7 +538,12 @@ void restore_rollback_state(ggml_backend_t backend, ggml_tensor * t,
 void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb,
                         ggml_backend_t backend, bool async_copy,
                         bool pinned_copy, int raw_pos, int raw_count) {
-    ggml_backend_t saved_backend = (async_copy || pinned_copy) ? backend : nullptr;
+    // Device staging does not depend on the legacy async/pinned switches:
+    // without them every row would otherwise be a blocking host copy.
+    const bool use_device = backend && device_rollback_enabled() &&
+        init_device_rollback(cache, rb, backend);
+    ggml_backend_t saved_backend =
+        (use_device || async_copy || pinned_copy) ? backend : nullptr;
     if (rb.async_backend && rb.async_backend != saved_backend) {
         ggml_backend_synchronize(rb.async_backend);
     }
@@ -532,8 +551,6 @@ void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb
     rb.raw_pos = raw_pos;
     rb.raw_count = std::clamp(raw_count, 0, kRollbackMaxTokens);
     rb.layers.resize(cache.layers.size());
-    const bool use_device = (async_copy || pinned_copy) && backend &&
-        device_rollback_enabled() && init_device_rollback(cache, rb, backend);
     const bool use_pinned =
         !use_device && pinned_copy && init_pinned_rollback(cache, rb, backend);
     rb.uses_pinned_copy = use_pinned;
