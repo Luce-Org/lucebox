@@ -2676,6 +2676,11 @@ static ggml_tensor * build_mla_attention_lane_core(
                     (size_t) w.n_swa * sizeof(float)));
             }
         }
+        // Gathered histories arrive as F32 rows (GET_ROWS); the scorer reads
+        // the F16 cache format, which holds them exactly.
+        if (index_comp_history_source && index_comp_history_source->type != GGML_TYPE_F16) {
+            index_comp_history_source = ggml_cast(ctx, index_comp_history_source, GGML_TYPE_F16);
+        }
         indexer_topk = deepseek4_build_indexer_topk(
             ctx, qr, cur, w, L, index_comp_history_source,
             n_index_comp, kv_start, n_tokens, ratio, rope_pos,
@@ -2895,9 +2900,23 @@ static ggml_tensor * build_mla_attention_lane_core(
     // row IDs. The CUDA/HIP kernel can derive the raw causal window and the
     // completed compressed-row frontier from kv_start and the query index.
     // Keep every other attention shape on the explicit mask contract.
-    const bool direct_indexer_topk = indexer_topk && ratio == 4 && !image_spans.size &&
-        (maskless_sparse_prefill ||
-         ds4_env_flag("LUCE_DS4_DIRECT_INDEXER_TOPK"));
+    const bool exact_numerical_bands =
+        attention_impl == DeepSeek4AttentionImpl::DenseFlash &&
+        causal_batch &&
+        n_tokens > DS4_NUMERICAL_PREFILL_BAND &&
+        n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
+    // A shared selection (V4.1) always runs on the D=512 flash kernel, which
+    // reads only the selected compressed rows: the lane's mask keeps the
+    // causal visibility and the selection names the rows (the 2K numerical
+    // bands attach each band's slice below).
+    const bool selection_flash = w.shared_index_topk && indexer_topk &&
+        head_dim == 512 && n_rot == 64 && !image_spans.size;
+    const bool direct_indexer_topk = ratio == 4
+        ? indexer_topk && !image_spans.size &&
+          (maskless_sparse_prefill || ds4_env_flag("LUCE_DS4_DIRECT_INDEXER_TOPK"))
+        : selection_flash && !exact_numerical_bands;
+    // Only the ratio-4 maskless prefill derives visibility without a mask.
+    const bool maskless_direct = direct_indexer_topk && !selection_flash;
     // Layer-major, non-indexed layers can skip the quadratic causal mask:
     // their KV layout is [prior chronological window | current batch], so
     // the kernel derives the exact causal window from kv_start and the query
@@ -2937,11 +2956,6 @@ static ggml_tensor * build_mla_attention_lane_core(
         (analytic_causal_shmem <= analytic_causal_lds_limit ||
          streaming_dense_high_ratio) &&
         ds4_env_flag("LUCE_DS4_DIRECT_CONTIGUOUS_CAUSAL");
-    const bool exact_numerical_bands =
-        attention_impl == DeepSeek4AttentionImpl::DenseFlash &&
-        causal_batch &&
-        n_tokens > DS4_NUMERICAL_PREFILL_BAND &&
-        n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
     if (!exact_numerical_bands) {
         if (masked_kv && n_tokens > 1) {
             score_mask = ggml_reshape_2d(ctx, cached_inputs->attn_row_mask,
@@ -3037,7 +3051,7 @@ static ggml_tensor * build_mla_attention_lane_core(
     // Preserve appended raw verifier rows as well as the learned top-k set.
     // Numerical bands apply the selection to each band's own mask below.
     if (indexer_topk && !exact_numerical_bands) {
-        if (!score_mask && !direct_indexer_topk && f32_array_inputs) {
+        if (!score_mask && !maskless_direct && f32_array_inputs) {
             score_mask = ggml_new_tensor_2d(
                 ctx, GGML_TYPE_F32, n_attn, n_tokens);
             ggml_set_input(score_mask);
@@ -3045,7 +3059,7 @@ static ggml_tensor * build_mla_attention_lane_core(
                 score_mask,
                 std::vector<float>((size_t) n_attn * n_tokens, 0.0f),
             });
-        } else if (!score_mask && !direct_indexer_topk) {
+        } else if (!score_mask && !maskless_direct) {
             // Graphs without host-filled inputs (cached and verify lanes)
             // see every row: an all-zero base mask built in the graph.
             ggml_tensor * zero = ggml_scale(
@@ -3064,8 +3078,9 @@ static ggml_tensor * build_mla_attention_lane_core(
     // Decode normally keeps the cheaper explicit path.  Once the trained
     // indexer has selected a bounded compressed-row set, however, the DS4
     // compact flash kernel avoids scanning every compressed KV row.
-    const bool use_flash = attention_impl != DeepSeek4AttentionImpl::Explicit &&
-                           (n_tokens > 1 || indexer_topk != nullptr);
+    const bool use_flash = selection_flash ||
+                           (attention_impl != DeepSeek4AttentionImpl::Explicit &&
+                            (n_tokens > 1 || indexer_topk != nullptr));
     if (use_flash) {
         if (exact_numerical_bands) {
             // A larger scheduling batch retains the numerical topology of
@@ -3194,19 +3209,21 @@ static ggml_tensor * build_mla_attention_lane_core(
                 ggml_tensor * band_mask = make_band_mask(
                     band_pos, band_count, band_prior_count,
                     band_comp_count);
-                if (indexer_topk && band_comp_count > 0) {
-                    // The band's compressed rows are the same span the
-                    // selection indexes; keep only the selected ones.
-                    ggml_tensor * band_selection = ggml_cont(ctx, ggml_view_2d(
-                        ctx, indexer_topk, indexer_topk->ne[0], band_count,
-                        indexer_topk->nb[1], (size_t) band_start * indexer_topk->nb[1]));
-                    band_mask = ggml_ds4_indexer_mask(
-                        ctx, ggml_cont(ctx, band_mask), band_selection,
-                        band_prior_count + band_count);
-                }
                 ggml_tensor * band_context = make_flash(
                     view_q(band_start, band_count), band_kv, band_mask,
                     band_prior_count + band_count, band_pos);
+                if (indexer_topk && band_comp_count > (int) indexer_topk->ne[0]) {
+                    // The band's compressed rows are the span the selection
+                    // indexes; the kernel reads only the selected ones. A band
+                    // whose rows all fit the selection stays dense (exact).
+                    ggml_tensor * band_selection = ggml_cont(ctx, ggml_view_2d(
+                        ctx, indexer_topk, indexer_topk->ne[0], band_count,
+                        indexer_topk->nb[1], (size_t) band_start * indexer_topk->nb[1]));
+                    ggml_flash_attn_ext_set_ds4_sparse(
+                        band_context, band_prior_count + band_count, w.n_swa,
+                        -(int) indexer_topk->ne[0], 32);
+                    ggml_flash_attn_ext_set_ds4_indexer_topk(band_context, band_selection);
+                }
                 context = context
                     ? ggml_concat(ctx, context, band_context, 2)
                     : band_context;
