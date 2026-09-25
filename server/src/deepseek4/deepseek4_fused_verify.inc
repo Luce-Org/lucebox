@@ -14,6 +14,24 @@ static void ds4_fv_set(ggml_tensor * t, const void * data, size_t nbytes) {
     if (t && t->buffer) ggml_backend_tensor_set(t, data, 0, nbytes);
 }
 
+// Attention lanes of a verify batch. A tokenwise verify (the staggered pre-mix
+// model, whose compressors may emit a row at every token) runs each token as
+// its own lane, exactly the single-token decode attention at its position;
+// otherwise the batch is one lane.
+static int ds4_fused_attention_lanes(const DeepSeek4Weights & w, int q) {
+    return w.hc_staggered_pre && q > 1 ? q : 1;
+}
+
+// Compressed rows a lane's attention spans: the rows visible at its last
+// token, rounded up to the replay stride.
+static int ds4_fused_lane_padded(const DeepSeek4Weights & w, const DeepSeek4LayerCache & clc,
+                                 int il, int lane_token_pos) {
+    const int ratio = (int) w.compress_ratios[il];
+    if (ratio <= 0 || !clc.comp_kv) return 0;
+    const int n_comp = ds4_comp_rows_used(clc.comp_kv, clc.n_comp, ratio, lane_token_pos);
+    return ds4_padded_comp_rows(n_comp, (int) clc.comp_kv->ne[1]);
+}
+
 struct Ds4MixedMoePolicy {
     bool owner_local_reduction = false;
     bool direct_device_join = false;
@@ -521,11 +539,15 @@ static bool ds4_build_fused_verify_graph(
         rows.ape = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);   ggml_set_input(rows.ape);
         rows.state = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(rows.state);
     }
-    // Up to two compressor emissions per layer. q<=4 uses at most one; q=5
-    // can touch two ratio-4 boundaries when it starts at position mod 4 == 3.
-    fg.i32_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2 * (int64_t) w.n_layer);
+    // Up to two compressor emissions per layer and attention lane. q<=4 uses
+    // at most one; q=5 can touch two ratio-4 boundaries when it starts at
+    // position mod 4 == 3; a tokenwise lane emits at most one.
+    const int n_lanes = paged_mode ? 1 : ds4_fused_attention_lanes(w, q);
+    const int attn_lane_q = q / n_lanes;
+    const int64_t comp_slots = 2 * (int64_t) w.n_layer * n_lanes;
+    fg.i32_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, comp_slots);
     ggml_set_input(fg.i32_bundle);
-    fg.i64_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 2 * (int64_t) w.n_layer);
+    fg.i64_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, comp_slots);
     ggml_set_input(fg.i64_bundle);
 
     // Mask bundle: q>1 preserves the q ring rows that the batch overwrites,
@@ -546,16 +568,13 @@ static bool ds4_build_fused_verify_graph(
         }
     } else if (!paged_mode) {
         for (int il = 0; il < w.n_layer; ++il) {
-            const int ratio = (int) w.compress_ratios[il];
             const DeepSeek4LayerCache & clc = ds4_comp_cache(*cache, w, il);
-            int padded = 0;
-            if (ratio > 0 && clc.comp_kv) {
-                const int n_comp = ds4_comp_rows_used(
-                    clc.comp_kv, clc.n_comp, ratio, kv_start + q - 1);
-                padded = ds4_padded_comp_rows(n_comp, (int) clc.comp_kv->ne[1]);
+            for (int lane = 0; lane < n_lanes; ++lane) {
+                const int padded = ds4_fused_lane_padded(
+                    w, clc, il, kv_start + (lane + 1) * attn_lane_q - 1);
+                const int preserved_rows = attn_lane_q > 1 ? attn_lane_q : 0;
+                mask_total += (int64_t) (w.n_swa + padded + preserved_rows) * attn_lane_q;
             }
-            const int preserved_rows = q > 1 ? q : 0;
-            mask_total += (int64_t) (w.n_swa + padded + preserved_rows) * q;
         }
     }
     fg.mask_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
@@ -605,6 +624,17 @@ static bool ds4_build_fused_verify_graph(
 
     std::vector<ggml_tensor *> capture_layers(capture_ids.size(), nullptr);
     std::vector<ggml_tensor *> attention_contexts;
+    // Tokenwise lanes record every token's compressor window row so a
+    // rejected suffix can be rolled back (Ds4VerifyWindowRows).
+    std::vector<ggml_tensor *> window_kv_rows, window_score_rows;
+    if (n_lanes > 1) {
+        for (int il = 0; il < w.n_layer; ++il) {
+            if (deepseek4_is_window_state(cache->layers[(size_t) il].attn_compressor,
+                                          (int) w.compress_ratios[il])) {
+                ex.window_layers.push_back(il);
+            }
+        }
+    }
     // Staggered pre-mix: the pre coefficients of the previous sub-block.
     ggml_tensor * carried_pre = nullptr;
 
@@ -620,7 +650,6 @@ static bool ds4_build_fused_verify_graph(
         const int lane_q = q;
         const int lane_start = 0;
         const int lane_kv_start = kv_start + lane_start;
-        const int lane_token_pos = lane_kv_start + lane_q - 1;
         const size_t hybrid_idx = (size_t) il;
 
         // ── Batched HC pre (attention) ──
@@ -881,55 +910,54 @@ static bool ds4_build_fused_verify_graph(
                 ctx, attn_out, w, L, q, /*allow_grouped=*/false, projection_columns);
         } else {
         // ── Batched speculative attention ──
+        // One lane for the batch, or one per token (ds4_fused_attention_lanes):
+        // each lane is the attention graph of a decode step at its position,
+        // built in position order, so its ring write, compressor step and
+        // attention see exactly the rows that decode step sees.
+        ggml_tensor * normed_all = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
+        const int window_idx = [&] {
+            const auto it = std::find(ex.window_layers.begin(), ex.window_layers.end(), il);
+            return it == ex.window_layers.end() ? -1 : (int) (it - ex.window_layers.begin());
+        }();
+        for (int lane = 0; lane < n_lanes; ++lane) {
+        const int aq = attn_lane_q;
+        const int a_start = lane * aq;
+        const int a_kv_start = kv_start + a_start;
+        const int a_token_pos = a_kv_start + aq - 1;
+        const auto lane_rows = [&](ggml_tensor * t) {
+            return n_lanes == 1 ? t : ggml_view_1d(ctx, t, aq, (size_t) a_start * t->nb[0]);
+        };
+        const size_t comp_slot = ((size_t) il * n_lanes + (size_t) lane) * 2;
         DeepSeek4AttentionGraphInputs ain{};
-        ain.rope_pos = ex.pos_q;
-        ain.neg_pos = ex.neg_q;
-        ain.raw_kv_rows = ex.rawrows;
-        ain.preserved_raw_rows = ex.saved_rawrows;
+        ain.rope_pos = lane_rows(ex.pos_q);
+        ain.neg_pos = lane_rows(ex.neg_q);
+        ain.raw_kv_rows = lane_rows(ex.rawrows);
+        ain.preserved_raw_rows = lane_rows(ex.saved_rawrows);
         if (ratio > 0) {
             int n_flush = 0;
-            for (int t = 0; t < lane_q; ++t) {
-                if (((lane_kv_start + t + 1) % ratio) == 0) ++n_flush;
+            for (int t = 0; t < aq; ++t) {
+                if (((a_kv_start + t + 1) % ratio) == 0) ++n_flush;
             }
             const int n_comp_inputs = std::max(1, n_flush);
-            ggml_tensor * ape_all = ex.rows_for(ratio)->ape;
-            ggml_tensor * state_all = ex.rows_for(ratio)->state;
-            ain.attn_ape_row = ape_all;
-            ain.attn_state_rows = state_all;
+            ain.attn_ape_row = lane_rows(ex.rows_for(ratio)->ape);
+            ain.attn_state_rows = lane_rows(ex.rows_for(ratio)->state);
             ain.attn_comp_pos = ggml_view_1d(
-                ctx, fg.i32_bundle, n_comp_inputs,
-                (size_t) il * 2 * sizeof(int32_t));
+                ctx, fg.i32_bundle, n_comp_inputs, comp_slot * sizeof(int32_t));
             ain.attn_comp_rows = ggml_view_1d(
-                ctx, fg.i64_bundle, n_comp_inputs,
-                (size_t) il * 2 * sizeof(int64_t));
-        }
-        if (ratio == 4) {
-            int n_flush = 0;
-            for (int t = 0; t < lane_q; ++t) {
-                if (((lane_kv_start + t + 1) % ratio) == 0) ++n_flush;
+                ctx, fg.i64_bundle, n_comp_inputs, comp_slot * sizeof(int64_t));
+            if (ratio == 4) {
+                ain.index_ape_row = ain.attn_ape_row;
+                ain.index_state_rows = ain.attn_state_rows;
+                ain.index_comp_pos = ain.attn_comp_pos;
+                ain.index_comp_rows = ain.attn_comp_rows;
             }
-            const int n_comp_inputs = std::max(1, n_flush);
-            ain.index_ape_row = ex.rows_for(ratio)->ape;
-            ain.index_state_rows = ex.rows_for(ratio)->state;
-            ain.index_comp_pos = ggml_view_1d(
-                ctx, fg.i32_bundle, n_comp_inputs,
-                (size_t) il * 2 * sizeof(int32_t));
-            ain.index_comp_rows = ggml_view_1d(
-                ctx, fg.i64_bundle, n_comp_inputs,
-                (size_t) il * 2 * sizeof(int64_t));
         }
-        int padded = 0;
-        if (ratio > 0 && comp_lc->comp_kv) {
-            const int n_comp = ds4_comp_rows_used(
-                comp_lc->comp_kv, comp_lc->n_comp, ratio, lane_token_pos);
-            padded = ds4_padded_comp_rows(n_comp, (int) comp_lc->comp_kv->ne[1]);
-        }
-        const int64_t n_attn = (int64_t) w.n_swa + padded +
-                               (lane_q > 1 ? lane_q : 0);
-        ain.attn_row_mask = ggml_view_2d(ctx, fg.mask_bundle, n_attn, lane_q,
+        const int padded = ds4_fused_lane_padded(w, *comp_lc, il, a_token_pos);
+        const int64_t n_attn = (int64_t) w.n_swa + padded + (aq > 1 ? aq : 0);
+        ain.attn_row_mask = ggml_view_2d(ctx, fg.mask_bundle, n_attn, aq,
                                          n_attn * sizeof(float), (size_t) mask_off * sizeof(float));
         ain.padded_comp = padded;
-        mask_off += n_attn * lane_q;
+        mask_off += n_attn * aq;
 
         std::vector<DeepSeek4I32InputBinding> i32b;
         std::vector<DeepSeek4I32ArrayBinding> i32ab;
@@ -945,19 +973,22 @@ static bool ds4_build_fused_verify_graph(
             // The exact indexer carries saved raw rows for batched lanes.
             // Coarse block selection has no saved-row contract; retain the
             // explicit verifier there instead of pruning raw history.
-            (lane_q == 1 || ratio == 4) &&
+            (aq == 1 || ratio == 4) &&
             padded > 2 * w.n_indexer_top_k;
         const DeepSeek4AttentionImpl attention_impl = sparse_attention
             ? DeepSeek4AttentionImpl::SparseFlash
             : DeepSeek4AttentionImpl::Explicit;
-        ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
-        attn_out = build_mla_attention(ctx, gf, normed, w, L, *lc, *comp_lc, il,
-                                                     lane_kv_start, lane_q, &ain,
+        ggml_tensor * normed = n_lanes == 1 ? normed_all
+            : ggml_view_2d(ctx, normed_all, n_embd, aq, normed_all->nb[1],
+                           (size_t) a_start * normed_all->nb[1]);
+        ggml_tensor * lane_out = build_mla_attention(ctx, gf, normed, w, L, *lc, *comp_lc, il,
+                                                     a_kv_start, aq, &ain,
                                                      i32b, i32ab, i64ab,
                                                      &f32ab, attention_impl,
-                                                     &ex.boundary_checkpoint.layers[
-                                                         (size_t) il]);
-        if (!attn_out) return false;
+                                                     n_lanes == 1
+                                                         ? &ex.boundary_checkpoint.layers[(size_t) il]
+                                                         : nullptr);
+        if (!lane_out) return false;
         if (!i32b.empty() || !i32ab.empty() || !i64ab.empty() ||
             !f32ab.empty()) {
             std::fprintf(stderr,
@@ -965,6 +996,20 @@ static bool ds4_build_fused_verify_graph(
                 "(%zu/%zu/%zu/%zu); cannot fuse\n",
                 il, i32b.size(), i32ab.size(), i64ab.size(), f32ab.size());
             return false;
+        }
+        if (window_idx >= 0) {
+            // The window row this token wrote, before the next lane's write.
+            const DeepSeek4CompressorState & st = lc->attn_compressor;
+            const size_t row_off = (size_t) (a_kv_start % ratio) * st.state_kv->nb[1];
+            window_kv_rows.push_back(ggml_cont(ctx, ggml_view_2d(
+                ctx, st.state_kv, st.state_kv->ne[0], 1, st.state_kv->nb[1], row_off)));
+            window_score_rows.push_back(ggml_cont(ctx, ggml_view_2d(
+                ctx, st.state_score, st.state_score->ne[0], 1, st.state_score->nb[1], row_off)));
+            ggml_build_forward_expand(gf, window_kv_rows.back());
+            ggml_build_forward_expand(gf, window_score_rows.back());
+        }
+        if (n_lanes > 1) ggml_build_forward_expand(gf, lane_out);
+        attn_out = attn_out ? ggml_concat(ctx, attn_out, lane_out, 1) : lane_out;
         }
         }
 
@@ -1189,7 +1234,8 @@ static bool ds4_build_fused_verify_graph(
                     return false;
                 }
                 ffn_out = inputs.output;
-                if (lane_q > 1 && native_route_width &&
+                // Tokenwise lanes join like single-token decode.
+                if (lane_q > 1 && n_lanes == 1 && native_route_width &&
                     mixed_policy.fused_hc_join &&
                     inputs.main_output && inputs.peer_output) {
                     fused_hc_join_inputs = &inputs;
@@ -1268,6 +1314,17 @@ static bool ds4_build_fused_verify_graph(
         ggml_set_output(ex.capture);
         ggml_build_forward_expand(gf, ex.capture);
     }
+    const auto concat_rows = [&](const std::vector<ggml_tensor *> & rows) {
+        ggml_tensor * all = nullptr;
+        for (ggml_tensor * row : rows) all = all ? ggml_concat(ctx, all, row, 1) : row;
+        if (all) {
+            ggml_set_output(all);
+            ggml_build_forward_expand(gf, all);
+        }
+        return all;
+    };
+    ex.window_kv = concat_rows(window_kv_rows);
+    ex.window_score = concat_rows(window_score_rows);
     ex.boundary_checkpoint.available = std::any_of(
         ex.boundary_checkpoint.layers.begin(),
         ex.boundary_checkpoint.layers.end(),
@@ -1592,7 +1649,6 @@ static int ds4_try_fused_verify_step(
     }
 
     const int q = n_tokens;
-    const int token_pos = kv_start + q - 1;
     std::vector<int64_t> key;
     key.reserve((size_t) w.n_layer + hooks->capture_layer_ids->size() + 5);
     key.push_back(w.n_swa);
@@ -1601,22 +1657,24 @@ static int ds4_try_fused_verify_step(
     key.push_back(hybrid ? 1 : 0);
     key.push_back((int64_t) hooks->capture_layer_ids->size());
     for (int layer : *hooks->capture_layer_ids) key.push_back(layer);
+    const int n_lanes = ds4_fused_attention_lanes(w, q);
+    const int attn_lane_q = q / n_lanes;
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) w.compress_ratios[il];
         DeepSeek4LayerCache & lc = ds4_comp_cache(cache, w, il);
-        int padded = 0;
-        if (ratio > 0 && lc.comp_kv) {
-            const int n_comp = ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos);
-            padded = ds4_padded_comp_rows(n_comp, (int) lc.comp_kv->ne[1]);
-        }
-        int b_idx = -1;
-        if (ratio > 0) {
-            for (int t = 0; t < q; ++t) {
-                if (((kv_start + t + 1) % ratio) == 0) { b_idx = t; break; }
+        for (int lane = 0; lane < n_lanes; ++lane) {
+            const int lane_kv_start = kv_start + lane * attn_lane_q;
+            const int padded = ds4_fused_lane_padded(
+                w, lc, il, lane_kv_start + attn_lane_q - 1);
+            int b_idx = -1;
+            if (ratio > 0) {
+                for (int t = 0; t < attn_lane_q; ++t) {
+                    if (((lane_kv_start + t + 1) % ratio) == 0) { b_idx = t; break; }
+                }
             }
+            key.push_back(
+                ((int64_t) padded << 4) | (int64_t) (b_idx + 1));
         }
-        key.push_back(
-            ((int64_t) padded << 4) | (int64_t) (b_idx + 1));
     }
 
     vc.counter++;
@@ -1694,27 +1752,29 @@ static int ds4_try_fused_verify_step(
         ds4_fv_set(rows.state, lv.data(), sizeof(int64_t) * q);
     }
 
-    std::vector<int32_t> i32v((size_t) w.n_layer * 2, 0);
-    std::vector<int64_t> i64v((size_t) w.n_layer * 2, 0);
+    std::vector<int32_t> i32v((size_t) w.n_layer * n_lanes * 2, 0);
+    std::vector<int64_t> i64v((size_t) w.n_layer * n_lanes * 2, 0);
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) w.compress_ratios[il];
-        if (ratio > 0) {
+        if (ratio <= 0) continue;
+        for (int lane = 0; lane < n_lanes; ++lane) {
+            const size_t slot = ((size_t) il * n_lanes + (size_t) lane) * 2;
+            const int lane_kv_start = kv_start + lane * attn_lane_q;
+            const int lane_token_pos = lane_kv_start + attn_lane_q - 1;
             int n_flush = 0;
-            for (int t = 0; t < q; ++t) {
-                if (((kv_start + t + 1) % ratio) != 0) continue;
+            for (int t = 0; t < attn_lane_q; ++t) {
+                if (((lane_kv_start + t + 1) % ratio) != 0) continue;
                 GGML_ASSERT(n_flush < 2);
-                const int pos_b = kv_start + t;
-                i32v[(size_t) il * 2 + (size_t) n_flush] =
-                    pos_b + 1 - ratio;
-                i64v[(size_t) il * 2 + (size_t) n_flush] =
-                    pos_b / ratio;
+                const int pos_b = lane_kv_start + t;
+                i32v[slot + (size_t) n_flush] = pos_b + 1 - ratio;
+                i64v[slot + (size_t) n_flush] = pos_b / ratio;
                 ++n_flush;
             }
             if (n_flush == 0) {
                 // The graph does not consume these values in a no-flush shape,
                 // but initialize them deterministically for diagnostics.
-                i32v[(size_t) il * 2] = token_pos + 1 - ratio;
-                i64v[(size_t) il * 2] = token_pos / ratio;
+                i32v[slot] = lane_token_pos + 1 - ratio;
+                i64v[slot] = lane_token_pos / ratio;
             }
         }
     }
@@ -1737,18 +1797,14 @@ static int ds4_try_fused_verify_step(
         };
         size_t off = 0;
         for (int il = 0; il < w.n_layer; ++il) {
-            const int ratio = (int) w.compress_ratios[il];
-            DeepSeek4LayerCache & lc = ds4_comp_cache(cache, w, il);
-            const int lane_q = q;
-            const int lane_start = 0;
+          const int ratio = (int) w.compress_ratios[il];
+          DeepSeek4LayerCache & lc = ds4_comp_cache(cache, w, il);
+          for (int lane = 0; lane < n_lanes; ++lane) {
+            const int lane_q = attn_lane_q;
+            const int lane_start = lane * attn_lane_q;
             const int lane_kv_start = kv_start + lane_start;
             const int lane_token_pos = lane_kv_start + lane_q - 1;
-            int padded = 0;
-            if (ratio > 0 && lc.comp_kv) {
-                const int n_comp = ds4_comp_rows_used(
-                    lc.comp_kv, lc.n_comp, ratio, lane_token_pos);
-                padded = ds4_padded_comp_rows(n_comp, (int) lc.comp_kv->ne[1]);
-            }
+            const int padded = ds4_fused_lane_padded(w, lc, il, lane_token_pos);
             const size_t n_attn = (size_t) w.n_swa + padded +
                                   (lane_q > 1 ? (size_t) lane_q : 0u);
             for (int i = 0; i < lane_q; ++i) {
@@ -1779,6 +1835,7 @@ static int ds4_try_fused_verify_step(
                 }
             }
             off += n_attn * lane_q;
+          }
         }
         GGML_ASSERT(off == mask_count);
 
@@ -1885,10 +1942,14 @@ static int ds4_try_fused_verify_step(
     // can never bypass validation using the previous generation's executable.
     const bool force_verify_graph_replay = q > 1 &&
         ds4_env_flag("LUCE_DS4_VERIFY_FORCE_GRAPH_REPLAY");
+    // Tokenwise lanes match single-token decode only with batch-invariant
+    // products in the batched projections, FFN and output head.
     ScopedCudaGraphOverrides graph_override_scope(
         /*disable_graphs=*/capture_eager,
         /*mmvq_max_ncols=*/capture_cache && q == 1 ? 3 : 0,
-        /*skip_property_check=*/force_verify_graph_replay);
+        /*skip_property_check=*/force_verify_graph_replay,
+        /*ds4_mix_mmv_max_tokens=*/0,
+        /*mmvq_batch_invariant=*/n_lanes > 1);
     MoeStreamedMailbox * mailbox =
         hybrid && hybrid->expert_cache ? hybrid->expert_cache->mailbox() : nullptr;
     const std::vector<MoeStreamedMailbox::Job> stream_jobs =
@@ -1943,6 +2004,23 @@ static int ds4_try_fused_verify_step(
     }
     if (hooks->boundary_checkpoint_out) {
         *hooks->boundary_checkpoint_out = ex->boundary_checkpoint;
+    }
+    if (hooks->window_rows && ex->window_kv && ex->window_score) {
+        // Layer-major [row, token] -> per layer [token][row bytes].
+        Ds4VerifyWindowRows & rows = *hooks->window_rows;
+        rows.kv.assign((size_t) w.n_layer, {});
+        rows.score.assign((size_t) w.n_layer, {});
+        std::vector<uint8_t> kv_all(ggml_nbytes(ex->window_kv));
+        std::vector<uint8_t> score_all(ggml_nbytes(ex->window_score));
+        ggml_backend_tensor_get(ex->window_kv, kv_all.data(), 0, kv_all.size());
+        ggml_backend_tensor_get(ex->window_score, score_all.data(), 0, score_all.size());
+        const size_t per_layer = kv_all.size() / ex->window_layers.size();
+        for (size_t i = 0; i < ex->window_layers.size(); ++i) {
+            const size_t il = (size_t) ex->window_layers[i];
+            rows.kv[il].assign(kv_all.begin() + i * per_layer, kv_all.begin() + (i + 1) * per_layer);
+            rows.score[il].assign(score_all.begin() + i * per_layer,
+                                  score_all.begin() + (i + 1) * per_layer);
+        }
     }
     if (telemetry) {
         telemetry->full_graph_read_us += ds4_elapsed_us(read_t0, Ds4TimingClock::now());

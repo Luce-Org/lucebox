@@ -6055,6 +6055,12 @@ struct Ds4FusedVerifyCache {
         ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap,q], token-major
         ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy output
         DeepSeek4SpecBoundaryCheckpoint boundary_checkpoint;
+        // Tokenwise verify: the compressor window row each token wrote, per
+        // window-state layer (window_layers), [row, layer-major token] for
+        // kv and score, read back as Ds4VerifyWindowRows.
+        std::vector<int> window_layers;
+        ggml_tensor * window_kv = nullptr;
+        ggml_tensor * window_score = nullptr;
         // Reused host staging for the context-sized additive attention mask.
         // Keeping it per slot removes allocation churn in both full and
         // sparse-range mask update modes.
@@ -9015,13 +9021,14 @@ bool deepseek4_step_layer_range(
     const bool wide_verify_candidate =
         n_tokens == DS4_Q5_VERIFY_TOKENS &&
         ds4_env_flag("LUCE_DS4_Q5_VERIFY");
-    // With the staggered pre-mix the fused graph serves single-token decode;
-    // verify batches take decode_tokenwise_verify below.
+    // With the staggered pre-mix the fused graph verifies token by token
+    // (ds4_fused_attention_lanes), so no compressor boundary limits its width.
+    const bool fused_verify_width_ok =
+        n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS || wide_verify_candidate ||
+        w.hc_staggered_pre;
     const bool fused_verify_candidate =
         (!moe_hybrid || fused_hybrid_ready) &&
-        n_tokens >= 2 && !w.hc_staggered_pre &&
-        (n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS ||
-         wide_verify_candidate) && verify_hooks &&
+        n_tokens >= 2 && fused_verify_width_ok && verify_hooks &&
         layer_begin == 0 && is_last_shard && out_logits &&
         ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
     // Fused verify has many preconditions and declining any of them is
@@ -9385,9 +9392,7 @@ bool deepseek4_step_layer_range(
         (fused_hybrid_decode && !verify_hooks)
             ? &fused_hybrid_decode_hooks : verify_hooks;
     if ((!moe_hybrid || fused_hybrid_ready) &&
-        ((n_tokens >= 2 && !w.hc_staggered_pre &&
-          (n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS ||
-           wide_verify_candidate) && verify_hooks) ||
+        ((n_tokens >= 2 && fused_verify_width_ok && verify_hooks) ||
          fused_hybrid_decode) &&
         layer_begin == 0 && is_last_shard &&
         out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled()) {
