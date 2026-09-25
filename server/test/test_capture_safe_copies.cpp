@@ -25,6 +25,16 @@ struct CaptureSafeCopiesFixture : CppUnitTestFramework::CommonFixture {
 void free_on(int device, void * ptr) {
     if (ptr && cudaSetDevice(device) == cudaSuccess) cudaFree(ptr);
 }
+
+// A listed device can still be unusable (visibility masks, exclusive mode).
+bool device_usable(int device) {
+    void * probe = nullptr;
+    const bool ok = cudaSetDevice(device) == cudaSuccess &&
+                    cudaMalloc(&probe, 256) == cudaSuccess;
+    if (probe) cudaFree(probe);
+    (void) cudaGetLastError();
+    return ok;
+}
 }  // namespace
 
 TEST_CASE(CaptureSafeCopiesFixture, copies_during_relaxed_capture) {
@@ -33,9 +43,12 @@ TEST_CASE(CaptureSafeCopiesFixture, copies_during_relaxed_capture) {
         SKIP("CUDA/HIP device unavailable");
     }
     constexpr size_t kBytes = 1 << 16;
-    // With a second GPU, also copy device 1 -> device 0 (the target/draft
-    // split), which goes through the peer or pinned-staging path.
-    const bool cross = n_devices > 1;
+    // With a second usable GPU, also copy device 1 -> device 0 (the
+    // target/draft split), which goes through the peer or pinned-staging path.
+    const bool cross = n_devices > 1 && device_usable(1);
+    if (n_devices > 1 && !cross) {
+        std::puts("[capture-safe-copies] device 1 unusable: same-device leg only");
+    }
     void * src = nullptr;
     void * dst = nullptr;
     void * src_peer = nullptr;
