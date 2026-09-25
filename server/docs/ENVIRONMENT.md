@@ -137,6 +137,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_DS4_Q5_VERIFY` - deepseek4_backend.cpp, deepseek4_dspark_spec.cpp, deepseek4_fused_verify.inc, deepseek4_graph.cpp (gfx1151 DSpark default =1: five-row fused verifier and the 24-slot cache; =0 restores the q<=4 verifier)
 - `LUCE_DS4_PINNED_ROLLBACK` - deepseek4_dspark_spec.cpp (gfx1151 DSpark default =1: pinned host rollback state; =0 restores pageable copies)
 - `LUCE_DS4_DEVICE_ROLLBACK` - deepseek4/deepseek4_dspark_spec.cpp
+- `LUCE_DS4_ASYNC_ROLLBACK` - deepseek4_dspark_spec.cpp (=1: stream-ordered per-row rollback copies when device staging is off)
 - `LUCE_DS4_COMP_PAD_STRIDE` - deepseek4_graph.cpp
 - `LUCE_DS4_CROSS_VENDOR_OWNER_SUMS` - deepseek4_fused_verify.inc
 - `LUCE_DS4_CUDA_LAYERS` - deepseek4_layer_split_adapter.cpp

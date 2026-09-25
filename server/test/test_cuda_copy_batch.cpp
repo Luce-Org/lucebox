@@ -1,3 +1,4 @@
+#include "CppUnitTestFramework.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
@@ -7,41 +8,33 @@
 #include <cstdio>
 #include <vector>
 
+namespace {
+struct CudaCopyBatchFixture : CppUnitTestFramework::CommonFixture {
+    using CppUnitTestFramework::CommonFixture::CommonFixture;
+};
+}  // namespace
+
 // ggml_backend_cuda_copy_batch_async: more descriptors than one launch holds,
 // aligned and unaligned ends, sizes from 1 byte to several KB, and an empty
 // descriptor. Every destination byte must hold its source byte and every
 // byte between destinations must stay untouched.
-int main() {
+TEST_CASE(CudaCopyBatchFixture, descriptor_batch) {
     if (ggml_backend_cuda_get_device_count() <= 0) {
-        std::puts("[cuda-copy-batch] SKIP: GPU device unavailable");
-        return 77;
+        SKIP("CUDA/HIP device unavailable");
     }
     ggml_backend_t gpu = ggml_backend_cuda_init(0);
-    if (!gpu) {
-        std::fprintf(stderr, "[cuda-copy-batch] backend initialization failed\n");
-        return 1;
-    }
+    REQUIRE(gpu != nullptr);
 
     constexpr int64_t kBytes = 1 << 20;
     ggml_init_params ip{};
     ip.mem_size = 2 * ggml_tensor_overhead();
     ip.no_alloc = true;
     ggml_context * ctx = ggml_init(ip);
-    if (!ctx) {
-        std::fprintf(stderr, "[cuda-copy-batch] ggml_init failed\n");
-        ggml_backend_free(gpu);
-        return 1;
-    }
+    REQUIRE(ctx != nullptr);
     ggml_tensor * src = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, kBytes);
     ggml_tensor * dst = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, kBytes);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, gpu);
-    if (!buf || !src->data || !dst->data) {
-        std::fprintf(stderr, "[cuda-copy-batch] device allocation failed\n");
-        if (buf) ggml_backend_buffer_free(buf);
-        ggml_free(ctx);
-        ggml_backend_free(gpu);
-        return 1;
-    }
+    REQUIRE(buf != nullptr);
 
     std::vector<uint8_t> src_host(kBytes);
     for (int64_t i = 0; i < kBytes; ++i) {
@@ -61,10 +54,8 @@ int main() {
             src_off = (src_off + 15) & ~int64_t(15);
             dst_off = (dst_off + 15) & ~int64_t(15);
         }
-        if (src_off + n > kBytes || dst_off + n > kBytes) {
-            std::fprintf(stderr, "[cuda-copy-batch] test layout overflow\n");
-            return 1;
-        }
+        REQUIRE(src_off + n <= kBytes);
+        REQUIRE(dst_off + n <= kBytes);
         descs.push_back({(const uint8_t *) src->data + src_off,
                          (uint8_t *) dst->data + dst_off, (size_t) n});
         for (int64_t j = 0; j < n; ++j) {
@@ -79,18 +70,17 @@ int main() {
 
     std::vector<uint8_t> got(kBytes);
     ggml_backend_tensor_get(dst, got.data(), 0, kBytes);
-    int64_t bad = 0;
-    for (int64_t i = 0; i < kBytes; ++i) {
-        if (got[i] != expected[i] && bad++ < 5) {
-            std::fprintf(stderr, "[cuda-copy-batch] byte %lld: got %u want %u\n",
-                         (long long) i, got[i], expected[i]);
-        }
+    int64_t first_bad = -1;
+    for (int64_t i = 0; i < kBytes && first_bad < 0; ++i) {
+        if (got[i] != expected[i]) first_bad = i;
+    }
+    if (first_bad >= 0) {
+        std::fprintf(stderr, "[cuda-copy-batch] byte %lld: got %u want %u\n",
+                     (long long) first_bad, got[first_bad], expected[first_bad]);
     }
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     ggml_backend_free(gpu);
-    std::printf("[cuda-copy-batch] %zu descriptors, %lld mismatched bytes\n",
-                descs.size(), (long long) bad);
-    return bad == 0 ? 0 : 1;
+    REQUIRE(first_bad == -1);
 }

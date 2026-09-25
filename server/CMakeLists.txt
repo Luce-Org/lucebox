@@ -1319,13 +1319,12 @@ if(LUCE_TESTS)
         list(APPEND _raw_unit_test_targets test_ds4_moe_combine_cuda)
     endif()
     # Host-only test of the ggml-cuda batched copy: plain C++ on both the CUDA
-    # and HIP builds.
+    # and HIP builds. Registered through the CppUnit list below.
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_copy_batch.cpp")
         add_executable(test_cuda_copy_batch test/test_cuda_copy_batch.cpp)
         target_include_directories(test_cuda_copy_batch PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(test_cuda_copy_batch PRIVATE ggml ${LUCE_GGML_BACKEND_TARGET})
-        list(APPEND _raw_unit_test_targets test_cuda_copy_batch)
     endif()
     if(LUCE_GPU_BACKEND STREQUAL "hip")
         add_executable(test_ds4_maskless_prefill test/test_ds4_maskless_prefill.cpp)
@@ -2325,7 +2324,8 @@ if(LUCE_TESTS)
         test_rocmfp3_mix_registry
         test_rocmfp_mix_slice_matvec
         test_rocmfp_mix_gateup_glu
-        test_rocmfp_mix_glu_fusable)
+        test_rocmfp_mix_glu_fusable
+        test_cuda_copy_batch)
     foreach(_cppunit_target IN LISTS _new_cppunit_test_targets)
         if(TARGET ${_cppunit_target})
             target_sources(${_cppunit_target} PRIVATE test/test_unit_main.cpp)

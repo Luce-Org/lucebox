@@ -3037,11 +3037,18 @@ static void test_dspark_compressor_rollback(ggml_backend_t backend, int copy_mod
                 for (int accepted = 0; accepted <= q; ++accepted) {
                     load(initial, copy_backend != nullptr);
                     deepseek4_spec_rollback_save(cache, rollback, pos, q, copy_backend, pinned);
-                    if (copy_backend && ggml_backend_is_cuda(copy_backend) &&
-                        !std::getenv("LUCE_DS4_DEVICE_ROLLBACK") &&
-                        pos == 0 && q == 1 && accepted == 0) {
-                        TEST_ASSERT(rollback.uses_device_copy);
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+                    {
+                        // Mirrors device_rollback_enabled(): only an exact
+                        // "0" turns device staging off.
+                        const char * device_env = std::getenv("LUCE_DS4_DEVICE_ROLLBACK");
+                        const bool device_off = device_env && std::strcmp(device_env, "0") == 0;
+                        if (copy_backend && ggml_backend_is_cuda(copy_backend) && !device_off &&
+                            pos == 0 && q == 1 && accepted == 0) {
+                            TEST_ASSERT(rollback.uses_device_copy);
+                        }
                     }
+#endif
                     if (pinned && pos == 0 && q == 1 && accepted == 0) {
                         // Device staging takes precedence on a GPU backend
                         // that holds every rollback tensor; pinned host
