@@ -1,5 +1,4 @@
-#include "common.cuh"
-#include "ggml-cuda.h"
+#include "copy-batch.cuh"
 #include "ggml-backend-impl.h"
 
 #include <algorithm>
@@ -41,16 +40,7 @@ __global__ void k_copy_batch(const copy_batch_params p) {
 
 } // namespace
 
-void ggml_backend_cuda_copy_batch_async(ggml_backend_t backend,
-                                        const ggml_cuda_copy_desc * descs,
-                                        int n) {
-    if (n <= 0) {
-        return;
-    }
-    GGML_ASSERT(ggml_backend_is_cuda(backend));
-    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_cuda_set_device(ctx->device);
-    cudaStream_t stream = ctx->stream();
+void ggml_cuda_copy_batch(const ggml_cuda_copy_desc * descs, int n, cudaStream_t stream) {
     constexpr int threads = 256;
     for (int base = 0; base < n; base += kCopyBatchMax) {
         const int count = std::min(kCopyBatchMax, n - base);
@@ -71,9 +61,23 @@ void ggml_backend_cuda_copy_batch_async(ggml_backend_t backend,
         if (used == 0) {
             continue;
         }
+        // Enough blocks for the largest copy to stream at full bandwidth;
+        // smaller descriptors leave their surplus blocks idle.
         const uint64_t per_block = (uint64_t) threads * 16;
-        const int blocks_x = (int) std::min<uint64_t>(64, (max_bytes + per_block - 1) / per_block);
+        const int blocks_x = (int) std::min<uint64_t>(512, (max_bytes + per_block - 1) / per_block);
         k_copy_batch<<<dim3(std::max(1, blocks_x), used), threads, 0, stream>>>(p);
         CUDA_CHECK(cudaGetLastError());
     }
+}
+
+void ggml_backend_cuda_copy_batch_async(ggml_backend_t backend,
+                                        const ggml_cuda_copy_desc * descs,
+                                        int n) {
+    if (n <= 0) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_copy_batch(descs, n, ctx->stream());
 }

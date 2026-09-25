@@ -27,6 +27,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_DRAFT_KV` | 1 | KILL SWITCH (remove after burn-in): =0 restores the legacy per-step drafter window recompute instead of the ring cache. |
 | `LUCE_LAGUNA_SWA_RING` | 1 | KILL SWITCH (remove after burn-in): =0 keeps SWA layers on pool-sized caches under KVFlash. |
 | `LUCE_PROF` | unset | DEBUG: comma list of profilers (step,verify,prefill). Replaces LUCE_LAGUNA_{STEP,VERIFY,PREFILL}_PROF. |
+| `GGML_CUDA_DISABLE_COPY_BATCH` | unset | KILL SWITCH (burn-in): set to issue one device memcpy per plain CPY node again. By default ggml-cuda gathers runs of consecutive same-type contiguous CPY nodes with independent byte ranges into one batched copy launch. |
 | `GGML_CUDA_GRAPH_STATS` | unset | DEBUG: per-graph CUDA-graph replay/capture/eager counters. |
 | `GGML_CUDA_GRAPH_STATS_EVERY` | 200 | DEBUG: print period for the stats above (clamped to >=1). |
 | `LUCE_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |
