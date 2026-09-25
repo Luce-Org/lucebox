@@ -90,13 +90,33 @@ void validation_and_lookup() {
         const auto walk = [&](const std::vector<TokenSpan> & layout, int prefix, int budget) {
             int done = 0;
             while (done < prefix) {
-                const int n = staged_prefill_chunk(view(layout), uint64_t(done), prefix - done, budget, 5);
-                require(n >= 5, "staged chunk makes progress");
-                require(prefix - done - n == 0 || prefix - done - n >= 5, "no stub tail");
+                const int remaining = prefix - done;
+                const int n = staged_prefill_chunk(view(layout), uint64_t(done), remaining, budget, 5);
+                const std::string at = " (images=" + std::to_string(layout.size()) +
+                    " prefix=" + std::to_string(prefix) + " budget=" + std::to_string(budget) +
+                    " done=" + std::to_string(done) + " n=" + std::to_string(n) + ")";
+                require(n >= 5, "staged chunk makes progress" + at);
+                require(remaining - n == 0 || remaining - n >= 5, "no stub tail" + at);
                 for (const TokenSpan & span : layout) {
                     require(!(uint64_t(done) < span.block_end && uint64_t(done + n) > span.block_begin &&
                               (uint64_t(done) > span.block_begin || uint64_t(done + n) < span.block_end)),
-                            "image block stays whole");
+                            "image block stays whole" + at);
+                }
+                // Past the budget, a chunk may only reach the first end that is
+                // valid at all: one that splits no image block and leaves no
+                // stub tail (a whole block, or the end of the prompt).
+                const int cap = std::max(budget, 5);
+                if (n > cap) {
+                    int first_valid = 0;
+                    for (int end = done + cap + 1; end <= prefix && !first_valid; ++end) {
+                        bool splits = false;
+                        for (const TokenSpan & span : layout) {
+                            splits = splits || (span.block_begin < uint64_t(end) && uint64_t(end) < span.block_end);
+                        }
+                        if (!splits && (prefix - end == 0 || prefix - end >= 5)) first_valid = end - done;
+                    }
+                    require(n == first_valid, "chunk exceeds the budget further than needed" + at +
+                            " first valid end past the budget=" + std::to_string(first_valid));
                 }
                 done += n;
             }
