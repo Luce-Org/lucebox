@@ -3038,11 +3038,21 @@ static void test_dspark_compressor_rollback(ggml_backend_t backend, int copy_mod
                     load(initial, copy_backend != nullptr);
                     deepseek4_spec_rollback_save(cache, rollback, pos, q, copy_backend, pinned);
                     if (pinned && pos == 0 && q == 1 && accepted == 0) {
-                        const auto host_type = ggml_backend_dev_host_buffer_type(
-                            ggml_backend_get_device(backend));
-                        TEST_ASSERT(rollback.pinned_buf && rollback.pinned_base);
-                        TEST_ASSERT(rollback.pinned_buf &&
-                            ggml_backend_buffer_get_type(rollback.pinned_buf) == host_type);
+                        // Device staging takes precedence on a GPU backend
+                        // that holds every rollback tensor; pinned host
+                        // staging is the fallback.
+                        if (rollback.uses_device_copy) {
+                            TEST_ASSERT(rollback.device_buf && rollback.device_base);
+                            TEST_ASSERT(rollback.device_buf &&
+                                ggml_backend_buffer_get_type(rollback.device_buf) ==
+                                    ggml_backend_get_default_buffer_type(backend));
+                        } else {
+                            const auto host_type = ggml_backend_dev_host_buffer_type(
+                                ggml_backend_get_device(backend));
+                            TEST_ASSERT(rollback.pinned_buf && rollback.pinned_base);
+                            TEST_ASSERT(rollback.pinned_buf &&
+                                ggml_backend_buffer_get_type(rollback.pinned_buf) == host_type);
+                        }
                     }
                     auto verified = initial;
                     advance(verified, pos, q);

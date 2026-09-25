@@ -204,8 +204,14 @@ struct DeepSeek4SpecRollback {
     PinnedSpan pinned_hc;
     ggml_backend_buffer_t pinned_buf = nullptr;
     uint8_t * pinned_base = nullptr;
+    // Device-resident staging with the same span layout as pinned_buf: save
+    // and apply become one batched device copy each instead of one blit per
+    // row. LUCE_DS4_DEVICE_ROLLBACK=0 keeps the pinned-host staging.
+    ggml_backend_buffer_t device_buf = nullptr;
+    uint8_t * device_base = nullptr;
     ggml_backend_t async_backend = nullptr;
     bool uses_pinned_copy = false;
+    bool uses_device_copy = false;
 
     DeepSeek4SpecRollback() = default;
     ~DeepSeek4SpecRollback();

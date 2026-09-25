@@ -356,10 +356,7 @@ void assign_pinned_span(DeepSeek4SpecRollback::PinnedSpan & span, size_t bytes,
     total += bytes;
 }
 
-bool init_pinned_rollback(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb,
-                          ggml_backend_t backend) {
-    if (rb.pinned_buf) return true;
-
+size_t assign_rollback_spans(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb) {
     rb.layers.resize(cache.layers.size());
     size_t total = 0;
     for (size_t il = 0; il < cache.layers.size(); ++il) {
@@ -381,6 +378,13 @@ bool init_pinned_rollback(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & 
     }
     assign_pinned_span(
         rb.pinned_hc, cache.hc_state ? ggml_nbytes(cache.hc_state) : 0, total);
+    return total;
+}
+
+bool init_pinned_rollback(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb,
+                          ggml_backend_t backend) {
+    if (rb.pinned_buf) return true;
+    const size_t total = assign_rollback_spans(cache, rb);
     if (total == 0) return false;
 
     ggml_backend_dev_t device = ggml_backend_get_device(backend);
@@ -400,14 +404,82 @@ bool init_pinned_rollback(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & 
     return true;
 }
 
+bool device_rollback_enabled() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("LUCE_DS4_DEVICE_ROLLBACK");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return enabled;
+}
+
+bool rollback_tensor_on(const ggml_tensor * t, ggml_backend_buffer_type_t buft) {
+    if (!t) return true;
+    const ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+    return buf && ggml_backend_buffer_get_type(buf) == buft;
+}
+
+// Device staging needs every saved tensor in the backend's own device memory,
+// because the batched copy runs as one kernel on that device.
+bool init_device_rollback(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb,
+                          ggml_backend_t backend) {
+    if (rb.device_buf) return true;
+    if (!backend || !ggml_backend_is_cuda(backend)) return false;
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    if (!rollback_tensor_on(cache.hc_state, buft)) return false;
+    for (const DeepSeek4LayerCache & lc : cache.layers) {
+        if (!rollback_tensor_on(lc.attn_compressor.state_kv, buft) ||
+            !rollback_tensor_on(lc.attn_compressor.state_score, buft) ||
+            !rollback_tensor_on(lc.indexer_compressor.state_kv, buft) ||
+            !rollback_tensor_on(lc.indexer_compressor.state_score, buft) ||
+            !rollback_tensor_on(lc.raw_kv, buft)) {
+            return false;
+        }
+    }
+    const size_t total = assign_rollback_spans(cache, rb);
+    if (total == 0) return false;
+    rb.device_buf = ggml_backend_alloc_buffer(backend, total);
+    if (!rb.device_buf) return false;
+    rb.device_base =
+        static_cast<uint8_t *>(ggml_backend_buffer_get_base(rb.device_buf));
+    if (!rb.device_base) {
+        ggml_backend_buffer_free(rb.device_buf);
+        rb.device_buf = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// Collects the copies of one save or apply for a single batched launch. A
+// later copy to the same destination replaces the earlier one, matching the
+// last-writer-wins order of the per-row path.
+struct RollbackCopies {
+    std::vector<ggml_cuda_copy_desc> descs;
+    void add(const void * src, void * dst, size_t nbytes) {
+        for (ggml_cuda_copy_desc & d : descs) {
+            if (d.dst == dst && d.nbytes == nbytes) {
+                d.src = src;
+                return;
+            }
+        }
+        descs.push_back({src, dst, nbytes});
+    }
+    void flush(ggml_backend_t backend) {
+        ggml_backend_cuda_copy_batch_async(backend, descs.data(), (int) descs.size());
+        descs.clear();
+    }
+};
+
 void save_rollback_state(ggml_backend_t backend, ggml_tensor * t,
-                         uint8_t * dst, bool async_copy, int pos, int count) {
+                         uint8_t * dst, bool async_copy, int pos, int count,
+                         RollbackCopies * copies = nullptr) {
     if (rollback_state_bytes(t) == 0) return;
     const bool rolling = t->ne[1] == 8;
     const size_t bytes = rolling ? rollback_state_bytes(t) : t->nb[1];
     for (int i = 0; i < (rolling ? 1 : count); ++i) {
         const size_t offset = rolling ? 0 : rollback_ring_row(t, pos + i) * t->nb[1];
-        if (async_copy) {
+        if (copies) {
+            copies->add((const uint8_t *) t->data + offset, dst + i * bytes, bytes);
+        } else if (async_copy) {
             ggml_backend_tensor_get_async(backend, t, dst + i * bytes, offset, bytes);
         } else {
             ggml_backend_tensor_get(t, dst + i * bytes, offset, bytes);
@@ -417,12 +489,14 @@ void save_rollback_state(ggml_backend_t backend, ggml_tensor * t,
 
 void restore_rollback_state(ggml_backend_t backend, ggml_tensor * t,
                             const uint8_t * src, bool async_copy,
-                            int pos, int count, int first_rejected, bool restore_prev) {
+                            int pos, int count, int first_rejected, bool restore_prev,
+                            RollbackCopies * copies = nullptr) {
     if (rollback_state_bytes(t) == 0) return;
     const bool rolling = t->ne[1] == 8;
     if (rolling && restore_prev) {
         const size_t bytes = prev_half_bytes(t);
-        if (async_copy) ggml_backend_tensor_set_async(backend, t, src, 0, bytes);
+        if (copies) copies->add(src, t->data, bytes);
+        else if (async_copy) ggml_backend_tensor_set_async(backend, t, src, 0, bytes);
         else            ggml_backend_tensor_set(t, src, 0, bytes);
     }
     // A rejected row whose ring slot is shared with a committed row of the
@@ -437,7 +511,9 @@ void restore_rollback_state(ggml_backend_t backend, ggml_tensor * t,
         const int row = (rolling ? 4 : 0) + rollback_ring_row(t, pos + i);
         const size_t offset = row * t->nb[1];
         const uint8_t * saved = src + (rolling ? offset : i * t->nb[1]);
-        if (async_copy) {
+        if (copies) {
+            copies->add(saved, (uint8_t *) t->data + offset, t->nb[1]);
+        } else if (async_copy) {
             ggml_backend_tensor_set_async(backend, t, saved, offset, t->nb[1]);
         } else {
             ggml_backend_tensor_set(t, saved, offset, t->nb[1]);
@@ -456,9 +532,16 @@ void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb
     rb.raw_pos = raw_pos;
     rb.raw_count = std::clamp(raw_count, 0, kRollbackMaxTokens);
     rb.layers.resize(cache.layers.size());
+    const bool use_device = (async_copy || pinned_copy) && backend &&
+        device_rollback_enabled() && init_device_rollback(cache, rb, backend);
     const bool use_pinned =
-        pinned_copy && init_pinned_rollback(cache, rb, backend);
+        !use_device && pinned_copy && init_pinned_rollback(cache, rb, backend);
     rb.uses_pinned_copy = use_pinned;
+    rb.uses_device_copy = use_device;
+    const bool use_staged = use_device || use_pinned;
+    uint8_t * staged_base = use_device ? rb.device_base : rb.pinned_base;
+    RollbackCopies device_copies;
+    RollbackCopies * copies = use_device ? &device_copies : nullptr;
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         const DeepSeek4LayerCache & lc = cache.layers[il];
         DeepSeek4SpecRollback::Layer & s = rb.layers[il];
@@ -466,14 +549,14 @@ void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb
                               const DeepSeek4SpecRollback::PinnedSpan & span) {
             const size_t bytes = rollback_state_bytes(t);
             if (bytes == 0) { buf.clear(); return; }
-            if (use_pinned) {
+            if (use_staged) {
                 GGML_ASSERT(span.size == bytes);
             } else {
                 buf.resize(bytes);
             }
             save_rollback_state(backend, t,
-                use_pinned ? rb.pinned_base + span.offset : buf.data(),
-                use_pinned || async_copy, rb.raw_pos, rb.raw_count);
+                use_staged ? staged_base + span.offset : buf.data(),
+                use_staged || async_copy, rb.raw_pos, rb.raw_count, copies);
         };
         save_state(lc.attn_compressor.state_kv, s.attn_kv, s.pinned_attn_kv);
         save_state(lc.attn_compressor.state_score, s.attn_sc, s.pinned_attn_sc);
@@ -487,17 +570,21 @@ void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb
             s.raw_rows.clear();
             continue;
         }
-        if (!use_pinned) {
+        if (!use_staged) {
             s.raw_rows.resize(s.raw_row_bytes * kRollbackMaxTokens);
         }
         for (int t = 0; t < rb.raw_count; ++t) {
             int row = (rb.raw_pos + t) % (int) lc.raw_kv->ne[1];
             if (row < 0) row += (int) lc.raw_kv->ne[1];
-            uint8_t * dst = use_pinned
-                ? rb.pinned_base + s.pinned_raw_rows.offset +
+            uint8_t * dst = use_staged
+                ? staged_base + s.pinned_raw_rows.offset +
                       (size_t) t * s.raw_row_bytes
                 : s.raw_rows.data() + (size_t) t * s.raw_row_bytes;
-            if (use_pinned || async_copy) {
+            if (copies) {
+                copies->add((const uint8_t *) lc.raw_kv->data +
+                                (size_t) row * lc.raw_kv->nb[1],
+                            dst, s.raw_row_bytes);
+            } else if (use_pinned || async_copy) {
                 ggml_backend_tensor_get_async(
                     backend, lc.raw_kv, dst,
                     (size_t) row * lc.raw_kv->nb[1], s.raw_row_bytes);
@@ -510,7 +597,9 @@ void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb
     }
     if (cache.hc_state) {
         const size_t bytes = ggml_nbytes(cache.hc_state);
-        if (use_pinned) {
+        if (copies) {
+            copies->add(cache.hc_state->data, staged_base + rb.pinned_hc.offset, bytes);
+        } else if (use_pinned) {
             ggml_backend_tensor_get_async(
                 backend, cache.hc_state,
                 rb.pinned_base + rb.pinned_hc.offset, 0, bytes);
@@ -524,6 +613,7 @@ void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb
             }
         }
     }
+    if (copies) copies->flush(backend);
 }
 
 // Truncate the cache to commit_pos. restore_prev is set when the verify
@@ -537,7 +627,13 @@ void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weight
     ggml_backend_t backend = rb.async_backend;
     const bool async_copy = backend != nullptr;
     const bool use_pinned = rb.uses_pinned_copy;
+    const bool use_device = rb.uses_device_copy;
     GGML_ASSERT(!use_pinned || (backend && rb.pinned_buf && rb.pinned_base));
+    GGML_ASSERT(!use_device || (backend && rb.device_buf && rb.device_base));
+    const bool use_staged = use_device || use_pinned;
+    const uint8_t * staged_base = use_device ? rb.device_base : rb.pinned_base;
+    RollbackCopies device_copies;
+    RollbackCopies * copies = use_device ? &device_copies : nullptr;
     cache.cur_pos = commit_pos;
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         DeepSeek4LayerCache & lc = cache.layers[il];
@@ -551,11 +647,11 @@ void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weight
                                      const DeepSeek4SpecRollback::PinnedSpan & span) {
                 const size_t bytes = rollback_state_bytes(t);
                 if (bytes == 0) return;
-                GGML_ASSERT((use_pinned ? span.size : buf.size()) == bytes);
+                GGML_ASSERT((use_staged ? span.size : buf.size()) == bytes);
                 restore_rollback_state(backend, t,
-                    use_pinned ? rb.pinned_base + span.offset : buf.data(),
-                    use_pinned || async_copy, rb.raw_pos, rb.raw_count,
-                    first_rejected, restore_prev);
+                    use_staged ? staged_base + span.offset : buf.data(),
+                    use_staged || async_copy, rb.raw_pos, rb.raw_count,
+                    first_rejected, restore_prev, copies);
             };
             restore_state(lc.attn_compressor.state_kv, s.attn_kv, s.pinned_attn_kv);
             restore_state(lc.attn_compressor.state_score, s.attn_sc, s.pinned_attn_sc);
@@ -570,17 +666,21 @@ void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weight
                 int row = (rb.raw_pos + t) % (int) lc.raw_kv->ne[1];
                 if (row < 0) row += (int) lc.raw_kv->ne[1];
                 const uint8_t * src = nullptr;
-                if (use_pinned &&
+                if (use_staged &&
                     s.pinned_raw_rows.size >=
                         (size_t) (t + 1) * s.raw_row_bytes) {
-                    src = rb.pinned_base + s.pinned_raw_rows.offset +
+                    src = staged_base + s.pinned_raw_rows.offset +
                           (size_t) t * s.raw_row_bytes;
                 } else if (s.raw_rows.size() >=
                            (size_t) (t + 1) * s.raw_row_bytes) {
                     src = s.raw_rows.data() + (size_t) t * s.raw_row_bytes;
                 }
                 if (!src) continue;
-                if (use_pinned || async_copy) {
+                if (copies) {
+                    copies->add(src, (uint8_t *) lc.raw_kv->data +
+                                         (size_t) row * lc.raw_kv->nb[1],
+                                s.raw_row_bytes);
+                } else if (use_pinned || async_copy) {
                     ggml_backend_tensor_set_async(
                         backend, lc.raw_kv, src,
                         (size_t) row * lc.raw_kv->nb[1], s.raw_row_bytes);
@@ -593,7 +693,10 @@ void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weight
         }
     }
     if (restore_prev && cache.hc_state) {
-        if (use_pinned && rb.pinned_hc.size > 0) {
+        if (copies && rb.pinned_hc.size > 0) {
+            copies->add(staged_base + rb.pinned_hc.offset, cache.hc_state->data,
+                        rb.pinned_hc.size);
+        } else if (use_pinned && rb.pinned_hc.size > 0) {
             ggml_backend_tensor_set_async(
                 backend, cache.hc_state,
                 rb.pinned_base + rb.pinned_hc.offset, 0, rb.pinned_hc.size);
@@ -608,6 +711,7 @@ void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weight
             }
         }
     }
+    if (copies) copies->flush(backend);
 }
 
 using SpecClock = std::chrono::steady_clock;
@@ -650,6 +754,9 @@ DeepSeek4SpecRollback::~DeepSeek4SpecRollback() {
     }
     if (pinned_buf) {
         ggml_backend_buffer_free(pinned_buf);
+    }
+    if (device_buf) {
+        ggml_backend_buffer_free(device_buf);
     }
 }
 
