@@ -1385,6 +1385,39 @@ bool DeepSeek4Backend::load_routing_adjustments() {
     return true;
 }
 
+// Device routing keeps a protected expert exactly as host routing does
+// (ds4_select_routed_experts): per layer it needs the selection bias without
+// the router bias delta and the protected mask on the device.
+bool DeepSeek4Backend::upload_protected_routing() {
+    if (w_.protected_experts.empty() || w_.router_bias_delta.empty()) return true;
+    const ggml_init_params params{2 * (size_t) w_.n_layer * ggml_tensor_overhead(), nullptr, true};
+    w_.routing_ctx = ggml_init(params);
+    if (!w_.routing_ctx) return false;
+    for (DeepSeek4Layer & L : w_.layers) {
+        L.native_selection_bias = ggml_new_tensor_1d(w_.routing_ctx, GGML_TYPE_F32, w_.n_expert);
+        L.protected_mask = ggml_new_tensor_1d(w_.routing_ctx, GGML_TYPE_I32, w_.n_expert);
+    }
+    w_.routing_buf = ggml_backend_alloc_ctx_tensors(w_.routing_ctx, backend_);
+    if (!w_.routing_buf) {
+        std::fprintf(stderr, "[deepseek4] failed to allocate the protected routing tables\n");
+        return false;
+    }
+    std::vector<float> bias((size_t) w_.n_expert);
+    std::vector<int32_t> mask((size_t) w_.n_expert);
+    for (int il = 0; il < w_.n_layer; ++il) {
+        DeepSeek4Layer & L = w_.layers[(size_t) il];
+        const size_t row = (size_t) il * (size_t) w_.n_expert;
+        ggml_backend_tensor_get(L.ffn_exp_probs_b, bias.data(), 0, sizeof(float) * bias.size());
+        for (int e = 0; e < w_.n_expert; ++e) {
+            bias[(size_t) e] -= w_.router_bias_delta[row + (size_t) e];
+            mask[(size_t) e] = w_.protected_experts[row + (size_t) e];
+        }
+        ggml_backend_tensor_set(L.native_selection_bias, bias.data(), 0, sizeof(float) * bias.size());
+        ggml_backend_tensor_set(L.protected_mask, mask.data(), 0, sizeof(int32_t) * mask.size());
+    }
+    return true;
+}
+
 // Adds the router bias delta to every layer's selection bias once, so routing
 // pays nothing per token. Mixing weights are unaffected (they never read it).
 bool DeepSeek4Backend::apply_routing_adjustments() {
@@ -1404,6 +1437,7 @@ bool DeepSeek4Backend::apply_routing_adjustments() {
             ggml_backend_tensor_set(t, bias.data(), 0, sizeof(float) * bias.size());
         }
     }
+    if (!upload_protected_routing()) return false;
     // Host routing reads a selection bias per layer and token; keep a copy.
     w_.selection_bias_host.clear();
     const bool f32_biases = std::all_of(w_.layers.begin(), w_.layers.end(), [&](const DeepSeek4Layer & L) {

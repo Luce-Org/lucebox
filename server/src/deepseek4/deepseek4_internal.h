@@ -162,6 +162,11 @@ struct DeepSeek4Layer {
     // Router
     ggml_tensor * ffn_gate_inp       = nullptr;  // [n_embd, n_expert] router weights F16
     ggml_tensor * ffn_exp_probs_b    = nullptr;  // [n_expert] optional routing bias
+    // With protected experts and a router bias (see protected_experts): the
+    // selection bias without the router bias (F32 [n_expert]) and the
+    // protected mask (I32 [n_expert]), for graphs that route on the device.
+    ggml_tensor * native_selection_bias = nullptr;
+    ggml_tensor * protected_mask        = nullptr;
     ggml_tensor * ffn_gate_bias_vl   = nullptr;  // image router bias, loaded only with --mmproj
 
     // Hash routing table (first n_hash_layer layers only)
@@ -193,6 +198,9 @@ struct DeepSeek4Weights {
     // Optional row-split buffer for selected dense projections. The buffer
     // owns per-device allocations while the tensor metadata stays in ctx.
     ggml_backend_buffer_t dense_split_buf = nullptr;
+    // Holds each layer's native_selection_bias and protected_mask.
+    ggml_context *        routing_ctx = nullptr;
+    ggml_backend_buffer_t routing_buf = nullptr;
 
     // Global tensors
     ggml_tensor * tok_embd       = nullptr;  // [n_embd, n_vocab]

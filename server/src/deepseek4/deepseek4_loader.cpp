@@ -2854,6 +2854,8 @@ void free_deepseek4_weights(DeepSeek4Weights & w) {
         w.dense_split_buf = nullptr;
     }
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
+    if (w.routing_buf) { ggml_backend_buffer_free(w.routing_buf); w.routing_buf = nullptr; }
+    if (w.routing_ctx) { ggml_free(w.routing_ctx); w.routing_ctx = nullptr; }
     w.layers.clear();
     w.selection_bias_host.clear();
     w.embedder.tok_embd_owned.clear();

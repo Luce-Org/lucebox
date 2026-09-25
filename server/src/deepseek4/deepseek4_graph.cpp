@@ -4442,6 +4442,13 @@ static Ds4MoeRouting build_moe_routing(
 
     const int k_used = ds4_effective_expert_count(w);
     out.selected = track(ggml_top_k(ctx, selection, k_used));
+    if (!selection_bias && L.native_selection_bias && L.protected_mask) {
+        // As host routing: the native top-k wins when it holds a protected expert.
+        ggml_tensor * native = track(ggml_top_k(
+            ctx, track(ggml_add(ctx, probs, L.native_selection_bias)), k_used));
+        out.selected = track(ggml_ds4_moe_protected_routes(
+            ctx, out.selected, native, L.protected_mask));
+    }
     ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, w.n_expert, n_tokens);
     out.weights = track(ggml_get_rows(ctx, probs_3d, out.selected));
     out.weights = ggml_reshape_2d(ctx, out.weights, k_used, n_tokens);

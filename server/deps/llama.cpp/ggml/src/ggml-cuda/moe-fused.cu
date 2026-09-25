@@ -431,6 +431,22 @@ static __global__ void ds4_peer_copy_f32_kernel(
     }
 }
 
+static __global__ void ds4_protected_routes_kernel(
+        const int32_t * biased, int64_t biased_ld,
+        const int32_t * native, int64_t native_ld,
+        const int32_t * protected_mask, int n_expert,
+        int32_t * dst, int k) {
+    const int t = blockIdx.x;
+    const int32_t * nat = native + (int64_t) t * native_ld;
+    bool keep_native = false;
+    for (int i = 0; i < k; ++i) {
+        const int32_t e = nat[i];
+        keep_native |= e >= 0 && e < n_expert && protected_mask[e] != 0;
+    }
+    const int32_t * src = keep_native ? nat : biased + (int64_t) t * biased_ld;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) dst[(int64_t) t * k + i] = src[i];
+}
+
 // Host mailbox. The words live in host-mapped, coherent memory, so every
 // access that orders the exchange uses system scope.
 static __device__ __forceinline__ uint32_t host_mailbox_load(const uint32_t * p) {
@@ -865,6 +881,20 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             (const float *) candidate_lut->data,
             (int32_t *) dst->data,
             n_routes, n_tokens, n_expert, main_quota, main_owner);
+        return;
+    }
+    if (mode == GGML_MOE_FUSED_PROTECTED_ROUTES) {
+        const ggml_tensor * biased = dst->src[0];
+        const ggml_tensor * native = dst->src[1];
+        const ggml_tensor * mask = dst->src[2];
+        GGML_ASSERT(biased->nb[0] == sizeof(int32_t) && native->nb[0] == sizeof(int32_t));
+        GGML_ASSERT(ggml_is_contiguous(dst));
+        const int k = (int) dst->ne[0];
+        ds4_protected_routes_kernel<<<(int) dst->ne[1], 32, 0, ctx.stream()>>>(
+            (const int32_t *) biased->data, (int64_t) (biased->nb[1] / sizeof(int32_t)),
+            (const int32_t *) native->data, (int64_t) (native->nb[1] / sizeof(int32_t)),
+            (const int32_t *) mask->data, (int) ggml_nelements(mask),
+            (int32_t *) dst->data, k);
         return;
     }
     if (mode == GGML_MOE_FUSED_HOST_POST || mode == GGML_MOE_FUSED_HOST_WAIT) {

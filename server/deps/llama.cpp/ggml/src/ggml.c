@@ -9173,6 +9173,25 @@ struct ggml_tensor * ggml_ds4_moe_owner_split(
     return result;
 }
 
+struct ggml_tensor * ggml_ds4_moe_protected_routes(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * biased,
+        struct ggml_tensor  * native,
+        struct ggml_tensor  * protected_mask) {
+    GGML_ASSERT(biased->type == GGML_TYPE_I32 && native->type == GGML_TYPE_I32);
+    GGML_ASSERT(protected_mask->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_are_same_shape(biased, native));
+    GGML_ASSERT(biased->ne[2] == 1 && biased->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(protected_mask));
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, biased->ne[0], biased->ne[1]);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = biased;
+    result->src[1] = native;
+    result->src[2] = protected_mask;
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_PROTECTED_ROUTES);
+    return result;
+}
+
 static void ggml_host_mailbox_set_ptr(struct ggml_tensor * t, int word, const void * ptr) {
     memcpy(&t->op_params[word], &ptr, sizeof(ptr));
 }

@@ -2665,6 +2665,7 @@ extern "C" {
         GGML_MOE_FUSED_CLUSTER_ALLREDUCE  = -7,
         GGML_MOE_FUSED_HOST_POST          = -8,
         GGML_MOE_FUSED_HOST_WAIT          = -9,
+        GGML_MOE_FUSED_PROTECTED_ROUTES   = -10,
     };
 
     // Word offsets in ggml_tensor::op_params for the host mailbox pair. All
@@ -2772,6 +2773,16 @@ extern "C" {
     // holds its stream until *flag == *step, then copies `payload` into a new
     // [ne0, ne1, ne2] tensor of `type`; `after` only orders it. The host bumps
     // *step before each launch, so a captured graph replays unchanged.
+    // Per token column of two [k, n_tokens] route selections: `native` when
+    // it routes to an expert marked in `protected_mask` (I32 [n_expert]),
+    // else `biased`. A router bias that moves routes toward resident experts
+    // then never displaces a protected expert.
+    GGML_API struct ggml_tensor * ggml_ds4_moe_protected_routes(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * biased,
+            struct ggml_tensor  * native,
+            struct ggml_tensor  * protected_mask);
+
     GGML_API struct ggml_tensor * ggml_host_mailbox_post(
             struct ggml_context * ctx,
             struct ggml_tensor  * src,

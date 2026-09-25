@@ -222,6 +222,7 @@ private:
     bool validate_model_features() const;
     bool load_routing_adjustments();
     bool apply_routing_adjustments();
+    bool upload_protected_routing();
     bool apply_expert_ownership(bool secondary_owner, MoeHybridConfig & hybrid_cfg);
     void log_route_counts(const char * phase);
     bool init_moe_tensor_parallel();
