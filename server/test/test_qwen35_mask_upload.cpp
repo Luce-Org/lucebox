@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -52,6 +53,8 @@ TEST_CASE(Qwen35MaskUploadFixture, live_rows_match_the_full_width_mask) {
 TEST_CASE(Qwen35MaskUploadFixture, upload_writes_live_columns_and_keeps_the_rest) {
     // A max_ctx-wide mask tensor: the upload must write the live columns of
     // every row through the strided 2-D copy and leave the rest untouched.
+    // With LUCE_QWEN35_MASK_FULL_WIDTH=1 (ctest
+    // server_unit_qwen35_mask_full_width) it must write every column.
     ggml_backend_t cpu = ggml_backend_cpu_init();
     ggml_init_params ip{};
     ip.mem_size = ggml_tensor_overhead() * 2;
@@ -71,8 +74,10 @@ TEST_CASE(Qwen35MaskUploadFixture, upload_writes_live_columns_and_keeps_the_rest
 
     std::vector<uint16_t> want;
     build_causal_mask(want, kv_start + n_tokens, n_tokens, kv_start, 32, 0, full);
-    const int live = qwen35_causal_mask_live_width(kv_start + n_tokens, full);
-    CHECK(live < full);
+    const char * full_env = std::getenv("LUCE_QWEN35_MASK_FULL_WIDTH");
+    const bool full_width = full_env && full_env[0] == '1';
+    const int live = full_width ? full : qwen35_causal_mask_live_width(kv_start + n_tokens, full);
+    CHECK(full_width || live < full);
     CHECK(want.size() == got.size());
     for (int r = 0; r < q_pad; ++r) {
         CHECK(std::memcmp(got.data() + (size_t)r * full, want.data() + (size_t)r * full,
