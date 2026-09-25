@@ -36,6 +36,7 @@
 | [Heterogeneous execution](https://www.lucebox.com/#benchmark) | DeepSeek V4 on R9700 + Strix Halo | **86 tok/s** decode; **788 tok/s** prefill at 2K |
 | [Paged attention + continuous batching](https://www.lucebox.com/blog/continuous-batching/) | Qwen 3.8 27B + DFlash2 on R9700; DeepSeek V4 Flash AR on Strix Halo | **300.9 tok/s** total at 5 clients (Qwen); **48.4 tok/s** output-window at 4 clients (DeepSeek) |
 | [Megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) | Qwen 3.5 0.8B on RTX 3090 | **413 tok/s**, **1.87 tok/J** |
+| [Vision (image input)](https://www.lucebox.com/blog/vision-llm-inference) | Qwen 3.8 27B vision on R9700 + DeepSeek V4 Flash Vision on Strix Halo, together | **3.2×** the image-question throughput of a DGX Spark (58 vs 18 a minute); **2.4×** faster at 8 users with the same model file |
 
 ---
 
@@ -53,6 +54,8 @@ Model links open the exact weights used by the measured setup. Drafter links ope
 | [Gemma 4 31B IT Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-31B-it-GGUF/blob/main/google_gemma-4-31B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF/blob/main/gemma-4-31B-it-DFlash-q8_0.gguf) | Decode | **3.2×** |
 | [DeepSeek V4 Flash ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf) + [DSpark Q4RMFP4 drafter](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | Decode | **42 tok/s** at 8K and **39 tok/s** on code and math with the plain launch ([PR #729](https://github.com/Luce-Org/lucebox/pull/729)) |
 | [Ling 3.0 Flash 124B-A5.1B Q4_K_M](https://huggingface.co/bloomer010/Ling-3.0-flash-GGUF) | Decode | **34.6 tok/s** median AR on DGX Spark |
+| [Qwen 3.8 27B IQ4_XS](https://huggingface.co/Lucebox/Qwen3.8-27B-IQ4_XS-fast-GGUF/blob/main/Qwen3.8-27B-IQ4_XS-pure.gguf) + [Q8_0 vision projector](https://huggingface.co/Lucebox/Qwen3.8-27B-IQ4_XS-fast-GGUF/blob/main/Qwen3.8-27B-mmproj-Q8_0.gguf) + DFlash2, on R9700 ([image input](docs/image-input.md)) | Image questions | **2.4×** vs llama.cpp on DGX Spark at 8 users (10.5 s vs 25.4 s); **2.1×** for one user |
+| [DeepSeek V4 Flash Vision ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf) + [BF16 vision projector](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-Vision-Exp-mmproj-BF16.gguf), encoder on R9700 ([image input](docs/image-input.md)) | Image questions | 4 users at once; first token **1.5×** sooner with 16 images when the R9700 encodes |
 
 ## Tested Machines (GPU/APU)
 
