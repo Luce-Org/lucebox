@@ -2,6 +2,7 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include "mmvq.cuh"
 #include "convert.cuh"
 
 #include <cstdlib>
@@ -848,6 +849,14 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         if (src0_nb[i] % (2*ts) != 0) {
             return false;
         }
+    }
+
+    // Batch-invariant products (ggml_backend_cuda_set_mmvq_batch_invariant)
+    // keep each column on the single-column accumulation order, which MMVF
+    // preserves through MMVF_MAX_BATCH_SIZE columns.
+    if (ggml_cuda_mmvq_batch_invariant() && ne11 <= MMVF_MAX_BATCH_SIZE &&
+        (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
+        return true;
     }
 
     switch (type) {
