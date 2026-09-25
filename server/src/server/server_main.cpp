@@ -1708,6 +1708,20 @@ int main(int argc, char ** argv) {
     // Disabled balancing loads only the selected primary, regardless of how
     // many placements were configured. No unused GPU worker is started.
     if (!load_balancing) options.resize(1);
+    // Several GPU models in one process capture HIP/CUDA graphs from different
+    // worker threads. Under relaxed capture, a blocking call from one worker
+    // (prefix-cache checkpoint copies, host reads) invalidates the capture in
+    // flight on the other, so replicas fail intermittently. Eager launches cost
+    // ~4% on one R9700 and nothing measurable on the balanced aggregate.
+    // LUCE_MULTI_MODEL_GRAPHS=1 keeps graphs on (ggml reads any value of
+    // GGML_CUDA_DISABLE_GRAPHS as disabled, so it cannot be the opt-out).
+    if (options.size() > 1) {
+        const char * keep = std::getenv("LUCE_MULTI_MODEL_GRAPHS");
+        const bool keep_graphs = keep && std::strcmp(keep, "1") == 0;
+        if (!keep_graphs) set_environment_variable("GGML_CUDA_DISABLE_GRAPHS", "1", false);
+        std::fprintf(stderr, "[server] %zu models in one process: GPU graph capture %s\n", options.size(),
+            keep_graphs ? "kept on (LUCE_MULTI_MODEL_GRAPHS=1)" : "disabled");
+    }
     for (auto & option : options) {
         option.sconfig.host = listener_config.host;
         option.sconfig.port = listener_config.port;
