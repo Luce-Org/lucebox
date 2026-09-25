@@ -75,9 +75,13 @@ TEST_CASE(CaptureSafeCopiesFixture, copies_during_relaxed_capture) {
                 cudaSetDevice(0) != cudaSuccess) {
                 break;
             }
+            // Clear the probe's result so the leg under capture is checked
+            // on its own; finish the clear before the capture opens (the
+            // memset is not ordered against the copy streams).
             if (!copy_peer_async(dst_peer, 0, src_peer, 1, kBytes) ||
                 cudaSetDevice(0) != cudaSuccess ||
-                cudaMemset(dst_peer, 0, kBytes) != cudaSuccess) {
+                cudaMemset(dst_peer, 0, kBytes) != cudaSuccess ||
+                cudaDeviceSynchronize() != cudaSuccess) {
                 (void) cudaGetLastError();
                 cross = false;
                 cross_ok = true;
