@@ -3440,18 +3440,23 @@ static ggml_tensor * build_mla_attention(
 struct Ds4IndexSelectionStore {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
-    ggml_tensor * rows = nullptr;   // I32 [top_k, DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS]
+    ggml_tensor * rows = nullptr;   // I32 [top_k, tokens]
+    uint64_t generation = 0;        // bumped whenever `rows` is reallocated
 
-    bool ensure(ggml_backend_t backend, const DeepSeek4Weights & w) {
+    // Grows to `columns` tokens; a grown store invalidates the graphs that
+    // viewed the old one (see generation).
+    bool ensure(ggml_backend_t backend, const DeepSeek4Weights & w, int columns) {
         if (!w.shared_index_topk) return true;
-        if (rows) return true;
+        columns = std::max(columns, DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS);
+        if (rows && rows->ne[1] >= columns) return true;
+        free();
+        ++generation;
         ggml_init_params params{};
         params.mem_size = ggml_tensor_overhead();
         params.no_alloc = true;
         ctx = ggml_init(params);
         if (!ctx) return false;
-        rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, w.n_indexer_top_k,
-                                  DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS);
+        rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, w.n_indexer_top_k, columns);
         buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
         if (!buf) { free(); return false; }
         return true;
@@ -5558,7 +5563,7 @@ static bool deepseek4_step_hybrid(
     std::vector<float> engram_keys;
     if (!ds4_engram_read_keys(w, cache.engram_tokens, token_ids, kv_start, n_tokens,
                               engram_keys, telemetry) ||
-        !runtime.index_selection.ensure(backend, w)) {
+        !runtime.index_selection.ensure(backend, w, n_tokens)) {
         return false;
     }
 
@@ -6367,6 +6372,7 @@ struct DeepSeek4LayerRangeCache {
     DeepSeek4LayerRangeScratch scratch;
     DeepSeek4EngramApplyRunner engram_apply;
     Ds4IndexSelectionStore index_selection;
+    uint64_t index_selection_generation = 0;
 
     bool matches(const DeepSeek4Weights & w,
                  ggml_backend_t candidate_backend,
@@ -9334,7 +9340,7 @@ bool deepseek4_step_layer_range(
         !fused_verify_candidate && moe_hybrid &&
         cache.prefill_mode != PrefillAttentionMode::Exact &&
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
-        layer_begin == 0 && is_last_shard &&
+        ((layer_begin == 0 && is_last_shard) || cache.layer_major_band) &&
         ds4_backend_is_gpu(backend);
     const bool layer_major_hooks_supported =
         !verify_hooks ||
@@ -9533,9 +9539,15 @@ bool deepseek4_step_layer_range(
         cache.layer_range_cache = new DeepSeek4LayerRangeCache();
     }
     DeepSeek4LayerRangeCache & layer_range_cache = *cache.layer_range_cache;
-    if (!layer_range_cache.matches(w, backend, device, layer_begin, layer_end, is_last_shard) &&
+    // A layer-major pass steps through single layers of the full model: keep
+    // the full-range runtime the prompt's other chunks and decode use.
+    const DeepSeek4LayerMajorBand * layer_major_band = cache.layer_major_band;
+    const int runtime_begin = layer_major_band ? 0 : layer_begin;
+    const int runtime_end = layer_major_band ? w.n_layer : layer_end;
+    const bool runtime_output = layer_major_band ? true : is_last_shard;
+    if (!layer_range_cache.matches(w, backend, device, runtime_begin, runtime_end, runtime_output) &&
         !initialize_layer_range_cache(
-            layer_range_cache, backend, device, w, layer_begin, layer_end, is_last_shard)) {
+            layer_range_cache, backend, device, w, runtime_begin, runtime_end, runtime_output)) {
         return false;
     }
 
@@ -9563,7 +9575,7 @@ bool deepseek4_step_layer_range(
     // attention workspace starts its bulk growth regime at 512 tokens, so
     // reserve the destructive cleanup for those genuinely large prefills.
     constexpr int k_bulk_prefill_cleanup_tokens = 512;
-    if (shared_layer_major_prefill && kv_start == 0 &&
+    if (shared_layer_major_prefill && kv_start == 0 && layer_begin == 0 &&
         n_tokens >= k_bulk_prefill_cleanup_tokens) {
         ggml_backend_synchronize(backend);
         if (moe_hybrid && moe_hybrid->cold_backend &&
@@ -9746,14 +9758,31 @@ bool deepseek4_step_layer_range(
         shared_inputs = &decode_shared_inputs;
     }
 
+    // Engram rows only for a range that holds an Engram layer (a layer-major
+    // pass steps through the others too).
+    bool range_has_engram = false;
+    for (int il = layer_begin; il < layer_end && w.engram_runtime; ++il) {
+        range_has_engram = range_has_engram || w.engram_runtime->layer_index(il) >= 0;
+    }
     std::vector<float> engram_keys;
-    if (!ds4_engram_read_keys(w, cache.engram_tokens, token_ids, kv_start, n_tokens,
+    if (range_has_engram &&
+        !ds4_engram_read_keys(w, cache.engram_tokens, token_ids, kv_start, n_tokens,
                               engram_keys, telemetry)) {
         return false;
     }
-    if (!layer_range_cache.index_selection.ensure(backend, w)) {
+    if (!layer_range_cache.index_selection.ensure(
+            backend, w, layer_major_band ? layer_major_band->selection_columns : n_tokens)) {
         std::fprintf(stderr, "[deepseek4] index selection store allocation failed\n");
         return false;
+    }
+    if (layer_range_cache.index_selection_generation != layer_range_cache.index_selection.generation) {
+        // Cached decode graphs view the store: rebuild them over the new one.
+        for (auto & per_layer : cached_decode_attn_graphs) {
+            for (auto & graph : per_layer) graph.free();
+            per_layer.clear();
+        }
+        layer_range_cache.decode_attn_cache_bytes = 0;
+        layer_range_cache.index_selection_generation = layer_range_cache.index_selection.generation;
     }
 
     bool backend_decode_hc_supported = true;
@@ -9769,13 +9798,18 @@ bool deepseek4_step_layer_range(
     // The staggered pre-mix (see ds4_hc_collapse) runs on the host HC path
     // only, and carries the previous sub-block's coefficients from layer 0.
     const bool staggered_pre = w.hc_staggered_pre;
-    if (staggered_pre && (layer_begin != 0 || layer_end != w.n_layer || n_hc > 4)) {
+    std::vector<float> * carried_pre = layer_major_band ? layer_major_band->staggered_pre : nullptr;
+    if (staggered_pre &&
+        ((!carried_pre && (layer_begin != 0 || layer_end != w.n_layer)) || n_hc > 4 ||
+         (carried_pre && carried_pre->size() != (size_t) n_tokens * (size_t) n_hc))) {
         std::fprintf(stderr, "[deepseek4] staggered hyper-connections need the full layer range "
-                     "(got %d..%d)\n", layer_begin, layer_end);
+                     "or a layer-major pass (got %d..%d)\n", layer_begin, layer_end);
         return false;
     }
     std::vector<float> hc_prev_pre, hc_own_pre;
-    if (staggered_pre) {
+    if (staggered_pre && carried_pre) {
+        hc_prev_pre = *carried_pre;
+    } else if (staggered_pre) {
         hc_prev_pre.assign((size_t) n_tokens * (size_t) n_hc, 0.0f);
         for (int t = 0; t < n_tokens; ++t) hc_prev_pre[(size_t) t * n_hc] = 1.0f;
     }
@@ -10187,7 +10221,8 @@ bool deepseek4_step_layer_range(
                         : heterogeneous_batched_prefill
                             ? DeepSeek4AttentionImpl::DenseFlash
                             : DeepSeek4AttentionImpl::Explicit;
-                ggml_tensor * store_view = layer_range_cache.index_selection.view(ctx, 0, n_tokens);
+                ggml_tensor * store_view = layer_range_cache.index_selection.view(
+                    ctx, layer_major_band ? layer_major_band->selection_first : 0, n_tokens);
                 ggml_tensor * index_selection = store_view;
                 attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, comp_lc, il,
                                                kv_start, n_tokens, nullptr,
@@ -10856,6 +10891,8 @@ bool deepseek4_step_layer_range(
         ggml_backend_tensor_get(hc_state_backend, hc_state.data(), 0, sizeof(float) * hc_state.size());
     }
 
+    if (carried_pre) *carried_pre = hc_prev_pre;
+
     // ── Output: HC pre → norm → lm_head (or return hidden state) ────────
     if (is_last_shard && out_logits) {
         // Final HC pre for output
@@ -10983,6 +11020,75 @@ bool deepseek4_step_layer_range(
 }
 
 // ─── Cache management ───────────────────────────────────────────────────
+
+bool deepseek4_prefill_layer_major(
+        ggml_backend_t backend, int device, const DeepSeek4Weights & w, DeepSeek4Cache & cache,
+        const float * embed, const int32_t * token_ids, int kv_start,
+        const std::vector<int> & bands, DeepSeek4StepTelemetry * telemetry,
+        MoeHybridStorage * moe_hybrid, MoeExpertComputeRuntime * expert_runtime,
+        MoeHybridRoutingStats * routing_stats) {
+    const int n_embd = w.n_embd, n_hc = w.n_hc;
+    const size_t hc_dim = (size_t) n_hc * (size_t) n_embd;
+    int n_tokens = 0;
+    for (int count : bands) {
+        if (count <= 4 || count > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS) return false;
+        n_tokens += count;
+    }
+    if (!moe_hybrid || bands.empty() || cache.layer_major_band) return false;
+
+    // The residual copies of every position between layers, and each token's
+    // staggered pre-mix (one-hot copy 0 before the first layer).
+    std::vector<float> residual((size_t) n_tokens * hc_dim);
+    std::vector<float> pre((size_t) n_tokens * (size_t) n_hc, 0.0f);
+    for (int t = 0; t < n_tokens; ++t) pre[(size_t) t * n_hc] = 1.0f;
+    // Each band hashes its Engram rows from the tokens before it, whatever
+    // the context holds after a previous layer's pass.
+    const DeepSeek4EngramTokens context_before = cache.engram_tokens;
+
+    DeepSeek4LayerMajorBand band;
+    band.selection_columns = n_tokens;
+    std::vector<float> band_pre, band_out;
+    bool ok = true;
+    for (int il = 0; il < w.n_layer && ok; ++il) {
+        int first = 0;
+        for (int count : bands) {
+            const int pos = kv_start + first;
+            cache.engram_tokens = context_before;
+            for (int t = std::max(0, first - DeepSeek4EngramTokens::kSize); t < first; ++t) {
+                cache.engram_tokens.put(kv_start + t, token_ids[t]);
+            }
+            band_pre.assign(pre.begin() + (ptrdiff_t) first * n_hc,
+                            pre.begin() + (ptrdiff_t) (first + count) * n_hc);
+            band.staggered_pre = &band_pre;
+            band.selection_first = first;
+            cache.layer_major_band = &band;
+            const float * input = il == 0 ? embed + (size_t) first * n_embd
+                                          : residual.data() + (size_t) first * hc_dim;
+            ok = deepseek4_step_layer_range(
+                backend, device, w, cache, band_out, input, count, pos, il, il + 1,
+                /*out_logits=*/nullptr, token_ids + first, telemetry,
+                /*allow_decode_graph_reuse=*/true, /*verify_hooks=*/nullptr,
+                moe_hybrid, expert_runtime, routing_stats);
+            cache.layer_major_band = nullptr;
+            if (!ok || band_out.size() != (size_t) count * hc_dim) {
+                std::fprintf(stderr, "[deepseek4] layer-major prefill failed at layer %d pos %d\n", il, pos);
+                ok = false;
+                break;
+            }
+            std::memcpy(residual.data() + (size_t) first * hc_dim, band_out.data(),
+                        band_out.size() * sizeof(float));
+            std::copy(band_pre.begin(), band_pre.end(), pre.begin() + (ptrdiff_t) first * n_hc);
+            first += count;
+        }
+    }
+    // The context after the whole prompt, as a chunked prefill leaves it.
+    cache.engram_tokens = context_before;
+    for (int t = std::max(0, n_tokens - DeepSeek4EngramTokens::kSize); t < n_tokens; ++t) {
+        cache.engram_tokens.put(kv_start + t, token_ids[t]);
+    }
+    cache.cur_pos = kv_start + n_tokens;
+    return ok;
+}
 
 DeepSeek4LayerGeometry deepseek4_layer_geometry(const DeepSeek4Weights & w, int layer) {
     const uint32_t ratio = (layer >= 0 && (size_t) layer < w.compress_ratios.size())

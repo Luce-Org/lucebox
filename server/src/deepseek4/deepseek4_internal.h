@@ -448,6 +448,16 @@ struct DeepSeek4LayerCache {
 // DeepSeek4Cache below and released by free_deepseek4_cache().
 struct DeepSeek4LayerRangeCache;
 
+// One step of a whole-prompt layer-major prefill (deepseek4_prefill_layer_major):
+// the step runs one layer over one band of the prompt, so the staggered
+// pre-mix of each token crosses the steps here, and the band's index
+// selection lives at its own columns of the selection store.
+struct DeepSeek4LayerMajorBand {
+    std::vector<float> * staggered_pre = nullptr;  // [n_tokens][n_hc], in and out
+    int selection_first = 0;                        // column of the band's first token
+    int selection_columns = 0;                      // tokens of the whole pass
+};
+
 struct DeepSeek4Cache {
     int cur_pos  = 0;
     int max_ctx  = 0;
@@ -461,6 +471,9 @@ struct DeepSeek4Cache {
 
     // The tokens the Engram hash of the next positions reads (V4.1).
     DeepSeek4EngramTokens engram_tokens;
+
+    // Set while a whole-prompt layer-major prefill runs its layer x band steps.
+    const DeepSeek4LayerMajorBand * layer_major_band = nullptr;
 
     // Lazily created on the first deepseek4_step_layer_range call.
     DeepSeek4LayerRangeCache * layer_range_cache = nullptr;
@@ -745,6 +758,19 @@ bool deepseek4_step_layer_range(
     MoeExpertComputeRuntime *   expert_runtime = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr,
     vision::ImageSpanView       image_spans = {});
+
+// Whole-prompt layer-major prefill of `bands` (token counts, in order) starting
+// at kv_start: every layer runs over all bands before the next layer starts,
+// so each streamed expert is read about once per prompt instead of once per
+// band. Only the residual copies of every position (n_hc * n_embd floats per
+// token) stay in host memory; the rest of a step is sized by its band. Needs
+// the mixed-owner (hybrid) tier with batched prefill; produces no logits.
+bool deepseek4_prefill_layer_major(
+    ggml_backend_t backend, int device, const DeepSeek4Weights & w, DeepSeek4Cache & cache,
+    const float * embed, const int32_t * token_ids, int kv_start,
+    const std::vector<int> & bands, DeepSeek4StepTelemetry * telemetry,
+    MoeHybridStorage * moe_hybrid, MoeExpertComputeRuntime * expert_runtime,
+    MoeHybridRoutingStats * routing_stats);
 
 bool deepseek4_validate_image_batch(
     const DeepSeek4Weights & w, const DeepSeek4Cache & cache,

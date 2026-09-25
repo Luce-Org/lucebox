@@ -3372,20 +3372,13 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
 
     bool snapshot_saved = false;
     bool late_context_chunk_logged = false;
-    for (int i = 0; i < n_total;) {
-        if (io.is_cancelled()) return pos;
-
+    // The size of the chunk at prompt offset i (position pos): the scratch
+    // bound, then every boundary a snapshot, a restore or a DSpark capture
+    // needs.
+    const auto plan_chunk = [&](int i, int pos, bool snapshot_saved) {
         int n_tok = bound_hybrid_scratch
             ? deepseek4_hybrid_prefill_step_tokens(chunk, pos, n_total - i)
             : std::min(chunk, n_total - i);
-        if (!late_context_chunk_logged && n_tok < chunk &&
-            pos >= 32768 && n_total - i >= chunk) {
-            late_context_chunk_logged = true;
-            std::fprintf(stderr,
-                         "[deepseek4] late-context prefill pressure bound: "
-                         "chunk %d->%d at pos=%d\n",
-                         chunk, n_tok, pos);
-        }
         // Keep the final heterogeneous band large enough for expert-major
         // execution. A tiny (<512) remainder falls back to grouped
         // mul_mat_id; the qualified affine MMQ path is deliberately disabled
@@ -3417,6 +3410,65 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 spec_snap_from, spec_snap_to);
         }
 
+        return n_tok;
+    };
+    // A chunk that needs no logits and no DSpark capture only moves the
+    // prompt forward: consecutive ones run as one whole-prompt layer-major
+    // pass (deepseek4_prefill_layer_major), which reads each streamed expert
+    // once instead of once per chunk.
+    const bool layer_major_prompt =
+        layer_range_hybrid && !images && cfg_.prefill_mode == PrefillAttentionMode::Dense;
+    const auto plain_chunk = [&](int i, int n_tok, bool snapshot_saved) {
+        const bool at_snap = save_snapshot && !snapshot_saved && kv_offset + i + n_tok >= snap_pos;
+        const bool capture = capture_spec &&
+            (i + n_tok > spec_final_from ||
+             (!snapshot_saved && i < spec_snap_to && i + n_tok > spec_snap_from));
+        return n_tok > 4 && i + n_tok < n_total && !at_snap && !capture;
+    };
+    for (int i = 0; i < n_total;) {
+        if (io.is_cancelled()) return pos;
+
+        if (layer_major_prompt) {
+            std::vector<int> bands;
+            int span = 0;
+            while (i + span < n_total) {
+                const int n = plan_chunk(i + span, pos + span, snapshot_saved);
+                if (!plain_chunk(i + span, n, snapshot_saved)) break;
+                bands.push_back(n);
+                span += n;
+            }
+            if (bands.size() >= 2) {
+                std::vector<float> embed((size_t) w_.n_embd * (size_t) span);
+                if (!w_.embedder.embed(tokens.data() + i, span, embed.data())) return -1;
+                DeepSeek4StepTelemetry step_tel;
+                if (!deepseek4_prefill_layer_major(
+                        backend_, cfg_.device.gpu, w_, cache_, embed.data(), tokens.data() + i, pos,
+                        bands, timing ? &step_tel : nullptr, moe_hybrid_.get(),
+                        expert_runtime_.compute ? &expert_runtime_ : nullptr, routing_stats_.get())) {
+                    std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
+                    return -1;
+                }
+                std::fprintf(stderr, "[deepseek4] layer-major prefill: %d tokens in %zu bands at pos=%d\n",
+                             span, bands.size(), pos);
+                if (timing) {
+                    add_step_tel(tel_acc, step_tel);
+                    steps += (int) bands.size();
+                }
+                pos += span;
+                i += span;
+                continue;
+            }
+        }
+
+        int n_tok = plan_chunk(i, pos, snapshot_saved);
+        if (!late_context_chunk_logged && n_tok < chunk &&
+            pos >= 32768 && n_total - i >= chunk) {
+            late_context_chunk_logged = true;
+            std::fprintf(stderr,
+                         "[deepseek4] late-context prefill pressure bound: "
+                         "chunk %d->%d at pos=%d\n",
+                         chunk, n_tok, pos);
+        }
         if (images) {
             n_tok = vision::atomic_image_chunk(images->spans(), uint64_t(pos), n_tok,
                                                uint64_t(n_total - i), image_capacity);
