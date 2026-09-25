@@ -1718,7 +1718,10 @@ int main(int argc, char ** argv) {
     if (options.size() > 1) {
         const char * keep = std::getenv("LUCE_MULTI_MODEL_GRAPHS");
         const bool keep_graphs = keep && std::strcmp(keep, "1") == 0;
-        if (!keep_graphs) set_environment_variable("GGML_CUDA_DISABLE_GRAPHS", "1", false);
+        if (!keep_graphs && set_environment_variable("GGML_CUDA_DISABLE_GRAPHS", "1", false) != 0) {
+            std::fprintf(stderr, "[server] failed to set GGML_CUDA_DISABLE_GRAPHS for multi-model serving\n");
+            return 2;
+        }
         std::fprintf(stderr, "[server] %zu models in one process: GPU graph capture %s\n", options.size(),
             keep_graphs ? "kept on (LUCE_MULTI_MODEL_GRAPHS=1)" : "disabled");
     }

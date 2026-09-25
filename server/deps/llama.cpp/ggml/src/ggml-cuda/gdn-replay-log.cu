@@ -31,11 +31,13 @@ struct CommitStreams {
     }
 };
 
-cudaStream_t commit_stream() {
+// Selects `device` and returns its stream for this thread. Callers pass the
+// device that owns the tensors, so a worker that last touched another GPU
+// still copies and launches on the right one.
+cudaStream_t commit_stream(int device) {
     thread_local CommitStreams local;
-    int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess || device < 0 ||
-        device >= GGML_CUDA_MAX_DEVICES) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES ||
+        cudaSetDevice(device) != cudaSuccess) {
         return nullptr;
     }
     cudaStream_t & stream = local.streams[device];
@@ -45,16 +47,21 @@ cudaStream_t commit_stream() {
     return stream;
 }
 
-bool commit_sync() {
-    cudaStream_t stream = commit_stream();
+bool commit_sync(int device) {
+    cudaStream_t stream = commit_stream(device);
     return stream && cudaStreamSynchronize(stream) == cudaSuccess;
 }
 
-bool read_to_host(void * dst, const void * src, size_t bytes) {
-    cudaStream_t stream = commit_stream();
-    return stream &&
+// Validation reads may run before the commit selects `device`; restore the
+// caller's device so a validate-only call has no side effect.
+bool read_to_host(int device, void * dst, const void * src, size_t bytes) {
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess) return false;
+    cudaStream_t stream = commit_stream(device);
+    const bool ok = stream &&
         cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
         cudaStreamSynchronize(stream) == cudaSuccess;
+    return cudaSetDevice(previous) == cudaSuccess && ok;
 }
 
 __global__ void gdn_replay_log_commit_kernel(
@@ -304,8 +311,8 @@ static bool gdn_replay_log_commit_many_impl(
         std::vector<int32_t> accepted((size_t) n_seqs);
         std::vector<int32_t> slots((size_t) n_seqs);
         const size_t map_bytes = (size_t) n_seqs*sizeof(int32_t);
-        if (!read_to_host(accepted.data(), accepted_prefixes->data, map_bytes) ||
-            !read_to_host(slots.data(), active_slot_ids->data, map_bytes)) return false;
+        if (!read_to_host(device, accepted.data(), accepted_prefixes->data, map_bytes) ||
+            !read_to_host(device, slots.data(), active_slot_ids->data, map_bytes)) return false;
 
         int common_tokens = -1;
         int common_state_slots = -1;
@@ -377,13 +384,13 @@ static bool gdn_replay_log_commit_many_impl(
             (unsigned int) heads, (unsigned int) n_seqs);
         if (state_size == 128 && replay_log_width == 2*state_size + 1 &&
             tokens <= 8) {
-            gdn_replay_log_commit_128_scalar_tile_kernel<<<state_grid, threads, 0, commit_stream()>>>(
+            gdn_replay_log_commit_128_scalar_tile_kernel<<<state_grid, threads, 0, commit_stream(device)>>>(
                 (const float *) replay_log->data, (float *) state->data,
                 (const int32_t *) accepted_prefixes->data,
                 (const int32_t *) active_slot_ids->data,
                 heads, tokens, (int) n_seqs, (int) state->ne[3]);
         } else {
-            gdn_replay_log_commit_kernel<<<state_grid, threads, 0, commit_stream()>>>(
+            gdn_replay_log_commit_kernel<<<state_grid, threads, 0, commit_stream(device)>>>(
                 (const float *) replay_log->data, (float *) state->data,
                 (const int32_t *) accepted_prefixes->data,
                 (const int32_t *) active_slot_ids->data,
@@ -399,7 +406,7 @@ static bool gdn_replay_log_commit_many_impl(
         const dim3 conv_grid(
             (unsigned int) ((conv_elements + threads - 1)/threads),
             (unsigned int) n_seqs, 1);
-        gdn_conv_replay_log_commit_kernel<<<conv_grid, threads, 0, commit_stream()>>>(
+        gdn_conv_replay_log_commit_kernel<<<conv_grid, threads, 0, commit_stream(device)>>>(
             (const float *) conv_input->data, (float *) conv_state->data,
             (const int32_t *) accepted_prefixes->data,
             (const int32_t *) active_slot_ids->data,
@@ -407,7 +414,7 @@ static bool gdn_replay_log_commit_many_impl(
             (int) n_seqs, (int) conv_state->ne[2]);
     }
     if (cudaGetLastError() != cudaSuccess) return false;
-    return !synchronize || commit_sync();
+    return !synchronize || commit_sync(device);
 }
 
 extern "C" bool ggml_backend_cuda_gdn_replay_log_commit_many(
@@ -463,9 +470,9 @@ static bool tree_cache_commit_many_impl(
         if (!same_device_pointer(active_slot_ids->data, device)) return false;
         std::vector<int64_t> destinations((size_t) n_rows);
         std::vector<int32_t> slots((size_t) n_seqs);
-        if (!read_to_host(destinations.data(), commit_rows->data,
+        if (!read_to_host(device, destinations.data(), commit_rows->data,
                        destinations.size()*sizeof(int64_t)) ||
-            !read_to_host(slots.data(), active_slot_ids->data,
+            !read_to_host(device, slots.data(), active_slot_ids->data,
                        slots.size()*sizeof(int32_t))) return false;
         for (int index = 0; index < n_caches; ++index) {
             ggml_tensor * cache = caches[index];
@@ -500,7 +507,7 @@ static bool tree_cache_commit_many_impl(
         const dim3 grid(
             (unsigned int) ((cache->nb[1] + threads - 1)/threads),
             (unsigned int) n_rows, (unsigned int) cache->ne[2]);
-        tree_cache_commit_kernel<<<grid, threads, 0, commit_stream()>>>(
+        tree_cache_commit_kernel<<<grid, threads, 0, commit_stream(device)>>>(
             (uint8_t *) cache->data,
             (const int64_t *) commit_rows->data,
             (const int32_t *) active_slot_ids->data,
@@ -509,7 +516,7 @@ static bool tree_cache_commit_many_impl(
             tree_scratch_base, tree_scratch_stride);
     }
     if (cudaGetLastError() != cudaSuccess) return false;
-    return !synchronize || commit_sync();
+    return !synchronize || commit_sync(device);
 }
 
 extern "C" bool ggml_backend_cuda_tree_cache_commit_many(
@@ -560,7 +567,7 @@ static bool tree_feature_commit_impl(
         if (!same_device_pointer(destination->data, device) ||
             !same_device_pointer(destination_rows->data, device)) return false;
         std::vector<int32_t> rows((size_t) n_rows);
-        if (!read_to_host(rows.data(), destination_rows->data,
+        if (!read_to_host(device, rows.data(), destination_rows->data,
                        rows.size()*sizeof(int32_t))) return false;
         for (int row : rows) {
             if (row < -1 || row >= destination->ne[1]) return false;
@@ -573,12 +580,12 @@ static bool tree_feature_commit_impl(
         (unsigned int) ((source->nb[1] + threads - 1)/threads),
         (unsigned int) n_rows, 1);
     (void) cudaGetLastError();
-    tree_feature_commit_kernel<<<grid, threads, 0, commit_stream()>>>(
+    tree_feature_commit_kernel<<<grid, threads, 0, commit_stream(device)>>>(
         (const uint8_t *) source->data, (uint8_t *) destination->data,
         (const int32_t *) destination_rows->data,
         source->nb[1], n_rows, (int) destination->ne[1]);
     if (cudaGetLastError() != cudaSuccess) return false;
-    return !synchronize || commit_sync();
+    return !synchronize || commit_sync(device);
 }
 
 extern "C" bool ggml_backend_cuda_tree_feature_commit(
@@ -659,7 +666,7 @@ extern "C" bool ggml_backend_cuda_tree_commit_transaction(
             commit_mode::COMMIT_PREVALIDATED)) {
         GGML_ABORT("tree commit failed after recurrent mutation began");
     }
-    if (!commit_sync()) {
+    if (!commit_sync(transaction_device)) {
         GGML_ABORT("tree commit failed during final synchronization");
     }
     return true;

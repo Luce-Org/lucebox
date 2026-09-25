@@ -346,6 +346,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `GGML_HIP_ROCWMMA_FATTN` - server/CMakeLists.txt (BUILD OPTION, not an env var: compiles the rocWMMA fattn kernel; required by `LUCE_FA256_WMMA` and the sub-32K head-256 prefill route)
 - `GGML_CUDA_BATCH_PEER_COPIES` - ggml-cuda.cu (ggml-cuda), deepseek4_fused_verify.inc, moe_hybrid_ffn_eval.cpp
 - `GGML_CUDA_GRAPH_MAX_KEYS` - common.cuh (ggml-cuda)
+- `GGML_CUDA_DISABLE_GRAPHS` - common.cuh (ggml-cuda), server_main.cpp (any value disables CUDA/HIP graph capture; the server sets it to 1 when one process serves more than one model block, see `LUCE_MULTI_MODEL_GRAPHS`)
 - `GGML_CUDA_MLA_DENSE_HIGH_RATIO` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
 - `GGML_CUDA_MLA_DENSE_WMMA` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
 - `GGML_CUDA_MLA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
