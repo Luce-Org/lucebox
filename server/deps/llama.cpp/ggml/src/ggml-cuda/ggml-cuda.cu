@@ -875,14 +875,25 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 static constexpr size_t GGML_CUDA_STAGED_COPY_MIN = (size_t) 1 << 20;
 static constexpr size_t GGML_CUDA_STAGED_COPY_CHUNK = (size_t) 16 << 20;
 
+// Released when the thread exits: short-lived worker threads (std::async
+// owner evaluations) would otherwise leak 32 MiB of pinned memory each.
+struct ggml_cuda_copy_staging_buffers {
+    char * buf[2] = {nullptr, nullptr};
+    ~ggml_cuda_copy_staging_buffers() {
+        for (char * b : buf) {
+            if (b) cudaFreeHost(b);
+        }
+    }
+};
+
 static char * ggml_cuda_copy_staging(int slot) {
-    thread_local char * staging[2] = {nullptr, nullptr};
-    if (!staging[slot]) {
+    thread_local ggml_cuda_copy_staging_buffers staging;
+    if (!staging.buf[slot]) {
         void * ptr = nullptr;
         CUDA_CHECK(cudaMallocHost(&ptr, GGML_CUDA_STAGED_COPY_CHUNK));
-        staging[slot] = (char *) ptr;
+        staging.buf[slot] = (char *) ptr;
     }
-    return staging[slot];
+    return staging.buf[slot];
 }
 
 static void ggml_cuda_staged_h2d(char * dst, const char * src, size_t size) {
