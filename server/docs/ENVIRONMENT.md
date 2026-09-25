@@ -22,7 +22,6 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_FA256_WMMA_MAX_KV` | 32768 | KV length above which the head-256 tensor-core route switches from the rocWMMA kernel to the raw-MMA kernel in `GGML_HIP_ROCWMMA_FATTN` builds (measured crossover on gfx1201). |
 | `LUCE_PAGED_WMMA` | unset (0) | BURN-IN: =1 routes paged full-attention layers (RDNA4, head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Differential-tested against the decode kernel; single-prompt TTFT -21% at 12K and -42% at 44K, batched 8K-pool prefill slightly ahead. |
 | `GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS` | unset | DEBUG: force the paged-attention context partition count (both routes) to bisect partition-overlap and overhead behaviour. |
-| `LUCE_DS4_DEVICE_ROLLBACK` | 1 | KILL SWITCH (burn-in): =0 restores the per-row DS4 speculative-rollback copies (blocking host copies by default, stream-ordered with `LUCE_DS4_ASYNC_ROLLBACK=1`, pinned host staging with `LUCE_DS4_PINNED_ROLLBACK=1`). By default, when the verifier runs on a CUDA/HIP backend that holds every rollback tensor, save and apply stage in device memory with one batched copy each (`ggml_backend_cuda_copy_batch_async`), whatever the async/pinned switches say. |
 | `LUCE_PREFILL_UBATCH` | backend-dependent (512 in `qwen35_backend.cpp`; 16/384 in `layer_split_daemon.cpp`; `cfg_.chunk` in `qwen35_layer_split_adapter.cpp`) | Prefill ubatch. Under pooled kvflash prefill it is rounded down to a multiple of the pager chunk (never below one chunk) and clamped to the pool, instead of being forced to one chunk per ubatch. |
 | `LUCE_DRAFT_KV` | 1 | KILL SWITCH (remove after burn-in): =0 restores the legacy per-step drafter window recompute instead of the ring cache. |
 | `LUCE_LAGUNA_SWA_RING` | 1 | KILL SWITCH (remove after burn-in): =0 keeps SWA layers on pool-sized caches under KVFlash. |
@@ -61,6 +60,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `GGML_SCHED_PROFILE` / `GGML_SCHED_PROFILE_MIN_SPLITS` | unset / 1 | DEBUG: report scheduler splits, copy volume, submission time, and source/destination synchronization time. |
 | `LUCE_DS4_TP_FUSED_CACHE_SLOTS` | 8, 24 with `LUCE_DS4_Q5_VERIFY` | BURN-IN: number of heterogeneous verifier schedulers retained; higher values retain substantially more scratch on both GPUs. |
 | `LUCE_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |
+| `LUCE_DS4_DEVICE_ROLLBACK` | 1 | KILL SWITCH (burn-in): =0 restores the per-row DS4 speculative-rollback copies (blocking host copies by default, stream-ordered with `LUCE_DS4_ASYNC_ROLLBACK=1`, pinned host staging with `LUCE_DS4_PINNED_ROLLBACK=1`). By default, when the verifier runs on a CUDA/HIP backend that holds every rollback tensor, save and apply stage in device memory with one batched copy each (`ggml_backend_cuda_copy_batch_async`), whatever the async/pinned switches say. |
 | `LUCE_DS4_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and emit semantic DS4 prefill, speculative-decode, and layer-range markers for external rocprof traces. No events, timing, or device synchronization are added. |
 | `LUCE_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
 | `LUCE_CUDA_MMVF_NARROW_F16` | enabled on qualified gfx1151 narrow F16 matmuls | BURN-IN KILL SWITCH: =0 restores the generic dispatch decision for the narrow F16 projection optimization, unless an explicit `LUCE_MMVF_MAX_NCOLS_F16` ceiling overrides it. |
@@ -102,7 +102,6 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_KV_V` - kv_quant.cpp, laguna_backend.cpp
 - `LUCE_LM_HEAD_FIX` - http_server.cpp
 - `LUCE_PAGED_WMMA` - paged-attn.cu (ggml-cuda) (=1 routes paged full-attention layers to the WMMA kernel; RDNA4 only, F16/Q8_0/Q4_0, non-tree)
-- `LUCE_DS4_DEVICE_ROLLBACK` - deepseek4/deepseek4_dspark_spec.cpp
 - `LUCE_PREFILL_UBATCH` - qwen35/prefill_helpers.h
 - `LUCE_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h
 - `LUCE_ADAPTIVE_K_TAU` - mmid_adaptive_k.h
@@ -137,6 +136,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_DS4_HYBRID_PREFILL_GPU_HC` - deepseek4_graph.cpp
 - `LUCE_DS4_Q5_VERIFY` - deepseek4_backend.cpp, deepseek4_dspark_spec.cpp, deepseek4_fused_verify.inc, deepseek4_graph.cpp (gfx1151 DSpark default =1: five-row fused verifier and the 24-slot cache; =0 restores the q<=4 verifier)
 - `LUCE_DS4_PINNED_ROLLBACK` - deepseek4_dspark_spec.cpp (gfx1151 DSpark default =1: pinned host rollback state; =0 restores pageable copies)
+- `LUCE_DS4_DEVICE_ROLLBACK` - deepseek4/deepseek4_dspark_spec.cpp
 - `LUCE_DS4_COMP_PAD_STRIDE` - deepseek4_graph.cpp
 - `LUCE_DS4_CROSS_VENDOR_OWNER_SUMS` - deepseek4_fused_verify.inc
 - `LUCE_DS4_CUDA_LAYERS` - deepseek4_layer_split_adapter.cpp
