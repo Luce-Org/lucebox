@@ -1271,7 +1271,7 @@ if(LUCE_TESTS)
             target_link_libraries(test_capture_safe_copies PRIVATE CUDA::cudart)
         endif()
         target_link_libraries(test_capture_safe_copies PRIVATE luce_common Threads::Threads)
-        list(APPEND _raw_unit_test_targets test_capture_safe_copies)
+        # Registered through the CppUnit list below.
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_mmid_grouped_cuda.cpp")
         add_executable(test_deepseek4_mmid_grouped_cuda test/test_deepseek4_mmid_grouped_cuda.cpp)
@@ -2323,6 +2323,7 @@ if(LUCE_TESTS)
         test_ggml_cluster_allreduce
         test_qwen35_tensor_parallel
         test_deepseek4_hc_cuda
+        test_capture_safe_copies
         test_flashprefill_kernels
         test_cuda_comm_api
         test_mmq_streamk_iq4_xs

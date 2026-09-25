@@ -122,8 +122,12 @@ bool copy_peer_async(void * dst, int dst_device,
     if (err != cudaSuccess) return false;
     return cudaStreamSynchronize(stream) == cudaSuccess;
 #else
+    // A null source stream would make the staging helper use the legacy
+    // default stream and a device-wide sync.
+    cudaStream_t src_stream = luce_copy_stream(src_device);
+    if (!src_stream) return false;
     return dflash_cuda_copy_between_devices(src_device, src, dst_device, dst, bytes,
-                                            luce_copy_stream(src_device), stream);
+                                            src_stream, stream);
 #endif
 }
 

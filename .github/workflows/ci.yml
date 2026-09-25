@@ -259,7 +259,7 @@ jobs:
       - name: Run capture-safe copy test
         run: |
           ctest --test-dir server/build --output-on-failure \
-            -R '^test_capture_safe_copies$' --no-tests=error
+            -R '^test_capture_safe_copies\.' --no-tests=error
 
       - name: Run concurrent-serving kernel tests
         run: |
@@ -406,7 +406,7 @@ jobs:
       - name: Run capture-safe copy test
         run: |
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" --output-on-failure \
-            -R '^test_capture_safe_copies$' --no-tests=error
+            -R '^test_capture_safe_copies\.' --no-tests=error
 
       - name: Run model-backed ROCm tests
         if: matrix.arch == 'gfx1151'
