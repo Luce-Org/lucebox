@@ -750,6 +750,235 @@ ggml_tensor * build_ple(ggml_context * c, ggml_cgraph * gf, ggml_tensor * hidden
     return ple_out;
 }
 
+static ggml_tensor * column(ggml_context * c, ggml_tensor * x, int s) {
+    GGML_ASSERT(s >= 0 && s < x->ne[1]);
+    return ggml_view_2d(c, x, x->ne[0], 1, x->nb[1], (size_t) s * x->nb[1]);
+}
+
+static ggml_tensor * build_linear_attn_projected(ggml_context * c, ggml_cgraph * gf,
+        ggml_tensor * qkv, ggml_tensor * z, ggml_tensor * beta, ggml_tensor * alpha,
+        const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
+        ggml_tensor * ssm_state, ggml_tensor * conv_state) {
+    const int64_t D = w.ssm_d_state, Hk = w.ssm_n_group;
+    const int64_t Hv = w.linear_value_heads, d_in = w.ssm_d_inner;
+    const int64_t kernel = w.ssm_d_conv;
+    const int64_t conv_channels = 2 * Hk * D + d_in;
+    const float eps = w.rms_eps;
+
+    beta = ggml_sigmoid(c, ggml_reshape_4d(c, beta, 1, Hv, 1, 1));
+    alpha = ggml_reshape_3d(c, alpha, Hv, 1, 1);
+    alpha = ggml_softplus(c, ggml_add(c, alpha, L.ssm_dt_bias));
+    ggml_tensor * gate = ggml_reshape_4d(c,
+        ggml_mul(c, alpha, L.ssm_a), 1, Hv, 1, 1);
+
+    ggml_tensor * hist = ggml_reshape_3d(c, conv_state, kernel - 1, conv_channels, 1);
+    ggml_tensor * qkv_t = ggml_transpose(c, qkv);
+    ggml_tensor * conv_input = ggml_concat(c, hist, qkv_t, 0);
+    ggml_tensor * new_hist = ggml_cont(c, ggml_view_3d(c, conv_input,
+        kernel - 1, conv_channels, 1, conv_input->nb[1], conv_input->nb[2],
+        conv_input->nb[0]));
+    ggml_build_forward_expand(gf, ggml_cpy(c, new_hist,
+        ggml_reshape_3d(c, conv_state, kernel - 1, conv_channels, 1)));
+
+    ggml_tensor * conv_op = ggml_ssm_conv(c, conv_input, L.ssm_conv1d);
+    // Preserve the fusion allocator dependency used by the single-sequence path.
+    conv_op->src[3] = qkv_t;
+    ggml_tensor * conv = ggml_silu(c, conv_op);
+    const size_t esz = ggml_element_size(conv);
+    const size_t tstride = (size_t) conv_channels * esz;
+    ggml_tensor * q_raw = ggml_view_3d(c, conv, D, Hk, 1, D * esz, tstride, 0);
+    ggml_tensor * k_raw = ggml_view_3d(c, conv, D, Hk, 1, D * esz, tstride, D * Hk * esz);
+    ggml_tensor * q_c = ggml_scale(c, ggml_rms_norm(c, q_raw, eps / (float) D),
+                                   1.0f / sqrtf((float) D));
+    ggml_tensor * k_c = ggml_scale(c, ggml_rms_norm(c, k_raw, eps / (float) D),
+                                   1.0f / sqrtf((float) D));
+    ggml_tensor * v_c = ggml_view_3d(c, conv, D, Hv, 1, D * esz, tstride,
+                                     2 * D * Hk * esz);
+    ggml_tensor * state4 = ggml_reshape_4d(c, ssm_state, D, D, Hv, 1);
+    ggml_tensor * gdn = ggml_gated_delta_net(c, q_c, k_c, v_c, gate, beta, state4);
+    ggml_gated_delta_net_set_skip_intermediate(gdn, true);
+    ggml_tensor * attn = ggml_view_4d(c, gdn, D, Hv, 1, 1,
+        ggml_row_size(gdn->type, D), ggml_row_size(gdn->type, D * Hv),
+        ggml_row_size(gdn->type, D * Hv), 0);
+    ggml_tensor * new_state = ggml_view_4d(c, gdn, D, D, Hv, 1,
+        ggml_row_size(gdn->type, D), ggml_row_size(gdn->type, D * D),
+        ggml_row_size(gdn->type, D * D * Hv), ggml_row_size(gdn->type, D * Hv));
+    ggml_build_forward_expand(gf, ggml_cpy(c, new_state, state4));
+    ggml_tensor * normed = ggml_mul(c, ggml_rms_norm(c, attn, eps), L.ssm_norm);
+    ggml_tensor * out = ggml_mul(c, normed,
+        ggml_sigmoid(c, ggml_reshape_4d(c, z, D, Hv, 1, 1)));
+    return ggml_reshape_2d(c, out, d_in, 1);
+}
+
+static ggml_tensor * build_full_attn_projected(ggml_context * c, ggml_cgraph * gf,
+        ggml_tensor * qfull, ggml_tensor * kraw, ggml_tensor * vraw,
+        ggml_tensor * positions, ggml_tensor * mask, const Qwen4ExpLayer & L,
+        const Qwen4ExpWeights & w, ggml_tensor * k_cache, ggml_tensor * v_cache,
+        int pos0, int64_t kv_view_len) {
+    const int64_t D = w.n_embd_head_k, Hq = w.n_head, Hk = w.n_head_kv;
+    const float eps = w.rms_eps;
+    ggml_tensor * q = ggml_rms_norm(c,
+        ggml_view_3d(c, qfull, D, Hq, 1, 2 * D * ggml_element_size(qfull),
+                     2 * D * Hq * ggml_element_size(qfull), 0), eps);
+    q = ggml_mul(c, q, L.q_norm);
+    ggml_tensor * gate = ggml_cont_2d(c,
+        ggml_view_3d(c, qfull, D, Hq, 1, 2 * D * ggml_element_size(qfull),
+                     2 * D * Hq * ggml_element_size(qfull), D * ggml_element_size(qfull)), D * Hq, 1);
+    ggml_tensor * k = ggml_mul(c,
+        ggml_rms_norm(c, ggml_reshape_3d(c, kraw, D, Hk, 1), eps), L.k_norm);
+    ggml_tensor * v = ggml_reshape_3d(c, vraw, D, Hk, 1);
+    int sections[4] = { w.rope_sections[0], w.rope_sections[1],
+                        w.rope_sections[2], w.rope_sections[3] };
+    q = ggml_rope_multi(c, q, positions, nullptr, w.rope_dimension_count, sections,
+        GGML_ROPE_TYPE_MROPE, 0, w.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    k = ggml_rope_multi(c, k, positions, nullptr, w.rope_dimension_count, sections,
+        GGML_ROPE_TYPE_MROPE, 0, w.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    ggml_tensor * kt = ggml_permute(c, ggml_cast(c, k, k_cache->type), 0, 2, 1, 3);
+    ggml_tensor * vt = ggml_permute(c, ggml_cast(c, v, v_cache->type), 0, 2, 1, 3);
+    ggml_build_forward_expand(gf, ggml_cpy(c, kt,
+        ggml_view_3d(c, k_cache, D, 1, Hk, k_cache->nb[1],
+                     k_cache->nb[2], (size_t) pos0 * k_cache->nb[1])));
+    ggml_build_forward_expand(gf, ggml_cpy(c, vt,
+        ggml_view_3d(c, v_cache, D, 1, Hk, v_cache->nb[1],
+                     v_cache->nb[2], (size_t) pos0 * v_cache->nb[1])));
+    ggml_tensor * kfull = ggml_view_3d(c, k_cache, D, kv_view_len, Hk,
+                                       k_cache->nb[1], k_cache->nb[2], 0);
+    ggml_tensor * vfull = ggml_view_3d(c, v_cache, D, kv_view_len, Hk,
+                                       v_cache->nb[1], v_cache->nb[2], 0);
+    ggml_tensor * qfa = ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));
+    ggml_tensor * attn = ggml_flash_attn_ext(c, qfa, kfull, vfull, mask,
+        1.0f / sqrtf((float) D), 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+    return ggml_mul(c, ggml_reshape_2d(c, attn, D * Hq, 1), ggml_sigmoid(c, gate));
+}
+
+static ggml_tensor * build_ple_row(ggml_context * c, ggml_cgraph * gf,
+        ggml_tensor * hidden, ggml_tensor * key, ggml_tensor * value,
+        const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, ggml_tensor * state,
+        const std::function<void(ggml_tensor *, const char *)> & trace) {
+    const int64_t n_embd = w.n_embd, hc = w.n_hc, hc_dim = n_embd * hc;
+    const float eps = w.rms_eps;
+    auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * nw) {
+        ggml_tensor * t = ggml_rms_norm(c, ggml_reshape_3d(c, x, n_embd, hc, 1), eps);
+        return ggml_reshape_3d(c, ggml_mul(c, ggml_reshape_2d(c, t, hc_dim, 1), nw),
+                               n_embd, hc, 1);
+    };
+    trace(key, "ple.key"); trace(value, "ple.value");
+    key = grouped_norm(key, L.ple_norm_key);
+    trace(key, "ple.knorm");
+    ggml_tensor * query = grouped_norm(hidden, L.ple_norm_query);
+    trace(query, "ple.qnorm");
+    ggml_tensor * score = ggml_scale(c, ggml_sum_rows(c, ggml_mul(c, key, query)),
+                                     1.0f / sqrtf((float) n_embd));
+    trace(score, "ple.score");
+    ggml_tensor * mag = ggml_sqrt(c, ggml_clamp(c, ggml_abs(c, score), 1e-6f, INFINITY));
+    ggml_tensor * gate = ggml_sigmoid(c, ggml_mul(c, ggml_sgn(c, score), mag));
+    trace(gate, "ple.gate");
+    ggml_tensor * gated = ggml_mul(c, ggml_repeat_4d(c,
+        ggml_reshape_3d(c, value, n_embd, 1, 1), n_embd, hc, 1, 1), gate);
+    trace(gated, "ple.gated");
+    ggml_tensor * normalized = grouped_norm(
+        ggml_reshape_2d(c, gated, hc_dim, 1), L.ple_norm_conv);
+    trace(normalized, "ple.normalized");
+    const int64_t kern = w.ple_conv_kernel, dil = w.ple_ngram_size;
+    const int64_t hist = (kern - 1) * dil;
+    ggml_tensor * norm_t = ggml_transpose(c, ggml_reshape_2d(c, normalized, hc_dim, 1));
+    ggml_tensor * padded = ggml_concat(c,
+        ggml_cont(c, ggml_reshape_2d(c, state, hist, hc_dim)), norm_t, 0);
+    ggml_build_forward_expand(gf, ggml_cpy(c,
+        ggml_cont(c, ggml_view_2d(c, padded, hist, hc_dim, padded->nb[1], padded->nb[0])),
+        ggml_reshape_2d(c, state, hist, hc_dim)));
+    ggml_tensor * conv_out = nullptr;
+    for (int64_t k = 0; k < kern; ++k) {
+        const int64_t start = hist - (kern - 1 - k) * dil;
+        // `padded` is [time, features] with time contiguous. Mirror the solo
+        // path's [T, features] view then transpose so each feature reads the
+        // selected time tap; a direct [features, 1] view would walk adjacent
+        // time values instead of the strided feature row.
+        ggml_tensor * shifted = ggml_cont(c, ggml_transpose(c,
+            ggml_view_3d(c, padded, 1, hc_dim, 1, padded->nb[1], padded->nb[2],
+                         ggml_row_size(padded->type, start))));
+        if (k == 0) shifted->src[1] = norm_t;
+        ggml_tensor * wk = ggml_reshape_1d(c, ggml_cont(c,
+            ggml_view_2d(c, L.ple_conv1d, 1, hc_dim, L.ple_conv1d->nb[1],
+                         k * L.ple_conv1d->nb[0])), hc_dim);
+        if (wk->type != GGML_TYPE_F32) wk = ggml_cast(c, wk, GGML_TYPE_F32);
+        ggml_tensor * term = ggml_mul(c, shifted, wk);
+        conv_out = conv_out ? ggml_add(c, conv_out, term) : term;
+    }
+    conv_out = ggml_reshape_3d(c, ggml_cont(c, ggml_silu(c, conv_out)), n_embd, hc, 1);
+    trace(conv_out, "ple.conv");
+    return ggml_add(c, hidden, ggml_add(c, gated, conv_out));
+}
+
+static void write_layer_trace(ggml_backend_t backend,
+        const std::vector<std::pair<ggml_tensor *, std::string>> & tensors) {
+    const char * tag = std::getenv("QWEN4EXP_TRACE_TAG");
+    if (!tag || !*tag) return;
+    for (const auto & entry : tensors) {
+        ggml_tensor * t = entry.first;
+        if (!t || !t->data || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_I32)) continue;
+        int64_t rows = 1, elems_per_row = ggml_nelements(t);
+        size_t row_stride = ggml_nbytes(t);
+        if (!std::strcmp(entry.second.c_str(), "ple.inp") ||
+            !std::strcmp(entry.second.c_str(), "ple.projkey") ||
+            !std::strcmp(entry.second.c_str(), "ple.projvalue")) {
+            rows = t->ne[1];
+            elems_per_row = t->ne[0];
+            row_stride = t->nb[1];
+        } else if (std::strncmp(entry.second.c_str(), "ple.", 4) == 0) {
+            rows = 1;
+            elems_per_row = ggml_nelements(t);
+            row_stride = ggml_nbytes(t);
+        } else if (t->ne[2] > 1 || std::strstr(entry.second.c_str(), ".res") ||
+            std::strstr(entry.second.c_str(), ".ple") || std::strstr(entry.second.c_str(), ".ffnxn")) {
+            rows = t->ne[2];
+            elems_per_row = t->ne[0] * t->ne[1];
+            row_stride = t->nb[2];
+        } else if (t->ne[1] > 1) {
+            rows = t->ne[1];
+            elems_per_row = t->ne[0];
+            row_stride = t->nb[1];
+        }
+        for (int64_t row = 0; row < rows; ++row) {
+            const size_t bytes = (size_t) elems_per_row * ggml_element_size(t);
+            std::vector<uint8_t> data(bytes);
+            ggml_backend_tensor_get(t, data.data(), (size_t) row * row_stride, bytes);
+            char path[512];
+            std::snprintf(path, sizeof(path), "/tmp/q4trace_%s_%s_row%lld.bin",
+                          tag, entry.second.c_str(), (long long) row);
+            FILE * f = std::fopen(path, "wb");
+            if (f) { std::fwrite(data.data(), 1, data.size(), f); std::fclose(f); }
+        }
+    }
+    (void) backend;
+}
+
+static void write_ple_indices(const std::vector<int32_t> & rows) {
+    const char * tag = std::getenv("QWEN4EXP_TRACE_TAG");
+    if (!tag || !*tag) return;
+    char path[512];
+    std::snprintf(path, sizeof(path), "/tmp/q4trace_%s_ple-indices.bin", tag);
+    FILE * f = std::fopen(path, "wb");
+    if (f) { std::fwrite(rows.data(), sizeof(int32_t), rows.size(), f); std::fclose(f); }
+}
+
+static void write_ple_host(const std::vector<float> & data) {
+    const char * tag = std::getenv("QWEN4EXP_TRACE_TAG");
+    if (!tag || !*tag) return;
+    char path[512];
+    std::snprintf(path, sizeof(path), "/tmp/q4trace_%s_ple-host.bin", tag);
+    FILE * f = std::fopen(path, "wb");
+    if (f) { std::fwrite(data.data(), sizeof(float), data.size(), f); std::fclose(f); }
+}
+
+static bool trace_layer_selected(const char * label) {
+    return label && (!std::strncmp(label, "ple.", 4) || std::strstr(label, ".att") || std::strstr(label, ".fmix") ||
+                     std::strstr(label, ".hcmix") || std::strstr(label, ".ffnxn") ||
+                     std::strstr(label, ".moe") || std::strstr(label, ".mid") ||
+                     std::strstr(label, ".res") || std::strstr(label, ".ple"));
+}
+
 }  // namespace
 
 Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
@@ -764,6 +993,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     static const bool prof = getenv("QWEN4EXP_PROF") != nullptr;
     // QWEN4EXP_DUMP=1 materialises per-layer activations and prints finite/absmax/mean.
     static const bool dump = getenv("QWEN4EXP_DUMP") != nullptr;
+    static const bool layer_trace = getenv("QWEN4EXP_LAYER_TRACE") != nullptr;
     // The fused reduction can differ from upstream's ggml_rms_norm below one
     // ulp; keep the unfused form for upstream differential checks.
     static const bool upstream = [] { const char * v = getenv("QWEN4EXP_UPSTREAM"); return v && std::atoi(v) != 0; }();
@@ -784,7 +1014,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     const bool use_stable_graph = stable_graph && reuse_decode_workspace;
     std::vector<std::pair<ggml_tensor *, std::string>> dump_t;
     auto dump_mark = [&](ggml_tensor * t, const char * label) {
-        if (dump && t) {
+        if (t && (dump || (layer_trace && trace_layer_selected(label)))) {
             // A view output must keep its owning allocation alive until the dump.
             for (ggml_tensor * base = t; base; base = base->view_src) ggml_set_output(base);
             ggml_set_name(t, label);
@@ -848,10 +1078,12 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                 }
             }
         }
+        if (layer_trace) write_ple_indices(ple_rows);
         if (!w.ple_reader.gather(ple_rows.data(), (int64_t) ple_rows.size(), ple_data.data())) {
             std::fprintf(stderr, "[qwen4exp] PLE gather failed\n");
             return res;
         }
+        if (layer_trace) write_ple_host(ple_data);
         const size_t keep = (size_t) std::min<int64_t>(ng - 1, n_tokens + (int64_t) ple_prev.size());
         std::vector<int32_t> next;
         next.reserve(keep);
@@ -1015,6 +1247,11 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
             res_hc = build_ple(ctx, gf, res_hc, ple_in, L, w,
                                cache.ple_conv_state.empty() ? nullptr :
                                    cache.ple_conv_state[0], dump_mark);
+            if (layer_trace) {
+                char ple_label[24];
+                std::snprintf(ple_label, sizeof(ple_label), "L%02d.ple", il);
+                dump_mark(res_hc, ple_label);
+            }
             xn_next = nullptr;   // PLE changed the residual; the norm must rerun
         }
 
@@ -1070,6 +1307,8 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
             std::snprintf(dlab, sizeof dlab, "L%02d.hcA", il);
             dump_mark(ffn_fused, dlab);
             ggml_tensor * ffn_xn = hc_norm_xn(ctx, ffn_fused, w.n_embd, w.n_hc, layer_T);
+            std::snprintf(dlab, sizeof dlab, "L%02d.ffnxn", il);
+            dump_mark(ffn_xn, dlab);
             cur = hc_mix_from_xn(ctx, ffn_xn,
                                  L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, &inject,
                                  w.n_embd, w.n_hc);
@@ -1296,7 +1535,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
             t_compute - t_upload, prof_now_ms() - t_compute, prof_now_ms() - t0);
     }
 
-    if (dump) {
+    if (dump || layer_trace) {
         for (auto & dt : dump_t) {
             ggml_tensor * t = dt.first;
             const size_t n = (size_t) ggml_nelements(t);
@@ -1357,6 +1596,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
             }
         }
     }
+    if (layer_trace) write_layer_trace(backend, dump_t);
 
     if (!reuse_decode_workspace) {
         ggml_gallocr_free(galloc);
@@ -1367,6 +1607,335 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     res.n_tokens = n_tokens;
     res.pos0 = pos0;
     return res;
+}
+
+Qwen4ExpForwardResult qwen4exp_forward_batched(
+        ggml_backend_t backend, const Qwen4ExpWeights & w,
+        Qwen4ExpCache * const * caches, const int32_t * tokens,
+        const int32_t * positions, int n_slots,
+        Qwen4ExpBatchedDecodeWorkspace & workspace,
+        std::vector<std::vector<float>> & out_logits) {
+    Qwen4ExpForwardResult result;
+    const char * enabled = std::getenv("QWEN4EXP_BATCHED_DECODE");
+    const char * upstream_env = std::getenv("QWEN4EXP_UPSTREAM");
+    static const bool layer_trace = std::getenv("QWEN4EXP_LAYER_TRACE") != nullptr;
+    if (!enabled || std::atoi(enabled) == 0 ||
+        (upstream_env && std::atoi(upstream_env) != 0) ||
+        !backend || !caches || !tokens || !positions || n_slots <= 0) return result;
+    out_logits.clear();
+
+    // Preserve the established single-sequence arithmetic and state transitions
+    // exactly. The new graph is only used for true multi-slot calls.
+    if (n_slots == 1) {
+        if (!caches[0]) return result;
+        std::vector<float> logits;
+        result = qwen4exp_forward(backend, w, *caches[0], tokens, 1, positions[0], logits);
+        if (result.ok) {
+            out_logits.assign(1, std::move(logits));
+        }
+        return result;
+    }
+    if (n_slots > 8) return result;
+    for (int s = 0; s < n_slots; ++s) {
+        if (!caches[s] || positions[s] < 0 || positions[s] >= caches[s]->max_ctx ||
+            caches[s]->kv_type != GGML_TYPE_F16 ||
+            caches[s]->linear_layer_ids != caches[0]->linear_layer_ids ||
+            caches[s]->full_layer_ids != caches[0]->full_layer_ids ||
+            caches[s]->ple_layer_ids != caches[0]->ple_layer_ids) return result;
+        for (int prev = 0; prev < s; ++prev) if (caches[prev] == caches[s]) return result;
+    }
+
+    static const bool hc_fused = [] {
+        const char * v = std::getenv("QWEN4EXP_UPSTREAM");
+        return !(v && std::atoi(v) != 0) && std::getenv("QWEN4EXP_HC_UNFUSED") == nullptr;
+    }();
+    static const bool stable_graph = [] {
+        const char * v = std::getenv("QWEN4EXP_DECODE_STABLEGRAPH");
+        return !(v && std::atoi(v) == 0);
+    }();
+    static const bool fa_pad256 = [] {
+        const char * v = std::getenv("QWEN4EXP_FA_PAD256");
+        return v && std::atoi(v) != 0;
+    }();
+    const int64_t T = n_slots;
+    const bool has_ple = w.ple_reader.available() && !caches[0]->ple_layer_ids.empty();
+    const int64_t ple_heads = w.ple_n_heads;
+    const int64_t ple_row_size = w.ple_head_dim * ple_heads;
+    std::vector<int> lin_idx(w.n_layer, -1), full_idx(w.n_layer, -1), ple_idx(w.n_layer, -1);
+    for (int i = 0; i < (int) caches[0]->linear_layer_ids.size(); ++i)
+        lin_idx[caches[0]->linear_layer_ids[i]] = i;
+    for (int i = 0; i < (int) caches[0]->full_layer_ids.size(); ++i)
+        full_idx[caches[0]->full_layer_ids[i]] = i;
+    for (int i = 0; i < (int) caches[0]->ple_layer_ids.size(); ++i)
+        ple_idx[caches[0]->ple_layer_ids[i]] = i;
+
+    std::vector<float> emb((size_t) w.n_embd * n_slots);
+    if (!w.embedder.embed(tokens, n_slots, emb.data())) {
+        std::fprintf(stderr, "[qwen4exp] batched CPU embedding failed\n");
+        return result;
+    }
+
+    std::vector<float> ple_data(has_ple ? (size_t) ple_row_size * n_slots : 0);
+    std::vector<std::vector<int32_t>> next_prev((size_t) n_slots);
+    if (has_ple) {
+        const int64_t ng = w.ple_ngram_size;
+        std::vector<int32_t> ple_rows((size_t) ple_heads * n_slots);
+        for (int s = 0; s < n_slots; ++s) {
+            const std::vector<int32_t> & prev = caches[s]->ple_prev;
+            std::vector<int32_t> seq = prev;
+            seq.push_back(tokens[s]);
+            const int64_t pos = (int64_t) prev.size();
+            std::vector<uint64_t> ctx((size_t) ng);
+            ctx[0] = (uint64_t) tokens[s];
+            bool cut = false;
+            for (int64_t j = 1; j < ng; ++j) {
+                if (cut || pos - j < 0) { ctx[j] = (uint64_t) w.ple_eos_token_id; cut = true; }
+                else {
+                    const int32_t id = seq[(size_t) (pos - j)];
+                    if (id < 0 || id == w.ple_eos_token_id) cut = true;
+                    ctx[j] = cut ? (uint64_t) w.ple_eos_token_id : (uint64_t) id;
+                }
+            }
+            for (int64_t n = 2; n <= ng; ++n) {
+                uint64_t mixed = ctx[0] * w.ple_layer_multipliers[0];
+                for (int64_t j = 1; j < n; ++j) mixed ^= ctx[j] * w.ple_layer_multipliers[(size_t) j];
+                const int64_t base = (n - 2) * w.ple_heads_per_ngram;
+                for (int64_t q = 0; q < w.ple_heads_per_ngram; ++q) {
+                    const int64_t h = base + q;
+                    ple_rows[(size_t) s * ple_heads + h] = (int32_t)
+                        ((mixed % (uint64_t) w.ple_head_vocab_sizes[h]) + w.ple_head_offsets[h]);
+                }
+            }
+            const size_t keep = (size_t) std::min<int64_t>(ng - 1, prev.size() + 1);
+            const size_t total = prev.size() + 1;
+            for (size_t k = total - keep; k < total; ++k)
+                next_prev[s].push_back(k < prev.size() ? prev[k] : tokens[s]);
+        }
+        if (layer_trace) write_ple_indices(ple_rows);
+        if (!w.ple_reader.gather(ple_rows.data(), (int64_t) ple_rows.size(), ple_data.data())) {
+            std::fprintf(stderr, "[qwen4exp] batched PLE gather failed\n");
+            return result;
+        }
+        if (layer_trace) write_ple_host(ple_data);
+    }
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 400000 +
+                  ggml_graph_overhead_custom(400000, false) + (2u << 20);
+    ip.no_alloc = true;
+    if (!workspace.ctx) workspace.ctx = ggml_init(ip);
+    else ggml_reset(workspace.ctx);
+    ggml_context * ctx = workspace.ctx;
+    if (!ctx) return result;
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 400000, false);
+    if (!gf) return result;
+    std::vector<std::pair<ggml_tensor *, std::string>> trace_tensors;
+    auto trace_mark = [&](ggml_tensor * t, const char * label) {
+        if (!layer_trace || !t || !trace_layer_selected(label)) return;
+        for (ggml_tensor * base = t; base; base = base->view_src) ggml_set_output(base);
+        ggml_set_name(t, label);
+        trace_tensors.emplace_back(t, label);
+    };
+    ggml_tensor * inp_emb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_embd, T);
+    ggml_set_input(inp_emb);
+    ggml_tensor * ple_in = nullptr;
+    if (has_ple) {
+        ple_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ple_row_size, T);
+        ggml_set_input(ple_in);
+        trace_mark(ple_in, "ple.inp");
+    }
+    ggml_tensor * res_hc = repeat_dim1(ctx,
+        ggml_reshape_3d(ctx, inp_emb, w.n_embd, 1, T), w.n_hc);
+    ggml_tensor * xn_next = nullptr;
+    std::vector<ggml_tensor *> position_inputs;
+    std::vector<ggml_tensor *> mask_inputs;
+    std::vector<int64_t> kv_view_lens((size_t) n_slots, 0);
+
+    for (int il = 0; il < w.n_layer; ++il) {
+        const Qwen4ExpLayer & L = w.layers[il];
+        if (L.is_ple && has_ple) {
+            // PLE table projection weights are read once for the whole row batch;
+            // only the stateful convolution windows branch per sequence.
+            ggml_tensor * key = mm(ctx, L.ple_key, ple_in);
+            ggml_tensor * value = mm(ctx, L.ple_value, ple_in);
+            trace_mark(key, "ple.projkey");
+            trace_mark(value, "ple.projvalue");
+            ggml_tensor * rows = nullptr;
+            for (int s = 0; s < n_slots; ++s) {
+                ggml_tensor * hidden = ggml_view_3d(ctx, res_hc, w.n_embd, w.n_hc, 1,
+                    res_hc->nb[1], res_hc->nb[2], (size_t) s * res_hc->nb[2]);
+                ggml_tensor * row = build_ple_row(ctx, gf, hidden,
+                    column(ctx, key, s), column(ctx, value, s), L, w,
+                    caches[s]->ple_conv_state[(size_t) ple_idx[il]], trace_mark);
+                rows = rows ? ggml_concat(ctx, rows, row, 2) : row;
+            }
+            char trace_label[24];
+            std::snprintf(trace_label, sizeof(trace_label), "L%02d.ple", il);
+            trace_mark(rows, trace_label);
+            res_hc = rows;
+            xn_next = nullptr;
+        }
+
+        ggml_tensor * inject = nullptr;
+        ggml_tensor * cur = hc_fused
+            ? hc_mix_from_xn(ctx, xn_next ? xn_next : [&]() {
+                ggml_tensor * xn = ggml_rms_norm(ctx, res_hc, w.rms_eps);
+                xn = ggml_reshape_2d(ctx, xn, w.n_embd * w.n_hc, T);
+                    xn = ggml_mul(ctx, xn, L.hc_attn_norm);
+                    return ggml_reshape_3d(ctx, xn, w.n_embd, w.n_hc, T);
+                }(), L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject,
+                &inject, w.n_embd, w.n_hc)
+            : hc_mix(ctx, res_hc, L.hc_attn_norm, L.hc_attn_down,
+                L.hc_attn_up, L.hc_attn_inject, &inject,
+                w.n_embd, w.n_hc, w.rms_eps);
+        xn_next = nullptr;
+        char trace_label[24]; std::snprintf(trace_label, sizeof(trace_label), "L%02d.hcmix", il);
+        trace_mark(cur, trace_label);
+
+        if (L.is_full_attention) {
+            const int fi = full_idx[il];
+            ggml_tensor * qfull = mm(ctx, L.wq, cur);
+            ggml_tensor * kraw = mm(ctx, L.wk, cur);
+            ggml_tensor * vraw = mm(ctx, L.wv, cur);
+            ggml_tensor * attn_rows = nullptr;
+            for (int s = 0; s < n_slots; ++s) {
+                ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+                ggml_set_input(pos);
+                position_inputs.push_back(pos);
+                const int64_t kv_len = (int64_t) positions[s] + 1;
+                const int64_t kv_view_len = stable_graph
+                    ? std::min<int64_t>(caches[s]->max_ctx, ((kv_len + 511) / 256) * 256)
+                    : (fa_pad256 ? (kv_len + 255) / 256 * 256 : kv_len);
+                kv_view_lens[(size_t) s] = kv_view_len;
+                ggml_tensor * mask = nullptr;
+                if (stable_graph || fa_pad256) {
+                    mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_view_len, 1);
+                    ggml_set_input(mask);
+                    mask_inputs.push_back(mask);
+                }
+                // The host fills one independent M-RoPE position vector per row.
+                ggml_tensor * attn = build_full_attn_projected(ctx, gf,
+                    column(ctx, qfull, s), column(ctx, kraw, s), column(ctx, vraw, s),
+                    pos, mask, L, w, caches[s]->attn_k[(size_t) fi],
+                    caches[s]->attn_v[(size_t) fi], positions[s], kv_view_len);
+                attn_rows = attn_rows ? ggml_concat(ctx, attn_rows, attn, 1) : attn;
+            }
+            cur = mm(ctx, L.wo, attn_rows);
+        } else {
+            // Dense input projections are batched; each recurrent/conv op sees
+            // exactly one row and its own slot state.
+            const int li = lin_idx[il];
+            ggml_tensor * qkv = mm(ctx, L.attn_qkv, cur);
+            ggml_tensor * z = mm(ctx, L.attn_gate, cur);
+            ggml_tensor * beta = mm(ctx, L.ssm_beta, cur);
+            ggml_tensor * alpha = mm(ctx, L.ssm_alpha, cur);
+            ggml_tensor * rows = nullptr;
+            for (int s = 0; s < n_slots; ++s) {
+                ggml_tensor * row = build_linear_attn_projected(ctx, gf,
+                    column(ctx, qkv, s), column(ctx, z, s), column(ctx, beta, s),
+                    column(ctx, alpha, s), L, w,
+                    caches[s]->ssm_state[(size_t) li], caches[s]->conv_state[(size_t) li]);
+                rows = rows ? ggml_concat(ctx, rows, row, 1) : row;
+            }
+            cur = mm(ctx, L.ssm_out, rows);
+        }
+        std::snprintf(trace_label, sizeof(trace_label), "L%02d.att", il);
+        trace_mark(cur, trace_label);
+        ggml_tensor * ffn_fused = nullptr;
+        if (hc_fused) {
+            ffn_fused = hc_combine_norm(ctx, inject, res_hc, cur,
+                L.hc_ffn_norm, w.n_embd, w.n_hc, T, w.rms_eps);
+            res_hc = hc_norm_res(ctx, ffn_fused, w.n_embd, w.n_hc, T);
+            ggml_tensor * ffn_xn = hc_norm_xn(ctx, ffn_fused, w.n_embd, w.n_hc, T);
+            std::snprintf(trace_label, sizeof(trace_label), "L%02d.ffnxn", il);
+            trace_mark(ffn_xn, trace_label);
+            cur = hc_mix_from_xn(ctx, ffn_xn,
+                L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, &inject, w.n_embd, w.n_hc);
+        } else {
+            res_hc = hc_combine(ctx, res_hc, cur, inject, w.n_embd, w.n_hc, T);
+            cur = hc_mix(ctx, res_hc, L.hc_ffn_norm, L.hc_ffn_down,
+                L.hc_ffn_up, L.hc_ffn_inject, &inject, w.n_embd, w.n_hc, w.rms_eps);
+        }
+        std::snprintf(trace_label, sizeof(trace_label), "L%02d.fmix", il);
+        trace_mark(cur, trace_label);
+        cur = build_moe(ctx, cur, L, w, il, trace_mark);
+        std::snprintf(trace_label, sizeof(trace_label), "L%02d.moe", il);
+        trace_mark(cur, trace_label);
+        const bool next_ple = (il + 1 < w.n_layer) && w.layers[il + 1].is_ple && has_ple;
+        if (next_ple) {
+            // Match the single-sequence graph's PLE boundary: do not fold the
+            // next layer's grouped norm into a residual that PLE will change.
+            res_hc = hc_combine(ctx, res_hc, cur, inject, w.n_embd, w.n_hc, T);
+            xn_next = nullptr;
+        } else if (hc_fused) {
+            ggml_tensor * gamma = (il + 1 < w.n_layer)
+                ? w.layers[il + 1].hc_attn_norm : w.output_hc_norm;
+            ggml_tensor * f = hc_combine_norm(ctx, inject, res_hc, cur,
+                gamma, w.n_embd, w.n_hc, T, w.rms_eps);
+            res_hc = hc_norm_res(ctx, f, w.n_embd, w.n_hc, T);
+            xn_next = hc_norm_xn(ctx, f, w.n_embd, w.n_hc, T);
+        } else {
+            res_hc = hc_combine(ctx, res_hc, cur, inject, w.n_embd, w.n_hc, T);
+            xn_next = nullptr;
+        }
+        std::snprintf(trace_label, sizeof(trace_label), "L%02d.res", il);
+        trace_mark(res_hc, trace_label);
+    }
+
+    ggml_tensor * final = xn_next
+        ? hc_mix_from_xn(ctx, xn_next, w.output_hc_down, w.output_hc_up,
+                         nullptr, nullptr, w.n_embd, w.n_hc)
+        : hc_mix(ctx, res_hc, w.output_hc_norm, w.output_hc_down,
+                 w.output_hc_up, nullptr, nullptr, w.n_embd, w.n_hc, w.rms_eps);
+    ggml_tensor * logits = ggml_mul_mat(ctx, w.output, final);
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+
+    if (!workspace.alloc)
+        workspace.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!workspace.alloc || !ggml_gallocr_reserve(workspace.alloc, gf) ||
+        !ggml_gallocr_alloc_graph(workspace.alloc, gf)) {
+        workspace.planned = false;
+        std::fprintf(stderr, "[qwen4exp] batched graph allocation failed (N=%d)\n", n_slots);
+        return result;
+    }
+    workspace.planned = true;
+
+    ggml_backend_tensor_set(inp_emb, emb.data(), 0, emb.size() * sizeof(float));
+    if (ple_in) ggml_backend_tensor_set(ple_in, ple_data.data(), 0, ple_data.size() * sizeof(float));
+    for (size_t i = 0; i < position_inputs.size(); ++i) {
+        const int s = (int) (i % (size_t) n_slots);
+        const int32_t p[4] = { positions[s], positions[s], positions[s], 0 };
+        ggml_backend_tensor_set(position_inputs[i], p, 0, sizeof(p));
+    }
+    for (size_t s = 0; s < mask_inputs.size(); ++s) {
+        const int slot = (int) (s % (size_t) n_slots);
+        const int64_t kv_len = (int64_t) positions[slot] + 1;
+        std::vector<ggml_fp16_t> mask((size_t) kv_view_lens[(size_t) slot],
+            ggml_fp32_to_fp16(-INFINITY));
+        std::fill(mask.begin(), mask.begin() + kv_len, ggml_fp32_to_fp16(0.0f));
+        ggml_backend_tensor_set(mask_inputs[s], mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    }
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        workspace.planned = false;
+        std::fprintf(stderr, "[qwen4exp] batched graph compute failed\n");
+        return result;
+    }
+    std::vector<float> packed((size_t) w.n_vocab * n_slots);
+    ggml_backend_tensor_get(logits, packed.data(), 0, packed.size() * sizeof(float));
+    out_logits.resize((size_t) n_slots);
+    for (int s = 0; s < n_slots; ++s) {
+        out_logits[(size_t) s].assign(packed.begin() + (size_t) s * w.n_vocab,
+                                      packed.begin() + (size_t) (s + 1) * w.n_vocab);
+    }
+    if (layer_trace) write_layer_trace(backend, trace_tensors);
+    if (has_ple) {
+        for (int s = 0; s < n_slots; ++s) caches[s]->ple_prev = std::move(next_prev[s]);
+    }
+    result.ok = true;
+    result.n_tokens = n_slots;
+    result.pos0 = positions[0];
+    return result;
 }
 
 }  // namespace luce::common

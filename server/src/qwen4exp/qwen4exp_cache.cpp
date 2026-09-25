@@ -146,6 +146,12 @@ void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace) {
     workspace = {};
 }
 
+void clear_qwen4exp_batched_decode_workspace(Qwen4ExpBatchedDecodeWorkspace & workspace) {
+    if (workspace.alloc) ggml_gallocr_free(workspace.alloc);
+    if (workspace.ctx) ggml_free(workspace.ctx);
+    workspace = {};
+}
+
 void free_qwen4exp_cache(Qwen4ExpCache & c) {
     clear_qwen4exp_decode_workspace(c.decode_workspace);
     if (c.input_ring.buf) {
@@ -172,6 +178,9 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
 
 void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c) {
     (void) backend;
+    // A reset makes any stable T=1 graph's captured recurrent/KV state stale.
+    // Batched graphs are rebuilt each call and use a separate shared arena.
+    clear_qwen4exp_decode_workspace(c.decode_workspace);
     for (ggml_tensor * t : c.ssm_state) {
         if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
     }
