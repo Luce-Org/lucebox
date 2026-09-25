@@ -1,4 +1,7 @@
 #include "moe-fused.cuh"
+
+#include <cstdio>
+#include <thread>
 #include "ggml-cuda/vecdotq.cuh"
 #include "ggml-cuda/dequantize.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -513,6 +516,31 @@ static __global__ void host_mailbox_wait_kernel(
 }
 #endif // !defined(GGML_USE_HIP)
 
+// Whether a mailbox wait may hold a device queue. Without compute wave
+// save/restore (amdgpu cwsr_enable=0) a queue with resident waves can only be
+// removed once they finish, so a wave waiting for the host blocks every queue
+// eviction until the MES times out and resets the GPU. There the wait happens
+// on the host instead: synchronize the stream, then wait for the answer.
+static bool host_mailbox_device_wait() {
+    static const bool allowed = [] {
+#if defined(GGML_USE_HIP)
+        FILE * f = std::fopen("/sys/module/amdgpu/parameters/cwsr_enable", "r");
+        if (!f) return true;
+        int enabled = 1;
+        if (std::fscanf(f, "%d", &enabled) != 1) enabled = 1;
+        std::fclose(f);
+        if (!enabled) {
+            GGML_LOG_INFO("%s: amdgpu compute wave save/restore is off; host mailbox waits run on the host\n",
+                          __func__);
+        }
+        return enabled != 0;
+#else
+        return true;
+#endif
+    }();
+    return allowed;
+}
+
 template <typename T>
 static T host_mailbox_ptr(const ggml_tensor * t, int word) {
     T ptr = nullptr;
@@ -920,13 +948,18 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         } else {
             GGML_ASSERT(ggml_is_contiguous(dst));
 #if defined(GGML_USE_HIP)
-            // A stream wait, not a spinning kernel: the command processor
-            // holds the queue with no waves in flight, so the scheduler can
-            // still preempt or evict it (a long-running spin kernel made the
-            // MES fail to remove the queue and reset the GPU). The step is
-            // read at launch, which keeps these graphs eager.
+            // The step is read at launch, which keeps these graphs eager.
             const uint32_t s = *(const volatile uint32_t *) step;
-            CUDA_CHECK(hipStreamWaitValue32(ctx.stream(), flag, s, hipStreamWaitValueEq, 0xFFFFFFFFu));
+            if (host_mailbox_device_wait()) {
+                CUDA_CHECK(hipStreamWaitValue32(ctx.stream(), flag, s, hipStreamWaitValueEq, 0xFFFFFFFFu));
+            } else {
+                // The resolver answers once the device has run the post
+                // enqueued before this wait; only this thread waits, and the
+                // device keeps running what is already queued.
+                for (uint32_t spin = 0; __atomic_load_n(flag, __ATOMIC_ACQUIRE) != s; ++spin) {
+                    if (spin > 1024) std::this_thread::yield();
+                }
+            }
             host_mailbox_copy_kernel<<<1, 256, 0, ctx.stream()>>>(
                 payload, (uint32_t *) dst->data, (int64_t) (ggml_nbytes(dst) / sizeof(uint32_t)));
 #else
