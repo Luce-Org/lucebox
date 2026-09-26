@@ -313,7 +313,23 @@ static void concat_cuda_typed(ggml_backend_cuda_context & ctx, const ggml_tensor
         const T * src1_d = (const T *)src1->data;
         T * dst_d = (T *)dst->data;
 
-        if (dim != 3) {
+        // Contiguous operands whose dims above `dim` are all 1 concatenate as
+        // two copies. Besides being cheaper, this keeps a long dim-1 concat
+        // (a DS4 layer's raw rows plus every compressed row at a 128K context)
+        // off the kernel below, whose grid.y is ne1 (at most 65535).
+        const bool outer_ones = dim == 2 || (dim == 1 && dst->ne[2] == 1);
+        if (dim != 3 && outer_ones) {
+            const size_t size0 = ggml_nbytes(src0) / (size_t) dst->ne[3];
+            const size_t size1 = ggml_nbytes(src1) / (size_t) dst->ne[3];
+            for (int i3 = 0; i3 < dst->ne[3]; i3++) {
+                char * d = (char *) dst_d + i3 * dst->nb[3];
+                CUDA_CHECK(cudaMemcpyAsync(d, (const char *) src0_d + i3 * src0->nb[3], size0,
+                                           cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(d + size0, (const char *) src1_d + i3 * src1->nb[3], size1,
+                                           cudaMemcpyDeviceToDevice, stream));
+            }
+        } else if (dim != 3) {
+            GGML_ASSERT(dst->ne[1] <= 65535 && dst->ne[2] <= 65535);
             for (int i3 = 0; i3 < dst->ne[3]; i3++) {
                 concat_cuda(
                         src0_d + i3 * (src0->nb[3] / sizeof(T)),

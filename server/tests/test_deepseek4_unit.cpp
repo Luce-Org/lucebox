@@ -1984,6 +1984,43 @@ static void test_long_row_top_k(ggml_backend_t backend, const char * name) {
     std::fprintf(stderr, " %d rows match %s\n", checked, g_failures ? "done" : "ok");
 }
 
+// ggml_concat on the device past 65,535 rows along dim 1: a DS4 attention
+// step at a 128K context joins its raw rows with every compressed row.
+static void test_long_concat(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_long_concat (%s) ...", name);
+    struct Case { int ne0, rows0, rows1; ggml_type type; };
+    const Case cases[] = {{512, 1152, 70000, GGML_TYPE_F32}, {128, 3, 131071, GGML_TYPE_F16}};
+    for (const Case & cs : cases) {
+        ggml_init_params params{};
+        params.mem_size = 8 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false);
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, cs.type, cs.ne0, cs.rows0);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, cs.type, cs.ne0, cs.rows1);
+        ggml_set_input(a);
+        ggml_set_input(b);
+        ggml_tensor * c = ggml_concat(ctx, a, b, 1);
+        ggml_set_output(c);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8, false);
+        ggml_build_forward_expand(gf, c);
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        TEST_ASSERT(ggml_gallocr_alloc_graph(alloc, gf));
+        std::vector<uint8_t> va(ggml_nbytes(a)), vb(ggml_nbytes(b)), got(ggml_nbytes(c));
+        for (size_t i = 0; i < va.size(); ++i) va[i] = (uint8_t) (i * 7 + 1);
+        for (size_t i = 0; i < vb.size(); ++i) vb[i] = (uint8_t) (i * 13 + 5);
+        ggml_backend_tensor_set(a, va.data(), 0, va.size());
+        ggml_backend_tensor_set(b, vb.data(), 0, vb.size());
+        TEST_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(c, got.data(), 0, got.size());
+        TEST_ASSERT_MSG(std::memcmp(got.data(), va.data(), va.size()) == 0 &&
+                        std::memcmp(got.data() + va.size(), vb.data(), vb.size()) == 0,
+                        "long concat differs");
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+    }
+    std::fprintf(stderr, " %s\n", g_failures ? "done" : "ok");
+}
+
 static void test_hash_routing_lookup() {
     std::fprintf(stderr, "  test_hash_routing_lookup ...");
 
@@ -8466,6 +8503,7 @@ int main(int argc, char ** argv) {
             test_engram_apply_released_weights(gpu, "gpu");
             test_v41_indexer_topk(gpu, "gpu");
             test_long_row_top_k(gpu, "gpu");
+            test_long_concat(gpu, "gpu");
             ggml_backend_free(gpu);
         } else {
             std::fprintf(stderr, "  test_dspark_compressor_rollback GPU skipped (no device)\n");
