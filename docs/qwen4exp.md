@@ -105,10 +105,50 @@ change backend execution.
 - **Kernel differentials:** `server/test/` (mmb-vs-cuBLAS, DS4 mmid regression,
   forward smoke).
 
+## Concurrent serving (opt-in, experimental)
+
+Up to four concurrent decode slots are supported at `--max-ctx 32768` by a
+full-cache sequence engine (no paged attention). It is **default-off** and must
+be requested explicitly, e.g.
+
+```
+LUCE_QWEN4EXP_SEQ_ENGINE=1 QWEN4EXP_BATCHED_DECODE=1 \
+    luce_server MODEL --max-ctx 32768 --max-concurrency 4 --chunk 16384
+```
+
+- **Envelope:** `--max-concurrency 2..4`, `--max-ctx 32768` exactly, one local
+  target device, no `--kv-pool-tokens`, no layer split / tensor parallel. Outside
+  it the feature gate keeps the normal "--paged-attention required" rejection.
+- **Design:** one full F16 `Qwen4ExpCache` per slot (~929 MiB each at 32k), one
+  shared batched-decode workspace, one FIFO prefill owner (512-token slices).
+  `qwen4exp_forward_batched()` runs the shared embedding/projection/MoE/HC ops as
+  one row batch and the per-slot attention/GDN/PLE against each slot's own cache.
+- **Verified behavior:** four simultaneous distinct requests are correct with no
+  cross-talk; the quality suite (HE/GSM/Math/recall) is unchanged; a fifth request
+  defers cleanly; an over-context request is a per-request `400`; a mid-stream
+  client disconnect does not disturb other slots. The SeqEngine contract and a
+  randomized admit/retire soak pass at N=2/4, and peak GTT (~75 GiB) returns to
+  idle with no leak. Evidence: `performance/qwen4exp-concurrency-{p1,p2,p3}/`.
+- **Goodput — not a throughput multiplier:** the model is MoE (512 experts,
+  top-10), so each concurrent row streams *different* experts and the expert
+  weight traffic scales with N. Measured aggregate decode is ~**1.08x** at N=4
+  (per-request decode 27.9 -> 7.5 t/s). Concurrency serves multiple users at once;
+  it does not increase total throughput.
+- **Numerics:** batched (T=4) and single-stream (T=1) greedy output can differ at
+  near ties (measured epsilon up to ~2; flips occur where the solo top-2 margin is
+  small). This is the well-documented batch-size floating-point non-associativity
+  (see arXiv 2506.09501), amplified here by MoE routing: near-tie expert flips
+  cascade and expert sets first diverge around layer 12. A tunable component comes
+  from the batch-dependent dense dispatch (T=1 MMVQ vs T=4 MMQ); forcing MMVQ at
+  T=4 lowers epsilon but does not restore exact greedy parity. Keep concurrent
+  serving opt-in where single-stream reproducibility is required. Evidence:
+  `performance/qwen4exp-concurrency-numerics/`.
+
 ## Not included
 
-Speculative decoding (the model's MTP head) and QSA decode attention are planned
-follow-ups; decode is currently dense autoregressive.
+Concurrent serving is opt-in (above), and speculative decoding (the model's MTP
+head) and QSA decode attention are planned follow-ups; default decode is dense
+autoregressive and single-stream.
 
 Run the differential harness on the GPU box with
 `python3 server/scripts/qwen4exp_upstream_diff.py --model MODEL --seq 16 --reference --output-dir /tmp/qwen-reference`.
