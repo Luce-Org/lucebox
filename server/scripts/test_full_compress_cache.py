@@ -14,7 +14,7 @@ Correctness: all three replies must be identical.
 Skipped automatically if any prerequisite is missing:
   - target GGUF
   - draft (drafter) safetensors dir or GGUF
-  - Qwen3-0.6B-BF16 drafter GGUF
+  - Qwen3.5-0.8B-BF16 drafter GGUF
   - test_dflash binary
 """
 import os
@@ -33,7 +33,7 @@ from pathlib import Path
 ROOT          = Path(__file__).resolve().parent.parent.parent
 TARGET        = Path.home() / "models/qwen3.6-27b/Qwen3.6-27B-UD-Q4_K_XL.gguf"
 DRAFT         = Path.home() / "models/qwen3.6-27b-dflash"
-DRAFTER_GGUF  = Path.home() / "models/Qwen3-0.6B-BF16.gguf"
+DRAFTER_GGUF  = Path.home() / "models/Qwen3.5-0.8B-BF16.gguf"
 SERVER_BIN    = ROOT / "server/build/luce_server"
 
 for p, label in [

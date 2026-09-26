@@ -23,9 +23,9 @@ GPT-2 byte-level pre-tokenizer), so detok-then-retok preserves info.
 Usage:
     python3 laguna_pflash_niah.py \\
         --target /path/to/laguna-xs2-Q4_K_M.gguf \\
-        --drafter /path/to/Qwen3-0.6B-BF16.gguf \\
+        --drafter /path/to/Qwen3.5-0.8B-BF16.gguf \\
         --laguna-tok /path/to/Laguna-XS.2 \\
-        --drafter-tok /path/to/Qwen3-0.6B \\
+        --drafter-tok /path/to/Qwen3.5-0.8B \\
         --pflash-bin /path/to/pflash_daemon \\
         --laguna-bin /path/to/test_laguna_daemon \\
         --ctx 16384 --depth 0.5 --keep 0.10
@@ -308,9 +308,9 @@ class LagunaDaemon:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True, type=Path, help="Laguna GGUF")
-    ap.add_argument("--drafter", required=True, type=Path, help="Qwen3-0.6B drafter GGUF")
+    ap.add_argument("--drafter", required=True, type=Path, help="Qwen3.5-0.8B drafter GGUF")
     ap.add_argument("--laguna-tok", required=True, type=Path, help="Laguna HF dir with tokenizer.json")
-    ap.add_argument("--drafter-tok", required=True, type=Path, help="Qwen3 HF dir with tokenizer.json")
+    ap.add_argument("--drafter-tok", required=True, type=Path, help="Qwen3.5 HF dir with tokenizer.json")
     ap.add_argument("--pflash-bin", required=True, type=Path)
     ap.add_argument("--laguna-bin", required=True, type=Path)
     ap.add_argument("--ctx", type=int, default=16384)

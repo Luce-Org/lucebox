@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace luce::qwen3 {
+namespace luce::pflash {
 
 struct AnchorScanCfg {
     int chunk_size;
@@ -39,4 +39,4 @@ void scan_and_force_transitive(
     std::vector<uint8_t>& forced
 );
 
-} // namespace luce::qwen3
+} // namespace luce::pflash

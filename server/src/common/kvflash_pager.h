@@ -700,7 +700,7 @@ inline bool kvflash_policy_is_qk() {
     return env && std::strcmp(env, "qk") == 0;
 }
 
-// Locate the Qwen3-0.6B residency drafter: the explicit override
+// Locate the Qwen3.5-0.8B residency drafter: the explicit override
 // (LUCE_KVFLASH_DRAFTER, set from --prefill-drafter), then the
 // well-known locations next to the target model, then the appliance path.
 // Returns "" when nothing is readable (callers fall back to LRU, loudly).
@@ -712,10 +712,10 @@ inline std::string kvflash_find_drafter(const char * target_path) {
     const size_t slash = dir.find_last_of('/');
     dir = (slash == std::string::npos) ? "." : dir.substr(0, slash);
     const std::string candidates[] = {
-        dir + "/Qwen3-0.6B-BF16.gguf",
-        dir + "/drafter/Qwen3-0.6B-BF16.gguf",
-        dir + "/draft/Qwen3-0.6B-BF16.gguf",
-        "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf",
+        dir + "/Qwen3.5-0.8B-BF16.gguf",
+        dir + "/drafter/Qwen3.5-0.8B-BF16.gguf",
+        dir + "/draft/Qwen3.5-0.8B-BF16.gguf",
+        "/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf",
     };
     for (const std::string & c : candidates) {
         if (std::FILE * f = std::fopen(c.c_str(), "rb")) {

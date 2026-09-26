@@ -1,4 +1,4 @@
-// Smoke test for the custom Qwen3-0.6B drafter forward path.
+// Smoke test for the Qwen3.5-0.8B PFlash drafter forward path.
 //
 // Loads the BF16 GGUF, generates a synthetic token sequence at the requested
 // length, runs drafter_score_and_compress end-to-end, and prints timing +
@@ -8,12 +8,13 @@
 // Usage:
 //   smoke_qwen3_forward <gguf_path> <seq_len_or_FILE:path> [keep_ratio]
 // Examples:
-//   smoke_qwen3_forward .../Qwen3-0.6B-BF16.gguf 140000 0.02
-//   smoke_qwen3_forward .../Qwen3-0.6B-BF16.gguf FILE:/tmp/niah_32k.bin 0.05
+//   smoke_qwen3_forward .../Qwen3.5-0.8B-BF16.gguf 140000 0.02
+//   smoke_qwen3_forward .../Qwen3.5-0.8B-BF16.gguf FILE:/tmp/niah_32k.bin 0.05
 //
 // Token file format: little-endian u32 count, then count int32 token IDs.
 
-#include "qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
+#include "pflash/qwen35_drafter.h"
 #include "luce.h"
 
 #include <chrono>
@@ -71,7 +72,7 @@ int main(int argc, char ** argv) {
     auto t_load1 = std::chrono::steady_clock::now();
     std::printf("[smoke] load_drafter %.2fs vocab=%d\n",
         std::chrono::duration<double>(t_load1 - t_load0).count(),
-        ctx.weights.n_vocab);
+        ctx.state->weights.n_vocab);
 
     std::vector<int32_t> ids;
     if (from_file) {
@@ -79,7 +80,7 @@ int main(int argc, char ** argv) {
     } else {
         ids.resize((size_t)S);
         std::mt19937 rng(42);
-        std::uniform_int_distribution<int> dist(0, ctx.weights.n_vocab - 1);
+        std::uniform_int_distribution<int> dist(0, ctx.state->weights.n_vocab - 1);
         for (int i = 0; i < S; ++i) ids[i] = dist(rng);
     }
 
@@ -90,7 +91,8 @@ int main(int argc, char ** argv) {
     auto t0 = std::chrono::steady_clock::now();
     std::vector<int32_t> out = drafter_score_and_compress(
         ctx, ids, keep_ratio,
-        /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13);
+        /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13,
+        /*score_query_end=*/(int)ids.size());
     auto t1 = std::chrono::steady_clock::now();
 
     if (out.empty()) {
