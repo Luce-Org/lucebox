@@ -4626,6 +4626,7 @@ void ggml_backend_cuda_reset_fattn_launch_counts() { g_fattn_qsa_launches = 0; g
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+#if defined(GGML_USE_HIP)
     if (ggml_cuda_flash_attn_ext_qsa_decode_supported(ctx, dst)) {
         ++g_fattn_qsa_launches;
         ggml_cuda_flash_attn_ext_qsa_decode(ctx, dst);
@@ -4636,6 +4637,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_cuda_flash_attn_ext_qsa(ctx, dst);
         return;
     }
+#endif // defined(GGML_USE_HIP)
     ++g_fattn_dense_launches;
     if (ggml_flash_attn_ext_is_ds4(dst)) {
 #if defined(GGML_USE_HIP)

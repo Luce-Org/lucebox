@@ -11,6 +11,8 @@
 
 int ggml_cuda_mmb_probe_tile = 0;
 
+#if defined(__gfx1151__)
+
 namespace {
 
 typedef short v16s __attribute__((ext_vector_type(16)));
@@ -536,6 +538,7 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
 __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo) {
     hi = __builtin_bit_cast(uint16_t, (_Float16) x); lo = __builtin_bit_cast(uint16_t, (_Float16) (x - (float) __builtin_bit_cast(_Float16, hi)));
 }
+#if defined(__gfx1151__)
 template <int BM, int BN, int WTM, int WTN, bool TWO, bool X16 = false>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_f32split_kernel(const float * __restrict__ W, const void * __restrict__ Xv, float * __restrict__ D, const int M, const int K, const int T) {
@@ -608,6 +611,7 @@ mmb_f32split_kernel(const float * __restrict__ W, const void * __restrict__ Xv, 
 #pragma unroll
             for (int e = 0; e < 8; ++e) { const int t = t0 + wn * WTN + j * 16 + 2 * e + cn; if (t < T) D[(size_t) t * M + m] = acc[i][j][e]; } }
 }
+#endif
 
 // two tile classes: experts with >= thresh rows get BN_BIG-row tiles, the rest BN_SMALL-row tiles (fewer wasted rows on tiny experts)
 __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t * __restrict__ desc_big, uint32_t * __restrict__ desc_small,
@@ -740,7 +744,7 @@ bool mmb_enabled() {
     }();
     if (!requested) return false;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    return GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
+    return GGML_CUDA_CC_IS_RDNA3_5(cc);
 }
 int  mmb_min_t()   { return 512; }
 int  mmb_f32split_mode(){ return 2; }
@@ -848,6 +852,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     cudaStream_t stream = ctx.stream();
     const int K = (int) src0->ne[0], M = (int) src0->ne[1];
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
+#if defined(__gfx1151__)
     if (src0->type == GGML_TYPE_F32) {
         dim3 grid((M + 127) / 128, (T + 127) / 128);
         static const bool two = true;
@@ -863,6 +868,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         }
         CUDA_CHECK(cudaGetLastError()); return;
     }
+#endif
     // A bf16-only tensor already lives in the mmb cache as bf16; reading it as f32 would reinterpret bytes.
     const uint16_t * xhp = ggml_cuda_mmb_bf16_src(src1);
     if (!xhp) xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
@@ -1131,3 +1137,34 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
     CUDA_CHECK(cudaGetLastError());
     g_mmb_shadow_bytes += bytes;
 }
+
+#else
+
+// MMB's WMMA kernels use gfx1151-only BF16/F16 intrinsics. Keep the API
+// available to the shared HIP dispatcher, but route other targets to ggml's
+// generic MMQ/cuBLAS implementations.
+bool ggml_cuda_mmb_supported_mm(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
+bool ggml_cuda_mmb_supported_mmid(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
+void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {}
+void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {}
+void ggml_cuda_mmb_begin_graph() {}
+uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context &, const ggml_tensor *, size_t) { return nullptr; }
+const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor *) { return nullptr; }
+const uint16_t * ggml_cuda_mmb_bf16_src(const ggml_tensor *) { return nullptr; }
+const void * ggml_cuda_mmb_shadow_ptr(const ggml_tensor *) { return nullptr; }
+uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context &, int, const ggml_tensor *, size_t) { return nullptr; }
+void ggml_cuda_mmb_marks_clear() {}
+size_t ggml_cuda_mmb_marks_count() { return 0; }
+void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor *) {}
+bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor *) { return false; }
+bool ggml_cuda_mmb_gatemix() { return false; }
+bool ggml_cuda_mmb_down16() { return false; }
+bool ggml_cuda_mmb_res16() { return false; }
+bool ggml_cuda_mmb_blk16() { return false; }
+bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, int, float, float) { return false; }
+bool ggml_cuda_mmb_supported_glu(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
+void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {}
+void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context &, const ggml_tensor *) {}
+void ggml_cuda_mmb_release_all() {}
+
+#endif // defined(__gfx1151__)
