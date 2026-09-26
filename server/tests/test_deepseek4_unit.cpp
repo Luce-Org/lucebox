@@ -1929,6 +1929,61 @@ static void test_v41_indexer_topk(ggml_backend_t backend, const char * name) {
                  g_failures ? "done" : "ok");
 }
 
+// ggml_top_k on the device for the long rows of a long-context indexer
+// (k = 512 past 32K columns) and for candidate blocks (k = 2048): the same
+// set as a full sort, for widths that leave partial tiles and several merge
+// levels. Scores are a shuffled ramp, so there are no ties.
+static void test_long_row_top_k(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_long_row_top_k (%s) ...", name);
+    struct Case { int ncols, nrows, k; };
+    const Case cases[] = {{32769, 3, 512}, {70001, 2, 512}, {300000, 1, 512}, {16385, 3, 2048}, {4097, 2, 2048}};
+    TestLcg rng(512u);
+    int checked = 0;
+    for (const Case & cs : cases) {
+        std::vector<float> x((size_t) cs.ncols * cs.nrows);
+        for (int r = 0; r < cs.nrows; ++r) {
+            float * row = x.data() + (size_t) r * cs.ncols;
+            for (int c = 0; c < cs.ncols; ++c) row[c] = (float) c / (float) cs.ncols - 0.5f;
+            for (int c = cs.ncols - 1; c > 0; --c) {
+                const int o = (int) ((rng.next() + 1.0f) * 0.5f * (float) (c + 1)) % (c + 1);
+                std::swap(row[c], row[o]);
+            }
+        }
+        ggml_init_params params{};
+        params.mem_size = 8 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false);
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * x_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cs.ncols, cs.nrows);
+        ggml_set_input(x_t);
+        ggml_tensor * top = ggml_top_k(ctx, x_t, cs.k);
+        ggml_set_output(top);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8, false);
+        ggml_build_forward_expand(gf, top);
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        TEST_ASSERT(ggml_gallocr_alloc_graph(alloc, gf));
+        ggml_backend_tensor_set(x_t, x.data(), 0, x.size() * 4);
+        TEST_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        std::vector<int32_t> got((size_t) cs.k * cs.nrows);
+        ggml_backend_tensor_get(top, got.data(), 0, got.size() * 4);
+        for (int r = 0; r < cs.nrows; ++r) {
+            const float * row = x.data() + (size_t) r * cs.ncols;
+            std::vector<int> order((size_t) cs.ncols);
+            std::iota(order.begin(), order.end(), 0);
+            std::partial_sort(order.begin(), order.begin() + cs.k, order.end(),
+                              [&](int a, int b) { return row[a] > row[b]; });
+            std::vector<int> want(order.begin(), order.begin() + cs.k);
+            std::vector<int> mine(got.begin() + (ptrdiff_t) r * cs.k, got.begin() + (ptrdiff_t) (r + 1) * cs.k);
+            std::sort(want.begin(), want.end());
+            std::sort(mine.begin(), mine.end());
+            TEST_ASSERT_MSG(mine == want, "long-row top-k differs from a full sort");
+            ++checked;
+        }
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+    }
+    std::fprintf(stderr, " %d rows match %s\n", checked, g_failures ? "done" : "ok");
+}
+
 static void test_hash_routing_lookup() {
     std::fprintf(stderr, "  test_hash_routing_lookup ...");
 
@@ -8410,6 +8465,7 @@ int main(int argc, char ** argv) {
             test_engram_apply_synthetic(gpu, "gpu");
             test_engram_apply_released_weights(gpu, "gpu");
             test_v41_indexer_topk(gpu, "gpu");
+            test_long_row_top_k(gpu, "gpu");
             ggml_backend_free(gpu);
         } else {
             std::fprintf(stderr, "  test_dspark_compressor_rollback GPU skipped (no device)\n");

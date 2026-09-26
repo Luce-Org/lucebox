@@ -1474,6 +1474,98 @@ static void topk_hierarchical_block_radix_cuda(
     CUDA_CHECK(cudaGetLastError());
 }
 
+// One merge level of topk_tiled_block_radix_cuda: block (row, group) keeps
+// the best k of up to `per_group` consecutive k-lists of its row (at most
+// 4096 candidates) and writes one k-list. Padded indices (>= ncols) rank
+// below every real score, as in k_topk_block_radix_merge_f32_i32.
+static __global__ void k_topk_block_radix_merge_groups_f32_i32(
+        const float * x,
+        const int   * lists,
+        int         * out,
+        int           ncols,
+        int           nlists,
+        int           per_group,
+        int           k) {
+    constexpr int BLOCK_THREADS = 256;
+    constexpr int ITEMS_PER_THREAD = 16;
+    using block_sort = hipcub::BlockRadixSort<
+        uint32_t, BLOCK_THREADS, ITEMS_PER_THREAD, int>;
+    __shared__ typename block_sort::TempStorage storage;
+
+    const int ngroups = (nlists + per_group - 1) / per_group;
+    const int row = (int) blockIdx.x / ngroups;
+    const int group = (int) blockIdx.x - row * ngroups;
+    const int first_list = group * per_group;
+    const int ncandidates = min(per_group, nlists - first_list) * k;
+    const float * x_row = x + (size_t) row * ncols;
+    const int * candidate_row = lists + ((size_t) row * nlists + first_list) * k;
+    uint32_t keys[ITEMS_PER_THREAD];
+    int indices[ITEMS_PER_THREAD];
+#pragma unroll
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        const int rank = (int) threadIdx.x * ITEMS_PER_THREAD + item;
+        keys[item] = 0;
+        indices[item] = ncols;
+        if (rank < ncandidates) {
+            const int col = candidate_row[rank];
+            if (col < ncols) {
+                const uint32_t bits = (uint32_t) __float_as_int(x_row[col]);
+                const uint32_t ordered = (bits & 0x80000000u)
+                    ? ~bits : (bits ^ 0x80000000u);
+                keys[item] = ordered == 0 ? 1 : ordered;
+                indices[item] = col;
+            }
+        }
+    }
+
+    block_sort(storage).SortDescending(keys, indices);
+
+#pragma unroll
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        const int rank = (int) threadIdx.x * ITEMS_PER_THREAD + item;
+        if (rank < k) {
+            out[((size_t) row * ngroups + group) * k + rank] = indices[item];
+        }
+    }
+}
+
+// Top-k of rows of any width with a power-of-two k <= 2048 in bounded memory:
+// the best k of every 4096-column tile, then merge levels of up to 4096
+// candidates each until one k-list per row is left. The device-wide sort it
+// replaces for these shapes needs about 20 bytes of scratch per score (a
+// 64K-row indexer over a 1K-token prefill batch: 1.3 GB); this needs
+// 4 * k * ceil(ncols / 4096) bytes per row.
+static void topk_tiled_block_radix_cuda(
+        ggml_cuda_pool & pool,
+        const float  * x,
+        int          * dst,
+        int            ncols,
+        int            nrows,
+        int            k,
+        cudaStream_t   stream) {
+    constexpr int TILE_COLS = 4096;
+    constexpr int threads = 256;
+    GGML_ASSERT(k > 0 && k <= TILE_COLS / 2 && (k & (k - 1)) == 0);
+    int nlists = (ncols + TILE_COLS - 1) / TILE_COLS;
+    const int per_group = TILE_COLS / k;
+    ggml_cuda_pool_alloc<int> level_a(pool, (size_t) nrows * nlists * k);
+    ggml_cuda_pool_alloc<int> level_b(pool, (size_t) nrows * ((nlists + per_group - 1) / per_group) * k);
+    int * cur = nlists == 1 ? dst : level_a.get();
+    k_topk_block_radix_tiles_f32_i32<16><<<(unsigned) (nrows * nlists), threads, 0, stream>>>(
+        x, cur, ncols, nlists, k);
+    int * spare = level_b.get();
+    while (nlists > 1) {
+        const int ngroups = (nlists + per_group - 1) / per_group;
+        int * out = ngroups == 1 ? dst : spare;
+        k_topk_block_radix_merge_groups_f32_i32<<<(unsigned) (nrows * ngroups), threads, 0, stream>>>(
+            x, cur, out, ncols, nlists, per_group, k);
+        spare = cur;
+        cur = out;
+        nlists = ngroups;
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 #endif  // GGML_CUDA_USE_HIPCUB
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1517,6 +1609,17 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             topk_hierarchical_block_radix_cuda(
                 pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
         }
+        return;
+    }
+    // Rows past the 8-tile merge (the indexer beyond 32K compressed rows)
+    // and k = 2048 (candidate blocks): the tiled selection, unless the block
+    // radix top-k is explicitly off, instead of a device-wide sort whose
+    // scratch grows with every score.
+    const bool block_radix_off = block_radix_env &&
+        (block_radix_env[0] == '\0' || strcmp(block_radix_env, "0") == 0);
+    if (!block_radix_off && ncols > 4096 &&
+        ((k == 512 && ncols > 32768) || k == 2048)) {
+        topk_tiled_block_radix_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
         return;
     }
 #endif
