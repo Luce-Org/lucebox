@@ -26,8 +26,9 @@
 #include "common/concurrency/paged_kv_pool.h"
 #include "concurrency/qwen35_seq_engine.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
+#include "placement/skip_park_guard.h"
 #include "qwen35_vision.h"
-#include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
+#include "pflash/pflash_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
 #include "kvflash_pager.h"         // bounded KV residency pool
 #include "kvflash_scorer.h"        // chunk-relevance policy interface
 #include "kvflash_qk.h"            // target-QK scorer (pooled keys + query)
@@ -275,6 +276,15 @@ protected:
     void kvflash_ensure_scorer();
 
 private:
+    // One compression window (park → load drafter → score → restore) with
+    // the park step optional. compress_batch runs it through
+    // run_skip_park_window, which retries parked after an out-of-memory
+    // no-park attempt.
+    std::vector<CompressResult> run_compress_window(
+        const std::vector<CompressRequest> & requests,
+        const CompressRequest & load_request,
+        bool park_window);
+
     // ── GPU backends ─────────────────────────────────────────────────
     ggml_backend_t target_backend_ = nullptr;
     ggml_backend_t draft_backend_  = nullptr;
@@ -323,6 +333,9 @@ private:
     // ── Pflash drafter (lazy-loaded) ─────────────────────────────────
     DrafterContext drafter_ctx_;
     bool           drafter_loaded_ = false;
+    // Skip-park fail-safe: parks a few windows after an out-of-memory
+    // no-park window recovered with parking (placement/skip_park_guard.h).
+    luce::common::SkipParkFallback skip_park_fallback_;
 
     // ── Sampler state ────────────────────────────────────────────────
     SamplerCfg      sampler_;

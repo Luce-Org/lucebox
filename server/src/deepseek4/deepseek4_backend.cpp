@@ -17,6 +17,7 @@
 #include "common/peer_access.h"
 #include "common/platform_env.h"
 #include "common/sampler.h"
+#include "pflash/pflash_compress.h"
 
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 #include "common/gpu_runtime_compat.h"
@@ -3974,52 +3975,109 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
     }
     if (load_request == nullptr) return results;
 
+    const auto classify = [&requests, &valid_request](
+            const std::vector<CompressResult> & rs) {
+        auto outcome = SkipParkWindowOutcome::Ok;
+        for (size_t i = 0; i < requests.size(); ++i) {
+            if (!valid_request(requests[i])) continue;
+            if (i >= rs.size()) return SkipParkWindowOutcome::Failed;
+            if (rs[i].ok) continue;
+            if (rs[i].out_of_memory) return SkipParkWindowOutcome::OutOfMemory;
+            outcome = SkipParkWindowOutcome::Failed;
+        }
+        return outcome;
+    };
+    return run_skip_park_window(
+        load_request->skip_park, skip_park_fallback_,
+        [&](bool park_window) {
+            return run_compress_window(requests, *load_request, park_window);
+        },
+        classify, [this]() { release_pflash_drafter(); },
+        "[deepseek4-pflash]");
+}
+
+std::vector<ModelBackend::CompressResult> DeepSeek4Backend::run_compress_window(
+        const std::vector<CompressRequest> & requests,
+        const CompressRequest & load_request,
+        bool park_window) {
+    std::vector<CompressResult> results(requests.size());
+    const auto valid_request = [](const CompressRequest & request) {
+        return !request.input_ids.empty() && !request.drafter_path.empty() &&
+            std::isfinite(request.keep_ratio) &&
+            request.keep_ratio >= 0.0f && request.keep_ratio <= 1.0f;
+    };
+
     // Parking releases target/cache buffers, including the expert backend.
     // Drain their queued work before releasing any of those dependencies.
     if (backend_) ggml_backend_synchronize(backend_);
     if (spec_backend_) ggml_backend_synchronize(spec_backend_);
     if (expert_backend_) ggml_backend_synchronize(expert_backend_);
     const bool was_parked = parked_;
-    if (!load_request->skip_park && !parked_ &&
+    if (park_window && !parked_ &&
         !park(ParkTarget::TargetModel)) {
         return results;
     }
     if (pflash_drafter_loaded_ &&
-        (pflash_drafter_path_ != load_request->drafter_path ||
-         pflash_drafter_gpu_ != load_request->drafter_gpu)) {
+        (pflash_drafter_path_ != load_request.drafter_path ||
+         pflash_drafter_gpu_ != load_request.drafter_gpu)) {
         release_pflash_drafter();
     }
     if (!pflash_drafter_loaded_) {
-        if (!load_drafter(load_request->drafter_path, 999,
-                          load_request->drafter_gpu,
+        if (!load_drafter(load_request.drafter_path, 999,
+                          load_request.drafter_gpu,
                           pflash_drafter_ctx_)) {
             std::fprintf(stderr, "[deepseek4-pflash] load failed: %s\n",
                          luce_last_error());
+            const bool oom = luce::common::last_error_is_oom();
+            for (size_t index = 0; index < requests.size(); ++index) {
+                if (valid_request(requests[index])) results[index].out_of_memory = oom;
+            }
             release_pflash_drafter();
-            if (!load_request->skip_park && !was_parked) {
+            if (park_window && !was_parked) {
                 unpark(ParkTarget::TargetModel);
             }
             return results;
         }
         pflash_drafter_loaded_ = true;
-        pflash_drafter_path_ = load_request->drafter_path;
-        pflash_drafter_gpu_ = load_request->drafter_gpu;
+        pflash_drafter_path_ = load_request.drafter_path;
+        pflash_drafter_gpu_ = load_request.drafter_gpu;
     }
 
     for (size_t index = 0; index < requests.size(); ++index) {
         const CompressRequest & request = requests[index];
         if (!valid_request(request)) continue;
         CompressResult & result = results[index];
+        // score_query_end < 0 is the legacy "tail window" request value;
+        // the qwen35 scorer requires an explicit end.
+        const int score_query_end = request.score_query_end >= 0
+            ? request.score_query_end : (int)request.input_ids.size();
         result.compressed_ids = drafter_score_and_compress(
-            pflash_drafter_ctx_, request.input_ids, request.keep_ratio);
+            pflash_drafter_ctx_, request.input_ids, request.keep_ratio,
+            /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
+            score_query_end, request.required_instruction_spans,
+            request.query_suffix_candidates, request.history_query_spans,
+            request.turn_query_span);
         result.ok = !result.compressed_ids.empty();
+        result.out_of_memory = !result.ok && luce::common::last_error_is_oom();
+        if (result.ok) result.kept_spans = pflash_last_kept_spans();
+        if (result.ok) {
+            const auto & scoring = pflash_last_scoring_stats();
+            result.scorer_resume = scoring.resume;
+            result.scorer_new_tokens = scoring.new_tokens;
+            result.scorer_forward_s = scoring.forward_s;
+            for (const auto & candidate : pflash_last_candidate_lifts()) {
+                result.candidate_lifts.push_back({candidate.span, candidate.lift});
+            }
+        }
     }
 
-    if (load_request->residency_action ==
-        DraftResidencyAction::ReleaseAfterUse) {
+    // A recent out-of-memory window overrides KeepLoaded: VRAM is tight.
+    if (load_request.residency_action ==
+            DraftResidencyAction::ReleaseAfterUse ||
+        skip_park_fallback_.memory_tight()) {
         release_pflash_drafter();
     }
-    if (!load_request->skip_park && !was_parked &&
+    if (park_window && !was_parked &&
         !unpark(ParkTarget::TargetModel)) {
         std::fill(results.begin(), results.end(), CompressResult{});
     }

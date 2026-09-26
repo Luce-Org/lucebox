@@ -8,8 +8,8 @@
 //
 // Implementations:
 //   - (none)            pure LRU + recency, zero dependencies
-//   - KvFlashDrafterScorer   qwen3/qwen3_kvflash_scorer.h — pflash drafter tail
-//                       attention (shared with pflash compression)
+//   - KvFlashDrafterScorer   pflash/kvflash_drafter_scorer.h — pflash drafter
+//                       tail attention (shared with pflash compression)
 
 #pragma once
 

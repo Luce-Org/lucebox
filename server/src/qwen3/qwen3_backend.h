@@ -1,10 +1,10 @@
 // Qwen3Backend — ModelBackend for the Qwen3-0.6B model used as a standalone
-// inference backend (not just as a pflash drafter).
+// inference backend.
 //
 // Architecture: 28-layer transformer, 16 heads (8 KV), hidden=1024, vocab=151936.
 // Sliding-window attention (FA_WINDOW=512), standard RoPE.
 //
-// This backend reuses the Qwen3DrafterWeights loader but adds:
+// This backend reuses the Qwen3Weights loader but adds:
 //   - Persistent KV cache for incremental decode
 //   - Step-based forward (prefill chunks + single-token decode)
 //   - Logits output via out_norm + lm_head
@@ -13,8 +13,9 @@
 
 #include "common/model_backend.h"
 #include "placement/placement_config.h"
-#include "qwen3_drafter_model.h"
-#include "qwen3_drafter.h"
+#include "qwen3_model.h"
+#include "pflash/pflash_drafter.h"
+#include "placement/skip_park_guard.h"
 #include "common/sampler.h"
 
 #include "ggml.h"
@@ -48,7 +49,7 @@ struct Qwen3Cache {
     ggml_backend_buffer_t buf = nullptr;
 };
 
-bool  create_qwen3_cache(ggml_backend_t backend, const Qwen3DrafterWeights & w,
+bool  create_qwen3_cache(ggml_backend_t backend, const Qwen3Weights & w,
                           int max_ctx, Qwen3Cache & out);
 void  free_qwen3_cache(Qwen3Cache & c);
 
@@ -110,13 +111,16 @@ public:
 private:
     Qwen3BackendConfig    cfg_;
     ggml_backend_t        backend_ = nullptr;
-    Qwen3DrafterWeights   w_;
+    Qwen3Weights   w_;
     Qwen3Cache            cache_;
     bool                  parked_ = false;
 
     // Pflash drafter (lazy-loaded, reuses the same model for compress)
     DrafterContext         drafter_ctx_;
     bool                  drafter_loaded_ = false;
+    // Skip-park fail-safe: parks a few requests after an out-of-memory
+    // no-park compress recovered with parking (placement/skip_park_guard.h).
+    SkipParkFallback      skip_park_fallback_;
 
     // Sampler
     SamplerCfg            sampler_;

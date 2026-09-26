@@ -31,6 +31,12 @@ struct DraftResidencyContext {
     DraftResidencyUse use = DraftResidencyUse::PFlashCompress;
     bool low_vram_hint = false;
     bool has_decode_draft = false;
+    // True when the startup skip-park probe proved the target, decode draft
+    // and pflash drafter fit co-resident with margin. Under Auto it upgrades
+    // PFlashCompress to KeepLoaded — the drafter stays loaded between
+    // requests, removing its per-request reload. Ignored by other uses and
+    // by explicit Persistent/RequestScoped policies.
+    bool ample_vram = false;
 };
 
 inline const char * draft_residency_policy_name(DraftResidencyPolicy policy) {
@@ -71,8 +77,14 @@ inline DraftResidencyAction resolve_draft_residency_action(
 
     switch (ctx.use) {
     case DraftResidencyUse::PFlashCompress:
-        // Auto releases the pflash drafter after scoring: resident drafter starves target prefill on 24GB cards; lazy reload costs ~2s.
-        return DraftResidencyAction::ReleaseAfterUse;
+        // Auto releases the pflash drafter after scoring on constrained
+        // cards (resident drafter starves target prefill on 24GB; lazy
+        // reload costs ~2s). With proven ample VRAM the same startup probe
+        // that enabled skip-park also keeps the drafter resident — its
+        // footprint is already accounted and the reload is pure overhead.
+        return ctx.ample_vram
+            ? DraftResidencyAction::KeepLoaded
+            : DraftResidencyAction::ReleaseAfterUse;
     case DraftResidencyUse::DFlashDecode:
         // DFlash draft is latency-sensitive; keep it resident unless the
         // operator explicitly opted into the low-VRAM/request-scoped path.

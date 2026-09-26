@@ -983,7 +983,7 @@ park a target while it owns live sequence state.
 ./server/build-hip/luce_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
   --prefill-compression auto \
-  --prefill-drafter /path/to/Qwen3-0.6B-BF16.gguf \
+  --prefill-drafter /path/to/Qwen3.5-0.8B-BF16.gguf \
   --prefill-skip-park
 ```
 

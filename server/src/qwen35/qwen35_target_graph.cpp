@@ -310,7 +310,7 @@ bool create_target_cache_partial(const TargetWeights & w,
 
         out.base_buf = ggml_backend_alloc_ctx_tensors(out.base_ctx, backend);
         if (!out.base_buf) {
-            set_last_error("ggml_backend_alloc_ctx_tensors failed for base cache");
+            set_last_oom_error("ggml_backend_alloc_ctx_tensors failed for base cache");
             ggml_free(out.base_ctx);
             out.base_ctx = nullptr;
             return false;
@@ -388,7 +388,7 @@ bool create_target_cache_partial(const TargetWeights & w,
                     ? f32_total - q8_total : 0);
         }
         if (!out.rollback_buf) {
-            set_last_error("ggml_backend_alloc_ctx_tensors failed for rollback cache");
+            set_last_oom_error("ggml_backend_alloc_ctx_tensors failed for rollback cache");
             ggml_free(out.rollback_ctx);
             out.rollback_ctx = nullptr;
             return false;
@@ -721,7 +721,7 @@ bool migrate_prefill_cache(const TargetWeights & w,
             n_delta, max_verify_tokens, checkpoint_bytes);
     }
     if (!cache.rollback_buf) {
-        set_last_error("ggml_backend_alloc_ctx_tensors failed for rollback cache");
+        set_last_oom_error("ggml_backend_alloc_ctx_tensors failed for rollback cache");
         ggml_free(cache.rollback_ctx);
         cache.rollback_ctx = nullptr;
         return false;
@@ -1077,7 +1077,7 @@ bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend) {
 
     c.rollback_buf = ggml_backend_alloc_ctx_tensors(c.rollback_ctx, backend);
     if (!c.rollback_buf) {
-        set_last_error("ensure_ssm_snapshot alloc_ctx_tensors failed");
+        set_last_oom_error("ensure_ssm_snapshot alloc_ctx_tensors failed");
         // Null the snap pointers so a later snapshot/restore_ssm_state (which
         // iterates ssm_state.size()) skips them instead of dereferencing
         // tensors from the freed rollback_ctx.

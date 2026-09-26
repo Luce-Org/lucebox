@@ -34,6 +34,11 @@ struct MoeHybridStorage;
 // Single source of truth for error reporting.
 // All loaders / graph builders push into this via set_last_error(...).
 void set_last_error(std::string msg);
+// Same, for a failed device allocation (buffer, graph allocator, cache). The
+// PFlash skip-park fallback retries a window with parking only after this kind
+// of failure; any later set_last_error() clears the flag.
+void set_last_oom_error(std::string msg);
+bool last_error_is_oom();
 
 // ─── Target weights (Qwen3.5-27B, qwen35 hybrid, Q4_K_M in ggml context) ──
 //

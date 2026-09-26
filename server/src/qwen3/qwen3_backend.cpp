@@ -6,7 +6,8 @@
 // After all layers, out_norm + lm_head produces logits for the last token.
 
 #include "qwen3_backend.h"
-#include "qwen3_drafter.h"
+#include "internal.h"
+#include "pflash/pflash_drafter.h"
 #include "luce.h"
 #include "common/sampler.h"
 #include "common/io_utils.h"
@@ -25,7 +26,7 @@ namespace luce::common {
 
 // ── Cache management ───────────────────────────────────────────────────
 
-bool create_qwen3_cache(ggml_backend_t backend, const Qwen3DrafterWeights & w,
+bool create_qwen3_cache(ggml_backend_t backend, const Qwen3Weights & w,
                           int max_ctx, Qwen3Cache & out) {
     const int n_layer = w.n_layer;
     const int D       = w.head_dim;
@@ -91,7 +92,7 @@ bool Qwen3Backend::init() {
         return false;
     }
 
-    if (!load_qwen3_drafter_model(cfg_.model_path, backend_, w_)) {
+    if (!load_qwen3_model(cfg_.model_path, backend_, w_)) {
         std::fprintf(stderr, "[qwen3] model load failed: %s\n", luce_last_error());
         return false;
     }
@@ -145,8 +146,8 @@ bool Qwen3Backend::unpark(ParkTarget target) {
     if (target == ParkTarget::TargetModel || target == ParkTarget::All) {
         if (parked_) {
             // Reload weights
-            Qwen3DrafterWeights w_new;
-            if (!load_qwen3_drafter_model(cfg_.model_path, backend_, w_new)) {
+            Qwen3Weights w_new;
+            if (!load_qwen3_model(cfg_.model_path, backend_, w_new)) {
                 std::fprintf(stderr, "[qwen3] unpark reload failed\n");
                 return false;
             }
@@ -957,29 +958,59 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
     CompressResult result;
     if (req.input_ids.empty()) return result;
 
-    const bool was_parked = parked_;
-    if (!req.skip_park && !parked_) park(ParkTarget::TargetModel);
+    auto attempt = [&](bool park_window) {
+        CompressResult r;
+        const bool was_parked = parked_;
+        if (park_window && !parked_) park(ParkTarget::TargetModel);
 
-    if (!drafter_loaded_) {
-        if (!load_drafter(req.drafter_path, 999, req.drafter_gpu, drafter_ctx_)) {
-            std::fprintf(stderr, "[compress] load failed: %s\n", luce_last_error());
-            if (!req.skip_park && !was_parked) unpark(ParkTarget::TargetModel);
-            return result;
+        if (!drafter_loaded_) {
+            if (!load_drafter(req.drafter_path, 999, req.drafter_gpu,
+                              drafter_ctx_)) {
+                std::fprintf(stderr, "[compress] load failed: %s\n",
+                             luce_last_error());
+                r.out_of_memory = luce::common::last_error_is_oom();
+                if (park_window && !was_parked) unpark(ParkTarget::TargetModel);
+                return r;
+            }
+            drafter_loaded_ = true;
         }
-        drafter_loaded_ = true;
-    }
 
-    result.compressed_ids = drafter_score_and_compress(
-        drafter_ctx_, req.input_ids, req.keep_ratio,
-        /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
-        req.score_query_end);
-    result.ok = !result.compressed_ids.empty();
+        // score_query_end < 0 is the legacy "tail window" request value; the
+        // qwen35 scorer requires an explicit end.
+        const int score_query_end = req.score_query_end >= 0
+            ? req.score_query_end : (int)req.input_ids.size();
+        r = CompressResult::from_compressed_ids(drafter_score_and_compress(
+            drafter_ctx_, req.input_ids, req.keep_ratio,
+            /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
+            score_query_end, req.required_instruction_spans,
+            req.query_suffix_candidates, req.history_query_spans,
+            req.turn_query_span));
+        r.out_of_memory = !r.ok && luce::common::last_error_is_oom();
 
-    if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
-        free_drafter();
-    }
+        // A recent out-of-memory window overrides KeepLoaded: VRAM is tight.
+        if (req.residency_action == DraftResidencyAction::ReleaseAfterUse ||
+            skip_park_fallback_.memory_tight()) {
+            free_drafter();
+        }
 
-    if (!req.skip_park && !was_parked) unpark(ParkTarget::TargetModel);
+        if (park_window && !was_parked) unpark(ParkTarget::TargetModel);
+        return r;
+    };
+
+    const auto classify = [](const CompressResult & r) {
+        return r.ok ? SkipParkWindowOutcome::Ok
+             : r.out_of_memory ? SkipParkWindowOutcome::OutOfMemory
+             : SkipParkWindowOutcome::Failed;
+    };
+    result = run_skip_park_window(
+        req.skip_park, skip_park_fallback_, attempt, classify,
+        [this]() {
+            // Unconditional free: a failed load_drafter can leave a live
+            // backend in the ctx even though drafter_loaded_ is still false.
+            luce::common::free_drafter(drafter_ctx_);
+            drafter_loaded_ = false;
+        },
+        "[compress]");
     return result;
 }
 
@@ -1030,7 +1061,9 @@ bool Qwen3Backend::handle_compress(const std::string & line, const DaemonIO & io
     }
 
     const float keep = (float)keep_x1000 / 1000.0f;
-    auto compressed = drafter_score_and_compress(drafter_ctx_, src_ids, keep);
+    auto compressed = drafter_score_and_compress(drafter_ctx_, src_ids, keep,
+        /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13,
+        (int)src_ids.size());
     std::printf("[compress] %zu -> %zu tokens\n", src_ids.size(), compressed.size());
     std::fflush(stdout);
 
@@ -1038,7 +1071,7 @@ bool Qwen3Backend::handle_compress(const std::string & line, const DaemonIO & io
 
     for (int32_t t : compressed) io.emit(t);
     io.emit(-1);
-    return true;
+    return !compressed.empty();
 }
 
 void Qwen3Backend::free_drafter() {
@@ -1064,7 +1097,7 @@ void Qwen3Backend::shutdown() {
     }
     free_qwen3_cache(cache_);
     if (!parked_) {
-        free_qwen3_drafter_model(w_);
+        free_qwen3_model(w_);
     }
     if (backend_) {
         ggml_backend_free(backend_);

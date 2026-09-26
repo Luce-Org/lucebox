@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "placement/skip_park_guard.h"
+
 #include <cstdint>
 #include <string>
 
@@ -72,5 +74,22 @@ struct GgufMetadata {
 // in-memory hash still gets returned.
 GgufMetadata read_gguf_metadata(const std::string & path,
                                 bool compute_sha256);
+
+// Read the PFlash drafter dims the skip-park estimator needs from the drafter
+// GGUF header and derive its worst-case resident footprint. `weights_bytes` is
+// the file size (upper bound on device weights); `runtime_bytes_per_token` and
+// `fixed_bytes` mirror the buffers the Qwen3.5 scorer allocates in
+// pflash/qwen35_drafter.cpp: `scoring_sessions` kept sessions (see
+// pflash_scoring_sessions()) and a scorer query window of `query_tokens`.
+// KV cache bytes honor the same LUCE_KV_* env resolution as the runtime
+// cache, with TQ3 suppressed like the drafter's ScopedKvTq3Off.
+//
+// Returns false when the file can't be opened or is not a Qwen3.5 drafter —
+// callers must then treat the footprint as unknown (auto skip-park resolves
+// off).
+bool inspect_drafter_footprint(const std::string & path,
+                               int query_tokens,
+                               int scoring_sessions,
+                               SkipParkDrafterInfo & out);
 
 }  // namespace luce::common

@@ -6,7 +6,7 @@
 
 #include "gemma4_backend.h"
 #include "luce.h"
-#include "../qwen3/qwen3_kvflash_scorer.h"
+#include "pflash/kvflash_drafter_scorer.h"
 #include "common/sampler.h"
 #include "common/io_utils.h"
 #include "common/dflash_feature_ring.h"
@@ -190,7 +190,7 @@ void Gemma4Backend::kvflash_read_config() {
 }
 
 // Drafter rescore + repage (FlashMemory tau loop) with the cross-tokenizer
-// scorer: gemma ids are detokenized and re-scored through the Qwen3-0.6B
+// scorer: gemma ids are detokenized and re-scored through the Qwen3.5-0.8B
 // drafter. Lazy: the drafter + tokenizers load on the first reselect that
 // needs them, never on a request's first tokens.
 void Gemma4Backend::kvflash_maybe_reselect(int generated) {
@@ -257,7 +257,7 @@ bool Gemma4Backend::kvflash_attach() {
                 cache_.swa_size,
                 !kvflash_drafter_path_.empty()
                     ? "drafter/cross-tok (attaches on first reselect)"
-                    : "lru (recency-only: no Qwen3-0.6B drafter found)");
+                    : "lru (recency-only: no Qwen3.5-0.8B drafter found)");
     std::fflush(stdout);
     return true;
 }
@@ -1203,7 +1203,7 @@ bool Gemma4Backend::handle_compress(const std::string & line,
 
     const char * dpath = (n >= 3 && drafter_path[0])
         ? drafter_path
-        : "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+        : "/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf";
 
     // Park target to free VRAM for the drafter (unless skip_park).
     const bool was_parked = parked_;
@@ -1232,7 +1232,9 @@ bool Gemma4Backend::handle_compress(const std::string & line,
     bool ok = false;
     if (!tokens.empty()) {
         const float keep = (float)keep_x1000 / 1000.0f;
-        auto compressed = drafter_score_and_compress(drafter_ctx_, tokens, keep);
+        auto compressed = drafter_score_and_compress(drafter_ctx_, tokens, keep,
+            /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13,
+            (int)tokens.size());
         ok = !compressed.empty();
         if (ok) {
             std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",

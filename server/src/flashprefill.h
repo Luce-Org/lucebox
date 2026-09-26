@@ -1,5 +1,5 @@
 // Public C++ entry point for the FlashPrefill block-sparse attention used by
-// the in-process Qwen3-0.6B drafter (speculative prefill scoring).
+// the in-process Qwen3.5-0.8B drafter (speculative prefill scoring).
 //
 // Wraps kernels 1-4 + GPU block_select into one call. Call signature mirrors
 // the upstream `flash_prefill` from qhfan/FlashPrefill (arXiv:2603.06199).

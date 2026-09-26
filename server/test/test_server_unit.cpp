@@ -7,6 +7,7 @@
 // Run:   ./test_server_unit
 
 #include "CppUnitTestFramework.hpp"
+#include "scoped_env.h"
 
 #include "server/sse_emitter.h"
 #include "server/tool_parser.h"
@@ -45,13 +46,15 @@
 #include "qwen35moe/qwen35moe_ffn.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
-#include "qwen3_drafter.h"
-#include "qwen3_drafter_model.h"
+#include "pflash/pflash_drafter.h"
+#include "qwen3_model.h"
+#include "pflash/pflash_compress.h"
 #include "luce.h"
 #include "gguf.h"
 #include <nlohmann/json.hpp>
 
 #include <filesystem>
+#include <algorithm>
 #include <cmath>
 #include <cerrno>
 #include <cstdio>
@@ -72,6 +75,7 @@
 #include <sys/socket.h>
 #else
 #include <io.h>
+#include <process.h>
 #endif
 
 #if defined(_WIN32)
@@ -153,6 +157,18 @@ struct SchedulerTestHarness {
         return server.slot_tokens_.at(slot);
     }
 };
+
+struct HttpServerTestAccess {
+    static std::string apply_pflash_compression(
+            HttpServer & server, const ParsedRequest & req) {
+        HttpServer::PreparedPrompt prepared;
+        return server.apply_pflash_compression(req, prepared);
+    }
+    static HttpServer::PreparedPrompt prepare_prompt(
+            HttpServer & server, const ParsedRequest & req) {
+        return server.prepare_prompt(req);
+    }
+};
 }
 
 namespace {
@@ -201,26 +217,33 @@ TEST_CASE(ServerUnitFixture, test_pflash_scorer_uses_user_query_before_chat_suff
     };
     const std::vector<int32_t> rendered{
         1, 2, 100, 101, 102, 103, 104, 105, 106, 107,
-        200, 201, 100, 101, 102, 103, 104, 105, 106, 107,
+        200, 201, 202, 203, 204, 205, 206, 207,
     };
 
-    const auto window = http_detail::find_pflash_query_window(
-        rendered, query, /*search_end=*/12);
+    const auto window = http_detail::find_pflash_query_window(rendered, query);
 
     TEST_ASSERT(window.valid());
     TEST_ASSERT(window.tokens == 8);
     TEST_ASSERT(window.end == 10);
-    TEST_ASSERT((int)rendered.size() - window.end == 10);
+    TEST_ASSERT((int)rendered.size() - window.end == 8);
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_scorer_accepts_responses_string_input) {
-    ToolMemory tool_memory;
-    const auto messages = normalize_chat_messages(
-        json("Which token is the answer?"), ApiFormat::RESPONSES, tool_memory);
+TEST_CASE(ServerUnitFixture, test_pflash_scorer_maps_last_128_user_tokens) {
+    std::vector<int32_t> query;
+    for (int token = 0; token < 160; ++token) {
+        query.push_back(1000 + token);
+    }
+    std::vector<int32_t> rendered{1, 2};
+    rendered.insert(rendered.end(), query.begin(), query.end());
+    rendered.insert(rendered.end(), {200, 201, 202, 203});
 
-    TEST_ASSERT(
-        http_detail::pflash_user_query_text(messages) ==
-        "Which token is the answer?");
+    const auto window =
+        http_detail::find_pflash_query_window(rendered, query, 128);
+
+    TEST_ASSERT(window.valid());
+    TEST_ASSERT(window.tokens == 128);
+    TEST_ASSERT(window.end == 162);
+    TEST_ASSERT((int)rendered.size() - window.end == 4);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_tolerates_one_bpe_boundary_token) {
@@ -229,25 +252,950 @@ TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_tolerates_one_bpe_boundar
         1, 2, 999, 11, 12, 13, 14, 15, 16, 17, 200, 201,
     };
 
-    const auto window = http_detail::find_pflash_query_window(
-        rendered, query, /*search_end=*/10);
+    const auto window = http_detail::find_pflash_query_window(rendered, query);
 
     TEST_ASSERT(window.valid());
     TEST_ASSERT(window.tokens == 7);
     TEST_ASSERT(window.end == 10);
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_stays_before_latest_user_boundary) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{
+        1, 2, 999, 11, 12, 13, 14, 15, 16, 17,
+        200, 201, 10, 11, 12, 13, 14, 15, 16, 17, 202,
+    };
+    // The sentinel changes the token at the user end, but the later template
+    // and assistant tokens remain stable. The common suffix establishes the
+    // semantic boundary after the original complete user suffix.
+    const std::vector<int32_t> sentinel_rendered{
+        1, 2, 999, 11, 12, 13, 14, 15, 16, 9999,
+        200, 201, 10, 11, 12, 13, 14, 15, 16, 17, 202,
+    };
+
+    const int search_end = http_detail::pflash_query_search_end_from_sentinel(
+        rendered, sentinel_rendered);
+    const auto bounded =
+        http_detail::find_pflash_query_window(rendered, query, 8, search_end);
+    const auto unbounded = http_detail::find_pflash_query_window(rendered, query);
+
+    TEST_ASSERT(search_end == 10);
+    TEST_ASSERT(bounded.valid());
+    TEST_ASSERT(bounded.tokens == 7);
+    TEST_ASSERT(bounded.end == 10);
+    TEST_ASSERT(unbounded.valid());
+    TEST_ASSERT(unbounded.tokens == 8);
+    TEST_ASSERT(unbounded.end == 20);
+    TEST_ASSERT(http_detail::pflash_query_search_end_from_sentinel(
+        rendered, std::vector<int32_t>{42}) < 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_explicit_query_matches_before_trailing_content) {
+    // An explicit query sits before trailing instructions inside the latest
+    // user content; anchored matching (message tail) must fail, unanchored
+    // matching must find its latest occurrence and tolerate a leading-token
+    // boundary difference from tokenizing the query on its own.
+    const std::vector<int32_t> query{5, 10, 11, 12, 13, 14};   // 5 = boundary drift
+    const std::vector<int32_t> rendered{
+        1, 2, 3, 10, 11, 12, 13, 14, 300, 301, 302, 303, 304, 305, 306, 307,
+    };
+    const auto anchored = http_detail::find_pflash_query_window(rendered, query, 8, 16, 1);
+    const auto explicit_window = http_detail::find_pflash_query_window(rendered, query, 8, 16, 1, false);
+    TEST_ASSERT(!anchored.valid());
+    TEST_ASSERT(explicit_window.valid());
+    TEST_ASSERT(explicit_window.end == 8);
+    TEST_ASSERT(explicit_window.tokens == 5);
+    const auto out_of_window = http_detail::find_pflash_query_window(rendered, query, 8, 16, 9, false);
+    TEST_ASSERT(!out_of_window.valid());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_explicit_query_tolerates_merged_trailing_token) {
+    // The query's last token merges with the prompt's following newline
+    // ("  " alone vs "  \n" in context): the unanchored match drops that
+    // trailing token, the untrimmed match still wins when it exists, and
+    // anchored (message tail) matching keeps its exact-suffix contract.
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 77};   // 77 = "  "
+    const std::vector<int32_t> rendered{
+        1, 2, 3, 10, 11, 12, 13, 14, 78, 300, 301, 302,   // 78 = "  \n"
+    };
+    const auto trimmed = http_detail::find_pflash_query_window(rendered, query, 8, 12, 1, false);
+    TEST_ASSERT(trimmed.valid());
+    TEST_ASSERT(trimmed.end == 8);
+    TEST_ASSERT(trimmed.tokens == 5);
+    TEST_ASSERT(trimmed.trailing_trimmed == 1);
+    const std::vector<int32_t> exact{1, 10, 11, 12, 13, 14, 77, 2, 10, 11, 12, 13, 14, 78};
+    const auto untrimmed = http_detail::find_pflash_query_window(exact, query, 8, 14, 0, false);
+    TEST_ASSERT(untrimmed.valid());
+    TEST_ASSERT(untrimmed.end == 7);
+    TEST_ASSERT(untrimmed.tokens == 6);
+    TEST_ASSERT(untrimmed.trailing_trimmed == 0);
+    const auto anchored = http_detail::find_pflash_query_window(rendered, query, 8, 12, 1);
+    TEST_ASSERT(!anchored.valid());
+    const std::vector<int32_t> short_query{10, 11, 12, 77};
+    const auto too_short = http_detail::find_pflash_query_window(rendered, short_query, 8, 12, 1, false);
+    TEST_ASSERT(!too_short.valid());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_bounded_mapping_prefers_latest_shortened_suffix) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{
+        1, 10, 11, 12, 13, 14, 15, 16, 17,
+        900, 11, 12, 13, 14, 15, 16, 17, 200, 201,
+    };
+
+    const auto bounded =
+        http_detail::find_pflash_query_window(rendered, query, 8, 17);
+    const auto unbounded = http_detail::find_pflash_query_window(rendered, query, 8);
+
+    TEST_ASSERT(bounded.valid());
+    TEST_ASSERT(bounded.end == 17);
+    TEST_ASSERT(bounded.tokens == 7);
+    // The compatibility path remains width-first when there is no semantic
+    // boundary, so the earlier exact duplicate still wins there.
+    TEST_ASSERT(unbounded.valid());
+    TEST_ASSERT(unbounded.end == 9);
+    TEST_ASSERT(unbounded.tokens == 8);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_bounded_mapping_rejects_earlier_duplicate) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{
+        1, 10, 11, 12, 13, 14, 15, 16, 17,
+        900, 11, 12, 13, 14, 15, 16, 999, 200,
+    };
+
+    const auto bounded =
+        http_detail::find_pflash_query_window(rendered, query, 8, 18);
+    const auto unbounded =
+        http_detail::find_pflash_query_window(rendered, query, 8);
+
+    TEST_ASSERT(!bounded.valid());
+    TEST_ASSERT(unbounded.valid());
+    TEST_ASSERT(unbounded.end == 9);
+    TEST_ASSERT(unbounded.tokens == 8);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_bounded_mapping_stays_inside_content_start) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{
+        1, 2, 3, 4, 10, 11, 12, 13, 14, 15, 16, 17, 200,
+    };
+
+    const auto bounded = http_detail::find_pflash_query_window(
+        rendered, query, 8, 12, 5);
+
+    TEST_ASSERT(bounded.valid());
+    TEST_ASSERT(bounded.end == 12);
+    TEST_ASSERT(bounded.tokens == 7);
+    TEST_ASSERT(bounded.end - bounded.tokens == 5);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_maps_content_start_from_leading_sentinel) {
+    const std::vector<int32_t> rendered{1, 2, 10, 11, 12, 13, 20};
+    const std::vector<int32_t> sentinel_rendered{
+        1, 2, 999, 10, 11, 12, 13, 20,
+    };
+
+    TEST_ASSERT(http_detail::pflash_query_search_begin_from_sentinel(
+        rendered, sentinel_rendered) == 2);
+    TEST_ASSERT(http_detail::pflash_query_search_begin_from_sentinel(
+        rendered, rendered) < 0);
+}
+
+// ─── Explicit query / required-text span mapping ────────────────────────
+// A minimal GPT-2 byte-BPE tokenizer whose vocab reproduces the runtime
+// failure shape: " What" and "What" are distinct tokens, so a standalone
+// query encoding cannot match a prompt where the question's first character
+// merges with the preceding space.
+
+static std::string test_gpt2_encode(const std::string & text) {
+    static const auto fwd = []() {
+        std::array<uint32_t, 256> table{};
+        int n = 0;
+        for (int b = 0; b < 256; ++b) {
+            const bool printable =
+                (b >= 33 && b <= 126) || (b >= 161 && b <= 172) ||
+                (b >= 174 && b <= 255);
+            table[b] = printable ? (uint32_t) b : (uint32_t) (256 + n++);
+        }
+        return table;
+    }();
+    std::string out;
+    for (char ch : text) {
+        const uint32_t cp = fwd[(uint8_t) ch];
+        if (cp < 0x80) {
+            out.push_back((char) cp);
+        } else {
+            out.push_back((char) (0xC0 | (cp >> 6)));
+            out.push_back((char) (0x80 | (cp & 0x3F)));
+        }
+    }
+    return out;
+}
+
+static std::string write_pflash_bpe_tokenizer_fixture(
+        const std::vector<std::string> & raw_tokens,
+        const std::string & byte_cover,
+        const std::vector<std::string> & control_tokens =
+            {"<|im_start|>", "<|im_end|>"}) {
+    std::vector<std::string> tokens = control_tokens;
+    std::vector<uint32_t> types(tokens.size(), 3);
+    const auto add = [&](const std::string & encoded, uint32_t type) {
+        if (std::find(tokens.begin(), tokens.end(), encoded) == tokens.end()) {
+            tokens.push_back(encoded);
+            types.push_back(type);
+        }
+    };
+    for (const auto & raw : raw_tokens) add(test_gpt2_encode(raw), 1);
+    for (char ch : byte_cover) add(test_gpt2_encode(std::string(1, ch)), 1);
+
+    std::vector<const char *> token_ptrs;
+    for (const auto & token : tokens) token_ptrs.push_back(token.c_str());
+    gguf_context * g = gguf_init_empty();
+    gguf_set_arr_str(g, "tokenizer.ggml.tokens", token_ptrs.data(),
+                     (int32_t) tokens.size());
+    gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
+                      types.data(), (int32_t) types.size());
+    gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
+    gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
+    gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 0);
+    gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 1);
+    // Per-process names: ctest runs each case in its own process, in
+    // parallel, and every process starts the serial at zero.
+    static int fixture_serial = 0;
+#if defined(_WIN32)
+    const long long pid = (long long) _getpid();
+#else
+    const long long pid = (long long) getpid();
+#endif
+    const std::string path = test_tmp_path((
+        "luce_test_pflash_bpe_" + std::to_string(pid) + "_" +
+        std::to_string(++fixture_serial) + ".gguf").c_str()).string();
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+    return path;
+}
+
+static std::string write_deepseek_marker_tokenizer_fixture() {
+    gguf_context * g = gguf_init_empty();
+    const char * tokens[] = {
+        "x",
+        "<｜begin▁of▁sentence｜>",
+        "<｜end▁of▁sentence｜>",
+        "<｜User｜>",
+        "<｜Assistant｜>",
+    };
+    const uint32_t token_types[] = {1, 3, 3, 3, 3};
+    gguf_set_arr_str(g, "tokenizer.ggml.tokens", tokens,
+                     sizeof(tokens) / sizeof(tokens[0]));
+    gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
+                      token_types, sizeof(token_types) / sizeof(token_types[0]));
+    gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
+    gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
+    gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 1);
+    gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 2);
+
+    const std::string path = test_tmp_path("luce_test_deepseek_markers.gguf").string();
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+    return path;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_decoded_span_covers_bpe_merged_first_token) {
+    const std::string content =
+        "See docs.\n\nQuestion: What is the answer?\n Answer:";
+    const std::string rendered = "<|im_start|>user\n" + content +
+        "<|im_end|>\n<|im_start|>assistant\n";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"Question", ":", " What", "What", " is", " the", " answer", "?",
+         "\n", "\n\n", " Answer", "user", "assistant", "See", " docs", "."},
+        rendered + "What is the answer?");
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    const auto prompt = tok.encode(rendered);
+    const std::string needle = "What is the answer?";
+    // The standalone query encoding starts with a bare "What" token; the
+    // prompt merged the preceding space into " What". The id-suffix matcher
+    // therefore accepts a shortened window that misses the first word — the
+    // regression this span mapping fixes.
+    const auto query_ids = tok.encode(needle);
+    const auto legacy = http_detail::find_pflash_query_window(
+        prompt, query_ids, 64, -1, 0, /*anchored=*/false);
+    TEST_ASSERT(legacy.valid());
+    TEST_ASSERT(tok.decode({prompt.begin() + (legacy.end - legacy.tokens),
+                            prompt.begin() + legacy.end}) != needle);
+
+    const auto span = http_detail::pflash_decoded_text_span(
+        tok, prompt, 0, (int) prompt.size(), needle);
+    TEST_ASSERT(span.begin >= 0);
+    const std::string covered = tok.decode(
+        {prompt.begin() + span.begin, prompt.begin() + span.end});
+    TEST_ASSERT(covered.find(needle) != std::string::npos);
+    TEST_ASSERT(span.end == legacy.end);
+    TEST_ASSERT(span.begin == legacy.end - legacy.tokens - 1);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_decoded_span_prefers_last_occurrence) {
+    const std::string content =
+        "Ask: What is up? Then again: What is up?";
+    const std::string rendered = "<|im_start|>user\n" + content +
+        "<|im_end|>\n";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"Ask", ":", " What", " is", " up", "?", " Then", " again",
+         "user", "\n"},
+        rendered + "What is up?");
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    const auto prompt = tok.encode(rendered);
+    const std::string needle = "What is up?";
+    const auto span = http_detail::pflash_decoded_text_span(
+        tok, prompt, 0, (int) prompt.size(), needle);
+    TEST_ASSERT(span.begin >= 0);
+    const size_t last = rendered.rfind(needle);
+    const auto tail = tok.encode(rendered.substr(0, last));
+    // The needle's leading space merges into " What" in the prompt, but the
+    // standalone-encoded prefix keeps it as its own " " token, so the merged
+    // token sits at tail.size() - 1.
+    TEST_ASSERT(span.begin == (int) tail.size() - 1);
+    TEST_ASSERT(tok.decode({prompt.begin() + span.begin,
+                            prompt.begin() + span.end})
+                .find(needle) != std::string::npos);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_decoded_span_handles_unicode_and_content_end) {
+    const std::string content = "Discuss the café Über Alles? now";
+    const std::string rendered = "<|im_start|>user\n" + content + "<|im_end|>\n";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"Discuss", " the", " café", "café", " Über", " Alles", "?", " now",
+         "user", "\n"},
+        rendered + "café Über Alles?");
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    const auto prompt = tok.encode(rendered);
+    const std::string needle = "café Über Alles?";
+    const auto span = http_detail::pflash_decoded_text_span(
+        tok, prompt, 0, (int) prompt.size(), needle);
+    TEST_ASSERT(span.begin >= 0);
+    TEST_ASSERT(tok.decode({prompt.begin() + span.begin,
+                            prompt.begin() + span.end})
+                .find(needle) != std::string::npos);
+    // A needle that never occurs maps to no span — callers must fail closed.
+    const auto missing = http_detail::pflash_decoded_text_span(
+        tok, prompt, 0, (int) prompt.size(), "never-present question");
+    TEST_ASSERT(missing.begin < 0);
+    // An empty needle and an empty range are invalid rather than a
+    // degenerate zero-width span.
+    TEST_ASSERT(http_detail::pflash_decoded_text_span(
+        tok, prompt, 0, (int) prompt.size(), "").begin < 0);
+    TEST_ASSERT(http_detail::pflash_decoded_text_span(
+        tok, prompt, 4, 4, needle).begin < 0);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_required_parses_string_arrays) {
+    TEST_ASSERT(parse_pflash_required_from_body({}).empty());
+    TEST_ASSERT(parse_pflash_required_from_body(
+        {{"pflash_required", "not-an-array"}}).empty());
+    const auto top = parse_pflash_required_from_body(
+        {{"pflash_required",
+          {"answer briefly.", "Question:", 7, nullptr}}});
+    TEST_ASSERT(top.size() == 2);
+    TEST_ASSERT(top[0] == "answer briefly.");
+    const auto nested = parse_pflash_required_from_body(
+        {{"extra_body", {{"pflash_required", {"keep me"}}}}});
+    TEST_ASSERT(nested.size() == 1 && nested[0] == "keep me");
+    // extra_body wins over the top-level field, like session_id.
+    const auto both = parse_pflash_required_from_body(
+        {{"pflash_required", {"outer"}},
+         {"extra_body", {{"pflash_required", {"inner"}}}}});
+    TEST_ASSERT(both.size() == 1 && both[0] == "inner");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_instruction_plan_covers_tools_and_late_developer_roles) {
+    const std::vector<ChatMessage> messages{
+        {"system", "system instruction", ""},
+        {"developer", "leading developer instruction", ""},
+        {"user", "document text", ""},
+        {"assistant", "prior answer", ""},
+        {"developer", "late developer instruction", ""},
+        {"tool", "tool result is history", "call-1"},
+        {"user", "latest query", ""},
+    };
+    const auto plan = http_detail::plan_pflash_instruction_messages(messages);
+
+    TEST_ASSERT(plan.instruction_messages ==
+                std::vector<size_t>({0, 1, 4}));
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_instruction_plan_handles_empty_instructions) {
+    const std::vector<ChatMessage> tool_only{
+        {"user", "use the tool", ""},
+    };
+    const auto tool_plan =
+        http_detail::plan_pflash_instruction_messages(tool_only);
+    TEST_ASSERT(tool_plan.instruction_messages.empty());
+
+    const std::vector<ChatMessage> empty_instruction{
+        {"system", "", ""},
+        {"user", "plain query", ""},
+    };
+    const auto empty_plan =
+        http_detail::plan_pflash_instruction_messages(empty_instruction);
+    TEST_ASSERT(empty_plan.instruction_messages.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_tool_span_follows_arbitrary_jinja_placement) {
+    static const char TPL[] =
+        "{%- for m in messages -%}{{ m.content }}{%- endfor -%}"
+        "{%- if tools -%}|TOOLS:{{ tools[0].function.name }}{%- endif -%}";
+    const std::vector<ChatMessage> messages{{"user", "query-first", ""}};
+    const std::string tools =
+        R"([{"type":"function","function":{"name":"late_lookup"}}])";
+    const std::string with_tools = render_chat_template_jinja(
+        TPL, messages, "", "", true, false, tools);
+    const std::string without_tools = render_chat_template_jinja(
+        TPL, messages, "", "", true, false, "[]");
+    const std::vector<int32_t> original(with_tools.begin(), with_tools.end());
+    const std::vector<int32_t> variant(without_tools.begin(), without_tools.end());
+
+    const PFlashTokenSpan span =
+        http_detail::pflash_changed_token_span(original, variant);
+    TEST_ASSERT(span.begin >= (int) messages[0].content.size());
+    TEST_ASSERT(span.end == (int) original.size());
+    TEST_ASSERT(with_tools.substr(
+        (size_t) span.begin, (size_t) (span.end - span.begin)).find(
+            "late_lookup") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_instruction_span_follows_reordered_jinja_message) {
+    static const char TPL[] =
+        "{%- for m in messages -%}{%- if m.role == 'user' -%}"
+        "<{{ m.role }}>{{ m.content }}</{{ m.role }}>"
+        "{%- endif -%}{%- endfor -%}"
+        "{%- for m in messages -%}{%- if m.role == 'system' -%}"
+        "<{{ m.role }}>{{ m.content }}</{{ m.role }}>"
+        "{%- endif -%}{%- endfor -%}";
+    const std::vector<ChatMessage> messages{
+        {"system", "retain this rule", ""},
+        {"user", "question first", ""},
+    };
+    const std::string rendered = render_chat_template_jinja(
+        TPL, messages, "", "", true, false);
+    auto without_system = messages;
+    without_system.erase(without_system.begin());
+    const std::string variant_rendered = render_chat_template_jinja(
+        TPL, without_system, "", "", true, false);
+    const std::vector<int32_t> original(rendered.begin(), rendered.end());
+    const std::vector<int32_t> variant(
+        variant_rendered.begin(), variant_rendered.end());
+
+    const PFlashTokenSpan span =
+        http_detail::pflash_changed_token_span(original, variant);
+    TEST_ASSERT(span.begin > (int) messages[1].content.size());
+    const std::string retained = rendered.substr(
+        (size_t) span.begin, (size_t) (span.end - span.begin));
+    TEST_ASSERT(retained.find("<system>") != std::string::npos);
+    TEST_ASSERT(retained.find(messages[0].content) != std::string::npos);
+    TEST_ASSERT(retained.find("</system>") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_instruction_spans_are_canonicalized) {
+    const auto spans = http_detail::canonicalize_pflash_token_spans(
+        {{12, 20}, {0, 4}, {3, 8}, {20, 24}});
+    TEST_ASSERT(spans == std::vector<PFlashTokenSpan>({{0, 8}, {12, 24}}));
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_qwen_tool_prefix_boundary_covers_schema) {
+    const std::vector<ChatMessage> messages{{"user", "find weather", ""}};
+    const std::string tools =
+        R"([{"type":"function","function":{"name":"lookup_weather"}}])";
+    const std::string sentinel = "__PFLASH_BEGIN_02C47F91__";
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, true, false, tools);
+    auto marked_messages = messages;
+    marked_messages[0].content = sentinel + marked_messages[0].content;
+    const std::string marked = render_chat_template(
+        marked_messages, ChatFormat::QWEN3, true, false, tools);
+    const std::vector<int32_t> rendered_ids(rendered.begin(), rendered.end());
+    const std::vector<int32_t> marked_ids(marked.begin(), marked.end());
+
+    const int prefix_end = http_detail::pflash_query_search_begin_from_sentinel(
+        rendered_ids, marked_ids);
+    TEST_ASSERT(prefix_end > 0);
+    TEST_ASSERT(rendered.substr(0, (size_t) prefix_end).find("lookup_weather") !=
+                std::string::npos);
+    TEST_ASSERT(rendered.substr(0, (size_t) prefix_end).find("find weather") ==
+                std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_qwen_late_developer_span_covers_role_envelope) {
+    const std::vector<ChatMessage> messages{
+        {"user", std::string(930, 'u'), ""},
+        {"assistant", "history", ""},
+        {"developer", std::string(180, 'd'), ""},
+        {"user", "latest query", ""},
+    };
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, true, false);
+    auto without_developer = messages;
+    without_developer.erase(without_developer.begin() + 2);
+    const std::string without_developer_rendered = render_chat_template(
+        without_developer, ChatFormat::QWEN3, true, false);
+    const std::vector<int32_t> ids(rendered.begin(), rendered.end());
+    const std::vector<int32_t> variant(
+        without_developer_rendered.begin(), without_developer_rendered.end());
+
+    const PFlashTokenSpan span =
+        http_detail::pflash_changed_token_span(ids, variant);
+    const size_t content_begin = rendered.find(messages[2].content);
+    TEST_ASSERT(content_begin != std::string::npos);
+    TEST_ASSERT(span.begin >= 0);
+    TEST_ASSERT((size_t) span.begin < content_begin);
+    TEST_ASSERT((size_t) span.end > content_begin + messages[2].content.size());
+    TEST_ASSERT(span.begin < 1024);
+    TEST_ASSERT(span.end > 1024);
+    TEST_ASSERT(rendered.substr(
+        (size_t) span.begin,
+        (size_t) (span.end - span.begin)).find("developer") !=
+        std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_responses_string_tails_only_raw_content) {
+    ToolMemory tool_memory;
+    const auto normalized = normalize_chat_messages(
+        json("raw completion input"), ApiFormat::RESPONSES, tool_memory);
+    TEST_ASSERT(normalized.size() == 1);
+    TEST_ASSERT(normalized[0].role == "user");
+    TEST_ASSERT(normalized[0].content == "raw completion input");
+
+    const std::vector<int32_t> rendered{
+        1, 2, 10, 11, 12, 13, 14, 200, 201,
+    };
+    const auto window = http_detail::pflash_tail_query_window(
+        rendered, 128, /*query_end=*/7, /*query_begin=*/2);
+    TEST_ASSERT(window.valid());
+    TEST_ASSERT(window.end == 7);
+    TEST_ASSERT(window.tokens == 5);
+    TEST_ASSERT(window.end - window.tokens == 2);
+}
+
+TEST_CASE(ServerUnitFixture, test_compress_result_fails_closed_on_empty_ids) {
+    const auto failed = ModelBackend::CompressResult::from_compressed_ids({});
+    const auto succeeded =
+        ModelBackend::CompressResult::from_compressed_ids({11, 12});
+
+    TEST_ASSERT(!failed.ok);
+    TEST_ASSERT(failed.compressed_ids.empty());
+    TEST_ASSERT(succeeded.ok);
+    TEST_ASSERT(succeeded.compressed_ids == std::vector<int32_t>({11, 12}));
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_parser_fingerprint_has_fixed_encoding) {
+    const std::vector<int32_t> ids{1, -2, 2147483647};
+    TEST_ASSERT(http_detail::pflash_token_fingerprint(ids) ==
+                "45409a0b0f44c5fd");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_tail_query_window) {
+    const auto empty = http_detail::pflash_tail_query_window({}, 128);
+    TEST_ASSERT(!empty.valid());
+
+    const std::vector<int32_t> short_prompt{1, 2, 3};
+    const auto short_tail =
+        http_detail::pflash_tail_query_window(short_prompt, 128);
+    TEST_ASSERT(short_tail.valid());
+    TEST_ASSERT(short_tail.end == 3);
+    TEST_ASSERT(short_tail.tokens == 3);
+
+    std::vector<int32_t> long_prompt(200);
+    const auto capped_tail =
+        http_detail::pflash_tail_query_window(long_prompt, 128);
+    TEST_ASSERT(capped_tail.valid());
+    TEST_ASSERT(capped_tail.end == 200);
+    TEST_ASSERT(capped_tail.tokens == 128);
+    const auto bounded_tail =
+        http_detail::pflash_tail_query_window(long_prompt, 128, 150);
+    TEST_ASSERT(bounded_tail.valid());
+    TEST_ASSERT(bounded_tail.end == 150);
+    TEST_ASSERT(bounded_tail.tokens == 128);
+    TEST_ASSERT(!http_detail::pflash_tail_query_window(long_prompt, 0).valid());
+    TEST_ASSERT(!http_detail::pflash_tail_query_window(long_prompt, 128, 0).valid());
+    TEST_ASSERT(!http_detail::pflash_tail_query_window(long_prompt, 128, 201).valid());
+}
+
+// Renders ``messages`` with the server's own chat template and returns the
+// chat-query turn the scorer would use, decoded as {header, content}.
+struct PflashRenderedQueryTurn {
+    bool valid = false;
+    bool later_turns = false;
+    std::string family;
+    std::string header;
+    std::string content;
+    std::string after;
+    std::string closing;      // content end .. turn end
+    std::string generation;   // generation prompt .. prompt end
+    std::vector<std::string> roles;
+};
+
+static PflashRenderedQueryTurn pflash_rendered_query_turn(
+        const std::vector<ChatMessage> & messages,
+        ChatFormat format,
+        bool thinking,
+        const std::vector<std::string> & control_tokens) {
+    const std::string rendered = render_chat_template(
+        messages, format, /*add_generation_prompt=*/true, thinking);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", "?", "user", "assistant", "model",
+         "system", "\n", "Sure", "."},
+        rendered, control_tokens);
+    Tokenizer tok;
+    PflashRenderedQueryTurn out;
+    if (!tok.load_from_gguf(path.c_str())) {
+        unlink(path.c_str());
+        return out;
+    }
+    const auto prompt = tok.encode(rendered);
+    ChatMarkers markers;
+    if (resolve_chat_markers(tok, markers)) {
+        out.family = markers.family;
+        const auto turn = http_detail::pflash_chat_query_turn(
+            tok, markers, tok, prompt);
+        out.valid = turn.valid();
+        if (out.valid) {
+            out.header = tok.decode({prompt.begin() + turn.role_begin,
+                                     prompt.begin() + turn.content_begin});
+            out.content = tok.decode({prompt.begin() + turn.content_begin,
+                                      prompt.begin() + turn.content_end});
+            out.after = tok.decode({prompt.begin() + turn.content_end,
+                                    prompt.end()});
+            out.closing = tok.decode({prompt.begin() + turn.content_end,
+                                      prompt.begin() + turn.turn_end});
+            out.generation = tok.decode(
+                {prompt.begin() + turn.generation_begin, prompt.end()});
+            out.later_turns = turn.later_turns;
+            for (const auto & each : turn.turns) out.roles.push_back(each.role);
+        }
+    }
+    unlink(path.c_str());
+    return out;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_query_turn_skips_rendered_generation_prompt) {
+    // Every family's generation prompt carries a think/channel prefix after
+    // the assistant marker; the query must still be the latest user turn.
+    const std::vector<ChatMessage> messages{
+        {"system", "You are helpful.", ""},
+        {"user", "first turn", ""},
+        {"assistant", "Sure.", ""},
+        {"user", "What is the answer?", ""},
+    };
+    struct Family {
+        ChatFormat format;
+        const char * name;
+        std::vector<std::string> control_tokens;
+        const char * header;
+    };
+    const std::vector<Family> families{
+        {ChatFormat::QWEN3, "qwen", {"<|im_start|>", "<|im_end|>"},
+         "<|im_start|>user\n"},
+        {ChatFormat::GEMMA4, "gemma", {"<|turn>", "<turn|>"},
+         "<|turn>user\n"},
+        {ChatFormat::DEEPSEEK4, "deepseek",
+         {"<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜User｜>",
+          "<｜Assistant｜>"},
+         "<｜User｜>"},
+        {ChatFormat::LAGUNA, "laguna",
+         {"<system>", "</system>", "<user>", "</user>", "<assistant>",
+          "</assistant>"},
+         "<user>\n"},
+    };
+    for (const auto & family : families) {
+        for (const bool thinking : {false, true}) {
+            const auto turn = pflash_rendered_query_turn(
+                messages, family.format, thinking, family.control_tokens);
+            TEST_ASSERT_MSG(turn.family == family.name, family.name);
+            TEST_ASSERT_MSG(turn.valid, family.name);
+            TEST_ASSERT_MSG(turn.content == "What is the answer?",
+                            std::string(family.name) + " thinking=" +
+                                (thinking ? "1" : "0") + " content=[" +
+                                turn.content + "]");
+            TEST_ASSERT_MSG(turn.header == family.header,
+                            std::string(family.name) + " header=[" +
+                                turn.header + "]");
+            // The rendered tail after the content is template machinery.
+            TEST_ASSERT_MSG(turn.after.find("answer") == std::string::npos,
+                            family.name);
+            TEST_ASSERT_MSG(!turn.later_turns, family.name);
+        }
+    }
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_query_turn_skips_tool_output_turns) {
+    // Agent loop: tool results render inside user turns on Qwen and
+    // DeepSeek. The query stays on the user's own latest turn.
+    const std::vector<ChatMessage> messages{
+        {"user", "What is the answer?", ""},
+        {"assistant", "Sure.", ""},
+        {"tool", "tool output here", "call-1"},
+    };
+    const auto qwen = pflash_rendered_query_turn(
+        messages, ChatFormat::QWEN3, false, {"<|im_start|>", "<|im_end|>"});
+    TEST_ASSERT(qwen.valid);
+    TEST_ASSERT_MSG(qwen.content == "What is the answer?", qwen.content);
+    TEST_ASSERT(qwen.header == "<|im_start|>user\n");
+    TEST_ASSERT(qwen.later_turns);
+    TEST_ASSERT(qwen.roles == std::vector<std::string>({"user", "assistant", "tool"}));
+    TEST_ASSERT_MSG(qwen.closing == "<|im_end|>", qwen.closing);
+    TEST_ASSERT_MSG(qwen.generation == "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                    qwen.generation);
+
+    const auto deepseek = pflash_rendered_query_turn(
+        messages, ChatFormat::DEEPSEEK4, true,
+        {"<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜User｜>",
+         "<｜Assistant｜>"});
+    TEST_ASSERT(deepseek.valid);
+    TEST_ASSERT_MSG(deepseek.content == "What is the answer?",
+                    deepseek.content);
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_query_turn_falls_back_without_user_turn) {
+    const auto turn = pflash_rendered_query_turn(
+        {{"system", "You are helpful.", ""}}, ChatFormat::QWEN3, true,
+        {"<|im_start|>", "<|im_end|>"});
+    TEST_ASSERT(turn.valid);
+    TEST_ASSERT(turn.content == "You are helpful.");
+    TEST_ASSERT(turn.header == "<|im_start|>system\n");
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_query_turn_open_tail_runs_to_prompt_end) {
+    const std::string rendered = "<|im_start|>user\nhello there";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"hello", " there", "user", "\n"}, rendered);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    const auto prompt = tok.encode(rendered);
+    ChatMarkers markers;
+    TEST_ASSERT(resolve_chat_markers(tok, markers));
+    const auto span = http_detail::pflash_chat_query_turn(
+        tok, markers, tok, prompt);
+    TEST_ASSERT(span.valid());
+    TEST_ASSERT(span.content_end == (int) prompt.size());
+    TEST_ASSERT(tok.decode({prompt.begin() + span.content_begin,
+                            prompt.begin() + span.content_end})
+                == "hello there");
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_query_turn_rejects_markerless_text) {
+    const std::string rendered = "just some raw text, no chat markers";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"just", " some", " raw", " text"}, rendered);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    const auto prompt = tok.encode(rendered);
+    ChatMarkers markers;
+    TEST_ASSERT(resolve_chat_markers(tok, markers));
+    const auto span = http_detail::pflash_chat_query_turn(
+        tok, markers, tok, prompt);
+    TEST_ASSERT(!span.valid());
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_normalizes_multipart_latest_user_for_reverse_lookup) {
+    ToolMemory tool_memory;
+    const json messages = json::array({
+        {{"role", "user"}, {"content", "older user"}},
+        {{"role", "assistant"}, {"content", "assistant before latest"}},
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "input_text"}, {"text", "input-"}},
+            {{"type", "input_image"}, {"image_url", "ignored"}},
+            {{"type", "text"}, {"text", "text"}}
+        })}},
+        {{"role", "assistant"}, {"content", "assistant after latest"}},
+        {{"role", "tool"}, {"content", "tool after latest"}}
+    });
+
+    const auto normalized = normalize_chat_messages(
+        messages, ApiFormat::OPENAI_CHAT, tool_memory);
+    const auto latest_user = std::find_if(
+        normalized.rbegin(), normalized.rend(),
+        [](const ChatMessage & message) { return message.role == "user"; });
+    TEST_ASSERT(latest_user != normalized.rend());
+    if (latest_user != normalized.rend()) {
+        TEST_ASSERT(latest_user->content == "input-text");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_selection_cache_and_continuation_policy) {
+    TEST_ASSERT(http_detail::pflash_full_cache_restore_allowed(false));
+    TEST_ASSERT(!http_detail::pflash_full_cache_restore_allowed(true));
+}
+
+TEST_CASE(ServerUnitFixture, test_timings_json_carries_pflash_details) {
+    GenTimings timings;
+    TEST_ASSERT(!build_timings_json(timings, 0).contains("pflash"));
+    timings.pflash = {{"compress_ms", 12.5}, {"view", {{"mode", "continue"}}}};
+    const auto out = build_timings_json(timings, 0);
+    TEST_ASSERT(out["pflash"]["view"]["mode"] == "continue");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_join_kept_spans_breaks_between_pieces) {
+    const std::string text = "one fact.\ngap text.Two starts.\n\nThree.";
+    const std::string path = write_pflash_bpe_tokenizer_fixture({}, text);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+    const auto ids = tok.encode(text);
+    const auto token_at = [&] (const std::string & needle) {
+        const auto span = http_detail::pflash_decoded_text_span(
+            tok, ids, 0, (int) ids.size(), needle);
+        return span;
+    };
+    const auto one = token_at("one fact.");
+    const auto two = token_at("Two starts.");
+    const auto three = token_at("\n\nThree.");
+    // Non-adjacent pieces without a break get a paragraph break...
+    TEST_ASSERT_MSG(http_detail::pflash_join_kept_spans(tok, ids, {one, two}) ==
+                    "one fact.\n\nTwo starts.",
+                    http_detail::pflash_join_kept_spans(tok, ids, {one, two}));
+    // ...a piece that already opens a paragraph is left alone...
+    TEST_ASSERT(http_detail::pflash_join_kept_spans(tok, ids, {one, three}) ==
+                "one fact.\n\nThree.");
+    // ...and adjacent pieces are joined as they were.
+    TEST_ASSERT(http_detail::pflash_join_kept_spans(tok, ids, {{0, 3}, {3, 5}}) ==
+                tok.decode({ids.begin(), ids.begin() + 5}));
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_recall_by_lift_takes_clear_attention_only) {
+    const std::vector<std::pair<PFlashTokenSpan, double>> lifts{
+        {{0, 10}, 40.0},     // clearly attended, not in view
+        {{10, 20}, 2.0},     // background
+        {{20, 30}, 90.0},    // clearly attended, already in view
+        {{30, 60}, 12.0},    // attended, half in view
+        {{60, 70}, 25.0},
+    };
+    const std::vector<PFlashTokenSpan> in_view{{20, 45}};
+    auto recalled = http_detail::pflash_recall_by_lift(lifts, in_view, 8.0);
+    TEST_ASSERT(recalled.size() == 2);   // [0,10) and [45,70) merged
+    TEST_ASSERT(recalled[0].begin == 0 && recalled[0].end == 10);
+    TEST_ASSERT(recalled[1].begin == 45 && recalled[1].end == 70);
+    // A lower bar takes the background segment too.
+    recalled = http_detail::pflash_recall_by_lift(lifts, in_view, 1.0);
+    TEST_ASSERT(recalled.size() == 2);   // [0,20) and [45,70)
+    TEST_ASSERT(recalled[0].begin == 0 && recalled[0].end == 20);
+    TEST_ASSERT(recalled[1].begin == 45 && recalled[1].end == 70);
+    // Nothing clears a high bar.
+    TEST_ASSERT(http_detail::pflash_recall_by_lift(lifts, in_view, 100.0).empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_subtract_token_spans) {
+    const std::vector<PFlashTokenSpan> spans{{0, 10}, {20, 30}, {40, 50}};
+    const std::vector<PFlashTokenSpan> minus{{5, 22}, {25, 26}, {40, 50}};
+    const auto out = http_detail::pflash_subtract_token_spans(spans, minus);
+    TEST_ASSERT(out.size() == 3);
+    TEST_ASSERT(out[0].begin == 0 && out[0].end == 5);
+    TEST_ASSERT(out[1].begin == 22 && out[1].end == 25);
+    TEST_ASSERT(out[2].begin == 26 && out[2].end == 30);
+    TEST_ASSERT(http_detail::pflash_subtract_token_spans(spans, {}).size() == 3);
+    TEST_ASSERT(http_detail::pflash_subtract_token_spans(spans, {{0, 60}}).empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_recall_excerpt_strips_chat_markers) {
+    const std::string text =
+        "tail of a fact<|im_end|>\n<|im_start|>assistant\nSure, noted."
+        "<|im_end|>\n<|im_start|>user\n";
+    const std::string excerpt = http_detail::pflash_recall_excerpt(
+        text, {"<|im_start|>"}, {"<|im_end|>"}, /*generic_role_lines=*/true);
+    TEST_ASSERT_MSG(excerpt == "tail of a fact\n\n\nSure, noted.", excerpt);
+    TEST_ASSERT(http_detail::pflash_recall_excerpt(
+        "<|im_end|>\n", {"<|im_start|>"}, {"<|im_end|>"}, true).empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_chat_view_store_matches_prompt_prefix) {
+    http_detail::PflashChatViewStore store(2);
+    http_detail::PflashChatView first;
+    first.raw_tokens = {1, 2, 3, 9, 9};
+    first.raw_gen_begin = 3;
+    first.drafter_ids = {1, 2, 3, 9, 9};
+    first.drafter_gen_begin = 3;
+    store.remember(first);
+
+    http_detail::PflashChatView found;
+    // The next turn keeps the prefix before the old generation prompt.
+    TEST_ASSERT(store.find({1, 2, 3, 4, 5, 9, 9}, {1, 2, 3, 4, 5, 9, 9}, found));
+    TEST_ASSERT(found.raw_gen_begin == 3);
+    // A different conversation does not match.
+    TEST_ASSERT(!store.find({1, 7, 3, 4}, {1, 7, 3, 4}, found));
+    // A continuation replaces the view it continues.
+    http_detail::PflashChatView second = first;
+    second.raw_tokens = {1, 2, 3, 4, 5, 9, 9};
+    second.raw_gen_begin = 5;
+    second.drafter_ids = second.raw_tokens;
+    second.drafter_gen_begin = 5;
+    store.remember(second);
+    TEST_ASSERT(store.size() == 1);
+    TEST_ASSERT(store.find({1, 2, 3, 4, 5, 6, 9}, {1, 2, 3, 4, 5, 6, 9}, found));
+    TEST_ASSERT(found.raw_gen_begin == 5);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_kept_tokens_follow_selector_chunks) {
+    // 100 tokens in chunks of 10; query [80, 85); instruction span [3, 12)
+    // touches chunks 0 and 1.
+    const std::vector<PFlashTokenSpan> kept{{3, 12}};
+    // Suffix structural: chunks 0, 1, 8, 9.
+    TEST_ASSERT(http_detail::pflash_kept_tokens(100, 10, 80, 85, kept, true) == 40);
+    // Suffix scored: only the query's chunk after it.
+    TEST_ASSERT(http_detail::pflash_kept_tokens(100, 10, 80, 85, kept, false) == 30);
+    TEST_ASSERT(http_detail::pflash_kept_tokens(0, 10, 0, 0, kept, true) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_effective_keep_ratio_spends_on_droppable) {
+    // 1000 tokens, 400 kept, 5 %: budget 400 + 30 + 1 slack.
+    TEST_ASSERT(std::abs(http_detail::pflash_effective_keep_ratio(
+        1000, 400, 0.05) - 0.431) < 1e-12);
+    // Nothing kept: the plain ratio plus the slack token.
+    TEST_ASSERT(std::abs(http_detail::pflash_effective_keep_ratio(
+        1000, 0, 0.05) - 0.051) < 1e-12);
+    // Everything kept caps at 1.
+    TEST_ASSERT(http_detail::pflash_effective_keep_ratio(1000, 1000, 0.05) == 1.0);
+    // The floored budget never lands below the kept tokens.
+    for (int kept = 0; kept <= 997; kept += 7) {
+        const double ratio =
+            http_detail::pflash_effective_keep_ratio(997, kept, 0.013);
+        TEST_ASSERT((int) std::floor(997.0 * ratio) >= kept);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_target_token_ceiling_floors) {
+    TEST_ASSERT(http_detail::pflash_target_token_ceiling(7, 0.5) == 3);
+    TEST_ASSERT(http_detail::pflash_target_token_ceiling(120000, 16384.0 / 120000.0) == 16384);
+    TEST_ASSERT(http_detail::pflash_target_token_ceiling(-1, 0.5) < 0);
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_rejects_weak_punctuation_match) {
     const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
     const std::vector<int32_t> rendered{1, 2, 15, 16, 17, 200, 201};
-    TEST_ASSERT(!http_detail::find_pflash_query_window(
-        rendered, query, /*search_end=*/7).valid());
+    TEST_ASSERT(!http_detail::find_pflash_query_window(rendered, query).valid());
 
     const std::vector<int32_t> short_query{30, 31, 32};
     const std::vector<int32_t> short_rendered{1, 30, 31, 32, 200};
     const auto short_window =
-        http_detail::find_pflash_query_window(
-            short_rendered, short_query, /*search_end=*/4);
+        http_detail::find_pflash_query_window(short_rendered, short_query);
     TEST_ASSERT(short_window.valid());
     TEST_ASSERT(short_window.tokens == 3);
     TEST_ASSERT(short_window.end == 4);
@@ -268,7 +1216,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_score_validation_counts_nan_and_inf) {
 TEST_CASE(ServerUnitFixture, test_qwen35_pflash_rejects_missing_query_window) {
     DrafterContext ctx;
     ctx.loaded = true;
-    ctx.arch = DrafterArch::Qwen35_0p8b;
     const std::vector<int32_t> ids(16, 1);
 
     const auto compressed = drafter_score_and_compress(
@@ -281,12 +1228,24 @@ TEST_CASE(ServerUnitFixture, test_qwen35_pflash_rejects_missing_query_window) {
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_ipc_rejects_unsupported_query_widths) {
-    TEST_ASSERT(valid_pflash_score_query_tokens(1));
-    TEST_ASSERT(valid_pflash_score_query_tokens(8));
-    TEST_ASSERT(!valid_pflash_score_query_tokens(0));
-    TEST_ASSERT(!valid_pflash_score_query_tokens(9));
-    TEST_ASSERT(!valid_pflash_score_query_tokens(
-        (std::numeric_limits<int>::max)()));
+    const auto accepted = [](int score_query_tokens) {
+        std::string line;
+        std::string error;
+        const bool formatted = format_pflash_drafter_ipc_compress_command(
+            0.5f, 16, score_query_tokens, "/tmp/pflash_ids.bin", line, error);
+        if (!formatted) return false;
+        PFlashDrafterIpcCompressCommand parsed;
+        return parse_pflash_drafter_ipc_compress_command(line, parsed, error) &&
+               parsed.score_query_tokens == score_query_tokens;
+    };
+    // The explicit scorer query sizes its own window, so widths above the
+    // former eight-token cap round-trip; non-positive widths still fail closed.
+    TEST_ASSERT(accepted(1));
+    TEST_ASSERT(accepted(8));
+    TEST_ASSERT(accepted(128));
+    TEST_ASSERT(!accepted(0));
+    TEST_ASSERT(!accepted(-1));
+    TEST_ASSERT(!accepted((std::numeric_limits<int>::min)()));
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_query_capture_splits_across_chunks) {
@@ -1707,8 +2666,8 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_final_invoke_be
         "<｜DSML｜tool_calls>\n"
         "<｜DSML｜invoke name=\"edit\">\n"
         "<｜DSML｜parameter name=\"file_path\" string=\"true\">/home/dpavlin/aimax/LUCEBOX_STRIX_HALO_GUIDE.md</｜DSML｜parameter>\n"
-        "<｜DSML｜parameter name=\"new_string\" string=\"true\">### B. Paged Attention WMMA (head-256, RDNA4) — `DFLASH27B_PAGED_WMMA` (default off, BURN-IN)\n"
-        "- Env `DFLASH27B_PAGED_WMMA=1` routes paged full-attention layers (head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Default (unset/0) keeps the V_DOT2 decode kernel.\n"
+        "<｜DSML｜parameter name=\"new_string\" string=\"true\">### B. Paged Attention WMMA (head-256, RDNA4) — `LUCE_PAGED_WMMA` (default off, BURN-IN)\n"
+        "- Env `LUCE_PAGED_WMMA=1` routes paged full-attention layers (head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Default (unset/0) keeps the V_DOT2 decode kernel.\n"
         "- Differential: single-prompt TTFT −21% @12K, −42% @44K; batched 8K-pool prefill slightly ahead. Kernel-level 20.6–22.4 TFLOP/s vs 6.4–6.8 (3.1–3.3×); end-to-end bounded by attention's prefill share (~8% @44K, ~4% @12K).\n"
         "- Two-mode CTest: `test_paged_attn_wmma` (V_DOT2, env=0) / `paged_attn_wmma_route` (env=1), diff via `server/test/compare_paged_attn.py --tol 6e-3`. Need `--reconfig` after the upstream pull for `CMakeLists.txt` to register targets.\n"
         "- Source of truth: `server/docs/PAGED_ATTN_WMMA_HANDOFF.md`.</｜DSML｜parameter>\n"
@@ -1735,7 +2694,7 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_final_invoke_be
         TEST_ASSERT(result.tool_calls[0].name == "edit");
         auto args = json::parse(result.tool_calls[0].arguments);
         TEST_ASSERT(args["file_path"] == "/home/dpavlin/aimax/LUCEBOX_STRIX_HALO_GUIDE.md");
-        TEST_ASSERT(args["new_string"].get<std::string>().find("DFLASH27B_PAGED_WMMA") != std::string::npos);
+        TEST_ASSERT(args["new_string"].get<std::string>().find("LUCE_PAGED_WMMA") != std::string::npos);
         TEST_ASSERT(args["old_string"].get<std::string>().find("Prefill Mode") != std::string::npos);
     }
 }
@@ -3083,32 +4042,6 @@ TEST_CASE(ServerUnitFixture, test_stop_sequence_holdback_extends) {
 // ═══════════════════════════════════════════════════════════════════════
 // Prefix cache hash tests (model-free)
 // ═══════════════════════════════════════════════════════════════════════
-
-static std::string write_deepseek_marker_tokenizer_fixture() {
-    gguf_context * g = gguf_init_empty();
-    const char * tokens[] = {
-        "x",
-        "<｜begin▁of▁sentence｜>",
-        "<｜end▁of▁sentence｜>",
-        "<｜User｜>",
-        "<｜Assistant｜>",
-    };
-    const uint32_t token_types[] = {1, 3, 3, 3, 3};
-    gguf_set_arr_str(g, "tokenizer.ggml.tokens", tokens,
-                     sizeof(tokens) / sizeof(tokens[0]));
-    gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
-                      token_types,
-                      sizeof(token_types) / sizeof(token_types[0]));
-    gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
-    gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
-    gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 1);
-    gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 2);
-
-    const std::string path = test_tmp_path("luce_test_deepseek_markers.gguf").string();
-    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
-    gguf_free(g);
-    return path;
-}
 
 TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
@@ -4546,6 +5479,29 @@ TEST_CASE(ServerUnitFixture, test_draft_residency_pflash_auto) {
             DraftResidencyUse::PFlashCompress,
             /*low_vram_hint=*/true,
             /*has_decode_draft=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
+
+    // Proven ample VRAM (resolved skip-park) upgrades auto to KeepLoaded —
+    // the drafter stays resident between requests.
+    action = resolve_draft_residency_action(
+        DraftResidencyPolicy::Auto,
+        DraftResidencyContext{
+            DraftResidencyUse::PFlashCompress,
+            /*low_vram_hint=*/false,
+            /*has_decode_draft=*/false,
+            /*ample_vram=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::KeepLoaded);
+
+    // Explicit policies still override the hint both ways.
+    action = resolve_draft_residency_action(
+        DraftResidencyPolicy::RequestScoped,
+        DraftResidencyContext{
+            DraftResidencyUse::PFlashCompress,
+            /*low_vram_hint=*/false,
+            /*has_decode_draft=*/false,
+            /*ample_vram=*/true,
         });
     TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
 }
@@ -5992,6 +6948,919 @@ TEST_CASE(ServerUnitFixture,
     victim.cancel();
 }
 #endif
+
+struct MockPflashCompressBackend : MockBackend {
+    int compress_calls = 0;
+    CompressRequest last_request;
+
+    CompressResult compress(const CompressRequest & request) override {
+        ++compress_calls;
+        last_request = request;
+        return CompressResult::from_compressed_ids(request.input_ids);
+    }
+};
+
+TEST_CASE(ServerUnitFixture, test_pflash_default_raw_text_maps_user_query) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", nullptr};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", nullptr};
+    luce_test::ScopedEnvVar query{"PFLASH_SELECT_QUERY_TOKENS", nullptr};
+    luce_test::ScopedEnvVar parser{"PFLASH_SELECT_QUERY_PARSER", nullptr};
+    luce_test::ScopedEnvVar top_p{"PFLASH_SELECT_TOP_P", nullptr};
+
+    const std::string tokenizer_path =
+        write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(tokenizer_path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::RESPONSES;
+        request.messages = "x";
+        request.prompt_tokens = tokenizer.encode("x");
+
+        const std::string error =
+            HttpServerTestAccess::apply_pflash_compression(server, request);
+        TEST_ASSERT_MSG(error.empty(), error);
+    }
+
+    TEST_ASSERT(backend.compress_calls == 1);
+    TEST_ASSERT(backend.last_request.score_query_end == 1);
+    TEST_ASSERT(backend.last_request.score_query_tokens == 1);
+    unlink(tokenizer_path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_chat_query_is_the_prompt_end) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
+
+    // The server's own Qwen rendering, generation prompt and its think
+    // prefix included.
+    const std::string rendered = render_chat_template(
+        {{"system", "You are helpful.", ""},
+         {"user", "What is the answer?", ""}},
+        ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", "?", "user", "assistant",
+         "system", "\n", "You", " are", " helpful", "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 1.0f;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "system"}, {"content", "You are helpful."}},
+            {{"role", "user"}, {"content", "What is the answer?"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const std::string error =
+            HttpServerTestAccess::apply_pflash_compression(server, request);
+        TEST_ASSERT_MSG(error.empty(), error);
+    }
+
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & ids = backend.last_request.input_ids;
+    const int im_end = tokenizer.token_to_id("<|im_end|>");
+    int last_im_end = -1;
+    for (int i = 0; i < (int) ids.size(); ++i) {
+        if (ids[i] == im_end) last_im_end = i;
+    }
+    TEST_ASSERT(last_im_end > 0);
+    // The scorer query is the prompt's last token, where the model starts
+    // answering; nothing is parsed out of the user's text.
+    TEST_ASSERT(backend.last_request.score_query_end == (int) ids.size());
+    TEST_ASSERT(backend.last_request.score_query_tokens == 1);
+    // The user turn's tail scores as a second query window.
+    const auto turn = backend.last_request.turn_query_span;
+    TEST_ASSERT(turn.begin >= 0 && turn.end == last_im_end);
+    TEST_ASSERT(tokenizer.decode({ids.begin() + turn.begin, ids.begin() + turn.end})
+                == "What is the answer?");
+    // The generation prompt, the turn's role header and -- a short turn --
+    // the whole question stay.
+    bool header_pinned = false;
+    bool question_pinned = false;
+    bool generation_pinned = false;
+    for (const auto & span : backend.last_request.required_instruction_spans) {
+        const std::string text = tokenizer.decode(
+            {ids.begin() + span.begin, ids.begin() + span.end});
+        if (text.find("<|im_start|>user\n") != std::string::npos) {
+            header_pinned = true;
+        }
+        if (text.find("What is the answer?") != std::string::npos) {
+            question_pinned = true;
+        }
+        if (span.begin <= last_im_end + 2 && span.end == (int) ids.size()) {
+            generation_pinned = true;
+        }
+    }
+    TEST_ASSERT(header_pinned);
+    TEST_ASSERT(question_pinned);
+    TEST_ASSERT(generation_pinned);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_agent_turns_after_query_are_candidates) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
+
+    const std::vector<ChatMessage> messages{
+        {"user", "What is the answer?", ""},
+        {"assistant", "Sure.", ""},
+        {"tool", "tool output here", "call-1"},
+    };
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", "?", "user", "assistant", "\n",
+         "Sure", "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 1.0f;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "user"}, {"content", "What is the answer?"}},
+            {{"role", "assistant"}, {"content", "Sure."}},
+            {{"role", "tool"}, {"content", "tool output here"},
+             {"tool_call_id", "call-1"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const std::string error =
+            HttpServerTestAccess::apply_pflash_compression(server, request);
+        TEST_ASSERT_MSG(error.empty(), error);
+    }
+
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & request = backend.last_request;
+    const auto & ids = request.input_ids;
+    // The query is the prompt's end, so nothing follows it: the assistant
+    // and tool turns are ordinary context.
+    TEST_ASSERT(!request.query_suffix_candidates);
+    TEST_ASSERT(request.score_query_end == (int) ids.size());
+    TEST_ASSERT(request.score_query_tokens == 1);
+    // The generation prompt is pinned, and the short assistant turn stays as
+    // part of the conversation's skeleton; the tool output between the query
+    // and the generation prompt is scored, not pinned.
+    bool generation_pinned = false;
+    for (const auto & span : request.required_instruction_spans) {
+        const std::string text = tokenizer.decode(
+            {ids.begin() + span.begin, ids.begin() + span.end});
+        TEST_ASSERT_MSG(text.find("tool output") == std::string::npos, text);
+        if (span.end == (int) ids.size() &&
+            text.find("<|im_start|>assistant\n<think>\n") != std::string::npos) {
+            generation_pinned = true;
+        }
+    }
+    TEST_ASSERT(generation_pinned);
+    unlink(path.c_str());
+}
+
+// Keeps a prefix of the input that fits the requested ratio, so the target
+// ceiling check sees a real compression.
+struct MockPflashBudgetBackend : MockBackend {
+    int compress_calls = 0;
+    CompressRequest last_request;
+
+    CompressResult compress(const CompressRequest & request) override {
+        ++compress_calls;
+        last_request = request;
+        const size_t keep = (size_t) std::max(1.0, std::floor(
+            (double) request.input_ids.size() * request.keep_ratio) - 2.0);
+        return CompressResult::from_compressed_ids(std::vector<int32_t>(
+            request.input_ids.begin(),
+            request.input_ids.begin() + (long) std::min(keep, request.input_ids.size())));
+    }
+};
+
+struct PflashSystemPromptCase {
+    std::string rendered;
+    json messages;
+    std::vector<std::string> vocab;
+};
+
+static PflashSystemPromptCase pflash_long_system_prompt_case(
+        const std::string & instruction_role = "system") {
+    std::string system;
+    for (int i = 0; i < 30; ++i) system += "You are helpful. ";
+    // Longer than the multi-turn skeleton keeps whole: droppable material.
+    std::string history;
+    for (int i = 0; i < 120; ++i) history += "Sure. ";
+    PflashSystemPromptCase out;
+    out.rendered = render_chat_template(
+        {{instruction_role, system, ""},
+         {"user", history, ""},
+         {"assistant", "Sure.", ""},
+         {"user", "What is the answer?", ""}},
+        // As the server renders it: ParsedRequest defaults to thinking on,
+        // and the instruction spans come from re-renders of this prompt.
+        ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true);
+    out.messages = json::array({
+        {{"role", instruction_role}, {"content", system}},
+        {{"role", "user"}, {"content", history}},
+        {{"role", "assistant"}, {"content", "Sure."}},
+        {{"role", "user"}, {"content", "What is the answer?"}},
+    });
+    out.vocab = {"What", " is", " the", " answer", "?", "user", "assistant",
+                 "system", "\n", "You", " are", " helpful", ".", " ", "Sure"};
+    return out;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_budget_spends_keep_ratio_on_droppable_tokens) {
+    // A system prompt larger than keep_ratio x prompt used to exhaust the
+    // budget (mandatory_query_exceeds_budget). It is kept and the ratio now
+    // applies to the rest.
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    const auto prompt = pflash_long_system_prompt_case();
+    const std::string path =
+        write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashBudgetBackend>();
+    MockPflashBudgetBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 0.05f;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    std::string error;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = prompt.messages;
+        request.prompt_tokens = tokenizer.encode(prompt.rendered);
+        error = HttpServerTestAccess::apply_pflash_compression(server, request);
+    }
+    TEST_ASSERT_MSG(error.empty(), error);
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & request = backend.last_request;
+    const int input = (int) request.input_ids.size();
+    int system_end = -1;
+    for (const auto & span : request.required_instruction_spans) {
+        const std::string text = tokenizer.decode(
+            {request.input_ids.begin() + span.begin,
+             request.input_ids.begin() + span.end});
+        if (text.find("You are helpful") != std::string::npos) {
+            system_end = span.end;
+        }
+    }
+    TEST_ASSERT(system_end > 0);   // the system prompt is still kept
+    // Its tokens are charged on top of 5 % of the droppable rest.
+    TEST_ASSERT(request.keep_ratio > (double) system_end / input);
+    TEST_ASSERT(request.keep_ratio < 1.0f);
+    unlink(path.c_str());
+}
+
+static std::string pflash_overflowing_instruction_error(
+        const std::string & role, bool & compressed,
+        std::vector<std::string> & kept_texts) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    const auto prompt = pflash_long_system_prompt_case(role);
+    const std::string path =
+        write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashBudgetBackend>();
+    MockPflashBudgetBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 0.3f;
+    config.max_ctx = 200;   // smaller than the instructions + max_output
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    std::string error;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = prompt.messages;
+        request.prompt_tokens = tokenizer.encode(prompt.rendered);
+        request.max_output = 16;
+        error = HttpServerTestAccess::apply_pflash_compression(server, request);
+    }
+    compressed = backend.compress_calls == 1;
+    kept_texts.clear();
+    if (compressed) {
+        const auto & request = backend.last_request;
+        for (const auto & span : request.required_instruction_spans) {
+            kept_texts.push_back(tokenizer.decode(
+                {request.input_ids.begin() + span.begin,
+                 request.input_ids.begin() + span.end}));
+        }
+    }
+    unlink(path.c_str());
+    return error;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_refuses_system_prompt_that_overflows_context) {
+    // The system prompt is never compressed: when it alone does not fit the
+    // context the request fails before the drafter runs.
+    bool compressed = true;
+    std::vector<std::string> kept;
+    const std::string error =
+        pflash_overflowing_instruction_error("system", compressed, kept);
+    TEST_ASSERT_MSG(error.find("system prompt alone does not fit") !=
+                        std::string::npos, error);
+    TEST_ASSERT(!compressed);
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_scores_developer_text_that_overflows_context) {
+    // A developer message too large for the context is data: it loses its
+    // pin and competes for the budget.
+    bool compressed = false;
+    std::vector<std::string> kept;
+    const std::string error =
+        pflash_overflowing_instruction_error("developer", compressed, kept);
+    TEST_ASSERT_MSG(error.empty(), error);
+    TEST_ASSERT(compressed);
+    for (const auto & text : kept) {
+        TEST_ASSERT_MSG(text.find("You are helpful") == std::string::npos, text);
+    }
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_auto_threshold_counts_droppable_tokens) {
+    // Auto mode: the whole prompt clears the threshold, the droppable part
+    // does not -- nothing worth selecting, so the prompt goes through as is.
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    const auto prompt = pflash_long_system_prompt_case();
+    const std::string path =
+        write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const auto ids = tokenizer.encode(prompt.rendered);
+
+    auto backend_owner = std::make_unique<MockPflashBudgetBackend>();
+    MockPflashBudgetBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::AUTO;
+    config.pflash_threshold = (int) ids.size() - 20;
+    config.pflash_keep_ratio = 0.3f;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = prompt.messages;
+        request.prompt_tokens = ids;
+        const auto prepared =
+            HttpServerTestAccess::prepare_prompt(server, request);
+        TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+        TEST_ASSERT(!prepared.compressed);
+        TEST_ASSERT(prepared.tokens == ids);
+    }
+    TEST_ASSERT(backend.compress_calls == 0);
+    unlink(path.c_str());
+}
+
+// Keeps the required spans, the query window through the end, and whatever
+// ``pick`` adds; reports the kept spans like the in-process drafter does.
+struct MockPflashSpanBackend : MockBackend {
+    int compress_calls = 0;
+    CompressRequest last_request;
+    std::function<std::vector<PFlashTokenSpan>(const CompressRequest &)> pick;
+
+    CompressResult compress(const CompressRequest & request) override {
+        ++compress_calls;
+        last_request = request;
+        auto spans = request.required_instruction_spans;
+        spans.push_back({request.score_query_end - request.score_query_tokens,
+                         (int) request.input_ids.size()});
+        if (pick) {
+            const auto extra = pick(request);
+            spans.insert(spans.end(), extra.begin(), extra.end());
+        }
+        spans = http_detail::canonicalize_pflash_token_spans(std::move(spans));
+        CompressResult result;
+        for (const auto & span : spans) {
+            result.compressed_ids.insert(result.compressed_ids.end(),
+                request.input_ids.begin() + span.begin,
+                request.input_ids.begin() + span.end);
+        }
+        result.kept_spans = spans;
+        result.ok = !result.compressed_ids.empty();
+        return result;
+    }
+};
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_view_appends_turns_and_recalls_missing_segments) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar view_env{"PFLASH_CHAT_VIEW", nullptr};
+    // Only turns of a few tokens stay whole, so the document turn is
+    // material the selection picks from.
+    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", "4"};
+
+    std::string system;
+    for (int i = 0; i < 20; ++i) system += "You are helpful. ";
+    const std::string document =
+        "alpha facts live here. filler filler filler. beta facts live here.";
+    const std::vector<ChatMessage> turn1{
+        {"system", system, ""},
+        {"user", document + " Question one?", ""},
+    };
+    auto turn2 = turn1;
+    turn2.push_back({"assistant", "Answer one.", ""});
+    turn2.push_back({"user", "Question two?", ""});
+    const auto render = [] (const std::vector<ChatMessage> & messages) {
+        return render_chat_template(messages, ChatFormat::QWEN3,
+                                    /*add_generation_prompt=*/true,
+                                    /*enable_thinking=*/true);
+    };
+    const auto to_json = [] (const std::vector<ChatMessage> & messages) {
+        json out = json::array();
+        for (const auto & message : messages) {
+            out.push_back({{"role", message.role}, {"content", message.content}});
+        }
+        return out;
+    };
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"alpha", " facts", "beta", " live", " here", ".", " filler",
+         "Question", " one", " two", "?", "Answer", "user", "assistant",
+         "system", "\n", "You", " are", " helpful"},
+        render(turn2) +
+            "[Earlier in this conversation]\n[End of earlier excerpts]\n");
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashSpanBackend>();
+    MockPflashSpanBackend & backend = *backend_owner;
+    const char * wanted = "alpha facts";
+    backend.pick = [&] (const ModelBackend::CompressRequest & request) {
+        const auto span = http_detail::pflash_decoded_text_span(
+            tokenizer, request.input_ids, 0, (int) request.input_ids.size(),
+            wanted);
+        return span.begin < 0 ? std::vector<PFlashTokenSpan>{}
+                              : std::vector<PFlashTokenSpan>{span};
+    };
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    config.pflash_keep_ratio = 1.0f;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    std::vector<int32_t> served1;
+    std::vector<int32_t> served2;
+    std::vector<int32_t> served3;
+    std::vector<std::string> modes;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        const auto run = [&] (const std::vector<ChatMessage> & messages,
+                              std::vector<int32_t> & served) {
+            ParsedRequest request;
+            request.format = ApiFormat::OPENAI_CHAT;
+            request.messages = to_json(messages);
+            request.prompt_tokens = tokenizer.encode(render(messages));
+            const auto prepared =
+                HttpServerTestAccess::prepare_prompt(server, request);
+            TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+            TEST_ASSERT(prepared.compressed);
+            served = prepared.tokens;
+            // usage.timings.pflash reports the view outcome.
+            TEST_ASSERT(prepared.pflash_stats.contains("view"));
+            modes.push_back(prepared.pflash_stats["view"].value("mode", ""));
+            TEST_ASSERT(prepared.pflash_stats["view"].value("served_tokens", 0) ==
+                        (int) served.size());
+            // The snapshot lands where the next turn's prompt branches off.
+            const auto generation =
+                tokenizer.encode("<|im_start|>assistant\n<think>\n");
+            TEST_ASSERT(prepared.snapshot_cut ==
+                        (int) (served.size() - generation.size()));
+        };
+        run(turn1, served1);
+        wanted = "beta facts";   // the new query wants what turn 1 dropped
+        run(turn2, served2);
+        run(turn2, served3);     // a retry serves the same view
+    }
+    const std::string text1 = tokenizer.decode(served1);
+    const std::string text2 = tokenizer.decode(served2);
+    TEST_ASSERT(text1.find("alpha facts") != std::string::npos);
+    TEST_ASSERT(text1.find("beta facts") == std::string::npos);
+
+    // Turn 2 extends turn 1's served prompt: everything before its
+    // generation prompt is reused token for token.
+    const auto generation = tokenizer.encode("<|im_start|>assistant\n<think>\n");
+    TEST_ASSERT(served1.size() > generation.size());
+    const size_t reused = served1.size() - generation.size();
+    TEST_ASSERT(served2.size() > reused);
+    TEST_ASSERT(std::equal(served1.begin(), served1.begin() + (long) reused,
+                           served2.begin()));
+    // The recalled segment opens the new user turn, after the answer.
+    const size_t answer = text2.find("Answer one.");
+    const size_t recall = text2.find("[Earlier in this conversation]");
+    const size_t question = text2.find("Question two?");
+    TEST_ASSERT(answer != std::string::npos);
+    TEST_ASSERT(recall != std::string::npos && recall > answer);
+    TEST_ASSERT(text2.find("beta facts", recall) != std::string::npos);
+    TEST_ASSERT(question != std::string::npos && question > recall);
+    TEST_ASSERT(served3 == served2);
+    TEST_ASSERT(modes == std::vector<std::string>({"fresh", "continue", "repeat"}));
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_multi_turn_keeps_skeleton_and_history_queries) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", nullptr};
+
+    std::string material;
+    for (int i = 0; i < 80; ++i) material += "filler words here. ";
+    const std::vector<ChatMessage> messages{
+        {"system", "You are helpful.", ""},
+        {"user", "Here is text: " + material + "What is the first answer?", ""},
+        {"assistant", "Sure.", ""},
+        {"user", "What is the answer?", ""},
+    };
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", " first", "?", "user", "assistant",
+         "system", "\n", "Sure", ".", " filler", " words", " here"},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 1.0f;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        json wire = json::array();
+        for (const auto & message : messages) {
+            wire.push_back({{"role", message.role}, {"content", message.content}});
+        }
+        request.messages = wire;
+        request.prompt_tokens = tokenizer.encode(rendered);
+        const std::string error =
+            HttpServerTestAccess::apply_pflash_compression(server, request);
+        TEST_ASSERT_MSG(error.empty(), error);
+    }
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & request = backend.last_request;
+    const auto & ids = request.input_ids;
+    const auto text_of = [&] (const PFlashTokenSpan & span) {
+        return tokenizer.decode({ids.begin() + span.begin, ids.begin() + span.end});
+    };
+    // The short assistant answer stays whole; the long first user turn keeps
+    // only its header, its material competes for the budget.
+    bool answer_kept = false;
+    bool material_kept = false;
+    for (const auto & span : request.required_instruction_spans) {
+        const std::string text = text_of(span);
+        answer_kept = answer_kept || text.find("Sure.") != std::string::npos;
+        material_kept = material_kept ||
+            text.find("filler words") != std::string::npos;
+    }
+    TEST_ASSERT(answer_kept);
+    TEST_ASSERT(!material_kept);
+    // The earlier question scores alongside the current one, through the
+    // last token of the header of the reply that followed it.
+    TEST_ASSERT(request.history_query_spans.size() == 1);
+    const auto history = request.history_query_spans[0];
+    TEST_ASSERT(history.end - history.begin == 1);
+    TEST_ASSERT_MSG(tokenizer.decode({ids.begin() + history.end,
+                                      ids.begin() + history.end + 2}) == "Sure.",
+                    text_of(history));
+    unlink(path.c_str());
+}
+
+// Two turns over one document through prepare_prompt; returns the served
+// prompts, the view modes and how often the compressor ran.
+struct PflashTwoTurnRun {
+    std::vector<std::vector<int32_t>> served;
+    std::vector<std::string> modes;
+    int compress_calls = 0;
+    std::string text2;
+};
+
+static PflashTwoTurnRun pflash_two_turn_run(const std::string & follow_up) {
+    std::string system;
+    for (int i = 0; i < 20; ++i) system += "You are helpful. ";
+    const std::string document =
+        "alpha facts live here. filler filler filler. beta facts live here.";
+    const std::vector<ChatMessage> turn1{
+        {"system", system, ""},
+        {"user", document + " Question one?", ""},
+    };
+    auto turn2 = turn1;
+    turn2.push_back({"assistant", "Answer one.", ""});
+    turn2.push_back({"user", follow_up + " Question two?", ""});
+    const auto render = [] (const std::vector<ChatMessage> & messages) {
+        return render_chat_template(messages, ChatFormat::QWEN3,
+                                    /*add_generation_prompt=*/true,
+                                    /*enable_thinking=*/true);
+    };
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"alpha", " facts", "beta", " live", " here", ".", " filler",
+         "Question", " one", " two", "?", "Answer", "user", "assistant",
+         "system", "\n", "You", " are", " helpful", " pasted", " notes"},
+        render(turn2) +
+            "[Earlier in this conversation]\n[End of earlier excerpts]\n");
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<MockPflashSpanBackend>();
+    MockPflashSpanBackend & backend = *backend_owner;
+    // The fact and the questions: a prompt-end query ranks the user's own
+    // sentences first, so the scorer keeps them.
+    backend.pick = [&] (const ModelBackend::CompressRequest & request) {
+        std::vector<PFlashTokenSpan> spans;
+        for (const char * text : {"alpha facts", "Question one?", "Question two?"}) {
+            const auto span = http_detail::pflash_decoded_text_span(
+                tokenizer, request.input_ids, 0, (int) request.input_ids.size(),
+                text);
+            if (span.begin >= 0) spans.push_back(span);
+        }
+        return spans;
+    };
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    config.pflash_keep_ratio = 1.0f;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    PflashTwoTurnRun run;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        const std::vector<const std::vector<ChatMessage> *> turns{&turn1, &turn2};
+        for (const auto * messages : turns) {
+            ParsedRequest request;
+            request.format = ApiFormat::OPENAI_CHAT;
+            json wire = json::array();
+            for (const auto & message : *messages) {
+                wire.push_back({{"role", message.role}, {"content", message.content}});
+            }
+            request.messages = wire;
+            request.prompt_tokens = tokenizer.encode(render(*messages));
+            const auto prepared = HttpServerTestAccess::prepare_prompt(server, request);
+            TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+            run.served.push_back(prepared.tokens);
+            run.modes.push_back(prepared.pflash_stats["view"].value("mode", ""));
+        }
+    }
+    run.compress_calls = backend.compress_calls;
+    run.text2 = tokenizer.decode(run.served[1]);
+    unlink(path.c_str());
+    return run;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_view_small_follow_up_without_recall_skips_the_drafter) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar recall{"PFLASH_CHAT_RECALL", "0"};
+    const auto run = pflash_two_turn_run("");
+    // Turn 2 is appended exactly as full prefill appends it: no scoring.
+    TEST_ASSERT(run.compress_calls == 1);
+    TEST_ASSERT(run.modes == std::vector<std::string>({"fresh", "continue"}));
+    TEST_ASSERT(run.text2.find("[Earlier in this conversation]") == std::string::npos);
+    TEST_ASSERT(run.text2.find("Answer one.") != std::string::npos);
+    TEST_ASSERT(run.text2.find("Question two?") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_view_compresses_large_follow_ups_only) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar threshold{"PFLASH_CHAT_COMPRESS_NEW_TOKENS", "40"};
+    // The pasted turn is material, not a short turn kept whole.
+    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", "8"};
+    std::string pasted;
+    for (int i = 0; i < 12; ++i) pasted += " pasted notes filler.";
+    const auto run = pflash_two_turn_run(pasted);
+    TEST_ASSERT(run.compress_calls == 2);
+    TEST_ASSERT(run.modes == std::vector<std::string>({"fresh", "continue-compressed"}));
+    // The view before the new material is reused token for token...
+    const auto & first = run.served[0];
+    const auto & second = run.served[1];
+    TEST_ASSERT(second.size() > 0 && first.size() > 16);
+    const size_t prefix = first.size() - 8;
+    TEST_ASSERT(std::equal(first.begin(), first.begin() + (long) (prefix - 8),
+                           second.begin()));
+    // ...and the pasted material is compressed: only what the selection
+    // keeps (the question) survives, not the whole paste.
+    TEST_ASSERT_MSG(run.text2.find("Question two?") != std::string::npos, run.text2);
+    TEST_ASSERT(run.text2.find(pasted) == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_legacy_chat_query_uses_last_user_turn) {
+    // No strict-selection environment: the legacy selector derives the same
+    // query, and a trailing tool result does not replace the user's turn.
+    const std::vector<ChatMessage> messages{
+        {"user", "What is the answer?", ""},
+        {"assistant", "Sure.", ""},
+        {"tool", "tool output here", "call-1"},
+    };
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/false);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", "?", "user", "assistant", "\n",
+         "Sure", "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "user"}, {"content", "What is the answer?"}},
+            {{"role", "assistant"}, {"content", "Sure."}},
+            {{"role", "tool"}, {"content", "tool output here"},
+             {"tool_call_id", "call-1"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const std::string error =
+            HttpServerTestAccess::apply_pflash_compression(server, request);
+        TEST_ASSERT_MSG(error.empty(), error);
+    }
+
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & ids = backend.last_request.input_ids;
+    const int query_end = backend.last_request.score_query_end;
+    const int query_begin = query_end - backend.last_request.score_query_tokens;
+    TEST_ASSERT(query_begin >= 0);
+    TEST_ASSERT(backend.last_request.score_query_tokens <= 8);
+    const std::string query = tokenizer.decode(
+        {ids.begin() + query_begin, ids.begin() + query_end});
+    TEST_ASSERT_MSG(std::string("What is the answer?").size() >= query.size() &&
+                    std::string("What is the answer?").compare(
+                        19 - query.size(), query.size(), query) == 0,
+                    query);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_selection_owns_chat_continuations) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
+
+    const std::string rendered = render_chat_template(
+        {{"user", "first", ""},
+         {"assistant", "Sure.", ""},
+         {"user", "second question", ""}},
+        ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/false);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"first", "second", " question", "user", "assistant", "\n", "Sure",
+         "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    config.pflash_keep_ratio = 1.0f;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "user"}, {"content", "first"}},
+            {{"role", "assistant"}, {"content", "Sure."}},
+            {{"role", "user"}, {"content", "second question"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const auto prepared =
+            HttpServerTestAccess::prepare_prompt(server, request);
+        TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+        TEST_ASSERT(prepared.compressed);
+        TEST_ASSERT(!prepared.flowkv);
+    }
+
+    // Whole-prompt PFlash ran on the multi-turn prompt and scored against
+    // the prompt's last token.
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & ids = backend.last_request.input_ids;
+    TEST_ASSERT(backend.last_request.score_query_end == (int) ids.size());
+    TEST_ASSERT(backend.last_request.score_query_tokens == 1);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_default_continuation_stays_on_flowkv) {
+    const std::string rendered =
+        "<|im_start|>user\nfirst<|im_end|>\n"
+        "<|im_start|>assistant\nSure.<|im_end|>\n"
+        "<|im_start|>user\nsecond<|im_end|>\n"
+        "<|im_start|>assistant\n";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"first", "second", "user", "assistant", "\n", "Sure", "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "user"}, {"content", "first"}},
+            {{"role", "assistant"}, {"content", "Sure."}},
+            {{"role", "user"}, {"content", "second"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const auto prepared =
+            HttpServerTestAccess::prepare_prompt(server, request);
+        TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+    }
+
+    // Without a strict-selection environment FlowKV keeps owning
+    // continuations; whole-prompt PFlash never ran.
+    TEST_ASSERT(backend.compress_calls == 0);
+    unlink(path.c_str());
+}
 
 struct MockBatchCompressBackend : MockBackend {
     int compress_calls = 0;
@@ -8387,23 +10256,36 @@ TEST_CASE(ServerUnitFixture, test_flowkv_session_keep_ratio_override) {
 
     TEST_ASSERT(std::fabs(static_ratio - configured_ratio) < 1e-6f);
     TEST_ASSERT(std::fabs(adaptive_ratio - 0.09f) < 1e-6f);
+
+    // A session without feedback keeps the configured (curve) ratio, and its
+    // first feedback adapts from that ratio rather than the fixed default:
+    // 0.1875 (the 16K real-use budget) minus one small step at high acceptance.
+    const float curve_ratio = 0.1875f;
+    TEST_ASSERT(std::fabs(http_detail::resolve_pflash_keep_ratio(
+        curve_ratio, "fresh", sessions) - curve_ratio) < 1e-6f);
+    sessions.update("fresh", 0.95f, curve_ratio);
+    TEST_ASSERT(std::fabs(http_detail::resolve_pflash_keep_ratio(
+        curve_ratio, "fresh", sessions) - (curve_ratio - 0.01f)) < 1e-6f);
+    // Seeds are clamped to the controller's range like every later step.
+    sessions.update("wide", 0.50f, 0.30f);
+    TEST_ASSERT(std::fabs(sessions.get_keep_ratio("wide") - 0.20f) < 1e-6f);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Qwen3-0.6B drafter loader: truncated GGUF guard (bug #438)
+// Qwen3-0.6B model loader: truncated GGUF guard (bug #438)
 // ═══════════════════════════════════════════════════════════════════════
 //
 // Builds a minimal but structurally valid Qwen3-0.6B-style GGUF on disk, then
-// verifies that load_qwen3_drafter_model:
+// verifies that load_qwen3_model:
 //   (1) loads the full, untruncated file successfully (positive control), and
 //   (2) fails cleanly with a "truncated or corrupt" error when the tensor-data
 //       section is truncated — instead of letting the H2D copy read past the
 //       end of the mmap and SIGSEGV inside the device copy.
 
-// Write a tiny valid drafter GGUF and return its path. The loader fixes
-// n_vocab at 151936 (Qwen3DrafterWeights default), so token_embd stays the
+// Write a tiny valid model GGUF and return its path. The loader fixes
+// n_vocab at 151936 (Qwen3Weights default), so token_embd stays the
 // largest tensor (~2.4 MB BF16) while every other tensor is minimal.
-static std::string write_qwen3_drafter_fixture_gguf() {
+static std::string write_qwen3_model_fixture_gguf() {
     const int n_embd    = 8;
     const int n_head    = 2;
     const int head_dim  = 4;
@@ -8459,7 +10341,7 @@ static std::string write_qwen3_drafter_fixture_gguf() {
     add_tensor("blk.0.ffn_down.weight",    GGML_TYPE_BF16, 2, n_ff,     n_embd);
 
     const std::string path = test_tmp_path(
-        "luce_test_qwen3_drafter_438.gguf").string();
+        "luce_test_qwen3_model_438.gguf").string();
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
 
     gguf_free(g);
@@ -8467,18 +10349,18 @@ static std::string write_qwen3_drafter_fixture_gguf() {
     return path;
 }
 
-TEST_CASE(ServerUnitFixture, test_qwen3_drafter_rejects_truncated_gguf) {
-    const std::string path = write_qwen3_drafter_fixture_gguf();
+TEST_CASE(ServerUnitFixture, test_qwen3_model_rejects_truncated_gguf) {
+    const std::string path = write_qwen3_model_fixture_gguf();
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     TEST_ASSERT(backend != nullptr);
 
     // Positive control: the full, untruncated file loads cleanly.
     {
-        Qwen3DrafterWeights w;
-        bool ok = load_qwen3_drafter_model(path, backend, w);
+        Qwen3Weights w;
+        bool ok = load_qwen3_model(path, backend, w);
         TEST_ASSERT_MSG(ok, luce_last_error());
-        free_qwen3_drafter_model(w);
+        free_qwen3_model(w);
     }
 
     // Truncate inside the tensor-data section. The header, kv block, and tensor
@@ -8494,13 +10376,13 @@ TEST_CASE(ServerUnitFixture, test_qwen3_drafter_rejects_truncated_gguf) {
 
     // The loader must fail cleanly (no SIGSEGV) with a descriptive error.
     {
-        Qwen3DrafterWeights w;
-        bool ok = load_qwen3_drafter_model(path, backend, w);
+        Qwen3Weights w;
+        bool ok = load_qwen3_model(path, backend, w);
         TEST_ASSERT(!ok);
         const std::string err = luce_last_error();
         TEST_ASSERT_MSG(err.find("truncated or corrupt") != std::string::npos,
                         err.c_str());
-        free_qwen3_drafter_model(w);
+        free_qwen3_model(w);
     }
 
     ggml_backend_free(backend);

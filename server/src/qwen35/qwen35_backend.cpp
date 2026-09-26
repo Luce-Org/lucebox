@@ -6,6 +6,7 @@
 #include "common/spec_acceptance.h"
 #include "common/draft_block_size.h"
 #include "common/draft_swa.h"
+#include "placement/gpu_vmm_pool.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
@@ -26,8 +27,9 @@
 #include "common/restore_delta.h"
 #include "common/specla_mode.h"
 #include "qwen35_tensor_parallel.h"
-#include "qwen3/qwen3_drafter.h"
-#include "qwen3/qwen3_kvflash_scorer.h"
+#include "pflash/pflash_drafter.h"
+#include "pflash/pflash_compress.h"
+#include "pflash/kvflash_drafter_scorer.h"
 
 #include "ggml-cuda.h"
 #include "ggml-backend-impl.h"
@@ -651,7 +653,7 @@ bool Qwen35Backend::init() {
                     kvflash_qk_policy_ ? "qk (target pooled-K vs decode query)"
                     : !kvflash_drafter_path_.empty()
                         ? "drafter (attaches on first reselect)"
-                        : "lru (recency-only: no Qwen3-0.6B drafter found "
+                        : "lru (recency-only: no Qwen3.5-0.8B drafter found "
                           "next to the model or in --prefill-drafter)");
         std::fflush(stdout);
     }
@@ -1145,9 +1147,44 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
         }
     }
     if (load_request == nullptr) return results;
-    const bool should_park = !load_request->skip_park;
+
+    const auto classify = [&requests](const std::vector<CompressResult> & rs) {
+        auto outcome = SkipParkWindowOutcome::Ok;
+        for (size_t i = 0; i < requests.size(); ++i) {
+            const auto & r = requests[i];
+            if (r.input_ids.empty() || r.drafter_path.empty()) continue;
+            if (i >= rs.size()) return SkipParkWindowOutcome::Failed;
+            if (rs[i].ok) continue;
+            if (rs[i].out_of_memory) return SkipParkWindowOutcome::OutOfMemory;
+            outcome = SkipParkWindowOutcome::Failed;
+        }
+        return outcome;
+    };
+    const auto drop_drafter = [this]() {
+        // free_drafter() handles the loaded case and the kvflash scorer
+        // borrow; the unconditional free clears a backend/weights
+        // half-initialized by a failed load_drafter.
+        free_drafter();
+        luce::common::free_drafter(drafter_ctx_);
+        drafter_loaded_ = false;
+    };
+    return run_skip_park_window(
+        load_request->skip_park, skip_park_fallback_,
+        [&](bool park_window) {
+            return run_compress_window(requests, *load_request, park_window);
+        },
+        classify, drop_drafter, "[compress]");
+}
+
+std::vector<ModelBackend::CompressResult> Qwen35Backend::run_compress_window(
+        const std::vector<CompressRequest> & requests,
+        const CompressRequest & load_request,
+        bool park_window) {
+    std::vector<CompressResult> results(requests.size());
+    // A recent out-of-memory window overrides KeepLoaded: VRAM is tight.
     const bool release_after_use =
-        load_request->residency_action == DraftResidencyAction::ReleaseAfterUse;
+        load_request.residency_action == DraftResidencyAction::ReleaseAfterUse ||
+        skip_park_fallback_.memory_tight();
 
     // Park target+draft to free VRAM for the drafter (unless skip_park).
     // A FlowKV request may contain many aged messages. Keep this residency
@@ -1155,7 +1192,7 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
     // models independently.
     const bool was_target_parked = target_parked_;
     const bool was_draft_parked  = draft_parked_;
-    if (should_park) {
+    if (park_window) {
         step_graph_destroy(sg_);
         if (!target_parked_) park(ParkTarget::TargetModel);
         if (!draft_parked_)  park(ParkTarget::DraftModel);
@@ -1175,12 +1212,14 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
     if (!drafter_loaded_) {
         // drafter_ctx_.backend == nullptr → load_drafter creates its own
         std::fprintf(stderr, "[compress] loading drafter from %s ...\n",
-                     load_request->drafter_path.c_str());
-        if (!load_drafter(load_request->drafter_path, /*gpu_layers=*/999,
-                          load_request->drafter_gpu, drafter_ctx_)) {
+                     load_request.drafter_path.c_str());
+        if (!load_drafter(load_request.drafter_path, /*gpu_layers=*/999,
+                          load_request.drafter_gpu, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
                          luce_last_error());
-            if (should_park) {
+            const bool oom = luce::common::last_error_is_oom();
+            for (auto & result : results) result.out_of_memory = oom;
+            if (park_window) {
                 if (!was_target_parked) unpark(ParkTarget::TargetModel);
                 if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
             }
@@ -1202,11 +1241,28 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
         if (request.input_ids.empty() || request.drafter_path.empty()) continue;
 
         auto & result = results[index];
+        // score_query_end < 0 is the legacy "tail window" request value;
+        // the qwen35 scorer requires an explicit end.
+        const int score_query_end = request.score_query_end >= 0
+            ? request.score_query_end : (int)request.input_ids.size();
         result.compressed_ids = drafter_score_and_compress(
             drafter_ctx_, request.input_ids, request.keep_ratio,
             /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
-            request.score_query_end);
+            score_query_end, request.required_instruction_spans,
+            request.query_suffix_candidates, request.history_query_spans,
+            request.turn_query_span);
         result.ok = !result.compressed_ids.empty();
+        result.out_of_memory = !result.ok && luce::common::last_error_is_oom();
+        if (result.ok) result.kept_spans = pflash_last_kept_spans();
+        if (result.ok) {
+            const auto & scoring = pflash_last_scoring_stats();
+            result.scorer_resume = scoring.resume;
+            result.scorer_new_tokens = scoring.new_tokens;
+            result.scorer_forward_s = scoring.forward_s;
+            for (const auto & candidate : pflash_last_candidate_lifts()) {
+                result.candidate_lifts.push_back({candidate.span, candidate.lift});
+            }
+        }
         if (result.ok) {
             std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
                          request.input_ids.size(), result.compressed_ids.size());
@@ -1218,7 +1274,7 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
     }
 
     // Restore park state
-    if (should_park) {
+    if (park_window) {
         if (!was_target_parked) unpark(ParkTarget::TargetModel);
         if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
     }
@@ -1248,7 +1304,7 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
     req.keep_ratio = (float)keep_x1000 / 1000.0f;
     req.drafter_path = (n >= 3 && drafter_path[0])
         ? drafter_path
-        : "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+        : "/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf";
     {
         size_t total_vram = 0;
         int dev = 0;
@@ -1257,7 +1313,8 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
         if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess)
             total_vram = prop.totalGlobalMem;
         const bool allowed = luce::common::skip_park_allowed(
-            skip_park, total_vram, cfg_.device.max_ctx);
+            skip_park, total_vram, cfg_.device.max_ctx,
+            luce::common::gpu_backend_uses_vmm_pool());
         if (skip_park && !allowed) {
             std::fprintf(stderr,
                 "[server] --prefill-skip-park downgraded: <32GB GPU with max_ctx>65536"

@@ -1,5 +1,7 @@
 #include "gguf_inspect.h"
+#include "ggml.h"
 #include "gguf.h"
+#include "kv_quant.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -419,6 +421,148 @@ GgufMetadata read_gguf_metadata(const std::string & path,
     }
 
     return m;
+}
+
+// ─── PFlash drafter footprint (skip-park estimator) ─────────────────────
+//
+// Worst-case per-token GPU state while the Qwen3.5 drafter scores a window
+// (pflash/qwen35_drafter.cpp), on top of its weights:
+//
+//   strict scorer (block-15 head, the default under strict selection):
+//     scoring sessions      PFLASH_DRAFTER_SESSIONS (default 2) sessions kept
+//                           for prefix reuse, each sized S + S/2 + 4096:
+//                           KV of the full-attention layers in blocks 0..14
+//                           + f32 block-15 keys [head_dim, n_head_kv]
+//     act_in + act_out      [n_embd, S] f32                  → 2·n_embd·4
+//     logits + mask         [S, nq, n_head] + [S, nq] f32    → nq·(n_head+1)·4
+//                           (nq = the scorer query window, up to 512 tokens)
+//     probe raw scores      [S] f32 ×2
+//   legacy scorer (all-layer running max): full-depth KV + activations
+//
+// Both are bounded; the estimate takes the larger per-token cost.
+// Fixed: SSM/conv state and snapshots, per-1024-token-ubatch transients,
+// 8192-key score chunks, gallocr slack, and the sessions' 4096-token headroom.
+
+namespace {
+
+constexpr int64_t kLegacyLookahead = 8;
+constexpr int     kQwen35HeadBlocks = 15;   // blocks 0..14 feed the head
+// SSM/conv state + per-ubatch and key-chunk transients + gallocr slack.
+constexpr int64_t kHybridFixedBytes = 384ll * 1024 * 1024;
+
+// The drafter cache wraps create_target_cache in ScopedKvTq3Off — TQ3 is never
+// a drafter KV type, so suppress it while resolving the same env overrides.
+struct ScopedKvTq3Suppress {
+    ScopedKvTq3Suppress() {
+        const char * raw = std::getenv("LUCE_KV_TQ3");
+        had_ = raw != nullptr;
+        old_ = had_ ? raw : "";
+#if defined(_WIN32)
+        _putenv_s("LUCE_KV_TQ3", "0");
+#else
+        setenv("LUCE_KV_TQ3", "0", 1);
+#endif
+    }
+    ~ScopedKvTq3Suppress() {
+#if defined(_WIN32)
+        if (had_) _putenv_s("LUCE_KV_TQ3", old_.c_str());
+        else      _putenv_s("LUCE_KV_TQ3", "");
+#else
+        if (had_) setenv("LUCE_KV_TQ3", old_.c_str(), 1);
+        else      unsetenv("LUCE_KV_TQ3");
+#endif
+    }
+    bool        had_ = false;
+    std::string old_;
+};
+
+}  // namespace
+
+bool inspect_drafter_footprint(const std::string & path,
+                               int query_tokens,
+                               int scoring_sessions,
+                               SkipParkDrafterInfo & out) {
+    out = SkipParkDrafterInfo{};
+
+    struct stat st{};
+    if (::stat(path.c_str(), &st) == 0) out.weights_bytes = int64_t(st.st_size);
+
+    gguf_init_params gip{};
+    gip.no_alloc = true;
+    gip.ctx = nullptr;
+    gguf_context * gctx = gguf_init_from_file(path.c_str(), gip);
+    if (!gctx) return false;
+
+    std::string arch;
+    if (int64_t id = gguf_find_key(gctx, "general.architecture"); id >= 0) {
+        if (const char * v = gguf_get_val_str(gctx, id)) arch = v;
+    }
+    // The PFlash drafter is a Qwen3.5 hybrid (pflash/pflash_drafter.cpp);
+    // anything else is not a drafter the scorer can load.
+    if (arch != "qwen35") { gguf_free(gctx); return false; }
+
+    auto get_i32 = [&](const char * suffix, int32_t & dst) -> bool {
+        const std::string key = arch + "." + suffix;
+        const int64_t id = gguf_find_key(gctx, key.c_str());
+        if (id < 0) return false;
+        dst = int32_t(gguf_get_val_u32(gctx, id));
+        return true;
+    };
+
+    // Qwen3.5-0.8B defaults, so a partial header still gets a bounded estimate.
+    int32_t n_layer = 24, n_embd = 1024, n_head = 8, n_head_kv = 2,
+            head_dim = 256, fai = 4, ctx_len = 262144;
+    get_i32("block_count",                  n_layer);
+    get_i32("embedding_length",             n_embd);
+    get_i32("attention.head_count",         n_head);
+    get_i32("attention.head_count_kv",      n_head_kv);
+    get_i32("attention.key_length",         head_dim);
+    get_i32("full_attention_interval",      fai);
+    get_i32("context_length",               ctx_len);
+    // Embedded NextN blocks inflate block_count on hybrid checkpoints.
+    int32_t nextn = 0;
+    get_i32("nextn_predict_layers",         nextn);
+    gguf_free(gctx);
+
+    if (n_layer <= 0 || n_embd <= 0 || n_head <= 0 || n_head_kv <= 0 ||
+        head_dim <= 0 || fai <= 0 || ctx_len <= 0) {
+        return false;
+    }
+    if (nextn > 0 && nextn < n_layer) n_layer -= nextn;
+
+    ggml_type kv_k = GGML_TYPE_Q4_0, kv_v = GGML_TYPE_Q4_0;
+    {
+        ScopedKvTq3Suppress tq3_off;
+        luce::resolve_kv_types(kv_k, kv_v);
+    }
+
+    const int64_t nq = std::max<int64_t>(query_tokens, kLegacyLookahead);
+    const int64_t sessions = std::max(scoring_sessions, 1);
+    // PFLASH_DRAFTER_SESSIONS=0 scores from a scratch session sized S.
+    const int64_t capacity_x2 = scoring_sessions > 0 ? 3 : 2;   // ×1.5 or ×1
+    const int64_t session_per_token =
+        int64_t(kv_reservation_bytes_per_token(
+            std::min(n_layer, kQwen35HeadBlocks), fai, n_head_kv,
+            kv_k, head_dim, kv_v, head_dim)) +                    // KV
+        int64_t(head_dim) * n_head_kv * 4;                        // keys
+    const int64_t strict_per_token =
+        sessions * session_per_token * capacity_x2 / 2 +
+        int64_t(2) * n_embd * 4 +                                 // act_in/out
+        nq * (n_head + 1) * 4 +                                   // logits+mask
+        2 * 4;                                                    // probe raw
+    const int64_t legacy_per_token =
+        int64_t(2) * n_embd * 4 +                                 // act_in/out
+        int64_t(kv_reservation_bytes_per_token(
+            n_layer, fai, n_head_kv, kv_k, head_dim, kv_v, head_dim)) +
+        kLegacyLookahead * n_head * 4 +                           // logits
+        (kLegacyLookahead + 2) * 4;                               // mask+probe
+
+    out.recognized = true;
+    out.runtime_bytes_per_token = std::max(strict_per_token, legacy_per_token);
+    out.fixed_bytes = kHybridFixedBytes +
+        (scoring_sessions > 0 ? sessions * 4096 * session_per_token : 0);
+    out.context_length = ctx_len;
+    return true;
 }
 
 }  // namespace luce::common

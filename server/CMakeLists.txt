@@ -191,9 +191,9 @@ endif()
 
 # ─── ggml (vendored from llama.cpp) ──────────────────────────────────
 #
-# We use only ggml from the vendored llama.cpp snapshot. The drafter is
-# loaded via our own custom Qwen3-0.6B forward
-# (src/qwen3/qwen3_loader.cpp + src/qwen3/qwen3_graph.cpp)
+# We use only ggml from the vendored llama.cpp snapshot. The PFlash drafter
+# is loaded via our own custom Qwen3.5-0.8B forward
+# (src/pflash/qwen35_loader.cpp + src/qwen35/qwen35_target_graph.cpp)
 # rather than libllama, so libllama is not built.
 #
 # No BLAS, no Metal, no Vulkan, no examples/tests/tools.
@@ -531,6 +531,7 @@ set(LUCE_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/bailingmoe3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pflash
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
@@ -547,11 +548,14 @@ add_library(luce_common STATIC
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
-    src/qwen3/anchor_scan.cpp
-    src/qwen3/qwen3_drafter.cpp
-    src/qwen3/qwen3_kvflash_scorer.cpp
+    src/pflash/anchor_scan.cpp
+    src/pflash/pflash_selection.cpp
+    src/pflash/pflash_drafter.cpp
+    src/pflash/pflash_compress.cpp
+    src/pflash/qwen35_drafter.cpp
+    src/pflash/qwen35_loader.cpp
+    src/pflash/kvflash_drafter_scorer.cpp
     src/qwen3/qwen3_loader.cpp
-    src/qwen3/qwen3_graph.cpp
     src/qwen3/qwen3_backend.cpp
     src/qwen3/qwen3_daemon.cpp
     src/gemma4/gemma4_loader.cpp
@@ -654,6 +658,7 @@ add_library(luce_common STATIC
     src/common/backend_precision.cpp
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
+    src/placement/gpu_vmm_pool.cpp
     src/common/backend_plan.cpp
     src/common/backend_factory.cpp
     src/common/feature_gate.cpp
@@ -750,7 +755,7 @@ endif()
 #   - CUDA sm_60–sm_69 (Pascal): scalar F16, no tensor cores — flashprefill_scalar.cu
 #   - HIP Phase 1 (default): ggml q8 fallback, no custom kernels.
 #   - HIP Phase 2 (LUCE_HIP_SM80_EQUIV=ON): rocWMMA-native kernels.
-# The dispatch in qwen3_graph.cpp checks buffer type at runtime:
+# The dispatch in flashprefill.h checks buffer type at runtime:
 #   BF16 buffers → bf16 WMMA kernel; F16 buffers → f16 WMMA kernel; else → ggml FA.
 if(LUCE_GPU_BACKEND STREQUAL "hip")
     # rms_norm_hip.cu is needed by the HIP chunk-B graph path regardless of SM80_EQUIV.
@@ -1463,12 +1468,6 @@ if(LUCE_TESTS)
         target_link_libraries(test_turbo_wht_warp PRIVATE CUDA::cudart)
         list(APPEND _raw_unit_test_targets test_turbo_wht_warp)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
-        # RED phase binary: same source WITHOUT the fix flag — documents the bug.
-        add_executable(test_drafter_tail_capture_guard_red
-            test/test_unit_main.cpp
-            test/test_drafter_tail_capture_guard.cpp)
-    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
         target_link_libraries(test_draft_vs_reference PRIVATE luce_common)
@@ -2162,10 +2161,8 @@ if(LUCE_TESTS)
             test/test_chain_rollback_policy.cpp
             test/test_ddtree_tau.cpp
             test/test_anchor_transitive.cpp
-            test/test_drafter_early_exit_score_range.cpp
-            test/test_drafter_tail_capture_guard.cpp
-            test/test_drafter_warm_path_regression.cpp
-            test/test_qwen3_buffer_plan.cpp
+            test/test_pflash_drafter_ipc.cpp
+            test/test_pflash_selection.cpp
             test/test_model_test_paths.cpp
             test/test_gguf_mmap.cpp
             test/test_kv_quant.cpp
@@ -2189,7 +2186,7 @@ if(LUCE_TESTS)
             src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
-            src/qwen3/anchor_scan.cpp)
+            src/pflash/anchor_scan.cpp)
         # Keep the GREEN formula target-local: the separate RED regression
         # executable compiles the same source without this definition.
         target_compile_definitions(test_server_unit PRIVATE

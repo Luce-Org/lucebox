@@ -16,6 +16,8 @@
 #include "model_card.h"
 #include "common/backend_factory.h"
 #include "common/chain_rollback_policy.h"
+#include "common/gguf_inspect.h"
+#include "common/gpu_runtime_compat.h"
 #include "common/layer_split_utils.h"
 #include "common/model_capabilities.h"
 #include "common/spark_corpus.h"
@@ -27,6 +29,9 @@
 #include "engine/luce_engine.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
+#include "placement/gpu_vmm_pool.h"
+#include "pflash/pflash_drafter.h"
+#include "pflash/pflash_selection.h"
 #include "kvflash_pager.h"
 #include "kv_quant.h"
 
@@ -203,8 +208,12 @@ static void print_usage(const char * prog) {
         "                              (token,ratio) breakpoints; linear interp.\n"
         "                              Overrides --prefill-keep-ratio. Example:\n"
         "                              10000:0.5 40000:0.2 100000:0.1\n"
-        "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3-0.6B)\n"
-        "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
+        "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3.5-0.8B)\n"
+        "  --prefill-skip-park [auto|on|off]\n"
+        "                              Keep target+draft resident while the\n"
+        "                              drafter scores (default: auto — resolved\n"
+        "                              from drafter footprint vs. free VRAM;\n"
+        "                              bare flag = on)\n"
         "  --draft-residency auto|persistent|request-scoped\n"
         "                         Drafter lifetime policy (default: auto)\n"
         "  --lazy-draft                Legacy alias for --draft-residency=request-scoped\n"
@@ -714,7 +723,16 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         } else if (std::strcmp(argv[i], "--prefill-drafter") == 0 && i + 1 < argc) {
             sconfig.pflash_drafter_path = argv[++i];
         } else if (std::strcmp(argv[i], "--prefill-skip-park") == 0) {
-            sconfig.pflash_skip_park = true;
+            // Tri-state: bare flag = on (historical boolean). The value is
+            // optional — consume the next arg only when it parses as a mode
+            // so a stray positional isn't mistaken for a value.
+            if (i + 1 < argc && argv[i + 1][0] != '-' &&
+                parse_skip_park_mode(argv[i + 1],
+                                     sconfig.pflash_skip_park_mode)) {
+                ++i;
+            } else {
+                sconfig.pflash_skip_park_mode = SkipParkMode::On;
+            }
         } else if (std::strcmp(argv[i], "--prefill-upstream-base") == 0 && i + 1 < argc) {
             sconfig.pflash_upstream_base = argv[++i];
             // Strip trailing slash
@@ -1123,11 +1141,11 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             std::fprintf(stderr, "[server] drafter tokenizer load failed\n");
             return 1;
         }
-        std::fprintf(stderr, "[server] pflash: mode=%s threshold=%d keep=%.3f drafter_gpu=%d skip_park=%d\n",
+        std::fprintf(stderr, "[server] pflash: mode=%s threshold=%d keep=%.3f drafter_gpu=%d skip_park=%s\n",
                      sconfig.pflash_mode == ServerConfig::PflashMode::AUTO ? "auto" : "always",
                      sconfig.pflash_threshold, sconfig.pflash_keep_ratio,
                      sconfig.pflash_drafter_gpu,
-                     (int)sconfig.pflash_skip_park);
+                     skip_park_mode_name(sconfig.pflash_skip_park_mode));
         if (!sconfig.pflash_curve.empty()) {
             std::fprintf(stderr, "[server] pflash curve:");
             for (const auto & p : sconfig.pflash_curve)
@@ -1214,6 +1232,78 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         backend->shutdown();
         return 2;
     }
+
+    // ── Skip-park startup resolution ──────────────────────────────────────
+    // Resolve --prefill-skip-park once, here: after the backend has fully
+    // loaded (so free VRAM reflects the resident target + decode draft) and
+    // before sconfig is frozen into the HttpServer. Auto compares the
+    // drafter's GGUF-derived footprint against measured free VRAM on the
+    // drafter device; on/off are explicit. Remote-IPC and upstream-proxy
+    // drafters never park in-process, so they resolve off unconditionally.
+    if (pflash_enabled && !sconfig.pflash_drafter_path.empty() &&
+        !sconfig.pflash_remote_drafter &&
+        sconfig.pflash_upstream_base.empty()) {
+        // The scorer's query window sizes its logits; an invalid selection
+        // config fails every request later, so the widest window is a safe
+        // stand-in here.
+        luce::pflash::PFlashSelectionConfig selection;
+        std::string selection_error;
+        const int query_tokens =
+            luce::pflash::resolve_pflash_selection(
+                sconfig.max_ctx, /*legacy_chunk_size=*/32, selection,
+                selection_error)
+                ? selection.query_tokens : 512;
+        SkipParkDrafterInfo footprint;
+        const bool footprint_ok = inspect_drafter_footprint(
+            sconfig.pflash_drafter_path, query_tokens,
+            pflash_scoring_sessions(), footprint);
+        const bool vmm_pool = gpu_backend_uses_vmm_pool();
+        int64_t total_vram = -1, free_vram = -1;
+        int prev_dev = -1;
+        if (cudaGetDevice(&prev_dev) == cudaSuccess) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, sconfig.pflash_drafter_gpu) ==
+                cudaSuccess) {
+                total_vram = int64_t(prop.totalGlobalMem);
+            }
+            if (cudaSetDevice(sconfig.pflash_drafter_gpu) == cudaSuccess) {
+                size_t free_b = 0, total_b = 0;
+                if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+                    free_vram = int64_t(free_b);
+                }
+                (void)cudaSetDevice(prev_dev);
+            }
+        }
+        const SkipParkDecision decision = resolve_skip_park(
+            sconfig.pflash_skip_park_mode,
+            /*drafter_configured=*/true,
+            footprint_ok ? footprint : SkipParkDrafterInfo{},
+            free_vram, total_vram, sconfig.max_ctx, vmm_pool);
+        sconfig.pflash_skip_park = decision.enabled;
+        sconfig.pflash_keep_drafter_loaded = decision.keep_drafter_loaded;
+        sconfig.pflash_skip_park_required_bytes = decision.required_bytes;
+        sconfig.pflash_skip_park_free_bytes =
+            std::max<int64_t>(free_vram, 0);
+        std::fprintf(stderr,
+            "[server] pflash skip-park: mode=%s → %s "
+            "(need %.2f GiB incl. margin, keep-loaded %.2f GiB, free %.2f GiB, "
+            "window %lld tok, query %d tok, vmm_pool=%d)\n",
+            skip_park_mode_name(sconfig.pflash_skip_park_mode),
+            decision.reason.c_str(),
+            decision.required_bytes / double(1ll << 30),
+            decision.keep_loaded_bytes / double(1ll << 30),
+            std::max<int64_t>(free_vram, 0) / double(1ll << 30),
+            (long long)decision.window_tokens, query_tokens, (int)vmm_pool);
+    } else {
+        sconfig.pflash_skip_park = false;
+        sconfig.pflash_keep_drafter_loaded = false;
+        if (pflash_enabled) {
+            std::fprintf(stderr,
+                "[server] pflash skip-park: off (remote/upstream drafter or "
+                "no drafter)\n");
+        }
+    }
+
     // ── Thinking-budget v2: resolve model card and apply to ServerConfig ──
     // Reuse the metadata captured during factory preparation instead of
     // opening the GGUF header again.
@@ -1507,7 +1597,9 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         std::fprintf(stderr, "[server] │  pflash_drafter_gpu= %d\n", sconfig.pflash_drafter_gpu);
         std::fprintf(stderr, "[server] │  pflash_drafter_exec= %s\n",
                      sconfig.pflash_remote_drafter ? "remote-ipc" : "local");
-        std::fprintf(stderr, "[server] │  pflash_skip_park= %s\n", sconfig.pflash_skip_park ? "ON" : "off");
+        std::fprintf(stderr, "[server] │  pflash_skip_park= %s (mode=%s)\n",
+                     sconfig.pflash_skip_park ? "ON" : "off",
+                     skip_park_mode_name(sconfig.pflash_skip_park_mode));
         std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("LUCE_FP_USE_BSA") ? "ON" : "off");
         std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("LUCE_FP_ALPHA") ? getenv("LUCE_FP_ALPHA") : "0.12 (default)");
     }

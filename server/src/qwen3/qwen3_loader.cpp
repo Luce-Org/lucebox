@@ -1,4 +1,4 @@
-// GGUF loader for Qwen3-0.6B drafter. Reads weights from a BF16 GGUF file
+// GGUF loader for the Qwen3-0.6B model. Reads weights from a BF16 GGUF file
 // produced by `convert_hf_to_gguf.py Qwen/Qwen3-0.6B`. Sets up ggml tensors
 // on the requested backend.
 //
@@ -22,8 +22,9 @@
 // We mmap the GGUF file and copy each tensor's bytes to the backend buffer
 // (mirrors the luce gguf_target_loader pattern).
 
-#include "qwen3_drafter_model.h"
+#include "qwen3_model.h"
 #include "common/backend_precision.h"
+#include "common/gguf_inspect.h"
 #include "common/gguf_mmap.h"
 #include "internal.h"
 
@@ -91,6 +92,20 @@ bool copy_tensor_from_file(gguf_context * gctx, const char * name,
         return true;
     }
 
+    if (src_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_BF16) {
+        std::vector<ggml_bf16_t> tmp_bf16((size_t)n);
+        ggml_fp32_to_bf16_row((const float *)src, tmp_bf16.data(), n);
+        ggml_backend_tensor_set(dst, tmp_bf16.data(), 0, ggml_nbytes(dst));
+        return true;
+    }
+
+    if (src_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp_f16((size_t)n);
+        ggml_fp32_to_fp16_row((const float *)src, tmp_f16.data(), n);
+        ggml_backend_tensor_set(dst, tmp_f16.data(), 0, ggml_nbytes(dst));
+        return true;
+    }
+
     std::fprintf(stderr, "[qwen3-0.6b] unsupported tensor conversion for %s: %s -> %s\n",
                  name, ggml_type_name(src_type), ggml_type_name(dst_type));
     return false;
@@ -110,9 +125,9 @@ float get_f32(gguf_context * g, const char * key, float def) {
 
 } // namespace
 
-bool load_qwen3_drafter_model(const std::string & path,
-                              ggml_backend_t backend,
-                              Qwen3DrafterWeights & out) {
+bool load_qwen3_model(const std::string & path,
+                      ggml_backend_t backend,
+                      Qwen3Weights & out) {
     out.backend = backend;
     const BackendPrecisionPolicy precision = select_drafter_precision_policy(backend);
     out.weight_type = precision.weight_type;
@@ -194,7 +209,7 @@ bool load_qwen3_drafter_model(const std::string & path,
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
     if (!out.buf) {
-        set_last_error("ggml_backend_alloc_ctx_tensors failed for Qwen3-0.6B drafter");
+        set_last_error("ggml_backend_alloc_ctx_tensors failed for Qwen3-0.6B");
         gguf_free(gctx);
         ggml_free(out.ctx);
         out.ctx = nullptr;
@@ -236,10 +251,10 @@ bool load_qwen3_drafter_model(const std::string & path,
         const size_t off = gguf_get_tensor_offset(gctx, i);  // relative to data_off
         const size_t sz  = gguf_get_tensor_size(gctx, i);
         if (data_off > file_size || off > data_avail || sz > data_avail - off) {
-            set_last_error(std::string("Qwen3-0.6B drafter GGUF is truncated or corrupt: tensor '")
+            set_last_error(std::string("Qwen3-0.6B GGUF is truncated or corrupt: tensor '")
                 + gguf_get_tensor_name(gctx, i) + "' data ends at " + std::to_string(data_off + off + sz)
                 + " but file is only " + std::to_string(file_size)
-                + " bytes. Re-download the drafter model (" + path + ").");
+                + " bytes. Re-download the model (" + path + ").");
             gguf_free(gctx);
             ggml_backend_buffer_free(out.buf);
             ggml_free(out.ctx);
@@ -290,7 +305,7 @@ bool load_qwen3_drafter_model(const std::string & path,
     return true;
 }
 
-void free_qwen3_drafter_model(Qwen3DrafterWeights & w) {
+void free_qwen3_model(Qwen3Weights & w) {
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx); w.ctx = nullptr; }
     w.layers.clear();

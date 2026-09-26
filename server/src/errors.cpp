@@ -12,11 +12,24 @@ namespace luce::common {
 namespace {
 std::mutex g_err_mu;
 std::string g_last_error;
+bool g_last_error_oom = false;
 }
 
 void set_last_error(std::string msg) {
     std::lock_guard<std::mutex> lk(g_err_mu);
     g_last_error = std::move(msg);
+    g_last_error_oom = false;
+}
+
+void set_last_oom_error(std::string msg) {
+    std::lock_guard<std::mutex> lk(g_err_mu);
+    g_last_error = std::move(msg);
+    g_last_error_oom = true;
+}
+
+bool last_error_is_oom() {
+    std::lock_guard<std::mutex> lk(g_err_mu);
+    return g_last_error_oom;
 }
 
 } // namespace luce::common

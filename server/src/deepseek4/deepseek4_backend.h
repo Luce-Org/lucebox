@@ -15,11 +15,12 @@
 #include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
+#include "pflash/pflash_drafter.h"
+#include "placement/skip_park_guard.h"
 #include "deepseek4_vision.h"
 #include "deepseek4_image_prompt.h"
 #include "deepseek4_image_assembly.h"
 #include "deepseek4_image_admission.h"
-#include "qwen3/qwen3_drafter.h"
 #include "deepseek4_seq_engine.h"
 
 #include "ggml.h"
@@ -189,6 +190,9 @@ private:
     bool                           pflash_drafter_loaded_ = false;
     std::string                    pflash_drafter_path_;
     int                            pflash_drafter_gpu_ = -1;
+    // Skip-park fail-safe: parks a few windows after an out-of-memory
+    // no-park window recovered with parking (placement/skip_park_guard.h).
+    SkipParkFallback               skip_park_fallback_;
     // Once a long prompt selects the fragmentation-safe prefill shape, retain
     // it for later requests so the HIP arenas never switch back under load.
     int                            hybrid_prefill_chunk_cap_ = 0;
@@ -197,6 +201,14 @@ private:
     bool load_spec_drafter();
     void release_spec_drafter(bool mark_parked);
     void release_pflash_drafter();
+    // One compression window (sync → park → load drafter → score → restore)
+    // with the park step optional. compress_batch runs it through
+    // run_skip_park_window, which retries parked after an out-of-memory
+    // no-park attempt.
+    std::vector<CompressResult> run_compress_window(
+        const std::vector<CompressRequest> & requests,
+        const CompressRequest & load_request,
+        bool park_window);
     void keep_spec_feature_tail(std::vector<float> & features,
                                 size_t max_rows) const;
     // True when a wide prefill path returns per-token DSpark features and the

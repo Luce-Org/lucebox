@@ -110,7 +110,7 @@ def main():
     # Default matches bench_niah_cpp.py's --drafter-tokenizer, since that is
     # the tokenizer the downstream NIAH bench uses to size case["prompt"]
     # for the drafter forward. Override for any other harness.
-    ap.add_argument("--tokenizer", default="Qwen/Qwen3-0.6B")
+    ap.add_argument("--tokenizer", default="Qwen/Qwen3.5-0.8B")
     args = ap.parse_args()
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
 
