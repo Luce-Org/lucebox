@@ -60,7 +60,7 @@ PFlash phase or DFlash draft-process boundary. See
 ## Performance
 
 NIAH single-needle end-to-end on RTX 3090 (Qwen3.6-27B Q4_K_M target,
-Qwen3-0.6B drafter, in-process daemon, `LUCE_FP_USE_BSA=1`,
+Qwen3.5-0.8B drafter, in-process daemon, `LUCE_FP_USE_BSA=1`,
 `LUCE_FP_ALPHA=0.85`, `keep_ratio=0.05`):
 
 | Source S | dflash TTFT | llama.cpp baseline | Speedup | NIAH |
@@ -81,10 +81,15 @@ src/
   flashprefill_select.cpp       Host fallback for block_select (rarely used)
   bsa_launcher.cu               BSA launcher: blockmask conversion + Flash_fwd_params
   bsa_fwd_inst.cu               Single-TU instantiation of BSA's hdim128 kernel
-  qwen3/                   Qwen3-0.6B drafter model code
+  pflash/                  PFlash drafter (Qwen3.5-0.8B scorer) code
+    qwen35_loader.cpp    GGUF → Qwen3.5-0.8B weights + scoring head + probe
+    qwen35_drafter.{h,cpp}    block-15 head scorer + legacy running-max scorer
+    pflash_drafter.{h,cpp}    drafter_score_and_compress() entry point
+    pflash_compress.{h,cpp}   scores → strict selection → compressed ids
+    pflash_selection.{h,cpp}  strict budget selection + segment probing
+  qwen3/                      Qwen3-0.6B standalone inference (not the drafter)
     qwen3_loader.cpp       GGUF → Qwen3-0.6B BF16 weight tensors
-    qwen3_graph.cpp        Custom Qwen3-0.6B forward (per-layer A/FP/B graphs)
-    qwen3_drafter.{h,cpp}       drafter_score_and_compress() entry point
+    qwen3_backend.{h,cpp}     step forward + ModelBackend
   qwen35/                       Qwen3.5/3.6 target + DFlash draft model code
     qwen35_target_graph.cpp     Qwen3.5/3.6 target graph (ggml)
     gguf_target_loader.cpp      Qwen3.5 target GGUF loader

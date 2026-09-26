@@ -12,7 +12,7 @@
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
-#include "qwen3/qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
 #include "qwen35_target_shard_ipc.h"
 #include "step_graph.h"
 #include "internal.h"

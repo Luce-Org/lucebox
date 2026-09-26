@@ -39,7 +39,7 @@ Long-context prefill is O(S²): vanilla llama.cpp on a single RTX 3090 takes **~
 **What was missing:** no implementation that sits in front of a quantized GGUF target on a 24 GB card without dragging Python+Triton into the runtime path. PFlash is that:
 
 - C++/CUDA daemon-resident drafter + scoring + target generation, all in one process, one ggml allocator.
-- Custom Qwen3-0.6B BF16 forward (`qwen3_0p6b_loader.cpp` + `qwen3_0p6b_graph.cpp`) — no libllama.
+- Custom Qwen3.5-0.8B BF16 forward (`src/pflash/qwen35_loader.cpp` + the qwen35 target graph) — no libllama.
 - 4 CUDA kernels for the FlashPrefill `mean_K → score → select → sparse_fwd` algorithm (`flashprefill_kernels.cu`).
 - BSA ([mit-han-lab/Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention), FA-2 derived, sm_80+) for the long-context drafter forward, wired without `libtorch` via 3 ATen/c10 header stubs (`server/deps/bsa_stubs/`).
 - 128K → 2.6K span selection at `keep_ratio=0.05`, NIAH retrieved at every measured context, decode ~74 tok/s downstream.
@@ -72,13 +72,13 @@ cmake --build server/build --target test_dflash test_flashprefill_kernels -j
 
 # 2. fetch weights (target + spec-decode draft + drafter scorer)
 uv run hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir server/models/
-uv run hf download Qwen/Qwen3-0.6B model.safetensors tokenizer.json --local-dir server/models/drafter/
+uv run hf download Qwen/Qwen3.5-0.8B model.safetensors tokenizer.json --local-dir server/models/drafter/
 uv run hf download z-lab/Qwen3.6-27B-DFlash model.safetensors --local-dir server/models/draft/
 
-# 2b. convert the drafter (Qwen3-0.6B HF) to a BF16 GGUF for the C++ scorer.
+# 2b. convert the drafter (Qwen3.5-0.8B HF) to a BF16 GGUF for the C++ scorer.
 #     The submodule already vendors llama.cpp at deps/llama.cpp.
 uv run python server/deps/llama.cpp/convert_hf_to_gguf.py server/models/drafter \
-       --outtype bf16 --outfile server/models/Qwen3-0.6B-BF16.gguf
+       --outtype bf16 --outfile server/models/Qwen3.5-0.8B-BF16.gguf
 
 # 3. generate NIAH cases + run head-to-head bench against the C++ daemon
 uv run --directory pflash python tests/niah_gen.py --n 1 --ctx 131072 --out /tmp/niah_128k.jsonl
@@ -86,7 +86,7 @@ uv run --directory pflash python tests/bench_niah_cpp.py \
   --bin    ../server/build/test_dflash \
   --target ../server/models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft-spec ../server/models/draft/model.safetensors \
-  --drafter-gguf ../server/models/Qwen3-0.6B-BF16.gguf \
+  --drafter-gguf ../server/models/Qwen3.5-0.8B-BF16.gguf \
   --cases  /tmp/niah_128k.jsonl --keep-ratio 0.05 --n-gen 256
 ```
 
@@ -99,8 +99,8 @@ For an OpenAI-compatible server with transparent compression on long prompts, ru
 | `--prefill-compression` | `off` / `auto` / `always` | `off` | When to run pflash. `auto` compresses when total prompt ≥ threshold; `always` compresses every request. |
 | `--prefill-threshold` | int (tokens) | `32000` | Token threshold for `auto` mode. |
 | `--prefill-keep-ratio` | float `(0, 1]` | `0.05` | Fraction of source tokens to keep after compression. `0.02` for 128K, `0.10` for 32K. |
-| `--prefill-drafter` | path to `.gguf` | required when not `off` | Drafter weights (Qwen3-0.6B BF16 GGUF). |
-| `--prefill-drafter-tokenizer` | HF repo id | `Qwen/Qwen3-0.6B` | HF tokenizer for the drafter vocab. |
+| `--prefill-drafter` | path to `.gguf` | required when not `off` | Drafter weights (Qwen3.5-0.8B BF16 GGUF). |
+| `--prefill-drafter-tokenizer` | HF repo id | `Qwen/Qwen3.5-0.8B` | HF tokenizer for the drafter vocab. |
 
 When `--prefill-compression != off`, the server auto-sets `LUCE_LM_HEAD_FIX=0` and `LUCE_FA_WINDOW=0` (matching the bench harness — needed so the post-compress draft graph fits on a 24 GB card without OOM).
 
@@ -111,7 +111,7 @@ When `--prefill-compression != off`, the server auto-sets `LUCE_LM_HEAD_FIX=0` a
   --prefill-compression auto \
   --prefill-threshold 4096 \
   --prefill-keep-ratio 0.02 \
-  --prefill-drafter server/models/Qwen3-0.6B-BF16.gguf
+  --prefill-drafter server/models/Qwen3.5-0.8B-BF16.gguf
 ```
 
 Below the threshold the server runs the standard target generate (no compression). Above it, the server transparently runs `compress` on the daemon, swaps the prompt for the compressed text, and continues the normal `/v1/chat/completions` flow. Tool-calling requests (`req.tools` non-empty) skip compression so JSON tool definitions stay intact.
@@ -155,7 +155,7 @@ prompt (≤ 128K tokens)
    ▼
 ┌──────────────────────────────────────────────┐
 │  drafter (in-process)                        │
-│   custom Qwen3-0.6B BF16 forward in ggml     │
+│   custom Qwen3.5-0.8B BF16 forward in ggml   │
 │   FlashPrefill block-sparse via BSA (≥ 32K)  │
 │   tail-attention scoring → score [S]         │
 │   chunk(128) + alpha-threshold → top blocks  │
@@ -177,7 +177,7 @@ prompt (≤ 128K tokens)
 └──────────────────────────────────────────────┘
 ```
 
-**Drafter forward.** Custom Qwen3-0.6B graph (`qwen3_0p6b_graph.cpp`) per-layer A/FP/B blocks: dense attention up to ~32K source, FlashPrefill sparse attention at and above. The 4 FP kernels live in `flashprefill_kernels.cu`; BSA dispatch is in `bsa_launcher.cu` + `bsa_fwd_inst.cu`.
+**Drafter forward.** The Qwen3.5-0.8B drafter (`src/pflash/qwen35_drafter.cpp` on the qwen35 target graph) runs the model's first fifteen blocks and scores the context with block 15's NoPE Q/K attention-mass head; `PFLASH_QWEN35_LEGACY_SCORER=1` selects the all-layer running-max scorer instead.
 
 **Scoring + selection.** Tail attention `Q[-N:] @ K^T / sqrt(d)` per layer/head, max over (L, H), mean over the tail window. Block-level threshold by `alpha * mean(scores)` selects which K-blocks each Q-block attends to. Configurable via `LUCE_FP_ALPHA`.
 
@@ -205,14 +205,14 @@ What we built:
 
 - C++/CUDA port of the FlashPrefill algorithm: 4 kernels (`mean_K / score / select / sparse_fwd`), no Triton dependency.
 - BSA ([mit-han-lab/Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention)) wired without `libtorch` via 3 ATen/c10 header stubs (`server/deps/bsa_stubs/`).
-- Custom Qwen3-0.6B BF16 forward so the drafter runs through the same ggml allocator as the 27B target.
+- Custom Qwen3.5-0.8B BF16 forward so the drafter runs through the same ggml allocator as the 27B target.
 - Daemon stdin protocol (`compress` / `generate` / `park` / `unpark` / `free drafter`) so target + drafter coexist on a 24 GB card.
 - NIAH harness against `llama-bench` for end-to-end validation.
 
 ## Scope and limits
 
 - **Single 24 GB GPU** target (RTX 3090 reference). On 32+ GB cards, drafter + target can coexist and the park/unpark dance disappears.
-- **Qwen3.6-27B Q4_K_M target + Qwen3-0.6B drafter** is the validated pair. Other targets/drafters need keep_ratio + alpha re-calibration.
+- **Qwen3.6-27B Q4_K_M target + Qwen3.5-0.8B drafter** is the validated pair. Other targets/drafters need keep_ratio + alpha re-calibration.
 - **NIAH single-needle** is the only retrieval task validated end-to-end. Multi-doc QA, long-form code retrieval, etc. still TBD.
 - **sm_80+** required for BSA (RTX 3090 sm_86 is the reference). On sm_75 (Turing) the build auto-disables BSA and falls back to the WMMA path; expect a slower drafter forward at long ctx.
 
@@ -242,16 +242,16 @@ These are operator-side flags on the launcher; they do not change
 PFlash semantics. A short prompt lane should keep the original
 defaults.
 
-### Drafter selection: BF16 Qwen3-0.6B for compress
+### Drafter selection: BF16 Qwen3.5-0.8B for compress
 
 PFlash compress benefits from a small, fast drafter. The validated
-choice is **Qwen3-0.6B** in **BF16 safetensors** with ~5 attention
+choice is **Qwen3.5-0.8B** in **BF16 safetensors** with ~5 attention
 layers. The DFlash drafter for the same target works correctly
 during decode-after-unpark but is heavier than ideal for compress.
 
 Practical guidance:
 
-- Use Qwen3-0.6B BF16 for `compress` (PFlash side).
+- Use Qwen3.5-0.8B BF16 for `compress` (PFlash side).
 - Reuse the larger DFlash drafter for `decode` after unpark
   (DFlash side).
 
@@ -262,7 +262,7 @@ simultaneously on a 24 GB GPU.
 
 Reproducible comparison vs Ollama native `/api/chat` on the same
 64K unique-prompt summary task, RTX 6000 Ada sm_89,
-Qwen3.6-27B-Q4_K_M, FA_WINDOW=0. Drafter setup: Qwen3-0.6B BF16
+Qwen3.6-27B-Q4_K_M, FA_WINDOW=0. Drafter setup: Qwen3.5-0.8B BF16
 GGUF for the PFlash compress path (see "Drafter selection" above);
 the larger DFlash drafter on the luce daemon side ran as FP16
 safetensors during decode-after-unpark on this run. Feel free to

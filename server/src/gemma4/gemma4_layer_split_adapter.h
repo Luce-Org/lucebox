@@ -11,7 +11,7 @@
 #include "gemma4_internal.h"
 #include "placement/placement_config.h"
 #include "placement/remote_target_shard_config.h"
-#include "qwen3/qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
 
 #include "ggml-backend.h"
 

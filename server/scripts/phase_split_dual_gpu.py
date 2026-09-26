@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run PFlash prefill through a persistent daemon, optionally followed by target generation.
 
-This phase-split harness is intentionally PFlash-only. It keeps the Qwen3-0.6B
+This phase-split harness is intentionally PFlash-only. It keeps the Qwen3.5-0.8B
 PFlash drafter resident in `pflash_daemon`, optionally on a different CUDA or
 HIP backend from the later target run. The cross-backend boundary is host-side
 token/text data; target layer split remains inside one backend binary.
@@ -35,8 +35,8 @@ def env_path(name: str, default: Path) -> Path:
 
 
 DEFAULT_BUILD = env_path("PFLASH_PHASE_BUILD_DIR", ROOT / "build")
-DEFAULT_DRAFTER = env_path("PFLASH_PHASE_DRAFTER", ROOT / "models" / "Qwen3-0.6B-BF16.gguf")
-DEFAULT_TOKENIZER = os.environ.get("PFLASH_PHASE_TOKENIZER", "Qwen/Qwen3-0.6B")
+DEFAULT_DRAFTER = env_path("PFLASH_PHASE_DRAFTER", ROOT / "models" / "Qwen3.5-0.8B-BF16.gguf")
+DEFAULT_TOKENIZER = os.environ.get("PFLASH_PHASE_TOKENIZER", "Qwen/Qwen3.5-0.8B")
 DEFAULT_TARGET = env_path("LUCE_TARGET", ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf")
 DEFAULT_TARGET_DRAFT = env_path("LUCE_DRAFT", ROOT / "models" / "draft")
 DEFAULT_TARGET_TOKENIZER = os.environ.get("PFLASH_PHASE_TARGET_TOKENIZER", "Qwen/Qwen3.6-27B")

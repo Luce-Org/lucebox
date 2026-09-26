@@ -15,11 +15,11 @@
 #include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
+#include "pflash/pflash_drafter.h"
 #include "deepseek4_vision.h"
 #include "deepseek4_image_prompt.h"
 #include "deepseek4_image_assembly.h"
 #include "deepseek4_image_admission.h"
-#include "qwen3/qwen3_drafter.h"
 #include "deepseek4_seq_engine.h"
 
 #include "ggml.h"

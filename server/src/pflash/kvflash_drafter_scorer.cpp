@@ -1,6 +1,6 @@
-#include "qwen3_kvflash_scorer.h"
+#include "kvflash_drafter_scorer.h"
 
-#include "qwen3_drafter_model.h"
+#include "qwen35_drafter.h"
 #include "server/tokenizer.h"
 
 #include <algorithm>
@@ -15,30 +15,25 @@ constexpr int kLookahead  = 8;
 constexpr int kPoolKernel = 13;
 constexpr int kMinSegment = 4096;
 
-// Tail-attention token scores for `ids`: mean over the lookahead window of
-// the drafter's running-max, then AvgPool smoothing. Same math as
-// drafter_score_and_compress.
+// Tail-attention token scores for `ids` from the Qwen3.5-0.8B drafter:
+// the all-layer running-max scorer with AvgPool smoothing. Same math as
+// drafter_score_and_compress with the legacy scorer.
 bool score_tokens_direct(DrafterContext & ctx, const std::vector<int32_t> & ids,
                          std::vector<float> & out) {
-    const int S = (int)ids.size();
-    std::vector<float> running_max;
-    if (!forward_qwen3_drafter_model(ctx.weights, ids, kLookahead, running_max)) {
+    if (!ctx.state) return false;
+    const luce::pflash::PFlashSelectionConfig experiment;
+    std::vector<float> scores;
+    if (qwen35_score_and_compress(ctx.state->weights, ids,
+                                  /*keep_ratio=*/1.0f, /*chunk_size=*/64,
+                                  kLookahead, kPoolKernel,
+                                  /*score_query_end=*/-1,
+                                  experiment,
+                                  /*required_instruction_spans=*/{},
+                                  &scores).empty() ||
+        scores.size() != ids.size()) {
         return false;
     }
-    std::vector<float> score((size_t)S, 0.0f);
-    for (int j = 0; j < S; j++) {
-        float s = 0.0f;
-        for (int t = 0; t < kLookahead; t++) s += running_max[(size_t)t * S + j];
-        score[j] = s / kLookahead;
-    }
-    out.assign((size_t)S, 0.0f);
-    const int half = kPoolKernel / 2;
-    for (int j = 0; j < S; j++) {
-        const int lo = std::max(0, j - half), hi = std::min(S - 1, j + half);
-        float s = 0.0f;
-        for (int k = lo; k <= hi; k++) s += score[k];
-        out[j] = s / (hi - lo + 1);
-    }
+    out = std::move(scores);
     return true;
 }
 

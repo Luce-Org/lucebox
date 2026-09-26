@@ -203,7 +203,7 @@ static void print_usage(const char * prog) {
         "                              (token,ratio) breakpoints; linear interp.\n"
         "                              Overrides --prefill-keep-ratio. Example:\n"
         "                              10000:0.5 40000:0.2 100000:0.1\n"
-        "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3-0.6B)\n"
+        "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3.5-0.8B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
         "  --draft-residency auto|persistent|request-scoped\n"
         "                         Drafter lifetime policy (default: auto)\n"

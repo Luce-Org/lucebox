@@ -387,7 +387,5 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_MMVQ_MAX_NCOLS` - deepseek4_backend.cpp
 - `LUCE_QK_FUSE_LAYERS` - laguna_target_graph.cpp
 - `LUCE_QK_FUSE_MODE` - laguna_target_graph.cpp
-- `PFLASH_DRAFTER_EARLY_EXIT_N` - qwen3_graph.cpp
-- `PFLASH_DRAFTER_SCORE_LAYERS` - qwen3_graph.cpp
 - `PFLASH_FREEZE_HOT_WINDOW` - http_server.cpp
 - `TMPDIR` - backend_ipc.cpp, moe_expert_compute_ipc.cpp

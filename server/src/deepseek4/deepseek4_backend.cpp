@@ -17,6 +17,7 @@
 #include "common/peer_access.h"
 #include "common/platform_env.h"
 #include "common/sampler.h"
+#include "pflash/pflash_compress.h"
 
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 #include "common/gpu_runtime_compat.h"
@@ -4010,9 +4011,27 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
         const CompressRequest & request = requests[index];
         if (!valid_request(request)) continue;
         CompressResult & result = results[index];
+        // score_query_end < 0 is the legacy "tail window" request value;
+        // the qwen35 scorer requires an explicit end.
+        const int score_query_end = request.score_query_end >= 0
+            ? request.score_query_end : (int)request.input_ids.size();
         result.compressed_ids = drafter_score_and_compress(
-            pflash_drafter_ctx_, request.input_ids, request.keep_ratio);
+            pflash_drafter_ctx_, request.input_ids, request.keep_ratio,
+            /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
+            score_query_end, request.required_instruction_spans,
+            request.query_suffix_candidates, request.history_query_spans,
+            request.turn_query_span);
         result.ok = !result.compressed_ids.empty();
+        if (result.ok) result.kept_spans = pflash_last_kept_spans();
+        if (result.ok) {
+            const auto & scoring = pflash_last_scoring_stats();
+            result.scorer_resume = scoring.resume;
+            result.scorer_new_tokens = scoring.new_tokens;
+            result.scorer_forward_s = scoring.forward_s;
+            for (const auto & candidate : pflash_last_candidate_lifts()) {
+                result.candidate_lifts.push_back({candidate.span, candidate.lift});
+            }
+        }
     }
 
     if (load_request->residency_action ==

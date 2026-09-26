@@ -14,8 +14,9 @@
 #include "qwen35/layer_split_forward.h"
 #include "qwen35/qwen35_layer_split_dflash_target.h"
 #include "qwen35/prefill_helpers.h"
-#include "qwen3/qwen3_drafter.h"
-#include "qwen3/qwen3_kvflash_scorer.h"
+#include "pflash/pflash_drafter.h"
+#include "pflash/pflash_compress.h"
+#include "pflash/kvflash_drafter_scorer.h"
 #include "kv_quant.h"
 
 #include "ggml-cuda.h"
@@ -210,7 +211,7 @@ bool Qwen35LayerSplitAdapter::kvflash_attach() {
                 kvflash_tau_,
                 !kvflash_drafter_path_.empty()
                     ? "drafter (attaches on first reselect)"
-                    : "lru (recency-only: no Qwen3-0.6B drafter found)");
+                    : "lru (recency-only: no Qwen3.5-0.8B drafter found)");
     std::fflush(stdout);
     return true;
 }
@@ -1360,7 +1361,7 @@ bool Qwen35LayerSplitAdapter::decode_dflash(
 }
 
 const char * Qwen35LayerSplitAdapter::default_compress_drafter_path() const {
-    return "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+    return "/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf";
 }
 
 ModelBackend::CompressResult
@@ -1385,11 +1386,27 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
         std::fprintf(stderr, "[target-split][compress] drafter ready\n");
     }
 
+    // score_query_end < 0 is the legacy "tail window" request value; the
+    // qwen35 scorer requires an explicit end.
+    const int score_query_end = req.score_query_end >= 0
+        ? req.score_query_end : (int)req.input_ids.size();
     result.compressed_ids = drafter_score_and_compress(
         pflash_drafter_, req.input_ids, req.keep_ratio,
         /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
-        req.score_query_end);
+        score_query_end, req.required_instruction_spans,
+        req.query_suffix_candidates, req.history_query_spans,
+            req.turn_query_span);
     result.ok = !result.compressed_ids.empty();
+    if (result.ok) result.kept_spans = pflash_last_kept_spans();
+    if (result.ok) {
+        const auto & scoring = pflash_last_scoring_stats();
+        result.scorer_resume = scoring.resume;
+        result.scorer_new_tokens = scoring.new_tokens;
+        result.scorer_forward_s = scoring.forward_s;
+        for (const auto & candidate : pflash_last_candidate_lifts()) {
+            result.candidate_lifts.push_back({candidate.span, candidate.lift});
+        }
+    }
     if (result.ok) {
         std::fprintf(stderr, "[target-split][compress] %zu -> %zu tokens\n",
                      req.input_ids.size(), result.compressed_ids.size());

@@ -8,7 +8,7 @@
 
 #include "laguna_backend.h"
 #include "laguna_internal.h"
-#include "qwen3/qwen3_kvflash_scorer.h"
+#include "pflash/kvflash_drafter_scorer.h"
 #include "luce.h"
 #include "common/ddtree.h"
 #include "common/domino_head.h"
@@ -270,7 +270,7 @@ void LagunaBackend::kvflash_read_config() {
 }
 
 // Drafter rescore + repage (FlashMemory tau loop) with the cross-tokenizer
-// scorer: laguna ids are detokenized and re-scored through the Qwen3-0.6B
+// scorer: laguna ids are detokenized and re-scored through the Qwen3.5-0.8B
 // drafter (relevance is text-level, so the tokenizer gap is bridged by
 // re-tokenization). Lazy: the drafter + tokenizers load on the first
 // reselect that needs them, never on a request's first tokens.
@@ -341,7 +341,7 @@ bool LagunaBackend::kvflash_attach() {
                 kvflash_tokens_, args_.max_ctx,
                 !kvflash_drafter_path_.empty()
                     ? "drafter/cross-tok (attaches on first reselect)"
-                    : "lru (recency-only: no Qwen3-0.6B drafter found)",
+                    : "lru (recency-only: no Qwen3.5-0.8B drafter found)",
                 pc.tail_window_chunks);
     std::fflush(stdout);
     return true;
@@ -1864,13 +1864,14 @@ bool LagunaBackend::handle_compress(const std::string & line,
             return true;
         }
         drafter_loaded_ = true;
-        std::printf("[drafter] loaded %s vocab=%d\n",
-                     drafter_path, drafter_ctx_.weights.n_vocab);
+        std::printf("[drafter] loaded %s\n", drafter_path);
         std::fflush(stdout);
     }
 
     const float keep = (float)keep_x1000 / 1000.0f;
-    auto compressed = drafter_score_and_compress(drafter_ctx_, src_ids, keep);
+    auto compressed = drafter_score_and_compress(drafter_ctx_, src_ids, keep,
+        /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13,
+        (int)src_ids.size());
     std::printf("[compress] %zu -> %zu tokens (keep_ratio=%.3f)\n",
                  src_ids.size(), compressed.size(), keep);
     std::fflush(stdout);

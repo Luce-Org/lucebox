@@ -41,7 +41,7 @@ does not fit at all.)
 # recommended: drafter-scored residency, pool auto-sized from VRAM.
 # pass --prefill-drafter so the drafter is guaranteed (no silent LRU fallback).
 luce_server model.gguf --max-ctx 32768 --kvflash auto \
-    --prefill-drafter /opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf
+    --prefill-drafter /opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf
 
 # drop the path to auto-probe (model dir, drafter/, draft/, /opt/lucebox/models/drafter/);
 # falls back to LRU if none is found, so check the banner reads policy=drafter
@@ -52,7 +52,7 @@ luce_server model.gguf --max-ctx 32768 --kvflash 8192 --kvflash-policy lru
 ```
 
 Drafter-scored residency is the DEFAULT policy on every model family:
-the server probes for `Qwen3-0.6B-BF16.gguf` next to the model (same
+the server probes for `Qwen3.5-0.8B-BF16.gguf` next to the model (same
 dir, `drafter/`, `draft/`, then `/opt/lucebox/models/drafter/`) and
 lazy-loads it on the first reselect; `--prefill-drafter` overrides the
 location, prefill compression can stay off either way. Qwen-family
@@ -147,7 +147,7 @@ Env: `LUCE_KVFLASH_POLICY=qk`. Bench: `test_kvflash --qkbench`.
 - `server/src/common/kvflash_qk.h` — target-QK scorer: pure scoring math
   (unit-tested in `server/test/test_kvflash_qk.cpp`), seal-time key pooling,
   `KvFlashTargetQkScorer`
-- `server/src/qwen3/qwen3_kvflash_scorer.{h,cpp}` — pflash-drafter scorer
+- `server/src/pflash/kvflash_drafter_scorer.{h,cpp}` — pflash-drafter scorer
   (tail attention; bisects on allocation pressure)
 - `server/src/qwen35/*` — cache `ctx_alloc`, masked pooled decode, slot-mapped
   spec verify, daemon flags
