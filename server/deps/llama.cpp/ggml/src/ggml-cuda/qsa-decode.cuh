@@ -99,19 +99,25 @@ bool ggml_cuda_flash_attn_ext_qsa_decode_supported(ggml_backend_cuda_context & c
 
 void ggml_cuda_flash_attn_ext_qsa_decode(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * ids = dst->src[5];
+#if defined(__gfx1151__)
     const bool wmma = q->ne[2] == 12*k->ne[2] && k->nb[1]%16 == 0 &&
         k->nb[2]%16 == 0 && uintptr_t(k->data)%16 == 0;
+#else
+    const bool wmma = false;
+#endif
     const int ns = ids->ne[0], nq = q->ne[1], nh = q->ne[2], step = wmma ? 64 : 128;
     const int splits = (ns + step - 1)/step;
     float scale;
     memcpy(&scale, dst->op_params, sizeof(scale));
     ggml_cuda_pool_alloc<float> partial(ctx.pool(), size_t(nq)*nh*splits*258);
     if (wmma) {
+#if defined(__gfx1151__)
     qsa_decode_wmma_partial<<<dim3(k->ne[2], nq, splits), 256, 0, ctx.stream()>>>(
         (const char *) q->data, (const char *) k->data, (const char *) v->data,
         m ? (const char *) m->data : nullptr, (const char *) ids->data,
         q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2], m ? m->nb[1] : 0, ids->nb[1],
         k->ne[1], ns, nh, splits, scale, partial.get());
+#endif
     } else {
     qsa_decode_partial<<<dim3(nh, nq, splits), 128, 0, ctx.stream()>>>(
         (const char *) q->data, (const char *) k->data, (const char *) v->data,

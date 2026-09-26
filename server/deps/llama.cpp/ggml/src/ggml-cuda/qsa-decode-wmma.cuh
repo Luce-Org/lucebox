@@ -3,6 +3,7 @@
 typedef short qd_half16 __attribute__((ext_vector_type(16)));
 typedef float qd_float8 __attribute__((ext_vector_type(8)));
 
+#if defined(__gfx1151__)
 static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
         const char * q, const char * k, const char * v, const char * mask, const char * ids,
         size_t q1, size_t q2, size_t k1, size_t k2, size_t v1, size_t v2, size_t m1, size_t i1,
@@ -115,3 +116,4 @@ static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
         if (w == 0 && hi == 0) { dst[256] = maximum; dst[257] = normalizer; }
     }
 }
+#endif
