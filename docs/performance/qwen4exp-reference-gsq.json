@@ -1,0 +1,8 @@
+{
+  "ok": true,
+  "settings": {
+    "QWEN4EXP_RMS_SCALE_FUSED": "1",
+    "QWEN4EXP_LAST_TOKEN_FFN": "1"
+  },
+  "harness_exit": 0
+}

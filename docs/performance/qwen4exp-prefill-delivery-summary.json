@@ -1,0 +1,22 @@
+{
+  "quality_ok": true,
+  "settings": {
+    "QWEN4EXP_RMS_SCALE_FUSED": "1",
+    "QWEN4EXP_LAST_TOKEN_FFN": "1",
+    "GGML_DS4_INDEXER_M32_CACHE_B": "0"
+  },
+  "chunk": "16384",
+  "ttft": [
+    16.49,
+    16.5,
+    16.48,
+    16.45,
+    16.54,
+    16.37,
+    16.33,
+    16.34
+  ],
+  "min_tps": 989.4800483675938,
+  "median_tps": 993.9880706465606,
+  "best_tps": 1002.2045315370485
+}

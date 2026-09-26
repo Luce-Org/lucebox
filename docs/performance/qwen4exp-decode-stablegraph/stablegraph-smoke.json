@@ -1,0 +1,48 @@
+[
+  {
+    "usage": {
+      "completion_tokens": 128,
+      "prompt_tokens": 1996,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 4377.4,
+        "decode_tokens_per_sec": 29.2,
+        "effective_prompt_tokens": 1996,
+        "prefill_ms": 2462.6,
+        "prefilled_tokens": 1996
+      },
+      "total_tokens": 2124
+    },
+    "ttft_s": 2.6155765440053074,
+    "wall_s": 6.847547388009843,
+    "rep": 1,
+    "model": "iq4",
+    "kind": "decode",
+    "target_depth": 2048
+  },
+  {
+    "usage": {
+      "completion_tokens": 128,
+      "prompt_tokens": 16348,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 4610.9,
+        "decode_tokens_per_sec": 27.8,
+        "effective_prompt_tokens": 16348,
+        "prefill_ms": 16394.5,
+        "prefilled_tokens": 16348
+      },
+      "total_tokens": 16476
+    },
+    "ttft_s": 16.561776139002177,
+    "wall_s": 21.015704161007307,
+    "rep": 1,
+    "model": "iq4",
+    "kind": "decode",
+    "target_depth": 16384
+  }
+]

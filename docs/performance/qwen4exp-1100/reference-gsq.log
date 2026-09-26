@@ -1,0 +1,5 @@
+REFERENCE gsq exit 0
+BINARY gsq L00.gnorm final_output-0 EXACT bytes 393216
+BINARY gsq L03.faout attn_pregate-3 EXACT bytes 393216
+BINARY gsq L03.att attn_output-3 EXACT bytes 163840
+BINARY gsq logits result_output EXACT bytes 993280

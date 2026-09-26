@@ -1,0 +1,453 @@
+{
+  "command": [
+    "server/build-hip-graphs-t14/dflash_server",
+    "--model",
+    "/home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18844",
+    "--target-device",
+    "hip:0",
+    "--max-ctx",
+    "32768",
+    "--chunk",
+    "2048",
+    "--prefix-cache-slots",
+    "0"
+  ],
+  "results": [
+    {
+      "repeat": 1,
+      "exit": 0,
+      "stdout": "[bench] url=http://127.0.0.1:18844  model=dflash  suites=recall\n\n[bench] === RECALL (n=2) ===\n    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score\n  ---  ---               ------  -------  --------  -------  ---------  -----\n    1  recall_13k        19.03s  18.027s    758.00       32      31.95  OK\n    2  recall_24k        30.07s  29.105s    824.00       30      31.25  OK\n\n  [summary] ok=2/2  wall=24.55s  TTFT=23.566s  prefill=791.00 tok/s  output=31.60 tok/s  accuracy=2/2 (100.0%)\n\n[bench] === SUMMARY ===\n   Suite     OK     Wall     TTFT   Pf tok/s   Out tok/s   Out tok       Score\n  recall    2/2   24.55s  23.566s     791.00       31.60        62         2/2\nwrote /tmp/q4exp-arch-regression/e41-graphs-on-recall8.recall-1.json\n",
+      "result": {
+        "command": "bench",
+        "url": "http://127.0.0.1:18844",
+        "model": "dflash",
+        "suites": {
+          "recall": {
+            "suite": "recall",
+            "n": 2,
+            "n_ok": 2,
+            "results": [
+              {
+                "id": "recall_13k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the rig's thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 19.028,
+                "ttft_s": 18.0268,
+                "prompt_tokens": 13664,
+                "completion_tokens": 32,
+                "prefill_tok_s": 758.0,
+                "output_tok_s": 31.95,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              },
+              {
+                "id": "recall_24k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 30.065,
+                "ttft_s": 29.1055,
+                "prompt_tokens": 23984,
+                "completion_tokens": 30,
+                "prefill_tok_s": 824.0,
+                "output_tok_s": 31.25,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              }
+            ],
+            "mean_wall_s": 24.547,
+            "mean_ttft_s": 23.5662,
+            "mean_prefill_tok_s": 791.0,
+            "mean_output_tok_s": 31.6,
+            "total_output_tokens": 62,
+            "total_prompt_tokens": 37648,
+            "accuracy": "2/2",
+            "accuracy_pct": 100.0
+          }
+        },
+        "ok": true
+      }
+    },
+    {
+      "repeat": 2,
+      "exit": 0,
+      "stdout": "[bench] url=http://127.0.0.1:18844  model=dflash  suites=recall\n\n[bench] === RECALL (n=2) ===\n    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score\n  ---  ---               ------  -------  --------  -------  ---------  -----\n    1  recall_13k        17.54s  16.507s    827.80       32      30.97  OK\n    2  recall_24k        30.04s  29.082s    824.70       30      31.24  OK\n\n  [summary] ok=2/2  wall=23.79s  TTFT=22.795s  prefill=826.20 tok/s  output=31.10 tok/s  accuracy=2/2 (100.0%)\n\n[bench] === SUMMARY ===\n   Suite     OK     Wall     TTFT   Pf tok/s   Out tok/s   Out tok       Score\n  recall    2/2   23.79s  22.795s     826.20       31.10        62         2/2\nwrote /tmp/q4exp-arch-regression/e41-graphs-on-recall8.recall-2.json\n",
+      "result": {
+        "command": "bench",
+        "url": "http://127.0.0.1:18844",
+        "model": "dflash",
+        "suites": {
+          "recall": {
+            "suite": "recall",
+            "n": 2,
+            "n_ok": 2,
+            "results": [
+              {
+                "id": "recall_13k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the rig's thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 17.541,
+                "ttft_s": 16.5072,
+                "prompt_tokens": 13664,
+                "completion_tokens": 32,
+                "prefill_tok_s": 827.8,
+                "output_tok_s": 30.97,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              },
+              {
+                "id": "recall_24k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 30.043,
+                "ttft_s": 29.0824,
+                "prompt_tokens": 23984,
+                "completion_tokens": 30,
+                "prefill_tok_s": 824.7,
+                "output_tok_s": 31.24,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              }
+            ],
+            "mean_wall_s": 23.792,
+            "mean_ttft_s": 22.7948,
+            "mean_prefill_tok_s": 826.2,
+            "mean_output_tok_s": 31.1,
+            "total_output_tokens": 62,
+            "total_prompt_tokens": 37648,
+            "accuracy": "2/2",
+            "accuracy_pct": 100.0
+          }
+        },
+        "ok": true
+      }
+    },
+    {
+      "repeat": 3,
+      "exit": 0,
+      "stdout": "[bench] url=http://127.0.0.1:18844  model=dflash  suites=recall\n\n[bench] === RECALL (n=2) ===\n    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score\n  ---  ---               ------  -------  --------  -------  ---------  -----\n    1  recall_13k        17.52s  16.563s    825.00       30      31.20  OK\n    2  recall_24k        30.17s  29.212s    821.00       30      31.21  OK\n\n  [summary] ok=2/2  wall=23.85s  TTFT=22.887s  prefill=823.00 tok/s  output=31.20 tok/s  accuracy=2/2 (100.0%)\n\n[bench] === SUMMARY ===\n   Suite     OK     Wall     TTFT   Pf tok/s   Out tok/s   Out tok       Score\n  recall    2/2   23.85s  22.887s     823.00       31.20        60         2/2\nwrote /tmp/q4exp-arch-regression/e41-graphs-on-recall8.recall-3.json\n",
+      "result": {
+        "command": "bench",
+        "url": "http://127.0.0.1:18844",
+        "model": "dflash",
+        "suites": {
+          "recall": {
+            "suite": "recall",
+            "n": 2,
+            "n_ok": 2,
+            "results": [
+              {
+                "id": "recall_13k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 17.524,
+                "ttft_s": 16.5626,
+                "prompt_tokens": 13664,
+                "completion_tokens": 30,
+                "prefill_tok_s": 825.0,
+                "output_tok_s": 31.2,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              },
+              {
+                "id": "recall_24k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 30.174,
+                "ttft_s": 29.2125,
+                "prompt_tokens": 23984,
+                "completion_tokens": 30,
+                "prefill_tok_s": 821.0,
+                "output_tok_s": 31.21,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              }
+            ],
+            "mean_wall_s": 23.849,
+            "mean_ttft_s": 22.8875,
+            "mean_prefill_tok_s": 823.0,
+            "mean_output_tok_s": 31.2,
+            "total_output_tokens": 60,
+            "total_prompt_tokens": 37648,
+            "accuracy": "2/2",
+            "accuracy_pct": 100.0
+          }
+        },
+        "ok": true
+      }
+    },
+    {
+      "repeat": 4,
+      "exit": 0,
+      "stdout": "[bench] url=http://127.0.0.1:18844  model=dflash  suites=recall\n\n[bench] === RECALL (n=2) ===\n    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score\n  ---  ---               ------  -------  --------  -------  ---------  -----\n    1  recall_13k        17.66s  16.624s    822.00       32      30.91  OK\n    2  recall_24k        30.22s  29.256s    819.80       30      31.15  OK\n\n  [summary] ok=2/2  wall=23.94s  TTFT=22.940s  prefill=820.90 tok/s  output=31.03 tok/s  accuracy=2/2 (100.0%)\n\n[bench] === SUMMARY ===\n   Suite     OK     Wall     TTFT   Pf tok/s   Out tok/s   Out tok       Score\n  recall    2/2   23.94s  22.940s     820.90       31.03        62         2/2\nwrote /tmp/q4exp-arch-regression/e41-graphs-on-recall8.recall-4.json\n",
+      "result": {
+        "command": "bench",
+        "url": "http://127.0.0.1:18844",
+        "model": "dflash",
+        "suites": {
+          "recall": {
+            "suite": "recall",
+            "n": 2,
+            "n_ok": 2,
+            "results": [
+              {
+                "id": "recall_13k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the rig's thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 17.659,
+                "ttft_s": 16.6237,
+                "prompt_tokens": 13664,
+                "completion_tokens": 32,
+                "prefill_tok_s": 822.0,
+                "output_tok_s": 30.91,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              },
+              {
+                "id": "recall_24k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 30.219,
+                "ttft_s": 29.256,
+                "prompt_tokens": 23984,
+                "completion_tokens": 30,
+                "prefill_tok_s": 819.8,
+                "output_tok_s": 31.15,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              }
+            ],
+            "mean_wall_s": 23.939,
+            "mean_ttft_s": 22.9398,
+            "mean_prefill_tok_s": 820.9,
+            "mean_output_tok_s": 31.03,
+            "total_output_tokens": 62,
+            "total_prompt_tokens": 37648,
+            "accuracy": "2/2",
+            "accuracy_pct": 100.0
+          }
+        },
+        "ok": true
+      }
+    },
+    {
+      "repeat": 5,
+      "exit": 0,
+      "stdout": "[bench] url=http://127.0.0.1:18844  model=dflash  suites=recall\n\n[bench] === RECALL (n=2) ===\n    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score\n  ---  ---               ------  -------  --------  -------  ---------  -----\n    1  recall_13k        17.96s  16.665s    819.90       39      30.17  OK\n    2  recall_24k        30.30s  29.337s    817.50       30      31.11  OK\n\n  [summary] ok=2/2  wall=24.13s  TTFT=23.001s  prefill=818.70 tok/s  output=30.64 tok/s  accuracy=2/2 (100.0%)\n\n[bench] === SUMMARY ===\n   Suite     OK     Wall     TTFT   Pf tok/s   Out tok/s   Out tok       Score\n  recall    2/2   24.13s  23.001s     818.70       30.64        69         2/2\nwrote /tmp/q4exp-arch-regression/e41-graphs-on-recall8.recall-5.json\n",
+      "result": {
+        "command": "bench",
+        "url": "http://127.0.0.1:18844",
+        "model": "dflash",
+        "suites": {
+          "recall": {
+            "suite": "recall",
+            "n": 2,
+            "n_ok": 2,
+            "results": [
+              {
+                "id": "recall_13k",
+                "ok": true,
+                "text": "The calibration key for the Strix Halo test rig is QUINCE-AMBER-7731, and the rig's thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 17.957,
+                "ttft_s": 16.6647,
+                "prompt_tokens": 13664,
+                "completion_tokens": 39,
+                "prefill_tok_s": 819.9,
+                "output_tok_s": 30.17,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              },
+              {
+                "id": "recall_24k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 30.301,
+                "ttft_s": 29.3368,
+                "prompt_tokens": 23984,
+                "completion_tokens": 30,
+                "prefill_tok_s": 817.5,
+                "output_tok_s": 31.11,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              }
+            ],
+            "mean_wall_s": 24.129,
+            "mean_ttft_s": 23.0008,
+            "mean_prefill_tok_s": 818.7,
+            "mean_output_tok_s": 30.64,
+            "total_output_tokens": 69,
+            "total_prompt_tokens": 37648,
+            "accuracy": "2/2",
+            "accuracy_pct": 100.0
+          }
+        },
+        "ok": true
+      }
+    },
+    {
+      "repeat": 6,
+      "exit": 0,
+      "stdout": "[bench] url=http://127.0.0.1:18844  model=dflash  suites=recall\n\n[bench] === RECALL (n=2) ===\n    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score\n  ---  ---               ------  -------  --------  -------  ---------  -----\n    1  recall_13k        17.72s  16.690s    818.70       32      30.94  OK\n    2  recall_24k        30.31s  29.350s    817.20       30      31.19  OK\n\n  [summary] ok=2/2  wall=24.02s  TTFT=23.020s  prefill=818.00 tok/s  output=31.07 tok/s  accuracy=2/2 (100.0%)\n\n[bench] === SUMMARY ===\n   Suite     OK     Wall     TTFT   Pf tok/s   Out tok/s   Out tok       Score\n  recall    2/2   24.02s  23.020s     818.00       31.07        62         2/2\nwrote /tmp/q4exp-arch-regression/e41-graphs-on-recall8.recall-6.json\n",
+      "result": {
+        "command": "bench",
+        "url": "http://127.0.0.1:18844",
+        "model": "dflash",
+        "suites": {
+          "recall": {
+            "suite": "recall",
+            "n": 2,
+            "n_ok": 2,
+            "results": [
+              {
+                "id": "recall_13k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the rig's thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 17.724,
+                "ttft_s": 16.6902,
+                "prompt_tokens": 13664,
+                "completion_tokens": 32,
+                "prefill_tok_s": 818.7,
+                "output_tok_s": 30.94,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              },
+              {
+                "id": "recall_24k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 30.312,
+                "ttft_s": 29.35,
+                "prompt_tokens": 23984,
+                "completion_tokens": 30,
+                "prefill_tok_s": 817.2,
+                "output_tok_s": 31.19,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              }
+            ],
+            "mean_wall_s": 24.018,
+            "mean_ttft_s": 23.0201,
+            "mean_prefill_tok_s": 818.0,
+            "mean_output_tok_s": 31.07,
+            "total_output_tokens": 62,
+            "total_prompt_tokens": 37648,
+            "accuracy": "2/2",
+            "accuracy_pct": 100.0
+          }
+        },
+        "ok": true
+      }
+    },
+    {
+      "repeat": 7,
+      "exit": 0,
+      "stdout": "[bench] url=http://127.0.0.1:18844  model=dflash  suites=recall\n\n[bench] === RECALL (n=2) ===\n    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score\n  ---  ---               ------  -------  --------  -------  ---------  -----\n    1  recall_13k        17.64s  16.678s    819.30       30      31.20  OK\n    2  recall_24k        30.32s  29.359s    816.90       30      31.18  OK\n\n  [summary] ok=2/2  wall=23.98s  TTFT=23.018s  prefill=818.10 tok/s  output=31.19 tok/s  accuracy=2/2 (100.0%)\n\n[bench] === SUMMARY ===\n   Suite     OK     Wall     TTFT   Pf tok/s   Out tok/s   Out tok       Score\n  recall    2/2   23.98s  23.018s     818.10       31.19        60         2/2\nwrote /tmp/q4exp-arch-regression/e41-graphs-on-recall8.recall-7.json\n",
+      "result": {
+        "command": "bench",
+        "url": "http://127.0.0.1:18844",
+        "model": "dflash",
+        "suites": {
+          "recall": {
+            "suite": "recall",
+            "n": 2,
+            "n_ok": 2,
+            "results": [
+              {
+                "id": "recall_13k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 17.639,
+                "ttft_s": 16.6777,
+                "prompt_tokens": 13664,
+                "completion_tokens": 30,
+                "prefill_tok_s": 819.3,
+                "output_tok_s": 31.2,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              },
+              {
+                "id": "recall_24k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 30.321,
+                "ttft_s": 29.3587,
+                "prompt_tokens": 23984,
+                "completion_tokens": 30,
+                "prefill_tok_s": 816.9,
+                "output_tok_s": 31.18,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              }
+            ],
+            "mean_wall_s": 23.98,
+            "mean_ttft_s": 23.0182,
+            "mean_prefill_tok_s": 818.1,
+            "mean_output_tok_s": 31.19,
+            "total_output_tokens": 60,
+            "total_prompt_tokens": 37648,
+            "accuracy": "2/2",
+            "accuracy_pct": 100.0
+          }
+        },
+        "ok": true
+      }
+    },
+    {
+      "repeat": 8,
+      "exit": 0,
+      "stdout": "[bench] url=http://127.0.0.1:18844  model=dflash  suites=recall\n\n[bench] === RECALL (n=2) ===\n    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score\n  ---  ---               ------  -------  --------  -------  ---------  -----\n    1  recall_13k        17.64s  16.676s    819.40       30      31.22  OK\n    2  recall_24k        30.28s  29.320s    818.00       30      31.21  OK\n\n  [summary] ok=2/2  wall=23.96s  TTFT=22.998s  prefill=818.70 tok/s  output=31.21 tok/s  accuracy=2/2 (100.0%)\n\n[bench] === SUMMARY ===\n   Suite     OK     Wall     TTFT   Pf tok/s   Out tok/s   Out tok       Score\n  recall    2/2   23.96s  22.998s     818.70       31.21        60         2/2\nwrote /tmp/q4exp-arch-regression/e41-graphs-on-recall8.recall-8.json\n",
+      "result": {
+        "command": "bench",
+        "url": "http://127.0.0.1:18844",
+        "model": "dflash",
+        "suites": {
+          "recall": {
+            "suite": "recall",
+            "n": 2,
+            "n_ok": 2,
+            "results": [
+              {
+                "id": "recall_13k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 17.637,
+                "ttft_s": 16.6758,
+                "prompt_tokens": 13664,
+                "completion_tokens": 30,
+                "prefill_tok_s": 819.4,
+                "output_tok_s": 31.22,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              },
+              {
+                "id": "recall_24k",
+                "ok": true,
+                "text": "The calibration key is QUINCE-AMBER-7731, and the thermal ceiling is recorded as 54 degrees Celsius.",
+                "wall_s": 30.282,
+                "ttft_s": 29.3204,
+                "prompt_tokens": 23984,
+                "completion_tokens": 30,
+                "prefill_tok_s": 818.0,
+                "output_tok_s": 31.21,
+                "correct": true,
+                "score_detail": "correct: all expected present"
+              }
+            ],
+            "mean_wall_s": 23.959,
+            "mean_ttft_s": 22.9981,
+            "mean_prefill_tok_s": 818.7,
+            "mean_output_tok_s": 31.21,
+            "total_output_tokens": 60,
+            "total_prompt_tokens": 37648,
+            "accuracy": "2/2",
+            "accuracy_pct": 100.0
+          }
+        },
+        "ok": true
+      }
+    }
+  ]
+}

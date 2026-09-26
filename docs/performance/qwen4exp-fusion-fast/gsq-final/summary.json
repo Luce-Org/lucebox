@@ -1,0 +1,79 @@
+{
+  "label": "gsq-final",
+  "binary": "/tmp/qwen4exp-fusion-fast/server/build-hip/dflash_server",
+  "model": "/home/duster/models/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+  "dense_table": "1",
+  "n": 8,
+  "samples": [
+    {
+      "pt": 16366,
+      "sec": 20.71,
+      "tps": 790.2462578464509
+    },
+    {
+      "pt": 16366,
+      "sec": 20.75,
+      "tps": 788.722891566265
+    },
+    {
+      "pt": 16366,
+      "sec": 20.69,
+      "tps": 791.0101498308361
+    },
+    {
+      "pt": 16366,
+      "sec": 20.72,
+      "tps": 789.8648648648649
+    },
+    {
+      "pt": 16366,
+      "sec": 20.71,
+      "tps": 790.2462578464509
+    },
+    {
+      "pt": 16366,
+      "sec": 20.73,
+      "tps": 789.4838398456343
+    },
+    {
+      "pt": 16366,
+      "sec": 20.69,
+      "tps": 791.0101498308361
+    },
+    {
+      "pt": 16366,
+      "sec": 20.73,
+      "tps": 789.4838398456343
+    }
+  ],
+  "tps": {
+    "min": 788.722891566265,
+    "median": 790.0555613556579,
+    "max": 791.0101498308361
+  },
+  "seconds": {
+    "min": 20.69,
+    "median": 20.715,
+    "max": 20.75
+  },
+  "sclk_mhz": {
+    "min": 2861,
+    "median": 2889,
+    "max": 2900
+  },
+  "power_uw": {
+    "min": 18037000,
+    "median": 121077000,
+    "max": 133000000
+  },
+  "temp_mc": {
+    "min": 37000,
+    "median": 68000,
+    "max": 77000
+  },
+  "gpu_busy": {
+    "min": 0,
+    "median": 100,
+    "max": 100
+  }
+}

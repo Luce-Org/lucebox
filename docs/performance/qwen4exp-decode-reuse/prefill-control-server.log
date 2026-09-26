@@ -1,0 +1,102 @@
+[server] load balancing disabled; primary=dflash target=hip:0
+[server] loading tokenizer from /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf
+[tokenizer] added_tokens: 33 special tokens
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 eot=248046 pre=qwen35 sp=no
+[server] creating backend...
+[backend_factory] detected arch=qwen4exp
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 98304 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 98304 MiB
+[qwen4exp] qwen4exp trunk loaded: 48 layers (36 linear + 12 full), 1222 tensors 66.24 GiB from 3 shard(s), experts=10/512 hc=4/320 ple_layers=1 ngram=3 heads_per_ngram=8 table_rows=320001536 eos=248046
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (DFLASH_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 937.50 MiB @ ctx=40000, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[server] gguf meta: general.name='Qwen3.8 Flash Next' general.architecture='qwen4exp'
+[model_card] using cards dir: /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards
+[model_card] probing sidecar: /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards/qwen3.8-flash-next.json (from general.name='Qwen3.8 Flash Next')
+[model_card] sidecar not found at /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards/qwen3.8-flash-next.json
+[model_card] using family fallback for arch='qwen4exp'
+[server] effort-tier ceiling = max_ctx(40000) - hard_limit_reply_budget(4096) = 35904
+
+[server] ╭─── Configuration ───────────────────────────────────╮
+[server] │  host            = 127.0.0.1
+[server] │  port            = 18719
+[server] │  model           = /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf
+[server] │  draft           = (none)
+[server] │  model_name      = dflash
+[server] │  max_ctx         = 40000
+[server] │  model_card      = family:qwen4exp
+[server] │  max_tokens      = 32768 (family:qwen4exp)
+[server] │  think_max_tokens= 28672 (family:qwen4exp)
+[server] │  hard_limit_reply= 4096 (family:qwen4exp)
+[server] │  effort tiers    = low=3584 (family:qwen4exp)
+[server] │                    medium=14336 (family:qwen4exp)
+[server] │                    high=28672 (family:qwen4exp)
+[server] │                    x-high=28672 (family:qwen4exp)
+[server] │                    max=28672 (family:qwen4exp)
+[server] │  target_device   = hip:0
+[server] │  target_split    = layer
+[server] │  draft_device    = auto:0
+[server] │  draft_exec      = local
+[server] │  peer_access     = off
+[server] │  chunk           = 16384
+[server] │  admission_wait  = 20 ms
+[server] │  fa_window       = 0
+[server] │  ddtree          = off
+[server] │  specla          = off
+[server] │  fast_rollback   = ON
+[server] │  ddtree_budget   = 22
+[server] │  prefix_cache    = 32 slots
+[server] │  agent_turn_cache= off
+[server] │  prefill_cache   = 0 slots
+[server] │  cors            = ON
+[server] │  cache_type_k    = family default
+[server] │  cache_type_v    = family default
+[server] │  pflash          = off
+[server] │  draft_residency = auto
+[server] ╰─────────────────────────────────────────────────────╯
+
+[server] level-2 force-close (marker-only, 8 chars → 1 tokens, hard_limit_reply_budget = 4096)
+[server] level-2 force-close token ids: 248069
+[pc] enabled: cap=32 family=qwen
+[ppp] enabled=1 rearrange=0 lcp_window=8 min_pin=512 max_ephemeral=256
+[server] model dflash automatic decode KV offload budget: 0 bytes
+[server] listening on http://127.0.0.1:18719
+[server] request path=/v1/chat/completions body_bytes=79815
+[server] chat chatcmpl_0000000000000000 format=chat stream=true msgs=1 tools=0 prompt_tokens=16366 max_tokens=1 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000000 format=chat stream=true prompt_tokens=16366 max_tokens=1 tools=0
+[server] chat CACHE chatcmpl_0000000000000000 restore=false slot=-1 prefix_len=0 effective_prompt=16366 pflash=false disk_policy=full disk_hit=false snap_slot=0 snap_pos=16360 full_snap_slot=-1 full_snap_pos=0
+[server] chat DONE chatcmpl_0000000000000000 ok=true in=16366 effective_in=16366 out=1 17.5s 0.1 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=17.5s decode=0.0s(922.7tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=79815
+[server] chat chatcmpl_0000000000000001 format=chat stream=true msgs=1 tools=0 prompt_tokens=16366 max_tokens=1 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000001 format=chat stream=true prompt_tokens=16366 max_tokens=1 tools=0
+[server] chat CACHE chatcmpl_0000000000000001 restore=false slot=-1 prefix_len=0 effective_prompt=16366 pflash=false disk_policy=full disk_hit=false snap_slot=1 snap_pos=16360 full_snap_slot=-1 full_snap_pos=0
+[server] chat DONE chatcmpl_0000000000000001 ok=true in=16366 effective_in=16366 out=1 16.0s 0.1 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=16.0s decode=0.0s(3739.6tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=79815
+[server] chat chatcmpl_0000000000000002 format=chat stream=true msgs=1 tools=0 prompt_tokens=16366 max_tokens=1 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000002 format=chat stream=true prompt_tokens=16366 max_tokens=1 tools=0
+[server] chat CACHE chatcmpl_0000000000000002 restore=false slot=-1 prefix_len=0 effective_prompt=16366 pflash=false disk_policy=full disk_hit=false snap_slot=2 snap_pos=16360 full_snap_slot=-1 full_snap_pos=0
+[server] chat DONE chatcmpl_0000000000000002 ok=true in=16366 effective_in=16366 out=1 15.8s 0.1 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=15.8s decode=0.0s(3458.3tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=79815
+[server] chat chatcmpl_0000000000000003 format=chat stream=true msgs=1 tools=0 prompt_tokens=16366 max_tokens=1 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000003 format=chat stream=true prompt_tokens=16366 max_tokens=1 tools=0
+[server] chat CACHE chatcmpl_0000000000000003 restore=false slot=-1 prefix_len=0 effective_prompt=16366 pflash=false disk_policy=full disk_hit=false snap_slot=3 snap_pos=16360 full_snap_slot=-1 full_snap_pos=0
+[server] chat DONE chatcmpl_0000000000000003 ok=true in=16366 effective_in=16366 out=1 15.5s 0.1 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=15.5s decode=0.0s(3665.2tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=79815
+[server] chat chatcmpl_0000000000000004 format=chat stream=true msgs=1 tools=0 prompt_tokens=16366 max_tokens=1 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000004 format=chat stream=true prompt_tokens=16366 max_tokens=1 tools=0
+[server] chat CACHE chatcmpl_0000000000000004 restore=false slot=-1 prefix_len=0 effective_prompt=16366 pflash=false disk_policy=full disk_hit=false snap_slot=4 snap_pos=16360 full_snap_slot=-1 full_snap_pos=0
+[server] chat DONE chatcmpl_0000000000000004 ok=true in=16366 effective_in=16366 out=1 15.2s 0.1 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=15.2s decode=0.0s(3595.1tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=79815
+[server] chat chatcmpl_0000000000000005 format=chat stream=true msgs=1 tools=0 prompt_tokens=16366 max_tokens=1 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000005 format=chat stream=true prompt_tokens=16366 max_tokens=1 tools=0
+[server] chat CACHE chatcmpl_0000000000000005 restore=false slot=-1 prefix_len=0 effective_prompt=16366 pflash=false disk_policy=full disk_hit=false snap_slot=5 snap_pos=16360 full_snap_slot=-1 full_snap_pos=0
+[server] chat DONE chatcmpl_0000000000000005 ok=true in=16366 effective_in=16366 out=1 15.2s 0.1 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=15.2s decode=0.0s(3612.2tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=79815
+[server] chat chatcmpl_0000000000000006 format=chat stream=true msgs=1 tools=0 prompt_tokens=16366 max_tokens=1 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000006 format=chat stream=true prompt_tokens=16366 max_tokens=1 tools=0
+[server] chat CACHE chatcmpl_0000000000000006 restore=false slot=-1 prefix_len=0 effective_prompt=16366 pflash=false disk_policy=full disk_hit=false snap_slot=6 snap_pos=16360 full_snap_slot=-1 full_snap_pos=0
+[server] chat DONE chatcmpl_0000000000000006 ok=true in=16366 effective_in=16366 out=1 15.2s 0.1 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=15.2s decode=0.0s(3750.7tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=79815
+[server] chat chatcmpl_0000000000000007 format=chat stream=true msgs=1 tools=0 prompt_tokens=16366 max_tokens=1 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000007 format=chat stream=true prompt_tokens=16366 max_tokens=1 tools=0
+[server] chat CACHE chatcmpl_0000000000000007 restore=false slot=-1 prefix_len=0 effective_prompt=16366 pflash=false disk_policy=full disk_hit=false snap_slot=7 snap_pos=16360 full_snap_slot=-1 full_snap_pos=0
+[server] chat DONE chatcmpl_0000000000000007 ok=true in=16366 effective_in=16366 out=1 15.3s 0.1 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=15.3s decode=0.0s(3670.9tok/s) error=- detail=-

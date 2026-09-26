@@ -113,8 +113,11 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
             violations.emplace_back(protocol_error);
             return false;
         }
-        require(result.ok(), "valid planned work must succeed");
-        if (!result.ok()) return false;
+        if (!result.ok()) {
+            require(false, ("valid planned work must succeed: " +
+                            result.error).c_str());
+            return false;
+        }
 
         std::vector<bool> decode_answered((size_t)n_slots, false);
         std::vector<bool> prefill_answered((size_t)n_slots, false);

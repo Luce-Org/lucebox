@@ -1,0 +1,191 @@
+{
+  "wall_ms": 21616.3,
+  "kernel_sum_ms": 21167.818693999987,
+  "gpu_busy_union_ms": 21158.24282,
+  "copy_sum_ms": 0,
+  "host_or_idle_ms": 458.0571799999998,
+  "kernel_dispatches": 4665,
+  "copy_events": 0,
+  "completion_tokens": 1,
+  "effective_prompt_tokens": 16366,
+  "buckets": {
+    "routed MoE": {
+      "ms": 6188.738778999993,
+      "dispatches": 566
+    },
+    "dense GEMM (MMB)": {
+      "ms": 5537.891661999998,
+      "dispatches": 477
+    },
+    "MMQ/quantized GEMM": {
+      "ms": 2559.600934999998,
+      "dispatches": 478
+    },
+    "dense GEMM (rocBLAS)": {
+      "ms": 1387.1495019999998,
+      "dispatches": 58
+    },
+    "GDN": {
+      "ms": 1267.344298,
+      "dispatches": 72
+    },
+    "HC": {
+      "ms": 1182.936238,
+      "dispatches": 192
+    },
+    "QSA/indexer": {
+      "ms": 1040.688948,
+      "dispatches": 84
+    },
+    "elementwise/routing": {
+      "ms": 677.775948,
+      "dispatches": 1441
+    },
+    "conversions/copies": {
+      "ms": 663.9479069999995,
+      "dispatches": 853
+    },
+    "norms": {
+      "ms": 465.48349399999995,
+      "dispatches": 161
+    },
+    "RoPE": {
+      "ms": 182.38657600000002,
+      "dispatches": 48
+    },
+    "PLE compute": {
+      "ms": 6.781391999999999,
+      "dispatches": 2
+    },
+    "other": {
+      "ms": 4.711991,
+      "dispatches": 221
+    },
+    "matrix-vector GEMM (dense + expert)": {
+      "ms": 2.381024,
+      "dispatches": 12
+    }
+  },
+  "top_kernels": {
+    "void (anonymous namespace)::mmb_dense_kernel<128, 128, 32, 64, 2>(unsigned char const*, unsigned short const*, float*, unsigned short*, bool, int, int, int)": {
+      "ms": 4729.544142000004,
+      "dispatches": 334
+    },
+    "void (anonymous namespace)::mmb_routed_glu_kernel<64, 128, 32, 32, 53, false>(unsigned char const*, unsigned char const*, unsigned long, unsigned short const*, float*, unsigned short*, bool, int const*, int const*, int const*, unsigned int const*, int, int)": {
+      "ms": 1365.3236749999999,
+      "dispatches": 13
+    },
+    "void gated_delta_net_tiled_cuda<128, 8, 8, 16>(float const*, float const*, float const*, float const*, float const*, float const*, float*, float*, long, long, long, long, long, long, long, long, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, float)": {
+      "ms": 1024.727884,
+      "dispatches": 36
+    },
+    "void mul_mat_q<(ggml_type)23, 128, false>(char const*, int const*, int const*, int const*, __hip_bfloat16 const*, unsigned char const*, float*, float*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)": {
+      "ms": 894.8019920000002,
+      "dispatches": 65
+    },
+    "hc_combine_norm_f32_b256(float const*, float const*, float const*, float const*, float*, float*, unsigned short*, bool, unsigned short const*, unsigned short*, unsigned short const*, int, float, float, float, float, float)": {
+      "ms": 812.821341,
+      "dispatches": 95
+    },
+    "qsa3_attn_kernel(float const*, unsigned short const*, unsigned short const*, unsigned short const*, unsigned short const*, unsigned short const*, int const*, float*, qsa3_layout)": {
+      "ms": 801.7304919999999,
+      "dispatches": 12
+    },
+    "Cijk_Alik_Bljk_BBS_BH_MT128x128x32_MI16x16x16x1_SN_1LDSB0_APM1_ABV0_ACED0_AF0EM1_AF1EM1_AMAS3_ASE_ASGT_ASLT_ASM_ASAE01_ASCE01_ASEM1_AAC0_BL1_BS1_CLR0_DTLA0_DTLB0_DTVA0_DTVB0_DVO0_ETSP_EPS1_ELFLR0_EMLL0_FSSC10_FL0_GLVWA8_GLVWB8_GRCGA1_GRCGB1_GRPM1_GRVW8_GSU1_GSUASB_GLS0_ISA1151_IU1_K1_KLA_LBSPPA128_LBSPPB128_LPA8_LPB8_LDL1_LRVW16_LWPMn1_LDW0_FMA_MIAV1_MDA2_MO40_MMFGLC_MKFGSU256_NTA0_NTB0_NTC0_NTD0_NEPBS0_NLCA1_NLCB1_ONLL1_OPLV0_PK0_PAP0_PGR1_PLR0_PKA0_SIA3_SLW1_SS1_SU0_SUM0_SUS0_SCIUI1_SPO0_SRVW0_SSO0_SVW2_SNLL0_TSGRA0_TSGRB0_TT4_64_TLDS1_UMLDSA1_UMLDSB1_U64SL1_USFGROn1_VAW1_VSn1_VW2_VWB2_VFLRP0_WSGRA1_WSGRB1_WS32_WG32_4_1_WGM4": {
+      "ms": 743.201468,
+      "dispatches": 29
+    },
+    "void (anonymous namespace)::mmb_routed_kernel<128, 128, 32, 64, 74, false>(unsigned char const*, unsigned long, unsigned short const*, float*, unsigned short*, bool, int const*, int const*, int const*, unsigned int const*, int, int)": {
+      "ms": 740.0695249999999,
+      "dispatches": 30
+    },
+    "void mul_mat_q<(ggml_type)12, 128, false>(char const*, int const*, int const*, int const*, __hip_bfloat16 const*, unsigned char const*, float*, float*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)": {
+      "ms": 692.7501339999999,
+      "dispatches": 45
+    },
+    "void (anonymous namespace)::mmb_routed_glu_kernel<64, 128, 32, 32, 49, false>(unsigned char const*, unsigned char const*, unsigned long, unsigned short const*, float*, unsigned short*, bool, int const*, int const*, int const*, unsigned int const*, int, int)": {
+      "ms": 665.1860289999998,
+      "dispatches": 10
+    },
+    "void (anonymous namespace)::mmb_small_n_bf16_kernel<4, 64, 128>(unsigned short const*, unsigned short const*, float*, int, int, int)": {
+      "ms": 655.0124639999998,
+      "dispatches": 142
+    },
+    "Cijk_Alik_Bljk_BBS_BH_MT128x128x32_MI16x16x16x1_SN_1LDSB0_APM1_ABV0_ACED0_AF0EM1_AF1EM1_AMAS3_ASE_ASGT_ASLT_ASM_ASAE01_ASCE01_ASEM1_AAC0_BL1_BS1_CLR0_DTLA0_DTLB0_DTVA0_DTVB0_DVO0_ETSP_EPS1_ELFLR0_EMLL0_FSSC10_FL0_GLVWA8_GLVWB8_GRCGA1_GRCGB1_GRPM1_GRVW8_GSU1_GSUASB_GLS0_ISA1151_IU1_K1_KLA_LBSPPA128_LBSPPB128_LPA8_LPB8_LDL1_LRVW16_LWPMn1_LDW0_FMA_MIAV1_MDA2_MO40_MMFGLC_MKFGSU256_NTA0_NTB0_NTC0_NTD0_NEPBS0_NLCA1_NLCB1_ONLL1_OPLV0_PK0_PAP0_PGR1_PLR0_PKA0_SIA1_SLW1_SS1_SU0_SUM0_SUS0_SCIUI1_SPO0_SRVW0_SSO0_SVW2_SNLL0_TSGRA0_TSGRB0_TT4_64_TLDS1_UMLDSA1_UMLDSB1_U64SL1_USFGROn1_VAW1_VSn1_VW2_VWB2_VFLRP0_WSGRA1_WSGRB1_WS32_WG32_4_1_WGM4": {
+      "ms": 643.9480339999999,
+      "dispatches": 29
+    },
+    "void (anonymous namespace)::mmb_routed_glu_kernel<64, 128, 32, 32, 54, false>(unsigned char const*, unsigned char const*, unsigned long, unsigned short const*, float*, unsigned short*, bool, int const*, int const*, int const*, unsigned int const*, int, int)": {
+      "ms": 622.4789109999999,
+      "dispatches": 10
+    },
+    "void (anonymous namespace)::mmb_routed_glu_kernel<64, 128, 32, 32, 48, false>(unsigned char const*, unsigned char const*, unsigned long, unsigned short const*, float*, unsigned short*, bool, int const*, int const*, int const*, unsigned int const*, int, int)": {
+      "ms": 578.988616,
+      "dispatches": 9
+    },
+    "void (anonymous namespace)::mmb_routed_glu_kernel<64, 128, 32, 32, 50, false>(unsigned char const*, unsigned char const*, unsigned long, unsigned short const*, float*, unsigned short*, bool, int const*, int const*, int const*, unsigned int const*, int, int)": {
+      "ms": 502.865125,
+      "dispatches": 5
+    },
+    "void mul_mat_q<(ggml_type)21, 128, false>(char const*, int const*, int const*, int const*, __hip_bfloat16 const*, unsigned char const*, float*, float*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>)": {
+      "ms": 417.23427900000013,
+      "dispatches": 55
+    },
+    "moe_fused_combine_shared_kernel_f32(HIP_vector_type<float, 4u> const*, float const*, HIP_vector_type<float, 4u> const*, HIP_vector_type<float, 4u>*, int, int, int, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)": {
+      "ms": 410.942743,
+      "dispatches": 48
+    },
+    "hc_mix_reduce_bf16(unsigned short const*, unsigned short const*, float*, long, long, int, float, float)": {
+      "ms": 370.11128,
+      "dispatches": 95
+    },
+    "void rms_norm_f32<256, true, false>(float const*, float*, int, long, long, long, float, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>)": {
+      "ms": 325.85546400000004,
+      "dispatches": 84
+    },
+    "void (anonymous namespace)::mmb_routed_glu_kernel<64, 32, 16, 16, 53, false>(unsigned char const*, unsigned char const*, unsigned long, unsigned short const*, float*, unsigned short*, bool, int const*, int const*, int const*, unsigned int const*, int, int)": {
+      "ms": 324.818393,
+      "dispatches": 13
+    },
+    "void (anonymous namespace)::mmb_routed_kernel<128, 128, 32, 64, 0, false>(unsigned char const*, unsigned long, unsigned short const*, float*, unsigned short*, bool, int const*, int const*, int const*, unsigned int const*, int, int)": {
+      "ms": 319.39160499999997,
+      "dispatches": 17
+    },
+    "void unary_gated_op_kernel<&(op_sigmoid(float)), float>(float const*, float const*, float*, long, long, long, long)": {
+      "ms": 259.604383,
+      "dispatches": 48
+    },
+    "void gdn_conv_direct_kernel<true, 128>(float const*, float const*, float const*, float*, int, int)": {
+      "ms": 242.61641400000008,
+      "dispatches": 36
+    },
+    "void cpy_scalar<&(void cpy_1_scalar<float, float>(char const*, char*))>(char const*, char*, long, long, long, long, long, long, long, long, long, long, long, long, long, long, long)": {
+      "ms": 208.470112,
+      "dispatches": 61
+    },
+    "void rope_multi<true, false, false, float>(float const*, float*, int, int, int, int, int, int, int, int, int, int, int const*, float, float, float, rope_corr_dims, float, float const*, mrope_sections, bool)": {
+      "ms": 182.38657600000002,
+      "dispatches": 48
+    },
+    "void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)0>(float const*, int const*, void*, long, long, long, long, long, int, int, long, long)": {
+      "ms": 176.00982400000007,
+      "dispatches": 186
+    },
+    "void (anonymous namespace)::mmb_dense_kernel<128, 256, 64, 64, 2>(unsigned char const*, unsigned short const*, float*, unsigned short*, bool, int, int, int)": {
+      "ms": 153.335056,
+      "dispatches": 1
+    },
+    "convert_bf16_to_f32_vec(unsigned short const*, float*, long)": {
+      "ms": 146.35589400000003,
+      "dispatches": 58
+    },
+    "void k_bin_bcast<&(op_mul(float, float)), float, float, float, float const*>(float const*, float const*, float*, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, int, int, int, int, int, int, float const*)": {
+      "ms": 136.51322199999998,
+      "dispatches": 141
+    },
+    "void (anonymous namespace)::mmb_routed_glu_kernel<64, 32, 16, 16, 54, false>(unsigned char const*, unsigned char const*, unsigned long, unsigned short const*, float*, unsigned short*, bool, int const*, int const*, int const*, unsigned int const*, int, int)": {
+      "ms": 127.20384000000001,
+      "dispatches": 10
+    }
+  }
+}

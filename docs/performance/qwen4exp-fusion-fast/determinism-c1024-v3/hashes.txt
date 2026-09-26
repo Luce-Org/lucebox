@@ -1,0 +1,3 @@
+1f34fa0b724ae8ca93a1172077df1a02e8dc676b5d7b7c063a18b70a16bd926c  /tmp/qwen4exp-fusion-fast-evidence/determinism-c1024-v3/run1.bin
+1f34fa0b724ae8ca93a1172077df1a02e8dc676b5d7b7c063a18b70a16bd926c  /tmp/qwen4exp-fusion-fast-evidence/determinism-c1024-v3/run2.bin
+1f34fa0b724ae8ca93a1172077df1a02e8dc676b5d7b7c063a18b70a16bd926c  /tmp/qwen4exp-fusion-fast-evidence/determinism-c1024-v3/run3.bin

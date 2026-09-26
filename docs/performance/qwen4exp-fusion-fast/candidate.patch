@@ -1,0 +1,300 @@
+diff --git a/server/deps/llama.cpp/ggml/src/ggml-cuda/gdn-conv.cu b/server/deps/llama.cpp/ggml/src/ggml-cuda/gdn-conv.cu
+index d9bef53f..4496fa3c 100644
+--- a/server/deps/llama.cpp/ggml/src/ggml-cuda/gdn-conv.cu
++++ b/server/deps/llama.cpp/ggml/src/ggml-cuda/gdn-conv.cu
+@@ -4,9 +4,25 @@
+ 
+ static bool gdn_conv_enabled() { return true; }
+ 
++// Preserve the old recurrent state in otherwise-unused concat columns, then
++// materialize only the tail consumed by the state checkpoint.
++static __global__ void gdn_concat_tail(const float * __restrict__ state, const float * __restrict__ x, float * __restrict__ out,
++                                       const int C, const int T, const int tail_from, const int row_stride) {
++    const int ncols = T + 3 - tail_from;
++    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= (int64_t) C * (3 + ncols)) return;
++    const int c = (int) (idx / (3 + ncols)), col = (int) (idx % (3 + ncols));
++    if (col < 3) {
++        out[(size_t) c * row_stride + col] = state[c * 3 + col];
++    } else {
++        const int j = tail_from + col - 3;
++        out[(size_t) c * row_stride + j] = (j < 3) ? state[c * 3 + j] : x[(size_t) (j - 3) * C + c];
++    }
++}
++
+ template <bool apply_silu, int TT>
+-static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float * __restrict__ concat,
+-        const float * __restrict__ w, float * __restrict__ y, const int C, const int T) {
++static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float * __restrict__ saved_state, const float * __restrict__ x,
++        const float * __restrict__ w, float * __restrict__ y, const int C, const int T, const int state_stride) {
+     const int c  = blockIdx.x * 256 + threadIdx.x;
+     const int t0 = blockIdx.y * TT;
+     if (c >= C) return;
+@@ -15,7 +31,7 @@ static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float
+     for (int j = 0; j < 4; ++j) wr[j] = w[c * 4 + j];
+     float xw[4];
+ #pragma unroll
+-    for (int k = 0; k < 4; ++k) { const int jp = t0 + k; xw[k] = concat[(size_t) c * (T + 3) + jp]; }
++    for (int k = 0; k < 4; ++k) { const int jp = t0 + k; xw[k] = (jp < 3) ? saved_state[(size_t) c * state_stride + jp] : x[(size_t) (jp - 3) * C + c]; }
+     const float b = 0.0f;
+     const int tend = min(T, t0 + TT);
+     for (int t = t0; t < tend; ++t) {
+@@ -25,7 +41,7 @@ static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float
+         sumf += b;
+         y[(size_t) t * C + c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+         xw[0] = xw[1]; xw[1] = xw[2]; xw[2] = xw[3];
+-        const int jp = t + 4; xw[3] = jp < T + 3 ? concat[(size_t) c * (T + 3) + jp] : 0.0f;
++        const int jp = t + 4; xw[3] = (jp < 3) ? saved_state[(size_t) c * state_stride + jp] : ((jp - 3) < T ? x[(size_t) (jp - 3) * C + c] : 0.0f);
+     }
+ }
+ 
+@@ -44,7 +60,7 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+     if (cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) return false;
+     if (T < 256 || C % 256 != 0) return false;
+     if (i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_VIEW || cgraph->nodes[i + 1]->view_src != cc) return false;
+-    int conv = -1;
++    int64_t tail_from = T + 3; int conv = -1;
+     for (int n = i + 1; n < cgraph->n_nodes && n < i + 64; ++n) {
+         const ggml_tensor * t = cgraph->nodes[n];
+         if (t->op == GGML_OP_SSM_CONV && t->src[0] == cc) { conv = n; break; }
+@@ -54,7 +70,7 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+         if (t->op == GGML_OP_VIEW) {
+             if (t->ne[0] != 3 || t->ne[1] != C || t->nb[1] != cc->nb[1] || t->view_offs % sizeof(float)) return false;
+             const int64_t col = (int64_t) (t->view_offs / sizeof(float)); if (col < 0 || col + 3 > T + 3) return false;
+-            continue;
++            tail_from = std::min(tail_from, col); continue;
+         }
+         if (t->op == GGML_OP_CONT && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc) continue;
+         return false;
+@@ -69,11 +85,13 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
+     if (su->op != GGML_OP_UNARY || ggml_get_unary_op(su) != GGML_UNARY_OP_SILU || su->src[0] != cv || su->type != GGML_TYPE_F32 || !ggml_is_contiguous(su)) return false;
+     for (int n = conv + 2; n < cgraph->n_nodes; ++n) { const ggml_tensor * t = cgraph->nodes[n];
+         for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == cv || t->src[s]->view_src == cv) return false; }
+-    m.concat_idx = i; m.conv_idx = conv; m.concat = cc; m.w = w; m.conv_out = cgraph->nodes[conv + 1];
+-    m.C = C; m.T = T; m.silu = true;
++    m.concat_idx = i; m.conv_idx = conv; m.input = tr; m.state = st; m.concat = cc; m.w = w; m.conv_out = cgraph->nodes[conv + 1];
++    m.C = C; m.T = T; m.tail_from = tail_from; m.silu = true;
+     return true;
+ }
+ 
++bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m) { return gdn_conv_check(cgraph, i, m); }
++
+ bool ggml_cuda_gdn_conv_match_at_conv(const ggml_cgraph * cgraph, int j, ggml_cuda_gdn_conv_match & m) {
+     if (!gdn_conv_enabled() || j < 1 || cgraph->nodes[j]->op != GGML_OP_SSM_CONV) return false;
+     const ggml_tensor * cc = cgraph->nodes[j]->src[0];
+@@ -81,10 +99,18 @@ bool ggml_cuda_gdn_conv_match_at_conv(const ggml_cgraph * cgraph, int j, ggml_cu
+     return false;
+ }
+ 
++void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m) {
++    const int ncols = (int) (m.T + 3 - m.tail_from);
++    const int64_t n = m.C * (3 + ncols);
++    gdn_concat_tail<<<(unsigned) ((n + 255) / 256), 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.input->data,
++        (float *) m.concat->data, (int) m.C, (int) m.T, (int) m.tail_from, (int) (m.concat->nb[1] / sizeof(float)));
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m) {
+     constexpr int TT = 128;
+     dim3 grid((unsigned) (m.C / 256), (unsigned) ((m.T + TT - 1) / TT));
+-    gdn_conv_direct_kernel<true, TT><<<grid, 256, 0, ctx.stream()>>>((const float *) m.concat->data,
+-        (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T);
++    gdn_conv_direct_kernel<true, TT><<<grid, 256, 0, ctx.stream()>>>((const float *) m.concat->data, (const float *) m.input->data,
++        (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T, (int) (m.concat->nb[1] / sizeof(float)));
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/server/deps/llama.cpp/ggml/src/ggml-cuda/gdn-conv.cuh b/server/deps/llama.cpp/ggml/src/ggml-cuda/gdn-conv.cuh
+index cf1f41b7..3cb7add9 100644
+--- a/server/deps/llama.cpp/ggml/src/ggml-cuda/gdn-conv.cuh
++++ b/server/deps/llama.cpp/ggml/src/ggml-cuda/gdn-conv.cuh
+@@ -2,11 +2,15 @@
+ #include "common.cuh"
+ struct ggml_cuda_gdn_conv_match {
+     int concat_idx = -1, conv_idx = -1;   // node indices
++    const ggml_tensor * input = nullptr;  // CONCAT src[1], transpose view of [C, T]
++    const ggml_tensor * state = nullptr;  // [3, C] F32 contiguous
+     const ggml_tensor * concat = nullptr; // [T+3, C] F32
+     const ggml_tensor * w = nullptr;
+     ggml_tensor * conv_out = nullptr;
+-    int64_t C = 0, T = 0;
++    int64_t C = 0, T = 0, tail_from = 0;  // first concat column that must be materialized
+     bool silu = false;
+ };
++bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m);
+ bool ggml_cuda_gdn_conv_match_at_conv(const ggml_cgraph * cgraph, int j, ggml_cuda_gdn_conv_match & m);
++void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
+ void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
+diff --git a/server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu b/server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu
+index e4a6bd36..c275c38b 100644
+--- a/server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5126,6 +5126,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 if (!disable_fusion) {
+                     if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+                         static const bool conv_prof = []() { const bool e = (getenv("GGML_CUDA_CONV_PROF") != nullptr); if (e) { setvbuf(stderr, nullptr, _IONBF, 0); } return e; }();
++                        if (node->op == GGML_OP_CONCAT) {
++                            ggml_cuda_ple_conv_match pm;
++                            if (ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) {
++                                if (conv_prof) std::fprintf(stderr, "[conv] ple tail C=%lld T=%lld from=%lld\n", (long long) pm.C, (long long) pm.T, (long long) pm.tail_from);
++                                ggml_cuda_ple_conv_write_tail(*cuda_ctx, pm);
++                                i += 1;
++                                continue;
++                            }
++                            ggml_cuda_gdn_conv_match gm;
++                            if (ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
++                                if (conv_prof) std::fprintf(stderr, "[conv] gdn tail C=%lld T=%lld from=%lld\n", (long long) gm.C, (long long) gm.T, (long long) gm.tail_from);
++                                ggml_cuda_gdn_conv_write_tail(*cuda_ctx, gm);
++                                i += 1;
++                                continue;
++                            }
++                        }
+                         if (node->op == GGML_OP_CONT) {
+                             ggml_cuda_ple_conv_match pm;
+                             if (ggml_cuda_ple_conv_match_at_tap(cgraph, i, pm)) {
+diff --git a/server/deps/llama.cpp/ggml/src/ggml-cuda/ple-conv.cu b/server/deps/llama.cpp/ggml/src/ggml-cuda/ple-conv.cu
+index cb3639ce..bf69251f 100644
+--- a/server/deps/llama.cpp/ggml/src/ggml-cuda/ple-conv.cu
++++ b/server/deps/llama.cpp/ggml/src/ggml-cuda/ple-conv.cu
+@@ -13,9 +13,23 @@ static __device__ __forceinline__ float ple_mul_rn(const float a, const float b)
+ static __device__ __forceinline__ float ple_add_rn(const float a, const float b) { return __fadd_rn(a, b); }
+ #endif
+ 
++static __global__ void ple_concat_tail(const float * __restrict__ state, const float * __restrict__ x, float * __restrict__ out,
++                                       const int C, const int T, const int H, const int tail_from, const int row_stride) {
++    const int ncols = T + H - tail_from;
++    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= (int64_t) C * (H + ncols)) return;
++    const int c = (int) (idx / (H + ncols)), col = (int) (idx % (H + ncols));
++    if (col < H) {
++        out[(size_t) c * row_stride + col] = state[c * H + col];
++    } else {
++        const int j = tail_from + col - H;
++        out[(size_t) c * row_stride + j] = (j < H) ? state[c * H + j] : x[(size_t) (j - H) * C + c];
++    }
++}
++
+ template <int K, int DIL, int TT, typename W>
+-static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __restrict__ concat,
+-        const W * __restrict__ w, float * __restrict__ y, const int C, const int T) {
++static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __restrict__ saved_state, const float * __restrict__ x,
++        const W * __restrict__ w, float * __restrict__ y, const int C, const int T, const int state_stride) {
+     constexpr int H = (K - 1) * DIL, WIN = H + 1;
+     const int c = blockIdx.x * 256 + threadIdx.x, t0 = blockIdx.y * TT;
+     if (c >= C) return;
+@@ -23,7 +37,7 @@ static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __re
+ #pragma unroll
+     for (int k = 0; k < K; ++k) wr[k] = ggml_cuda_cast<float>(w[c * K + k]);
+     float win[WIN];
+-    auto ld = [&](int jp) -> float { return jp < T + H ? concat[(size_t) c * (T + H) + jp] : 0.0f; };
++    auto ld = [&](int jp) -> float { return (jp < H) ? saved_state[(size_t) c * state_stride + jp] : ((jp - H) < T ? x[(size_t) (jp - H) * C + c] : 0.0f); };
+ #pragma unroll
+     for (int k = 0; k < WIN; ++k) win[k] = ld(t0 + k);
+     const int tend = min(T, t0 + TT);
+@@ -51,7 +65,7 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
+     if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) return false;
+     if (cc->ne[0] != T + H || cc->ne[1] != C || cc->ne[2] != 1 || !ggml_is_contiguous(cc) || T < 256 || C % 256 != 0) return false;
+     if (cgraph->nodes[i + 1]->op != GGML_OP_VIEW || cgraph->nodes[i + 1]->view_src != cc) return false;
+-    int first_tap = -1, ntaps = 0; const ggml_tensor * wroot = nullptr; const ggml_tensor * chain = nullptr; int silu = -1;
++    int64_t tail_from = T + H; int first_tap = -1, ntaps = 0; const ggml_tensor * wroot = nullptr; const ggml_tensor * chain = nullptr; int silu = -1;
+     const ggml_tensor * tap_out[4] = {nullptr,nullptr,nullptr,nullptr};
+     std::vector<const ggml_tensor *> allowed_views, casts;
+     int terms = 0, adds = 0;
+@@ -60,7 +74,8 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
+         if (t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SILU && chain && t->src[0] == chain) { silu = n; break; }
+         if (t->op == GGML_OP_VIEW && t->view_src == cc && t->ne[0] == H) {
+             if (t->ne[1] != C || t->ne[2] != 1 || t->ne[3] != 1 || t->nb[1] != cc->nb[1] || t->view_offs % sizeof(float) || t->view_offs / sizeof(float) + H > T + H) return false;
+-            allowed_views.push_back(t); continue; }
++            allowed_views.push_back(t);
++            tail_from = std::min(tail_from, (int64_t)(t->view_offs / sizeof(float))); continue; }
+         if (t->op == GGML_OP_CONT && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc && t->src[0]->ne[0] == H) continue;
+         if (t->op == GGML_OP_CPY) continue;
+         if (t->op == GGML_OP_CONT && t->src[0]->op == GGML_OP_TRANSPOSE && t->src[0]->view_src == cc) {
+@@ -138,10 +153,11 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
+             std::find(casts.begin(), casts.end(), cgraph->nodes[n]) != casts.end()) outputs.push_back(n);
+     }
+     if (!ggml_can_fuse_subgraph_ext(cgraph, indices.data(), (int) indices.size(), ops.data(), outputs.data(), (int) outputs.size())) return false;
+-    m.concat_idx = i; m.first_tap_idx = first_tap; m.silu_idx = silu; m.concat = cc; m.w = wroot; m.out = cgraph->nodes[silu];
+-    m.C = C; m.T = T; m.H = H; m.K = 4; m.dil = 3;
++    m.concat_idx = i; m.first_tap_idx = first_tap; m.silu_idx = silu; m.input = tr; m.state = st; m.concat = cc; m.w = wroot; m.out = cgraph->nodes[silu];
++    m.C = C; m.T = T; m.H = H; m.K = 4; m.dil = 3; m.tail_from = tail_from;
+     return true;
+ }
++bool ggml_cuda_ple_conv_match_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv_match & m) { return ple_conv_check(cgraph, i, m); }
+ bool ggml_cuda_ple_conv_match_at_tap(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv_match & m) {
+     if (!ple_conv_enabled()) return false;
+     const ggml_tensor * t = cgraph->nodes[i];
+@@ -150,15 +166,22 @@ bool ggml_cuda_ple_conv_match_at_tap(const ggml_cgraph * cgraph, int i, ggml_cud
+     for (int c = i - 1; c >= 0 && c >= i - 96; --c) if (cgraph->nodes[c] == cc) return ple_conv_check(cgraph, c, m) && m.first_tap_idx == i;
+     return false;
+ }
++void ggml_cuda_ple_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_ple_conv_match & m) {
++    const int ncols = (int) (m.T + m.H - m.tail_from);
++    const int64_t n = m.C * (m.H + ncols);
++    ple_concat_tail<<<(unsigned) ((n + 255) / 256), 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.input->data,
++        (float *) m.concat->data, (int) m.C, (int) m.T, (int) m.H, (int) m.tail_from, (int) (m.concat->nb[1] / sizeof(float)));
++    CUDA_CHECK(cudaGetLastError());
++}
+ void ggml_cuda_ple_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_ple_conv_match & m) {
+     constexpr int TT = 128;
+     dim3 grid((unsigned) (m.C / 256), (unsigned) ((m.T + TT - 1) / TT));
+     if (m.w->type == GGML_TYPE_F32) {
+-        ple_conv_kernel<4, 3, TT, float><<<grid, 256, 0, ctx.stream()>>>((const float *) m.concat->data,
+-            (const float *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T);
++        ple_conv_kernel<4, 3, TT, float><<<grid, 256, 0, ctx.stream()>>>((const float *) m.concat->data, (const float *) m.input->data,
++            (const float *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T, (int) (m.concat->nb[1] / sizeof(float)));
+     } else {
+-        ple_conv_kernel<4, 3, TT, half><<<grid, 256, 0, ctx.stream()>>>((const float *) m.concat->data,
+-            (const half *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T);
++        ple_conv_kernel<4, 3, TT, half><<<grid, 256, 0, ctx.stream()>>>((const float *) m.concat->data, (const float *) m.input->data,
++            (const half *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T, (int) (m.concat->nb[1] / sizeof(float)));
+     }
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/server/deps/llama.cpp/ggml/src/ggml-cuda/ple-conv.cuh b/server/deps/llama.cpp/ggml/src/ggml-cuda/ple-conv.cuh
+index a8de8317..927ee621 100644
+--- a/server/deps/llama.cpp/ggml/src/ggml-cuda/ple-conv.cuh
++++ b/server/deps/llama.cpp/ggml/src/ggml-cuda/ple-conv.cuh
+@@ -2,11 +2,15 @@
+ #include "common.cuh"
+ struct ggml_cuda_ple_conv_match {
+     int concat_idx = -1, first_tap_idx = -1, silu_idx = -1;
++    const ggml_tensor * input = nullptr;   // CONCAT src[1], transpose view of [C, T]
++    const ggml_tensor * state = nullptr;   // [H, C] F32 contiguous (H = (K-1)*dil)
+     const ggml_tensor * concat = nullptr;  // [T+H, C]
+     const ggml_tensor * w = nullptr;
+     ggml_tensor * out = nullptr;           // silu output [C, T]
+-    int64_t C = 0, T = 0, H = 0, K = 0, dil = 0;
++    int64_t C = 0, T = 0, H = 0, K = 0, dil = 0, tail_from = 0;
+     int starts[8] = {0};
+ };
++bool ggml_cuda_ple_conv_match_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv_match & m);
+ bool ggml_cuda_ple_conv_match_at_tap(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv_match & m);
++void ggml_cuda_ple_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_ple_conv_match & m);
+ void ggml_cuda_ple_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_ple_conv_match & m);
+diff --git a/server/src/qwen4exp/qwen4exp_graph.cpp b/server/src/qwen4exp/qwen4exp_graph.cpp
+index c9db9c71..013e010e 100644
+--- a/server/src/qwen4exp/qwen4exp_graph.cpp
++++ b/server/src/qwen4exp/qwen4exp_graph.cpp
+@@ -271,7 +271,11 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor
+     ggml_build_forward_expand(gf, ggml_cpy(c, new_hist,
+         ggml_reshape_3d(c, conv_state, kernel - 1, conv_channels, 1)));
+ 
+-    ggml_tensor * conv = ggml_silu(c, ggml_ssm_conv(c, conv_input, L.ssm_conv1d));
++    ggml_tensor * conv_op = ggml_ssm_conv(c, conv_input, L.ssm_conv1d);
++    // The gfx1151 fusion reads CONCAT's input at this later node. src[3] is
++    // unused by ordinary SSM_CONV and gives the allocator the real lifetime.
++    conv_op->src[3] = qkv_t;
++    ggml_tensor * conv = ggml_silu(c, conv_op);
+     if (dump_mark) {
+         char dlab[32];
+         std::snprintf(dlab, sizeof dlab, "L%02d.conv", il);
+@@ -725,6 +729,9 @@ ggml_tensor * build_ple(ggml_context * c, ggml_cgraph * gf, ggml_tensor * hidden
+         ggml_tensor * shifted = ggml_cont(c, ggml_transpose(c,
+             ggml_view_3d(c, padded, T, hc_dim, 1, padded->nb[1], padded->nb[2],
+                          ggml_row_size(padded->type, start))));
++        // The fused kernel runs at the first CONT and reads norm_t directly.
++        // CONT ignores src[1], so use it as the allocator dependency edge.
++        if (k == 0) shifted->src[1] = norm_t;
+         ggml_tensor * wk = ggml_cont(c,
+             ggml_view_2d(c, L.ple_conv1d, 1, hc_dim, L.ple_conv1d->nb[1],
+                          k * L.ple_conv1d->nb[0]));

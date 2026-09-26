@@ -1,0 +1,33 @@
+2026-09-25T13:41:46+00:00
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 40.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T13:42:01+00:00
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 41.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================
+2026-09-25T13:42:16+00:00
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 32.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 45.0
+====================================================================================
+=============================== End of ROCm SMI Log ================================

@@ -1,0 +1,22 @@
+SERVER_PROCESSES:
+
+GTT_BYTES=18636800
+               total        used        free      shared  buff/cache   available
+Mem:             125          65          28           0          32          59
+Swap:              7           0           7
+PROFILE=balanced
+
+
+========================= ROCm System Management Interface =========================
+=================================== Temperature ====================================
+GPU[0]		: Temperature (Sensor edge) (C): 31.0
+GPU[0]		: Temperature (Sensor junction) (C): 31.0
+GPU[0]		: Temperature (Sensor memory) (C): 28.0
+GPU[1]		: Temperature (Sensor edge) (C): 36.0
+====================================================================================
+============================ Current clock frequencies =============================
+GPU[0]		: dcefclk clock level: 1: (219Mhz)
+GPU[0]		: fclk clock level: 1: (582Mhz)
+GPU[0]		: mclk clock level: 0: (96Mhz)
+python3: ./src/rocm_smi.cc:121: uint64_t get_multiplier_from_str(char): Assertion `false' failed.
+GUARD_OK

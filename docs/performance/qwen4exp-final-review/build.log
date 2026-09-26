@@ -1,0 +1,898 @@
+[  1%] Built target test_blocking_row_pool
+[  1%] Built target test_kernel_qualification_core
+[  1%] Built target test_platform_compat
+[  3%] Built target ggml-base
+[  3%] Built target test_ds4_budget_hook
+[  4%] Built target test_deepseek4_roctx
+[  5%] Built target test_drafter_tail_capture_guard_red
+[  5%] Built target test_qwen35_roctx
+[  6%] Built target test_seq_slot_manager
+[  6%] Built target test_seq_engine_contract
+[  7%] Built target test_parallel_prefix_txn
+[  8%] Built target test_paged_kv_pool
+[  9%] Built target test_chain_spec_shapes
+[  9%] Built target test_dflash2_selector_validation
+[ 10%] Built target test_ddtree_path
+[ 10%] Built target test_seq_batch_plan
+[ 10%] Built target test_client_send_buffer
+[ 11%] Built target test_ggml_meta_split_layout
+[ 11%] Built target test_moe_input_ready
+[ 12%] Built target test_qwen35_split_tree_guard
+[ 12%] Building CXX object CMakeFiles/test_feature_gate.dir/test/test_feature_gate.cpp.o
+[ 12%] Building CXX object deps/llama.cpp/ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ops.cpp.o
+[ 12%] Built target test_rocmfp4
+[ 12%] Built target test_rocmfpx
+[ 12%] Building HIP object deps/llama.cpp/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/fattn.cu.o
+[ 12%] Building HIP object deps/llama.cpp/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/ggml-cuda.cu.o
+[ 13%] Linking CXX executable test_feature_gate
+Discovering CppUnitTestFramework tests for test_feature_gate
+[ 14%] Built target test_feature_gate
+[ 15%] Building HIP object deps/llama.cpp/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/mmb.cu.o
+[ 15%] Linking CXX shared library libggml-cpu.so
+[ 17%] Built target ggml-cpu
+[ 18%] Linking HIP shared library libggml-hip.so
+[ 50%] Built target ggml-hip
+[ 50%] Linking CXX shared library libggml.so
+[ 51%] Built target ggml
+[ 51%] Linking HIP executable test_cuda_pool_shutdown
+[ 51%] Linking HIP executable test_rocmfpx_mmq
+[ 51%] Linking HIP executable test_rocmfp4_hip_tail
+[ 51%] Built target test_rocmfpx_mmq
+[ 51%] Built target test_cuda_pool_shutdown
+[ 51%] Built target test_rocmfp4_hip_tail
+[ 51%] Linking HIP executable test_gfx1151_width4_dispatch
+[ 51%] Linking HIP executable test_qwen35_gdn_verify_fusion
+[ 51%] Linking HIP executable test_ds4_mmid_regression
+[ 51%] Building CXX object CMakeFiles/dflash_common.dir/src/qwen4exp/qwen4exp_loader.cpp.o
+[ 52%] Built target test_gfx1151_width4_dispatch
+[ 52%] Built target test_qwen35_gdn_verify_fusion
+[ 52%] Built target test_ds4_mmid_regression
+[ 52%] Building CXX object CMakeFiles/dflash_common.dir/src/qwen4exp/qwen4exp_cache.cpp.o
+[ 52%] Linking HIP executable test_softmax_sink_col
+[ 52%] Linking CXX executable test_mul_mat_host_input
+[ 52%] Built target test_softmax_sink_col
+[ 52%] Linking CXX executable test_rms_norm_scale
+[ 52%] Built target test_mul_mat_host_input
+[ 52%] Linking CXX executable test_fattn_mma256
+[ 52%] Built target test_rms_norm_scale
+[ 52%] Linking CXX executable test_mmb_cublas_diff
+[ 52%] Built target test_fattn_mma256
+[ 52%] Linking HIP executable test_convert_vec
+[ 53%] Built target test_convert_vec
+[ 53%] Linking CXX executable test_getrows_scalar
+[ 53%] Built target test_mmb_cublas_diff
+[ 54%] Linking CXX executable test_quant_probe
+[ 54%] Built target test_getrows_scalar
+[ 55%] Linking CXX executable bench_fattn_mma256
+[ 55%] Linking HIP executable test_paged_attn_wmma
+[ 55%] Built target test_quant_probe
+[ 55%] Linking HIP executable bench_paged_attn_wmma
+[ 55%] Built target test_paged_attn_wmma
+[ 55%] Linking HIP executable bench_rocmfp_mix_gateup_glu
+[ 55%] Built target bench_paged_attn_wmma
+[ 55%] Building CXX object CMakeFiles/dflash_common.dir/src/qwen4exp/qwen4exp_graph.cpp.o
+[ 55%] Built target bench_fattn_mma256
+[ 56%] Built target bench_rocmfp_mix_gateup_glu
+[ 56%] Linking HIP executable bench_ds4_topk
+[ 57%] Building CXX object CMakeFiles/test_rope_tail.dir/test/test_rope_tail.cpp.o
+[ 57%] Built target bench_ds4_topk
+[ 57%] Building HIP object CMakeFiles/test_deepseek4_mmid_grouped_cuda.dir/test/test_deepseek4_mmid_grouped_cuda.cpp.o
+[ 57%] Linking CXX executable test_rope_tail
+Discovering CppUnitTestFramework tests for test_rope_tail
+[ 57%] Built target test_rope_tail
+[ 57%] Linking HIP executable test_ds4_moe_combine_cuda
+[ 58%] Built target test_ds4_moe_combine_cuda
+[ 59%] Linking HIP executable test_ds4_maskless_prefill
+[ 59%] Linking CXX executable test_ggml_rmsnorm_batch
+[ 59%] Built target test_ds4_maskless_prefill
+[ 59%] Linking HIP executable test_rocmfp3_mix_registry
+Discovering CppUnitTestFramework tests for test_rocmfp3_mix_registry
+Discovering CppUnitTestFramework tests for test_ggml_rmsnorm_batch
+[ 59%] Building CXX object CMakeFiles/dflash_common.dir/src/qwen4exp/qwen4exp_backend.cpp.o
+[ 60%] Built target test_ggml_rmsnorm_batch
+[ 60%] Built target test_rocmfp3_mix_registry
+[ 60%] Building CXX object CMakeFiles/dflash_common.dir/src/deepseek4/deepseek4_layer_split_adapter.cpp.o
+[ 60%] Linking HIP executable test_rocmfp_mix_slice_matvec
+Discovering CppUnitTestFramework tests for test_rocmfp_mix_slice_matvec
+[ 61%] Built target test_rocmfp_mix_slice_matvec
+[ 61%] Linking HIP executable test_rocmfp_mix_gateup_glu
+Discovering CppUnitTestFramework tests for test_rocmfp_mix_gateup_glu
+[ 62%] Built target test_rocmfp_mix_gateup_glu
+[ 62%] Linking HIP executable test_rocmfp_mix_glu_fusable
+Discovering CppUnitTestFramework tests for test_rocmfp_mix_glu_fusable
+[ 62%] Built target test_rocmfp_mix_glu_fusable
+[ 62%] Linking CXX executable spike_thin_copy
+[ 63%] Built target spike_thin_copy
+[ 63%] Linking CXX executable test_kernel_qualification_gdn
+[ 63%] Linking HIP executable test_deepseek4_mmid_grouped_cuda
+[ 63%] Built target test_deepseek4_mmid_grouped_cuda
+[ 63%] Built target test_kernel_qualification_gdn
+[ 64%] Linking HIP executable test_kernel_qualification_moe_ds4
+[ 64%] Linking CXX executable test_batched_gdn
+[ 64%] Built target test_kernel_qualification_moe_ds4
+[ 64%] Linking CXX executable test_gdn_replay_log
+[ 64%] Built target test_batched_gdn
+[ 64%] Linking CXX executable test_concat_transpose
+[ 64%] Built target test_gdn_replay_log
+[ 64%] Linking CXX executable bench_paged_attention
+[ 64%] Built target test_concat_transpose
+[ 64%] Building CXX object CMakeFiles/dflash_common.dir/src/common/backend_factory.cpp.o
+[ 64%] Building HIP object CMakeFiles/dflash_common.dir/src/deepseek4/deepseek4_hc_cuda.cu.o
+[ 64%] Built target bench_paged_attention
+[ 64%] Building HIP object CMakeFiles/dflash_common.dir/src/common/geometric_draft_topk_cuda.cu.o
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:272:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  272 |         cudaGetDevice(&previous);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:59:37: note: expanded from macro 'cudaGetDevice'
+   59 | #define cudaGetDevice               hipGetDevice
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:273:33: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  273 |         if (previous != device) cudaSetDevice(device);
+      |                                 ^~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:60:37: note: expanded from macro 'cudaSetDevice'
+   60 | #define cudaSetDevice               hipSetDevice
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:274:19: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  274 |         if (d_lp) cudaFree(d_lp);
+      |                   ^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:276:20: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  276 |         if (d_ids) cudaFree(d_ids);
+      |                    ^~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:278:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  278 |         if (d_pmax) cudaFree(d_pmax);
+      |                     ^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:280:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  280 |         if (d_psum) cudaFree(d_psum);
+      |                     ^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:282:19: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  282 |         if (d_pv) cudaFree(d_pv);
+      |                   ^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:284:19: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  284 |         if (d_pi) cudaFree(d_pi);
+      |                   ^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:286:50: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  286 |         if (previous >= 0 && previous != device) cudaSetDevice(previous);
+      |                                                  ^~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:60:37: note: expanded from macro 'cudaSetDevice'
+   60 | #define cudaSetDevice               hipSetDevice
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:357:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  357 |         cudaGetLastError();  // clear the error so we don't poison the next CUDA call
+      |         ^~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:79:37: note: expanded from macro 'cudaGetLastError'
+   79 | #define cudaGetLastError            hipGetLastError
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:363:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  363 |     cudaGetDevice(&prev);
+      |     ^~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:59:37: note: expanded from macro 'cudaGetDevice'
+   59 | #define cudaGetDevice               hipGetDevice
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:365:22: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  365 |     if (dev != prev) cudaSetDevice(dev);
+      |                      ^~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:60:37: note: expanded from macro 'cudaSetDevice'
+   60 | #define cudaSetDevice               hipSetDevice
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:375:25: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  375 |         if (kProfile) { cudaEventCreate(&e_k0); cudaEventCreate(&e_k1); cudaEventCreate(&e_c1); cudaEventRecord(e_k0); }
+      |                         ^~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:66:37: note: expanded from macro 'cudaEventCreate'
+   66 | #define cudaEventCreate             hipEventCreate
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:375:49: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  375 |         if (kProfile) { cudaEventCreate(&e_k0); cudaEventCreate(&e_k1); cudaEventCreate(&e_c1); cudaEventRecord(e_k0); }
+      |                                                 ^~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:66:37: note: expanded from macro 'cudaEventCreate'
+   66 | #define cudaEventCreate             hipEventCreate
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:375:73: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  375 |         if (kProfile) { cudaEventCreate(&e_k0); cudaEventCreate(&e_k1); cudaEventCreate(&e_c1); cudaEventRecord(e_k0); }
+      |                                                                         ^~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:66:37: note: expanded from macro 'cudaEventCreate'
+   66 | #define cudaEventCreate             hipEventCreate
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:375:97: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  375 |         if (kProfile) { cudaEventCreate(&e_k0); cudaEventCreate(&e_k1); cudaEventCreate(&e_c1); cudaEventRecord(e_k0); }
+      |                                                                                                 ^~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:68:37: note: expanded from macro 'cudaEventRecord'
+   68 | #define cudaEventRecord             hipEventRecord
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:409:23: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  409 |         if (kProfile) cudaEventRecord(e_k1);
+      |                       ^~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:68:37: note: expanded from macro 'cudaEventRecord'
+   68 | #define cudaEventRecord             hipEventRecord
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:418:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  418 |             cudaEventRecord(e_c1); cudaEventSynchronize(e_c1);
+      |             ^~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:68:37: note: expanded from macro 'cudaEventRecord'
+   68 | #define cudaEventRecord             hipEventRecord
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:418:36: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  418 |             cudaEventRecord(e_c1); cudaEventSynchronize(e_c1);
+      |                                    ^~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:69:37: note: expanded from macro 'cudaEventSynchronize'
+   69 | #define cudaEventSynchronize        hipEventSynchronize
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:420:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  420 |             cudaEventElapsedTime(&k_ms, e_k0, e_k1);
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:70:37: note: expanded from macro 'cudaEventElapsedTime'
+   70 | #define cudaEventElapsedTime        hipEventElapsedTime
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:421:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  421 |             cudaEventElapsedTime(&c_ms, e_k1, e_c1);
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:70:37: note: expanded from macro 'cudaEventElapsedTime'
+   70 | #define cudaEventElapsedTime        hipEventElapsedTime
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:424:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  424 |             cudaEventDestroy(e_k0); cudaEventDestroy(e_k1); cudaEventDestroy(e_c1);
+      |             ^~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:67:37: note: expanded from macro 'cudaEventDestroy'
+   67 | #define cudaEventDestroy            hipEventDestroy
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:424:37: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  424 |             cudaEventDestroy(e_k0); cudaEventDestroy(e_k1); cudaEventDestroy(e_c1);
+      |                                     ^~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:67:37: note: expanded from macro 'cudaEventDestroy'
+   67 | #define cudaEventDestroy            hipEventDestroy
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:424:61: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  424 |             cudaEventDestroy(e_k0); cudaEventDestroy(e_k1); cudaEventDestroy(e_c1);
+      |                                                             ^~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:67:37: note: expanded from macro 'cudaEventDestroy'
+   67 | #define cudaEventDestroy            hipEventDestroy
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:427:14: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  427 |     if (!ok) cudaGetLastError();
+      |              ^~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:79:37: note: expanded from macro 'cudaGetLastError'
+   79 | #define cudaGetLastError            hipGetLastError
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:428:22: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  428 |     if (dev != prev) cudaSetDevice(prev);
+      |                      ^~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:60:37: note: expanded from macro 'cudaSetDevice'
+   60 | #define cudaSetDevice               hipSetDevice
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:42:22: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   42 |         if (d_state) cudaFree(d_state);
+      |                      ^~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:43:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   43 |         if (d_sums) cudaFree(d_sums);
+      |                     ^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:44:20: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   44 |         if (d_mix) cudaFree(d_mix);
+      |                    ^~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:45:22: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   45 |         if (d_scale) cudaFree(d_scale);
+      |                      ^~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:46:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   46 |         if (d_base) cudaFree(d_base);
+      |                     ^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:47:24: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   47 |         if (d_working) cudaFree(d_working);
+      |                        ^~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:48:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   48 |         if (d_post) cudaFree(d_post);
+      |                     ^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:49:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   49 |         if (d_comb) cudaFree(d_comb);
+      |                     ^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:64:17: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   64 |                 cudaFree(d_working);
+      |                 ^~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:73:17: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   73 |                 cudaFree(d_state);
+      |                 ^~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+In file included from /tmp/qwen4exp-final-review/server/src/qwen35/qwen35_backend.h:30,
+                 from /tmp/qwen4exp-final-review/server/src/common/backend_factory.cpp:8:
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h: In member function ‘void dflash::common::KvFlashPager::reset()’:
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h:167:34: warning: ignoring returned value of type ‘hipError_t’, declared with attribute ‘nodiscard’ [-Wunused-result]
+  167 |             cudaStreamSynchronize(page_stream_);
+In file included from /opt/rocm/include/hip/hip_runtime.h:65,
+                 from /tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:10,
+                 from /tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h:66:
+/opt/rocm/include/hip/hip_runtime_api.h:2910:12: note: in call to ‘hipError_t hipStreamSynchronize(hipStream_t)’, declared here
+ 2910 | hipError_t hipStreamSynchronize(hipStream_t stream);
+      |            ^~~~~~~~~~~~~~~~~~~~
+/opt/rocm/include/hip/hip_runtime_api.h:419:3: note: ‘hipError_t’ declared here
+  419 | } hipError_t;
+      |   ^~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h: In member function ‘void dflash::common::KvFlashPager::zero_free_blocks()’:
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h:204:34: warning: ignoring returned value of type ‘hipError_t’, declared with attribute ‘nodiscard’ [-Wunused-result]
+  204 |             cudaStreamSynchronize(page_stream_);
+/opt/rocm/include/hip/hip_runtime_api.h:2910:12: note: in call to ‘hipError_t hipStreamSynchronize(hipStream_t)’, declared here
+ 2910 | hipError_t hipStreamSynchronize(hipStream_t stream);
+      |            ^~~~~~~~~~~~~~~~~~~~
+/opt/rocm/include/hip/hip_runtime_api.h:419:3: note: ‘hipError_t’ declared here
+  419 | } hipError_t;
+      |   ^~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h: In member function ‘void dflash::common::KvFlashPager::synchronize_paging()’:
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h:312:30: warning: ignoring returned value of type ‘hipError_t’, declared with attribute ‘nodiscard’ [-Wunused-result]
+  312 |         cudaStreamSynchronize(page_stream_);  // page_stream_==nullptr syncs the default stream
+/opt/rocm/include/hip/hip_runtime_api.h:2910:12: note: in call to ‘hipError_t hipStreamSynchronize(hipStream_t)’, declared here
+ 2910 | hipError_t hipStreamSynchronize(hipStream_t stream);
+      |            ^~~~~~~~~~~~~~~~~~~~
+/opt/rocm/include/hip/hip_runtime_api.h:419:3: note: ‘hipError_t’ declared here
+  419 | } hipError_t;
+      |   ^~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h: In member function ‘void dflash::common::KvFlashPager::cleanup_()’:
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h:545:30: warning: ignoring returned value of type ‘hipError_t’, declared with attribute ‘nodiscard’ [-Wunused-result]
+  545 |         cudaStreamSynchronize(page_stream_);  // real stream, or default stream if create failed
+/opt/rocm/include/hip/hip_runtime_api.h:2910:12: note: in call to ‘hipError_t hipStreamSynchronize(hipStream_t)’, declared here
+ 2910 | hipError_t hipStreamSynchronize(hipStream_t stream);
+      |            ^~~~~~~~~~~~~~~~~~~~
+/opt/rocm/include/hip/hip_runtime_api.h:419:3: note: ‘hipError_t’ declared here
+  419 | } hipError_t;
+      |   ^~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h:547:30: warning: ignoring returned value of type ‘hipError_t’, declared with attribute ‘nodiscard’ [-Wunused-result]
+  547 |             cudaStreamDestroy(page_stream_);
+/opt/rocm/include/hip/hip_runtime_api.h:2872:12: note: in call to ‘hipError_t hipStreamDestroy(hipStream_t)’, declared here
+ 2872 | hipError_t hipStreamDestroy(hipStream_t stream);
+      |            ^~~~~~~~~~~~~~~~
+/opt/rocm/include/hip/hip_runtime_api.h:419:3: note: ‘hipError_t’ declared here
+  419 | } hipError_t;
+      |   ^~~~~~~~~~
+10 warnings generated when compiling for gfx1151.
+[ 64%] Building HIP object CMakeFiles/dflash_common.dir/src/common/specla_commit_cuda.cu.o
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:42:22: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   42 |         if (d_state) cudaFree(d_state);
+      |                      ^~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:43:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   43 |         if (d_sums) cudaFree(d_sums);
+      |                     ^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:44:20: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   44 |         if (d_mix) cudaFree(d_mix);
+      |                    ^~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:45:22: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   45 |         if (d_scale) cudaFree(d_scale);
+      |                      ^~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:46:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   46 |         if (d_base) cudaFree(d_base);
+      |                     ^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:47:24: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   47 |         if (d_working) cudaFree(d_working);
+      |                        ^~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:48:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   48 |         if (d_post) cudaFree(d_post);
+      |                     ^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:49:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   49 |         if (d_comb) cudaFree(d_comb);
+      |                     ^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:64:17: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   64 |                 cudaFree(d_working);
+      |                 ^~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+/tmp/qwen4exp-final-review/server/src/deepseek4/deepseek4_hc_cuda.cu:73:17: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   73 |                 cudaFree(d_state);
+      |                 ^~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:21:18: note: expanded from macro 'cudaFree'
+   21 | #define cudaFree hipFree
+      |                  ^
+10 warnings generated when compiling for host.
+26 warnings generated when compiling for gfx1151.
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:272:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  272 |         cudaGetDevice(&previous);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:59:37: note: expanded from macro 'cudaGetDevice'
+   59 | #define cudaGetDevice               hipGetDevice
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:273:33: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  273 |         if (previous != device) cudaSetDevice(device);
+      |                                 ^~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:60:37: note: expanded from macro 'cudaSetDevice'
+   60 | #define cudaSetDevice               hipSetDevice
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:274:19: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  274 |         if (d_lp) cudaFree(d_lp);
+      |                   ^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:276:20: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  276 |         if (d_ids) cudaFree(d_ids);
+      |                    ^~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:278:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  278 |         if (d_pmax) cudaFree(d_pmax);
+      |                     ^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:280:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  280 |         if (d_psum) cudaFree(d_psum);
+      |                     ^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:282:19: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  282 |         if (d_pv) cudaFree(d_pv);
+      |                   ^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:284:19: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  284 |         if (d_pi) cudaFree(d_pi);
+      |                   ^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:286:50: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  286 |         if (previous >= 0 && previous != device) cudaSetDevice(previous);
+      |                                                  ^~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:60:37: note: expanded from macro 'cudaSetDevice'
+   60 | #define cudaSetDevice               hipSetDevice
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:357:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  357 |         cudaGetLastError();  // clear the error so we don't poison the next CUDA call
+      |         ^~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:79:37: note: expanded from macro 'cudaGetLastError'
+   79 | #define cudaGetLastError            hipGetLastError
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:363:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  363 |     cudaGetDevice(&prev);
+      |     ^~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:59:37: note: expanded from macro 'cudaGetDevice'
+   59 | #define cudaGetDevice               hipGetDevice
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:365:22: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  365 |     if (dev != prev) cudaSetDevice(dev);
+      |                      ^~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:60:37: note: expanded from macro 'cudaSetDevice'
+   60 | #define cudaSetDevice               hipSetDevice
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:375:25: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  375 |         if (kProfile) { cudaEventCreate(&e_k0); cudaEventCreate(&e_k1); cudaEventCreate(&e_c1); cudaEventRecord(e_k0); }
+      |                         ^~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:66:37: note: expanded from macro 'cudaEventCreate'
+   66 | #define cudaEventCreate             hipEventCreate
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:375:49: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  375 |         if (kProfile) { cudaEventCreate(&e_k0); cudaEventCreate(&e_k1); cudaEventCreate(&e_c1); cudaEventRecord(e_k0); }
+      |                                                 ^~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:66:37: note: expanded from macro 'cudaEventCreate'
+   66 | #define cudaEventCreate             hipEventCreate
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:375:73: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  375 |         if (kProfile) { cudaEventCreate(&e_k0); cudaEventCreate(&e_k1); cudaEventCreate(&e_c1); cudaEventRecord(e_k0); }
+      |                                                                         ^~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:66:37: note: expanded from macro 'cudaEventCreate'
+   66 | #define cudaEventCreate             hipEventCreate
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:375:97: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  375 |         if (kProfile) { cudaEventCreate(&e_k0); cudaEventCreate(&e_k1); cudaEventCreate(&e_c1); cudaEventRecord(e_k0); }
+      |                                                                                                 ^~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:68:37: note: expanded from macro 'cudaEventRecord'
+   68 | #define cudaEventRecord             hipEventRecord
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:409:23: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  409 |         if (kProfile) cudaEventRecord(e_k1);
+      |                       ^~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:68:37: note: expanded from macro 'cudaEventRecord'
+   68 | #define cudaEventRecord             hipEventRecord
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:418:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  418 |             cudaEventRecord(e_c1); cudaEventSynchronize(e_c1);
+      |             ^~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:68:37: note: expanded from macro 'cudaEventRecord'
+   68 | #define cudaEventRecord             hipEventRecord
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:418:36: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  418 |             cudaEventRecord(e_c1); cudaEventSynchronize(e_c1);
+      |                                    ^~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:69:37: note: expanded from macro 'cudaEventSynchronize'
+   69 | #define cudaEventSynchronize        hipEventSynchronize
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:420:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  420 |             cudaEventElapsedTime(&k_ms, e_k0, e_k1);
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:70:37: note: expanded from macro 'cudaEventElapsedTime'
+   70 | #define cudaEventElapsedTime        hipEventElapsedTime
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:421:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  421 |             cudaEventElapsedTime(&c_ms, e_k1, e_c1);
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:70:37: note: expanded from macro 'cudaEventElapsedTime'
+   70 | #define cudaEventElapsedTime        hipEventElapsedTime
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:424:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  424 |             cudaEventDestroy(e_k0); cudaEventDestroy(e_k1); cudaEventDestroy(e_c1);
+      |             ^~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:67:37: note: expanded from macro 'cudaEventDestroy'
+   67 | #define cudaEventDestroy            hipEventDestroy
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:424:37: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  424 |             cudaEventDestroy(e_k0); cudaEventDestroy(e_k1); cudaEventDestroy(e_c1);
+      |                                     ^~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:67:37: note: expanded from macro 'cudaEventDestroy'
+   67 | #define cudaEventDestroy            hipEventDestroy
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:424:61: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  424 |             cudaEventDestroy(e_k0); cudaEventDestroy(e_k1); cudaEventDestroy(e_c1);
+      |                                                             ^~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:67:37: note: expanded from macro 'cudaEventDestroy'
+   67 | #define cudaEventDestroy            hipEventDestroy
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:427:14: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  427 |     if (!ok) cudaGetLastError();
+      |              ^~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:79:37: note: expanded from macro 'cudaGetLastError'
+   79 | #define cudaGetLastError            hipGetLastError
+      |                                     ^
+/tmp/qwen4exp-final-review/server/src/common/geometric_draft_topk_cuda.cu:428:22: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  428 |     if (dev != prev) cudaSetDevice(prev);
+      |                      ^~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:60:37: note: expanded from macro 'cudaSetDevice'
+   60 | #define cudaSetDevice               hipSetDevice
+      |                                     ^
+26 warnings generated when compiling for host.
+[ 64%] Linking HIP static library libdflash_common.a
+[ 84%] Built target dflash_common
+[ 84%] Linking HIP executable test_qwen35_tensor_parallel
+[ 84%] Linking HIP executable pflash_daemon
+[ 84%] Building HIP object CMakeFiles/test_rms_norm_hip.dir/test/test_rms_norm_hip.cpp.o
+[ 84%] Building HIP object CMakeFiles/test_deepseek4_hc_cuda.dir/test/test_deepseek4_hc_cuda.cpp.o
+[ 84%] Built target pflash_daemon
+Discovering CppUnitTestFramework tests for test_qwen35_tensor_parallel
+[ 84%] Building HIP object CMakeFiles/test_draft_topk_cuda.dir/test/test_draft_topk_cuda.cpp.o
+[ 84%] Built target test_qwen35_tensor_parallel
+[ 84%] Linking HIP executable test_deepseek4_unit
+[ 84%] Built target test_deepseek4_unit
+[ 84%] Linking HIP executable test_ds4_load_transactional
+[ 84%] Built target test_ds4_load_transactional
+[ 84%] Linking HIP executable test_ds4_mix_registry_teardown
+Discovering CppUnitTestFramework tests for test_ds4_mix_registry_teardown
+[ 84%] Built target test_ds4_mix_registry_teardown
+[ 84%] Linking HIP executable test_ds4_dmix_entry_validation
+Discovering CppUnitTestFramework tests for test_ds4_dmix_entry_validation
+[ 85%] Built target test_ds4_dmix_entry_validation
+[ 85%] Linking HIP executable test_ds4_paged_prefill_model
+[ 85%] Built target test_ds4_paged_prefill_model
+[ 85%] Linking HIP executable test_ds4_dspark_load
+[ 85%] Built target test_ds4_dspark_load
+[ 85%] Linking HIP executable smoke_draft_graph
+[ 85%] Built target smoke_draft_graph
+[ 85%] Linking HIP executable smoke_qwen3_forward
+/tmp/qwen4exp-final-review/server/test/test_rms_norm_hip.cpp:102:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  102 |     cudaFree(d_src); cudaFree(d_w); cudaFree(d_dst);
+      |     ^~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/test/test_rms_norm_hip.cpp:102:22: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  102 |     cudaFree(d_src); cudaFree(d_w); cudaFree(d_dst);
+      |                      ^~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/test/test_rms_norm_hip.cpp:102:37: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  102 |     cudaFree(d_src); cudaFree(d_w); cudaFree(d_dst);
+      |                                     ^~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+[ 86%] Built target smoke_qwen3_forward
+/tmp/qwen4exp-final-review/server/test/test_deepseek4_hc_cuda.cpp:113:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  113 |         cudaFree(d_fn);
+      |         ^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/test/test_deepseek4_hc_cuda.cpp:116:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  116 |     cudaFree(d_fn);
+      |     ^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+[ 86%] Building CXX object CMakeFiles/smoke_qwen4exp_forward.dir/test/smoke_qwen4exp_forward.cpp.o
+/tmp/qwen4exp-final-review/server/test/test_draft_topk_cuda.cpp:74:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   74 |     cudaMemcpy(d_logits, h_logits.data(), n_logits * sizeof(float),
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   75 |                cudaMemcpyHostToDevice);
+      |                ~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:42:37: note: expanded from macro 'cudaMemcpy'
+   42 | #define cudaMemcpy                  hipMemcpy
+      |                                     ^
+/tmp/qwen4exp-final-review/server/test/test_draft_topk_cuda.cpp:81:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   81 |     cudaFree(d_logits);
+      |     ^~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/test/test_draft_topk_cuda.cpp:192:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  192 |             cudaMemcpy(d, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:42:37: note: expanded from macro 'cudaMemcpy'
+   42 | #define cudaMemcpy                  hipMemcpy
+      |                                     ^
+/tmp/qwen4exp-final-review/server/test/test_draft_topk_cuda.cpp:205:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  205 |             cudaFree(d);
+      |             ^~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+3 warnings generated when compiling for gfx1151.
+2 warnings generated when compiling for gfx1151.
+4 warnings generated when compiling for gfx1151.
+[ 86%] Linking HIP executable smoke_qwen4exp_forward
+[ 86%] Built target smoke_qwen4exp_forward
+[ 87%] Linking HIP executable test_vs_oracle
+[ 87%] Built target test_vs_oracle
+[ 87%] Linking HIP executable smoke_laguna_forward
+[ 87%] Built target smoke_laguna_forward
+[ 87%] Linking HIP executable bench_laguna_ttft
+[ 88%] Built target bench_laguna_ttft
+/tmp/qwen4exp-final-review/server/test/test_rms_norm_hip.cpp:102:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  102 |     cudaFree(d_src); cudaFree(d_w); cudaFree(d_dst);
+      |     ^~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/test/test_rms_norm_hip.cpp:102:22: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  102 |     cudaFree(d_src); cudaFree(d_w); cudaFree(d_dst);
+      |                      ^~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/test/test_rms_norm_hip.cpp:102:37: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  102 |     cudaFree(d_src); cudaFree(d_w); cudaFree(d_dst);
+      |                                     ^~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+[ 88%] Linking HIP executable bench_laguna_pflash
+[ 88%] Built target bench_laguna_pflash
+[ 88%] Linking HIP executable bench_laguna_generate
+/tmp/qwen4exp-final-review/server/test/test_deepseek4_hc_cuda.cpp:113:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  113 |         cudaFree(d_fn);
+      |         ^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/test/test_deepseek4_hc_cuda.cpp:116:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  116 |     cudaFree(d_fn);
+      |     ^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+[ 88%] Built target bench_laguna_generate
+[ 88%] Linking HIP executable bench_laguna_spark
+[ 88%] Built target bench_laguna_spark
+[ 88%] Linking HIP executable test_laguna_daemon
+[ 88%] Built target test_laguna_daemon
+/tmp/qwen4exp-final-review/server/test/test_draft_topk_cuda.cpp:74:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   74 |     cudaMemcpy(d_logits, h_logits.data(), n_logits * sizeof(float),
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   75 |                cudaMemcpyHostToDevice);
+      |                ~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:42:37: note: expanded from macro 'cudaMemcpy'
+   42 | #define cudaMemcpy                  hipMemcpy
+      |                                     ^
+/tmp/qwen4exp-final-review/server/test/test_draft_topk_cuda.cpp:81:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   81 |     cudaFree(d_logits);
+      |     ^~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+/tmp/qwen4exp-final-review/server/test/test_draft_topk_cuda.cpp:192:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  192 |             cudaMemcpy(d, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:42:37: note: expanded from macro 'cudaMemcpy'
+   42 | #define cudaMemcpy                  hipMemcpy
+      |                                     ^
+/tmp/qwen4exp-final-review/server/test/test_draft_topk_cuda.cpp:205:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  205 |             cudaFree(d);
+      |             ^~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/hip_compat/cuda_runtime.h:40:37: note: expanded from macro 'cudaFree'
+   40 | #define cudaFree                    hipFree
+      |                                     ^
+[ 88%] Linking HIP executable smoke_target_forward
+[ 88%] Built target smoke_target_forward
+[ 88%] Linking HIP executable test_generate
+[ 88%] Built target test_generate
+[ 88%] Linking HIP executable test_kvflash
+[ 88%] Built target test_kvflash
+[ 89%] Linking HIP executable test_draft_swa
+3 warnings generated when compiling for host.
+[ 89%] Linking HIP executable test_rms_norm_hip
+Discovering CppUnitTestFramework tests for test_draft_swa
+Discovering CppUnitTestFramework tests for test_rms_norm_hip
+[ 89%] Built target test_draft_swa
+[ 89%] Linking HIP executable test_draft_swa_multilane
+[ 89%] Built target test_rms_norm_hip
+[ 89%] Linking HIP executable test_dflash
+[ 89%] Built target test_draft_swa_multilane
+[ 89%] Linking HIP executable test_tokenizer_harness
+[ 89%] Built target test_dflash
+[ 89%] Built target test_tokenizer_harness
+[ 90%] Linking HIP executable test_recurrent_snapshot
+2 warnings generated when compiling for host.
+[ 91%] Linking HIP executable test_delta_net_specla
+[ 91%] Linking HIP executable test_deepseek4_hc_cuda
+Discovering CppUnitTestFramework tests for test_recurrent_snapshot
+[ 91%] Built target test_delta_net_specla
+Discovering CppUnitTestFramework tests for test_deepseek4_hc_cuda
+[ 91%] Building CXX object CMakeFiles/test_server_unit.dir/test/test_server_unit.cpp.o
+[ 91%] Built target test_recurrent_snapshot
+[ 91%] Built target test_deepseek4_hc_cuda
+[ 91%] Linking HIP executable test_model_smoke
+[ 91%] Linking HIP executable dflash_server
+4 warnings generated when compiling for host.
+Discovering CppUnitTestFramework tests for test_model_smoke
+[ 91%] Linking HIP executable test_draft_topk_cuda
+Copying status.html to build/share/
+[ 92%] Built target dflash_server
+[ 92%] Linking HIP executable backend_ipc_daemon
+[ 92%] Built target test_draft_topk_cuda
+[ 93%] Built target test_model_smoke
+[ 93%] Built target backend_ipc_daemon
+In file included from /tmp/qwen4exp-final-review/server/src/common/layer_split_kvflash.h:9,
+                 from /tmp/qwen4exp-final-review/server/test/test_server_unit.cpp:37:
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h: In member function ‘void dflash::common::KvFlashPager::reset()’:
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h:167:34: warning: ignoring returned value of type ‘hipError_t’, declared with attribute ‘nodiscard’ [-Wunused-result]
+  167 |             cudaStreamSynchronize(page_stream_);
+In file included from /opt/rocm/include/hip/hip_runtime.h:65,
+                 from /tmp/qwen4exp-final-review/server/src/common/gpu_runtime_compat.h:10,
+                 from /tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h:66:
+/opt/rocm/include/hip/hip_runtime_api.h:2910:12: note: in call to ‘hipError_t hipStreamSynchronize(hipStream_t)’, declared here
+ 2910 | hipError_t hipStreamSynchronize(hipStream_t stream);
+      |            ^~~~~~~~~~~~~~~~~~~~
+/opt/rocm/include/hip/hip_runtime_api.h:419:3: note: ‘hipError_t’ declared here
+  419 | } hipError_t;
+      |   ^~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h: In member function ‘void dflash::common::KvFlashPager::zero_free_blocks()’:
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h:204:34: warning: ignoring returned value of type ‘hipError_t’, declared with attribute ‘nodiscard’ [-Wunused-result]
+  204 |             cudaStreamSynchronize(page_stream_);
+/opt/rocm/include/hip/hip_runtime_api.h:2910:12: note: in call to ‘hipError_t hipStreamSynchronize(hipStream_t)’, declared here
+ 2910 | hipError_t hipStreamSynchronize(hipStream_t stream);
+      |            ^~~~~~~~~~~~~~~~~~~~
+/opt/rocm/include/hip/hip_runtime_api.h:419:3: note: ‘hipError_t’ declared here
+  419 | } hipError_t;
+      |   ^~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h: In member function ‘void dflash::common::KvFlashPager::synchronize_paging()’:
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h:312:30: warning: ignoring returned value of type ‘hipError_t’, declared with attribute ‘nodiscard’ [-Wunused-result]
+  312 |         cudaStreamSynchronize(page_stream_);  // page_stream_==nullptr syncs the default stream
+/opt/rocm/include/hip/hip_runtime_api.h:2910:12: note: in call to ‘hipError_t hipStreamSynchronize(hipStream_t)’, declared here
+ 2910 | hipError_t hipStreamSynchronize(hipStream_t stream);
+      |            ^~~~~~~~~~~~~~~~~~~~
+/opt/rocm/include/hip/hip_runtime_api.h:419:3: note: ‘hipError_t’ declared here
+  419 | } hipError_t;
+      |   ^~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h: In member function ‘void dflash::common::KvFlashPager::cleanup_()’:
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h:545:30: warning: ignoring returned value of type ‘hipError_t’, declared with attribute ‘nodiscard’ [-Wunused-result]
+  545 |         cudaStreamSynchronize(page_stream_);  // real stream, or default stream if create failed
+/opt/rocm/include/hip/hip_runtime_api.h:2910:12: note: in call to ‘hipError_t hipStreamSynchronize(hipStream_t)’, declared here
+ 2910 | hipError_t hipStreamSynchronize(hipStream_t stream);
+      |            ^~~~~~~~~~~~~~~~~~~~
+/opt/rocm/include/hip/hip_runtime_api.h:419:3: note: ‘hipError_t’ declared here
+  419 | } hipError_t;
+      |   ^~~~~~~~~~
+/tmp/qwen4exp-final-review/server/src/common/kvflash_pager.h:547:30: warning: ignoring returned value of type ‘hipError_t’, declared with attribute ‘nodiscard’ [-Wunused-result]
+  547 |             cudaStreamDestroy(page_stream_);
+/opt/rocm/include/hip/hip_runtime_api.h:2872:12: note: in call to ‘hipError_t hipStreamDestroy(hipStream_t)’, declared here
+ 2872 | hipError_t hipStreamDestroy(hipStream_t stream);
+      |            ^~~~~~~~~~~~~~~~
+/opt/rocm/include/hip/hip_runtime_api.h:419:3: note: ‘hipError_t’ declared here
+  419 | } hipError_t;
+      |   ^~~~~~~~~~
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp: In member function ‘void {anonymous}::TestCase_test_disk_cache_header_round_trip::Run()’:
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp:6303:30: warning: ignoring return value of ‘size_t fread(void*, size_t, size_t, FILE*)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+ 6303 |     char magic[4]; std::fread(magic, 4, 1, f);
+      |                    ~~~~~~~~~~^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp:6305:28: warning: ignoring return value of ‘size_t fread(void*, size_t, size_t, FILE*)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+ 6305 |     uint32_t rv; std::fread(&rv, 4, 1, f);
+      |                  ~~~~~~~~~~^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp:6307:32: warning: ignoring return value of ‘size_t fread(void*, size_t, size_t, FILE*)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+ 6307 |     uint8_t lid[16]; std::fread(lid, 16, 1, f);
+      |                      ~~~~~~~~~~^~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp:6309:15: warning: ignoring return value of ‘size_t fread(void*, size_t, size_t, FILE*)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+ 6309 |     std::fread(&rv, 4, 1, f); TEST_ASSERT(rv == 1234);  // cur_pos
+      |     ~~~~~~~~~~^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp:6310:15: warning: ignoring return value of ‘size_t fread(void*, size_t, size_t, FILE*)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+ 6310 |     std::fread(&rv, 4, 1, f); TEST_ASSERT(rv == 42);    // n_tensors
+      |     ~~~~~~~~~~^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp:6311:15: warning: ignoring return value of ‘size_t fread(void*, size_t, size_t, FILE*)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+ 6311 |     std::fread(&rv, 4, 1, f); TEST_ASSERT(rv == 567);   // token_count
+      |     ~~~~~~~~~~^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp:6312:31: warning: ignoring return value of ‘size_t fread(void*, size_t, size_t, FILE*)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+ 6312 |     uint8_t th[16]; std::fread(th, 16, 1, f);
+      |                     ~~~~~~~~~~^~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp:6314:30: warning: ignoring return value of ‘size_t fread(void*, size_t, size_t, FILE*)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+ 6314 |     uint64_t ru64; std::fread(&ru64, 8, 1, f); TEST_ASSERT(ru64 == 9999999);  // payload
+      |                    ~~~~~~~~~~^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp:6315:15: warning: ignoring return value of ‘size_t fread(void*, size_t, size_t, FILE*)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+ 6315 |     std::fread(&ru64, 8, 1, f); TEST_ASSERT(ru64 == 1700000000);  // created_at
+      |     ~~~~~~~~~~^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp:6316:15: warning: ignoring return value of ‘size_t fread(void*, size_t, size_t, FILE*)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+ 6316 |     std::fread(&ru64, 8, 1, f); TEST_ASSERT(ru64 == 1700000100);  // last_used
+      |     ~~~~~~~~~~^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp:6317:29: warning: ignoring return value of ‘size_t fread(void*, size_t, size_t, FILE*)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+ 6317 |     int32_t ri32; std::fread(&ri32, 4, 1, f); TEST_ASSERT(ri32 == 151643);  // last_tok
+      |                   ~~~~~~~~~~^~~~~~~~~~~~~~~~
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp: In function ‘std::array<unsigned char, 16> read_layout_id_from_cache_dir(const std::string&)’:
+/tmp/qwen4exp-final-review/server/test/test_server_unit.cpp:6549:23: warning: ignoring return value of ‘size_t fread(void*, size_t, size_t, FILE*)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+ 6549 |             std::fread(id.data(), 1, 16, f);
+      |             ~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~
+[ 94%] Linking HIP executable test_server_unit
+Discovering CppUnitTestFramework tests for test_server_unit
+[100%] Built target test_server_unit

@@ -1,0 +1,44 @@
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 98304 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 98304 MiB
+[qwen4exp] qwen4exp trunk loaded: 48 layers (36 linear + 12 full), 1222 tensors 66.24 GiB from 3 shard(s), experts=10/512 hc=4/320 ple_layers=1 ngram=3 heads_per_ngram=8 table_rows=320001536 eos=248046
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[tokenizer] added_tokens: 33 special tokens
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 eot=248046 pre=qwen35 sp=no
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[qwen4exp-seq] N=2 contract=PASS soak=PASS
+[qwen4exp-seq] N=4 contract=PASS soak=PASS
+[distinct] slot=0 answer=
+
+<think>
+The user asks a simple math question and wants a one-sentence answer without reasoning.
+</think>
+
+2 + 2 = expected=4 coherent=no
+[distinct] slot=1 answer=
+
+<think>
+The user asks for the capital of France in one short sentence without reasoning.
+</think>
+
+The capital of France is Paris expected=paris coherent=yes
+[distinct] slot=2 answer=
+
+Jupiter is the largest planet in our solar system.<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|> expected=jupiter coherent=yes
+[distinct] slot=3 answer=
+
+<think>
+The user asks what color red and white paint make. This is a simple factual question. Red mixed with white expected=pink coherent=no
+[distinct-margin] slot=0 max_epsilon=3.4206541 first_divergence_step=7 epsilon=0.50860035 solo_margin=0.021116257 2epsilon=1.0172007
+[distinct-margin] slot=1 max_epsilon=2.4509969 first_divergence_step=-1 epsilon=0 solo_margin=0 2epsilon=0
+[distinct-margin] slot=2 max_epsilon=3.2024879 first_divergence_step=-1 epsilon=0 solo_margin=0 2epsilon=0
+[distinct-margin] slot=3 max_epsilon=3.7828238 first_divergence_step=-1 epsilon=0 solo_margin=0 2epsilon=0
+[qwen4exp-seq] distinct-concurrent=FAIL
+EXIT=1

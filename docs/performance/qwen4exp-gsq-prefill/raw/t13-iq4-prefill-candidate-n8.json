@@ -1,0 +1,178 @@
+[
+  {
+    "usage": {
+      "completion_tokens": 1,
+      "prompt_tokens": 16366,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 0.3,
+        "decode_tokens_per_sec": 3725.0,
+        "effective_prompt_tokens": 16366,
+        "prefill_ms": 16278.1,
+        "prefilled_tokens": 16366
+      },
+      "total_tokens": 16367
+    },
+    "ttft_s": 16.28558998600056,
+    "wall_s": 16.286979747004807,
+    "rep": 1,
+    "model": "iq4",
+    "kind": "prefill"
+  },
+  {
+    "usage": {
+      "completion_tokens": 1,
+      "prompt_tokens": 16366,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 0.3,
+        "decode_tokens_per_sec": 3602.8,
+        "effective_prompt_tokens": 16366,
+        "prefill_ms": 15259.6,
+        "prefilled_tokens": 16366
+      },
+      "total_tokens": 16367
+    },
+    "ttft_s": 15.268799233992468,
+    "wall_s": 15.27016745400033,
+    "rep": 2,
+    "model": "iq4",
+    "kind": "prefill"
+  },
+  {
+    "usage": {
+      "completion_tokens": 1,
+      "prompt_tokens": 16366,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 0.3,
+        "decode_tokens_per_sec": 3656.9,
+        "effective_prompt_tokens": 16366,
+        "prefill_ms": 15172.3,
+        "prefilled_tokens": 16366
+      },
+      "total_tokens": 16367
+    },
+    "ttft_s": 15.18025222500728,
+    "wall_s": 15.181731554999715,
+    "rep": 3,
+    "model": "iq4",
+    "kind": "prefill"
+  },
+  {
+    "usage": {
+      "completion_tokens": 1,
+      "prompt_tokens": 16366,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 0.3,
+        "decode_tokens_per_sec": 3606.9,
+        "effective_prompt_tokens": 16366,
+        "prefill_ms": 15203.2,
+        "prefilled_tokens": 16366
+      },
+      "total_tokens": 16367
+    },
+    "ttft_s": 15.211370365999755,
+    "wall_s": 15.212951589011936,
+    "rep": 4,
+    "model": "iq4",
+    "kind": "prefill"
+  },
+  {
+    "usage": {
+      "completion_tokens": 1,
+      "prompt_tokens": 16366,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 0.3,
+        "decode_tokens_per_sec": 3657.3,
+        "effective_prompt_tokens": 16366,
+        "prefill_ms": 15194.3,
+        "prefilled_tokens": 16366
+      },
+      "total_tokens": 16367
+    },
+    "ttft_s": 15.201407952001318,
+    "wall_s": 15.202850503002992,
+    "rep": 5,
+    "model": "iq4",
+    "kind": "prefill"
+  },
+  {
+    "usage": {
+      "completion_tokens": 1,
+      "prompt_tokens": 16366,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 0.3,
+        "decode_tokens_per_sec": 3694.1,
+        "effective_prompt_tokens": 16366,
+        "prefill_ms": 15377.1,
+        "prefilled_tokens": 16366
+      },
+      "total_tokens": 16367
+    },
+    "ttft_s": 15.384933626002748,
+    "wall_s": 15.386368392006261,
+    "rep": 6,
+    "model": "iq4",
+    "kind": "prefill"
+  },
+  {
+    "usage": {
+      "completion_tokens": 1,
+      "prompt_tokens": 16366,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 0.3,
+        "decode_tokens_per_sec": 3660.0,
+        "effective_prompt_tokens": 16366,
+        "prefill_ms": 15226.0,
+        "prefilled_tokens": 16366
+      },
+      "total_tokens": 16367
+    },
+    "ttft_s": 15.233215165993897,
+    "wall_s": 15.234626276986091,
+    "rep": 7,
+    "model": "iq4",
+    "kind": "prefill"
+  },
+  {
+    "usage": {
+      "completion_tokens": 1,
+      "prompt_tokens": 16366,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 0.3,
+        "decode_tokens_per_sec": 3621.0,
+        "effective_prompt_tokens": 16366,
+        "prefill_ms": 15333.4,
+        "prefilled_tokens": 16366
+      },
+      "total_tokens": 16367
+    },
+    "ttft_s": 15.343168778999825,
+    "wall_s": 15.344613303008373,
+    "rep": 8,
+    "model": "iq4",
+    "kind": "prefill"
+  }
+]

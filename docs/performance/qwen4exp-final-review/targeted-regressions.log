@@ -1,0 +1,25 @@
+Test project /tmp/qwen4exp-final-review/server/build-hip
+      Start 635: test_rope_tail.RopeTailFixture.cpu_matches_split_rotate_concat
+ 1/10 Test #635: test_rope_tail.RopeTailFixture.cpu_matches_split_rotate_concat ...   Passed    0.03 sec
+      Start 674: ds4_maskless_prefill_defaults
+ 2/10 Test #674: ds4_maskless_prefill_defaults ....................................   Passed    0.34 sec
+      Start 675: ds4_maskless_prefill_disabled
+ 3/10 Test #675: ds4_maskless_prefill_disabled ....................................   Passed    0.21 sec
+      Start 676: ds4_maskless_prefill_f32
+ 4/10 Test #676: ds4_maskless_prefill_f32 .........................................   Passed    1.98 sec
+      Start 677: ds4_maskless_prefill_short
+ 5/10 Test #677: ds4_maskless_prefill_short .......................................   Passed    0.13 sec
+      Start 678: ds4_maskless_prefill_defaults_f32
+ 6/10 Test #678: ds4_maskless_prefill_defaults_f32 ................................   Passed    0.20 sec
+      Start 679: ds4_maskless_prefill_disabled_f32
+ 7/10 Test #679: ds4_maskless_prefill_disabled_f32 ................................   Passed    0.20 sec
+      Start 680: ds4_maskless_prefill_short_f32
+ 8/10 Test #680: ds4_maskless_prefill_short_f32 ...................................   Passed    0.14 sec
+      Start 704: test_ds4_maskless_prefill
+ 9/10 Test #704: test_ds4_maskless_prefill ........................................   Passed    1.55 sec
+      Start 706: deepseek4_unit
+10/10 Test #706: deepseek4_unit ...................................................   Passed   11.05 sec
+
+100% tests passed, 0 tests failed out of 10
+
+Total Test time (real) =  15.84 sec

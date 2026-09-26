@@ -132,53 +132,85 @@ SERVER_PROFILES: dict[str, ServerProfile] = {
     "rtx3090_luce_fast": ServerProfile(
         name="rtx3090_luce_fast",
         args=(
-            "--budget", "22",
-            "--verify-mode", "ddtree",
-            "--max-ctx", "4096",
-            "--fa-window", "0",
-            "--cache-type-k", "q8_0",
-            "--cache-type-v", "q8_0",
-            "--prefix-cache-slots", "0",
-            "--prefill-cache-slots", "0",
+            "--budget",
+            "22",
+            "--verify-mode",
+            "ddtree",
+            "--max-ctx",
+            "4096",
+            "--fa-window",
+            "0",
+            "--cache-type-k",
+            "q8_0",
+            "--cache-type-v",
+            "q8_0",
+            "--prefix-cache-slots",
+            "0",
+            "--prefill-cache-slots",
+            "0",
         ),
     ),
     "rtx3090_luce_safe": ServerProfile(
         name="rtx3090_luce_safe",
         args=(
-            "--budget", "22",
-            "--verify-mode", "ddtree",
-            "--max-ctx", "8192",
-            "--fa-window", "0",
-            "--cache-type-k", "q8_0",
-            "--cache-type-v", "q8_0",
-            "--prefix-cache-slots", "0",
-            "--prefill-cache-slots", "0",
+            "--budget",
+            "22",
+            "--verify-mode",
+            "ddtree",
+            "--max-ctx",
+            "8192",
+            "--fa-window",
+            "0",
+            "--cache-type-k",
+            "q8_0",
+            "--cache-type-v",
+            "q8_0",
+            "--prefix-cache-slots",
+            "0",
+            "--prefill-cache-slots",
+            "0",
         ),
     ),
     "rtx3090_luce_16k": ServerProfile(
         name="rtx3090_luce_16k",
         args=(
-            "--budget", "22",
-            "--verify-mode", "ddtree",
-            "--max-ctx", "16384",
-            "--fa-window", "0",
-            "--cache-type-k", "q8_0",
-            "--cache-type-v", "q8_0",
-            "--prefix-cache-slots", "0",
-            "--prefill-cache-slots", "0",
+            "--budget",
+            "22",
+            "--verify-mode",
+            "ddtree",
+            "--max-ctx",
+            "16384",
+            "--fa-window",
+            "0",
+            "--cache-type-k",
+            "q8_0",
+            "--cache-type-v",
+            "q8_0",
+            "--prefix-cache-slots",
+            "0",
+            "--prefill-cache-slots",
+            "0",
         ),
     ),
     "rtx3090_luce_long": ServerProfile(
         name="rtx3090_luce_long",
         args=(
-            "--budget", "16",
-            "--verify-mode", "ddtree",
-            "--max-ctx", "32768",
-            "--fa-window", "0",
-            "--cache-type-k", "q8_0",
-            "--cache-type-v", "q8_0",
-            "--prefix-cache-slots", "0",
-            "--prefill-cache-slots", "0",
+            "--budget",
+            "16",
+            "--verify-mode",
+            "ddtree",
+            "--max-ctx",
+            "32768",
+            "--fa-window",
+            "0",
+            "--cache-type-k",
+            "q8_0",
+            "--cache-type-v",
+            "q8_0",
+            "--prefix-cache-slots",
+            "0",
+            "--prefill-cache-slots",
+            "0",
             "--lazy-draft",
         ),
         long_prompt=True,
@@ -186,17 +218,28 @@ SERVER_PROFILES: dict[str, ServerProfile] = {
     "rtx3090_pflash_32k": ServerProfile(
         name="rtx3090_pflash_32k",
         args=(
-            "--budget", "16",
-            "--verify-mode", "ddtree",
-            "--max-ctx", "32768",
-            "--fa-window", "0",
-            "--cache-type-k", "q8_0",
-            "--cache-type-v", "q8_0",
-            "--prefix-cache-slots", "0",
-            "--prefill-cache-slots", "0",
-            "--prefill-compression", "auto",
-            "--prefill-threshold", "4096",
-            "--prefill-keep-ratio", "0.10",
+            "--budget",
+            "16",
+            "--verify-mode",
+            "ddtree",
+            "--max-ctx",
+            "32768",
+            "--fa-window",
+            "0",
+            "--cache-type-k",
+            "q8_0",
+            "--cache-type-v",
+            "q8_0",
+            "--prefix-cache-slots",
+            "0",
+            "--prefill-cache-slots",
+            "0",
+            "--prefill-compression",
+            "auto",
+            "--prefill-threshold",
+            "4096",
+            "--prefill-keep-ratio",
+            "0.10",
             "--lazy-draft",
         ),
         needs_prefill_drafter=True,
@@ -299,10 +342,12 @@ def client_smoke_env(work_dir: Path, spec: ClientSpec) -> dict[str, str] | None:
         return None
     home = hermes_home(work_dir)
     env = os.environ.copy()
-    env.update({
-        "HOME": str(home),
-        "HERMES_HOME": str(home),
-    })
+    env.update(
+        {
+            "HOME": str(home),
+            "HERMES_HOME": str(home),
+        }
+    )
     return env
 
 
@@ -338,11 +383,13 @@ def install_client(work_dir: Path, spec: ClientSpec) -> dict[str, Any]:
             script_path,
         )
         env = os.environ.copy()
-        env.update({
-            "HOME": str(home),
-            "HERMES_HOME": str(home),
-            "HERMES_INSTALL_DIR": str(install_dir),
-        })
+        env.update(
+            {
+                "HOME": str(home),
+                "HERMES_HOME": str(home),
+                "HERMES_INSTALL_DIR": str(install_dir),
+            }
+        )
         result = run_cmd(
             ["bash", str(script_path), "--skip-setup", "--skip-browser"],
             env=env,
@@ -390,14 +437,16 @@ def install_client(work_dir: Path, spec: ClientSpec) -> dict[str, Any]:
         timeout=30,
         env=client_smoke_env(work_dir, spec),
     )
-    result.update({
-        "client": spec.name,
-        "installer": spec.install,
-        "package": spec.package,
-        "binary": str(bin_path),
-        "binary_exists": bin_path.exists(),
-        "version": version,
-    })
+    result.update(
+        {
+            "client": spec.name,
+            "installer": spec.install,
+            "package": spec.package,
+            "binary": str(bin_path),
+            "binary_exists": bin_path.exists(),
+            "version": version,
+        }
+    )
     return result
 
 
@@ -503,11 +552,7 @@ def http_sse(
                 choices = obj.get("choices") or []
                 if choices:
                     delta = choices[0].get("delta") or {}
-                    piece = (
-                        delta.get("content")
-                        or delta.get("reasoning_content")
-                        or ""
-                    )
+                    piece = delta.get("content") or delta.get("reasoning_content") or ""
                     if piece:
                         token_deltas += 1
                         text += str(piece)
@@ -567,10 +612,7 @@ def unique_prompt(text: str, label: str) -> str:
 def text_check(text: str | None, expect_substring: str | None = None) -> dict[str, Any]:
     value = text or ""
     ok = bool(value.strip())
-    marker_seen = (
-        expect_substring.lower() in value.lower()
-        if expect_substring else None
-    )
+    marker_seen = expect_substring.lower() in value.lower() if expect_substring else None
     return {
         "generated_ok": ok,
         "generated_chars": len(value),
@@ -674,45 +716,56 @@ def probe_openai_chat(base_url: str, *, include_long: bool = False) -> list[dict
         {"role": "user", "content": stream_prompt},
     ]
     stream_payload.update({"stream": True, "stream_options": {"include_usage": True}})
-    probes.append({
-        "name": "chat.stream",
-        **http_sse(
-            base_url + "/v1/chat/completions",
-            stream_payload,
-            expect_substring=EXPECTED_MARKER,
-        ),
-    })
+    probes.append(
+        {
+            "name": "chat.stream",
+            **http_sse(
+                base_url + "/v1/chat/completions",
+                stream_payload,
+                expect_substring=EXPECTED_MARKER,
+            ),
+        }
+    )
 
     status, body, elapsed = http_json("POST", base_url + "/v1/chat/completions", payload)
-    probes.append(record_probe(
-        "chat.non_stream", status, body, elapsed,
-        generated_text=openai_chat_text(body),
-        expect_substring=EXPECTED_MARKER,
-        required=False,
-    ))
+    probes.append(
+        record_probe(
+            "chat.non_stream",
+            status,
+            body,
+            elapsed,
+            generated_text=openai_chat_text(body),
+            expect_substring=EXPECTED_MARKER,
+            required=False,
+        )
+    )
 
     tool_payload = {
         "model": MODEL,
-        "messages": [{
-            "role": "user",
-            "content": unique_prompt(
-                "Return a short answer and include the word lucebox.",
-                "chat-tools",
-            ),
-        }],
+        "messages": [
+            {
+                "role": "user",
+                "content": unique_prompt(
+                    "Return a short answer and include the word lucebox.",
+                    "chat-tools",
+                ),
+            }
+        ],
         "max_tokens": 16,
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read a file",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
                 },
-            },
-        }],
+            }
+        ],
         "tool_choice": "auto",
     }
     status, body, elapsed = http_json("POST", base_url + "/v1/chat/completions", tool_payload)
@@ -727,13 +780,15 @@ def probe_openwebui(base_url: str, *, include_long: bool = False) -> list[dict[s
     if isinstance(body, dict):
         data = body.get("data") or []
         model_meta_ok = bool(data and data[0].get("context_length"))
-    probes.append({
-        "name": "openwebui.model_metadata",
-        "ok": status == 200 and model_meta_ok,
-        "status": status,
-        "seconds": round(elapsed, 3),
-        "body_tail": body if isinstance(body, str) else json.dumps(body)[-2000:],
-    })
+    probes.append(
+        {
+            "name": "openwebui.model_metadata",
+            "ok": status == 200 and model_meta_ok,
+            "status": status,
+            "seconds": round(elapsed, 3),
+            "body_tail": body if isinstance(body, str) else json.dumps(body)[-2000:],
+        }
+    )
     return probes
 
 
@@ -752,34 +807,45 @@ def probe_anthropic_messages(base_url: str, *, include_long: bool = False) -> li
         "stop_sequences": ["\n\n\n"],
         # Claude Code sends tool metadata. luce_server currently ignores extra
         # Anthropic fields, but the request must not fail validation.
-        "tools": [{
-            "name": "Read",
-            "description": "Read a file",
-            "input_schema": {
-                "type": "object",
-                "properties": {"file_path": {"type": "string"}},
-                "required": ["file_path"],
-            },
-        }],
+        "tools": [
+            {
+                "name": "Read",
+                "description": "Read a file",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            }
+        ],
     }
     stream_payload = dict(payload)
-    stream_payload["messages"] = [{
-        "role": "user",
-        "content": "Reply with exactly: lucebox-stream-ok two",
-    }]
+    stream_payload["messages"] = [
+        {
+            "role": "user",
+            "content": "Reply with exactly: lucebox-stream-ok two",
+        }
+    ]
     stream_payload["stream"] = True
-    probes.append({
-        "name": "anthropic.messages_stream",
-        **probe_anthropic_sse(base_url + "/v1/messages", stream_payload),
-    })
+    probes.append(
+        {
+            "name": "anthropic.messages_stream",
+            **probe_anthropic_sse(base_url + "/v1/messages", stream_payload),
+        }
+    )
 
     status, body, elapsed = http_json("POST", base_url + "/v1/messages", payload)
-    probes.append(record_probe(
-        "anthropic.messages", status, body, elapsed,
-        generated_text=anthropic_text(body),
-        expect_substring=EXPECTED_MARKER,
-        required=False,
-    ))
+    probes.append(
+        record_probe(
+            "anthropic.messages",
+            status,
+            body,
+            elapsed,
+            generated_text=anthropic_text(body),
+            expect_substring=EXPECTED_MARKER,
+            required=False,
+        )
+    )
     return probes
 
 
@@ -848,57 +914,72 @@ def probe_responses(base_url: str, *, include_long: bool = False) -> list[dict[s
     probes = []
     status, body, elapsed = http_json("GET", base_url + "/v1/models?client_version=harness-smoke")
     models_ok = isinstance(body, dict) and bool(body.get("models"))
-    probes.append({
-        "name": "codex.models",
-        "ok": status == 200 and models_ok,
-        "status": status,
-        "seconds": round(elapsed, 3),
-        "body_tail": body if isinstance(body, str) else json.dumps(body)[-2000:],
-    })
+    probes.append(
+        {
+            "name": "codex.models",
+            "ok": status == 200 and models_ok,
+            "status": status,
+            "seconds": round(elapsed, 3),
+            "body_tail": body if isinstance(body, str) else json.dumps(body)[-2000:],
+        }
+    )
     payload = {
         "model": MODEL,
         "instructions": "You are a concise coding agent.",
-        "input": [{
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": prompt}],
-        }],
-        "tools": [{
-            "type": "function",
-            "name": "read_file",
-            "description": "Read a file",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
-            },
-        }],
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }
+        ],
         "tool_choice": "auto",
         "reasoning": {"effort": "low"},
         "max_output_tokens": 32,
     }
     status, body, elapsed = http_json("POST", base_url + "/v1/responses", payload)
-    probes.append(record_probe(
-        "responses.non_stream", status, body, elapsed,
-        generated_text=responses_text(body),
-        expect_substring=EXPECTED_MARKER,
-    ))
+    probes.append(
+        record_probe(
+            "responses.non_stream",
+            status,
+            body,
+            elapsed,
+            generated_text=responses_text(body),
+            expect_substring=EXPECTED_MARKER,
+        )
+    )
 
     stream_prompt = unique_prompt(
         long_prompt() if include_long else coding_prompt(),
         "responses-stream",
     )
     stream_payload = dict(payload)
-    stream_payload["input"] = [{
-        "type": "message",
-        "role": "user",
-        "content": [{"type": "input_text", "text": stream_prompt}],
-    }]
+    stream_payload["input"] = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": stream_prompt}],
+        }
+    ]
     stream_payload["stream"] = True
-    probes.append({
-        "name": "responses.stream",
-        **probe_responses_sse(base_url + "/v1/responses", stream_payload),
-    })
+    probes.append(
+        {
+            "name": "responses.stream",
+            **probe_responses_sse(base_url + "/v1/responses", stream_payload),
+        }
+    )
     return probes
 
 
@@ -957,13 +1038,15 @@ def probe_wrapper(base_url: str, *, include_long: bool = False) -> list[dict[str
     # harness.lol itself wraps child CLIs; the server-side compatibility risk is
     # already covered by the child protocols. Keep this cheap and explicit.
     probes = probe_health(base_url)
-    probes.append({
-        "name": "wrapper.protocols_delegated",
-        "ok": True,
-        "status": 200,
-        "seconds": 0.0,
-        "body_tail": "harness wraps claude/codex/opencode; run those probes too.",
-    })
+    probes.append(
+        {
+            "name": "wrapper.protocols_delegated",
+            "ok": True,
+            "status": 200,
+            "seconds": 0.0,
+            "body_tail": "harness wraps claude/codex/opencode; run those probes too.",
+        }
+    )
     return probes
 
 
@@ -996,21 +1079,22 @@ def run_client_probe(
     try:
         probes = probe_fn(base_url, include_long=include_long)
     except Exception as exc:
-        probes = [{
-            "name": "probe_exception",
-            "ok": False,
-            "status": 0,
-            "seconds": 0.0,
-            "body_tail": repr(exc),
-        }]
+        probes = [
+            {
+                "name": "probe_exception",
+                "ok": False,
+                "status": 0,
+                "seconds": 0.0,
+                "body_tail": repr(exc),
+            }
+        ]
     return {
         "client": spec.name,
         "protocol": spec.protocol,
         "package": spec.package,
         "package_smoke": package_result,
-        "ok": all((not probe_required(p)) or p.get("ok") for p in probes) and (
-            package_result is None or bool(package_result.get("ok"))
-        ),
+        "ok": all((not probe_required(p)) or p.get("ok") for p in probes)
+        and (package_result is None or bool(package_result.get("ok"))),
         "probes": probes,
         "started_ms": started,
         "ended_ms": now_ms(),
@@ -1035,23 +1119,28 @@ def wait_http(base_url: str, proc: subprocess.Popen | None = None, timeout: int 
 def gpu_mem() -> dict[str, Any] | None:
     if shutil.which("nvidia-smi") is None:
         return None
-    result = run_cmd([
-        "nvidia-smi",
-        "--query-gpu=name,memory.used,memory.total,utilization.gpu",
-        "--format=csv,noheader,nounits",
-    ], timeout=10)
+    result = run_cmd(
+        [
+            "nvidia-smi",
+            "--query-gpu=name,memory.used,memory.total,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+        timeout=10,
+    )
     if not result["ok"]:
         return {"error": result["output_tail"]}
     rows = []
     for line in result["output_tail"].strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) >= 4:
-            rows.append({
-                "name": parts[0],
-                "memory_used_mib": int(parts[1]),
-                "memory_total_mib": int(parts[2]),
-                "gpu_util_percent": int(parts[3]),
-            })
+            rows.append(
+                {
+                    "name": parts[0],
+                    "memory_used_mib": int(parts[1]),
+                    "memory_total_mib": int(parts[2]),
+                    "gpu_util_percent": int(parts[3]),
+                }
+            )
     return {"gpus": rows}
 
 
@@ -1088,9 +1177,12 @@ def start_server(
     args = [
         str(bin_path),
         str(target),
-        "--host", "127.0.0.1",
-        "--port", str(port),
-        "--draft", str(draft),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--draft",
+        str(draft),
         *profile.args,
     ]
     if profile.needs_prefill_drafter:
@@ -1214,7 +1306,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
                         target=args.target.resolve(),
                         draft=args.draft.resolve(),
                         bin_path=args.bin.resolve(),
-                        prefill_drafter=args.prefill_drafter.resolve() if args.prefill_drafter else None,
+                        prefill_drafter=args.prefill_drafter.resolve()
+                        if args.prefill_drafter
+                        else None,
                         port=client_port,
                         work_dir=work_dir,
                     )
@@ -1329,16 +1423,13 @@ def cmd_list(_args: argparse.Namespace) -> int:
 def score_client(client: dict[str, Any]) -> dict[str, Any]:
     probes = client.get("probes") or []
     failed = [p.get("name") for p in probes if not p.get("ok")]
-    failed_required = [
-        p.get("name") for p in probes
-        if probe_required(p) and not p.get("ok")
-    ]
+    failed_required = [p.get("name") for p in probes if probe_required(p) and not p.get("ok")]
     decode_failed = [
-        p.get("name") for p in probes
-        if "generated_ok" in p and not p.get("generated_ok")
+        p.get("name") for p in probes if "generated_ok" in p and not p.get("generated_ok")
     ]
     required_decode_failed = [
-        p.get("name") for p in probes
+        p.get("name")
+        for p in probes
         if probe_required(p) and "generated_ok" in p and not p.get("generated_ok")
     ]
     seconds = sum(float(p.get("seconds") or 0.0) for p in probes)
@@ -1361,13 +1452,15 @@ def cmd_report(args: argparse.Namespace) -> int:
         for profile in data.get("profiles") or []:
             for client in profile.get("clients") or []:
                 score = score_client(client)
-                rows.append({
-                    "source": str(path),
-                    "profile": profile.get("profile"),
-                    "client": client.get("client"),
-                    "server_args": client.get("server_args") or profile.get("server_args"),
-                    **score,
-                })
+                rows.append(
+                    {
+                        "source": str(path),
+                        "profile": profile.get("profile"),
+                        "client": client.get("client"),
+                        "server_args": client.get("server_args") or profile.get("server_args"),
+                        **score,
+                    }
+                )
 
     by_client: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -1407,22 +1500,22 @@ def cmd_report(args: argparse.Namespace) -> int:
 def _score_math_response(text: str, gold_answer: str) -> tuple[bool, str]:
     """Score a Math500 response. Returns (correct, detail_str)."""
     think_end = text.rfind("</think>")
-    answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
+    answer_text = text[think_end + len("</think>") :] if think_end >= 0 else text
 
     pred = _extract_boxed(answer_text)
 
     # Fallback: "the answer is **X**" patterns
     if pred is None:
         bold_pattern = re.compile(
-            r'(?:answer\s+is|there\s+are|result\s+is|equals?|=)\s*\*\*(.+?)\*\*',
-            re.IGNORECASE)
+            r"(?:answer\s+is|there\s+are|result\s+is|equals?|=)\s*\*\*(.+?)\*\*", re.IGNORECASE
+        )
         m = bold_pattern.search(answer_text)
         if m:
             pred = m.group(1).strip().rstrip(".")
 
     # Fallback: last $...$ expression
     if pred is None:
-        matches = re.findall(r'\$([^$]+)\$', answer_text)
+        matches = re.findall(r"\$([^$]+)\$", answer_text)
         if matches:
             pred = matches[-1].strip()
 
@@ -1441,7 +1534,7 @@ def _score_math_response(text: str, gold_answer: str) -> tuple[bool, str]:
 def _score_gsm_response(text: str, gold_answer: str) -> tuple[bool, str]:
     """Score a GSM8K response. Returns (correct, detail_str)."""
     think_end = text.rfind("</think>")
-    answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
+    answer_text = text[think_end + len("</think>") :] if think_end >= 0 else text
 
     pred = None
 
@@ -1449,32 +1542,33 @@ def _score_gsm_response(text: str, gold_answer: str) -> tuple[bool, str]:
     boxed = _extract_boxed(answer_text)
     if boxed:
         cleaned = boxed.replace(",", "").replace("$", "").strip()
-        if re.match(r'^[+-]?\d+\.?\d*$', cleaned):
+        if re.match(r"^[+-]?\d+\.?\d*$", cleaned):
             pred = cleaned
 
-    # #### <number>
+    # Explicit final-answer markers, taking the LAST one (models restate and
+    # show intermediate "we get N" lines). Matches "#### N", "Answer: N",
+    # "The answer is N", "Result: N", "Total: N".
     if pred is None:
-        m = re.search(r'####\s*\$?([+-]?\d[\d,]*\.?\d*)', answer_text)
-        if m:
-            pred = m.group(1).replace(",", "")
+        markers = list(
+            re.finditer(
+                r"(?i)(?:####|answer\s*(?:is|:)|the\s+answer\s*(?:is|:)|"
+                r"result\s*(?:is|:)|total\s*(?:is|:|=))"
+                r"[^\d\-+]{0,40}?([+-]?\d[\d,]*\.?\d*)",
+                answer_text,
+            )
+        )
+        if markers:
+            pred = markers[-1].group(1).replace(",", "")
 
-    # "the answer is **X**"
+    # **<number>** or **$<number>** (last)
     if pred is None:
-        m = re.search(
-            r'(?:answer\s+is|result\s+is|equals?|there\s+are|we\s+get)\s*\*?\*?\$?([+-]?\d[\d,]*\.?\d*)',
-            answer_text, re.IGNORECASE)
+        m = re.findall(r"\*\*\$?([+-]?\d[\d,]*\.?\d*)\*\*", answer_text)
         if m:
-            pred = m.group(1).replace(",", "")
-
-    # **<number>** or **$<number>**
-    if pred is None:
-        m = re.search(r'\*\*\$?([+-]?\d[\d,]*\.?\d*)\*\*', answer_text)
-        if m:
-            pred = m.group(1).replace(",", "")
+            pred = m[-1].replace(",", "")
 
     # Last standalone number
     if pred is None:
-        nums = re.findall(r'(?<![.\d])([+-]?\d[\d,]*\.?\d*)(?![.\d])', answer_text)
+        nums = re.findall(r"(?<![.\d])([+-]?\d[\d,]*\.?\d*)(?![.\d])", answer_text)
         if nums:
             pred = nums[-1].replace(",", "")
 
@@ -1503,17 +1597,20 @@ def _score_he_response(text: str, entry_point: str, gold_test: str) -> tuple[boo
     import subprocess as _sp
 
     think_end = text.rfind("</think>")
-    answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
+    answer_text = text[think_end + len("</think>") :] if think_end >= 0 else text
 
     # Extract code block (```python ... ``` or ``` ... ```)
     code = None
-    m = re.search(r'```(?:python)?\s*\n(.*?)```', answer_text, re.DOTALL)
+    m = re.search(r"```(?:python)?\s*\n(.*?)```", answer_text, re.DOTALL)
     if m:
         code = m.group(1)
     else:
         # Try to find the function definition directly
-        m = re.search(r'((?:from\s|import\s).*?\n)?(\s*def\s+' + re.escape(entry_point) + r'\b.*)',
-                       answer_text, re.DOTALL)
+        m = re.search(
+            r"((?:from\s|import\s).*?\n)?(\s*def\s+" + re.escape(entry_point) + r"\b.*)",
+            answer_text,
+            re.DOTALL,
+        )
         if m:
             prefix = m.group(1) or ""
             code = prefix + m.group(2)
@@ -1525,14 +1622,11 @@ def _score_he_response(text: str, entry_point: str, gold_test: str) -> tuple[boo
     test_script = code + "\n" + gold_test + f"\ncheck({entry_point})\n"
 
     try:
-        result = _sp.run(
-            ["python3", "-c", test_script],
-            capture_output=True, text=True, timeout=10
-        )
+        result = _sp.run(["python3", "-c", test_script], capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             return True, "correct: tests passed"
         else:
-            err = result.stderr.strip().split('\n')[-1] if result.stderr else "unknown error"
+            err = result.stderr.strip().split("\n")[-1] if result.stderr else "unknown error"
             return False, f"wrong: {err[:80]}"
     except _sp.TimeoutExpired:
         return False, "wrong: timeout"
@@ -1542,7 +1636,7 @@ def _score_he_response(text: str, entry_point: str, gold_test: str) -> tuple[boo
 
 # ── bench subcommand ────────────────────────────────────────────────────────
 
-BENCH_SUITES = ("he", "gsm", "math", "agent")
+BENCH_SUITES = ("he", "gsm", "math", "agent", "recall")
 BENCH_PROMPTS_DIR = Path(__file__).resolve().parent / "benchmarks" / "prompts"
 
 BENCH_SUITE_FILES = {
@@ -1550,6 +1644,7 @@ BENCH_SUITE_FILES = {
     "gsm": "bench_gsm.jsonl",
     "math": "bench_math.jsonl",
     "agent": "bench_agent.jsonl",
+    "recall": "bench_recall.jsonl",
 }
 
 
@@ -1583,6 +1678,14 @@ def _run_bench_case(
     messages = case["messages"]
     max_tokens = max_tokens_override or case.get("max_tokens", 256)
 
+    # Optional experiment knobs (unset by default, so behaviour is unchanged):
+    #   BENCH_MAX_TOKENS  force the completion cap for every case
+    #   BENCH_THINKING    on/off -> chat_template_kwargs.enable_thinking
+    #   BENCH_EFFORT      low|medium|high|x-high|max|none -> reasoning.effort
+    _mt = os.environ.get("BENCH_MAX_TOKENS")
+    if _mt:
+        max_tokens = int(_mt)
+
     payload = {
         "model": model,
         "messages": messages,
@@ -1591,6 +1694,14 @@ def _run_bench_case(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    _think = os.environ.get("BENCH_THINKING")
+    if _think is not None:
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": _think.strip().lower() not in ("0", "off", "false", "no")
+        }
+    _effort = os.environ.get("BENCH_EFFORT")
+    if _effort:
+        payload["reasoning"] = {"effort": _effort}
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         base_url + "/v1/chat/completions",
@@ -1625,11 +1736,7 @@ def _run_bench_case(
                 choices = obj.get("choices") or []
                 if choices:
                     delta = choices[0].get("delta") or {}
-                    piece = (
-                        delta.get("content")
-                        or delta.get("reasoning_content")
-                        or ""
-                    )
+                    piece = delta.get("content") or delta.get("reasoning_content") or ""
                     if piece:
                         if first_token_time is None:
                             first_token_time = time.perf_counter()
@@ -1655,9 +1762,15 @@ def _run_bench_case(
     completion_tokens = usage.get("completion_tokens") or token_deltas
 
     # Compute derived metrics
-    prefill_tok_s = prompt_tokens / ttft_s if (ttft_s and ttft_s > 0 and prompt_tokens > 0) else None
+    prefill_tok_s = (
+        prompt_tokens / ttft_s if (ttft_s and ttft_s > 0 and prompt_tokens > 0) else None
+    )
     decode_s = (wall_s - ttft_s) if ttft_s else None
-    output_tok_s = completion_tokens / decode_s if (decode_s and decode_s > 0 and completion_tokens > 0) else None
+    output_tok_s = (
+        completion_tokens / decode_s
+        if (decode_s and decode_s > 0 and completion_tokens > 0)
+        else None
+    )
 
     return {
         "id": case["id"],
@@ -1688,17 +1801,23 @@ def _run_bench_suite(
     n_correct, n_scored = 0, 0
 
     print(f"\n[bench] === {suite.upper()} (n={len(cases)}) ===", flush=True)
-    print(f"  {'#':>3s}  {'id':<16s}  {'wall':>6s}  {'TTFT':>7s}  {'pf tok/s':>8s}  "
-          f"{'out_tok':>7s}  {'out tok/s':>9s}  {'score'}", flush=True)
-    print(f"  {'---':>3s}  {'---':<16s}  {'------':>6s}  {'-------':>7s}  {'--------':>8s}  "
-          f"{'-------':>7s}  {'---------':>9s}  {'-----'}", flush=True)
+    print(
+        f"  {'#':>3s}  {'id':<16s}  {'wall':>6s}  {'TTFT':>7s}  {'pf tok/s':>8s}  "
+        f"{'out_tok':>7s}  {'out tok/s':>9s}  {'score'}",
+        flush=True,
+    )
+    print(
+        f"  {'---':>3s}  {'---':<16s}  {'------':>6s}  {'-------':>7s}  {'--------':>8s}  "
+        f"{'-------':>7s}  {'---------':>9s}  {'-----'}",
+        flush=True,
+    )
 
     for i, case in enumerate(cases):
         try:
             result = _run_bench_case(base_url, model, case)
         except Exception as exc:
             result = {"id": case["id"], "ok": False, "error": repr(exc)}
-            print(f"  {i+1:3d}  {case['id']:<16s}  FAILED: {exc}", flush=True)
+            print(f"  {i + 1:3d}  {case['id']:<16s}  FAILED: {exc}", flush=True)
             results.append(result)
             continue
 
@@ -1706,7 +1825,8 @@ def _run_bench_suite(
         score_detail = ""
         if suite == "he" and "gold_test" in case and result.get("text"):
             correct, detail = _score_he_response(
-                result["text"], case["entry_point"], case["gold_test"])
+                result["text"], case["entry_point"], case["gold_test"]
+            )
             result["correct"] = correct
             result["score_detail"] = detail
             n_scored += 1
@@ -1724,8 +1844,27 @@ def _run_bench_suite(
             if correct:
                 n_correct += 1
             score_detail = "OK" if correct else "WRONG"
-
-        # Format output line
+        elif ("expect_contains" in case or "expect_regex" in case) and result.get("text"):
+            # Generic substring/regex check (used by the recall suite and any
+            # prompt with expect_contains/expect_regex).
+            wanted = case.get("expect_contains", [])
+            if isinstance(wanted, str):
+                wanted = [wanted]
+            misses = [s for s in wanted if s not in result["text"]]
+            rx = case.get("expect_regex")
+            rx_bad = bool(rx) and re.search(rx, result["text"]) is None
+            correct = not misses and not rx_bad
+            detail = (
+                "correct: all expected present"
+                if correct
+                else f"missing={misses}" + (f" regex_miss={rx}" if rx_bad else "")
+            )
+            result["correct"] = correct
+            result["score_detail"] = detail
+            n_scored += 1
+            if correct:
+                n_correct += 1
+            score_detail = "OK" if correct else "WRONG"
         wall_str = f"{result.get('wall_s', 0):.2f}s"
         ttft = result.get("ttft_s")
         ttft_str = f"{ttft:.3f}s" if ttft is not None else "n/a"
@@ -1736,7 +1875,7 @@ def _run_bench_suite(
         out_tps_str = f"{out_tps:.2f}" if out_tps is not None else "n/a"
 
         print(
-            f"  {i+1:3d}  {case['id']:<16s}  {wall_str:>6s}  {ttft_str:>7s}  "
+            f"  {i + 1:3d}  {case['id']:<16s}  {wall_str:>6s}  {ttft_str:>7s}  "
             f"{pf_str:>8s}  {out_tok:>7d}  {out_tps_str:>9s}  {score_detail}",
             flush=True,
         )
@@ -1762,8 +1901,12 @@ def _run_bench_suite(
 
         agg["mean_wall_s"] = round(sum(walls) / len(walls), 3)
         agg["mean_ttft_s"] = round(sum(ttfts) / len(ttfts), 4) if ttfts else None
-        agg["mean_prefill_tok_s"] = round(sum(pf_tps_list) / len(pf_tps_list), 1) if pf_tps_list else None
-        agg["mean_output_tok_s"] = round(sum(out_tps_list) / len(out_tps_list), 2) if out_tps_list else None
+        agg["mean_prefill_tok_s"] = (
+            round(sum(pf_tps_list) / len(pf_tps_list), 1) if pf_tps_list else None
+        )
+        agg["mean_output_tok_s"] = (
+            round(sum(out_tps_list) / len(out_tps_list), 2) if out_tps_list else None
+        )
         agg["total_output_tokens"] = sum(out_toks)
         agg["total_prompt_tokens"] = sum(prompt_toks)
 
@@ -1777,8 +1920,12 @@ def _run_bench_suite(
             bucket_agg = {}
             for bk, bk_results in sorted(buckets.items()):
                 bk_ttfts = [r["ttft_s"] for r in bk_results if r.get("ttft_s") is not None]
-                bk_pf = [r["prefill_tok_s"] for r in bk_results if r.get("prefill_tok_s") is not None]
-                bk_out = [r["output_tok_s"] for r in bk_results if r.get("output_tok_s") is not None]
+                bk_pf = [
+                    r["prefill_tok_s"] for r in bk_results if r.get("prefill_tok_s") is not None
+                ]
+                bk_out = [
+                    r["output_tok_s"] for r in bk_results if r.get("output_tok_s") is not None
+                ]
                 bk_walls = [r["wall_s"] for r in bk_results]
                 bucket_agg[bk] = {
                     "n": len(bk_results),
@@ -1823,7 +1970,9 @@ def cmd_bench(args: argparse.Namespace) -> int:
         selected = [s.strip() for s in args.suite.split(",")]
         unknown = [s for s in selected if s not in BENCH_SUITES]
         if unknown:
-            raise SystemExit(f"unknown suite(s): {', '.join(unknown)}; choices: {', '.join(BENCH_SUITES)}")
+            raise SystemExit(
+                f"unknown suite(s): {', '.join(unknown)}; choices: {', '.join(BENCH_SUITES)}"
+            )
 
     # Check server health first
     try:
@@ -1838,7 +1987,10 @@ def cmd_bench(args: argparse.Namespace) -> int:
     all_suites: dict[str, Any] = {}
     for suite in selected:
         all_suites[suite] = _run_bench_suite(
-            suite, base_url, model, n_sample,
+            suite,
+            base_url,
+            model,
+            n_sample,
             prompts_dir=Path(args.prompts_dir) if args.prompts_dir else None,
         )
 
@@ -1852,8 +2004,11 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
     # Final summary
     print("\n[bench] === SUMMARY ===", flush=True)
-    print(f"{'Suite':>8s}  {'OK':>5s}  {'Wall':>7s}  {'TTFT':>7s}  {'Pf tok/s':>9s}  "
-          f"{'Out tok/s':>10s}  {'Out tok':>8s}  {'Score':>10s}", flush=True)
+    print(
+        f"{'Suite':>8s}  {'OK':>5s}  {'Wall':>7s}  {'TTFT':>7s}  {'Pf tok/s':>9s}  "
+        f"{'Out tok/s':>10s}  {'Out tok':>8s}  {'Score':>10s}",
+        flush=True,
+    )
     for suite, s in all_suites.items():
         ok_str = f"{s['n_ok']}/{s['n']}"
         wall_str = f"{s.get('mean_wall_s', 0):.2f}s" if s.get("mean_wall_s") else "-"
@@ -1862,8 +2017,11 @@ def cmd_bench(args: argparse.Namespace) -> int:
         out_str = f"{s['mean_output_tok_s']:.2f}" if s.get("mean_output_tok_s") else "-"
         tok_str = str(s.get("total_output_tokens", 0))
         score_str = s.get("accuracy", "-")
-        print(f"{suite:>8s}  {ok_str:>5s}  {wall_str:>7s}  {ttft_str:>7s}  "
-              f"{pf_str:>9s}  {out_str:>10s}  {tok_str:>8s}  {score_str:>10s}", flush=True)
+        print(
+            f"{suite:>8s}  {ok_str:>5s}  {wall_str:>7s}  {ttft_str:>7s}  "
+            f"{pf_str:>9s}  {out_str:>10s}  {tok_str:>8s}  {score_str:>10s}",
+            flush=True,
+        )
 
     write_json(args.json_out, payload)
     return 0 if payload["ok"] else 1
@@ -1902,8 +2060,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_sweep.add_argument("--install-packages", action="store_true")
     p_sweep.add_argument("--package-smoke", action="store_true")
     p_sweep.add_argument("--long-prompt", action="store_true")
-    p_sweep.add_argument("--isolate-clients", action="store_true",
-                         help="Restart the server for each client probe")
+    p_sweep.add_argument(
+        "--isolate-clients", action="store_true", help="Restart the server for each client probe"
+    )
     p_sweep.add_argument("--port", type=int, default=None)
     p_sweep.add_argument("--start-timeout", type=int, default=240)
     p_sweep.add_argument("--json-out", type=Path, default=None)
@@ -1916,13 +2075,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_bench = sub.add_parser("bench", help="Run benchmark suites (he, gsm, math, agent)")
     p_bench.add_argument("--url", required=True, help="Server base URL")
-    p_bench.add_argument("--suite", default="all",
-                         help="Comma-separated suites: he,gsm,math,agent (default: all)")
+    p_bench.add_argument(
+        "--suite", default="all", help="Comma-separated suites: he,gsm,math,agent (default: all)"
+    )
     p_bench.add_argument("--model", default=MODEL, help="Model name")
-    p_bench.add_argument("--n-sample", type=int, default=None,
-                         help="Max prompts per suite (default: all)")
-    p_bench.add_argument("--prompts-dir", default=None,
-                         help="Override prompts directory")
+    p_bench.add_argument(
+        "--n-sample", type=int, default=None, help="Max prompts per suite (default: all)"
+    )
+    p_bench.add_argument("--prompts-dir", default=None, help="Override prompts directory")
     p_bench.add_argument("--json-out", type=Path, default=None)
     p_bench.set_defaults(func=cmd_bench)
 

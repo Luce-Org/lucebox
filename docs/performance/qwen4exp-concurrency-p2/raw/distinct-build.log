@@ -1,0 +1,10 @@
+[  0%] Built target image_codec_png
+[  1%] Built target libjpeg_turbo_external
+[  5%] Built target ggml-base
+[  8%] Built target ggml-cpu
+[ 62%] Built target ggml-hip
+[ 62%] Built target ggml
+[ 98%] Built target luce_common
+[ 98%] Building CXX object CMakeFiles/test_qwen4exp_seq_engine.dir/test/test_qwen4exp_seq_engine.cpp.o
+[100%] Linking HIP executable test_qwen4exp_seq_engine
+[100%] Built target test_qwen4exp_seq_engine

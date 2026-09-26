@@ -1,0 +1,21 @@
+[  1%] Built target libjpeg_turbo_external
+[  1%] Built target image_codec_png
+[  5%] Built target ggml-base
+[  8%] Built target ggml-cpu
+[ 62%] Built target ggml-hip
+[ 62%] Built target ggml
+[ 63%] Building CXX object CMakeFiles/luce_common.dir/src/qwen4exp/qwen4exp_seq_engine.cpp.o
+[ 63%] Linking HIP static library libluce_common.a
+[ 98%] Built target luce_common
+[100%] Linking HIP executable test_qwen4exp_seq_engine
+[100%] Built target test_qwen4exp_seq_engine
+[  1%] Built target image_codec_png
+[  1%] Built target libjpeg_turbo_external
+[  5%] Built target ggml-base
+[  8%] Built target ggml-cpu
+[ 63%] Built target ggml-hip
+[ 63%] Built target ggml
+[100%] Built target luce_common
+[100%] Linking HIP executable luce_server
+Copying status.html to build/share/
+[100%] Built target luce_server

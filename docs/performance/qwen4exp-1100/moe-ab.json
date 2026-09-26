@@ -1,0 +1,114 @@
+[
+  {
+    "label": "control",
+    "round": 0,
+    "ttft": 17.73,
+    "tps": 923.0682459108855,
+    "wall_time": 1789893285.4974873
+  },
+  {
+    "label": "control",
+    "round": 0,
+    "ttft": 16.61,
+    "tps": 985.3100541842264,
+    "wall_time": 1789893302.183034
+  },
+  {
+    "label": "control",
+    "round": 0,
+    "ttft": 16.41,
+    "tps": 997.3187081048142,
+    "wall_time": 1789893318.6499786
+  },
+  {
+    "label": "control",
+    "round": 0,
+    "ttft": 16.4,
+    "tps": 997.9268292682927,
+    "wall_time": 1789893335.1175766
+  },
+  {
+    "label": "pipeline",
+    "round": 1,
+    "ttft": 17.1,
+    "tps": 957.0760233918128,
+    "wall_time": 1789893408.3270795
+  },
+  {
+    "label": "pipeline",
+    "round": 1,
+    "ttft": 16.5,
+    "tps": 991.8787878787879,
+    "wall_time": 1789893424.8890355
+  },
+  {
+    "label": "pipeline",
+    "round": 1,
+    "ttft": 16.46,
+    "tps": 994.2891859052247,
+    "wall_time": 1789893441.4164765
+  },
+  {
+    "label": "pipeline",
+    "round": 1,
+    "ttft": 16.42,
+    "tps": 996.7113276492082,
+    "wall_time": 1789893457.9051404
+  },
+  {
+    "label": "pipeline",
+    "round": 2,
+    "ttft": 17.24,
+    "tps": 949.3039443155453,
+    "wall_time": 1789893528.8718832
+  },
+  {
+    "label": "pipeline",
+    "round": 2,
+    "ttft": 16.85,
+    "tps": 971.2759643916913,
+    "wall_time": 1789893545.7929893
+  },
+  {
+    "label": "pipeline",
+    "round": 2,
+    "ttft": 16.86,
+    "tps": 970.699881376038,
+    "wall_time": 1789893562.721352
+  },
+  {
+    "label": "pipeline",
+    "round": 2,
+    "ttft": 16.68,
+    "tps": 981.1750599520384,
+    "wall_time": 1789893579.4621317
+  },
+  {
+    "label": "control",
+    "round": 3,
+    "ttft": 17.17,
+    "tps": 953.174140943506,
+    "wall_time": 1789893652.3114142
+  },
+  {
+    "label": "control",
+    "round": 3,
+    "ttft": 16.96,
+    "tps": 964.9764150943396,
+    "wall_time": 1789893669.34102
+  },
+  {
+    "label": "control",
+    "round": 3,
+    "ttft": 16.84,
+    "tps": 971.8527315914489,
+    "wall_time": 1789893686.2534444
+  },
+  {
+    "label": "control",
+    "round": 3,
+    "ttft": 16.71,
+    "tps": 979.4135248354279,
+    "wall_time": 1789893703.0377476
+  }
+]

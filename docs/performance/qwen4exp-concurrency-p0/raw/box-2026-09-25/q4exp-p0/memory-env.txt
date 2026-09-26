@@ -1,0 +1,19 @@
+env
+SHELL=/bin/bash
+PWD=/home/duster
+LOGNAME=duster
+XDG_SESSION_TYPE=tty
+HOME=/home/duster
+LANG=en_US.UTF-8
+SSH_CONNECTION=100.93.12.69 57730 100.126.37.90 22
+XDG_SESSION_CLASS=user
+USER=duster
+SHLVL=0
+XDG_SESSION_ID=93
+LC_CTYPE=C.UTF-8
+XDG_RUNTIME_DIR=/run/user/1006
+SSH_CLIENT=100.93.12.69 57730 22
+LC_ALL=C.UTF-8
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1006/bus
+_=/tmp/q4exp-p0-run-memory.sh

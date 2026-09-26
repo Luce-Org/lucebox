@@ -214,6 +214,42 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+// Preserve the two-op RMS_NORM -> SCALE rounding, including the intermediate
+// F32 product. Algebraically collapsing this into rsqrt(sum + eps) changes bits.
+static __global__ void rms_norm_scale_f32(
+        const float * x, float * dst, int ncols,
+        int64_t stride_row, int64_t stride_channel, int64_t stride_sample,
+        float eps, float post_scale, float bias) {
+    x += blockIdx.z * stride_sample + blockIdx.y * stride_channel + blockIdx.x * stride_row;
+    dst += ((blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x) * (int64_t) ncols;
+    float sum = 0.0f;
+    for (int col = threadIdx.x; col < ncols; col += 128) {
+        const float xi = x[col];
+        sum += xi * xi;
+    }
+    // The 128-wide input leaves four zero warps in the original 256-thread
+    // kernel. Omitting those warps preserves its two-stage reduction tree.
+    extern __shared__ float s_sum[];
+    sum = block_reduce<block_reduce_method::SUM, 128>(sum, s_sum);
+    const float scale = rsqrtf(sum / ncols + eps);
+    for (int col = threadIdx.x; col < ncols; col += 128) {
+        const float normalized = __fmul_rn(scale, x[col]);
+        dst[col] = post_scale * normalized + bias;
+    }
+}
+
+void ggml_cuda_op_rms_norm_scale(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * scale) {
+    const ggml_tensor * x = norm->src[0];
+    float eps, params[2];
+    memcpy(&eps, norm->op_params, sizeof(eps));
+    memcpy(params, scale->op_params, sizeof(params));
+    const dim3 grid(x->ne[1], x->ne[2], x->ne[3]);
+    rms_norm_scale_f32<<<grid, 128, 32 * sizeof(float), ctx.stream()>>>(
+        (const float *) x->data, (float *) scale->data, x->ne[0],
+        x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), x->nb[3] / sizeof(float),
+        eps, params[0], params[1]);
+}
+
 // dflash: residual add fused into the following rms_norm * weight.
 //   sum = a + b            (written to sum_out; it is the next residual)
 //   dst = rms_norm(sum) * w

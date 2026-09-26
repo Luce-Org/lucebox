@@ -1,0 +1,78 @@
+// Qwen4ExpBackend — ModelBackend for Qwen3.8-Flash-Next (arch `qwen4exp`).
+//
+// Implements the single-sequence hybrid DeltaNet/full-attention graph,
+// hyper-connections, PLE, and routed MoE used by the model.
+
+#pragma once
+
+#include "common/model_backend.h"
+#include "placement/placement_config.h"
+
+#include "qwen4exp_internal.h"
+#include "qwen4exp_cache.h"
+#include "qwen4exp_seq_engine.h"
+
+#include "ggml.h"
+#include "ggml-backend.h"
+
+#include <string>
+#include <memory>
+#include <vector>
+
+namespace luce::common {
+
+struct Qwen4ExpBackendConfig {
+    std::string     model_path;
+    DevicePlacement device;
+    int             stream_fd = -1;
+    int             chunk     = 2048;
+    int             max_concurrency = 1;
+};
+
+class Qwen4ExpBackend final : public ModelBackend {
+public:
+    explicit Qwen4ExpBackend(Qwen4ExpBackendConfig cfg);
+    ~Qwen4ExpBackend() override;
+
+    Qwen4ExpBackend(const Qwen4ExpBackend &) = delete;
+    Qwen4ExpBackend & operator=(const Qwen4ExpBackend &) = delete;
+
+    bool init();
+
+    // ModelBackend interface
+    void print_ready_banner() const override;
+
+    bool park(ParkTarget target) override;
+    bool unpark(ParkTarget target) override;
+    bool is_target_parked() const override { return parked_; }
+
+    GenerateResult generate_impl(const GenerateRequest & req,
+                                 const DaemonIO & io) override;
+
+    bool snapshot_save(int slot) override;
+    void snapshot_free(int slot) override;
+    bool snapshot_used(int slot) const override;
+    int  snapshot_cur_pos(int slot) const override;
+
+    GenerateResult restore_and_generate_impl(int slot,
+                                             const GenerateRequest & req,
+                                             const DaemonIO & io) override;
+
+    bool handle_compress(const std::string & line,
+                         const DaemonIO & io) override;
+    void free_drafter() override;
+
+    void shutdown() override;
+    SeqEngine * seq_engine() override { return seq_engine_.get(); }
+
+private:
+    Qwen4ExpBackendConfig cfg_;
+    ggml_backend_t        backend_ = nullptr;
+    Qwen4ExpWeights       weights_;
+    Qwen4ExpCache         cache_;
+    std::vector<Qwen4ExpCache> seq_caches_;
+    std::unique_ptr<Qwen4ExpSeqEngine> seq_engine_;
+    bool                  parked_  = false;
+};
+
+}  // namespace luce::common

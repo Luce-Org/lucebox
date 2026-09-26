@@ -100,7 +100,9 @@ struct DiskCacheHeader {
 // to avoid alignment/packing issues. The on-disk size is exactly 80 bytes.
 
 static constexpr size_t DISK_CACHE_HEADER_SIZE = 80;
-static constexpr uint32_t DISK_CACHE_VERSION = 2;
+// v3: ggml_type id 42 changed meaning (TQ3_0 -> Q2_0). Bump so cache files
+// written before the Q2_0 type existed are rejected instead of misread.
+static constexpr uint32_t DISK_CACHE_VERSION = 3;
 
 // ─── Tensor table entry (on-disk) ──────────────────────────────────────
 

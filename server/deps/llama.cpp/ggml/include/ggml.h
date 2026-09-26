@@ -433,7 +433,8 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_TQ3_0   = 42,  // TurboQuant 3.5 bpv (3-bit Lloyd-Max + FWHT rotation)
+        GGML_TYPE_Q2_0    = 42,  // 2-bit (QK=64): {d} + 2-bit quads, values {-1,0,1,2}*d
+        GGML_TYPE_TQ3_0   = 43,  // TurboQuant 3.5 bpv (3-bit Lloyd-Max + FWHT rotation)
         GGML_TYPE_Q4_0_ROCMFP4      = 100,
         GGML_TYPE_Q4_0_ROCMFP4_FAST = 101,
         GGML_TYPE_Q6_0_ROCMFPX      = 102,
@@ -480,6 +481,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4          = 100,
         GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN     = 101,
         GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT = 102,
@@ -626,6 +628,8 @@ extern "C" {
         GGML_OP_SOFT_MAX_VISION_F32, // inference-only HIP source-order DS4V softmax
         GGML_OP_MUL_MAT_VISION_AV_F32, // inference-only HIP source-layout DS4V AV
         GGML_OP_DS4_MOE_COMBINE,
+
+        GGML_OP_HC_COMBINE_NORM,  // Fused hyper-connection combine + next stream rms-norm
 
         GGML_OP_COUNT,
     };
@@ -2482,6 +2486,12 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_prec       prec);
 
+    // Upper bound on the number of finite entries in every mask row (used by
+    // the selected-attention kernel to size its shared-memory reduction).
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
+
     // DS4 layout and block-sparse policy for flash_attn_ext. raw_window is the
     // maximum visible span inside the raw-row region. Compressed rows are
     // selected in fixed-size blocks, capped to keep_rows. Zero leaves the
@@ -2876,6 +2886,17 @@ extern "C" {
             struct ggml_tensor  * down_e,
             struct ggml_tensor  * weights,
             struct ggml_tensor  * shared_out);
+
+    // Fused hyper-connection combine (residual + repeat(block)*w) and the
+    // following stream rms-norm with gamma. Packed result [n_embd, hc, tokens, 2]:
+    // channel 0 is the new residual, channel 1 the normalized stream.
+    GGML_API struct ggml_tensor * ggml_hc_combine_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * inject,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * block_out,
+            struct ggml_tensor  * gamma,
+            float                 s1, float b1, float s2, float b2, float eps);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

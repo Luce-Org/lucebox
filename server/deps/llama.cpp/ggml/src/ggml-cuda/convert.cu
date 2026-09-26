@@ -6,6 +6,7 @@
 #include "../../rocmfp4/rocmfp4_hip_scale.cuh"
 
 #include <cstdint>
+#include <type_traits>
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
@@ -193,15 +194,6 @@ static __global__ void dequantize_block_q3_K(const void * __restrict__ vx, dst_t
     const uint8_t * hm = x[i].hmask;
 
     for (int l = l0; l < l0+4; ++l) y[l] = dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
-}
-
-static inline __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
-    if (j < 4) {
-        d = q[j] & 63; m = q[j + 4] & 63;
-    } else {
-        d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
-        m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
-    }
 }
 
 template<typename dst_t>
@@ -822,8 +814,69 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
 }
 
+// Vectorized contiguous casts for the hot bf16<->f32 directions (the cuBLAS
+// route's f32->bf16 src and bf16->f32 dst staging). 8 elements per thread: one
+// uint4 load for bf16 / two float4 stores for f32, and vice versa. Same
+// intrinsics as ggml_cuda_cast, so the output is bit-identical to convert_unary.
+__device__ __forceinline__ float cu_bf16_to_f32(const uint16_t h) {
+    return __bfloat162float(__builtin_bit_cast(nv_bfloat16, h));
+}
+__device__ __forceinline__ uint16_t cu_f32_to_bf16(const float f) {
+    return __builtin_bit_cast(uint16_t, __float2bfloat16(f));
+}
+
+static __global__ void convert_bf16_to_f32_vec(
+        const uint16_t * __restrict__ x, float * __restrict__ y, const int64_t k) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t i = t * 8;
+    if (i + 8 <= k) {
+        const uint4 v = *reinterpret_cast<const uint4 *>(x + i);
+        float4 a, b;
+        a.x = cu_bf16_to_f32((uint16_t) (v.x & 0xffffu)); a.y = cu_bf16_to_f32((uint16_t) (v.x >> 16));
+        a.z = cu_bf16_to_f32((uint16_t) (v.y & 0xffffu)); a.w = cu_bf16_to_f32((uint16_t) (v.y >> 16));
+        b.x = cu_bf16_to_f32((uint16_t) (v.z & 0xffffu)); b.y = cu_bf16_to_f32((uint16_t) (v.z >> 16));
+        b.z = cu_bf16_to_f32((uint16_t) (v.w & 0xffffu)); b.w = cu_bf16_to_f32((uint16_t) (v.w >> 16));
+        reinterpret_cast<float4 *>(y)[2*t]     = a;
+        reinterpret_cast<float4 *>(y)[2*t + 1] = b;
+    } else {
+        for (int64_t j = i; j < k && j < i + 8; ++j) y[j] = cu_bf16_to_f32(x[j]);
+    }
+}
+
+static __global__ void convert_f32_to_bf16_vec(
+        const float * __restrict__ x, uint16_t * __restrict__ y, const int64_t k) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t i = t * 8;
+    if (i + 8 <= k) {
+        const float4 a = reinterpret_cast<const float4 *>(x)[2*t];
+        const float4 b = reinterpret_cast<const float4 *>(x)[2*t + 1];
+        uint4 o;
+        o.x = (uint32_t) cu_f32_to_bf16(a.x) | ((uint32_t) cu_f32_to_bf16(a.y) << 16);
+        o.y = (uint32_t) cu_f32_to_bf16(a.z) | ((uint32_t) cu_f32_to_bf16(a.w) << 16);
+        o.z = (uint32_t) cu_f32_to_bf16(b.x) | ((uint32_t) cu_f32_to_bf16(b.y) << 16);
+        o.w = (uint32_t) cu_f32_to_bf16(b.z) | ((uint32_t) cu_f32_to_bf16(b.w) << 16);
+        reinterpret_cast<uint4 *>(y)[t] = o;
+    } else {
+        for (int64_t j = i; j < k && j < i + 8; ++j) y[j] = cu_f32_to_bf16(x[j]);
+    }
+}
+
 template <typename src_t, typename dst_t>
 static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    constexpr bool is_bf16 = std::is_same_v<src_t, nv_bfloat16> && std::is_same_v<dst_t, float>;
+    constexpr bool is_f32  = std::is_same_v<src_t, float>        && std::is_same_v<dst_t, nv_bfloat16>;
+    if constexpr (is_bf16 || is_f32) {
+        if (((uintptr_t) vx) % 16 == 0 && ((uintptr_t) y) % 16 == 0) {
+            const int64_t nthreads = (k + 7) / 8;
+            const unsigned nblocks = (unsigned) ((nthreads + 255) / 256);
+            if constexpr (is_bf16) {
+                convert_bf16_to_f32_vec<<<nblocks, 256, 0, stream>>>((const uint16_t *) vx, (float *) y, k);
+            } else {
+                convert_f32_to_bf16_vec<<<nblocks, 256, 0, stream>>>((const float *) vx, (uint16_t *) y, k);
+            }
+            return;
+        }
+    }
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
@@ -842,6 +895,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_TQ3_0:
             return dequantize_row_tq3_0_cuda;
+        case GGML_TYPE_Q2_0:
+            return dequantize_block_cont_cuda<QK2_0, QR2_0, dequantize_q2_0>;
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_1:
@@ -916,6 +971,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_TQ3_0:
             return dequantize_row_tq3_0_cuda;
+        case GGML_TYPE_Q2_0:
+            return dequantize_block_cont_cuda<QK2_0, QR2_0, dequantize_q2_0>;
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_1:
@@ -983,6 +1040,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
             return convert_unary_cuda<float>;
+        case GGML_TYPE_Q2_0:
+            return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
         case GGML_TYPE_Q4_0:
             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
         case GGML_TYPE_Q4_1:
@@ -1016,6 +1075,8 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
             return convert_unary_cuda<float, nv_bfloat16>;
+        case GGML_TYPE_Q2_0:
+            return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
         case GGML_TYPE_Q4_0:
             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
         case GGML_TYPE_Q4_1:
@@ -1049,6 +1110,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F16:
             return convert_unary_cuda<half, float>;
+        case GGML_TYPE_Q2_0:
+            return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
         case GGML_TYPE_Q4_0:
             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
         case GGML_TYPE_Q4_1:

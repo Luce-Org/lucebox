@@ -267,7 +267,8 @@ static bool family_fallback(const std::string & arch, ModelCard & out) {
     // Coarse safety net when no sidecar matches. Values are conservative
     // and intentionally not aspirational — operators are expected to ship
     // a sidecar for production models. See spec §3.1.
-    if (arch == "qwen35" || arch == "qwen36" || arch == "qwen3") {
+    if (arch == "qwen35" || arch == "qwen36" || arch == "qwen3" ||
+        arch == "qwen4exp") {
         out.max_tokens                 = 32768;
         out.complex_problem_max_tokens = 0;
         // Qwen3.x is verbose post-`</think>` — restates derivation in the

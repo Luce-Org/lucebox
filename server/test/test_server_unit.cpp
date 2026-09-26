@@ -6255,7 +6255,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_size) {
     // Bumped to 2 when the K-rotation default changed: a cache written by an
     // older binary stores K in the rotated basis, and the layout id does not
     // cover that, so the version is what rejects it.
-    TEST_ASSERT(DISK_CACHE_VERSION == 2);
+    TEST_ASSERT(DISK_CACHE_VERSION == 3);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {

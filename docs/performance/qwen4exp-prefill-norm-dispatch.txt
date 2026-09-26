@@ -1,0 +1,4 @@
+('__amd_rocclr_copyBuffer', 5, 0.046615)
+('rms_norm_scale_f32(float const*, float*, int, long, long, long, float, float, float)', 9, 3.081256)
+('void rms_norm_f32<256, false, false>(float const*, float*, int, long, long, long, float, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>)', 9, 5.346421)
+('scale_f32(float const*, float*, float, float, long)', 9, 2.45822)

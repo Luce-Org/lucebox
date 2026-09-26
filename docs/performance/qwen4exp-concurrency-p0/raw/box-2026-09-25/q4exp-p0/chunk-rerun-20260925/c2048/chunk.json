@@ -1,0 +1,21 @@
+{
+  "prompt_repeats": 29900,
+  "prefill_request": {
+    "status": 200,
+    "error": null,
+    "http_start_to_first_delta_s": 51.91574744299987,
+    "wall_s": 51.91587819099982,
+    "events": 1
+  },
+  "decode_request": {
+    "status": 200,
+    "error": null,
+    "enqueue_to_first_delta_s": 50.946324065,
+    "first_delta_to_last_delta_s": 1.4429123639999943,
+    "events": 44,
+    "gap_median_s": 0.03434866700013117,
+    "gap_p99_s": 0.034856040000022404,
+    "gap_max_s": 0.034856040000022404,
+    "gap_n": 43
+  }
+}

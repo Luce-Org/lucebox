@@ -1,0 +1,76 @@
+{
+  "short": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "content": "The capital of France is **Paris**.",
+          "role": "assistant"
+        }
+      }
+    ],
+    "created": 1789924257,
+    "id": "chatcmpl_0000000000000000",
+    "model": "dflash",
+    "object": "chat.completion",
+    "usage": {
+      "accept_rate": 0.0,
+      "completion_tokens": 9,
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      },
+      "prompt_tokens": 22,
+      "spec_decode_ran": false,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 325.9,
+        "decode_tokens_per_sec": 27.6,
+        "effective_prompt_tokens": 22,
+        "prefill_ms": 318.1,
+        "prefilled_tokens": 22
+      },
+      "total_tokens": 31
+    }
+  },
+  "long": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "content": "QUINCE-AMBER-7731",
+          "role": "assistant"
+        }
+      }
+    ],
+    "created": 1789924279,
+    "id": "chatcmpl_0000000000000001",
+    "model": "dflash",
+    "object": "chat.completion",
+    "usage": {
+      "accept_rate": 0.0,
+      "completion_tokens": 12,
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      },
+      "prompt_tokens": 16366,
+      "spec_decode_ran": false,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 467.0,
+        "decode_tokens_per_sec": 25.7,
+        "effective_prompt_tokens": 16366,
+        "prefill_ms": 21578.7,
+        "prefilled_tokens": 16366
+      },
+      "total_tokens": 16378
+    }
+  },
+  "short_pass": true,
+  "long_pass": true
+}

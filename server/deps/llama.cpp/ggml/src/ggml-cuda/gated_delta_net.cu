@@ -7,6 +7,7 @@
 
 static thread_local size_t g_gdn_scalar_launch_count = 0;
 static thread_local size_t g_gdn_grouped_cols_launch_count = 0;
+static thread_local size_t g_gdn_tiled_launch_count = 0;
 
 extern "C" size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void) {
     return g_gdn_scalar_launch_count;
@@ -14,6 +15,10 @@ extern "C" size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void) {
 
 extern "C" size_t ggml_backend_cuda_get_gdn_grouped_cols_launch_count(void) {
     return g_gdn_grouped_cols_launch_count;
+}
+
+extern "C" size_t ggml_backend_cuda_get_gdn_tiled_launch_count(void) {
+    return g_gdn_tiled_launch_count;
 }
 
 static bool gdn_grouped_cols_supported(int device) {
@@ -622,6 +627,188 @@ gated_delta_net_cuda_grouped_cols(const float * q,
     }
 }
 
+// Tiled gated delta-net for large prefill batches (S_v = 128, GDA).
+// Ported from pwilkin/llama.cpp strix-halo 964c6f2f0 (measured 2.37x prefill on
+// gfx1151 at a 24576-token ubatch). Tiles the recurrence over tokens so the
+// state stays in registers across a tile instead of round-tripping to memory
+// per token. Chain path only: the tree, mapped-verify, intermediate-capture and
+// raw-gate paths keep the scalar/grouped kernels.
+#if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4))
+template <int mask>
+static __device__ __forceinline__ float gdn_dpp_row_xmask(const float x) {
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x160 | mask, 0xf, 0xf, true));
+}
+static __device__ __forceinline__ float gdn_permlanex16_swap(const float x) {
+    return __int_as_float(__builtin_amdgcn_permlanex16(__float_as_int(x), __float_as_int(x), 0x76543210, 0xFEDCBA98, true, false));
+}
+static __device__ __forceinline__ float gdn_warp_reduce_sum32(float x) {
+    x += gdn_permlanex16_swap(x);
+    x += gdn_dpp_row_xmask<8>(x);
+    x += gdn_dpp_row_xmask<4>(x);
+    x += gdn_dpp_row_xmask<2>(x);
+    x += gdn_dpp_row_xmask<1>(x);
+    return x;
+}
+#define GDN_DPP_REDUCE 1
+#endif
+
+template <int width>
+static __device__ __forceinline__ float gdn_warp_reduce_sum(const float x) {
+#if defined(GDN_DPP_REDUCE)
+    if constexpr (width == 32) {
+        return gdn_warp_reduce_sum32(x);
+    }
+#endif
+    return warp_reduce_sum<width>(x);
+}
+
+template <int S_v, int NUM_WARPS, int COLS, int TOKEN_TILE>
+__global__ void __launch_bounds__(32 * NUM_WARPS, 1)
+gated_delta_net_tiled_cuda(const float * q,
+                           const float * k,
+                           const float * v,
+                           const float * g,
+                           const float * beta,
+                           const float * curr_state,
+                           float *       dst,
+                           float *       state,
+                           int64_t       H,
+                           int64_t       n_tokens,
+                           int64_t       sq1,
+                           int64_t       sq2,
+                           int64_t       sq3,
+                           int64_t       sv1,
+                           int64_t       sv2,
+                           int64_t       sv3,
+                           int64_t       sb1,
+                           int64_t       sb2,
+                           int64_t       sb3,
+                           const uint3   neqk1_magic,
+                           const uint3   rq3_magic,
+                           float         scale) {
+    constexpr int warp_size     = 32;
+    constexpr int rows_per_lane = S_v / warp_size;
+    constexpr int block_cols    = NUM_WARPS * COLS;
+    static_assert(S_v % warp_size == 0, "S_v must be a multiple of the warp size");
+    static_assert(S_v % block_cols == 0, "block columns must divide S_v");
+
+    __shared__ float q_shared[TOKEN_TILE][S_v];
+    __shared__ float k_shared[TOKEN_TILE][S_v];
+    __shared__ float v_shared[TOKEN_TILE][block_cols];
+    __shared__ float g_shared[TOKEN_TILE];
+    __shared__ float beta_shared[TOKEN_TILE];
+
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t sequence = blockIdx.y;
+    const int      lane     = threadIdx.x;
+    const int      col0     = blockIdx.z * block_cols;          // first column of the block
+    const int      colw     = threadIdx.y * COLS;               // first column of this warp inside the block
+    const int      thread   = threadIdx.y * warp_size + lane;
+    constexpr int  nthreads = NUM_WARPS * warp_size;
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    const int64_t state_in_offset  = sequence * H * S_v * S_v + h_idx * S_v * S_v;
+    const int64_t state_out_offset = (sequence * H + h_idx) * S_v * S_v;
+    state += state_out_offset;
+    curr_state += state_in_offset + (col0 + colw) * S_v;
+    float * attn_data = dst + (sequence * n_tokens * H + h_idx) * S_v + col0 + colw;
+
+    float s_shard[COLS][rows_per_lane];
+
+#pragma unroll
+    for (int c = 0; c < COLS; c++) {
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[c][r] = curr_state[c * S_v + r * warp_size + lane];
+        }
+    }
+
+    for (int t0 = 0; t0 < n_tokens; t0 += TOKEN_TILE) {
+        const int tile_size = min((int) TOKEN_TILE, (int) (n_tokens - t0));
+
+        for (int idx = thread; idx < tile_size * S_v; idx += nthreads) {
+            const int tt = idx / S_v;
+            const int i  = idx % S_v;
+            const int t  = t0 + tt;
+            q_shared[tt][i] = q[iq3 * sq3 + t * sq2 + iq1 * sq1 + i];
+            k_shared[tt][i] = k[iq3 * sq3 + t * sq2 + iq1 * sq1 + i];
+        }
+        for (int idx = thread; idx < tile_size * block_cols; idx += nthreads) {
+            const int tt = idx / block_cols;
+            const int c  = idx % block_cols;
+            const int t  = t0 + tt;
+            v_shared[tt][c] = v[sequence * sv3 + t * sv2 + h_idx * sv1 + col0 + c];
+        }
+        if (thread < tile_size) {
+            const int64_t gb_offset = sequence * sb3 + (t0 + thread) * sb2 + h_idx * sb1;
+            g_shared[thread]    = g[gb_offset];
+            beta_shared[thread] = beta[gb_offset];
+        }
+        __syncthreads();
+
+        for (int tt = 0; tt < tile_size; ++tt) {
+            const int t = t0 + tt;
+
+            float k_reg[rows_per_lane];
+            float q_reg[rows_per_lane];
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                k_reg[r] = k_shared[tt][i];
+                q_reg[r] = q_shared[tt][i];
+            }
+
+            const float g_val    = expf(g_shared[tt]);
+            const float beta_val = beta_shared[tt];
+
+            float attn_col[COLS];
+#pragma unroll
+            for (int c = 0; c < COLS; c++) {
+                // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
+                float kv_shard = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    kv_shard = fmaf(s_shard[c][r], k_reg[r], kv_shard);
+                }
+                const float kv_col = gdn_warp_reduce_sum<warp_size>(kv_shard);
+
+                // delta[col] = (v[col] - g * kv[col]) * beta
+                const float delta_col = fmaf(-g_val, kv_col, v_shared[tt][colw + c]) * beta_val;
+
+                // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
+                // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
+                float attn_partial = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    s_shard[c][r] = fmaf(g_val, s_shard[c][r], k_reg[r] * delta_col);
+                    attn_partial  = fmaf(s_shard[c][r], q_reg[r], attn_partial);
+                }
+                attn_col[c] = gdn_warp_reduce_sum<warp_size>(attn_partial);
+            }
+
+            if (lane < COLS) {
+                float a = attn_col[0];
+#pragma unroll
+                for (int c = 1; c < COLS; c++) {
+                    a = lane == c ? attn_col[c] : a;
+                }
+                attn_data[(int64_t) t * S_v * H + lane] = a * scale;
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int c = 0; c < COLS; c++) {
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            state[(col0 + colw + c) * S_v + r * warp_size + lane] = s_shard[c][r];
+        }
+    }
+}
+
 template <bool KDA, bool TREE_MODE, bool WRITE_INTER, typename InterT = float>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -653,6 +840,29 @@ static void launch_gated_delta_net(
     const bool ampere_nvidia = GGML_CUDA_CC_IS_NVIDIA(cc)
                             && cc >= GGML_CUDA_CC_AMPERE
                             && cc <  GGML_CUDA_CC_ADA_LOVELACE;
+    // Tiled recurrence: chain path only, S_v=128 GDA at prefill batch sizes on
+    // RDNA3.5. Excludes tree, mapped verify, intermediate capture, raw gates and
+    // multi-sequence batches, which the scalar/grouped kernels still own.
+    if (!KDA && !TREE_MODE && !WRITE_INTER &&
+        active_slot_ids_d == nullptr && persist_inter_d == nullptr &&
+        replay_log_d == nullptr && gate_bias == nullptr && gate_A == nullptr &&
+        state_out_d != nullptr && n_seqs == 1 && S_v == 128 && H == 48 &&
+        GGML_CUDA_CC_IS_RDNA3_5(cc) && n_tokens >= 16 && n_tokens <= 32768 &&
+        getenv("LUCE_GDN_NO_TILED") == nullptr &&
+        // Explicit route overrides win: the qualification test pins scalar or
+        // grouped_cols via these, so the tiled path must not shadow them.
+        getenv("LUCE_GDN_FORCE_GROUPED_COLS") == nullptr &&
+        getenv("LUCE_GDN_NO_GROUPED_COLS") == nullptr) {
+        ++g_gdn_tiled_launch_count;
+        const dim3 tiled_grid(H, n_seqs, 2);
+        const dim3 tiled_block(32, 8, 1);
+        gated_delta_net_tiled_cuda<128, 8, 8, 16><<<tiled_grid, tiled_block, 0, stream>>>(
+            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, H, n_tokens,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+            neqk1_magic, rq3_magic, scale);
+        return;
+    }
+
     const bool force_grouped_cols = getenv("LUCE_GDN_FORCE_GROUPED_COLS") != nullptr;
     const bool disable_grouped_cols = getenv("LUCE_GDN_NO_GROUPED_COLS") != nullptr;
     const bool use_grouped_cols = force_grouped_cols ||

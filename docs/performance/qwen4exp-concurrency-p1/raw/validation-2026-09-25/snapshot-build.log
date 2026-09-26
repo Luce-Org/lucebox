@@ -1,0 +1,10 @@
+[  0%] Built target image_codec_png
+[  1%] Built target libjpeg_turbo_external
+[  5%] Built target ggml-base
+[  8%] Built target ggml-cpu
+[ 63%] Built target ggml-hip
+[ 63%] Built target ggml
+[ 98%] Built target luce_common
+[ 98%] Building CXX object CMakeFiles/qwen4exp_bridge_probe.dir/test/qwen4exp_tail_replay.cpp.o
+[ 98%] Linking HIP executable qwen4exp_bridge_probe
+[100%] Built target qwen4exp_bridge_probe

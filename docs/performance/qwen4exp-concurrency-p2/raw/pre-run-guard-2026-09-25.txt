@@ -1,0 +1,13 @@
+Attempt 1: ssh -o ConnectTimeout=10 duster@lucebox4.tail97592a.ts.net
+Result: connection timed out before remote command; guard values unavailable.
+
+Attempt 2: ssh -o ConnectTimeout=10 duster@100.115.193.112
+Result: connection timed out before remote command; guard values unavailable.
+
+Retry: tailscale status
+Result: failed to connect to local tailscaled; it does not appear to be running.
+
+Retry: ssh -vv -o ConnectTimeout=8 duster@lucebox4
+Result: local hostname could not be resolved.
+
+No server/GTT/RAM result was obtained. No build or GPU run was started.

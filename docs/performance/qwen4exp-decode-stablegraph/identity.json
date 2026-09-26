@@ -1,0 +1,134 @@
+{
+  "control": {
+    "2048": {
+      "pieces": [
+        "Q",
+        "UI",
+        "NC",
+        "E",
+        "-A",
+        "MBE",
+        "R",
+        "-",
+        "7",
+        "7",
+        "3",
+        "1 | QUINCE-AMBER-7731"
+      ],
+      "usage": {
+        "completion_tokens": 24,
+        "prompt_tokens": 1834,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 814.1,
+          "decode_tokens_per_sec": 29.5,
+          "effective_prompt_tokens": 1834,
+          "prefill_ms": 3539.1,
+          "prefilled_tokens": 1834
+        },
+        "total_tokens": 1858
+      }
+    },
+    "16384": {
+      "pieces": [
+        "Q",
+        "UI",
+        "NC",
+        "E",
+        "-A",
+        "MBE",
+        "R",
+        "-",
+        "7",
+        "7",
+        "3",
+        "1 | QUINCE-AMBER-7731"
+      ],
+      "usage": {
+        "completion_tokens": 24,
+        "prompt_tokens": 14864,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 886.2,
+          "decode_tokens_per_sec": 27.1,
+          "effective_prompt_tokens": 14864,
+          "prefill_ms": 15239.5,
+          "prefilled_tokens": 14864
+        },
+        "total_tokens": 14888
+      }
+    }
+  },
+  "candidate": {
+    "2048": {
+      "pieces": [
+        "Q",
+        "UI",
+        "NC",
+        "E",
+        "-A",
+        "MBE",
+        "R",
+        "-",
+        "7",
+        "7",
+        "3",
+        "1 | QUINCE-AMBER-7731"
+      ],
+      "usage": {
+        "completion_tokens": 24,
+        "prompt_tokens": 1834,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 815.3,
+          "decode_tokens_per_sec": 29.4,
+          "effective_prompt_tokens": 1834,
+          "prefill_ms": 3737.7,
+          "prefilled_tokens": 1834
+        },
+        "total_tokens": 1858
+      }
+    },
+    "16384": {
+      "pieces": [
+        "Q",
+        "UI",
+        "NC",
+        "E",
+        "-A",
+        "MBE",
+        "R",
+        "-",
+        "7",
+        "7",
+        "3",
+        "1 | QUINCE-AMBER-7731"
+      ],
+      "usage": {
+        "completion_tokens": 24,
+        "prompt_tokens": 14864,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 835.3,
+          "decode_tokens_per_sec": 28.7,
+          "effective_prompt_tokens": 14864,
+          "prefill_ms": 15549.5,
+          "prefilled_tokens": 14864
+        },
+        "total_tokens": 14888
+      }
+    }
+  },
+  "equal": {
+    "2048": true,
+    "16384": true
+  }
+}

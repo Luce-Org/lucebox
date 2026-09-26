@@ -1,0 +1,163 @@
+{
+  "decode_ab": {
+    "control": {
+      "2048": {
+        "n": 8,
+        "effective_prompt_tokens": [
+          1996
+        ],
+        "median_tps": 28.577828116327137,
+        "min_tps": 28.238616307800918,
+        "max_tps": 28.75758256571557,
+        "median_decode_ms": 4479.0
+      },
+      "16384": {
+        "n": 8,
+        "effective_prompt_tokens": [
+          16348
+        ],
+        "median_tps": 25.31730276797772,
+        "min_tps": 25.089184209494686,
+        "max_tps": 25.51122095109021,
+        "median_decode_ms": 5055.9
+      }
+    },
+    "candidate": {
+      "2048": {
+        "n": 8,
+        "effective_prompt_tokens": [
+          1996
+        ],
+        "median_tps": 29.887339431074164,
+        "min_tps": 29.707336319539536,
+        "max_tps": 30.0173537826556,
+        "median_decode_ms": 4282.75,
+        "delta_percent": 4.5822632476359315
+      },
+      "16384": {
+        "n": 8,
+        "effective_prompt_tokens": [
+          16348
+        ],
+        "median_tps": 28.064329462318526,
+        "min_tps": 27.954922687166942,
+        "max_tps": 28.17087395734754,
+        "median_decode_ms": 4560.95,
+        "delta_percent": 10.850392395730847
+      }
+    }
+  },
+  "phase_profile": {
+    "control": {
+      "2048": {
+        "n": 254,
+        "mean_build_alloc_ms": 0.9456692913385827,
+        "median_build_alloc_ms": 0.9,
+        "min_build_alloc_ms": 0.9,
+        "max_build_alloc_ms": 2.3,
+        "nonzero_calls": 254
+      },
+      "16384": {
+        "n": 254,
+        "mean_build_alloc_ms": 1.2106299212598426,
+        "median_build_alloc_ms": 1.2,
+        "min_build_alloc_ms": 0.9,
+        "max_build_alloc_ms": 2.4,
+        "nonzero_calls": 254
+      }
+    },
+    "candidate": {
+      "2048": {
+        "n": 254,
+        "mean_build_alloc_ms": 0.01062992125984252,
+        "median_build_alloc_ms": 0.0,
+        "min_build_alloc_ms": 0.0,
+        "max_build_alloc_ms": 2.7,
+        "nonzero_calls": 1
+      },
+      "16384": {
+        "n": 254,
+        "mean_build_alloc_ms": 0.00984251968503937,
+        "median_build_alloc_ms": 0.0,
+        "min_build_alloc_ms": 0.0,
+        "max_build_alloc_ms": 2.5,
+        "nonzero_calls": 1
+      }
+    }
+  },
+  "prefill": {
+    "n": 8,
+    "samples": [
+      {
+        "tokens": 16366,
+        "ttft_s": 16.02,
+        "tps": 1021.598002496879
+      },
+      {
+        "tokens": 16366,
+        "ttft_s": 15.55,
+        "tps": 1052.475884244373
+      },
+      {
+        "tokens": 16366,
+        "ttft_s": 15.45,
+        "tps": 1059.2880258899677
+      },
+      {
+        "tokens": 16366,
+        "ttft_s": 15.35,
+        "tps": 1066.1889250814334
+      },
+      {
+        "tokens": 16366,
+        "ttft_s": 15.34,
+        "tps": 1066.883963494133
+      },
+      {
+        "tokens": 16366,
+        "ttft_s": 15.34,
+        "tps": 1066.883963494133
+      },
+      {
+        "tokens": 16366,
+        "ttft_s": 15.3,
+        "tps": 1069.673202614379
+      },
+      {
+        "tokens": 16366,
+        "ttft_s": 15.33,
+        "tps": 1067.579908675799
+      }
+    ],
+    "min_latency_s": 15.3,
+    "median_latency_s": 15.344999999999999,
+    "max_latency_s": 16.02,
+    "best_tps": 1069.673202614379,
+    "median_tps": 1066.536444287783,
+    "min_tps": 1021.598002496879
+  },
+  "runtime_trace": {
+    "generated_positions": 256,
+    "t1_forward_calls": 254,
+    "hip_graph_launch_calls": 253,
+    "hip_launch_kernel_calls": 11519,
+    "total_kernel_trace_rows_including_prefill": 720108,
+    "device_kernels_per_graph_launch_distribution": {
+      "2800": 253
+    },
+    "first_graph_correlations": [
+      35125,
+      35589,
+      36053,
+      36517,
+      36981,
+      37445,
+      37909,
+      38373
+    ],
+    "raw_remote_paths": [
+      "/tmp/q4exp-followup/stablegraph-runtime-trace-trace/stablegraph-runtime-trace_hip_api_trace.csv",
+      "/tmp/q4exp-followup/stablegraph-runtime-trace-trace/stablegraph-runtime-trace_kernel_trace.csv"
+    ]
+  }
+}

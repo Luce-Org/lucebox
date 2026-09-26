@@ -1,0 +1,330 @@
+{
+  "prefill_graphs_on": {
+    "n": 8,
+    "median": 1039.4517878307863,
+    "min": 1020.2796636057029,
+    "max": 1043.9430762066963
+  },
+  "decode_graphs_off_2048": {
+    "n": 8,
+    "median": 30.0,
+    "min": 29.8,
+    "max": 30.1
+  },
+  "decode_ms_graphs_off_2048": {
+    "n": 8,
+    "median": 4267.049999999999,
+    "min": 4253.0,
+    "max": 4292.2
+  },
+  "decode_graphs_off_16384": {
+    "n": 8,
+    "median": 28.15,
+    "min": 28.0,
+    "max": 28.2
+  },
+  "decode_ms_graphs_off_16384": {
+    "n": 8,
+    "median": 4547.5,
+    "min": 4542.2,
+    "max": 4570.1
+  },
+  "decode_graphs_on_2048": {
+    "n": 8,
+    "median": 29.95,
+    "min": 29.8,
+    "max": 30.0
+  },
+  "decode_ms_graphs_on_2048": {
+    "n": 8,
+    "median": 4277.35,
+    "min": 4266.1,
+    "max": 4299.5
+  },
+  "decode_graphs_on_16384": {
+    "n": 8,
+    "median": 28.25,
+    "min": 26.3,
+    "max": 28.4
+  },
+  "decode_ms_graphs_on_16384": {
+    "n": 8,
+    "median": 4527.4,
+    "min": 4513.1,
+    "max": 4864.5
+  },
+  "decode_delta_pct_2048": -0.16666666666667052,
+  "decode_delta_pct_16384": 0.355239786856143,
+  "e35-logits-graphs-off": {
+    "steps": 32,
+    "selected_equal": 32,
+    "top2_equal": 27,
+    "hash_equal": 0,
+    "step0": {
+      "a": {
+        "request": 1,
+        "step": 0,
+        "pos": 13664,
+        "selected": 760,
+        "best": 760,
+        "best_logit": 18.7120724,
+        "second": 1719,
+        "second_logit": 16.9466019,
+        "margin": 1.7654705,
+        "hash": "b914bde1db492eea"
+      },
+      "b": {
+        "request": 2,
+        "step": 0,
+        "pos": 13664,
+        "selected": 760,
+        "best": 760,
+        "best_logit": 18.7441158,
+        "second": 1719,
+        "second_logit": 16.130661,
+        "margin": 2.61345482,
+        "hash": "78af2a6aa0e5b3c3"
+      }
+    },
+    "best_logit_abs_diff": {
+      "n": 32,
+      "median": 0.17221930000000008,
+      "min": 0.003995899999999608,
+      "max": 0.8088492999999985
+    },
+    "margin_abs_diff": {
+      "n": 32,
+      "median": 0.3306274400000002,
+      "min": 0.005854610000000093,
+      "max": 1.5753621999999998
+    }
+  },
+  "e35-logits-graphs-on": {
+    "steps": 32,
+    "selected_equal": 32,
+    "top2_equal": 27,
+    "hash_equal": 0,
+    "step0": {
+      "a": {
+        "request": 1,
+        "step": 0,
+        "pos": 13664,
+        "selected": 760,
+        "best": 760,
+        "best_logit": 17.9643803,
+        "second": 1719,
+        "second_logit": 16.100975,
+        "margin": 1.86340523,
+        "hash": "dff835343bb7113a"
+      },
+      "b": {
+        "request": 2,
+        "step": 0,
+        "pos": 13664,
+        "selected": 760,
+        "best": 760,
+        "best_logit": 18.8389969,
+        "second": 1719,
+        "second_logit": 18.2815208,
+        "margin": 0.557476044,
+        "hash": "3dedb0833d8bfc5d"
+      }
+    },
+    "best_logit_abs_diff": {
+      "n": 32,
+      "median": 0.48456479999999935,
+      "min": 0.01923749999999913,
+      "max": 1.5406818999999992
+    },
+    "margin_abs_diff": {
+      "n": 32,
+      "median": 0.37602758999999963,
+      "min": 0.030586239999999876,
+      "max": 1.8977508800000003
+    }
+  },
+  "e36-qsa-off-graphs-off": {
+    "steps": 32,
+    "selected_equal": 32,
+    "top2_equal": 24,
+    "hash_equal": 0,
+    "step0": {
+      "a": {
+        "request": 1,
+        "step": 0,
+        "pos": 13664,
+        "selected": 760,
+        "best": 760,
+        "best_logit": 18.7064114,
+        "second": 8584,
+        "second_logit": 17.3380032,
+        "margin": 1.3684082,
+        "hash": "09afdce03dea4686"
+      },
+      "b": {
+        "request": 2,
+        "step": 0,
+        "pos": 13664,
+        "selected": 760,
+        "best": 760,
+        "best_logit": 18.7316952,
+        "second": 1719,
+        "second_logit": 16.9908257,
+        "margin": 1.74086952,
+        "hash": "eb5c9bdc4120479e"
+      }
+    },
+    "best_logit_abs_diff": {
+      "n": 32,
+      "median": 0.3397636500000001,
+      "min": 0.02528380000000041,
+      "max": 2.5910817
+    },
+    "margin_abs_diff": {
+      "n": 32,
+      "median": 0.4016199094999999,
+      "min": 0.00643062999999966,
+      "max": 3.8922138199999994
+    }
+  },
+  "e37-mmb-off-graphs-off": {
+    "steps": 32,
+    "selected_equal": 32,
+    "top2_equal": 27,
+    "hash_equal": 0,
+    "step0": {
+      "a": {
+        "request": 1,
+        "step": 0,
+        "pos": 13664,
+        "selected": 760,
+        "best": 760,
+        "best_logit": 18.1446533,
+        "second": 8584,
+        "second_logit": 16.2348862,
+        "margin": 1.90976715,
+        "hash": "f8264ca90a79255a"
+      },
+      "b": {
+        "request": 2,
+        "step": 0,
+        "pos": 13664,
+        "selected": 760,
+        "best": 760,
+        "best_logit": 18.5473862,
+        "second": 8584,
+        "second_logit": 16.9151878,
+        "margin": 1.63219833,
+        "hash": "e47055f41aaabc48"
+      }
+    },
+    "best_logit_abs_diff": {
+      "n": 32,
+      "median": 0.349947000000002,
+      "min": 0.054910599999999476,
+      "max": 1.1073494000000004
+    },
+    "margin_abs_diff": {
+      "n": 32,
+      "median": 0.41570568200000024,
+      "min": 0.0077790999999987065,
+      "max": 1.7842368999999998
+    }
+  },
+  "e38-upstream-graphs-off": {
+    "steps": 32,
+    "selected_equal": 32,
+    "top2_equal": 26,
+    "hash_equal": 0,
+    "step0": {
+      "a": {
+        "request": 1,
+        "step": 0,
+        "pos": 13664,
+        "selected": 760,
+        "best": 760,
+        "best_logit": 19.3006439,
+        "second": 8584,
+        "second_logit": 17.1392746,
+        "margin": 2.16136932,
+        "hash": "b37879cfd1a4691a"
+      },
+      "b": {
+        "request": 2,
+        "step": 0,
+        "pos": 13664,
+        "selected": 760,
+        "best": 760,
+        "best_logit": 18.2102928,
+        "second": 8584,
+        "second_logit": 15.8213577,
+        "margin": 2.38893509,
+        "hash": "0a8be5be4bad6582"
+      }
+    },
+    "best_logit_abs_diff": {
+      "n": 32,
+      "median": 0.3538017499999988,
+      "min": 0.07128909999999777,
+      "max": 1.342960399999999
+    },
+    "margin_abs_diff": {
+      "n": 32,
+      "median": 0.30843305500000096,
+      "min": 0.029920579999999974,
+      "max": 1.6100711800000003
+    }
+  },
+  "e39-gdn-scalar-graphs-off": {
+    "steps": 32,
+    "selected_equal": 32,
+    "top2_equal": 29,
+    "hash_equal": 0,
+    "step0": {
+      "a": {
+        "request": 1,
+        "step": 0,
+        "pos": 13664,
+        "selected": 760,
+        "best": 760,
+        "best_logit": 18.6834698,
+        "second": 1719,
+        "second_logit": 16.9457207,
+        "margin": 1.7377491,
+        "hash": "8ea69c92743f9764"
+      },
+      "b": {
+        "request": 2,
+        "step": 0,
+        "pos": 13664,
+        "selected": 760,
+        "best": 760,
+        "best_logit": 17.5647373,
+        "second": 1719,
+        "second_logit": 16.2803421,
+        "margin": 1.28439522,
+        "hash": "1d1520c0577e595a"
+      }
+    },
+    "best_logit_abs_diff": {
+      "n": 32,
+      "median": 0.33383465,
+      "min": 0.015287400000001838,
+      "max": 1.1187325000000001
+    },
+    "margin_abs_diff": {
+      "n": 32,
+      "median": 0.34420204,
+      "min": 0.009549140000000733,
+      "max": 1.9320201899999994
+    }
+  },
+  "reference_ids_historical_capture": {
+    "upstream_layers": 48,
+    "candidate_layers": 48,
+    "compared_layers": 48,
+    "mismatches": 0,
+    "upstream_source": "/home/peppi/Dev/lucebox-qwen4exp/docs/performance/qwen4exp-decode-stablegraph/reference/upstream.log",
+    "candidate_source": "/home/peppi/Dev/lucebox-qwen4exp/docs/performance/qwen4exp-graph-triage/raw/e46-reference-diff-clean/ours.log"
+  }
+}

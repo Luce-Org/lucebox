@@ -1,0 +1,26 @@
+START hc-ab 0 control {} chunk 16384
+hc-ab control warmup pt=16366 ttft=19.15s tps=854.621
+hc-ab control 1 pt=16366 ttft=17.31s tps=945.465
+hc-ab control 2 pt=16366 ttft=16.54s tps=989.480
+hc-ab control 3 pt=16366 ttft=16.39s tps=998.536
+hc-ab control 4 pt=16366 ttft=16.42s tps=996.711
+START hc-ab 1 tile16 {'QWEN4EXP_HC_TILE16': '1'} chunk 16384
+hc-ab tile16 warmup pt=16366 ttft=17.94s tps=912.263
+hc-ab tile16 1 pt=16366 ttft=16.50s tps=991.879
+hc-ab tile16 2 pt=16366 ttft=16.15s tps=1013.375
+hc-ab tile16 3 pt=16366 ttft=15.90s tps=1029.308
+hc-ab tile16 4 pt=16366 ttft=15.92s tps=1028.015
+START hc-ab 2 tile16 {'QWEN4EXP_HC_TILE16': '1'} chunk 16384
+hc-ab tile16 warmup pt=16366 ttft=18.39s tps=889.940
+hc-ab tile16 1 pt=16366 ttft=16.61s tps=985.310
+hc-ab tile16 2 pt=16366 ttft=15.91s tps=1028.661
+hc-ab tile16 3 pt=16366 ttft=15.89s tps=1029.956
+hc-ab tile16 4 pt=16366 ttft=15.92s tps=1028.015
+START hc-ab 3 control {} chunk 16384
+hc-ab control warmup pt=16366 ttft=19.38s tps=844.479
+hc-ab control 1 pt=16366 ttft=17.13s tps=955.400
+hc-ab control 2 pt=16366 ttft=17.00s tps=962.706
+hc-ab control 3 pt=16366 ttft=16.47s tps=993.685
+hc-ab control 4 pt=16366 ttft=16.42s tps=996.711
+RESULT control n 8 min 945.465049104564 median 991.5827685675249 best 998.535692495424
+RESULT tile16 n 8 min 985.3100541842264 median 1028.0150753768844 best 1029.9559471365637

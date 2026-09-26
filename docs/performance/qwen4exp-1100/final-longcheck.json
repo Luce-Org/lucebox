@@ -1,0 +1,16 @@
+[
+  {
+    "plant_position": 0,
+    "prompt_tokens": 16366,
+    "text": "QUINCE-AMBER-7731",
+    "seconds": 15.982506888991338,
+    "ok": true
+  },
+  {
+    "plant_position": 339,
+    "prompt_tokens": 16366,
+    "text": "calibration key for the Strix Halo test rig is QUINCE-AMBER-7731",
+    "seconds": 16.21749956900021,
+    "ok": true
+  }
+]

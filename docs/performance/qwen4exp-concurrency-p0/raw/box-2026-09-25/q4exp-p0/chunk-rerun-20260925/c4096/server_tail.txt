@@ -1,0 +1,8 @@
+[server] chat START chatcmpl_0000000000000000 format=chat stream=true prompt_tokens=29922 max_tokens=1 tools=0
+[server] chat CACHE chatcmpl_0000000000000000 restore=false slot=-1 prefix_len=0 effective_prompt=29922 pflash=false disk_policy=full disk_hit=false snap_slot=0 snap_pos=29916 full_snap_slot=-1 full_snap_pos=0
+[server] request path=/v1/chat/completions body_bytes=221
+[server] chat chatcmpl_0000000000000001 format=chat stream=true msgs=1 tools=0 prompt_tokens=41 max_tokens=64 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat DONE chatcmpl_0000000000000000 ok=true in=29922 effective_in=29922 out=1 53.5s 0.0 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=53.5s decode=0.0s(634.1tok/s) error=- detail=-
+[server] chat START chatcmpl_0000000000000001 format=chat stream=true prompt_tokens=41 max_tokens=64 tools=0
+[server] chat CACHE chatcmpl_0000000000000001 restore=false slot=-1 prefix_len=0 effective_prompt=41 pflash=false disk_policy=full disk_hit=false snap_slot=1 snap_pos=35 full_snap_slot=-1 full_snap_pos=0
+[server] chat DONE chatcmpl_0000000000000001 ok=true in=41 effective_in=41 out=64 2.5s 25.9 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=0.3s decode=2.2s(29.4tok/s) error=- detail=-

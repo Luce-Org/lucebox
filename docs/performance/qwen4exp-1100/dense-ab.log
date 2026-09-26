@@ -1,0 +1,26 @@
+START dense-table 0 control {} chunk 16384
+dense-table control warmup pt=16366 ttft=18.25s tps=896.767
+dense-table control 1 pt=16366 ttft=16.86s tps=970.700
+dense-table control 2 pt=16366 ttft=16.84s tps=971.853
+dense-table control 3 pt=16366 ttft=16.84s tps=971.853
+dense-table control 4 pt=16366 ttft=16.84s tps=971.853
+START dense-table 1 table {'QWEN4EXP_DENSE_TABLE': '1'} chunk 16384
+dense-table table warmup pt=16366 ttft=16.99s tps=963.273
+dense-table table 1 pt=16366 ttft=16.13s tps=1014.631
+dense-table table 2 pt=16366 ttft=15.78s tps=1037.136
+dense-table table 3 pt=16366 ttft=15.69s tps=1043.085
+dense-table table 4 pt=16366 ttft=15.67s tps=1044.416
+START dense-table 2 table {'QWEN4EXP_DENSE_TABLE': '1'} chunk 16384
+dense-table table warmup pt=16366 ttft=18.20s tps=899.231
+dense-table table 1 pt=16366 ttft=16.38s tps=999.145
+dense-table table 2 pt=16366 ttft=15.88s tps=1030.605
+dense-table table 3 pt=16366 ttft=15.88s tps=1030.605
+dense-table table 4 pt=16366 ttft=15.73s tps=1040.432
+START dense-table 3 control {} chunk 16384
+dense-table control warmup pt=16366 ttft=20.97s tps=780.448
+dense-table control 1 pt=16366 ttft=16.65s tps=982.943
+dense-table control 2 pt=16366 ttft=16.48s tps=993.083
+dense-table control 3 pt=16366 ttft=16.34s tps=1001.591
+dense-table control 4 pt=16366 ttft=16.61s tps=985.310
+RESULT control n 8 min 970.699881376038 median 977.3978372671959 best 1001.5911872705018
+RESULT table n 8 min 999.1452991452992 median 1033.8700743535962 best 1044.416081684748

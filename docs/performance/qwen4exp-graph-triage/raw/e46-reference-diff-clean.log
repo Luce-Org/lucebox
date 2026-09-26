@@ -1,0 +1,75 @@
++ g++ -O2 -I/home/duster/llama-qwen4/include -I/home/duster/llama-qwen4/ggml/include /tmp/qwen4exp_upstream_nodes.cpp -L/home/duster/llama-qwen4/build/bin -lllama -lggml -lggml-base -Wl,-rpath,/home/duster/llama-qwen4/build/bin -o /tmp/qwen4exp_nodes_up
++ /tmp/qwen4exp_nodes_up /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf 16
++ /home/duster/lucebox-qwen4exp/server/build-hip-graphs-t14/smoke_qwen4exp_forward /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf 16
+[tokens] OK: upstream first/last = 13/118798, matches synthetic recipe; ours uses the same input (source-verified)
+
+=== ffn_out (upstream) vs L%02d.moe (ours) ===
+L00  n=40960/40960  absmax up=0.35476 ours=0.35476 ratio=1.0000  mean up=0.00043193 ours=0.00043193 drift=0.0000
+L01  n=40960/40960  absmax up=0.22226 ours=0.22226 ratio=1.0000  mean up=0.00012875 ours=0.00012875 drift=0.0000
+L02  n=40960/40960  absmax up=0.10521 ours=0.10521 ratio=1.0000  mean up=0.00031678 ours=0.00031678 drift=0.0000
+L03  n=40960/40960  absmax up=0.054243 ours=0.054243 ratio=1.0000  mean up=7.0731e-05 ours=7.0731e-05 drift=0.0000
+L04  n=40960/40960  absmax up=0.10578 ours=0.10578 ratio=1.0000  mean up=0.00011148 ours=0.00011148 drift=0.0000
+L05  n=40960/40960  absmax up=0.094318 ours=0.094318 ratio=1.0000  mean up=0.00059365 ours=0.00059365 drift=0.0000
+L06  n=40960/40960  absmax up=0.081688 ours=0.081688 ratio=1.0000  mean up=0.00012736 ours=0.00012736 drift=0.0000
+L07  n=40960/40960  absmax up=0.093433 ours=0.093433 ratio=1.0000  mean up=0.00025934 ours=0.00025934 drift=0.0000
+L08  n=40960/40960  absmax up=0.10889 ours=0.10889 ratio=1.0000  mean up=-0.00010649 ours=-0.00010649 drift=0.0000
+L09  n=40960/40960  absmax up=0.056037 ours=0.056037 ratio=1.0000  mean up=5.226e-06 ours=5.226e-06 drift=0.0000
+L10  n=40960/40960  absmax up=0.31705 ours=0.31705 ratio=1.0000  mean up=-8.1724e-05 ours=-8.1724e-05 drift=0.0000
+L11  n=40960/40960  absmax up=0.060558 ours=0.060558 ratio=1.0000  mean up=-5.1323e-05 ours=-5.1323e-05 drift=0.0000
+L12  n=40960/40960  absmax up=0.052917 ours=0.052917 ratio=1.0000  mean up=2.0966e-05 ours=2.0966e-05 drift=0.0000
+L13  n=40960/40960  absmax up=0.15835 ours=0.15835 ratio=1.0000  mean up=0.00013121 ours=0.00013121 drift=0.0000
+L14  n=40960/40960  absmax up=0.13365 ours=0.13365 ratio=1.0000  mean up=1.3558e-05 ours=1.3558e-05 drift=0.0000
+L15  n=40960/40960  absmax up=0.29284 ours=0.29284 ratio=1.0000  mean up=1.7402e-05 ours=1.7402e-05 drift=0.0000
+L16  n=40960/40960  absmax up=0.69491 ours=0.69491 ratio=1.0000  mean up=6.4728e-05 ours=6.4728e-05 drift=0.0000
+L17  n=40960/40960  absmax up=0.19059 ours=0.19059 ratio=1.0000  mean up=8.9461e-05 ours=8.9461e-05 drift=0.0000
+L18  n=40960/40960  absmax up=0.059126 ours=0.059126 ratio=1.0000  mean up=-0.00015282 ours=-0.00015282 drift=0.0000
+L19  n=40960/40960  absmax up=0.094034 ours=0.094034 ratio=1.0000  mean up=0.00034801 ours=0.00034801 drift=0.0000
+L20  n=40960/40960  absmax up=0.089988 ours=0.089988 ratio=1.0000  mean up=2.4846e-05 ours=2.4846e-05 drift=0.0000
+L21  n=40960/40960  absmax up=0.069395 ours=0.069395 ratio=1.0000  mean up=0.00017092 ours=0.00017092 drift=0.0000
+L22  n=40960/40960  absmax up=0.11344 ours=0.11344 ratio=1.0000  mean up=1.3847e-05 ours=1.3847e-05 drift=0.0000
+L23  n=40960/40960  absmax up=0.089951 ours=0.089951 ratio=1.0000  mean up=-2.5676e-05 ours=-2.5676e-05 drift=0.0000
+L24  n=40960/40960  absmax up=0.56808 ours=0.56808 ratio=1.0000  mean up=0.00014961 ours=0.00014961 drift=0.0000
+L25  n=40960/40960  absmax up=0.047753 ours=0.047753 ratio=1.0000  mean up=2.5522e-05 ours=2.5522e-05 drift=0.0000
+L26  n=40960/40960  absmax up=0.60901 ours=0.60901 ratio=1.0000  mean up=-5.1901e-05 ours=-5.1901e-05 drift=0.0000
+L27  n=40960/40960  absmax up=0.058203 ours=0.058203 ratio=1.0000  mean up=0.0002455 ours=0.0002455 drift=0.0000
+L28  n=40960/40960  absmax up=0.13372 ours=0.13372 ratio=1.0000  mean up=-7.4119e-05 ours=-7.4119e-05 drift=0.0000
+L29  n=40960/40960  absmax up=0.15117 ours=0.15117 ratio=1.0000  mean up=0.00012448 ours=0.00012448 drift=0.0000
+L30  n=40960/40960  absmax up=0.070623 ours=0.070623 ratio=1.0000  mean up=0.00013674 ours=0.00013674 drift=0.0000
+L31  n=40960/40960  absmax up=0.10441 ours=0.10441 ratio=1.0000  mean up=0.00021806 ours=0.00021806 drift=0.0000
+L32  n=40960/40960  absmax up=0.37851 ours=0.37851 ratio=1.0000  mean up=8.5089e-05 ours=8.5089e-05 drift=0.0000
+L33  n=40960/40960  absmax up=0.070063 ours=0.070063 ratio=1.0000  mean up=-4.5033e-05 ours=-4.5033e-05 drift=0.0000
+L34  n=40960/40960  absmax up=0.14382 ours=0.14382 ratio=1.0000  mean up=0.00029486 ours=0.00029486 drift=0.0000
+L35  n=40960/40960  absmax up=0.15308 ours=0.15308 ratio=1.0000  mean up=0.00073038 ours=0.00073038 drift=0.0000
+L36  n=40960/40960  absmax up=0.22495 ours=0.22495 ratio=1.0000  mean up=0.0006028 ours=0.0006028 drift=0.0000
+L37  n=40960/40960  absmax up=0.17562 ours=0.17562 ratio=1.0000  mean up=0.00028218 ours=0.00028218 drift=0.0000
+L38  n=40960/40960  absmax up=0.21001 ours=0.21001 ratio=1.0000  mean up=6.1094e-06 ours=6.1094e-06 drift=0.0000
+L39  n=40960/40960  absmax up=0.4363 ours=0.4363 ratio=1.0000  mean up=0.00031165 ours=0.00031165 drift=0.0000
+L40  n=40960/40960  absmax up=0.20732 ours=0.20732 ratio=1.0000  mean up=4.3997e-05 ours=4.3997e-05 drift=0.0000
+L41  n=40960/40960  absmax up=0.15664 ours=0.15664 ratio=1.0000  mean up=-0.00017022 ours=-0.00017022 drift=0.0000
+L42  n=40960/40960  absmax up=0.22779 ours=0.22779 ratio=1.0000  mean up=0.00051773 ours=0.00051773 drift=0.0000
+L43  n=40960/40960  absmax up=0.19925 ours=0.19925 ratio=1.0000  mean up=0.00028799 ours=0.00028799 drift=0.0000
+L44  n=40960/40960  absmax up=0.27237 ours=0.27237 ratio=1.0000  mean up=5.5395e-05 ours=5.5395e-05 drift=0.0000
+L45  n=40960/40960  absmax up=0.25372 ours=0.25372 ratio=1.0000  mean up=-0.00066474 ours=-0.00066474 drift=0.0000
+L46  n=40960/40960  absmax up=0.32734 ours=0.32734 ratio=1.0000  mean up=-0.00026988 ours=-0.00026988 drift=0.0000
+L47  n=2560/2560  absmax up=0.56771 ours=0.56771 ratio=1.0000  mean up=-0.00065209 ours=-0.00065209 drift=0.0000
+
+=== attn_output (upstream) vs L%02d.att (ours) ===
+  (scope: 12 full-attention layers; 36 linear-attention layers excluded: upstream attn_output there is the pre-projection tensor, ours att is post-projection)
+L03  n=40960/40960  absmax up=0.92088 ours=0.92088 ratio=1.0000  mean up=-0.0031026 ours=-0.0031026 drift=0.0000
+L07  n=40960/40960  absmax up=2.4454 ours=2.4454 ratio=1.0000  mean up=0.0015229 ours=0.0015229 drift=0.0000
+L11  n=40960/40960  absmax up=2.7891 ours=2.7891 ratio=1.0000  mean up=-0.00073435 ours=-0.00073435 drift=0.0000
+L15  n=40960/40960  absmax up=1.321 ours=1.321 ratio=1.0000  mean up=-0.0022271 ours=-0.0022271 drift=0.0000
+L19  n=40960/40960  absmax up=1.6864 ours=1.6864 ratio=1.0000  mean up=0.00025727 ours=0.00025727 drift=0.0000
+L23  n=40960/40960  absmax up=0.70695 ours=0.70695 ratio=1.0000  mean up=0.0032501 ours=0.0032501 drift=0.0000
+L27  n=40960/40960  absmax up=3.4233 ours=3.4233 ratio=1.0000  mean up=-0.00074299 ours=-0.00074299 drift=0.0000
+L31  n=40960/40960  absmax up=0.75784 ours=0.75784 ratio=1.0000  mean up=-0.0013037 ours=-0.0013037 drift=0.0000
+L35  n=40960/40960  absmax up=0.77769 ours=0.77769 ratio=1.0000  mean up=0.0013312 ours=0.0013312 drift=0.0000
+L39  n=40960/40960  absmax up=0.561 ours=0.561 ratio=1.0000  mean up=0.00083159 ours=0.00083159 drift=0.0000
+L43  n=40960/40960  absmax up=0.53831 ours=0.53831 ratio=1.0000  mean up=0.0017151 ours=0.0017151 drift=0.0000
+L47  n=40960/40960  absmax up=2.9074 ours=2.9074 ratio=1.0000  mean up=-0.0024683 ours=-0.0024683 drift=0.0000
+[ids] ERROR: missing expert-id layers
+
+(note) res<->l_last alignment removed: ours L%02d.res is the packed [n_embd,hc,T,2] stream, not the wide residual
+(note) a single run per engine cannot separate FP noise from divergence; ratios within the A-A noise floor (see --calibrate) are not evidence of drift
+
+No onset (informational): all aligned pairs within [0.99,1.01]

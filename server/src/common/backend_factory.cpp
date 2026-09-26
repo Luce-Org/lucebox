@@ -8,6 +8,7 @@
 #include "qwen35_backend.h"
 #include "qwen35moe_backend.h"
 #include "bailingmoe3_backend.h"
+#include "qwen4exp_backend.h"
 #include "laguna_backend.h"
 #include "laguna_layer_split_adapter.h"
 #include "qwen3_backend.h"
@@ -97,6 +98,7 @@ constexpr bool layer_split_carries(FeatureSupport support) {
 LUCE_CHECK_ARCH("qwen35",    Qwen35Config,          Qwen35LayerSplitAdapterConfig);
 LUCE_CHECK_ARCH("qwen35moe", Qwen35Config,          NoLayerSplitConfig);
 LUCE_CHECK_ARCH("bailingmoe3", BailingMoe3Config,   NoLayerSplitConfig);
+LUCE_CHECK_ARCH("qwen4exp",   Qwen4ExpBackendConfig, NoLayerSplitConfig);
 LUCE_CHECK_ARCH("laguna",    LagunaBackendArgs,     LagunaLayerSplitAdapterConfig);
 LUCE_CHECK_ARCH("qwen3",     Qwen3BackendConfig,    NoLayerSplitConfig);
 LUCE_CHECK_ARCH("gemma4",    Gemma4BackendConfig,   Gemma4LayerSplitAdapterConfig);
@@ -130,6 +132,8 @@ static_assert(std::is_same_v<
     std::optional<std::string>>);
 static_assert(std::is_same_v<
     decltype(BailingMoe3Config{}.model_path), std::string>);
+static_assert(std::is_same_v<
+    decltype(Qwen4ExpBackendConfig{}.model_path), std::string>);
 static_assert(std::is_same_v<
     decltype(LagunaBackendArgs{}.target_path), std::string>);
 static_assert(std::is_same_v<
@@ -262,6 +266,21 @@ std::unique_ptr<ModelBackend> construct_backend(
         auto backend = std::make_unique<BailingMoe3Backend>(std::move(cfg));
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] BailingMoe3Backend init failed\n");
+            return nullptr;
+        }
+        return backend;
+
+    } else if (arch == "qwen4exp") {
+        Qwen4ExpBackendConfig cfg;
+        cfg.model_path = model.path;
+        cfg.device = placement.target;
+        cfg.stream_fd = execution.stream_fd;
+        if (execution.chunk > 0) cfg.chunk = execution.chunk;
+        cfg.max_concurrency = execution.max_concurrency;
+
+        auto backend = std::make_unique<Qwen4ExpBackend>(std::move(cfg));
+        if (!backend->init()) {
+            std::fprintf(stderr, "[backend_factory] Qwen4ExpBackend init failed\n");
             return nullptr;
         }
         return backend;

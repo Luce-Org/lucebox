@@ -1,0 +1,657 @@
+[server] load balancing disabled; primary=dflash target=hip:0
+[server] loading tokenizer from /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf
+[tokenizer] added_tokens: 33 special tokens
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 eot=248046 pre=qwen35 sp=no
+[server] creating backend...
+[backend_factory] detected arch=qwen4exp
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 98304 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 98304 MiB
+[qwen4exp] qwen4exp trunk loaded: 48 layers (36 linear + 12 full), 1222 tensors 66.24 GiB from 3 shard(s), experts=10/512 hc=4/320 ple_layers=1 ngram=3 heads_per_ngram=8 table_rows=320001536 eos=248046
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (DFLASH_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[server] gguf meta: general.name='Qwen3.8 Flash Next' general.architecture='qwen4exp'
+[model_card] using cards dir: /home/duster/lucebox-qwen4exp/server/build-hip-graphs-t14/../../share/model_cards
+[model_card] probing sidecar: /home/duster/lucebox-qwen4exp/server/build-hip-graphs-t14/../../share/model_cards/qwen3.8-flash-next.json (from general.name='Qwen3.8 Flash Next')
+[model_card] sidecar not found at /home/duster/lucebox-qwen4exp/server/build-hip-graphs-t14/../../share/model_cards/qwen3.8-flash-next.json
+[model_card] using family fallback for arch='qwen4exp'
+[server] effort-tier ceiling = max_ctx(32768) - hard_limit_reply_budget(4096) = 28672
+
+[server] ╭─── Configuration ───────────────────────────────────╮
+[server] │  host            = 127.0.0.1
+[server] │  port            = 18845
+[server] │  model           = /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf
+[server] │  draft           = (none)
+[server] │  model_name      = dflash
+[server] │  max_ctx         = 32768
+[server] │  model_card      = family:qwen4exp
+[server] │  max_tokens      = 32768 (family:qwen4exp)
+[server] │  think_max_tokens= 28672 (family:qwen4exp)
+[server] │  hard_limit_reply= 4096 (family:qwen4exp)
+[server] │  effort tiers    = low=3584 (family:qwen4exp)
+[server] │                    medium=14336 (family:qwen4exp)
+[server] │                    high=28672 (family:qwen4exp)
+[server] │                    x-high=28672 (family:qwen4exp)
+[server] │                    max=28672 (family:qwen4exp)
+[server] │  target_device   = hip:0
+[server] │  target_split    = layer
+[server] │  draft_device    = auto:0
+[server] │  draft_exec      = local
+[server] │  peer_access     = off
+[server] │  chunk           = 16384
+[server] │  admission_wait  = 20 ms
+[server] │  fa_window       = 0
+[server] │  ddtree          = off
+[server] │  specla          = off
+[server] │  fast_rollback   = ON
+[server] │  ddtree_budget   = 22
+[server] │  prefix_cache    = 0 slots
+[server] │  agent_turn_cache= off
+[server] │  prefill_cache   = 0 slots
+[server] │  cors            = ON
+[server] │  cache_type_k    = family default
+[server] │  cache_type_v    = family default
+[server] │  pflash          = off
+[server] │  draft_residency = auto
+[server] ╰─────────────────────────────────────────────────────╯
+
+[server] level-2 force-close (marker-only, 8 chars → 1 tokens, hard_limit_reply_budget = 4096)
+[server] level-2 force-close token ids: 248069
+[ppp] enabled=1 rearrange=0 lcp_window=8 min_pin=512 max_ephemeral=256
+[server] model dflash automatic decode KV offload budget: 0 bytes
+[server] listening on http://127.0.0.1:18845
+[server] request path=/v1/chat/completions body_bytes=568
+[server] chat chatcmpl_0000000000000000 format=chat stream=true msgs=1 tools=0 prompt_tokens=142 max_tokens=512 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000000 format=chat stream=true prompt_tokens=142 max_tokens=512 tools=0
+[server] chat CACHE chatcmpl_0000000000000000 restore=false slot=-1 prefix_len=0 effective_prompt=142 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[qwen4exp-stable] event=build bucket=512 nodes=5147
+[qwen4exp-stable] event=first bucket=512 calls=1
+[qwen4exp-stable] event=reuse bucket=512 calls=2
+[qwen4exp-stable] event=reuse bucket=512 calls=3
+[qwen4exp-stable] event=reuse bucket=512 calls=4
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=32 replay=30 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=64 replay=62 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=96 replay=94 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=128 replay=126 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=128
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=160 replay=158 capture=1 eager=1 enabled=1
+[server] chat DONE chatcmpl_0000000000000000 ok=true in=142 effective_in=142 out=173 6.8s 25.5 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.8s decode=5.9s(29.3tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=726
+[server] chat chatcmpl_0000000000000001 format=chat stream=true msgs=1 tools=0 prompt_tokens=134 max_tokens=512 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000001 format=chat stream=true prompt_tokens=134 max_tokens=512 tools=0
+[server] chat CACHE chatcmpl_0000000000000001 restore=false slot=-1 prefix_len=0 effective_prompt=134 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=192 replay=190 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=224 replay=222 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=256 replay=254 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=256
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=288 replay=286 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=320 replay=318 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=352 replay=350 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=384 replay=382 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=384
+[server] chat DONE chatcmpl_0000000000000001 ok=true in=134 effective_in=134 out=230 8.3s 27.7 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.6s decode=7.7s(30.0tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=549
+[server] chat chatcmpl_0000000000000002 format=chat stream=true msgs=1 tools=0 prompt_tokens=103 max_tokens=512 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000002 format=chat stream=true prompt_tokens=103 max_tokens=512 tools=0
+[server] chat CACHE chatcmpl_0000000000000002 restore=false slot=-1 prefix_len=0 effective_prompt=103 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=416 replay=414 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=448 replay=446 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=480 replay=478 capture=1 eager=1 enabled=1
+[server] chat DONE chatcmpl_0000000000000002 ok=true in=103 effective_in=103 out=97 3.9s 25.1 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.7s decode=3.2s(30.3tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=669
+[server] chat chatcmpl_0000000000000003 format=chat stream=true msgs=1 tools=0 prompt_tokens=137 max_tokens=512 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000003 format=chat stream=true prompt_tokens=137 max_tokens=512 tools=0
+[server] chat CACHE chatcmpl_0000000000000003 restore=false slot=-1 prefix_len=0 effective_prompt=137 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=512 replay=510 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=512
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=544 replay=542 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=576 replay=574 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=608 replay=606 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=640 replay=638 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=640
+[server] chat DONE chatcmpl_0000000000000003 ok=true in=137 effective_in=137 out=157 5.9s 26.7 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.7s decode=5.2s(30.2tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=651
+[server] chat chatcmpl_0000000000000004 format=chat stream=true msgs=1 tools=0 prompt_tokens=136 max_tokens=512 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000004 format=chat stream=true prompt_tokens=136 max_tokens=512 tools=0
+[server] chat CACHE chatcmpl_0000000000000004 restore=false slot=-1 prefix_len=0 effective_prompt=136 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=672 replay=670 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=704 replay=702 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=736 replay=734 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=768 replay=766 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=768
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=800 replay=798 capture=1 eager=1 enabled=1
+[server] chat DONE chatcmpl_0000000000000004 ok=true in=136 effective_in=136 out=169 6.3s 27.0 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.6s decode=5.6s(30.1tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=506
+[server] chat chatcmpl_0000000000000005 format=chat stream=true msgs=1 tools=0 prompt_tokens=112 max_tokens=512 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000005 format=chat stream=true prompt_tokens=112 max_tokens=512 tools=0
+[server] chat CACHE chatcmpl_0000000000000005 restore=false slot=-1 prefix_len=0 effective_prompt=112 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=832 replay=830 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=864 replay=862 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=896 replay=894 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=896
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=928 replay=926 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=960 replay=958 capture=1 eager=1 enabled=1
+[server] chat DONE chatcmpl_0000000000000005 ok=true in=112 effective_in=112 out=152 5.7s 26.7 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.6s decode=5.0s(30.2tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=655
+[server] chat chatcmpl_0000000000000006 format=chat stream=true msgs=1 tools=0 prompt_tokens=132 max_tokens=512 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000006 format=chat stream=true prompt_tokens=132 max_tokens=512 tools=0
+[server] chat CACHE chatcmpl_0000000000000006 restore=false slot=-1 prefix_len=0 effective_prompt=132 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=992 replay=990 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1024 replay=1022 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=1024
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1056 replay=1054 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1088 replay=1086 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1120 replay=1118 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1152 replay=1150 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=1152
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1184 replay=1182 capture=1 eager=1 enabled=1
+[server] chat DONE chatcmpl_0000000000000006 ok=true in=132 effective_in=132 out=214 7.7s 27.7 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.6s decode=7.1s(30.1tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=549
+[server] chat chatcmpl_0000000000000007 format=chat stream=true msgs=1 tools=0 prompt_tokens=112 max_tokens=512 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000007 format=chat stream=true prompt_tokens=112 max_tokens=512 tools=0
+[server] chat CACHE chatcmpl_0000000000000007 restore=false slot=-1 prefix_len=0 effective_prompt=112 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1216 replay=1214 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1248 replay=1246 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1280 replay=1278 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=1280
+[server] chat DONE chatcmpl_0000000000000007 ok=true in=112 effective_in=112 out=112 4.4s 25.7 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.6s decode=3.7s(30.2tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=592
+[server] chat chatcmpl_0000000000000008 format=chat stream=true msgs=1 tools=0 prompt_tokens=134 max_tokens=512 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000008 format=chat stream=true prompt_tokens=134 max_tokens=512 tools=0
+[server] chat CACHE chatcmpl_0000000000000008 restore=false slot=-1 prefix_len=0 effective_prompt=134 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1312 replay=1310 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1344 replay=1342 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1376 replay=1374 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1408 replay=1406 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=1408
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1440 replay=1438 capture=1 eager=1 enabled=1
+[server] chat DONE chatcmpl_0000000000000008 ok=true in=134 effective_in=134 out=163 6.0s 27.0 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.6s decode=5.4s(30.1tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=499
+[server] chat chatcmpl_0000000000000009 format=chat stream=true msgs=1 tools=0 prompt_tokens=116 max_tokens=512 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000009 format=chat stream=true prompt_tokens=116 max_tokens=512 tools=0
+[server] chat CACHE chatcmpl_0000000000000009 restore=false slot=-1 prefix_len=0 effective_prompt=116 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1472 replay=1470 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1504 replay=1502 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1536 replay=1534 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=1536
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1568 replay=1566 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1600 replay=1598 capture=1 eager=1 enabled=1
+[server] chat DONE chatcmpl_0000000000000009 ok=true in=116 effective_in=116 out=158 5.9s 26.6 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.7s decode=5.2s(30.1tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=468
+[server] chat chatcmpl_000000000000000a format=chat stream=true msgs=1 tools=0 prompt_tokens=82 max_tokens=1024 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_000000000000000a format=chat stream=true prompt_tokens=82 max_tokens=1024 tools=0
+[server] chat CACHE chatcmpl_000000000000000a restore=false slot=-1 prefix_len=0 effective_prompt=82 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1632 replay=1630 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1664 replay=1662 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=1664
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1696 replay=1694 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1728 replay=1726 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1760 replay=1758 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1792 replay=1790 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=1792
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1824 replay=1822 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1856 replay=1854 capture=1 eager=1 enabled=1
+[server] chat DONE chatcmpl_000000000000000a ok=true in=82 effective_in=82 out=247 8.8s 28.2 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.5s decode=8.3s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=287
+[server] chat chatcmpl_000000000000000b format=chat stream=true msgs=1 tools=0 prompt_tokens=43 max_tokens=1024 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_000000000000000b format=chat stream=true prompt_tokens=43 max_tokens=1024 tools=0
+[server] chat CACHE chatcmpl_000000000000000b restore=false slot=-1 prefix_len=0 effective_prompt=43 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1888 replay=1886 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1920 replay=1918 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=1920
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1952 replay=1950 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=1984 replay=1982 capture=1 eager=1 enabled=1
+[server] chat DONE chatcmpl_000000000000000b ok=true in=43 effective_in=43 out=143 5.0s 28.4 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.3s decode=4.8s(30.0tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=361
+[server] chat chatcmpl_000000000000000c format=chat stream=true msgs=1 tools=0 prompt_tokens=72 max_tokens=1024 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_000000000000000c format=chat stream=true prompt_tokens=72 max_tokens=1024 tools=0
+[server] chat CACHE chatcmpl_000000000000000c restore=false slot=-1 prefix_len=0 effective_prompt=72 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2016 replay=2014 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2048 replay=2046 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=2048
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2080 replay=2078 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2112 replay=2110 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2144 replay=2142 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2176 replay=2174 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=2176
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2208 replay=2206 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2240 replay=2238 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2272 replay=2270 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2304 replay=2302 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=2304
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2336 replay=2334 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2368 replay=2366 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2400 replay=2398 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2432 replay=2430 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=512 calls=2432
+[qwen4exp-stable] event=rebuild old_bucket=512 new_bucket=1024
+[qwen4exp-stable] event=build bucket=1024 nodes=5147
+[qwen4exp-stable] event=first bucket=1024 calls=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=2
+[qwen4exp-stable] event=reuse bucket=1024 calls=3
+[qwen4exp-stable] event=reuse bucket=1024 calls=4
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2464 replay=2460 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2496 replay=2492 capture=2 eager=2 enabled=1
+[server] chat DONE chatcmpl_000000000000000c ok=true in=72 effective_in=72 out=519 17.8s 29.2 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.4s decode=17.4s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=302
+[server] chat chatcmpl_000000000000000d format=chat stream=true msgs=1 tools=0 prompt_tokens=51 max_tokens=1024 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_000000000000000d format=chat stream=true prompt_tokens=51 max_tokens=1024 tools=0
+[server] chat CACHE chatcmpl_000000000000000d restore=false slot=-1 prefix_len=0 effective_prompt=51 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2528 replay=2524 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2560 replay=2556 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=128
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2592 replay=2588 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2624 replay=2620 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2656 replay=2652 capture=2 eager=2 enabled=1
+[server] chat DONE chatcmpl_000000000000000d ok=true in=51 effective_in=51 out=153 5.4s 28.3 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.3s decode=5.1s(30.0tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=646
+[server] chat chatcmpl_000000000000000e format=chat stream=true msgs=1 tools=0 prompt_tokens=125 max_tokens=1024 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_000000000000000e format=chat stream=true prompt_tokens=125 max_tokens=1024 tools=0
+[server] chat CACHE chatcmpl_000000000000000e restore=false slot=-1 prefix_len=0 effective_prompt=125 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2688 replay=2684 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=256
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2720 replay=2716 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2752 replay=2748 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2784 replay=2780 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2816 replay=2812 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=384
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2848 replay=2844 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2880 replay=2876 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2912 replay=2908 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2944 replay=2940 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=512
+[server] chat DONE chatcmpl_000000000000000e ok=true in=125 effective_in=125 out=283 10.2s 27.8 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.7s decode=9.5s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=386
+[server] chat chatcmpl_000000000000000f format=chat stream=true msgs=1 tools=0 prompt_tokens=72 max_tokens=1024 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_000000000000000f format=chat stream=true prompt_tokens=72 max_tokens=1024 tools=0
+[server] chat CACHE chatcmpl_000000000000000f restore=false slot=-1 prefix_len=0 effective_prompt=72 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=2976 replay=2972 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3008 replay=3004 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3040 replay=3036 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3072 replay=3068 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=640
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3104 replay=3100 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3136 replay=3132 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3168 replay=3164 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3200 replay=3196 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=768
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3232 replay=3228 capture=2 eager=2 enabled=1
+[server] chat DONE chatcmpl_000000000000000f ok=true in=72 effective_in=72 out=303 10.6s 28.6 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.4s decode=10.1s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=370
+[server] chat chatcmpl_0000000000000010 format=chat stream=true msgs=1 tools=0 prompt_tokens=58 max_tokens=1024 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000010 format=chat stream=true prompt_tokens=58 max_tokens=1024 tools=0
+[server] chat CACHE chatcmpl_0000000000000010 restore=false slot=-1 prefix_len=0 effective_prompt=58 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3264 replay=3260 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3296 replay=3292 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3328 replay=3324 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=896
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3360 replay=3356 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3392 replay=3388 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3424 replay=3420 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3456 replay=3452 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=1024
+[server] chat DONE chatcmpl_0000000000000010 ok=true in=58 effective_in=58 out=216 7.6s 28.6 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.3s decode=7.2s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=470
+[server] chat chatcmpl_0000000000000011 format=chat stream=true msgs=1 tools=0 prompt_tokens=87 max_tokens=1024 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000011 format=chat stream=true prompt_tokens=87 max_tokens=1024 tools=0
+[server] chat CACHE chatcmpl_0000000000000011 restore=false slot=-1 prefix_len=0 effective_prompt=87 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3488 replay=3484 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3520 replay=3516 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3552 replay=3548 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3584 replay=3580 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=1152
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3616 replay=3612 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3648 replay=3644 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3680 replay=3676 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3712 replay=3708 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=1280
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3744 replay=3740 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3776 replay=3772 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3808 replay=3804 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3840 replay=3836 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=1408
+[server] chat DONE chatcmpl_0000000000000011 ok=true in=87 effective_in=87 out=399 13.9s 28.7 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.5s decode=13.4s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=496
+[server] chat chatcmpl_0000000000000012 format=chat stream=true msgs=1 tools=0 prompt_tokens=96 max_tokens=1024 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000012 format=chat stream=true prompt_tokens=96 max_tokens=1024 tools=0
+[server] chat CACHE chatcmpl_0000000000000012 restore=false slot=-1 prefix_len=0 effective_prompt=96 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3872 replay=3868 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3904 replay=3900 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3936 replay=3932 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=3968 replay=3964 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=1536
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4000 replay=3996 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4032 replay=4028 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4064 replay=4060 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4096 replay=4092 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=1664
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4128 replay=4124 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4160 replay=4156 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4192 replay=4188 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4224 replay=4220 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=1792
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4256 replay=4252 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4288 replay=4284 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4320 replay=4316 capture=2 eager=2 enabled=1
+[server] chat DONE chatcmpl_0000000000000012 ok=true in=96 effective_in=96 out=465 16.1s 28.9 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.5s decode=15.6s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=408
+[server] chat chatcmpl_0000000000000013 format=chat stream=true msgs=1 tools=0 prompt_tokens=78 max_tokens=1024 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000013 format=chat stream=true prompt_tokens=78 max_tokens=1024 tools=0
+[server] chat CACHE chatcmpl_0000000000000013 restore=false slot=-1 prefix_len=0 effective_prompt=78 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4352 replay=4348 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=1920
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4384 replay=4380 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4416 replay=4412 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4448 replay=4444 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4480 replay=4476 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=2048
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4512 replay=4508 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4544 replay=4540 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4576 replay=4572 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4608 replay=4604 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=2176
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4640 replay=4636 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4672 replay=4668 capture=2 eager=2 enabled=1
+[server] chat DONE chatcmpl_0000000000000013 ok=true in=78 effective_in=78 out=339 11.8s 28.8 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.4s decode=11.3s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=290
+[server] chat chatcmpl_0000000000000014 format=chat stream=true msgs=1 tools=0 prompt_tokens=47 max_tokens=2048 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000014 format=chat stream=true prompt_tokens=47 max_tokens=2048 tools=0
+[server] chat CACHE chatcmpl_0000000000000014 restore=false slot=-1 prefix_len=0 effective_prompt=47 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4704 replay=4700 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4736 replay=4732 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=2304
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4768 replay=4764 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4800 replay=4796 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4832 replay=4828 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4864 replay=4860 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=2432
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4896 replay=4892 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4928 replay=4924 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4960 replay=4956 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=4992 replay=4988 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=2560
+[server] chat DONE chatcmpl_0000000000000014 ok=true in=47 effective_in=47 out=332 11.4s 29.1 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.3s decode=11.1s(29.8tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=322
+[server] chat chatcmpl_0000000000000015 format=chat stream=true msgs=1 tools=0 prompt_tokens=70 max_tokens=2048 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000015 format=chat stream=true prompt_tokens=70 max_tokens=2048 tools=0
+[server] chat CACHE chatcmpl_0000000000000015 restore=false slot=-1 prefix_len=0 effective_prompt=70 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5024 replay=5020 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5056 replay=5052 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5088 replay=5084 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5120 replay=5116 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=2688
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5152 replay=5148 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5184 replay=5180 capture=2 eager=2 enabled=1
+[server] chat DONE chatcmpl_0000000000000015 ok=true in=70 effective_in=70 out=211 7.5s 28.2 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.4s decode=7.1s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=392
+[server] chat chatcmpl_0000000000000016 format=chat stream=true msgs=1 tools=0 prompt_tokens=69 max_tokens=2048 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000016 format=chat stream=true prompt_tokens=69 max_tokens=2048 tools=0
+[server] chat CACHE chatcmpl_0000000000000016 restore=false slot=-1 prefix_len=0 effective_prompt=69 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5216 replay=5212 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5248 replay=5244 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=2816
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5280 replay=5276 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5312 replay=5308 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5344 replay=5340 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5376 replay=5372 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=2944
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5408 replay=5404 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5440 replay=5436 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5472 replay=5468 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5504 replay=5500 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=3072
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5536 replay=5532 capture=2 eager=2 enabled=1
+[server] chat DONE chatcmpl_0000000000000016 ok=true in=69 effective_in=69 out=340 11.8s 28.8 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.4s decode=11.4s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=413
+[server] chat chatcmpl_0000000000000017 format=chat stream=true msgs=1 tools=0 prompt_tokens=102 max_tokens=2048 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000017 format=chat stream=true prompt_tokens=102 max_tokens=2048 tools=0
+[server] chat CACHE chatcmpl_0000000000000017 restore=false slot=-1 prefix_len=0 effective_prompt=102 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5568 replay=5564 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5600 replay=5596 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5632 replay=5628 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=3200
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5664 replay=5660 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5696 replay=5692 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5728 replay=5724 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5760 replay=5756 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=3328
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5792 replay=5788 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5824 replay=5820 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5856 replay=5852 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5888 replay=5884 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=3456
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5920 replay=5916 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5952 replay=5948 capture=2 eager=2 enabled=1
+[server] chat DONE chatcmpl_0000000000000017 ok=true in=102 effective_in=102 out=422 14.7s 28.6 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.6s decode=14.1s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=321
+[server] chat chatcmpl_0000000000000018 format=chat stream=true msgs=1 tools=0 prompt_tokens=61 max_tokens=2048 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000018 format=chat stream=true prompt_tokens=61 max_tokens=2048 tools=0
+[server] chat CACHE chatcmpl_0000000000000018 restore=false slot=-1 prefix_len=0 effective_prompt=61 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=5984 replay=5980 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6016 replay=6012 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=3584
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6048 replay=6044 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6080 replay=6076 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6112 replay=6108 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6144 replay=6140 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=3712
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6176 replay=6172 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6208 replay=6204 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6240 replay=6236 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6272 replay=6268 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=3840
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6304 replay=6300 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6336 replay=6332 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6368 replay=6364 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6400 replay=6396 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=3968
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6432 replay=6428 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6464 replay=6460 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6496 replay=6492 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6528 replay=6524 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=4096
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6560 replay=6556 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6592 replay=6588 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6624 replay=6620 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6656 replay=6652 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=4224
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6688 replay=6684 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6720 replay=6716 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6752 replay=6748 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6784 replay=6780 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=4352
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6816 replay=6812 capture=2 eager=2 enabled=1
+[server] chat DONE chatcmpl_0000000000000018 ok=true in=61 effective_in=61 out=846 28.7s 29.5 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.3s decode=28.3s(29.8tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=296
+[server] chat chatcmpl_0000000000000019 format=chat stream=true msgs=1 tools=0 prompt_tokens=51 max_tokens=2048 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000019 format=chat stream=true prompt_tokens=51 max_tokens=2048 tools=0
+[server] chat CACHE chatcmpl_0000000000000019 restore=false slot=-1 prefix_len=0 effective_prompt=51 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6848 replay=6844 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6880 replay=6876 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6912 replay=6908 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=4480
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6944 replay=6940 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=6976 replay=6972 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7008 replay=7004 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7040 replay=7036 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=4608
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7072 replay=7068 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7104 replay=7100 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7136 replay=7132 capture=2 eager=2 enabled=1
+[server] chat DONE chatcmpl_0000000000000019 ok=true in=51 effective_in=51 out=344 11.8s 29.0 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.3s decode=11.5s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=295
+[server] chat chatcmpl_000000000000001a format=chat stream=true msgs=1 tools=0 prompt_tokens=56 max_tokens=2048 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_000000000000001a format=chat stream=true prompt_tokens=56 max_tokens=2048 tools=0
+[server] chat CACHE chatcmpl_000000000000001a restore=false slot=-1 prefix_len=0 effective_prompt=56 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7168 replay=7164 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=4736
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7200 replay=7196 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7232 replay=7228 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7264 replay=7260 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7296 replay=7292 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=4864
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7328 replay=7324 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7360 replay=7356 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7392 replay=7388 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7424 replay=7420 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=4992
+[server] chat DONE chatcmpl_000000000000001a ok=true in=56 effective_in=56 out=287 9.9s 28.9 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.3s decode=9.6s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=316
+[server] chat chatcmpl_000000000000001b format=chat stream=true msgs=1 tools=0 prompt_tokens=64 max_tokens=2048 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_000000000000001b format=chat stream=true prompt_tokens=64 max_tokens=2048 tools=0
+[server] chat CACHE chatcmpl_000000000000001b restore=false slot=-1 prefix_len=0 effective_prompt=64 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7456 replay=7452 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7488 replay=7484 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7520 replay=7516 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7552 replay=7548 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=5120
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7584 replay=7580 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7616 replay=7612 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7648 replay=7644 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7680 replay=7676 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=5248
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7712 replay=7708 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7744 replay=7740 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7776 replay=7772 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7808 replay=7804 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=5376
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7840 replay=7836 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7872 replay=7868 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7904 replay=7900 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7936 replay=7932 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=5504
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=7968 replay=7964 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8000 replay=7996 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8032 replay=8028 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8064 replay=8060 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=5632
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8096 replay=8092 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8128 replay=8124 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8160 replay=8156 capture=2 eager=2 enabled=1
+[server] chat DONE chatcmpl_000000000000001b ok=true in=64 effective_in=64 out=728 24.7s 29.5 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.3s decode=24.4s(29.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=293
+[server] chat chatcmpl_000000000000001c format=chat stream=true msgs=1 tools=0 prompt_tokens=43 max_tokens=2048 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_000000000000001c format=chat stream=true prompt_tokens=43 max_tokens=2048 tools=0
+[server] chat CACHE chatcmpl_000000000000001c restore=false slot=-1 prefix_len=0 effective_prompt=43 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8192 replay=8188 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=5760
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8224 replay=8220 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8256 replay=8252 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8288 replay=8284 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8320 replay=8316 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=5888
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8352 replay=8348 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8384 replay=8380 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8416 replay=8412 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8448 replay=8444 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=6016
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8480 replay=8476 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8512 replay=8508 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8544 replay=8540 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8576 replay=8572 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=6144
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8608 replay=8604 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8640 replay=8636 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8672 replay=8668 capture=2 eager=2 enabled=1
+[server] chat DONE chatcmpl_000000000000001c ok=true in=43 effective_in=43 out=504 17.1s 29.4 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.3s decode=16.9s(29.8tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=402
+[server] chat chatcmpl_000000000000001d format=chat stream=true msgs=1 tools=0 prompt_tokens=103 max_tokens=2048 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_000000000000001d format=chat stream=true prompt_tokens=103 max_tokens=2048 tools=0
+[server] chat CACHE chatcmpl_000000000000001d restore=false slot=-1 prefix_len=0 effective_prompt=103 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8704 replay=8700 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=6272
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8736 replay=8732 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8768 replay=8764 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8800 replay=8796 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8832 replay=8828 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=6400
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8864 replay=8860 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8896 replay=8892 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8928 replay=8924 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8960 replay=8956 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=6528
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=8992 replay=8988 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9024 replay=9020 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9056 replay=9052 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9088 replay=9084 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=6656
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9120 replay=9116 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9152 replay=9148 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9184 replay=9180 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9216 replay=9212 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=6784
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9248 replay=9244 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9280 replay=9276 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9312 replay=9308 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9344 replay=9340 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=6912
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9376 replay=9372 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9408 replay=9404 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9440 replay=9436 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9472 replay=9468 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=1024 calls=7040
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9504 replay=9500 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9536 replay=9532 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9568 replay=9564 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=rebuild old_bucket=1024 new_bucket=1536
+[qwen4exp-stable] event=build bucket=1536 nodes=5147
+[qwen4exp-stable] event=first bucket=1536 calls=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9600 replay=9594 capture=3 eager=3 enabled=1
+[qwen4exp-stable] event=reuse bucket=1536 calls=2
+[qwen4exp-stable] event=reuse bucket=1536 calls=3
+[qwen4exp-stable] event=reuse bucket=1536 calls=4
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9632 replay=9626 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9664 replay=9658 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9696 replay=9690 capture=3 eager=3 enabled=1
+[qwen4exp-stable] event=reuse bucket=1536 calls=128
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9728 replay=9722 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9760 replay=9754 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9792 replay=9786 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9824 replay=9818 capture=3 eager=3 enabled=1
+[qwen4exp-stable] event=reuse bucket=1536 calls=256
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9856 replay=9850 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9888 replay=9882 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9920 replay=9914 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9952 replay=9946 capture=3 eager=3 enabled=1
+[qwen4exp-stable] event=reuse bucket=1536 calls=384
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=9984 replay=9978 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10016 replay=10010 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10048 replay=10042 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10080 replay=10074 capture=3 eager=3 enabled=1
+[qwen4exp-stable] event=reuse bucket=1536 calls=512
+[qwen4exp-stable] event=rebuild old_bucket=1536 new_bucket=2048
+[qwen4exp-stable] event=build bucket=2048 nodes=5147
+[qwen4exp-stable] event=first bucket=2048 calls=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10112 replay=10104 capture=4 eager=4 enabled=1
+[qwen4exp-stable] event=reuse bucket=2048 calls=2
+[qwen4exp-stable] event=reuse bucket=2048 calls=3
+[qwen4exp-stable] event=reuse bucket=2048 calls=4
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10144 replay=10136 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10176 replay=10168 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10208 replay=10200 capture=4 eager=4 enabled=1
+[qwen4exp-stable] event=reuse bucket=2048 calls=128
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10240 replay=10232 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10272 replay=10264 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10304 replay=10296 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10336 replay=10328 capture=4 eager=4 enabled=1
+[qwen4exp-stable] event=reuse bucket=2048 calls=256
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10368 replay=10360 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10400 replay=10392 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10432 replay=10424 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10464 replay=10456 capture=4 eager=4 enabled=1
+[qwen4exp-stable] event=reuse bucket=2048 calls=384
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10496 replay=10488 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10528 replay=10520 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10560 replay=10552 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10592 replay=10584 capture=4 eager=4 enabled=1
+[qwen4exp-stable] event=reuse bucket=2048 calls=512
+[qwen4exp-stable] event=rebuild old_bucket=2048 new_bucket=2560
+[qwen4exp-stable] event=build bucket=2560 nodes=5147
+[qwen4exp-stable] event=first bucket=2560 calls=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10624 replay=10614 capture=5 eager=5 enabled=1
+[qwen4exp-stable] event=reuse bucket=2560 calls=2
+[qwen4exp-stable] event=reuse bucket=2560 calls=3
+[qwen4exp-stable] event=reuse bucket=2560 calls=4
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10656 replay=10646 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10688 replay=10678 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x7845bb8d1c90 n_nodes=5147 total=10720 replay=10710 capture=5 eager=5 enabled=1
+[server] chat DONE chatcmpl_000000000000001d ok=true in=103 effective_in=103 out=2048 69.3s 29.6 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=0.6s decode=68.7s(29.8tok/s) error=- detail=-

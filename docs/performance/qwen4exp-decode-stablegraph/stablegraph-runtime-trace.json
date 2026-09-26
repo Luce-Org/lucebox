@@ -1,0 +1,43 @@
+{
+  "model": "iq4",
+  "kind": "decode",
+  "depth": 2048,
+  "warmup": {
+    "usage": {
+      "completion_tokens": 128,
+      "prompt_tokens": 1996,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 19048.8,
+        "decode_tokens_per_sec": 6.7,
+        "effective_prompt_tokens": 1996,
+        "prefill_ms": 3816.6,
+        "prefilled_tokens": 1996
+      },
+      "total_tokens": 2124
+    },
+    "ttft_s": 4.360130455010221,
+    "wall_s": 22.881422832011594
+  },
+  "measured": {
+    "usage": {
+      "completion_tokens": 128,
+      "prompt_tokens": 1996,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 19129.0,
+        "decode_tokens_per_sec": 6.7,
+        "effective_prompt_tokens": 1996,
+        "prefill_ms": 3032.0,
+        "prefilled_tokens": 1996
+      },
+      "total_tokens": 2124
+    },
+    "ttft_s": 3.6424188040109584,
+    "wall_s": 22.169364781002514
+  }
+}
