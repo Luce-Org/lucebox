@@ -1209,6 +1209,16 @@ void ggml_cuda_op_ds4_indexer_score(
 #endif
     {
         (void) wmma_capable;
+#if defined(GGML_USE_HIP) && !DS4_INDEXER_WMMA_AVAILABLE
+        // Built without rocWMMA 2.x headers: every score takes the scalar
+        // kernel, several times slower on long prompts. Say so once.
+        static bool warned = false;
+        if (!warned && warp_size == 32) {
+            warned = true;
+            GGML_LOG_WARN("%s: built without rocWMMA 2.x headers, the DS4 indexer scores on the "
+                          "scalar kernel (install rocwmma-dev and rebuild)\n", __func__);
+        }
+#endif
         const dim3 grid((unsigned) n_comp, (unsigned) n_tokens, 1);
         if (q->type == GGML_TYPE_F16) {
             ds4_indexer_score_scalar_kernel<true><<<grid, 256, 0, stream>>>(
