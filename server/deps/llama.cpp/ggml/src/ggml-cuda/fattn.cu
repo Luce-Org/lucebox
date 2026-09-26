@@ -343,13 +343,15 @@ __global__ static void ds4_fa_ratio4_causal_bounds_kernel(
         int   n_kv,
         int   raw_rows,
         int   raw_window,
-        int   kv_start) {
+        int   kv_start,
+        int   causal_ratio) {
     const int t = (int) blockIdx.x * (int) blockDim.x +
                   (int) threadIdx.x;
     if (t >= n_tokens) return;
 
     const auto visible = ds4_ratio4_causal_visibility(
-        t, n_tokens, raw_rows, n_kv - raw_rows, raw_window, kv_start);
+        t, n_tokens, raw_rows, n_kv - raw_rows, raw_window, kv_start,
+        causal_ratio);
     int * token_bounds = bounds + (size_t) t * 4;
     token_bounds[0] = visible.raw_first;
     token_bounds[1] = visible.raw_last;
@@ -578,7 +580,8 @@ __global__ static void ds4_fa_indexed_rows_topk_kernel(
         int             n_kv,
         int             raw_rows,
         int             capacity,
-        int             kv_start = 0) {
+        int             kv_start = 0,
+        int             causal_ratio = 4) {
     const int t = (int) blockIdx.x;
     const int tid = (int) threadIdx.x;
     if (t >= n_tokens) return;
@@ -603,7 +606,7 @@ __global__ static void ds4_fa_indexed_rows_topk_kernel(
         const int physical = raw_rows + comp;
         bool visible = comp >= 0 && comp < n_comp_rows;
         if constexpr (RATIO4_CAUSAL) {
-            visible = visible && comp < (kv_start + t + 1) / 4;
+            visible = visible && comp < (kv_start + t + 1) / causal_ratio;
         } else {
             visible = visible &&
                 ds4_fa_load<Mask, Mask>(token_mask + physical) > -1.0e20f;
@@ -3118,7 +3121,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst)
         return false;
     }
     const int n_comp_rows = n_kv - raw_rows;
-    if (causal_ratio > 0) {
+    if (causal_ratio > 0 && !ratio4_causal) {
         const int kv_start = ggml_get_op_params_i32(dst, 8);
         const int prior_rows = raw_rows - n_tokens;
         if (mask || indexer_topk || n_tokens <= raw_window ||
@@ -3167,7 +3170,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst)
                 kv_start < 0 || raw_window <= 0 || indexed_capacity > 512 ||
                 n_tokens <= raw_window ||
                 prior_rows != std::min(kv_start, raw_window) ||
-                n_comp_rows != (kv_start + n_tokens) / 4) {
+                n_comp_rows != (kv_start + n_tokens) /
+                    (causal_ratio > 0 ? causal_ratio : 4)) {
                 return false;
             }
         }
@@ -3258,6 +3262,9 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
         ds4_fa_is_gfx1151(device_info.cc);
     const bool sparse = sparse_requested && !bypass_sparse_selector;
 
+    // Maskless indexed attention (ratio4_causal): the compressed frontier's
+    // ratio, 4 unless the graph set one (V4.1's ratio-1/2 layers).
+    const int indexed_causal_ratio = causal_ratio > 0 ? causal_ratio : 4;
     ds4_inverse_rope_params inverse_rope{};
     inverse_rope.enabled = rope_flags & 1;
     inverse_rope.forward_q_enabled = (rope_flags & 2) != 0;
@@ -3437,7 +3444,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                         indexed_rows, indexed_counts,
                         indexed_owner_offsets, indexed_owner_ranks,
                         n_tokens, n_kv, raw_rows, indexed_capacity,
-                        inverse_rope.kv_start);
+                        inverse_rope.kv_start, indexed_causal_ratio);
             } else if (mask->type == GGML_TYPE_F16) {
                 if (indexer_topk) {
                     ds4_launch_indexed_rows_topk<half>(
@@ -3487,7 +3494,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
             ds4_fa_ratio4_causal_bounds_kernel<<<
                 (n_tokens + 255) / 256, 256, 0, stream>>>(
                     visibility_bounds, n_tokens, n_kv, raw_rows,
-                    raw_window, inverse_rope.kv_start);
+                    raw_window, inverse_rope.kv_start, indexed_causal_ratio);
         } else if (contiguous_causal) {
             ds4_fa_contiguous_causal_bounds_kernel<<<
                 (n_tokens + 255) / 256, 256, 0, stream>>>(

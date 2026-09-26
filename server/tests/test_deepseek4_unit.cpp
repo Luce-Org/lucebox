@@ -150,10 +150,10 @@ static void test_dspark_seed_row_restore_cpu() {
 static void test_ds4_ratio4_causal_visibility_formula() {
     std::fprintf(stderr, "  test_ds4_ratio4_causal_visibility_formula ...");
     constexpr int raw_window = 128;
-    const auto check_chunk = [&](int kv_start, int n_tokens) {
+    const auto check_chunk = [&](int kv_start, int n_tokens, int ratio = 4) {
         const int prior_rows = std::min(kv_start, raw_window);
         const int raw_rows = prior_rows + n_tokens;
-        const int n_comp_rows = (kv_start + n_tokens) / 4;
+        const int n_comp_rows = (kv_start + n_tokens) / ratio;
         const int probes[] = {
             0, 1, 2, 3, 127, 128, 2050, 2051, 8191, 8192, 8193,
             kv_start, kv_start + 1, kv_start + 2, kv_start + 3,
@@ -179,10 +179,10 @@ static void test_ds4_ratio4_causal_visibility_formula() {
             // as the usual complete ratio-4 history used by prefill.
             for (int capacity : {0, 1, n_comp_rows / 2, n_comp_rows}) {
                 const auto actual = ds4_ratio4_causal_visibility(
-                    token, n_tokens, raw_rows, capacity, raw_window, kv_start);
+                    token, n_tokens, raw_rows, capacity, raw_window, kv_start, ratio);
                 int reference_comp = 0;
                 for (int row = 0; row < capacity; ++row) {
-                    reference_comp += 4 * (row + 1) - 1 <= position;
+                    reference_comp += ratio * (row + 1) - 1 <= position;
                 }
                 TEST_ASSERT(reference_first == actual.raw_first);
                 TEST_ASSERT(reference_last == actual.raw_last);
@@ -195,6 +195,10 @@ static void test_ds4_ratio4_causal_visibility_formula() {
     };
     check_chunk(0, 8192);
     check_chunk(0, 10240);
+    check_chunk(0, 2048, 1);          // V4.1 ratio-1 and ratio-2 bands
+    check_chunk(63488, 2048, 1);
+    check_chunk(2048, 2048, 2);
+    check_chunk(129023, 1025, 2);
     check_chunk(8192, 941);
     check_chunk(122880, 129);
     check_chunk(122883, 129);

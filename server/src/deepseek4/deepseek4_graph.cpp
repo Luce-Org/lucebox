@@ -2688,18 +2688,23 @@ static ggml_tensor * build_mla_attention_lane_core(
             i32_array_inputs);
         if (shared_selection && lane.index_selection) *lane.index_selection = indexer_topk;
     }
-    // Maskless ratio-4 sparse prefill admission. This repeats the kernel's
+    // Maskless indexed prefill admission. This repeats the kernel's
     // ratio4_causal support check in fattn.cu exactly (indexed-row capacity,
     // chronological prior window, completed compressed-row frontier): the
     // maskless op is only built when the kernel would accept it, otherwise
     // the explicit-mask path is built. Layer-major graphs execute directly,
     // so an op the kernel rejects would abort instead of falling back.
-    // The kernel's analytic frontier is the ratio-4 one.
+    // V4 takes it on its ratio-4 sparse prefill; V4.1, which selects on
+    // every compressed layer, on any layer-major batch at the layer's ratio
+    // (ggml_flash_attn_ext_set_ds4_causal_ratio): no [rows, tokens] mask.
     constexpr int maskless_indexed_rows_cap = 512;  // fattn.cu top-k scan width
+    const bool maskless_indexed_layer = ratio > 0 &&
+        (w.shared_index_topk ? attention_impl != DeepSeek4AttentionImpl::Explicit
+                             : attention_impl == DeepSeek4AttentionImpl::SparseFlash && ratio == 4);
     const bool maskless_sparse_prefill =
-        attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
+        maskless_indexed_layer &&
         layer_major_batch && !gathered_history && !image_spans.size &&
-        indexer_topk && ratio == 4 && n_tokens > w.n_swa &&
+        indexer_topk && n_tokens > w.n_swa &&
         indexer_topk->ne[0] <= maskless_indexed_rows_cap &&
         n_prior_rows == std::min(kv_start, w.n_swa) &&
         n_comp_live == (kv_start + n_tokens) / ratio;
@@ -2915,8 +2920,9 @@ static ggml_tensor * build_mla_attention_lane_core(
         ? indexer_topk && !image_spans.size &&
           (maskless_sparse_prefill || ds4_env_flag("LUCE_DS4_DIRECT_INDEXER_TOPK"))
         : selection_flash && !exact_numerical_bands;
-    // Only the ratio-4 maskless prefill derives visibility without a mask.
-    const bool maskless_direct = direct_indexer_topk && !selection_flash;
+    // Only the maskless indexed prefill derives visibility without a mask.
+    const bool maskless_direct = direct_indexer_topk &&
+        (!selection_flash || maskless_sparse_prefill);
     // Layer-major, non-indexed layers can skip the quadratic causal mask:
     // their KV layout is [prior chronological window | current batch], so
     // the kernel derives the exact causal window from kv_start and the query
@@ -3143,8 +3149,8 @@ static ggml_tensor * build_mla_attention_lane_core(
                 const int attn_count = (int) kv_band->ne[1];
                 ggml_tensor * k_band = ggml_reshape_3d(
                     ctx, kv_band, head_dim, attn_count, 1);
-                ggml_tensor * mask_fa = ds4_cast_if_needed(
-                    ctx, mask_band, GGML_TYPE_F16);
+                ggml_tensor * mask_fa = mask_band
+                    ? ds4_cast_if_needed(ctx, mask_band, GGML_TYPE_F16) : nullptr;
                 ggml_tensor * result = ggml_flash_attn_ext(
                     ctx, q_band, k_band, k_band, mask_fa,
                     kq_scale, 0.0f, 0.0f);
@@ -3206,13 +3212,28 @@ static ggml_tensor * build_mla_attention_lane_core(
 
                 ggml_tensor * band_kv = append_comp(
                     band_raw, band_comp_count);
-                ggml_tensor * band_mask = make_band_mask(
-                    band_pos, band_count, band_prior_count,
-                    band_comp_count);
+                // An indexed band needs no [rows, band] mask: the kernel
+                // derives each query's raw window and compressed frontier
+                // from the band position and the layer's ratio and reads
+                // only the selected rows (fattn.cu ratio4_causal; the
+                // admission below repeats its checks). Same rows in the same
+                // order as the masked path.
+                const bool band_indexed = indexer_topk &&
+                    band_comp_count > (int) indexer_topk->ne[0];
+                const bool band_maskless = band_indexed && ratio > 0 &&
+                    indexer_topk->ne[0] <= 512 && band_count > w.n_swa &&
+                    band_prior_count == std::min(band_pos, w.n_swa) &&
+                    band_comp_count == (band_pos + band_count) / ratio;
+                ggml_tensor * band_mask = band_maskless ? nullptr
+                    : make_band_mask(band_pos, band_count, band_prior_count,
+                                     band_comp_count);
                 ggml_tensor * band_context = make_flash(
                     view_q(band_start, band_count), band_kv, band_mask,
                     band_prior_count + band_count, band_pos);
-                if (indexer_topk && band_comp_count > (int) indexer_topk->ne[0]) {
+                if (band_maskless) {
+                    ggml_flash_attn_ext_set_ds4_causal_ratio(band_context, ratio);
+                }
+                if (band_indexed) {
                     // The band's compressed rows are the span the selection
                     // indexes; the kernel reads only the selected ones. A band
                     // whose rows all fit the selection stays dense (exact).
@@ -3273,6 +3294,9 @@ static ggml_tensor * build_mla_attention_lane_core(
             if (direct_indexer_topk) {
                 ggml_flash_attn_ext_set_ds4_indexer_topk(
                     context, indexer_topk);
+            }
+            if (maskless_sparse_prefill && ratio != 4) {
+                ggml_flash_attn_ext_set_ds4_causal_ratio(context, ratio);
             }
             if (attention_impl != DeepSeek4AttentionImpl::Explicit &&
                 head_dim == 512 && n_rot == 64) {
