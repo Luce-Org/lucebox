@@ -196,6 +196,7 @@ private:
     struct HybridPrefillScratch {
         size_t target = 0;
         size_t second = 0;
+        size_t target_fixed = 0;   // per chunk, whatever its size
     };
     static HybridPrefillScratch hybrid_prefill_scratch_per_token(
         const DeepSeek4Weights & w, int max_ctx, int chunk);
@@ -237,7 +238,7 @@ private:
     bool init_streamed_expert_tier();
     bool check_device_headroom() const;
     bool log_device_memory(const char * when) const;
-    void size_hybrid_prefill_chunk();
+    bool size_hybrid_prefill_chunk();
     bool requires_monolithic_model() const;
     bool validate_prefill_mode() const;
     bool validate_model_features() const;

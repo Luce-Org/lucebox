@@ -2130,7 +2130,7 @@ bool DeepSeek4Backend::init() {
         }
     }
     if (!init_streamed_expert_tier() || !check_device_headroom()) return false;
-    size_hybrid_prefill_chunk();
+    if (!size_hybrid_prefill_chunk()) return false;
     image_capable_ = vision_ != nullptr;
     return true;
 }
@@ -2269,11 +2269,25 @@ DeepSeek4Backend::HybridPrefillScratch DeepSeek4Backend::hybrid_prefill_scratch_
     }
     const size_t f32 = sizeof(float);
     const size_t heads = (size_t) w.n_head * (size_t) w.head_dim * f32;
-    const size_t mask = ((size_t) w.n_swa + (size_t) std::max(1, chunk) + comp_rows) *
-                        (f32 + sizeof(uint16_t));
+    const size_t mask_row = ((size_t) w.n_swa + (size_t) std::max(1, chunk) + comp_rows) *
+                            (f32 + sizeof(uint16_t));
+    size_t mask = mask_row;
     const size_t routes = (size_t) w.n_expert_used * 3 * (size_t) w.n_ff_exp * f32;
     const size_t token = (size_t) w.n_embd * f32;
     HybridPrefillScratch out;
+    if (w.shared_index_topk) {
+        // V4.1 selects on every compressed layer. A prefill band whose
+        // queries have a selection attends without a mask, so the mask spans
+        // at most top_k compressed rows (plus one short tail band of up to
+        // n_swa tokens with a full one). The index sources score every
+        // compressed row per token (scores, their ranked copy, top-k and
+        // candidate-block scratch: 9 bytes), and each band gathers every
+        // compressed row as F32 attention rows (cast and concat).
+        mask = ((size_t) w.n_swa + (size_t) std::max(1, chunk) +
+                std::min(comp_rows, (size_t) w.n_indexer_top_k)) * (f32 + sizeof(uint16_t)) +
+               comp_rows * (2 * f32 + 1);
+        out.target_fixed = (size_t) w.n_swa * mask_row + 2 * comp_rows * (size_t) w.head_dim * f32;
+    }
     out.target = 4 * heads + mask + routes + 4 * token + 2 * (size_t) w.n_expert * f32;
     out.second = 2 * routes + 4 * token;
     return out;
@@ -2295,19 +2309,34 @@ int DeepSeek4Backend::hybrid_prefill_fit_tokens(size_t free_bytes, size_t keep_b
 // cap is fixed for the life of the target, so a prompt is always cut into the
 // same chunks and a restored prefix reproduces a cold prefill
 // (GenerateRequest::restore_points).
-void DeepSeek4Backend::size_hybrid_prefill_chunk() {
-    if (!moe_hybrid_ || cfg_.prefill_mode == PrefillAttentionMode::Exact) return;
+bool DeepSeek4Backend::size_hybrid_prefill_chunk() {
+    if (!moe_hybrid_ || cfg_.prefill_mode == PrefillAttentionMode::Exact) return true;
     const int chunk = std::max(1, cfg_.chunk > 0 ? cfg_.chunk : w_.n_swa);
-    const HybridPrefillScratch per_token = hybrid_prefill_scratch_per_token(
-        w_, cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192, chunk);
-    const auto fit = [](int device, size_t bytes) {
+    const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
+    const HybridPrefillScratch per_token = hybrid_prefill_scratch_per_token(w_, max_ctx, chunk);
+    const auto fit = [](int device, size_t bytes, size_t fixed) {
         size_t free_b = 0, total_b = 0;
         ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
-        return hybrid_prefill_fit_tokens(free_b, ds4_device_headroom_bytes(device) / 2, bytes);
+        return hybrid_prefill_fit_tokens(free_b, ds4_device_headroom_bytes(device) / 2 + fixed, bytes);
     };
-    int tokens = fit(cfg_.device.gpu, per_token.target);
+    {
+        // A context the smallest chunk cannot prefill at its end is refused
+        // at load rather than failing an allocation in the middle of a prompt.
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(cfg_.device.gpu, &free_b, &total_b);
+        const size_t keep = ds4_device_headroom_bytes(cfg_.device.gpu) / 2 + per_token.target_fixed;
+        const size_t smallest = 64 * per_token.target;
+        if (free_b < keep + smallest) {
+            std::fprintf(stderr,
+                         "[deepseek4] --max-ctx %d needs %.2f GiB free on device %d to prefill 64 tokens "
+                         "at the end of the context, %.2f GiB are; lower --max-ctx or the expert budgets\n",
+                         max_ctx, (keep + smallest) / 1073741824.0, cfg_.device.gpu, free_b / 1073741824.0);
+            return false;
+        }
+    }
+    int tokens = fit(cfg_.device.gpu, per_token.target, per_token.target_fixed);
     if (stream_cache_device_ >= 0 && stream_cache_device_ != cfg_.device.gpu) {
-        tokens = std::min(tokens, fit(stream_cache_device_, per_token.second));
+        tokens = std::min(tokens, fit(stream_cache_device_, per_token.second, 0));
     }
     if (tokens < chunk) {
         hybrid_prefill_chunk_cap_ = hybrid_prefill_chunk_cap_ > 0
@@ -2315,6 +2344,7 @@ void DeepSeek4Backend::size_hybrid_prefill_chunk() {
         std::fprintf(stderr, "[deepseek4] batched prefill chunk %d -> %d tokens to fit the "
                      "devices' free memory\n", chunk, tokens);
     }
+    return true;
 }
 
 // Tokens of a batched prefill chunk at absolute `pos` that stop at the next
