@@ -1,0 +1,117 @@
+[
+  {
+    "id": "arith",
+    "messages": [{"role": "user", "content": "What is 17 * 23? Reply with only the number."}],
+    "max_tokens": 16,
+    "check": {"number": 391}
+  },
+  {
+    "id": "capital",
+    "messages": [{"role": "user", "content": "What is the capital of France? Reply with one word."}],
+    "max_tokens": 16,
+    "check": {"contains": ["paris"]}
+  },
+  {
+    "id": "primes",
+    "messages": [{"role": "user", "content": "List the first five prime numbers, separated by commas. Reply with only the list."}],
+    "max_tokens": 32,
+    "check": {"regex": "2\\D+3\\D+5\\D+7\\D+11"}
+  },
+  {
+    "id": "word_problem",
+    "messages": [{"role": "user", "content": "A train travels 60 km in 1.5 hours. What is its average speed in km/h? Reply with only the number."}],
+    "max_tokens": 16,
+    "check": {"number": 40}
+  },
+  {
+    "id": "count",
+    "messages": [{"role": "user", "content": "Count from 1 to 40, separated by single spaces. Reply with only the numbers."}],
+    "max_tokens": 160,
+    "check": {"sequence": 40}
+  },
+  {
+    "id": "code",
+    "messages": [{"role": "user", "content": "Write a Python function is_even(n) that returns True when n is even. Reply with only the code."}],
+    "max_tokens": 96,
+    "check": {"contains": ["def is_even", "% 2"]}
+  },
+  {
+    "id": "json",
+    "messages": [{"role": "user", "content": "Return a JSON object with the key \"name\" set to \"lucebox\" and the key \"version\" set to 3. Reply with only the JSON."}],
+    "max_tokens": 48,
+    "check": {"json": {"name": "lucebox", "version": 3}}
+  },
+  {
+    "id": "translate",
+    "messages": [{"role": "user", "content": "Translate \"good morning\" into Italian. Reply with only the translation."}],
+    "max_tokens": 16,
+    "check": {"any": ["buongiorno", "buon giorno"]}
+  },
+  {
+    "id": "unicode",
+    "messages": [{"role": "user", "content": "Repeat this text exactly: Città 東京 🚀"}],
+    "max_tokens": 24,
+    "check": {"contains": ["città", "東京", "🚀"]}
+  },
+  {
+    "id": "multi_turn",
+    "messages": [
+      {"role": "system", "content": "You are a concise assistant."},
+      {"role": "user", "content": "My name is Alice and I live in Lisbon."},
+      {"role": "assistant", "content": "Nice to meet you, Alice."},
+      {"role": "user", "content": "In which city do I live? Reply with one word."}
+    ],
+    "max_tokens": 16,
+    "check": {"contains": ["lisbon"]}
+  },
+  {
+    "id": "tool_call",
+    "messages": [{"role": "user", "content": "What is the weather in Rome right now?"}],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+          }
+        }
+      }
+    ],
+    "max_tokens": 160,
+    "check": {"tool_call": {"name": "get_weather", "arguments_contain": {"city": "rome"}}}
+  },
+  {
+    "id": "needle",
+    "generate": "needle",
+    "max_tokens": 16,
+    "check": {"contains": ["7429"]}
+  },
+  {
+    "id": "stream",
+    "stream": true,
+    "messages": [{"role": "user", "content": "What is the capital of Japan? Reply with one word."}],
+    "max_tokens": 16,
+    "check": {"contains": ["tokyo"]}
+  },
+  {
+    "id": "thinking",
+    "thinking": true,
+    "messages": [{"role": "user", "content": "What is 12 + 30?"}],
+    "max_tokens": 768,
+    "check": {"number": 42, "field": "any"}
+  },
+  {
+    "id": "story",
+    "messages": [{"role": "user", "content": "Write a short paragraph about a lighthouse keeper."}],
+    "max_tokens": 192,
+    "check": {"min_words": 40, "no_loop": true}
+  },
+  {
+    "id": "arith_repeat",
+    "repeat_of": "arith"
+  }
+]

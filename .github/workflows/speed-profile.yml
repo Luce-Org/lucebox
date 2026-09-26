@@ -25,6 +25,8 @@ on:
 concurrency:
   group: lucebox-rtx3090-gpu-runner
   cancel-in-progress: false
+  # Keep every waiting run instead of replacing the older one.
+  queue: max
 
 jobs:
   speed-profile:

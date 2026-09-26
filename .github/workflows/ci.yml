@@ -192,6 +192,9 @@ jobs:
     concurrency:
       group: ${{ matrix.concurrency_group }}
       cancel-in-progress: false
+      # Without a queue GitHub keeps one waiting job per group and cancels the
+      # older one, so a second PR would silently drop the first PR's GPU run.
+      queue: max
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -318,40 +321,17 @@ jobs:
     concurrency:
       group: lucebox3-${{ matrix.concurrency_key }}-runner
       cancel-in-progress: false
+      # Queue instead of replacing waiting jobs (see gpu-tests).
+      queue: max
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: KFD health (diagnose instead of hanging)
         # rocminfo on a wedged KFD blocks in uninterruptible sleep and eats
-        # the whole 20-minute job timeout. Probe with a hard timeout first,
-        # and when it hangs, dump the evidence (D-state holders, dmesg) so
-        # the job fails in seconds with a diagnosis instead of silently.
-        run: |
-          # A wedged KFD puts rocminfo in UNINTERRUPTIBLE sleep: timeout(1)
-          # cannot kill it and a foreground wait blocks until the job
-          # timeout. Probe in the background (output to a file so no pipe
-          # keeps the step alive) and enforce the deadline in the shell.
-          /opt/rocm/bin/rocminfo > /tmp/rocminfo.out 2>&1 &
-          PROBE=$!
-          for i in $(seq 1 15); do
-            kill -0 $PROBE 2>/dev/null || break
-            sleep 1
-          done
-          if kill -0 $PROBE 2>/dev/null; then
-            echo "::error::rocminfo hung (likely D-state) — ROCm/KFD wedged; the box needs a reboot"
-            echo "--- probe state:"
-            ps -o pid,stat,wchan:32,comm -p $PROBE || true
-            echo "--- processes holding /dev/kfd:"
-            sudo fuser -v /dev/kfd 2>&1 || true
-            echo "--- D-state processes:"
-            ps -eo pid,user,stat,wchan:32,comm | awk '$3 ~ /D/' || true
-            echo "--- recent amdgpu/kfd dmesg:"
-            sudo dmesg 2>/dev/null | grep -iE "amdgpu|kfd" | tail -15 || true
-            kill -9 $PROBE 2>/dev/null || true
-            disown $PROBE 2>/dev/null || true
-            exit 1
-          fi
-          wait $PROBE && echo "KFD healthy" || { echo "::error::rocminfo exited non-zero"; cat /tmp/rocminfo.out | tail -5; exit 1; }
+        # the whole 20-minute job timeout. The probe enforces a 15 s deadline
+        # and dumps the evidence (D-state holders, dmesg) so the job fails in
+        # seconds with a diagnosis. Shared with model-e2e.yml.
+        run: bash .github/ci/kfd_health.sh /tmp/rocminfo.out
 
       - name: ROCm inventory includes ${{ matrix.arch }}
         run: cat /tmp/rocminfo.out | grep -E "Name:|Marketing Name:" | grep -F "${{ matrix.arch }}"
