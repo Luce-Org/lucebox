@@ -841,7 +841,15 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.model_name.c_str());
         return 2;
     }
-    if (bargs.max_concurrency > 1) bargs.paged_attention = true;
+    const char * qwen4exp_seq_env = std::getenv("LUCE_QWEN4EXP_SEQ_ENGINE");
+    const char * qwen4exp_batch_env = std::getenv("QWEN4EXP_BATCHED_DECODE");
+    const char * qwen4exp_upstream_env = std::getenv("QWEN4EXP_UPSTREAM");
+    const bool qwen4exp_full_cache_concurrency =
+        qwen4exp_seq_env && std::strcmp(qwen4exp_seq_env, "1") == 0 &&
+        qwen4exp_batch_env && std::strcmp(qwen4exp_batch_env, "1") == 0 &&
+        !(qwen4exp_upstream_env && std::atoi(qwen4exp_upstream_env) != 0);
+    if (bargs.max_concurrency > 1 && !qwen4exp_full_cache_concurrency)
+        bargs.paged_attention = true;
     if (sconfig.decode_kv_offload_bytes &&
         sconfig.decode_kv_offload_bytes != kAutoKvOffloadBytes && bargs.max_concurrency <= 1) {
         std::fprintf(stderr, "[server] --decode-kv-offload-mb requires --max-concurrency greater than 1\n");
