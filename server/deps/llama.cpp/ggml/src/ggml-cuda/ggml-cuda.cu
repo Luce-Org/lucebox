@@ -3916,6 +3916,14 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+// View-like and empty nodes: the evaluation loops launch nothing for them.
+// Used by graph capture and by the copy-run batching, so it must stay outside
+// USE_CUDA_GRAPH.
+static bool ggml_cuda_node_launches_nothing(const ggml_tensor * node) {
+    return ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+        node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE;
+}
+
 #ifdef USE_CUDA_GRAPH
 
 // GGML_CUDA_COLLECTIVE_GRAPH_CAPTURE=1: allow graph capture of a graph that
@@ -3927,12 +3935,6 @@ static bool ggml_cuda_cluster_capture_allowed() {
         return v && v[0] && strcmp(v, "0") != 0;
     }();
     return allowed;
-}
-
-// View-like and empty nodes: the evaluation loops launch nothing for them.
-static bool ggml_cuda_node_launches_nothing(const ggml_tensor * node) {
-    return ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-        node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE;
 }
 
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
