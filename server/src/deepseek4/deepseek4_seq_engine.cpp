@@ -66,6 +66,52 @@ StepPlanLimits DeepSeek4SeqEngine::step_plan_limits(
 SeqEngine::AdmitResult DeepSeek4SeqEngine::admit(
         uint64_t request_id, const std::vector<int32_t> & prompt,
         const SamplerCfg & sampler) {
+    AdmitResult result = admit_slot(request_id, prompt, sampler);
+    if (result.status == AdmitResult::Status::admitted &&
+        !stage_text_prompt(request_id, result.slot, prompt) &&
+        !slots_.is_active(result.slot)) {
+        result.status = AdmitResult::Status::failed;
+        result.slot = -1;
+        result.error = "text prompt could not be staged";
+    }
+    return result;
+}
+
+bool DeepSeek4SeqEngine::stage_text_prompt(
+        uint64_t request_id, int slot, const std::vector<int32_t> & prompt) {
+    // Short prompts prefill in the gathered batch; staging pays off once a
+    // prompt spans many sixteen-row (one-row on the hybrid path) steps.
+    constexpr int kMinStagedTextTokens = 64;
+    const int prefix = int(prompt.size()) - 1;
+    if (!b_.text_staging_available() || int(prompt.size()) < kMinStagedTextTokens ||
+        prompt.size() > size_t(b_.cache_.max_ctx) || staging_in_flight(slot)) {
+        return false;
+    }
+    PendingImage pending;
+    pending.slot = slot;
+    pending.staged.request_id = request_id;
+    pending.staged.prompt = prompt;
+    pending.staged.prefix = prefix;
+    pending.staged.staging = b_.image_staging_cache(slot);
+    if (!pending.staged.staging || !b_.begin_staged_prefill(pending.staged)) {
+        return false;  // nothing seeded yet: the gathered prefill still works
+    }
+    SeqSlotManager::PrefillChunk seeded = slots_.seed_restored_prefix(slot, prefix);
+    bool ok = seeded.ok && seeded.rows.size() == size_t(prefix);
+    for (size_t i = 0; ok && i < seeded.new_blocks.size(); ++i) {
+        ok = set_block(slot, seeded.first_new_block + int(i), seeded.new_blocks[i]);
+    }
+    if (!ok) {
+        retire(slot);  // partially seeded: the request cannot continue
+        return false;
+    }
+    pending_images_.push_back(std::move(pending));
+    return true;
+}
+
+SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_slot(
+        uint64_t request_id, const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler) {
     using AdmitStatus = AdmitResult::Status;
     AdmitResult result = slots_.admit(
         request_id, prompt, sampler);
@@ -105,7 +151,7 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_images(
     }
     // Claim the slot before encoding: a busy pool defers the request and
     // retries it, and encoding first would rerun the encoder on every retry.
-    AdmitResult result = admit(request_id, prompt, sampler);
+    AdmitResult result = admit_slot(request_id, prompt, sampler);
     if (result.status != AdmitResult::Status::admitted) return result;
     if (staging_in_flight(result.slot)) {
         // The slot's staging cache still belongs to a pass in flight (its
@@ -119,6 +165,7 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_images(
     PendingImage pending;
     pending.slot = result.slot;
     pending.staged.images = images;
+    pending.staged.request_id = request_id;
     pending.staged.prompt = prompt;
     pending.staged.prefix = prefix;
     pending.staged.staging = b_.image_staging_cache(result.slot);
@@ -159,23 +206,66 @@ bool DeepSeek4SeqEngine::staging_in_flight(int slot) const {
     return false;
 }
 
+namespace {
+constexpr int kHybridStagedRowsWithDecode = 1024;
+constexpr int kHybridStagedRowsWithoutDecode = 2048;
+}  // namespace
+
 void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
-    if (!staged_pass_) {
+    if (b_.staged_text_uses_chunks()) {
+        // Heterogeneous placement: stage one bounded chunk of the oldest
+        // pending text prompt per step, so live decoders wait for at most
+        // one chunk rather than the whole prompt.
+        for (auto & pending : pending_images_) {
+            DeepSeek4StagedPrefill & staged = pending.staged;
+            if (staged.images || staged.finished() || !staged.staging) continue;
+            std::string error;
+            const auto t0 = std::chrono::steady_clock::now();
+            const int before = staged.done;
+            // Each heterogeneous chunk pays a large fixed cost (every cold
+            // expert's weights are read once per call), so chunks stay wide:
+            // measured 306 rows in 3.2 s against 1842 rows in 7.7 s.
+            if (!b_.run_staged_text_chunk(
+                    staged, decoding ? kHybridStagedRowsWithDecode
+                                     : kHybridStagedRowsWithoutDecode, error)) {
+                // Intentionally terminal: the slot already holds the prompt
+                // as seeded rows, and a failure of this path (scratch or
+                // expert allocation) would most likely recur in the gathered
+                // prefill of the same rows. The request fails cleanly and its
+                // slot is released.
+                staged.error = error.empty() ? "staged text prefill failed" : error;
+            } else if (staged.done >= staged.prefix) {
+                std::fprintf(stderr, "[deepseek4] staged text prefill slot %d: %d rows, last chunk %d rows %.0f ms\n",
+                             pending.slot, staged.prefix, staged.done - before,
+                             std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t0).count());
+            }
+            break;
+        }
+    }
+    if (!staged_pass_ && !pending_images_.empty()) {
         std::vector<DeepSeek4StagedPrefill *> items;
         std::vector<int> slots;
-        for (auto & pending : pending_images_) {
-            if (pending.staged.finished()) continue;
-            items.push_back(&pending.staged);
-            slots.push_back(pending.slot);
+        // Image blocks take the budget first: a long text prompt must not
+        // hold co-pending image staging back for its whole prefill.
+        for (int text = 0; text < 2; ++text) {
+            for (auto & pending : pending_images_) {
+                if (pending.staged.finished() || bool(pending.staged.images) == bool(text)) continue;
+                if (text && b_.staged_text_uses_chunks()) continue;
+                items.push_back(&pending.staged);
+                slots.push_back(pending.slot);
+            }
         }
-        if (items.empty()) return;
         auto staged = std::make_unique<StagedPass>();
         std::vector<int> rows;
-        if (b_.begin_staged_pass(items, decoding ? DS4_STAGED_PREFILL_ROWS_PER_STEP
-                                                 : DS4_STAGED_PREFILL_ROWS_WITHOUT_DECODE,
-                                 staged->pass, rows)) {
+        if (items.empty()) {
+            // Nothing for the shared pass this step.
+        } else if (b_.begin_staged_pass(items, decoding ? DS4_STAGED_PREFILL_ROWS_PER_STEP
+                                                        : DS4_STAGED_PREFILL_ROWS_WITHOUT_DECODE,
+                                        staged->pass, rows)) {
             for (size_t k = 0; k < items.size(); ++k) {
-                if (rows[k] > 0) staged->members.push_back({slots[k], items[k]->images, rows[k]});
+                if (rows[k] > 0) staged->members.push_back(
+                    {slots[k], items[k]->images, items[k]->request_id, rows[k]});
             }
             staged->started = std::chrono::steady_clock::now();
             staged_pass_ = std::move(staged);
@@ -200,7 +290,7 @@ void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
                 PendingImage * pending = pending_image(member.slot);
                 // A member that retired (or whose slot now holds another
                 // request) is skipped.
-                if (!pending || pending->staged.images != member.images) continue;
+                if (!pending || pending->staged.request_id != member.request_id) continue;
                 if (ok) pending->staged.done += member.rows;
                 else pending->staged.error = error.empty() ? "staged prefill failed" : error;
             }

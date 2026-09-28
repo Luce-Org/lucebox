@@ -256,8 +256,10 @@ std::string check_feature_compatibility(
             if (target_backend != PlacementBackend::Hip) {
                 return "DeepSeek4 paged attention requires a local HIP target";
             }
-            if (args.ds4_prefill_mode != PrefillAttentionMode::Exact) {
-                return "DeepSeek4 paged attention requires --ds4-prefill exact";
+            if (args.ds4_prefill_mode != PrefillAttentionMode::Exact &&
+                args.ds4_prefill_mode != PrefillAttentionMode::Sparse) {
+                return "DeepSeek4 paged attention requires --ds4-prefill exact "
+                       "or sparse";
             }
             if (args.ds4_fused_decode || args.ds4_fused_verify_f16_kv) {
                 return "DeepSeek4 paged attention requires non-fused "

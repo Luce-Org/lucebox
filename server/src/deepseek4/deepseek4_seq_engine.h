@@ -18,7 +18,8 @@ class DeepSeek4Backend;
 // A batched image request's prompt prefix, prefilled into its slot's staging
 // cache over several steps before it is copied into the paged slot.
 struct DeepSeek4StagedPrefill {
-    ImagePromptHandle images;
+    ImagePromptHandle images;   // empty for a text prompt
+    uint64_t request_id = 0;    // identifies the request across slot reuse
     std::vector<int32_t> prompt;
     int prefix = 0;
     DeepSeek4Cache * staging = nullptr;
@@ -60,11 +61,18 @@ public:
                              const ImagePromptHandle & images) override;
 
 private:
+    AdmitResult admit_slot(uint64_t request_id, const std::vector<int32_t> & prompt,
+                           const SamplerCfg & sampler);
+    // Stage a text prompt through the layer-major sparse path (only with
+    // --ds4-prefill sparse); false leaves it on the gathered prefill.
+    bool stage_text_prompt(uint64_t request_id, int slot,
+                           const std::vector<int32_t> & prompt);
     bool set_block(int slot, int logical, int32_t physical);
     void fail_prefill(int slot, std::vector<PrefillOutput> & outputs,
                       const std::string & error);
 
-    // Image requests still being staged: their slots hold the prompt minus
+    // Requests still being staged (images, or text under --ds4-prefill
+    // sparse): their slots hold the prompt minus
     // its last token as seeded blocks. Every step advances them by one shared
     // pass (so decode keeps running between passes) and copies each finished
     // one into its paged slot; until then the slot's last-token prefill waits.
@@ -79,7 +87,8 @@ private:
     struct StagedPass {
         struct Member {
             int slot = -1;
-            ImagePromptHandle images;  // also identifies the request
+            ImagePromptHandle images;  // keeps the pass's image rows alive
+            uint64_t request_id = 0;   // identifies the request (text too)
             int rows = 0;
         };
         DeepSeek4PrefillPass pass;
