@@ -1049,6 +1049,58 @@ size_t Qwen35Backend::snapshot_bytes_estimate(int tokens) const {
         w_, cache_, tokens, ggml_backend_get_default_buffer_type(snap_backend_));
 }
 
+ModelBackend::MemoryReport Qwen35Backend::memory_report() const {
+    MemoryReport report =
+        memory_report_for(cache_, prefix_snapshots_, PREFIX_SLOTS);
+    // Paged serving keeps sequences in blocks; cur_pos is not one of them.
+    if (cfg_.paged_attention) report.cache.live_tokens = -1;
+    // KVFlash bookkeeping and the DFlash feature mirror's staging buffer live
+    // in host memory beside the cache.
+    report.cache.host_state_bytes =
+        kvflash_history_.capacity() * sizeof(int32_t) +
+        kvflash_scores_.capacity() * sizeof(float) +
+        kvflash_mask_buf_.capacity() * sizeof(uint16_t) +
+        kvflash_qk_pool_.host_bytes() + feature_mirror_.staging_bytes;
+    return report;
+}
+
+ModelBackend::MemoryReport Qwen35Backend::memory_report_for(
+        const TargetCache & cache, const PrefixSnapshot * snapshots,
+        int n_snapshots) {
+    MemoryReport report;
+    if (!cache.base_buf) return report;
+    const auto bytes = [](const ggml_tensor * t) {
+        return t ? (uint64_t) ggml_nbytes(t) : (uint64_t) 0;
+    };
+    report.available = true;
+    report.cache.host = ggml_backend_buffer_is_host(cache.base_buf);
+    report.cache.capacity_tokens = cache.max_ctx;
+    report.cache.live_tokens = cache.n_seq_slots > 1 ? -1 : cache.cur_pos;
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        report.cache.kv_bytes += bytes(cache.attn_k[i]) + bytes(cache.attn_v[i]);
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        report.cache.recurrent_bytes +=
+            bytes(cache.ssm_state[i]) + bytes(cache.conv_state[i]);
+    }
+    report.cache.draft_feature_bytes = bytes(cache.target_feat);
+    uint64_t allocated = ggml_backend_buffer_get_size(cache.base_buf);
+    if (cache.rollback_buf) {
+        allocated += ggml_backend_buffer_get_size(cache.rollback_buf);
+    }
+    const uint64_t named = report.cache.kv_bytes + report.cache.recurrent_bytes +
+                           report.cache.draft_feature_bytes;
+    report.cache.other_bytes = allocated > named ? allocated - named : 0;
+    for (int slot = 0; slot < n_snapshots; ++slot) {
+        const auto & snap = snapshots[slot];
+        if (!snap.ctx || !snap.buf) continue;
+        report.snapshots.push_back({slot, snap.cur_pos,
+                                    ggml_backend_buffer_get_size(snap.buf),
+                                    ggml_backend_buffer_is_host(snap.buf)});
+    }
+    return report;
+}
+
 ModelBackend::SnapshotRef Qwen35Backend::snapshot_ref(int slot) const {
     SnapshotRef ref;
     if (slot < 0 || slot >= PREFIX_SLOTS) return ref;

@@ -105,6 +105,7 @@ public:
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
     size_t snapshot_bytes_estimate(int tokens) const override;
+    MemoryReport memory_report() const override;
     // Ondisk prefix cache: DeepSeek snapshots are CPU ggml contexts whose
     // tensors carry stable names plus a meta/logits/feature sidecar, so they
     // serialize and rebind like the Qwen snapshots do.

@@ -648,6 +648,15 @@ private:
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
     std::unordered_set<int> agent_turn_cache_slots_;
+
+    // Memory held by the live cache and saved snapshots, rebuilt on the
+    // generation thread after each request and read by /props (see
+    // publish_memory_report and memory_json).
+    mutable std::mutex memory_report_mu_;
+    json memory_report_;
+    uint64_t memory_report_requests_ = 0;
+    void publish_memory_report();
+    json memory_json() const;
     std::vector<std::vector<int32_t>> recent_disk_prompts_;
     // Recent tool-bearing prompt prefixes for PPP LCP annotate.
     std::vector<std::vector<int32_t>> recent_tool_prefixes_;

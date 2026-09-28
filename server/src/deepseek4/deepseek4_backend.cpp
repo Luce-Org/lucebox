@@ -3868,6 +3868,79 @@ size_t DeepSeek4Backend::snapshot_bytes_estimate(int tokens) const {
     return bytes ? bytes + (n_logits + n_features) * sizeof(float) : 0;
 }
 
+namespace {
+
+// Adds one cache buffer to `out`: K/V rows, compressor and HC state, and the
+// rest of the allocation.
+template <typename Layers>
+void add_deepseek4_cache_memory(ModelBackend::MemoryReport::Cache & out,
+                                const Layers & layers,
+                                const ggml_tensor * hc_state,
+                                ggml_backend_buffer_t buf) {
+    const auto bytes = [](const ggml_tensor * t) {
+        return t ? (uint64_t) ggml_nbytes(t) : (uint64_t) 0;
+    };
+    uint64_t kv = 0;
+    uint64_t recurrent = bytes(hc_state);
+    for (const auto & layer : layers) {
+        kv += bytes(layer.raw_kv) + bytes(layer.comp_kv) + bytes(layer.index_comp_kv);
+        recurrent += bytes(layer.attn_compressor.state_kv) +
+                     bytes(layer.attn_compressor.state_score) +
+                     bytes(layer.indexer_compressor.state_kv) +
+                     bytes(layer.indexer_compressor.state_score);
+    }
+    const uint64_t allocated = ggml_backend_buffer_get_size(buf);
+    out.kv_bytes += kv;
+    out.recurrent_bytes += recurrent;
+    out.other_bytes += allocated > kv + recurrent ? allocated - kv - recurrent : 0;
+}
+
+}  // namespace
+
+ModelBackend::MemoryReport DeepSeek4Backend::memory_report() const {
+    MemoryReport report;
+    const bool paged = paged_cache_.buf != nullptr;
+    if (!paged && !cache_.buf) return report;
+    report.available = true;
+    report.cache.host = ggml_backend_buffer_is_host(paged ? paged_cache_.buf : cache_.buf);
+    if (paged) {
+        report.cache.capacity_tokens = paged_cache_.plan.max_ctx;
+        add_deepseek4_cache_memory(report.cache, paged_cache_.layers, nullptr,
+                                   paged_cache_.buf);
+    } else {
+        report.cache.capacity_tokens = cache_.max_ctx;
+        report.cache.live_tokens = cache_.cur_pos;
+    }
+    // The single-request cache: the whole cache in classic serving, image
+    // slot 0's staging cache in paged serving, beside the other slots' ones.
+    if (cache_.buf) {
+        add_deepseek4_cache_memory(report.cache, cache_.layers, cache_.hc_state,
+                                   cache_.buf);
+    }
+    for (const auto & staging : image_staging_caches_) {
+        if (!staging || !staging->buf) continue;
+        add_deepseek4_cache_memory(report.cache, staging->layers,
+                                   staging->hc_state, staging->buf);
+    }
+    // DSpark reads its feature window and the last logits from host vectors.
+    // Trimming a vector keeps its allocation, so count capacity, not size.
+    report.cache.host_state_bytes =
+        (last_logits_.capacity() + spec_feat_window_.capacity()) * sizeof(float);
+    for (int slot = 0; slot < PREFIX_SLOTS; ++slot) {
+        const auto & snap = snapshots_[slot];
+        if (!snap.ctx || !snap.buf) continue;
+        const auto & aux = snapshot_aux_[slot];
+        const uint64_t host_copies =
+            (aux.last_logits.capacity() + aux.spec_feat_window.capacity()) *
+            sizeof(float);
+        report.snapshots.push_back({slot, snap.cur_pos,
+                                    ggml_backend_buffer_get_size(snap.buf),
+                                    ggml_backend_buffer_is_host(snap.buf),
+                                    host_copies});
+    }
+    return report;
+}
+
 ModelBackend::SnapshotRef DeepSeek4Backend::snapshot_ref(int slot) const {
     SnapshotRef ref;
     // Paged concurrent serving has no monolithic cache to restore into.

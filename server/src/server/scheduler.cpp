@@ -136,10 +136,14 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
     auto finish_job = [this](ServerJob * job) {
         stop_job_stream(job);
-        std::lock_guard<std::mutex> lk(job->mu);
-        job->done = true;
-        job->cv.notify_one();
+        {
+            std::lock_guard<std::mutex> lk(job->mu);
+            job->done = true;
+            job->cv.notify_one();
+        }
+        publish_memory_report();
     };
+    publish_memory_report();
 
     // A stalled reader may buffer at most this much before being dropped.
     constexpr size_t kMaxSlotSendBuffer = 1u << 20;

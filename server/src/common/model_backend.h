@@ -203,6 +203,36 @@ struct ModelBackend {
     // each snapshot has a large fixed cost (see docs/PREFIX_CACHE.md).
     static constexpr int kMaxSlots = 64;
 
+    // Memory held by the live cache and the saved snapshots, for /props.
+    // Called on the thread that runs generation, never concurrently with it.
+    struct MemoryReport {
+        struct Cache {
+            bool host = false;             // cache buffers live in host memory
+            int64_t capacity_tokens = 0;   // positions one sequence can hold
+            int64_t live_tokens = -1;      // committed positions; -1 when
+                                           // paged or holding several
+                                           // sequences
+            uint64_t kv_bytes = 0;         // attention K/V
+            uint64_t recurrent_bytes = 0;  // SSM/conv or compressor state
+            uint64_t draft_feature_bytes = 0;  // DFlash target features held
+                                               // in the cache allocation
+            uint64_t other_bytes = 0;      // rollback, scratch rings, etc.
+            uint64_t host_state_bytes = 0; // live host-side state beside the
+                                           // cache (logits, feature windows)
+        };
+        struct Snapshot {
+            int slot = -1;
+            int tokens = 0;
+            uint64_t bytes = 0;            // the snapshot buffer
+            bool host = true;              // the buffer lives in host memory
+            uint64_t host_copy_bytes = 0;  // host-side copies kept beside it
+        };
+        bool available = false;
+        Cache cache;
+        std::vector<Snapshot> snapshots;
+    };
+    virtual MemoryReport memory_report() const { return {}; }
+
     virtual bool snapshot_save(int slot) = 0;
     virtual void snapshot_free(int slot) = 0;
     virtual bool snapshot_used(int slot) const = 0;

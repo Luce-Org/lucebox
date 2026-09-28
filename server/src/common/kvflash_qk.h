@@ -113,6 +113,12 @@ public:
         return has(c) ? keys_[(size_t)c].data() : nullptr;
     }
     int n_chunks() const { return (int)keys_.size(); }
+    // Host memory the pooled keys hold (allocated capacity).
+    size_t host_bytes() const {
+        size_t bytes = keys_.capacity() * sizeof(keys_[0]);
+        for (const auto & chunk : keys_) bytes += chunk.capacity() * sizeof(float);
+        return bytes;
+    }
 
     // Pool chunk `c` whose rows sit in pool block `block` of each cache
     // tensor in `attn_k` ([head_dim, pool_tokens, n_head_kv], quantized).
