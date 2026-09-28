@@ -37,7 +37,6 @@ private:
     SeqSlotManager slots_;
     Qwen4ExpBatchedDecodeWorkspace decode_workspace_;
     int prefill_chunk_;
-    int prefill_owner_ = -1;
 };
 
 } // namespace luce::common

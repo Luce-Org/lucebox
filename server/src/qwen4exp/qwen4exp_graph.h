@@ -31,6 +31,35 @@ struct Qwen4ExpForwardResult {
     int  pos0 = 0;
 };
 
+// Experimental T=1 output-head placement on a second HIP device. The trunk
+// remains on the primary backend; only output.weight and its matvec live here.
+struct Qwen4ExpHeadOffload {
+    ggml_backend_t backend = nullptr;
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * weight = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * output = nullptr;
+    std::vector<float> hidden;
+};
+
+bool qwen4exp_head_offload_init(Qwen4ExpHeadOffload & head,
+                                ggml_backend_t backend,
+                                const Qwen4ExpWeights & w);
+void qwen4exp_head_offload_free(Qwen4ExpHeadOffload & head);
+
+// One independent sequence span in a packed forward graph. Tokens within a
+// segment are consecutive for this cache; segments never share recurrent, PLE,
+// or KV state. The result returns one logits row for each segment's final
+// token.
+struct Qwen4ExpForwardSegment {
+    Qwen4ExpCache * cache = nullptr;
+    const int32_t * tokens = nullptr;
+    int n_tokens = 0;
+    int pos0 = 0;
+};
+
 // Run the trunk. `tokens` has n_tokens entries, processed as one contiguous
 // single-sequence span at positions [pos0, pos0 + n_tokens). On success the
 // cache is advanced to pos0 + n_tokens and out_logits holds n_vocab floats
@@ -41,7 +70,8 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                                        const int32_t * tokens,
                                        int n_tokens,
                                        int pos0,
-                                       std::vector<float> & out_logits);
+                                       std::vector<float> & out_logits,
+                                       Qwen4ExpHeadOffload * head = nullptr);
 
 // Decode one next token for each independent slot. `caches[s]` owns that
 // sequence's KV and recurrent state; `tokens[s]` and `positions[s]` are never
@@ -55,6 +85,17 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
                                        const int32_t * tokens,
                                        const int32_t * positions,
                                        int n_slots,
+                                       Qwen4ExpBatchedDecodeWorkspace & workspace,
+                                       std::vector<std::vector<float>> & out_logits);
+
+// Packed independent-sequence forward for concurrent prefill/decode. Shared
+// dense/HC/MoE operations use the concatenated token rows; stateful operators
+// are built separately for each segment against its own cache.
+Qwen4ExpForwardResult qwen4exp_forward_packed(
+                                       ggml_backend_t backend,
+                                       const Qwen4ExpWeights & w,
+                                       const Qwen4ExpForwardSegment * segments,
+                                       int n_segments,
                                        Qwen4ExpBatchedDecodeWorkspace & workspace,
                                        std::vector<std::vector<float>> & out_logits);
 

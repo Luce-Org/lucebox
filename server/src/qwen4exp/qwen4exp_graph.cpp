@@ -13,6 +13,7 @@
 #include <cstring>
 #include <chrono>
 #include <functional>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,6 +24,87 @@ namespace {
 static double prof_now_ms() {
     return std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static bool batch_telemetry_enabled() {
+    const char * value = std::getenv("QWEN4EXP_BATCH_TELEMETRY");
+    return value && std::atoi(value) != 0;
+}
+
+static double mono_now_s() {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void trace_batch_widths(ggml_cgraph * gf, const char * phase,
+                               int rows, int max_kv) {
+    const char * enabled = std::getenv("QWEN4EXP_BATCH_TELEMETRY");
+    if (!enabled || std::atoi(enabled) == 0 || !gf) return;
+
+    std::map<int, int> matmul_widths, mmid_widths;
+    std::map<std::string, int> state_ops;
+    std::vector<std::string> width_one;
+    int matmul_count = 0, mmid_count = 0, max_matmul_width = 0, dense_t1_count = 0;
+    const int node_count = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < node_count; ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        if (!node) continue;
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
+            node->src[0] && node->src[1]) {
+            const bool is_id = node->op == GGML_OP_MUL_MAT_ID;
+            const int width = is_id
+                ? (int) node->src[1]->ne[2]
+                : node->src[1]->ne[0] > 0
+                    ? (int) (ggml_nelements(node->src[1]) / node->src[1]->ne[0])
+                    : 0;
+            if (is_id) {
+                ++mmid_count;
+                ++mmid_widths[width];
+            } else {
+                ++matmul_count;
+                ++matmul_widths[width];
+                max_matmul_width = std::max(max_matmul_width, width);
+                if (width == 1) {
+                    ++dense_t1_count;
+                    if (width_one.size() < 12) width_one.emplace_back(
+                        std::string(node->src[0]->name) +
+                        "[" + std::to_string(node->src[0]->ne[0]) + "x" +
+                        std::to_string(node->src[0]->ne[1]) + "]");
+                }
+            }
+        } else if (node->op == GGML_OP_FLASH_ATTN_EXT ||
+                   node->op == GGML_OP_GATED_DELTA_NET ||
+                   node->op == GGML_OP_SSM_CONV) {
+            ++state_ops[ggml_op_name(node->op)];
+        }
+    }
+    auto widths = [](const std::map<int, int> & hist) {
+        std::string out;
+        for (const auto & [width, count] : hist) {
+            if (!out.empty()) out += ",";
+            out += std::to_string(width) + ":" + std::to_string(count);
+        }
+        return out.empty() ? std::string("-") : out;
+    };
+    std::string state;
+    for (const auto & [op, count] : state_ops) {
+        if (!state.empty()) state += ",";
+        state += op + ":" + std::to_string(count);
+    }
+    std::string t1;
+    for (const std::string & name : width_one) {
+        if (!t1.empty()) t1 += ",";
+        t1 += name;
+    }
+    static uint64_t call = 0;
+    std::fprintf(stderr,
+        "[qwen4exp-batch] call=%llu phase=%s rows=%d max_kv=%d nodes=%d "
+        "MUL_MAT=%d{width:count:%s} MMID=%d{width:count:%s} "
+        "max_dense_T=%d state={%s} dense_T1=%d names=%d[%s]\n",
+        (unsigned long long) ++call, phase, rows, max_kv, node_count,
+        matmul_count, widths(matmul_widths).c_str(), mmid_count,
+        widths(mmid_widths).c_str(), max_matmul_width, state.c_str(),
+        dense_t1_count, (int) width_one.size(), t1.empty() ? "-" : t1.c_str());
 }
 
 size_t ring_align_up(size_t value) {
@@ -750,6 +832,84 @@ ggml_tensor * build_ple(ggml_context * c, ggml_cgraph * gf, ggml_tensor * hidden
     return ple_out;
 }
 
+static ggml_tensor * column_span(ggml_context * c, ggml_tensor * x,
+                                 int start, int count) {
+    GGML_ASSERT(x && start >= 0 && count > 0 && start + count <= x->ne[1]);
+    return ggml_view_2d(c, x, x->ne[0], count, x->nb[1],
+                        (size_t) start * x->nb[1]);
+}
+
+static ggml_tensor * token_span_3d(ggml_context * c, ggml_tensor * x,
+                                   int start, int count) {
+    GGML_ASSERT(x && start >= 0 && count > 0 && start + count <= x->ne[2]);
+    return ggml_view_3d(c, x, x->ne[0], x->ne[1], count,
+                        x->nb[1], x->nb[2], (size_t) start * x->nb[2]);
+}
+
+static ggml_tensor * build_ple_projected(ggml_context * c, ggml_cgraph * gf,
+        ggml_tensor * hidden, ggml_tensor * key, ggml_tensor * value,
+        const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
+        ggml_tensor * ple_conv_state,
+        const std::function<void(ggml_tensor *, const char *)> & dump_mark) {
+    const int64_t n_embd = w.n_embd, hc = w.n_hc, hc_dim = n_embd * hc;
+    const int64_t T = hidden->ne[2];
+    const float eps = w.rms_eps;
+    auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * nw) {
+        ggml_tensor * t = ggml_reshape_3d(c, x, n_embd, hc, T);
+        t = ggml_rms_norm(c, t, eps);
+        t = ggml_reshape_2d(c, t, hc_dim, T);
+        t = ggml_mul(c, t, nw);
+        return ggml_reshape_3d(c, t, n_embd, hc, T);
+    };
+
+    key = grouped_norm(key, L.ple_norm_key);
+    ggml_tensor * query = grouped_norm(hidden, L.ple_norm_query);
+    ggml_tensor * score = ggml_scale(c, ggml_sum_rows(c, ggml_mul(c, key, query)),
+                                     1.0f / std::sqrt((float) n_embd));
+    ggml_tensor * mag = ggml_sqrt(c,
+        ggml_clamp(c, ggml_abs(c, score), 1e-6f, INFINITY));
+    ggml_tensor * gate = ggml_sigmoid(c, ggml_mul(c, ggml_sgn(c, score), mag));
+    ggml_tensor * repeated_value = repeat_dim1(c,
+        ggml_reshape_3d(c, value, n_embd, 1, T), hc);
+    ggml_tensor * gated = ggml_mul(c, repeated_value, gate);
+    ggml_tensor * normalized = ggml_reshape_2d(c,
+        grouped_norm(ggml_reshape_2d(c, gated, hc_dim, T), L.ple_norm_conv),
+        hc_dim, T);
+
+    const int64_t kern = w.ple_conv_kernel, dil = w.ple_ngram_size;
+    const int64_t hist = (kern - 1) * dil;
+    ggml_tensor * norm_t = ggml_transpose(c, ggml_reshape_2d(c, normalized, hc_dim, T));
+    ggml_tensor * state = ggml_cont(c,
+        ggml_reshape_3d(c, ple_conv_state, hist, hc_dim, 1));
+    ggml_tensor * padded = ggml_concat(c, state, norm_t, 0);
+    ggml_build_forward_expand(gf, ggml_cpy(c,
+        ggml_cont(c, ggml_view_3d(c, padded, hist, hc_dim, 1,
+            padded->nb[1], padded->nb[2], (size_t) T * padded->nb[0])),
+        ggml_reshape_3d(c, ple_conv_state, hist, hc_dim, 1)));
+
+    ggml_tensor * conv_out = nullptr;
+    for (int64_t k = 0; k < kern; ++k) {
+        const int64_t start = hist - (kern - 1 - k) * dil;
+        ggml_tensor * shifted = ggml_cont(c, ggml_transpose(c,
+            ggml_view_3d(c, padded, T, hc_dim, 1, padded->nb[1],
+                         padded->nb[2], ggml_row_size(padded->type, start))));
+        if (k == 0) shifted->src[1] = norm_t;
+        ggml_tensor * wk = ggml_cont(c,
+            ggml_view_2d(c, L.ple_conv1d, 1, hc_dim, L.ple_conv1d->nb[1],
+                         k * L.ple_conv1d->nb[0]));
+        wk = ggml_reshape_1d(c, wk, hc_dim);
+        if (wk->type != GGML_TYPE_F32) wk = ggml_cast(c, wk, GGML_TYPE_F32);
+        ggml_tensor * term = ggml_mul(c, shifted, wk);
+        conv_out = conv_out ? ggml_add(c, conv_out, term) : term;
+    }
+    conv_out = ggml_reshape_3d(c, ggml_cont(c, ggml_silu(c, conv_out)),
+                               n_embd, hc, T);
+    ggml_tensor * out = ggml_add(c, hidden, ggml_add(c, gated, conv_out));
+    if (dump_mark) dump_mark(out, "ple.packed");
+    ggml_build_forward_expand(gf, out);
+    return out;
+}
+
 static ggml_tensor * column(ggml_context * c, ggml_tensor * x, int s) {
     GGML_ASSERT(s >= 0 && s < x->ne[1]);
     return ggml_view_2d(c, x, x->ne[0], 1, x->nb[1], (size_t) s * x->nb[1]);
@@ -810,23 +970,92 @@ static ggml_tensor * build_linear_attn_projected(ggml_context * c, ggml_cgraph *
     return ggml_reshape_2d(c, out, d_in, 1);
 }
 
+static ggml_tensor * build_linear_attn_projected_sequence(
+        ggml_context * c, ggml_cgraph * gf, ggml_tensor * qkv,
+        ggml_tensor * z, ggml_tensor * beta, ggml_tensor * alpha,
+        const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
+        ggml_tensor * ssm_state, ggml_tensor * conv_state) {
+    const int64_t D = w.ssm_d_state, Hk = w.ssm_n_group;
+    const int64_t Hv = w.linear_value_heads, d_in = w.ssm_d_inner;
+    const int64_t T = qkv->ne[1], kernel = w.ssm_d_conv;
+    const int64_t conv_channels = 2 * Hk * D + d_in;
+    const float eps = w.rms_eps;
+
+    beta = ggml_sigmoid(c, ggml_reshape_4d(c, beta, 1, Hv, T, 1));
+    alpha = ggml_reshape_3d(c, alpha, Hv, T, 1);
+    alpha = ggml_softplus(c, ggml_add(c, alpha, L.ssm_dt_bias));
+    ggml_tensor * gate = ggml_reshape_4d(c,
+        ggml_mul(c, alpha, L.ssm_a), 1, Hv, T, 1);
+
+    ggml_tensor * hist = ggml_reshape_3d(c, conv_state, kernel - 1, conv_channels, 1);
+    ggml_tensor * qkv_t = ggml_transpose(c, qkv);
+    ggml_tensor * conv_input = ggml_concat(c, hist, qkv_t, 0);
+    ggml_tensor * new_hist = ggml_cont(c, ggml_view_3d(c, conv_input,
+        kernel - 1, conv_channels, 1, conv_input->nb[1], conv_input->nb[2],
+        (size_t) T * conv_input->nb[0]));
+    ggml_build_forward_expand(gf, ggml_cpy(c, new_hist,
+        ggml_reshape_3d(c, conv_state, kernel - 1, conv_channels, 1)));
+
+    ggml_tensor * conv_op = ggml_ssm_conv(c, conv_input, L.ssm_conv1d);
+    // The fused kernel's source is a graph dependency, so qkv stays live
+    // through the CONCAT-tail write under allocator reuse.
+    conv_op->src[3] = qkv_t;
+    ggml_tensor * conv = ggml_silu(c, conv_op);
+    const size_t esz = ggml_element_size(conv);
+    const size_t tstride = (size_t) conv_channels * esz;
+    ggml_tensor * q_raw = ggml_view_3d(c, conv, D, Hk, T, D * esz,
+                                       tstride, 0);
+    ggml_tensor * k_raw = ggml_view_3d(c, conv, D, Hk, T, D * esz,
+                                       tstride, D * Hk * esz);
+    static const bool gdnl2_legacy = std::getenv("QWEN4EXP_GDNL2_LEGACY") != nullptr;
+    ggml_tensor * q_c = gdnl2_legacy
+        ? ggml_l2_norm(c, q_raw, eps)
+        : ggml_scale(c, ggml_rms_norm(c, q_raw, eps / (float) D),
+                     1.0f / sqrtf((float) D));
+    ggml_tensor * k_c = gdnl2_legacy
+        ? ggml_l2_norm(c, k_raw, eps)
+        : ggml_scale(c, ggml_rms_norm(c, k_raw, eps / (float) D),
+                     1.0f / sqrtf((float) D));
+    ggml_tensor * v_c = ggml_view_3d(c, conv, D, Hv, T, D * esz,
+                                     tstride, 2 * D * Hk * esz);
+    ggml_tensor * state4 = ggml_reshape_4d(c, ssm_state, D, D, Hv, 1);
+    ggml_tensor * gdn = ggml_gated_delta_net(c, q_c, k_c, v_c, gate, beta, state4);
+    ggml_gated_delta_net_set_skip_intermediate(gdn, true);
+    ggml_tensor * attn = ggml_view_4d(c, gdn, D, Hv, T, 1,
+        ggml_row_size(gdn->type, D),
+        ggml_row_size(gdn->type, D * Hv),
+        ggml_row_size(gdn->type, D * Hv * T), 0);
+    ggml_tensor * new_state = ggml_view_4d(c, gdn, D, D, Hv, 1,
+        ggml_row_size(gdn->type, D),
+        ggml_row_size(gdn->type, D * D),
+        ggml_row_size(gdn->type, D * D * Hv),
+        ggml_row_size(gdn->type, D * Hv * T));
+    ggml_build_forward_expand(gf, ggml_cpy(c, new_state, state4));
+    ggml_tensor * normed = ggml_mul(c, ggml_rms_norm(c, attn, eps), L.ssm_norm);
+    ggml_tensor * out = ggml_mul(c, normed,
+        ggml_sigmoid(c, ggml_reshape_4d(c, z, D, Hv, T, 1)));
+    return ggml_reshape_2d(c, out, d_in, T);
+}
+
 static ggml_tensor * build_full_attn_projected(ggml_context * c, ggml_cgraph * gf,
         ggml_tensor * qfull, ggml_tensor * kraw, ggml_tensor * vraw,
         ggml_tensor * positions, ggml_tensor * mask, const Qwen4ExpLayer & L,
         const Qwen4ExpWeights & w, ggml_tensor * k_cache, ggml_tensor * v_cache,
         int pos0, int64_t kv_view_len) {
     const int64_t D = w.n_embd_head_k, Hq = w.n_head, Hk = w.n_head_kv;
+    const int64_t T = qfull->ne[1];
     const float eps = w.rms_eps;
     ggml_tensor * q = ggml_rms_norm(c,
-        ggml_view_3d(c, qfull, D, Hq, 1, 2 * D * ggml_element_size(qfull),
+        ggml_view_3d(c, qfull, D, Hq, T, 2 * D * ggml_element_size(qfull),
                      2 * D * Hq * ggml_element_size(qfull), 0), eps);
     q = ggml_mul(c, q, L.q_norm);
     ggml_tensor * gate = ggml_cont_2d(c,
-        ggml_view_3d(c, qfull, D, Hq, 1, 2 * D * ggml_element_size(qfull),
-                     2 * D * Hq * ggml_element_size(qfull), D * ggml_element_size(qfull)), D * Hq, 1);
+        ggml_view_3d(c, qfull, D, Hq, T, 2 * D * ggml_element_size(qfull),
+                     2 * D * Hq * ggml_element_size(qfull), D * ggml_element_size(qfull)),
+        D * Hq, T);
     ggml_tensor * k = ggml_mul(c,
-        ggml_rms_norm(c, ggml_reshape_3d(c, kraw, D, Hk, 1), eps), L.k_norm);
-    ggml_tensor * v = ggml_reshape_3d(c, vraw, D, Hk, 1);
+        ggml_rms_norm(c, ggml_reshape_3d(c, kraw, D, Hk, T), eps), L.k_norm);
+    ggml_tensor * v = ggml_reshape_3d(c, vraw, D, Hk, T);
     int sections[4] = { w.rope_sections[0], w.rope_sections[1],
                         w.rope_sections[2], w.rope_sections[3] };
     q = ggml_rope_multi(c, q, positions, nullptr, w.rope_dimension_count, sections,
@@ -836,10 +1065,10 @@ static ggml_tensor * build_full_attn_projected(ggml_context * c, ggml_cgraph * g
     ggml_tensor * kt = ggml_permute(c, ggml_cast(c, k, k_cache->type), 0, 2, 1, 3);
     ggml_tensor * vt = ggml_permute(c, ggml_cast(c, v, v_cache->type), 0, 2, 1, 3);
     ggml_build_forward_expand(gf, ggml_cpy(c, kt,
-        ggml_view_3d(c, k_cache, D, 1, Hk, k_cache->nb[1],
+        ggml_view_3d(c, k_cache, D, T, Hk, k_cache->nb[1],
                      k_cache->nb[2], (size_t) pos0 * k_cache->nb[1])));
     ggml_build_forward_expand(gf, ggml_cpy(c, vt,
-        ggml_view_3d(c, v_cache, D, 1, Hk, v_cache->nb[1],
+        ggml_view_3d(c, v_cache, D, T, Hk, v_cache->nb[1],
                      v_cache->nb[2], (size_t) pos0 * v_cache->nb[1])));
     ggml_tensor * kfull = ggml_view_3d(c, k_cache, D, kv_view_len, Hk,
                                        k_cache->nb[1], k_cache->nb[2], 0);
@@ -849,7 +1078,7 @@ static ggml_tensor * build_full_attn_projected(ggml_context * c, ggml_cgraph * g
     ggml_tensor * attn = ggml_flash_attn_ext(c, qfa, kfull, vfull, mask,
         1.0f / sqrtf((float) D), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
-    return ggml_mul(c, ggml_reshape_2d(c, attn, D * Hq, 1), ggml_sigmoid(c, gate));
+    return ggml_mul(c, ggml_reshape_2d(c, attn, D * Hq, T), ggml_sigmoid(c, gate));
 }
 
 static ggml_tensor * build_ple_row(ggml_context * c, ggml_cgraph * gf,
@@ -1363,6 +1592,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     ggml_set_name(logits, "logits");
     dump_mark(logits, "logits");
     ggml_build_forward_expand(gf, logits);
+    trace_batch_widths(gf, "single", (int) T, (int) graph_kv_len);
 
     // Point input tensors at this call's pinned ring slot before allocation so the gallocr leaves them alone.
     char * ring_embd = nullptr;
@@ -1505,6 +1735,8 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     }
 
     if (prof) t_upload = prof_now_ms();
+    const bool call_telemetry = batch_telemetry_enabled();
+    const double call_begin_s = call_telemetry ? mono_now_s() : 0.0;
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[qwen4exp] graph compute failed\n");
         if (use_stable_graph) {
@@ -1519,6 +1751,11 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
 
     out_logits.resize((size_t) w.n_vocab);
     ggml_backend_tensor_get(logits, out_logits.data(), 0, sizeof(float) * w.n_vocab);
+    if (call_telemetry) {
+        std::fprintf(stderr,
+            "[qwen4exp-forward-call] T=%d pos=%d begin_abs=%.9f done_abs=%.9f\n",
+            n_tokens, pos0, call_begin_s, mono_now_s());
+    }
     if (use_stable_graph) {
         decode_ws.stable_calls++;
         if (stable_telemetry) {
@@ -1890,6 +2127,10 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
     ggml_tensor * logits = ggml_mul_mat(ctx, w.output, final);
     ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
+    int max_kv = 0;
+    for (int s = 0; s < n_slots; ++s)
+        max_kv = std::max(max_kv, positions[s] + 1);
+    trace_batch_widths(gf, "batched", n_slots, max_kv);
 
     if (!workspace.alloc)
         workspace.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -1916,10 +2157,21 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
         std::fill(mask.begin(), mask.begin() + kv_len, ggml_fp32_to_fp16(0.0f));
         ggml_backend_tensor_set(mask_inputs[s], mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
+    const bool batch_telemetry = batch_telemetry_enabled();
+    const auto compute_start = batch_telemetry
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const double compute_begin_s = batch_telemetry ? mono_now_s() : 0.0;
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         workspace.planned = false;
         std::fprintf(stderr, "[qwen4exp] batched graph compute failed\n");
         return result;
+    }
+    if (batch_telemetry) {
+        const double compute_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - compute_start).count();
+        std::fprintf(stderr,
+            "[qwen4exp-batch-time] rows=%d compute_ms=%.3f begin_abs=%.9f done_abs=%.9f\n",
+            n_slots, compute_ms, compute_begin_s, mono_now_s());
     }
     std::vector<float> packed((size_t) w.n_vocab * n_slots);
     ggml_backend_tensor_get(logits, packed.data(), 0, packed.size() * sizeof(float));
@@ -1935,6 +2187,451 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
     result.ok = true;
     result.n_tokens = n_slots;
     result.pos0 = positions[0];
+    return result;
+}
+
+Qwen4ExpForwardResult qwen4exp_forward_packed(
+        ggml_backend_t backend, const Qwen4ExpWeights & w,
+        const Qwen4ExpForwardSegment * segments, int n_segments,
+        Qwen4ExpBatchedDecodeWorkspace & workspace,
+        std::vector<std::vector<float>> & out_logits) {
+    Qwen4ExpForwardResult result;
+    const char * enabled = std::getenv("QWEN4EXP_BATCHED_DECODE");
+    const char * upstream = std::getenv("QWEN4EXP_UPSTREAM");
+    if (!enabled || std::atoi(enabled) == 0 ||
+        (upstream && std::atoi(upstream) != 0) ||
+        !backend || !segments || n_segments <= 0 || n_segments > 8) return result;
+    out_logits.clear();
+    if (!segments[0].cache) return result;
+
+    if (n_segments == 1) {
+        const Qwen4ExpForwardSegment & segment = segments[0];
+        if (!segment.cache || !segment.tokens || segment.n_tokens <= 0) return result;
+        std::vector<float> logits;
+        result = qwen4exp_forward(backend, w, *segment.cache, segment.tokens,
+                                  segment.n_tokens, segment.pos0, logits);
+        if (result.ok) out_logits.push_back(std::move(logits));
+        return result;
+    }
+
+    static const bool layer_trace = std::getenv("QWEN4EXP_LAYER_TRACE") != nullptr;
+    static const bool hc_fused = [] {
+        const char * value = std::getenv("QWEN4EXP_UPSTREAM");
+        return !(value && std::atoi(value) != 0) &&
+               std::getenv("QWEN4EXP_HC_UNFUSED") == nullptr;
+    }();
+    static const bool fa_pad256 = [] {
+        const char * value = std::getenv("QWEN4EXP_FA_PAD256");
+        return value && std::atoi(value) != 0;
+    }();
+    static const bool last_token_ffn = [] {
+        const char * value = std::getenv("QWEN4EXP_LAST_TOKEN_FFN");
+        return !(value && std::atoi(value) == 0);
+    }();
+
+    const int64_t ple_heads = w.ple_n_heads;
+    const int64_t ple_row_size = w.ple_head_dim * ple_heads;
+    const bool has_ple = w.ple_reader.available() &&
+                         !segments[0].cache->ple_layer_ids.empty();
+    std::vector<int> lin_idx(w.n_layer, -1), full_idx(w.n_layer, -1),
+                     ple_idx(w.n_layer, -1);
+    for (int i = 0; i < (int) segments[0].cache->linear_layer_ids.size(); ++i)
+        lin_idx[segments[0].cache->linear_layer_ids[(size_t) i]] = i;
+    for (int i = 0; i < (int) segments[0].cache->full_layer_ids.size(); ++i)
+        full_idx[segments[0].cache->full_layer_ids[(size_t) i]] = i;
+    for (int i = 0; i < (int) segments[0].cache->ple_layer_ids.size(); ++i)
+        ple_idx[segments[0].cache->ple_layer_ids[(size_t) i]] = i;
+
+    std::vector<int> offsets((size_t) n_segments);
+    int total_rows = 0;
+    std::vector<int32_t> all_tokens;
+    std::vector<int64_t> kv_view_lens((size_t) n_segments);
+    for (int s = 0; s < n_segments; ++s) {
+        const Qwen4ExpForwardSegment & segment = segments[s];
+        if (!segment.cache || !segment.tokens || segment.n_tokens <= 0 ||
+            segment.pos0 < 0 ||
+            (int64_t) segment.pos0 + segment.n_tokens > segment.cache->max_ctx ||
+            segment.cache->kv_type != GGML_TYPE_F16 ||
+            segment.cache->linear_layer_ids != segments[0].cache->linear_layer_ids ||
+            segment.cache->full_layer_ids != segments[0].cache->full_layer_ids ||
+            segment.cache->ple_layer_ids != segments[0].cache->ple_layer_ids ||
+            segment.cache->cur_pos != segment.pos0 ||
+            total_rows + segment.n_tokens > 2048) return result;
+        for (int i = 0; i < segment.n_tokens; ++i)
+            if (segment.tokens[i] < 0 || segment.tokens[i] >= w.n_vocab)
+                return result;
+        for (int prev = 0; prev < s; ++prev)
+            if (segments[prev].cache == segment.cache) return result;
+        offsets[(size_t) s] = total_rows;
+        total_rows += segment.n_tokens;
+        all_tokens.insert(all_tokens.end(), segment.tokens,
+                          segment.tokens + segment.n_tokens);
+        const int64_t kv_len = (int64_t) segment.pos0 + segment.n_tokens;
+        kv_view_lens[(size_t) s] = fa_pad256
+            ? (kv_len + 255) / 256 * 256 : kv_len;
+    }
+
+    std::vector<float> embeddings((size_t) w.n_embd * total_rows);
+    if (!w.embedder.embed(all_tokens.data(), total_rows, embeddings.data())) {
+        std::fprintf(stderr, "[qwen4exp] packed CPU embedding failed\n");
+        return result;
+    }
+
+    std::vector<float> ple_data(has_ple ? (size_t) ple_row_size * total_rows : 0);
+    std::vector<std::vector<int32_t>> next_prev((size_t) n_segments);
+    if (has_ple) {
+        const int64_t ng = w.ple_ngram_size;
+        std::vector<int32_t> ple_rows((size_t) total_rows * ple_heads);
+        for (int s = 0; s < n_segments; ++s) {
+            const Qwen4ExpForwardSegment & segment = segments[s];
+            const std::vector<int32_t> & prev = segment.cache->ple_prev;
+            std::vector<int32_t> history = prev;
+            history.insert(history.end(), segment.tokens,
+                           segment.tokens + segment.n_tokens);
+            for (int i = 0; i < segment.n_tokens; ++i) {
+                const int64_t at = (int64_t) prev.size() + i;
+                std::vector<uint64_t> ctx((size_t) ng);
+                ctx[0] = (uint64_t) segment.tokens[i];
+                bool cut = false;
+                for (int64_t j = 1; j < ng; ++j) {
+                    if (cut || at - j < 0) {
+                        ctx[(size_t) j] = (uint64_t) w.ple_eos_token_id;
+                        cut = true;
+                    } else {
+                        const int32_t token = history[(size_t) (at - j)];
+                        if (token < 0 || token == w.ple_eos_token_id) cut = true;
+                        ctx[(size_t) j] = cut
+                            ? (uint64_t) w.ple_eos_token_id : (uint64_t) token;
+                    }
+                }
+                for (int64_t order = 2; order <= ng; ++order) {
+                    uint64_t mixed = ctx[0] * w.ple_layer_multipliers[0];
+                    for (int64_t j = 1; j < order; ++j)
+                        mixed ^= ctx[(size_t) j] *
+                                 w.ple_layer_multipliers[(size_t) j];
+                    const int64_t base = (order - 2) * w.ple_heads_per_ngram;
+                    for (int64_t q = 0; q < w.ple_heads_per_ngram; ++q) {
+                        const int64_t h = base + q;
+                        const size_t row =
+                            ((size_t) offsets[(size_t) s] + (size_t) i) *
+                                (size_t) ple_heads + (size_t) h;
+                        ple_rows[row] = (int32_t)
+                            ((mixed % (uint64_t) w.ple_head_vocab_sizes[(size_t) h]) +
+                             w.ple_head_offsets[(size_t) h]);
+                    }
+                }
+            }
+            const size_t keep = (size_t) std::min<int64_t>(
+                ng - 1, (int64_t) history.size());
+            next_prev[(size_t) s].assign(history.end() - keep, history.end());
+        }
+        if (layer_trace) write_ple_indices(ple_rows);
+        if (!w.ple_reader.gather(ple_rows.data(),
+                (int64_t) ple_rows.size(), ple_data.data())) {
+            std::fprintf(stderr, "[qwen4exp] packed PLE gather failed\n");
+            return result;
+        }
+        if (layer_trace) write_ple_host(ple_data);
+    }
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 400000 +
+                  ggml_graph_overhead_custom(400000, false) + (2u << 20);
+    ip.no_alloc = true;
+    if (!workspace.ctx) workspace.ctx = ggml_init(ip);
+    else ggml_reset(workspace.ctx);
+    ggml_context * ctx = workspace.ctx;
+    if (!ctx) return result;
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 400000, false);
+    if (!gf) return result;
+    std::vector<std::pair<ggml_tensor *, std::string>> trace_tensors;
+    auto trace_mark = [&](ggml_tensor * tensor, const char * label) {
+        if (!layer_trace || !tensor || !trace_layer_selected(label)) return;
+        for (ggml_tensor * base = tensor; base; base = base->view_src)
+            ggml_set_output(base);
+        ggml_set_name(tensor, label);
+        trace_tensors.emplace_back(tensor, label);
+    };
+
+    ggml_tensor * inp_emb = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, w.n_embd, total_rows);
+    ggml_set_input(inp_emb);
+    ggml_tensor * ple_in = nullptr;
+    if (has_ple) {
+        ple_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                    ple_row_size, total_rows);
+        ggml_set_input(ple_in);
+        trace_mark(ple_in, "ple.inp");
+    }
+    ggml_tensor * res_hc = repeat_dim1(ctx,
+        ggml_reshape_3d(ctx, inp_emb, w.n_embd, 1, total_rows), w.n_hc);
+    ggml_tensor * xn_next = nullptr;
+
+    std::vector<ggml_tensor *> position_inputs((size_t) n_segments, nullptr);
+    std::vector<ggml_tensor *> mask_inputs((size_t) n_segments, nullptr);
+    std::vector<std::vector<int32_t>> positions_host((size_t) n_segments);
+    std::vector<std::vector<ggml_fp16_t>> masks_host((size_t) n_segments);
+    for (int s = 0; s < n_segments; ++s) {
+        const Qwen4ExpForwardSegment & segment = segments[s];
+        const int count = segment.n_tokens;
+        positions_host[(size_t) s].assign((size_t) 4 * count, 0);
+        for (int i = 0; i < count; ++i) {
+            const int32_t pos = segment.pos0 + i;
+            for (int axis = 0; axis < 3; ++axis)
+                positions_host[(size_t) s][(size_t) axis * count + i] = pos;
+        }
+        ggml_tensor * position = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_I32, (int64_t) 4 * count);
+        ggml_set_input(position);
+        position_inputs[(size_t) s] = position;
+
+        const int64_t kv_len = (int64_t) segment.pos0 + count;
+        const int64_t mask_len = kv_view_lens[(size_t) s];
+        if (count > 1 || fa_pad256) {
+            ggml_tensor * mask = ggml_new_tensor_2d(
+                ctx, GGML_TYPE_F16, mask_len, count);
+            ggml_set_input(mask);
+            mask_inputs[(size_t) s] = mask;
+            auto & host = masks_host[(size_t) s];
+            host.resize((size_t) mask_len * count);
+            const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+            for (int row = 0; row < count; ++row) {
+                const int64_t visible = (int64_t) segment.pos0 + row;
+                for (int64_t col = 0; col < mask_len; ++col)
+                    host[(size_t) row * mask_len + (size_t) col] =
+                        col <= visible ? zero : ninf;
+            }
+            (void) kv_len;
+        }
+    }
+
+    for (int il = 0; il < w.n_layer; ++il) {
+        const Qwen4ExpLayer & L = w.layers[il];
+        if (L.is_ple && has_ple) {
+            ggml_tensor * key = mm(ctx, L.ple_key, ple_in);
+            ggml_tensor * value = mm(ctx, L.ple_value, ple_in);
+            ggml_tensor * rows = nullptr;
+            for (int s = 0; s < n_segments; ++s) {
+                const int start = offsets[(size_t) s];
+                const int count = segments[s].n_tokens;
+                ggml_tensor * hidden = token_span_3d(ctx, res_hc, start, count);
+                ggml_tensor * row = build_ple_projected(ctx, gf, hidden,
+                    column_span(ctx, key, start, count),
+                    column_span(ctx, value, start, count), L, w,
+                    segments[s].cache->ple_conv_state[(size_t) ple_idx[(size_t) il]],
+                    trace_mark);
+                rows = rows ? ggml_concat(ctx, rows, row, 2) : row;
+            }
+            res_hc = rows;
+            xn_next = nullptr;
+        }
+
+        ggml_tensor * inject = nullptr;
+        ggml_tensor * cur = hc_fused
+            ? hc_mix_from_xn(ctx, xn_next ? xn_next : [&]() {
+                ggml_tensor * xn = ggml_rms_norm(ctx, res_hc, w.rms_eps);
+                xn = ggml_reshape_2d(ctx, xn, w.n_embd * w.n_hc, total_rows);
+                xn = ggml_mul(ctx, xn, L.hc_attn_norm);
+                return ggml_reshape_3d(ctx, xn, w.n_embd, w.n_hc, total_rows);
+            }(), L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject,
+                &inject, w.n_embd, w.n_hc)
+            : hc_mix(ctx, res_hc, L.hc_attn_norm, L.hc_attn_down,
+                L.hc_attn_up, L.hc_attn_inject, &inject,
+                w.n_embd, w.n_hc, w.rms_eps);
+        xn_next = nullptr;
+
+        if (L.is_full_attention) {
+            ggml_tensor * qfull = mm(ctx, L.wq, cur);
+            ggml_tensor * kraw = mm(ctx, L.wk, cur);
+            ggml_tensor * vraw = mm(ctx, L.wv, cur);
+            ggml_tensor * attention_rows = nullptr;
+            const int fi = full_idx[(size_t) il];
+            for (int s = 0; s < n_segments; ++s) {
+                const int start = offsets[(size_t) s];
+                const int count = segments[s].n_tokens;
+                ggml_tensor * attn = build_full_attn_projected(ctx, gf,
+                    column_span(ctx, qfull, start, count),
+                    column_span(ctx, kraw, start, count),
+                    column_span(ctx, vraw, start, count),
+                    position_inputs[(size_t) s], mask_inputs[(size_t) s],
+                    L, w, segments[s].cache->attn_k[(size_t) fi],
+                    segments[s].cache->attn_v[(size_t) fi],
+                    segments[s].pos0, kv_view_lens[(size_t) s]);
+                attention_rows = attention_rows
+                    ? ggml_concat(ctx, attention_rows, attn, 1) : attn;
+            }
+            cur = mm(ctx, L.wo, attention_rows);
+        } else {
+            const int li = lin_idx[(size_t) il];
+            ggml_tensor * qkv = mm(ctx, L.attn_qkv, cur);
+            ggml_tensor * z = mm(ctx, L.attn_gate, cur);
+            ggml_tensor * beta = mm(ctx, L.ssm_beta, cur);
+            ggml_tensor * alpha = mm(ctx, L.ssm_alpha, cur);
+            ggml_tensor * linear_rows = nullptr;
+            for (int s = 0; s < n_segments; ++s) {
+                const int start = offsets[(size_t) s];
+                const int count = segments[s].n_tokens;
+                ggml_tensor * row = build_linear_attn_projected_sequence(ctx, gf,
+                    column_span(ctx, qkv, start, count),
+                    column_span(ctx, z, start, count),
+                    column_span(ctx, beta, start, count),
+                    column_span(ctx, alpha, start, count), L, w,
+                    segments[s].cache->ssm_state[(size_t) li],
+                    segments[s].cache->conv_state[(size_t) li]);
+                linear_rows = linear_rows
+                    ? ggml_concat(ctx, linear_rows, row, 1) : row;
+            }
+            cur = mm(ctx, L.ssm_out, linear_rows);
+        }
+
+        int64_t layer_rows = total_rows;
+        if (last_token_ffn && il == w.n_layer - 1 && total_rows > n_segments) {
+            ggml_tensor * cur_tail = nullptr;
+            ggml_tensor * inject_tail = nullptr;
+            ggml_tensor * residual_tail = nullptr;
+            for (int s = 0; s < n_segments; ++s) {
+                const int tail = offsets[(size_t) s] + segments[s].n_tokens - 1;
+                ggml_tensor * c_row = ggml_view_2d(ctx, cur, cur->ne[0], 1,
+                    cur->nb[1], (size_t) tail * cur->nb[1]);
+                ggml_tensor * i_row = ggml_view_2d(ctx, inject, inject->ne[0], 1,
+                    inject->nb[1], (size_t) tail * inject->nb[1]);
+                ggml_tensor * r_row = ggml_view_3d(ctx, res_hc,
+                    res_hc->ne[0], res_hc->ne[1], 1, res_hc->nb[1],
+                    res_hc->nb[2], (size_t) tail * res_hc->nb[2]);
+                cur_tail = cur_tail ? ggml_concat(ctx, cur_tail, c_row, 1) : c_row;
+                inject_tail = inject_tail
+                    ? ggml_concat(ctx, inject_tail, i_row, 1) : i_row;
+                residual_tail = residual_tail
+                    ? ggml_concat(ctx, residual_tail, r_row, 2) : r_row;
+            }
+            cur = cur_tail;
+            inject = inject_tail;
+            res_hc = residual_tail;
+            layer_rows = n_segments;
+        }
+
+        if (hc_fused) {
+            ggml_tensor * ffn_fused = hc_combine_norm(ctx, inject, res_hc, cur,
+                L.hc_ffn_norm, w.n_embd, w.n_hc, layer_rows, w.rms_eps);
+            res_hc = hc_norm_res(ctx, ffn_fused, w.n_embd, w.n_hc, layer_rows);
+            ggml_tensor * ffn_xn = hc_norm_xn(ctx, ffn_fused,
+                w.n_embd, w.n_hc, layer_rows);
+            cur = hc_mix_from_xn(ctx, ffn_xn,
+                L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject,
+                &inject, w.n_embd, w.n_hc);
+        } else {
+            res_hc = hc_combine(ctx, res_hc, cur, inject,
+                                w.n_embd, w.n_hc, layer_rows);
+            cur = hc_mix(ctx, res_hc, L.hc_ffn_norm,
+                L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject,
+                &inject, w.n_embd, w.n_hc, w.rms_eps);
+        }
+        cur = build_moe(ctx, cur, L, w, il, trace_mark);
+        const bool next_ple = il + 1 < w.n_layer &&
+                              w.layers[il + 1].is_ple && has_ple;
+        if (next_ple) {
+            res_hc = hc_combine(ctx, res_hc, cur, inject, w.n_embd, w.n_hc,
+                                layer_rows);
+            xn_next = nullptr;
+        } else if (hc_fused) {
+            ggml_tensor * gamma = il + 1 < w.n_layer
+                ? w.layers[il + 1].hc_attn_norm : w.output_hc_norm;
+            ggml_tensor * f = hc_combine_norm(ctx, inject, res_hc, cur,
+                gamma, w.n_embd, w.n_hc, layer_rows, w.rms_eps);
+            res_hc = hc_norm_res(ctx, f, w.n_embd, w.n_hc, layer_rows);
+            xn_next = hc_norm_xn(ctx, f, w.n_embd, w.n_hc, layer_rows);
+        } else {
+            res_hc = hc_combine(ctx, res_hc, cur, inject,
+                                w.n_embd, w.n_hc, layer_rows);
+            xn_next = nullptr;
+        }
+    }
+
+    if (!last_token_ffn && total_rows > n_segments) {
+        ggml_tensor * residual_tail = nullptr;
+        ggml_tensor * xn_tail = nullptr;
+        for (int s = 0; s < n_segments; ++s) {
+            const int tail = offsets[(size_t) s] + segments[s].n_tokens - 1;
+            ggml_tensor * row = ggml_view_3d(ctx, res_hc,
+                res_hc->ne[0], res_hc->ne[1], 1, res_hc->nb[1],
+                res_hc->nb[2], (size_t) tail * res_hc->nb[2]);
+            residual_tail = residual_tail
+                ? ggml_concat(ctx, residual_tail, row, 2) : row;
+            if (xn_next) {
+                ggml_tensor * xrow = ggml_view_2d(ctx, xn_next,
+                    xn_next->ne[0], 1, xn_next->nb[1],
+                    (size_t) tail * xn_next->nb[1]);
+                xn_tail = xn_tail ? ggml_concat(ctx, xn_tail, xrow, 1) : xrow;
+            }
+        }
+        res_hc = residual_tail;
+        if (xn_next) xn_next = xn_tail;
+    }
+    ggml_tensor * final = xn_next
+        ? hc_mix_from_xn(ctx, xn_next, w.output_hc_down, w.output_hc_up,
+                         nullptr, nullptr, w.n_embd, w.n_hc)
+        : hc_mix(ctx, res_hc, w.output_hc_norm, w.output_hc_down,
+                 w.output_hc_up, nullptr, nullptr,
+                 w.n_embd, w.n_hc, w.rms_eps);
+    ggml_tensor * logits = ggml_mul_mat(ctx, w.output, final);
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+    int max_kv = 0;
+    for (int s = 0; s < n_segments; ++s)
+        max_kv = std::max(max_kv,
+            segments[s].pos0 + segments[s].n_tokens);
+    trace_batch_widths(gf, "packed", total_rows, max_kv);
+
+    if (!workspace.alloc)
+        workspace.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!workspace.alloc || !ggml_gallocr_reserve(workspace.alloc, gf) ||
+        !ggml_gallocr_alloc_graph(workspace.alloc, gf)) {
+        workspace.planned = false;
+        std::fprintf(stderr, "[qwen4exp] packed graph allocation failed (segments=%d rows=%d)\n",
+                     n_segments, total_rows);
+        return result;
+    }
+    workspace.planned = true;
+    ggml_backend_tensor_set(inp_emb, embeddings.data(), 0,
+                            embeddings.size() * sizeof(float));
+    if (ple_in)
+        ggml_backend_tensor_set(ple_in, ple_data.data(), 0,
+                                ple_data.size() * sizeof(float));
+    for (int s = 0; s < n_segments; ++s) {
+        ggml_backend_tensor_set(position_inputs[(size_t) s],
+            positions_host[(size_t) s].data(), 0,
+            positions_host[(size_t) s].size() * sizeof(int32_t));
+        if (mask_inputs[(size_t) s])
+            ggml_backend_tensor_set(mask_inputs[(size_t) s],
+                masks_host[(size_t) s].data(), 0,
+                masks_host[(size_t) s].size() * sizeof(ggml_fp16_t));
+    }
+    const bool batch_telemetry = batch_telemetry_enabled();
+    const double compute_begin_s = batch_telemetry ? mono_now_s() : 0.0;
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        workspace.planned = false;
+        std::fprintf(stderr, "[qwen4exp] packed graph compute failed\n");
+        return result;
+    }
+    if (batch_telemetry)
+        std::fprintf(stderr,
+            "[qwen4exp-packed-time] segments=%d rows=%d begin_abs=%.9f done_abs=%.9f\n",
+            n_segments, total_rows, compute_begin_s, mono_now_s());
+
+    std::vector<float> packed_logits((size_t) w.n_vocab * n_segments);
+    ggml_backend_tensor_get(logits, packed_logits.data(), 0,
+                            packed_logits.size() * sizeof(float));
+    out_logits.resize((size_t) n_segments);
+    for (int s = 0; s < n_segments; ++s) {
+        const auto begin = packed_logits.begin() + (size_t) s * w.n_vocab;
+        out_logits[(size_t) s].assign(begin, begin + w.n_vocab);
+        segments[s].cache->ple_prev = std::move(next_prev[(size_t) s]);
+    }
+    if (layer_trace) write_layer_trace(backend, trace_tensors);
+    result.ok = true;
+    result.n_tokens = total_rows;
+    result.pos0 = segments[0].pos0;
     return result;
 }
 
