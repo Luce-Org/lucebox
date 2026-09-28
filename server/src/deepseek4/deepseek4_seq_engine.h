@@ -87,7 +87,8 @@ private:
     struct StagedPass {
         struct Member {
             int slot = -1;
-            uint64_t request_id = 0;
+            ImagePromptHandle images;  // keeps the pass's image rows alive
+            uint64_t request_id = 0;   // identifies the request (text too)
             int rows = 0;
         };
         DeepSeek4PrefillPass pass;

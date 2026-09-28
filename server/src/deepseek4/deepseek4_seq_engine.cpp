@@ -83,7 +83,7 @@ bool DeepSeek4SeqEngine::stage_text_prompt(
     // prompt spans many sixteen-row (one-row on the hybrid path) steps.
     constexpr int kMinStagedTextTokens = 64;
     const int prefix = int(prompt.size()) - 1;
-    if (!b_.text_staging_available() || prefix < kMinStagedTextTokens ||
+    if (!b_.text_staging_available() || int(prompt.size()) < kMinStagedTextTokens ||
         prompt.size() > size_t(b_.cache_.max_ctx) || staging_in_flight(slot)) {
         return false;
     }
@@ -241,11 +241,15 @@ void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
     if (!staged_pass_ && !pending_images_.empty()) {
         std::vector<DeepSeek4StagedPrefill *> items;
         std::vector<int> slots;
-        for (auto & pending : pending_images_) {
-            if (pending.staged.finished()) continue;
-            if (!pending.staged.images && b_.staged_text_uses_chunks()) continue;
-            items.push_back(&pending.staged);
-            slots.push_back(pending.slot);
+        // Image blocks take the budget first: a long text prompt must not
+        // hold co-pending image staging back for its whole prefill.
+        for (int text = 0; text < 2; ++text) {
+            for (auto & pending : pending_images_) {
+                if (pending.staged.finished() || bool(pending.staged.images) == bool(text)) continue;
+                if (text && b_.staged_text_uses_chunks()) continue;
+                items.push_back(&pending.staged);
+                slots.push_back(pending.slot);
+            }
         }
         auto staged = std::make_unique<StagedPass>();
         std::vector<int> rows;
@@ -255,7 +259,8 @@ void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
                                                         : DS4_STAGED_PREFILL_ROWS_WITHOUT_DECODE,
                                         staged->pass, rows)) {
             for (size_t k = 0; k < items.size(); ++k) {
-                if (rows[k] > 0) staged->members.push_back({slots[k], items[k]->request_id, rows[k]});
+                if (rows[k] > 0) staged->members.push_back(
+                    {slots[k], items[k]->images, items[k]->request_id, rows[k]});
             }
             staged->started = std::chrono::steady_clock::now();
             staged_pass_ = std::move(staged);

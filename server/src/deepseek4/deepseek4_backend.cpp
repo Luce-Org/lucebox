@@ -1244,8 +1244,13 @@ bool DeepSeek4Backend::run_staged_text_chunk(StagedPrefill & item, int max_rows,
     const int remaining = item.prefix - item.done;
     // The row budget is the caller's (it trades decode stalls against the
     // per-chunk fixed cost); only the late-context scratch bound applies.
+    // Same placement-aware cap as single-request sparse prefill: only the
+    // qualified R9700 + Strix Halo placement takes 2K chunks at long context.
+    const int capped = deepseek4_hybrid_prefill_chunk_tokens(
+        std::max(min_rows, max_rows), item.prefix,
+        hybrid_prefill_chunk_cap_, hybrid_long_context_chunk_);
     int n = deepseek4_hybrid_prefill_step_tokens(
-        std::max(min_rows, max_rows), item.done, remaining);
+        std::max(min_rows, capped), item.done, remaining);
     n = std::min(n, remaining);
     if (n < remaining && remaining - n < min_rows) n = remaining - min_rows;
     if (n < min_rows) n = remaining;  // the whole short tail in one chunk
@@ -2107,6 +2112,7 @@ bool DeepSeek4Backend::init() {
                 // Text staging is an optimization: keep serving without it.
                 for (auto & cache : image_staging_caches_) free_deepseek4_cache(*cache);
                 image_staging_caches_.clear();
+                free_deepseek4_cache(cache_);  // paged text serving does not use it
                 std::fprintf(stderr, "[deepseek4] staging caches do not fit (%d x ctx=%d): text prompts "
                                      "prefill in the batch\n", cfg_.max_concurrency, max_ctx);
             }
