@@ -16,7 +16,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LUCE_ADAPTIVE_SPEC_WIDTH` | unset | BURN-IN: =1 enables the shared acceptance-feedback verify-width controller. Fixed width is the production default; backend-specific overrides take precedence. |
+| `LUCE_ADAPTIVE_SPEC_WIDTH` | unset | BURN-IN: =1 enables the shared acceptance-feedback verify-width controller for single-request speculative decoding. Fixed width is the production default there; backend-specific overrides take precedence. The Qwen3.5/3.6/3.8 concurrent engine (`--max-concurrency` > 1) uses the controller by default, choosing 4/8/block per round from per-depth acceptance and measured round cost; =0 restores the fixed block width there. |
 | `LUCE_FA256_MMA` | 1 on RDNA4 | KILL SWITCH (burn-in): =0 restores the generic tile kernel for head-256 attention on RDNA4. With the default 1, prefill-sized head-256 batches take the rocWMMA kernel below ~32K KV and the raw-MMA kernel beyond (rocWMMA requires a `GGML_HIP_ROCWMMA_FATTN` build; without it the raw-MMA kernel covers all shapes). |
 | `LUCE_FA256_WMMA` | unset | A/B: =1 forces the rocWMMA kernel on head-256 RDNA4 shapes whose KV length is a multiple of 256, bypassing the KV-length crossover (requires a `GGML_HIP_ROCWMMA_FATTN` build). |
 | `LUCE_FA256_WMMA_MAX_KV` | 32768 | KV length above which the head-256 tensor-core route switches from the rocWMMA kernel to the raw-MMA kernel in `GGML_HIP_ROCWMMA_FATTN` builds (measured crossover on gfx1201). |
@@ -114,7 +114,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_QWEN35_MASK_FULL_WIDTH` - qwen35/prefill_helpers.h
 - `LUCE_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h
 - `LUCE_ADAPTIVE_K_TAU` - mmid_adaptive_k.h
-- `LUCE_ADAPTIVE_SPEC_WIDTH` - adaptive_spec_width.h
+- `LUCE_ADAPTIVE_SPEC_WIDTH` - adaptive_spec_width.h, qwen35_seq_engine.cpp
 - `LUCE_ADAPTIVE_WIDTH_MIN` - adaptive_verify_width.h
 - `LUCE_ADAPTIVE_WIDTH_THETA` - adaptive_verify_width.h
 - `LUCE_ARGS` - scripts/entrypoint.sh (extra `luce_server` flags, split on whitespace)

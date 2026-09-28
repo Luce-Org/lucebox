@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include "common/adaptive_spec_width.h"
 #include "common/concurrency/seq_engine.h"
 #include "common/concurrency/paged_kv_offload.h"
 #include "common/dflash_draft_kv.h"
@@ -29,7 +30,9 @@
 #include "../qwen35_image_request.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -191,6 +194,15 @@ private:
     StepResult step_chain_spec(
         const StepPlan & plan, const std::vector<uint8_t> & selected,
         PreparedChainRound && prepared);
+    // Verify width for one batched chain round. With
+    // LUCE_ADAPTIVE_SPEC_WIDTH=1 each batch bucket keeps its own
+    // AdaptiveSpecWidth: a round's cost depends on the total verify rows
+    // (lanes x width), while the width that maximizes committed tokens per
+    // unit cost does not depend on how many lanes share the same acceptance.
+    int choose_chain_width(int bucket);
+    void observe_chain_width(int bucket, int width,
+                             const std::vector<size_t> & accepted,
+                             double step_ms);
     PrefixStoreEvent capture_prefix(
         int slot, PrefixCaptureTicket ticket);
     bool arm_capture(
@@ -204,6 +216,27 @@ private:
     int64_t         scratch_row_ = 0;
     FixedChainConfig fixed_chain_;
     bool            fixed_chain_ready_ = false;
+    struct ChainWidthState {
+        AdaptiveSpecWidth controller;
+        std::vector<int>  offers;  // rounds offered at each width
+        long long rounds = 0;
+        double    accepted_sum = 0.0;
+        size_t    lane_rounds = 0;
+        // Per-depth trials and acceptances (decayed). A depth is a trial
+        // only when it was offered and every shallower candidate was
+        // accepted, so a narrow width does not bias the deeper estimates.
+        std::vector<double> depth_trials;
+        std::vector<double> depth_accepts;
+        explicit ChainWidthState(int max_width)
+            : controller(max_width, 2, true),
+              offers(static_cast<size_t>(max_width) + 1, 0),
+              depth_trials(static_cast<size_t>(max_width), 0.0),
+              depth_accepts(static_cast<size_t>(max_width), 0.0) {}
+    };
+    bool adaptive_chain_width_ = false;
+    std::vector<int> chain_width_choices_;  // ascending, includes the block
+    std::map<int, ChainWidthState> chain_width_by_bucket_;
+    std::chrono::steady_clock::time_point chain_round_t0_{};
     ggml_context *  feature_view_ctx_ = nullptr;
     std::vector<DraftFeatureMirror> slot_feature_mirrors_;
     std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;
