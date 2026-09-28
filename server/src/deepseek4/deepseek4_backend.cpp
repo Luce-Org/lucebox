@@ -2092,11 +2092,7 @@ bool DeepSeek4Backend::init() {
             // staging cache (slot 0 uses cache_), then copy it into the paged
             // slot. All of them are allocated now, so memory is committed at
             // startup rather than in the middle of a request.
-            if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
-                std::fprintf(stderr, "[deepseek4] failed to allocate KV cache (ctx=%d)\n", max_ctx);
-                return false;
-            }
-            bool staged = true;
+            bool staged = create_deepseek4_cache(backend_, w_, max_ctx, cache_);
             image_staging_caches_.clear();
             for (int slot = 1; staged && slot < cfg_.max_concurrency; ++slot) {
                 auto cache = std::make_unique<DeepSeek4Cache>();
