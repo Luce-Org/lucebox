@@ -217,7 +217,8 @@ private:
     bool            fixed_chain_ready_ = false;
     struct ChainWidthState {
         AdaptiveSpecWidth controller;
-        std::vector<int>  offers;  // rounds offered at each width
+        std::vector<int>  offers;   // rounds offered at each width
+        std::vector<int>  samples;  // clean cost samples at each width
         long long rounds = 0;
         double    accepted_sum = 0.0;
         size_t    lane_rounds = 0;
@@ -229,6 +230,7 @@ private:
         explicit ChainWidthState(int max_width)
             : controller(max_width, 2, true),
               offers(static_cast<size_t>(max_width) + 1, 0),
+              samples(static_cast<size_t>(max_width) + 1, 0),
               depth_trials(static_cast<size_t>(max_width), 0.0),
               depth_accepts(static_cast<size_t>(max_width), 0.0) {}
     };

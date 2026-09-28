@@ -734,7 +734,10 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
 namespace {
 // Offers per width before the controller decides for a new lane count.
 // Rounds that rebuild their graph are not cost samples.
-constexpr int kChainWidthCalibrationOffers = 3;
+constexpr int kChainWidthCalibrationSamples = 2;
+// A width that keeps landing on rounds with AR peers or a graph rebuild
+// stops being forced after this many offers.
+constexpr int kChainWidthCalibrationMaxOffers = 8;
 // Per-round decay of the depth statistics, so they follow the live mix.
 constexpr double kChainDepthDecay = 0.98;
 // Beta prior on each conditional acceptance (mean 0.7, weight 2 trials).
@@ -748,8 +751,9 @@ int Qwen35SeqEngine::choose_chain_width(int lanes) {
     ChainWidthState & state =
         chain_width_by_lanes_.try_emplace(lanes, full).first->second;
     for (int width : chain_width_choices_) {
-        if (state.offers[static_cast<size_t>(width)] <
-                kChainWidthCalibrationOffers) {
+        const size_t w = static_cast<size_t>(width);
+        if (state.samples[w] < kChainWidthCalibrationSamples &&
+            state.offers[w] < kChainWidthCalibrationMaxOffers) {
             return width;
         }
     }
@@ -787,6 +791,7 @@ void Qwen35SeqEngine::observe_chain_width(
     // Every lane is an acceptance sample; the round is one cost sample when
     // it is clean (step_ms < 0 marks a round that is not).
     const float cost = step_ms > 0.0 ? static_cast<float>(step_ms) : -1.0f;
+    if (cost > 0.0f) ++state.samples[static_cast<size_t>(width)];
     for (size_t lane = 0; lane < accepted.size(); ++lane) {
         state.controller.observe(static_cast<int>(accepted[lane]), width,
                                  lane == 0 ? cost : -1.0f);
@@ -841,6 +846,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         int slot = -1;
         std::vector<int32_t> tokens;
         size_t accepted = 0;
+        size_t verified = 0;  // target-verified prefix before policy clamps
         int32_t pending = -1;
         Qwen35SlotManager::StepAppend append;
         int seq_len = -1;
@@ -1142,6 +1148,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             posterior.data() + static_cast<size_t>(row_base);
         size_t accepted = chain_verified_prefix(
             proposal.tokens, lane_posterior, static_cast<size_t>(tree_width));
+        proposal.verified = accepted;
         const int room =
             slots_.max_context() - slots_.slot(proposal.slot).cur_pos;
         accepted = std::min(accepted, static_cast<size_t>(std::max(0, room)));
@@ -1335,8 +1342,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     if (adaptive_chain_width_) {
         std::vector<size_t> accepted;
         accepted.reserve(proposals.size());
+        // Model acceptance, not the committed length: the room and
+        // min-token clamps are serving policy, not rejections.
         for (const Proposal & proposal : proposals) {
-            accepted.push_back(proposal.accepted);
+            accepted.push_back(proposal.verified);
         }
         const double step_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - chain_round_t0_).count();
