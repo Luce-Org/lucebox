@@ -137,6 +137,11 @@ public:
     int  snapshot_cur_pos(int slot) const override;
     size_t snapshot_bytes_estimate(int tokens) const override;
     int snapshot_granularity() const override;
+    MemoryReport memory_report() const override;
+    // memory_report() for an explicit cache and snapshot array.
+    static MemoryReport memory_report_for(const TargetCache & cache,
+                                          const PrefixSnapshot * snapshots,
+                                          int n_snapshots);
 
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,

@@ -72,6 +72,32 @@ Qwen35SeqEngine::Qwen35SeqEngine(
         b_.cache_.target_feat && b_.cache_.target_feat_cap > 0;
     if (!fixed_chain_ready_) return;
 
+    // Candidate verify widths: a few shapes keep graph builds and captures
+    // bounded while covering the measured optimum at 1..8 lanes.
+    // On by default for batched serving (measured: never slower than the
+    // fixed block, +6-37% aggregate at 2-8 lanes); LUCE_ADAPTIVE_SPEC_WIDTH=0
+    // restores the fixed block width.
+    {
+        const char * env = std::getenv("LUCE_ADAPTIVE_SPEC_WIDTH");
+        adaptive_chain_width_ = !(env && env[0] == '0' && env[1] == '\0');
+    }
+    for (int width : {4, 8, fixed_chain_.width}) {
+        if (width >= 2 && width <= fixed_chain_.width &&
+            std::find(chain_width_choices_.begin(), chain_width_choices_.end(),
+                      width) == chain_width_choices_.end()) {
+            chain_width_choices_.push_back(width);
+        }
+    }
+    std::sort(chain_width_choices_.begin(), chain_width_choices_.end());
+    if (adaptive_chain_width_) {
+        std::fprintf(stderr,
+            "[parallel] adaptive DFlash2 verify width: widths");
+        for (int width : chain_width_choices_) {
+            std::fprintf(stderr, " %d", width);
+        }
+        std::fprintf(stderr, " (per batch bucket, acceptance x cost)\n");
+    }
+
     ggml_init_params params{};
     params.mem_size = ggml_tensor_overhead() *
         static_cast<size_t>(n_slots + 1);
@@ -705,6 +731,130 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
     return stage;
 }
 
+namespace {
+// Offers per width before the controller decides for a new lane count.
+// Rounds that rebuild their graph are not cost samples.
+constexpr int kChainWidthCalibrationSamples = 2;
+// A width that keeps landing on rounds with AR peers or a graph rebuild
+// stops being forced after this many offers.
+constexpr int kChainWidthCalibrationMaxOffers = 8;
+// Per-round decay of the depth statistics, so they follow the live mix.
+constexpr double kChainDepthDecay = 0.98;
+// Beta prior on each conditional acceptance (mean 0.7, weight 2 trials).
+constexpr double kChainDepthPriorAccepts = 1.4;
+constexpr double kChainDepthPriorTrials = 2.0;
+}  // namespace
+
+int Qwen35SeqEngine::choose_chain_width(int bucket) {
+    const int full = fixed_chain_.width;
+    if (!adaptive_chain_width_ || chain_width_choices_.empty()) return full;
+    ChainWidthState & state =
+        chain_width_by_bucket_.try_emplace(bucket, full).first->second;
+    for (int width : chain_width_choices_) {
+        const size_t w = static_cast<size_t>(width);
+        if (state.samples[w] < kChainWidthCalibrationSamples &&
+            state.offers[w] < kChainWidthCalibrationMaxOffers) {
+            return width;
+        }
+    }
+    // Conditional acceptance of each candidate depth. Depths never tried
+    // inherit the deepest measured rate (geometric continuation).
+    std::vector<float> & conditional = state.conditional;
+    conditional.assign(static_cast<size_t>(full - 1), 0.7f);
+    float last = 0.7f;
+    for (int depth = 1; depth < full; ++depth) {
+        const double trials = state.depth_trials[static_cast<size_t>(depth)];
+        if (trials >= 1.0) {
+            last = static_cast<float>(
+                (state.depth_accepts[static_cast<size_t>(depth)] +
+                 kChainDepthPriorAccepts) /
+                (trials + kChainDepthPriorTrials));
+        }
+        conditional[static_cast<size_t>(depth - 1)] = last;
+    }
+    const int wanted =
+        state.controller.next_width_cost_aware(conditional, full);
+    int width = chain_width_choices_.front();
+    for (int choice : chain_width_choices_) {
+        if (choice <= wanted) width = choice;
+    }
+    return width;
+}
+
+void Qwen35SeqEngine::observe_chain_width(
+        int bucket, int width, const std::vector<size_t> & accepted,
+        double step_ms) {
+    if (!adaptive_chain_width_) return;
+    auto it = chain_width_by_bucket_.find(bucket);
+    if (it == chain_width_by_bucket_.end()) return;
+    ChainWidthState & state = it->second;
+    // Saturating counters: they only gate calibration.
+    int & offers = state.offers[static_cast<size_t>(width)];
+    offers = std::min(offers + 1, kChainWidthCalibrationMaxOffers);
+    // Every lane is an acceptance sample; the round is one cost sample when
+    // it is clean (step_ms < 0 marks a round that is not).
+    const float cost = step_ms > 0.0 ? static_cast<float>(step_ms) : -1.0f;
+    if (cost > 0.0f) {
+        int & samples = state.samples[static_cast<size_t>(width)];
+        samples = std::min(samples + 1, kChainWidthCalibrationSamples);
+    }
+    // The controller's clean-draft flag comes from its last observe(), so
+    // the round's majority outcome is observed last (with the cost sample);
+    // otherwise one arbitrary lane would drive the next exploration step.
+    size_t clean = 0;
+    for (size_t accepted_width : accepted) {
+        clean += accepted_width >= static_cast<size_t>(width);
+    }
+    const bool round_clean = 2 * clean > accepted.size();
+    size_t last = accepted.size();
+    for (size_t lane = 0; lane < accepted.size(); ++lane) {
+        if ((accepted[lane] >= static_cast<size_t>(width)) == round_clean) {
+            last = lane;
+            break;
+        }
+    }
+    for (size_t lane = 0; lane < accepted.size(); ++lane) {
+        if (lane == last) continue;
+        state.controller.observe(static_cast<int>(accepted[lane]), width, -1.0f);
+    }
+    if (last < accepted.size()) {
+        state.controller.observe(static_cast<int>(accepted[last]), width, cost);
+    }
+    for (double & trials : state.depth_trials) trials *= kChainDepthDecay;
+    for (double & accepts : state.depth_accepts) accepts *= kChainDepthDecay;
+    for (size_t lane = 0; lane < accepted.size(); ++lane) {
+        // accepted includes the seed: candidates 1..accepted-1 passed, and
+        // candidate `accepted` (if offered) was the first rejection.
+        const int passed = static_cast<int>(accepted[lane]) - 1;
+        for (int depth = 1; depth < width; ++depth) {
+            if (depth <= passed) {
+                state.depth_trials[static_cast<size_t>(depth)] += 1.0;
+                state.depth_accepts[static_cast<size_t>(depth)] += 1.0;
+            } else {
+                state.depth_trials[static_cast<size_t>(depth)] += 1.0;
+                break;
+            }
+        }
+    }
+    ++state.rounds;
+    for (size_t lane = 0; lane < accepted.size(); ++lane) {
+        state.accepted_sum += static_cast<double>(accepted[lane]);
+    }
+    state.lane_rounds += accepted.size();
+    if (state.rounds % 1024 == 0) {
+        std::fprintf(stderr, "[parallel] adaptive width bucket=%d rounds=%lld "
+                     "mean_accepted=%.2f offers:", bucket,
+                     (long long) state.rounds,
+                     state.lane_rounds ? state.accepted_sum / state.lane_rounds : 0.0);
+        for (int choice : chain_width_choices_) {
+            std::fprintf(stderr, " w%d=%d", choice,
+                         state.offers[static_cast<size_t>(choice)]);
+        }
+        std::fprintf(stderr, " next=%d\n",
+                     choose_chain_width(bucket));
+    }
+}
+
 SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         const StepPlan & plan, const std::vector<uint8_t> & selected,
         PreparedChainRound && prepared_round) {
@@ -720,6 +870,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         int slot = -1;
         std::vector<int32_t> tokens;
         size_t accepted = 0;
+        size_t verified = 0;  // target-verified prefix before policy clamps
         int32_t pending = -1;
         Qwen35SlotManager::StepAppend append;
         int seq_len = -1;
@@ -733,7 +884,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         int32_t pending = -1;
     };
 
-    const int tree_width = fixed_chain_.width;
+    const int full_width = fixed_chain_.width;
     const int hidden = b_.w_.n_embd;
     const int n_head_kv = b_.w_.n_head_kv;
     const int n_slots = slots_.slot_count();
@@ -758,7 +909,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             }
             PreparedChainDraft & prepared = prepared_round.drafts[i];
             if (prepared.tokens.size() !=
-                    static_cast<size_t>(tree_width) ||
+                    static_cast<size_t>(full_width) ||
                 prepared.tokens.front() != input.token) {
                 result.error = "prepared DFlash2 chain is invalid";
                 return result;
@@ -852,6 +1003,17 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     const int spec_count = static_cast<int>(proposals.size());
     const int ar_count = static_cast<int>(ar_lanes.size());
     const int tree_bucket = chain_decode_bucket_width(spec_count);
+    // The drafter always proposes the full block; a narrower round verifies
+    // the leading prefix of every chain, which is the same chain truncated.
+    // Controllers are keyed by the verify graph bucket: the graph is built
+    // for tree_bucket lanes (missing lanes are padding), so a round's cost is
+    // set by the bucket and width, not by how many lanes are real.
+    const int tree_width = choose_chain_width(tree_bucket);
+    if (tree_width < full_width) {
+        for (Proposal & proposal : proposals) {
+            proposal.tokens.resize(static_cast<size_t>(tree_width));
+        }
+    }
     const int tree_rows_count = tree_width * tree_bucket;
     const int total_rows = ar_count + tree_rows_count;
 
@@ -865,6 +1027,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     }
 
     StepGraph & graph = b_.sg_;
+    const ggml_cgraph * graph_before = graph.gf;
     if (!build_target_step_paged_tree(
             graph, b_.w_, b_.cache_, b_.target_backend_,
             tree_width, tree_bucket, max_prefix,
@@ -873,6 +1036,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         result.error = "fixed chain target graph build failed";
         return result;
     }
+    // A rebuilt graph (new width, context bucket or AR mix) puts its build
+    // time into this round; such a round is not a cost sample.
+    const bool graph_rebuilt = graph.gf != graph_before;
 
     std::vector<int32_t> tokens(static_cast<size_t>(total_rows), 0);
     std::vector<int32_t> parents(
@@ -1007,6 +1173,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             posterior.data() + static_cast<size_t>(row_base);
         size_t accepted = chain_verified_prefix(
             proposal.tokens, lane_posterior, static_cast<size_t>(tree_width));
+        proposal.verified = accepted;
         const int room =
             slots_.max_context() - slots_.slot(proposal.slot).cur_pos;
         accepted = std::min(accepted, static_cast<size_t>(std::max(0, room)));
@@ -1197,6 +1364,22 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         }
     }
 
+    if (adaptive_chain_width_) {
+        std::vector<size_t> & accepted = chain_accepted_scratch_;
+        accepted.clear();
+        // Model acceptance, not the committed length: the room and
+        // min-token clamps are serving policy, not rejections.
+        for (const Proposal & proposal : proposals) {
+            accepted.push_back(proposal.verified);
+        }
+        const double step_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - chain_round_t0_).count();
+        // Rounds with AR peers or a fresh graph still teach acceptance, but
+        // their time is not the cost of this width at this lane count.
+        observe_chain_width(tree_bucket, tree_width, accepted,
+                            ar_count == 0 && !graph_rebuilt ? step_ms : -1.0);
+    }
+
     result.decode.reserve(inputs.size());
     for (size_t i = 0; i < inputs.size(); ++i) {
         DecodeOutput output;
@@ -1283,6 +1466,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         chain_lanes.begin(), chain_lanes.end(),
         [](uint8_t selected) { return selected != 0; });
     if (has_chain_lane) {
+        chain_round_t0_ = std::chrono::steady_clock::now();
         std::optional<PreparedChainRound> prepared =
             prepare_chain_drafts(inputs, chain_lanes);
         if (prepared) {

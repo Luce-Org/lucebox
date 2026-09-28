@@ -21,6 +21,7 @@
 #include "server/api_types.h"
 #include "server/http_server.h"
 #include "server/image_input.h"
+#include "qwen35/qwen35_backend.h"
 #include "engine/luce_engine.h"
 #include "server/chat_template.h"
 #include "common/concurrency/seq_engine.h"
@@ -152,6 +153,18 @@ struct SchedulerTestHarness {
     static const std::vector<int32_t> & slot_tokens(
             const HttpServer & server, int slot) {
         return server.slot_tokens_.at(slot);
+    }
+
+    static void publish_memory_report(HttpServer & server) {
+        server.publish_memory_report();
+    }
+
+    static json memory_json(const HttpServer & server) {
+        return server.memory_json();
+    }
+
+    static void mark_agent_turn(HttpServer & server, int slot) {
+        server.agent_turn_cache_slots_.insert(slot);
     }
 };
 }
@@ -5169,6 +5182,66 @@ TEST_CASE(ServerUnitFixture, test_qwen_snapshot_estimate_matches_saved_snapshot)
     ggml_backend_free(cpu);
 }
 
+// The Qwen report adds up the live cache and each snapshot from the buffers
+// snapshot_target_cache() actually allocates.
+TEST_CASE(ServerUnitFixture, test_qwen_memory_report_matches_buffers) {
+    TargetWeights w;
+    w.n_layer = 4;
+    w.full_attention_interval = 4;
+    w.n_embd = 64;
+    w.n_embd_head_k = 32;
+    w.n_embd_head_v = 32;
+    w.n_head = 2;
+    w.n_head_kv = 1;
+    w.ssm_d_conv = 4;
+    w.ssm_d_inner = 64;
+    w.ssm_d_state = 16;
+    w.ssm_dt_rank = 4;
+    w.ssm_n_group = 2;
+    w.n_capture_layers = 5;
+
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    TEST_ASSERT(cpu != nullptr);
+    TargetCache cache;
+    TEST_ASSERT(create_target_cache(w, 64, 0, cpu, cache, /*prefill_only=*/true));
+    PrefixSnapshot snapshots[3];
+    cache.cur_pos = 17;
+    TEST_ASSERT(snapshot_target_cache(w, cache, cpu, snapshots[1]));
+    cache.cur_pos = 40;
+
+    const auto report = Qwen35Backend::memory_report_for(cache, snapshots, 3);
+    TEST_ASSERT(report.available);
+    TEST_ASSERT(report.cache.host);
+    TEST_ASSERT(report.cache.capacity_tokens == 64);
+    TEST_ASSERT(report.cache.live_tokens == 40);
+    uint64_t kv = 0, recurrent = 0;
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        kv += ggml_nbytes(cache.attn_k[i]) + ggml_nbytes(cache.attn_v[i]);
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        recurrent += ggml_nbytes(cache.ssm_state[i]) + ggml_nbytes(cache.conv_state[i]);
+    }
+    TEST_ASSERT(kv > 0 && recurrent > 0);
+    TEST_ASSERT(report.cache.kv_bytes == kv);
+    TEST_ASSERT(report.cache.recurrent_bytes == recurrent);
+    TEST_ASSERT(report.cache.draft_feature_bytes == ggml_nbytes(cache.target_feat));
+    uint64_t allocated = ggml_backend_buffer_get_size(cache.base_buf);
+    if (cache.rollback_buf) allocated += ggml_backend_buffer_get_size(cache.rollback_buf);
+    TEST_ASSERT(report.cache.kv_bytes + report.cache.recurrent_bytes +
+                    report.cache.draft_feature_bytes + report.cache.other_bytes ==
+                allocated);
+    TEST_ASSERT(report.snapshots.size() == 1);
+    TEST_ASSERT(report.snapshots[0].slot == 1);
+    TEST_ASSERT(report.snapshots[0].tokens == 17);
+    TEST_ASSERT(report.snapshots[0].host);
+    TEST_ASSERT(report.snapshots[0].bytes ==
+                ggml_backend_buffer_get_size(snapshots[1].buf));
+
+    free_prefix_snapshot(snapshots[1]);
+    free_target_cache(cache);
+    ggml_backend_free(cpu);
+}
+
 TEST_CASE(ServerUnitFixture, test_jinja_render_basic) {
     std::vector<ChatMessage> msgs = {
         {"system", "you are helpful", ""},
@@ -6009,6 +6082,92 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_budget_resolution) {
     config.concurrent_prefix_cache_max_bytes = 4096;
     budget = resolve_prefix_cache_budget(config, unsized);
     TEST_ASSERT(budget.bytes == 4096 && budget.error.empty());
+    unlink(path.c_str());
+}
+
+struct MemoryReportBackend : MockBackend {
+    MemoryReport memory_report() const override {
+        MemoryReport report;
+        report.available = true;
+        report.cache.capacity_tokens = 4096;
+        report.cache.live_tokens = 1200;
+        report.cache.kv_bytes = 1000;
+        report.cache.recurrent_bytes = 200;
+        report.cache.draft_feature_bytes = 30;
+        report.cache.other_bytes = 4;
+        report.cache.host_state_bytes = 5;
+        report.snapshots = {
+            {0, 1024, 100, true},
+            {1, 2048, 150, true},
+            {3, 512, 60, true},
+            {ModelBackend::kMaxSlots - 1, 256, 40, false, 8},
+        };
+        return report;
+    }
+};
+
+// /props reports where memory goes: the live cache, each saved snapshot
+// labelled by its cache role, and the process's resident set.
+TEST_CASE(ServerUnitFixture, test_props_memory_report) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    LuceEngine engine(std::make_unique<MemoryReportBackend>());
+    ServerConfig config;
+    config.prefix_cache_cap = 2;
+    config.prefill_cache_cap = 2;
+    HttpServer server(engine, tokenizer, config);
+
+    // Before the first report there is nothing to show but the process.
+    json memory = SchedulerTestHarness::memory_json(server);
+    TEST_ASSERT(memory["cache"].is_null());
+    TEST_ASSERT(memory["reports_published"] == 0);
+    TEST_ASSERT(memory["snapshots"]["count"] == 0);
+    TEST_ASSERT(memory["snapshots"]["slots"].is_array());
+    TEST_ASSERT(memory["snapshots"]["slots"].empty());
+
+    SchedulerTestHarness::mark_agent_turn(server, 1);
+    SchedulerTestHarness::publish_memory_report(server);
+    memory = SchedulerTestHarness::memory_json(server);
+    TEST_ASSERT(memory["reports_published"] == 1);
+    const json & cache = memory["cache"];
+    TEST_ASSERT(cache["location"] == "device");
+    TEST_ASSERT(cache["capacity_tokens"] == 4096);
+    TEST_ASSERT(cache["live_tokens"] == 1200);
+    TEST_ASSERT(cache["kv_bytes"] == 1000);
+    TEST_ASSERT(cache["recurrent_bytes"] == 200);
+    TEST_ASSERT(cache["draft_feature_bytes"] == 30);
+    TEST_ASSERT(cache["other_bytes"] == 4);
+    TEST_ASSERT(cache["host_state_bytes"] == 5);
+
+    const json & snapshots = memory["snapshots"];
+    TEST_ASSERT(snapshots["count"] == 4);
+    // The device snapshot's host-side copies count as host memory.
+    TEST_ASSERT(snapshots["host_bytes"] == 310 + 8);
+    TEST_ASSERT(snapshots["device_bytes"] == 40);
+    const json & slots = snapshots["slots"];
+    TEST_ASSERT(slots.size() == 4);
+    TEST_ASSERT(slots[0]["kind"] == "prefix");
+    TEST_ASSERT(slots[0]["tokens"] == 1024);
+    TEST_ASSERT(slots[1]["kind"] == "agent_turn");
+    TEST_ASSERT(slots[2]["kind"] == "prefill_cache");
+    TEST_ASSERT(slots[3]["kind"] == "disk_staging");
+    TEST_ASSERT(slots[3]["location"] == "device");
+    TEST_ASSERT(slots[3]["bytes"] == 48);
+#if defined(__linux__)
+    TEST_ASSERT(memory["process"]["rss_bytes"].get<uint64_t>() > 0);
+    TEST_ASSERT(memory["process"]["peak_rss_bytes"].get<uint64_t>() >=
+                memory["process"]["rss_bytes"].get<uint64_t>());
+#endif
+
+    // A backend without a report still yields a well-formed section.
+    LuceEngine plain_engine(std::make_unique<MockBackend>());
+    HttpServer plain(plain_engine, tokenizer, config);
+    SchedulerTestHarness::publish_memory_report(plain);
+    memory = SchedulerTestHarness::memory_json(plain);
+    TEST_ASSERT(memory["cache"].is_null());
+    TEST_ASSERT(memory["snapshots"]["count"] == 0);
     unlink(path.c_str());
 }
 

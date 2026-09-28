@@ -105,6 +105,7 @@ public:
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
     size_t snapshot_bytes_estimate(int tokens) const override;
+    MemoryReport memory_report() const override;
     // Ondisk prefix cache: DeepSeek snapshots are CPU ggml contexts whose
     // tensors carry stable names plus a meta/logits/feature sidecar, so they
     // serialize and rebind like the Qwen snapshots do.
@@ -159,6 +160,7 @@ private:
     // Batched image serving: one single-request staging cache per slot
     // (slot 0 uses cache_), allocated at startup.
     std::vector<std::unique_ptr<DeepSeek4Cache>> image_staging_caches_;
+    bool                   text_staging_ = false;
     vision::ImageAdmissionReserves image_reserves_;
 
     // Sampler
@@ -243,6 +245,20 @@ private:
     // that the engine advances a few layers per step.
     using StagedPrefill = DeepSeek4StagedPrefill;
     DeepSeek4Cache * image_staging_cache(int slot);
+    // --ds4-prefill sparse with paged serving: text prompts prefill through
+    // the staging caches (layer-major sparse) and are copied into their slot.
+    // A heterogeneous placement stages text only through the in-process
+    // expert path that run_staged_text_chunk() drives.
+    bool text_staging_available() const {
+        return text_staging_ &&
+               (!w_.moe_hybrid ||
+                (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)));
+    }
+    // The shared staged pass needs the whole model on one GPU. With
+    // heterogeneous experts, a text prompt stages one bounded chunk per call
+    // through the regular sparse layer-major prefill instead.
+    bool staged_text_uses_chunks() const { return text_staging_available() && w_.moe_hybrid; }
+    bool run_staged_text_chunk(StagedPrefill & item, int max_rows, std::string & error);
     // Starts encoding an admitted image request: queued on the encoder
     // worker with --mmproj-device, otherwise encoded here.
     bool encode_image_request(const std::vector<int32_t> & prompt, const ImagePromptHandle & images,

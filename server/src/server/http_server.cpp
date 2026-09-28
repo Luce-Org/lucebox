@@ -1810,6 +1810,7 @@ void HttpServer::handle_client(SocketHandle fd) {
             json body = hr.path == "/props"
                 ? build_props_body(config_, prefix_cache_, tool_memory_)
                 : status_.to_json();
+            if (hr.path == "/props") body["memory"] = memory_json();
             body.update(model_routing_status());
             send_response(fd, 200, "application/json", body.dump() + "\n");
             socket_close(fd);
@@ -1825,6 +1826,7 @@ void HttpServer::handle_client(SocketHandle fd) {
     // Introspection: server config + cache stats + arch + capabilities.
     if (hr.method == "GET" && hr.path == "/props") {
         json body = build_props_body(config_, prefix_cache_, tool_memory_);
+        body["memory"] = memory_json();
         send_response(fd, 200, "application/json", body.dump() + "\n");
         socket_close(fd);
         return;
@@ -2020,13 +2022,16 @@ json HttpServer::model_routing_status() {
     std::lock_guard<std::mutex> lock(routing_mu_);
     for (const auto & model : models_) {
         HttpServer & server = *model.server;
+        json props = build_props_body(
+            server.config_, server.prefix_cache_, server.tool_memory_);
+        props["memory"] = server.memory_json();
         models.push_back({{"id", server.config_.model_name},
             {"capacity", model.capacity}, {"in_flight", model.in_flight},
             {"execution_mode", server.backend_.seq_engine() ? "batched" : "single-request"},
             {"target_device", server.config_.target_device},
             {"draft_device", server.config_.draft_device},
             {"max_context", server.config_.max_ctx},
-            {"props", build_props_body(server.config_, server.prefix_cache_, server.tool_memory_)},
+            {"props", std::move(props)},
             {"status", server.status_.to_json()}});
     }
     return {{"routing", "primary-first"}, {"waiting", routing_waiters_},
@@ -4044,6 +4049,91 @@ void HttpServer::trim_snapshots_after_commit(int slot) {
     release(prefix_cache_.enforce_resident_budget(slot));
 }
 
+void HttpServer::publish_memory_report() {
+    const ModelBackend::MemoryReport report = backend_.memory_report();
+    json cache = nullptr;
+    if (report.available) {
+        cache = {
+            {"location", report.cache.host ? "host" : "device"},
+            {"capacity_tokens", report.cache.capacity_tokens},
+            {"live_tokens", report.cache.live_tokens >= 0
+                ? json(report.cache.live_tokens) : json(nullptr)},
+            {"kv_bytes", report.cache.kv_bytes},
+            {"recurrent_bytes", report.cache.recurrent_bytes},
+            {"draft_feature_bytes", report.cache.draft_feature_bytes},
+            {"other_bytes", report.cache.other_bytes},
+            {"host_state_bytes", report.cache.host_state_bytes},
+        };
+    }
+    // Slot ranges: inline prefix entries, then the exact-prompt cache, and
+    // the last backend slot stages disk-cache hits.
+    const int prefix_slots = prefix_cache_.stats().capacity;
+    json slots = json::array();
+    uint64_t host_bytes = 0, device_bytes = 0;
+    for (const auto & snap : report.snapshots) {
+        const char * kind = snap.slot == kDiskStagingSlot ? "disk_staging"
+            : snap.slot >= prefix_slots ? "prefill_cache"
+            : agent_turn_cache_slots_.count(snap.slot) ? "agent_turn"
+            : "prefix";
+        // Host-side copies are system RAM wherever the buffer lives.
+        (snap.host ? host_bytes : device_bytes) += snap.bytes;
+        host_bytes += snap.host_copy_bytes;
+        slots.push_back({{"slot", snap.slot}, {"kind", kind},
+                         {"tokens", snap.tokens},
+                         {"bytes", snap.bytes + snap.host_copy_bytes},
+                         {"location", snap.host ? "host" : "device"}});
+    }
+    json out = {
+        {"cache", std::move(cache)},
+        {"snapshots", {
+            {"count", report.snapshots.size()},
+            {"host_bytes", host_bytes},
+            {"device_bytes", device_bytes},
+            {"slots", std::move(slots)},
+        }},
+    };
+    std::lock_guard<std::mutex> lock(memory_report_mu_);
+    memory_report_ = std::move(out);
+    ++memory_report_requests_;
+}
+
+// Resident and peak resident set of this process, read now.
+static json process_memory_json() {
+    json out = {{"rss_bytes", nullptr}, {"peak_rss_bytes", nullptr}};
+#if defined(__linux__)
+    std::ifstream status("/proc/self/status");
+    std::string key;
+    uint64_t kib = 0;
+    std::string unit;
+    std::string line;
+    while (std::getline(status, line)) {
+        std::istringstream fields(line);
+        if (!(fields >> key >> kib >> unit) || unit != "kB") continue;
+        if (key == "VmRSS:") out["rss_bytes"] = kib * 1024;
+        if (key == "VmHWM:") out["peak_rss_bytes"] = kib * 1024;
+    }
+#endif
+    return out;
+}
+
+json HttpServer::memory_json() const {
+    json out;
+    {
+        std::lock_guard<std::mutex> lock(memory_report_mu_);
+        // Before the first report, the same shape with nothing counted.
+        out = memory_report_.is_null()
+            ? json{{"cache", nullptr},
+                   {"snapshots", {{"count", 0}, {"host_bytes", 0},
+                                  {"device_bytes", 0},
+                                  {"slots", json::array()}}}}
+            : memory_report_;
+        // Reports are taken at startup and after each request.
+        out["reports_published"] = memory_report_requests_;
+    }
+    out["process"] = process_memory_json();
+    return out;
+}
+
 void HttpServer::remember_agent_turn(
         const ParsedRequest & req, const PreparedPrompt & prepared,
         const GenerationCacheState & cache, const GenerateResult & result,
@@ -4379,11 +4469,13 @@ void HttpServer::send_nonstream_response(
 }
 
 void HttpServer::worker_loop() {
+    publish_memory_report();
     while (true) {
         ServerJob * job = dequeue();
         if (!job) break;  // stopping
 
         process_job(job);
+        publish_memory_report();
     }
 }
 

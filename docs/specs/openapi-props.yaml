@@ -46,9 +46,10 @@ paths:
         endpoints, loaded model, model-card-derived budgets,
         reasoning / speculative / tools capabilities, sampler
         capability flags, prefix-cache state, full-cache state,
-        tool-replay state, and PFlash configuration. Never blocks
-        on the worker thread; the response is a snapshot of
-        atomic counters and config state.
+        tool-replay state, PFlash configuration, and memory use.
+        Never blocks on the worker thread; the response is a
+        snapshot of atomic counters, config state, and the memory
+        report the worker last published.
       tags:
         - introspection
       responses:
@@ -102,6 +103,30 @@ paths:
                       enabled: false
                       in_use: 0
                       lifetime_hits: 0
+                    memory:
+                      cache:
+                        location: "device"
+                        capacity_tokens: 94072
+                        live_tokens: 9933
+                        kv_bytes: 3275210752
+                        recurrent_bytes: 156893184
+                        draft_feature_bytes: 209715200
+                        other_bytes: 2610573312
+                        host_state_bytes: 0
+                      snapshots:
+                        count: 1
+                        host_bytes: 289013760
+                        device_bytes: 0
+                        slots:
+                          - slot: 0
+                            kind: "prefix"
+                            tokens: 1536
+                            bytes: 289013760
+                            location: "host"
+                      reports_published: 5
+                      process:
+                        rss_bytes: 1460379648
+                        peak_rss_bytes: 14754349056
                     model:
                       arch: "qwen35"
                       draft_path: "/.../dflash-draft-3.6-q4_k_m.gguf"
@@ -195,6 +220,7 @@ components:
         - daemon
         - default_generation_settings
         - full_cache
+        - memory
         - model
         - model_alias
         - model_card
@@ -229,6 +255,8 @@ components:
           $ref: "#/components/schemas/DefaultGenerationSettings"
         full_cache:
           $ref: "#/components/schemas/FullCache"
+        memory:
+          $ref: "#/components/schemas/Memory"
         model:
           $ref: "#/components/schemas/Model"
         model_alias:
@@ -680,6 +708,122 @@ components:
           minimum: 0
           description: Token-count threshold for AUTO mode.
           example: null
+
+    Memory:
+      description: |
+        Where the model's memory goes. `cache` and `snapshots` are
+        rebuilt from the backend's buffers at startup and after every
+        request; `process` is read when `/props` is served. See
+        docs/specs/props-endpoint.md §4.17.
+      type: object
+      required: [cache, snapshots, reports_published, process]
+      properties:
+        cache:
+          oneOf:
+            - $ref: "#/components/schemas/MemoryCache"
+            - type: "null"
+        snapshots:
+          oneOf:
+            - $ref: "#/components/schemas/MemorySnapshots"
+            - type: "null"
+        reports_published:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Reports built since startup (startup plus one per request).
+        process:
+          type: object
+          required: [rss_bytes, peak_rss_bytes]
+          properties:
+            rss_bytes:
+              type: ["integer", "null"]
+              format: int64
+              description: Resident set size (VmRSS); null where unavailable.
+            peak_rss_bytes:
+              type: ["integer", "null"]
+              format: int64
+              description: |
+                Peak resident set size (VmHWM), including model loading;
+                null where unavailable.
+
+    MemoryCache:
+      description: |
+        Live cache allocated once for --max-ctx and reused; in concurrent
+        serving the shared paged cache plus any per-slot staging caches.
+      type: object
+      required:
+        - location
+        - capacity_tokens
+        - live_tokens
+        - kv_bytes
+        - recurrent_bytes
+        - draft_feature_bytes
+        - other_bytes
+        - host_state_bytes
+      properties:
+        location:
+          type: string
+          enum: ["device", "host"]
+        capacity_tokens:
+          type: integer
+          format: int64
+        live_tokens:
+          type: ["integer", "null"]
+          format: int64
+          description: |
+            Committed positions; null when serving is paged or the cache
+            holds several sequences.
+        kv_bytes:
+          type: integer
+          format: int64
+        recurrent_bytes:
+          type: integer
+          format: int64
+        draft_feature_bytes:
+          type: integer
+          format: int64
+        other_bytes:
+          type: integer
+          format: int64
+        host_state_bytes:
+          type: integer
+          format: int64
+          description: |
+            Live decode state kept in system RAM beside the cache,
+            counted by allocated capacity.
+
+    MemorySnapshots:
+      description: Saved prefix-cache snapshots.
+      type: object
+      required: [count, host_bytes, device_bytes, slots]
+      properties:
+        count:
+          type: integer
+        host_bytes:
+          type: integer
+          format: int64
+        device_bytes:
+          type: integer
+          format: int64
+        slots:
+          type: array
+          items:
+            type: object
+            required: [slot, kind, tokens, bytes, location]
+            properties:
+              slot:
+                type: integer
+              kind:
+                type: string
+                enum: ["prefix", "agent_turn", "prefill_cache", "disk_staging"]
+              tokens:
+                type: integer
+              bytes:
+                type: integer
+                format: int64
+              location:
+                type: string
+                enum: ["device", "host"]
 
     PrefixCache:
       description: |

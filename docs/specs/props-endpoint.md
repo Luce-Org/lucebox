@@ -61,6 +61,7 @@ request will not delay a `/props` response.
   "daemon":                       { "alive": true },
   "default_generation_settings":  { … },
   "full_cache":                   { … },
+  "memory":                       { … },
   "model":                        { … },
   "model_alias":                  "<string>",
   "model_card":                   { … } | null,
@@ -77,8 +78,8 @@ request will not delay a `/props` response.
 }
 ```
 
-All top-level keys are required and always emitted by
-`build_props_body`. Optional nested fields may be `null` when the
+All top-level keys are required and always emitted, by
+`build_props_body` or (for `memory`) by the `/props` handler. Optional nested fields may be `null` when the
 corresponding feature is disabled (e.g. `pflash.threshold` when
 `pflash.enabled = false`; `speculative.ddtree_budget` when
 `speculative.enabled = false`). `model_card` itself is `null` when
@@ -499,6 +500,83 @@ configuration drift between runs is possible.
 - `draft_device` — resolved draft-model device placement, or
   `null` when no draft model is loaded.
 
+### 4.17 `memory`
+
+```json
+"memory": {
+  "cache": {
+    "location":            "device",
+    "capacity_tokens":     131072,
+    "live_tokens":         1768,
+    "kv_bytes":            908169216,
+    "recurrent_bytes":     12271616,
+    "draft_feature_bytes": 0,
+    "other_bytes":         0,
+    "host_state_bytes":    6808576
+  },
+  "snapshots": {
+    "count":        4,
+    "host_bytes":   230721792,
+    "device_bytes": 0,
+    "slots": [
+      {"slot": 0, "kind": "prefix", "tokens": 1699, "bytes": 43188608, "location": "host"},
+      {"slot": 1, "kind": "prefix", "tokens": 2013, "bytes": 45353088, "location": "host"},
+      {"slot": 2, "kind": "prefix", "tokens": 4557, "bytes": 62858368, "location": "host"},
+      {"slot": 3, "kind": "prefix", "tokens": 6950, "bytes": 79321728, "location": "host"}
+    ]
+  },
+  "reports_published": 6,
+  "process": {"rss_bytes": 100766515200, "peak_rss_bytes": 110348533760}
+}
+```
+
+Recorded from DeepSeek V4 Flash on Strix Halo (`--profile ds4-strix`)
+after a four-turn tool conversation and one compacted request: the
+four turn snapshots are all still held.
+
+Where the model's memory goes. The generation thread rebuilds
+`cache` and `snapshots` from the backend's real buffers at startup
+and after every request (`reports_published` counts those
+rebuilds), so they describe the state between requests. `process`
+is read when `/props` is served. Only Qwen and DeepSeek4 backends
+report `cache` and `snapshots`; other backends return `cache: null`
+and an empty snapshot list.
+
+- `cache` — the live cache the model decodes from, allocated once
+  for `--max-ctx` and reused across requests. In concurrent serving it
+  is the paged cache shared by all sequences, plus DeepSeek4's
+  per-slot image staging caches when vision is loaded:
+  - `location` — `"device"` (a GPU allocation) or `"host"` (a CPU
+    buffer). On unified-memory parts such as Strix Halo a device
+    allocation is still system RAM.
+  - `capacity_tokens` / `live_tokens` — positions one sequence can
+    hold and positions currently committed (`null` when serving is
+    paged or the cache holds several sequences).
+  - `kv_bytes` — attention K/V. `recurrent_bytes` — SSM/conv state
+    (Qwen) or compressor and HC state (DeepSeek4).
+    `draft_feature_bytes` — DFlash target features kept in the cache
+    allocation. `other_bytes` — the rest of the cache allocation
+    (rollback and scratch tensors).
+  - `host_state_bytes` — live decode state kept in system RAM beside
+    the cache (Qwen KVFlash bookkeeping and DFlash feature staging;
+    DeepSeek4 last logits and DSpark feature window), counted by
+    allocated capacity: a trimmed buffer still holds its memory.
+- `snapshots` — saved prefix-cache snapshots. On discrete GPUs they
+  live in system RAM, which is where RAM grows when a long agent
+  conversation keeps one per turn. `bytes` includes the allocated
+  capacity of host-side copies a snapshot keeps; those copies count
+  toward `host_bytes` whatever the buffer's `location`. Before the
+  first report the section has `count: 0` and an empty slot list. `kind`: `"prefix"` (turn-boundary cache),
+  `"agent_turn"` (`--agent-turn-cache` replay), `"prefill_cache"`
+  (`--prefill-cache-slots`), `"disk_staging"` (a disk-cache hit being
+  restored).
+- `process` — resident (`VmRSS`) and peak (`VmHWM`) memory of the
+  server process; `null` where the platform does not report them. The
+  peak includes model loading, when weights pass through host memory,
+  so compare `rss_bytes` over time to see growth. On unified-memory
+  parts RSS also counts the model weights and the cache (about 100 GB
+  for the example above).
+
 ## 5. Schema versioning
 
 `build_info` includes `props_schema=<n>`. The integer `n` bumps
@@ -588,6 +666,21 @@ version increments.
     "enabled":       false,
     "in_use":        0,
     "lifetime_hits": 0
+  },
+  "memory": {
+    "cache": {
+      "location": "device", "capacity_tokens": 94072, "live_tokens": 9933,
+      "kv_bytes": 3275210752, "recurrent_bytes": 156893184,
+      "draft_feature_bytes": 209715200, "other_bytes": 2610573312,
+      "host_state_bytes": 0
+    },
+    "snapshots": {
+      "count": 1, "host_bytes": 289013760, "device_bytes": 0,
+      "slots": [{"slot": 0, "kind": "prefix", "tokens": 1536,
+                 "bytes": 289013760, "location": "host"}]
+    },
+    "reports_published": 5,
+    "process": {"rss_bytes": 1460379648, "peak_rss_bytes": 14754349056}
   },
   "model": {
     "arch":         "qwen35",

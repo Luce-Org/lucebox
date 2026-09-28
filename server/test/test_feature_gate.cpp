@@ -554,7 +554,10 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     ds4.max_concurrency = DEEPSEEK4_MAX_PAGED_SEQUENCES + 1;
     CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
     ds4.max_concurrency = 2;
+    // Sparse prefill stages text prompts; dense has no paged path.
     ds4.ds4_prefill_mode = PrefillAttentionMode::Sparse;
+    CHECK(gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
+    ds4.ds4_prefill_mode = PrefillAttentionMode::Dense;
     CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
     ds4.ds4_prefill_mode = PrefillAttentionMode::Exact;
     ds4.ds4_fused_decode = true;
