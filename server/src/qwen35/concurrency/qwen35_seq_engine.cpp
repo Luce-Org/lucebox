@@ -798,9 +798,27 @@ void Qwen35SeqEngine::observe_chain_width(
         int & samples = state.samples[static_cast<size_t>(width)];
         samples = std::min(samples + 1, kChainWidthCalibrationSamples);
     }
+    // The controller's clean-draft flag comes from its last observe(), so
+    // the round's majority outcome is observed last (with the cost sample);
+    // otherwise one arbitrary lane would drive the next exploration step.
+    size_t clean = 0;
+    for (size_t accepted_width : accepted) {
+        clean += accepted_width >= static_cast<size_t>(width);
+    }
+    const bool round_clean = 2 * clean > accepted.size();
+    size_t last = accepted.size();
     for (size_t lane = 0; lane < accepted.size(); ++lane) {
-        state.controller.observe(static_cast<int>(accepted[lane]), width,
-                                 lane == 0 ? cost : -1.0f);
+        if ((accepted[lane] >= static_cast<size_t>(width)) == round_clean) {
+            last = lane;
+            break;
+        }
+    }
+    for (size_t lane = 0; lane < accepted.size(); ++lane) {
+        if (lane == last) continue;
+        state.controller.observe(static_cast<int>(accepted[lane]), width, -1.0f);
+    }
+    if (last < accepted.size()) {
+        state.controller.observe(static_cast<int>(accepted[last]), width, cost);
     }
     for (double & trials : state.depth_trials) trials *= kChainDepthDecay;
     for (double & accepts : state.depth_accepts) accepts *= kChainDepthDecay;
