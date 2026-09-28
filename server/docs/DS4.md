@@ -393,9 +393,21 @@ DeepSeek4 paged concurrency supports two resident HIP deployments:
   to 6 lanes, but concurrency 5–6 is not qualified for this configuration.
 
 Paged serving decodes autoregressively: it rejects `--draft` (and
-`LUCE_DS4_SPEC`), sparse prefill and fused decode, so it does not combine
+`LUCE_DS4_SPEC`), dense prefill and fused decode, so it does not combine
 with `--profile ds4-strix` or `ds4-r9700-strix`. The container entrypoint
 leaves out its DSpark drafter when `--max-concurrency` is above 1.
+
+Prompt prefill follows `--ds4-prefill`. With `exact`, every prompt row runs
+in the gathered graph (one row per lane per step on the heterogeneous
+deployment). With `sparse`, text prompts of at least 64 tokens prefill on the
+single-request sparse layer-major path into their slot's staging cache and
+are then copied into the paged slot, as image prompts already do; their last
+token and all decoding stay in the gathered graph. The monolithic deployment
+shares one layer-sliced pass across staged prompts. The heterogeneous
+deployment runs one chunk per step (2048 rows while no request decodes, 1024
+while others decode). On R9700 + Strix Halo a 1843-token prompt reaches its
+first token in 8.3 s instead of 85.2 s, the same as single-request serving;
+sparse prefill is approximate, as in single-request serving.
 
 The heterogeneous mode is route-level expert parallelism. It is not an
 explicit `--target-device hip:0,hip:1` layer split and does not use a remote

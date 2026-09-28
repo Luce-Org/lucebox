@@ -1218,8 +1218,11 @@ DeepSeek4Cache * DeepSeek4Backend::image_staging_cache(int slot) {
 }
 
 bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item) {
-    const auto * images = dynamic_cast<const DeepSeek4ImagePrompt *>(item.images.get());
-    if (!images || !item.staging || item.prefix < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS ||
+    // Without images the item is a text prompt (sparse text staging).
+    const auto * images = item.images
+        ? dynamic_cast<const DeepSeek4ImagePrompt *>(item.images.get()) : nullptr;
+    if ((item.images && !images) || (!images && !text_staging_) ||
+        !item.staging || item.prefix < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS ||
         item.prefix > int(item.prompt.size()) || item.prefix > item.staging->max_ctx) {
         item.error = "invalid staged prefill request";
         return false;
@@ -1227,6 +1230,42 @@ bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item) {
     reset_deepseek4_cache(*item.staging);
     item.staging->prefill_mode = PrefillAttentionMode::Sparse;
     item.done = 0;
+    return true;
+}
+
+bool DeepSeek4Backend::run_staged_text_chunk(StagedPrefill & item, int max_rows,
+                                             std::string & error) {
+    constexpr int min_rows = DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS;
+    if (item.images || !item.staging || item.finished() ||
+        !moe_hybrid_ || !(expert_runtime_.compute || expert_backend_)) {
+        error = "staged text prefill is not available for this placement";
+        return false;
+    }
+    const int remaining = item.prefix - item.done;
+    // The row budget is the caller's (it trades decode stalls against the
+    // per-chunk fixed cost); only the late-context scratch bound applies.
+    int n = deepseek4_hybrid_prefill_step_tokens(
+        std::max(min_rows, max_rows), item.done, remaining);
+    n = std::min(n, remaining);
+    if (n < remaining && remaining - n < min_rows) n = remaining - min_rows;
+    if (n < min_rows) n = remaining;  // the whole short tail in one chunk
+    std::vector<float> embed(size_t(n) * size_t(w_.n_embd));
+    if (!w_.embedder.embed(item.prompt.data() + item.done, n, embed.data())) {
+        error = "staged prefill embedding failed";
+        return false;
+    }
+    std::vector<float> hc_state;
+    if (!deepseek4_step_layer_range(
+            backend_, cfg_.device.gpu, w_, *item.staging, hc_state,
+            embed.data(), n, item.done, 0, w_.n_layer, nullptr,
+            item.prompt.data() + item.done, nullptr,
+            /*allow_decode_graph_reuse=*/true, nullptr, moe_hybrid_.get(),
+            expert_runtime_.compute ? &expert_runtime_ : nullptr,
+            routing_stats_.get(), vision::ImageSpanView{})) {
+        error = "staged text prefill failed";
+        return false;
+    }
+    item.done += n;
     return true;
 }
 
@@ -1246,19 +1285,32 @@ bool DeepSeek4Backend::begin_staged_pass(const std::vector<StagedPrefill *> & it
         StagedPrefill * item = items[k];
         if (item->finished() || budget < min_rows) continue;
         const auto * images = static_cast<const DeepSeek4ImagePrompt *>(item->images.get());
-        if (images->stream_failed()) {
-            item->error = "image encoding failed";
-            continue;
+        int n = 0;
+        if (images) {
+            if (images->stream_failed()) {
+                item->error = "image encoding failed";
+                continue;
+            }
+            n = vision::staged_prefill_chunk(images->spans(), uint64_t(item->done),
+                                             item->prefix - item->done, budget, min_rows);
+            if (n == 0) {
+                item->error = "staged prefill could not be chunked";
+                continue;
+            }
+            if (!images->images_ready(size_t(item->done), size_t(n))) continue;
+        } else {
+            // Text: the budget's worth of rows, never leaving a tail below the
+            // layer-major minimum for the next pass.
+            const int remaining = item->prefix - item->done;
+            n = std::min(remaining, budget);
+            if (n < remaining && remaining - n < min_rows) n = remaining - min_rows;
+            if (n < min_rows) continue;
         }
-        const int n = vision::staged_prefill_chunk(images->spans(), uint64_t(item->done),
-                                                   item->prefix - item->done, budget, min_rows);
-        if (n == 0) {
-            item->error = "staged prefill could not be chunked";
-            continue;
-        }
-        if (!images->images_ready(size_t(item->done), size_t(n))) continue;
         std::vector<float> embed(size_t(n) * size_t(w_.n_embd));
-        if (!images->embed_chunk(w_.embedder, size_t(item->done), n, embed.data())) {
+        const bool embedded = images
+            ? images->embed_chunk(w_.embedder, size_t(item->done), n, embed.data())
+            : w_.embedder.embed(item->prompt.data() + item->done, n, embed.data());
+        if (!embedded) {
             item->error = "staged prefill embedding failed";
             continue;
         }
@@ -1269,7 +1321,7 @@ bool DeepSeek4Backend::begin_staged_pass(const std::vector<StagedPrefill *> & it
         seq.token_ids = item->prompt.data() + item->done;
         seq.n_tokens = n;
         seq.kv_start = item->done;
-        seq.image_spans = images->spans();
+        if (images) seq.image_spans = images->spans();
         seqs.push_back(seq);
         members.push_back(k);
         budget -= n;
@@ -1974,13 +2026,14 @@ bool DeepSeek4Backend::init() {
         (cfg_.max_concurrency < 1 ||
          cfg_.max_concurrency > DEEPSEEK4_MAX_PAGED_SEQUENCES ||
          cfg_.device.is_layer_split() ||
-         cfg_.prefill_mode != PrefillAttentionMode::Exact ||
+         (cfg_.prefill_mode != PrefillAttentionMode::Exact &&
+          cfg_.prefill_mode != PrefillAttentionMode::Sparse) ||
          cfg_.fused_decode || cfg_.fused_verify_f16_kv ||
          env_flag_enabled("LUCE_DS4_FUSED_DECODE") ||
          spec_requested_)) {
         std::fprintf(stderr,
             "[deepseek4] paged serving requires 1..%d local slots, exact "
-            "prefill, and autoregressive non-fused decode\n",
+            "or sparse prefill, and autoregressive non-fused decode\n",
             DEEPSEEK4_MAX_PAGED_SEQUENCES);
         return false;
     }
@@ -2027,28 +2080,46 @@ bool DeepSeek4Backend::init() {
                 (unsigned long long)requested);
             return false;
         }
-        if (vision_) {
-            // Image admissions prefill on the single-request sparse path into
-            // their slot's staging cache (slot 0 uses cache_), then copy it
-            // into the paged slot. All of them are allocated now, so memory is
-            // committed at startup rather than in the middle of a request.
-            bool staged = create_deepseek4_cache(backend_, w_, max_ctx, cache_);
+        const bool stage_text = cfg_.prefill_mode == PrefillAttentionMode::Sparse;
+        if (vision_ || stage_text) {
+            // Image admissions, and text prompts under --ds4-prefill sparse,
+            // prefill on the single-request sparse path into their slot's
+            // staging cache (slot 0 uses cache_), then copy it into the paged
+            // slot. All of them are allocated now, so memory is committed at
+            // startup rather than in the middle of a request.
+            if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
+                std::fprintf(stderr, "[deepseek4] failed to allocate KV cache (ctx=%d)\n", max_ctx);
+                return false;
+            }
+            bool staged = true;
             image_staging_caches_.clear();
             for (int slot = 1; staged && slot < cfg_.max_concurrency; ++slot) {
                 auto cache = std::make_unique<DeepSeek4Cache>();
                 staged = create_deepseek4_cache(backend_, w_, max_ctx, *cache);
                 if (staged) image_staging_caches_.push_back(std::move(cache));
             }
-            if (!staged) {
+            if (!staged && vision_) {
                 std::fprintf(stderr, "[deepseek4] image staging caches do not fit (%d x ctx=%d); "
                                      "reduce --max-ctx or --max-concurrency\n", cfg_.max_concurrency, max_ctx);
                 return false;
             }
+            if (!staged) {
+                // Text staging is an optimization: keep serving without it.
+                for (auto & cache : image_staging_caches_) free_deepseek4_cache(*cache);
+                image_staging_caches_.clear();
+                std::fprintf(stderr, "[deepseek4] staging caches do not fit (%d x ctx=%d): text prompts "
+                                     "prefill in the batch\n", cfg_.max_concurrency, max_ctx);
+            }
+            text_staging_ = stage_text && staged;
             cache_.prefill_mode = PrefillAttentionMode::Sparse;
-            std::fprintf(stderr, "[deepseek4] batched image serving: %d slots, staging caches %.0f MB "
-                                 "(ctx=%d each)\n", cfg_.max_concurrency,
-                         double(estimate_ds4_cache_bytes(w_, max_ctx)) * cfg_.max_concurrency / (1024.0 * 1024.0),
-                         max_ctx);
+            if (staged) {
+                std::fprintf(stderr, "[deepseek4] staged prefill (%s%s): %d slots, staging caches %.0f MB "
+                                     "(ctx=%d each)\n", vision_ ? "images" : "",
+                             text_staging_ ? (vision_ ? ", sparse text" : "sparse text") : "",
+                             cfg_.max_concurrency,
+                             double(estimate_ds4_cache_bytes(w_, max_ctx)) * cfg_.max_concurrency / (1024.0 * 1024.0),
+                             max_ctx);
+            }
         }
     } else {
         if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
