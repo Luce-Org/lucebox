@@ -228,6 +228,11 @@ void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
             if (!b_.run_staged_text_chunk(
                     staged, decoding ? kHybridStagedRowsWithDecode
                                      : kHybridStagedRowsWithoutDecode, error)) {
+                // Intentionally terminal: the slot already holds the prompt
+                // as seeded rows, and a failure of this path (scratch or
+                // expert allocation) would most likely recur in the gathered
+                // prefill of the same rows. The request fails cleanly and its
+                // slot is released.
                 staged.error = error.empty() ? "staged text prefill failed" : error;
             } else if (staged.done >= staged.prefix) {
                 std::fprintf(stderr, "[deepseek4] staged text prefill slot %d: %d rows, last chunk %d rows %.0f ms\n",

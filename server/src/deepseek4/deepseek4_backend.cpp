@@ -1309,6 +1309,8 @@ bool DeepSeek4Backend::begin_staged_pass(const std::vector<StagedPrefill *> & it
             const int remaining = item->prefix - item->done;
             n = std::min(remaining, budget);
             if (n < remaining && remaining - n < min_rows) n = remaining - min_rows;
+            // A short tail that fits the remaining budget goes in whole.
+            if (n < min_rows && remaining <= budget) n = remaining;
             if (n < min_rows) continue;
         }
         std::vector<float> embed(size_t(n) * size_t(w_.n_embd));
