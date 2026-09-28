@@ -247,11 +247,17 @@ private:
     DeepSeek4Cache * image_staging_cache(int slot);
     // --ds4-prefill sparse with paged serving: text prompts prefill through
     // the staging caches (layer-major sparse) and are copied into their slot.
-    bool text_staging_available() const { return text_staging_; }
+    // A heterogeneous placement stages text only through the in-process
+    // expert path that run_staged_text_chunk() drives.
+    bool text_staging_available() const {
+        return text_staging_ &&
+               (!w_.moe_hybrid ||
+                (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)));
+    }
     // The shared staged pass needs the whole model on one GPU. With
     // heterogeneous experts, a text prompt stages one bounded chunk per call
     // through the regular sparse layer-major prefill instead.
-    bool staged_text_uses_chunks() const { return text_staging_ && w_.moe_hybrid; }
+    bool staged_text_uses_chunks() const { return text_staging_available() && w_.moe_hybrid; }
     bool run_staged_text_chunk(StagedPrefill & item, int max_rows, std::string & error);
     // Starts encoding an admitted image request: queued on the encoder
     // worker with --mmproj-device, otherwise encoded here.
