@@ -759,7 +759,8 @@ int Qwen35SeqEngine::choose_chain_width(int lanes) {
     }
     // Conditional acceptance of each candidate depth. Depths never tried
     // inherit the deepest measured rate (geometric continuation).
-    std::vector<float> conditional(static_cast<size_t>(full - 1), 0.7f);
+    std::vector<float> & conditional = state.conditional;
+    conditional.assign(static_cast<size_t>(full - 1), 0.7f);
     float last = 0.7f;
     for (int depth = 1; depth < full; ++depth) {
         const double trials = state.depth_trials[static_cast<size_t>(depth)];
@@ -787,11 +788,16 @@ void Qwen35SeqEngine::observe_chain_width(
     auto it = chain_width_by_lanes_.find(lanes);
     if (it == chain_width_by_lanes_.end()) return;
     ChainWidthState & state = it->second;
-    ++state.offers[static_cast<size_t>(width)];
+    // Saturating counters: they only gate calibration.
+    int & offers = state.offers[static_cast<size_t>(width)];
+    offers = std::min(offers + 1, kChainWidthCalibrationMaxOffers);
     // Every lane is an acceptance sample; the round is one cost sample when
     // it is clean (step_ms < 0 marks a round that is not).
     const float cost = step_ms > 0.0 ? static_cast<float>(step_ms) : -1.0f;
-    if (cost > 0.0f) ++state.samples[static_cast<size_t>(width)];
+    if (cost > 0.0f) {
+        int & samples = state.samples[static_cast<size_t>(width)];
+        samples = std::min(samples + 1, kChainWidthCalibrationSamples);
+    }
     for (size_t lane = 0; lane < accepted.size(); ++lane) {
         state.controller.observe(static_cast<int>(accepted[lane]), width,
                                  lane == 0 ? cost : -1.0f);
@@ -1340,8 +1346,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     }
 
     if (adaptive_chain_width_) {
-        std::vector<size_t> accepted;
-        accepted.reserve(proposals.size());
+        std::vector<size_t> & accepted = chain_accepted_scratch_;
+        accepted.clear();
         // Model acceptance, not the committed length: the room and
         // min-token clamps are serving policy, not rejections.
         for (const Proposal & proposal : proposals) {

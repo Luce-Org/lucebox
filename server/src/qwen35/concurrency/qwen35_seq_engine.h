@@ -227,17 +227,20 @@ private:
         // accepted, so a narrow width does not bias the deeper estimates.
         std::vector<double> depth_trials;
         std::vector<double> depth_accepts;
+        std::vector<float>  conditional;  // reused per round
         explicit ChainWidthState(int max_width)
             : controller(max_width, 2, true),
               offers(static_cast<size_t>(max_width) + 1, 0),
               samples(static_cast<size_t>(max_width) + 1, 0),
               depth_trials(static_cast<size_t>(max_width), 0.0),
-              depth_accepts(static_cast<size_t>(max_width), 0.0) {}
+              depth_accepts(static_cast<size_t>(max_width), 0.0),
+              conditional(static_cast<size_t>(std::max(1, max_width - 1)), 0.7f) {}
     };
     bool adaptive_chain_width_ = false;
     std::vector<int> chain_width_choices_;  // ascending, includes the block
     std::map<int, ChainWidthState> chain_width_by_lanes_;
     std::chrono::steady_clock::time_point chain_round_t0_{};
+    std::vector<size_t> chain_accepted_scratch_;
     ggml_context *  feature_view_ctx_ = nullptr;
     std::vector<DraftFeatureMirror> slot_feature_mirrors_;
     std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;
