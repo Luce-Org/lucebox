@@ -745,11 +745,11 @@ constexpr double kChainDepthPriorAccepts = 1.4;
 constexpr double kChainDepthPriorTrials = 2.0;
 }  // namespace
 
-int Qwen35SeqEngine::choose_chain_width(int lanes) {
+int Qwen35SeqEngine::choose_chain_width(int bucket) {
     const int full = fixed_chain_.width;
     if (!adaptive_chain_width_ || chain_width_choices_.empty()) return full;
     ChainWidthState & state =
-        chain_width_by_lanes_.try_emplace(lanes, full).first->second;
+        chain_width_by_bucket_.try_emplace(bucket, full).first->second;
     for (int width : chain_width_choices_) {
         const size_t w = static_cast<size_t>(width);
         if (state.samples[w] < kChainWidthCalibrationSamples &&
@@ -782,11 +782,11 @@ int Qwen35SeqEngine::choose_chain_width(int lanes) {
 }
 
 void Qwen35SeqEngine::observe_chain_width(
-        int lanes, int width, const std::vector<size_t> & accepted,
+        int bucket, int width, const std::vector<size_t> & accepted,
         double step_ms) {
     if (!adaptive_chain_width_) return;
-    auto it = chain_width_by_lanes_.find(lanes);
-    if (it == chain_width_by_lanes_.end()) return;
+    auto it = chain_width_by_bucket_.find(bucket);
+    if (it == chain_width_by_bucket_.end()) return;
     ChainWidthState & state = it->second;
     // Saturating counters: they only gate calibration.
     int & offers = state.offers[static_cast<size_t>(width)];
@@ -842,8 +842,8 @@ void Qwen35SeqEngine::observe_chain_width(
     }
     state.lane_rounds += accepted.size();
     if (state.rounds % 1024 == 0) {
-        std::fprintf(stderr, "[parallel] adaptive width lanes=%d rounds=%lld "
-                     "mean_accepted=%.2f offers:", lanes,
+        std::fprintf(stderr, "[parallel] adaptive width bucket=%d rounds=%lld "
+                     "mean_accepted=%.2f offers:", bucket,
                      (long long) state.rounds,
                      state.lane_rounds ? state.accepted_sum / state.lane_rounds : 0.0);
         for (int choice : chain_width_choices_) {
@@ -851,7 +851,7 @@ void Qwen35SeqEngine::observe_chain_width(
                          state.offers[static_cast<size_t>(choice)]);
         }
         std::fprintf(stderr, " next=%d\n",
-                     choose_chain_width(lanes));
+                     choose_chain_width(bucket));
     }
 }
 
@@ -1005,9 +1005,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     const int tree_bucket = chain_decode_bucket_width(spec_count);
     // The drafter always proposes the full block; a narrower round verifies
     // the leading prefix of every chain, which is the same chain truncated.
-    // Controllers are keyed by the exact speculative lane count: one graph
-    // bucket spans several lane counts, whose round costs differ.
-    const int tree_width = choose_chain_width(spec_count);
+    // Controllers are keyed by the verify graph bucket: the graph is built
+    // for tree_bucket lanes (missing lanes are padding), so a round's cost is
+    // set by the bucket and width, not by how many lanes are real.
+    const int tree_width = choose_chain_width(tree_bucket);
     if (tree_width < full_width) {
         for (Proposal & proposal : proposals) {
             proposal.tokens.resize(static_cast<size_t>(tree_width));
@@ -1375,7 +1376,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             std::chrono::steady_clock::now() - chain_round_t0_).count();
         // Rounds with AR peers or a fresh graph still teach acceptance, but
         // their time is not the cost of this width at this lane count.
-        observe_chain_width(spec_count, tree_width, accepted,
+        observe_chain_width(tree_bucket, tree_width, accepted,
                             ar_count == 0 && !graph_rebuilt ? step_ms : -1.0);
     }
 

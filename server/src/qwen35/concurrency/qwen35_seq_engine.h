@@ -194,12 +194,12 @@ private:
     StepResult step_chain_spec(
         const StepPlan & plan, const std::vector<uint8_t> & selected,
         PreparedChainRound && prepared);
-    // Verify width for one batched chain round. Each speculative lane count
-    // keeps its own AdaptiveSpecWidth: a round's cost depends on the total
-    // verify rows (lanes x width), while the width that maximizes committed
+    // Verify width for one batched chain round. Each verify graph bucket
+    // keeps its own AdaptiveSpecWidth: a round's cost depends on the graph's
+    // rows (bucket lanes x width), while the width that maximizes committed
     // tokens per unit cost does not depend on how many lanes share it.
-    int choose_chain_width(int lanes);
-    void observe_chain_width(int lanes, int width,
+    int choose_chain_width(int bucket);
+    void observe_chain_width(int bucket, int width,
                              const std::vector<size_t> & accepted,
                              double step_ms);
     PrefixStoreEvent capture_prefix(
@@ -238,7 +238,7 @@ private:
     };
     bool adaptive_chain_width_ = false;
     std::vector<int> chain_width_choices_;  // ascending, includes the block
-    std::map<int, ChainWidthState> chain_width_by_lanes_;
+    std::map<int, ChainWidthState> chain_width_by_bucket_;
     std::chrono::steady_clock::time_point chain_round_t0_{};
     std::vector<size_t> chain_accepted_scratch_;
     ggml_context *  feature_view_ctx_ = nullptr;
