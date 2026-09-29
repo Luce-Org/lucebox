@@ -296,6 +296,45 @@ __device__ __forceinline__ void mmb_dq_q4k_slice(uint4 q0, uint4 q1, uint4 meta,
     }
 }
 
+// One 32-element half of mmb_dq_q4k_slice (half 0 = low nibbles / sub-block 2*slice, half 1 = high nibbles), same
+// per-element arithmetic, so splitting a row across two threads is bit-exact. out points at the half's 16 words.
+__device__ __forceinline__ void mmb_dq_q4k_half(uint4 q0, uint4 q1, uint4 meta, int slice, int half, uint32_t * out) {
+    const float d = mmb_h2f((uint16_t) meta.x), dm = mmb_h2f((uint16_t)(meta.x >> 16));
+    auto byte = [&](int i) { const uint32_t word = i < 4 ? meta.y : i < 8 ? meta.z : meta.w; return (word >> (8 * (i & 3))) & 255; };
+    const int i = 2 * slice + half;
+    const uint32_t sc = i < 4 ? byte(i) & 63 : (byte(i + 4) & 15) | ((byte(i - 4) >> 6) << 4);
+    const uint32_t mn = i < 4 ? byte(i + 4) & 63 : (byte(i + 4) >> 4) | ((byte(i) >> 6) << 4);
+    const float ds = d * sc, ms = dm * mn;
+    const uint32_t words[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+    const int sh = 4 * half;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t q = words[j] >> sh;
+        out[2*j]     = mmb_pack2(ds * (q & 15) - ms, ds * ((q >> 8) & 15) - ms);
+        out[2*j + 1] = mmb_pack2(ds * ((q >> 16) & 15) - ms, ds * ((q >> 24) & 15) - ms);
+    }
+}
+
+// One Q5_1 block (32 elements) of mmb_dq_q51_pair: w = {dm, high, q[4]} words, same arithmetic (bit-exact split).
+__device__ __forceinline__ void mmb_dq_q51_one(const uint32_t * w, uint32_t * out) {
+    const uint32_t dm = w[0], high = w[1];
+    const float d = mmb_h2f((uint16_t)dm), m = mmb_h2f((uint16_t)(dm >> 16));
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t q = w[2 + j];
+        float lo[4], hi[4];
+#pragma unroll
+        for (int lane = 0; lane < 4; ++lane) {
+            const int low = ((q >> (8 * lane)) & 15) | (((high >> (4 * j + lane)) & 1) << 4);
+            const int upper = ((q >> (8 * lane + 4)) & 15) | (((high >> (16 + 4 * j + lane)) & 1) << 4);
+            lo[lane] = d * low + m; hi[lane] = d * upper + m;
+        }
+        out[2*j] = mmb_pack2(lo[0],lo[1]);
+        out[2*j + 1] = mmb_pack2(lo[2],lo[3]);
+        out[8 + 2*j] = mmb_pack2(hi[0],hi[1]);
+        out[8 + 2*j + 1] = mmb_pack2(hi[2],hi[3]);
+    }
+}
 
 __device__ __forceinline__ void mmb_dq_q51_pair(uint4 a, uint4 b, uint4 c, uint32_t * out) {
     const uint32_t words[12] = {a.x,a.y,a.z,a.w,b.x,b.y,b.z,b.w,c.x,c.y,c.z,c.w};

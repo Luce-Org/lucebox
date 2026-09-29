@@ -138,8 +138,18 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
 
     int weight_ks = 0;
+    // Q5_1 with 2*BM == MMB_NT: two threads per row, one 32-element block each (was BM of 256 threads decoding both).
+    constexpr bool Q51_SPLIT = WTYPE == 32 + GGML_TYPE_Q5_1 && 2 * BM == MMB_NT;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
+        if constexpr (Q51_SPLIT) {
+            const int row = tid >> 1;
+            if (row < a_rows) {
+                const uint2 * p = (const uint2 *)(Wbase + (size_t)row * wrow_bytes + (size_t)ks * 48 + (tid & 1) * 24);
+                const uint2 w0 = p[0], w1 = p[1], w2 = p[2];
+                a0[0] = make_uint4(w0.x, w0.y, w1.x, w1.y); a2[0] = w2.x; a3[0].x = w2.y;
+            } else { a0[0] = make_uint4(0,0,0,0); a2[0] = 0; a3[0].x = 0; }
+        } else
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) {
             const int row = tid + i * MMB_NT;
@@ -164,6 +174,10 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     };
     auto store_lds = [&]() {
         if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
+        if constexpr (Q51_SPLIT) {
+            const uint32_t w[6] = {a0[0].x, a0[0].y, a0[0].z, a0[0].w, a2[0], a3[0].x};
+            mmb_dq_q51_one(w, (uint32_t *)(As + (tid >> 1) * MMB_LDS_STRIDE) + 16 * (tid & 1));
+        } else
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
             if constexpr (WTYPE == 0) mmb_dq_row36(a0[i], a1[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
@@ -409,8 +423,21 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #pragma unroll
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
     int weight_ks = 0;
+    // q4_K with 4*BM == MMB_NT: every thread decodes one 32-element half of one gate-or-up row (was BM of 256 threads
+    // decoding both full rows while the rest waited at the barrier). Same per-element arithmetic: bit-exact.
+    constexpr bool Q4K_SPLIT = WTYPE == 32 + GGML_TYPE_Q4_K && 4 * BM == MMB_NT;
+    const int s_mat = tid / (2 * BM), s_row = (tid >> 1) % BM, s_half = tid & 1;
+    uint4 sq0, sq1, sqm;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
+        if constexpr (Q4K_SPLIT) {
+            if (s_row < a_rows) {
+                const uint8_t * p = (s_mat ? Wu : Wg) + (size_t)s_row * wrow_bytes + (size_t)(ks / 4) * sizeof(block_q4_K);
+                sqm = *(const uint4 *)p;
+                const int offset = 16 + (ks & 3) * 32;
+                sq0 = *(const uint4 *)(p + offset); sq1 = *(const uint4 *)(p + offset + 16);
+            } else { sqm = sq0 = sq1 = make_uint4(0,0,0,0); }
+        } else
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) {
             const int row = tid + i * MMB_NT;
@@ -445,6 +472,9 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
             mmb_load_quant_tile<LOAD_TYPE, BM, MMB_LDS_STRIDE>(Wu, wrow_bytes, a_rows, weight_ks, Au);
         }
 
+        if constexpr (Q4K_SPLIT) {
+            mmb_dq_q4k_half(sq0, sq1, sqm, weight_ks & 3, s_half, (uint32_t *)((s_mat ? Au : Ag) + s_row * MMB_LDS_STRIDE) + 16 * s_half);
+        } else
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) {
             const int row = tid + i * MMB_NT;
@@ -1053,7 +1083,10 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
             E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
     }
-    constexpr int BN_SMALL = 32, THRESH = 128;
+    // Experts under THRESH rows take BN_SMALL-token tiles. Every tile re-streams the expert's weights; at ~40 rows per
+    // expert (T=2048, top-10 of 512) 64-token tiles read each expert once where 32 read most twice. The per-output
+    // K order is unchanged, so the tile width is bit-exact.
+    constexpr int BN_SMALL = 64, THRESH = 128;
     const int nbig_max   = n_rows / BN + E + 1;
     const int nsmall_max = E * ((THRESH + BN_SMALL - 1) / BN_SMALL) + 1;
     ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
@@ -1067,7 +1100,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     mmb_dispatch_quant(src0->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
     mmb_routed_kernel<128, BN, 32, 64, WT><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-    mmb_routed_kernel<128, BN_SMALL, 32, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+    mmb_routed_kernel<128, BN_SMALL, 32, 32, WT><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
     });
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1101,7 +1134,10 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
             E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
     }
-    constexpr int BN_SMALL = 32, THRESH = 128;
+    // Experts under THRESH rows take BN_SMALL-token tiles. Every tile re-streams the expert's weights; at ~40 rows per
+    // expert (T=2048, top-10 of 512) 64-token tiles read each expert once where 32 read most twice. The per-output
+    // K order is unchanged, so the tile width is bit-exact.
+    constexpr int BN_SMALL = 64, THRESH = 128;
     const int nbig_max   = n_rows / BN + E + 1;
     const int nsmall_max = E * ((THRESH + BN_SMALL - 1) / BN_SMALL) + 1;
     ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
@@ -1114,7 +1150,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     mmb_dispatch_quant(gw->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
     mmb_routed_glu_kernel<64, BN, 32, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-    mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+    mmb_routed_glu_kernel<64, BN_SMALL, 16, 32, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
     });
     CUDA_CHECK(cudaGetLastError());
 }
