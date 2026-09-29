@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -54,7 +55,19 @@ bool TensorFileReader::open(const std::string & path, std::string * err, Mode mo
         const uint64_t available = host_available_bytes();
         want_direct = available > 0 && buffered_.size() > available / 2;
     }
-    if (want_direct) direct_.open(path, /*direct=*/true);  // unsupported: stay buffered
+    if (want_direct) {
+        std::string direct_err;
+        if (!direct_.open(path, /*direct=*/true, &direct_err)) {
+            if (mode == Mode::Direct) {
+                buffered_.close();
+                if (err) *err = "direct reads unavailable: " + direct_err;
+                return false;
+            }
+            // Auto: the file still loads, through the page cache.
+            std::fprintf(stderr, "[loader] direct reads unavailable for %s (%s); reading through the page cache\n",
+                         path.c_str(), direct_err.c_str());
+        }
+    }
     return true;
 }
 
@@ -111,6 +124,7 @@ bool TensorFileReader::load(const std::vector<TensorFileSpan> & spans, std::stri
             }
             if (!ok) {
                 // Buffered, or a direct read the file system refused.
+                if (direct_.is_open()) buffered_fallbacks_.fetch_add(1, std::memory_order_relaxed);
                 ok = buffered_.read_at(off, aligned, p.size);
                 src = aligned;
             }
@@ -140,23 +154,29 @@ bool TensorFileReader::load(const std::vector<TensorFileSpan> & spans, std::stri
 
 bool load_tensor_spans(const std::string & path, const void * mapping, size_t mapping_size,
                        const std::vector<TensorFileSpan> & spans, std::string * err) {
-    uint64_t lo = UINT64_MAX, hi = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;  // file bytes the spans cover
     for (const TensorFileSpan & s : spans) {
         if (!s.tensor || s.size == 0) continue;
         if (s.file_offset > mapping_size || s.size > mapping_size - s.file_offset || !span_fits_tensor(s)) {
             if (err) *err = std::string("weight span out of range for tensor ") + ggml_get_name(s.tensor);
             return false;
         }
-        lo = std::min<uint64_t>(lo, s.file_offset);
-        hi = std::max<uint64_t>(hi, s.file_offset + s.size);
+        ranges.emplace_back(s.file_offset, s.file_offset + s.size);
     }
-    if (hi <= lo) return true;
-    // One residency scan over the weight range: mostly cached means a warm
-    // start, which the mapping serves fastest.
-    const size_t range = (size_t) (hi - lo);
-    const size_t cached = mapped_resident_bytes(mapping, lo, range);
+    if (ranges.empty()) return true;
+    // Residency of the bytes the spans read (overlaps and touching spans
+    // merged, gaps between them left out): mostly cached means a warm start,
+    // which the mapping serves fastest.
+    std::sort(ranges.begin(), ranges.end());
+    size_t wanted = 0, cached = 0;
+    for (size_t i = 0; i < ranges.size();) {
+        uint64_t lo = ranges[i].first, hi = ranges[i].second;
+        for (++i; i < ranges.size() && ranges[i].first <= hi; ++i) hi = std::max(hi, ranges[i].second);
+        wanted += (size_t) (hi - lo);
+        cached += mapped_resident_bytes(mapping, lo, (size_t) (hi - lo));
+    }
     TensorFileReader reader;
-    if (cached < range - range / 10 && reader.open(path)) return reader.load(spans, err);
+    if (cached < wanted - wanted / 10 && reader.open(path)) return reader.load(spans, err);
     for (const TensorFileSpan & s : spans) {
         if (!s.tensor || s.size == 0) continue;
         ggml_backend_tensor_set(s.tensor, static_cast<const uint8_t *>(mapping) + s.file_offset,

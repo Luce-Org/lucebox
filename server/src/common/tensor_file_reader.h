@@ -12,6 +12,7 @@
 
 #include "platform_io.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -30,13 +31,18 @@ struct TensorFileSpan {
 
 class TensorFileReader {
 public:
-    // Auto: direct reads for a file larger than half the available memory.
-    // Buffered / Direct force the choice (tests).
+    // Auto: direct reads for a file larger than half the available memory,
+    // buffered (with a warning) where the file system refuses them.
+    // Buffered / Direct force the choice (tests); Direct fails to open where
+    // direct reads are unavailable.
     enum class Mode { Auto, Buffered, Direct };
 
     bool open(const std::string & path, std::string * err = nullptr, Mode mode = Mode::Auto);
     bool is_open() const { return buffered_.is_open(); }
     bool direct() const { return direct_.is_open(); }
+    // True when every read so far bypassed the page cache: direct reads the
+    // file system refused fall back to buffered ones, which cache pages.
+    bool reads_bypassed_cache() const { return direct() && buffered_fallbacks_.load() == 0; }
     uint64_t size() const { return buffered_.size(); }
 
     // Copies every span into its tensor (ggml_backend_tensor_set); false with
@@ -50,6 +56,7 @@ public:
 private:
     ReadOnlyFile buffered_;  // always open; also the fallback of a failed direct read
     ReadOnlyFile direct_;    // open when reads bypass the page cache
+    mutable std::atomic<size_t> buffered_fallbacks_{0};  // direct reads served buffered
 };
 
 // Loads `spans` of the file at `path`, the same file as `mapping` (mapped from

@@ -306,7 +306,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_NO_MASK` - laguna_backend.cpp
 - `LUCE_NO_MOE_ROUTER_FUSE` - qwen35moe_ffn.cpp
 - `LUCE_NO_MOE_SWIGLU_FUSE` - qwen35moe_ffn.cpp
-- `LUCE_NO_PREAD` - tensor_file_reader.cpp (kill switch: loaders copy weights out of the mapping instead of reading the file on several threads)
+- `LUCE_NO_PREAD` - tensor_file_reader.cpp (KILL SWITCH: any non-empty value other than `0` makes loaders copy weights out of the mapping instead of reading the file on several threads; `=0` leaves the threaded reads on)
 - `LUCE_PROF` - prof_env.h
 - `LUCE_MMPROJ` - scripts/entrypoint.sh (maps to `--mmproj`)
 - `LUCE_PREFILL_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefill-cache-slots`)

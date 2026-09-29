@@ -2427,9 +2427,10 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     // the device before its first graph.
     if (!spans.empty()) ggml_backend_synchronize(backend);
 #if defined(__linux__)
-    // Buffered reads left the file's pages cached, as the mapped copies did:
-    // release them the same way.
-    if (read_ok && reclaim_sources && !reader.direct()) {
+    // Buffered reads (including direct reads the file system refused) left
+    // the file's pages cached, as the mapped copies did: release them the
+    // same way.
+    if (read_ok && reclaim_sources && !reader.reads_bypassed_cache()) {
         for (const TensorFileSpan & sp : spans) {
             reclaim_copied_file_source(mmap.addr, mmap.len, (const char *)mmap.addr + sp.file_offset,
                                        sp.size, mmap.fd, ggml_get_name(sp.tensor));

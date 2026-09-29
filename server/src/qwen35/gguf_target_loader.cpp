@@ -1017,6 +1017,10 @@ bool load_target_gguf_partial(const std::string & path,
         if (!load_tensor_spans(path, mm_addr, mm_len, spans, &read_err)) {
             set_last_error(read_err);
             release_out_buffer();
+            if (out.ctx) {
+                ggml_free(out.ctx);
+                out.ctx = nullptr;
+            }
             gguf_free(gctx);
             return false;
         }

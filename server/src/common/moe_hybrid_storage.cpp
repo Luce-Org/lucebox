@@ -642,7 +642,17 @@ bool build_moe_hybrid_storage_from_file(
                     if (err) *err = "expert slice out of bounds in file";
                     return false;
                 }
-                spans.push_back({stack, expert_bytes * i, (uint64_t)(src.data - file_base) + rel, expert_bytes});
+                const uint64_t file_offset = (uint64_t)(src.data - file_base) + rel;
+                // Consecutive experts are consecutive in the file and the
+                // stack: one span, read in whole pieces instead of one small
+                // read per expert.
+                if (!spans.empty() && spans.back().tensor == stack &&
+                    spans.back().tensor_offset + spans.back().size == expert_bytes * i &&
+                    spans.back().file_offset + spans.back().size == file_offset) {
+                    spans.back().size += expert_bytes;
+                    continue;
+                }
+                spans.push_back({stack, expert_bytes * i, file_offset, expert_bytes});
             }
             return true;
         };

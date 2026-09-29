@@ -249,13 +249,16 @@ uint64_t host_available_bytes() {
         }
         std::fclose(cg);
     }
-    while (!group.empty() && group != "/") {
+    // The walk ends at the mount root "/" (checked once): a container with
+    // its own cgroup namespace sees its group as "/", its limit at the root.
+    while (!group.empty()) {
         uint64_t max = 0, cur = 0;
-        const std::string dir = "/sys/fs/cgroup" + group;
+        const std::string dir = "/sys/fs/cgroup" + (group == "/" ? std::string() : group);
         if (read_u64_file(dir + "/memory.max", max) && read_u64_file(dir + "/memory.current", cur)) {
             const uint64_t room = max > cur ? max - cur : 0;
             if (bytes == 0 || room < bytes) bytes = room;
         }
+        if (group == "/") break;
         group.resize(group.rfind('/') == 0 ? 1 : group.rfind('/'));
     }
     return bytes;
