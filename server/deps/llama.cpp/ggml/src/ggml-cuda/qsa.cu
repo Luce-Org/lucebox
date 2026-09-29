@@ -172,7 +172,7 @@ struct qsa3_layout {
     float scale;
 };
 
-#if defined(__gfx1151__)
+#if defined(__gfx1151__) || !defined(__HIP_DEVICE_COMPILE__)
 __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         const float * __restrict__ q, const uint16_t * __restrict__ pk, const uint16_t * __restrict__ pv,
         const uint16_t * __restrict__ mask, const uint16_t * __restrict__ ublk, const uint16_t * __restrict__ umask,
@@ -396,7 +396,7 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
 #endif
 
 bool ggml_cuda_flash_attn_ext_qsa_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
-#if !defined(__gfx1151__)
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__)
     (void) ctx; (void) dst;
     return false;
 #else
@@ -423,7 +423,7 @@ bool ggml_cuda_flash_attn_ext_qsa_supported(ggml_backend_cuda_context & ctx, con
 }
 
 void ggml_cuda_flash_attn_ext_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-#if !defined(__gfx1151__)
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__)
     (void) ctx; (void) dst;
     return;
 #else

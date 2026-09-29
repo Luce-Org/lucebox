@@ -11,7 +11,7 @@
 
 int ggml_cuda_mmb_probe_tile = 0;
 
-#if defined(__gfx1151__)
+#if defined(__gfx1151__) || !defined(__HIP_DEVICE_COMPILE__)
 
 namespace {
 
@@ -538,7 +538,7 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
 __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo) {
     hi = __builtin_bit_cast(uint16_t, (_Float16) x); lo = __builtin_bit_cast(uint16_t, (_Float16) (x - (float) __builtin_bit_cast(_Float16, hi)));
 }
-#if defined(__gfx1151__)
+#if defined(__gfx1151__) || !defined(__HIP_DEVICE_COMPILE__)
 template <int BM, int BN, int WTM, int WTN, bool TWO, bool X16 = false>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_f32split_kernel(const float * __restrict__ W, const void * __restrict__ Xv, float * __restrict__ D, const int M, const int K, const int T) {
@@ -737,14 +737,15 @@ static const uint16_t * mmb_shadow_lookup(const ggml_tensor * w) {
 // Off by default: opt in with GGML_CUDA_MMB=1. bf16 WMMA dequant changes the
 // rounding of prefill GEMMs relative to the MMQ int path, so it must never
 // silently alter existing architectures' numerics.
+// Kernels exist only in the gfx1151 code object; a fat build must still route
+// other devices (gfx1201) to generic kernels, so gate on the current device.
+bool mmb_arch() { return GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc); }
 bool mmb_enabled() {
     static const bool requested = []() {
         const char * env = getenv("GGML_CUDA_MMB");
         return env && atoi(env) == 1;
     }();
-    if (!requested) return false;
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    return GGML_CUDA_CC_IS_RDNA3_5(cc);
+    return requested && mmb_arch();
 }
 int  mmb_min_t()   { return 512; }
 int  mmb_f32split_mode(){ return 2; }
@@ -798,7 +799,7 @@ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot,
 }
 void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); }
 size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size(); }
-void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { g_mmb_bf16_only.insert(t); }
+void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { if (mmb_arch()) g_mmb_bf16_only.insert(t); }
 bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_bf16_only.count(t) > 0; }
 void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } g_mmb_bf16_only.clear(); }
 void ggml_cuda_mmb_release_all() {
@@ -852,7 +853,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     cudaStream_t stream = ctx.stream();
     const int K = (int) src0->ne[0], M = (int) src0->ne[1];
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
-#if defined(__gfx1151__)
+#if defined(__gfx1151__) || !defined(__HIP_DEVICE_COMPILE__)
     if (src0->type == GGML_TYPE_F32) {
         dim3 grid((M + 127) / 128, (T + 127) / 128);
         static const bool two = true;
@@ -927,10 +928,10 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     CUDA_CHECK(cudaGetLastError());
 }
 
-bool ggml_cuda_mmb_gatemix() { return mmb_gatemix_flag(); }
-bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
-bool ggml_cuda_mmb_blk16() { return true; }
-bool ggml_cuda_mmb_res16()  { return true; }
+bool ggml_cuda_mmb_gatemix() { return mmb_arch() && mmb_gatemix_flag(); }
+bool ggml_cuda_mmb_down16() { return mmb_arch() && mmb_down16_flag(); }
+bool ggml_cuda_mmb_blk16() { return mmb_arch(); }
+bool ggml_cuda_mmb_res16()  { return mmb_arch(); }
 // Exact operator differential, opt-in and excluded from benchmark runs.
 __global__ void mmb_check_bytes(const uint8_t * a, const uint8_t * b, size_t n, unsigned int * errors) {
     unsigned int count = 0;
@@ -940,7 +941,7 @@ __global__ void mmb_check_bytes(const uint8_t * a, const uint8_t * b, size_t n, 
 
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
         const int hc, const float scale, const float bias) {
-    if (!mmb_gatemix_flag() || hc != 4 || !mmb_quant_type(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
+    if (!ggml_cuda_mmb_gatemix() || hc != 4 || !mmb_quant_type(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     if (K % ggml_blck_size(w->type) != 0) return false;
     if (K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t()) return false;
@@ -1082,7 +1083,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
 
 // Called from graph_optimize (outside stream capture): create the shadow for an eligible IQ4_NL dense weight.
 void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
-    if (!w) return;
+    if (!w || !mmb_arch()) return;
     if (mmb_is_resident_q6k(w)) {
         if (!mmb_shadow_q6k() || g_mmb_shadow.count(w->data) > 0) return;
         const size_t n = (size_t) w->ne[0] * w->ne[1], bytes = n * 2;
