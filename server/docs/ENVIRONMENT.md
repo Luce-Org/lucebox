@@ -35,6 +35,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `QWEN4EXP_QSA` | 0 | `1` enables qwen4exp prefill selected attention. Decode remains dense. |
 | `QWEN4EXP_MMB_CUBLAS` | 0 | Qwen4exp validated bf16-shadow dense route (`1`, `3`, or `5`). Mode `2` is diagnostic only. |
 | `LUCE_MMB_SHADOW` | 2 | Shared MMB bf16 weight-shadow policy (`0` off, `1` IQ4_NL/Q5_K, `2` Q6_K). |
+| `LUCE_MMB_Q8F16` | unset | EXPERIMENTAL: =1 routes MMB Q8_0 dense GEMMs (T>=512, gfx1151) to the Q8->F16 WMMA kernel (`mmb-q8f16.cuh`); changes numerics vs the bf16 tile. |
 | `LLAMA_MMB_HC16` | 0 | `2` enables the qwen4exp validated bf16-only hyper-connection stream. |
 | `QWEN4EXP_DENSE_TABLE` | 1 | BURN-IN KILL SWITCH: =0 disables the gfx1151, 16366-token measured MMQ table. |
 | `QWEN4EXP_HC_TILE16` | 1 | BURN-IN KILL SWITCH: =0 restores the original IQ4_NL hyper-connection tile. |
@@ -421,3 +422,4 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `QWEN4EXP_MMB_CUBLAS` - ggml-cuda.cu (cuBLAS route: 0/unset off, 1 validated K=2560, 3 + ssm_out, 5 + HC down/up)
 - `LUCE_MMB_SHADOW` - mmb.cu (1 enables the IQ4_NL bf16 weight shadow; default 2 = Q6_K only)
 - `LUCE_MMB_SHADOW_CAP_MB` - mmb.cu (cap on total bf16 weight-shadow bytes)
+- `LUCE_MMB_Q8F16` - mmb.cu (1 = Q8_0 dense via the F16 WMMA kernel)

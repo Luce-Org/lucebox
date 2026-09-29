@@ -37,6 +37,8 @@ __global__ void mmb_cvt_f32_bf16(const float * __restrict__ x, uint16_t * __rest
 
 }
 #include "mmb-quant.cuh"
+#include "mmb-q8f16.cuh"
+#include "mmb-small-m.cuh"
 namespace {
 
 // dequantize one weight row's two consecutive IQ4_NL blocks (36 bytes) into 64 bf16 in LDS.
@@ -661,6 +663,24 @@ static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, con
     return buf;
 }
 
+// F16 twin of the bf16 activation cache for the Q8_0 -> F16 WMMA route: an F32 activation is converted once per
+// graph and shared by every GEMM that reads it (qkv/gate, q/k/v); converting in the tile load instead re-reads F32
+// per row tile and ran ssm_out/HC down at half speed (docs/performance/qwen4exp-q8-dense).
+static std::vector<mmb_cache_entry> g_mmb_f16_cache;
+__global__ void mmb_cvt_f32_f16(const float * __restrict__ x, _Float16 * __restrict__ y, const size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = mq_f2h_sat(x[i]);
+}
+static const _Float16 * mmb_f16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
+    const ggml_tensor * root = mmb_root(src1);
+    for (auto & e : g_mmb_f16_cache) if (e.root == root && e.data == src1->data && e.n == n) return (const _Float16 *) e.buf->get();
+    if (g_mmb_f16_cache.size() >= mmb_cache_max()) { delete g_mmb_f16_cache.front().buf; g_mmb_f16_cache.erase(g_mmb_f16_cache.begin()); }
+    auto * buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n);
+    g_mmb_f16_cache.push_back({root, src1->data, n, buf});
+    mmb_cvt_f32_f16<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>((const float *) src1->data, (_Float16 *) buf->get(), n);
+    return (const _Float16 *) buf->get();
+}
+
 // Shadow BF16 copies of IQ4_NL dense weights: dequantised once (same LUT*scale -> BF16 RNE as mmb_dq_row36, so the
 // WMMA inputs are bitwise identical) so the dense GEMM runs the dequant-free WTYPE=2 path.
 __global__ void mmb_dq_q6k_bf16_kernel(const uint8_t * __restrict__ W, uint16_t * __restrict__ out, const size_t nblocks) {
@@ -757,6 +777,10 @@ bool mmb_tall()    { return mmb_tall_mode() != 0; }
 bool mmb_gatemix_flag() { return true; }
 bool mmb_down16_flag() { return true; }
 bool mmb_glu()     { return true; }
+// LUCE_MMB_Q8F16=1: Q8_0 dense GEMMs take the F16 WMMA kernel (mmb-q8f16.cuh) instead of the bf16 tile.
+// LUCE_MMB_SMALL_M=1: F32/bf16 dense GEMMs with M <= 8 (HC inject) take the bandwidth kernel (mmb-small-m.cuh).
+bool mmb_small_m() { static const bool on = getenv("LUCE_MMB_SMALL_M") && atoi(getenv("LUCE_MMB_SMALL_M")) == 1; return on; }
+bool mmb_q8f16()   { static const bool on = getenv("LUCE_MMB_Q8F16") && atoi(getenv("LUCE_MMB_Q8F16")) == 1; return on; }
 
 } // namespace
 
@@ -801,7 +825,7 @@ void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); }
 size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size(); }
 void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { if (mmb_arch()) g_mmb_bf16_only.insert(t); }
 bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_bf16_only.count(t) > 0; }
-void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } g_mmb_bf16_only.clear(); }
+void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_f16_cache) delete e.buf; g_mmb_f16_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } g_mmb_bf16_only.clear(); }
 void ggml_cuda_mmb_release_all() {
     ggml_cuda_mmb_begin_graph();
     for (int i = 0; i < 4; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
@@ -854,6 +878,13 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const int K = (int) src0->ne[0], M = (int) src0->ne[1];
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
 #if defined(__gfx1151__) || !defined(__HIP_DEVICE_COMPILE__)
+    if (mmb_small_m() && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) && M <= 8) {
+        const uint16_t * xb = ggml_cuda_mmb_bf16_src(src1);
+        if (mmb_small_m_launch(src0->data, src0->type == GGML_TYPE_BF16, xb ? (const void *) xb : src1->data, xb != nullptr,
+                               (float *) dst->data, T, M, K, stream)) {
+            CUDA_CHECK(cudaGetLastError()); return;
+        }
+    }
     if (src0->type == GGML_TYPE_F32) {
         dim3 grid((M + 127) / 128, (T + 127) / 128);
         static const bool two = true;
@@ -868,6 +899,16 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             else    mmb_f32split_kernel<128, 128, 32, 64, false, false><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
         }
         CUDA_CHECK(cudaGetLastError()); return;
+    }
+    if (src0->type == GGML_TYPE_Q8_0 && mmb_q8f16() && !(K == 320 && M == 10240)) {
+        // Q8_0 -> F16 WMMA (bf16-only activations converted in the tile load, F32 ones via the per-graph F16 cache). A bf16-only dst keeps its in-place bf16 form.
+        const uint16_t * xb = ggml_cuda_mmb_bf16_src(src1);
+        const bool bf16_dst = ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0;
+        const void * xa = xb ? (const void *) xb : (const void *) mmb_f16_activation(ctx, src1, (size_t) T * K, stream);
+        if (mmb_q8f16_launch((const uint8_t *) src0->data, xa, xb ? 1 : 0,
+                             bf16_dst ? nullptr : (float *) dst->data, bf16_dst ? (uint16_t *) dst->data : nullptr, T, M, K, stream)) {
+            CUDA_CHECK(cudaGetLastError()); return;
+        }
     }
 #endif
     // A bf16-only tensor already lives in the mmb cache as bf16; reading it as f32 would reinterpret bytes.
