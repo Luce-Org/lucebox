@@ -418,7 +418,10 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 //                               (CUDA default on; HIP default off)
 //   LUCE_MMID_GROUPED_TYPES   bitmask, 1 = Q4_K, 2 = Q6_K,
 //                               4 = Q4_0/Q8_0/Q5_K, 8 = ROCmFP2/ROCmFP3,
-//                               16 = ROCmFP4-fast, 32 = ROCmFP3 only.
+//                               16 = ROCmFP4-fast, 32 = ROCmFP3 only,
+//                               64 = Q5_0 on sm_86 with batch/projection-shape guards.
+//                               Default 71; 7 disables Q5_0 while retaining
+//                               the previously enabled formats.
 //   LUCE_MMID_GROUPED_DEVICE  optional zero-based device index; unset/-1
 //                               applies the path to every eligible device.
 //                               Q6_K stays on its tuned MMQ route above 5
