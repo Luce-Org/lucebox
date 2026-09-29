@@ -86,7 +86,7 @@ bool TensorFileReader::load(const std::vector<TensorFileSpan> & spans, std::stri
         size_t i;
         while (!failed.load(std::memory_order_relaxed) && (i = next.fetch_add(1)) < pieces.size()) {
             const Piece & p = pieces[i];
-            if (buf.size() < p.size + 3 * kAlign) buf.resize(std::max(kPieceBytes, p.size) + 3 * kAlign);
+            if (buf.size() < p.size + 3 * kAlign) buf.resize(p.size + 3 * kAlign);
             uint8_t * aligned = reinterpret_cast<uint8_t *>(
                 ((uintptr_t) buf.data() + kAlign - 1) & ~(uintptr_t) (kAlign - 1));
             const uint64_t off = p.span->file_offset + p.at;

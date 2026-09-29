@@ -46,7 +46,7 @@ Untagged variables are operational tuning knobs.
 | `LUCE_MAX_CONTEXT` | KV sizing override for laguna and qwen35moe expert placement. |
 | `LUCE_DEFAULT_MAX_TOKENS` | Default generation token cap. |
 | `LUCE_IGNORE_EOS` | Ignore EOS token during generation. |
-| `LUCE_NO_PREAD` | 🔀 **kill-switch** Every model loader copies its weights out of the file mapping instead of the threaded reads of `tensor_file_reader` (direct reads for a file larger than half the available memory). |
+| `LUCE_NO_PREAD` | 🔀 **kill-switch** Every model loader copies its weights out of the file mapping instead of using `tensor_file_reader`'s threaded reads (which bypass the page cache for a file larger than half the available memory). |
 | `LUCE_LAZY` | Container entrypoint: `1` adds `--lazy-draft` (needs a draft and `LUCE_PREFILL_DRAFTER`). |
 
 ## GPU / backend placement
