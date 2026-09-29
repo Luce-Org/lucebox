@@ -1250,14 +1250,6 @@ if(LUCE_TESTS)
             list(APPEND _raw_unit_test_targets test_getrows_scalar)
         endif()
 
-        # Diagnostic, not a test: probes real quantized tensor bytes read from a
-        # GGUF against the CPU backend to locate a mishandled type.
-        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_quant_probe.cpp")
-            luce_add_ggml_gpu_executable(test_quant_probe test/test_quant_probe.cpp)
-            target_compile_definitions(test_quant_probe PRIVATE GGML_USE_HIP)
-            target_link_libraries(test_quant_probe PRIVATE ggml-cpu)
-        endif()
-
         # The rocWMMA fragment-layout probe requires the rocWMMA headers; it
         # only builds when the rocWMMA fattn kernel is enabled so the
         # default HIP build stays independent of the optional package.
