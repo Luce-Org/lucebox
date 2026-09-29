@@ -634,6 +634,7 @@ add_library(luce_common STATIC
     src/common/moe_hybrid_ffn_eval.cpp
     src/common/moe_hybrid_expert_cache.cpp
     src/common/platform_io.cpp
+    src/common/tensor_file_reader.cpp
     src/common/moe_hybrid_stream.cpp
     src/common/moe_expert_compute.cpp
     src/common/moe_expert_compute_cpu.cpp
@@ -2203,7 +2204,8 @@ if(LUCE_TESTS)
             test/test_qwen35moe_expert_placement.cpp
             test/test_qwen35moe_swap_manager.cpp
             test/test_mmq_streamk_schedule.cpp
-            test/test_moe_hybrid_storage.cpp)
+            test/test_moe_hybrid_storage.cpp
+            test/test_tensor_file_reader.cpp)
         if(LUCE_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _server_unit_sources
                 test/test_gpu_sampler_cuda.cpp

@@ -8,6 +8,7 @@
 
 #include "common/gguf_bounds.h"
 #include "common/gguf_mmap.h"
+#include "common/tensor_file_reader.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -439,6 +440,7 @@ bool load_bailingmoe3_gguf(const std::string & path,
     }
     const uint8_t * bytes = static_cast<const uint8_t *>(mmap.data());
     const size_t file_size = mmap.size();
+    std::vector<TensorFileSpan> spans;
     for (const TensorAllocation & allocation : allocations) {
         if (allocation.file_offset + allocation.file_size < allocation.file_offset ||
             allocation.file_offset + allocation.file_size > file_size) {
@@ -447,8 +449,15 @@ bool load_bailingmoe3_gguf(const std::string & path,
             return fail("truncated tensor data for " +
                         std::string(allocation.tensor->name));
         }
-        ggml_backend_tensor_set(allocation.tensor,
-            bytes + allocation.file_offset, 0, allocation.file_size);
+        spans.push_back({allocation.tensor, 0, allocation.file_offset, allocation.file_size});
+    }
+    {
+        std::string read_error;
+        if (!load_tensor_spans(path, bytes, spans, &read_error)) {
+            ggml_backend_buffer_free(out.buf);
+            out.buf = nullptr;
+            return fail(read_error);
+        }
     }
 
     const int64_t token_tid = gguf_find_tensor(gctx, "token_embd.weight");

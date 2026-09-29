@@ -1815,20 +1815,6 @@ bool DeepSeek4Backend::apply_routing_adjustments() {
 
 static size_t ds4_device_headroom_bytes(int device);
 
-// Linux MemAvailable in bytes, 0 when unknown.
-static uint64_t ds4_host_available_bytes() {
-    FILE * f = std::fopen("/proc/meminfo", "r");
-    if (!f) return 0;
-    char line[256];
-    unsigned long long kb = 0;
-    uint64_t bytes = 0;
-    while (std::fgets(line, sizeof(line), f)) {
-        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) { bytes = (uint64_t) kb << 10; break; }
-    }
-    std::fclose(f);
-    return bytes;
-}
-
 // Host RAM kept free of the locked expert tier: the OS and this process's
 // own host buffers (a layer-major pass keeps its HC state and embeddings,
 // (n_hc + 1) * n_embd floats per token of at most one pass span, on the host).
@@ -1875,7 +1861,7 @@ bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, int secondar
             // headroom and a margin for the buffers allocated after the experts.
             carve_reserve = ds4_device_headroom_bytes(secondary_gpu) + ds4_stream_cache_request_bytes() +
                             (1ULL << 30);
-            const uint64_t avail = ds4_host_available_bytes();
+            const uint64_t avail = host_available_bytes();
             const uint64_t keep = ds4_host_reserve_bytes(w_, cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192);
             const uint64_t host_want = avail > keep ? avail - keep : 0;
             host_bytes = ggml_backend_cuda_set_host_spill(secondary_gpu, carve_reserve, host_want);
@@ -2657,7 +2643,7 @@ bool DeepSeek4Backend::check_device_headroom() const {
     // Locked host memory cannot be reclaimed: the host keeps the OS reserve free.
     const size_t locked = stream_cache_device_ >= 0 ? ggml_backend_cuda_host_spill_bytes(stream_cache_device_) : 0;
     if (locked > 0) {
-        const uint64_t avail = ds4_host_available_bytes();
+        const uint64_t avail = host_available_bytes();
         const uint64_t need = 4ULL << 30;
         std::fprintf(stderr, "[deepseek4] host memory: %.2f GiB available beside %.2f GiB of locked experts "
                      "(headroom %.2f GiB)%s\n", avail / 1073741824.0, locked / 1073741824.0,

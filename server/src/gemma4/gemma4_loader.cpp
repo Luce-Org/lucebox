@@ -13,6 +13,7 @@
 #include "gemma4_internal.h"
 #include "internal.h"
 #include "luce.h"
+#include "common/tensor_file_reader.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -404,6 +405,7 @@ bool load_gemma4_gguf_partial(const std::string & path,
     // Copy tensor data from mmap to backend; track tok_embd for CPU embedder
     size_t tok_embd_off = 0, tok_embd_sz = 0;
     ggml_type tok_embd_type = GGML_TYPE_COUNT;
+    std::vector<TensorFileSpan> spans;
     for (int i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(gctx, i);
         ggml_tensor * t = ggml_get_tensor(meta_ctx, name);
@@ -415,8 +417,14 @@ bool load_gemma4_gguf_partial(const std::string & path,
             tok_embd_sz = sz;
             tok_embd_type = gguf_get_tensor_type(gctx, i);
         }
-        if (should_load_gemma4_tensor(name, plan)) {
-            ggml_backend_tensor_set(t, (const char *)mmap.addr + offset, 0, sz);
+        if (should_load_gemma4_tensor(name, plan)) spans.push_back({t, 0, offset, sz});
+    }
+    {
+        std::string read_err;
+        if (!load_tensor_spans(path, mmap.addr, spans, &read_err)) {
+            set_last_error("gemma4: " + read_err);
+            mmap.close_map();
+            gguf_free(gctx); return false;
         }
     }
 

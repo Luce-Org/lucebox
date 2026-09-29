@@ -41,6 +41,7 @@
 #include "internal.h"
 #include "luce.h"
 #include "common/gguf_mmap.h"
+#include "common/tensor_file_reader.h"
 #include "common/gguf_bounds.h"
 
 #include <cinttypes>
@@ -562,6 +563,7 @@ bool load_target_gguf_laguna_partial(const std::string & path,
     }
 
     // ── 4. Copy selected tensor bytes to GPU; remember tok_embd for embedder ─
+    std::vector<TensorFileSpan> spans;
     size_t total = 0;
     size_t tok_embd_off = 0, tok_embd_sz = 0;
     ggml_type tok_embd_type = GGML_TYPE_COUNT;
@@ -586,8 +588,11 @@ bool load_target_gguf_laguna_partial(const std::string & path,
         }
         if (!should_load_laguna_tensor(tname, plan)) continue;
         if (plan.metadata_only) continue;
-        ggml_backend_tensor_set(t, mm_addr + off, 0, sz);
+        spans.push_back({t, 0, off, sz});
         total += sz;
+    }
+    if (!load_tensor_spans(path, mm_addr, spans, &err)) {
+        set_last_error(err); gguf_free(gctx); return false;
     }
 
     // Fused per-head q/k norm weights: [head_dim, n_head+n_head_kv] f32 with
