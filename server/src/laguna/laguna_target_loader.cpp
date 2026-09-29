@@ -591,8 +591,11 @@ bool load_target_gguf_laguna_partial(const std::string & path,
         spans.push_back({t, 0, off, sz});
         total += sz;
     }
-    if (!load_tensor_spans(path, mm_addr, spans, &err)) {
-        set_last_error(err); gguf_free(gctx); return false;
+    if (!load_tensor_spans(path, mm_addr, mm_len, spans, &err)) {
+        set_last_error(err);
+        free_laguna_target_weights(out);
+        gguf_free(gctx);
+        return false;
     }
 
     // Fused per-head q/k norm weights: [head_dim, n_head+n_head_kv] f32 with

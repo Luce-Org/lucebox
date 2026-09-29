@@ -30,28 +30,35 @@ struct TensorFileSpan {
 
 class TensorFileReader {
 public:
-    bool open(const std::string & path, std::string * err = nullptr);
-    bool is_open() const { return file_.is_open(); }
-    bool direct() const { return file_.direct(); }
-    uint64_t size() const { return file_.size(); }
+    // Auto: direct reads for a file larger than half the available memory.
+    // Buffered / Direct force the choice (tests).
+    enum class Mode { Auto, Buffered, Direct };
+
+    bool open(const std::string & path, std::string * err = nullptr, Mode mode = Mode::Auto);
+    bool is_open() const { return buffered_.is_open(); }
+    bool direct() const { return direct_.is_open(); }
+    uint64_t size() const { return buffered_.size(); }
 
     // Copies every span into its tensor (ggml_backend_tensor_set); false with
-    // *err on a read error or a span outside the file or its tensor. Spans may
-    // target any backend buffer that accepts ggml_backend_tensor_set for a
-    // byte range (not a split buffer, whose tensors take only whole writes);
-    // the writes are serialized.
+    // *err on a read error or a span outside the file or its tensor. A span
+    // of a meta (tensor-parallel) buffer is written whole; other buffers take
+    // it in pieces. A CUDA split buffer is not a valid target: its tensors
+    // take only whole writes and it cannot be recognized here. The writes are
+    // serialized.
     bool load(const std::vector<TensorFileSpan> & spans, std::string * err = nullptr) const;
 
 private:
-    ReadOnlyFile file_;
+    ReadOnlyFile buffered_;  // always open; also the fallback of a failed direct read
+    ReadOnlyFile direct_;    // open when reads bypass the page cache
 };
 
 // Loads `spans` of the file at `path`, the same file as `mapping` (mapped from
-// offset zero; the caller checked the bounds). Spans already in the page cache
-// are copied straight out of the mapping, the fastest warm start; otherwise a
-// TensorFileReader reads them. The mapping is also the fallback where the
-// reader cannot open the file (or LUCE_NO_PREAD is set).
-bool load_tensor_spans(const std::string & path, const void * mapping,
+// offset zero, `mapping_size` bytes). Spans outside the mapping are refused.
+// Spans already in the page cache are copied straight out of the mapping, the
+// fastest warm start; otherwise a TensorFileReader reads them. The mapping is
+// also the fallback where the reader cannot open the file (or LUCE_NO_PREAD is
+// set).
+bool load_tensor_spans(const std::string & path, const void * mapping, size_t mapping_size,
                        const std::vector<TensorFileSpan> & spans, std::string * err = nullptr);
 
 }  // namespace luce::common
