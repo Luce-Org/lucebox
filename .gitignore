@@ -93,3 +93,7 @@ server/docs/tuning-snapshots/
 # Workdir editor backup suffixes
 *.git-head
 *.pre-pflash-rename
+
+# Local-only performance/evidence logs (kept on disk, never committed)
+/docs/performance/
+/docs/qwen4exp.md
