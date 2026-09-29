@@ -137,22 +137,9 @@ int main(int argc, char ** argv) {
             std::vector<std::vector<float>> solo(N), batched;
             bool streams_match = true;
             for (int s = 0; s < N; ++s) {
-                char trace_tag[128];
-                const char * trace_prefix = std::getenv("QWEN4EXP_TRACE_PREFIX");
-                if (trace_prefix) {
-                    std::snprintf(trace_tag, sizeof(trace_tag), "%s_solo_s%d_step%d",
-                                  trace_prefix, s, step);
-                    setenv("QWEN4EXP_TRACE_TAG", trace_tag, 1);
-                }
                 auto r = qwen4exp_forward(backend, w, caches[s], &feed[s], 1, pos[s], solo[s]);
                 restore_cache(caches[s], snapshots[s]);
                 if (!r.ok) { std::fprintf(stderr, "solo failed slot=%d\n", s); return 1; }
-            }
-            if (std::getenv("QWEN4EXP_TRACE_PREFIX")) {
-                char trace_tag[128];
-                std::snprintf(trace_tag, sizeof(trace_tag), "%s_batch_step%d",
-                              std::getenv("QWEN4EXP_TRACE_PREFIX"), step);
-                setenv("QWEN4EXP_TRACE_TAG", trace_tag, 1);
             }
             auto r = qwen4exp_forward_batched(backend, w, ptrs, feed, pos, N, workspace, batched);
             if (!r.ok || batched.size() != N) { std::fprintf(stderr, "batched forward failed\n"); return 1; }
@@ -173,10 +160,6 @@ int main(int argc, char ** argv) {
             std::printf("[batch-probe] phase=%s step=%d epsilon_max=%.9g\n", identical ? "identical" : "distinct", step, phase_eps);
             if (identical) for (int s = 0; s < N; ++s) if (argmax(batched[s]) != argmax(batched[0])) ++failures;
             for (int s = 0; s < N; ++s) { feed[s] = argmax(batched[s]); pos[s]++; }
-            if (step == 0 && std::getenv("QWEN4EXP_TRACE_FIRST_DECODE")) {
-                std::fflush(nullptr);
-                std::exit(failures ? 1 : 0);
-            }
             if (!streams_match) break; // The first divergence and its 2*epsilon margin were recorded above.
         }
 

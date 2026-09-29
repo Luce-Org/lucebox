@@ -849,8 +849,7 @@ static ggml_tensor * token_span_3d(ggml_context * c, ggml_tensor * x,
 static ggml_tensor * build_ple_projected(ggml_context * c, ggml_cgraph * gf,
         ggml_tensor * hidden, ggml_tensor * key, ggml_tensor * value,
         const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
-        ggml_tensor * ple_conv_state,
-        const std::function<void(ggml_tensor *, const char *)> & dump_mark) {
+        ggml_tensor * ple_conv_state) {
     const int64_t n_embd = w.n_embd, hc = w.n_hc, hc_dim = n_embd * hc;
     const int64_t T = hidden->ne[2];
     const float eps = w.rms_eps;
@@ -905,7 +904,6 @@ static ggml_tensor * build_ple_projected(ggml_context * c, ggml_cgraph * gf,
     conv_out = ggml_reshape_3d(c, ggml_cont(c, ggml_silu(c, conv_out)),
                                n_embd, hc, T);
     ggml_tensor * out = ggml_add(c, hidden, ggml_add(c, gated, conv_out));
-    if (dump_mark) dump_mark(out, "ple.packed");
     ggml_build_forward_expand(gf, out);
     return out;
 }
@@ -1083,8 +1081,7 @@ static ggml_tensor * build_full_attn_projected(ggml_context * c, ggml_cgraph * g
 
 static ggml_tensor * build_ple_row(ggml_context * c, ggml_cgraph * gf,
         ggml_tensor * hidden, ggml_tensor * key, ggml_tensor * value,
-        const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, ggml_tensor * state,
-        const std::function<void(ggml_tensor *, const char *)> & trace) {
+        const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, ggml_tensor * state) {
     const int64_t n_embd = w.n_embd, hc = w.n_hc, hc_dim = n_embd * hc;
     const float eps = w.rms_eps;
     auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * nw) {
@@ -1092,23 +1089,16 @@ static ggml_tensor * build_ple_row(ggml_context * c, ggml_cgraph * gf,
         return ggml_reshape_3d(c, ggml_mul(c, ggml_reshape_2d(c, t, hc_dim, 1), nw),
                                n_embd, hc, 1);
     };
-    trace(key, "ple.key"); trace(value, "ple.value");
     key = grouped_norm(key, L.ple_norm_key);
-    trace(key, "ple.knorm");
     ggml_tensor * query = grouped_norm(hidden, L.ple_norm_query);
-    trace(query, "ple.qnorm");
     ggml_tensor * score = ggml_scale(c, ggml_sum_rows(c, ggml_mul(c, key, query)),
                                      1.0f / sqrtf((float) n_embd));
-    trace(score, "ple.score");
     ggml_tensor * mag = ggml_sqrt(c, ggml_clamp(c, ggml_abs(c, score), 1e-6f, INFINITY));
     ggml_tensor * gate = ggml_sigmoid(c, ggml_mul(c, ggml_sgn(c, score), mag));
-    trace(gate, "ple.gate");
     ggml_tensor * gated = ggml_mul(c, ggml_repeat_4d(c,
         ggml_reshape_3d(c, value, n_embd, 1, 1), n_embd, hc, 1, 1), gate);
-    trace(gated, "ple.gated");
     ggml_tensor * normalized = grouped_norm(
         ggml_reshape_2d(c, gated, hc_dim, 1), L.ple_norm_conv);
-    trace(normalized, "ple.normalized");
     const int64_t kern = w.ple_conv_kernel, dil = w.ple_ngram_size;
     const int64_t hist = (kern - 1) * dil;
     ggml_tensor * norm_t = ggml_transpose(c, ggml_reshape_2d(c, normalized, hc_dim, 1));
@@ -1136,76 +1126,7 @@ static ggml_tensor * build_ple_row(ggml_context * c, ggml_cgraph * gf,
         conv_out = conv_out ? ggml_add(c, conv_out, term) : term;
     }
     conv_out = ggml_reshape_3d(c, ggml_cont(c, ggml_silu(c, conv_out)), n_embd, hc, 1);
-    trace(conv_out, "ple.conv");
     return ggml_add(c, hidden, ggml_add(c, gated, conv_out));
-}
-
-static void write_layer_trace(ggml_backend_t backend,
-        const std::vector<std::pair<ggml_tensor *, std::string>> & tensors) {
-    const char * tag = std::getenv("QWEN4EXP_TRACE_TAG");
-    if (!tag || !*tag) return;
-    for (const auto & entry : tensors) {
-        ggml_tensor * t = entry.first;
-        if (!t || !t->data || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_I32)) continue;
-        int64_t rows = 1, elems_per_row = ggml_nelements(t);
-        size_t row_stride = ggml_nbytes(t);
-        if (!std::strcmp(entry.second.c_str(), "ple.inp") ||
-            !std::strcmp(entry.second.c_str(), "ple.projkey") ||
-            !std::strcmp(entry.second.c_str(), "ple.projvalue")) {
-            rows = t->ne[1];
-            elems_per_row = t->ne[0];
-            row_stride = t->nb[1];
-        } else if (std::strncmp(entry.second.c_str(), "ple.", 4) == 0) {
-            rows = 1;
-            elems_per_row = ggml_nelements(t);
-            row_stride = ggml_nbytes(t);
-        } else if (t->ne[2] > 1 || std::strstr(entry.second.c_str(), ".res") ||
-            std::strstr(entry.second.c_str(), ".ple") || std::strstr(entry.second.c_str(), ".ffnxn")) {
-            rows = t->ne[2];
-            elems_per_row = t->ne[0] * t->ne[1];
-            row_stride = t->nb[2];
-        } else if (t->ne[1] > 1) {
-            rows = t->ne[1];
-            elems_per_row = t->ne[0];
-            row_stride = t->nb[1];
-        }
-        for (int64_t row = 0; row < rows; ++row) {
-            const size_t bytes = (size_t) elems_per_row * ggml_element_size(t);
-            std::vector<uint8_t> data(bytes);
-            ggml_backend_tensor_get(t, data.data(), (size_t) row * row_stride, bytes);
-            char path[512];
-            std::snprintf(path, sizeof(path), "/tmp/q4trace_%s_%s_row%lld.bin",
-                          tag, entry.second.c_str(), (long long) row);
-            FILE * f = std::fopen(path, "wb");
-            if (f) { std::fwrite(data.data(), 1, data.size(), f); std::fclose(f); }
-        }
-    }
-    (void) backend;
-}
-
-static void write_ple_indices(const std::vector<int32_t> & rows) {
-    const char * tag = std::getenv("QWEN4EXP_TRACE_TAG");
-    if (!tag || !*tag) return;
-    char path[512];
-    std::snprintf(path, sizeof(path), "/tmp/q4trace_%s_ple-indices.bin", tag);
-    FILE * f = std::fopen(path, "wb");
-    if (f) { std::fwrite(rows.data(), sizeof(int32_t), rows.size(), f); std::fclose(f); }
-}
-
-static void write_ple_host(const std::vector<float> & data) {
-    const char * tag = std::getenv("QWEN4EXP_TRACE_TAG");
-    if (!tag || !*tag) return;
-    char path[512];
-    std::snprintf(path, sizeof(path), "/tmp/q4trace_%s_ple-host.bin", tag);
-    FILE * f = std::fopen(path, "wb");
-    if (f) { std::fwrite(data.data(), sizeof(float), data.size(), f); std::fclose(f); }
-}
-
-static bool trace_layer_selected(const char * label) {
-    return label && (!std::strncmp(label, "ple.", 4) || std::strstr(label, ".att") || std::strstr(label, ".fmix") ||
-                     std::strstr(label, ".hcmix") || std::strstr(label, ".ffnxn") ||
-                     std::strstr(label, ".moe") || std::strstr(label, ".mid") ||
-                     std::strstr(label, ".res") || std::strstr(label, ".ple"));
 }
 
 }  // namespace
@@ -1222,7 +1143,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     static const bool prof = getenv("QWEN4EXP_PROF") != nullptr;
     // QWEN4EXP_DUMP=1 materialises per-layer activations and prints finite/absmax/mean.
     static const bool dump = getenv("QWEN4EXP_DUMP") != nullptr;
-    static const bool layer_trace = getenv("QWEN4EXP_LAYER_TRACE") != nullptr;
     // The fused reduction can differ from upstream's ggml_rms_norm below one
     // ulp; keep the unfused form for upstream differential checks.
     static const bool upstream = [] { const char * v = getenv("QWEN4EXP_UPSTREAM"); return v && std::atoi(v) != 0; }();
@@ -1243,7 +1163,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     const bool use_stable_graph = stable_graph && reuse_decode_workspace;
     std::vector<std::pair<ggml_tensor *, std::string>> dump_t;
     auto dump_mark = [&](ggml_tensor * t, const char * label) {
-        if (t && (dump || (layer_trace && trace_layer_selected(label)))) {
+        if (t && dump) {
             // A view output must keep its owning allocation alive until the dump.
             for (ggml_tensor * base = t; base; base = base->view_src) ggml_set_output(base);
             ggml_set_name(t, label);
@@ -1307,12 +1227,10 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                 }
             }
         }
-        if (layer_trace) write_ple_indices(ple_rows);
         if (!w.ple_reader.gather(ple_rows.data(), (int64_t) ple_rows.size(), ple_data.data())) {
             std::fprintf(stderr, "[qwen4exp] PLE gather failed\n");
             return res;
         }
-        if (layer_trace) write_ple_host(ple_data);
         const size_t keep = (size_t) std::min<int64_t>(ng - 1, n_tokens + (int64_t) ple_prev.size());
         std::vector<int32_t> next;
         next.reserve(keep);
@@ -1476,11 +1394,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
             res_hc = build_ple(ctx, gf, res_hc, ple_in, L, w,
                                cache.ple_conv_state.empty() ? nullptr :
                                    cache.ple_conv_state[0], dump_mark);
-            if (layer_trace) {
-                char ple_label[24];
-                std::snprintf(ple_label, sizeof(ple_label), "L%02d.ple", il);
-                dump_mark(res_hc, ple_label);
-            }
             xn_next = nullptr;   // PLE changed the residual; the norm must rerun
         }
 
@@ -1772,7 +1685,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
             t_compute - t_upload, prof_now_ms() - t_compute, prof_now_ms() - t0);
     }
 
-    if (dump || layer_trace) {
+    if (dump) {
         for (auto & dt : dump_t) {
             ggml_tensor * t = dt.first;
             const size_t n = (size_t) ggml_nelements(t);
@@ -1833,7 +1746,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
             }
         }
     }
-    if (layer_trace) write_layer_trace(backend, dump_t);
 
     if (!reuse_decode_workspace) {
         ggml_gallocr_free(galloc);
@@ -1855,7 +1767,6 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
     Qwen4ExpForwardResult result;
     const char * enabled = std::getenv("QWEN4EXP_BATCHED_DECODE");
     const char * upstream_env = std::getenv("QWEN4EXP_UPSTREAM");
-    static const bool layer_trace = std::getenv("QWEN4EXP_LAYER_TRACE") != nullptr;
     if (!enabled || std::atoi(enabled) == 0 ||
         (upstream_env && std::atoi(upstream_env) != 0) ||
         !backend || !caches || !tokens || !positions || n_slots <= 0) return result;
@@ -1948,12 +1859,10 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
             for (size_t k = total - keep; k < total; ++k)
                 next_prev[s].push_back(k < prev.size() ? prev[k] : tokens[s]);
         }
-        if (layer_trace) write_ple_indices(ple_rows);
         if (!w.ple_reader.gather(ple_rows.data(), (int64_t) ple_rows.size(), ple_data.data())) {
             std::fprintf(stderr, "[qwen4exp] batched PLE gather failed\n");
             return result;
         }
-        if (layer_trace) write_ple_host(ple_data);
     }
 
     ggml_init_params ip{};
@@ -1966,20 +1875,12 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
     if (!ctx) return result;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 400000, false);
     if (!gf) return result;
-    std::vector<std::pair<ggml_tensor *, std::string>> trace_tensors;
-    auto trace_mark = [&](ggml_tensor * t, const char * label) {
-        if (!layer_trace || !t || !trace_layer_selected(label)) return;
-        for (ggml_tensor * base = t; base; base = base->view_src) ggml_set_output(base);
-        ggml_set_name(t, label);
-        trace_tensors.emplace_back(t, label);
-    };
     ggml_tensor * inp_emb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_embd, T);
     ggml_set_input(inp_emb);
     ggml_tensor * ple_in = nullptr;
     if (has_ple) {
         ple_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ple_row_size, T);
         ggml_set_input(ple_in);
-        trace_mark(ple_in, "ple.inp");
     }
     ggml_tensor * res_hc = repeat_dim1(ctx,
         ggml_reshape_3d(ctx, inp_emb, w.n_embd, 1, T), w.n_hc);
@@ -1995,20 +1896,15 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
             // only the stateful convolution windows branch per sequence.
             ggml_tensor * key = mm(ctx, L.ple_key, ple_in);
             ggml_tensor * value = mm(ctx, L.ple_value, ple_in);
-            trace_mark(key, "ple.projkey");
-            trace_mark(value, "ple.projvalue");
             ggml_tensor * rows = nullptr;
             for (int s = 0; s < n_slots; ++s) {
                 ggml_tensor * hidden = ggml_view_3d(ctx, res_hc, w.n_embd, w.n_hc, 1,
                     res_hc->nb[1], res_hc->nb[2], (size_t) s * res_hc->nb[2]);
                 ggml_tensor * row = build_ple_row(ctx, gf, hidden,
                     column(ctx, key, s), column(ctx, value, s), L, w,
-                    caches[s]->ple_conv_state[(size_t) ple_idx[il]], trace_mark);
+                    caches[s]->ple_conv_state[(size_t) ple_idx[il]]);
                 rows = rows ? ggml_concat(ctx, rows, row, 2) : row;
             }
-            char trace_label[24];
-            std::snprintf(trace_label, sizeof(trace_label), "L%02d.ple", il);
-            trace_mark(rows, trace_label);
             res_hc = rows;
             xn_next = nullptr;
         }
@@ -2026,8 +1922,6 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
                 L.hc_attn_up, L.hc_attn_inject, &inject,
                 w.n_embd, w.n_hc, w.rms_eps);
         xn_next = nullptr;
-        char trace_label[24]; std::snprintf(trace_label, sizeof(trace_label), "L%02d.hcmix", il);
-        trace_mark(cur, trace_label);
 
         if (L.is_full_attention) {
             const int fi = full_idx[il];
@@ -2076,16 +1970,12 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
             }
             cur = mm(ctx, L.ssm_out, rows);
         }
-        std::snprintf(trace_label, sizeof(trace_label), "L%02d.att", il);
-        trace_mark(cur, trace_label);
         ggml_tensor * ffn_fused = nullptr;
         if (hc_fused) {
             ffn_fused = hc_combine_norm(ctx, inject, res_hc, cur,
                 L.hc_ffn_norm, w.n_embd, w.n_hc, T, w.rms_eps);
             res_hc = hc_norm_res(ctx, ffn_fused, w.n_embd, w.n_hc, T);
             ggml_tensor * ffn_xn = hc_norm_xn(ctx, ffn_fused, w.n_embd, w.n_hc, T);
-            std::snprintf(trace_label, sizeof(trace_label), "L%02d.ffnxn", il);
-            trace_mark(ffn_xn, trace_label);
             cur = hc_mix_from_xn(ctx, ffn_xn,
                 L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, &inject, w.n_embd, w.n_hc);
         } else {
@@ -2093,11 +1983,7 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
             cur = hc_mix(ctx, res_hc, L.hc_ffn_norm, L.hc_ffn_down,
                 L.hc_ffn_up, L.hc_ffn_inject, &inject, w.n_embd, w.n_hc, w.rms_eps);
         }
-        std::snprintf(trace_label, sizeof(trace_label), "L%02d.fmix", il);
-        trace_mark(cur, trace_label);
-        cur = build_moe(ctx, cur, L, w, il, trace_mark);
-        std::snprintf(trace_label, sizeof(trace_label), "L%02d.moe", il);
-        trace_mark(cur, trace_label);
+        cur = build_moe(ctx, cur, L, w, il);
         const bool next_ple = (il + 1 < w.n_layer) && w.layers[il + 1].is_ple && has_ple;
         if (next_ple) {
             // Match the single-sequence graph's PLE boundary: do not fold the
@@ -2115,8 +2001,6 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
             res_hc = hc_combine(ctx, res_hc, cur, inject, w.n_embd, w.n_hc, T);
             xn_next = nullptr;
         }
-        std::snprintf(trace_label, sizeof(trace_label), "L%02d.res", il);
-        trace_mark(res_hc, trace_label);
     }
 
     ggml_tensor * final = xn_next
@@ -2180,7 +2064,6 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
         out_logits[(size_t) s].assign(packed.begin() + (size_t) s * w.n_vocab,
                                       packed.begin() + (size_t) (s + 1) * w.n_vocab);
     }
-    if (layer_trace) write_layer_trace(backend, trace_tensors);
     if (has_ple) {
         for (int s = 0; s < n_slots; ++s) caches[s]->ple_prev = std::move(next_prev[s]);
     }
@@ -2214,7 +2097,6 @@ Qwen4ExpForwardResult qwen4exp_forward_packed(
         return result;
     }
 
-    static const bool layer_trace = std::getenv("QWEN4EXP_LAYER_TRACE") != nullptr;
     static const bool hc_fused = [] {
         const char * value = std::getenv("QWEN4EXP_UPSTREAM");
         return !(value && std::atoi(value) != 0) &&
@@ -2325,13 +2207,11 @@ Qwen4ExpForwardResult qwen4exp_forward_packed(
                 ng - 1, (int64_t) history.size());
             next_prev[(size_t) s].assign(history.end() - keep, history.end());
         }
-        if (layer_trace) write_ple_indices(ple_rows);
         if (!w.ple_reader.gather(ple_rows.data(),
                 (int64_t) ple_rows.size(), ple_data.data())) {
             std::fprintf(stderr, "[qwen4exp] packed PLE gather failed\n");
             return result;
         }
-        if (layer_trace) write_ple_host(ple_data);
     }
 
     ggml_init_params ip{};
@@ -2344,14 +2224,6 @@ Qwen4ExpForwardResult qwen4exp_forward_packed(
     if (!ctx) return result;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 400000, false);
     if (!gf) return result;
-    std::vector<std::pair<ggml_tensor *, std::string>> trace_tensors;
-    auto trace_mark = [&](ggml_tensor * tensor, const char * label) {
-        if (!layer_trace || !tensor || !trace_layer_selected(label)) return;
-        for (ggml_tensor * base = tensor; base; base = base->view_src)
-            ggml_set_output(base);
-        ggml_set_name(tensor, label);
-        trace_tensors.emplace_back(tensor, label);
-    };
 
     ggml_tensor * inp_emb = ggml_new_tensor_2d(
         ctx, GGML_TYPE_F32, w.n_embd, total_rows);
@@ -2361,7 +2233,6 @@ Qwen4ExpForwardResult qwen4exp_forward_packed(
         ple_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
                                     ple_row_size, total_rows);
         ggml_set_input(ple_in);
-        trace_mark(ple_in, "ple.inp");
     }
     ggml_tensor * res_hc = repeat_dim1(ctx,
         ggml_reshape_3d(ctx, inp_emb, w.n_embd, 1, total_rows), w.n_hc);
@@ -2419,8 +2290,7 @@ Qwen4ExpForwardResult qwen4exp_forward_packed(
                 ggml_tensor * row = build_ple_projected(ctx, gf, hidden,
                     column_span(ctx, key, start, count),
                     column_span(ctx, value, start, count), L, w,
-                    segments[s].cache->ple_conv_state[(size_t) ple_idx[(size_t) il]],
-                    trace_mark);
+                    segments[s].cache->ple_conv_state[(size_t) ple_idx[(size_t) il]]);
                 rows = rows ? ggml_concat(ctx, rows, row, 2) : row;
             }
             res_hc = rows;
@@ -2527,7 +2397,7 @@ Qwen4ExpForwardResult qwen4exp_forward_packed(
                 L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject,
                 &inject, w.n_embd, w.n_hc, w.rms_eps);
         }
-        cur = build_moe(ctx, cur, L, w, il, trace_mark);
+        cur = build_moe(ctx, cur, L, w, il);
         const bool next_ple = il + 1 < w.n_layer &&
                               w.layers[il + 1].is_ple && has_ple;
         if (next_ple) {
@@ -2628,7 +2498,6 @@ Qwen4ExpForwardResult qwen4exp_forward_packed(
         out_logits[(size_t) s].assign(begin, begin + w.n_vocab);
         segments[s].cache->ple_prev = std::move(next_prev[(size_t) s]);
     }
-    if (layer_trace) write_layer_trace(backend, trace_tensors);
     result.ok = true;
     result.n_tokens = total_rows;
     result.pos0 = segments[0].pos0;
