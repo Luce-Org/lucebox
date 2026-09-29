@@ -1,7 +1,7 @@
 // Unit tests for resolve_anchor_params() — no GPU, no model files.
 
 #include "CppUnitTestFramework.hpp"
-#include "qwen3/anchor_params.h"
+#include "pflash/anchor_params.h"
 
 using namespace luce::common;
 

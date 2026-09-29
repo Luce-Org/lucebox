@@ -10,7 +10,7 @@
 #include "common/target_shard_ipc_daemon.h"
 #include "luce.h"
 #include "placement/placement_backend.h"
-#include "qwen3/qwen3_kvflash_scorer.h"
+#include "pflash/kvflash_drafter_scorer.h"
 
 #include "ggml-cuda.h"
 
@@ -410,7 +410,7 @@ bool Gemma4LayerSplitAdapter::kvflash_attach() {
                 kvflash_tau_,
                 !kvflash_drafter_path_.empty()
                     ? "drafter/cross-tok (attaches on first reselect)"
-                    : "lru (recency-only: no Qwen3-0.6B drafter found)");
+                    : "lru (recency-only: no Qwen3.5-0.8B drafter found)");
     std::fflush(stdout);
     return true;
 }

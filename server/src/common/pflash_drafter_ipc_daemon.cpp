@@ -4,7 +4,7 @@
 
 #include "luce.h"
 #include "dflash_draft_ipc.h"
-#include "qwen3/qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -45,31 +45,31 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
         std::string cmd;
         iss >> cmd;
         if (cmd == "quit" || cmd == "exit") break;
-        if (cmd == "compress") {
-            int keep_x1000 = 0;
-            int score_query_end = -1;
-            int score_query_tokens = 8;
-            iss >> keep_x1000 >> score_query_end >> score_query_tokens;
-            std::string path = read_line_tail(iss);
-            if (keep_x1000 < 0 || keep_x1000 > 1000 ||
-                !valid_pflash_score_query_tokens(score_query_tokens) ||
-                path.empty()) {
-                std::fprintf(stderr, "[pflash-ipc-daemon] bad compress: %s\n",
-                             line.c_str());
+        if (cmd == "compress" || cmd == "compress2" || cmd == "compress3") {
+            PFlashDrafterIpcCompressCommand request;
+            std::string parse_error;
+            if (!parse_pflash_drafter_ipc_compress_command(line, request, parse_error)) {
+                std::fprintf(stderr, "[pflash-ipc-daemon] bad compress: %s (%s)\n",
+                             line.c_str(), parse_error.c_str());
                 stream_status(stream_fd, -1);
                 continue;
             }
-            auto input_ids = read_int32_file(path);
+            auto input_ids = read_int32_file(request.path);
             if (input_ids.empty()) {
                 std::fprintf(stderr, "[pflash-ipc-daemon] read tokens failed: %s\n",
-                             path.c_str());
+                             request.path.c_str());
                 stream_status(stream_fd, -1);
                 continue;
             }
-            const float keep = (float)keep_x1000 / 1000.0f;
+            // The IPC protocol uses score_query_end < 0 for "tail"; the
+            // qwen35 scorer requires an explicit end, so translate here.
+            const int score_query_end = request.score_query_end >= 0
+                ? request.score_query_end : (int)input_ids.size();
             auto compressed = drafter_score_and_compress(
-                ctx, input_ids, keep, /*chunk_size=*/32, score_query_tokens,
-                /*pool_kernel=*/13, score_query_end);
+                ctx, input_ids, request.keep_ratio, /*chunk_size=*/32,
+                request.score_query_tokens, /*pool_kernel=*/13,
+                score_query_end,
+                request.required_instruction_spans);
             if (compressed.empty()) {
                 std::fprintf(stderr, "[pflash-ipc-daemon] compress returned empty\n");
                 stream_status(stream_fd, -1);

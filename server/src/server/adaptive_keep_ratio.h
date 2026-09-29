@@ -53,23 +53,32 @@ inline AdaptiveKeepRatioState step_adaptive_keep_ratio(
 // Prevents memory exhaustion from unbounded unique-session insertion.
 class HttpServerSessions {
 public:
-    void update(const std::string& session_id, float observed_accept) {
+    // ``seed_keep`` is the ratio a brand-new session adapts from: the server
+    // passes the configured (curve) ratio so a session starts at the real-use
+    // budget for its prompt length rather than the fixed default, and the
+    // controller then moves it by acceptance feedback within the same bounds.
+    void update(const std::string& session_id, float observed_accept,
+                float seed_keep = AdaptiveKeepRatioState{}.last_keep) {
         std::lock_guard<std::mutex> lock(mu_);
         auto it = map_.find(session_id);
         if (it == map_.end()) {
             evict_if_full_locked();
             lru_.push_front(session_id);
-            map_.emplace(session_id, Entry{step_adaptive_keep_ratio({}, observed_accept), lru_.begin()});
+            AdaptiveKeepRatioState seed;
+            seed.last_keep = std::clamp(seed_keep, kBanditKeepMin, kBanditKeepMax);
+            map_.emplace(session_id, Entry{step_adaptive_keep_ratio(seed, observed_accept), lru_.begin()});
         } else {
             it->second.state = step_adaptive_keep_ratio(it->second.state, observed_accept);
             lru_.splice(lru_.begin(), lru_, it->second.lru_it);
         }
     }
 
-    float get_keep_ratio(const std::string& session_id) const {
+    // A session with no feedback yet reports ``fallback`` (the configured ratio).
+    float get_keep_ratio(const std::string& session_id,
+                         float fallback = AdaptiveKeepRatioState{}.last_keep) const {
         std::lock_guard<std::mutex> lock(mu_);
         auto it = map_.find(session_id);
-        if (it == map_.end()) return AdaptiveKeepRatioState{}.last_keep;
+        if (it == map_.end()) return fallback;
         lru_.splice(lru_.begin(), lru_, it->second.lru_it);
         return it->second.state.last_keep;
     }

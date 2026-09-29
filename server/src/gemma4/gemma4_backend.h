@@ -14,7 +14,7 @@
 #include "common/sampler.h"
 #include "../common/kvflash_pager.h"
 #include "../common/kvflash_scorer.h"
-#include "../qwen3/qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -106,7 +106,7 @@ private:
     // Pools the FULL-attention layers only (SWA layers already ring-buffer).
     // Drafter-scored residency by default via the cross-tokenizer bridge
     // (KvFlashCrossTokScorer: gemma ids are detokenized and re-scored by
-    // the Qwen3-0.6B drafter); LRU is the fallback when no drafter is
+    // the Qwen3.5-0.8B drafter); LRU is the fallback when no drafter is
     // found or --kvflash-policy lru.
     KvFlashPager                   kvflash_pager_;
     std::unique_ptr<KvFlashScorer> kvflash_scorer_;

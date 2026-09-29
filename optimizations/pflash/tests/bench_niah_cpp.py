@@ -27,12 +27,12 @@ def main():
     ap.add_argument("--target", default="/opt/lucebox/models/Qwen3.6-27B-Q4_K_M.gguf")
     ap.add_argument("--draft-spec", default="/home/lucebox/lucebox-hub/server/models/draft/model.safetensors",
                     help="draft model used for spec decoding (NOT drafter scorer)")
-    ap.add_argument("--drafter-gguf", default="/home/lucebox/lucebox-hub/server/models/Qwen3-0.6B-BF16.gguf",
-                    help="C++ drafter scorer GGUF (Qwen3-0.6B BF16)")
-    ap.add_argument("--drafter-arch", default="qwen3-0.6b", choices=["qwen3-0.6b", "qwen35-0.8b"],
+    ap.add_argument("--drafter-gguf", default="/home/lucebox/lucebox-hub/server/models/Qwen3.5-0.8B-BF16.gguf",
+                    help="C++ drafter scorer GGUF (Qwen3.5-0.8B BF16)")
+    ap.add_argument("--drafter-arch", default="qwen35-0.8b", choices=["qwen35-0.8b"],
                     help="C++ drafter architecture selector")
     ap.add_argument("--target-tokenizer", default="Qwen/Qwen3.6-27B")
-    ap.add_argument("--drafter-tokenizer", default="Qwen/Qwen3-0.6B")
+    ap.add_argument("--drafter-tokenizer", default="Qwen/Qwen3.5-0.8B")
     ap.add_argument("--max-ctx", type=int, default=16384,
                     help="daemon KV cache max ctx; sized for compressed prompt+gen, NOT source")
     ap.add_argument("--keep-ratio", type=float, default=0.020)
