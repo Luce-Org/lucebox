@@ -63,28 +63,36 @@ bool TensorFileReader::load(const std::vector<TensorFileSpan> & spans, std::stri
         if (err) *err = "weight file is not open";
         return false;
     }
-    std::vector<Piece> pieces;
+    // Pieces of plain buffers are read on several threads; whole-tensor
+    // spans follow on this thread alone, so only one full copy is staged.
+    std::vector<Piece> pieces, whole;
     for (const TensorFileSpan & s : spans) {
         if (!s.tensor || s.size == 0) continue;
         if (s.file_offset > size() || s.size > size() - s.file_offset || !span_fits_tensor(s)) {
             if (err) *err = std::string("weight span out of range for tensor ") + ggml_get_name(s.tensor);
             return false;
         }
-        const size_t piece = whole_writes_only(s.tensor) ? s.size : kPieceBytes;
-        for (size_t at = 0; at < s.size; at += piece) {
-            pieces.push_back({&s, at, std::min(piece, s.size - at)});
+        if (whole_writes_only(s.tensor)) {
+            whole.push_back({&s, 0, s.size});
+            continue;
+        }
+        for (size_t at = 0; at < s.size; at += kPieceBytes) {
+            pieces.push_back({&s, at, std::min(kPieceBytes, s.size - at)});
         }
     }
+    const size_t n_split = pieces.size();
+    pieces.insert(pieces.end(), whole.begin(), whole.end());
     if (pieces.empty()) return true;
 
     std::atomic<size_t> next{0};
+    size_t end = n_split;
     std::atomic<bool> failed{false};
     std::mutex write_mu;  // one tensor write at a time
     std::string first_error;
     const auto worker = [&] {
         std::vector<uint8_t> buf;
         size_t i;
-        while (!failed.load(std::memory_order_relaxed) && (i = next.fetch_add(1)) < pieces.size()) {
+        while (!failed.load(std::memory_order_relaxed) && (i = next.fetch_add(1)) < end) {
             const Piece & p = pieces[i];
             if (buf.size() < p.size + 3 * kAlign) buf.resize(p.size + 3 * kAlign);
             uint8_t * aligned = reinterpret_cast<uint8_t *>(
@@ -118,11 +126,14 @@ bool TensorFileReader::load(const std::vector<TensorFileSpan> & spans, std::stri
             ggml_backend_tensor_set(p.span->tensor, src, p.span->tensor_offset + p.at, p.size);
         }
     };
-    const size_t n_threads = std::min(kMaxThreads, pieces.size());
+    const size_t n_threads = std::min(kMaxThreads, n_split);
     std::vector<std::thread> threads;
     for (size_t t = 1; t < n_threads; ++t) threads.emplace_back(worker);
     worker();
     for (std::thread & t : threads) t.join();
+    next = n_split;
+    end = pieces.size();
+    worker();
     if (failed.load() && err) *err = first_error;
     return !failed.load();
 }
