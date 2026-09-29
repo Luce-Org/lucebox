@@ -9,8 +9,6 @@
 #include <vector>
 #include <unordered_set>
 
-int ggml_cuda_mmb_probe_tile = 0;
-
 #if defined(__gfx1151__) || !defined(__HIP_DEVICE_COMPILE__)
 
 namespace {
@@ -937,8 +935,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         return;
     }
     const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q5_K) ? mmb_shadow_lookup(src0) : nullptr;
-    const bool big = ggml_cuda_mmb_probe_tile ? ggml_cuda_mmb_probe_tile == 256 :
-        (M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096);
+    const bool big = (M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096);
     uint16_t * Dh = (mmb_hc16() && K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
     bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
     if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {

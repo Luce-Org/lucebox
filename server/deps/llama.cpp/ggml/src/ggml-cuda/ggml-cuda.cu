@@ -2995,81 +2995,11 @@ static bool ggml_cuda_mmb_cublas_shape_ok(const ggml_tensor * src0) {
     return false;
 }
 
-extern int ggml_cuda_mmb_probe_tile;
-static int qwen_dense_probe_route = 0;
-
-static void ggml_cuda_mul_mat_bf16_cublas(
-        ggml_backend_cuda_context & ctx,
-        const ggml_tensor * src0,
-        const ggml_tensor * src1,
-        ggml_tensor * dst) {
-    const uint16_t * xb = ggml_cuda_mmb_bf16_src(src1);
-    ggml_tensor tmp1 = *src1;
-    const ggml_tensor * cublas_src1 = src1;
-    if (xb) {
-        tmp1.type = GGML_TYPE_BF16;
-        tmp1.data = const_cast<uint16_t *>(xb);
-        tmp1.nb[0] = sizeof(uint16_t);
-        tmp1.nb[1] = sizeof(uint16_t) * src1->ne[0];
-        tmp1.nb[2] = tmp1.nb[1] * src1->ne[1];
-        tmp1.nb[3] = tmp1.nb[2] * src1->ne[2];
-        cublas_src1 = &tmp1;
-    }
-    ggml_cuda_op_mul_mat(ctx, src0, cublas_src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
-}
 #endif // defined(GGML_USE_HIP)
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 #if defined(GGML_USE_HIP)
-    // Offline capture only: repeated complete operations on actual model inputs.
-    // Always replay the normal path last so probe results never feed the graph.
-    static const bool probe = getenv("QWEN4EXP_DENSE_PROBE") != nullptr;
     const int64_t tokens = ggml_nrows(src1);
-    if (probe && !qwen_dense_probe_route && tokens >= 512 &&
-        ggml_cuda_mmb_supported_mm(src0, src1, dst) &&
-        (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_BF16)) {
-        static std::set<std::tuple<int, int64_t, int64_t, int64_t, bool, bool>> seen;
-        const bool bf = ggml_cuda_mmb_bf16_src(src1) != nullptr;
-        const bool shadow = ggml_cuda_mmb_shadow_ptr(src0) != nullptr;
-        if (seen.emplace((int)src0->type, src0->ne[1], src0->ne[0], tokens, bf, shadow).second) {
-            cudaEvent_t start, end;
-            CUDA_CHECK(cudaEventCreateWithFlags(&start, 0)); CUDA_CHECK(cudaEventCreateWithFlags(&end, 0));
-            for (int route : {1, 2, 4, 5, 3}) {
-                if (route == 1 && (!shadow || !ggml_cuda_mmb_cublas_shape_ok(src0))) continue;
-                // Native BF16 can go directly to rocBLAS without a shadow.
-                if (route == 2 && src0->type != GGML_TYPE_BF16) continue;
-                // MMQ requires materialized F32; don't reinterpret bf16-only storage.
-                if (route == 3 && (!ggml_is_quantized(src0->type) || bf || ggml_cuda_mmb_is_bf16_only(dst))) continue;
-                qwen_dense_probe_route = route;
-                ggml_cuda_mmb_probe_tile = route == 4 ? 128 : route == 5 ? 256 : 0;
-                for (int rep = 0; rep < 6; ++rep) {
-                    CUDA_CHECK(cudaEventRecord(start, ctx.stream()));
-                    ggml_cuda_mul_mat(ctx, src0, src1, dst);
-                    CUDA_CHECK(cudaEventRecord(end, ctx.stream()));
-                    CUDA_CHECK(cudaEventSynchronize(end));
-                    float ms;
-#if defined(GGML_USE_HIP)
-                    CUDA_CHECK(hipEventElapsedTime(&ms, start, end));
-#else
-                    CUDA_CHECK(cudaEventElapsedTime(&ms, start, end));
-#endif
-                    std::fprintf(stderr, "[dense-probe] type=%d M=%lld K=%lld T=%lld bf=%d shadow=%d route=%d rep=%d ms=%.6f name=%s\n",
-                        (int)src0->type, (long long)src0->ne[1], (long long)src0->ne[0], (long long)tokens, bf, shadow, route, rep, ms, src0->name);
-                }
-            }
-            qwen_dense_probe_route = 0; ggml_cuda_mmb_probe_tile = 0;
-            CUDA_CHECK(cudaEventDestroy(end)); CUDA_CHECK(cudaEventDestroy(start));
-        }
-    }
-    if (qwen_dense_probe_route == 3) {
-        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    if (qwen_dense_probe_route == 2) {
-        ggml_cuda_mul_mat_bf16_cublas(ctx, src0, src1, dst);
-        return;
-    }
-
     // Frozen gfx1151 / ROCm 7.2.2 table, trained on separate 16366-token captures.
     // MMQ changes activation quantization, so the reference profile never takes it;
     // it is on by default and can be disabled with QWEN4EXP_DENSE_TABLE=0.
@@ -3078,7 +3008,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const char * ref = getenv("QWEN4EXP_UPSTREAM");
         return !(e && atoi(e) == 0) && !(ref && atoi(ref));
     }();
-    const bool measured_dense = table && !probe && tokens == 16366 &&
+    const bool measured_dense = table && tokens == 16366 &&
         !ggml_backend_buft_is_cuda_split(src0->buffer->buft) &&
         ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
         ggml_cuda_mmb_supported_mm(src0, src1, dst);
@@ -3142,7 +3072,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 #if defined(GGML_USE_HIP)
     // QWEN4EXP_MMB_CUBLAS: =1 validated K=2560 projections; =2 broad (K,N >= 2560).
     const bool cublas_shape_ok = ggml_cuda_mmb_cublas_shape_ok(src0);
-    if ((!qwen_dense_probe_route || qwen_dense_probe_route == 1) && ggml_cuda_mmb_cublas_mode() > 0 && !split && !grouped_src && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+    if (ggml_cuda_mmb_cublas_mode() > 0 && !split && !grouped_src && src0->ne[2] == 1 && src0->ne[3] == 1 &&
         (src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q5_K) &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
