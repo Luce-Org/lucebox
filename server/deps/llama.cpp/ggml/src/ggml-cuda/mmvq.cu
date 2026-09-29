@@ -476,17 +476,19 @@ static bool mmvq_env_flag(const char * name, bool default_value = false) {
 static bool mmid_grouped_type_ok(ggml_type type) {
     // bit0 = Q4_K, bit1 = Q6_K, bit2 = Q4_0/Q8_0/Q5_K,
     // bit3 = Q2_0_ROCMFP2/Q3_0_ROCMFPX, bit4 = ROCmFP4-fast,
-    // bit5 = ROCmFP3 only. Default:
-    // previously validated types only (7); LUCE_MMID_GROUPED_TYPES is an
-    // experimental override.
+    // bit5 = ROCmFP3 only, bit6 = Q5_0. Q5_0 has additional architecture,
+    // batch and projection-shape guards below. LUCE_MMID_GROUPED_TYPES is an
+    // experimental override; 7 restores the policy without Q5_0.
     static const int mask = []() {
         const char * e = std::getenv("LUCE_MMID_GROUPED_TYPES");
         if (e == nullptr || e[0] == '\0') {
-            return 7;
+            return 7 | 64;
         }
         return atoi(e);
     }();
     switch (type) {
+        case GGML_TYPE_Q5_0:
+            return (mask & 64) != 0;
         case GGML_TYPE_Q4_K:
             return (mask & 1) != 0;
         case GGML_TYPE_Q6_K:
@@ -525,6 +527,12 @@ static bool mmid_grouped_arch_ok(int cc) {
 
 bool ggml_cuda_mmvq_mmid_grouped_enabled(
         ggml_type type, int cc, int64_t ncols_dst, int64_t routed_pairs) {
+    // This shape-independent predicate also vetoes graph fusion. Q5_0 is
+    // selected only at the kernel call site below, after fusion is decided,
+    // so adding its shape-specific path does not disable existing fusions.
+    if (type == GGML_TYPE_Q5_0) {
+        return false;
+    }
     return ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_MOE_BATCH_SIZE &&
         routed_pairs <= MMID_GROUPED_MAX_PAIRS &&
         mmid_grouped_env() && mmid_grouped_type_ok(type) &&
@@ -538,7 +546,9 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // RDNA3/RDNA4 (wave32) share the non-grouped kernel's wave-width warp_reduce.
     // IS_RDNA3/IS_RDNA4 are pure cc-range checks, safe above the IS_AMD guard below.
     // The HIP path remains opt-in until on-hardware parity and performance validation.
-    if (mmid_grouped_env() && mmid_grouped_type_ok(type) &&
+    // Q5_0 support is shape-specific and must not raise the MMVQ batch ceiling
+    // for the shapes that still use the legacy kernel.
+    if (type != GGML_TYPE_Q5_0 && mmid_grouped_env() && mmid_grouped_type_ok(type) &&
         mmid_grouped_arch_ok(cc) && mmid_grouped_device_ok()) {
         return MMVQ_MAX_MOE_BATCH_SIZE;
     }
@@ -1744,6 +1754,10 @@ static bool mul_mat_vec_q_grouped_dispatch(
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const uint3 nchannels_y_fd = init_fastdiv_values((uint32_t) nchannels_y);
     switch (type) {
+        case GGML_TYPE_Q5_0:
+            mul_mat_vec_q_moe_grouped_launch<GGML_TYPE_Q5_0>(vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
+            return true;
         case GGML_TYPE_Q4_0:
             mul_mat_vec_q_moe_grouped_launch<GGML_TYPE_Q4_0>(vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
                 stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
@@ -2874,8 +2888,17 @@ void ggml_cuda_mul_mat_vec_q(
     }();
 
     // [TAG_MMID_GROUPED] grouped-expert path for small MUL_MAT_ID batches.
-    if (ids && ggml_cuda_mmvq_mmid_grouped_enabled(
-            src0->type, cc, ncols_dst, nchannels_dst*ncols_dst)) {
+    // Qualify Q5_0 for the Gemma 4 expert-down projection. A wider shape
+    // screen found regressions, so other projections retain their fallback.
+    // The grouped kernel reads complete four-row tiles; the qualified row
+    // count is divisible by four. Broadcast and per-slot inputs are supported.
+    const bool q5_grouped = src0->type == GGML_TYPE_Q5_0 && cc == 860 &&
+        ncols_dst == 16 && nchannels_dst == 8 && ne00 == 704 && ne01 == 2816 &&
+        (nchannels_y == 1 || nchannels_y == 8) &&
+        fusion_local.gate == nullptr && fusion_local.x_bias == nullptr && fusion_local.gate_bias == nullptr &&
+        mmid_grouped_env() && mmid_grouped_type_ok(src0->type) && mmid_grouped_device_ok();
+    if (ids && (q5_grouped || ggml_cuda_mmvq_mmid_grouped_enabled(
+            src0->type, cc, ncols_dst, nchannels_dst*ncols_dst))) {
         // Batches above MMID_GROUPED_MAX_PAIRS fall through to the legacy
         // per-expert kernel instead of aborting the request.
         const int np = (int) (nchannels_dst*ncols_dst);
