@@ -31,24 +31,6 @@ struct Qwen4ExpForwardResult {
     int  pos0 = 0;
 };
 
-// Experimental T=1 output-head placement on a second HIP device. The trunk
-// remains on the primary backend; only output.weight and its matvec live here.
-struct Qwen4ExpHeadOffload {
-    ggml_backend_t backend = nullptr;
-    ggml_context * ctx = nullptr;
-    ggml_backend_buffer_t buf = nullptr;
-    ggml_cgraph * graph = nullptr;
-    ggml_tensor * weight = nullptr;
-    ggml_tensor * input = nullptr;
-    ggml_tensor * output = nullptr;
-    std::vector<float> hidden;
-};
-
-bool qwen4exp_head_offload_init(Qwen4ExpHeadOffload & head,
-                                ggml_backend_t backend,
-                                const Qwen4ExpWeights & w);
-void qwen4exp_head_offload_free(Qwen4ExpHeadOffload & head);
-
 // One independent sequence span in a packed forward graph. Tokens within a
 // segment are consecutive for this cache; segments never share recurrent, PLE,
 // or KV state. The result returns one logits row for each segment's final
@@ -70,8 +52,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                                        const int32_t * tokens,
                                        int n_tokens,
                                        int pos0,
-                                       std::vector<float> & out_logits,
-                                       Qwen4ExpHeadOffload * head = nullptr);
+                                       std::vector<float> & out_logits);
 
 // Decode one next token for each independent slot. `caches[s]` owns that
 // sequence's KV and recurrent state; `tokens[s]` and `positions[s]` are never
