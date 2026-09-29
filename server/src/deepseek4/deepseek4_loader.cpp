@@ -27,6 +27,7 @@
 #include "luce.h"
 #include "common/gguf_bounds.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/tensor_file_reader.h"
 #include "../common/copied_source_reclaim.h"
 #include "../common/copied_source_upload.h"
 #include "../common/moe_hybrid_types.h"
@@ -2373,108 +2374,62 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         a.file_offset = data_offset + a.tensor_offset;
     }
 
-#if !defined(_WIN32)
-    bool fast_managed = (buf != nullptr) && ggml_backend_cuda_buffer_is_managed(buf) && (getenv("LUCE_NO_PREAD") == nullptr);
-#else
-    // pread/posix_fadvise not available on Windows; fall back to mmap path.
-    bool fast_managed = false;
+    // Tensors in one plain buffer are read from the file on several threads
+    // (tensor_file_reader.h). A split tensor has no single base address: its
+    // rows go through the split buffer, which distributes them to each GPU.
+    TensorFileReader reader;
+    const bool read_file = reader.open(path);
+    std::vector<TensorFileSpan> spans;
+#if defined(__linux__) && (defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP))
+    std::vector<uint8_t> upload_scratch;
 #endif
-    if (fast_managed) {
-        // Unified/managed buffer: read weights straight off disk into it in parallel at
-        // disk bandwidth, instead of mmap page-faults (~5x slower). Drop the cached file
-        // pages afterward so the page cache does not double a near-RAM-size model.
-        unsigned nth = std::thread::hardware_concurrency();
-        if (nth == 0) nth = 4;
-        if (nth > 8)  nth = 8;
-        std::atomic<size_t> next{0};
-        std::atomic<bool> read_ok{true};
-        auto worker = [&]() {
-            size_t i;
-            while ((i = next.fetch_add(1)) < allocs.size()) {
-                auto & a = allocs[i];
-                if (!a.upload_to_backend || a.dense_split) continue;
-                char * dst = (char *) a.tensor->data;
-                size_t done = 0;
-                while (done < a.file_size) {
-#if !defined(_WIN32)
-                    ssize_t r = pread(mmap.fd, dst + done, a.file_size - done,
-                              (off_t) (a.file_offset + done));
-#else
-                    int r = -1;  // not reached: fast_managed is false on Windows
-#endif
-                    if (r <= 0) { read_ok = false; return; }
-                    done += (size_t) r;
-                }
+    for (auto & a : allocs) {
+        if (!a.upload_to_backend) continue;
+        if (read_file && !a.dense_split) {
+            spans.push_back({a.tensor, 0, a.file_offset, a.file_size});
+            continue;
+        }
+        const void * src_data = (const char *)mmap.addr + a.file_offset;
+#if defined(__linux__) && (defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP))
+        if (reclaim_sources && !a.dense_split && ggml_backend_is_cuda(backend) &&
+            !ggml_backend_cuda_buffer_is_managed(buf)) {
+            // HIP may pin pageable upload sources. Keep file-backed pages
+            // out of that path so completed-source cache advice can act.
+            if (!upload_copied_file_chunks(mmap.addr, mmap.len, a.file_offset,
+                    a.file_size, upload_scratch,
+                    [&](const uint8_t * bytes, size_t offset, size_t count) {
+                        ggml_backend_tensor_set(a.tensor, bytes, offset, count);
+                    })) {
+                set_last_error("invalid dense staged-upload source range");
+                mmap.close_map();
+                if (split_buf) ggml_backend_buffer_free(split_buf);
+                if (buf) ggml_backend_buffer_free(buf);
+                gguf_free(gctx);
+                ggml_free(meta_ctx);
+                return false;
             }
-        };
-        std::vector<std::thread> pool;
-        for (unsigned t = 0; t < nth; t++) pool.emplace_back(worker);
-        for (auto & th : pool) th.join();
-#if !defined(_WIN32)
-        posix_fadvise(mmap.fd, 0, (off_t) mmap.len, POSIX_FADV_DONTNEED);
+        } else
 #endif
-        ggml_backend_synchronize(backend);  // make CPU-written managed pages visible to GPU
-        // Split tensors have no single CPU-visible base address. Upload them
-        // through the split buffer, which distributes whole rows to each GPU.
-        for (auto & a : allocs) {
-            if (!a.upload_to_backend || !a.dense_split) continue;
-            const void * src_data = (const char *)mmap.addr + a.file_offset;
+        {
             ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+        }
 #if defined(__linux__)
-            // set_tensor has completed its source copy, including split buffers.
-            if (reclaim_sources) {
-                reclaim_copied_file_source(mmap.addr, mmap.len, src_data, a.file_size,
-                                           mmap.fd, ggml_get_name(a.tensor));
-            }
-#endif
+        // set_tensor has completed its source copy, including split buffers.
+        if (reclaim_sources) {
+            reclaim_copied_file_source(mmap.addr, mmap.len, src_data, a.file_size,
+                                       mmap.fd, ggml_get_name(a.tensor));
         }
-        if (!read_ok) {
-            set_last_error("parallel weight read failed");
-            mmap.close_map();
-            if (split_buf) ggml_backend_buffer_free(split_buf);
-            if (buf) ggml_backend_buffer_free(buf);
-            gguf_free(gctx);
-            ggml_free(meta_ctx);
-            return false;
-        }
-    } else {
-#if defined(__linux__) && (defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP))
-        std::vector<uint8_t> upload_scratch;
 #endif
-        for (auto & a : allocs) {
-            if (!a.upload_to_backend) continue;
-            const void * src_data = (const char *)mmap.addr + a.file_offset;
-#if defined(__linux__) && (defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP))
-            if (reclaim_sources && !a.dense_split && ggml_backend_is_cuda(backend) &&
-                !ggml_backend_cuda_buffer_is_managed(buf)) {
-                // HIP may pin pageable upload sources. Keep file-backed pages
-                // out of that path so completed-source cache advice can act.
-                if (!upload_copied_file_chunks(mmap.addr, mmap.len, a.file_offset,
-                        a.file_size, upload_scratch,
-                        [&](const uint8_t * bytes, size_t offset, size_t count) {
-                            ggml_backend_tensor_set(a.tensor, bytes, offset, count);
-                        })) {
-                    set_last_error("invalid dense staged-upload source range");
-                    mmap.close_map();
-                    if (split_buf) ggml_backend_buffer_free(split_buf);
-                    if (buf) ggml_backend_buffer_free(buf);
-                    gguf_free(gctx);
-                    ggml_free(meta_ctx);
-                    return false;
-                }
-            } else
-#endif
-            {
-                ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
-            }
-#if defined(__linux__)
-            // set_tensor has completed its source copy, including split buffers.
-            if (reclaim_sources) {
-                reclaim_copied_file_source(mmap.addr, mmap.len, src_data, a.file_size,
-                                           mmap.fd, ggml_get_name(a.tensor));
-            }
-#endif
-        }
+    }
+    std::string read_err;
+    if (!spans.empty() && !reader.load(spans, &read_err)) {
+        set_last_error(read_err);
+        mmap.close_map();
+        if (split_buf) ggml_backend_buffer_free(split_buf);
+        if (buf) ggml_backend_buffer_free(buf);
+        gguf_free(gctx);
+        ggml_free(meta_ctx);
+        return false;
     }
     mmap.close_map();
 
@@ -2842,13 +2797,16 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     }
 
     const MoeHybridConfig cfg = cfg_override ? *cfg_override : make_ds4_moe_hybrid_config(w);
+    TensorFileReader reader;
+    const bool read_file = reader.open(path);
+    int advice_fd = -1;
+#if defined(__linux__)
+    advice_fd = ds4_image_capable(w) ? mmap.fd : -1;
+#endif
     const bool ok = build_moe_hybrid_storage_from_file_with_mmap(
         cfg, backend, placement, layer_descs, layer_file_data,
-        mmap.addr, mmap.len, out, err, 0, cold_gpu_backend
-#if defined(__linux__)
-        , ds4_image_capable(w) ? mmap.fd : -1
-#endif
-    );
+        mmap.addr, mmap.len, out, err, 0, cold_gpu_backend, advice_fd,
+        read_file ? &reader : nullptr);
     // Advice borrows the original fd only while construction is in progress.
     mmap.close_fd();
 

@@ -1,6 +1,9 @@
 #include "platform_io.h"
 
 #include <cerrno>
+#include <cstdio>
+#include <algorithm>
+#include <vector>
 
 #if defined(_WIN32)
 #  ifndef NOMINMAX
@@ -100,6 +103,14 @@ void ReadOnlyFile::advise_willneed(uint64_t, size_t) const {}
 
 void advise_mapped_willneed(const void *, size_t, uint64_t, size_t) {}
 
+size_t mapped_resident_bytes(const void *, uint64_t, size_t) { return 0; }
+
+uint64_t host_available_bytes() {
+    MEMORYSTATUSEX st{};
+    st.dwLength = sizeof(st);
+    return GlobalMemoryStatusEx(&st) ? (uint64_t) st.ullAvailPhys : 0;
+}
+
 uint32_t host_word_load_acquire(const uint32_t * p) {
     const uint32_t v = *(const volatile uint32_t *) p;
     _ReadWriteBarrier();
@@ -180,6 +191,40 @@ void advise_mapped_willneed(const void * map, size_t map_size, uint64_t offset, 
     const size_t start = (size_t) offset / page * page;
     (void) madvise(const_cast<uint8_t *>(static_cast<const uint8_t *>(map)) + start,
                    size + ((size_t) offset - start), MADV_WILLNEED);
+}
+
+size_t mapped_resident_bytes(const void * map, uint64_t offset, size_t size) {
+    if (!map || size == 0) return 0;
+    static const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t start = ((uintptr_t) map + (uintptr_t) offset) / page * page;
+    const uintptr_t end = (uintptr_t) map + (uintptr_t) offset + size;
+    const size_t pages = (size_t) ((end - start + page - 1) / page);
+#if defined(__APPLE__)
+    std::vector<char> in(pages);
+#else
+    std::vector<unsigned char> in(pages);
+#endif
+    if (mincore(reinterpret_cast<void *>(start), end - start, in.data()) != 0) return 0;
+    size_t resident = 0;
+    for (size_t i = 0; i < pages; ++i) resident += (in[i] & 1) ? 1 : 0;
+    return std::min(size, resident * page);
+}
+
+uint64_t host_available_bytes() {
+#if defined(__linux__)
+    FILE * f = std::fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    unsigned long long kb = 0;
+    uint64_t bytes = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) { bytes = (uint64_t) kb << 10; break; }
+    }
+    std::fclose(f);
+    return bytes;
+#else
+    return 0;
+#endif
 }
 
 uint32_t host_word_load_acquire(const uint32_t * p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }

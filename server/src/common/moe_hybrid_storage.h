@@ -4,6 +4,7 @@
 
 #include "moe_hybrid_types.h"
 #include "moe_hybrid_placement.h"
+#include "tensor_file_reader.h"
 
 #include "ggml-alloc.h"
 
@@ -305,6 +306,9 @@ int moe_hybrid_cache_swap_in(MoeHybridLayerStorage & st, int global_expert,
                              ggml_backend_t gpu_backend);
 
 // Build hybrid storage by loading expert data directly from file (mmap).
+// With `reader` (the same file, see tensor_file_reader.h) and the mapping, the
+// experts are read from the file on several threads instead of copied out of
+// the mapping.
 // Optional: a caller opts in to advisory page-cache reclamation of completed
 // materialized GPU layers by passing all three readonly_file_* arguments: the
 // read-only mapping (which must start at file offset zero), its size, and the
@@ -322,7 +326,8 @@ bool build_moe_hybrid_storage_from_file(
     ggml_backend_t cold_gpu_backend = nullptr,
     const void * readonly_file_mmap = nullptr,
     size_t readonly_file_mmap_size = 0,
-    int readonly_file_fd = -1);
+    int readonly_file_fd = -1,
+    const TensorFileReader * reader = nullptr);
 
 // Spark: split a VRAM budget into a pinned-hot tier + an auto-sized expert
 // cache ring. target_bytes==0 keeps the current budget (use the card);
@@ -351,6 +356,7 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     std::string * err = nullptr,
     int cache_slots = 0,
     ggml_backend_t cold_gpu_backend = nullptr,
-    int readonly_file_fd = -1);
+    int readonly_file_fd = -1,
+    const TensorFileReader * reader = nullptr);
 
 }  // namespace luce::common

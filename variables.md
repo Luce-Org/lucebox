@@ -216,7 +216,7 @@ Untagged variables are operational tuning knobs.
 | `LUCE_DS4_MOE_TP` / `LUCE_DS4_MOE_TP_INPROC` / `LUCE_DS4_MOE_TP_GPU` | Burn-in controls for in-process route-owner expert parallelism and the cold-owner HIP device. |
 | `LUCE_DS4_HOTNESS_CSV` | Optional per-layer expert routing profile for hot placement. |
 | `LUCE_MOE_COLD_BACKEND` | Cold-expert compute backend. |
-| `LUCE_NO_PREAD` | Disable pread-based weight loading. |
+| `LUCE_NO_PREAD` | Disable the threaded weight reads (tensor_file_reader); loaders copy out of the mapping. |
 
 ## MoE expert compute / IPC
 

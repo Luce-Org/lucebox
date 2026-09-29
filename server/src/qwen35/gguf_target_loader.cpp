@@ -49,6 +49,7 @@
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
 #include "common/gguf_mmap.h"
+#include "common/tensor_file_reader.h"
 #include "common/gguf_bounds.h"
 
 #include <cinttypes>
@@ -979,6 +980,7 @@ bool load_target_gguf_partial(const std::string & path,
     const uint8_t * mm_addr = (const uint8_t *)mm.data();
     const size_t    mm_len  = mm.size();
 
+    std::vector<TensorFileSpan> spans;
     size_t total = 0;
     size_t tok_embd_off = 0, tok_embd_sz = 0;
     ggml_type tok_embd_type = GGML_TYPE_COUNT;
@@ -1007,8 +1009,17 @@ bool load_target_gguf_partial(const std::string & path,
         if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
             continue;
         }
-        ggml_backend_tensor_set(t, mm_addr + off, 0, sz);
+        spans.push_back({t, 0, off, sz});
         total += sz;
+    }
+    {
+        std::string read_err;
+        if (!load_tensor_spans(path, mm_addr, spans, &read_err)) {
+            set_last_error(read_err);
+            release_out_buffer();
+            gguf_free(gctx);
+            return false;
+        }
     }
 
     // ── 4b. Read NVFP4 per-tensor weight scales (optional; 1.0 for non-NVFP4).

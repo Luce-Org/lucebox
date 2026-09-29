@@ -46,9 +46,17 @@ private:
     bool direct_ = false;
 };
 
+// Memory the host can still hand out without swapping (Linux MemAvailable,
+// Windows available physical memory); 0 when unknown.
+uint64_t host_available_bytes();
+
 // Hint that [offset, offset + size) of a read-only mapping of `map_size`
 // bytes at `map` will be read soon; no-op where unsupported.
 void advise_mapped_willneed(const void * map, size_t map_size, uint64_t offset, size_t size);
+
+// Bytes of [offset, offset + size) of a read-only mapping at `map` that are in
+// memory now (whole pages counted); 0 where the platform cannot tell.
+size_t mapped_resident_bytes(const void * map, uint64_t offset, size_t size);
 
 // Acquire / release on a 32-bit word shared with a device or another thread
 // through host-mapped memory, and the spin-wait pause.
