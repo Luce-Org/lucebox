@@ -453,7 +453,7 @@ bool load_bailingmoe3_gguf(const std::string & path,
     }
     {
         std::string read_error;
-        if (!load_tensor_spans(path, bytes, spans, &read_error)) {
+        if (!load_tensor_spans(path, bytes, file_size, spans, &read_error)) {
             ggml_backend_buffer_free(out.buf);
             out.buf = nullptr;
             return fail(read_error);

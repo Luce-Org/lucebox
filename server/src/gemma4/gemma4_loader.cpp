@@ -421,9 +421,10 @@ bool load_gemma4_gguf_partial(const std::string & path,
     }
     {
         std::string read_err;
-        if (!load_tensor_spans(path, mmap.addr, spans, &read_err)) {
+        if (!load_tensor_spans(path, mmap.addr, mmap.len, spans, &read_err)) {
             set_last_error("gemma4: " + read_err);
             mmap.close_map();
+            free_gemma4_weights(out);
             gguf_free(gctx); return false;
         }
     }

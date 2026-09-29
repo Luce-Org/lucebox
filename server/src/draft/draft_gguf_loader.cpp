@@ -690,8 +690,12 @@ bool load_draft_gguf(const std::string & path,
         spans.push_back({t, 0, data_start + rel_off, sz});
         total += sz;
     }
-    if (!load_tensor_spans(path, mm_addr, spans, &err)) {
+    if (!load_tensor_spans(path, mm_addr, mm_len, spans, &err)) {
         set_last_error(err);
+        ggml_backend_buffer_free(out.buf);
+        out.buf = nullptr;
+        ggml_free(meta_ctx);
+        out.ctx = nullptr;
         gguf_free(gctx);
         return false;
     }

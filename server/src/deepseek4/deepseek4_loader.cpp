@@ -2422,7 +2422,11 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 #endif
     }
     std::string read_err;
-    if (!spans.empty() && !reader.load(spans, &read_err)) {
+    const bool read_ok = spans.empty() || reader.load(spans, &read_err);
+    // Writes into a managed buffer come from the host: make them visible to
+    // the device before its first graph.
+    if (!spans.empty()) ggml_backend_synchronize(backend);
+    if (!read_ok) {
         set_last_error(read_err);
         mmap.close_map();
         if (split_buf) ggml_backend_buffer_free(split_buf);
