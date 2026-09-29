@@ -1349,6 +1349,15 @@ if(LUCE_TESTS)
         target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE
             ggml ${LUCE_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_deepseek4_mmid_grouped_cuda)
+        if(LUCE_GPU_BACKEND STREQUAL "cuda")
+            add_test(NAME q5_mmid_grouped_cuda
+                COMMAND ${CMAKE_COMMAND}
+                    -DTEST_EXECUTABLE=$<TARGET_FILE:test_deepseek4_mmid_grouped_cuda>
+                    -DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/q5_mmid_grouped
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/test/test_q5_mmid_grouped.cmake)
+            set_tests_properties(q5_mmid_grouped_cuda PROPERTIES
+                SKIP_REGULAR_EXPRESSION "q5-mmid-grouped SKIP")
+        endif()
         add_test(NAME deepseek4_mmid_grouped_cuda_reject_parent_width
             COMMAND ${CMAKE_COMMAND} -E env LUCE_MMID_TEST_WIDTH=16
                 $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda> --mmid-only)
