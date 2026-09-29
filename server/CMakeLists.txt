@@ -1647,6 +1647,11 @@ if(LUCE_TESTS)
         # Self-skips (returns 0) unless DS4_TEST_MODEL points at a qtype-105 model.
         add_test(NAME ds4_load_transactional COMMAND test_ds4_load_transactional)
     endif()
+    add_executable(test_ds41_mxfp8 test/unit/test_ds41_mxfp8.cpp)
+    target_link_libraries(test_ds41_mxfp8 PRIVATE ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+    add_test(NAME test_ds41_mxfp8_cpu COMMAND test_ds41_mxfp8 cpu)
+    add_test(NAME test_ds41_mxfp8_gpu COMMAND test_ds41_mxfp8 gpu)
+    set_tests_properties(test_ds41_mxfp8_gpu PROPERTIES SKIP_RETURN_CODE 77)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_rocmfp3_mix_registry.cpp")
         # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
         # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,

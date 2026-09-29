@@ -66,6 +66,20 @@ static __device__ __forceinline__ void dequantize_q5_1(const void * vx, const in
     v.y = (v.y * dm.x) + dm.y;
 }
 
+// Exact: E4M3 bits as FP16 are value * 2^-8, and the E8M0 scale folds in the 2^8 (see ggml-common.h).
+static __device__ __forceinline__ float mxfp8_scale(const uint8_t e) {
+    return __uint_as_float(GGML_MXFP8_SCALE_BITS(e));
+}
+static __device__ __forceinline__ float mxfp8_value(const uint8_t code) {
+    return __half2float(__ushort_as_half(GGML_MXFP8_F16_BITS(code)));
+}
+static __device__ __forceinline__ void dequantize_mxfp8(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_mxfp8 * x = (const block_mxfp8 *) vx;
+    const float d = mxfp8_scale(x[ib].e[iqs/32]);   // iqs is even, so iqs and iqs + 1 share a scale
+    v.x = mxfp8_value(x[ib].qs[iqs + 0]) * d;
+    v.y = mxfp8_value(x[ib].qs[iqs + 1]) * d;
+}
+
 static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q8_0 * x = (const block_q8_0 *) vx;
 

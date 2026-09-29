@@ -829,6 +829,8 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
 
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_MXFP8:   // exact: E4M3 * 2^k fits BF16's 8-bit mantissa (no FP16 route: small scales underflow)
+            return dequantize_block_cont_cuda<QK_MXFP8, QR_MXFP8, dequantize_mxfp8>;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_F16:
@@ -924,6 +926,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_block_cont_cuda<QK5_0, QR5_0, dequantize_q5_0>;
         case GGML_TYPE_Q5_1:
             return dequantize_block_cont_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+        case GGML_TYPE_MXFP8:
+            return dequantize_block_cont_cuda<QK_MXFP8, QR_MXFP8, dequantize_mxfp8>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_Q2_K:
@@ -1024,6 +1028,8 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_0, QR5_0, dequantize_q5_0>;
         case GGML_TYPE_Q5_1:
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+        case GGML_TYPE_MXFP8:
+            return dequantize_block_cuda<QK_MXFP8, QR_MXFP8, dequantize_mxfp8>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_Q4_0_ROCMFP4:
@@ -1057,6 +1063,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_0, QR5_0, dequantize_q5_0>;
         case GGML_TYPE_Q5_1:
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+        case GGML_TYPE_MXFP8:
+            return dequantize_block_cuda<QK_MXFP8, QR_MXFP8, dequantize_mxfp8>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_Q4_0_ROCMFP4:
