@@ -297,7 +297,12 @@ static bool grouped_supported_device();
 static int run_q5_cases(const char * output_path, bool grouped_enabled) {
     int devices = 0;
     cudaDeviceProp device{};
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+    const cudaError_t device_status = cudaGetDeviceCount(&devices);
+    if (device_status == cudaErrorNoDevice || (device_status == cudaSuccess && devices == 0)) return 77;
+    if (device_status != cudaSuccess) {
+        std::fprintf(stderr, "cudaGetDeviceCount failed: %s\n", cudaGetErrorString(device_status));
+        return 1;
+    }
     if (cudaGetDeviceProperties(&device, 0) != cudaSuccess) return 1;
     if (device.major != 8 || device.minor != 6) return 77;
 

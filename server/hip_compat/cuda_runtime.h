@@ -28,6 +28,7 @@ using cudaDeviceProp        = hipDeviceProp_t;
 
 // Error codes
 #define cudaSuccess                 hipSuccess
+#define cudaErrorNoDevice           hipErrorNoDevice
 #define cudaErrorInvalidValue       hipErrorInvalidValue
 #define cudaErrorIllegalAddress     hipErrorIllegalAddress
 #define cudaErrorAssert             hipErrorAssert
