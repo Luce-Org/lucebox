@@ -13,7 +13,7 @@
 #include "common/dflash_draft_graph.h"
 #include "common/dflash_draft_kv.h"
 #include "placement/placement_config.h"
-#include "qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
 #include "kvflash_pager.h"
 #include "kvflash_scorer.h"
 #include "../common/moe_hybrid_ffn_eval.h"
@@ -141,7 +141,7 @@ private:
     bool ensure_slot(int slot);
 
     // ── kvflash (bounded KV residency; see common/kvflash_pager.h) ──
-    // Drafter-scored residency by default: the Qwen3-0.6B drafter scores
+    // Drafter-scored residency by default: the Qwen3.5-0.8B drafter scores
     // chunks through the cross-tokenizer bridge (KvFlashCrossTokScorer —
     // relevance is text-level, so the target's ids are detokenized and
     // re-tokenized for the drafter). LRU is the fallback when no drafter is

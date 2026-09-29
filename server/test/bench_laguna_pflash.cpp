@@ -1,7 +1,7 @@
 // End-to-end PFlash + Laguna TTFT bench. Mirrors the qwen3.6-27B PFlash flow:
 //
 //   1. Tokenize input (synthetic in DRAFTER vocab for the bench)
-//   2. Drafter (Qwen3-0.6B BF16) score_and_compress  -> surviving Qwen3 IDs
+//   2. Drafter (Qwen3.5-0.8B BF16) score_and_compress -> surviving Qwen3.5 IDs
 //   3. Cross-tokenizer mapping Qwen3 IDs -> Laguna IDs (NOT plumbed yet; we
 //      use a fake target token for compute-time-only measurement)
 //   4. Laguna build_laguna_graph dense prefill on the COMPRESSED sequence
@@ -13,7 +13,8 @@
 
 #include "laguna_internal.h"
 #include "internal.h"
-#include "qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
+#include "pflash/qwen35_drafter.h"
 #include "luce.h"
 
 #include <chrono>
@@ -102,12 +103,13 @@ int main(int argc, char ** argv) {
     }
     auto td1 = std::chrono::steady_clock::now();
     std::printf("[pflash] drafter loaded in %.2fs vocab=%d\n",
-                std::chrono::duration<double>(td1 - td0).count(), drafter.weights.n_vocab);
+                std::chrono::duration<double>(td1 - td0).count(), drafter.state->weights.n_vocab);
 
     std::vector<int32_t> input(N, fake_q);
     auto tc0 = std::chrono::steady_clock::now();
     std::vector<int32_t> compressed = drafter_score_and_compress(
-        drafter, input, keep_r, /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13);
+        drafter, input, keep_r, /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13,
+        /*score_query_end=*/(int)input.size());
     auto tc1 = std::chrono::steady_clock::now();
     if (compressed.empty()) {
         std::fprintf(stderr, "drafter compress failed: %s\n", luce_last_error());

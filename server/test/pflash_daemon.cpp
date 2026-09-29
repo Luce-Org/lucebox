@@ -1,6 +1,6 @@
 // Persistent PFlash compressor daemon.
 //
-// Loads the Qwen3-0.6B PFlash drafter once, then accepts stdin commands:
+// Loads the Qwen3.5-0.8B PFlash drafter once, then accepts stdin commands:
 //
 //   compress <keep_x1000> <lookahead> <chunk> <pool> <counted_ids.bin>
 //   quit
@@ -10,7 +10,8 @@
 // values to --stream-fd=<fd>, terminated by -1. Logs go to stdout/stderr.
 
 #include "luce.h"
-#include "qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
+#include "pflash/qwen35_drafter.h"
 
 #include <chrono>
 #include <cstdint>
@@ -68,7 +69,7 @@ static void stream_ids(int stream_fd, const std::vector<int32_t> & ids) {
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <qwen3-0.6b.gguf> [--stream-fd=N]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <qwen3.5-0.8b.gguf> [--stream-fd=N]\n", argv[0]);
         return 2;
     }
 
@@ -89,7 +90,7 @@ int main(int argc, char ** argv) {
     auto t_load1 = std::chrono::steady_clock::now();
     std::printf("[pflash-daemon] ready load=%.3fs vocab=%d\n",
                 std::chrono::duration<double>(t_load1 - t_load0).count(),
-                ctx.weights.n_vocab);
+                ctx.state->weights.n_vocab);
     std::fflush(stdout);
 
     std::string line;
@@ -139,7 +140,7 @@ int main(int argc, char ** argv) {
         std::fflush(stdout);
 
         auto t0 = std::chrono::steady_clock::now();
-        std::vector<int32_t> out = drafter_score_and_compress(ctx, ids, keep_ratio, chunk, lookahead, pool);
+        std::vector<int32_t> out = drafter_score_and_compress(ctx, ids, keep_ratio, chunk, lookahead, pool, (int)ids.size());
         auto t1 = std::chrono::steady_clock::now();
 
         const double secs = std::chrono::duration<double>(t1 - t0).count();

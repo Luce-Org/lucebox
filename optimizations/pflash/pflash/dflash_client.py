@@ -230,7 +230,7 @@ class DflashClient:
     def unpark_target(self): self._send("unpark target\n")
 
     def compress(self, prompt_ids: list[int], keep_ratio: float, drafter_gguf: str,
-                 drafter_arch: str = "qwen3-0.6b") -> list[int]:
+                 drafter_arch: str = "qwen35-0.8b") -> list[int]:
         """C++ drafter score+compress via daemon. Returns compressed token ids.
 
         Daemon command: compress <bin> <keep_x1000> <drafter_gguf> <drafter_arch>

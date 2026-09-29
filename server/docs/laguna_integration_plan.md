@@ -4,7 +4,7 @@ Status: scaffolding. PR #115 in lucebox-hub bumps llama.cpp submodule to `luce-d
 
 ## Context
 
-- `pflash_daemon` (test/pflash_daemon.cpp): drafter-only stdin compressor, loads Qwen3-0.6B via luce's own loader, emits compressed token IDs in DRAFTER vocab. Already model-agnostic on the target side. **No change needed.**
+- `pflash_daemon` (test/pflash_daemon.cpp): drafter-only stdin compressor, loads Qwen3.5-0.8B via luce's own loader, emits compressed token IDs in DRAFTER vocab. Already model-agnostic on the target side. **No change needed.**
 - `test_dflash` (test/test_dflash.cpp 190 KB): main target runner. Hand-rolled CUDA forward graph for qwen35 hybrid. Loads via `load_target_gguf` which hardcodes `arch == "qwen35"`. **Hard-blocked on Laguna.**
 - `qwen35_target_graph.cpp` (60 KB): hand-rolled CUDA forward, builds full-attn + delta-net + FFN. Uses `flash_prefill_forward_bf16` for sparse prefill.
 - `flashprefill.{h,cpp}` + `flashprefill_kernels.cu`: model-agnostic block-sparse FA. Takes Q/K/V tensors, returns O. Already works for any GQA arch with head_dim 128. **Reusable as-is.**
@@ -57,7 +57,7 @@ No libllama dependency in dflash runtime. Keep ggml-only stack. (libllama+LAGUNA
    - Detect arch from loaded weights
    - For Laguna arch, use `LagunaTargetCache` + `build_laguna_graph` instead of qwen35 equivalents
    - Adjust per-layer-head-count in attention buffer sizing
-   - PFlash drafter call unchanged (drafter is Qwen3-0.6B regardless of target)
+   - PFlash drafter call unchanged (drafter is Qwen3.5-0.8B regardless of target)
    - Cross-tokenizer mapping (Qwen3 IDs → Laguna IDs): byte-level round-trip via existing optimizations/pflash/ Python module OR port to C++ helper
 
 ## Phasing

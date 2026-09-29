@@ -156,7 +156,16 @@ int flash_prefill_forward_q8(
                                     (size_t)kv_len * cl * sizeof(uint16_t));
         }
 
-        ggml_backend_graph_compute(backend, gf);
+        const ggml_status compute_status =
+            ggml_backend_graph_compute(backend, gf);
+        if (compute_status != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr,
+                         "[flashprefill_q8] graph compute failed at cs=%d: %s\n",
+                         cs, ggml_status_to_string(compute_status));
+            ggml_free(ctx);
+            ggml_gallocr_free(galloc);
+            return -1;
+        }
         ggml_backend_synchronize(backend);
         ggml_free(ctx);
     }

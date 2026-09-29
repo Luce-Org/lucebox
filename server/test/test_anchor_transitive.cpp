@@ -2,7 +2,7 @@
 // T1: single-pass match; T2: single-pass misses hops; T3: transitive rescues all hops.
 
 #include "CppUnitTestFramework.hpp"
-#include "../src/qwen3/anchor_scan.h"
+#include "../src/pflash/anchor_scan.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -52,9 +52,9 @@ static void t1_single_pass_match() {
     const int n_chunks = (N + CHUNK - 1) / CHUNK;
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
 
-    luce::qwen3::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
+    luce::pflash::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
                                      /*max_anchor_hits=*/8, /*ngram=*/4};
-    luce::qwen3::scan_and_force(ids, q0, query_pool, cfg, forced);
+    luce::pflash::scan_and_force(ids, q0, query_pool, cfg, forced);
 
     // Chunk containing pos 100 must be forced.
     const int target_chunk = 100 / CHUNK;  // chunk 1
@@ -88,9 +88,9 @@ static void t2_single_pass_misses_hops() {
     const int n_chunks = (N + CHUNK - 1) / CHUNK;
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
 
-    luce::qwen3::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
+    luce::pflash::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
                                      /*max_anchor_hits=*/8, /*ngram=*/4};
-    luce::qwen3::scan_and_force(ids, q0, query_pool, cfg, forced);
+    luce::pflash::scan_and_force(ids, q0, query_pool, cfg, forced);
 
     const int chunk_hop3 = 1200 / CHUNK;  // 18
     const int chunk_hop2 = 600  / CHUNK;  // 9
@@ -126,9 +126,9 @@ static void t3_transitive_rescues_all() {
     const int n_chunks = (N + CHUNK - 1) / CHUNK;
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
 
-    luce::qwen3::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
+    luce::pflash::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
                                      /*max_anchor_hits=*/8, /*ngram=*/4};
-    luce::qwen3::scan_and_force_transitive(ids, q0, initial_query_pool,
+    luce::pflash::scan_and_force_transitive(ids, q0, initial_query_pool,
                                               cfg, /*max_iters=*/3, forced);
 
     const int chunk_hop3 = 1200 / CHUNK;
@@ -187,10 +187,10 @@ static void t4_rare_token_bridges_different_context() {
     const int n_chunks = (N + CHUNK - 1) / CHUNK;
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
 
-    luce::qwen3::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
+    luce::pflash::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
                                      /*max_anchor_hits=*/8, /*ngram=*/4,
                                      /*rare_token_max_freq=*/8};
-    luce::qwen3::scan_and_force_transitive(ids, q0, initial_query_pool,
+    luce::pflash::scan_and_force_transitive(ids, q0, initial_query_pool,
                                               cfg, /*max_iters=*/3, forced);
 
     const int chunk_hop3 = 1200 / CHUNK;  // 18
@@ -250,12 +250,12 @@ static void t5_gate_closes_when_pass1_finds_many() {
     // --- Test A: gate CLOSED (cascade_min_anchor_count=5) ---
     {
         std::vector<uint8_t> forced_a((size_t)n_chunks, 0);
-        luce::qwen3::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
+        luce::pflash::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
                                          /*max_anchor_hits=*/64, /*ngram=*/4,
                                          /*rare_token_max_freq=*/2,
                                          /*cascade_min_anchor_count=*/5,
                                          /*max_forced_count=*/INT_MAX};
-        luce::qwen3::scan_and_force_transitive(ids, q0, query_pool,
+        luce::pflash::scan_and_force_transitive(ids, q0, query_pool,
                                                   cfg, /*max_iters=*/3, forced_a);
 
         // Pass-1 forces chunks 0..49 (50 chunks); gate closes → cascade skipped.
@@ -272,12 +272,12 @@ static void t5_gate_closes_when_pass1_finds_many() {
     // --- Test B: gate OPEN (cascade_min_anchor_count=0) → cascade forces chunk 60 ---
     {
         std::vector<uint8_t> forced_b((size_t)n_chunks, 0);
-        luce::qwen3::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
+        luce::pflash::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
                                          /*max_anchor_hits=*/64, /*ngram=*/4,
                                          /*rare_token_max_freq=*/2,
                                          /*cascade_min_anchor_count=*/0,
                                          /*max_forced_count=*/INT_MAX};
-        luce::qwen3::scan_and_force_transitive(ids, q0, query_pool,
+        luce::pflash::scan_and_force_transitive(ids, q0, query_pool,
                                                   cfg, /*max_iters=*/3, forced_b);
 
         // Cascade runs; chunk 5 is forced by pass-1 and contains RT;
@@ -330,12 +330,12 @@ static void t6_hard_cap_prevents_runaway() {
     // Without cap: cascade forces chunks 0..20 (21 chunks total).
     // With cap=5: stops at 5.
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
-    luce::qwen3::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
+    luce::pflash::AnchorScanCfg cfg{CHUNK, /*anchor_radius=*/0,
                                      /*max_anchor_hits=*/8, /*ngram=*/4,
                                      /*rare_token_max_freq=*/2,
                                      /*cascade_min_anchor_count=*/0,
                                      /*max_forced_count=*/5};
-    luce::qwen3::scan_and_force_transitive(ids, q0, query_pool,
+    luce::pflash::scan_and_force_transitive(ids, q0, query_pool,
                                               cfg, /*max_iters=*/25, forced);
 
     int total_forced = 0;

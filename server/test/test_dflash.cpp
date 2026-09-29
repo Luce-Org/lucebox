@@ -25,7 +25,7 @@
 #include "specla_commit_cuda.h"
 #include "specla_mode.h"
 #include "draft_graph.h"
-#include "qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
 #include "gpu_runtime_compat.h"
 #include "chain_rollback_policy.h"
 #include "draft_swa.h"
@@ -2379,8 +2379,8 @@ int main(int argc, char ** argv) {
             // Format: "compress <src_bin_path> <keep_ratio_x1000> <drafter_gguf> [drafter_arch]"
             //   src_bin_path:   int32 token IDs file (drafter vocab)
             //   keep_ratio_x1000: integer keep ratio × 1000 (e.g. 20 → 0.020)
-            //   drafter_gguf:   path to drafter GGUF (loaded lazily once)
-            //   drafter_arch:   qwen3-0.6b (default) or qwen35-0.8b
+            //   drafter_gguf:   path to the Qwen3.5-0.8B drafter GGUF (loaded lazily once)
+            //   drafter_arch:   accepted for compatibility, ignored (Qwen3.5-0.8B only)
             // Output: stream of int32 compressed token IDs, terminated by -1.
             // Drafter coexists with target+draft via libllama in the same
             // ggml allocator — no park/unpark needed for compression itself.
@@ -2388,7 +2388,7 @@ int main(int argc, char ** argv) {
                 char ppath[1024];
                 int  keep_x1000 = 0;
                 char drafter_path[1024];
-                char arch_name[64] = "qwen3-0.6b";
+                char arch_name[64] = "";
                 int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s %63s",
                                     ppath, &keep_x1000, drafter_path, arch_name);
                 if (n < 3) {
@@ -2396,11 +2396,7 @@ int main(int argc, char ** argv) {
                                  "[compress] bad args, need: <bin> <keep_x1000> <drafter_gguf> [drafter_arch]\n");
                     stream_emit(-1); continue;
                 }
-                luce::common::DrafterArch drafter_arch;
-                if (!luce::common::parse_drafter_arch(arch_name, drafter_arch)) {
-                    std::fprintf(stderr, "[compress] bad drafter_arch: %s\n", arch_name);
-                    stream_emit(-1); continue;
-                }
+
                 auto src_ids = read_int32_file(ppath);
                 if (src_ids.empty()) {
                     std::fprintf(stderr, "[compress] empty input\n");
@@ -2429,31 +2425,21 @@ int main(int argc, char ** argv) {
                 }
 
                 if (!drafter_loaded) {
-                    if (!luce::common::load_drafter(drafter_path, /*gpu_layers=*/999, drafter_arch, drafter_ctx)) {
+                    if (!luce::common::load_drafter(drafter_path, /*gpu_layers=*/999, drafter_ctx)) {
                         std::fprintf(stderr, "[compress] load_drafter failed: %s\n",
                                      luce_last_error());
                         stream_emit(-1); continue;
                     }
                     drafter_loaded = true;
-                    if (drafter_arch == luce::common::DrafterArch::Qwen3_0p6b) {
-                        std::printf("[drafter] loaded %s arch=%s (n_layer=%d n_head=%d n_head_kv=%d)\n",
-                                    drafter_path, luce::common::drafter_arch_name(drafter_arch), drafter_ctx.weights.n_layer,
-                                    drafter_ctx.weights.n_head, drafter_ctx.weights.n_head_kv);
-                    } else {
-                        std::printf("[drafter] loaded %s arch=%s\n",
-                                    drafter_path, luce::common::drafter_arch_name(drafter_arch));
-                    }
+                    std::printf("[drafter] loaded %s\n", drafter_path);
                     std::fflush(stdout);
-                } else if (drafter_ctx.arch != drafter_arch) {
-                    std::fprintf(stderr, "[compress] requested arch=%s but loaded arch=%s\n",
-                                 luce::common::drafter_arch_name(drafter_arch),
-                                 luce::common::drafter_arch_name(drafter_ctx.arch));
-                    stream_emit(-1); continue;
                 }
 
                 float keep = (float)keep_x1000 / 1000.0f;
                 auto compressed = luce::common::drafter_score_and_compress(
-                    drafter_ctx, src_ids, keep);
+                    drafter_ctx, src_ids, keep,
+                    /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13,
+                    (int)src_ids.size());
                 std::printf("[compress] %zu -> %zu tokens (keep_ratio=%.3f)\n",
                             src_ids.size(), compressed.size(), keep);
                 std::fflush(stdout);

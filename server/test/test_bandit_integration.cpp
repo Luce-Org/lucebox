@@ -101,3 +101,14 @@ TEST_CASE(BanditIntegrationFixture, non_string_session_id_array_extra_body) {
     std::string sid = parse_session_id_from_body(body);
     CHECK(sid.empty());
 }
+
+TEST_CASE(BanditIntegrationFixture, pflash_query_top_level_and_extra_body) {
+    json top = {{"pflash_query", "Which function has the deliberate error?"}};
+    CHECK(parse_pflash_query_from_body(top) == "Which function has the deliberate error?");
+    json nested = {{"extra_body", {{"pflash_query", "What is the major tributary of the Rhine?"}}}};
+    CHECK(parse_pflash_query_from_body(nested) == "What is the major tributary of the Rhine?");
+    json absent = {{"messages", json::array()}};
+    CHECK(parse_pflash_query_from_body(absent).empty());
+    json wrong_type = {{"pflash_query", 7}};
+    CHECK(parse_pflash_query_from_body(wrong_type).empty());
+}
