@@ -254,6 +254,122 @@ int sample_logits(const float * logits_in,
     return draw_from_weights(cand, r_uniform);
 }
 
+void sampler_distribution(const float * logits_in,
+                          int vocab,
+                          const SamplerCfg & cfg,
+                          const std::vector<int32_t> & history,
+                          std::vector<std::pair<float, int>> & cand) {
+    // Same chain as sample_logits (penalties, top_k, temperature, top_p). The
+    // exponentials are computed once in float and the top-p cut searches the
+    // highest 1024 logits first, falling back to nucleus_cutoff only when the
+    // mass is spread wider than that: the verifier builds this for up to five
+    // rows per speculative step over the full vocabulary.
+    thread_local std::vector<float> z;
+    z.assign(logits_in, logits_in + vocab);
+    if (cfg.rep_pen > 1.0f && !history.empty()) {
+        const int win  = std::min((int)history.size(), cfg.rep_window);
+        const int from = (int)history.size() - win;
+        std::unordered_set<int> seen;
+        for (int i = from; i < (int)history.size(); i++) seen.insert(history[i]);
+        for (int t : seen) {
+            if (t >= 0 && t < vocab) z[t] = z[t] > 0.0f ? z[t] / cfg.rep_pen : z[t] * cfg.rep_pen;
+        }
+    }
+    if ((cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f) && !history.empty()) {
+        const int win  = std::min((int)history.size(), cfg.rep_window);
+        const int from = (int)history.size() - win;
+        std::unordered_map<int, int> counts;
+        for (int i = from; i < (int)history.size(); i++) counts[history[i]]++;
+        for (auto & kv : counts) {
+            if (kv.first >= 0 && kv.first < vocab) {
+                z[kv.first] -= cfg.freq_pen * kv.second + cfg.pres_pen;
+            }
+        }
+    }
+    if (cfg.temp <= 0.0f) {
+        const int best = (int) (std::max_element(z.begin(), z.end()) - z.begin());
+        cand.assign(1, {1.0f, best});
+        return;
+    }
+
+    const bool need_top_k = cfg.top_k > 0 && cfg.top_k < vocab;
+    const bool need_top_p = cfg.top_p > 0.0f && cfg.top_p < 1.0f;
+    const float inv_t = 1.0f / std::max(1e-3f, cfg.temp);
+    if (need_top_k) {
+        cand.resize(vocab);
+        for (int i = 0; i < vocab; i++) cand[i] = {z[i], i};
+        std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(),
+                          [](auto & a, auto & b){ return a.first > b.first; });
+        cand.resize(cfg.top_k);
+    } else {
+        const float maxv = *std::max_element(z.begin(), z.end()) * inv_t;
+        double Z = 0.0;
+        for (int i = 0; i < vocab; i++) {
+            z[i] = std::exp(z[i] * inv_t - maxv);
+            Z += z[i];
+        }
+        if (!need_top_p) {
+            cand.resize(vocab);
+            for (int i = 0; i < vocab; i++) cand[i] = {(float) (z[i] / Z), i};
+            return;
+        }
+        const double target = (double) cfg.top_p * Z;
+        // Every token below tau = (1 - top_p) * Z / vocab lies outside the
+        // nucleus: together they weigh less than (1 - top_p) * Z, so the
+        // tokens at or above tau already reach the target mass and the cut
+        // falls among them. Only those need sorting.
+        const float tau = (float) ((1.0 - (double) cfg.top_p) * Z / vocab);
+        cand.clear();
+        for (int i = 0; i < vocab; i++) {
+            if (z[i] >= tau) cand.push_back({z[i], i});
+        }
+        const auto desc = [](auto & a, auto & b){ return a.first > b.first; };
+        size_t cut = 0;
+        if (cand.size() <= 4096) {
+            std::sort(cand.begin(), cand.end(), desc);
+            double cum = 0.0;
+            for (size_t i = 0; i < cand.size(); i++) {
+                cum += cand[i].first;
+                if (cum >= target) { cut = i + 1; break; }
+            }
+        }
+        if (cut == 0) {
+            cut = nucleus_cutoff(cand, target, [](auto & c){ return (double) c.first; });
+        }
+        cand.resize(cut);
+        double Zc = 0.0;
+        for (auto & c : cand) Zc += c.first;
+        for (auto & c : cand) c.first = (float) (c.first / Zc);
+        return;
+    }
+    // top_k path: softmax over the kept candidates, then top_p within them.
+    const float maxv = cand.front().first * inv_t;
+    std::vector<float> probs(cand.size());
+    double Z = 0.0;
+    for (size_t i = 0; i < cand.size(); i++) {
+        probs[i] = std::exp(cand[i].first * inv_t - maxv);
+        Z       += probs[i];
+    }
+    for (auto & p : probs) p = (float)(p / Z);
+    if (need_top_p) {
+        double cum = 0.0;
+        size_t cut = probs.size();
+        for (size_t i = 0; i < probs.size(); i++) {
+            cum += probs[i];
+            if (cum >= cfg.top_p) { cut = i + 1; break; }
+        }
+        probs.resize(cut); cand.resize(cut);
+        double Zc = 0.0;
+        for (float p : probs) Zc += p;
+        for (auto & p : probs) p = (float)(p / Zc);
+    }
+    for (size_t i = 0; i < cand.size(); i++) cand[i].first = probs[i];
+}
+
+int sampler_draw(const std::vector<std::pair<float, int>> & cand, double r_uniform) {
+    return draw_from_weights(cand, r_uniform);
+}
+
 bool parse_sampler_token(std::string & line, SamplerCfg & out) {
     auto pos = line.find(" samp=");
     if (pos == std::string::npos) return false;

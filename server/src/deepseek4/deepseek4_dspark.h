@@ -29,6 +29,7 @@
 #pragma once
 
 #include "deepseek4_internal.h"
+#include "deepseek4_spec_sampling.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -304,6 +305,10 @@ bool run_deepseek4_dspark_spec_decode(
         const std::function<bool(int32_t)> & on_token = {},
         MoeHybridStorage * moe_hybrid = nullptr,
         MoeExpertComputeRuntime * expert_runtime = nullptr,
-        MoeHybridRoutingStats * routing_stats = nullptr);
+        MoeHybridRoutingStats * routing_stats = nullptr,
+        // Non-null for requests that sample (temp > 0 or penalties): drafts
+        // stay greedy and are kept with the target's probability
+        // (deepseek4_spec_sampling.h), so tokens follow the request's sampler.
+        DSparkSpecSampling * sampling = nullptr);
 
 }  // namespace luce::common
