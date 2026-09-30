@@ -11,6 +11,8 @@
 # unknown names get 404 with the list of loaded names.
 #
 #   launch_routing.sh
+# TOPOLOGY=strix starts only brick-max and qwen35-2b, both on hip:1, for when
+# another session holds the R9700.
 # Env: LUCE_SERVER (binary), MODELS (~/models), PORT (8420), FORCE=1 to start
 # even if another process holds /dev/kfd. LUCE_MULTI_MODEL_GRAPHS=1 passes
 # through to keep GPU graphs on (experimental; see MODEL_LOAD_BALANCING.md).
@@ -36,15 +38,22 @@ if [[ "${FORCE:-0}" != 1 ]] && holders="$(lsof -t /dev/kfd 2>/dev/null)" && [[ -
   exit 1
 fi
 
-args=(
-  --model-routing name --host 127.0.0.1 --port "$PORT" --routing-queue-limit 64
-  --model "$MODELS/Qwen3.8-27B-UD-IQ4_XS.gguf" --model-name qwen3.8-27b
-    --target-device hip:0
-    --draft "$MODELS/qwen38-dflash2-q8_0.gguf" --draft-device hip:0 --draft-block-size 16
-    --cache-type-k q8_0 --cache-type-v q8_0
-    --max-concurrency 4 --kv-pool-tokens 131072 --max-ctx 65536 --max-tokens 32768
+BRICK_DEVICE=hip:0
+args=(--model-routing name --host 127.0.0.1 --port "$PORT" --routing-queue-limit 64)
+case "${TOPOLOGY:-full}" in
+  full)
+    args+=(
+      --model "$MODELS/Qwen3.8-27B-UD-IQ4_XS.gguf" --model-name qwen3.8-27b
+        --target-device hip:0
+        --draft "$MODELS/qwen38-dflash2-q8_0.gguf" --draft-device hip:0 --draft-block-size 16
+        --cache-type-k q8_0 --cache-type-v q8_0
+        --max-concurrency 4 --kv-pool-tokens 131072 --max-ctx 65536 --max-tokens 32768) ;;
+  strix) BRICK_DEVICE=hip:1 ;;
+  *) echo "TOPOLOGY must be full or strix" >&2; exit 2 ;;
+esac
+args+=(
   --model "$MODELS/routing/brick-complexity-2-max-Q8_0.gguf" --model-name brick-max
-    --target-device hip:0
+    --target-device "$BRICK_DEVICE"
     --max-concurrency 4 --kv-pool-tokens 131072 --max-ctx 32768
   --model "$MODELS/routing/Qwen3.5-2B-Q8_0.gguf" --model-name qwen35-2b
     --target-device hip:1
