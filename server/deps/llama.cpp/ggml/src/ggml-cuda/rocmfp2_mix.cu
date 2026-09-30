@@ -1257,9 +1257,10 @@ __global__ void __launch_bounds__(MIX_WARP) mix_matvec_rocmfp2_moe_dedup_kernel(
     const int my_id = lane < n_pairs
         ? ids[(int64_t) (lane / n_used) * ids_s1 + (int64_t) (lane % n_used) * ids_s0] : INT_MIN;
     const int expert = __shfl(my_id, pair, MIX_WARP);
-    const uint64_t route_mask = (uint64_t) __ballot(my_id == expert) & 0xFFFFFFFFull;
+    // Only real routes vote: padded lanes hold INT_MIN, which a corrupt id
+    // could equal, and would then add out-of-range routes to the mask.
+    const uint64_t route_mask = (uint64_t) __ballot(lane < n_pairs && my_id == expert) & 0xFFFFFFFFull;
     if (__builtin_ctzll(route_mask) != pair) return;   // a lower route owns this expert
-    const int n_r = __builtin_popcountll(route_mask);
     const bool bad_expert = expert < 0 || expert >= n_experts;
     __shared__ float s_lut[2 * MIX_K];
     if (!bad_expert && lane < 2 * MIX_K) {
@@ -1279,15 +1280,26 @@ __global__ void __launch_bounds__(MIX_WARP) mix_matvec_rocmfp2_moe_dedup_kernel(
     }
     const uint8_t * edata = data + (int64_t) expert * nb02;
     const int mode = (int) modes[expert];
+    // Routes are served in chunks of at most CAP, so every route is computed
+    // even if a token's route row repeats an expert (more routes than tokens). Each
+    // route's output is independent, so chunking does not change results.
+    constexpr int CAP = MAXT < 8 ? MAXT : 8;
+    uint64_t rest = route_mask;
+    while (rest) {
+        uint64_t chunk = 0;
+        int n = 0;
+        for (uint64_t m = rest; m && n < CAP; m &= m - 1, ++n) chunk |= m & (~m + 1);
+        rest &= ~chunk;
 #define MIX_DEDUP_CASE(N) \
-    case N: if constexpr (N <= MAXT) mix_dedup_dispatch<GLU_MODE, N>(route_mask, n_used, src1, ne11, src1_s1, src1_s2, dst_s1, dst_s2, edata, mode, s_lut, dst, in, out, \
-        row0, lane, glu_limit); break;
-    switch (n_r) {
-        MIX_DEDUP_CASE(1) MIX_DEDUP_CASE(2) MIX_DEDUP_CASE(3) MIX_DEDUP_CASE(4)
-        MIX_DEDUP_CASE(5) MIX_DEDUP_CASE(6) MIX_DEDUP_CASE(7) MIX_DEDUP_CASE(8)
-        default: break;
-    }
+        case N: if constexpr (N <= CAP) mix_dedup_dispatch<GLU_MODE, N>(chunk, n_used, src1, ne11, src1_s1, src1_s2, dst_s1, dst_s2, edata, mode, s_lut, dst, in, out, \
+            row0, lane, glu_limit); break;
+        switch (n) {
+            MIX_DEDUP_CASE(1) MIX_DEDUP_CASE(2) MIX_DEDUP_CASE(3) MIX_DEDUP_CASE(4)
+            MIX_DEDUP_CASE(5) MIX_DEDUP_CASE(6) MIX_DEDUP_CASE(7) MIX_DEDUP_CASE(8)
+            default: break;
+        }
 #undef MIX_DEDUP_CASE
+    }
 }
 
 static int mix_dedup_min_tokens() {
@@ -1394,7 +1406,8 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id(
     const int rows_per_block = (row4 ? 4 : 2) * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
     if (e.gfx1151 && n_tokens >= mix_dedup_min_tokens() && n_tokens <= MIX_DEDUP_MAX_ROUTES &&
-        n_expert_used * n_tokens <= MIX_WARP && mix_dedup_enabled()) {
+        n_expert_used * n_tokens <= MIX_WARP && mix_dedup_enabled() &&
+        mix_gfx1151_row4_enabled()) {
         mix_launch_dedup<0>(e, src1, ids, dst, in, out, n_expert_used, n_tokens, ne11,
                             ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, 0.0f, stream);
     } else if (row4) {
@@ -1448,7 +1461,8 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
     const int rows_per_block = (row4 ? 4 : 2) * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
     if (strix_tuned && n_tokens >= mix_dedup_min_tokens() && n_tokens <= MIX_DEDUP_MAX_ROUTES &&
-        n_expert_used * n_tokens <= MIX_WARP && mix_dedup_enabled()) {
+        n_expert_used * n_tokens <= MIX_WARP && mix_dedup_enabled() &&
+        mix_gfx1151_row4_enabled()) {
         mix_launch_dedup<0>(eu, src1, ids, dst, in, out, n_expert_used, n_tokens, ne11,
                             ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, 0.0f, stream);
         mix_launch_dedup<2>(eg, src1, ids, dst, in, out, n_expert_used, n_tokens, ne11,

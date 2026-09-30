@@ -1170,9 +1170,10 @@ __global__ void __launch_bounds__(MIX_WARP) mix_matvec_rocmfp3_moe_dedup_kernel(
     const int my_id = lane < n_pairs
         ? ids[(int64_t) (lane / n_used) * ids_s1 + (int64_t) (lane % n_used) * ids_s0] : INT_MIN;
     const int expert = __shfl(my_id, pair, MIX_WARP);
-    const uint64_t route_mask = (uint64_t) __ballot(my_id == expert) & 0xFFFFFFFFull;
+    // Only real routes vote: padded lanes hold INT_MIN, which a corrupt id
+    // could equal, and would then add out-of-range routes to the mask.
+    const uint64_t route_mask = (uint64_t) __ballot(lane < n_pairs && my_id == expert) & 0xFFFFFFFFull;
     if (__builtin_ctzll(route_mask) != pair) return;
-    const int n_r = __builtin_popcountll(route_mask);
     const bool bad_expert = expert < 0 || expert >= n_experts;
     __shared__ float s_lut[2 * MIX_K];
     if (!bad_expert && lane < 2 * MIX_K) {
@@ -1192,15 +1193,26 @@ __global__ void __launch_bounds__(MIX_WARP) mix_matvec_rocmfp3_moe_dedup_kernel(
     }
     const uint8_t * edata = data + (int64_t) expert * nb02;
     const int mode = (int) modes[expert];
+    // Routes are served in chunks of at most CAP, so every route is computed
+    // even if a token's route row repeats an expert (more routes than tokens). Each
+    // route's output is independent, so chunking does not change results.
+    constexpr int CAP = MAXT < 8 ? MAXT : 8;
+    uint64_t rest = route_mask;
+    while (rest) {
+        uint64_t chunk = 0;
+        int n = 0;
+        for (uint64_t m = rest; m && n < CAP; m &= m - 1, ++n) chunk |= m & (~m + 1);
+        rest &= ~chunk;
 #define MIX3_DEDUP_CASE(N) \
-    case N: if constexpr (N <= MAXT) mix3_dedup_dispatch<N>(route_mask, n_used, src1, ne11, \
-        src1_s1, src1_s2, dst_s1, dst_s2, edata, mode, s_lut, dst, in, out, row0, lane); break;
-    switch (n_r) {
-        MIX3_DEDUP_CASE(1) MIX3_DEDUP_CASE(2) MIX3_DEDUP_CASE(3) MIX3_DEDUP_CASE(4)
-        MIX3_DEDUP_CASE(5) MIX3_DEDUP_CASE(6) MIX3_DEDUP_CASE(7) MIX3_DEDUP_CASE(8)
-        default: break;
-    }
+        case N: if constexpr (N <= CAP) mix3_dedup_dispatch<N>(chunk, n_used, src1, ne11, \
+            src1_s1, src1_s2, dst_s1, dst_s2, edata, mode, s_lut, dst, in, out, row0, lane); break;
+        switch (n) {
+            MIX3_DEDUP_CASE(1) MIX3_DEDUP_CASE(2) MIX3_DEDUP_CASE(3) MIX3_DEDUP_CASE(4)
+            MIX3_DEDUP_CASE(5) MIX3_DEDUP_CASE(6) MIX3_DEDUP_CASE(7) MIX3_DEDUP_CASE(8)
+            default: break;
+        }
 #undef MIX3_DEDUP_CASE
+    }
 }
 
 static bool mix3_dedup_enabled(int n_tokens) {
@@ -1236,7 +1248,9 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_id(
     const int rows_per_wave = row3 ? 3 : 2;
     const int rows_per_block = rows_per_wave * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
-    if (e.gfx1151 && n_expert_used * n_tokens <= MIX_WARP && mix3_dedup_enabled(n_tokens)) {
+    // The dedup kernel is the 3-row scheme, so it follows the row3 opt-out.
+    if (e.gfx1151 && n_expert_used * n_tokens <= MIX_WARP && mix3_dedup_enabled(n_tokens) &&
+        mix_gfx1151_row3_enabled()) {
 #if defined(GGML_USE_HIP)
         dim3 dgrid((out + 2) / 3, n_expert_used * n_tokens, 1);
 #define MIX3_DEDUP_LAUNCH(T) \
