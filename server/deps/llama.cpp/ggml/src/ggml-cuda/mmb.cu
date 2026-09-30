@@ -354,7 +354,7 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
     load_regs(0); store_lds(); __syncthreads();
     for (int ks = 0; ks < nks; ++ks) {
         if (ks + 1 < nks) load_regs(ks + 1);
-#pragma unroll 1   // unrolled k16 steps and epilogue pushed this kernel to 256 VGPRs with spills (E424)
+#pragma unroll 1   // unrolled k16 steps and epilogue pushed this kernel to 256 VGPRs with spills
         for (int kk = 0; kk < MMB_BK; kk += 16) {
             v16s a[HC], b[TN]; const int r = lane & 15;
 #pragma unroll
@@ -813,7 +813,7 @@ bool mmb_tall()    { return mmb_tall_mode() != 0; }
 bool mmb_gatemix_flag() { return true; }
 bool mmb_down16_flag() { return true; }
 bool mmb_glu()     { return true; }
-// Default on, =0 kill switches (quality-gated E412/E413):
+// Default on, =0 kill switches (long-prompt quality gate on UD-Q4_K_XL and IQ4_NL):
 // LUCE_MMB_Q8F16: Q8_0 dense GEMMs take the F16 WMMA kernel (mmb-q8f16.cuh) instead of the bf16 tile.
 // LUCE_MMB_SMALL_M: F32/bf16 dense GEMMs with small M (HC inject, alpha/beta) take the bandwidth kernel (mmb-small-m.cuh).
 static bool mmb_env_on(const char * name) { const char * e = getenv(name); return !(e && atoi(e) == 0); }

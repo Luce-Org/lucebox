@@ -3781,7 +3781,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 #if defined(GGML_USE_HIP)
 // hc_combine_norm emits Q8 tiles of a bf16-only xn that feeds a Q8_0 GEMM, and that HC down projection runs W8A8 on
-// int8 WMMA (quality-gated E413, -32 ms/chunk E415). Default on; LUCE_MMB_HCDOWN_I8=0 is the kill switch.
+// int8 WMMA (long-prompt quality gate; ~32 ms less per 2048-token UD chunk). Default on; LUCE_MMB_HCDOWN_I8=0 is the kill switch.
 static bool hcdown_i8() { static const bool on = !(getenv("LUCE_MMB_HCDOWN_I8") && atoi(getenv("LUCE_MMB_HCDOWN_I8")) == 0); return on; }
 #endif
 
@@ -5077,7 +5077,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     }
 
     // ROPE (multi-section, F32) -> PERMUTE -> CONT: the rope writes its rows straight into the CONT layout (qwen4exp Q
-    // for flash attention, E429). Addresses change, values do not. Off under QWEN4EXP_UPSTREAM (reference graph).
+    // for flash attention). Addresses change, values do not. Off under QWEN4EXP_UPSTREAM (reference graph).
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ROPE && ops.begin()[1] == GGML_OP_PERMUTE && ops.begin()[2] == GGML_OP_CONT &&
         ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
         static const bool upstream = getenv("QWEN4EXP_UPSTREAM") && atoi(getenv("QWEN4EXP_UPSTREAM")) != 0;
@@ -6377,7 +6377,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         // The routed down rows feeding a MoE-mode HC combine (the qwen4exp MoE fold, QWEN4EXP_F16) are written as F16
-        // in place and read by that combine only (quality-gated E413).
+        // in place and read by that combine only (covered by the long-prompt quality gate).
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * cn = cgraph->nodes[i];
             if (cn->op != GGML_OP_HC_COMBINE_NORM || ggml_get_op_params_i32(cn, 5) != 1) continue;

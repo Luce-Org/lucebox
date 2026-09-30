@@ -340,7 +340,7 @@ static __global__ void rope_multi(const T *            x,
 
 // rope_multi with one block per (token, sample) and one thread per rotation pair: the angle is computed once and
 // applied to every head (rope_multi recomputes it per head in one 256-thread block per row, half of them idle).
-// dst strides are free, so a following PERMUTE + CONT is written directly (E429). Same per-element math.
+// dst strides are free, so a following PERMUTE + CONT is written directly. Same per-element math.
 template <bool forward, bool has_ff, typename T>
 static __global__ void rope_multi_heads(const T * x, T * dst, const int ne00, const int ne01, const int ne02,
         const int s01, const int s02, const int s03, const int s1, const int s2, const int s3, const int n_dims,
@@ -367,7 +367,7 @@ static __global__ void rope_multi_heads(const T * x, T * dst, const int ne00, co
             const float x0 = x[ix + 0];
             const float x1 = x[ix + n_dims/2];
 
-            // Explicit form of the contraction the compiler picks for rope_multi's two lines (bit-identical, E429).
+            // Explicit form of the contraction the compiler picks for rope_multi's two lines (bit-identical).
             dst[idst + 0]        = __builtin_fmaf(x0, cos_theta, -__fmul_rn(x1, sin_theta));
             dst[idst + n_dims/2] = __builtin_fmaf(x1, cos_theta, __fmul_rn(x0, sin_theta));
         }

@@ -1502,7 +1502,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         dump_mark(cur, dlab);
         const bool next_ple = (il + 1 < w.n_layer) && w.layers[il + 1].is_ple && has_ple;
         // Prefill: the MoE combine runs inside the next HC_COMBINE_NORM (one kernel fewer; last-bit numerics change
-        // from FMA contraction in the new kernel, quality-gated E413). Not at T=1: it cost ~1.7% decode (E414).
+        // from FMA contraction in the new kernel, covered by the long-prompt quality gate). Not at T=1: it cost ~1.7% decode.
         static const bool moe_unfused = getenv("QWEN4EXP_MOE_UNFUSED") != nullptr;
         Qwen4ExpMoeParts moe_parts;
         const bool fold = f16_paths() && !moe_unfused && hc_fused && !next_ple && ggml_backend_cuda_mmb_prefill(layer_T);
