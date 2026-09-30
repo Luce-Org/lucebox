@@ -9203,6 +9203,71 @@ struct ggml_tensor * ggml_ds4_moe_owner_split(
     return result;
 }
 
+struct ggml_tensor * ggml_ds4_moe_protected_routes(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * biased,
+        struct ggml_tensor  * native,
+        struct ggml_tensor  * protected_mask) {
+    GGML_ASSERT(biased->type == GGML_TYPE_I32 && native->type == GGML_TYPE_I32);
+    GGML_ASSERT(protected_mask->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_are_same_shape(biased, native));
+    GGML_ASSERT(biased->ne[2] == 1 && biased->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(protected_mask));
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, biased->ne[0], biased->ne[1]);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = biased;
+    result->src[1] = native;
+    result->src[2] = protected_mask;
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_PROTECTED_ROUTES);
+    return result;
+}
+
+static void ggml_host_mailbox_set_ptr(struct ggml_tensor * t, int word, const void * ptr) {
+    memcpy(&t->op_params[word], &ptr, sizeof(ptr));
+}
+
+struct ggml_tensor * ggml_host_mailbox_post(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * src,
+        const uint32_t      * step,
+        uint32_t            * flag,
+        void                * payload) {
+    GGML_ASSERT(src && ggml_is_contiguous(src));
+    GGML_ASSERT(ggml_nbytes(src) % sizeof(uint32_t) == 0);
+    GGML_ASSERT(step && flag && payload);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = src;
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_HOST_POST);
+    ggml_host_mailbox_set_ptr(result, GGML_MOE_FUSED_HOST_STEP_WORD, step);
+    ggml_host_mailbox_set_ptr(result, GGML_MOE_FUSED_HOST_FLAG_WORD, flag);
+    ggml_host_mailbox_set_ptr(result, GGML_MOE_FUSED_HOST_PAYLOAD_WORD, payload);
+    return result;
+}
+
+struct ggml_tensor * ggml_host_mailbox_wait(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * after,
+        enum ggml_type        type,
+        int64_t               ne0,
+        int64_t               ne1,
+        int64_t               ne2,
+        const uint32_t      * step,
+        const uint32_t      * flag,
+        const void          * payload) {
+    GGML_ASSERT(after);
+    GGML_ASSERT(step && flag && payload);
+    GGML_ASSERT(ggml_type_size(type) % sizeof(uint32_t) == 0 && ggml_blck_size(type) == 1);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, type, ne0, ne1, ne2);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = after;
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_HOST_WAIT);
+    ggml_host_mailbox_set_ptr(result, GGML_MOE_FUSED_HOST_STEP_WORD, step);
+    ggml_host_mailbox_set_ptr(result, GGML_MOE_FUSED_HOST_FLAG_WORD, flag);
+    ggml_host_mailbox_set_ptr(result, GGML_MOE_FUSED_HOST_PAYLOAD_WORD, payload);
+    return result;
+}
+
 struct ggml_tensor * ggml_ds4_moe_align_ids(
         struct ggml_context * ctx,
         struct ggml_tensor  * expert_ids) {
@@ -9480,6 +9545,14 @@ struct ggml_tensor * ggml_ds4_indexer_qat(
     struct ggml_tensor * result = ggml_dup_tensor(ctx, input);
     result->op = GGML_OP_DS4_INDEXER_QAT;
     result->src[0] = input;
+    return result;
+}
+
+struct ggml_tensor * ggml_ds4_indexer_qat_plain(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * input) {
+    struct ggml_tensor * result = ggml_ds4_indexer_qat(ctx, input);
+    ggml_set_op_params_i32(result, 0, 1);   // skip the Hadamard rotation
     return result;
 }
 

@@ -1,4 +1,7 @@
 #include "moe-fused.cuh"
+
+#include <cstdio>
+#include <thread>
 #include "ggml-cuda/vecdotq.cuh"
 #include "ggml-cuda/dequantize.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -431,6 +434,96 @@ static __global__ void ds4_peer_copy_f32_kernel(
     }
 }
 
+static __global__ void ds4_protected_routes_kernel(
+        const int32_t * biased, int64_t biased_ld,
+        const int32_t * native, int64_t native_ld,
+        const int32_t * protected_mask, int n_expert,
+        int32_t * dst, int k) {
+    const int t = blockIdx.x;
+    const int32_t * nat = native + (int64_t) t * native_ld;
+    bool keep_native = false;
+    for (int i = 0; i < k; ++i) {
+        const int32_t e = nat[i];
+        keep_native |= e >= 0 && e < n_expert && protected_mask[e] != 0;
+    }
+    const int32_t * src = keep_native ? nat : biased + (int64_t) t * biased_ld;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) dst[(int64_t) t * k + i] = src[i];
+}
+
+// Host mailbox. The words live in host-mapped, coherent memory, so every
+// access that orders the exchange uses system scope.
+static __device__ __forceinline__ uint32_t host_mailbox_load(const uint32_t * p) {
+#if defined(GGML_USE_HIP)
+    return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    const uint32_t v = *(const volatile uint32_t *) p;
+    __threadfence_system();
+    return v;
+#endif
+}
+
+static __device__ __forceinline__ void host_mailbox_store(uint32_t * p, uint32_t v) {
+#if defined(GGML_USE_HIP)
+    __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    __threadfence_system();
+    *(volatile uint32_t *) p = v;
+#endif
+}
+
+static __global__ void host_mailbox_post_kernel(
+        const uint32_t * __restrict__ src, int64_t n_words,
+        const uint32_t * step, uint32_t * flag, uint32_t * payload,
+        int32_t * dst) {
+    for (int64_t i = threadIdx.x; i < n_words; i += blockDim.x) {
+        ((volatile uint32_t *) payload)[i] = src[i];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        const uint32_t s = host_mailbox_load(step);
+        host_mailbox_store(flag, s);
+        dst[0] = (int32_t) s;
+    }
+}
+
+// Copies the host's answer once it is published (HIP: after a stream wait).
+static __global__ void host_mailbox_copy_kernel(
+        const uint32_t * payload, uint32_t * __restrict__ dst, int64_t n_words) {
+    for (int64_t i = threadIdx.x; i < n_words; i += blockDim.x) {
+        dst[i] = ((const volatile uint32_t *) payload)[i];
+    }
+}
+
+#if !defined(GGML_USE_HIP)
+// Waits for the host's answer to this step. The bound only turns a lost
+// answer (a host-side bug) into wrong output instead of a hung device.
+static __global__ void host_mailbox_wait_kernel(
+        const uint32_t * step, const uint32_t * flag,
+        const uint32_t * payload, uint32_t * __restrict__ dst, int64_t n_words) {
+    if (threadIdx.x == 0) {
+        const uint32_t s = host_mailbox_load(step);
+        for (uint64_t spin = 0; host_mailbox_load(flag) != s && spin < (1ull << 32); ++spin) {
+#if defined(GGML_USE_HIP)
+            __builtin_amdgcn_s_sleep(2);
+#endif
+        }
+    }
+    __syncthreads();
+    for (int64_t i = threadIdx.x; i < n_words; i += blockDim.x) {
+        dst[i] = ((const volatile uint32_t *) payload)[i];
+    }
+}
+#endif // !defined(GGML_USE_HIP)
+
+template <typename T>
+static T host_mailbox_ptr(const ggml_tensor * t, int word) {
+    T ptr = nullptr;
+    memcpy(&ptr, &t->op_params[word], sizeof(ptr));
+    GGML_ASSERT(ptr);
+    return ptr;
+}
+
 // Align equal owner-local expert IDs across q-token warps.  The high 16 bits
 // of every valid output encode the original route slot; invalid entries use
 // the sign bit plus the original slot.  The dedicated MoE MMVQ kernel decodes
@@ -801,6 +894,56 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             (const float *) candidate_lut->data,
             (int32_t *) dst->data,
             n_routes, n_tokens, n_expert, main_quota, main_owner);
+        return;
+    }
+    if (mode == GGML_MOE_FUSED_PROTECTED_ROUTES) {
+        const ggml_tensor * biased = dst->src[0];
+        const ggml_tensor * native = dst->src[1];
+        const ggml_tensor * mask = dst->src[2];
+        GGML_ASSERT(biased->nb[0] == sizeof(int32_t) && native->nb[0] == sizeof(int32_t));
+        GGML_ASSERT(ggml_is_contiguous(dst));
+        const int k = (int) dst->ne[0];
+        ds4_protected_routes_kernel<<<(int) dst->ne[1], 32, 0, ctx.stream()>>>(
+            (const int32_t *) biased->data, (int64_t) (biased->nb[1] / sizeof(int32_t)),
+            (const int32_t *) native->data, (int64_t) (native->nb[1] / sizeof(int32_t)),
+            (const int32_t *) mask->data, (int) ggml_nelements(mask),
+            (int32_t *) dst->data, k);
+        return;
+    }
+    if (mode == GGML_MOE_FUSED_HOST_POST || mode == GGML_MOE_FUSED_HOST_WAIT) {
+        const auto * step = host_mailbox_ptr<const uint32_t *>(dst, GGML_MOE_FUSED_HOST_STEP_WORD);
+        auto * flag = host_mailbox_ptr<uint32_t *>(dst, GGML_MOE_FUSED_HOST_FLAG_WORD);
+        auto * payload = host_mailbox_ptr<uint32_t *>(dst, GGML_MOE_FUSED_HOST_PAYLOAD_WORD);
+        if (mode == GGML_MOE_FUSED_HOST_POST) {
+            const ggml_tensor * src = dst->src[0];
+            GGML_ASSERT(src && ggml_is_contiguous(src) && dst->type == GGML_TYPE_I32);
+            host_mailbox_post_kernel<<<1, 256, 0, ctx.stream()>>>(
+                (const uint32_t *) src->data, (int64_t) (ggml_nbytes(src) / sizeof(uint32_t)),
+                step, flag, payload, (int32_t *) dst->data);
+        } else {
+            GGML_ASSERT(ggml_is_contiguous(dst));
+#if defined(GGML_USE_HIP)
+            // The wait runs on the host: a device wave waiting for the host
+            // would hold its queue, and without compute wave save/restore
+            // (amdgpu cwsr_enable=0, the Lucebox setting) a queue that cannot
+            // be evicted ends in an MES timeout and a GPU reset. The resolver
+            // answers once the device has run the post enqueued before this
+            // wait; only this thread waits, and the device keeps running what
+            // is already queued. The step is read at launch, which keeps
+            // these graphs eager.
+            const uint32_t s = *(const volatile uint32_t *) step;
+            for (uint32_t spin = 0; __atomic_load_n(flag, __ATOMIC_ACQUIRE) != s;) {
+                if (spin < 1024) ++spin;
+                else std::this_thread::yield();
+            }
+            host_mailbox_copy_kernel<<<1, 256, 0, ctx.stream()>>>(
+                payload, (uint32_t *) dst->data, (int64_t) (ggml_nbytes(dst) / sizeof(uint32_t)));
+#else
+            host_mailbox_wait_kernel<<<1, 256, 0, ctx.stream()>>>(
+                step, flag, payload, (uint32_t *) dst->data,
+                (int64_t) (ggml_nbytes(dst) / sizeof(uint32_t)));
+#endif
+        }
         return;
     }
     if (mode == GGML_MOE_FUSED_ALIGN_IDS) {

@@ -46,6 +46,7 @@ Untagged variables are operational tuning knobs.
 | `LUCE_MAX_CONTEXT` | KV sizing override for laguna and qwen35moe expert placement. |
 | `LUCE_DEFAULT_MAX_TOKENS` | Default generation token cap. |
 | `LUCE_IGNORE_EOS` | Ignore EOS token during generation. |
+| `LUCE_NO_PREAD` | 🔀 **kill-switch** Every model loader copies its weights out of the file mapping instead of using `tensor_file_reader`'s threaded reads (which bypass the page cache for a file larger than half the available memory). |
 | `LUCE_LAZY` | Container entrypoint: `1` adds `--lazy-draft` (needs a draft and `LUCE_PREFILL_DRAFTER`). |
 
 ## GPU / backend placement
@@ -216,7 +217,6 @@ Untagged variables are operational tuning knobs.
 | `LUCE_DS4_MOE_TP` / `LUCE_DS4_MOE_TP_INPROC` / `LUCE_DS4_MOE_TP_GPU` | Burn-in controls for in-process route-owner expert parallelism and the cold-owner HIP device. |
 | `LUCE_DS4_HOTNESS_CSV` | Optional per-layer expert routing profile for hot placement. |
 | `LUCE_MOE_COLD_BACKEND` | Cold-expert compute backend. |
-| `LUCE_NO_PREAD` | Disable pread-based weight loading. |
 
 ## MoE expert compute / IPC
 

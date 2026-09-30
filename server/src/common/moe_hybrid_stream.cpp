@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -27,7 +28,8 @@ MoeHybridStreamEngine::MoeHybridStreamEngine(MoeHybridStreamEngine && o) noexcep
       scratch_gate_(o.scratch_gate_), scratch_up_(o.scratch_up_),
       scratch_down_(o.scratch_down_),
       last_gate_bytes_(o.last_gate_bytes_), last_up_bytes_(o.last_up_bytes_),
-      last_down_bytes_(o.last_down_bytes_) {
+      last_down_bytes_(o.last_down_bytes_), stats_(o.stats_) {
+    o.stats_ = {};
     o.pinned_buf_ = nullptr; o.pinned_size_ = 0;
     o.gpu_scratch_ = nullptr; o.scratch_size_ = 0;
     o.backend_ = nullptr;
@@ -45,6 +47,7 @@ MoeHybridStreamEngine & MoeHybridStreamEngine::operator=(MoeHybridStreamEngine &
         scratch_down_ = o.scratch_down_;
         last_gate_bytes_ = o.last_gate_bytes_; last_up_bytes_ = o.last_up_bytes_;
         last_down_bytes_ = o.last_down_bytes_;
+        stats_ = o.stats_; o.stats_ = {};
         o.pinned_buf_ = nullptr; o.pinned_size_ = 0;
         o.gpu_scratch_ = nullptr; o.scratch_size_ = 0;
         o.backend_ = nullptr;
@@ -54,6 +57,16 @@ MoeHybridStreamEngine & MoeHybridStreamEngine::operator=(MoeHybridStreamEngine &
     return *this;
 }
 
+// Slack after every staged matrix. The streaming eval hands this scratch to
+// tensors owned by a graph allocator, and ggml-cuda's quantized matvec zeroes
+// the row padding it expects after a quantized matrix whose width is not a
+// multiple of MATRIX_ROW_PADDING (512 elements), for example the 2304-wide
+// down experts of DeepSeek V4.1. Without slack that write lands in the next
+// staged matrix or past the buffer. 4 KiB covers the padding of every
+// quantized type.
+static constexpr size_t kRegionPad = 4096;
+static constexpr size_t kRegions   = 3;   // gate, up, down (or gate_up, down)
+
 bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend, size_t max_expert_bytes,
                                  std::string * err) {
     destroy();
@@ -61,17 +74,20 @@ bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend, size_t max_expert_b
         if (err) *err = "invalid arguments to stream engine init";
         return false;
     }
+    const size_t alloc_bytes = max_expert_bytes + kRegions * kRegionPad;
 
-    // Allocate pinned host staging buffer
-    cudaError_t cuda_err = cudaMallocHost(&pinned_buf_, max_expert_bytes);
+    // Allocate pinned host staging buffer (zeroed once: the pad bytes travel
+    // to the GPU with every expert and must decode to nothing)
+    cudaError_t cuda_err = cudaMallocHost(&pinned_buf_, alloc_bytes);
     if (cuda_err != cudaSuccess) {
         if (err) *err = std::string("cudaMallocHost failed: ") + cudaGetErrorString(cuda_err);
         return false;
     }
-    pinned_size_ = max_expert_bytes;
+    std::memset(pinned_buf_, 0, alloc_bytes);
+    pinned_size_ = alloc_bytes;
 
     // Allocate GPU scratch buffer
-    cuda_err = cudaMalloc(&gpu_scratch_, max_expert_bytes);
+    cuda_err = cudaMalloc(&gpu_scratch_, alloc_bytes);
     if (cuda_err != cudaSuccess) {
         if (err) *err = std::string("cudaMalloc scratch failed: ") + cudaGetErrorString(cuda_err);
         cudaFreeHost(pinned_buf_);
@@ -79,7 +95,7 @@ bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend, size_t max_expert_b
         pinned_size_ = 0;
         return false;
     }
-    scratch_size_ = max_expert_bytes;
+    scratch_size_ = alloc_bytes;
     backend_ = gpu_backend;
     return true;
 }
@@ -170,6 +186,7 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
 
     const auto * file_base = static_cast<const uint8_t *>(mmap_data);
     size_t staging_offset = 0;
+    const auto read_t0 = std::chrono::steady_clock::now();
 
     // Validate expert_id against region size
     if (expert_id < 0) {
@@ -189,7 +206,7 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
                     file_base + file_off, bytes);
         last_gate_bytes_ = bytes;
         last_up_bytes_ = 0;
-        staging_offset += bytes;
+        staging_offset += bytes + kRegionPad;
     } else {
         // gate
         {
@@ -202,7 +219,7 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
             std::memcpy(static_cast<uint8_t *>(pinned_buf_) + staging_offset,
                         file_base + file_off, bytes);
             last_gate_bytes_ = bytes;
-            staging_offset += bytes;
+            staging_offset += bytes + kRegionPad;
         }
         // up
         {
@@ -215,7 +232,7 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
             std::memcpy(static_cast<uint8_t *>(pinned_buf_) + staging_offset,
                         file_base + file_off, bytes);
             last_up_bytes_ = bytes;
-            staging_offset += bytes;
+            staging_offset += bytes + kRegionPad;
         }
     }
 
@@ -230,7 +247,7 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
         std::memcpy(static_cast<uint8_t *>(pinned_buf_) + staging_offset,
                     file_base + file_off, bytes);
         last_down_bytes_ = bytes;
-        staging_offset += bytes;
+        staging_offset += bytes + kRegionPad;
     }
 
     if (staging_offset > scratch_size_) {
@@ -239,25 +256,34 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
     }
 
     // DMA pinned → GPU scratch (synchronous for now; async pipeline in eval function)
+    const auto upload_t0 = std::chrono::steady_clock::now();
     cudaError_t cuda_err = cudaMemcpy(gpu_scratch_, pinned_buf_, staging_offset,
                                       cudaMemcpyHostToDevice);
     if (cuda_err != cudaSuccess) {
         if (err) *err = std::string("cudaMemcpy H2D failed: ") + cudaGetErrorString(cuda_err);
         return false;
     }
+    const auto upload_t1 = std::chrono::steady_clock::now();
+    auto us = [](auto a, auto b) {
+        return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
+    stats_.experts += 1;
+    stats_.bytes += staging_offset;
+    stats_.read_us += us(read_t0, upload_t0);
+    stats_.upload_us += us(upload_t0, upload_t1);
 
     // Set pointers into scratch
     auto * scratch_bytes = static_cast<uint8_t *>(gpu_scratch_);
     size_t off = 0;
     if (regions.fused_gate_up) {
         scratch_gate_ = scratch_bytes + off;
-        off += last_gate_bytes_;
+        off += last_gate_bytes_ + kRegionPad;
         scratch_up_ = nullptr;
     } else {
         scratch_gate_ = scratch_bytes + off;
-        off += last_gate_bytes_;
+        off += last_gate_bytes_ + kRegionPad;
         scratch_up_ = scratch_bytes + off;
-        off += last_up_bytes_;
+        off += last_up_bytes_ + kRegionPad;
     }
     scratch_down_ = scratch_bytes + off;
 
@@ -302,7 +328,7 @@ bool eval_moe_cold_experts_streaming(
     for (int i = 0; i < total_slots; ++i) {
         const int32_t gid = selected_ids[i];
         if (gid < 0 || gid >= cfg.n_expert) continue;
-        if (storage.hot_local_by_global[(size_t)gid] < 0) {
+        if (storage.is_streamed(gid)) {
             cold_needed[(size_t)gid] = true;
         }
     }
@@ -324,6 +350,14 @@ bool eval_moe_cold_experts_streaming(
         if (!engine.stream_expert_sync(mmap_data, mmap_size, regions, cold_eid, gpu_backend, err)) {
             return false;
         }
+        struct ComputeTimer {
+            MoeHybridStreamEngine & engine;
+            std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+            ~ComputeTimer() {
+                engine.add_compute_us((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t0).count());
+            }
+        } compute_timer{engine};
 
         // Gather all tokens that selected this expert
         struct TokenHit { int ti; float weight; };

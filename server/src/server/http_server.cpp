@@ -21,6 +21,7 @@
 #include "engine/luce_engine.h"
 #include "admission.h"
 #include "common/concurrency/seq_engine.h"
+#include "common/model_capabilities.h"
 #include "response_error.h"
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
@@ -740,10 +741,10 @@ json build_props_body(const ServerConfig & config,
                       const ToolMemory & tool_memory) {
     // arch-gated capabilities (mirrors Python _capabilities()).
     const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
-    const bool is_deepseek4 = (config.arch == "deepseek4");
+    const bool is_deepseek4 = (arch_is_deepseek4_family(config.arch));
     const bool reasoning_supported = is_qwen || is_deepseek4;
     const bool speculative_supported = is_qwen;
-    const bool tools_supported = is_qwen || config.arch == "deepseek4";
+    const bool tools_supported = is_qwen || arch_is_deepseek4_family(config.arch);
 
     auto pcs  = prefix_cache.stats();
     auto pcfs = prefix_cache.full_stats();
@@ -2208,11 +2209,11 @@ void apply_request_reasoning(
             normalized_effort = "low";
         } else if (effort == "medium") {
             tier_value = config.effort_tiers.medium;
-            normalized_effort = config.arch == "deepseek4" ? "high" : "medium";
+            normalized_effort = arch_is_deepseek4_family(config.arch) ? "high" : "medium";
         } else if (effort == "xhigh") {
             // DeepSeek V4 Flash's OpenAI-compatible APIs map xhigh to high.
             // Other architectures retain Lucebox's x-high tier alias.
-            if (config.arch == "deepseek4") {
+            if (arch_is_deepseek4_family(config.arch)) {
                 tier_value = config.effort_tiers.high;
                 normalized_effort = "high";
             } else {
@@ -2222,7 +2223,7 @@ void apply_request_reasoning(
         } else if (effort == "x-high") {
             // Hyphenated x-high is Lucebox's explicit five-tier extension.
             tier_value = config.effort_tiers.x_high;
-            normalized_effort = config.arch == "deepseek4" ? "max" : "x-high";
+            normalized_effort = arch_is_deepseek4_family(config.arch) ? "max" : "x-high";
         } else if (effort == "max") {
             tier_value = config.effort_tiers.max;
             normalized_effort = "max";
@@ -2283,7 +2284,7 @@ void apply_request_reasoning(
     // DeepSeek uses high whenever thinking is enabled without an explicit
     // model-facing effort. Only API-style thinking.type="enabled" also selects
     // the high budget tier; bare template toggles affect rendering alone.
-    if (enable_thinking && config.arch == "deepseek4" &&
+    if (enable_thinking && arch_is_deepseek4_family(config.arch) &&
         normalized_effort.empty()) {
         normalized_effort = "high";
         if (req.thinking_opt_in) {
@@ -2602,6 +2603,21 @@ namespace {
 
 // Disk-cache staging lives above both PrefixCache pools.
 constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
+
+// Every position a later request may restore `prompt`'s prefix from: its chat
+// boundaries plus the extra cuts a cache may take (a PPP pin, a fixed disk
+// scope). See GenerateRequest::restore_points.
+std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
+                                       const ChatMarkers & markers,
+                                       std::initializer_list<int> cuts) {
+    std::vector<int> points = find_all_boundaries(prompt, markers);
+    for (int cut : cuts) {
+        if (cut > 0 && cut < (int) prompt.size()) points.push_back(cut);
+    }
+    std::sort(points.begin(), points.end());
+    points.erase(std::unique(points.begin(), points.end()), points.end());
+    return points;
+}
 
 struct CompletionTokenCounts {
     int total = 0;
@@ -3720,6 +3736,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         scoped_request.n_gen = 0;
         scoped_request.snap_slot = kDiskStagingSlot;
         scoped_request.snap_pos = selected_boundary;
+        scoped_request.restore_points = prefix_restore_points(
+            scoped_request.prompt, prefix_cache_.chat_markers(), {forced_cut});
         DaemonIO scoped_io;
         scoped_io.stream_fd = -1;
         const auto scoped_result =
@@ -3803,6 +3821,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             cold_request.n_gen = 0;
             cold_request.snap_slot = kDiskStagingSlot;
             cold_request.snap_pos = cold_boundary;
+            cold_request.restore_points = prefix_restore_points(
+                cold_request.prompt, prefix_cache_.chat_markers(), {forced_cut});
             DaemonIO cold_io;
             cold_io.stream_fd = -1;
             const auto cold_result = backend_.generate(cold_request, cold_io);
@@ -3912,6 +3932,12 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         cache.disk_hit ? "true" : "false",
         cache.snap_slot, cache.snap_cut,
         cache.full_snap_slot, cache.full_snap_pos);
+
+    if (!prefix_cache_.disabled() || !disk_cache_.disabled()) {
+        generate_request.restore_points = prefix_restore_points(
+            effective_prompt, prefix_cache_.chat_markers(),
+            {forced_cut, selected_boundary});
+    }
 
     status_.set_flags(
         cache.using_restore, prepared.compressed,

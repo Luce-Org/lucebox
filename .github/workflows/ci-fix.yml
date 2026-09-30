@@ -1,0 +1,78 @@
+name: CI fix
+
+# When a run of a workflow below fails, asks the CI fix bot to diagnose it. The
+# bot comments the diagnosis and a proposed fix on the pull request (or on the
+# commit, for main), with a patch when the cause is in the code. It only
+# comments: it never commits, pushes or merges. Reply with `/ci-fix <feedback>`
+# on the pull request to get a revised diagnosis. The `no-ci-fix` label stops
+# automatic diagnoses on a pull request; an explicit /ci-fix is still answered.
+#
+# This workflow only forwards ids; it checks out and runs nothing. The bot
+# re-checks every request, including the commenter's write access.
+# workflow_run and issue_comment always run this file from the default branch.
+#
+# workflow_run needs workflow names, so add new workflows to the list. The bot
+# dispatchers (Compact commits and this one) stay out of it.
+
+on:
+  workflow_run:
+    workflows: [CI, Commit style, Docker prebuilds, Speed Profile]
+    types: [completed]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  dispatch-run:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Hand the failed run to the CI fix bot
+        env:
+          GH_TOKEN: ${{ secrets.LUCEBOX_BOTS_DISPATCH_TOKEN }}
+          BOT_REPO: ${{ secrets.LUCEBOX_BOTS_DISPATCH_REPO }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW: ${{ github.event.workflow_run.name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ] || [ -z "$BOT_REPO" ]; then
+            echo "::error::LUCEBOX_BOTS_DISPATCH_TOKEN or LUCEBOX_BOTS_DISPATCH_REPO is not set"
+            exit 1
+          fi
+          gh api "repos/$BOT_REPO/dispatches" \
+            -f event_type=ci-fix \
+            -f "client_payload[repository]=$REPO" \
+            -F "client_payload[run_id]=$RUN_ID" >/dev/null
+          echo "Sent the failed $WORKFLOW run $RUN_ID to the CI fix bot." >> "$GITHUB_STEP_SUMMARY"
+
+  dispatch-reply:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/ci-fix') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Hand the reply to the CI fix bot
+        env:
+          GH_TOKEN: ${{ secrets.LUCEBOX_BOTS_DISPATCH_TOKEN }}
+          BOT_REPO: ${{ secrets.LUCEBOX_BOTS_DISPATCH_REPO }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ] || [ -z "$BOT_REPO" ]; then
+            echo "::error::LUCEBOX_BOTS_DISPATCH_TOKEN or LUCEBOX_BOTS_DISPATCH_REPO is not set"
+            exit 1
+          fi
+          gh api "repos/$BOT_REPO/dispatches" \
+            -f event_type=ci-fix \
+            -f "client_payload[repository]=$REPO" \
+            -F "client_payload[pr]=$PR" \
+            -F "client_payload[comment_id]=$COMMENT_ID" >/dev/null
+          echo "Sent the /ci-fix reply on #$PR to the CI fix bot." >> "$GITHUB_STEP_SUMMARY"

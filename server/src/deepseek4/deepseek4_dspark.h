@@ -2,7 +2,11 @@
 //
 // The DSpark drafter is a small (n_layer≈3) DeepSeek-V4 block stack stored under
 // the checkpoint's mtp.* namespace and converted to a GGUF with arch
-// "deepseek4-dflash-draft" (see scripts/convert_ds4_dspark_draft_to_gguf.py).
+// "deepseek4-dflash-draft" (V4 Flash) or "deepseek41-dflash-draft" (V4.1
+// Flash, see scripts/convert_ds4_dspark_draft_to_gguf.py). The V4.1 block
+// follows the target's V4.1 rules (staggered hyper-connection pre-mix, no
+// per-head query norm, no output_hc_* head collapse) and captures the
+// residual entering target layers 37-39.
 //
 // Reference forward: deepseek-ai/DeepSeek-V4-Flash-DSpark inference/model.py
 // (DSparkBlock / DSparkAttention / DSparkMarkovHead / DSparkConfidenceHead,
@@ -68,6 +72,11 @@ struct DSparkDrafter {
     int mask_token_id   = 128799;
     bool dspark_enabled  = false;
     bool head_hc_enabled = false;
+    // Attend with the DS4 D=512 flash kernel instead of BLAS products (HIP).
+    // It is faster, and a drafter on a second GPU needs it: rocBLAS looks
+    // its Tensile kernels up by name across devices, so a GEMM on a second
+    // architecture makes the target GPU's next GEMM of that name fail.
+    bool flash_attention = false;
     std::vector<int> capture_layer_ids;  // [40,41,42]
 };
 
@@ -177,7 +186,8 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
                                      MoeExpertComputeRuntime * expert_runtime = nullptr,
                                      MoeHybridRoutingStats * routing_stats = nullptr,
                                      DeepSeek4SpecBoundaryCheckpoint *
-                                         boundary_checkpoint_out = nullptr);
+                                         boundary_checkpoint_out = nullptr,
+                                     Ds4VerifyWindowRows * window_rows = nullptr);
 
 // Minimal speculative-decode rollback state. Rejected positions must restore
 // the physical SWA rows they overwrote after the ring wraps; otherwise a later

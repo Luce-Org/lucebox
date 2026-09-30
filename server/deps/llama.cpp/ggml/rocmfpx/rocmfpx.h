@@ -76,6 +76,11 @@ _Static_assert(sizeof(block_rocmfp8) == QS_ROCMFP8 + sizeof(uint8_t), "wrong roc
 
 GGML_API float  rocmfpx_ue4m3_to_fp32(uint8_t e);
 GGML_API bool   rocmfpx_scale_is_valid(uint8_t e);
+// Q2_0_ROCMFP2 half-block scale. Bit 7 of the scale byte, which UE4M3 never
+// sets, negates that half-block's codebook ({1, 0, -1, -2} x scale instead of
+// {-1, 0, 1, 2} x scale); the low seven bits are the UE4M3 scale. Blocks that
+// never set the bit decode as before. Not used by the ROCMFP2_AFFINE layout.
+GGML_API float  rocmfpx_fp2_half_scale_to_fp32(uint8_t e);
 GGML_API size_t rocmfpx_row_size_fp2(int64_t k);
 GGML_API size_t rocmfpx_row_size_fp3(int64_t k);
 GGML_API size_t rocmfpx_row_size_fp6(int64_t k);

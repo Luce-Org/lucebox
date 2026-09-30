@@ -44,8 +44,36 @@ TEST_CASE(DeepSeek4PagedCacheFixture, allocation_plan) {
     CHECK(twice.raw_bytes == p.raw_bytes * 2 && twice.state_bytes == p.state_bytes * 2);
     CHECK(!plan_deepseek4_paged_cache(512, 128, 1, 4096, 40, {4, 16}, twice));
     CHECK(!plan_deepseek4_paged_cache(512, 128, 1, 4096,
-          std::numeric_limits<uint32_t>::max(), {4}, twice));
+          std::numeric_limits<uint32_t>::max(), std::vector<uint32_t>{4}, twice));
 
+}
+
+TEST_CASE(DeepSeek4PagedCacheFixture, shared_compressed_cache_geometry) {
+    // V4.1: a ratio-2 kv/index source pools one window of two rows at 1x
+    // width and writes index keys without indexer state; its readers own only
+    // the raw ring; a ratio-1 source emits one row per token with no state.
+    const auto src2 = deepseek4_layer_geometry_from_ratio(2, 512, 128, 128, true, true);
+    CHECK(src2.has_comp && src2.has_comp_state() && src2.has_index && !src2.has_index_state());
+    CHECK(src2.comp_width == 512 && src2.comp_state_rows == 2 && src2.index_dim == 128);
+    const auto reader = deepseek4_layer_geometry_from_ratio(2, 512, 128, 128, false, true);
+    CHECK(!reader.has_comp && !reader.has_index && reader.comp_capacity(4096) == 0);
+    const auto src1 = deepseek4_layer_geometry_from_ratio(1, 512, 128, 128, true, false);
+    CHECK(src1.has_comp && !src1.has_comp_state() && !src1.has_index);
+    CHECK(src1.comp_capacity(4096) == 4096 + 16);
+    // V4 layers keep their shapes: ratio 4 carries the double-width state and
+    // the indexer compressor, ratio 128 one window at 1x width.
+    const auto v4 = deepseek4_layer_geometry_from_ratio(4, 512, 128, 128, true, true);
+    CHECK(v4.comp_width == 1024 && v4.comp_state_rows == 8);
+    CHECK(v4.index_state_width == 256 && v4.index_state_rows == 8);
+
+    DeepSeek4PagedCachePlan p;
+    CHECK(plan_deepseek4_paged_cache(512, 128, 2, 4096, 40,
+          std::vector<DeepSeek4LayerGeometry>{src2, reader, src1}, p));
+    CHECK(p.physical_rows[0] == 40 * 64 && p.physical_rows[1] == 0 &&
+          p.physical_rows[2] == 40 * 128);
+    CHECK(p.compressed_bytes == uint64_t(40 * 64) * (512 + 128) * 2 +
+                                uint64_t(40 * 128) * 512 * 2);
+    CHECK(p.state_bytes == uint64_t(512) * 2 * 8 * 2);
 }
 
 TEST_CASE(DeepSeek4PagedCacheFixture, gathered_lane_history) {

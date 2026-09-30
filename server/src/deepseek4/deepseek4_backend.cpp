@@ -17,6 +17,10 @@
 #include "common/peer_access.h"
 #include "common/platform_env.h"
 #include "common/sampler.h"
+#include "common/moe_hybrid_expert_cache.h"
+#include "common/moe_hybrid_routing_stats.h"
+
+#include <nlohmann/json.hpp>
 
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 #include "common/gpu_runtime_compat.h"
@@ -29,12 +33,15 @@
 
 #include <algorithm>
 #include <charconv>
+#include <system_error>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
+#include <fstream>
 #include <atomic>
 #include <condition_variable>
 #include <exception>
@@ -171,6 +178,16 @@ static uint64_t elapsed_us(Clock::time_point start, Clock::time_point end) {
 static bool env_flag_enabled(const char * name) {
     const char * value = std::getenv(name);
     return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
+// The expert usage profile that ranks placement: LUCE_DS4_HOTNESS_CSV, or
+// else the route counts earlier runs learned into LUCE_DS4_ROUTING_STATS_OUT.
+static const char * ds4_usage_profile_path() {
+    const char * given = std::getenv("LUCE_DS4_HOTNESS_CSV");
+    if (given && *given) return given;
+    const char * learned = std::getenv("LUCE_DS4_ROUTING_STATS_OUT");
+    if (learned && *learned && std::ifstream(learned).good()) return learned;
+    return nullptr;
 }
 
 struct AffineMmqPrefillScope {
@@ -684,6 +701,8 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.full_graph_set_us += src.full_graph_set_us;
     dst.full_graph_compute_us += src.full_graph_compute_us;
     dst.full_graph_read_us += src.full_graph_read_us;
+    dst.engram_read_us += src.engram_read_us;
+    dst.engram_apply_us += src.engram_apply_us;
     dst.hc_post_attn_us += src.hc_post_attn_us;
     dst.hc_pre_ffn_us += src.hc_pre_ffn_us;
     dst.ffn_build_us += src.ffn_build_us;
@@ -802,27 +821,22 @@ static void log_ds4_expert_memory_info(const char * tag,
 
 static uint64_t estimate_ds4_cache_bytes(const DeepSeek4Weights & w, int max_ctx) {
     size_t total_bytes = 0;
-    const size_t head_dim = (size_t) w.head_dim;
-    const size_t swa_size = (size_t) w.n_swa;
-
     for (int il = 0; il < w.n_layer; ++il) {
-        total_bytes += swa_size * head_dim * sizeof(uint16_t);
-        const uint32_t ratio = w.compress_ratios[(size_t) il];
-        if (ratio == 0) continue;
-
-        const size_t comp_cap = (size_t) (max_ctx / (int) ratio) + 16;
-        total_bytes += comp_cap * head_dim * sizeof(uint16_t);
-
-        const size_t state_rows = (ratio == 4) ? 8 : ratio;
-        const size_t comp_width = head_dim * (ratio == 4 ? 2 : 1);
-        total_bytes += state_rows * comp_width * sizeof(float) * 2;
-
-        if (ratio == 4) {
+        const DeepSeek4LayerGeometry g = deepseek4_layer_geometry(w, il);
+        total_bytes += (size_t) g.raw_rows * (size_t) g.head_dim * sizeof(uint16_t);
+        if (!g.has_comp) continue;
+        const size_t comp_cap = (size_t) g.comp_capacity(max_ctx);
+        total_bytes += comp_cap * (size_t) g.head_dim * sizeof(uint16_t);
+        if (g.has_comp_state()) {
+            total_bytes += (size_t) g.comp_state_rows * (size_t) g.comp_width * sizeof(float) * 2;
+        }
+        if (g.has_index) {
             // index_comp_kv is per-head. The full multi-head width lives
             // only in fixed-size state scratch and does not scale with context.
-            const size_t index_dim = (size_t) w.n_indexer_head_dim;
-            total_bytes += comp_cap * index_dim * sizeof(uint16_t);
-            total_bytes += state_rows * (2 * index_dim) * sizeof(float) * 2;
+            total_bytes += comp_cap * (size_t) g.index_dim * sizeof(uint16_t);
+            if (g.has_index_state()) {
+                total_bytes += (size_t) g.index_state_rows * (size_t) g.index_state_width * sizeof(float) * 2;
+            }
         }
     }
 
@@ -1089,7 +1103,7 @@ void log_deepseek4_step_telemetry(const char * phase,
         "ffn_hot_graph_build=%llu ffn_hot_graph_hit=%llu ffn_cold_graph_build=%llu ffn_cold_graph_hit=%llu "
         "hc_pre=%.1fms hc_pre_build=%.1fms hc_pre_input=%.1fms hc_pre_compute=%.1fms "
         "hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
-        "hot_sel=%d cold_sel=%d\n",
+        "engram_read=%.1fms engram_apply=%.1fms hot_sel=%d cold_sel=%d\n",
         phase, tokens, steps, wall_s, tok_s,
         ms(t.total_us), ms(t.embed_us), ms(t.attn_build_us), ms(t.attn_compute_us), ms(t.attn_read_us),
         ms(t.full_graph_build_us), ms(t.full_graph_set_us),
@@ -1106,6 +1120,7 @@ void log_deepseek4_step_telemetry(const char * phase,
         ms(t.hc_pre_compute_us),
         ms(t.hc_post_attn_us + t.hc_post_ffn_us),
         ms(t.output_us), ms(t.sample_us), ms(t.emit_us),
+        ms(t.engram_read_us), ms(t.engram_apply_us),
         t.hot_selected, t.cold_selected);
 }
 
@@ -1645,6 +1660,382 @@ bool DeepSeek4Backend::requires_monolithic_model() const {
            prefill_attention_mode_is_approximate(cfg_.prefill_mode);
 }
 
+// DeepSeek V4.1 runs with dense attention over its shared compressed caches
+// on the host hyper-connection paths, the fused whole-model graph (decode and
+// DSpark verify) and paged concurrent serving. The paths below do not
+// implement its cache sharing or staggered pre-mix yet, so refuse them
+// instead of silently producing wrong tokens.
+bool DeepSeek4Backend::validate_model_features() const {
+    if (!w_.hc_staggered_pre) return true;
+    const char * unsupported = nullptr;
+#if !defined(LUCE_BACKEND_HIP) && !defined(GGML_USE_HIP)
+    // Qualified on ROCm only: on CUDA the candidate-block selection (past
+    // 16,384 compressed rows) does not match the reference yet.
+    unsupported = "a CUDA build (V4.1 is qualified on ROCm)";
+#endif
+    if (cfg_.fused_decode || env_flag_enabled("LUCE_DS4_FUSED_DECODE")) {
+        unsupported = "fused decode";
+    } else if (cfg_.fused_verify_f16_kv) {
+        unsupported = "the fused verifier's F16 K/V";
+    } else if (cfg_.device.is_layer_split()) {
+        unsupported = "layer split";
+    } else if (!cfg_.mmproj_path.empty()) {
+        unsupported = "--mmproj";
+    }
+    if (!w_.protected_experts.empty() && !w_.moe_hybrid) {
+        std::fprintf(stderr, "[deepseek4] --ds4-protected-experts applies on the host routing of the "
+                     "hybrid expert tier; this model is fully resident\n");
+        return false;
+    }
+    if (unsupported) {
+        std::fprintf(stderr, "[deepseek4] %s is not implemented for %s (see server/docs/DS41.md)\n",
+                     unsupported, w_.arch.c_str());
+        return false;
+    }
+    // Paged V4.1 serving is qualified with the default expert-owner kernels
+    // only: with these switches it has faulted the GPU (see DS41.md, known
+    // limits), so refuse them until that is understood.
+    if (cfg_.paged_attention) {
+        static const char * const unqualified[] = {
+            "LUCE_DS4_TP_GROUPED_MMVQ", "LUCE_MOE_TP_GROUPED_MMVQ", "LUCE_MMID_GROUPED",
+            "LUCE_DS4_TP_NATIVE_ROUTE_WIDTH", "LUCE_DS4_TP_MASKED_ROUTES",
+            "LUCE_DS4_TP_BATCH_SPLIT_COPIES", "GGML_CUDA_BATCH_PEER_COPIES", "GGML_BATCH_PEER_COPIES",
+            "LUCE_DS4_TP_DEVICE_JOIN", "LUCE_MOE_TP_DEVICE_JOIN", "LUCE_DS4_TP_DEVICE_JOIN_SPLIT",
+            "LUCE_DS4_TP_FUSED_HC_JOIN", "LUCE_DS4_TP_ROUTE_PREFORK", "LUCE_MOE_TP_ROUTE_PREFORK",
+            "LUCE_DS4_TP_COARSE_OWNER", "LUCE_MOE_TP_COARSE_OWNER", "LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS",
+            "LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK",
+        };
+        for (const char * name : unqualified) {
+            if (env_flag_enabled(name)) {
+                std::fprintf(stderr, "[deepseek4] %s is not qualified with paged serving of %s "
+                             "(see server/docs/DS41.md); unset it or drop --paged-attention\n",
+                             name, w_.arch.c_str());
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Opens the Engram tables of a V4.1 model: every forward path then applies
+// the n-gram memory at the Engram layers (deepseek4_engram.h).
+bool DeepSeek4Backend::init_engram() {
+    w_.engram_runtime.reset();
+    if (!w_.engram.present()) return true;
+    auto runtime = std::make_shared<DeepSeek4EngramRuntime>();
+    std::string err;
+    if (!runtime->init(w_, cfg_.model_path, &err)) {
+        std::fprintf(stderr, "[deepseek4] %s\n", err.c_str());
+        return false;
+    }
+    w_.engram_runtime = std::move(runtime);
+    return true;
+}
+
+// ─── Routing adjustments and explicit expert ownership ─────────────────
+
+// Reads --ds4-router-bias (raw little-endian f32 [n_layer][n_expert]) and
+// --ds4-protected-experts ({"<layer>": [expert ids], ...}) into the weights.
+bool DeepSeek4Backend::load_routing_adjustments() {
+    const size_t n = (size_t) w_.n_layer * (size_t) w_.n_expert;
+    w_.router_bias_delta.clear();
+    w_.protected_experts.clear();
+    if (!cfg_.router_bias_path.empty()) {
+        std::ifstream f(cfg_.router_bias_path, std::ios::binary | std::ios::ate);
+        if (!f || (size_t) f.tellg() != n * sizeof(float)) {
+            std::fprintf(stderr, "[deepseek4] router bias %s must hold %zu f32 values ([%d][%d])\n",
+                         cfg_.router_bias_path.c_str(), n, w_.n_layer, w_.n_expert);
+            return false;
+        }
+        w_.router_bias_delta.resize(n);
+        f.seekg(0);
+        f.read(reinterpret_cast<char *>(w_.router_bias_delta.data()), (std::streamsize) (n * sizeof(float)));
+        if (!f) return false;
+        for (float v : w_.router_bias_delta) {
+            if (!std::isfinite(v)) {
+                std::fprintf(stderr, "[deepseek4] router bias %s holds a non-finite value\n",
+                             cfg_.router_bias_path.c_str());
+                return false;
+            }
+        }
+    }
+    if (!cfg_.protected_experts_path.empty()) {
+        std::ifstream f(cfg_.protected_experts_path);
+        nlohmann::json j;
+        try {
+            f >> j;
+        } catch (const std::exception & ex) {
+            std::fprintf(stderr, "[deepseek4] protected experts %s: %s\n",
+                         cfg_.protected_experts_path.c_str(), ex.what());
+            return false;
+        }
+        if (!j.is_object()) {
+            std::fprintf(stderr, "[deepseek4] protected experts %s: expected an object of layer -> experts\n",
+                         cfg_.protected_experts_path.c_str());
+            return false;
+        }
+        w_.protected_experts.assign(n, 0);
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            int layer = -1;
+            const std::string & key = it.key();
+            const auto parsed = std::from_chars(key.data(), key.data() + key.size(), layer);
+            if (parsed.ec != std::errc() || parsed.ptr != key.data() + key.size() ||
+                layer < 0 || layer >= w_.n_layer || !it.value().is_array()) {
+                std::fprintf(stderr, "[deepseek4] protected experts: bad layer entry \"%s\"\n", key.c_str());
+                return false;
+            }
+            for (const auto & e : it.value()) {
+                const int expert = e.is_number_integer() ? e.get<int>() : -1;
+                if (expert < 0 || expert >= w_.n_expert) {
+                    std::fprintf(stderr, "[deepseek4] protected experts: bad expert in layer %d\n", layer);
+                    return false;
+                }
+                w_.protected_experts[(size_t) layer * (size_t) w_.n_expert + (size_t) expert] = 1;
+            }
+        }
+    }
+    return true;
+}
+
+// Device routing keeps a protected expert exactly as host routing does
+// (ds4_select_routed_experts): per layer it needs the selection bias without
+// the router bias delta and the protected mask on the device.
+bool DeepSeek4Backend::upload_protected_routing() {
+    if (w_.protected_experts.empty() || w_.router_bias_delta.empty()) return true;
+    const ggml_init_params params{2 * (size_t) w_.n_layer * ggml_tensor_overhead(), nullptr, true};
+    w_.routing_ctx = ggml_init(params);
+    if (!w_.routing_ctx) return false;
+    for (DeepSeek4Layer & L : w_.layers) {
+        L.native_selection_bias = ggml_new_tensor_1d(w_.routing_ctx, GGML_TYPE_F32, w_.n_expert);
+        L.protected_mask = ggml_new_tensor_1d(w_.routing_ctx, GGML_TYPE_I32, w_.n_expert);
+    }
+    w_.routing_buf = ggml_backend_alloc_ctx_tensors(w_.routing_ctx, backend_);
+    if (!w_.routing_buf) {
+        std::fprintf(stderr, "[deepseek4] failed to allocate the protected routing tables\n");
+        return false;
+    }
+    std::vector<float> bias((size_t) w_.n_expert);
+    std::vector<int32_t> mask((size_t) w_.n_expert);
+    for (int il = 0; il < w_.n_layer; ++il) {
+        DeepSeek4Layer & L = w_.layers[(size_t) il];
+        const size_t row = (size_t) il * (size_t) w_.n_expert;
+        ggml_backend_tensor_get(L.ffn_exp_probs_b, bias.data(), 0, sizeof(float) * bias.size());
+        for (int e = 0; e < w_.n_expert; ++e) {
+            bias[(size_t) e] -= w_.router_bias_delta[row + (size_t) e];
+            mask[(size_t) e] = w_.protected_experts[row + (size_t) e];
+        }
+        ggml_backend_tensor_set(L.native_selection_bias, bias.data(), 0, sizeof(float) * bias.size());
+        ggml_backend_tensor_set(L.protected_mask, mask.data(), 0, sizeof(int32_t) * mask.size());
+    }
+    return true;
+}
+
+// Adds the router bias delta to every layer's selection bias once, so routing
+// pays nothing per token. Mixing weights are unaffected (they never read it).
+bool DeepSeek4Backend::apply_routing_adjustments() {
+    if (!load_routing_adjustments()) return false;
+    if (!w_.router_bias_delta.empty()) {
+        std::vector<float> bias((size_t) w_.n_expert);
+        for (int il = 0; il < w_.n_layer; ++il) {
+            ggml_tensor * t = w_.layers[(size_t) il].ffn_exp_probs_b;
+            if (!t || t->type != GGML_TYPE_F32 || ggml_nelements(t) != w_.n_expert) {
+                std::fprintf(stderr, "[deepseek4] layer %d has no F32 selection bias for --ds4-router-bias\n", il);
+                return false;
+            }
+            ggml_backend_tensor_get(t, bias.data(), 0, sizeof(float) * bias.size());
+            for (int e = 0; e < w_.n_expert; ++e) {
+                bias[(size_t) e] += w_.router_bias_delta[(size_t) il * (size_t) w_.n_expert + (size_t) e];
+            }
+            ggml_backend_tensor_set(t, bias.data(), 0, sizeof(float) * bias.size());
+        }
+    }
+    if (!upload_protected_routing()) return false;
+    // Host routing reads a selection bias per layer and token; keep a copy.
+    w_.selection_bias_host.clear();
+    const bool f32_biases = std::all_of(w_.layers.begin(), w_.layers.end(), [&](const DeepSeek4Layer & L) {
+        return L.ffn_exp_probs_b && L.ffn_exp_probs_b->type == GGML_TYPE_F32 &&
+               ggml_nelements(L.ffn_exp_probs_b) == w_.n_expert;
+    });
+    if (f32_biases && !w_.layers.empty()) {
+        w_.selection_bias_host.resize((size_t) w_.n_layer * (size_t) w_.n_expert);
+        for (int il = 0; il < w_.n_layer; ++il) {
+            ggml_backend_tensor_get(w_.layers[(size_t) il].ffn_exp_probs_b,
+                                    w_.selection_bias_host.data() + (size_t) il * (size_t) w_.n_expert,
+                                    0, sizeof(float) * (size_t) w_.n_expert);
+        }
+    }
+    if (!w_.router_bias_delta.empty() || !w_.protected_experts.empty()) {
+        std::fprintf(stderr, "[deepseek4] routing: router bias %s, %d protected experts\n",
+                     w_.router_bias_delta.empty() ? "off" : cfg_.router_bias_path.c_str(),
+                     (int) std::count(w_.protected_experts.begin(), w_.protected_experts.end(), 1));
+    }
+    return true;
+}
+
+static size_t ds4_device_headroom_bytes(int device);
+
+// Host RAM kept free of the locked expert tier: the OS and this process's
+// own host buffers (a layer-major pass keeps its HC state and embeddings,
+// (n_hc + 1) * n_embd floats per token of at most one pass span, on the host).
+static uint64_t ds4_host_reserve_bytes(const DeepSeek4Weights & w, int max_ctx) {
+    const int span = std::min(std::max(0, max_ctx), DS4_LAYER_MAJOR_PROMPT_SPAN);
+    return (5ULL << 30) + (uint64_t) span * (uint64_t) (w.n_hc + 1) * (uint64_t) w.n_embd * sizeof(float);
+}
+
+// The streamed expert cache an integrated secondary keeps in its carve when
+// its experts spill to host memory (the cache itself takes whatever the carve
+// has left; see init_streamed_expert_tier).
+static uint64_t ds4_stream_cache_request_bytes() {
+    return (uint64_t) 4608 << 20;
+}
+
+// Replaces the uniform hot set with an explicit three-tier ownership: the
+// placement file (or the uniform placement when only protected experts are
+// given), protected experts pinned to the primary, fitted to the primary
+// budget (what the uniform placement spends) and the secondary device.
+bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, int secondary_gpu,
+                                              MoeHybridConfig & hybrid_cfg) {
+    if (!load_routing_adjustments()) return false;
+    if (cfg_.expert_placement_path.empty() && w_.protected_experts.empty()) return true;
+
+    std::vector<uint64_t> expert_bytes((size_t) w_.n_layer);
+    for (int il = 0; il < w_.n_layer; ++il) {
+        const DeepSeek4Layer & L = w_.layers[(size_t) il];
+        expert_bytes[(size_t) il] = (ggml_nbytes(L.ffn_gate_exps) + ggml_nbytes(L.ffn_up_exps) +
+                                     ggml_nbytes(L.ffn_down_exps)) / (uint64_t) w_.n_expert;
+    }
+    uint64_t primary_budget = 0;
+    for (int il = 0; il < w_.n_layer; ++il) {
+        primary_budget += expert_bytes[(size_t) il] * (uint64_t) moe_placement_.hot_counts[(size_t) il];
+    }
+    uint64_t secondary_budget = 0;
+    if (secondary_owner) {
+        size_t free_bytes = 0, total_bytes = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(expert_backend_), &free_bytes, &total_bytes);
+        uint64_t carve_reserve = 4ULL << 30;   // compute buffers on the secondary
+        uint64_t host_bytes = 0;
+        if (secondary_gpu >= 0) {
+            // An integrated secondary also holds experts in locked host memory
+            // past its carve. The carve keeps the streamed expert cache, the
+            // headroom and a margin for the buffers allocated after the experts.
+            carve_reserve = ds4_device_headroom_bytes(secondary_gpu) + ds4_stream_cache_request_bytes() +
+                            (1ULL << 30);
+            const uint64_t avail = host_available_bytes();
+            const uint64_t keep = ds4_host_reserve_bytes(w_, cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192);
+            const uint64_t host_want = avail > keep ? avail - keep : 0;
+            host_bytes = ggml_backend_cuda_set_host_spill(secondary_gpu, carve_reserve, host_want);
+            if (host_bytes + (1ULL << 30) < host_want) {
+                std::fprintf(stderr, "[deepseek4] device %d: only %.2f of %.2f GiB of host memory can be locked "
+                             "(RLIMIT_MEMLOCK); the rest of these experts stream from the drive. Run as a "
+                             "service with LimitMEMLOCK=infinity (or as root), or raise `ulimit -l`.\n",
+                             secondary_gpu, host_bytes / 1073741824.0, host_want / 1073741824.0);
+            }
+            if (host_bytes > 0) {
+                std::fprintf(stderr, "[deepseek4] device %d: experts past the carve (keeping %.2f GiB free) "
+                             "go to locked host memory, up to %.2f GiB (%.2f GiB available, %.2f GiB kept)\n",
+                             secondary_gpu, carve_reserve / 1073741824.0, host_bytes / 1073741824.0,
+                             avail / 1073741824.0, keep / 1073741824.0);
+            }
+        }
+        const uint64_t capacity = (free_bytes > carve_reserve ? free_bytes - carve_reserve : 0) + host_bytes;
+        secondary_budget = capacity;
+    }
+
+    MoeExpertOwnership own;
+    std::string err;
+    if (!cfg_.expert_placement_path.empty()) {
+        if (!MoeExpertOwnership::load_json(cfg_.expert_placement_path, w_.n_layer, w_.n_expert, own, &err)) {
+            std::fprintf(stderr, "[deepseek4] %s\n", err.c_str());
+            return false;
+        }
+    } else {
+        own.init(w_.n_layer, w_.n_expert,
+                 secondary_owner ? MoeExpertOwnership::Secondary : MoeExpertOwnership::Stream);
+        for (int il = 0; il < w_.n_layer; ++il) {
+            for (int32_t e : moe_placement_.hot_expert_ids[(size_t) il]) {
+                own.set(il, e, MoeExpertOwnership::Primary);
+            }
+        }
+    }
+    for (size_t i = 0; i < w_.protected_experts.size(); ++i) {
+        if (w_.protected_experts[i]) own.pin_primary((int) (i / (size_t) w_.n_expert), (int) (i % (size_t) w_.n_expert));
+    }
+    MoeHybridRoutingStats usage;
+    const char * usage_path = ds4_usage_profile_path();
+    const bool have_usage = usage_path && *usage_path && MoeHybridRoutingStats::load_csv(usage_path, usage, &err);
+    if (!own.fit_budgets(expert_bytes, primary_budget, secondary_budget, have_usage ? &usage : nullptr, &err)) {
+        std::fprintf(stderr, "[deepseek4] expert ownership: %s\n", err.c_str());
+        return false;
+    }
+
+    moe_placement_.hot_expert_ids = own.expert_ids(MoeExpertOwnership::Primary);
+    moe_placement_.total_hot = 0;
+    for (int il = 0; il < w_.n_layer; ++il) {
+        moe_placement_.hot_counts[(size_t) il] = (int) moe_placement_.hot_expert_ids[(size_t) il].size();
+        moe_placement_.total_hot += moe_placement_.hot_counts[(size_t) il];
+    }
+    moe_decode_placement_ = {};
+    if (secondary_owner) hybrid_cfg.cold_expert_ids = own.expert_ids(MoeExpertOwnership::Secondary);
+
+    using O = MoeExpertOwnership;
+    std::fprintf(stderr,
+                 "[deepseek4] expert ownership: primary %d experts %.2f GiB (budget %.2f GiB), "
+                 "secondary %d experts %.2f GiB (budget %.2f GiB), streamed %d experts %.2f GiB\n",
+                 own.count(O::Primary), gib(own.bytes(O::Primary, expert_bytes)), gib(primary_budget),
+                 own.count(O::Secondary), gib(own.bytes(O::Secondary, expert_bytes)), gib(secondary_budget),
+                 own.count(O::Stream), gib(own.bytes(O::Stream, expert_bytes)));
+    std::fprintf(stderr, "[deepseek4] expert ownership from %s; demotions ranked by %s\n",
+                 cfg_.expert_placement_path.empty() ? "the uniform placement" : cfg_.expert_placement_path.c_str(),
+                 have_usage ? usage_path : "layer balance");
+    return true;
+}
+
+// One line per phase of a request: where its routed expert calls went and
+// what the streamed ones cost (mmap read incl. SSD faults, upload, compute).
+void DeepSeek4Backend::log_route_counts(const char * phase) {
+    if (!moe_hybrid_) return;
+    MoeHybridStorage::RouteCounts & c = moe_hybrid_->route_counts;
+    const double total = (double) std::max<uint64_t>(1, c.total());
+    const MoeHybridStreamEngine::Stats & st = stream_engine_.stats();
+    const MoeStreamedExpertCache::Stats cs =
+        expert_cache_.ready() ? expert_cache_.stats() : MoeStreamedExpertCache::Stats{};
+    // The fused graph counts no host routes; its streamed loads still show.
+    if ((c.total() > 0 || cs.experts > 0) && expert_cache_.ready()) {
+        const double used = (double) std::max<uint64_t>(1, cs.experts);
+        std::fprintf(stderr, "[deepseek4] %s routed calls: %" PRIu64 " primary %.1f%%, secondary %.1f%%, "
+                     "streamed %.1f%%; streamed %" PRIu64 " experts, cache hit %.1f%% (prefetched %.1f%%, warm %.1f%%), "
+                     "loaded %" PRIu64 " (%" PRIu64 " by prefetch) %.2f GiB: read %.0f ms, upload %.0f ms, "
+                     "wait %.0f ms (%" PRIu64 " missed, %" PRIu64 " late), compute %.0f ms; "
+                     "prefetch accuracy %.1f%% of %" PRIu64 "\n",
+                     phase, c.total(), 100.0 * (double) c.primary / total,
+                     100.0 * (double) c.secondary / total, 100.0 * (double) c.streamed / total,
+                     cs.experts, 100.0 * (double) cs.hits / used, 100.0 * (double) cs.prefetch_hits / used,
+                     100.0 * (double) cs.warm_hits / used,
+                     cs.loads, cs.prefetched, gib(cs.bytes), cs.read_us / 1000.0, cs.upload_us / 1000.0,
+                     cs.wait_us / 1000.0, cs.missed, cs.late, cs.compute_us / 1000.0,
+                     100.0 * (double) cs.predicted_used / (double) std::max<uint64_t>(1, cs.predicted_of),
+                     cs.predicted_of);
+    } else if (c.total() > 0) {
+        std::fprintf(stderr, "[deepseek4] %s routed calls: %" PRIu64 " primary %.1f%%, secondary %.1f%%, "
+                     "streamed %.1f%%; streamed %" PRIu64 " experts %.2f GiB: read %.0f ms, upload %.0f ms, "
+                     "compute %.0f ms\n",
+                     phase, c.total(), 100.0 * (double) c.primary / total,
+                     100.0 * (double) c.secondary / total, 100.0 * (double) c.streamed / total,
+                     st.experts, gib(st.bytes), st.read_us / 1000.0, st.upload_us / 1000.0,
+                     st.compute_us / 1000.0);
+    }
+    reset_route_counts();
+    // Runtime allocations (graph caches, prefill scratch) must stay inside
+    // the headroom the fit check left; report where each phase ends.
+    if (moe_hybrid_) log_device_memory(phase);
+}
+
+void DeepSeek4Backend::reset_route_counts() {
+    if (moe_hybrid_) moe_hybrid_->route_counts = {};
+    stream_engine_.reset_stats();
+    if (expert_cache_.ready()) expert_cache_.reset_stats();
+}
+
 bool DeepSeek4Backend::validate_prefill_mode() const {
     if (cfg_.prefill_mode == PrefillAttentionMode::Exact) {
         return true;
@@ -1714,6 +2105,13 @@ bool DeepSeek4Backend::load_model() {
         requires_monolithic_model() && !heterogeneous_tp;
     if (target_backend == PlacementBackend::Hip &&
         (force_full || need_monolithic)) {
+        // A fully resident model has no expert owners to place.
+        if (!cfg_.expert_placement_path.empty()) {
+            std::fprintf(stderr, "[deepseek4] --ds4-expert-placement needs the hybrid expert tier, "
+                         "which this configuration loads fully resident; add --expert-device or "
+                         "drop the placement\n");
+            return false;
+        }
         std::fprintf(stderr,
                      "[deepseek4] monolithic execution requested "
                      "(forced=%s, paged=%s, fused_decode=%s, "
@@ -1866,7 +2264,10 @@ bool DeepSeek4Backend::load_spec_drafter() {
     }
 
     const DSparkDrafter & d = *drafter;
-    bool compatible = d.core.n_embd == w_.n_embd &&
+    // A drafter is trained against one target: its hyper-connection rules
+    // (the staggered pre-mix of V4.1) must match the target's.
+    bool compatible = d.core.hc_staggered_pre == w_.hc_staggered_pre &&
+                      d.core.n_embd == w_.n_embd &&
                       d.core.n_vocab == w_.n_vocab &&
                       d.vocab_size == w_.n_vocab &&
                       d.mask_token_id >= 0 && d.mask_token_id < w_.n_vocab &&
@@ -1877,9 +2278,9 @@ bool DeepSeek4Backend::load_spec_drafter() {
     if (!compatible) {
         std::fprintf(stderr,
                      "[deepseek4] DSpark drafter is incompatible with target "
-                     "(target embd/vocab/layers=%d/%d/%d, draft=%d/%d)\n",
-                     w_.n_embd, w_.n_vocab, w_.n_layer,
-                     d.core.n_embd, d.vocab_size);
+                     "(target %s embd/vocab/layers=%d/%d/%d, draft %s %d/%d)\n",
+                     w_.arch.c_str(), w_.n_embd, w_.n_vocab, w_.n_layer,
+                     d.core.arch.c_str(), d.core.n_embd, d.vocab_size);
         free_deepseek4_dspark_drafter(*drafter);
         if (spec_backend_) {
             ggml_backend_free(spec_backend_);
@@ -1888,6 +2289,7 @@ bool DeepSeek4Backend::load_spec_drafter() {
         return false;
     }
 
+    drafter->flash_attention = placement_backend_of(draft_backend) == PlacementBackend::Hip;
     spec_drafter_ = std::move(drafter);
     spec_enabled_ = true;
     spec_drafter_parked_ = false;
@@ -1948,12 +2350,14 @@ int DeepSeek4Backend::capture_safe_prefill_tokens(
         }
     };
 
+    // A batched capture returns every requested row of its chunk, so only a
+    // token-by-token capture splits at the capture windows.
     if (!batch_final_capture) {
         split_at(final_capture_from);
-    }
-    if (snapshot_pending) {
-        split_at(snapshot_capture_from);
-        split_at(snapshot_capture_to);
+        if (snapshot_pending) {
+            split_at(snapshot_capture_from);
+            split_at(snapshot_capture_to);
+        }
     }
     return safe_tokens;
 }
@@ -1967,10 +2371,11 @@ bool DeepSeek4Backend::supports_batched_spec_feature_capture(
         return false;
     }
     // The monolithic layer-major path reads only the requested token range.
-    // Sparse heterogeneous prefill returns every requested capture row; the
-    // caller then retains the final/snapshot window. Other hybrid modes are
-    // tokenwise and must still split at capture boundaries.
-    return !hybrid || mode == PrefillAttentionMode::Sparse;
+    // Batched heterogeneous prefill returns every requested capture row; the
+    // caller then retains the final/snapshot window. Hybrid prefill that runs
+    // token by token never reaches here with more than one token.
+    (void) hybrid;
+    return true;
 }
 
 bool DeepSeek4Backend::init() {
@@ -2054,10 +2459,10 @@ bool DeepSeek4Backend::init() {
 
     snap_backend_ = ggml_backend_init_by_name("cpu", nullptr);
 
-    if (!load_model()) {
+    if (!load_model() || !apply_routing_adjustments() || !init_engram()) {
         return false;
     }
-    if (!validate_prefill_mode()) {
+    if (!validate_prefill_mode() || !validate_model_features()) {
         return false;
     }
     if (prefill_attention_mode_is_approximate(cfg_.prefill_mode)) {
@@ -2142,13 +2547,6 @@ bool DeepSeek4Backend::init() {
             "compute callback; select in-process LUCE_DS4_MOE_TP or disable paged attention\n");
         return false;
     }
-    if (cfg_.paged_attention && moe_hybrid_ &&
-        !moe_hybrid_->materialized_cold_experts) {
-        std::fprintf(stderr,
-            "[deepseek4] paged serving requires statically materialized "
-            "expert ownership; enable in-process LUCE_DS4_MOE_TP\n");
-        return false;
-    }
 
     if (const char * stats_path = std::getenv("LUCE_DS4_ROUTING_STATS_OUT")) {
         if (*stats_path) {
@@ -2158,8 +2556,15 @@ bool DeepSeek4Backend::init() {
                 return false;
             }
             routing_stats_out_path_ = stats_path;
-            std::fprintf(stderr, "[deepseek4] routing stats enabled output=%s\n",
-                         routing_stats_out_path_.c_str());
+            // Keep learning across restarts: resume the counts saved there.
+            MoeHybridRoutingStats saved;
+            std::string load_err;
+            const bool resumed = std::ifstream(stats_path).good() &&
+                MoeHybridRoutingStats::load_csv(stats_path, saved, &load_err) &&
+                saved.matches(w_.n_layer, w_.n_expert, w_.n_expert_used);
+            if (resumed) *routing_stats_ = std::move(saved);
+            std::fprintf(stderr, "[deepseek4] routing stats enabled output=%s%s\n",
+                         routing_stats_out_path_.c_str(), resumed ? " (resumed)" : "");
         }
     }
     if (env_flag_enabled("LUCE_DS4_TP_ROUTE_STATS") && !routing_stats_) {
@@ -2220,8 +2625,228 @@ bool DeepSeek4Backend::init() {
             std::fprintf(stderr, "[deepseek4] LUCE_DS4_SPEC set but LUCE_DS4_DRAFT gguf missing\n");
         }
     }
+    if (!init_streamed_expert_tier() || !check_device_headroom()) return false;
+    if (!size_hybrid_prefill_chunk()) return false;
     image_capable_ = vision_ != nullptr;
     return true;
+}
+
+// Free memory a device must keep after every persistent allocation: room for
+// the graph compute buffers allocated at the first request, and on an APU for
+// the driver, so no allocation spills past the carve into shared (SVM) memory.
+static size_t ds4_device_headroom_bytes(int device) {
+    cudaDeviceProp prop{};
+    const bool integrated = cudaGetDeviceProperties(&prop, device) == cudaSuccess && prop.integrated;
+    return integrated ? ((size_t) 4 << 30) : ((size_t) 3 << 29);
+}
+
+// Streamed expert cache, sized from what is left after
+// the model, the owner stacks, the caches and the drafter are in place.
+bool DeepSeek4Backend::init_streamed_expert_tier() {
+    MoeHybridStorage * hybrid = moe_hybrid_.get();
+    if (!hybrid || !hybrid->stream_engine || stream_cache_device_ < 0) return true;
+    std::string err;
+    // The cache takes what the device has left beyond its headroom.
+    MoeExpertCacheOptions cache_opts;
+    cache_opts.device = stream_cache_device_;
+    cache_opts.reserve_bytes = ds4_device_headroom_bytes(cache_opts.device);
+    cache_opts.direct_path = cfg_.model_path;
+    // Once experts are locked in host memory the page cache is too small to
+    // hold the streamed tier, so every load reads the drive directly.
+    cache_opts.direct_all = ggml_backend_cuda_host_spill_bytes(cache_opts.device) > 0;
+    {
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(cache_opts.device, &free_b, &total_b);
+        cache_opts.pool_bytes = free_b > cache_opts.reserve_bytes ? free_b - cache_opts.reserve_bytes : 0;
+        if (cache_opts.pool_bytes > 0 &&
+            init_deepseek4_streamed_expert_cache(w_, *hybrid, cache_opts, expert_cache_, &err)) {
+            hybrid->expert_cache = &expert_cache_;
+            // Start with the most used streamed experts resident; the
+            // loaders fill the pool while the server comes up.
+            MoeHybridRoutingStats usage;
+            const char * usage_path = ds4_usage_profile_path();
+            std::string usage_err;
+            if (usage_path && MoeHybridRoutingStats::load_csv(usage_path, usage, &usage_err)) {
+                expert_cache_.warm(usage);
+            }
+        } else {
+            std::fprintf(stderr, "[deepseek4] streamed expert cache disabled: %s\n",
+                         cache_opts.pool_bytes ? err.c_str() : "no room left on the device");
+        }
+    }
+    if (cfg_.paged_attention && hybrid->streams_cold_experts() && !hybrid->expert_cache) {
+        std::fprintf(stderr,
+            "[deepseek4] paged serving requires statically materialized "
+            "expert ownership or the streamed expert cache\n");
+        return false;
+    }
+    return true;
+}
+
+// Logs every device's used / total / free memory against its headroom.
+// At load (`when` null) every device must keep the whole headroom free; while
+// serving, the prefill chunk may spend half of it (size_hybrid_prefill_chunk)
+// and the decode/verify graphs the rest, so a phase only warns below half.
+// False when a device is below its limit.
+bool DeepSeek4Backend::log_device_memory(const char * when) const {
+    std::vector<int> devices = {cfg_.device.gpu};
+    if (stream_cache_device_ >= 0 && stream_cache_device_ != cfg_.device.gpu) {
+        devices.push_back(stream_cache_device_);
+    }
+    bool ok = true;
+    for (int device : devices) {
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+        const size_t headroom = ds4_device_headroom_bytes(device);
+        const size_t need = when ? headroom / 2 : headroom;
+        std::fprintf(stderr, "[deepseek4] device %d memory%s%s: %.2f of %.2f GiB used, %.2f GiB free "
+                     "(headroom %.2f GiB)%s\n", device, when ? " " : "", when ? when : "",
+                     (total_b - free_b) / 1073741824.0,
+                     total_b / 1073741824.0, free_b / 1073741824.0, headroom / 1073741824.0,
+                     free_b < need ? (when ? ": runtime allocations ate more than half the headroom"
+                                           : ": does not fit") : "");
+        ok = ok && free_b >= need;
+    }
+    return ok;
+}
+
+// Logs every device's memory once everything persistent is allocated and
+// refuses a configuration that leaves less than the device's headroom, rather
+// than let the driver overcommit it at the first request.
+bool DeepSeek4Backend::check_device_headroom() const {
+    bool ok = log_device_memory(nullptr);
+    // Locked host memory cannot be reclaimed: the host keeps the OS reserve free.
+    const size_t locked = stream_cache_device_ >= 0 ? ggml_backend_cuda_host_spill_bytes(stream_cache_device_) : 0;
+    if (locked > 0) {
+        const uint64_t avail = host_available_bytes();
+        const uint64_t need = 4ULL << 30;
+        std::fprintf(stderr, "[deepseek4] host memory: %.2f GiB available beside %.2f GiB of locked experts "
+                     "(headroom %.2f GiB)%s\n", avail / 1073741824.0, locked / 1073741824.0,
+                     need / 1073741824.0, avail < need ? ": does not fit" : "");
+        ok = ok && avail >= need;
+    }
+    if (!ok) {
+        std::fprintf(stderr, "[deepseek4] the configuration does not fit the devices with their "
+                     "headroom; lower LUCE_EXPERT_BUDGET_MB, "
+                     "--kv-pool-tokens or --max-ctx\n");
+    }
+    return ok;
+}
+
+// Scratch one token of a batched mixed-owner prefill chunk needs. The target
+// holds the attention graph (queries, context and the causal mask over the raw
+// window, the chunk and every compressed row `max_ctx` can reach) and the
+// routing and hot-owner arenas; the GPU of the second owner and the streamed
+// experts holds their arenas.
+DeepSeek4Backend::HybridPrefillScratch DeepSeek4Backend::hybrid_prefill_scratch_per_token(
+        const DeepSeek4Weights & w, int max_ctx, int chunk) {
+    size_t comp_rows = 0;
+    for (uint32_t ratio : w.compress_ratios) {
+        if (ratio > 0) comp_rows = std::max(comp_rows, (size_t) std::max(0, max_ctx) / ratio);
+    }
+    const size_t f32 = sizeof(float);
+    const size_t heads = (size_t) w.n_head * (size_t) w.head_dim * f32;
+    const size_t mask_row = ((size_t) w.n_swa + (size_t) std::max(1, chunk) + comp_rows) *
+                            (f32 + sizeof(uint16_t));
+    size_t mask = mask_row;
+    // Per routed token the expert-major MoE graph holds the gathered input and
+    // the down output (n_embd each) besides gate, up and their product
+    // (n_ff_exp each); measured about 270 KiB a token on the R9700 at a 4K
+    // chunk, which the three ff rows alone undercounted.
+    const size_t routes = (size_t) w.n_expert_used *
+                          (2 * (size_t) w.n_embd + 3 * (size_t) w.n_ff_exp) * f32;
+    const size_t token = (size_t) w.n_embd * f32;
+    HybridPrefillScratch out;
+    if (w.shared_index_topk) {
+        // V4.1 selects on every compressed layer. A prefill band whose
+        // queries have a selection attends without a mask, so the mask spans
+        // at most top_k compressed rows (plus one short tail band of up to
+        // n_swa tokens with a full one). The index sources score every
+        // compressed row per token (scores, their ranked copy, top-k and
+        // candidate-block scratch: 9 bytes), and each band gathers every
+        // compressed row as F32 attention rows (cast and concat).
+        mask = ((size_t) w.n_swa + (size_t) std::max(1, chunk) +
+                std::min(comp_rows, (size_t) w.n_indexer_top_k)) * (f32 + sizeof(uint16_t)) +
+               comp_rows * (2 * f32 + 1);
+        out.target_fixed = (size_t) w.n_swa * mask_row + 2 * comp_rows * (size_t) w.head_dim * f32;
+    }
+    out.target = 4 * heads + mask + routes + 4 * token + 2 * (size_t) w.n_expert * f32;
+    out.second = 2 * routes + 4 * token;
+    return out;
+}
+
+// Chunk tokens whose scratch fits `free_bytes` while `keep_bytes` stay free:
+// a multiple of 64, and at least 64.
+int DeepSeek4Backend::hybrid_prefill_fit_tokens(size_t free_bytes, size_t keep_bytes,
+                                                size_t per_token_bytes) {
+    constexpr size_t granule = 64;
+    const size_t room = free_bytes > keep_bytes ? free_bytes - keep_bytes : 0;
+    const size_t tokens = per_token_bytes > 0 ? room / per_token_bytes : 0;
+    return (int) std::min<size_t>(DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS,
+                                  std::max(granule, tokens / granule * granule));
+}
+
+// Bounds a batched mixed-owner prefill chunk by the memory left after load;
+// each device keeps half its headroom for the decode and verify graphs. The
+// cap is fixed for the life of the target, so a prompt is always cut into the
+// same chunks and a restored prefix reproduces a cold prefill
+// (GenerateRequest::restore_points).
+bool DeepSeek4Backend::size_hybrid_prefill_chunk() {
+    if (!moe_hybrid_ || cfg_.prefill_mode == PrefillAttentionMode::Exact) return true;
+    const int chunk = std::max(1, cfg_.chunk > 0 ? cfg_.chunk : w_.n_swa);
+    const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
+    const HybridPrefillScratch per_token = hybrid_prefill_scratch_per_token(w_, max_ctx, chunk);
+    const auto fit = [](int device, size_t bytes, size_t fixed) {
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+        return hybrid_prefill_fit_tokens(free_b, ds4_device_headroom_bytes(device) / 2 + fixed, bytes);
+    };
+    {
+        // A context the smallest chunk cannot prefill at its end is refused
+        // at load rather than failing an allocation in the middle of a prompt.
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(cfg_.device.gpu, &free_b, &total_b);
+        const size_t keep = ds4_device_headroom_bytes(cfg_.device.gpu) / 2 + per_token.target_fixed;
+        const size_t smallest = 64 * per_token.target;
+        if (free_b < keep + smallest) {
+            std::fprintf(stderr,
+                         "[deepseek4] --max-ctx %d needs %.2f GiB free on device %d to prefill 64 tokens "
+                         "at the end of the context, %.2f GiB are; lower --max-ctx or the expert budgets\n",
+                         max_ctx, (keep + smallest) / 1073741824.0, cfg_.device.gpu, free_b / 1073741824.0);
+            return false;
+        }
+    }
+    int tokens = fit(cfg_.device.gpu, per_token.target, per_token.target_fixed);
+    if (stream_cache_device_ >= 0 && stream_cache_device_ != cfg_.device.gpu) {
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(stream_cache_device_, &free_b, &total_b);
+        const size_t keep = ds4_device_headroom_bytes(stream_cache_device_) / 2;
+        if (free_b < keep + 64 * per_token.second) {
+            std::fprintf(stderr,
+                         "[deepseek4] device %d needs %.2f GiB free to prefill 64 tokens, %.2f GiB are; "
+                         "lower the expert budgets\n",
+                         stream_cache_device_, (keep + 64 * per_token.second) / 1073741824.0,
+                         free_b / 1073741824.0);
+            return false;
+        }
+        tokens = std::min(tokens, fit(stream_cache_device_, per_token.second, 0));
+    }
+    if (tokens < chunk) {
+        hybrid_prefill_chunk_cap_ = hybrid_prefill_chunk_cap_ > 0
+            ? std::min(hybrid_prefill_chunk_cap_, tokens) : tokens;
+        std::fprintf(stderr, "[deepseek4] batched prefill chunk %d -> %d tokens to fit the "
+                     "devices' free memory\n", chunk, tokens);
+    }
+    return true;
+}
+
+// Tokens of a batched prefill chunk at absolute `pos` that stop at the next
+// restore point, so every restore point starts a chunk.
+int DeepSeek4Backend::restore_safe_prefill_tokens(int pos, int requested_tokens,
+                                                  const std::vector<int> & restore_points) {
+    const auto next = std::upper_bound(restore_points.begin(), restore_points.end(), pos);
+    return next != restore_points.end() && *next < pos + requested_tokens
+        ? *next - pos : requested_tokens;
 }
 
 bool DeepSeek4Backend::init_moe_tensor_parallel() {
@@ -2243,6 +2868,10 @@ bool DeepSeek4Backend::init_moe_tensor_parallel() {
         const PlacementBackend local_kind =
             cfg_.device.backend == PlacementBackend::Auto
                 ? compiled_placement_backend() : cfg_.device.backend;
+        int secondary_experts = 0;
+        for (const MoeHybridLayerStorage & layer : moe_hybrid_->layers) {
+            secondary_experts += (int) layer.cold_expert_ids.size();
+        }
         std::fprintf(stderr,
                      "[deepseek4-moe-tp] enabled mode=in-process local=%s:%d "
                      "secondary=%s:%d primary_experts=%d "
@@ -2251,7 +2880,7 @@ bool DeepSeek4Backend::init_moe_tensor_parallel() {
                      placement_backend_name(tp.secondary_backend),
                      tp.secondary_gpu,
                      moe_placement_.total_hot,
-                     w_.n_layer * w_.n_expert - moe_placement_.total_hot);
+                     secondary_experts);
         return true;
     }
 
@@ -2304,7 +2933,7 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
             !plan_deepseek4_paged_cache(
                 (uint32_t)w.head_dim, (uint32_t)w.n_indexer_head_dim,
                 (uint32_t)cfg_.max_concurrency, (uint32_t)max_ctx,
-                physical_blocks, w.compress_ratios, paged_plan) ||
+                physical_blocks, deepseek4_layer_geometries(w), paged_plan) ||
             kv_bytes > UINT64_MAX - paged_plan.total_persistent_bytes) {
             if (err) *err = "failed to plan paged KV memory for hybrid placement";
             return false;
@@ -2328,7 +2957,7 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     const bool concentrate_requested = tp.concentrate_secondary;
     bool concentrated = false;
     int retained_local = 0;
-    const char * profile_path = std::getenv("LUCE_DS4_HOTNESS_CSV");
+    const char * profile_path = ds4_usage_profile_path();
     const char * decode_profile_path =
         std::getenv("LUCE_DS4_DECODE_HOTNESS_CSV");
     const bool phase_aware_placement = decode_profile_path &&
@@ -2630,6 +3259,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
 
     auto hybrid = std::make_shared<MoeHybridStorage>();
     const auto fail_hybrid_init = [&]() {
+        expert_cache_.destroy();
         stream_engine_.destroy();
         hybrid.reset();
         if (expert_backend_) {
@@ -2677,6 +3307,11 @@ bool DeepSeek4Backend::init_hybrid_model() {
         }
         hybrid_cfg.materialize_cold_experts = true;
         hybrid_cfg.cold_expert_backend = MoeHybridColdBackend::Gpu;
+    }
+    const int host_spill_gpu = same_runtime_tp ? tp.secondary_gpu : -1;
+    if (!apply_expert_ownership(inprocess_tp, host_spill_gpu, hybrid_cfg)) {
+        if (host_spill_gpu >= 0) ggml_backend_cuda_set_host_spill(host_spill_gpu, 0, 0);
+        return fail_hybrid_init();
     }
     if (vision_) {
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
@@ -2731,7 +3366,15 @@ bool DeepSeek4Backend::init_hybrid_model() {
             cfg_.model_path, backend_, w_, moe_placement_, &hybrid_cfg,
             *hybrid, &err, expert_backend_)) {
         std::fprintf(stderr, "[deepseek4] failed to build hybrid expert storage: %s\n", err.c_str());
+        ggml_backend_cuda_set_host_spill(host_spill_gpu, 0, 0);
         return fail_hybrid_init();
+    }
+    // Only the expert stacks go to host memory; everything allocated later
+    // stays in the carve.
+    ggml_backend_cuda_set_host_spill(host_spill_gpu, 0, 0);
+    if (const size_t spilled = ggml_backend_cuda_host_spill_bytes(host_spill_gpu)) {
+        std::fprintf(stderr, "[deepseek4] device %d: %.2f GiB of secondary experts in locked host memory\n",
+                     host_spill_gpu, spilled / 1073741824.0);
     }
     if (same_runtime_tp && has_mix_experts &&
         !register_deepseek4_moe_hybrid_mix_tables(
@@ -2817,7 +3460,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
                      "[deepseek4] speculative verifier routes all experts "
                      "to the duplicated secondary stack\n");
     }
-    if (hybrid->has_mmap() && !hybrid->materialized_cold_experts) {
+    if (hybrid->has_mmap() && hybrid->streams_cold_experts()) {
         size_t max_expert_bytes = 0;
         for (const auto & layer : hybrid->layers) {
             const size_t per_expert_bytes = layer.fused_gate_up
@@ -2838,6 +3481,12 @@ bool DeepSeek4Backend::init_hybrid_model() {
                      "[deepseek4] cold-expert stream engine ready: pinned=%.1f MiB scratch=%.1f MiB\n",
                      stream_engine_.pinned_bytes() / 1024.0 / 1024.0,
                      stream_engine_.scratch_bytes() / 1024.0 / 1024.0);
+        hybrid->stream_engine = &stream_engine_;
+
+        // The device cache for streamed experts is sized last, after every
+        // other allocation (init_streamed_expert_tier).
+        stream_cache_device_ = inprocess_tp && tp.secondary_backend == local_kind
+            ? tp.secondary_gpu : cfg_.device.gpu;
     }
 
     moe_hybrid_ = std::move(hybrid);
@@ -2851,11 +3500,17 @@ bool DeepSeek4Backend::init_hybrid_model() {
                 is_gfx_device(tp.secondary_gpu, "gfx1151")
             ? kDs4QualifiedLongContextChunk
             : kDs4DefaultLongContextChunk;
-    const int total_cold = w_.n_layer * w_.n_expert - moe_placement_.total_hot;
+    int total_cold = 0, total_streamed = 0;
+    for (const MoeHybridLayerStorage & layer : moe_hybrid_->layers) {
+        total_streamed += layer.n_streamed;
+        if (layer.down_cold || layer.gate_up_cold) total_cold += (int) layer.cold_expert_ids.size();
+    }
     const char * cold_backend =
-        moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu ? "gpu" : "cpu";
-    std::fprintf(stderr, "[deepseek4] hybrid experts ready: hot=%d cold=%d cold_backend=%s%s\n",
-                 moe_placement_.total_hot, total_cold, cold_backend, "");
+        moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu  ? "gpu"
+        : moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::None ? "none"
+                                                                       : "cpu";
+    std::fprintf(stderr, "[deepseek4] hybrid experts ready: hot=%d cold=%d streamed=%d cold_backend=%s\n",
+                 moe_placement_.total_hot, total_cold, total_streamed, cold_backend);
     return true;
 }
 
@@ -2899,6 +3554,7 @@ bool DeepSeek4Backend::park(ParkTarget target) {
     last_logits_pos_ = -1;
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
+    expert_cache_.destroy();
     stream_engine_.destroy();
     moe_hybrid_.reset();
     if (expert_backend_) {
@@ -2925,10 +3581,11 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
     const bool want_target_model = park_target_includes_target_model(target);
 
     if (want_target_model && parked_) {
-        if (!load_model()) {
+        if (!load_model() || !apply_routing_adjustments() || !init_engram()) {
             std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
             release_vision();
             free_deepseek4_weights(w_);
+            expert_cache_.destroy();
             stream_engine_.destroy();
             moe_hybrid_.reset();
             if (expert_backend_) {
@@ -2948,6 +3605,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             free_deepseek4_cache(cache_);
             release_vision();
             free_deepseek4_weights(w_);
+            expert_cache_.destroy();
             stream_engine_.destroy();
             moe_hybrid_.reset();
             if (expert_backend_) {
@@ -2965,6 +3623,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             release_vision();
             free_deepseek4_weights(w_);
             expert_runtime_.reset();
+            expert_cache_.destroy();
             stream_engine_.destroy();
             moe_hybrid_.reset();
             if (expert_backend_) {
@@ -2983,6 +3642,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
     if (!validate_prefill_mode()) {
         release_vision();
         free_deepseek4_weights(w_);
+        expert_cache_.destroy();
         stream_engine_.destroy();
         moe_hybrid_.reset();
         moe_placement_ = {};
@@ -3001,6 +3661,10 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             return false;
         }
     }
+    // A restored target sizes its streamed expert tier last again.
+    if (moe_hybrid_ && !expert_cache_.ready() && !init_streamed_expert_tier()) return false;
+    // The same post-load checks as init(): a restore that no longer fits fails.
+    if (moe_hybrid_ && (!check_device_headroom() || !size_hybrid_prefill_chunk())) return false;
     cache_.prefill_mode = cfg_.prefill_mode;
     return true;
 }
@@ -3080,7 +3744,11 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   int snap_slot,
                                   int snap_pos,
                                   const DeepSeek4ImagePrompt * images,
-                                  int prefix_tokens) {
+                                  int prefix_tokens,
+                                  const std::vector<int> & restore_points) {
+    // A cancelled or failed request returns before logging its counts: start
+    // this one's from zero.
+    reset_route_counts();
     // Image prompts capture DSpark features from their text chunks only: the
     // image graph takes no capture hooks (see the chunking below).
     const bool capture_spec = spec_enabled_ && spec_drafter_;
@@ -3108,17 +3776,33 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     const int requested_chunk = cfg_.chunk > 0 ? cfg_.chunk : w_.n_swa;
     const int n_total = prefix_tokens > 0
         ? std::min(prefix_tokens, (int)tokens.size()) : (int)tokens.size();
+    // A long prompt routes to most streamed experts: load them in bulk mode
+    // (direct reads, recycled within half the slot pool) so the decode that
+    // follows keeps its slots and the page cache.
+    constexpr int kBulkPrefillTokens = 256;
+    struct BulkLoads {
+        MoeStreamedExpertCache * cache = nullptr;
+        ~BulkLoads() { if (cache) cache->set_bulk(false); }
+    } bulk_loads;
+    if (expert_cache_.ready() && n_total >= kBulkPrefillTokens) {
+        expert_cache_.set_bulk(true);
+        bulk_loads.cache = &expert_cache_;
+    }
     // Bound the layer-major graph to the topology validated by the prefill
     // kernels. Smaller tail chunks use the same scheduler or its reference
     // fallback.
     const int layer_major_cap = vision_
         ? std::min(1024, DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS)
         : DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
-    // Only sparse prefill has a qualified batched mixed-owner HC path. Dense
-    // hybrid execution remains tokenwise; batching it would skip per-token HC
-    // post-mixing and corrupt the hidden state.
+    // Mixed-owner prefill batches on the layer-range path, which mixes the
+    // hyper-connections per token: sparse, or dense attention there. Dense
+    // prefill through the host hybrid step stays token by token; batching it
+    // would skip per-token HC post-mixing and corrupt the hidden state.
+    const bool layer_range_hybrid =
+        moe_hybrid_ && (expert_runtime_.compute || expert_backend_);
     const bool hybrid_batch_supported =
-        !moe_hybrid_ || cache_.prefill_mode == PrefillAttentionMode::Sparse;
+        !moe_hybrid_ || cache_.prefill_mode == PrefillAttentionMode::Sparse ||
+        (cache_.prefill_mode == PrefillAttentionMode::Dense && layer_range_hybrid);
     const int base_chunk =
         !hybrid_batch_supported ||
         (cache_.prefill_mode == PrefillAttentionMode::Exact &&
@@ -3127,8 +3811,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         : std::max(1, std::min(requested_chunk,
                                layer_major_cap));
     const bool bound_hybrid_scratch =
-        moe_hybrid_ &&
-        cache_.prefill_mode == PrefillAttentionMode::Sparse;
+        moe_hybrid_ && hybrid_batch_supported &&
+        cache_.prefill_mode != PrefillAttentionMode::Exact;
     const int chunk = bound_hybrid_scratch
         ? deepseek4_hybrid_prefill_chunk_tokens(
               base_chunk, kv_offset + n_total,
@@ -3225,20 +3909,13 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
 
     bool snapshot_saved = false;
     bool late_context_chunk_logged = false;
-    for (int i = 0; i < n_total;) {
-        if (io.is_cancelled()) return pos;
-
+    // The size of the chunk at prompt offset i (position pos): the scratch
+    // bound, then every boundary a snapshot, a restore or a DSpark capture
+    // needs.
+    const auto plan_chunk = [&](int i, int pos, bool snapshot_saved) {
         int n_tok = bound_hybrid_scratch
             ? deepseek4_hybrid_prefill_step_tokens(chunk, pos, n_total - i)
             : std::min(chunk, n_total - i);
-        if (!late_context_chunk_logged && n_tok < chunk &&
-            pos >= 32768 && n_total - i >= chunk) {
-            late_context_chunk_logged = true;
-            std::fprintf(stderr,
-                         "[deepseek4] late-context prefill pressure bound: "
-                         "chunk %d->%d at pos=%d\n",
-                         chunk, n_tok, pos);
-        }
         // Keep the final heterogeneous band large enough for expert-major
         // execution. A tiny (<512) remainder falls back to grouped
         // mul_mat_id; the qualified affine MMQ path is deliberately disabled
@@ -3256,6 +3933,10 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             snap_pos > pos && snap_pos < pos + n_tok) {
             n_tok = snap_pos - pos;
         }
+        // A batched chunk's numerics depend on where it starts. Start one at
+        // every position a later request may restore from, so the chunks after
+        // a restore are exactly the ones a cold prefill of the prompt runs.
+        n_tok = restore_safe_prefill_tokens(pos, n_tok, restore_points);
         if (capture_spec) {
             const bool batch_final_capture =
                 supports_batched_spec_feature_capture(
@@ -3266,6 +3947,66 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 spec_snap_from, spec_snap_to);
         }
 
+        return n_tok;
+    };
+    // A chunk that needs no logits and no DSpark capture only moves the
+    // prompt forward: consecutive ones run as one whole-prompt layer-major
+    // pass (deepseek4_prefill_layer_major), which reads each streamed expert
+    // once instead of once per chunk.
+    const bool layer_major_prompt =
+        layer_range_hybrid && !images && cache_.prefill_mode == PrefillAttentionMode::Dense;
+    const auto plain_chunk = [&](int i, int n_tok, bool snapshot_saved) {
+        const bool at_snap = save_snapshot && !snapshot_saved && kv_offset + i + n_tok >= snap_pos;
+        const bool capture = capture_spec &&
+            (i + n_tok > spec_final_from ||
+             (!snapshot_saved && i < spec_snap_to && i + n_tok > spec_snap_from));
+        return n_tok > 4 && i + n_tok < n_total && !at_snap && !capture;
+    };
+    for (int i = 0; i < n_total;) {
+        if (io.is_cancelled()) return pos;
+
+        if (layer_major_prompt) {
+            std::vector<int> bands;
+            int span = 0;
+            while (i + span < n_total) {
+                const int n = plan_chunk(i + span, pos + span, snapshot_saved);
+                if (!plain_chunk(i + span, n, snapshot_saved)) break;
+                if (!bands.empty() && span + n > DS4_LAYER_MAJOR_PROMPT_SPAN) break;
+                bands.push_back(n);
+                span += n;
+            }
+            if (bands.size() >= 2) {
+                std::vector<float> embed((size_t) w_.n_embd * (size_t) span);
+                if (!w_.embedder.embed(tokens.data() + i, span, embed.data())) return -1;
+                DeepSeek4StepTelemetry step_tel;
+                if (!deepseek4_prefill_layer_major(
+                        backend_, cfg_.device.gpu, w_, cache_, embed.data(), tokens.data() + i, pos,
+                        bands, timing ? &step_tel : nullptr, moe_hybrid_.get(),
+                        expert_runtime_.compute ? &expert_runtime_ : nullptr, routing_stats_.get())) {
+                    std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
+                    return -1;
+                }
+                std::fprintf(stderr, "[deepseek4] layer-major prefill: %d tokens in %zu bands at pos=%d\n",
+                             span, bands.size(), pos);
+                if (timing) {
+                    add_step_tel(tel_acc, step_tel);
+                    steps += (int) bands.size();
+                }
+                pos += span;
+                i += span;
+                continue;
+            }
+        }
+
+        int n_tok = plan_chunk(i, pos, snapshot_saved);
+        if (!late_context_chunk_logged && n_tok < chunk &&
+            pos >= 32768 && n_total - i >= chunk) {
+            late_context_chunk_logged = true;
+            std::fprintf(stderr,
+                         "[deepseek4] late-context prefill pressure bound: "
+                         "chunk %d->%d at pos=%d\n",
+                         chunk, n_tok, pos);
+        }
         bool chunk_has_image = false;
         if (images) {
             n_tok = vision::atomic_image_chunk(images->spans(), uint64_t(pos), n_tok,
@@ -3358,7 +4099,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         static const bool affine_capture_enabled =
             env_flag_enabled("LUCE_CUDA_MMQ_FP2_AFFINE_CAPTURE");
         affine_mmq_scope.set_enabled(hp == nullptr || affine_capture_enabled);
-        if (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)) {
+        if (layer_range_hybrid) {
             ok = deepseek4_step_layer_range(
                 backend_, cfg_.device.gpu, w_, cache_, hc_state,
                 embed.data(), n_tok, pos,
@@ -3488,6 +4229,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     if (n_total > DS4_CONSERVATIVE_VERIFY_MAX_TOKENS) {
         deepseek4_release_prefill_scratch(cache_, moe_hybrid_.get());
     }
+    log_route_counts("prefill");
     return pos;
 }
 
@@ -3630,6 +4372,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
     if (timing) {
         log_deepseek4_step_telemetry("decode", (int)out_tokens.size(), steps, elapsed_s(phase_t0), tel_acc);
     }
+    log_route_counts("decode");
     return true;
 }
 
@@ -3698,12 +4441,14 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     int committed = kv_offset;
     if (kv_offset == 0) {
         committed = do_prefill(req.prompt, out_io, 0,
-                               req.snap_slot, req.snap_pos, images);
+                               req.snap_slot, req.snap_pos, images,
+                               /*prefix_tokens=*/0, req.restore_points);
     } else if (kv_offset < (int) req.prompt.size()) {
         std::vector<int32_t> suffix(req.prompt.begin() + kv_offset,
                                     req.prompt.end());
         committed = do_prefill(suffix, out_io, kv_offset,
-                               req.snap_slot, req.snap_pos);
+                               req.snap_slot, req.snap_pos, nullptr,
+                               /*prefix_tokens=*/0, req.restore_points);
     }
     if (committed < 0) {
         result.fail(GenerateErrorCode::PrefillFailed);
@@ -3813,6 +4558,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         std::fprintf(stderr, "[deepseek4] DSpark decode: %zu tok in %.3fs (%.1f tok/s) accept_rate=%.2f\n",
                      result.tokens.size(), result.decode_s,
                      result.decode_s > 0 ? result.tokens.size() / result.decode_s : 0.0, accept_rate);
+        log_route_counts("decode");
         maybe_save_routing_stats();
         return result;
     }
@@ -4313,6 +5059,7 @@ void DeepSeek4Backend::shutdown() {
     image_staging_caches_.clear();
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
+    expert_cache_.destroy();
     stream_engine_.destroy();
     moe_hybrid_.reset();
     if (expert_backend_) {

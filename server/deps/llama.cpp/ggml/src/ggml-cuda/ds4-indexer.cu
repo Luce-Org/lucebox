@@ -1,3 +1,4 @@
+#include <atomic>
 #include "ds4-indexer.cuh"
 #include "ds4-env.cuh"
 
@@ -72,7 +73,8 @@ static __global__ void ds4_indexer_qat_kernel(
         const float * src,
         int64_t       n_rows,
         int64_t       src_row_stride,
-        int64_t       dst_row_stride) {
+        int64_t       dst_row_stride,
+        bool          rotate) {
     constexpr int WIDTH = 128;
     constexpr float HADAMARD_SCALE = 0.08838834764831845f;
     const int64_t row = (int64_t) blockIdx.x;
@@ -86,7 +88,7 @@ static __global__ void ds4_indexer_qat_kernel(
     values[tid] = src_row[tid];
     __syncthreads();
 
-    for (int stride = 1; stride < WIDTH; stride <<= 1) {
+    for (int stride = 1; rotate && stride < WIDTH; stride <<= 1) {
         if ((tid & stride) == 0) {
             const int base =
                 (tid & ~(2 * stride - 1)) + (tid & (stride - 1));
@@ -98,7 +100,7 @@ static __global__ void ds4_indexer_qat_kernel(
         __syncthreads();
     }
 
-    const float value = values[tid] * HADAMARD_SCALE;
+    const float value = rotate ? values[tid] * HADAMARD_SCALE : values[tid];
     const int block = tid >> 5;
     const int lane = tid & 31;
     const int block_base = block * 32;
@@ -141,7 +143,8 @@ void ggml_cuda_op_ds4_indexer_qat(
     ds4_indexer_qat_kernel<<<(unsigned) n_rows, 128, 0, stream>>>(
         static_cast<float *>(dst->data),
         static_cast<const float *>(src->data),
-        n_rows, src_row_stride, dst_row_stride);
+        n_rows, src_row_stride, dst_row_stride,
+        ggml_get_op_params_i32(dst, 0) == 0);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1207,6 +1210,15 @@ void ggml_cuda_op_ds4_indexer_score(
 #endif
     {
         (void) wmma_capable;
+#if defined(GGML_USE_HIP) && !DS4_INDEXER_WMMA_AVAILABLE
+        // Built without rocWMMA 2.x headers: every score takes the scalar
+        // kernel, several times slower on long prompts. Say so once.
+        static std::atomic<bool> warned{false};
+        if (warp_size == 32 && !warned.exchange(true)) {
+            GGML_LOG_WARN("%s: built without rocWMMA 2.x headers, the DS4 indexer scores on the "
+                          "scalar kernel (install rocwmma-dev and rebuild)\n", __func__);
+        }
+#endif
         const dim3 grid((unsigned) n_comp, (unsigned) n_tokens, 1);
         if (q->type == GGML_TYPE_F16) {
             ds4_indexer_score_scalar_kernel<true><<<grid, 256, 0, stream>>>(

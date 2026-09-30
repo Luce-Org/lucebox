@@ -111,13 +111,14 @@ static void ggml_compute_forward_ds4_indexer_qat(
     GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
 
     const int64_t n_rows = ggml_nrows(src);
+    const bool rotate = ggml_get_op_params_i32(dst, 0) == 0;
     for (int64_t row = params->ith; row < n_rows; row += params->nth) {
         float values[128];
         const float * src_row = (const float *) ((const char *) src->data + row * src->nb[1]);
         float * dst_row = (float *) ((char *) dst->data + row * dst->nb[1]);
         memcpy(values, src_row, sizeof(values));
 
-        for (int stride = 1; stride < 128; stride <<= 1) {
+        for (int stride = 1; rotate && stride < 128; stride <<= 1) {
             for (int base = 0; base < 128; base += 2 * stride) {
                 for (int i = 0; i < stride; ++i) {
                     const float a = values[base + i];
@@ -127,7 +128,7 @@ static void ggml_compute_forward_ds4_indexer_qat(
                 }
             }
         }
-        for (int i = 0; i < 128; ++i) {
+        for (int i = 0; rotate && i < 128; ++i) {
             values[i] *= 0.08838834764831845f;
         }
         for (int block = 0; block < 4; ++block) {

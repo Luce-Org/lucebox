@@ -9,6 +9,7 @@
 #include "common/model_backend.h"
 #include "common/moe_expert_compute.h"
 #include "common/sampler.h"
+#include "../common/moe_hybrid_expert_cache.h"
 #include "../common/moe_hybrid_placement.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_storage.h"
@@ -221,13 +222,31 @@ private:
                                            int snapshot_capture_from,
                                            int snapshot_capture_to);
 
+    // Batched mixed-owner prefill: per-token scratch on the target and on the
+    // second owner's GPU, the chunk that fits a device, and the chunk length at
+    // `pos` that stops at the next restore point.
+    struct HybridPrefillScratch {
+        size_t target = 0;
+        size_t second = 0;
+        size_t target_fixed = 0;   // per chunk, whatever its size
+    };
+    static HybridPrefillScratch hybrid_prefill_scratch_per_token(
+        const DeepSeek4Weights & w, int max_ctx, int chunk);
+    static int hybrid_prefill_fit_tokens(size_t free_bytes, size_t keep_bytes,
+                                         size_t per_token_bytes);
+    static int restore_safe_prefill_tokens(int pos, int requested_tokens,
+                                           const std::vector<int> & restore_points);
+
     // Prefill prompt tokens in chunks, return absolute committed position.
     // prefix_tokens > 0 prefills only that many leading tokens (the batched
-    // image admission leaves the last prompt token to the paged engine).
+    // image admission leaves the last prompt token to the paged engine). A
+    // batched prefill starts a chunk at every absolute `restore_points`
+    // position (see GenerateRequest::restore_points).
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
                    int kv_offset = 0, int snap_slot = -1, int snap_pos = -1,
                    const DeepSeek4ImagePrompt * images = nullptr,
-                   int prefix_tokens = 0);
+                   int prefix_tokens = 0,
+                   const std::vector<int> & restore_points = {});
     bool load_vision();
     bool init_single_gpu_vision();
     // Encodes one image with the vision runtime (caller serialises use).
@@ -293,8 +312,21 @@ private:
 
     bool load_model();
     bool init_hybrid_model();
+    bool init_streamed_expert_tier();
+    bool check_device_headroom() const;
+    bool log_device_memory(const char * when) const;
+    bool size_hybrid_prefill_chunk();
     bool requires_monolithic_model() const;
     bool validate_prefill_mode() const;
+    bool validate_model_features() const;
+    bool init_engram();
+    bool load_routing_adjustments();
+    bool apply_routing_adjustments();
+    bool upload_protected_routing();
+    bool apply_expert_ownership(bool secondary_owner, int secondary_gpu, MoeHybridConfig & hybrid_cfg);
+    void log_route_counts(const char * phase);
+    // Zeroes the per-phase route and streamed-cache counters.
+    void reset_route_counts();
     bool init_moe_tensor_parallel();
     bool compute_uniform_hybrid_placement(const DeepSeek4Weights & w,
                                           int max_ctx,
@@ -307,6 +339,8 @@ private:
     MoeHybridPlacement                moe_placement_;
     MoeHybridPlacement                moe_decode_placement_;
     MoeHybridStreamEngine             stream_engine_;
+    MoeStreamedExpertCache            expert_cache_;
+    int                               stream_cache_device_ = -1;
     MoeExpertComputeRuntime            expert_runtime_;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string                       routing_stats_out_path_;

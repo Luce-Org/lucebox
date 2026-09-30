@@ -102,6 +102,50 @@ inline const std::vector<LaunchProfile> & launch_profiles() {
                 {"ROCBLAS_USE_HIPBLASLT", "0"},
             },
         },
+        {
+            "ds41-lucebox",
+            "DeepSeek V4.1 Flash on the Lucebox: dense work, hot experts and the "
+            "drafter on the R9700 (gfx1201), a second expert stack on Strix Halo "
+            "(gfx1151, carve plus locked host memory), the rest streamed from SSD; "
+            "the Lucebox placement and router bias from share/deepseek41 (next to "
+            "the binary, or server/share from the repository root)",
+            {
+                {"--target-device", "hip:0"},
+                {"--expert-device", "hip:1"},
+                {"--peer-access", nullptr},
+                {"--max-ctx", "131072"},
+                {"--chunk", "4096"},
+                {"--ds4-prefill", "dense"},
+                // share/... values resolve against the install (server_main.cpp).
+                {"--ds4-expert-placement", "share/deepseek41/placement_lucebox.json"},
+                {"--ds4-router-bias", "share/deepseek41/router_bias_lucebox_40x384_f32.bin"},
+                {"--ds4-protected-experts", "share/deepseek41/massive_experts.json"},
+            },
+            {
+                {"LUCE_EXPERT_BUDGET_MB", "10500"},
+                {"LUCE_DS4_FUSED_VERIFY", "1"},
+                {"LUCE_DS4_FUSED_HYBRID_DECODE", "1"},
+                {"LUCE_DS4_PINNED_ROLLBACK", "1"},
+                {"LUCE_DS4_TP_ROUTE_PREFORK", "1"},
+                {"LUCE_DS4_TP_DEVICE_JOIN", "1"},
+                {"LUCE_DS4_TP_DEVICE_JOIN_SPLIT", "1"},
+                {"LUCE_DS4_TP_FUSED_HC_JOIN", "1"},
+                {"LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS", "1"},
+                {"LUCE_DS4_TP_COARSE_OWNER", "1"},
+                {"LUCE_DS4_TP_NATIVE_ROUTE_WIDTH", "1"},
+                {"LUCE_DS4_TP_MASKED_ROUTES", "1"},
+                {"LUCE_DS4_TP_GROUPED_MMVQ", "1"},
+                {"LUCE_DS4_TP_CAPTURE_CACHE_SLOTS", "4"},
+                {"LUCE_MOE_FULL_COLD_PARALLEL", "1"},
+                {"GGML_CUDA_BATCH_PEER_COPIES", "1"},
+                {"LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK", "2"},
+                {"LUCE_CUDA_I32_REPEAT", "1"},
+                {"LUCE_DS4_DIRECT_INDEXER_TOPK", "1"},
+                {"GGML_DS4_TOPK_BLOCK_RADIX", "1"},
+                {"ROCBLAS_USE_HIPBLASLT", "0"},
+                {"GPU_MAX_HW_QUEUES", "8"},
+            },
+        },
     };
     return profiles;
 }

@@ -105,4 +105,50 @@ struct MoeHybridPlacement {
         std::string * err = nullptr);
 };
 
+// Explicit expert ownership across three tiers: the primary device (the
+// hot stack), a secondary device (the cold stack of an in-process second
+// owner) and the model file, from which the remaining experts are streamed
+// on demand. Built from a placement file or from a MoeHybridPlacement, then
+// fitted to per-device byte budgets.
+//
+// Placement file (JSON): {"owners": [...]} with n_layer * n_expert strings,
+// index layer * n_expert + expert, each "primary", "secondary" or "stream".
+struct MoeExpertOwnership {
+    enum Owner : uint8_t { Primary = 0, Secondary = 1, Stream = 2 };
+    static constexpr int kOwners = 3;
+
+    int n_layer  = 0;
+    int n_expert = 0;
+    std::vector<uint8_t> owner;    // [n_layer * n_expert] Owner
+    std::vector<uint8_t> pinned;   // [n_layer * n_expert] 1 = keep on the primary
+
+    bool init(int n_layer, int n_expert, Owner fill);
+    static bool load_json(const std::string & path, int n_layer, int n_expert,
+                          MoeExpertOwnership & out, std::string * err = nullptr);
+
+    Owner at(int layer, int expert) const {
+        return (Owner) owner[(size_t) layer * (size_t) n_expert + (size_t) expert];
+    }
+    void set(int layer, int expert, Owner o) {
+        owner[(size_t) layer * (size_t) n_expert + (size_t) expert] = (uint8_t) o;
+    }
+    // Assigns the expert to the primary and exempts it from demotion.
+    void pin_primary(int layer, int expert);
+
+    // Demotes experts one tier at a time (primary -> secondary -> stream)
+    // until each device tier fits its budget. The least-used experts go
+    // first when `usage` is given; otherwise, and among equal usage, the
+    // demotions are spread evenly across layers, highest expert id first.
+    // Fails only when the pinned experts alone exceed the primary budget.
+    bool fit_budgets(const std::vector<uint64_t> & layer_expert_bytes,
+                     uint64_t primary_budget, uint64_t secondary_budget,
+                     const MoeHybridRoutingStats * usage,
+                     std::string * err = nullptr);
+
+    // Expert ids of one tier, per layer, in ascending order.
+    std::vector<std::vector<int32_t>> expert_ids(Owner o) const;
+    int count(Owner o) const;
+    uint64_t bytes(Owner o, const std::vector<uint64_t> & layer_expert_bytes) const;
+};
+
 }  // namespace luce::common

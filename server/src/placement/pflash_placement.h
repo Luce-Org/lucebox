@@ -15,11 +15,6 @@ struct PFlashDrafterPlacement {
     RemoteDraftConfig remote;
 };
 
-inline bool pflash_drafter_placement_used(bool pflash_enabled,
-                                          bool has_decode_draft) {
-    return pflash_enabled || has_decode_draft;
-}
-
 inline PFlashDrafterPlacement resolve_pflash_drafter_placement(
         const DevicePlacement & target_device,
         const DevicePlacement & drafter_device,

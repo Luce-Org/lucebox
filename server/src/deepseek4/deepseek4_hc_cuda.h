@@ -15,6 +15,16 @@ bool deepseek4_cuda_hc_pre_mix(const float * hc_state_host,
                                float         eps,
                                float *       mix_host);
 
+// deepseek4_cuda_hc_pre_mix for n_tokens consecutive HC states (and mixes of
+// 2*n_hc + n_hc*n_hc floats each) in one round trip; bit-identical per token.
+bool deepseek4_cuda_hc_pre_mix_batch(const float * hc_states_host,
+                                     int           n_tokens,
+                                     const void *  fn_device,
+                                     int           n_embd,
+                                     int           n_hc,
+                                     float         eps,
+                                     float *       mix_host);
+
 bool deepseek4_cuda_hc_pre(const float * hc_state_host,
                            const void *  fn_device,
                            const float * scale_host,

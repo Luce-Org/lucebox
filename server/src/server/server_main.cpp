@@ -33,6 +33,7 @@
 #include "kvflash_pager.h"
 #include "kv_quant.h"
 
+#include <filesystem>
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
@@ -163,6 +164,14 @@ static void print_usage(const char * prog) {
         "  --ds4-expert-top-k <N>\n"
         "                       Keep and renormalize the highest-ranked N routed experts\n"
         "                       (0=model default; single-device DeepSeek4 only)\n"
+        "  --ds4-expert-placement <FILE>\n"
+        "                       Per-expert owner: primary GPU, secondary GPU or streamed\n"
+        "                       from the model file (JSON, see docs/DS41.md)\n"
+        "  --ds4-router-bias <FILE>\n"
+        "                       Add f32 [n_layer][n_expert] to the routing selection bias\n"
+        "  --ds4-protected-experts <FILE>\n"
+        "                       Experts that keep a token's native routing and stay on\n"
+        "                       the primary GPU (JSON {\"layer\": [ids]})\n"
         "  --ds4-prefill <mode> DeepSeek4 prefill: exact, dense, or sparse\n"
         "                       (default: exact; dense/sparse are experimental\n"
         "                       and may change generated tokens)\n"
@@ -546,6 +555,21 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 std::fprintf(stderr, "[server] --ds4-expert-top-k must be non-negative\n");
                 return 2;
             }
+        } else if ((std::strcmp(argv[i], "--ds4-expert-placement") == 0 ||
+                    std::strcmp(argv[i], "--ds4-router-bias") == 0 ||
+                    std::strcmp(argv[i], "--ds4-protected-experts") == 0) && i + 1 < argc) {
+            // Checked here so a wrong path fails before the model is mapped.
+            const char * flag = argv[i];
+            const char * path = argv[++i];
+            std::error_code ec;
+            if (!*path || !std::filesystem::is_regular_file(path, ec)) {
+                std::fprintf(stderr, "[server] %s: no such file '%s'\n", flag, path);
+                return 2;
+            }
+            std::string & dst = std::strcmp(flag, "--ds4-expert-placement") == 0 ? bargs.ds4_expert_placement
+                              : std::strcmp(flag, "--ds4-router-bias") == 0 ? bargs.ds4_router_bias
+                                                                            : bargs.ds4_protected_experts;
+            dst = path;
         } else if (std::strcmp(argv[i], "--ds4-prefill") == 0 && i + 1 < argc) {
             const char * mode = argv[++i];
             bargs.ds4_prefill_mode_set = true;
@@ -1036,9 +1060,9 @@ static void print_target_device_hint(const std::string & model_path,
 static bool apply_expert_device(const DevicePlacement & expert,
                                 const BackendPlan & plan) {
     const DevicePlacement & target = plan.placement().target;
-    if (plan.arch() != "deepseek4") {
+    if (!luce::common::arch_is_deepseek4_family(plan.arch())) {
         std::fprintf(stderr,
-            "[server] --expert-device is only valid for deepseek4 models (detected '%s')\n",
+            "[server] --expert-device is only valid for DeepSeek V4 / V4.1 models (detected '%s')\n",
             plan.arch().c_str());
         return false;
     }
@@ -1209,7 +1233,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     const BackendPlan::Execution & backend_execution =
         backend_plan.execution();
     const std::string & arch = backend_plan.arch();
-    if (multi_model && !backend_cache.paged_attention && arch != "deepseek4" && arch != "qwen35") {
+    if (multi_model && !backend_cache.paged_attention && !arch_is_deepseek4_family(arch) && arch != "qwen35") {
         std::fprintf(stderr,
             "[server] model '%s': single-request routing currently supports Qwen and DeepSeek4; "
             "use --max-concurrency for a supported batched model\n", sconfig.model_name.c_str());
@@ -1304,7 +1328,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     if (arch == "qwen35" && !backend_placement.target.is_multi_device()) {
         cache_type_k = luce::kv_type_name(backend_cache.cache_type_k);
         cache_type_v = luce::kv_type_name(backend_cache.cache_type_v);
-    } else if (arch == "deepseek4") {
+    } else if (arch_is_deepseek4_family(arch)) {
         if (!cache_type_k.empty() || !cache_type_v.empty()) {
             std::fprintf(stderr, "[server] model '%s': --cache-type-k/v are ignored by DeepSeek4's fixed cache layout\n", sconfig.model_name.c_str());
         }
@@ -1679,7 +1703,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     std::fprintf(stderr, "[server] │  chunk           = %d\n", backend_execution.chunk);
     std::fprintf(stderr, "[server] │  admission_wait  = %d ms\n",
                  sconfig.admission_coalesce_ms);
-    if (arch == "deepseek4") {
+    if (arch_is_deepseek4_family(arch)) {
         std::fprintf(stderr, "[server] │  ds4_fused      = %s\n",
                      backend_execution.fused_decode ? "ON" : "off");
         std::fprintf(stderr, "[server] │  ds4_verify_f16kv= %s\n",
@@ -1934,6 +1958,28 @@ static int list_devices(const char * model_path) {
 // right after the model path. Tokens the block already sets are left out, so
 // explicit flags win in any order. The profile's environment is installed by
 // load_model(), so a block that is never loaded changes nothing.
+// A profile data file (share/...) as installed: next to the binary
+// (<bin>/../share, <bin>/share), else under the working directory
+// (server/share from the repository root, then share).
+static std::string resolve_profile_data_path(const std::string & rel, const char * argv0) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> roots;
+    std::error_code ec;
+    fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (ec && argv0) exe = fs::absolute(argv0, ec);
+    if (!exe.empty()) {
+        roots.push_back(exe.parent_path().parent_path());
+        roots.push_back(exe.parent_path());
+    }
+    roots.push_back(fs::current_path(ec) / "server");
+    roots.push_back(fs::current_path(ec));
+    for (const fs::path & root : roots) {
+        const fs::path p = root / rel;
+        if (fs::exists(p, ec)) return p.string();
+    }
+    return rel;  // not found: the file flag check names it
+}
+
 static bool expand_launch_profile(std::vector<char *> & block,
                                   std::vector<std::unique_ptr<std::string>> & storage,
                                   bool load_balancing,
@@ -1972,7 +2018,9 @@ static bool expand_launch_profile(std::vector<char *> & block,
     std::vector<char *> inserted;
     std::string shown;
     for (const std::string & arg : args) {
-        storage.push_back(std::make_unique<std::string>(arg));
+        const bool data = arg.rfind("share/", 0) == 0;
+        storage.push_back(std::make_unique<std::string>(
+            data ? resolve_profile_data_path(arg, kept.empty() ? nullptr : kept[0]) : arg));
         inserted.push_back(storage.back()->data());
         shown += " " + arg;
     }

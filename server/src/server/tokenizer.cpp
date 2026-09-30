@@ -585,6 +585,34 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
                 }
             }
         }
+        // Some DeepSeek V4.1 conversions type the chat, thinking and tool
+        // markers as normal tokens (V4 files type them control/user-defined).
+        // BPE would then spell <｜User｜> as five text pieces and the model
+        // would never see its turn markers. On a DeepSeek vocabulary, match
+        // every token in the full-width control form, and the markers the
+        // DeepSeek template emits, as a whole string like any added token.
+        static const std::string kDsBos = "<｜begin▁of▁sentence｜>";
+        if (!id_to_token_.empty() && id_to_token_[0] == kDsBos) {
+            static const char * kDsMarkers[] = {
+                "<think>", "</think>", "<|EOT|>", "｜DSML｜", "<dsml:", "</dsml:",
+            };
+            const std::string open = "<｜", close = "｜>";
+            size_t repaired = 0;
+            for (int i = 0; i < n_types && i < n_vocab; i++) {
+                const uint32_t ttype = ((const uint32_t *)gguf_get_arr_data(gctx, type_key))[i];
+                if (ttype == 3 || ttype == 4) continue;
+                const std::string & tok = id_to_token_[i];
+                bool marker = tok.size() > open.size() + close.size() &&
+                    tok.compare(0, open.size(), open) == 0 &&
+                    tok.compare(tok.size() - close.size(), close.size(), close) == 0;
+                for (const char * m : kDsMarkers) marker = marker || tok == m;
+                if (marker) { added_tokens_.push_back({tok, (int32_t)i}); ++repaired; }
+            }
+            if (repaired > 0) {
+                std::fprintf(stderr, "[tokenizer] %zu DeepSeek control tokens were typed "
+                             "normal in the GGUF; matching them as whole tokens\n", repaired);
+            }
+        }
         // Sort longest-first for greedy matching.
         std::sort(added_tokens_.begin(), added_tokens_.end(),
                   [](const auto & a, const auto & b) {

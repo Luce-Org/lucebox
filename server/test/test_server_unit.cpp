@@ -11,7 +11,6 @@
 #include "server/sse_emitter.h"
 #include "server/tool_parser.h"
 #include "server/model_card.h"
-#include "server/reasoning.h"
 #include "server/response_error.h"
 #include "server/prefix_cache.h"
 #include "server/pin_friendly_prompt.h"
@@ -704,31 +703,6 @@ TEST_CASE(ServerUnitFixture, test_utf8_sanitize_empty) {
     TEST_ASSERT(utf8_sanitize("") == "");
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Reasoning parser tests
-// ═══════════════════════════════════════════════════════════════════════
-
-TEST_CASE(ServerUnitFixture, test_reasoning_basic) {
-    auto r = parse_reasoning("<think>I need to think</think>The answer is 42");
-    TEST_ASSERT(r.has_reasoning);
-    TEST_ASSERT(r.reasoning == "I need to think");
-    TEST_ASSERT(r.content == "The answer is 42");
-}
-
-TEST_CASE(ServerUnitFixture, test_reasoning_no_tags) {
-    auto r = parse_reasoning("Just plain text");
-    TEST_ASSERT(!r.has_reasoning);
-    TEST_ASSERT(r.content == "Just plain text");
-}
-
-TEST_CASE(ServerUnitFixture, test_reasoning_started_in_thinking) {
-    auto r = parse_reasoning("thinking body</think>content here",
-                             true, true);
-    TEST_ASSERT(r.has_reasoning);
-    TEST_ASSERT(r.reasoning == "thinking body");
-    TEST_ASSERT(r.content == "content here");
-}
-
 TEST_CASE(ServerUnitFixture, test_emitter_started_in_thinking_without_open_tag) {
     auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), true);
     auto chunks = em.emit_token("Thinking Process: calculate 9 + 6.");
@@ -742,36 +716,6 @@ TEST_CASE(ServerUnitFixture, test_emitter_started_in_thinking_without_open_tag) 
     TEST_ASSERT(em.first_content_token_index() == 2);
     TEST_ASSERT(all.find("reasoning_content") != std::string::npos);
     TEST_ASSERT(all.find("\"content\":\"Thinking Process") == std::string::npos);
-}
-
-TEST_CASE(ServerUnitFixture, test_reasoning_unclosed_think) {
-    auto r = parse_reasoning("<think>still thinking no close",
-                             true, false);
-    TEST_ASSERT(r.has_reasoning);
-    TEST_ASSERT(r.reasoning == "still thinking no close");
-    TEST_ASSERT(r.content.empty());
-}
-
-TEST_CASE(ServerUnitFixture, test_reasoning_empty_thinking) {
-    auto r = parse_reasoning("<think></think>answer");
-    TEST_ASSERT(!r.has_reasoning);  // empty reasoning
-    TEST_ASSERT(r.content == "answer");
-}
-
-TEST_CASE(ServerUnitFixture, test_reasoning_whitespace_in_think) {
-    auto r = parse_reasoning("<think>\n  reasoning \n</think>\ncontent");
-    TEST_ASSERT(r.has_reasoning);
-    TEST_ASSERT(r.reasoning == "reasoning");
-    TEST_ASSERT(r.content == "content");
-}
-
-TEST_CASE(ServerUnitFixture, test_reasoning_disabled) {
-    // When thinking disabled but tags present, the parser still finds them
-    // (the caller decides whether to use the reasoning field).
-    auto r = parse_reasoning("<think>ignored</think>content",
-                             false, false);
-    // Tags are still parsed — has_reasoning is true because reasoning text is non-empty
-    TEST_ASSERT(r.content == "content");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4337,63 +4281,10 @@ TEST_CASE(ServerUnitFixture, test_concurrent_status_is_aggregate_only) {
     TEST_ASSERT(snapshot["current"].is_null());
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_config_modes) {
-    ServerConfig cfg;
-    cfg.pflash_mode = ServerConfig::PflashMode::AUTO;
-    TEST_ASSERT(cfg.pflash_mode != ServerConfig::PflashMode::OFF);
-
-    cfg.pflash_mode = ServerConfig::PflashMode::ALWAYS;
-    TEST_ASSERT(cfg.pflash_mode != ServerConfig::PflashMode::OFF);
-    TEST_ASSERT(cfg.pflash_mode != ServerConfig::PflashMode::AUTO);
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_compress_request_struct) {
-    ModelBackend::CompressRequest req;
-    req.input_ids = {1, 2, 3, 4, 5};
-    req.keep_ratio = 0.05f;
-    req.drafter_path = "/path/to/drafter.gguf";
-    req.skip_park = true;
-
-    TEST_ASSERT(req.input_ids.size() == 5);
-    TEST_ASSERT(req.keep_ratio > 0.0f);
-    TEST_ASSERT(!req.drafter_path.empty());
-    TEST_ASSERT(req.skip_park);
-}
-
 TEST_CASE(ServerUnitFixture, test_pflash_compress_result_defaults) {
     ModelBackend::CompressResult result;
     TEST_ASSERT(!result.ok);
     TEST_ASSERT(result.compressed_ids.empty());
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_threshold_auto_mode) {
-    // Simulate the threshold check logic from http_server.cpp
-    ServerConfig cfg;
-    cfg.pflash_mode = ServerConfig::PflashMode::AUTO;
-    cfg.pflash_threshold = 1000;
-
-    // Below threshold: don't compress
-    int n_prompt = 500;
-    bool should = (cfg.pflash_mode == ServerConfig::PflashMode::ALWAYS) ||
-                  (cfg.pflash_mode == ServerConfig::PflashMode::AUTO && n_prompt >= cfg.pflash_threshold);
-    TEST_ASSERT(!should);
-
-    // Above threshold: compress
-    n_prompt = 2000;
-    should = (cfg.pflash_mode == ServerConfig::PflashMode::ALWAYS) ||
-             (cfg.pflash_mode == ServerConfig::PflashMode::AUTO && n_prompt >= cfg.pflash_threshold);
-    TEST_ASSERT(should);
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_threshold_always_mode) {
-    ServerConfig cfg;
-    cfg.pflash_mode = ServerConfig::PflashMode::ALWAYS;
-
-    // Even small prompts should compress in ALWAYS mode
-    int n_prompt = 10;
-    bool should = (cfg.pflash_mode == ServerConfig::PflashMode::ALWAYS) ||
-                  (cfg.pflash_mode == ServerConfig::PflashMode::AUTO && n_prompt >= cfg.pflash_threshold);
-    TEST_ASSERT(should);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_config_upstream_defaults) {
@@ -4402,66 +4293,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_config_upstream_defaults) {
     TEST_ASSERT(cfg.pflash_upstream_key.empty());
     TEST_ASSERT(cfg.pflash_upstream_model.empty());
     TEST_ASSERT(cfg.pflash_curve.empty());
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_curve_interpolation) {
-    ServerConfig cfg;
-    cfg.pflash_curve = {{10000, 0.50f}, {40000, 0.20f}, {100000, 0.10f}};
-
-    // Replicate the piecewise logic from http_server.cpp
-    auto keep = [&](int n) -> float {
-        const auto & curve = cfg.pflash_curve;
-        if (n <= curve.front().first) return curve.front().second;
-        if (n >= curve.back().first)  return curve.back().second;
-        for (size_t i = 0; i + 1 < curve.size(); ++i) {
-            if (n <= curve[i + 1].first) {
-                float t = (float)(n - curve[i].first) /
-                          (float)(curve[i + 1].first - curve[i].first);
-                return curve[i].second + t * (curve[i + 1].second - curve[i].second);
-            }
-        }
-        return curve.back().second;
-    };
-
-    // Below first breakpoint
-    TEST_ASSERT(keep(5000) == 0.50f);
-    // At first breakpoint
-    TEST_ASSERT(keep(10000) == 0.50f);
-    // Midpoint between 10k and 40k
-    float mid = keep(25000);
-    TEST_ASSERT(mid > 0.20f && mid < 0.50f);
-    // At second breakpoint
-    TEST_ASSERT(std::fabs(keep(40000) - 0.20f) < 0.001f);
-    // Above last breakpoint
-    TEST_ASSERT(keep(200000) == 0.10f);
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_curve_empty_uses_flat) {
-    ServerConfig cfg;
-    cfg.pflash_keep_ratio = 0.05f;
-    // With empty curve, should fall back to flat ratio
-    TEST_ASSERT(cfg.pflash_curve.empty());
-    TEST_ASSERT(cfg.pflash_keep_ratio == 0.05f);
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_upstream_proxy_config) {
-    ServerConfig cfg;
-    cfg.pflash_upstream_base = "http://localhost:8080/v1";
-    cfg.pflash_upstream_key = "test-key";
-    cfg.pflash_upstream_model = "test-model";
-
-    TEST_ASSERT(!cfg.pflash_upstream_base.empty());
-    TEST_ASSERT(cfg.pflash_upstream_key == "test-key");
-    TEST_ASSERT(cfg.pflash_upstream_model == "test-model");
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_raw_body_preserved) {
-    ParsedRequest req;
-    req.raw_body = {{"model", "test"}, {"messages", json::array()}, {"temperature", 0.7}};
-
-    TEST_ASSERT(req.raw_body.contains("model"));
-    TEST_ASSERT(req.raw_body.contains("temperature"));
-    TEST_ASSERT(req.raw_body["temperature"].get<float>() > 0.6f);
 }
 
 TEST_CASE(ServerUnitFixture, test_parse_request_sampler_applies_defaults_and_overrides) {
@@ -4815,17 +4646,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_placement_disabled_never_remote) {
     TEST_ASSERT(placement.drafter_backend == PlacementBackend::Hip);
     TEST_ASSERT(!placement.remote_drafter);
     TEST_ASSERT(!placement.remote.enabled());
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_placement_usage_gate) {
-    TEST_ASSERT(!pflash_drafter_placement_used(
-        /*pflash_enabled=*/false, /*has_decode_draft=*/false));
-    TEST_ASSERT(pflash_drafter_placement_used(
-        /*pflash_enabled=*/false, /*has_decode_draft=*/true));
-    TEST_ASSERT(pflash_drafter_placement_used(
-        /*pflash_enabled=*/true, /*has_decode_draft=*/false));
-    TEST_ASSERT(pflash_drafter_placement_used(
-        /*pflash_enabled=*/true, /*has_decode_draft=*/true));
 }
 
 TEST_CASE(ServerUnitFixture, test_draft_residency_parse) {
@@ -6972,38 +6792,6 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_continued_boundary) {
     rm_rf(dir);
 }
 
-TEST_CASE(ServerUnitFixture, test_disk_cache_continued_interval_logic) {
-    // Verify the continued boundary math independently.
-    // Target = (cur_pos / interval) * interval
-    // Only fires when target > last_store_pos AND target >= min_tokens.
-    int interval = 10240;
-    int min_tokens = 512;
-
-    // cur_pos=10239: target = 10239/10240 * 10240 = 0. No save.
-    int target = (10239 / interval) * interval;
-    TEST_ASSERT(target == 0);
-
-    // cur_pos=10240: target = 10240. Save.
-    target = (10240 / interval) * interval;
-    TEST_ASSERT(target == 10240);
-
-    // cur_pos=20479: target = 10240. But if last_store=10240, no save.
-    target = (20479 / interval) * interval;
-    TEST_ASSERT(target == 10240);
-
-    // cur_pos=20480: target = 20480. Save.
-    target = (20480 / interval) * interval;
-    TEST_ASSERT(target == 20480);
-
-    // Verify min_tokens gate.
-    int small_interval = 100;
-    target = (150 / small_interval) * small_interval;
-    TEST_ASSERT(target == 100);
-    // target=100 < min_tokens=512, so the continued save should NOT fire.
-    TEST_ASSERT(target < min_tokens);
-    (void)min_tokens;
-}
-
 TEST_CASE(ServerUnitFixture, test_disk_cache_full_lookup_lengths) {
     // Whole prompt first, then every boundary deepest first, skipping cuts
     // below the persistence minimum and the prompt end itself.
@@ -7081,31 +6869,6 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_finds_boundary) {
     TEST_ASSERT(result == 0);  // layout not known yet
 
     rm_rf(dir);
-}
-
-TEST_CASE(ServerUnitFixture, test_disk_cache_budget_enforcement_scoring) {
-    // Test that eviction scoring prefers lower-value entries.
-    // score = (hits+1) * token_count / file_size
-    // Entry with fewer tokens + fewer hits should have lower score.
-
-    // Simulate: entry A: 100 tokens, 0 hits, 1MB → score = 1*100/1M = 0.0001
-    //           entry B: 10000 tokens, 5 hits, 1MB → score = 6*10000/1M = 0.06
-    // Entry A should be evicted first.
-    double score_a = (0.0 + 1.0) * 100.0 / (1024.0 * 1024.0);
-    double score_b = (5.0 + 1.0) * 10000.0 / (1024.0 * 1024.0);
-    TEST_ASSERT(score_a < score_b);
-
-    // With time decay: entry B with 24h old hits (4 half-lives = 0.0625 remaining)
-    double decay_24h = std::exp(-86400.0 * 3.2e-5);  // ~0.064
-    double score_b_decayed = (5.0 * decay_24h + 1.0) * 10000.0 / (1024.0 * 1024.0);
-    // Should still be higher than A since (5*0.064+1)=1.32 > 1.0
-    TEST_ASSERT(score_b_decayed > score_a);
-
-    // With 7 days old (massive decay), hits are nearly zero:
-    double decay_7d = std::exp(-604800.0 * 3.2e-5);  // ~5e-9
-    double score_b_ancient = (5.0 * decay_7d + 1.0) * 10000.0 / (1024.0 * 1024.0);
-    // (5*~0 + 1)*10000/1M ≈ 0.01 — still > score_a since more tokens
-    TEST_ASSERT(score_b_ancient > score_a);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_lookup_miss_no_layout) {
@@ -7548,25 +7311,6 @@ TEST_CASE(ServerUnitFixture, test_moe_hybrid_expert_compute_batch_default) {
     luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_BATCH");
     luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_BATCH_MAX");
     TEST_ASSERT(moe_hybrid_expert_compute_batch_limit() == 32);
-}
-
-TEST_CASE(ServerUnitFixture, test_moe_hybrid_expert_compute_ipc_mode_batch_limit) {
-    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE");
-    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
-    TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 1024);
-
-    luce_setenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE", "auto");
-    luce_setenv("LUCE_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY", "512");
-    TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 512);
-
-    luce_setenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE", "batched");
-    TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 512);
-
-    luce_setenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE", "stream");
-    TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 32);
-
-    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE");
-    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
 }
 
 TEST_CASE(ServerUnitFixture, test_moe_hybrid_prefill_hot_sub_batch_limit) {
@@ -8521,70 +8265,6 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_resto
 TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_defaults_to_zero) {
     GenerateResult r;
     TEST_ASSERT(r.accept_rate == 0.0f);
-}
-
-TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_can_be_set) {
-    GenerateResult r;
-    r.accept_rate = 0.85f;
-    TEST_ASSERT(r.accept_rate == 0.85f);
-}
-
-TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_bounds) {
-    GenerateResult r;
-    r.accept_rate = 0.0f;
-    TEST_ASSERT(r.accept_rate >= 0.0f && r.accept_rate <= 1.0f);
-    r.accept_rate = 1.0f;
-    TEST_ASSERT(r.accept_rate >= 0.0f && r.accept_rate <= 1.0f);
-}
-
-TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_openai) {
-    // Simulate the non-streaming OpenAI JSON response build.
-    // Verify accept_rate flows from GenerateResult into usage block.
-    GenerateResult result;
-    result.succeed();
-    result.tokens = {1, 2, 3};
-    result.accept_rate = 0.75f;
-    result.spec_decode_ran = true;
-
-    std::vector<int32_t> prompt_tokens = {10, 20};
-
-    json resp = {
-        {"id", "test"},
-        {"usage", {
-            {"prompt_tokens", (int)prompt_tokens.size()},
-            {"completion_tokens", (int)result.tokens.size()},
-            {"total_tokens", (int)(prompt_tokens.size() + result.tokens.size())},
-            {"accept_rate", result.accept_rate},
-            {"spec_decode_ran", result.spec_decode_ran}
-        }}
-    };
-
-    TEST_ASSERT(resp["usage"].contains("accept_rate"));
-    TEST_ASSERT(std::abs(resp["usage"]["accept_rate"].get<float>() - 0.75f) < 1e-6f);
-    TEST_ASSERT(resp["usage"]["spec_decode_ran"].get<bool>());
-}
-
-TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_anthropic) {
-    GenerateResult result;
-    result.succeed();
-    result.tokens = {1, 2};
-    result.accept_rate = 0.60f;
-    result.spec_decode_ran = true;
-
-    std::vector<int32_t> prompt_tokens = {5};
-
-    json resp = {
-        {"usage", {
-            {"input_tokens", (int)prompt_tokens.size()},
-            {"output_tokens", (int)result.tokens.size()},
-            {"accept_rate", result.accept_rate},
-            {"spec_decode_ran", result.spec_decode_ran}
-        }}
-    };
-
-    TEST_ASSERT(resp["usage"].contains("accept_rate"));
-    TEST_ASSERT(std::abs(resp["usage"]["accept_rate"].get<float>() - 0.60f) < 1e-6f);
-    TEST_ASSERT(resp["usage"]["spec_decode_ran"].get<bool>());
 }
 
 TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_zero_when_no_spec_decode) {

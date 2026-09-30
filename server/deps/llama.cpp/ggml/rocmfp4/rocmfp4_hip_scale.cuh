@@ -45,6 +45,13 @@ static __device__ __forceinline__ float rocmfpx_ue4m3_to_fp32_finite(uint8_t x) 
     return rocmfp4_u32_as_f32(bits);
 }
 
+// Q2_0_ROCMFP2 half-block scale: bit 7 (never set by UE4M3) negates the
+// half-block's codebook. Mirrors rocmfpx_fp2_half_scale_to_fp32 in rocmfpx.c.
+static __device__ __forceinline__ float rocmfpx_fp2_half_scale_to_fp32_finite(uint8_t e) {
+    const float scale = rocmfpx_ue4m3_to_fp32_finite((uint8_t) (e & 0x7Fu));
+    return (e & 0x80u) ? -scale : scale;
+}
+
 static __device__ __forceinline__ uint8_t rocmfpx_nearest_scale_ue4m3_cuda(float target_scale) {
     if (!(target_scale > 0.0f) || !isfinite(target_scale)) {
         return 0;

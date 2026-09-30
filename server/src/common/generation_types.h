@@ -36,6 +36,11 @@ struct GenerateRequest {
     // Existing physical snapshot coordinates during the cache migration.
     int snap_pos = -1;
     int snap_slot = -1;
+    // Ascending prompt positions a later request may restore a snapshot at
+    // (the prefix cache's chat boundaries and cuts). A backend whose chunked
+    // prefill depends on where chunks start begins one at each, so a restored
+    // prefix plus a suffix prefill reproduces a cold prefill exactly.
+    std::vector<int> restore_points;
     // Transitional callback used below the future Generation channel adapter.
     TokenCallback on_token;
     // Model-ready optional sequences are owned because the engine may retain

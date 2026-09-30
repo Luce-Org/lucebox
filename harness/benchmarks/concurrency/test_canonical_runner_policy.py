@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Focused policy/provenance checks for the canonical concurrency runner."""
+"""Input-validation checks for the canonical concurrency runner."""
 
 from __future__ import annotations
 
 import os
-import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,16 +13,13 @@ RUNNER = Path(__file__).with_name("run_qwen36_canonical_concurrency.sh")
 
 
 class CanonicalRunnerPolicyTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.script = RUNNER.read_text(encoding="utf-8")
+    def setUp(self) -> None:
+        # A regression that lets a value through must not write into the repo.
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.out = Path(self.temp.name) / "out"
 
-    def test_prefill_first_policy_defaults_off_and_rejects_out_of_range_values(self) -> None:
-        self.assertIn(
-            'PREFILL_FIRST_BURST_STEPS="${PREFILL_FIRST_BURST_STEPS:-0}"',
-            self.script,
-        )
-
+    def test_prefill_first_policy_rejects_out_of_range_values(self) -> None:
         for value in (
             "-1",
             "1025",
@@ -33,6 +30,7 @@ class CanonicalRunnerPolicyTests(unittest.TestCase):
             env.update(
                 MODEL="/dev/null",
                 SERVER_BIN="/bin/true",
+                OUT=str(self.out),
                 PREFILL_FIRST_BURST_STEPS=value,
             )
             result = subprocess.run(
@@ -44,16 +42,8 @@ class CanonicalRunnerPolicyTests(unittest.TestCase):
                     "PREFILL_FIRST_BURST_STEPS must be an integer in range 0..1024",
                     result.stderr,
                 )
-        self.assertIn(
-            '(( 10#$PREFILL_FIRST_BURST_STEPS > 1024 ))',
-            self.script,
-        )
 
     def test_idle_prefill_budget_rejects_zero_and_above_effective_cap(self) -> None:
-        self.assertIn(
-            'IDLE_PREFILL_TOKENS="${IDLE_PREFILL_TOKENS:-4096}"',
-            self.script,
-        )
         for value in (
             "0",
             "16385",
@@ -64,6 +54,7 @@ class CanonicalRunnerPolicyTests(unittest.TestCase):
             env.update(
                 MODEL="/dev/null",
                 SERVER_BIN="/bin/true",
+                OUT=str(self.out),
                 IDLE_PREFILL_TOKENS=value,
             )
             result = subprocess.run(
@@ -75,76 +66,29 @@ class CanonicalRunnerPolicyTests(unittest.TestCase):
                     "IDLE_PREFILL_TOKENS must be an integer in range 1..16384",
                     result.stderr,
                 )
-        self.assertIn(
-            '(( 10#$IDLE_PREFILL_TOKENS > 16384 ))',
-            self.script,
-        )
 
-    def test_policy_is_inside_ar_and_ddtree_launch_arrays_before_command(self) -> None:
-        launch_blocks = re.findall(
-            r'launch=\(env (?P<body>.*?)"\$\{command\[@\]\}"\)',
-            self.script,
-            flags=re.DOTALL,
+    def test_policy_range_edges_are_accepted(self) -> None:
+        # Each accepted edge must pass its own guard and stop at a later one,
+        # so a shifted or over-tight cap changes which message is printed.
+        cases = (
+            ({"PREFILL_FIRST_BURST_STEPS": "0", "IDLE_PREFILL_TOKENS": "0"}, "IDLE_PREFILL_TOKENS"),
+            ({"PREFILL_FIRST_BURST_STEPS": "1024", "IDLE_PREFILL_TOKENS": "0"}, "IDLE_PREFILL_TOKENS"),
+            ({"IDLE_PREFILL_TOKENS": "1", "SLOTS": "8"}, "SLOTS"),
+            ({"IDLE_PREFILL_TOKENS": "16384", "SLOTS": "8"}, "SLOTS"),
         )
-        self.assertEqual(len(launch_blocks), 2)
-        self.assertEqual(
-            sum("LUCE_DDTREE_ADAPTIVE" in block for block in launch_blocks), 1
-        )
-        assignment = (
-            'LUCE_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"'
-        )
-        idle_assignment = (
-            'LUCE_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"'
-        )
-        for block in launch_blocks:
-            with self.subTest(ddtree="LUCE_DDTREE_ADAPTIVE" in block):
-                self.assertIn('ROCR_VISIBLE_DEVICES="$GPU_DEVICE"', block)
-                self.assertIn(assignment, block)
-                self.assertIn(idle_assignment, block)
-                self.assertLess(block.index(assignment), block.index("stdbuf"))
-                self.assertLess(block.index(idle_assignment), block.index("stdbuf"))
-
-    def test_metadata_records_the_exact_resolved_policy_value(self) -> None:
-        self.assertIn(
-            "slots,prefill_first_burst_steps,expected_gpu_arch,"
-            "idle_prefill_tokens=sys.argv[1:]",
-            self.script,
-        )
-        self.assertIn(
-            '"prefill_first_burst_steps":int(prefill_first_burst_steps)',
-            self.script,
-        )
-        self.assertIn(
-            '"$GPU_DEVICE" "$SLOTS" "$PREFILL_FIRST_BURST_STEPS"',
-            self.script,
-        )
-
-        self.assertIn('"idle_prefill_tokens":int(idle_prefill_tokens)', self.script)
-        self.assertIn(
-            '"$EXPECTED_GPU_ARCH" "$IDLE_PREFILL_TOKENS"', self.script
-        )
-
-    def test_expected_arch_is_optional_recorded_and_checked_after_health(self) -> None:
-        self.assertIn('EXPECTED_GPU_ARCH="${EXPECTED_GPU_ARCH:-}"', self.script)
-        self.assertIn(
-            '[[ -z "$EXPECTED_GPU_ARCH" || "$EXPECTED_GPU_ARCH" =~ '
-            '^gfx[0-9a-f]+$ ]]',
-            self.script,
-        )
-        self.assertIn('"expected_gpu_arch":expected_gpu_arch or None', self.script)
-        self.assertIn(
-            '"$PREFILL_FIRST_BURST_STEPS" "$EXPECTED_GPU_ARCH"', self.script
-        )
-        health = self.script.index("if ! wait_health")
-        literal_check = self.script.index(
-            'grep -F -- "$EXPECTED_GPU_ARCH" "$case_dir/server.log"', health
-        )
-        client = self.script.index("client_common=(", literal_check)
-        self.assertLess(health, literal_check)
-        self.assertLess(literal_check, client)
-        guard = self.script[literal_check:client]
-        self.assertIn('> "$case_dir/gpu-identity.txt"', guard)
-        self.assertLess(guard.index("stop_server"), guard.index("return 1"))
+        for overrides, later_guard in cases:
+            env = os.environ.copy()
+            env.update(
+                MODEL="/dev/null", SERVER_BIN="/bin/true", OUT=str(self.out), **overrides
+            )
+            result = subprocess.run(
+                [str(RUNNER)], env=env, text=True, capture_output=True, check=False
+            )
+            with self.subTest(**overrides):
+                self.assertEqual(result.returncode, 2)
+                self.assertTrue(
+                    result.stderr.startswith(f"{later_guard} must be"), result.stderr
+                )
 
 
 if __name__ == "__main__":

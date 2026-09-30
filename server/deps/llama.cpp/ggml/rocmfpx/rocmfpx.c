@@ -61,6 +61,11 @@ bool rocmfpx_scale_is_valid(uint8_t e) {
     return e <= 0x7e;
 }
 
+float rocmfpx_fp2_half_scale_to_fp32(uint8_t e) {
+    const float scale = rocmfpx_ue4m3_to_fp32((uint8_t) (e & 0x7f));
+    return (e & 0x80) ? -scale : scale;
+}
+
 size_t rocmfpx_row_size_fp2(int64_t k) {
     assert(k % QK_ROCMFP2 == 0);
     return (size_t) (k / QK_ROCMFP2) * sizeof(block_rocmfp2);
@@ -926,7 +931,7 @@ void rocmfpx_dequantize_row_fp2(const block_rocmfp2 * GGML_RESTRICT x, float * G
             const uint8_t code = (uint8_t) ((xb->qs[i >> 2] >> (2*(i & 3))) & 3u);
             yb[i] = (float) code * scale - offset;
 #else
-            const float scale = rocmfpx_ue4m3_to_fp32(xb->e[i >= QK_ROCMFP2/2]);
+            const float scale = rocmfpx_fp2_half_scale_to_fp32(xb->e[i >= QK_ROCMFP2/2]);
             const uint8_t code = (uint8_t) ((xb->qs[i >> 2] >> (2*(i & 3))) & 3u);
             yb[i] = kvalues_rocmfp2[code] * scale;
 #endif
@@ -1232,9 +1237,15 @@ bool rocmfpx_validate_row_data_fp2(const void * data, size_t nbytes) {
 
     const block_rocmfp2 * blocks = (const block_rocmfp2 *) data;
     const size_t nb = nbytes / sizeof(block_rocmfp2);
+#ifdef ROCMFP2_AFFINE
+    const uint8_t scale_mask = 0xff;
+#else
+    const uint8_t scale_mask = 0x7f;  // bit 7 is the sign flip
+#endif
 
     for (size_t i = 0; i < nb; ++i) {
-        if (!rocmfpx_scale_is_valid(blocks[i].e[0]) || !rocmfpx_scale_is_valid(blocks[i].e[1])) {
+        if (!rocmfpx_scale_is_valid(blocks[i].e[0] & scale_mask) ||
+            !rocmfpx_scale_is_valid(blocks[i].e[1] & scale_mask)) {
             return false;
         }
     }

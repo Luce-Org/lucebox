@@ -29,6 +29,7 @@
 #include "common/draft_swa.h"
 #include "common/derived_scalars.h"
 #include "common/gguf_mmap.h"
+#include "common/tensor_file_reader.h"
 #include "common/gguf_bounds.h"
 
 #include <algorithm>
@@ -671,6 +672,7 @@ bool load_draft_gguf(const std::string & path,
     const size_t data_start = gguf_get_data_offset(gctx);
     const int64_t n_tensors = gguf_get_n_tensors(gctx);
 
+    std::vector<TensorFileSpan> spans;
     size_t total = 0;
     for (int64_t tid = 0; tid < n_tensors; tid++) {
         const char * tname = gguf_get_tensor_name(gctx, tid);
@@ -685,9 +687,17 @@ bool load_draft_gguf(const std::string & path,
             gguf_free(gctx);
             return false;
         }
-        const uint8_t * tensor_bytes = mm_addr + data_start + rel_off;
-        ggml_backend_tensor_set(t, tensor_bytes, 0, sz);
+        spans.push_back({t, 0, data_start + rel_off, sz});
         total += sz;
+    }
+    if (!load_tensor_spans(path, mm_addr, mm_len, spans, &err)) {
+        set_last_error(err);
+        ggml_backend_buffer_free(out.buf);
+        out.buf = nullptr;
+        ggml_free(meta_ctx);
+        out.ctx = nullptr;
+        gguf_free(gctx);
+        return false;
     }
 
     gguf_free(gctx);

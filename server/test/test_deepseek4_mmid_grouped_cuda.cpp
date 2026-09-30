@@ -77,15 +77,22 @@ static int test_benchmark_iterations() {
     return 0;
 }
 
+struct MmidShape {
+    int k = 256;
+    int rows = 128;
+    int input_channels = 1;
+};
+
 static bool run_case(
         ggml_backend_t backend,
         ggml_type type,
         int width,
         bool fused_ds4,
         bool write_output,
-        std::ofstream & output) {
-    int k_dim = 256;
-    int n_rows = 128;
+        std::ofstream & output,
+        MmidShape shape = {}) {
+    int k_dim = shape.k;
+    int n_rows = shape.rows;
     int n_experts = 32;
     int top_k = 8;
     const int benchmark_iterations = env_positive("LUCE_MMID_BENCH_ITERS", 0);
@@ -110,7 +117,7 @@ static bool run_case(
     ggml_tensor * weights = ggml_new_tensor_3d(ctx, type, k_dim, n_rows, n_experts);
     ggml_tensor * gate_weights =
         fused_ds4 ? ggml_new_tensor_3d(ctx, type, k_dim, n_rows, n_experts) : nullptr;
-    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k_dim, 1, width);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k_dim, shape.input_channels, width);
     ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, width);
     // Model weights stay live across fused operations and benchmark replays.
     // INPUT alone lets gallocr recycle a weight after its unfused last use,
@@ -146,7 +153,7 @@ static bool run_case(
     if (!benchmark) {
         weights_f.resize((size_t) k_dim * n_rows * n_experts);
     }
-    std::vector<float> input_f((size_t) k_dim * width);
+    std::vector<float> input_f((size_t) k_dim * shape.input_channels * width);
     for (float & value : weights_f) {
         value = dist(rng);
     }
@@ -244,6 +251,12 @@ static bool run_case(
     if (status == GGML_STATUS_SUCCESS) {
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_get(result, result_h.data(), 0, result_h.size() * sizeof(float));
+        if (!std::all_of(result_h.begin(), result_h.end(), [](float v) { return std::isfinite(v); })) {
+            std::fprintf(stderr, "non-finite output type=%s width=%d\n", ggml_type_name(type), width);
+            ggml_gallocr_free(alloc);
+            ggml_free(ctx);
+            return false;
+        }
         for (int token = 0; token < width; ++token) {
             for (int slot = 0; slot < top_k; ++slot) {
                 if (ids_h[(size_t) token * top_k + slot] >= 0) {
@@ -278,6 +291,55 @@ static bool run_case(
 }
 
 static bool grouped_supported_device();
+
+// Reuse the existing tensor builder, with shapes specific to the Q5_0 policy.
+// The CMake driver compares the complete outputs under default/off/type-mask-off.
+static int run_q5_cases(const char * output_path, bool grouped_enabled) {
+    int devices = 0;
+    cudaDeviceProp device{};
+    const cudaError_t device_status = cudaGetDeviceCount(&devices);
+    if (device_status == cudaErrorNoDevice || (device_status == cudaSuccess && devices == 0)) return 77;
+    if (device_status != cudaSuccess) {
+        std::fprintf(stderr, "cudaGetDeviceCount failed: %s\n", cudaGetErrorString(device_status));
+        return 1;
+    }
+    if (cudaGetDeviceProperties(&device, 0) != cudaSuccess) return 1;
+    if (device.major != 8 || device.minor != 6) return 77;
+
+    const struct {
+        const char * name;
+        int width;
+        MmidShape shape;
+        bool fused, grouped;
+    } cases[] = {
+        {"expert-down",      16, {704, 2816, 8}, false, true},
+        {"broadcast",        16, {704, 2816, 1}, false, true},
+        {"single-position",   1, {704, 2816, 8}, false, false},
+        {"partial-row-tile", 16, {704, 2818, 8}, false, false},
+        {"fused-gate-up",    16, {704, 2816, 1}, true,  false},
+    };
+    auto backend = ggml_backend_cuda_init(0);
+    if (!backend) return 1;
+    std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+    bool ok = output.good();
+    for (const auto & c : cases) {
+        if (!ok) break;
+        const auto before = ggml_backend_cuda_get_mmvq_launch_count();
+        const auto grouped_before = ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count();
+        ok = run_case(backend, GGML_TYPE_Q5_0, c.width, c.fused, true, output, c.shape);
+        const auto launches = ggml_backend_cuda_get_mmvq_launch_count() - before;
+        const auto grouped = ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count() - grouped_before;
+        // One MMVQ call also proves that the two projections in fused-gate-up
+        // were fused. Output parity alone would miss losing that fusion.
+        ok = ok && launches == 1 && grouped == size_t(grouped_enabled && c.grouped);
+        std::printf("[q5-mmid] %s mmvq=%zu grouped=%zu %s\n",
+                    c.name, launches, grouped, ok ? "PASS" : "FAIL");
+    }
+    output.close();
+    ok = ok && output.good();
+    ggml_backend_free(backend);
+    return ok ? 0 : 1;
+}
 
 static int run_child(const char * mode, const char * output_path) {
     const bool grouped = std::strcmp(mode, "grouped") == 0;
@@ -719,6 +781,9 @@ static std::string child_command(
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 4 && std::strcmp(argv[1], "--q5-cases") == 0) {
+        return run_q5_cases(argv[2], std::atoi(argv[3]) != 0);
+    }
     if (argc == 2 && std::strcmp(argv[1], "--test-benchmark-iterations") == 0) {
         return test_benchmark_iterations();
     }
@@ -731,7 +796,7 @@ int main(int argc, char ** argv) {
         argc == 2 && std::strcmp(argv[1], "--mmid-only") == 0;
     if (argc != 1 && !combine_only && !mmid_only) {
         std::fprintf(stderr,
-                     "usage: %s [--combine-only|--mmid-only|--test-benchmark-iterations|--child legacy|grouped|masked-fused|direct OUTPUT]\n",
+                     "usage: %s [--combine-only|--mmid-only|--test-benchmark-iterations|--child legacy|grouped|masked-fused|direct OUTPUT|--q5-cases OUTPUT EXPECT_GROUPED]\n",
                      argv[0]);
         return 2;
     }

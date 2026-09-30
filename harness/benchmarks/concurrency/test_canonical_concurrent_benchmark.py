@@ -212,21 +212,22 @@ class CanonicalBenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid ddtree_steps"):
                 benchmark.load_ddtree_metrics(path)
 
-    def test_blog_generator_matches_bench_he_source(self) -> None:
+    def test_he_raw_suite_is_the_ten_bench_he_prompts(self) -> None:
         generator_spec = importlib.util.spec_from_file_location(
             "generate_prompts", HERE / "generate_prompts.py"
         )
         assert generator_spec is not None and generator_spec.loader is not None
         generator = importlib.util.module_from_spec(generator_spec)
         generator_spec.loader.exec_module(generator)
-        self.assertEqual(len(generator.PROMPTS), 10)
-        source_spec = importlib.util.spec_from_file_location(
-            "bench_he_source", HERE.parents[2] / "server" / "scripts" / "bench_he.py"
+        records = generator.build_records("he-raw")
+        self.assertEqual(
+            [record["id"] for record in records],
+            [f"he_raw_{index:02d}" for index in range(1, 11)],
         )
-        assert source_spec is not None and source_spec.loader is not None
-        source = importlib.util.module_from_spec(source_spec)
-        source_spec.loader.exec_module(source)
-        self.assertEqual(generator.PROMPTS, source.PROMPTS)
+        self.assertTrue(all(record["suite"] == "he-raw" for record in records))
+        self.assertEqual(len({record["prompt"] for record in records}), 10)
+
+    def test_raw_prompt_template_passes_content_through_unchanged(self) -> None:
         self.assertEqual(
             (HERE / "raw_prompt_identity.jinja").read_text(encoding="utf-8"),
             "{%- for message in messages -%}{{ message.content }}{%- endfor -%}\n",

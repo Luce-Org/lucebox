@@ -100,6 +100,12 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <cerrno>
+#if defined(GGML_USE_HIP) && defined(__linux__)
+#include <sys/mman.h>
+#include <sys/resource.h>
+#endif
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -126,6 +132,17 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 static thread_local int ggml_cuda_mmvq_max_ncols_override = 0;
 static thread_local int ggml_cuda_ds4_mix_mmv_max_tokens = GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
 static thread_local bool ggml_cuda_graphs_disabled_override = false;
+static thread_local bool ggml_cuda_mmvq_batch_invariant_enabled = false;
+
+extern "C" bool ggml_backend_cuda_set_mmvq_batch_invariant(bool enabled) {
+    const bool previous = ggml_cuda_mmvq_batch_invariant_enabled;
+    ggml_cuda_mmvq_batch_invariant_enabled = enabled;
+    return previous;
+}
+
+bool ggml_cuda_mmvq_batch_invariant() {
+    return ggml_cuda_mmvq_batch_invariant_enabled;
+}
 
 extern "C" int ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(int max_tokens) {
     GGML_ASSERT(max_tokens >= 0 && max_tokens <= GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS);
@@ -225,7 +242,7 @@ static size_t ggml_cuda_total_ram_bytes() {
     return cached;
 }
 
-static const std::array<bool, GGML_CUDA_MAX_DEVICES> & ggml_cuda_integrated_devices() {
+static bool ggml_cuda_device_is_integrated(int device) {
     static const std::array<bool, GGML_CUDA_MAX_DEVICES> integrated = []() {
         std::array<bool, GGML_CUDA_MAX_DEVICES> flags{};
         int n = 0;
@@ -236,43 +253,8 @@ static const std::array<bool, GGML_CUDA_MAX_DEVICES> & ggml_cuda_integrated_devi
         }
         return flags;
     }();
-    return integrated;
+    return device >= 0 && device < GGML_CUDA_MAX_DEVICES && integrated[device];
 }
-
-static bool ggml_cuda_device_is_integrated(int device) {
-    return device >= 0 && device < GGML_CUDA_MAX_DEVICES && ggml_cuda_integrated_devices()[device];
-}
-
-// HIP H2D into GTT memory can livelock on the pageable path; bounce through pinned staging.
-// Opt out: LUCE_HIP_NO_PINNED_STAGE=1.
-#if defined(GGML_USE_HIP)
-static const size_t GGML_CUDA_STAGE_CHUNK = 256ull * 1024 * 1024;
-
-static void * ggml_cuda_staging_buffer(int device) {
-    static std::mutex mutex;
-    static std::unordered_map<int, void *> buffers;
-    std::lock_guard<std::mutex> lock(mutex);
-    void * & buf = buffers[device];
-    if (buf == nullptr) {
-        ggml_cuda_set_device(device);
-        cudaError_t err = cudaMallocHost(&buf, GGML_CUDA_STAGE_CHUNK);
-        if (err != cudaSuccess) {
-            (void) cudaGetLastError();
-            GGML_LOG_WARN("%s: pinned staging buffer alloc failed (%s); using direct copies\n",
-                          __func__, cudaGetErrorString(err));
-            buf = nullptr;
-        }
-    }
-    return buf;
-}
-
-static bool ggml_cuda_stage_h2d(int device) {
-    if (getenv("LUCE_HIP_NO_PINNED_STAGE") != nullptr) {
-        return false;
-    }
-    return ggml_cuda_device_is_integrated(device);
-}
-#endif // defined(GGML_USE_HIP)
 
 static bool ggml_cuda_device_use_uma(int device, size_t size) {
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
@@ -305,6 +287,138 @@ static bool ggml_cuda_device_use_uma(int device, size_t size) {
     return use;
 }
 
+// Host spill for integrated GPUs (ggml_backend_cuda_set_host_spill): while it
+// is on, a device allocation that would leave less than `carve_reserve` free in
+// the carve goes to locked host memory instead, which the GPU reads from the
+// same DRAM. Those buffers are tracked here and released with cudaFreeHost.
+struct ggml_cuda_host_spill_state {
+    size_t carve_reserve = 0;
+    size_t host_left = 0;
+    size_t host_used = 0;
+};
+static std::mutex g_host_spill_mutex;
+static ggml_cuda_host_spill_state g_host_spill[GGML_CUDA_MAX_DEVICES];
+static std::unordered_map<void *, std::pair<int, size_t>> g_host_spill_ptrs;
+
+static bool ggml_cuda_host_spill_take(void * p) {
+    std::lock_guard<std::mutex> lock(g_host_spill_mutex);
+    auto it = g_host_spill_ptrs.find(p);
+    if (it == g_host_spill_ptrs.end()) return false;
+    ggml_cuda_host_spill_state & st = g_host_spill[it->second.first];
+    st.host_used -= it->second.second;
+    // The freed bytes go back to the budget while spill is on.
+    if (st.carve_reserve > 0) st.host_left += it->second.second;
+    g_host_spill_ptrs.erase(it);
+    return true;
+}
+
+// Host bytes this process may lock: unlimited with CAP_IPC_LOCK (a root
+// service), else RLIMIT_MEMLOCK, its soft limit first raised to the hard one.
+static size_t ggml_cuda_lockable_host_bytes() {
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    if (FILE * f = fopen("/proc/self/status", "r")) {
+        char line[256];
+        unsigned long long cap_eff = 0;
+        bool found = false;
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "CapEff: %llx", &cap_eff) == 1) { found = true; break; }
+        }
+        fclose(f);
+        constexpr int cap_ipc_lock = 14;
+        if (found && (cap_eff >> cap_ipc_lock) & 1) return SIZE_MAX;
+    }
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0) return 0;
+    if (rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        if (setrlimit(RLIMIT_MEMLOCK, &rl) != 0) (void) getrlimit(RLIMIT_MEMLOCK, &rl);
+    }
+    return rl.rlim_cur == RLIM_INFINITY ? SIZE_MAX : (size_t) rl.rlim_cur;
+#else
+    return 0;
+#endif
+}
+
+#if defined(GGML_USE_HIP) && defined(__linux__)
+// Locked, coarse-grained host memory for a device buffer. It must be locked:
+// the GPU does not mark the host pages it reads as accessed, so reclaim takes
+// them for cold and swaps them out, and every swap-in evicts all GPU queues of
+// the process until the pages are back.
+static bool ggml_cuda_host_spill_malloc(void ** ptr, size_t size, int device) {
+    // The budget is reserved up front and refunded on failure, so concurrent
+    // allocations cannot overdraw it.
+    size_t carve_reserve = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_host_spill_mutex);
+        ggml_cuda_host_spill_state & st = g_host_spill[device];
+        if (st.carve_reserve == 0 || st.host_left < size) return false;
+        carve_reserve = st.carve_reserve;
+        st.host_left -= size;
+    }
+    const auto refund = [&]() {
+        std::lock_guard<std::mutex> lock(g_host_spill_mutex);
+        g_host_spill[device].host_left += size;
+        return false;
+    };
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= size + carve_reserve) {
+        return refund();
+    }
+    if (hipHostMalloc(ptr, size, hipHostMallocNonCoherent) != hipSuccess) {
+        (void) hipGetLastError();
+        return refund();
+    }
+    // Kernels get this pointer as a device address: take the spill only
+    // where the host mapping has the same address on the device.
+    void * dev_ptr = nullptr;
+    if (hipHostGetDevicePointer(&dev_ptr, *ptr, 0) != hipSuccess || dev_ptr != *ptr) {
+        (void) hipGetLastError();
+        (void) hipHostFree(*ptr);
+        *ptr = nullptr;
+        return refund();
+    }
+    if (mlock(*ptr, size) != 0) {
+        GGML_LOG_WARN("ggml_cuda: cannot lock %.1f MiB of host memory for device %d (%s)\n",
+                      size / 1048576.0, device, strerror(errno));
+        (void) hipHostFree(*ptr);
+        *ptr = nullptr;
+        return refund();
+    }
+    std::lock_guard<std::mutex> lock(g_host_spill_mutex);
+    g_host_spill[device].host_used += size;
+    g_host_spill_ptrs[*ptr] = {device, size};
+    return true;
+}
+#endif
+
+size_t ggml_backend_cuda_set_host_spill(int device, size_t carve_reserve, size_t host_bytes) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || !ggml_cuda_device_is_integrated(device)) {
+        return 0;
+    }
+    if (carve_reserve == 0 || host_bytes == 0) {
+        carve_reserve = 0;
+        host_bytes = 0;
+    }
+    // Under a finite lock limit, leave room for the runtime's own pinned
+    // buffers (copy staging, graph inputs).
+    const size_t lockable = ggml_cuda_lockable_host_bytes();
+    constexpr size_t pinned_headroom = (size_t) 512 << 20;
+    host_bytes = std::min(host_bytes, lockable == SIZE_MAX ? lockable
+                                      : lockable > pinned_headroom ? lockable - pinned_headroom : 0);
+    std::lock_guard<std::mutex> lock(g_host_spill_mutex);
+    ggml_cuda_host_spill_state & st = g_host_spill[device];
+    st.carve_reserve = host_bytes > 0 ? carve_reserve : 0;
+    // Spills still alive count against the new budget.
+    st.host_left = host_bytes > st.host_used ? host_bytes - st.host_used : 0;
+    return host_bytes;
+}
+
+size_t ggml_backend_cuda_host_spill_bytes(int device) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) return 0;
+    std::lock_guard<std::mutex> lock(g_host_spill_mutex);
+    return g_host_spill[device].host_used;
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device, bool * out_managed = nullptr) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -335,7 +449,37 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device,
         }
 #endif // defined(GGML_USE_HIP)
     } else {
+#if defined(GGML_USE_HIP) && defined(__linux__)
+        // Only buffers spill: their context frees a spilled pointer with
+        // cudaFreeHost, the pools (no out_managed) would cudaFree it.
+        if (out_managed && ggml_cuda_host_spill_malloc(ptr, size, device)) {
+            *out_managed = true;  // CPU-addressable
+            return cudaSuccess;
+        }
+#endif // defined(GGML_USE_HIP) && defined(__linux__)
         err = cudaMalloc(ptr, size);
+#if defined(GGML_USE_HIP)
+        // An integrated GPU with a large carve (e.g. 64 GiB) can fill its
+        // device heap mid-load while host RAM still has room. Retry as managed
+        // memory so the carve and GTT are usable together; same opt-out as
+        // the auto-UMA path above.
+        if (err != cudaSuccess && getenv("LUCE_HIP_NO_AUTO_UMA") == nullptr &&
+            ggml_cuda_device_is_integrated(device)) {
+            (void)hipGetLastError();
+            err = cudaMallocManaged(ptr, size);
+            if (err == cudaSuccess) {
+                managed = true;
+                (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device);
+                (void)hipGetLastError();
+                static bool logged = false;
+                if (!logged) {
+                    GGML_LOG_INFO("ggml_cuda: device %d heap full; overflowing to unified (managed) memory\n",
+                                  device);
+                    logged = true;
+                }
+            }
+        }
+#endif // defined(GGML_USE_HIP)
     }
     if (out_managed != nullptr) {
         *out_managed = managed && (err == cudaSuccess);
@@ -857,7 +1001,11 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (ggml_cuda_host_spill_take(dev_ptr)) {
+            CUDA_CHECK(cudaFreeHost(dev_ptr));
+        } else {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -913,6 +1061,69 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// Large host<->device copies go through a pinned staging buffer of this thread
+// instead of letting the runtime pin the caller's pages (on ROCm a pageable
+// transfer registers them as userptr memory, which the kernel must keep
+// restoring while the page cache churns, e.g. when the source is a mapped
+// model file). Small copies keep the direct path.
+static constexpr size_t GGML_CUDA_STAGED_COPY_MIN = (size_t) 1 << 20;
+static constexpr size_t GGML_CUDA_STAGED_COPY_CHUNK = (size_t) 16 << 20;
+
+// Released when the thread exits: short-lived worker threads (std::async
+// owner evaluations) would otherwise leak 32 MiB of pinned memory each.
+struct ggml_cuda_copy_staging_buffers {
+    char * buf[2] = {nullptr, nullptr};
+    ~ggml_cuda_copy_staging_buffers() {
+        for (char * b : buf) {
+            if (b) cudaFreeHost(b);
+        }
+    }
+};
+
+// Null when pinned memory is off (GGML_CUDA_NO_PINNED) or cannot be had:
+// the caller then copies directly from pageable memory.
+static char * ggml_cuda_copy_staging(int slot) {
+    static const bool no_pinned = getenv("GGML_CUDA_NO_PINNED") != nullptr;
+    if (no_pinned) return nullptr;
+    thread_local ggml_cuda_copy_staging_buffers staging;
+    if (!staging.buf[slot]) {
+        void * ptr = nullptr;
+        if (cudaMallocHost(&ptr, GGML_CUDA_STAGED_COPY_CHUNK) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        staging.buf[slot] = (char *) ptr;
+    }
+    return staging.buf[slot];
+}
+
+static void ggml_cuda_staged_h2d(char * dst, const char * src, size_t size) {
+    // Two buffers: fill one while the other uploads.
+    cudaEvent_t done[2] = {nullptr, nullptr};
+    for (int i = 0; i < 2; ++i) CUDA_CHECK(cudaEventCreateWithFlags(&done[i], cudaEventDisableTiming));
+    for (size_t at = 0, k = 0; at < size; at += GGML_CUDA_STAGED_COPY_CHUNK, ++k) {
+        const int slot = (int) (k & 1);
+        const size_t n = std::min(GGML_CUDA_STAGED_COPY_CHUNK, size - at);
+        char * staging = ggml_cuda_copy_staging(slot);
+        if (k >= 2) CUDA_CHECK(cudaEventSynchronize(done[slot]));
+        memcpy(staging, src + at, n);
+        CUDA_CHECK(cudaMemcpyAsync(dst + at, staging, n, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaEventRecord(done[slot], cudaStreamPerThread));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    for (int i = 0; i < 2; ++i) CUDA_CHECK(cudaEventDestroy(done[i]));
+}
+
+static void ggml_cuda_staged_d2h(char * dst, const char * src, size_t size) {
+    char * staging = ggml_cuda_copy_staging(0);
+    for (size_t at = 0; at < size; at += GGML_CUDA_STAGED_COPY_CHUNK) {
+        const size_t n = std::min(GGML_CUDA_STAGED_COPY_CHUNK, size - at);
+        CUDA_CHECK(cudaMemcpyAsync(staging, src + at, n, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        memcpy(dst + at, staging, n);
+    }
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
@@ -951,46 +1162,10 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         }
         return;
     }
-#if defined(GGML_USE_HIP)
-    if (ggml_cuda_stage_h2d(ctx->device)) {
-        void * staging = ggml_cuda_staging_buffer(ctx->device);
-        if (staging != nullptr) {
-            char * dst = (char *) tensor->data + offset;
-            const char * src = (const char *) data;
-            const size_t chunk = GGML_CUDA_STAGE_CHUNK;
-            unsigned nth = std::thread::hardware_concurrency();
-            if (nth == 0) nth = 4;
-            if (nth > 16) nth = 16;
-            for (size_t done = 0; done < size; ) {
-                const size_t n = (chunk < size - done) ? chunk : (size - done);
-                // Pinned staging copy, then one DMA; split large chunks across threads.
-                const size_t par_threshold = (size_t) 16 * 1024 * 1024;
-                if (n >= par_threshold && nth > 1) {
-                    std::vector<std::thread> workers;
-                    workers.reserve(nth);
-                    const size_t part = (n + nth - 1) / nth;
-                    for (unsigned t = 0; t < nth; t++) {
-                        const size_t s0 = (size_t) t * part;
-                        if (s0 >= n) break;
-                        const size_t len = (part < n - s0) ? part : (n - s0);
-                        workers.emplace_back([staging, src, done, s0, len]() {
-                            memcpy((char *) staging + s0, src + done + s0, len);
-                        });
-                    }
-                    for (auto & w : workers) {
-                        w.join();
-                    }
-                } else {
-                    memcpy(staging, src + done, n);
-                }
-                CUDA_CHECK(cudaMemcpyAsync(dst + done, staging, n, cudaMemcpyHostToDevice, cudaStreamPerThread));
-                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-                done += n;
-            }
-            return;
-        }
+    if (size >= GGML_CUDA_STAGED_COPY_MIN && ggml_cuda_copy_staging(0) && ggml_cuda_copy_staging(1)) {
+        ggml_cuda_staged_h2d((char *) tensor->data + offset, (const char *) data, size);
+        return;
     }
-#endif // defined(GGML_USE_HIP)
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -999,6 +1174,10 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (size >= GGML_CUDA_STAGED_COPY_MIN && !ctx->is_managed && ggml_cuda_copy_staging(0)) {
+        ggml_cuda_staged_d2h((char *) data, (const char *) tensor->data + offset, size);
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -2674,6 +2853,9 @@ static int ggml_cuda_mmvq_max_ncols() {
         const int v = e ? atoi(e) : 3;
         return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
     }();
+    if (ggml_cuda_mmvq_batch_invariant_enabled) {
+        return MMVQ_MAX_BATCH_SIZE;
+    }
     return ggml_cuda_mmvq_max_ncols_override > 0
         ? ggml_cuda_mmvq_max_ncols_override : configured;
 }
@@ -4383,6 +4565,13 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to a collective node\n", __func__);
 #endif
+        }
+
+        // A host mailbox wait enqueues a stream wait on the step it reads
+        // from host memory at launch, so its graph runs eagerly.
+        if (node->op == GGML_OP_MOE_FUSED &&
+            ggml_get_op_params_i32(node, 0) == GGML_MOE_FUSED_HOST_WAIT) {
+            use_cuda_graph = false;
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]

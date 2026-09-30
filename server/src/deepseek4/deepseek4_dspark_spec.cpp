@@ -126,7 +126,8 @@ public:
                                              /*allow_graph_reuse=*/true,
                                              moe_hybrid_, expert_runtime_,
                                              routing_stats_,
-                                             &boundary_checkpoint_)) {
+                                             &boundary_checkpoint_,
+                                             &window_rows_)) {
             return false;
         }
         if (am.empty()) return false;
@@ -244,6 +245,7 @@ public:
         return copied;
     }
     void clear_snapshot() { free_deepseek4_snapshot(snap_); }
+    const Ds4VerifyWindowRows & last_window_rows() const { return window_rows_; }
 
 private:
     const DeepSeek4Weights & w_;
@@ -261,6 +263,7 @@ private:
     std::vector<float> verify_logits_;
     std::vector<float> verify_features_;
     DeepSeek4SpecBoundaryCheckpoint boundary_checkpoint_;
+    Ds4VerifyWindowRows window_rows_;
     MoeHybridStorage * moe_hybrid_ = nullptr;
     MoeExpertComputeRuntime * expert_runtime_ = nullptr;
     MoeHybridRoutingStats * routing_stats_ = nullptr;
@@ -323,6 +326,9 @@ constexpr float kDs4VerifyWidthCostMs[DS4_Q5_VERIFY_TOKENS + 1] = {
 // prev-half = first 4 rows of a [comp_width, 8] ratio-4 rolling state.
 // Ratio-128 states need only the touched ring rows, not the full 128 rows.
 constexpr int kRollbackMaxTokens = 6; // Preserve the existing raw-ring staging capacity.
+// Default V4.1 verify width (seed + two drafts): q=3 beat q=4..6 on the
+// hybrid tier (count 13.0, code 15.0 tok/s against 13.4/13.7 at q=4).
+constexpr int kDs4TokenwiseVerifyDefaultWidth = 3;
 
 size_t prev_half_bytes(const ggml_tensor * t) {
     return t && t->ne[1] == 8 ? (size_t) t->nb[1] * 4 : 0;
@@ -655,8 +661,9 @@ void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weight
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         DeepSeek4LayerCache & lc = cache.layers[il];
         const uint32_t ratio = il < w.compress_ratios.size() ? w.compress_ratios[il] : 0;
-        if (ratio > 0) lc.n_comp = commit_pos / (int) ratio;
-        if (ratio == 4) lc.n_index_comp = commit_pos / 4;
+        // Only the owner of the compressed rows counts them (V4.1 readers own none).
+        if (ratio > 0 && deepseek4_is_kv_source(w, (int) il)) lc.n_comp = commit_pos / (int) ratio;
+        if (lc.index_comp_kv) lc.n_index_comp = commit_pos / (int) ratio;
         const int first_rejected = std::clamp(commit_pos - rb.raw_pos, 0, rb.raw_count);
         if (il < rb.layers.size()) {
             const DeepSeek4SpecRollback::Layer & s = rb.layers[il];
@@ -729,6 +736,36 @@ void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weight
         }
     }
     if (copies) copies->flush(backend);
+}
+
+// V4.1 pooled windows (ratio 2): after a rejection at commit_pos, the rows
+// of the window commit_pos falls in that belong to accepted tokens must hold
+// those tokens' projections, but a later (rejected) token of the batch may
+// have overwritten them. Put them back from the rows the verify kept. The
+// window starts at or after verify_pos because the seed is always accepted
+// and a window is at most two tokens; its remaining rows are rewritten by
+// the next tokens before the window is pooled.
+void spec_restore_window_rows(const Ds4VerifyWindowRows & rows, const DeepSeek4Weights & w,
+                              DeepSeek4Cache & cache, int verify_pos, int commit_pos) {
+    for (size_t il = 0; il < cache.layers.size() && il < rows.kv.size(); ++il) {
+        DeepSeek4LayerCache & lc = cache.layers[il];
+        const int ratio = il < w.compress_ratios.size() ? (int) w.compress_ratios[il] : 0;
+        if (!deepseek4_is_window_state(lc.attn_compressor, ratio)) continue;
+        const size_t row_bytes = lc.attn_compressor.state_kv->nb[1];
+        const int window_start = commit_pos / ratio * ratio;
+        for (int p = std::max(window_start, verify_pos); p < commit_pos; ++p) {
+            const size_t t = (size_t) (p - verify_pos);
+            if (rows.kv[il].size() < (t + 1) * row_bytes ||
+                rows.score[il].size() < (t + 1) * row_bytes) {
+                continue;
+            }
+            const size_t offset = (size_t) (p % ratio) * row_bytes;
+            ggml_backend_tensor_set(lc.attn_compressor.state_kv,
+                                    rows.kv[il].data() + t * row_bytes, offset, row_bytes);
+            ggml_backend_tensor_set(lc.attn_compressor.state_score,
+                                    rows.score[il].data() + t * row_bytes, offset, row_bytes);
+        }
+    }
 }
 
 using SpecClock = std::chrono::steady_clock;
@@ -819,7 +856,8 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
                                      MoeExpertComputeRuntime * expert_runtime,
                                      MoeHybridRoutingStats * routing_stats,
                                      DeepSeek4SpecBoundaryCheckpoint *
-                                         boundary_checkpoint_out) {
+                                         boundary_checkpoint_out,
+                                     Ds4VerifyWindowRows * window_rows) {
     const DeepSeek4RoctxPhaseScope roctx_phase(InferencePhase::Verify);
     std::vector<float> hc_state;
     std::vector<float> all_logits;
@@ -832,6 +870,7 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
     hooks.argmax_out = &gpu_argmax;
     if (boundary_checkpoint_out) boundary_checkpoint_out->clear();
     hooks.boundary_checkpoint_out = boundary_checkpoint_out;
+    hooks.window_rows = window_rows;
     hooks.prefer_argmax_only =
         spec_env_flag("LUCE_DS4_GPU_ARGMAX_VERIFY") && logits_out == nullptr;
     if (!deepseek4_step_layer_range(backend, device, w, cache, hc_state, embed, n_tokens, kv_start,
@@ -966,11 +1005,19 @@ bool run_deepseek4_dspark_spec_decode(
     // The explicit wide path handles a second ratio-4 boundary in-graph and
     // restores/replays only a rejected prefix, avoiding full snapshots on the
     // overwhelmingly common all-accepted path.
-    const int fast_cap = std::min(
-        block + 1,
-        q5_verify ? DS4_Q5_VERIFY_TOKENS
-                  : DS4_CONSERVATIVE_VERIFY_MAX_TOKENS);
-    int q_cap = full_snap ? block + 1 : fast_cap;
+    // V4.1 verifies each token through its decode lane, so no compressor
+    // boundary limits its width, only the rollback staging does
+    // (LUCE_DS4_SPEC_Q up to six); the default width measured best on the
+    // R9700 + Strix Halo hybrid tier.
+    const bool tokenwise_verify = target_w.hc_staggered_pre;
+    const int fast_cap = tokenwise_verify
+        ? std::min(block + 1, kRollbackMaxTokens)
+        : std::min(block + 1,
+                   q5_verify ? DS4_Q5_VERIFY_TOKENS
+                             : DS4_CONSERVATIVE_VERIFY_MAX_TOKENS);
+    int q_cap = full_snap ? block + 1
+              : tokenwise_verify ? std::min(fast_cap, kDs4TokenwiseVerifyDefaultWidth)
+              : fast_cap;
     if (const char * qs = std::getenv("LUCE_DS4_SPEC_Q")) {
         const int v = std::atoi(qs);
         if (v >= 2 && v <= block + 1) {
@@ -1142,7 +1189,8 @@ bool run_deepseek4_dspark_spec_decode(
             const char * v = std::getenv("LUCE_DS4_FUSED_VERIFY");
             return v && *v && *v != '0';
         }();
-        int q_step_cap = (seq_verify_mode || fused_verify_mode)
+        int q_step_cap = tokenwise_verify ? q_cap
+                       : (seq_verify_mode || fused_verify_mode)
                        ? std::min(
                              q_cap,
                              q5_verify ? DS4_Q5_VERIFY_TOKENS
@@ -1346,6 +1394,12 @@ bool run_deepseek4_dspark_spec_decode(
                 ok = false;
                 break;
             }
+        } else if (!full_snap && accept < q && tokenwise_verify) {
+            // Raw rows and compressed-row counters as below; the V4.1
+            // compressors keep no ratio-4 halves, only pooled windows.
+            spec_rollback_apply(rollback, target_w, target_cache, commit_pos, false);
+            spec_restore_window_rows(target.last_window_rows(), target_w, target_cache,
+                                     pos, commit_pos);
         } else if (!full_snap && accept < q &&
                    q > DS4_CONSERVATIVE_VERIFY_MAX_TOKENS) {
             // Rejected wide (q5) verify over positions [pos, pos + 4].
@@ -1518,7 +1572,7 @@ bool run_deepseek4_dspark_spec_decode(
             "[ds4-spec-t] verify tel/step: hc_pre_a=%.1f attn_b=%.1f attn_c=%.1f attn_r=%.1f "
             "hc_post_a=%.1f hc_pre_f=%.1f route(b/c/r/s)=%.1f/%.1f/%.1f/%.1f "
             "ffn(b/c/r)=%.1f/%.1f/%.1f eval=%.1f hot=%.1f cold=%.1f comb=%.1f part=%.1f "
-            "full(b/s/c/r)=%.1f/%.1f/%.1f/%.1f ghits=%llu gbuilds=%llu ms\n",
+            "full(b/s/c/r)=%.1f/%.1f/%.1f/%.1f engram(read/apply)=%.1f/%.1f ghits=%llu gbuilds=%llu ms\n",
             tel.hc_pre_attn_us / s, tel.attn_build_us / s, tel.attn_compute_us / s,
             tel.attn_read_us / s, tel.hc_post_attn_us / s, tel.hc_pre_ffn_us / s,
             tel.route_build_us / s, tel.route_compute_us / s, tel.route_read_us / s,
@@ -1528,6 +1582,7 @@ bool run_deepseek4_dspark_spec_decode(
             tel.ffn_combine_us / s, tel.ffn_partition_us / s,
             tel.full_graph_build_us / s, tel.full_graph_set_us / s,
             tel.full_graph_compute_us / s, tel.full_graph_read_us / s,
+            tel.engram_read_us / s, tel.engram_apply_us / s,
             (unsigned long long) tel.ffn_hot_graph_hits,
             (unsigned long long) tel.ffn_hot_graph_builds);
     }

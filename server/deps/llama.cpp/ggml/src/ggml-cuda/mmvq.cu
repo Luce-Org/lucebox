@@ -153,7 +153,7 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp2_q8_1_packed32(
 #ifdef ROCMFP2_AFFINE
     return rocmfpx_fp2_affine_dot(bq2, bq8_1, sumi, iqs, db);
 #else
-    return db * rocmfpx_ue4m3_to_fp32_finite(bq2->e[iqs]) * sumi;
+    return db * rocmfpx_fp2_half_scale_to_fp32_finite(bq2->e[iqs]) * sumi;
 #endif
 }
 
@@ -420,7 +420,10 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 //                               (CUDA default on; HIP default off)
 //   LUCE_MMID_GROUPED_TYPES   bitmask, 1 = Q4_K, 2 = Q6_K,
 //                               4 = Q4_0/Q8_0/Q5_K, 8 = ROCmFP2/ROCmFP3,
-//                               16 = ROCmFP4-fast, 32 = ROCmFP3 only.
+//                               16 = ROCmFP4-fast, 32 = ROCmFP3 only,
+//                               64 = Q5_0 on sm_86 with batch/projection-shape guards.
+//                               Default 71; 7 disables Q5_0 while retaining
+//                               the previously enabled formats.
 //   LUCE_MMID_GROUPED_DEVICE  optional zero-based device index; unset/-1
 //                               applies the path to every eligible device.
 //                               Q6_K stays on its tuned MMQ route above 5
@@ -478,17 +481,19 @@ static bool mmvq_env_flag(const char * name, bool default_value = false) {
 static bool mmid_grouped_type_ok(ggml_type type) {
     // bit0 = Q4_K, bit1 = Q6_K, bit2 = Q4_0/Q8_0/Q5_K,
     // bit3 = Q2_0_ROCMFP2/Q3_0_ROCMFPX, bit4 = ROCmFP4-fast,
-    // bit5 = ROCmFP3 only. Default:
-    // previously validated types only (7); LUCE_MMID_GROUPED_TYPES is an
-    // experimental override.
+    // bit5 = ROCmFP3 only, bit6 = Q5_0. Q5_0 has additional architecture,
+    // batch and projection-shape guards below. LUCE_MMID_GROUPED_TYPES is an
+    // experimental override; 7 restores the policy without Q5_0.
     static const int mask = []() {
         const char * e = std::getenv("LUCE_MMID_GROUPED_TYPES");
         if (e == nullptr || e[0] == '\0') {
-            return 7;
+            return 7 | 64;
         }
         return atoi(e);
     }();
     switch (type) {
+        case GGML_TYPE_Q5_0:
+            return (mask & 64) != 0;
         case GGML_TYPE_Q4_K:
             return (mask & 1) != 0;
         case GGML_TYPE_Q6_K:
@@ -527,6 +532,12 @@ static bool mmid_grouped_arch_ok(int cc) {
 
 bool ggml_cuda_mmvq_mmid_grouped_enabled(
         ggml_type type, int cc, int64_t ncols_dst, int64_t routed_pairs) {
+    // This shape-independent predicate also vetoes graph fusion. Q5_0 is
+    // selected only at the kernel call site below, after fusion is decided,
+    // so adding its shape-specific path does not disable existing fusions.
+    if (type == GGML_TYPE_Q5_0) {
+        return false;
+    }
     return ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_MOE_BATCH_SIZE &&
         routed_pairs <= MMID_GROUPED_MAX_PAIRS &&
         mmid_grouped_env() && mmid_grouped_type_ok(type) &&
@@ -540,7 +551,9 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // RDNA3/RDNA4 (wave32) share the non-grouped kernel's wave-width warp_reduce.
     // IS_RDNA3/IS_RDNA4 are pure cc-range checks, safe above the IS_AMD guard below.
     // The HIP path remains opt-in until on-hardware parity and performance validation.
-    if (mmid_grouped_env() && mmid_grouped_type_ok(type) &&
+    // Q5_0 support is shape-specific and must not raise the MMVQ batch ceiling
+    // for the shapes that still use the legacy kernel.
+    if (type != GGML_TYPE_Q5_0 && mmid_grouped_env() && mmid_grouped_type_ok(type) &&
         mmid_grouped_arch_ok(cc) && mmid_grouped_device_ok()) {
         return MMVQ_MAX_MOE_BATCH_SIZE;
     }
@@ -780,8 +793,9 @@ static bool rocmfp4_q5_x4_plus1_enabled() {
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false,
           int fixed_ncols_x = 0, bool unroll_k_loop_2 = false,
           bool reuse_rocmfp4_weights = false,
-          bool c_fp3_packed24 = false, bool c_fp4_x4 = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+          bool c_fp3_packed24 = false, bool c_fp4_x4 = false,
+          bool c_width_invariant = false>
+__launch_bounds__(calc_nwarps(type, c_width_invariant ? 1 : ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids, const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -794,8 +808,11 @@ static __global__ void mul_mat_vec_q(
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    // Width-invariant launches keep the single-column block shape, so each
+    // column's K traversal and reduction match a one-column product exactly.
+    constexpr int shape_cols = c_width_invariant ? 1 : ncols_dst;
+    constexpr int nwarps = calc_nwarps(type, shape_cols, table_id);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(shape_cols, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
@@ -1746,6 +1763,10 @@ static bool mul_mat_vec_q_grouped_dispatch(
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const uint3 nchannels_y_fd = init_fastdiv_values((uint32_t) nchannels_y);
     switch (type) {
+        case GGML_TYPE_Q5_0:
+            mul_mat_vec_q_moe_grouped_launch<GGML_TYPE_Q5_0>(vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
+            return true;
         case GGML_TYPE_Q4_0:
             mul_mat_vec_q_moe_grouped_launch<GGML_TYPE_Q4_0>(vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
                 stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
@@ -1824,9 +1845,11 @@ static bool mul_mat_vec_q_grouped_dispatch(
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false) {
-    const int nwarps = calc_nwarps(type, ncols_dst, table_id);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false,
+        const bool width_invariant = false) {
+    const int shape_cols = width_invariant ? 1 : ncols_dst;
+    const int nwarps = calc_nwarps(type, shape_cols, table_id);
+    const int rpb = calc_rows_per_block(shape_cols, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1836,7 +1859,8 @@ static std::pair<dim3, dim3> calc_launch_params(
 template<ggml_type type, int c_ncols_dst, bool small_k = false,
          int fixed_ncols_x = 0, bool unroll_k_loop_2 = false,
          bool reuse_rocmfp4_weights = false,
-         bool fp3_packed24 = false, bool fp4_x4 = false>
+         bool fp3_packed24 = false, bool fp4_x4 = false,
+         bool width_invariant = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1850,7 +1874,7 @@ static void mul_mat_vec_q_switch_fusion(
     if (has_fusion) {
         mul_mat_vec_q<type, c_ncols_dst, true, small_k, fixed_ncols_x,
                       unroll_k_loop_2, reuse_rocmfp4_weights, fp3_packed24,
-                      fp4_x4><<<block_nums, block_dims, nbytes_shared, stream>>>
+                      fp4_x4, width_invariant><<<block_nums, block_dims, nbytes_shared, stream>>>
             (vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
              channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
              sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ids_tokenwise_samples);
@@ -1859,7 +1883,7 @@ static void mul_mat_vec_q_switch_fusion(
 
     mul_mat_vec_q<type, c_ncols_dst, false, small_k, fixed_ncols_x,
                   unroll_k_loop_2, reuse_rocmfp4_weights, fp3_packed24,
-                  fp4_x4><<<block_nums, block_dims, nbytes_shared, stream>>>
+                  fp4_x4, width_invariant><<<block_nums, block_dims, nbytes_shared, stream>>>
         (vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ids_tokenwise_samples);
@@ -2276,7 +2300,39 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return;
     }
 
-    if (use_tokenwise_mm && !has_ids && ncols_dst > 1 && nsamples_dst == 1) {
+    // Batch-invariant products (ggml_backend_cuda_set_mmvq_batch_invariant):
+    // Q8_0 keeps the single-column block shape and reads each weight row once
+    // for all columns; other types run the single-column kernel per column.
+    const bool width_invariant = !has_ids && ncols_dst > 1 && ggml_cuda_mmvq_batch_invariant();
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        if (width_invariant) {
+#define GGML_MMVQ_INVARIANT_LAUNCH(NC) \
+            case NC: { \
+                std::pair<dim3, dim3> dims = calc_launch_params<type>( \
+                    NC, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, true); \
+                mul_mat_vec_q_switch_fusion<type, NC, false, 0, false, false, false, false, true>( \
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, \
+                    stride_row_x, stride_col_y, stride_col_dst, \
+                    channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, \
+                    sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, \
+                    dims.first, dims.second, 0, ids_stride, stream); \
+            } break
+            switch (ncols_dst) {
+                GGML_MMVQ_INVARIANT_LAUNCH(2);
+                GGML_MMVQ_INVARIANT_LAUNCH(3);
+                GGML_MMVQ_INVARIANT_LAUNCH(4);
+                GGML_MMVQ_INVARIANT_LAUNCH(5);
+                GGML_MMVQ_INVARIANT_LAUNCH(6);
+                GGML_MMVQ_INVARIANT_LAUNCH(7);
+                GGML_MMVQ_INVARIANT_LAUNCH(8);
+                default: GGML_ABORT("unreachable batch-invariant width");
+            }
+#undef GGML_MMVQ_INVARIANT_LAUNCH
+            return;
+        }
+    }
+
+    if ((use_tokenwise_mm || width_invariant) && !has_ids && ncols_dst > 1 && nsamples_dst == 1) {
         constexpr int c_ncols_dst = 1;
         const bool use_small_k = should_use_small_k(c_ncols_dst);
         const uint3 token_sample_ratio_fd = init_fastdiv_values(ncols_dst);
@@ -2882,8 +2938,17 @@ void ggml_cuda_mul_mat_vec_q(
     }();
 
     // [TAG_MMID_GROUPED] grouped-expert path for small MUL_MAT_ID batches.
-    if (ids && ggml_cuda_mmvq_mmid_grouped_enabled(
-            src0->type, cc, ncols_dst, nchannels_dst*ncols_dst)) {
+    // Qualify Q5_0 for the Gemma 4 expert-down projection. A wider shape
+    // screen found regressions, so other projections retain their fallback.
+    // The grouped kernel reads complete four-row tiles; the qualified row
+    // count is divisible by four. Broadcast and per-slot inputs are supported.
+    const bool q5_grouped = src0->type == GGML_TYPE_Q5_0 && cc == 860 &&
+        ncols_dst == 16 && nchannels_dst == 8 && ne00 == 704 && ne01 == 2816 &&
+        (nchannels_y == 1 || nchannels_y == 8) &&
+        fusion_local.gate == nullptr && fusion_local.x_bias == nullptr && fusion_local.gate_bias == nullptr &&
+        mmid_grouped_env() && mmid_grouped_type_ok(src0->type) && mmid_grouped_device_ok();
+    if (ids && (q5_grouped || ggml_cuda_mmvq_mmid_grouped_enabled(
+            src0->type, cc, ncols_dst, nchannels_dst*ncols_dst))) {
         // Batches above MMID_GROUPED_MAX_PAIRS fall through to the legacy
         // per-expert kernel instead of aborting the request.
         const int np = (int) (nchannels_dst*ncols_dst);

@@ -4,6 +4,7 @@
 
 #include "moe_hybrid_types.h"
 #include "moe_hybrid_placement.h"
+#include "tensor_file_reader.h"
 
 #include "ggml-alloc.h"
 
@@ -15,6 +16,8 @@
 namespace luce::common {
 
 struct MoeHybridRoutingStats;
+class MoeHybridStreamEngine;
+class MoeStreamedExpertCache;
 
 // File region for one expert tensor (offset into mmap).
 struct ExpertFileRegion {
@@ -99,6 +102,19 @@ struct MoeHybridLayerStorage {
     std::vector<int32_t> decode_hot_local_by_global;
     std::vector<int32_t> decode_cold_local_by_global;
     std::vector<int32_t> cold_local_by_global;
+    // Experts owned by neither stack, streamed from the model file on demand:
+    // the whole cold set when the cold stack is not materialized, otherwise
+    // what an explicit cold-stack list leaves out.
+    int n_streamed = 0;
+    bool is_streamed(int global_expert) const {
+        if (global_expert < 0 || (size_t) global_expert >= hot_local_by_global.size() ||
+            hot_local_by_global[(size_t) global_expert] >= 0) {
+            return false;
+        }
+        const bool cold_stack = down_cold || gate_up_cold;
+        return cold_stack ? cold_local_by_global[(size_t) global_expert] < 0
+                          : n_streamed > 0 && cold_backend_kind != MoeHybridColdBackend::None;
+    }
 
     // --- Bounded GPU expert cache (laguna) ---
     // Hot tensors are over-allocated by `cache_slots` spare entries appended
@@ -203,13 +219,31 @@ struct MoeHybridStorage {
     ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT;
     MoeHybridPlacement placement;
 
-    // Cold experts are streamed from the source file on demand. Cold owner
-    // None is not materialized either, but it has no cold experts at all, so
-    // it must not set up a streaming path.
+    // Some experts are streamed from the source file on demand: every cold
+    // expert when the cold stack is not materialized, or those an explicit
+    // cold-stack list leaves out. Cold owner None is not materialized either,
+    // but it has no cold experts at all, so it must not set up a streaming path.
     bool streams_cold_experts() const {
-        return !materialized_cold_experts &&
-               cold_backend_kind != MoeHybridColdBackend::None;
+        if (cold_backend_kind == MoeHybridColdBackend::None) return false;
+        if (!materialized_cold_experts) return true;
+        for (const MoeHybridLayerStorage & layer : layers) {
+            if (layer.n_streamed > 0) return true;
+        }
+        return false;
     }
+    // Serve the streamed experts; owned by the model backend, set after init.
+    // The cache, when set, replaces the engine's one-expert-at-a-time path.
+    MoeHybridStreamEngine * stream_engine = nullptr;
+    MoeStreamedExpertCache * expert_cache = nullptr;
+
+    // Routed expert calls by owner since the last reset, for request logs.
+    struct RouteCounts {
+        uint64_t primary = 0;
+        uint64_t secondary = 0;
+        uint64_t streamed = 0;
+        uint64_t total() const { return primary + secondary + streamed; }
+    } route_counts;
+    void count_routes(int layer, const int32_t * expert_ids, size_t n);
     std::vector<MoeHybridLayerStorage> layers;
 
     // Long heterogeneous prefill uses one routing graph and one owner graph
@@ -272,6 +306,9 @@ int moe_hybrid_cache_swap_in(MoeHybridLayerStorage & st, int global_expert,
                              ggml_backend_t gpu_backend);
 
 // Build hybrid storage by loading expert data directly from file (mmap).
+// With `reader` (the same file, see tensor_file_reader.h) and the mapping, the
+// experts are read from the file on several threads instead of copied out of
+// the mapping.
 // Optional: a caller opts in to advisory page-cache reclamation of completed
 // materialized GPU layers by passing all three readonly_file_* arguments: the
 // read-only mapping (which must start at file offset zero), its size, and the
@@ -289,7 +326,8 @@ bool build_moe_hybrid_storage_from_file(
     ggml_backend_t cold_gpu_backend = nullptr,
     const void * readonly_file_mmap = nullptr,
     size_t readonly_file_mmap_size = 0,
-    int readonly_file_fd = -1);
+    int readonly_file_fd = -1,
+    const TensorFileReader * reader = nullptr);
 
 // Spark: split a VRAM budget into a pinned-hot tier + an auto-sized expert
 // cache ring. target_bytes==0 keeps the current budget (use the card);
@@ -318,6 +356,7 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     std::string * err = nullptr,
     int cache_slots = 0,
     ggml_backend_t cold_gpu_backend = nullptr,
-    int readonly_file_fd = -1);
+    int readonly_file_fd = -1,
+    const TensorFileReader * reader = nullptr);
 
 }  // namespace luce::common

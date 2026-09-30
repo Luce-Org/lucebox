@@ -35,6 +35,7 @@
 | [KVFlash](https://www.lucebox.com/blog/laguna-xs21) | Laguna XS 2.1 33B at 256K on RTX 3090 | **152.3 tok/s** with an 8K pool |
 | [Heterogeneous execution](https://www.lucebox.com/#benchmark) | DeepSeek V4 on R9700 + Strix Halo | **86 tok/s** decode; **788 tok/s** prefill at 2K |
 | [Paged attention + continuous batching](https://www.lucebox.com/blog/continuous-batching/) | Qwen 3.8 27B + DFlash2 on R9700; DeepSeek V4 Flash AR on Strix Halo | **300.9 tok/s** total at 5 clients (Qwen); **48.4 tok/s** output-window at 4 clients (DeepSeek) |
+| [Three-tier experts](server/docs/DS41.md) | DeepSeek V4.1 Flash on R9700 + Strix Halo + SSD | **25-26 tok/s** decode on code; **118-121 tok/s** prefill at 4K, at the profile's 128K context |
 | [Megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) | Qwen 3.5 0.8B on RTX 3090 | **413 tok/s**, **1.87 tok/J** |
 | [Vision (image input)](https://www.lucebox.com/blog/vision-llm-inference) | Qwen 3.8 27B vision on R9700 + DeepSeek V4 Flash Vision on Strix Halo, together | **3.2×** the image-question throughput of a DGX Spark (58 vs 18 a minute); **2.4×** faster at 8 users with the same model file |
 
@@ -53,6 +54,7 @@ Model links open the exact weights used by the measured setup. Drafter links ope
 | [Gemma 4 26B-A4B Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-26B-A4B-it-GGUF/blob/main/google_gemma-4-26B-A4B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF/blob/main/gemma-4-26B-A4B-it-DFlash-q8_0.gguf) | Decode | **1.31×** |
 | [Gemma 4 31B IT Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-31B-it-GGUF/blob/main/google_gemma-4-31B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF/blob/main/gemma-4-31B-it-DFlash-q8_0.gguf) | Decode | **3.2×** |
 | [DeepSeek V4 Flash ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf) + [DSpark Q4RMFP4 drafter](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | Decode | **42 tok/s** at 8K and **39 tok/s** on code and math with the plain launch ([PR #729](https://github.com/Luce-Org/lucebox/pull/729)) |
+| [DeepSeek V4.1 Flash ROCMFP2S](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-ROCMFP23-GGUF/blob/main/DeepSeek-V4.1-Flash-ROCMFP2S.gguf) + DSpark drafter (from the [source checkpoint](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash), converted with `server/scripts/convert_ds4_dspark_draft_to_gguf.py`), experts split across R9700, Strix Halo and SSD with `--profile ds41-lucebox` ([guide](server/docs/DS41.md)) | Decode | **25.4-25.8 tok/s** on code, **16.8-17.5 tok/s** after a 4K prompt, at the profile's 128K context |
 | [Ling 3.0 Flash 124B-A5.1B Q4_K_M](https://huggingface.co/bloomer010/Ling-3.0-flash-GGUF) | Decode | **34.6 tok/s** median AR on DGX Spark |
 | [Qwen 3.8 27B IQ4_XS](https://huggingface.co/Lucebox/Qwen3.8-27B-IQ4_XS-fast-GGUF/blob/main/Qwen3.8-27B-IQ4_XS-pure.gguf) + [Q8_0 vision projector](https://huggingface.co/Lucebox/Qwen3.8-27B-IQ4_XS-fast-GGUF/blob/main/Qwen3.8-27B-mmproj-Q8_0.gguf) + [DFlash2 drafter](https://huggingface.co/Lucebox/Qwen3.8-27B-DFlash2-GGUF/blob/main/Qwen3.8-27B-DFlash2-Q8_0.gguf), on R9700 ([image input](docs/image-input.md)) | Image questions | **2.4×** vs llama.cpp on DGX Spark at 8 users (10.5 s vs 25.4 s); **2.1×** for one user |
 | [DeepSeek V4 Flash Vision ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf) + [BF16 vision projector](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-Vision-Exp-mmproj-BF16.gguf), encoder on R9700, 4 users at once ([image input](docs/image-input.md)) | Image questions | **1.5×** sooner first token with 16 images when the R9700 encodes |
@@ -257,6 +259,7 @@ See [Continuous batching in Lucebox](https://www.lucebox.com/blog/continuous-bat
 | OpenAI Chat Completions, Responses, and Anthropic Messages | [API reference](server/docs/API.md) |
 | CUDA, HIP, and mixed-device placement | [Mixed-backend guide](server/docs/MIXED_BACKEND.md) |
 | DeepSeek V4 single-device and heterogeneous profiles | [DeepSeek V4 guide](server/docs/DS4.md) |
+| DeepSeek V4.1 Flash on R9700 + Strix Halo + SSD | [DeepSeek V4.1 guide](server/docs/DS41.md) |
 | Image input (Qwen3.8, DeepSeek V4 Flash Vision) | [Image input guide](docs/image-input.md) |
 | Environment variables | [Environment reference](server/docs/ENVIRONMENT.md) |
 | Server internals | [Architecture](server/docs/ARCHITECTURE.md) |

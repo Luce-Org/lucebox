@@ -79,6 +79,7 @@ inline constexpr ArchCapabilities kArchCapabilities[] = {
     {"qwen3",      false, false, true,  false,   kNever, kNever, kNever, kNever, kNever,kNever, kNever},
     {"gemma4",     true,  false, false, false,   kMono, kNever, kNever, kNever, kBoth,kNever, kNever},
     {"deepseek4",  true,  false, true,  false,   kMono,  kNever, kNever, kNever, kNever,kNever, kMono},
+    {"deepseek41", false, false, true,  false,   kMono,  kNever, kNever, kNever, kNever,kNever, kMono},
 };
 
 inline constexpr std::size_t kArchCount =
@@ -204,6 +205,12 @@ inline bool arch_has(const std::string & arch,
 // can admit a model the factory cannot build.
 inline bool arch_is_supported(const std::string & arch) {
     return find_arch_capabilities(arch) != nullptr;
+}
+
+// DeepSeek V4.1 Flash ("deepseek41") is served by the deepseek4 backend and
+// follows every server-side rule of that family.
+inline bool arch_is_deepseek4_family(const std::string & arch) {
+    return arch == "deepseek4" || arch == "deepseek41";
 }
 
 inline bool arch_supports_layer_split(const std::string & arch) {

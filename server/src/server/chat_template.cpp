@@ -1,6 +1,7 @@
 // Chat template renderer implementation.
 
 #include "chat_template.h"
+#include "common/model_capabilities.h"
 
 #include "jinja/lexer.h"
 #include "jinja/parser.h"
@@ -64,7 +65,7 @@ static void append_available_tools(std::string & result,
 }
 
 ChatFormat chat_format_for_arch(const std::string & arch) {
-    if (arch == "deepseek4") return ChatFormat::DEEPSEEK4;
+    if (arch_is_deepseek4_family(arch)) return ChatFormat::DEEPSEEK4;
     if (arch == "laguna") return ChatFormat::LAGUNA;
     if (arch == "gemma4") return ChatFormat::GEMMA4;
     if (arch == "bailingmoe3") return ChatFormat::BAILINGMOE3;

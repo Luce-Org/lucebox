@@ -23,6 +23,7 @@
 #include "common/layer_split_utils.h"
 #include "common/moe_hybrid_ffn_eval.h"
 #include "deepseek4/deepseek4_dspark.h"
+#include "deepseek4/deepseek4_engram.h"
 
 #include <filesystem>
 #include <memory>
@@ -146,13 +147,13 @@ static void test_dspark_seed_row_restore_cpu() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
-static void test_ds4_ratio4_causal_visibility_formula() {
-    std::fprintf(stderr, "  test_ds4_ratio4_causal_visibility_formula ...");
+static void test_ds4_causal_visibility_formula() {
+    std::fprintf(stderr, "  test_ds4_causal_visibility_formula ...");
     constexpr int raw_window = 128;
-    const auto check_chunk = [&](int kv_start, int n_tokens) {
+    const auto check_chunk = [&](int kv_start, int n_tokens, int ratio = 4) {
         const int prior_rows = std::min(kv_start, raw_window);
         const int raw_rows = prior_rows + n_tokens;
-        const int n_comp_rows = (kv_start + n_tokens) / 4;
+        const int n_comp_rows = (kv_start + n_tokens) / ratio;
         const int probes[] = {
             0, 1, 2, 3, 127, 128, 2050, 2051, 8191, 8192, 8193,
             kv_start, kv_start + 1, kv_start + 2, kv_start + 3,
@@ -177,11 +178,11 @@ static void test_ds4_ratio4_causal_visibility_formula() {
             // Truncated/empty histories exercise the capacity bound as well
             // as the usual complete ratio-4 history used by prefill.
             for (int capacity : {0, 1, n_comp_rows / 2, n_comp_rows}) {
-                const auto actual = ds4_ratio4_causal_visibility(
-                    token, n_tokens, raw_rows, capacity, raw_window, kv_start);
+                const auto actual = ds4_causal_visibility(
+                    token, n_tokens, raw_rows, capacity, raw_window, kv_start, ratio);
                 int reference_comp = 0;
                 for (int row = 0; row < capacity; ++row) {
-                    reference_comp += 4 * (row + 1) - 1 <= position;
+                    reference_comp += ratio * (row + 1) - 1 <= position;
                 }
                 TEST_ASSERT(reference_first == actual.raw_first);
                 TEST_ASSERT(reference_last == actual.raw_last);
@@ -194,6 +195,10 @@ static void test_ds4_ratio4_causal_visibility_formula() {
     };
     check_chunk(0, 8192);
     check_chunk(0, 10240);
+    check_chunk(0, 2048, 1);          // V4.1 ratio-1 and ratio-2 bands
+    check_chunk(63488, 2048, 1);
+    check_chunk(2048, 2048, 2);
+    check_chunk(129023, 1025, 2);
     check_chunk(8192, 941);
     check_chunk(122880, 129);
     check_chunk(122883, 129);
@@ -1495,6 +1500,803 @@ static void test_indexer_mask_cpu(ggml_backend_t backend) {
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+// ─── Engram apply against DeepSeek's reference (inference/model.py) ─────
+
+// model.py Engram.forward in double precision, for one layer:
+//   kv = wkv(keys); key_c, value = split(kv); weight = q * k
+//   dot_c = sum_d h_c * weight_c * key_c * rstd(h_c) * rstd(key_c) / sqrt(dim)
+//   gate_c = sigmoid(sign(dot_c) * sqrt(max(|dot_c|, 1e-6))); h_c += gate_c * value
+// wkv is [n_out][key_width] (ggml row order), q and k are [n_hc][n_embd],
+// h is [n_tokens][n_hc][n_embd], keys [n_tokens][key_width].
+static void reference_engram_apply(const std::vector<float> & wkv, const std::vector<float> & q,
+                                   const std::vector<float> & k, int n_embd, int n_hc, int key_width,
+                                   double eps, int n_tokens, const std::vector<float> & keys,
+                                   std::vector<double> & h, std::vector<double> & gates) {
+    const int n_out = n_embd * (n_hc + 1);
+    gates.assign((size_t) n_tokens * n_hc, 0.0);
+    std::vector<double> kv((size_t) n_out);
+    for (int t = 0; t < n_tokens; ++t) {
+        const float * x = keys.data() + (size_t) t * key_width;
+        for (int o = 0; o < n_out; ++o) {
+            const float * row = wkv.data() + (size_t) o * key_width;
+            double sum = 0.0;
+            for (int i = 0; i < key_width; ++i) sum += (double) row[i] * (double) x[i];
+            kv[(size_t) o] = sum;
+        }
+        const double * value = kv.data() + (size_t) n_hc * n_embd;
+        for (int c = 0; c < n_hc; ++c) {
+            double * hc = h.data() + ((size_t) t * n_hc + c) * n_embd;
+            const double * key = kv.data() + (size_t) c * n_embd;
+            double hh = 0.0, kk = 0.0, dot = 0.0;
+            for (int d = 0; d < n_embd; ++d) {
+                hh += hc[d] * hc[d];
+                kk += key[d] * key[d];
+                dot += hc[d] * (double) q[(size_t) c * n_embd + d] * (double) k[(size_t) c * n_embd + d] * key[d];
+            }
+            dot *= 1.0 / std::sqrt(hh / n_embd + eps) / std::sqrt(kk / n_embd + eps) / std::sqrt((double) n_embd);
+            const double mag = std::sqrt(std::max(std::fabs(dot), 1e-6));
+            const double gate = 1.0 / (1.0 + std::exp(-(dot < 0 ? -mag : mag)));
+            gates[(size_t) t * n_hc + c] = gate;
+            for (int d = 0; d < n_embd; ++d) hc[d] += gate * value[d];
+        }
+    }
+}
+
+struct EngramApplyError {
+    double out_rel = 0.0;    // max |out - ref| / rms(ref update)
+    double gate_abs = 0.0;   // max |gate - ref gate|
+};
+
+// Runs deepseek4_build_engram_apply on `backend` and compares it with the
+// reference. wkv is uploaded as F16 (the released GGUF type).
+static EngramApplyError run_engram_apply_case(ggml_backend_t backend, const std::vector<ggml_fp16_t> & wkv16,
+                                              const std::vector<float> & q, const std::vector<float> & k,
+                                              int n_embd, int n_hc, int key_width, float eps, int n_tokens,
+                                              const std::vector<float> & keys, const std::vector<float> & h) {
+    EngramApplyError err;
+    const int n_out = n_embd * (n_hc + 1);
+    ggml_init_params params{};
+    params.mem_size = 64 * ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false);
+    params.no_alloc = true;
+    ggml_context * wctx = ggml_init(params);
+    ggml_tensor * wkv_t = ggml_new_tensor_2d(wctx, GGML_TYPE_F16, key_width, n_out);
+    ggml_tensor * q_t = ggml_new_tensor_2d(wctx, GGML_TYPE_F32, n_embd, n_hc);
+    ggml_tensor * k_t = ggml_new_tensor_2d(wctx, GGML_TYPE_F32, n_embd, n_hc);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+    TEST_ASSERT_MSG(wbuf != nullptr, "engram weight buffer");
+    if (!wbuf) { ggml_free(wctx); return {1e30, 1e30}; }
+    ggml_backend_tensor_set(wkv_t, wkv16.data(), 0, wkv16.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(q_t, q.data(), 0, q.size() * sizeof(float));
+    ggml_backend_tensor_set(k_t, k.data(), 0, k.size() * sizeof(float));
+    DeepSeek4Layer L{};
+    L.engram_wkv = wkv_t;
+    L.engram_q = q_t;
+    L.engram_k = k_t;
+
+    // The host-path runner (chunks of 256 tokens) and a graph with the gate.
+    std::vector<float> out = h;
+    DeepSeek4EngramApplyRunner runner;
+    TEST_ASSERT_MSG(runner.run(backend, L, n_embd, n_hc, eps, out.data(), keys.data(), n_tokens),
+                    "engram apply runner failed");
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * h_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+    ggml_tensor * keys_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, key_width, n_tokens);
+    ggml_set_input(h_t);
+    ggml_set_input(keys_t);
+    ggml_tensor * gate_t = nullptr;
+    ggml_tensor * out_t = deepseek4_build_engram_apply(ctx, h_t, keys_t, L, n_embd, n_hc, eps, &gate_t);
+    ggml_set_output(gate_t);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(gf, out_t);
+    ggml_build_forward_expand(gf, gate_t);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    TEST_ASSERT_MSG(ggml_gallocr_alloc_graph(alloc, gf), "engram gate graph alloc");
+    ggml_backend_tensor_set(h_t, h.data(), 0, h.size() * sizeof(float));
+    ggml_backend_tensor_set(keys_t, keys.data(), 0, keys.size() * sizeof(float));
+    TEST_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+    std::vector<float> gates((size_t) n_hc * n_tokens);
+    ggml_backend_tensor_get(gate_t, gates.data(), 0, gates.size() * sizeof(float));
+
+    std::vector<float> wkv32(wkv16.size());
+    ggml_fp16_to_fp32_row(wkv16.data(), wkv32.data(), (int64_t) wkv16.size());
+    std::vector<double> ref(h.begin(), h.end());
+    std::vector<double> ref_gates;
+    reference_engram_apply(wkv32, q, k, n_embd, n_hc, key_width, eps, n_tokens, keys, ref, ref_gates);
+    double update_sq = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) update_sq += (ref[i] - h[i]) * (ref[i] - h[i]);
+    const double update_rms = std::sqrt(update_sq / (double) ref.size());
+    for (size_t i = 0; i < ref.size(); ++i) {
+        err.out_rel = std::max(err.out_rel, std::fabs((double) out[i] - ref[i]) / update_rms);
+    }
+    for (size_t i = 0; i < gates.size(); ++i) {
+        err.gate_abs = std::max(err.gate_abs, std::fabs((double) gates[i] - ref_gates[i]));
+    }
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    runner.release();
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(wctx);
+    return err;
+}
+
+static void test_engram_apply_synthetic(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_engram_apply_synthetic (%s) ...", name);
+    constexpr int n_embd = 128, n_hc = 4, key_width = 6 * 32, n_tokens = 300;   // two runner parts
+    TestLcg rng(20260925u);
+    std::vector<ggml_fp16_t> wkv((size_t) key_width * n_embd * (n_hc + 1));
+    for (auto & v : wkv) v = ggml_fp32_to_fp16(0.08f * rng.next());
+    std::vector<float> q((size_t) n_embd * n_hc), k(q.size()), keys((size_t) key_width * n_tokens),
+                       h((size_t) n_embd * n_hc * n_tokens);
+    for (auto & v : q) v = 1.0f + 0.5f * rng.next();
+    for (auto & v : k) v = 1.0f + 0.5f * rng.next();
+    // Keys exactly representable in F16, as the released rows are.
+    for (auto & v : keys) v = ggml_fp16_to_fp32(ggml_fp32_to_fp16(2.0f * rng.next()));
+    for (auto & v : h) v = 3.0f * rng.next();
+    const EngramApplyError e = run_engram_apply_case(backend, wkv, q, k, n_embd, n_hc, key_width, 1e-20f,
+                                                     n_tokens, keys, h);
+    TEST_ASSERT_MSG(e.out_rel < 2e-3, "engram apply output");
+    TEST_ASSERT_MSG(e.gate_abs < 2e-4, "engram gate");
+    std::fprintf(stderr, " out %.2e gate %.2e %s\n", e.out_rel, e.gate_abs, g_failures ? "done" : "ok");
+}
+
+// The released tables and weights (LUCE_DS4_ENGRAM_GGUF=<V4.1 GGUF>): hash a
+// token run, read its rows through the runtime (in two chunks, carrying the
+// n-gram context), and apply each Engram layer on `backend` against the
+// reference. Reads 314 MB of weights per layer.
+static void test_engram_apply_released_weights(ggml_backend_t backend, const char * name) {
+    const char * path = std::getenv("LUCE_DS4_ENGRAM_GGUF");
+    if (!path || !*path) {
+        std::fprintf(stderr, "  test_engram_apply_released_weights skipped (LUCE_DS4_ENGRAM_GGUF unset)\n");
+        return;
+    }
+    std::fprintf(stderr, "  test_engram_apply_released_weights (%s) ...", name);
+    DeepSeek4Weights w;
+    std::string err;
+    TEST_ASSERT_MSG(deepseek4_read_engram_metadata(path, w.engram, &err), err.c_str());
+    if (!w.engram.present()) return;
+    w.n_vocab = (int) w.engram.token_map.size();
+    DeepSeek4EngramRuntime runtime;
+    TEST_ASSERT_MSG(runtime.init(w, path, &err), err.c_str());
+    if (!runtime.present()) return;
+
+    // A token run and its rows, prepared in two chunks from one context.
+    const std::vector<int32_t> tokens = {0, 128803, 3072, 14, 5871, 223, 3072, 14, 5871, 16, 1, 90210};
+    const int n_tokens = (int) tokens.size();
+    const size_t width = runtime.key_floats();
+    std::vector<float> keys((size_t) runtime.n_layers() * n_tokens * width), part((size_t) runtime.n_layers() * 7 * width);
+    DeepSeek4EngramTokens ctx, ctx2;
+    TEST_ASSERT(runtime.prepare(ctx, tokens.data(), 0, (size_t) n_tokens, keys.data(), &err));
+    TEST_ASSERT(runtime.prepare(ctx2, tokens.data(), 0, 5, part.data(), &err));
+    std::vector<float> rest((size_t) runtime.n_layers() * 7 * width);
+    TEST_ASSERT(runtime.prepare(ctx2, tokens.data() + 5, 5, 7, rest.data(), &err));
+    for (int l = 0; l < runtime.n_layers(); ++l) {
+        TEST_ASSERT(std::memcmp(part.data() + (size_t) l * 5 * width,
+                                keys.data() + (size_t) l * n_tokens * width, 5 * width * sizeof(float)) == 0);
+        TEST_ASSERT(std::memcmp(rest.data() + (size_t) l * 7 * width,
+                                keys.data() + ((size_t) l * n_tokens + 5) * width, 7 * width * sizeof(float)) == 0);
+    }
+    DeepSeek4EngramTokens unknown;
+    TEST_ASSERT(!runtime.prepare(unknown, tokens.data() + 5, 5, 1, part.data(), &err));
+
+    // Weights of each Engram layer, straight from the file.
+    ggml_context * meta = nullptr;
+    gguf_init_params gip{};
+    gip.no_alloc = true;
+    gip.ctx = &meta;
+    gguf_context * g = gguf_init_from_file(path, gip);
+    TEST_ASSERT(g != nullptr);
+    if (!g) return;
+    FILE * f = std::fopen(path, "rb");
+    auto read_tensor = [&](const std::string & tname, ggml_type type, void * dst, size_t bytes) {
+        const int64_t id = gguf_find_tensor(g, tname.c_str());
+        const ggml_tensor * t = ggml_get_tensor(meta, tname.c_str());
+        if (id < 0 || !t || t->type != type || ggml_nbytes(t) != bytes) return false;
+        const size_t off = gguf_get_data_offset(g) + gguf_get_tensor_offset(g, id);
+        return fseeko(f, (off_t) off, SEEK_SET) == 0 && std::fread(dst, 1, bytes, f) == bytes;
+    };
+    float eps = 1e-20f;   // config.json rms_norm_eps
+    for (const char * key : {"deepseek41.attention.layer_norm_rms_epsilon", "deepseek41.rms_norm_eps"}) {
+        const int64_t id = gguf_find_key(g, key);
+        if (id >= 0) eps = gguf_get_val_f32(g, id);
+    }
+    for (int l = 0; l < runtime.n_layers(); ++l) {
+        const std::string blk = "blk." + std::to_string(runtime.layer_id(l)) + ".";
+        const ggml_tensor * qn = ggml_get_tensor(meta, (blk + "engram_q_norm.weight").c_str());
+        TEST_ASSERT(qn != nullptr);
+        if (!qn) break;
+        const int n_embd = (int) qn->ne[0], n_hc = (int) qn->ne[1], key_width = (int) width;
+        std::vector<ggml_fp16_t> wkv((size_t) key_width * n_embd * (n_hc + 1));
+        std::vector<float> q((size_t) n_embd * n_hc), k(q.size());
+        TEST_ASSERT(read_tensor(blk + "engram_kv.weight", GGML_TYPE_F16, wkv.data(), wkv.size() * 2));
+        TEST_ASSERT(read_tensor(blk + "engram_q_norm.weight", GGML_TYPE_F32, q.data(), q.size() * 4));
+        TEST_ASSERT(read_tensor(blk + "engram_k_norm.weight", GGML_TYPE_F32, k.data(), k.size() * 4));
+        TestLcg rng(7u + (uint32_t) l);
+        std::vector<float> h((size_t) n_embd * n_hc * n_tokens);
+        for (auto & v : h) v = rng.next();
+        std::vector<float> layer_keys(keys.begin() + (ptrdiff_t) ((size_t) l * n_tokens * width),
+                                      keys.begin() + (ptrdiff_t) ((size_t) (l + 1) * n_tokens * width));
+        const EngramApplyError e = run_engram_apply_case(backend, wkv, q, k, n_embd, n_hc, key_width, eps,
+                                                         n_tokens, layer_keys, h);
+        TEST_ASSERT_MSG(e.out_rel < 1e-2, "released engram apply output");
+        TEST_ASSERT_MSG(e.gate_abs < 1e-3, "released engram gate");
+        std::fprintf(stderr, " layer %d: out %.2e gate %.2e;", runtime.layer_id(l), e.out_rel, e.gate_abs);
+    }
+    std::fclose(f);
+    gguf_free(g);
+    ggml_free(meta);
+    std::fprintf(stderr, " %s\n", g_failures ? "done" : "ok");
+}
+
+// ─── V4.1 indexer against DeepSeek's reference (inference/model.py) ─────
+
+// kernel.py fp4_act_quant(x, 32, inplace=True): per 32-block E8M0 scale
+// 2^ceil(log2(amax / 6)), values rounded to E2M1 (ties to even), no rotation.
+static void reference_fp4_round_trip(float * row, int width) {
+    for (int block = 0; block < width / 32; ++block) {
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(row[block * 32 + i]));
+        amax = std::max(amax, 7.052966104933725e-38f);
+        const float scale = std::exp2(std::ceil(std::log2(amax / 6.0f)));
+        for (int i = 0; i < 32; ++i) {
+            float & v = row[block * 32 + i];
+            v = reference_e2m1_round(std::clamp(v / scale, -6.0f, 6.0f)) * scale;
+        }
+    }
+}
+
+// model.py precompute_freqs_cis + apply_rotary_emb on the last n_rot dims
+// (YaRN with the compressed layers' base and the checkpoint's factor).
+static void reference_tail_rope(float * x, int width, int n_rot, int pos, const DeepSeek4Weights & w) {
+    const double base = w.compress_rope_freq_base, factor = w.rope_scale_factor;
+    const double orig = (double) w.rope_orig_ctx;
+    auto corrected = [&](double rotations) {
+        return n_rot * std::log(orig / (rotations * 2 * M_PI)) / (2 * std::log(base));
+    };
+    const double low = std::max(std::floor(corrected(w.rope_yarn_beta_fast)), 0.0);
+    const double high = std::min(std::ceil(corrected(w.rope_yarn_beta_slow)), (double) n_rot - 1);
+    float * tail = x + (width - n_rot);
+    for (int i = 0; i < n_rot / 2; ++i) {
+        double freq = 1.0 / std::pow(base, 2.0 * i / n_rot);
+        const double ramp = std::clamp((i - low) / std::max(high - low, 1e-3), 0.0, 1.0);
+        freq = freq / factor * ramp + freq * (1.0 - ramp);
+        const double a = pos * freq, c = std::cos(a), s = std::sin(a);
+        const double x0 = tail[2 * i], x1 = tail[2 * i + 1];
+        tail[2 * i] = (float) (x0 * c - x1 * s);
+        tail[2 * i + 1] = (float) (x0 * s + x1 * c);
+    }
+}
+
+// model.py Indexer.forward scores for `n_tokens` queries at kv_start.. over
+// `n_comp` index keys: fp4 queries (after RoPE) against the stored keys, ReLU,
+// head weights weights_proj(x) * (128^-0.5 * n_heads^-0.5), rows past the
+// query's compress_len at -1e300.
+static std::vector<std::vector<double>> reference_indexer_scores(
+        const DeepSeek4Weights & w, const std::vector<float> & wq_b, const std::vector<float> & proj,
+        const std::vector<float> & qr, const std::vector<float> & x, const std::vector<float> & keys,
+        int q_lora, int n_embd, int n_comp, int kv_start, int n_tokens, int ratio) {
+    const int H = w.n_indexer_head, D = w.n_indexer_head_dim;
+    std::vector<std::vector<double>> out((size_t) n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        const int visible = std::min(n_comp, (kv_start + t + 1) / ratio);
+        std::vector<double> & score = out[(size_t) t];
+        score.assign((size_t) n_comp, -1e300);
+        std::vector<float> q((size_t) H * D);
+        for (int o = 0; o < H * D; ++o) {
+            double acc = 0.0;
+            for (int i = 0; i < q_lora; ++i) acc += (double) wq_b[(size_t) o * q_lora + i] * qr[(size_t) t * q_lora + i];
+            q[(size_t) o] = (float) acc;
+        }
+        for (int h = 0; h < H; ++h) {
+            reference_tail_rope(q.data() + (size_t) h * D, D, w.n_rot, kv_start + t, w);
+            reference_fp4_round_trip(q.data() + (size_t) h * D, D);
+        }
+        std::vector<double> hw((size_t) H);
+        for (int h = 0; h < H; ++h) {
+            double acc = 0.0;
+            for (int i = 0; i < n_embd; ++i) acc += (double) proj[(size_t) h * n_embd + i] * x[(size_t) t * n_embd + i];
+            hw[(size_t) h] = acc / std::sqrt((double) D * H);
+        }
+        for (int c = 0; c < visible; ++c) {
+            double sc = 0.0;
+            for (int h = 0; h < H; ++h) {
+                double dot = 0.0;
+                for (int d = 0; d < D; ++d) dot += (double) q[(size_t) h * D + d] * keys[(size_t) c * D + d];
+                sc += std::max(dot, 0.0) * hw[(size_t) h];
+            }
+            score[(size_t) c] = sc;
+        }
+    }
+    return out;
+}
+
+// The top `k` of `score` among the rows `allowed` keeps (all when null),
+// sorted by row; `margin` is the relative gap between the last selected and
+// the first dropped score (1e300 when nothing competes).
+static std::vector<int> reference_topk_rows(const std::vector<double> & score, int k,
+                                            const std::vector<bool> * allowed, double * margin) {
+    std::vector<int> order;
+    for (int r = 0; r < (int) score.size(); ++r) {
+        if (score[(size_t) r] > -1e299 && (!allowed || (*allowed)[(size_t) r])) order.push_back(r);
+    }
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return score[(size_t) a] > score[(size_t) b]; });
+    k = std::min(k, (int) order.size());
+    std::vector<int> out(order.begin(), order.begin() + k);
+    std::sort(out.begin(), out.end());
+    if (margin && k == 0) {
+        *margin = 1e300;
+    } else if (margin) {
+        const double s1 = score[(size_t) order[(size_t) k - 1]];
+        *margin = k < (int) order.size()
+            ? (s1 - score[(size_t) order[(size_t) k]]) / std::max(std::fabs(s1), 1e-30) : 1e300;
+    }
+    return out;
+}
+
+static std::vector<std::vector<int>> reference_indexer_topk(
+        const DeepSeek4Weights & w, const std::vector<float> & wq_b, const std::vector<float> & proj,
+        const std::vector<float> & qr, const std::vector<float> & x, const std::vector<float> & keys,
+        int q_lora, int n_embd, int n_comp, int kv_start, int n_tokens, int ratio,
+        std::vector<double> * margins) {
+    const auto scores = reference_indexer_scores(w, wq_b, proj, qr, x, keys, q_lora, n_embd,
+                                                 n_comp, kv_start, n_tokens, ratio);
+    std::vector<std::vector<int>> out((size_t) n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        double margin = 0.0;
+        out[(size_t) t] = reference_topk_rows(scores[(size_t) t], w.n_indexer_top_k, nullptr, &margin);
+        if (margins) margins->push_back(margin);
+    }
+    return out;
+}
+
+// model.py select_candidate_blocks for one query that sees `visible` rows of
+// `score`: blocks score as their best visible row, the block of the newest
+// row is pinned, the top `topk_blocks` are kept unless unreachable. Returns
+// the kept rows as a mask; `blocks` gets the kept block ids (sorted) and
+// `margin` the relative gap at the block cut (1e300 when nothing competes).
+static std::vector<bool> reference_candidate_rows(const std::vector<double> & score, int visible,
+                                                  int topk_blocks, int block_size,
+                                                  std::vector<int> & blocks, double * margin) {
+    const int n = (int) score.size(), nb = (n + block_size - 1) / block_size;
+    std::vector<double> best((size_t) nb, -INFINITY);
+    for (int r = 0; r < std::min(n, visible); ++r) {
+        best[(size_t) (r / block_size)] = std::max(best[(size_t) (r / block_size)], score[(size_t) r]);
+    }
+    best[(size_t) ((visible - 1) / block_size)] = INFINITY;
+    std::vector<int> order((size_t) nb);
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return best[(size_t) a] > best[(size_t) b]; });
+    const int k = std::min(topk_blocks, nb);
+    blocks.clear();
+    for (int i = 0; i < k; ++i) if (best[(size_t) order[(size_t) i]] > -INFINITY) blocks.push_back(order[(size_t) i]);
+    std::sort(blocks.begin(), blocks.end());
+    if (margin) {
+        const double s1 = best[(size_t) order[(size_t) k - 1]], s2 = k < nb ? best[(size_t) order[(size_t) k]] : -INFINITY;
+        *margin = (std::isinf(s1) || std::isinf(s2)) ? 1e300 : (s1 - s2) / std::max(std::fabs(s1), 1e-30);
+    }
+    std::vector<bool> rows((size_t) n, false);
+    for (int b : blocks) {
+        for (int r = b * block_size; r < std::min(n, (b + 1) * block_size); ++r) rows[(size_t) r] = true;
+    }
+    return rows;
+}
+
+// deepseek4_build_indexer_topk with the V4.1 geometry (32 heads x 128, top
+// 512, no rotation) on synthetic weights, against the reference: every
+// query's selection must match wherever the reference's 512th and 513th
+// scores are not a near tie; queries that see at most 512 rows select them
+// all, and a step where none sees more than 512 builds no selection (dense).
+static void test_v41_indexer_topk(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_v41_indexer_topk (%s) ...", name);
+    DeepSeek4Weights w;
+    w.n_indexer_head = 32;
+    w.n_indexer_head_dim = 128;
+    w.n_indexer_top_k = 512;
+    w.n_rot = 64;
+    w.indexer_rotate = false;
+    w.shared_index_topk = true;
+    w.compress_rope_freq_base = 160000.0f;
+    w.rope_scale_factor = 16.0f;
+    w.rope_yarn_beta_fast = 32.0f;
+    w.rope_yarn_beta_slow = 1.0f;
+    w.rope_orig_ctx = 65536;
+    constexpr int q_lora = 64, n_embd = 96, H = 32, D = 128;
+    TestLcg rng(41u);
+    std::vector<float> wq_b((size_t) H * D * q_lora), proj((size_t) H * n_embd);
+    for (auto & v : wq_b) v = 0.2f * rng.next();
+    for (auto & v : proj) v = rng.next();
+    int checked = 0, near_ties = 0;
+    struct Case { int ratio, n_comp, kv_start, n_tokens; bool dense; };
+    const Case cases[] = {
+        {1, 700, 697, 3, false},   // decode/verify-like rows past top_k
+        {2, 600, 1020, 6, false},  // ratio 2: the first tokens still see <= 512 rows
+        {1, 700, 505, 4, true},    // nobody sees more than 512 rows: dense
+    };
+    for (const Case & cs : cases) {
+        std::vector<float> keys((size_t) cs.n_comp * D), qr((size_t) cs.n_tokens * q_lora),
+                           x((size_t) cs.n_tokens * n_embd);
+        for (int c = 0; c < cs.n_comp; ++c) {
+            for (int d = 0; d < D; ++d) keys[(size_t) c * D + d] = rng.next();
+            reference_fp4_round_trip(keys.data() + (size_t) c * D, D);   // stored fp4
+        }
+        for (auto & v : qr) v = rng.next();
+        for (auto & v : x) v = rng.next();
+
+        ggml_init_params params{};
+        params.mem_size = 256 * ggml_tensor_overhead() + ggml_graph_overhead_custom(256, false);
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        DeepSeek4Layer L{};
+        L.indexer_attn_q_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_lora, H * D);
+        L.indexer_proj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, H);
+        ggml_tensor * comp = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D, cs.n_comp);
+        ggml_tensor * qr_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_lora, cs.n_tokens);
+        ggml_tensor * x_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, cs.n_tokens);
+        ggml_tensor * pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, cs.n_tokens);
+        for (ggml_tensor * t : {qr_t, x_t, pos_t}) ggml_set_input(t);
+        ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        std::vector<DeepSeek4I32ArrayBinding> arrays;
+        ggml_tensor * sel = deepseek4_build_indexer_topk(ctx, qr_t, x_t, w, L, comp, cs.n_comp, cs.kv_start,
+                                                         cs.n_tokens, cs.ratio, pos_t, nullptr, arrays);
+        if (cs.dense) {
+            TEST_ASSERT_MSG(sel == nullptr, "a step with <= top_k visible rows builds no selection");
+            ggml_backend_buffer_free(wbuf);
+            ggml_free(ctx);
+            continue;
+        }
+        TEST_ASSERT(sel != nullptr);
+        if (!sel || !wbuf) { ggml_free(ctx); continue; }
+        ggml_set_output(sel);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 256, false);
+        ggml_build_forward_expand(gf, sel);
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        TEST_ASSERT(ggml_gallocr_alloc_graph(alloc, gf));
+        ggml_backend_tensor_set(L.indexer_attn_q_b, wq_b.data(), 0, wq_b.size() * 4);
+        ggml_backend_tensor_set(L.indexer_proj, proj.data(), 0, proj.size() * 4);
+        std::vector<ggml_fp16_t> keys16(keys.size());
+        ggml_fp32_to_fp16_row(keys.data(), keys16.data(), (int64_t) keys.size());
+        ggml_backend_tensor_set(comp, keys16.data(), 0, keys16.size() * 2);
+        ggml_backend_tensor_set(qr_t, qr.data(), 0, qr.size() * 4);
+        ggml_backend_tensor_set(x_t, x.data(), 0, x.size() * 4);
+        std::vector<int32_t> pos((size_t) cs.n_tokens);
+        for (int t = 0; t < cs.n_tokens; ++t) pos[(size_t) t] = cs.kv_start + t;
+        ggml_backend_tensor_set(pos_t, pos.data(), 0, pos.size() * 4);
+        for (const auto & b : arrays) {
+            ggml_backend_tensor_set(b.tensor, b.values.data(), 0, b.values.size() * 4);
+        }
+        TEST_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        std::vector<int32_t> got((size_t) ggml_nelements(sel));
+        ggml_backend_tensor_get(sel, got.data(), 0, got.size() * 4);
+        std::vector<double> margins;
+        const auto want = reference_indexer_topk(w, wq_b, proj, qr, x, keys, q_lora, n_embd, cs.n_comp,
+                                                 cs.kv_start, cs.n_tokens, cs.ratio, &margins);
+        const int k = (int) sel->ne[0];
+        for (int t = 0; t < cs.n_tokens; ++t) {
+            const int visible = (cs.kv_start + t + 1) / cs.ratio;
+            std::vector<int> rows(got.begin() + (ptrdiff_t) t * k, got.begin() + (ptrdiff_t) (t + 1) * k);
+            // A query that sees <= top_k rows keeps [0, top_k); the causal
+            // mask hides the ones past its frontier.
+            std::vector<int> mine;
+            for (int r : rows) if (r < visible) mine.push_back(r);
+            std::sort(mine.begin(), mine.end());
+            if (margins[(size_t) t] < 1e-4) { ++near_ties; continue; }
+            TEST_ASSERT_MSG(mine == want[(size_t) t], "indexer selection differs from the reference");
+            ++checked;
+        }
+        ggml_gallocr_free(alloc);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx);
+    }
+    std::fprintf(stderr, " %d queries match, %d near ties skipped %s\n", checked, near_ties,
+                 g_failures ? "done" : "ok");
+}
+
+// ggml_top_k on the device for the long rows of a long-context indexer
+// (k = 512 past 32K columns) and for candidate blocks (k = 2048): the same
+// set as a full sort, for widths that leave partial tiles and several merge
+// levels. Scores are a shuffled ramp, so there are no ties.
+static void test_long_row_top_k(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_long_row_top_k (%s) ...", name);
+    struct Case { int ncols, nrows, k; };
+    const Case cases[] = {{32769, 3, 512}, {70001, 2, 512}, {300000, 1, 512}, {16385, 3, 2048}, {4097, 2, 2048}};
+    TestLcg rng(512u);
+    int checked = 0;
+    for (const Case & cs : cases) {
+        std::vector<float> x((size_t) cs.ncols * cs.nrows);
+        for (int r = 0; r < cs.nrows; ++r) {
+            float * row = x.data() + (size_t) r * cs.ncols;
+            for (int c = 0; c < cs.ncols; ++c) row[c] = (float) c / (float) cs.ncols - 0.5f;
+            for (int c = cs.ncols - 1; c > 0; --c) {
+                const int o = (int) ((rng.next() + 1.0f) * 0.5f * (float) (c + 1)) % (c + 1);
+                std::swap(row[c], row[o]);
+            }
+        }
+        ggml_init_params params{};
+        params.mem_size = 8 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false);
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * x_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cs.ncols, cs.nrows);
+        ggml_set_input(x_t);
+        ggml_tensor * top = ggml_top_k(ctx, x_t, cs.k);
+        ggml_set_output(top);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8, false);
+        ggml_build_forward_expand(gf, top);
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        TEST_ASSERT(ggml_gallocr_alloc_graph(alloc, gf));
+        ggml_backend_tensor_set(x_t, x.data(), 0, x.size() * 4);
+        TEST_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        std::vector<int32_t> got((size_t) cs.k * cs.nrows);
+        ggml_backend_tensor_get(top, got.data(), 0, got.size() * 4);
+        for (int r = 0; r < cs.nrows; ++r) {
+            const float * row = x.data() + (size_t) r * cs.ncols;
+            std::vector<int> order((size_t) cs.ncols);
+            std::iota(order.begin(), order.end(), 0);
+            std::partial_sort(order.begin(), order.begin() + cs.k, order.end(),
+                              [&](int a, int b) { return row[a] > row[b]; });
+            std::vector<int> want(order.begin(), order.begin() + cs.k);
+            std::vector<int> mine(got.begin() + (ptrdiff_t) r * cs.k, got.begin() + (ptrdiff_t) (r + 1) * cs.k);
+            std::sort(want.begin(), want.end());
+            std::sort(mine.begin(), mine.end());
+            TEST_ASSERT_MSG(mine == want, "long-row top-k differs from a full sort");
+            ++checked;
+        }
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+    }
+    std::fprintf(stderr, " %d rows match %s\n", checked, g_failures ? "done" : "ok");
+}
+
+// ggml_concat on the device past 65,535 rows along dim 1: a DS4 attention
+// step at a 128K context joins its raw rows with every compressed row.
+static void test_long_concat(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_long_concat (%s) ...", name);
+    struct Case { int ne0, rows0, rows1; ggml_type type; };
+    const Case cases[] = {{512, 1152, 70000, GGML_TYPE_F32}, {128, 3, 131071, GGML_TYPE_F16}};
+    for (const Case & cs : cases) {
+        ggml_init_params params{};
+        params.mem_size = 8 * ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false);
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, cs.type, cs.ne0, cs.rows0);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, cs.type, cs.ne0, cs.rows1);
+        ggml_set_input(a);
+        ggml_set_input(b);
+        ggml_tensor * c = ggml_concat(ctx, a, b, 1);
+        ggml_set_output(c);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8, false);
+        ggml_build_forward_expand(gf, c);
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        TEST_ASSERT(ggml_gallocr_alloc_graph(alloc, gf));
+        std::vector<uint8_t> va(ggml_nbytes(a)), vb(ggml_nbytes(b)), got(ggml_nbytes(c));
+        for (size_t i = 0; i < va.size(); ++i) va[i] = (uint8_t) (i * 7 + 1);
+        for (size_t i = 0; i < vb.size(); ++i) vb[i] = (uint8_t) (i * 13 + 5);
+        ggml_backend_tensor_set(a, va.data(), 0, va.size());
+        ggml_backend_tensor_set(b, vb.data(), 0, vb.size());
+        TEST_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(c, got.data(), 0, got.size());
+        TEST_ASSERT_MSG(std::memcmp(got.data(), va.data(), va.size()) == 0 &&
+                        std::memcmp(got.data() + va.size(), vb.data(), vb.size()) == 0,
+                        "long concat differs");
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+    }
+    std::fprintf(stderr, " %s\n", g_failures ? "done" : "ok");
+}
+
+// Candidate block pre-selection against model.py on synthetic indexer
+// scores: deepseek4_candidate_blocks (block max, the newest block pinned, top
+// blocks) on the source's scores, then deepseek4_restrict_to_candidate_blocks
+// and top-k on a reader's. Queries see fewer and more rows than the blocks
+// hold; a partial last block is covered; ratio 2 checks the frontier formula.
+static void test_v41_candidate_blocks(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_v41_candidate_blocks (%s) ...", name);
+    struct Case { int ratio, n_comp, kv_start, n_tokens, topk_blocks, block_size, top_k; };
+    const Case cases[] = {
+        {1, 83, 39, 44, 6, 8, 12},    // 40..83 visible rows, partial last block of 3
+        {2, 70, 80, 60, 5, 8, 10},    // (pos + 1) / 2 = 40..70 visible
+        {1, 4100, 4000, 100, 256, 8, 512},
+        {1, 40000, 39997, 3, 2048, 8, 512},   // V4.1 geometry past 32K rows
+    };
+    TestLcg rng(4141u);
+    int checked = 0;
+    for (const Case & cs : cases) {
+        const int n = cs.n_comp, T = cs.n_tokens;
+        std::vector<float> src((size_t) n * T), rd((size_t) n * T);
+        std::vector<int32_t> pos((size_t) T);
+        for (int t = 0; t < T; ++t) {
+            pos[(size_t) t] = cs.kv_start + t;
+            const int visible = (cs.kv_start + t + 1) / cs.ratio;
+            for (int r = 0; r < n; ++r) {
+                src[(size_t) t * n + r] = r < visible ? rng.next() : -1.0e30f;
+                rd[(size_t) t * n + r] = r < visible ? rng.next() : -1.0e30f;
+            }
+        }
+        ggml_init_params params{};
+        params.mem_size = 128 * ggml_tensor_overhead() + ggml_graph_overhead_custom(128, false);
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * src_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
+        ggml_tensor * rd_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
+        ggml_tensor * pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+        for (ggml_tensor * t : {src_t, rd_t, pos_t}) ggml_set_input(t);
+        ggml_tensor * cand = deepseek4_candidate_blocks(ctx, src_t, pos_t, cs.ratio, cs.topk_blocks, cs.block_size);
+        ggml_tensor * sel = ggml_top_k(ctx, deepseek4_restrict_to_candidate_blocks(ctx, rd_t, cand, cs.block_size),
+                                       cs.top_k);
+        ggml_set_output(cand);
+        ggml_set_output(sel);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 128, false);
+        ggml_build_forward_expand(gf, cand);
+        ggml_build_forward_expand(gf, sel);
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        TEST_ASSERT(ggml_gallocr_alloc_graph(alloc, gf));
+        ggml_backend_tensor_set(src_t, src.data(), 0, src.size() * 4);
+        ggml_backend_tensor_set(rd_t, rd.data(), 0, rd.size() * 4);
+        ggml_backend_tensor_set(pos_t, pos.data(), 0, pos.size() * 4);
+        TEST_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        std::vector<int32_t> got_cand((size_t) ggml_nelements(cand)), got_sel((size_t) ggml_nelements(sel));
+        ggml_backend_tensor_get(cand, got_cand.data(), 0, got_cand.size() * 4);
+        ggml_backend_tensor_get(sel, got_sel.data(), 0, got_sel.size() * 4);
+        for (int t = 0; t < T; ++t) {
+            const int visible = (cs.kv_start + t + 1) / cs.ratio;
+            std::vector<double> s_src((size_t) n), s_rd((size_t) n);
+            for (int r = 0; r < n; ++r) {
+                s_src[(size_t) r] = r < visible ? src[(size_t) t * n + r] : -1e300;
+                s_rd[(size_t) r] = r < visible ? rd[(size_t) t * n + r] : -1e300;
+            }
+            std::vector<int> want_blocks;
+            const std::vector<bool> allowed = reference_candidate_rows(
+                s_src, visible, cs.topk_blocks, cs.block_size, want_blocks, nullptr);
+            const std::vector<int> want = reference_topk_rows(s_rd, cs.top_k, &allowed, nullptr);
+            std::vector<int> blocks;
+            for (int i = 0; i < cs.topk_blocks; ++i) {
+                const int b = got_cand[(size_t) t * cs.topk_blocks + i];
+                if (b * cs.block_size < visible) blocks.push_back(b);
+            }
+            std::sort(blocks.begin(), blocks.end());
+            std::vector<int> mine(got_sel.begin() + (ptrdiff_t) t * cs.top_k,
+                                  got_sel.begin() + (ptrdiff_t) (t + 1) * cs.top_k);
+            std::sort(mine.begin(), mine.end());
+            TEST_ASSERT_MSG(blocks == want_blocks, "candidate blocks differ from the reference");
+            TEST_ASSERT_MSG(mine == want, "selection inside the candidate blocks differs from the reference");
+            ++checked;
+        }
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+    }
+    std::fprintf(stderr, " %d queries match %s\n", checked, g_failures ? "done" : "ok");
+}
+
+// The same through deepseek4_build_indexer_topk with real indexer math (V4.1
+// geometry, small top-k and blocks): the candidate source picks its blocks,
+// a later index source with other weights selects inside them. Checked
+// against reference_indexer_scores + model.py's two levels.
+static void test_v41_indexer_candidates(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_v41_indexer_candidates (%s) ...", name);
+#if !defined(GGML_USE_HIP)
+    // V4.1 is qualified on ROCm; the backend refuses it on CUDA builds, where
+    // this selection differs from the reference (sm_121, 6 of 80 queries).
+    if (std::strcmp(name, "cpu") != 0) {
+        std::fprintf(stderr, " skipped (V4.1 is ROCm-only)\n");
+        return;
+    }
+#endif
+    DeepSeek4Weights w;
+    w.n_indexer_head = 32;
+    w.n_indexer_head_dim = 128;
+    w.n_indexer_top_k = 16;
+    w.n_rot = 64;
+    w.indexer_rotate = false;
+    w.shared_index_topk = true;
+    w.compress_rope_freq_base = 160000.0f;
+    w.rope_scale_factor = 16.0f;
+    w.rope_yarn_beta_fast = 32.0f;
+    w.rope_yarn_beta_slow = 1.0f;
+    w.rope_orig_ctx = 65536;
+    w.candidate_source_layer = 0;
+    w.candidate_topk_blocks = 8;
+    w.candidate_block_size = 8;
+    constexpr int q_lora = 64, n_embd = 96, H = 32, D = 128;
+    constexpr int ratio = 1, kv_start = 20, n_tokens = 80, n_comp = kv_start + n_tokens;
+    TestLcg rng(4242u);
+    std::vector<float> wq[2], pj[2];
+    for (int l = 0; l < 2; ++l) {
+        wq[l].resize((size_t) H * D * q_lora);
+        pj[l].resize((size_t) H * n_embd);
+        for (auto & v : wq[l]) v = 0.2f * rng.next();
+        for (auto & v : pj[l]) v = rng.next();
+    }
+    std::vector<float> keys((size_t) n_comp * D), qr((size_t) n_tokens * q_lora), x((size_t) n_tokens * n_embd);
+    for (int c = 0; c < n_comp; ++c) {
+        for (int d = 0; d < D; ++d) keys[(size_t) c * D + d] = rng.next();
+        reference_fp4_round_trip(keys.data() + (size_t) c * D, D);
+    }
+    for (auto & v : qr) v = rng.next();
+    for (auto & v : x) v = rng.next();
+
+    ggml_init_params params{};
+    params.mem_size = 512 * ggml_tensor_overhead() + ggml_graph_overhead_custom(512, false);
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    DeepSeek4Layer L[2]{};
+    for (auto & l : L) {
+        l.indexer_attn_q_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_lora, H * D);
+        l.indexer_proj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, H);
+    }
+    ggml_tensor * comp = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D, n_comp);
+    ggml_tensor * qr_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_lora, n_tokens);
+    ggml_tensor * x_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    for (ggml_tensor * t : {qr_t, x_t, pos_t}) ggml_set_input(t);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    TEST_ASSERT(wbuf != nullptr);
+    std::vector<DeepSeek4I32ArrayBinding> arrays;
+    DeepSeek4IndexCandidates source;
+    source.source = true;
+    ggml_tensor * sel_src = deepseek4_build_indexer_topk(ctx, qr_t, x_t, w, L[0], comp, n_comp, kv_start,
+                                                         n_tokens, ratio, pos_t, nullptr, arrays, &source);
+    DeepSeek4IndexCandidates reader;
+    reader.blocks = source.blocks;
+    ggml_tensor * sel = deepseek4_build_indexer_topk(ctx, qr_t, x_t, w, L[1], comp, n_comp, kv_start,
+                                                     n_tokens, ratio, pos_t, nullptr, arrays, &reader);
+    TEST_ASSERT(sel_src && sel && source.blocks);
+    if (!sel_src || !sel || !source.blocks || !wbuf) { ggml_free(ctx); return; }
+    ggml_set_output(sel_src);
+    ggml_set_output(sel);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 512, false);
+    ggml_build_forward_expand(gf, sel_src);
+    ggml_build_forward_expand(gf, sel);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    TEST_ASSERT(ggml_gallocr_alloc_graph(alloc, gf));
+    for (int l = 0; l < 2; ++l) {
+        ggml_backend_tensor_set(L[l].indexer_attn_q_b, wq[l].data(), 0, wq[l].size() * 4);
+        ggml_backend_tensor_set(L[l].indexer_proj, pj[l].data(), 0, pj[l].size() * 4);
+    }
+    std::vector<ggml_fp16_t> keys16(keys.size());
+    ggml_fp32_to_fp16_row(keys.data(), keys16.data(), (int64_t) keys.size());
+    ggml_backend_tensor_set(comp, keys16.data(), 0, keys16.size() * 2);
+    ggml_backend_tensor_set(qr_t, qr.data(), 0, qr.size() * 4);
+    ggml_backend_tensor_set(x_t, x.data(), 0, x.size() * 4);
+    std::vector<int32_t> pos((size_t) n_tokens);
+    for (int t = 0; t < n_tokens; ++t) pos[(size_t) t] = kv_start + t;
+    ggml_backend_tensor_set(pos_t, pos.data(), 0, pos.size() * 4);
+    for (const auto & b : arrays) ggml_backend_tensor_set(b.tensor, b.values.data(), 0, b.values.size() * 4);
+    TEST_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+    std::vector<int32_t> got((size_t) ggml_nelements(sel));
+    ggml_backend_tensor_get(sel, got.data(), 0, got.size() * 4);
+
+    const auto s_src = reference_indexer_scores(w, wq[0], pj[0], qr, x, keys, q_lora, n_embd, n_comp,
+                                                kv_start, n_tokens, ratio);
+    const auto s_rd = reference_indexer_scores(w, wq[1], pj[1], qr, x, keys, q_lora, n_embd, n_comp,
+                                               kv_start, n_tokens, ratio);
+    const int K = w.n_indexer_top_k;
+    int checked = 0, near_ties = 0, restricted = 0, changed = 0;
+    for (int t = 0; t < n_tokens; ++t) {
+        const int visible = (kv_start + t + 1) / ratio;
+        std::vector<int> blocks;
+        double block_margin = 0.0, row_margin = 0.0;
+        const std::vector<bool> allowed = reference_candidate_rows(
+            s_src[(size_t) t], visible, w.candidate_topk_blocks, w.candidate_block_size, blocks, &block_margin);
+        const std::vector<int> want = reference_topk_rows(s_rd[(size_t) t], K, &allowed, &row_margin);
+        std::vector<int> mine;
+        for (int i = 0; i < K; ++i) {
+            const int r = got[(size_t) t * K + i];
+            if (r < visible) mine.push_back(r);
+        }
+        std::sort(mine.begin(), mine.end());
+        if (block_margin < 1e-4 || row_margin < 1e-4) { ++near_ties; continue; }
+        TEST_ASSERT_MSG(mine == want, "indexer selection inside the candidate blocks differs from the reference");
+        restricted += visible > w.candidate_topk_blocks * w.candidate_block_size;
+        changed += want != reference_topk_rows(s_rd[(size_t) t], K, nullptr, nullptr);
+        ++checked;
+    }
+    // The blocks must have mattered somewhere, or this checks nothing new.
+    TEST_ASSERT(restricted > 0 && changed > 0);
+    ggml_gallocr_free(alloc);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(ctx);
+    std::fprintf(stderr, " %d queries match (%d restricted, %d changed by the blocks), %d near ties skipped %s\n",
+                 checked, restricted, changed, near_ties, g_failures ? "done" : "ok");
 }
 
 static void test_hash_routing_lookup() {
@@ -3003,6 +3805,9 @@ static void test_dspark_compressor_rollback(ggml_backend_t backend, int copy_mod
             tensors.push_back(state->state_score);
         }
     }
+    // A V4 ratio-4 layer also owns index-key rows; its counter rolls back
+    // with the compressed rows.
+    cache.layers[0].index_comp_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 3, 4);
     auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     TEST_ASSERT(buffer != nullptr);
     if (!buffer) { ggml_free(ctx); return; }
@@ -3929,6 +4734,24 @@ static void test_monolithic_snapshot_disk_roundtrip() {
         TEST_ASSERT(backend.snapshot_used(6));
         TEST_ASSERT(backend.snapshots_[6].owns_storage);
     }
+    // Snapshots carry the current format version; an older one is refused.
+    {
+        const ModelBackend::SnapshotRef good = backend.snapshot_ref(5);
+        ggml_context * old_ctx = nullptr;
+        ggml_backend_buffer_t old_buf = nullptr;
+        TEST_ASSERT(clone_snapshot_context_like_disk_reader(good.ctx, &old_ctx, &old_buf));
+        ggml_tensor * meta = ggml_get_tensor(old_ctx, kDeepSeek4SnapMetaName);
+        TEST_ASSERT(meta != nullptr);
+        int32_t version = 0;
+        ggml_backend_tensor_get(meta, &version, 0, sizeof(version));
+        TEST_ASSERT(version == kDeepSeek4SnapMetaVersion && version >= 2);
+        version = 1;
+        ggml_backend_tensor_set(meta, &version, 0, sizeof(version));
+        TEST_ASSERT(!backend.snapshot_adopt(7, old_ctx, old_buf, good.cur_pos, -1));
+        TEST_ASSERT(!backend.snapshot_used(7));
+        ggml_backend_buffer_free(old_buf);
+        ggml_free(old_ctx);
+    }
 
     for (int i = 0; i < 8; ++i) backend.snapshot_free(i);
     remove_test_disk_cache_dir(dir);
@@ -4085,17 +4908,87 @@ static void test_spec_feature_tail_is_bounded() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_prefill_restore_points() {
+    std::fprintf(stderr, "  test_prefill_restore_points ...");
+
+    using Backend = DeepSeek4Backend;
+    // A chunk stops at the next restore point after its start.
+    const std::vector<int> points = {100, 300, 350};
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(0, 1024, points) == 100);
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(100, 1024, points) == 200);
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(300, 1024, points) == 50);
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(350, 1024, points) == 1024);
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(0, 64, points) == 64);
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(36, 64, points) == 64);
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(0, 1024, {}) == 1024);
+
+    // The chunks after any restore point are the ones a cold prefill runs.
+    const auto chunk_starts = [&](int from, int end, int chunk) {
+        std::vector<int> starts;
+        for (int pos = from; pos < end;) {
+            starts.push_back(pos);
+            pos += Backend::restore_safe_prefill_tokens(pos, std::min(chunk, end - pos), points);
+        }
+        return starts;
+    };
+    const std::vector<int> cold = chunk_starts(0, 1400, 256);
+    for (int point : points) {
+        const std::vector<int> restored = chunk_starts(point, 1400, 256);
+        TEST_ASSERT(std::find(cold.begin(), cold.end(), point) != cold.end());
+        TEST_ASSERT(std::equal(restored.begin(), restored.end(),
+                               std::find(cold.begin(), cold.end(), point)));
+    }
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_hybrid_prefill_chunk_fit() {
+    std::fprintf(stderr, "  test_hybrid_prefill_chunk_fit ...");
+
+    using Backend = DeepSeek4Backend;
+    // The fitted chunk is a function of its inputs only: a multiple of 64,
+    // at least 64, within the layer-major limit.
+    const size_t gib = (size_t) 1 << 30, mib = (size_t) 1 << 20;
+    TEST_ASSERT(Backend::hybrid_prefill_fit_tokens(4 * gib, gib, mib) == 3072);
+    TEST_ASSERT(Backend::hybrid_prefill_fit_tokens(4 * gib, gib, mib) ==
+                Backend::hybrid_prefill_fit_tokens(4 * gib, gib, mib));
+    TEST_ASSERT(Backend::hybrid_prefill_fit_tokens(gib + 100 * mib, gib, mib) == 64);
+    TEST_ASSERT(Backend::hybrid_prefill_fit_tokens(gib + 130 * mib, gib, mib) == 128);
+    TEST_ASSERT(Backend::hybrid_prefill_fit_tokens(gib / 2, gib, mib) == 64);
+    TEST_ASSERT(Backend::hybrid_prefill_fit_tokens(64 * gib, gib, 1) ==
+                DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS);
+
+    // Per-token scratch grows with the compressed rows a context can reach;
+    // ratio-1 layers reach one row per token.
+    DeepSeek4Weights w;
+    w.n_embd = 5120;
+    w.n_head = 64;
+    w.head_dim = 512;
+    w.n_expert = 384;
+    w.n_expert_used = 6;
+    w.n_ff_exp = 2304;
+    w.n_swa = 128;
+    w.compress_ratios = {0, 0, 2, 1};
+    const auto short_ctx = Backend::hybrid_prefill_scratch_per_token(w, 4096, 1024);
+    const auto long_ctx = Backend::hybrid_prefill_scratch_per_token(w, 16384, 1024);
+    TEST_ASSERT(long_ctx.target - short_ctx.target == (size_t) (16384 - 4096) * 6);
+    TEST_ASSERT(long_ctx.second == short_ctx.second);
+    TEST_ASSERT(short_ctx.target > short_ctx.second && short_ctx.second > 0);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_dspark_prefill_capture_boundaries() {
     std::fprintf(stderr, "  test_dspark_prefill_capture_boundaries ...");
 
     using Backend = DeepSeek4Backend;
-    // Both monolithic layer-major and sparse heterogeneous prefill return the
-    // per-token capture rows needed to retain a tail from one wide graph.
+    // Both monolithic layer-major and batched heterogeneous prefill return
+    // the per-token capture rows needed to retain a tail from one wide graph.
     TEST_ASSERT(Backend::supports_batched_spec_feature_capture(
                     false, PrefillAttentionMode::Sparse, 2048));
     TEST_ASSERT(Backend::supports_batched_spec_feature_capture(
                     true, PrefillAttentionMode::Sparse, 2048));
-    TEST_ASSERT(!Backend::supports_batched_spec_feature_capture(
+    TEST_ASSERT(Backend::supports_batched_spec_feature_capture(
                     true, PrefillAttentionMode::Dense, 2048));
     TEST_ASSERT(!Backend::supports_batched_spec_feature_capture(
                     true, PrefillAttentionMode::Exact, 2048));
@@ -4113,12 +5006,15 @@ static void test_dspark_prefill_capture_boundaries() {
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
                     1920, 128, 1920, false, false, 0, 0) == 128);
 
-    // A pending checkpoint contributes both edges of its capture window. The
-    // resulting batches are either wholly hooked or wholly unhooked.
+    // A token-by-token capture also stops at both edges of a pending
+    // checkpoint's window; a batched capture returns its rows from any chunk,
+    // so a checkpoint does not change where batched chunks start.
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    0, 2048, 1920, true, true, 384, 512) == 384);
+                    0, 2048, 1920, true, true, 384, 512) == 2048);
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    384, 1664, 1920, true, true, 384, 512) == 128);
+                    0, 2048, 1920, false, true, 384, 512) == 384);
+    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
+                    384, 1664, 1920, false, true, 384, 512) == 128);
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
                     512, 1536, 1920, false, false, 384, 512) == 1408);
 
@@ -8106,7 +9002,12 @@ int main(int argc, char ** argv) {
     test_indexer_qat_cpu(backend);
     test_indexer_score_cpu(backend);
     test_indexer_mask_cpu(backend);
-    test_ds4_ratio4_causal_visibility_formula();
+    test_engram_apply_synthetic(backend, "cpu");
+    test_engram_apply_released_weights(backend, "cpu");
+    test_v41_indexer_topk(backend, "cpu");
+    test_v41_candidate_blocks(backend, "cpu");
+    test_v41_indexer_candidates(backend, "cpu");
+    test_ds4_causal_visibility_formula();
     test_dspark_seed_row_restore_cpu();
     test_hash_routing_lookup();
     test_raw_ring_spans_after_wrap();
@@ -8152,6 +9053,8 @@ int main(int argc, char ** argv) {
     test_layer_split_snapshot_disk_roundtrip();
     test_spec_feature_tail_is_bounded();
     test_dspark_prefill_capture_boundaries();
+    test_hybrid_prefill_chunk_fit();
+    test_prefill_restore_points();
     test_reset_request_state();
     test_reset_deepseek4_cache(backend);
     test_adapter_guard_paths();
@@ -8164,6 +9067,13 @@ int main(int argc, char ** argv) {
         auto gpu = ggml_backend_cuda_init(0);
         if (gpu) {
             for (int mode = 0; mode < 3; ++mode) test_dspark_compressor_rollback(gpu, mode);
+            test_engram_apply_synthetic(gpu, "gpu");
+            test_engram_apply_released_weights(gpu, "gpu");
+            test_v41_indexer_topk(gpu, "gpu");
+            test_v41_candidate_blocks(gpu, "gpu");
+            test_v41_indexer_candidates(gpu, "gpu");
+            test_long_row_top_k(gpu, "gpu");
+            test_long_concat(gpu, "gpu");
             ggml_backend_free(gpu);
         } else {
             std::fprintf(stderr, "  test_dspark_compressor_rollback GPU skipped (no device)\n");

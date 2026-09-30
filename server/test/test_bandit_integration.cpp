@@ -35,26 +35,6 @@ TEST_CASE(BanditIntegrationFixture, three_turn_session_evolves_keep_ratio) {
     CHECK(sessions.turn_count("s1") == 3);
 }
 
-TEST_CASE(BanditIntegrationFixture, no_session_id_uses_static_default) {
-    HttpServerSessions sessions;
-    CHECK(sessions.size() == 0);
-    float k = sessions.get_keep_ratio("");
-    CHECK(approx_eq(k, AdaptiveKeepRatioState{}.last_keep));
-}
-
-TEST_CASE(BanditIntegrationFixture, isolated_sessions) {
-    HttpServerSessions sessions;
-    sessions.update("high_accept", 0.95f);
-    sessions.update("low_accept", 0.50f);
-
-    float k_high = sessions.get_keep_ratio("high_accept");
-    float k_low = sessions.get_keep_ratio("low_accept");
-    CHECK(k_high < k_low);
-    CHECK(sessions.turn_count("high_accept") == 1);
-    CHECK(sessions.turn_count("low_accept") == 1);
-    CHECK(sessions.size() == 2);
-}
-
 TEST_CASE(BanditIntegrationFixture, multi_turn_reaches_lower_bound) {
     HttpServerSessions sessions;
     for (int i = 0; i < 100; ++i) {

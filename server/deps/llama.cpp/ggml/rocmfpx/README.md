@@ -18,6 +18,12 @@ ROCmFP2 uses the integer levels `-1, 0, 1, 2`; ROCmFP3 uses
 `0, +/-1, +/-2, +/-4`; ROCmFP6 uses signed-magnitude levels up to 31; and
 ROCmFP8 uses signed integer levels clamped to `[-127, 127]`.
 
+ROCmFP2 scale bytes carry one more bit ("fp2s"). UE4M3 scales never exceed
+`0x7e`, so bit 7 is free: when set it negates the codebook of that half-block
+(`1, 0, -1, -2` instead of `-1, 0, 1, 2`), which lets the encoder put the
+asymmetric level on whichever side the weights need. Files written without
+the bit decode exactly as before. The affine ROCmFP2 build does not use it.
+
 `rocmfpx.c` provides deterministic CPU reference quantization,
 dequantization, validation, and vector-dot functions. Backend dispatch is
 integrated in ggml's HIP source tree. Vulkan kernels are not implemented in

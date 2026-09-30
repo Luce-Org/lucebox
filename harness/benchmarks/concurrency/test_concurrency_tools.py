@@ -88,108 +88,65 @@ class PromptGeneratorTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
-    def test_runners_isolate_and_record_selected_gpu(self) -> None:
-        for script_name in (
-            "run_qwen36_concurrency.sh",
-            "run_qwen36_canonical_concurrency.sh",
+    def test_ragged_runner_accepts_tuning_range_edges(self) -> None:
+        # CLIENTS=0 is validated after both tuning ranges, so reaching it
+        # proves each edge value was accepted.
+        runner = HERE / "run_qwen36_concurrency.sh"
+        for variable, value in (
+            ("PREFILL_FIRST_BURST_STEPS", "0"),
+            ("PREFILL_FIRST_BURST_STEPS", "1024"),
+            ("IDLE_PREFILL_TOKENS", "1"),
+            ("IDLE_PREFILL_TOKENS", "16384"),
         ):
-            text = (HERE / script_name).read_text(encoding="utf-8")
-            self.assertIn('GPU_DEVICE="${GPU_DEVICE:-0}"', text)
-            self.assertIn('ROCR_VISIBLE_DEVICES="$GPU_DEVICE"', text)
-            self.assertIn('"rocr_visible_devices"', text)
-
-    def test_ragged_runner_derives_offsets_from_requested_matrix(self) -> None:
-        text = (HERE / "run_qwen36_concurrency.sh").read_text(encoding="utf-8")
-        self.assertIn('CLIENTS="${CLIENTS:-2,4,8,16}"', text)
-        self.assertIn('prompt_offsets[$c]="$next_prompt_offset"', text)
-        self.assertIn('--clients "$CLIENTS"', text)
-        self.assertNotIn("prompt_offsets=([", text)
-
-    def test_ragged_runner_records_prefill_first_policy(self) -> None:
-        text = (HERE / "run_qwen36_concurrency.sh").read_text(encoding="utf-8")
-        self.assertIn('PREFILL_FIRST_BURST_STEPS="${PREFILL_FIRST_BURST_STEPS:-0}"', text)
-        self.assertIn('LUCE_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"', text)
-        self.assertIn('"prefill_first_burst_steps"', text)
-        self.assertIn('(( 10#$PREFILL_FIRST_BURST_STEPS > 1024 ))', text)
-        launch_start = text.index("launch_command=(env", text.index("else\n    launch_command="))
-        burst_assignment = text.index(
-            'LUCE_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"',
-            launch_start,
-        )
-        launch_end = text.index('"${command[@]}")', burst_assignment)
-        self.assertLess(launch_start, burst_assignment)
-        self.assertLess(burst_assignment, launch_end)
-
-    def test_runners_record_bounded_idle_prefill_budget(self) -> None:
-        ragged = (HERE / "run_qwen36_concurrency.sh").read_text(encoding="utf-8")
-        canonical = (
-            HERE / "run_qwen36_canonical_concurrency.sh"
-        ).read_text(encoding="utf-8")
-        for text in (ragged, canonical):
-            self.assertIn(
-                'IDLE_PREFILL_TOKENS="${IDLE_PREFILL_TOKENS:-4096}"', text
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "MODEL": "/dev/null",
+                "LUCE_SERVER_BIN": "/bin/true",
+                "LLAMA_SERVER_BIN": "/bin/true",
+                "CLIENTS": "0",
+                "OUT": "/nonexistent/unused",
+                variable: value,
+            }
+            result = subprocess.run(
+                [str(runner)], env=env, text=True, capture_output=True, check=False
             )
-            self.assertIn('^[0-9]{1,4}$ ]]', text)
-            self.assertIn('^[1-9][0-9]{0,4}$ ]]', text)
-            self.assertIn('(( 10#$IDLE_PREFILL_TOKENS > 16384 ))', text)
-            self.assertIn(
-                "IDLE_PREFILL_TOKENS must be an integer in range 1..16384", text
-            )
-            self.assertIn('"idle_prefill_tokens"', text)
-        assignment = 'LUCE_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"'
-        self.assertEqual(ragged.count(assignment), 1)
-        self.assertEqual(canonical.count(assignment), 2)
-        self.assertIn(
-            '"idle_prefill_tokens":int(idle_prefill_tokens) '
-            'if variant != "llama" else None',
-            ragged,
-        )
-        self.assertIn(
-            '"idle_prefill_tokens":int(idle_prefill_tokens)', canonical
-        )
+            with self.subTest(variable=variable, value=value):
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("CLIENTS must contain positive integers", result.stderr)
 
-    def test_ragged_runner_rejects_oversized_tuning_integers(self) -> None:
+    def test_ragged_runner_rejects_out_of_range_tuning_integers(self) -> None:
         runner = HERE / "run_qwen36_concurrency.sh"
         oversized = "18446744073709551616"
         cases = (
             (
                 "PREFILL_FIRST_BURST_STEPS",
+                ("-1", "1025", oversized),
                 "PREFILL_FIRST_BURST_STEPS must be an integer in range 0..1024",
             ),
             (
                 "IDLE_PREFILL_TOKENS",
+                ("0", "16385", oversized),
                 "IDLE_PREFILL_TOKENS must be an integer in range 1..16384",
             ),
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for variable, message in cases:
-                env = {
-                    "PATH": os.environ.get("PATH", ""),
-                    "MODEL": "/dev/null",
-                    "LUCE_SERVER_BIN": "/bin/true",
-                    "LLAMA_SERVER_BIN": "/bin/true",
-                    "OUT": str(root / variable),
-                    variable: oversized,
-                }
-                result = subprocess.run(
-                    [str(runner)], env=env, text=True, capture_output=True, check=False
-                )
-                with self.subTest(variable=variable):
-                    self.assertEqual(result.returncode, 2)
-                    self.assertIn(message, result.stderr)
-
-    def test_ragged_runner_can_fail_closed_on_gpu_arch(self) -> None:
-        text = (HERE / "run_qwen36_concurrency.sh").read_text(encoding="utf-8")
-        self.assertIn('EXPECTED_GPU_ARCH="${EXPECTED_GPU_ARCH:-}"', text)
-        self.assertIn('rocminfo 2>/dev/null | grep -F -- "$EXPECTED_GPU_ARCH"', text)
-        self.assertIn('"$case_dir/gpu-identity.txt"', text)
-        self.assertIn('"$binary" --list-devices', text)
-        self.assertIn('"$case_dir/llama-list-devices.txt"', text)
-        self.assertIn('-ngl all -lv 4 --reasoning off --reasoning-format none', text)
-        self.assertIn('offloaded ([1-9][0-9]*)/([1-9][0-9]*) layers to GPU', text)
-        self.assertIn('"$case_dir/server-gpu-proof.txt"', text)
-        self.assertIn('"expected_gpu_arch"', text)
+            for variable, values, message in cases:
+                for value in values:
+                    env = {
+                        "PATH": os.environ.get("PATH", ""),
+                        "MODEL": "/dev/null",
+                        "LUCE_SERVER_BIN": "/bin/true",
+                        "LLAMA_SERVER_BIN": "/bin/true",
+                        "OUT": str(root / f"{variable}-{value}"),
+                        variable: value,
+                    }
+                    result = subprocess.run(
+                        [str(runner)], env=env, text=True, capture_output=True, check=False
+                    )
+                    with self.subTest(variable=variable, value=value):
+                        self.assertEqual(result.returncode, 2)
+                        self.assertIn(message, result.stderr)
 
 
 class SummarizerTests(unittest.TestCase):

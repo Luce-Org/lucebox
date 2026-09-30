@@ -3241,9 +3241,12 @@ bool LagunaBackend::build_hybrid_storage_from_file(
     int cache_slots = 0;
     if (const char * cs = std::getenv("LUCE_LAGUNA_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
     else if (cache_slots_ >= 0) cache_slots = cache_slots_;
+    TensorFileReader reader;
+    const bool read_file = reader.open(args_.target_path);
     bool ok = build_moe_hybrid_storage_from_file_with_mmap(hybrid_cfg, backend_, placement,
                                                             layer_descs, layer_file_data,
-                                                            mmap_addr, file_size, *hybrid, &err, cache_slots);
+                                                            mmap_addr, file_size, *hybrid, &err, cache_slots,
+                                                            nullptr, -1, read_file ? &reader : nullptr);
     gguf_free(gctx);
     if (!ok) {
 #if defined(_WIN32)

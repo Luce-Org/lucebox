@@ -7,7 +7,6 @@
 
 #include "tool_parser.h"
 #include "tool_memory.h"
-#include "reasoning.h"
 #include "api_types.h"
 #include "response_error.h"
 #include <nlohmann/json.hpp>

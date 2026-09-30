@@ -49,6 +49,11 @@ std::string check_feature_compatibility(
         return "--target-shard-ipc-work-dir requires --target-shard-ipc-bin";
     }
 
+    // DeepSeek V4.1 has no layer-split path, which a remote target shard uses.
+    if (arch == "deepseek41" && args.remote_target_shard.enabled()) {
+        return "--target-shard-ipc-bin is not implemented for DeepSeek V4.1 (see server/docs/DS41.md)";
+    }
+
     // ── vision projector × architecture / placement
     if (args.mmproj_path.has_value()) {
         if ((arch != "deepseek4" && arch != "qwen35") || args.device.is_layer_split() ||
@@ -75,7 +80,7 @@ std::string check_feature_compatibility(
         !admission.pflash_drafter_configured) {
         return "--prefill-compression requires --prefill-drafter";
     }
-    if (admission.pflash_enabled && arch == "deepseek4" &&
+    if (admission.pflash_enabled && arch_is_deepseek4_family(arch) &&
         args.device.is_layer_split()) {
         return "--prefill-compression is not supported with DeepSeek4 layer splitting";
     }
@@ -254,7 +259,7 @@ std::string check_feature_compatibility(
         if (admission.fixed_kvflash_requested()) {
             return "--paged-attention cannot be combined with KVFlash";
         }
-        if (arch == "deepseek4") {
+        if (arch_is_deepseek4_family(arch)) {
             if (target_backend != PlacementBackend::Hip) {
                 return "DeepSeek4 paged attention requires a local HIP target";
             }
@@ -311,7 +316,7 @@ std::string check_feature_compatibility(
         }
         // Qwen's graph is qualified through 64 lanes. DeepSeek's gathered
         // whole-model graph has a smaller, separately qualified ceiling.
-        const int max_slots = arch == "deepseek4"
+        const int max_slots = arch_is_deepseek4_family(arch)
             ? DEEPSEEK4_MAX_PAGED_SEQUENCES : 64;
         if (args.max_concurrency > max_slots) {
             return "--max-concurrency must be at most " +
@@ -340,7 +345,7 @@ std::string check_feature_compatibility(
     }
 
     // ── --ds4-prefill × architecture
-    if (args.ds4_prefill_mode_set && arch != "deepseek4") {
+    if (args.ds4_prefill_mode_set && !arch_is_deepseek4_family(arch)) {
         return "--ds4-prefill is only valid for deepseek4 models (detected '" +
                arch + "')";
     }
@@ -350,17 +355,17 @@ std::string check_feature_compatibility(
     // by either monolithic backend, but the layer-split adapter does not yet
     // propagate it.
     const bool monolithic_ds4 =
-        arch == "deepseek4" &&
+        arch_is_deepseek4_family(arch) &&
         target_backend == PlacementBackend::Hip &&
         !args.device.is_layer_split() &&
         !args.remote_target_shard.enabled();
     const bool local_ds4 =
-        arch == "deepseek4" &&
+        arch_is_deepseek4_family(arch) &&
         !args.device.is_layer_split() &&
         !args.remote_target_shard.enabled();
 
     // ── approximate --ds4-prefill × placement
-    if (arch == "deepseek4" &&
+    if (arch_is_deepseek4_family(arch) &&
         prefill_attention_mode_is_approximate(args.ds4_prefill_mode) &&
         !monolithic_ds4) {
         return std::string("DS4 ") +
@@ -385,6 +390,13 @@ std::string check_feature_compatibility(
     if (args.ds4_expert_top_k != 0 && !local_ds4) {
         return "--ds4-expert-top-k currently requires a single local "
                "DeepSeek4 backend";
+    }
+
+    // ── expert ownership and routing files × architecture/adapter
+    if ((!args.ds4_expert_placement.empty() || !args.ds4_router_bias.empty() ||
+         !args.ds4_protected_experts.empty()) && !local_ds4) {
+        return "--ds4-expert-placement, --ds4-router-bias and "
+               "--ds4-protected-experts require a single local DeepSeek4 backend";
     }
 
     return {};
@@ -426,7 +438,7 @@ std::vector<std::string> collect_feature_warnings(
     // remote target shard on one local device; that adapter drops the same
     // options as an explicit split.
     const bool split = args.device.is_layer_split() ||
-        (arch == "deepseek4" && args.remote_target_shard.enabled());
+        (arch_is_deepseek4_family(arch) && args.remote_target_shard.enabled());
 
     // Each entry pairs a requested option with the capability predicate for
     // the field create_backend() would have to forward for it to take effect.

@@ -218,7 +218,11 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         int cache_slots = 0;
     if (const char * cs = std::getenv("LUCE_QWEN35MOE_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
     else if (cache_slots_ >= 0) cache_slots = cache_slots_;
-    if (!build_moe_hybrid_storage_from_file_with_mmap(hybrid_cfg, backend, placement, layer_descs, layer_file_data, mmap_addr, file_size, *hybrid, &err, cache_slots)) {
+    TensorFileReader reader;
+    const bool read_file = reader.open(cfg_.target_path);
+    if (!build_moe_hybrid_storage_from_file_with_mmap(hybrid_cfg, backend, placement, layer_descs, layer_file_data,
+                                                      mmap_addr, file_size, *hybrid, &err, cache_slots,
+                                                      nullptr, -1, read_file ? &reader : nullptr)) {
 #if defined(_WIN32)
             UnmapViewOfFile(const_cast<void *>(mmap_addr));
 #else

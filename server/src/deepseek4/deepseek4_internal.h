@@ -8,9 +8,17 @@
 //   - Indexer: on ratio-4 layers, learned scorer selects top-k compressed rows.
 //   - HC: Hierarchical Controller with 4 parallel residual streams, mixed via
 //     Sinkhorn-normalized combine matrices at each sublayer.
-//   - MoE: 256 routed experts (top-6) + 1 shared expert per layer.
-//     First 3 layers use hash-based routing (token_id → expert_ids).
+//   - MoE: routed experts (top-6, 256 in V4 / 384 in V4.1) + 1 shared expert
+//     per layer. V4's first 3 layers use hash-based routing (token_id → expert_ids).
 //   - RoPE: partial rotation (64 of 512 dims), YaRN scaling.
+//
+// DeepSeek V4.1 Flash ("deepseek41") shares every struct here. Its deltas:
+// compress ratios 2 (layers 2-19) and 1 (20-39) with the compressed rows
+// owned by a few kv source layers and read by the layers after them, index
+// keys derived from the attention latent at those sources, no per-head query
+// norm, a staggered hyper-connection pre-mix, candidate block pre-selection,
+// and the Engram n-gram memory on two layers. See docs/DS41.md for what the
+// runtime implements today.
 
 #pragma once
 
@@ -30,6 +38,7 @@
 #include "deepseek4_image_spans.h"
 #include "common/concurrency/paged_kv_pool.h"
 #include "deepseek4_paged_cache.h"
+#include "deepseek4_engram.h"
 
 namespace luce::common {
 
@@ -37,6 +46,11 @@ namespace luce::common {
 // the raw-cache rounding boundary between them.
 inline constexpr int DS4_NUMERICAL_PREFILL_BAND = 2048;
 inline constexpr int DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS = 10240;
+// Longest prompt span one layer-major pass covers. The pass keeps each token's
+// HC state and embedding on the host, so this, not the context length, bounds
+// that memory; a longer prompt runs as several passes, each reading the
+// streamed experts once.
+inline constexpr int DS4_LAYER_MAJOR_PROMPT_SPAN = 16384;
 // Chunks of four rows or fewer take the decode-shaped path, not layer-major.
 inline constexpr int DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS = 5;
 // Staged image prefill rows per batched step, shared by the pending requests.
@@ -58,6 +72,8 @@ struct MoeHybridConfig;
 struct MoeHybridRoutingStats;
 struct MoeExpertComputeRuntime;
 class MoeHybridStreamEngine;
+class MoeStreamedExpertCache;
+struct MoeExpertCacheOptions;
 
 struct DeepSeek4StepTelemetry {
     uint64_t total_us = 0;
@@ -95,6 +111,8 @@ struct DeepSeek4StepTelemetry {
     uint64_t full_graph_set_us = 0;
     uint64_t full_graph_compute_us = 0;
     uint64_t full_graph_read_us = 0;
+    uint64_t engram_read_us = 0;     // hashing and table reads
+    uint64_t engram_apply_us = 0;    // host-path apply graphs
     int hot_selected = 0;
     int cold_selected = 0;
 };
@@ -128,16 +146,29 @@ struct DeepSeek4Layer {
     ggml_tensor * attn_compressor_gate = nullptr;  // [n_embd, comp_width] score/gating
     ggml_tensor * attn_compressor_norm = nullptr;  // [head_dim] post-pool RMS norm
 
-    // ── Indexer (ratio-4 layers only) ────────────────────────────────
+    // ── Indexer (V4: ratio-4 layers; V4.1: index source layers) ──────
     // Selects which compressed rows to attend via top-k scoring.
     ggml_tensor * indexer_attn_q_b     = nullptr;  // [n_lora_q, n_indexer_head * indexer_head_dim]
     ggml_tensor * indexer_proj         = nullptr;  // [n_embd, n_indexer_head] head weight projection
 
-    // Indexer has its own compressor for the indexer key cache
+    // V4: the indexer has its own compressor for the indexer key cache.
     ggml_tensor * indexer_compressor_ape  = nullptr;
     ggml_tensor * indexer_compressor_kv   = nullptr;
     ggml_tensor * indexer_compressor_gate = nullptr;
     ggml_tensor * indexer_compressor_norm = nullptr;
+
+    // V4.1: index keys are rope_tail(rms_norm(indexer_k · latent)) of the
+    // compressed latent, written at kv source layers that are index sources.
+    ggml_tensor * indexer_k            = nullptr;  // [head_dim, indexer_head_dim]
+    ggml_tensor * indexer_k_norm       = nullptr;  // [indexer_head_dim]
+
+    // ── Engram (V4.1 engram layers only) ─────────────────────────────
+    // The hash table itself (blk.N.engram_embd) is never loaded; its rows are
+    // read on demand (deepseek4_engram.h) and applied to every HC copy of
+    // the layer input, before its attention HC pre.
+    ggml_tensor * engram_q             = nullptr;  // [n_embd, n_hc]
+    ggml_tensor * engram_k             = nullptr;  // [n_embd, n_hc]
+    ggml_tensor * engram_wkv           = nullptr;  // [n_hash_cols * key_len, n_embd * (n_hc + 1)]
 
     // ── HC Attention ─────────────────────────────────────────────────
     ggml_tensor * hc_attn_fn         = nullptr;  // [n_hc * n_embd, hc_mix_dim] F16
@@ -150,6 +181,11 @@ struct DeepSeek4Layer {
     // Router
     ggml_tensor * ffn_gate_inp       = nullptr;  // [n_embd, n_expert] router weights F16
     ggml_tensor * ffn_exp_probs_b    = nullptr;  // [n_expert] optional routing bias
+    // With protected experts and a router bias (see protected_experts): the
+    // selection bias without the router bias (F32 [n_expert]) and the
+    // protected mask (I32 [n_expert]), for graphs that route on the device.
+    ggml_tensor * native_selection_bias = nullptr;
+    ggml_tensor * protected_mask        = nullptr;
     ggml_tensor * ffn_gate_bias_vl   = nullptr;  // image router bias, loaded only with --mmproj
 
     // Hash routing table (first n_hash_layer layers only)
@@ -181,6 +217,9 @@ struct DeepSeek4Weights {
     // Optional row-split buffer for selected dense projections. The buffer
     // owns per-device allocations while the tensor metadata stays in ctx.
     ggml_backend_buffer_t dense_split_buf = nullptr;
+    // Holds each layer's native_selection_bias and protected_mask.
+    ggml_context *        routing_ctx = nullptr;
+    ggml_backend_buffer_t routing_buf = nullptr;
 
     // Global tensors
     ggml_tensor * tok_embd       = nullptr;  // [n_embd, n_vocab]
@@ -197,6 +236,9 @@ struct DeepSeek4Weights {
     CpuEmbedder embedder;
 
     // ── Architecture metadata ────────────────────────────────────────
+    // Model family, general.architecture: "deepseek4" (V4 Flash) or
+    // "deepseek41" (V4.1 Flash). Metadata keys are read as `arch + "."`.
+    std::string arch      = "deepseek4";
     int n_layer           = 43;
     int n_embd            = 4096;
     int n_vocab           = 129280;
@@ -228,8 +270,73 @@ struct DeepSeek4Weights {
     int n_hc              = 4;
     int n_hc_sinkhorn_iter = 20;
 
-    // Per-layer compression ratios (0 = no compression, 4 or 128)
+    // Per-layer compression ratios (0 = no compression; V4: 4 or 128;
+    // V4.1: 2 or 1).
     std::vector<uint32_t> compress_ratios;
+
+    // Compressed-cache ownership. Every compressing layer keeps its ratio, but
+    // only kv source layers run a compressor and write compressed rows; the
+    // layers after a source read that source's rows. Index source layers score
+    // the shared index keys and hand their top-k to the layers after them.
+    // V4 declares no sources: every compressing layer is its own kv source and
+    // every ratio-4 layer its own index source, so every kv_src[il] == il.
+    std::vector<int>     kv_source_layer_ids;     // declared or inferred, ascending
+    std::vector<int>     index_source_layer_ids;
+    std::vector<int>     kv_src;                  // per layer: owner of its compressed rows
+    std::vector<int>     idx_src;                 // per layer: owner of its top-k
+    std::vector<uint8_t> kv_source_flags;         // per layer: is a kv source
+    std::vector<uint8_t> index_source_flags;      // per layer: is an index source
+    bool shared_comp_cache = false;               // some layer reads another layer's rows
+
+    // Forward-pass rules that differ between the families, set by the loader
+    // and defaulting to V4. The graph tests these, never the architecture
+    // name; docs/DS41.md ("One backend, behavior rules") lists them all.
+    bool attn_q_head_norm = true;    // unit-RMS per query head after wq_b (V4 only)
+    bool hc_staggered_pre = false;   // V4.1 pre-mix: see ds4_hc_collapse in the graph
+    // Indexer. V4 selects per ratio-4 layer on the sparse attention paths and
+    // rotates queries and keys (Hadamard) before their FP4 round trip. V4.1
+    // selects at every index source on every path, hands the selection to the
+    // layers after it (idx_src), and quantizes without the rotation.
+    bool shared_index_topk = false;
+    bool indexer_rotate = true;
+
+    // Candidate block pre-selection (V4.1): the index sources after
+    // candidate_source_layer restrict their top-k to the candidate blocks
+    // that layer selected. -1 = off. An exact no-op until more than
+    // candidate_topk_blocks * candidate_block_size compressed rows.
+    int candidate_source_layer = -1;
+    int candidate_topk_blocks  = 0;
+    int candidate_block_size   = 0;
+
+    // Engram n-gram hash memory (V4.1): hash constants as written by the
+    // converter (deepseek41.engram.*) and where each layer's table lives.
+    struct Engram {
+        std::vector<int>      layer_ids;
+        int                   n_heads   = 0;
+        int                   key_len   = 0;
+        int                   max_ngram = 0;
+        std::vector<uint64_t> multipliers;  // [n_engram_layers * max_ngram]
+        std::vector<uint64_t> primes;       // [n_engram_layers * (max_ngram - 1) * n_heads]
+        std::vector<uint64_t> offsets;      // same shape as primes
+        std::vector<int32_t>  token_map;    // [n_vocab] compressed token ids
+        int32_t               pad_id = -1;  // already compressed
+        std::vector<uint64_t> rows;         // [n_engram_layers] table rows = sum of that layer's primes
+        // Where each layer's table lives when the GGUF embeds it
+        // (blk.N.engram_embd, I8 [row_bytes, rows]: 256 E4M3 + 8 E8M0 block
+        // scales per row). Never mapped; rows are pread on demand.
+        struct Table {
+            int      layer_id    = -1;
+            uint64_t file_offset = 0;   // absolute byte offset in the GGUF
+            uint64_t rows        = 0;
+            uint32_t row_bytes   = 0;
+            int      ggml_type   = -1;  // ggml_type of the tensor as stored
+        };
+        std::vector<Table>    tables;
+        bool present() const { return !layer_ids.empty(); }
+    } engram;
+    // The hash and the open tables (set by the backend after load; null when
+    // the model has no Engram layers). Every forward path applies it.
+    std::shared_ptr<const DeepSeek4EngramRuntime> engram_runtime;
 
     // RoPE
     float rope_freq_base        = 10000.0f;
@@ -241,7 +348,7 @@ struct DeepSeek4Weights {
 
     // Norms
     float rms_eps         = 1.0e-6f;
-    float hc_eps          = 1.0e-6f;
+    float hc_eps          = 1.0e-6f;   // RMS eps of the HC mixes (V4.1: rms_eps)
 
     // SwiGLU
     float swiglu_clamp_exp = 10.0f;
@@ -256,6 +363,16 @@ struct DeepSeek4Weights {
     // Runtime serving policy. These values are set by the backend after the
     // GGUF is loaded; they are not model metadata.
     int  routed_expert_top_k = 0;  // 0 = model default (n_expert_used)
+    // Routing adjustments loaded with the model (--ds4-router-bias,
+    // --ds4-protected-experts), [n_layer * n_expert] each, empty when unused.
+    // The delta is already added to every ffn_exp_probs_b; host routing
+    // subtracts it again to find a token's native top-k.
+    std::vector<float>   router_bias_delta;
+    std::vector<uint8_t> protected_experts;
+    // Host copy of every layer's selection bias (exp_probs_b with the router
+    // bias applied), [n_layer * n_expert], taken once after the adjustments.
+    // Empty when a layer has no F32 bias; host routing then reads the device.
+    std::vector<float>   selection_bias_host;
     bool fused_decode        = false;
     bool fused_verify_f16_kv = false;
 };
@@ -269,6 +386,28 @@ inline bool ds4_image_capable(const DeepSeek4Weights & w) {
 inline bool deepseek4_is_eos_tok(int tok, const DeepSeek4Weights & w) {
     return (w.eos_chat_id >= 0 && tok == w.eos_chat_id)
         || (w.eos_id >= 0 && tok == w.eos_id);
+}
+
+// Source-layer indirection. The loader always fills the arrays; weights built
+// by hand (tests) fall back to the V4 rule: every compressing layer owns its
+// rows and the ratio-4 layers carry the indexer.
+inline bool deepseek4_is_kv_source(const DeepSeek4Weights & w, int il) {
+    if (il < 0 || (size_t) il >= w.compress_ratios.size()) return false;
+    if (w.kv_source_flags.empty()) return w.compress_ratios[(size_t) il] > 0;
+    return w.kv_source_flags[(size_t) il] != 0;
+}
+inline bool deepseek4_is_index_source(const DeepSeek4Weights & w, int il) {
+    if (il < 0 || (size_t) il >= w.compress_ratios.size()) return false;
+    if (w.index_source_flags.empty()) return w.compress_ratios[(size_t) il] == 4;
+    return w.index_source_flags[(size_t) il] != 0;
+}
+// Layer whose compressed rows (and index keys) `il` attends over.
+inline int deepseek4_kv_source_layer(const DeepSeek4Weights & w, int il) {
+    return (il >= 0 && (size_t) il < w.kv_src.size()) ? w.kv_src[(size_t) il] : il;
+}
+// Layer whose top-k `il` reuses (see DeepSeek4Weights::shared_index_topk).
+inline int deepseek4_index_source_layer(const DeepSeek4Weights & w, int il) {
+    return (il >= 0 && (size_t) il < w.idx_src.size()) ? w.idx_src[(size_t) il] : il;
 }
 
 // ─── KV Cache ───────────────────────────────────────────────────────────
@@ -327,6 +466,16 @@ struct DeepSeek4LayerCache {
 // DeepSeek4Cache below and released by free_deepseek4_cache().
 struct DeepSeek4LayerRangeCache;
 
+// One step of a whole-prompt layer-major prefill (deepseek4_prefill_layer_major):
+// the step runs one layer over one band of the prompt, so the staggered
+// pre-mix of each token crosses the steps here, and the band's index
+// selection lives at its own columns of the selection store.
+struct DeepSeek4LayerMajorBand {
+    std::vector<float> * staggered_pre = nullptr;  // [n_tokens][n_hc], in and out
+    int selection_first = 0;                        // column of the band's first token
+    int selection_columns = 0;                      // tokens of the whole pass
+};
+
 struct DeepSeek4Cache {
     int cur_pos  = 0;
     int max_ctx  = 0;
@@ -337,6 +486,12 @@ struct DeepSeek4Cache {
 
     // HC residual streams: [n_hc * n_embd] persistent state
     ggml_tensor * hc_state    = nullptr;  // [n_hc * n_embd]
+
+    // The tokens the Engram hash of the next positions reads (V4.1).
+    DeepSeek4EngramTokens engram_tokens;
+
+    // Set while a whole-prompt layer-major prefill runs its layer x band steps.
+    const DeepSeek4LayerMajorBand * layer_major_band = nullptr;
 
     // Lazily created on the first deepseek4_step_layer_range call.
     DeepSeek4LayerRangeCache * layer_range_cache = nullptr;
@@ -359,6 +514,8 @@ struct DeepSeek4PagedCache {
     // Dedicated bounded gathered-reference graph cache (opaque here because
     // its implementation shares the fused verifier's private machinery).
     void * gathered_runtime = nullptr;
+    // Per slot: the tokens the Engram hash of its next positions reads.
+    std::vector<DeepSeek4EngramTokens> engram_tokens;
 };
 
 struct DeepSeek4Snapshot;
@@ -394,6 +551,9 @@ struct DeepSeek4BackendConfig {
     bool         paged_attention = false;
     int          max_concurrency = 1;
     long long    kv_pool_tokens = 0;
+    std::string  expert_placement_path;   // three-tier expert ownership (JSON)
+    std::string  router_bias_path;        // f32 [n_layer][n_expert] selection bias delta
+    std::string  protected_experts_path;  // {"layer": [expert ids]} (JSON)
 };
 
 // ─── Function declarations ──────────────────────────────────────────────
@@ -410,9 +570,68 @@ ggml_tensor * deepseek4_indexed_attention_rows(
 ggml_tensor * deepseek4_preserve_raw_rows(
     ggml_context * ctx, ggml_tensor * raw_kv, ggml_tensor * rows);
 
+// An I32 graph input and the values the caller uploads before computing.
+struct DeepSeek4I32ArrayBinding {
+    ggml_tensor *          tensor = nullptr;
+    std::vector<int32_t>   values;
+};
+
+// The indexer's top-k compressed rows for every query token ([top_k,
+// n_tokens] I32, indices into index_comp), or null when no token sees more
+// than top_k rows (attention over every visible row is then the same). Tokens
+// that see at most top_k rows get [0, top_k) and rely on the causal mask.
+//
+// With `candidates` (V4.1, w.candidate_source_layer) and more than
+// candidate_topk_blocks * candidate_block_size rows, the candidate source
+// layer also picks its candidate blocks (candidates->blocks, I32
+// [candidate_topk_blocks, n_tokens]) and an index source after it given
+// those blocks selects only inside them.
+struct DeepSeek4IndexCandidates {
+    ggml_tensor * blocks = nullptr;  // in (a later index source) or out (the source)
+    bool source = false;
+};
+
+ggml_tensor * deepseek4_build_indexer_topk(
+    ggml_context * ctx, ggml_tensor * qr_norm, ggml_tensor * cur,
+    const DeepSeek4Weights & w, const DeepSeek4Layer & L,
+    ggml_tensor * index_comp, int n_comp, int kv_start, int n_tokens, int ratio,
+    ggml_tensor * rope_pos, ggml_tensor * visibility_mask,
+    std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
+    DeepSeek4IndexCandidates * candidates = nullptr);
+
+// model.py select_candidate_blocks: from indexer scores [n_comp, n_tokens]
+// (rows a query cannot see at -1e30) and the queries' positions (I32), the
+// `topk_blocks` blocks of `block_size` rows with the best row, the block
+// holding each query's newest row always among them. I32 [topk_blocks,
+// n_tokens]; a partial last block has index n_comp / block_size.
+ggml_tensor * deepseek4_candidate_blocks(
+    ggml_context * ctx, ggml_tensor * scores, ggml_tensor * positions,
+    int ratio, int topk_blocks, int block_size);
+
+// The scores with every row outside the given candidate blocks at -1e30.
+ggml_tensor * deepseek4_restrict_to_candidate_blocks(
+    ggml_context * ctx, ggml_tensor * scores, ggml_tensor * candidates, int block_size);
+
 // Keep a per-token indexer visibility mask aligned with the scored suffix.
 ggml_tensor * deepseek4_indexer_visibility_suffix(
     ggml_context * ctx, ggml_tensor * mask, int first_scored, int n_scored);
+
+// Engram on the host hyper-connection paths (deepseek4_engram_apply.cpp): a
+// step reads the Engram rows of its tokens once for every Engram layer
+// (`keys`, a no-op without Engram), then each Engram layer updates the HC
+// copies entering it. `ctx` is the sequence's n-gram context.
+bool ds4_engram_read_keys(const DeepSeek4Weights & w, DeepSeek4EngramTokens & ctx,
+                          const int32_t * token_ids, int kv_start, int n_tokens,
+                          std::vector<float> & keys, DeepSeek4StepTelemetry * telemetry);
+bool ds4_engram_apply_host(ggml_backend_t backend, const DeepSeek4Weights & w, int il,
+                           const std::vector<float> & keys, float * hc_state, int n_tokens,
+                           DeepSeek4EngramApplyRunner & runner,
+                           DeepSeek4StepTelemetry * telemetry);
+
+// The Engram constants and table locations of a GGUF, without loading any
+// tensor (tools and tests).
+bool deepseek4_read_engram_metadata(const std::string & path, DeepSeek4Weights::Engram & out,
+                                    std::string * err);
 
 bool load_deepseek4_gguf(const std::string & path,
                           ggml_backend_t backend,
@@ -434,26 +653,18 @@ bool create_deepseek4_cache(ggml_backend_t backend,
                              int max_ctx,
                              DeepSeek4Cache & out);
 
-// Per-layer cache geometry implied by the weights. Single source of truth for
-// create_deepseek4_cache() and for snapshot declaration/validation
-// (deepseek4_snapshot.h), so the two can never disagree on shapes.
-struct DeepSeek4LayerGeometry {
-    uint32_t ratio = 0;            // compress ratio: 0 (raw window only), 4 or 128
-    int64_t  head_dim = 0;         // raw / compressed row width (F16)
-    int64_t  raw_rows = 0;         // n_swa
-    bool     has_comp = false;     // ratio > 0: comp_kv + attn compressor state
-    int64_t  comp_width = 0;       // attn compressor state width (F32)
-    int64_t  comp_state_rows = 0;
-    bool     has_index = false;    // ratio == 4: index_comp_kv + indexer state
-    int64_t  index_dim = 0;        // indexer row width (F16)
-    int64_t  index_state_width = 0;  // indexer compressor state width (F32)
-    int64_t  index_state_rows = 0;
-    // Compressed-row capacity for a cache of `max_ctx` tokens (0 if !has_comp).
-    int64_t comp_capacity(int max_ctx) const {
-        return has_comp ? (int64_t) max_ctx / (int64_t) ratio + 16 : 0;
-    }
-};
+// Per-layer cache geometry implied by the weights (struct and rules in
+// deepseek4_paged_cache.h). Single source of truth for create_deepseek4_cache(),
+// the paged planner, the cache byte estimate and snapshot declaration and
+// validation (deepseek4_snapshot.h), so none of them can disagree on shapes.
 DeepSeek4LayerGeometry deepseek4_layer_geometry(const DeepSeek4Weights & w, int layer);
+std::vector<DeepSeek4LayerGeometry> deepseek4_layer_geometries(const DeepSeek4Weights & w);
+// The compressed rows `il` attends over: its own cache at a kv source (every
+// V4 layer), the source's cache at a V4.1 reader. Readers never write there.
+template <typename Cache>
+inline auto & ds4_comp_cache(Cache & cache, const DeepSeek4Weights & w, int il) {
+    return cache.layers[(size_t) deepseek4_kv_source_layer(w, il)];
+}
 inline int64_t deepseek4_hc_state_elements(const DeepSeek4Weights & w) {
     return (int64_t) w.n_hc * (int64_t) w.n_embd;
 }
@@ -525,6 +736,15 @@ int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
                                            int kv_start,
                                            int n_tokens);
 
+// Sets up the device cache for the experts the hybrid storage streams from
+// the model file (see common/moe_hybrid_expert_cache.h).
+bool init_deepseek4_streamed_expert_cache(
+    const DeepSeek4Weights &      w,
+    const MoeHybridStorage &      hybrid,
+    const MoeExpertCacheOptions & opts,
+    MoeStreamedExpertCache &      cache,
+    std::string *                 err);
+
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).
 // hc_state: [n_hc * n_embd] persistent HC residual (updated in-place).
@@ -553,6 +773,16 @@ bool deepseek4_step(
 // When set on a multi-token deepseek4_step_layer_range call they add: per-layer
 // mean-over-HC feature capture and full per-position logits. Null on the normal
 // (23 tok/s) decode path so it is completely unaffected.
+// Rows a verify batch wrote into small pooled compressor windows (V4.1 ratio
+// 2: a window's state rows are its tokens' projections, pooled when it
+// completes). A later token of the batch overwrites the row of an earlier one
+// at the same window slot, so a rejection that ends mid-window puts the
+// accepted tokens' rows back from here (see the DSpark rollback).
+struct Ds4VerifyWindowRows {
+    std::vector<std::vector<uint8_t>> kv;     // [layer] -> [batch token][row bytes]
+    std::vector<std::vector<uint8_t>> score;
+};
+
 struct Ds4VerifyHooks {
     const std::vector<int> * capture_layer_ids = nullptr;  // e.g. {40,41,42}
     std::vector<float> *     capture_out = nullptr;         // [n_cap*n_embd * n_tokens]
@@ -564,7 +794,16 @@ struct Ds4VerifyHooks {
     std::vector<int32_t> *   argmax_out = nullptr;          // [n_tokens], optional GPU result
     bool                     prefer_argmax_only = false;     // skip logits D2H when available
     DeepSeek4SpecBoundaryCheckpoint * boundary_checkpoint_out = nullptr;
+    Ds4VerifyWindowRows *    window_rows = nullptr;         // V4.1 tokenwise verify
 };
+
+// True for a compressor state that is one pooled window of `ratio` rows
+// (V4.1 ratio 2), as opposed to V4's overlapping ratio-4 state or its
+// ratio-128 ring.
+inline bool deepseek4_is_window_state(const DeepSeek4CompressorState & st, int ratio) {
+    return ratio > 1 && ratio < 4 && st.state_kv && st.state_score &&
+           st.state_kv->ne[1] == ratio && st.state_score->ne[1] == ratio;
+}
 
 bool deepseek4_step_layer_range(
     ggml_backend_t              backend,
@@ -586,6 +825,19 @@ bool deepseek4_step_layer_range(
     MoeExpertComputeRuntime *   expert_runtime = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr,
     vision::ImageSpanView       image_spans = {});
+
+// Whole-prompt layer-major prefill of `bands` (token counts, in order) starting
+// at kv_start: every layer runs over all bands before the next layer starts,
+// so each streamed expert is read about once per prompt instead of once per
+// band. Only the residual copies of every position (n_hc * n_embd floats per
+// token) stay in host memory; the rest of a step is sized by its band. Needs
+// the mixed-owner (hybrid) tier with batched prefill; produces no logits.
+bool deepseek4_prefill_layer_major(
+    ggml_backend_t backend, int device, const DeepSeek4Weights & w, DeepSeek4Cache & cache,
+    const float * embed, const int32_t * token_ids, int kv_start,
+    const std::vector<int> & bands, DeepSeek4StepTelemetry * telemetry,
+    MoeHybridStorage * moe_hybrid, MoeExpertComputeRuntime * expert_runtime,
+    MoeHybridRoutingStats * routing_stats);
 
 // One sequence of a shared prefill pass: `n_tokens` rows of `embed` starting
 // at `kv_start` of `cache`, with the sequence's image spans in its own prompt
@@ -701,9 +953,11 @@ struct DeepSeek4Snapshot {
         DeepSeek4CompressorState indexer_compressor;
     };
     std::vector<LayerSnap> layers;
+    // The Engram n-gram context at cur_pos (host side).
+    DeepSeek4EngramTokens engram_tokens;
     // Optional serialization sidecars (ondisk prefix cache). Present when the
     // snapshot was saved with DeepSeek4SnapshotAux or adopted from disk.
-    //   meta_snap        I32 [kDeepSeek4SnapMetaBase + 2 * n_layer]
+    //   meta_snap        I32 [kDeepSeek4SnapMetaBase + 2 * n_layer + kDeepSeek4SnapMetaTail]
     //   last_logits_snap F32 [n_vocab]
     //   spec_feat_snap   F32 [1, max(1, n_spec_feat)]  (logical length in meta)
     ggml_tensor * meta_snap        = nullptr;
