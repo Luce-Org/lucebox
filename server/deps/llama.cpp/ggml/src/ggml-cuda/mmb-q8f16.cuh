@@ -220,6 +220,13 @@ __global__ void __launch_bounds__(256) mmb_q8f16_kernel(const uint8_t * __restri
 static bool mmb_q8f16_launch(const uint8_t * w, const void * x, const int xt, float * y, uint16_t * yh,
         const int T, const int M, const int K, hipStream_t stream) {
     if (K % 64 != 0 || T < 96 || M < 1 || xt < 0 || xt > 2) return false;
+    if (M <= 1024) {   // few output rows (shared expert, k/v): 128-row x 256-token tiles, bit-exact (0.33 -> 0.22 ms at M=640, E430)
+        const unsigned grid_s = ((T + 255) / 256) * ((M + 127) / 128);
+        if (xt == 0) mmb_q8f16_kernel<128, 256, 2, 2, 4, 0><<<grid_s, 256, 0, stream>>>(w, x, y, yh, T, M, K);
+        if (xt == 1) mmb_q8f16_kernel<128, 256, 2, 2, 4, 1><<<grid_s, 256, 0, stream>>>(w, x, y, yh, T, M, K);
+        if (xt == 2) mmb_q8f16_kernel<128, 256, 2, 2, 4, 2><<<grid_s, 256, 0, stream>>>(w, x, y, yh, T, M, K);
+        return true;
+    }
     const unsigned grid = ((T + 127) / 128) * ((M + 255) / 256);
     if (xt == 0) mmb_q8f16_kernel<256, 128, 2, 8, 1, 0><<<grid, 256, 0, stream>>>(w, x, y, yh, T, M, K);
     if (xt == 1) mmb_q8f16_kernel<256, 128, 2, 8, 1, 1><<<grid, 256, 0, stream>>>(w, x, y, yh, T, M, K);
