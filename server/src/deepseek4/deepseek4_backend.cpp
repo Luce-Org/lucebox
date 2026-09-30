@@ -4486,10 +4486,10 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     const bool sampling_requires_ar = spec_sampling &&
         env_flag_disabled("LUCE_DS4_SPEC_SAMPLING");
     // A drafter was loaded and the operator asked for spec decode, but this
-    // request routes to AR anyway. Say why, once: the DS4 model card defaults
-    // temperature to 1.0, so a request that merely OMITS temperature lands
-    // here — the server then decodes pure AR while the startup log still says
-    // "spec-decode ENABLED", which reads as a spec-engagement regression.
+    // request routes to AR anyway: a forced AR retry, a thinking budget, or
+    // sampling with LUCE_DS4_SPEC_SAMPLING=0. Say why, once, since the startup
+    // log still says "spec-decode ENABLED" and a silent AR fallback reads as a
+    // spec-engagement regression.
     if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
         (req.force_ar_decode || budget_requires_ar || sampling_requires_ar)) {
         static bool warned = false;

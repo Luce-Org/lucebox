@@ -40,7 +40,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <future>
+#include <functional>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -1127,6 +1128,8 @@ bool run_deepseek4_dspark_spec_decode(
     double tm_sample = 0;
     std::vector<float> spec_logits;
     std::vector<std::vector<std::pair<float, int>>> spec_rows;
+    std::vector<std::vector<int32_t>> spec_hist;   // per-row sampler history
+    std::unique_ptr<DSparkRowPool> row_pool;       // created on the first sampled step
     if (sampling) target.set_keep_logits(true);   // verify returns every row's logits
     const SpecClock::time_point run_t0 = SpecClock::now();
 
@@ -1344,7 +1347,8 @@ bool run_deepseek4_dspark_spec_decode(
             deepseek4_dspark_draft_wait(drafter_backend);
             tm_probe_wait += spec_ms_since(probe_t0);
         }
-        if (!verify_ok) {
+        // Drop the whole verified batch from the cache (restore to pos).
+        const auto undo_verify = [&] {
             if (full_snap) {
                 if (!target.restore_kv()) {
                     std::fprintf(stderr, "[ds4-spec] restore after verify failure failed\n");
@@ -1353,6 +1357,9 @@ bool run_deepseek4_dspark_spec_decode(
                 spec_rollback_apply(
                     rollback, target_w, target_cache, pos, boundary_crossed);
             }
+        };
+        if (!verify_ok) {
+            undo_verify();
             std::fprintf(stderr, "[ds4-spec] verify failed\n");
             ok = false;
             break;
@@ -1370,23 +1377,22 @@ bool run_deepseek4_dspark_spec_decode(
             // q5 step on the host); the walk consumes them in order.
             t0 = SpecClock::now();
             if (!target.read_verify_logits(q, spec_logits)) {
+                undo_verify();
                 std::fprintf(stderr, "[ds4-spec] sampling: verify logits unavailable\n");
                 ok = false;
                 break;
             }
             if (spec_rows.size() < (size_t) q) spec_rows.resize((size_t) q);
-            const auto build_row = [&](int i) {
-                std::vector<int32_t> hist = sampling->history;
-                for (int k = 1; k <= i; k++) hist.push_back(draft_tok[(size_t) k]);
+            if (spec_hist.size() < (size_t) q) spec_hist.resize((size_t) q);
+            const std::function<void(int)> build_row = [&](int i) {
+                dspark_row_history(sampling->cfg, sampling->history, draft_tok.data(), i,
+                                   spec_hist[(size_t) i]);
                 sampler_distribution(spec_logits.data() + (size_t) i * target_w.n_vocab,
-                                     target_w.n_vocab, sampling->cfg, hist,
+                                     target_w.n_vocab, sampling->cfg, spec_hist[(size_t) i],
                                      spec_rows[(size_t) i]);
             };
-            std::vector<std::future<void>> jobs;
-            jobs.reserve((size_t) q);
-            for (int i = 1; i < q; i++) jobs.push_back(std::async(std::launch::async, build_row, i));
-            build_row(0);
-            for (auto & j : jobs) j.get();
+            if (!row_pool) row_pool = std::make_unique<DSparkRowPool>(std::max(0, q_cap - 1));
+            row_pool->run(q, build_row);
             const DSparkSampleStep step =
                 dspark_spec_sample_accept(spec_rows, draft_tok.data(), q, *sampling->rng);
             accept = step.accept;

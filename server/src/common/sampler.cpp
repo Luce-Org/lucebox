@@ -28,8 +28,8 @@ namespace {
 // cut. Each level's cost is proportional to its (shrinking) range, so total
 // work is O(cand.size()), not O(cand.size() log cand.size()) like a full sort,
 // regardless of where the cutoff lands.
-template <typename MassFn>
-size_t nucleus_cutoff(std::vector<std::pair<float, int>> & cand, double target, MassFn mass_of) {
+template <typename Mass, typename MassFn>
+size_t nucleus_cutoff(std::vector<std::pair<Mass, int>> & cand, double target, MassFn mass_of) {
     constexpr size_t kBaseCase = 64;
     size_t lo = 0, hi = cand.size();
     while (hi - lo > kBaseCase) {
@@ -260,11 +260,13 @@ void sampler_distribution(const float * logits_in,
                           const std::vector<int32_t> & history,
                           std::vector<std::pair<float, int>> & cand) {
     // Same chain as sample_logits (penalties, top_k, temperature, top_p). The
-    // exponentials are computed once in float and the top-p cut searches the
-    // highest 1024 logits first, falling back to nucleus_cutoff only when the
-    // mass is spread wider than that: the verifier builds this for up to five
-    // rows per speculative step over the full vocabulary.
+    // no-top_k path computes each exponential once in double, as
+    // sample_logits' cutoff does, keeps only the tokens at or above a mass
+    // bound tau that the nucleus cannot extend below, and sorts those
+    // (nucleus_cutoff when more than 4096 survive): the verifier builds this
+    // for up to five rows per speculative step over the full vocabulary.
     thread_local std::vector<float> z;
+    thread_local std::vector<double> zd;
     z.assign(logits_in, logits_in + vocab);
     if (cfg.rep_pen > 1.0f && !history.empty()) {
         const int win  = std::min((int)history.size(), cfg.rep_window);
@@ -302,15 +304,18 @@ void sampler_distribution(const float * logits_in,
                           [](auto & a, auto & b){ return a.first > b.first; });
         cand.resize(cfg.top_k);
     } else {
+        // Masses as sample_logits computes them for its cutoff:
+        // exp((double) logit * inv_t - maxv) with a float maxv.
         const float maxv = *std::max_element(z.begin(), z.end()) * inv_t;
+        zd.resize((size_t) vocab);
         double Z = 0.0;
         for (int i = 0; i < vocab; i++) {
-            z[i] = std::exp(z[i] * inv_t - maxv);
-            Z += z[i];
+            zd[(size_t) i] = std::exp((double) z[i] * inv_t - maxv);
+            Z += zd[(size_t) i];
         }
         if (!need_top_p) {
             cand.resize(vocab);
-            for (int i = 0; i < vocab; i++) cand[i] = {(float) (z[i] / Z), i};
+            for (int i = 0; i < vocab; i++) cand[i] = {(float) (zd[(size_t) i] / Z), i};
             return;
         }
         const double target = (double) cfg.top_p * Z;
@@ -318,28 +323,29 @@ void sampler_distribution(const float * logits_in,
         // nucleus: together they weigh less than (1 - top_p) * Z, so the
         // tokens at or above tau already reach the target mass and the cut
         // falls among them. Only those need sorting.
-        const float tau = (float) ((1.0 - (double) cfg.top_p) * Z / vocab);
-        cand.clear();
+        const double tau = (1.0 - (double) cfg.top_p) * Z / vocab;
+        thread_local std::vector<std::pair<double, int>> cd;
+        cd.clear();
         for (int i = 0; i < vocab; i++) {
-            if (z[i] >= tau) cand.push_back({z[i], i});
+            if (zd[(size_t) i] >= tau) cd.push_back({zd[(size_t) i], i});
         }
         const auto desc = [](auto & a, auto & b){ return a.first > b.first; };
         size_t cut = 0;
-        if (cand.size() <= 4096) {
-            std::sort(cand.begin(), cand.end(), desc);
+        if (cd.size() <= 4096) {
+            std::sort(cd.begin(), cd.end(), desc);
             double cum = 0.0;
-            for (size_t i = 0; i < cand.size(); i++) {
-                cum += cand[i].first;
+            for (size_t i = 0; i < cd.size(); i++) {
+                cum += cd[i].first;
                 if (cum >= target) { cut = i + 1; break; }
             }
         }
         if (cut == 0) {
-            cut = nucleus_cutoff(cand, target, [](auto & c){ return (double) c.first; });
+            cut = nucleus_cutoff(cd, target, [](auto & c){ return c.first; });
         }
-        cand.resize(cut);
         double Zc = 0.0;
-        for (auto & c : cand) Zc += c.first;
-        for (auto & c : cand) c.first = (float) (c.first / Zc);
+        for (size_t i = 0; i < cut; i++) Zc += cd[i].first;
+        cand.resize(cut);
+        for (size_t i = 0; i < cut; i++) cand[i] = {(float) (cd[i].first / Zc), cd[i].second};
         return;
     }
     // top_k path: softmax over the kept candidates, then top_p within them.
@@ -367,7 +373,21 @@ void sampler_distribution(const float * logits_in,
 }
 
 int sampler_draw(const std::vector<std::pair<float, int>> & cand, double r_uniform) {
-    return draw_from_weights(cand, r_uniform);
+    // Same inverse-CDF walk as draw_from_weights, but zero-weight entries are
+    // never returned: speculative sampling zeroes a rejected candidate in place
+    // and a uniform of exactly 0 would otherwise select it when it leads.
+    double Z = 0.0;
+    for (auto & c : cand) Z += c.first;
+    const double r = r_uniform * Z;
+    double acc = 0.0;
+    int last = -1;
+    for (auto & c : cand) {
+        if (c.first <= 0.0f) continue;
+        acc += c.first;
+        last = c.second;
+        if (r <= acc) return c.second;
+    }
+    return last >= 0 ? last : cand.back().second;
 }
 
 bool parse_sampler_token(std::string & line, SamplerCfg & out) {

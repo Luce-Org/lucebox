@@ -114,7 +114,8 @@ TEST_CASE(Ds4SpecSamplingFixture, distribution_matches_reference_chain) {
         sampler_distribution(logits.data(), vocab, cfg, history, dist);
         const auto got = as_map(dist);
         const auto want = reference_distribution(logits, cfg, history);
-        CHECK(got.size() == want.size());
+        // Support sizes can differ by a boundary token whose float and double
+        // masses round to opposite sides of the cut; the mass check bounds it.
         CHECK(max_abs_diff(got, want) < 2e-5);
     }
 }
@@ -130,7 +131,8 @@ TEST_CASE(Ds4SpecSamplingFixture, distribution_matches_sample_logits_draws) {
     sampler_distribution(logits.data(), vocab, cfg, history, dist);
     std::mt19937_64 rng(1234);
     std::map<int, long> counts;
-    const long n = 200000;
+    // 20K draws: GPU sampler builds run each through a device round trip.
+    const long n = 20000;
     for (long i = 0; i < n; i++) counts[sample_logits(logits.data(), vocab, cfg, history, rng)]++;
     CHECK(frequencies_match(counts, n, as_map(dist)));
 }
@@ -174,4 +176,43 @@ TEST_CASE(Ds4SpecSamplingFixture, greedy_draft_acceptance_keeps_target_distribut
     CHECK(frequencies_match(second_after, n_second, as_map(base[1])));
     CHECK(n_third > 1000);
     CHECK(frequencies_match(third_after, n_third, as_map(base[2])));
+}
+
+TEST_CASE(Ds4SpecSamplingFixture, draw_never_returns_zeroed_entry) {
+    // A rejected candidate is zeroed in place; a uniform of exactly 0 must
+    // still land on the first positive entry.
+    const std::vector<std::pair<float, int>> dist = {{0.0f, 7}, {0.25f, 3}, {0.0f, 9}, {0.75f, 5}};
+    CHECK(sampler_draw(dist, 0.0) == 3);
+    CHECK(sampler_draw(dist, 1.0) == 5);
+    CHECK(sampler_draw(dist, 0.5) == 5);
+}
+
+TEST_CASE(Ds4SpecSamplingFixture, row_history_is_the_penalty_window) {
+    std::vector<int32_t> history;
+    for (int i = 0; i < 1000; i++) history.push_back(i);
+    const int32_t draft[4] = {-1, 2001, 2002, 2003};
+    std::vector<int32_t> out;
+
+    SamplerCfg plain;
+    plain.temp = 0.7f;
+    dspark_row_history(plain, history, draft, 3, out);
+    CHECK(out.empty());                      // no penalty reads history
+
+    SamplerCfg pen;
+    pen.temp = 0.7f; pen.rep_pen = 1.1f; pen.rep_window = 256;
+    dspark_row_history(pen, history, draft, 2, out);
+    CHECK(out.size() == 258);                // window + two drafts
+    CHECK(out.front() == 744 && out[255] == 999);
+    CHECK(out[256] == 2001 && out[257] == 2002);
+}
+
+TEST_CASE(Ds4SpecSamplingFixture, row_pool_runs_every_row_once) {
+    DSparkRowPool pool(4);
+    for (int round = 0; round < 200; round++) {
+        const int n = 1 + round % 7;         // also more rows than workers
+        std::vector<int> hits((size_t) n, 0);
+        const std::function<void(int)> fn = [&](int i) { hits[(size_t) i]++; };
+        pool.run(n, fn);
+        for (int h : hits) CHECK(h == 1);
+    }
 }

@@ -11,8 +11,14 @@
 
 #include "common/sampler.h"
 
+#include <algorithm>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <mutex>
 #include <random>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -24,6 +30,80 @@ struct DSparkSpecSampling {
     SamplerCfg cfg;
     std::vector<int32_t> history;
     std::mt19937_64 * rng = nullptr;
+};
+
+// History a verify row's sampler reads: the tail of `history` that the
+// penalties can see (rep_window tokens) followed by draft[1..i]. Empty when no
+// penalty is active, since the chain then ignores history.
+inline void dspark_row_history(const SamplerCfg & cfg, const std::vector<int32_t> & history,
+                               const int32_t * draft, int i, std::vector<int32_t> & out) {
+    out.clear();
+    if (!(cfg.rep_pen > 1.0f || cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f)) return;
+    const size_t keep = (size_t) std::max(0, cfg.rep_window);
+    const size_t from = history.size() > keep ? history.size() - keep : 0;
+    out.assign(history.begin() + (std::ptrdiff_t) from, history.end());
+    for (int k = 1; k <= i; k++) out.push_back(draft[k]);
+}
+
+// Persistent workers for building verify rows in parallel. One pool lives for
+// a request, so a long generation does not create threads per step. run(n, fn)
+// calls fn(0) on the caller and fn(1..n-1) on the workers, and returns when
+// all have finished.
+class DSparkRowPool {
+public:
+    explicit DSparkRowPool(int n_workers) {
+        for (int w = 0; w < n_workers; w++) threads_.emplace_back([this, w] { loop(w); });
+    }
+    ~DSparkRowPool() {
+        { std::lock_guard<std::mutex> lk(mu_); stop_ = true; }
+        cv_.notify_all();
+        for (auto & t : threads_) t.join();
+    }
+    DSparkRowPool(const DSparkRowPool &) = delete;
+    DSparkRowPool & operator=(const DSparkRowPool &) = delete;
+
+    void run(int n, const std::function<void(int)> & fn) {
+        const int n_workers = std::min(n - 1, (int) threads_.size());
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            fn_ = &fn; n_jobs_ = n_workers; pending_ = n_workers; gen_++;
+        }
+        cv_.notify_all();
+        fn(0);
+        for (int i = n_workers + 1; i < n; i++) fn(i);   // more rows than workers
+        std::unique_lock<std::mutex> lk(mu_);
+        done_cv_.wait(lk, [this] { return pending_ == 0; });
+        fn_ = nullptr;
+    }
+
+private:
+    void loop(int w) {
+        uint64_t seen = 0;
+        for (;;) {
+            const std::function<void(int)> * fn = nullptr;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] { return stop_ || gen_ != seen; });
+                if (stop_) return;
+                seen = gen_;
+                if (w >= n_jobs_) continue;
+                fn = fn_;
+            }
+            (*fn)(w + 1);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (--pending_ == 0) done_cv_.notify_one();
+            }
+        }
+    }
+
+    std::vector<std::thread> threads_;
+    std::mutex mu_;
+    std::condition_variable cv_, done_cv_;
+    const std::function<void(int)> * fn_ = nullptr;
+    int n_jobs_ = 0, pending_ = 0;
+    uint64_t gen_ = 0;
+    bool stop_ = false;
 };
 
 struct DSparkSampleStep {
