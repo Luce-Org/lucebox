@@ -58,7 +58,7 @@ for w in "${want[@]}"; do
       wait_ready qwen38-27b 8421 ;;
     brick)
       start brick-max "$MODELS/routing/brick-complexity-2-max-Q8_0.gguf" \
-        --target-device hip:0 --max-concurrency 4 --kv-pool-tokens 16384 --max-ctx 4096 \
+        --target-device hip:0 --max-concurrency 4 --kv-pool-tokens 131072 --max-ctx 32768 \
         --host 127.0.0.1 --port 8411 --model-name brick-max
       wait_ready brick-max 8411 ;;
     2b)

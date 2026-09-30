@@ -118,6 +118,7 @@ async def brick_probs(
     model: str | None = None,
     prompt_suffix: str = "",
     logprobs: bool = True,
+    max_chars: int = 3000,
     client: httpx.AsyncClient | None = None,
     timeout: float = 10.0,
 ) -> dict[str, float]:
@@ -129,7 +130,7 @@ async def brick_probs(
     rejects logprobs with a 400) it reads the generated word instead, giving
     one-hot probs: routing still works, but confidence is always 1.
     """
-    query = truncate_query(query_text)
+    query = truncate_query(query_text, max_chars)
     root = root_url(service_url)
     if kind == "llama-server":
         url = f"{root}/completion"

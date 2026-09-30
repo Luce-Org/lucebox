@@ -74,8 +74,8 @@ You can also pass the spec as JSON:
 | router | kind | params (defaults) |
 |---|---|---|
 | `fixed` | leaf | `model` (an arm) |
-| `brick` | leaf | `service=brick-max`, `t_small=0.8`, `t_mid=0.5`, `h_max=0.5`, `small`/`mid`/`large` (arms by rank; `small=none` drops the cheapest tier), `no_think` (llama-server kind only), `on_error=<large>` |
-| `brick_skill` | leaf | `skills=<skill table JSON>` (required), `latency=<profile JSON>` (config `latency_defaults` fill gaps), `service=brick-max`, `r=0`, `beta` and `lam` (override `r`'s values), `tie_eps=0.03`, `arms=a\|b\|c` (candidates; default all), `live_load=on`, `capability=/home/berto/models/routing/brick-capability`, `max_length=512` |
+| `brick` | leaf | `service=brick-max`, `t_small=0.8`, `t_mid=0.5`, `h_max=0.5`, `small`/`mid`/`large` (arms by rank; `small=none` drops the cheapest tier), `no_think` (llama-server kind only), `max_chars=3000` (head+tail of the last user message sent to Brick; service config can set it too), `on_error=<large>` |
+| `brick_skill` | leaf | `skills=<skill table JSON>` (required), `latency=<profile JSON>` (config `latency_defaults` fill gaps), `service=brick-max`, `r=0`, `beta` and `lam` (override `r`'s values), `tie_eps=0.03`, `arms=a\|b\|c` (candidates; default all), `live_load=on`, `capability=/home/berto/models/routing/brick-capability`, `max_length=512`, `max_chars=3000` |
 | `load_aware` | wrapper | `margin_up=1.0`, `margin_down=0.1`, `promote=0` (off) |
 
 How each router decides:
