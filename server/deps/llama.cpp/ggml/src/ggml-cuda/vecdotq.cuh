@@ -1308,6 +1308,16 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 static __device__ __forceinline__ uint2 iq2_xxs_grid_levels(const uint2 grid) {
     return make_uint2((grid.x >> 4) & 0x03030303u, (grid.y >> 4) & 0x03030303u);
 }
+
+// The 8 signs of one ksigns group (7 stored bits s7, the 8th their parity) as
+// v_perm selector bits: sign i at bit 8i+2 of .x and sign i+4 at bit 8i+2 of
+// .y. One carry-free 24-bit multiply spreads sign i to bit 8i+2 (i < 4) and
+// sign i+4 to bit 8i+6 (i < 3); the 8th sign is bit 0 of the popcount, added
+// at bit 26 (a zero bit) and kept by the mask.
+static __device__ __forceinline__ uint2 ksigns_perm_bits(const uint32_t s7) {
+    const uint32_t spr = s7 * 0x00810204u;
+    return make_uint2(spr & 0x04040404u, ((spr >> 4) + (__popc(s7) << 26)) & 0x04040404u);
+}
 #endif // defined(GGML_USE_HIP)
 
 // grid is iq2xxs_grid viewed as uint2, or a shared-memory copy of it; with
@@ -1343,18 +1353,14 @@ static __device__ __forceinline__ void vec_dot_iq2_xxs_q8_1_grid_parts(
         // per byte. Instead v_perm_b32 takes byte i from the grid word or from
         // its negation with selector i + 4*sign_i. Grid bytes are 8, 25 or 43,
         // so 0x01010100 - g negates every byte (borrows stay byte-local) and
-        // the int8 values equal the saturating path's. One carry-free 24-bit
-        // multiply spreads sign i to bit 8i+2 (i < 4) and sign i+4 to bit
-        // 8i+6 (i < 3); the 8th sign is the parity of the 7 stored bits: bit 0
-        // of the popcount, added at bit 26 (a zero bit) and kept by the mask.
-        // From the level table the selector is level_i + 4*sign_i instead and
-        // v_perm picks from the constant pair {8, 25, 43 | -8, -25, -43}: the
-        // same bytes, without negating each looked-up word.
-        const uint32_t s7   = (aux32 >> (7 * k0 / 2)) & 0x7Fu;
-        const uint32_t spr  = s7 * 0x00810204u;
-        const uint32_t sel0 = (spr & 0x04040404u) | (levels ? grid_pos.x : 0x03020100u);
-        const uint32_t sel1 = (((spr >> 4) + (__popc(s7) << 26)) & 0x04040404u) |
-                              (levels ? grid_pos.y : 0x03020100u);
+        // the int8 values equal the saturating path's (sign bits from
+        // ksigns_perm_bits). From the level table the selector is
+        // level_i + 4*sign_i instead and v_perm picks from the constant pair
+        // {8, 25, 43 | -8, -25, -43}: the same bytes, without negating each
+        // looked-up word.
+        const uint2    sb   = ksigns_perm_bits((aux32 >> (7 * k0 / 2)) & 0x7Fu);
+        const uint32_t sel0 = sb.x | (levels ? grid_pos.x : 0x03020100u);
+        const uint32_t sel1 = sb.y | (levels ? grid_pos.y : 0x03020100u);
         const int grid0 = levels ? __builtin_amdgcn_perm(0x00D5E7F8u, 0x002B1908u, sel0)
                                  : __builtin_amdgcn_perm(0x01010100u - grid_pos.x, grid_pos.x, sel0);
         const int grid1 = levels ? __builtin_amdgcn_perm(0x00D5E7F8u, 0x002B1908u, sel1)
@@ -1493,29 +1499,51 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
 #define VDR_IQ3_XXS_Q8_1_MMVQ 2
 #define VDR_IQ3_XXS_Q8_1_MMQ  2
 
-static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+// grid is iq3xxs_grid or a shared-memory copy of it. Returns the two factors
+// of the lane's dot, d * sumi, as vec_dot_iq2_xxs_q8_1_grid_parts does.
+static __device__ __forceinline__ void vec_dot_iq3_xxs_q8_1_grid_parts(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint32_t * __restrict__ grid, float & d_out, int & sumi_out) {
 
     const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
 
+#if defined(GGML_USE_HIP)
+    // The block is 2-byte aligned: one 8-byte load for the lane's grid indices
+    // and one 4-byte load for its sign/scale word instead of 16-bit pieces.
+    int2 q3_packed;
+    memcpy(&q3_packed, bq3->qs + 4*iqs, sizeof(q3_packed));
+    uint32_t aux32;
+    memcpy(&aux32, bq3->qs + QK_K/4 + 4*(iqs/2), sizeof(aux32));
+#else
     const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1));
-    const uint8_t * q3 = (const uint8_t *) &q3_packed;
     const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+#endif // defined(GGML_USE_HIP)
+    const uint8_t * q3 = (const uint8_t *) &q3_packed;
 
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const int2 grid_pos = make_int2(grid[q3[l0 + 0]], grid[q3[l0 + 1]]);
+
+#if defined(GGML_USE_HIP)
+        // The IQ2_XXS sign decode: v_perm_b32 takes byte i from the grid word
+        // or from its negation with selector i + 4*sign_i. Grid bytes are
+        // 4..62, so 0x01010100 - g negates every byte (borrows stay
+        // byte-local) and the int8 values equal the saturating path's.
+        const uint2 sb = ksigns_perm_bits((aux32 >> (7*l0/2)) & 0x7Fu);
+        const int grid_l = __builtin_amdgcn_perm(0x01010100u - grid_pos.x, grid_pos.x, sb.x | 0x03020100u);
+        const int grid_h = __builtin_amdgcn_perm(0x01010100u - grid_pos.y, grid_pos.y, sb.y | 0x03020100u);
+#else
         const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
 
-        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
-
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif // defined(GGML_USE_HIP)
 
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
@@ -1524,8 +1552,22 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 
     const int ls = aux32 >> 28;
     sumi = (ls*sumi + sumi/2)/2;
-    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    d_out = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    sumi_out = sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_grid(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint32_t * __restrict__ grid) {
+    float d;
+    int sumi;
+    vec_dot_iq3_xxs_q8_1_grid_parts(vbq, bq8_1, kbx, iqs, grid, d, sumi);
     return d * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_iq3_xxs_q8_1_grid(vbq, bq8_1, kbx, iqs, iq3xxs_grid);
 }
 
 #define VDR_IQ3_S_Q8_1_MMVQ 2

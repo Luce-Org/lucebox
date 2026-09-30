@@ -825,6 +825,31 @@ static __device__ __forceinline__ float warp_reduce_sum_wave32_dpp(float x) {
     return x;
 }
 
+// The shared-grid IQ types' lane dot from grid, their table in shared memory
+// (uint2 IQ2_XXS entries, the level table with levels, or uint32 IQ3_XXS
+// entries): the two factors d * sumi, or their product.
+template <ggml_type type, bool levels>
+static __device__ __forceinline__ void vec_dot_iq_shared_grid_parts(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+        const void * __restrict__ grid, float & d, int & sumi) {
+    if constexpr (type == GGML_TYPE_IQ2_XXS) {
+        vec_dot_iq2_xxs_q8_1_grid_parts<levels>(vbq, bq8_1, kbx, iqs, (const uint2 *) grid, d, sumi);
+    } else {
+        static_assert(type == GGML_TYPE_IQ3_XXS, "the shared-grid types are IQ2_XXS and IQ3_XXS");
+        vec_dot_iq3_xxs_q8_1_grid_parts(vbq, bq8_1, kbx, iqs, (const uint32_t *) grid, d, sumi);
+    }
+}
+
+template <ggml_type type, bool levels>
+static __device__ __forceinline__ float vec_dot_iq_shared_grid(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+        const void * __restrict__ grid) {
+    float d;
+    int sumi;
+    vec_dot_iq_shared_grid_parts<type, levels>(vbq, bq8_1, kbx, iqs, grid, d, sumi);
+    return d * sumi;
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false,
           int fixed_ncols_x = 0, bool unroll_k_loop_2 = false,
           bool reuse_rocmfp4_weights = false,
@@ -874,22 +899,24 @@ static __global__ void mul_mat_vec_q(
     const     int blocks_per_row_x = (fixed_ncols_x > 0 ? fixed_ncols_x : ncols_x) / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
-    // Multi-row IQ2_XXS blocks decode from a shared-memory grid table (see the
-    // fixed-K loop) and reduce with warp_reduce_sum_wave32_dpp.
-    constexpr bool iq2xxs_shared_grid = type == GGML_TYPE_IQ2_XXS && fixed_ncols_x > 0 && c_row_warps > 1;
+    // Multi-row IQ2_XXS / IQ3_XXS blocks decode from a shared-memory grid
+    // table (see the fixed-K loop) and reduce with warp_reduce_sum_wave32_dpp.
+    constexpr bool iq_shared_grid = (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS) &&
+        fixed_ncols_x > 0 && c_row_warps > 1;
 #if defined(GGML_USE_HIP)
     constexpr bool iq2xxs_levels = true;
 #else
     constexpr bool iq2xxs_levels = false;
 #endif // defined(GGML_USE_HIP)
-    static_assert(!iq2xxs_shared_grid || (ncols_dst == 1 && warp_size == 32),
-                  "the IQ2_XXS shared-grid path is a one-column wave32 kernel");
+    static_assert(!iq_shared_grid || (ncols_dst == 1 && warp_size == 32),
+                  "the IQ shared-grid path is a one-column wave32 kernel");
 
     static_assert(fixed_ncols_x == 0 ||
                   type == GGML_TYPE_Q3_0_ROCMFPX ||
                   type == GGML_TYPE_Q2_0_ROCMFP2 ||
-                  type == GGML_TYPE_IQ2_XXS,
-                  "fixed-K decode specialization is limited to profiled ROCmFP2/FP3/IQ2_XXS types");
+                  type == GGML_TYPE_IQ2_XXS ||
+                  type == GGML_TYPE_IQ3_XXS,
+                  "fixed-K decode specialization is limited to profiled ROCmFP2/FP3/IQ2_XXS/IQ3_XXS types");
     static_assert(!unroll_k_loop_2 || type == GGML_TYPE_Q4_0_ROCMFP4_FAST,
                   "partial K-loop unrolling is limited to the profiled FP4FAST path");
     static_assert(!reuse_rocmfp4_weights ||
@@ -1040,12 +1067,13 @@ static __global__ void mul_mat_vec_q(
         constexpr int fixed_blocks = fixed_ncols_x/qk;
         constexpr int fixed_iters = (fixed_blocks + blocks_per_iter - 1) / blocks_per_iter;
 
-        // Multi-row IQ2_XXS blocks copy the 2 KiB grid to shared memory once:
-        // the lane-divergent lookups become LDS reads instead of vector-cache
-        // gathers. On HIP the copy is the level table (iq2_xxs_grid_levels);
-        // the decoded weights, and so every dot product, are unchanged.
-        const uint2 * iq2xxs_grid_src = (const uint2 *) iq2xxs_grid;
-        if constexpr (iq2xxs_shared_grid) {
+        // Multi-row IQ2_XXS / IQ3_XXS blocks copy the grid (2 KiB / 1 KiB) to
+        // shared memory once: the lane-divergent lookups become LDS reads
+        // instead of vector-cache gathers. On HIP the IQ2_XXS copy is the
+        // level table (iq2_xxs_grid_levels); the decoded weights, and so every
+        // dot product, are unchanged.
+        const void * iq_grid_src = nullptr;
+        if constexpr (iq_shared_grid) {
             // A masked route (negative id) makes the whole block's rows zero,
             // exactly as the loop below would, and validity is per block
             // (blockIdx.y), so every wave leaves before the barrier.
@@ -1056,23 +1084,32 @@ static __global__ void mul_mat_vec_q(
                 }
                 return;
             }
-            // Each thread copies two adjacent entries: one 16-byte load.
-            __shared__ uint2 iq2xxs_grid_shared[256];
-            for (int l = 2*(warp_size*threadIdx.y + threadIdx.x); l < 256; l += 2*c_row_warps*warp_size) {
+            const int block_tid = warp_size*threadIdx.y + threadIdx.x;
+            if constexpr (type == GGML_TYPE_IQ2_XXS) {
+                // Each thread copies two adjacent entries: one 16-byte load.
+                __shared__ uint2 iq2xxs_grid_shared[256];
+                for (int l = 2*block_tid; l < 256; l += 2*c_row_warps*warp_size) {
 #pragma unroll
-                for (int e = 0; e < 2; ++e) {
-                    const uint2 grid = ((const uint2 *) iq2xxs_grid)[l + e];
+                    for (int e = 0; e < 2; ++e) {
+                        const uint2 grid = ((const uint2 *) iq2xxs_grid)[l + e];
 #if defined(GGML_USE_HIP)
-                    iq2xxs_grid_shared[l + e] = iq2_xxs_grid_levels(grid);
+                        iq2xxs_grid_shared[l + e] = iq2_xxs_grid_levels(grid);
 #else
-                    iq2xxs_grid_shared[l + e] = grid;
+                        iq2xxs_grid_shared[l + e] = grid;
 #endif // defined(GGML_USE_HIP)
+                    }
                 }
+                iq_grid_src = iq2xxs_grid_shared;
+            } else {
+                __shared__ uint32_t iq3xxs_grid_shared[256];
+                for (int l = block_tid; l < 256; l += c_row_warps*warp_size) {
+                    iq3xxs_grid_shared[l] = iq3xxs_grid[l];
+                }
+                iq_grid_src = iq3xxs_grid_shared;
             }
             __syncthreads();
-            iq2xxs_grid_src = iq2xxs_grid_shared;
         }
-        GGML_UNUSED(iq2xxs_grid_src);
+        GGML_UNUSED(iq_grid_src);
 
         // K = 2304 leaves one block for the last iteration, i.e. lanes 0-7 of
         // each row. With two rows per wave, lanes 8r..8r+7 decode row r's
@@ -1080,12 +1117,12 @@ static __global__ void mul_mat_vec_q(
         // through ROW_XMASK DPP (lane n <- lane n^8), then form d*sumi and add
         // it themselves: every accumulator adds the same product in the same
         // order as before.
-        constexpr bool iq2xxs_pack_tail = iq2xxs_shared_grid && !has_fusion &&
+        constexpr bool iq_pack_tail = iq_shared_grid && !has_fusion &&
             rows_per_cuda_block == 2 && fixed_blocks % blocks_per_iter == 1;
 
 #pragma unroll
         for (int iter = 0; iter < fixed_iters; ++iter) {
-            if constexpr (iq2xxs_pack_tail) {
+            if constexpr (iq_pack_tail) {
                 if (iter == fixed_iters - 1) {
                     constexpr int lanes_per_block = qi/vdr;
                     const int tail_row = tid / lanes_per_block;
@@ -1094,9 +1131,9 @@ static __global__ void mul_mat_vec_q(
                     float tail_d = 0.0f;
                     int tail_sumi = 0;
                     if (tail_row < rows_per_cuda_block) {
-                        vec_dot_iq2_xxs_q8_1_grid_parts<iq2xxs_levels>(
+                        vec_dot_iq_shared_grid_parts<type, iq2xxs_levels>(
                             vx, &y[(fixed_blocks - 1)*(qk/QK8_1)],
-                            kbx_offset + tail_row*stride_row_x + fixed_blocks - 1, kqs, iq2xxs_grid_src,
+                            kbx_offset + tail_row*stride_row_x + fixed_blocks - 1, kqs, iq_grid_src,
                             tail_d, tail_sumi);
                     }
                     const float tail_d1    = __int_as_float(warp_shfl_xor_wave32<lanes_per_block>(__float_as_int(tail_d)));
@@ -1125,14 +1162,14 @@ static __global__ void mul_mat_vec_q(
                 const int kbx_offset = sample_x*stride_sample_x + channel_xs[j]*stride_channel_x + row0*stride_row_x;
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    if constexpr (iq2xxs_shared_grid) {
-                        tmp[j][i] += vec_dot_iq2_xxs_q8_1_grid<iq2xxs_levels>(
-                            vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, iq2xxs_grid_src);
+                    if constexpr (iq_shared_grid) {
+                        tmp[j][i] += vec_dot_iq_shared_grid<type, iq2xxs_levels>(
+                            vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, iq_grid_src);
                         if constexpr (has_fusion) {
                             if (use_gate) {
-                                tmp_gate[j][i] += vec_dot_iq2_xxs_q8_1_grid<iq2xxs_levels>(
+                                tmp_gate[j][i] += vec_dot_iq_shared_grid<type, iq2xxs_levels>(
                                     vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs,
-                                    iq2xxs_grid_src);
+                                    iq_grid_src);
                             }
                         }
                     } else {
@@ -1304,7 +1341,7 @@ static __global__ void mul_mat_vec_q(
     for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
         for (int i = 0; i < rows_per_cuda_block; ++i) {
-            if constexpr (iq2xxs_shared_grid) {
+            if constexpr (iq_shared_grid) {
                 tmp[j][i] = warp_reduce_sum_wave32_dpp(tmp[j][i]);
                 if constexpr (has_fusion) {
                     if (use_gate) {
@@ -2058,8 +2095,9 @@ static void mul_mat_vec_rocmfpx_fixed_k_launch(
         const int warp_size, cudaStream_t stream) {
     static_assert(type == GGML_TYPE_Q3_0_ROCMFPX ||
                   type == GGML_TYPE_Q2_0_ROCMFP2 ||
-                  type == GGML_TYPE_IQ2_XXS,
-                  "fixed-K helper is limited to profiled ROCmFP2/FP3/IQ2_XXS kernels");
+                  type == GGML_TYPE_IQ2_XXS ||
+                  type == GGML_TYPE_IQ3_XXS,
+                  "fixed-K helper is limited to profiled ROCmFP2/FP3/IQ2_XXS/IQ3_XXS kernels");
     static_assert(fixed_ncols_x == 2048 || fixed_ncols_x == 4096 ||
                   fixed_ncols_x == 2304 || fixed_ncols_x == 5120,
                   "fixed-K helper compiled an unexpected DS4/DS4.1 shape");
@@ -2674,19 +2712,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
         }
     }
 
-    // DS4.1 IQ2_XXS experts (gate/up K=5120, down K=2304) on one-wave AMD
-    // tables. A compile-time K fully unrolls the lane loop so every weight
-    // and activation load issues before the first dot; each lane still adds
-    // its blocks in the same order and the warp reduction is unchanged.
-    if constexpr (type == GGML_TYPE_IQ2_XXS) {
-        // Four waves per block, two rows per wave: the two rows share every
+    // DS4.1 IQ2_XXS / IQ3_XXS experts (gate/up K=5120, down K=2304) on
+    // one-wave AMD tables. A compile-time K fully unrolls the lane loop so
+    // every weight and activation load issues before the first dot; each lane
+    // still adds its blocks in the same order and the warp reduction is
+    // unchanged. Both types have the same lane layout (qi 16, vdr 2).
+    if constexpr (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS) {
+        // Eight waves per block, two rows per wave: the two rows share every
         // activation load and the per-wave prologue, grid fill and barrier.
-        constexpr int iq2_row_warps = 8;
-        constexpr int iq2_wave_rows = 2;
-        if (GGML_CUDA_CC_IS_AMD(cc) && ncols_dst == 1 && nrows_x % (iq2_row_warps*iq2_wave_rows) == 0 &&
+        constexpr int iq_row_warps = 8;
+        constexpr int iq_wave_rows = 2;
+        if (GGML_CUDA_CC_IS_AMD(cc) && ncols_dst == 1 && nrows_x % (iq_row_warps*iq_wave_rows) == 0 &&
             calc_nwarps(type, 1, table_id) == 1 && !should_use_small_k(1)) {
             if (ncols_x == 5120) {
-                mul_mat_vec_rocmfpx_fixed_k_launch<type, 5120, iq2_row_warps, iq2_wave_rows>(
+                mul_mat_vec_rocmfpx_fixed_k_launch<type, 5120, iq_row_warps, iq_wave_rows>(
                     vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
                     nchannels_dst, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y,
@@ -2696,7 +2735,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 return;
             }
             if (ncols_x == 2304) {
-                mul_mat_vec_rocmfpx_fixed_k_launch<type, 2304, iq2_row_warps, iq2_wave_rows>(
+                mul_mat_vec_rocmfpx_fixed_k_launch<type, 2304, iq_row_warps, iq_wave_rows>(
                     vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
                     nchannels_dst, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y,
