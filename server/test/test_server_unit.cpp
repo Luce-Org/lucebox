@@ -3190,6 +3190,59 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_records_only_validated_restore) {
     unlink(path.c_str());
 }
 
+TEST_CASE(ServerUnitFixture, test_prefix_cache_long_first_turn_snapshots_whole_prompt) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    // An agent's first turn: a short system/tools head, then a user turn
+    // well past LUCE_PC_DEEP_FIRST_MIN (4096). The snapshot covers the whole
+    // prompt, so the first follow-up does not re-prefill the conversation.
+    std::vector<int32_t> short_head = {1, 100, 3};
+    short_head.insert(short_head.end(), 5000, 101);
+    short_head.push_back(4);
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/true);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == (int) short_head.size());
+        r.cancel();
+    }
+
+    // A head longer than LUCE_PC_DEEP_FIRST_MAX_HEAD (2048) keeps its own
+    // pin: new conversations that share it must not re-prefill it.
+    std::vector<int32_t> long_head = {1};
+    long_head.insert(long_head.end(), 3000, 100);
+    long_head.push_back(3);
+    long_head.insert(long_head.end(), 5000, 101);
+    long_head.push_back(4);
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            long_head, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/true);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == 3002);
+        r.cancel();
+    }
+
+    // A short tail keeps the head pin as before.
+    const std::vector<int32_t> short_tail = {1, 100, 3, 101, 4};
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_tail, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/true);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == 3);
+        r.cancel();
+    }
+
+    unlink(path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_restore_invalidation_preserves_pending_pin) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;

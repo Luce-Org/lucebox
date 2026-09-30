@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <chrono>
 
@@ -579,6 +580,27 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
     if (disabled_ || active_inline_reservation_ != 0) return {};
 
     const auto candidates = find_all_boundaries(prompt_ids, markers_);
+    // Cold request with a long tail past a short system/tools head (an
+    // agent's first turn): snapshot the whole conversation instead of the
+    // head, or the first follow-up re-prefills everything. Only a short head
+    // gives up its own pin this way, so a new conversation that shares it
+    // re-prefills at most LUCE_PC_DEEP_FIRST_MAX_HEAD tokens (default 2048).
+    // LUCE_PC_DEEP_FIRST_MIN is the tail length that triggers it (default
+    // 4096 tokens; 0 keeps the head pin).
+    static const int deep_first_min = [] {
+        const char * v = std::getenv("LUCE_PC_DEEP_FIRST_MIN");
+        return v && *v ? std::atoi(v) : 4096;
+    }();
+    static const int deep_first_max_head = [] {
+        const char * v = std::getenv("LUCE_PC_DEEP_FIRST_MAX_HEAD");
+        return v && *v ? std::atoi(v) : 2048;
+    }();
+    if (deep_first_min > 0 && restored_prefix_len == 0 && !candidates.empty() &&
+        candidates.front() <= deep_first_max_head &&
+        (int) prompt_ids.size() - candidates.front() >= deep_first_min) {
+        prefer_tools_boundary = false;
+        include_last_message = true;
+    }
     int target_cut = 0;
     bool forced = false;
     if (should_force_inline_snapshot_boundary(
