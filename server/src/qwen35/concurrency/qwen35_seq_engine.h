@@ -180,9 +180,12 @@ private:
                               const char * client_message);
     PrefillStage stage_prefill_chunk(int slot, int max_tokens,
                                      std::vector<PrefillOutput> & outputs);
+    // `logprobs_out`, when non-null, receives the chosen token's
+    // log-probabilities if the slot's sampler asks for them.
     int32_t sample_graph_row(int slot, int logits_row,
                              const int32_t * cached_argmax = nullptr,
-                             std::vector<float> * logits_scratch = nullptr);
+                             std::vector<float> * logits_scratch = nullptr,
+                             std::optional<TokenLogprobs> * logprobs_out = nullptr);
     std::vector<uint8_t> select_chain_lanes(
         const StepPlan & plan) const;
     bool chain_spec_input_capable(const StepInput & input) const;

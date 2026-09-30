@@ -7,9 +7,11 @@ them. If all eligible models are busy, requests enter a bounded waiting queue.
 
 Model placement, primary GPU selection and enabling load balancing are separate
 settings. For example, Qwen can stay on R9700 and DeepSeek4 on Strix Halo while
-either GPU is selected as primary. Every generation request follows this
-capacity-based policy, regardless of the request's `model` field. The response
-identifies the model that actually generated the answer.
+either GPU is selected as primary. By default every generation request follows
+this capacity-based policy, regardless of the request's `model` field;
+`--model-routing name` instead pins a request that names a model to that model
+(see [Name routing](#name-routing)). The response identifies the model that
+actually generated the answer.
 
 Each model keeps its own tokenizer, defaults, backend and scheduler. Clients
 use the existing Chat Completions, Messages and Responses endpoints.
@@ -64,11 +66,91 @@ limit or a promise that every sequence will fit in the KV pool.
 {"model":"auto","messages":[{"role":"user","content":"Write a Python parser."}],"max_tokens":512,"stream":true}
 ```
 
+## Name routing
+
+`--model-routing name` hosts several different models behind one listener and
+lets the client choose among them, like separate servers would, but in one
+process. It loads every model block (it implies `--load-balancing`, with the
+same per-block rules below) and applies one rule per request:
+
+| Request `model` | Generation | `count_tokens` |
+| --- | --- | --- |
+| a block's `--model-name` | that block only; waits for its capacity | that block |
+| omitted, empty or `auto` | balanced as below (primary first) | 400 |
+| anything else | 404 listing the loaded names | 404 |
+
+A pinned request never spills onto another model: when its block is full it
+waits in the shared routing queue (`--routing-queue-limit`) until that block
+has capacity, the client disconnects or the server stops. A request that can
+never fit that block's context or KV pool gets 400 without waiting.
+`--unknown-model primary` serves unrecognized names on the primary instead of
+answering 404 (the default is `reject`). The option is accepted only with
+`--model-routing name`. `/status/json` and `/props` report
+`routing: "by-name"`; the per-model `models[].{id, capacity, in_flight}` entries
+are unchanged, so a gateway can read each model's load by its name.
+
+Example: the routing trial's three models, one process on port 8420
+(`harness/routing/scripts/launch_routing.sh`):
+
+```bash
+luce_server --model-routing name --host 127.0.0.1 --port 8420 --routing-queue-limit 64 \
+  --model ~/models/Qwen3.8-27B-UD-IQ4_XS.gguf --model-name qwen3.8-27b \
+    --target-device hip:0 \
+    --draft ~/models/qwen38-dflash2-q8_0.gguf --draft-device hip:0 --draft-block-size 16 \
+    --cache-type-k q8_0 --cache-type-v q8_0 \
+    --max-concurrency 4 --kv-pool-tokens 131072 --max-ctx 65536 --max-tokens 32768 \
+  --model ~/models/routing/brick-complexity-2-max-Q8_0.gguf --model-name brick-max \
+    --target-device hip:0 \
+    --max-concurrency 4 --kv-pool-tokens 131072 --max-ctx 32768 \
+  --model ~/models/routing/Qwen3.5-2B-Q8_0.gguf --model-name qwen35-2b \
+    --target-device hip:1 \
+    --max-concurrency 4 --kv-pool-tokens 262144 --max-ctx 122880
+```
+
+Two blocks share the R9700 here. Give every block on a shared GPU an explicit
+`--kv-pool-tokens`: without it Qwen sizes its pool from the memory free when
+that block loads, starving the blocks loaded after it.
+
+Per-block options include placement (`--target-device`, `--draft`,
+`--draft-device`, `--draft-block-size`), capacity (`--max-concurrency`,
+`--kv-pool-tokens`, `--max-ctx`), output defaults (`--max-tokens`,
+`--default-max-tokens` and the thinking budgets), Qwen's `--cache-type-k/v`,
+prefix-cache sizes and `--admission-coalesce-ms`. Process-wide: the listener
+(`--host`, `--port`, `--no-cors`, `--routing-queue-limit`, first block only),
+`--model-routing`, `--unknown-model`, environment variables, and GPU graph
+capture (next section). Each batched block also keeps its own copied prefix
+checkpoints, bounded by 4 GiB of host RAM per block.
+
+Request features are checked by the block that serves the request, after
+routing: for example `logprobs` is accepted when the named block's backend
+reports per-token log-probabilities, independently of the primary.
+
+## GPU graphs with several models
+
+A process that loads more than one model disables HIP/CUDA graph capture
+(`GGML_CUDA_DISABLE_GRAPHS=1`) unless `LUCE_MULTI_MODEL_GRAPHS=1` is set. Each
+model captures from its own worker thread with relaxed capture mode, and a
+blocking runtime call from another worker (the `cudaStreamPerThread`
+copy-and-synchronize in ggml's tensor get/set, prefix-checkpoint copies)
+invalidates a capture in flight; the capturing worker then aborts. PR #770
+moved the helper copies and replay-log commits off the legacy stream, but still
+measured about two failed runs in three with the two models on different GPUs
+(R9700 and Strix Halo). So separate devices or separate graph caches do not
+make capture safe, and a per-model or per-device relaxation (possible
+mechanically through `GGML_CUDA_DISABLE_GRAPHS_DEVICES` or the per-thread
+override) would still expose the capturing model to the other workers' blocking
+calls. A safe relaxation needs the capture window to exclude other workers'
+blocking calls, which does not exist yet. On the balanced two-27B aggregate
+eager launches cost nothing measurable; small, launch-bound models such as a
+0.8B/2B lose more, which is unmeasured here. `LUCE_MULTI_MODEL_GRAPHS=1`
+remains an at-your-own-risk experiment.
+
 ## How requests are balanced
 
 - Every generation request follows operator-configured priority. An omitted,
   empty, `auto`, explicit model name, or other client alias has the same
-  load-balancing behavior. There is no model pinning. With balancing enabled, requests try the
+  load-balancing behavior. There is no model pinning unless
+  `--model-routing name` is set. With balancing enabled, requests try the
   primary and then the remaining models; without it, only the primary serves.
   This is preference with capacity fallback, not round-robin.
 - The listener reserves an available model slot. Its scheduler then calls

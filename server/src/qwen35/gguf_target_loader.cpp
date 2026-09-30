@@ -10,6 +10,8 @@
 //     token_embd.weight              [hidden, vocab]
 //     output_norm.weight             [hidden]                  F32
 //     output.weight                  [hidden, vocab]           Q6_K (lm_head)
+//                                    absent when embeddings are tied (0.8B,
+//                                    2B): token_embd.weight is the LM head.
 //
 //   Per layer blk.<i> (full-attention layers, i.e. i % 4 == 3):
 //     attn_norm.weight               [hidden]                  F32
@@ -171,12 +173,16 @@ static bool is_expert_tensor_name(const char * name) {
            (len == 16 && std::strncmp(base, "ffn_gate_up_exps", 16) == 0);
 }
 
+// token_embd.weight normally stays host-only for the CPU embedder. With tied
+// embeddings (no output.weight, e.g. Qwen3.5-0.8B/2B) it doubles as the LM
+// head, so the stage that owns the output also uploads it.
 static bool should_load_target_tensor(const char * name,
                                       int layer_begin,
                                       int layer_end,
                                       bool load_output,
+                                      bool tied_output,
                                       bool skip_expert_tensors = false) {
-    if (std::strcmp(name, "token_embd.weight") == 0) return false;
+    if (std::strcmp(name, "token_embd.weight") == 0) return tied_output && load_output;
     if (std::strcmp(name, "output_norm.weight") == 0 ||
         std::strcmp(name, "output.weight") == 0) {
         return load_output;
@@ -577,10 +583,16 @@ bool load_target_gguf_partial(const std::string & path,
     out.tok_embd = g("token_embd.weight");
     out.out_norm = g("output_norm.weight");
     out.output   = g("output.weight");
-    if (!out.tok_embd || !out.out_norm || !out.output) {
-        set_last_error("missing top-level tensors (token_embd/output_norm/output)");
+    if (!out.tok_embd || !out.out_norm) {
+        set_last_error("missing top-level tensors (token_embd/output_norm)");
         gguf_free(gctx);
         return false;
+    }
+    const bool tied_output = out.output == nullptr;
+    if (tied_output) {
+        out.output = out.tok_embd;
+        std::printf("[loader] no output.weight: LM head tied to token_embd.weight (%s)\n",
+                    ggml_type_name(out.tok_embd->type));
     }
     out.n_vocab = (int)out.tok_embd->ne[1];
 
@@ -692,7 +704,7 @@ bool load_target_gguf_partial(const std::string & path,
     for (int64_t tid = 0; tid < n_tensors; tid++) {
         const char * tname = gguf_get_tensor_name(gctx, tid);
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
-        if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
+        if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, tied_output, plan.skip_expert_tensors)) {
             continue;
         }
         TargetTensorAlloc a;
@@ -967,7 +979,8 @@ bool load_target_gguf_partial(const std::string & path,
     // ── 4. mmap the file and copy tensor bytes to CUDA ────────────────
     //
     // SKIP uploading token_embd.weight — it stays on CPU for embedding
-    // lookup (CUDA get_rows doesn't support k-quants). Its bytes are copied
+    // lookup (CUDA get_rows doesn't support k-quants) — unless it is the tied
+    // LM head, in which case the output stage gets a device copy too. Its bytes are copied
     // into owned host memory below (step 5), so the mmap is released when this
     // local goes out of scope.
     GgufMmap mm;
@@ -1002,11 +1015,11 @@ bool load_target_gguf_partial(const std::string & path,
             tok_embd_off  = off;
             tok_embd_sz   = sz;
             tok_embd_type = gguf_get_tensor_type(gctx, tid);
-            continue;
+            if (!tied_output) continue;
         }
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
         if (!t) continue;
-        if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
+        if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, tied_output, plan.skip_expert_tensors)) {
             continue;
         }
         spans.push_back({t, 0, off, sz});

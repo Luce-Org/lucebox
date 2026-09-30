@@ -97,6 +97,15 @@ struct ServerConfig {
     int         port        = 8080;
     int         max_tokens  = 4096;     // default max output tokens (legacy alias for default_max_tokens)
     int         routing_queue_limit = 32; // waiting auto requests across the listener
+    // How a multi-model listener picks a model for a generation request.
+    // balance: operator priority with capacity fallback; the request's
+    // `model` is ignored. name: a request naming a loaded model runs only on
+    // it (waiting for its capacity); omitted/"auto" still balances.
+    enum class ModelRouting { balance, name };
+    ModelRouting model_routing = ModelRouting::balance;
+    // Name routing: serve an unrecognized model name on the primary instead
+    // of answering 404.
+    bool        unknown_model_to_primary = false;
     int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
     bool        enable_cors = true;
     std::string model_name  = "luce";
@@ -375,6 +384,21 @@ PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
 SamplerCfg parse_request_sampler(const json & body,
                                  const SamplingDefaults & defaults);
 
+// Resolve OpenAI `logprobs` / `top_logprobs` into SamplerCfg::logprobs_top_n
+// (-1 when not requested). Throws std::invalid_argument for a malformed
+// value, a top_logprobs outside [0, 20] or without logprobs=true, or a
+// non-chat endpoint; route_request's catch turns that into a 400.
+int parse_request_logprobs(const json & body, ApiFormat format);
+
+// OpenAI chat `choices[].logprobs` object for per-token log-probabilities:
+// {"content": [{token, logprob, bytes, top_logprobs: [{token, logprob,
+// bytes}]}]}. `token_bytes` maps an id to its raw bytes, which may be a
+// partial UTF-8 sequence; `bytes` keeps them exact and `token` carries a
+// sanitized copy so the response stays valid JSON.
+json build_openai_logprobs(
+    const std::vector<TokenLogprobs> & logprobs,
+    const std::function<std::string(int32_t)> & token_bytes);
+
 // Read the required `messages` field. Throws std::invalid_argument when
 // it is missing or not a non-empty array; route_request's catch turns
 // that into a 400.
@@ -555,7 +579,8 @@ private:
         const std::vector<int32_t> & gen_tokens, int n_gen_cap,
         bool budget_forced_close, bool degenerate_decode_close,
         const GenTimings & gen_timings,
-        ClientSendBuffer * send_buffer = nullptr);
+        ClientSendBuffer * send_buffer = nullptr,
+        std::vector<TokenLogprobs> logprobs = {});
     std::string format_http_response(
         int status, const std::string & content_type,
         const std::string & body);

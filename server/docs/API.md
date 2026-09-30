@@ -75,8 +75,8 @@ under `usage.timings`:
 | `chat_template_kwargs` | object | — | Direct template control (`{"enable_thinking":true}`) | ✅ |
 | `stop` | string/array | — | Stop sequences | ✅ |
 | `n` | int | — | Number of completions | ❌ TODO |
-| `logprobs` | bool | — | Return log probabilities | ❌ TODO |
-| `top_logprobs` | int | — | Number of top logprobs per token | ❌ TODO |
+| `logprobs` | bool | `false` | Return log probabilities (non-streaming, qwen35 targets; see [Logprobs](#logprobs)) | ✅ |
+| `top_logprobs` | int | 0 | Number of top logprobs per token (0–20; requires `logprobs: true`) | ✅ |
 | `response_format` | object | — | JSON mode / structured output | ❌ TODO |
 | `tool_choice` | string/object | — | Tool choice / force tool usage | ✅ |
 | `logit_bias` | object | — | Per-token logit adjustments | ❌ TODO |
@@ -98,7 +98,38 @@ under `usage.timings`:
 | `usage.prompt_tokens` | ✅ |
 | `usage.completion_tokens` | ✅ |
 | `usage.total_tokens` | ✅ |
-| `choices[].logprobs` | ❌ TODO |
+| `choices[].logprobs` | ✅ when `logprobs: true` |
+
+### Logprobs
+
+`logprobs: true` returns, for every generated token, its log-probability and the `top_logprobs` most likely alternatives in the OpenAI shape. Values come from the raw logits row the token was chosen from: temperature, top-k/top-p and penalties change which token is picked, not the reported distribution. A token that is only part of a UTF-8 character has its exact bytes in `bytes` and U+FFFD in `token`.
+
+```bash
+curl -s http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Rate this task: rename a variable"}],
+       "max_tokens":1,"temperature":0,"logprobs":true,"top_logprobs":3}'
+```
+
+```json
+{
+  "choices": [{
+    "index": 0,
+    "message": {"role": "assistant", "content": "easy"},
+    "finish_reason": "length",
+    "logprobs": {"content": [{
+      "token": "easy", "logprob": -0.0312, "bytes": [101, 97, 115, 121],
+      "top_logprobs": [
+        {"token": "easy", "logprob": -0.0312, "bytes": [101, 97, 115, 121]},
+        {"token": "medium", "logprob": -3.52, "bytes": [109, 101, 100, 105, 117, 109]},
+        {"token": "hard", "logprob": -6.87, "bytes": [104, 97, 114, 100]}
+      ]
+    }]}
+  }]
+}
+```
+
+Limits (each returns HTTP 400): `stream: true`, endpoints other than `/v1/chat/completions`, `top_logprobs` outside 0–20 or without `logprobs: true`, and backends other than the single-device qwen35 one (layer-split, qwen35moe, DeepSeek4, Laguna, Gemma4 and Qwen3 targets). A logprobs request decodes without speculation, and on the single-request path it bypasses the prefix caches; with `--max-concurrency` it still uses prefix checkpoints, which always leave the last prompt token to prefill.
 
 ---
 
@@ -244,7 +275,7 @@ support causes errors or silent feature degradation.
 
 | Feature | Notes |
 |---------|-------|
-| **`logprobs` / `top_logprobs`** | Token probabilities in response. Debugging/analysis only. |
+| **Streaming `logprobs`** | Non-streaming chat completions return logprobs; SSE chunks do not carry them yet. |
 | **`n` (multiple completions)** | Generate N choices per request. No known agent uses this. |
 | **`logit_bias`** | Per-token logit adjustments. |
 | **`user`** | End-user identifier (tracking only). |

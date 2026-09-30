@@ -118,6 +118,12 @@ static void print_usage(const char * prog) {
         "  --load-balancing-primary-gpu <backend:gpu> Select the primary model by its target device.\n"
         "                      Defaults to the first block; request model names\n"
         "                      do not change generation routing.\n"
+        "  --model-routing <balance|name> How several model blocks share requests\n"
+        "                      (default: balance). name loads every block and runs a\n"
+        "                      request naming a block's --model-name only on that\n"
+        "                      block; omitted or auto requests still balance.\n"
+        "  --unknown-model <reject|primary> Name routing: answer an unrecognized\n"
+        "                      model name with 404 (default) or serve it on the primary.\n"
         "  --draft <path>       Draft model for speculative decode (DFlash for Qwen,\n"
         "                       Gemma and Laguna; DSpark for DeepSeek4)\n"
         "  --mmproj <path>      Vision projector GGUF: enables image input (Qwen3.5/3.8, DS4V)\n"
@@ -2038,6 +2044,9 @@ int main(int argc, char ** argv) {
     // main's argv and outlive every backend, including factories borrowing paths.
     std::vector<std::vector<char *>> model_args(1, {argv[0]});
     bool load_balancing = false;
+    auto model_routing = ServerConfig::ModelRouting::balance;
+    bool unknown_model_to_primary = false;
+    bool unknown_model_set = false;
     std::string primary_gpu;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--load-balancing") == 0) {
@@ -2052,6 +2061,25 @@ int main(int argc, char ** argv) {
             }
             primary_gpu = placement_device_name(device);
             ++i;
+        } else if (std::strcmp(argv[i], "--model-routing") == 0) {
+            const char * value = i + 1 < argc ? argv[++i] : "";
+            if (std::strcmp(value, "balance") == 0) {
+                model_routing = ServerConfig::ModelRouting::balance;
+            } else if (std::strcmp(value, "name") == 0) {
+                model_routing = ServerConfig::ModelRouting::name;
+            } else {
+                std::fprintf(stderr, "[server] --model-routing expects balance or name\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--unknown-model") == 0) {
+            const char * value = i + 1 < argc ? argv[++i] : "";
+            if (std::strcmp(value, "reject") == 0 || std::strcmp(value, "primary") == 0) {
+                unknown_model_to_primary = std::strcmp(value, "primary") == 0;
+                unknown_model_set = true;
+            } else {
+                std::fprintf(stderr, "[server] --unknown-model expects reject or primary\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--model") == 0) {
             if (i + 1 >= argc || argv[i + 1][0] == '-') {
                 std::fprintf(stderr, "[server] --model requires a model path\n");
@@ -2064,10 +2092,19 @@ int main(int argc, char ** argv) {
         }
     }
     const bool multi_model = model_args.size() > 1;
-    if (load_balancing && !multi_model) {
-        std::fprintf(stderr, "[server] --load-balancing requires at least two model blocks\n");
+    const bool name_routing = model_routing == ServerConfig::ModelRouting::name;
+    if (unknown_model_set && !name_routing) {
+        std::fprintf(stderr, "[server] --unknown-model requires --model-routing name\n");
         return 2;
     }
+    if ((load_balancing || name_routing) && !multi_model) {
+        std::fprintf(stderr, "[server] %s requires at least two model blocks\n",
+                     name_routing ? "--model-routing name" : "--load-balancing");
+        return 2;
+    }
+    // Name routing serves every block, so it loads them all under the same
+    // per-model scoping rules as load balancing.
+    if (name_routing) load_balancing = true;
     // Profile tokens are referenced by model_args for the process lifetime.
     static std::vector<std::unique_ptr<std::string>> profile_storage;
     std::vector<const luce::server::LaunchProfile *> profiles(model_args.size());
@@ -2121,8 +2158,11 @@ int main(int argc, char ** argv) {
     // Several GPU models in one process capture HIP/CUDA graphs from different
     // worker threads. Under relaxed capture, a blocking call from one worker
     // (prefix-cache checkpoint copies, host reads) invalidates the capture in
-    // flight on the other, so replicas fail intermittently. Eager launches cost
-    // ~4% on one R9700 and nothing measurable on the balanced aggregate.
+    // flight on the other, so replicas fail intermittently. This was observed
+    // with the models on different GPUs (R9700 + Strix Halo): separate devices
+    // or graph caches do not make capture safe, only keeping other workers'
+    // blocking calls out of an open capture would. Eager launches cost ~4% on
+    // one R9700 and nothing measurable on the balanced aggregate.
     // LUCE_MULTI_MODEL_GRAPHS=1 keeps graphs on (ggml reads any value of
     // GGML_CUDA_DISABLE_GRAPHS as disabled, so it cannot be the opt-out).
     if (options.size() > 1) {
@@ -2143,9 +2183,13 @@ int main(int argc, char ** argv) {
         option.sconfig.port = listener_config.port;
         option.sconfig.enable_cors = listener_config.enable_cors;
         option.sconfig.routing_queue_limit = listener_config.routing_queue_limit;
+        option.sconfig.model_routing = model_routing;
+        option.sconfig.unknown_model_to_primary = unknown_model_to_primary;
     }
     std::fprintf(stderr, "[server] load balancing %s; primary=%s target=%s\n",
-        load_balancing ? "enabled" : "disabled", options.front().sconfig.model_name.c_str(),
+        name_routing ? "by request model name (auto balances)"
+                     : load_balancing ? "enabled" : "disabled",
+        options.front().sconfig.model_name.c_str(),
         options.front().target_device_auto
             ? "auto" : placement_device_name(options.front().bargs.device).c_str());
 

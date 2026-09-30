@@ -44,3 +44,13 @@ check_launch(disabled_second_policy 1 "failed to detect architecture from ${seco
 check_launch(balanced_policy_rejected 2 "changes process-wide policy"
     "${primary}" --model-name qwen --no-fast-rollback
     --model "${secondary}" --model-name ds4 --load-balancing)
+
+# Name routing loads every block, so it applies the balanced-mode name rules.
+check_launch(name_routing_duplicate 2 "--model-name must be unique"
+    "${primary}" --model "${secondary}" --model-routing name)
+check_launch(name_routing_unique 1 "failed to detect architecture from ${primary}"
+    "${primary}" --model-name qwen --model "${secondary}" --model-name ds4
+    --model-routing name --unknown-model primary)
+check_launch(unknown_model_needs_name_routing 2 "--unknown-model requires --model-routing name"
+    "${primary}" --model-name qwen --model "${secondary}" --model-name ds4
+    --load-balancing --unknown-model primary)

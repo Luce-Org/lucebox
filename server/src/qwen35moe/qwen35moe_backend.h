@@ -30,6 +30,8 @@ public:
                                              const GenerateRequest & req,
                                              const DaemonIO & io) override;
     bool supports_dflash_spec_decode() const override { return true; }
+    // Its own generate paths do not fill GenerateResult::logprobs.
+    bool supports_logprobs() const override { return false; }
 
     bool set_routing_collector(MoeRoutingCollector * c) override { routing_collector_ = c; return true; }
     const MoeHybridRoutingStats * get_routing_stats() const override { return routing_stats_.get(); }

@@ -184,6 +184,11 @@ struct ModelBackend {
     virtual GenerateResult generate_impl(const GenerateRequest & req,
                                          const DaemonIO & io) = 0;
 
+    // Whether generate() (with force_ar_decode) and seq_engine() fill
+    // per-token log-probabilities when sampler.wants_logprobs(). The server
+    // rejects logprobs requests for backends that do not.
+    virtual bool supports_logprobs() const { return false; }
+
     // ── Concurrent serving ───────────────────────────────────────────
     // Backends that can hold several live sequences at once and execute a
     // batched decode over paged KV expose them as decode slots through a

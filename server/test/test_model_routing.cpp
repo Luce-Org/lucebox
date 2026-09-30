@@ -280,7 +280,9 @@ public:
 
 struct RoutedBackend : ModelBackend {
     HeldEngine engine;
+    bool logprobs = false;
     SeqEngine * seq_engine() override { return &engine; }
+    bool supports_logprobs() const override { return logprobs; }
     void print_ready_banner() const override {}
     bool park(ParkTarget) override { return true; }
     bool unpark(ParkTarget) override { return true; }
@@ -387,7 +389,9 @@ public:
 
     explicit RunningModels(bool single_peer = false, bool single_listener = false,
                            bool load_balancing = true, int queue_limit = 0,
-                           bool reverse_priority = false, size_t offload_bytes = 0) {
+                           bool reverse_priority = false, size_t offload_bytes = 0,
+                           ServerConfig::ModelRouting routing = ServerConfig::ModelRouting::balance,
+                           bool unknown_to_primary = false) {
         load_tokenizer(first_tok, false);
         load_tokenizer(second_tok, true);
         // Obtain a loopback test port from the OS, then hand it to HttpServer.
@@ -405,6 +409,8 @@ public:
         config.model_name = "qwen";
         config.max_ctx = 64;
         config.routing_queue_limit = queue_limit;
+        config.model_routing = routing;
+        config.unknown_model_to_primary = unknown_to_primary;
         config.decode_kv_offload_bytes = offload_bytes;
         config.default_max_tokens = 4;
         config.prefix_cache_cap = 0;
@@ -947,6 +953,65 @@ TEST_CASE(ModelRoutingFixture, test_reversed_priority_ignores_generation_model_n
         models.second.engine.capacity_busy = true;
     }
     ROUTING_CHECK(response_body(models.post(chat("ds4")).read())["model"] == "qwen");
+}
+
+// Name routing pins a named request to its model: it waits for that model's
+// capacity instead of spilling onto an idle one, while auto still balances.
+TEST_CASE(ModelRoutingFixture, test_name_routing_pins_named_requests_without_spilling) {
+    using Routing = ServerConfig::ModelRouting;
+    RunningModels models(false, false, true, 1, false, 0, Routing::name);
+    ROUTING_CHECK(models.get("/v1/models")["data"].size() == 2);
+    ROUTING_CHECK(models.get("/status/json")["routing"] == "by-name");
+    auto a = models.post(chat("ds4"));
+    auto b = models.post(chat("ds4"));
+    models.second.engine.wait_admissions(2);
+    auto waiting = models.post(chat("ds4"));
+    const auto deadline = Clock::now() + 5s;
+    while (models.get("/status/json")["waiting"] != 1) {
+        ROUTING_CHECK(Clock::now() < deadline);
+        std::this_thread::yield();
+    }
+    ROUTING_CHECK(models.first.engine.admissions == 0);
+    const json unknown = response_body(models.post(chat("gpt-4o")).read(), 404);
+    ROUTING_CHECK(unknown["error"]["message"].get<std::string>().find(
+        "available models: qwen, ds4") != std::string::npos);
+    response_body(models.post(chat("gpt-4o"), "/v1/messages/count_tokens").read(), 404);
+    models.first.engine.finish();
+    ROUTING_CHECK(response_body(models.post(chat("auto")).read())["model"] == "qwen");
+    ROUTING_CHECK(response_body(models.post(chat("qwen")).read())["model"] == "qwen");
+    models.second.engine.finish();
+    for (Socket * client : {&a, &b, &waiting}) {
+        ROUTING_CHECK(response_body(client->read())["model"] == "ds4");
+    }
+    ROUTING_CHECK(models.second.engine.admissions == 3);
+}
+
+TEST_CASE(ModelRoutingFixture, test_name_routing_can_serve_unknown_names_on_primary) {
+    RunningModels models(false, false, true, 0, false, 0,
+                         ServerConfig::ModelRouting::name, true);
+    models.first.engine.finish();
+    models.second.engine.finish();
+    ROUTING_CHECK(response_body(models.post(chat("gpt-4o")).read())["model"] == "qwen");
+    ROUTING_CHECK(response_body(models.post(chat("gpt-4o"), "/v1/messages/count_tokens").read())["input_tokens"] == 1);
+    ROUTING_CHECK(models.second.engine.admissions == 0);
+}
+
+// Logprobs support belongs to the model that serves the request, not to the
+// listener's primary.
+TEST_CASE(ModelRoutingFixture, test_logprobs_support_is_decided_by_the_routed_model) {
+    RunningModels models(false, false, true, 0, false, 0, ServerConfig::ModelRouting::name);
+    models.second.logprobs = true;
+    models.first.engine.finish();
+    models.second.engine.finish();
+    auto request = chat("ds4");
+    request["logprobs"] = true;
+    request["top_logprobs"] = 2;
+    const json served = response_body(models.post(request).read());
+    ROUTING_CHECK(served["model"] == "ds4");
+    ROUTING_CHECK(served["choices"][0].contains("logprobs"));
+    request["model"] = "qwen";
+    response_body(models.post(request).read(), 400);
+    ROUTING_CHECK(models.first.engine.admissions == 0);
 }
 
 // These tests exercise live HTTP ownership during decode growth. Earlier

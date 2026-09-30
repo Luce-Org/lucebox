@@ -657,6 +657,7 @@ add_library(luce_common STATIC
     src/qwen35/layer_split_daemon_loop.cpp
     src/qwen35/qwen35_daemon.cpp
     src/common/sampler.cpp
+    src/common/token_logprobs.cpp
     src/common/backend_precision.cpp
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
@@ -2180,6 +2181,7 @@ if(LUCE_TESTS)
             test/test_bandit_integration.cpp
             test/test_admission.cpp
             test/test_restore_delta.cpp
+            test/test_token_logprobs.cpp
             test/test_chain_rollback_policy.cpp
             test/test_ddtree_tau.cpp
             test/test_anchor_transitive.cpp

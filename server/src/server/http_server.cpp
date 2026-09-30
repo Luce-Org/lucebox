@@ -30,6 +30,7 @@
 #include "common/kv_rotation.h"
 #include "common/sha1.h"
 #include "freeze_history.h"
+#include "utf8_utils.h"
 
 #ifdef LUCE_HAS_CURL
 #include <curl/curl.h>
@@ -639,6 +640,66 @@ SamplerCfg parse_request_sampler(const json & body,
         sampler.rep_window = body["rep_window"].get<int>();
     }
     return sampler;
+}
+
+int parse_request_logprobs(const json & body, ApiFormat format) {
+    const bool has_top = body.contains("top_logprobs") &&
+                         !body["top_logprobs"].is_null();
+    bool enabled = false;
+    if (body.contains("logprobs") && !body["logprobs"].is_null()) {
+        if (!body["logprobs"].is_boolean()) {
+            throw std::invalid_argument("logprobs must be a boolean");
+        }
+        enabled = body["logprobs"].get<bool>();
+    }
+    if (!enabled) {
+        if (has_top) {
+            throw std::invalid_argument(
+                "top_logprobs requires logprobs to be true");
+        }
+        return -1;
+    }
+    if (format != ApiFormat::OPENAI_CHAT) {
+        throw std::invalid_argument(
+            "logprobs is only supported on /v1/chat/completions");
+    }
+    if (!has_top) return 0;
+    if (!body["top_logprobs"].is_number_integer()) {
+        throw std::invalid_argument("top_logprobs must be an integer");
+    }
+    const int64_t top = body["top_logprobs"].get<int64_t>();
+    if (top < 0 || top > kMaxTopLogprobs) {
+        throw std::invalid_argument(
+            "top_logprobs must be between 0 and " +
+            std::to_string(kMaxTopLogprobs));
+    }
+    return (int) top;
+}
+
+json build_openai_logprobs(
+        const std::vector<TokenLogprobs> & logprobs,
+        const std::function<std::string(int32_t)> & token_bytes) {
+    // OpenAI reports -9999.0 for tokens it considers impossible; JSON has no
+    // -infinity (nlohmann would write null).
+    auto entry = [&](const TokenLogprob & lp) {
+        const std::string raw = token_bytes(lp.token);
+        json bytes = json::array();
+        for (unsigned char c : raw) bytes.push_back((int) c);
+        return json{
+            {"token", utf8_sanitize(raw)},
+            {"logprob", std::isfinite(lp.logprob) ? lp.logprob : -9999.0f},
+            {"bytes", std::move(bytes)},
+        };
+    };
+    json content = json::array();
+    for (const TokenLogprobs & position : logprobs) {
+        json item = entry(position.chosen);
+        json top = json::array();
+        for (const TokenLogprob & alt : position.top) top.push_back(entry(alt));
+        item["top_logprobs"] = std::move(top);
+        content.push_back(std::move(item));
+    }
+    return {{"content", std::move(content)}};
 }
 
 json require_messages_array(const json & body) {
@@ -1922,9 +1983,28 @@ bool HttpServer::route_model_request(SocketHandle fd, ParsedRequest & req,
         send_error(fd, 400, "token counting requires an explicit model name");
         return true;
     }
-    // Generation always follows operator priority. Only token counting needs
-    // an explicit tokenizer, since no generating model has been selected yet.
-    const bool automatic = !count_only;
+    // Token counting needs the named model's tokenizer. Generation follows
+    // operator priority unless name routing pins a request to the model it
+    // names; a pinned request waits for that model and never spills over.
+    const bool by_name = config_.model_routing == ServerConfig::ModelRouting::name;
+    RoutedModel * pinned = nullptr;
+    if (count_only || (by_name && !unnamed)) {
+        for (auto & model : models_) {
+            if (model.server->config_.model_name == requested) pinned = &model;
+        }
+        if (!pinned && by_name && config_.unknown_model_to_primary) {
+            pinned = &models_.front();
+        }
+        if (!pinned) {
+            std::string names;
+            for (const auto & model : models_) {
+                names += (names.empty() ? "" : ", ") + model.server->config_.model_name;
+            }
+            send_error(fd, 404, "unknown model '" + requested + "'; available models: " + names);
+            return true;
+        }
+    }
+    const bool automatic = pinned == nullptr;
 
     // A routing reservation owns a backend slot through retirement and output
     // draining. Engine admission, on its worker, remains the KV authority.
@@ -1955,10 +2035,8 @@ bool HttpServer::route_model_request(SocketHandle fd, ParsedRequest & req,
     for (;;) {
         if (http_detail::inspect_peer_socket(fd) ==
                 http_detail::PeerSocketState::Disconnected) return true;
-        bool known = automatic;
         for (auto & model : models_) {
-            if (!automatic && requested != model.server->config_.model_name) continue;
-            known = true;
+            if (pinned && &model != pinned) continue;
             if (unfit.count(model.server)) continue;
             {
                 std::lock_guard<std::mutex> lock(routing_mu_);
@@ -1990,11 +2068,7 @@ bool HttpServer::route_model_request(SocketHandle fd, ParsedRequest & req,
             send_error(fd, 400, "request exceeds the context or KV pool capacity of every model");
             return true;
         }
-        if (!known) {
-            send_error(fd, 404, "unknown model '" + requested + "'");
-            return true;
-        }
-        if (!automatic || stopping_.load()) {
+        if (count_only || stopping_.load()) {
             send_error(fd, 503, "no available model capacity or server stopping");
             return true;
         }
@@ -2035,7 +2109,8 @@ json HttpServer::model_routing_status() {
             {"props", std::move(props)},
             {"status", server.status_.to_json()}});
     }
-    return {{"routing", "primary-first"}, {"waiting", routing_waiters_},
+    const bool by_name = config_.model_routing == ServerConfig::ModelRouting::name;
+    return {{"routing", by_name ? "by-name" : "primary-first"}, {"waiting", routing_waiters_},
             {"queue_limit", config_.routing_queue_limit}, {"models", models}};
 }
 
@@ -2064,6 +2139,19 @@ bool HttpServer::parse_common_request_fields(
     }
 
     req.sampler = parse_request_sampler(body, config_.sampler_defaults);
+    req.sampler.logprobs_top_n = parse_request_logprobs(body, req.format);
+    if (req.sampler.wants_logprobs()) {
+        // Logprobs are read per token on the plain decode path; the SSE
+        // emitter has no per-token logprobs channel yet.
+        if (req.stream) {
+            send_error(fd, 400, "logprobs is not supported with stream=true");
+            return false;
+        }
+        if (!backend_.supports_logprobs()) {
+            send_error(fd, 400, "logprobs is not supported by this model backend");
+            return false;
+        }
+    }
     if (body.contains("tools")) req.tools = body["tools"];
     // Tool choice constraint for hint generation.
     if (body.contains("tool_choice")) req.tool_choice = body["tool_choice"];
@@ -2778,6 +2866,11 @@ json build_openai_completion_response(
         {"message", message},
         {"finish_reason", finish_reason},
     };
+    if (req.sampler.wants_logprobs() && tokenizer) {
+        choice["logprobs"] = build_openai_logprobs(
+            result.logprobs,
+            [tokenizer](int32_t id) { return tokenizer->token_text(id); });
+    }
     if (req.thinking_opt_in) {
         // finish_details mirrors ds4_eval.c's eval_think_close_info.
         // close_kind is "natural" when the model closed its own thinking
@@ -3529,7 +3622,10 @@ bool HttpServer::forward_upstream(
 HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,
         GenerateRequest & generate_request) {
-    if (req.images) return {};
+    // Logprobs need the prefill logits row, which an exact snapshot hit
+    // skips; logprobs requests are short classification prompts, so they
+    // bypass the prefix caches entirely.
+    if (req.images || req.sampler.wants_logprobs()) return {};
     auto & effective_prompt = prepared.tokens;
     // Tool-heavy requests prefer the reusable system/tool boundary under eviction.
     const bool prefer_inline_snap = !req.tools.empty();
@@ -3951,7 +4047,7 @@ void HttpServer::finalize_generation_cache(
         GenerationCacheState & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected) {
-    if (req.images) return;
+    if (req.images || req.sampler.wants_logprobs()) return;
     const auto & effective_prompt = prepared.tokens;
     const bool generation_produced_output = result.ok() &&
         completion_tokens > 0 && visible_output_seen && !client_disconnected;
@@ -4465,7 +4561,8 @@ void HttpServer::send_nonstream_response(
         const std::vector<int32_t> & gen_tokens, int n_gen_cap,
         bool budget_forced_close, bool degenerate_decode_close,
         const GenTimings & gen_timings,
-        ClientSendBuffer * send_buffer) {
+        ClientSendBuffer * send_buffer,
+        std::vector<TokenLogprobs> logprobs) {
     CompletionTokenCounts counts;
     counts.total = (int) gen_tokens.size();
     const bool is_eos = !gen_tokens.empty() &&
@@ -4481,6 +4578,7 @@ void HttpServer::send_nonstream_response(
     result.tokens = gen_tokens;
     result.budget_forced_close = budget_forced_close;
     result.degenerate_decode_close = degenerate_decode_close;
+    result.logprobs = std::move(logprobs);
 
     const json response = build_non_streaming_response(
         req, result, n_gen_cap, gen_timings, counts, emitter, &tokenizer_);

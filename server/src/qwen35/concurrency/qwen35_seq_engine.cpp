@@ -226,6 +226,7 @@ bool Qwen35SeqEngine::chain_spec_input_capable(
     }
     const Qwen35Slot & slot = slots_.slot(input.slot);
     return slot.decoding() && !slot.sampler.needs_logit_processing() &&
+           !slot.sampler.wants_logprobs() &&
            slot.cur_pos >= 1 &&
            slot.cur_pos + fixed_chain_.width <= slots_.max_context();
 }
@@ -611,7 +612,8 @@ PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
 
 int32_t Qwen35SeqEngine::sample_graph_row(
         int slot, int logits_row, const int32_t * cached_argmax,
-        std::vector<float> * logits_scratch) {
+        std::vector<float> * logits_scratch,
+        std::optional<TokenLogprobs> * logprobs_out) {
     const TargetWeights & w = b_.w_;
     const int vocab = w.n_vocab;
     Qwen35Slot & seq = slots_.slot(slot);
@@ -637,9 +639,23 @@ int32_t Qwen35SeqEngine::sample_graph_row(
             (size_t)logits_row * sizeof(int32_t), sizeof(int32_t));
         ggml_backend_synchronize(b_.target_backend_);
     }
-    return b_.apply_min_tokens_floor(
+    token = b_.apply_min_tokens_floor(
         token, seq.generated_tokens(),
         (size_t)logits_row * (size_t)vocab * sizeof(float));
+    if (logprobs_out && token >= 0 && seq.sampler.wants_logprobs()) {
+        std::vector<float> local_logits;
+        std::vector<float> & logits = logits_scratch
+            ? *logits_scratch
+            : local_logits;
+        logits.resize((size_t)vocab);
+        ggml_backend_tensor_get(
+            b_.sg_.logits, logits.data(),
+            (size_t)logits_row * (size_t)vocab * sizeof(float),
+            sizeof(float) * (size_t)vocab);
+        *logprobs_out = compute_token_logprobs(
+            logits.data(), vocab, token, seq.sampler.logprobs_top_n);
+    }
+    return token;
 }
 
 bool Qwen35SeqEngine::upload_block_table_delta(
@@ -882,6 +898,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         int position = -1;
         int64_t physical_row = -1;
         int32_t pending = -1;
+        std::optional<TokenLogprobs> logprobs;
     };
 
     const int full_width = fixed_chain_.width;
@@ -1357,7 +1374,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         ArLane & lane = ar_lanes[static_cast<size_t>(lane_index)];
         lane.pending = sample_graph_row(
             lane.slot, lane_index,
-            &posterior[static_cast<size_t>(lane_index)], &logits_buf_);
+            &posterior[static_cast<size_t>(lane_index)], &logits_buf_,
+            &lane.logprobs);
         if (lane.pending < 0) {
             result.error = "compact AR sampling failed";
             return result;
@@ -1392,8 +1410,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
                 proposal.tokens.begin() + 1,
                 proposal.tokens.begin() + proposal.accepted);
         } else {
-            output.token =
-                ar_lanes[static_cast<size_t>(ar_for_input[i])].pending;
+            ArLane & lane = ar_lanes[static_cast<size_t>(ar_for_input[i])];
+            output.token = lane.pending;
+            output.logprobs = std::move(lane.logprobs);
         }
         result.decode.push_back(std::move(output));
     }
@@ -1819,7 +1838,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         slots_.commit_step(out.slot);
         const int row = decode_row0 + output_rows_[oi];
         out.token = sample_graph_row(
-            out.slot, row, &argmax_buf_[(size_t)row], &logits_buf_);
+            out.slot, row, &argmax_buf_[(size_t)row], &logits_buf_,
+            &out.logprobs);
     }
 
     int commit_row = 0;
@@ -1837,7 +1857,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             out.status = PrefillOutput::Status::completed;
             out.token = sample_graph_row(
                 slot, commit_row, &argmax_buf_[(size_t)commit_row],
-                &logits_buf_);
+                &logits_buf_, &out.logprobs);
             ++commit_row;
             slots_.commit_prefill(slot);
         }

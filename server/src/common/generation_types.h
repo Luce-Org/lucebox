@@ -10,6 +10,7 @@
 
 #include "image_prompt.h"
 #include "sampler.h"
+#include "token_logprobs.h"
 
 namespace luce::common {
 
@@ -104,6 +105,9 @@ struct GenerateResult {
     // A producer must explicitly call succeed() before returning success.
     std::optional<GenerateError> error = GenerateError{};
     std::vector<int32_t> tokens;
+    // One entry per token when sampler.wants_logprobs() and the backend
+    // supports it; empty otherwise.
+    std::vector<TokenLogprobs> logprobs;
     double prefill_s = 0.0;
     double decode_s = 0.0;
     // Prompt tokens confirmed by the backend's physical snapshot restore.

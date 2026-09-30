@@ -48,6 +48,8 @@ struct SchedSlot {
     std::optional<ResponseError> error;
     bool finished = false;
     std::vector<int32_t> gen_tokens;   // committed + pending, in order
+    // Parallel to gen_tokens when the request asked for logprobs.
+    std::vector<TokenLogprobs> logprobs;
     int32_t pending_tok = -1;          // sampled, fed back next step
     // Buffered client output (see client_send_buffer.h): chunks append here and
     // a non-blocking flush runs every scheduler iteration, so one slow
@@ -217,9 +219,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // delta into send_buffer, and parks the token in pending_tok as the next
     // step's input for this slot. Sets s.finished — but never retires the
     // slot — on EOS, gen cap, stop-sequence hit, or degenerate repetition.
-    auto advance_slot = [&](SchedSlot & s, int32_t tok) {
+    // `logprobs` is the engine's report for the sampled token, if any.
+    auto advance_slot = [&](SchedSlot & s, int32_t tok,
+                            const std::optional<TokenLogprobs> & logprobs) {
         maybe_force_close(s, tok);
         s.gen_tokens.push_back(tok);
+        if (logprobs) s.logprobs.push_back(*logprobs);
         const bool cont = deliver_generation_token(
             s.job, s.job->req, *s.emitter, tok, s.completion_tokens,
             s.send_buffer);
@@ -326,7 +331,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             send_nonstream_response(req, s.fd, *s.emitter, s.gen_tokens,
                                     s.n_gen_cap, s.budget_forced_close,
                                     s.degenerate_close, gen_timings,
-                                    &s.send_buffer);
+                                    &s.send_buffer, std::move(s.logprobs));
         }
 
         const double elapsed_s = std::chrono::duration<double>(
@@ -980,9 +985,14 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 s.finished = true;
                 continue;
             }
+            // Only the final token carries logprobs; slots that asked for
+            // them never speculate, so it is the only token.
+            size_t consumed = 0;
             consume_decode_output_tokens(out, [&](int32_t token) {
                 if (s.finished) return false;
-                advance_slot(s, token);
+                const bool last = consumed++ == out.committed_tokens.size();
+                advance_slot(s, token,
+                             last ? out.logprobs : std::optional<TokenLogprobs>{});
                 return !s.finished;
             });
         }
@@ -1037,7 +1047,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     s.prefill_s = std::chrono::duration<double>(
                         s.decode_started_at - s.started_at).count();
                 }
-                advance_slot(s, out.token);
+                advance_slot(s, out.token, out.logprobs);
                 continue;
             }
         }

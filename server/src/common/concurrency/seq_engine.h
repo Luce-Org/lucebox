@@ -51,11 +51,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "common/image_prompt.h"
 #include "common/sampler.h"
+#include "common/token_logprobs.h"
 #include "prefix_store.h"
 
 namespace luce::common {
@@ -232,6 +234,9 @@ public:
         // per-request error instead of silently truncating generation.
         std::string error;
         std::vector<int32_t> committed_tokens;
+        // Log-probabilities of `token` when the slot's sampler asked for them
+        // (such slots never speculate, so committed_tokens stays empty).
+        std::optional<TokenLogprobs> logprobs;
     };
 
     struct PrefillOutput {
@@ -246,6 +251,8 @@ public:
         // Present only for completed: the request's first sampled token,
         // pending until the scheduler feeds it into the next decode step.
         int32_t token = -1;
+        // Log-probabilities of `token`, as for DecodeOutput.
+        std::optional<TokenLogprobs> logprobs;
         // Present only for failed.
         std::string error;
         // A capture ending on this successfully-computed prefill boundary.

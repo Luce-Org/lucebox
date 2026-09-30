@@ -860,6 +860,15 @@ int32_t Qwen35Backend::apply_min_tokens_floor(int32_t tok, int generated,
     return alt;
 }
 
+void Qwen35Backend::record_ar_logprobs(size_t logits_offset, int32_t token) {
+    const int vocab = w_.n_vocab;
+    std::vector<float> row((size_t)vocab);
+    ggml_backend_tensor_get(sg_.logits, row.data(), logits_offset,
+                            sizeof(float) * (size_t)vocab);
+    ar_logprobs_.push_back(compute_token_logprobs(
+        row.data(), vocab, token, sampler_.logprobs_top_n));
+}
+
 SeqEngine * Qwen35Backend::seq_engine() {
     return seq_engine_.get();
 }
@@ -1483,6 +1492,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     if (req.do_sample && sampler_.seed != 0) {
         sampler_rng_.seed(sampler_.seed);
     }
+    ar_logprobs_.clear();
 
     // Zero delta-net recurrent state (SSM + conv) so a fresh prompt doesn't
     // inherit stale hidden state from the previous request. KV cache is
@@ -1576,7 +1586,9 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
         }
         // Image requests speculate too: the verify target shifts its rotary
         // positions by rope_delta_, and the drafter only proposes tokens.
-        if (cfg_.paged_attention || req.force_ar_decode) {
+        // Logprobs are recorded by AR decode only.
+        if (cfg_.paged_attention || req.force_ar_decode ||
+            req.sampler.wants_logprobs()) {
             decode_ok = do_ar_decode(committed, ar_n_gen, result.tokens, out_io,
                                      req.budget_hook,
                                      &result.budget_forced_close,
@@ -1611,6 +1623,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
+    result.logprobs = std::move(ar_logprobs_);
     result.succeed();
     return result;
 }
@@ -1657,6 +1670,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     if (req.do_sample && sampler_.seed != 0) {
         sampler_rng_.seed(sampler_.seed);
     }
+    ar_logprobs_.clear();
 
     const int snap_pos = prefix_snapshots_[slot].cur_pos;
     cache_.cur_pos = snap_pos;
@@ -1728,6 +1742,12 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         // BEFORE its own build_target_step, so a null/freed graph tensor aborts
         // in ggml_backend_tensor_set. Build a single-token decode step graph at
         // the restored position now, mirroring do_ar_decode's per-step build.
+        if (req.sampler.wants_logprobs()) {
+            // No prefill ran, so there is no logits row for the first token.
+            result.fail(GenerateErrorCode::BackendSpecific,
+                        "logprobs are unavailable on an exact snapshot hit");
+            return result;
+        }
         const bool pool = kvflash_active();
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/cache_.cur_pos, /*n_tokens=*/1,
@@ -1760,7 +1780,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         // generation. Most requests never hit the tail because the
         // model closes </think> naturally well before the budget edge.
         bool decode_ok = false;
-        if (req.force_ar_decode) {
+        if (req.force_ar_decode || req.sampler.wants_logprobs()) {
             decode_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io,
                                      req.budget_hook,
                                      &result.budget_forced_close,
@@ -1795,6 +1815,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
+    result.logprobs = std::move(ar_logprobs_);
     result.succeed();
     return result;
 }
@@ -2411,6 +2432,14 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             first_tok = cache_.last_tok;
         }
         maybe_force_close(first_tok);
+        if (sampler_.wants_logprobs()) {
+            // An exact snapshot hit decodes without prefill logits.
+            if (!prefill_last_logits_valid_) {
+                set_last_error("logprobs need the prefill logits row");
+                return false;
+            }
+            record_ar_logprobs(prefill_last_logits_offset_, first_tok);
+        }
         out_tokens.push_back(first_tok);
         io.emit(first_tok);
         if (kvflash_active()) kvflash_history_.push_back(first_tok);
@@ -2550,6 +2579,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             next_tok, (int)out_tokens.size(), /*logits_row_offset=*/0);
 
         maybe_force_close(next_tok);
+        if (sampler_.wants_logprobs()) record_ar_logprobs(0, next_tok);
 
         out_tokens.push_back(next_tok);
         io.emit(next_tok);

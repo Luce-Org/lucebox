@@ -130,6 +130,9 @@ public:
 
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
+    // AR decode and the concurrent engine report logprobs; a logprobs request
+    // never speculates (see generate_impl).
+    bool supports_logprobs() const override { return true; }
 
     bool snapshot_save(int slot) override;
     void snapshot_free(int slot) override;
@@ -339,6 +342,13 @@ private:
     // without deriving a chunk-local offset from absolute KV position.
     std::size_t     prefill_last_logits_offset_ = 0;
     bool            prefill_last_logits_valid_  = false;
+
+    // do_ar_decode's per-token log-probabilities when sampler_ asks for
+    // them; moved into GenerateResult::logprobs by the generate paths.
+    std::vector<TokenLogprobs> ar_logprobs_;
+    // Appends the log-probabilities of `token` from the sg_.logits row at
+    // byte offset `logits_offset`.
+    void record_ar_logprobs(std::size_t logits_offset, int32_t token);
 
     // The single-request path owns one live sequence. The allocator and
     // attention op are sequence-aware; concurrent serving uses the engine
