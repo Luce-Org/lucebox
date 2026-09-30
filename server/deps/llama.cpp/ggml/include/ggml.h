@@ -630,6 +630,7 @@ extern "C" {
         GGML_OP_DS4_MOE_COMBINE,
 
         GGML_OP_HC_COMBINE_NORM,  // Fused hyper-connection combine + next stream rms-norm
+        GGML_OP_GATED_RMS_NORM_F16, // rms_norm(x) * gamma * sigmoid(z) -> F16 (qwen4exp GDN tail)
 
         GGML_OP_COUNT,
     };
@@ -2897,6 +2898,35 @@ extern "C" {
             struct ggml_tensor  * block_out,
             struct ggml_tensor  * gamma,
             float                 s1, float b1, float s2, float b2, float eps);
+
+    // HC_COMBINE_NORM whose block output is the MoE combine, computed in the same kernel:
+    // block_out = sum_e down[:,e]*weights[e] + shared*sigmoid(shared_logit). down [n_embd, n_used, T],
+    // weights [n_used, T], shared [n_embd, T], shared_logit [1, T]. Same packed result as ggml_hc_combine_norm.
+    GGML_API struct ggml_tensor * ggml_hc_combine_norm_moe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * inject,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * shared,
+            struct ggml_tensor  * shared_logit,
+            struct ggml_tensor  * gamma,
+            float                 s1, float b1, float s2, float b2, float eps);
+
+    // rms_norm(x) * gamma * sigmoid(z) per row of x->ne[0], written as F16 [x->ne[0]*x->ne[1], x->ne[2]].
+    // x is [ncols, heads, tokens]; gamma has ncols or ncols*heads elements; z is [ncols*heads, tokens].
+    GGML_API struct ggml_tensor * ggml_gated_rms_norm_f16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * z,
+            float                 eps);
+
+    // sigmoid(z) * x -> F16 (gamma == NULL form of ggml_gated_rms_norm_f16); z may be a strided [ncols, heads, tokens] view.
+    GGML_API struct ggml_tensor * ggml_gated_f16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * z);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

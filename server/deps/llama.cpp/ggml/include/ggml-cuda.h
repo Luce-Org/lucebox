@@ -228,6 +228,11 @@ GGML_BACKEND_API bool ggml_cuda_rocmfp2_mix_register_host(
 GGML_BACKEND_API void ggml_cuda_rocmfp2_mix_unregister(const void * base);
 GGML_BACKEND_API void ggml_cuda_rocmfp3_mix_unregister(const void * base);
 
+// True when a matmul with weight w over n_tokens rows can take an F16 activation (HIP MMB Q8_0 -> F16 route).
+GGML_BACKEND_API bool ggml_backend_cuda_mmb_f16_input_ok(const struct ggml_tensor * w, int64_t n_tokens);
+// True when MMB serves the prefill GEMMs of an n_tokens batch on the current device (gfx1151, GGML_CUDA_MMB=1).
+GGML_BACKEND_API bool ggml_backend_cuda_mmb_prefill(int64_t n_tokens);
+
 #ifdef  __cplusplus
 }
 #endif

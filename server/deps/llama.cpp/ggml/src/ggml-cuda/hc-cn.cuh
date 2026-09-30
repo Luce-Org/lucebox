@@ -15,6 +15,14 @@ struct ggml_cuda_hc_combine_norm_args {
     const uint16_t *    res_in_bf16  = nullptr;   // `residual` is BF16 in place (marked bf16-only)
     const uint16_t *    blk_in_bf16  = nullptr;
     uint16_t *          res_out_bf16 = nullptr;
+    // MoE mode (block_out unused): block_out[t] = sum_e down[t,e]*w[t,e] (route order, weight-0 routes skipped)
+    // + shared[t]*sigmoid(shared_logit[t]), the exact arithmetic of DS4_MOE_COMBINE after the gated shared-expert MUL.
+    const ggml_tensor * moe_down     = nullptr;   // [n_embd, n_used, T] F32
+    const ggml_tensor * moe_w        = nullptr;   // [n_used, T]        F32
+    const ggml_tensor * moe_shared   = nullptr;   // [n_embd, T]        F32 (before the sigmoid gate)
+    const ggml_tensor * moe_sh_logit = nullptr;   // [1, T]             F32
+    bool                moe_down_f16 = false;     // moe_down holds F16 in place (F16-only mark)
+    int8_t *            out_q8       = nullptr;   // Q8 activation tiles of xn for the W8A8 HC down (mmb-w8a8.cuh layout)
 };
 
 bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & args, int warp_size);

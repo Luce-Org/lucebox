@@ -2092,6 +2092,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_HC_COMBINE_NORM:
             GGML_ABORT("GGML_OP_HC_COMBINE_NORM is only supported on the CUDA/HIP backend");
+        case GGML_OP_GATED_RMS_NORM_F16:
+            GGML_ABORT("GGML_OP_GATED_RMS_NORM_F16 is only supported on the CUDA/HIP backend");
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);

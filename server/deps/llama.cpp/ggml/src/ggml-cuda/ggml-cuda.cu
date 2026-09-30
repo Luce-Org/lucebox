@@ -40,6 +40,7 @@
 #include "ggml-cuda/mmb.cuh"
 #include "ggml-cuda/hc-mix.cuh"
 #include "ggml-cuda/hc-cn.cuh"
+#include "ggml-cuda/gated-norm.cuh"
 #include "ggml-cuda/ple-conv.cuh"
 #include "ggml-cuda/gdn-conv.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -104,6 +105,7 @@
 #include <cstring>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <array>
 #include <cstdlib>
 #include <string>
@@ -116,6 +118,7 @@ static std::map<uint64_t, double> g_mm_ms;
 static std::map<uint64_t, long long> g_mm_n;
 #if defined(GGML_USE_HIP)
 static std::unordered_map<const ggml_tensor *, const ggml_tensor *> g_hc_marked_xn;
+static std::unordered_set<const ggml_tensor *> g_hc_q8_xn;   // marked combines whose xn feeds a W8A8-eligible Q8_0 GEMM
 #endif
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -3008,7 +3011,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const char * ref = getenv("QWEN4EXP_UPSTREAM");
         return !(e && atoi(e) == 0) && !(ref && atoi(ref));
     }();
-    const bool measured_dense = table && tokens == 16366 &&
+    const bool measured_dense = table && tokens == 16366 && src1->type == GGML_TYPE_F32 &&
         !ggml_backend_buft_is_cuda_split(src0->buffer->buft) &&
         ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
         ggml_cuda_mmb_supported_mm(src0, src1, dst);
@@ -3594,6 +3597,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+#if defined(GGML_USE_HIP)
+// hc_combine_norm emits Q8 tiles of a bf16-only xn that feeds a Q8_0 GEMM, and that HC down projection runs W8A8 on
+// int8 WMMA (quality-gated E413, -32 ms/chunk E415). Default on; LUCE_MMB_HCDOWN_I8=0 is the kill switch.
+static bool hcdown_i8() { static const bool on = !(getenv("LUCE_MMB_HCDOWN_I8") && atoi(getenv("LUCE_MMB_HCDOWN_I8")) == 0); return on; }
+#endif
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
 #if defined(GGML_USE_HIP)
     // A bf16-only tensor holds only its bf16 form; an unfused op reading it would read garbage.
@@ -3604,7 +3613,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             if (ggml_cuda_mmb_is_bf16_only(src) || (src->view_src && ggml_cuda_mmb_is_bf16_only(src->view_src))) {
                 GGML_ABORT("MMB: %s(%s) reads BF16-only tensor %s through the unfused path", ggml_op_name(dst->op), dst->name, src->name);
             }
+            if (ggml_cuda_mmb_is_f16_only(src) && !(dst->op == GGML_OP_HC_COMBINE_NORM && s == 2 &&
+                    ggml_get_op_params_i32(dst, 5) == 1)) {
+                GGML_ABORT("MMB: %s(%s) reads F16-only tensor %s outside the MoE-mode HC combine", ggml_op_name(dst->op), dst->name, src->name);
+            }
         }
+    }
+    if (ggml_cuda_mmb_marks_count() > 0 && dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID &&
+            (ggml_cuda_mmb_is_bf16_only(dst) || ggml_cuda_mmb_is_f16_only(dst))) {
+        GGML_ABORT("MMB: %s(%s) writes a BF16/F16-only tensor through the unfused path", ggml_op_name(dst->op), dst->name);
     }
 #endif // defined(GGML_USE_HIP)
     switch (dst->op) {
@@ -3784,11 +3801,41 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_ds4_moe_combine(ctx, dst);
             break;
 #if defined(GGML_USE_HIP)
+        case GGML_OP_GATED_RMS_NORM_F16:
+            ggml_cuda_op_gated_rms_norm_f16(ctx, dst);
+            break;
         case GGML_OP_HC_COMBINE_NORM: {
             const int64_t n_embd = dst->ne[0], hc = dst->ne[1], n_tokens = dst->ne[2];
             float * base = (float *) dst->data;
             auto it = g_hc_marked_xn.find(dst);
-            if (it != g_hc_marked_xn.end()) {
+            if (ggml_get_op_params_i32(dst, 5) == 1) {
+                // MoE mode: src2 = routed down rows, src4 = route weights, src5 = shared expert, src6 = shared gate logit.
+                ggml_cuda_hc_combine_norm_args a{};
+                a.inject       = dst->src[0];
+                a.residual     = dst->src[1];
+                a.gamma        = dst->src[3];
+                a.moe_down     = dst->src[2];
+                a.moe_w        = dst->src[4];
+                a.moe_shared   = dst->src[5];
+                a.moe_sh_logit = dst->src[6];
+                a.moe_down_f16 = ggml_cuda_mmb_is_f16_only(dst->src[2]);
+                ggml_tensor res_t = *dst;
+                res_t.ne[3] = 1; res_t.data = base; res_t.view_src = nullptr;
+                ggml_tensor xn_t = res_t;
+                xn_t.data = base + (size_t) n_embd * hc * n_tokens;
+                a.out_res = &res_t;
+                const bool marked = it != g_hc_marked_xn.end();
+                a.out_xn       = marked ? const_cast<ggml_tensor *>(it->second) : &xn_t;
+                a.out_xn_bf16  = marked ? (uint16_t *) it->second->data : nullptr;
+                a.store_xn_f32 = !marked;
+                if (marked && hcdown_i8() && g_hc_q8_xn.count(dst)) a.out_q8 = ggml_cuda_mmb_q8_reserve(ctx, it->second, ggml_cuda_mmb_w8a8_tile_bytes((int) n_tokens, (int) (n_embd * hc)));
+                a.s1 = ggml_get_op_params_f32(dst, 0);
+                a.b1 = ggml_get_op_params_f32(dst, 1);
+                a.s2 = ggml_get_op_params_f32(dst, 2);
+                a.b2 = ggml_get_op_params_f32(dst, 3);
+                a.eps = ggml_get_op_params_f32(dst, 4);
+                ggml_cuda_op_hc_combine_norm(ctx, a);
+            } else if (it != g_hc_marked_xn.end()) {
                 // xn is bf16-only: write that channel to the mmb cache and skip its f32 form.
                 ggml_cuda_hc_combine_norm_args a{};
                 a.inject    = dst->src[0];
@@ -3804,6 +3851,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 a.out_res = &res_t;
                 a.out_xn_bf16  = (uint16_t *) a.out_xn->data;   // in place; consumers read bf16 from here
                 a.store_xn_f32 = false;
+                if (hcdown_i8() && g_hc_q8_xn.count(dst)) a.out_q8 = ggml_cuda_mmb_q8_reserve(ctx, it->second, ggml_cuda_mmb_w8a8_tile_bytes((int) n_tokens, (int) (n_embd * hc)));
                 a.s1 = ggml_get_op_params_f32(dst, 0);
                 a.b1 = ggml_get_op_params_f32(dst, 1);
                 a.s2 = ggml_get_op_params_f32(dst, 2);
@@ -5995,6 +6043,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // Drop last graph's mmb activation cache: keyed by raw data pointers the pool recycles.
     ggml_cuda_mmb_begin_graph();
     g_hc_marked_xn.clear();
+    g_hc_q8_xn.clear();
 #endif
     ggml_backend_cuda_reset_fattn_launch_counts();
 
@@ -6037,14 +6086,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (v->view_src == op && v->view_offs == xn_off) { xn = v; break; }
             }
             if (!xn || ggml_nrows(xn) < 512) continue;
-            bool ok = true; int nread = 0;
+            bool ok = true, q8 = false; int nread = 0;
             for (int n = i + 1; n < cgraph->n_nodes && ok; ++n) {
                 const ggml_tensor * t = cgraph->nodes[n];
                 if (!reads(t, xn)) continue;
                 ++nread;
                 if (t->op == GGML_OP_MUL_MAT &&
                     (ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t) ||
-                     ggml_cuda_mmb_cublas_shape_ok(t->src[0]))) continue;
+                     ggml_cuda_mmb_cublas_shape_ok(t->src[0]))) {
+                    q8 = q8 || (t->src[0]->type == GGML_TYPE_Q8_0 && t->src[0]->ne[0] % 128 == 0 && t->src[0]->ne[1] >= 32);
+                    continue;
+                }
                 if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
                 if (t->op == GGML_OP_MUL && is_hc_mix_mul(n, xn)) continue;
                 { static unsigned dbg = 0; if (getenv("LLAMA_HC16_DEBUG") && ggml_nrows(xn) >= 4096 && dbg++ < 12)
@@ -6053,7 +6105,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
             { static unsigned dbg2 = 0; if (getenv("LLAMA_HC16_DEBUG") && ggml_nrows(xn) >= 4096 && dbg2++ < 12)
                 std::fprintf(stderr, "HC16 xn=%s rows=%lld consumers=%d ok=%d\n", xn->name, (long long) ggml_nrows(xn), nread, (int) ok); }
-            if (ok && nread > 0) { ggml_cuda_mmb_mark_bf16_only(xn); g_hc_marked_xn[op] = xn; }
+            if (ok && nread > 0) { ggml_cuda_mmb_mark_bf16_only(xn); g_hc_marked_xn[op] = xn; if (q8) g_hc_q8_xn.insert(op); }
         }
 
         // Only the gate-mix path with a quantized w_up writes bf16 in place; the reduce fallback writes f32.
@@ -6088,6 +6140,43 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 std::fprintf(stderr, "HC16 mixdst rows=%lld consumers=%d ok=%d\n",
                     (long long) ggml_nrows(ma.dst), nread, (int) ok); }
             if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(ma.dst);
+        }
+
+        // The fused routed GLU (gate MMID, up MMID, SWIGLU) writes bf16 in place when every consumer is an MMB
+        // MUL_MAT_ID, so its F32 form is never stored. Mirror the fusion's own conditions exactly: a marked GLU that ran
+        // unfused would leave F32 where the consumer reads bf16 (compute_forward aborts on that).
+        static const bool fusion_off = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr;
+        for (int i = 2; i < cgraph->n_nodes && !fusion_off; ++i) {
+            ggml_tensor * glu = cgraph->nodes[i];
+            if (glu->op != GGML_OP_GLU || (glu->flags & GGML_TENSOR_FLAG_OUTPUT)) continue;
+            const ggml_tensor * g = glu->src[0], * u = glu->src[1];
+            if (!g || !u || g->op != GGML_OP_MUL_MAT_ID || u->op != GGML_OP_MUL_MAT_ID) continue;
+            const bool adjacent = (cgraph->nodes[i - 2] == g && cgraph->nodes[i - 1] == u) ||
+                                  (cgraph->nodes[i - 2] == u && cgraph->nodes[i - 1] == g);
+            if (!adjacent || !ggml_cuda_can_fuse(cgraph, i - 2, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, {}) ||
+                !ggml_cuda_mmb_supported_glu(g->src[0], u->src[0], u->src[1], u->src[2], glu)) continue;
+            bool ok = true; int nread = 0;
+            for (int n = i + 1; n < cgraph->n_nodes && ok; ++n) {
+                const ggml_tensor * t = cgraph->nodes[n];
+                if (!reads(t, glu)) continue;
+                ++nread;
+                ok = t->op == GGML_OP_MUL_MAT_ID && t->src[1] == glu &&
+                     ggml_cuda_mmb_supported_mmid(t->src[0], t->src[1], t->src[2], t);
+            }
+            if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(glu);
+        }
+
+        // The routed down rows feeding a MoE-mode HC combine (the qwen4exp MoE fold, QWEN4EXP_F16) are written as F16
+        // in place and read by that combine only (quality-gated E413).
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * cn = cgraph->nodes[i];
+            if (cn->op != GGML_OP_HC_COMBINE_NORM || ggml_get_op_params_i32(cn, 5) != 1) continue;
+            ggml_tensor * down = cn->src[2];
+            if (!down || down->op != GGML_OP_MUL_MAT_ID || (down->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                !ggml_cuda_mmb_supported_mmid(down->src[0], down->src[1], down->src[2], down)) continue;
+            int nread = 0;
+            for (int n = 0; n < cgraph->n_nodes; ++n) if (reads(cgraph->nodes[n], down)) ++nread;
+            if (nread == 1) ggml_cuda_mmb_mark_f16_only(down);
         }
     }
 #endif // defined(GGML_USE_HIP)
@@ -6962,6 +7051,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                      op->src[2]->view_offs % sizeof(float4) == 0 &&
                      op->src[2]->nb[1] % sizeof(float4) == 0));
 #if defined(GGML_USE_HIP)
+        case GGML_OP_GATED_RMS_NORM_F16:
+            return op->src[0]->type == GGML_TYPE_F32 && (!op->src[1] || op->src[1]->type == GGML_TYPE_F32) &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->src[0]->ne[0] <= 256;
         case GGML_OP_HC_COMBINE_NORM:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
@@ -6969,6 +7061,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op->src[3]);
 #else
         case GGML_OP_HC_COMBINE_NORM:
+        case GGML_OP_GATED_RMS_NORM_F16:
             return false;
 #endif
         case GGML_OP_MUL_MAT:
@@ -7717,3 +7810,22 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)
+
+bool ggml_backend_cuda_mmb_f16_input_ok(const ggml_tensor * w, int64_t n_tokens) {
+#if defined(GGML_USE_HIP)
+    return ggml_cuda_mmb_q8f16_f16_input(w, n_tokens);
+#else
+    GGML_UNUSED(w);
+    GGML_UNUSED(n_tokens);
+    return false;
+#endif
+}
+
+bool ggml_backend_cuda_mmb_prefill(int64_t n_tokens) {
+#if defined(GGML_USE_HIP)
+    return ggml_cuda_mmb_prefill(n_tokens);
+#else
+    GGML_UNUSED(n_tokens);
+    return false;
+#endif
+}

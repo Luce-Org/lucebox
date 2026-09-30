@@ -2,6 +2,12 @@
 #include "common.cuh"
 // Quantized-weight BF16 WMMA GEMM on gfx1151, from 512 tokens up.
 bool ggml_cuda_mmb_supported_mm  (const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+int8_t * ggml_cuda_mmb_q8_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t bytes);
+size_t ggml_cuda_mmb_w8a8_tile_bytes(int T, int K);
+void ggml_cuda_mmb_mark_f16_only(const ggml_tensor * t);
+bool ggml_cuda_mmb_is_f16_only(const ggml_tensor * t);
+bool ggml_cuda_mmb_q8f16_f16_input(const ggml_tensor * w, int64_t n_tokens);
+bool ggml_cuda_mmb_prefill(int64_t n_tokens);
 bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst);
 void ggml_cuda_mul_mat_mmb   (ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);

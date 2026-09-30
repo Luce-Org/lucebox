@@ -5,6 +5,7 @@
 #include "qwen4exp_graph.h"
 
 #include "delta_net_chunked.h"
+#include "ggml-cuda.h"
 
 #include <algorithm>
 #include <cmath>
@@ -29,6 +30,16 @@ static double prof_now_ms() {
 static bool batch_telemetry_enabled() {
     const char * value = std::getenv("QWEN4EXP_BATCH_TELEMETRY");
     return value && std::atoi(value) != 0;
+}
+
+// F16 activation paths for gfx1151 MMB prefill (gated-norm tail, attention gate, MoE fold). Default on; QWEN4EXP_F16=0
+// is the kill switch. Off under QWEN4EXP_UPSTREAM (byte-exact reference) and QWEN4EXP_DUMP (per-node dumps).
+static bool f16_paths() {
+    static const bool on = [] {
+        const char * u = getenv("QWEN4EXP_UPSTREAM"), * f = getenv("QWEN4EXP_F16");
+        return !(u && std::atoi(u) != 0) && getenv("QWEN4EXP_DUMP") == nullptr && !(f && std::atoi(f) == 0);
+    }();
+    return on;
 }
 
 static double mono_now_s() {
@@ -247,9 +258,18 @@ static ggml_tensor * hc_norm_xn(ggml_context * c, ggml_tensor * fused,
 
 // ── MoE FFN: 512 experts top-10 (softmax), gated shared expert ──────────
 
+// Un-combined MoE outputs, for folding the combine into the next HC_COMBINE_NORM (ggml_hc_combine_norm_moe).
+struct Qwen4ExpMoeParts {
+    ggml_tensor * down         = nullptr;   // [n_embd, n_used, T]
+    ggml_tensor * weights      = nullptr;   // [n_used, T]
+    ggml_tensor * shared       = nullptr;   // [n_embd, T], before the sigmoid gate
+    ggml_tensor * shared_logit = nullptr;   // [1, T]
+};
+
 [[maybe_unused]] ggml_tensor * build_moe(ggml_context * c, ggml_tensor * cur,
                         const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, int il,
-                        const std::function<void(ggml_tensor *, const char *)> & dump_mark = {}) {
+                        const std::function<void(ggml_tensor *, const char *)> & dump_mark = {},
+                        Qwen4ExpMoeParts * parts = nullptr) {
     const int64_t n_embd   = w.n_embd;
     const int64_t n_tokens = cur->ne[1];
     const int64_t n_expert = w.n_expert;
@@ -290,7 +310,12 @@ static ggml_tensor * hc_norm_xn(ggml_context * c, ggml_tensor * fused,
     ggml_tensor * sh_gu   = ggml_swiglu_split(c, sh_gate, sh_up);
     ggml_tensor * shared  = mm(c, L.ffn_down_shexp, sh_gu);
 
-    ggml_tensor * shared_gate = ggml_sigmoid(c, mm(c, L.ffn_gate_inp_shexp, cur));
+    ggml_tensor * shared_logit = mm(c, L.ffn_gate_inp_shexp, cur);
+    if (parts) {   // the caller folds the combine into the next HC_COMBINE_NORM
+        *parts = { down, wsel, shared, shared_logit };
+        return nullptr;
+    }
+    ggml_tensor * shared_gate = ggml_sigmoid(c, shared_logit);
     shared = ggml_mul(c, shared, shared_gate);   // [n_embd,T] * [1,T] broadcasts over dim 0
     dmark(shared, "msh");
 
@@ -400,6 +425,12 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor 
         ggml_row_size(gdn->type, D * Hv * T));
     ggml_build_forward_expand(gf, ggml_cpy(c, new_state, state4));
 
+    // Gated norm written as F16 in one pass, read directly by ssm_out's Q8_0 -> F16 GEMM (same arithmetic as the
+    // chain below, so bit-exact).
+    if (f16_paths() && ggml_backend_cuda_mmb_f16_input_ok(L.ssm_out, T)) {
+        ggml_tensor * lin_raw = mm(c, L.ssm_out, ggml_gated_rms_norm_f16(c, attn, L.ssm_norm, z, eps));
+        return ggml_reshape_2d(c, lin_raw, w.n_embd, T);
+    }
     ggml_tensor * normed = ggml_mul(c, ggml_rms_norm(c, attn, eps), L.ssm_norm);
     ggml_tensor * out = ggml_mul(c, normed, ggml_sigmoid(c, ggml_reshape_4d(c, z, D, Hv, T, 1)));
     if (dump_mark) {
@@ -737,6 +768,12 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
         dump_mark(gate, dlab);
     }
 
+    // sigmoid(gate) * attn written as F16 in one pass straight from the wq view (no CONT), read directly by wo's
+    // Q8_0 -> F16 GEMM. Same product as below, so bit-exact.
+    if (f16_paths() && ggml_backend_cuda_mmb_f16_input_ok(L.wo, T)) {
+        ggml_tensor * gate3 = ggml_view_3d(c, qfull, D, Hq, T, 2 * D * qe, 2 * D * Hq * qe, D * qe);
+        return mm(c, L.wo, ggml_gated_f16(c, attn, gate3));
+    }
     ggml_tensor * attn2 = ggml_reshape_2d(c, attn, D * Hq, T);
     attn2 = ggml_mul(c, attn2, ggml_sigmoid(c, gate));
     if (dump_mark) {
@@ -1463,12 +1500,24 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         }
         std::snprintf(dlab, sizeof dlab, "L%02d.fmix", il);
         dump_mark(cur, dlab);
-        cur = build_moe(ctx, cur, L, w, il, dump_mark);
+        const bool next_ple = (il + 1 < w.n_layer) && w.layers[il + 1].is_ple && has_ple;
+        // Prefill: the MoE combine runs inside the next HC_COMBINE_NORM (one kernel fewer; last-bit numerics change
+        // from FMA contraction in the new kernel, quality-gated E413). Not at T=1: it cost ~1.7% decode (E414).
+        static const bool moe_unfused = getenv("QWEN4EXP_MOE_UNFUSED") != nullptr;
+        Qwen4ExpMoeParts moe_parts;
+        const bool fold = f16_paths() && !moe_unfused && hc_fused && !next_ple && ggml_backend_cuda_mmb_prefill(layer_T);
+        cur = build_moe(ctx, cur, L, w, il, dump_mark, fold ? &moe_parts : nullptr);
         std::snprintf(dlab, sizeof dlab, "L%02d.moe", il);
         dump_mark(cur, dlab);
 
-        const bool next_ple = (il + 1 < w.n_layer) && w.layers[il + 1].is_ple && has_ple;
-        if (next_ple) {
+        if (fold) {
+            ggml_tensor * gamma = (il + 1 < w.n_layer)
+                ? w.layers[il + 1].hc_attn_norm : w.output_hc_norm;
+            ggml_tensor * f = ggml_hc_combine_norm_moe(ctx, inject, res_hc, moe_parts.down, moe_parts.weights,
+                moe_parts.shared, moe_parts.shared_logit, gamma, 1.0f / (float) w.n_hc, 0.0f, 2.0f, 0.0f, w.rms_eps);
+            res_hc = hc_norm_res(ctx, f, w.n_embd, w.n_hc, layer_T);
+            xn_next = hc_norm_xn(ctx, f, w.n_embd, w.n_hc, layer_T);
+        } else if (next_ple) {
             res_hc = hc_combine(ctx, res_hc, cur, inject, w.n_embd, w.n_hc, layer_T);
             xn_next = nullptr;
             std::snprintf(dlab, sizeof dlab, "L%02d.res", il);

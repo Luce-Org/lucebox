@@ -1215,9 +1215,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DS4_MOE_COMBINE",
 
     "HC_COMBINE_NORM",
+    "GATED_RMS_NORM_F16",
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1349,9 +1350,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "ds4_moe_combine(down,w,shared)",
 
     "hc_combine_norm(inj,res,blk,gamma)",
+    "gated_rms_norm_f16(x,gamma,z)",
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -9617,4 +9619,78 @@ struct ggml_tensor * ggml_hc_combine_norm(
     ggml_set_op_params_f32(result, 3, b2);
     ggml_set_op_params_f32(result, 4, eps);
     return result;
+}
+
+struct ggml_tensor * ggml_hc_combine_norm_moe(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * inject,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * shared,
+        struct ggml_tensor  * shared_logit,
+        struct ggml_tensor  * gamma,
+        float                 s1, float b1, float s2, float b2, float eps) {
+    GGML_ASSERT(inject && residual && down && weights && shared && shared_logit && gamma);
+    GGML_ASSERT(inject->type == GGML_TYPE_F32 && residual->type == GGML_TYPE_F32 && down->type == GGML_TYPE_F32 &&
+                weights->type == GGML_TYPE_F32 && shared->type == GGML_TYPE_F32 &&
+                shared_logit->type == GGML_TYPE_F32 && gamma->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(inject) && ggml_is_contiguous(residual) && ggml_is_contiguous(gamma) &&
+                ggml_is_contiguous(weights) && ggml_is_contiguous(shared_logit) && down->nb[0] == sizeof(float) &&
+                shared->nb[0] == sizeof(float));
+    const int64_t n_embd = residual->ne[0], nt = residual->ne[2];
+    GGML_ASSERT(residual->ne[3] == 1 && inject->ne[0] == residual->ne[1] && inject->ne[1] == nt);
+    GGML_ASSERT(down->ne[0] == n_embd && down->ne[2] == nt && down->ne[3] == 1 && weights->ne[0] == down->ne[1] &&
+                ggml_nrows(weights) == nt && shared->ne[0] == n_embd && ggml_nrows(shared) == nt &&
+                ggml_nelements(shared_logit) == nt);
+    GGML_ASSERT(ggml_nelements(gamma) == n_embd * residual->ne[1]);
+
+    const int64_t ne[4] = { n_embd, residual->ne[1], nt, 2 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op     = GGML_OP_HC_COMBINE_NORM;
+    result->src[0] = inject;
+    result->src[1] = residual;
+    result->src[2] = down;
+    result->src[3] = gamma;
+    result->src[4] = weights;
+    result->src[5] = shared;
+    result->src[6] = shared_logit;
+    ggml_set_op_params_f32(result, 0, s1);
+    ggml_set_op_params_f32(result, 1, b1);
+    ggml_set_op_params_f32(result, 2, s2);
+    ggml_set_op_params_f32(result, 3, b2);
+    ggml_set_op_params_f32(result, 4, eps);
+    ggml_set_op_params_i32(result, 5, 1);
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_rms_norm_f16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gamma,
+        struct ggml_tensor  * z,
+        float                 eps) {
+    GGML_ASSERT(x && z);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && z->type == GGML_TYPE_F32 && (!gamma || gamma->type == GGML_TYPE_F32));
+    const int64_t ncols = x->ne[0], nh = x->ne[1], nt = x->ne[2];
+    GGML_ASSERT(x->ne[3] == 1 && x->nb[0] == sizeof(float) && z->nb[0] == sizeof(float));
+    GGML_ASSERT(!gamma || (ggml_is_contiguous(gamma) && gamma->ne[0] == ncols &&
+                           (ggml_nelements(gamma) == ncols || ggml_nelements(gamma) == ncols * nh)));
+    GGML_ASSERT((z->ne[0] == ncols * nh && ggml_nrows(z) == nt) ||
+                (z->ne[0] == ncols && z->ne[1] == nh && z->ne[2] == nt && z->ne[3] == 1));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ncols * nh, nt);
+    result->op     = GGML_OP_GATED_RMS_NORM_F16;
+    result->src[0] = x;
+    result->src[1] = gamma;
+    result->src[2] = z;
+    ggml_set_op_params_f32(result, 0, eps);
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_f16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * z) {
+    return ggml_gated_rms_norm_f16(ctx, x, NULL, z, 0.0f);
 }
