@@ -63,7 +63,7 @@ for w in "${want[@]}"; do
       wait_ready brick-max 8411 ;;
     2b)
       start qwen35-2b "$MODELS/routing/Qwen3.5-2B-Q8_0.gguf" \
-        --target-device hip:1 --max-concurrency 4 --kv-pool-tokens 65536 --max-ctx 16384 \
+        --target-device hip:1 --max-concurrency 4 --kv-pool-tokens 262144 --max-ctx 122880 \
         --host 127.0.0.1 --port 8402 --model-name qwen35-2b
       wait_ready qwen35-2b 8402 ;;
     *) echo "unknown name $w (27b brick 2b)" >&2; exit 2 ;;
