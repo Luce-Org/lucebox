@@ -183,6 +183,7 @@ struct ModelBackend {
 
     virtual GenerateResult generate_impl(const GenerateRequest & req,
                                          const DaemonIO & io) = 0;
+    virtual bool supports_prefill_logits() const { return false; }
 
     // ── Concurrent serving ───────────────────────────────────────────
     // Backends that can hold several live sequences at once and execute a

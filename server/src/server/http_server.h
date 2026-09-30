@@ -283,6 +283,11 @@ bool canonical_assistant_content(
     const std::string & sentinel,
     const std::string & generated_text,
     std::string & content);
+std::vector<double> systemone_restricted_softmax(
+    const std::vector<float> & logits,
+    const std::vector<int32_t> & token_ids);
+double systemone_distribution_confidence(
+    const std::vector<double> & probabilities);
 
 struct PflashQueryWindow {
     int end = -1;       // exclusive token offset in the rendered prompt
@@ -356,6 +361,16 @@ struct ParsedRequest {
     // The prompt ends with tool results. Clients only append after them, so
     // the inline snapshot may cover them (see select_inline_snapshot_boundary).
     bool                      ends_with_tool_result = false;
+
+    struct SystemOneQuestion {
+        std::string              id;
+        std::string              type;
+        std::vector<int32_t>     prompt_tokens;
+        std::vector<std::string> option_keys;
+        json                     option_descriptions;
+        std::vector<int32_t>     label_token_ids;
+    };
+    std::vector<SystemOneQuestion> systemone_questions;
 };
 
 // Resident budget the PrefixCache enforces: the concurrent limit in paged
@@ -442,6 +457,8 @@ private:
 
     // Client thread: read HTTP request, parse, enqueue job, wait.
     void handle_client(SocketHandle fd);
+    bool prepare_systemone_request(SocketHandle fd, ParsedRequest & req);
+    void process_systemone_job(ServerJob * job);
 
     struct HttpRequest;
     bool start_worker();

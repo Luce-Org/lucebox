@@ -1471,6 +1471,11 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                             const DaemonIO & io) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
+    if (req.return_prefill_logits && req.n_gen != 0) {
+        result.fail(GenerateErrorCode::BackendSpecific,
+                    "prefill logits require n_gen == 0");
+        return result;
+    }
     if (concurrent_slots() > 1) {
         // begin_paged_sequence would reset the shared pool under every live
         // slot; the scheduler must use the seq_* API instead.
@@ -1531,6 +1536,18 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     }
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
+    if (req.return_prefill_logits) {
+        if (!prefill_last_logits_valid_ || !sg_.logits) {
+            result.fail(GenerateErrorCode::PrefillFailed,
+                        "final-position prefill logits are unavailable");
+            return result;
+        }
+        result.prefill_logits.resize((size_t)w_.n_vocab);
+        ggml_backend_tensor_get(
+            sg_.logits, result.prefill_logits.data(),
+            prefill_last_logits_offset_,
+            sizeof(float) * result.prefill_logits.size());
+    }
     if (out_io.is_cancelled()) {
         result.succeed();
         return result;

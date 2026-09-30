@@ -30,6 +30,9 @@ struct GenerateRequest {
     // Backend-owned image payload bound to `prompt`; empty for text requests.
     ImagePromptHandle images;
     int n_gen = 0;
+    // Return the full vocabulary logits at the final prompt position.
+    // This is a prefill-only operation: callers must keep n_gen == 0.
+    bool return_prefill_logits = false;
     SamplerCfg sampler;
     bool do_sample = false;
     bool stream = false;
@@ -104,6 +107,7 @@ struct GenerateResult {
     // A producer must explicitly call succeed() before returning success.
     std::optional<GenerateError> error = GenerateError{};
     std::vector<int32_t> tokens;
+    std::vector<float> prefill_logits;
     double prefill_s = 0.0;
     double decode_s = 0.0;
     // Prompt tokens confirmed by the backend's physical snapshot restore.

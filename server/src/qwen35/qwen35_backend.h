@@ -130,6 +130,7 @@ public:
 
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
+    bool supports_prefill_logits() const override { return true; }
 
     bool snapshot_save(int slot) override;
     void snapshot_free(int slot) override;
