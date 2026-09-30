@@ -95,3 +95,8 @@ def test_load_state_live_and_down(mock):
     state = run(signals.load_state(cfg.models))
     assert state["qwen35-2b"] == {"in_flight": 1, "capacity": 1}
     assert state["qwen35-0.8b"] is None  # mock returns 500 -> unknown, not a crash
+
+
+def test_brick_probs_fall_back_to_generated_word():
+    resp = {"choices": [{"message": {"role": "assistant", "content": "medium"}}]}
+    assert signals.parse_brick_probs(resp) == {"easy": 0.0, "medium": 1.0, "hard": 0.0}

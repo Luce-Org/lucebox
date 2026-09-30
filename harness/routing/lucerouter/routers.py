@@ -201,7 +201,8 @@ class BrickRouter(Router):
         try:
             probs = await signals.brick_probs(
                 self.service.base_url, text, kind=self.service.kind, model=self.service.served_name,
-                prompt_suffix=self.suffix, client=self.res.client)
+                prompt_suffix=self.suffix, logprobs=bool(self.service.extra.get("logprobs", True)),
+                client=self.res.client)
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as e:
             return self.decision(self.on_error, f"brick error: {type(e).__name__}: {e}",
                                  signals_={"error": str(e)})
@@ -317,7 +318,8 @@ class BrickSkillRouter(Router):
         try:
             probs = await signals.brick_probs(
                 self.service.base_url, text, kind=self.service.kind, model=self.service.served_name,
-                prompt_suffix=self.suffix, client=self.res.client)
+                prompt_suffix=self.suffix, logprobs=bool(self.service.extra.get("logprobs", True)),
+                client=self.res.client)
             return probs, None, (time.perf_counter() - t0) * 1000
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as e:
             return None, f"{type(e).__name__}: {e}", (time.perf_counter() - t0) * 1000

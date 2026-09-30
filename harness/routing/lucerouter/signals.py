@@ -100,6 +100,13 @@ def parse_brick_probs(resp: dict) -> dict[str, float]:
         total = sum(mass.values())
         if total > 0:
             return {k: v / total for k, v in mass.items()}
+    # No logprobs in the response: fall back to the generated word (one-hot).
+    choices = resp.get("choices") if isinstance(resp, dict) else None
+    if choices:
+        text = (choices[0].get("message") or {}).get("content") or choices[0].get("text") or ""
+        label = token_label(text.strip().split()[0]) if text.strip() else None
+        if label:
+            return {k: float(k == label) for k in LABELS}
     raise ValueError("no easy/medium/hard token in brick response")
 
 
@@ -110,6 +117,7 @@ async def brick_probs(
     kind: str = "luce_server",
     model: str | None = None,
     prompt_suffix: str = "",
+    logprobs: bool = True,
     client: httpx.AsyncClient | None = None,
     timeout: float = 10.0,
 ) -> dict[str, float]:
@@ -117,7 +125,9 @@ async def brick_probs(
 
     kind="llama-server" uses raw `/completion` with a ChatML prompt (+ optional
     `prompt_suffix`); anything else uses OpenAI `/v1/chat/completions` with
-    logprobs and thinking disabled.
+    logprobs and thinking disabled. With logprobs=False (or when the server
+    rejects logprobs with a 400) it reads the generated word instead, giving
+    one-hot probs: routing still works, but confidence is always 1.
     """
     query = truncate_query(query_text)
     root = root_url(service_url)
@@ -130,15 +140,20 @@ async def brick_probs(
         body = {
             "messages": [{"role": "system", "content": BRICK_SYSTEM},
                          {"role": "user", "content": f"Classify: {query}"}],
-            "max_tokens": 1, "temperature": 0, "logprobs": True, "top_logprobs": 20,
+            "max_tokens": 1, "temperature": 0,
             "chat_template_kwargs": {"enable_thinking": False},
         }
+        if logprobs:
+            body.update(logprobs=True, top_logprobs=20)
         if model:
             body["model"] = model
     own = client is None
     client = client or httpx.AsyncClient()
     try:
         r = await client.post(url, json=body, timeout=timeout)
+        if r.status_code == 400 and body.pop("logprobs", None):
+            body.pop("top_logprobs", None)
+            r = await client.post(url, json=body, timeout=timeout)
         r.raise_for_status()
         return parse_brick_probs(r.json())
     finally:
