@@ -4887,6 +4887,21 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    // ROPE (multi-section, F32) -> PERMUTE -> CONT: the rope writes its rows straight into the CONT layout (qwen4exp Q
+    // for flash attention, E429). Addresses change, values do not. Off under QWEN4EXP_UPSTREAM (reference graph).
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ROPE && ops.begin()[1] == GGML_OP_PERMUTE && ops.begin()[2] == GGML_OP_CONT &&
+        ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+        static const bool upstream = getenv("QWEN4EXP_UPSTREAM") && atoi(getenv("QWEN4EXP_UPSTREAM")) != 0;
+        const ggml_tensor * rope = cgraph->nodes[node_idx];
+        const ggml_tensor * perm = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * cont = cgraph->nodes[node_idx + 2];
+        const int mode = ggml_get_op_params_i32(rope, 2);
+        return !upstream && (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION && !(mode & GGML_ROPE_TYPE_TAIL) &&
+            rope->type == GGML_TYPE_F32 && rope->src[0]->type == GGML_TYPE_F32 && rope->src[0]->ne[3] == 1 &&
+            perm->src[0] == rope && ggml_get_op_params_i32(perm, 0) == 0 &&
+            cont->src[0] == perm && cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont);
+    }
+
     // dflash: residual ADD + RMS_NORM + MUL. The add output stays live (it is
     // the next residual), so this is a subgraph fusion with two outputs.
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM &&
@@ -5439,6 +5454,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 }
                             }
                         }
+                    }
+
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_PERMUTE, GGML_OP_CONT }, {})) {
+                        ggml_cuda_op_rope_permuted(*cuda_ctx, cgraph->nodes[i], cgraph->nodes[i + 2]);
+                        i += 2;
+                        continue;
                     }
 
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
