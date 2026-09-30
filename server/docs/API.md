@@ -89,10 +89,23 @@ The endpoint supports:
 that every configured answer label is one distinct tokenizer token in the
 exact `Answer:` context. Invalid requests return `422`.
 
+The fixed prompt presents `noul` labels as `Yes` and `No`, then instructs the
+model to answer with exactly one criterion label. This keeps the answer token
+generation-free while improving direct-logit classification with instruction
+models.
+
 The current final-logit implementation is available on the monolithic
 Qwen3.5/Qwen3.6 backend. It is rejected when `--max-concurrency` enables the
 concurrent-slot engine; other backends return `503` until they expose their
 final-position prefill logits.
+
+Run the sourced live quality suite against a local model with:
+
+```bash
+python3 server/tests/test_systemone_quality.py \
+  --launch server/models/Qwen3.6-27B-Q4_K_M.gguf \
+  --server-bin server/build/dflash_server
+```
 
 ---
 

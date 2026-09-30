@@ -405,6 +405,7 @@ Subject: I was charged twice.
 Message: Please refund the extra payment.
 </STATE>
 
+Choose exactly one criterion label. Answer with only that label.
 Answer:
 ```
 

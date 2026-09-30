@@ -2512,16 +2512,22 @@ std::string systemone_prompt(
         << "\n</TASK>\n\n<CRITERIA>\n";
     for (size_t i = 0; i < labels.size(); ++i) {
         out << '[' << labels[i] << "] ";
-        if (!keys[i].empty()) out << systemone_escape(keys[i]);
+        if (type == "noul") {
+            out << (i == 0 ? "Yes" : "No");
+        } else if (!keys[i].empty()) {
+            out << systemone_escape(keys[i]);
+        }
         if (!descriptions[i].is_null()) {
-            if (!keys[i].empty()) out << ": ";
+            if (type != "noul" && !keys[i].empty()) out << ": ";
+            else out << " - ";
             out << systemone_description_text(descriptions[i]);
         }
         out << '\n';
     }
     out << "</CRITERIA>\n\n<STATE>\n"
         << systemone_description_text(state)
-        << "\n</STATE>\n\nAnswer:";
+        << "\n</STATE>\n\nChoose exactly one criterion label. "
+           "Answer with only that label.\nAnswer:";
     return out.str();
 }
 
