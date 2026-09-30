@@ -1293,6 +1293,11 @@ bool run_deepseek4_dspark_spec_decode(
             }
         }
         if ((int) draft_tok.size() > q_step_cap) draft_tok.resize(q_step_cap);
+        // A step emits at most q tokens (kept candidates + bonus); never verify
+        // more than the request can still emit, or the cache would commit
+        // tokens (drafted or forced close tokens) that are never returned.
+        const int remaining_out = std::max(1, n_gen - n_generated);
+        if ((int) draft_tok.size() > remaining_out) draft_tok.resize((size_t) remaining_out);
         const int q = (int) draft_tok.size();   // seed + candidates
         if (q >= 0 && q <= q_cap) width_steps[(size_t) q]++;
         tm_head += spec_ms_since(t0);
@@ -1394,15 +1399,17 @@ bool run_deepseek4_dspark_spec_decode(
             if (sampling) {
                 t0 = SpecClock::now();
                 if (!target.read_verify_logits(q, spec_logits)) {
+                    undo_verify();
                     std::fprintf(stderr, "[ds4-spec] sampling: verify logits unavailable\n");
                     ok = false;
                     break;
                 }
-                std::vector<int32_t> hist = sampling->history;
-                for (int k = 1; k < q; k++) hist.push_back(draft_tok[(size_t) k]);
                 if (spec_rows.empty()) spec_rows.resize(1);
+                if (spec_hist.empty()) spec_hist.resize(1);
+                dspark_row_history(sampling->cfg, sampling->history, draft_tok.data(), q - 1,
+                                   spec_hist[0]);
                 sampler_distribution(spec_logits.data() + (size_t) (q - 1) * target_w.n_vocab,
-                                     target_w.n_vocab, sampling->cfg, hist, spec_rows[0]);
+                                     target_w.n_vocab, sampling->cfg, spec_hist[0], spec_rows[0]);
                 std::uniform_real_distribution<double> unif(0.0, 1.0);
                 bonus = sampler_draw(spec_rows[0], unif(*sampling->rng));
                 tm_sample += spec_ms_since(t0);

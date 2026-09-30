@@ -139,7 +139,7 @@ std::vector<int32_t> ar_reference(const std::vector<int32_t> & close, int n_gen,
 }
 
 std::vector<int32_t> spec_decode(const std::vector<int32_t> & close, int n_gen, int hard,
-                                 int q_cap, std::mt19937_64 & rng) {
+                                 int q_cap, std::mt19937_64 & rng, bool & overcommit) {
     using namespace luce::deepseek4;
     std::uniform_real_distribution<double> unif(0.0, 1.0);
     std::uniform_int_distribution<int32_t> wrong(1, 40);
@@ -160,6 +160,9 @@ std::vector<int32_t> spec_decode(const std::vector<int32_t> & close, int n_gen, 
                 ctx.push_back(d);
             }
         }
+        // Like the DSpark loop: never verify more than can still be emitted.
+        const int remaining = n_gen - (int) seq.size();
+        if ((int) draft.size() > remaining) draft.resize((size_t) remaining);
         const int q = (int) draft.size();
         int accept = 1;
         std::vector<int32_t> ctx = seq;
@@ -175,8 +178,11 @@ std::vector<int32_t> spec_decode(const std::vector<int32_t> & close, int n_gen, 
         int32_t bonus = toy_model(ctx);
         spec_budget_hook_step(close, n_gen - (int) seq.size(), hard, forcing,
                               forcing ? q - 1 : 0, accept, bonus, st);
-        for (int i = 1; i < accept && (int) seq.size() < n_gen; i++) seq.push_back(draft[(size_t) i]);
-        if ((int) seq.size() < n_gen) seq.push_back(bonus);
+        // Every token the step commits (seed + kept candidates) is emitted: the
+        // step's output (kept candidates + bonus) fits in what is left.
+        if (accept > remaining) overcommit = true;
+        for (int i = 1; i < accept; i++) seq.push_back(draft[(size_t) i]);
+        seq.push_back(bonus);
     }
     return seq;
 }
@@ -190,10 +196,14 @@ TEST_CASE(BudgetHookFixture, spec_step_matches_ar_rule) {
     for (int trial = 0; trial < 3000; trial++) {
         const auto & close = closes[(size_t) trial % closes.size()];
         const int n_gen = 8 + (int) (rng() % 80);
-        const int hard = (int) (rng() % (uint64_t) (n_gen - 1));   // never fires on the seed
+        // hard <= n_gen - 1: the seed (remaining n_gen) never fires; at
+        // n_gen - 1 the hook fires on the first speculative token.
+        const int hard = (int) (rng() % (uint64_t) n_gen);
         const int q_cap = 2 + (int) (rng() % 5);
         const auto want = ar_reference(close, n_gen, hard);
-        const auto got = spec_decode(close, n_gen, hard, q_cap, rng);
+        bool overcommit = false;
+        const auto got = spec_decode(close, n_gen, hard, q_cap, rng, overcommit);
+        REQUIRE(!overcommit);
         REQUIRE(got == want);
         fired += std::find(want.begin(), want.end(), 101) != want.end();
     }

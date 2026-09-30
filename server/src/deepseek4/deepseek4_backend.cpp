@@ -4484,7 +4484,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     const bool budget_hook_active = !req.budget_hook.close_token_ids.empty();
     const bool budget_requires_ar = budget_hook_active &&
         (env_flag_disabled("LUCE_DS4_SPEC_HOOK") ||
-         req.n_gen - 1 - req.budget_hook.hard_limit_remaining < 1);
+         req.n_gen <= req.budget_hook.hard_limit_remaining);
     // Sampling and penalties run through DSpark as speculative sampling
     // (deepseek4_spec_sampling.h): drafts stay greedy and each is kept with
     // the target sampler's probability, so tokens follow the request's sampler.
