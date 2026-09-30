@@ -508,8 +508,8 @@ private:
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected);
     // Save the live post-generation state as an inline checkpoint of the
-    // prompt plus the generated tokens `canonical` (the conversation with
-    // this turn appended, as the next request renders it) agrees with.
+    // prompt plus those generated tokens that agree with `canonical` (the
+    // conversation with this turn appended, as the next request renders it).
     bool save_generated_turn(
         const std::vector<int32_t> & prompt,
         const std::vector<int32_t> & generated,

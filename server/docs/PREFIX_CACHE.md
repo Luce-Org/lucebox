@@ -224,11 +224,11 @@ snapshots there, since no saved state lies past it otherwise.
 
 After a tool-call turn the server also keeps the state the generation left
 behind, keyed by the prompt plus the generated tokens the next request renders
-identically (see [Agent Turn Cache](API.md#agent-turn-cache)). That snapshot is
-deferred: while the next request continues the conversation it is never copied
+identically (see [Agent Turn Cache](API.md#agent-turn-cache)). Qwen defers that
+snapshot: while the next request continues the conversation it is never copied
 to system RAM, and it is copied out only before other work would overwrite the
-live state. Restoring the snapshot the live state already holds copies nothing
-back either.
+live state, or when the disk cache persists it at shutdown. Restoring the
+snapshot the live state already holds copies nothing back either.
 
 Coding agents grow one conversation turn by turn, and each turn's snapshot is a
 strict prefix of the next. After committing a snapshot, the single-sequence

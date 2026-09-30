@@ -1616,6 +1616,7 @@ void HttpServer::shutdown() {
     if (!disk_cache_.disabled() && !slot_tokens_.empty()) {
         std::fprintf(stderr, "[disk-cache] shutdown: saving %zu tracked slots\n",
                      slot_tokens_.size());
+        backend_.snapshot_flush_deferred();
         for (auto & [slot, tokens] : slot_tokens_) {
             if (backend_.snapshot_used(slot)) {
                 disk_cache_.learn_layout(slot);
@@ -1841,6 +1842,7 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
     if (!disk_cache_.disabled() && !slot_tokens_.empty()) {
         std::fprintf(stderr, "[disk-cache] shutdown: saving %zu tracked slots\n",
                      slot_tokens_.size());
+        backend_.snapshot_flush_deferred();
         for (auto & [slot, tokens] : slot_tokens_) {
             if (backend_.snapshot_used(slot)) {
                 disk_cache_.learn_layout(slot);
@@ -4316,10 +4318,8 @@ bool HttpServer::save_generated_turn(
     forget_inline_slot_metadata(slot);
     backend_.snapshot_free(slot);
     // The next request usually continues this state, so the backend may
-    // keep it live instead of copying it out. Disk persistence reads the
-    // payload, so it needs the copy.
-    const bool saved = disk_cache_.disabled()
-        ? backend_.snapshot_save_deferred(slot) : backend_.snapshot_save(slot);
+    // keep it live instead of copying it out.
+    const bool saved = backend_.snapshot_save_deferred(slot);
     const int saved_pos = saved ? backend_.snapshot_cur_pos(slot) : 0;
     if (saved_pos <= prompt_len || saved_pos > matched) {
         backend_.snapshot_free(slot);

@@ -133,6 +133,7 @@ public:
 
     bool snapshot_save(int slot) override;
     bool snapshot_save_deferred(int slot) override;
+    void snapshot_flush_deferred() override { materialize_live_snapshot(); }
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;

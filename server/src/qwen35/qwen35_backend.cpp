@@ -1916,7 +1916,16 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     }
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
-    int prefill_ubatch = qwen35_prefill_ubatch(512);
+    // A chunk never ends within kMinChunkTokens of its start, except at the
+    // end of the prompt: a chunk of a few tokens in the middle of a prompt
+    // produced NaN logits on the R9700 (Qwen3.8, a 2-token chunk after a
+    // restore). A restore away from every restore point (a generated-turn
+    // checkpoint) cannot reproduce a cold prefill anyway, so its first chunk
+    // runs further before stopping. Both rules depend only on where chunks
+    // start, so a cold prefill and a restored one still cut alike.
+    constexpr int kMinChunkTokens = 16;
+    constexpr int kOffGridMinLeadTokens = 64;
+    int prefill_ubatch = std::max(kMinChunkTokens, qwen35_prefill_ubatch(512));
     const int prompt_len = (int)tokens.size();
     prefill_last_logits_valid_ = false;
 
@@ -1993,15 +2002,6 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
     }
 
-    // A chunk never ends within kMinChunkTokens of its start, except at the
-    // end of the prompt: a chunk of a few tokens in the middle of a prompt
-    // produced NaN logits on the R9700 (Qwen3.8, a 2-token chunk after a
-    // restore). A restore away from every restore point (a generated-turn
-    // checkpoint) cannot reproduce a cold prefill anyway, so its first chunk
-    // runs further before stopping. Both rules depend only on where chunks
-    // start, so a cold prefill and a restored one still cut alike.
-    constexpr int kMinChunkTokens = 16;
-    constexpr int kOffGridMinLeadTokens = 64;
     const bool restored_off_grid = kv_offset > 0 &&
         !std::binary_search(restore_points.begin(), restore_points.end(), kv_offset);
 

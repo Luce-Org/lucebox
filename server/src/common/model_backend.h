@@ -238,8 +238,10 @@ struct ModelBackend {
     // live state as the snapshot and copy it out only before something
     // changes that state. A restore of `slot` as the very next operation
     // then continues the live state without any copy, and consumes it.
-    // snapshot_ref() does not see a snapshot that was never copied.
+    // snapshot_ref() sees it only after snapshot_flush_deferred().
     virtual bool snapshot_save_deferred(int slot) { return snapshot_save(slot); }
+    // Copy a snapshot snapshot_save_deferred() kept live into its slot.
+    virtual void snapshot_flush_deferred() {}
     virtual void snapshot_free(int slot) = 0;
     virtual bool snapshot_used(int slot) const = 0;
     virtual int  snapshot_cur_pos(int slot) const = 0;
@@ -272,11 +274,16 @@ struct ModelBackend {
             slot, result.decode_s);
         GenerateRequest retry = req;
         retry.force_ar_decode = true;
+        if (snapshot_used(slot)) {
+            return merge_empty_spec_retry_result(
+                result, restore_and_generate_impl(slot, retry, io));
+        }
         // A deferred snapshot the first attempt continued in place no
         // longer exists (snapshot_save_deferred()); prefill the prompt.
-        return merge_empty_spec_retry_result(result, snapshot_used(slot)
-            ? restore_and_generate_impl(slot, retry, io)
-            : generate_impl(retry, io));
+        GenerateResult merged =
+            merge_empty_spec_retry_result(result, generate_impl(retry, io));
+        merged.restored_prefix_tokens = 0;
+        return merged;
     }
 
     virtual GenerateResult restore_and_generate_impl(int slot,

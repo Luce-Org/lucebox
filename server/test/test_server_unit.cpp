@@ -6111,34 +6111,49 @@ TEST_CASE(ServerUnitFixture, test_qwen35_prefill_chunks) {
 }
 
 // An agent turn that continues a generated-turn checkpoint skips its own
-// snapshot while another checkpoint lies close behind; other requests keep it.
+// snapshot while another checkpoint lies close behind; it keeps it when the
+// other checkpoints are far behind, and other requests always keep it.
 TEST_CASE(ServerUnitFixture, test_agent_continuation_throttles_snapshot) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    auto backend_owner = std::make_unique<SlotSetBackend>();
-    SlotSetBackend & backend = *backend_owner;
-    LuceEngine engine(std::move(backend_owner));
-    ServerConfig config;
-    config.prefix_cache_cap = 4;
-    HttpServer server(engine, tokenizer, config);
-    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
 
-    const std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102, 3, 103, 4};
-    cache.confirm_inline_snap(0, 3, prompt);
-    cache.confirm_inline_snap(1, 6, prompt);
-    SchedulerTestHarness::mark_agent_turn(server, 1);
-    backend.positions[0] = 3;
-    backend.positions[1] = 6;
+    // Slot 0 holds the first 3 tokens, slot 1 a generated-turn checkpoint
+    // `filler` + 5 tokens in, and the prompt adds one more turn.
+    const auto prepare = [&](int filler, bool ends_with_tool_result) {
+        auto backend_owner = std::make_unique<SlotSetBackend>();
+        SlotSetBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.prefix_cache_cap = 4;
+        HttpServer server(engine, tokenizer, config);
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
 
-    const auto agent = SchedulerTestHarness::prepare_cache(
-        server, prompt, /*ends_with_tool_result=*/true);
-    TEST_ASSERT(agent.restore_slot == 1);
-    TEST_ASSERT(!agent.snapshot);
+        std::vector<int32_t> prompt = {1, 100, 3, 101, 4};
+        prompt.insert(prompt.end(), (size_t) filler, 102);
+        const int checkpoint = (int) prompt.size();
+        prompt.insert(prompt.end(), {3, 103, 4});
+        cache.confirm_inline_snap(0, 3, prompt);
+        cache.confirm_inline_snap(1, checkpoint, prompt);
+        SchedulerTestHarness::mark_agent_turn(server, 1);
+        backend.positions[0] = 3;
+        backend.positions[1] = checkpoint;
+        return SchedulerTestHarness::prepare_cache(
+            server, prompt, ends_with_tool_result);
+    };
 
-    const auto chat = SchedulerTestHarness::prepare_cache(server, prompt);
+    const auto near = prepare(1, /*ends_with_tool_result=*/true);
+    TEST_ASSERT(near.restore_slot == 1);
+    TEST_ASSERT(!near.snapshot);
+
+    const auto chat = prepare(1, /*ends_with_tool_result=*/false);
     TEST_ASSERT(chat.restore_slot == 1);
     TEST_ASSERT(chat.snapshot);
+
+    // Slot 0 lies more than 2048 tokens behind the cut.
+    const auto far = prepare(2100, /*ends_with_tool_result=*/true);
+    TEST_ASSERT(far.restore_slot == 1);
+    TEST_ASSERT(far.snapshot);
     unlink(path.c_str());
 }
 
@@ -8540,6 +8555,7 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_consumed_restore_with_pr
     TEST_ASSERT(backend.restore_calls == 1);
     TEST_ASSERT(backend.generate_calls == 1);
     TEST_ASSERT(backend.generate_saw_force_ar);
+    TEST_ASSERT(result.restored_prefix_tokens == 0);
 }
 
 TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_generate_once_with_ar) {
