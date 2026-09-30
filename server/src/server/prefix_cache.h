@@ -189,7 +189,10 @@ public:
 
     // Resize the resident budget (the concurrent scheduler sizes it once the
     // batch engine can estimate a checkpoint).
-    void set_max_resident_bytes(size_t bytes) { max_resident_bytes_ = bytes; }
+    void set_max_resident_bytes(size_t bytes) {
+        max_resident_bytes_ = bytes;
+        max_resident_bytes_published_.store(bytes, std::memory_order_relaxed);
+    }
 
     // Select a boundary, destination, and optional budget victim as one owned
     // operation. At most one reservation can be live; destroying it cancels
@@ -340,6 +343,7 @@ private:
     // is sufficient — no synchronization with other state required.
     std::atomic<int64_t> lifetime_hits_{0};       // inline cache hits
     std::atomic<uint64_t> resident_bytes_count_{0};
+    std::atomic<uint64_t> max_resident_bytes_published_{0};   // /props mirror of max_resident_bytes_
     std::atomic<uint64_t> budget_skips_{0};
     std::atomic<uint64_t> capture_attempts_{0};
     std::atomic<uint64_t> capture_failures_{0};

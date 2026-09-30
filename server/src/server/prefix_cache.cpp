@@ -327,6 +327,7 @@ PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer,
     : cap_(std::min(cap, MAX_CACHE_SLOTS))
     , max_resident_bytes_(max_resident_bytes)
 {
+    max_resident_bytes_published_.store(max_resident_bytes_, std::memory_order_relaxed);
     if (cap_ <= 0) {
         disabled_ = true;
         cap_ = 0;
@@ -1086,7 +1087,7 @@ PrefixCache::InlineStats PrefixCache::stats() const {
     out.in_use =
         (int)entries_size_count_.load(std::memory_order_relaxed);
     out.lifetime_hits = lifetime_hits_.load(std::memory_order_relaxed);
-    out.max_resident_bytes = (uint64_t)max_resident_bytes_;
+    out.max_resident_bytes = max_resident_bytes_published_.load(std::memory_order_relaxed);
     out.resident_bytes =
         resident_bytes_count_.load(std::memory_order_relaxed);
     out.budget_skips = budget_skips_.load(std::memory_order_relaxed);

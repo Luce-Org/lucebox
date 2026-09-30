@@ -8070,10 +8070,26 @@ TEST_CASE(ServerUnitFixture, test_sampler_needs_logit_processing) {
     TEST_ASSERT(!cfg.needs_logit_processing());
 }
 
+TEST_CASE(ServerUnitFixture, test_auto_concurrent_prefix_budget) {
+    const size_t MiB = 1024 * 1024, GiB = 1024 * MiB;
+    const size_t floor = ServerConfig::kConcurrentPrefixBudgetFloor;
+    // Small checkpoints stay at the former 4 GiB default.
+    TEST_ASSERT(auto_concurrent_prefix_budget(100 * MiB, 4, 128 * GiB) == floor);
+    // 2 x slots + 1 checkpoints when that is above the floor and under the cap.
+    TEST_ASSERT(auto_concurrent_prefix_budget(1237 * MiB, 4, 128 * GiB) == 9 * 1237 * MiB);
+    // Capped at a quarter of the available memory...
+    TEST_ASSERT(auto_concurrent_prefix_budget(4 * GiB, 8, 64 * GiB) == 16 * GiB);
+    // ...but never below the floor, and unknown memory does not cap.
+    TEST_ASSERT(auto_concurrent_prefix_budget(4 * GiB, 8, 8 * GiB) == floor);
+    TEST_ASSERT(auto_concurrent_prefix_budget(1 * GiB, 4, 0) == 9 * GiB);
+    // A non-positive slot count sizes one slot.
+    TEST_ASSERT(auto_concurrent_prefix_budget(2 * GiB, 0, 0) == 6 * GiB);
+}
+
 TEST_CASE(ServerUnitFixture, test_server_config_cache_defaults) {
     ServerConfig cfg;
     TEST_ASSERT(cfg.prefix_cache_cap == 32);
-    TEST_ASSERT(cfg.concurrent_prefix_cache_max_bytes == (size_t)4 * 1024 * 1024 * 1024);
+    TEST_ASSERT(cfg.concurrent_prefix_cache_max_bytes == ServerConfig::kPrefixCacheBudgetAuto);
     TEST_ASSERT(!cfg.concurrent_paged_prefix_cache);
     TEST_ASSERT(cfg.prefill_cache_cap == 0);
 }

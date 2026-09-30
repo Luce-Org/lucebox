@@ -203,9 +203,9 @@ static void print_usage(const char * prog) {
         "                       and reject an explicit limit\n"
         "  --concurrent-prefix-cache-max-mib <MiB>\n"
         "                       Resident RAM limit for copied concurrent paged\n"
-        "                       checkpoints (default: auto = 2 x slots + 1 snapshots\n"
-        "                       at --max-ctx, at least 4096 MiB, at most 1/4 of\n"
-        "                       available memory; 0 unlimited)\n"
+        "                       checkpoints (default: auto = 2 x --max-concurrency + 1\n"
+        "                       checkpoints at --max-ctx, at least 4096 MiB; above\n"
+        "                       that at most 1/4 of available memory; 0 unlimited)\n"
         "  --agent-turn-cache         When the next request renders a tool-call turn\n"
         "                       with other tokens, prefill it into the prefix\n"
         "                       cache while idle\n"
@@ -650,9 +650,10 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         } else if (std::strcmp(
                        argv[i], "--concurrent-prefix-cache-max-mib") == 0) {
             if (i + 1 >= argc ||
-                !parse_mib(argv[++i], sconfig.concurrent_prefix_cache_max_bytes)) {
+                !parse_mib_or_auto(argv[++i], ServerConfig::kPrefixCacheBudgetAuto,
+                                   sconfig.concurrent_prefix_cache_max_bytes)) {
                 std::fprintf(stderr,
-                    "[server] --concurrent-prefix-cache-max-mib must be a "
+                    "[server] --concurrent-prefix-cache-max-mib must be auto or a "
                     "non-negative "
                     "integer that fits in addressable memory\n");
                 return 2;

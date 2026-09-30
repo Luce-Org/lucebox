@@ -203,7 +203,7 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 |-------------|---------|-------------|
 | `--prefix-cache-slots N` | 32 | Max turn-boundary prefix cache slots |
 | `--prefix-cache-max-mib auto\|N` | auto | Resident RAM limit for single-sequence prefix snapshots; `auto` keeps room for three snapshots at `--max-ctx`, capped at a quarter of the memory available at startup (a readable cgroup v2 container limit is included; otherwise total physical RAM is used); `0` is unlimited. Enforced for Qwen and DeepSeek4 (not DeepSeek4 mixed-backend splits): other backends cannot size snapshots, so `auto` stays unlimited there and an explicit limit is rejected at startup |
-| `--concurrent-prefix-cache-max-mib N` | auto | Resident RAM limit for copied concurrent paged checkpoints; auto = 2 x slots + 1 checkpoints at `--max-ctx` (at least 4096 MiB, at most 1/4 of available memory); `0` is unlimited |
+| `--concurrent-prefix-cache-max-mib N` | auto | Resident RAM limit for copied concurrent paged checkpoints; `auto` = 2 x `--max-concurrency` + 1 checkpoints at `--max-ctx`, at least 4096 MiB; above that, at most 1/4 of available memory; `0` is unlimited |
 | `--prefill-cache-slots N` | 0 | Max exact full-prompt prefill cache slots |
 | `--skip-park` | false | Skip parking draft model during compress |
 
@@ -262,9 +262,11 @@ can exceed the limit by up to one checkpoint.
 By default the limit is sized when the scheduler starts, from the batch
 engine's own estimate of one checkpoint at `--max-ctx`: every slot keeps its
 conversation's restore point and the capture in flight, and all slots share the
-system/tools head, so the budget holds 2 x slots + 1 checkpoints. It is never
-below 4096 MiB (the former fixed default) and never above a quarter of the
-available memory. With a fixed 4096 MiB, four Qwen3.8-27B coding agents with
+system/tools head, so the budget holds 2 x `--max-concurrency` + 1
+checkpoints. It is never below 4096 MiB (the former fixed default); above that
+it is capped at a quarter of the available memory (the container limit when one
+applies, else total physical memory when availability cannot be read), so a host
+with less than 16 GiB keeps the former 4096 MiB. With a fixed 4096 MiB, four Qwen3.8-27B coding agents with
 20K-token conversations could not store their deeper checkpoints: every turn fell
 back to the system/tools head and re-read most of the conversation.
 

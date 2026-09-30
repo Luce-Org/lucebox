@@ -375,6 +375,10 @@ struct PrefixCacheBudget {
     std::string error;        // set when an explicit limit cannot apply;
                               // startup rejects that configuration
 };
+// Automatic concurrent paged prefix budget: 2 x slots + 1 checkpoints of
+// per_checkpoint bytes, at least ServerConfig::kConcurrentPrefixBudgetFloor
+// and, above that, at most memory / 4 when memory is known (non-zero).
+size_t auto_concurrent_prefix_budget(size_t per_checkpoint, int slots, size_t memory);
 PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
                                               const ModelBackend & backend);
 

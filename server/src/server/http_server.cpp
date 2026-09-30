@@ -1321,16 +1321,19 @@ static size_t budgetable_memory_bytes() {
     return 0;
 }
 
-size_t HttpServer::concurrent_prefix_budget(size_t per_checkpoint, int slots) const {
-    // Each slot keeps its conversation's restore point and the capture in
-    // flight, plus one shared system/tools head: 2 x slots + 1 checkpoints at
-    // --max-ctx. Never less than the old 4 GiB default, never more than a
-    // quarter of the memory available.
-    size_t bytes = std::max(ServerConfig::kConcurrentPrefixBudgetFloor,
-                            per_checkpoint * (2 * (size_t)std::max(1, slots) + 1));
-    const size_t memory = budgetable_memory_bytes();
-    if (memory > 0) bytes = std::min(bytes, std::max(ServerConfig::kConcurrentPrefixBudgetFloor, memory / 4));
+size_t auto_concurrent_prefix_budget(size_t per_checkpoint, int slots, size_t memory) {
+    // Each decode slot keeps its conversation's restore point and the capture
+    // in flight, plus one shared system/tools head: 2 x slots + 1 checkpoints
+    // at --max-ctx. Never less than the former fixed 4096 MiB; above that,
+    // never more than a quarter of the memory available (when known).
+    const size_t floor = ServerConfig::kConcurrentPrefixBudgetFloor;
+    size_t bytes = std::max(floor, per_checkpoint * (2 * (size_t)std::max(1, slots) + 1));
+    if (memory > 0) bytes = std::min(bytes, std::max(floor, memory / 4));
     return bytes;
+}
+
+size_t HttpServer::concurrent_prefix_budget(size_t per_checkpoint, int slots) const {
+    return auto_concurrent_prefix_budget(per_checkpoint, slots, budgetable_memory_bytes());
 }
 
 PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,

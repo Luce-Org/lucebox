@@ -306,7 +306,7 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--kvflash-tau <N>` | `64` | Drafter-policy reselect interval. |
 | `--prefix-cache-slots <N>` | `32` | In-memory prefix-cache slots; `0` disables. |
 | `--prefix-cache-max-mib <auto\|MiB>` | `auto` | Resident RAM limit for single-sequence prefix snapshots (Qwen and DeepSeek4); `auto` keeps room for three snapshots at `--max-ctx`, at most a quarter of available memory; `0` is unlimited. See [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md#configuration). |
-| `--concurrent-prefix-cache-max-mib <MiB>` | auto | Resident RAM limit for copied concurrent paged prefix checkpoints. Auto sizes it at startup for 2 x slots + 1 checkpoints at `--max-ctx`, at least 4096 MiB and at most 1/4 of available memory; `0` is unlimited. |
+| `--concurrent-prefix-cache-max-mib <MiB>` | auto | Resident RAM limit for copied concurrent paged prefix checkpoints. `auto` sizes it when the scheduler starts: 2 x `--max-concurrency` + 1 checkpoints at `--max-ctx`, at least 4096 MiB (the former default); above that, at most 1/4 of available memory. `0` is unlimited. |
 | `--agent-turn-cache` | off | Replay a generated tool-call turn the next request renders differently, so prefix caching still extends through it. |
 | `--prefill-cache-slots <N>` | `0` | Full-prompt cache slots. |
 | `--paged-attention` | off | Enable paged KV for supported Qwen targets (16-token blocks) or DeepSeek4 on Strix Halo and R9700 plus Strix Halo (128-token pages). DeepSeek4 paged serving is AR-only. |
