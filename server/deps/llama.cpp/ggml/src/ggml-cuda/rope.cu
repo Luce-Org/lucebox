@@ -560,12 +560,8 @@ static void rope_multi_cuda(const T *            x,
 #else
     const bool per_token = false;
 #endif
-    // Explicit parity mode; preserve the fork's FP64 long-context default.
-    static const bool upstream_f32 = [] {
-        const char * v = getenv("QWEN4EXP_ROPE_F32");
-        const char * ref = getenv("QWEN4EXP_UPSTREAM");
-        return (v && atoi(v) != 0) || (ref && atoi(ref) != 0);
-    }();
+    // Upstream parity mode; otherwise keep the fork's FP64 long-context default.
+    static const bool upstream_f32 = [] { const char * ref = getenv("QWEN4EXP_UPSTREAM"); return ref && atoi(ref) != 0; }();
     if (upstream_f32) {
         if (freq_factors == nullptr) {
             rope_multi<forward, false, true, T><<<block_nums, block_dims, 0, stream>>>(

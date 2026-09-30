@@ -17,7 +17,7 @@ namespace luce::common {
 
 // UMA graph-input ring: forward inputs in pinned host memory the iGPU reads
 // over GTT (no H2D staging). Two slots rotate so the host never overwrites
-// inputs a still-submitted graph may read. Opt out: LUCE_HIP_NO_UMA_RING=1.
+// inputs a still-submitted graph may read.
 struct Qwen4ExpInputRing {
     bool                  enabled    = false;
     int                   next_slot  = 0;
@@ -38,8 +38,8 @@ struct Qwen4ExpDecodeWorkspace {
     ggml_gallocr_t alloc = nullptr;
     bool planned = false;
 
-    // Stable T=1 graph state (QWEN4EXP_DECODE_STABLEGRAPH=1). The graph is
-    // rebuilt only when the fixed attention-span bucket changes.
+    // Stable T=1 graph state. The graph is rebuilt only when the fixed
+    // attention-span bucket changes.
     ggml_cgraph * gf = nullptr;
     ggml_tensor * inp_emb = nullptr;
     ggml_tensor * positions = nullptr;
@@ -48,7 +48,6 @@ struct Qwen4ExpDecodeWorkspace {
     ggml_tensor * kv_row = nullptr;
     ggml_tensor * logits = nullptr;
     int64_t kv_bucket = 0;
-    uint64_t stable_calls = 0;
 };
 
 // Shared arena for exact-width independent-sequence decode. Unlike the stable
@@ -99,8 +98,7 @@ struct Qwen4ExpCache {
     // Pinned graph-input ring (see Qwen4ExpInputRing).
     Qwen4ExpInputRing input_ring;
 
-    // T=1 decode workspace reuse, on by default (disable with
-    // QWEN4EXP_DECODE_REUSE=0; excluded under QWEN4EXP_UPSTREAM=1).
+    // T=1 decode workspace reuse (excluded under QWEN4EXP_UPSTREAM=1).
     Qwen4ExpDecodeWorkspace decode_workspace;
 };
 

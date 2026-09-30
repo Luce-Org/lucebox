@@ -848,7 +848,6 @@ static void launch_gated_delta_net(
         replay_log_d == nullptr && gate_bias == nullptr && gate_A == nullptr &&
         state_out_d != nullptr && n_seqs == 1 && S_v == 128 && H == 48 &&
         GGML_CUDA_CC_IS_RDNA3_5(cc) && n_tokens >= 16 && n_tokens <= 32768 &&
-        getenv("LUCE_GDN_NO_TILED") == nullptr &&
         // Explicit route overrides win: the qualification test pins scalar or
         // grouped_cols via these, so the tiled path must not shadow them.
         getenv("LUCE_GDN_FORCE_GROUPED_COLS") == nullptr &&

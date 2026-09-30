@@ -4,7 +4,6 @@
 #include "ggml-cuda.h"
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -58,11 +57,6 @@ static bool run_case(ggml_backend_t gpu, int tokens, bool strided, int heads = 1
     return ok;
 }
 int main() {
-#ifdef _WIN32
-    _putenv_s("QWEN4EXP_RMS_SCALE_FUSED", "1");
-#else
-    setenv("QWEN4EXP_RMS_SCALE_FUSED", "1", 1);
-#endif
     ggml_backend_t gpu = ggml_backend_cuda_init(0);
     if (!gpu) return 77;
     bool ok = true;

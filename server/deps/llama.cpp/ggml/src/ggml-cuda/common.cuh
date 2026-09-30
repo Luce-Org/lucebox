@@ -1204,9 +1204,6 @@ struct ggml_cuda_pool {
     virtual void free(void * ptr, size_t size) = 0;
     virtual bool is_legacy() const = 0;
     virtual size_t trim() = 0;
-
-    // Bytes currently held by the pool. Diagnostics only (GGML_CUDA_POOL_LOG).
-    virtual size_t size_bytes() const { return 0; }
 };
 
 template<typename T>

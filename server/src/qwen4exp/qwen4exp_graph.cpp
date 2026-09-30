@@ -27,9 +27,10 @@ static double prof_now_ms() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-static bool batch_telemetry_enabled() {
-    const char * value = std::getenv("QWEN4EXP_BATCH_TELEMETRY");
-    return value && std::atoi(value) != 0;
+// QWEN4EXP_PROF=1: per-call phase timings, forward-call timestamps and graph batch widths.
+static bool prof_enabled() {
+    static const bool on = std::getenv("QWEN4EXP_PROF") != nullptr;
+    return on;
 }
 
 // F16 activation paths for gfx1151 MMB prefill (gated-norm tail, attention gate, MoE fold). Default on; QWEN4EXP_F16=0
@@ -49,8 +50,7 @@ static double mono_now_s() {
 
 static void trace_batch_widths(ggml_cgraph * gf, const char * phase,
                                int rows, int max_kv) {
-    const char * enabled = std::getenv("QWEN4EXP_BATCH_TELEMETRY");
-    if (!enabled || std::atoi(enabled) == 0 || !gf) return;
+    if (!prof_enabled() || !gf) return;
 
     std::map<int, int> matmul_widths, mmid_widths;
     std::map<std::string, int> state_ops;
@@ -323,7 +323,7 @@ struct Qwen4ExpMoeParts {
     // Keep the unfused form for upstream differential checks.
     static const bool moe_fused = [] {
         const char * v = getenv("QWEN4EXP_UPSTREAM");
-        return !(v && std::atoi(v) != 0) && getenv("QWEN4EXP_MOE_UNFUSED") == nullptr;
+        return !(v && std::atoi(v) != 0);
     }();
     if (!moe_fused) {
         // Upstream aggregate: weight every route (broadcast mul), then sequential
@@ -395,17 +395,9 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor 
     ggml_tensor * k_raw = ggml_view_3d(c, conv, D, Hk, T, D * esz, tstride, D * Hk * esz);
     // Upstream build_gdn_l2_norm is rms_norm(x, eps/n) * (1/sqrt(n)) == x/sqrt(sum(x^2)+eps).
     // ggml_l2_norm instead rounds x*rsqrtf(max(sum(x^2), eps^2)), a ~1e-6 relative difference
-    // that seeds the GDN recurrence and flips MoE routing; keep it only behind an env gate.
-    static const bool gdnl2_legacy = getenv("QWEN4EXP_GDNL2_LEGACY") != nullptr;
-    ggml_tensor * q_c;
-    ggml_tensor * k_c;
-    if (gdnl2_legacy) {
-        q_c = ggml_l2_norm(c, q_raw, eps);
-        k_c = ggml_l2_norm(c, k_raw, eps);
-    } else {
-        q_c = ggml_scale(c, ggml_rms_norm(c, q_raw, eps / (float) D), 1.0f / sqrtf((float) D));
-        k_c = ggml_scale(c, ggml_rms_norm(c, k_raw, eps / (float) D), 1.0f / sqrtf((float) D));
-    }
+    // that seeds the GDN recurrence and flips MoE routing.
+    ggml_tensor * q_c = ggml_scale(c, ggml_rms_norm(c, q_raw, eps / (float) D), 1.0f / sqrtf((float) D));
+    ggml_tensor * k_c = ggml_scale(c, ggml_rms_norm(c, k_raw, eps / (float) D), 1.0f / sqrtf((float) D));
     ggml_tensor * v_c = ggml_view_3d(c, conv, D, Hv, T, D * esz, tstride, 2 * D * Hk * esz);
 
     ggml_tensor * state4 = ggml_reshape_4d(c, ssm_state, D, D, Hv, 1);
@@ -1042,15 +1034,10 @@ static ggml_tensor * build_linear_attn_projected_sequence(
                                        tstride, 0);
     ggml_tensor * k_raw = ggml_view_3d(c, conv, D, Hk, T, D * esz,
                                        tstride, D * Hk * esz);
-    static const bool gdnl2_legacy = std::getenv("QWEN4EXP_GDNL2_LEGACY") != nullptr;
-    ggml_tensor * q_c = gdnl2_legacy
-        ? ggml_l2_norm(c, q_raw, eps)
-        : ggml_scale(c, ggml_rms_norm(c, q_raw, eps / (float) D),
-                     1.0f / sqrtf((float) D));
-    ggml_tensor * k_c = gdnl2_legacy
-        ? ggml_l2_norm(c, k_raw, eps)
-        : ggml_scale(c, ggml_rms_norm(c, k_raw, eps / (float) D),
-                     1.0f / sqrtf((float) D));
+    ggml_tensor * q_c = ggml_scale(c, ggml_rms_norm(c, q_raw, eps / (float) D),
+                                   1.0f / sqrtf((float) D));
+    ggml_tensor * k_c = ggml_scale(c, ggml_rms_norm(c, k_raw, eps / (float) D),
+                                   1.0f / sqrtf((float) D));
     ggml_tensor * v_c = ggml_view_3d(c, conv, D, Hv, T, D * esz,
                                      tstride, 2 * D * Hk * esz);
     ggml_tensor * state4 = ggml_reshape_4d(c, ssm_state, D, D, Hv, 1);
@@ -1177,27 +1164,15 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                                        std::vector<float> & out_logits) {
     Qwen4ExpForwardResult res;
     if (n_tokens <= 0 || pos0 < 0 || !tokens) return res;
-    static const bool prof = getenv("QWEN4EXP_PROF") != nullptr;
+    const bool prof = prof_enabled();
     // QWEN4EXP_DUMP=1 materialises per-layer activations and prints finite/absmax/mean.
     static const bool dump = getenv("QWEN4EXP_DUMP") != nullptr;
     // The fused reduction can differ from upstream's ggml_rms_norm below one
     // ulp; keep the unfused form for upstream differential checks.
     static const bool upstream = [] { const char * v = getenv("QWEN4EXP_UPSTREAM"); return v && std::atoi(v) != 0; }();
-    static const bool hc_fused = !upstream && getenv("QWEN4EXP_HC_UNFUSED") == nullptr;
-    static const bool decode_reuse = [] {
-        const char * value = getenv("QWEN4EXP_DECODE_REUSE");
-        return !(value && std::atoi(value) == 0);
-    }();
-    static const bool stable_graph = [] {
-        const char * value = getenv("QWEN4EXP_DECODE_STABLEGRAPH");
-        return !(value && std::atoi(value) == 0);
-    }();
-    static const bool stable_telemetry = [] {
-        const char * value = getenv("QWEN4EXP_STABLEGRAPH_TELEMETRY");
-        return value && std::atoi(value) != 0;
-    }();
-    const bool reuse_decode_workspace = decode_reuse && !upstream && n_tokens == 1 && !dump;
-    const bool use_stable_graph = stable_graph && reuse_decode_workspace;
+    const bool hc_fused = !upstream;
+    // T=1 decode reuses one context/allocator and a stable bucketed graph.
+    const bool use_stable_graph = !upstream && n_tokens == 1 && !dump;
     std::vector<std::pair<ggml_tensor *, std::string>> dump_t;
     auto dump_mark = [&](ggml_tensor * t, const char * label) {
         if (t && dump) {
@@ -1281,7 +1256,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     if (prof) t_ple = prof_now_ms();
     const int64_t T = n_tokens;
     const int64_t kv_len = pos0 + n_tokens;
-    static const bool fa_pad256 = upstream || [] { const char * v = getenv("QWEN4EXP_FA_PAD256"); return v && std::atoi(v) != 0; }();
+    const bool fa_pad256 = upstream;   // the upstream reference pads K/V to 256
     // Give a new stable graph at least one full 256-token generation window.
     // The fixed mask excludes its padded tail, while the stable K/V views and
     // set_rows index keep every graph pointer and property unchanged.
@@ -1314,11 +1289,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         }
         out_logits.resize((size_t) w.n_vocab);
         ggml_backend_tensor_get(ws.logits, out_logits.data(), 0, sizeof(float) * w.n_vocab);
-        ws.stable_calls++;
-        if (stable_telemetry && (ws.stable_calls <= 4 || ws.stable_calls % 128 == 0)) {
-            std::fprintf(stderr, "[qwen4exp-stable] event=reuse bucket=%lld calls=%llu\n",
-                         (long long) ws.kv_bucket, (unsigned long long) ws.stable_calls);
-        }
         if (prof) {
             t_compute = prof_now_ms();
             std::fprintf(stderr,
@@ -1338,10 +1308,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         return res;
     }
     if (use_stable_graph && decode_ws.ctx) {
-        if (stable_telemetry) {
-            std::fprintf(stderr, "[qwen4exp-stable] event=rebuild old_bucket=%lld new_bucket=%lld\n",
-                         (long long) decode_ws.kv_bucket, (long long) stable_kv_bucket);
-        }
         clear_qwen4exp_decode_workspace(decode_ws);
     }
 
@@ -1350,7 +1316,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                   ggml_graph_overhead_custom(200000, false) + (1u << 20);
     ip.no_alloc = true;
     ggml_context * ctx = nullptr;
-    if (reuse_decode_workspace) {
+    if (use_stable_graph) {
         if (cache.decode_workspace.ctx == nullptr) {
             cache.decode_workspace.ctx = ggml_init(ip);
         } else {
@@ -1464,11 +1430,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         std::snprintf(dlab, sizeof dlab, "L%02d.att", il);
         dump_mark(cur, dlab);
         int64_t layer_T = T;
-        static const bool last_token_ffn = [] {
-            const char * value = getenv("QWEN4EXP_LAST_TOKEN_FFN");
-            return !(value && std::atoi(value) == 0);
-        }();
-        if ((upstream || last_token_ffn) && il == w.n_layer - 1 && T > 1) {
+        if (il == w.n_layer - 1 && T > 1) {
             // Upstream selects output rows before the final HC/FFN, so its
             // quantized matmuls dispatch with one token (MMV rather than MMQ).
             // The default path reuses that selection after all attention cache
@@ -1503,9 +1465,8 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         const bool next_ple = (il + 1 < w.n_layer) && w.layers[il + 1].is_ple && has_ple;
         // Prefill: the MoE combine runs inside the next HC_COMBINE_NORM (one kernel fewer; last-bit numerics change
         // from FMA contraction in the new kernel, covered by the long-prompt quality gate). Not at T=1: it cost ~1.7% decode.
-        static const bool moe_unfused = getenv("QWEN4EXP_MOE_UNFUSED") != nullptr;
         Qwen4ExpMoeParts moe_parts;
-        const bool fold = f16_paths() && !moe_unfused && hc_fused && !next_ple && ggml_backend_cuda_mmb_prefill(layer_T);
+        const bool fold = f16_paths() && hc_fused && !next_ple && ggml_backend_cuda_mmb_prefill(layer_T);
         cur = build_moe(ctx, cur, L, w, il, dump_mark, fold ? &moe_parts : nullptr);
         std::snprintf(dlab, sizeof dlab, "L%02d.moe", il);
         dump_mark(cur, dlab);
@@ -1597,7 +1558,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     }
 
     ggml_gallocr_t galloc = nullptr;
-    if (reuse_decode_workspace) {
+    if (use_stable_graph) {
         if (cache.decode_workspace.alloc == nullptr) {
             cache.decode_workspace.alloc =
                 ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -1608,25 +1569,25 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     }
     if (!galloc) {
         std::fprintf(stderr, "[qwen4exp] graph allocator creation failed\n");
-        if (!reuse_decode_workspace) ggml_free(ctx);
+        if (!use_stable_graph) ggml_free(ctx);
         return res;
     }
     // T=1 graphs keep the same broad shape but advancing KV views can change
     // lifetimes. Recompute assignments while retaining the allocator buffers;
     // reusing the old index-wise plan produced incorrect tokens.
-    const bool reserve_ok = !reuse_decode_workspace ||
+    const bool reserve_ok = !use_stable_graph ||
         !cache.decode_workspace.planned || ggml_gallocr_reserve(galloc, gf);
     if (!reserve_ok || !ggml_gallocr_alloc_graph(galloc, gf)) {
         std::fprintf(stderr, "[qwen4exp] graph alloc failed (T=%lld kv_len=%lld)\n",
                      (long long) T, (long long) kv_len);
-        if (reuse_decode_workspace) cache.decode_workspace.planned = false;
-        if (!reuse_decode_workspace) {
+        if (use_stable_graph) cache.decode_workspace.planned = false;
+        if (!use_stable_graph) {
             ggml_gallocr_free(galloc);
             ggml_free(ctx);
         }
         return res;
     }
-    if (reuse_decode_workspace) cache.decode_workspace.planned = true;
+    if (use_stable_graph) cache.decode_workspace.planned = true;
 
     if (use_stable_graph) {
         decode_ws.gf = gf;
@@ -1637,11 +1598,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         decode_ws.kv_row = kv_row;
         decode_ws.logits = logits;
         decode_ws.kv_bucket = stable_kv_bucket;
-        decode_ws.stable_calls = 0;
-        if (stable_telemetry) {
-            std::fprintf(stderr, "[qwen4exp-stable] event=build bucket=%lld nodes=%d\n",
-                         (long long) stable_kv_bucket, ggml_graph_n_nodes(gf));
-        }
     }
 
     if (prof) t_alloc = prof_now_ms();
@@ -1697,13 +1653,13 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     }
 
     if (prof) t_upload = prof_now_ms();
-    const bool call_telemetry = batch_telemetry_enabled();
+    const bool call_telemetry = prof_enabled();
     const double call_begin_s = call_telemetry ? mono_now_s() : 0.0;
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[qwen4exp] graph compute failed\n");
         if (use_stable_graph) {
             clear_qwen4exp_decode_workspace(decode_ws);
-        } else if (!reuse_decode_workspace) {
+        } else {
             ggml_gallocr_free(galloc);
             ggml_free(ctx);
         }
@@ -1717,14 +1673,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         std::fprintf(stderr,
             "[qwen4exp-forward-call] T=%d pos=%d begin_abs=%.9f done_abs=%.9f\n",
             n_tokens, pos0, call_begin_s, mono_now_s());
-    }
-    if (use_stable_graph) {
-        decode_ws.stable_calls++;
-        if (stable_telemetry) {
-            std::fprintf(stderr, "[qwen4exp-stable] event=first bucket=%lld calls=%llu\n",
-                         (long long) decode_ws.kv_bucket,
-                         (unsigned long long) decode_ws.stable_calls);
-        }
     }
     if (prof) {
         t_compute = prof_now_ms();
@@ -1796,7 +1744,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         }
     }
 
-    if (!reuse_decode_workspace) {
+    if (!use_stable_graph) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
     }
@@ -1844,15 +1792,7 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
 
     static const bool hc_fused = [] {
         const char * v = std::getenv("QWEN4EXP_UPSTREAM");
-        return !(v && std::atoi(v) != 0) && std::getenv("QWEN4EXP_HC_UNFUSED") == nullptr;
-    }();
-    static const bool stable_graph = [] {
-        const char * v = std::getenv("QWEN4EXP_DECODE_STABLEGRAPH");
-        return !(v && std::atoi(v) == 0);
-    }();
-    static const bool fa_pad256 = [] {
-        const char * v = std::getenv("QWEN4EXP_FA_PAD256");
-        return v && std::atoi(v) != 0;
+        return !(v && std::atoi(v) != 0);
     }();
     const int64_t T = n_slots;
     const bool has_ple = w.ple_reader.available() && !caches[0]->ple_layer_ids.empty();
@@ -1983,16 +1923,12 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
                 ggml_set_input(pos);
                 position_inputs.push_back(pos);
                 const int64_t kv_len = (int64_t) positions[s] + 1;
-                const int64_t kv_view_len = stable_graph
-                    ? std::min<int64_t>(caches[s]->max_ctx, ((kv_len + 511) / 256) * 256)
-                    : (fa_pad256 ? (kv_len + 255) / 256 * 256 : kv_len);
+                const int64_t kv_view_len =
+                    std::min<int64_t>(caches[s]->max_ctx, ((kv_len + 511) / 256) * 256);
                 kv_view_lens[(size_t) s] = kv_view_len;
-                ggml_tensor * mask = nullptr;
-                if (stable_graph || fa_pad256) {
-                    mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_view_len, 1);
-                    ggml_set_input(mask);
-                    mask_inputs.push_back(mask);
-                }
+                ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_view_len, 1);
+                ggml_set_input(mask);
+                mask_inputs.push_back(mask);
                 // The host fills one independent M-RoPE position vector per row.
                 ggml_tensor * attn = build_full_attn_projected(ctx, gf,
                     column(ctx, qfull, s), column(ctx, kraw, s), column(ctx, vraw, s),
@@ -2090,7 +2026,7 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
         std::fill(mask.begin(), mask.begin() + kv_len, ggml_fp32_to_fp16(0.0f));
         ggml_backend_tensor_set(mask_inputs[s], mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
-    const bool batch_telemetry = batch_telemetry_enabled();
+    const bool batch_telemetry = prof_enabled();
     const auto compute_start = batch_telemetry
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const double compute_begin_s = batch_telemetry ? mono_now_s() : 0.0;
@@ -2148,16 +2084,7 @@ Qwen4ExpForwardResult qwen4exp_forward_packed(
 
     static const bool hc_fused = [] {
         const char * value = std::getenv("QWEN4EXP_UPSTREAM");
-        return !(value && std::atoi(value) != 0) &&
-               std::getenv("QWEN4EXP_HC_UNFUSED") == nullptr;
-    }();
-    static const bool fa_pad256 = [] {
-        const char * value = std::getenv("QWEN4EXP_FA_PAD256");
-        return value && std::atoi(value) != 0;
-    }();
-    static const bool last_token_ffn = [] {
-        const char * value = std::getenv("QWEN4EXP_LAST_TOKEN_FFN");
-        return !(value && std::atoi(value) == 0);
+        return !(value && std::atoi(value) != 0);
     }();
 
     const int64_t ple_heads = w.ple_n_heads;
@@ -2198,8 +2125,7 @@ Qwen4ExpForwardResult qwen4exp_forward_packed(
         all_tokens.insert(all_tokens.end(), segment.tokens,
                           segment.tokens + segment.n_tokens);
         const int64_t kv_len = (int64_t) segment.pos0 + segment.n_tokens;
-        kv_view_lens[(size_t) s] = fa_pad256
-            ? (kv_len + 255) / 256 * 256 : kv_len;
+        kv_view_lens[(size_t) s] = kv_len;
     }
 
     std::vector<float> embeddings((size_t) w.n_embd * total_rows);
@@ -2307,7 +2233,7 @@ Qwen4ExpForwardResult qwen4exp_forward_packed(
 
         const int64_t kv_len = (int64_t) segment.pos0 + count;
         const int64_t mask_len = kv_view_lens[(size_t) s];
-        if (count > 1 || fa_pad256) {
+        if (count > 1) {
             ggml_tensor * mask = ggml_new_tensor_2d(
                 ctx, GGML_TYPE_F16, mask_len, count);
             ggml_set_input(mask);
@@ -2405,7 +2331,7 @@ Qwen4ExpForwardResult qwen4exp_forward_packed(
         }
 
         int64_t layer_rows = total_rows;
-        if (last_token_ffn && il == w.n_layer - 1 && total_rows > n_segments) {
+        if (il == w.n_layer - 1 && total_rows > n_segments) {
             ggml_tensor * cur_tail = nullptr;
             ggml_tensor * inject_tail = nullptr;
             ggml_tensor * residual_tail = nullptr;
@@ -2467,26 +2393,6 @@ Qwen4ExpForwardResult qwen4exp_forward_packed(
         }
     }
 
-    if (!last_token_ffn && total_rows > n_segments) {
-        ggml_tensor * residual_tail = nullptr;
-        ggml_tensor * xn_tail = nullptr;
-        for (int s = 0; s < n_segments; ++s) {
-            const int tail = offsets[(size_t) s] + segments[s].n_tokens - 1;
-            ggml_tensor * row = ggml_view_3d(ctx, res_hc,
-                res_hc->ne[0], res_hc->ne[1], 1, res_hc->nb[1],
-                res_hc->nb[2], (size_t) tail * res_hc->nb[2]);
-            residual_tail = residual_tail
-                ? ggml_concat(ctx, residual_tail, row, 2) : row;
-            if (xn_next) {
-                ggml_tensor * xrow = ggml_view_2d(ctx, xn_next,
-                    xn_next->ne[0], 1, xn_next->nb[1],
-                    (size_t) tail * xn_next->nb[1]);
-                xn_tail = xn_tail ? ggml_concat(ctx, xn_tail, xrow, 1) : xrow;
-            }
-        }
-        res_hc = residual_tail;
-        if (xn_next) xn_next = xn_tail;
-    }
     ggml_tensor * final = xn_next
         ? hc_mix_from_xn(ctx, xn_next, w.output_hc_down, w.output_hc_up,
                          nullptr, nullptr, w.n_embd, w.n_hc)
@@ -2526,7 +2432,7 @@ Qwen4ExpForwardResult qwen4exp_forward_packed(
                 masks_host[(size_t) s].data(), 0,
                 masks_host[(size_t) s].size() * sizeof(ggml_fp16_t));
     }
-    const bool batch_telemetry = batch_telemetry_enabled();
+    const bool batch_telemetry = prof_enabled();
     const double compute_begin_s = batch_telemetry ? mono_now_s() : 0.0;
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         workspace.planned = false;

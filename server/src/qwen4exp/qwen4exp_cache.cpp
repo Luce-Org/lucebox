@@ -11,7 +11,6 @@ namespace {
 // the (pinned) host buffer type directly — the same condition the scheduler
 // UMA detection uses in ggml-backend.cpp.
 bool qwen4exp_uma_ring_supported(ggml_backend_t backend) {
-    if (getenv("LUCE_HIP_NO_UMA_RING") != nullptr) return false;
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) return false;
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -81,9 +80,8 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
         out.ple_conv_state[i] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, ple_hist, hc_dim);
     }
 
-    const char * fa_pad = getenv("QWEN4EXP_FA_PAD256");
     const char * upstream = getenv("QWEN4EXP_UPSTREAM");
-    const bool padded = (fa_pad && std::atoi(fa_pad) != 0) || (upstream && std::atoi(upstream) != 0);
+    const bool padded = upstream && std::atoi(upstream) != 0;   // the upstream reference pads K/V to 256
     const int64_t kv_capacity = padded ? (static_cast<int64_t>(max_ctx) + 255)/256*256 : max_ctx;
     for (size_t i = 0; i < n_full; ++i) {
         out.attn_k[i] = ggml_new_tensor_3d(out.ctx, kv_type,
@@ -119,7 +117,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
     if (out.input_ring.enabled) {
         std::fprintf(stderr,
             "[qwen4exp] cache: integrated GPU detected, graph inputs will be "
-            "ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)\n");
+            "ring-buffered in pinned host memory\n");
     }
 
     // A fresh cache must start from zero recurrent state, not whatever the

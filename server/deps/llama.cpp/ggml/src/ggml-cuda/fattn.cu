@@ -4506,13 +4506,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // Match upstream's RDNA3.5 head-256 selection without altering RDNA4 paths.
     int rdna3_gqa_eff = 1;
     while (rdna3_gqa_eff < 8 && gqa_ratio % (2*rdna3_gqa_eff) == 0) rdna3_gqa_eff *= 2;
-    static const auto env_int64 = [](const char * name, int64_t def) -> int64_t {
-        const char * e = getenv(name);
-        return e ? atoll(e) : def;
-    };
-    // Keep existing QSA/padded callers on their shipped path unless opted in.
-    static const bool rdna3_fa256 = env_int64("QWEN4EXP_UPSTREAM", 0) != 0 ||
-        env_int64("QWEN4EXP_FA_PAD256", 0) != 0 || env_int64("LUCE_FA256_MMA", 0) != 0;
+    // Upstream parity mode only (its K/V cache is padded to 256); QSA callers keep their shipped path.
+    static const bool rdna3_fa256 = [] { const char * ref = getenv("QWEN4EXP_UPSTREAM"); return ref && atoll(ref) != 0; }();
     if (rdna3_fa256 && GGML_CUDA_CC_IS_RDNA3_5(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256 &&
         Q->ne[1] * rdna3_gqa_eff > 32) {
         return BEST_FATTN_KERNEL_MMA_F16;
@@ -4562,6 +4557,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // f16 / 2e-3 q8_0 KV) and is the default; LUCE_FA256_MMA=0 opts
     // out. LUCE_FA256_WMMA=1 additionally enables the unqualified
     // rocWMMA kernel for A/B work.
+    static const auto env_int64 = [](const char * name, int64_t def) -> int64_t {
+        const char * e = getenv(name);
+        return e ? atoll(e) : def;
+    };
     static const bool fa256_tc          = env_int64("LUCE_FA256_MMA", 1) != 0;
     static const bool fa256_wmma        = env_int64("LUCE_FA256_WMMA", 0) != 0;
     // KV length above which the raw-MMA kernel takes over from rocWMMA in
@@ -4625,27 +4624,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
-static long long g_fattn_qsa_launches   = 0;
-static long long g_fattn_dense_launches = 0;
-long long ggml_backend_cuda_get_fattn_qsa_launch_count()   { return g_fattn_qsa_launches; }
-long long ggml_backend_cuda_get_fattn_dense_launch_count() { return g_fattn_dense_launches; }
-void ggml_backend_cuda_reset_fattn_launch_counts() { g_fattn_qsa_launches = 0; g_fattn_dense_launches = 0; }
-
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 #if defined(GGML_USE_HIP)
     if (ggml_cuda_flash_attn_ext_qsa_decode_supported(ctx, dst)) {
-        ++g_fattn_qsa_launches;
         ggml_cuda_flash_attn_ext_qsa_decode(ctx, dst);
         return;
     }
     if (ggml_cuda_flash_attn_ext_qsa_supported(ctx, dst)) {
-        ++g_fattn_qsa_launches;
         ggml_cuda_flash_attn_ext_qsa(ctx, dst);
         return;
     }
 #endif // defined(GGML_USE_HIP)
-    ++g_fattn_dense_launches;
     if (ggml_flash_attn_ext_is_ds4(dst)) {
 #if defined(GGML_USE_HIP)
         if (!ggml_cuda_ds4_flash_attn_d512_f32(ctx, dst)) {

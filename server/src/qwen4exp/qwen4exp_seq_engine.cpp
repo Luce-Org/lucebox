@@ -169,8 +169,7 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     }
     if (plan.decode.empty() && plan.prefills.empty()) return result;
 
-    const char * telemetry = std::getenv("QWEN4EXP_STEP_TELEMETRY");
-    const bool telemetry_on = telemetry && std::atoi(telemetry) != 0;
+    static const bool telemetry_on = std::getenv("QWEN4EXP_PROF") != nullptr;
     uint64_t telemetry_step = 0;
     const double step_begin_s = telemetry_on ? mono_now_s() : 0.0;
     if (telemetry_on) {

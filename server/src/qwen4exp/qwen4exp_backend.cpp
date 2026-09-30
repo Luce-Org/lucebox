@@ -1,14 +1,20 @@
 #include "qwen4exp_backend.h"
 #include "qwen4exp_graph.h"
 
+#include "common/platform_env.h"
 #include "common/sampler.h"
 
 #include "ggml-cuda.h"
+
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
+#include "common/gpu_runtime_compat.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <utility>
 #include <vector>
@@ -19,6 +25,26 @@ namespace {
 bool enabled_env(const char * name) {
     const char * value = std::getenv(name);
     return value && std::atoi(value) != 0;
+}
+
+// gfx1151 prefill profile, qualified together on UD-Q4_K_XL, IQ4_NL and GSQ (long-prompt quality gate): MMB WMMA
+// prefill, hipBLASLt on the bf16 weight shadow for the dense projections, bf16 HC activations, QSA sparse attention,
+// and no automatic managed memory (it duplicates the weights). Must run before the backend reads any of them.
+// An explicit value wins; QWEN4EXP_UPSTREAM keeps the reference configuration.
+void apply_gfx1151_defaults(int gpu) {
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
+    cudaDeviceProp prop{};
+    if (enabled_env("QWEN4EXP_UPSTREAM") || cudaGetDeviceProperties(&prop, gpu) != cudaSuccess ||
+        std::strncmp(prop.gcnArchName, "gfx1151", 7) != 0) return;
+    static const char * const defaults[][2] = {
+        {"LUCE_HIP_NO_AUTO_UMA", "1"}, {"GGML_CUDA_MMB", "1"}, {"QWEN4EXP_MMB_CUBLAS", "5"},
+        {"LUCE_MMB_SHADOW", "1"}, {"LLAMA_MMB_HC16", "2"}, {"QWEN4EXP_QSA", "1"},
+    };
+    for (const auto & kv : defaults) set_environment_variable(kv[0], kv[1], false);
+    std::fprintf(stderr, "[qwen4exp] gfx1151: prefill profile on (MMB, hipBLASLt shadow, HC16, QSA)\n");
+#else
+    (void) gpu;
+#endif
 }
 }
 
@@ -34,6 +60,7 @@ bool Qwen4ExpBackend::init() {
         std::fprintf(stderr, "[qwen4exp] layer split is not supported yet\n");
         return false;
     }
+    apply_gfx1151_defaults(cfg_.device.gpu);
     backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
     if (!backend_) {
         std::fprintf(stderr, "[qwen4exp] backend init failed for GPU %d\n",

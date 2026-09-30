@@ -1059,13 +1059,6 @@ bool ggml_cuda_mmb_gatemix() { return mmb_arch() && mmb_gatemix_flag(); }
 bool ggml_cuda_mmb_down16() { return mmb_arch() && mmb_down16_flag(); }
 bool ggml_cuda_mmb_blk16() { return mmb_arch(); }
 bool ggml_cuda_mmb_res16()  { return mmb_arch(); }
-// Exact operator differential, opt-in and excluded from benchmark runs.
-__global__ void mmb_check_bytes(const uint8_t * a, const uint8_t * b, size_t n, unsigned int * errors) {
-    unsigned int count = 0;
-    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) count += a[i] != b[i];
-    if (count) atomicAdd(errors, count);
-}
-
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
         const int hc, const float scale, const float bias) {
     if (!ggml_cuda_mmb_gatemix() || hc != 4 || !mmb_quant_type(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
@@ -1084,41 +1077,15 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (!xn16) xn16 = mmb_bf16_activation(ctx, xn, (size_t) T * M, stream);
     if (!xn16) return false;
     const uint16_t * lo16 = mmb_bf16_activation(ctx, lo, (size_t) T * K, stream);
-    static const bool tile16 = [] {
-        const char * e = getenv("QWEN4EXP_HC_TILE16");
-        const char * ref = getenv("QWEN4EXP_UPSTREAM");
-        return !(e && atoi(e) == 0) && !(ref && atoi(ref));
-    }();
+    // 16-column tiles (bit-exact with the 32-column tile); the upstream reference keeps the original tile.
+    static const bool tile16 = [] { const char * ref = getenv("QWEN4EXP_UPSTREAM"); return !(ref && atoi(ref)); }();
     const bool use16 = tile16 && K == 320 && E % 32 == 0 && (w->type == GGML_TYPE_IQ4_NL || w->type == GGML_TYPE_Q8_0);
-    static const bool check = getenv("QWEN4EXP_HC_TILE_CHECK") != nullptr;
-    ggml_cuda_pool_alloc<uint8_t> reference(ctx.pool());
-    const size_t bytes = (size_t) E * T * (store_f32 ? sizeof(float) : sizeof(uint16_t));
-    const void * output = store_f32 ? dst->data : outh;
-    if (check && use16) {
-        reference.alloc(bytes);
-        const dim3 original_grid(E / 32, (T + 127) / 128);
-        mmb_dispatch_quant(w->type, [&](auto tag) {
-            constexpr int WT = decltype(tag)::value;
-            hc_gate_mix_kernel<4, WT><<<original_grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
-        });
-        CUDA_CHECK(cudaMemcpyAsync(reference.get(), output, bytes, cudaMemcpyDeviceToDevice, stream));
-    }
     dim3 grid(E / (use16 ? 16 : 32), (T + 127) / 128);
     mmb_dispatch_quant(w->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
         if (use16) hc_gate_mix_kernel<4, WT, 16, 1><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
         else hc_gate_mix_kernel<4, WT><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
     });
-    if (check && use16) {
-        ggml_cuda_pool_alloc<unsigned int> errors(ctx.pool(), 1);
-        CUDA_CHECK(cudaMemsetAsync(errors.get(), 0, sizeof(unsigned int), stream));
-        mmb_check_bytes<<<256, 256, 0, stream>>>(reference.get(), (const uint8_t *) output, bytes, errors.get());
-        unsigned int count;
-        CUDA_CHECK(cudaMemcpyAsync(&count, errors.get(), sizeof(count), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        std::fprintf(stderr, "[hc-tile-check] %s T=%d bytes=%zu differences=%u\n", dst->name, T, bytes, count);
-        GGML_ASSERT(count == 0);
-    }
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

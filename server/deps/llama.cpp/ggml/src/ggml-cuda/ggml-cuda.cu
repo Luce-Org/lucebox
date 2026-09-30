@@ -1,10 +1,6 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
-#include <set>
-#include <map>
-#include <tuple>
-#include <cstdio>
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/vision-bias.cuh"
@@ -117,11 +113,6 @@
 #include <string>
 #include <vector>
 
-static bool g_op_prof = getenv("GGML_CUDA_OP_PROF") != nullptr;
-static std::unordered_map<int, double> g_op_ms;
-static std::unordered_map<int, long long> g_op_n;
-static std::map<uint64_t, double> g_mm_ms;
-static std::map<uint64_t, long long> g_mm_n;
 #if defined(GGML_USE_HIP)
 static std::unordered_map<const ggml_tensor *, const ggml_tensor *> g_hc_marked_xn;
 static std::unordered_set<const ggml_tensor *> g_hc_q8_xn;   // marked combines whose xn feeds a W8A8-eligible Q8_0 GEMM
@@ -696,13 +687,6 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
-    static int log_level() {
-        static const int level = []() {
-            const char * e = getenv("GGML_CUDA_POOL_LOG");
-            return e ? (e[0] == 'a' ? 2 : 1) : 0;
-        }();
-        return level;
-    }
     // Free buffers keyed by size. alloc() takes the smallest cached buffer
     // that fits, the same best-fit choice the original linear scan made, and
     // free() returns a buffer to the cache; both are O(log n). A DeepSeek4
@@ -742,20 +726,12 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         void * ptr;
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
-        const int ll = log_level();
-        if (ll == 2 || (ll == 1 && size >= (8u << 20))) {
-            GGML_LOG_INFO("[cuda-pool] dev=%d alloc req=%.1f MiB look=%.1f MiB pool=%zu -> %zu MiB\n",
-                device, size/1048576.0, look_ahead_size/1048576.0,
-                pool_size/1048576, (pool_size + look_ahead_size)/1048576);
-        }
         ggml_cuda_set_device(device);
         CUDA_CHECK(ggml_cuda_device_malloc(&ptr, look_ahead_size, device));
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
         return ptr;
     }
-
-    size_t size_bytes() const override { return pool_size; }
 
     void free(void * ptr, size_t size) override {
         if ((int) free_buffers.size() < MAX_BUFFERS) {
@@ -817,8 +793,6 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
     }
-
-    size_t size_bytes() const override { return pool_used; }
 
     void * alloc(size_t size, size_t * actual_size) override {
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
@@ -3187,12 +3161,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int64_t tokens = ggml_nrows(src1);
     // Frozen gfx1151 / ROCm 7.2.2 table, trained on separate 16366-token captures.
     // MMQ changes activation quantization, so the reference profile never takes it;
-    // it is on by default and can be disabled with QWEN4EXP_DENSE_TABLE=0.
-    static const bool table = [] {
-        const char * e = getenv("QWEN4EXP_DENSE_TABLE");
-        const char * ref = getenv("QWEN4EXP_UPSTREAM");
-        return !(e && atoi(e) == 0) && !(ref && atoi(ref));
-    }();
+    static const bool table = [] { const char * ref = getenv("QWEN4EXP_UPSTREAM"); return !(ref && atoi(ref)); }();
     const bool measured_dense = table && tokens == 16366 && src1->type == GGML_TYPE_F32 &&
         !ggml_backend_buft_is_cuda_split(src0->buffer->buft) &&
         ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
@@ -3243,14 +3212,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
     }
 #endif // defined(GGML_USE_HIP)
-    static const bool dense_telemetry = getenv("LUCE_MMB_TELEMETRY") != nullptr;
-    static const bool mm_shape_log = getenv("QWEN4EXP_MM_LOG") != nullptr;
-    if (mm_shape_log) {
-        static std::set<std::tuple<long long, long long, int>> seen;
-        if (seen.insert(std::make_tuple((long long) src0->ne[0], (long long) src0->ne[1], (int) src0->type)).second) {
-            std::fprintf(stderr, "[mm] K=%lld N=%lld type=%d\n", (long long) src0->ne[0], (long long) src0->ne[1], (int) src0->type);
-        }
-    }
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
     const bool grouped_src = ggml_mul_mat_is_grouped_src(dst);
 
@@ -3264,7 +3225,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         cublas_shape_ok && src1->ne[1] * src1->ne[2] * src1->ne[3] >= 512) {
         const void * sh = ggml_cuda_mmb_shadow_ptr(src0);
         if (sh) {
-            static const bool cublas_log = getenv("QWEN4EXP_CUBLAS_LOG") != nullptr;
             ggml_tensor tmp = *src0;
             tmp.type = GGML_TYPE_BF16;
             tmp.data = const_cast<void *>(sh);
@@ -3284,11 +3244,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                 tmp1.nb[2] = tmp1.nb[1] * src1->ne[1];
                 tmp1.nb[3] = tmp1.nb[2] * src1->ne[2];
                 s1 = &tmp1;
-            }
-            if (cublas_log) {
-                std::fprintf(stderr, "[cublas] %s K=%lld N=%lld T=%lld src1=%s\n", src0->name,
-                    (long long) src0->ne[0], (long long) src0->ne[1],
-                    (long long) (src1->ne[1] * src1->ne[2] * src1->ne[3]), xb ? "bf16" : "f32");
             }
             ggml_cuda_op_mul_mat(ctx, &tmp, s1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
             return;
@@ -3492,19 +3447,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
 #if defined(GGML_USE_HIP)
     } else if (!split && ggml_cuda_mmb_supported_mm(src0, src1, dst)) {
-        if (dense_telemetry) {
-            std::fprintf(stderr, "[dense-mat] path=mmb name=%s type=%s M=%lld K=%lld T=%lld\n",
-                dst->name, ggml_type_name(src0->type), (long long) src0->ne[1], (long long) src0->ne[0],
-                (long long) (src1->ne[1] * src1->ne[2] * src1->ne[3]));
-        }
         ggml_cuda_mul_mat_mmb(ctx, src0, src1, dst);
 #endif // defined(GGML_USE_HIP)
     } else if (!split && use_mul_mat_q) {
-        if (dense_telemetry) {
-            std::fprintf(stderr, "[dense-mat] path=mmq name=%s type=%s M=%lld K=%lld T=%lld\n",
-                dst->name, ggml_type_name(src0->type), (long long) src0->ne[1], (long long) src0->ne[0],
-                (long long) (src1->ne[1] * src1->ne[2] * src1->ne[3]));
-        }
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)
         && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
@@ -5509,18 +5454,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
                 if (!disable_fusion) {
                     if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
-                        static const bool conv_prof = []() { const bool e = (getenv("GGML_CUDA_CONV_PROF") != nullptr); if (e) { setvbuf(stderr, nullptr, _IONBF, 0); } return e; }();
                         if (node->op == GGML_OP_CONCAT) {
                             ggml_cuda_ple_conv_match pm;
                             if (ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) {
-                                if (conv_prof) std::fprintf(stderr, "[conv] ple tail C=%lld T=%lld from=%lld\n", (long long) pm.C, (long long) pm.T, (long long) pm.tail_from);
                                 ggml_cuda_ple_conv_write_tail(*cuda_ctx, pm);
                                 i += 1;
                                 continue;
                             }
                             ggml_cuda_gdn_conv_match gm;
                             if (ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
-                                if (conv_prof) std::fprintf(stderr, "[conv] gdn tail C=%lld T=%lld from=%lld\n", (long long) gm.C, (long long) gm.T, (long long) gm.tail_from);
                                 ggml_cuda_gdn_conv_write_tail(*cuda_ctx, gm);
                                 i += 1;
                                 continue;
@@ -5529,7 +5471,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         if (node->op == GGML_OP_CONT) {
                             ggml_cuda_ple_conv_match pm;
                             if (ggml_cuda_ple_conv_match_at_tap(cgraph, i, pm)) {
-                                if (conv_prof) std::fprintf(stderr, "[conv] ple direct C=%lld T=%lld K=%lld\n", (long long) pm.C, (long long) pm.T, (long long) pm.K);
                                 ggml_cuda_ple_conv_direct(*cuda_ctx, pm);
                                 i += pm.silu_idx - i;
                                 continue;
@@ -5538,7 +5479,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         if (node->op == GGML_OP_SSM_CONV) {
                             ggml_cuda_gdn_conv_match gm;
                             if (ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
-                                if (conv_prof) std::fprintf(stderr, "[conv] gdn direct C=%lld T=%lld\n", (long long) gm.C, (long long) gm.T);
                                 ggml_cuda_gdn_conv_direct(*cuda_ctx, gm);
                                 i += 1;
                                 continue;
@@ -5925,12 +5865,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
 
                     // Bit-exact replacement for the two-kernel GDN normalization.
-                    // Qualified for RDNA3.5 and 128-wide rows; 0 is the A/B fallback.
-                    static const bool rms_scale_fused = [] {
-                        const char * value = getenv("QWEN4EXP_RMS_SCALE_FUSED");
-                        return !value || atoi(value) != 0;
-                    }();
-                    if (rms_scale_fused && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                    // Qualified for RDNA3.5 and 128-wide rows.
+                    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
                         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
                         ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
@@ -5982,32 +5918,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-#if defined(GGML_USE_HIP)
-                cudaEvent_t pev0 = nullptr, pev1 = nullptr;
-                if (g_op_prof) {
-                    CUDA_CHECK(hipEventCreate(&pev0));
-                    CUDA_CHECK(hipEventCreate(&pev1));
-                    CUDA_CHECK(cudaEventRecord(pev0, cuda_ctx->stream()));
-                }
-#endif
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
-#if defined(GGML_USE_HIP)
-                if (g_op_prof) {
-                    CUDA_CHECK(cudaEventRecord(pev1, cuda_ctx->stream()));
-                    CUDA_CHECK(cudaEventSynchronize(pev1));
-                    float ms = 0.0f;
-                    CUDA_CHECK(hipEventElapsedTime(&ms, pev0, pev1));
-                    g_op_ms[(int) node->op] += ms;
-                    g_op_n[(int) node->op]++;
-                    if (node->op == GGML_OP_MUL_MAT && node->src[0]) {
-                        const uint64_t key = ((uint64_t) node->src[0]->ne[0] << 32) | (uint32_t) node->src[0]->ne[1];
-                        g_mm_ms[key] += ms;
-                        g_mm_n[key]++;
-                    }
-                    CUDA_CHECK(cudaEventDestroy(pev0));
-                    CUDA_CHECK(cudaEventDestroy(pev1));
-                }
-#endif
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -6018,35 +5929,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
 
-            if (g_op_prof) {
-                std::vector<std::pair<double, int>> v;
-                for (const auto & e : g_op_ms) v.push_back({e.second, e.first});
-                std::sort(v.rbegin(), v.rend());
-                double tot = 0.0;
-                for (const auto & e : v) tot += e.first;
-                std::fprintf(stderr, "[op-prof] graph total=%.1fms\n", tot);
-                for (size_t k = 0; k < v.size() && k < 18; ++k) {
-                    std::fprintf(stderr, "  %-22s %8.1fms  x%lld\n",
-                        ggml_op_name((ggml_op) v[k].second), v[k].first, g_op_n[v[k].second]);
-                }
-                g_op_ms.clear();
-                g_op_n.clear();
-                std::vector<std::pair<double, uint64_t>> mv;
-                for (const auto & e : g_mm_ms) mv.push_back({e.second, e.first});
-                std::sort(mv.rbegin(), mv.rend());
-                for (size_t k = 0; k < mv.size() && k < 14; ++k) {
-                    std::fprintf(stderr, "  [mm] K=%-6lld N=%-7lld %8.1fms x%lld\n",
-                        (long long) (mv[k].second >> 32), (long long) (uint32_t) mv[k].second,
-                        mv[k].first, g_mm_n[mv[k].second]);
-                }
-                g_mm_ms.clear();
-                g_mm_n.clear();
-            }
-            if (getenv("QWEN4EXP_FA_TELEMETRY")) {
-                std::fprintf(stderr, "[fa] graph qsa=%lld dense=%lld\n",
-                    ggml_backend_cuda_get_fattn_qsa_launch_count(),
-                    ggml_backend_cuda_get_fattn_dense_launch_count());
-            }
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -6254,10 +6136,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_mmb_begin_graph();
     g_hc_marked_xn.clear();
     g_hc_q8_xn.clear();
-#endif
-    ggml_backend_cuda_reset_fattn_launch_counts();
 
-#if defined(GGML_USE_HIP)
     // xn is a view of HC_COMBINE_NORM, so reads() keys on (view_src, view_offs); a plain pointer test misses consumers.
     static const int hc16 = getenv("LLAMA_MMB_HC16") ? atoi(getenv("LLAMA_MMB_HC16")) : 0;
     if (hc16 >= 2 && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
@@ -6309,12 +6188,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 }
                 if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
                 if (t->op == GGML_OP_MUL && is_hc_mix_mul(n, xn)) continue;
-                { static unsigned dbg = 0; if (getenv("LLAMA_HC16_DEBUG") && ggml_nrows(xn) >= 4096 && dbg++ < 12)
-                    std::fprintf(stderr, "HC16 xn=%s blocked by consumer %s(%s)\n", xn->name, ggml_op_name(t->op), t->name); }
                 ok = false;   // default deny: any unrecognised consumer blocks the mark
             }
-            { static unsigned dbg2 = 0; if (getenv("LLAMA_HC16_DEBUG") && ggml_nrows(xn) >= 4096 && dbg2++ < 12)
-                std::fprintf(stderr, "HC16 xn=%s rows=%lld consumers=%d ok=%d\n", xn->name, (long long) ggml_nrows(xn), nread, (int) ok); }
             if (ok && nread > 0) { ggml_cuda_mmb_mark_bf16_only(xn); g_hc_marked_xn[op] = xn; if (q8) g_hc_q8_xn.insert(op); }
         }
 
@@ -6339,16 +6214,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     ggml_cuda_mmb_supported_mmid(t->src[0], t->src[1], t->src[2], t)) continue;
                 if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
                     t->op == GGML_OP_PERMUTE || t->op == GGML_OP_CONT) continue;
-                { static unsigned dbg = 0; if (getenv("LLAMA_HC16_DEBUG") && dbg++ < 20)
-                    std::fprintf(stderr, "HC16 mixdst blocked by %s(w=%s type=%s)\n",
-                        ggml_op_name(t->op),
-                        ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && t->src[0]) ? t->src[0]->name : "-",
-                        ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && t->src[0]) ? ggml_type_name(t->src[0]->type) : "-"); }
                 ok = false;
             }
-            { static unsigned dbg2 = 0; if (getenv("LLAMA_HC16_DEBUG") && dbg2++ < 12)
-                std::fprintf(stderr, "HC16 mixdst rows=%lld consumers=%d ok=%d\n",
-                    (long long) ggml_nrows(ma.dst), nread, (int) ok); }
             if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(ma.dst);
         }
 
@@ -6390,9 +6257,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // defined(GGML_USE_HIP)
-
-    static const bool pool_log_graph = getenv("GGML_CUDA_POOL_LOG") != nullptr;
-    const size_t pool_before = pool_log_graph ? cuda_ctx->pool().size_bytes() : 0;
 
     // LIFO-free last evaluation's memoized q8_1 activations.
     while (!cuda_ctx->luce_q8_memo.empty()) {
@@ -6547,12 +6411,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
-
-    if (pool_log_graph) {
-        const size_t pool_after = cuda_ctx->pool().size_bytes();
-        GGML_LOG_INFO("[cuda-arena] nodes=%d pool=%zu MiB delta=%zu MiB\n",
-            cgraph->n_nodes, pool_after/1048576, (pool_after - pool_before)/1048576);
-    }
 
     return GGML_STATUS_SUCCESS;
 }
