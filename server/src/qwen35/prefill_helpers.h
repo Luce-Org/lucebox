@@ -12,6 +12,19 @@
 
 namespace luce::common {
 
+// Qwen prefill chunking. Between restore points chunks keep to the
+// kQwen35PrefillUbatch grid. A chunk never ends within kQwen35MinChunkTokens
+// of its start, except at the end of the prompt: a chunk of a few tokens in
+// the middle of a prompt produced NaN logits on the R9700 (Qwen3.8, a 2-token
+// chunk after a restore). A restore away from every restore point (a
+// generated-turn checkpoint) cannot reproduce a cold prefill anyway, so its
+// first chunk runs kQwen35OffGridLeadTokens before stopping. Both rules depend
+// only on where chunks start, so a cold prefill and a restored one still cut
+// alike.
+inline constexpr int kQwen35PrefillUbatch = 512;
+inline constexpr int kQwen35MinChunkTokens = 16;
+inline constexpr int kQwen35OffGridLeadTokens = 64;
+
 // Tokens of the prefill chunk at absolute position kv_pos with `remaining`
 // prompt tokens left. Every restore point (ascending, absolute) starts a
 // chunk; between them chunks end on multiples of `ubatch`, the grid a cold

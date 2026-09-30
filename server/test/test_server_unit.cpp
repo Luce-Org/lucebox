@@ -6103,19 +6103,21 @@ TEST_CASE(ServerUnitFixture, test_prepare_cache_skips_consumed_snapshot) {
 
 static std::vector<int> prefill_chunk_starts(
         int kv_offset, int prompt_end, const std::vector<int> & points,
-        int first_min_tokens = 16) {
+        int first_min_tokens = kQwen35MinChunkTokens) {
     std::vector<int> starts;
     for (int pos = kv_offset; pos < prompt_end;) {
         starts.push_back(pos);
         pos += qwen35_prefill_chunk_tokens(
-            pos, prompt_end - pos, 512, points,
-            pos == kv_offset ? first_min_tokens : 16);
+            pos, prompt_end - pos, kQwen35PrefillUbatch, points,
+            pos == kv_offset ? first_min_tokens : kQwen35MinChunkTokens);
     }
     return starts;
 }
 
 // Chunks start at every restore point, keep to the 512 grid in between, and
-// are never shorter than 16 tokens before the end of the prompt.
+// are never shorter than 16 tokens before the end of the prompt. The expected
+// starts below assume those values of kQwen35PrefillUbatch and
+// kQwen35MinChunkTokens.
 TEST_CASE(ServerUnitFixture, test_qwen35_prefill_chunks) {
     TEST_ASSERT((prefill_chunk_starts(0, 1300, {}) ==
                  std::vector<int>{0, 512, 1024}));
@@ -6136,8 +6138,10 @@ TEST_CASE(ServerUnitFixture, test_qwen35_prefill_chunks) {
                                std::find(cold.begin(), cold.end(), start)));
     }
     // An off-grid restore runs its first chunk at least 64 tokens.
-    const auto off_grid = prefill_chunk_starts(1003, 1300, {1010, 1100}, 64);
-    TEST_ASSERT(off_grid.size() >= 2 && off_grid[1] - off_grid[0] >= 64);
+    const auto off_grid = prefill_chunk_starts(
+        1003, 1300, {1010, 1100}, kQwen35OffGridLeadTokens);
+    TEST_ASSERT(off_grid.size() >= 2 &&
+                off_grid[1] - off_grid[0] >= kQwen35OffGridLeadTokens);
 }
 
 // An agent turn that continues a generated-turn checkpoint skips its own

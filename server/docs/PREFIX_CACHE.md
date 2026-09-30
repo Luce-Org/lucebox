@@ -218,10 +218,10 @@ DFlash draft, one snapshot is about 34 KiB per token plus about 350 MiB fixed:
 Every chat boundary (and every extra cut a cache may take) starts a prefill
 chunk, in a cold prefill and after a restore alike (`restore_points`). A
 snapshot therefore lands exactly on the boundary it was requested at, and a
-restored prefix plus the suffix prefill reproduces a cold prefill. Qwen never
-ends a chunk within 16 tokens of its start, or 64 after restoring a
-generated-turn checkpoint, so the cache does not request a snapshot that close
-to the restored prefix. The
+restored prefix plus the suffix prefill reproduces a cold prefill. Apart from
+the last chunk of the prompt, Qwen never ends a chunk within 16 tokens of its
+start, or 64 after restoring a generated-turn checkpoint, so the cache does not
+request a snapshot that close to the restored prefix. The
 generation prompt's own boundary starts a chunk only when the request
 snapshots there, since no saved state lies past it otherwise.
 

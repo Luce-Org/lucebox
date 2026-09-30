@@ -137,9 +137,9 @@ public:
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
-    // The first prefill chunk after a restore runs at least this far, so a
-    // restore point closer than that starts no chunk (do_prefill).
-    int  snapshot_granularity() const override { return kOffGridMinLeadTokens; }
+    // The first prefill chunk after a restore runs up to 64 tokens
+    // (kQwen35OffGridLeadTokens), so a closer restore point starts no chunk.
+    int  snapshot_granularity() const override;
     size_t snapshot_bytes_estimate(int tokens) const override;
     MemoryReport memory_report() const override;
     // memory_report() for an explicit cache and snapshot array.
@@ -388,17 +388,6 @@ private:
     std::unique_ptr<DFlashTarget> dflash_target_;
 
     // ── Internal helpers ─────────────────────────────────────────────
-    // A prefill chunk never ends within kMinChunkTokens of its start, except
-    // at the end of the prompt: a chunk of a few tokens in the middle of a
-    // prompt produced NaN logits on the R9700 (Qwen3.8, a 2-token chunk
-    // after a restore). A restore away from every restore point (a
-    // generated-turn checkpoint) cannot reproduce a cold prefill anyway, so
-    // its first chunk runs kOffGridMinLeadTokens before stopping. Both rules
-    // depend only on where chunks start, so a cold prefill and a restored
-    // one still cut alike.
-    static constexpr int kMinChunkTokens = 16;
-    static constexpr int kOffGridMinLeadTokens = 64;
-
     // Prefill a prompt and return the number of tokens committed to KV.
     // kv_offset > 0 resumes from a restored snapshot: tokens are placed at
     // KV positions [kv_offset, kv_offset + tokens.size()) instead of [0, N).

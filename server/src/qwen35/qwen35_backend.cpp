@@ -1017,11 +1017,19 @@ bool Qwen35Backend::snapshot_save(int slot) {
         return false;
     }
     // A deferred snapshot is the live state; copy it out while it still is.
+    // Copying it out already saves this slot when it is the deferred one.
+    const bool deferred_here = live_snapshot_deferred_ &&
+        slot == live_snapshot_slot_ && cache_.cur_pos == live_snapshot_pos_;
     materialize_live_snapshot();
-    const bool ok = snapshot_target_cache(
-        w_, cache_, snap_backend_, prefix_snapshots_[slot]);
+    const bool ok = deferred_here && prefix_snapshots_[slot].ctx
+        ? true
+        : snapshot_target_cache(w_, cache_, snap_backend_, prefix_snapshots_[slot]);
     live_snapshot_slot_ = ok && !generating_ ? slot : -1;
     return ok;
+}
+
+int Qwen35Backend::snapshot_granularity() const {
+    return kQwen35OffGridLeadTokens;
 }
 
 bool Qwen35Backend::snapshot_save_deferred(int slot) {
@@ -1923,7 +1931,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     }
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
-    int prefill_ubatch = std::max(kMinChunkTokens, qwen35_prefill_ubatch(512));
+    int prefill_ubatch = std::max(kQwen35MinChunkTokens,
+                                  qwen35_prefill_ubatch(kQwen35PrefillUbatch));
     const int prompt_len = (int)tokens.size();
     prefill_last_logits_valid_ = false;
 
@@ -2021,8 +2030,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             ? std::min(prefill_ubatch, prompt_len - start)
             : qwen35_prefill_chunk_tokens(
                   kv_pos, prompt_len - start, prefill_ubatch, restore_points,
-                  start == 0 && restored_off_grid ? kOffGridMinLeadTokens
-                                                  : kMinChunkTokens);
+                  start == 0 && restored_off_grid ? kQwen35OffGridLeadTokens
+                                                  : kQwen35MinChunkTokens);
         // When snap_pos falls inside this chunk (a cut that is not a restore
         // point), snapshot at the chunk START kv_pos: the largest chunk
         // boundary <= snap_pos, strictly within the requested prefix, so a
