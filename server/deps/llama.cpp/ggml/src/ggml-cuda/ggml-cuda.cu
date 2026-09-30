@@ -3098,7 +3098,7 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
                 const char * v = std::getenv("LUCE_MIX_WMMA_GLU");
                 return !(v && v[0] == '0');
             }();
-            const bool wmma = ids && ggml_cuda_mix_wmma_moe_enabled(up->src[0], ncols, cc);
+            const bool wmma = ids && ggml_cuda_mix_wmma_moe_enabled(up->src[0], src1, ids, ncols, cc);
             if (wmma && wmma_glu &&
                 glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_DS4 &&
                 glu->src[0] && glu->src[1] && glu->src[0]->data == gate->data && glu->src[1]->data == up->data &&
@@ -3408,7 +3408,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_mix_wmma_moe_enabled(src0, ne12, cc)) {
+        if (ggml_cuda_mix_wmma_moe_enabled(src0, src1, ids, ne12, cc)) {
             log_dispatch("mix_wmma");
             ggml_cuda_mix_wmma_moe(ctx, src0, src1, ids, dst);
             return;

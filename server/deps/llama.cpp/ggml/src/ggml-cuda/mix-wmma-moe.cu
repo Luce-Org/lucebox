@@ -7,6 +7,12 @@
 // waves accumulate it against 64 gathered F16 routes on the matrix cores.
 //
 // On by default on RDNA3 (LUCE_MIX_WMMA_PREFILL=0 disables); other GPUs keep MMQ.
+//
+// The structure (dequantize a weight tile into padded LDS, then accumulate it
+// on the WMMA units against gathered routed activations) follows Piotr
+// Wilkin's bf16 WMMA dequant GEMM for large prefill batches (mmb.cu, in his
+// Strix Halo llama.cpp work integrated into ROCmFPX), adapted here to F16 and
+// to the ROCmFP2/FP3 MIX codebook formats.
 
 #include "mix-wmma-moe.cuh"
 #include "unary.cuh"
@@ -29,8 +35,6 @@ namespace {
 
 constexpr int kBM = 128;          // output rows per block
 constexpr int kBN = 64;           // routes per block
-constexpr int kBK = 32;           // one quant block per row per K step
-constexpr int kLdsStride = kBK + 8;   // halves; +8 keeps 16-byte rows off one bank
 constexpr int kThreads = 256;
 
 template <int TYPE> struct MixFormat;
@@ -40,14 +44,6 @@ template <> struct MixFormat<GGML_TYPE_Q2_1_ROCMFP2_MIX> {
 template <> struct MixFormat<GGML_TYPE_Q3_1_ROCMFP3_MIX> {
     static constexpr int kBlockBytes = 14, kCodeBytes = 12, kLevels = 8, kBits = 3;
 };
-
-// UE4M3 scale as the MIX decoders read it (bias 11, subnormal step 2^-10).
-__device__ __forceinline__ float mix_wmma_ue4m3(uint32_t e) {
-    if (e > 0x7E) return 0.0f;
-    const int ex = (int) (e >> 3), mant = (int) (e & 7);
-    if (ex == 0) return (float) mant * 0.0009765625f;
-    return ldexpf((float) (8 + mant), ex - 11);
-}
 
 // Mode-0 fixed levels, code order (see mix_fp2_fixed / mix_fp3_fixed).
 template <int TYPE>
@@ -350,7 +346,8 @@ __launch_bounds__(kThreads) __global__ void mix_wmma_moe_kernel(
 
 }  // namespace
 
-bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, int64_t n_tokens, int cc) {
+bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, const ggml_tensor * src1,
+                                    const ggml_tensor * ids, int64_t n_tokens, int cc) {
     // On by default; LUCE_MIX_WMMA_PREFILL=0 returns these batches to MMQ.
     static const bool enabled = [] {
         const char * v = std::getenv("LUCE_MIX_WMMA_PREFILL");
@@ -362,7 +359,15 @@ bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, int64_t n_tokens, 
     }();
     if (!enabled || !GGML_CUDA_CC_IS_RDNA3(cc)) return false;
     if (src0->type != GGML_TYPE_Q2_1_ROCMFP2_MIX && src0->type != GGML_TYPE_Q3_1_ROCMFP3_MIX) return false;
-    return n_tokens >= min_tokens && src0->ne[0] % kBK2 == 0 && src0->ne[1] % kBM == 0 && src0->ne[2] <= 1024;
+    if (!(n_tokens >= min_tokens && src0->ne[0] % kBK2 == 0 && src0->ne[1] % kBM == 0 && src0->ne[2] <= 1024)) {
+        return false;
+    }
+    // The gather reads each activation row as K contiguous floats.
+    if (!ids || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1)) return false;
+    // One grid row per route tile: at most n_routes / 64 + n_experts tiles
+    // (bn >= 64) must fit the 65535 grid-y limit; longer batches stay on MMQ.
+    const int64_t max_tiles = (ids->ne[0] * n_tokens + 63) / 64 + src0->ne[2];
+    return max_tiles <= 65535;
 }
 
 // Routes, tiles and the gathered F16 activations are shared by every weight
