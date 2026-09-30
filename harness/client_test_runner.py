@@ -2052,8 +2052,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sweep = sub.add_parser("sweep", help="Start server profiles and probe them")
     p_sweep.add_argument("--target", type=Path, required=True)
     p_sweep.add_argument("--draft", type=Path, required=True)
-    p_sweep.add_argument("--bin", type=Path, required=True,
-                         help="Path to luce_server binary")
+    p_sweep.add_argument("--bin", type=Path, required=True, help="Path to luce_server binary")
     p_sweep.add_argument("--prefill-drafter", type=Path, default=None)
     p_sweep.add_argument("--profiles", default="rtx3090_luce_fast,rtx3090_luce_safe")
     p_sweep.add_argument("--clients", default="all")
