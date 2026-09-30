@@ -354,7 +354,7 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
     load_regs(0); store_lds(); __syncthreads();
     for (int ks = 0; ks < nks; ++ks) {
         if (ks + 1 < nks) load_regs(ks + 1);
-#pragma unroll
+#pragma unroll 1   // unrolled k16 steps and epilogue pushed this kernel to 256 VGPRs with spills (E424)
         for (int kk = 0; kk < MMB_BK; kk += 16) {
             v16s a[HC], b[TN]; const int r = lane & 15;
 #pragma unroll
@@ -376,7 +376,7 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
     const int cm = lane & 15, cn = lane >> 4; const int ch = e0 + wm * 16 + cm;
 #pragma unroll
     for (int j = 0; j < TN; ++j) {
-#pragma unroll
+#pragma unroll 1
         for (int e = 0; e < 8; ++e) {
             const int t = t0 + wn * (TN * 16) + j * 16 + 2 * e + cn;
             if (t >= T) continue;
