@@ -32,7 +32,7 @@ def test_accepts(message: str) -> None:
         ("fix: clamp the rollback window", "required lowercase scope"),
         ("ci(): empty scope", "required lowercase scope"),
         ("fix(server): clamp the rollback window.", "ends with a period"),
-        ("fix(server): " + "x" * 100, "at most 100"),
+        ("fix(server): " + "x" * 300, "at most 300"),
         ("fix(server): clamp\nbody without a blank line", "blank line"),
     ],
 )
