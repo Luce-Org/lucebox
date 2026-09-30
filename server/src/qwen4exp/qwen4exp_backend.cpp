@@ -220,8 +220,10 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
     std::vector<int32_t> history = req.prompt;
 
     const auto t_dec0 = std::chrono::steady_clock::now();
+    BudgetHookState budget;   // thinking force-close: keeps the reply reserve of the budget for the answer
     int32_t next = sample_logits(logits.data(), weights_.n_vocab, req.sampler, history, rng);
     for (int g = 0; g < req.n_gen; ++g) {
+        if (budget.apply(req.budget_hook, g, req.n_gen, next)) result.budget_forced_close = true;
         result.tokens.push_back(next);
         io.emit(next);
         if (io.is_cancelled()) {

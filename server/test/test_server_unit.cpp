@@ -4367,6 +4367,31 @@ TEST_CASE(ServerUnitFixture, test_max_output_alias_precedence_ignores_shadowed_i
         resolve_max_output_tokens({{"max_completion_tokens", 8}}, 400) == 8);
 }
 
+// Thinking force-close: once the remaining budget reaches the reply reserve the next tokens become the close
+// sequence; a model that emits close[0] itself keeps its own token and is not counted as forced.
+TEST_CASE(ServerUnitFixture, test_budget_hook_state_force_closes_at_reply_reserve) {
+    const BudgetHook hook{{7, 8, 9}, 4};
+    BudgetHookState s;
+    int32_t tok = 1;
+    TEST_ASSERT(!s.apply(hook, 5, 10, tok) && tok == 1);   // remaining 5 > reserve 4
+    tok = 2;
+    TEST_ASSERT(s.apply(hook, 6, 10, tok) && tok == 7);    // remaining 4: forced close[0]
+    tok = 3;
+    TEST_ASSERT(!s.apply(hook, 7, 10, tok) && tok == 8);
+    tok = 3;
+    TEST_ASSERT(!s.apply(hook, 8, 10, tok) && tok == 9);
+    tok = 3;
+    TEST_ASSERT(!s.apply(hook, 9, 10, tok) && tok == 3);   // the answer resumes
+    BudgetHookState own;
+    tok = 7;
+    TEST_ASSERT(!own.apply(hook, 6, 10, tok) && tok == 7); // self-closed at the boundary
+    tok = 5;
+    TEST_ASSERT(!own.apply(hook, 7, 10, tok) && tok == 8);
+    BudgetHookState off;
+    tok = 5;
+    TEST_ASSERT(!off.apply(BudgetHook{}, 9, 10, tok) && tok == 5);
+}
+
 static ServerConfig deepseek_reasoning_test_config() {
     ServerConfig config;
     config.arch = "deepseek4";
