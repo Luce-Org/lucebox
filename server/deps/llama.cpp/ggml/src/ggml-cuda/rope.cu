@@ -368,8 +368,8 @@ static __global__ void rope_multi_heads(const T * x, T * dst, const int ne00, co
             const float x1 = x[ix + n_dims/2];
 
             // Explicit form of the contraction the compiler picks for rope_multi's two lines (bit-identical).
-            dst[idst + 0]        = __builtin_fmaf(x0, cos_theta, -__fmul_rn(x1, sin_theta));
-            dst[idst + n_dims/2] = __builtin_fmaf(x1, cos_theta, __fmul_rn(x0, sin_theta));
+            dst[idst + 0]        = fmaf(x0, cos_theta, -__fmul_rn(x1, sin_theta));
+            dst[idst + n_dims/2] = fmaf(x1, cos_theta, __fmul_rn(x0, sin_theta));
         }
     }
 }
