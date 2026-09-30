@@ -39,11 +39,13 @@ if [[ "${FORCE:-0}" != 1 ]] && holders="$(lsof -t /dev/kfd 2>/dev/null)" && [[ -
 fi
 
 BRICK_DEVICE=hip:0
-args=(--model-routing name --host 127.0.0.1 --port "$PORT" --routing-queue-limit 64)
+# The first model is positional; process-wide options go in its block.
+args=(--model-routing name)
+common=(--host 127.0.0.1 --port "$PORT" --routing-queue-limit 64)
 case "${TOPOLOGY:-full}" in
   full)
     args+=(
-      --model "$MODELS/Qwen3.8-27B-UD-IQ4_XS.gguf" --model-name qwen3.8-27b
+      "$MODELS/Qwen3.8-27B-UD-IQ4_XS.gguf" "${common[@]}" --model-name qwen3.8-27b
         --target-device hip:0
         --draft "$MODELS/qwen38-dflash2-q8_0.gguf" --draft-device hip:0 --draft-block-size 16
         --cache-type-k q8_0 --cache-type-v q8_0
@@ -51,10 +53,16 @@ case "${TOPOLOGY:-full}" in
   strix) BRICK_DEVICE=hip:1 ;;
   *) echo "TOPOLOGY must be full or strix" >&2; exit 2 ;;
 esac
+if [[ "${TOPOLOGY:-full}" == strix ]]; then
+  args+=("$MODELS/routing/brick-complexity-2-max-Q8_0.gguf" "${common[@]}")
+else
+  args+=(--model "$MODELS/routing/brick-complexity-2-max-Q8_0.gguf")
+fi
 args+=(
-  --model "$MODELS/routing/brick-complexity-2-max-Q8_0.gguf" --model-name brick-max
+  --model-name brick-max
     --target-device "$BRICK_DEVICE"
     --max-concurrency 4 --kv-pool-tokens 131072 --max-ctx 32768
+    --chat-template-file "$HERE/config/brick_chatml.jinja"
   --model "$MODELS/routing/Qwen3.5-2B-Q8_0.gguf" --model-name qwen35-2b
     --target-device hip:1
     --max-concurrency 4 --kv-pool-tokens 262144 --max-ctx 122880

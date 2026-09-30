@@ -93,8 +93,8 @@ Example: the routing trial's three models, one process on port 8420
 (`harness/routing/scripts/launch_routing.sh`):
 
 ```bash
-luce_server --model-routing name --host 127.0.0.1 --port 8420 --routing-queue-limit 64 \
-  --model ~/models/Qwen3.8-27B-UD-IQ4_XS.gguf --model-name qwen3.8-27b \
+luce_server --model-routing name ~/models/Qwen3.8-27B-UD-IQ4_XS.gguf \
+  --host 127.0.0.1 --port 8420 --routing-queue-limit 64 --model-name qwen3.8-27b \
     --target-device hip:0 \
     --draft ~/models/qwen38-dflash2-q8_0.gguf --draft-device hip:0 --draft-block-size 16 \
     --cache-type-k q8_0 --cache-type-v q8_0 \
