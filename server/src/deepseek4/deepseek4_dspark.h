@@ -288,6 +288,16 @@ inline bool deepseek4_verify_crosses_multiple_ratio4_boundaries(
 // verify against the DS4 target in one batched forward, accept the matching
 // prefix, and loop. Returns generated tokens via `io.emit`. Mirrors the laguna
 // DSpark loop. accept_rate_out (optional) gets mean accepted / block.
+// Thinking-budget hook for speculative decode. When the remaining window
+// falls to hard_limit, close_ids replace the next emitted tokens in order,
+// exactly as the AR loop's budget_hook_apply does, and speculative decode
+// continues for the answer.
+struct DSparkBudgetHook {
+    std::vector<int32_t> close_ids;
+    int hard_limit = 0;
+    bool fired = false;             // out: the hook forced the close
+};
+
 struct GenerateRequest;  // fwd (from common/…); the loop only needs n_gen + committed
 bool run_deepseek4_dspark_spec_decode(
         ggml_backend_t backend,
@@ -309,6 +319,9 @@ bool run_deepseek4_dspark_spec_decode(
         // Non-null for requests that sample (temp > 0 or penalties): drafts
         // stay greedy and are kept with the target's probability
         // (deepseek4_spec_sampling.h), so tokens follow the request's sampler.
-        DSparkSpecSampling * sampling = nullptr);
+        DSparkSpecSampling * sampling = nullptr,
+        // Non-null for requests with a thinking budget: the hook is applied
+        // inside speculative decode (deepseek4_budget_hook.h).
+        DSparkBudgetHook * budget_hook = nullptr);
 
 }  // namespace luce::common

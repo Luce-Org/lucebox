@@ -4477,7 +4477,14 @@ GenerateResult DeepSeek4Backend::generate_from_state(
 
     // Decode
     auto t1 = Clock::now();
-    const bool budget_requires_ar = !req.budget_hook.close_token_ids.empty();
+    // A thinking budget runs inside DSpark (DSparkBudgetHook), which emits
+    // what the AR loop's hook would. The seed is emitted before DSpark starts,
+    // so a hook that would already fire on it decodes AR.
+    // LUCE_DS4_SPEC_HOOK=0 routes every budgeted request through AR.
+    const bool budget_hook_active = !req.budget_hook.close_token_ids.empty();
+    const bool budget_requires_ar = budget_hook_active &&
+        (env_flag_disabled("LUCE_DS4_SPEC_HOOK") ||
+         req.n_gen - 1 - req.budget_hook.hard_limit_remaining < 1);
     // Sampling and penalties run through DSpark as speculative sampling
     // (deepseek4_spec_sampling.h): drafts stay greedy and each is kept with
     // the target sampler's probability, so tokens follow the request's sampler.
@@ -4544,6 +4551,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         out_io.emit(seed);
         float accept_rate = 0.0f;
         bool spec_ran = false;
+        bool spec_forced_close = false;
         if (!out_io.is_cancelled() && !deepseek4_is_eos_tok(seed, w_) && req.n_gen > 1) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
             const int win_len = feat_row > 0 ? (int) (spec_feat_window_.size() / feat_row) : 0;
@@ -4553,6 +4561,12 @@ GenerateResult DeepSeek4Backend::generate_from_state(
             // advances the target cache, reject post-decode snapshots rather
             // than pairing that state with stale prefill logits.
             last_logits_pos_ = -1;
+            std::optional<DSparkBudgetHook> spec_hook;
+            if (budget_hook_active) {
+                spec_hook.emplace();
+                spec_hook->close_ids = req.budget_hook.close_token_ids;
+                spec_hook->hard_limit = req.budget_hook.hard_limit_remaining;
+            }
             if (!run_deepseek4_dspark_spec_decode(
                     backend_, cfg_.device.gpu, w_, cache_, *spec_drafter_, committed, seed,
                     req.n_gen - 1,
@@ -4567,18 +4581,21 @@ GenerateResult DeepSeek4Backend::generate_from_state(
                         ? moe_hybrid_.get() : nullptr,
                     expert_runtime_.compute ? &expert_runtime_ : nullptr,
                     routing_stats_.get(),
-                    spec_sampler ? &*spec_sampler : nullptr)) {
+                    spec_sampler ? &*spec_sampler : nullptr,
+                    spec_hook ? &*spec_hook : nullptr)) {
                 result.fail(GenerateErrorCode::DecodeFailed,
                             "DSpark speculative decode failed");
                 return result;
             }
             gen.insert(gen.end(), spec_toks.begin(), spec_toks.end());
+            spec_forced_close = spec_hook && spec_hook->fired;
         }
         result.succeed();
         result.tokens = std::move(gen);
         result.decode_s = elapsed_s(t1);
         result.accept_rate = accept_rate;
         result.spec_decode_ran = spec_ran;
+        result.budget_forced_close = spec_forced_close;
         std::fprintf(stderr, "[deepseek4] DSpark decode: %zu tok in %.3fs (%.1f tok/s) accept_rate=%.2f\n",
                      result.tokens.size(), result.decode_s,
                      result.decode_s > 0 ? result.tokens.size() / result.decode_s : 0.0, accept_rate);

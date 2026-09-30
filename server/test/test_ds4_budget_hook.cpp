@@ -11,7 +11,9 @@
 
 #include "deepseek4/deepseek4_budget_hook.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <random>
 #include <vector>
 
 namespace {
@@ -116,6 +118,86 @@ TEST_CASE(BudgetHookFixture, never_fires_with_zero_reserve) {
     REQUIRE(st.step(kClose3, /*remaining=*/1, /*hard=*/0, /*sampled=*/42) == 42);
     REQUIRE(!st.started);
     REQUIRE(!st.forced);
+}
+
+// The DSpark form of the rule (spec_budget_hook_step) must emit exactly what the AR rule emits
+// token by token, whatever the drafts, their acceptance and the verify width. A deterministic
+// toy model makes both paths comparable: its next token is a hash of everything emitted so far.
+namespace {
+
+int32_t toy_model(const std::vector<int32_t> & seq) {
+    uint64_t h = 1469598103934665603ull;
+    for (int32_t t : seq) h = (h ^ (uint64_t) t) * 1099511628211ull;
+    return 1 + (int32_t) (h % 40);
+}
+
+std::vector<int32_t> ar_reference(const std::vector<int32_t> & close, int n_gen, int hard) {
+    std::vector<int32_t> seq;
+    HookState st;
+    for (int g = 0; g < n_gen; g++) seq.push_back(st.step(close, n_gen - g, hard, toy_model(seq)));
+    return seq;
+}
+
+std::vector<int32_t> spec_decode(const std::vector<int32_t> & close, int n_gen, int hard,
+                                 int q_cap, std::mt19937_64 & rng) {
+    using namespace luce::deepseek4;
+    std::uniform_real_distribution<double> unif(0.0, 1.0);
+    std::uniform_int_distribution<int32_t> wrong(1, 40);
+    std::vector<int32_t> seq = {toy_model({})};   // the seed, emitted before speculation
+    SpecBudgetHookState st;
+    while ((int) seq.size() < n_gen) {
+        const bool forcing = spec_budget_hook_forcing(close, st);
+        std::vector<int32_t> draft = {seq.back()};
+        if (forcing) {
+            const int k = std::min((int) (close.size() - st.inject_pos), q_cap - 1);
+            for (int i = 0; i < k; i++) draft.push_back(close[st.inject_pos + (size_t) i]);
+        } else {
+            std::vector<int32_t> ctx = seq;
+            for (int i = 1; i < q_cap; i++) {
+                const int32_t right = toy_model(ctx);
+                const int32_t d = unif(rng) < 0.7 ? right : wrong(rng);
+                draft.push_back(d);
+                ctx.push_back(d);
+            }
+        }
+        const int q = (int) draft.size();
+        int accept = 1;
+        std::vector<int32_t> ctx = seq;
+        if (forcing) {
+            accept = q;
+            for (int i = 1; i < q; i++) ctx.push_back(draft[(size_t) i]);
+        } else {
+            for (int i = 1; i < q && draft[(size_t) i] == toy_model(ctx); i++) {
+                ctx.push_back(draft[(size_t) i]);
+                accept++;
+            }
+        }
+        int32_t bonus = toy_model(ctx);
+        spec_budget_hook_step(close, n_gen - (int) seq.size(), hard, forcing,
+                              forcing ? q - 1 : 0, accept, bonus, st);
+        for (int i = 1; i < accept && (int) seq.size() < n_gen; i++) seq.push_back(draft[(size_t) i]);
+        if ((int) seq.size() < n_gen) seq.push_back(bonus);
+    }
+    return seq;
+}
+
+}  // namespace
+
+TEST_CASE(BudgetHookFixture, spec_step_matches_ar_rule) {
+    std::mt19937_64 rng(2026);
+    const std::vector<std::vector<int32_t>> closes = {{101}, {101, 102, 103}, {101, 102, 103, 104, 105, 106, 107}};
+    int fired = 0;
+    for (int trial = 0; trial < 3000; trial++) {
+        const auto & close = closes[(size_t) trial % closes.size()];
+        const int n_gen = 8 + (int) (rng() % 80);
+        const int hard = (int) (rng() % (uint64_t) (n_gen - 1));   // never fires on the seed
+        const int q_cap = 2 + (int) (rng() % 5);
+        const auto want = ar_reference(close, n_gen, hard);
+        const auto got = spec_decode(close, n_gen, hard, q_cap, rng);
+        REQUIRE(got == want);
+        fired += std::find(want.begin(), want.end(), 101) != want.end();
+    }
+    REQUIRE(fired > 2000);   // the close actually happened in most trials
 }
 
 }  // namespace BudgetHookTests

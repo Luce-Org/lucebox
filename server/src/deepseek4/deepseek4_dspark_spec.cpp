@@ -22,6 +22,7 @@
 // LUCE_DS4_FULL_SNAP=1 for A/B validation.
 
 #include "deepseek4_dspark.h"
+#include "deepseek4_budget_hook.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_snapshot.h"
 #include "deepseek4_roctx.h"
@@ -930,8 +931,11 @@ bool run_deepseek4_dspark_spec_decode(
         MoeHybridStorage * moe_hybrid,
         MoeExpertComputeRuntime * expert_runtime,
         MoeHybridRoutingStats * routing_stats,
-        DSparkSpecSampling * sampling) {
+        DSparkSpecSampling * sampling,
+        DSparkBudgetHook * budget_hook) {
     const int n_embd = target_w.n_embd;
+    const bool hook_on = budget_hook && !budget_hook->close_ids.empty();
+    luce::deepseek4::SpecBudgetHookState hook_st;
     const int n_tgt = drafter.n_target_layers;
     const int block = drafter.block_size;
     const int n_swa = target_w.n_swa;
@@ -1136,10 +1140,14 @@ bool run_deepseek4_dspark_spec_decode(
     while (n_generated < n_gen) {
         const SpecClock::time_point step_t0 = SpecClock::now();
         const int ctx_len = feat_count < n_swa ? feat_count : n_swa;
+        // The close sequence is under way: verify its remaining tokens as
+        // forced drafts instead of asking the drafter.
+        const bool forcing = hook_on &&
+            luce::deepseek4::spec_budget_hook_forcing(budget_hook->close_ids, hook_st);
 
         // Noise block = [seed] + [MASK]*(block-1).
         SpecClock::time_point t0 = SpecClock::now();
-        if (q_cap >= 2) {
+        if (q_cap >= 2 && !forcing) {
             noise_ids[0] = lt;
             for (int i = 1; i < block; i++) {
                 noise_ids[i] = drafter.mask_token_id;
@@ -1212,11 +1220,19 @@ bool run_deepseek4_dspark_spec_decode(
         // step. Do not stack the slower acceptance-regime cap on top of it;
         // acceptance feedback remains the fallback and drives q5/artifacts
         // without confidence metadata.
-        if (!use_confidence_width) {
+        if (!use_confidence_width && !forcing) {
             q_step_cap = width_controller.next_width_cost_aware(
                 {}, q_step_cap);
         }
-        if (q_step_cap >= 2) {
+        if (forcing) {
+            draft_tok.push_back(lt);
+            const int pending = (int) (budget_hook->close_ids.size() - hook_st.inject_pos);
+            const int k = std::min(pending, std::max(0, q_step_cap - 1));
+            for (int i = 0; i < k; i++) {
+                draft_tok.push_back(budget_hook->close_ids[hook_st.inject_pos + (size_t) i]);
+            }
+            ds_ok = true;
+        } else if (q_step_cap >= 2) {
             std::memcpy(padded_hidden.data() + n_embd, local_hidden.data(),
                         sizeof(float) * (size_t) n_embd * block);
             if (use_confidence_width) {
@@ -1258,7 +1274,9 @@ bool run_deepseek4_dspark_spec_decode(
         // width with the best predicted committed-tokens/step-cost ratio;
         // this avoids treating a narrower verifier as proportionally cheaper
         // when q3 and q4 are nearly the same cost on gfx1151.
-        if (use_confidence_width && !draft_confidence.empty()) {
+        if (forcing) {
+            // Forced drafts keep their width.
+        } else if (use_confidence_width && !draft_confidence.empty()) {
             if (draft_confidence.size() > (size_t) kDs4ConfidenceDepths) {
                 step_confidence.assign(draft_confidence.begin(),
                                        draft_confidence.begin() + kDs4ConfidenceDepths);
@@ -1369,7 +1387,29 @@ bool run_deepseek4_dspark_spec_decode(
         // plus each candidate the target agrees with.
         int accept = 1;
         int bonus = -1;
-        if (sampling) {
+        if (forcing) {
+            // Every forced candidate is kept; the bonus is the target's next
+            // token after the last one, drawn with the request's sampler.
+            accept = q;
+            if (sampling) {
+                t0 = SpecClock::now();
+                if (!target.read_verify_logits(q, spec_logits)) {
+                    std::fprintf(stderr, "[ds4-spec] sampling: verify logits unavailable\n");
+                    ok = false;
+                    break;
+                }
+                std::vector<int32_t> hist = sampling->history;
+                for (int k = 1; k < q; k++) hist.push_back(draft_tok[(size_t) k]);
+                if (spec_rows.empty()) spec_rows.resize(1);
+                sampler_distribution(spec_logits.data() + (size_t) (q - 1) * target_w.n_vocab,
+                                     target_w.n_vocab, sampling->cfg, hist, spec_rows[0]);
+                std::uniform_real_distribution<double> unif(0.0, 1.0);
+                bonus = sampler_draw(spec_rows[0], unif(*sampling->rng));
+                tm_sample += spec_ms_since(t0);
+            } else {
+                bonus = tgt_am[q - 1];
+            }
+        } else if (sampling) {
             // Verify row i is the target's next-token logits after
             // draft_tok[i]. Each row's distribution depends only on its logits
             // and on the history extended by draft_tok[1..i], all known now,
@@ -1404,6 +1444,16 @@ bool run_deepseek4_dspark_spec_decode(
                 else break;
             }
             bonus = tgt_am[accept - 1];                       // target's token at the accept point
+        }
+        // Thinking-budget hook over this step's emitted tokens: where the AR
+        // rule would override a token, truncate the step there and emit the
+        // close token as the bonus.
+        if (hook_on) {
+            int32_t hook_bonus = bonus;
+            luce::deepseek4::spec_budget_hook_step(
+                budget_hook->close_ids, n_gen - n_generated, budget_hook->hard_limit,
+                forcing, forcing ? q - 1 : 0, accept, hook_bonus, hook_st);
+            bonus = hook_bonus;
         }
         const int matched = accept - 1;                       // accepted candidates
         const int commit_pos = pos + accept;                  // seed + accepted candidates in KV
@@ -1522,10 +1572,12 @@ bool run_deepseek4_dspark_spec_decode(
         const int fN = full_snap ? target.last_verify_n() : accept;
         push_features(feats.data(), fN);
         tm_feat += spec_ms_since(t0);
-        width_controller.observe(
-            accept, q, (float) spec_ms_since(step_t0));
-        if (use_confidence_width) {
-            width_controller.observe_confidence(draft_confidence, accept, q);
+        if (!forcing) {
+            width_controller.observe(
+                accept, q, (float) spec_ms_since(step_t0));
+            if (use_confidence_width) {
+                width_controller.observe_confidence(draft_confidence, accept, q);
+            }
         }
 
         // Output tokens this step = accepted candidates + bonus.
@@ -1550,8 +1602,10 @@ bool run_deepseek4_dspark_spec_decode(
         }
         pos = commit_pos;              // seed + accepted candidates now in KV
         lt = bonus;                    // deferred bonus becomes next seed
-        accept_sum += matched;
-        offered_sum += q - 1;
+        if (!forcing) {                // forced drafts say nothing about the drafter
+            accept_sum += matched;
+            offered_sum += q - 1;
+        }
         steps++;
         if (timing && (steps <= 4 || (steps & 31) == 0)) {
             std::fprintf(stderr,
@@ -1566,6 +1620,7 @@ bool run_deepseek4_dspark_spec_decode(
         if (hit_eos || stop_requested) break;
     }
 
+    if (hook_on && hook_st.forced_close) budget_hook->fired = true;
     const double total_ms = spec_ms_since(run_t0);
     if (accept_rate_out) {
         *accept_rate_out = offered_sum > 0

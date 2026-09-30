@@ -66,5 +66,60 @@ inline int32_t budget_hook_apply(const std::vector<int32_t> & close_ids,
     return close_ids.front();
 }
 
+// The same rule applied to one DSpark speculative step, so thinking requests
+// keep speculative decode instead of routing to AR.
+//
+// A step emits `accept` tokens: the kept candidates draft[1..accept-1], then
+// `bonus`. `first_remaining` is the window left (n_gen - generated) at the
+// step's first emitted token. Where the AR rule would override emitted token
+// i, the step is truncated there and the close token becomes the bonus (the
+// next step's seed). While the rest of the close sequence is pending
+// (spec_budget_hook_forcing), the caller drafts it verbatim, verifies it and
+// keeps every forced candidate; `n_forced` is how many it verified, and only
+// the bonus after them is checked here. Every emitted token then equals what
+// budget_hook_apply would emit token by token.
+struct SpecBudgetHookState {
+    bool started = false;
+    std::size_t inject_pos = 0;
+    bool forced_close = false;
+};
+
+// True while the next step must draft the close sequence instead of asking the
+// drafter.
+inline bool spec_budget_hook_forcing(const std::vector<int32_t> & close_ids,
+                                     const SpecBudgetHookState & st) {
+    return !close_ids.empty() && st.started && st.inject_pos < close_ids.size();
+}
+
+inline void spec_budget_hook_step(const std::vector<int32_t> & close_ids,
+                                  int first_remaining,
+                                  int hard_limit,
+                                  bool forcing,
+                                  int n_forced,
+                                  int & accept,
+                                  int32_t & bonus,
+                                  SpecBudgetHookState & st) {
+    if (close_ids.empty()) return;
+    if (forcing) st.inject_pos += (std::size_t) n_forced;
+    for (int i = forcing ? accept : 1; i <= accept; i++) {
+        const int remaining = first_remaining - (i - 1);
+        if (st.started) {
+            if (st.inject_pos < close_ids.size()) {
+                if (i < accept) accept = i;
+                bonus = close_ids[st.inject_pos++];
+            }
+            return;
+        }
+        if (remaining <= hard_limit) {
+            st.started = true;
+            st.forced_close = true;
+            st.inject_pos = 1;
+            if (i < accept) accept = i;
+            bonus = close_ids.front();
+            return;
+        }
+    }
+}
+
 }  // namespace deepseek4
 }  // namespace luce
