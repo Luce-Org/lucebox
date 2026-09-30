@@ -5216,6 +5216,83 @@ TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
     }
 }
 
+// Claude Code shape: tool_use blocks in the assistant turn, tool_result
+// blocks (any order, string or block content) plus reminder text in the
+// next user turn, then a system note.
+TEST_CASE(ServerUnitFixture, test_normalize_anthropic_tool_followup_messages) {
+    ToolMemory tool_memory;
+    const std::string raw =
+        "<think>\n\n</think>\n\n<tool_call>\n<function=Read>\n"
+        "<parameter=file_path>\n/a.py\n</parameter>\n</function>\n</tool_call>";
+    tool_memory.remember({"call_a", "call_b"}, raw);
+
+    const json messages = json::array({
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "text"}, {"text", "read both"}}})}},
+        {{"role", "assistant"}, {"content", json::array({
+            {{"type", "text"}, {"text", ""}},
+            {{"type", "tool_use"}, {"id", "call_a"}, {"name", "Read"},
+             {"input", {{"file_path", "/a.py"}}}},
+            {{"type", "tool_use"}, {"id", "call_b"}, {"name", "Read"},
+             {"input", {{"file_path", "/b.py"}}}}})}},
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "tool_result"}, {"tool_use_id", "call_b"},
+             {"content", json::array({{{"type", "text"}, {"text", "B"}}})}},
+            {{"type", "tool_result"}, {"tool_use_id", "call_a"},
+             {"content", "A"}},
+            {{"type", "text"}, {"text", "<system-reminder>x</system-reminder>"}}})}},
+        {{"role", "system"}, {"content", json::array({
+            {{"type", "text"}, {"text", "<total_tokens>9</total_tokens>"}}})}},
+    });
+
+    const auto chat = normalize_chat_messages(
+        messages, ApiFormat::ANTHROPIC, tool_memory);
+    TEST_ASSERT(chat.size() == 6);
+    if (chat.size() == 6) {
+        TEST_ASSERT(chat[0].role == "user" && chat[0].content == "read both");
+        TEST_ASSERT(chat[1].role == "assistant" && chat[1].content == raw);
+        TEST_ASSERT(chat[2].role == "tool" && chat[2].tool_call_id == "call_b" &&
+                    chat[2].content == "B");
+        TEST_ASSERT(chat[3].role == "tool" && chat[3].tool_call_id == "call_a" &&
+                    chat[3].content == "A");
+        TEST_ASSERT(chat[4].role == "user" &&
+                    chat[4].content == "<system-reminder>x</system-reminder>");
+        TEST_ASSERT(chat[5].role == "system");
+    }
+    TEST_ASSERT(!http_detail::ends_with_tool_result(chat));
+    TEST_ASSERT(http_detail::ends_with_tool_result(
+        std::vector<ChatMessage>(chat.begin(), chat.begin() + 4)));
+    std::vector<ChatMessage> with_note(chat.begin(), chat.begin() + 4);
+    with_note.push_back(chat[5]);
+    TEST_ASSERT(http_detail::ends_with_tool_result(with_note));
+}
+
+// Calls the server no longer remembers (restart, eviction) still reach the
+// model, in the Qwen template's own tool-call rendering.
+TEST_CASE(ServerUnitFixture, test_normalize_anthropic_tool_use_without_memory) {
+    ToolMemory tool_memory;
+    const json messages = json::array({
+        {{"role", "user"}, {"content", "go"}},
+        {{"role", "assistant"}, {"content", json::array({
+            {{"type", "text"}, {"text", "Reading."}},
+            {{"type", "tool_use"}, {"id", "toolu_1"}, {"name", "Read"},
+             {"input", {{"file_path", "/a.py"}}}},
+            {{"type", "tool_use"}, {"id", "toolu_2"}, {"name", "Grep"},
+             {"input", {{"pattern", "x"}, {"n", 3}}}}})}},
+    });
+    const auto chat = normalize_chat_messages(
+        messages, ApiFormat::ANTHROPIC, tool_memory);
+    TEST_ASSERT(chat.size() == 2);
+    if (chat.size() == 2) {
+        TEST_ASSERT(chat[1].content ==
+            "Reading.\n\n"
+            "<tool_call>\n<function=Read>\n<parameter=file_path>\n/a.py\n"
+            "</parameter>\n</function>\n</tool_call>\n"
+            "<tool_call>\n<function=Grep>\n<parameter=n>\n3\n</parameter>\n"
+            "<parameter=pattern>\nx\n</parameter>\n</function>\n</tool_call>");
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Placement config tests
 // ═══════════════════════════════════════════════════════════════════════

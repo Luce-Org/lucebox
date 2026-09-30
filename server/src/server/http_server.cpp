@@ -293,6 +293,14 @@ bool should_clamp_flowkv_disk_cache(
     return flowkv && policy.compress;
 }
 
+bool ends_with_tool_result(const std::vector<ChatMessage> & messages) {
+    for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+        if (it->role == "system") continue;
+        return it->role == "tool" || it->role == "function";
+    }
+    return false;
+}
+
 bool canonical_turn_matches_checkpoint(
         const std::vector<int32_t> & prompt,
         const std::vector<int32_t> & completed_turn,
@@ -1022,6 +1030,23 @@ std::string render_tool_call_xml(const std::string & name, const json & argument
     return out;
 }
 
+// Text of an Anthropic tool_result block: a string, or the text blocks of an
+// array (images and documents have no text form here).
+static std::string anthropic_tool_result_text(const json & block) {
+    if (!block.contains("content")) return {};
+    const auto & content = block["content"];
+    if (content.is_string()) return content.get<std::string>();
+    std::string text;
+    if (content.is_array()) {
+        for (const auto & part : content) {
+            if (!part.is_object() || part.value("type", "") != "text") continue;
+            if (!text.empty()) text += "\n";
+            text += part.value("text", "");
+        }
+    }
+    return text;
+}
+
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
@@ -1069,15 +1094,60 @@ std::vector<ChatMessage> normalize_chat_messages(
 
             ChatMessage cm;
             cm.role = m.value("role", "user");
+            const bool anthropic_blocks = format == ApiFormat::ANTHROPIC &&
+                m.contains("content") && m["content"].is_array();
 
-            bool replayed = false;
+            // Anthropic sends tool results as tool_result blocks at the
+            // start of a user turn. Each becomes a tool message; the user's
+            // own text, if any, follows them.
+            if (anthropic_blocks && cm.role == "user") {
+                bool has_results = false;
+                std::string text;
+                for (const auto & part : m["content"]) {
+                    if (!part.is_object()) continue;
+                    const std::string ptype = part.value("type", "");
+                    if (ptype == "tool_result") {
+                        chat_msgs.push_back({"tool", anthropic_tool_result_text(part),
+                                             part.value("tool_use_id", "")});
+                        has_results = true;
+                    } else if (ptype == "text") {
+                        text += part.value("text", "");
+                    }
+                }
+                if (has_results) {
+                    if (!text.empty()) chat_msgs.push_back({"user", std::move(text)});
+                    continue;
+                }
+            }
+
+            // Tool calls come back as OpenAI tool_calls or Anthropic
+            // tool_use blocks. Tool memory replays the call as the model
+            // wrote it.
+            std::vector<std::string> call_ids;
+            std::string rendered_calls;
             if (cm.role == "assistant" && m.contains("tool_calls") &&
-                m["tool_calls"].is_array() && !m["tool_calls"].empty()) {
-                std::vector<std::string> call_ids;
+                m["tool_calls"].is_array()) {
                 for (const auto & tc : m["tool_calls"]) {
                     std::string id = tc.value("id", "");
                     if (!id.empty()) call_ids.push_back(id);
                 }
+            }
+            if (anthropic_blocks && cm.role == "assistant") {
+                for (const auto & part : m["content"]) {
+                    if (!part.is_object() || part.value("type", "") != "tool_use")
+                        continue;
+                    std::string id = part.value("id", "");
+                    if (!id.empty()) call_ids.push_back(id);
+                    if (!rendered_calls.empty()) rendered_calls += "\n";
+                    rendered_calls += "<tool_call>\n" +
+                        render_tool_call_xml(part.value("name", ""),
+                                             part.value("input", json::object())) +
+                        "</tool_call>";
+                }
+            }
+
+            bool replayed = false;
+            if (!call_ids.empty()) {
                 std::string raw = tool_memory.lookup(call_ids);
                 if (!raw.empty()) {
                     cm.content = raw;
@@ -1096,6 +1166,12 @@ std::vector<ChatMessage> normalize_chat_messages(
                             cm.content += part.value("text", "");
                         }
                     }
+                }
+                // Calls the server no longer remembers: the Qwen template's
+                // own rendering of message.tool_calls.
+                if (!rendered_calls.empty()) {
+                    if (!cm.content.empty()) cm.content += "\n\n";
+                    cm.content += rendered_calls;
                 }
             }
 
@@ -2521,9 +2597,8 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
 
         const std::vector<ChatMessage> chat_messages =
             normalize_chat_messages(req.messages, req.format, tool_memory_);
-        req.ends_with_tool_result = !chat_messages.empty() &&
-            (chat_messages.back().role == "tool" ||
-             chat_messages.back().role == "function");
+        req.ends_with_tool_result =
+            http_detail::ends_with_tool_result(chat_messages);
         // Reasoning must be applied BEFORE rendering: the template injects
         // the empty <think>\n\n</think>\n\n block when thinking is disabled.
         apply_request_reasoning(body, config_, req);

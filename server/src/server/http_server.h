@@ -273,6 +273,10 @@ float resolve_pflash_keep_ratio(float configured_ratio,
                                 const HttpServerSessions & sessions);
 bool should_clamp_flowkv_disk_cache(
     bool flowkv, const DiskPrefixCachePolicy & policy);
+// True when the last message other than a system note is a tool result.
+// Agent clients append system notes (a context budget, reminders) after
+// the tool results; those notes are append-only history too.
+bool ends_with_tool_result(const std::vector<ChatMessage> & messages);
 bool canonical_turn_matches_checkpoint(
     const std::vector<int32_t> & prompt,
     const std::vector<int32_t> & completed_turn,
