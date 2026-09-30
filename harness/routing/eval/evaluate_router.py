@@ -1,25 +1,34 @@
-"""Score the Brick router offline against measured labels (runs/<name>/labels.jsonl).
+"""Score the Brick routers offline against measured labels (runs/<name>/labels.jsonl).
 
-Three reports, written to runs/<name>/router_eval/:
+Everything is per arm (config "arms": by default qwen35-2b, qwen38-27b and
+qwen38-27b-think, the 27B with thinking on). Four reports, written to runs/<name>/router_eval/:
 
-1. Baselines: always-<model> for each model, and the oracle (cheapest model whose
+1. Baselines: always-<arm> for each arm, and the oracle (cheapest arm whose
    answer was correct; if none, the best-scoring one).
 2. Brick threshold sweep, per Brick service (default brick-max and brick-eco) and per
-   model pool ({small, mid, large}, {mid, large}, {small, large}): a grid over the
+   arm pool ({small, mid, large}, {mid, large}, {small, large}): a grid over the
    pool's relevant thresholds (t_small, t_mid, h_max) replayed through the router's
    own ``BrickRouter.choose``. Each point reports quality (mean score of the chosen
    model's answer), expected latency (chosen model's measured total_ms + the Brick
    call), the under-route rate (sent to a model that failed while a bigger model in
    the pool passed) and the over-route rate; Pareto-optimal points are marked.
-3. Brick calibration: reliability tables of each class probability against the
-   cheapest model that was actually OK (easy <-> small ok, medium <-> mid is the
+3. brick_skill beta sweep (Brick's J = D + beta * latency rule), per service and pool, when a
+   skill table exists (runs/<name>/skills.json from eval.fit_skills). The latency term uses
+   the static profile (runs/<name>/latency_profile.json from eval.fit_latency, else the
+   config's latency_defaults) with no live queue. The measured latency of a point is the chosen
+   arm's total_ms plus capability_ms + brick_ms (an upper bound: live, the two classifiers run
+   concurrently). Points are Pareto-marked within the sweep and together with the pool's
+   threshold points (pareto_combined).
+4. Brick calibration: reliability tables of each class probability against the
+   cheapest arm that was actually OK (easy <-> small ok, medium <-> mid is the
    cheapest ok, hard <-> only large ok or none), with ECE, plus an argmax confusion
    table.
 
 Brick is called once per prompt through the offline router API
 (``lucerouter.routers.build("brick:service=S", config)`` + ``await router.route(...)``)
 and the probabilities are cached in runs/<name>/brick_probs.jsonl, so a sweep is one
-classifier pass however large the grid.
+classifier pass however large the grid. Capability probabilities are cached the same way in
+runs/<name>/capability_probs.jsonl (see eval.fit_skills).
 """
 
 from __future__ import annotations
@@ -36,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from .common import BACKENDS_PATH, PROMPTS_PATH, RUNS_DIR, append_jsonl, read_jsonl
+from .fit_skills import classify_capabilities, load_capability_cache, local_capability_fn
 from .label import oracle_choice, pool_cheapest_ok
 
 DEFAULT_SERVICES = ["brick-max", "brick-eco"]
@@ -45,6 +55,7 @@ DEFAULT_GRID = {
     "h_max": [0.2, 0.35, 0.5, 0.7, 1.01],
 }
 CLASSES = ("easy", "medium", "hard")
+DEFAULT_BETAS = [0.0, 0.05, 0.1, 0.23, 0.5, 1.0, 2.0, 4.0, 8.0]
 
 
 # --------------------------------------------------------------------------- scoring (pure)
@@ -159,6 +170,39 @@ def sweep(
         points.append({**params, **score_decisions(usable, decisions, pool)})
     pareto_front(points)
     return points
+
+
+def skill_sweep(
+    labels: list[dict[str, Any]],
+    probs: dict[str, dict[str, Any]],
+    cap: dict[str, dict[str, Any]],
+    prompt_chars: dict[str, int],
+    pool: list[str],
+    betas: list[float],
+    router_for: Callable[[float], Any],
+) -> list[dict[str, Any]]:
+    """Replay brick_skill's ``choose`` per beta. Router time = brick_ms + capability_ms."""
+    usable = [lab for lab in labels if lab["id"] in probs and lab["id"] in cap]
+    points = []
+    for beta in betas:
+        router = router_for(beta)
+        decisions = {}
+        for lab in usable:
+            i = lab["id"]
+            arm, _, _ = router.choose(probs[i]["probs"], cap[i]["probs"], prompt_chars[i])
+            decisions[i] = {"model": arm, "latency_ms": probs[i]["latency_ms"] + cap[i]["latency_ms"]}
+        points.append({"beta": beta, **score_decisions(usable, decisions, pool)})
+    pareto_front(points)
+    return points
+
+
+def mark_combined_pareto(*sweeps: list[dict[str, Any]]) -> None:
+    """Set ``pareto_combined`` on every point, judged against all the sweeps' points together."""
+    everything = [p for s in sweeps for p in s if p.get("n")]
+    flags = [dict(p) for p in everything]
+    pareto_front(flags)
+    for p, f in zip(everything, flags):
+        p["pareto_combined"] = f["pareto"]
 
 
 # --------------------------------------------------------------------------- calibration
@@ -301,9 +345,24 @@ def sweep_markdown(service: str, pool_name: str, points: list[dict[str, Any]],
     return lines + [""]
 
 
+def skill_markdown(service: str, pool_name: str, points: list[dict[str, Any]]) -> list[str]:
+    lines = [f"### brick_skill / {service} / pool {pool_name}\n",
+             "Every beta point; P = Pareto within the sweep, C = Pareto together with the threshold sweep.\n",
+             "| beta | quality | mean ms | router ms | under (too small) | over | distribution | P | C |",
+             "|---|---|---|---|---|---|---|---|---|"]
+    for p in points:
+        if not p.get("n"):
+            continue
+        lines.append(f"| {p['beta']} | {_pct(p['quality'])} | {p['mean_latency_ms']:.0f} | "
+                     f"{p['mean_router_ms']:.0f} | {_pct(p['under_route_rate'])} | {_pct(p['over_route_rate'])} | "
+                     f"{_dist(p['distribution'])} | {'P' if p['pareto'] else ''} | "
+                     f"{'C' if p.get('pareto_combined') else ''} |")
+    return lines + [""]
+
+
 def calibration_markdown(service: str, cal: dict[str, Any]) -> list[str]:
     lines = [f"### {service} calibration ({cal['n']} prompts)\n",
-             "Observed = share of prompts whose cheapest OK model matches the class "
+             "Observed = share of prompts whose cheapest OK arm matches the class "
              "(easy: small ok; medium: mid is the cheapest ok; hard: only large ok or none).\n"]
     for cls, c in cal["classes"].items():
         lines += [f"**p_{cls}** (base rate {_pct(c['base_rate'])}, ECE {c['ece']:.3f})\n",
@@ -332,24 +391,29 @@ async def run(args: argparse.Namespace) -> None:
     out_dir = run_dir / "router_eval"
     out_dir.mkdir(parents=True, exist_ok=True)
     config = load_config(args.config)
-    models = [m.name for m in config.by_rank()]
+    models = [a.name for a in config.arms_by_rank()]
     all_labels = [lab for lab in read_jsonl(run_dir / "labels.jsonl") if lab["complete"]]
     missing = [m for m in models if all_labels and m not in all_labels[0]["quality"]]
     if missing:
         models = [m for m in models if m not in missing]
-        print(f"note: no labels for {missing}; evaluating over {models}")
+        print(f"note: no labels for arms {missing}; evaluating over {models}")
     labels = all_labels if args.split == "all" else [lab for lab in all_labels if lab["split"] == args.split]
     prompts = {p["id"]: p for p in read_jsonl(args.prompts)}
     grid = {k: _floats(getattr(args, f"{k}_grid")) for k in DEFAULT_GRID}
     cache = run_dir / "brick_probs.jsonl"
+    skills_path = Path(args.skills) if args.skills else run_dir / "skills.json"
+    latency_path = Path(args.latency_profile) if args.latency_profile else run_dir / "latency_profile.json"
+    cap = load_skill_inputs(args, run_dir, prompts, [lab["id"] for lab in labels], skills_path)
+    chars = prompt_chars(prompts)
 
     base = baselines(labels, models)
     report: dict[str, Any] = {"split": args.split, "n": len(labels), "models": models,
                               "baselines": base, "services": {}}
     md = [f"# Brick router evaluation ({args.split} split, {len(labels)} prompts)\n",
-          "quality = mean score of the chosen model's answer; latency = chosen model's measured "
-          "total_ms + Brick call; under = sent to a model that failed while a bigger model in the pool "
-          "passed; over = a smaller model in the pool would have passed.\n",
+          "quality = mean score of the chosen arm's answer; latency = chosen arm's measured "
+          "total_ms + router time (Brick call, plus the capability classifier for brick_skill); "
+          "under = sent to an arm that failed while a higher-rank arm in the pool passed; "
+          "over = a lower-rank arm in the pool would have passed.\n",
           "## Baselines\n", *baselines_markdown(base), ""]
 
     async with httpx.AsyncClient() as client:
@@ -378,7 +442,20 @@ async def run(args: argparse.Namespace) -> None:
                 pool_base = baselines([lab for lab in labels if lab["id"] in probs], pool)
                 target = base[f"always_{models[-1]}"]["quality"] - args.quality_tolerance
                 svc["pools"][pool_name] = {"baselines": pool_base, "points": points}
+                if cap:
+                    spec = (f"brick_skill:service={service},skills={skills_path},live_load=off,"
+                            f"r={args.skill_r},arms={'|'.join(pool)}"
+                            + (f",latency={latency_path}" if latency_path.exists() else ""))
+
+                    def router_for(beta, spec=spec):
+                        return build(f"{spec},beta={beta}", config, client=client, capability_fn=_no_capability)
+
+                    skill_points = skill_sweep(labels, probs, cap, chars, pool, _floats(args.beta_grid), router_for)
+                    mark_combined_pareto(points, skill_points)
+                    svc["pools"][pool_name]["brick_skill"] = skill_points
                 md += sweep_markdown(service, pool_name, points, pool_base, target)
+                if cap:
+                    md += skill_markdown(service, pool_name, svc["pools"][pool_name]["brick_skill"])
             cal = calibration(labels, probs, models, n_bins=args.bins)
             svc["calibration"] = cal
             md += calibration_markdown(service, cal)
@@ -389,6 +466,36 @@ async def run(args: argparse.Namespace) -> None:
     (out_dir / "results.md").write_text(text)
     print(text)
     print(f"wrote {out_dir / 'results.md'} and results.json (probabilities cached in {cache})")
+
+
+def _no_capability(text: str) -> dict[str, float]:
+    raise RuntimeError("offline replay uses cached capability probs")
+
+
+def prompt_chars(prompts: dict[str, dict[str, Any]]) -> dict[str, int]:
+    from lucerouter.types import RouteRequest
+
+    return {i: RouteRequest(messages=p["messages"]).prompt_chars() for i, p in prompts.items()}
+
+
+def load_skill_inputs(args: argparse.Namespace, run_dir: Path, prompts: dict[str, dict[str, Any]],
+                      ids: list[str], skills_path: Path) -> dict[str, dict[str, Any]]:
+    """Cached capability probs for ``ids`` (classifying missing ones), or {} to skip brick_skill."""
+    if not skills_path.exists():
+        print(f"note: no skill table at {skills_path}; skipping brick_skill (run eval.fit_skills)")
+        return {}
+    cache = run_dir / "capability_probs.jsonl"
+    missing = [i for i in ids if i not in load_capability_cache(cache)]
+    if missing and not args.no_classify:
+        try:
+            fn = local_capability_fn(args.capability_model)
+            fn("warm up")
+        except Exception as e:  # noqa: BLE001 - optional extra or model missing
+            print(f"note: capability classifier unavailable ({e}); using cached probs only")
+        else:
+            n = classify_capabilities(fn, prompts, missing, cache)
+            print(f"capability: classified {n} new prompts")
+    return load_capability_cache(cache)
 
 
 def _floats(s: str) -> list[float]:
@@ -409,6 +516,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--quality-tolerance", type=float, default=0.02,
                     help="headline: fastest point within this of always-largest quality")
     ap.add_argument("--bins", type=int, default=5, help="calibration bins")
+    ap.add_argument("--skills", default=None, help="brick_skill skill table (default runs/<name>/skills.json)")
+    ap.add_argument("--latency-profile", default=None,
+                    help="brick_skill latency profile (default runs/<name>/latency_profile.json, "
+                         "else the config's latency_defaults)")
+    ap.add_argument("--beta-grid", default=",".join(map(str, DEFAULT_BETAS)))
+    ap.add_argument("--skill-r", type=float, default=0.0, help="Brick knob r for mu/b/lambda in the beta sweep")
+    ap.add_argument("--capability-model", default=None, help="ModernBERT dir for missing capability probs")
+    ap.add_argument("--no-classify", action="store_true", help="use cached capability probs only")
     ap.add_argument("--concurrency", type=int, default=1, help="parallel Brick calls")
     return ap
 

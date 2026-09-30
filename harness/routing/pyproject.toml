@@ -13,9 +13,20 @@ dependencies = [
 [project.optional-dependencies]
 # Offline eval pipeline (eval/): dataset download for build_set.py.
 eval = ["datasets>=2.19", "pyarrow>=15"]
+# brick_skill router: the Brick ModernBERT capability classifier, run on CPU in-process.
+# torch comes from the CPU-only wheel index (see [tool.uv.sources]).
+brick = ["torch>=2.4", "transformers>=4.48"]
 
 [dependency-groups]
 dev = ["pytest>=8"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", extra = "brick" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [build-system]
 requires = ["hatchling"]

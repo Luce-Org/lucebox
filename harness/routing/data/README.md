@@ -1,7 +1,8 @@
 # Routing eval data
 
-The prompt set for measuring, per prompt, which of `qwen35-0.8b`, `qwen35-2b` and
-`qwen38-27b` answers acceptably and how fast. The results show how much headroom
+The prompt set for measuring, per prompt, which routing arm answers acceptably and
+how fast. The default arms (`arms` in `config/backends.json`) are `qwen35-2b` with thinking
+off, `qwen38-27b` with thinking off, and `qwen38-27b-think`, the same 27B with thinking on. The results show how much headroom
 small-model routing has, and let us score Brick routers offline before an online A/B.
 
 | file | what |
@@ -94,9 +95,10 @@ cd harness/routing
 # 0. (Re)build the prompt set. This downloads the datasets into data/cache/.
 uv run --extra eval python -m eval.build_set          # or: uv run --no-project --with datasets --with pyarrow python -m eval.build_set
 
-# 1. Collect answers. The default is thinking off and concurrency 1, which keeps latency clean.
-uv run python -m eval.collect --run pilot                                 # every model in backends.json
-uv run python -m eval.collect --run pilot --models qwen38-27b --thinking on   # judge references (optional; do this before grading)
+# 1. Collect answers for every arm (2b off, 27b off, 27b on) at concurrency 1, which keeps latency clean.
+#    The 27B thinking-on answers are also the judge references.
+uv run python -m eval.collect --run pilot
+#   --arms qwen38-27b-think   --models qwen35-0.8b --thinking off  (ad-hoc model x mode instead of arms)
 #   --max-tokens math_hard=4096  --categories gsm8k,code  --limit 20  --split test
 #   Throughput runs: --concurrency 8 --shuffle, under a separate run name.
 #   Resumable: rerunning skips (id, model, thinking) rows that succeeded and retries errors.
@@ -104,27 +106,38 @@ uv run python -m eval.collect --run pilot --models qwen38-27b --thinking on   # 
 # 2. Grade. Resumable. Judge rows graded before a reference existed are regraded automatically.
 uv run python -m eval.grade --run pilot                  # --no-judge for deterministic graders only
 
-# 3. Label and report headroom. Writes runs/pilot/labels.jsonl, headroom.md and headroom.json.
-uv run python -m eval.label --run pilot                  # --thinking on labels the thinking-on answers
+# 3. Label and report headroom per arm. Writes runs/pilot/labels.jsonl, headroom.md and headroom.json.
+uv run python -m eval.label --run pilot                  # --arms a,b,c for a subset
 
-# 4. Evaluate Brick routers on the test split. Writes runs/pilot/router_eval/results.{md,json}.
-uv run python -m eval.evaluate_router --run pilot        # brick-max and brick-eco by default
+# 4. Brick complexity probs are cached by evaluate_router (step 6). To weight the latency
+#    profile's output tokens by complexity class, run step 6 once first, or skip the weighting.
+# 5. Fit brick_skill inputs on the train split.
+uv run python -m eval.fit_latency --run pilot                  # -> runs/pilot/latency_profile.json
+uv run --extra brick python -m eval.fit_skills --run pilot     # -> runs/pilot/skills.json (+ capability_probs.jsonl)
+
+# 6. Evaluate the Brick routers on the test split. Writes runs/pilot/router_eval/results.{md,json}.
+uv run --extra brick python -m eval.evaluate_router --run pilot   # brick-max and brick-eco by default
 #   --service brick-max  --split all  --t-small-grid 0.5,0.7,0.9  --t-mid-grid ...  --h-max-grid ...
+#   --beta-grid 0,0.1,0.23,1,4  --skill-r 0  --no-classify (cached capability probs only)
 ```
 
 Outputs, all under `runs/<name>/`:
 
-- `answers.jsonl`: `{id, model, thinking, text, reasoning, ttft_ms, total_ms, prompt_tokens, completion_tokens, finish_reason, error, max_tokens, concurrency}`. The file is append-only, and the last row per key wins.
+- `answers.jsonl` (keyed by backend model and thinking mode; an arm maps to one such pair): `{id, model, thinking, text, reasoning, ttft_ms, total_ms, prompt_tokens, completion_tokens, finish_reason, error, max_tokens, concurrency}`. The file is append-only, and the last row per key wins.
 - `grades.jsonl`: `{id, model, thinking, correct, score, grader, detail, finish_reason}`.
-- `labels.jsonl`: `{id, split, source, category, text, quality: {model: score}, correct: {model: bool}, latency: {model: total_ms}, ttft: {model: ms}, cheapest_ok, complete}`.
+- `labels.jsonl`: `{id, split, source, category, text, quality: {arm: score}, correct: {arm: bool}, latency: {arm: total_ms}, ttft: {arm: ms}, cheapest_ok, complete}`. `cheapest_ok` is the lowest-rank arm that was correct.
 - `headroom.{md,json}` reports:
-  - the share of prompts each model gets right, the share only the 27B gets right, and the share nobody gets right, overall and per category;
-  - the mean and median latency and the mean TTFT per model;
-  - quality and latency for the oracle and for always sending to each model.
+  - the share of prompts each arm gets right, the share only the top arm (27B thinking) gets right, and the share nobody gets right, overall and per category;
+  - the mean and median latency and the mean TTFT per arm;
+  - quality and latency for the oracle and for always sending to each arm.
 - `brick_probs.jsonl`: `{id, service, probs: {easy, medium, hard}, latency_ms, error}`. This caches one Brick pass per service, so reruns and wider grids make no new classifier calls.
-- `router_eval/results.{md,json}` holds three reports:
-  - baselines: always-0.8b, always-2b, always-27b and the oracle;
-  - for each Brick service and each pool ({0.8b, 2b, 27b}, {2b, 27b} and {0.8b, 27b}), a threshold sweep over `t_small`, `t_mid` and `h_max`. Each grid point is replayed through `BrickRouter.choose`. The report gives a Pareto table of quality against expected latency (the chosen model's measured `total_ms` plus the Brick call), the under-route rate (sent to too small a model) and the over-route rate. It also names the fastest point within 2 points of always-27B quality;
-  - Brick calibration: a reliability table and ECE for each class probability, plus an argmax confusion table. Each is measured against the cheapest model that was actually OK: easy means the 0.8b is OK, medium means the 2b is the cheapest OK, and hard means only the 27B is OK or none is.
+- `latency_profile.json` (`eval.fit_latency`): per-arm TTFT line, TPOT and output tokens (per complexity class when `brick_probs.jsonl` exists), per-backend service time, and `chars_per_token`.
+- `capability_probs.jsonl`: `{id, probs: {6 capabilities}, latency_ms, error}`. This caches one ModernBERT pass per prompt.
+- `skills.json` (`eval.fit_skills`): the per-arm Brick skill vectors fitted on the train split, and the probability mass behind each dimension.
+- `router_eval/results.{md,json}` holds four reports:
+  - baselines: always-2b, always-27b, always-27b-think and the oracle;
+  - for each Brick service and each arm pool ({2b, 27b, 27b-think}, {27b, 27b-think} and {2b, 27b-think}), a threshold sweep over `t_small`, `t_mid` and `h_max`. Each grid point is replayed through `BrickRouter.choose`. The report gives a Pareto table of quality against expected latency (the chosen model's measured `total_ms` plus the Brick call), the under-route rate (sent to too small a model) and the over-route rate. It also names the fastest point within 2 points of the top arm's quality;
+  - for each service and pool, a `brick_skill` beta sweep. It uses the static latency profile, with no live queue. The latency charged is the chosen arm's `total_ms` plus `capability_ms` and `brick_ms`; this is an upper bound, because the router runs the two classifiers concurrently. Points are Pareto-marked within the sweep (P) and together with the threshold points (C);
+  - Brick calibration: a reliability table and ECE for each class probability, plus an argmax confusion table. Each is measured against the cheapest arm that was actually OK: easy means the 2b is OK, medium means the 27B without thinking is the cheapest OK, and hard means only the 27B with thinking is OK, or none is.
 
 Tests: `cd harness/routing && uv run pytest tests -k eval`.

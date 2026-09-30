@@ -103,7 +103,14 @@ class MockBackends:
         ])
 
 
-def make_config(base: str, overrides: dict | None = None):
+ARMS = {  # the production arm layout: 2b off, 27b off, 27b on (same backend)
+    "qwen35-2b": {"model": "qwen35-2b", "thinking": False, "rank": 0},
+    "qwen38-27b": {"model": "qwen38-27b", "thinking": False, "rank": 1},
+    "qwen38-27b-think": {"model": "qwen38-27b", "thinking": True, "rank": 2},
+}
+
+
+def make_config(base: str, overrides: dict | None = None, arms: bool = False, extra: dict | None = None):
     models = {
         "qwen35-0.8b": {"base_url": f"{base}/qwen35-0.8b/v1", "kind": "luce_server", "rank": 0},
         "qwen35-2b": {"base_url": f"{base}/qwen35-2b/v1", "kind": "luce_server", "rank": 1},
@@ -115,7 +122,7 @@ def make_config(base: str, overrides: dict | None = None):
     return config_from_dict({"models": models, "services": {
         "brick-max": {"base_url": f"{base}/brick", "kind": "luce_server"},
         "embed": {"base_url": f"{base}/embed", "kind": "luce_server"},
-    }})
+    }, **({"arms": ARMS} if arms else {}), **(extra or {})})
 
 
 def run(coro):

@@ -1,12 +1,16 @@
-"""Join grades + answers into per-prompt routing labels and a headroom report.
+"""Join grades + answers into per-prompt, per-arm routing labels and a headroom report.
+
+An arm is a (model, thinking) route target from config/backends.json "arms" (default:
+qwen35-2b off, qwen38-27b off, qwen38-27b-think = the 27B with thinking on).
 
 runs/<name>/labels.jsonl rows:
 
-    {id, split, source, category, text, quality: {model: score}, correct: {model: bool},
-     latency: {model: total_ms}, ttft: {model: ttft_ms}, cheapest_ok: model|null, complete}
+    {id, split, source, category, text, quality: {arm: score}, correct: {arm: bool},
+     latency: {arm: total_ms}, ttft: {arm: ttft_ms}, cheapest_ok: arm|null, complete}
 
-``cheapest_ok`` is the lowest-rank model whose answer is correct (null if none).
-``complete`` is true when every requested model has a grade for the prompt.
+``cheapest_ok`` is the lowest-rank arm whose answer is correct (null if none); arm rank
+orders arms by cost, which for the default arms is also the order of measured latency.
+``complete`` is true when every requested arm has a grade for the prompt.
 Also writes runs/<name>/headroom.{md,json}.
 """
 
@@ -19,7 +23,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .common import PROMPTS_PATH, RUNS_DIR, latest_by_key, load_backends, read_jsonl, write_jsonl
+from .common import PROMPTS_PATH, RUNS_DIR, latest_by_key, load_arms, read_jsonl, write_jsonl
 
 
 def last_user_text(messages: list[dict[str, Any]]) -> str:
@@ -36,17 +40,17 @@ def build_labels(
     prompts: list[dict[str, Any]],
     grades: list[dict[str, Any]],
     answers: list[dict[str, Any]],
-    models: list[str],
-    thinking: bool = False,
+    arms: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """``models`` must be ordered smallest -> largest (rank order)."""
+    """``arms`` ({arm: {"model", "thinking"}}) must be ordered cheapest first (rank order)."""
     g_by = latest_by_key(grades)
     a_by = latest_by_key(answers)
+    models = list(arms)
     labels = []
     for p in prompts:
         quality, correct, latency, ttft = {}, {}, {}, {}
         for m in models:
-            key = (p["id"], m, thinking)
+            key = (p["id"], arms[m]["model"], bool(arms[m]["thinking"]))
             g = g_by.get(key)
             if g is None:
                 continue
@@ -150,8 +154,8 @@ def _ms(x: float | None) -> str:
 def headroom_markdown(h: dict[str, Any]) -> str:
     models = h["models"]
     largest = models[-1]
-    lines = [f"# Routing headroom\n\n{h['n_complete']} prompts with grades for every model "
-             f"({h['n_prompts']} labelled).\n", "## Who answers acceptably\n"]
+    lines = [f"# Routing headroom\n\n{h['n_complete']} prompts with grades for every arm "
+             f"({h['n_prompts']} labelled). Columns are arms (model + thinking mode).\n", "## Who answers acceptably\n"]
     cols = [f"{m}_ok" for m in models] + [f"only_{largest}_ok", "none_ok"]
     lines.append("| category | n | " + " | ".join(cols) + " |")
     lines.append("|---" * (len(cols) + 2) + "|")
@@ -159,8 +163,8 @@ def headroom_markdown(h: dict[str, Any]) -> str:
                  + " | ".join(_pct(h["overall"][c]) for c in cols) + " |")
     for cat, row in h["by_category"].items():
         lines.append(f"| {cat} | {row['n']} | " + " | ".join(_pct(row[c]) for c in cols) + " |")
-    lines += ["", "## Latency per model (total request time)\n",
-              "| model | mean ms | median ms | mean TTFT ms |", "|---|---|---|---|"]
+    lines += ["", "## Latency per arm (total request time)\n",
+              "| arm | mean ms | median ms | mean TTFT ms |", "|---|---|---|---|"]
     for m in models:
         L = h["latency"][m]
         lines.append(f"| {m} | {_ms(L['mean_ms'])} | {_ms(L['median_ms'])} | {_ms(L['mean_ttft_ms'])} |")
@@ -178,16 +182,17 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--run-dir", default=None)
     ap.add_argument("--prompts", type=Path, default=PROMPTS_PATH)
     ap.add_argument("--backends", default=None)
-    ap.add_argument("--models", default=None, help="comma list, smallest first (default: backends by rank)")
-    ap.add_argument("--thinking", choices=["off", "on"], default="off",
-                    help="which answers the labels describe")
+    ap.add_argument("--arms", default=None, help="comma list of arms, cheapest first (default: config arms by rank)")
     args = ap.parse_args(argv)
     run_dir = Path(args.run_dir) if args.run_dir else RUNS_DIR / (args.run or "")
     if not (args.run or args.run_dir):
         ap.error("--run or --run-dir required")
-    models = args.models.split(",") if args.models else list(load_backends(args.backends))
+    arms = load_arms(args.backends)
+    if args.arms:
+        arms = {a: arms[a] for a in args.arms.split(",")}
+    models = list(arms)
     labels = build_labels(read_jsonl(args.prompts), read_jsonl(run_dir / "grades.jsonl"),
-                          read_jsonl(run_dir / "answers.jsonl"), models, args.thinking == "on")
+                          read_jsonl(run_dir / "answers.jsonl"), arms)
     write_jsonl(run_dir / "labels.jsonl", labels)
     h = headroom(labels, models)
     (run_dir / "headroom.json").write_text(json.dumps(h, indent=2) + "\n")

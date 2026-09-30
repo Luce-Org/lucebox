@@ -22,6 +22,14 @@ DEFAULT_BACKENDS: dict[str, dict[str, Any]] = {
     "qwen38-27b": {"base_url": "http://127.0.0.1:8216/v1", "kind": "luce_server", "rank": 2},
 }
 
+# Route targets used when config/backends.json is missing entirely:
+# 2B thinking off, 27B thinking off, 27B thinking on. 0.8b stays a configurable model, not an arm.
+DEFAULT_ARMS: dict[str, dict[str, Any]] = {
+    "qwen35-2b": {"model": "qwen35-2b", "thinking": False, "rank": 0},
+    "qwen38-27b": {"model": "qwen38-27b", "thinking": False, "rank": 1},
+    "qwen38-27b-think": {"model": "qwen38-27b", "thinking": True, "rank": 2},
+}
+
 # The model whose thinking-on answer serves as the judge reference.
 REFERENCE_MODEL = "qwen38-27b"
 
@@ -84,6 +92,24 @@ def load_backends(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
     else:
         models = DEFAULT_BACKENDS
     return dict(sorted(models.items(), key=lambda kv: kv[1].get("rank", 0)))
+
+
+def load_arms(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
+    """{arm: {"model", "thinking": bool, "rank"}} ordered cheapest first.
+
+    Reads the config's "arms"; a config without them gets one thinking-off arm per model
+    (the lucerouter default), and a missing config file gets DEFAULT_ARMS.
+    """
+    p = Path(path) if path else BACKENDS_PATH
+    if p.exists():
+        data = json.loads(p.read_text())
+        arms = data.get("arms") or {m: {"model": m, "rank": spec.get("rank", i)}
+                                    for i, (m, spec) in enumerate(data.get("models", {}).items())}
+    else:
+        arms = DEFAULT_ARMS
+    out = {name: {"model": a["model"], "thinking": bool(a.get("thinking")), "rank": int(a.get("rank", 0))}
+           for name, a in arms.items()}
+    return dict(sorted(out.items(), key=lambda kv: kv[1]["rank"]))
 
 
 def model_ranks(backends: dict[str, dict[str, Any]]) -> dict[str, int]:

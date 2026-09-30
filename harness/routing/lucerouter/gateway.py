@@ -3,9 +3,12 @@
     python -m lucerouter.gateway --config config/backends.json \
         --router "load_aware>brick:service=brick-max" --port 8400 --log runs/gateway/decisions.jsonl
 
-Requests with model "route"/"auto"/absent are routed; a request naming a
-configured model (or its served_name) is passed through. Every request appends
-one JSON line to the decision log.
+Requests with model "route"/"auto"/absent are routed to an arm; the gateway sends
+them to the arm's backend with the arm's overrides (`chat_template_kwargs.enable_thinking`
+when the arm sets `thinking`). A request naming a configured model (or its
+served_name) is passed through untouched; one naming an arm that is not also a
+model name gets that arm's overrides without routing. Every request appends one
+JSON line to the decision log.
 """
 
 from __future__ import annotations
@@ -58,13 +61,14 @@ class Stats:
         self.requests = 0
         self.routed = 0
         self.errors = 0
-        self.by_model: Counter = Counter()
+        self.by_arm: Counter = Counter()
+        self.by_backend: Counter = Counter()
         self.router_ms_total = 0.0
 
     def to_dict(self, router_label: str) -> dict:
         return {"router": router_label, "uptime_s": round(time.time() - self.started, 1),
                 "requests": self.requests, "routed": self.routed, "errors": self.errors,
-                "by_model": dict(self.by_model),
+                "by_arm": dict(self.by_arm), "by_backend": dict(self.by_backend),
                 "router_ms_avg": round(self.router_ms_total / self.routed, 3) if self.routed else None}
 
 
@@ -93,13 +97,18 @@ def create_app(config: Config, router: Router, log_path: str | None = None,
     served = {m.request_model: m.name for m in config.models.values()}
     client = httpx.AsyncClient(timeout=httpx.Timeout(backend_timeout, connect=5.0))
 
-    def headers_for(decision: RouteDecision, request_id: str) -> dict:
-        return {"x-lucerouter-model": decision.model, "x-lucerouter-router": decision.router,
-                "x-lucerouter-request-id": request_id}
+    def headers_for(decision: RouteDecision, request_id: str, backend: str | None = None) -> dict:
+        h = {"x-lucerouter-model": decision.model, "x-lucerouter-router": decision.router,
+             "x-lucerouter-request-id": request_id}
+        if backend:
+            h["x-lucerouter-backend"] = backend
+        return h
 
-    def record(request_id, decision, routed, stream, session_id, **extra):
+    def record(request_id, decision, routed, stream, session_id, backend=None, **extra):
         stats.requests += 1
-        stats.by_model[decision.model] += 1
+        stats.by_arm[decision.model] += 1
+        if backend:
+            stats.by_backend[backend] += 1
         if routed:
             stats.routed += 1
             stats.router_ms_total += decision.latency_ms
@@ -107,6 +116,7 @@ def create_app(config: Config, router: Router, log_path: str | None = None,
             stats.errors += 1
         log.write({"ts": datetime.now(timezone.utc).isoformat(), "request_id": request_id,
                    "session_id": session_id, "routed": routed, "stream": stream,
+                   "arm": decision.model, "backend": backend,
                    "decision": decision.to_dict(), "router_latency_ms": round(decision.latency_ms, 3),
                    **extra})
 
@@ -119,17 +129,25 @@ def create_app(config: Config, router: Router, log_path: str | None = None,
         req = RouteRequest.from_openai(body, dict(request.headers))
         asked = body.get("model")
         routed = asked in ROUTE_ALIASES
+        arm = None  # arm whose overrides apply; None = passthrough, body untouched
         if routed:
             decision = await router.route(req)
+            arm = config.arms.get(decision.model)
+            backend_name = arm.model if arm else None
         elif asked in config.models or asked in served:
-            name = asked if asked in config.models else served[asked]
-            decision = RouteDecision(model=name, router="passthrough", reason="model named in request")
+            backend_name = asked if asked in config.models else served[asked]
+            decision = RouteDecision(model=backend_name, router="passthrough", reason="model named in request")
+        elif asked in config.arms:
+            arm = config.arms[asked]
+            backend_name = arm.model
+            decision = RouteDecision(model=asked, router="arm", reason="arm named in request")
         else:
             return JSONResponse({"error": {"message": f"unknown model {asked!r}; use 'route' or one of "
-                                                      f"{sorted(config.models)}"}}, status_code=404)
+                                                      f"{sorted(set(config.models) | set(config.arms))}"}},
+                                status_code=404)
         stream = bool(body.get("stream"))
 
-        if decision.model not in config.models:
+        if backend_name is None:
             handler = extra_targets.get(decision.model)
             if handler is None:
                 record(request_id, decision, routed, stream, req.session_id, status=502,
@@ -139,11 +157,15 @@ def create_app(config: Config, router: Router, log_path: str | None = None,
             record(request_id, decision, routed, stream, req.session_id, status=None, handler=decision.model)
             return await handler(body, decision, request)
 
-        backend = config.models[decision.model]
+        backend = config.models[backend_name]
         fwd = {k: v for k, v in body.items() if k not in GATEWAY_FIELDS}
         fwd["model"] = backend.request_model
+        if arm is not None and arm.thinking is not None:
+            kwargs = fwd.get("chat_template_kwargs")
+            fwd["chat_template_kwargs"] = {**(kwargs if isinstance(kwargs, dict) else {}),
+                                           "enable_thinking": arm.thinking}
         url = f"{backend.base_url.rstrip('/')}/chat/completions"
-        hdrs = headers_for(decision, request_id)
+        hdrs = headers_for(decision, request_id, backend_name)
         auth = request.headers.get("authorization")
         out_headers = {"authorization": auth} if auth else {}
         t0 = time.perf_counter()
@@ -152,7 +174,7 @@ def create_app(config: Config, router: Router, log_path: str | None = None,
             upstream = await client.send(client.build_request("POST", url, json=fwd, headers=out_headers),
                                          stream=True)
         except httpx.HTTPError as e:
-            record(request_id, decision, routed, stream, req.session_id, status=502,
+            record(request_id, decision, routed, stream, req.session_id, backend=backend_name, status=502,
                    backend_total_ms=round((time.perf_counter() - t0) * 1000, 2), error=f"{type(e).__name__}: {e}")
             return JSONResponse({"error": {"message": f"backend {decision.model} unreachable: {e}"}},
                                 status_code=502, headers=hdrs)
@@ -174,7 +196,7 @@ def create_app(config: Config, router: Router, log_path: str | None = None,
                     error = f"{type(e).__name__}: {e}"
                 finally:
                     await upstream.aclose()
-                    record(request_id, decision, routed, True, req.session_id, status=200,
+                    record(request_id, decision, routed, True, req.session_id, backend=backend_name, status=200,
                            backend_ttft_ms=round(ttft, 2) if ttft is not None else None,
                            backend_total_ms=round((time.perf_counter() - t0) * 1000, 2),
                            usage=_usage_from_sse(tail), error=error)
@@ -196,7 +218,7 @@ def create_app(config: Config, router: Router, log_path: str | None = None,
                 content = json.dumps(payload).encode()
         except ValueError:
             pass
-        record(request_id, decision, routed, stream, req.session_id, status=upstream.status_code,
+        record(request_id, decision, routed, stream, req.session_id, backend=backend_name, status=upstream.status_code,
                backend_ttft_ms=total_ms, backend_total_ms=total_ms, usage=usage,
                error=None if upstream.status_code < 400 else raw[:500].decode(errors="replace"))
         return Response(content, status_code=upstream.status_code, headers={**passthrough, **hdrs},
@@ -205,8 +227,10 @@ def create_app(config: Config, router: Router, log_path: str | None = None,
     async def models(request: Request):
         now = int(time.time())
         data = [{"id": "route", "object": "model", "created": now, "owned_by": "lucerouter"}]
+        data += [{"id": a.name, "object": "model", "created": now, "owned_by": "lucerouter-arm"}
+                 for a in config.arms_by_rank()]
         data += [{"id": m.name, "object": "model", "created": now, "owned_by": m.kind}
-                 for m in config.by_rank()]
+                 for m in config.by_rank() if m.name not in config.arms]
         return JSONResponse({"object": "list", "data": data})
 
     async def health(request: Request):
@@ -246,7 +270,7 @@ def main(argv=None):
     config = load_config(args.config)
     router = build(args.router, config)
     app = create_app(config, router, args.log)
-    print(f"lucerouter: router={router.label} models={[m.name for m in config.by_rank()]} log={args.log}")
+    print(f"lucerouter: router={router.label} arms={[a.name for a in config.arms_by_rank()]} log={args.log}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

@@ -1,6 +1,7 @@
 """label.py headroom maths and evaluate_router.py scoring, Brick sweep, calibration and cache.
 
-Four prompts with hand-computed outcomes (S=0.8b, M=2b, L=27b):
+Four prompts with hand-computed outcomes over the default arms (S=2b, M=27b think off,
+L=27b think on; M and L share one backend model and differ only in the thinking flag):
     a: everyone ok         -> cheapest S
     b: S fails, M/L ok     -> cheapest M
     c: only L ok           -> cheapest L
@@ -14,10 +15,11 @@ from types import SimpleNamespace
 
 import pytest
 from eval import evaluate_router as ev
+from eval.common import DEFAULT_ARMS as ARMS
 from eval.label import build_labels, headroom
 from mocks import make_config
 
-S, M, L = "qwen35-0.8b", "qwen35-2b", "qwen38-27b"
+S, M, L = "qwen35-2b", "qwen38-27b", "qwen38-27b-think"
 MODELS = [S, M, L]
 OK = {"a": {S, M, L}, "b": {M, L}, "c": {L}, "d": set()}
 TEXT = {"a": "EASYQ say hi", "b": "MIDQ summarize", "c": "HARDQ design", "d": "HARDQ prove"}
@@ -33,25 +35,25 @@ def grades_and_answers(ids=OK):
     grades, answers = [], []
     for i in ids:
         for m in MODELS:
-            grades.append({"id": i, "model": m, "thinking": False, "correct": m in OK[i],
-                           "score": float(m in OK[i]), "grader": "x", "detail": {}})
-            answers.append({"id": i, "model": m, "thinking": False, "total_ms": LAT[m], "ttft_ms": 5.0})
+            key = {"id": i, "model": ARMS[m]["model"], "thinking": ARMS[m]["thinking"]}
+            grades.append({**key, "correct": m in OK[i], "score": float(m in OK[i]), "grader": "x", "detail": {}})
+            answers.append({**key, "total_ms": LAT[m], "ttft_ms": 5.0, "prompt_tokens": 10,
+                            "completion_tokens": int(LAT[m] / 10)})
     return grades, answers
 
 
 @pytest.fixture
 def labels():
-    return build_labels(prompts(), *grades_and_answers(), MODELS)
+    return build_labels(prompts(), *grades_and_answers(), ARMS)
 
 
 def test_labels_cheapest_ok_and_completeness(labels):
     assert {lab["id"]: lab["cheapest_ok"] for lab in labels} == {"a": S, "b": M, "c": L, "d": None}
     assert all(lab["complete"] for lab in labels)
     grades, answers = grades_and_answers()
-    partial = build_labels(prompts(), [g for g in grades if g["model"] != L], answers, MODELS)
+    partial = build_labels(prompts(), [g for g in grades if not g["thinking"]], answers, ARMS)
     assert not any(lab["complete"] for lab in partial)
-    # thinking-on labels only read thinking-on grades
-    assert build_labels(prompts(), grades, answers, MODELS, thinking=True) == []
+    assert {lab["id"]: sorted(lab["quality"]) for lab in partial}["a"] == [S, M]   # think arm missing
 
 
 def test_headroom_shares_and_policies(labels):
@@ -141,11 +143,10 @@ def test_brick_probs_cache_is_one_pass_and_retries_failures(tmp_path):
     assert ev.load_probs_cache(cache, "brick-eco") == {}      # cache is per service
 
 
-def test_cli_brick_sweep_through_real_router(mock, tmp_path, labels):
-    """End to end through lucerouter.build against the mock Brick service."""
+def write_cli_inputs(mock, tmp_path, labels):
     cfg = make_config(mock.base)
     config = {"models": {m.name: {"base_url": m.base_url, "rank": m.rank} for m in cfg.models.values()},
-              "services": {"brick-max": {"base_url": f"{mock.base}/brick"}}}
+              "services": {"brick-max": {"base_url": f"{mock.base}/brick"}}, "arms": ARMS}
     (tmp_path / "backends.json").write_text(json.dumps(config))
     (tmp_path / "prompts.jsonl").write_text("".join(json.dumps(p) + "\n" for p in prompts()))
     run_dir = tmp_path / "run"
@@ -154,6 +155,12 @@ def test_cli_brick_sweep_through_real_router(mock, tmp_path, labels):
     argv = ["--run-dir", str(run_dir), "--prompts", str(tmp_path / "prompts.jsonl"),
             "--config", str(tmp_path / "backends.json"), "--service", "brick-max",
             "--t-small-grid", "0.8,1.01", "--t-mid-grid", "0.5,1.01", "--h-max-grid", "0.5"]
+    return run_dir, argv
+
+
+def test_cli_brick_sweep_through_real_router(mock, tmp_path, labels):
+    """End to end through lucerouter.build against the mock Brick service."""
+    run_dir, argv = write_cli_inputs(mock, tmp_path, labels)
     ev.main(argv)
     assert len(mock.brick_requests) == 4
 
@@ -173,3 +180,28 @@ def test_cli_brick_sweep_through_real_router(mock, tmp_path, labels):
 
     ev.main(argv)                                              # rerun: probabilities come from cache
     assert len(mock.brick_requests) == 4
+
+
+def test_cli_brick_skill_beta_sweep_from_cached_capabilities(mock, tmp_path, labels):
+    """brick_skill replays over cached capability probs; beta trades the 27B arms for the 2b."""
+    run_dir, argv = write_cli_inputs(mock, tmp_path, labels)
+    caps = ("coding", "creative_synthesis", "instruction_following", "math_reasoning",
+            "planning_agentic", "world_knowledge")
+    kind = {"a": "creative_synthesis", "b": "coding", "c": "math_reasoning", "d": "math_reasoning"}
+    (run_dir / "capability_probs.jsonl").write_text("".join(
+        json.dumps({"id": i, "probs": {c: float(c == k) for c in caps}, "latency_ms": 50.0, "error": None}) + "\n"
+        for i, k in kind.items()))
+    skill = {S: 0.3, M: 0.8, L: 0.95}                      # same on every dimension
+    (run_dir / "skills.json").write_text(json.dumps({"arms": {a: dict.fromkeys(caps, v) for a, v in skill.items()}}))
+    (run_dir / "latency_profile.json").write_text(json.dumps({"arms": {
+        a: {"ttft_ms": 0, "tpot_ms": 1, "out_tokens": {"default": LAT[a]}} for a in MODELS}}))
+    ev.main(argv + ["--no-classify", "--beta-grid", "0,100"])
+
+    report = json.loads((run_dir / "router_eval" / "results.json").read_text())
+    pts = {p["beta"]: p for p in report["services"]["brick-max"]["pools"][f"{S}+{M}+{L}"]["brick_skill"]}
+    assert pts[0.0]["distribution"] == {M: 1.0}           # 27B off meets every requirement; think over-capacity
+    assert pts[100.0]["distribution"] == {S: 1.0}         # latency dominates
+    brick_ms = [r["latency_ms"] for r in ev.load_probs_cache(run_dir / "brick_probs.jsonl", "brick-max").values()]
+    assert pts[100.0]["mean_router_ms"] == pytest.approx(50.0 + sum(brick_ms) / 4)   # capability + Brick
+    assert all("pareto_combined" in p for p in pts.values())
+    assert "brick_skill / brick-max" in (run_dir / "router_eval" / "results.md").read_text()

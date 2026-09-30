@@ -78,6 +78,27 @@ def test_named_model_passthrough_and_unknown(gw):
     assert gw.post("/v1/chat/completions", json={"model": "gpt-9", "messages": []}).status_code == 404
 
 
+def test_arm_sets_thinking_only_on_routed_requests(mock, tmp_path):
+    """Both 27B arms hit one backend; the arm, not the client, decides thinking on routed requests."""
+    cfg = make_config(mock.base, arms=True)
+    log = tmp_path / "d.jsonl"
+    client_kwargs = {"enable_thinking": False, "other": 1}
+    with serve(create_app(cfg, build(SPEC, cfg), str(log))) as url, httpx.Client(base_url=url) as c:
+        r = c.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "HARDQ"}],
+                                                  "chat_template_kwargs": client_kwargs})
+        assert r.headers["x-lucerouter-model"] == "qwen38-27b-think" and r.headers["x-lucerouter-backend"] == L
+        c.post("/v1/chat/completions", json={"model": L, "messages": [{"role": "user", "content": "HARDQ"}],
+                                             "chat_template_kwargs": client_kwargs})
+        c.post("/v1/chat/completions", json={"model": "qwen38-27b-think", "messages": []})
+    sent = [(m, b.get("chat_template_kwargs")) for m, b in mock.requests]
+    assert sent == [(L, {"enable_thinking": True, "other": 1}),   # routed: arm overrides the client
+                    (L, client_kwargs),                              # passthrough: untouched
+                    (L, {"enable_thinking": True})]                  # arm named: its overrides
+    recs = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [(r["arm"], r["backend"], r["routed"]) for r in recs] == [
+        ("qwen38-27b-think", L, True), (L, L, False), ("qwen38-27b-think", L, False)]
+
+
 def test_models_health_stats(gw):
     ids = [m["id"] for m in gw.get("/v1/models").json()["data"]]
     assert ids == ["route", S, M, L]
@@ -85,7 +106,8 @@ def test_models_health_stats(gw):
     gw.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "EASYQ"}]})
     gw.post("/v1/chat/completions", json={"model": L, "messages": [{"role": "user", "content": "x"}]})
     stats = gw.get("/router/stats").json()
-    assert stats["requests"] == 2 and stats["routed"] == 1 and stats["by_model"] == {S: 1, L: 1}
+    assert stats["requests"] == 2 and stats["routed"] == 1 and stats["by_arm"] == {S: 1, L: 1}
+    assert stats["by_backend"] == {S: 1, L: 1}
 
 
 def test_backend_down_is_502_and_logged(mock, tmp_path):

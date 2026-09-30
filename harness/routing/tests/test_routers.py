@@ -7,6 +7,7 @@ from lucerouter.routers import build, parse_spec
 from lucerouter.types import RouteRequest
 
 S, M, L = "qwen35-0.8b", "qwen35-2b", "qwen38-27b"
+T = "qwen38-27b-think"  # arm on the L backend
 
 
 def user(text, **kw):
@@ -65,6 +66,12 @@ def test_brick_routes_via_classifier(mock):
     assert ds[0].router == "brick:service=brick-max" and ds[0].latency_ms > 0
 
 
+def test_brick_default_arms_map_easy_medium_hard(mock):
+    cfg = make_config(mock.base, arms=True)
+    ds = run(route_all("brick:service=brick-max", cfg, [user("EASYQ"), user("MIDQ"), user("HARDQ")]))
+    assert [d.model for d in ds] == [M, L, T]
+
+
 def test_brick_classifier_down_falls_back_to_large():
     cfg = make_config("http://127.0.0.1:1")  # nothing listening
     [d] = run(route_all("brick:service=brick-max", cfg, [user("EASYQ")]))
@@ -96,6 +103,23 @@ def test_load_aware_shifts(mock):
 
     mock.load.clear()  # load unknown -> inner decision unchanged
     assert go("load_aware>brick:service=brick-max", "MIDQ").model == M
+
+
+def test_load_aware_is_per_backend_for_shared_arms(mock):
+    """27B full: the think arm shares its queue, so it is never an escape route."""
+    cfg = make_config(mock.base, arms=True)
+    free, full = {"in_flight": 0, "capacity": 1}, {"in_flight": 1, "capacity": 1}
+    mock.load.update({M: free, L: full})
+
+    def go(spec, text):
+        [d] = run(route_all(spec, cfg, [user(text)], load_ttl_s=0))
+        return d.model
+
+    assert go("load_aware>brick:service=brick-max", "MIDQ") == L           # margin 0.3 > margin_down
+    assert go("load_aware:margin_down=0.5>brick:service=brick-max", "MIDQ") == M
+    assert go("load_aware:margin_down=1>brick:service=brick-max", "HARDQ") == M   # skips busy 27b arm
+    mock.load.update({M: full, L: free})
+    assert go("load_aware>brick:service=brick-max", "EASYQ") == L          # nearest free arm up
 
 
 def test_offline_api_with_two_model_config():

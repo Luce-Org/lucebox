@@ -21,17 +21,24 @@ Every router's `decide()` returns a RouteDecision; `route()` adds timing and
 the outermost label. Routers may return a model that is not in the config
 (e.g. "swarm") as an escalation target; the gateway resolves those via its
 `extra_targets` hook.
+
+Routers choose *arms* (config.arms): a backend model plus request overrides such as
+thinking on/off. Without an `arms` section every model is one arm, named after it.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
+from pathlib import Path
 
 import httpx
 
-from . import signals
+from . import brick_math, signals
+from .capability import DEFAULT_MODEL_DIR, get_classifier, routing_text, run_capability
 from .config import Config
+from .latency import LatencyProfile, expected_latency_ms, queue_wait_ms
 from .types import RouteDecision, RouteRequest
 
 ROUTERS: dict[str, type["Router"]] = {}
@@ -43,13 +50,17 @@ def register(cls):
 
 
 class Resources:
-    """Things routers share: one HTTP client and one cached load monitor."""
+    """Things routers share: one HTTP client, one cached load monitor (per backend model) and
+    the capability classifier function (``capability_fn(text) -> probs``; None = load the
+    local ModernBERT lazily)."""
 
-    def __init__(self, config: Config, client: httpx.AsyncClient | None = None, load_ttl_s: float = 0.2):
+    def __init__(self, config: Config, client: httpx.AsyncClient | None = None, load_ttl_s: float = 0.2,
+                 capability_fn=None):
         self.config = config
         self.client = client or httpx.AsyncClient()
         self._own_client = client is None
         self.load = signals.LoadMonitor(config.models, self.client, ttl_s=load_ttl_s)
+        self.capability_fn = capability_fn
 
     async def aclose(self):
         if self._own_client:
@@ -92,9 +103,9 @@ class Router:
             return None
         return list(v) if isinstance(v, (list, tuple)) else [s for s in str(v).split("|") if s]
 
-    def check_model(self, model: str | None, key: str):
-        if model is not None and model not in self.config.models:
-            raise ValueError(f"{self.name}: {key}={model!r} is not a configured model")
+    def check_arm(self, arm: str | None, key: str):
+        if arm is not None and arm not in self.config.arms:
+            raise ValueError(f"{self.name}: {key}={arm!r} is not a configured arm (have {sorted(self.config.arms)})")
 
     async def route(self, req: RouteRequest) -> RouteDecision:
         t0 = time.perf_counter()
@@ -118,7 +129,7 @@ class Router:
 
 @register
 class FixedRouter(Router):
-    """fixed:model=X — always X (baselines)."""
+    """fixed:model=X — always arm X (baselines)."""
     name = "fixed"
 
     def __init__(self, *a, **kw):
@@ -131,8 +142,8 @@ class FixedRouter(Router):
         return self.decision(self.model, "fixed")
 
 
-def _default_tiers(config: Config) -> tuple[str | None, str | None, str]:
-    names = [m.name for m in config.by_rank()]
+def _tiers(names: list[str]) -> tuple[str | None, str | None, str]:
+    """(small, mid, large) from arms ordered cheapest first."""
     if len(names) >= 3:
         return names[0], names[1], names[-1]
     if len(names) == 2:
@@ -147,16 +158,18 @@ class BrickRouter(Router):
     p_easy >= t_small                             -> small
     p_easy + p_medium >= t_mid and p_hard < h_max -> mid
     otherwise                                     -> large
+    small/mid/large are arms, by rank: with the default arms easy -> qwen35-2b,
+    medium -> qwen38-27b, hard -> qwen38-27b-think.
     Params: service, t_small, t_mid, h_max, small, mid, large (small/mid may be
     "none"), no_think (llama-server kind only: append the empty think block),
-    on_error (model used when the classifier fails; default large).
+    on_error (arm used when the classifier fails; default large).
     signals.margin = distance of the probs from flipping the decision.
     """
     name = "brick"
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
-        small, mid, large = _default_tiers(self.config)
+        small, mid, large = _tiers([a.name for a in self.config.arms_by_rank()])
         self.small = self.p_str("small", small)
         self.mid = self.p_str("mid", mid)
         self.large = self.p_str("large", large)
@@ -166,8 +179,8 @@ class BrickRouter(Router):
         self.on_error = self.p_str("on_error", self.large)
         self.service = self.config.service(self.p_str("service", "brick-max"))
         self.suffix = signals.THINK_SUFFIX if self.p_bool("no_think") else self.service.prompt_suffix
-        for key in ("small", "mid"):
-            self.check_model(getattr(self, key), key)
+        for key in ("small", "mid", "large"):
+            self.check_arm(getattr(self, key), key)
 
     def choose(self, probs: dict) -> tuple[str, str, float]:
         """(model, reason, margin) — pure threshold logic, unit-tested directly."""
@@ -199,18 +212,162 @@ class BrickRouter(Router):
                                        "service": self.service.name})
 
 
+def load_skill_table(path: str | Path) -> dict[str, dict[str, float]]:
+    """{arm: {capability: s}} from a skill table JSON (eval/fit_skills.py)."""
+    data = json.loads(Path(path).read_text())
+    table = {}
+    for arm, vec in data["arms"].items():
+        if isinstance(vec, list):
+            vec = dict(zip(data.get("capabilities", brick_math.CAPABILITIES), vec, strict=True))
+        missing = set(brick_math.CAPABILITIES) - set(vec)
+        if missing:
+            raise ValueError(f"skill table {path}: arm {arm!r} lacks {sorted(missing)}")
+        table[arm] = {c: float(vec[c]) for c in brick_math.CAPABILITIES}
+    return table
+
+
+@register
+class BrickSkillRouter(Router):
+    """brick_skill: Brick's spatial capability rule with latency in place of cost.
+
+    J_m = D_m + beta * Lat_m / max_k Lat_k over the candidate arms, argmin J (see brick_math).
+    D_m needs the capability probs p(x) (ModernBERT, in-process) and the complexity label and
+    confidence (the Brick complexity service, as in `brick`). Lat_m comes from the latency
+    profile plus the live queue of the arm's backend (see lucerouter/latency.py).
+
+    Params: service (complexity, default brick-max), skills (skill table JSON, required),
+    latency (latency profile JSON; config latency_defaults fill gaps), r (Brick knob in
+    [-1, 1], default 0, sets mu/b/beta/lam), beta and lam (override r's values), tie_eps
+    (0.03), arms (candidates, default all arms), live_load (default on), capability (model
+    dir), max_length (512), no_think (llama-server complexity service only).
+    When the capability classifier fails, the complexity label picks the arm like Brick's
+    model_map fallback (easy -> cheapest, medium -> middle, hard -> top). A complexity
+    failure counts as ("medium", confidence 1), as in Brick.
+    """
+    name = "brick_skill"
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.service = self.config.service(self.p_str("service", "brick-max"))
+        self.suffix = signals.THINK_SUFFIX if self.p_bool("no_think") else self.service.prompt_suffix
+        self.arms = self.p_list("arms") or [a.name for a in self.config.arms_by_rank()]
+        self.arms.sort(key=lambda a: self.config.arms[a].rank if a in self.config.arms else 0)
+        for arm in self.arms:
+            self.check_arm(arm, "arms")
+        skills_path = self.p_str("skills")
+        if not skills_path:
+            raise ValueError("brick_skill needs skills=<skill table JSON> (eval/fit_skills.py)")
+        table = load_skill_table(skills_path)
+        self.latency = LatencyProfile.load(self.p_str("latency"), fallback=self.config.latency_defaults)
+        for arm in self.arms:
+            if arm not in table:
+                raise ValueError(f"brick_skill: no skill vector for arm {arm!r} in {skills_path}")
+            if arm not in self.latency.arms:
+                raise ValueError(f"brick_skill: no latency profile for arm {arm!r} "
+                                 "(pass latency=<profile JSON> or set latency_defaults in the config)")
+        self.skills = {arm: table[arm] for arm in self.arms}
+        base = brick_math.effective_params(self.p_float("r", 0.0))
+        beta, lam = self.p_float("beta"), self.p_float("lam")
+        self.brick = brick_math.BrickParams(mu=base.mu, b=base.b,
+                                             beta=base.beta if beta is None else beta,
+                                             lam=base.lam if lam is None else lam)
+        self.tie_eps = self.p_float("tie_eps", brick_math.TIE_EPS)
+        self.live_load = self.p_bool("live_load", True)
+        self.capability_fn = self.res.capability_fn or get_classifier(
+            self.p_str("capability", DEFAULT_MODEL_DIR), self.p_int("max_length", 512)).predict
+        small, mid, large = _tiers(self.arms)
+        self.fallback = {"easy": small or mid or large, "medium": mid or large, "hard": large}
+
+    def latencies(self, prompt_chars: int, complexity: dict | None, max_tokens: int | None = None,
+                  loads: dict | None = None) -> dict[str, dict[str, float]]:
+        """Expected latency breakdown per candidate arm (loads: per backend model, or None)."""
+        ptoks = self.latency.prompt_tokens(prompt_chars)
+        out = {}
+        for arm in self.arms:
+            backend = self.config.arms[arm].model
+            queue = 0.0
+            if loads:
+                sharing = [a for a in self.config.arms if self.config.arms[a].model == backend]
+                queue = queue_wait_ms(loads.get(backend), self.latency.backend_service_ms(backend, sharing))
+            out[arm] = expected_latency_ms(self.latency.arms[arm], ptoks, complexity, max_tokens, queue)
+        return out
+
+    def choose(self, complexity: dict | None, capability: dict, prompt_chars: int,
+               max_tokens: int | None = None, loads: dict | None = None) -> tuple[str, str, dict]:
+        """(arm, reason, info) — the pure scoring step, used offline by evaluate_router."""
+        label, conf = brick_math.complexity_label(complexity)
+        tau_q = brick_math.tau_query(label, conf)
+        z_q = brick_math.required_level(tau_q, self.brick)
+        p = brick_math.normalise_probs(capability)
+        lats = self.latencies(prompt_chars, complexity, max_tokens, loads)
+        arm, scores, margin = brick_math.select(p, self.skills, {a: v["total_ms"] for a, v in lats.items()},
+                                                z_q, self.brick, self.tie_eps)
+        top = max(p, key=p.get)
+        best = next(s for s in scores if s.arm == arm)
+        reason = (f"argmin J: {arm} J={best.J:.3f} (D={best.D:.3f}, lat {best.lat_ms:.0f} ms); "
+                  f"{label} conf {conf:.2f} -> tau {tau_q:.3f}; top capability {top} {p[top]:.2f}")
+        info = {"scores": {s.arm: {**s.to_dict(), "queue_ms": round(lats[s.arm]["queue_ms"], 1),
+                                   "out_tokens": round(lats[s.arm]["out_tokens"], 1)} for s in scores},
+                "margin": round(margin, 4), "tau_q": round(tau_q, 4), "z_q": round(z_q, 4),
+                "complexity_label": label, "capability": {c: round(v, 4) for c, v in p.items()}}
+        return arm, reason, info
+
+    async def _complexity(self, text):
+        t0 = time.perf_counter()
+        try:
+            probs = await signals.brick_probs(
+                self.service.base_url, text, kind=self.service.kind, model=self.service.served_name,
+                prompt_suffix=self.suffix, client=self.res.client)
+            return probs, None, (time.perf_counter() - t0) * 1000
+        except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as e:
+            return None, f"{type(e).__name__}: {e}", (time.perf_counter() - t0) * 1000
+
+    async def _capability(self, text):
+        t0 = time.perf_counter()
+        try:
+            probs = await run_capability(self.capability_fn, text)
+            return probs, None, (time.perf_counter() - t0) * 1000
+        except Exception as e:  # noqa: BLE001 - any classifier failure falls back to complexity
+            return None, f"{type(e).__name__}: {e}", (time.perf_counter() - t0) * 1000
+
+    async def decide(self, req):
+        (cx, cx_err, brick_ms), (cap, cap_err, cap_ms) = await asyncio.gather(
+            self._complexity(req.last_user_text()), self._capability(routing_text(req.messages)))
+        sig = {"brick_ms": round(brick_ms, 2), "capability_ms": round(cap_ms, 2), "service": self.service.name,
+               "params": {k: round(v, 6) for k, v in vars(self.brick).items()}, "complexity": cx}
+        if cx_err:
+            sig["complexity_error"] = cx_err
+        if cap_err:
+            label, _ = brick_math.complexity_label(cx)
+            sig.update(capability_error=cap_err, error=cap_err, margin=0.0)
+            return self.decision(self.fallback[label], f"capability error, complexity {label} fallback: {cap_err}",
+                                 signals_=sig)
+        loads = await self.res.load.get() if self.live_load else None
+        if loads is not None:
+            sig["load"] = loads
+        arm, reason, info = self.choose(cx, cap, req.prompt_chars(), req.max_tokens, loads)
+        scores = info.pop("scores")
+        sig.update(info)
+        return self.decision(arm, reason, scores=scores, signals_=sig)
+
+
 # ─── wrappers ────────────────────────────────────────────────────────────
 
 @register
 class LoadAwareRouter(Router):
     """load_aware: nudge the inner decision by live backend load.
 
-    * chosen model full (in_flight >= capacity):
-        - shift one rank up if that model is free and margin <= margin_up (default: always);
-        - else shift one rank down if free and margin <= margin_down (default 0.1).
-    * promote (default 0 = off): if the largest model is idle and margin < promote,
-      move a smaller decision to the largest model.
+    Load is per backend model, so arms that share a backend (27B think on/off) share it.
+    * chosen arm's backend full (in_flight >= capacity):
+        - move to the nearest higher-rank arm whose backend is free, if margin <= margin_up
+          (default: always);
+        - else to the nearest lower-rank arm whose backend is free, if margin <= margin_down
+          (default 0.1).
+    * promote (default 0 = off): if the top arm's backend is idle and margin < promote,
+      move a lower decision to the top arm.
     `margin` is the inner router's signals.margin (0 when absent). Unknown load = no change.
+    brick_skill already prices the live queue into its latency term, so on top of it this
+    wrapper only acts on full backends and borderline J gaps.
     """
     name = "load_aware"
     wrapper = True
@@ -223,34 +380,37 @@ class LoadAwareRouter(Router):
 
     async def decide(self, req):
         d = await self.inner.decide(req)
-        if d.model not in self.config.models:
+        if d.model not in self.config.arms:
             return d
         loads = await self.res.load.get()
         d.signals["load"] = loads
         margin = float(d.signals.get("margin") or 0.0)
-        order = [m.name for m in self.config.by_rank()]
+        order = [a.name for a in self.config.arms_by_rank()]
         i = order.index(d.model)
 
-        def busy(m):
-            s = loads.get(m)
+        def state(arm):
+            return loads.get(self.config.arms[arm].model)
+
+        def busy(arm):
+            s = state(arm)
             return s is not None and s["in_flight"] >= s["capacity"]
 
-        def free(m):
-            s = loads.get(m)
+        def free(arm):
+            s = state(arm)
             return s is not None and s["in_flight"] < s["capacity"]
 
-        up = order[i + 1] if i + 1 < len(order) else None
-        down = order[i - 1] if i > 0 else None
+        up = next((a for a in order[i + 1:] if free(a)), None)
+        down = next((a for a in reversed(order[:i]) if free(a)), None)
         new = None
         if busy(d.model):
-            if up and free(up) and margin <= self.margin_up:
+            if up and margin <= self.margin_up:
                 new, why = up, "busy, shifted up"
-            elif down and free(down) and margin <= self.margin_down:
+            elif down and margin <= self.margin_down:
                 new, why = down, "busy, shifted down"
         elif self.promote > 0 and d.model != order[-1] and margin < self.promote:
-            s = loads.get(order[-1])
+            s = state(order[-1])
             if s is not None and s["in_flight"] == 0:
-                new, why = order[-1], "largest idle, promoted borderline decision"
+                new, why = order[-1], "top arm idle, promoted borderline decision"
         if new:
             d.signals["inner_model"] = d.model
             d.reason = f"load_aware: {d.model} {why} to {new} (margin {margin:.3f}; inner: {d.reason})"
@@ -295,8 +455,9 @@ def spec_label(layers: list[tuple[str, dict]]) -> str:
 
 
 def build(spec, config: Config, *, client: httpx.AsyncClient | None = None,
-          load_ttl_s: float = 0.2) -> Router:
-    """Build a router chain from a spec."""
+          load_ttl_s: float = 0.2, capability_fn=None) -> Router:
+    """Build a router chain from a spec. ``capability_fn(text) -> {capability: prob}``
+    replaces the local ModernBERT classifier (tests, or a remote classifier later)."""
     layers = parse_spec(spec)
     for i, (name, _) in enumerate(layers):
         if name not in ROUTERS:
@@ -304,7 +465,7 @@ def build(spec, config: Config, *, client: httpx.AsyncClient | None = None,
         last = i == len(layers) - 1
         if ROUTERS[name].wrapper == last:
             raise ValueError(f"{name!r}: wrappers need an inner router; leaf routers must come last")
-    res = Resources(config, client=client, load_ttl_s=load_ttl_s)
+    res = Resources(config, client=client, load_ttl_s=load_ttl_s, capability_fn=capability_fn)
     router = None
     for name, params in reversed(layers):
         router = ROUTERS[name](config, params, res, inner=router)

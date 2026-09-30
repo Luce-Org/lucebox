@@ -4,7 +4,8 @@ import asyncio
 import json
 
 import httpx
-from eval.collect import completed_keys, plan_jobs, stream_chat
+from eval.collect import collect_targets, completed_keys, plan_jobs, stream_chat
+from eval.common import DEFAULT_ARMS
 from eval.common import read_jsonl
 from eval.grade import grade_rows, needs_regrade, reference_answers
 from eval.graders import GradeResult
@@ -62,9 +63,15 @@ def test_resume_skips_successes_and_retries_errors(tmp_path):
     ]
     answers.write_text("".join(json.dumps(r) + "\n" for r in rows))
     prompts = [{"id": i} for i in "abcd"]
-    jobs = plan_jobs(prompts, ["s", "l"], [False], completed_keys(answers))
+    jobs = plan_jobs(prompts, [("s", False), ("l", False)], completed_keys(answers))
     assert [(p["id"], m) for p, m, _ in jobs] == [
         ("b", "s"), ("d", "s"), ("a", "l"), ("b", "l"), ("c", "l"), ("d", "l")]
+
+
+def test_default_targets_are_the_arms_with_shared_backend():
+    assert collect_targets(DEFAULT_ARMS) == [("qwen35-2b", False), ("qwen38-27b", False), ("qwen38-27b", True)]
+    assert collect_targets(DEFAULT_ARMS, models=["qwen35-0.8b"], thinking="both") == [
+        ("qwen35-0.8b", False), ("qwen35-0.8b", True)]
 
 
 class FakeJudge:

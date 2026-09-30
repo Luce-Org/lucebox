@@ -10,8 +10,12 @@ Writes runs/<name>/answers.jsonl (append-only; resumable). One row per run:
 for clean per-request latency; raise it only for throughput runs (and use a
 different run name, since latency under load is not comparable).
 
-    python -m eval.collect --run pilot --models qwen35-0.8b,qwen35-2b,qwen38-27b
-    python -m eval.collect --run pilot --models qwen38-27b --thinking on   # judge refs
+    python -m eval.collect --run pilot                      # every arm in backends.json
+    python -m eval.collect --run pilot --arms qwen38-27b-think
+    python -m eval.collect --run pilot --models qwen35-0.8b --thinking off   # ad-hoc model x mode
+
+By default the jobs are the config's arms (2b off, 27b off, 27b on); the 27B thinking-on
+answers double as judge references.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from .common import (
     RUNS_DIR,
     append_jsonl,
     latest_by_key,
+    load_arms,
     load_backends,
     read_jsonl,
 )
@@ -139,18 +144,24 @@ async def stream_chat(
 
 def plan_jobs(
     prompts: list[dict[str, Any]],
-    models: list[str],
-    thinking_modes: list[bool],
+    targets: list[tuple[str, bool]],
     done: set[tuple[str, str, bool]],
 ) -> list[tuple[dict[str, Any], str, bool]]:
-    """Jobs still to run, ordered model-major so each server stays warm."""
-    return [
-        (p, m, t)
-        for m in models
-        for t in thinking_modes
-        for p in prompts
-        if (p["id"], m, t) not in done
-    ]
+    """Jobs still to run for each (model, thinking) target, target-major so each server stays warm."""
+    return [(p, m, t) for m, t in targets for p in prompts if (p["id"], m, t) not in done]
+
+
+def collect_targets(arms: dict[str, dict[str, Any]], arm_names: list[str] | None = None,
+                    models: list[str] | None = None, thinking: str = "off") -> list[tuple[str, bool]]:
+    """(model, thinking) pairs to collect: the given models x modes, else the arms (deduped)."""
+    if models:
+        modes = {"off": [False], "on": [True], "both": [False, True]}[thinking]
+        return [(m, t) for m in models for t in modes]
+    names = arm_names or list(arms)
+    unknown = [a for a in names if a not in arms]
+    if unknown:
+        raise SystemExit(f"unknown arms {unknown} (have {list(arms)})")
+    return list(dict.fromkeys((arms[a]["model"], arms[a]["thinking"]) for a in names))
 
 
 def completed_keys(answers_path: Path) -> set[tuple[str, str, bool]]:
@@ -162,11 +173,13 @@ async def run(args: argparse.Namespace) -> None:
     import httpx
 
     backends = load_backends(args.backends)
-    models = [m.strip() for m in args.models.split(",")] if args.models else list(backends)
-    for m in models:
+    targets = collect_targets(load_arms(args.backends),
+                              [a.strip() for a in args.arms.split(",")] if args.arms else None,
+                              [m.strip() for m in args.models.split(",")] if args.models else None,
+                              args.thinking)
+    for m, _ in targets:
         if m not in backends:
             raise SystemExit(f"model {m!r} not in backends ({list(backends)})")
-    thinking_modes = {"off": [False], "on": [True], "both": [False, True]}[args.thinking]
 
     prompts = read_jsonl(args.prompts)
     if args.split != "all":
@@ -187,7 +200,7 @@ async def run(args: argparse.Namespace) -> None:
     out_dir = RUNS_DIR / args.run if not args.out_dir else Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     answers = out_dir / "answers.jsonl"
-    jobs = plan_jobs(prompts, models, thinking_modes, completed_keys(answers))
+    jobs = plan_jobs(prompts, targets, completed_keys(answers))
     if args.shuffle:
         random.Random(0).shuffle(jobs)
     print(f"{len(jobs)} jobs to run -> {answers}", flush=True)
@@ -229,8 +242,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out-dir", default=None, help="override runs/<name>")
     ap.add_argument("--prompts", type=Path, default=PROMPTS_PATH)
     ap.add_argument("--backends", default=None, help="backends.json (default config/backends.json)")
-    ap.add_argument("--models", default=None, help="comma list (default: all in backends.json)")
-    ap.add_argument("--thinking", choices=["off", "on", "both"], default="off")
+    ap.add_argument("--arms", default=None, help="comma list of arms (default: every arm in backends.json)")
+    ap.add_argument("--models", default=None, help="ad-hoc comma list of models, instead of arms")
+    ap.add_argument("--thinking", choices=["off", "on", "both"], default="off", help="modes for --models")
     ap.add_argument("--split", choices=["all", "train", "test"], default="all")
     ap.add_argument("--categories", default=None, help="comma list of categories or sources")
     ap.add_argument("--limit", type=int, default=0)

@@ -6,13 +6,22 @@ Schema (extra keys are kept in `extra` and otherwise ignored):
                              "rank": 0, "served_name": optional, "context": optional int,
                              "capacity": optional int, ...}},
      "services": {"<name>": {"base_url": "...", "kind": "...", "served_name": optional,
-                             "prompt_suffix": optional str, ...}}}
+                             "prompt_suffix": optional str, ...}},
+     "arms":     {"<arm>": {"model": "<model name>", "thinking": true|false|null, "rank": 0}},
+     "latency_defaults": {...}}   # optional hand-set latency profile (see lucerouter/latency.py)
 
 `rank` orders models by size (0 = smallest). `served_name` is the `model`
 value sent to the backend (defaults to the config key). `context` is the
 model's context window in tokens (informational). `capacity` is the
 concurrent request budget used when the backend's status endpoint does not
 report one.
+
+An *arm* is what routers choose: a backend model plus request overrides
+(today only `thinking`, sent as `chat_template_kwargs.enable_thinking`).
+Several arms can share one backend (e.g. the 27B with thinking off and on).
+When `arms` is absent every model is one arm with thinking unset, so the
+request goes through unchanged. `rank` orders arms from cheapest to most
+capable.
 """
 
 from __future__ import annotations
@@ -63,10 +72,31 @@ class Service:
 
 
 @dataclass
+class Arm:
+    name: str
+    model: str                     # backend model name (key of Config.models)
+    rank: int
+    thinking: bool | None = None   # None: leave the client's chat_template_kwargs alone
+    extra: dict = field(default_factory=dict)
+
+
+@dataclass
 class Config:
     models: dict[str, ModelBackend]
     services: dict[str, Service] = field(default_factory=dict)
     path: str | None = None
+    arms: dict[str, Arm] = field(default_factory=dict)
+    latency_defaults: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not self.arms:
+            self.arms = {m.name: Arm(name=m.name, model=m.name, rank=m.rank) for m in self.models.values()}
+
+    def arms_by_rank(self) -> list[Arm]:
+        return sorted(self.arms.values(), key=lambda a: a.rank)
+
+    def backend_of(self, arm: str) -> ModelBackend:
+        return self.models[self.arms[arm].model]
 
     def by_rank(self) -> list[ModelBackend]:
         return sorted(self.models.values(), key=lambda m: m.rank)
@@ -88,6 +118,7 @@ class Config:
 
 _MODEL_KEYS = {"base_url", "kind", "rank", "served_name", "context", "capacity"}
 _SERVICE_KEYS = {"base_url", "kind", "served_name", "prompt_suffix"}
+_ARM_KEYS = {"model", "thinking", "rank"}
 
 
 def config_from_dict(data: dict, path: str | None = None) -> Config:
@@ -115,7 +146,16 @@ def config_from_dict(data: dict, path: str | None = None) -> Config:
         )
     if not models:
         raise ValueError("config has no models")
-    return Config(models=models, services=services, path=path)
+    arms = {}
+    for name, a in (data.get("arms") or {}).items():
+        if a["model"] not in models:
+            raise ValueError(f"arm {name!r}: model {a['model']!r} is not a configured model")
+        thinking = a.get("thinking")
+        arms[name] = Arm(name=name, model=a["model"], rank=int(a.get("rank", models[a["model"]].rank)),
+                         thinking=None if thinking is None else bool(thinking),
+                         extra={k: v for k, v in a.items() if k not in _ARM_KEYS})
+    return Config(models=models, services=services, path=path, arms=arms,
+                  latency_defaults=dict(data.get("latency_defaults") or {}))
 
 
 def load_config(path: str | Path) -> Config:
