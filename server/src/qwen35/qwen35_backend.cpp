@@ -1675,16 +1675,6 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             ? cache_.cur_pos == live_snapshot_pos_
             : prefix_snapshots_[slot].ctx &&
               cache_.cur_pos == prefix_snapshots_[slot].cur_pos);
-    // Continuing the live state consumes a deferred snapshot; any other
-    // restore overwrites the live state, so copy that snapshot out first.
-    if (!live_restore) materialize_live_snapshot();
-    live_snapshot_slot_ = -1;
-    live_snapshot_deferred_ = false;
-    generating_ = true;
-    struct GeneratingScope {
-        bool & flag;
-        ~GeneratingScope() { flag = false; }
-    } generating_scope{generating_};
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (cfg_.paged_attention) {
@@ -1700,15 +1690,27 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         out_io.emit(-1);
         return result;
     }
-    // An exact snapshot hit decodes without a prefill, so the offset a
-    // previous image request left behind must not survive into this one.
-    rope_delta_ = 0;
     if (slot < 0 || slot >= PREFIX_SLOTS ||
         (!live_restore && !prefix_snapshots_[slot].ctx)) {
         result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);
         return result;
     }
+    // A restore that other state overwrites copies a deferred snapshot out
+    // first. Continuing the live state keeps it until prefill or decode
+    // changes that state, so a failure before then leaves it restorable.
+    if (!live_restore) {
+        materialize_live_snapshot();
+        live_snapshot_slot_ = -1;
+    }
+    generating_ = true;
+    struct GeneratingScope {
+        bool & flag;
+        ~GeneratingScope() { flag = false; }
+    } generating_scope{generating_};
+    // An exact snapshot hit decodes without a prefill, so the offset a
+    // previous image request left behind must not survive into this one.
+    rope_delta_ = 0;
     const int snap_pos = live_restore ? cache_.cur_pos
                                       : prefix_snapshots_[slot].cur_pos;
 
@@ -1759,6 +1761,11 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             }
         }
     }
+
+    // Prefill and decode change the live state from here on, which consumes
+    // a deferred snapshot this restore continues.
+    live_snapshot_slot_ = -1;
+    live_snapshot_deferred_ = false;
 
     // Daemon receives the FULL prompt; slice off the cached prefix and prefill
     // only the delta at KV positions [snap_pos, snap_pos + delta.size()).
@@ -1916,15 +1923,6 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     }
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
-    // A chunk never ends within kMinChunkTokens of its start, except at the
-    // end of the prompt: a chunk of a few tokens in the middle of a prompt
-    // produced NaN logits on the R9700 (Qwen3.8, a 2-token chunk after a
-    // restore). A restore away from every restore point (a generated-turn
-    // checkpoint) cannot reproduce a cold prefill anyway, so its first chunk
-    // runs further before stopping. Both rules depend only on where chunks
-    // start, so a cold prefill and a restored one still cut alike.
-    constexpr int kMinChunkTokens = 16;
-    constexpr int kOffGridMinLeadTokens = 64;
     int prefill_ubatch = std::max(kMinChunkTokens, qwen35_prefill_ubatch(512));
     const int prompt_len = (int)tokens.size();
     prefill_last_logits_valid_ = false;

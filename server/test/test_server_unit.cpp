@@ -170,11 +170,15 @@ struct SchedulerTestHarness {
         return server.agent_turn_cache_slots_.count(slot) != 0;
     }
 
+    // `own_snapshot_slot` is the inline snapshot the request itself took.
     static bool save_generated_turn(
             HttpServer & server, const std::vector<int32_t> & prompt,
             const std::vector<int32_t> & generated,
-            const std::vector<int32_t> & canonical) {
+            const std::vector<int32_t> & canonical,
+            int own_snapshot_slot = -1) {
         HttpServer::GenerationCacheState cache;
+        cache.snap_prepared = own_snapshot_slot >= 0;
+        cache.snap_slot = own_snapshot_slot;
         return server.save_generated_turn(prompt, generated, canonical, cache);
     }
 
@@ -6031,6 +6035,31 @@ TEST_CASE(ServerUnitFixture, test_save_generated_turn_keys_live_state) {
             server, prompt, generated, partial));
         TEST_ASSERT(SchedulerTestHarness::prefix_cache(server).stats().in_use == 0);
     }
+    {
+        // At capacity the checkpoint never evicts the request's own inline
+        // snapshot, the fallback when the next request diverges inside the
+        // generated turn. Otherwise slot 1, the oldest leaf, would go.
+        auto backend_owner = std::make_unique<LiveStateBackend>();
+        LiveStateBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.prefix_cache_cap = 3;
+        HttpServer server(engine, tokenizer, config);
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        cache.confirm_inline_snap(0, 2, prompt);
+        cache.confirm_inline_snap(1, 4, prompt);
+        cache.confirm_inline_snap(2, 3, std::vector<int32_t>{1, 100, 9});
+        backend.live_position = 6;
+        TEST_ASSERT(SchedulerTestHarness::save_generated_turn(
+            server, prompt, generated, canonical, /*own_snapshot_slot=*/1));
+        TEST_ASSERT(backend.saved_slot == 2);
+        std::vector<int32_t> next = canonical;
+        next.insert(next.end(), {8, 9});
+        TEST_ASSERT(cache.lookup(next).first == 2);
+        std::vector<int32_t> diverged = prompt;
+        diverged.insert(diverged.end(), {250, 7});
+        TEST_ASSERT(cache.lookup(diverged).first == 1);
+    }
     unlink(path.c_str());
 }
 
@@ -6062,7 +6091,8 @@ TEST_CASE(ServerUnitFixture, test_prepare_cache_skips_consumed_snapshot) {
     const std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102};
     cache.confirm_inline_snap(0, 2, prompt);
     cache.confirm_inline_snap(1, 4, prompt);
-    backend.positions[0] = 2;  // slot 1's snapshot was consumed
+    // Slot 1 has no snapshot left: it was consumed.
+    backend.positions[0] = 2;
 
     const auto prepared = SchedulerTestHarness::prepare_cache(server, prompt);
     TEST_ASSERT(prepared.restore_slot == 0);

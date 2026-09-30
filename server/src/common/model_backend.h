@@ -246,10 +246,10 @@ struct ModelBackend {
     virtual bool snapshot_used(int slot) const = 0;
     virtual int  snapshot_cur_pos(int slot) const = 0;
 
-    // Snapshots land on multiples of this many positions past the restore
-    // point, so a cut closer than one step to it cannot be saved. Backends
-    // that start a prefill chunk at every restore point save exactly there
-    // and return 1.
+    // A snapshot lands at least this many positions past the restore point,
+    // so a cut closer than that cannot be saved. Backends that start a
+    // prefill chunk at every restore point (Qwen: beyond this distance) save
+    // exactly there.
     virtual int snapshot_granularity() const { return 1; }
 
     // System-memory bytes a snapshot of the first `tokens` positions would
