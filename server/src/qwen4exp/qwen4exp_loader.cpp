@@ -786,7 +786,9 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
             ple_path = shards.front().path;
         }
         std::string reader_error;
-        if (!out.ple_reader.open(ple_path, kPleTensor, 4, reader_error)) {
+        // A 2,048-token prefill gathers ~49k random rows of the n-gram table from disk; with 4 readers the cold
+        // preads alone took ~0.8 s of TTFT. 32 keep the NVMe queue full (decode stays serial below 64 rows).
+        if (!out.ple_reader.open(ple_path, kPleTensor, 32, reader_error)) {
             return fail(reader_error);
         }
         out.shard2_path = ple_path;
