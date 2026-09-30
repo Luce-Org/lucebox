@@ -187,6 +187,10 @@ public:
 
     using InlineSnapshotSize = std::function<size_t(int target_cut)>;
 
+    // Resize the resident budget (the concurrent scheduler sizes it once the
+    // batch engine can estimate a checkpoint).
+    void set_max_resident_bytes(size_t bytes) { max_resident_bytes_ = bytes; }
+
     // Select a boundary, destination, and optional budget victim as one owned
     // operation. At most one reservation can be live; destroying it cancels
     // without changing committed metadata.
