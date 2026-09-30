@@ -3431,7 +3431,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_MOE_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
-                if (ne2 <= mmvq_mmid_max) {
+                // Batch-invariant mode (DS4.1 verification) keeps every small batch on MMVQ, whose per-token
+                // single-column path reproduces decode exactly; MMQ would reduce in another order.
+                if (ne2 <= mmvq_mmid_max || ggml_cuda_mmvq_batch_invariant_enabled) {
                     log_dispatch("mmvq");
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;

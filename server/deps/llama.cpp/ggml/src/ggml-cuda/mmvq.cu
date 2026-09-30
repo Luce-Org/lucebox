@@ -2420,6 +2420,21 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     const bool has_ids = ids != nullptr;
 
+    // Batch-invariant MUL_MAT_ID (ggml_backend_cuda_set_mmvq_batch_invariant, set by DS4.1 verification): run each
+    // token through the single-token path -- the decode kernel with its launch shape and reduction order -- so a
+    // verify batch reproduces decode bit for bit. The multi-token MoE kernel and the per-width launches reduce in a
+    // different order (test_ds41_mmid_width_invariance). For MUL_MAT_ID the columns are tokens.
+    if (has_ids && ncols_dst > 1 && ggml_cuda_mmvq_batch_invariant()) {
+        for (int t = 0; t < ncols_dst; ++t) {
+            mul_mat_vec_q_switch_ncols_dst<type>(
+                vx, (const block_q8_1 *) vy + (int64_t) t*stride_col_y, ids + (int64_t) t*ids_stride, fusion,
+                dst + (int64_t) t*stride_col_dst, ncols_x, nrows_x, 1, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+        }
+        return;
+    }
+
     const auto should_use_small_k = [&](int c_ncols_dst) {
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
