@@ -3191,6 +3191,12 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_records_only_validated_restore) {
 }
 
 TEST_CASE(ServerUnitFixture, test_prefix_cache_long_first_turn_snapshots_whole_prompt) {
+    // reserve_inline_snap reads these once per process; the expectations
+    // below are for the defaults, so an exported override skips the case.
+    if (std::getenv("LUCE_PC_DEEP_FIRST_MIN") || std::getenv("LUCE_PC_DEEP_FIRST_MAX_HEAD")) {
+        std::fprintf(stderr, "skip: LUCE_PC_DEEP_FIRST_* overridden\n");
+        return;
+    }
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
@@ -3205,6 +3211,17 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_long_first_turn_snapshots_whole_p
         PrefixCache cache(2, tokenizer);
         auto r = cache.reserve_inline_snap(
             short_head, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/true);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == (int) short_head.size());
+        r.cancel();
+    }
+    // A new conversation that restored only the shared head still snapshots
+    // its long first turn whole.
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/3,
             /*prefer_tools_boundary=*/true);
         TEST_ASSERT(r.active());
         TEST_ASSERT(r.target_cut() == (int) short_head.size());

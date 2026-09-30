@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
@@ -568,6 +570,23 @@ void PrefixCache::release_inline_reservation(uint64_t id) {
     if (inline_reservation_active(id)) active_inline_reservation_ = 0;
 }
 
+namespace {
+// The whole value as a non-negative int, else `fallback` (also when unset).
+int env_nonneg_int(const char * name, int fallback) {
+    const char * v = std::getenv(name);
+    if (!v || !*v) return fallback;
+    char * end = nullptr;
+    errno = 0;
+    const long n = std::strtol(v, &end, 10);
+    if (errno != 0 || *end != '\0' || n < 0 || n > INT_MAX) {
+        std::fprintf(stderr, "[pc] ignoring %s=%s (want a non-negative integer); using %d\n",
+                     name, v, fallback);
+        return fallback;
+    }
+    return (int) n;
+}
+}  // namespace
+
 PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len,
@@ -580,22 +599,20 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
     if (disabled_ || active_inline_reservation_ != 0) return {};
 
     const auto candidates = find_all_boundaries(prompt_ids, markers_);
-    // Cold request with a long tail past a short system/tools head (an
-    // agent's first turn): snapshot the whole conversation instead of the
-    // head, or the first follow-up re-prefills everything. Only a short head
-    // gives up its own pin this way, so a new conversation that shares it
-    // re-prefills at most LUCE_PC_DEEP_FIRST_MAX_HEAD tokens (default 2048).
+    // A long tail past a short system/tools head (an agent's first turn, cold
+    // or with only the shared head restored): snapshot at the last message
+    // boundary instead of the head, or the first follow-up re-prefills the
+    // whole turn. That boundary is the end of the prompt unless the template
+    // appends tokens after it. Only a short head gives up its own pin this
+    // way, so a new conversation that shares it re-prefills at most
+    // LUCE_PC_DEEP_FIRST_MAX_HEAD tokens (default 2048).
     // LUCE_PC_DEEP_FIRST_MIN is the tail length that triggers it (default
-    // 4096 tokens; 0 keeps the head pin).
-    static const int deep_first_min = [] {
-        const char * v = std::getenv("LUCE_PC_DEEP_FIRST_MIN");
-        return v && *v ? std::atoi(v) : 4096;
-    }();
-    static const int deep_first_max_head = [] {
-        const char * v = std::getenv("LUCE_PC_DEEP_FIRST_MAX_HEAD");
-        return v && *v ? std::atoi(v) : 2048;
-    }();
-    if (deep_first_min > 0 && restored_prefix_len == 0 && !candidates.empty() &&
+    // 4096 tokens; 0 keeps the head pin). Values that are not a whole
+    // non-negative integer keep the defaults.
+    static const int deep_first_min = env_nonneg_int("LUCE_PC_DEEP_FIRST_MIN", 4096);
+    static const int deep_first_max_head = env_nonneg_int("LUCE_PC_DEEP_FIRST_MAX_HEAD", 2048);
+    if (deep_first_min > 0 && !candidates.empty() &&
+        restored_prefix_len <= candidates.front() &&
         candidates.front() <= deep_first_max_head &&
         (int) prompt_ids.size() - candidates.front() >= deep_first_min) {
         prefer_tools_boundary = false;
