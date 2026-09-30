@@ -152,7 +152,9 @@ The default draft path is discovered under `models/draft/`. Scripts prefer `dfla
 harnesses. It supports `/health`,
 `/v1/models`, OpenAI Chat Completions including streaming and tool metadata,
 OpenAI Responses for Codex and OMP, Anthropic Messages for Claude Code, and
-Open WebUI model metadata.
+Open WebUI model metadata. The Qwen3.5/Qwen3.6 backend also supports direct-logit typed
+decisions at `/v1/systemone`; one question runs one prefill, while multiple
+questions over the shared state run one independent prefill per question.
 
 Build it with the rest of the CUDA runtime:
 

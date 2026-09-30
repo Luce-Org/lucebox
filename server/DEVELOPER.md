@@ -145,6 +145,7 @@ cd server
 | `POST /v1/chat/completions` | OpenAI Chat Completions API |
 | `POST /v1/responses` | OpenAI Responses API (Codex) |
 | `POST /v1/messages` | Anthropic Messages API |
+| `POST /v1/systemone` | Direct-logit typed decisions (Qwen3.5/Qwen3.6) |
 
 ---
 
