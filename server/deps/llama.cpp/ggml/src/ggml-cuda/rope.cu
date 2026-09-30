@@ -553,6 +553,13 @@ static void rope_multi_cuda(const T *            x,
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 
+    // The per-token kernel pins its rotation to the FMA form HIP compiles rope_multi to (bit-identical on AMD); CUDA
+    // builds keep rope_multi so NVIDIA results do not move by an ulp.
+#if defined(GGML_USE_HIP)
+    const bool per_token = ne02 >= 64;
+#else
+    const bool per_token = false;
+#endif
     // Explicit parity mode; preserve the fork's FP64 long-context default.
     static const bool upstream_f32 = [] {
         const char * v = getenv("QWEN4EXP_ROPE_F32");
@@ -569,7 +576,7 @@ static void rope_multi_cuda(const T *            x,
                 x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
                 attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
         }
-    } else if (ne02 >= 64) {   // prefill: one block per token (decode keeps rope_multi's per-row blocks)
+    } else if (per_token) {   // prefill: one block per token (decode keeps rope_multi's per-row blocks)
         const int bx = std::min(128, std::max(32, ne00 / 2)), ne03 = nr / (ne01 * ne02);
         const dim3 hb(bx, 256 / bx, 1), hg(ne02, ne03, 1);
         if (freq_factors == nullptr) {
