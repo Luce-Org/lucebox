@@ -1,0 +1,104 @@
+{
+  "models": {
+    "qwen35-0.8b": {
+      "base_url": "http://127.0.0.1:8401/v1",
+      "kind": "luce_server",
+      "rank": 0,
+      "gguf": "/home/berto/models/routing/Qwen3.5-0.8B-Q8_0.gguf",
+      "served_name": "qwen35-0.8b",
+      "context": 16384,
+      "capacity": 4
+    },
+    "qwen35-2b": {
+      "base_url": "http://127.0.0.1:8420/v1",
+      "kind": "luce_server",
+      "rank": 1,
+      "gguf": "/home/berto/models/routing/Qwen3.5-2B-Q8_0.gguf",
+      "served_name": "qwen35-2b",
+      "context": 122880,
+      "capacity": 4
+    },
+    "qwen38-27b": {
+      "base_url": "http://127.0.0.1:8420/v1",
+      "kind": "luce_server",
+      "rank": 2,
+      "served_name": "qwen3.8-27b",
+      "context": 65536,
+      "capacity": 4
+    }
+  },
+  "arms": {
+    "qwen35-2b": {
+      "model": "qwen35-2b",
+      "thinking": false,
+      "rank": 0
+    },
+    "qwen38-27b": {
+      "model": "qwen38-27b",
+      "thinking": false,
+      "rank": 1
+    },
+    "qwen38-27b-think": {
+      "model": "qwen38-27b",
+      "thinking": true,
+      "rank": 2
+    }
+  },
+  "latency_defaults": {
+    "_note": "hand-set placeholders until eval/fit_latency.py writes runs/<name>/latency_profile.json",
+    "chars_per_token": 3.8,
+    "arms": {
+      "qwen35-2b": {
+        "ttft_ms": 30,
+        "ttft_ms_per_token": 0.1,
+        "tpot_ms": 7,
+        "out_tokens": {
+          "default": 350
+        }
+      },
+      "qwen38-27b": {
+        "ttft_ms": 150,
+        "ttft_ms_per_token": 1.0,
+        "tpot_ms": 35,
+        "out_tokens": {
+          "default": 400
+        }
+      },
+      "qwen38-27b-think": {
+        "ttft_ms": 150,
+        "ttft_ms_per_token": 1.0,
+        "tpot_ms": 35,
+        "out_tokens": {
+          "default": 2000
+        }
+      }
+    }
+  },
+  "services": {
+    "brick-max": {
+      "base_url": "http://127.0.0.1:8420",
+      "kind": "luce_server",
+      "gguf": "/home/berto/models/routing/brick-complexity-2-max-Q8_0.gguf",
+      "served_name": "brick-max",
+      "context": 32768,
+      "capacity": 4,
+      "max_chars": 3000
+    },
+    "brick-eco": {
+      "base_url": "http://127.0.0.1:8412",
+      "kind": "luce_server",
+      "gguf": "/home/berto/models/routing/brick-complexity-2-eco-Q8_0.gguf",
+      "served_name": "brick-eco",
+      "context": 32768,
+      "capacity": 4
+    },
+    "embed": {
+      "base_url": "http://127.0.0.1:8413",
+      "kind": "todo",
+      "gguf": "/home/berto/models/routing/Qwen3-Embedding-0.6B-Q8_0.gguf",
+      "served_name": "embed",
+      "context": 8192,
+      "capacity": 4
+    }
+  }
+}

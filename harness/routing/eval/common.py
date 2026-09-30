@@ -18,8 +18,8 @@ BACKENDS_PATH = CONFIG_DIR / "backends.json"
 # Used when config/backends.json is missing (e.g. in unit tests).
 DEFAULT_BACKENDS: dict[str, dict[str, Any]] = {
     "qwen35-0.8b": {"base_url": "http://127.0.0.1:8401/v1", "rank": 0},
-    "qwen35-2b": {"base_url": "http://127.0.0.1:8402/v1", "rank": 1},
-    "qwen38-27b": {"base_url": "http://127.0.0.1:8216/v1", "kind": "luce_server", "rank": 2},
+    "qwen35-2b": {"base_url": "http://127.0.0.1:8420/v1", "rank": 1},
+    "qwen38-27b": {"base_url": "http://127.0.0.1:8420/v1", "kind": "luce_server", "rank": 2},
 }
 
 # Route targets used when config/backends.json is missing entirely:
