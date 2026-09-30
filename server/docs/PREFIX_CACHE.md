@@ -215,11 +215,20 @@ the fixed part dominates short prefixes. For Qwen3.5/3.6-27B with q8_0 KV and a
 DFlash draft, one snapshot is about 34 KiB per token plus about 350 MiB fixed:
 0.7 GiB at 10K tokens, 1.0 GiB at 20K and 3.5 GiB at 94K.
 
-Qwen saves a snapshot only at a prefill chunk start (512 tokens by default,
-`LUCE_PREFILL_UBATCH`) past the position it restored from, so the cache only
-targets cuts the backend can reach. A system/tools head shorter than one chunk
-is not pinned; the cache moves on to the next reachable conversation boundary
-instead of retrying a cut that can never be saved.
+Every chat boundary (and every extra cut a cache may take) starts a prefill
+chunk, in a cold prefill and after a restore alike (`restore_points`). A
+snapshot therefore lands exactly on the boundary it was requested at, and a
+restored prefix plus the suffix prefill reproduces a cold prefill. The
+generation prompt's own boundary starts a chunk only when the request
+snapshots there, since no saved state lies past it otherwise.
+
+After a tool-call turn the server also keeps the state the generation left
+behind, keyed by the prompt plus the generated tokens the next request renders
+identically (see [Agent Turn Cache](API.md#agent-turn-cache)). That snapshot is
+deferred: while the next request continues the conversation it is never copied
+to system RAM, and it is copied out only before other work would overwrite the
+live state. Restoring the snapshot the live state already holds copies nothing
+back either.
 
 Coding agents grow one conversation turn by turn, and each turn's snapshot is a
 strict prefix of the next. After committing a snapshot, the single-sequence

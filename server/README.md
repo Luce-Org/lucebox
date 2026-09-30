@@ -307,7 +307,7 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--prefix-cache-slots <N>` | `32` | In-memory prefix-cache slots; `0` disables. |
 | `--prefix-cache-max-mib <auto\|MiB>` | `auto` | Resident RAM limit for single-sequence prefix snapshots (Qwen and DeepSeek4); `auto` keeps room for three snapshots at `--max-ctx`, at most a quarter of available memory; `0` is unlimited. See [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md#configuration). |
 | `--concurrent-prefix-cache-max-mib <MiB>` | `4096` | Resident RAM limit for copied concurrent paged prefix checkpoints; `0` is unlimited. |
-| `--agent-turn-cache` | off | Extend prefix caching through generated tool calls. |
+| `--agent-turn-cache` | off | Replay a generated tool-call turn the next request renders differently, so prefix caching still extends through it. |
 | `--prefill-cache-slots <N>` | `0` | Full-prompt cache slots. |
 | `--paged-attention` | off | Enable paged KV for supported Qwen targets (16-token blocks) or DeepSeek4 on Strix Halo and R9700 plus Strix Halo (128-token pages). DeepSeek4 paged serving is AR-only. |
 | `--max-concurrency <N>` | `1` | Maximum concurrent decode sequences. Qwen supports up to 64; DeepSeek4 supports up to 6. Values above 1 enable paged attention. |

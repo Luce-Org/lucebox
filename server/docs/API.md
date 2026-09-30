@@ -20,28 +20,31 @@ backend (qwen35, qwen3, gemma4, laguna).
 
 ## Agent Turn Cache
 
-Start the server with `--agent-turn-cache` to extend the existing in-memory
-prefix cache through generated tool calls. After the model emits a valid tool
-call, the server reuses its deepest compatible prefix checkpoint, replays the
-uncached tail once, and saves the canonical completed turn. On the next OpenAI
-Chat Completions or Responses request, only the appended tool result and new
-suffix need prefill.
+The in-memory prefix cache extends through generated tool calls. After the
+model emits a valid tool call, the server keeps the state the generation left
+behind as a checkpoint of the prompt plus the generated turn, as far as the
+next request renders that turn with the same tokens (tool memory replays the
+generated text, so normally all of it). On the next OpenAI Chat Completions
+or Responses request, only the appended tool result and the new suffix need
+prefill. When that request is the next one the server runs,
+it continues the live state without copying the checkpoint back.
 
-This is a server-wide optimization; request bodies do not change. It requires
-`--prefix-cache-slots` to be nonzero. Compressed or token-rewritten prompts and
-requests without a compatible checkpoint safely fall back to ordinary prefix
-caching.
+This is a server-wide optimization for single-sequence serving; request bodies
+do not change. It requires `--prefix-cache-slots` to be nonzero. Compressed or
+token-rewritten prompts fall back to ordinary prefix caching.
 
-The replay moves prefill work out of the follow-up request when tool execution
-is long enough to overlap it; it does not eliminate that work. Paged attention
-and `--max-concurrency` do not yet support shared prefix blocks, so they cannot
-be combined with Agent Turn Cache.
+`--agent-turn-cache` adds a fallback for turns the next request renders
+differently: the server reuses its deepest compatible prefix checkpoint,
+replays the uncached tail once while idle, and saves the canonical completed
+turn. The replay moves prefill work out of the follow-up request when tool
+execution is long enough to overlap it; it does not eliminate that work.
+Paged attention and `--max-concurrency` do not yet support shared prefix
+blocks, so they cannot be combined with `--agent-turn-cache`.
 
 The exact full-prompt cache may remain enabled for identical-request hits.
 Disable it only when benchmarking the incremental Agent Turn Cache benefit.
 
-Successful Chat Completions and Responses requests expose the measured result
-under `usage.timings`:
+Successful requests expose the measured result under `usage.timings`:
 
 - `agent_turn_cache_hit`: the restored prefix includes a generated agent turn.
 - `cached_prefix_tokens`: backend-confirmed tokens restored from KV state.

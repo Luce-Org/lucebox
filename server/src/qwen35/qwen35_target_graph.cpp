@@ -1294,8 +1294,17 @@ static ggml_tensor * build_full_attn_block(
     // TQ3_0 path: the cache is zero-initialised, so padded rows contribute
     // exp(-row_max) ~ 0 to the (mask-less) softmax denominator.
     const bool  step_invariant = kv_write_rows != nullptr;
+    // A masked span pads freely too (the mask hides the padded rows), and a
+    // multiple of 256 is what selects the tensor-core kernels for a prefill
+    // chunk: on RDNA4 any other span falls back to the generic tile kernel,
+    // which is slower and less accurate at head size 256 (2.8e-3 vs 3.7e-4
+    // from the CPU reference at 33K). Chunks too short for the tensor-core
+    // route keep their exact span.
+    constexpr int kPaddedPrefillMinTokens = 32;
+    const bool padded_prefill =
+        attn_mask != nullptr && n_tokens >= kPaddedPrefillMinTokens;
     const int fattn_stride  = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0 ||
-                               step_invariant) ? 256 : 1;
+                               step_invariant || padded_prefill) ? 256 : 1;
     // Round a KV span up to the FA stride.
     const auto padded_kv_len = [&](int len) {
         return ((len + fattn_stride - 1) / fattn_stride) * fattn_stride;
@@ -1423,10 +1432,8 @@ static ggml_tensor * build_full_attn_block(
                                   ? (kv_start - fa_window) : 0;
         const int win_len = kv_len - win_start;
         int win_len_padded = padded_kv_len(win_len);
-        if (step_invariant) {
-            // Never view past the read tensor (its rows may not be 256-aligned).
-            win_len_padded = std::min(win_len_padded, (int)cache_k->ne[1]);
-        }
+        // Never view past the read tensor (its rows may not be 256-aligned).
+        win_len_padded = std::min(win_len_padded, (int)cache_k->ne[1] - win_start);
         // kvflash: KV lives at pool SLOTS, and the caller's mask is built in
         // slot space over the whole pool. Slot indices are not bounded by the
         // logical context length, so a view sized from kv_start can end below
@@ -2981,6 +2988,21 @@ bool snapshot_target_cache(const TargetWeights & w,
     snap.layout          = PrefixSnapshot::Layout::dense;
 
     return true;
+}
+
+void clear_kv_rows_from(TargetCache & cache, int pos) {
+    if (pos < 0) pos = 0;
+    for (const auto * layers : {&cache.attn_k, &cache.attn_v}) {
+        for (ggml_tensor * t : *layers) {
+            if (!t || pos >= t->ne[1]) continue;
+            const size_t rows = (size_t)(t->ne[1] - pos);
+            for (int64_t h = 0; h < t->ne[2]; ++h) {
+                ggml_backend_tensor_memset(
+                    t, 0, (size_t)h * t->nb[2] + (size_t)pos * t->nb[1],
+                    rows * t->nb[1]);
+            }
+        }
+    }
 }
 
 bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {

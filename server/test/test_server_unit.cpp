@@ -165,6 +165,41 @@ struct SchedulerTestHarness {
     static void mark_agent_turn(HttpServer & server, int slot) {
         server.agent_turn_cache_slots_.insert(slot);
     }
+
+    static bool is_agent_turn(const HttpServer & server, int slot) {
+        return server.agent_turn_cache_slots_.count(slot) != 0;
+    }
+
+    static bool save_generated_turn(
+            HttpServer & server, const std::vector<int32_t> & prompt,
+            const std::vector<int32_t> & generated,
+            const std::vector<int32_t> & canonical) {
+        HttpServer::GenerationCacheState cache;
+        return server.save_generated_turn(prompt, generated, canonical, cache);
+    }
+
+    struct PreparedCache {
+        int restore_slot;   // -1 without a restore
+        int prefix_len;
+        bool snapshot;      // an inline snapshot is planned
+    };
+
+    static PreparedCache prepare_cache(
+            HttpServer & server, const std::vector<int32_t> & prompt,
+            bool ends_with_tool_result = false) {
+        ParsedRequest req;
+        req.prompt_tokens = prompt;
+        req.response_id = "test";
+        req.ends_with_tool_result = ends_with_tool_result;
+        HttpServer::PreparedPrompt prepared;
+        prepared.tokens = prompt;
+        GenerateRequest generate_request;
+        generate_request.prompt = prompt;
+        const auto cache = server.prepare_generation_cache(
+            req, prepared, generate_request);
+        return {cache.using_restore ? cache.cache_slot : -1, cache.prefix_len,
+                cache.snap_prepared};
+    }
 };
 }
 
@@ -5922,6 +5957,191 @@ TEST_CASE(ServerUnitFixture, test_inline_snapshot_finalization_prunes_chain) {
     unlink(path.c_str());
 }
 
+// The live state after generation covers the prompt and the decoded part
+// of the reply; it is saved only as far as the next request's rendering of
+// the turn agrees with it.
+struct LiveStateBackend : ShortInlineSnapshotBackend {
+    int live_position = 0;
+    int saves = 0;
+
+    bool snapshot_save(int slot) override {
+        saved_slot = slot;
+        saved_position = live_position;
+        ++saves;
+        return true;
+    }
+    void snapshot_free(int slot) override {
+        if (slot == saved_slot) saved_position = 0;
+    }
+};
+
+TEST_CASE(ServerUnitFixture, test_save_generated_turn_keys_live_state) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::vector<int32_t> prompt = {1, 100, 3, 101};
+    const std::vector<int32_t> generated = {200, 201, 202};
+    // The next request renders the reply, then appends tool results.
+    const std::vector<int32_t> canonical = {1, 100, 3, 101, 200, 201, 202, 7};
+
+    {
+        auto backend_owner = std::make_unique<LiveStateBackend>();
+        LiveStateBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.prefix_cache_cap = 2;
+        HttpServer server(engine, tokenizer, config);
+        // The last sampled token was never decoded.
+        backend.live_position = 6;
+        TEST_ASSERT(SchedulerTestHarness::save_generated_turn(
+            server, prompt, generated, canonical));
+        std::vector<int32_t> next = canonical;
+        next.insert(next.end(), {8, 9});
+        const auto hit =
+            SchedulerTestHarness::prefix_cache(server).lookup(next);
+        TEST_ASSERT(hit.first == backend.saved_slot);
+        TEST_ASSERT(hit.second == 6);
+        TEST_ASSERT(SchedulerTestHarness::is_agent_turn(server, hit.first));
+    }
+    {
+        // A reply the next request renders differently is not saved.
+        auto backend_owner = std::make_unique<LiveStateBackend>();
+        LiveStateBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.prefix_cache_cap = 2;
+        HttpServer server(engine, tokenizer, config);
+        backend.live_position = 6;
+        const std::vector<int32_t> rerendered = {1, 100, 3, 101, 250, 7};
+        TEST_ASSERT(!SchedulerTestHarness::save_generated_turn(
+            server, prompt, generated, rerendered));
+        TEST_ASSERT(backend.saves == 0);
+    }
+    {
+        // State past the agreeing tokens would claim rows it does not match.
+        auto backend_owner = std::make_unique<LiveStateBackend>();
+        LiveStateBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.prefix_cache_cap = 2;
+        HttpServer server(engine, tokenizer, config);
+        backend.live_position = 7;
+        const std::vector<int32_t> partial = {1, 100, 3, 101, 200, 201, 250};
+        TEST_ASSERT(!SchedulerTestHarness::save_generated_turn(
+            server, prompt, generated, partial));
+        TEST_ASSERT(SchedulerTestHarness::prefix_cache(server).stats().in_use == 0);
+    }
+    unlink(path.c_str());
+}
+
+// A hit whose backend snapshot is gone (a deferred snapshot a live
+// continuation consumed) is dropped and the next deepest entry restored.
+struct SlotSetBackend : MockBackend {
+    std::map<int, int> positions;
+    bool snapshot_used(int slot) const override {
+        return positions.count(slot) != 0;
+    }
+    int snapshot_cur_pos(int slot) const override {
+        const auto it = positions.find(slot);
+        return it == positions.end() ? 0 : it->second;
+    }
+};
+
+TEST_CASE(ServerUnitFixture, test_prepare_cache_skips_consumed_snapshot) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<SlotSetBackend>();
+    SlotSetBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.prefix_cache_cap = 4;
+    HttpServer server(engine, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+
+    const std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102};
+    cache.confirm_inline_snap(0, 2, prompt);
+    cache.confirm_inline_snap(1, 4, prompt);
+    backend.positions[0] = 2;  // slot 1's snapshot was consumed
+
+    const auto prepared = SchedulerTestHarness::prepare_cache(server, prompt);
+    TEST_ASSERT(prepared.restore_slot == 0);
+    TEST_ASSERT(prepared.prefix_len == 2);
+    TEST_ASSERT(cache.lookup_candidate(prompt, (int)prompt.size()).first == 0);
+    unlink(path.c_str());
+}
+
+static std::vector<int> prefill_chunk_starts(
+        int kv_offset, int prompt_end, const std::vector<int> & points,
+        int first_min_tokens = 16) {
+    std::vector<int> starts;
+    for (int pos = kv_offset; pos < prompt_end;) {
+        starts.push_back(pos);
+        pos += qwen35_prefill_chunk_tokens(
+            pos, prompt_end - pos, 512, points,
+            pos == kv_offset ? first_min_tokens : 16);
+    }
+    return starts;
+}
+
+// Chunks start at every restore point, keep to the 512 grid in between, and
+// are never shorter than 16 tokens before the end of the prompt.
+TEST_CASE(ServerUnitFixture, test_qwen35_prefill_chunks) {
+    TEST_ASSERT((prefill_chunk_starts(0, 1300, {}) ==
+                 std::vector<int>{0, 512, 1024}));
+    TEST_ASSERT((prefill_chunk_starts(0, 1300, {21, 700}) ==
+                 std::vector<int>{0, 21, 512, 700, 1024}));
+    // A restore point 2 tokens before the grid does not leave a 2-token chunk.
+    TEST_ASSERT((prefill_chunk_starts(0, 1300, {510}) ==
+                 std::vector<int>{0, 510, 1022}));
+    // The prompt's last chunk may be short.
+    TEST_ASSERT((prefill_chunk_starts(0, 515, {}) ==
+                 std::vector<int>{0, 512}));
+    // A prefill resumed at a chunk start of the cold prefill cuts alike.
+    const std::vector<int> points = {40, 300, 1400, 1405, 2047, 2600};
+    const auto cold = prefill_chunk_starts(0, 3000, points);
+    for (int start : cold) {
+        const auto resumed = prefill_chunk_starts(start, 3000, points);
+        TEST_ASSERT(std::equal(resumed.begin(), resumed.end(),
+                               std::find(cold.begin(), cold.end(), start)));
+    }
+    // An off-grid restore runs its first chunk at least 64 tokens.
+    const auto off_grid = prefill_chunk_starts(1003, 1300, {1010, 1100}, 64);
+    TEST_ASSERT(off_grid.size() >= 2 && off_grid[1] - off_grid[0] >= 64);
+}
+
+// An agent turn that continues a generated-turn checkpoint skips its own
+// snapshot while another checkpoint lies close behind; other requests keep it.
+TEST_CASE(ServerUnitFixture, test_agent_continuation_throttles_snapshot) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<SlotSetBackend>();
+    SlotSetBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.prefix_cache_cap = 4;
+    HttpServer server(engine, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+
+    const std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102, 3, 103, 4};
+    cache.confirm_inline_snap(0, 3, prompt);
+    cache.confirm_inline_snap(1, 6, prompt);
+    SchedulerTestHarness::mark_agent_turn(server, 1);
+    backend.positions[0] = 3;
+    backend.positions[1] = 6;
+
+    const auto agent = SchedulerTestHarness::prepare_cache(
+        server, prompt, /*ends_with_tool_result=*/true);
+    TEST_ASSERT(agent.restore_slot == 1);
+    TEST_ASSERT(!agent.snapshot);
+
+    const auto chat = SchedulerTestHarness::prepare_cache(server, prompt);
+    TEST_ASSERT(chat.restore_slot == 1);
+    TEST_ASSERT(chat.snapshot);
+    unlink(path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_prefix_cache_budget_resolution) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
@@ -8223,6 +8443,10 @@ struct EmptySpecRetryBackend : MockBackend {
     bool restore_saw_force_ar = false;
     bool generate_first_empty_visible = false;
     bool restore_first_empty_visible = false;
+    // False once the first attempt continued a deferred snapshot in place.
+    bool snapshot_present = true;
+
+    bool snapshot_used(int) const override { return snapshot_present; }
 
     GenerateResult generate_impl(const GenerateRequest & req,
                             const DaemonIO &) override {
@@ -8296,6 +8520,26 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_spec_restore_once_
     TEST_ASSERT(result.restored_prefix_tokens == 3);
     TEST_ASSERT(backend.restore_calls == 2);
     TEST_ASSERT(backend.restore_saw_force_ar);
+}
+
+// A deferred snapshot the first attempt consumed cannot be restored again:
+// the retry prefills the whole prompt.
+TEST_CASE(ServerUnitFixture, test_model_backend_retries_consumed_restore_with_prefill) {
+    EmptySpecRetryBackend backend;
+    backend.snapshot_present = false;
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    DaemonIO io;
+
+    GenerateResult result = backend.restore_and_generate(7, req, io);
+
+    TEST_ASSERT(result.ok());
+    TEST_ASSERT(result.tokens.size() == 1);
+    TEST_ASSERT(result.tokens[0] == 42);
+    TEST_ASSERT(backend.restore_calls == 1);
+    TEST_ASSERT(backend.generate_calls == 1);
+    TEST_ASSERT(backend.generate_saw_force_ar);
 }
 
 TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_generate_once_with_ar) {

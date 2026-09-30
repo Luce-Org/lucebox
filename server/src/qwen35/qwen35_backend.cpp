@@ -875,6 +875,8 @@ void Qwen35Backend::print_ready_banner() const {
 // ── Park / unpark ───────────────────────────────────────────────────────
 
 bool Qwen35Backend::park(ParkTarget target) {
+    materialize_live_snapshot();
+    live_snapshot_slot_ = -1;
     const bool want_draft_model = park_target_includes_draft_model(target);
     const bool want_target_model = park_target_includes_target_model(target);
     const bool use_remote_draft = cfg_.remote_draft.enabled();
@@ -904,6 +906,8 @@ bool Qwen35Backend::park(ParkTarget target) {
 }
 
 bool Qwen35Backend::unpark(ParkTarget target) {
+    materialize_live_snapshot();
+    live_snapshot_slot_ = -1;
     const bool want_target_model = park_target_includes_target_model(target);
     const bool want_draft_model = park_target_includes_draft_model(target);
     const bool use_remote_draft = cfg_.remote_draft.enabled();
@@ -1012,34 +1016,67 @@ bool Qwen35Backend::snapshot_save(int slot) {
         }
         return false;
     }
-    PrefixSnapshot & snap = prefix_snapshots_[slot];
-    return snapshot_target_cache(w_, cache_, snap_backend_, snap);
+    // A deferred snapshot is the live state; copy it out while it still is.
+    materialize_live_snapshot();
+    const bool ok = snapshot_target_cache(
+        w_, cache_, snap_backend_, prefix_snapshots_[slot]);
+    live_snapshot_slot_ = ok && !generating_ ? slot : -1;
+    return ok;
+}
+
+bool Qwen35Backend::snapshot_save_deferred(int slot) {
+    if (generating_ || cfg_.paged_attention || kvflash_active() ||
+        slot < 0 || slot >= PREFIX_SLOTS || cache_.cur_pos <= 0) {
+        return snapshot_save(slot);
+    }
+    materialize_live_snapshot();
+    free_prefix_snapshot(prefix_snapshots_[slot]);
+    live_snapshot_slot_ = slot;
+    live_snapshot_pos_ = cache_.cur_pos;
+    live_snapshot_deferred_ = true;
+    return true;
+}
+
+void Qwen35Backend::materialize_live_snapshot() {
+    if (!live_snapshot_deferred_) return;
+    live_snapshot_deferred_ = false;
+    const int slot = live_snapshot_slot_;
+    if (cache_.cur_pos != live_snapshot_pos_ ||
+        !snapshot_target_cache(w_, cache_, snap_backend_,
+                               prefix_snapshots_[slot])) {
+        free_prefix_snapshot(prefix_snapshots_[slot]);
+        live_snapshot_slot_ = -1;
+    }
 }
 
 void Qwen35Backend::snapshot_free(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS) return;
+    if (slot == live_snapshot_slot_) {
+        live_snapshot_slot_ = -1;
+        live_snapshot_deferred_ = false;
+    }
     free_prefix_snapshot(prefix_snapshots_[slot]);
 }
 
 bool Qwen35Backend::snapshot_used(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
-    return prefix_snapshots_[slot].ctx != nullptr;
+    return prefix_snapshots_[slot].ctx != nullptr ||
+           (live_snapshot_deferred_ && slot == live_snapshot_slot_);
 }
 
 bool Qwen35Backend::restore_target_cache_from_snapshot(int slot) {
+    materialize_live_snapshot();
+    live_snapshot_slot_ = -1;
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) return false;
     return restore_target_cache(prefix_snapshots_[slot], cache_);
 }
 
 int Qwen35Backend::snapshot_cur_pos(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return 0;
+    if (live_snapshot_deferred_ && slot == live_snapshot_slot_) {
+        return live_snapshot_pos_;
+    }
     return prefix_snapshots_[slot].cur_pos;
-}
-
-int Qwen35Backend::snapshot_granularity() const {
-    // do_prefill() saves at the start of the chunk holding the requested cut
-    // and never at the restore point itself.
-    return qwen35_prefill_ubatch(512);
 }
 
 size_t Qwen35Backend::snapshot_bytes_estimate(int tokens) const {
@@ -1292,6 +1329,8 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
 }
 
 bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & io) {
+    materialize_live_snapshot();
+    live_snapshot_slot_ = -1;
     // Check for "nopark" suffix (must be a separate token, not part of a path)
     bool skip_park = (line.size() >= 16 &&
                       line.compare(line.size() - 7, 7, " nopark") == 0);
@@ -1469,6 +1508,13 @@ void Qwen35Backend::release_scratch() {
 
 GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                             const DaemonIO & io) {
+    materialize_live_snapshot();
+    live_snapshot_slot_ = -1;
+    generating_ = true;
+    struct GeneratingScope {
+        bool & flag;
+        ~GeneratingScope() { flag = false; }
+    } generating_scope{generating_};
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (concurrent_slots() > 1) {
@@ -1524,7 +1570,8 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     }
     const bool has_images = image_rows.prompt != nullptr;
     const int committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot,
-                                     /*kv_offset=*/0, has_images ? &image_rows : nullptr);
+                                     /*kv_offset=*/0, has_images ? &image_rows : nullptr,
+                                     req.restore_points);
     if (committed < 0) {
         result.fail(GenerateErrorCode::PrefillFailed);
         return result;
@@ -1620,6 +1667,24 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
 GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                                         const GenerateRequest & req,
                                                         const DaemonIO & io) {
+    // The live cache already is this snapshot when it was saved (or kept,
+    // deferred) after the previous generation and nothing ran since.
+    const bool live_restore = slot >= 0 && slot == live_snapshot_slot_ &&
+        !kvflash_active() &&
+        (live_snapshot_deferred_
+            ? cache_.cur_pos == live_snapshot_pos_
+            : prefix_snapshots_[slot].ctx &&
+              cache_.cur_pos == prefix_snapshots_[slot].cur_pos);
+    // Continuing the live state consumes a deferred snapshot; any other
+    // restore overwrites the live state, so copy that snapshot out first.
+    if (!live_restore) materialize_live_snapshot();
+    live_snapshot_slot_ = -1;
+    live_snapshot_deferred_ = false;
+    generating_ = true;
+    struct GeneratingScope {
+        bool & flag;
+        ~GeneratingScope() { flag = false; }
+    } generating_scope{generating_};
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (cfg_.paged_attention) {
@@ -1638,19 +1703,27 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     // An exact snapshot hit decodes without a prefill, so the offset a
     // previous image request left behind must not survive into this one.
     rope_delta_ = 0;
-    if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) {
+    if (slot < 0 || slot >= PREFIX_SLOTS ||
+        (!live_restore && !prefix_snapshots_[slot].ctx)) {
         result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);
         return result;
     }
+    const int snap_pos = live_restore ? cache_.cur_pos
+                                      : prefix_snapshots_[slot].cur_pos;
 
-    // Clear-then-restore: the step-invariant decode reads a 256-padded,
-    // mask-less FA span, so rows beyond the restored prefix must be ZERO,
-    // not leftovers from the previous request. cudaMemset is ~0.2ms.
-    if (cache_.base_buf) ggml_backend_buffer_clear(cache_.base_buf, 0);
-
-    // Restore snapshot
-    restore_target_cache(prefix_snapshots_[slot], cache_);
+    if (live_restore) {
+        // The live cache already is this snapshot (saved after the previous
+        // generation, nothing ran since). Only the rows past it differ from
+        // a restore: rejected drafts, which the padded decode span reads.
+        clear_kv_rows_from(cache_, cache_.cur_pos);
+    } else {
+        // Clear-then-restore: the step-invariant decode reads a 256-padded,
+        // mask-less FA span, so rows beyond the restored prefix must be ZERO,
+        // not leftovers from the previous request. cudaMemset is ~0.2ms.
+        if (cache_.base_buf) ggml_backend_buffer_clear(cache_.base_buf, 0);
+        restore_target_cache(prefix_snapshots_[slot], cache_);
+    }
 
     // Now generate from restored state
     sampler_ = req.sampler;
@@ -1658,7 +1731,6 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         sampler_rng_.seed(sampler_.seed);
     }
 
-    const int snap_pos = prefix_snapshots_[slot].cur_pos;
     cache_.cur_pos = snap_pos;
     result.restored_prefix_tokens = snap_pos;
 
@@ -1695,7 +1767,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     if (prompt_len > snap_pos) {
         auto t_prefill_start = std::chrono::steady_clock::now();
         std::vector<int32_t> delta = restore_prompt_delta(req.prompt, snap_pos);
-        committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
+        committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot,
+                               /*kv_offset=*/snap_pos, nullptr, req.restore_points);
         if (committed < 0) {
             result.fail(GenerateErrorCode::PrefillFailed);
             return result;
@@ -1714,7 +1787,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         cache_.cur_pos = 0;
         result.restored_prefix_tokens = 0;
         auto t_prefill_start = std::chrono::steady_clock::now();
-        committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
+        committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot,
+                               /*kv_offset=*/0, nullptr, req.restore_points);
         if (committed < 0) {
             result.fail(GenerateErrorCode::PrefillFailed);
             return result;
@@ -1809,7 +1883,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
                                int snap_pos, int snap_slot,
                                int kv_offset,
-                               const Qwen35ImageRows * images) {
+                               const Qwen35ImageRows * images,
+                               const std::vector<int> & restore_points) {
     if (images && kv_offset != 0) {
         std::fprintf(stderr, "prefill: an image prompt must start at position 0\n");
         return -1;
@@ -1918,6 +1993,18 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
     }
 
+    // A chunk never ends within kMinChunkTokens of its start, except at the
+    // end of the prompt: a chunk of a few tokens in the middle of a prompt
+    // produced NaN logits on the R9700 (Qwen3.8, a 2-token chunk after a
+    // restore). A restore away from every restore point (a generated-turn
+    // checkpoint) cannot reproduce a cold prefill anyway, so its first chunk
+    // runs further before stopping. Both rules depend only on where chunks
+    // start, so a cold prefill and a restored one still cut alike.
+    constexpr int kMinChunkTokens = 16;
+    constexpr int kOffGridMinLeadTokens = 64;
+    const bool restored_off_grid = kv_offset > 0 &&
+        !std::binary_search(restore_points.begin(), restore_points.end(), kv_offset);
+
     // Chunked prefill
     std::vector<float> embed_buf((size_t)hidden * prefill_ubatch);
     int committed = kv_offset;
@@ -1925,18 +2012,25 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (io.is_cancelled()) break;
         const int kv_pos = kv_offset + start;
 
-        int n_tokens = std::min(prefill_ubatch, prompt_len - start);
-        // FIX(bug2): do NOT shrink the prefill chunk to snap_pos. Shrinking
-        // realigns every subsequent chunk, changing GPU batch sizes vs the
-        // no-cache path -> FP-nondeterministic state divergence -> different
-        // greedy output on cache hits. Keep uniform chunks. When snap_pos falls
-        // inside this chunk, snapshot at the chunk START boundary kv_pos: the
-        // largest chunk boundary <= snap_pos. That stays (a) chunk-aligned, so
-        // the prefill is bit-identical to the no-cache path, and (b) strictly
-        // within the requested prefix, so a later request that shares only the
-        // system-prompt prefix still restores a valid cross-request hit.
-        // (Rounding UP would push the snapshot to prompt end -> the full prompt
-        // incl. the user message -> a different user msg restores garbage.)
+        // Every restore point starts a chunk, in a cold prefill and after a
+        // restore alike, so both cut the prompt into the same chunks and
+        // produce the same state (FIX(bug2): chunk boundaries change the
+        // numerics). A snapshot requested at a restore point is then exact.
+        // Between restore points chunks keep to the ubatch grid: attention
+        // over chunks off it is markedly slower.
+        // Pooled kvflash prefill keeps its own chunking and never snapshots.
+        const int n_tokens = kvf_paged
+            ? std::min(prefill_ubatch, prompt_len - start)
+            : qwen35_prefill_chunk_tokens(
+                  kv_pos, prompt_len - start, prefill_ubatch, restore_points,
+                  start == 0 && restored_off_grid ? kOffGridMinLeadTokens
+                                                  : kMinChunkTokens);
+        // When snap_pos falls inside this chunk (a cut that is not a restore
+        // point), snapshot at the chunk START kv_pos: the largest chunk
+        // boundary <= snap_pos, strictly within the requested prefix, so a
+        // later request that shares only that prefix still restores a valid
+        // hit. (Rounding UP would include tokens past the cut, e.g. a user
+        // message another request does not share.)
         if (snap_slot >= 0 && snap_pos >= 0 &&
             kv_pos <= snap_pos && snap_pos < kv_pos + n_tokens) {
             if (kv_pos > kv_offset && !kvf_paged) {   // skip degenerate / relocated

@@ -132,11 +132,11 @@ public:
                                  const DaemonIO & io) override;
 
     bool snapshot_save(int slot) override;
+    bool snapshot_save_deferred(int slot) override;
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
     size_t snapshot_bytes_estimate(int tokens) const override;
-    int snapshot_granularity() const override;
     MemoryReport memory_report() const override;
     // memory_report() for an explicit cache and snapshot array.
     static MemoryReport memory_report_for(const TargetCache & cache,
@@ -286,6 +286,16 @@ private:
     ggml_backend_t target_backend_ = nullptr;
     ggml_backend_t draft_backend_  = nullptr;
     ggml_backend_t snap_backend_   = nullptr;  // snapshot storage (CPU or unified)
+    // Slot whose snapshot equals the live cache: saved outside a
+    // generation, with no generation since. Restoring it copies nothing.
+    // A deferred one was never copied out (snapshot_save_deferred()).
+    int  live_snapshot_slot_ = -1;
+    int  live_snapshot_pos_ = 0;
+    bool live_snapshot_deferred_ = false;
+    bool generating_ = false;
+    // Copies a deferred live snapshot into its slot before the live state
+    // changes; a no-op otherwise.
+    void materialize_live_snapshot();
     std::unique_ptr<Qwen35TensorParallelContext> tensor_parallel_;
     bool           split_gpus_     = false;
 
@@ -378,11 +388,15 @@ private:
     // kv_offset > 0 resumes from a restored snapshot: tokens are placed at
     // KV positions [kv_offset, kv_offset + tokens.size()) instead of [0, N).
     // `images` carries the encoded rows of an image prompt (kv_offset 0 only).
+    // A chunk starts at every absolute `restore_points` position (see
+    // GenerateRequest::restore_points), so a snapshot at one is exact and a
+    // restore from it reproduces a cold prefill.
     int do_prefill(const std::vector<int32_t> & tokens,
                    const DaemonIO & io,
                    int snap_pos = -1, int snap_slot = -1,
                    int kv_offset = 0,
-                   const Qwen35ImageRows * images = nullptr);
+                   const Qwen35ImageRows * images = nullptr,
+                   const std::vector<int> & restore_points = {});
 
     // Speculative decode loop: draft → verify → accept until EOS/max.
     // When budget_hook is non-null and (n_gen - generated) drops to the

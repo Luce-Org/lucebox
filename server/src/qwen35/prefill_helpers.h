@@ -12,6 +12,24 @@
 
 namespace luce::common {
 
+// Tokens of the prefill chunk at absolute position kv_pos with `remaining`
+// prompt tokens left. Every restore point (ascending, absolute) starts a
+// chunk; between them chunks end on multiples of `ubatch`, the grid a cold
+// prefill uses. A chunk ends no sooner than `min_tokens` in, except at the
+// end of the prompt. The result depends only on where the chunk starts, so a
+// prefill resumed at a chunk start of a cold prefill cuts the rest alike.
+inline int qwen35_prefill_chunk_tokens(int kv_pos, int remaining, int ubatch,
+                                       const std::vector<int> & restore_points,
+                                       int min_tokens) {
+    const int after = kv_pos - 1 + std::max(1, min_tokens);
+    int end = kv_pos + std::min(ubatch, remaining);
+    const auto next = std::upper_bound(
+        restore_points.begin(), restore_points.end(), after);
+    if (next != restore_points.end()) end = std::min(end, *next);
+    end = std::min(end, (after / ubatch + 1) * ubatch);
+    return end - kv_pos;
+}
+
 inline int qwen35_prefill_ubatch(int fallback) {
     const char * value = std::getenv("LUCE_PREFILL_UBATCH");
     return value ? std::max(1, std::atoi(value)) : fallback;

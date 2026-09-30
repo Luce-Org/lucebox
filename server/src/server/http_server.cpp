@@ -2681,11 +2681,16 @@ constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
 
 // Every position a later request may restore `prompt`'s prefix from: its chat
 // boundaries plus the extra cuts a cache may take (a PPP pin, a fixed disk
-// scope). See GenerateRequest::restore_points.
+// scope). See GenerateRequest::restore_points. `drop_last_boundary` leaves
+// out the generation prompt's own boundary: a request that does not snapshot
+// there saves no state past it, so that split would only cost a short extra
+// prefill step (a snapshot there comes back through `cuts`).
 std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
                                        const ChatMarkers & markers,
-                                       std::initializer_list<int> cuts) {
+                                       std::initializer_list<int> cuts,
+                                       bool drop_last_boundary = false) {
     std::vector<int> points = find_all_boundaries(prompt, markers);
+    if (drop_last_boundary && !points.empty()) points.pop_back();
     for (int cut : cuts) {
         if (cut > 0 && cut < (int) prompt.size()) points.push_back(cut);
     }
@@ -3690,12 +3695,22 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             }
         }
     }
-    if (!cache.using_restore) {
-        auto [inline_slot, inline_len] =
-            prefix_cache_.lookup(effective_prompt);
+    // An entry whose backend snapshot is gone is dropped and the next
+    // deepest one tried, instead of prefilling the whole prompt.
+    while (!cache.using_restore) {
+        const auto [inline_slot, inline_len] = prefix_cache_.lookup_candidate(
+            effective_prompt, (int) effective_prompt.size());
+        if (inline_slot < 0) break;
+        if (!backend_.snapshot_used(inline_slot)) {
+            forget_inline_slot_metadata(inline_slot);
+            prefix_cache_.invalidate_inline_snap(inline_slot);
+            continue;
+        }
+        prefix_cache_.record_inline_hit(
+            inline_slot, inline_len, effective_prompt.size());
         cache.cache_slot = inline_slot;
         cache.prefix_len = inline_len;
-        cache.using_restore = cache.cache_slot >= 0;
+        cache.using_restore = true;
     }
 
     // FlowKV may rewrite aged messages, so only its stable system prefix is
@@ -3962,7 +3977,23 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         }
     };
 
-    if (prefer_inline_snap || cache.using_restore) {
+    // An agent turn that continues its generated-turn checkpoint is itself
+    // continued the same way by the next request, so its own snapshot only
+    // backs an interrupted or edited turn. Take one when the deepest other
+    // checkpoint lies kAgentFallbackStride tokens behind; each copy costs
+    // the whole prefix.
+    bool skip_inline = false;
+    if (cache.using_restore && !cache.disk_hit && req.ends_with_tool_result &&
+        agent_turn_cache_slots_.count(cache.cache_slot)) {
+        constexpr int kAgentFallbackStride = 2048;
+        const auto boundaries = find_all_boundaries(
+            effective_prompt, prefix_cache_.chat_markers());
+        const int cut = boundaries.empty() ? 0 : boundaries.back();
+        const int fallback = prefix_cache_.lookup_candidate(
+            effective_prompt, logical_prefix_len - 1).second;
+        skip_inline = cut - fallback < kAgentFallbackStride;
+    }
+    if (!skip_inline && (prefer_inline_snap || cache.using_restore)) {
         prepare_inline();
     }
     if (!cache.using_restore && cache.snap_slot < 0) {
@@ -3971,7 +4002,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
 
     // Full cache may be disabled or already contain this exact key. Fall
     // back to an inline snapshot when no target has been selected yet.
-    if (!cache.full_snap_prepared && cache.snap_slot < 0) {
+    if (!skip_inline && !cache.full_snap_prepared && cache.snap_slot < 0) {
         prepare_inline();
     }
 
@@ -4011,7 +4042,9 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     if (!prefix_cache_.disabled() || !disk_cache_.disabled()) {
         generate_request.restore_points = prefix_restore_points(
             effective_prompt, prefix_cache_.chat_markers(),
-            {forced_cut, selected_boundary});
+            {forced_cut, selected_boundary,
+             cache.snap_prepared ? cache.snap_cut : 0},
+            /*drop_last_boundary=*/true);
     }
 
     status_.set_flags(
@@ -4030,6 +4063,15 @@ void HttpServer::finalize_generation_cache(
     const auto & effective_prompt = prepared.tokens;
     const bool generation_produced_output = result.ok() &&
         completion_tokens > 0 && visible_output_seen && !client_disconnected;
+
+    // Continuing a deferred snapshot in place consumes it; its entry must
+    // not stay discoverable.
+    if (cache.using_restore && !cache.disk_hit &&
+        agent_turn_cache_slots_.count(cache.cache_slot) &&
+        !backend_.snapshot_used(cache.cache_slot)) {
+        forget_inline_slot_metadata(cache.cache_slot);
+        prefix_cache_.invalidate_inline_snap(cache.cache_slot);
+    }
 
     if (cache.full_snap_prepared) {
         if (generation_produced_output &&
@@ -4235,6 +4277,71 @@ json HttpServer::memory_json() const {
     return out;
 }
 
+bool HttpServer::save_generated_turn(
+        const std::vector<int32_t> & prompt,
+        const std::vector<int32_t> & generated,
+        const std::vector<int32_t> & canonical,
+        const GenerationCacheState & cache) {
+    // The live state after generation holds the prompt and the generated
+    // tokens (the last one sampled may not be decoded yet). It is reusable
+    // up to where those tokens stop matching the turn the next request
+    // renders, which is all of it when tool memory replays the text exactly.
+    const int prompt_len = (int) prompt.size();
+    if (canonical.size() <= prompt.size() ||
+        !std::equal(prompt.begin(), prompt.end(), canonical.begin())) {
+        return false;
+    }
+    int matched = prompt_len;
+    const int limit = (std::min)(
+        (int) canonical.size(), prompt_len + (int) generated.size());
+    while (matched < limit &&
+           generated[(size_t) (matched - prompt_len)] == canonical[(size_t) matched]) {
+        ++matched;
+    }
+    if (matched <= prompt_len) return false;
+
+    // Keep this request's own checkpoints: they are the fallback when the
+    // next request diverges inside the generated turn.
+    const int keep_slot = cache.snap_prepared ? cache.snap_slot
+        : cache.using_restore && !cache.disk_hit ? cache.cache_slot : -1;
+    auto reservation = prefix_cache_.reserve_inline_snap(
+        canonical, prompt_len, false, matched, keep_slot,
+        [this](int target_cut) {
+            return backend_.snapshot_bytes_estimate(target_cut);
+        });
+    if (!reservation.active() || reservation.target_cut() != matched) {
+        return false;
+    }
+    const int slot = reservation.slot();
+    forget_inline_slot_metadata(slot);
+    backend_.snapshot_free(slot);
+    // The next request usually continues this state, so the backend may
+    // keep it live instead of copying it out. Disk persistence reads the
+    // payload, so it needs the copy.
+    const bool saved = disk_cache_.disabled()
+        ? backend_.snapshot_save_deferred(slot) : backend_.snapshot_save(slot);
+    const int saved_pos = saved ? backend_.snapshot_cur_pos(slot) : 0;
+    if (saved_pos <= prompt_len || saved_pos > matched) {
+        backend_.snapshot_free(slot);
+        reservation.abort();
+        return false;
+    }
+    reservation.commit_at(
+        canonical, saved_pos, backend_.snapshot_bytes_estimate(saved_pos));
+    for (const int evicted : prefix_cache_.enforce_resident_budget(slot)) {
+        forget_inline_slot_metadata(evicted);
+        backend_.snapshot_free(evicted);
+    }
+    slot_tokens_[slot] = std::vector<int32_t>(
+        canonical.begin(), canonical.begin() + saved_pos);
+    agent_turn_cache_slots_.insert(slot);
+    std::fprintf(stderr,
+        "[agent-turn-cache] saved generated turn slot=%d prefix=%d "
+        "(prompt=%d generated=%zu)\n",
+        slot, saved_pos, prompt_len, generated.size());
+    return true;
+}
+
 void HttpServer::remember_agent_turn(
         const ParsedRequest & req, const PreparedPrompt & prepared,
         const GenerationCacheState & cache, const GenerateResult & result,
@@ -4282,7 +4389,7 @@ void HttpServer::remember_agent_turn(
     tool_memory_.remember(call_ids, assistant_content);
 
     if (!replay_cache || req.images) return;
-    if (!config_.agent_turn_cache || prefix_cache_.disabled()) return;
+    if (prefix_cache_.disabled()) return;
     // Cache only stateless-equivalent prompts. Compression and token rewrites
     // need a separate replay contract.
     if (prepared.compressed || prepared.tokens != req.prompt_tokens) return;
@@ -4294,7 +4401,11 @@ void HttpServer::remember_agent_turn(
         return;
     }
     std::vector<int32_t> canonical_tokens = tokenizer_.encode(canonical_rendered);
-    if (has_pending_jobs()) return;
+    if (save_generated_turn(prepared.tokens, result.tokens, canonical_tokens,
+                            cache)) {
+        return;
+    }
+    if (!config_.agent_turn_cache || has_pending_jobs()) return;
 
     // Reuse the deepest checkpoint ordinary prefix caching already produced.
     // Matching at the checkpoint, instead of at the prompt end, tolerates the

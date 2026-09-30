@@ -507,6 +507,14 @@ private:
         GenerationCacheState & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected);
+    // Save the live post-generation state as an inline checkpoint of the
+    // prompt plus the generated tokens `canonical` (the conversation with
+    // this turn appended, as the next request renders it) agrees with.
+    bool save_generated_turn(
+        const std::vector<int32_t> & prompt,
+        const std::vector<int32_t> & generated,
+        const std::vector<int32_t> & canonical,
+        const GenerationCacheState & cache);
     void remember_agent_turn(
         const ParsedRequest & req, const PreparedPrompt & prepared,
         const GenerationCacheState & cache, const GenerateResult & result,
