@@ -76,6 +76,18 @@ enum class AdmissionDisposition {
 
 void HttpServer::scheduler_loop(SeqEngine & engine) {
     const int n_slots = engine.slot_count();
+    if (config_.concurrent_paged_prefix_cache &&
+        config_.concurrent_prefix_cache_max_bytes == ServerConfig::kPrefixCacheBudgetAuto) {
+        const size_t per = engine.estimate_prefix_store_bytes(engine.max_context());
+        if (per > 0) {
+            const size_t bytes = concurrent_prefix_budget(per, n_slots);
+            prefix_cache_.set_max_resident_bytes(bytes);
+            std::fprintf(stderr,
+                "[pc] concurrent prefix budget (auto): %zu MiB = %d slots, %zu MiB per "
+                "checkpoint at %d tokens\n",
+                bytes / (1024 * 1024), n_slots, per / (1024 * 1024), engine.max_context());
+        }
+    }
     std::vector<SchedSlot> slots((size_t)n_slots);
     uint64_t next_request_id = 1;
     uint64_t next_admission_order = 0;

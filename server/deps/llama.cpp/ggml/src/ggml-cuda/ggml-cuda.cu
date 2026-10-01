@@ -34,6 +34,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mix-wmma-moe.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-fused-combine.cuh"
@@ -3090,8 +3091,34 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
             ggml_mul_mat_get_mixed_mmq(up) == ggml_mul_mat_get_mixed_mmq(gate) &&
             !(ggml_cuda_mmvq_max_ncols_override > 0 &&
               ncols <= ggml_cuda_mmvq_max_ncols_override)) {
-            ggml_cuda_mul_mat_q_pair(
-                ctx, up->src[0], gate->src[0], src1, ids, up, gate);
+            // RDNA3.5 prefill: ROCmFP2/FP3 MIX experts on the F16 WMMA GEMM
+            // (mix-wmma-moe.cu). When the GLU reads exactly this gate/up
+            // pair, SwiGLU-DS4 runs in the up launch's epilogue.
+            static const bool wmma_glu = [] {
+                const char * v = std::getenv("LUCE_MIX_WMMA_GLU");
+                return !(v && v[0] == '0');
+            }();
+            // The pair launches assume one weight type and shape; any other
+            // pair stays on MMQ.
+            const bool wmma = ids && up->src[0]->type == gate->src[0]->type &&
+                ggml_are_same_shape(up->src[0], gate->src[0]) &&
+                ggml_cuda_mix_wmma_moe_enabled(up->src[0], src1, ids, ncols, cc);
+            if (wmma && wmma_glu &&
+                glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_DS4 &&
+                glu->src[0] && glu->src[1] && glu->src[0]->data == gate->data && glu->src[1]->data == up->data &&
+                ggml_is_contiguous(glu->src[0]) && ggml_is_contiguous(glu->src[1]) &&
+                ggml_nelements(glu->src[0]) == ggml_nelements(gate) && ggml_is_contiguous(glu) &&
+                ggml_are_same_shape(glu, gate) && ggml_are_same_stride(glu, gate)) {
+                ggml_cuda_mix_wmma_moe_pair_glu(ctx, up->src[0], gate->src[0], src1, ids, gate, glu,
+                                                ggml_get_op_params_f32(glu, 2));
+                return true;
+            }
+            if (wmma) {
+                ggml_cuda_mix_wmma_moe_pair(ctx, up->src[0], gate->src[0], src1, ids, up, gate);
+            } else {
+                ggml_cuda_mul_mat_q_pair(
+                    ctx, up->src[0], gate->src[0], src1, ids, up, gate);
+            }
             ggml_cuda_op_swiglu_ds4(ctx, glu);
             return true;
         }
@@ -3383,6 +3410,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             }
+        }
+
+        if (ggml_cuda_mix_wmma_moe_enabled(src0, src1, ids, ne12, cc)) {
+            log_dispatch("mix_wmma");
+            ggml_cuda_mix_wmma_moe(ctx, src0, src1, ids, dst);
+            return;
         }
 
         if (ggml_cuda_should_use_mmq(dst, cc, ne12, /*n_experts=*/ne02)) {

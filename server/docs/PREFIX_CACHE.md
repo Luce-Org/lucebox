@@ -203,7 +203,7 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 |-------------|---------|-------------|
 | `--prefix-cache-slots N` | 32 | Max turn-boundary prefix cache slots |
 | `--prefix-cache-max-mib auto\|N` | auto | Resident RAM limit for single-sequence prefix snapshots; `auto` keeps room for three snapshots at `--max-ctx`, capped at a quarter of the memory available at startup (a readable cgroup v2 container limit is included; otherwise total physical RAM is used); `0` is unlimited. Enforced for Qwen and DeepSeek4 (not DeepSeek4 mixed-backend splits): other backends cannot size snapshots, so `auto` stays unlimited there and an explicit limit is rejected at startup |
-| `--concurrent-prefix-cache-max-mib N` | 4096 | Resident RAM limit for copied concurrent paged checkpoints; `0` is unlimited |
+| `--concurrent-prefix-cache-max-mib N` | auto | Resident RAM limit for copied concurrent paged checkpoints; `auto` = 2 x `--max-concurrency` + 1 checkpoints at `--max-ctx`, at least 4096 MiB; above that, at most 1/4 of available memory; `0` is unlimited |
 | `--prefill-cache-slots N` | 0 | Max exact full-prompt prefill cache slots |
 | `--skip-park` | false | Skip parking draft model during compress |
 
@@ -215,11 +215,23 @@ the fixed part dominates short prefixes. For Qwen3.5/3.6-27B with q8_0 KV and a
 DFlash draft, one snapshot is about 34 KiB per token plus about 350 MiB fixed:
 0.7 GiB at 10K tokens, 1.0 GiB at 20K and 3.5 GiB at 94K.
 
-Qwen saves a snapshot only at a prefill chunk start (512 tokens by default,
-`LUCE_PREFILL_UBATCH`) past the position it restored from, so the cache only
-targets cuts the backend can reach. A system/tools head shorter than one chunk
-is not pinned; the cache moves on to the next reachable conversation boundary
-instead of retrying a cut that can never be saved.
+Every chat boundary (and every extra cut a cache may take) starts a prefill
+chunk, in a cold prefill and after a restore alike (`restore_points`). A
+snapshot therefore lands exactly on the boundary it was requested at, and a
+restored prefix plus the suffix prefill reproduces a cold prefill. Apart from
+the last chunk of the prompt, Qwen never ends a chunk within 16 tokens of its
+start, or 64 after restoring a generated-turn checkpoint, so the cache does not
+request a snapshot that close to the restored prefix. The
+generation prompt's own boundary starts a chunk only when the request
+snapshots there, since no saved state lies past it otherwise.
+
+After a tool-call turn the server also keeps the state the generation left
+behind, keyed by the prompt plus the generated tokens the next request renders
+identically (see [Agent Turn Cache](API.md#agent-turn-cache)). Qwen defers that
+snapshot: while the next request continues the conversation it is never copied
+to system RAM, and it is copied out only before other work would overwrite the
+live state, or when the disk cache persists it at shutdown. Restoring the
+snapshot the live state already holds copies nothing back either.
 
 Coding agents grow one conversation turn by turn, and each turn's snapshot is a
 strict prefix of the next. After committing a snapshot, the single-sequence
@@ -246,6 +258,17 @@ checkpoint without disturbing the committed cache. The configured limit covers
 resident committed checkpoint buffers. During an atomic replacement, the new
 buffer and the selected victim can coexist briefly, so transient process memory
 can exceed the limit by up to one checkpoint.
+
+By default the limit is sized when the scheduler starts, from the batch
+engine's own estimate of one checkpoint at `--max-ctx`: every slot keeps its
+conversation's restore point and the capture in flight, and all slots share the
+system/tools head, so the budget holds 2 x `--max-concurrency` + 1
+checkpoints. It is never below 4096 MiB (the former fixed default); above that
+it is capped at a quarter of the available memory (the container limit when one
+applies, else total physical memory when availability cannot be read), so a host
+with less than 16 GiB keeps the former 4096 MiB. With a fixed 4096 MiB, four Qwen3.8-27B coding agents with
+20K-token conversations could not store their deeper checkpoints: every turn fell
+back to the system/tools head and re-read most of the conversation.
 
 | Scenario | Typical prefix length | Recommended cap |
 |----------|----------------------|-----------------|
