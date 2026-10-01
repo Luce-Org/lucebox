@@ -1303,7 +1303,13 @@ __global__ void __launch_bounds__(MIX_WARP) mix_matvec_rocmfp2_moe_dedup_kernel(
 }
 
 static int mix_dedup_min_tokens() {
-    static const int v = [] { const char * e = std::getenv("LUCE_MIX_DEDUP_MIN"); return e ? std::atoi(e) : 3; }();
+    // A whole number >= 1; anything else keeps the default.
+    static const int v = [] {
+        const char * e = std::getenv("LUCE_MIX_DEDUP_MIN");
+        char * end = nullptr;
+        const long n = e && *e ? std::strtol(e, &end, 10) : 0;
+        return (end && *end == '\0' && n >= 1 && n <= 64) ? (int) n : 3;
+    }();
     return v;
 }
 

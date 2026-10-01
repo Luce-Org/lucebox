@@ -1060,11 +1060,13 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
 // bit-identical to the per-route kernel. LUCE_MIX_DEDUP=0 disables.
 static constexpr int MIX3_DEDUP_MAX_ROUTES = 8;
 
-template <int NR, int MODE>
+// GLU_MODE 0 writes the dot products; 2 is the gate pass of the two-pass
+// SwiGLU, folding the up value already in dst as the per-route kernel does.
+template <int GLU_MODE, int NR, int MODE>
 __device__ __forceinline__ void mix3_dedup_body(
         const uint8_t * __restrict__ edata, const float * __restrict__ s_lut,
         const float * const (&xcol)[NR], const int64_t (&obase)[NR],
-        float * __restrict__ dst, int in, int out, int row0, int lane) {
+        float * __restrict__ dst, int in, int out, int row0, int lane, float glu_limit) {
     constexpr int R = 3;
     const int nb = in / MIX_QK;
     const uint8_t * rb[R];
@@ -1128,18 +1130,22 @@ __device__ __forceinline__ void mix3_dedup_body(
         if (lane == 0) {
             #pragma unroll
             for (int k = 0; k < R; ++k) {
-                if (row0 + k < out) dst[obase[r] + k] = acc[r][k];
+                if (row0 + k < out) {
+                    const int64_t o = obase[r] + k;
+                    dst[o] = GLU_MODE == 2 ? ggml_cuda_op_swiglu_ds4_single(acc[r][k], dst[o], glu_limit)
+                                           : acc[r][k];
+                }
             }
         }
     }
 }
 
-template <int NR>
+template <int GLU_MODE, int NR>
 __device__ __forceinline__ void mix3_dedup_dispatch(
         uint64_t route_mask, int n_used, const float * __restrict__ src1, int ne11,
         int64_t src1_s1, int64_t src1_s2, int64_t dst_s1, int64_t dst_s2,
         const uint8_t * __restrict__ edata, int mode, const float * __restrict__ s_lut,
-        float * __restrict__ dst, int in, int out, int row0, int lane) {
+        float * __restrict__ dst, int in, int out, int row0, int lane, float glu_limit) {
     const float * xcol[NR];
     int64_t obase[NR];
     #pragma unroll
@@ -1150,11 +1156,11 @@ __device__ __forceinline__ void mix3_dedup_dispatch(
         xcol[i]  = src1 + (int64_t) token * src1_s2 + (int64_t) (slot % ne11) * src1_s1;
         obase[i] = (int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0;
     }
-    if (mode == 0) mix3_dedup_body<NR, 0>(edata, s_lut, xcol, obase, dst, in, out, row0, lane);
-    else           mix3_dedup_body<NR, 1>(edata, s_lut, xcol, obase, dst, in, out, row0, lane);
+    if (mode == 0) mix3_dedup_body<GLU_MODE, NR, 0>(edata, s_lut, xcol, obase, dst, in, out, row0, lane, glu_limit);
+    else           mix3_dedup_body<GLU_MODE, NR, 1>(edata, s_lut, xcol, obase, dst, in, out, row0, lane, glu_limit);
 }
 
-template <int MAXT>
+template <int GLU_MODE, int MAXT>
 __global__ void __launch_bounds__(MIX_WARP) mix_matvec_rocmfp3_moe_dedup_kernel(
         const uint8_t * __restrict__ data, size_t nb02,
         const nv_bfloat16 * __restrict__ codebooks, const uint8_t * __restrict__ modes,
@@ -1162,7 +1168,7 @@ __global__ void __launch_bounds__(MIX_WARP) mix_matvec_rocmfp3_moe_dedup_kernel(
         float * __restrict__ dst, int in, int out, int n_experts, int ne11,
         int n_used, int n_tokens,
         int64_t ids_s0, int64_t ids_s1, int64_t src1_s1, int64_t src1_s2,
-        int64_t dst_s1, int64_t dst_s2) {
+        int64_t dst_s1, int64_t dst_s2, float glu_limit) {
     const int lane = threadIdx.x;
     const int row0 = blockIdx.x * 3;
     const int pair = blockIdx.y;
@@ -1204,8 +1210,8 @@ __global__ void __launch_bounds__(MIX_WARP) mix_matvec_rocmfp3_moe_dedup_kernel(
         for (uint64_t m = rest; m && n < CAP; m &= m - 1, ++n) chunk |= m & (~m + 1);
         rest &= ~chunk;
 #define MIX3_DEDUP_CASE(N) \
-        case N: if constexpr (N <= CAP) mix3_dedup_dispatch<N>(chunk, n_used, src1, ne11, \
-            src1_s1, src1_s2, dst_s1, dst_s2, edata, mode, s_lut, dst, in, out, row0, lane); break;
+        case N: if constexpr (N <= CAP) mix3_dedup_dispatch<GLU_MODE, N>(chunk, n_used, src1, ne11, \
+            src1_s1, src1_s2, dst_s1, dst_s2, edata, mode, s_lut, dst, in, out, row0, lane, glu_limit); break;
         switch (n) {
             MIX3_DEDUP_CASE(1) MIX3_DEDUP_CASE(2) MIX3_DEDUP_CASE(3) MIX3_DEDUP_CASE(4)
             MIX3_DEDUP_CASE(5) MIX3_DEDUP_CASE(6) MIX3_DEDUP_CASE(7) MIX3_DEDUP_CASE(8)
@@ -1217,12 +1223,41 @@ __global__ void __launch_bounds__(MIX_WARP) mix_matvec_rocmfp3_moe_dedup_kernel(
 
 static bool mix3_dedup_enabled(int n_tokens) {
     static const bool on = [] { const char * v = std::getenv("LUCE_MIX_DEDUP"); return !(v && v[0] == '0'); }();
-    static const int min_t = [] { const char * v = std::getenv("LUCE_MIX_DEDUP_MIN"); return v ? std::atoi(v) : 3; }();
+    // A whole number >= 1; anything else keeps the default.
+    static const int min_t = [] {
+        const char * v = std::getenv("LUCE_MIX_DEDUP_MIN");
+        char * end = nullptr;
+        const long n = v && *v ? std::strtol(v, &end, 10) : 0;
+        return (end && *end == '\0' && n >= 1 && n <= 64) ? (int) n : 3;
+    }();
     return on && n_tokens >= min_t && n_tokens <= MIX3_DEDUP_MAX_ROUTES;
+}
+
+template <int GLU_MODE>
+static void mix3_launch_dedup(const MixEntry & e, const float * src1, const int32_t * ids, float * dst,
+                              int in, int out, int n_expert_used, int n_tokens, int ne11,
+                              int64_t ids_s0, int64_t ids_s1, int64_t src1_s1, int64_t src1_s2,
+                              int64_t dst_s1, int64_t dst_s2, float glu_limit, cudaStream_t stream) {
+    dim3 dgrid((out + 2) / 3, n_expert_used * n_tokens, 1);
+#define MIX3_DEDUP_LAUNCH(T) \
+    case T: mix_matvec_rocmfp3_moe_dedup_kernel<GLU_MODE, T><<<dgrid, dim3(MIX_WARP), 0, stream>>>( \
+        (const uint8_t *) e.base, e.nb02, e.codebooks, e.modes, src1, ids, dst, \
+        in, out, e.n_experts, ne11, n_expert_used, n_tokens, \
+        ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, glu_limit); break;
+    switch (n_tokens) {
+        MIX3_DEDUP_LAUNCH(1) MIX3_DEDUP_LAUNCH(2) MIX3_DEDUP_LAUNCH(3) MIX3_DEDUP_LAUNCH(4)
+        MIX3_DEDUP_LAUNCH(5) MIX3_DEDUP_LAUNCH(6) MIX3_DEDUP_LAUNCH(7) MIX3_DEDUP_LAUNCH(8)
+        default: break;
+    }
+#undef MIX3_DEDUP_LAUNCH
 }
 #else
 // The dedup kernel uses AMD wave intrinsics; CUDA builds keep the per-route kernel.
 static bool mix3_dedup_enabled(int) { return false; }
+template <int GLU_MODE>
+static void mix3_launch_dedup(const MixEntry &, const float *, const int32_t *, float *,
+                              int, int, int, int, int, int64_t, int64_t, int64_t, int64_t,
+                              int64_t, int64_t, float, cudaStream_t) {}
 #endif // defined(GGML_USE_HIP)
 
 bool ggml_cuda_rocmfp3_mix_mul_mat_id(
@@ -1251,20 +1286,8 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_id(
     // The dedup kernel is the 3-row scheme, so it follows the row3 opt-out.
     if (e.gfx1151 && n_expert_used * n_tokens <= MIX_WARP && mix3_dedup_enabled(n_tokens) &&
         mix_gfx1151_row3_enabled()) {
-#if defined(GGML_USE_HIP)
-        dim3 dgrid((out + 2) / 3, n_expert_used * n_tokens, 1);
-#define MIX3_DEDUP_LAUNCH(T) \
-        case T: mix_matvec_rocmfp3_moe_dedup_kernel<T><<<dgrid, dim3(MIX_WARP), 0, stream>>>( \
-            (const uint8_t *) e.base, e.nb02, e.codebooks, e.modes, src1, ids, dst, \
-            in, out, e.n_experts, ne11, n_expert_used, n_tokens, \
-            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2); break;
-        switch (n_tokens) {
-            MIX3_DEDUP_LAUNCH(1) MIX3_DEDUP_LAUNCH(2) MIX3_DEDUP_LAUNCH(3) MIX3_DEDUP_LAUNCH(4)
-            MIX3_DEDUP_LAUNCH(5) MIX3_DEDUP_LAUNCH(6) MIX3_DEDUP_LAUNCH(7) MIX3_DEDUP_LAUNCH(8)
-            default: break;
-        }
-#undef MIX3_DEDUP_LAUNCH
-#endif // defined(GGML_USE_HIP)
+        mix3_launch_dedup<0>(e, src1, ids, dst, in, out, n_expert_used, n_tokens, ne11,
+                             ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, 0.0f, stream);
     } else if (row3) {
         mix_matvec_rocmfp3_moe_kernel<0, 3><<<grid, dim3(threads), 0, stream>>>(
             (const uint8_t *) e.base, e.nb02, e.codebooks, e.modes,
@@ -1315,7 +1338,14 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_id_glu(
     const int rows_per_wave = row3 ? 3 : 2;
     const int rows_per_block = rows_per_wave * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
-    if (!two_pass) {
+    // Where the per-route path runs its two three-row passes, the dedup kernel
+    // runs them instead (up, then gate folding SwiGLU in place), bit-identical.
+    if (row3 && n_expert_used * n_tokens <= MIX_WARP && mix3_dedup_enabled(n_tokens)) {
+        mix3_launch_dedup<0>(eu, src1, ids, dst, in, out, n_expert_used, n_tokens, ne11,
+                             ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, 0.0f, stream);
+        mix3_launch_dedup<2>(eg, src1, ids, dst, in, out, n_expert_used, n_tokens, ne11,
+                             ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, glu_limit, stream);
+    } else if (!two_pass) {
         mix_matvec_rocmfp3_moe_kernel<1, 2><<<grid, dim3(threads), 0, stream>>>(
             (const uint8_t *) eu.base, eu.nb02, eu.codebooks, eu.modes,
             src1, ids, dst, in, out, eu.n_experts, ne11,
