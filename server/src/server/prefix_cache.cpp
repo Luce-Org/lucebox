@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <chrono>
 
@@ -327,6 +330,7 @@ PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer,
     : cap_(std::min(cap, MAX_CACHE_SLOTS))
     , max_resident_bytes_(max_resident_bytes)
 {
+    max_resident_bytes_published_.store(max_resident_bytes_, std::memory_order_relaxed);
     if (cap_ <= 0) {
         disabled_ = true;
         cap_ = 0;
@@ -567,6 +571,23 @@ void PrefixCache::release_inline_reservation(uint64_t id) {
     if (inline_reservation_active(id)) active_inline_reservation_ = 0;
 }
 
+namespace {
+// The whole value as a non-negative int, else `fallback` (also when unset).
+int env_nonneg_int(const char * name, int fallback) {
+    const char * v = std::getenv(name);
+    if (!v || !*v) return fallback;
+    char * end = nullptr;
+    errno = 0;
+    const long n = std::strtol(v, &end, 10);
+    if (errno != 0 || *end != '\0' || n < 0 || n > INT_MAX) {
+        std::fprintf(stderr, "[pc] ignoring %s=%s (want a non-negative integer); using %d\n",
+                     name, v, fallback);
+        return fallback;
+    }
+    return (int) n;
+}
+}  // namespace
+
 PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len,
@@ -579,6 +600,37 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
     if (disabled_ || active_inline_reservation_ != 0) return {};
 
     const auto candidates = find_all_boundaries(prompt_ids, markers_);
+    // A long tail past a short system/tools head (an agent's first turn, cold
+    // or with only the shared head restored): snapshot at the last message
+    // boundary instead of the head, or the first follow-up re-prefills the
+    // whole turn. That boundary is the end of the prompt unless the template
+    // appends tokens after it. Only a short head gives up its own pin this
+    // way, so a new conversation that shares it re-prefills at most
+    // LUCE_PC_DEEP_FIRST_MAX_HEAD tokens (default 2048).
+    // LUCE_PC_DEEP_FIRST_MIN is the tail length that triggers it (default
+    // 4096 tokens; 0 keeps the head pin). Values that are not a whole
+    // non-negative integer keep the defaults.
+    // Only the tool-request path pins the head, so only it changes. A forced
+    // pin still ahead of the restored prefix (an explicit pin_end, or PPP's
+    // pin of a head seen before) wins and keeps its protection, and a prompt
+    // the resident budget could never hold keeps the head pin instead of
+    // saving nothing.
+    static const int deep_first_min = env_nonneg_int("LUCE_PC_DEEP_FIRST_MIN", 4096);
+    static const int deep_first_max_head = env_nonneg_int("LUCE_PC_DEEP_FIRST_MAX_HEAD", 2048);
+    const auto whole_prompt_fits = [&]() {
+        if (max_resident_bytes_ == 0) return true;
+        const size_t bytes = estimate_bytes ? estimate_bytes((int) prompt_ids.size()) : 0;
+        return bytes != 0 && bytes <= max_resident_bytes_;
+    };
+    if (deep_first_min > 0 && prefer_tools_boundary && !candidates.empty() &&
+        restored_prefix_len <= candidates.front() &&
+        forced_cut <= restored_prefix_len &&
+        candidates.front() <= deep_first_max_head &&
+        (int) prompt_ids.size() - candidates.front() >= deep_first_min &&
+        whole_prompt_fits()) {
+        prefer_tools_boundary = false;
+        include_last_message = true;
+    }
     int target_cut = 0;
     bool forced = false;
     if (should_force_inline_snapshot_boundary(
@@ -1086,7 +1138,7 @@ PrefixCache::InlineStats PrefixCache::stats() const {
     out.in_use =
         (int)entries_size_count_.load(std::memory_order_relaxed);
     out.lifetime_hits = lifetime_hits_.load(std::memory_order_relaxed);
-    out.max_resident_bytes = (uint64_t)max_resident_bytes_;
+    out.max_resident_bytes = max_resident_bytes_published_.load(std::memory_order_relaxed);
     out.resident_bytes =
         resident_bytes_count_.load(std::memory_order_relaxed);
     out.budget_skips = budget_skips_.load(std::memory_order_relaxed);

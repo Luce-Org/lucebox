@@ -76,7 +76,7 @@ docs(hub): add DVFS methodology link
 ```
 
 Allowed types: `feat`, `fix`, `refactor`, `perf`, `docs`, `test`, `bench`, `build`, `chore`, `ci`, `revert`.
-The scope is required and lowercase, and the subject stays under 100 characters with no
+The scope is required and lowercase, and the subject stays within 300 characters with no
 trailing period. CI checks every commit in a pull request
 ([`commit-style.yml`](.github/workflows/commit-style.yml)).
 

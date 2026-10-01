@@ -35,7 +35,7 @@ TYPES = (
 )
 SUBJECT = re.compile(rf"^(?:{'|'.join(TYPES)})\([a-z0-9._/,-]+\)!?: \S")
 GITHUB_REVERT = re.compile(r'^Revert ".+"$')
-MAX_SUBJECT = 100
+MAX_SUBJECT = 300
 
 
 def problems(message: str) -> list[str]:

@@ -234,13 +234,22 @@ struct ModelBackend {
     virtual MemoryReport memory_report() const { return {}; }
 
     virtual bool snapshot_save(int slot) = 0;
+    // snapshot_save() between generations, where the backend may keep the
+    // live state as the snapshot and copy it out only before something
+    // changes that state. A restore of `slot` as the very next operation
+    // then continues the live state without any copy, and consumes it.
+    // snapshot_ref() sees it only after snapshot_flush_deferred().
+    virtual bool snapshot_save_deferred(int slot) { return snapshot_save(slot); }
+    // Copy a snapshot snapshot_save_deferred() kept live into its slot.
+    virtual void snapshot_flush_deferred() {}
     virtual void snapshot_free(int slot) = 0;
     virtual bool snapshot_used(int slot) const = 0;
     virtual int  snapshot_cur_pos(int slot) const = 0;
 
-    // Snapshots land on multiples of this many positions past the restore
-    // point, so a cut closer than one step to it cannot be saved. Qwen saves
-    // only at prefill chunk starts; exact-position backends return 1.
+    // A snapshot lands at least this many positions past the restore point,
+    // so a cut closer than that cannot be saved. Backends that start a
+    // prefill chunk at every restore point (Qwen: beyond this distance) save
+    // exactly there.
     virtual int snapshot_granularity() const { return 1; }
 
     // System-memory bytes a snapshot of the first `tokens` positions would
@@ -265,8 +274,16 @@ struct ModelBackend {
             slot, result.decode_s);
         GenerateRequest retry = req;
         retry.force_ar_decode = true;
-        return merge_empty_spec_retry_result(result,
-                                             restore_and_generate_impl(slot, retry, io));
+        if (snapshot_used(slot)) {
+            return merge_empty_spec_retry_result(
+                result, restore_and_generate_impl(slot, retry, io));
+        }
+        // A deferred snapshot the first attempt continued in place no
+        // longer exists (snapshot_save_deferred()); prefill the prompt.
+        GenerateResult merged =
+            merge_empty_spec_retry_result(result, generate_impl(retry, io));
+        merged.restored_prefix_tokens = 0;
+        return merged;
     }
 
     virtual GenerateResult restore_and_generate_impl(int slot,

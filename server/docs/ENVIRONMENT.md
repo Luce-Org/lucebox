@@ -21,6 +21,10 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_FA256_WMMA` | unset | A/B: =1 forces the rocWMMA kernel on head-256 RDNA4 shapes whose KV length is a multiple of 256, bypassing the KV-length crossover (requires a `GGML_HIP_ROCWMMA_FATTN` build). |
 | `LUCE_FA256_WMMA_MAX_KV` | 32768 | KV length above which the head-256 tensor-core route switches from the rocWMMA kernel to the raw-MMA kernel in `GGML_HIP_ROCWMMA_FATTN` builds (measured crossover on gfx1201). |
 | `LUCE_PAGED_WMMA` | unset (0) | BURN-IN: =1 routes paged full-attention layers (RDNA4, head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Differential-tested against the decode kernel; single-prompt TTFT -21% at 12K and -42% at 44K, batched 8K-pool prefill slightly ahead. |
+| `LUCE_MIX_WMMA_PREFILL` | 1 on RDNA3.5 | KILL SWITCH (burn-in): =0 returns prefill-sized ROCmFP2/FP3 MIX mul_mat_id batches to MMQ. By default they run on the F16 WMMA routed-expert GEMM (F16 operands, F32 accumulation, so not bit-identical to MMQ). |
+| `LUCE_MIX_WMMA_MIN_TOKENS` | 64 | Smallest batch (tokens) that takes the MIX WMMA GEMM; a whole number >= 1, anything else keeps the default. |
+| `LUCE_MIX_WMMA_BN` | auto (64 or 128) | A/B: force the MIX WMMA route-tile width (64, 96 or 128); by default it follows the mean routes per expert. |
+| `LUCE_MIX_WMMA_GLU` | 1 | =0 keeps the separate SwiGLU-DS4 kernel instead of folding it into the MIX WMMA up launch. |
 | `GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS` | unset | DEBUG: force the paged-attention context partition count (both routes) to bisect partition-overlap and overhead behaviour. |
 | `LUCE_QWEN35_MASK_FULL_WIDTH` | unset | KILL SWITCH (burn-in): =1 restores the full max_ctx-wide causal-mask upload on the Qwen3.5/3.6/3.8 prefill and verify paths. By default only the columns flash attention reads (the live window rounded up to 256, plus one 256 stride) are built and copied. |
 | `LUCE_PREFILL_UBATCH` | backend-dependent (512 in `qwen35_backend.cpp`; 16/384 in `layer_split_daemon.cpp`; `cfg_.chunk` in `qwen35_layer_split_adapter.cpp`) | Prefill ubatch. Under pooled kvflash prefill it is rounded down to a multiple of the pager chunk (never below one chunk) and clamped to the pool, instead of being forced to one chunk per ubatch. |
@@ -106,7 +110,11 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_DS4_SPEC` / `LUCE_DS4_DRAFT` / `LUCE_DS4_DRAFT_BACKEND` / `LUCE_DS4_DRAFT_GPU` | unset | OPT-IN: enable DeepSeek4 DSpark, select its draft GGUF, and optionally select the local drafter backend/device. See `DS4.md`. |
 | `LUCE_DS4_CUDA_LAYERS` | auto | Override the DeepSeek4 heterogeneous layer-split heuristic. See `DS4.md`. |
 | `LUCE_ROCMFP2_ROW4` | 1 on gfx1151 for q>2; legacy two-row kernel elsewhere | BURN-IN KILL SWITCH: =0 restores two-row-per-wave ROCmFP2 verification kernels. |
+| `LUCE_MIX_DEDUP` | 1 on gfx1151 | KILL SWITCH (burn-in): =0 returns ROCmFP2/FP3 MIX verify matvecs (small DSpark verify batches on gfx1151) to the per-route kernel. By default the workgroup of an expert's first route serves every route to it, decoding each weight block once; output is bit-identical. Follows the row4 (FP2) and row3 (FP3) opt-outs. |
+| `LUCE_MIX_DEDUP_MIN` | 3 | Smallest verify batch (tokens) that takes the dedup kernel; a whole number >= 1, anything else keeps the default. |
 | `LUCE_MULTI_MODEL_GRAPHS` | unset | =1 keeps GPU graph capture on when one process serves several model blocks (`--load-balancing`). By default the server sets `GGML_CUDA_DISABLE_GRAPHS=1` there, because concurrent captures from different model workers invalidate each other. |
+| `LUCE_PC_DEEP_FIRST_MIN` | 4096 | KILL SWITCH (burn-in): tail length, in tokens past a short system/tools head, at which a tool request's first turn is snapshotted whole instead of at the head, so the first follow-up only prefills the new turn. =0 keeps the head pin. Not applied when a forced pin is still ahead of the restored prefix or the whole prompt cannot fit the resident budget. |
+| `LUCE_PC_DEEP_FIRST_MAX_HEAD` | 2048 | Longest system/tools head (tokens) that gives up its own pin for the whole-prompt snapshot above; longer heads keep the head pin. |
 
 ## Full inventory (generated)
 
@@ -135,6 +143,10 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_COLD_THREADS` - moe_expert_compute_cpu.cpp
 - `LUCE_CUDA_BACKEND_PATH` - dynamic_backend.cpp
 - `LUCE_CUDA_MMVF_NARROW_F16` - ggml-cuda/mmvf.cu
+- `LUCE_MIX_WMMA_PREFILL` - ggml-cuda/mix-wmma-moe.cu
+- `LUCE_MIX_WMMA_MIN_TOKENS` - ggml-cuda/mix-wmma-moe.cu
+- `LUCE_MIX_WMMA_BN` - ggml-cuda/mix-wmma-moe.cu
+- `LUCE_MIX_WMMA_GLU` - ggml-cuda/ggml-cuda.cu
 - `LUCE_CUDA_MMVQ_FP4_X4` - deepseek4_backend.cpp, mmvq.cu
 - `LUCE_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS` - moe_hybrid_ffn_eval.cpp
 - `LUCE_CUDA_MMVQ_MOE_FP3_PACKED24` - deepseek4_backend.cpp, mmvq.cu
@@ -210,6 +222,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_QWEN35_ROCTX` - qwen35_roctx.cpp
 - `LUCE_DS4_SEQ_VERIFY` - deepseek4_dspark_spec.cpp
 - `LUCE_ROCMFP2_ROW4` - rocmfp2_mix.cu
+- `LUCE_MIX_DEDUP` - rocmfp2_mix.cu, rocmfp3_mix.cu
+- `LUCE_MIX_DEDUP_MIN` - rocmfp2_mix.cu, rocmfp3_mix.cu
 - `LUCE_DS4_SPEC` - deepseek4_backend.cpp
 - `LUCE_DS4_SPEC_REFERENCE_EXACT` - deepseek4_dspark_spec.cpp
 - `LUCE_DS4_SPEC_Q` - deepseek4_dspark_spec.cpp
@@ -406,6 +420,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_Q8_MEMO` - mmvq.cu (set to 0 to disable q8_1 activation memoisation; on by default)
 - `LUCE_MMQ_BIG_PREFILL` - mmq.cu (=0 disables the RDNA4 128-wide MMQ tiles for large prefill batches)
 - `LUCE_MMVQ_MAX_NCOLS` - deepseek4_backend.cpp
+- `LUCE_PC_DEEP_FIRST_MAX_HEAD` - prefix_cache.cpp
+- `LUCE_PC_DEEP_FIRST_MIN` - prefix_cache.cpp
 - `LUCE_QK_FUSE_LAYERS` - laguna_target_graph.cpp
 - `LUCE_QK_FUSE_MODE` - laguna_target_graph.cpp
 - `PFLASH_DRAFTER_EARLY_EXIT_N` - qwen3_graph.cpp
