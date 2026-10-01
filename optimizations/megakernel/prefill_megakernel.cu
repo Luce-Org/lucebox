@@ -628,20 +628,18 @@ __device__ void phase_qk_norm_rope(
             ss = mega_warp_sum(ss);
             float sc = rsqrtf(ss / FA_HEAD_DIM + RMS_EPS);
             sc = __shfl_sync(0xffffffff, sc, 0);
-            for (int i = lid; i < FA_HEAD_DIM; i += 32) {
-                float normed = __bfloat162float(qh[i]) * sc * (1.f + __bfloat162float(qnw[i]));
-                if (i < FA_ROT_DIM) {
-                    float fe = float(2 * (i % (FA_ROT_DIM / 2))) / FA_ROT_DIM;
-                    float freq = float(pos) / powf(FA_ROPE_THETA, fe);
-                    float cv = cosf(freq), sv = sinf(freq);
-                    int p = (i < FA_ROT_DIM / 2) ? i + FA_ROT_DIM / 2 : i - FA_ROT_DIM / 2;
-                    float pv = __bfloat162float(qh[p]) * sc * (1.f + __bfloat162float(qnw[p]));
-                    qh[i] = __float2bfloat16((i < FA_ROT_DIM / 2)
-                                              ? (normed * cv - pv * sv)
-                                              : (pv * sv + normed * cv));
-                } else {
-                    qh[i] = __float2bfloat16(normed);
-                }
+            // Preserve both normalized coordinates before updating this pair in place.
+            for (int i = lid; i < FA_ROT_DIM / 2; i += 32) {
+                int p = i + FA_ROT_DIM / 2;
+                float q0 = __bfloat162float(qh[i]) * sc * (1.f + __bfloat162float(qnw[i]));
+                float q1 = __bfloat162float(qh[p]) * sc * (1.f + __bfloat162float(qnw[p]));
+                float freq = float(pos) / powf(FA_ROPE_THETA, float(2 * i) / FA_ROT_DIM);
+                float cv = cosf(freq), sv = sinf(freq);
+                qh[i] = __float2bfloat16(q0 * cv - q1 * sv);
+                qh[p] = __float2bfloat16(q0 * sv + q1 * cv);
+            }
+            for (int i = FA_ROT_DIM + lid; i < FA_HEAD_DIM; i += 32) {
+                qh[i] = __float2bfloat16(__bfloat162float(qh[i]) * sc * (1.f + __bfloat162float(qnw[i])));
             }
         } else {
             int kidx = idx - total_q;
@@ -657,21 +655,20 @@ __device__ void phase_qk_norm_rope(
             ss = mega_warp_sum(ss);
             float sc = rsqrtf(ss / FA_HEAD_DIM + RMS_EPS);
             sc = __shfl_sync(0xffffffff, sc, 0);
-            for (int i = lid; i < FA_HEAD_DIM; i += 32) {
-                float normed = __bfloat162float(kh[i]) * sc * (1.f + __bfloat162float(knw[i]));
-                float fk;
-                if (i < FA_ROT_DIM) {
-                    float fe = float(2 * (i % (FA_ROT_DIM / 2))) / FA_ROT_DIM;
-                    float freq = float(pos) / powf(FA_ROPE_THETA, fe);
-                    float cv = cosf(freq), sv = sinf(freq);
-                    int p = (i < FA_ROT_DIM / 2) ? i + FA_ROT_DIM / 2 : i - FA_ROT_DIM / 2;
-                    float pv = __bfloat162float(kh[p]) * sc * (1.f + __bfloat162float(knw[p]));
-                    fk = (i < FA_ROT_DIM / 2) ? (normed * cv - pv * sv) : (pv * sv + normed * cv);
-                } else {
-                    fk = normed;
-                }
-                kh[i] = __float2bfloat16(fk);
-                kc[i] = __float2bfloat16(fk);
+            // K is also updated in place as well as copied to the cache.
+            for (int i = lid; i < FA_ROT_DIM / 2; i += 32) {
+                int p = i + FA_ROT_DIM / 2;
+                float k0 = __bfloat162float(kh[i]) * sc * (1.f + __bfloat162float(knw[i]));
+                float k1 = __bfloat162float(kh[p]) * sc * (1.f + __bfloat162float(knw[p]));
+                float freq = float(pos) / powf(FA_ROPE_THETA, float(2 * i) / FA_ROT_DIM);
+                float cv = cosf(freq), sv = sinf(freq);
+                kh[i] = kc[i] = __float2bfloat16(k0 * cv - k1 * sv);
+                kh[p] = kc[p] = __float2bfloat16(k0 * sv + k1 * cv);
+                vc[i] = vh[i];
+                vc[p] = vh[p];
+            }
+            for (int i = FA_ROT_DIM + lid; i < FA_HEAD_DIM; i += 32) {
+                kh[i] = kc[i] = __float2bfloat16(__bfloat162float(kh[i]) * sc * (1.f + __bfloat162float(knw[i])));
                 vc[i] = vh[i];
             }
         }

@@ -514,16 +514,19 @@ __device__ void full_attention_layer(
                 float ss = 0; for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) ss += qh_ptr[i]*qh_ptr[i];
                 ss = warp_reduce_sum(ss); float sc = rsqrtf(ss / float(FA_HEAD_DIM) + RMS_EPS);
                 sc = SHFL_SYNC(0xffffffff, sc, 0);
-                for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) {
-                    float normed = qh_ptr[i]*sc*(1.0f+H2F(__ldg(w.q_norm_weight+i)));
-                    if (i < FA_ROTARY_DIM) {
-                        float fe = float(2*(i%(FA_ROTARY_DIM/2))) / float(FA_ROTARY_DIM);
-                        float freq = float(position) / powf(FA_ROPE_THETA, fe);
-                        float cv = cosf(freq), sv = sinf(freq);
-                        int p = (i < FA_ROTARY_DIM/2) ? i+FA_ROTARY_DIM/2 : i-FA_ROTARY_DIM/2;
-                        float pv = qh_ptr[p]*sc*(1.0f+H2F(__ldg(w.q_norm_weight+p)));
-                        qh_ptr[i] = (i < FA_ROTARY_DIM/2) ? (normed*cv-pv*sv) : (pv*sv+normed*cv);
-                    } else { qh_ptr[i] = normed; }
+                // Each lane owns a rotary pair. Read both originals before either store.
+                for (int i = lane_id; i < FA_ROTARY_DIM/2; i += WARP_SIZE) {
+                    int p = i + FA_ROTARY_DIM/2;
+                    float q0 = qh_ptr[i]*sc*(1.0f+H2F(__ldg(w.q_norm_weight+i)));
+                    float q1 = qh_ptr[p]*sc*(1.0f+H2F(__ldg(w.q_norm_weight+p)));
+                    float fe = float(2*i) / float(FA_ROTARY_DIM);
+                    float freq = float(position) / powf(FA_ROPE_THETA, fe);
+                    float cv = cosf(freq), sv = sinf(freq);
+                    qh_ptr[i] = q0*cv - q1*sv;
+                    qh_ptr[p] = q0*sv + q1*cv;
+                }
+                for (int i = FA_ROTARY_DIM + lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) {
+                    qh_ptr[i] = qh_ptr[i]*sc*(1.0f+H2F(__ldg(w.q_norm_weight+i)));
                 }
             }
         }

@@ -244,14 +244,18 @@ __global__ void pf_qk_norm_rope(
         half_t *qh = q + pos * FA_QPROJ_SIZE + head * FA_HEAD_DIM * 2;
         float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(qh[i]); ss += v*v; }
         ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = SHFL_SYNC(0xffffffff,sc,0);
-        for (int i = lid; i < FA_HEAD_DIM; i += 32) {
-            float normed = H2F(qh[i])*sc*(1.f+H2F(qnw[i]));
-            if (i < FA_ROT_DIM) {
-                float fe=float(2*(i%(FA_ROT_DIM/2)))/FA_ROT_DIM; float freq=float(pos)/powf(FA_ROPE_THETA,fe);
-                float cv=cosf(freq),sv=sinf(freq); int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
-                float pv=H2F(qh[p])*sc*(1.f+H2F(qnw[p]));
-                qh[i]=F2H((i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv));
-            } else qh[i]=F2H(normed);
+        // Preserve both normalized coordinates before updating this pair in place.
+        for (int i = lid; i < FA_ROT_DIM/2; i += 32) {
+            int p = i + FA_ROT_DIM/2;
+            float q0 = H2F(qh[i])*sc*(1.f+H2F(qnw[i]));
+            float q1 = H2F(qh[p])*sc*(1.f+H2F(qnw[p]));
+            float freq = float(pos)/powf(FA_ROPE_THETA, float(2*i)/FA_ROT_DIM);
+            float cv = cosf(freq), sv = sinf(freq);
+            qh[i] = F2H(q0*cv - q1*sv);
+            qh[p] = F2H(q0*sv + q1*cv);
+        }
+        for (int i = FA_ROT_DIM + lid; i < FA_HEAD_DIM; i += 32) {
+            qh[i] = F2H(H2F(qh[i])*sc*(1.f+H2F(qnw[i])));
         }
     }
     int kidx = idx - total_q;
@@ -263,15 +267,20 @@ __global__ void pf_qk_norm_rope(
         half_t *vc = v_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
         float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(kh[i]); ss += v*v; }
         ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = SHFL_SYNC(0xffffffff,sc,0);
-        for (int i = lid; i < FA_HEAD_DIM; i += 32) {
-            float normed = H2F(kh[i])*sc*(1.f+H2F(knw[i])); float fk;
-            if (i < FA_ROT_DIM) {
-                float fe=float(2*(i%(FA_ROT_DIM/2)))/FA_ROT_DIM; float freq=float(pos)/powf(FA_ROPE_THETA,fe);
-                float cv=cosf(freq),sv=sinf(freq); int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
-                float pv=H2F(kh[p])*sc*(1.f+H2F(knw[p]));
-                fk=(i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv);
-            } else fk=normed;
-            kh[i]=F2H(fk); kc[i]=F2H(fk); vc[i]=vh[i];
+        // K is also updated in place as well as copied to the cache.
+        for (int i = lid; i < FA_ROT_DIM/2; i += 32) {
+            int p = i + FA_ROT_DIM/2;
+            float k0 = H2F(kh[i])*sc*(1.f+H2F(knw[i]));
+            float k1 = H2F(kh[p])*sc*(1.f+H2F(knw[p]));
+            float freq = float(pos)/powf(FA_ROPE_THETA, float(2*i)/FA_ROT_DIM);
+            float cv = cosf(freq), sv = sinf(freq);
+            kh[i] = kc[i] = F2H(k0*cv - k1*sv);
+            kh[p] = kc[p] = F2H(k0*sv + k1*cv);
+            vc[i] = vh[i]; vc[p] = vh[p];
+        }
+        for (int i = FA_ROT_DIM + lid; i < FA_HEAD_DIM; i += 32) {
+            kh[i] = kc[i] = F2H(H2F(kh[i])*sc*(1.f+H2F(knw[i])));
+            vc[i] = vh[i];
         }
     }
 }
@@ -1064,14 +1073,18 @@ __global__ void pf_qk_norm_rope_fused(
         half_t *qh = qkv_fused + pos * STRIDE + head * FA_HEAD_DIM * 2;
         float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(qh[i]); ss += v*v; }
         ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = SHFL_SYNC(0xffffffff,sc,0);
-        for (int i = lid; i < FA_HEAD_DIM; i += 32) {
-            float normed = H2F(qh[i])*sc*(1.f+H2F(qnw[i]));
-            if (i < FA_ROT_DIM) {
-                float fe=float(2*(i%(FA_ROT_DIM/2)))/FA_ROT_DIM; float freq=float(pos)/powf(FA_ROPE_THETA,fe);
-                float cv=cosf(freq),sv=sinf(freq); int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
-                float pv=H2F(qh[p])*sc*(1.f+H2F(qnw[p]));
-                qh[i]=F2H((i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv));
-            } else qh[i]=F2H(normed);
+        // Preserve both normalized coordinates before updating this pair in place.
+        for (int i = lid; i < FA_ROT_DIM/2; i += 32) {
+            int p = i + FA_ROT_DIM/2;
+            float q0 = H2F(qh[i])*sc*(1.f+H2F(qnw[i]));
+            float q1 = H2F(qh[p])*sc*(1.f+H2F(qnw[p]));
+            float freq = float(pos)/powf(FA_ROPE_THETA, float(2*i)/FA_ROT_DIM);
+            float cv = cosf(freq), sv = sinf(freq);
+            qh[i] = F2H(q0*cv - q1*sv);
+            qh[p] = F2H(q0*sv + q1*cv);
+        }
+        for (int i = FA_ROT_DIM + lid; i < FA_HEAD_DIM; i += 32) {
+            qh[i] = F2H(H2F(qh[i])*sc*(1.f+H2F(qnw[i])));
         }
     }
     int kidx = idx - total_q;
@@ -1083,15 +1096,20 @@ __global__ void pf_qk_norm_rope_fused(
         half_t *vc = v_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
         float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(kh[i]); ss += v*v; }
         ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = SHFL_SYNC(0xffffffff,sc,0);
-        for (int i = lid; i < FA_HEAD_DIM; i += 32) {
-            float normed = H2F(kh[i])*sc*(1.f+H2F(knw[i])); float fk;
-            if (i < FA_ROT_DIM) {
-                float fe=float(2*(i%(FA_ROT_DIM/2)))/FA_ROT_DIM; float freq=float(pos)/powf(FA_ROPE_THETA,fe);
-                float cv=cosf(freq),sv=sinf(freq); int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
-                float pv=H2F(kh[p])*sc*(1.f+H2F(knw[p]));
-                fk=(i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv);
-            } else fk=normed;
-            kh[i]=F2H(fk); kc[i]=F2H(fk); vc[i]=vh[i];
+        // K is also updated in place as well as copied to the cache.
+        for (int i = lid; i < FA_ROT_DIM/2; i += 32) {
+            int p = i + FA_ROT_DIM/2;
+            float k0 = H2F(kh[i])*sc*(1.f+H2F(knw[i]));
+            float k1 = H2F(kh[p])*sc*(1.f+H2F(knw[p]));
+            float freq = float(pos)/powf(FA_ROPE_THETA, float(2*i)/FA_ROT_DIM);
+            float cv = cosf(freq), sv = sinf(freq);
+            kh[i] = kc[i] = F2H(k0*cv - k1*sv);
+            kh[p] = kc[p] = F2H(k0*sv + k1*cv);
+            vc[i] = vh[i]; vc[p] = vh[p];
+        }
+        for (int i = FA_ROT_DIM + lid; i < FA_HEAD_DIM; i += 32) {
+            kh[i] = kc[i] = F2H(H2F(kh[i])*sc*(1.f+H2F(knw[i])));
+            vc[i] = vh[i];
         }
     }
 }

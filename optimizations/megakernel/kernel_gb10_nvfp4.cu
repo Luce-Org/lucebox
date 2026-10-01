@@ -944,20 +944,17 @@ static __device__ void full_attention_layer_nvfp4(
                 ss = warp_reduce_sum(ss);
                 float sc = rsqrtf(ss / float(FA_HEAD_DIM) + RMS_EPS);
                 sc = __shfl_sync(0xffffffff, sc, 0);
-                for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) {
-                    float wt = 1.0f + __bfloat162float(__ldg(w.q_norm_weight + i));
-                    float normed = qh_ptr[i] * sc * wt;
-                    if (i < FA_ROTARY_DIM) {
-                        int pair = i & ((FA_ROTARY_DIM / 2) - 1);
-                        int p = (i < FA_ROTARY_DIM / 2) ? i + FA_ROTARY_DIM / 2 : i - FA_ROTARY_DIM / 2;
-                        float pwt = 1.0f + __bfloat162float(__ldg(w.q_norm_weight + p));
-                        float pv = qh_ptr[p] * sc * pwt;
-                        float cv = s_rope_cos[pair];
-                        float sv = s_rope_sin[pair];
-                        qh_ptr[i] = (i < FA_ROTARY_DIM / 2) ? (normed * cv - pv * sv) : (pv * sv + normed * cv);
-                    } else {
-                        qh_ptr[i] = normed;
-                    }
+                // Each lane owns a rotary pair. Read both originals before either store.
+                for (int i = lane_id; i < FA_ROTARY_DIM / 2; i += WARP_SIZE) {
+                    int p = i + FA_ROTARY_DIM / 2;
+                    float q0 = qh_ptr[i] * sc * (1.0f + __bfloat162float(__ldg(w.q_norm_weight + i)));
+                    float q1 = qh_ptr[p] * sc * (1.0f + __bfloat162float(__ldg(w.q_norm_weight + p)));
+                    float cv = s_rope_cos[i], sv = s_rope_sin[i];
+                    qh_ptr[i] = q0 * cv - q1 * sv;
+                    qh_ptr[p] = q0 * sv + q1 * cv;
+                }
+                for (int i = FA_ROTARY_DIM + lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) {
+                    qh_ptr[i] = qh_ptr[i] * sc * (1.0f + __bfloat162float(__ldg(w.q_norm_weight + i)));
                 }
             }
         }
