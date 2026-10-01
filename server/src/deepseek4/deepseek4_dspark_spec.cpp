@@ -1475,6 +1475,9 @@ bool run_deepseek4_dspark_spec_decode(
                 forcing, forcing ? q - 1 : 0, accept, hook_bonus, hook_st);
             bonus = hook_bonus;
         }
+        // The hook replaced this step's bonus with the close token (and may
+        // have cut the step short there).
+        const bool close_bonus = hook_on && !hook_was_started && hook_st.started;
         const int matched = accept - 1;                       // accepted candidates
         const int commit_pos = pos + accept;                  // seed + accepted candidates in KV
 
@@ -1592,7 +1595,10 @@ bool run_deepseek4_dspark_spec_decode(
         const int fN = full_snap ? target.last_verify_n() : accept;
         push_features(feats.data(), fN);
         tm_feat += spec_ms_since(t0);
-        if (!forcing) {
+        // Forced steps and the step the hook cut short say nothing about the
+        // drafter: keep both out of the width controller and the statistics.
+        const bool hook_step = forcing || close_bonus;
+        if (!hook_step) {
             width_controller.observe(
                 accept, q, (float) spec_ms_since(step_t0));
             if (use_confidence_width) {
@@ -1600,10 +1606,8 @@ bool run_deepseek4_dspark_spec_decode(
             }
         }
 
-        // The hook replaced this step's bonus with the close token. It only
-        // counts as fired once that token is emitted: an EOS or stop earlier
-        // in the step ends the stream first, as it would under AR.
-        const bool close_bonus = hook_on && !hook_was_started && hook_st.started;
+        // The close token only counts as fired once it is emitted: an EOS or
+        // stop earlier in the step ends the stream first, as it would under AR.
         // Output tokens this step = accepted candidates + bonus.
         bool hit_eos = false;
         for (int i = 1; i <= accept; i++) {
@@ -1627,7 +1631,7 @@ bool run_deepseek4_dspark_spec_decode(
         }
         pos = commit_pos;              // seed + accepted candidates now in KV
         lt = bonus;                    // deferred bonus becomes next seed
-        if (!forcing) {                // forced drafts say nothing about the drafter
+        if (!hook_step) {
             accept_sum += matched;
             offered_sum += q - 1;
         }
