@@ -31,7 +31,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `GGML_CUDA_GRAPH_STATS` | unset | DEBUG: per-graph CUDA-graph replay/capture/eager counters. |
 | `GGML_CUDA_GRAPH_STATS_EVERY` | 200 | DEBUG: print period for the stats above (clamped to >=1). |
 | `LUCE_HIP_NO_AUTO_UMA` | unset (1: qwen4exp gfx1151) | `1` disables automatic unified-memory placement on integrated GPUs. qwen4exp on gfx1151 defaults it, `GGML_CUDA_MMB=1`, `QWEN4EXP_MMB_CUBLAS=5`, `LUCE_MMB_SHADOW=1`, `LLAMA_MMB_HC16=2` and `QWEN4EXP_QSA=1` (its qualified prefill profile) unless the variable is set or `QWEN4EXP_UPSTREAM=1`. |
-| `QWEN4EXP_QSA` | 0 (1: qwen4exp gfx1151) | `1` enables qwen4exp prefill selected attention (gfx1151 only). Decode remains dense. |
+| `QWEN4EXP_QSA` | 0 (1: qwen4exp gfx1151) | `1` enables qwen4exp selected attention (QSA) at prefill and decode, as the reference model does past 2,048 context tokens (qualified on gfx1151 only). |
 | `QWEN4EXP_MMB_CUBLAS` | 0 (5: qwen4exp gfx1151) | Qwen4exp validated bf16-shadow dense route (`1`, `3`, or `5`). Mode `2` is diagnostic only. |
 | `LUCE_MMB_SHADOW` | 2 (1: qwen4exp gfx1151) | Shared MMB bf16 weight-shadow policy (`0` off, `1` IQ4_NL/Q5_K, `2` Q6_K). |
 | `LUCE_MMB_Q8F16` | 1 | KILL SWITCH: =0 returns MMB Q8_0 dense GEMMs (T>=512, gfx1151) from the Q8->F16 WMMA kernel (`mmb-q8f16.cuh`) to the bf16 tile. |
