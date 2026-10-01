@@ -21,6 +21,7 @@
 #include "rocmfp2_mix.cuh"
 #include "rocmfp3_mix.cuh"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -361,13 +362,29 @@ __global__ void mix_wmma_zero_masked(const int32_t * __restrict__ ids, int si1, 
 
 }  // namespace
 
-bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, const ggml_tensor * src1,
-                                    const ggml_tensor * ids, int64_t n_tokens, int cc) {
-    // On by default; LUCE_MIX_WMMA_PREFILL=0 returns these batches to MMQ.
+// On by default; LUCE_MIX_WMMA_PREFILL=0 returns these batches to MMQ.
+static bool mix_wmma_prefill_enabled() {
     static const bool enabled = [] {
         const char * v = std::getenv("LUCE_MIX_WMMA_PREFILL");
         return !(v && std::strcmp(v, "0") == 0);
     }();
+    return enabled;
+}
+
+static std::atomic<uint64_t> g_mix_wmma_launches{0};
+
+bool ggml_cuda_mix_wmma_moe_available(int device) {
+    return mix_wmma_prefill_enabled() && device >= 0 && device < ggml_cuda_info().device_count &&
+           GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc);
+}
+
+uint64_t ggml_cuda_mix_wmma_moe_launch_count() {
+    return g_mix_wmma_launches.load(std::memory_order_relaxed);
+}
+
+bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, const ggml_tensor * src1,
+                                    const ggml_tensor * ids, int64_t n_tokens, int cc) {
+    const bool enabled = mix_wmma_prefill_enabled();
     // A whole number >= 1; anything else keeps the default (0 would send
     // decode batches here).
     static const int min_tokens = [] {
@@ -488,6 +505,7 @@ static void mix_wmma_moe_run(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
     }
     CUDA_CHECK(cudaGetLastError());
+    g_mix_wmma_launches.fetch_add(1, std::memory_order_relaxed);
 }
 
 void ggml_cuda_mix_wmma_moe(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,

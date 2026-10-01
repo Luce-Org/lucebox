@@ -79,6 +79,9 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_id_glu(
     int64_t dst_s1, int64_t dst_s2,
     float glu_limit, cudaStream_t stream);
 
+bool ggml_cuda_mix_wmma_moe_available(int device);
+uint64_t ggml_cuda_mix_wmma_moe_launch_count();
+
 static int g_fails = 0;
 
 #define CHECK(cond)                                                            \
@@ -509,12 +512,18 @@ void RocmfpMixGateupGluFixture::check_prefill_mul_mat_id(bool fp3) {
     const std::vector<float> poison(yn, 1.0e9f);
     ggml_backend_tensor_set(product, poison.data(), 0, yn * sizeof(float));
     REQUIRE_TRUE(register_mix(weight->data, rows_bytes, n_experts, out, in, books.data(), modes.data()));
+    const uint64_t wmma_before = ggml_cuda_mix_wmma_moe_launch_count();
     {
         luce::common::ScopedCudaGraphOverrides scope(/*disable_graphs=*/true);
         REQUIRE_TRUE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
     }
     std::vector<float> got(yn);
     ggml_backend_tensor_get(product, got.data(), 0, yn * sizeof(float));
+    // Where WMMA is available the batch must have taken it, so an MMQ
+    // fallback cannot pass for the kernel.
+    if (ggml_cuda_mix_wmma_moe_available(device)) {
+        CHECK(ggml_cuda_mix_wmma_moe_launch_count() > wmma_before);
+    }
     unregister_mix(weight->data);
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);

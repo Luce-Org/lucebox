@@ -3098,7 +3098,11 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
                 const char * v = std::getenv("LUCE_MIX_WMMA_GLU");
                 return !(v && v[0] == '0');
             }();
-            const bool wmma = ids && ggml_cuda_mix_wmma_moe_enabled(up->src[0], src1, ids, ncols, cc);
+            // The pair launches assume one weight type and shape; any other
+            // pair stays on MMQ.
+            const bool wmma = ids && up->src[0]->type == gate->src[0]->type &&
+                ggml_are_same_shape(up->src[0], gate->src[0]) &&
+                ggml_cuda_mix_wmma_moe_enabled(up->src[0], src1, ids, ncols, cc);
             if (wmma && wmma_glu &&
                 glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_DS4 &&
                 glu->src[0] && glu->src[1] && glu->src[0]->data == gate->data && glu->src[1]->data == up->data &&
