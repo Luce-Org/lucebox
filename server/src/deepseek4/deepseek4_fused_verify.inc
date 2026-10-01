@@ -1263,9 +1263,19 @@ static bool ds4_build_fused_verify_graph(
             // head-plus-tail reduction order without padding the two-route
             // tail with duplicate zero-weight expert paths.
             // A streamed layer posts its routes once, so it keeps them whole.
+            // Tokenwise verify lanes keep them whole as well: the q=1 graph
+            // sums all six routes in one combine, and the 4 + 2 decomposition
+            // sums them in another order, so a batched verify built with it
+            // differs from decode by rounding (H200, DS4.1-Flash: the first
+            // differing cache bytes appear at layer 1 of the first verify;
+            // with whole routes the q=3 verify and q=1 decode are bit-identical).
+            // LUCE_DS4_TP_HEAD4_TAIL2=1 restores the decomposition for bisection.
+            static const bool legacy_head4_tail2 =
+                ds4_env_flag("LUCE_DS4_TP_HEAD4_TAIL2");
             const bool native_route_width =
                 !same_gpu_runtime ||
-                mixed_policy.native_route_width || streamed;
+                mixed_policy.native_route_width || streamed ||
+                (n_lanes > 1 && !legacy_head4_tail2);
             if (lane_q > 1 && hybrid_cfg.n_expert_used > 4 && has_hot_routed &&
                 !native_route_width) {
                 const int route_width = hybrid_cfg.n_expert_used;

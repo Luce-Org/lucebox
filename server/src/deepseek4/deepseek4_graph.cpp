@@ -2270,8 +2270,10 @@ static ggml_tensor * build_mla_output_projection(
     // The grouped source layout is read by MMQ's activation quantizer and by
     // nothing else, so a projection stored unquantized (BF16 attention from a
     // converter that leaves dense tensors alone) takes the plain path.
+    // MXFP8 (native FP8 dense) has no MMQ, so it also takes the plain path.
     const bool grouped_output_projection =
         allow_grouped && n_tokens > 1 && ggml_is_quantized(L.attn_output_b->type) &&
+        L.attn_output_b->type != GGML_TYPE_MXFP8 &&
         !ds4_env_flag("LUCE_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
     if (grouped_output_projection) {
         return ggml_mul_mat_grouped_src(ctx, L.attn_output_b, attn_low);

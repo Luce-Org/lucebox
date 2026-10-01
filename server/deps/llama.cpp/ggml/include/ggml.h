@@ -442,7 +442,8 @@ extern "C" {
         GGML_TYPE_Q3_1_ROCMFP3_MIX  = 105, // per-expert mixed absmax/adaptive ROCmFP3 (P4); codebook in GGUF KV
         GGML_TYPE_Q2_1_ROCMFP2_MIX  = 106, // per-expert mixed absmax/adaptive ROCmFP2 (gate/up); codebook in sidecar
         GGML_TYPE_Q2_0_ROCMFP2      = 107,
-        GGML_TYPE_COUNT   = 108,
+        GGML_TYPE_MXFP8   = 117, // E4M3 codes + one E8M0 scale per 32; 264 B per 256 weights (lossless for DS4.1 native FP8)
+        GGML_TYPE_COUNT   = 118,
     };
 
     // precision
