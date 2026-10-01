@@ -6,6 +6,7 @@
 #include <cmath>
 #include <map>
 #include <random>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -102,12 +103,13 @@ TEST_CASE(Ds4SpecSamplingFixture, distribution_matches_reference_chain) {
     std::vector<int32_t> history;
     for (int i = 0; i < 300; i++) history.push_back((i * 37) % 2000);
 
-    std::vector<SamplerCfg> cfgs(5);
+    std::vector<SamplerCfg> cfgs(6);
     cfgs[0].temp = 0.7f; cfgs[0].top_p = 0.95f;                     // nucleus over the full vocab
     cfgs[1].temp = 1.0f;                                             // plain softmax
     cfgs[2].temp = 0.8f; cfgs[2].top_k = 40; cfgs[2].top_p = 0.9f;   // top_k then top_p
     cfgs[3].temp = 0.6f; cfgs[3].top_p = 0.5f; cfgs[3].rep_pen = 1.15f;
     cfgs[4].temp = 1.0f; cfgs[4].top_p = 0.99f; cfgs[4].freq_pen = 0.4f; cfgs[4].pres_pen = 0.3f;
+    cfgs[5].temp = 0.8f; cfgs[5].top_k = 50;                         // top_k only
 
     std::vector<std::pair<float, int>> dist;
     for (const auto & cfg : cfgs) {
@@ -213,6 +215,84 @@ TEST_CASE(Ds4SpecSamplingFixture, row_pool_runs_every_row_once) {
         std::vector<int> hits((size_t) n, 0);
         const std::function<void(int)> fn = [&](int i) { hits[(size_t) i]++; };
         pool.run(n, fn);
+        for (int h : hits) CHECK(h == 1);
+    }
+}
+
+TEST_CASE(Ds4SpecSamplingFixture, greedy_penalties_match_the_cpu_chain_bit_for_bit) {
+    // temp 0 with penalties is an argmax over penalized logits, so the rows
+    // must apply the penalties with the CPU chain's float operations in its
+    // order (repetition, then frequency, then presence), or a near tie can
+    // pick a different token than the AR draw. Logits on a coarse grid make
+    // ties and last-bit differences common.
+    const int vocab = 64;
+    std::mt19937_64 rng(5);
+    std::uniform_int_distribution<int> level(0, 20), tok(0, vocab - 1);
+    SamplerCfg cfg;
+    cfg.temp = 0.0f; cfg.rep_pen = 1.1f; cfg.freq_pen = 0.1f; cfg.pres_pen = 0.3f;
+    std::vector<std::pair<float, int>> dist;
+    int mismatches = 0;
+    for (int trial = 0; trial < 20000; trial++) {
+        std::vector<float> logits((size_t) vocab);
+        for (float & l : logits) l = 0.1f * (float) level(rng) - 0.7f;
+        std::vector<int32_t> history(30);
+        for (auto & t : history) t = tok(rng);
+        std::vector<float> z = logits;
+        std::unordered_map<int, int> counts;
+        for (int t : history) counts[t]++;
+        for (auto & kv : counts) {
+            float & l = z[(size_t) kv.first];
+            l = l > 0.0f ? l / cfg.rep_pen : l * cfg.rep_pen;
+            l -= cfg.freq_pen * kv.second;
+            l -= cfg.pres_pen;
+        }
+        const int want = (int) (std::max_element(z.begin(), z.end()) - z.begin());
+        sampler_distribution(logits.data(), vocab, cfg, history, dist);
+        mismatches += dist.size() != 1 || dist[0].second != want;
+    }
+    CHECK(mismatches == 0);
+}
+
+TEST_CASE(Ds4SpecSamplingFixture, candidate_outside_the_nucleus_is_never_kept) {
+    // p(d) = 0 for a candidate the nucleus cuts: it must be rejected every
+    // time, and the redraw must come from the nucleus.
+    const int vocab = 32;
+    const auto logits = random_logits(vocab, 21, 2.0f);
+    SamplerCfg cfg;
+    cfg.temp = 0.8f; cfg.top_p = 0.5f;
+    std::vector<std::pair<float, int>> row0, row1;
+    sampler_distribution(logits.data(), vocab, cfg, {}, row0);
+    sampler_distribution(logits.data(), vocab, cfg, {}, row1);
+    const int outside = (int) (std::min_element(logits.begin(), logits.end()) - logits.begin());
+    std::unordered_set<int> nucleus;
+    for (auto & e : row0) nucleus.insert(e.second);
+    REQUIRE_TRUE(!nucleus.count(outside));
+    const int32_t draft[2] = {0, outside};
+    std::mt19937_64 rng(3);
+    for (int t = 0; t < 10000; t++) {
+        std::vector<std::vector<std::pair<float, int>>> rows = {row0, row1};
+        const DSparkSampleStep s = dspark_spec_sample_accept(rows, draft, 2, rng);
+        CHECK(s.accept == 1);
+        CHECK(s.bonus != outside && nucleus.count(s.bonus) == 1);
+    }
+}
+
+TEST_CASE(Ds4SpecSamplingFixture, row_pool_propagates_a_failing_row) {
+    DSparkRowPool pool(3);
+    for (int bad = 0; bad < 5; bad++) {      // the caller's rows and the workers'
+        const std::function<void(int)> fn = [&](int i) {
+            if (i == bad) throw std::runtime_error("row failed");
+        };
+        bool threw = false;
+        try {
+            pool.run(5, fn);
+        } catch (const std::runtime_error &) {
+            threw = true;
+        }
+        CHECK(threw);
+        std::vector<int> hits(4, 0);           // and the pool still works
+        const std::function<void(int)> ok = [&](int i) { hits[(size_t) i]++; };
+        pool.run(4, ok);
         for (int h : hits) CHECK(h == 1);
     }
 }

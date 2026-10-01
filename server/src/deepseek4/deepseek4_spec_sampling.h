@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <random>
@@ -62,18 +63,31 @@ public:
     DSparkRowPool(const DSparkRowPool &) = delete;
     DSparkRowPool & operator=(const DSparkRowPool &) = delete;
 
+    // A row that throws (here or on a worker) is rethrown once every worker
+    // is done with `fn`; the first failure wins and the pool stays usable.
     void run(int n, const std::function<void(int)> & fn) {
-        const int n_workers = std::min(n - 1, (int) threads_.size());
+        const int n_workers = std::max(0, std::min(n - 1, (int) threads_.size()));
         {
             std::lock_guard<std::mutex> lk(mu_);
-            fn_ = &fn; n_jobs_ = n_workers; pending_ = n_workers; gen_++;
+            fn_ = &fn; n_jobs_ = n_workers; pending_ = n_workers; error_ = nullptr; gen_++;
         }
         cv_.notify_all();
-        fn(0);
-        for (int i = n_workers + 1; i < n; i++) fn(i);   // more rows than workers
-        std::unique_lock<std::mutex> lk(mu_);
-        done_cv_.wait(lk, [this] { return pending_ == 0; });
-        fn_ = nullptr;
+        std::exception_ptr local;
+        try {
+            if (n > 0) fn(0);
+            for (int i = n_workers + 1; i < n; i++) fn(i);   // more rows than workers
+        } catch (...) {
+            local = std::current_exception();
+        }
+        std::exception_ptr err;
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            done_cv_.wait(lk, [this] { return pending_ == 0; });
+            fn_ = nullptr;
+            err = local ? local : error_;
+            error_ = nullptr;
+        }
+        if (err) std::rethrow_exception(err);
     }
 
 private:
@@ -89,9 +103,15 @@ private:
                 if (w >= n_jobs_) continue;
                 fn = fn_;
             }
-            (*fn)(w + 1);
+            std::exception_ptr err;
+            try {
+                (*fn)(w + 1);
+            } catch (...) {
+                err = std::current_exception();
+            }
             {
                 std::lock_guard<std::mutex> lk(mu_);
+                if (err && !error_) error_ = err;
                 if (--pending_ == 0) done_cv_.notify_one();
             }
         }
@@ -101,6 +121,7 @@ private:
     std::mutex mu_;
     std::condition_variable cv_, done_cv_;
     const std::function<void(int)> * fn_ = nullptr;
+    std::exception_ptr error_;
     int n_jobs_ = 0, pending_ = 0;
     uint64_t gen_ = 0;
     bool stop_ = false;

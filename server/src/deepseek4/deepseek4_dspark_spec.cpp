@@ -141,11 +141,17 @@ public:
         return true;
     }
 
+    // Hands the verify logits over instead of copying them (q rows of the
+    // full vocabulary per sampled step): one read per verify, and the next
+    // verify rebuilds the buffer. A second read fails rather than return a
+    // stale step.
     bool read_verify_logits(int n_tokens, std::vector<float> & out) override {
         if (!keep_logits_ || verify_logits_.empty()) return false;
         const size_t need = (size_t) n_tokens * w_.n_vocab;
         if (verify_logits_.size() < need) return false;
-        out.assign(verify_logits_.begin(), verify_logits_.begin() + need);
+        out.swap(verify_logits_);
+        out.resize(need);
+        verify_logits_.clear();
         return true;
     }
 
