@@ -1494,6 +1494,16 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         general_arch,
         /*repo_root_hint=*/"");
 
+    // Qwen3.8-Flash-Next renders with the GGUF's own chat template (reasoning-effort instruction, thinking default,
+    // tool format), as llama.cpp does, unless --chat-template-file overrides it.
+    if (general_arch == "qwen4exp" && sconfig.chat_template_src.empty() &&
+        !backend_model.metadata.chat_template.empty()) {
+        sconfig.chat_template_src = backend_model.metadata.chat_template;
+        sconfig.chat_template_path = "gguf:tokenizer.chat_template";
+        std::fprintf(stderr, "[server] using the GGUF chat template (%zu bytes)\n",
+                     sconfig.chat_template_src.size());
+    }
+
     // Apply each tunable to sconfig only if the operator did NOT set it
     // via CLI. CLI always wins (spec §3.1 source #1).
     //

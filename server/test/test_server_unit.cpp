@@ -4422,6 +4422,46 @@ static ParsedRequest resolve_qwen_reasoning(const json & body) {
     return req;
 }
 
+static ParsedRequest resolve_qwen4exp_reasoning(const json & body) {
+    ServerConfig config = deepseek_reasoning_test_config();
+    config.arch = "qwen4exp";
+    ParsedRequest req;
+    req.max_output = 1000;
+    apply_request_reasoning(body, config, req);
+    return req;
+}
+
+// Qwen3.8-Flash-Next's official template thinks by default (reasoning effort xhigh); an omitted thinking field must
+// keep it on, with the budget envelope active so the reply reserve applies. Explicit off still wins. Other Qwen
+// architectures keep the server's thinking-off default.
+TEST_CASE(ServerUnitFixture, test_qwen4exp_thinks_by_default) {
+    const ParsedRequest by_default = resolve_qwen4exp_reasoning(json::object());
+    TEST_ASSERT(by_default.thinking_enabled && by_default.thinking_opt_in);
+    const ParsedRequest off = resolve_qwen4exp_reasoning({{"thinking", {{"type", "disabled"}}}});
+    TEST_ASSERT(!off.thinking_enabled && !off.thinking_opt_in);
+    const ParsedRequest kw_off = resolve_qwen4exp_reasoning({{"chat_template_kwargs", {{"enable_thinking", false}}}});
+    TEST_ASSERT(!kw_off.thinking_enabled && !kw_off.thinking_opt_in);
+    TEST_ASSERT(!resolve_qwen_reasoning(json::object()).thinking_enabled);
+}
+
+// Qwen3.8-Flash-Next's template knows low, medium and xhigh (its default); Lucebox's high, x-high and max map to xhigh.
+TEST_CASE(ServerUnitFixture, test_qwen4exp_template_effort_mapping) {
+    TEST_ASSERT(qwen4exp_template_effort("") == "");
+    TEST_ASSERT(qwen4exp_template_effort("low") == "low");
+    TEST_ASSERT(qwen4exp_template_effort("medium") == "medium");
+    TEST_ASSERT(qwen4exp_template_effort("high") == "xhigh");
+    TEST_ASSERT(qwen4exp_template_effort("x-high") == "xhigh");
+    TEST_ASSERT(qwen4exp_template_effort("max") == "xhigh");
+}
+
+// The Jinja path hands the reasoning effort to the template only when one is set (templates default it themselves).
+TEST_CASE(ServerUnitFixture, test_jinja_render_passes_reasoning_effort) {
+    const std::string tmpl = "{% if reasoning_effort is defined %}{{ reasoning_effort }}{% else %}unset{% endif %}";
+    const std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    TEST_ASSERT(render_chat_template_jinja(tmpl, msgs, "", "", true, true, "", "low") == "low");
+    TEST_ASSERT(render_chat_template_jinja(tmpl, msgs, "", "", true, true, "") == "unset");
+}
+
 TEST_CASE(ServerUnitFixture, test_deepseek_reasoning_effort_aliases_and_budgets) {
     struct Case {
         const char * requested;

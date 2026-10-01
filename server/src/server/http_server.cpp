@@ -2182,15 +2182,16 @@ void apply_request_reasoning(
     // Explicit thinking budgets override reasoning-effort tiers. Template
     // kwargs can still override whether the rendered prompt enables thinking.
     // Default: thinking OFF (Qwen3.6 thinking wrecks DFlash acceptance
-    // rates; clients opt in explicitly).
-    bool enable_thinking = false;
+    // rates; clients opt in explicitly). Qwen3.8-Flash-Next's own template
+    // thinks by default, so it keeps the budget envelope on unless disabled.
+    bool enable_thinking = config.arch == "qwen4exp";
     int request_budget_tokens = -1;
     int request_reply_budget = -1;
     int effort_phase1_cap = -1;
     bool effort_set = false;
     std::string normalized_effort;
 
-    req.thinking_opt_in = false;
+    req.thinking_opt_in = enable_thinking;
     req.per_req_phase1_cap = -1;
     req.per_req_reply_budget = -1;
 
@@ -2370,7 +2371,8 @@ bool HttpServer::render_messages_to_text(
             rendered = render_chat_template_jinja(
                 config_.chat_template_src, chat_messages, bos, eos,
                 add_generation_prompt,
-                req.thinking_enabled, tools_json);
+                req.thinking_enabled, tools_json,
+                config_.arch == "qwen4exp" ? qwen4exp_template_effort(req.reasoning_effort) : std::string());
         } catch (const std::exception & e) {
             error = std::string("chat template (jinja) render failed: ") + e.what();
             return false;

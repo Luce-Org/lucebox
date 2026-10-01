@@ -13,6 +13,7 @@ namespace luce::common {
 struct GgufModelInfo {
     std::string arch;       // e.g. "qwen35", "laguna", "qwen3", "gemma4"
     std::string name;       // optional general.name display string
+    std::string chat_template;  // optional tokenizer.chat_template (Jinja source)
     int         n_layer = -1;  // target layers used for inference
 };
 
