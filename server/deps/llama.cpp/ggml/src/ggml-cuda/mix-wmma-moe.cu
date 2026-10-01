@@ -6,7 +6,8 @@
 // the same float product the dequantize kernels round to half) and eight
 // waves accumulate it against 64 gathered F16 routes on the matrix cores.
 //
-// On by default on RDNA3 (LUCE_MIX_WMMA_PREFILL=0 disables); other GPUs keep MMQ.
+// On by default on RDNA3.5 (gfx115x, the arch it is validated on;
+// LUCE_MIX_WMMA_PREFILL=0 disables); other GPUs keep MMQ.
 //
 // The structure (dequantize a weight tile into padded LDS, then accumulate it
 // on the WMMA units against gathered routed activations) follows Piotr
@@ -344,6 +345,20 @@ __launch_bounds__(kThreads) __global__ void mix_wmma_moe_kernel(
 #endif
 }
 
+// Masked owner routes (negative expert ids) are compacted out of the tiles,
+// so no tile writes their destination column (route r = token *
+// n_expert_used + slot, as in ids_dst). MMQ clears all of dst for this;
+// clearing only these columns keeps their contribution exactly zero.
+__global__ void mix_wmma_zero_masked(const int32_t * __restrict__ ids, int si1, int n_expert_used,
+                                     float * __restrict__ dst, int64_t s1, int m) {
+    const int64_t r = blockIdx.x;
+    const int64_t t = r / n_expert_used;
+    const int j = (int) (r % n_expert_used);
+    if (ids[t * si1 + j] >= 0) return;
+    float * col = dst + r * s1;
+    for (int i = threadIdx.x; i < m; i += blockDim.x) col[i] = 0.0f;
+}
+
 }  // namespace
 
 bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, const ggml_tensor * src1,
@@ -357,7 +372,7 @@ bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, const ggml_tensor 
         const char * v = std::getenv("LUCE_MIX_WMMA_MIN_TOKENS");
         return v && *v ? std::atoi(v) : 64;
     }();
-    if (!enabled || !GGML_CUDA_CC_IS_RDNA3(cc)) return false;
+    if (!enabled || !GGML_CUDA_CC_IS_RDNA3_5(cc)) return false;
     if (src0->type != GGML_TYPE_Q2_1_ROCMFP2_MIX && src0->type != GGML_TYPE_Q3_1_ROCMFP3_MIX) return false;
     if (!(n_tokens >= min_tokens && src0->ne[0] % kBK2 == 0 && src0->ne[1] % kBM == 0 && src0->ne[2] <= 1024)) {
         return false;
@@ -442,6 +457,8 @@ static void mix_wmma_moe_run(ggml_backend_cuda_context & ctx, const ggml_tensor 
         GGML_ASSERT(fp2 ? ggml_cuda_rocmfp2_mix_mmq_info(w->data, &codebooks, &modes)
                         : ggml_cuda_rocmfp3_mix_mmq_info(w->data, &codebooks, &modes));
         const int64_t s1 = dst->nb[1] / sizeof(float);
+        mix_wmma_zero_masked<<<(unsigned) n_routes, 256, 0, stream>>>(
+            (const int32_t *) ids->data, si1, (int) n_expert_used, (float *) dst->data, s1, (int) m);
         // The last weight may apply SwiGLU-DS4 against an already computed gate.
         const bool fuse = glu_gate && wi == n_weights - 1;
         const float * gate_ptr = fuse ? (const float *) glu_gate->data : nullptr;

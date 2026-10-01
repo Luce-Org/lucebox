@@ -40,6 +40,7 @@
 using CppUnitTestFramework::CommonFixture;
 #undef CHECK
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -128,6 +129,7 @@ namespace {
 struct RocmfpMixGateupGluFixture : CommonFixture {
     using CommonFixture::CommonFixture;
     void check_fused_gateup_glu(bool fp3);
+    void check_prefill_mul_mat_id(bool fp3);
 };
 }
 
@@ -412,6 +414,147 @@ void RocmfpMixGateupGluFixture::check_fused_gateup_glu(bool fp3) {
     if (g_fails) { std::fprintf(stderr, "%d FAILURE(S)\n", g_fails); REQUIRE_TRUE(false); }
     std::fprintf(stderr, "OK: fused gate/up GLU matches the unfused pair, order is respected, "
                          "half-registered/mismatched pairs are refused, and out-of-range ids zero\n");
+}
+
+// Prefill-sized batches of the MIX types take the F16 WMMA GEMM on RDNA3.5
+// (mix-wmma-moe.cu; LUCE_MMID_TELEMETRY=1 logs path=mix_wmma) and MMQ
+// elsewhere. Either way the graph result must match the registry's exact
+// per-route dots, run in verify-sized chunks, within F16 rounding, and masked
+// owner routes (negative ids) must come out exactly zero: no route tile writes
+// them, so a poisoned destination must not survive.
+void RocmfpMixGateupGluFixture::check_prefill_mul_mat_id(bool fp3) {
+    g_fails = 0;
+    const int BLOCK_BYTES = fp3 ? 14 : 10;
+    const int K = fp3 ? 8 : 4;
+    const auto register_mix = fp3 ? ggml_cuda_rocmfp3_mix_register_host : ggml_cuda_rocmfp2_mix_register_host;
+    const auto unregister_mix = fp3 ? ggml_cuda_rocmfp3_mix_unregister : ggml_cuda_rocmfp2_mix_unregister;
+    const auto mul_mat_id = fp3 ? ggml_cuda_rocmfp3_mix_mul_mat_id : ggml_cuda_rocmfp2_mix_mul_mat_id;
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
+        SKIP("no HIP device available");
+    }
+    int device = 0;
+    HIP_OK(cudaGetDevice(&device));
+
+    // WMMA needs K % 64 == 0, M % 128 == 0 and at least 64 tokens.
+    const int in = 256, out = 128, n_experts = 16, n_used = 6, ntok = 96;
+    const int nb = in / QK;
+    const size_t rows_bytes = (size_t) out * nb * BLOCK_BYTES;
+    std::vector<uint8_t> w(rows_bytes * n_experts);
+    for (auto & b : w) b = (uint8_t) rnd();
+    for (size_t blk = 0; blk < w.size() / BLOCK_BYTES; ++blk) {
+        uint8_t * meta = &w[blk * BLOCK_BYTES + BLOCK_BYTES - 2];
+        meta[0] = (uint8_t) (0x30 | (meta[0] & 0x80));
+        meta[1] = (uint8_t) (0x30 | (meta[1] & 0x80));
+    }
+    std::vector<uint16_t> books((size_t) n_experts * 2 * K);
+    for (size_t i = 0; i < books.size(); ++i) books[i] = f32_to_bf16(-1.0f + 0.37f * (float) (i % 7));
+    std::vector<uint8_t> modes(n_experts);
+    for (int e = 0; e < n_experts; ++e) modes[e] = (uint8_t) (e % 2);  // fixed and learned levels
+
+    const size_t xn = (size_t) in * ntok;
+    const size_t yn = (size_t) out * n_used * ntok;
+    std::vector<float> xh(xn);
+    for (size_t i = 0; i < xn; ++i) xh[i] = -0.75f + 0.03f * (float) (i % 51);
+    // Distinct experts per token; every fourth token masks one slot, as the
+    // two-device owner split does for routes the other device serves.
+    std::vector<int32_t> idsh((size_t) n_used * ntok);
+    for (int t = 0; t < ntok; ++t) {
+        for (int j = 0; j < n_used; ++j) {
+            idsh[(size_t) t * n_used + j] = (t % 4 == 1 && j == 2) ? -1 : (t * 5 + j * 3) % n_experts;
+        }
+    }
+
+    // Reference: the exact per-route dots, at most the paged cap per launch.
+    void * d_w = nullptr;
+    float * d_x = nullptr, * d_ref = nullptr;
+    int32_t * d_ids = nullptr;
+    HIP_OK(cudaMalloc(&d_w, w.size()));
+    HIP_OK(cudaMalloc(&d_x, sizeof(float) * xn));
+    HIP_OK(cudaMalloc(&d_ref, sizeof(float) * yn));
+    HIP_OK(cudaMalloc(&d_ids, sizeof(int32_t) * idsh.size()));
+    HIP_OK(cudaMemcpy(d_w, w.data(), w.size(), cudaMemcpyHostToDevice));
+    HIP_OK(cudaMemcpy(d_x, xh.data(), sizeof(float) * xn, cudaMemcpyHostToDevice));
+    HIP_OK(cudaMemcpy(d_ids, idsh.data(), sizeof(int32_t) * idsh.size(), cudaMemcpyHostToDevice));
+    REQUIRE_TRUE(register_mix(d_w, rows_bytes, n_experts, out, in, books.data(), modes.data()));
+    for (int t0 = 0; t0 < ntok; t0 += GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS) {
+        const int n = std::min(GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS, ntok - t0);
+        CHECK(mul_mat_id(d_w, d_x + (size_t) t0 * in, d_ids + (size_t) t0 * n_used,
+                         d_ref + (size_t) t0 * out * n_used, in, out, n_used, n, 1,
+                         1, n_used, 0, in, out, (int64_t) out * n_used, nullptr));
+    }
+    HIP_OK(cudaDeviceSynchronize());
+    std::vector<float> ref(yn);
+    HIP_OK(cudaMemcpy(ref.data(), d_ref, sizeof(float) * yn, cudaMemcpyDeviceToHost));
+    unregister_mix(d_w);
+    HIP_OK(cudaFree(d_w)); HIP_OK(cudaFree(d_x)); HIP_OK(cudaFree(d_ref)); HIP_OK(cudaFree(d_ids));
+
+    // The graph dispatcher on a poisoned destination.
+    ggml_backend_t backend = ggml_backend_cuda_init(device);
+    REQUIRE_TRUE(backend != nullptr);
+    ggml_context * ctx = ggml_init({ggml_tensor_overhead()*32 + ggml_graph_overhead_custom(32, false), nullptr, true});
+    REQUIRE_TRUE(ctx != nullptr);
+    const auto type = fp3 ? GGML_TYPE_Q3_1_ROCMFP3_MIX : GGML_TYPE_Q2_1_ROCMFP2_MIX;
+    auto * weight = ggml_new_tensor_3d(ctx, type, in, out, n_experts);
+    auto * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, in, 1, ntok);
+    auto * routing = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, ntok);
+    auto * product = ggml_mul_mat_id(ctx, weight, input, routing);
+    auto * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, product);
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    REQUIRE_TRUE(buffer != nullptr);
+    ggml_backend_tensor_set(weight, w.data(), 0, w.size());
+    ggml_backend_tensor_set(input, xh.data(), 0, xn * sizeof(float));
+    ggml_backend_tensor_set(routing, idsh.data(), 0, idsh.size() * sizeof(int32_t));
+    const std::vector<float> poison(yn, 1.0e9f);
+    ggml_backend_tensor_set(product, poison.data(), 0, yn * sizeof(float));
+    REQUIRE_TRUE(register_mix(weight->data, rows_bytes, n_experts, out, in, books.data(), modes.data()));
+    {
+        luce::common::ScopedCudaGraphOverrides scope(/*disable_graphs=*/true);
+        REQUIRE_TRUE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    }
+    std::vector<float> got(yn);
+    ggml_backend_tensor_get(product, got.data(), 0, yn * sizeof(float));
+    unregister_mix(weight->data);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    int masked_bad = 0, routes = 0;
+    double worst = 0.0, mag = 0.0;
+    for (int t = 0; t < ntok; ++t) {
+        for (int j = 0; j < n_used; ++j) {
+            const size_t col = ((size_t) t * n_used + j) * out;
+            if (idsh[(size_t) t * n_used + j] < 0) {
+                for (int i = 0; i < out; ++i) masked_bad += got[col + i] != 0.0f;
+                continue;
+            }
+            double err = 0.0, norm = 0.0;
+            for (int i = 0; i < out; ++i) {
+                CHECK(std::isfinite(got[col + i]));
+                const double d = (double) got[col + i] - (double) ref[col + i];
+                err += d * d;
+                norm += (double) ref[col + i] * ref[col + i];
+            }
+            worst = std::fmax(worst, std::sqrt(err / std::fmax(norm, 1e-12)));
+            mag += norm;
+            ++routes;
+        }
+    }
+    std::fprintf(stderr, "prefill %s: %d routes, worst relative L2 error vs route dots %.3e, "
+                 "nonzero masked values %d\n", fp3 ? "fp3" : "fp2", routes, worst, masked_bad);
+    CHECK(mag > 0.0);
+    CHECK(masked_bad == 0);
+    CHECK(worst < 5e-3);  // F16 operands, F32 accumulation; a wiring error is O(1)
+    if (g_fails) { std::fprintf(stderr, "%d FAILURE(S)\n", g_fails); REQUIRE_TRUE(false); }
+}
+
+TEST_CASE(RocmfpMixGateupGluFixture, fp2_prefill_batch_matches_route_dots) {
+    check_prefill_mul_mat_id(false);
+}
+
+TEST_CASE(RocmfpMixGateupGluFixture, fp3_prefill_batch_matches_route_dots) {
+    check_prefill_mul_mat_id(true);
 }
 
 TEST_CASE(RocmfpMixGateupGluFixture, fp2_fused_gateup_glu_and_paged_dispatch) {

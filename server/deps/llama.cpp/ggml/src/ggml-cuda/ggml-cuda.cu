@@ -3091,7 +3091,7 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
             ggml_mul_mat_get_mixed_mmq(up) == ggml_mul_mat_get_mixed_mmq(gate) &&
             !(ggml_cuda_mmvq_max_ncols_override > 0 &&
               ncols <= ggml_cuda_mmvq_max_ncols_override)) {
-            // RDNA3 prefill: ROCmFP2/FP3 MIX experts on the F16 WMMA GEMM
+            // RDNA3.5 prefill: ROCmFP2/FP3 MIX experts on the F16 WMMA GEMM
             // (mix-wmma-moe.cu). When the GLU reads exactly this gate/up
             // pair, SwiGLU-DS4 runs in the up launch's epilogue.
             static const bool wmma_glu = [] {
