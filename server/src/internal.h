@@ -645,6 +645,10 @@ bool snapshot_target_cache(const TargetWeights & w,
 // those will be repopulated by the first decode step's verify forward.
 bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache);
 
+// Zero the full-attention K/V rows at positions >= `pos` (what a
+// clear-then-restore leaves past a restored prefix).
+void clear_kv_rows_from(TargetCache & cache, int pos);
+
 // Free the snapshot's GPU buffers.
 void free_prefix_snapshot(PrefixSnapshot & snap);
 

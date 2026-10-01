@@ -96,7 +96,11 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_DS4_SPEC` / `LUCE_DS4_DRAFT` / `LUCE_DS4_DRAFT_BACKEND` / `LUCE_DS4_DRAFT_GPU` | unset | OPT-IN: enable DeepSeek4 DSpark, select its draft GGUF, and optionally select the local drafter backend/device. See `DS4.md`. |
 | `LUCE_DS4_CUDA_LAYERS` | auto | Override the DeepSeek4 heterogeneous layer-split heuristic. See `DS4.md`. |
 | `LUCE_ROCMFP2_ROW4` | 1 on gfx1151 for q>2; legacy two-row kernel elsewhere | BURN-IN KILL SWITCH: =0 restores two-row-per-wave ROCmFP2 verification kernels. |
+| `LUCE_MIX_DEDUP` | 1 on gfx1151 | KILL SWITCH (burn-in): =0 returns ROCmFP2/FP3 MIX verify matvecs (small DSpark verify batches on gfx1151) to the per-route kernel. By default the workgroup of an expert's first route serves every route to it, decoding each weight block once; output is bit-identical. Follows the row4 (FP2) and row3 (FP3) opt-outs. |
+| `LUCE_MIX_DEDUP_MIN` | 3 | Smallest verify batch (tokens) that takes the dedup kernel; a whole number >= 1, anything else keeps the default. |
 | `LUCE_MULTI_MODEL_GRAPHS` | unset | =1 keeps GPU graph capture on when one process serves several model blocks (`--load-balancing`). By default the server sets `GGML_CUDA_DISABLE_GRAPHS=1` there, because concurrent captures from different model workers invalidate each other. |
+| `LUCE_PC_DEEP_FIRST_MIN` | 4096 | KILL SWITCH (burn-in): tail length, in tokens past a short system/tools head, at which a tool request's first turn is snapshotted whole instead of at the head, so the first follow-up only prefills the new turn. =0 keeps the head pin. Not applied when a forced pin is still ahead of the restored prefix or the whole prompt cannot fit the resident budget. |
+| `LUCE_PC_DEEP_FIRST_MAX_HEAD` | 2048 | Longest system/tools head (tokens) that gives up its own pin for the whole-prompt snapshot above; longer heads keep the head pin. |
 
 ## Full inventory (generated)
 
@@ -204,6 +208,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_QWEN35_ROCTX` - qwen35_roctx.cpp
 - `LUCE_DS4_SEQ_VERIFY` - deepseek4_dspark_spec.cpp
 - `LUCE_ROCMFP2_ROW4` - rocmfp2_mix.cu
+- `LUCE_MIX_DEDUP` - rocmfp2_mix.cu, rocmfp3_mix.cu
+- `LUCE_MIX_DEDUP_MIN` - rocmfp2_mix.cu, rocmfp3_mix.cu
 - `LUCE_DS4_SPEC` - deepseek4_backend.cpp
 - `LUCE_DS4_SPEC_REFERENCE_EXACT` - deepseek4_dspark_spec.cpp
 - `LUCE_DS4_SPEC_Q` - deepseek4_dspark_spec.cpp
@@ -400,6 +406,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_Q8_MEMO` - mmvq.cu (set to 0 to disable q8_1 activation memoisation; on by default)
 - `LUCE_MMQ_BIG_PREFILL` - mmq.cu (=0 disables the RDNA4 128-wide MMQ tiles for large prefill batches)
 - `LUCE_MMVQ_MAX_NCOLS` - deepseek4_backend.cpp
+- `LUCE_PC_DEEP_FIRST_MAX_HEAD` - prefix_cache.cpp
+- `LUCE_PC_DEEP_FIRST_MIN` - prefix_cache.cpp
 - `LUCE_QK_FUSE_LAYERS` - laguna_target_graph.cpp
 - `LUCE_QK_FUSE_MODE` - laguna_target_graph.cpp
 - `PFLASH_DRAFTER_EARLY_EXIT_N` - qwen3_graph.cpp

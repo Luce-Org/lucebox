@@ -8,6 +8,7 @@
 // standalone swiglu_ds4 kernel applies, not a re-derivation of the formula.
 #include "unary.cuh"
 #include <cstdlib>
+#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -1118,6 +1119,233 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     }
 }
 
+static constexpr int MIX_DEDUP_MAX_ROUTES = 8;
+
+#if defined(GGML_USE_HIP)
+// Expert-deduplicated MoE matvec for small verify batches. Tokens in one
+// DSpark verify share about a third of their routed experts (q=5: 30 routes ->
+// ~20 distinct experts per layer), and the per-(token, slot) kernel above
+// decodes and reads a shared expert once per route. Here the workgroup of an
+// expert's FIRST route serves every route to it: each weight block is decoded
+// once and folded into one accumulator per route, and duplicate routes retire
+// at once. The route count is a compile-time template argument so accumulators
+// and activation pointers stay in registers, and the fixed/adaptive mode branch
+// sits outside the weight loop. Every dot keeps mix_block_accum4's term order,
+// so results are bit-identical. gfx1151, q5 realistic routing: gate/up 0.307 ->
+// 0.276 ms per matrix. Used for q >= 3 (LUCE_MIX_DEDUP_MIN); q <= 2 keeps the
+// one-pass GLU kernel. LUCE_MIX_DEDUP=0 disables.
+
+// Body for an owner workgroup serving NR routes of one expert. NR is a
+// compile-time constant so every per-route pointer and accumulator stays in
+// registers.
+template <int GLU_MODE, int NR, int MODE>
+__device__ __forceinline__ void mix_dedup_body(
+        const uint8_t * __restrict__ edata, const float * __restrict__ s_lut,
+        const float * const (&xcol)[NR], const int64_t (&obase)[NR],
+        float * __restrict__ dst, int in, int out, int row0, int lane, float glu_limit) {
+    constexpr int R = 4;
+    const int nb = in / MIX_QK;
+    const uint8_t * rb[R];
+    #pragma unroll
+    for (int k = 0; k < R; ++k) {
+        rb[k] = edata + (int64_t) ((row0 + k < out) ? row0 + k : row0) * nb * MIX_BLOCK_BYTES;
+    }
+    float acc[NR][R];
+    #pragma unroll
+    for (int r = 0; r < NR; ++r)
+        #pragma unroll
+        for (int k = 0; k < R; ++k) acc[r][k] = 0.0f;
+    for (int blk = lane; blk < nb; blk += MIX_WARP) {
+        uint64_t codes[R];
+        uint16_t meta[R];
+        #pragma unroll
+        for (int k = 0; k < R; ++k) {
+            const uint8_t * b = rb[k] + (int64_t) blk * MIX_BLOCK_BYTES;
+            MIX_MEMCPY(&codes[k], b, sizeof(uint64_t));
+            MIX_MEMCPY(&meta[k], b + MIX_QS, sizeof(uint16_t));
+        }
+        float s_lo[R], s_hi[R];
+        const float * bk_lo[R];
+        const float * bk_hi[R];
+        #pragma unroll
+        for (int k = 0; k < R; ++k) {
+            const uint8_t m0 = (uint8_t) meta[k], m1 = (uint8_t) (meta[k] >> 8);
+            s_lo[k] = mix_ue4m3(MODE == 0 ? m0 : (uint8_t) (m0 & 0x7F));
+            s_hi[k] = mix_ue4m3(MODE == 0 ? m1 : (uint8_t) (m1 & 0x7F));
+            bk_lo[k] = s_lut + (m0 >> 7) * MIX_K;
+            bk_hi[k] = s_lut + (m1 >> 7) * MIX_K;
+        }
+        const int col0 = blk * MIX_QK;
+        #pragma unroll
+        for (int j = 0; j < MIX_QK; ++j) {
+            float w[R];
+            #pragma unroll
+            for (int k = 0; k < R; ++k) {
+                const uint32_t c = mix_fp2_code_u64(codes[k], j);
+                float lvl;
+                if constexpr (MODE == 0) lvl = mix_fp2_fixed(c);
+                else                     lvl = ((j < MIX_QK/2) ? bk_lo[k] : bk_hi[k])[c];
+                w[k] = ((j < MIX_QK/2) ? s_lo[k] : s_hi[k]) * lvl;
+            }
+            #pragma unroll
+            for (int r = 0; r < NR; ++r) {
+                const float x = xcol[r][col0 + j];
+                #pragma unroll
+                for (int k = 0; k < R; ++k) acc[r][k] += w[k] * x;
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        #pragma unroll
+        for (int k = 0; k < R; ++k) {
+            #pragma unroll
+            for (int off = MIX_WARP/2; off > 0; off >>= 1) acc[r][k] += mix_warp_shfl_down(acc[r][k], off);
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int k = 0; k < R; ++k) {
+                if (row0 + k < out) {
+                    const int64_t o = obase[r] + k;
+                    dst[o] = GLU_MODE == 2 ? ggml_cuda_op_swiglu_ds4_single(acc[r][k], dst[o], glu_limit)
+                                           : acc[r][k];
+                }
+            }
+        }
+    }
+}
+
+template <int GLU_MODE, int NR>
+__device__ __forceinline__ void mix_dedup_dispatch(
+        uint64_t route_mask, int n_used, const float * __restrict__ src1, int ne11,
+        int64_t src1_s1, int64_t src1_s2, int64_t dst_s1, int64_t dst_s2,
+        const uint8_t * __restrict__ edata, int mode, const float * __restrict__ s_lut,
+        float * __restrict__ dst, int in, int out, int row0, int lane, float glu_limit) {
+    const float * xcol[NR];
+    int64_t obase[NR];
+    #pragma unroll
+    for (int i = 0; i < NR; ++i) {
+        const int p = __builtin_ctzll(route_mask);
+        route_mask &= route_mask - 1;
+        const int token = p / n_used, slot = p % n_used;
+        xcol[i]  = src1 + (int64_t) token * src1_s2 + (int64_t) (slot % ne11) * src1_s1;
+        obase[i] = (int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0;
+    }
+    if (mode == 0) mix_dedup_body<GLU_MODE, NR, 0>(edata, s_lut, xcol, obase, dst, in, out, row0, lane, glu_limit);
+    else           mix_dedup_body<GLU_MODE, NR, 1>(edata, s_lut, xcol, obase, dst, in, out, row0, lane, glu_limit);
+}
+
+// Grid (out/4, n_used * n_tokens). The workgroup of an expert's first route
+// serves every route to it; later duplicates retire immediately. MAXT (the
+// batch's token count) bounds the routes per expert, since a token routes to
+// an expert at most once, and sizes the register budget.
+template <int GLU_MODE, int MAXT>
+__global__ void __launch_bounds__(MIX_WARP) mix_matvec_rocmfp2_moe_dedup_kernel(
+        const uint8_t * __restrict__ data, size_t nb02,
+        const nv_bfloat16 * __restrict__ codebooks, const uint8_t * __restrict__ modes,
+        const float * __restrict__ src1, const int32_t * __restrict__ ids,
+        float * __restrict__ dst, int in, int out, int n_experts, int ne11,
+        int n_used, int n_tokens,
+        int64_t ids_s0, int64_t ids_s1, int64_t src1_s1, int64_t src1_s2,
+        int64_t dst_s1, int64_t dst_s2, float glu_limit) {
+    const int lane = threadIdx.x;
+    const int row0 = blockIdx.x * 4;
+    const int pair = blockIdx.y;
+    const int n_pairs = n_used * n_tokens;
+    // One routing id per lane (n_pairs <= MIX_WARP, checked by the launcher);
+    // a ballot gives every route to this workgroup's expert at once.
+    const int my_id = lane < n_pairs
+        ? ids[(int64_t) (lane / n_used) * ids_s1 + (int64_t) (lane % n_used) * ids_s0] : INT_MIN;
+    const int expert = __shfl(my_id, pair, MIX_WARP);
+    // Only real routes vote: padded lanes hold INT_MIN, which a corrupt id
+    // could equal, and would then add out-of-range routes to the mask.
+    const uint64_t route_mask = (uint64_t) __ballot(lane < n_pairs && my_id == expert) & 0xFFFFFFFFull;
+    if (__builtin_ctzll(route_mask) != pair) return;   // a lower route owns this expert
+    const bool bad_expert = expert < 0 || expert >= n_experts;
+    __shared__ float s_lut[2 * MIX_K];
+    if (!bad_expert && lane < 2 * MIX_K) {
+        s_lut[lane] = __bfloat162float(codebooks[(int64_t) expert * 2 * MIX_K + lane]);
+    }
+    __syncthreads();
+    if (row0 >= out) return;
+    if (bad_expert) {
+        if (lane == 0) {
+            for (uint64_t m = route_mask; m; m &= m - 1) {
+                const int p = __builtin_ctzll(m);
+                const int64_t o = (int64_t) (p / n_used) * dst_s2 + (int64_t) (p % n_used) * dst_s1 + row0;
+                for (int k = 0; k < 4 && row0 + k < out; ++k) dst[o + k] = 0.0f;
+            }
+        }
+        return;
+    }
+    const uint8_t * edata = data + (int64_t) expert * nb02;
+    const int mode = (int) modes[expert];
+    // Routes are served in chunks of at most CAP, so every route is computed
+    // even if a token's route row repeats an expert (more routes than tokens). Each
+    // route's output is independent, so chunking does not change results.
+    constexpr int CAP = MAXT < 8 ? MAXT : 8;
+    uint64_t rest = route_mask;
+    while (rest) {
+        uint64_t chunk = 0;
+        int n = 0;
+        for (uint64_t m = rest; m && n < CAP; m &= m - 1, ++n) chunk |= m & (~m + 1);
+        rest &= ~chunk;
+#define MIX_DEDUP_CASE(N) \
+        case N: if constexpr (N <= CAP) mix_dedup_dispatch<GLU_MODE, N>(chunk, n_used, src1, ne11, src1_s1, src1_s2, dst_s1, dst_s2, edata, mode, s_lut, dst, in, out, \
+            row0, lane, glu_limit); break;
+        switch (n) {
+            MIX_DEDUP_CASE(1) MIX_DEDUP_CASE(2) MIX_DEDUP_CASE(3) MIX_DEDUP_CASE(4)
+            MIX_DEDUP_CASE(5) MIX_DEDUP_CASE(6) MIX_DEDUP_CASE(7) MIX_DEDUP_CASE(8)
+            default: break;
+        }
+#undef MIX_DEDUP_CASE
+    }
+}
+
+static int mix_dedup_min_tokens() {
+    // A whole number >= 1; anything else keeps the default.
+    static const int v = [] {
+        const char * e = std::getenv("LUCE_MIX_DEDUP_MIN");
+        char * end = nullptr;
+        const long n = e && *e ? std::strtol(e, &end, 10) : 0;
+        return (end && *end == '\0' && n >= 1 && n <= 64) ? (int) n : 3;
+    }();
+    return v;
+}
+
+static bool mix_dedup_enabled() {
+    static const bool on = [] { const char * v = std::getenv("LUCE_MIX_DEDUP"); return !(v && v[0] == '0'); }();
+    return on;
+}
+
+template <int GLU_MODE>
+static void mix_launch_dedup(const MixEntry & e, const float * src1, const int32_t * ids, float * dst,
+                             int in, int out, int n_used, int n_tokens, int ne11,
+                             int64_t ids_s0, int64_t ids_s1, int64_t src1_s1, int64_t src1_s2,
+                             int64_t dst_s1, int64_t dst_s2, float glu_limit, cudaStream_t stream) {
+    dim3 grid((out + 3) / 4, n_used * n_tokens, 1);
+#define MIX_DEDUP_LAUNCH(T) \
+    case T: mix_matvec_rocmfp2_moe_dedup_kernel<GLU_MODE, T><<<grid, dim3(MIX_WARP), 0, stream>>>( \
+        (const uint8_t *) e.base, e.nb02, e.codebooks, e.modes, src1, ids, dst, \
+        in, out, e.n_experts, ne11, n_used, n_tokens, \
+        ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, glu_limit); break;
+    switch (n_tokens) {
+        MIX_DEDUP_LAUNCH(1) MIX_DEDUP_LAUNCH(2) MIX_DEDUP_LAUNCH(3) MIX_DEDUP_LAUNCH(4)
+        MIX_DEDUP_LAUNCH(5) MIX_DEDUP_LAUNCH(6) MIX_DEDUP_LAUNCH(7) MIX_DEDUP_LAUNCH(8)
+        default: break;
+    }
+#undef MIX_DEDUP_LAUNCH
+}
+#else
+// The dedup kernel uses AMD wave intrinsics; CUDA builds keep the per-route kernel.
+static int mix_dedup_min_tokens() { return INT_MAX; }
+static bool mix_dedup_enabled() { return false; }
+template <int GLU_MODE>
+static void mix_launch_dedup(const MixEntry &, const float *, const int32_t *, float *,
+                             int, int, int, int, int, int64_t, int64_t, int64_t, int64_t,
+                             int64_t, int64_t, float, cudaStream_t) {}
+#endif // defined(GGML_USE_HIP)
+
 // Launch the sync-free MoE matvec for a qtype-106 mul_mat_id. Resolves the
 // tensor's registry entry (base/nb02/codebooks/modes for ALL experts) from vx;
 // the per-expert index is read on device. Returns false if the tensor is not
@@ -1183,7 +1411,12 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id(
     const int threads = warps_per_block * MIX_WARP;
     const int rows_per_block = (row4 ? 4 : 2) * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
-    if (row4) {
+    if (e.gfx1151 && n_tokens >= mix_dedup_min_tokens() && n_tokens <= MIX_DEDUP_MAX_ROUTES &&
+        n_expert_used * n_tokens <= MIX_WARP && mix_dedup_enabled() &&
+        mix_gfx1151_row4_enabled()) {
+        mix_launch_dedup<0>(e, src1, ids, dst, in, out, n_expert_used, n_tokens, ne11,
+                            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, 0.0f, stream);
+    } else if (row4) {
         mix_matvec_rocmfp2_moe_kernel<0, 4><<<grid, dim3(threads), 0, stream>>>(
             (const uint8_t *) e.base, e.nb02, e.codebooks, e.modes,
             src1, ids, dst, in, out, e.n_experts, ne11,
@@ -1233,7 +1466,14 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
     const int threads = warps_per_block * MIX_WARP;
     const int rows_per_block = (row4 ? 4 : 2) * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
-    if (!strix_tuned || n_tokens <= 2) {
+    if (strix_tuned && n_tokens >= mix_dedup_min_tokens() && n_tokens <= MIX_DEDUP_MAX_ROUTES &&
+        n_expert_used * n_tokens <= MIX_WARP && mix_dedup_enabled() &&
+        mix_gfx1151_row4_enabled()) {
+        mix_launch_dedup<0>(eu, src1, ids, dst, in, out, n_expert_used, n_tokens, ne11,
+                            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, 0.0f, stream);
+        mix_launch_dedup<2>(eg, src1, ids, dst, in, out, n_expert_used, n_tokens, ne11,
+                            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, glu_limit, stream);
+    } else if (!strix_tuned || n_tokens <= 2) {
         mix_matvec_rocmfp2_moe_kernel<1, 2><<<grid, dim3(threads), 0, stream>>>(
             (const uint8_t *) eu.base, eu.nb02, eu.codebooks, eu.modes,
             src1, ids, dst, in, out, eu.n_experts, ne11,

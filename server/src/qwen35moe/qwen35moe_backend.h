@@ -29,6 +29,8 @@ public:
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,
                                              const DaemonIO & io) override;
+    // These generation paths neither continue nor copy out a live state.
+    bool snapshot_save_deferred(int slot) override { return snapshot_save(slot); }
     bool supports_dflash_spec_decode() const override { return true; }
 
     bool set_routing_collector(MoeRoutingCollector * c) override { routing_collector_ = c; return true; }
