@@ -510,35 +510,15 @@ static ggml_tensor * qsa_pooled_keys(ggml_context * c, ggml_cgraph * gf, const Q
     return ggml_reshape_3d(c, all, idim, n_after, 1);
 }
 
-static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
-        ggml_tensor * Q, ggml_tensor * Kf, ggml_tensor * Vf,
-        const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, int64_t ratio,
-        ggml_tensor * positions, int64_t kv_pad, int64_t kv_len, int64_t kv_start,
-        ggml_tensor * pooled, int64_t nb, bool packed) {
-    const int64_t idim   = w.indexer_head_size;
-    const int64_t nih    = w.indexer_n_head;
-    const int64_t r      = ratio;
-    const int64_t T      = cur->ne[1];
-    const int64_t budget = w.indexer_top_k / r;
-    const float   eps    = w.rms_eps;
-    const float   qscale = 1.0f / std::sqrt((float) w.n_embd_head_k);
-    int sections[4] = { w.rope_sections[0], w.rope_sections[1], w.rope_sections[2], w.rope_sections[3] };
-
-    ggml_tensor * qi = mm(c, L.indexer_q_proj, cur);              // [idim*nih, T]
-    qi = ggml_reshape_3d(c, qi, idim, nih, T);
-    qi = ggml_mul(c, ggml_rms_norm(c, qi, eps), L.indexer_q_norm);
-    qi = ggml_rope_multi(c, qi, positions, nullptr, w.rope_dimension_count, sections,
-        GGML_ROPE_TYPE_MROPE, 0, w.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    if (!ggml_is_contiguous(qi)) qi = ggml_cont(c, qi);
-
-    ggml_tensor * comp16 = ggml_cast(c,
-        ggml_reshape_2d(c, ggml_cont(c, pooled), idim, nb), GGML_TYPE_F16);
-    ggml_tensor * hw = ggml_reshape_2d(c,
-        ggml_scale_bias(c, ggml_scale(c, ggml_arange(c, 0.0f, (float) (nih * T), 1.0f), 0.0f), 0.0f, 1.0f),
-        nih, T);
-    ggml_tensor * summed = ggml_ds4_indexer_score(c, qi, hw, comp16, (int) kv_start, (int) r);
-
-    ggml_tensor * blocks = ggml_cont(c, ggml_top_k(c, summed, (int) budget));   // [budget, T]
+// Retain the original float graph outside the exact integer domain of ratio-4 QSA.
+static ggml_tensor * qsa_cell_ids(ggml_context * c, ggml_tensor * blocks, ggml_tensor * positions,
+        int64_t r, int64_t kv_start, int64_t nb) {
+    const int64_t budget = blocks->ne[0];
+    const int64_t T = blocks->ne[1];
+    if (r == 4 && budget <= 1024 && nb < (1 << 22) && kv_start + T < (1 << 24)) {
+        return ggml_qsa_decode_ids(c, blocks, ggml_view_1d(c, positions, T, 0), (int) r);
+    }
+    blocks = ggml_cont(c, blocks);
     ggml_tensor * order = ggml_argsort(c, ggml_cast(c, blocks, GGML_TYPE_F32), GGML_SORT_ORDER_ASC);
     blocks = ggml_reshape_3d(c, ggml_get_rows(c,
         ggml_view_4d(c, blocks, 1, budget, T, 1, blocks->nb[0], blocks->nb[1], blocks->nb[2], 0),
@@ -571,9 +551,41 @@ static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
         ggml_tensor * row = ggml_reshape_2d(c, ggml_cast(c, val, GGML_TYPE_I32), 1, T);
         rows = rows ? ggml_concat(c, rows, row, 0) : row;
     }
-    ggml_tensor * ids = ggml_reshape_2d(c,
+    return ggml_reshape_2d(c,
         ggml_concat(c, cells, ggml_reshape_3d(c, rows, r - 1, T, 1), 0),
         budget * r + (r - 1), T);
+}
+
+static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
+        ggml_tensor * Q, ggml_tensor * Kf, ggml_tensor * Vf,
+        const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, int64_t ratio,
+        ggml_tensor * positions, int64_t kv_pad, int64_t kv_len, int64_t kv_start,
+        ggml_tensor * pooled, int64_t nb, bool packed) {
+    const int64_t idim   = w.indexer_head_size;
+    const int64_t nih    = w.indexer_n_head;
+    const int64_t r      = ratio;
+    const int64_t T      = cur->ne[1];
+    const int64_t budget = w.indexer_top_k / r;
+    const float   eps    = w.rms_eps;
+    const float   qscale = 1.0f / std::sqrt((float) w.n_embd_head_k);
+    int sections[4] = { w.rope_sections[0], w.rope_sections[1], w.rope_sections[2], w.rope_sections[3] };
+
+    ggml_tensor * qi = mm(c, L.indexer_q_proj, cur);              // [idim*nih, T]
+    qi = ggml_reshape_3d(c, qi, idim, nih, T);
+    qi = ggml_mul(c, ggml_rms_norm(c, qi, eps), L.indexer_q_norm);
+    qi = ggml_rope_multi(c, qi, positions, nullptr, w.rope_dimension_count, sections,
+        GGML_ROPE_TYPE_MROPE, 0, w.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    if (!ggml_is_contiguous(qi)) qi = ggml_cont(c, qi);
+
+    ggml_tensor * comp16 = ggml_cast(c,
+        ggml_reshape_2d(c, ggml_cont(c, pooled), idim, nb), GGML_TYPE_F16);
+    ggml_tensor * hw = ggml_reshape_2d(c,
+        ggml_scale_bias(c, ggml_scale(c, ggml_arange(c, 0.0f, (float) (nih * T), 1.0f), 0.0f), 0.0f, 1.0f),
+        nih, T);
+    ggml_tensor * summed = ggml_ds4_indexer_score(c, qi, hw, comp16, (int) kv_start, (int) r);
+
+    ggml_tensor * blocks = ggml_top_k(c, summed, (int) budget);   // Keep selection and its tie behavior unchanged.
+    ggml_tensor * ids = qsa_cell_ids(c, blocks, positions, r, kv_start, nb);
 
     ggml_tensor * q3 = ggml_cont(c, ggml_permute(c, Q, 0, 2, 1, 3));       // [D, T, Hq]
     // Only the packed prefill kernel needs contiguous K/V; the per-query kernel reads the cache through its strides,
