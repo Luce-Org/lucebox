@@ -632,6 +632,8 @@ extern "C" {
         GGML_OP_HC_COMBINE_NORM,  // Fused hyper-connection combine + next stream rms-norm
         GGML_OP_GATED_RMS_NORM_F16, // rms_norm(x) * gamma * sigmoid(z) -> F16 (qwen4exp GDN tail)
 
+        GGML_OP_QSA_DECODE_IDS, // Sort selected blocks and expand visible QSA cells
+
         GGML_OP_COUNT,
     };
 
@@ -2923,6 +2925,17 @@ extern "C" {
             struct ggml_tensor  * index_comp,
             struct ggml_tensor  * visibility_mask,
             int                   kv_start,
+            int                   ratio);
+
+    // Sort each row of already-selected block ids ascending (does not select or change top-k ties).
+    // blocks: I32 [budget,T], 1 <= budget <= 1024, contiguous dim 0; positions: contiguous I32 [T].
+    // Block ids and positions must be nonnegative. ratio >= 2. Returns I32 [budget*ratio+ratio-1,T].
+    // A block b emits ratio*b+i iff ratio*b+ratio-1 <= position, otherwise -1.
+    // The last ratio-1 slots emit br+i iff <= position, where br = ((position+1)/ratio)*ratio.
+    GGML_API struct ggml_tensor * ggml_qsa_decode_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * positions,
             int                   ratio);
 
     // Preserve the raw rows of base_mask and retain only selected compressed

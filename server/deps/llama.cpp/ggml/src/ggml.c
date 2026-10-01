@@ -1216,9 +1216,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "HC_COMBINE_NORM",
     "GATED_RMS_NORM_F16",
+    "QSA_DECODE_IDS",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1351,9 +1352,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "hc_combine_norm(inj,res,blk,gamma)",
     "gated_rms_norm_f16(x,gamma,z)",
+    "qsa_decode_ids(blocks,positions)",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -9603,6 +9605,27 @@ struct ggml_tensor * ggml_ds4_indexer_score(
         int                   ratio) {
     return ggml_ds4_indexer_score_masked(
         ctx, q, head_weights, index_comp, NULL, kv_start, ratio);
+}
+
+struct ggml_tensor * ggml_qsa_decode_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * positions,
+        int                   ratio) {
+    GGML_ASSERT(blocks->type == GGML_TYPE_I32 && ggml_is_matrix(blocks));
+    GGML_ASSERT(blocks->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(blocks->ne[0] >= 1 && blocks->ne[0] <= 1024 && blocks->ne[1] >= 1);
+    GGML_ASSERT(positions->type == GGML_TYPE_I32 && ggml_is_vector(positions));
+    GGML_ASSERT(ggml_is_contiguous(positions) && positions->ne[0] == blocks->ne[1]);
+    GGML_ASSERT(ratio >= 2 && (blocks->ne[0] + 1) * (int64_t) ratio <= INT32_MAX);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, blocks->ne[0] * ratio + ratio - 1, blocks->ne[1]);
+    result->op = GGML_OP_QSA_DECODE_IDS;
+    result->src[0] = blocks;
+    result->src[1] = positions;
+    ggml_set_op_params_i32(result, 0, ratio);
+    return result;
 }
 
 struct ggml_tensor * ggml_ds4_indexer_mask(

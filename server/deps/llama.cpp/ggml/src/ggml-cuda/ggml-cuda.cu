@@ -81,6 +81,7 @@
 #include "ggml-cuda/moe-fused.cuh"
 #include "ggml-cuda/ds4-hc.cuh"
 #include "ggml-cuda/ds4-indexer.cuh"
+#include "ggml-cuda/qsa-ids.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -3921,6 +3922,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DS4_INDEXER_SCORE:
             ggml_cuda_op_ds4_indexer_score(ctx, dst);
             break;
+        case GGML_OP_QSA_DECODE_IDS:
+            ggml_cuda_op_qsa_decode_ids(ctx, dst);
+            break;
         case GGML_OP_DS4_INDEXER_MASK:
             ggml_cuda_op_ds4_indexer_mask(ctx, dst);
             break;
@@ -7098,6 +7102,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op->src[1]) &&
                    ggml_is_contiguous(op->src[2]);
+        case GGML_OP_QSA_DECODE_IDS:
+            return op->src[0]->type == GGML_TYPE_I32 &&
+                   op->src[0]->ne[0] >= 1 && op->src[0]->ne[0] <= 1024 &&
+                   ggml_is_matrix(op->src[0]) && op->src[0]->nb[0] == sizeof(int32_t) &&
+                   op->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[1]);
         case GGML_OP_DS4_INDEXER_MASK:
             return op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_I32 &&

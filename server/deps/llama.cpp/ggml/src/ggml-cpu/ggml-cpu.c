@@ -216,6 +216,39 @@ static void ggml_compute_forward_ds4_indexer_score(
     }
 }
 
+static int ggml_qsa_compare_ids(const void * a, const void * b) {
+    const int32_t x = *(const int32_t *) a;
+    const int32_t y = *(const int32_t *) b;
+    return (x > y) - (x < y);
+}
+
+static void ggml_compute_forward_qsa_decode_ids(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * blocks = dst->src[0];
+    const int32_t * positions = (const int32_t *) dst->src[1]->data;
+    const int64_t budget = blocks->ne[0];
+    const int64_t ratio = ggml_get_op_params_i32(dst, 0);
+    for (int64_t t = params->ith; t < blocks->ne[1]; t += params->nth) {
+        const int32_t * src = (const int32_t *) ((const char *) blocks->data + t * blocks->nb[1]);
+        int32_t * out = (int32_t *) ((char *) dst->data + t * dst->nb[1]);
+        const int64_t pos = positions[t];
+        memcpy(out, src, budget * sizeof(int32_t));
+        qsort(out, budget, sizeof(int32_t), ggml_qsa_compare_ids);
+        // Expand backwards so the output itself is the sorting scratch space.
+        for (int64_t j = budget; j-- > 0;) {
+            const int64_t first = ratio * out[j];
+            for (int64_t i = 0; i < ratio; ++i) {
+                out[ratio * j + i] = first + ratio - 1 <= pos ? (int32_t) (first + i) : -1;
+            }
+        }
+        const int64_t br = ((pos + 1) / ratio) * ratio;
+        for (int64_t i = 0; i < ratio - 1; ++i) {
+            out[budget * ratio + i] = br + i <= pos ? (int32_t) (br + i) : -1;
+        }
+    }
+}
+
 static void ggml_compute_forward_ds4_indexer_mask(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
@@ -2083,6 +2116,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ds4_indexer_score(params, tensor);
             } break;
+        case GGML_OP_QSA_DECODE_IDS:
+            {
+                ggml_compute_forward_qsa_decode_ids(params, tensor);
+            } break;
         case GGML_OP_DS4_INDEXER_MASK:
             {
                 ggml_compute_forward_ds4_indexer_mask(params, tensor);
@@ -2654,6 +2691,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DS4_INDEXER_QAT:
         case GGML_OP_DS4_INDEXER_SCORE:
         case GGML_OP_DS4_INDEXER_MASK:
+        case GGML_OP_QSA_DECODE_IDS:
         case GGML_OP_DS4_MOE_COMBINE:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_SPARSE:
