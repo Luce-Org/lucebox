@@ -21,6 +21,10 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_FA256_WMMA` | unset | A/B: =1 forces the rocWMMA kernel on head-256 RDNA4 shapes whose KV length is a multiple of 256, bypassing the KV-length crossover (requires a `GGML_HIP_ROCWMMA_FATTN` build). |
 | `LUCE_FA256_WMMA_MAX_KV` | 32768 | KV length above which the head-256 tensor-core route switches from the rocWMMA kernel to the raw-MMA kernel in `GGML_HIP_ROCWMMA_FATTN` builds (measured crossover on gfx1201). |
 | `LUCE_PAGED_WMMA` | unset (0) | BURN-IN: =1 routes paged full-attention layers (RDNA4, head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Differential-tested against the decode kernel; single-prompt TTFT -21% at 12K and -42% at 44K, batched 8K-pool prefill slightly ahead. |
+| `LUCE_MIX_WMMA_PREFILL` | 1 on RDNA3.5 | KILL SWITCH (burn-in): =0 returns prefill-sized ROCmFP2/FP3 MIX mul_mat_id batches to MMQ. By default they run on the F16 WMMA routed-expert GEMM (F16 operands, F32 accumulation, so not bit-identical to MMQ). |
+| `LUCE_MIX_WMMA_MIN_TOKENS` | 64 | Smallest batch (tokens) that takes the MIX WMMA GEMM; a whole number >= 1, anything else keeps the default. |
+| `LUCE_MIX_WMMA_BN` | auto (64 or 128) | A/B: force the MIX WMMA route-tile width (64, 96 or 128); by default it follows the mean routes per expert. |
+| `LUCE_MIX_WMMA_GLU` | 1 | =0 keeps the separate SwiGLU-DS4 kernel instead of folding it into the MIX WMMA up launch. |
 | `GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS` | unset | DEBUG: force the paged-attention context partition count (both routes) to bisect partition-overlap and overhead behaviour. |
 | `LUCE_QWEN35_MASK_FULL_WIDTH` | unset | KILL SWITCH (burn-in): =1 restores the full max_ctx-wide causal-mask upload on the Qwen3.5/3.6/3.8 prefill and verify paths. By default only the columns flash attention reads (the live window rounded up to 256, plus one 256 stride) are built and copied. |
 | `LUCE_PREFILL_UBATCH` | backend-dependent (512 in `qwen35_backend.cpp`; 16/384 in `layer_split_daemon.cpp`; `cfg_.chunk` in `qwen35_layer_split_adapter.cpp`) | Prefill ubatch. Under pooled kvflash prefill it is rounded down to a multiple of the pager chunk (never below one chunk) and clamped to the pool, instead of being forced to one chunk per ubatch. |
@@ -121,6 +125,10 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_COLD_THREADS` - moe_expert_compute_cpu.cpp
 - `LUCE_CUDA_BACKEND_PATH` - dynamic_backend.cpp
 - `LUCE_CUDA_MMVF_NARROW_F16` - ggml-cuda/mmvf.cu
+- `LUCE_MIX_WMMA_PREFILL` - ggml-cuda/mix-wmma-moe.cu
+- `LUCE_MIX_WMMA_MIN_TOKENS` - ggml-cuda/mix-wmma-moe.cu
+- `LUCE_MIX_WMMA_BN` - ggml-cuda/mix-wmma-moe.cu
+- `LUCE_MIX_WMMA_GLU` - ggml-cuda/ggml-cuda.cu
 - `LUCE_CUDA_MMVQ_FP4_X4` - deepseek4_backend.cpp, mmvq.cu
 - `LUCE_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS` - moe_hybrid_ffn_eval.cpp
 - `LUCE_CUDA_MMVQ_MOE_FP3_PACKED24` - deepseek4_backend.cpp, mmvq.cu

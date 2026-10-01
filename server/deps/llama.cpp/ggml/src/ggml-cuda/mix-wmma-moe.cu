@@ -368,9 +368,13 @@ bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, const ggml_tensor 
         const char * v = std::getenv("LUCE_MIX_WMMA_PREFILL");
         return !(v && std::strcmp(v, "0") == 0);
     }();
+    // A whole number >= 1; anything else keeps the default (0 would send
+    // decode batches here).
     static const int min_tokens = [] {
         const char * v = std::getenv("LUCE_MIX_WMMA_MIN_TOKENS");
-        return v && *v ? std::atoi(v) : 64;
+        char * end = nullptr;
+        const long n = v && *v ? std::strtol(v, &end, 10) : 0;
+        return (end && *end == '\0' && n >= 1 && n <= 1 << 20) ? (int) n : 64;
     }();
     if (!enabled || !GGML_CUDA_CC_IS_RDNA3_5(cc)) return false;
     if (src0->type != GGML_TYPE_Q2_1_ROCMFP2_MIX && src0->type != GGML_TYPE_Q3_1_ROCMFP3_MIX) return false;
