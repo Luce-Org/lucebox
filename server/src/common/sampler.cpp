@@ -102,6 +102,39 @@ int sample_from_gpu_probs(std::vector<float> & probs, double top_p, double r_uni
 }
 #endif
 
+// Repetition penalty, then the frequency and presence penalties, applied to
+// the logit `logit_at(token)` refers to. sample_logits and
+// sampler_distribution both use it, so the speculative verifier's rows see
+// exactly the logits the AR draw does.
+template <typename LogitAt>
+void apply_sampler_penalties(const SamplerCfg & cfg, const std::vector<int32_t> & history,
+                             int vocab, LogitAt logit_at) {
+    if (history.empty()) return;
+    const int win  = std::min((int)history.size(), cfg.rep_window);
+    const int from = (int)history.size() - win;
+    // Multiplicative repetition penalty (HuggingFace-style).
+    if (cfg.rep_pen > 1.0f) {
+        std::unordered_set<int> seen;
+        for (int i = from; i < (int)history.size(); i++) seen.insert(history[i]);
+        for (int t : seen) {
+            if (t < 0 || t >= vocab) continue;
+            float & l = logit_at(t);
+            l = (l > 0.0f) ? l / cfg.rep_pen : l * cfg.rep_pen;
+        }
+    }
+    // OpenAI-style additive frequency and presence penalties.
+    if (cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f) {
+        std::unordered_map<int, int> counts;
+        for (int i = from; i < (int)history.size(); i++) counts[history[i]]++;
+        for (auto & kv : counts) {
+            if (kv.first < 0 || kv.first >= vocab) continue;
+            float & l = logit_at(kv.first);
+            l -= cfg.freq_pen * kv.second;
+            l -= cfg.pres_pen;
+        }
+    }
+}
+
 }  // namespace
 
 int sample_logits(const float * logits_in,
@@ -158,34 +191,8 @@ int sample_logits(const float * logits_in,
     std::vector<std::pair<float, int>> cand(vocab);
     for (int i = 0; i < vocab; i++) cand[i] = {logits_in[i], i};
 
-    // Multiplicative repetition penalty (HuggingFace-style).
-    if (cfg.rep_pen > 1.0f && !history.empty()) {
-        const int win  = std::min((int)history.size(), cfg.rep_window);
-        const int from = (int)history.size() - win;
-        std::unordered_set<int> seen;
-        for (int i = from; i < (int)history.size(); i++) seen.insert(history[i]);
-        for (auto & c : cand) {
-            if (seen.count(c.second)) {
-                c.first = (c.first > 0.0f) ? c.first / cfg.rep_pen
-                                           : c.first * cfg.rep_pen;
-            }
-        }
-    }
-
-    // OpenAI-style additive frequency and presence penalties.
-    if ((cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f) && !history.empty()) {
-        const int win  = std::min((int)history.size(), cfg.rep_window);
-        const int from = (int)history.size() - win;
-        std::unordered_map<int, int> counts;
-        for (int i = from; i < (int)history.size(); i++) counts[history[i]]++;
-        for (auto & c : cand) {
-            auto it = counts.find(c.second);
-            if (it != counts.end()) {
-                c.first -= cfg.freq_pen * it->second;
-                c.first -= cfg.pres_pen;
-            }
-        }
-    }
+    // cand[i] is still token i here.
+    apply_sampler_penalties(cfg, history, vocab, [&](int t) -> float & { return cand[(size_t) t].first; });
 
     // temp=0 → deterministic argmax (after penalties have been applied above).
     // Independent of top_k/top_p (the single highest-logit token is always the
@@ -268,26 +275,7 @@ void sampler_distribution(const float * logits_in,
     thread_local std::vector<float> z;
     thread_local std::vector<double> zd;
     z.assign(logits_in, logits_in + vocab);
-    if (cfg.rep_pen > 1.0f && !history.empty()) {
-        const int win  = std::min((int)history.size(), cfg.rep_window);
-        const int from = (int)history.size() - win;
-        std::unordered_set<int> seen;
-        for (int i = from; i < (int)history.size(); i++) seen.insert(history[i]);
-        for (int t : seen) {
-            if (t >= 0 && t < vocab) z[t] = z[t] > 0.0f ? z[t] / cfg.rep_pen : z[t] * cfg.rep_pen;
-        }
-    }
-    if ((cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f) && !history.empty()) {
-        const int win  = std::min((int)history.size(), cfg.rep_window);
-        const int from = (int)history.size() - win;
-        std::unordered_map<int, int> counts;
-        for (int i = from; i < (int)history.size(); i++) counts[history[i]]++;
-        for (auto & kv : counts) {
-            if (kv.first >= 0 && kv.first < vocab) {
-                z[kv.first] -= cfg.freq_pen * kv.second + cfg.pres_pen;
-            }
-        }
-    }
+    apply_sampler_penalties(cfg, history, vocab, [&](int t) -> float & { return z[(size_t) t]; });
     if (cfg.temp <= 0.0f) {
         const int best = (int) (std::max_element(z.begin(), z.end()) - z.begin());
         cand.assign(1, {1.0f, best});
