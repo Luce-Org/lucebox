@@ -3257,6 +3257,54 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_long_first_turn_snapshots_whole_p
         r.cancel();
     }
 
+    // A request without tools never pinned the head; it keeps its usual cut
+    // (the start of the last message) rather than a whole-prompt snapshot.
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/false);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == 3);
+        r.cancel();
+    }
+
+    // A forced pin ahead of the restored prefix (PPP's pin of a head seen
+    // before, not resident now) still wins.
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/true, /*forced_cut=*/3);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == 3);
+        r.cancel();
+    }
+    // Once that pin is restored, the long first turn is snapshotted whole.
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/3,
+            /*prefer_tools_boundary=*/true, /*forced_cut=*/3);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == (int) short_head.size());
+        r.cancel();
+    }
+
+    // A whole prompt the resident budget can never hold keeps the head pin
+    // instead of saving nothing.
+    {
+        PrefixCache cache(2, tokenizer, /*max_resident_bytes=*/1000);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/true, /*forced_cut=*/0,
+            /*restore_source_slot=*/-1,
+            [](int cut) { return (size_t) cut; });
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == 3);
+        r.cancel();
+    }
+
     unlink(path.c_str());
 }
 

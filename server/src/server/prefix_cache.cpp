@@ -609,12 +609,24 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
     // LUCE_PC_DEEP_FIRST_MIN is the tail length that triggers it (default
     // 4096 tokens; 0 keeps the head pin). Values that are not a whole
     // non-negative integer keep the defaults.
+    // Only the tool-request path pins the head, so only it changes. A forced
+    // pin still ahead of the restored prefix (an explicit pin_end, or PPP's
+    // pin of a head seen before) wins and keeps its protection, and a prompt
+    // the resident budget could never hold keeps the head pin instead of
+    // saving nothing.
     static const int deep_first_min = env_nonneg_int("LUCE_PC_DEEP_FIRST_MIN", 4096);
     static const int deep_first_max_head = env_nonneg_int("LUCE_PC_DEEP_FIRST_MAX_HEAD", 2048);
-    if (deep_first_min > 0 && !candidates.empty() &&
+    const auto whole_prompt_fits = [&]() {
+        if (max_resident_bytes_ == 0) return true;
+        const size_t bytes = estimate_bytes ? estimate_bytes((int) prompt_ids.size()) : 0;
+        return bytes != 0 && bytes <= max_resident_bytes_;
+    };
+    if (deep_first_min > 0 && prefer_tools_boundary && !candidates.empty() &&
         restored_prefix_len <= candidates.front() &&
+        forced_cut <= restored_prefix_len &&
         candidates.front() <= deep_first_max_head &&
-        (int) prompt_ids.size() - candidates.front() >= deep_first_min) {
+        (int) prompt_ids.size() - candidates.front() >= deep_first_min &&
+        whole_prompt_fits()) {
         prefer_tools_boundary = false;
         include_last_message = true;
     }
