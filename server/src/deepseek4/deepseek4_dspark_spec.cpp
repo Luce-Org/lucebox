@@ -942,6 +942,7 @@ bool run_deepseek4_dspark_spec_decode(
     const int n_embd = target_w.n_embd;
     const bool hook_on = budget_hook && !budget_hook->close_ids.empty();
     luce::deepseek4::SpecBudgetHookState hook_st;
+    bool close_emitted = false;    // the hook's close token reached the stream
     const int n_tgt = drafter.n_target_layers;
     const int block = drafter.block_size;
     const int n_swa = target_w.n_swa;
@@ -1320,7 +1321,7 @@ bool run_deepseek4_dspark_spec_decode(
 
         // Feasibility-only control: duplicate the current draft and discard it.
         bool probe_inflight = false;
-        if (draft_overlap_probe_enabled && q_cap >= 2) {
+        if (draft_overlap_probe_enabled && q_cap >= 2 && !forcing) {   // no fresh draft on forced steps
             const SpecClock::time_point probe_t0 = SpecClock::now();
             probe_inflight = draft_overlap_reuse_context
                 ? deepseek4_dspark_draft_forward_async_reuse_context(
@@ -1402,7 +1403,12 @@ bool run_deepseek4_dspark_spec_decode(
             // Every forced candidate is kept; the bonus is the target's next
             // token after the last one, drawn with the request's sampler.
             accept = q;
-            if (sampling) {
+            // While close tokens remain after this step's forced candidates,
+            // the hook replaces the bonus with the next one; only the step that
+            // finishes the sequence keeps it (the first answer token).
+            const bool bonus_kept =
+                hook_st.inject_pos + (size_t) (q - 1) >= budget_hook->close_ids.size();
+            if (sampling && bonus_kept) {
                 t0 = SpecClock::now();
                 if (!target.read_verify_logits(q, spec_logits)) {
                     undo_verify();
@@ -1420,7 +1426,7 @@ bool run_deepseek4_dspark_spec_decode(
                 bonus = sampler_draw(spec_rows[0], unif(*sampling->rng));
                 tm_sample += spec_ms_since(t0);
             } else {
-                bonus = tgt_am[q - 1];
+                bonus = tgt_am[q - 1];   // greedy, or a bonus the hook replaces
             }
         } else if (sampling) {
             // Verify row i is the target's next-token logits after
@@ -1461,6 +1467,7 @@ bool run_deepseek4_dspark_spec_decode(
         // Thinking-budget hook over this step's emitted tokens: where the AR
         // rule would override a token, truncate the step there and emit the
         // close token as the bonus.
+        const bool hook_was_started = hook_st.started;
         if (hook_on) {
             int32_t hook_bonus = bonus;
             luce::deepseek4::spec_budget_hook_step(
@@ -1593,6 +1600,10 @@ bool run_deepseek4_dspark_spec_decode(
             }
         }
 
+        // The hook replaced this step's bonus with the close token. It only
+        // counts as fired once that token is emitted: an EOS or stop earlier
+        // in the step ends the stream first, as it would under AR.
+        const bool close_bonus = hook_on && !hook_was_started && hook_st.started;
         // Output tokens this step = accepted candidates + bonus.
         bool hit_eos = false;
         for (int i = 1; i <= accept; i++) {
@@ -1604,6 +1615,7 @@ bool run_deepseek4_dspark_spec_decode(
                              i == accept ? " bonus" : "");
             }
             out_tokens.push_back(t);
+            if (i == accept && close_bonus) close_emitted = true;
             if (sampling) sampling->history.push_back(t);
             n_generated++;
             if (on_token && !on_token(t)) {
@@ -1633,7 +1645,7 @@ bool run_deepseek4_dspark_spec_decode(
         if (hit_eos || stop_requested) break;
     }
 
-    if (hook_on && hook_st.forced_close) budget_hook->fired = true;
+    if (hook_on && close_emitted) budget_hook->fired = true;
     const double total_ms = spec_ms_since(run_t0);
     if (accept_rate_out) {
         *accept_rate_out = offered_sum > 0
