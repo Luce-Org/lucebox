@@ -128,18 +128,83 @@ static bool check(ggml_backend_t backend, int device, const Case & c, int tokens
     return ok && diff_tokens == 0;
 }
 
+// Dense products the verify batch runs q-wide (GGML_OP_MUL_MAT): T-column batch vs T single columns.
+static bool check_dense(ggml_backend_t backend, int device, ggml_type type, const char * name, int k, int n, int tokens, bool invariant) {
+    std::mt19937 rng(777u + unsigned(type) * 31u + unsigned(k));
+    std::vector<float> wf(size_t(k) * n), x(size_t(k) * tokens);
+    std::normal_distribution<float> gauss(0.0f, 0.02f);
+    for (auto & v : wf) v = gauss(rng);
+    for (auto & v : x) v = gauss(rng) * 50.0f;
+    ggml_init_params params{};
+    params.mem_size = size_t(4 * tokens + 8) * ggml_tensor_overhead() + 2 * ggml_graph_overhead_custom(4 * tokens + 8, false);
+    params.no_alloc = true;
+    auto ctx = ggml_init(params);
+    auto a = ggml_new_tensor_2d(ctx, type, k, n);
+    std::vector<ggml_tensor *> xs, ys;
+    auto g1 = ggml_new_graph_custom(ctx, 4 * tokens + 8, false);
+    for (int t = 0; t < tokens; ++t) {
+        auto b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        auto y = ggml_mul_mat(ctx, a, b);
+        xs.push_back(b); ys.push_back(y); ggml_build_forward_expand(g1, y);
+    }
+    auto bb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+    auto yb = ggml_mul_mat(ctx, a, bb);
+    auto g2 = ggml_new_graph_custom(ctx, 4 * tokens + 8, false);
+    ggml_build_forward_expand(g2, yb);
+    if (!ggml_backend_supports_op(backend, yb)) { ggml_free(ctx); return true; }
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    // weights: quantize/convert from f32 through ggml's own reference
+    std::vector<uint8_t> wq(ggml_row_size(type, k) * n);
+    if (type == GGML_TYPE_F32) std::memcpy(wq.data(), wf.data(), wq.size());
+    else ggml_quantize_chunk(type, wf.data(), wq.data(), 0, n, k, nullptr);
+    ggml_backend_tensor_set(a, wq.data(), 0, wq.size());
+    for (int t = 0; t < tokens; ++t) ggml_backend_tensor_set(xs[t], x.data() + size_t(t) * k, 0, size_t(k) * sizeof(float));
+    ggml_backend_tensor_set(bb, x.data(), 0, x.size() * sizeof(float));
+    const bool previous = ggml_backend_cuda_set_mmvq_batch_invariant(invariant);
+    bool ok = ggml_backend_graph_compute(backend, g1) == GGML_STATUS_SUCCESS &&
+              ggml_backend_graph_compute(backend, g2) == GGML_STATUS_SUCCESS;
+    ggml_backend_synchronize(backend);
+    ggml_backend_cuda_set_mmvq_batch_invariant(previous);
+    std::vector<float> single(n), batch(size_t(n) * tokens);
+    ggml_backend_tensor_get(yb, batch.data(), 0, batch.size() * sizeof(float));
+    int diff_tokens = 0; size_t diff_values = 0; double max_abs = 0.0;
+    for (int t = 0; t < tokens && ok; ++t) {
+        ggml_backend_tensor_get(ys[t], single.data(), 0, size_t(n) * sizeof(float));
+        const float * bt = batch.data() + size_t(t) * n;
+        if (std::memcmp(single.data(), bt, size_t(n) * sizeof(float)) != 0) {
+            ++diff_tokens;
+            for (int i = 0; i < n; ++i) if (std::memcmp(&single[i], &bt[i], 4) != 0) { ++diff_values; max_abs = std::max(max_abs, std::abs(double(single[i]) - double(bt[i]))); }
+        }
+    }
+    std::printf("{\"device\":%d,\"op\":\"mul_mat\",\"type\":\"%s\",\"surface\":\"%s\",\"k\":%d,\"n\":%d,\"tokens\":%d,\"batch_invariant\":%s,"
+                "\"identical\":%s,\"diff_tokens\":%d,\"diff_values\":%zu,\"max_abs\":%.3g,\"ok\":%s}\n",
+                device, ggml_type_name(type), name, k, n, tokens, invariant ? "true" : "false", diff_tokens == 0 ? "true" : "false",
+                diff_tokens, diff_values, max_abs, ok ? "true" : "false");
+    std::fflush(stdout);
+    ggml_backend_buffer_free(buffer); ggml_free(ctx);
+    return ok && diff_tokens == 0;
+}
+
 int main(int argc, char ** argv) {
     const int tokens = argc > 1 ? std::atoi(argv[1]) : 3, experts = argc > 2 ? std::atoi(argv[2]) : 64;
     const ggml_type types[] = {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_K, GGML_TYPE_MXFP4, GGML_TYPE_Q8_0};
     bool all = true;
-    for (int d = 0; d < ggml_backend_cuda_get_device_count(); ++d) {
-        auto backend = ggml_backend_cuda_init(d);
+    for (int dv = 0; dv < ggml_backend_cuda_get_device_count(); ++dv) {
+        auto backend = ggml_backend_cuda_init(dv);
         if (!backend) return 2;
         for (ggml_type t : types) {
             const Case cases[] = {{t, "down", 2304, 5120}, {t, "gate_up", 5120, 2304}};
             for (const auto & c : cases)
-                for (bool inv : {false, true}) all = check(backend, d, c, tokens, experts, inv) && all;
+                for (bool inv : {false, true}) all = check(backend, dv, c, tokens, experts, inv) && all;
         }
+        // dense verify-batch products of DS4.1: BF16 output head, F16 indexer/compressor, F32 router, MXFP8 attention
+        struct D { ggml_type t; const char * name; int k, n; } dense[] = {
+            {GGML_TYPE_BF16, "output_head", 5120, 129280}, {GGML_TYPE_F16, "indexer_k", 5120, 2048},
+            {GGML_TYPE_F16, "compressor_kv", 5120, 1024}, {GGML_TYPE_F32, "router", 5120, 384},
+            {GGML_TYPE_MXFP8, "attn_q_b", 1280, 32768}, {GGML_TYPE_Q8_0, "q8_dense", 5120, 2304},
+        };
+        for (const auto & d : dense)
+            for (bool inv : {false, true}) all = check_dense(backend, dv, d.t, d.name, d.k, d.n, tokens, inv) && all;
         ggml_backend_free(backend);
         if (argc > 3) break;                                       // first device only
     }
