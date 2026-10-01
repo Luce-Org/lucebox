@@ -90,6 +90,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_SPLIT_FAST_ROLLBACK` | unset | OPT-IN: exact F32 checkpoints and replay-free rollback for local qwen35 target layer splits. Prefer `--target-split-fast-rollback`; adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
 | `LUCE_STALL_TOOL_PREFIX` | unset | OPT-IN: recover a stalled tool call by injecting the prepared tool prefix when generation stops after an action suffix. |
 | `LUCE_DS4_SPEC` / `LUCE_DS4_DRAFT` / `LUCE_DS4_DRAFT_BACKEND` / `LUCE_DS4_DRAFT_GPU` | unset | OPT-IN: enable DeepSeek4 DSpark, select its draft GGUF, and optionally select the local drafter backend/device. See `DS4.md`. |
+| `LUCE_DS4_SPEC_SAMPLING` | 1 | KILL SWITCH (burn-in): =0 decodes DeepSeek4 requests that sample (temperature > 0 or penalties) on the AR path. By default they keep DSpark with speculative sampling: greedy drafts kept with the target sampler's probability, so every token follows the request's sampler distribution. |
 | `LUCE_DS4_CUDA_LAYERS` | auto | Override the DeepSeek4 heterogeneous layer-split heuristic. See `DS4.md`. |
 | `LUCE_ROCMFP2_ROW4` | 1 on gfx1151 for q>2; legacy two-row kernel elsewhere | BURN-IN KILL SWITCH: =0 restores two-row-per-wave ROCmFP2 verification kernels. |
 | `LUCE_MULTI_MODEL_GRAPHS` | unset | =1 keeps GPU graph capture on when one process serves several model blocks (`--load-balancing`). By default the server sets `GGML_CUDA_DISABLE_GRAPHS=1` there, because concurrent captures from different model workers invalidate each other. |
@@ -199,6 +200,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_DS4_SPEC` - deepseek4_backend.cpp
 - `LUCE_DS4_SPEC_REFERENCE_EXACT` - deepseek4_dspark_spec.cpp
 - `LUCE_DS4_SPEC_Q` - deepseek4_dspark_spec.cpp
+- `LUCE_DS4_SPEC_SAMPLING` - deepseek4_backend.cpp
 - `LUCE_DS4_SPARSE_DECODE_FLASH` - deepseek4_fused_verify.inc, deepseek4_graph.cpp
 - `LUCE_DS4_TIMING` - deepseek4_backend.cpp, deepseek4_target_shard_ipc_daemon.cpp
 - `LUCE_DS4_TP_CAPTURE_CACHE_SLOTS` - deepseek4_fused_verify.inc
