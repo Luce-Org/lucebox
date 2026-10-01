@@ -3291,6 +3291,22 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_long_first_turn_snapshots_whole_p
         r.cancel();
     }
 
+    // The whole-prompt snapshot is what the first follow-up restores: once
+    // committed, the next turn (the first one plus new tokens) finds all of it.
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/true);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.commit(short_head));
+        std::vector<int32_t> follow_up = short_head;
+        follow_up.insert(follow_up.end(), {1, 102, 3, 103, 103, 4});
+        const auto hit = cache.lookup(follow_up);
+        TEST_ASSERT(hit.first >= 0);
+        TEST_ASSERT(hit.second == (int) short_head.size());
+    }
+
     // A whole prompt the resident budget can never hold keeps the head pin
     // instead of saving nothing.
     {
