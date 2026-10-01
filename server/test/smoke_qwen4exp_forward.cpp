@@ -14,10 +14,12 @@
 
 #include "ggml-cuda.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -131,6 +133,55 @@ int main(int argc, char ** argv) {
             std::printf("[smoke] decode OK %.3fs pos=%d argmax=%d\n",
                 std::chrono::duration<double>(d1 - d0).count(), S, argmax(logits2));
         }
+    }
+
+    // QWEN4EXP_SMOKE_SPLIT=N[:c]: the same S tokens as one prefill vs a prefill of S-N plus the last N tokens in
+    // chunks of c (default 1, i.e. decode) must give the same last-position distribution. QSA selection is
+    // chunk-invariant, so past the block budget this checks decode (c=1) against prefill; c in 9..127 runs dense
+    // attention there and shows how far a wrong selection drifts.
+    if (const char * split_env = getenv("QWEN4EXP_SMOKE_SPLIT"); rc == 0 && split_env) {
+        const int N = std::atoi(split_env);
+        const char * colon = std::strchr(split_env, ':');
+        const int step = colon ? std::max(1, std::atoi(colon + 1)) : 1;
+        std::vector<float> full, split;
+        reset_qwen4exp_state(backend, cache);
+        bool ok = N > 0 && N < S && qwen4exp_forward(backend, w, cache, tokens.data(), S, 0, full).ok;
+        reset_qwen4exp_state(backend, cache);
+        ok = ok && qwen4exp_forward(backend, w, cache, tokens.data(), S - N, 0, split).ok;
+        for (int i = S - N; ok && i < S; i += step) {
+            const int n = std::min(step, S - i);
+            ok = qwen4exp_forward(backend, w, cache, &tokens[i], n, i, split).ok;
+        }
+        float max_diff = 0.0f;
+        double kl = 0.0;
+        int overlap = 0;
+        if (ok) {
+            auto softmax = [](const std::vector<float> & v) {
+                const float mx = *std::max_element(v.begin(), v.end());
+                std::vector<double> p(v.size());
+                double z = 0.0;
+                for (size_t i = 0; i < v.size(); ++i) z += (p[i] = std::exp((double) v[i] - mx));
+                for (double & x : p) x /= z;
+                return p;
+            };
+            auto top10 = [](const std::vector<float> & v) {
+                std::vector<int> idx(v.size());
+                for (size_t i = 0; i < v.size(); ++i) idx[i] = (int) i;
+                std::partial_sort(idx.begin(), idx.begin() + 10, idx.end(), [&](int a, int b) { return v[a] > v[b]; });
+                idx.resize(10);
+                return idx;
+            };
+            const std::vector<double> pf = softmax(full), ps = softmax(split);
+            for (size_t i = 0; i < full.size(); ++i) {
+                max_diff = std::max(max_diff, std::fabs(full[i] - split[i]));
+                if (pf[i] > 0.0) kl += pf[i] * std::log(pf[i] / std::max(ps[i], 1e-300));
+            }
+            const std::vector<int> tf = top10(full), ts = top10(split);
+            for (int a : tf) overlap += (int) std::count(ts.begin(), ts.end(), a);
+        }
+        std::printf("[smoke] split S=%d N=%d chunk=%d ok=%d argmax %d vs %d max_abs_diff=%.4f kl=%.6f top10_overlap=%d\n",
+            S, N, step, (int) ok, ok ? argmax(full) : -1, ok ? argmax(split) : -1, max_diff, kl, overlap);
+        if (!ok || argmax(full) != argmax(split)) rc = 1;
     }
 
     free_qwen4exp_cache(cache);

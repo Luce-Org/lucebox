@@ -8,9 +8,9 @@
 // 512-expert top-10 MoE, per-layer n-gram embedding) into Luzebox's ggml graph
 // style.
 //
-// Single sequence (n_seqs = 1). Prefill can use the learned sparse indexer;
-// single-token decode uses dense attention. The PLE table is read through
-// Qwen4ExpPleReader and is never uploaded in full.
+// Single sequence (n_seqs = 1). Past the indexer's block budget, full attention uses QSA selected attention
+// (gfx1151: prefill chunks of >= 128 tokens and decode); below it QSA equals dense attention. The PLE table is
+// read through Qwen4ExpPleReader and is never uploaded in full.
 
 #pragma once
 
@@ -24,6 +24,9 @@
 #include <vector>
 
 namespace luce::common {
+
+// QSA indexer block pooling: [idim, nb*r] keys -> [idim, nb], block b = mean of tokens r*b .. r*b+r-1.
+ggml_tensor * qwen4exp_pool_blocks(ggml_context * c, ggml_tensor * keys, int64_t r);
 
 struct Qwen4ExpForwardResult {
     bool ok = false;

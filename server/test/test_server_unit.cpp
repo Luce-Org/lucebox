@@ -21,6 +21,7 @@
 #include "server/http_server.h"
 #include "server/image_input.h"
 #include "qwen35/qwen35_backend.h"
+#include "qwen4exp/qwen4exp_graph.h"
 #include "engine/luce_engine.h"
 #include "server/chat_template.h"
 #include "common/concurrency/seq_engine.h"
@@ -5025,6 +5026,30 @@ TEST_CASE(ServerUnitFixture, test_qwen_snapshot_estimate_matches_saved_snapshot)
 
     free_target_cache(cache);
     ggml_backend_free(cpu);
+}
+
+// Qwen4Exp QSA indexer pooling: block b is the mean of the r consecutive token keys r*b .. r*b+r-1
+// (reference modeling_qwen4_exp.py: block_token_indices.view(n, ratio) then mean over the ratio axis).
+TEST_CASE(ServerUnitFixture, test_qwen4exp_pool_blocks_averages_consecutive_tokens) {
+    ggml_init_params ip{1 << 20, nullptr, false};
+    ggml_context * c = ggml_init(ip);
+    TEST_ASSERT(c != nullptr);
+    const int idim = 2, r = 4, nb = 3;
+    ggml_tensor * k = ggml_new_tensor_2d(c, GGML_TYPE_F32, idim, nb * r);
+    float * kd = (float *) k->data;
+    for (int t = 0; t < nb * r; ++t) {
+        for (int d = 0; d < idim; ++d) kd[t * idim + d] = 100.0f * d + (float) t;
+    }
+    ggml_tensor * pooled = qwen4exp_pool_blocks(c, k, r);
+    ggml_cgraph * gf = ggml_new_graph(c);
+    ggml_build_forward_expand(gf, pooled);
+    TEST_ASSERT(ggml_graph_compute_with_ctx(c, gf, 1) == GGML_STATUS_SUCCESS);
+    TEST_ASSERT(pooled->ne[0] == idim && pooled->ne[1] == nb && ggml_is_contiguous(pooled));
+    const float * pd = (const float *) pooled->data;
+    for (int b = 0; b < nb; ++b) {
+        for (int d = 0; d < idim; ++d) TEST_ASSERT(pd[b * idim + d] == 100.0f * d + (float) (r * b) + 1.5f);
+    }
+    ggml_free(c);
 }
 
 // The Qwen report adds up the live cache and each snapshot from the buffers

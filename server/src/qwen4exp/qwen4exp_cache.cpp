@@ -55,7 +55,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
     }
 
     ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() * (static_cast<size_t>(w.n_layer) * 4 + 16) + 4096;
+    ip.mem_size = ggml_tensor_overhead() * (static_cast<size_t>(w.n_layer) * 5 + 16) + 4096;
     ip.no_alloc = true;
     out.ctx = ggml_init(ip);
     if (!out.ctx) return false;
@@ -63,6 +63,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
     out.attn_k.assign(n_full, nullptr);
     out.attn_v.assign(n_full, nullptr);
     out.indexer_k.assign(n_full, nullptr);
+    out.indexer_raw.assign(n_full, nullptr);
     out.ssm_state.assign(n_linear, nullptr);
     out.conv_state.assign(n_linear, nullptr);
 
@@ -94,6 +95,8 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
             const int64_t max_blocks = (static_cast<int64_t>(max_ctx) + ratio - 1) / ratio;
             out.indexer_k[i] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
                 w.indexer_head_size, max_blocks);
+            out.indexer_raw[i] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
+                w.indexer_head_size, max_ctx);
         }
     }
     for (size_t i = 0; i < n_linear; ++i) {
@@ -163,6 +166,7 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
     c.attn_k.clear();
     c.attn_v.clear();
     c.indexer_k.clear();
+    c.indexer_raw.clear();
     c.ssm_state.clear();
     c.conv_state.clear();
     c.ple_conv_state.clear();

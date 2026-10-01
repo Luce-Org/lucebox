@@ -458,50 +458,63 @@ static ggml_tensor * qsa_pack_values(ggml_context * c, ggml_tensor * values) {
     return ggml_cont(c, ggml_permute(c, blocks, 1, 0, 2, 3));
 }
 
-// The zero-padded tail block (T % r != 0) is never selectable: complete-block visibility masks its cells.
-static ggml_tensor * build_indexer_pooled(ggml_context * c, ggml_tensor * cur,
-        const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, int64_t pos0, int64_t r) {
-    const int64_t idim = w.indexer_head_size;
-    const int64_t T    = cur->ne[1];
-    const int64_t nb   = (T + r - 1) / r;
-    const float   eps  = w.rms_eps;
-    int sections[4] = { w.rope_sections[0], w.rope_sections[1], w.rope_sections[2], w.rope_sections[3] };
+}  // namespace
 
-    ggml_tensor * kraw = mm(c, L.indexer_k_proj, cur);            // [idim, T]
-    if (nb * r > T) {
-        ggml_tensor * z = ggml_reshape_2d(c,
-            ggml_scale_bias(c, ggml_arange(c, 0.0f, (float) (idim * (nb * r - T)), 1.0f), 0.0f, 0.0f),
-            idim, nb * r - T);
-        kraw = ggml_concat(c, kraw, z, 1);
-    }
-    kraw = ggml_reshape_3d(c, kraw, idim, nb, r);
-    ggml_tensor * pooled = nullptr;
+ggml_tensor * qwen4exp_pool_blocks(ggml_context * c, ggml_tensor * keys, int64_t r) {
+    const int64_t idim = keys->ne[0], nb = keys->ne[1] / r;
+    ggml_tensor * k3 = ggml_reshape_3d(c, ggml_is_contiguous(keys) ? keys : ggml_cont(c, keys), idim, r, nb);
+    ggml_tensor * sum = nullptr;
     for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * sl = ggml_cont(c, ggml_view_3d(c, kraw, idim, nb, 1,
-            kraw->nb[1], kraw->nb[2], i * kraw->nb[2]));
-        pooled = pooled ? ggml_add(c, pooled, sl) : sl;
+        ggml_tensor * tok = ggml_view_2d(c, k3, idim, nb, k3->nb[2], (size_t) i * k3->nb[1]);   // token r*b+i of every block
+        sum = sum ? ggml_add(c, sum, tok) : ggml_cont(c, tok);
     }
-    pooled = ggml_scale(c, pooled, 1.0f / (float) r);
-    pooled = ggml_mul(c, ggml_rms_norm(c, pooled, eps), L.indexer_k_norm);
+    return ggml_scale(c, sum, 1.0f / (float) r);
+}
 
-    ggml_tensor * bp = ggml_scale_bias(c,
-        ggml_scale(c, ggml_arange(c, 0.0f, (float) nb, 1.0f), (float) r), 1.0f, (float) pos0);
-    ggml_tensor * bp_i = ggml_cast(c, bp, GGML_TYPE_I32);
-    ggml_tensor * bp_z = ggml_cast(c, ggml_scale(c, bp, 0.0f), GGML_TYPE_I32);
-    ggml_tensor * bpos = ggml_concat(c, ggml_concat(c, bp_i, bp_i, 0),
-                                        ggml_concat(c, bp_i, bp_z, 0), 0);
-    // rope indexes its tokens on ne[2], so put the block axis there.
-    pooled = ggml_rope_multi(c, ggml_reshape_3d(c, pooled, idim, 1, nb), bpos, nullptr,
-        w.rope_dimension_count, sections, GGML_ROPE_TYPE_MROPE, 0, w.rope_theta,
-        1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    return ggml_reshape_3d(c, pooled, idim, nb, 1);
+namespace {
+
+// Pooled keys of the complete blocks [0, n_after) for QSA scoring. Blocks [n_pooled, n_after) are pooled here from
+// raw keys -- tokens before pos0 from indexer_raw (written by earlier forwards), the rest from this forward's `kraw` --
+// then normed, M-RoPE'd at their first token's position and stored in indexer_k (reference: Qwen4ExpTextQSAIndexer).
+static ggml_tensor * qsa_pooled_keys(ggml_context * c, ggml_cgraph * gf, const Qwen4ExpLayer & L,
+        const Qwen4ExpWeights & w, ggml_tensor * indexer_k, ggml_tensor * indexer_raw, ggml_tensor * kraw,
+        int64_t pos0, int64_t r, int64_t n_pooled, int64_t n_after) {
+    const int64_t idim = w.indexer_head_size;
+    ggml_tensor * fresh = nullptr;
+    if (n_after > n_pooled) {
+        const int64_t t0 = r * n_pooled, t1 = r * n_after, n_new = n_after - n_pooled;
+        const int64_t cached = std::min(t1, pos0) - t0;
+        ggml_tensor * span = cached > 0
+            ? ggml_view_2d(c, indexer_raw, idim, cached, indexer_raw->nb[1], (size_t) t0 * indexer_raw->nb[1])
+            : nullptr;
+        if (t1 > pos0) {
+            ggml_tensor * now = ggml_view_2d(c, kraw, idim, t1 - pos0, kraw->nb[1], 0);
+            span = span ? ggml_concat(c, span, now, 1) : now;
+        }
+        fresh = qwen4exp_pool_blocks(c, span, r);
+        fresh = ggml_mul(c, ggml_rms_norm(c, fresh, w.rms_eps), L.indexer_k_norm);
+        int sections[4] = { w.rope_sections[0], w.rope_sections[1], w.rope_sections[2], w.rope_sections[3] };
+        ggml_tensor * bp = ggml_scale(c, ggml_arange(c, (float) n_pooled, (float) n_after, 1.0f), (float) r);
+        ggml_tensor * bp_i = ggml_cast(c, bp, GGML_TYPE_I32);
+        ggml_tensor * bp_z = ggml_cast(c, ggml_scale(c, bp, 0.0f), GGML_TYPE_I32);
+        ggml_tensor * bpos = ggml_concat(c, ggml_concat(c, bp_i, bp_i, 0), ggml_concat(c, bp_i, bp_z, 0), 0);
+        // rope indexes its tokens on ne[2], so put the block axis there.
+        fresh = ggml_rope_multi(c, ggml_reshape_3d(c, fresh, idim, 1, n_new), bpos, nullptr,
+            w.rope_dimension_count, sections, GGML_ROPE_TYPE_MROPE, 0, w.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        fresh = ggml_reshape_2d(c, fresh, idim, n_new);
+        ggml_build_forward_expand(gf, ggml_cpy(c, fresh,
+            ggml_view_2d(c, indexer_k, idim, n_new, indexer_k->nb[1], (size_t) n_pooled * indexer_k->nb[1])));
+    }
+    ggml_tensor * prefix = n_pooled > 0 ? ggml_view_2d(c, indexer_k, idim, n_pooled, indexer_k->nb[1], 0) : nullptr;
+    ggml_tensor * all = prefix && fresh ? ggml_concat(c, prefix, fresh, 1) : (prefix ? prefix : fresh);
+    return ggml_reshape_3d(c, all, idim, n_after, 1);
 }
 
 static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
         ggml_tensor * Q, ggml_tensor * Kf, ggml_tensor * Vf,
         const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, int64_t ratio,
         ggml_tensor * positions, int64_t kv_pad, int64_t kv_len, int64_t kv_start,
-        ggml_tensor * pooled, int64_t nb) {
+        ggml_tensor * pooled, int64_t nb, bool packed) {
     const int64_t idim   = w.indexer_head_size;
     const int64_t nih    = w.indexer_n_head;
     const int64_t r      = ratio;
@@ -563,60 +576,60 @@ static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
         budget * r + (r - 1), T);
 
     ggml_tensor * q3 = ggml_cont(c, ggml_permute(c, Q, 0, 2, 1, 3));       // [D, T, Hq]
-    ggml_tensor * Kc = ggml_is_contiguous(Kf) ? Kf : ggml_cont(c, Kf);
-    ggml_tensor * Vc = ggml_is_contiguous(Vf) ? Vf : ggml_cont(c, Vf);
+    // Only the packed prefill kernel needs contiguous K/V; the per-query kernel reads the cache through its strides,
+    // so decode must not copy the visible prefix every token.
+    ggml_tensor * Kc = packed && !ggml_is_contiguous(Kf) ? ggml_cont(c, Kf) : Kf;
+    ggml_tensor * Vc = packed && !ggml_is_contiguous(Vf) ? ggml_cont(c, Vf) : Vf;
     ggml_tensor * attn = ggml_flash_attn_ext(c, q3, Kc, Vc, nullptr, qscale, 0.0f, 0.0f);
     attn->src[5] = ids;
-    attn->src[6] = qsa_pack_keys(c, Kc);
-    attn->src[7] = qsa_pack_values(c, Vc);
+    if (packed) {   // prefill kernel (T >= 128); the per-query decode kernel reads K/V rows by id
+        attn->src[6] = qsa_pack_keys(c, Kc);
+        attn->src[7] = qsa_pack_values(c, Vc);
+    }
     ggml_flash_attn_ext_set_n_kv_max(attn, (int32_t) ids->ne[0]);
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     return attn;
 }
 
-static bool indexer_store_ok(ggml_tensor * indexer_k, int64_t T, int64_t pos0, int64_t ratio) {
-    static const bool use_qsa = [] {
-        const char * value = getenv("QWEN4EXP_QSA");
-        return value && std::atoi(value) != 0;
-    }();
-    if (!use_qsa || T < 128 || ratio <= 1 || ratio % 4 != 0 || pos0 % ratio != 0) return false;
-    const int64_t off    = pos0 / ratio;
-    const int64_t nb_cur = (T + ratio - 1) / ratio;
-    return indexer_k != nullptr && off + nb_cur <= indexer_k->ne[1];
+static bool qsa_enabled() {
+    static const bool on = [] { const char * v = getenv("QWEN4EXP_QSA"); return v && std::atoi(v) != 0; }();
+    return on;
 }
 
-// indexer_written bounds the populated prefix; selected-block scoring must never read uninitialised columns.
-static bool qsa_layer_ok(const Qwen4ExpWeights & w, ggml_tensor * k_cache,
-                         ggml_tensor * indexer_k, int64_t T, int64_t kv_len,
-                         int64_t pos0, int64_t ratio, int64_t Hq, int64_t Hk,
-                         int64_t indexer_written) {
-    static const bool use_qsa = [] {
-        const char * value = getenv("QWEN4EXP_QSA");
-        return value && std::atoi(value) != 0;
-    }();
-    if (!use_qsa || T < 128 || ratio <= 1) return false;
-    if (w.indexer_head_size != 128 || w.indexer_n_head <= 0 ||
-        w.indexer_top_k % ratio != 0) return false;
-    if ((w.indexer_top_k / ratio) * ratio + (ratio - 1) > 2560 || Hq != 12 * Hk) return false;
-    const int64_t qsa_step = (ratio % 4 == 0) ? ratio : (ratio % 2 == 0 ? ratio * 2 : ratio * 4);
-    const int64_t kv_pad   = (kv_len + qsa_step - 1) / qsa_step * qsa_step;
-    if (kv_pad > k_cache->ne[1]) return false;
-    if (!indexer_store_ok(indexer_k, T, pos0, ratio)) return false;
-    const int64_t budget = w.indexer_top_k / ratio;
-    const int64_t nb_cur = (T + ratio - 1) / ratio;
-    const int64_t off    = pos0 / ratio;
-    if (off + nb_cur < budget) return false;
-    if (off > indexer_written) return false;   // prefix not fully populated
-    return true;
+// QSA block ratio of the full-attention layers (0 when the model has no indexer).
+static int64_t qsa_ratio(const Qwen4ExpWeights & w) {
+    for (int il = 0; il < w.n_layer && il < (int) w.compress_ratios.size(); ++il) {
+        if (w.layers[il].is_full_attention && w.compress_ratios[il] > 1) return w.compress_ratios[il];
+    }
+    return 0;
+}
+
+enum Qwen4ExpQsaMode { QSA_DENSE = 0, QSA_PREFILL = 1, QSA_DECODE = 2 };
+
+// Selected attention is exactly dense while every query sees at most `budget` complete blocks, so it only runs past
+// that point: the packed prefill kernel for T >= 128, the per-query decode kernel below that. CUDA builds and the
+// upstream reference stay dense.
+static Qwen4ExpQsaMode qsa_mode(const Qwen4ExpWeights & w, const Qwen4ExpCache & cache, int64_t T, int64_t pos0,
+                                bool upstream) {
+    const int64_t r = qsa_ratio(w);
+    if (!qsa_enabled() || upstream || r <= 1 || cache.indexer_raw.empty() || !cache.indexer_raw[0]) return QSA_DENSE;
+    if (w.indexer_head_size != 128 || w.indexer_n_head <= 0 || w.indexer_top_k % r != 0) return QSA_DENSE;
+    const int64_t budget = w.indexer_top_k / r;
+    if (budget * r + (r - 1) > 2560 || w.n_head != 12 * w.n_head_kv) return QSA_DENSE;
+    if ((pos0 + T) / r <= budget) return QSA_DENSE;
+    if (T < 128) return QSA_DECODE;
+    const int64_t step = (r % 4 == 0) ? r : (r % 2 == 0 ? r * 2 : r * 4);
+    const int64_t kv_pad = (pos0 + T + step - 1) / step * step;
+    return kv_pad <= cache.attn_k[0]->ne[1] ? QSA_PREFILL : QSA_DENSE;
 }
 
 ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * cur,
                               const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
                               ggml_tensor * k_cache, ggml_tensor * v_cache,
-                              ggml_tensor * indexer_k,
+                              ggml_tensor * indexer_k, ggml_tensor * indexer_raw,
                               ggml_tensor * positions, ggml_tensor * mask, ggml_tensor * kv_row,
                               int64_t kv_len, int64_t pos0, int64_t ratio,
-                              int64_t indexer_written, int il,
+                              int64_t n_pooled, Qwen4ExpQsaMode qsa, int il,
                               const std::function<void(ggml_tensor *, const char *)> & dump_mark = {}) {
     const int64_t D      = w.n_embd_head_k;   // 256
     const int64_t Hq     = w.n_head;          // 24
@@ -694,50 +707,48 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
     ggml_tensor * V_full = ggml_view_3d(c, v_cache, D, kv_len, Hk,
         v_cache->nb[1], v_cache->nb[2], 0);
 
-    // Pad K/V to a multiple of lcm(4, ratio) so QSA runs at any prompt length instead of falling back to dense.
-    const int64_t qsa_step = (ratio % 4 == 0) ? ratio : (ratio % 2 == 0 ? ratio * 2 : ratio * 4);
-    const int64_t kv_pad   = (kv_len + qsa_step - 1) / qsa_step * qsa_step;
-
-    const int64_t nb_cur = (T + ratio - 1) / ratio;   // blocks in this chunk
-    const int64_t off    = pos0 / ratio;              // cached blocks before it
-    const bool store = indexer_store_ok(indexer_k, T, pos0, ratio);
-    const bool qsa_ok = qsa_layer_ok(w, k_cache, indexer_k, T, kv_len, pos0, ratio, Hq, Hk, indexer_written);
+    // Every token's raw indexer key goes to the cache, so blocks can be pooled whenever QSA first needs them.
+    ggml_tensor * kraw = nullptr;
+    if (indexer_raw) {
+        kraw = mm(c, L.indexer_k_proj, cur);   // [idim, T]
+        ggml_build_forward_expand(gf, kv_row
+            ? ggml_set_rows(c, indexer_raw, kraw, kv_row)
+            : ggml_cpy(c, kraw, ggml_view_2d(c, indexer_raw, kraw->ne[0], T, indexer_raw->nb[1],
+                                             (size_t) pos0 * indexer_raw->nb[1])));
+    }
     // qwen4exp_forward elides the dense causal mask only when every full layer takes QSA; a dense fallback without one must fail loudly.
-    if (T > 1 && mask == nullptr && !qsa_ok) {
+    if (T > 1 && mask == nullptr && qsa != QSA_PREFILL) {
         std::fprintf(stderr,
             "[qwen4exp] dense attention without a causal mask (T=%lld pos0=%lld)\n",
             (long long) T, (long long) pos0);
         std::abort();
     }
 
-    // Persist this chunk's indexer keys even if QSA is not selected: later chunks read blocks [0, off).
-    ggml_tensor * pooled_cur = nullptr;
-    if (store) {
-        pooled_cur = build_indexer_pooled(c, cur, L, w, pos0, ratio);
-        ggml_build_forward_expand(gf, ggml_cpy(c,
-            ggml_reshape_2d(c, pooled_cur, w.indexer_head_size, nb_cur),
-            ggml_view_2d(c, indexer_k, w.indexer_head_size, nb_cur,
-                         indexer_k->nb[1], (size_t) off * indexer_k->nb[1])));
-    }
-
     ggml_tensor * attn;
-    if (qsa_ok) {
-        GGML_ASSERT(pooled_cur != nullptr);
-        ggml_tensor * pooled = pooled_cur;
-        if (off > 0) {
-            ggml_tensor * prefix = ggml_view_2d(c, indexer_k, w.indexer_head_size, off,
-                                                indexer_k->nb[1], 0);
-            pooled = ggml_reshape_3d(c, ggml_concat(c, prefix,
-                ggml_reshape_2d(c, pooled_cur, w.indexer_head_size, nb_cur), 1),
-                w.indexer_head_size, off + nb_cur, 1);
+    if (qsa != QSA_DENSE) {
+        GGML_ASSERT(kraw && indexer_k && ratio > 1);
+        const int64_t n_after = (pos0 + T) / ratio;   // complete blocks visible to the last query
+        ggml_tensor * pooled = qsa_pooled_keys(c, gf, L, w, indexer_k, indexer_raw, kraw, pos0, ratio, n_pooled, n_after);
+        if (qsa == QSA_PREFILL) {
+            // Pad K/V to a multiple of lcm(4, ratio) for the packed prefill kernel.
+            const int64_t qsa_step = (ratio % 4 == 0) ? ratio : (ratio % 2 == 0 ? ratio * 2 : ratio * 4);
+            const int64_t kv_pad   = (kv_len + qsa_step - 1) / qsa_step * qsa_step;
+            ggml_tensor * K_pad = (kv_pad != kv_len)
+                ? ggml_view_3d(c, k_cache, D, kv_pad, Hk, k_cache->nb[1], k_cache->nb[2], 0) : K_full;
+            ggml_tensor * V_pad = (kv_pad != kv_len)
+                ? ggml_view_3d(c, v_cache, D, kv_pad, Hk, v_cache->nb[1], v_cache->nb[2], 0) : V_full;
+            attn = build_qsa_attn(c, cur, Q, K_pad, V_pad, L, w, ratio, positions,
+                                  kv_pad, kv_len, pos0, pooled, n_after, true);
+        } else {
+            attn = build_qsa_attn(c, cur, Q, K_full, V_full, L, w, ratio, positions,
+                                  kv_len, kv_len, pos0, pooled, n_after, false);
         }
-
-        ggml_tensor * K_pad = (kv_pad != kv_len)
-            ? ggml_view_3d(c, k_cache, D, kv_pad, Hk, k_cache->nb[1], k_cache->nb[2], 0) : K_full;
-        ggml_tensor * V_pad = (kv_pad != kv_len)
-            ? ggml_view_3d(c, v_cache, D, kv_pad, Hk, v_cache->nb[1], v_cache->nb[2], 0) : V_full;
-        attn = build_qsa_attn(c, cur, Q, K_pad, V_pad, L, w, ratio, positions,
-                              kv_pad, kv_len, pos0, pooled, off + nb_cur);
+        if (dump_mark) {   // the last query's selected cells
+            ggml_tensor * ids = attn->src[5];
+            char dlab[32];
+            std::snprintf(dlab, sizeof dlab, "L%02d.qsaids", il);
+            dump_mark(ggml_view_1d(c, ids, ids->ne[0], (size_t) (T - 1) * ids->nb[1]), dlab);
+        }
     } else {
         // The padded cache tail is zero-initialized and excluded by the causal mask,
         // including during single-token decode.
@@ -1172,7 +1183,11 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     static const bool upstream = [] { const char * v = getenv("QWEN4EXP_UPSTREAM"); return v && std::atoi(v) != 0; }();
     const bool hc_fused = !upstream;
     // T=1 decode reuses one context/allocator and a stable bucketed graph.
-    const bool use_stable_graph = !upstream && n_tokens == 1 && !dump;
+    // Past the QSA block budget the selected-cell graph changes shape as blocks complete, so it is rebuilt per step.
+    const Qwen4ExpQsaMode qsa = qsa_mode(w, cache, n_tokens, pos0, upstream);
+    // T=1 decode reuses one context/allocator; below the QSA budget it also keeps a stable bucketed graph.
+    const bool reuse_ws = !upstream && n_tokens == 1 && !dump;
+    const bool use_stable_graph = reuse_ws && qsa == QSA_DENSE;
     std::vector<std::pair<ggml_tensor *, std::string>> dump_t;
     auto dump_mark = [&](ggml_tensor * t, const char * label) {
         if (t && dump) {
@@ -1316,13 +1331,17 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                   ggml_graph_overhead_custom(200000, false) + (1u << 20);
     ip.no_alloc = true;
     ggml_context * ctx = nullptr;
-    if (use_stable_graph) {
+    if (reuse_ws) {
         if (cache.decode_workspace.ctx == nullptr) {
             cache.decode_workspace.ctx = ggml_init(ip);
         } else {
             ggml_reset(cache.decode_workspace.ctx);
         }
         ctx = cache.decode_workspace.ctx;
+        if (!use_stable_graph) {   // the reset just freed the stable graph's tensors
+            decode_ws.gf = nullptr;
+            decode_ws.kv_bucket = 0;
+        }
     } else {
         ctx = ggml_init(ip);
     }
@@ -1344,36 +1363,8 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         ggml_set_input(kv_row);
     }
     ggml_tensor * mask = nullptr;
-    // QSA derives its own complete-block visibility. Elide the dense mask only
-    // when every full-attention layer can take that path.
-    int full0 = -1;
-    for (int il = 0; il < w.n_layer && full0 < 0; ++il) {
-        if (w.layers[il].is_full_attention) full0 = il;
-    }
-    bool qsa_all = T > 1 && full0 >= 0;
-    // Capture before advancing so the per-layer guard bounds the prefix this chunk reads.
-    const int indexer_written = cache.indexer_blocks;
-    // Commit only after the graph computes: a failed alloc/compute must not mark columns the kernel never wrote.
-    int next_indexer_blocks = indexer_written;
-    if (T > 1 && full0 >= 0) {
-        const int fi = full_idx[full0];
-        const int64_t ratio = full0 < (int) w.compress_ratios.size() ? w.compress_ratios[full0] : 0;
-        for (int il = 0; il < w.n_layer && qsa_all; ++il) {
-            if (!w.layers[il].is_full_attention) continue;
-            const int layer_fi = full_idx[il];
-            const int64_t layer_ratio = il < (int) w.compress_ratios.size()
-                ? w.compress_ratios[il] : 0;
-            qsa_all = qsa_layer_ok(w, cache.attn_k[layer_fi], cache.indexer_k[layer_fi],
-                                   T, kv_len, pos0, layer_ratio,
-                                   w.n_head, w.n_head_kv, indexer_written);
-        }
-        if (indexer_store_ok(cache.indexer_k[fi], T, pos0, ratio)) {
-            // Only extend on a contiguous chunk; a gap leaves the cache unusable so later chunks fall back to dense.
-            const int off = (int) (pos0 / ratio);
-            const int end = (int) (pos0 / ratio + (T + ratio - 1) / ratio);
-            next_indexer_blocks = (indexer_written == off) ? end : -1;
-        }
-    }
+    // QSA derives its own complete-block visibility: the prefill kernel needs no dense mask.
+    const bool qsa_all = qsa == QSA_PREFILL;
     if ((T > 1 || fa_pad256 || use_stable_graph) && !qsa_all) {
         mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mask_len, T);
         ggml_set_input(mask);
@@ -1419,9 +1410,10 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
             const int fi = full_idx[il];
             cur = build_full_attn(ctx, gf, cur, L, w,
                                   cache.attn_k[fi], cache.attn_v[fi], cache.indexer_k[fi],
+                                  qsa_enabled() && !upstream ? cache.indexer_raw[fi] : nullptr,
                                   positions, mask, kv_row, graph_kv_len, pos0,
                                   il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0,
-                                  indexer_written, il, dump_mark);
+                                  cache.indexer_blocks, qsa, il, dump_mark);
         } else {
             const int li = lin_idx[il];
             cur = build_linear_attn(ctx, gf, cur, L, w,
@@ -1558,7 +1550,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     }
 
     ggml_gallocr_t galloc = nullptr;
-    if (use_stable_graph) {
+    if (reuse_ws) {
         if (cache.decode_workspace.alloc == nullptr) {
             cache.decode_workspace.alloc =
                 ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -1569,25 +1561,25 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     }
     if (!galloc) {
         std::fprintf(stderr, "[qwen4exp] graph allocator creation failed\n");
-        if (!use_stable_graph) ggml_free(ctx);
+        if (!reuse_ws) ggml_free(ctx);
         return res;
     }
     // T=1 graphs keep the same broad shape but advancing KV views can change
     // lifetimes. Recompute assignments while retaining the allocator buffers;
     // reusing the old index-wise plan produced incorrect tokens.
-    const bool reserve_ok = !use_stable_graph ||
+    const bool reserve_ok = !reuse_ws ||
         !cache.decode_workspace.planned || ggml_gallocr_reserve(galloc, gf);
     if (!reserve_ok || !ggml_gallocr_alloc_graph(galloc, gf)) {
         std::fprintf(stderr, "[qwen4exp] graph alloc failed (T=%lld kv_len=%lld)\n",
                      (long long) T, (long long) kv_len);
-        if (use_stable_graph) cache.decode_workspace.planned = false;
-        if (!use_stable_graph) {
+        if (reuse_ws) cache.decode_workspace.planned = false;
+        if (!reuse_ws) {
             ggml_gallocr_free(galloc);
             ggml_free(ctx);
         }
         return res;
     }
-    if (use_stable_graph) cache.decode_workspace.planned = true;
+    if (reuse_ws) cache.decode_workspace.planned = true;
 
     if (use_stable_graph) {
         decode_ws.gf = gf;
@@ -1657,7 +1649,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     const double call_begin_s = call_telemetry ? mono_now_s() : 0.0;
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[qwen4exp] graph compute failed\n");
-        if (use_stable_graph) {
+        if (reuse_ws) {
             clear_qwen4exp_decode_workspace(decode_ws);
         } else {
             ggml_gallocr_free(galloc);
@@ -1665,7 +1657,8 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         }
         return res;
     }
-    cache.indexer_blocks = next_indexer_blocks;
+    // Commit only after the graph computed: a failed compute must not mark blocks the kernel never pooled.
+    if (qsa != QSA_DENSE) cache.indexer_blocks = (int) ((pos0 + T) / qsa_ratio(w));
 
     out_logits.resize((size_t) w.n_vocab);
     ggml_backend_tensor_get(logits, out_logits.data(), 0, sizeof(float) * w.n_vocab);
@@ -1744,7 +1737,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         }
     }
 
-    if (!use_stable_graph) {
+    if (!reuse_ws) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
     }

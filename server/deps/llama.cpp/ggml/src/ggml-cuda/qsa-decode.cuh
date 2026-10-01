@@ -86,7 +86,7 @@ bool ggml_cuda_flash_attn_ext_qsa_decode_supported(ggml_backend_cuda_context & c
     memcpy(&cap, (const char *) dst->op_params + 8, 4);
     if (bias != 0.0f || cap != 0.0f || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 ||
         v->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
-        q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 || q->ne[1] < 1 || q->ne[1] > 8 ||
+        q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 || q->ne[1] < 1 || q->ne[1] > 127 ||
         k->ne[1] < 1 || k->ne[1] > 262144 || v->ne[1] != k->ne[1] ||
         k->ne[2] < 1 || q->ne[2] % k->ne[2] || v->ne[2] != k->ne[2] ||
         q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||

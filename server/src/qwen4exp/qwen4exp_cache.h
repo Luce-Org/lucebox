@@ -75,10 +75,12 @@ struct Qwen4ExpCache {
     std::vector<ggml_tensor *> attn_k;  // size = n_full
     std::vector<ggml_tensor *> attn_v;
 
-    // QSA indexer keys, normed + M-RoPE'd at absolute block positions:
-    // [indexer_head_size, ceil(max_ctx/ratio)] f32. `indexer_blocks` is the
-    // populated prefix QSA selection must never read past.
-    std::vector<ggml_tensor *> indexer_k;  // size = n_full
+    // QSA indexer. indexer_raw holds every token's raw (pre-pool) key, [indexer_head_size, max_ctx] f32;
+    // indexer_k holds pooled complete blocks (mean of `ratio` consecutive raw keys, normed and M-RoPE'd at the
+    // block start), [indexer_head_size, ceil(max_ctx/ratio)] f32. `indexer_blocks` is the pooled prefix: blocks
+    // past it are pooled from indexer_raw the next time QSA runs.
+    std::vector<ggml_tensor *> indexer_k;    // size = n_full
+    std::vector<ggml_tensor *> indexer_raw;  // size = n_full
     int indexer_blocks = 0;
 
     // Gated delta net: ssm_state [S_v, S_v, H_v] f32;
