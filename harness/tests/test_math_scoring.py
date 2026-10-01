@@ -58,6 +58,13 @@ class GsmScoringTest(unittest.TestCase):
     def test_hash_marker(self) -> None:
         self.assertTrue(self._score("The total is 3\n#### 3", "3"))
 
+    def test_marker_followed_by_equation(self) -> None:
+        # Regression (Qwen3.8-Flash-Next gsm_02): "total: $2 + 1 = 3$" was read as 2.
+        text = "3.  **Total:** Add the bolts together for the total: $2 + 1 = 3$.\n\n**3**"
+        self.assertTrue(self._score(text, "3"))
+        self.assertTrue(self._score("Answer: 20 + 80 + 160 = 260 sheep", "260"))
+        self.assertTrue(self._score("The answer is 10 (x = 3 is not used).", "10"))
+
     def test_wrong(self) -> None:
         self.assertFalse(self._score("**Answer:** 20", "260"))
 

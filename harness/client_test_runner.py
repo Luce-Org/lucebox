@@ -1558,7 +1558,13 @@ def _score_gsm_response(text: str, gold_answer: str) -> tuple[bool, str]:
             )
         )
         if markers:
-            pred = markers[-1].group(1).replace(",", "")
+            m = markers[-1]
+            # "Total: $2 + 1 = 3$" -> the equation's result, not its first operand.
+            eq = re.match(
+                r"(?:\s*[-+*/×x]\s*\$?\d[\d,]*\.?\d*)+\s*=\s*\$?([+-]?\d[\d,]*\.?\d*)",
+                answer_text[m.end() :],
+            )
+            pred = (eq or m).group(1).replace(",", "")
 
     # **<number>** or **$<number>** (last)
     if pred is None:
