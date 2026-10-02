@@ -220,14 +220,27 @@ DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot) {
 
 bool Qwen35SeqEngine::chain_spec_input_capable(
         const StepInput & input) const {
-    if (!fixed_chain_ready_ || !input.allow_speculation ||
-        input.slot < 0 || input.slot >= slots_.slot_count()) {
-        return false;
+    return chain_spec_decision(input) ==
+        observability::SpecDecision::Selected;
+}
+
+observability::SpecDecision Qwen35SeqEngine::chain_spec_decision(
+        const StepInput & input) const {
+    using Decision = observability::SpecDecision;
+    if (!fixed_chain_ready_) return Decision::FeatureUnavailable;
+    if (!input.allow_speculation) return Decision::CallerDisallowed;
+    if (input.slot < 0 || input.slot >= slots_.slot_count()) {
+        return Decision::InvalidSlot;
     }
     const Qwen35Slot & slot = slots_.slot(input.slot);
-    return slot.decoding() && !slot.sampler.needs_logit_processing() &&
-           slot.cur_pos >= 1 &&
-           slot.cur_pos + fixed_chain_.width <= slots_.max_context();
+    if (!slot.decoding() || slot.cur_pos < 1 ||
+        slot.cur_pos + fixed_chain_.width > slots_.max_context()) {
+        return Decision::InsufficientContext;
+    }
+    if (slot.sampler.needs_logit_processing()) {
+        return Decision::SamplingUnsupported;
+    }
+    return Decision::Selected;
 }
 
 std::vector<uint8_t>
@@ -243,7 +256,10 @@ Qwen35SeqEngine::select_chain_lanes(const StepPlan & plan) const {
 std::optional<Qwen35SeqEngine::PreparedChainRound>
 Qwen35SeqEngine::prepare_chain_drafts(
         const std::vector<StepInput> & inputs,
-        const std::vector<uint8_t> & selected) {
+        const std::vector<uint8_t> & selected,
+        observability::StepProfile * profile) {
+    const uint64_t prepare_started_ns =
+        profile ? observability::steady_time_ns() : 0;
     if (selected.size() != inputs.size() || !fixed_chain_ready_ ||
         fixed_chain_.width <= 1 || fixed_chain_.width != b_.dw_.block_size) {
         return std::nullopt;
@@ -358,12 +374,28 @@ Qwen35SeqEngine::prepare_chain_drafts(
         roots.push_back(lanes.front().root);
     }
 
+    if (profile) {
+        profile->end_phase(
+            observability::Phase::DraftPrepare, prepare_started_ns);
+        profile->draft_bucket = static_cast<uint32_t>(bucket);
+        profile->draft_rows =
+            static_cast<uint32_t>(fixed_chain_.width * bucket);
+        profile->draft_padding_rows =
+            static_cast<uint32_t>(fixed_chain_.width * dummy_count);
+        profile->draft_forwards = 1;
+    }
+
     std::vector<std::vector<float>> hidden_blocks;
     std::vector<std::vector<int32_t>> proposals;
-    if (!draft_kv_batch_compute(
+    bool drafted = false;
+    {
+        const observability::PhaseScope phase(
+            profile, observability::Phase::DraftCompute);
+        drafted = draft_kv_batch_compute(
             batch_draft_graph_, b_.dw_, b_.draft_backend_,
-            batch_states, hidden_blocks) ||
-        hidden_blocks.size() != batch_states.size()) {
+            batch_states, hidden_blocks);
+    }
+    if (!drafted || hidden_blocks.size() != batch_states.size()) {
         reset_lanes();
         return std::nullopt;
     }
@@ -372,10 +404,15 @@ Qwen35SeqEngine::prepare_chain_drafts(
     for (const std::vector<float> & block : hidden_blocks) {
         hidden_by_lane.push_back(block.data());
     }
-    if (!dflash2_select_chains_batched(
+    bool selected_chains = false;
+    {
+        const observability::PhaseScope phase(
+            profile, observability::Phase::ProposalSelect);
+        selected_chains = dflash2_select_chains_batched(
             b_.dw_, b_.draft_backend_, b_.w_.output, hidden_by_lane,
-            fixed_chain_.width, roots, proposals) ||
-        proposals.size() != batch_states.size()) {
+            fixed_chain_.width, roots, proposals);
+    }
+    if (!selected_chains || proposals.size() != batch_states.size()) {
         reset_lanes();
         return std::nullopt;
     }
@@ -860,6 +897,11 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         PreparedChainRound && prepared_round) {
     StepResult result;
     const std::vector<StepInput> & inputs = plan.decode;
+    observability::StepProfile * const profile = plan.profile;
+    if (profile) {
+        profile->path = observability::StepPath::Chain;
+        profile->executed_decode_lanes = static_cast<uint32_t>(inputs.size());
+    }
     if (!plan.prefills.empty() || selected.size() != inputs.size()) {
         result.error = "invalid fixed chain round";
         return result;
@@ -1025,14 +1067,51 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     for (const ArLane & lane : ar_lanes) {
         max_prefix = std::max(max_prefix, lane.position + 1);
     }
+    if (profile) {
+        const uint32_t offered = static_cast<uint32_t>(tree_width - 1);
+        profile->spec_tree_width = static_cast<uint32_t>(tree_width);
+        profile->target_rows = static_cast<uint32_t>(total_rows);
+        profile->target_padding_rows =
+            static_cast<uint32_t>(tree_width * (tree_bucket - spec_count));
+        profile->decode_bucket = static_cast<uint32_t>(tree_bucket);
+        profile->max_kv_len = static_cast<uint32_t>(max_prefix);
+        profile->target_forwards = 1;
+        profile->spec_proposed_draft_tokens = offered * spec_count;
+        profile->spec_verified_draft_tokens = offered * spec_count;
+        for (int position = 1; position < tree_width &&
+                 position < static_cast<int>(observability::kMaxSpecPositions);
+             ++position) {
+            profile->proposed_by_position[static_cast<size_t>(position)] +=
+                static_cast<uint32_t>(spec_count);
+        }
+        for (const Proposal & proposal : proposals) {
+            if (auto * lane = profile->find_lane(
+                    proposal.slot, observability::LaneKind::Decode)) {
+                lane->proposed_draft_tokens = offered;
+                lane->verified_draft_tokens = offered;
+            }
+        }
+    }
+    // Chain rounds return before the packed path's concurrent_step, so they
+    // carry their own path range inside the service round.
+    const Qwen35RoctxMetadata roctx_metadata{
+        static_cast<int>(inputs.size()), tree_bucket, 0, 0, total_rows,
+        max_prefix, observability::current_service_round(), "chain"};
+    const Qwen35RoctxRange roctx_step("qwen35.concurrent_step", roctx_metadata);
 
     StepGraph & graph = b_.sg_;
     const ggml_cgraph * graph_before = graph.gf;
-    if (!build_target_step_paged_tree(
+    bool graph_built = false;
+    {
+        const observability::PhaseScope build_phase(
+            profile, observability::Phase::TargetGraphBuild);
+        graph_built = build_target_step_paged_tree(
             graph, b_.w_, b_.cache_, b_.target_backend_,
             tree_width, tree_bucket, max_prefix,
             fixed_chain_.scratch_base, fixed_chain_.scratch_stride,
-            b_.cfg_.kq_stride_pad, ar_count)) {
+            b_.cfg_.kq_stride_pad, ar_count);
+    }
+    if (!graph_built) {
         result.error = "fixed chain target graph build failed";
         return result;
     }
@@ -1040,6 +1119,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     // time into this round; such a round is not a cost sample.
     const bool graph_rebuilt = graph.gf != graph_before;
 
+    std::optional<observability::PhaseScope> phase;
+    if (profile) phase.emplace(profile, observability::Phase::MetadataUpload);
     std::vector<int32_t> tokens(static_cast<size_t>(total_rows), 0);
     std::vector<int32_t> parents(
         static_cast<size_t>(tree_rows_count), -1);
@@ -1154,18 +1235,31 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
         sizeof(int32_t) * seq_lens_.size());
     staged_round.device_lengths_dirty = true;
-    if (ggml_backend_graph_compute(b_.target_backend_, graph.gf) !=
-        GGML_STATUS_SUCCESS) {
+    phase.reset();
+    ggml_status target_status = GGML_STATUS_FAILED;
+    {
+        const observability::PhaseScope compute_phase(
+            profile, observability::Phase::TargetCompute);
+        const Qwen35RoctxRange roctx_compute(
+            "qwen35.graph_compute", roctx_metadata);
+        target_status = ggml_backend_graph_compute(b_.target_backend_, graph.gf);
+    }
+    if (target_status != GGML_STATUS_SUCCESS) {
         result.error = "fixed chain target compute failed";
         return result;
     }
 
     std::vector<int32_t> posterior(
         static_cast<size_t>(total_rows), -1);
-    ggml_backend_tensor_get(
-        graph.argmax_tokens, posterior.data(), 0,
-        sizeof(int32_t) * posterior.size());
+    {
+        const observability::PhaseScope readback_phase(
+            profile, observability::Phase::ReadbackSync);
+        ggml_backend_tensor_get(
+            graph.argmax_tokens, posterior.data(), 0,
+            sizeof(int32_t) * posterior.size());
+    }
 
+    if (profile) phase.emplace(profile, observability::Phase::Acceptance);
     for (int lane_index = 0; lane_index < spec_count; ++lane_index) {
         Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
         const int row_base = ar_count + lane_index * tree_width;
@@ -1190,7 +1284,31 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             return result;
         }
     }
+    phase.reset();
+    if (profile) {
+        // Index 0 is the root; accepted counts target-verified children and
+        // durable counts the children committed after serving clamps.
+        for (const Proposal & proposal : proposals) {
+            const uint32_t accepted =
+                static_cast<uint32_t>(proposal.verified - 1);
+            const uint32_t durable =
+                static_cast<uint32_t>(proposal.accepted - 1);
+            profile->spec_accepted_draft_tokens += accepted;
+            profile->spec_durable_draft_tokens += durable;
+            for (uint32_t position = 1; position <= accepted &&
+                     position < observability::kMaxSpecPositions;
+                 ++position) {
+                ++profile->accepted_by_position[position];
+            }
+            if (auto * lane = profile->find_lane(
+                    proposal.slot, observability::LaneKind::Decode)) {
+                lane->accepted_draft_tokens = accepted;
+                lane->durable_draft_tokens = durable;
+            }
+        }
+    }
 
+    if (profile) phase.emplace(profile, observability::Phase::StatePromotion);
     std::vector<int32_t> accepted_prefixes(
         static_cast<size_t>(tree_bucket), 0);
     std::vector<int32_t> commit_slots(
@@ -1341,6 +1459,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         slots_.commit_step(input.slot);
     }
     staged_round.committed = true;
+    phase.reset();
+    if (profile) phase.emplace(profile, observability::Phase::SamplingCommit);
     for (int lane_index = 0; lane_index < spec_count; ++lane_index) {
         Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
         const int graph_row = ar_count + lane_index * tree_width +
@@ -1361,6 +1481,17 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         if (lane.pending < 0) {
             result.error = "compact AR sampling failed";
             return result;
+        }
+    }
+    phase.reset();
+    if (profile) {
+        profile->spec_pending_tokens = static_cast<uint32_t>(spec_count);
+        profile->kv_blocks_free_after = pool_.free_block_count();
+        for (const StepInput & input : inputs) {
+            if (auto * lane = profile->find_lane(
+                    input.slot, observability::LaneKind::Decode)) {
+                lane->pending_token_sampled = true;
+            }
         }
     }
 
@@ -1406,8 +1537,22 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     std::vector<PrefillOutput> & prefill_outputs = result.prefills;
     const std::vector<StepInput> & inputs = plan.decode;
     const int n_slots = slots_.slot_count();
+    observability::StepProfile * const profile = plan.profile;
+    const uint64_t round_id = observability::current_service_round();
+    if (profile) {
+        profile->kv_blocks_total = pool_.physical_block_count();
+        profile->kv_blocks_free_before = pool_.free_block_count();
+        profile->kv_blocks_free_after = profile->kv_blocks_free_before;
+        profile->active_sequences = pool_.active_sequence_count();
+        profile->spec_tree_width =
+            static_cast<uint32_t>(std::max(0, fixed_chain_.width));
+    }
 
     auto fail_step = [&](const std::string & error) {
+        if (profile) {
+            profile->ok = false;
+            profile->kv_blocks_free_after = pool_.free_block_count();
+        }
         result.decode.clear();
         result.prefills.clear();
         result.error = error;
@@ -1457,22 +1602,60 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         static_cast<int>(plan.prefills.size()),
         -1,
         -1,
+        round_id,
     };
     const Qwen35RoctxRange roctx_service_round(
         "qwen35.service_round", service_round_metadata);
 
     std::vector<uint8_t> chain_lanes = select_chain_lanes(plan);
+    if (profile) {
+        for (const StepInput & input : inputs) {
+            const auto decision = chain_spec_decision(input);
+            auto * lane = profile->find_lane(
+                input.slot, observability::LaneKind::Decode);
+            if (lane) {
+                lane->context_tokens =
+                    static_cast<uint32_t>(slots_.slot(input.slot).cur_pos);
+                lane->spec = !plan.prefills.empty() &&
+                        decision == observability::SpecDecision::Selected
+                    ? observability::SpecDecision::PromptWorkPresent
+                    : decision;
+            }
+            if (decision == observability::SpecDecision::Selected) {
+                ++profile->spec_eligible_lanes;
+                if (plan.prefills.empty()) ++profile->spec_reserved_lanes;
+            }
+        }
+    }
     const bool has_chain_lane = std::any_of(
         chain_lanes.begin(), chain_lanes.end(),
         [](uint8_t selected) { return selected != 0; });
     if (has_chain_lane) {
         chain_round_t0_ = std::chrono::steady_clock::now();
+        if (profile) {
+            profile->spec_attempted_lanes = static_cast<uint32_t>(
+                std::count(chain_lanes.begin(), chain_lanes.end(), 1));
+        }
         std::optional<PreparedChainRound> prepared =
-            prepare_chain_drafts(inputs, chain_lanes);
+            prepare_chain_drafts(inputs, chain_lanes, profile);
         if (prepared) {
             return step_chain_spec(plan, chain_lanes, std::move(*prepared));
         }
+        if (profile) {
+            for (size_t i = 0; i < inputs.size(); ++i) {
+                if (!chain_lanes[i]) continue;
+                if (auto * lane = profile->find_lane(
+                        inputs[i].slot, observability::LaneKind::Decode)) {
+                    lane->spec =
+                        observability::SpecDecision::DraftPrepareFailed;
+                }
+            }
+        }
     }
+
+    if (profile) profile->path = observability::StepPath::Packed;
+    const uint64_t input_started_ns =
+        profile ? observability::steady_time_ns() : 0;
 
     const TargetWeights & w = b_.w_;
     StepGraph & sg = b_.sg_;
@@ -1523,6 +1706,12 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         live_physical_rows_.push_back(app.physical_row);
         live_slot_ids_.push_back(in.slot);
         max_kv_len = std::max(max_kv_len, app.position + 1);
+        if (profile) {
+            if (auto * lane = profile->find_lane(
+                    in.slot, observability::LaneKind::Decode)) {
+                lane->context_tokens = static_cast<uint32_t>(app.position + 1);
+            }
+        }
         out.failed = false;
         decode_outputs.push_back(std::move(out));
         output_rows_.push_back(compact_row);
@@ -1544,6 +1733,15 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             return fail_step("selected prefill work made no progress");
         }
         prefills.push_back(std::move(prefill));
+        if (profile) {
+            if (auto * lane = profile->find_lane(
+                    slice.slot, observability::LaneKind::Prefill)) {
+                lane->context_tokens =
+                    static_cast<uint32_t>(prefills.back().kv_pos);
+                lane->executed_prefill_tokens =
+                    static_cast<uint32_t>(prefills.back().chunk);
+            }
+        }
     }
 
     const int live_count = (int)live_tokens_.size();
@@ -1584,9 +1782,23 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     }
     const bool with_prefill = n_prefill > 0;
     const int n_total = n_prefill + decode_bucket;
+    if (profile) {
+        profile->end_phase(
+            observability::Phase::InputStaging, input_started_ns);
+        profile->executed_decode_lanes = static_cast<uint32_t>(live_count);
+        profile->executed_prefill_lanes =
+            static_cast<uint32_t>(prefills.size());
+        profile->executed_prefill_tokens = static_cast<uint32_t>(n_prefill);
+        profile->target_rows = static_cast<uint32_t>(n_total);
+        profile->target_padding_rows =
+            static_cast<uint32_t>(decode_bucket - live_count);
+        profile->decode_bucket = static_cast<uint32_t>(decode_bucket);
+        profile->max_kv_len = static_cast<uint32_t>(max_kv_len);
+        profile->target_forwards = 1;
+    }
     const Qwen35RoctxMetadata roctx_metadata{
         live_count, decode_bucket, n_prefill, (int)segments.size(),
-        n_total, max_kv_len};
+        n_total, max_kv_len, round_id, "packed"};
     const Qwen35RoctxRange roctx_step("qwen35.concurrent_step", roctx_metadata);
     const int gather_rows = with_prefill
         ? (with_decode ? n_commits + decode_bucket
@@ -1594,6 +1806,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         : 0;
 
     bool built = false;
+    {
+    const observability::PhaseScope build_phase(
+        profile, observability::Phase::TargetGraphBuild);
     if (with_prefill) {
         built = build_target_step(
             sg, w, b_.cache_, b_.target_backend_,
@@ -1633,6 +1848,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             /*n_logits_rows=*/0,
             /*compact_slots=*/true);
     }
+    }
     if (!built || !sg.kv_write_rows ||
         (fixed_chain_ready_ && !sg.target_feat_rows) ||
         (with_prefill &&
@@ -1641,6 +1857,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         return fail_step("packed prefill/decode graph build failed");
     }
 
+    std::optional<observability::PhaseScope> upload_phase;
+    if (profile) upload_phase.emplace(profile, observability::Phase::MetadataUpload);
     embed_buf_.resize((size_t)hidden * n_total);
     int token_offset = 0;
     for (const PrefillStage & prefill : prefills) {
@@ -1790,9 +2008,12 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     ggml_backend_tensor_set_async(
         b_.target_backend_, b_.cache_.paged_kv_seq_lens,
         seq_lens_.data(), 0, sizeof(int32_t) * seq_lens_.size());
+    upload_phase.reset();
 
     ggml_status st = GGML_STATUS_FAILED;
     {
+        const observability::PhaseScope compute_phase(
+            profile, observability::Phase::TargetCompute);
         const Qwen35RoctxRange roctx_compute(
             "qwen35.graph_compute", roctx_metadata);
         st = ggml_backend_graph_compute(b_.target_backend_, sg.gf);
@@ -1803,16 +2024,20 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
 
     const int decode_row0 = with_prefill ? n_commits : 0;
     const int argmax_rows = with_prefill ? gather_rows : decode_bucket;
-    argmax_buf_.assign((size_t)argmax_rows, -1);
-    ggml_backend_tensor_get_async(
-        b_.target_backend_, sg.argmax_tokens, argmax_buf_.data(), 0,
-        sizeof(int32_t) * argmax_buf_.size());
     {
+        const observability::PhaseScope readback_phase(
+            profile, observability::Phase::ReadbackSync);
+        argmax_buf_.assign((size_t)argmax_rows, -1);
+        ggml_backend_tensor_get_async(
+            b_.target_backend_, sg.argmax_tokens, argmax_buf_.data(), 0,
+            sizeof(int32_t) * argmax_buf_.size());
         const Qwen35RoctxRange roctx_sync(
             "qwen35.argmax_readback", roctx_metadata);
         ggml_backend_synchronize(b_.target_backend_);
     }
 
+    const observability::PhaseScope sampling_phase(
+        profile, observability::Phase::SamplingCommit);
     for (size_t oi = 0; oi < inputs.size(); ++oi) {
         DecodeOutput & out = decode_outputs[oi];
         if (out.failed) continue;
@@ -1842,6 +2067,16 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             slots_.commit_prefill(slot);
         }
         prefill_outputs.push_back(std::move(out));
+    }
+    if (profile) {
+        profile->kv_blocks_free_after = pool_.free_block_count();
+        for (const DecodeOutput & out : decode_outputs) {
+            if (out.failed) continue;
+            if (auto * lane = profile->find_lane(
+                    out.slot, observability::LaneKind::Decode)) {
+                lane->pending_token_sampled = true;
+            }
+        }
     }
     return result;
 }

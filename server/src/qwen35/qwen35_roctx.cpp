@@ -92,6 +92,19 @@ void append(char * message, size_t capacity, size_t & used, const char * name, i
     const int n = std::snprintf(message + used, capacity - used, " %s=%d", name, value);
     if (n > 0) used += std::min((size_t)n, capacity - used - 1);
 }
+
+void append_round(char * message, size_t capacity, size_t & used,
+                  uint64_t round_id, const char * path) {
+    if (round_id != 0 && used < capacity) {
+        const int n = std::snprintf(message + used, capacity - used,
+                                    " round_id=%llu", (unsigned long long)round_id);
+        if (n > 0) used += std::min((size_t)n, capacity - used - 1);
+    }
+    if (path && path[0] && used < capacity) {
+        const int n = std::snprintf(message + used, capacity - used, " path=%s", path);
+        if (n > 0) used += std::min((size_t)n, capacity - used - 1);
+    }
+}
 } // namespace
 
 bool qwen35_roctx_env_enabled(const char * value) {
@@ -108,6 +121,7 @@ Qwen35RoctxRange::Qwen35RoctxRange(const char * scope, const Qwen35RoctxMetadata
     char message[256];
     const int initial = std::snprintf(message, sizeof(message), "%s", scope);
     size_t used = initial > 0 ? std::min((size_t)initial, sizeof(message) - 1) : 0;
+    append_round(message, sizeof(message), used, metadata.round_id, metadata.path);
     append(message, sizeof(message), used, "live", metadata.live);
     append(message, sizeof(message), used, "bucket", metadata.bucket);
     append(message, sizeof(message), used, "prefill_tokens", metadata.prefill_tokens);

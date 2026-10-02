@@ -31,6 +31,7 @@
 #include "adaptive_keep_ratio.h"
 #include "server_status.h"
 #include "sse_emitter.h"
+#include "common/observability/concurrency_capture.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -200,6 +201,8 @@ struct ServerConfig {
     std::string runtime_backend;       // "cuda" | "hip" | "cpu"
     int         fa_window           = 0;
     int         ddtree_budget       = 0;
+    int         draft_block_size    = 0;  // LUCE_PROF capture metadata
+    int         max_concurrency     = 1;  // LUCE_PROF capture metadata
     bool        speculative_enabled = false;
     bool        image_input_enabled = false;
     bool        target_sharding     = false;
@@ -719,6 +722,8 @@ private:
     std::condition_variable         queue_cv_;
     ServerJob *                     queue_head_ = nullptr;
     ServerJob *                     queue_tail_ = nullptr;
+    // LUCE_PROF lucebox.concurrency.v1 capture; inert when disabled.
+    observability::ConcurrencyCapture capture_;
     std::atomic<bool>               stopping_{false};
 
     // Active client thread tracking.
@@ -755,6 +760,7 @@ struct ServerJob {
     // First concurrent-scheduler attempt; retained across busy deferrals so
     // server-side prefill/elapsed telemetry does not erase queueing delay.
     std::chrono::steady_clock::time_point parallel_started_at{};
+    uint64_t      profile_queued_ns = 0;  // LUCE_PROF enqueue time
 };
 
 // ─── Parse session_id from a chat-completion JSON body ──────────────────

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 namespace luce::common {
 
 struct Qwen35RoctxMetadata {
@@ -9,6 +11,10 @@ struct Qwen35RoctxMetadata {
     int prefill_segments = -1;
     int total_rows = -1;
     int max_kv_len = -1;
+    // Scheduler service round (0 = none) and executed path, so rocprof
+    // kernels join the lucebox.concurrency.v1 step with the same round_id.
+    uint64_t round_id = 0;
+    const char * path = nullptr;
 };
 
 struct Qwen35RoctxCallbacks {

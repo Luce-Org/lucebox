@@ -221,6 +221,15 @@ DeepSeek4RoctxRange::DeepSeek4RoctxRange(
     append_field(message, sizeof(message), used, " layer_begin=%d", metadata.layer_begin);
     append_field(message, sizeof(message), used, " layer_end=%d", metadata.layer_end);
     append_field(message, sizeof(message), used, " device=%d", metadata.device);
+    if (metadata.round_id != 0 && used < sizeof(message)) {
+        const int written = std::snprintf(
+            message + used, sizeof(message) - used, " round_id=%llu",
+            static_cast<unsigned long long>(metadata.round_id));
+        if (written > 0) {
+            used += std::min(static_cast<size_t>(written),
+                             sizeof(message) - used - 1);
+        }
+    }
 
     if (callbacks.push(message) >= 0) {
         pop_ = callbacks.pop;

@@ -26,6 +26,7 @@
 #include "common/concurrency/paged_kv_offload.h"
 #include "common/dflash_draft_kv.h"
 #include "common/dflash_feature_ring.h"
+#include "common/observability/inference_profile.h"
 #include "qwen35_slot_manager.h"
 #include "../qwen35_image_request.h"
 
@@ -186,11 +187,14 @@ private:
     std::vector<uint8_t> select_chain_lanes(
         const StepPlan & plan) const;
     bool chain_spec_input_capable(const StepInput & input) const;
+    observability::SpecDecision chain_spec_decision(
+        const StepInput & input) const;
     DraftFeatureMirror * slot_feature_mirror(int slot);
     DraftKvState * ensure_slot_draft_kv(int slot);
     std::optional<PreparedChainRound> prepare_chain_drafts(
         const std::vector<StepInput> & inputs,
-        const std::vector<uint8_t> & selected);
+        const std::vector<uint8_t> & selected,
+        observability::StepProfile * profile);
     StepResult step_chain_spec(
         const StepPlan & plan, const std::vector<uint8_t> & selected,
         PreparedChainRound && prepared);

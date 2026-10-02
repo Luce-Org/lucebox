@@ -1805,6 +1805,8 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     sconfig.draft_path   = backend_speculation.draft_path.value_or("");
     sconfig.fa_window    = backend_cache.fa_window;
     sconfig.ddtree_budget = backend_speculation.ddtree_budget;
+    sconfig.draft_block_size = backend_speculation.draft_block_size;
+    sconfig.max_concurrency = backend_execution.max_concurrency;
     sconfig.speculative_enabled = backend_speculation.ddtree_mode;
     sconfig.target_sharding     = backend_placement.target.is_layer_split();
     // KV type: report the operator's choice if set, else the family default

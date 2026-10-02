@@ -374,6 +374,18 @@ void test_metadata_and_balance() {
     }
     CHECK(events.size() == 2);
     CHECK(events[1] == "pop");
+
+    events.clear();
+    {
+        const DeepSeek4RoctxRange range(
+            "ds4.paged_gathered_step",
+            {InferencePhase::Batched, 3, 0, 43, 0, 17}, true,
+            {record_push, record_pop});
+    }
+    CHECK(events.size() == 2);
+    CHECK(events[0] ==
+          "push:ds4.paged_gathered_step mode=batched tokens=3 layer_begin=0 "
+          "layer_end=43 device=0 round_id=17");
 }
 
 void test_failed_push_is_not_popped() {

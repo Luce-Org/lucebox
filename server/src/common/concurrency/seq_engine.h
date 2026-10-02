@@ -60,6 +60,8 @@
 
 namespace luce::common {
 
+namespace observability { struct StepProfile; }
+
 // Model-neutral prefill planning for continuous batching. The scheduler owns
 // arrival order and fairness; the engine advertises the useful work envelope
 // and lowers the selected slices into its model-specific graph.
@@ -262,6 +264,9 @@ public:
     struct StepPlan {
         std::vector<StepInput>    decode;
         std::vector<PrefillSlice> prefills;
+        // Optional LUCE_PROF capture record for this service round; null when
+        // profiling is off. Engines may fill it but must not change behavior.
+        observability::StepProfile * profile = nullptr;
     };
 
     struct StepResult {

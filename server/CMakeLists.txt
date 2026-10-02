@@ -537,6 +537,8 @@ set(LUCE_SRC_INCLUDE_DIRS
 )
 
 add_library(luce_common STATIC
+    src/common/observability/concurrency_capture.cpp
+    src/common/observability/inference_profile.cpp
     src/errors.cpp
     src/qwen35/gguf_target_loader.cpp
     src/qwen35/qwen35_target_graph.cpp
@@ -1897,6 +1899,18 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_seq_slot_manager)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_concurrency_capture.cpp")
+        # LUCE_PROF lucebox.concurrency.v1 emitter against its schema: no GPU.
+        add_executable(test_concurrency_capture
+            test/test_concurrency_capture.cpp
+            src/common/observability/concurrency_capture.cpp
+            src/common/observability/inference_profile.cpp)
+        target_include_directories(test_concurrency_capture PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_concurrency_capture PRIVATE
+            nlohmann_json::nlohmann_json)
+        list(APPEND _raw_unit_test_targets test_concurrency_capture)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_engine_contract.cpp")
         # SeqEngine conformance checker + the fakes that prove it bites: no GPU.
         add_executable(test_seq_engine_contract test/test_seq_engine_contract.cpp)
@@ -2776,6 +2790,18 @@ if(LUCE_SERVER)
             src/server/prompt_normalize.cpp
         )
         target_include_directories(luce_server PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        # Source revision for LUCE_PROF capture metadata, fixed at configure.
+        execute_process(
+            COMMAND git rev-parse --short=12 HEAD
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            OUTPUT_VARIABLE _luce_git_sha
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(_luce_git_sha)
+            target_compile_definitions(luce_server PRIVATE
+                LUCE_GIT_SHA="${_luce_git_sha}")
+        endif()
+        unset(_luce_git_sha)
         # This script executes the server directly on the build host.
         if(LUCE_TESTS AND NOT CMAKE_CROSSCOMPILING)
             add_dependencies(check luce_server)

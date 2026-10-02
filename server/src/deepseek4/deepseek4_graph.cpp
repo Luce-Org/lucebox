@@ -15,6 +15,7 @@
 #include "common/blocking_row_pool.h"
 #include "deepseek4_hc_cuda.h"
 #include "deepseek4_roctx.h"
+#include "common/observability/inference_profile.h"
 #include "deepseek4_page_layout.h"
 #include "internal.h"
 #include "../common/step_graph.h"
@@ -9204,7 +9205,7 @@ bool deepseek4_paged_gathered_step(
     const DeepSeek4RoctxRange roctx_range(
         "ds4.paged_gathered_step",
         {InferencePhase::Batched, static_cast<int>(lanes), 0, w.n_layer,
-         device});
+         device, observability::current_service_round()});
     auto * rt = static_cast<Ds4PagedGatheredRuntime *>(cache.gathered_runtime);
     if (!rt) {
         rt = new (std::nothrow) Ds4PagedGatheredRuntime;

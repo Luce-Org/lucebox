@@ -6,6 +6,8 @@
 
 #include "common/inference_phase.h"
 
+#include <cstdint>
+
 namespace luce::common {
 
 struct DeepSeek4RoctxMetadata {
@@ -14,6 +16,9 @@ struct DeepSeek4RoctxMetadata {
     int layer_begin = -1;
     int layer_end = -1;
     int device = -1;
+    // Scheduler service round (0 = none); set only on the one range per
+    // round that rocprof_join treats as the round window.
+    uint64_t round_id = 0;
 };
 
 // Callback injection keeps range lifetime and metadata independently testable

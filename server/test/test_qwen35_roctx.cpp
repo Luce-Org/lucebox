@@ -56,6 +56,24 @@ int main() {
     CHECK(events[2] == "pop");
     CHECK(events[3] == "pop");
 
+    // round_id and path lead the fields so rocprof_join can match the
+    // lucebox.concurrency.v1 step for the round.
+    events.clear();
+    {
+        Qwen35RoctxRange service_round(
+            "qwen35.service_round", {2, -1, 0, 0, -1, -1, 42}, true,
+            {push, pop});
+        Qwen35RoctxRange chain_step(
+            "qwen35.concurrent_step", {2, 2, 0, 0, 16, 300, 42, "chain"},
+            true, {push, pop});
+    }
+    CHECK(events.size() == 4);
+    CHECK(events[0] == "qwen35.service_round round_id=42 live=2 "
+                       "prefill_tokens=0 prefill_segments=0");
+    CHECK(events[1] == "qwen35.concurrent_step round_id=42 path=chain live=2 "
+                       "bucket=2 prefill_tokens=0 prefill_segments=0 "
+                       "total_rows=16 max_kv_len=300");
+
     events.clear();
     { Qwen35RoctxRange disabled("qwen35.graph_compute", {}, false, {push, pop}); }
     CHECK(events.empty());
