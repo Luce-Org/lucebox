@@ -1056,7 +1056,6 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 }
 
 bool ggml_cuda_mmb_gatemix() { return mmb_arch() && mmb_gatemix_flag(); }
-bool ggml_cuda_mmb_down16() { return mmb_arch() && mmb_down16_flag(); }
 bool ggml_cuda_mmb_blk16() { return mmb_arch(); }
 bool ggml_cuda_mmb_res16()  { return mmb_arch(); }
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
@@ -1269,7 +1268,6 @@ size_t ggml_cuda_mmb_marks_count() { return 0; }
 void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor *) {}
 bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor *) { return false; }
 bool ggml_cuda_mmb_gatemix() { return false; }
-bool ggml_cuda_mmb_down16() { return false; }
 bool ggml_cuda_mmb_res16() { return false; }
 bool ggml_cuda_mmb_blk16() { return false; }
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, int, float, float) { return false; }

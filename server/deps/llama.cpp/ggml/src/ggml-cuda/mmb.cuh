@@ -29,7 +29,6 @@ size_t ggml_cuda_mmb_marks_count();
 void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t);
 bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t);
 bool ggml_cuda_mmb_gatemix();
-bool ggml_cuda_mmb_down16();
 bool ggml_cuda_mmb_res16();
 bool ggml_cuda_mmb_blk16();
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst, int hc, float scale, float bias);
