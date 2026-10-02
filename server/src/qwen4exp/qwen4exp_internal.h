@@ -17,11 +17,6 @@
 namespace luce::common {
 
 struct Qwen4ExpLayer {
-    // Pre-attention / pre-FFN norms (the block RMSNorm inputs).
-    ggml_tensor * attn_norm      = nullptr;  // [n_embd]
-    ggml_tensor * attn_post_norm = nullptr;  // [n_embd]
-    ggml_tensor * ffn_norm       = nullptr;  // [n_embd]
-
     // Hyper-connections (hc_count streams). Norm is [n_embd] reshaped to
     // [n_embd, hc]; down/up are the low-rank [hc_dim, hc_lr] / [hc_lr, hc_dim]
     // mixers; inject is [hc_dim, hc].
@@ -69,7 +64,6 @@ struct Qwen4ExpLayer {
 
     // MoE FFN (all 48 layers).
     ggml_tensor * ffn_gate_inp        = nullptr;  // router
-    ggml_tensor * ffn_exp_probs_b     = nullptr;  // router correction bias
     ggml_tensor * ffn_gate_exps       = nullptr;
     ggml_tensor * ffn_up_exps         = nullptr;
     ggml_tensor * ffn_down_exps       = nullptr;
@@ -80,14 +74,6 @@ struct Qwen4ExpLayer {
 
     bool is_full_attention = false;
     bool is_ple            = false;
-
-    // Optional NVFP4-style per-tensor scales (1.0 = none).
-    float attn_qkv_s = 1.0f;
-    float wq_s       = 1.0f;
-    float wk_s       = 1.0f;
-    float wv_s       = 1.0f;
-    float wo_s       = 1.0f;
-    float ssm_out_s  = 1.0f;
 };
 
 // Lazy direct reader for shard 2's per_layer_token_embd: pread rows from a
