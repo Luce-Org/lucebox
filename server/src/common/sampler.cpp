@@ -28,8 +28,8 @@ namespace {
 // cut. Each level's cost is proportional to its (shrinking) range, so total
 // work is O(cand.size()), not O(cand.size() log cand.size()) like a full sort,
 // regardless of where the cutoff lands.
-template <typename MassFn>
-size_t nucleus_cutoff(std::vector<std::pair<float, int>> & cand, double target, MassFn mass_of) {
+template <typename Mass, typename MassFn>
+size_t nucleus_cutoff(std::vector<std::pair<Mass, int>> & cand, double target, MassFn mass_of) {
     constexpr size_t kBaseCase = 64;
     size_t lo = 0, hi = cand.size();
     while (hi - lo > kBaseCase) {
@@ -102,6 +102,39 @@ int sample_from_gpu_probs(std::vector<float> & probs, double top_p, double r_uni
 }
 #endif
 
+// Repetition penalty, then the frequency and presence penalties, applied to
+// the logit `logit_at(token)` refers to. sample_logits and
+// sampler_distribution both use it, so the speculative verifier's rows see
+// exactly the logits the AR draw does.
+template <typename LogitAt>
+void apply_sampler_penalties(const SamplerCfg & cfg, const std::vector<int32_t> & history,
+                             int vocab, LogitAt logit_at) {
+    if (history.empty()) return;
+    const int win  = std::min((int)history.size(), cfg.rep_window);
+    const int from = (int)history.size() - win;
+    // Multiplicative repetition penalty (HuggingFace-style).
+    if (cfg.rep_pen > 1.0f) {
+        std::unordered_set<int> seen;
+        for (int i = from; i < (int)history.size(); i++) seen.insert(history[i]);
+        for (int t : seen) {
+            if (t < 0 || t >= vocab) continue;
+            float & l = logit_at(t);
+            l = (l > 0.0f) ? l / cfg.rep_pen : l * cfg.rep_pen;
+        }
+    }
+    // OpenAI-style additive frequency and presence penalties.
+    if (cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f) {
+        std::unordered_map<int, int> counts;
+        for (int i = from; i < (int)history.size(); i++) counts[history[i]]++;
+        for (auto & kv : counts) {
+            if (kv.first < 0 || kv.first >= vocab) continue;
+            float & l = logit_at(kv.first);
+            l -= cfg.freq_pen * kv.second;
+            l -= cfg.pres_pen;
+        }
+    }
+}
+
 }  // namespace
 
 int sample_logits(const float * logits_in,
@@ -158,34 +191,8 @@ int sample_logits(const float * logits_in,
     std::vector<std::pair<float, int>> cand(vocab);
     for (int i = 0; i < vocab; i++) cand[i] = {logits_in[i], i};
 
-    // Multiplicative repetition penalty (HuggingFace-style).
-    if (cfg.rep_pen > 1.0f && !history.empty()) {
-        const int win  = std::min((int)history.size(), cfg.rep_window);
-        const int from = (int)history.size() - win;
-        std::unordered_set<int> seen;
-        for (int i = from; i < (int)history.size(); i++) seen.insert(history[i]);
-        for (auto & c : cand) {
-            if (seen.count(c.second)) {
-                c.first = (c.first > 0.0f) ? c.first / cfg.rep_pen
-                                           : c.first * cfg.rep_pen;
-            }
-        }
-    }
-
-    // OpenAI-style additive frequency and presence penalties.
-    if ((cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f) && !history.empty()) {
-        const int win  = std::min((int)history.size(), cfg.rep_window);
-        const int from = (int)history.size() - win;
-        std::unordered_map<int, int> counts;
-        for (int i = from; i < (int)history.size(); i++) counts[history[i]]++;
-        for (auto & c : cand) {
-            auto it = counts.find(c.second);
-            if (it != counts.end()) {
-                c.first -= cfg.freq_pen * it->second;
-                c.first -= cfg.pres_pen;
-            }
-        }
-    }
+    // cand[i] is still token i here.
+    apply_sampler_penalties(cfg, history, vocab, [&](int t) -> float & { return cand[(size_t) t].first; });
 
     // temp=0 → deterministic argmax (after penalties have been applied above).
     // Independent of top_k/top_p (the single highest-logit token is always the
@@ -252,6 +259,123 @@ int sample_logits(const float * logits_in,
     // loop a second time.
     for (size_t i = 0; i < cand.size(); i++) cand[i].first = probs[i];
     return draw_from_weights(cand, r_uniform);
+}
+
+void sampler_distribution(const float * logits_in,
+                          int vocab,
+                          const SamplerCfg & cfg,
+                          const std::vector<int32_t> & history,
+                          std::vector<std::pair<float, int>> & cand) {
+    // Same chain as sample_logits (penalties, top_k, temperature, top_p). The
+    // no-top_k path computes each exponential once in double, as
+    // sample_logits' cutoff does, keeps only the tokens at or above a mass
+    // bound tau that the nucleus cannot extend below, and sorts those
+    // (nucleus_cutoff when more than 4096 survive): the verifier builds this
+    // for up to five rows per speculative step over the full vocabulary.
+    thread_local std::vector<float> z;
+    thread_local std::vector<double> zd;
+    z.assign(logits_in, logits_in + vocab);
+    apply_sampler_penalties(cfg, history, vocab, [&](int t) -> float & { return z[(size_t) t]; });
+    if (cfg.temp <= 0.0f) {
+        const int best = (int) (std::max_element(z.begin(), z.end()) - z.begin());
+        cand.assign(1, {1.0f, best});
+        return;
+    }
+
+    const bool need_top_k = cfg.top_k > 0 && cfg.top_k < vocab;
+    const bool need_top_p = cfg.top_p > 0.0f && cfg.top_p < 1.0f;
+    const float inv_t = 1.0f / std::max(1e-3f, cfg.temp);
+    if (need_top_k) {
+        cand.resize(vocab);
+        for (int i = 0; i < vocab; i++) cand[i] = {z[i], i};
+        std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(),
+                          [](auto & a, auto & b){ return a.first > b.first; });
+        cand.resize(cfg.top_k);
+    } else {
+        // Masses as sample_logits computes them for its cutoff:
+        // exp((double) logit * inv_t - maxv) with a float maxv.
+        const float maxv = *std::max_element(z.begin(), z.end()) * inv_t;
+        zd.resize((size_t) vocab);
+        double Z = 0.0;
+        for (int i = 0; i < vocab; i++) {
+            zd[(size_t) i] = std::exp((double) z[i] * inv_t - maxv);
+            Z += zd[(size_t) i];
+        }
+        if (!need_top_p) {
+            cand.resize(vocab);
+            for (int i = 0; i < vocab; i++) cand[i] = {(float) (zd[(size_t) i] / Z), i};
+            return;
+        }
+        const double target = (double) cfg.top_p * Z;
+        // Every token below tau = (1 - top_p) * Z / vocab lies outside the
+        // nucleus: together they weigh less than (1 - top_p) * Z, so the
+        // tokens at or above tau already reach the target mass and the cut
+        // falls among them. Only those need sorting.
+        const double tau = (1.0 - (double) cfg.top_p) * Z / vocab;
+        thread_local std::vector<std::pair<double, int>> cd;
+        cd.clear();
+        for (int i = 0; i < vocab; i++) {
+            if (zd[(size_t) i] >= tau) cd.push_back({zd[(size_t) i], i});
+        }
+        const auto desc = [](auto & a, auto & b){ return a.first > b.first; };
+        size_t cut = 0;
+        if (cd.size() <= 4096) {
+            std::sort(cd.begin(), cd.end(), desc);
+            double cum = 0.0;
+            for (size_t i = 0; i < cd.size(); i++) {
+                cum += cd[i].first;
+                if (cum >= target) { cut = i + 1; break; }
+            }
+        }
+        if (cut == 0) {
+            cut = nucleus_cutoff(cd, target, [](auto & c){ return c.first; });
+        }
+        double Zc = 0.0;
+        for (size_t i = 0; i < cut; i++) Zc += cd[i].first;
+        cand.resize(cut);
+        for (size_t i = 0; i < cut; i++) cand[i] = {(float) (cd[i].first / Zc), cd[i].second};
+        return;
+    }
+    // top_k path: softmax over the kept candidates, then top_p within them.
+    const float maxv = cand.front().first * inv_t;
+    std::vector<float> probs(cand.size());
+    double Z = 0.0;
+    for (size_t i = 0; i < cand.size(); i++) {
+        probs[i] = std::exp(cand[i].first * inv_t - maxv);
+        Z       += probs[i];
+    }
+    for (auto & p : probs) p = (float)(p / Z);
+    if (need_top_p) {
+        double cum = 0.0;
+        size_t cut = probs.size();
+        for (size_t i = 0; i < probs.size(); i++) {
+            cum += probs[i];
+            if (cum >= cfg.top_p) { cut = i + 1; break; }
+        }
+        probs.resize(cut); cand.resize(cut);
+        double Zc = 0.0;
+        for (float p : probs) Zc += p;
+        for (auto & p : probs) p = (float)(p / Zc);
+    }
+    for (size_t i = 0; i < cand.size(); i++) cand[i].first = probs[i];
+}
+
+int sampler_draw(const std::vector<std::pair<float, int>> & cand, double r_uniform) {
+    // Same inverse-CDF walk as draw_from_weights, but zero-weight entries are
+    // never returned: speculative sampling zeroes a rejected candidate in place
+    // and a uniform of exactly 0 would otherwise select it when it leads.
+    double Z = 0.0;
+    for (auto & c : cand) Z += c.first;
+    const double r = r_uniform * Z;
+    double acc = 0.0;
+    int last = -1;
+    for (auto & c : cand) {
+        if (c.first <= 0.0f) continue;
+        acc += c.first;
+        last = c.second;
+        if (r <= acc) return c.second;
+    }
+    return last >= 0 ? last : cand.back().second;
 }
 
 bool parse_sampler_token(std::string & line, SamplerCfg & out) {

@@ -22,6 +22,7 @@
 // LUCE_DS4_FULL_SNAP=1 for A/B validation.
 
 #include "deepseek4_dspark.h"
+#include "deepseek4_budget_hook.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_snapshot.h"
 #include "deepseek4_roctx.h"
@@ -40,6 +41,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <functional>
+#include <memory>
+#include <utility>
 #include <vector>
 
 namespace luce::common {
@@ -137,11 +141,17 @@ public:
         return true;
     }
 
+    // Hands the verify logits over instead of copying them (q rows of the
+    // full vocabulary per sampled step): one read per verify, and the next
+    // verify rebuilds the buffer. A second read fails rather than return a
+    // stale step.
     bool read_verify_logits(int n_tokens, std::vector<float> & out) override {
         if (!keep_logits_ || verify_logits_.empty()) return false;
         const size_t need = (size_t) n_tokens * w_.n_vocab;
         if (verify_logits_.size() < need) return false;
-        out.assign(verify_logits_.begin(), verify_logits_.begin() + need);
+        out.swap(verify_logits_);
+        out.resize(need);
+        verify_logits_.clear();
         return true;
     }
 
@@ -926,8 +936,13 @@ bool run_deepseek4_dspark_spec_decode(
         const std::function<bool(int32_t)> & on_token,
         MoeHybridStorage * moe_hybrid,
         MoeExpertComputeRuntime * expert_runtime,
-        MoeHybridRoutingStats * routing_stats) {
+        MoeHybridRoutingStats * routing_stats,
+        DSparkSpecSampling * sampling,
+        DSparkBudgetHook * budget_hook) {
     const int n_embd = target_w.n_embd;
+    const bool hook_on = budget_hook && !budget_hook->close_ids.empty();
+    luce::deepseek4::SpecBudgetHookState hook_st;
+    bool close_emitted = false;    // the hook's close token reached the stream
     const int n_tgt = drafter.n_target_layers;
     const int block = drafter.block_size;
     const int n_swa = target_w.n_swa;
@@ -1121,15 +1136,25 @@ bool run_deepseek4_dspark_spec_decode(
     // Cumulative phase timings (ms).
     double tm_draft = 0, tm_head = 0, tm_save = 0, tm_verify = 0, tm_apply = 0, tm_feat = 0;
     double tm_probe_submit = 0, tm_probe_wait = 0;
+    double tm_sample = 0;
+    std::vector<float> spec_logits;
+    std::vector<std::vector<std::pair<float, int>>> spec_rows;
+    std::vector<std::vector<int32_t>> spec_hist;   // per-row sampler history
+    std::unique_ptr<DSparkRowPool> row_pool;       // created on the first sampled step
+    if (sampling) target.set_keep_logits(true);   // verify returns every row's logits
     const SpecClock::time_point run_t0 = SpecClock::now();
 
     while (n_generated < n_gen) {
         const SpecClock::time_point step_t0 = SpecClock::now();
         const int ctx_len = feat_count < n_swa ? feat_count : n_swa;
+        // The close sequence is under way: verify its remaining tokens as
+        // forced drafts instead of asking the drafter.
+        const bool forcing = hook_on &&
+            luce::deepseek4::spec_budget_hook_forcing(budget_hook->close_ids, hook_st);
 
         // Noise block = [seed] + [MASK]*(block-1).
         SpecClock::time_point t0 = SpecClock::now();
-        if (q_cap >= 2) {
+        if (q_cap >= 2 && !forcing) {
             noise_ids[0] = lt;
             for (int i = 1; i < block; i++) {
                 noise_ids[i] = drafter.mask_token_id;
@@ -1202,11 +1227,19 @@ bool run_deepseek4_dspark_spec_decode(
         // step. Do not stack the slower acceptance-regime cap on top of it;
         // acceptance feedback remains the fallback and drives q5/artifacts
         // without confidence metadata.
-        if (!use_confidence_width) {
+        if (!use_confidence_width && !forcing) {
             q_step_cap = width_controller.next_width_cost_aware(
                 {}, q_step_cap);
         }
-        if (q_step_cap >= 2) {
+        if (forcing) {
+            draft_tok.push_back(lt);
+            const int pending = (int) (budget_hook->close_ids.size() - hook_st.inject_pos);
+            const int k = std::min(pending, std::max(0, q_step_cap - 1));
+            for (int i = 0; i < k; i++) {
+                draft_tok.push_back(budget_hook->close_ids[hook_st.inject_pos + (size_t) i]);
+            }
+            ds_ok = true;
+        } else if (q_step_cap >= 2) {
             std::memcpy(padded_hidden.data() + n_embd, local_hidden.data(),
                         sizeof(float) * (size_t) n_embd * block);
             if (use_confidence_width) {
@@ -1248,7 +1281,9 @@ bool run_deepseek4_dspark_spec_decode(
         // width with the best predicted committed-tokens/step-cost ratio;
         // this avoids treating a narrower verifier as proportionally cheaper
         // when q3 and q4 are nearly the same cost on gfx1151.
-        if (use_confidence_width && !draft_confidence.empty()) {
+        if (forcing) {
+            // Forced drafts keep their width.
+        } else if (use_confidence_width && !draft_confidence.empty()) {
             if (draft_confidence.size() > (size_t) kDs4ConfidenceDepths) {
                 step_confidence.assign(draft_confidence.begin(),
                                        draft_confidence.begin() + kDs4ConfidenceDepths);
@@ -1265,6 +1300,11 @@ bool run_deepseek4_dspark_spec_decode(
             }
         }
         if ((int) draft_tok.size() > q_step_cap) draft_tok.resize(q_step_cap);
+        // A step emits at most q tokens (kept candidates + bonus); never verify
+        // more than the request can still emit, or the cache would commit
+        // tokens (drafted or forced close tokens) that are never returned.
+        const int remaining_out = std::max(1, n_gen - n_generated);
+        if ((int) draft_tok.size() > remaining_out) draft_tok.resize((size_t) remaining_out);
         const int q = (int) draft_tok.size();   // seed + candidates
         if (q >= 0 && q <= q_cap) width_steps[(size_t) q]++;
         tm_head += spec_ms_since(t0);
@@ -1281,7 +1321,7 @@ bool run_deepseek4_dspark_spec_decode(
 
         // Feasibility-only control: duplicate the current draft and discard it.
         bool probe_inflight = false;
-        if (draft_overlap_probe_enabled && q_cap >= 2) {
+        if (draft_overlap_probe_enabled && q_cap >= 2 && !forcing) {   // no fresh draft on forced steps
             const SpecClock::time_point probe_t0 = SpecClock::now();
             probe_inflight = draft_overlap_reuse_context
                 ? deepseek4_dspark_draft_forward_async_reuse_context(
@@ -1337,7 +1377,8 @@ bool run_deepseek4_dspark_spec_decode(
             deepseek4_dspark_draft_wait(drafter_backend);
             tm_probe_wait += spec_ms_since(probe_t0);
         }
-        if (!verify_ok) {
+        // Drop the whole verified batch from the cache (restore to pos).
+        const auto undo_verify = [&] {
             if (full_snap) {
                 if (!target.restore_kv()) {
                     std::fprintf(stderr, "[ds4-spec] restore after verify failure failed\n");
@@ -1346,6 +1387,9 @@ bool run_deepseek4_dspark_spec_decode(
                 spec_rollback_apply(
                     rollback, target_w, target_cache, pos, boundary_crossed);
             }
+        };
+        if (!verify_ok) {
+            undo_verify();
             std::fprintf(stderr, "[ds4-spec] verify failed\n");
             ok = false;
             break;
@@ -1354,12 +1398,87 @@ bool run_deepseek4_dspark_spec_decode(
         // Accept the longest matching prefix. accept counts the seed (slot 0)
         // plus each candidate the target agrees with.
         int accept = 1;
-        for (int i = 0; i < q - 1; i++) {
-            if (draft_tok[i + 1] == tgt_am[i]) accept++;
-            else break;
+        int bonus = -1;
+        if (forcing) {
+            // Every forced candidate is kept; the bonus is the target's next
+            // token after the last one, drawn with the request's sampler.
+            accept = q;
+            // While close tokens remain after this step's forced candidates,
+            // the hook replaces the bonus with the next one; only the step that
+            // finishes the sequence keeps it (the first answer token).
+            const bool bonus_kept =
+                hook_st.inject_pos + (size_t) (q - 1) >= budget_hook->close_ids.size();
+            if (sampling && bonus_kept) {
+                t0 = SpecClock::now();
+                if (!target.read_verify_logits(q, spec_logits)) {
+                    undo_verify();
+                    std::fprintf(stderr, "[ds4-spec] sampling: verify logits unavailable\n");
+                    ok = false;
+                    break;
+                }
+                if (spec_rows.empty()) spec_rows.resize(1);
+                if (spec_hist.empty()) spec_hist.resize(1);
+                dspark_row_history(sampling->cfg, sampling->history, draft_tok.data(), q - 1,
+                                   spec_hist[0]);
+                sampler_distribution(spec_logits.data() + (size_t) (q - 1) * target_w.n_vocab,
+                                     target_w.n_vocab, sampling->cfg, spec_hist[0], spec_rows[0]);
+                std::uniform_real_distribution<double> unif(0.0, 1.0);
+                bonus = sampler_draw(spec_rows[0], unif(*sampling->rng));
+                tm_sample += spec_ms_since(t0);
+            } else {
+                bonus = tgt_am[q - 1];   // greedy, or a bonus the hook replaces
+            }
+        } else if (sampling) {
+            // Verify row i is the target's next-token logits after
+            // draft_tok[i]. Each row's distribution depends only on its logits
+            // and on the history extended by draft_tok[1..i], all known now,
+            // so the rows are built concurrently (serially this was 4-6 ms per
+            // q5 step on the host); the walk consumes them in order.
+            t0 = SpecClock::now();
+            if (!target.read_verify_logits(q, spec_logits)) {
+                undo_verify();
+                std::fprintf(stderr, "[ds4-spec] sampling: verify logits unavailable\n");
+                ok = false;
+                break;
+            }
+            if (spec_rows.size() < (size_t) q) spec_rows.resize((size_t) q);
+            if (spec_hist.size() < (size_t) q) spec_hist.resize((size_t) q);
+            const std::function<void(int)> build_row = [&](int i) {
+                dspark_row_history(sampling->cfg, sampling->history, draft_tok.data(), i,
+                                   spec_hist[(size_t) i]);
+                sampler_distribution(spec_logits.data() + (size_t) i * target_w.n_vocab,
+                                     target_w.n_vocab, sampling->cfg, spec_hist[(size_t) i],
+                                     spec_rows[(size_t) i]);
+            };
+            if (!row_pool) row_pool = std::make_unique<DSparkRowPool>(std::max(0, q_cap - 1));
+            row_pool->run(q, build_row);
+            const DSparkSampleStep step =
+                dspark_spec_sample_accept(spec_rows, draft_tok.data(), q, *sampling->rng);
+            accept = step.accept;
+            bonus = step.bonus;
+            tm_sample += spec_ms_since(t0);
+        } else {
+            for (int i = 0; i < q - 1; i++) {
+                if (draft_tok[i + 1] == tgt_am[i]) accept++;
+                else break;
+            }
+            bonus = tgt_am[accept - 1];                       // target's token at the accept point
         }
+        // Thinking-budget hook over this step's emitted tokens: where the AR
+        // rule would override a token, truncate the step there and emit the
+        // close token as the bonus.
+        const bool hook_was_started = hook_st.started;
+        if (hook_on) {
+            int32_t hook_bonus = bonus;
+            luce::deepseek4::spec_budget_hook_step(
+                budget_hook->close_ids, n_gen - n_generated, budget_hook->hard_limit,
+                forcing, forcing ? q - 1 : 0, accept, hook_bonus, hook_st);
+            bonus = hook_bonus;
+        }
+        // The hook replaced this step's bonus with the close token (and may
+        // have cut the step short there).
+        const bool close_bonus = hook_on && !hook_was_started && hook_st.started;
         const int matched = accept - 1;                       // accepted candidates
-        const int bonus = tgt_am[accept - 1];                 // target's token at the accept point
         const int commit_pos = pos + accept;                  // seed + accepted candidates in KV
 
         if (timing && steps < 8 && q >= 2) {
@@ -1476,12 +1595,19 @@ bool run_deepseek4_dspark_spec_decode(
         const int fN = full_snap ? target.last_verify_n() : accept;
         push_features(feats.data(), fN);
         tm_feat += spec_ms_since(t0);
-        width_controller.observe(
-            accept, q, (float) spec_ms_since(step_t0));
-        if (use_confidence_width) {
-            width_controller.observe_confidence(draft_confidence, accept, q);
+        // Forced steps and the step the hook cut short say nothing about the
+        // drafter: keep both out of the width controller and the statistics.
+        const bool hook_step = forcing || close_bonus;
+        if (!hook_step) {
+            width_controller.observe(
+                accept, q, (float) spec_ms_since(step_t0));
+            if (use_confidence_width) {
+                width_controller.observe_confidence(draft_confidence, accept, q);
+            }
         }
 
+        // The close token only counts as fired once it is emitted: an EOS or
+        // stop earlier in the step ends the stream first, as it would under AR.
         // Output tokens this step = accepted candidates + bonus.
         bool hit_eos = false;
         for (int i = 1; i <= accept; i++) {
@@ -1493,6 +1619,8 @@ bool run_deepseek4_dspark_spec_decode(
                              i == accept ? " bonus" : "");
             }
             out_tokens.push_back(t);
+            if (i == accept && close_bonus) close_emitted = true;
+            if (sampling) sampling->history.push_back(t);
             n_generated++;
             if (on_token && !on_token(t)) {
                 stop_requested = true;
@@ -1503,8 +1631,10 @@ bool run_deepseek4_dspark_spec_decode(
         }
         pos = commit_pos;              // seed + accepted candidates now in KV
         lt = bonus;                    // deferred bonus becomes next seed
-        accept_sum += matched;
-        offered_sum += q - 1;
+        if (!hook_step) {
+            accept_sum += matched;
+            offered_sum += q - 1;
+        }
         steps++;
         if (timing && (steps <= 4 || (steps & 31) == 0)) {
             std::fprintf(stderr,
@@ -1519,6 +1649,7 @@ bool run_deepseek4_dspark_spec_decode(
         if (hit_eos || stop_requested) break;
     }
 
+    if (hook_on && close_emitted) budget_hook->fired = true;
     const double total_ms = spec_ms_since(run_t0);
     if (accept_rate_out) {
         *accept_rate_out = offered_sum > 0
@@ -1527,11 +1658,12 @@ bool run_deepseek4_dspark_spec_decode(
     }
     std::fprintf(stderr,
                  "[ds4-spec] gen=%d steps=%ld mean_accept=%.2f/%.2f "
-                 "q_cap=%d full_snap=%d\n",
+                 "q_cap=%d full_snap=%d sampling=%d sample=%.2f ms/step\n",
                  n_generated, steps,
                  steps ? (double) accept_sum / steps : 0.0,
                  steps ? (double) offered_sum / steps : 0.0, q_cap,
-                 (int) full_snap);
+                 (int) full_snap, sampling ? 1 : 0,
+                 steps ? tm_sample / steps : 0.0);
     if (width_controller.enabled()) {
         std::fprintf(
             stderr,

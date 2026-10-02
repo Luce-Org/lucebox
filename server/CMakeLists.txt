@@ -2250,6 +2250,7 @@ if(LUCE_TESTS)
             test/test_mmq_tile_selection.cpp
             test/test_mixed_mmq_policy.cpp
             test/test_spec_acceptance.cpp
+            test/test_ds4_spec_sampling.cpp
             test/test_ds4_env.cpp
             test/test_kvflash_ubatch.cpp
             test/test_qwen35_mask_upload.cpp

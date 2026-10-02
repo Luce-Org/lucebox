@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace luce::common {
@@ -47,6 +48,19 @@ int sample_logits(const float * logits_in,
                   const SamplerCfg & cfg,
                   const std::vector<int32_t> & history,
                   std::mt19937_64 & rng);
+
+// The distribution sample_logits draws from, after the whole chain (penalties,
+// top_k, temperature, top_p) as (probability, token) pairs summing to 1. With
+// temp <= 0 it is the single post-penalty argmax. Speculative sampling uses it
+// to accept a drafted token with the target's own probability.
+void sampler_distribution(const float * logits_in,
+                          int vocab,
+                          const SamplerCfg & cfg,
+                          const std::vector<int32_t> & history,
+                          std::vector<std::pair<float, int>> & out);
+
+// Inverse-CDF draw over (weight, token) pairs; weights need not be normalized.
+int sampler_draw(const std::vector<std::pair<float, int>> & cand, double r_uniform);
 
 // Strip ` samp=...` tail from `line` (in place); return true when one was
 // parsed. Out-of-band fields default to a permissive greedy-equivalent (top_p=1,
