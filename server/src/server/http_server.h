@@ -176,6 +176,14 @@ struct ServerConfig {
     // in the request parser; CLI does not currently override.
     SamplingDefaults sampler_defaults;
 
+    // Sampler defaults for requests whose final thinking state is OFF
+    // (model card's `sampling_no_thinking`, spec §3.3). has_* fields are
+    // all false when the card doesn't define the block; omitted request
+    // fields then keep falling back to `sampler_defaults` above, matching
+    // pre-existing behaviour. Only applied once the request's final
+    // thinking state is known — see apply_no_thinking_sampler_defaults.
+    SamplingDefaults sampler_defaults_no_thinking;
+
     // Operator-facing tag for the startup banner: e.g.
     // "share/model_cards/qwen3.6-27b.json", "family:qwen35", "hard-fallback".
     // Surfaced at /props.budget_envelope.model_card_source per
@@ -391,6 +399,21 @@ PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
 // Parse request sampler fields, applying model-card defaults where present.
 SamplerCfg parse_request_sampler(const json & body,
                                  const SamplingDefaults & defaults);
+
+// Overlay the model card's no-thinking sampler defaults onto an
+// already-parsed `sampler`, for any field the request body did not
+// explicitly set. parse_request_sampler runs before the request's final
+// thinking state is known (apply_request_reasoning resolves it afterward,
+// since the effort-tier phase-1 cap depends on ParsedRequest::max_output),
+// so it can only apply the thinking-mode `sampling` defaults; this patches
+// the no-thinking fields in once the final state is available. Call only
+// when the resolved thinking state is OFF. A no-op when `no_thinking`
+// carries no has_* fields (card without `sampling_no_thinking`), which
+// preserves pre-existing behaviour: omitted fields keep the thinking-mode
+// defaults regardless of thinking state.
+void apply_no_thinking_sampler_defaults(const json & body,
+                                        const SamplingDefaults & no_thinking,
+                                        SamplerCfg & sampler);
 
 // Read the required `messages` field. Throws std::invalid_argument when
 // it is missing or not a non-empty array; route_request's catch turns

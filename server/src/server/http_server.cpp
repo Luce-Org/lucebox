@@ -649,6 +649,30 @@ SamplerCfg parse_request_sampler(const json & body,
     return sampler;
 }
 
+void apply_no_thinking_sampler_defaults(const json & body,
+                                        const SamplingDefaults & no_thinking,
+                                        SamplerCfg & sampler) {
+    // Mirrors the body-key checks in parse_request_sampler: only backfill a
+    // field the request left unset, and only when the card actually
+    // supplied a no-thinking value for it.
+    if (no_thinking.has_temperature && !body.contains("temperature")) {
+        sampler.temp = no_thinking.temperature;
+    }
+    if (no_thinking.has_top_p && !body.contains("top_p")) {
+        sampler.top_p = no_thinking.top_p;
+    }
+    if (no_thinking.has_top_k && !body.contains("top_k")) {
+        sampler.top_k = no_thinking.top_k;
+    }
+    if (no_thinking.has_presence_penalty && !body.contains("presence_penalty")) {
+        sampler.pres_pen = no_thinking.presence_penalty;
+    }
+    if (no_thinking.has_repetition_penalty &&
+        !body.contains("repetition_penalty") && !body.contains("rep_pen")) {
+        sampler.rep_pen = no_thinking.repetition_penalty;
+    }
+}
+
 json require_messages_array(const json & body) {
     if (!body.contains("messages") || !body["messages"].is_array() ||
         body["messages"].empty()) {
@@ -2648,6 +2672,15 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         // Reasoning must be applied BEFORE rendering: the template injects
         // the empty <think>\n\n</think>\n\n block when thinking is disabled.
         apply_request_reasoning(body, config_, req);
+        // req.sampler was built by parse_common_request_fields above, before
+        // the final thinking state was known — it can only have applied the
+        // thinking-mode `sampler_defaults`. Now that req.thinking_enabled is
+        // resolved, backfill any still-omitted fields from the card's
+        // no-thinking defaults when thinking ended up OFF.
+        if (!req.thinking_enabled) {
+            apply_no_thinking_sampler_defaults(
+                body, config_.sampler_defaults_no_thinking, req.sampler);
+        }
         // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio).
         req.session_id = parse_session_id_from_body(body);
 

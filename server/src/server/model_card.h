@@ -57,6 +57,14 @@ struct ModelCard {
     int               max_tokens                 = 16000;  // spec §3.4 hard fallback
     int               complex_problem_max_tokens = 0;      // 0 = not specified
     SamplingDefaults  sampling;
+    // Optional sampler defaults for requests whose final thinking state is
+    // OFF (sidecar field `sampling_no_thinking`, same shape as `sampling`).
+    // Qwen3.8-Flash-Next's card documents distinct thinking vs. instruct
+    // sampling sets; `sampling` carries the thinking-mode values and this
+    // field carries the instruct-mode ones. has_* fields left false when
+    // the sidecar doesn't define the block, which keeps today's behaviour
+    // (no-thinking requests fall back to `sampling`) unchanged.
+    SamplingDefaults  sampling_no_thinking;
     EffortTiers       effort_tiers;
     // Bumped from 512 to 4096 on 2026-05-25. The original ds4_eval.c
     // value was sized for DeepSeek-V4-flash's terse style but silently

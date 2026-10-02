@@ -4493,6 +4493,166 @@ TEST_CASE(ServerUnitFixture, test_parse_request_sampler_applies_defaults_and_ove
     TEST_ASSERT(std::fabs(sampler.rep_pen - 1.1f) < 0.001f);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// sampling_no_thinking: per-card sampler defaults for requests whose final
+// thinking state resolves to OFF (e.g. Qwen3.8-Flash-Next's instruct-mode
+// recipe vs. its thinking-mode one). See docs/specs/thinking-budget.md §3.3.
+// ═══════════════════════════════════════════════════════════════════════
+
+// Mirrors the real pipeline in HttpServer::handle_model_request: sampler
+// defaults are parsed before the final thinking state is known, then
+// apply_request_reasoning resolves req.thinking_enabled, then (only when
+// thinking ended up OFF) apply_no_thinking_sampler_defaults backfills the
+// still-omitted fields from the card's no-thinking block.
+static SamplerCfg resolve_request_sampler(const json & body, const ServerConfig & config) {
+    SamplerCfg sampler = parse_request_sampler(body, config.sampler_defaults);
+    ParsedRequest req;
+    req.max_output = resolve_max_output_tokens(body, config.default_max_tokens);
+    apply_request_reasoning(body, config, req);
+    if (!req.thinking_enabled) {
+        apply_no_thinking_sampler_defaults(
+            body, config.sampler_defaults_no_thinking, sampler);
+    }
+    return sampler;
+}
+
+// Qwen3.8-Flash-Next's published thinking vs. instruct sampling sets.
+static ServerConfig qwen4exp_dual_sampling_config() {
+    ServerConfig config;
+    config.arch = "qwen4exp";  // thinks by default unless disabled
+    config.default_max_tokens = 32768;
+    config.think_max_tokens = 24576;
+    config.hard_limit_reply_budget = 8192;
+
+    config.sampler_defaults.has_temperature = true;
+    config.sampler_defaults.temperature = 1.0f;
+    config.sampler_defaults.has_top_p = true;
+    config.sampler_defaults.top_p = 0.95f;
+    config.sampler_defaults.has_top_k = true;
+    config.sampler_defaults.top_k = 20;
+    config.sampler_defaults.has_presence_penalty = true;
+    config.sampler_defaults.presence_penalty = 0.0f;
+    config.sampler_defaults.has_repetition_penalty = true;
+    config.sampler_defaults.repetition_penalty = 1.0f;
+
+    config.sampler_defaults_no_thinking.has_temperature = true;
+    config.sampler_defaults_no_thinking.temperature = 0.7f;
+    config.sampler_defaults_no_thinking.has_top_p = true;
+    config.sampler_defaults_no_thinking.top_p = 0.80f;
+    config.sampler_defaults_no_thinking.has_top_k = true;
+    config.sampler_defaults_no_thinking.top_k = 20;
+    config.sampler_defaults_no_thinking.has_presence_penalty = true;
+    config.sampler_defaults_no_thinking.presence_penalty = 1.5f;
+    config.sampler_defaults_no_thinking.has_repetition_penalty = true;
+    config.sampler_defaults_no_thinking.repetition_penalty = 1.0f;
+    return config;
+}
+
+TEST_CASE(ServerUnitFixture, test_model_card_parses_sampling_no_thinking) {
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() / "dflash-mc-no-thinking-test";
+    fs::remove_all(root);
+    fs::create_directories(root / "share" / "model_cards");
+
+    {
+        FILE * f = std::fopen(
+            (root / "share" / "model_cards" / "notest-model.json").string().c_str(), "w");
+        TEST_ASSERT(f != nullptr);
+        std::fprintf(f,
+            "{\"name\":\"notest-model\",\"source\":\"test\",\"verified_at\":\"2026-10-02\","
+            "\"max_tokens\":32768,"
+            "\"sampling\":{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"min_p\":0.0,"
+            "\"presence_penalty\":0.0,\"repetition_penalty\":1.0},"
+            "\"sampling_no_thinking\":{\"temperature\":0.7,\"top_p\":0.8,\"top_k\":20,"
+            "\"min_p\":0.0,\"presence_penalty\":1.5,\"repetition_penalty\":1.0}}");
+        std::fclose(f);
+    }
+
+    auto card = luce::common::resolve_model_card("", "notest-model", "qwen4exp", root.string());
+    fs::remove_all(root);
+
+    TEST_ASSERT(card.sampling.has_temperature);
+    TEST_ASSERT(std::fabs(card.sampling.temperature - 1.0f) < 1.0e-6f);
+
+    TEST_ASSERT(card.sampling_no_thinking.has_temperature);
+    TEST_ASSERT(std::fabs(card.sampling_no_thinking.temperature - 0.7f) < 1.0e-6f);
+    TEST_ASSERT(card.sampling_no_thinking.has_top_p);
+    TEST_ASSERT(std::fabs(card.sampling_no_thinking.top_p - 0.8f) < 1.0e-6f);
+    TEST_ASSERT(card.sampling_no_thinking.has_top_k);
+    TEST_ASSERT(card.sampling_no_thinking.top_k == 20);
+    TEST_ASSERT(card.sampling_no_thinking.has_presence_penalty);
+    TEST_ASSERT(std::fabs(card.sampling_no_thinking.presence_penalty - 1.5f) < 1.0e-6f);
+    TEST_ASSERT(card.sampling_no_thinking.has_repetition_penalty);
+    TEST_ASSERT(std::fabs(card.sampling_no_thinking.repetition_penalty - 1.0f) < 1.0e-6f);
+}
+
+TEST_CASE(ServerUnitFixture, test_sampler_defaults_no_thinking_applied_when_thinking_off) {
+    const ServerConfig config = qwen4exp_dual_sampling_config();
+    const json body = {
+        {"chat_template_kwargs", {{"enable_thinking", false}}},
+    };
+    const SamplerCfg sampler = resolve_request_sampler(body, config);
+
+    TEST_ASSERT(std::fabs(sampler.temp - 0.7f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.top_p - 0.80f) < 0.001f);
+    TEST_ASSERT(sampler.top_k == 20);
+    TEST_ASSERT(std::fabs(sampler.pres_pen - 1.5f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.rep_pen - 1.0f) < 0.001f);
+}
+
+TEST_CASE(ServerUnitFixture, test_sampler_defaults_thinking_mode_unaffected_by_no_thinking_card) {
+    const ServerConfig config = qwen4exp_dual_sampling_config();
+    const json body = json::object();  // qwen4exp thinks by default when omitted
+    const SamplerCfg sampler = resolve_request_sampler(body, config);
+
+    TEST_ASSERT(std::fabs(sampler.temp - 1.0f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.top_p - 0.95f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.pres_pen - 0.0f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.rep_pen - 1.0f) < 0.001f);
+}
+
+TEST_CASE(ServerUnitFixture, test_sampler_explicit_fields_win_in_both_thinking_modes) {
+    const ServerConfig config = qwen4exp_dual_sampling_config();
+
+    const json thinking_off_body = {
+        {"temperature", 0.33f},
+        {"presence_penalty", 0.1f},
+        {"chat_template_kwargs", {{"enable_thinking", false}}},
+    };
+    const SamplerCfg off_sampler = resolve_request_sampler(thinking_off_body, config);
+    TEST_ASSERT(std::fabs(off_sampler.temp - 0.33f) < 0.001f);
+    TEST_ASSERT(std::fabs(off_sampler.pres_pen - 0.1f) < 0.001f);
+    // Omitted fields still pick up the no-thinking defaults.
+    TEST_ASSERT(std::fabs(off_sampler.top_p - 0.80f) < 0.001f);
+
+    const json thinking_on_body = {{"temperature", 0.44f}};
+    const SamplerCfg on_sampler = resolve_request_sampler(thinking_on_body, config);
+    TEST_ASSERT(std::fabs(on_sampler.temp - 0.44f) < 0.001f);
+    TEST_ASSERT(std::fabs(on_sampler.top_p - 0.95f) < 0.001f);
+}
+
+TEST_CASE(ServerUnitFixture, test_sampler_defaults_no_thinking_absent_keeps_today_behavior) {
+    // A card without `sampling_no_thinking` must behave exactly as before
+    // this feature: no-thinking requests still fall back to the (thinking-
+    // mode) `sampling` defaults for omitted fields.
+    ServerConfig config;
+    config.arch = "qwen4exp";
+    config.sampler_defaults.has_temperature = true;
+    config.sampler_defaults.temperature = 1.0f;
+    config.sampler_defaults.has_presence_penalty = true;
+    config.sampler_defaults.presence_penalty = 0.0f;
+    // config.sampler_defaults_no_thinking left default-constructed: every
+    // has_* is false, i.e. the card has no `sampling_no_thinking` block.
+
+    const json body = {
+        {"chat_template_kwargs", {{"enable_thinking", false}}},
+    };
+    const SamplerCfg sampler = resolve_request_sampler(body, config);
+
+    TEST_ASSERT(std::fabs(sampler.temp - 1.0f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.pres_pen - 0.0f) < 0.001f);
+}
+
 TEST_CASE(ServerUnitFixture, test_require_messages_array_rejects_invalid) {
     const json valid = {{"messages", json::array({
         {{"role", "user"}, {"content", "hi"}},
@@ -8570,6 +8730,43 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     // keys are NOT in the wholesale shape — they moved to budget_envelope.
     TEST_ASSERT(!body["model_card"].contains("think_max_tokens"));
     TEST_ASSERT(!body["model_card"].contains("hard_limit_reply_budget"));
+}
+
+TEST_CASE(ServerUnitFixture, test_props_model_card_exposes_sampling_no_thinking) {
+    // sampling_no_thinking rides along in the wholesale raw-sidecar re-emit
+    // next to the existing `sampling` block, so preflight tooling can
+    // assert the card actually carries distinct instruct-mode values.
+    json sidecar = {
+        {"name",        "Qwen3.8 Flash Next"},
+        {"source",      "https://huggingface.co/Qwen/Qwen3.8-Flash-Next"},
+        {"verified_at", "2026-10-01"},
+        {"max_tokens",  32768},
+        {"sampling", {
+            {"temperature", 1.0}, {"top_p", 0.95}, {"top_k", 20},
+            {"min_p", 0.0}, {"presence_penalty", 0.0}, {"repetition_penalty", 1.0},
+        }},
+        {"sampling_no_thinking", {
+            {"temperature", 0.7}, {"top_p", 0.80}, {"top_k", 20},
+            {"min_p", 0.0}, {"presence_penalty", 1.5}, {"repetition_penalty", 1.0},
+        }},
+    };
+    ServerConfig cfg = make_props_config_with_sidecar(sidecar);
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body["model_card"].contains("sampling"));
+    TEST_ASSERT(body["model_card"].contains("sampling_no_thinking"));
+    TEST_ASSERT(std::fabs(
+        body["model_card"]["sampling_no_thinking"]["temperature"].get<double>() - 0.7) < 1.0e-6);
+    TEST_ASSERT(std::fabs(
+        body["model_card"]["sampling_no_thinking"]["top_p"].get<double>() - 0.80) < 1.0e-6);
+    TEST_ASSERT(std::fabs(
+        body["model_card"]["sampling_no_thinking"]["presence_penalty"].get<double>() - 1.5) < 1.0e-6);
+    // Existing `sampling` (thinking-mode) field is untouched by the addition.
+    TEST_ASSERT(std::fabs(
+        body["model_card"]["sampling"]["temperature"].get<double>() - 1.0) < 1.0e-6);
 }
 
 TEST_CASE(ServerUnitFixture, test_props_model_card_null_on_family_fallback) {

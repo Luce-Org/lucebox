@@ -1553,6 +1553,10 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
 
     // Sampler defaults — currently no CLI surface; always take from card.
     sconfig.sampler_defaults = card.sampling;
+    // Instruct-mode (non-thinking) sampler defaults, if the card supplies
+    // `sampling_no_thinking`; all has_* false otherwise, which is a no-op
+    // at request time. See docs/specs/thinking-budget.md §3.3.
+    sconfig.sampler_defaults_no_thinking = card.sampling_no_thinking;
 
     sconfig.model_card_source_label = card.source_label;
     // Stash the raw sidecar JSON (or null on family/hard fallback) so
