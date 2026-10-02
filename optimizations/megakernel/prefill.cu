@@ -5,6 +5,7 @@
  */
 
 #include "half_type.h"
+#include "rope.h"
 
 // ── Pascal (sm_6x) compatibility shims ──
 #if TARGET_SM >= 70
@@ -244,15 +245,11 @@ __global__ void pf_qk_norm_rope(
         half_t *qh = q + pos * FA_QPROJ_SIZE + head * FA_HEAD_DIM * 2;
         float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(qh[i]); ss += v*v; }
         ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = SHFL_SYNC(0xffffffff,sc,0);
-        // Preserve both normalized coordinates before updating this pair in place.
         for (int i = lid; i < FA_ROT_DIM/2; i += 32) {
             int p = i + FA_ROT_DIM/2;
-            float q0 = H2F(qh[i])*sc*(1.f+H2F(qnw[i]));
-            float q1 = H2F(qh[p])*sc*(1.f+H2F(qnw[p]));
             float freq = float(pos)/powf(FA_ROPE_THETA, float(2*i)/FA_ROT_DIM);
             float cv = cosf(freq), sv = sinf(freq);
-            qh[i] = F2H(q0*cv - q1*sv);
-            qh[p] = F2H(q0*sv + q1*cv);
+            apply_rope_pair(qh, qh, qnw, i, p, sc, cv, sv);
         }
         for (int i = FA_ROT_DIM + lid; i < FA_HEAD_DIM; i += 32) {
             qh[i] = F2H(H2F(qh[i])*sc*(1.f+H2F(qnw[i])));
@@ -267,15 +264,12 @@ __global__ void pf_qk_norm_rope(
         half_t *vc = v_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
         float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(kh[i]); ss += v*v; }
         ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = SHFL_SYNC(0xffffffff,sc,0);
-        // K is also updated in place as well as copied to the cache.
         for (int i = lid; i < FA_ROT_DIM/2; i += 32) {
             int p = i + FA_ROT_DIM/2;
-            float k0 = H2F(kh[i])*sc*(1.f+H2F(knw[i]));
-            float k1 = H2F(kh[p])*sc*(1.f+H2F(knw[p]));
             float freq = float(pos)/powf(FA_ROPE_THETA, float(2*i)/FA_ROT_DIM);
             float cv = cosf(freq), sv = sinf(freq);
-            kh[i] = kc[i] = F2H(k0*cv - k1*sv);
-            kh[p] = kc[p] = F2H(k0*sv + k1*cv);
+            apply_rope_pair(kh, kh, knw, i, p, sc, cv, sv);
+            kc[i] = kh[i]; kc[p] = kh[p];
             vc[i] = vh[i]; vc[p] = vh[p];
         }
         for (int i = FA_ROT_DIM + lid; i < FA_HEAD_DIM; i += 32) {
@@ -1073,15 +1067,11 @@ __global__ void pf_qk_norm_rope_fused(
         half_t *qh = qkv_fused + pos * STRIDE + head * FA_HEAD_DIM * 2;
         float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(qh[i]); ss += v*v; }
         ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = SHFL_SYNC(0xffffffff,sc,0);
-        // Preserve both normalized coordinates before updating this pair in place.
         for (int i = lid; i < FA_ROT_DIM/2; i += 32) {
             int p = i + FA_ROT_DIM/2;
-            float q0 = H2F(qh[i])*sc*(1.f+H2F(qnw[i]));
-            float q1 = H2F(qh[p])*sc*(1.f+H2F(qnw[p]));
             float freq = float(pos)/powf(FA_ROPE_THETA, float(2*i)/FA_ROT_DIM);
             float cv = cosf(freq), sv = sinf(freq);
-            qh[i] = F2H(q0*cv - q1*sv);
-            qh[p] = F2H(q0*sv + q1*cv);
+            apply_rope_pair(qh, qh, qnw, i, p, sc, cv, sv);
         }
         for (int i = FA_ROT_DIM + lid; i < FA_HEAD_DIM; i += 32) {
             qh[i] = F2H(H2F(qh[i])*sc*(1.f+H2F(qnw[i])));
@@ -1096,15 +1086,12 @@ __global__ void pf_qk_norm_rope_fused(
         half_t *vc = v_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
         float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = H2F(kh[i]); ss += v*v; }
         ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = SHFL_SYNC(0xffffffff,sc,0);
-        // K is also updated in place as well as copied to the cache.
         for (int i = lid; i < FA_ROT_DIM/2; i += 32) {
             int p = i + FA_ROT_DIM/2;
-            float k0 = H2F(kh[i])*sc*(1.f+H2F(knw[i]));
-            float k1 = H2F(kh[p])*sc*(1.f+H2F(knw[p]));
             float freq = float(pos)/powf(FA_ROPE_THETA, float(2*i)/FA_ROT_DIM);
             float cv = cosf(freq), sv = sinf(freq);
-            kh[i] = kc[i] = F2H(k0*cv - k1*sv);
-            kh[p] = kc[p] = F2H(k0*sv + k1*cv);
+            apply_rope_pair(kh, kh, knw, i, p, sc, cv, sv);
+            kc[i] = kh[i]; kc[p] = kh[p];
             vc[i] = vh[i]; vc[p] = vh[p];
         }
         for (int i = FA_ROT_DIM + lid; i < FA_HEAD_DIM; i += 32) {

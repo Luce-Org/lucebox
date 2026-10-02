@@ -12,6 +12,7 @@
  */
 
 #include "half_type.h"
+#include "rope.h"
 
 // ── Pascal (sm_6x) compatibility shims ──
 // Pascal lacks the _sync suffixed warp shuffle and the fence.acq_rel.gpu
@@ -489,17 +490,16 @@ __device__ void full_attention_layer(
             float ss = 0; for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) ss += kh[i]*kh[i];
             ss = warp_reduce_sum(ss); float sc = rsqrtf(ss / float(FA_HEAD_DIM) + RMS_EPS);
             sc = SHFL_SYNC(0xffffffff, sc, 0);
-            for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) {
-                float normed = kh[i] * sc * (1.0f + H2F(__ldg(w.k_norm_weight + i)));
-                if (i < FA_ROTARY_DIM) {
-                    float fe = float(2*(i%(FA_ROTARY_DIM/2))) / float(FA_ROTARY_DIM);
-                    float freq = float(position) / powf(FA_ROPE_THETA, fe);
-                    float cv = cosf(freq), sv = sinf(freq);
-                    int p = (i < FA_ROTARY_DIM/2) ? i+FA_ROTARY_DIM/2 : i-FA_ROTARY_DIM/2;
-                    float pv = kh[p]*sc*(1.0f+H2F(__ldg(w.k_norm_weight+p)));
-                    float rotated = (i < FA_ROTARY_DIM/2) ? (normed*cv - pv*sv) : (pv*sv + normed*cv);
-                    kc[i] = F2H(rotated);
-                } else { kc[i] = F2H(normed); }
+            for (int i = lane_id; i < FA_ROTARY_DIM/2; i += WARP_SIZE) {
+                int p = i + FA_ROTARY_DIM/2;
+                float fe = float(2*i) / float(FA_ROTARY_DIM);
+                float freq = float(position) / powf(FA_ROPE_THETA, fe);
+                float cv = cosf(freq), sv = sinf(freq);
+                apply_rope_pair(kh, kc, w.k_norm_weight, i, p, sc, cv, sv);
+                vc[i] = F2H(vh[i]); vc[p] = F2H(vh[p]);
+            }
+            for (int i = FA_ROTARY_DIM + lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) {
+                kc[i] = F2H(kh[i]*sc*(1.0f+H2F(__ldg(w.k_norm_weight+i))));
                 vc[i] = F2H(vh[i]);
             }
         }
@@ -514,16 +514,12 @@ __device__ void full_attention_layer(
                 float ss = 0; for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) ss += qh_ptr[i]*qh_ptr[i];
                 ss = warp_reduce_sum(ss); float sc = rsqrtf(ss / float(FA_HEAD_DIM) + RMS_EPS);
                 sc = SHFL_SYNC(0xffffffff, sc, 0);
-                // Each lane owns a rotary pair. Read both originals before either store.
                 for (int i = lane_id; i < FA_ROTARY_DIM/2; i += WARP_SIZE) {
                     int p = i + FA_ROTARY_DIM/2;
-                    float q0 = qh_ptr[i]*sc*(1.0f+H2F(__ldg(w.q_norm_weight+i)));
-                    float q1 = qh_ptr[p]*sc*(1.0f+H2F(__ldg(w.q_norm_weight+p)));
                     float fe = float(2*i) / float(FA_ROTARY_DIM);
                     float freq = float(position) / powf(FA_ROPE_THETA, fe);
                     float cv = cosf(freq), sv = sinf(freq);
-                    qh_ptr[i] = q0*cv - q1*sv;
-                    qh_ptr[p] = q0*sv + q1*cv;
+                    apply_rope_pair(qh_ptr, qh_ptr, w.q_norm_weight, i, p, sc, cv, sv);
                 }
                 for (int i = FA_ROTARY_DIM + lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) {
                     qh_ptr[i] = qh_ptr[i]*sc*(1.0f+H2F(__ldg(w.q_norm_weight+i)));

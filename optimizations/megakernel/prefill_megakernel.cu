@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <mma.h>
+#include "rope.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -628,15 +629,11 @@ __device__ void phase_qk_norm_rope(
             ss = mega_warp_sum(ss);
             float sc = rsqrtf(ss / FA_HEAD_DIM + RMS_EPS);
             sc = __shfl_sync(0xffffffff, sc, 0);
-            // Preserve both normalized coordinates before updating this pair in place.
             for (int i = lid; i < FA_ROT_DIM / 2; i += 32) {
                 int p = i + FA_ROT_DIM / 2;
-                float q0 = __bfloat162float(qh[i]) * sc * (1.f + __bfloat162float(qnw[i]));
-                float q1 = __bfloat162float(qh[p]) * sc * (1.f + __bfloat162float(qnw[p]));
                 float freq = float(pos) / powf(FA_ROPE_THETA, float(2 * i) / FA_ROT_DIM);
                 float cv = cosf(freq), sv = sinf(freq);
-                qh[i] = __float2bfloat16(q0 * cv - q1 * sv);
-                qh[p] = __float2bfloat16(q0 * sv + q1 * cv);
+                apply_rope_pair(qh, qh, qnw, i, p, sc, cv, sv);
             }
             for (int i = FA_ROT_DIM + lid; i < FA_HEAD_DIM; i += 32) {
                 qh[i] = __float2bfloat16(__bfloat162float(qh[i]) * sc * (1.f + __bfloat162float(qnw[i])));
@@ -655,15 +652,12 @@ __device__ void phase_qk_norm_rope(
             ss = mega_warp_sum(ss);
             float sc = rsqrtf(ss / FA_HEAD_DIM + RMS_EPS);
             sc = __shfl_sync(0xffffffff, sc, 0);
-            // K is also updated in place as well as copied to the cache.
             for (int i = lid; i < FA_ROT_DIM / 2; i += 32) {
                 int p = i + FA_ROT_DIM / 2;
-                float k0 = __bfloat162float(kh[i]) * sc * (1.f + __bfloat162float(knw[i]));
-                float k1 = __bfloat162float(kh[p]) * sc * (1.f + __bfloat162float(knw[p]));
                 float freq = float(pos) / powf(FA_ROPE_THETA, float(2 * i) / FA_ROT_DIM);
                 float cv = cosf(freq), sv = sinf(freq);
-                kh[i] = kc[i] = __float2bfloat16(k0 * cv - k1 * sv);
-                kh[p] = kc[p] = __float2bfloat16(k0 * sv + k1 * cv);
+                apply_rope_pair(kh, kh, knw, i, p, sc, cv, sv);
+                kc[i] = kh[i]; kc[p] = kh[p];
                 vc[i] = vh[i];
                 vc[p] = vh[p];
             }

@@ -83,6 +83,7 @@ setup(
         CUDAExtension(
             name="qwen35_megakernel_bf16_C",
             sources=sources,
+            depends=["half_type.h", "rope.h"],
             extra_compile_args={
                 "cxx": cxx_args,
                 "nvcc": nvcc_args,
