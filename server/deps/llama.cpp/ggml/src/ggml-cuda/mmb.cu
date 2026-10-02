@@ -804,15 +804,6 @@ bool mmb_enabled() {
     return requested && mmb_arch();
 }
 int  mmb_min_t()   { return 512; }
-int  mmb_f32split_mode(){ return 2; }
-bool mmb_f32split() { return true; }
-bool mmb_bf16w()    { return true; }
-bool mmb_hc16()    { return true; }
-int  mmb_tall_mode(){ return 2; }
-bool mmb_tall()    { return mmb_tall_mode() != 0; }
-bool mmb_gatemix_flag() { return true; }
-bool mmb_down16_flag() { return true; }
-bool mmb_glu()     { return true; }
 // Default on, =0 kill switches (long-prompt quality gate on UD-Q4_K_XL and IQ4_NL):
 // LUCE_MMB_Q8F16: Q8_0 dense GEMMs take the F16 WMMA kernel (mmb-q8f16.cuh) instead of the bf16 tile.
 // LUCE_MMB_SMALL_M: F32/bf16 dense GEMMs with small M (HC inject, alpha/beta) take the bandwidth kernel (mmb-small-m.cuh).
@@ -910,8 +901,8 @@ bool ggml_cuda_mmb_q8f16_f16_input(const ggml_tensor * w, int64_t n_tokens) {
 bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (!mmb_enabled()) return false;
     const bool quant = mmb_quant_type(src0->type);
-    const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
-    const bool f32w  = src0->type == GGML_TYPE_F32 && mmb_f32split();
+    const bool bf16w = src0->type == GGML_TYPE_BF16;
+    const bool f32w  = src0->type == GGML_TYPE_F32;
     if (quant && src0->ne[0] % ggml_blck_size(src0->type) != 0) return false;
     // An F16 activation (e.g. GATED_RMS_NORM_F16) is only readable by the Q8_0 -> F16 WMMA route.
     const bool f16_in = src1->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_Q8_0 && mmb_q8f16() &&
@@ -956,7 +947,6 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     }
     if (src0->type == GGML_TYPE_F32) {
         dim3 grid((M + 127) / 128, (T + 127) / 128);
-        static const bool two = true;
         // A bf16-only src1 already holds its bf16 form; widen inside the tile load.
         const uint16_t * xb = ggml_cuda_mmb_bf16_src(src1);
         const void * xp = xb ? (const void *) xb : (const void *) src1->data;
@@ -968,13 +958,8 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             else    mmb_f32split_kernel<64, 32, 16, 16, true, false><<<g, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
             CUDA_CHECK(cudaGetLastError()); return;
         }
-        if (two) {
-            if (xb) mmb_f32split_kernel<128, 128, 32, 64, true,  true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
-            else    mmb_f32split_kernel<128, 128, 32, 64, true,  false><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
-        } else {
-            if (xb) mmb_f32split_kernel<128, 128, 32, 64, false, true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
-            else    mmb_f32split_kernel<128, 128, 32, 64, false, false><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
-        }
+        if (xb) mmb_f32split_kernel<128, 128, 32, 64, true,  true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
+        else    mmb_f32split_kernel<128, 128, 32, 64, true,  false><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
         CUDA_CHECK(cudaGetLastError()); return;
     }
     if (src0->type == GGML_TYPE_Q8_0) {
@@ -1016,16 +1001,15 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         return;
     }
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data;
-    if (mmb_tall() && src0->type == GGML_TYPE_IQ4_NL && M <= 384 && K >= 4096 && T >= 2048) {   // tall-M tile: HC down|inject [10240 -> 324], activations read once
-        static const int wide = mmb_tall_mode() >= 2;
-        if (wide) { dim3 grid(1, (T + 63) / 64); mmb_dense_kernel<384, 64, 96, 32, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
-        else      { dim3 grid(1, (T + 31) / 32); mmb_dense_kernel<384, 32, 96, 16, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
+    if (src0->type == GGML_TYPE_IQ4_NL && M <= 384 && K >= 4096 && T >= 2048) {   // tall-M tile: HC down|inject [10240 -> 324], activations read once
+        dim3 grid(1, (T + 63) / 64);
+        mmb_dense_kernel<384, 64, 96, 32, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
     const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q5_K) ? mmb_shadow_lookup(src0) : nullptr;
     const bool big = (M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096);
-    uint16_t * Dh = (mmb_hc16() && K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
+    uint16_t * Dh = (K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
     bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
     if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {
         Dh = (uint16_t *) dst->data; store_f32 = false;
@@ -1055,7 +1039,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     CUDA_CHECK(cudaGetLastError());
 }
 
-bool ggml_cuda_mmb_gatemix() { return mmb_arch() && mmb_gatemix_flag(); }
+bool ggml_cuda_mmb_gatemix() { return mmb_arch(); }
 bool ggml_cuda_mmb_blk16() { return mmb_arch(); }
 bool ggml_cuda_mmb_res16()  { return mmb_arch(); }
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
@@ -1120,7 +1104,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data; const size_t eb = (size_t) src0->nb[2];
     const bool f16_out = ggml_cuda_mmb_is_f16_only(dst);   // rows kept as F16 in place for the MoE-mode HC combine
-    uint16_t * Dh = (f16_out || (mmb_down16_flag() && ggml_cuda_mmb_is_bf16_only(dst))) ? (uint16_t *) dst->data : nullptr;
+    uint16_t * Dh = (f16_out || ggml_cuda_mmb_is_bf16_only(dst)) ? (uint16_t *) dst->data : nullptr;
     const bool store_f32 = Dh == nullptr;
     dim3 gbig((M + 127) / 128, nbig_max), gsmall((M + 127) / 128, nsmall_max);
     mmb_dispatch_quant(src0->type, [&](auto tag) {
@@ -1137,7 +1121,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
 }
 
 bool ggml_cuda_mmb_supported_glu(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
-    if (!mmb_enabled() || !mmb_glu() || !gw || !uw || !src1 || !ids || !glu) return false;
+    if (!mmb_enabled() || !gw || !uw || !src1 || !ids || !glu) return false;
     if (!mmb_quant_type(gw->type) || uw->type != gw->type) return false;
     if (!ggml_are_same_shape(gw, uw) || gw->nb[1] != uw->nb[1] || gw->nb[2] != uw->nb[2]) return false;
     if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) return false;
