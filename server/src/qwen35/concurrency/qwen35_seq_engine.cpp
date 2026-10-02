@@ -272,7 +272,7 @@ DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot, bool batched) {
 }
 
 bool Qwen35SeqEngine::chain_spec_input_capable(
-        const StepInput & input) const {
+        const StepInput & input, int width) const {
     if (!fixed_chain_ready_ || !input.allow_speculation ||
         input.slot < 0 || input.slot >= slots_.slot_count()) {
         return false;
@@ -280,13 +280,26 @@ bool Qwen35SeqEngine::chain_spec_input_capable(
     const Qwen35Slot & slot = slots_.slot(input.slot);
     return slot.decoding() && !slot.sampler.needs_logit_processing() &&
            slot.cur_pos >= 1 &&
-           slot.cur_pos + fixed_chain_.width <= slots_.max_context();
+           slot.cur_pos + (width > 0 ? width : fixed_chain_.width) <=
+               slots_.max_context();
 }
 
 std::vector<uint8_t>
 Qwen35SeqEngine::select_chain_lanes(const StepPlan & plan) const {
     std::vector<uint8_t> selected(plan.decode.size(), 0);
     if (!plan.prefills.empty()) return selected;
+    // Two or more lanes draft the batched block, so near the context limit a
+    // lane qualifies when that shorter block fits; a lane alone drafts the
+    // configured block and needs room for all of it.
+    if (batched_draft_width_ > 0) {
+        size_t lanes = 0;
+        for (size_t i = 0; i < plan.decode.size(); ++i) {
+            selected[i] = chain_spec_input_capable(
+                plan.decode[i], batched_draft_width_) ? 1 : 0;
+            lanes += selected[i];
+        }
+        if (lanes >= 2) return selected;
+    }
     for (size_t i = 0; i < plan.decode.size(); ++i) {
         selected[i] = chain_spec_input_capable(plan.decode[i]) ? 1 : 0;
     }
@@ -344,7 +357,7 @@ Qwen35SeqEngine::prepare_chain_drafts(
     for (size_t i = 0; i < inputs.size(); ++i) {
         if (!selected[i]) continue;
         const StepInput & input = inputs[i];
-        if (!chain_spec_input_capable(input)) {
+        if (!chain_spec_input_capable(input, draft_width)) {
             reset_lanes();
             return std::nullopt;
         }

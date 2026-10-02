@@ -185,7 +185,8 @@ private:
                              std::vector<float> * logits_scratch = nullptr);
     std::vector<uint8_t> select_chain_lanes(
         const StepPlan & plan) const;
-    bool chain_spec_input_capable(const StepInput & input) const;
+    // width: the block the round drafts (0 = the configured block).
+    bool chain_spec_input_capable(const StepInput & input, int width = 0) const;
     DraftFeatureMirror * slot_feature_mirror(int slot);
     DraftKvState * ensure_slot_draft_kv(int slot, bool batched = false);
     void reset_slot_draft_kv(int slot);
