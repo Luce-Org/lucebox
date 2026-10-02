@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -45,6 +46,18 @@ int argmax(const std::vector<float> & v) {
         }
     }
     return best;
+}
+
+bool same_bits(const std::vector<float> & a, const std::vector<float> & b) {
+    return a.size() == b.size() &&
+        std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+}
+
+uint64_t logits_hash(const std::vector<float> & x) {
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t * p = reinterpret_cast<const uint8_t *>(x.data());
+    for (size_t i = 0; i < x.size() * sizeof(float); ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
 }
 
 }  // namespace
@@ -182,6 +195,33 @@ int main(int argc, char ** argv) {
         std::printf("[smoke] split S=%d N=%d chunk=%d ok=%d argmax %d vs %d max_abs_diff=%.4f kl=%.6f top10_overlap=%d\n",
             S, N, step, (int) ok, ok ? argmax(full) : -1, ok ? argmax(split) : -1, max_diff, kl, overlap);
         if (!ok || argmax(full) != argmax(split)) rc = 1;
+    }
+
+    // A reset/reuse must match a freshly allocated cache for the same prefix.
+    if (rc == 0) {
+        Qwen4ExpCache fresh;
+        if (!create_qwen4exp_cache(backend, w, S + 4, GGML_TYPE_F16, fresh)) {
+            std::fprintf(stderr, "[smoke] fresh cache creation failed\n");
+            rc = 1;
+        } else {
+            reset_qwen4exp_state(backend, cache);
+            reset_qwen4exp_state(backend, fresh);
+            std::vector<float> tmp, reused_logits, fresh_logits;
+            const bool p1 = qwen4exp_forward(backend, w, cache, tokens.data(), S, 0, tmp).ok;
+            const bool p2 = qwen4exp_forward(backend, w, fresh, tokens.data(), S, 0, tmp).ok;
+            const int32_t reuse_token = 77 % w.n_vocab;
+            const Qwen4ExpForwardResult rr = qwen4exp_forward(backend, w, cache, &reuse_token, 1, S, reused_logits);
+            const Qwen4ExpForwardResult fr = qwen4exp_forward(backend, w, fresh, &reuse_token, 1, S, fresh_logits);
+            if (!p1 || !p2 || !rr.ok || !fr.ok || !same_bits(reused_logits, fresh_logits)) {
+                std::fprintf(stderr, "[smoke] cancel-reset-reuse FAILED\n");
+                rc = 1;
+            } else {
+                std::printf("[smoke] cancel-reset-reuse OK reused_hash=%016llx fresh_cache_hash=%016llx\n",
+                    (unsigned long long) logits_hash(reused_logits),
+                    (unsigned long long) logits_hash(fresh_logits));
+            }
+            free_qwen4exp_cache(fresh);
+        }
     }
 
     free_qwen4exp_cache(cache);

@@ -17,6 +17,7 @@
 
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -531,6 +532,18 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     dense.model_path = "/nonexistent/model.gguf";
     dense.max_concurrency = 2;
     CHECK(!gate_result(dense, "qwen35", PlacementBackend::Cuda).empty());
+
+    // qwen4exp has no paged decode path (paged_attn = kNever): the retired
+    // experimental independent-slot engine previously bypassed this rule via
+    // LUCE_QWEN4EXP_SEQ_ENGINE / QWEN4EXP_BATCHED_DECODE. max_concurrency > 1
+    // must now be rejected the same way as every other unsupported
+    // architecture, with or without those environment variables set.
+    setenv("LUCE_QWEN4EXP_SEQ_ENGINE", "1", 1);
+    setenv("QWEN4EXP_BATCHED_DECODE", "1", 1);
+    CHECK(!gate_result(dense, "qwen4exp", PlacementBackend::Cuda).empty());
+    unsetenv("LUCE_QWEN4EXP_SEQ_ENGINE");
+    unsetenv("QWEN4EXP_BATCHED_DECODE");
+    CHECK(!gate_result(dense, "qwen4exp", PlacementBackend::Cuda).empty());
 
     BackendArgs parallel = paged;
     parallel.max_concurrency = 2;

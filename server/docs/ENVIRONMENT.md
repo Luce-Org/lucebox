@@ -43,10 +43,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_MMB_HCDOWN_I8` | 1 | KILL SWITCH: =0 keeps the qwen4exp HC down projection (Q8_0) on the F16 WMMA route instead of int8 WMMA on Q8 tiles emitted by the HC combine (`mmb-w8a8.cuh`). |
 | `QWEN4EXP_F16` | 1 | KILL SWITCH: =0 disables the gfx1151 MMB prefill F16 paths (gated-norm tail, attention gate, MoE combine folded into the HC combine with F16 routed-down rows). Off under `QWEN4EXP_UPSTREAM` and `QWEN4EXP_DUMP`. |
 | `LLAMA_MMB_HC16` | 0 (2: qwen4exp gfx1151) | `2` enables the qwen4exp validated bf16-only hyper-connection stream. |
-| `QWEN4EXP_BATCHED_DECODE` | 0 | EXPERIMENTAL: =1 enables independent-slot batched decode; required with `LUCE_QWEN4EXP_SEQ_ENGINE=1`. Default off; excluded under `QWEN4EXP_UPSTREAM=1`. |
-| `LUCE_QWEN4EXP_SEQ_ENGINE` | unset | EXPERIMENTAL: =1 enables qwen4exp full-cache SeqEngine concurrency when paired with `QWEN4EXP_BATCHED_DECODE=1`, `--max-concurrency=2..4`, and `--max-ctx=32768`. No paging; excluded under upstream reference mode. |
 | `QWEN4EXP_UPSTREAM` | unset | DEBUG: reference-compatible qwen4exp path (unfused ops, F32 RoPE, K/V padded to 256) used by the upstream differential harness. |
-| `QWEN4EXP_PROF` | unset | DEBUG: qwen4exp per-call phase timings, forward-call timestamps, graph batch widths and SeqEngine step telemetry. |
 | `QWEN4EXP_DUMP` / `QWEN4EXP_DUMP_BIN` | unset | DEBUG: qwen4exp activation dumps for differential tests. |
 | `LUCE_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |
 | `LUCE_ADAPTIVE_K_DENSE` | per-model default | CSV of MoE layers kept dense under adaptive-K (DFlash capture layers). Warned-inert on families that do not thread layer indices yet. |

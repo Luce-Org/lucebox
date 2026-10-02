@@ -147,12 +147,6 @@ void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace) {
     workspace = {};
 }
 
-void clear_qwen4exp_batched_decode_workspace(Qwen4ExpBatchedDecodeWorkspace & workspace) {
-    if (workspace.alloc) ggml_gallocr_free(workspace.alloc);
-    if (workspace.ctx) ggml_free(workspace.ctx);
-    workspace = {};
-}
-
 void free_qwen4exp_cache(Qwen4ExpCache & c) {
     clear_qwen4exp_decode_workspace(c.decode_workspace);
     if (c.input_ring.buf) {
