@@ -187,7 +187,8 @@ private:
         const StepPlan & plan) const;
     bool chain_spec_input_capable(const StepInput & input) const;
     DraftFeatureMirror * slot_feature_mirror(int slot);
-    DraftKvState * ensure_slot_draft_kv(int slot);
+    DraftKvState * ensure_slot_draft_kv(int slot, bool batched = false);
+    void reset_slot_draft_kv(int slot);
     std::optional<PreparedChainRound> prepare_chain_drafts(
         const std::vector<StepInput> & inputs,
         const std::vector<uint8_t> & selected);
@@ -198,7 +199,8 @@ private:
     // keeps its own AdaptiveSpecWidth: a round's cost depends on the graph's
     // rows (bucket lanes x width), while the width that maximizes committed
     // tokens per unit cost does not depend on how many lanes share it.
-    int choose_chain_width(int bucket);
+    // cap: the longest chain the round drafted (0 = the configured block).
+    int choose_chain_width(int bucket, int cap = 0);
     void observe_chain_width(int bucket, int width,
                              const std::vector<size_t> & accepted,
                              double step_ms);
@@ -246,6 +248,16 @@ private:
     std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;
     std::vector<std::unique_ptr<DraftKvState>> dummy_draft_kv_;
     DraftKvBatchGraph batch_draft_graph_;
+    // Rounds with two or more lanes draft a shorter block than the configured
+    // one: a long block pays for itself only when one request decodes alone
+    // (verify cost grows with lanes x width, acceptance stays per lane).
+    // batched_dw_ is b_.dw_ with that block size; it shares the tensors of
+    // b_.dw_ and is never freed. 0 = every round drafts the configured block.
+    int batched_draft_width_ = 0;
+    DraftWeights batched_dw_;
+    std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_batched_;
+    std::vector<std::unique_ptr<DraftKvState>> dummy_draft_kv_batched_;
+    DraftKvBatchGraph batch_draft_graph_batched_;
 
     // Hoisted per-step buffers (reused across step() calls).
     std::vector<int>         reserve_growth_;
