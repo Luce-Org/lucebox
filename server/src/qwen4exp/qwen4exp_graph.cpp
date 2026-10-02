@@ -1187,7 +1187,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                                        std::vector<float> & out_logits) {
     Qwen4ExpForwardResult res;
     if (n_tokens <= 0 || pos0 < 0 || !tokens) return res;
-    const bool prof = prof_enabled();
     // QWEN4EXP_DUMP=1 materialises per-layer activations and prints finite/absmax/mean.
     static const bool dump = getenv("QWEN4EXP_DUMP") != nullptr;
     // The fused reduction can differ from upstream's ggml_rms_norm below one
@@ -1209,8 +1208,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
             dump_t.emplace_back(t, label);
         }
     };
-    const double t0 = prof ? prof_now_ms() : 0.0;
-    double t_emb = t0, t_ple = t0, t_alloc = t0, t_upload = t0, t_compute = t0;
     if (pos0 + n_tokens > cache.max_ctx) {
         std::fprintf(stderr, "[qwen4exp] context overflow: %d + %d > %d\n",
                      pos0, n_tokens, cache.max_ctx);
@@ -1227,7 +1224,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         std::fprintf(stderr, "[qwen4exp] cpu embedding failed\n");
         return res;
     }
-    if (prof) t_emb = prof_now_ms();
 
     const bool has_ple = !cache.ple_layer_ids.empty() && w.ple_reader.available();
     const int64_t ple_heads = w.ple_n_heads;
@@ -1280,7 +1276,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         cache.ple_prev = std::move(next);
     }
 
-    if (prof) t_ple = prof_now_ms();
     const int64_t T = n_tokens;
     const int64_t kv_len = pos0 + n_tokens;
     const bool fa_pad256 = upstream;   // the upstream reference pads K/V to 256
@@ -1309,20 +1304,12 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
             ggml_backend_tensor_set_async(backend, ws.ple_in, ple_data.data(), 0,
                                           sizeof(float) * ple_data.size());
         }
-        if (prof) t_upload = prof_now_ms();
         if (ggml_backend_graph_compute(backend, ws.gf) != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "[qwen4exp] stable graph compute failed\n");
             return false;
         }
         out_logits.resize((size_t) w.n_vocab);
         ggml_backend_tensor_get(ws.logits, out_logits.data(), 0, sizeof(float) * w.n_vocab);
-        if (prof) {
-            t_compute = prof_now_ms();
-            std::fprintf(stderr,
-                "[qwen4exp-prof] T=1 stable=1 embed=%.1fms ple=%.1fms build+alloc=0.0ms mask+upload=%.1fms compute=%.1fms get=%.1fms total=%.1fms\n",
-                t_emb - t0, t_ple - t_emb, t_upload - t_ple,
-                t_compute - t_upload, prof_now_ms() - t_compute, prof_now_ms() - t0);
-        }
         return true;
     };
 
@@ -1519,7 +1506,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     ggml_set_name(logits, "logits");
     dump_mark(logits, "logits");
     ggml_build_forward_expand(gf, logits);
-    trace_batch_widths(gf, "single", (int) T, (int) graph_kv_len);
 
     // Point input tensors at this call's pinned ring slot before allocation so the gallocr leaves them alone.
     char * ring_embd = nullptr;
@@ -1604,7 +1590,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         decode_ws.kv_bucket = stable_kv_bucket;
     }
 
-    if (prof) t_alloc = prof_now_ms();
     // M-RoPE sections are section-major [s*T + i]: 0..2 carry the position, 3 is zero.
     std::vector<int32_t> pos((size_t) 4 * T, 0);
     for (int64_t i = 0; i < T; ++i) {
@@ -1656,9 +1641,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         }
     }
 
-    if (prof) t_upload = prof_now_ms();
-    const bool call_telemetry = prof_enabled();
-    const double call_begin_s = call_telemetry ? mono_now_s() : 0.0;
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[qwen4exp] graph compute failed\n");
         if (reuse_ws) {
@@ -1674,18 +1656,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
 
     out_logits.resize((size_t) w.n_vocab);
     ggml_backend_tensor_get(logits, out_logits.data(), 0, sizeof(float) * w.n_vocab);
-    if (call_telemetry) {
-        std::fprintf(stderr,
-            "[qwen4exp-forward-call] T=%d pos=%d begin_abs=%.9f done_abs=%.9f\n",
-            n_tokens, pos0, call_begin_s, mono_now_s());
-    }
-    if (prof) {
-        t_compute = prof_now_ms();
-        std::fprintf(stderr,
-            "[qwen4exp-prof] T=%d embed=%.1fms ple=%.1fms build+alloc=%.1fms mask+upload=%.1fms compute=%.1fms get=%.1fms total=%.1fms\n",
-            n_tokens, t_emb - t0, t_ple - t_emb, t_alloc - t_ple, t_upload - t_alloc,
-            t_compute - t_upload, prof_now_ms() - t_compute, prof_now_ms() - t0);
-    }
 
     if (dump) {
         for (auto & dt : dump_t) {
