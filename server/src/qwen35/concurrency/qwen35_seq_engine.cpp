@@ -96,16 +96,26 @@ Qwen35SeqEngine::Qwen35SeqEngine(
     {
         const char * env = std::getenv("LUCE_BATCHED_DRAFT_WIDTH");
         const int want = env ? std::atoi(env) : 8;
-        if (n_slots > 1 && want >= 2 && want < fixed_chain_.width &&
+        const bool supported = want >= 2 && want < fixed_chain_.width &&
             std::find(chain_width_choices_.begin(), chain_width_choices_.end(),
-                      want) != chain_width_choices_.end()) {
+                      want) != chain_width_choices_.end();
+        if (n_slots > 1 && supported) {
             batched_draft_width_ = want;
-            batched_dw_ = b_.dw_;
-            batched_dw_.block_size = want;
             slot_draft_kv_batched_.resize(static_cast<size_t>(n_slots));
             std::fprintf(stderr,
                 "[parallel] batched rounds draft block %d (one lane: %d)\n",
                 want, fixed_chain_.width);
+        } else if (env && want != 0 && !supported) {
+            // only the verify widths below the block have graphs
+            std::fprintf(stderr,
+                "[parallel] LUCE_BATCHED_DRAFT_WIDTH=%s ignored: use 0 or a "
+                "verify width below the block (",
+                env);
+            for (int width : chain_width_choices_) {
+                if (width < fixed_chain_.width) std::fprintf(stderr, " %d", width);
+            }
+            std::fprintf(stderr, " ); batched rounds draft block %d\n",
+                         fixed_chain_.width);
         }
     }
     if (adaptive_chain_width_) {
@@ -209,6 +219,13 @@ void Qwen35SeqEngine::release_draft_graphs() {
     }
 }
 
+int Qwen35SeqEngine::chain_draft_width(
+        const std::vector<uint8_t> & selected) const {
+    const bool batched = batched_draft_width_ > 0 &&
+        std::count(selected.begin(), selected.end(), uint8_t{1}) >= 2;
+    return batched ? batched_draft_width_ : fixed_chain_.width;
+}
+
 void Qwen35SeqEngine::reset_slot_draft_kv(int slot) {
     for (auto * states : {&slot_draft_kv_, &slot_draft_kv_batched_}) {
         if (slot >= 0 && slot < static_cast<int>(states->size()) &&
@@ -286,10 +303,14 @@ Qwen35SeqEngine::prepare_chain_drafts(
     }
     PreparedChainRound round;
     round.drafts.resize(inputs.size());
-    // Two or more lanes draft the shorter batched block (batched_draft_width_).
-    const bool batched = batched_draft_width_ > 0 &&
-        std::count(selected.begin(), selected.end(), uint8_t{1}) >= 2;
-    const int draft_width = batched ? batched_draft_width_ : fixed_chain_.width;
+    // Two or more lanes draft the shorter batched block (batched_draft_width_),
+    // with the live draft tensors.
+    const int draft_width = chain_draft_width(selected);
+    const bool batched = draft_width != fixed_chain_.width;
+    if (batched) {
+        batched_dw_ = b_.dw_;
+        batched_dw_.block_size = draft_width;
+    }
     const DraftWeights & dw = batched ? batched_dw_ : b_.dw_;
     std::vector<std::unique_ptr<DraftKvState>> & dummies =
         batched ? dummy_draft_kv_batched_ : dummy_draft_kv_;
@@ -1901,11 +1922,12 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
 bool Qwen35SeqEngine::reserve_decode(const StepPlan & plan) {
     std::fill(reserve_growth_.begin(), reserve_growth_.end(), 0);
     const auto chains = select_chain_lanes(plan);
+    const int chain_width = chain_draft_width(chains);      // what the round will draft and verify
     for (size_t i = 0; i < plan.decode.size(); ++i) {
         const int slot = plan.decode[i].slot;
         if (slot < 0 || slot >= slots_.slot_count() ||
             reserve_growth_[(size_t)slot]) return false;
-        reserve_growth_[(size_t)slot] = chains[i] ? fixed_chain_.width : 1;
+        reserve_growth_[(size_t)slot] = chains[i] ? chain_width : 1;
     }
     return slots_.reserve_decode(reserve_growth_);
 }

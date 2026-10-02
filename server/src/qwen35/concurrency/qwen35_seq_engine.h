@@ -189,6 +189,8 @@ private:
     DraftFeatureMirror * slot_feature_mirror(int slot);
     DraftKvState * ensure_slot_draft_kv(int slot, bool batched = false);
     void reset_slot_draft_kv(int slot);
+    // The block a round with these selected lanes drafts.
+    int chain_draft_width(const std::vector<uint8_t> & selected) const;
     std::optional<PreparedChainRound> prepare_chain_drafts(
         const std::vector<StepInput> & inputs,
         const std::vector<uint8_t> & selected);
@@ -251,8 +253,10 @@ private:
     // Rounds with two or more lanes draft a shorter block than the configured
     // one: a long block pays for itself only when one request decodes alone
     // (verify cost grows with lanes x width, acceptance stays per lane).
-    // batched_dw_ is b_.dw_ with that block size; it shares the tensors of
-    // b_.dw_ and is never freed. 0 = every round drafts the configured block.
+    // batched_dw_ is b_.dw_ with that block size, copied again at every
+    // batched round so it always holds the live tensors (a draft park and
+    // unpark reloads b_.dw_); it is never freed. 0 = every round drafts the
+    // configured block.
     int batched_draft_width_ = 0;
     DraftWeights batched_dw_;
     std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_batched_;
