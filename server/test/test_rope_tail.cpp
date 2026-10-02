@@ -6,6 +6,7 @@
 // test builds both forms on the CUDA/HIP backend and on the CPU backend and
 // requires bit-identical results, for positive and negative positions and for
 // the single-head 2D shape the compressor uses.
+// Also checks the input lifetime of the M-RoPE -> PERMUTE -> CONT fusion.
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #ifdef LUCE_ROPE_TEST_GPU
@@ -132,6 +133,57 @@ size_t bit_mismatches(const std::vector<float> & a, const std::vector<float> & b
     return mm;
 }
 
+// CONT may reuse the position leaf after ROPE's last read in the unfused
+// schedule. Fusing ROPE into that destination would race position reads with
+// output writes, even for T=1 where the permutation is otherwise an identity.
+bool check_mrope_cont_alias(ggml_backend_t backend, int heads, int tokens) {
+    ggml_context * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
+    if (!ctx) return false;
+    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, heads, tokens);
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * tokens);
+    ggml_set_input(x);
+    ggml_set_input(pos);
+    int sections[4] = {16, 24, 24, 0};
+    ggml_tensor * rope = ggml_rope_multi(ctx, x, pos, nullptr, 128, sections,
+        GGML_ROPE_TYPE_MROPE, 0, 10000000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    ggml_tensor * out = ggml_cont(ctx, ggml_permute(ctx, rope, 0, 2, 1, 3));
+    // Materializing this intermediate provides the unfused reference without
+    // changing the process-wide fusion setting.
+    ggml_set_output(rope);
+    ggml_set_output(out);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) { ggml_free(ctx); return false; }
+    std::vector<float> input((size_t) ggml_nelements(x)), expected(input.size()), actual(input.size());
+    for (float & value : input) value = lcg_uniform() * 3.0f;
+    std::vector<int32_t> positions((size_t) 4 * tokens);
+    for (int axis = 0; axis < 4; ++axis)
+        for (int t = 0; t < tokens; ++t) positions[axis * tokens + t] = axis == 3 ? 0 : 2050 + t;
+    ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+    ggml_backend_tensor_set(pos, positions.data(), 0, ggml_nbytes(pos));
+    bool ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+    ggml_backend_tensor_get(out, expected.data(), 0, ggml_nbytes(out));
+    rope->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+    // Both tensors use buf. This is a legal allocation for separate ROPE/CONT;
+    // pos remains a GGML_OP_NONE leaf, which overlap checks must not skip.
+    void * separate_positions = pos->data;
+    for (int repeat = 0; ok && repeat < 3; ++repeat) {
+        const size_t offset = repeat == 2 ? ggml_nbytes(out) - ggml_nbytes(pos) : 0;
+        pos->data = repeat == 0 ? separate_positions : (char *) out->data + offset;
+        ggml_backend_tensor_set(pos, positions.data(), 0, ggml_nbytes(pos));
+        ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        ggml_backend_tensor_get(out, actual.data(), 0, ggml_nbytes(out));
+        const size_t mismatches = bit_mismatches(expected, actual);
+        std::printf("mrope-cont: H=%d T=%d alias=%d offset=%zu mismatches=%zu\n",
+                    heads, tokens, repeat != 0, offset, mismatches);
+        ok = ok && mismatches == 0;
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return ok;
+}
+
 bool check(ggml_backend_t backend, const char * label, int head_dim, int n_heads, int n_tokens,
            const std::vector<int32_t> & pos, const RopeParams & rp, bool use_factors = false) {
     std::vector<float> x((size_t) head_dim * n_heads * n_tokens);
@@ -190,10 +242,28 @@ TEST_CASE(RopeTailFixture, cpu_matches_split_rotate_concat) {
     compare();
 }
 
+TEST_CASE(RopeTailFixture, cpu_mrope_cont_position_alias) {
+    backend = ggml_backend_cpu_init();
+    REQUIRE_TRUE(check_mrope_cont_alias(backend, 24, 1));
+    REQUIRE_TRUE(check_mrope_cont_alias(backend, 256, 1));
+    REQUIRE_TRUE(check_mrope_cont_alias(backend, 24, 128));
+}
+
 #ifdef LUCE_ROPE_TEST_GPU
 TEST_CASE(RopeTailFixture, gpu_matches_split_rotate_concat) {
     if (ggml_backend_cuda_get_device_count() == 0) SKIP("no CUDA/HIP device available");
     backend = ggml_backend_cuda_init(0);
     compare();
+}
+
+TEST_CASE(RopeTailFixture, gpu_mrope_cont_position_alias) {
+    if (ggml_backend_cuda_get_device_count() == 0) SKIP("no CUDA/HIP device available");
+    backend = ggml_backend_cuda_init(0);
+    ggml_backend_cuda_set_graphs_disabled_override(true);
+    const bool ok = check_mrope_cont_alias(backend, 24, 1) &&
+                    check_mrope_cont_alias(backend, 256, 1) &&
+                    check_mrope_cont_alias(backend, 24, 128);
+    ggml_backend_cuda_set_graphs_disabled_override(false);
+    REQUIRE_TRUE(ok);
 }
 #endif

@@ -4946,7 +4946,9 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE) {
+                // Leaf inputs can be recycled after their unfused last use too
+                // (e.g. RoPE positions reused by the following CONT).
+                if (!src) {
                     continue;
                 }
 
@@ -5067,10 +5069,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * perm = cgraph->nodes[node_idx + 1];
         const ggml_tensor * cont = cgraph->nodes[node_idx + 2];
         const int mode = ggml_get_op_params_i32(rope, 2);
+        const int outputs[] = { node_idx + 2 };
         return !upstream && (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION && !(mode & GGML_ROPE_TYPE_TAIL) &&
             rope->type == GGML_TYPE_F32 && rope->src[0]->type == GGML_TYPE_F32 && rope->src[0]->ne[3] == 1 &&
             perm->src[0] == rope && ggml_get_op_params_i32(perm, 0) == 0 &&
-            cont->src[0] == perm && cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont);
+            cont->src[0] == perm && cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, 3, outputs, 1);
     }
 
     // dflash: residual ADD + RMS_NORM + MUL. The add output stays live (it is
