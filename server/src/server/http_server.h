@@ -353,6 +353,12 @@ struct ParsedRequest {
     // hard_limit_reply_budget. Values are already clamped to those ceilings.
     int                       per_req_phase1_cap   = -1;
     int                       per_req_reply_budget = -1;
+    // Jinja-path only: `preserve_thinking` from `chat_template_kwargs`.
+    // Tri-state: -1 = not set (template default applies, typically true),
+    // 0 = false, 1 = true. Controls whether official templates (e.g.
+    // qwen4exp) replay earlier assistant turns' recorded <think> block
+    // (message.reasoning_content) or strip it.
+    int                       preserve_thinking = -1;
     // Stop sequences (OpenAI "stop" + Anthropic "stop_sequences")
     std::vector<std::string>  stop_sequences;
     // Bandit: per-session adaptive keep_ratio opt-in

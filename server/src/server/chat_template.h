@@ -19,6 +19,12 @@ struct ChatMessage {
     std::string content;    // message text
     // Optional tool_call_id for tool result messages.
     std::string tool_call_id;
+    // Optional prior <think> text for assistant messages (OpenAI-compatible
+    // `reasoning_content` / `reasoning` fields on request history). Only the
+    // Jinja renderer consumes this — exposed to templates as
+    // `message.reasoning_content` so official templates (e.g. qwen4exp) can
+    // decide whether to replay it inside <think>...</think>.
+    std::string reasoning_content;
 };
 
 // Chat template format.
@@ -71,6 +77,12 @@ ChatFormat chat_format_for_arch(const std::string & arch);
 // `tools_json`   optional JSON array of tool definitions; when non-empty it
 //                is parsed and injected as `tools` into the template context.
 // `reasoning_effort` optional; injected as `reasoning_effort` when non-empty.
+// `preserve_thinking` tri-state: -1 leaves the template variable undefined
+//                (so the template's own default — typically true — applies);
+//                0/1 inject it as the `preserve_thinking` boolean. Official
+//                templates (e.g. qwen4exp) use this to decide whether earlier
+//                assistant turns replay their recorded <think> block
+//                (message.reasoning_content) or render with it stripped.
 //
 // Internally caches the most recently parsed program per thread (avoids
 // re-parsing the template on every request). Throws std::runtime_error on
@@ -83,7 +95,8 @@ std::string render_chat_template_jinja(
     bool add_generation_prompt = true,
     bool enable_thinking = false,
     const std::string & tools_json = "",
-    const std::string & reasoning_effort = "");
+    const std::string & reasoning_effort = "",
+    int preserve_thinking = -1);
 
 // Qwen3.8-Flash-Next's template knows the efforts low, medium and xhigh (its default); Lucebox's high, x-high and
 // max map to xhigh. Empty stays empty so the template applies its own default.

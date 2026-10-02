@@ -1094,6 +1094,21 @@ std::vector<ChatMessage> normalize_chat_messages(
 
             ChatMessage cm;
             cm.role = m.value("role", "user");
+
+            // Carry a replayed assistant turn's prior <think> text through to
+            // the Jinja renderer as message.reasoning_content (OpenAI/DeepSeek
+            // dialect; `reasoning` is the OpenRouter/Anthropic-gateway flat
+            // alias — same field the response side emits, see
+            // format_response_message's reasoning_content/reasoning/
+            // reasoning_details trio below).
+            if (cm.role == "assistant") {
+                if (m.contains("reasoning_content") && m["reasoning_content"].is_string()) {
+                    cm.reasoning_content = m["reasoning_content"].get<std::string>();
+                } else if (m.contains("reasoning") && m["reasoning"].is_string()) {
+                    cm.reasoning_content = m["reasoning"].get<std::string>();
+                }
+            }
+
             const bool anthropic_blocks = format == ApiFormat::ANTHROPIC &&
                 m.contains("content") && m["content"].is_array();
 
@@ -2293,6 +2308,7 @@ void apply_request_reasoning(
     req.thinking_opt_in = enable_thinking;
     req.per_req_phase1_cap = -1;
     req.per_req_reply_budget = -1;
+    req.preserve_thinking = -1;
 
     auto apply_reasoning_effort = [&](const std::string & effort) {
         if (effort == "none") {
@@ -2379,6 +2395,10 @@ void apply_request_reasoning(
         }
         if (kwargs.contains("enable_thinking")) {
             enable_thinking = kwargs["enable_thinking"].get<bool>();
+        }
+        if (kwargs.contains("preserve_thinking") &&
+            kwargs["preserve_thinking"].is_boolean()) {
+            req.preserve_thinking = kwargs["preserve_thinking"].get<bool>() ? 1 : 0;
         }
     }
     // DeepSeek uses high whenever thinking is enabled without an explicit
@@ -2471,7 +2491,8 @@ bool HttpServer::render_messages_to_text(
                 config_.chat_template_src, chat_messages, bos, eos,
                 add_generation_prompt,
                 req.thinking_enabled, tools_json,
-                config_.arch == "qwen4exp" ? qwen4exp_template_effort(req.reasoning_effort) : std::string());
+                config_.arch == "qwen4exp" ? qwen4exp_template_effort(req.reasoning_effort) : std::string(),
+                req.preserve_thinking);
         } catch (const std::exception & e) {
             error = std::string("chat template (jinja) render failed: ") + e.what();
             return false;

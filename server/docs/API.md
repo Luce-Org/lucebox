@@ -75,7 +75,7 @@ Successful requests expose the measured result under `usage.timings`:
 | `rep_window` | int | 256 | Token lookback window for penalties | ✅ |
 | `tools` | array | none | Tool/function definitions | ✅ |
 | `reasoning` | object | — | Reasoning effort control (`{"effort":"medium"}`) | ✅ |
-| `chat_template_kwargs` | object | — | Direct template control (`{"enable_thinking":true}`) | ✅ |
+| `chat_template_kwargs` | object | — | Direct template control (`{"enable_thinking":true}`). Jinja templates (e.g. qwen4exp) also accept `preserve_thinking` (bool): whether earlier assistant turns replay their recorded `reasoning_content` inside `<think>...</think>` (default: template's own default, typically true) | ✅ |
 | `stop` | string/array | — | Stop sequences | ✅ |
 | `n` | int | — | Number of completions | ❌ TODO |
 | `logprobs` | bool | — | Return log probabilities | ❌ TODO |

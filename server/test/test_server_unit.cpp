@@ -4617,6 +4617,21 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_thinks_by_default) {
     TEST_ASSERT(!resolve_qwen_reasoning(json::object()).thinking_enabled);
 }
 
+// chat_template_kwargs.preserve_thinking is a tri-state Jinja-only toggle:
+// absent leaves req.preserve_thinking at -1 (template default applies), and
+// an explicit bool sets 0/1. It must not disturb thinking_enabled/opt_in.
+TEST_CASE(ServerUnitFixture, test_qwen4exp_preserve_thinking_kwarg) {
+    const ParsedRequest absent = resolve_qwen4exp_reasoning(json::object());
+    TEST_ASSERT(absent.preserve_thinking == -1);
+    const ParsedRequest off = resolve_qwen4exp_reasoning(
+        {{"chat_template_kwargs", {{"preserve_thinking", false}}}});
+    TEST_ASSERT(off.preserve_thinking == 0);
+    TEST_ASSERT(off.thinking_enabled && off.thinking_opt_in);
+    const ParsedRequest on = resolve_qwen4exp_reasoning(
+        {{"chat_template_kwargs", {{"preserve_thinking", true}}}});
+    TEST_ASSERT(on.preserve_thinking == 1);
+}
+
 // Qwen3.8-Flash-Next's template knows low, medium and xhigh (its default); Lucebox's high, x-high and max map to xhigh.
 TEST_CASE(ServerUnitFixture, test_qwen4exp_template_effort_mapping) {
     TEST_ASSERT(qwen4exp_template_effort("") == "");
@@ -5405,6 +5420,82 @@ TEST_CASE(ServerUnitFixture, test_jinja_render_bad_tools_json_throws) {
     TEST_ASSERT(threw);
 }
 
+// Mirrors the official qwen4exp (Qwen3.8-Flash-Next) GGUF Jinja template's
+// think-replay snippet: earlier assistant turns either replay their recorded
+// reasoning_content inside <think>...</think>, or (preserve_thinking=false)
+// drop the think block entirely for turns at/before the last user query.
+static const char QWEN4EXP_THINK_REPLAY_TEMPLATE[] =
+    "{%- set ns = namespace(last_query_index = 0) -%}"
+    "{%- for message in messages -%}"
+    "{%- if message.role == 'user' -%}{%- set ns.last_query_index = loop.index0 -%}{%- endif -%}"
+    "{%- endfor -%}"
+    "{%- for message in messages -%}"
+    "{%- set content = message.content -%}"
+    "{%- if message.role == 'assistant' -%}"
+    "{%- set reasoning_content = '' -%}"
+    "{%- if message.reasoning_content is string -%}{%- set reasoning_content = message.reasoning_content -%}{%- endif -%}"
+    "{%- set reasoning_content = reasoning_content|trim -%}"
+    "{%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index -%}"
+    "{{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content + '<|im_end|>\\n' }}"
+    "{%- else -%}"
+    "{{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}"
+    "{%- endif -%}"
+    "{%- else -%}"
+    "{{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}"
+    "{%- endif -%}"
+    "{%- endfor -%}";
+
+// (a) An assistant history message with reasoning_content renders inside
+// <think>...</think> under the default (preserve_thinking left unset).
+TEST_CASE(ServerUnitFixture, test_jinja_render_reasoning_content_default_preserves_think) {
+    const std::vector<ChatMessage> msgs = {
+        {"user",      "Q1", "", ""},
+        {"assistant", "A1", "", "thinking about Q1"},
+        {"user",      "Q2", "", ""},
+    };
+    const std::string out = render_chat_template_jinja(
+        QWEN4EXP_THINK_REPLAY_TEMPLATE, msgs, "", "",
+        /*add_gen=*/false, /*think=*/true, "", "",
+        /*preserve_thinking=*/-1);
+    TEST_ASSERT(out.find(
+        "<|im_start|>assistant\n<think>\nthinking about Q1\n</think>\n\nA1<|im_end|>")
+        != std::string::npos);
+}
+
+// (b) With preserve_thinking=false the earlier assistant turn renders
+// without any <think> block.
+TEST_CASE(ServerUnitFixture, test_jinja_render_preserve_thinking_false_strips_think) {
+    const std::vector<ChatMessage> msgs = {
+        {"user",      "Q1", "", ""},
+        {"assistant", "A1", "", "thinking about Q1"},
+        {"user",      "Q2", "", ""},
+    };
+    const std::string out = render_chat_template_jinja(
+        QWEN4EXP_THINK_REPLAY_TEMPLATE, msgs, "", "",
+        /*add_gen=*/false, /*think=*/true, "", "",
+        /*preserve_thinking=*/0);
+    TEST_ASSERT(out.find("<|im_start|>assistant\nA1<|im_end|>") != std::string::npos);
+    TEST_ASSERT(out.find("<think>") == std::string::npos);
+}
+
+// (c) Without reasoning_content and under the default preserve setting, the
+// output is unchanged from today: an empty <think></think> block (neither of
+// the template's two official modes, but the pre-existing behavior — this is
+// a regression guard, not an endorsement).
+TEST_CASE(ServerUnitFixture, test_jinja_render_no_reasoning_content_regression) {
+    const std::vector<ChatMessage> msgs = {
+        {"user",      "Q1", "", ""},
+        {"assistant", "A1", "", ""},
+        {"user",      "Q2", "", ""},
+    };
+    const std::string out = render_chat_template_jinja(
+        QWEN4EXP_THINK_REPLAY_TEMPLATE, msgs, "", "",
+        /*add_gen=*/false, /*think=*/true, "", "",
+        /*preserve_thinking=*/-1);
+    TEST_ASSERT(out.find("<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>")
+        != std::string::npos);
+}
+
 TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
     ToolMemory tool_memory;
     const std::string call_id = "call_exec_001";
@@ -5553,6 +5644,31 @@ TEST_CASE(ServerUnitFixture, test_normalize_anthropic_tool_use_without_memory) {
             "</parameter>\n</function>\n</tool_call>\n"
             "<tool_call>\n<function=Grep>\n<parameter=n>\n3\n</parameter>\n"
             "<parameter=pattern>\nx\n</parameter>\n</function>\n</tool_call>");
+    }
+}
+
+// An assistant history message's prior <think> text must carry through to
+// ChatMessage.reasoning_content (OpenAI/DeepSeek dialect `reasoning_content`,
+// and the OpenRouter/Anthropic-gateway flat `reasoning` alias — the same
+// names the response side emits, see format_response_message). Non-assistant
+// roles and messages with neither field must leave it empty.
+TEST_CASE(ServerUnitFixture, test_normalize_assistant_reasoning_content_passthrough) {
+    ToolMemory tool_memory;
+    const json messages = json::array({
+        {{"role", "user"}, {"content", "hi"}},
+        {{"role", "assistant"}, {"content", "A1"}, {"reasoning_content", "thought one"}},
+        {{"role", "user"}, {"content", "and?"}, {"reasoning_content", "ignored on non-assistant"}},
+        {{"role", "assistant"}, {"content", "A2"}, {"reasoning", "thought two"}},
+        {{"role", "assistant"}, {"content", "A3"}},
+    });
+    const auto chat = normalize_chat_messages(
+        messages, ApiFormat::OPENAI_CHAT, tool_memory);
+    TEST_ASSERT(chat.size() == 5);
+    if (chat.size() == 5) {
+        TEST_ASSERT(chat[1].reasoning_content == "thought one");
+        TEST_ASSERT(chat[2].reasoning_content.empty());
+        TEST_ASSERT(chat[3].reasoning_content == "thought two");
+        TEST_ASSERT(chat[4].reasoning_content.empty());
     }
 }
 

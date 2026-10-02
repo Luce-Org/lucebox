@@ -599,7 +599,8 @@ std::string render_chat_template_jinja(
     bool add_generation_prompt,
     bool enable_thinking,
     const std::string & tools_json,
-    const std::string & reasoning_effort)
+    const std::string & reasoning_effort,
+    int preserve_thinking)
 {
     if (template_src.empty()) {
         throw std::runtime_error("render_chat_template_jinja: template_src is empty");
@@ -619,6 +620,9 @@ std::string render_chat_template_jinja(
         if (!m.tool_call_id.empty()) {
             mj["tool_call_id"] = m.tool_call_id;
         }
+        if (!m.reasoning_content.empty()) {
+            mj["reasoning_content"] = m.reasoning_content;
+        }
         messages_j.push_back(std::move(mj));
     }
 
@@ -629,6 +633,9 @@ std::string render_chat_template_jinja(
     inputs["add_generation_prompt"] = add_generation_prompt;
     inputs["enable_thinking"]       = enable_thinking;
     if (!reasoning_effort.empty()) inputs["reasoning_effort"] = reasoning_effort;
+    // -1 = unset: leave `preserve_thinking` undefined so the template's own
+    // default (official qwen4exp template defaults to true) applies.
+    if (preserve_thinking >= 0) inputs["preserve_thinking"] = (preserve_thinking != 0);
 
     bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
     if (has_tools) {
