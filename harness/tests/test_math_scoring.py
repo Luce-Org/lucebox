@@ -25,6 +25,19 @@ class MathScoringTest(unittest.TestCase):
         self.assertTrue(math_scoring._math_equiv(r"\dfrac{1}{2}", "1/2"))
         self.assertTrue(math_scoring._math_equiv(r"\frac{5\sqrt{5}}{3}", r"5\sqrt{5}/3"))
 
+    def test_fraction_decimal_equivalence(self) -> None:
+        # Regression: flattening \frac without grouping broke this (true->false).
+        self.assertTrue(math_scoring._math_equiv(r"\frac{1}{2}", "0.5"))
+
+    def test_nested_fraction_grouping_preserved(self) -> None:
+        # Regression: flattening \frac{A}{B} to "A/B" without parens made
+        # \frac{1}{\frac{2}{3}} (= 1/(2/3) = 1.5) collide with
+        # \frac{\frac{1}{2}}{3} (= (1/2)/3 = 1/6) as the same string
+        # "1/2/3" (false->true). They must stay distinct.
+        self.assertFalse(
+            math_scoring._math_equiv(r"\frac{1}{\frac{2}{3}}", r"\frac{\frac{1}{2}}{3}")
+        )
+
     def test_interval_spacing(self) -> None:
         self.assertTrue(math_scoring._math_equiv("[2, 5)", "[2,5)"))
         self.assertTrue(math_scoring._math_equiv("[2, 5)", "[2,5)"))

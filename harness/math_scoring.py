@@ -50,7 +50,10 @@ def _brace_group_at(s: str, k: int) -> tuple[str, int] | None:
 
 def _expand_frac(s: str) -> str:
     """Rewrite \\frac{A}{B} (and \\dfrac/\\tfrac) to A/B so LaTeX and plain
-    forms compare equal. Handles nested braces in A/B."""
+    forms compare equal. Recursively expands nested fractions first and
+    parenthesizes a side whose expansion contains a "/", so grouping is
+    preserved: \\frac{1}{\\frac{2}{3}} -> "1/(2/3)" while
+    \\frac{\\frac{1}{2}}{3} -> "(1/2)/3" (they must not collide)."""
     out = s
     for _ in range(32):
         m = re.search(r"\\(?:d|t)?frac\s*\{", out)
@@ -60,17 +63,30 @@ def _expand_frac(s: str) -> str:
         g1 = _brace_group_at(out, out.index("{", i))
         if g1 is None:
             break
-        a, e1 = g1
+        a_raw, e1 = g1
         g2 = _brace_group_at(out, e1)
         if g2 is None:
             break
-        b, e2 = g2
+        b_raw, e2 = g2
+        a = _expand_frac(a_raw)
+        b = _expand_frac(b_raw)
+        if "/" in a:
+            a = f"({a})"
+        if "/" in b:
+            b = f"({b})"
         out = out[:i] + f"{a}/{b}" + out[e2:]
     return out
 
 
 def _normalize_math(s: str | None) -> str:
-    """Normalize a math answer string for comparison."""
+    """Normalize a math answer string for comparison.
+
+    This deliberately keeps \\frac{...}{...} intact (rather than flattening
+    it here) so callers that need exact fraction grouping -- e.g. the
+    numeric \\frac{A}{B} comparisons in ``_math_equiv`` -- see the real
+    structure. Flattening (via ``_expand_frac``) happens later, only for the
+    string-equality fallback.
+    """
     if s is None:
         return ""
     s = s.strip()
@@ -79,7 +95,6 @@ def _normalize_math(s: str | None) -> str:
     # Strip currency $ (e.g. "$18" -> "18")
     if re.match(r"^\$\d", s):
         s = s[1:]
-    s = _expand_frac(s)
     s = re.sub(r"\\text\s*\{([^}]*)\}", r"\1", s)
     s = re.sub(r"\\mathrm\s*\{([^}]*)\}", r"\1", s)
     for cmd in [r"\left", r"\right", r"\displaystyle", r"\,", r"\;", r"\:", r"\!", r"\ "]:
@@ -123,6 +138,12 @@ def _math_equiv(pred: str | None, gold: str | None) -> bool:
     p_c = re.sub(r"\s*\\frac", r"\\frac", p)
     g_c = re.sub(r"\s*\\frac", r"\\frac", g)
     if p_c == g_c:
+        return True
+    # Flatten \frac{A}{B} to A/B (grouping-preserving) so LaTeX fractions
+    # compare equal to their plain-text "A/B" form. This must happen after
+    # the exact-match checks above so it never collapses distinct nested
+    # groupings into the same string.
+    if _expand_frac(p_c) == _expand_frac(g_c):
         return True
     try:
         pf = float(p.replace(",", ""))
