@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -19,16 +18,6 @@
 
 namespace luce::common {
 namespace {
-
-// F16 activation paths for gfx1151 MMB prefill (gated-norm tail, attention gate, MoE fold). Default on; QWEN4EXP_F16=0
-// is the kill switch. Off under QWEN4EXP_UPSTREAM (byte-exact reference) and QWEN4EXP_DUMP (per-node dumps).
-static bool f16_paths() {
-    static const bool on = [] {
-        const char * u = getenv("QWEN4EXP_UPSTREAM"), * f = getenv("QWEN4EXP_F16");
-        return !(u && std::atoi(u) != 0) && getenv("QWEN4EXP_DUMP") == nullptr && !(f && std::atoi(f) == 0);
-    }();
-    return on;
-}
 
 size_t ring_align_up(size_t value) {
     const size_t remainder = value % 256;
@@ -179,7 +168,7 @@ struct Qwen4ExpMoeParts {
 };
 
 [[maybe_unused]] ggml_tensor * build_moe(ggml_context * c, ggml_tensor * cur,
-                        const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, int il,
+                        const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, int il, bool reference,
                         const std::function<void(ggml_tensor *, const char *)> & dump_mark = {},
                         Qwen4ExpMoeParts * parts = nullptr) {
     const int64_t n_embd   = w.n_embd;
@@ -233,11 +222,7 @@ struct Qwen4ExpMoeParts {
 
     ggml_tensor * moe_out;
     // Keep the unfused form for upstream differential checks.
-    static const bool moe_fused = [] {
-        const char * v = getenv("QWEN4EXP_UPSTREAM");
-        return !(v && std::atoi(v) != 0);
-    }();
-    if (!moe_fused) {
+    if (reference) {
         // Upstream aggregate: weight every route (broadcast mul), then sequential
         // per-route view adds in argsort order, then add the gated shared expert.
         ggml_tensor * wexp = ggml_mul(c, down, ggml_reshape_3d(c, wsel, 1, n_used, n_tokens));
@@ -258,7 +243,7 @@ struct Qwen4ExpMoeParts {
 // ── Linear attention: gated delta net (36 layers) ───────────────────────
 
 ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * cur,
-                                const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
+                                const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, bool f16,
                                 ggml_tensor * ssm_state, ggml_tensor * conv_state, int il,
                                 const std::function<void(ggml_tensor *, const char *)> & dump_mark = {}) {
     const int64_t D      = w.ssm_d_state;              // 128
@@ -331,7 +316,7 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor 
 
     // Gated norm written as F16 in one pass, read directly by ssm_out's Q8_0 -> F16 GEMM (same arithmetic as the
     // chain below, so bit-exact).
-    if (f16_paths() && ggml_backend_cuda_mmb_f16_input_ok(L.ssm_out, T)) {
+    if (f16 && ggml_backend_cuda_mmb_f16_input_ok(L.ssm_out, T)) {
         ggml_tensor * lin_raw = mm(c, L.ssm_out, ggml_gated_rms_norm_f16(c, attn, L.ssm_norm, z, eps));
         return ggml_reshape_2d(c, lin_raw, w.n_embd, T);
     }
@@ -515,11 +500,6 @@ static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
     return attn;
 }
 
-static bool qsa_enabled() {
-    static const bool on = [] { const char * v = getenv("QWEN4EXP_QSA"); return v && std::atoi(v) != 0; }();
-    return on;
-}
-
 // QSA block ratio of the full-attention layers (0 when the model has no indexer).
 static int64_t qsa_ratio(const Qwen4ExpWeights & w) {
     for (int il = 0; il < w.n_layer && il < (int) w.compress_ratios.size(); ++il) {
@@ -534,9 +514,9 @@ enum Qwen4ExpQsaMode { QSA_DENSE = 0, QSA_PREFILL = 1, QSA_DECODE = 2 };
 // that point: the packed prefill kernel for T >= 128, the per-query decode kernel below that. CUDA builds and the
 // upstream reference stay dense.
 static Qwen4ExpQsaMode qsa_mode(const Qwen4ExpWeights & w, const Qwen4ExpCache & cache, int64_t T, int64_t pos0,
-                                bool upstream) {
+                                bool enabled) {
     const int64_t r = qsa_ratio(w);
-    if (!qsa_enabled() || upstream || r <= 1 || cache.indexer_raw.empty() || !cache.indexer_raw[0]) return QSA_DENSE;
+    if (!enabled || r <= 1 || cache.indexer_raw.empty() || !cache.indexer_raw[0]) return QSA_DENSE;
     if (w.indexer_head_size != 128 || w.indexer_n_head <= 0 || w.indexer_top_k % r != 0) return QSA_DENSE;
     const int64_t budget = w.indexer_top_k / r;
     if (budget * r + (r - 1) > 2560 || w.n_head != 12 * w.n_head_kv) return QSA_DENSE;
@@ -548,7 +528,7 @@ static Qwen4ExpQsaMode qsa_mode(const Qwen4ExpWeights & w, const Qwen4ExpCache &
 }
 
 ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * cur,
-                              const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
+                              const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, bool f16,
                               ggml_tensor * k_cache, ggml_tensor * v_cache,
                               ggml_tensor * indexer_k, ggml_tensor * indexer_raw,
                               ggml_tensor * positions, ggml_tensor * mask, ggml_tensor * kv_row,
@@ -697,7 +677,7 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
 
     // sigmoid(gate) * attn written as F16 in one pass straight from the wq view (no CONT), read directly by wo's
     // Q8_0 -> F16 GEMM. Same product as below, so bit-exact.
-    if (f16_paths() && ggml_backend_cuda_mmb_f16_input_ok(L.wo, T)) {
+    if (f16 && ggml_backend_cuda_mmb_f16_input_ok(L.wo, T)) {
         ggml_tensor * gate3 = ggml_view_3d(c, qfull, D, Hq, T, 2 * D * qe, 2 * D * Hq * qe, D * qe);
         return mm(c, L.wo, ggml_gated_f16(c, attn, gate3));
     }
@@ -804,18 +784,16 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                                        const int32_t * tokens,
                                        int n_tokens,
                                        int pos0,
-                                       std::vector<float> & out_logits) {
+                                       std::vector<float> & out_logits, bool dump) {
     Qwen4ExpForwardResult res;
     if (n_tokens <= 0 || pos0 < 0 || !tokens) return res;
-    // QWEN4EXP_DUMP=1 materialises per-layer activations and prints finite/absmax/mean.
-    static const bool dump = getenv("QWEN4EXP_DUMP") != nullptr;
-    // The fused reduction can differ from upstream's ggml_rms_norm below one
-    // ulp; keep the unfused form for upstream differential checks.
-    static const bool upstream = [] { const char * v = getenv("QWEN4EXP_UPSTREAM"); return v && std::atoi(v) != 0; }();
+    const bool upstream = cache.reference;
+    const Qwen4ExpCudaScope profile(w.gfx1151, upstream);
+    const bool f16 = !upstream && !dump;
     const bool hc_fused = !upstream;
     // T=1 decode reuses one context/allocator and a stable bucketed graph.
     // Past the QSA block budget the selected-cell graph changes shape as blocks complete, so it is rebuilt per step.
-    const Qwen4ExpQsaMode qsa = qsa_mode(w, cache, n_tokens, pos0, upstream);
+    const Qwen4ExpQsaMode qsa = qsa_mode(w, cache, n_tokens, pos0, profile.optimized);
     // T=1 decode reuses one context/allocator; below the QSA budget it also keeps a stable bucketed graph.
     const bool reuse_ws = !upstream && n_tokens == 1 && !dump;
     const bool use_stable_graph = reuse_ws && qsa == QSA_DENSE;
@@ -1027,15 +1005,15 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         dump_mark(cur, dlab);
         if (L.is_full_attention) {
             const int fi = full_idx[il];
-            cur = build_full_attn(ctx, gf, cur, L, w,
+            cur = build_full_attn(ctx, gf, cur, L, w, f16,
                                   cache.attn_k[fi], cache.attn_v[fi], cache.indexer_k[fi],
-                                  qsa_enabled() && !upstream ? cache.indexer_raw[fi] : nullptr,
+                                  profile.optimized ? cache.indexer_raw[fi] : nullptr,
                                   positions, mask, kv_row, graph_kv_len, pos0,
                                   il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0,
                                   cache.indexer_blocks, qsa, il, dump_mark);
         } else {
             const int li = lin_idx[il];
-            cur = build_linear_attn(ctx, gf, cur, L, w,
+            cur = build_linear_attn(ctx, gf, cur, L, w, f16,
                                     cache.ssm_state[li], cache.conv_state[li], il, dump_mark);
         }
         std::snprintf(dlab, sizeof dlab, "L%02d.att", il);
@@ -1077,8 +1055,8 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         // Prefill: the MoE combine runs inside the next HC_COMBINE_NORM (one kernel fewer; last-bit numerics change
         // from FMA contraction in the new kernel, covered by the long-prompt quality gate). Not at T=1: it cost ~1.7% decode.
         Qwen4ExpMoeParts moe_parts;
-        const bool fold = f16_paths() && hc_fused && !next_ple && ggml_backend_cuda_mmb_prefill(layer_T);
-        cur = build_moe(ctx, cur, L, w, il, dump_mark, fold ? &moe_parts : nullptr);
+        const bool fold = f16 && hc_fused && !next_ple && ggml_backend_cuda_mmb_prefill(layer_T);
+        cur = build_moe(ctx, cur, L, w, il, upstream, dump_mark, fold ? &moe_parts : nullptr);
         std::snprintf(dlab, sizeof dlab, "L%02d.moe", il);
         dump_mark(cur, dlab);
 
@@ -1297,24 +1275,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
             }
             std::vector<float> v(n);
             ggml_backend_tensor_get(t, v.data(), 0, n * sizeof(float));
-            static const char * dump_bin = getenv("QWEN4EXP_DUMP_BIN");
-            if (dump_bin && dump_bin[0] && n_tokens > 1) {
-                std::string names = dump_bin, want;
-                size_t pos = 0;
-                while (pos <= names.size()) {
-                    size_t comma = names.find(',', pos);
-                    want = names.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-                    if (want == dt.second) {
-                        char path[256];
-                        std::snprintf(path, sizeof path, "/tmp/our_%s.bin", dt.second.c_str());
-                        FILE * f = std::fopen(path, "wb");
-                        if (f) { std::fwrite(v.data(), sizeof(float), n, f); std::fclose(f); }
-                        break;
-                    }
-                    if (comma == std::string::npos) break;
-                    pos = comma + 1;
-                }
-            }
             bool finite = true; double amax = 0, sum = 0, sumsq = 0;
             size_t argmax = 0;
             for (size_t i = 0; i < n; ++i) {

@@ -5418,6 +5418,32 @@ TEST_CASE(ServerUnitFixture, test_qwen_snapshot_estimate_matches_saved_snapshot)
 
 // Qwen4Exp QSA indexer pooling: block b is the mean of the r consecutive token keys r*b .. r*b+r-1
 // (reference modeling_qwen4_exp.py: block_token_indices.view(n, ratio) then mean over the ratio axis).
+TEST_CASE(ServerUnitFixture, test_qwen4exp_profile_is_scoped) {
+    using namespace luce::common;
+    auto set = ggml_backend_cuda_set_qwen4exp_profile;
+    TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_DEFAULT) == GGML_CUDA_QWEN4EXP_OFF);
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    const bool supported = ggml_backend_cuda_qwen4exp_supported(cpu);
+    TEST_ASSERT(!supported);
+    {
+        Qwen4ExpCudaScope reference(true, true);
+        TEST_ASSERT(!reference.optimized);
+        TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_REFERENCE) == GGML_CUDA_QWEN4EXP_REFERENCE);
+        // An unsupported backend masks a nested profile, then restores it.
+        [&] { Qwen4ExpCudaScope generic(supported); TEST_ASSERT(!generic.optimized);
+              TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_OFF); }();
+        TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_REFERENCE) == GGML_CUDA_QWEN4EXP_REFERENCE);
+        bool isolated = false;
+        std::thread other([&] { isolated = set(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_OFF; });
+        other.join();
+        TEST_ASSERT(isolated);
+    }
+    [&] { Qwen4ExpCudaScope optimized(true); TEST_ASSERT(optimized.optimized);
+          TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_DEFAULT) == GGML_CUDA_QWEN4EXP_DEFAULT); }();
+    TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_DEFAULT);
+    ggml_backend_free(cpu);
+}
+
 TEST_CASE(ServerUnitFixture, test_qwen4exp_pool_blocks_averages_consecutive_tokens) {
     ggml_init_params ip{1 << 20, nullptr, false};
     ggml_context * c = ggml_init(ip);

@@ -4509,10 +4509,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // Upstream parity mode (its K/V cache is padded to 256) or an explicit LUCE_FA256_MMA=1 opt-in
     // (test_fattn_mma256); QSA callers keep their shipped path.
     static const bool rdna3_fa256 = [] {
-        const char * ref = getenv("QWEN4EXP_UPSTREAM"), * mma = getenv("LUCE_FA256_MMA");
-        return (ref && atoll(ref) != 0) || (mma && atoll(mma) != 0);
+        const char * mma = getenv("LUCE_FA256_MMA");
+        return mma && atoll(mma) != 0;
     }();
-    if (rdna3_fa256 && GGML_CUDA_CC_IS_RDNA3_5(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256 &&
+    if ((ggml_cuda_qwen4exp_reference() || rdna3_fa256) && GGML_CUDA_CC_IS_RDNA3_5(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256 &&
         Q->ne[1] * rdna3_gqa_eff > 32) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }

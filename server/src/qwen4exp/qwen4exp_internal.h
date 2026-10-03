@@ -8,6 +8,7 @@
 #pragma once
 
 #include "internal.h"
+#include "ggml-cuda.h"
 #include "common/gguf_mmap.h"
 
 #include <cstdint>
@@ -15,6 +16,19 @@
 #include <vector>
 
 namespace luce::common {
+
+// Match ggml's calling-thread overrides, restoring them even on early returns.
+struct Qwen4ExpCudaScope {
+    const bool optimized;
+    const ggml_cuda_qwen4exp_profile previous;
+    explicit Qwen4ExpCudaScope(bool gfx1151, bool reference = false)
+        : optimized(gfx1151 && !reference),
+          previous(ggml_backend_cuda_set_qwen4exp_profile(reference ? GGML_CUDA_QWEN4EXP_REFERENCE :
+                   optimized ? GGML_CUDA_QWEN4EXP_DEFAULT : GGML_CUDA_QWEN4EXP_OFF)) {}
+    ~Qwen4ExpCudaScope() { ggml_backend_cuda_set_qwen4exp_profile(previous); }
+    Qwen4ExpCudaScope(const Qwen4ExpCudaScope &) = delete;
+    Qwen4ExpCudaScope & operator=(const Qwen4ExpCudaScope &) = delete;
+};
 
 struct Qwen4ExpLayer {
     // Hyper-connections (hc_count streams). Norm is [n_embd] reshaped to
@@ -113,6 +127,7 @@ private:
 };
 
 struct Qwen4ExpWeights {
+    bool gfx1151 = false;  // Cache profile support at load, before any allocation.
     ggml_context *        ctx     = nullptr;  // shard 1 tensor descriptors
     // Descriptor contexts of shards 2..N (split GGUFs); `ctx` covers shard 1.
     std::vector<ggml_context *> extra_meta_ctxs;
@@ -195,7 +210,7 @@ struct Qwen4ExpWeights {
 // failure.
 bool load_qwen4exp_gguf(const std::string & path,
                         ggml_backend_t backend,
-                        Qwen4ExpWeights & out);
+                        Qwen4ExpWeights & out, bool reference = false);
 
 void free_qwen4exp_weights(Qwen4ExpWeights & w);
 

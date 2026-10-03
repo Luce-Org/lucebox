@@ -31,7 +31,10 @@ model cards (`share/model_cards/qwen3.8-flash-next.json`, and
 ```
 
 No environment variables are needed: on gfx1151 the backend sets up its
-measured kernel profile itself before loading. Prefill runs in 2048-token
+measured kernel profile through scoped code settings during loading and forward
+evaluation. Device support is resolved once at load; forward scopes only exchange
+the calling thread's profile flag. It does not read qwen4exp environment variables or change the process
+environment; other models retain their own dispatch. Prefill runs in 2048-token
 chunks; long prompts on UD prefill faster with `--chunk 8192` (a 16K prompt
 reaches its first token in 13.2-13.8 s). `--chunk 16384` does not fit UD in
 memory with a 40K context.
@@ -42,7 +45,7 @@ Build:
 cmake -S server -B server/build-hip -DCMAKE_BUILD_TYPE=Release \
   -DLUCE_GPU_BACKEND=hip -DLUCE_HIP_ARCHITECTURES=gfx1151 \
   -DCMAKE_HIP_ARCHITECTURES=gfx1151
-cmake --build server/build-hip -j --target luce_server
+cmake --build server/build-hip -j4 --target luce_server
 ```
 
 ### Thinking
@@ -112,3 +115,22 @@ Tests: `test_qwen4exp_qsa_ids` (QSA block selection, GPU and CPU),
 CONT fusion alias), `test_backend_plan` (default prefill chunk),
 `test_server_unit`, and `smoke_qwen4exp_forward` (split-prefill KLs and
 cancel/reset/reuse on a real GGUF).
+
+The smoke binary uses the same gfx1151 defaults as the server. Its test controls
+are command-line arguments:
+
+```bash
+server/build-hip/smoke_qwen4exp_forward MODEL.gguf 6000 \
+  --token-file tokens6000.txt --split 100:1
+python3 server/scripts/qwen4exp_upstream_diff.py --model MODEL.gguf \
+  --llama-tree /path/to/llama-qwen4 --our-bin server/build-hip/smoke_qwen4exp_forward \
+  --seq 16 --reference
+```
+
+`--split N[:chunk]` compares one prefill against a split suffix. `--reference`
+selects upstream graph/attention/RoPE math, and `--dump` prints activation
+summaries; the differential harness passes both to the smoke binary. These
+controls are test-only. The harness also accepts `--token-file`, `--output-dir`
+and `--calibrate`. Binary activation dumps and the HC16-off comparison were
+removed. The chunk differential remains available as
+`qwen4exp_forward_diff.py qsa --server BINARY --model MODEL --port 8711`.

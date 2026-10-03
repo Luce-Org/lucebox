@@ -345,7 +345,9 @@ bool Qwen4ExpPleReader::gather(const int32_t * rows, int64_t n, float * dst) con
 // ─── Loader ─────────────────────────────────────────────────────────────
 
 bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
-                        Qwen4ExpWeights & out) {
+                        Qwen4ExpWeights & out, bool reference) {
+    out.gfx1151 = ggml_backend_cuda_qwen4exp_supported(backend);
+    const Qwen4ExpCudaScope profile(out.gfx1151, reference);
     // Open every shard of the model; a single-file GGUF is a one-element list.
     std::vector<ShardSource> shards;
     for (const std::string & shard_path : discover_shard_paths(path)) {

@@ -34,17 +34,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `GGML_CUDA_DISABLE_COPY_BATCH` | unset | KILL SWITCH (burn-in): set to issue one device memcpy per plain CPY node again. By default ggml-cuda gathers runs of consecutive same-type contiguous CPY nodes with independent byte ranges into one batched copy launch. |
 | `GGML_CUDA_GRAPH_STATS` | unset | DEBUG: per-graph CUDA-graph replay/capture/eager counters. |
 | `GGML_CUDA_GRAPH_STATS_EVERY` | 200 | DEBUG: print period for the stats above (clamped to >=1). |
-| `LUCE_HIP_NO_AUTO_UMA` | unset (1: qwen4exp gfx1151) | `1` disables automatic unified-memory placement on integrated GPUs. qwen4exp on gfx1151 defaults it, `GGML_CUDA_MMB=1`, `QWEN4EXP_MMB_CUBLAS=5`, `LUCE_MMB_SHADOW=1`, `LLAMA_MMB_HC16=2` and `QWEN4EXP_QSA=1` (its qualified prefill profile) unless the variable is set or `QWEN4EXP_UPSTREAM=1`. |
-| `QWEN4EXP_QSA` | 0 (1: qwen4exp gfx1151) | `1` enables qwen4exp selected attention (QSA) at prefill and decode, as the reference model does past 2,048 context tokens (qualified on gfx1151 only). |
-| `QWEN4EXP_MMB_CUBLAS` | 0 (5: qwen4exp gfx1151) | Qwen4exp validated bf16-shadow dense route (`1`, `3`, or `5`). Mode `2` is diagnostic only. |
-| `LUCE_MMB_SHADOW` | 2 (1: qwen4exp gfx1151) | Shared MMB bf16 weight-shadow policy (`0` off, `1` IQ4_NL/Q5_K, `2` Q6_K). |
-| `LUCE_MMB_Q8F16` | 1 | KILL SWITCH: =0 returns MMB Q8_0 dense GEMMs (T>=512, gfx1151) from the Q8->F16 WMMA kernel (`mmb-q8f16.cuh`) to the bf16 tile. |
-| `LUCE_MMB_SMALL_M` | 1 | KILL SWITCH: =0 returns small-M MMB dense GEMMs (HC inject, alpha/beta) from the bandwidth kernel (`mmb-small-m.cuh`) to the WMMA tile. |
-| `LUCE_MMB_HCDOWN_I8` | 1 | KILL SWITCH: =0 keeps the qwen4exp HC down projection (Q8_0) on the F16 WMMA route instead of int8 WMMA on Q8 tiles emitted by the HC combine (`mmb-w8a8.cuh`). |
-| `QWEN4EXP_F16` | 1 | KILL SWITCH: =0 disables the gfx1151 MMB prefill F16 paths (gated-norm tail, attention gate, MoE combine folded into the HC combine with F16 routed-down rows). Off under `QWEN4EXP_UPSTREAM` and `QWEN4EXP_DUMP`. |
-| `LLAMA_MMB_HC16` | 0 (2: qwen4exp gfx1151) | `2` enables the qwen4exp validated bf16-only hyper-connection stream. |
-| `QWEN4EXP_UPSTREAM` | unset | DEBUG: reference-compatible qwen4exp path (unfused ops, F32 RoPE, K/V padded to 256) used by the upstream differential harness. |
-| `QWEN4EXP_DUMP` / `QWEN4EXP_DUMP_BIN` | unset | DEBUG: qwen4exp activation dumps for differential tests. |
+| `LUCE_HIP_NO_AUTO_UMA` | unset | Disables automatic unified-memory placement on integrated GPUs. The qwen4exp gfx1151 profile disables it through a scoped code setting, without changing the environment. |
 | `LUCE_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |
 | `LUCE_ADAPTIVE_K_DENSE` | per-model default | CSV of MoE layers kept dense under adaptive-K (DFlash capture layers). Warned-inert on families that do not thread layer indices yet. |
 | `LUCE_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. |
@@ -429,12 +419,3 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `PFLASH_DRAFTER_SCORE_LAYERS` - qwen3_graph.cpp
 - `PFLASH_FREEZE_HOT_WINDOW` - http_server.cpp
 - `TMPDIR` - backend_ipc.cpp, moe_expert_compute_ipc.cpp
-- `LLAMA_MMB_HC16` - ggml-cuda.cu (>=2: mark the HC normalized stream bf16-only when every consumer reads the bf16 copy; default off)
-- `QWEN4EXP_QSA` - qwen4exp_graph.cpp (enable the sparse selected-attention path)
-- `QWEN4EXP_MMB_CUBLAS` - ggml-cuda.cu (cuBLAS route: 0/unset off, 1 validated K=2560, 3 + ssm_out, 5 + HC down/up)
-- `LUCE_MMB_SHADOW` - mmb.cu (1 enables the IQ4_NL bf16 weight shadow; default 2 = Q6_K only)
-- `LUCE_MMB_SHADOW_CAP_MB` - mmb.cu (cap on total bf16 weight-shadow bytes)
-- `LUCE_MMB_Q8F16` - mmb.cu (0 = Q8_0 dense back on the bf16 tile; default on)
-- `LUCE_MMB_SMALL_M` - mmb.cu (0 = small-M dense back on the WMMA tile; default on)
-- `LUCE_MMB_HCDOWN_I8` - ggml-cuda.cu (0 = HC down off int8 WMMA; default on)
-- `QWEN4EXP_F16` - qwen4exp_graph.cpp (0 = disable the MMB prefill F16 paths; default on)

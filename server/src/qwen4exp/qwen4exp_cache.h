@@ -51,6 +51,7 @@ struct Qwen4ExpDecodeWorkspace {
 };
 
 struct Qwen4ExpCache {
+    bool reference = false;  // test-only upstream differential (padded KV and reference math)
     ggml_context *        ctx     = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
 
@@ -90,12 +91,12 @@ struct Qwen4ExpCache {
     // Pinned graph-input ring (see Qwen4ExpInputRing).
     Qwen4ExpInputRing input_ring;
 
-    // T=1 decode workspace reuse (excluded under QWEN4EXP_UPSTREAM=1).
+    // T=1 decode workspace reuse (excluded in reference tests).
     Qwen4ExpDecodeWorkspace decode_workspace;
 };
 
 bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
-                           int max_ctx, ggml_type kv_type, Qwen4ExpCache & out);
+                           int max_ctx, ggml_type kv_type, Qwen4ExpCache & out, bool reference = false);
 
 void free_qwen4exp_cache(Qwen4ExpCache & c);
 

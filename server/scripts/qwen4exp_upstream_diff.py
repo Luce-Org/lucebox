@@ -52,6 +52,8 @@ import sys
 def run(cmd, env=None, timeout=600):
     print(f"+ {' '.join(cmd)}", file=sys.stderr)
     p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
+    if p.returncode:
+        sys.exit(p.stdout + p.stderr + f"\ncommand failed: {p.returncode}")
     return p.stdout + p.stderr
 
 
@@ -76,7 +78,7 @@ def build_ours(repo):
     build_dir = os.path.join(repo, "server", "build-hip")
     bin_path = os.path.join(build_dir, "smoke_qwen4exp_forward")
     if not os.path.exists(bin_path):
-        out = run(["ninja", "-C", build_dir, "smoke_qwen4exp_forward"], timeout=1200)
+        out = run(["cmake", "--build", build_dir, "-j4", "--target", "smoke_qwen4exp_forward"], timeout=1200)
         if not os.path.exists(bin_path):
             print(out, file=sys.stderr)
             sys.exit("our smoke build failed")
@@ -141,7 +143,7 @@ BAD_BAND = (0.9, 1.1)
 MEAN_DRIFT_MAX = 0.1
 
 
-def check_tokens(up_out, our_out, seq):
+def check_tokens(up_out, our_out, seq, token_file=None):
     """Hard-check token parity. Upstream prints its ids; our smoke binary does
     not, so ours' tok[i]=(i*7919+13)%n_vocab recipe (smoke_qwen4exp_forward.cpp)
     is verified against the upstream ids and the vocab both engines report."""
@@ -159,8 +161,8 @@ def check_tokens(up_out, our_out, seq):
     if s != seq:
         problems.append(f"upstream ran {s} tokens, harness expected {seq}")
     expected = [(i * 7919 + 13) % n_vocab for i in range(seq)]
-    if os.environ.get("QWEN4EXP_TOKEN_FILE"):
-        with open(os.environ["QWEN4EXP_TOKEN_FILE"]) as f:
+    if token_file:
+        with open(token_file) as f:
             expected = list(map(int, f.read().split()))
         if len(expected) != seq:
             print("[tokens] ERROR: token file length differs from --seq")
@@ -172,7 +174,7 @@ def check_tokens(up_out, our_out, seq):
         print(f"[tokens] ERROR: {p}")
     if problems:
         return True
-    source = "token file" if os.environ.get("QWEN4EXP_TOKEN_FILE") else "synthetic recipe"
+    source = "token file" if token_file else "synthetic recipe"
     print(f"[tokens] OK: upstream first/last = {first}/{last}, matches {source}; "
           "ours uses the same input (source-verified)")
     return False
@@ -243,7 +245,7 @@ def compare(up_data, our_data, seq):
 def calibrate(up_bin, args, env, up_data):
     """A-A rerun of the upstream engine: measures its run-to-run absmax noise
     floor so small ours-vs-upstream excursions can be interpreted."""
-    up_out2 = run([up_bin, args.model, str(args.seq)], env=env, timeout=600)
+    up_out2 = run([up_bin, args.model, str(args.seq), *(["--token-file", args.token_file] if args.token_file else [])], env=env, timeout=600)
     up_data2 = parse_upstream(up_out2)
     worst, worst_pair = 0.0, "-"
     for up_kind in ALIGN.values():
@@ -261,11 +263,12 @@ def calibrate(up_bin, args, env, up_data):
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_repo = os.path.dirname(os.path.dirname(script_dir))
-    default_llama = os.environ.get(
-        "QWEN4EXP_LLAMA_TREE", os.path.expanduser("~/llama-qwen4"))
+    default_llama = os.path.expanduser("~/llama-qwen4")
     ap = argparse.ArgumentParser()
     ap.add_argument("--llama-tree", default=default_llama)
     ap.add_argument("--repo", default=default_repo)
+    ap.add_argument("--our-bin", help="use this already-built smoke binary")
+    ap.add_argument("--token-file")
     ap.add_argument("--model", required=True)
     ap.add_argument("--seq", type=int, default=16)
     ap.add_argument("--reference", action="store_true",
@@ -277,16 +280,18 @@ def main():
 
     up_bin = "/tmp/qwen4exp_nodes_up"
     build_upstream_dumper(script_dir, args.llama_tree, up_bin)
-    our_bin = build_ours(args.repo)
+    our_bin = args.our_bin or build_ours(args.repo)
 
     env = dict(os.environ, HIP_VISIBLE_DEVICES="1")
-    up_out = run([up_bin, args.model, str(args.seq)], env=env, timeout=600)
+    up_out = run([up_bin, args.model, str(args.seq), *(["--token-file", args.token_file] if args.token_file else [])], env=env, timeout=600)
     up_data = parse_upstream(up_out)
 
-    env2 = dict(env, QWEN4EXP_DUMP="1", GGML_CUDA_MMB="0")
+    test_args = ["--dump"]
     if args.reference:
-        env2["QWEN4EXP_UPSTREAM"] = "1"
-    our_out = run([our_bin, args.model, str(args.seq)], env=env2, timeout=600)
+        test_args.append("--reference")
+    if args.token_file:
+        test_args += ["--token-file", args.token_file]
+    our_out = run([our_bin, args.model, str(args.seq), *test_args], env=env, timeout=600)
     our_data = parse_ours(our_out)
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -298,7 +303,7 @@ def main():
         print(up_out)
         sys.exit("upstream run failed")
 
-    bad = check_tokens(up_out, our_out, args.seq)
+    bad = check_tokens(up_out, our_out, args.seq, args.token_file)
     bad_tables, onset, onset_pair = compare(up_data, our_data, args.seq)
     bad = bad or bad_tables
     if args.reference:

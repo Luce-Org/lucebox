@@ -43,6 +43,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                                        const int32_t * tokens,
                                        int n_tokens,
                                        int pos0,
-                                       std::vector<float> & out_logits);
+                                       std::vector<float> & out_logits,
+                                       bool dump = false);  // test-only activation summaries
 
 }  // namespace luce::common

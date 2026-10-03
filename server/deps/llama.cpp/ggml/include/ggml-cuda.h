@@ -237,9 +237,20 @@ GGML_BACKEND_API bool ggml_cuda_rocmfp2_mix_register_host(
 GGML_BACKEND_API void ggml_cuda_rocmfp2_mix_unregister(const void * base);
 GGML_BACKEND_API void ggml_cuda_rocmfp3_mix_unregister(const void * base);
 
+// Calling-thread profile. Scoped qwen4exp callers restore the returned value;
+// other models keep the generic dispatcher. DEFAULT requires a supported backend
+// (checked once at load); REFERENCE is for differential tests.
+enum ggml_cuda_qwen4exp_profile {
+    GGML_CUDA_QWEN4EXP_OFF,
+    GGML_CUDA_QWEN4EXP_DEFAULT,
+    GGML_CUDA_QWEN4EXP_REFERENCE,
+};
+GGML_BACKEND_API enum ggml_cuda_qwen4exp_profile ggml_backend_cuda_set_qwen4exp_profile(enum ggml_cuda_qwen4exp_profile profile);
+GGML_BACKEND_API bool ggml_backend_cuda_qwen4exp_supported(ggml_backend_t backend);
+
 // True when a matmul with weight w over n_tokens rows can take an F16 activation (HIP MMB Q8_0 -> F16 route).
 GGML_BACKEND_API bool ggml_backend_cuda_mmb_f16_input_ok(const struct ggml_tensor * w, int64_t n_tokens);
-// True when MMB serves the prefill GEMMs of an n_tokens batch on the current device (gfx1151, GGML_CUDA_MMB=1).
+// True when MMB serves this qwen4exp prefill batch on gfx1151.
 GGML_BACKEND_API bool ggml_backend_cuda_mmb_prefill(int64_t n_tokens);
 
 // Integrated GPUs only. While on, a buffer allocation on `device` that would

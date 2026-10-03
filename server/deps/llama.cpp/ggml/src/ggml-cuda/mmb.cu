@@ -5,7 +5,6 @@
 #include <map>
 #include <utility>
 #include "mmid.cuh"
-#include <cstdlib>
 #include <vector>
 #include <unordered_set>
 
@@ -763,19 +762,7 @@ __global__ void mmb_dq_iq4nl_bf16_kernel(const uint8_t * __restrict__ W, uint16_
 static std::unordered_map<const void *, uint16_t *> g_mmb_shadow;
 static std::map<std::pair<const void *, const void *>, uint16_t *> g_mmb_shadow_pair;   // concat(w0, w1) along rows -> BF16 copy
 static size_t g_mmb_shadow_bytes = 0;
-int    mmb_shadow_mode(){
-    static const int m = []() { const char * e = getenv("LUCE_MMB_SHADOW"); return e ? atoi(e) : 2; }();
-    return m;
-}
-bool   mmb_shadow()    { return mmb_shadow_mode() != 0; }
-bool   mmb_shadow_q6k(){ return mmb_shadow_mode() >= 1; }
-size_t mmb_shadow_cap(){
-    static const size_t c = []() {
-        const char * e = getenv("LUCE_MMB_SHADOW_CAP_MB");
-        return (size_t) (e ? atoll(e) : 6144) << 20;
-    }();
-    return c;
-}
+constexpr size_t MMB_SHADOW_CAP = size_t{6144} << 20;
 static bool mmb_is_resident_q6k(const ggml_tensor * w) { return w && w->type == GGML_TYPE_Q6_K && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768; }
 static bool mmb_is_resident_iq4(const ggml_tensor * w) { return w && w->type == GGML_TYPE_IQ4_NL && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w); }
 // Q5_K is a handful of attn_output weights; shadowing them routes the GEMM to
@@ -790,33 +777,18 @@ static const uint16_t * mmb_shadow_lookup(const ggml_tensor * w) {
     auto it = g_mmb_shadow.find(w->data); return it == g_mmb_shadow.end() ? nullptr : it->second;
 }
 
-// Off by default: opt in with GGML_CUDA_MMB=1. bf16 WMMA dequant changes the
-// rounding of prefill GEMMs relative to the MMQ int path, so it must never
-// silently alter existing architectures' numerics.
-// Kernels exist only in the gfx1151 code object; a fat build must still route
-// other devices (gfx1201) to generic kernels, so gate on the current device.
+// Only the scoped qwen4exp profile enables MMB; other models retain their numerics.
+// The caller qualifies gfx1151 once at load, including in fat builds.
 bool mmb_arch() { return GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc); }
-bool mmb_enabled() {
-    static const bool requested = []() {
-        const char * env = getenv("GGML_CUDA_MMB");
-        return env && atoi(env) == 1;
-    }();
-    return requested && mmb_arch();
-}
-int  mmb_min_t()   { return 512; }
-// Default on, =0 kill switches (long-prompt quality gate on UD-Q4_K_XL and IQ4_NL):
-// LUCE_MMB_Q8F16: Q8_0 dense GEMMs take the F16 WMMA kernel (mmb-q8f16.cuh) instead of the bf16 tile.
-// LUCE_MMB_SMALL_M: F32/bf16 dense GEMMs with small M (HC inject, alpha/beta) take the bandwidth kernel (mmb-small-m.cuh).
-static bool mmb_env_on(const char * name) { const char * e = getenv(name); return !(e && atoi(e) == 0); }
-bool mmb_small_m() { static const bool on = mmb_env_on("LUCE_MMB_SMALL_M"); return on; }
-bool mmb_q8f16()   { static const bool on = mmb_env_on("LUCE_MMB_Q8F16"); return on; }
+bool mmb_enabled() { return ggml_cuda_qwen4exp_enabled(); }
+int mmb_min_t() { return 512; }
 
 } // namespace
 
 // bf16 weight shadow (mmb_shadow_prepare) as a raw pointer, so a GEMM can feed
 // it to cuBLAS/hipBLASLt instead of running the hand-rolled mmb kernel.
 const void * ggml_cuda_mmb_shadow_ptr(const ggml_tensor * w) {
-    return (!w || !mmb_shadow()) ? nullptr : (const void *) mmb_shadow_lookup(w);
+    return (!w || !mmb_enabled()) ? nullptr : (const void *) mmb_shadow_lookup(w);
 }
 
 // The bf16-only mark is set on the xn view created by hc_combine_norm, but its
@@ -893,7 +865,7 @@ uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const gg
 bool ggml_cuda_mmb_prefill(int64_t n_tokens) { return mmb_enabled() && n_tokens >= mmb_min_t(); }
 
 bool ggml_cuda_mmb_q8f16_f16_input(const ggml_tensor * w, int64_t n_tokens) {
-    return mmb_enabled() && mmb_q8f16() && w && w->type == GGML_TYPE_Q8_0 && w->ne[2] == 1 && w->ne[3] == 1 &&
+    return mmb_enabled() && w && w->type == GGML_TYPE_Q8_0 && w->ne[2] == 1 && w->ne[3] == 1 &&
         ggml_is_contiguous(w) && w->ne[0] % 64 == 0 && !(w->ne[0] == 320 && w->ne[1] == 10240) &&
         n_tokens >= mmb_min_t() && n_tokens <= INT32_MAX / 4;
 }
@@ -905,7 +877,7 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
     const bool f32w  = src0->type == GGML_TYPE_F32;
     if (quant && src0->ne[0] % ggml_blck_size(src0->type) != 0) return false;
     // An F16 activation (e.g. GATED_RMS_NORM_F16) is only readable by the Q8_0 -> F16 WMMA route.
-    const bool f16_in = src1->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_Q8_0 && mmb_q8f16() &&
+    const bool f16_in = src1->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_Q8_0 &&
         !(src0->ne[0] == 320 && src0->ne[1] == 10240);
     if ((!quant && !bf16w && !f32w) || (src1->type != GGML_TYPE_F32 && !f16_in) || dst->type != GGML_TYPE_F32) return false;
     if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
@@ -938,7 +910,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const int K = (int) src0->ne[0], M = (int) src0->ne[1];
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
 #if defined(__gfx1151__) || !defined(__HIP_DEVICE_COMPILE__)
-    if (mmb_small_m() && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) && M <= 8) {
+    if ((src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) && M <= 8) {
         const uint16_t * xb = ggml_cuda_mmb_bf16_src(src1);
         if (mmb_small_m_launch(src0->data, src0->type == GGML_TYPE_BF16, xb ? (const void *) xb : src1->data, xb != nullptr,
                                (float *) dst->data, T, M, K, stream)) {
@@ -963,14 +935,14 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         CUDA_CHECK(cudaGetLastError()); return;
     }
     if (src0->type == GGML_TYPE_Q8_0) {
-        // Q8 activation tiles from hc_combine_norm (LUCE_MMB_HCDOWN_I8): the HC down projection on int8 WMMA.
+        // Q8 activation tiles from hc_combine_norm (qwen4exp profile): the HC down projection on int8 WMMA.
         if (const int8_t * xq = mmb_q8_lookup(src1)) {
             if (mmb_w8a8_launch((const uint8_t *) src0->data, xq, (float *) dst->data, T, M, K, stream)) {
                 CUDA_CHECK(cudaGetLastError()); return;
             }
         }
     }
-    if (src0->type == GGML_TYPE_Q8_0 && mmb_q8f16() && !(K == 320 && M == 10240)) {
+    if (src0->type == GGML_TYPE_Q8_0 && !(K == 320 && M == 10240)) {
         // Q8_0 -> F16 WMMA (bf16-only activations converted in the tile load, F32 ones via the per-graph F16 cache). A bf16-only dst keeps its in-place bf16 form.
         const bool f16_in = src1->type == GGML_TYPE_F16;
         const uint16_t * xb = f16_in ? nullptr : ggml_cuda_mmb_bf16_src(src1);
@@ -1007,7 +979,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q5_K) ? mmb_shadow_lookup(src0) : nullptr;
+    const uint16_t * shadow_pre = (src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q5_K) ? mmb_shadow_lookup(src0) : nullptr;
     const bool big = (M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096);
     uint16_t * Dh = (K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
     bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
@@ -1060,9 +1032,8 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (!xn16) xn16 = mmb_bf16_activation(ctx, xn, (size_t) T * M, stream);
     if (!xn16) return false;
     const uint16_t * lo16 = mmb_bf16_activation(ctx, lo, (size_t) T * K, stream);
-    // 16-column tiles (bit-exact with the 32-column tile); the upstream reference keeps the original tile.
-    static const bool tile16 = [] { const char * ref = getenv("QWEN4EXP_UPSTREAM"); return !(ref && atoi(ref)); }();
-    const bool use16 = tile16 && K == 320 && E % 32 == 0 && (w->type == GGML_TYPE_IQ4_NL || w->type == GGML_TYPE_Q8_0);
+    // 16-column tiles (bit-exact with the 32-column tile).
+    const bool use16 = K == 320 && E % 32 == 0 && (w->type == GGML_TYPE_IQ4_NL || w->type == GGML_TYPE_Q8_0);
     dim3 grid(E / (use16 ? 16 : 32), (T + 127) / 128);
     mmb_dispatch_quant(w->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
@@ -1174,11 +1145,11 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
 
 // Called from graph_optimize (outside stream capture): create the shadow for an eligible IQ4_NL dense weight.
 void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
-    if (!w || !mmb_arch()) return;
+    if (!w || !mmb_enabled()) return;
     if (mmb_is_resident_q6k(w)) {
-        if (!mmb_shadow_q6k() || g_mmb_shadow.count(w->data) > 0) return;
+        if (g_mmb_shadow.count(w->data) > 0) return;
         const size_t n = (size_t) w->ne[0] * w->ne[1], bytes = n * 2;
-        if (g_mmb_shadow_bytes + bytes > mmb_shadow_cap()) { GGML_LOG_INFO("MMB_SHADOW cap reached; %s stays Q6_K\n", w->name); return; }
+        if (g_mmb_shadow_bytes + bytes > MMB_SHADOW_CAP) { GGML_LOG_INFO("MMB_SHADOW cap reached; %s stays Q6_K\n", w->name); return; }
         uint16_t * buf = nullptr;
         if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
         mmb_dq_q6k_bf16_kernel<<<(unsigned) ((n / 256 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 256);
@@ -1186,11 +1157,10 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         g_mmb_shadow[w->data] = buf; g_mmb_shadow_bytes += bytes;
         return;
     }
-    if (mmb_shadow_mode() != 1) return;               // mode 2: Q6_K only
     if (mmb_is_resident_q5k(w)) {
-        if (!mmb_shadow() || g_mmb_shadow.count(w->data) > 0) return;
+        if (g_mmb_shadow.count(w->data) > 0) return;
         const size_t n = (size_t) w->ne[0] * w->ne[1], bytes = n * 2;
-        if (g_mmb_shadow_bytes + bytes > mmb_shadow_cap()) { GGML_LOG_INFO("MMB_SHADOW cap reached; %s stays Q5_K\n", w->name); return; }
+        if (g_mmb_shadow_bytes + bytes > MMB_SHADOW_CAP) { GGML_LOG_INFO("MMB_SHADOW cap reached; %s stays Q5_K\n", w->name); return; }
         // No Q5_K->bf16 dequant; go via F16 (dequantize_row_q5_K) then F16->bf16.
         const to_fp16_cuda_t to_f16  = ggml_get_to_fp16_cuda(GGML_TYPE_Q5_K);
         const to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F16);
@@ -1214,7 +1184,7 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
     if (concat ? g_mmb_shadow_pair.count({w->src[0]->data, w->src[1]->data}) > 0 : g_mmb_shadow.count(w->data) > 0) return;
     const size_t n = (size_t) w->ne[0] * w->ne[1];
     const size_t bytes = n * 2;
-    if (g_mmb_shadow_bytes + bytes > mmb_shadow_cap()) { static bool warned = false; if (!warned) { GGML_LOG_INFO("MMB_SHADOW cap reached at %.1f MB; further weights stay IQ4_NL\n", g_mmb_shadow_bytes / 1048576.0); warned = true; } return; }
+    if (g_mmb_shadow_bytes + bytes > MMB_SHADOW_CAP) { static bool warned = false; if (!warned) { GGML_LOG_INFO("MMB_SHADOW cap reached at %.1f MB; further weights stay IQ4_NL\n", g_mmb_shadow_bytes / 1048576.0); warned = true; } return; }
     uint16_t * buf = nullptr;
     if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
     if (concat) {
