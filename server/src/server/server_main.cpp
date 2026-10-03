@@ -157,7 +157,7 @@ static void print_usage(const char * prog) {
         "                                 qwen35 layer splits (extra VRAM; env:\n"
         "                                 LUCE_SPLIT_FAST_ROLLBACK=1)\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
-        "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
+        "  --chunk <N>          Chunked-prefill chunk size (default: 512; qwen4exp 2048)\n"
         "  --ds4-fused-decode   Enable DeepSeek4 single-graph GPU decode\n"
         "  --ds4-fused-verify-f16-kv\n"
         "                       Reuse F16 MLA cache in batched DeepSeek4 verification\n"
@@ -549,6 +549,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             bargs.device.peer_access = true;
         } else if (std::strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
             bargs.chunk = std::atoi(argv[++i]);
+            bargs.chunk_set = true;
         } else if (std::strcmp(argv[i], "--ds4-fused-decode") == 0) {
             bargs.ds4_fused_decode = true;
         } else if (std::strcmp(argv[i], "--ds4-fused-verify-f16-kv") == 0) {
