@@ -66,5 +66,16 @@ The W9100-only row-count override accepts 1,2,4,8. Unset preserves upstream ggml
 behavior; all other device IDs ignore the override. This is not a general speed
 claim or an invitation to change driver, clocks, power or cooling settings.
 
-See the accompanying external validation report for exact hardware, matched
-performance, full raw evidence and explicit skipped platform coverage.
+## Cooling during validation
+
+W9100 testing used a custom GPU-only fan curve managed externally through
+CoolerControl. Chassis fans remained under factory automatic control. GPU clocks,
+voltage, power limits, and VBIOS were unchanged. This contribution does not install
+or modify fan controls.
+
+See [validation notes](VALIDATION.md) for the exact fan curve, test conditions,
+results, and coverage limitations. Cooling settings are part of the recorded test
+environment, not a requirement to copy these settings onto other hardware.
+
+The accompanying external validation report retains full raw evidence and
+explicit skipped platform coverage.
