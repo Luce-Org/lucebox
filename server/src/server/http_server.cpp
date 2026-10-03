@@ -2219,6 +2219,11 @@ bool HttpServer::parse_endpoint_request(
         const std::string & path, const json & body, ParsedRequest & req,
         bool & count_tokens_only) {
     count_tokens_only = false;
+    if (path == "/v1/systemone") {
+        req.format = ApiFormat::SYSTEMONE;
+        req.response_id = generate_id("systemone");
+        return true;
+    }
     if (path == "/v1/chat/completions") {
         req.format = ApiFormat::OPENAI_CHAT;
         req.response_id = generate_id("chatcmpl");
@@ -2571,6 +2576,303 @@ RoutingAdmission HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedReq
     return job.admission;
 }
 
+namespace {
+
+bool systemone_description_valid(const json & value) {
+    return value.is_string() || value.is_array() || value.is_object();
+}
+
+std::string systemone_escape(std::string value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char ch : value) {
+        if (ch == '<') escaped += "\\u003c";
+        else if (ch == '>') escaped += "\\u003e";
+        else escaped.push_back(ch);
+    }
+    return escaped;
+}
+
+std::string systemone_description_text(const json & value) {
+    return systemone_escape(
+        value.is_string() ? value.get<std::string>() : value.dump(2));
+}
+
+std::string systemone_prompt(
+        const std::string & type,
+        const json & instructions,
+        const std::vector<std::string> & labels,
+        const std::vector<std::string> & keys,
+        const json & descriptions,
+        const json & state) {
+    std::ostringstream out;
+    out << "<TASK type=\"" << type << "\">\n"
+        << systemone_description_text(instructions)
+        << "\n</TASK>\n\n<CRITERIA>\n";
+    for (size_t i = 0; i < labels.size(); ++i) {
+        out << '[' << labels[i] << "] ";
+        if (type == "noul") {
+            out << (i == 0 ? "Yes" : "No");
+        } else if (!keys[i].empty()) {
+            out << systemone_escape(keys[i]);
+        }
+        if (!descriptions[i].is_null()) {
+            if (type != "noul" && !keys[i].empty()) out << ": ";
+            else out << " - ";
+            out << systemone_description_text(descriptions[i]);
+        }
+        out << '\n';
+    }
+    out << "</CRITERIA>\n\n<STATE>\n"
+        << systemone_description_text(state)
+        << "\n</STATE>\n\nChoose exactly one criterion label. "
+           "Answer with only that label.\nAnswer:";
+    return out.str();
+}
+
+}  // namespace
+
+std::vector<double> http_detail::systemone_restricted_softmax(
+        const std::vector<float> & logits,
+        const std::vector<int32_t> & token_ids) {
+    double max_logit = -std::numeric_limits<double>::infinity();
+    for (int32_t token_id : token_ids) {
+        max_logit = (std::max)(max_logit, (double)logits[(size_t)token_id]);
+    }
+    std::vector<double> probabilities;
+    probabilities.reserve(token_ids.size());
+    double total = 0.0;
+    for (int32_t token_id : token_ids) {
+        const double value =
+            std::exp((double)logits[(size_t)token_id] - max_logit);
+        probabilities.push_back(value);
+        total += value;
+    }
+    for (double & probability : probabilities) probability /= total;
+    return probabilities;
+}
+
+double http_detail::systemone_distribution_confidence(
+        const std::vector<double> & probabilities) {
+    double entropy = 0.0;
+    for (double probability : probabilities) {
+        if (probability > 0.0) entropy -= probability * std::log(probability);
+    }
+    return (std::clamp)(
+        1.0 - entropy / std::log((double)probabilities.size()), 0.0, 1.0);
+}
+
+bool HttpServer::prepare_systemone_request(
+        SocketHandle fd, ParsedRequest & req) {
+    try {
+        const json & body = req.raw_body;
+        if (!body.is_object()) {
+            send_error(fd, 422, "request body must be a JSON object");
+            return false;
+        }
+        if (!body.contains("model") || !body["model"].is_string() ||
+            body["model"].get<std::string>().empty()) {
+            send_error(fd, 422, "model must be a non-empty string");
+            return false;
+        }
+        req.model = body["model"].get<std::string>();
+        if (req.model != config_.model_name) {
+            send_error(fd, 404, "unknown model '" + req.model + "'");
+            return false;
+        }
+        if (!body.contains("state") ||
+            !(body["state"].is_string() || body["state"].is_array() ||
+              body["state"].is_object())) {
+            send_error(fd, 422, "state must be a string, object, or array");
+            return false;
+        }
+        if (!body.contains("questions") || !body["questions"].is_object() ||
+            body["questions"].empty()) {
+            send_error(fd, 422, "questions must be a non-empty object");
+            return false;
+        }
+
+        const json & state = body["state"];
+        for (auto it = body["questions"].begin();
+             it != body["questions"].end(); ++it) {
+            if (!it.value().is_object()) {
+                send_error(
+                    fd, 422, "questions." + it.key() + " must be an object");
+                return false;
+            }
+            const json & question = it.value();
+            if (!question.contains("type") || !question["type"].is_string()) {
+                send_error(
+                    fd, 422,
+                    "questions." + it.key() + ".type must be a string");
+                return false;
+            }
+            if (!question.contains("instructions") ||
+                !systemone_description_valid(question["instructions"])) {
+                send_error(
+                    fd, 422,
+                    "questions." + it.key() +
+                    ".instructions must be a string, object, or array");
+                return false;
+            }
+
+            ParsedRequest::SystemOneQuestion prepared;
+            prepared.id = it.key();
+            prepared.type = question["type"].get<std::string>();
+            std::vector<std::string> labels;
+
+            if (prepared.type == "noul") {
+                labels = {"Y", "N"};
+                prepared.option_keys = {"true", "false"};
+                prepared.option_descriptions = json::array({
+                    "The answer is yes or true.",
+                    "The answer is no or false.",
+                });
+                if (question.contains("criteria")) {
+                    if (!question["criteria"].is_object()) {
+                        send_error(
+                            fd, 422,
+                            "questions." + it.key() +
+                            ".criteria must be an object");
+                        return false;
+                    }
+                    for (size_t i = 0; i < prepared.option_keys.size(); ++i) {
+                        const std::string & key = prepared.option_keys[i];
+                        if (!question["criteria"].contains(key)) continue;
+                        const json & description = question["criteria"][key];
+                        if (!systemone_description_valid(description)) {
+                            send_error(
+                                fd, 422,
+                                "questions." + it.key() + ".criteria." + key +
+                                " must be a string, object, or array");
+                            return false;
+                        }
+                        prepared.option_descriptions[i] = description;
+                    }
+                }
+            } else if (prepared.type == "choice") {
+                if (!question.contains("criteria") ||
+                    !question["criteria"].is_object()) {
+                    send_error(
+                        fd, 422,
+                        "questions." + it.key() +
+                        ".criteria must be an object");
+                    return false;
+                }
+                const json & criteria = question["criteria"];
+                if (criteria.size() < 2 || criteria.size() > 10) {
+                    send_error(
+                        fd, 422,
+                        "questions." + it.key() +
+                        ".criteria must contain 2 to 10 options");
+                    return false;
+                }
+                prepared.option_descriptions = json::array();
+                size_t index = 0;
+                for (auto criterion = criteria.begin();
+                     criterion != criteria.end(); ++criterion, ++index) {
+                    if (!(criterion.value().is_null() ||
+                          systemone_description_valid(criterion.value()))) {
+                        send_error(
+                            fd, 422,
+                            "questions." + it.key() + ".criteria." +
+                            criterion.key() +
+                            " must be null, a string, object, or array");
+                        return false;
+                    }
+                    labels.push_back(std::string(1, (char)('A' + index)));
+                    prepared.option_keys.push_back(criterion.key());
+                    prepared.option_descriptions.push_back(criterion.value());
+                }
+            } else if (prepared.type == "score") {
+                if (!question.contains("criteria") ||
+                    !question["criteria"].is_array() ||
+                    question["criteria"].size() < 2 ||
+                    question["criteria"].size() > 10) {
+                    send_error(
+                        fd, 422,
+                        "questions." + it.key() +
+                        ".criteria must contain 2 to 10 ordered levels");
+                    return false;
+                }
+                prepared.option_descriptions = question["criteria"];
+                for (size_t i = 0;
+                     i < prepared.option_descriptions.size(); ++i) {
+                    if (!systemone_description_valid(
+                            prepared.option_descriptions[i])) {
+                        send_error(
+                            fd, 422,
+                            "questions." + it.key() +
+                            ".criteria entries must be strings, objects, or arrays");
+                        return false;
+                    }
+                    labels.push_back(std::string(1, (char)('A' + i)));
+                    prepared.option_keys.push_back(std::to_string(i));
+                }
+            } else {
+                send_error(
+                    fd, 422,
+                    "questions." + it.key() +
+                    ".type must be noul, choice, or score");
+                return false;
+            }
+
+            const std::string prompt = systemone_prompt(
+                prepared.type, question["instructions"], labels,
+                prepared.option_keys, prepared.option_descriptions, state);
+            prepared.prompt_tokens = tokenizer_.encode(prompt);
+            if (prepared.prompt_tokens.empty()) {
+                send_error(
+                    fd, 422,
+                    "questions." + it.key() + " produced an empty prompt");
+                return false;
+            }
+            if (config_.max_ctx > 0 &&
+                prepared.prompt_tokens.size() > (size_t)config_.max_ctx) {
+                send_error(
+                    fd, 422,
+                    "questions." + it.key() +
+                    " exceeds the model context limit");
+                return false;
+            }
+
+            std::unordered_set<int32_t> distinct_ids;
+            for (const std::string & label : labels) {
+                const std::vector<int32_t> with_label =
+                    tokenizer_.encode(prompt + " " + label);
+                if (with_label.size() != prepared.prompt_tokens.size() + 1 ||
+                    !std::equal(
+                        prepared.prompt_tokens.begin(),
+                        prepared.prompt_tokens.end(), with_label.begin())) {
+                    send_error(
+                        fd, 422,
+                        "label '" + label +
+                        "' is not one token after the Answer: prefix");
+                    return false;
+                }
+                const int32_t token_id = with_label.back();
+                if (!distinct_ids.insert(token_id).second) {
+                    send_error(
+                        fd, 422,
+                        "answer labels do not map to distinct tokens");
+                    return false;
+                }
+                prepared.label_token_ids.push_back(token_id);
+            }
+            req.systemone_questions.push_back(std::move(prepared));
+        }
+        req.prompt_tokens = req.systemone_questions.front().prompt_tokens;
+        req.max_output = 0;
+        req.stream = false;
+        return true;
+    } catch (const std::exception & error) {
+        send_error(
+            fd, 422,
+            std::string("invalid /v1/systemone request: ") + error.what());
+        return false;
+    }
+}
+
 bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
     if (hr.method != "POST") return false;
 
@@ -2595,6 +2897,24 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
 bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
                                       bool count_tokens_only,
                                       RoutingAdmission * admission) {
+    if (req.format == ApiFormat::SYSTEMONE) {
+        if (backend_.seq_engine()) {
+            send_error(
+                fd, 503,
+                "/v1/systemone is unavailable with concurrent-slot serving");
+            return true;
+        }
+        if (!backend_.supports_prefill_logits()) {
+            send_error(
+                fd, 503,
+                "the selected backend does not expose final-position "
+                "prefill logits");
+            return true;
+        }
+        if (!prepare_systemone_request(fd, req)) return true;
+        enqueue_request_and_wait(fd, std::move(req));
+        return true;
+    }
     try {
         const json & body = req.raw_body;
         if (!parse_common_request_fields(fd, body, req)) return true;
@@ -4712,7 +5032,137 @@ void HttpServer::worker_loop() {
     }
 }
 
+void HttpServer::process_systemone_job(ServerJob * job) {
+    const ParsedRequest & req = job->req;
+    const auto finish_job = [&]() {
+        std::lock_guard<std::mutex> lock(job->mu);
+        job->done = true;
+        job->cv.notify_one();
+    };
+    const auto fail_request = [&](int status, const std::string & message) {
+        if (!job->client_disconnected.load(std::memory_order_acquire)) {
+            send_error(job->fd, status, message);
+        }
+        finish_job();
+    };
+
+    json answers = json::object();
+    int input_tokens = 0;
+    for (const ParsedRequest::SystemOneQuestion & question :
+         req.systemone_questions) {
+        if (job->client_disconnected.load(std::memory_order_acquire)) {
+            finish_job();
+            return;
+        }
+
+        GenerateRequest generate_request;
+        generate_request.prompt = question.prompt_tokens;
+        generate_request.n_gen = 0;
+        generate_request.return_prefill_logits = true;
+
+        DaemonIO io;
+        GenerateResult result = backend_.generate(generate_request, io);
+        backend_.release_scratch();
+        if (!result.ok()) {
+            fail_request(
+                500,
+                "prefill failed for question '" + question.id + "': " +
+                std::string(result.error_code()) +
+                (result.error_detail().empty()
+                     ? std::string()
+                     : ": " + std::string(result.error_detail())));
+            return;
+        }
+        if (result.prefill_logits.empty()) {
+            fail_request(
+                503,
+                "the selected backend does not expose final-position "
+                "prefill logits");
+            return;
+        }
+        for (int32_t token_id : question.label_token_ids) {
+            if (token_id < 0 ||
+                (size_t)token_id >= result.prefill_logits.size()) {
+                fail_request(
+                    500, "label token is outside the backend vocabulary");
+                return;
+            }
+        }
+
+        const std::vector<double> probabilities =
+            http_detail::systemone_restricted_softmax(
+                result.prefill_logits, question.label_token_ids);
+        input_tokens += (int)question.prompt_tokens.size();
+
+        if (question.type == "noul") {
+            answers[question.id] = {
+                {"type", "noul"},
+                {"noul", probabilities[0]},
+            };
+            continue;
+        }
+
+        size_t best = 0;
+        for (size_t i = 1; i < probabilities.size(); ++i) {
+            if (probabilities[i] > probabilities[best]) best = i;
+        }
+        json probability_map = json::object();
+        for (size_t i = 0; i < probabilities.size(); ++i) {
+            probability_map[question.option_keys[i]] = probabilities[i];
+        }
+
+        if (question.type == "choice") {
+            answers[question.id] = {
+                {"type", "choice"},
+                {"choice", question.option_keys[best]},
+                {"probabilities", std::move(probability_map)},
+                {"confidence",
+                 http_detail::systemone_distribution_confidence(
+                     probabilities)},
+            };
+            continue;
+        }
+
+        double expected_score = 0.0;
+        json legend = json::object();
+        for (size_t i = 0; i < probabilities.size(); ++i) {
+            expected_score += (double)i * probabilities[i];
+            const json & description = question.option_descriptions[i];
+            legend[question.option_keys[i]] =
+                description.is_string()
+                    ? description.get<std::string>()
+                    : description.dump();
+        }
+        answers[question.id] = {
+            {"type", "score"},
+            {"score", expected_score},
+            {"legend", std::move(legend)},
+            {"probabilities", std::move(probability_map)},
+            {"confidence",
+             http_detail::systemone_distribution_confidence(probabilities)},
+        };
+    }
+
+    if (!job->client_disconnected.load(std::memory_order_acquire)) {
+        const json response = {
+            {"model", config_.model_name},
+            {"answers", std::move(answers)},
+            {"usage", {
+                {"input_tokens", input_tokens},
+                {"output_tokens", 0},
+            }},
+        };
+        send_response(
+            job->fd, 200, "application/json", response.dump() + "\n");
+    }
+    finish_job();
+}
+
 void HttpServer::process_job(ServerJob * job) {
+    if (job->req.format == ApiFormat::SYSTEMONE) {
+        process_systemone_job(job);
+        return;
+    }
     SocketHandle fd = job->fd;
     const auto & req = job->req;
     auto started_at = std::chrono::steady_clock::now();
@@ -5361,6 +5811,7 @@ std::string HttpServer::format_http_response(
         case 404: reason = "Not Found"; break;
         case 405: reason = "Method Not Allowed"; break;
         case 413: reason = "Payload Too Large"; break;
+        case 422: reason = "Unprocessable Entity"; break;
         case 500: reason = "Internal Server Error"; break;
         case 503: reason = "Service Unavailable"; break;
     }

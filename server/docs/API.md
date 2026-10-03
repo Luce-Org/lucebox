@@ -15,6 +15,97 @@ backend (qwen35, qwen3, gemma4, laguna).
 | POST | `/v1/chat/completions` | OpenAI Chat Completions | ✅ |
 | POST | `/v1/messages` | Anthropic Messages | ✅ |
 | POST | `/v1/responses` | OpenAI Responses API | ✅ |
+| POST | `/v1/systemone` | Direct-logit typed decisions | ✅ Qwen3.5/Qwen3.6 |
+
+---
+
+## POST `/v1/systemone`
+
+Runs Jev-like typed decisions without decoding. Each question is rendered as a
+fixed task/criteria/state prompt, the backend performs one prefill, and the
+server reads only the allowed label logits at the final `Answer:` position.
+
+One question therefore uses one prefill pass. Multiple questions sharing one
+state use one independent prefill pass per question; answers are independent
+and no generated label token is appended.
+
+```json
+{
+  "model": "luce-dflash",
+  "state": {
+    "subject": "Duplicate charge",
+    "message": "Please refund the duplicate charge."
+  },
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": {
+        "billing": "Payments, invoices, and refunds",
+        "technical": "Bugs and integrations"
+      }
+    },
+    "refund_requested": {
+      "type": "noul",
+      "instructions": "Does the customer request a refund?"
+    }
+  }
+}
+```
+
+The endpoint supports:
+
+- `noul`, using restricted `Y`/`N` logits.
+- `choice`, with 2–10 named options using `A`–`J`.
+- `score`, with 2–10 ordered levels using `A`–`J`.
+- String, object, or array values for `state`, `instructions`, and descriptions.
+
+```json
+{
+  "model": "luce-dflash",
+  "answers": {
+    "department": {
+      "type": "choice",
+      "choice": "billing",
+      "probabilities": {
+        "billing": 0.91,
+        "technical": 0.09
+      },
+      "confidence": 0.56
+    },
+    "refund_requested": {
+      "type": "noul",
+      "noul": 0.98
+    }
+  },
+  "usage": {
+    "input_tokens": 236,
+    "output_tokens": 0
+  }
+}
+```
+
+`confidence` is `1 - normalized_entropy(probabilities)`. The server validates
+that every configured answer label is one distinct tokenizer token in the
+exact `Answer:` context. Invalid requests return `422`.
+
+The fixed prompt presents `noul` labels as `Yes` and `No`, then instructs the
+model to answer with exactly one criterion label. This keeps the answer token
+generation-free while improving direct-logit classification with instruction
+models.
+
+The current final-logit implementation is available on the monolithic
+Qwen3.5/Qwen3.6 backend. It is rejected when `--max-concurrency` enables the
+concurrent-slot engine; other backends return `503` until they expose their
+final-position prefill logits.
+
+Run the sourced live quality suite against a local model with:
+
+```bash
+python3 server/tests/test_systemone_quality.py \
+  --launch server/models/Qwen3.6-27B-Q4_K_M.gguf \
+  --server-bin server/build/dflash_server
+```
 
 ---
 

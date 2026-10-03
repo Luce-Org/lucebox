@@ -3,7 +3,13 @@
 
 namespace luce::common {
 
-enum class ApiFormat { OPENAI_CHAT, ANTHROPIC, RESPONSES, COMPLETIONS };
+enum class ApiFormat {
+    OPENAI_CHAT,
+    ANTHROPIC,
+    RESPONSES,
+    COMPLETIONS,
+    SYSTEMONE,
+};
 
 // Log/status name of a format — shared by the request-tracing logs of the
 // classic worker loop and the concurrent scheduler.
@@ -13,6 +19,7 @@ inline const char * api_format_name(ApiFormat format) {
     case ApiFormat::ANTHROPIC:   return "anthropic";
     case ApiFormat::RESPONSES:   return "responses";
     case ApiFormat::COMPLETIONS: return "completions";
+    case ApiFormat::SYSTEMONE:   return "systemone";
     default:                     return "unknown";
     }
 }

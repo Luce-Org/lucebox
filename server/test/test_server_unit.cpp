@@ -280,6 +280,21 @@ TEST_CASE(ServerUnitFixture, test_api_format_names_are_total) {
     CHECK(std::string(api_format_name(ApiFormat::ANTHROPIC)) == "anthropic");
     CHECK(std::string(api_format_name(ApiFormat::RESPONSES)) == "responses");
     CHECK(std::string(api_format_name(ApiFormat::COMPLETIONS)) == "completions");
+    CHECK(std::string(api_format_name(ApiFormat::SYSTEMONE)) == "systemone");
+}
+
+TEST_CASE(ServerUnitFixture, test_systemone_restricted_softmax_and_confidence) {
+    const std::vector<float> logits{1000.0f, -1000.0f, 999.0f};
+    const std::vector<double> probabilities =
+        http_detail::systemone_restricted_softmax(logits, {0, 2});
+    CHECK(probabilities.size() == 2);
+    CHECK(std::abs(probabilities[0] - 0.7310585786) < 1e-8);
+    CHECK(std::abs(probabilities[1] - 0.2689414214) < 1e-8);
+    CHECK(std::abs(probabilities[0] + probabilities[1] - 1.0) < 1e-12);
+
+    CHECK(std::abs(http_detail::systemone_distribution_confidence({0.5, 0.5}))
+          < 1e-12);
+    CHECK(http_detail::systemone_distribution_confidence({0.999, 0.001}) > 0.98);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_scorer_uses_user_query_before_chat_suffix) {
