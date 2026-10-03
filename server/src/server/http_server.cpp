@@ -649,6 +649,30 @@ SamplerCfg parse_request_sampler(const json & body,
     return sampler;
 }
 
+void apply_no_thinking_sampler_defaults(const json & body,
+                                        const SamplingDefaults & no_thinking,
+                                        SamplerCfg & sampler) {
+    // Mirrors the body-key checks in parse_request_sampler: only backfill a
+    // field the request left unset, and only when the card actually
+    // supplied a no-thinking value for it.
+    if (no_thinking.has_temperature && !body.contains("temperature")) {
+        sampler.temp = no_thinking.temperature;
+    }
+    if (no_thinking.has_top_p && !body.contains("top_p")) {
+        sampler.top_p = no_thinking.top_p;
+    }
+    if (no_thinking.has_top_k && !body.contains("top_k")) {
+        sampler.top_k = no_thinking.top_k;
+    }
+    if (no_thinking.has_presence_penalty && !body.contains("presence_penalty")) {
+        sampler.pres_pen = no_thinking.presence_penalty;
+    }
+    if (no_thinking.has_repetition_penalty &&
+        !body.contains("repetition_penalty") && !body.contains("rep_pen")) {
+        sampler.rep_pen = no_thinking.repetition_penalty;
+    }
+}
+
 json require_messages_array(const json & body) {
     if (!body.contains("messages") || !body["messages"].is_array() ||
         body["messages"].empty()) {
@@ -1094,6 +1118,21 @@ std::vector<ChatMessage> normalize_chat_messages(
 
             ChatMessage cm;
             cm.role = m.value("role", "user");
+
+            // Carry a replayed assistant turn's prior <think> text through to
+            // the Jinja renderer as message.reasoning_content (OpenAI/DeepSeek
+            // dialect; `reasoning` is the OpenRouter/Anthropic-gateway flat
+            // alias — same field the response side emits, see
+            // format_response_message's reasoning_content/reasoning/
+            // reasoning_details trio below).
+            if (cm.role == "assistant") {
+                if (m.contains("reasoning_content") && m["reasoning_content"].is_string()) {
+                    cm.reasoning_content = m["reasoning_content"].get<std::string>();
+                } else if (m.contains("reasoning") && m["reasoning"].is_string()) {
+                    cm.reasoning_content = m["reasoning"].get<std::string>();
+                }
+            }
+
             const bool anthropic_blocks = format == ApiFormat::ANTHROPIC &&
                 m.contains("content") && m["content"].is_array();
 
@@ -2281,17 +2320,19 @@ void apply_request_reasoning(
     // Explicit thinking budgets override reasoning-effort tiers. Template
     // kwargs can still override whether the rendered prompt enables thinking.
     // Default: thinking OFF (Qwen3.6 thinking wrecks DFlash acceptance
-    // rates; clients opt in explicitly).
-    bool enable_thinking = false;
+    // rates; clients opt in explicitly). Qwen3.8-Flash-Next's own template
+    // thinks by default, so it keeps the budget envelope on unless disabled.
+    bool enable_thinking = config.arch == "qwen4exp";
     int request_budget_tokens = -1;
     int request_reply_budget = -1;
     int effort_phase1_cap = -1;
     bool effort_set = false;
     std::string normalized_effort;
 
-    req.thinking_opt_in = false;
+    req.thinking_opt_in = enable_thinking;
     req.per_req_phase1_cap = -1;
     req.per_req_reply_budget = -1;
+    req.preserve_thinking = -1;
 
     auto apply_reasoning_effort = [&](const std::string & effort) {
         if (effort == "none") {
@@ -2378,6 +2419,10 @@ void apply_request_reasoning(
         }
         if (kwargs.contains("enable_thinking")) {
             enable_thinking = kwargs["enable_thinking"].get<bool>();
+        }
+        if (kwargs.contains("preserve_thinking") &&
+            kwargs["preserve_thinking"].is_boolean()) {
+            req.preserve_thinking = kwargs["preserve_thinking"].get<bool>() ? 1 : 0;
         }
     }
     // DeepSeek uses high whenever thinking is enabled without an explicit
@@ -2469,7 +2514,9 @@ bool HttpServer::render_messages_to_text(
             rendered = render_chat_template_jinja(
                 config_.chat_template_src, chat_messages, bos, eos,
                 add_generation_prompt,
-                req.thinking_enabled, tools_json);
+                req.thinking_enabled, tools_json,
+                config_.arch == "qwen4exp" ? qwen4exp_template_effort(req.reasoning_effort) : std::string(),
+                req.preserve_thinking);
         } catch (const std::exception & e) {
             error = std::string("chat template (jinja) render failed: ") + e.what();
             return false;
@@ -2625,6 +2672,15 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         // Reasoning must be applied BEFORE rendering: the template injects
         // the empty <think>\n\n</think>\n\n block when thinking is disabled.
         apply_request_reasoning(body, config_, req);
+        // req.sampler was built by parse_common_request_fields above, before
+        // the final thinking state was known — it can only have applied the
+        // thinking-mode `sampler_defaults`. Now that req.thinking_enabled is
+        // resolved, backfill any still-omitted fields from the card's
+        // no-thinking defaults when thinking ended up OFF.
+        if (!req.thinking_enabled) {
+            apply_no_thinking_sampler_defaults(
+                body, config_.sampler_defaults_no_thinking, req.sampler);
+        }
         // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio).
         req.session_id = parse_session_id_from_body(body);
 

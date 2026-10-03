@@ -434,7 +434,7 @@ static void mix_wmma_moe_run(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int si1  = ids->nb[1] / ggml_element_size(ids);
     const int sis1 = src1->nb[2] / src1->nb[1];
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-        (int) n_experts, (int) ne12, (int) n_expert_used, (int) ne11, si1, sis1, stream);
+        (int) n_experts, (int) ne12, (int) n_expert_used, (int) ne11, si1, sis1, /*write_inverse=*/false, stream);
 
     // Route-tile width: decode work per FLOP falls as 1/bn, padding rises
     // with it. Pick from the mean routes per expert; LUCE_MIX_WMMA_BN forces.

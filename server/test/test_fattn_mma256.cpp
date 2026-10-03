@@ -1,4 +1,4 @@
-// DKQ=256 MMA fattn differential qualification (RDNA4, gfx1201).
+// DKQ=256 MMA fattn differential qualification (RDNA3.5/gfx1151 and RDNA4/gfx1201).
 //
 // Qwen3.5/3.6/3.8 dense-hybrid targets attend at head_dim=256. The RDNA4
 // dispatch historically capped the MMA fattn path at head 128, so prefill
@@ -34,7 +34,7 @@ static int head_dim() {
     return e ? atoi(e) : 256;
 }
 constexpr int Hq = 24;  // query heads
-constexpr int Hk = 4;   // KV heads (gqa ratio 6)
+int Hk = 4;   // KV heads (gqa ratio 6)
 
 uint32_t g_rng = 0x9e3779b9u;
 float next_float() {
@@ -254,9 +254,10 @@ bool run_case(ggml_backend_t gpu, ggml_backend_t cpu, const Case & c, int D) {
 int main() {
 #if defined(GGML_USE_HIP)
     hipDeviceProp_t props{};
-    if (hipGetDeviceProperties(&props, 0) != hipSuccess ||
-        std::strncmp(props.gcnArchName, "gfx12", 5) != 0) {
-        std::printf("[fattn-mma256] SKIP: requires gfx12 (RDNA4)\n");
+    const bool have_device = hipGetDeviceProperties(&props, 0) == hipSuccess;
+    const bool rdna35 = have_device && std::strncmp(props.gcnArchName, "gfx115", 6) == 0;
+    if (!have_device || (!rdna35 && std::strncmp(props.gcnArchName, "gfx12", 5) != 0)) {
+        std::printf("[fattn-mma256] SKIP: requires RDNA3.5 or RDNA4\n");
         return 77;
     }
     // Must precede the first GPU fattn dispatch: fattn.cu reads the opt-in
@@ -287,7 +288,8 @@ int main() {
     // Ragged KV length (not a multiple of FATTN_KQ_STRIDE): gqa_opt does
     // not apply, so the tensor-core route must NOT fire and the generic
     // fallback must still produce correct results.
-    const bool expect_tc = !kill_switch;
+    const bool expect_tc = rdna35 || !kill_switch;
+    if (rdna35) Hk = 2; // Qwen4Exp GQA=12: four heads per MMA tile.
     // The tile kernel's own accumulation sits ~1.2e-3 from the CPU
     // reference (pre-existing numerics); the kill-switch mode verifies the
     // fallback route and its correctness at that looser bound.
@@ -303,6 +305,15 @@ int main() {
         {  4096,   64, false, expect_tc, true,  0.0f,  tol_mul*1e-3f },
         {  4096,   64, false, expect_tc, false, 50.0f, tol_mul*1e-3f },
     };
+    if (rdna35) {
+        // Exercise upstream ncols=64 and the short-query TILE fallback.
+        cases.insert(cases.begin(), {
+            { 256, 16, false, true,  false, 0.0f, 1e-3f },
+            { 256,  9, false, true,  false, 0.0f, 1e-3f },
+            { 256,  8, false, false, false, 0.0f, 2e-3f },
+            { 256,  1, false, false, false, 0.0f, 2e-3f },
+        });
+    }
     if (wmma_force) {
         cases.insert(cases.begin() + 1, { 512, 16, false, expect_tc, false, 0.0f, tol_mul*1e-3f });
     }

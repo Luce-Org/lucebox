@@ -72,6 +72,7 @@ struct BackendArgs {
 
     // Chunked prefill
     int                  chunk                = 512;
+    bool                 chunk_set            = false;   // --chunk given explicitly
     PrefillAttentionMode ds4_prefill_mode     = PrefillAttentionMode::Exact;
     bool                 ds4_prefill_mode_set = false;
 

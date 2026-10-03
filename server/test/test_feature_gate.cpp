@@ -17,6 +17,7 @@
 
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -410,7 +411,7 @@ void test_feature_gate_paged_attention_requires_monolithic_backend() {
 
     // qwen35moe shares Qwen35Config, so its rejection is this gate's job —
     // the factory's field-presence cross-check cannot tell the two apart.
-    for (const char * arch : {"qwen35moe", "laguna", "qwen3", "gemma4"}) {
+    for (const char * arch : {"qwen35moe", "qwen4exp", "laguna", "qwen3", "gemma4"}) {
         CHECK(!gate_result(args, arch, PlacementBackend::Cuda).empty());
     }
 
@@ -531,6 +532,9 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     dense.model_path = "/nonexistent/model.gguf";
     dense.max_concurrency = 2;
     CHECK(!gate_result(dense, "qwen35", PlacementBackend::Cuda).empty());
+
+    // qwen4exp has no paged decode path; multiple slots are always rejected.
+    CHECK(!gate_result(dense, "qwen4exp", PlacementBackend::Cuda).empty());
 
     BackendArgs parallel = paged;
     parallel.max_concurrency = 2;
@@ -731,7 +735,7 @@ void test_model_capability_tables() {
     }
 
     // arch_is_supported() must match create_backend()'s dispatch chain.
-    for (const char * arch : {"qwen35", "qwen35moe", "laguna",
+    for (const char * arch : {"qwen35", "qwen35moe", "qwen4exp", "laguna",
                               "qwen3", "gemma4", "deepseek4"}) {
         CHECK(arch_is_supported(arch));
     }
@@ -765,6 +769,11 @@ void test_model_capability_tables() {
     CHECK(arch_supports_paged_attention("deepseek4", false));
     CHECK(!arch_supports_paged_attention("deepseek4", true));
     CHECK(!arch_supports_paged_attention("qwen35moe", false));
+    CHECK(!arch_supports_layer_split("qwen4exp"));
+    CHECK(!arch_supports_remote_draft("qwen4exp"));
+    CHECK(!arch_supports_pflash_compression("qwen4exp"));
+    CHECK(!arch_supports_decode_draft("qwen4exp", false));
+    CHECK(!arch_supports_paged_attention("qwen4exp", false));
     CHECK(arch_supports_draft_block_size("qwen35", false));
     CHECK(!arch_supports_draft_block_size("qwen35", true));
     CHECK(!arch_supports_draft_block_size("qwen35moe", false));

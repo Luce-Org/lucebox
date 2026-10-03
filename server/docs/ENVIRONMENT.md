@@ -34,6 +34,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `GGML_CUDA_DISABLE_COPY_BATCH` | unset | KILL SWITCH (burn-in): set to issue one device memcpy per plain CPY node again. By default ggml-cuda gathers runs of consecutive same-type contiguous CPY nodes with independent byte ranges into one batched copy launch. |
 | `GGML_CUDA_GRAPH_STATS` | unset | DEBUG: per-graph CUDA-graph replay/capture/eager counters. |
 | `GGML_CUDA_GRAPH_STATS_EVERY` | 200 | DEBUG: print period for the stats above (clamped to >=1). |
+| `LUCE_HIP_NO_AUTO_UMA` | unset | Disables automatic unified-memory placement on integrated GPUs. The qwen4exp gfx1151 profile disables it through a scoped code setting, without changing the environment. |
 | `LUCE_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |
 | `LUCE_ADAPTIVE_K_DENSE` | per-model default | CSV of MoE layers kept dense under adaptive-K (DFlash capture layers). Warned-inert on families that do not thread layer indices yet. |
 | `LUCE_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. |

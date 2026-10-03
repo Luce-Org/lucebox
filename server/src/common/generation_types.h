@@ -25,6 +25,28 @@ struct BudgetHook {
     int hard_limit_remaining = 0;
 };
 
+// Per-generation force-close state. apply() takes the candidate token after
+// `generated` tokens of an `n_gen` budget and substitutes the close sequence
+// once the remaining budget reaches the reserve. A model that samples
+// close[0] itself keeps it. Returns true when close[0] was forced.
+struct BudgetHookState {
+    bool started = false;
+    int  pos     = 0;
+    bool apply(const BudgetHook & hook, int generated, int n_gen, int32_t & tok) {
+        if (hook.close_token_ids.empty()) return false;
+        if (started) {
+            if (pos < (int) hook.close_token_ids.size()) tok = hook.close_token_ids[(size_t) pos++];
+            return false;
+        }
+        if (n_gen - generated > hook.hard_limit_remaining) return false;
+        started = true;
+        pos = 1;
+        if (tok == hook.close_token_ids.front()) return false;
+        tok = hook.close_token_ids.front();
+        return true;
+    }
+};
+
 struct GenerateRequest {
     std::vector<int32_t> prompt;
     // Backend-owned image payload bound to `prompt`; empty for text requests.

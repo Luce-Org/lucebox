@@ -21,6 +21,7 @@
 #include "server/http_server.h"
 #include "server/image_input.h"
 #include "qwen35/qwen35_backend.h"
+#include "qwen4exp/qwen4exp_graph.h"
 #include "engine/luce_engine.h"
 #include "server/chat_template.h"
 #include "common/concurrency/seq_engine.h"
@@ -4492,6 +4493,166 @@ TEST_CASE(ServerUnitFixture, test_parse_request_sampler_applies_defaults_and_ove
     TEST_ASSERT(std::fabs(sampler.rep_pen - 1.1f) < 0.001f);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// sampling_no_thinking: per-card sampler defaults for requests whose final
+// thinking state resolves to OFF (e.g. Qwen3.8-Flash-Next's instruct-mode
+// recipe vs. its thinking-mode one). See docs/specs/thinking-budget.md §3.3.
+// ═══════════════════════════════════════════════════════════════════════
+
+// Mirrors the real pipeline in HttpServer::handle_model_request: sampler
+// defaults are parsed before the final thinking state is known, then
+// apply_request_reasoning resolves req.thinking_enabled, then (only when
+// thinking ended up OFF) apply_no_thinking_sampler_defaults backfills the
+// still-omitted fields from the card's no-thinking block.
+static SamplerCfg resolve_request_sampler(const json & body, const ServerConfig & config) {
+    SamplerCfg sampler = parse_request_sampler(body, config.sampler_defaults);
+    ParsedRequest req;
+    req.max_output = resolve_max_output_tokens(body, config.default_max_tokens);
+    apply_request_reasoning(body, config, req);
+    if (!req.thinking_enabled) {
+        apply_no_thinking_sampler_defaults(
+            body, config.sampler_defaults_no_thinking, sampler);
+    }
+    return sampler;
+}
+
+// Qwen3.8-Flash-Next's published thinking vs. instruct sampling sets.
+static ServerConfig qwen4exp_dual_sampling_config() {
+    ServerConfig config;
+    config.arch = "qwen4exp";  // thinks by default unless disabled
+    config.default_max_tokens = 32768;
+    config.think_max_tokens = 24576;
+    config.hard_limit_reply_budget = 8192;
+
+    config.sampler_defaults.has_temperature = true;
+    config.sampler_defaults.temperature = 1.0f;
+    config.sampler_defaults.has_top_p = true;
+    config.sampler_defaults.top_p = 0.95f;
+    config.sampler_defaults.has_top_k = true;
+    config.sampler_defaults.top_k = 20;
+    config.sampler_defaults.has_presence_penalty = true;
+    config.sampler_defaults.presence_penalty = 0.0f;
+    config.sampler_defaults.has_repetition_penalty = true;
+    config.sampler_defaults.repetition_penalty = 1.0f;
+
+    config.sampler_defaults_no_thinking.has_temperature = true;
+    config.sampler_defaults_no_thinking.temperature = 0.7f;
+    config.sampler_defaults_no_thinking.has_top_p = true;
+    config.sampler_defaults_no_thinking.top_p = 0.80f;
+    config.sampler_defaults_no_thinking.has_top_k = true;
+    config.sampler_defaults_no_thinking.top_k = 20;
+    config.sampler_defaults_no_thinking.has_presence_penalty = true;
+    config.sampler_defaults_no_thinking.presence_penalty = 1.5f;
+    config.sampler_defaults_no_thinking.has_repetition_penalty = true;
+    config.sampler_defaults_no_thinking.repetition_penalty = 1.0f;
+    return config;
+}
+
+TEST_CASE(ServerUnitFixture, test_model_card_parses_sampling_no_thinking) {
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() / "dflash-mc-no-thinking-test";
+    fs::remove_all(root);
+    fs::create_directories(root / "share" / "model_cards");
+
+    {
+        FILE * f = std::fopen(
+            (root / "share" / "model_cards" / "notest-model.json").string().c_str(), "w");
+        TEST_ASSERT(f != nullptr);
+        std::fprintf(f,
+            "{\"name\":\"notest-model\",\"source\":\"test\",\"verified_at\":\"2026-10-02\","
+            "\"max_tokens\":32768,"
+            "\"sampling\":{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"min_p\":0.0,"
+            "\"presence_penalty\":0.0,\"repetition_penalty\":1.0},"
+            "\"sampling_no_thinking\":{\"temperature\":0.7,\"top_p\":0.8,\"top_k\":20,"
+            "\"min_p\":0.0,\"presence_penalty\":1.5,\"repetition_penalty\":1.0}}");
+        std::fclose(f);
+    }
+
+    auto card = luce::common::resolve_model_card("", "notest-model", "qwen4exp", root.string());
+    fs::remove_all(root);
+
+    TEST_ASSERT(card.sampling.has_temperature);
+    TEST_ASSERT(std::fabs(card.sampling.temperature - 1.0f) < 1.0e-6f);
+
+    TEST_ASSERT(card.sampling_no_thinking.has_temperature);
+    TEST_ASSERT(std::fabs(card.sampling_no_thinking.temperature - 0.7f) < 1.0e-6f);
+    TEST_ASSERT(card.sampling_no_thinking.has_top_p);
+    TEST_ASSERT(std::fabs(card.sampling_no_thinking.top_p - 0.8f) < 1.0e-6f);
+    TEST_ASSERT(card.sampling_no_thinking.has_top_k);
+    TEST_ASSERT(card.sampling_no_thinking.top_k == 20);
+    TEST_ASSERT(card.sampling_no_thinking.has_presence_penalty);
+    TEST_ASSERT(std::fabs(card.sampling_no_thinking.presence_penalty - 1.5f) < 1.0e-6f);
+    TEST_ASSERT(card.sampling_no_thinking.has_repetition_penalty);
+    TEST_ASSERT(std::fabs(card.sampling_no_thinking.repetition_penalty - 1.0f) < 1.0e-6f);
+}
+
+TEST_CASE(ServerUnitFixture, test_sampler_defaults_no_thinking_applied_when_thinking_off) {
+    const ServerConfig config = qwen4exp_dual_sampling_config();
+    const json body = {
+        {"chat_template_kwargs", {{"enable_thinking", false}}},
+    };
+    const SamplerCfg sampler = resolve_request_sampler(body, config);
+
+    TEST_ASSERT(std::fabs(sampler.temp - 0.7f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.top_p - 0.80f) < 0.001f);
+    TEST_ASSERT(sampler.top_k == 20);
+    TEST_ASSERT(std::fabs(sampler.pres_pen - 1.5f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.rep_pen - 1.0f) < 0.001f);
+}
+
+TEST_CASE(ServerUnitFixture, test_sampler_defaults_thinking_mode_unaffected_by_no_thinking_card) {
+    const ServerConfig config = qwen4exp_dual_sampling_config();
+    const json body = json::object();  // qwen4exp thinks by default when omitted
+    const SamplerCfg sampler = resolve_request_sampler(body, config);
+
+    TEST_ASSERT(std::fabs(sampler.temp - 1.0f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.top_p - 0.95f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.pres_pen - 0.0f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.rep_pen - 1.0f) < 0.001f);
+}
+
+TEST_CASE(ServerUnitFixture, test_sampler_explicit_fields_win_in_both_thinking_modes) {
+    const ServerConfig config = qwen4exp_dual_sampling_config();
+
+    const json thinking_off_body = {
+        {"temperature", 0.33f},
+        {"presence_penalty", 0.1f},
+        {"chat_template_kwargs", {{"enable_thinking", false}}},
+    };
+    const SamplerCfg off_sampler = resolve_request_sampler(thinking_off_body, config);
+    TEST_ASSERT(std::fabs(off_sampler.temp - 0.33f) < 0.001f);
+    TEST_ASSERT(std::fabs(off_sampler.pres_pen - 0.1f) < 0.001f);
+    // Omitted fields still pick up the no-thinking defaults.
+    TEST_ASSERT(std::fabs(off_sampler.top_p - 0.80f) < 0.001f);
+
+    const json thinking_on_body = {{"temperature", 0.44f}};
+    const SamplerCfg on_sampler = resolve_request_sampler(thinking_on_body, config);
+    TEST_ASSERT(std::fabs(on_sampler.temp - 0.44f) < 0.001f);
+    TEST_ASSERT(std::fabs(on_sampler.top_p - 0.95f) < 0.001f);
+}
+
+TEST_CASE(ServerUnitFixture, test_sampler_defaults_no_thinking_absent_keeps_today_behavior) {
+    // A card without `sampling_no_thinking` must behave exactly as before
+    // this feature: no-thinking requests still fall back to the (thinking-
+    // mode) `sampling` defaults for omitted fields.
+    ServerConfig config;
+    config.arch = "qwen4exp";
+    config.sampler_defaults.has_temperature = true;
+    config.sampler_defaults.temperature = 1.0f;
+    config.sampler_defaults.has_presence_penalty = true;
+    config.sampler_defaults.presence_penalty = 0.0f;
+    // config.sampler_defaults_no_thinking left default-constructed: every
+    // has_* is false, i.e. the card has no `sampling_no_thinking` block.
+
+    const json body = {
+        {"chat_template_kwargs", {{"enable_thinking", false}}},
+    };
+    const SamplerCfg sampler = resolve_request_sampler(body, config);
+
+    TEST_ASSERT(std::fabs(sampler.temp - 1.0f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.pres_pen - 0.0f) < 0.001f);
+}
+
 TEST_CASE(ServerUnitFixture, test_require_messages_array_rejects_invalid) {
     const json valid = {{"messages", json::array({
         {{"role", "user"}, {"content", "hi"}},
@@ -4540,6 +4701,31 @@ TEST_CASE(ServerUnitFixture, test_max_output_alias_precedence_ignores_shadowed_i
         resolve_max_output_tokens({{"max_completion_tokens", 8}}, 400) == 8);
 }
 
+// Thinking force-close: once the remaining budget reaches the reply reserve the next tokens become the close
+// sequence; a model that emits close[0] itself keeps its own token and is not counted as forced.
+TEST_CASE(ServerUnitFixture, test_budget_hook_state_force_closes_at_reply_reserve) {
+    const BudgetHook hook{{7, 8, 9}, 4};
+    BudgetHookState s;
+    int32_t tok = 1;
+    TEST_ASSERT(!s.apply(hook, 5, 10, tok) && tok == 1);   // remaining 5 > reserve 4
+    tok = 2;
+    TEST_ASSERT(s.apply(hook, 6, 10, tok) && tok == 7);    // remaining 4: forced close[0]
+    tok = 3;
+    TEST_ASSERT(!s.apply(hook, 7, 10, tok) && tok == 8);
+    tok = 3;
+    TEST_ASSERT(!s.apply(hook, 8, 10, tok) && tok == 9);
+    tok = 3;
+    TEST_ASSERT(!s.apply(hook, 9, 10, tok) && tok == 3);   // the answer resumes
+    BudgetHookState own;
+    tok = 7;
+    TEST_ASSERT(!own.apply(hook, 6, 10, tok) && tok == 7); // self-closed at the boundary
+    tok = 5;
+    TEST_ASSERT(!own.apply(hook, 7, 10, tok) && tok == 8);
+    BudgetHookState off;
+    tok = 5;
+    TEST_ASSERT(!off.apply(BudgetHook{}, 9, 10, tok) && tok == 5);
+}
+
 static ServerConfig deepseek_reasoning_test_config() {
     ServerConfig config;
     config.arch = "deepseek4";
@@ -4567,6 +4753,61 @@ static ParsedRequest resolve_qwen_reasoning(const json & body) {
     req.max_output = 1000;
     apply_request_reasoning(body, config, req);
     return req;
+}
+
+static ParsedRequest resolve_qwen4exp_reasoning(const json & body) {
+    ServerConfig config = deepseek_reasoning_test_config();
+    config.arch = "qwen4exp";
+    ParsedRequest req;
+    req.max_output = 1000;
+    apply_request_reasoning(body, config, req);
+    return req;
+}
+
+// Qwen3.8-Flash-Next's official template thinks by default (reasoning effort xhigh); an omitted thinking field must
+// keep it on, with the budget envelope active so the reply reserve applies. Explicit off still wins. Other Qwen
+// architectures keep the server's thinking-off default.
+TEST_CASE(ServerUnitFixture, test_qwen4exp_thinks_by_default) {
+    const ParsedRequest by_default = resolve_qwen4exp_reasoning(json::object());
+    TEST_ASSERT(by_default.thinking_enabled && by_default.thinking_opt_in);
+    const ParsedRequest off = resolve_qwen4exp_reasoning({{"thinking", {{"type", "disabled"}}}});
+    TEST_ASSERT(!off.thinking_enabled && !off.thinking_opt_in);
+    const ParsedRequest kw_off = resolve_qwen4exp_reasoning({{"chat_template_kwargs", {{"enable_thinking", false}}}});
+    TEST_ASSERT(!kw_off.thinking_enabled && !kw_off.thinking_opt_in);
+    TEST_ASSERT(!resolve_qwen_reasoning(json::object()).thinking_enabled);
+}
+
+// chat_template_kwargs.preserve_thinking is a tri-state Jinja-only toggle:
+// absent leaves req.preserve_thinking at -1 (template default applies), and
+// an explicit bool sets 0/1. It must not disturb thinking_enabled/opt_in.
+TEST_CASE(ServerUnitFixture, test_qwen4exp_preserve_thinking_kwarg) {
+    const ParsedRequest absent = resolve_qwen4exp_reasoning(json::object());
+    TEST_ASSERT(absent.preserve_thinking == -1);
+    const ParsedRequest off = resolve_qwen4exp_reasoning(
+        {{"chat_template_kwargs", {{"preserve_thinking", false}}}});
+    TEST_ASSERT(off.preserve_thinking == 0);
+    TEST_ASSERT(off.thinking_enabled && off.thinking_opt_in);
+    const ParsedRequest on = resolve_qwen4exp_reasoning(
+        {{"chat_template_kwargs", {{"preserve_thinking", true}}}});
+    TEST_ASSERT(on.preserve_thinking == 1);
+}
+
+// Qwen3.8-Flash-Next's template knows low, medium and xhigh (its default); Lucebox's high, x-high and max map to xhigh.
+TEST_CASE(ServerUnitFixture, test_qwen4exp_template_effort_mapping) {
+    TEST_ASSERT(qwen4exp_template_effort("") == "");
+    TEST_ASSERT(qwen4exp_template_effort("low") == "low");
+    TEST_ASSERT(qwen4exp_template_effort("medium") == "medium");
+    TEST_ASSERT(qwen4exp_template_effort("high") == "xhigh");
+    TEST_ASSERT(qwen4exp_template_effort("x-high") == "xhigh");
+    TEST_ASSERT(qwen4exp_template_effort("max") == "xhigh");
+}
+
+// The Jinja path hands the reasoning effort to the template only when one is set (templates default it themselves).
+TEST_CASE(ServerUnitFixture, test_jinja_render_passes_reasoning_effort) {
+    const std::string tmpl = "{% if reasoning_effort is defined %}{{ reasoning_effort }}{% else %}unset{% endif %}";
+    const std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    TEST_ASSERT(render_chat_template_jinja(tmpl, msgs, "", "", true, true, "", "low") == "low");
+    TEST_ASSERT(render_chat_template_jinja(tmpl, msgs, "", "", true, true, "") == "unset");
 }
 
 TEST_CASE(ServerUnitFixture, test_deepseek_reasoning_effort_aliases_and_budgets) {
@@ -5175,6 +5416,56 @@ TEST_CASE(ServerUnitFixture, test_qwen_snapshot_estimate_matches_saved_snapshot)
     ggml_backend_free(cpu);
 }
 
+// Qwen4Exp QSA indexer pooling: block b is the mean of the r consecutive token keys r*b .. r*b+r-1
+// (reference modeling_qwen4_exp.py: block_token_indices.view(n, ratio) then mean over the ratio axis).
+TEST_CASE(ServerUnitFixture, test_qwen4exp_profile_is_scoped) {
+    using namespace luce::common;
+    auto set = ggml_backend_cuda_set_qwen4exp_profile;
+    TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_DEFAULT) == GGML_CUDA_QWEN4EXP_OFF);
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    const bool supported = ggml_backend_cuda_qwen4exp_supported(cpu);
+    TEST_ASSERT(!supported);
+    {
+        Qwen4ExpCudaScope reference(true, true);
+        TEST_ASSERT(!reference.optimized);
+        TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_REFERENCE) == GGML_CUDA_QWEN4EXP_REFERENCE);
+        // An unsupported backend masks a nested profile, then restores it.
+        [&] { Qwen4ExpCudaScope generic(supported); TEST_ASSERT(!generic.optimized);
+              TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_OFF); }();
+        TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_REFERENCE) == GGML_CUDA_QWEN4EXP_REFERENCE);
+        bool isolated = false;
+        std::thread other([&] { isolated = set(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_OFF; });
+        other.join();
+        TEST_ASSERT(isolated);
+    }
+    [&] { Qwen4ExpCudaScope optimized(true); TEST_ASSERT(optimized.optimized);
+          TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_DEFAULT) == GGML_CUDA_QWEN4EXP_DEFAULT); }();
+    TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_DEFAULT);
+    ggml_backend_free(cpu);
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen4exp_pool_blocks_averages_consecutive_tokens) {
+    ggml_init_params ip{1 << 20, nullptr, false};
+    ggml_context * c = ggml_init(ip);
+    TEST_ASSERT(c != nullptr);
+    const int idim = 2, r = 4, nb = 3;
+    ggml_tensor * k = ggml_new_tensor_2d(c, GGML_TYPE_F32, idim, nb * r);
+    float * kd = (float *) k->data;
+    for (int t = 0; t < nb * r; ++t) {
+        for (int d = 0; d < idim; ++d) kd[t * idim + d] = 100.0f * d + (float) t;
+    }
+    ggml_tensor * pooled = qwen4exp_pool_blocks(c, k, r);
+    ggml_cgraph * gf = ggml_new_graph(c);
+    ggml_build_forward_expand(gf, pooled);
+    TEST_ASSERT(ggml_graph_compute_with_ctx(c, gf, 1) == GGML_STATUS_SUCCESS);
+    TEST_ASSERT(pooled->ne[0] == idim && pooled->ne[1] == nb && ggml_is_contiguous(pooled));
+    const float * pd = (const float *) pooled->data;
+    for (int b = 0; b < nb; ++b) {
+        for (int d = 0; d < idim; ++d) TEST_ASSERT(pd[b * idim + d] == 100.0f * d + (float) (r * b) + 1.5f);
+    }
+    ggml_free(c);
+}
+
 // The Qwen report adds up the live cache and each snapshot from the buffers
 // snapshot_target_cache() actually allocates.
 TEST_CASE(ServerUnitFixture, test_qwen_memory_report_matches_buffers) {
@@ -5313,6 +5604,82 @@ TEST_CASE(ServerUnitFixture, test_jinja_render_bad_tools_json_throws) {
         threw = true;
     }
     TEST_ASSERT(threw);
+}
+
+// Mirrors the official qwen4exp (Qwen3.8-Flash-Next) GGUF Jinja template's
+// think-replay snippet: earlier assistant turns either replay their recorded
+// reasoning_content inside <think>...</think>, or (preserve_thinking=false)
+// drop the think block entirely for turns at/before the last user query.
+static const char QWEN4EXP_THINK_REPLAY_TEMPLATE[] =
+    "{%- set ns = namespace(last_query_index = 0) -%}"
+    "{%- for message in messages -%}"
+    "{%- if message.role == 'user' -%}{%- set ns.last_query_index = loop.index0 -%}{%- endif -%}"
+    "{%- endfor -%}"
+    "{%- for message in messages -%}"
+    "{%- set content = message.content -%}"
+    "{%- if message.role == 'assistant' -%}"
+    "{%- set reasoning_content = '' -%}"
+    "{%- if message.reasoning_content is string -%}{%- set reasoning_content = message.reasoning_content -%}{%- endif -%}"
+    "{%- set reasoning_content = reasoning_content|trim -%}"
+    "{%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index -%}"
+    "{{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content + '<|im_end|>\\n' }}"
+    "{%- else -%}"
+    "{{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}"
+    "{%- endif -%}"
+    "{%- else -%}"
+    "{{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}"
+    "{%- endif -%}"
+    "{%- endfor -%}";
+
+// (a) An assistant history message with reasoning_content renders inside
+// <think>...</think> under the default (preserve_thinking left unset).
+TEST_CASE(ServerUnitFixture, test_jinja_render_reasoning_content_default_preserves_think) {
+    const std::vector<ChatMessage> msgs = {
+        {"user",      "Q1", "", ""},
+        {"assistant", "A1", "", "thinking about Q1"},
+        {"user",      "Q2", "", ""},
+    };
+    const std::string out = render_chat_template_jinja(
+        QWEN4EXP_THINK_REPLAY_TEMPLATE, msgs, "", "",
+        /*add_gen=*/false, /*think=*/true, "", "",
+        /*preserve_thinking=*/-1);
+    TEST_ASSERT(out.find(
+        "<|im_start|>assistant\n<think>\nthinking about Q1\n</think>\n\nA1<|im_end|>")
+        != std::string::npos);
+}
+
+// (b) With preserve_thinking=false the earlier assistant turn renders
+// without any <think> block.
+TEST_CASE(ServerUnitFixture, test_jinja_render_preserve_thinking_false_strips_think) {
+    const std::vector<ChatMessage> msgs = {
+        {"user",      "Q1", "", ""},
+        {"assistant", "A1", "", "thinking about Q1"},
+        {"user",      "Q2", "", ""},
+    };
+    const std::string out = render_chat_template_jinja(
+        QWEN4EXP_THINK_REPLAY_TEMPLATE, msgs, "", "",
+        /*add_gen=*/false, /*think=*/true, "", "",
+        /*preserve_thinking=*/0);
+    TEST_ASSERT(out.find("<|im_start|>assistant\nA1<|im_end|>") != std::string::npos);
+    TEST_ASSERT(out.find("<think>") == std::string::npos);
+}
+
+// (c) Without reasoning_content and under the default preserve setting, the
+// output is unchanged from today: an empty <think></think> block (neither of
+// the template's two official modes, but the pre-existing behavior — this is
+// a regression guard, not an endorsement).
+TEST_CASE(ServerUnitFixture, test_jinja_render_no_reasoning_content_regression) {
+    const std::vector<ChatMessage> msgs = {
+        {"user",      "Q1", "", ""},
+        {"assistant", "A1", "", ""},
+        {"user",      "Q2", "", ""},
+    };
+    const std::string out = render_chat_template_jinja(
+        QWEN4EXP_THINK_REPLAY_TEMPLATE, msgs, "", "",
+        /*add_gen=*/false, /*think=*/true, "", "",
+        /*preserve_thinking=*/-1);
+    TEST_ASSERT(out.find("<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>")
+        != std::string::npos);
 }
 
 TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
@@ -5463,6 +5830,31 @@ TEST_CASE(ServerUnitFixture, test_normalize_anthropic_tool_use_without_memory) {
             "</parameter>\n</function>\n</tool_call>\n"
             "<tool_call>\n<function=Grep>\n<parameter=n>\n3\n</parameter>\n"
             "<parameter=pattern>\nx\n</parameter>\n</function>\n</tool_call>");
+    }
+}
+
+// An assistant history message's prior <think> text must carry through to
+// ChatMessage.reasoning_content (OpenAI/DeepSeek dialect `reasoning_content`,
+// and the OpenRouter/Anthropic-gateway flat `reasoning` alias — the same
+// names the response side emits, see format_response_message). Non-assistant
+// roles and messages with neither field must leave it empty.
+TEST_CASE(ServerUnitFixture, test_normalize_assistant_reasoning_content_passthrough) {
+    ToolMemory tool_memory;
+    const json messages = json::array({
+        {{"role", "user"}, {"content", "hi"}},
+        {{"role", "assistant"}, {"content", "A1"}, {"reasoning_content", "thought one"}},
+        {{"role", "user"}, {"content", "and?"}, {"reasoning_content", "ignored on non-assistant"}},
+        {{"role", "assistant"}, {"content", "A2"}, {"reasoning", "thought two"}},
+        {{"role", "assistant"}, {"content", "A3"}},
+    });
+    const auto chat = normalize_chat_messages(
+        messages, ApiFormat::OPENAI_CHAT, tool_memory);
+    TEST_ASSERT(chat.size() == 5);
+    if (chat.size() == 5) {
+        TEST_ASSERT(chat[1].reasoning_content == "thought one");
+        TEST_ASSERT(chat[2].reasoning_content.empty());
+        TEST_ASSERT(chat[3].reasoning_content == "thought two");
+        TEST_ASSERT(chat[4].reasoning_content.empty());
     }
 }
 
@@ -7175,7 +7567,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_size) {
     // Bumped to 2 when the K-rotation default changed: a cache written by an
     // older binary stores K in the rotated basis, and the layout id does not
     // cover that, so the version is what rejects it.
-    TEST_ASSERT(DISK_CACHE_VERSION == 2);
+    TEST_ASSERT(DISK_CACHE_VERSION == 3);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
@@ -8364,6 +8756,43 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     // keys are NOT in the wholesale shape — they moved to budget_envelope.
     TEST_ASSERT(!body["model_card"].contains("think_max_tokens"));
     TEST_ASSERT(!body["model_card"].contains("hard_limit_reply_budget"));
+}
+
+TEST_CASE(ServerUnitFixture, test_props_model_card_exposes_sampling_no_thinking) {
+    // sampling_no_thinking rides along in the wholesale raw-sidecar re-emit
+    // next to the existing `sampling` block, so preflight tooling can
+    // assert the card actually carries distinct instruct-mode values.
+    json sidecar = {
+        {"name",        "Qwen3.8 Flash Next"},
+        {"source",      "https://huggingface.co/Qwen/Qwen3.8-Flash-Next"},
+        {"verified_at", "2026-10-01"},
+        {"max_tokens",  32768},
+        {"sampling", {
+            {"temperature", 1.0}, {"top_p", 0.95}, {"top_k", 20},
+            {"min_p", 0.0}, {"presence_penalty", 0.0}, {"repetition_penalty", 1.0},
+        }},
+        {"sampling_no_thinking", {
+            {"temperature", 0.7}, {"top_p", 0.80}, {"top_k", 20},
+            {"min_p", 0.0}, {"presence_penalty", 1.5}, {"repetition_penalty", 1.0},
+        }},
+    };
+    ServerConfig cfg = make_props_config_with_sidecar(sidecar);
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body["model_card"].contains("sampling"));
+    TEST_ASSERT(body["model_card"].contains("sampling_no_thinking"));
+    TEST_ASSERT(std::fabs(
+        body["model_card"]["sampling_no_thinking"]["temperature"].get<double>() - 0.7) < 1.0e-6);
+    TEST_ASSERT(std::fabs(
+        body["model_card"]["sampling_no_thinking"]["top_p"].get<double>() - 0.80) < 1.0e-6);
+    TEST_ASSERT(std::fabs(
+        body["model_card"]["sampling_no_thinking"]["presence_penalty"].get<double>() - 1.5) < 1.0e-6);
+    // Existing `sampling` (thinking-mode) field is untouched by the addition.
+    TEST_ASSERT(std::fabs(
+        body["model_card"]["sampling"]["temperature"].get<double>() - 1.0) < 1.0e-6);
 }
 
 TEST_CASE(ServerUnitFixture, test_props_model_card_null_on_family_fallback) {

@@ -8,6 +8,7 @@
 #include "fattn.cuh"
 #include "ds4-env.cuh"
 #include "ds4-causal.h"
+#include "qsa.cuh"
 
 #include <type_traits>
 
@@ -4005,7 +4006,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 
-    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING || amd_wmma_available(cc) || Q->ne[1] <= 32/ncols2) {
+    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING || (amd_wmma_available(cc) && !(GGML_CUDA_CC_IS_RDNA3(cc) && DKQ == 256 && DV == 256)) || Q->ne[1] <= 32/ncols2) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
@@ -4065,6 +4066,22 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
             return;
         } else {
             GGML_ABORT("fatal error");
+        }
+    }
+
+    // Qwen4Exp GQA=12 uses four heads per tile upstream, not a padded group of eight.
+    if (GGML_CUDA_CC_IS_RDNA3(cc) && DKQ == 256 && DV == 256 && use_gqa_opt) {
+        if (gqa_ratio % 8 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+            return;
+        }
+        if (gqa_ratio % 4 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+            return;
+        }
+        if (gqa_ratio % 2 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+            return;
         }
     }
 
@@ -4486,6 +4503,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // Use the WMMA kernel if possible:
+    // Match upstream's RDNA3.5 head-256 selection without altering RDNA4 paths.
+    int rdna3_gqa_eff = 1;
+    while (rdna3_gqa_eff < 8 && gqa_ratio % (2*rdna3_gqa_eff) == 0) rdna3_gqa_eff *= 2;
+    // Upstream parity mode (its K/V cache is padded to 256) or an explicit LUCE_FA256_MMA=1 opt-in
+    // (test_fattn_mma256); QSA callers keep their shipped path.
+    static const bool rdna3_fa256 = [] {
+        const char * mma = getenv("LUCE_FA256_MMA");
+        return mma && atoll(mma) != 0;
+    }();
+    if ((ggml_cuda_qwen4exp_reference() || rdna3_fa256) && GGML_CUDA_CC_IS_RDNA3_5(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256 &&
+        Q->ne[1] * rdna3_gqa_eff > 32) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
     // On RDNA4 the rocWMMA kernel is not qualified (fragment layouts do not
     // match the hand-rolled softmax reductions), so it is reachable only
     // through the env-gated head-256 block below.
@@ -4599,6 +4630,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_flash_attn_ext_qsa_decode_supported(ctx, dst)) {
+        ggml_cuda_flash_attn_ext_qsa_decode(ctx, dst);
+        return;
+    }
+    if (ggml_cuda_flash_attn_ext_qsa_supported(ctx, dst)) {
+        ggml_cuda_flash_attn_ext_qsa(ctx, dst);
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
     if (ggml_flash_attn_ext_is_ds4(dst)) {
 #if defined(GGML_USE_HIP)
         if (!ggml_cuda_ds4_flash_attn_d512_f32(ctx, dst)) {
@@ -4609,6 +4650,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         GGML_ABORT("DeepSeek4 D=512 flash attention is only available on HIP");
 #endif // defined(GGML_USE_HIP)
     }
+    // Only the QSA kernel honours selected-cell indices. The generic kernels
+    // below attend to every key; a maskless sparse op must not reach them.
+    // DeepSeek4 has its own maskless kernel and returns above.
+    GGML_ASSERT((dst->src[3] || !dst->src[5]) &&
+        "sparse flash attention without a mask needs the qsa kernel");
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

@@ -81,9 +81,6 @@ using cudaDeviceProp        = hipDeviceProp_t;
 #define cudaGetErrorName            hipGetErrorName
 #define cudaPeekAtLastError         hipPeekAtLastError
 
-// Launch bounds
-#define __launch_bounds__           __launch_bounds__
-
 // Stream capture status (added CUDA 10.0 — ROCm compat headers may omit this)
 #define cudaStreamCaptureStatus             hipStreamCaptureStatus
 #define cudaStreamCaptureStatusNone         hipStreamCaptureStatusNone

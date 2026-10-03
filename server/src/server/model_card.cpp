@@ -164,6 +164,27 @@ static void enforce_tier_invariants(EffortTiers & t,
 
 // ── Sidecar parsing ─────────────────────────────────────────────────────
 
+// Shared by the `sampling` (thinking-mode) and `sampling_no_thinking`
+// (instruct-mode) sidecar fields — same shape, same field list.
+static void parse_sampling_defaults(const json & s, SamplingDefaults & out) {
+    auto pick_f = [&](const char * k, float & v, bool & has) {
+        if (s.contains(k) && s[k].is_number()) {
+            v = s[k].get<float>(); has = true;
+        }
+    };
+    auto pick_i = [&](const char * k, int & v, bool & has) {
+        if (s.contains(k) && s[k].is_number_integer()) {
+            v = s[k].get<int>(); has = true;
+        }
+    };
+    pick_f("temperature",        out.temperature,        out.has_temperature);
+    pick_f("top_p",              out.top_p,              out.has_top_p);
+    pick_i("top_k",              out.top_k,              out.has_top_k);
+    pick_f("min_p",              out.min_p,              out.has_min_p);
+    pick_f("presence_penalty",   out.presence_penalty,   out.has_presence_penalty);
+    pick_f("repetition_penalty", out.repetition_penalty, out.has_repetition_penalty);
+}
+
 static bool load_sidecar(const std::string & path, ModelCard & out, std::string & err) {
     std::ifstream f(path);
     if (!f.is_open()) {
@@ -228,23 +249,13 @@ static bool load_sidecar(const std::string & path, ModelCard & out, std::string 
     }
 
     if (j.contains("sampling") && j["sampling"].is_object()) {
-        const auto & s = j["sampling"];
-        auto pick_f = [&](const char * k, float & v, bool & has) {
-            if (s.contains(k) && s[k].is_number()) {
-                v = s[k].get<float>(); has = true;
-            }
-        };
-        auto pick_i = [&](const char * k, int & v, bool & has) {
-            if (s.contains(k) && s[k].is_number_integer()) {
-                v = s[k].get<int>(); has = true;
-            }
-        };
-        pick_f("temperature",        out.sampling.temperature,        out.sampling.has_temperature);
-        pick_f("top_p",              out.sampling.top_p,              out.sampling.has_top_p);
-        pick_i("top_k",              out.sampling.top_k,              out.sampling.has_top_k);
-        pick_f("min_p",              out.sampling.min_p,              out.sampling.has_min_p);
-        pick_f("presence_penalty",   out.sampling.presence_penalty,   out.sampling.has_presence_penalty);
-        pick_f("repetition_penalty", out.sampling.repetition_penalty, out.sampling.has_repetition_penalty);
+        parse_sampling_defaults(j["sampling"], out.sampling);
+    }
+    if (j.contains("sampling_no_thinking") && j["sampling_no_thinking"].is_object()) {
+        // Instruct-mode sampler defaults, applied to requests whose final
+        // thinking state resolves to OFF. See model_card.h for the
+        // has_*-false-means-absent fallback contract.
+        parse_sampling_defaults(j["sampling_no_thinking"], out.sampling_no_thinking);
     }
 
     if (j.contains("reasoning_effort_tiers") && j["reasoning_effort_tiers"].is_object()) {
@@ -268,7 +279,8 @@ static bool family_fallback(const std::string & arch, ModelCard & out) {
     // Coarse safety net when no sidecar matches. Values are conservative
     // and intentionally not aspirational — operators are expected to ship
     // a sidecar for production models. See spec §3.1.
-    if (arch == "qwen35" || arch == "qwen36" || arch == "qwen3") {
+    if (arch == "qwen35" || arch == "qwen36" || arch == "qwen3" ||
+        arch == "qwen4exp") {
         out.max_tokens                 = 32768;
         out.complex_problem_max_tokens = 0;
         // Qwen3.x is verbose post-`</think>` — restates derivation in the

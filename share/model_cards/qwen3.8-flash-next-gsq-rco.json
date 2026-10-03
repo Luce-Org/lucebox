@@ -1,0 +1,26 @@
+{
+  "name": "Qwen3.8-Flash-Next GSQ-RCO",
+  "source": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next",
+  "verified_at": "2026-10-01",
+  "max_tokens": 32768,
+  "complex_problem_max_tokens": 81920,
+  "hard_limit_reply_budget": 8192,
+  "thinking_terminator_hint": "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n",
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0
+  },
+  "sampling_no_thinking": {
+    "temperature": 0.7,
+    "top_p": 0.80,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "repetition_penalty": 1.0
+  },
+  "notes": "Same as qwen3.8-flash-next.json; the ISTA-DASLab GSQ-RCO GGUF reports general.name 'Qwen3.8-Flash-Next GSQ-RCO'."
+}

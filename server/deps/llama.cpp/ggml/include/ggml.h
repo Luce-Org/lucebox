@@ -433,7 +433,8 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_TQ3_0   = 42,  // TurboQuant 3.5 bpv (3-bit Lloyd-Max + FWHT rotation)
+        GGML_TYPE_Q2_0    = 42,  // 2-bit (QK=64): {d} + 2-bit quads, values {-1,0,1,2}*d
+        GGML_TYPE_TQ3_0   = 43,  // TurboQuant 3.5 bpv (3-bit Lloyd-Max + FWHT rotation)
         GGML_TYPE_Q4_0_ROCMFP4      = 100,
         GGML_TYPE_Q4_0_ROCMFP4_FAST = 101,
         GGML_TYPE_Q6_0_ROCMFPX      = 102,
@@ -480,6 +481,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4          = 100,
         GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN     = 101,
         GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT = 102,
@@ -626,6 +628,11 @@ extern "C" {
         GGML_OP_SOFT_MAX_VISION_F32, // inference-only HIP source-order DS4V softmax
         GGML_OP_MUL_MAT_VISION_AV_F32, // inference-only HIP source-layout DS4V AV
         GGML_OP_DS4_MOE_COMBINE,
+
+        GGML_OP_HC_COMBINE_NORM,  // Fused hyper-connection combine + next stream rms-norm
+        GGML_OP_GATED_RMS_NORM_F16, // rms_norm(x) * gamma * sigmoid(z) -> F16 (qwen4exp GDN tail)
+
+        GGML_OP_QSA_DECODE_IDS, // Sort selected blocks and expand visible QSA cells
 
         GGML_OP_COUNT,
     };
@@ -2482,6 +2489,12 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_prec       prec);
 
+    // Upper bound on the number of finite entries in every mask row (used by
+    // the selected-attention kernel to size its shared-memory reduction).
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
+
     // DS4 layout and block-sparse policy for flash_attn_ext. raw_window is the
     // maximum visible span inside the raw-row region. Compressed rows are
     // selected in fixed-size blocks, capped to keep_rows. Zero leaves the
@@ -2914,6 +2927,17 @@ extern "C" {
             int                   kv_start,
             int                   ratio);
 
+    // Sort each row of already-selected block ids ascending (does not select or change top-k ties).
+    // blocks: I32 [budget,T], 1 <= budget <= 1024, contiguous dim 0; positions: contiguous I32 [T].
+    // Block ids and positions must be nonnegative. ratio >= 2. Returns I32 [budget*ratio+ratio-1,T].
+    // A block b emits ratio*b+i iff ratio*b+ratio-1 <= position, otherwise -1.
+    // The last ratio-1 slots emit br+i iff <= position, where br = ((position+1)/ratio)*ratio.
+    GGML_API struct ggml_tensor * ggml_qsa_decode_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * positions,
+            int                   ratio);
+
     // Preserve the raw rows of base_mask and retain only selected compressed
     // rows. selected is I32 [top_k,n_tokens], indexing the compressed span;
     // base_mask is F32 [raw_rows+n_comp,n_tokens].
@@ -2930,6 +2954,46 @@ extern "C" {
             struct ggml_tensor  * down_e,
             struct ggml_tensor  * weights,
             struct ggml_tensor  * shared_out);
+
+    // Fused hyper-connection combine (residual + repeat(block)*w) and the
+    // following stream rms-norm with gamma. Packed result [n_embd, hc, tokens, 2]:
+    // channel 0 is the new residual, channel 1 the normalized stream.
+    GGML_API struct ggml_tensor * ggml_hc_combine_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * inject,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * block_out,
+            struct ggml_tensor  * gamma,
+            float                 s1, float b1, float s2, float b2, float eps);
+
+    // HC_COMBINE_NORM whose block output is the MoE combine, computed in the same kernel:
+    // block_out = sum_e down[:,e]*weights[e] + shared*sigmoid(shared_logit). down [n_embd, n_used, T],
+    // weights [n_used, T], shared [n_embd, T], shared_logit [1, T]. Same packed result as ggml_hc_combine_norm.
+    GGML_API struct ggml_tensor * ggml_hc_combine_norm_moe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * inject,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * shared,
+            struct ggml_tensor  * shared_logit,
+            struct ggml_tensor  * gamma,
+            float                 s1, float b1, float s2, float b2, float eps);
+
+    // rms_norm(x) * gamma * sigmoid(z) per row of x->ne[0], written as F16 [x->ne[0]*x->ne[1], x->ne[2]].
+    // x is [ncols, heads, tokens]; gamma has ncols or ncols*heads elements; z is [ncols*heads, tokens].
+    GGML_API struct ggml_tensor * ggml_gated_rms_norm_f16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * z,
+            float                 eps);
+
+    // sigmoid(z) * x -> F16 (gamma == NULL form of ggml_gated_rms_norm_f16); z may be a strided [ncols, heads, tokens] view.
+    GGML_API struct ggml_tensor * ggml_gated_f16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * z);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

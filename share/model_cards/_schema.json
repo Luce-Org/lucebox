@@ -65,6 +65,19 @@
         "repetition_penalty": { "type": "number" }
       }
     },
+    "sampling_no_thinking": {
+      "type": "object",
+      "description": "Optional. Same shape as `sampling`, but applied instead of it when a request's final thinking state resolves to OFF (e.g. chat_template_kwargs.enable_thinking=false, reasoning.effort=\"none\", thinking.type=\"disabled\"). Some model cards (e.g. Qwen3.8-Flash-Next) document distinct thinking vs. instruct sampling recipes. Only fields present here override the `sampling` defaults for no-thinking requests; an omitted field keeps falling back to `sampling`. If this block is absent entirely, no-thinking requests use `sampling` exactly as before.",
+      "additionalProperties": false,
+      "properties": {
+        "temperature":        { "type": "number" },
+        "top_p":              { "type": "number" },
+        "top_k":              { "type": "integer" },
+        "min_p":              { "type": "number" },
+        "presence_penalty":   { "type": "number" },
+        "repetition_penalty": { "type": "number" }
+      }
+    },
     "reasoning_effort_tiers": {
       "type": "object",
       "description": "Optional. Explicit per-tier phase-1 budgets. Overrides any computed default. Use when ratio-based defaults don't fit the model.",
