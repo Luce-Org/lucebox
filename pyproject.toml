@@ -23,7 +23,7 @@ line-length = 100
 # server-internal and optimization Python (server/scripts, optimizations/*)
 # carries pre-existing style debt and is added to `include` as it is cleaned
 # up. Vendored deps stay excluded permanently (extend-exclude below).
-include = ["harness/**/*.py", "scripts/**/*.py"]
+include = ["harness/**/*.py", "scripts/**/*.py", "conftest.py", "server/test/python/**/*.py"]
 extend-exclude = [
     "server/deps",
     "megakernel",
@@ -35,6 +35,17 @@ extend-exclude = [
 # E7xx) is intentionally staged out for now so the gate stays green without
 # reflowing existing code; tighten once the tracked surfaces are clean.
 select = ["F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+# Repo root on sys.path so tests can import harness/, server/ helpers.
+pythonpath = ["."]
+testpaths = ["server/test/python", "harness", ".github/ci"]
+addopts = "-ra --strict-markers"
+markers = [
+    "server: needs a running luce_server (use --base-url URL or --launch MODEL)",
+    "model: needs local GGUF model files or built test binaries",
+    "slow: long-running test",
+]
 
 [tool.uv]
 package = false

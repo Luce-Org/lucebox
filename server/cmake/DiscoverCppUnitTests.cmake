@@ -14,6 +14,11 @@ if(NOT DEFINED TEST_PREFIX)
     set(TEST_PREFIX "")
 endif()
 
+# TEST_LABELS: optional ;-separated ctest labels set on every discovered case.
+if(NOT DEFINED TEST_LABELS)
+    set(TEST_LABELS "")
+endif()
+
 execute_process(
     COMMAND "${TEST_EXECUTABLE}" --discover_tests --adapter_info
     WORKING_DIRECTORY "${TEST_WORKING_DIR}"
@@ -62,7 +67,7 @@ if(_discover_output)
 
         file(APPEND "${CTEST_FILE}"
             "add_test([==[${_ctest_name}]==] [==[${TEST_EXECUTABLE}]==] --exact [==[${_test_keyword}]==])\n"
-            "set_tests_properties([==[${_ctest_name}]==] PROPERTIES WORKING_DIRECTORY [==[${TEST_WORKING_DIR}]==] SKIP_RETURN_CODE 77)\n")
+            "set_tests_properties([==[${_ctest_name}]==] PROPERTIES WORKING_DIRECTORY [==[${TEST_WORKING_DIR}]==] SKIP_RETURN_CODE 77 LABELS [==[${TEST_LABELS}]==])\n")
         list(APPEND _discovered_ctest_names "${_ctest_name}")
     endforeach()
 endif()

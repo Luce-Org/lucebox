@@ -145,12 +145,12 @@ Env: `LUCE_KVFLASH_POLICY=qk`. Bench: `test_kvflash --qkbench`.
 - `server/src/common/kvflash_pager.h` — pool, page table, host store, reselect
 - `server/src/common/kvflash_scorer.h` — chunk-relevance policy interface
 - `server/src/common/kvflash_qk.h` — target-QK scorer: pure scoring math
-  (unit-tested in `server/test/test_kvflash_qk.cpp`), seal-time key pooling,
+  (unit-tested in `server/test/unit/test_kvflash_qk.cpp`), seal-time key pooling,
   `KvFlashTargetQkScorer`
 - `server/src/qwen3/qwen3_kvflash_scorer.{h,cpp}` — pflash-drafter scorer
   (tail attention; bisects on allocation pressure)
 - `server/src/qwen35/*` — cache `ctx_alloc`, masked pooled decode, slot-mapped
   spec verify, daemon flags
-- `server/test/test_kvflash.cpp` — verification suite (A-F), `--niah`,
+- `server/test/unit/test_kvflash.cpp` — verification suite (A-F), `--niah`,
   `--niah256`, `--longab`
 - [DESIGN.md](DESIGN.md) — mechanism details and tuning notes

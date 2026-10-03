@@ -4,7 +4,7 @@
 // Each shard gets its own CUDA backend, partial weights, and KV cache.
 // Activations are transferred between shards at shard boundaries.
 //
-// NOTE: The full implementation currently lives in test/test_dflash.cpp
+// NOTE: The full implementation currently lives in test/unit/test_dflash.cpp
 // (run_target_layer_split_daemon) because it depends on many helpers and
 // globals defined there. This header defines the DevicePlacement-based
 // args struct as the migration target. The implementation will move here

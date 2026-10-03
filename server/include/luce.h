@@ -2,7 +2,7 @@
 // Qwen3.5-27B with the z-lab/Qwen3.5-27B-DFlash draft model on a single RTX 3090.
 //
 // Model constants (hardcoded for this pair) + the last-error helper.
-// The real driver is test/test_dflash.cpp. A clean public API with chat /
+// The real driver is test/unit/test_dflash.cpp. A clean public API with chat /
 // streaming / KV persistence is a planned follow-up.
 
 #ifndef LUCE_H
