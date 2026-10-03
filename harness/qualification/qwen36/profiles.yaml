@@ -1,0 +1,65 @@
+schema_version: 2
+
+families:
+  qwen-dense:
+    recipes:
+      qwen36-27b-q4-ar-c4:
+        modality: text
+        decode_mode: autoregressive
+        feature_set: ar
+        server_arguments: []
+        paged_attention: true
+        max_concurrency: 4
+        quant: Q4_K_M
+        target_artifact: Qwen3.6-27B-Q4_K_M.gguf
+        target_sha256: 5ed60d0af4650a854b1755bd392f9aef4872643dc25a254bc68043fa638392a0
+        qualification:
+          runner: qwen36_amd
+          server_port: 8080
+          max_context: 4096
+          prefix_cache_slots: 0
+          smoke:
+            prompts: harness/benchmarks/prompts/generation_smoke.jsonl
+            workloads:
+              - {name: paged-ar-c1, concurrency: 1, maximum_tokens: 64, warmups: 1, repetitions: 2}
+              - {name: paged-ar-c4, concurrency: 4, maximum_tokens: 64, warmups: 1, repetitions: 2, require_identical: true}
+          quality:
+            prompts: harness/benchmarks/prompts/bench_gsm.jsonl
+            maximum_tokens: 512
+            minimum_gold_accuracy: 0.60
+          performance:
+            prompts: harness/qualification/qwen36/prompts/performance.jsonl
+            workloads:
+              - {name: performance-c1, concurrency: 1, maximum_tokens: 32, warmups: 5, repetitions: 20}
+              - {name: performance-c4, concurrency: 4, maximum_tokens: 32, warmups: 5, repetitions: 20}
+          drift:
+            monitor_interval_seconds: 15
+            minimum_samples: 8
+            steady_window_samples: 2
+            maximum_rss_growth_mib: 512
+            maximum_health_latency_growth_fraction: 0.50
+
+profiles:
+  qwen36-27b-q4-r9700-ar-c4:
+    family: qwen-dense
+    recipe: qwen36-27b-q4-ar-c4
+    runner: lucebox3
+    status: active
+    topology: single-device
+    devices:
+      - {role: target, name: Radeon AI PRO R9700, arch: gfx1201}
+    visible_device: "0"
+    required_telemetry: amd
+    power_profile: platform-managed
+
+  qwen36-27b-q4-strix-halo-ar-c4:
+    family: qwen-dense
+    recipe: qwen36-27b-q4-ar-c4
+    runner: lucebox3
+    status: active
+    topology: single-device
+    devices:
+      - {role: target, name: Strix Halo Radeon 8060S, arch: gfx1151}
+    visible_device: "1"
+    required_telemetry: amd
+    power_profile: platform-managed
