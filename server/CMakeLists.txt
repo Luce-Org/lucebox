@@ -1310,6 +1310,12 @@ if(LUCE_TESTS)
     target_include_directories(test_qwen35_tensor_parallel PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
     target_link_libraries(test_qwen35_tensor_parallel PRIVATE luce_common)
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_ds41_q8_mmvq.cpp")
+        # Benchmark, not a test: DS4.1 dense Q8_0 projections through the ggml
+        # mul_mat dispatch at 1-4 columns, with the column-identity check.
+        add_executable(bench_ds41_q8_mmvq test/bench/bench_ds41_q8_mmvq.cpp)
+        target_link_libraries(bench_ds41_q8_mmvq PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
+    endif()
     add_executable(test_rope_tail test/unit/test_rope_tail.cpp)
     target_compile_definitions(test_rope_tail PRIVATE LUCE_ROPE_TEST_GPU=1)
     target_link_libraries(test_rope_tail PRIVATE ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
