@@ -3011,6 +3011,13 @@ static bool ds4_fa_is_gfx1151(const int cc) {
     return cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
 }
 
+// Devices that run the matrix-core D512 kernels when their switches are on:
+// Strix Halo, and RDNA4 (gfx12 WMMA through the same mma tiles). Only the
+// kernel choice widens; the gfx1151 defaults and decode schedule do not.
+static bool ds4_fa_wmma_device(const int cc) {
+    return ds4_fa_is_gfx1151(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
+}
+
 static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst) {
     if (!ggml_flash_attn_ext_is_ds4(dst)) {
         return false;
@@ -3276,7 +3283,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
         causal_ratio >= 64 && kv_f16 && K->data == V->data &&
         n_heads % 32 == 0 && n_tokens >= 64 &&
         device_info.warp_size == 32 &&
-        ds4_fa_is_gfx1151(device_info.cc);
+        ds4_fa_wmma_device(device_info.cc);
     const bool sparse = sparse_requested && !bypass_sparse_selector;
 
     // Maskless indexed attention (ratio4_causal): the compressed frontier's
@@ -3539,7 +3546,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
              (mask && mask->type == GGML_TYPE_F16)) &&
             K->data == V->data && n_heads % 32 == 0 &&
             device_info.warp_size == 32 && n_tokens >= 64 &&
-            ds4_fa_is_gfx1151(device_info.cc)) {
+            ds4_fa_wmma_device(device_info.cc)) {
             constexpr int wmma_heads = 16;
             constexpr int head_groups = 2;
             const dim3 wmma_grid(
@@ -3668,7 +3675,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
             // =0 is the kill switch back to the scalar streaming kernel.
             const bool use_wmma = kv_f16 &&
                 ds4_env_flag_enabled("GGML_CUDA_MLA_STREAM_WMMA") &&
-                ds4_fa_is_gfx1151(device_info.cc);
+                ds4_fa_wmma_device(device_info.cc);
             if (use_wmma) {
                 constexpr int wmma_heads = 16;
                 const char * head_groups_env =

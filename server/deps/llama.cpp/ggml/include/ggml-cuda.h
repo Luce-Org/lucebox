@@ -109,6 +109,21 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_paged_attn_wmma256_launch_count(vo
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 
+// Peer copy on the source device's side stream: the source's compute stream
+// keeps running while the copy is in flight; the destination waits for it.
+// Returns false when it does not apply (the caller copies the usual way).
+GGML_BACKEND_API bool ggml_backend_cuda_copy_tensor_async_side(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const struct ggml_tensor * src, struct ggml_tensor * dst);
+// Order the backend's compute stream after its side-stream copies so far.
+GGML_BACKEND_API void ggml_backend_cuda_join_side_copies(ggml_backend_t backend);
+// Peer copy on the source's compute stream without a destination wait:
+// record an event on the source after it and wait on it where the data is
+// needed. Returns false when it does not apply.
+GGML_BACKEND_API bool ggml_backend_cuda_copy_tensor_async_nowait(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const struct ggml_tensor * src, struct ggml_tensor * dst);
+
 // conduct allreduce operation between devices
 GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
 

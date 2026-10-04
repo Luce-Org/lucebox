@@ -251,23 +251,52 @@ bool DeepSeek4EngramRuntime::prepare(DeepSeek4EngramTokens & ctx, const int32_t 
     for (size_t t = 0; t < count; ++t) ctx.put(first_pos + (int) t, tokens[t]);
 
     // Split the rows per layer and start every read before waiting on any.
-    std::vector<std::vector<uint32_t>> layer_ids((size_t) n_layers, std::vector<uint32_t>(count * cols));
+    std::vector<std::vector<uint32_t>> layer_ids((size_t) n_layers);
     for (int l = 0; l < n_layers; ++l) {
-        for (size_t t = 0; t < count; ++t) {
-            std::memcpy(&layer_ids[(size_t) l][t * cols], &ids[(t * (size_t) n_layers + (size_t) l) * cols],
-                        cols * sizeof(uint32_t));
-        }
+        split_layer_ids(ids, count, l, layer_ids[(size_t) l]);
         tables_[(size_t) l].prefetch(layer_ids[(size_t) l].data(), count * cols);
     }
     for (int l = 0; l < n_layers; ++l) {
-        float * dst = keys + (size_t) l * count * key_floats();
-        if (!tables_[(size_t) l].read(layer_ids[(size_t) l].data(), count * cols, dst, threads_)) {
-            if (err) *err = std::string("engram: table read failed for layer ") +
-                            std::to_string(hasher_.layer_id(l)) + ": " + std::strerror(errno);
+        if (!read_layer_rows(l, layer_ids[(size_t) l], keys + (size_t) l * count * key_floats(), err)) {
             return false;
         }
-        rows_read_.fetch_add(count * cols, std::memory_order_relaxed);
     }
+    return true;
+}
+
+bool DeepSeek4EngramRuntime::read_layer(const DeepSeek4EngramTokens & ctx, const int32_t * tokens,
+                                        int first_pos, size_t count, int layer, float * keys,
+                                        std::string * err) const {
+    if (layer < 0 || layer >= hasher_.n_layers()) {
+        if (err) *err = "engram: no such Engram layer";
+        return false;
+    }
+    std::vector<uint32_t> ids, layer_ids;
+    if (!row_ids(ctx, tokens, first_pos, count, ids, err)) return false;
+    split_layer_ids(ids, count, layer, layer_ids);
+    tables_[(size_t) layer].prefetch(layer_ids.data(), layer_ids.size());
+    return read_layer_rows(layer, layer_ids, keys, err);
+}
+
+// The row ids of Engram layer index `layer` out of row_ids()' [count][n_layers][cols].
+void DeepSeek4EngramRuntime::split_layer_ids(const std::vector<uint32_t> & ids, size_t count, int layer,
+                                             std::vector<uint32_t> & out) const {
+    const size_t cols = (size_t) hasher_.cols();
+    const size_t n_layers = (size_t) hasher_.n_layers();
+    out.resize(count * cols);
+    for (size_t t = 0; t < count; ++t) {
+        std::memcpy(&out[t * cols], &ids[(t * n_layers + (size_t) layer) * cols], cols * sizeof(uint32_t));
+    }
+}
+
+bool DeepSeek4EngramRuntime::read_layer_rows(int layer, const std::vector<uint32_t> & layer_ids,
+                                             float * dst, std::string * err) const {
+    if (!tables_[(size_t) layer].read(layer_ids.data(), layer_ids.size(), dst, threads_)) {
+        if (err) *err = std::string("engram: table read failed for layer ") +
+                        std::to_string(hasher_.layer_id(layer)) + ": " + std::strerror(errno);
+        return false;
+    }
+    rows_read_.fetch_add(layer_ids.size(), std::memory_order_relaxed);
     return true;
 }
 

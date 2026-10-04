@@ -1809,12 +1809,13 @@ bool DeepSeek4Backend::load_routing_adjustments() {
 // the router bias delta and the protected mask on the device.
 bool DeepSeek4Backend::upload_protected_routing() {
     if (w_.protected_experts.empty() || w_.router_bias_delta.empty()) return true;
-    const ggml_init_params params{2 * (size_t) w_.n_layer * ggml_tensor_overhead(), nullptr, true};
+    const ggml_init_params params{3 * (size_t) w_.n_layer * ggml_tensor_overhead(), nullptr, true};
     w_.routing_ctx = ggml_init(params);
     if (!w_.routing_ctx) return false;
     for (DeepSeek4Layer & L : w_.layers) {
         L.native_selection_bias = ggml_new_tensor_1d(w_.routing_ctx, GGML_TYPE_F32, w_.n_expert);
         L.protected_mask = ggml_new_tensor_1d(w_.routing_ctx, GGML_TYPE_I32, w_.n_expert);
+        L.router_bias_delta_dev = ggml_new_tensor_1d(w_.routing_ctx, GGML_TYPE_F32, w_.n_expert);
     }
     w_.routing_buf = ggml_backend_alloc_ctx_tensors(w_.routing_ctx, backend_);
     if (!w_.routing_buf) {
@@ -1833,6 +1834,8 @@ bool DeepSeek4Backend::upload_protected_routing() {
         }
         ggml_backend_tensor_set(L.native_selection_bias, bias.data(), 0, sizeof(float) * bias.size());
         ggml_backend_tensor_set(L.protected_mask, mask.data(), 0, sizeof(int32_t) * mask.size());
+        ggml_backend_tensor_set(L.router_bias_delta_dev, w_.router_bias_delta.data() + row, 0,
+                                sizeof(float) * (size_t) w_.n_expert);
     }
     return true;
 }
@@ -3920,6 +3923,60 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
 
     bool snapshot_saved = false;
     bool late_context_chunk_logged = false;
+    // Decoder SWA bounded replay (LUCE_DS41_DECODER_BOUNDED_REPLAY=1). The
+    // layers after the last kv source read the encoder only through that
+    // source's compressed rows plus a raw window of their own, so every
+    // prompt row runs the layers up to that source and only the final n_swa
+    // rows run the rest, their raw window floored at the first replay row.
+    // Not exact: V4.1 is trained to tolerate it (tech report, sec. 3.2.2).
+    // Prompts that save a snapshot before their end keep the exact path.
+    static const bool replay_requested =
+        env_flag_enabled("LUCE_DS41_DECODER_BOUNDED_REPLAY");
+    int replay_cut = -1;  // the last layer every prompt row runs
+    if (replay_requested) {
+        for (int il = 0; il < w_.n_layer; ++il) {
+            // The cut is the deepest layer any layer reads its compressed KV
+            // from (V4.1: 20); the per-layer source flags may be unset.
+            replay_cut = std::max(replay_cut, deepseek4_kv_source_layer(w_, il));
+        }
+        for (int il = replay_cut + 1; replay_cut >= 0 && il < w_.n_layer; ++il) {
+            // Index sources after the cut (V4.1: 24-36) are fine: the cut layer
+            // publishes every row; only an Engram layer past it disables replay.
+            if (w_.layers[(size_t) il].engram_q) {
+                replay_cut = -1;
+            }
+        }
+    }
+    const int replay_from = n_total - w_.n_swa;  // prompt index of the first replay row
+    if (replay_requested) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "[deepseek4] decoder bounded replay requested: cut=%d n_swa=%d n_layer=%d\n",
+                         replay_cut, w_.n_swa, w_.n_layer);
+        }
+    }
+    const bool replay =
+        replay_cut >= 0 && replay_cut + 1 < w_.n_layer &&
+        layer_range_hybrid && !images &&
+        cache_.prefill_mode == PrefillAttentionMode::Dense &&
+        replay_from >= DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS &&
+        !(save_snapshot && snap_pos < kv_offset + n_total);
+    DeepSeek4LayerMajorTail replay_tail;
+    struct ReplayFloorReset {
+        DeepSeek4Cache * cache = nullptr;
+        ~ReplayFloorReset() {
+            if (cache) for (DeepSeek4LayerCache & lc : cache->layers) lc.swa_floor = 0;
+        }
+    } replay_floor_reset;
+    if (replay) {
+        replay_floor_reset.cache = &cache_;
+        std::fprintf(stderr,
+                     "[deepseek4] decoder bounded replay: %d rows through layers 0-%d, "
+                     "last %d through all %d (floor=%d)\n",
+                     replay_from, replay_cut, n_total - replay_from, w_.n_layer,
+                     kv_offset + replay_from);
+    }
     // The size of the chunk at prompt offset i (position pos): the scratch
     // bound, then every boundary a snapshot, a restore or a DSpark capture
     // needs.
@@ -3933,7 +3990,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         // there and a full 256-expert duplicate stack makes that tail far more
         // expensive than slightly rebalancing the preceding chunk.
         const int tail_tokens = n_total - (i + n_tok);
-        if (moe_hybrid_ && capture_spec &&
+        if (moe_hybrid_ && capture_spec && !replay &&
             tail_tokens > 0 && tail_tokens < 512 &&
             n_tok >= 1024 - tail_tokens) {
             n_tok -= 512 - tail_tokens;
@@ -3948,6 +4005,10 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         // every position a later request may restore from, so the chunks after
         // a restore are exactly the ones a cold prefill of the prompt runs.
         n_tok = restore_safe_prefill_tokens(pos, n_tok, restore_points);
+        // The replay rows start a chunk of their own.
+        if (replay && i < replay_from && i + n_tok > replay_from) {
+            n_tok = replay_from - i;
+        }
         if (capture_spec) {
             const bool batch_final_capture =
                 supports_batched_spec_feature_capture(
@@ -3957,6 +4018,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 save_snapshot && !snapshot_saved,
                 spec_snap_from, spec_snap_to);
         }
+        // The replay rows run as one batch: a split could leave a piece too
+        // small for the batched attention that models the floor.
+        if (replay && i >= replay_from) n_tok = n_total - i;
 
         return n_tok;
     };
@@ -3971,7 +4035,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         const bool capture = capture_spec &&
             (i + n_tok > spec_final_from ||
              (!snapshot_saved && i < spec_snap_to && i + n_tok > spec_snap_from));
-        return n_tok > 4 && i + n_tok < n_total && !at_snap && !capture;
+        return n_tok >= DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS && i + n_tok < n_total && !at_snap && !capture;
     };
     for (int i = 0; i < n_total;) {
         if (io.is_cancelled()) return pos;
@@ -3986,16 +4050,40 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 bands.push_back(n);
                 span += n;
             }
-            if (bands.size() >= 2) {
-                std::vector<float> embed((size_t) w_.n_embd * (size_t) span);
-                if (!w_.embedder.embed(tokens.data() + i, span, embed.data())) return -1;
+            // The replay rows ride along as the pass's last band for layers
+            // [0, cut]; the chunk below then runs only the layers past it.
+            const bool with_tail = replay && !bands.empty() &&
+                i + span == replay_from && n_total - replay_from >= DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS;
+            const int tail_rows = with_tail ? n_total - replay_from : 0;
+            // The tail joins the last band when it fits (one weight read per
+            // layer for both), else it is a band of its own.
+            const bool tail_merged = with_tail &&
+                bands.back() + tail_rows <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
+            if (tail_merged) bands.back() += tail_rows;
+            else if (with_tail) bands.push_back(tail_rows);
+            if (bands.size() >= 2 || (replay && !bands.empty())) {
+                const int pass_rows = span + tail_rows;
+                std::vector<float> embed((size_t) w_.n_embd * (size_t) pass_rows);
+                if (!w_.embedder.embed(tokens.data() + i, pass_rows, embed.data())) return -1;
                 DeepSeek4StepTelemetry step_tel;
+                replay_tail = DeepSeek4LayerMajorTail{};
+                replay_tail.rows = tail_rows;
                 if (!deepseek4_prefill_layer_major(
                         backend_, cfg_.device.gpu, w_, cache_, embed.data(), tokens.data() + i, pos,
                         bands, timing ? &step_tel : nullptr, moe_hybrid_.get(),
-                        expert_runtime_.compute ? &expert_runtime_ : nullptr, routing_stats_.get())) {
+                        expert_runtime_.compute ? &expert_runtime_ : nullptr, routing_stats_.get(),
+                        replay ? replay_cut + 1 : -1, with_tail ? &replay_tail : nullptr)) {
                     std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
                     return -1;
+                }
+                if (with_tail) {
+                    // The tail's rows have run layers [0, cut]; the chunk
+                    // below runs the rest from their residual.
+                    if (tail_merged) bands.back() -= tail_rows;
+                    else bands.pop_back();
+                    cache_.cur_pos = pos + span;
+                    std::fprintf(stderr, "[deepseek4] replay single pass: %d tail rows %s the last band\n",
+                                 tail_rows, tail_merged ? "merged into" : "after");
                 }
                 std::fprintf(stderr, "[deepseek4] layer-major prefill: %d tokens in %zu bands at pos=%d\n",
                              span, bands.size(), pos);
@@ -4110,11 +4198,23 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         static const bool affine_capture_enabled =
             env_flag_enabled("LUCE_CUDA_MMQ_FP2_AFFINE_CAPTURE");
         affine_mmq_scope.set_enabled(hp == nullptr || affine_capture_enabled);
+        const bool replay_chunk = replay && i >= replay_from;
+        for (int il = replay_cut + 1; replay_chunk && il < w_.n_layer; ++il) {
+            cache_.layers[(size_t) il].swa_floor = kv_offset + replay_from;
+        }
+        const bool tail_chunk = replay_chunk && replay_tail.rows == n_tok && i == replay_from;
+        DeepSeek4LayerMajorBand tail_band;
+        if (tail_chunk) {
+            tail_band.staggered_pre = &replay_tail.pre;
+            tail_band.selection_first = replay_tail.selection_first;
+            tail_band.selection_columns = replay_tail.selection_columns;
+            cache_.layer_major_band = &tail_band;
+        }
         if (layer_range_hybrid) {
             ok = deepseek4_step_layer_range(
                 backend_, cfg_.device.gpu, w_, cache_, hc_state,
-                embed.data(), n_tok, pos,
-                0, w_.n_layer, need_logits ? &logits : nullptr,
+                tail_chunk ? replay_tail.residual.data() : embed.data(), n_tok, pos,
+                tail_chunk ? replay_cut + 1 : 0, w_.n_layer, need_logits ? &logits : nullptr,
                 tokens.data() + i,
                 timing ? &step_tel : nullptr,
                 /*allow_decode_graph_reuse=*/true, hp,
@@ -4141,6 +4241,11 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                             /*moe_hybrid=*/nullptr, /*expert_runtime=*/nullptr,
                                             /*routing_stats=*/nullptr,
                                             images ? images->spans() : vision::ImageSpanView{});
+        }
+        cache_.layer_major_band = nullptr;
+        if (tail_chunk) replay_tail = DeepSeek4LayerMajorTail{};
+        for (int il = replay_cut + 1; replay_chunk && il < w_.n_layer; ++il) {
+            cache_.layers[(size_t) il].swa_floor = 0;
         }
         if (ok && hp && !spec_cap.empty()) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
@@ -4450,16 +4555,65 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     // snapshot. An exact full-prompt hit can decode immediately from the
     // logits and speculative feature window saved with the cache state.
     int committed = kv_offset;
-    if (kv_offset == 0) {
-        committed = do_prefill(req.prompt, out_io, 0,
-                               req.snap_slot, req.snap_pos, images,
-                               /*prefix_tokens=*/0, req.restore_points);
-    } else if (kv_offset < (int) req.prompt.size()) {
-        std::vector<int32_t> suffix(req.prompt.begin() + kv_offset,
-                                    req.prompt.end());
-        committed = do_prefill(suffix, out_io, kv_offset,
-                               req.snap_slot, req.snap_pos, nullptr,
-                               /*prefix_tokens=*/0, req.restore_points);
+    // With decoder SWA bounded replay, a snapshot inside the prompt splits
+    // the prefill at it: the part before ends at the snapshot (where replay
+    // completes the state the snapshot keeps) and the rest continues from
+    // there, both with replay, exactly as a later request that restores the
+    // snapshot would run. A prompt that saves no such snapshot runs whole.
+    static const bool replay_requested = env_flag_enabled("LUCE_DS41_DECODER_BOUNDED_REPLAY");
+    const int prompt_end = (int) req.prompt.size();
+    const bool split_at_snapshot = replay_requested && !images && req.snap_slot >= 0 &&
+        req.snap_pos > kv_offset && req.snap_pos < prompt_end;
+    const auto run_prefill = [&]() {
+        if (split_at_snapshot) {
+            const std::vector<int32_t> head(req.prompt.begin() + kv_offset,
+                                            req.prompt.begin() + req.snap_pos);
+            const int at = do_prefill(head, out_io, kv_offset, req.snap_slot, req.snap_pos,
+                                      nullptr, /*prefix_tokens=*/0, req.restore_points);
+            if (at != req.snap_pos) return at;
+            const std::vector<int32_t> rest(req.prompt.begin() + req.snap_pos, req.prompt.end());
+            return do_prefill(rest, out_io, req.snap_pos, /*snap_slot=*/-1, /*snap_pos=*/0,
+                              nullptr, /*prefix_tokens=*/0, req.restore_points);
+        }
+        if (kv_offset == 0) {
+            return do_prefill(req.prompt, out_io, 0,
+                              req.snap_slot, req.snap_pos, images,
+                              /*prefix_tokens=*/0, req.restore_points);
+        }
+        if (kv_offset < prompt_end) {
+            std::vector<int32_t> suffix(req.prompt.begin() + kv_offset,
+                                        req.prompt.end());
+            return do_prefill(suffix, out_io, kv_offset,
+                              req.snap_slot, req.snap_pos, nullptr,
+                              /*prefix_tokens=*/0, req.restore_points);
+        }
+        return kv_offset;
+    };
+    committed = run_prefill();
+    // A long prefill that ran out of device memory is retried once from the
+    // request's starting state with every disposable arena retired and a
+    // smaller pipeline band, instead of failing the request.
+    if (committed < 0 && !out_io.is_cancelled() && !images &&
+        (kv_offset == 0 || prefill_retry_slot_ >= 0)) {
+        deepseek4_release_retry_scratch(cache_, moe_hybrid_.get());
+        const bool pipelined = deepseek4_prefill_pipeline_bands() > 0;
+        if (pipelined) {
+            cache_.pipeline_cap_pct /= 2;
+            std::fprintf(stderr, "[deepseek4] prefill pipeline band cap now %d%%%s\n",
+                         cache_.pipeline_cap_pct,
+                         cache_.pipeline_cap_pct < kDs4PipelineMinCapPct ? " (pipeline off)" : "");
+        }
+        const bool restored = kv_offset == 0 || snapshot_restore(prefill_retry_slot_);
+        std::fprintf(stderr, "[deepseek4] prefill failed; retrying once from pos %d%s\n",
+                     kv_offset, restored ? "" : " (snapshot restore failed)");
+        if (restored) committed = run_prefill();
+        // The first recovery is the expected one (the one-time allocations
+        // of the first long request): go back to the full cap once. A later
+        // failure keeps the smaller cap.
+        if (pipelined && committed >= 0 && !pipeline_cap_restored_) {
+            cache_.pipeline_cap_pct = kDs4PipelineCapPct;
+            pipeline_cap_restored_ = true;
+        }
     }
     if (committed < 0) {
         result.fail(GenerateErrorCode::PrefillFailed);
@@ -4927,7 +5081,9 @@ GenerateResult DeepSeek4Backend::restore_and_generate_impl(
         result.fail(GenerateErrorCode::BackendSpecific, "snapshot restore");
         return result;
     }
+    prefill_retry_slot_ = slot;
     result = generate_from_state(req, io, snap_pos);
+    prefill_retry_slot_ = -1;
     if (result.ok()) result.restored_prefix_tokens = snap_pos;
     return result;
 }

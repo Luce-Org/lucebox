@@ -177,6 +177,11 @@ public:
     // when `ctx` does not hold the tokens before first_pos.
     bool prepare(DeepSeek4EngramTokens & ctx, const int32_t * tokens, int first_pos,
                  size_t count, float * keys, std::string * err) const;
+    // The rows of Engram layer index `layer` alone, for the same arguments,
+    // into keys[count][key_floats()] (prepare's block for that layer); the
+    // tokens are not recorded in `ctx`.
+    bool read_layer(const DeepSeek4EngramTokens & ctx, const int32_t * tokens, int first_pos,
+                    size_t count, int layer, float * keys, std::string * err) const;
     // Starts reading the rows `prepare` will need for the same arguments,
     // without waiting and without recording the tokens.
     void prefetch(const DeepSeek4EngramTokens & ctx, const int32_t * tokens, int first_pos,
@@ -188,6 +193,10 @@ public:
 private:
     bool row_ids(const DeepSeek4EngramTokens & ctx, const int32_t * tokens, int first_pos,
                  size_t count, std::vector<uint32_t> & ids, std::string * err) const;
+    void split_layer_ids(const std::vector<uint32_t> & ids, size_t count, int layer,
+                         std::vector<uint32_t> & out) const;
+    bool read_layer_rows(int layer, const std::vector<uint32_t> & layer_ids, float * dst,
+                         std::string * err) const;
 
     DeepSeek4EngramHasher hasher_;
     std::vector<DeepSeek4EngramTable> tables_;   // one per Engram layer, hasher order
@@ -234,8 +243,15 @@ public:
     // hc: [n_tokens][n_hc * n_embd], keys: [n_tokens][cols * key_len].
     bool run(ggml_backend * backend, const DeepSeek4Layer & L, int n_embd, int n_hc, float rms_eps,
              float * hc, const float * keys, int n_tokens);
+    // The same update in place on a device residual: hc_dev is a contiguous
+    // F32 [n_hc * n_embd, n_tokens] tensor on `backend`; only the keys upload.
+    bool run_device(ggml_backend * backend, const DeepSeek4Layer & L, int n_embd, int n_hc, float rms_eps,
+                    ggml_tensor * hc_dev, const float * keys, int n_tokens);
 
 private:
+    bool run_chunks(ggml_backend * backend, const DeepSeek4Layer & L, int n_embd, int n_hc, float rms_eps,
+                    float * hc_host, ggml_tensor * hc_dev, const float * keys, int n_tokens);
+
     ggml_gallocr * alloc_ = nullptr;
     ggml_backend * alloc_backend_ = nullptr;
     std::vector<uint8_t> meta_;

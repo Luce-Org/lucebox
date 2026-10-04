@@ -198,6 +198,11 @@ private:
     // Once a long prompt selects the fragmentation-safe prefill shape, retain
     // it for later requests so the HIP arenas never switch back under load.
     int                            hybrid_prefill_chunk_cap_ = 0;
+    // Snapshot slot a restored request started from (-1: fresh prompt);
+    // a failed prefill restores it before its one retry.
+    int                            prefill_retry_slot_ = -1;
+    // Whether a retried prefill already restored the full pipeline cap.
+    bool                           pipeline_cap_restored_ = false;
     int                            hybrid_long_context_chunk_ = kDs4DefaultLongContextChunk;
 
     bool load_spec_drafter();

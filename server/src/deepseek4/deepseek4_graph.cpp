@@ -104,6 +104,13 @@ static bool ds4_env_flag(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+// LUCE_DS4_ENGRAM_DEVICE=1: layer-major prefill applies Engram on the device
+// residual and reads each band's Engram rows once for both Engram layers.
+static bool ds4_engram_on_device() {
+    static const bool enabled = ds4_env_flag("LUCE_DS4_ENGRAM_DEVICE");
+    return enabled;
+}
+
 // F32 key/value-side accumulation protects the short-context quality baseline
 // while still avoiding a full-cache F16 -> F32 conversion once attention is
 // large enough for that conversion to dominate verifier time.
@@ -2092,6 +2099,9 @@ struct DeepSeek4MlaLaneBindings {
     };
 
     HistoryMode history_mode = HistoryMode::ContiguousRing;
+    // Raw rows before this position are outside the current window
+    // (DeepSeek4LayerCache::swa_floor).
+    int swa_floor = 0;
     // In gathered mode these are immutable, chronological attention inputs.
     // Counts are explicit so adapters may bind capacity-padded tensors.
     ggml_tensor * prepared_raw_attention = nullptr;
@@ -2335,6 +2345,7 @@ static DeepSeek4MlaLaneBindings deepseek4_contiguous_lane_bindings(
     lane.attn_compressor = &comp_lc.attn_compressor;
     lane.indexer_compressor = &comp_lc.indexer_compressor;
     lane.write_comp = deepseek4_is_kv_source(w, layer_idx);
+    lane.swa_floor = lc.swa_floor;
     const int committed = ds4_committed_comp_rows(w, comp_lc.n_comp);
     const int committed_index = ds4_committed_comp_rows(w, comp_lc.n_index_comp);
     lane.n_comp_live = ratio > 0
@@ -2439,6 +2450,15 @@ static ggml_tensor * build_mla_attention_lane_core(
     ggml_tensor * prior_rows_scratch_f16 = nullptr;
     int n_prior_rows = gathered_history ? lane.n_raw_history : 0;
     const bool fused_causal = cached_inputs && cached_inputs->attn_row_mask && n_tokens > 1;
+    // A floored raw window is only modelled by the batched chronological
+    // snapshot below; every other path reads ring rows the floor excludes.
+    if (lane.swa_floor > 0 && kv_start - lane.swa_floor < w.n_swa &&
+        (gathered_history || fused_causal || !layer_major_batch)) {
+        std::fprintf(stderr,
+                     "[deepseek4] layer %d: a raw-window floor needs the batched prefill path\n",
+                     layer_idx);
+        return nullptr;
+    }
     if (!gathered_history && fused_causal) {
         // Fused verify: ALWAYS q preserved rows so the topology is stable;
         // unwrapped/garbage rows are masked by the host-filled mask values.
@@ -2475,9 +2495,9 @@ static ggml_tensor * build_mla_attention_lane_core(
         // Snapshot the chronological pre-chunk window before any ring writes.
         // Attention then consumes [prior F16 rows | current F32 rows], matching
         // the single-token path and avoiding an F16 round-trip for this chunk.
-        n_prior_rows = std::min(kv_start, w.n_swa);
+        n_prior_rows = std::min(std::max(0, kv_start - lane.swa_floor), w.n_swa);
         if (n_prior_rows > 0) {
-            const int first = kv_start < w.n_swa ? 0 : (kv_start % w.n_swa);
+            const int first = (kv_start - n_prior_rows) % w.n_swa;
             const int tail = std::min(n_prior_rows, w.n_swa - first);
             auto snapshot_span = [&](int row, int count) {
                 ggml_tensor * span = ggml_view_2d(
@@ -2766,13 +2786,14 @@ static ggml_tensor * build_mla_attention_lane_core(
         indexer_topk->ne[0] <= maskless_indexed_rows_cap &&
         n_prior_rows == std::min(kv_start, w.n_swa) &&
         n_comp_live == (kv_start + n_tokens) / ratio;
-    // F16 K/V transport for long sparse prefill. F16 rounding of the prefill
-    // rows changes the DSpark target features, so it is only used where it
-    // was qualified: the gfx1151 sparse-prefill profile defaults it on and
+    // F16 K/V transport for long flash prefill (sparse, or V4.1's dense
+    // prefill over its shared selection). F16 rounding of the prefill rows
+    // changes the DSpark target features, so it is only used where it was
+    // qualified: the gfx1151 sparse-prefill profile defaults it on and
     // LUCE_DS4_PREFILL_F16_KV_ALL=0 is the kill switch; everywhere else
     // prefill keeps the F32 rows.
     const bool f16_sparse_prefill =
-        attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
+        attention_impl != DeepSeek4AttentionImpl::Explicit &&
         layer_major_batch && !gathered_history &&
         n_tokens > w.n_swa &&
         ds4_env_flag("LUCE_DS4_PREFILL_F16_KV_ALL");
@@ -2991,9 +3012,11 @@ static ggml_tensor * build_mla_attention_lane_core(
     // row IDs. The CUDA/HIP kernel can derive the raw causal window and the
     // completed compressed-row frontier from kv_start and the query index.
     // Keep every other attention shape on the explicit mask contract.
+    // The F16 K/V transport already rounds what the 2K bands keep exact,
+    // so it takes the whole batch in one F16 pass instead.
     const bool exact_numerical_bands =
         attention_impl == DeepSeek4AttentionImpl::DenseFlash &&
-        causal_batch &&
+        causal_batch && !f16_sparse_prefill &&
         n_tokens > DS4_NUMERICAL_PREFILL_BAND &&
         n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
     // A shared selection (V4.1) always runs on the D=512 flash kernel, which
@@ -3038,7 +3061,6 @@ static ggml_tensor * build_mla_attention_lane_core(
         (size_t) analytic_causal_heads * analytic_causal_rope_scratch_per_head *
             sizeof(float);
     const bool streaming_dense_high_ratio =
-        attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
         f16_sparse_prefill && ratio >= 64 && head_dim == 512 && n_rot == 64 &&
         ds4_env_flag("GGML_CUDA_MLA_DENSE_HIGH_RATIO") &&
         ds4_env_flag("GGML_CUDA_MLA_DENSE_WMMA");
@@ -6446,6 +6468,10 @@ struct DeepSeek4LayerRangeCache {
     DeepSeek4PrefillHcPreGraph prefill_hc_pre_graph;
     DeepSeek4PrefillHcPostGraph prefill_hc_post_graph;
     DeepSeek4PrefillHcPostGraph prefill_moe_hc_post_graph;
+    // Second set for odd bands of a pipelined layer-major pass.
+    DeepSeek4PrefillHcPreGraph prefill_hc_pre_graph_alt;
+    DeepSeek4PrefillHcPostGraph prefill_hc_post_graph_alt;
+    DeepSeek4PrefillHcPostGraph prefill_moe_hc_post_graph_alt;
     std::vector<std::vector<DeepSeek4CachedDecodeAttnGraph>> cached_decode_attn_graphs;
     // Byte accounting for cached_decode_attn_graphs (ds4_decode_attn_cache_trim):
     // resident device bytes, the budget fixed when the first graph was cached,
@@ -6490,6 +6516,9 @@ struct DeepSeek4LayerRangeCache {
         prefill_hc_pre_graph.free();
         prefill_hc_post_graph.free();
         prefill_moe_hc_post_graph.free();
+        prefill_hc_pre_graph_alt.free();
+        prefill_hc_post_graph_alt.free();
+        prefill_moe_hc_post_graph_alt.free();
         for (auto & graph : cached_decode_attn_hc_pre_graphs) {
             graph.free();
         }
@@ -6522,6 +6551,9 @@ struct DeepSeek4LayerRangeCache {
         prefill_hc_pre_graph.free();
         prefill_hc_post_graph.free();
         prefill_moe_hc_post_graph.free();
+        prefill_hc_pre_graph_alt.free();
+        prefill_hc_post_graph_alt.free();
+        prefill_moe_hc_post_graph_alt.free();
         scratch.clear();
     }
 
@@ -6545,6 +6577,9 @@ struct DeepSeek4LayerRangeCache {
         prefill_hc_pre_graph.free();
         prefill_hc_post_graph.free();
         prefill_moe_hc_post_graph.free();
+        prefill_hc_pre_graph_alt.free();
+        prefill_hc_post_graph_alt.free();
+        prefill_moe_hc_post_graph_alt.free();
         for (auto & per_layer : cached_decode_attn_graphs) {
             for (auto & graph : per_layer) {
                 graph.free();
@@ -7492,6 +7527,42 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     ggml_build_forward_expand(gf, normed);
     ggml_build_forward_expand(gf, probs);
     ggml_tensor * probs_pair = build_ds4_next_layer_router(ctx, gf, inp, probs, w, hybrid, layer);
+    // LUCE_DS4_DEVICE_TOPK=1: each token's top route_width + 2 candidates
+    // (and the native set when protected experts are in play) come from the
+    // device; the host orders them exactly as ds4_select_routed_experts would.
+    static const bool device_topk_requested = ds4_env_flag("LUCE_DS4_DEVICE_TOPK");
+    // Two candidates past route_width: the host re-orders the device set by
+    // (score desc, expert asc), so a tie at the boundary still finds its
+    // host winner among them.
+    constexpr int kMaxDeviceTopkCandidates = 18;
+    const int topk_cand = std::min(route_width + 2, w.n_expert);
+    const bool topk_protected = !w.protected_experts.empty() && !w.router_bias_delta.empty();
+    const bool device_topk = device_topk_requested && !hash_routed && !image_spans.size &&
+        !probs_pair && !w.selection_bias_host.empty() && L.ffn_exp_probs_b &&
+        topk_cand <= kMaxDeviceTopkCandidates &&
+        (!topk_protected || L.router_bias_delta_dev);
+    ggml_tensor * topk_biased = nullptr, * topk_biased_p = nullptr;
+    ggml_tensor * topk_native = nullptr, * topk_native_p = nullptr;
+    if (device_topk) {
+        // The caller reads normed/probs after the graph: keep their buffers.
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) ggml_set_output(ggml_graph_node(gf, i));
+        ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, w.n_expert, n_tokens);
+        ggml_tensor * biased_score = ggml_add(ctx, probs, L.ffn_exp_probs_b);
+        topk_biased = ggml_top_k(ctx, biased_score, topk_cand);
+        topk_biased_p = ggml_get_rows(ctx, probs_3d, topk_biased);
+        ggml_set_output(topk_biased);
+        ggml_set_output(topk_biased_p);
+        ggml_build_forward_expand(gf, topk_biased_p);
+        if (topk_protected) {
+            // Same float order as the host score: (p + bias) - delta.
+            ggml_tensor * native_score = ggml_sub(ctx, biased_score, L.router_bias_delta_dev);
+            topk_native = ggml_top_k(ctx, native_score, topk_cand);
+            topk_native_p = ggml_get_rows(ctx, probs_3d, topk_native);
+            ggml_set_output(topk_native);
+            ggml_set_output(topk_native_p);
+            ggml_build_forward_expand(gf, topk_native_p);
+        }
+    }
     ggml_gallocr_t alloc = nullptr;
     if (persistent_owner_alloc) {
         if (!hybrid.prefill_route_alloc) {
@@ -7560,7 +7631,9 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     if (!device_ffn_input) {
         normed_host.resize((size_t)n_embd * (size_t)n_tokens);
     }
-    std::vector<float> probs_host((size_t)w.n_expert * (size_t)n_tokens);
+    std::vector<float> probs_host(device_topk ? 0 : (size_t)w.n_expert * (size_t)n_tokens);
+    std::vector<int32_t> topk_ids_host;
+    std::vector<float> topk_p_host;
     Ds4NextLayerRoutes next_routes;
     if (route_ok) {
         const auto route_read_t0 = Ds4TimingClock::now();
@@ -7568,7 +7641,17 @@ static bool eval_ds4_layer_range_hybrid_ffn(
             ggml_backend_tensor_get(normed, normed_host.data(), 0,
                                     sizeof(float) * normed_host.size());
         }
-        if (!read_ds4_probs_and_next_routes(probs_pair, w, layer, n_tokens, probs_host.data(), next_routes)) {
+        if (device_topk) {
+            const size_t nk = (size_t) topk_cand * (size_t) n_tokens;
+            topk_ids_host.resize(nk * (topk_native ? 2 : 1));
+            topk_p_host.resize(nk * (topk_native ? 2 : 1));
+            ggml_backend_tensor_get(topk_biased, topk_ids_host.data(), 0, sizeof(int32_t) * nk);
+            ggml_backend_tensor_get(topk_biased_p, topk_p_host.data(), 0, sizeof(float) * nk);
+            if (topk_native) {
+                ggml_backend_tensor_get(topk_native, topk_ids_host.data() + nk, 0, sizeof(int32_t) * nk);
+                ggml_backend_tensor_get(topk_native_p, topk_p_host.data() + nk, 0, sizeof(float) * nk);
+            }
+        } else if (!read_ds4_probs_and_next_routes(probs_pair, w, layer, n_tokens, probs_host.data(), next_routes)) {
             ggml_backend_tensor_get(probs, probs_host.data(), 0,
                                     sizeof(float) * probs_host.size());
         }
@@ -7622,6 +7705,51 @@ static bool eval_ds4_layer_range_hybrid_ffn(
             }
             std::copy_n(selection.indices.data(), route_width, token_ids_out);
             std::copy_n(selection.weights.data(), route_width, token_weights);
+            observe_active_routing(routing_stats, layer, token_ids_out, token_weights, route_width);
+            continue;
+        }
+
+        if (device_topk) {
+            // Host semantics (ds4_select_routed_experts): the native set wins
+            // when it holds a protected expert.
+            const size_t nk = (size_t) topk_cand * (size_t) n_tokens;
+            const size_t off = (size_t) t * (size_t) topk_cand;
+            const size_t lrow = (size_t) layer * (size_t) w.n_expert;
+            // Host order over the device candidates: score desc, expert asc.
+            const auto host_order = [&](size_t base, const float * minus, int * order) {
+                const int32_t * ids = topk_ids_host.data() + base + off;
+                const float * ps = topk_p_host.data() + base + off;
+                float score[kMaxDeviceTopkCandidates];
+                for (int c = 0; c < topk_cand; ++c) {
+                    order[c] = c;
+                    score[c] = ps[c] + bias[ids[c]] - (minus ? minus[ids[c]] : 0.0f);
+                }
+                std::sort(order, order + topk_cand, [&](int a, int b2) {
+                    return score[a] != score[b2] ? score[a] > score[b2] : ids[a] < ids[b2];
+                });
+            };
+            int order[kMaxDeviceTopkCandidates];
+            bool use_native = false;
+            if (topk_native) {
+                host_order(nk, w.router_bias_delta.data() + lrow, order);
+                for (int slot = 0; slot < route_width; ++slot) {
+                    const int32_t e = topk_ids_host[nk + off + (size_t) order[slot]];
+                    if (e >= 0 && e < w.n_expert && w.protected_experts[lrow + (size_t) e]) { use_native = true; break; }
+                }
+            }
+            if (!use_native) host_order(0, nullptr, order);
+            const int32_t * ids = topk_ids_host.data() + (use_native ? nk : 0) + off;
+            const float * ps = topk_p_host.data() + (use_native ? nk : 0) + off;
+            float sum = 0.0f;
+            for (int slot = 0; slot < route_width; ++slot) {
+                token_ids_out[slot] = ids[order[slot]];
+                token_weights[slot] = ps[order[slot]];
+                sum += token_weights[slot];
+            }
+            sum = std::max(sum, 6.103515625e-5f);
+            for (int slot = 0; slot < route_width; ++slot) {
+                token_weights[slot] = token_weights[slot] / sum * w.expert_weight_scale;
+            }
             observe_active_routing(routing_stats, layer, token_ids_out, token_weights, route_width);
             continue;
         }
@@ -9612,6 +9740,227 @@ bool deepseek4_paged_gathered_step(
     return true;
 }
 
+// The rows of a layer-major band in its device residual, laid out like `like`
+// (a contiguous F32 [hc_dim, n_tokens] graph tensor). Null when they differ.
+static ggml_tensor * ds4_band_residual_view(ggml_context * ctx,
+                                             const DeepSeek4LayerMajorBand & band,
+                                             const ggml_tensor * like) {
+    ggml_tensor * res = band.device_residual;
+    if (!res || !like || like->type != GGML_TYPE_F32 || !ggml_is_contiguous(like)) return nullptr;
+    const size_t offset = (size_t) band.selection_first * (size_t) res->nb[1];
+    if (offset + ggml_nbytes(like) > ggml_nbytes(res)) return nullptr;
+    ggml_tensor * v = ggml_view_4d(ctx, res, like->ne[0], like->ne[1], like->ne[2], like->ne[3],
+                                   like->nb[1], like->nb[2], like->nb[3], offset);
+    if (ggml_backend_view_init(v) != GGML_STATUS_SUCCESS) return nullptr;
+    return v;
+}
+
+// Chunk size of the shared layer-major prefill attention arena.
+static constexpr size_t kDs4PrefillArenaChunk = (size_t) 128 << 20;
+
+// The heterogeneous prefill's routing and hot-owner arenas (completed work).
+static void ds4_free_route_and_hot_arenas(MoeHybridStorage * moe_hybrid) {
+    if (!moe_hybrid) return;
+    if (moe_hybrid->prefill_route_alloc) {
+        ggml_gallocr_free(moe_hybrid->prefill_route_alloc);
+        moe_hybrid->prefill_route_alloc = nullptr;
+    }
+    if (moe_hybrid->prefill_hot_alloc) {
+        ggml_gallocr_free(moe_hybrid->prefill_hot_alloc);
+        moe_hybrid->prefill_hot_alloc = nullptr;
+    }
+}
+
+static ggml_context * ds4_band_view_ctx() {
+    ggml_init_params p{};
+    p.mem_size = 4 * ggml_tensor_overhead();
+    p.no_alloc = true;
+    return ggml_init(p);
+}
+
+// Copy rows [first, first + rows) of a device residual ([hc_dim, N] F32)
+// from (to_device = false) or to host memory.
+static bool ds4_residual_rows_copy(ggml_tensor * residual, int first, int rows,
+                                   float * host, bool to_device) {
+    ggml_context * vctx = ds4_band_view_ctx();
+    ggml_tensor * v = vctx ? ggml_view_2d(vctx, residual, residual->ne[0], rows, residual->nb[1],
+                                          (size_t) first * residual->nb[1]) : nullptr;
+    const bool ok = v && ggml_backend_view_init(v) == GGML_STATUS_SUCCESS;
+    if (ok) {
+        const size_t bytes = sizeof(float) * (size_t) residual->ne[0] * (size_t) rows;
+        if (to_device) ggml_backend_tensor_set(v, host, 0, bytes);
+        else           ggml_backend_tensor_get(v, host, 0, bytes);
+    }
+    if (vctx) ggml_free(vctx);
+    return ok;
+}
+
+// Pipelined layer-major prefill keeps up to two bands' routed-expert FFNs
+// running on the cold owner, one per HC graph slot (DeepSeek4LayerMajorBand::
+// graph_slot). A slot's HC post graph already holds the band's residual,
+// split and hot partial; its cold partial lands in block_out_cold, and the
+// slot is joined when the next band to use it starts.
+struct Ds4PrefillPipelineSlot {
+    MoeDeferredColdJoin cold;
+    bool pending = false;
+    unsigned seq = 0;  // launch order, to join the older slot first
+    int layer = -1;
+    int first = 0;
+    ggml_tensor * device_residual = nullptr;
+    DeepSeek4PrefillHcPostGraph * post = nullptr;
+};
+
+struct Ds4PrefillPipeline {
+    Ds4PrefillPipelineSlot slots[2];
+    // Per slot: the staging input on the cold device and the event its cold
+    // owner records after copying the partial back.
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_backend_event_t events[2] = {nullptr, nullptr};
+    unsigned launches = 0;
+
+    bool init(ggml_backend_t cold_backend, int n_embd, int max_rows) {
+        ggml_init_params p{};
+        p.mem_size = 3 * ggml_tensor_overhead();
+        p.no_alloc = true;
+        ctx = ggml_init(p);
+        if (!ctx) return false;
+        for (Ds4PrefillPipelineSlot & slot : slots) {
+            slot.cold.input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, max_rows);
+        }
+        buf = ggml_backend_alloc_ctx_tensors(ctx, cold_backend);
+        if (!buf) return false;
+        for (int i = 0; i < 2; ++i) {
+            events[i] = ggml_backend_event_new(ggml_backend_get_device(cold_backend));
+            if (!events[i]) return false;
+            slots[i].cold.done = events[i];
+        }
+        return true;
+    }
+    ~Ds4PrefillPipeline() {
+        for (ggml_backend_event_t e : events) if (e) ggml_backend_event_free(e);
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+    }
+};
+
+static bool ds4_pipeline_finish(Ds4PrefillPipelineSlot & p, ggml_backend_t backend) {
+    if (!p.pending) return true;
+    p.pending = false;
+    std::string err;
+    if (!p.cold.wait(&err)) {
+        std::fprintf(stderr, "[deepseek4] pipelined cold FFN failed layer %d: %s\n", p.layer, err.c_str());
+        return false;
+    }
+    ggml_backend_event_wait(backend, p.cold.done);
+    if (ggml_backend_graph_compute(backend, p.post->sg.gf) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "[deepseek4] pipelined HC-post compute failed layer %d\n", p.layer);
+        return false;
+    }
+    DeepSeek4LayerMajorBand band;
+    band.device_residual = p.device_residual;
+    band.selection_first = p.first;
+    ggml_context * vctx = ds4_band_view_ctx();
+    ggml_tensor * dst = vctx ? ds4_band_residual_view(vctx, band, p.post->sg.hidden_states) : nullptr;
+    if (!dst) {
+        if (vctx) ggml_free(vctx);
+        std::fprintf(stderr, "[deepseek4] pipelined residual view failed layer %d\n", p.layer);
+        return false;
+    }
+    ggml_backend_tensor_copy(p.post->sg.hidden_states, dst);
+    ggml_free(vctx);
+    return true;
+}
+
+// Join every pending slot, older first (on failure: wait them out).
+static bool ds4_pipeline_finish_all(Ds4PrefillPipeline & pipe, ggml_backend_t backend, bool ok) {
+    Ds4PrefillPipelineSlot * order[2] = {&pipe.slots[0], &pipe.slots[1]};
+    if (order[1]->pending && (!order[0]->pending || order[1]->seq < order[0]->seq)) {
+        std::swap(order[0], order[1]);
+    }
+    for (Ds4PrefillPipelineSlot * slot : order) {
+        if (ok) {
+            ok = ds4_pipeline_finish(*slot, backend);
+        } else {
+            std::string ignored;
+            slot->cold.wait(&ignored);
+            slot->pending = false;
+        }
+    }
+    return ok;
+}
+
+// A layer-major pass's Engram rows, read on a worker thread ahead of the
+// layers that apply them: every band's rows of the first Engram layer, then
+// of the next. The tables (V4.1: 2 x 101 GB inside the GGUF) are larger than
+// host memory, so these are mostly random drive reads; read in the step they
+// stall the pass at each band's first Engram layer. keys[band] has the layout
+// ds4_engram_read_keys produces, so the band's step finds it complete.
+struct Ds4EngramReadAhead {
+    std::vector<std::vector<float>> keys;
+    std::thread worker;
+    std::mutex mu;
+    std::condition_variable cv;
+    int done = 0;  // (Engram layer, band) reads completed, in order
+    bool failed = false;
+    std::atomic<bool> stop{false};
+    int n_bands = 0;
+    std::string err;
+
+    void start(const DeepSeek4Weights & w, const DeepSeek4EngramTokens & before,
+               const int32_t * token_ids, int kv_start, const std::vector<int> & bands) {
+        const DeepSeek4EngramRuntime * engram = w.engram_runtime.get();
+        n_bands = (int) bands.size();
+        keys.resize(bands.size());
+        for (size_t bi = 0; bi < bands.size(); ++bi) {
+            keys[bi].resize((size_t) engram->n_layers() * (size_t) bands[bi] * engram->key_floats());
+        }
+        worker = std::thread([this, engram, before, token_ids, kv_start, bands]() {
+            for (int l = 0; l < engram->n_layers(); ++l) {
+                int first = 0;
+                for (size_t bi = 0; bi < bands.size(); ++bi) {
+                    if (stop.load(std::memory_order_relaxed)) return;
+                    const int count = bands[bi];
+                    // The context the band's step would hash from.
+                    DeepSeek4EngramTokens ctx = before;
+                    for (int t = std::max(0, first - DeepSeek4EngramTokens::kSize); t < first; ++t) {
+                        ctx.put(kv_start + t, token_ids[t]);
+                    }
+                    std::string read_err;
+                    const bool ok = engram->read_layer(
+                        ctx, token_ids + first, kv_start + first, (size_t) count, l,
+                        keys[bi].data() + (size_t) l * (size_t) count * engram->key_floats(), &read_err);
+                    {
+                        std::lock_guard<std::mutex> lock(mu);
+                        if (ok) ++done;
+                        else { failed = true; err = read_err; }
+                    }
+                    cv.notify_all();
+                    if (!ok) return;
+                    first += count;
+                }
+            }
+        });
+    }
+    // Waits until band `band`'s rows of Engram layer index `layer` are in.
+    bool wait(int band, int layer, DeepSeek4StepTelemetry * telemetry) {
+        const auto t0 = Ds4TimingClock::now();
+        std::unique_lock<std::mutex> lock(mu);
+        const int target = layer * n_bands + band + 1;
+        cv.wait(lock, [&] { return done >= target || failed; });
+        if (telemetry) telemetry->engram_read_us += ds4_elapsed_us(t0, Ds4TimingClock::now());
+        if (done < target) {
+            std::fprintf(stderr, "[deepseek4] %s\n", err.c_str());
+            return false;
+        }
+        return true;
+    }
+    ~Ds4EngramReadAhead() {
+        stop.store(true, std::memory_order_relaxed);
+        if (worker.joinable()) worker.join();
+    }
+};
+
 bool deepseek4_step_layer_range(
         ggml_backend_t backend,
         int device,
@@ -9633,6 +9982,13 @@ bool deepseek4_step_layer_range(
         MoeHybridRoutingStats * routing_stats,
         vision::ImageSpanView image_spans) {
     const auto step_t0 = Ds4TimingClock::now();
+    // This band's HC graph slot may still hold an earlier band's pending
+    // join: complete it before the slot's graphs are reused.
+    if (cache.layer_major_band && cache.layer_major_band->pipeline &&
+        !ds4_pipeline_finish(cache.layer_major_band->pipeline->slots[cache.layer_major_band->graph_slot],
+                             backend)) {
+        return false;
+    }
 
     bool image_batch = false;
     std::string image_error;
@@ -9880,6 +10236,10 @@ bool deepseek4_step_layer_range(
     //   separate buffer (IPC daemon). Detect the alias before any resize, which
     //   would invalidate embed.
     const size_t hc_state_elems = (size_t)hc_dim * (size_t)n_tokens;
+    // A layer-major band past layer 0 with a device residual takes its input
+    // from the device (or, without the device HC path, copies it down below).
+    const bool band_device_input = cache.layer_major_band &&
+        cache.layer_major_band->device_residual && layer_begin > 0;
     const bool embed_points_to_hc_state = embed != nullptr && embed == hc_state.data();
     if (hc_state.size() != hc_state_elems) {
         if (embed_points_to_hc_state) {
@@ -9899,6 +10259,8 @@ bool deepseek4_step_layer_range(
                        embed + (size_t)t * n_embd, (size_t)n_embd * sizeof(float));
             }
         }
+    } else if (band_device_input) {
+        // Filled from the band's device residual once the HC path is known.
     } else {
         // Later shard: embed contains full HC state from previous shard
         if (!embed) {
@@ -9938,9 +10300,13 @@ bool deepseek4_step_layer_range(
     auto & cached_decode_ffn_hc_pre_graphs = layer_range_cache.cached_decode_ffn_hc_pre_graphs;
     auto & cached_decode_hc_post_graph = layer_range_cache.cached_decode_hc_post_graph;
     auto & shared_prefill_attn_alloc = layer_range_cache.shared_prefill_attn_alloc;
-    auto & prefill_hc_pre_graph = layer_range_cache.prefill_hc_pre_graph;
-    auto & prefill_hc_post_graph = layer_range_cache.prefill_hc_post_graph;
-    auto & prefill_moe_hc_post_graph = layer_range_cache.prefill_moe_hc_post_graph;
+    const bool alt_graph_slot = cache.layer_major_band && cache.layer_major_band->graph_slot == 1;
+    auto & prefill_hc_pre_graph = alt_graph_slot ? layer_range_cache.prefill_hc_pre_graph_alt
+                                                 : layer_range_cache.prefill_hc_pre_graph;
+    auto & prefill_hc_post_graph = alt_graph_slot ? layer_range_cache.prefill_hc_post_graph_alt
+                                                  : layer_range_cache.prefill_hc_post_graph;
+    auto & prefill_moe_hc_post_graph = alt_graph_slot ? layer_range_cache.prefill_moe_hc_post_graph_alt
+                                                      : layer_range_cache.prefill_moe_hc_post_graph;
     auto & cached_decode_attn_graphs = layer_range_cache.cached_decode_attn_graphs;
     auto & cached_decode_ffn_graphs = layer_range_cache.cached_decode_ffn_graphs;
     auto & cached_decode_output_graph = layer_range_cache.cached_decode_output_graph;
@@ -10143,12 +10509,19 @@ bool deepseek4_step_layer_range(
     for (int il = layer_begin; il < layer_end && w.engram_runtime; ++il) {
         range_has_engram = range_has_engram || w.engram_runtime->layer_index(il) >= 0;
     }
-    std::vector<float> engram_keys;
-    if (range_has_engram &&
-        !ds4_engram_read_keys(w, cache.engram_tokens, token_ids, kv_start, n_tokens,
-                              engram_keys, telemetry)) {
-        return false;
+    std::vector<float> engram_keys_local;
+    std::vector<float> * band_engram_keys =
+        layer_major_band ? layer_major_band->engram_keys : nullptr;
+    const bool band_keys_hit = range_has_engram && band_engram_keys && !band_engram_keys->empty();
+    if (range_has_engram && !band_keys_hit) {
+        if (!ds4_engram_read_keys(w, cache.engram_tokens, token_ids, kv_start, n_tokens,
+                                  engram_keys_local, telemetry)) {
+            return false;
+        }
+        if (band_engram_keys) *band_engram_keys = std::move(engram_keys_local);
     }
+    const std::vector<float> & engram_keys =
+        band_engram_keys && range_has_engram ? *band_engram_keys : engram_keys_local;
     if (!layer_range_cache.index_selection.ensure(
             backend, w, layer_major_band ? layer_major_band->selection_columns : n_tokens)) {
         std::fprintf(stderr, "[deepseek4] index selection store allocation failed\n");
@@ -10237,9 +10610,26 @@ bool deepseek4_step_layer_range(
                          "[deepseek4-prefill] batched GPU HC initialization failed\n");
             return false;
         }
-        ggml_backend_tensor_set(prefill_hc_post_graph.residual_hc,
-                                hc_state.data(), 0,
-                                sizeof(float) * hc_state.size());
+        bool from_device = false;
+        if (band_device_input) {
+            ggml_context * vctx = ds4_band_view_ctx();
+            ggml_tensor * src = vctx ? ds4_band_residual_view(
+                vctx, *cache.layer_major_band, prefill_hc_post_graph.residual_hc) : nullptr;
+            if (src) {
+                ggml_backend_tensor_copy(src, prefill_hc_post_graph.residual_hc);
+                from_device = true;
+            }
+            if (vctx) ggml_free(vctx);
+            if (!from_device) {
+                std::fprintf(stderr, "[deepseek4] band residual view mismatch layer %d\n", layer_begin);
+                return false;
+            }
+        }
+        if (!from_device) {
+            ggml_backend_tensor_set(prefill_hc_post_graph.residual_hc,
+                                    hc_state.data(), 0,
+                                    sizeof(float) * hc_state.size());
+        }
         hc_state_backend = prefill_hc_post_graph.residual_hc;
     } else if (use_backend_decode_hc_graph || use_backend_decode_hc_direct) {
         if (!cached_decode_hc_post_graph.valid() ||
@@ -10252,6 +10642,16 @@ bool deepseek4_step_layer_range(
         ggml_backend_tensor_set(cached_decode_hc_post_graph.residual_hc,
                                 hc_state.data(), 0, sizeof(float) * hc_state.size());
         hc_state_backend = cached_decode_hc_post_graph.residual_hc;
+    }
+    if (band_device_input && !use_backend_prefill_hc) {
+        if (!ds4_residual_rows_copy(cache.layer_major_band->device_residual,
+                                    cache.layer_major_band->selection_first, n_tokens,
+                                    hc_state.data(), /*to_device=*/false)) {
+            return false;
+        }
+        if (hc_state_backend) {
+            ggml_backend_tensor_set(hc_state_backend, hc_state.data(), 0, sizeof(float) * hc_state.size());
+        }
     }
     const auto capture_requested = [&](int layer) {
         if (!verify_hooks || !verify_hooks->capture_layer_ids ||
@@ -10292,6 +10692,9 @@ bool deepseek4_step_layer_range(
         const HcLayerWeightsCpu & hc_lw = hc_layer_weights_range[(size_t)il];
         const int ratio = (int)w.compress_ratios[il];
         bool hash_routed = false;
+        bool ffn_deferred = false;
+        Ds4PrefillPipeline * pipe = cache.layer_major_band
+            ? cache.layer_major_band->pipeline : nullptr;
         const ggml_tensor * attn_in_backend = nullptr;
         const ggml_tensor * ffn_in_backend = nullptr;
         const ggml_tensor * attn_post_backend = nullptr;
@@ -10307,11 +10710,24 @@ bool deepseek4_step_layer_range(
         }
         // The residual copies stay in host memory on the staggered pre-mix
         // paths, the only ones a model with Engram layers takes.
-        if (!engram_keys.empty() && use_backend_prefill_hc && hc_state_backend) {
+        bool engram_done_on_device = false;
+        if (ds4_engram_on_device() && !engram_keys.empty() && use_backend_prefill_hc && hc_state_backend &&
+            w.engram_runtime && w.engram_runtime->layer_index(il) >= 0) {
+            if (hc_state_backend != prefill_hc_post_graph.residual_hc) {
+                ggml_backend_tensor_copy(hc_state_backend, prefill_hc_post_graph.residual_hc);
+                hc_state_backend = prefill_hc_post_graph.residual_hc;
+            }
+            if (!ds4_engram_apply_device(backend, w, il, engram_keys, prefill_hc_post_graph.residual_hc,
+                                         n_tokens, layer_range_cache.engram_apply, telemetry)) {
+                return false;
+            }
+            engram_done_on_device = true;
+        }
+        if (!engram_done_on_device && !engram_keys.empty() && use_backend_prefill_hc && hc_state_backend) {
             // Engram adds to the residual on the host: bring it over and back.
             ggml_backend_tensor_get(hc_state_backend, hc_state.data(), 0, sizeof(float) * hc_state.size());
         }
-        if (!engram_keys.empty() &&
+        if (!engram_done_on_device && !engram_keys.empty() &&
             ((hc_state_backend && !use_backend_prefill_hc) ||
              !ds4_engram_apply_host(backend, w, il, engram_keys, hc_state.data(), n_tokens,
                                     layer_range_cache.engram_apply, telemetry))) {
@@ -10320,7 +10736,7 @@ bool deepseek4_step_layer_range(
             }
             return false;
         }
-        if (!engram_keys.empty() && use_backend_prefill_hc && hc_state_backend) {
+        if (!engram_done_on_device && !engram_keys.empty() && use_backend_prefill_hc && hc_state_backend) {
             ggml_backend_tensor_set(prefill_hc_post_graph.residual_hc, hc_state.data(), 0,
                                     sizeof(float) * hc_state.size());
             hc_state_backend = prefill_hc_post_graph.residual_hc;
@@ -10652,8 +11068,18 @@ bool deepseek4_step_layer_range(
                 auto & attn_alloc = shared_layer_major_prefill
                     ? shared_prefill_attn_alloc
                     : cached_attn_allocs[(size_t)il];
-                constexpr size_t shared_prefill_max_chunk =
-                    128u * 1024u * 1024u;
+                // LUCE_DS4_PREFILL_ARENA_CHUNK_MB: chunk size of the shared
+                // prefill arena; 0 = a single chunk that only grows, so bands
+                // never free and regrow it.
+                static const long arena_chunk_mb = [] {
+                    const char * v = std::getenv("LUCE_DS4_PREFILL_ARENA_CHUNK_MB");
+                    return v && *v ? std::strtol(v, nullptr, 10) : -1L;
+                }();
+                static const bool single_chunk_arena = arena_chunk_mb == 0;
+                static const size_t shared_prefill_max_chunk =
+                    arena_chunk_mb < 0 ? kDs4PrefillArenaChunk
+                    : single_chunk_arena ? (size_t) SIZE_MAX / 2
+                                         : (size_t) arena_chunk_mb << 20;
                 if (!attn_alloc.valid() || attn_alloc.owner_ctx != w.ctx || attn_alloc.backend != backend) {
                     attn_alloc.free();
                     attn_alloc.alloc = shared_layer_major_prefill
@@ -10669,7 +11095,8 @@ bool deepseek4_step_layer_range(
                     shared_layer_major_prefill && attn_alloc.alloc
                         ? ggml_gallocr_get_buffer_size(attn_alloc.alloc, 0)
                         : 0;
-                if (shared_layer_major_prefill && attn_alloc.alloc) {
+                if (shared_layer_major_prefill && attn_alloc.alloc &&
+                    !(single_chunk_arena && attn_bytes_before > 0)) {
                     ggml_gallocr_t sizing =
                         ggml_gallocr_new_with_max_chunk_size(
                             ggml_backend_get_default_buffer_type(backend),
@@ -10702,16 +11129,7 @@ bool deepseek4_step_layer_range(
                                 ggml_backend_synchronize(
                                     moe_hybrid->cold_backend);
                             }
-                            if (moe_hybrid->prefill_route_alloc) {
-                                ggml_gallocr_free(
-                                    moe_hybrid->prefill_route_alloc);
-                                moe_hybrid->prefill_route_alloc = nullptr;
-                            }
-                            if (moe_hybrid->prefill_hot_alloc) {
-                                ggml_gallocr_free(
-                                    moe_hybrid->prefill_hot_alloc);
-                                moe_hybrid->prefill_hot_alloc = nullptr;
-                            }
+                            ds4_free_route_and_hot_arenas(moe_hybrid);
                         }
                         // HIP may split a ~650 MiB gallocr reservation into
                         // several backend buffers. At tightly packed DS4
@@ -10746,18 +11164,7 @@ bool deepseek4_step_layer_range(
                             // workspaces are also complete. On large chunks
                             // they can otherwise prevent the shared attention
                             // arena from growing by only a few dozen MiB.
-                            if (moe_hybrid) {
-                                if (moe_hybrid->prefill_route_alloc) {
-                                    ggml_gallocr_free(
-                                        moe_hybrid->prefill_route_alloc);
-                                    moe_hybrid->prefill_route_alloc = nullptr;
-                                }
-                                if (moe_hybrid->prefill_hot_alloc) {
-                                    ggml_gallocr_free(
-                                        moe_hybrid->prefill_hot_alloc);
-                                    moe_hybrid->prefill_hot_alloc = nullptr;
-                                }
-                            }
+                            ds4_free_route_and_hot_arenas(moe_hybrid);
                             size_t free_after_evict = 0;
                             ggml_backend_cuda_get_device_memory(
                                 device, &free_after_evict, &total_bytes);
@@ -10798,8 +11205,29 @@ bool deepseek4_step_layer_range(
                         }
                     }
                 }
-                const bool attn_allocated = attn_alloc.alloc &&
+                bool attn_allocated = attn_alloc.alloc &&
                     ggml_gallocr_alloc_graph(attn_alloc.alloc, gf);
+                if (!attn_allocated && shared_layer_major_prefill && single_chunk_arena) {
+                    ggml_backend_synchronize(backend);
+                    if (moe_hybrid && moe_hybrid->cold_backend &&
+                        moe_hybrid->cold_backend != backend) {
+                        ggml_backend_synchronize(moe_hybrid->cold_backend);
+                    }
+                    layer_range_cache.fused_verify_graph_cache.destroy();
+                    layer_range_cache.fused_capture_graph_cache.destroy();
+                    layer_range_cache.fused_decode_graph_cache.evict_graphs();
+                    ds4_free_route_and_hot_arenas(moe_hybrid);
+                    attn_alloc.free();
+                    attn_alloc.alloc = ggml_gallocr_new_with_max_chunk_size(
+                        ggml_backend_get_default_buffer_type(backend), kDs4PrefillArenaChunk);
+                    attn_alloc.owner_ctx = w.ctx;
+                    attn_alloc.backend = backend;
+                    attn_allocated = attn_alloc.alloc &&
+                        ggml_gallocr_alloc_graph(attn_alloc.alloc, gf);
+                    std::fprintf(stderr, "[deepseek4] single-chunk prefill arena could not grow at layer %d; "
+                                 "retried with %zu MiB chunks: %s\n", il, kDs4PrefillArenaChunk >> 20,
+                                 attn_allocated ? "ok" : "failed");
+                }
                 if (!attn_allocated) {
                     std::fprintf(stderr, "[deepseek4] attn graph alloc failed layer %d\n", il);
                     ggml_free(ctx);
@@ -11113,7 +11541,10 @@ bool deepseek4_step_layer_range(
                     // results into the device join tensors. A genuine split
                     // uses the expert-major host-combine path; treating it as
                     // device-resident makes HC-post read stale tensors.
-                    cold_stack && cold_stack->ne[2] == w.n_expert;
+                    cold_stack &&
+                    (cold_stack->ne[2] == w.n_expert ||
+                     (moe_split_owner_device_join_enabled() &&
+                      cold_stack->ne[2] > 0));
                 ffn_device_join =
                     use_backend_prefill_hc && ffn_in_backend &&
                     local_expert_runtime &&
@@ -11132,19 +11563,36 @@ bool deepseek4_step_layer_range(
                     owner_outputs.cold =
                         prefill_moe_hc_post_graph.block_out_cold;
                 }
-                if (!eval_ds4_layer_range_hybrid_ffn(
+                // Pipelined prefill: this band's cold owner runs behind the
+                // other slot's (the cold arena is shared), its input crosses
+                // into the slot's staging tensor, and the routing below may
+                // overwrite the previous band's routed input once its copy
+                // has run.
+                Ds4PrefillPipelineSlot * slot = pipe ? &pipe->slots[cache.layer_major_band->graph_slot] : nullptr;
+                Ds4PrefillPipelineSlot * other = pipe ? &pipe->slots[1 - cache.layer_major_band->graph_slot] : nullptr;
+                const bool defer_ffn = pipe && ffn_device_join && use_backend_prefill_hc &&
+                    cache.layer_major_band->device_residual && !out_logits &&
+                    !capture_requested(il) && il + 1 == layer_end;
+                if (pipe) ggml_backend_cuda_join_side_copies(backend);
+                if (pipe && !defer_ffn && !ds4_pipeline_finish_all(*pipe, backend, true)) return false;
+                if (defer_ffn) slot->cold.after = other->pending ? &other->cold : nullptr;
+                owner_outputs.defer = defer_ffn ? &slot->cold : nullptr;
+                const bool ffn_eval_ok = eval_ds4_layer_range_hybrid_ffn(
                         backend, w, L, il, n_tokens,
                         ffn_working.data(), ffn_in_backend,
                         token_ids, hash_routing_tables_range[(size_t)il],
                         *moe_hybrid, expert_runtime, routing_stats,
                         ffn_out_host, telemetry,
                         ffn_device_join ? &owner_outputs : nullptr,
-                        kv_start, image_batch ? image_spans : vision::ImageSpanView{})) {
+                        kv_start, image_batch ? image_spans : vision::ImageSpanView{});
+                if (!ffn_eval_ok) {
+                    if (pipe) ds4_pipeline_finish_all(*pipe, backend, false);
                     std::fprintf(stderr,
                                  "[deepseek4-moe-tp] layer-range FFN failed layer %d\n",
                                  il);
                     return false;
                 }
+                ffn_deferred = defer_ffn && slot->cold.pending();
             } else {
                 if (hash_routed) {
                     const int n_used = n_expert_used;
@@ -11233,6 +11681,16 @@ bool deepseek4_step_layer_range(
                 ggml_backend_tensor_copy(
                     const_cast<ggml_tensor *>(ffn_split_backend),
                     hc_post_graph.split);
+                if (ffn_deferred) {
+                    Ds4PrefillPipelineSlot & slot = pipe->slots[cache.layer_major_band->graph_slot];
+                    slot.pending = true;
+                    slot.seq = pipe->launches++;
+                    slot.layer = il;
+                    slot.first = cache.layer_major_band->selection_first;
+                    slot.device_residual = cache.layer_major_band->device_residual;
+                    slot.post = &hc_post_graph;
+                    hc_state_backend = nullptr;
+                } else {
                 const auto hc_post_ffn_t0 = Ds4TimingClock::now();
                 if (ggml_backend_graph_compute(
                         backend, hc_post_graph.sg.gf) !=
@@ -11245,6 +11703,7 @@ bool deepseek4_step_layer_range(
                 hc_state_backend = hc_post_graph.sg.hidden_states;
                 if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(
                     hc_post_ffn_t0, Ds4TimingClock::now());
+                }
             } else if (use_backend_decode_hc_graph || use_backend_decode_hc_direct) {
                 if (hc_state_backend != cached_decode_hc_post_graph.residual_hc) {
                     ggml_backend_tensor_copy(hc_state_backend,
@@ -11299,9 +11758,29 @@ bool deepseek4_step_layer_range(
         }
     }
 
-    if ((use_backend_prefill_hc || use_backend_decode_hc_graph ||
+    bool output_on_device = false;
+    if (use_backend_prefill_hc && hc_state_backend && layer_major_band &&
+        layer_major_band->device_residual && !out_logits) {
+        ggml_context * vctx = ds4_band_view_ctx();
+        ggml_tensor * dst = vctx ? ds4_band_residual_view(vctx, *layer_major_band, hc_state_backend) : nullptr;
+        if (dst) {
+            ggml_backend_tensor_copy(hc_state_backend, dst);
+            output_on_device = true;
+        }
+        if (vctx) ggml_free(vctx);
+    }
+    if (!output_on_device &&
+        (use_backend_prefill_hc || use_backend_decode_hc_graph ||
          use_backend_decode_hc_direct) && hc_state_backend) {
         ggml_backend_tensor_get(hc_state_backend, hc_state.data(), 0, sizeof(float) * hc_state.size());
+        if (layer_major_band && layer_major_band->device_residual && !out_logits) {
+            // Keep the residual coherent when this band left the device path.
+            if (!ds4_residual_rows_copy(layer_major_band->device_residual,
+                                        layer_major_band->selection_first, n_tokens,
+                                        hc_state.data(), /*to_device=*/true)) {
+                return false;
+            }
+        }
     }
 
     if (carried_pre) *carried_pre = hc_prev_pre;
@@ -11439,33 +11918,149 @@ bool deepseek4_prefill_layer_major(
         const float * embed, const int32_t * token_ids, int kv_start,
         const std::vector<int> & bands, DeepSeek4StepTelemetry * telemetry,
         MoeHybridStorage * moe_hybrid, MoeExpertComputeRuntime * expert_runtime,
-        MoeHybridRoutingStats * routing_stats) {
+        MoeHybridRoutingStats * routing_stats, int layer_end,
+        DeepSeek4LayerMajorTail * tail) {
     const int n_embd = w.n_embd, n_hc = w.n_hc;
+    const int n_run_layers = layer_end > 0 ? std::min(layer_end, w.n_layer) : w.n_layer;
     const size_t hc_dim = (size_t) n_hc * (size_t) n_embd;
     int n_tokens = 0;
     for (int count : bands) {
-        if (count <= 4 || count > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS) return false;
+        if (count < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS || count > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS) return false;
         n_tokens += count;
     }
     if (!moe_hybrid || bands.empty() || cache.layer_major_band) return false;
 
     // The residual copies of every position between layers, and each token's
     // staggered pre-mix (one-hot copy 0 before the first layer).
-    std::vector<float> residual((size_t) n_tokens * hc_dim);
+    // LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL=1 keeps the residual between layers
+    // on the target device when it fits next to 1.5 GiB of headroom; else host.
+    ggml_context * resid_ctx = nullptr;
+    ggml_backend_buffer_t resid_buf = nullptr;
+    ggml_tensor * device_residual = nullptr;
+    static const bool device_residual_requested =
+        ds4_env_flag("LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL");
+    if (device_residual_requested && device >= 0) {
+        constexpr size_t kResidualHeadroom = (size_t) 1536 << 20;
+        const size_t bytes = (size_t) n_tokens * hc_dim * sizeof(float);
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+        if (free_b > bytes + kResidualHeadroom) {
+            ggml_init_params p{};
+            p.mem_size = 2 * ggml_tensor_overhead();
+            p.no_alloc = true;
+            resid_ctx = ggml_init(p);
+            if (resid_ctx) {
+                device_residual = ggml_new_tensor_2d(resid_ctx, GGML_TYPE_F32, (int64_t) hc_dim, n_tokens);
+                resid_buf = ggml_backend_alloc_ctx_tensors(resid_ctx, backend);
+                if (!resid_buf) device_residual = nullptr;
+            }
+        }
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "[deepseek4] layer-major residual on %s (%.1f MiB, free %.1f MiB)\n",
+                         device_residual ? "device" : "host", bytes / 1048576.0, free_b / 1048576.0);
+        }
+    }
+    struct ResidualRelease {
+        ggml_context * ctx; ggml_backend_buffer_t buf;
+        ~ResidualRelease() { if (buf) ggml_backend_buffer_free(buf); if (ctx) ggml_free(ctx); }
+    } residual_release{resid_ctx, resid_buf};
+    std::vector<float> residual(device_residual ? 0 : (size_t) n_tokens * hc_dim);
     std::vector<float> pre((size_t) n_tokens * (size_t) n_hc, 0.0f);
     for (int t = 0; t < n_tokens; ++t) pre[(size_t) t * n_hc] = 1.0f;
     // Each band hashes its Engram rows from the tokens before it, whatever
     // the context holds after a previous layer's pass.
     const DeepSeek4EngramTokens context_before = cache.engram_tokens;
 
+    // Pipelined prefill: overlap one band's cold-owner FFN with the next
+    // band's attention on the primary (needs the device residual and the
+    // device owner join), over at least max(N, 2) bands.
+    const int pipeline_bands = deepseek4_prefill_pipeline_bands();
+    const bool pipeline_requested = pipeline_bands > 0;
+    std::vector<int> run_bands = bands;
+    Ds4PrefillPipeline pipeline_state;
+    const int pipeline_cap_pct = cache.pipeline_cap_pct;
+    const bool pipelined = pipeline_requested && device_residual &&
+        pipeline_cap_pct >= kDs4PipelineMinCapPct;
+    // Two bands of at least 64 rows (the grouped MoE kernels' minimum): a
+    // short pass gains the most, its secondary owner otherwise running in
+    // series with the primary at every layer.
+    constexpr int kPipelineMinRows = 128;
+    if (pipelined && n_tokens >= kPipelineMinRows) {
+        // Equal bands, none larger than the largest band the caller sized
+        // for its scratch, nor than the free device memory allows: with two
+        // bands in flight a row costs about 1.5 MiB of attention and owner
+        // arenas, and 2 GiB stays free beside them.
+        constexpr size_t kPipelineRowBytes = (size_t) 1536 << 10;
+        constexpr size_t kPipelineReserveBytes = (size_t) 2048 << 20;
+        int cap = 0;
+        for (int c : bands) cap = std::max(cap, c);
+        {
+            size_t free_b = 0, total_b = 0;
+            ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+            const size_t avail = free_b > kPipelineReserveBytes ? free_b - kPipelineReserveBytes : 0;
+            const int mem_cap = std::max(512, (int) std::min<size_t>(
+                avail / kPipelineRowBytes * (size_t) std::min(100, pipeline_cap_pct) / 100u, (size_t) cap));
+            if (mem_cap < cap) {
+                std::fprintf(stderr, "[deepseek4] pipeline band cap %d -> %d rows (free %.0f MiB)\n",
+                             cap, mem_cap, free_b / 1048576.0);
+                cap = mem_cap;
+            }
+        }
+        int nb = std::max(2, pipeline_bands);
+        nb = std::max(nb, (n_tokens + cap - 1) / cap);
+        while (nb > 2 && n_tokens / nb < 256) --nb;
+        if (nb != (int) run_bands.size() || pipeline_bands >= 2) {
+            run_bands.assign((size_t) nb, n_tokens / nb);
+            for (int i = 0; i < n_tokens % nb; ++i) run_bands[(size_t) i] += 1;
+        }
+    }
+    {
+        static bool logged = false;
+        if (pipeline_requested && !logged) {
+            logged = true;
+            std::fprintf(stderr, "[deepseek4] layer-major prefill pipeline %s (%zu bands)\n",
+                         pipelined ? "active"
+                         : !device_residual ? "inactive (needs the device residual)"
+                                            : "inactive (band cap backed off)",
+                         run_bands.size());
+        }
+    }
+
     DeepSeek4LayerMajorBand band;
     band.selection_columns = n_tokens;
+    band.device_residual = device_residual;
+    if (pipelined && run_bands.size() >= 2) {
+        int max_rows = 0;
+        for (int c : run_bands) max_rows = std::max(max_rows, c);
+        if (pipeline_state.init(moe_hybrid->cold_backend, n_embd, max_rows)) {
+            band.pipeline = &pipeline_state;
+        } else {
+            std::fprintf(stderr, "[deepseek4] pipeline staging allocation failed; bands run in turn\n");
+        }
+    }
+    unsigned pipeline_step = 0;
+    // Engram rows depend only on a band's tokens: read once, ahead of the
+    // pass, and reused by the band's second Engram layer.
+    Ds4EngramReadAhead engram_ahead;
+    std::vector<std::vector<float>> & band_keys = engram_ahead.keys;
+    if (ds4_engram_on_device() && w.engram_runtime && token_ids) {
+        engram_ahead.start(w, context_before, token_ids, kv_start, run_bands);
+    }
     std::vector<float> band_pre, band_out;
     bool ok = true;
-    for (int il = 0; il < w.n_layer && ok; ++il) {
+    for (int il = 0; il < n_run_layers && ok; ++il) {
+        const int engram_layer = band_keys.empty() ? -1 : w.engram_runtime->layer_index(il);
         int first = 0;
-        for (int count : bands) {
+        for (size_t bi = 0; bi < run_bands.size(); ++bi) {
+            if (engram_layer >= 0 && !engram_ahead.wait((int) bi, engram_layer, telemetry)) {
+                ok = false;
+                break;
+            }
+            const int count = run_bands[bi];
             const int pos = kv_start + first;
+            band.graph_slot = band.pipeline ? (int) (pipeline_step++ & 1) : 0;
             cache.engram_tokens = context_before;
             for (int t = std::max(0, first - DeepSeek4EngramTokens::kSize); t < first; ++t) {
                 cache.engram_tokens.put(kv_start + t, token_ids[t]);
@@ -11474,9 +12069,11 @@ bool deepseek4_prefill_layer_major(
                             pre.begin() + (ptrdiff_t) (first + count) * n_hc);
             band.staggered_pre = &band_pre;
             band.selection_first = first;
+            band.engram_keys = band_keys.empty() ? nullptr : &band_keys[bi];
             cache.layer_major_band = &band;
             const float * input = il == 0 ? embed + (size_t) first * n_embd
-                                          : residual.data() + (size_t) first * hc_dim;
+                                : device_residual ? nullptr
+                                                  : residual.data() + (size_t) first * hc_dim;
             ok = deepseek4_step_layer_range(
                 backend, device, w, cache, band_out, input, count, pos, il, il + 1,
                 /*out_logits=*/nullptr, token_ids + first, telemetry,
@@ -11488,11 +12085,32 @@ bool deepseek4_prefill_layer_major(
                 ok = false;
                 break;
             }
-            std::memcpy(residual.data() + (size_t) first * hc_dim, band_out.data(),
-                        band_out.size() * sizeof(float));
+            if (!device_residual) {
+                std::memcpy(residual.data() + (size_t) first * hc_dim, band_out.data(),
+                            band_out.size() * sizeof(float));
+            }
             std::copy(band_pre.begin(), band_pre.end(), pre.begin() + (ptrdiff_t) first * n_hc);
             first += count;
         }
+    }
+    if (band.pipeline) ok = ds4_pipeline_finish_all(pipeline_state, backend, ok);
+    if (ok && tail) {
+        // tail->rows on entry: how many trailing rows to hand back (0 = the
+        // whole last band).
+        const int rows = tail->rows > 0 ? std::min(tail->rows, n_tokens) : run_bands.back();
+        const int first = n_tokens - rows;
+        tail->rows = rows;
+        tail->selection_first = first;
+        tail->selection_columns = n_tokens;
+        tail->residual.resize((size_t) rows * hc_dim);
+        if (device_residual) {
+            ok = ds4_residual_rows_copy(device_residual, first, rows, tail->residual.data(),
+                                        /*to_device=*/false);
+        } else {
+            std::memcpy(tail->residual.data(), residual.data() + (size_t) first * hc_dim,
+                        sizeof(float) * tail->residual.size());
+        }
+        tail->pre.assign(pre.begin() + (ptrdiff_t) first * n_hc, pre.end());
     }
     // The context after the whole prompt, as a chunked prefill leaves it.
     cache.engram_tokens = context_before;
@@ -11704,6 +12322,21 @@ void deepseek4_release_prefill_scratch(
                      free_before / (1024.0 * 1024.0),
                      free_after / (1024.0 * 1024.0));
     }
+}
+
+int deepseek4_prefill_pipeline_bands() {
+    static const int bands = [] {
+        const char * v = std::getenv("LUCE_DS4_PREFILL_PIPELINE");
+        return v && *v ? std::max(0, std::atoi(v)) : 0;
+    }();
+    return bands;
+}
+
+void deepseek4_release_retry_scratch(DeepSeek4Cache & c,
+                                     MoeHybridStorage * moe_hybrid) {
+    deepseek4_release_prefill_scratch(c, moe_hybrid);
+    if (c.layer_range_cache) c.layer_range_cache->prepare_for_new_prefill();
+    if (moe_hybrid) moe_hybrid->release_graph_caches();
 }
 
 void deepseek4_release_image_scratch(DeepSeek4Cache & c,

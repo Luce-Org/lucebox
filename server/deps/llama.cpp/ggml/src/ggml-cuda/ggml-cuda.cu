@@ -932,6 +932,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaEventDestroy(copy_event));
         copy_event = nullptr;
     }
+    if (side_copy_stream != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaStreamSynchronize(side_copy_stream));
+        CUDA_CHECK(cudaStreamDestroy(side_copy_stream));
+        CUDA_CHECK(cudaEventDestroy(side_copy_ready));
+        CUDA_CHECK(cudaEventDestroy(side_copy_done));
+        side_copy_stream = nullptr;
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -4113,6 +4121,95 @@ static void ggml_cuda_flush_peer_copy_batch(const char * reason) {
 }
 #endif
 
+// A peer copy on the source context's side stream instead of its compute
+// stream: it starts where the compute stream is when the copy is queued, the
+// destination stream waits for it, and later work on the source's compute
+// stream does not. The caller keeps src unchanged until the destination has
+// consumed it. False when the backends or buffers do not qualify; the caller
+// then copies the usual way.
+bool ggml_backend_cuda_copy_tensor_async_side(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+                                              const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+        return false;
+    }
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (!buf_src || !buf_dst || !ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst) ||
+        !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || ggml_nbytes(src) != ggml_nbytes(dst)) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx_src = (ggml_backend_cuda_context *) backend_src->context;
+    ggml_backend_cuda_context * ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+    const ggml_backend_cuda_buffer_context * bctx_src = (const ggml_backend_cuda_buffer_context *) buf_src->context;
+    const ggml_backend_cuda_buffer_context * bctx_dst = (const ggml_backend_cuda_buffer_context *) buf_dst->context;
+    if (ctx_src->device == ctx_dst->device || bctx_src->device != ctx_src->device ||
+        bctx_dst->device != ctx_dst->device) {
+        return false;
+    }
+#if defined(GGML_USE_HIP)
+    // Batched peer copies record their completion later on the source
+    // stream; settle them before ordering against that stream.
+    ggml_cuda_flush_peer_copy_batch("side-copy");
+#endif
+    ggml_cuda_set_device(ctx_src->device);
+    if (!ctx_src->side_copy_stream) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ctx_src->side_copy_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx_src->side_copy_ready, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx_src->side_copy_done, cudaEventDisableTiming));
+    }
+    cudaStream_t side = ctx_src->side_copy_stream;
+    CUDA_CHECK(cudaEventRecord(ctx_src->side_copy_ready, ctx_src->stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(side, ctx_src->side_copy_ready, 0));
+    CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, ctx_dst->device, src->data, ctx_src->device,
+                                   ggml_nbytes(dst), side));
+    CUDA_CHECK(cudaEventRecord(ctx_src->side_copy_done, side));
+    ggml_cuda_set_device(ctx_dst->device);
+    CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), ctx_src->side_copy_done, 0));
+    return true;
+}
+
+// A peer copy queued on the source's compute stream with no wait on the
+// destination: the caller records an event on the source backend after it
+// and has the destination wait for that event when it needs the data.
+bool ggml_backend_cuda_copy_tensor_async_nowait(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+                                                const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+        return false;
+    }
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (!buf_src || !buf_dst || !ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst) ||
+        !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || ggml_nbytes(src) != ggml_nbytes(dst)) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx_src = (ggml_backend_cuda_context *) backend_src->context;
+    ggml_backend_cuda_context * ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+    if (ctx_src->device == ctx_dst->device) {
+        return false;
+    }
+#if defined(GGML_USE_HIP)
+    ggml_cuda_flush_peer_copy_batch("nowait-copy");
+#endif
+    ggml_cuda_set_device(ctx_src->device);
+    CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, ctx_dst->device, src->data, ctx_src->device,
+                                   ggml_nbytes(dst), ctx_src->stream()));
+    return true;
+}
+
+// Order the compute stream after every side-stream copy queued so far, so
+// it may overwrite their sources.
+void ggml_backend_cuda_join_side_copies(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    if (!ctx->side_copy_stream) {
+        return;
+    }
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->stream(), ctx->side_copy_done, 0));
+}
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -4206,6 +4303,9 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_cuda_set_device(cuda_ctx->device);
 #endif
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    if (cuda_ctx->side_copy_stream) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->side_copy_stream));
+    }
 
     GGML_UNUSED(backend);
 }

@@ -186,6 +186,7 @@ struct DeepSeek4Layer {
     // protected mask (I32 [n_expert]), for graphs that route on the device.
     ggml_tensor * native_selection_bias = nullptr;
     ggml_tensor * protected_mask        = nullptr;
+    ggml_tensor * router_bias_delta_dev = nullptr;  // router bias delta row (device)
     ggml_tensor * ffn_gate_bias_vl   = nullptr;  // image router bias, loaded only with --mmproj
 
     // Hash routing table (first n_hash_layer layers only)
@@ -459,12 +460,19 @@ struct DeepSeek4LayerCache {
     // Compressor rolling state
     DeepSeek4CompressorState attn_compressor;
     DeepSeek4CompressorState indexer_compressor;
+
+    // Raw-window floor for a decoder bounded replay (do_prefill): a batched
+    // step at kv_start sees only the raw rows at positions >= swa_floor.
+    // 0 everywhere else, and reset before the prefill returns.
+    int swa_floor = 0;
 };
 
 // Per-shard runtime state for deepseek4_step_layer_range (host-side HC weight
 // cache + cached decode graphs). Defined in deepseek4_graph.cpp; owned by the
 // DeepSeek4Cache below and released by free_deepseek4_cache().
 struct DeepSeek4LayerRangeCache;
+
+struct Ds4PrefillPipeline;  // deepseek4_graph.cpp
 
 // One step of a whole-prompt layer-major prefill (deepseek4_prefill_layer_major):
 // the step runs one layer over one band of the prompt, so the staggered
@@ -474,7 +482,33 @@ struct DeepSeek4LayerMajorBand {
     std::vector<float> * staggered_pre = nullptr;  // [n_tokens][n_hc], in and out
     int selection_first = 0;                        // column of the band's first token
     int selection_columns = 0;                      // tokens of the whole pass
+    // Optional [n_hc * n_embd, selection_columns] F32 residual on the target
+    // device: a band reads its input (after layer 0) and writes its output
+    // there instead of crossing the host link every layer.
+    ggml_tensor * device_residual = nullptr;
+    // Optional per-band Engram keys: read at the band's first Engram layer,
+    // reused at the next (they depend only on the band's tokens).
+    std::vector<float> * engram_keys = nullptr;
+    // Pipelined prefill (LUCE_DS4_PREFILL_PIPELINE): which set of prefill HC
+    // graphs this band uses (bands alternate, so a band's deferred FFN join
+    // keeps its own tensors), and the pass's pipeline state.
+    int graph_slot = 0;
+    Ds4PrefillPipeline * pipeline = nullptr;
 };
+
+// The last band of a layer-major pass that stopped early (bounded replay):
+// its rows' residual and staggered pre-mix after the last layer run, and its
+// columns in the pass's selection store, for a band call over the rest.
+struct DeepSeek4LayerMajorTail {
+    int rows = 0;
+    int selection_first = 0;
+    int selection_columns = 0;
+    std::vector<float> residual;  // [rows][n_hc * n_embd]
+    std::vector<float> pre;       // [rows][n_hc]
+};
+
+inline constexpr int kDs4PipelineCapPct = 50;
+inline constexpr int kDs4PipelineMinCapPct = 25;
 
 struct DeepSeek4Cache {
     int cur_pos  = 0;
@@ -483,6 +517,11 @@ struct DeepSeek4Cache {
 
     std::vector<DeepSeek4LayerCache> layers;
     PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
+    // Pipelined prefill bands use this share of the memory-derived row cap:
+    // the first long request of a process also makes one-time allocations
+    // the free-memory read does not see yet. A failed prefill halves it;
+    // below kDs4PipelineMinCapPct the pipeline is off.
+    int pipeline_cap_pct = kDs4PipelineCapPct;
 
     // HC residual streams: [n_hc * n_embd] persistent state
     ggml_tensor * hc_state    = nullptr;  // [n_hc * n_embd]
@@ -627,6 +666,10 @@ bool ds4_engram_apply_host(ggml_backend_t backend, const DeepSeek4Weights & w, i
                            const std::vector<float> & keys, float * hc_state, int n_tokens,
                            DeepSeek4EngramApplyRunner & runner,
                            DeepSeek4StepTelemetry * telemetry);
+bool ds4_engram_apply_device(ggml_backend_t backend, const DeepSeek4Weights & w, int il,
+                             const std::vector<float> & keys, ggml_tensor * hc_dev, int n_tokens,
+                             DeepSeek4EngramApplyRunner & runner,
+                             DeepSeek4StepTelemetry * telemetry);
 
 // The Engram constants and table locations of a GGUF, without loading any
 // tensor (tools and tests).
@@ -710,6 +753,14 @@ void reset_deepseek4_cache(DeepSeek4Cache & c);
 // state and the DSpark feature tail remain live for the following decode.
 void deepseek4_release_prefill_scratch(DeepSeek4Cache & c,
                                        MoeHybridStorage * moe_hybrid);
+// LUCE_DS4_PREFILL_PIPELINE: the minimum band count of a pipelined
+// layer-major prefill (0 = no pipeline).
+int deepseek4_prefill_pipeline_bands();
+// Before a prefill retry: retire the prefill arenas, the cached decode and
+// verify graphs and the owner graph caches. KV, snapshots and the index
+// selection store stay.
+void deepseek4_release_retry_scratch(DeepSeek4Cache & c,
+                                     MoeHybridStorage * moe_hybrid);
 // Retire all disposable decoder/owner graphs before the vision tower uses the
 // shared scratch allowance. KV and saved snapshots are left intact.
 void deepseek4_release_image_scratch(DeepSeek4Cache & c,
@@ -837,7 +888,9 @@ bool deepseek4_prefill_layer_major(
     const float * embed, const int32_t * token_ids, int kv_start,
     const std::vector<int> & bands, DeepSeek4StepTelemetry * telemetry,
     MoeHybridStorage * moe_hybrid, MoeExpertComputeRuntime * expert_runtime,
-    MoeHybridRoutingStats * routing_stats);
+    MoeHybridRoutingStats * routing_stats,
+    int layer_end = -1,   // run layers [0, layer_end); -1 = every layer
+    DeepSeek4LayerMajorTail * tail = nullptr);  // out: the last band's state
 
 // One sequence of a shared prefill pass: `n_tokens` rows of `embed` starting
 // at `kv_start` of `cache`, with the sequence's image spans in its own prompt
