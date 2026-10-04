@@ -3190,60 +3190,6 @@ static bool ggml_cuda_mmb_cublas_shape_ok(const ggml_tensor * w) {
 #endif // defined(GGML_USE_HIP)
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-#if defined(GGML_USE_HIP)
-    const int64_t tokens = ggml_nrows(src1);
-    // Frozen gfx1151 / ROCm 7.2.2 table, trained on separate 16366-token captures.
-    // MMQ changes activation quantization, so the reference profile never takes it;
-    const bool measured_dense = ggml_cuda_qwen4exp_enabled() && tokens == 16366 && src1->type == GGML_TYPE_F32 &&
-        !ggml_backend_buft_is_cuda_split(src0->buffer->buft) &&
-        ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
-        ggml_cuda_mmb_supported_mm(src0, src1, dst);
-    if (measured_dense &&
-        !ggml_cuda_mmb_bf16_src(src1) && !ggml_cuda_mmb_is_bf16_only(dst)) {
-        struct entry { ggml_type type; int64_t m, k; bool shadow; };
-        static const entry measured[] = {
-            {GGML_TYPE_IQ4_NL, 2560, 2560, false},
-            {GGML_TYPE_Q8_0,   2560, 6144, false},
-            {GGML_TYPE_Q8_0,   2560,  640, false},
-            {GGML_TYPE_IQ4_NL, 2560,  640, false},
-            {GGML_TYPE_Q5_K,   2560, 6144, true},
-            {GGML_TYPE_IQ4_NL, 2560, 6144, true},
-
-            // GSQ-RCO IQ3_XXS: every tuple below beat MMB in a separate
-            // 16366-token capture. Shadow-backed Q5_K/Q6_K tuples that favor
-            // rocBLAS remain on the shadow route below.
-            {GGML_TYPE_Q4_K,     512, 2560, false},
-            {GGML_TYPE_Q4_K,     640, 2560, false},
-            {GGML_TYPE_Q4_K,    2560, 6144, false},
-            {GGML_TYPE_Q4_K,    6144, 2560, false},
-            {GGML_TYPE_Q4_K,   10240, 2560, false},
-            {GGML_TYPE_Q4_K,   12288, 2560, false},
-            {GGML_TYPE_Q5_K,     512, 2560, false},
-            {GGML_TYPE_Q5_K,     640, 2560, false},
-            {GGML_TYPE_Q6_K,     512, 2560, true},
-            {GGML_TYPE_Q6_K,     640, 2560, true},
-            {GGML_TYPE_IQ3_S,    512, 2560, false},
-            {GGML_TYPE_IQ3_S,    640, 2560, false},
-            {GGML_TYPE_IQ3_S,   2560, 6144, false},
-            {GGML_TYPE_IQ3_S,   6144, 2560, false},
-            {GGML_TYPE_IQ3_S,  12288, 2560, false},
-            {GGML_TYPE_IQ4_XS,   512, 2560, false},
-            {GGML_TYPE_IQ4_XS,   640, 2560, false},
-            {GGML_TYPE_IQ4_XS,  2560, 6144, false},
-            {GGML_TYPE_IQ4_XS,  6144, 2560, false},
-            {GGML_TYPE_IQ4_XS, 10240, 2560, false},
-            {GGML_TYPE_IQ4_XS, 12288, 2560, false},
-            {GGML_TYPE_Q2_0,    2560,  640, false},
-        };
-        for (const auto & row : measured) {
-            if (src0->type == row.type && src0->ne[1] == row.m && src0->ne[0] == row.k &&
-                (ggml_cuda_mmb_shadow_ptr(src0) != nullptr) == row.shadow) {
-                ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
-                return;
-            }
-        }
-    }
-#endif // defined(GGML_USE_HIP)
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
     const bool grouped_src = ggml_mul_mat_is_grouped_src(dst);
 
