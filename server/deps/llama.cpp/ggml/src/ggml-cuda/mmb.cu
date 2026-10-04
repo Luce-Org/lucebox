@@ -428,20 +428,24 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #pragma unroll
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
     int weight_ks = 0;
-    // q4_K with 4*BM == MMB_NT: every thread decodes one 32-element half of one gate-or-up row (was BM of 256 threads
-    // decoding both full rows while the rest waited at the barrier). Same per-element arithmetic: bit-exact.
+    // Q4_K: two threads per gate/up row, each owning 16 packed bytes of every 64-value slice. Keep the full
+    // compressed block in registers across four K steps: 128 payload + 2*16 header bytes instead of 4*2*(32+16).
+    // BF16 tiles and the per-output WMMA K order stay unchanged; no expanded weights go through DRAM.
     constexpr bool Q4K_SPLIT = WTYPE == 32 + GGML_TYPE_Q4_K && 4 * BM == MMB_NT;
     const int s_mat = tid / (2 * BM), s_row = (tid >> 1) % BM, s_half = tid & 1;
-    uint4 sq0, sq1, sqm;
+    uint4 sq0, sq1, sq2, sq3, sqm;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
         if constexpr (Q4K_SPLIT) {
-            if (s_row < a_rows) {
-                const uint8_t * p = (s_mat ? Wu : Wg) + (size_t)s_row * wrow_bytes + (size_t)(ks / 4) * sizeof(block_q4_K);
-                sqm = *(const uint4 *)p;
-                const int offset = 16 + (ks & 3) * 32;
-                sq0 = *(const uint4 *)(p + offset); sq1 = *(const uint4 *)(p + offset + 16);
-            } else { sqm = sq0 = sq1 = make_uint4(0,0,0,0); }
+            if ((ks & 3) == 0) {
+                if (s_row < a_rows) {
+                    const uint8_t * p = (s_mat ? Wu : Wg) + (size_t)s_row * wrow_bytes + (size_t)(ks / 4) * sizeof(block_q4_K);
+                    sqm = *(const uint4 *)p;
+                    p += 16 + s_half * 16;
+                    sq0 = *(const uint4 *)(p);      sq1 = *(const uint4 *)(p + 32);
+                    sq2 = *(const uint4 *)(p + 64); sq3 = *(const uint4 *)(p + 96);
+                } else { sqm = sq0 = sq1 = sq2 = sq3 = make_uint4(0,0,0,0); }
+            }
         } else
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) {
@@ -478,7 +482,9 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
         }
 
         if constexpr (Q4K_SPLIT) {
-            mmb_dq_q4k_half(sq0, sq1, sqm, weight_ks & 3, s_half, (uint32_t *)((s_mat ? Au : Ag) + s_row * MMB_LDS_STRIDE) + 16 * s_half);
+            const int slice = weight_ks & 3;
+            const uint4 q = slice == 0 ? sq0 : slice == 1 ? sq1 : slice == 2 ? sq2 : sq3;
+            mmb_dq_q4k_stripe(q, sqm, slice, (uint32_t *)((s_mat ? Au : Ag) + s_row * MMB_LDS_STRIDE) + 8 * s_half);
         } else
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) {

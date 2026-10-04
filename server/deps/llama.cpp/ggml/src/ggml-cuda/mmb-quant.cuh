@@ -296,22 +296,24 @@ __device__ __forceinline__ void mmb_dq_q4k_slice(uint4 q0, uint4 q1, uint4 meta,
     }
 }
 
-// One 32-element half of mmb_dq_q4k_slice (half 0 = low nibbles / sub-block 2*slice, half 1 = high nibbles), same
-// per-element arithmetic, so splitting a row across two threads is bit-exact. out points at the half's 16 words.
-__device__ __forceinline__ void mmb_dq_q4k_half(uint4 q0, uint4 q1, uint4 meta, int slice, int half, uint32_t * out) {
+// Decode 16 packed bytes into both nibble planes. Two threads cover a 64-value slice without loading the same
+// packed bytes twice. out points at word 0 or 8 of the slice; the high nibbles go 16 words further on.
+__device__ __forceinline__ void mmb_dq_q4k_stripe(uint4 q, uint4 meta, int slice, uint32_t * out) {
     const float d = mmb_h2f((uint16_t) meta.x), dm = mmb_h2f((uint16_t)(meta.x >> 16));
     auto byte = [&](int i) { const uint32_t word = i < 4 ? meta.y : i < 8 ? meta.z : meta.w; return (word >> (8 * (i & 3))) & 255; };
-    const int i = 2 * slice + half;
-    const uint32_t sc = i < 4 ? byte(i) & 63 : (byte(i + 4) & 15) | ((byte(i - 4) >> 6) << 4);
-    const uint32_t mn = i < 4 ? byte(i + 4) & 63 : (byte(i + 4) >> 4) | ((byte(i) >> 6) << 4);
-    const float ds = d * sc, ms = dm * mn;
-    const uint32_t words[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
-    const int sh = 4 * half;
+    const uint32_t words[4] = {q.x, q.y, q.z, q.w};
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const uint32_t q = words[j] >> sh;
-        out[2*j]     = mmb_pack2(ds * (q & 15) - ms, ds * ((q >> 8) & 15) - ms);
-        out[2*j + 1] = mmb_pack2(ds * ((q >> 16) & 15) - ms, ds * ((q >> 24) & 15) - ms);
+    for (int half = 0; half < 2; ++half) {
+        const int i = 2 * slice + half;
+        const uint32_t sc = i < 4 ? byte(i) & 63 : (byte(i + 4) & 15) | ((byte(i - 4) >> 6) << 4);
+        const uint32_t mn = i < 4 ? byte(i + 4) & 63 : (byte(i + 4) >> 4) | ((byte(i) >> 6) << 4);
+        const float ds = d * sc, ms = dm * mn;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t v = words[j] >> (4 * half);
+            out[16*half + 2*j]     = mmb_pack2(ds * (v & 15) - ms, ds * ((v >> 8) & 15) - ms);
+            out[16*half + 2*j + 1] = mmb_pack2(ds * ((v >> 16) & 15) - ms, ds * ((v >> 24) & 15) - ms);
+        }
     }
 }
 
