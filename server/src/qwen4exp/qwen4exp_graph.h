@@ -33,6 +33,16 @@ struct Qwen4ExpForwardResult {
     int  pos0 = 0;
 };
 
+// Host-only input preparation; safe to run for the next prompt chunk while
+// the current graph computes. The caller owns the immutable token span.
+struct Qwen4ExpInputs {
+    bool ok = false;
+    std::vector<float> emb, ple;
+    std::vector<int32_t> ple_prev;
+};
+Qwen4ExpInputs qwen4exp_prepare_inputs(const Qwen4ExpWeights & w,
+    const int32_t * tokens, int n_tokens, const std::vector<int32_t> & ple_prev);
+
 // Run the trunk. `tokens` has n_tokens entries, processed as one contiguous
 // single-sequence span at positions [pos0, pos0 + n_tokens). On success the
 // cache is advanced to pos0 + n_tokens and out_logits holds n_vocab floats
@@ -44,6 +54,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                                        int n_tokens,
                                        int pos0,
                                        std::vector<float> & out_logits,
-                                       bool dump = false);  // test-only activation summaries
+                                       bool dump = false,  // test-only activation summaries
+                                       const Qwen4ExpInputs * inputs = nullptr);
 
 }  // namespace luce::common

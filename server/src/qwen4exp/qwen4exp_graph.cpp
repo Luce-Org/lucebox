@@ -620,8 +620,8 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
             : ggml_cpy(c, kraw, ggml_view_2d(c, indexer_raw, kraw->ne[0], T, indexer_raw->nb[1],
                                              (size_t) pos0 * indexer_raw->nb[1])));
     }
-    // qwen4exp_forward elides the dense causal mask only when every full layer takes QSA; a dense fallback without one must fail loudly.
-    if (T > 1 && mask == nullptr && qsa != QSA_PREFILL) {
+    // Both QSA kernels compute visibility themselves; a dense fallback needs a causal mask.
+    if (T > 1 && mask == nullptr && qsa == QSA_DENSE) {
         std::fprintf(stderr,
             "[qwen4exp] dense attention without a causal mask (T=%lld pos0=%lld)\n",
             (long long) T, (long long) pos0);
@@ -778,56 +778,22 @@ ggml_tensor * build_ple(ggml_context * c, ggml_cgraph * gf, ggml_tensor * hidden
 
 }  // namespace
 
-Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
-                                       const Qwen4ExpWeights & w,
-                                       Qwen4ExpCache & cache,
-                                       const int32_t * tokens,
-                                       int n_tokens,
-                                       int pos0,
-                                       std::vector<float> & out_logits, bool dump) {
-    Qwen4ExpForwardResult res;
-    if (n_tokens <= 0 || pos0 < 0 || !tokens) return res;
-    const bool upstream = cache.reference;
-    const Qwen4ExpCudaScope profile(w.gfx1151, upstream);
-    const bool f16 = !upstream && !dump;
-    const bool hc_fused = !upstream;
-    // T=1 decode reuses one context/allocator and a stable bucketed graph.
-    // Past the QSA block budget the selected-cell graph changes shape as blocks complete, so it is rebuilt per step.
-    const Qwen4ExpQsaMode qsa = qsa_mode(w, cache, n_tokens, pos0, profile.optimized);
-    // T=1 decode reuses one context/allocator; below the QSA budget it also keeps a stable bucketed graph.
-    const bool reuse_ws = !upstream && n_tokens == 1 && !dump;
-    const bool use_stable_graph = reuse_ws && qsa == QSA_DENSE;
-    std::vector<std::pair<ggml_tensor *, std::string>> dump_t;
-    auto dump_mark = [&](ggml_tensor * t, const char * label) {
-        if (t && dump) {
-            // A view output must keep its owning allocation alive until the dump.
-            for (ggml_tensor * base = t; base; base = base->view_src) ggml_set_output(base);
-            ggml_set_name(t, label);
-            dump_t.emplace_back(t, label);
-        }
-    };
-    if (pos0 + n_tokens > cache.max_ctx) {
-        std::fprintf(stderr, "[qwen4exp] context overflow: %d + %d > %d\n",
-                     pos0, n_tokens, cache.max_ctx);
-        return res;
-    }
-
-    std::vector<int> lin_idx(w.n_layer, -1);
-    std::vector<int> full_idx(w.n_layer, -1);
-    for (size_t i = 0; i < cache.linear_layer_ids.size(); ++i) lin_idx[cache.linear_layer_ids[i]] = (int) i;
-    for (size_t i = 0; i < cache.full_layer_ids.size(); ++i)   full_idx[cache.full_layer_ids[i]] = (int) i;
-
-    std::vector<float> emb((size_t) w.n_embd * n_tokens);
+Qwen4ExpInputs qwen4exp_prepare_inputs(const Qwen4ExpWeights & w,
+        const int32_t * tokens, int n_tokens, const std::vector<int32_t> & ple_prev) {
+    Qwen4ExpInputs res;
+    if (!tokens || n_tokens <= 0) return res;
+    auto & emb = res.emb;
+    emb.resize((size_t) w.n_embd * n_tokens);
     if (!w.embedder.embed(tokens, n_tokens, emb.data())) {
         std::fprintf(stderr, "[qwen4exp] cpu embedding failed\n");
         return res;
     }
 
-    const bool has_ple = !cache.ple_layer_ids.empty() && w.ple_reader.available();
+    const bool has_ple = !w.ple_layer_ids.empty() && w.ple_reader.available();
     const int64_t ple_heads = w.ple_n_heads;
     std::vector<int32_t> ple_rows(has_ple ? (size_t) ple_heads * n_tokens : 0);
-    std::vector<float>   ple_data(has_ple ? (size_t) w.ple_head_dim * ple_heads * n_tokens : 0);
-    std::vector<int32_t> ple_prev = cache.ple_prev;   // oldest first, size <= ng-1
+    auto & ple_data = res.ple;
+    ple_data.resize(has_ple ? (size_t) w.ple_head_dim * ple_heads * n_tokens : 0);
     if (has_ple) {
         const int64_t ng = w.ple_ngram_size;
         std::vector<int32_t> seq = ple_prev;
@@ -871,8 +837,64 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         for (size_t k = total - keep; k < total; ++k) {
             next.push_back(k < ple_prev.size() ? ple_prev[k] : tokens[k - ple_prev.size()]);
         }
-        cache.ple_prev = std::move(next);
+        res.ple_prev = std::move(next);
     }
+
+    res.ok = true;
+    return res;
+}
+
+Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
+                                       const Qwen4ExpWeights & w,
+                                       Qwen4ExpCache & cache,
+                                       const int32_t * tokens,
+                                       int n_tokens,
+                                       int pos0,
+                                       std::vector<float> & out_logits, bool dump,
+                                       const Qwen4ExpInputs * inputs) {
+    Qwen4ExpForwardResult res;
+    if (n_tokens <= 0 || pos0 < 0 || !tokens) return res;
+    const bool upstream = cache.reference;
+    const Qwen4ExpCudaScope profile(w.gfx1151, upstream);
+    const bool f16 = !upstream && !dump;
+    const bool hc_fused = !upstream;
+    // T=1 decode reuses one context/allocator and a stable bucketed graph.
+    // Past the QSA block budget the selected-cell graph changes shape as blocks complete, so it is rebuilt per step.
+    const Qwen4ExpQsaMode qsa = qsa_mode(w, cache, n_tokens, pos0, profile.optimized);
+    // T=1 decode reuses one context/allocator; below the QSA budget it also keeps a stable bucketed graph.
+    const bool reuse_ws = !upstream && n_tokens == 1 && !dump;
+    const bool use_stable_graph = reuse_ws && qsa == QSA_DENSE;
+    std::vector<std::pair<ggml_tensor *, std::string>> dump_t;
+    auto dump_mark = [&](ggml_tensor * t, const char * label) {
+        if (t && dump) {
+            // A view output must keep its owning allocation alive until the dump.
+            for (ggml_tensor * base = t; base; base = base->view_src) ggml_set_output(base);
+            ggml_set_name(t, label);
+            dump_t.emplace_back(t, label);
+        }
+    };
+    if (pos0 > cache.max_ctx || n_tokens > cache.max_ctx - pos0) {
+        std::fprintf(stderr, "[qwen4exp] context overflow: %d + %d > %d\n",
+                     pos0, n_tokens, cache.max_ctx);
+        return res;
+    }
+
+    std::vector<int> lin_idx(w.n_layer, -1);
+    std::vector<int> full_idx(w.n_layer, -1);
+    for (size_t i = 0; i < cache.linear_layer_ids.size(); ++i) lin_idx[cache.linear_layer_ids[i]] = (int) i;
+    for (size_t i = 0; i < cache.full_layer_ids.size(); ++i)   full_idx[cache.full_layer_ids[i]] = (int) i;
+
+    const bool has_ple = !cache.ple_layer_ids.empty() && w.ple_reader.available();
+    const int64_t ple_heads = w.ple_n_heads;
+    Qwen4ExpInputs local_inputs;
+    if (!inputs) {
+        local_inputs = qwen4exp_prepare_inputs(w, tokens, n_tokens, cache.ple_prev);
+        inputs = &local_inputs;
+    }
+    if ((!inputs->ok || inputs->emb.size() != (size_t) w.n_embd * n_tokens ||
+        inputs->ple.size() != (has_ple ? (size_t) w.ple_head_dim * ple_heads * n_tokens : 0))) return res;
+    const auto & emb = inputs->emb;
+    const auto & ple_data = inputs->ple;
 
     const int64_t T = n_tokens;
     const int64_t kv_len = pos0 + n_tokens;
@@ -914,6 +936,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     Qwen4ExpDecodeWorkspace & decode_ws = cache.decode_workspace;
     if (use_stable_graph && decode_ws.gf && kv_len <= decode_ws.kv_bucket) {
         if (!run_stable(decode_ws)) return res;
+        cache.ple_prev = inputs->ple_prev;
         res.ok = true;
         res.n_tokens = n_tokens;
         res.pos0 = pos0;
@@ -960,9 +983,8 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         ggml_set_input(kv_row);
     }
     ggml_tensor * mask = nullptr;
-    // QSA derives its own complete-block visibility: the prefill kernel needs no dense mask.
-    const bool qsa_all = qsa == QSA_PREFILL;
-    if ((T > 1 || fa_pad256 || use_stable_graph) && !qsa_all) {
+    // Both packed prefill and short-tail QSA derive their own visibility.
+    if ((T > 1 || fa_pad256 || use_stable_graph) && qsa == QSA_DENSE) {
         mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mask_len, T);
         ggml_set_input(mask);
     }
@@ -1249,6 +1271,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         }
         return res;
     }
+    cache.ple_prev = inputs->ple_prev;
     // Commit only after the graph computed: a failed compute must not mark blocks the kernel never pooled.
     if (qsa != QSA_DENSE) cache.indexer_blocks = (int) ((pos0 + T) / qsa_ratio(w));
 

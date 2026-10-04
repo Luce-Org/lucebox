@@ -743,7 +743,9 @@ gated_delta_net_tiled_cuda(const float * q,
         }
         if (thread < tile_size) {
             const int64_t gb_offset = sequence * sb3 + (t0 + thread) * sb2 + h_idx * sb1;
-            g_shared[thread]    = g[gb_offset];
+            // All columns use the same decay: evaluate exp once per token/block,
+            // preserving the recurrence and its reduction/FMA order.
+            g_shared[thread]    = expf(g[gb_offset]);
             beta_shared[thread] = beta[gb_offset];
         }
         __syncthreads();
@@ -760,7 +762,7 @@ gated_delta_net_tiled_cuda(const float * q,
                 q_reg[r] = q_shared[tt][i];
             }
 
-            const float g_val    = expf(g_shared[tt]);
+            const float g_val    = g_shared[tt];
             const float beta_val = beta_shared[tt];
 
             float attn_col[COLS];

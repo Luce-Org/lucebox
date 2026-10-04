@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <future>
 #include <random>
 #include <utility>
 #include <vector>
@@ -113,13 +114,26 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
     reset_qwen4exp_state(backend_, cache_);
 
     const auto t_pre0 = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < req.prompt.size(); i += (size_t) chunk) {
+    // Exactly one host-only gather ahead. A future joins before returning on
+    // failure/cancellation, so neither the prompt nor the reader can be freed
+    // while a worker is using it. No GPU or cache mutation on that thread.
+    auto prepare = [&](size_t offset) {
+        const size_t start = offset > (size_t) (weights_.ple_ngram_size - 1)
+            ? offset - (weights_.ple_ngram_size - 1) : 0;
+        std::vector<int32_t> prev(req.prompt.begin() + start, req.prompt.begin() + offset);
+        return qwen4exp_prepare_inputs(weights_, req.prompt.data() + offset,
+            (int) std::min((size_t) chunk, req.prompt.size() - offset), prev);
+    };
+    auto inputs = prepare(0);
+    for (size_t i = 0; i < req.prompt.size();) {
         const int n = (int) std::min((size_t) chunk, req.prompt.size() - i);
+        const size_t next = i + n;
+        std::future<Qwen4ExpInputs> pending;
+        if (next < req.prompt.size()) pending = std::async(std::launch::async, prepare, next);
         const Qwen4ExpForwardResult r = qwen4exp_forward(
-            backend_, weights_, cache_, req.prompt.data() + i, n, pos, logits);
+            backend_, weights_, cache_, req.prompt.data() + i, n, pos, logits, false, &inputs);
         if (!r.ok) {
-            result.fail(GenerateErrorCode::PrefillFailed,
-                        "qwen4exp prefill forward failed");
+            result.fail(GenerateErrorCode::PrefillFailed, "qwen4exp prefill forward failed");
             return result;
         }
         pos += n;
@@ -127,6 +141,8 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
             result.fail(GenerateErrorCode::Cancelled, "cancelled during prefill");
             return result;
         }
+        if (pending.valid()) inputs = pending.get();
+        i = next;
     }
     const auto t_pre1 = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_pre1 - t_pre0).count();
