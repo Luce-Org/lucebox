@@ -37,8 +37,8 @@ the calling thread's profile flag. It does not read qwen4exp environment variabl
 environment; other models retain their own dispatch. Without `--chunk`, the
 prefill chunk is the largest 256-row multiple that fits the memory left after
 weights and caches (7424 rows for UD at 262K context, one slot); the banner and
-`/props` report it. Prompt attention accumulates in F32, so the logits do not
-depend on the chunk size.
+`/props` report it. Prompt attention accumulates in F32: on UD an 18K prompt
+prefilled in 2048- or 7424-row chunks gives logits bitwise equal to one pass.
 
 Build:
 
