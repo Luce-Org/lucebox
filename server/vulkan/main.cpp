@@ -1,6 +1,6 @@
 #include "lfm2_backend.h"
 #include "qwen2_backend.h"
-#include "model_selection.h"
+#include "startup_policy.h"
 #include "gguf.h"
 #include "engine/luce_engine.h"
 #include "server/http_server.h"
@@ -39,7 +39,9 @@ int main(int argc, char ** argv) {
         if (ai < 0 || gguf_get_kv_type(meta.get(), ai) != GGUF_TYPE_STRING)
             throw std::runtime_error("missing architecture");
         const std::string arch = gguf_get_val_str(meta.get(), ai);
-        const bool lfm = vulkan_model(arch) == VulkanModel::Lfm2Moe;
+        const auto model = vulkan_model(arch);
+        const bool lfm = model == VulkanModel::Lfm2Moe;
+        validate_vulkan_context(model, ctx);
         Tokenizer tokenizer;
         if (!tokenizer.load_from_gguf(argv[1])) throw std::runtime_error("tokenizer load failed");
         auto backend = lfm ? make_lfm2_vulkan(argv[1], ctx, chunk, flash)
@@ -56,11 +58,9 @@ int main(int argc, char ** argv) {
         cfg.decode_kv_offload_bytes = 0; cfg.default_max_tokens = 1024;
         cfg.max_tokens = 1024; cfg.hard_limit_reply_budget = 0;
         cfg.sampler_defaults.temperature = 0;
-        const auto ti = gguf_find_key(meta.get(), "tokenizer.chat_template");
-        if (ti >= 0 && gguf_get_kv_type(meta.get(), ti) == GGUF_TYPE_STRING) {
-            cfg.chat_template_src = gguf_get_val_str(meta.get(), ti);
-            cfg.chat_template_path = "GGUF:tokenizer.chat_template";
-        } else if (lfm) throw std::runtime_error("missing GGUF chat template");
+        const auto chat_template = vulkan_chat_template(meta.get(), model);
+        cfg.chat_template_src = chat_template.source;
+        cfg.chat_template_path = chat_template.path;
         HttpServer http(engine, tokenizer, cfg);
         http.set_chat_format(ChatFormat::QWEN3);
         server = &http;
