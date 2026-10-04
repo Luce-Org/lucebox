@@ -457,10 +457,186 @@ static __global__ void ds4_hc_out_kernel(
     dst[d] = acc;
 }
 
+// Modes 4/5: the DS4 router (ggml_ds4_router_select / _weights). Same expressions as op_softplus / op_sqrt /
+// op_add / op_clamp / op_div / scale_f32 and the same bitonic network as
+// k_argsort_f32_i32 (descending), so the selection and weights are identical
+// (test_ds4_fused_ops_cuda). No expression here may contract to an FMA:
+// the one product-plus-sum uses explicit rounding intrinsics.
+static __device__ __forceinline__ float ds4_router_prob(float x) {
+    const float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));
+    return sqrtf(sp);
+}
+
+template <int NPAD>
+static __device__ void ds4_router_sort_desc(int * idx, float * val, int n, int col) {
+    for (int kk = 2; kk <= NPAD; kk *= 2) {
+        for (int j = kk / 2; j > 0; j /= 2) {
+            const int ixj = col ^ j;
+            if (ixj > col) {
+                if ((col & kk) == 0) {
+                    if (idx[col] >= n || (idx[ixj] < n && val[col] < val[ixj])) {
+                        const int ti = idx[col]; idx[col] = idx[ixj]; idx[ixj] = ti;
+                        const float tv = val[col]; val[col] = val[ixj]; val[ixj] = tv;
+                    }
+                } else {
+                    if (idx[ixj] >= n || (idx[col] < n && val[col] > val[ixj])) {
+                        const int ti = idx[col]; idx[col] = idx[ixj]; idx[ixj] = ti;
+                        const float tv = val[col]; val[col] = val[ixj]; val[ixj] = tv;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+template <int NPAD>
+static __global__ void ds4_router_select_kernel(
+        const float * __restrict__ logits, size_t ld, const float * __restrict__ bias,
+        const float * __restrict__ native_bias, const int32_t * __restrict__ protected_mask,
+        int n_expert, int k, int32_t * __restrict__ dst) {
+    __shared__ int idx[NPAD];
+    __shared__ float val[NPAD];
+    __shared__ float probs[NPAD];
+    __shared__ int native_top[32];
+    __shared__ int keep_native;
+    const int t = blockIdx.x;
+    const int col = threadIdx.x;
+    if (col < n_expert) probs[col] = ds4_router_prob(logits[(size_t) t * ld + col]);
+    if (col == 0) keep_native = 0;
+    __syncthreads();
+    if (native_bias) {
+        idx[col] = col;
+        if (col < n_expert) val[col] = probs[col] + native_bias[col];
+        __syncthreads();
+        ds4_router_sort_desc<NPAD>(idx, val, n_expert, col);
+        if (col < k) {
+            native_top[col] = idx[col];
+            const int e = idx[col];
+            if (e >= 0 && e < n_expert && protected_mask[e] != 0) atomicOr(&keep_native, 1);
+        }
+        __syncthreads();
+    }
+    idx[col] = col;
+    if (col < n_expert) val[col] = probs[col] + bias[col];
+    __syncthreads();
+    ds4_router_sort_desc<NPAD>(idx, val, n_expert, col);
+    if (col < k) dst[(size_t) t * k + col] = keep_native ? native_top[col] : idx[col];
+}
+
+static __global__ void ds4_router_weights_kernel(
+        const float * __restrict__ logits, size_t ld, const int32_t * __restrict__ ids,
+        int k, float clamp_min, float scale, int apply_scale, float * __restrict__ dst) {
+    // One thread per token: k <= 32 values, reduced in reduce_rows' order.
+    const int t = blockIdx.x;
+    float w[32];
+    float v[32];
+#pragma unroll
+    for (int l = 0; l < 32; ++l) {
+        w[l] = l < k ? ds4_router_prob(logits[(size_t) t * ld + ids[(size_t) t * k + l]]) : 0.0f;
+        v[l] = w[l];
+    }
+    // reduce_rows_f32 on a k-wide row: lane l holds element l, then the
+    // 32-lane xor butterfly (the second block stage adds zeros only).
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float n[32];
+#pragma unroll
+        for (int l = 0; l < 32; ++l) n[l] = v[l] + v[l ^ off];
+#pragma unroll
+        for (int l = 0; l < 32; ++l) v[l] = n[l];
+    }
+    float sum = v[0];
+    sum = fminf(fmaxf(sum, clamp_min), INFINITY);
+    for (int i = 0; i < k; ++i) {
+        float r = w[i] / sum;
+        if (apply_scale) r = __fadd_rn(__fmul_rn(scale, r), 0.0f);  // scale_f32: scale * x + 0
+        dst[(size_t) t * k + i] = r;
+    }
+}
+
+// Mode 6: the staggered HC collapse. sum_rows over a 4-wide row of products
+// is one wave32 butterfly, (x0 + x2) + (x1 + x3); other widths replay the
+// whole butterfly with zeros past n_hc. Contraction off: a product must not
+// fuse into the following add.
+static __global__ void ds4_hc_collapse_kernel(
+        const float * __restrict__ hc, const float * __restrict__ pre, float * __restrict__ dst,
+        int n_embd, int n_hc, size_t hc_stride, size_t pre_stride, size_t dst_stride) {
+#pragma clang fp contract(off)
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (d >= n_embd) return;
+    const float * h = hc + (size_t) t * hc_stride + d;
+    const float * p = pre + (size_t) t * pre_stride;
+    if (n_hc == 4) {
+        const float v0 = h[0] * p[0];
+        const float v1 = h[(size_t) n_embd] * p[1];
+        const float v2 = h[2 * (size_t) n_embd] * p[2];
+        const float v3 = h[3 * (size_t) n_embd] * p[3];
+        dst[(size_t) t * dst_stride + d] = (v0 + v2) + (v1 + v3);
+        return;
+    }
+    float v[32];
+#pragma unroll
+    for (int l = 0; l < 32; ++l) v[l] = l < n_hc ? h[(size_t) l * n_embd] * p[l] : 0.0f;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float n[32];
+#pragma unroll
+        for (int l = 0; l < 32; ++l) n[l] = v[l] + v[l ^ off];
+#pragma unroll
+        for (int l = 0; l < 32; ++l) v[l] = n[l];
+    }
+    dst[(size_t) t * dst_stride + d] = v[0];
+}
+
+// GGML_OP_DS4_HC modes (op_params[0]): 0 hc_pre, 1 hc_post, 2 hc_out,
+// 3 hc_post_split, 4 router_select, 5 router_weights, 6 hc_collapse.
 void ggml_cuda_op_ds4_hc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * src2 = dst->src[2];
+
+    if (ggml_get_op_params_i32(dst, 0) == 4) {
+        const ggml_tensor * logits = dst->src[0];
+        const int k = ggml_get_op_params_i32(dst, 1);
+        const int n_expert = (int) logits->ne[0];
+        const int n_tokens = (int) logits->ne[1];
+        const float * nb = dst->src[2] ? (const float *) dst->src[2]->data : nullptr;
+        const int32_t * pm = dst->src[3] ? (const int32_t *) dst->src[3]->data : nullptr;
+        if (n_expert <= 512) {
+            ds4_router_select_kernel<512><<<n_tokens, 512, 0, ctx.stream()>>>(
+                (const float *) logits->data, logits->nb[1] / sizeof(float),
+                (const float *) dst->src[1]->data, nb, pm, n_expert, k, (int32_t *) dst->data);
+        } else {
+            ds4_router_select_kernel<1024><<<n_tokens, 1024, 0, ctx.stream()>>>(
+                (const float *) logits->data, logits->nb[1] / sizeof(float),
+                (const float *) dst->src[1]->data, nb, pm, n_expert, k, (int32_t *) dst->data);
+        }
+        return;
+    }
+    if (ggml_get_op_params_i32(dst, 0) == 6) {
+        const ggml_tensor * hc = dst->src[0];
+        const ggml_tensor * pre = dst->src[1];
+        const int n_embd = ggml_get_op_params_i32(dst, 1);
+        const int n_hc = ggml_get_op_params_i32(dst, 2);
+        const dim3 grid((n_embd + 255) / 256, (unsigned) dst->ne[1], 1);
+        ds4_hc_collapse_kernel<<<grid, 256, 0, ctx.stream()>>>(
+            (const float *) hc->data, (const float *) pre->data, (float *) dst->data,
+            n_embd, n_hc, hc->nb[1] / sizeof(float), pre->nb[1] / sizeof(float),
+            dst->nb[1] / sizeof(float));
+        return;
+    }
+    if (ggml_get_op_params_i32(dst, 0) == 5) {
+        const ggml_tensor * logits = dst->src[0];
+        const ggml_tensor * ids = dst->src[1];
+        const float clamp_min = ggml_get_op_params_f32(dst, 4);
+        const float scale = ggml_get_op_params_f32(dst, 5);
+        ds4_router_weights_kernel<<<(int) ids->ne[1], 1, 0, ctx.stream()>>>(
+            (const float *) logits->data, logits->nb[1] / sizeof(float), (const int32_t *) ids->data,
+            (int) ids->ne[0], clamp_min, scale, scale != 1.0f ? 1 : 0, (float *) dst->data);
+        return;
+    }
 
     GGML_ASSERT(src0 && src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1 && src1->type == GGML_TYPE_F32);

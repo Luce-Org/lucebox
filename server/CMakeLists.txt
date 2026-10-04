@@ -1454,6 +1454,14 @@ if(LUCE_TESTS)
             ggml-cpu ggml ${LUCE_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_ds4_moe_combine_cuda)
     endif()
+    # The fused DS4 router and HC collapse ops against the unfused op chains,
+    # bit for bit.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_fused_ops_cuda.cpp")
+        add_executable(test_ds4_fused_ops_cuda test/unit/test_ds4_fused_ops_cuda.cpp)
+        target_link_libraries(test_ds4_fused_ops_cuda PRIVATE
+            ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
+        list(APPEND _raw_unit_test_targets test_ds4_fused_ops_cuda)
+    endif()
     # Host-only test of the ggml-cuda batched copy: plain C++ on both the CUDA
     # and HIP builds. Registered through the CppUnit list below.
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_cuda_copy_batch.cpp")

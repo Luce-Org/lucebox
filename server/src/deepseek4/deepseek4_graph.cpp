@@ -4669,6 +4669,21 @@ static Ds4MoeRouting build_moe_routing(
     };
     ggml_tensor * logits = track(ggml_mul_mat(ctx, L.ffn_gate_inp, cur));
 
+    static const bool fuse_router = ds4_env_flag("LUCE_DS4_FUSE_ROUTER");
+    const int k_fused = ds4_effective_expert_count(w);
+    if (fuse_router && !selection_bias && n_tokens <= 64 && L.ffn_exp_probs_b &&
+        L.ffn_exp_probs_b->type == GGML_TYPE_F32 && w.n_expert <= 1024 && k_fused <= 32 &&
+        logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits)) {
+        const bool protect = L.native_selection_bias && L.protected_mask;
+        out.selected = track(ggml_ds4_router_select(
+            ctx, logits, L.ffn_exp_probs_b,
+            protect ? L.native_selection_bias : nullptr,
+            protect ? L.protected_mask : nullptr, k_fused));
+        out.weights = track(ggml_ds4_router_weights(
+            ctx, logits, out.selected, 6.103515625e-5f, w.expert_weight_scale));
+        return out;
+    }
+
     // DS4 routes with sqrt(softplus(logit)). Optional bias affects only the
     // top-k expert selection, while expert weights come from the unbiased
     // router probabilities and are normalized after selection.
@@ -6644,6 +6659,14 @@ static ggml_tensor * ds4_build_hc_collapse(ggml_context * ctx, ggml_tensor * hc,
     const int64_t n_tokens = hc->ne[1];
     if (!pre) {
         return ggml_cont(ctx, ggml_view_2d(ctx, hc, n_embd, n_tokens, hc->nb[1], 0));
+    }
+    // LUCE_DS4_FUSE_COLLAPSE=1: one kernel with the same rounding instead of a
+    // mul, a transpose and a 4-wide sum_rows (test_ds4_fused_ops_cuda).
+    static const bool fused_collapse = ds4_env_flag("LUCE_DS4_FUSE_COLLAPSE");
+    if (fused_collapse && hc->nb[0] == sizeof(float) && pre->nb[0] == sizeof(float) &&
+        pre->ne[0] == n_hc && hc->ne[0] == (int64_t) n_embd * n_hc && ggml_n_dims(pre) <= 2) {
+        return ggml_ds4_hc_collapse(ctx, hc, ggml_n_dims(pre) == 1
+            ? ggml_reshape_2d(ctx, pre, n_hc, 1) : pre, n_hc);
     }
     ggml_tensor * hc3 = ggml_reshape_3d(ctx, hc, n_embd, n_hc, n_tokens);
     ggml_tensor * weighted = ggml_mul(

@@ -2876,6 +2876,34 @@ extern "C" {
             int                   n_hc,
             float                 pre_scale);
 
+    // ggml_ds4_router_select: DS4 top-k routing from router logits [n_expert, T]:
+    // sqrt(softplus(logit)) + bias, top-k descending; with native_bias and
+    // protected_mask, a token whose native top-k holds a protected expert keeps
+    // the native selection. -> I32 [k, T]
+    GGML_API struct ggml_tensor * ggml_ds4_router_select(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * native_bias,
+            struct ggml_tensor  * protected_mask,
+            int                   k);
+    // ggml_ds4_router_weights: probs of the selected experts normalised by their
+    // clamped sum, times scale. -> F32 [k, T]
+    GGML_API struct ggml_tensor * ggml_ds4_router_weights(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * selected,
+            float                 clamp_min,
+            float                 scale);
+    // ggml_ds4_hc_collapse: dst[d, t] = sum_h hc[d + h*n_embd, t] * pre[h, t],
+    // rounded as mul, permute and sum_rows round it.
+    // hc: F32 [n_embd*n_hc, T] (nb0 = 4), pre: F32 [n_hc, T] (nb0 = 4) -> F32 [n_embd, T].
+    GGML_API struct ggml_tensor * ggml_ds4_hc_collapse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * hc,
+            struct ggml_tensor  * pre,
+            int                   n_hc);
+
     // Official DS4 ratio-4 indexer transform. Each contiguous 128-wide F32
     // row is Hadamard-rotated and passed through the model's blockwise FP4
     // activation-simulation round trip. The operation is out-of-place so the
