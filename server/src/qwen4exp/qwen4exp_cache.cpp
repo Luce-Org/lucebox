@@ -83,7 +83,10 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
         out.ple_conv_state[i] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, ple_hist, hc_dim);
     }
 
-    const int64_t kv_capacity = reference ? (static_cast<int64_t>(max_ctx) + 255)/256*256 : max_ctx;
+    // Packed attention reads groups of four keys even for an unaligned
+    // logical context limit. Padding is masked by the causal cell IDs.
+    const int64_t align = reference ? 256 : profile.optimized ? 4 : 1;
+    const int64_t kv_capacity = (static_cast<int64_t>(max_ctx) + align - 1) / align * align;
     for (size_t i = 0; i < n_full; ++i) {
         out.attn_k[i] = ggml_new_tensor_3d(out.ctx, kv_type,
             w.n_embd_head_k, kv_capacity, w.n_head_kv);

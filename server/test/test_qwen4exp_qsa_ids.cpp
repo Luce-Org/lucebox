@@ -73,7 +73,7 @@ static std::vector<int32_t> reference(const std::vector<int32_t> & blocks, int T
 }
 
 static Result run(ggml_backend_t be, int T, int budget, int pos0, int r,
-                  const std::vector<int32_t> & blocks, const std::vector<float> & scores = {}) {
+                  const std::vector<int32_t> & blocks, const std::vector<float> & scores = {}, bool enumerate = false) {
     ggml_context * c = ggml_init({8 * 1024 * 1024, nullptr, true});
     Result result;
     const int n_comp = scores.empty() ? 0 : (int) scores.size() / T;
@@ -82,6 +82,10 @@ static Result run(ggml_backend_t be, int T, int budget, int pos0, int r,
     // Exercise both nonzero view offsets and a non-contiguous row stride.
     ggml_tensor * selected = scores.empty() ? ggml_view_2d(c, input, budget, T, input->nb[1], 3 * sizeof(int32_t))
                                            : ggml_top_k(c, input, budget);
+    if (enumerate) {
+        selected = ggml_cast(c, ggml_repeat_4d(c, ggml_arange(c, 0.0f, (float) budget, 1.0f),
+            budget, T, 1, 1), GGML_TYPE_I32);
+    }
     ggml_tensor * positions = ggml_new_tensor_1d(c, GGML_TYPE_I32, 4 * T);
     ggml_tensor * fused = ggml_qsa_decode_ids(c, selected, ggml_view_1d(c, positions, T, 0), r);
     ggml_tensor * old = legacy_ids(c, selected, pos0, r);
@@ -147,6 +151,28 @@ int main(int argc, char ** argv) {
             const Result got = gpu ? run(gpu, T, budget, pos0, r, blocks) : want;
             const bool pass = want.ok && got.ok && want.ids == got.ids;
             std::printf("qsa-ids T=%-3d pos=%-5d %s\n", T, pos0, pass ? "OK" : "FAIL");
+            ok &= pass; ++cases;
+        }
+    }
+    // Dense-regime IDs must enumerate EXACTLY [0, absolute_query], including
+    // the <4-token dummy block and the last all-keys query at position 2050.
+    for (int T : {1, 2, 3, 4, 127, 128, 2048}) {
+        for (int pos0 : {0, 1, 3, 1024, 2047}) {
+            if (pos0 + T > 2051) continue;
+            const int budget = std::max(1, (pos0 + T) / 4);
+            std::vector<int32_t> blocks((size_t) budget * T);
+            for (int t = 0; t < T; ++t) for (int b = 0; b < budget; ++b) blocks[(size_t) t * budget + b] = b;
+            const Result got = run(gpu ? gpu : cpu, T, budget, pos0, 4, blocks, {}, true);
+            bool pass = got.ok;
+            for (int t = 0; pass && t < T; ++t) {
+                int next = 0;
+                for (int j = 0; j < budget * 4 + 3; ++j) {
+                    const int id = got.ids[(size_t) t * (budget * 4 + 3) + j];
+                    if (id >= 0) pass &= id == next++;
+                }
+                pass &= next == pos0 + t + 1;
+            }
+            std::printf("qsa-ids dense T=%-4d pos=%-4d %s\n", T, pos0, pass ? "OK" : "FAIL");
             ok &= pass; ++cases;
         }
     }

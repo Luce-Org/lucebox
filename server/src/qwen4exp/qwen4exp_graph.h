@@ -7,9 +7,12 @@
 // 512-expert top-10 MoE, per-layer n-gram embedding) into Luzebox's ggml graph
 // style.
 //
-// Single sequence (n_seqs = 1). Past the indexer's block budget, full attention uses QSA selected attention
-// (gfx1151: prefill chunks of >= 128 tokens and decode); below it QSA equals dense attention. The PLE table is
-// read through Qwen4ExpPleReader and is never uploaded in full.
+// Single sequence (n_seqs = 1). On gfx1151, multi-row prompt prefill uses QSA
+// with F32 accumulation, including below the selection budget. T=1 retains
+// dense attention below the budget and selected attention beyond it. This
+// last-logit-only trunk has no MTP verification entry point: an MTP port must
+// route verify rows through the T=1 attention path, not the prefill promotion.
+// The PLE table is read through Qwen4ExpPleReader, never uploaded in full.
 
 #pragma once
 

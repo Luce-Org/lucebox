@@ -165,10 +165,13 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // --split N[:c]: the same S tokens as one prefill vs a prefill of S-N plus the last N tokens in
-    // chunks of c (default 1, i.e. decode) must give the same last-position distribution. QSA selection is
-    // chunk-invariant, so past the block budget this checks decode (c=1) against prefill; c in 9..127 runs dense
-    // attention there and shows how far a wrong selection drifts.
+    // --split N[:c]: compare one prefill with S-N prompt tokens followed by N
+    // tokens in chunks of c (default 1: decode). These are numerical probes,
+    // not a bitwise prefill/decode contract: short QSA and packed QSA use
+    // different reductions. At S=6000 the established KLs for 100:1, 200:1,
+    // 100:100, 256:128 are .082874/.118543/.652715/.734763 (the last flips
+    // argmax 271 -> 17 and exits 1). Below the budget, T=1 deliberately keeps
+    // dense decode while multi-row prompt prefill uses precise QSA.
     if (rc == 0 && N > 0) {
         std::vector<float> full, split;
         reset_qwen4exp_state(backend, cache);
