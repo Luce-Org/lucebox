@@ -220,6 +220,39 @@ struct LaunchPolicyFixture : CommonFixture {
             CHECK(name != "LUCE_DS4_DRAFT");
         }
     }
+
+    void test_ds41_gorgon_profile_is_the_measured_recipe() {
+        // Every expert resident (no SSD tier): the placement and router bias
+        // come from the command line, the drafter shares the R9700.
+        const LaunchProfile * profile = find_launch_profile("ds41-gorgon");
+        CHECK(profile != nullptr);
+        const std::vector<std::string> args = launch_profile_args(*profile, {});
+        const auto value_of = [&](const char * flag) -> std::string {
+            for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == flag) return args[i + 1];
+            return {};
+        };
+        CHECK(value_of("--target-device") == "hip:0");
+        CHECK(value_of("--expert-device") == "hip:1");
+        CHECK(value_of("--draft-device") == "hip:0");
+        CHECK(value_of("--ds4-prefill") == "dense");
+        CHECK(!contains_flag(args, "--ds4-expert-placement"));
+        CHECK(!contains_flag(args, "--ds4-router-bias"));
+        const auto env_of = [&](const char * name) -> std::string {
+            for (const LaunchProfileEnv & entry : profile->env) {
+                if (std::string(entry.name) == name) return entry.value;
+            }
+            return {};
+        };
+        CHECK(env_of("LUCE_EXPERT_BUDGET_MB") == "12000");
+        CHECK(env_of("LUCE_DS41_DECODER_BOUNDED_REPLAY") == "1");
+        CHECK(env_of("LUCE_DS4_PREFILL_PIPELINE") == "2");
+        CHECK(env_of("LUCE_DS4_DRAFT_SWAP") == "1");
+        CHECK(env_of("GGML_CUDA_MLA_SPLIT_KV_COUNT") == "8");
+        // A flag given on the command line replaces the profile's value.
+        const std::vector<std::string> given = {"--draft-device", "hip:1"};
+        const std::vector<std::string> merged = launch_profile_args(*profile, given);
+        CHECK(!contains_flag(merged, "--draft-device"));
+    }
 };
 
 }  // namespace
@@ -236,4 +269,5 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_profile_flags_yield_to_explicit_flags();
     test_profile_replaces_documented_recipe();
     test_ds41_profile_is_the_lucebox_recipe();
+    test_ds41_gorgon_profile_is_the_measured_recipe();
 }

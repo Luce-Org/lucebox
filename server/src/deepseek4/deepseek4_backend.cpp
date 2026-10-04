@@ -17,6 +17,7 @@
 #include "common/peer_access.h"
 #include "common/platform_env.h"
 #include "common/sampler.h"
+#include "common/dspark_head.h"
 #include "common/moe_hybrid_expert_cache.h"
 #include "common/moe_hybrid_routing_stats.h"
 
@@ -2312,7 +2313,117 @@ bool DeepSeek4Backend::load_spec_drafter() {
     return true;
 }
 
+// LUCE_DS4_DRAFT_SWAP with the drafter on the target GPU: mirror it and size
+// the long-prompt chunk as if it were absent. A no-op without the switch,
+// without a drafter on the target or without room for the pinned mirror;
+// false only when the sizing fails.
+bool DeepSeek4Backend::setup_draft_swap() {
+    // Requests run one at a time here: paged (concurrent) serving loads no
+    // drafter, so no other sequence can be decoding while it is swapped out.
+    if (!env_flag_enabled("LUCE_DS4_DRAFT_SWAP") || cfg_.paged_attention || !spec_drafter_ ||
+        !moe_hybrid_ || spec_drafter_->core.backend != backend_ || !draft_swap_prepare()) {
+        return true;
+    }
+    DraftSwap & s = draft_swap_;
+    s.cap_with = hybrid_prefill_chunk_cap_;
+    hybrid_prefill_chunk_cap_ = 0;
+    prefill_sizing_extra_free_ = s.size;
+    const bool sized = size_hybrid_prefill_chunk();
+    prefill_sizing_extra_free_ = 0;
+    s.cap_without = hybrid_prefill_chunk_cap_;
+    hybrid_prefill_chunk_cap_ = s.cap_with;
+    if (!sized) return false;
+    std::fprintf(stderr, "[deepseek4] draft swap: prefill chunk cap %d with the drafter, "
+                 "%d with it swapped out (0 = uncapped)\n", s.cap_with, s.cap_without);
+    return true;
+}
+
+bool DeepSeek4Backend::draft_swap_prepare() {
+    DraftSwap & s = draft_swap_;
+    if (s.host) return true;
+    if (!spec_drafter_ || !spec_drafter_->core.buf || !spec_drafter_->core.ctx) return false;
+    ggml_backend_buffer_t dev = spec_drafter_->core.buf;
+    s.buft = ggml_backend_buffer_get_type(dev);
+    s.usage = ggml_backend_buffer_get_usage(dev);
+    s.size = ggml_backend_buffer_get_size(dev);
+    s.host = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), s.size);
+    if (!s.host) {
+        std::fprintf(stderr, "[deepseek4] draft swap: pinned host mirror of %.2f GiB failed\n",
+                     s.size / 1073741824.0);
+        return false;
+    }
+    char * base = (char *) ggml_backend_buffer_get_base(dev);
+    char * hbase = (char *) ggml_backend_buffer_get_base(s.host);
+    for (ggml_tensor * t = ggml_get_first_tensor(spec_drafter_->core.ctx); t;
+         t = ggml_get_next_tensor(spec_drafter_->core.ctx, t)) {
+        if (t->buffer != dev || !t->data) continue;
+        if (t->view_src) { s.views.push_back(t); continue; }
+        const size_t off = (size_t) ((char *) t->data - base);
+        ggml_backend_tensor_get(t, hbase + off, 0, ggml_nbytes(t));
+        s.tensors.push_back({t, off});
+    }
+    std::fprintf(stderr, "[deepseek4] draft swap: %.2f GiB of DSpark weights mirrored in pinned "
+                 "host memory (%zu tensors)\n", s.size / 1073741824.0, s.tensors.size());
+    return true;
+}
+
+bool DeepSeek4Backend::draft_swap_out() {
+    DraftSwap & s = draft_swap_;
+    if (s.out || !s.host || !spec_drafter_ || !spec_drafter_->core.buf) return false;
+    ggml_backend_synchronize(backend_);
+    // Cached DSpark graphs point into the buffer: drop them, and bump the
+    // drafter generation so none is reused after the swap-in.
+    reset_deepseek4_dspark_runtime_cache();
+    dspark_note_drafter_lifecycle();
+    ggml_backend_buffer_free(spec_drafter_->core.buf);
+    spec_drafter_->core.buf = nullptr;
+    for (auto & e : s.tensors) { e.first->buffer = nullptr; e.first->data = nullptr; }
+    for (ggml_tensor * v : s.views) { v->buffer = nullptr; v->data = nullptr; }
+    s.out = true;
+    return true;
+}
+
+bool DeepSeek4Backend::draft_swap_in() {
+    DraftSwap & s = draft_swap_;
+    if (!s.out) return true;
+    const auto t0 = Clock::now();
+    ggml_backend_buffer_t dev = ggml_backend_buft_alloc_buffer(s.buft, s.size);
+    if (!dev) {
+        std::fprintf(stderr, "[deepseek4] draft swap: device buffer of %.2f GiB unavailable\n",
+                     s.size / 1073741824.0);
+        return false;
+    }
+    ggml_backend_buffer_set_usage(dev, s.usage);
+    char * base = (char *) ggml_backend_buffer_get_base(dev);
+    const char * hbase = (const char *) ggml_backend_buffer_get_base(s.host);
+    for (auto & e : s.tensors) {
+        if (ggml_backend_tensor_alloc(dev, e.first, base + e.second) != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[deepseek4] draft swap: tensor placement failed\n");
+            for (auto & placed : s.tensors) { placed.first->buffer = nullptr; placed.first->data = nullptr; }
+            ggml_backend_buffer_free(dev);
+            return false;
+        }
+        ggml_backend_tensor_set(e.first, hbase + e.second, 0, ggml_nbytes(e.first));
+    }
+    for (ggml_tensor * v : s.views) ggml_backend_view_init(v);
+    spec_drafter_->core.buf = dev;
+    s.out = false;
+    reset_deepseek4_dspark_runtime_cache();
+    dspark_note_drafter_lifecycle();
+    std::fprintf(stderr, "[deepseek4] draft swap: DSpark weights restored in %.0f ms\n",
+                 elapsed_s(t0) * 1000.0);
+    return true;
+}
+
+// Forget the mirror before its drafter goes: its tensor pointers belong to
+// that drafter's context.
+void DeepSeek4Backend::draft_swap_release() {
+    if (draft_swap_.host) ggml_backend_buffer_free(draft_swap_.host);
+    draft_swap_ = DraftSwap{};
+}
+
 void DeepSeek4Backend::release_spec_drafter(bool mark_parked) {
+    draft_swap_release();
     if (spec_drafter_) {
         free_deepseek4_dspark_drafter(*spec_drafter_);
     }
@@ -2641,6 +2752,7 @@ bool DeepSeek4Backend::init() {
     }
     if (!init_streamed_expert_tier() || !check_device_headroom()) return false;
     if (!size_hybrid_prefill_chunk()) return false;
+    if (!setup_draft_swap()) return false;
     image_capable_ = vision_ != nullptr;
     return true;
 }
@@ -2810,9 +2922,10 @@ bool DeepSeek4Backend::size_hybrid_prefill_chunk() {
     const int chunk = std::max(1, cfg_.chunk > 0 ? cfg_.chunk : w_.n_swa);
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
     const HybridPrefillScratch per_token = hybrid_prefill_scratch_per_token(w_, max_ctx, chunk);
-    const auto fit = [](int device, size_t bytes, size_t fixed) {
+    const auto fit = [this](int device, size_t bytes, size_t fixed) {
         size_t free_b = 0, total_b = 0;
         ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+        if (device == cfg_.device.gpu) free_b += prefill_sizing_extra_free_;
         return hybrid_prefill_fit_tokens(free_b, ds4_device_headroom_bytes(device) / 2 + fixed, bytes);
     };
     {
@@ -3679,6 +3792,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
     if (moe_hybrid_ && !expert_cache_.ready() && !init_streamed_expert_tier()) return false;
     // The same post-load checks as init(): a restore that no longer fits fails.
     if (moe_hybrid_ && (!check_device_headroom() || !size_hybrid_prefill_chunk())) return false;
+    if (!draft_swap_.host && !setup_draft_swap()) return false;
     cache_.prefill_mode = cfg_.prefill_mode;
     return true;
 }
@@ -4589,6 +4703,18 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         }
         return kv_offset;
     };
+    // The longest single prefill of this request (a split runs two).
+    const int prefill_tokens = split_at_snapshot
+        ? std::max(req.snap_pos - kv_offset, prompt_end - req.snap_pos)
+        : prompt_end - kv_offset;
+    // Prefills this long gain more from the drafter's memory than the ~1.4 s
+    // its weights take to come back (R9700 + Gorgon Halo: even at ~10K
+    // tokens, a win from 15K).
+    constexpr int kDraftSwapMinPrompt = 10240;
+    if (draft_swap_.host && !draft_swap_.out && prefill_tokens > kDraftSwapMinPrompt &&
+        draft_swap_out()) {
+        hybrid_prefill_chunk_cap_ = draft_swap_.cap_without;
+    }
     committed = run_prefill();
     // A long prefill that ran out of device memory is retried once from the
     // request's starting state with every disposable arena retired and a
@@ -4613,6 +4739,17 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         if (pipelined && committed >= 0 && !pipeline_cap_restored_) {
             cache_.pipeline_cap_pct = kDs4PipelineCapPct;
             pipeline_cap_restored_ = true;
+        }
+    }
+    if (draft_swap_.out) {
+        // Keep any sticky reduction of the swapped-out chunk, then bring the
+        // drafter back before decode.
+        draft_swap_.cap_without = hybrid_prefill_chunk_cap_;
+        hybrid_prefill_chunk_cap_ = draft_swap_.cap_with;
+        deepseek4_release_prefill_scratch(cache_, moe_hybrid_.get());
+        if (!draft_swap_in()) {
+            result.fail(GenerateErrorCode::PrefillFailed, "DSpark drafter swap-in failed");
+            return result;
         }
     }
     if (committed < 0) {

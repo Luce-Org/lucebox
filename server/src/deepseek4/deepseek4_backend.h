@@ -187,6 +187,28 @@ private:
     bool                           spec_requested_ = false;
     bool                           spec_enabled_ = false;
     bool                           spec_drafter_parked_ = false;
+    // LUCE_DS4_DRAFT_SWAP: a pinned host mirror of the drafter's core
+    // weights, so long prompts can prefill with the drafter's device memory;
+    // the chunk caps the prefill uses with the drafter in and out.
+    struct DraftSwap {
+        ggml_backend_buffer_type_t buft = nullptr;
+        ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+        size_t size = 0;
+        ggml_backend_buffer_t host = nullptr;
+        std::vector<std::pair<ggml_tensor *, size_t>> tensors;  // tensor, offset
+        std::vector<ggml_tensor *> views;
+        bool out = false;
+        int cap_with = 0;
+        int cap_without = 0;
+    };
+    DraftSwap                      draft_swap_;
+    // Device bytes size_hybrid_prefill_chunk() counts as free on the target.
+    size_t                         prefill_sizing_extra_free_ = 0;
+    bool setup_draft_swap();
+    bool draft_swap_prepare();
+    bool draft_swap_out();
+    bool draft_swap_in();
+    void draft_swap_release();
     std::string                    spec_draft_path_;
     ggml_backend_t                 spec_backend_ = nullptr;
     std::unique_ptr<DSparkDrafter> spec_drafter_;
