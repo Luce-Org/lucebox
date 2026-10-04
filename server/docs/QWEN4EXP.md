@@ -34,10 +34,11 @@ No environment variables are needed: on gfx1151 the backend sets up its
 measured kernel profile through scoped code settings during loading and forward
 evaluation. Device support is resolved once at load; forward scopes only exchange
 the calling thread's profile flag. It does not read qwen4exp environment variables or change the process
-environment; other models retain their own dispatch. Prefill runs in 2048-token
-chunks; long prompts on UD prefill faster with `--chunk 8192` (a 16K prompt
-reaches its first token in 13.2-13.8 s). `--chunk 16384` does not fit UD in
-memory with a 40K context.
+environment; other models retain their own dispatch. Without `--chunk`, the
+prefill chunk is the largest 256-row multiple that fits the memory left after
+weights and caches (7424 rows for UD at 262K context, one slot); the banner and
+`/props` report it. Prompt attention accumulates in F32, so the logits do not
+depend on the chunk size.
 
 Build:
 
@@ -77,8 +78,8 @@ Strix Halo, default flags, fresh server per run:
 
 | | prefill | decode |
 | --- | --- | --- |
-| UD-Q4_K_XL, 16K prompt | 990-1,100 tok/s | 22.4 tok/s |
-| UD-Q4_K_XL, 64K prompt | ~1,000 tok/s | 20.9 tok/s |
+| UD-Q4_K_XL, 16K prompt | 1,200-1,240 tok/s | 22.4 tok/s |
+| UD-Q4_K_XL, 64K prompt | 1,200-1,250 tok/s | 20.9 tok/s |
 | UD-Q4_K_XL, short prompt | - | 24.1 tok/s |
 | IQ4_NL, 16K prompt | 950-1,010 tok/s | 28.5 tok/s (30.6 short) |
 | GSQ-RCO IQ3_XXS, 16K prompt | ~475 tok/s | 25-26 tok/s |
@@ -112,7 +113,8 @@ all three quants.
 
 Tests: `test_qwen4exp_qsa_ids` (QSA block selection, GPU and CPU),
 `test_qwen4exp_indexer_score`, `test_rope_tail` (including the M-RoPE ->
-CONT fusion alias), `test_backend_plan` (default prefill chunk),
+CONT fusion alias), `test_backend_plan` (default prefill chunk), `test_qwen4exp_chunk`
+(memory-sized chunk selection),
 `test_server_unit`, and `smoke_qwen4exp_forward` (split-prefill KLs and
 cancel/reset/reuse on a real GGUF).
 

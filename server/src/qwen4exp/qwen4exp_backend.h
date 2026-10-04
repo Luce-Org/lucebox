@@ -22,7 +22,8 @@ struct Qwen4ExpBackendConfig {
     std::string     model_path;
     DevicePlacement device;
     int             stream_fd = -1;
-    int             chunk     = 2048;
+    int             chunk     = 0;  // auto: measured allocation budget
+    int             slots     = 1;
 };
 
 class Qwen4ExpBackend final : public ModelBackend {
@@ -37,6 +38,7 @@ public:
 
     // ModelBackend interface
     void print_ready_banner() const override;
+    int prefill_chunk_size() const override { return chunk_; }
 
     bool park(ParkTarget target) override;
     bool unpark(ParkTarget target) override;
@@ -65,6 +67,7 @@ private:
     ggml_backend_t        backend_ = nullptr;
     Qwen4ExpWeights       weights_;
     Qwen4ExpCache         cache_;
+    int                   chunk_   = 0;
     bool                  parked_  = false;
 };
 

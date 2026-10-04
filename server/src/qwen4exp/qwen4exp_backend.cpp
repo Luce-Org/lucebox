@@ -1,4 +1,5 @@
 #include "qwen4exp_backend.h"
+#include "qwen4exp_chunk.h"
 #include "qwen4exp_graph.h"
 
 #include "common/sampler.h"
@@ -14,6 +15,72 @@
 #include <vector>
 
 namespace luce::common {
+
+int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
+        Qwen4ExpCache & cache, int slots, int resident_slots) {
+    if (slots < 1 || resident_slots < 1 || resident_slots > slots) return 0;
+    size_t free_device = 0, total = 0, free_host = 0;
+    ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device_id(backend), &free_device, &total);
+    ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_host, &total);
+    // The generic UMA query substitutes MemAvailable; retain the HIP/GTT limit too.
+    const size_t available = std::min(free_device, free_host);
+    size_t shadow = 0, shadow_tmp = 0;
+    if (w.gfx1151) {
+        auto count_shadow = [&](ggml_context * ctx) {
+            for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->buffer && t->ne[2] == 1 && t->ne[3] == 1 && t->ne[1] <= 32768 &&
+                    (t->type == GGML_TYPE_IQ4_NL || t->type == GGML_TYPE_Q6_K || t->type == GGML_TYPE_Q5_K)) {
+                    const size_t bytes = (size_t) ggml_nelements(t) * 2;
+                    shadow += bytes;
+                    if (t->type == GGML_TYPE_Q5_K) shadow_tmp = std::max(shadow_tmp, bytes);
+                }
+            }
+        };
+        count_shadow(w.ctx);
+        for (auto * ctx : w.extra_meta_ctxs) count_shadow(ctx);
+    }
+    const size_t state = ggml_backend_buffer_get_size(cache.buf);
+    const auto decode = qwen4exp_graph_memory(backend, w, cache, 1, cache.max_ctx - 1);
+    if (decode.graph == SIZE_MAX) return 0;
+    // A decode workspace can remain resident in every slot while another slot
+    // prefills. Shared weights, shadows and scratch are counted only once.
+    const size_t fixed = (slots - resident_slots) * state + shadow + shadow_tmp + slots * decode.graph;
+    const int chunk = qwen4exp_fit_chunk(cache.max_ctx, available, fixed, [&](int n) {
+        size_t graph = 0, inputs = 0, mask = 0, host = 0, scratch = 0;
+        // End-of-context QSA workspace, and the largest dense span before QSA.
+        // Include an unaligned context tail, which can fall back to dense FA.
+        const int ratio = w.compress_ratios.empty() ? 1 : std::max(1, *std::max_element(w.compress_ratios.begin(), w.compress_ratios.end()));
+        const int dense_end = std::min(cache.max_ctx, w.indexer_top_k + ratio - 1);
+        auto measure = [&](int rows, int end) {
+            if (rows <= 0 || end <= 0) return true;
+            rows = std::min(rows, end);
+            const auto m = qwen4exp_graph_memory(backend, w, cache, rows, end - rows);
+            if (m.graph == SIZE_MAX) return false;
+            graph = std::max(graph, m.graph);
+            inputs = std::max(inputs, m.inputs);
+            mask = std::max(mask, m.mask);
+            host = std::max(host, m.host);
+            scratch = std::max(scratch, m.scratch);
+            return true;
+        };
+        for (const int end : {n, dense_end, std::min(cache.max_ctx, dense_end + n),
+                             cache.max_ctx - cache.max_ctx % ratio, cache.max_ctx}) {
+            if (!measure(n, end)) return SIZE_MAX;
+        }
+        // Partial final chunks can cross the MMB (512) or packed QSA (128)
+        // dispatch floors. Their F32 buffers/masks can outgrow the full chunk.
+        for (const int tail : {511, 127, 1}) {
+            if (tail < n && !measure(tail, cache.max_ctx)) return SIZE_MAX;
+        }
+        const size_t workspace = graph + slots * (inputs + mask) + host + scratch;
+        std::fprintf(stderr, "[qwen4exp] chunk-plan rows=%d graph=%zu ring=%zu host=%zu scratch=%zu required=%zu available=%zu\n",
+            n, graph, slots * (inputs + mask), host, scratch, fixed + workspace, available);
+        return workspace;
+    });
+    std::fprintf(stderr, "[qwen4exp] chunk-auto ctx=%d slots=%d resident=%d chunk=%d state=%zu fixed=%zu available=%zu headroom=%zu\n",
+        cache.max_ctx, slots, resident_slots, chunk, state, fixed, available, available / 10);
+    return chunk;
+}
 
 Qwen4ExpBackend::Qwen4ExpBackend(Qwen4ExpBackendConfig cfg)
     : cfg_(std::move(cfg)) {}
@@ -41,6 +108,11 @@ bool Qwen4ExpBackend::init() {
     if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx,
                                GGML_TYPE_F16, cache_)) {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
+        return false;
+    }
+    chunk_ = cfg_.chunk > 0 ? cfg_.chunk : qwen4exp_select_chunk(backend_, weights_, cache_, cfg_.slots);
+    if (chunk_ <= 0) {
+        std::fprintf(stderr, "[qwen4exp] insufficient prefill memory at configured context/slots\n");
         return false;
     }
     return true;
@@ -88,6 +160,7 @@ bool Qwen4ExpBackend::unpark(ParkTarget target) {
         free_qwen4exp_weights(weights_);
         return false;
     }
+    // Keep the resolved serving policy across park/unpark (and /props stable).
     parked_ = false;
     std::printf("[qwen4exp] target unparked\n");
     std::fflush(stdout);
@@ -107,7 +180,7 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
     }
 
     std::vector<float> logits;
-    const int chunk = std::max(1, cfg_.chunk);
+    const int chunk = chunk_;
     int pos = 0;
 
     // A generate() call starts a fresh sequence.

@@ -118,10 +118,10 @@ void test_deepseek_options_land_in_execution() {
     CHECK(plan.execution().chunk == 512);
 }
 
-void test_qwen4exp_defaults_to_2048_token_chunks() {
+void test_qwen4exp_defaults_to_auto_chunks() {
     BackendPreparation result = resolve(plain_args(), "qwen4exp");
     CHECK(std::holds_alternative<BackendPlan>(result));
-    CHECK(std::get<BackendPlan>(result).execution().chunk == 2048);
+    CHECK(std::get<BackendPlan>(result).execution().chunk == 0);
 
     BackendArgs args = plain_args();
     args.chunk = 512;
@@ -242,7 +242,7 @@ void test_supported_specla_requires_a_draft() {
 TEST_CASE(BackendPlanFixture, backend_plan_suite) {
     test_plan_owns_the_effective_request();
     test_deepseek_options_land_in_execution();
-    test_qwen4exp_defaults_to_2048_token_chunks();
+    test_qwen4exp_defaults_to_auto_chunks();
     test_specla_without_fast_rollback_falls_back();
     test_supported_specla_selects_ddtree();
     test_explicit_specla_tau_is_preserved();

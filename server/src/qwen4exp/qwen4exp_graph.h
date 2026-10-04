@@ -46,6 +46,13 @@ struct Qwen4ExpInputs {
 Qwen4ExpInputs qwen4exp_prepare_inputs(const Qwen4ExpWeights & w,
     const int32_t * tokens, int n_tokens, const std::vector<int32_t> & ple_prev);
 
+struct Qwen4ExpGraphMemory {
+    size_t graph = 0, inputs = 0, mask = 0, host = 0, scratch = 0;
+};
+// Allocation plan only: no GPU allocation, input reads, compute or state update.
+Qwen4ExpGraphMemory qwen4exp_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
+    Qwen4ExpCache & cache, int n_tokens, int pos0);
+
 // Run the trunk. `tokens` has n_tokens entries, processed as one contiguous
 // single-sequence span at positions [pos0, pos0 + n_tokens). On success the
 // cache is advanced to pos0 + n_tokens and out_logits holds n_vocab floats

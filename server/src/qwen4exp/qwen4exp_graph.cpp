@@ -871,16 +871,16 @@ Qwen4ExpInputs qwen4exp_prepare_inputs(const Qwen4ExpWeights & w,
     return res;
 }
 
-Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
+static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
                                        const Qwen4ExpWeights & w,
                                        Qwen4ExpCache & cache,
                                        const int32_t * tokens,
                                        int n_tokens,
                                        int pos0,
                                        std::vector<float> & out_logits, bool dump,
-                                       const Qwen4ExpInputs * inputs) {
+                                       const Qwen4ExpInputs * inputs, Qwen4ExpGraphMemory * measure) {
     Qwen4ExpForwardResult res;
-    if (n_tokens <= 0 || pos0 < 0 || !tokens) return res;
+    if (n_tokens <= 0 || pos0 < 0 || (!tokens && !measure)) return res;
     const bool upstream = cache.reference;
     const Qwen4ExpCudaScope profile(w.gfx1151, upstream);
     const bool f16 = !upstream && !dump;
@@ -889,7 +889,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     // Past the QSA block budget the selected-cell graph changes shape as blocks complete, so it is rebuilt per step.
     const Qwen4ExpQsaMode qsa = qsa_mode(w, cache, n_tokens, pos0, profile.optimized);
     // T=1 decode reuses one context/allocator; below the QSA budget it also keeps a stable bucketed graph.
-    const bool reuse_ws = !upstream && n_tokens == 1 && !dump;
+    const bool reuse_ws = !measure && !upstream && n_tokens == 1 && !dump;
     const bool use_stable_graph = reuse_ws && qsa == QSA_DENSE;
     std::vector<std::pair<ggml_tensor *, std::string>> dump_t;
     auto dump_mark = [&](ggml_tensor * t, const char * label) {
@@ -914,14 +914,14 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     const bool has_ple = !cache.ple_layer_ids.empty() && w.ple_reader.available();
     const int64_t ple_heads = w.ple_n_heads;
     Qwen4ExpInputs local_inputs;
-    if (!inputs) {
+    if (!measure && !inputs) {
         local_inputs = qwen4exp_prepare_inputs(w, tokens, n_tokens, cache.ple_prev);
         inputs = &local_inputs;
     }
-    if ((!inputs->ok || inputs->emb.size() != (size_t) w.n_embd * n_tokens ||
+    if (!measure && (!inputs->ok || inputs->emb.size() != (size_t) w.n_embd * n_tokens ||
         inputs->ple.size() != (has_ple ? (size_t) w.ple_head_dim * ple_heads * n_tokens : 0))) return res;
-    const auto & emb = inputs->emb;
-    const auto & ple_data = inputs->ple;
+    const auto & emb = measure ? local_inputs.emb : inputs->emb;
+    const auto & ple_data = measure ? local_inputs.ple : inputs->ple;
 
     const int64_t T = n_tokens;
     const int64_t kv_len = pos0 + n_tokens;
@@ -1154,6 +1154,38 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     dump_mark(logits, "logits");
     ggml_build_forward_expand(gf, logits);
 
+    if (measure) {
+        auto alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        ggml_gallocr_reserve_n_size(alloc, gf, nullptr, nullptr, &measure->graph);
+        ggml_gallocr_free(alloc);
+        // Graph inputs are included above. Reserve BOTH grow-only UMA ring slots
+        // as well (conservative: the normal allocator excludes their tensors).
+        const size_t input_bytes = ring_align_up(ggml_nbytes(inp_emb)) +
+            ring_align_up(ggml_nbytes(positions)) +
+            (ple_in ? ring_align_up(ggml_nbytes(ple_in)) : 0);
+        measure->inputs = cache.input_ring.enabled ? 2 * input_bytes : 0;
+        measure->mask = cache.input_ring.enabled && mask ? 2 * ring_align_up(ggml_nbytes(mask)) : 0;
+        // Current and lookahead host embeddings/PLE, sorted row indices + read scratch.
+        measure->host = 2 * ((size_t) w.n_embd * T * sizeof(float) +
+            (has_ple ? (size_t) ple_heads * T * (w.ple_head_dim * sizeof(float) +
+                3 * sizeof(int32_t) + w.ple_reader.row_bytes()) : 0));
+        size_t activation = 0, largest = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const auto * node = ggml_graph_node(gf, i);
+            largest = std::max(largest, ggml_nbytes(node));
+            if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+                activation = std::max(activation, (size_t) ggml_nelements(node->src[1]));
+            }
+        }
+        // MMB retains four BF16, four F16 and four producer buffers. Account
+        // for those plus one Q8 activation and two largest-node scratch buffers
+        // (conversion/attention and a retired pool allocation during growth).
+        measure->scratch = w.gfx1151 ? (4 + 4 + 4) * 2 * activation + activation + 2 * largest : 2 * largest;
+        ggml_free(ctx);
+        res.ok = true;
+        return res;
+    }
+
     // Point input tensors at this call's pinned ring slot before allocation so the gallocr leaves them alone.
     char * ring_embd = nullptr;
     char * ring_pos  = nullptr;
@@ -1362,6 +1394,26 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     res.n_tokens = n_tokens;
     res.pos0 = pos0;
     return res;
+}
+
+Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend, const Qwen4ExpWeights & w,
+        Qwen4ExpCache & cache, const int32_t * tokens, int n_tokens, int pos0,
+        std::vector<float> & logits, bool dump, const Qwen4ExpInputs * inputs) {
+    return forward_impl(backend, w, cache, tokens, n_tokens, pos0, logits, dump, inputs, nullptr);
+}
+
+Qwen4ExpGraphMemory qwen4exp_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
+        Qwen4ExpCache & cache, int n_tokens, int pos0) {
+    Qwen4ExpGraphMemory memory;
+    std::vector<float> unused;
+    const int blocks = cache.indexer_blocks;
+    const int64_t ratio = std::max<int64_t>(1, qsa_ratio(w));
+    cache.indexer_blocks = pos0 / ratio <= w.indexer_top_k / ratio ? 0 : (int) (pos0 / ratio);
+    const bool ok = forward_impl(backend, w, cache, nullptr, n_tokens, pos0, unused,
+                                false, nullptr, &memory).ok;
+    cache.indexer_blocks = blocks;
+    if (!ok) memory.graph = SIZE_MAX;
+    return memory;
 }
 
 }  // namespace luce::common

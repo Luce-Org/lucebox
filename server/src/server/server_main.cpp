@@ -157,7 +157,7 @@ static void print_usage(const char * prog) {
         "                                 qwen35 layer splits (extra VRAM; env:\n"
         "                                 LUCE_SPLIT_FAST_ROLLBACK=1)\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
-        "  --chunk <N>          Chunked-prefill chunk size (default: 512; qwen4exp 2048)\n"
+        "  --chunk <N>          Chunked-prefill chunk size (default: 512; qwen4exp memory-sized)\n"
         "  --ds4-fused-decode   Enable DeepSeek4 single-graph GPU decode\n"
         "  --ds4-fused-verify-f16-kv\n"
         "                       Reuse F16 MLA cache in batched DeepSeek4 verification\n"
@@ -1713,7 +1713,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
     std::fprintf(stderr, "[server] │  peer_access     = %s\n",
                  backend_placement.target.peer_access ? "ON" : "off");
-    std::fprintf(stderr, "[server] │  chunk           = %d\n", backend_execution.chunk);
+    std::fprintf(stderr, "[server] │  chunk           = %d\n", backend->prefill_chunk_size() > 0 ? backend->prefill_chunk_size() : backend_execution.chunk);
     std::fprintf(stderr, "[server] │  admission_wait  = %d ms\n",
                  sconfig.admission_coalesce_ms);
     if (arch_is_deepseek4_family(arch)) {
@@ -1834,7 +1834,8 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
 #else
         "cuda";
 #endif
-    sconfig.chunk         = backend_execution.chunk;
+    sconfig.chunk         = backend->prefill_chunk_size() > 0
+        ? backend->prefill_chunk_size() : backend_execution.chunk;
     sconfig.target_device = placement_device_name(backend_placement.target);
     sconfig.draft_device  = backend_speculation.draft_path
                                 ? placement_device_name(backend_placement.draft)

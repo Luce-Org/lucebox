@@ -164,10 +164,9 @@ BackendPreparation BackendPlanBuilder::resolve(
     plan.speculation_.use_feature_mirror = args.use_feature_mirror;
 
     plan.execution_.stream_fd = args.stream_fd;
-    // qwen4exp prefills ~1.5x faster in 2048-token chunks than in the generic
-    // 512 (gfx1151 UD-Q4_K_XL: ~1,090 vs ~720 tok/s).
+    // Resolve qwen4exp auto sizing after weights and the configured cache load.
     plan.execution_.chunk =
-        plan.model_.metadata.arch == "qwen4exp" && !args.chunk_set ? 2048 : args.chunk;
+        plan.model_.metadata.arch == "qwen4exp" && !args.chunk_set ? 0 : args.chunk;
     plan.execution_.max_concurrency = args.max_concurrency;
     plan.execution_.prefill_mode = args.ds4_prefill_mode;
     plan.execution_.expert_top_k = args.ds4_expert_top_k;
