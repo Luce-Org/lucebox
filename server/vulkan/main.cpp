@@ -42,6 +42,7 @@ int main(int argc, char ** argv) {
         const auto model = vulkan_model(arch);
         const bool lfm = model == VulkanModel::Lfm2Moe;
         validate_vulkan_context(model, ctx);
+        const auto chat_template = vulkan_chat_template(meta.get(), model);
         Tokenizer tokenizer;
         if (!tokenizer.load_from_gguf(argv[1])) throw std::runtime_error("tokenizer load failed");
         auto backend = lfm ? make_lfm2_vulkan(argv[1], ctx, chunk, flash)
@@ -58,7 +59,6 @@ int main(int argc, char ** argv) {
         cfg.decode_kv_offload_bytes = 0; cfg.default_max_tokens = 1024;
         cfg.max_tokens = 1024; cfg.hard_limit_reply_budget = 0;
         cfg.sampler_defaults.temperature = 0;
-        const auto chat_template = vulkan_chat_template(meta.get(), model);
         cfg.chat_template_src = chat_template.source;
         cfg.chat_template_path = chat_template.path;
         HttpServer http(engine, tokenizer, cfg);

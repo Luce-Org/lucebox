@@ -18,7 +18,12 @@ inline bool unsupported_lfm_vulkan_request(const std::string & runtime_backend,
     for (const char * key : {"temperature", "presence_penalty", "frequency_penalty"}) {
         if (body.contains(key) && (!body[key].is_number() || body[key] != 0)) return true;
     }
-    for (const char * key : {"tools", "tool_choice", "functions", "function_call", "response_format", "logprobs", "top_logprobs", "logit_bias", "repetition_penalty", "repeat_penalty"}) {
+    // Proven no-op forms stay on the ordinary text-only path. Reject other
+    // values (including malformed types), rather than silently ignoring them.
+    if (body.contains("tools") && (!body["tools"].is_array() || !body["tools"].empty())) return true;
+    if (body.contains("logprobs") && (!body["logprobs"].is_boolean() || body["logprobs"].get<bool>())) return true;
+    if (body.contains("response_format") && !body["response_format"].is_null()) return true;
+    for (const char * key : {"tool_choice", "functions", "function_call", "top_logprobs", "logit_bias", "repetition_penalty", "repeat_penalty", "rep_pen"}) {
         if (body.contains(key)) return true;
     }
     return false;

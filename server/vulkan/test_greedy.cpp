@@ -2,6 +2,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
 #include <random>
 #include <vector>
 using luce::common::finite_argmax;
@@ -37,6 +40,11 @@ int main() {
     if(!threw)throw std::runtime_error("empty accepted");++cases;
     std::vector<float>x(152064);for(auto &v:x)v=float(int(rng()%2001)-1000)/8;
     volatile int sink=0;
+#ifdef __SSE2__
+    const char * fused_label = "fused-SSE2";
+#else
+    const char * fused_label = "fused-scalar";
+#endif
     for(int mode=0;mode<2;++mode) {
         auto start=std::chrono::steady_clock::now();
         for(int r=0;r<2000;++r) {
@@ -45,7 +53,7 @@ int main() {
                 sink=int(std::max_element(x.begin(),x.end())-x.begin());
             } else sink=finite_argmax(x.data(),x.size());
         }
-        printf("%s us/call %.3f token %d\n",mode?"fused-SSE2":"old-two-pass",std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-start).count()/2000,int(sink));
+        printf("%s us/call %.3f token %d\n",mode?fused_label:"old-two-pass",std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-start).count()/2000,int(sink));
     }
     printf("PASS %zu exact reference/edge/nonfinite cases\n",cases);
 }

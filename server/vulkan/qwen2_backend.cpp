@@ -1,5 +1,6 @@
 #include "qwen2_backend.h"
 #include "greedy.h"
+#include "resource_owners.h"
 #include "ggml-alloc.h"
 #include "ggml-vulkan.h"
 #include "gguf.h"
@@ -30,8 +31,8 @@ struct Mapping {
  ~Mapping(){if(p!=MAP_FAILED)munmap(p,size);if(fd>=0)close(fd);}
 };
 class Qwen2Vulkan final : public ModelBackend {
- ggml_backend_t backend_=nullptr;
- ggml_gallocr_t decode_alloc_=nullptr, prefill_alloc_=nullptr;
+ VulkanBackendOwner backend_;
+ GraphAllocatorOwner decode_alloc_, prefill_alloc_;
  struct StepGraph {
   Context context; ggml_cgraph *graph=nullptr;
   ggml_tensor *tokens=nullptr,*positions=nullptr,*mask=nullptr,*logits=nullptr;
@@ -51,8 +52,8 @@ class Qwen2Vulkan final : public ModelBackend {
  ggml_tensor *norm(ggml_context *c,ggml_tensor *x,ggml_tensor *scale){return ggml_mul(c,ggml_rms_norm(c,x,eps_),scale);}
 public:
  Qwen2Vulkan(const std::string &path,int context,int chunk,bool flash):ctx_(context),chunk_(chunk),flash_(flash){
-  backend_=ggml_backend_vk_init(0);require(backend_,"Vulkan device initialization failed");
-  std::fprintf(stderr,"[lucebox-vulkan] native Qwen2 target on %s; context=%d chunk=%d flash=%d\n",ggml_backend_name(backend_),ctx_,chunk_,flash_);
+  backend_.reset(ggml_backend_vk_init(0));require(backend_!=nullptr,"Vulkan device initialization failed");
+  std::fprintf(stderr,"[lucebox-vulkan] native Qwen2 target on %s; context=%d chunk=%d flash=%d\n",ggml_backend_name(backend_.get()),ctx_,chunk_,flash_);
   weights_.p=ggml_init({16*1024*1024,nullptr,true}); require(weights_.p,"weight metadata allocation failed");
   struct Part { std::string path; std::unique_ptr<Gguf> g; std::unique_ptr<Context> c; }; std::vector<Part> parts;
   int nsplit=1;
@@ -77,7 +78,7 @@ public:
    parts.push_back(std::move(p));
   }
   require(nsplit>0&&nsplit<=99999,"invalid split count");
-  wbuf_.p=ggml_backend_alloc_ctx_tensors(weights_.p,backend_);require(wbuf_.p,"Vulkan weight allocation failed");ggml_backend_buffer_set_usage(wbuf_.p,GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+  wbuf_.p=ggml_backend_alloc_ctx_tensors(weights_.p,backend_.get());require(wbuf_.p,"Vulkan weight allocation failed");ggml_backend_buffer_set_usage(wbuf_.p,GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
   for(auto &p:parts){Mapping m(p.path);for(int64_t i=0;i<gguf_get_n_tensors(p.g->p);i++){
    auto *dst=w(gguf_get_tensor_name(p.g->p,i));size_t off=gguf_get_data_offset(p.g->p)+gguf_get_tensor_offset(p.g->p,i),sz=ggml_nbytes(dst);require(off<=m.size&&sz<=m.size-off,"tensor exceeds model shard");ggml_backend_tensor_set(dst,(char*)m.p+off,0,sz);
   }}
@@ -87,9 +88,11 @@ public:
    keys_.push_back(ggml_new_tensor_3d(cache_.p,GGML_TYPE_F16,head_,kvheads_,ctx_));
    values_.push_back(flash_ ? ggml_new_tensor_3d(cache_.p,GGML_TYPE_F16,head_,kvheads_,ctx_) : ggml_new_tensor_3d(cache_.p,GGML_TYPE_F16,ctx_,head_,kvheads_));
   }
-  cbuf_.p=ggml_backend_alloc_ctx_tensors(cache_.p,backend_);require(cbuf_.p,"KV allocation failed");
-  decode_alloc_=ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
-  prefill_alloc_=ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+  cbuf_.p=ggml_backend_alloc_ctx_tensors(cache_.p,backend_.get());require(cbuf_.p,"KV allocation failed");
+  decode_alloc_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_.get())));
+  require(decode_alloc_!=nullptr,"decode allocator allocation failed");
+  prefill_alloc_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_.get())));
+  require(prefill_alloc_!=nullptr,"prefill allocator allocation failed");
   std::fprintf(stderr,"[lucebox-vulkan] loaded %zu tensors, %d layers, %d vocab; weights=%zu KV=%zu bytes\n",tensors_.size(),layers_,vocab_,ggml_backend_buffer_get_size(wbuf_.p),ggml_backend_buffer_get_size(cbuf_.p));
  }
  ~Qwen2Vulkan() override { shutdown(); }
@@ -100,7 +103,7 @@ public:
   if(n==1 && (!decode_graph_ || decode_graph_->cache_len!=cache_len)) decode_graph_=std::make_unique<StepGraph>();
   StepGraph &step=n==1?*decode_graph_:prefill_graph;
   Context &c=step.context;
-  auto alloc=n==1?decode_alloc_:prefill_alloc_;
+  auto alloc=n==1?decode_alloc_.get():prefill_alloc_.get();
   if(!step.graph) {
   step.cache_len=cache_len;
   c.p=ggml_init({32*1024*1024,nullptr,true});require(c.p,"graph metadata allocation failed");
@@ -145,7 +148,7 @@ public:
   x=ggml_view_2d(c.p,x,dim_,1,x->nb[1],(n-1)*x->nb[1]);
   auto *logits=ggml_mul_mat(c.p,w("output.weight"),norm(c.p,x,w("output_norm.weight")));
   ggml_set_output(logits);ggml_build_forward_expand(g,logits);
-  for(int i=0;i<ggml_graph_n_nodes(g);i++) { auto *node=ggml_graph_node(g,i); require(ggml_backend_supports_op(backend_,node),("unsupported Vulkan op "+std::string(ggml_op_name(node->op))).c_str()); }
+  for(int i=0;i<ggml_graph_n_nodes(g);i++) { auto *node=ggml_graph_node(g,i); require(ggml_backend_supports_op(backend_.get(),node),("unsupported Vulkan op "+std::string(ggml_op_name(node->op))).c_str()); }
   require(ggml_gallocr_alloc_graph(alloc,g),"graph device allocation failed");
   step.graph=g;step.tokens=tokens;step.positions=pos;step.mask=mask;step.logits=logits;
   }
@@ -159,7 +162,7 @@ public:
   ggml_backend_tensor_set(pos,positions.data(),0,n*sizeof(int32_t));
   std::vector<float> masks(cache_len*n);for(int j=0;j<n;j++)for(int i=0;i<cache_len;i++)masks[j*cache_len+i]=i>past+j?-std::numeric_limits<float>::infinity():0;
   ggml_backend_tensor_set(mask,masks.data(),0,masks.size()*sizeof(float));
-  auto status=ggml_backend_graph_compute(backend_,g);
+  auto status=ggml_backend_graph_compute(backend_.get(),g);
   result.resize(vocab_);if(status==GGML_STATUS_SUCCESS)ggml_backend_tensor_get(logits,result.data(),0,result.size()*sizeof(float));
   require(status==GGML_STATUS_SUCCESS,"Vulkan compute failed");
  }
@@ -192,7 +195,14 @@ public:
  GenerateResult restore_and_generate_impl(int,const GenerateRequest&,const DaemonIO&)override{GenerateResult r;r.fail(GenerateErrorCode::InvalidSnapshotSlot,"Qwen2 Vulkan snapshot cache unsupported");return r;}
  bool handle_compress(const std::string&,const DaemonIO&)override{return false;}void free_drafter()override{}
  void shutdown()override{
-  if(backend_){ggml_backend_synchronize(backend_);if(decode_alloc_){ggml_gallocr_free(decode_alloc_);decode_alloc_=nullptr;}if(prefill_alloc_){ggml_gallocr_free(prefill_alloc_);prefill_alloc_=nullptr;}if(cbuf_.p){ggml_backend_buffer_free(cbuf_.p);cbuf_.p=nullptr;}if(wbuf_.p){ggml_backend_buffer_free(wbuf_.p);wbuf_.p=nullptr;}ggml_backend_free(backend_);backend_=nullptr;}
+  if(backend_){
+   ggml_backend_synchronize(backend_.get());
+   decode_graph_.reset();
+   decode_alloc_.reset();prefill_alloc_.reset();
+   if(cbuf_.p){ggml_backend_buffer_free(cbuf_.p);cbuf_.p=nullptr;}
+   if(wbuf_.p){ggml_backend_buffer_free(wbuf_.p);wbuf_.p=nullptr;}
+   backend_.reset();
+  }
  }
 };
 }
