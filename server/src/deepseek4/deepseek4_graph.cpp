@@ -439,6 +439,11 @@ struct DeepSeek4AttentionGraphInputs {
     // [n_swa raw rows ++ padded comp rows]; 0 for valid, -1e30 for padding.
     ggml_tensor * attn_row_mask = nullptr;
     int           padded_comp = 0;   // padded compressed-row count (>= n_comp)
+    // I32 [top_k] holding 0..top_k-1 (LUCE_DS4_EXPLICIT_SPLIT): the row list
+    // of a lane that attends to all of its compressed rows.
+    ggml_tensor * identity_rows = nullptr;
+    // F16 copy of attn_row_mask taken once per step (LUCE_DS4_MASK_F16_ONCE).
+    ggml_tensor * attn_row_mask_f16 = nullptr;
     // Optional stable-topology compressor rows. DSpark's fused verifier leaves
     // this null and uses its batched state-row inputs instead.
     ggml_tensor * flush_rows = nullptr;
@@ -2729,6 +2734,18 @@ static ggml_tensor * build_mla_attention_lane_core(
                 : indexer_topk;
         }
     }
+    // A short-context verify lane without a selection attends to every
+    // compressed row: give it the identity row list so it runs the split-KV
+    // flash schedule on the F16 cache (LUCE_DS4_EXPLICIT_SPLIT).
+    if (!indexer_topk && cached_inputs && cached_inputs->identity_rows && masked_kv &&
+        n_tokens == 1 && attention_impl == DeepSeek4AttentionImpl::Explicit &&
+        w.shared_index_topk && head_dim == 512 && n_rot == 64 && !image_spans.size &&
+        !gathered_history && cached_inputs->padded_comp > 1 &&
+        cached_inputs->padded_comp <= (int) cached_inputs->identity_rows->ne[0]) {
+        indexer_topk = ggml_view_2d(ctx, cached_inputs->identity_rows,
+                                    cached_inputs->padded_comp, 1,
+                                    (size_t) cached_inputs->padded_comp * sizeof(int32_t), 0);
+    }
     // Maskless indexed prefill admission. This repeats the kernel's
     // ratio4_causal support check in fattn.cu exactly (indexed-row capacity,
     // chronological prior window, completed compressed-row frontier): the
@@ -2844,8 +2861,10 @@ static ggml_tensor * build_mla_attention_lane_core(
     } else {
         kv_attn = raw_kv_view(0, n_raw);
     }
+    // LUCE_DS4_F16_KV_LANES=1: single-token lanes keep F16 K/V too.
+    static const bool f16_kv_lanes = ds4_env_flag("LUCE_DS4_F16_KV_LANES");
     const bool fused_verify_f16_kv = w.fused_verify_f16_kv &&
-        masked_kv && n_tokens > 1 &&
+        masked_kv && (n_tokens > 1 || f16_kv_lanes) &&
         kv_attn->type == GGML_TYPE_F32 &&
         raw_kv_source->type == GGML_TYPE_F16 &&
         (!comp_history_source ||
@@ -2856,6 +2875,11 @@ static ggml_tensor * build_mla_attention_lane_core(
         attention_impl == DeepSeek4AttentionImpl::Explicit;
     const bool fused_sparse_f16_kv = fused_verify_f16_kv &&
         attention_impl == DeepSeek4AttentionImpl::SparseFlash;
+    // Explicit lanes with a V4.1 shared selection run on the D=512 flash
+    // kernel too (selection_flash below); keep their K/V in F16 there.
+    const bool explicit_selection_f16_kv = fused_explicit_f16_kv &&
+        w.shared_index_topk && indexer_topk && head_dim == 512 &&
+        n_rot == 64 && !image_spans.size;
     // Segmented K/V is a device-class default (HIP backends), with
     // GGML_CUDA_MLA_SEGMENTED_KV=0 as the graph-side kill switch. The two
     // NO_SPLIT_KV flags below are the kernel's own split-KV kill switches
@@ -2875,9 +2899,11 @@ static ggml_tensor * build_mla_attention_lane_core(
     // list. Keep raw, compressed, and preserved overwritten rows as separate
     // dependencies and let the native split-KV kernel address them directly.
     // This removes two O(context) concatenations per indexed layer/step.
-    const bool segmented_sparse_f16_kv = fused_sparse_f16_kv &&
+    const bool segmented_sparse_f16_kv =
+        (fused_sparse_f16_kv || explicit_selection_f16_kv) &&
         segmented_kv_enabled && indexer_topk && n_tokens <= 8 &&
-        n_comp_attn > 0 && comp_history_source && old_rows_scratch_f16 &&
+        n_comp_attn > 0 && comp_history_source &&
+        (old_rows_scratch_f16 || n_comp_attn > 1) &&
         !ds4_env_flag("GGML_CUDA_MLA_NO_SPLIT_KV") &&
         !ds4_env_flag("GGML_DS4_FA_NO_SPLIT_KV");
     ggml_tensor * segmented_kv_comp = nullptr;
@@ -2894,7 +2920,18 @@ static ggml_tensor * build_mla_attention_lane_core(
             ggml_tensor * comp = ggml_view_2d(
                 ctx, comp_history_source, head_dim, n_comp_attn,
                 comp_history_source->nb[1], 0);
-            if (segmented_sparse_f16_kv) {
+            if (segmented_sparse_f16_kv && !old_rows_scratch_f16) {
+                // No preserved rows (single-token lane): the last
+                // compressed row is the tail segment, so the logical
+                // [raw | compressed] sequence is unchanged.
+                segmented_kv_comp = ggml_view_2d(
+                    ctx, comp_history_source, head_dim, n_comp_attn - 1,
+                    comp_history_source->nb[1], 0);
+                segmented_kv_tail = ggml_view_2d(
+                    ctx, comp_history_source, head_dim, 1,
+                    comp_history_source->nb[1],
+                    (size_t) (n_comp_attn - 1) * comp_history_source->nb[1]);
+            } else if (segmented_sparse_f16_kv) {
                 segmented_kv_comp = comp;
             } else {
                 kv_attn = ggml_concat(ctx, kv_attn, comp, 1);
@@ -2912,6 +2949,14 @@ static ggml_tensor * build_mla_attention_lane_core(
         static std::atomic<bool> sparse_f16_kv_logged{false};
         std::atomic<bool> & logged = fused_sparse_f16_kv
             ? sparse_f16_kv_logged : explicit_f16_kv_logged;
+        static std::atomic<bool> selection_f16_kv_logged{false};
+        if (explicit_selection_f16_kv &&
+            !selection_f16_kv_logged.exchange(true)) {
+            std::fprintf(stderr,
+                "[deepseek4] explicit selection F16 K/V active: tokens=%d "
+                "compressed=%d segmented=%s\n", n_tokens, n_comp_attn,
+                segmented_sparse_f16_kv ? "yes" : "no");
+        }
         if (!logged.exchange(true)) {
             std::fprintf(stderr,
                 "[deepseek4] fused %s F16 K/V active: tokens=%d "
@@ -3300,7 +3345,8 @@ static ggml_tensor * build_mla_attention_lane_core(
             // The verifier retains its independently qualified F16 transport;
             // long prefill streams F32 rows unless f16_sparse_prefill is on.
             ggml_tensor * kv_fa =
-                (fused_sparse_f16_kv || f16_sparse_prefill)
+                (fused_sparse_f16_kv || f16_sparse_prefill ||
+                 explicit_selection_f16_kv)
                 ? kv_attn
                 : ds4_cast_if_needed(ctx, kv_attn, GGML_TYPE_F32);
             const int materialized_kv_rows = segmented_sparse_f16_kv
@@ -3309,7 +3355,11 @@ static ggml_tensor * build_mla_attention_lane_core(
                 ctx, kv_fa, head_dim, materialized_kv_rows, 1);
             ggml_tensor * v_fa = k_fa;
             ggml_tensor * mask_fa = score_mask
-                ? ds4_cast_if_needed(ctx, score_mask, GGML_TYPE_F16)
+                ? (masked_kv && cached_inputs->attn_row_mask_f16 &&
+                   ggml_nelements(cached_inputs->attn_row_mask_f16) == ggml_nelements(score_mask)
+                       ? ggml_reshape_2d(ctx, cached_inputs->attn_row_mask_f16,
+                                         score_mask->ne[0], score_mask->ne[1])
+                       : ds4_cast_if_needed(ctx, score_mask, GGML_TYPE_F16))
                 : nullptr;
             context = ggml_flash_attn_ext(ctx, q_fa, k_fa, v_fa, mask_fa,
                                           kq_scale, 0.0f, 0.0f);
@@ -6143,6 +6193,8 @@ struct DeepSeek4FusedDecodeGraph {
     ggml_tensor * i32_bundle = nullptr;
     ggml_tensor * i64_bundle = nullptr;
     ggml_tensor * mask_bundle = nullptr;   // additive score mask (0 / -1e30), may be null
+    ggml_tensor * identity_rows = nullptr; // I32 0..top_k-1 (LUCE_DS4_EXPLICIT_SPLIT)
+    ggml_tensor * mask_bundle_f16 = nullptr; // LUCE_DS4_MASK_F16_ONCE
     std::vector<ggml_tensor *> hash_ids;
     std::vector<MoeHybridGraphInputs> hybrid_inputs;
     // Posts of each layer's predicted next-layer routes (streamed mailbox).
@@ -6166,6 +6218,8 @@ struct DeepSeek4FusedDecodeGraph {
         i32_bundle = nullptr;
         i64_bundle = nullptr;
         mask_bundle = nullptr;
+        identity_rows = nullptr;
+        mask_bundle_f16 = nullptr;
         logits = nullptr;
         hash_ids.clear();
         hybrid_inputs.clear();

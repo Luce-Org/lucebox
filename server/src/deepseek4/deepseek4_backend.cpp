@@ -2178,7 +2178,11 @@ bool DeepSeek4Backend::load_model() {
                  w_.mixed_mmq_policy == GGML_MIXED_MMQ_DISABLED ? "disabled" :
                  "backend default");
     w_.fused_decode = cfg_.fused_decode && !moe_hybrid_;
-    w_.fused_verify_f16_kv = cfg_.fused_verify_f16_kv && !moe_hybrid_;
+    w_.fused_verify_f16_kv = (cfg_.fused_verify_f16_kv && !moe_hybrid_) ||
+        (moe_hybrid_ && env_flag_enabled("LUCE_DS4_HYBRID_F16_VERIFY_KV"));
+    if (moe_hybrid_ && w_.fused_verify_f16_kv) {
+        std::fprintf(stderr, "[deepseek4] hybrid tier: F16 verify K/V on (LUCE_DS4_HYBRID_F16_VERIFY_KV)\n");
+    }
     if (cfg_.fused_decode && moe_hybrid_) {
         std::fprintf(stderr,
                      "[deepseek4] fused decode unavailable with hybrid expert placement; "

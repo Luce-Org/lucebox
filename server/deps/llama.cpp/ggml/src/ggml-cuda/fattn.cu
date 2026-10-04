@@ -313,16 +313,28 @@ __global__ static void ds4_fa_visibility_bounds_kernel(
             raw_last = base + 63 - __clzll(active);
         }
     }
+    // First visible compressed row: forward until a visible row appears.
     for (int base = raw_rows; base < n_kv; base += warpSize) {
         const int r = base + lane;
         const unsigned long long active = __ballot(
             r < n_kv &&
             ds4_fa_load<Mask, Mask>(token_mask + r) > -1.0e20f);
-        if (lane == 0 && active != 0) {
-            if (comp_first == n_kv) {
-                comp_first = base + __ffsll(active) - 1;
+        if (active != 0) {
+            comp_first = base + __ffsll(active) - 1;
+            break;
+        }
+    }
+    // Last visible compressed row: backward from the end (same row set).
+    if (comp_first < n_kv) {
+        for (int top = n_kv; top > comp_first; top -= warpSize) {
+            const int r = top - warpSize + lane;
+            const unsigned long long active = __ballot(
+                r >= comp_first && r < n_kv &&
+                ds4_fa_load<Mask, Mask>(token_mask + r) > -1.0e20f);
+            if (active != 0) {
+                comp_last = (top - warpSize) + 63 - __clzll(active);
+                break;
             }
-            comp_last = base + 63 - __clzll(active);
         }
     }
     if (lane == 0) {
@@ -619,29 +631,34 @@ __global__ static void ds4_fa_indexed_rows_topk_kernel(
     if (tid < N_OWNERS) owner_counts[tid] = 0;
     __syncthreads();
 
-    for (int width = 2; width <= SORT_WIDTH; width <<= 1) {
-        for (int stride = width >> 1; stride > 0; stride >>= 1) {
-            const int peer = tid ^ stride;
-            if (peer > tid) {
-                const int lhs = sorted_rows[tid];
-                const int rhs = sorted_rows[peer];
-                const bool ascending = (tid & width) == 0;
-                if ((lhs > rhs) == ascending) {
-                    sorted_rows[tid] = rhs;
-                    sorted_rows[peer] = lhs;
+    // An ascending input (identity row lists) is its own sorted order:
+    // skipping the network leaves the same array.
+    const bool already_sorted =
+        __syncthreads_and(tid == 0 || sorted_rows[tid - 1] <= sorted_rows[tid]) != 0;
+    if (!already_sorted) {
+        for (int width = 2; width <= SORT_WIDTH; width <<= 1) {
+            for (int stride = width >> 1; stride > 0; stride >>= 1) {
+                const int peer = tid ^ stride;
+                if (peer > tid) {
+                    const int lhs = sorted_rows[tid];
+                    const int rhs = sorted_rows[peer];
+                    const bool ascending = (tid & width) == 0;
+                    if ((lhs > rhs) == ascending) {
+                        sorted_rows[tid] = rhs;
+                        sorted_rows[peer] = lhs;
+                    }
                 }
+                __syncthreads();
             }
-            __syncthreads();
         }
     }
 
+    // Valid rows sort first (INVALID_ROW is the maximum), so the count of
+    // valid entries is the prefix length.
+    const int valid_total = __syncthreads_count(row != INVALID_ROW);
     if (tid == 0) {
-        int valid = 0;
-        while (valid < capacity && sorted_rows[valid] != INVALID_ROW) {
-            ++valid;
-        }
-        count = valid;
-        selected_counts[t] = valid;
+        count = valid_total;
+        selected_counts[t] = valid_total;
     }
     __syncthreads();
 
@@ -664,7 +681,7 @@ __global__ static void ds4_fa_indexed_rows_topk_kernel(
     if (tid < N_OWNERS) {
         int write = token_owner_offsets[tid];
         for (int rank = 0; rank < count; ++rank) {
-            if ((token_rows[rank] & (N_OWNERS - 1)) == tid) {
+            if ((sorted_rows[rank] & (N_OWNERS - 1)) == tid) {
                 token_owner_ranks[write++] = rank;
             }
         }
@@ -3770,66 +3787,76 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
         if (indexed_mask && !ratio4_causal &&
             n_tokens <= split_kv_max_decode_tokens &&
             (segmented_kv || ds4_mla_split_kv_enabled(split_kv_default))) {
-            constexpr int split_count = 4;
-            const int split_stride =
-                (raw_window + indexed_capacity + split_count - 1) /
-                split_count;
-            ggml_cuda_pool_alloc<float> partial_alloc(ctx.pool());
-            float * partial = partial_alloc.alloc(
-                (size_t) n_tokens * n_heads * split_count * (512 + 2));
-            if (kv_f16 && mask->type == GGML_TYPE_F16) {
-                ds4_launch_flash_attn_d512_indexed_split<
-                    half, half, split_count>(
-                    (float *) dst->data, partial, (const float *) Q->data,
-                    q_stride_token, q_stride_head,
-                    (const half *) K->data, (const half *) V->data,
-                    segmented_kv
-                        ? (const half *) kv_compressed->data : nullptr,
-                    segmented_kv
-                        ? (const half *) kv_preserved_tail->data : nullptr,
-                    (const half *) mask->data,
-                    sinks ? (const float *) sinks->data : nullptr,
-                    n_tokens, n_heads, n_kv, materialized_kv_rows,
-                    compressed_kv_rows, scale, raw_rows, split_stride,
-                    visibility_bounds, indexed_rows, indexed_counts,
-                    indexed_capacity, inverse_rope,
-                    inverse_rope_coefficients, forward_rope_coefficients,
-                    stream);
-            } else if (kv_f32 && mask->type == GGML_TYPE_F32) {
-                ds4_launch_flash_attn_d512_indexed_split<
-                    float, float, split_count>(
-                    (float *) dst->data, partial, (const float *) Q->data,
-                    q_stride_token, q_stride_head,
-                    (const float *) K->data, (const float *) V->data,
-                    nullptr, nullptr,
-                    (const float *) mask->data,
-                    sinks ? (const float *) sinks->data : nullptr,
-                    n_tokens, n_heads, n_kv, materialized_kv_rows,
-                    compressed_kv_rows, scale, raw_rows, split_stride,
-                    visibility_bounds, indexed_rows, indexed_counts,
-                    indexed_capacity, inverse_rope,
-                    inverse_rope_coefficients, forward_rope_coefficients,
-                    stream);
-            } else if (kv_f32 && mask->type == GGML_TYPE_F16) {
-                ds4_launch_flash_attn_d512_indexed_split<
-                    float, half, split_count>(
-                    (float *) dst->data, partial, (const float *) Q->data,
-                    q_stride_token, q_stride_head,
-                    (const float *) K->data, (const float *) V->data,
-                    nullptr, nullptr,
-                    (const half *) mask->data,
-                    sinks ? (const float *) sinks->data : nullptr,
-                    n_tokens, n_heads, n_kv, materialized_kv_rows,
-                    compressed_kv_rows, scale, raw_rows, split_stride,
-                    visibility_bounds, indexed_rows, indexed_counts,
-                    indexed_capacity, inverse_rope,
-                    inverse_rope_coefficients, forward_rope_coefficients,
-                    stream);
-            } else {
-                return false;
-            }
-            CUDA_CHECK(cudaGetLastError());
-            return true;
+            static const int split_count_rt = [] {
+                const char * v = getenv("GGML_CUDA_MLA_SPLIT_KV_COUNT");
+                const int n = v && *v ? atoi(v) : 4;
+                return n >= 16 ? 16 : n >= 8 ? 8 : 4;
+            }();
+            const auto run_split = [&](auto split_tag) -> bool {
+                constexpr int split_count = decltype(split_tag)::value;
+                const int split_stride =
+                    (raw_window + indexed_capacity + split_count - 1) /
+                    split_count;
+                ggml_cuda_pool_alloc<float> partial_alloc(ctx.pool());
+                float * partial = partial_alloc.alloc(
+                    (size_t) n_tokens * n_heads * split_count * (512 + 2));
+                if (kv_f16 && mask->type == GGML_TYPE_F16) {
+                    ds4_launch_flash_attn_d512_indexed_split<
+                        half, half, split_count>(
+                        (float *) dst->data, partial, (const float *) Q->data,
+                        q_stride_token, q_stride_head,
+                        (const half *) K->data, (const half *) V->data,
+                        segmented_kv
+                            ? (const half *) kv_compressed->data : nullptr,
+                        segmented_kv
+                            ? (const half *) kv_preserved_tail->data : nullptr,
+                        (const half *) mask->data,
+                        sinks ? (const float *) sinks->data : nullptr,
+                        n_tokens, n_heads, n_kv, materialized_kv_rows,
+                        compressed_kv_rows, scale, raw_rows, split_stride,
+                        visibility_bounds, indexed_rows, indexed_counts,
+                        indexed_capacity, inverse_rope,
+                        inverse_rope_coefficients, forward_rope_coefficients,
+                        stream);
+                } else if (kv_f32 && mask->type == GGML_TYPE_F32) {
+                    ds4_launch_flash_attn_d512_indexed_split<
+                        float, float, split_count>(
+                        (float *) dst->data, partial, (const float *) Q->data,
+                        q_stride_token, q_stride_head,
+                        (const float *) K->data, (const float *) V->data,
+                        nullptr, nullptr,
+                        (const float *) mask->data,
+                        sinks ? (const float *) sinks->data : nullptr,
+                        n_tokens, n_heads, n_kv, materialized_kv_rows,
+                        compressed_kv_rows, scale, raw_rows, split_stride,
+                        visibility_bounds, indexed_rows, indexed_counts,
+                        indexed_capacity, inverse_rope,
+                        inverse_rope_coefficients, forward_rope_coefficients,
+                        stream);
+                } else if (kv_f32 && mask->type == GGML_TYPE_F16) {
+                    ds4_launch_flash_attn_d512_indexed_split<
+                        float, half, split_count>(
+                        (float *) dst->data, partial, (const float *) Q->data,
+                        q_stride_token, q_stride_head,
+                        (const float *) K->data, (const float *) V->data,
+                        nullptr, nullptr,
+                        (const half *) mask->data,
+                        sinks ? (const float *) sinks->data : nullptr,
+                        n_tokens, n_heads, n_kv, materialized_kv_rows,
+                        compressed_kv_rows, scale, raw_rows, split_stride,
+                        visibility_bounds, indexed_rows, indexed_counts,
+                        indexed_capacity, inverse_rope,
+                        inverse_rope_coefficients, forward_rope_coefficients,
+                        stream);
+                } else {
+                    return false;
+                }
+                CUDA_CHECK(cudaGetLastError());
+                return true;
+            };
+            return split_count_rt == 16 ? run_split(std::integral_constant<int, 16>{})
+                 : split_count_rt == 8  ? run_split(std::integral_constant<int, 8>{})
+                                        : run_split(std::integral_constant<int, 4>{});
         }
         // No kernel below understands the segmented layout (see above).
         GGML_ASSERT(!segmented_kv);
