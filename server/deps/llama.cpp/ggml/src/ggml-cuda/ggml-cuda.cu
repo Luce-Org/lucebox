@@ -4127,8 +4127,15 @@ static void ggml_cuda_flush_peer_copy_batch(const char * reason) {
 // stream does not. The caller keeps src unchanged until the destination has
 // consumed it. False when the backends or buffers do not qualify; the caller
 // then copies the usual way.
-bool ggml_backend_cuda_copy_tensor_async_side(ggml_backend_t backend_src, ggml_backend_t backend_dst,
-                                              const ggml_tensor * src, ggml_tensor * dst) {
+// A contiguous same-size copy between two CUDA backends on different devices,
+// each tensor in a CUDA buffer on its backend's device: the copies below
+// qualify only then, as ggml_backend_cuda_cpy_tensor_async's peer path does.
+static bool ggml_cuda_peer_copy_qualifies(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+                                          const ggml_tensor * src, const ggml_tensor * dst) {
+#ifdef GGML_CUDA_NO_PEER_COPY
+    GGML_UNUSED_VARS(backend_src, backend_dst, src, dst);
+    return false;
+#else
     if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
         return false;
     }
@@ -4138,14 +4145,22 @@ bool ggml_backend_cuda_copy_tensor_async_side(ggml_backend_t backend_src, ggml_b
         !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || ggml_nbytes(src) != ggml_nbytes(dst)) {
         return false;
     }
-    ggml_backend_cuda_context * ctx_src = (ggml_backend_cuda_context *) backend_src->context;
-    ggml_backend_cuda_context * ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+    const ggml_backend_cuda_context * ctx_src = (const ggml_backend_cuda_context *) backend_src->context;
+    const ggml_backend_cuda_context * ctx_dst = (const ggml_backend_cuda_context *) backend_dst->context;
     const ggml_backend_cuda_buffer_context * bctx_src = (const ggml_backend_cuda_buffer_context *) buf_src->context;
     const ggml_backend_cuda_buffer_context * bctx_dst = (const ggml_backend_cuda_buffer_context *) buf_dst->context;
-    if (ctx_src->device == ctx_dst->device || bctx_src->device != ctx_src->device ||
-        bctx_dst->device != ctx_dst->device) {
+    return ctx_src->device != ctx_dst->device && bctx_src->device == ctx_src->device &&
+           bctx_dst->device == ctx_dst->device;
+#endif
+}
+
+bool ggml_backend_cuda_copy_tensor_async_side(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+                                              const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_cuda_peer_copy_qualifies(backend_src, backend_dst, src, dst)) {
         return false;
     }
+    ggml_backend_cuda_context * ctx_src = (ggml_backend_cuda_context *) backend_src->context;
+    ggml_backend_cuda_context * ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
 #if defined(GGML_USE_HIP)
     // Batched peer copies record their completion later on the source
     // stream; settle them before ordering against that stream.
@@ -4173,20 +4188,11 @@ bool ggml_backend_cuda_copy_tensor_async_side(ggml_backend_t backend_src, ggml_b
 // and has the destination wait for that event when it needs the data.
 bool ggml_backend_cuda_copy_tensor_async_nowait(ggml_backend_t backend_src, ggml_backend_t backend_dst,
                                                 const ggml_tensor * src, ggml_tensor * dst) {
-    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
-        return false;
-    }
-    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
-    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
-    if (!buf_src || !buf_dst || !ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst) ||
-        !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || ggml_nbytes(src) != ggml_nbytes(dst)) {
+    if (!ggml_cuda_peer_copy_qualifies(backend_src, backend_dst, src, dst)) {
         return false;
     }
     ggml_backend_cuda_context * ctx_src = (ggml_backend_cuda_context *) backend_src->context;
     ggml_backend_cuda_context * ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
-    if (ctx_src->device == ctx_dst->device) {
-        return false;
-    }
 #if defined(GGML_USE_HIP)
     ggml_cuda_flush_peer_copy_batch("nowait-copy");
 #endif

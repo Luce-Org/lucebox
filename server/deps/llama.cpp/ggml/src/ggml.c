@@ -9514,10 +9514,13 @@ struct ggml_tensor * ggml_ds4_router_select(
         struct ggml_tensor  * protected_mask,
         int                   k) {
     GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits));
-    GGML_ASSERT(bias->type == GGML_TYPE_F32 && ggml_nelements(bias) == logits->ne[0]);
-    GGML_ASSERT(!native_bias || (native_bias->type == GGML_TYPE_F32 &&
+    GGML_ASSERT(logits->ne[2] == 1 && logits->ne[3] == 1);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
+                ggml_nelements(bias) == logits->ne[0]);
+    GGML_ASSERT(!native_bias || (native_bias->type == GGML_TYPE_F32 && ggml_is_contiguous(native_bias) &&
                                  ggml_nelements(native_bias) == logits->ne[0]));
-    GGML_ASSERT(!protected_mask || protected_mask->type == GGML_TYPE_I32);
+    GGML_ASSERT(!protected_mask || (protected_mask->type == GGML_TYPE_I32 && ggml_is_contiguous(protected_mask) &&
+                                    ggml_nelements(protected_mask) == logits->ne[0]));
     GGML_ASSERT((native_bias == NULL) == (protected_mask == NULL));
     GGML_ASSERT(k > 0 && k <= 32 && logits->ne[0] >= k && logits->ne[0] <= 1024);
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, logits->ne[1]);
@@ -9538,6 +9541,7 @@ struct ggml_tensor * ggml_ds4_router_weights(
         float                 clamp_min,
         float                 scale) {
     GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits));
+    GGML_ASSERT(logits->ne[2] == 1 && logits->ne[3] == 1);
     GGML_ASSERT(selected->type == GGML_TYPE_I32 && ggml_is_contiguous(selected));
     GGML_ASSERT(selected->ne[1] == logits->ne[1] && selected->ne[0] <= 32);
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, selected->ne[0], selected->ne[1]);

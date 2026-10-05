@@ -557,37 +557,40 @@ static __global__ void ds4_router_weights_kernel(
 
 // Mode 6: the staggered HC collapse. sum_rows over a 4-wide row of products
 // is one wave32 butterfly, (x0 + x2) + (x1 + x3); other widths replay the
-// whole butterfly with zeros past n_hc. Contraction off: a product must not
-// fuse into the following add.
+// whole butterfly with zeros past n_hc. A product must not fuse into the
+// following add: __fmul_rn keeps it a separate rounding on CUDA too, where
+// nvcc ignores the clang pragma and builds with fast math.
 static __global__ void ds4_hc_collapse_kernel(
         const float * __restrict__ hc, const float * __restrict__ pre, float * __restrict__ dst,
-        int n_embd, int n_hc, size_t hc_stride, size_t pre_stride, size_t dst_stride) {
+        int n_embd, int n_hc, int n_tokens, size_t hc_stride, size_t pre_stride, size_t dst_stride) {
 #pragma clang fp contract(off)
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
     if (d >= n_embd) return;
-    const float * h = hc + (size_t) t * hc_stride + d;
-    const float * p = pre + (size_t) t * pre_stride;
-    if (n_hc == 4) {
-        const float v0 = h[0] * p[0];
-        const float v1 = h[(size_t) n_embd] * p[1];
-        const float v2 = h[2 * (size_t) n_embd] * p[2];
-        const float v3 = h[3 * (size_t) n_embd] * p[3];
-        dst[(size_t) t * dst_stride + d] = (v0 + v2) + (v1 + v3);
-        return;
+    // grid.y is capped at 65535: a longer batch strides over its tokens.
+    for (int t = blockIdx.y; t < n_tokens; t += gridDim.y) {
+        const float * h = hc + (size_t) t * hc_stride + d;
+        const float * p = pre + (size_t) t * pre_stride;
+        if (n_hc == 4) {
+            const float v0 = __fmul_rn(h[0], p[0]);
+            const float v1 = __fmul_rn(h[(size_t) n_embd], p[1]);
+            const float v2 = __fmul_rn(h[2 * (size_t) n_embd], p[2]);
+            const float v3 = __fmul_rn(h[3 * (size_t) n_embd], p[3]);
+            dst[(size_t) t * dst_stride + d] = (v0 + v2) + (v1 + v3);
+            continue;
+        }
+        float v[32];
+#pragma unroll
+        for (int l = 0; l < 32; ++l) v[l] = l < n_hc ? __fmul_rn(h[(size_t) l * n_embd], p[l]) : 0.0f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            float n[32];
+#pragma unroll
+            for (int l = 0; l < 32; ++l) n[l] = v[l] + v[l ^ off];
+#pragma unroll
+            for (int l = 0; l < 32; ++l) v[l] = n[l];
+        }
+        dst[(size_t) t * dst_stride + d] = v[0];
     }
-    float v[32];
-#pragma unroll
-    for (int l = 0; l < 32; ++l) v[l] = l < n_hc ? h[(size_t) l * n_embd] * p[l] : 0.0f;
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        float n[32];
-#pragma unroll
-        for (int l = 0; l < 32; ++l) n[l] = v[l] + v[l ^ off];
-#pragma unroll
-        for (int l = 0; l < 32; ++l) v[l] = n[l];
-    }
-    dst[(size_t) t * dst_stride + d] = v[0];
 }
 
 // GGML_OP_DS4_HC modes (op_params[0]): 0 hc_pre, 1 hc_post, 2 hc_out,
@@ -620,10 +623,11 @@ void ggml_cuda_op_ds4_hc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         const ggml_tensor * pre = dst->src[1];
         const int n_embd = ggml_get_op_params_i32(dst, 1);
         const int n_hc = ggml_get_op_params_i32(dst, 2);
-        const dim3 grid((n_embd + 255) / 256, (unsigned) dst->ne[1], 1);
+        const int n_tokens = (int) dst->ne[1];
+        const dim3 grid((n_embd + 255) / 256, (unsigned) (n_tokens < 65535 ? n_tokens : 65535), 1);
         ds4_hc_collapse_kernel<<<grid, 256, 0, ctx.stream()>>>(
             (const float *) hc->data, (const float *) pre->data, (float *) dst->data,
-            n_embd, n_hc, hc->nb[1] / sizeof(float), pre->nb[1] / sizeof(float),
+            n_embd, n_hc, n_tokens, hc->nb[1] / sizeof(float), pre->nb[1] / sizeof(float),
             dst->nb[1] / sizeof(float));
         return;
     }

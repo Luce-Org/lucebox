@@ -3794,7 +3794,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
         if (indexed_mask && !ratio4_causal &&
             n_tokens <= split_kv_max_decode_tokens &&
             (segmented_kv || ds4_mla_split_kv_enabled(split_kv_default))) {
-            static const int split_count_rt = [] {
+            // Read per launch like the other GGML_CUDA_MLA_* switches.
+            const int split_count_rt = [] {
                 const char * v = getenv("GGML_CUDA_MLA_SPLIT_KV_COUNT");
                 const int n = v && *v ? atoi(v) : 4;
                 return n >= 16 ? 16 : n >= 8 ? 8 : 4;

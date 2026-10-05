@@ -179,7 +179,6 @@ inline const std::vector<LaunchProfile> & launch_profiles() {
                 {"LUCE_DS4_PREFILL_PIPELINE", "2"},
                 {"LUCE_DS4_PREFILL_ARENA_CHUNK_MB", "0"},
                 {"LUCE_DS4_DEVICE_TOPK", "1"},
-                {"LUCE_DS4_DRAFT_SWAP", "1"},
                 // The cold owner's input crosses PCIe on a side stream.
                 {"LUCE_MOE_SIDE_COPY", "1"},
                 // Prefill attention on the R9700's matrix cores: F16 K/V

@@ -2367,6 +2367,47 @@ bool DeepSeek4Backend::draft_swap_prepare() {
     return true;
 }
 
+// Decoder SWA bounded replay (LUCE_DS41_DECODER_BOUNDED_REPLAY=1). The
+// layers after the last kv source read the encoder only through that
+// source's compressed rows plus a raw window of their own, so every prompt
+// row runs the layers up to that source and only the final n_swa rows run
+// the rest, their raw window floored at the first replay row. Not exact:
+// V4.1 is trained to tolerate it (tech report, sec. 3.2.2).
+int DeepSeek4Backend::bounded_replay_cut() const {
+    static const bool requested = env_flag_enabled("LUCE_DS41_DECODER_BOUNDED_REPLAY");
+    if (!requested) return -1;
+    int cut = -1;
+    for (int il = 0; il < w_.n_layer; ++il) {
+        // The cut is the deepest layer any layer reads its compressed KV
+        // from (V4.1: 20); the per-layer source flags may be unset.
+        cut = std::max(cut, deepseek4_kv_source_layer(w_, il));
+    }
+    for (int il = cut + 1; cut >= 0 && il < w_.n_layer; ++il) {
+        // Index sources after the cut (V4.1: 24-36) are fine: the cut layer
+        // publishes every row; only an Engram layer past it disables replay.
+        if (w_.layers[(size_t) il].engram_q) return -1;
+    }
+    return cut;
+}
+
+// Replay runs on the layer-range hybrid path's dense text prefill only, and
+// only when the drafter captures layers past the cut: the replay tail runs
+// the captured layers for the last rows alone.
+bool DeepSeek4Backend::bounded_replay_runs(bool images) const {
+    const int cut = bounded_replay_cut();
+    if (cut < 0 || cut + 1 >= w_.n_layer || images || !moe_hybrid_ ||
+        !(expert_runtime_.compute || expert_backend_) ||
+        cache_.prefill_mode != PrefillAttentionMode::Dense) {
+        return false;
+    }
+    if (spec_drafter_) {
+        for (int il : spec_drafter_->capture_layer_ids) {
+            if (il <= cut) return false;
+        }
+    }
+    return true;
+}
+
 bool DeepSeek4Backend::draft_swap_out() {
     DraftSwap & s = draft_swap_;
     if (s.out || !s.host || !spec_drafter_ || !spec_drafter_->core.buf) return false;
@@ -4037,32 +4078,11 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
 
     bool snapshot_saved = false;
     bool late_context_chunk_logged = false;
-    // Decoder SWA bounded replay (LUCE_DS41_DECODER_BOUNDED_REPLAY=1). The
-    // layers after the last kv source read the encoder only through that
-    // source's compressed rows plus a raw window of their own, so every
-    // prompt row runs the layers up to that source and only the final n_swa
-    // rows run the rest, their raw window floored at the first replay row.
-    // Not exact: V4.1 is trained to tolerate it (tech report, sec. 3.2.2).
-    // Prompts that save a snapshot before their end keep the exact path.
-    static const bool replay_requested =
-        env_flag_enabled("LUCE_DS41_DECODER_BOUNDED_REPLAY");
-    int replay_cut = -1;  // the last layer every prompt row runs
-    if (replay_requested) {
-        for (int il = 0; il < w_.n_layer; ++il) {
-            // The cut is the deepest layer any layer reads its compressed KV
-            // from (V4.1: 20); the per-layer source flags may be unset.
-            replay_cut = std::max(replay_cut, deepseek4_kv_source_layer(w_, il));
-        }
-        for (int il = replay_cut + 1; replay_cut >= 0 && il < w_.n_layer; ++il) {
-            // Index sources after the cut (V4.1: 24-36) are fine: the cut layer
-            // publishes every row; only an Engram layer past it disables replay.
-            if (w_.layers[(size_t) il].engram_q) {
-                replay_cut = -1;
-            }
-        }
-    }
+    // Decoder SWA bounded replay (bounded_replay_cut). Prompts that save a
+    // snapshot before their end keep the exact path.
+    const int replay_cut = bounded_replay_cut();  // the last layer every prompt row runs
     const int replay_from = n_total - w_.n_swa;  // prompt index of the first replay row
-    if (replay_requested) {
+    if (env_flag_enabled("LUCE_DS41_DECODER_BOUNDED_REPLAY")) {
         static bool logged = false;
         if (!logged) {
             logged = true;
@@ -4070,10 +4090,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                          replay_cut, w_.n_swa, w_.n_layer);
         }
     }
-    const bool replay =
-        replay_cut >= 0 && replay_cut + 1 < w_.n_layer &&
-        layer_range_hybrid && !images &&
-        cache_.prefill_mode == PrefillAttentionMode::Dense &&
+    const bool replay = bounded_replay_runs(images != nullptr) &&
         replay_from >= DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS &&
         !(save_snapshot && snap_pos < kv_offset + n_total);
     DeepSeek4LayerMajorTail replay_tail;
@@ -4674,9 +4691,8 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     // completes the state the snapshot keeps) and the rest continues from
     // there, both with replay, exactly as a later request that restores the
     // snapshot would run. A prompt that saves no such snapshot runs whole.
-    static const bool replay_requested = env_flag_enabled("LUCE_DS41_DECODER_BOUNDED_REPLAY");
     const int prompt_end = (int) req.prompt.size();
-    const bool split_at_snapshot = replay_requested && !images && req.snap_slot >= 0 &&
+    const bool split_at_snapshot = bounded_replay_runs(images != nullptr) && req.snap_slot >= 0 &&
         req.snap_pos > kv_offset && req.snap_pos < prompt_end;
     const auto run_prefill = [&]() {
         if (split_at_snapshot) {
@@ -4716,40 +4732,37 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         hybrid_prefill_chunk_cap_ = draft_swap_.cap_without;
     }
     committed = run_prefill();
-    // A long prefill that ran out of device memory is retried once from the
-    // request's starting state with every disposable arena retired and a
-    // smaller pipeline band, instead of failing the request.
-    if (committed < 0 && !out_io.is_cancelled() && !images &&
+    // A pipelined hybrid prefill that ran out of device memory is retried
+    // once from the request's starting state with every disposable arena
+    // retired and the pipeline off (one band in flight, the same bands, so
+    // the same numerics), instead of failing the request. Other prefills
+    // fail as before.
+    if (committed < 0 && moe_hybrid_ && deepseek4_prefill_pipeline_bands() > 0 &&
+        !cache_.pipeline_off && !out_io.is_cancelled() && !images &&
         (kv_offset == 0 || prefill_retry_slot_ >= 0)) {
         deepseek4_release_retry_scratch(cache_, moe_hybrid_.get());
-        const bool pipelined = deepseek4_prefill_pipeline_bands() > 0;
-        if (pipelined) {
-            cache_.pipeline_cap_pct /= 2;
-            std::fprintf(stderr, "[deepseek4] prefill pipeline band cap now %d%%%s\n",
-                         cache_.pipeline_cap_pct,
-                         cache_.pipeline_cap_pct < kDs4PipelineMinCapPct ? " (pipeline off)" : "");
-        }
+        cache_.pipeline_off = true;
         const bool restored = kv_offset == 0 || snapshot_restore(prefill_retry_slot_);
-        std::fprintf(stderr, "[deepseek4] prefill failed; retrying once from pos %d%s\n",
+        std::fprintf(stderr, "[deepseek4] prefill failed; retrying once from pos %d with the pipeline off%s\n",
                      kv_offset, restored ? "" : " (snapshot restore failed)");
         if (restored) committed = run_prefill();
         // The first recovery is the expected one (the one-time allocations
-        // of the first long request): go back to the full cap once. A later
-        // failure keeps the smaller cap.
-        if (pipelined && committed >= 0 && !pipeline_cap_restored_) {
-            cache_.pipeline_cap_pct = kDs4PipelineCapPct;
-            pipeline_cap_restored_ = true;
+        // of the first long request): turn the pipeline back on once. A
+        // later failure keeps it off.
+        if (committed >= 0 && !pipeline_retry_recovered_) {
+            cache_.pipeline_off = false;
+            pipeline_retry_recovered_ = true;
         }
     }
     if (draft_swap_.out) {
         // Keep any sticky reduction of the swapped-out chunk, then bring the
-        // drafter back before decode.
+        // drafter back before decode. A failed swap-in decodes this request
+        // without the drafter; the next request tries again.
         draft_swap_.cap_without = hybrid_prefill_chunk_cap_;
         hybrid_prefill_chunk_cap_ = draft_swap_.cap_with;
         deepseek4_release_prefill_scratch(cache_, moe_hybrid_.get());
         if (!draft_swap_in()) {
-            result.fail(GenerateErrorCode::PrefillFailed, "DSpark drafter swap-in failed");
-            return result;
+            std::fprintf(stderr, "[deepseek4] draft swap: this request decodes without DSpark\n");
         }
     }
     if (committed < 0) {
@@ -4809,7 +4822,8 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     // An image prompt whose last image leaves no captured text rows gives the
     // drafter no context to start from; decode that request plainly.
     const bool image_without_draft_context = req.images && spec_feat_window_.empty();
-    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 && !image_without_draft_context &&
+    if (spec_enabled_ && spec_drafter_ && !draft_swap_.out && req.n_gen > 0 &&
+        !image_without_draft_context &&
         !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
         if (last_logits_.empty()) {
             result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill logits");

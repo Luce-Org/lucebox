@@ -2339,7 +2339,8 @@ static void mul_mat_vec_q_moe_launch(
 }
 
 
-// RDNA4 Q8_0 dense MMVQ.
+#if defined(GGML_USE_HIP)
+// RDNA4 Q8_0 dense MMVQ (HIP builds only).
 //
 // On RDNA4 the one-column Q8_0 kernel, and the batch-invariant multi-column
 // launch that keeps its block shape (DSpark verify), run eight waves per
@@ -2527,7 +2528,7 @@ static void mul_mat_vec_q8_0_rdna4_launch_nc(
         stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio, \
         stride_sample_x, stride_sample_y, stride_sample_dst, stream)
     // Block shapes from the gfx1201 sweep of the DS4.1 dense projections
-    // (server/test/bench_ds41_q8_mmvq.cpp). Few rows (attn_kv, 512) or one
+    // (server/test/bench/bench_ds41_q8_mmvq.cpp). Few rows (attn_kv, 512) or one
     // K step per row (attn_q_b, K=1280): four waves share a row pair's eight
     // virtual waves and two row pairs share a block, which keeps enough
     // loads in flight. Long rows over many rows: eight waves per row pair.
@@ -2565,6 +2566,7 @@ static void mul_mat_vec_q8_0_rdna4_launch(
     }
 #undef Q8_RDNA4_NC
 }
+#endif // defined(GGML_USE_HIP)
 
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
@@ -2681,6 +2683,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // RDNA4 Q8_0 products on the eight-wave single-row block shape (one
     // column, or several columns under batch-invariant products): same
     // arithmetic, packed rows, see mul_mat_vec_q8_0_rdna4.
+#if defined(GGML_USE_HIP)
     if constexpr (type == GGML_TYPE_Q8_0) {
         if (!has_ids && !has_fusion && (ncols_dst == 1 || width_invariant) &&
             ncols_dst <= MMVQ_Q8_RDNA4_MAX_COLS && GGML_CUDA_CC_IS_RDNA4(cc) &&
@@ -2694,6 +2697,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             return;
         }
     }
+#endif // defined(GGML_USE_HIP)
     if constexpr (type == GGML_TYPE_Q8_0) {
         if (width_invariant) {
 #define GGML_MMVQ_INVARIANT_LAUNCH(NC) \

@@ -203,6 +203,7 @@ int main() {
         {4096, 4, 64, 24},
         {4096, 4, 2170, 24},
         {1024, 8, 17, 8},
+        {256, 4, 70000, 4},  // past the 65535 grid.y limit
     };
     for (const CollapseCase & c : collapse_cases) {
         for (int rep = 0; rep < 2; ++rep) {

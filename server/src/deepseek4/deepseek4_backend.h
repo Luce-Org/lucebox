@@ -209,6 +209,11 @@ private:
     bool draft_swap_out();
     bool draft_swap_in();
     void draft_swap_release();
+    // Decoder SWA bounded replay (LUCE_DS41_DECODER_BOUNDED_REPLAY): the last
+    // layer every prompt row runs, or -1 when replay is off or the model has
+    // no such cut; and whether a prefill of this kind can replay at all.
+    int bounded_replay_cut() const;
+    bool bounded_replay_runs(bool images) const;
     std::string                    spec_draft_path_;
     ggml_backend_t                 spec_backend_ = nullptr;
     std::unique_ptr<DSparkDrafter> spec_drafter_;
@@ -223,8 +228,8 @@ private:
     // Snapshot slot a restored request started from (-1: fresh prompt);
     // a failed prefill restores it before its one retry.
     int                            prefill_retry_slot_ = -1;
-    // Whether a retried prefill already restored the full pipeline cap.
-    bool                           pipeline_cap_restored_ = false;
+    // Whether a retried prefill already turned the pipeline back on.
+    bool                           pipeline_retry_recovered_ = false;
     int                            hybrid_long_context_chunk_ = kDs4DefaultLongContextChunk;
 
     bool load_spec_drafter();

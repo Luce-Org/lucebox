@@ -246,7 +246,8 @@ struct LaunchPolicyFixture : CommonFixture {
         CHECK(env_of("LUCE_EXPERT_BUDGET_MB") == "12000");
         CHECK(env_of("LUCE_DS41_DECODER_BOUNDED_REPLAY") == "1");
         CHECK(env_of("LUCE_DS4_PREFILL_PIPELINE") == "2");
-        CHECK(env_of("LUCE_DS4_DRAFT_SWAP") == "1");
+        // The drafter swap stays opt-in: cache hits must match a full prefill.
+        CHECK(env_of("LUCE_DS4_DRAFT_SWAP").empty());
         CHECK(env_of("GGML_CUDA_MLA_SPLIT_KV_COUNT") == "8");
         // A flag given on the command line replaces the profile's value.
         const std::vector<std::string> given = {"--draft-device", "hip:1"};

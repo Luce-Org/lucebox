@@ -2897,8 +2897,10 @@ static ggml_tensor * build_mla_attention_lane_core(
     const bool fused_sparse_f16_kv = fused_verify_f16_kv &&
         attention_impl == DeepSeek4AttentionImpl::SparseFlash;
     // Explicit lanes with a V4.1 shared selection run on the D=512 flash
-    // kernel too (selection_flash below); keep their K/V in F16 there.
-    const bool explicit_selection_f16_kv = fused_explicit_f16_kv &&
+    // kernel too (selection_flash below); LUCE_DS4_EXPLICIT_SPLIT keeps their
+    // K/V in F16 there.
+    static const bool explicit_split = ds4_env_flag("LUCE_DS4_EXPLICIT_SPLIT");
+    const bool explicit_selection_f16_kv = explicit_split && fused_explicit_f16_kv &&
         w.shared_index_topk && indexer_topk && head_dim == 512 &&
         n_rot == 64 && !image_spans.size;
     // Segmented K/V is a device-class default (HIP backends), with
@@ -7545,7 +7547,8 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     ggml_tensor * topk_native = nullptr, * topk_native_p = nullptr;
     if (device_topk) {
         // The caller reads normed/probs after the graph: keep their buffers.
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) ggml_set_output(ggml_graph_node(gf, i));
+        ggml_set_output(normed);
+        ggml_set_output(probs);
         ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, w.n_expert, n_tokens);
         ggml_tensor * biased_score = ggml_add(ctx, probs, L.ffn_exp_probs_b);
         topk_biased = ggml_top_k(ctx, biased_score, topk_cand);
@@ -11975,47 +11978,21 @@ bool deepseek4_prefill_layer_major(
 
     // Pipelined prefill: overlap one band's cold-owner FFN with the next
     // band's attention on the primary (needs the device residual and the
-    // device owner join), over at least max(N, 2) bands.
+    // device owner join). Each caller band, a chunk the caller starts at
+    // every restore point, runs as max(N, 2) equal parts of at least 64 rows
+    // (the grouped MoE kernels' minimum), so two parts in flight hold one
+    // chunk's rows. The parts depend on the chunk alone, not on free memory
+    // or on where the pass starts: a restored prefix and a cold prefill of
+    // the same prompt run the same bands. Without the device residual, or
+    // after a failed prefill turned the pipeline off, the same parts run in
+    // turn.
     const int pipeline_bands = deepseek4_prefill_pipeline_bands();
     const bool pipeline_requested = pipeline_bands > 0;
-    std::vector<int> run_bands = bands;
+    const std::vector<int> run_bands = pipeline_requested
+        ? deepseek4_pipeline_parts(bands, pipeline_bands)
+        : bands;
     Ds4PrefillPipeline pipeline_state;
-    const int pipeline_cap_pct = cache.pipeline_cap_pct;
-    const bool pipelined = pipeline_requested && device_residual &&
-        pipeline_cap_pct >= kDs4PipelineMinCapPct;
-    // Two bands of at least 64 rows (the grouped MoE kernels' minimum): a
-    // short pass gains the most, its secondary owner otherwise running in
-    // series with the primary at every layer.
-    constexpr int kPipelineMinRows = 128;
-    if (pipelined && n_tokens >= kPipelineMinRows) {
-        // Equal bands, none larger than the largest band the caller sized
-        // for its scratch, nor than the free device memory allows: with two
-        // bands in flight a row costs about 1.5 MiB of attention and owner
-        // arenas, and 2 GiB stays free beside them.
-        constexpr size_t kPipelineRowBytes = (size_t) 1536 << 10;
-        constexpr size_t kPipelineReserveBytes = (size_t) 2048 << 20;
-        int cap = 0;
-        for (int c : bands) cap = std::max(cap, c);
-        {
-            size_t free_b = 0, total_b = 0;
-            ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
-            const size_t avail = free_b > kPipelineReserveBytes ? free_b - kPipelineReserveBytes : 0;
-            const int mem_cap = std::max(512, (int) std::min<size_t>(
-                avail / kPipelineRowBytes * (size_t) std::min(100, pipeline_cap_pct) / 100u, (size_t) cap));
-            if (mem_cap < cap) {
-                std::fprintf(stderr, "[deepseek4] pipeline band cap %d -> %d rows (free %.0f MiB)\n",
-                             cap, mem_cap, free_b / 1048576.0);
-                cap = mem_cap;
-            }
-        }
-        int nb = std::max(2, pipeline_bands);
-        nb = std::max(nb, (n_tokens + cap - 1) / cap);
-        while (nb > 2 && n_tokens / nb < 256) --nb;
-        if (nb != (int) run_bands.size() || pipeline_bands >= 2) {
-            run_bands.assign((size_t) nb, n_tokens / nb);
-            for (int i = 0; i < n_tokens % nb; ++i) run_bands[(size_t) i] += 1;
-        }
-    }
+    const bool pipelined = pipeline_requested && device_residual && !cache.pipeline_off;
     {
         static bool logged = false;
         if (pipeline_requested && !logged) {
@@ -12023,7 +12000,7 @@ bool deepseek4_prefill_layer_major(
             std::fprintf(stderr, "[deepseek4] layer-major prefill pipeline %s (%zu bands)\n",
                          pipelined ? "active"
                          : !device_residual ? "inactive (needs the device residual)"
-                                            : "inactive (band cap backed off)",
+                                            : "inactive (off after a failed prefill)",
                          run_bands.size());
         }
     }
@@ -12322,6 +12299,17 @@ void deepseek4_release_prefill_scratch(
                      free_before / (1024.0 * 1024.0),
                      free_after / (1024.0 * 1024.0));
     }
+}
+
+std::vector<int> deepseek4_pipeline_parts(const std::vector<int> & bands, int pipeline_bands) {
+    constexpr int kMinPartRows = 64;  // the grouped MoE kernels' minimum
+    const int per_band = std::max(2, pipeline_bands);
+    std::vector<int> parts;
+    for (int c : bands) {
+        const int n = std::max(1, std::min(per_band, c / kMinPartRows));
+        for (int p = 0; p < n; ++p) parts.push_back(c / n + (p < c % n ? 1 : 0));
+    }
+    return parts;
 }
 
 int deepseek4_prefill_pipeline_bands() {

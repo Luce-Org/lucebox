@@ -437,9 +437,9 @@ bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, const ggml_tensor 
     }
     // The gather reads each activation row as K contiguous floats.
     if (!ids || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1)) return false;
-    // One grid row per route tile: at most n_routes / 64 + n_experts tiles
-    // (bn >= 64) must fit the 65535 grid-y limit; longer batches stay on MMQ.
-    const int64_t max_tiles = (ids->ne[0] * n_tokens + 63) / 64 + src0->ne[2];
+    // One grid row per route tile: at most n_routes / 32 + n_experts tiles
+    // (bn >= 32) must fit the 65535 grid-y limit; longer batches stay on MMQ.
+    const int64_t max_tiles = (ids->ne[0] * n_tokens + 31) / 32 + src0->ne[2];
     return max_tiles <= 65535;
 }
 

@@ -507,9 +507,6 @@ struct DeepSeek4LayerMajorTail {
     std::vector<float> pre;       // [rows][n_hc]
 };
 
-inline constexpr int kDs4PipelineCapPct = 50;
-inline constexpr int kDs4PipelineMinCapPct = 25;
-
 struct DeepSeek4Cache {
     int cur_pos  = 0;
     int max_ctx  = 0;
@@ -517,11 +514,9 @@ struct DeepSeek4Cache {
 
     std::vector<DeepSeek4LayerCache> layers;
     PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
-    // Pipelined prefill bands use this share of the memory-derived row cap:
-    // the first long request of a process also makes one-time allocations
-    // the free-memory read does not see yet. A failed prefill halves it;
-    // below kDs4PipelineMinCapPct the pipeline is off.
-    int pipeline_cap_pct = kDs4PipelineCapPct;
+    // A failed pipelined prefill is retried with the pipeline off (one band
+    // in flight, the same bands); see DeepSeek4Backend::generate.
+    bool pipeline_off = false;
 
     // HC residual streams: [n_hc * n_embd] persistent state
     ggml_tensor * hc_state    = nullptr;  // [n_hc * n_embd]
@@ -756,6 +751,10 @@ void deepseek4_release_prefill_scratch(DeepSeek4Cache & c,
 // LUCE_DS4_PREFILL_PIPELINE: the minimum band count of a pipelined
 // layer-major prefill (0 = no pipeline).
 int deepseek4_prefill_pipeline_bands();
+// The bands a pipelined layer-major pass runs: each caller band as
+// max(pipeline_bands, 2) equal parts of at least 64 rows, the remainder rows
+// first. The parts depend on each band alone.
+std::vector<int> deepseek4_pipeline_parts(const std::vector<int> & bands, int pipeline_bands);
 // Before a prefill retry: retire the prefill arenas, the cached decode and
 // verify graphs and the owner graph caches. KV, snapshots and the index
 // selection store stay.

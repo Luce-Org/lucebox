@@ -2895,7 +2895,9 @@ static bool batched_peer_copies_enabled() {
 
 // LUCE_DS4_GROUPED_HYBRID_PREFILL sends owner stacks whose down projection is
 // ROCmFP2 too through the grouped MUL_MAT_ID prefill graph (default off):
-// 1 = the secondary (cold) owner only, 2 = both owners.
+// 1 = the secondary (cold) owner only, 2 = both owners. Any nonzero value
+// also gives every owner's expert-major prefill the SWIGLU_DS4 split op and
+// the fused combine, whatever its down type (same arithmetic).
 static int grouped_fp2_down_prefill_mode() {
     static const int mode = env_int_or_default("LUCE_DS4_GROUPED_HYBRID_PREFILL", 0);
     return mode;
