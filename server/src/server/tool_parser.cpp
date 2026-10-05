@@ -1127,9 +1127,37 @@ static bool extract_raw_json_tool_fallback(const std::string & text,
     return false;
 }
 
+// DeepSeek V4.1 writes DSML tags with a leading-space name (<｜DSML｜ invoke>,
+// </｜DSML｜ parameter>, <｜DSML｜ calls>); V4 writes <｜DSML｜invoke> and
+// <｜DSML｜tool_calls>. Map the V4.1 spelling onto the V4 one so every pattern
+// below accepts both. Only tag positions change; other text is kept.
+static std::string normalize_dsml_tags(const std::string & text) {
+    static const std::string dsml = "｜DSML｜";
+    size_t hit = text.find(dsml);
+    if (hit == std::string::npos) return text;
+    std::string out;
+    out.reserve(text.size());
+    size_t pos = 0;
+    while (hit != std::string::npos) {
+        size_t end = hit + dsml.size();
+        out.append(text, pos, end - pos);
+        const bool in_tag = hit >= 1 && (text[hit - 1] == '<' ||
+                                         (text[hit - 1] == '/' && hit >= 2 && text[hit - 2] == '<'));
+        if (in_tag && end < text.size() && text[end] == ' ') {
+            ++end;
+            if (text.compare(end, 6, "calls>") == 0) out += "tool_";
+        }
+        pos = end;
+        hit = text.find(dsml, pos);
+    }
+    out.append(text, pos, std::string::npos);
+    return out;
+}
+
 // ─── Main parser ────────────────────────────────────────────────────────
 
-ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
+ToolParseResult parse_tool_calls(const std::string & raw_text, const json & tools) {
+    const std::string text = normalize_dsml_tags(raw_text);
     ToolParseResult result;
     std::vector<Span> removals;
     std::vector<std::pair<size_t, ToolCall>> positioned_calls;
