@@ -2889,7 +2889,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    src0->view_src;
 
     const int64_t ncols_dst = is_mul_mat_id ? dst->ne[2] : src1->ne[1];
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+    // MXFP8 has its own matvec (ggml_cuda_mxfp8_mul_mat_vec); MMVQ has no kernel for it.
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_MXFP8 && !bad_padding_clear &&
+                             src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 &&
                              ncols_dst <= (is_mul_mat_id ? MMVQ_MAX_MOE_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE);
 #ifdef ROCMFP2_AFFINE

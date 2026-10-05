@@ -152,6 +152,42 @@ static bool batch_invariant(ggml_backend_t backend, std::mt19937 & rng) {
     return ok;
 }
 
+// A one-column MXFP8 product feeding an ADD is a MUL_MAT + ADD fusion candidate. MMVQ has no MXFP8
+// kernel, so the graph must keep the MXFP8 GEMV and still add exactly.
+static bool fused_add(ggml_backend_t backend, std::mt19937 & rng) {
+    const int cols = 2304, rows = 128;
+    auto w = random_rows(rng, cols, rows, 105, 125);
+    std::normal_distribution<float> n(0.0f, 1.0f);
+    std::vector<float> x(cols), bias(rows);
+    for (auto & v : x) v = n(rng);
+    for (auto & v : bias) v = n(rng);
+    auto ref = run(backend, w, x, cols, rows, 1, 1, 1);
+    ggml_init_params params{};
+    params.mem_size = 16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false);
+    params.no_alloc = true;
+    auto ctx = ggml_init(params);
+    auto a = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP8, cols, rows);
+    auto b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, 1);
+    auto c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, 1);
+    auto y = ggml_add(ctx, ggml_mul_mat(ctx, a, b), c);
+    auto graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, y);
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    ggml_backend_tensor_set(a, w.data(), 0, w.size());
+    ggml_backend_tensor_set(b, x.data(), 0, x.size() * sizeof(float));
+    ggml_backend_tensor_set(c, bias.data(), 0, bias.size() * sizeof(float));
+    bool ok = ref.ok && ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+    ggml_backend_synchronize(backend);
+    std::vector<float> out(rows);
+    ggml_backend_tensor_get(y, out.data(), 0, out.size() * sizeof(float));
+    for (int r = 0; r < rows && ok; ++r)
+        if (out[r] != ref.out[r] + bias[r]) ok = false;
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    std::printf("backend=%s fused_add %s\n", ggml_backend_name(backend), ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static bool host_checks() {
     std::mt19937 rng(7);
     auto w = random_rows(rng, QK, 3, 100, 130);
@@ -191,6 +227,7 @@ int main(int argc, char ** argv) {
             {5120, 64, 9, 1, 1}, {2304, 128, 32, 1, 1}, {4096, 64, 12, 8, 8}};
         for (const auto & s : shapes) ok = ok && accuracy(backend, rng, s[0], s[1], s[2], s[3], s[4]);
         if (!cpu) ok = ok && batch_invariant(backend, rng);
+        ok = ok && fused_add(backend, rng);
         ggml_backend_free(backend);
         if (!ok) return 3;
     }
