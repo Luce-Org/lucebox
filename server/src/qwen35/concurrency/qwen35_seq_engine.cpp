@@ -89,6 +89,35 @@ Qwen35SeqEngine::Qwen35SeqEngine(
         }
     }
     std::sort(chain_width_choices_.begin(), chain_width_choices_.end());
+    // Batched rounds draft the native DFlash2 block (8) when the configured
+    // block is longer. Measured on an R9700, Qwen 3.8 27B + DFlash2 at block
+    // 16: 8 lanes 146 -> 189 tok/s; one lane keeps block 16, unchanged.
+    // LUCE_BATCHED_DRAFT_WIDTH=<n> picks another width, 0 turns it off.
+    {
+        const char * env = std::getenv("LUCE_BATCHED_DRAFT_WIDTH");
+        const int want = env ? std::atoi(env) : 8;
+        const bool supported = want >= 2 && want < fixed_chain_.width &&
+            std::find(chain_width_choices_.begin(), chain_width_choices_.end(),
+                      want) != chain_width_choices_.end();
+        if (n_slots > 1 && supported) {
+            batched_draft_width_ = want;
+            slot_draft_kv_batched_.resize(static_cast<size_t>(n_slots));
+            std::fprintf(stderr,
+                "[parallel] batched rounds draft block %d (one lane: %d)\n",
+                want, fixed_chain_.width);
+        } else if (env && want != 0 && !supported) {
+            // only the verify widths below the block have graphs
+            std::fprintf(stderr,
+                "[parallel] LUCE_BATCHED_DRAFT_WIDTH=%s ignored: use 0 or a "
+                "verify width below the block (",
+                env);
+            for (int width : chain_width_choices_) {
+                if (width < fixed_chain_.width) std::fprintf(stderr, " %d", width);
+            }
+            std::fprintf(stderr, " ); batched rounds draft block %d\n",
+                         fixed_chain_.width);
+        }
+    }
     if (adaptive_chain_width_) {
         std::fprintf(stderr,
             "[parallel] adaptive DFlash2 verify width: widths");
@@ -173,14 +202,35 @@ Qwen35SeqEngine::~Qwen35SeqEngine() {
 
 void Qwen35SeqEngine::release_draft_graphs() {
     draft_kv_batch_free(batch_draft_graph_);
-    for (std::unique_ptr<DraftKvState> & state : dummy_draft_kv_) {
-        if (state) draft_kv_free(*state);
+    draft_kv_batch_free(batch_draft_graph_batched_);
+    for (auto * dummies : {&dummy_draft_kv_, &dummy_draft_kv_batched_}) {
+        for (std::unique_ptr<DraftKvState> & state : *dummies) {
+            if (state) draft_kv_free(*state);
+        }
+        dummies->clear();
     }
-    dummy_draft_kv_.clear();
-    for (std::unique_ptr<DraftKvState> & state : slot_draft_kv_) {
-        if (state) {
-            draft_kv_free(*state);
-            state.reset();
+    for (auto * states : {&slot_draft_kv_, &slot_draft_kv_batched_}) {
+        for (std::unique_ptr<DraftKvState> & state : *states) {
+            if (state) {
+                draft_kv_free(*state);
+                state.reset();
+            }
+        }
+    }
+}
+
+int Qwen35SeqEngine::chain_draft_width(
+        const std::vector<uint8_t> & selected) const {
+    const bool batched = batched_draft_width_ > 0 &&
+        std::count(selected.begin(), selected.end(), uint8_t{1}) >= 2;
+    return batched ? batched_draft_width_ : fixed_chain_.width;
+}
+
+void Qwen35SeqEngine::reset_slot_draft_kv(int slot) {
+    for (auto * states : {&slot_draft_kv_, &slot_draft_kv_batched_}) {
+        if (slot >= 0 && slot < static_cast<int>(states->size()) &&
+            (*states)[static_cast<size_t>(slot)]) {
+            draft_kv_reset(*(*states)[static_cast<size_t>(slot)]);
         }
     }
 }
@@ -193,16 +243,19 @@ DraftFeatureMirror * Qwen35SeqEngine::slot_feature_mirror(int slot) {
     return &slot_feature_mirrors_[static_cast<size_t>(slot)];
 }
 
-DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot) {
+DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot, bool batched) {
     DraftFeatureMirror * mirror = slot_feature_mirror(slot);
+    std::vector<std::unique_ptr<DraftKvState>> & states =
+        batched ? slot_draft_kv_batched_ : slot_draft_kv_;
+    const DraftWeights & dw = batched ? batched_dw_ : b_.dw_;
     if (!mirror || slot < 0 ||
-        slot >= static_cast<int>(slot_draft_kv_.size())) {
+        slot >= static_cast<int>(states.size())) {
         return nullptr;
     }
     std::unique_ptr<DraftKvState> & state =
-        slot_draft_kv_[static_cast<size_t>(slot)];
+        states[static_cast<size_t>(slot)];
     if (state && state->mem_buf &&
-        state->built_for == static_cast<const void *>(&b_.dw_)) {
+        state->built_for == static_cast<const void *>(&dw)) {
         return state.get();
     }
     if (state) draft_kv_free(*state);
@@ -210,7 +263,7 @@ DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot) {
     const int cap = std::min(
         mirror->cap, std::max(1, b_.cfg_.draft_ctx_max));
     if (!draft_kv_init_batched(
-            *state, b_.dw_, b_.draft_backend_, cap)) {
+            *state, dw, b_.draft_backend_, cap)) {
         draft_kv_free(*state);
         state.reset();
         return nullptr;
@@ -219,7 +272,7 @@ DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot) {
 }
 
 bool Qwen35SeqEngine::chain_spec_input_capable(
-        const StepInput & input) const {
+        const StepInput & input, int width) const {
     if (!fixed_chain_ready_ || !input.allow_speculation ||
         input.slot < 0 || input.slot >= slots_.slot_count()) {
         return false;
@@ -227,13 +280,26 @@ bool Qwen35SeqEngine::chain_spec_input_capable(
     const Qwen35Slot & slot = slots_.slot(input.slot);
     return slot.decoding() && !slot.sampler.needs_logit_processing() &&
            slot.cur_pos >= 1 &&
-           slot.cur_pos + fixed_chain_.width <= slots_.max_context();
+           slot.cur_pos + (width > 0 ? width : fixed_chain_.width) <=
+               slots_.max_context();
 }
 
 std::vector<uint8_t>
 Qwen35SeqEngine::select_chain_lanes(const StepPlan & plan) const {
     std::vector<uint8_t> selected(plan.decode.size(), 0);
     if (!plan.prefills.empty()) return selected;
+    // Two or more lanes draft the batched block, so near the context limit a
+    // lane qualifies when that shorter block fits; a lane alone drafts the
+    // configured block and needs room for all of it.
+    if (batched_draft_width_ > 0) {
+        size_t lanes = 0;
+        for (size_t i = 0; i < plan.decode.size(); ++i) {
+            selected[i] = chain_spec_input_capable(
+                plan.decode[i], batched_draft_width_) ? 1 : 0;
+            lanes += selected[i];
+        }
+        if (lanes >= 2) return selected;
+    }
     for (size_t i = 0; i < plan.decode.size(); ++i) {
         selected[i] = chain_spec_input_capable(plan.decode[i]) ? 1 : 0;
     }
@@ -250,6 +316,19 @@ Qwen35SeqEngine::prepare_chain_drafts(
     }
     PreparedChainRound round;
     round.drafts.resize(inputs.size());
+    // Two or more lanes draft the shorter batched block (batched_draft_width_),
+    // with the live draft tensors.
+    const int draft_width = chain_draft_width(selected);
+    const bool batched = draft_width != fixed_chain_.width;
+    if (batched) {
+        batched_dw_ = b_.dw_;
+        batched_dw_.block_size = draft_width;
+    }
+    const DraftWeights & dw = batched ? batched_dw_ : b_.dw_;
+    std::vector<std::unique_ptr<DraftKvState>> & dummies =
+        batched ? dummy_draft_kv_batched_ : dummy_draft_kv_;
+    DraftKvBatchGraph & draft_graph =
+        batched ? batch_draft_graph_batched_ : batch_draft_graph_;
 
     struct Lane {
         size_t input_index = 0;
@@ -262,15 +341,15 @@ Qwen35SeqEngine::prepare_chain_drafts(
     lanes.reserve(inputs.size());
     const int hidden = b_.w_.n_embd;
     std::vector<int32_t> noise(
-        static_cast<size_t>(fixed_chain_.width), b_.w_.mask_token_id);
+        static_cast<size_t>(draft_width), b_.w_.mask_token_id);
     std::vector<float> noise_embed(
-        static_cast<size_t>(hidden) * fixed_chain_.width);
+        static_cast<size_t>(hidden) * draft_width);
 
     auto reset_lanes = [&]() {
         for (const Lane & lane : lanes) {
             if (lane.state) draft_kv_reset(*lane.state);
         }
-        for (const std::unique_ptr<DraftKvState> & state : dummy_draft_kv_) {
+        for (const std::unique_ptr<DraftKvState> & state : dummies) {
             if (state) draft_kv_reset(*state);
         }
     };
@@ -278,11 +357,11 @@ Qwen35SeqEngine::prepare_chain_drafts(
     for (size_t i = 0; i < inputs.size(); ++i) {
         if (!selected[i]) continue;
         const StepInput & input = inputs[i];
-        if (!chain_spec_input_capable(input)) {
+        if (!chain_spec_input_capable(input, draft_width)) {
             reset_lanes();
             return std::nullopt;
         }
-        DraftKvState * state = ensure_slot_draft_kv(input.slot);
+        DraftKvState * state = ensure_slot_draft_kv(input.slot, batched);
         DraftFeatureMirror * mirror = slot_feature_mirror(input.slot);
         if (!state || !mirror) {
             if (state) draft_kv_reset(*state);
@@ -291,7 +370,7 @@ Qwen35SeqEngine::prepare_chain_drafts(
         }
         lanes.push_back({i, input.slot, input.token, state, mirror});
         if (!draft_kv_begin_step(
-                *state, b_.dw_, b_.draft_backend_, *mirror,
+                *state, dw, b_.draft_backend_, *mirror,
                 slots_.slot(input.slot).cur_pos)) {
             reset_lanes();
             return std::nullopt;
@@ -300,7 +379,7 @@ Qwen35SeqEngine::prepare_chain_drafts(
         std::fill(
             noise.begin() + 1, noise.end(), b_.w_.mask_token_id);
         if (!b_.w_.embedder.embed(
-                noise.data(), fixed_chain_.width, noise_embed.data())) {
+                noise.data(), draft_width, noise_embed.data())) {
             reset_lanes();
             return std::nullopt;
         }
@@ -325,28 +404,28 @@ Qwen35SeqEngine::prepare_chain_drafts(
     const int cap = std::min(
         lanes.front().mirror->cap,
         std::max(1, b_.cfg_.draft_ctx_max));
-    while (static_cast<int>(dummy_draft_kv_.size()) < dummy_count) {
+    while (static_cast<int>(dummies.size()) < dummy_count) {
         auto dummy = std::make_unique<DraftKvState>();
         if (!draft_kv_init_batched(
-                *dummy, b_.dw_, b_.draft_backend_, cap)) {
+                *dummy, dw, b_.draft_backend_, cap)) {
             draft_kv_free(*dummy);
             reset_lanes();
             return std::nullopt;
         }
-        dummy_draft_kv_.push_back(std::move(dummy));
+        dummies.push_back(std::move(dummy));
     }
     noise[0] = lanes.front().root;
     std::fill(noise.begin() + 1, noise.end(), b_.w_.mask_token_id);
     if (!b_.w_.embedder.embed(
-            noise.data(), fixed_chain_.width, noise_embed.data())) {
+            noise.data(), draft_width, noise_embed.data())) {
         reset_lanes();
         return std::nullopt;
     }
     for (int i = 0; i < dummy_count; ++i) {
         DraftKvState * dummy =
-            dummy_draft_kv_[static_cast<size_t>(i)].get();
+            dummies[static_cast<size_t>(i)].get();
         if (!draft_kv_begin_step(
-                *dummy, b_.dw_, b_.draft_backend_,
+                *dummy, dw, b_.draft_backend_,
                 *lanes.front().mirror, 1)) {
             reset_lanes();
             return std::nullopt;
@@ -361,7 +440,7 @@ Qwen35SeqEngine::prepare_chain_drafts(
     std::vector<std::vector<float>> hidden_blocks;
     std::vector<std::vector<int32_t>> proposals;
     if (!draft_kv_batch_compute(
-            batch_draft_graph_, b_.dw_, b_.draft_backend_,
+            draft_graph, dw, b_.draft_backend_,
             batch_states, hidden_blocks) ||
         hidden_blocks.size() != batch_states.size()) {
         reset_lanes();
@@ -373,8 +452,8 @@ Qwen35SeqEngine::prepare_chain_drafts(
         hidden_by_lane.push_back(block.data());
     }
     if (!dflash2_select_chains_batched(
-            b_.dw_, b_.draft_backend_, b_.w_.output, hidden_by_lane,
-            fixed_chain_.width, roots, proposals) ||
+            dw, b_.draft_backend_, b_.w_.output, hidden_by_lane,
+            draft_width, roots, proposals) ||
         proposals.size() != batch_states.size()) {
         reset_lanes();
         return std::nullopt;
@@ -383,7 +462,7 @@ Qwen35SeqEngine::prepare_chain_drafts(
     for (size_t lane_index = 0; lane_index < lanes.size(); ++lane_index) {
         const Lane & lane = lanes[lane_index];
         std::vector<int32_t> & tokens = proposals[lane_index];
-        if (tokens.size() != static_cast<size_t>(fixed_chain_.width) ||
+        if (tokens.size() != static_cast<size_t>(draft_width) ||
             tokens.front() != lane.root) {
             reset_lanes();
             return std::nullopt;
@@ -407,11 +486,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
     if (result.status == AdmitResult::Status::admitted) {
         clear_slot_images(result.slot);
         reset_recurrent_slot(b_.cache_, result.slot);
-        if (result.slot >= 0 &&
-            result.slot < static_cast<int>(slot_draft_kv_.size()) &&
-            slot_draft_kv_[static_cast<size_t>(result.slot)]) {
-            draft_kv_reset(*slot_draft_kv_[static_cast<size_t>(result.slot)]);
-        }
+        reset_slot_draft_kv(result.slot);
     }
     return result;
 }
@@ -745,12 +820,18 @@ constexpr double kChainDepthPriorAccepts = 1.4;
 constexpr double kChainDepthPriorTrials = 2.0;
 }  // namespace
 
-int Qwen35SeqEngine::choose_chain_width(int bucket) {
-    const int full = fixed_chain_.width;
-    if (!adaptive_chain_width_ || chain_width_choices_.empty()) return full;
+int Qwen35SeqEngine::choose_chain_width(int bucket, int cap) {
+    const int requested = cap > 0 ? std::min(cap, fixed_chain_.width)
+                                  : fixed_chain_.width;
+    if (!adaptive_chain_width_ || chain_width_choices_.empty()) return requested;
     ChainWidthState & state =
-        chain_width_by_bucket_.try_emplace(bucket, full).first->second;
+        chain_width_by_bucket_.try_emplace(bucket, requested).first->second;
+    // A bucket keeps the width it was set up for: batched buckets draft the
+    // shorter batched block, so their controller never offers more.
+    const int full = std::min(
+        requested, static_cast<int>(state.depth_trials.size()));
     for (int width : chain_width_choices_) {
+        if (width > full) break;
         const size_t w = static_cast<size_t>(width);
         if (state.samples[w] < kChainWidthCalibrationSamples &&
             state.offers[w] < kChainWidthCalibrationMaxOffers) {
@@ -776,7 +857,7 @@ int Qwen35SeqEngine::choose_chain_width(int bucket) {
         state.controller.next_width_cost_aware(conditional, full);
     int width = chain_width_choices_.front();
     for (int choice : chain_width_choices_) {
-        if (choice <= wanted) width = choice;
+        if (choice <= wanted && choice <= full) width = choice;
     }
     return width;
 }
@@ -908,8 +989,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
                 return result;
             }
             PreparedChainDraft & prepared = prepared_round.drafts[i];
-            if (prepared.tokens.size() !=
-                    static_cast<size_t>(full_width) ||
+            if (prepared.tokens.size() < 2 ||
+                prepared.tokens.size() > static_cast<size_t>(full_width) ||
                 prepared.tokens.front() != input.token) {
                 result.error = "prepared DFlash2 chain is invalid";
                 return result;
@@ -1008,7 +1089,12 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     // Controllers are keyed by the verify graph bucket: the graph is built
     // for tree_bucket lanes (missing lanes are padding), so a round's cost is
     // set by the bucket and width, not by how many lanes are real.
-    const int tree_width = choose_chain_width(tree_bucket);
+    // A batched round drafted a shorter block: verify at most that much.
+    int drafted = full_width;
+    for (const Proposal & proposal : proposals) {
+        drafted = std::min(drafted, static_cast<int>(proposal.tokens.size()));
+    }
+    const int tree_width = choose_chain_width(tree_bucket, drafted);
     if (tree_width < full_width) {
         for (Proposal & proposal : proposals) {
             proposal.tokens.resize(static_cast<size_t>(tree_width));
@@ -1849,11 +1935,12 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
 bool Qwen35SeqEngine::reserve_decode(const StepPlan & plan) {
     std::fill(reserve_growth_.begin(), reserve_growth_.end(), 0);
     const auto chains = select_chain_lanes(plan);
+    const int chain_width = chain_draft_width(chains);      // what the round will draft and verify
     for (size_t i = 0; i < plan.decode.size(); ++i) {
         const int slot = plan.decode[i].slot;
         if (slot < 0 || slot >= slots_.slot_count() ||
             reserve_growth_[(size_t)slot]) return false;
-        reserve_growth_[(size_t)slot] = chains[i] ? fixed_chain_.width : 1;
+        reserve_growth_[(size_t)slot] = chains[i] ? chain_width : 1;
     }
     return slots_.reserve_decode(reserve_growth_);
 }
@@ -1865,10 +1952,7 @@ bool Qwen35SeqEngine::restore_kv(int slot, std::string & error) {
         // state together — so it must be reset exactly as at admission.
         if (!slots_.resume_recompute(slot)) return false;
         reset_recurrent_slot(b_.cache_, slot);
-        if (slot < static_cast<int>(slot_draft_kv_.size()) &&
-            slot_draft_kv_[static_cast<size_t>(slot)]) {
-            draft_kv_reset(*slot_draft_kv_[static_cast<size_t>(slot)]);
-        }
+        reset_slot_draft_kv(slot);
         return true;
     }
     std::vector<int32_t> blocks;
@@ -1895,10 +1979,7 @@ void Qwen35SeqEngine::retire(int slot) {
     offload_.discard(slot);
     clear_slot_images(slot);
     if (!slots_.is_active(slot)) return;
-    if (slot >= 0 && slot < static_cast<int>(slot_draft_kv_.size()) &&
-        slot_draft_kv_[static_cast<size_t>(slot)]) {
-        draft_kv_reset(*slot_draft_kv_[static_cast<size_t>(slot)]);
-    }
+    reset_slot_draft_kv(slot);
     slots_.retire(slot);
 }
 

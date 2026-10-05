@@ -1019,8 +1019,8 @@ endif()
 
 # PFlash phase-split harness
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash_daemon.cpp")
-    add_executable(pflash_daemon test/pflash_daemon.cpp)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/pflash_daemon.cpp")
+    add_executable(pflash_daemon test/smoke/pflash_daemon.cpp)
     target_include_directories(pflash_daemon PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
     target_link_libraries(pflash_daemon PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     if(LUCE_GPU_BACKEND STREQUAL "cuda")
@@ -1052,17 +1052,61 @@ if(LUCE_TESTS)
     set(_raw_unit_test_targets)
     enable_testing()
 
+    # Test sources live under test/{unit,smoke,bench}/ while the shared
+    # helpers (CppUnitTestFramework.hpp, host_check.h, ...) stay at test/.
+    # Put the helper dir on every test target's include path.
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/test)
+
+    # ─── CPU-safe subset ─────────────────────────────────────────────
+    # Tests that build and pass on a GPU-less hosted runner carry the ctest
+    # label `cpu`; `make check-cpu` builds exactly their binaries and runs
+    # `ctest -L cpu`, which is what the hosted CI job does. To add a test to
+    # that subset, list it here: its ctest name for a plain test, or its
+    # target for a CppUnit binary (every discovered case is labeled). Tests
+    # registered by hand (test_server_unit, batched_gdn_cpu, the server_unit_*
+    # script tests) set the label at their add_test site.
+    set(_luce_cpu_ctest_names
+        deepseek4_unit
+        test_seq_slot_manager
+        test_seq_engine_contract
+        test_seq_batch_plan
+        test_client_send_buffer
+        test_ds4_mix_fitter)
+    set(_luce_cpu_cppunit_targets
+        test_feature_gate
+        test_platform_compat
+        test_paged_kv_pool
+        test_blocking_row_pool
+        test_rope_tail
+        test_kernel_qualification_core
+        test_cuda_copy_batch)
+
+    # Standalone check of the DS4 MIX histogram fitter: reuses the converter
+    # source with its main() renamed away, so it needs the converter's
+    # include dirs and link deps.
+    if(TARGET ds4_mix_converter AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_mix_fitter.cpp")
+        add_executable(test_ds4_mix_fitter test/unit/test_ds4_mix_fitter.cpp)
+        target_include_directories(test_ds4_mix_fitter PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfp4)
+        target_link_libraries(test_ds4_mix_fitter PRIVATE
+            ggml-base nlohmann_json::nlohmann_json)
+        if(UNIX)
+            target_link_libraries(test_ds4_mix_fitter PRIVATE m)
+        endif()
+        list(APPEND _raw_unit_test_targets test_ds4_mix_fitter)
+    endif()
+
     add_executable(
         test_kernel_qualification_core
-        test/test_kernel_qualification_core.cpp)
-    target_include_directories(
-        test_kernel_qualification_core PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        test/unit/test_kernel_qualification_core.cpp)
 
     # Header-only platform shims must remain independently buildable and
     # runnable on hosted Windows workers without a GPU.
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_platform_compat.cpp")
-        add_executable(test_platform_compat test/test_platform_compat.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_platform_compat.cpp")
+        add_executable(test_platform_compat test/unit/test_platform_compat.cpp)
         target_include_directories(test_platform_compat PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         if(WIN32)
@@ -1072,12 +1116,12 @@ if(LUCE_TESTS)
 
     if((LUCE_GPU_BACKEND STREQUAL "hip" OR
         LUCE_GPU_BACKEND STREQUAL "cuda")
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_pool_shutdown.cpp")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_cuda_pool_shutdown.cpp")
         add_executable(test_cuda_pool_shutdown
-            test/test_unit_main.cpp
-            test/test_cuda_pool_shutdown.cpp)
+            test/unit/test_unit_main.cpp
+            test/unit/test_cuda_pool_shutdown.cpp)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
-            set_source_files_properties(test/test_cuda_pool_shutdown.cpp PROPERTIES LANGUAGE HIP)
+            set_source_files_properties(test/unit/test_cuda_pool_shutdown.cpp PROPERTIES LANGUAGE HIP)
             set_target_properties(test_cuda_pool_shutdown PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         endif()
         target_include_directories(test_cuda_pool_shutdown PRIVATE
@@ -1089,8 +1133,8 @@ if(LUCE_TESTS)
     endif()
 
     if(LUCE_GPU_BACKEND STREQUAL "cuda"
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_comm_api.cpp")
-        add_executable(test_cuda_comm_api test/test_cuda_comm_api.cpp)
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_cuda_comm_api.cpp")
+        add_executable(test_cuda_comm_api test/unit/test_cuda_comm_api.cpp)
         target_include_directories(test_cuda_comm_api PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(test_cuda_comm_api PRIVATE
@@ -1098,7 +1142,7 @@ if(LUCE_TESTS)
     endif()
 
     if(LUCE_ENABLE_MIXED_CUDA_HIP)
-        add_executable(test_mixed_cuda_hip test/test_mixed_cuda_hip.cpp)
+        add_executable(test_mixed_cuda_hip test/unit/test_mixed_cuda_hip.cpp)
         target_include_directories(test_mixed_cuda_hip PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(test_mixed_cuda_hip PRIVATE luce_common)
@@ -1110,7 +1154,7 @@ if(LUCE_TESTS)
     # luce_common's production (hook-free) definition, which has a different
     # layout. Mixing both in one binary violates the one-definition rule.
     find_package(Threads REQUIRED)
-    add_executable(test_blocking_row_pool test/test_blocking_row_pool.cpp)
+    add_executable(test_blocking_row_pool test/unit/test_blocking_row_pool.cpp)
     target_include_directories(test_blocking_row_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(test_blocking_row_pool PRIVATE LUCE_BLOCKING_ROW_POOL_TEST_HOOKS=1)
     target_link_libraries(test_blocking_row_pool PRIVATE Threads::Threads)
@@ -1129,7 +1173,7 @@ if(LUCE_TESTS)
     endif()
     list(APPEND _raw_unit_test_targets test_rocmfpx)
 
-    add_executable(test_ds4_mix_converter test/test_ds4v_mix_converter.cpp test/test_unit_main.cpp)
+    add_executable(test_ds4_mix_converter test/unit/test_ds4v_mix_converter.cpp test/unit/test_unit_main.cpp)
     target_include_directories(test_ds4_mix_converter PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx)
@@ -1140,8 +1184,8 @@ if(LUCE_TESTS)
     list(APPEND _raw_unit_test_targets test_ds4_mix_converter)
 
     if(LUCE_GPU_BACKEND STREQUAL "hip")
-        add_executable(test_rocmfp4_hip_tail test/test_rocmfp4_hip_tail.cpp)
-        set_source_files_properties(test/test_rocmfp4_hip_tail.cpp PROPERTIES LANGUAGE HIP)
+        add_executable(test_rocmfp4_hip_tail test/unit/test_rocmfp4_hip_tail.cpp)
+        set_source_files_properties(test/unit/test_rocmfp4_hip_tail.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_rocmfp4_hip_tail PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_include_directories(test_rocmfp4_hip_tail PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
@@ -1153,8 +1197,8 @@ if(LUCE_TESTS)
             hip::host)
         list(APPEND _raw_unit_test_targets test_rocmfp4_hip_tail)
 
-        add_executable(test_rocmfpx_mmq test/test_rocmfpx_mmq.cpp)
-        set_source_files_properties(test/test_rocmfpx_mmq.cpp PROPERTIES LANGUAGE HIP)
+        add_executable(test_rocmfpx_mmq test/unit/test_rocmfpx_mmq.cpp)
+        set_source_files_properties(test/unit/test_rocmfpx_mmq.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_rocmfpx_mmq PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_include_directories(test_rocmfpx_mmq PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
@@ -1167,8 +1211,8 @@ if(LUCE_TESTS)
             hip::host)
         list(APPEND _raw_unit_test_targets test_rocmfpx_mmq)
 
-        add_executable(test_gfx1151_width4_dispatch test/test_gfx1151_width4_dispatch.cpp)
-        set_source_files_properties(test/test_gfx1151_width4_dispatch.cpp PROPERTIES LANGUAGE HIP)
+        add_executable(test_gfx1151_width4_dispatch test/unit/test_gfx1151_width4_dispatch.cpp)
+        set_source_files_properties(test/unit/test_gfx1151_width4_dispatch.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_gfx1151_width4_dispatch PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_include_directories(test_gfx1151_width4_dispatch PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
@@ -1182,8 +1226,8 @@ if(LUCE_TESTS)
         # Guards the route-bounded mmid merge: negative (masked owner) ids must
         # not reserve holes in the compact routing arrays. Drives the helper for
         # the fast (<=256 experts) and classic paths, forward and inverse.
-        add_executable(test_ds4_mmid_regression test/test_ds4_mmid_regression.cpp)
-        set_source_files_properties(test/test_ds4_mmid_regression.cpp PROPERTIES LANGUAGE HIP)
+        add_executable(test_ds4_mmid_regression test/unit/test_ds4_mmid_regression.cpp)
+        set_source_files_properties(test/unit/test_ds4_mmid_regression.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_ds4_mmid_regression PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_compile_definitions(test_ds4_mmid_regression PRIVATE GGML_USE_HIP)
         target_include_directories(test_ds4_mmid_regression PRIVATE
@@ -1195,8 +1239,8 @@ if(LUCE_TESTS)
             hip::host)
         list(APPEND _raw_unit_test_targets test_ds4_mmid_regression)
 
-        add_executable(test_qwen35_gdn_verify_fusion test/test_qwen35_gdn_verify_fusion.cpp)
-        set_source_files_properties(test/test_qwen35_gdn_verify_fusion.cpp PROPERTIES LANGUAGE HIP)
+        add_executable(test_qwen35_gdn_verify_fusion test/unit/test_qwen35_gdn_verify_fusion.cpp)
+        set_source_files_properties(test/unit/test_qwen35_gdn_verify_fusion.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_qwen35_gdn_verify_fusion PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_include_directories(test_qwen35_gdn_verify_fusion PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
@@ -1208,41 +1252,41 @@ if(LUCE_TESTS)
         list(APPEND _raw_unit_test_targets test_qwen35_gdn_verify_fusion)
 
 
-        add_executable(test_softmax_sink_col test/test_softmax_sink_col.cpp)
-        set_source_files_properties(test/test_softmax_sink_col.cpp PROPERTIES LANGUAGE HIP)
+        add_executable(test_softmax_sink_col test/unit/test_softmax_sink_col.cpp)
+        set_source_files_properties(test/unit/test_softmax_sink_col.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_softmax_sink_col PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_link_libraries(test_softmax_sink_col PRIVATE ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET} hip::host)
         list(APPEND _raw_unit_test_targets test_softmax_sink_col)
 
-        luce_add_ggml_gpu_executable(test_mul_mat_host_input test/test_mul_mat_host_input.cpp)
+        luce_add_ggml_gpu_executable(test_mul_mat_host_input test/unit/test_mul_mat_host_input.cpp)
         list(APPEND _raw_unit_test_targets test_mul_mat_host_input)
-        luce_add_ggml_gpu_executable(test_rms_norm_scale test/test_rms_norm_scale.cpp)
+        luce_add_ggml_gpu_executable(test_rms_norm_scale test/unit/test_rms_norm_scale.cpp)
         list(APPEND _raw_unit_test_targets test_rms_norm_scale)
-        luce_add_ggml_gpu_executable(test_qwen4exp_indexer_score test/test_qwen4exp_indexer_score.cpp)
+        luce_add_ggml_gpu_executable(test_qwen4exp_indexer_score test/unit/test_qwen4exp_indexer_score.cpp)
         target_link_libraries(test_qwen4exp_indexer_score PRIVATE ggml-cpu)
         list(APPEND _raw_unit_test_targets test_qwen4exp_indexer_score)
-        luce_add_ggml_gpu_executable(test_qwen4exp_qsa_ids test/test_qwen4exp_qsa_ids.cpp)
+        luce_add_ggml_gpu_executable(test_qwen4exp_qsa_ids test/unit/test_qwen4exp_qsa_ids.cpp)
         target_link_libraries(test_qwen4exp_qsa_ids PRIVATE ggml-cpu)
         list(APPEND _raw_unit_test_targets test_qwen4exp_qsa_ids)
 
-        luce_add_ggml_gpu_executable(test_fattn_mma256 test/test_fattn_mma256.cpp)
+        luce_add_ggml_gpu_executable(test_fattn_mma256 test/unit/test_fattn_mma256.cpp)
         target_compile_definitions(test_fattn_mma256 PRIVATE GGML_USE_HIP)
         target_link_libraries(test_fattn_mma256 PRIVATE ggml-cpu)
         list(APPEND _raw_unit_test_targets test_fattn_mma256)
 
         # Standalone mmb-vs-library-GEMM differential on one quantized MUL_MAT,
         # against a CPU dequant reference. See the file header.
-        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_mmb_cublas_diff.cpp")
-            luce_add_ggml_gpu_executable(test_mmb_cublas_diff test/test_mmb_cublas_diff.cpp)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_mmb_cublas_diff.cpp")
+            luce_add_ggml_gpu_executable(test_mmb_cublas_diff test/unit/test_mmb_cublas_diff.cpp)
             target_compile_definitions(test_mmb_cublas_diff PRIVATE GGML_USE_HIP)
             target_link_libraries(test_mmb_cublas_diff PRIVATE ggml-cpu)
             list(APPEND _raw_unit_test_targets test_mmb_cublas_diff)
         endif()
 
         # Vectorized bf16<->f32 cast vs the scalar fallback, bit-exact.
-        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_convert_vec.cpp")
-            add_executable(test_convert_vec test/test_convert_vec.cpp)
-            set_source_files_properties(test/test_convert_vec.cpp PROPERTIES LANGUAGE HIP)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_convert_vec.cpp")
+            add_executable(test_convert_vec test/unit/test_convert_vec.cpp)
+            set_source_files_properties(test/unit/test_convert_vec.cpp PROPERTIES LANGUAGE HIP)
             set_target_properties(test_convert_vec PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
             target_compile_definitions(test_convert_vec PRIVATE GGML_USE_HIP)
             target_include_directories(test_convert_vec PRIVATE
@@ -1253,8 +1297,8 @@ if(LUCE_TESTS)
         endif()
 
         # ne00==1 scalar get_rows gather vs a reference gather.
-        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_getrows_scalar.cpp")
-            luce_add_ggml_gpu_executable(test_getrows_scalar test/test_getrows_scalar.cpp)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_getrows_scalar.cpp")
+            luce_add_ggml_gpu_executable(test_getrows_scalar test/unit/test_getrows_scalar.cpp)
             target_compile_definitions(test_getrows_scalar PRIVATE GGML_USE_HIP)
             target_link_libraries(test_getrows_scalar PRIVATE ggml-cpu)
             list(APPEND _raw_unit_test_targets test_getrows_scalar)
@@ -1264,8 +1308,8 @@ if(LUCE_TESTS)
         # only builds when the rocWMMA fattn kernel is enabled so the
         # default HIP build stays independent of the optional package.
         if(GGML_HIP_ROCWMMA_FATTN)
-            luce_add_ggml_gpu_executable(test_rocwmma_layout test/test_rocwmma_layout.cpp)
-            set_source_files_properties(test/test_rocwmma_layout.cpp PROPERTIES LANGUAGE HIP)
+            luce_add_ggml_gpu_executable(test_rocwmma_layout test/unit/test_rocwmma_layout.cpp)
+            set_source_files_properties(test/unit/test_rocwmma_layout.cpp PROPERTIES LANGUAGE HIP)
             set_target_properties(test_rocwmma_layout PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
             target_compile_definitions(test_rocwmma_layout PRIVATE GGML_USE_HIP)
             target_include_directories(test_rocwmma_layout PRIVATE ${GGML_HIP_ROCWMMA_INCLUDE_DIR})
@@ -1275,14 +1319,14 @@ if(LUCE_TESTS)
         # Benchmark, not a test: built with the tests but deliberately NOT added
         # to _raw_unit_test_targets. A/B's the fattn kernel routes at
         # chunked-prefill shapes.
-        luce_add_ggml_gpu_executable(bench_fattn_mma256 test/bench_fattn_mma256.cpp)
+        luce_add_ggml_gpu_executable(bench_fattn_mma256 test/bench/bench_fattn_mma256.cpp)
         target_compile_definitions(bench_fattn_mma256 PRIVATE GGML_USE_HIP)
 
         # Two-mode differential test for the stage-1 WMMA paged-attention
         # kernel (RDNA4): runs the op through the WMMA route and the V_DOT2
-        # decode route, then tests/compare_paged_attn.py compares the dumps.
-        add_executable(test_paged_attn_wmma test/test_paged_attn_wmma.cpp)
-        set_source_files_properties(test/test_paged_attn_wmma.cpp PROPERTIES LANGUAGE HIP)
+        # decode route, then test/bench/compare_paged_attn.py compares the dumps.
+        add_executable(test_paged_attn_wmma test/unit/test_paged_attn_wmma.cpp)
+        set_source_files_properties(test/unit/test_paged_attn_wmma.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_paged_attn_wmma PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_compile_definitions(test_paged_attn_wmma PRIVATE GGML_USE_HIP)
         target_include_directories(test_paged_attn_wmma PRIVATE
@@ -1293,8 +1337,8 @@ if(LUCE_TESTS)
 
         # Benchmark, not a test: isolates the paged-attention op at
         # chunked-prefill shapes and A/B's the V_DOT2 / WMMA routes.
-        add_executable(bench_paged_attn_wmma test/bench_paged_attn_wmma.cpp)
-        set_source_files_properties(test/bench_paged_attn_wmma.cpp PROPERTIES LANGUAGE HIP)
+        add_executable(bench_paged_attn_wmma test/bench/bench_paged_attn_wmma.cpp)
+        set_source_files_properties(test/bench/bench_paged_attn_wmma.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(bench_paged_attn_wmma PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_compile_definitions(bench_paged_attn_wmma PRIVATE GGML_USE_HIP)
         target_include_directories(bench_paged_attn_wmma PRIVATE
@@ -1305,8 +1349,8 @@ if(LUCE_TESTS)
         # Benchmark, not a test: built with the tests but deliberately NOT added to
         # _raw_unit_test_targets, so ctest stays deterministic. Measures the launch-count
         # claim the fusion rests on.
-        add_executable(bench_rocmfp_mix_gateup_glu test/bench_rocmfp_mix_gateup_glu.cpp)
-        set_source_files_properties(test/bench_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE HIP)
+        add_executable(bench_rocmfp_mix_gateup_glu test/bench/bench_rocmfp_mix_gateup_glu.cpp)
+        set_source_files_properties(test/bench/bench_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(bench_rocmfp_mix_gateup_glu PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_include_directories(bench_rocmfp_mix_gateup_glu PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
@@ -1316,28 +1360,28 @@ if(LUCE_TESTS)
         # Benchmark, not a test: compares the generic segmented full sort with
         # the exact two-stage block-radix TOP_K used by the DS4 long-context
         # indexer. Correctness across tile counts lives in test_deepseek4_unit.
-        add_executable(bench_ds4_topk test/bench_ds4_topk.cpp)
-        set_source_files_properties(test/bench_ds4_topk.cpp PROPERTIES LANGUAGE HIP)
+        add_executable(bench_ds4_topk test/bench/bench_ds4_topk.cpp)
+        set_source_files_properties(test/bench/bench_ds4_topk.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(bench_ds4_topk PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_include_directories(bench_ds4_topk PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(bench_ds4_topk PRIVATE
             ggml ggml-base ${LUCE_GGML_BACKEND_TARGET} hip::host)
     endif()
-    add_executable(test_qwen35_tensor_parallel test/test_qwen35_tensor_parallel.cpp)
+    add_executable(test_qwen35_tensor_parallel test/unit/test_qwen35_tensor_parallel.cpp)
     target_include_directories(test_qwen35_tensor_parallel PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
     target_link_libraries(test_qwen35_tensor_parallel PRIVATE luce_common)
 
-    add_executable(test_rope_tail test/test_rope_tail.cpp)
+    add_executable(test_rope_tail test/unit/test_rope_tail.cpp)
     target_compile_definitions(test_rope_tail PRIVATE LUCE_ROPE_TEST_GPU=1)
     target_link_libraries(test_rope_tail PRIVATE ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
 
-    if(LUCE_GPU_BACKEND STREQUAL "cuda" AND _luce_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
-        add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
+    if(LUCE_GPU_BACKEND STREQUAL "cuda" AND _luce_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_flashprefill_kernels.cpp")
+        add_executable(test_flashprefill_kernels test/unit/test_flashprefill_kernels.cpp)
         set_target_properties(test_flashprefill_kernels PROPERTIES CUDA_ARCHITECTURES "${_luce_archs}")
         target_include_directories(test_flashprefill_kernels PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(test_flashprefill_kernels PRIVATE luce_common CUDA::cudart)
-    elseif(LUCE_GPU_BACKEND STREQUAL "hip" AND LUCE_HIP_SM80_EQUIV AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
+    elseif(LUCE_GPU_BACKEND STREQUAL "hip" AND LUCE_HIP_SM80_EQUIV AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_flashprefill_kernels.cpp")
         # HIP build of the rocWMMA flashprefill numerics test. The test source is
         # written in CUDA spellings; the hip_compat/ shim maps cuda_runtime.h /
         # cuda_bf16.h and the cuda* APIs onto HIP, exactly as the kernel sources
@@ -1345,8 +1389,8 @@ if(LUCE_TESTS)
         # what provides the launch_*_bf16 symbols in luce_common. Lets the
         # rocWMMA path be validated on AMD (gfx1100 / gfx1151 / gfx12xx incl.
         # the R9700) instead of CUDA-only.
-        add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
-        set_source_files_properties(test/test_flashprefill_kernels.cpp PROPERTIES LANGUAGE HIP)
+        add_executable(test_flashprefill_kernels test/unit/test_flashprefill_kernels.cpp)
+        set_source_files_properties(test/unit/test_flashprefill_kernels.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_flashprefill_kernels PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_include_directories(test_flashprefill_kernels PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -1357,9 +1401,9 @@ if(LUCE_TESTS)
     # rms_norm_hip.cu is compiled into luce_common regardless of SM80_EQUIV
     # (it feeds the HIP chunk-B graph path). Validates the wavefront-generalized
     # reduction against the device's actual wave width.
-    if(LUCE_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rms_norm_hip.cpp")
-        add_executable(test_rms_norm_hip test/test_rms_norm_hip.cpp)
-        set_source_files_properties(test/test_rms_norm_hip.cpp PROPERTIES LANGUAGE HIP)
+    if(LUCE_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_rms_norm_hip.cpp")
+        add_executable(test_rms_norm_hip test/unit/test_rms_norm_hip.cpp)
+        set_source_files_properties(test/unit/test_rms_norm_hip.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_rms_norm_hip PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_include_directories(test_rms_norm_hip PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -1370,9 +1414,9 @@ if(LUCE_TESTS)
     # DS4 Hierarchical-Controller pre-mix kernels vs CPU reference. HIP only:
     # deepseek4_hc_cuda.cu is compiled into luce_common on this backend. Validates
     # the HC mix matvec + NHC=4 Sinkhorn path against the device's actual wave width.
-    if(LUCE_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_hc_cuda.cpp")
-        add_executable(test_deepseek4_hc_cuda test/test_deepseek4_hc_cuda.cpp)
-        set_source_files_properties(test/test_deepseek4_hc_cuda.cpp PROPERTIES LANGUAGE HIP)
+    if(LUCE_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_deepseek4_hc_cuda.cpp")
+        add_executable(test_deepseek4_hc_cuda test/unit/test_deepseek4_hc_cuda.cpp)
+        set_source_files_properties(test/unit/test_deepseek4_hc_cuda.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_deepseek4_hc_cuda PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_include_directories(test_deepseek4_hc_cuda PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -1382,8 +1426,8 @@ if(LUCE_TESTS)
     endif()
     # Helper copies must not break another thread's graph capture (several
     # models served by one process).
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_capture_safe_copies.cpp")
-        add_executable(test_capture_safe_copies test/test_capture_safe_copies.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_capture_safe_copies.cpp")
+        add_executable(test_capture_safe_copies test/unit/test_capture_safe_copies.cpp)
         target_include_directories(test_capture_safe_copies PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
@@ -1396,10 +1440,10 @@ if(LUCE_TESTS)
         target_link_libraries(test_capture_safe_copies PRIVATE luce_common Threads::Threads)
         # Registered through the CppUnit list below.
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_mmid_grouped_cuda.cpp")
-        add_executable(test_deepseek4_mmid_grouped_cuda test/test_deepseek4_mmid_grouped_cuda.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_deepseek4_mmid_grouped_cuda.cpp")
+        add_executable(test_deepseek4_mmid_grouped_cuda test/unit/test_deepseek4_mmid_grouped_cuda.cpp)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
-            set_source_files_properties(test/test_deepseek4_mmid_grouped_cuda.cpp PROPERTIES LANGUAGE HIP)
+            set_source_files_properties(test/unit/test_deepseek4_mmid_grouped_cuda.cpp PROPERTIES LANGUAGE HIP)
             set_target_properties(test_deepseek4_mmid_grouped_cuda PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
             target_include_directories(test_deepseek4_mmid_grouped_cuda PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
@@ -1456,9 +1500,9 @@ if(LUCE_TESTS)
         set_tests_properties(deepseek4_mmid_grouped_cuda_combine_override
             PROPERTIES SKIP_RETURN_CODE 77)
     endif()
-    if(LUCE_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_moe_combine_cuda.cpp")
-        add_executable(test_ds4_moe_combine_cuda test/test_ds4_moe_combine_cuda.cpp)
-        set_source_files_properties(test/test_ds4_moe_combine_cuda.cpp PROPERTIES LANGUAGE HIP)
+    if(LUCE_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_moe_combine_cuda.cpp")
+        add_executable(test_ds4_moe_combine_cuda test/unit/test_ds4_moe_combine_cuda.cpp)
+        set_source_files_properties(test/unit/test_ds4_moe_combine_cuda.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_ds4_moe_combine_cuda PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_include_directories(test_ds4_moe_combine_cuda PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
@@ -1468,8 +1512,8 @@ if(LUCE_TESTS)
     endif()
     # Host-only test of the ggml-cuda batched copy: plain C++ on both the CUDA
     # and HIP builds. Registered through the CppUnit list below.
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_copy_batch.cpp")
-        add_executable(test_cuda_copy_batch test/test_cuda_copy_batch.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_cuda_copy_batch.cpp")
+        add_executable(test_cuda_copy_batch test/unit/test_cuda_copy_batch.cpp)
         target_include_directories(test_cuda_copy_batch PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(test_cuda_copy_batch PRIVATE ggml ${LUCE_GGML_BACKEND_TARGET})
@@ -1480,8 +1524,8 @@ if(LUCE_TESTS)
             ENVIRONMENT "GGML_CUDA_DISABLE_COPY_BATCH=1")
     endif()
     if(LUCE_GPU_BACKEND STREQUAL "hip")
-        add_executable(test_ggml_host_mailbox_cuda test/test_ggml_host_mailbox_cuda.cpp)
-        set_source_files_properties(test/test_ggml_host_mailbox_cuda.cpp PROPERTIES LANGUAGE HIP)
+        add_executable(test_ggml_host_mailbox_cuda test/unit/test_ggml_host_mailbox_cuda.cpp)
+        set_source_files_properties(test/unit/test_ggml_host_mailbox_cuda.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_ggml_host_mailbox_cuda PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_include_directories(test_ggml_host_mailbox_cuda PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
@@ -1489,8 +1533,8 @@ if(LUCE_TESTS)
             ggml ${LUCE_GGML_BACKEND_TARGET} hip::host)
     endif()
     if(LUCE_GPU_BACKEND STREQUAL "hip")
-        add_executable(test_ds4_maskless_prefill test/test_ds4_maskless_prefill.cpp)
-        set_source_files_properties(test/test_ds4_maskless_prefill.cpp PROPERTIES LANGUAGE HIP)
+        add_executable(test_ds4_maskless_prefill test/unit/test_ds4_maskless_prefill.cpp)
+        set_source_files_properties(test/unit/test_ds4_maskless_prefill.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_ds4_maskless_prefill PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_link_libraries(test_ds4_maskless_prefill PRIVATE
             ggml ${LUCE_GGML_BACKEND_TARGET} hip::host)
@@ -1510,15 +1554,15 @@ if(LUCE_TESTS)
         unset(_maskless_mode)
     endif()
     # HIP-only standalone build; CUDA backend is covered by aggregated test_server_unit.
-    if(LUCE_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
+    if(LUCE_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_draft_topk_cuda.cpp")
         # HIP build of the same GPU-vs-CPU parity test. The test source uses CUDA
         # spellings (<cuda_runtime.h> + cudaMalloc/cudaMemcpy/...); the hip_compat
         # shim maps them onto HIP, exactly as the kernel TU does. Lets the draft
         # top-K port be validated on AMD (gfx1100 / gfx1151 / gfx12xx).
         add_executable(test_draft_topk_cuda
-            test/test_unit_main.cpp
-            test/test_draft_topk_cuda.cpp)
-        set_source_files_properties(test/test_draft_topk_cuda.cpp PROPERTIES LANGUAGE HIP)
+            test/unit/test_unit_main.cpp
+            test/unit/test_draft_topk_cuda.cpp)
+        set_source_files_properties(test/unit/test_draft_topk_cuda.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_draft_topk_cuda PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         target_include_directories(test_draft_topk_cuda PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -1529,8 +1573,8 @@ if(LUCE_TESTS)
     # Focused CUDA-vs-CPU oracle for the IQ4_XS MMQ stream-k scheduler. These
     # shapes cover the no-fixup, partial-row, fixup, two-wave, and deeper-K
     # transitions validated for the llama.cpp #22298 backport on sm_86.
-    if(LUCE_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_mmq_streamk_iq4_xs.cpp")
-        add_executable(test_mmq_streamk_iq4_xs test/test_mmq_streamk_iq4_xs.cpp)
+    if(LUCE_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_mmq_streamk_iq4_xs.cpp")
+        add_executable(test_mmq_streamk_iq4_xs test/unit/test_mmq_streamk_iq4_xs.cpp)
         target_link_libraries(test_mmq_streamk_iq4_xs PRIVATE
             ggml
             ggml-cpu
@@ -1538,9 +1582,9 @@ if(LUCE_TESTS)
             ggml-base)
         list(APPEND _raw_unit_test_targets test_mmq_streamk_iq4_xs)
     endif()
-    if(LUCE_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_turbo_wht_warp.cu")
+    if(LUCE_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_turbo_wht_warp.cu")
         find_package(CUDAToolkit REQUIRED)
-        add_executable(test_turbo_wht_warp test/test_turbo_wht_warp.cu)
+        add_executable(test_turbo_wht_warp test/unit/test_turbo_wht_warp.cu)
         set_target_properties(test_turbo_wht_warp PROPERTIES CUDA_ARCHITECTURES "${_luce_archs}")
         target_include_directories(test_turbo_wht_warp PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
@@ -1551,7 +1595,7 @@ if(LUCE_TESTS)
     endif()
     if((LUCE_GPU_BACKEND STREQUAL "cuda" AND GGML_CUDA_GRAPHS) OR
        (LUCE_GPU_BACKEND STREQUAL "hip" AND GGML_HIP_GRAPHS))
-        add_executable(test_direct_zero_uid_graph_aba test/test_direct_zero_uid_graph_aba.cpp)
+        add_executable(test_direct_zero_uid_graph_aba test/unit/test_direct_zero_uid_graph_aba.cpp)
         # This host-only test calls the GGML C API; the linked backend owns the
         # device code and runtime dependencies. No HIP language or shim is needed.
         target_include_directories(test_direct_zero_uid_graph_aba PRIVATE
@@ -1566,8 +1610,8 @@ if(LUCE_TESTS)
         endif()
         list(APPEND _raw_unit_test_targets test_direct_zero_uid_graph_aba)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_unit.cpp")
-        add_executable(test_deepseek4_unit test/test_deepseek4_unit.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_deepseek4_unit.cpp")
+        add_executable(test_deepseek4_unit test/unit/test_deepseek4_unit.cpp)
         target_include_directories(test_deepseek4_unit PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_deepseek4_unit PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
@@ -1585,9 +1629,9 @@ if(LUCE_TESTS)
         endif()
         list(APPEND _raw_unit_test_targets test_deepseek4_unit)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_roctx.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_deepseek4_roctx.cpp")
         add_executable(test_deepseek4_roctx
-            test/test_deepseek4_roctx.cpp
+            test/unit/test_deepseek4_roctx.cpp
             src/deepseek4/deepseek4_roctx.cpp
             src/common/target_shard_ipc_daemon.cpp)
         target_include_directories(test_deepseek4_roctx PRIVATE
@@ -1602,9 +1646,9 @@ if(LUCE_TESTS)
         target_link_libraries(test_deepseek4_roctx PRIVATE ${CMAKE_DL_LIBS})
         list(APPEND _raw_unit_test_targets test_deepseek4_roctx)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35_roctx.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_qwen35_roctx.cpp")
         add_executable(test_qwen35_roctx
-            test/test_qwen35_roctx.cpp
+            test/unit/test_qwen35_roctx.cpp
             src/qwen35/qwen35_roctx.cpp)
         target_include_directories(test_qwen35_roctx PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1615,8 +1659,8 @@ if(LUCE_TESTS)
         target_link_libraries(test_qwen35_roctx PRIVATE ${CMAKE_DL_LIBS})
         list(APPEND _raw_unit_test_targets test_qwen35_roctx)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ggml_rmsnorm_batch.cpp")
-        add_executable(test_ggml_rmsnorm_batch test/test_ggml_rmsnorm_batch.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ggml_rmsnorm_batch.cpp")
+        add_executable(test_ggml_rmsnorm_batch test/unit/test_ggml_rmsnorm_batch.cpp)
         target_include_directories(test_ggml_rmsnorm_batch PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(test_ggml_rmsnorm_batch PRIVATE ggml ${LUCE_GGML_BACKEND_TARGET} ggml-base)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
@@ -1628,8 +1672,8 @@ if(LUCE_TESTS)
             target_link_libraries(test_ggml_rmsnorm_batch PRIVATE CUDA::cudart)
         endif()
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ggml_cluster_allreduce.cpp")
-        add_executable(test_ggml_cluster_allreduce test/test_ggml_cluster_allreduce.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ggml_cluster_allreduce.cpp")
+        add_executable(test_ggml_cluster_allreduce test/unit/test_ggml_cluster_allreduce.cpp)
         target_include_directories(test_ggml_cluster_allreduce PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(test_ggml_cluster_allreduce PRIVATE ggml ${LUCE_GGML_BACKEND_TARGET} ggml-base)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
@@ -1647,8 +1691,8 @@ if(LUCE_TESTS)
     # gated on DS4_TEST_MODEL and skips without it -- disproportionate. Excluded on Windows so
     # a tests-enabled MSVC build compiles; the portable coverage lives in
     # test_ds4_mix_registry_teardown and test_ds4_dmix_entry_validation, which need no model.
-    if(NOT WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_load_transactional.cpp")
-        add_executable(test_ds4_load_transactional test/test_ds4_load_transactional.cpp)
+    if(NOT WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_load_transactional.cpp")
+        add_executable(test_ds4_load_transactional test/unit/test_ds4_load_transactional.cpp)
         target_include_directories(test_ds4_load_transactional PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_ds4_load_transactional PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
@@ -1665,17 +1709,17 @@ if(LUCE_TESTS)
         # Self-skips (returns 0) unless DS4_TEST_MODEL points at a qtype-105 model.
         add_test(NAME ds4_load_transactional COMMAND test_ds4_load_transactional)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp3_mix_registry.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_rocmfp3_mix_registry.cpp")
         # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
         # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
         # which left the qtype-105/106 numerics verified on gfx1151 alone.
-        add_executable(test_rocmfp3_mix_registry test/test_rocmfp3_mix_registry.cpp)
+        add_executable(test_rocmfp3_mix_registry test/unit/test_rocmfp3_mix_registry.cpp)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
-            set_source_files_properties(test/test_rocmfp3_mix_registry.cpp PROPERTIES LANGUAGE HIP)
+            set_source_files_properties(test/unit/test_rocmfp3_mix_registry.cpp PROPERTIES LANGUAGE HIP)
             set_target_properties(test_rocmfp3_mix_registry PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
             target_compile_definitions(test_rocmfp3_mix_registry PRIVATE GGML_USE_HIP)
         else()
-            set_source_files_properties(test/test_rocmfp3_mix_registry.cpp PROPERTIES LANGUAGE CUDA)
+            set_source_files_properties(test/unit/test_rocmfp3_mix_registry.cpp PROPERTIES LANGUAGE CUDA)
             set_target_properties(test_rocmfp3_mix_registry PROPERTIES CUDA_ARCHITECTURES "${_luce_archs}")
         endif()
         target_include_directories(test_rocmfp3_mix_registry PRIVATE
@@ -1692,17 +1736,17 @@ if(LUCE_TESTS)
         endif()
         list(APPEND _raw_unit_test_targets test_rocmfp3_mix_registry)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp_mix_slice_matvec.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_rocmfp_mix_slice_matvec.cpp")
         # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
         # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
         # which left the qtype-105/106 numerics verified on gfx1151 alone.
-        add_executable(test_rocmfp_mix_slice_matvec test/test_rocmfp_mix_slice_matvec.cpp)
+        add_executable(test_rocmfp_mix_slice_matvec test/unit/test_rocmfp_mix_slice_matvec.cpp)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
-            set_source_files_properties(test/test_rocmfp_mix_slice_matvec.cpp PROPERTIES LANGUAGE HIP)
+            set_source_files_properties(test/unit/test_rocmfp_mix_slice_matvec.cpp PROPERTIES LANGUAGE HIP)
             set_target_properties(test_rocmfp_mix_slice_matvec PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
             target_compile_definitions(test_rocmfp_mix_slice_matvec PRIVATE GGML_USE_HIP)
         else()
-            set_source_files_properties(test/test_rocmfp_mix_slice_matvec.cpp PROPERTIES LANGUAGE CUDA)
+            set_source_files_properties(test/unit/test_rocmfp_mix_slice_matvec.cpp PROPERTIES LANGUAGE CUDA)
             set_target_properties(test_rocmfp_mix_slice_matvec PROPERTIES CUDA_ARCHITECTURES "${_luce_archs}")
         endif()
         target_include_directories(test_rocmfp_mix_slice_matvec PRIVATE
@@ -1719,17 +1763,17 @@ if(LUCE_TESTS)
         endif()
         list(APPEND _raw_unit_test_targets test_rocmfp_mix_slice_matvec)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp_mix_gateup_glu.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_rocmfp_mix_gateup_glu.cpp")
         # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
         # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
         # which left the qtype-105/106 numerics verified on gfx1151 alone.
-        add_executable(test_rocmfp_mix_gateup_glu test/test_rocmfp_mix_gateup_glu.cpp)
+        add_executable(test_rocmfp_mix_gateup_glu test/unit/test_rocmfp_mix_gateup_glu.cpp)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
-            set_source_files_properties(test/test_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE HIP)
+            set_source_files_properties(test/unit/test_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE HIP)
             set_target_properties(test_rocmfp_mix_gateup_glu PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
             target_compile_definitions(test_rocmfp_mix_gateup_glu PRIVATE GGML_USE_HIP)
         else()
-            set_source_files_properties(test/test_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE CUDA)
+            set_source_files_properties(test/unit/test_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE CUDA)
             set_target_properties(test_rocmfp_mix_gateup_glu PROPERTIES CUDA_ARCHITECTURES "${_luce_archs}")
         endif()
         target_include_directories(test_rocmfp_mix_gateup_glu PRIVATE
@@ -1747,17 +1791,17 @@ if(LUCE_TESTS)
         endif()
         list(APPEND _raw_unit_test_targets test_rocmfp_mix_gateup_glu)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp_mix_glu_fusable.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_rocmfp_mix_glu_fusable.cpp")
         # Pure admission logic on tensor metadata -- no device work, no kernels. Deliberately
         # OUTSIDE the hip-only block: the predicate it checks lives in ggml-cuda.cu and is
         # compiled for both backends, so the negative cases are worth exercising under CUDA
         # too. Source language follows the backend.
-        add_executable(test_rocmfp_mix_glu_fusable test/test_rocmfp_mix_glu_fusable.cpp)
+        add_executable(test_rocmfp_mix_glu_fusable test/unit/test_rocmfp_mix_glu_fusable.cpp)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
-            set_source_files_properties(test/test_rocmfp_mix_glu_fusable.cpp PROPERTIES LANGUAGE HIP)
+            set_source_files_properties(test/unit/test_rocmfp_mix_glu_fusable.cpp PROPERTIES LANGUAGE HIP)
             set_target_properties(test_rocmfp_mix_glu_fusable PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
         else()
-            set_source_files_properties(test/test_rocmfp_mix_glu_fusable.cpp PROPERTIES LANGUAGE CUDA)
+            set_source_files_properties(test/unit/test_rocmfp_mix_glu_fusable.cpp PROPERTIES LANGUAGE CUDA)
             set_target_properties(test_rocmfp_mix_glu_fusable PROPERTIES CUDA_ARCHITECTURES "${_luce_archs}")
         endif()
         target_include_directories(test_rocmfp_mix_glu_fusable PRIVATE
@@ -1772,10 +1816,10 @@ if(LUCE_TESTS)
         endif()
         list(APPEND _raw_unit_test_targets test_rocmfp_mix_glu_fusable)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_mix_registry_teardown.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_mix_registry_teardown.cpp")
         # Synthetic fixture: exercises free_deepseek4_weights' registry teardown with a
         # hand-built weights object, so it needs no model and cannot pass vacuously.
-        add_executable(test_ds4_mix_registry_teardown test/test_ds4_mix_registry_teardown.cpp)
+        add_executable(test_ds4_mix_registry_teardown test/unit/test_ds4_mix_registry_teardown.cpp)
         target_include_directories(test_ds4_mix_registry_teardown PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_ds4_mix_registry_teardown PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
@@ -1790,16 +1834,16 @@ if(LUCE_TESTS)
             target_link_libraries(test_ds4_mix_registry_teardown PRIVATE hip::host)
         endif()
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_budget_hook.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_budget_hook.cpp")
         # Thinking-budget force-close rule. Header-only logic, so unlike the other ds4 tests
         # this needs no backend, no ggml and no CUDA/HIP link at all.
-        add_executable(test_ds4_budget_hook test/test_ds4_budget_hook.cpp test/test_unit_main.cpp)
+        add_executable(test_ds4_budget_hook test/unit/test_ds4_budget_hook.cpp test/unit/test_unit_main.cpp)
         target_include_directories(test_ds4_budget_hook PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         add_test(NAME ds4_budget_hook COMMAND test_ds4_budget_hook)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dmix_entry_validation.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_dmix_entry_validation.cpp")
         # Pure validation logic against the loader's shared rule function: no model, no GPU.
-        add_executable(test_ds4_dmix_entry_validation test/test_ds4_dmix_entry_validation.cpp)
+        add_executable(test_ds4_dmix_entry_validation test/unit/test_ds4_dmix_entry_validation.cpp)
         target_include_directories(test_ds4_dmix_entry_validation PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_ds4_dmix_entry_validation PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
@@ -1816,16 +1860,16 @@ if(LUCE_TESTS)
     endif()
     # Optional Strix Halo regression; reuse the tokenizer in luce_common.
     if(LUCE_GPU_BACKEND STREQUAL "hip" AND
-       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_paged_prefill_model.cpp")
-        add_executable(test_ds4_paged_prefill_model test/test_ds4_paged_prefill_model.cpp)
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_paged_prefill_model.cpp")
+        add_executable(test_ds4_paged_prefill_model test/unit/test_ds4_paged_prefill_model.cpp)
         target_include_directories(test_ds4_paged_prefill_model PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         target_compile_definitions(test_ds4_paged_prefill_model PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
         target_link_libraries(test_ds4_paged_prefill_model PRIVATE
             luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET} ggml-base hip::host)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
-        add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_dspark_load.cpp")
+        add_executable(test_ds4_dspark_load test/unit/test_ds4_dspark_load.cpp)
         target_include_directories(test_ds4_dspark_load PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_ds4_dspark_load PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
@@ -1840,90 +1884,89 @@ if(LUCE_TESTS)
             target_link_libraries(test_ds4_dspark_load PRIVATE hip::host)
         endif()
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_draft_graph.cpp")
-        add_executable(smoke_draft_graph test/smoke_draft_graph.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_draft_graph.cpp")
+        add_executable(smoke_draft_graph test/smoke/smoke_draft_graph.cpp)
         target_include_directories(smoke_draft_graph PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_draft_graph PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_qwen3_forward.cpp")
-        add_executable(smoke_qwen3_forward test/smoke_qwen3_forward.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_qwen3_forward.cpp")
+        add_executable(smoke_qwen3_forward test/smoke/smoke_qwen3_forward.cpp)
         target_include_directories(smoke_qwen3_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_qwen3_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    add_executable(test_qwen4exp_chunk test/test_qwen4exp_chunk.cpp)
+    add_executable(test_qwen4exp_chunk test/unit/test_qwen4exp_chunk.cpp)
     target_include_directories(test_qwen4exp_chunk PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
     target_link_libraries(test_qwen4exp_chunk PRIVATE ggml)
     target_compile_options(test_qwen4exp_chunk PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-UNDEBUG>)
     add_test(NAME test_qwen4exp_chunk COMMAND test_qwen4exp_chunk)
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_qwen4exp_forward.cpp")
-        add_executable(smoke_qwen4exp_forward test/smoke_qwen4exp_forward.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_qwen4exp_forward.cpp")
+        add_executable(smoke_qwen4exp_forward test/smoke/smoke_qwen4exp_forward.cpp)
         target_include_directories(smoke_qwen4exp_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_qwen4exp_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_vs_oracle.cpp")
-        add_executable(test_vs_oracle test/test_vs_oracle.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_vs_oracle.cpp")
+        add_executable(test_vs_oracle test/unit/test_vs_oracle.cpp)
         target_include_directories(test_vs_oracle PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(test_vs_oracle PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_laguna_forward.cpp")
-        add_executable(smoke_laguna_forward test/smoke_laguna_forward.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_laguna_forward.cpp")
+        add_executable(smoke_laguna_forward test/smoke/smoke_laguna_forward.cpp)
         target_include_directories(smoke_laguna_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_laguna_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_ttft.cpp")
-        add_executable(bench_laguna_ttft test/bench_laguna_ttft.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_laguna_ttft.cpp")
+        add_executable(bench_laguna_ttft test/bench/bench_laguna_ttft.cpp)
         target_include_directories(bench_laguna_ttft PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_ttft PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_pflash.cpp")
-        add_executable(bench_laguna_pflash test/bench_laguna_pflash.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_laguna_pflash.cpp")
+        add_executable(bench_laguna_pflash test/bench/bench_laguna_pflash.cpp)
         target_include_directories(bench_laguna_pflash PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_pflash PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_generate.cpp")
-        add_executable(bench_laguna_generate test/bench_laguna_generate.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_laguna_generate.cpp")
+        add_executable(bench_laguna_generate test/bench/bench_laguna_generate.cpp)
         target_include_directories(bench_laguna_generate PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_generate PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_spark.cpp")
-        add_executable(bench_laguna_spark test/bench_laguna_spark.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_laguna_spark.cpp")
+        add_executable(bench_laguna_spark test/bench/bench_laguna_spark.cpp)
         target_include_directories(bench_laguna_spark PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_spark PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
     # This synthetic stream benchmark touches a multi-gigabyte sparse file and
     # requires a real CUDA device. Keep it manually runnable instead of adding
     # it to the hosted server-unit suite.
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_stream.cpp"
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_moe_stream.cpp"
        AND LUCE_GPU_BACKEND STREQUAL "cuda")
         add_executable(test_moe_stream
-            test/test_unit_main.cpp
-            test/test_moe_stream.cpp)
+            test/unit/test_unit_main.cpp
+            test/unit/test_moe_stream.cpp)
         target_include_directories(test_moe_stream PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS}
             ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(test_moe_stream PRIVATE
             luce_common ggml ${LUCE_GGML_BACKEND_TARGET} CUDA::cudart)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_laguna_daemon.cpp")
-        add_executable(test_laguna_daemon test/test_laguna_daemon.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_laguna_daemon.cpp")
+        add_executable(test_laguna_daemon test/unit/test_laguna_daemon.cpp)
         target_include_directories(test_laguna_daemon PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(test_laguna_daemon PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_target_forward.cpp")
-        add_executable(smoke_target_forward test/smoke_target_forward.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_target_forward.cpp")
+        add_executable(smoke_target_forward test/smoke/smoke_target_forward.cpp)
         target_include_directories(smoke_target_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_target_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_generate.cpp")
-        add_executable(test_generate test/test_generate.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_generate.cpp")
+        add_executable(test_generate test/unit/test_generate.cpp)
         target_include_directories(test_generate PRIVATE
-            ${LUCE_SRC_INCLUDE_DIRS}
-            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+            ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(test_generate PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash.cpp")
-        add_executable(test_kvflash test/test_kvflash.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_kvflash.cpp")
+        add_executable(test_kvflash test/unit/test_kvflash.cpp)
         target_include_directories(test_kvflash PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         # Default --qkbench filler: a bundled real-token stream, tiled to the
         # requested length. Keeps the qk gate valid out of the box (uniform-
@@ -1935,12 +1978,12 @@ if(LUCE_TESTS)
             target_link_libraries(test_kvflash PRIVATE CUDA::cudart)
         endif()
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_paged_kv_pool.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_paged_kv_pool.cpp")
         # Pure host-side allocator test: no model, ggml, or GPU is required.
         add_executable(test_paged_kv_pool
-            test/test_paged_kv_pool.cpp
-            test/test_deepseek4_page_layout.cpp
-            test/test_deepseek4_paged_cache.cpp
+            test/unit/test_paged_kv_pool.cpp
+            test/unit/test_deepseek4_page_layout.cpp
+            test/unit/test_deepseek4_paged_cache.cpp
             src/deepseek4/deepseek4_paged_cache.cpp
             src/common/concurrency/paged_kv_pool.cpp)
         target_compile_definitions(test_paged_kv_pool PRIVATE LUCE_DS4_PLAN_ONLY=1)
@@ -1948,11 +1991,11 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_paged_kv_pool)
     endif()
-    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_engram.cpp")
+    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_engram.cpp")
         # DeepSeek V4.1 Engram addressing and row decode: host only, no ggml or
         # GPU. The fixture writes its tables with POSIX file calls.
         add_executable(test_ds4_engram
-            test/test_ds4_engram.cpp
+            test/unit/test_ds4_engram.cpp
             src/deepseek4/deepseek4_engram.cpp
             src/common/platform_io.cpp)
         target_include_directories(test_ds4_engram PRIVATE
@@ -1960,95 +2003,90 @@ if(LUCE_TESTS)
         find_package(Threads REQUIRED)
         target_link_libraries(test_ds4_engram PRIVATE Threads::Threads)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_slot_manager.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_seq_slot_manager.cpp")
         # Host-side slot bookkeeping test (concurrent serving): no GPU.
         add_executable(test_seq_slot_manager
-            test/test_seq_slot_manager.cpp
+            test/unit/test_seq_slot_manager.cpp
             src/common/concurrency/seq_slot_manager.cpp
             src/common/concurrency/paged_kv_pool.cpp)
         target_include_directories(test_seq_slot_manager PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_seq_slot_manager)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_engine_contract.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_seq_engine_contract.cpp")
         # SeqEngine conformance checker + the fakes that prove it bites: no GPU.
-        add_executable(test_seq_engine_contract test/test_seq_engine_contract.cpp)
+        add_executable(test_seq_engine_contract test/unit/test_seq_engine_contract.cpp)
         target_include_directories(test_seq_engine_contract PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_seq_engine_contract)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_parallel_prefix_txn.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_parallel_prefix_txn.cpp")
         # Host-only ownership tests for the scheduler/cache capture ticket.
         add_executable(test_parallel_prefix_txn
-            test/test_parallel_prefix_txn.cpp)
+            test/unit/test_parallel_prefix_txn.cpp)
         target_include_directories(test_parallel_prefix_txn PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_parallel_prefix_txn)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ddtree_path.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ddtree_path.cpp")
         # Pure host-side accepted-path/pending-token contract tests.
         add_executable(test_ddtree_path
-            test/test_ddtree_path.cpp
+            test/unit/test_ddtree_path.cpp
             src/common/ddtree.cpp)
         target_include_directories(test_ddtree_path PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_ddtree_path)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_chain_spec_shapes.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_chain_spec_shapes.cpp")
         # Pure host-side fixed-chain prefix, bucket, and EOS contracts.
         add_executable(test_chain_spec_shapes
-            test/test_chain_spec_shapes.cpp)
+            test/unit/test_chain_spec_shapes.cpp)
         target_include_directories(test_chain_spec_shapes PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_chain_spec_shapes)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash2_selector_validation.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_dflash2_selector_validation.cpp")
         # Pure host-side selector metadata/layout validation: no GPU.
         add_executable(test_dflash2_selector_validation
-            test/test_dflash2_selector_validation.cpp)
+            test/unit/test_dflash2_selector_validation.cpp)
         target_include_directories(test_dflash2_selector_validation PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_dflash2_selector_validation)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_swa.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_draft_swa.cpp")
         # Pure host-side draft SWA metadata/override policy tests.
-        add_executable(test_draft_swa test/test_draft_swa.cpp)
+        add_executable(test_draft_swa test/unit/test_draft_swa.cpp)
         target_include_directories(test_draft_swa PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(test_draft_swa PRIVATE luce_common)
     endif()
     if((LUCE_GPU_BACKEND STREQUAL "cuda" OR
         LUCE_GPU_BACKEND STREQUAL "hip") AND
-       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_swa_multilane.cpp")
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_draft_swa_multilane.cpp")
         # Opt-in real-model proof for post-window lane masks and packed draft parity.
-        add_executable(test_draft_swa_multilane test/test_draft_swa_multilane.cpp)
+        add_executable(test_draft_swa_multilane test/unit/test_draft_swa_multilane.cpp)
         target_include_directories(test_draft_swa_multilane PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(test_draft_swa_multilane PRIVATE
             luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_draft_swa_multilane)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_batch_plan.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_seq_batch_plan.cpp")
         # Pure-host tests for model-neutral token-budget/FIFO planning.
-        add_executable(test_seq_batch_plan test/test_seq_batch_plan.cpp)
+        add_executable(test_seq_batch_plan test/unit/test_seq_batch_plan.cpp)
         target_include_directories(test_seq_batch_plan PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_seq_batch_plan)
     endif()
-    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_client_send_buffer.cpp")
+    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_client_send_buffer.cpp")
         # Buffered non-blocking client writer test (socketpair): no GPU.
-        add_executable(test_client_send_buffer test/test_client_send_buffer.cpp)
+        add_executable(test_client_send_buffer test/unit/test_client_send_buffer.cpp)
         target_include_directories(test_client_send_buffer PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_client_send_buffer)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash.cpp")
-        add_executable(test_dflash test/test_dflash.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_dflash.cpp")
+        add_executable(test_dflash test/unit/test_dflash.cpp)
         target_include_directories(test_dflash PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         if(LUCE_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_dflash PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
@@ -2074,8 +2112,8 @@ if(LUCE_TESTS)
     endif()
 
     # Tokenizer test harness (no GPU needed — links static lib for tokenizer + GGUF reader)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_tokenizer_harness.cpp")
-        add_executable(test_tokenizer_harness test/test_tokenizer_harness.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_tokenizer_harness.cpp")
+        add_executable(test_tokenizer_harness test/unit/test_tokenizer_harness.cpp)
         target_include_directories(test_tokenizer_harness PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         if(LUCE_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_tokenizer_harness PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
@@ -2095,20 +2133,20 @@ if(LUCE_TESTS)
 
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
     # Shared image input: request transport and JPEG/PNG decoding.
-    add_executable(test_image_input test/test_image_input.cpp src/server/image_input.cpp)
+    add_executable(test_image_input test/unit/test_image_input.cpp src/server/image_input.cpp)
     target_include_directories(test_image_input PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_image_input PRIVATE nlohmann_json::nlohmann_json)
     if(LUCE_IMAGE_CODECS)
-        add_executable(test_image_decode test/test_image_decode.cpp src/common/vision/image_decode.cpp)
+        add_executable(test_image_decode test/unit/test_image_decode.cpp src/common/vision/image_decode.cpp)
         target_include_directories(test_image_decode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(test_image_decode PRIVATE image_codec_jpeg image_codec_png)
         list(APPEND _raw_unit_test_targets test_image_decode)
     endif()
-    add_executable(test_image_resize test/test_image_resize.cpp src/common/vision/image_resize.cpp)
+    add_executable(test_image_resize test/unit/test_image_resize.cpp src/common/vision/image_resize.cpp)
     target_include_directories(test_image_resize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_executable(test_gpu_page_pool test/test_gpu_page_pool.cpp src/common/gpu_page_pool.cpp)
+    add_executable(test_gpu_page_pool test/unit/test_gpu_page_pool.cpp src/common/gpu_page_pool.cpp)
     target_include_directories(test_gpu_page_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_executable(test_qwen35_image test/test_qwen35_image.cpp
+    add_executable(test_qwen35_image test/unit/test_qwen35_image.cpp
         src/qwen35/qwen35_image_prompt.cpp src/qwen35/qwen35_vision.cpp
         src/common/vision/mmproj_file.cpp src/common/vision/image_resize.cpp)
     target_include_directories(test_qwen35_image PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -2118,7 +2156,7 @@ if(LUCE_TESTS)
 
     # DS4V image units: each test builds only the unit it covers.
     foreach(_ds4v_unit assembly integration policy prompt)
-        add_executable(test_ds4v_image_${_ds4v_unit} test/test_ds4v_image_${_ds4v_unit}.cpp)
+        add_executable(test_ds4v_image_${_ds4v_unit} test/unit/test_ds4v_image_${_ds4v_unit}.cpp)
         target_include_directories(test_ds4v_image_${_ds4v_unit} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4)
         list(APPEND _raw_unit_test_targets test_ds4v_image_${_ds4v_unit})
@@ -2130,12 +2168,12 @@ if(LUCE_TESTS)
         src/deepseek4/deepseek4_vision_preprocess.cpp
         src/common/vision/image_resize.cpp)
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_source_page_range.cpp")
-        add_executable(test_moe_source_page_range test/test_moe_source_page_range.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_moe_source_page_range.cpp")
+        add_executable(test_moe_source_page_range test/unit/test_moe_source_page_range.cpp)
         list(APPEND _raw_unit_test_targets test_moe_source_page_range)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_input_ready.cpp")
-        add_executable(test_moe_input_ready test/test_moe_input_ready.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_moe_input_ready.cpp")
+        add_executable(test_moe_input_ready test/unit/test_moe_input_ready.cpp)
         target_include_directories(test_moe_input_ready PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         if(UNIX)
@@ -2154,6 +2192,7 @@ if(LUCE_TESTS)
             COMMAND bash
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/test_entrypoint.sh"
                 "${CMAKE_CURRENT_SOURCE_DIR}/scripts/entrypoint.sh")
+        set_tests_properties(server_unit_entrypoint PROPERTIES LABELS cpu)
     endif()
 
     set(_pi_timeout_test "${CMAKE_CURRENT_SOURCE_DIR}/../harness/tests/test_run_pi_timeout.sh")
@@ -2162,6 +2201,7 @@ if(LUCE_TESTS)
         add_test(
             NAME server_unit_pi_harness_timeout
             COMMAND bash "${_pi_timeout_test}" "${_pi_launcher}")
+        set_tests_properties(server_unit_pi_harness_timeout PROPERTIES LABELS cpu)
     endif()
     unset(_pi_timeout_test)
     unset(_pi_launcher)
@@ -2173,6 +2213,7 @@ if(LUCE_TESTS)
         add_test(
             NAME server_unit_omp_harness_config
             COMMAND bash "${_omp_config_test}" "${_omp_launcher}")
+        set_tests_properties(server_unit_omp_harness_config PROPERTIES LABELS cpu)
     endif()
     unset(_omp_config_test)
     unset(_omp_launcher)
@@ -2184,6 +2225,7 @@ if(LUCE_TESTS)
         add_test(
             NAME server_unit_backend_pair_summary
             COMMAND "${_harness_python3}" "${_backend_pair_summary_test}")
+        set_tests_properties(server_unit_backend_pair_summary PROPERTIES LABELS cpu)
     endif()
     unset(_backend_pair_summary_test)
     unset(_harness_python3 CACHE)
@@ -2194,10 +2236,11 @@ if(LUCE_TESTS)
         add_test(
             NAME server_unit_client_harness_timeouts
             COMMAND bash "${_client_timeout_test}")
+        set_tests_properties(server_unit_client_harness_timeouts PROPERTIES LABELS cpu)
     endif()
     unset(_client_timeout_test)
 
-    add_executable(test_ggml_meta_split_layout test/test_ggml_meta_split_layout.cpp)
+    add_executable(test_ggml_meta_split_layout test/unit/test_ggml_meta_split_layout.cpp)
     target_include_directories(test_ggml_meta_split_layout PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
@@ -2205,13 +2248,13 @@ if(LUCE_TESTS)
 
     # CPU-only contract test for the fail-closed layer-split tree boundary.
     add_executable(test_qwen35_split_tree_guard
-        test/test_qwen35_split_tree_guard.cpp)
+        test/unit/test_qwen35_split_tree_guard.cpp)
     target_include_directories(test_qwen35_split_tree_guard PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
     list(APPEND _raw_unit_test_targets test_qwen35_split_tree_guard)
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_recurrent_snapshot.cpp")
-        add_executable(test_recurrent_snapshot test/test_recurrent_snapshot.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_recurrent_snapshot.cpp")
+        add_executable(test_recurrent_snapshot test/unit/test_recurrent_snapshot.cpp)
         target_include_directories(test_recurrent_snapshot PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(test_recurrent_snapshot PRIVATE
@@ -2219,11 +2262,11 @@ if(LUCE_TESTS)
         list(APPEND _raw_unit_test_targets test_recurrent_snapshot)
     endif()
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_delta_net_specla.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_delta_net_specla.cpp")
         # GPU parity test: SpecLA topology-masked verify + factor-based state
         # reconstruction vs the fused sequential gated-delta-net kernel.
         # Exits 77 (ctest SKIP) when no GPU is present.
-        add_executable(test_delta_net_specla test/test_delta_net_specla.cpp)
+        add_executable(test_delta_net_specla test/unit/test_delta_net_specla.cpp)
         target_include_directories(test_delta_net_specla PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(test_delta_net_specla PRIVATE
@@ -2231,51 +2274,51 @@ if(LUCE_TESTS)
         list(APPEND _raw_unit_test_targets test_delta_net_specla)
     endif()
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_server_unit.cpp")
         set(_server_unit_sources
-            test/test_unit_main.cpp
-            test/test_server_unit.cpp
-            test/test_model_routing.cpp
-            test/test_luce_engine.cpp
-            test/test_paged_kv_offload.cpp
-            test/test_anchor_params.cpp
-            test/test_derived_scalars.cpp
-            test/test_adaptive_spec_width.cpp
-            test/test_immutable_graph_input_pool.cpp
-            test/test_mmq_tile_selection.cpp
-            test/test_mixed_mmq_policy.cpp
-            test/test_spec_acceptance.cpp
-            test/test_ds4_spec_sampling.cpp
-            test/test_ds4_env.cpp
-            test/test_kvflash_ubatch.cpp
-            test/test_qwen35_mask_upload.cpp
-            test/test_adaptive_keep_ratio.cpp
-            test/test_skip_park_guard.cpp
-            test/test_bandit_integration.cpp
-            test/test_admission.cpp
-            test/test_restore_delta.cpp
-            test/test_chain_rollback_policy.cpp
-            test/test_ddtree_tau.cpp
-            test/test_anchor_transitive.cpp
-            test/test_drafter_early_exit_score_range.cpp
-            test/test_qwen3_buffer_plan.cpp
-            test/test_model_test_paths.cpp
-            test/test_gguf_mmap.cpp
-            test/test_kv_quant.cpp
-            test/test_kvflash_placement.cpp
-            test/test_kvflash_pool_sizing.cpp
-            test/test_kvflash_qk.cpp
-            test/test_qwen35moe_routing_stats.cpp
-            test/test_qwen35moe_expert_placement.cpp
-            test/test_qwen35moe_swap_manager.cpp
-            test/test_mmq_streamk_schedule.cpp
-            test/test_moe_hybrid_storage.cpp
-            test/test_tensor_file_reader.cpp)
+            test/unit/test_unit_main.cpp
+            test/unit/test_server_unit.cpp
+            test/unit/test_model_routing.cpp
+            test/unit/test_luce_engine.cpp
+            test/unit/test_paged_kv_offload.cpp
+            test/unit/test_anchor_params.cpp
+            test/unit/test_derived_scalars.cpp
+            test/unit/test_adaptive_spec_width.cpp
+            test/unit/test_immutable_graph_input_pool.cpp
+            test/unit/test_mmq_tile_selection.cpp
+            test/unit/test_mixed_mmq_policy.cpp
+            test/unit/test_spec_acceptance.cpp
+            test/unit/test_ds4_spec_sampling.cpp
+            test/unit/test_ds4_env.cpp
+            test/unit/test_kvflash_ubatch.cpp
+            test/unit/test_qwen35_mask_upload.cpp
+            test/unit/test_adaptive_keep_ratio.cpp
+            test/unit/test_skip_park_guard.cpp
+            test/unit/test_bandit_integration.cpp
+            test/unit/test_admission.cpp
+            test/unit/test_restore_delta.cpp
+            test/unit/test_chain_rollback_policy.cpp
+            test/unit/test_ddtree_tau.cpp
+            test/unit/test_anchor_transitive.cpp
+            test/unit/test_drafter_early_exit_score_range.cpp
+            test/unit/test_qwen3_buffer_plan.cpp
+            test/unit/test_model_test_paths.cpp
+            test/unit/test_gguf_mmap.cpp
+            test/unit/test_kv_quant.cpp
+            test/unit/test_kvflash_placement.cpp
+            test/unit/test_kvflash_pool_sizing.cpp
+            test/unit/test_kvflash_qk.cpp
+            test/unit/test_qwen35moe_routing_stats.cpp
+            test/unit/test_qwen35moe_expert_placement.cpp
+            test/unit/test_qwen35moe_swap_manager.cpp
+            test/unit/test_mmq_streamk_schedule.cpp
+            test/unit/test_moe_hybrid_storage.cpp
+            test/unit/test_tensor_file_reader.cpp)
         if(LUCE_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _server_unit_sources
-                test/test_gpu_sampler_cuda.cpp
-                test/test_cuda_pool_shutdown.cpp
-                test/test_draft_topk_cuda.cpp)
+                test/unit/test_gpu_sampler_cuda.cpp
+                test/unit/test_cuda_pool_shutdown.cpp
+                test/unit/test_draft_topk_cuda.cpp)
         endif()
         add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
@@ -2320,6 +2363,7 @@ if(LUCE_TESTS)
             # host. Register one aggregate test instead; CMake prepends the
             # target's CROSSCOMPILING_EMULATOR when one is configured.
             add_test(NAME server_unit COMMAND test_server_unit)
+            set_tests_properties(server_unit PROPERTIES LABELS cpu)
         else()
             set(_server_unit_ctest_generated
                 "${CMAKE_CURRENT_BINARY_DIR}/test_server_unit_discovered_tests.cmake")
@@ -2335,6 +2379,7 @@ if(LUCE_TESTS)
                     -DTEST_WORKING_DIR=${CMAKE_CURRENT_BINARY_DIR}
                     -DCTEST_FILE=${_server_unit_ctest_generated}
                     -DTEST_PREFIX=test_server_unit.
+                    -DTEST_LABELS=cpu
                     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/DiscoverCppUnitTests.cmake
                 VERBATIM
                 COMMENT "Discovering CppUnitTestFramework tests for test_server_unit")
@@ -2346,24 +2391,25 @@ if(LUCE_TESTS)
         add_test(NAME server_unit_qwen35_mask_full_width
             COMMAND test_server_unit Qwen35MaskUploadFixture)
         set_tests_properties(server_unit_qwen35_mask_full_width PROPERTIES
-            ENVIRONMENT "LUCE_QWEN35_MASK_FULL_WIDTH=1")
+            ENVIRONMENT "LUCE_QWEN35_MASK_FULL_WIDTH=1" LABELS cpu)
         unset(_server_unit_sources)
         list(APPEND _raw_unit_test_targets test_server_unit)
+        list(APPEND _luce_cpu_test_targets test_server_unit)
     endif()
 
     if((LUCE_GPU_BACKEND STREQUAL "cuda" OR
         LUCE_GPU_BACKEND STREQUAL "hip")
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_draft.cpp"
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target.cpp"
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target_laguna.cpp"
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_paged_attention.cpp")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_load_draft.cpp"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_load_target.cpp"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_load_target_laguna.cpp"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_paged_attention.cpp")
         add_executable(test_model_smoke
-            test/test_unit_main.cpp
-            test/smoke_load_draft.cpp
-            test/smoke_load_target.cpp
-            test/smoke_load_target_laguna.cpp
-            test/test_paged_attention.cpp
-            test/test_decode_kv_offload_gpu.cpp)
+            test/unit/test_unit_main.cpp
+            test/smoke/smoke_load_draft.cpp
+            test/smoke/smoke_load_target.cpp
+            test/smoke/smoke_load_target_laguna.cpp
+            test/unit/test_paged_attention.cpp
+            test/unit/test_decode_kv_offload_gpu.cpp)
         target_include_directories(test_model_smoke PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
@@ -2422,11 +2468,11 @@ if(LUCE_TESTS)
     # toolkit. This keeps policy rules testable in seconds instead of behind a
     # full backend build, which is why these tests do not live in
     # test_server_unit.
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_feature_gate.cpp")
-        add_executable(test_feature_gate test/test_feature_gate.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_feature_gate.cpp")
+        add_executable(test_feature_gate test/unit/test_feature_gate.cpp)
         target_sources(test_feature_gate PRIVATE
-            test/test_backend_plan.cpp
-            test/test_launch_policy.cpp
+            test/unit/test_backend_plan.cpp
+            test/unit/test_launch_policy.cpp
             src/common/backend_plan.cpp
             src/common/feature_gate.cpp
             src/kv_quant.cpp
@@ -2446,10 +2492,15 @@ if(LUCE_TESTS)
         endif()
     endif()
 
+    # luce_discover_cppunit_tests(<target> [<label>...]) — the labels are
+    # set on every discovered case (or on the aggregate test when
+    # cross-compiling).
     function(luce_discover_cppunit_tests target)
+        set(_test_labels ${ARGN})
         if(CMAKE_CROSSCOMPILING)
             add_test(NAME "${target}" COMMAND ${target})
-            set_tests_properties("${target}" PROPERTIES SKIP_RETURN_CODE 77)
+            set_tests_properties("${target}" PROPERTIES
+                SKIP_RETURN_CODE 77 LABELS "${_test_labels}")
             return()
         endif()
 
@@ -2467,6 +2518,7 @@ if(LUCE_TESTS)
                 -DTEST_WORKING_DIR=${CMAKE_CURRENT_BINARY_DIR}
                 -DCTEST_FILE=${_ctest_generated}
                 -DTEST_PREFIX=${target}.
+                "-DTEST_LABELS=${_test_labels}"
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/DiscoverCppUnitTests.cmake
             VERBATIM
             COMMENT "Discovering CppUnitTestFramework tests for ${target}")
@@ -2505,8 +2557,13 @@ if(LUCE_TESTS)
         test_cuda_copy_batch)
     foreach(_cppunit_target IN LISTS _new_cppunit_test_targets)
         if(TARGET ${_cppunit_target})
-            target_sources(${_cppunit_target} PRIVATE test/test_unit_main.cpp)
-            luce_discover_cppunit_tests(${_cppunit_target})
+            target_sources(${_cppunit_target} PRIVATE test/unit/test_unit_main.cpp)
+            if(_cppunit_target IN_LIST _luce_cpu_cppunit_targets)
+                luce_discover_cppunit_tests(${_cppunit_target} cpu)
+                list(APPEND _luce_cpu_test_targets ${_cppunit_target})
+            else()
+                luce_discover_cppunit_tests(${_cppunit_target})
+            endif()
             list(APPEND _cppunit_test_targets ${_cppunit_target})
             list(APPEND _raw_unit_test_targets ${_cppunit_target})
         endif()
@@ -2546,6 +2603,10 @@ if(LUCE_TESTS)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
                 set_tests_properties("${_unit_ctest_name}" PROPERTIES SKIP_RETURN_CODE 77)
+                if(_unit_ctest_name IN_LIST _luce_cpu_ctest_names)
+                    set_tests_properties("${_unit_ctest_name}" PROPERTIES LABELS cpu)
+                    list(APPEND _luce_cpu_test_targets ${_unit_target})
+                endif()
                 if(_unit_target STREQUAL "test_direct_zero_uid_graph_aba")
                     set_tests_properties("${_unit_ctest_name}" PROPERTIES TIMEOUT 60)
                 endif()
@@ -2711,8 +2772,8 @@ if(LUCE_TESTS)
     # the adapter is only compiled into luce_common when the CUDA arch list
     # includes an sm_80+ target, so this test can only link there too.
     if(LUCE_GPU_BACKEND STREQUAL "cuda" AND _luce_has_sm80
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flash_attn_sparse.cpp")
-        add_executable(test_flash_attn_sparse test/test_flash_attn_sparse.cpp)
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_flash_attn_sparse.cpp")
+        add_executable(test_flash_attn_sparse test/unit/test_flash_attn_sparse.cpp)
         target_link_libraries(test_flash_attn_sparse PRIVATE luce_common ggml ggml-cuda ggml-base)
         target_include_directories(test_flash_attn_sparse PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
@@ -2724,13 +2785,10 @@ if(LUCE_TESTS)
     if((LUCE_GPU_BACKEND STREQUAL "cuda" OR
         LUCE_GPU_BACKEND STREQUAL "hip")
        AND EXISTS
-           "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kernel_qualification_gdn.cpp")
+           "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_kernel_qualification_gdn.cpp")
         luce_add_ggml_gpu_executable(
             test_kernel_qualification_gdn
-            test/test_kernel_qualification_gdn.cpp)
-        target_include_directories(
-            test_kernel_qualification_gdn PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+            test/unit/test_kernel_qualification_gdn.cpp)
         add_test(
             NAME kernel_qualification_gdn
             COMMAND test_kernel_qualification_gdn)
@@ -2744,13 +2802,13 @@ if(LUCE_TESTS)
     if((LUCE_GPU_BACKEND STREQUAL "cuda" OR
         LUCE_GPU_BACKEND STREQUAL "hip")
        AND EXISTS
-           "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kernel_qualification_moe_ds4.cpp")
+           "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_kernel_qualification_moe_ds4.cpp")
         add_executable(
             test_kernel_qualification_moe_ds4
-            test/test_kernel_qualification_moe_ds4.cpp)
+            test/unit/test_kernel_qualification_moe_ds4.cpp)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
             set_source_files_properties(
-                test/test_kernel_qualification_moe_ds4.cpp PROPERTIES LANGUAGE HIP)
+                test/unit/test_kernel_qualification_moe_ds4.cpp PROPERTIES LANGUAGE HIP)
             set_target_properties(
                 test_kernel_qualification_moe_ds4 PROPERTIES
                 HIP_ARCHITECTURES "${_luce_archs}")
@@ -2760,7 +2818,7 @@ if(LUCE_TESTS)
                 test_kernel_qualification_moe_ds4 PRIVATE hip::host)
         else()
             set_source_files_properties(
-                test/test_kernel_qualification_moe_ds4.cpp PROPERTIES LANGUAGE CUDA)
+                test/unit/test_kernel_qualification_moe_ds4.cpp PROPERTIES LANGUAGE CUDA)
             set_target_properties(
                 test_kernel_qualification_moe_ds4 PROPERTIES
                 CUDA_ARCHITECTURES "${_luce_archs}")
@@ -2769,7 +2827,6 @@ if(LUCE_TESTS)
         endif()
         target_include_directories(
             test_kernel_qualification_moe_ds4 PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/test
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda
@@ -2789,21 +2846,23 @@ if(LUCE_TESTS)
 
     if((LUCE_GPU_BACKEND STREQUAL "cuda" OR
         LUCE_GPU_BACKEND STREQUAL "hip")
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_batched_gdn.cpp")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_batched_gdn.cpp")
         luce_add_ggml_gpu_executable(
-            test_batched_gdn test/test_batched_gdn.cpp)
+            test_batched_gdn test/unit/test_batched_gdn.cpp)
         add_test(NAME batched_gdn COMMAND test_batched_gdn)
         add_test(NAME batched_gdn_cpu COMMAND test_batched_gdn --cpu)
+        set_tests_properties(batched_gdn_cpu PROPERTIES LABELS cpu)
+        list(APPEND _luce_cpu_test_targets test_batched_gdn)
         if(TARGET check)
             add_dependencies(check test_batched_gdn)
         endif()
     endif()
     if((LUCE_GPU_BACKEND STREQUAL "cuda" OR
         LUCE_GPU_BACKEND STREQUAL "hip")
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gdn_replay_log.cpp")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_gdn_replay_log.cpp")
         luce_add_ggml_gpu_executable(
             test_gdn_replay_log
-            test/test_gdn_replay_log.cpp)
+            test/unit/test_gdn_replay_log.cpp)
         add_test(NAME gdn_replay_log COMMAND test_gdn_replay_log)
         add_test(
             NAME gdn_replay_log_gallocr
@@ -2817,9 +2876,9 @@ if(LUCE_TESTS)
     endif()
     if((LUCE_GPU_BACKEND STREQUAL "cuda" OR
         LUCE_GPU_BACKEND STREQUAL "hip")
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_concat_transpose.cpp")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_concat_transpose.cpp")
         luce_add_ggml_gpu_executable(
-            test_concat_transpose test/test_concat_transpose.cpp)
+            test_concat_transpose test/unit/test_concat_transpose.cpp)
         add_test(NAME concat_transpose COMMAND test_concat_transpose)
         if(TARGET check)
             add_dependencies(check test_concat_transpose)
@@ -2827,9 +2886,9 @@ if(LUCE_TESTS)
     endif()
     if((LUCE_GPU_BACKEND STREQUAL "cuda" OR
         LUCE_GPU_BACKEND STREQUAL "hip")
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_paged_attention.cpp")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_paged_attention.cpp")
         luce_add_ggml_gpu_executable(
-            bench_paged_attention test/bench_paged_attention.cpp)
+            bench_paged_attention test/bench/bench_paged_attention.cpp)
     endif()
 endif()
 
@@ -2949,4 +3008,19 @@ if(LUCE_SERVER)
             target_link_libraries(backend_ipc_daemon PRIVATE hip::host)
         endif()
     endif()
+endif()
+
+if(LUCE_TESTS)
+    # `make check-cpu` — build only the CPU-safe test binaries, then run
+    # `ctest -L cpu`. The hosted CI job runs exactly this target.
+    if(_luce_cpu_test_targets)
+        add_custom_target(check-cpu
+            COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure -L cpu --no-tests=error
+            COMMENT "Building and running the CPU-only unit subset"
+            USES_TERMINAL)
+        add_dependencies(check-cpu ${_luce_cpu_test_targets})
+    endif()
+    unset(_luce_cpu_test_targets)
+    unset(_luce_cpu_ctest_names)
+    unset(_luce_cpu_cppunit_targets)
 endif()

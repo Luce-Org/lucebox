@@ -5,10 +5,10 @@
 // laguna_backend.cpp; protocol plumbing lives in daemon_loop.cpp.
 //
 // Invoked from two places:
-//   - test/test_dflash.cpp: arch dispatch — when the GGUF reports
+//   - test/unit/test_dflash.cpp: arch dispatch — when the GGUF reports
 //     `general.architecture == "laguna"`, main() builds a LagunaDaemonArgs
 //     and calls run_laguna_daemon().
-//   - test/test_laguna_daemon.cpp: thin CLI wrapper for the NIAH driver.
+//   - test/unit/test_laguna_daemon.cpp: thin CLI wrapper for the NIAH driver.
 
 #include "laguna_daemon.h"
 #include "laguna_backend.h"

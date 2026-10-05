@@ -89,6 +89,6 @@ Build with the ROCm CI flags, then run both routes and the comparator:
 ```
 ctest -R '^test_paged_attn_wmma$'                     # V_DOT2
 ctest -R '^paged_attn_wmma_route$'                    # LUCE_PAGED_WMMA=1
-python3 server/test/compare_paged_attn.py \
+python3 server/test/bench/compare_paged_attn.py \
     paged_attn_out_vdot2.bin paged_attn_out_wmma.bin
 ```

@@ -25,7 +25,7 @@ Deliberately NOT aligned:
 
 Token parity: both engines feed tok[i] = (i*7919+13) % n_vocab for a
 length-S prefill (upstream: qwen4exp_upstream_nodes.cpp; ours:
-server/test/smoke_qwen4exp_forward.cpp). The upstream dumper always prints
+server/test/smoke/smoke_qwen4exp_forward.cpp). The upstream dumper always prints
 a TOKENS line with its first/last ids and vocab; the harness recomputes the
 recipe using the vocab size our binary reports and cross-checks. Our smoke
 binary does not print its token ids, so ours' ids are a source-verified

@@ -34,16 +34,14 @@ jobs:
       - name: Lint Python surfaces touched by lucebox tooling
         run: uv run --frozen --extra dev ruff check .
 
-      - name: Test DS4 benchmark tools
-        run: uv run --frozen --extra dev pytest -q harness/tests/test_ds4_benchmark_tools.py
+      - name: Python unit tests (no GPU/server/model required)
+        # Includes .github/ci. server/model/slow-marked tests need a running
+        # luce_server or local model files; no CI job runs them yet, so run
+        # them by hand with --base-url/--launch.
+        run: uv run --frozen --extra dev pytest -q -m "not server and not model and not slow"
 
-      - name: Test concurrency benchmark tools and runners
-        run: uv run --frozen --extra dev pytest -q harness/benchmarks/concurrency
-
-      - name: Lint and test CI helper scripts
-        run: |
-          find .github/ci -name '*.py' -print0 | xargs -0 uv run --frozen --extra dev ruff check
-          uv run --frozen --extra dev pytest -q .github/ci
+      - name: Lint CI helper scripts
+        run: find .github/ci -name '*.py' -print0 | xargs -0 uv run --frozen --extra dev ruff check
 
   build:
     name: Build (cmake + uv sync --extra megakernel)
@@ -88,21 +86,16 @@ jobs:
             -DLUCE_ENABLE_BSA=OFF \
             -DLUCE_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
+          # Compile-only coverage for GPU/model tests the hosted runner can't run.
           cmake --build build --target \
-            test_dflash test_generate test_flash_attn_sparse test_server_unit \
-            test_deepseek4_unit test_feature_gate test_seq_slot_manager \
-            test_seq_engine_contract test_seq_batch_plan test_client_send_buffer \
-            test_paged_kv_pool test_rope_tail test_blocking_row_pool \
-            test_model_smoke test_batched_gdn test_concat_transpose \
-            test_kernel_qualification_core test_kernel_qualification_gdn \
-            test_kernel_qualification_moe_ds4 test_cuda_copy_batch -j$(nproc)
+            test_dflash test_generate test_flash_attn_sparse test_model_smoke \
+            test_concat_transpose test_kernel_qualification_gdn \
+            test_kernel_qualification_moe_ds4 -j$(nproc)
 
-      - name: Run C++ server unit tests
-        run: |
-          cd server/build
-          ctest --output-on-failure \
-            -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer|paged_kv_pool|blocking_row_pool|rope_tail|batched_gdn_cpu|test_kernel_qualification_core|test_cuda_copy_batch\." \
-            --no-tests=error
+      - name: Build and run C++ CPU unit tests
+        # check-cpu builds every test labeled `cpu` in CMakeLists.txt and runs
+        # `ctest -L cpu`, so a new CPU-safe test needs no edit here.
+        run: cmake --build server/build --target check-cpu -j$(nproc)
 
       - name: Populate venv with cu128 torch + setuptools
         # First pass: install the workspace's default deps. luce declares
@@ -485,7 +478,7 @@ jobs:
       - name: Run Windows platform smoke test
         working-directory: server
         shell: cmd
-        run: ctest --test-dir build -R "^platform_compat$" --output-on-failure
+        run: ctest --test-dir build -R "^test_platform_compat[.]" --output-on-failure --no-tests=error
 
       - name: Verify build outputs
         shell: pwsh

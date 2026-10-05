@@ -2,8 +2,8 @@
 // at the two Engram layers (released checkpoint: 1 and 14).
 //
 // Addressing and the table read are tested bit-exact against the reference
-// (test/test_ds4_engram.cpp), the apply against the reference math on the
-// released weights (tests/test_deepseek4_unit.cpp); see docs/DS41.md.
+// (test/unit/test_ds4_engram.cpp), the apply against the reference math on the
+// released weights (test/unit/test_deepseek4_unit.cpp); see docs/DS41.md.
 //
 // Three pieces, kept independent of the graph so each can be tested alone:
 //   1. addressing: the last four compressed token ids hash to `cols` rows per
