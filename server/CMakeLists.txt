@@ -1653,11 +1653,11 @@ if(LUCE_TESTS)
     add_test(NAME test_ds41_mxfp8_gpu COMMAND test_ds41_mxfp8 gpu)
     set_tests_properties(test_ds41_mxfp8_gpu PROPERTIES SKIP_RETURN_CODE 77)
     # Kernel timing/exactness for the DS4.1 routed-expert decode matvec (not a pass/fail test).
-    add_executable(bench_ds41_iq_mmid test/bench_ds41_iq_mmid.cpp)
+    add_executable(bench_ds41_iq_mmid test/bench/bench_ds41_iq_mmid.cpp)
     target_link_libraries(bench_ds41_iq_mmid PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
-    add_executable(test_ds41_mmid_width_invariance test/test_ds41_mmid_width_invariance.cpp)
+    add_executable(test_ds41_mmid_width_invariance test/unit/test_ds41_mmid_width_invariance.cpp)
     target_link_libraries(test_ds41_mmid_width_invariance PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp3_mix_registry.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_rocmfp3_mix_registry.cpp")
         # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
         # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
         # which left the qtype-105/106 numerics verified on gfx1151 alone.
@@ -1890,7 +1890,7 @@ if(LUCE_TESTS)
     target_include_directories(test_moe_expert_slot_stride PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
     target_link_libraries(test_moe_expert_slot_stride PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     add_test(NAME test_moe_expert_slot_stride COMMAND test_moe_expert_slot_stride)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_laguna_daemon.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_laguna_daemon.cpp")
         add_executable(test_laguna_daemon test/unit/test_laguna_daemon.cpp)
         target_include_directories(test_laguna_daemon PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(test_laguna_daemon PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
