@@ -887,6 +887,13 @@ static __global__ void mul_mat_vec_q(
         NO_DEVICE_CODE;
         return;
     }
+    // The multi-row block is a wave32 kernel (DPP / permlanex16 exchanges, 32-lane
+    // row schedule); the host only launches it on wave32 parts, and a wave64
+    // target (gfx9) compiles it to an inert stub.
+    if constexpr (c_row_warps > 1 && warp_size != 32) {
+        NO_DEVICE_CODE;
+        return;
+    }
 #if defined(GGML_USE_HIP)
     // threadIdx.y is wave-uniform here; readfirstlane makes the row, and so
     // the weight and dst addressing, scalar.
@@ -902,14 +909,13 @@ static __global__ void mul_mat_vec_q(
     // Multi-row IQ2_XXS / IQ3_XXS blocks decode from a shared-memory grid
     // table (see the fixed-K loop) and reduce with warp_reduce_sum_wave32_dpp.
     constexpr bool iq_shared_grid = (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS) &&
-        fixed_ncols_x > 0 && c_row_warps > 1;
+        fixed_ncols_x > 0 && c_row_warps > 1 && warp_size == 32;
 #if defined(GGML_USE_HIP)
     constexpr bool iq2xxs_levels = true;
 #else
     constexpr bool iq2xxs_levels = false;
 #endif // defined(GGML_USE_HIP)
-    static_assert(!iq_shared_grid || (ncols_dst == 1 && warp_size == 32),
-                  "the IQ shared-grid path is a one-column wave32 kernel");
+    static_assert(!iq_shared_grid || ncols_dst == 1, "the IQ shared-grid path is a one-column kernel");
 
     static_assert(fixed_ncols_x == 0 ||
                   type == GGML_TYPE_Q3_0_ROCMFPX ||
@@ -2737,8 +2743,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
         // activation load and the per-wave prologue, grid fill and barrier.
         constexpr int iq_row_warps = 8;
         constexpr int iq_wave_rows = 2;
-        if (GGML_CUDA_CC_IS_AMD(cc) && ncols_dst == 1 && nrows_x % (iq_row_warps*iq_wave_rows) == 0 &&
-            calc_nwarps(type, 1, table_id) == 1 && !should_use_small_k(1)) {
+        // Mirrors the kernel's own guards (wave32, one wave and one row per
+        // table): a mismatch is declined here rather than launching a stub.
+        if (GGML_CUDA_CC_IS_AMD(cc) && warp_size == 32 && ncols_dst == 1 &&
+            nrows_x % (iq_row_warps*iq_wave_rows) == 0 &&
+            calc_nwarps(type, 1, table_id) == 1 && calc_rows_per_block(1, table_id, false, 1) == 1 &&
+            !should_use_small_k(1)) {
             if (ncols_x == 5120) {
                 mul_mat_vec_rocmfpx_fixed_k_launch<type, 5120, iq_row_warps, iq_wave_rows>(
                     vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,

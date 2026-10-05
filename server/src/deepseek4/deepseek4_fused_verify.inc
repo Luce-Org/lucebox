@@ -574,6 +574,11 @@ static bool ds4_build_fused_verify_graph(
     // position mod 4 == 3; a tokenwise lane emits at most one.
     const int n_lanes = paged_mode ? 1 : ds4_fused_attention_lanes(w, q);
     const int attn_lane_q = q / n_lanes;
+    // Tokenwise lanes keep the six routed experts in one owner graph (see the
+    // routed FFN below); LUCE_DS4_TP_HEAD4_TAIL2=1 restores the 4 + 2
+    // decomposition for bisection.
+    static const bool legacy_head4_tail2 = ds4_env_flag("LUCE_DS4_TP_HEAD4_TAIL2");
+    const bool whole_routes_for_lanes = n_lanes > 1 && !legacy_head4_tail2;
     const int64_t comp_slots = 2 * (int64_t) w.n_layer * n_lanes;
     fg.i32_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, comp_slots);
     ggml_set_input(fg.i32_bundle);
@@ -1270,12 +1275,10 @@ static bool ds4_build_fused_verify_graph(
             // differing cache bytes appear at layer 1 of the first verify;
             // with whole routes the q=3 verify and q=1 decode are bit-identical).
             // LUCE_DS4_TP_HEAD4_TAIL2=1 restores the decomposition for bisection.
-            static const bool legacy_head4_tail2 =
-                ds4_env_flag("LUCE_DS4_TP_HEAD4_TAIL2");
             const bool native_route_width =
                 !same_gpu_runtime ||
                 mixed_policy.native_route_width || streamed ||
-                (n_lanes > 1 && !legacy_head4_tail2);
+                whole_routes_for_lanes;
             if (lane_q > 1 && hybrid_cfg.n_expert_used > 4 && has_hot_routed &&
                 !native_route_width) {
                 const int route_width = hybrid_cfg.n_expert_used;

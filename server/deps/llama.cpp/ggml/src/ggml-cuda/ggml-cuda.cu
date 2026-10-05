@@ -1983,7 +1983,11 @@ static void ggml_cuda_op_mul_mat_cublas(
         row_diff == src0->ne[1] &&
         dst->op_params[0] == GGML_PREC_DEFAULT;
 
-    if (src0->type == GGML_TYPE_MXFP8) {
+    // MXFP8 past the GEMV width (mxfp8.cu keeps F32 activations up to 8 columns):
+    // exact BF16 decode of the weights, activations rounded to BF16 for the GEMM
+    // (a prefill-width path, not the decode/verify one). Without BF16 GEMM
+    // support the generic F32 dequantize + SGEMM path below serves it.
+    if (src0->type == GGML_TYPE_MXFP8 && supports_bf16) {
         GGML_ASSERT(ggml_is_contiguous(src0) && row_diff == src0->ne[1]);
         ggml_cuda_pool_alloc<nv_bfloat16> src0_as_bf16(ctx.pool(id), row_diff*ne00);
         ggml_get_to_bf16_cuda(GGML_TYPE_MXFP8)(src0_dd_i, src0_as_bf16.get(), row_diff*ne00, stream);
@@ -3151,9 +3155,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
     const bool grouped_src = ggml_mul_mat_is_grouped_src(dst);
     if (src0->type == GGML_TYPE_MXFP8) {
-        // Native FP8 dense weights: decode exactly, never quantize the activations. Small
-        // column counts use the register-decode GEMV; wider batches dequantize to BF16
-        // (exact) for a BF16 GEMM with F32 accumulation and output.
+        // Native FP8 dense weights, decoded exactly. Up to 8 columns the register-decode
+        // GEMV takes F32 activations (decode and verify); wider batches dequantize the
+        // weights to BF16 (exact) and round the activations to BF16 for a BF16 GEMM with
+        // F32 accumulation (prefill), or fall back to F32 SGEMM without BF16 support.
         GGML_ASSERT(!split && "MXFP8 does not support split buffers");
         GGML_ASSERT(!grouped_src && "MXFP8 has no grouped-source path");
         if (ggml_cuda_mxfp8_mul_mat_vec_supported(src0, src1, dst)) {
@@ -3432,8 +3437,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         if (ne2 <= MMVQ_MAX_MOE_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 // Batch-invariant mode (DS4.1 verification) keeps every small batch on MMVQ, whose per-token
-                // single-column path reproduces decode exactly; MMQ would reduce in another order.
-                if (ne2 <= mmvq_mmid_max || ggml_cuda_mmvq_batch_invariant_enabled) {
+                // single-column path reproduces decode exactly; MMQ would reduce in another order. Types with no
+                // MMVQ case at all (mmvq_mmid_max == 0, the mix formats) keep their own dispatch below.
+                if (ne2 <= mmvq_mmid_max || (ggml_cuda_mmvq_batch_invariant_enabled && mmvq_mmid_max > 0)) {
                     log_dispatch("mmvq");
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
