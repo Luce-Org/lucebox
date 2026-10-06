@@ -3945,64 +3945,38 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_HC_COMBINE_NORM: {
             const int64_t n_embd = dst->ne[0], hc = dst->ne[1], n_tokens = dst->ne[2];
             float * base = (float *) dst->data;
-            auto it = g_hc_marked_xn.find(dst);
+            ggml_cuda_hc_combine_norm_args a{};
+            a.inject   = dst->src[0];
+            a.residual = dst->src[1];
+            a.gamma    = dst->src[3];
             if (ggml_get_op_params_i32(dst, 5) == 1) {
                 // MoE mode: src2 = routed down rows, src4 = route weights, src5 = shared expert, src6 = shared gate logit.
-                ggml_cuda_hc_combine_norm_args a{};
-                a.inject       = dst->src[0];
-                a.residual     = dst->src[1];
-                a.gamma        = dst->src[3];
                 a.moe_down     = dst->src[2];
                 a.moe_w        = dst->src[4];
                 a.moe_shared   = dst->src[5];
                 a.moe_sh_logit = dst->src[6];
                 a.moe_down_f16 = ggml_cuda_mmb_is_f16_only(dst->src[2]);
-                ggml_tensor res_t = *dst;
-                res_t.ne[3] = 1; res_t.data = base; res_t.view_src = nullptr;
-                ggml_tensor xn_t = res_t;
-                xn_t.data = base + (size_t) n_embd * hc * n_tokens;
-                a.out_res = &res_t;
-                const bool marked = it != g_hc_marked_xn.end();
-                a.out_xn       = marked ? const_cast<ggml_tensor *>(it->second) : &xn_t;
-                a.out_xn_bf16  = marked ? (uint16_t *) it->second->data : nullptr;
-                a.store_xn_f32 = !marked;
-                if (marked && g_hc_q8_xn.count(dst)) a.out_q8 = ggml_cuda_mmb_q8_reserve(ctx, it->second, ggml_cuda_mmb_w8a8_tile_bytes((int) n_tokens, (int) (n_embd * hc)));
-                a.s1 = ggml_get_op_params_f32(dst, 0);
-                a.b1 = ggml_get_op_params_f32(dst, 1);
-                a.s2 = ggml_get_op_params_f32(dst, 2);
-                a.b2 = ggml_get_op_params_f32(dst, 3);
-                a.eps = ggml_get_op_params_f32(dst, 4);
-                ggml_cuda_op_hc_combine_norm(ctx, a);
-            } else if (it != g_hc_marked_xn.end()) {
-                // xn is bf16-only: write that channel to the mmb cache and skip its f32 form.
-                ggml_cuda_hc_combine_norm_args a{};
-                a.inject    = dst->src[0];
-                a.residual  = dst->src[1];
-                a.block_out = dst->src[2];
-                a.gamma     = dst->src[3];
-                a.out_xn    = const_cast<ggml_tensor *>(it->second);
-                ggml_tensor res_t = *dst;
-                res_t.ne[3]     = 1;
-                res_t.nb[3]     = dst->nb[3];
-                res_t.data      = base;
-                res_t.view_src  = nullptr;
-                a.out_res = &res_t;
-                a.out_xn_bf16  = (uint16_t *) a.out_xn->data;   // in place; consumers read bf16 from here
-                a.store_xn_f32 = false;
-                if (g_hc_q8_xn.count(dst)) a.out_q8 = ggml_cuda_mmb_q8_reserve(ctx, it->second, ggml_cuda_mmb_w8a8_tile_bytes((int) n_tokens, (int) (n_embd * hc)));
-                a.s1 = ggml_get_op_params_f32(dst, 0);
-                a.b1 = ggml_get_op_params_f32(dst, 1);
-                a.s2 = ggml_get_op_params_f32(dst, 2);
-                a.b2 = ggml_get_op_params_f32(dst, 3);
-                a.eps = ggml_get_op_params_f32(dst, 4);
-                ggml_cuda_op_hc_combine_norm(ctx, a);
             } else {
-                ggml_cuda_hc_combine_norm_ptrs(ctx, dst->src[0], dst->src[1], dst->src[2], dst->src[3],
-                    base, base + (size_t) n_embd * hc * n_tokens, n_embd, hc, n_tokens,
-                    ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1),
-                    ggml_get_op_params_f32(dst, 2), ggml_get_op_params_f32(dst, 3),
-                    ggml_get_op_params_f32(dst, 4));
+                a.block_out = dst->src[2];
             }
+            ggml_tensor res_t = *dst;
+            res_t.ne[3] = 1; res_t.data = base; res_t.view_src = nullptr;
+            ggml_tensor xn_t = res_t;
+            xn_t.data = base + (size_t) n_embd * hc * n_tokens;
+            a.out_res = &res_t;
+            // A marked xn is bf16-only: write that channel in place (consumers read bf16 there) and skip its f32 form.
+            auto it = g_hc_marked_xn.find(dst);
+            const bool marked = it != g_hc_marked_xn.end();
+            a.out_xn       = marked ? const_cast<ggml_tensor *>(it->second) : &xn_t;
+            a.out_xn_bf16  = marked ? (uint16_t *) it->second->data : nullptr;
+            a.store_xn_f32 = !marked;
+            if (marked && g_hc_q8_xn.count(dst)) a.out_q8 = ggml_cuda_mmb_q8_reserve(ctx, it->second, ggml_cuda_mmb_w8a8_tile_bytes((int) n_tokens, (int) (n_embd * hc)));
+            a.s1 = ggml_get_op_params_f32(dst, 0);
+            a.b1 = ggml_get_op_params_f32(dst, 1);
+            a.s2 = ggml_get_op_params_f32(dst, 2);
+            a.b2 = ggml_get_op_params_f32(dst, 3);
+            a.eps = ggml_get_op_params_f32(dst, 4);
+            ggml_cuda_op_hc_combine_norm(ctx, a);
         } break;
 #endif // defined(GGML_USE_HIP)
         case GGML_OP_GROUP_NORM:
