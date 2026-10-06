@@ -137,7 +137,6 @@ ggml_cuda_qwen4exp_profile ggml_backend_cuda_set_qwen4exp_profile(ggml_cuda_qwen
 }
 
 bool ggml_cuda_qwen4exp_enabled() { return qwen4exp_profile == GGML_CUDA_QWEN4EXP_DEFAULT; }
-bool ggml_cuda_qwen4exp_reference() { return qwen4exp_profile == GGML_CUDA_QWEN4EXP_REFERENCE; }
 
 bool ggml_backend_cuda_qwen4exp_supported(ggml_backend_t backend) {
 #if defined(GGML_USE_HIP)
@@ -3447,20 +3446,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
-    } else if (!split && ggml_cuda_qwen4exp_reference()
-            && src0->ne[1] == 1 && src1->ne[1] > MMVF_MAX_BATCH_SIZE && dst->ne[2] == 1 && dst->ne[3] == 1
-            && src0->type == GGML_TYPE_F32
-            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
-            && ggml_cuda_should_use_mmvf(src1->type, cc, src1->ne, src1->nb, 1)) {
-        // Upstream swaps vector-times-matrix into MMVF. IQ4_NL's F32 shared
-        // expert gate needs the same reduction order for exact comparison.
-        ggml_tensor dst_vec = *dst;
-        dst_vec.ne[0] = src1->ne[1];
-        dst_vec.ne[1] = 1;
-        dst_vec.nb[1] = dst_vec.nb[0]*src1->ne[1];
-        dst_vec.nb[2] = dst_vec.nb[1];
-        dst_vec.nb[3] = dst_vec.nb[1];
-        ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
     } else if (!split && use_mul_mat_f) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_vec_q) {
@@ -5148,7 +5133,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     }
 
     // ROPE (multi-section, F32) -> PERMUTE -> CONT: the rope writes its rows straight into the CONT layout (qwen4exp Q
-    // for flash attention). Addresses change, values do not. Off for the reference graph.
+    // for flash attention). Addresses change, values do not. qwen4exp graphs only.
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ROPE && ops.begin()[1] == GGML_OP_PERMUTE && ops.begin()[2] == GGML_OP_CONT &&
         ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
         const ggml_tensor * rope = cgraph->nodes[node_idx];
@@ -5156,7 +5141,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * cont = cgraph->nodes[node_idx + 2];
         const int mode = ggml_get_op_params_i32(rope, 2);
         const int outputs[] = { node_idx + 2 };
-        return !ggml_cuda_qwen4exp_reference() && (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION && !(mode & GGML_ROPE_TYPE_TAIL) &&
+        return ggml_cuda_qwen4exp_enabled() && (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION && !(mode & GGML_ROPE_TYPE_TAIL) &&
             rope->type == GGML_TYPE_F32 && rope->src[0]->type == GGML_TYPE_F32 && rope->src[0]->ne[3] == 1 &&
             perm->src[0] == rope && ggml_get_op_params_i32(perm, 0) == 0 &&
             cont->src[0] == perm && cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont) &&

@@ -4041,7 +4041,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 
-    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING || (amd_wmma_available(cc) && !(GGML_CUDA_CC_IS_RDNA3(cc) && DKQ == 256 && DV == 256)) || Q->ne[1] <= 32/ncols2) {
+    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING || amd_wmma_available(cc) || Q->ne[1] <= 32/ncols2) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
@@ -4101,22 +4101,6 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
             return;
         } else {
             GGML_ABORT("fatal error");
-        }
-    }
-
-    // Qwen4Exp GQA=12 uses four heads per tile upstream, not a padded group of eight.
-    if (GGML_CUDA_CC_IS_RDNA3(cc) && DKQ == 256 && DV == 256 && use_gqa_opt) {
-        if (gqa_ratio % 8 == 0) {
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
-            return;
-        }
-        if (gqa_ratio % 4 == 0) {
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
-            return;
-        }
-        if (gqa_ratio % 2 == 0) {
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
-            return;
         }
     }
 
@@ -4538,20 +4522,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // Use the WMMA kernel if possible:
-    // Match upstream's RDNA3.5 head-256 selection without altering RDNA4 paths.
-    int rdna3_gqa_eff = 1;
-    while (rdna3_gqa_eff < 8 && gqa_ratio % (2*rdna3_gqa_eff) == 0) rdna3_gqa_eff *= 2;
-    // Upstream parity mode (its K/V cache is padded to 256) or an explicit LUCE_FA256_MMA=1 opt-in
-    // (test_fattn_mma256); QSA callers keep their shipped path.
-    static const bool rdna3_fa256 = [] {
-        const char * mma = getenv("LUCE_FA256_MMA");
-        return mma && atoll(mma) != 0;
-    }();
-    if ((ggml_cuda_qwen4exp_reference() || rdna3_fa256) && GGML_CUDA_CC_IS_RDNA3_5(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256 &&
-        Q->ne[1] * rdna3_gqa_eff > 32) {
-        return BEST_FATTN_KERNEL_MMA_F16;
-    }
-
     // On RDNA4 the rocWMMA kernel is not qualified (fragment layouts do not
     // match the hand-rolled softmax reductions), so it is reachable only
     // through the env-gated head-256 block below.
