@@ -965,8 +965,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.model_name.c_str());
         return 2;
     }
-    if (bargs.max_concurrency > 1)
-        bargs.paged_attention = true;
+    if (bargs.max_concurrency > 1) bargs.paged_attention = true;
     if (sconfig.decode_kv_offload_bytes &&
         sconfig.decode_kv_offload_bytes != kAutoKvOffloadBytes && bargs.max_concurrency <= 1) {
         std::fprintf(stderr, "[server] --decode-kv-offload-mb requires --max-concurrency greater than 1\n");

@@ -280,14 +280,13 @@ std::string check_feature_compatibility(
         }
     }
 
-    // ── --max-concurrency × model sequence-engine support
-    // Concurrent decode slots are implemented by model-specific engines, all
-    // of which currently use paged K/V. The common scheduler does not
-    // require a particular model-state representation; each backend owns
-    // whatever per-slot state its graph needs alongside one block-table
-    // column per sequence. Everything the paged cluster above rejects is
-    // transitively rejected, so the rules here are only about the flag pair
-    // itself.
+    // ── --max-concurrency × paged attention
+    // Concurrent decode slots are implemented by model-specific paged
+    // backends. The common scheduler does not require a particular
+    // model-state representation; each backend owns whatever per-slot state
+    // its graph needs alongside one block-table column per sequence.
+    // Everything the paged cluster above rejects is transitively rejected,
+    // so the rules here are only about the flag pair itself.
     if (args.max_concurrency < 1) {
         return "--max-concurrency must be at least 1";
     }
