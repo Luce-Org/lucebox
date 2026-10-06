@@ -5018,9 +5018,9 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                // Leaf inputs can be recycled after their unfused last use too
-                // (e.g. RoPE positions reused by the following CONT).
-                if (!src) {
+                // qwen4exp graphs also check leaf inputs: they can be recycled after
+                // their unfused last use (e.g. RoPE positions reused by the following CONT).
+                if (!src || (src->op == GGML_OP_NONE && !ggml_cuda_qwen4exp_enabled())) {
                     continue;
                 }
 
@@ -5565,7 +5565,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // start of fusion operations
                 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
                 if (!disable_fusion) {
-                    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+                    const bool qwen4exp_rdna35 = ggml_cuda_qwen4exp_enabled() &&
+                        GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc);
+                    if (qwen4exp_rdna35) {
                         if (node->op == GGML_OP_CONCAT) {
                             ggml_cuda_ple_conv_match pm;
                             if (ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) {
@@ -5600,7 +5602,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #if defined(GGML_USE_HIP)
                     // HC gate GEMM + mix reduce fold; must precede the generic SIGMOID fusion below.
-                    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+                    if (qwen4exp_rdna35) {
                         ggml_cuda_hc_mix_args hma;
                         if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() && i + 1 < cgraph->n_nodes) {
                             const ggml_tensor * w  = node->src[0];
@@ -5977,8 +5979,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
 
                     // Bit-exact replacement for the two-kernel GDN normalization.
-                    // Qualified for RDNA3.5 and 128-wide rows.
-                    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                    // Qualified for qwen4exp on RDNA3.5 and 128-wide rows.
+                    if (qwen4exp_rdna35 &&
                         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
                         ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
@@ -7218,7 +7220,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // CUDA/HIP allocations are aligned, but views can start between
             // float4 boundaries. GGML folds nested views into view_offs, which
             // is available even before the scheduler allocates their buffers.
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[0] % 4 == 0 &&
                    op->src[0]->view_offs % sizeof(float4) == 0 &&
                    op->src[0]->nb[1] % sizeof(float4) == 0 &&

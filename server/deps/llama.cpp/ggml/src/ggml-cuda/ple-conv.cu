@@ -147,6 +147,8 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
     std::vector<int> indices, outputs{silu};
     std::vector<ggml_op> ops;
     for (int n = i; n <= silu; ++n) {
+        // The tap views of the conv weight compute nothing and view a weight outside the graph; the kernel reads m.w.
+        if (cgraph->nodes[n]->op == GGML_OP_VIEW && cgraph->nodes[n]->view_src == wroot) continue;
         indices.push_back(n); ops.push_back(cgraph->nodes[n]->op);
         if ((n < first_tap && (cgraph->nodes[n]->op == GGML_OP_CPY ||
              std::find(checkpoint_dsts.begin(), checkpoint_dsts.end(), cgraph->nodes[n]) != checkpoint_dsts.end())) ||

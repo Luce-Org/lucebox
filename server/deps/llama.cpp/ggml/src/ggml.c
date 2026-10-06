@@ -8638,10 +8638,6 @@ static int ggml_node_list_find_tensor(const struct ggml_cgraph * cgraph,
     return -1;
 }
 
-static bool ggml_is_constant(const struct ggml_tensor * tensor) {
-    return tensor->buffer != NULL && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && (tensor->flags & GGML_TENSOR_FLAG_PARAM) == 0;
-}
-
 bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
                                 const int *                node_idxs,
                                 int                        count,
@@ -8687,11 +8683,10 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
             return false;
         }
 
-        // if node is a view, check if the view_src and all its parent view_srcs are within the subgraph.
-        // external view sources are allowed only for weight tensors, which are constant for this graph execution.
+        // if node is a view, check if the view_src and all it's parent view_srcs are within the subgraph
         struct ggml_tensor * view_src = node->view_src;
         while (view_src) {
-            if (ggml_node_list_find_tensor(cgraph, node_idxs, count, view_src) == -1 && !ggml_is_constant(view_src)) {
+            if (ggml_node_list_find_tensor(cgraph, node_idxs, count, view_src) == -1) {
                 return false;
             }
             view_src = view_src->view_src;
