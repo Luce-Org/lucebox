@@ -109,6 +109,9 @@ typedef sycl::half2 ggml_half2;
 #define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
 #define QR_MXFP4 2
 
+#define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
+#define QR_MXFP8 1
+
 #define QI_NVFP4 (QK_NVFP4 / (4 * QR_NVFP4))
 #define QR_NVFP4 2
 
@@ -220,6 +223,22 @@ typedef struct {
     uint8_t qs[QK_MXFP4/2];
 } block_mxfp4;
 static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+
+// MXFP8: 256 E4M3 codes with one E8M0 scale per 32 consecutive weights of a row.
+// value = E4M3(qs[i]) * 2^(e[i/32] - 127). Row-blocked, so the DS4.1 checkpoint's
+// 32x32 weight blocks convert losslessly by repeating each block's scale on its rows.
+// The 8 scales come first so the codes are 8-byte aligned in every block.
+#define QK_MXFP8 256
+typedef struct {
+    uint8_t e[QK_MXFP8/32]; // E8M0
+    uint8_t qs[QK_MXFP8];   // E4M3 (bias 7, no inf; 0x7f/0xff are NaN and rejected)
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == QK_MXFP8/32 + QK_MXFP8, "wrong mxfp8 block size/padding");
+// Exact decode: E4M3 bits reinterpreted as FP16 are the value * 2^-8 (sub-normals included),
+// so value * 2^(e-127) = fp16(GGML_MXFP8_F16_BITS(code)) * 2^(e-119). e <= 246 keeps that scale finite.
+#define GGML_MXFP8_F16_BITS(code) ((uint16_t)((((uint32_t)(code) & 0x80u) << 8) | (((uint32_t)(code) & 0x7fu) << 7)))
+#define GGML_MXFP8_SCALE_BITS(e) ((uint32_t)((uint32_t)(e) + 8u) << 23)
+#define GGML_MXFP8_MAX_E 246
 
 #define QK_NVFP4 64
 #define QK_NVFP4_SUB 16  // sub-block size for per-group scales

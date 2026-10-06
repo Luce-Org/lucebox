@@ -7,6 +7,10 @@
 
 #include <cstdlib>
 
+// On HIP the K loops below are unrolled (the "K-loop unroll" pragmas) so the
+// loads of several stride-block_size trips issue back to back instead of
+// paying one load latency per trip. Each column's FMA chain keeps its order,
+// so results are unchanged.
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
         const T * __restrict__ x, const float * __restrict__ y, const int32_t * __restrict__ ids, const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
@@ -136,6 +140,9 @@ static __global__ void mul_mat_vec_f(
             }
         }
 
+#if defined(GGML_USE_HIP) // K-loop unroll
+#pragma unroll 8
+#endif
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
             const float2 tmpx = x2[col2];
             float2 tmpx_gate = make_float2(0.0f, 0.0f);
@@ -169,6 +176,9 @@ static __global__ void mul_mat_vec_f(
         }
 
         if (std::is_same_v<type_acc, float>) {
+#if defined(GGML_USE_HIP) // K-loop unroll
+#pragma unroll 8
+#endif
             for (int col2 = tid; col2 < ncols2; col2 += block_size) {
                 const float2 tmpx = __half22float2(x2[col2]);
                 float2 tmpx_gate = make_float2(0.0f, 0.0f);
@@ -196,6 +206,9 @@ static __global__ void mul_mat_vec_f(
             half2 sumh2[ncols_dst] = {{0.0f, 0.0f}};
             half2 sumh2_gate[ncols_dst] = {{0.0f, 0.0f}};
 
+#if defined(GGML_USE_HIP) // K-loop unroll
+#pragma unroll 8
+#endif
             for (int col2 = tid; col2 < ncols2; col2 += block_size) {
                 const half2 tmpx = x2[col2];
                 half2 tmpx_gate = make_half2(0.0f, 0.0f);
@@ -244,6 +257,9 @@ static __global__ void mul_mat_vec_f(
                 gate_x2 = (const int *) gate_x;
             }
         }
+#if defined(GGML_USE_HIP) // K-loop unroll
+#pragma unroll 8
+#endif
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
             const int tmpx = x2[col2];
             int tmpx_gate = 0;
@@ -278,6 +294,9 @@ static __global__ void mul_mat_vec_f(
                 gate_x2 = (const nv_bfloat162 *) gate_x;
             }
         }
+#if defined(GGML_USE_HIP) // K-loop unroll
+#pragma unroll 8
+#endif
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
             const nv_bfloat162 tmpx = x2[col2];
             nv_bfloat162 tmpx_gate;

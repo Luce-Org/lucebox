@@ -17,6 +17,7 @@
 #include "common/peer_access.h"
 #include "common/platform_env.h"
 #include "common/sampler.h"
+#include "common/dspark_head.h"
 #include "common/moe_hybrid_expert_cache.h"
 #include "common/moe_hybrid_routing_stats.h"
 
@@ -1809,12 +1810,13 @@ bool DeepSeek4Backend::load_routing_adjustments() {
 // the router bias delta and the protected mask on the device.
 bool DeepSeek4Backend::upload_protected_routing() {
     if (w_.protected_experts.empty() || w_.router_bias_delta.empty()) return true;
-    const ggml_init_params params{2 * (size_t) w_.n_layer * ggml_tensor_overhead(), nullptr, true};
+    const ggml_init_params params{3 * (size_t) w_.n_layer * ggml_tensor_overhead(), nullptr, true};
     w_.routing_ctx = ggml_init(params);
     if (!w_.routing_ctx) return false;
     for (DeepSeek4Layer & L : w_.layers) {
         L.native_selection_bias = ggml_new_tensor_1d(w_.routing_ctx, GGML_TYPE_F32, w_.n_expert);
         L.protected_mask = ggml_new_tensor_1d(w_.routing_ctx, GGML_TYPE_I32, w_.n_expert);
+        L.router_bias_delta_dev = ggml_new_tensor_1d(w_.routing_ctx, GGML_TYPE_F32, w_.n_expert);
     }
     w_.routing_buf = ggml_backend_alloc_ctx_tensors(w_.routing_ctx, backend_);
     if (!w_.routing_buf) {
@@ -1833,6 +1835,8 @@ bool DeepSeek4Backend::upload_protected_routing() {
         }
         ggml_backend_tensor_set(L.native_selection_bias, bias.data(), 0, sizeof(float) * bias.size());
         ggml_backend_tensor_set(L.protected_mask, mask.data(), 0, sizeof(int32_t) * mask.size());
+        ggml_backend_tensor_set(L.router_bias_delta_dev, w_.router_bias_delta.data() + row, 0,
+                                sizeof(float) * (size_t) w_.n_expert);
     }
     return true;
 }
@@ -2178,7 +2182,11 @@ bool DeepSeek4Backend::load_model() {
                  w_.mixed_mmq_policy == GGML_MIXED_MMQ_DISABLED ? "disabled" :
                  "backend default");
     w_.fused_decode = cfg_.fused_decode && !moe_hybrid_;
-    w_.fused_verify_f16_kv = cfg_.fused_verify_f16_kv && !moe_hybrid_;
+    w_.fused_verify_f16_kv = (cfg_.fused_verify_f16_kv && !moe_hybrid_) ||
+        (moe_hybrid_ && env_flag_enabled("LUCE_DS4_HYBRID_F16_VERIFY_KV"));
+    if (moe_hybrid_ && w_.fused_verify_f16_kv) {
+        std::fprintf(stderr, "[deepseek4] hybrid tier: F16 verify K/V on (LUCE_DS4_HYBRID_F16_VERIFY_KV)\n");
+    }
     if (cfg_.fused_decode && moe_hybrid_) {
         std::fprintf(stderr,
                      "[deepseek4] fused decode unavailable with hybrid expert placement; "
@@ -2305,7 +2313,158 @@ bool DeepSeek4Backend::load_spec_drafter() {
     return true;
 }
 
+// LUCE_DS4_DRAFT_SWAP with the drafter on the target GPU: mirror it and size
+// the long-prompt chunk as if it were absent. A no-op without the switch,
+// without a drafter on the target or without room for the pinned mirror;
+// false only when the sizing fails.
+bool DeepSeek4Backend::setup_draft_swap() {
+    // Requests run one at a time here: paged (concurrent) serving loads no
+    // drafter, so no other sequence can be decoding while it is swapped out.
+    if (!env_flag_enabled("LUCE_DS4_DRAFT_SWAP") || cfg_.paged_attention || !spec_drafter_ ||
+        !moe_hybrid_ || spec_drafter_->core.backend != backend_ || !draft_swap_prepare()) {
+        return true;
+    }
+    DraftSwap & s = draft_swap_;
+    s.cap_with = hybrid_prefill_chunk_cap_;
+    hybrid_prefill_chunk_cap_ = 0;
+    prefill_sizing_extra_free_ = s.size;
+    const bool sized = size_hybrid_prefill_chunk();
+    prefill_sizing_extra_free_ = 0;
+    s.cap_without = hybrid_prefill_chunk_cap_;
+    hybrid_prefill_chunk_cap_ = s.cap_with;
+    if (!sized) return false;
+    std::fprintf(stderr, "[deepseek4] draft swap: prefill chunk cap %d with the drafter, "
+                 "%d with it swapped out (0 = uncapped)\n", s.cap_with, s.cap_without);
+    return true;
+}
+
+bool DeepSeek4Backend::draft_swap_prepare() {
+    DraftSwap & s = draft_swap_;
+    if (s.host) return true;
+    if (!spec_drafter_ || !spec_drafter_->core.buf || !spec_drafter_->core.ctx) return false;
+    ggml_backend_buffer_t dev = spec_drafter_->core.buf;
+    s.buft = ggml_backend_buffer_get_type(dev);
+    s.usage = ggml_backend_buffer_get_usage(dev);
+    s.size = ggml_backend_buffer_get_size(dev);
+    s.host = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), s.size);
+    if (!s.host) {
+        std::fprintf(stderr, "[deepseek4] draft swap: pinned host mirror of %.2f GiB failed\n",
+                     s.size / 1073741824.0);
+        return false;
+    }
+    char * base = (char *) ggml_backend_buffer_get_base(dev);
+    char * hbase = (char *) ggml_backend_buffer_get_base(s.host);
+    for (ggml_tensor * t = ggml_get_first_tensor(spec_drafter_->core.ctx); t;
+         t = ggml_get_next_tensor(spec_drafter_->core.ctx, t)) {
+        if (t->buffer != dev || !t->data) continue;
+        if (t->view_src) { s.views.push_back(t); continue; }
+        const size_t off = (size_t) ((char *) t->data - base);
+        ggml_backend_tensor_get(t, hbase + off, 0, ggml_nbytes(t));
+        s.tensors.push_back({t, off});
+    }
+    std::fprintf(stderr, "[deepseek4] draft swap: %.2f GiB of DSpark weights mirrored in pinned "
+                 "host memory (%zu tensors)\n", s.size / 1073741824.0, s.tensors.size());
+    return true;
+}
+
+// Decoder SWA bounded replay (LUCE_DS41_DECODER_BOUNDED_REPLAY=1). The
+// layers after the last kv source read the encoder only through that
+// source's compressed rows plus a raw window of their own, so every prompt
+// row runs the layers up to that source and only the final n_swa rows run
+// the rest, their raw window floored at the first replay row. Not exact:
+// V4.1 is trained to tolerate it (tech report, sec. 3.2.2).
+int DeepSeek4Backend::bounded_replay_cut() const {
+    static const bool requested = env_flag_enabled("LUCE_DS41_DECODER_BOUNDED_REPLAY");
+    if (!requested) return -1;
+    int cut = -1;
+    for (int il = 0; il < w_.n_layer; ++il) {
+        // The cut is the deepest layer any layer reads its compressed KV
+        // from (V4.1: 20); the per-layer source flags may be unset.
+        cut = std::max(cut, deepseek4_kv_source_layer(w_, il));
+    }
+    for (int il = cut + 1; cut >= 0 && il < w_.n_layer; ++il) {
+        // Index sources after the cut (V4.1: 24-36) are fine: the cut layer
+        // publishes every row; only an Engram layer past it disables replay.
+        if (w_.layers[(size_t) il].engram_q) return -1;
+    }
+    return cut;
+}
+
+// Replay runs on the layer-range hybrid path's dense text prefill only, and
+// only when the drafter captures layers past the cut: the replay tail runs
+// the captured layers for the last rows alone.
+bool DeepSeek4Backend::bounded_replay_runs(bool images) const {
+    const int cut = bounded_replay_cut();
+    if (cut < 0 || cut + 1 >= w_.n_layer || images || !moe_hybrid_ ||
+        !(expert_runtime_.compute || expert_backend_) ||
+        cache_.prefill_mode != PrefillAttentionMode::Dense) {
+        return false;
+    }
+    if (spec_drafter_) {
+        for (int il : spec_drafter_->capture_layer_ids) {
+            if (il <= cut) return false;
+        }
+    }
+    return true;
+}
+
+bool DeepSeek4Backend::draft_swap_out() {
+    DraftSwap & s = draft_swap_;
+    if (s.out || !s.host || !spec_drafter_ || !spec_drafter_->core.buf) return false;
+    ggml_backend_synchronize(backend_);
+    // Cached DSpark graphs point into the buffer: drop them, and bump the
+    // drafter generation so none is reused after the swap-in.
+    reset_deepseek4_dspark_runtime_cache();
+    dspark_note_drafter_lifecycle();
+    ggml_backend_buffer_free(spec_drafter_->core.buf);
+    spec_drafter_->core.buf = nullptr;
+    for (auto & e : s.tensors) { e.first->buffer = nullptr; e.first->data = nullptr; }
+    for (ggml_tensor * v : s.views) { v->buffer = nullptr; v->data = nullptr; }
+    s.out = true;
+    return true;
+}
+
+bool DeepSeek4Backend::draft_swap_in() {
+    DraftSwap & s = draft_swap_;
+    if (!s.out) return true;
+    const auto t0 = Clock::now();
+    ggml_backend_buffer_t dev = ggml_backend_buft_alloc_buffer(s.buft, s.size);
+    if (!dev) {
+        std::fprintf(stderr, "[deepseek4] draft swap: device buffer of %.2f GiB unavailable\n",
+                     s.size / 1073741824.0);
+        return false;
+    }
+    ggml_backend_buffer_set_usage(dev, s.usage);
+    char * base = (char *) ggml_backend_buffer_get_base(dev);
+    const char * hbase = (const char *) ggml_backend_buffer_get_base(s.host);
+    for (auto & e : s.tensors) {
+        if (ggml_backend_tensor_alloc(dev, e.first, base + e.second) != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[deepseek4] draft swap: tensor placement failed\n");
+            for (auto & placed : s.tensors) { placed.first->buffer = nullptr; placed.first->data = nullptr; }
+            ggml_backend_buffer_free(dev);
+            return false;
+        }
+        ggml_backend_tensor_set(e.first, hbase + e.second, 0, ggml_nbytes(e.first));
+    }
+    for (ggml_tensor * v : s.views) ggml_backend_view_init(v);
+    spec_drafter_->core.buf = dev;
+    s.out = false;
+    reset_deepseek4_dspark_runtime_cache();
+    dspark_note_drafter_lifecycle();
+    std::fprintf(stderr, "[deepseek4] draft swap: DSpark weights restored in %.0f ms\n",
+                 elapsed_s(t0) * 1000.0);
+    return true;
+}
+
+// Forget the mirror before its drafter goes: its tensor pointers belong to
+// that drafter's context.
+void DeepSeek4Backend::draft_swap_release() {
+    if (draft_swap_.host) ggml_backend_buffer_free(draft_swap_.host);
+    draft_swap_ = DraftSwap{};
+}
+
 void DeepSeek4Backend::release_spec_drafter(bool mark_parked) {
+    draft_swap_release();
     if (spec_drafter_) {
         free_deepseek4_dspark_drafter(*spec_drafter_);
     }
@@ -2634,6 +2793,7 @@ bool DeepSeek4Backend::init() {
     }
     if (!init_streamed_expert_tier() || !check_device_headroom()) return false;
     if (!size_hybrid_prefill_chunk()) return false;
+    if (!setup_draft_swap()) return false;
     image_capable_ = vision_ != nullptr;
     return true;
 }
@@ -2803,9 +2963,10 @@ bool DeepSeek4Backend::size_hybrid_prefill_chunk() {
     const int chunk = std::max(1, cfg_.chunk > 0 ? cfg_.chunk : w_.n_swa);
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
     const HybridPrefillScratch per_token = hybrid_prefill_scratch_per_token(w_, max_ctx, chunk);
-    const auto fit = [](int device, size_t bytes, size_t fixed) {
+    const auto fit = [this](int device, size_t bytes, size_t fixed) {
         size_t free_b = 0, total_b = 0;
         ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+        if (device == cfg_.device.gpu) free_b += prefill_sizing_extra_free_;
         return hybrid_prefill_fit_tokens(free_b, ds4_device_headroom_bytes(device) / 2 + fixed, bytes);
     };
     {
@@ -3672,6 +3833,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
     if (moe_hybrid_ && !expert_cache_.ready() && !init_streamed_expert_tier()) return false;
     // The same post-load checks as init(): a restore that no longer fits fails.
     if (moe_hybrid_ && (!check_device_headroom() || !size_hybrid_prefill_chunk())) return false;
+    if (!draft_swap_.host && !setup_draft_swap()) return false;
     cache_.prefill_mode = cfg_.prefill_mode;
     return true;
 }
@@ -3916,6 +4078,36 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
 
     bool snapshot_saved = false;
     bool late_context_chunk_logged = false;
+    // Decoder SWA bounded replay (bounded_replay_cut). Prompts that save a
+    // snapshot before their end keep the exact path.
+    const int replay_cut = bounded_replay_cut();  // the last layer every prompt row runs
+    const int replay_from = n_total - w_.n_swa;  // prompt index of the first replay row
+    if (env_flag_enabled("LUCE_DS41_DECODER_BOUNDED_REPLAY")) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "[deepseek4] decoder bounded replay requested: cut=%d n_swa=%d n_layer=%d\n",
+                         replay_cut, w_.n_swa, w_.n_layer);
+        }
+    }
+    const bool replay = bounded_replay_runs(images != nullptr) &&
+        replay_from >= DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS &&
+        !(save_snapshot && snap_pos < kv_offset + n_total);
+    DeepSeek4LayerMajorTail replay_tail;
+    struct ReplayFloorReset {
+        DeepSeek4Cache * cache = nullptr;
+        ~ReplayFloorReset() {
+            if (cache) for (DeepSeek4LayerCache & lc : cache->layers) lc.swa_floor = 0;
+        }
+    } replay_floor_reset;
+    if (replay) {
+        replay_floor_reset.cache = &cache_;
+        std::fprintf(stderr,
+                     "[deepseek4] decoder bounded replay: %d rows through layers 0-%d, "
+                     "last %d through all %d (floor=%d)\n",
+                     replay_from, replay_cut, n_total - replay_from, w_.n_layer,
+                     kv_offset + replay_from);
+    }
     // The size of the chunk at prompt offset i (position pos): the scratch
     // bound, then every boundary a snapshot, a restore or a DSpark capture
     // needs.
@@ -3929,7 +4121,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         // there and a full 256-expert duplicate stack makes that tail far more
         // expensive than slightly rebalancing the preceding chunk.
         const int tail_tokens = n_total - (i + n_tok);
-        if (moe_hybrid_ && capture_spec &&
+        if (moe_hybrid_ && capture_spec && !replay &&
             tail_tokens > 0 && tail_tokens < 512 &&
             n_tok >= 1024 - tail_tokens) {
             n_tok -= 512 - tail_tokens;
@@ -3944,6 +4136,10 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         // every position a later request may restore from, so the chunks after
         // a restore are exactly the ones a cold prefill of the prompt runs.
         n_tok = restore_safe_prefill_tokens(pos, n_tok, restore_points);
+        // The replay rows start a chunk of their own.
+        if (replay && i < replay_from && i + n_tok > replay_from) {
+            n_tok = replay_from - i;
+        }
         if (capture_spec) {
             const bool batch_final_capture =
                 supports_batched_spec_feature_capture(
@@ -3953,6 +4149,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 save_snapshot && !snapshot_saved,
                 spec_snap_from, spec_snap_to);
         }
+        // The replay rows run as one batch: a split could leave a piece too
+        // small for the batched attention that models the floor.
+        if (replay && i >= replay_from) n_tok = n_total - i;
 
         return n_tok;
     };
@@ -3967,7 +4166,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         const bool capture = capture_spec &&
             (i + n_tok > spec_final_from ||
              (!snapshot_saved && i < spec_snap_to && i + n_tok > spec_snap_from));
-        return n_tok > 4 && i + n_tok < n_total && !at_snap && !capture;
+        return n_tok >= DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS && i + n_tok < n_total && !at_snap && !capture;
     };
     for (int i = 0; i < n_total;) {
         if (io.is_cancelled()) return pos;
@@ -3982,16 +4181,40 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 bands.push_back(n);
                 span += n;
             }
-            if (bands.size() >= 2) {
-                std::vector<float> embed((size_t) w_.n_embd * (size_t) span);
-                if (!w_.embedder.embed(tokens.data() + i, span, embed.data())) return -1;
+            // The replay rows ride along as the pass's last band for layers
+            // [0, cut]; the chunk below then runs only the layers past it.
+            const bool with_tail = replay && !bands.empty() &&
+                i + span == replay_from && n_total - replay_from >= DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS;
+            const int tail_rows = with_tail ? n_total - replay_from : 0;
+            // The tail joins the last band when it fits (one weight read per
+            // layer for both), else it is a band of its own.
+            const bool tail_merged = with_tail &&
+                bands.back() + tail_rows <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
+            if (tail_merged) bands.back() += tail_rows;
+            else if (with_tail) bands.push_back(tail_rows);
+            if (bands.size() >= 2 || (replay && !bands.empty())) {
+                const int pass_rows = span + tail_rows;
+                std::vector<float> embed((size_t) w_.n_embd * (size_t) pass_rows);
+                if (!w_.embedder.embed(tokens.data() + i, pass_rows, embed.data())) return -1;
                 DeepSeek4StepTelemetry step_tel;
+                replay_tail = DeepSeek4LayerMajorTail{};
+                replay_tail.rows = tail_rows;
                 if (!deepseek4_prefill_layer_major(
                         backend_, cfg_.device.gpu, w_, cache_, embed.data(), tokens.data() + i, pos,
                         bands, timing ? &step_tel : nullptr, moe_hybrid_.get(),
-                        expert_runtime_.compute ? &expert_runtime_ : nullptr, routing_stats_.get())) {
+                        expert_runtime_.compute ? &expert_runtime_ : nullptr, routing_stats_.get(),
+                        replay ? replay_cut + 1 : -1, with_tail ? &replay_tail : nullptr)) {
                     std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
                     return -1;
+                }
+                if (with_tail) {
+                    // The tail's rows have run layers [0, cut]; the chunk
+                    // below runs the rest from their residual.
+                    if (tail_merged) bands.back() -= tail_rows;
+                    else bands.pop_back();
+                    cache_.cur_pos = pos + span;
+                    std::fprintf(stderr, "[deepseek4] replay single pass: %d tail rows %s the last band\n",
+                                 tail_rows, tail_merged ? "merged into" : "after");
                 }
                 std::fprintf(stderr, "[deepseek4] layer-major prefill: %d tokens in %zu bands at pos=%d\n",
                              span, bands.size(), pos);
@@ -4106,11 +4329,23 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         static const bool affine_capture_enabled =
             env_flag_enabled("LUCE_CUDA_MMQ_FP2_AFFINE_CAPTURE");
         affine_mmq_scope.set_enabled(hp == nullptr || affine_capture_enabled);
+        const bool replay_chunk = replay && i >= replay_from;
+        for (int il = replay_cut + 1; replay_chunk && il < w_.n_layer; ++il) {
+            cache_.layers[(size_t) il].swa_floor = kv_offset + replay_from;
+        }
+        const bool tail_chunk = replay_chunk && replay_tail.rows == n_tok && i == replay_from;
+        DeepSeek4LayerMajorBand tail_band;
+        if (tail_chunk) {
+            tail_band.staggered_pre = &replay_tail.pre;
+            tail_band.selection_first = replay_tail.selection_first;
+            tail_band.selection_columns = replay_tail.selection_columns;
+            cache_.layer_major_band = &tail_band;
+        }
         if (layer_range_hybrid) {
             ok = deepseek4_step_layer_range(
                 backend_, cfg_.device.gpu, w_, cache_, hc_state,
-                embed.data(), n_tok, pos,
-                0, w_.n_layer, need_logits ? &logits : nullptr,
+                tail_chunk ? replay_tail.residual.data() : embed.data(), n_tok, pos,
+                tail_chunk ? replay_cut + 1 : 0, w_.n_layer, need_logits ? &logits : nullptr,
                 tokens.data() + i,
                 timing ? &step_tel : nullptr,
                 /*allow_decode_graph_reuse=*/true, hp,
@@ -4137,6 +4372,11 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                             /*moe_hybrid=*/nullptr, /*expert_runtime=*/nullptr,
                                             /*routing_stats=*/nullptr,
                                             images ? images->spans() : vision::ImageSpanView{});
+        }
+        cache_.layer_major_band = nullptr;
+        if (tail_chunk) replay_tail = DeepSeek4LayerMajorTail{};
+        for (int il = replay_cut + 1; replay_chunk && il < w_.n_layer; ++il) {
+            cache_.layers[(size_t) il].swa_floor = 0;
         }
         if (ok && hp && !spec_cap.empty()) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
@@ -4446,16 +4686,84 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     // snapshot. An exact full-prompt hit can decode immediately from the
     // logits and speculative feature window saved with the cache state.
     int committed = kv_offset;
-    if (kv_offset == 0) {
-        committed = do_prefill(req.prompt, out_io, 0,
-                               req.snap_slot, req.snap_pos, images,
-                               /*prefix_tokens=*/0, req.restore_points);
-    } else if (kv_offset < (int) req.prompt.size()) {
-        std::vector<int32_t> suffix(req.prompt.begin() + kv_offset,
-                                    req.prompt.end());
-        committed = do_prefill(suffix, out_io, kv_offset,
-                               req.snap_slot, req.snap_pos, nullptr,
-                               /*prefix_tokens=*/0, req.restore_points);
+    // With decoder SWA bounded replay, a snapshot inside the prompt splits
+    // the prefill at it: the part before ends at the snapshot (where replay
+    // completes the state the snapshot keeps) and the rest continues from
+    // there, both with replay, exactly as a later request that restores the
+    // snapshot would run. A prompt that saves no such snapshot runs whole.
+    const int prompt_end = (int) req.prompt.size();
+    const bool split_at_snapshot = bounded_replay_runs(images != nullptr) && req.snap_slot >= 0 &&
+        req.snap_pos > kv_offset && req.snap_pos < prompt_end;
+    const auto run_prefill = [&]() {
+        if (split_at_snapshot) {
+            const std::vector<int32_t> head(req.prompt.begin() + kv_offset,
+                                            req.prompt.begin() + req.snap_pos);
+            const int at = do_prefill(head, out_io, kv_offset, req.snap_slot, req.snap_pos,
+                                      nullptr, /*prefix_tokens=*/0, req.restore_points);
+            if (at != req.snap_pos) return at;
+            const std::vector<int32_t> rest(req.prompt.begin() + req.snap_pos, req.prompt.end());
+            return do_prefill(rest, out_io, req.snap_pos, /*snap_slot=*/-1, /*snap_pos=*/0,
+                              nullptr, /*prefix_tokens=*/0, req.restore_points);
+        }
+        if (kv_offset == 0) {
+            return do_prefill(req.prompt, out_io, 0,
+                              req.snap_slot, req.snap_pos, images,
+                              /*prefix_tokens=*/0, req.restore_points);
+        }
+        if (kv_offset < prompt_end) {
+            std::vector<int32_t> suffix(req.prompt.begin() + kv_offset,
+                                        req.prompt.end());
+            return do_prefill(suffix, out_io, kv_offset,
+                              req.snap_slot, req.snap_pos, nullptr,
+                              /*prefix_tokens=*/0, req.restore_points);
+        }
+        return kv_offset;
+    };
+    // The longest single prefill of this request (a split runs two).
+    const int prefill_tokens = split_at_snapshot
+        ? std::max(req.snap_pos - kv_offset, prompt_end - req.snap_pos)
+        : prompt_end - kv_offset;
+    // Prefills this long gain more from the drafter's memory than the ~1.4 s
+    // its weights take to come back (R9700 + Gorgon Halo: even at ~10K
+    // tokens, a win from 15K).
+    constexpr int kDraftSwapMinPrompt = 10240;
+    if (draft_swap_.host && !draft_swap_.out && prefill_tokens > kDraftSwapMinPrompt &&
+        draft_swap_out()) {
+        hybrid_prefill_chunk_cap_ = draft_swap_.cap_without;
+    }
+    committed = run_prefill();
+    // A pipelined hybrid prefill that ran out of device memory is retried
+    // once from the request's starting state with every disposable arena
+    // retired and the pipeline off (one band in flight, the same bands, so
+    // the same numerics), instead of failing the request. Other prefills
+    // fail as before.
+    if (committed < 0 && moe_hybrid_ && deepseek4_prefill_pipeline_bands() > 0 &&
+        !cache_.pipeline_off && !out_io.is_cancelled() && !images &&
+        (kv_offset == 0 || prefill_retry_slot_ >= 0)) {
+        deepseek4_release_retry_scratch(cache_, moe_hybrid_.get());
+        cache_.pipeline_off = true;
+        const bool restored = kv_offset == 0 || snapshot_restore(prefill_retry_slot_);
+        std::fprintf(stderr, "[deepseek4] prefill failed; retrying once from pos %d with the pipeline off%s\n",
+                     kv_offset, restored ? "" : " (snapshot restore failed)");
+        if (restored) committed = run_prefill();
+        // The first recovery is the expected one (the one-time allocations
+        // of the first long request): turn the pipeline back on once. A
+        // later failure keeps it off.
+        if (committed >= 0 && !pipeline_retry_recovered_) {
+            cache_.pipeline_off = false;
+            pipeline_retry_recovered_ = true;
+        }
+    }
+    if (draft_swap_.out) {
+        // Keep any sticky reduction of the swapped-out chunk, then bring the
+        // drafter back before decode. A failed swap-in decodes this request
+        // without the drafter; the next request tries again.
+        draft_swap_.cap_without = hybrid_prefill_chunk_cap_;
+        hybrid_prefill_chunk_cap_ = draft_swap_.cap_with;
+        deepseek4_release_prefill_scratch(cache_, moe_hybrid_.get());
+        if (!draft_swap_in()) {
+            std::fprintf(stderr, "[deepseek4] draft swap: this request decodes without DSpark\n");
+        }
     }
     if (committed < 0) {
         result.fail(GenerateErrorCode::PrefillFailed);
@@ -4514,7 +4822,8 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     // An image prompt whose last image leaves no captured text rows gives the
     // drafter no context to start from; decode that request plainly.
     const bool image_without_draft_context = req.images && spec_feat_window_.empty();
-    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 && !image_without_draft_context &&
+    if (spec_enabled_ && spec_drafter_ && !draft_swap_.out && req.n_gen > 0 &&
+        !image_without_draft_context &&
         !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
         if (last_logits_.empty()) {
             result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill logits");
@@ -4923,7 +5232,9 @@ GenerateResult DeepSeek4Backend::restore_and_generate_impl(
         result.fail(GenerateErrorCode::BackendSpecific, "snapshot restore");
         return result;
     }
+    prefill_retry_slot_ = slot;
     result = generate_from_state(req, io, snap_pos);
+    prefill_retry_slot_ = -1;
     if (result.ok()) result.restored_prefix_tokens = snap_pos;
     return result;
 }

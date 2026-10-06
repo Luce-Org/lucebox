@@ -234,6 +234,23 @@ static void test_moe_expert_major_default_threshold() {
     TEST_ASSERT(!moe_cold_input_first_policy_enabled(true, true, true));
 }
 
+static void test_pipeline_parts_follow_each_band() {
+    std::fprintf(stderr, "  test_pipeline_parts_follow_each_band ...");
+    using Parts = std::vector<int>;
+    // Equal parts of each band, the remainder rows first; short bands whole.
+    TEST_ASSERT(deepseek4_pipeline_parts({4096, 4096, 1000}, 2) == (Parts{2048, 2048, 2048, 2048, 500, 500}));
+    TEST_ASSERT(deepseek4_pipeline_parts({129, 127, 5}, 2) == (Parts{65, 64, 127, 5}));
+    TEST_ASSERT(deepseek4_pipeline_parts({1000}, 4) == (Parts{250, 250, 250, 250}));
+    TEST_ASSERT(deepseek4_pipeline_parts({200}, 4) == (Parts{67, 67, 66}));
+    // A pass that starts at a restore point splits its bands exactly as the
+    // cold pass over the whole prompt splits the same bands.
+    const Parts cold = deepseek4_pipeline_parts({2048, 2048, 2048, 1500}, 2);
+    const Parts warm = deepseek4_pipeline_parts({2048, 1500}, 2);
+    TEST_ASSERT(cold.size() >= warm.size() &&
+                std::equal(warm.begin(), warm.end(), cold.end() - (std::ptrdiff_t) warm.size()));
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 struct DeepSeek4FixtureOptions {
     bool include_vocab_size = true;
     uint32_t vocab_size = 128;
@@ -9010,6 +9027,7 @@ int main(int argc, char ** argv) {
     test_paged_cache_allocation(backend);
     test_compressor_pooling_correctness(backend);
     test_moe_expert_major_default_threshold();
+    test_pipeline_parts_follow_each_band();
     test_chunked_graph_allocator(backend);
     test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);

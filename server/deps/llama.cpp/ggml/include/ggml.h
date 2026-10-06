@@ -443,7 +443,8 @@ extern "C" {
         GGML_TYPE_Q3_1_ROCMFP3_MIX  = 105, // per-expert mixed absmax/adaptive ROCmFP3 (P4); codebook in GGUF KV
         GGML_TYPE_Q2_1_ROCMFP2_MIX  = 106, // per-expert mixed absmax/adaptive ROCmFP2 (gate/up); codebook in sidecar
         GGML_TYPE_Q2_0_ROCMFP2      = 107,
-        GGML_TYPE_COUNT   = 108,
+        GGML_TYPE_MXFP8   = 117, // E4M3 codes + one E8M0 scale per 32; 264 B per 256 weights (lossless for DS4.1 native FP8)
+        GGML_TYPE_COUNT   = 118,
     };
 
     // precision
@@ -2888,6 +2889,34 @@ extern "C" {
             struct ggml_tensor  * hc_state,
             int                   n_hc,
             float                 pre_scale);
+
+    // ggml_ds4_router_select: DS4 top-k routing from router logits [n_expert, T]:
+    // sqrt(softplus(logit)) + bias, top-k descending; with native_bias and
+    // protected_mask, a token whose native top-k holds a protected expert keeps
+    // the native selection. -> I32 [k, T]
+    GGML_API struct ggml_tensor * ggml_ds4_router_select(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * native_bias,
+            struct ggml_tensor  * protected_mask,
+            int                   k);
+    // ggml_ds4_router_weights: probs of the selected experts normalised by their
+    // clamped sum, times scale. -> F32 [k, T]
+    GGML_API struct ggml_tensor * ggml_ds4_router_weights(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * selected,
+            float                 clamp_min,
+            float                 scale);
+    // ggml_ds4_hc_collapse: dst[d, t] = sum_h hc[d + h*n_embd, t] * pre[h, t],
+    // rounded as mul, permute and sum_rows round it.
+    // hc: F32 [n_embd*n_hc, T] (nb0 = 4), pre: F32 [n_hc, T] (nb0 = 4) -> F32 [n_embd, T].
+    GGML_API struct ggml_tensor * ggml_ds4_hc_collapse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * hc,
+            struct ggml_tensor  * pre,
+            int                   n_hc);
 
     // Official DS4 ratio-4 indexer transform. Each contiguous 128-wide F32
     // row is Hadamard-rotated and passed through the model's blockwise FP4

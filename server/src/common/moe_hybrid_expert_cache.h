@@ -60,6 +60,14 @@ struct MoeExpertCacheOptions {
 
 class MoeStreamedExpertCache;
 
+// Byte stride between expert slots of one role (gate, up or down). Every layer
+// reads the shared slots through a view whose expert stride is this value, and
+// the matvec kernels index experts in whole quant blocks (stride / type size),
+// so it must be a multiple of the block size of every type that shares the
+// role: the largest expert rounded up to the least common multiple of those
+// sizes. With one type this is the largest expert itself.
+size_t moe_expert_slot_stride(size_t largest_expert_bytes, const std::vector<size_t> & type_sizes);
+
 // Resolves a device graph's streamed routes without returning control to the
 // host. Per layer the graph posts its route ids to host-mapped memory
 // (ggml_host_mailbox_post) and later waits for the answer

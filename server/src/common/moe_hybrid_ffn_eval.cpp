@@ -2799,6 +2799,25 @@ bool moe_expert_major_prefill_enabled(int n_tokens) {
         n_tokens, enabled, min_tokens);
 }
 
+bool moe_split_owner_device_join_enabled() {
+    static const bool enabled = []() {
+        const char * raw = std::getenv("LUCE_DS4_SPLIT_DEVICE_JOIN");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+// LUCE_MOE_SIDE_COPY=1: another device's owner input crosses on the
+// producer's side stream (ggml_backend_cuda_copy_tensor_async_side), so the
+// producer keeps computing while it is in flight.
+static bool side_copy_enabled() {
+    static const bool enabled = []() {
+        const char * raw = std::getenv("LUCE_MOE_SIDE_COPY");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
 // Expert-major prefill groups prompt rows by expert so the quantized GEMMs can
 // reuse each expert's weights.  Keep the inverse permutation and route weights
 // on the owner GPU as well: gathering the packed rows back to route-major order
@@ -2833,6 +2852,28 @@ static bool full_cold_parallel_enabled() {
     return enabled;
 }
 
+// Host partial of an owner whose output goes to a device join tensor; the
+// owner never fills it.
+static std::vector<float> & unused_host_partial() {
+    static thread_local std::vector<float> v;
+    return v;
+}
+
+bool MoeDeferredColdJoin::wait(std::string * err_out) {
+    if (!future.valid()) return true;
+    bool ok = false;
+    try {
+        ok = future.get();
+    } catch (...) {
+        ok = false;
+    }
+    if (!ok && err_out && err) *err_out = *err;
+    future = {};
+    keep.reset();
+    err = nullptr;
+    return ok;
+}
+
 static bool cold_input_first_enabled() {
     static const bool enabled = []() {
         const char * raw = std::getenv("LUCE_MOE_COLD_INPUT_FIRST");
@@ -2850,6 +2891,16 @@ static bool batched_peer_copies_enabled() {
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
+}
+
+// LUCE_DS4_GROUPED_HYBRID_PREFILL sends owner stacks whose down projection is
+// ROCmFP2 too through the grouped MUL_MAT_ID prefill graph (default off):
+// 1 = the secondary (cold) owner only, 2 = both owners. Any nonzero value
+// also gives every owner's expert-major prefill the SWIGLU_DS4 split op and
+// the fused combine, whatever its down type (same arithmetic).
+static int grouped_fp2_down_prefill_mode() {
+    static const int mode = env_int_or_default("LUCE_DS4_GROUPED_HYBRID_PREFILL", 0);
+    return mode;
 }
 
 static bool eval_moe_owner_expert_major_batched(
@@ -2873,7 +2924,13 @@ static bool eval_moe_owner_expert_major_batched(
     ggml_tensor *                   device_output = nullptr,
     ggml_backend_t                  device_output_owner = nullptr,
     ggml_gallocr_t *                p_alloc = nullptr,
-    const std::function<void()> &   input_ready = {}) {
+    const std::function<void()> &   input_ready = {},
+    ggml_backend_event_t            device_output_done = nullptr) {
+    // The secondary (cold) owner: its input comes from, or its output goes
+    // to, another device (the input may be staged on its own device first).
+    const bool secondary_owner =
+        (cur_backend_owner && cur_backend_owner != backend) ||
+        (device_output_owner && device_output_owner != backend);
     const int n_embd = cfg.n_embd;
     const int n_used = cfg.n_expert_used;
     const int n_ff = cfg.n_ff_exp;
@@ -2931,7 +2988,12 @@ static bool eval_moe_owner_expert_major_batched(
           up_tensor->type == GGML_TYPE_Q2_0_ROCMFP2) ||
          (gate_up_tensor &&
           gate_up_tensor->type == GGML_TYPE_Q2_0_ROCMFP2)) &&
-        down_tensor->type == GGML_TYPE_Q3_0_ROCMFPX;
+        (down_tensor->type == GGML_TYPE_Q3_0_ROCMFPX ||
+         // All-ROCmFP2 experts (DS4.1 ROCMFP2S): the same grouped
+         // MUL_MAT_ID graph instead of one sliced matmul chain per expert.
+         (down_tensor->type == GGML_TYPE_Q2_0_ROCMFP2 &&
+          (grouped_fp2_down_prefill_mode() >= 2 ||
+           (grouped_fp2_down_prefill_mode() == 1 && secondary_owner))));
     const bool use_grouped_mmid = grouped_mmid_types && []() {
         const char * raw = std::getenv("LUCE_MOE_GROUPED_MMID_PREFILL");
         return !raw || !*raw || std::strcmp(raw, "0") != 0;
@@ -3002,7 +3064,12 @@ static bool eval_moe_owner_expert_major_batched(
                 mixed_mmq(ggml_mul_mat_id(ctx, gate_tensor, cur_3d, local_ids_tensor), cfg.mixed_mmq_policy), desc.ffn_gate_exps_s);
             ggml_tensor * up_e = apply_scale2(ctx,
                 mixed_mmq(ggml_mul_mat_id(ctx, up_tensor, cur_3d, local_ids_tensor), cfg.mixed_mmq_policy), desc.ffn_up_exps_s);
-            gu = swiglu_maybe_clamped(ctx, gate_e, up_e, cfg.swiglu_clamp);
+            // With the type-107 grouped prefill on, express the clamped SwiGLU
+            // as one SWIGLU_DS4 op so the backend can pair gate/up over one
+            // gather and fold the GLU into the up epilogue (same arithmetic).
+            gu = grouped_fp2_down_prefill_mode() > 0 && cfg.swiglu_clamp > 1.0e-6f
+                ? ggml_swiglu_ds4_split(ctx, gate_e, up_e, cfg.swiglu_clamp)
+                : swiglu_maybe_clamped(ctx, gate_e, up_e, cfg.swiglu_clamp);
         }
 
         ggml_tensor * down_e = apply_scale2(ctx,
@@ -3014,7 +3081,9 @@ static bool eval_moe_owner_expert_major_batched(
         }
 
         ggml_tensor * combined_out = nullptr;
-        if (moe_hybrid_graph_policy().fused_combine) {
+        // The type-107 grouped prefill takes the fused combine on its own
+        // (prefill only; decode keeps LUCE_MOE_FUSED_COMBINE's choice).
+        if (moe_hybrid_graph_policy().fused_combine || grouped_fp2_down_prefill_mode() > 0) {
             // The production expert-major MMID path used to materialize the
             // weighted route tensor, transpose it, reduce it, and finally add
             // the shared expert. Reduce the owner-local routes directly from
@@ -3036,7 +3105,14 @@ static bool eval_moe_owner_expert_major_batched(
         }
 
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, 256, false);
-        if (device_output) {
+        // An output on another owner's device is copied after compute on the
+        // source stream (as the sliced path does), never written in-graph.
+        // (Only under LUCE_DS4_SPLIT_DEVICE_JOIN; otherwise the in-graph copy
+        // is kept exactly as before.)
+        const bool device_output_local = device_output &&
+            (!moe_split_owner_device_join_enabled() ||
+             !device_output_owner || device_output_owner == backend);
+        if (device_output_local) {
             ggml_tensor * copy = ggml_cpy(ctx, combined_out, device_output);
             ggml_set_output(copy);
             ggml_build_forward_expand(gf, copy);
@@ -3073,8 +3149,14 @@ static bool eval_moe_owner_expert_major_batched(
 
         if (cur_backend) {
             if (cur_backend_owner) {
-                ggml_backend_tensor_copy_async(
-                    cur_backend_owner, backend, cur_backend, inp);
+                // A side-stream copy reads the routed input after this call
+                // returns: callers join this owner before they route again.
+                const bool side_copied = cur_backend_owner != backend && side_copy_enabled() &&
+                    ggml_backend_cuda_copy_tensor_async_side(cur_backend_owner, backend, cur_backend, inp);
+                if (!side_copied) {
+                    ggml_backend_tensor_copy_async(
+                        cur_backend_owner, backend, cur_backend, inp);
+                }
             } else {
                 ggml_backend_tensor_copy(cur_backend, inp);
             }
@@ -3106,7 +3188,23 @@ static bool eval_moe_owner_expert_major_batched(
             return false;
         }
 
-        if (!device_output) {
+        if (device_output && !device_output_local) {
+            // With a done event the output's owner waits on it when it reads
+            // the output, not at an arbitrary point of its stream now.
+            if (!device_output_done ||
+                !ggml_backend_cuda_copy_tensor_async_nowait(
+                    backend, device_output_owner, combined_out, device_output)) {
+                ggml_backend_tensor_copy_async(
+                    backend, device_output_owner, combined_out, device_output);
+                ggml_backend_synchronize(device_output_owner);
+            }
+            if (device_output_done) {
+                ggml_backend_event_record(device_output_done, backend);
+                // The next owner on this device writes its inputs into the
+                // shared arena outside this stream: let the copy finish.
+                ggml_backend_synchronize(backend);
+            }
+        } else if (!device_output) {
             out.resize((size_t)n_embd * (size_t)n_tokens);
             ggml_backend_tensor_get(combined_out, out.data(), 0,
                                     sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
@@ -3742,7 +3840,119 @@ bool eval_moe_hybrid_ffn_batched(
                          n_tokens, n_hot_stack, n_cold_stack);
             logged = true;
         }
+        const bool device_join = moe_split_owner_device_join_enabled() &&
+            device_outputs && device_outputs->valid() && cur_backend;
         const auto wall_t0 = HybridClock::now();
+        MoeDeferredColdJoin * defer =
+            device_join && device_outputs->defer && !device_outputs->defer->pending() &&
+            device_outputs->defer->input && device_outputs->defer->done &&
+            device_outputs->defer->input->ne[0] == cfg.n_embd &&
+            device_outputs->defer->input->ne[1] >= n_tokens
+                ? device_outputs->defer : nullptr;
+        // The deferred cold owner's input: a view of the slot's staging tensor
+        // on the cold device, filled now on the producer's side stream.
+        struct DeferredCold {
+            MoeHybridConfig cfg;
+            MoeLayerDesc desc;
+            std::vector<int32_t> ids;
+            std::vector<float> weights;
+            std::vector<float> partial;
+            std::string err;
+            ggml_context * view_ctx = nullptr;
+            ggml_tensor * input = nullptr;
+            ~DeferredCold() { if (view_ctx) ggml_free(view_ctx); }
+        };
+        std::shared_ptr<DeferredCold> deferred;
+        if (defer) {
+            deferred = std::make_shared<DeferredCold>();
+            ggml_init_params vp{};
+            vp.mem_size = 2 * ggml_tensor_overhead();
+            vp.no_alloc = true;
+            deferred->view_ctx = ggml_init(vp);
+            ggml_tensor * view = deferred->view_ctx
+                ? ggml_view_2d(deferred->view_ctx, defer->input, cfg.n_embd, n_tokens,
+                               defer->input->nb[1], 0)
+                : nullptr;
+            if (view && ggml_backend_view_init(view) == GGML_STATUS_SUCCESS &&
+                ggml_backend_cuda_copy_tensor_async_side(gpu_backend, storage.cold_backend,
+                                                         cur_backend, view)) {
+                deferred->input = view;
+            } else {
+                defer = nullptr;  // no staging copy: join in this call
+            }
+        }
+        // A cold owner joined in this call still runs behind a pending one:
+        // one owner at a time drives the cold device.
+        if (!defer && device_outputs && device_outputs->defer && device_outputs->defer->after &&
+            device_outputs->defer->after->pending()) {
+            device_outputs->defer->after->future.wait();
+        }
+        if (defer) {
+            auto ctx = deferred;
+            ctx->cfg = cfg;
+            ctx->desc = desc;
+            const size_t n_routes = (size_t) n_tokens * (size_t) cfg.n_expert_used;
+            ctx->ids.assign(selected_ids, selected_ids + n_routes);
+            ctx->weights.assign(selected_weights, selected_weights + n_routes);
+            MoeHybridLayerStorage * st = &storage;
+            ggml_tensor * cold_dst = device_outputs->cold;
+            ggml_backend_t cold_dst_owner = device_outputs->backend;
+            const bool eager = heterogeneous_prefill_eager_enabled(p_cold_alloc != nullptr);
+            const int n_tok = n_tokens;
+            const std::shared_future<bool> after =
+                defer->after && defer->after->pending() ? defer->after->future
+                                                        : std::shared_future<bool>{};
+            ggml_backend_event_t done = defer->done;
+            defer->future = std::async(std::launch::async,
+                [ctx, st, cold_dst, cold_dst_owner, p_cold_alloc, eager, n_tok, after, done]() {
+                    if (after.valid() && !after.get()) {
+                        ctx->err = "the preceding cold owner failed";
+                        return false;
+                    }
+                    bool ok = false;
+                    try {
+                        ScopedCudaGraphOverrides graph_scope(eager);
+                        ok = eval_moe_owner_expert_major_batched(
+                            st->cold_backend, ctx->cfg, ctx->desc,
+                            st->gate_cold, st->up_cold, st->down_cold,
+                            st->gate_up_cold, st->cold_local_by_global,
+                            /*cur_host=*/nullptr, ctx->ids.data(), ctx->weights.data(), n_tok,
+                            /*include_shared=*/false, ctx->partial, &ctx->err,
+                            ctx->input, st->cold_backend, cold_dst, cold_dst_owner,
+                            p_cold_alloc, /*input_ready=*/{}, done);
+                    } catch (...) {
+                        ctx->err = "deferred cold owner threw";
+                        ok = false;
+                    }
+                    return ok;
+                }).share();
+            defer->keep = ctx;
+            defer->err = &ctx->err;
+            const auto hot_t0 = HybridClock::now();
+            std::string hot_err_text;
+            const bool hot_ok = eval_moe_owner_expert_major_batched(
+                gpu_backend, cfg, desc,
+                storage.gate_hot, storage.up_hot, storage.down_hot,
+                storage.gate_up_hot, storage.hot_local_by_global,
+                cur_host, selected_ids, selected_weights, n_tokens,
+                /*include_shared=*/true, unused_host_partial(), &hot_err_text,
+                cur_backend, gpu_backend,
+                device_outputs->hot, device_outputs->backend,
+                p_hot_alloc);
+            if (!hot_ok) {
+                std::string cold_err_text;
+                defer->wait(&cold_err_text);
+                if (err) *err = "hot owner failed (pipelined): " + hot_err_text;
+                return false;
+            }
+            out.clear();
+            if (telemetry) {
+                const auto hot_t1 = HybridClock::now();
+                telemetry->hot_us += elapsed_us(hot_t0, hot_t1);
+                telemetry->ffn_wall_us += elapsed_us(wall_t0, hot_t1);
+            }
+            return true;
+        }
         std::vector<float> hot_partial;
         std::vector<float> cold_partial;
         std::string hot_err;
@@ -3767,7 +3977,9 @@ bool eval_moe_hybrid_ffn_batched(
                     storage.gate_up_cold, storage.cold_local_by_global,
                     cur_host, selected_ids, selected_weights, n_tokens,
                     /*include_shared=*/false, cold_partial, &cold_err,
-                    cur_backend, gpu_backend, nullptr, nullptr,
+                    cur_backend, gpu_backend,
+                    device_join ? device_outputs->cold : nullptr,
+                    device_join ? device_outputs->backend : nullptr,
                     p_cold_alloc, signal_cold_input);
             });
             cold_input_ready->wait();
@@ -3784,7 +3996,9 @@ bool eval_moe_hybrid_ffn_batched(
                     storage.gate_up_cold, storage.cold_local_by_global,
                     cur_host, selected_ids, selected_weights, n_tokens,
                     /*include_shared=*/false, cold_partial, &cold_err,
-                    cur_backend, gpu_backend, nullptr, nullptr,
+                    cur_backend, gpu_backend,
+                    device_join ? device_outputs->cold : nullptr,
+                    device_join ? device_outputs->backend : nullptr,
                     p_cold_alloc);
             });
         }
@@ -3795,7 +4009,9 @@ bool eval_moe_hybrid_ffn_batched(
             storage.gate_up_hot, storage.hot_local_by_global,
             cur_host, selected_ids, selected_weights, n_tokens,
             /*include_shared=*/true, hot_partial, &hot_err,
-            cur_backend, gpu_backend, nullptr, nullptr,
+            cur_backend, gpu_backend,
+            device_join ? device_outputs->hot : nullptr,
+            device_join ? device_outputs->backend : nullptr,
             p_hot_alloc);
         const auto hot_t1 = HybridClock::now();
         const bool cold_ok = cold_future.get();
@@ -3806,10 +4022,14 @@ bool eval_moe_hybrid_ffn_batched(
             }
             return false;
         }
-        const size_t total = (size_t)cfg.n_embd * (size_t)n_tokens;
-        out.resize(total);
-        for (size_t i = 0; i < total; ++i) {
-            out[i] = hot_partial[i] + cold_partial[i];
+        if (!device_join) {
+            const size_t total = (size_t)cfg.n_embd * (size_t)n_tokens;
+            out.resize(total);
+            for (size_t i = 0; i < total; ++i) {
+                out[i] = hot_partial[i] + cold_partial[i];
+            }
+        } else {
+            out.clear();
         }
         if (telemetry) {
             telemetry->hot_us += elapsed_us(hot_t0, hot_t1);

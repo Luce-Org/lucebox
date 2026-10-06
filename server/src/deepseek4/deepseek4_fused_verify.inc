@@ -574,6 +574,11 @@ static bool ds4_build_fused_verify_graph(
     // position mod 4 == 3; a tokenwise lane emits at most one.
     const int n_lanes = paged_mode ? 1 : ds4_fused_attention_lanes(w, q);
     const int attn_lane_q = q / n_lanes;
+    // Tokenwise lanes keep the six routed experts in one owner graph (see the
+    // routed FFN below); LUCE_DS4_TP_HEAD4_TAIL2=1 restores the 4 + 2
+    // decomposition for bisection.
+    static const bool legacy_head4_tail2 = ds4_env_flag("LUCE_DS4_TP_HEAD4_TAIL2");
+    const bool whole_routes_for_lanes = n_lanes > 1 && !legacy_head4_tail2;
     const int64_t comp_slots = 2 * (int64_t) w.n_layer * n_lanes;
     fg.i32_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, comp_slots);
     ggml_set_input(fg.i32_bundle);
@@ -610,6 +615,17 @@ static bool ds4_build_fused_verify_graph(
     fg.mask_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
                                         std::max<int64_t>(mask_total, 1));
     ggml_set_input(fg.mask_bundle);
+    // LUCE_DS4_MASK_F16_ONCE=1: one F16 copy of the whole mask per step for
+    // the flash lanes instead of one cast per lane and layer.
+    fg.mask_bundle_f16 = !paged_mode && ds4_env_flag("LUCE_DS4_MASK_F16_ONCE")
+        ? ggml_cast(ctx, fg.mask_bundle, GGML_TYPE_F16) : nullptr;
+    // LUCE_DS4_EXPLICIT_SPLIT=1: the identity row list that sends
+    // short-context lanes to the split-KV flash kernel.
+    fg.identity_rows = nullptr;
+    if (!paged_mode && ds4_env_flag("LUCE_DS4_EXPLICIT_SPLIT") && w.n_indexer_top_k > 1) {
+        fg.identity_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, w.n_indexer_top_k);
+        ggml_set_input(fg.identity_rows);
+    }
     int64_t mask_off = 0;
 
     // Back every gathered lane's scalar and index inputs with shared
@@ -1014,6 +1030,12 @@ static bool ds4_build_fused_verify_graph(
         ain.attn_row_mask = ggml_view_2d(ctx, fg.mask_bundle, n_attn, aq,
                                          n_attn * sizeof(float), (size_t) mask_off * sizeof(float));
         ain.padded_comp = padded;
+        ain.identity_rows = fg.identity_rows;
+        if (fg.mask_bundle_f16) {
+            ain.attn_row_mask_f16 = ggml_view_2d(ctx, fg.mask_bundle_f16, n_attn, aq,
+                                                 n_attn * sizeof(ggml_fp16_t),
+                                                 (size_t) mask_off * sizeof(ggml_fp16_t));
+        }
         mask_off += n_attn * aq;
 
         std::vector<DeepSeek4I32InputBinding> i32b;
@@ -1263,9 +1285,17 @@ static bool ds4_build_fused_verify_graph(
             // head-plus-tail reduction order without padding the two-route
             // tail with duplicate zero-weight expert paths.
             // A streamed layer posts its routes once, so it keeps them whole.
+            // Tokenwise verify lanes keep them whole as well: the q=1 graph
+            // sums all six routes in one combine, and the 4 + 2 decomposition
+            // sums them in another order, so a batched verify built with it
+            // differs from decode by rounding (H200, DS4.1-Flash: the first
+            // differing cache bytes appear at layer 1 of the first verify;
+            // with whole routes the q=3 verify and q=1 decode are bit-identical).
+            // LUCE_DS4_TP_HEAD4_TAIL2=1 restores the decomposition for bisection.
             const bool native_route_width =
                 !same_gpu_runtime ||
-                mixed_policy.native_route_width || streamed;
+                mixed_policy.native_route_width || streamed ||
+                whole_routes_for_lanes;
             if (lane_q > 1 && hybrid_cfg.n_expert_used > 4 && has_hot_routed &&
                 !native_route_width) {
                 const int route_width = hybrid_cfg.n_expert_used;
@@ -1531,6 +1561,8 @@ static bool ds4_build_fused_verify_graph(
         pin_main(fg.i32_bundle);
         pin_main(fg.i64_bundle);
         pin_main(fg.mask_bundle);
+        if (fg.identity_rows) pin_main(fg.identity_rows);
+        if (fg.mask_bundle_f16) pin_main(fg.mask_bundle_f16);
         pin_main(ex.paged_i32);
         pin_main(ex.paged_i64);
         pin_main(ex.paged_gather);
@@ -1903,6 +1935,14 @@ static int ds4_try_fused_verify_step(
         }
     }
     ds4_fv_set(fg->i32_bundle, i32v.data(), sizeof(int32_t) * i32v.size());
+    if (fg->identity_rows) {
+        static thread_local std::vector<int32_t> identity;
+        if (identity.size() != (size_t) fg->identity_rows->ne[0]) {
+            identity.resize((size_t) fg->identity_rows->ne[0]);
+            for (size_t i = 0; i < identity.size(); ++i) identity[i] = (int32_t) i;
+        }
+        ds4_fv_set(fg->identity_rows, identity.data(), sizeof(int32_t) * identity.size());
+    }
     ds4_fv_set(fg->i64_bundle, i64v.data(), sizeof(int64_t) * i64v.size());
 
     // Causal mask values.  At long context this tensor is multi-megabyte,

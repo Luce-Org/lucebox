@@ -627,6 +627,84 @@ void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+static inline float mxfp8_scale(uint8_t e) {
+    union { uint32_t u; float f; } v;
+    v.u = GGML_MXFP8_SCALE_BITS(e);
+    return v.f;
+}
+
+// Round to nearest even E4M3 (bias 7, sub-normals, saturating at 448; 0x7f/0xff are never produced).
+static uint8_t mxfp8_encode_e4m3(float x) {
+    const uint8_t sign = signbit(x) ? 0x80 : 0;
+    const float a = fminf(fabsf(x), 448.0f);
+    if (!(a > 0.0f)) {
+        return sign;
+    }
+    int ex;
+    frexpf(a, &ex);                  // a in [2^(ex-1), 2^ex)
+    int biased = ex - 1 + 7;
+    const float step = biased >= 1 ? ldexpf(1.0f, ex - 1 - 3) : ldexpf(1.0f, -9);
+    const float q = a / step;
+    float n = floorf(q);
+    const float frac = q - n;
+    if (frac > 0.5f || (frac == 0.5f && ((int) n & 1))) {
+        n += 1.0f;
+    }
+    int m = (int) n;
+    if (biased < 1) {                // sub-normal: m in [0, 8]; 8 is the smallest normal
+        return m >= 8 ? (uint8_t) (sign | (1 << 3)) : (uint8_t) (sign | m);
+    }
+    if (m == 16) {
+        m = 8;
+        biased++;
+    }
+    if (biased > 15 || (biased == 15 && m > 14)) {
+        biased = 15;
+        m = 14;
+    }
+    return (uint8_t) (sign | (biased << 3) | (m - 8));
+}
+
+void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP8 == 0);
+    const int64_t nb = k / QK_MXFP8;
+    for (int64_t i = 0; i < nb; i++) {
+        for (int s = 0; s < QK_MXFP8/32; s++) {
+            const float * xs = x + i*QK_MXFP8 + s*32;
+            float amax = 0.0f;
+            for (int j = 0; j < 32; j++) {
+                amax = fmaxf(amax, fabsf(xs[j]));
+            }
+            // smallest power of two with amax / scale <= 448
+            int e = 127;
+            if (amax > 0.0f) {
+                int ex;
+                const float f = frexpf(amax / 448.0f, &ex);   // amax/448 = f * 2^ex, f in [0.5, 1)
+                e = 127 + (f == 0.5f ? ex - 1 : ex);
+            }
+            e = e < 0 ? 0 : e > GGML_MXFP8_MAX_E ? GGML_MXFP8_MAX_E : e;
+            y[i].e[s] = (uint8_t) e;
+            const float inv = ldexpf(1.0f, 127 - e);
+            for (int j = 0; j < 32; j++) {
+                y[i].qs[s*32 + j] = mxfp8_encode_e4m3(xs[j] * inv);
+            }
+        }
+    }
+}
+
+void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP8 == 0);
+    const int64_t nb = k / QK_MXFP8;
+    for (int64_t i = 0; i < nb; i++) {
+        for (int s = 0; s < QK_MXFP8/32; s++) {
+            const float d = mxfp8_scale(x[i].e[s]);
+            for (int j = 0; j < 32; j++) {
+                y[i*QK_MXFP8 + s*32 + j] = GGML_FP16_TO_FP32(GGML_MXFP8_F16_BITS(x[i].qs[s*32 + j])) * d;
+            }
+        }
+    }
+}
+
 void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_NVFP4;
     static const int qk_sub = QK_NVFP4_SUB;
@@ -2340,6 +2418,12 @@ size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     const size_t row_size = ggml_row_size(GGML_TYPE_Q8_0, n_per_row);
     quantize_row_q8_0_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * row_size;
+}
+
+size_t quantize_mxfp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_mxfp8_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_MXFP8, n_per_row);
 }
 
 size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -5503,6 +5587,24 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_MXFP4:
             {
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp4, data, nb);
+            } break;
+        case GGML_TYPE_MXFP8:
+            {
+                const block_mxfp8 * q = (const block_mxfp8 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    for (int s = 0; s < QK_MXFP8/32; ++s) {
+                        if (q[i].e[s] > GGML_MXFP8_MAX_E) {
+                            fprintf(stderr, "ggml_validate_row_data: found invalid mxfp8 scale %d at block %zu\n", q[i].e[s], i);
+                            return false;
+                        }
+                    }
+                    for (int j = 0; j < QK_MXFP8; ++j) {
+                        if ((q[i].qs[j] & 0x7f) == 0x7f) {
+                            fprintf(stderr, "ggml_validate_row_data: found E4M3 NaN at block %zu\n", i);
+                            return false;
+                        }
+                    }
+                }
             } break;
         case GGML_TYPE_NVFP4:
             {

@@ -46,11 +46,21 @@ template <> struct MixFormat<GGML_TYPE_Q2_1_ROCMFP2_MIX> {
 template <> struct MixFormat<GGML_TYPE_Q3_1_ROCMFP3_MIX> {
     static constexpr int kBlockBytes = 14, kCodeBytes = 12, kLevels = 8, kBits = 3;
 };
+// Plain ROCmFP2 (qtype 107): the MIX FP2 block shape (8 code bytes, then one
+// scale byte per 16-weight half) with the fixed levels {-1, 0, 1, 2}; bit 7 of
+// a scale byte negates its half (rocmfpx_fp2_half_scale_to_fp32_finite). No
+// codebook or mode sidecar.
+template <> struct MixFormat<GGML_TYPE_Q2_0_ROCMFP2> {
+    static constexpr int kBlockBytes = 10, kCodeBytes = 8, kLevels = 4, kBits = 2;
+};
+template <int TYPE> constexpr bool mix_is_fp2() {
+    return TYPE == GGML_TYPE_Q2_1_ROCMFP2_MIX || TYPE == GGML_TYPE_Q2_0_ROCMFP2;
+}
 
 // Mode-0 fixed levels, code order (see mix_fp2_fixed / mix_fp3_fixed).
 template <int TYPE>
 __device__ __forceinline__ float mix_wmma_fixed(uint32_t code) {
-    if constexpr (TYPE == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+    if constexpr (mix_is_fp2<TYPE>()) {
         return (float) ((int) code - 1);
     } else {
         const uint32_t m = code & 3u;
@@ -142,7 +152,13 @@ __device__ __forceinline__ void mix_wmma_decode_half(uint64_t codes, uint32_t me
     using F = MixFormat<TYPE>;
     float lev[F::kLevels];
     if (mode == 0) {
-        const float s = mix_wmma_scale(meta);
+        float s;
+        if constexpr (TYPE == GGML_TYPE_Q2_0_ROCMFP2) {
+            s = mix_wmma_scale(meta & 0x7Fu);
+            if (meta & 0x80u) s = -s;
+        } else {
+            s = mix_wmma_scale(meta);
+        }
 #pragma unroll
         for (int c = 0; c < F::kLevels; ++c) lev[c] = s * mix_wmma_fixed<TYPE>((uint32_t) c);
     } else {
@@ -153,7 +169,7 @@ __device__ __forceinline__ void mix_wmma_decode_half(uint64_t codes, uint32_t me
     }
     const uint32_t t0 = mix_wmma_pack(lev[0], lev[1]);
     const uint32_t t1 = mix_wmma_pack(lev[2], lev[3]);
-    if constexpr (TYPE == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+    if constexpr (mix_is_fp2<TYPE>()) {
 #pragma unroll
         for (int p = 0; p < 8; ++p) {
             const uint32_t c0 = (uint32_t) (codes >> (4 * p)) & 3u;
@@ -223,10 +239,13 @@ __launch_bounds__(kThreads) __global__ void mix_wmma_moe_kernel(
     __shared__ float s_lut[2 * F::kLevels];
 
     const int tid = threadIdx.x;
-    if (tid < 2 * F::kLevels) {
-        s_lut[tid] = __bfloat162float(codebooks[(int64_t) expert * 2 * F::kLevels + tid]);
+    int mode = 0;
+    if constexpr (TYPE != GGML_TYPE_Q2_0_ROCMFP2) {
+        if (tid < 2 * F::kLevels) {
+            s_lut[tid] = __bfloat162float(codebooks[(int64_t) expert * 2 * F::kLevels + tid]);
+        }
+        mode = modes[expert];
     }
-    const int mode = modes[expert];
 
     // Decode: row tid/2, quant block (tid&1) of the step's two.
     const int d_row = tid >> 1;
@@ -255,6 +274,12 @@ __launch_bounds__(kThreads) __global__ void mix_wmma_moe_kernel(
 
     v8f acc[2][kNF] = {};
     const int nk = k / kBK2;
+    // A 16-route fragment past the tile's last route is never stored: skip
+    // its loads and WMMAs (a 64-route tile over ~20 routes then costs about a
+    // third of the matrix work while its weights are still decoded once).
+    bool frag_live[kNF];
+#pragma unroll
+    for (int j = 0; j < kNF; ++j) frag_live[j] = r0 + wn + j * 16 < r_end;
 
     MixRaw<TYPE> raw = mix_wmma_load_raw<TYPE>(w_row);
     uint4 xv[kXLoads];
@@ -276,7 +301,7 @@ __launch_bounds__(kThreads) __global__ void mix_wmma_moe_kernel(
             std::memcpy(&lo, cb, 8);
             std::memcpy(&hi, cb + 8, 4);
             const uint32_t meta0 = rb[F::kCodeBytes], meta1 = rb[F::kCodeBytes + 1];
-            if constexpr (TYPE == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+            if constexpr (mix_is_fp2<TYPE>()) {
                 mix_wmma_decode_half<TYPE>(lo & 0xFFFFFFFFull, meta0, mode, s_lut, o0);
                 mix_wmma_decode_half<TYPE>(lo >> 32, meta1, mode, s_lut, o1);
             } else {
@@ -307,12 +332,14 @@ __launch_bounds__(kThreads) __global__ void mix_wmma_moe_kernel(
 #pragma unroll
             for (int i = 0; i < 2; ++i) a[i] = mix_wmma_frag(&s_w[(wm + i * 16 + sub) * kLds2 + ks]);
 #pragma unroll
-            for (int j = 0; j < kNF; ++j) b[j] = mix_wmma_frag(&s_x[(wn + j * 16 + sub) * kLds2 + ks]);
+            for (int j = 0; j < kNF; ++j) {
+                if (frag_live[j]) b[j] = mix_wmma_frag(&s_x[(wn + j * 16 + sub) * kLds2 + ks]);
+            }
 #pragma unroll
             for (int i = 0; i < 2; ++i)
 #pragma unroll
                 for (int j = 0; j < kNF; ++j)
-                    acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b[j], acc[i][j]);
+                    if (frag_live[j]) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b[j], acc[i][j]);
         }
         __syncthreads();
     }
@@ -394,15 +421,25 @@ bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, const ggml_tensor 
         return (end && *end == '\0' && n >= 1 && n <= 1 << 20) ? (int) n : 64;
     }();
     if (!enabled || !GGML_CUDA_CC_IS_RDNA3_5(cc)) return false;
-    if (src0->type != GGML_TYPE_Q2_1_ROCMFP2_MIX && src0->type != GGML_TYPE_Q3_1_ROCMFP3_MIX) return false;
+    // Plain ROCmFP2 (qtype 107) is opt-in: LUCE_ROCMFP2_WMMA_PREFILL=1.
+    static const bool plain_fp2 = [] {
+#ifdef ROCMFP2_AFFINE
+        return false;  // the affine wire format is not the two-scale layout decoded here
+#else
+        const char * v = std::getenv("LUCE_ROCMFP2_WMMA_PREFILL");
+        return v && v[0] && v[0] != '0';
+#endif
+    }();
+    if (src0->type != GGML_TYPE_Q2_1_ROCMFP2_MIX && src0->type != GGML_TYPE_Q3_1_ROCMFP3_MIX &&
+        !(plain_fp2 && src0->type == GGML_TYPE_Q2_0_ROCMFP2)) return false;
     if (!(n_tokens >= min_tokens && src0->ne[0] % kBK2 == 0 && src0->ne[1] % kBM == 0 && src0->ne[2] <= 1024)) {
         return false;
     }
     // The gather reads each activation row as K contiguous floats.
     if (!ids || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1)) return false;
-    // One grid row per route tile: at most n_routes / 64 + n_experts tiles
-    // (bn >= 64) must fit the 65535 grid-y limit; longer batches stay on MMQ.
-    const int64_t max_tiles = (ids->ne[0] * n_tokens + 63) / 64 + src0->ne[2];
+    // One grid row per route tile: at most n_routes / 32 + n_experts tiles
+    // (bn >= 32) must fit the 65535 grid-y limit; longer batches stay on MMQ.
+    const int64_t max_tiles = (ids->ne[0] * n_tokens + 31) / 32 + src0->ne[2];
     return max_tiles <= 65535;
 }
 
@@ -424,6 +461,7 @@ static void mix_wmma_moe_run(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t n_routes = ne12 * n_expert_used;
     GGML_ASSERT(dsts[0]->ne[1] == n_expert_used);
     GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+    const bool plain2 = src0->type == GGML_TYPE_Q2_0_ROCMFP2;
     const bool fp2 = src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_routes);
@@ -441,10 +479,14 @@ static void mix_wmma_moe_run(ggml_backend_cuda_context & ctx, const ggml_tensor 
     static const int forced_bn = [] {
         const char * v = std::getenv("LUCE_MIX_WMMA_BN");
         const int b = v && *v ? std::atoi(v) : 0;
-        return (b == 64 || b == 96 || b == 128) ? b : 0;
+        return (b == 32 || b == 64 || b == 96 || b == 128) ? b : 0;
     }();
     const int64_t mean_routes = n_routes / std::max<int64_t>(1, n_experts);
-    const int bn = forced_bn ? forced_bn : mean_routes >= 128 ? 128 : 64;
+    // Plain ROCmFP2 split owners see ~10-30 routes per expert: a 32-route
+    // tile halves the padded WMMA work (LUCE_MIX_WMMA_BN=64 keeps 64).
+    int bn = forced_bn ? forced_bn : mean_routes >= 128 ? 128 : 64;
+    if (!forced_bn && plain2 && mean_routes < 48) bn = 32;
+    if (bn == 32 && !plain2) bn = 64;  // the MIX launches have no 32-route tile
     const int64_t max_tiles = (n_routes + bn - 1) / bn + n_experts;
     ggml_cuda_pool_alloc<int2> tiles(ctx.pool(), max_tiles);
     ggml_cuda_pool_alloc<int> n_tiles(ctx.pool(), 1);
@@ -460,14 +502,16 @@ static void mix_wmma_moe_run(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     // Side data must stay registered until the kernels are enqueued.
     struct RegistryLock {
-        bool fp2;
-        explicit RegistryLock(bool f) : fp2(f) {
+        bool fp2, no_registry;
+        RegistryLock(bool f, bool n) : fp2(f), no_registry(n) {
+            if (no_registry) return;
             if (fp2) ggml_cuda_rocmfp2_mix_registry_lock(); else ggml_cuda_rocmfp3_mix_registry_lock();
         }
         ~RegistryLock() {
+            if (no_registry) return;
             if (fp2) ggml_cuda_rocmfp2_mix_registry_unlock(); else ggml_cuda_rocmfp3_mix_registry_unlock();
         }
-    } registry_lock(fp2);
+    } registry_lock(fp2, plain2);
 
     const dim3 grid((unsigned) (m / kBM), (unsigned) max_tiles);
     for (int wi = 0; wi < n_weights; ++wi) {
@@ -475,8 +519,9 @@ static void mix_wmma_moe_run(ggml_backend_cuda_context & ctx, const ggml_tensor 
         ggml_tensor * dst = dsts[wi];
         const void * codebooks = nullptr;
         const uint8_t * modes = nullptr;
-        GGML_ASSERT(fp2 ? ggml_cuda_rocmfp2_mix_mmq_info(w->data, &codebooks, &modes)
-                        : ggml_cuda_rocmfp3_mix_mmq_info(w->data, &codebooks, &modes));
+        GGML_ASSERT(plain2 ||
+                    (fp2 ? ggml_cuda_rocmfp2_mix_mmq_info(w->data, &codebooks, &modes)
+                         : ggml_cuda_rocmfp3_mix_mmq_info(w->data, &codebooks, &modes)));
         const int64_t s1 = dst->nb[1] / sizeof(float);
         mix_wmma_zero_masked<<<(unsigned) n_routes, 256, 0, stream>>>(
             (const int32_t *) ids->data, si1, (int) n_expert_used, (float *) dst->data, s1, (int) m);
@@ -495,10 +540,15 @@ static void mix_wmma_moe_run(ggml_backend_cuda_context & ctx, const ggml_tensor 
         };
         using fp2_t = std::integral_constant<int, GGML_TYPE_Q2_1_ROCMFP2_MIX>;
         using fp3_t = std::integral_constant<int, GGML_TYPE_Q3_1_ROCMFP3_MIX>;
+        using p2_t = std::integral_constant<int, GGML_TYPE_Q2_0_ROCMFP2>;
+        using bn32 = std::integral_constant<int, 32>;
         using bn64 = std::integral_constant<int, 64>;
         using bn96 = std::integral_constant<int, 96>;
         using bn128 = std::integral_constant<int, 128>;
-        if (fp2) {
+        if (plain2) {
+            if (bn == 128) launch(p2_t{}, bn128{}); else if (bn == 96) launch(p2_t{}, bn96{});
+            else if (bn == 32) launch(p2_t{}, bn32{}); else launch(p2_t{}, bn64{});
+        } else if (fp2) {
             if (bn == 128) launch(fp2_t{}, bn128{}); else if (bn == 96) launch(fp2_t{}, bn96{}); else launch(fp2_t{}, bn64{});
         } else {
             if (bn == 128) launch(fp3_t{}, bn128{}); else if (bn == 96) launch(fp3_t{}, bn96{}); else launch(fp3_t{}, bn64{});

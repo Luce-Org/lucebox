@@ -100,6 +100,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_DS4_CUDA_LAYERS` | auto | Override the DeepSeek4 heterogeneous layer-split heuristic. See `DS4.md`. |
 | `LUCE_ROCMFP2_ROW4` | 1 on gfx1151 for q>2; legacy two-row kernel elsewhere | BURN-IN KILL SWITCH: =0 restores two-row-per-wave ROCmFP2 verification kernels. |
 | `LUCE_MIX_DEDUP` | 1 on gfx1151 | KILL SWITCH (burn-in): =0 returns ROCmFP2/FP3 MIX verify matvecs (small DSpark verify batches on gfx1151) to the per-route kernel. By default the workgroup of an expert's first route serves every route to it, decoding each weight block once; output is bit-identical. Follows the row4 (FP2) and row3 (FP3) opt-outs. |
+| `LUCE_CUDA_MMVQ_Q8_RDNA4` | 1 on RDNA4 | KILL SWITCH (burn-in): =0 returns one-column Q8_0 matvecs on RDNA4 (and batch-invariant ones up to eight columns) to the generic eight-wave MMVQ kernel. The default kernel packs rows per wave but keeps the reference accumulation order, so output is bit-identical. |
+| `LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH` | 1 on gfx1151 | KILL SWITCH (burn-in): =0 returns ROCmFP2 MoE matvecs on gfx1151 to the loop without next-block prefetch; =1 turns the prefetching loop on elsewhere. Same accumulation order, bit-identical. |
 | `LUCE_MIX_DEDUP_MIN` | 3 | Smallest verify batch (tokens) that takes the dedup kernel; a whole number >= 1, anything else keeps the default. |
 | `LUCE_MULTI_MODEL_GRAPHS` | unset | =1 keeps GPU graph capture on when one process serves several model blocks (`--load-balancing`). By default the server sets `GGML_CUDA_DISABLE_GRAPHS=1` there, because concurrent captures from different model workers invalidate each other. |
 | `LUCE_PC_DEEP_FIRST_MIN` | 4096 | KILL SWITCH (burn-in): tail length, in tokens past a short system/tools head, at which a tool request's first turn is snapshotted whole instead of at the head, so the first follow-up only prefills the new turn. =0 keeps the head pin. Not applied when a forced pin is still ahead of the restored prefix or the whole prompt cannot fit the resident budget. |
@@ -121,6 +123,24 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_PAGED_WMMA` - paged-attn.cu (ggml-cuda) (=1 routes paged full-attention layers to the WMMA kernel; RDNA4 only, F16/Q8_0/Q4_0, non-tree)
 - `LUCE_DS4_LATE_CONTEXT_BEGIN` - deepseek4/deepseek4_backend.cpp (hybrid prefill position where chunks shrink to 1K; default 32768)
 - `LUCE_DS4_LONG_CONTEXT_CHUNK` - deepseek4/deepseek4_backend.cpp (hybrid prefill chunk cap for prompts ending above 4K; default 2048 on R9700 + Strix Halo, 1024 elsewhere)
+- `LUCE_DS41_DECODER_BOUNDED_REPLAY` - deepseek4/deepseek4_backend.cpp (=1: the V4.1 decoder SWA bounded replay: prompt rows before the last n_swa run only the layers up to the last KV source; approximate by design, the model is trained for it; set by `--profile ds41-gorgon`)
+- `LUCE_DS4_DRAFT_SWAP` - deepseek4/deepseek4_backend.cpp (=1: a prefill longer than 10K tokens moves the DSpark weights to pinned host memory and uses the larger chunk; opt-in, no profile sets it. A later request that restores a snapshot of such a prompt and prefills less than 10K tokens runs smaller chunks, so its answer can differ from the full prefill's; with the per-chunk pipeline bands it no longer speeds up prefill on an R9700 + Ryzen AI Max+ PRO 495)
+- `LUCE_DS4_HYBRID_F16_VERIFY_KV` - deepseek4/deepseek4_backend.cpp (=1: two-GPU serving keeps verify K/V in F16, like `--ds4-fused-verify-f16-kv` on one GPU; set by `--profile ds41-gorgon`)
+- `LUCE_DS4_ENGRAM_DEVICE` - deepseek4/deepseek4_graph.cpp (=1: layer-major prefill applies Engram on the device residual; set by `--profile ds41-gorgon`)
+- `LUCE_DS4_EXPLICIT_SPLIT` - deepseek4/deepseek4_graph.cpp, deepseek4_fused_verify.inc (=1: V4.1 explicit verify lanes run the split-KV flash schedule on the F16 cache; set by `--profile ds41-gorgon`)
+- `LUCE_DS4_MASK_F16_ONCE` - deepseek4/deepseek4_fused_verify.inc (=1: one F16 copy of the verify mask per step; set by `--profile ds41-gorgon`)
+- `LUCE_DS4_F16_KV_LANES` - deepseek4/deepseek4_graph.cpp (=1: single-token verify lanes keep F16 K/V too; set by `--profile ds41-gorgon`)
+- `LUCE_DS4_FUSE_ROUTER` - deepseek4/deepseek4_graph.cpp (=1: fused, bit-exact router select and weights ops for decode and verify; set by `--profile ds41-gorgon`)
+- `LUCE_DS4_FUSE_COLLAPSE` - deepseek4/deepseek4_graph.cpp (=1: fused, bit-exact HC collapse op; set by `--profile ds41-gorgon`)
+- `LUCE_DS4_DEVICE_TOPK` - deepseek4/deepseek4_graph.cpp (=1: hybrid prefill takes each token's top route candidates from the device; the host orders them exactly as before; set by `--profile ds41-gorgon`)
+- `LUCE_DS4_PREFILL_ARENA_CHUNK_MB` - deepseek4/deepseek4_graph.cpp (chunk size of the shared prefill arena; 0 = one chunk that only grows; set to 0 by `--profile ds41-gorgon`)
+- `LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL` - deepseek4/deepseek4_graph.cpp (=1: layer-major prefill keeps the residual on the primary GPU; set by `--profile ds41-gorgon`)
+- `LUCE_DS4_PREFILL_PIPELINE` - deepseek4/deepseek4_graph.cpp (N > 0: layer-major prefill runs each chunk as max(N, 2) parts and overlaps one part's cold-owner FFN with the next part's attention; set to 2 by `--profile ds41-gorgon`)
+- `LUCE_DS4_SPLIT_DEVICE_JOIN` - moe_hybrid_ffn_eval.cpp (=1: both owners' prefill partials join on the device; set by `--profile ds41-gorgon`)
+- `LUCE_DS4_GROUPED_HYBRID_PREFILL` - moe_hybrid_ffn_eval.cpp (1 = cold owner's ROCmFP2-down stacks, 2 = both owners', through the grouped MUL_MAT_ID prefill; set to 1 by `--profile ds41-gorgon`)
+- `LUCE_MOE_SIDE_COPY` - moe_hybrid_ffn_eval.cpp (=1: another device's owner input crosses on the producer's side stream, so the producer keeps computing; set by `--profile ds41-gorgon`)
+- `LUCE_ROCMFP2_WMMA_PREFILL` - mix-wmma-moe.cu (ggml-cuda) (=1: plain ROCmFP2 prefill batches on gfx1151 take the WMMA routed-expert GEMM; set by `--profile ds41-gorgon`)
+- `GGML_CUDA_MLA_SPLIT_KV_COUNT` - fattn.cu (ggml-cuda) (4, 8 or 16 split-KV segments for the D=512 indexed decode kernel; default 4; set to 8 by `--profile ds41-gorgon`)
 - `LUCE_PREFILL_UBATCH` - qwen35/prefill_helpers.h
 - `LUCE_QWEN35_MASK_FULL_WIDTH` - qwen35/prefill_helpers.h
 - `LUCE_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h

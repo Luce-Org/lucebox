@@ -100,6 +100,17 @@ MoeStreamedExpertCache::~MoeStreamedExpertCache() {
     destroy();
 }
 
+size_t moe_expert_slot_stride(size_t largest_expert_bytes, const std::vector<size_t> & type_sizes) {
+    size_t unit = 1;
+    for (size_t ts : type_sizes) {
+        if (ts == 0) continue;
+        size_t a = unit, b = ts;
+        while (b) { const size_t t = a % b; a = b; b = t; }
+        unit = unit / a * ts;
+    }
+    return (largest_expert_bytes + unit - 1) / unit * unit;
+}
+
 bool MoeStreamedExpertCache::init(const MoeHybridConfig & cfg,
                                   const std::vector<MoeLayerDesc> & descs,
                                   const MoeHybridStorage & storage,
@@ -122,6 +133,7 @@ bool MoeStreamedExpertCache::init(const MoeHybridConfig & cfg,
     // Slot geometry: the largest expert of each role over the streamed layers.
     // Layers with other weight types get their own view of the same slots.
     bool fused = false, any = false;
+    std::vector<size_t> sizes_gate, sizes_up, sizes_down;   // block sizes of the types sharing each role
     for (size_t il = 0; il < storage.layers.size(); ++il) {
         if (storage.layers[il].n_streamed == 0) continue;
         const LayerExpertRegions & r = storage.layer_regions[il];
@@ -137,8 +149,17 @@ bool MoeStreamedExpertCache::init(const MoeHybridConfig & cfg,
         stride_gate_ = std::max(stride_gate_, fused ? r.expert_bytes_gate_up : r.expert_bytes_gate);
         stride_up_ = std::max(stride_up_, fused ? (size_t) 0 : r.expert_bytes_up);
         stride_down_ = std::max(stride_down_, r.expert_bytes_down);
+        const ggml_tensor * gate = fused ? d.ffn_gate_up_exps : d.ffn_gate_exps;
+        if (gate) sizes_gate.push_back(ggml_type_size(gate->type));
+        if (!fused && d.ffn_up_exps) sizes_up.push_back(ggml_type_size(d.ffn_up_exps->type));
+        if (d.ffn_down_exps) sizes_down.push_back(ggml_type_size(d.ffn_down_exps->type));
     }
     if (!any) return fail("no streamed experts");
+    // Layers of different weight types share the slots through their own views,
+    // so each role's stride must be whole blocks of every one of those types.
+    stride_gate_ = moe_expert_slot_stride(stride_gate_, sizes_gate);
+    stride_up_ = stride_up_ ? moe_expert_slot_stride(stride_up_, sizes_up) : 0;
+    stride_down_ = moe_expert_slot_stride(stride_down_, sizes_down);
     slot_bytes_ = stride_gate_ + stride_up_ + stride_down_;
 
     size_t pool = opts.pool_bytes;

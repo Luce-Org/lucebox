@@ -1372,6 +1372,12 @@ if(LUCE_TESTS)
     target_include_directories(test_qwen35_tensor_parallel PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
     target_link_libraries(test_qwen35_tensor_parallel PRIVATE luce_common)
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_ds41_q8_mmvq.cpp")
+        # Benchmark, not a test: DS4.1 dense Q8_0 projections through the ggml
+        # mul_mat dispatch at 1-4 columns, with the column-identity check.
+        add_executable(bench_ds41_q8_mmvq test/bench/bench_ds41_q8_mmvq.cpp)
+        target_link_libraries(bench_ds41_q8_mmvq PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
+    endif()
     add_executable(test_rope_tail test/unit/test_rope_tail.cpp)
     target_compile_definitions(test_rope_tail PRIVATE LUCE_ROPE_TEST_GPU=1)
     target_link_libraries(test_rope_tail PRIVATE ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
@@ -1509,6 +1515,14 @@ if(LUCE_TESTS)
         target_link_libraries(test_ds4_moe_combine_cuda PRIVATE
             ggml-cpu ggml ${LUCE_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_ds4_moe_combine_cuda)
+    endif()
+    # The fused DS4 router and HC collapse ops against the unfused op chains,
+    # bit for bit.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_fused_ops_cuda.cpp")
+        add_executable(test_ds4_fused_ops_cuda test/unit/test_ds4_fused_ops_cuda.cpp)
+        target_link_libraries(test_ds4_fused_ops_cuda PRIVATE
+            ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
+        list(APPEND _raw_unit_test_targets test_ds4_fused_ops_cuda)
     endif()
     # Host-only test of the ggml-cuda batched copy: plain C++ on both the CUDA
     # and HIP builds. Registered through the CppUnit list below.
@@ -1709,6 +1723,16 @@ if(LUCE_TESTS)
         # Self-skips (returns 0) unless DS4_TEST_MODEL points at a qtype-105 model.
         add_test(NAME ds4_load_transactional COMMAND test_ds4_load_transactional)
     endif()
+    add_executable(test_ds41_mxfp8 test/unit/test_ds41_mxfp8.cpp)
+    target_link_libraries(test_ds41_mxfp8 PRIVATE ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+    add_test(NAME test_ds41_mxfp8_cpu COMMAND test_ds41_mxfp8 cpu)
+    add_test(NAME test_ds41_mxfp8_gpu COMMAND test_ds41_mxfp8 gpu)
+    set_tests_properties(test_ds41_mxfp8_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    # Kernel timing/exactness for the DS4.1 routed-expert decode matvec (not a pass/fail test).
+    add_executable(bench_ds41_iq_mmid test/bench/bench_ds41_iq_mmid.cpp)
+    target_link_libraries(bench_ds41_iq_mmid PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
+    add_executable(test_ds41_mmid_width_invariance test/unit/test_ds41_mmid_width_invariance.cpp)
+    target_link_libraries(test_ds41_mmid_width_invariance PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_rocmfp3_mix_registry.cpp")
         # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
         # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
@@ -1949,6 +1973,10 @@ if(LUCE_TESTS)
         target_link_libraries(test_moe_stream PRIVATE
             luce_common ggml ${LUCE_GGML_BACKEND_TARGET} CUDA::cudart)
     endif()
+    add_executable(test_moe_expert_slot_stride test/unit/test_moe_expert_slot_stride.cpp)
+    target_include_directories(test_moe_expert_slot_stride PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+    target_link_libraries(test_moe_expert_slot_stride PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
+    add_test(NAME test_moe_expert_slot_stride COMMAND test_moe_expert_slot_stride)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_laguna_daemon.cpp")
         add_executable(test_laguna_daemon test/unit/test_laguna_daemon.cpp)
         target_include_directories(test_laguna_daemon PRIVATE ${LUCE_SRC_INCLUDE_DIRS})

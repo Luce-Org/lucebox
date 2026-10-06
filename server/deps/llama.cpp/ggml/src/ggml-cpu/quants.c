@@ -58,6 +58,36 @@ void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_mxfp4_ref(x, y, k);
 }
 
+void quantize_row_mxfp8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp8_ref(x, y, k);
+}
+
+// MXFP8 against F32 activations (no activation quantization): exact weights, double accumulation.
+void ggml_vec_dot_mxfp8_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_MXFP8 == 0);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    const block_mxfp8 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+    double sum = 0.0;
+    for (int ib = 0; ib < n / QK_MXFP8; ++ib) {
+        for (int g = 0; g < QK_MXFP8/32; ++g) {
+            union { uint32_t u; float f; } d;
+            d.u = GGML_MXFP8_SCALE_BITS(x[ib].e[g]);
+            double acc = 0.0;
+            for (int j = 0; j < 32; ++j) {
+                const int k = g*32 + j;
+                acc += (double) GGML_CPU_FP16_TO_FP32(GGML_MXFP8_F16_BITS(x[ib].qs[k])) * (double) y[ib*QK_MXFP8 + k];
+            }
+            sum += acc * (double) d.f;
+        }
+    }
+    *s = (float) sum;
+}
+
 void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_nvfp4_ref(x, y, k);
 }

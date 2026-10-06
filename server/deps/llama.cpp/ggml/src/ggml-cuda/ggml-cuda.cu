@@ -45,6 +45,7 @@
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-fused-combine.cuh"
 #include "ggml-cuda/rocmfp3_mix.cuh"
+#include "ggml-cuda/mxfp8.cuh"
 #include "ggml-cuda/rocmfp2_mix.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -970,6 +971,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
         copy_event = nullptr;
+    }
+    if (side_copy_stream != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaStreamSynchronize(side_copy_stream));
+        CUDA_CHECK(cudaStreamDestroy(side_copy_stream));
+        CUDA_CHECK(cudaEventDestroy(side_copy_ready));
+        CUDA_CHECK(cudaEventDestroy(side_copy_done));
+        side_copy_stream = nullptr;
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -2021,7 +2030,30 @@ static void ggml_cuda_op_mul_mat_cublas(
         row_diff == src0->ne[1] &&
         dst->op_params[0] == GGML_PREC_DEFAULT;
 
-    if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
+    // MXFP8 past the GEMV width (mxfp8.cu keeps F32 activations up to 8 columns):
+    // exact BF16 decode of the weights, activations rounded to BF16 for the GEMM
+    // (a prefill-width path, not the decode/verify one). Without BF16 GEMM
+    // support the generic F32 dequantize + SGEMM path below serves it.
+    if (src0->type == GGML_TYPE_MXFP8 && supports_bf16) {
+        GGML_ASSERT(ggml_is_contiguous(src0) && row_diff == src0->ne[1]);
+        ggml_cuda_pool_alloc<nv_bfloat16> src0_as_bf16(ctx.pool(id), row_diff*ne00);
+        ggml_get_to_bf16_cuda(GGML_TYPE_MXFP8)(src0_dd_i, src0_as_bf16.get(), row_diff*ne00, stream);
+        ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id), src1_ncols*ne10);
+        const to_bf16_cuda_t to_bf16_cuda = ggml_get_to_bf16_cuda(src1->type);
+        GGML_ASSERT(to_bf16_cuda != nullptr);
+        to_bf16_cuda(src1_ddf_i, src1_as_bf16.get(), src1_ncols*ne10, stream);
+        const float alpha_f32 = 1.0f;
+        const float beta_f32  = 0.0f;
+        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        CUBLAS_CHECK(
+            cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                    row_diff, src1_ncols, ne10,
+                    &alpha_f32,  src0_as_bf16.get(), CUDA_R_16BF, ne00,
+                                 src1_as_bf16.get(), CUDA_R_16BF, ne10,
+                    &beta_f32,   dst_dd_i,           CUDA_R_32F,  ldc,
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    } else if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
         if (src1->type != GGML_TYPE_BF16) {
             const to_bf16_cuda_t to_bf16_cuda = ggml_get_to_bf16_cuda(src1->type);
@@ -2909,7 +2941,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    src0->view_src;
 
     const int64_t ncols_dst = is_mul_mat_id ? dst->ne[2] : src1->ne[1];
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+    // MXFP8 has its own matvec (ggml_cuda_mxfp8_mul_mat_vec); MMVQ has no kernel for it.
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_MXFP8 && !bad_padding_clear &&
+                             src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 &&
                              ncols_dst <= (is_mul_mat_id ? MMVQ_MAX_MOE_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE);
 #ifdef ROCMFP2_AFFINE
@@ -3192,6 +3226,20 @@ static bool ggml_cuda_mmb_cublas_shape_ok(const ggml_tensor * w) {
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
     const bool grouped_src = ggml_mul_mat_is_grouped_src(dst);
+    if (src0->type == GGML_TYPE_MXFP8) {
+        // Native FP8 dense weights, decoded exactly. Up to 8 columns the register-decode
+        // GEMV takes F32 activations (decode and verify); wider batches dequantize the
+        // weights to BF16 (exact) and round the activations to BF16 for a BF16 GEMM with
+        // F32 accumulation (prefill), or fall back to F32 SGEMM without BF16 support.
+        GGML_ASSERT(!split && "MXFP8 does not support split buffers");
+        GGML_ASSERT(!grouped_src && "MXFP8 has no grouped-source path");
+        if (ggml_cuda_mxfp8_mul_mat_vec_supported(src0, src1, dst)) {
+            ggml_cuda_mxfp8_mul_mat_vec(src0, src1, dst, ctx.stream());
+        } else {
+            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+        }
+        return;
+    }
 
 #if defined(GGML_USE_HIP)
     const bool cublas_shape_ok = ggml_cuda_mmb_cublas_shape_ok(src0);
@@ -3513,7 +3561,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_MOE_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
-                if (ne2 <= mmvq_mmid_max) {
+                // Batch-invariant mode (DS4.1 verification) keeps every small batch on MMVQ, whose per-token
+                // single-column path reproduces decode exactly; MMQ would reduce in another order. Types with no
+                // MMVQ case at all (mmvq_mmid_max == 0, the mix formats) keep their own dispatch below.
+                if (ne2 <= mmvq_mmid_max || (ggml_cuda_mmvq_batch_invariant_enabled && mmvq_mmid_max > 0)) {
                     log_dispatch("mmvq");
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
@@ -4331,6 +4382,101 @@ static void ggml_cuda_flush_peer_copy_batch(const char * reason) {
 }
 #endif
 
+// A peer copy on the source context's side stream instead of its compute
+// stream: it starts where the compute stream is when the copy is queued, the
+// destination stream waits for it, and later work on the source's compute
+// stream does not. The caller keeps src unchanged until the destination has
+// consumed it. False when the backends or buffers do not qualify; the caller
+// then copies the usual way.
+// A contiguous same-size copy between two CUDA backends on different devices,
+// each tensor in a CUDA buffer on its backend's device: the copies below
+// qualify only then, as ggml_backend_cuda_cpy_tensor_async's peer path does.
+static bool ggml_cuda_peer_copy_qualifies(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+                                          const ggml_tensor * src, const ggml_tensor * dst) {
+#ifdef GGML_CUDA_NO_PEER_COPY
+    GGML_UNUSED_VARS(backend_src, backend_dst, src, dst);
+    return false;
+#else
+    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+        return false;
+    }
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (!buf_src || !buf_dst || !ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst) ||
+        !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || ggml_nbytes(src) != ggml_nbytes(dst)) {
+        return false;
+    }
+    const ggml_backend_cuda_context * ctx_src = (const ggml_backend_cuda_context *) backend_src->context;
+    const ggml_backend_cuda_context * ctx_dst = (const ggml_backend_cuda_context *) backend_dst->context;
+    const ggml_backend_cuda_buffer_context * bctx_src = (const ggml_backend_cuda_buffer_context *) buf_src->context;
+    const ggml_backend_cuda_buffer_context * bctx_dst = (const ggml_backend_cuda_buffer_context *) buf_dst->context;
+    return ctx_src->device != ctx_dst->device && bctx_src->device == ctx_src->device &&
+           bctx_dst->device == ctx_dst->device;
+#endif
+}
+
+bool ggml_backend_cuda_copy_tensor_async_side(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+                                              const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_cuda_peer_copy_qualifies(backend_src, backend_dst, src, dst)) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx_src = (ggml_backend_cuda_context *) backend_src->context;
+    ggml_backend_cuda_context * ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+#if defined(GGML_USE_HIP)
+    // Batched peer copies record their completion later on the source
+    // stream; settle them before ordering against that stream.
+    ggml_cuda_flush_peer_copy_batch("side-copy");
+#endif
+    ggml_cuda_set_device(ctx_src->device);
+    if (!ctx_src->side_copy_stream) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ctx_src->side_copy_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx_src->side_copy_ready, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx_src->side_copy_done, cudaEventDisableTiming));
+    }
+    cudaStream_t side = ctx_src->side_copy_stream;
+    CUDA_CHECK(cudaEventRecord(ctx_src->side_copy_ready, ctx_src->stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(side, ctx_src->side_copy_ready, 0));
+    CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, ctx_dst->device, src->data, ctx_src->device,
+                                   ggml_nbytes(dst), side));
+    CUDA_CHECK(cudaEventRecord(ctx_src->side_copy_done, side));
+    ggml_cuda_set_device(ctx_dst->device);
+    CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), ctx_src->side_copy_done, 0));
+    return true;
+}
+
+// A peer copy queued on the source's compute stream with no wait on the
+// destination: the caller records an event on the source backend after it
+// and has the destination wait for that event when it needs the data.
+bool ggml_backend_cuda_copy_tensor_async_nowait(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+                                                const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_cuda_peer_copy_qualifies(backend_src, backend_dst, src, dst)) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx_src = (ggml_backend_cuda_context *) backend_src->context;
+    ggml_backend_cuda_context * ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+#if defined(GGML_USE_HIP)
+    ggml_cuda_flush_peer_copy_batch("nowait-copy");
+#endif
+    ggml_cuda_set_device(ctx_src->device);
+    CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, ctx_dst->device, src->data, ctx_src->device,
+                                   ggml_nbytes(dst), ctx_src->stream()));
+    return true;
+}
+
+// Order the compute stream after every side-stream copy queued so far, so
+// it may overwrite their sources.
+void ggml_backend_cuda_join_side_copies(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    if (!ctx->side_copy_stream) {
+        return;
+    }
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->stream(), ctx->side_copy_done, 0));
+}
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -4424,6 +4570,9 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_cuda_set_device(cuda_ctx->device);
 #endif
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    if (cuda_ctx->side_copy_stream) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->side_copy_stream));
+    }
 
     GGML_UNUSED(backend);
 }
@@ -7125,6 +7274,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if (a->type == GGML_TYPE_MXFP8) {
+                    return op->op == GGML_OP_MUL_MAT && (!a->buffer || !ggml_backend_buft_is_cuda_split(a->buffer->buft)) &&
+                        b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && a->ne[0] % QK_MXFP8 == 0 &&
+                        ggml_is_contiguous(a);
+                }
                 if (ggml_mul_mat_is_grouped_src(op)) {
                     const ggml_tensor * physical = b->view_src;
                     const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;

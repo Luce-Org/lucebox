@@ -2,6 +2,10 @@
 
 #pragma once
 
+#include <future>
+#include <memory>
+#include <string>
+
 #include "moe_hybrid_expert_cache.h"
 #include "moe_hybrid_types.h"
 #include "moe_hybrid_storage.h"
@@ -312,6 +316,31 @@ inline constexpr bool moe_cold_input_first_policy_enabled(
     return has_backend_input && enabled && !batched_peer_copies;
 }
 bool moe_expert_major_prefill_enabled(int n_tokens);
+// LUCE_DS4_SPLIT_DEVICE_JOIN=1: a split (reduced secondary stack) heterogeneous
+// prefill publishes both owners' partials into the device join tensors instead
+// of combining them on the host. Callers and the FFN must agree on it.
+bool moe_split_owner_device_join_enabled();
+
+// Pipelined layer-major prefill: a heterogeneous expert-major call whose
+// device outputs carry a free slot returns after its hot owner and leaves the
+// cold owner running; the caller completes the join later with wait() (the
+// cold inputs are owned by the slot, not the caller's frame).
+struct MoeDeferredColdJoin {
+    std::shared_future<bool> future;
+    std::shared_ptr<void> keep;
+    std::string * err = nullptr;
+    // Set by the caller. input: an F32 [n_embd, >= n_tokens] tensor on the
+    // cold owner's device the routed input crosses into (side stream), so
+    // the caller may route again at once; done: an event on that device the
+    // cold owner records after its partial's copy (wait on it before reading
+    // the cold output); after: the join this cold owner runs behind (one
+    // owner at a time drives the cold device).
+    ggml_tensor * input = nullptr;
+    ggml_backend_event_t done = nullptr;
+    const MoeDeferredColdJoin * after = nullptr;
+    bool pending() const { return future.valid(); }
+    bool wait(std::string * err_out);
+};
 
 // Optional device-resident owner destinations for long heterogeneous prefill.
 // When present, the hot/shared and cold partials are copied directly into
@@ -321,6 +350,8 @@ struct MoeHybridDeviceOutputs {
     ggml_backend_t backend = nullptr;
     ggml_tensor * hot = nullptr;
     ggml_tensor * cold = nullptr;
+    // Optional: defer the cold owner's join into this slot (see above).
+    MoeDeferredColdJoin * defer = nullptr;
 
     bool valid() const { return backend && hot && cold; }
 };

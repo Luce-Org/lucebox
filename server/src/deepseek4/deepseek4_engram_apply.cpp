@@ -104,6 +104,24 @@ void DeepSeek4EngramApplyRunner::release() {
 
 bool DeepSeek4EngramApplyRunner::run(ggml_backend_t backend, const DeepSeek4Layer & L, int n_embd, int n_hc,
                                      float rms_eps, float * hc, const float * keys, int n_tokens) {
+    return hc && run_chunks(backend, L, n_embd, n_hc, rms_eps, hc, nullptr, keys, n_tokens);
+}
+
+bool DeepSeek4EngramApplyRunner::run_device(ggml_backend_t backend, const DeepSeek4Layer & L, int n_embd,
+                                            int n_hc, float rms_eps, ggml_tensor * hc_dev,
+                                            const float * keys, int n_tokens) {
+    if (!hc_dev || hc_dev->type != GGML_TYPE_F32 || !ggml_is_contiguous(hc_dev) ||
+        ggml_nelements(hc_dev) != (int64_t) n_embd * n_hc * n_tokens) {
+        return false;
+    }
+    return run_chunks(backend, L, n_embd, n_hc, rms_eps, nullptr, hc_dev, keys, n_tokens);
+}
+
+// The residual comes from and returns to host memory (hc_host) or is
+// updated in place on the device (hc_dev); only the keys upload then.
+bool DeepSeek4EngramApplyRunner::run_chunks(ggml_backend_t backend, const DeepSeek4Layer & L, int n_embd,
+                                            int n_hc, float rms_eps, float * hc_host, ggml_tensor * hc_dev,
+                                            const float * keys, int n_tokens) {
     if (!backend || !L.engram_wkv || n_tokens <= 0) return false;
     if (alloc_backend_ != backend) {
         release();
@@ -122,23 +140,29 @@ bool DeepSeek4EngramApplyRunner::run(ggml_backend_t backend, const DeepSeek4Laye
         params.no_alloc = true;
         ggml_context * ctx = ggml_init(params);
         if (!ctx) return false;
-        ggml_tensor * h = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, count);
+        ggml_tensor * h = hc_dev
+            ? ggml_view_3d(ctx, hc_dev, n_embd, n_hc, count, sizeof(float) * (size_t) n_embd,
+                           sizeof(float) * hc_width, (size_t) first * sizeof(float) * hc_width)
+            : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, count);
         ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, key_width, count);
-        ggml_set_input(h);
+        if (!hc_dev) ggml_set_input(h);
         ggml_set_input(k);
         ggml_tensor * out = deepseek4_build_engram_apply(ctx, h, k, L, n_embd, n_hc, rms_eps);
         if (!out) { ggml_free(ctx); return false; }
+        if (hc_dev) out = ggml_cpy(ctx, out, h);
         ggml_set_output(out);
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
         ggml_build_forward_expand(gf, out);
         bool ok = ggml_gallocr_alloc_graph(alloc_, gf);
         if (ok) {
-            ggml_backend_tensor_set(h, hc + (size_t) first * hc_width, 0, sizeof(float) * hc_width * count);
+            if (!hc_dev) {
+                ggml_backend_tensor_set(h, hc_host + (size_t) first * hc_width, 0, sizeof(float) * hc_width * count);
+            }
             ggml_backend_tensor_set(k, keys + (size_t) first * key_width, 0, sizeof(float) * key_width * count);
             ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
         }
-        if (ok) {
-            ggml_backend_tensor_get(out, hc + (size_t) first * hc_width, 0, sizeof(float) * hc_width * count);
+        if (ok && !hc_dev) {
+            ggml_backend_tensor_get(out, hc_host + (size_t) first * hc_width, 0, sizeof(float) * hc_width * count);
         }
         ggml_free(ctx);
         if (!ok) return false;
@@ -188,6 +212,24 @@ bool ds4_engram_apply_host(ggml_backend_t backend, const DeepSeek4Weights & w, i
     if (!runner.run(backend, w.layers[(size_t) il], w.n_embd, w.n_hc, w.rms_eps,
                     hc_state, layer_keys, n_tokens)) {
         std::fprintf(stderr, "[deepseek4] engram apply failed at layer %d\n", il);
+        return false;
+    }
+    if (telemetry) telemetry->engram_apply_us += elapsed_us(t0);
+    return true;
+}
+
+bool ds4_engram_apply_device(ggml_backend_t backend, const DeepSeek4Weights & w, int il,
+                             const std::vector<float> & keys, ggml_tensor * hc_dev, int n_tokens,
+                             DeepSeek4EngramApplyRunner & runner,
+                             DeepSeek4StepTelemetry * telemetry) {
+    const DeepSeek4EngramRuntime * engram = w.engram_runtime.get();
+    const int e = engram ? engram->layer_index(il) : -1;
+    if (e < 0) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    const float * layer_keys = keys.data() + (size_t) e * (size_t) n_tokens * engram->key_floats();
+    if (!runner.run_device(backend, w.layers[(size_t) il], w.n_embd, w.n_hc, w.rms_eps,
+                           hc_dev, layer_keys, n_tokens)) {
+        std::fprintf(stderr, "[deepseek4] engram device apply failed at layer %d\n", il);
         return false;
     }
     if (telemetry) telemetry->engram_apply_us += elapsed_us(t0);

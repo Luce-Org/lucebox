@@ -1042,6 +1042,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_ROCMFPX> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP8> {
+    static constexpr int qk = QK_MXFP8;
+    static constexpr int qr = QR_MXFP8;
+    static constexpr int qi = QI_MXFP8;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;
@@ -1465,6 +1472,12 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    // Side-stream peer copies (ggml_backend_cuda_copy_tensor_async_side): a
+    // stream of their own, the compute stream's progress when a copy was
+    // queued, and the copy's end.
+    cudaStream_t side_copy_stream = nullptr;
+    cudaEvent_t side_copy_ready = nullptr;
+    cudaEvent_t side_copy_done = nullptr;
 
     // Memoize q8_1-quantized src1 activations across the
     // quantized matmuls of ONE graph evaluation (Q/K/V/gate/router/shexp all

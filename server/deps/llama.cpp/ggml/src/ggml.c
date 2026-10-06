@@ -854,6 +854,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_mxfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_ref,
     },
+    [GGML_TYPE_MXFP8] = {
+        .type_name                = "mxfp8",
+        .blck_size                = QK_MXFP8,
+        .type_size                = sizeof(block_mxfp8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_mxfp8,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_mxfp8_ref,
+    },
     [GGML_TYPE_NVFP4] = {
         .type_name                = "nvfp4",
         .blck_size                = QK_NVFP4,
@@ -8962,6 +8970,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q5_1:    result = quantize_q5_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_0:    result = quantize_q8_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_MXFP8:   result = quantize_mxfp8(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q3_K:    result = quantize_q3_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
@@ -9534,6 +9543,77 @@ struct ggml_tensor * ggml_ds4_hc_out(
     ggml_set_op_params_i32(result, 1, (int32_t) n_embd);
     ggml_set_op_params_i32(result, 2, (int32_t) n_hc);
     ggml_set_op_params_f32(result, 4, pre_scale);
+    return result;
+}
+
+// GGML_OP_DS4_HC modes 4 and 5 (see ggml_cuda_op_ds4_hc for the table).
+struct ggml_tensor * ggml_ds4_router_select(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * native_bias,
+        struct ggml_tensor  * protected_mask,
+        int                   k) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits));
+    GGML_ASSERT(logits->ne[2] == 1 && logits->ne[3] == 1);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
+                ggml_nelements(bias) == logits->ne[0]);
+    GGML_ASSERT(!native_bias || (native_bias->type == GGML_TYPE_F32 && ggml_is_contiguous(native_bias) &&
+                                 ggml_nelements(native_bias) == logits->ne[0]));
+    GGML_ASSERT(!protected_mask || (protected_mask->type == GGML_TYPE_I32 && ggml_is_contiguous(protected_mask) &&
+                                    ggml_nelements(protected_mask) == logits->ne[0]));
+    GGML_ASSERT((native_bias == NULL) == (protected_mask == NULL));
+    GGML_ASSERT(k > 0 && k <= 32 && logits->ne[0] >= k && logits->ne[0] <= 1024);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, logits->ne[1]);
+    result->op = GGML_OP_DS4_HC;
+    result->src[0] = logits;
+    result->src[1] = bias;
+    result->src[2] = native_bias;
+    result->src[3] = protected_mask;
+    ggml_set_op_params_i32(result, 0, 4);
+    ggml_set_op_params_i32(result, 1, k);
+    return result;
+}
+
+struct ggml_tensor * ggml_ds4_router_weights(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * selected,
+        float                 clamp_min,
+        float                 scale) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits));
+    GGML_ASSERT(logits->ne[2] == 1 && logits->ne[3] == 1);
+    GGML_ASSERT(selected->type == GGML_TYPE_I32 && ggml_is_contiguous(selected));
+    GGML_ASSERT(selected->ne[1] == logits->ne[1] && selected->ne[0] <= 32);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, selected->ne[0], selected->ne[1]);
+    result->op = GGML_OP_DS4_HC;
+    result->src[0] = logits;
+    result->src[1] = selected;
+    ggml_set_op_params_i32(result, 0, 5);
+    ggml_set_op_params_f32(result, 4, clamp_min);
+    ggml_set_op_params_f32(result, 5, scale);
+    return result;
+}
+
+// GGML_OP_DS4_HC mode 6.
+struct ggml_tensor * ggml_ds4_hc_collapse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * hc,
+        struct ggml_tensor  * pre,
+        int                   n_hc) {
+    GGML_ASSERT(hc->type == GGML_TYPE_F32 && pre->type == GGML_TYPE_F32);
+    GGML_ASSERT(hc->nb[0] == sizeof(float) && pre->nb[0] == sizeof(float));
+    GGML_ASSERT(n_hc > 0 && n_hc <= 32 && hc->ne[0] % n_hc == 0);
+    GGML_ASSERT(pre->ne[0] == n_hc && pre->ne[1] == hc->ne[1]);
+    GGML_ASSERT(hc->ne[2] == 1 && hc->ne[3] == 1 && pre->ne[2] == 1 && pre->ne[3] == 1);
+    const int64_t n_embd = hc->ne[0] / n_hc;
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc->ne[1]);
+    result->op = GGML_OP_DS4_HC;
+    result->src[0] = hc;
+    result->src[1] = pre;
+    ggml_set_op_params_i32(result, 0, 6);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_embd);
+    ggml_set_op_params_i32(result, 2, n_hc);
     return result;
 }
 

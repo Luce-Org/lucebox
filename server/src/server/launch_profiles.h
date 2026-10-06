@@ -146,6 +146,88 @@ inline const std::vector<LaunchProfile> & launch_profiles() {
                 {"GPU_MAX_HW_QUEUES", "8"},
             },
         },
+        {
+            "ds41-gorgon",
+            "DeepSeek V4.1 Flash on an R9700 (gfx1201) beside a 192 GB Gorgon "
+            "Halo (gfx1151) with every expert resident: dense work, hot experts "
+            "and the drafter on the R9700, the other experts on the Gorgon; "
+            "decoder SWA bounded replay and a pipelined layer-major prefill; "
+            "pass the expert placement and router bias for the box",
+            {
+                {"--target-device", "hip:0"},
+                {"--expert-device", "hip:1"},
+                {"--draft-device", "hip:0"},
+                {"--peer-access", nullptr},
+                {"--max-ctx", "131072"},
+                {"--chunk", "4096"},
+                {"--ds4-prefill", "dense"},
+                {"--ds4-protected-experts", "share/deepseek41/massive_experts.json"},
+            },
+            {
+                {"LUCE_EXPERT_BUDGET_MB", "12000"},
+                {"LUCE_DS4_LONG_CONTEXT_CHUNK", "4096"},
+                // Prefill: bounded replay, layer-major bands with the residual
+                // and Engram on the R9700, both owners joined on the device,
+                // the Gorgon's cold FFN of one band under the next band's
+                // attention, WMMA for plain ROCmFP2 experts, one arena.
+                {"LUCE_DS41_DECODER_BOUNDED_REPLAY", "1"},
+                {"LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL", "1"},
+                {"LUCE_DS4_ENGRAM_DEVICE", "1"},
+                {"LUCE_DS4_SPLIT_DEVICE_JOIN", "1"},
+                {"LUCE_DS4_GROUPED_HYBRID_PREFILL", "1"},
+                {"LUCE_ROCMFP2_WMMA_PREFILL", "1"},
+                {"LUCE_DS4_PREFILL_PIPELINE", "2"},
+                {"LUCE_DS4_PREFILL_ARENA_CHUNK_MB", "0"},
+                {"LUCE_DS4_DEVICE_TOPK", "1"},
+                // The cold owner's input crosses PCIe on a side stream.
+                {"LUCE_MOE_SIDE_COPY", "1"},
+                // Prefill attention on the R9700's matrix cores: F16 K/V
+                // rows into the WMMA D512 kernels (the gfx1151 set; its
+                // indexer and causal-window defaults are slower on gfx1201).
+                {"LUCE_DS4_PREFILL_F16_KV_ALL", "1"},
+                {"GGML_CUDA_MLA_STREAM_WMMA", "1"},
+                {"GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS", "2"},
+                {"GGML_CUDA_MLA_DENSE_WMMA", "1"},
+                {"GGML_CUDA_MLA_DENSE_HIGH_RATIO", "1"},
+                // Decode and verify: F16 K/V on every lane, split-KV flash
+                // (eight splits, short lanes included), fused router and HC
+                // collapse (both bit-exact).
+                {"LUCE_DS4_HYBRID_F16_VERIFY_KV", "1"},
+                {"LUCE_DS4_F16_KV_LANES", "1"},
+                {"GGML_CUDA_MLA_SPLIT_KV", "1"},
+                {"GGML_CUDA_MLA_SPLIT_KV_COUNT", "8"},
+                {"LUCE_DS4_EXPLICIT_SPLIT", "1"},
+                {"LUCE_DS4_FUSE_ROUTER", "1"},
+                {"LUCE_DS4_FUSE_COLLAPSE", "1"},
+                {"LUCE_DS4_MASK_F16_ONCE", "1"},
+                {"LUCE_DS4_SPEC_Q", "5"},
+                {"LUCE_DS4_Q5_VERIFY", "1"},
+                {"LUCE_DS4_COMP_PAD_STRIDE", "128"},
+                {"LUCE_DS4_ADAPTIVE_WIDTH", "1"},
+                // The ds41-lucebox owner and kernel settings.
+                {"LUCE_DS4_FUSED_VERIFY", "1"},
+                {"LUCE_DS4_FUSED_HYBRID_DECODE", "1"},
+                {"LUCE_DS4_PINNED_ROLLBACK", "1"},
+                {"LUCE_DS4_TP_ROUTE_PREFORK", "1"},
+                {"LUCE_DS4_TP_DEVICE_JOIN", "1"},
+                {"LUCE_DS4_TP_DEVICE_JOIN_SPLIT", "1"},
+                {"LUCE_DS4_TP_FUSED_HC_JOIN", "1"},
+                {"LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS", "1"},
+                {"LUCE_DS4_TP_COARSE_OWNER", "1"},
+                {"LUCE_DS4_TP_NATIVE_ROUTE_WIDTH", "1"},
+                {"LUCE_DS4_TP_MASKED_ROUTES", "1"},
+                {"LUCE_DS4_TP_GROUPED_MMVQ", "1"},
+                {"LUCE_DS4_TP_CAPTURE_CACHE_SLOTS", "4"},
+                {"LUCE_MOE_FULL_COLD_PARALLEL", "1"},
+                {"GGML_CUDA_BATCH_PEER_COPIES", "1"},
+                {"LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK", "2"},
+                {"LUCE_CUDA_I32_REPEAT", "1"},
+                {"LUCE_DS4_DIRECT_INDEXER_TOPK", "1"},
+                {"GGML_DS4_TOPK_BLOCK_RADIX", "1"},
+                {"ROCBLAS_USE_HIPBLASLT", "0"},
+                {"GPU_MAX_HW_QUEUES", "8"},
+            },
+        },
     };
     return profiles;
 }
