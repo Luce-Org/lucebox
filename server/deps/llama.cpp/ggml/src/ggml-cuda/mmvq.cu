@@ -2207,7 +2207,7 @@ static void mul_mat_vec_rocmfpx_fixed_k_launch(
         const uint32_t nsamples_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y,
         const uint32_t stride_sample_dst, const uint32_t ids_stride,
-        const int warp_size, cudaStream_t stream) {
+        const int warp_size, cudaStream_t stream, const bool ids_tokenwise_samples = false) {
     static_assert(type == GGML_TYPE_Q3_0_ROCMFPX ||
                   type == GGML_TYPE_Q2_0_ROCMFP2 ||
                   type == GGML_TYPE_IQ2_XXS ||
@@ -2226,7 +2226,17 @@ static void mul_mat_vec_rocmfpx_fixed_k_launch(
         stride_col_y, stride_col_dst, channel_ratio, stride_channel_x,
         stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x,
         stride_sample_y, stride_sample_dst, block_nums, block_dims, 0,
-        ids_stride, stream);
+        ids_stride, stream, ids_tokenwise_samples);
+}
+
+// gfx1151 fixed-K single-column launches (profiled DS4 shapes), shared by the dispatcher below and
+// mmvq_moe_matches_single_column.
+static bool mmvq_rocmfp3_fixed_k(const int cc, const int ncols_x) {
+    return is_gfx1151(cc) && ncols_x == 2048;
+}
+
+static bool mmvq_rocmfp2_fixed_k(const int cc, const int ncols_x) {
+    return is_gfx1151(cc) && (ncols_x == 4096 || ncols_x == 2048);
 }
 
 static void mul_mat_vec_rocmfp4_unroll2_launch(
@@ -2240,7 +2250,7 @@ static void mul_mat_vec_rocmfp4_unroll2_launch(
         const uint32_t nsamples_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y,
         const uint32_t stride_sample_dst, const uint32_t ids_stride,
-        const int warp_size, cudaStream_t stream) {
+        const int warp_size, cudaStream_t stream, const bool ids_tokenwise_samples = false) {
     const dim3 block_nums(nrows_x, nchannels_dst, nsamples_dst);
     const dim3 block_dims(warp_size, 1, 1);
     mul_mat_vec_q_switch_fusion<GGML_TYPE_Q4_0_ROCMFP4_FAST, 1, false, 0, true>(
@@ -2248,7 +2258,7 @@ static void mul_mat_vec_rocmfp4_unroll2_launch(
         stride_col_y, stride_col_dst, channel_ratio, stride_channel_x,
         stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x,
         stride_sample_y, stride_sample_dst, block_nums, block_dims, 0,
-        ids_stride, stream);
+        ids_stride, stream, ids_tokenwise_samples);
 }
 
 template <int ncols_dst>
@@ -2774,6 +2784,30 @@ static void mul_mat_vec_q8_0_rdna4_launch(
 }
 #endif // defined(GGML_USE_HIP)
 
+// True when the single-column launch for this type, device and K is the generic kernel with one wave per row:
+// each lane walks K in the same order and one warp reduction sums the row, which is also what the multi-token
+// MoE kernel does for every (token, row). Batch-invariant MUL_MAT_ID can then keep the MoE kernel, which serves
+// all tokens in one launch with its expert prefetch, for batches within its per-type width (its launch bounds;
+// batch-invariant dispatch also sends wider batches here). Multi-wave tables and the specialized single-column
+// launches (gfx1151 fixed-K ROCmFP, the FP4 unroll, the multi-row IQ kernels on AMD) reduce in another order, so
+// those take the tokenwise launch. test_ds41_mmid_width_invariance checks both cases per format and device.
+template <ggml_type type>
+static bool mmvq_moe_matches_single_column(const int cc, const int ncols_x, const int ncols_dst,
+                                           const mmvq_parameter_table_id table_id) {
+    if (ncols_dst > get_mmvq_mmid_max_batch(type, cc) ||
+        calc_nwarps(type, 1, table_id) != 1 || calc_rows_per_block(1, table_id, false, 1) != 1) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST: return !is_gfx1151(cc);
+        case GGML_TYPE_Q3_0_ROCMFPX:      return !mmvq_rocmfp3_fixed_k(cc, ncols_x);
+        case GGML_TYPE_Q2_0_ROCMFP2:      return !mmvq_rocmfp2_fixed_k(cc, ncols_x);
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ3_XXS:           return !GGML_CUDA_CC_IS_AMD(cc);
+        default:                          return true;
+    }
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -2782,9 +2816,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, cudaStream_t stream) {
+        const int ids_stride, cudaStream_t stream, const bool ids_tokenwise_samples = false) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
+    // Tokens as samples (see the batch-invariant MUL_MAT_ID case below) are a single-column launch.
+    GGML_ASSERT(!ids_tokenwise_samples || (ids != nullptr && ncols_dst == 1));
 
     const int device = ggml_cuda_get_device();
     const int                     cc        = ggml_cuda_info().devices[device].cc;
@@ -2806,11 +2842,28 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     const bool has_ids = ids != nullptr;
 
-    // Batch-invariant MUL_MAT_ID (ggml_backend_cuda_set_mmvq_batch_invariant, set by DS4.1 verification): run each
-    // token through the single-token path -- the decode kernel with its launch shape and reduction order -- so a
-    // verify batch reproduces decode bit for bit. The multi-token MoE kernel and the per-width launches reduce in a
+    static const bool use_moe_kernel =
+        mmvq_env_flag("LUCE_CUDA_MMVQ_MOE_KERNEL", true);
+
+    // Batch-invariant MUL_MAT_ID (ggml_backend_cuda_set_mmvq_batch_invariant, set by DS4.1 verification): every
+    // token must get the single-token path's arithmetic -- the decode kernel with its launch shape and reduction
+    // order -- so a verify batch reproduces decode bit for bit. The MoE kernel already does where the decode launch
+    // is the generic one-wave kernel (mmvq_moe_matches_single_column); elsewhere the multi-token kernels reduce in a
     // different order (test_ds41_mmid_width_invariance). For MUL_MAT_ID the columns are tokens.
-    if (has_ids && ncols_dst > 1 && ggml_cuda_mmvq_batch_invariant()) {
+    if (has_ids && ncols_dst > 1 && ggml_cuda_mmvq_batch_invariant() &&
+        !(use_moe_kernel && mmvq_moe_matches_single_column<type>(cc, ncols_x, ncols_dst, table_id))) {
+        // One launch: the tokens become the sample dimension of the single-token launch, and each block reads its
+        // token's expert ids, activations and output row, so every block runs the decode kernel's arithmetic for
+        // its token. Expert-bias fusions index the bias by sample, so they keep one launch per token.
+        if (nsamples_x == 1 && nsamples_dst == 1 && fusion.x_bias == nullptr && fusion.gate_bias == nullptr) {
+            mul_mat_vec_q_switch_ncols_dst<type>(
+                vx, vy, ids, fusion, dst, ncols_x, nrows_x, 1, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                /*nsamples_x=*/1, /*nsamples_dst=*/ncols_dst, /*stride_sample_x=*/0,
+                /*stride_sample_y=*/stride_col_y, /*stride_sample_dst=*/stride_col_dst, ids_stride, stream,
+                /*ids_tokenwise_samples=*/true);
+            return;
+        }
         for (int t = 0; t < ncols_dst; ++t) {
             mul_mat_vec_q_switch_ncols_dst<type>(
                 vx, (const block_q8_1 *) vy + (int64_t) t*stride_col_y, ids + (int64_t) t*ids_stride, fusion,
@@ -2971,9 +3024,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return;
     }
 
-    static const bool use_moe_kernel =
-        mmvq_env_flag("LUCE_CUDA_MMVQ_MOE_KERNEL", true);
-
     if (has_ids && ncols_dst > 1 && (use_moe_kernel || ncols_dst > MMVQ_MAX_BATCH_SIZE)) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
@@ -3088,26 +3138,26 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 channel_ratio_fd, stride_channel_x, stride_channel_y,
                 stride_channel_dst, nsamples_dst, sample_ratio_fd,
                 stride_sample_x, stride_sample_y, stride_sample_dst,
-                ids_stride, warp_size, stream);
+                ids_stride, warp_size, stream, ids_tokenwise_samples);
             return;
         }
     }
 
     if constexpr (type == GGML_TYPE_Q3_0_ROCMFPX) {
-        if (is_gfx1151(cc) && ncols_dst == 1 && ncols_x == 2048) {
+        if (ncols_dst == 1 && mmvq_rocmfp3_fixed_k(cc, ncols_x)) {
             mul_mat_vec_rocmfpx_fixed_k_launch<type, 2048>(
                 vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
                 nchannels_dst, stride_row_x, stride_col_y, stride_col_dst,
                 channel_ratio_fd, stride_channel_x, stride_channel_y,
                 stride_channel_dst, nsamples_dst, sample_ratio_fd,
                 stride_sample_x, stride_sample_y, stride_sample_dst,
-                ids_stride, warp_size, stream);
+                ids_stride, warp_size, stream, ids_tokenwise_samples);
             return;
         }
     }
 
     if constexpr (type == GGML_TYPE_Q2_0_ROCMFP2) {
-        if (is_gfx1151(cc) && ncols_dst == 1) {
+        if (ncols_dst == 1 && mmvq_rocmfp2_fixed_k(cc, ncols_x)) {
             if (ncols_x == 4096) {
                 mul_mat_vec_rocmfpx_fixed_k_launch<type, 4096>(
                     vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
@@ -3115,7 +3165,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     channel_ratio_fd, stride_channel_x, stride_channel_y,
                     stride_channel_dst, nsamples_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst,
-                    ids_stride, warp_size, stream);
+                    ids_stride, warp_size, stream, ids_tokenwise_samples);
                 return;
             }
             if (ncols_x == 2048) {
@@ -3125,7 +3175,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     channel_ratio_fd, stride_channel_x, stride_channel_y,
                     stride_channel_dst, nsamples_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst,
-                    ids_stride, warp_size, stream);
+                    ids_stride, warp_size, stream, ids_tokenwise_samples);
                 return;
             }
         }
@@ -3154,7 +3204,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     channel_ratio_fd, stride_channel_x, stride_channel_y,
                     stride_channel_dst, nsamples_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst,
-                    ids_stride, warp_size, stream);
+                    ids_stride, warp_size, stream, ids_tokenwise_samples);
                 return;
             }
             if (ncols_x == 2304) {
@@ -3164,7 +3214,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     channel_ratio_fd, stride_channel_x, stride_channel_y,
                     stride_channel_dst, nsamples_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst,
-                    ids_stride, warp_size, stream);
+                    ids_stride, warp_size, stream, ids_tokenwise_samples);
                 return;
             }
         }
@@ -3183,7 +3233,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
-                    stream);
+                    stream, ids_tokenwise_samples);
             } else {
                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                         nsamples_dst, warp_size, table_id);
@@ -3191,7 +3241,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
-                    stream);
+                    stream, ids_tokenwise_samples);
             }
         } break;
         case 2: {
