@@ -237,8 +237,8 @@ int ggml_cuda_get_device() {
 // model on a 125GB box). Managed memory has measurable alloc + access overhead on
 // this APU, so small models that fit stay on the faster hipMalloc path (verified:
 // 16GB model loads 3s / decodes 11.8 tok/s on hipMalloc vs 15s / 10.9 on managed).
-// The integrated flag reports the real HIP value; probe a fresh prop anyway.
-// Opt out: LUCE_HIP_NO_AUTO_UMA=1.
+// The cached ggml_cuda_info().devices[].integrated is hard-forced false (#15034
+// dodge), so probe a FRESH cudaDeviceProp. Opt out: LUCE_HIP_NO_AUTO_UMA=1.
 // Force-all: GGML_CUDA_ENABLE_UNIFIED_MEMORY. Tune gate: LUCE_HIP_UMA_MIN_FRAC.
 static size_t ggml_cuda_total_ram_bytes() {
     static const size_t cached = []() -> size_t {
@@ -596,12 +596,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
         info.default_tensor_split[id] = total_vram;
         total_vram += prop.totalGlobalMem;
-#if defined(GGML_USE_HIP)
-        // Report the real flag on HIP; #15034 was fixed by the scheduler graph-input ring buffer.
-        info.devices[id].integrated = prop.integrated;
-#else
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
-#endif
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
@@ -6043,7 +6038,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-                               ggml_backend_buft_is_cuda_split(node->src[j]->buffer->buft) || (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
+                               ggml_backend_buft_is_cuda_split(node->src[j]->buffer->buft) ||
+                               ((integrated || ggml_cuda_qwen4exp_enabled()) && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }
 #else
@@ -7083,14 +7079,8 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
 }
 
 static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {
-    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
-
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, ctx->device));
-
-    return prop.integrated
-        ? GGML_BACKEND_DEVICE_TYPE_IGPU
-        : GGML_BACKEND_DEVICE_TYPE_GPU;
+    GGML_UNUSED(dev);
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
 }
 
 static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {

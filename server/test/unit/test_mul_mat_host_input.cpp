@@ -13,11 +13,13 @@ int main() {
     if (!gpu) return 1;
     const auto dev = ggml_backend_get_device(gpu);
     const auto host_type = ggml_backend_dev_host_buffer_type(dev);
-    if (!host_type || !ggml_backend_dev_supports_buft(dev, host_type)) {
-        std::puts("SKIP: device does not support pinned host inputs");
+    // Pinned host inputs are the qwen4exp input ring's path on the gfx1151 iGPU.
+    if (!host_type || !ggml_backend_cuda_qwen4exp_supported(gpu)) {
+        std::puts("SKIP: pinned host inputs are a gfx1151 qwen4exp path");
         ggml_backend_free(gpu);
         return 0;
     }
+    const auto previous = ggml_backend_cuda_set_qwen4exp_profile(GGML_CUDA_QWEN4EXP_DEFAULT);
     bool ok = true;
     for (int n : {16, 17, 32}) {
         constexpr int k = 256, m = 256;
@@ -53,6 +55,7 @@ int main() {
         ggml_backend_buffer_free(host);
         ggml_free(ctx);
     }
+    ggml_backend_cuda_set_qwen4exp_profile(previous);
     ggml_backend_free(gpu);
     return ok ? 0 : 1;
 }

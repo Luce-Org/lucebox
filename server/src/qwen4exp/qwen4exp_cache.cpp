@@ -7,18 +7,13 @@ namespace luce::common {
 
 namespace {
 
-// The ring engages when the compute device is an integrated GPU that can read
-// the (pinned) host buffer type directly — the same condition the scheduler
-// UMA detection uses in ggml-backend.cpp.
+// The ring engages on the gfx1151 iGPU, which reads the pinned host buffer
+// type in place (the device stays reported as a GPU for every other model).
 bool qwen4exp_uma_ring_supported(ggml_backend_t backend) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) return false;
+    if (!ggml_backend_cuda_qwen4exp_supported(backend)) return false;
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
-        return false;
-    }
-    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
-    return host_buft != nullptr &&
-           ggml_backend_dev_supports_buft(dev, host_buft);
+    return dev != nullptr && ggml_backend_dev_host_buffer_type(dev) != nullptr;
 }
 
 }  // namespace

@@ -842,10 +842,10 @@ static void launch_gated_delta_net(
     const bool ampere_nvidia = GGML_CUDA_CC_IS_NVIDIA(cc)
                             && cc >= GGML_CUDA_CC_AMPERE
                             && cc <  GGML_CUDA_CC_ADA_LOVELACE;
-    // Tiled recurrence: chain path only, S_v=128 GDA at prefill batch sizes on
-    // RDNA3.5. Excludes tree, mapped verify, intermediate capture, raw gates and
+    // Tiled recurrence (qwen4exp graphs only): chain path, S_v=128 GDA at prefill
+    // batch sizes on RDNA3.5. Excludes tree, mapped verify, intermediate capture, raw gates and
     // multi-sequence batches, which the scalar/grouped kernels still own.
-    if (!KDA && !TREE_MODE && !WRITE_INTER &&
+    if (ggml_cuda_qwen4exp_enabled() && !KDA && !TREE_MODE && !WRITE_INTER &&
         active_slot_ids_d == nullptr && persist_inter_d == nullptr &&
         replay_log_d == nullptr && gate_bias == nullptr && gate_A == nullptr &&
         state_out_d != nullptr && n_seqs == 1 && S_v == 128 && H == 48 &&
