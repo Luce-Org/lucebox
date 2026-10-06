@@ -157,16 +157,6 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
 #pragma unroll
         for (int tid = lane; tid < 32; tid += 8) dequantize_iq4_xs<float>(row, k0 / QK, out, tid);
     }
-    else if constexpr (TYPE == GGML_TYPE_IQ4_NL) {
-#pragma unroll
-        for (int p = lane; p < 32; p += 8) {
-            const int pos = k0 + 2 * p, ib = pos / 32, q = (pos % 32) / 2;
-            const block_iq4_nl & b = ((const block_iq4_nl *) row)[ib];
-            const int o = ib * 32 + q - k0;
-            dst[o] = mmb_f2bf((float)b.d * kvalues_iq4nl[b.qs[q] & 15]);
-            dst[o + 16] = mmb_f2bf((float)b.d * kvalues_iq4nl[b.qs[q] >> 4]);
-        }
-    }
     else if constexpr (TYPE == GGML_TYPE_MXFP4) {
 #pragma unroll
         for (int p = lane; p < 32; p += 8) {

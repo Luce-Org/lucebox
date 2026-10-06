@@ -4,7 +4,6 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
-static bool ple_conv_enabled() { return true; }
 #if defined(__HIP_PLATFORM_AMD__)
 static __device__ __forceinline__ float ple_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
 static __device__ __forceinline__ float ple_add_rn(const float a, const float b) { float r; asm("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
@@ -53,7 +52,7 @@ static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __re
 }
 
 static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv_match & m) {
-    if (!ple_conv_enabled() || i < 0 || i + 2 >= cgraph->n_nodes) return false;
+    if (i < 0 || i + 2 >= cgraph->n_nodes) return false;
     const ggml_tensor * cc = cgraph->nodes[i];
     if ((cc->flags & GGML_TENSOR_FLAG_OUTPUT) || cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cc, 0) != 0) return false;
     const ggml_tensor * st = cc->src[0]; const ggml_tensor * tr = cc->src[1];
@@ -161,7 +160,6 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
 }
 bool ggml_cuda_ple_conv_match_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv_match & m) { return ple_conv_check(cgraph, i, m); }
 bool ggml_cuda_ple_conv_match_at_tap(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv_match & m) {
-    if (!ple_conv_enabled()) return false;
     const ggml_tensor * t = cgraph->nodes[i];
     if (t->op != GGML_OP_CONT || !t->src[0] || t->src[0]->op != GGML_OP_TRANSPOSE || !t->src[0]->view_src) return false;
     const ggml_tensor * cc = t->src[0]->view_src;
