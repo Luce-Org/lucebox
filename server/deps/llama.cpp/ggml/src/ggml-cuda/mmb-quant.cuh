@@ -10,7 +10,7 @@ struct mmb_quant_slice {
         uint16_t * dst;
         int index;
         __device__ void operator=(float value) const {
-            if (index >= 0 && index < 64) dst[index] = mmb_f2bf(value);
+            if (index >= 0 && index < 64) dst[index] = q4x_f2bf(value);
         }
     };
     __device__ mmb_quant_slice operator+(int64_t n) const { return {dst, begin, offset + (int) n}; }
@@ -28,8 +28,8 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
             float2 v;
             dequantize_q2_0(row, ib, qs, v);
             const int o = ib * QK + qs - k0;
-            dst[o] = mmb_f2bf(v.x);
-            dst[o + (QR == 1 ? 1 : QK / 2)] = mmb_f2bf(v.y);
+            dst[o] = q4x_f2bf(v.x);
+            dst[o + (QR == 1 ? 1 : QK / 2)] = q4x_f2bf(v.y);
         }
     }
     else if constexpr (TYPE == GGML_TYPE_Q4_0) {
@@ -40,8 +40,8 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
             float2 v;
             dequantize_q4_0(row, ib, qs, v);
             const int o = ib * QK + qs - k0;
-            dst[o] = mmb_f2bf(v.x);
-            dst[o + (QR == 1 ? 1 : QK / 2)] = mmb_f2bf(v.y);
+            dst[o] = q4x_f2bf(v.x);
+            dst[o + (QR == 1 ? 1 : QK / 2)] = q4x_f2bf(v.y);
         }
     }
     else if constexpr (TYPE == GGML_TYPE_Q4_1) {
@@ -52,8 +52,8 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
             float2 v;
             dequantize_q4_1(row, ib, qs, v);
             const int o = ib * QK + qs - k0;
-            dst[o] = mmb_f2bf(v.x);
-            dst[o + (QR == 1 ? 1 : QK / 2)] = mmb_f2bf(v.y);
+            dst[o] = q4x_f2bf(v.x);
+            dst[o + (QR == 1 ? 1 : QK / 2)] = q4x_f2bf(v.y);
         }
     }
     else if constexpr (TYPE == GGML_TYPE_Q5_0) {
@@ -64,8 +64,8 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
             float2 v;
             dequantize_q5_0(row, ib, qs, v);
             const int o = ib * QK + qs - k0;
-            dst[o] = mmb_f2bf(v.x);
-            dst[o + (QR == 1 ? 1 : QK / 2)] = mmb_f2bf(v.y);
+            dst[o] = q4x_f2bf(v.x);
+            dst[o + (QR == 1 ? 1 : QK / 2)] = q4x_f2bf(v.y);
         }
     }
     else if constexpr (TYPE == GGML_TYPE_Q5_1) {
@@ -76,8 +76,8 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
             float2 v;
             dequantize_q5_1(row, ib, qs, v);
             const int o = ib * QK + qs - k0;
-            dst[o] = mmb_f2bf(v.x);
-            dst[o + (QR == 1 ? 1 : QK / 2)] = mmb_f2bf(v.y);
+            dst[o] = q4x_f2bf(v.x);
+            dst[o + (QR == 1 ? 1 : QK / 2)] = q4x_f2bf(v.y);
         }
     }
     else if constexpr (TYPE == GGML_TYPE_Q8_0) {
@@ -88,8 +88,8 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
             float2 v;
             dequantize_q8_0(row, ib, qs, v);
             const int o = ib * QK + qs - k0;
-            dst[o] = mmb_f2bf(v.x);
-            dst[o + (QR == 1 ? 1 : QK / 2)] = mmb_f2bf(v.y);
+            dst[o] = q4x_f2bf(v.x);
+            dst[o + (QR == 1 ? 1 : QK / 2)] = q4x_f2bf(v.y);
         }
     }
     else if constexpr (TYPE == GGML_TYPE_Q2_K) {
@@ -164,8 +164,8 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
             const block_mxfp4 & b = ((const block_mxfp4 *) row)[ib];
             const float d = ggml_cuda_e8m0_to_fp32(b.e);
             const int o = ib * QK + q - k0;
-            dst[o] = mmb_f2bf(d * kvalues_mxfp4[b.qs[q] & 15] * 0.5f);
-            dst[o + QK / 2] = mmb_f2bf(d * kvalues_mxfp4[b.qs[q] >> 4] * 0.5f);
+            dst[o] = q4x_f2bf(d * kvalues_mxfp4[b.qs[q] & 15] * 0.5f);
+            dst[o + QK / 2] = q4x_f2bf(d * kvalues_mxfp4[b.qs[q] >> 4] * 0.5f);
         }
     }
     else if constexpr (TYPE == GGML_TYPE_NVFP4) {
@@ -177,8 +177,8 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
             const float d = ggml_cuda_ue4m3_to_fp32(b.d[sub]);
             const uint8_t q = b.qs[sub * (QK_NVFP4_SUB / 2) + j];
             const int o = ib * QK + sub * QK_NVFP4_SUB + j - k0;
-            dst[o] = mmb_f2bf(d * kvalues_mxfp4[q & 15]);
-            dst[o + QK_NVFP4_SUB / 2] = mmb_f2bf(d * kvalues_mxfp4[q >> 4]);
+            dst[o] = q4x_f2bf(d * kvalues_mxfp4[q & 15]);
+            dst[o + QK_NVFP4_SUB / 2] = q4x_f2bf(d * kvalues_mxfp4[q >> 4]);
         }
     }
 }
@@ -279,10 +279,10 @@ __device__ __forceinline__ void mmb_dq_q4k_slice(uint4 q0, uint4 q1, uint4 meta,
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const uint32_t q = words[j];
-        out[2*j] = mmb_pack2(d0 * (q & 15) - m0, d0 * ((q >> 8) & 15) - m0);
-        out[2*j + 1] = mmb_pack2(d0 * ((q >> 16) & 15) - m0, d0 * ((q >> 24) & 15) - m0);
-        out[16 + 2*j] = mmb_pack2(d1 * ((q >> 4) & 15) - m1, d1 * ((q >> 12) & 15) - m1);
-        out[16 + 2*j + 1] = mmb_pack2(d1 * ((q >> 20) & 15) - m1, d1 * (q >> 28) - m1);
+        out[2*j] = q4x_pack2(d0 * (q & 15) - m0, d0 * ((q >> 8) & 15) - m0);
+        out[2*j + 1] = q4x_pack2(d0 * ((q >> 16) & 15) - m0, d0 * ((q >> 24) & 15) - m0);
+        out[16 + 2*j] = q4x_pack2(d1 * ((q >> 4) & 15) - m1, d1 * ((q >> 12) & 15) - m1);
+        out[16 + 2*j + 1] = q4x_pack2(d1 * ((q >> 20) & 15) - m1, d1 * (q >> 28) - m1);
     }
 }
 
@@ -301,8 +301,8 @@ __device__ __forceinline__ void mmb_dq_q4k_stripe(uint4 q, uint4 meta, int slice
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const uint32_t v = words[j] >> (4 * half);
-            out[16*half + 2*j]     = mmb_pack2(ds * (v & 15) - ms, ds * ((v >> 8) & 15) - ms);
-            out[16*half + 2*j + 1] = mmb_pack2(ds * ((v >> 16) & 15) - ms, ds * ((v >> 24) & 15) - ms);
+            out[16*half + 2*j]     = q4x_pack2(ds * (v & 15) - ms, ds * ((v >> 8) & 15) - ms);
+            out[16*half + 2*j + 1] = q4x_pack2(ds * ((v >> 16) & 15) - ms, ds * ((v >> 24) & 15) - ms);
         }
     }
 }
@@ -321,10 +321,10 @@ __device__ __forceinline__ void mmb_dq_q51_one(const uint32_t * w, uint32_t * ou
             const int upper = ((q >> (8 * lane + 4)) & 15) | (((high >> (16 + 4 * j + lane)) & 1) << 4);
             lo[lane] = d * low + m; hi[lane] = d * upper + m;
         }
-        out[2*j] = mmb_pack2(lo[0],lo[1]);
-        out[2*j + 1] = mmb_pack2(lo[2],lo[3]);
-        out[8 + 2*j] = mmb_pack2(hi[0],hi[1]);
-        out[8 + 2*j + 1] = mmb_pack2(hi[2],hi[3]);
+        out[2*j] = q4x_pack2(lo[0],lo[1]);
+        out[2*j + 1] = q4x_pack2(lo[2],lo[3]);
+        out[8 + 2*j] = q4x_pack2(hi[0],hi[1]);
+        out[8 + 2*j + 1] = q4x_pack2(hi[2],hi[3]);
     }
 }
 
@@ -344,10 +344,10 @@ __device__ __forceinline__ void mmb_dq_q51_pair(uint4 a, uint4 b, uint4 c, uint3
                 const int upper = ((q >> (8 * lane + 4)) & 15) | (((high >> (16 + 4 * j + lane)) & 1) << 4);
                 lo[lane] = d * low + m; hi[lane] = d * upper + m;
             }
-            out[block * 16 + 2*j] = mmb_pack2(lo[0],lo[1]);
-            out[block * 16 + 2*j + 1] = mmb_pack2(lo[2],lo[3]);
-            out[block * 16 + 8 + 2*j] = mmb_pack2(hi[0],hi[1]);
-            out[block * 16 + 8 + 2*j + 1] = mmb_pack2(hi[2],hi[3]);
+            out[block * 16 + 2*j] = q4x_pack2(lo[0],lo[1]);
+            out[block * 16 + 2*j + 1] = q4x_pack2(lo[2],lo[3]);
+            out[block * 16 + 8 + 2*j] = q4x_pack2(hi[0],hi[1]);
+            out[block * 16 + 8 + 2*j + 1] = q4x_pack2(hi[2],hi[3]);
         }
     }
 }

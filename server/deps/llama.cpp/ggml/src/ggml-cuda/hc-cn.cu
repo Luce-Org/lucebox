@@ -1,37 +1,8 @@
 #include "hc-cn.cuh"
+#include "qwen4exp-common.cuh"
 #include <cstdlib>
 
-#if defined(__HIP_PLATFORM_AMD__)
-static __device__ __forceinline__ float hc_mul_rn(const float a, const float b) {
-    float result;
-    asm("v_mul_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
-    return result;
-}
-
-static __device__ __forceinline__ float hc_add_rn(const float a, const float b) {
-    float result;
-    asm("v_add_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
-    return result;
-}
-#else
-static __device__ __forceinline__ float hc_mul_rn(const float a, const float b) {
-    return __fmul_rn(a, b);
-}
-
-static __device__ __forceinline__ float hc_add_rn(const float a, const float b) {
-    return __fadd_rn(a, b);
-}
-#endif
-
-// same expression as op_sigmoid in unary.cu
-static __device__ __forceinline__ float hc_sigmoid(const float x) {
-    return 1.0f / (1.0f + expf(-x));
-}
-
 #define HC_CN_MAX_EMB 3072
-
-__device__ __forceinline__ float hc_bf2f32(const uint16_t h) { return __uint_as_float(((uint32_t) h) << 16); }
-__device__ __forceinline__ uint16_t hc_f2bf32(const float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 
 #define HC_CN_BLOCK2 256
 
@@ -49,9 +20,6 @@ static __device__ __forceinline__ void hc_q8_pair(int8_t * q8, const int nkb, co
     *(uint16_t *) (tile + (pos / 16) * 256 + tl * 16 + (pos % 16)) = (uint16_t) ((q0 & 0xff) | ((q1 & 0xff) << 8));
     if ((threadIdx.x & 15) == 0) *(float *) (tile + 512 + tl * 4) = d;
 }
-__device__ __forceinline__ uint32_t hc_pack2(const float a, const float b) {
-    return (uint32_t) hc_f2bf32(a) | ((uint32_t) hc_f2bf32(b) << 16);
-}
 
 // two elements per thread per iteration, packed 32-bit accesses
 static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b256(
@@ -62,7 +30,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
     __shared__ float s_sum[32];
     const int c = blockIdx.x, t = blockIdx.y, hc = gridDim.x, tid = threadIdx.x;
     const float x1 = s1 * inject[(int64_t) t * hc + c] + b1;
-    const float x2 = hc_sigmoid(x1);
+    const float x2 = q4x_sigmoid(x1);
     const float w  = s2 * x2 + b2;
     const int64_t row = (int64_t) t * hc + c;
     const float * res = residual  + row * n_embd;
@@ -78,13 +46,13 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
         if (col + 1 < n_embd) {
             const float2 r = *(const float2 *)(res + col);
             const float2 m = *(const float2 *)(blk + col);
-            const float a0 = hc_add_rn(r.x, hc_mul_rn(m.x, w));
-            const float a1 = hc_add_rn(r.y, hc_mul_rn(m.y, w));
+            const float a0 = q4x_add_rn(r.x, q4x_mul_rn(m.x, w));
+            const float a1 = q4x_add_rn(r.y, q4x_mul_rn(m.y, w));
             *(float2 *)(dst + col) = make_float2(a0, a1);
             xs[2 * k] = a0; xs[2 * k + 1] = a1;
             tmp += a0 * a0 + a1 * a1;
         } else if (col < n_embd) {
-            const float a0 = hc_add_rn(res[col], hc_mul_rn(blk[col], w));
+            const float a0 = q4x_add_rn(res[col], q4x_mul_rn(blk[col], w));
             dst[col] = a0;
             xs[2 * k] = a0;
             tmp += a0 * a0;
@@ -103,12 +71,12 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
             const float2 gv = *(const float2 *)(g + col);
             const float v0 = scale * xs[2 * k] * gv.x, v1 = scale * xs[2 * k + 1] * gv.y;
             if (store_xn_f32) *(float2 *)(xn + col) = make_float2(v0, v1);
-            if (xh) *(uint32_t *)(xh + col) = hc_pack2(v0, v1);
+            if (xh) *(uint32_t *)(xh + col) = q4x_pack2(v0, v1);
             if (q8) hc_q8_pair(q8, gridDim.x * n_embd / 32, t, c * n_embd + col, v0, v1);
         } else if (col < n_embd) {
             const float v0 = scale * xs[2 * k] * g[col];
             if (store_xn_f32) xn[col] = v0;
-            if (xh) xh[col] = hc_f2bf32(v0);
+            if (xh) xh[col] = q4x_f2bf(v0);
         }
     }
 }
@@ -128,7 +96,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_moe_f3
     const int t = blockIdx.x, tid = threadIdx.x;
     constexpr int KP = (HC_CN_MAX_EMB / 2 + HC_CN_BLOCK2 - 1) / HC_CN_BLOCK2;
     float ms[2 * KP];
-    const float sig = hc_sigmoid(sh_logit[t]);
+    const float sig = q4x_sigmoid(sh_logit[t]);
     const float * wr = moe_w + (int64_t) t * w_s1;
     // Routes outermost: every route issues all of this thread's column loads at once (the per-element add order is
     // still route order, so the result is unchanged).
@@ -171,7 +139,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_moe_f3
     }
     for (int c = 0; c < hc; ++c) {
         const float x1 = s1 * inject[(int64_t) t * hc + c] + b1;
-        const float x2 = hc_sigmoid(x1);
+        const float x2 = q4x_sigmoid(x1);
         const float w  = s2 * x2 + b2;
         const int64_t row = (int64_t) t * hc + c;
         const float * res = residual + row * n_embd;
@@ -185,14 +153,14 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_moe_f3
             if (col + 1 < n_embd) {
                 const float2 v = *(const float2 *)(res + col);
                 const float r0 = v.x, r1 = v.y, m0 = ms[2 * k], m1 = ms[2 * k + 1];
-                const float a0 = hc_add_rn(r0, hc_mul_rn(m0, w));
-                const float a1 = hc_add_rn(r1, hc_mul_rn(m1, w));
+                const float a0 = q4x_add_rn(r0, q4x_mul_rn(m0, w));
+                const float a1 = q4x_add_rn(r1, q4x_mul_rn(m1, w));
                 *(float2 *)(dst + col) = make_float2(a0, a1);
                 xs[2 * k] = a0; xs[2 * k + 1] = a1;
                 tmp += a0 * a0 + a1 * a1;
             } else if (col < n_embd) {
                 const float r0 = res[col], m0 = ms[2 * k];
-                const float a0 = hc_add_rn(r0, hc_mul_rn(m0, w));
+                const float a0 = q4x_add_rn(r0, q4x_mul_rn(m0, w));
                 dst[col] = a0;
                 xs[2 * k] = a0;
                 tmp += a0 * a0;
@@ -211,12 +179,12 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_moe_f3
                 const float2 gv = *(const float2 *)(g + col);
                 const float v0 = scale * xs[2 * k] * gv.x, v1 = scale * xs[2 * k + 1] * gv.y;
                 if (store_xn_f32) *(float2 *)(xn + col) = make_float2(v0, v1);
-                if (xh) *(uint32_t *)(xh + col) = hc_pack2(v0, v1);
+                if (xh) *(uint32_t *)(xh + col) = q4x_pack2(v0, v1);
                 if (q8) hc_q8_pair(q8, hc * n_embd / 32, t, c * n_embd + col, v0, v1);
             } else if (col < n_embd) {
                 const float v0 = scale * xs[2 * k] * g[col];
                 if (store_xn_f32) xn[col] = v0;
-                if (xh) xh[col] = hc_f2bf32(v0);
+                if (xh) xh[col] = q4x_f2bf(v0);
             }
         }
         __syncthreads();   // s_sum is reused by the next stream's reduction

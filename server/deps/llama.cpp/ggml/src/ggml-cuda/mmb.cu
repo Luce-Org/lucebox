@@ -1,4 +1,5 @@
 #include "mmb.cuh"
+#include "qwen4exp-common.cuh"
 #include "unary.cuh"
 #include "convert.cuh"
 #include <unordered_map>
@@ -14,8 +15,6 @@ typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 
-__device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
-__device__ __forceinline__ uint32_t mmb_pack2(float a, float b) { return (uint32_t)mmb_f2bf(a) | ((uint32_t)mmb_f2bf(b) << 16); }
 __constant__ int8_t mmb_kv_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 __device__ __forceinline__ float mmb_h2f(uint16_t h) { return (float) __builtin_bit_cast(_Float16, h); }
 
@@ -23,10 +22,10 @@ __global__ void mmb_cvt_f32_bf16(const float * __restrict__ x, uint16_t * __rest
     size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
     if (i + 8 <= n) {
         const float4 a = *(const float4 *)(x + i), b = *(const float4 *)(x + i + 4);
-        uint4 o; o.x = mmb_pack2(a.x, a.y); o.y = mmb_pack2(a.z, a.w); o.z = mmb_pack2(b.x, b.y); o.w = mmb_pack2(b.z, b.w);
+        uint4 o; o.x = q4x_pack2(a.x, a.y); o.y = q4x_pack2(a.z, a.w); o.z = q4x_pack2(b.x, b.y); o.w = q4x_pack2(b.z, b.w);
         *(uint4 *)(y + i) = o;
     } else {
-        for (; i < n; ++i) y[i] = mmb_f2bf(x[i]);
+        for (; i < n; ++i) y[i] = q4x_f2bf(x[i]);
     }
 }
 
@@ -69,8 +68,8 @@ __device__ __forceinline__ void mmb_dq_row36(const uint4 w0, const uint4 w1, con
                 x[h][2] = fmaf((float)((u >> 16) & 0xFFu), d, md);
                 x[h][3] = fmaf((float)(u >> 24), d, md);
             }
-            out[2*w] = mmb_pack2(x[0][0], x[0][1]); out[2*w + 1] = mmb_pack2(x[0][2], x[0][3]);
-            out[8 + 2*w] = mmb_pack2(x[1][0], x[1][1]); out[8 + 2*w + 1] = mmb_pack2(x[1][2], x[1][3]);
+            out[2*w] = q4x_pack2(x[0][0], x[0][1]); out[2*w + 1] = q4x_pack2(x[0][2], x[0][3]);
+            out[8 + 2*w] = q4x_pack2(x[1][0], x[1][1]); out[8 + 2*w + 1] = q4x_pack2(x[1][2], x[1][3]);
         }
     }
 }
@@ -87,7 +86,7 @@ __device__ __forceinline__ void mmb_dq_row68(const uint4 w0, const uint4 w1, con
             const uint32_t v = blk ? ws[9 + w] : ((ws[w] >> 16) | (ws[w + 1] << 16));
             const float e0 = d * (float)(int8_t)(v      ), e1 = d * (float)(int8_t)(v >>  8);
             const float e2 = d * (float)(int8_t)(v >> 16), e3 = d * (float)(int8_t)(v >> 24);
-            out[2*w] = mmb_pack2(e0, e1); out[2*w + 1] = mmb_pack2(e2, e3);
+            out[2*w] = q4x_pack2(e0, e1); out[2*w + 1] = q4x_pack2(e2, e3);
         }
     }
 }
@@ -115,7 +114,7 @@ __device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restri
             // DH_F16: the half copy is F16 (saturating, as the Q8F16 activations) instead of bf16.
             auto pk = [](const float a, const float b) -> uint32_t {
                 if constexpr (DH_F16) return (uint32_t) __builtin_bit_cast(uint16_t, mq_f2h_sat(a)) | ((uint32_t) __builtin_bit_cast(uint16_t, mq_f2h_sat(b)) << 16);
-                else return mmb_pack2(a, b);
+                else return q4x_pack2(a, b);
             };
             if (full && (M & 7) == 0) { *(uint4 *)(Dh + base) = make_uint4(pk(v0.x, v0.y), pk(v0.z, v0.w), pk(v1.x, v1.y), pk(v1.z, v1.w)); }
             else { const float vv[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
@@ -249,15 +248,6 @@ mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ X
         [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, Dh, store_f32, M, [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs);
 }
 
-#if defined(__HIP_PLATFORM_AMD__)
-__device__ __forceinline__ float gm_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
-__device__ __forceinline__ float gm_add_rn(const float a, const float b) { float r; asm("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
-#else
-__device__ __forceinline__ float gm_mul_rn(const float a, const float b) { return __fmul_rn(a, b); }
-__device__ __forceinline__ float gm_add_rn(const float a, const float b) { return __fadd_rn(a, b); }
-#endif
-__device__ __forceinline__ float gm_sigmoid(const float x) { return 1.0f / (1.0f + expf(-x)); }
-__device__ __forceinline__ float gm_bf2f(const uint16_t h) { return __uint_as_float(((uint32_t) h) << 16); }
 
 template <int HC, int WTYPE = 0, int CH = 32, int TN = 2>
 __global__ void __launch_bounds__(MMB_NT, 2)
@@ -340,13 +330,13 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
             float s = 0.f;
 #pragma unroll
             for (int c = 0; c < HC; ++c) {
-                const float g = __uint_as_float(((uint32_t) mmb_f2bf(acc[c][j][e])) << 16);   // the gate GEMM's BF16 epilogue rounding
-                const float term = gm_mul_rn(gm_bf2f(xr[(size_t)c * E]), gm_sigmoid(g));
-                s = (c == 0) ? term : gm_add_rn(s, term);
+                const float g = __uint_as_float(((uint32_t) q4x_f2bf(acc[c][j][e])) << 16);   // the gate GEMM's BF16 epilogue rounding
+                const float term = q4x_mul_rn(q4x_bf2f(xr[(size_t)c * E]), q4x_sigmoid(g));
+                s = (c == 0) ? term : q4x_add_rn(s, term);
             }
             const float o = scale * s + bias;
             if (store_f32) Out[(size_t)t * E + ch] = o;
-            if (OutH) OutH[(size_t)t * E + ch] = mmb_f2bf(o);
+            if (OutH) OutH[(size_t)t * E + ch] = q4x_f2bf(o);
         }
     }
 }
@@ -693,10 +683,10 @@ __global__ void mmb_dq_q6k_bf16_kernel(const uint8_t * __restrict__ W, uint16_t 
             const int8_t q2 = (int8_t)((QL[l + 32] & 0xF) | (((QH[l] >> 2) & 3) << 4)) - 32;
             const int8_t q3 = (int8_t)((QL[l +  0] >>  4) | (((QH[l] >> 4) & 3) << 4)) - 32;
             const int8_t q4 = (int8_t)((QL[l + 32] >>  4) | (((QH[l] >> 6) & 3) << 4)) - 32;
-            Y[l +  0] = mmb_f2bf(d * S[is + 0] * q1);
-            Y[l + 32] = mmb_f2bf(d * S[is + 2] * q2);
-            Y[l + 64] = mmb_f2bf(d * S[is + 4] * q3);
-            Y[l + 96] = mmb_f2bf(d * S[is + 6] * q4);
+            Y[l +  0] = q4x_f2bf(d * S[is + 0] * q1);
+            Y[l + 32] = q4x_f2bf(d * S[is + 2] * q2);
+            Y[l + 64] = q4x_f2bf(d * S[is + 4] * q3);
+            Y[l + 96] = q4x_f2bf(d * S[is + 6] * q4);
         }
     }
 }
@@ -715,7 +705,7 @@ __global__ void mmb_dq_iq4nl_bf16_kernel(const uint8_t * __restrict__ W, uint16_
         const float l1 = d * mmb_kv_iq4nl[(v >>  8) & 0xF], h1 = d * mmb_kv_iq4nl[(v >> 12) & 0xF];
         const float l2 = d * mmb_kv_iq4nl[(v >> 16) & 0xF], h2 = d * mmb_kv_iq4nl[(v >> 20) & 0xF];
         const float l3 = d * mmb_kv_iq4nl[(v >> 24) & 0xF], h3 = d * mmb_kv_iq4nl[(v >> 28) & 0xF];
-        o[2*w] = mmb_pack2(l0, l1); o[2*w + 1] = mmb_pack2(l2, l3); o[8 + 2*w] = mmb_pack2(h0, h1); o[8 + 2*w + 1] = mmb_pack2(h2, h3);
+        o[2*w] = q4x_pack2(l0, l1); o[2*w + 1] = q4x_pack2(l2, l3); o[8 + 2*w] = q4x_pack2(h0, h1); o[8 + 2*w + 1] = q4x_pack2(h2, h3);
     }
 }
 static std::unordered_map<const void *, uint16_t *> g_mmb_shadow;

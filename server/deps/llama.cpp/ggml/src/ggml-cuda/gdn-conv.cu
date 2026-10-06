@@ -1,22 +1,7 @@
 #include "gdn-conv.cuh"
+#include "qwen4exp-common.cuh"
 #include "unary.cuh"
 #include <cstdlib>
-
-// Preserve the old recurrent state in otherwise-unused concat columns, then
-// materialize only the tail consumed by the state checkpoint.
-static __global__ void gdn_concat_tail(const float * __restrict__ state, const float * __restrict__ x, float * __restrict__ out,
-                                       const int C, const int T, const int tail_from, const int row_stride) {
-    const int ncols = T + 3 - tail_from;
-    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t) C * (3 + ncols)) return;
-    const int c = (int) (idx / (3 + ncols)), col = (int) (idx % (3 + ncols));
-    if (col < 3) {
-        out[(size_t) c * row_stride + col] = state[c * 3 + col];
-    } else {
-        const int j = tail_from + col - 3;
-        out[(size_t) c * row_stride + j] = (j < 3) ? state[c * 3 + j] : x[(size_t) (j - 3) * C + c];
-    }
-}
 
 template <int TT>
 static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float * __restrict__ saved_state, const float * __restrict__ x,
@@ -98,7 +83,7 @@ bool ggml_cuda_gdn_conv_match_at_conv(const ggml_cgraph * cgraph, int j, ggml_cu
 void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m) {
     const int ncols = (int) (m.T + 3 - m.tail_from);
     const int64_t n = m.C * (3 + ncols);
-    gdn_concat_tail<<<(unsigned) ((n + 255) / 256), 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.input->data,
+    q4x_conv_concat_tail<3><<<(unsigned) ((n + 255) / 256), 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.input->data,
         (float *) m.concat->data, (int) m.C, (int) m.T, (int) m.tail_from, (int) (m.concat->nb[1] / sizeof(float)));
     CUDA_CHECK(cudaGetLastError());
 }

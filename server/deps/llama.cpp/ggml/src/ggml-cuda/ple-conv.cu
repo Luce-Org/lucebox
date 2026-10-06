@@ -1,30 +1,10 @@
 #include "ple-conv.cuh"
+#include "qwen4exp-common.cuh"
 #include "unary.cuh"
 #include "convert.cuh"
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
-#if defined(__HIP_PLATFORM_AMD__)
-static __device__ __forceinline__ float ple_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
-static __device__ __forceinline__ float ple_add_rn(const float a, const float b) { float r; asm("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
-#else
-static __device__ __forceinline__ float ple_mul_rn(const float a, const float b) { return __fmul_rn(a, b); }
-static __device__ __forceinline__ float ple_add_rn(const float a, const float b) { return __fadd_rn(a, b); }
-#endif
-
-static __global__ void ple_concat_tail(const float * __restrict__ state, const float * __restrict__ x, float * __restrict__ out,
-                                       const int C, const int T, const int H, const int tail_from, const int row_stride) {
-    const int ncols = T + H - tail_from;
-    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t) C * (H + ncols)) return;
-    const int c = (int) (idx / (H + ncols)), col = (int) (idx % (H + ncols));
-    if (col < H) {
-        out[(size_t) c * row_stride + col] = state[c * H + col];
-    } else {
-        const int j = tail_from + col - H;
-        out[(size_t) c * row_stride + j] = (j < H) ? state[c * H + j] : x[(size_t) (j - H) * C + c];
-    }
-}
 
 template <int K, int DIL, int TT, typename W>
 static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __restrict__ saved_state, const float * __restrict__ x,
@@ -41,9 +21,9 @@ static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __re
     for (int k = 0; k < WIN; ++k) win[k] = ld(t0 + k);
     const int tend = min(T, t0 + TT);
     for (int t = t0; t < tend; ++t) {
-        float s = ple_mul_rn(win[0], wr[0]);
+        float s = q4x_mul_rn(win[0], wr[0]);
 #pragma unroll
-        for (int k = 1; k < K; ++k) s = ple_add_rn(s, ple_mul_rn(win[k * DIL], wr[k]));
+        for (int k = 1; k < K; ++k) s = q4x_add_rn(s, q4x_mul_rn(win[k * DIL], wr[k]));
         y[(size_t) t * C + c] = ggml_cuda_op_silu_single(s);
 #pragma unroll
         for (int k = 0; k < WIN - 1; ++k) win[k] = win[k + 1];
@@ -167,10 +147,11 @@ bool ggml_cuda_ple_conv_match_at_tap(const ggml_cgraph * cgraph, int i, ggml_cud
     return false;
 }
 void ggml_cuda_ple_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_ple_conv_match & m) {
+    GGML_ASSERT(m.H == 9);   // ple_conv_check only matches the K = 4, dilation 3 conv
     const int ncols = (int) (m.T + m.H - m.tail_from);
     const int64_t n = m.C * (m.H + ncols);
-    ple_concat_tail<<<(unsigned) ((n + 255) / 256), 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.input->data,
-        (float *) m.concat->data, (int) m.C, (int) m.T, (int) m.H, (int) m.tail_from, (int) (m.concat->nb[1] / sizeof(float)));
+    q4x_conv_concat_tail<9><<<(unsigned) ((n + 255) / 256), 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.input->data,
+        (float *) m.concat->data, (int) m.C, (int) m.T, (int) m.tail_from, (int) (m.concat->nb[1] / sizeof(float)));
     CUDA_CHECK(cudaGetLastError());
 }
 void ggml_cuda_ple_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_ple_conv_match & m) {
