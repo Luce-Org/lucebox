@@ -17,8 +17,7 @@
 namespace luce::common {
 
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
-        Qwen4ExpCache & cache, int slots, int resident_slots) {
-    if (slots < 1 || resident_slots < 1 || resident_slots > slots) return 0;
+        Qwen4ExpCache & cache) {
     size_t free_device = 0, total = 0, free_host = 0;
     ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device_id(backend), &free_device, &total);
     ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_host, &total);
@@ -39,12 +38,12 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         count_shadow(w.ctx);
         for (auto * ctx : w.extra_meta_ctxs) count_shadow(ctx);
     }
-    const size_t state = ggml_backend_buffer_get_size(cache.buf);
     const auto decode = qwen4exp_graph_memory(backend, w, cache, 1, cache.max_ctx - 1);
     if (decode.graph == SIZE_MAX) return 0;
-    // A decode workspace can remain resident in every slot while another slot
-    // prefills. Shared weights, shadows and scratch are counted only once.
-    const size_t fixed = (slots - resident_slots) * state + shadow + shadow_tmp + slots * decode.graph;
+    // The decode workspace stays resident while the next prompt prefills.
+    const size_t fixed = shadow + shadow_tmp + decode.graph;
+    struct Plan { size_t graph = 0, ring = 0, host = 0, scratch = 0; };
+    std::vector<std::pair<int, Plan>> plans;   // one per probed chunk size
     const int chunk = qwen4exp_fit_chunk(cache.max_ctx, available, fixed, [&](int n) {
         size_t graph = 0, inputs = 0, mask = 0, host = 0, scratch = 0;
         // End-of-context QSA workspace, and the largest dense span before QSA.
@@ -72,13 +71,17 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         for (const int tail : {511, 127, 1}) {
             if (tail < n && !measure(tail, cache.max_ctx)) return SIZE_MAX;
         }
-        const size_t workspace = graph + slots * (inputs + mask) + host + scratch;
-        std::fprintf(stderr, "[qwen4exp] chunk-plan rows=%d graph=%zu ring=%zu host=%zu scratch=%zu required=%zu available=%zu\n",
-            n, graph, slots * (inputs + mask), host, scratch, fixed + workspace, available);
-        return workspace;
+        plans.push_back({n, {graph, inputs + mask, host, scratch}});
+        return graph + inputs + mask + host + scratch;
     });
-    std::fprintf(stderr, "[qwen4exp] chunk-auto ctx=%d slots=%d resident=%d chunk=%d state=%zu fixed=%zu available=%zu headroom=%zu\n",
-        cache.max_ctx, slots, resident_slots, chunk, state, fixed, available, available / 10);
+    for (const auto & [rows, p] : plans) {
+        if (rows != chunk) continue;
+        std::fprintf(stderr, "[qwen4exp] chunk-plan rows=%d graph=%zu ring=%zu host=%zu scratch=%zu required=%zu available=%zu\n",
+            rows, p.graph, p.ring, p.host, p.scratch, fixed + p.graph + p.ring + p.host + p.scratch, available);
+        break;
+    }
+    std::fprintf(stderr, "[qwen4exp] chunk-auto ctx=%d chunk=%d fixed=%zu available=%zu headroom=%zu\n",
+        cache.max_ctx, chunk, fixed, available, available / 10);
     return chunk;
 }
 
@@ -105,14 +108,13 @@ bool Qwen4ExpBackend::init() {
                      luce_last_error());
         return false;
     }
-    if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx,
-                               GGML_TYPE_F16, cache_)) {
+    if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_)) {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
         return false;
     }
-    chunk_ = cfg_.chunk > 0 ? cfg_.chunk : qwen4exp_select_chunk(backend_, weights_, cache_, cfg_.slots);
+    chunk_ = cfg_.chunk > 0 ? cfg_.chunk : qwen4exp_select_chunk(backend_, weights_, cache_);
     if (chunk_ <= 0) {
-        std::fprintf(stderr, "[qwen4exp] insufficient prefill memory at configured context/slots\n");
+        std::fprintf(stderr, "[qwen4exp] insufficient prefill memory at the configured context\n");
         return false;
     }
     return true;
@@ -154,8 +156,7 @@ bool Qwen4ExpBackend::unpark(ParkTarget target) {
                      luce_last_error());
         return false;
     }
-    if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx,
-                               GGML_TYPE_F16, cache_)) {
+    if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_)) {
         std::fprintf(stderr, "[qwen4exp] unpark cache creation failed\n");
         free_qwen4exp_weights(weights_);
         return false;
@@ -204,7 +205,7 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
         std::future<Qwen4ExpInputs> pending;
         if (next < req.prompt.size()) pending = std::async(std::launch::async, prepare, next);
         const Qwen4ExpForwardResult r = qwen4exp_forward(
-            backend_, weights_, cache_, req.prompt.data() + i, n, pos, logits, false, &inputs);
+            backend_, weights_, cache_, req.prompt.data() + i, n, pos, logits, &inputs);
         if (!r.ok) {
             result.fail(GenerateErrorCode::PrefillFailed, "qwen4exp prefill forward failed");
             return result;

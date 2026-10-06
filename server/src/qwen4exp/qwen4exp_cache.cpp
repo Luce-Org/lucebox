@@ -19,10 +19,15 @@ bool qwen4exp_uma_ring_supported(ggml_backend_t backend) {
 }  // namespace
 
 bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
-                           int max_ctx, ggml_type kv_type, Qwen4ExpCache & out, bool reference) {
-    const Qwen4ExpCudaScope profile(w.gfx1151, reference);
-    out.reference = reference;
-    if (max_ctx <= 0) return false;
+                           int max_ctx, Qwen4ExpCache & out) {
+    const Qwen4ExpCudaScope profile(w.gfx1151);
+    // The QSA cell-id kernel is exact for positions below 2^24.
+    if (max_ctx <= 0 || max_ctx >= (1 << 24)) {
+        std::fprintf(stderr, "[qwen4exp] cache: context %d out of range (1..%d)\n",
+                     max_ctx, (1 << 24) - 1);
+        return false;
+    }
+    constexpr ggml_type kv_type = GGML_TYPE_F16;
 
     out.full_layer_ids.clear();
     out.linear_layer_ids.clear();
@@ -80,7 +85,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
 
     // Packed attention reads groups of four keys even for an unaligned
     // logical context limit. Padding is masked by the causal cell IDs.
-    const int64_t align = reference ? 256 : profile.optimized ? 4 : 1;
+    const int64_t align = profile.optimized ? 4 : 1;
     const int64_t kv_capacity = (static_cast<int64_t>(max_ctx) + align - 1) / align * align;
     for (size_t i = 0; i < n_full; ++i) {
         out.attn_k[i] = ggml_new_tensor_3d(out.ctx, kv_type,
@@ -111,9 +116,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
     }
 
     out.max_ctx = max_ctx;
-    out.cur_pos = 0;
     out.indexer_blocks = 0;
-    out.kv_type = kv_type;
     out.input_ring.enabled = qwen4exp_uma_ring_supported(backend);
     if (out.input_ring.enabled) {
         std::fprintf(stderr,
@@ -166,7 +169,6 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
     c.full_layer_ids.clear();
     c.linear_layer_ids.clear();
     c.ple_prev.clear();
-    c.cur_pos = 0;
     c.max_ctx = 0;
 }
 
@@ -184,7 +186,6 @@ void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c) {
     for (ggml_tensor * t : c.ple_conv_state) {
         if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
     }
-    c.cur_pos = 0;
     c.indexer_blocks = 0;
     c.ple_prev.clear();
 }

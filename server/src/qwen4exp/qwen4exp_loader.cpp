@@ -308,9 +308,9 @@ bool Qwen4ExpPleReader::gather(const int32_t * rows, int64_t n, float * dst) con
 // ─── Loader ─────────────────────────────────────────────────────────────
 
 bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
-                        Qwen4ExpWeights & out, bool reference) {
+                        Qwen4ExpWeights & out) {
     out.gfx1151 = ggml_backend_cuda_qwen4exp_supported(backend);
-    const Qwen4ExpCudaScope profile(out.gfx1151, reference);
+    const Qwen4ExpCudaScope profile(out.gfx1151);
     // Open every shard of the model; a single-file GGUF is a one-element list.
     std::vector<ShardSource> shards;
     for (const std::string & shard_path : discover_shard_paths(path)) {
@@ -350,7 +350,6 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
             }
         }
         out.extra_meta_ctxs.clear();
-        out.backend = nullptr;
         return false;
     };
 
@@ -415,7 +414,6 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     out.n_embd_head_v = static_cast<int>(head_v);
     out.full_attention_interval = static_cast<int>(fai);
     out.n_ff_exp = static_cast<int>(n_ff_exp);
-    out.n_ff_shexp = static_cast<int>(n_ff_sh);
     out.n_expert = static_cast<int>(n_expert);
     out.n_expert_used = static_cast<int>(n_used);
     out.n_hc = static_cast<int>(n_hc);
@@ -423,10 +421,8 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     out.ssm_d_conv = static_cast<int>(ssm_conv);
     out.ssm_d_inner = static_cast<int>(ssm_inner);
     out.ssm_d_state = static_cast<int>(ssm_state);
-    out.ssm_dt_rank = static_cast<int>(ssm_dt);
     out.ssm_n_group = static_cast<int>(ssm_grp);
     out.linear_value_heads = static_cast<int>(ssm_inner / ssm_state);
-    out.linear_key_heads = static_cast<int>(ssm_grp);
     out.indexer_n_head = static_cast<int>(idx_head);
     out.indexer_head_size = static_cast<int>(idx_dim);
     out.indexer_top_k = static_cast<int>(idx_topk);
@@ -450,6 +446,14 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     if (out.compress_ratios.size() < n_layer) {
         return fail("missing or short attention.compress_ratios");
     }
+    // Selected attention runs the exact integer cell-id kernel, which covers
+    // blocks of 4 tokens (every published Qwen3.8-Flash-Next GGUF).
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (out.compress_ratios[il] > 1 && out.compress_ratios[il] != 4) {
+            return fail("layer " + std::to_string(il) + ": attention block ratio " +
+                        std::to_string(out.compress_ratios[il]) + " is not supported (only 4)");
+        }
+    }
     out.ple_layer_ids = get_i32_array(gctx, P + "ple.layers");
     {
         const std::vector<uint64_t> offs = get_u64_array(gctx, P + "ple.head_offsets");
@@ -459,7 +463,6 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     }
     out.ple_layer_multipliers = get_u64_array(gctx, P + "ple.layer_multipliers");
     out.ple_eos_token_id = static_cast<int32_t>(get_u32_or(gctx, P + "ple.eos_token_id", 0xFFFFFFFFu));
-    out.ple_image_token_id = static_cast<int32_t>(get_u32_or(gctx, P + "ple.image_token_id", 0xFFFFFFFFu));
     if (out.ple_head_offsets.size() != static_cast<size_t>(out.ple_n_heads) ||
         out.ple_head_vocab_sizes.size() != static_cast<size_t>(out.ple_n_heads)) {
         return fail("ple head offset/vocab arrays do not match (ngram_size-1)*heads_per_ngram");
@@ -492,7 +495,6 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     };
 
     out.tok_embd = tensor("token_embd.weight");
-    out.out_norm = tensor("output_norm.weight");   // qwen4exp folds this into output_hc_*
     out.output   = tensor("output.weight");
     out.output_hc_norm = tensor("output_hc_norm.weight");
     out.output_hc_down = tensor("output_hc_down.weight");
@@ -591,7 +593,6 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     // shard-2 PLE table are never uploaded).
     std::unordered_set<ggml_tensor *> wanted;
     auto add = [&](ggml_tensor * value) { if (value) wanted.insert(value); };
-    add(out.out_norm);
     add(out.output);
     add(out.output_hc_norm);
     add(out.output_hc_down);
@@ -647,7 +648,6 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     for (size_t s = 1; s < shards.size(); ++s) {
         out.extra_meta_ctxs.push_back(shards[s].meta);
     }
-    out.backend = backend;
     out.buf = ggml_backend_alloc_buffer(backend, allocation_size);
     if (!out.buf) return fail("weight buffer allocation failed");
     ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -741,7 +741,6 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         if (!out.ple_reader.open(ple_path, kPleTensor, 32, reader_error)) {
             return fail(reader_error);
         }
-        out.shard2_path = ple_path;
     }
 
     for (ShardSource & shard : shards) {
@@ -791,7 +790,6 @@ void free_qwen4exp_weights(Qwen4ExpWeights & w) {
     w.output_hc_norm = nullptr;
     w.output_hc_down = nullptr;
     w.output_hc_up = nullptr;
-    w.backend = nullptr;
 }
 
 }  // namespace luce::common

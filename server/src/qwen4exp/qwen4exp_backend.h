@@ -21,9 +21,7 @@ namespace luce::common {
 struct Qwen4ExpBackendConfig {
     std::string     model_path;
     DevicePlacement device;
-    int             stream_fd = -1;
     int             chunk     = 0;  // auto: measured allocation budget
-    int             slots     = 1;
 };
 
 class Qwen4ExpBackend final : public ModelBackend {

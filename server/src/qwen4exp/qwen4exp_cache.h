@@ -51,18 +51,15 @@ struct Qwen4ExpDecodeWorkspace {
 };
 
 struct Qwen4ExpCache {
-    bool reference = false;  // test-only upstream differential (padded KV and reference math)
     ggml_context *        ctx     = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
 
     int       max_ctx  = 0;
-    int       cur_pos  = 0;
-    ggml_type kv_type  = GGML_TYPE_F16;
 
     std::vector<int> full_layer_ids;    // size = 12
     std::vector<int> linear_layer_ids;  // size = 36
 
-    // Full attention: [head_dim, max_ctx, n_head_kv] (flash_attn_ext layout).
+    // Full attention: F16 [head_dim, max_ctx, n_head_kv] (flash_attn_ext layout).
     std::vector<ggml_tensor *> attn_k;  // size = n_full
     std::vector<ggml_tensor *> attn_v;
 
@@ -91,19 +88,19 @@ struct Qwen4ExpCache {
     // Pinned graph-input ring (see Qwen4ExpInputRing).
     Qwen4ExpInputRing input_ring;
 
-    // T=1 decode workspace reuse (excluded in reference tests).
+    // T=1 decode workspace reuse.
     Qwen4ExpDecodeWorkspace decode_workspace;
 };
 
 bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
-                           int max_ctx, ggml_type kv_type, Qwen4ExpCache & out, bool reference = false);
+                           int max_ctx, Qwen4ExpCache & out);
 
 void free_qwen4exp_cache(Qwen4ExpCache & c);
 
 void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace);
 
-// Zero the recurrent state and conv history and reset cur_pos. KV is left
-// intact; callers that need a clean sequence also reset cur_pos themselves.
+// Zero the recurrent state, conv history and pooled-block prefix. KV is left
+// intact: the next sequence overwrites it from position 0.
 void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c);
 
 }  // namespace luce::common

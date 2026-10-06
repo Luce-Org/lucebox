@@ -1,9 +1,8 @@
 // Qwen3.8-Flash-Next (GGUF arch `qwen4exp`) internal weight layout.
 //
 // The loader fills these structs straight from the GGUF tensor table and the
-// backend builds its own ggml graph (not a llama.cpp model). The tensor
-// inventory lives in docs/qwen4exp.md; `per_layer_token_embd` is read lazily
-// from disk and never uploaded.
+// backend builds its own ggml graph (not a llama.cpp model).
+// `per_layer_token_embd` is read lazily from disk and never uploaded.
 
 #pragma once
 
@@ -21,10 +20,10 @@ namespace luce::common {
 struct Qwen4ExpCudaScope {
     const bool optimized;
     const ggml_cuda_qwen4exp_profile previous;
-    explicit Qwen4ExpCudaScope(bool gfx1151, bool reference = false)
-        : optimized(gfx1151 && !reference),
-          previous(ggml_backend_cuda_set_qwen4exp_profile(reference ? GGML_CUDA_QWEN4EXP_REFERENCE :
-                   optimized ? GGML_CUDA_QWEN4EXP_DEFAULT : GGML_CUDA_QWEN4EXP_OFF)) {}
+    explicit Qwen4ExpCudaScope(bool gfx1151)
+        : optimized(gfx1151),
+          previous(ggml_backend_cuda_set_qwen4exp_profile(
+              gfx1151 ? GGML_CUDA_QWEN4EXP_DEFAULT : GGML_CUDA_QWEN4EXP_OFF)) {}
     ~Qwen4ExpCudaScope() { ggml_backend_cuda_set_qwen4exp_profile(previous); }
     Qwen4ExpCudaScope(const Qwen4ExpCudaScope &) = delete;
     Qwen4ExpCudaScope & operator=(const Qwen4ExpCudaScope &) = delete;
@@ -109,7 +108,6 @@ public:
     bool available() const { return fd_ >= 0; }
     int64_t n_rows() const { return n_rows_; }
     int64_t row_bytes() const { return row_size_; }
-    int64_t head_dim() const { return head_dim_; }
 
     // Fill dst[slot*head_dim, (slot+1)*head_dim) with row `rows[slot]`
     // dequantized to F32. Thread-safe.
@@ -131,13 +129,11 @@ struct Qwen4ExpWeights {
     ggml_context *        ctx     = nullptr;  // shard 1 tensor descriptors
     // Descriptor contexts of shards 2..N (split GGUFs); `ctx` covers shard 1.
     std::vector<ggml_context *> extra_meta_ctxs;
-    ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
 
     CpuEmbedder           embedder;
 
     ggml_tensor * tok_embd     = nullptr;  // metadata only; data stays on CPU
-    ggml_tensor * out_norm     = nullptr;
     ggml_tensor * output       = nullptr;
     ggml_tensor * output_hc_norm = nullptr;
     ggml_tensor * output_hc_down = nullptr;
@@ -154,7 +150,6 @@ struct Qwen4ExpWeights {
     int n_embd_head_v         = 256;
     int full_attention_interval = 4;
     int n_ff_exp              = 640;
-    int n_ff_shexp            = 640;
     int n_expert              = 512;
     int n_expert_used         = 10;
     int n_vocab               = 0;      // from token_embd.ne[1]
@@ -171,10 +166,8 @@ struct Qwen4ExpWeights {
     int ssm_d_conv            = 4;
     int ssm_d_inner           = 6144;   // = n_v_heads * head_v_dim
     int ssm_d_state           = 128;    // key/value head dim
-    int ssm_dt_rank           = 48;     // n_v_heads
     int ssm_n_group           = 16;     // n_k_heads
     int linear_value_heads    = 48;
-    int linear_key_heads      = 16;
 
     // Indexer (full-attention layers).
     int indexer_n_head        = 4;
@@ -193,10 +186,8 @@ struct Qwen4ExpWeights {
     std::vector<int64_t> ple_head_vocab_sizes;   // u64 in GGUF
     std::vector<uint64_t> ple_layer_multipliers; // u64 in GGUF
     int32_t ple_eos_token_id  = -1;
-    int32_t ple_image_token_id = -1;
 
-    // The shard holding per_layer_token_embd plus its lazy reader.
-    std::string   shard2_path;
+    // Lazy reader of per_layer_token_embd, in whichever shard holds it.
     Qwen4ExpPleReader ple_reader;
 
     int32_t eos_id      = -1;
@@ -210,7 +201,7 @@ struct Qwen4ExpWeights {
 // failure.
 bool load_qwen4exp_gguf(const std::string & path,
                         ggml_backend_t backend,
-                        Qwen4ExpWeights & out, bool reference = false);
+                        Qwen4ExpWeights & out);
 
 void free_qwen4exp_weights(Qwen4ExpWeights & w);
 

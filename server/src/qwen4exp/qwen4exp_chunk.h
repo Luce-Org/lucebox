@@ -31,9 +31,8 @@ int qwen4exp_fit_chunk(int max_ctx, size_t available, size_t fixed, Measure meas
 
 struct Qwen4ExpWeights;
 struct Qwen4ExpCache;
-// Call after weights and resident_slots caches are allocated, before prefill.
-// Other slots are reserved arithmetically, without risking trial allocations.
+// Call after the weights and the cache are allocated, before prefill.
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
-    Qwen4ExpCache & cache, int slots = 1, int resident_slots = 1);
+    Qwen4ExpCache & cache);
 
 }  // namespace luce::common

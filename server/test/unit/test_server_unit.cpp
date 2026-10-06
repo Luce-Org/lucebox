@@ -5530,21 +5530,19 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_profile_is_scoped) {
     const bool supported = ggml_backend_cuda_qwen4exp_supported(cpu);
     TEST_ASSERT(!supported);
     {
-        Qwen4ExpCudaScope reference(true, true);
-        TEST_ASSERT(!reference.optimized);
-        TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_REFERENCE) == GGML_CUDA_QWEN4EXP_REFERENCE);
-        // An unsupported backend masks a nested profile, then restores it.
+        // An unsupported backend masks the enclosing profile, then restores it.
         [&] { Qwen4ExpCudaScope generic(supported); TEST_ASSERT(!generic.optimized);
               TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_OFF); }();
-        TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_REFERENCE) == GGML_CUDA_QWEN4EXP_REFERENCE);
+        TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_DEFAULT) == GGML_CUDA_QWEN4EXP_DEFAULT);
         bool isolated = false;
         std::thread other([&] { isolated = set(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_OFF; });
         other.join();
         TEST_ASSERT(isolated);
     }
+    TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_DEFAULT);
     [&] { Qwen4ExpCudaScope optimized(true); TEST_ASSERT(optimized.optimized);
           TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_DEFAULT) == GGML_CUDA_QWEN4EXP_DEFAULT); }();
-    TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_DEFAULT);
+    TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_OFF);
     ggml_backend_free(cpu);
 }
 

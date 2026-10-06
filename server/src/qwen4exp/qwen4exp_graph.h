@@ -32,8 +32,6 @@ ggml_tensor * qwen4exp_pool_blocks(ggml_context * c, ggml_tensor * keys, int64_t
 
 struct Qwen4ExpForwardResult {
     bool ok = false;
-    int  n_tokens = 0;
-    int  pos0 = 0;
 };
 
 // Host-only input preparation; safe to run for the next prompt chunk while
@@ -64,7 +62,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                                        int n_tokens,
                                        int pos0,
                                        std::vector<float> & out_logits,
-                                       bool dump = false,  // test-only activation summaries
                                        const Qwen4ExpInputs * inputs = nullptr);
 
 }  // namespace luce::common
