@@ -6352,8 +6352,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
 #if defined(GGML_USE_HIP)
-    // Pre-dequantize eligible dense weights into a bf16 shadow (outside stream capture).
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
+    // Pre-dequantize eligible dense weights into a bf16 shadow (outside stream capture); qwen4exp graphs only.
+    for (int i = 0; ggml_cuda_qwen4exp_enabled() && i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT) {
             continue;
