@@ -5604,7 +5604,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     // HC gate GEMM + mix reduce fold; must precede the generic SIGMOID fusion below.
                     if (qwen4exp_rdna35) {
                         ggml_cuda_hc_mix_args hma;
-                        if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() && i + 1 < cgraph->n_nodes) {
+                        if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
                             const ggml_tensor * w  = node->src[0];
                             const ggml_tensor * lo = node->src[1];
                             if (ggml_is_quantized(w->type) && ggml_node_has_n_uses(cgraph, i, 1) &&
@@ -6314,7 +6314,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             if (cnt <= 0 || !ma.dst || i < 1 || ggml_nrows(ma.dst) < 512) continue;
             const ggml_tensor * wup = cgraph->nodes[i - 1];
             if (wup->op != GGML_OP_MUL_MAT || ma.gate != wup ||
-                !ggml_cuda_mmb_gatemix() || ma.hc != 4 ||
+                ma.hc != 4 ||
                 !ggml_is_quantized(wup->src[0]->type) || wup->src[1]->type != GGML_TYPE_F32) continue;
             bool ok = true; int nread = 0;
             for (int n = i + cnt; n < cgraph->n_nodes && ok; ++n) {

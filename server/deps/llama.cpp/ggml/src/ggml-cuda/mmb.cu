@@ -2,8 +2,6 @@
 #include "unary.cuh"
 #include "convert.cuh"
 #include <unordered_map>
-#include <map>
-#include <utility>
 #include "mmid.cuh"
 #include <vector>
 #include <unordered_set>
@@ -249,47 +247,6 @@ mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ X
     const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
     mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, false>(W + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
         [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, Dh, store_f32, M, [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs);
-}
-
-// Small-N (N<=8) bf16 dense: out[n,t] = sum_k w[n,k]*x[k,t]. The generic mmb tile
-// pads N up to 128 and re-reads x per warp; here every thread owns one (n,t)
-// output, x is staged once per k-tile by the whole block, and w is L2-resident.
-template <int NMAX, int TT, int KT>
-__global__ void __launch_bounds__(256, 2)
-mmb_small_n_bf16_kernel(const uint16_t * __restrict__ W, const uint16_t * __restrict__ X, float * __restrict__ D,
-        const int N, const int K, const int T) {
-    constexpr int NT = NMAX * TT;
-    static_assert(NT == 256, "kernel assumes 256 threads");
-    __shared__ uint16_t xs[KT][TT];
-    __shared__ uint16_t ws[NMAX][KT];
-    const int tid = threadIdx.x;
-    const int t0  = blockIdx.x * TT;
-    const int n   = tid / TT;
-    const int tlc = tid % TT;
-    const int t   = t0 + tlc;
-    float acc = 0.0f;
-    const int nks = K / KT;
-    for (int ks = 0; ks < nks; ++ks) {
-        for (int i = tid; i < KT * TT; i += NT) {
-            const int c = i / KT, r = i % KT, tt = t0 + c;
-            xs[r][c] = (tt < T) ? X[(size_t) tt * K + ks * KT + r] : (uint16_t) 0;
-        }
-        for (int i = tid; i < NMAX * KT; i += NT) {
-            const int nn = i / KT, rr = i % KT;
-            ws[nn][rr] = (nn < N) ? W[(size_t) nn * K + ks * KT + rr] : (uint16_t) 0;
-        }
-        __syncthreads();
-        if (n < N) {
-            #pragma unroll
-            for (int r = 0; r < KT; ++r) {
-                const float wv = __uint_as_float(((uint32_t) ws[n][r]) << 16);
-                const float xv = __uint_as_float(((uint32_t) xs[r][tlc]) << 16);
-                acc += wv * xv;
-            }
-        }
-        __syncthreads();
-    }
-    if (t < T && n < N) D[(size_t) t * N + n] = acc;
 }
 
 #if defined(__HIP_PLATFORM_AMD__)
@@ -579,7 +536,6 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
 __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo) {
     hi = __builtin_bit_cast(uint16_t, (_Float16) x); lo = __builtin_bit_cast(uint16_t, (_Float16) (x - (float) __builtin_bit_cast(_Float16, hi)));
 }
-#if defined(__gfx1151__) || !defined(__HIP_DEVICE_COMPILE__)
 template <int BM, int BN, int WTM, int WTN, bool TWO, bool X16 = false>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_f32split_kernel(const float * __restrict__ W, const void * __restrict__ Xv, float * __restrict__ D, const int M, const int K, const int T) {
@@ -652,7 +608,6 @@ mmb_f32split_kernel(const float * __restrict__ W, const void * __restrict__ Xv, 
 #pragma unroll
             for (int e = 0; e < 8; ++e) { const int t = t0 + wn * WTN + j * 16 + 2 * e + cn; if (t < T) D[(size_t) t * M + m] = acc[i][j][e]; } }
 }
-#endif
 
 // two tile classes: experts with >= thresh rows get BN_BIG-row tiles, the rest BN_SMALL-row tiles (fewer wasted rows on tiny experts)
 __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t * __restrict__ desc_big, uint32_t * __restrict__ desc_small,
@@ -766,7 +721,6 @@ __global__ void mmb_dq_iq4nl_bf16_kernel(const uint8_t * __restrict__ W, uint16_
     }
 }
 static std::unordered_map<const void *, uint16_t *> g_mmb_shadow;
-static std::map<std::pair<const void *, const void *>, uint16_t *> g_mmb_shadow_pair;   // concat(w0, w1) along rows -> BF16 copy
 static size_t g_mmb_shadow_bytes = 0;
 constexpr size_t MMB_SHADOW_CAP = size_t{6144} << 20;
 static bool mmb_is_resident_q6k(const ggml_tensor * w) { return w && w->type == GGML_TYPE_Q6_K && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768; }
@@ -774,12 +728,7 @@ static bool mmb_is_resident_iq4(const ggml_tensor * w) { return w && w->type == 
 // Q5_K is a handful of attn_output weights; shadowing them routes the GEMM to
 // cuBLAS instead of the ~7 TFLOP/s hand-rolled Q5_K mmb path.
 static bool mmb_is_resident_q5k(const ggml_tensor * w) { return w && w->type == GGML_TYPE_Q5_K && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768; }
-static bool mmb_is_row_concat(const ggml_tensor * w) {
-    return w && w->op == GGML_OP_CONCAT && w->type == GGML_TYPE_IQ4_NL && ggml_get_op_params_i32(w, 0) == 1 && mmb_is_resident_iq4(w->src[0]) && mmb_is_resident_iq4(w->src[1]) &&
-           w->src[0]->ne[0] == w->src[1]->ne[0] && w->ne[0] == w->src[0]->ne[0] && w->ne[1] == w->src[0]->ne[1] + w->src[1]->ne[1];
-}
 static const uint16_t * mmb_shadow_lookup(const ggml_tensor * w) {
-    if (w->op == GGML_OP_CONCAT) { auto it = g_mmb_shadow_pair.find({w->src[0]->data, w->src[1]->data}); return it == g_mmb_shadow_pair.end() ? nullptr : it->second; }
     auto it = g_mmb_shadow.find(w->data); return it == g_mmb_shadow.end() ? nullptr : it->second;
 }
 
@@ -844,7 +793,6 @@ static const int8_t * mmb_q8_lookup(const ggml_tensor * t) {
     return g_mmb_q8_buf && g_mmb_q8_root == mmb_root(t) && g_mmb_q8_data == t->data ? g_mmb_q8_buf->get() : nullptr;
 }
 size_t ggml_cuda_mmb_w8a8_tile_bytes(int T, int K) { return mmb_w8a8_tile_bytes(T, K); }
-void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); g_mmb_f16_only.clear(); }
 size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size() + g_mmb_f16_only.size(); }
 void ggml_cuda_mmb_mark_f16_only(const ggml_tensor * t) { if (mmb_arch()) g_mmb_f16_only.insert(t); }
 bool ggml_cuda_mmb_is_f16_only(const ggml_tensor * t) { return g_mmb_f16_only.count(t) > 0; }
@@ -856,15 +804,9 @@ void ggml_cuda_mmb_release_all() {
     delete g_mmb_q8_buf; g_mmb_q8_buf = nullptr; g_mmb_q8_cap = 0;
     for (int i = 0; i < 4; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
     // Shadow weights are raw cudaMalloc keyed by data pointer and held for the process lifetime.
-    for (auto & e : g_mmb_shadow)      { if (e.second) CUDA_CHECK(cudaFree(e.second)); }
-    for (auto & e : g_mmb_shadow_pair) { if (e.second) CUDA_CHECK(cudaFree(e.second)); }
+    for (auto & e : g_mmb_shadow) { if (e.second) CUDA_CHECK(cudaFree(e.second)); }
     g_mmb_shadow.clear();
-    g_mmb_shadow_pair.clear();
     g_mmb_shadow_bytes = 0;
-}
-uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
-    if (!mmb_enabled() || ggml_nrows(t) < mmb_min_t()) return nullptr;
-    return ggml_cuda_mmb_slot_reserve(ctx, 0, t, n);
 }
 
 // True when a MUL_MAT with weight w and n_tokens rows would take the Q8_0 -> F16 route and can read an F16 activation.
@@ -915,7 +857,6 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     cudaStream_t stream = ctx.stream();
     const int K = (int) src0->ne[0], M = (int) src0->ne[1];
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
-#if defined(__gfx1151__) || !defined(__HIP_DEVICE_COMPILE__)
     if ((src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) && M <= 8) {
         const uint16_t * xb = ggml_cuda_mmb_bf16_src(src1);
         if (mmb_small_m_launch(src0->data, src0->type == GGML_TYPE_BF16, xb ? (const void *) xb : src1->data, xb != nullptr,
@@ -952,32 +893,17 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         // Q8_0 -> F16 WMMA (bf16-only activations converted in the tile load, F32 ones via the per-graph F16 cache). A bf16-only dst keeps its in-place bf16 form.
         const bool f16_in = src1->type == GGML_TYPE_F16;
         const uint16_t * xb = f16_in ? nullptr : ggml_cuda_mmb_bf16_src(src1);
-        const bool bf16_dst = ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0;
+        const bool bf16_dst = ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0;
         const void * xa = f16_in ? src1->data : xb ? (const void *) xb : (const void *) mmb_f16_activation(ctx, src1, (size_t) T * K, stream);
         if (mmb_q8f16_launch((const uint8_t *) src0->data, xa, xb ? 1 : 0,
                              bf16_dst ? nullptr : (float *) dst->data, bf16_dst ? (uint16_t *) dst->data : nullptr, T, M, K, stream)) {
             CUDA_CHECK(cudaGetLastError()); return;
         }
     }
-#endif
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && "MMB: F16 activations need the Q8_0 -> F16 route");
     // A bf16-only tensor already lives in the mmb cache as bf16; reading it as f32 would reinterpret bytes.
     const uint16_t * xhp = ggml_cuda_mmb_bf16_src(src1);
     if (!xhp) xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
-    if (src0->type == GGML_TYPE_BF16 && M <= 8 && (K % 128) == 0) {
-        if (M <= 4) {
-            // NMAX=4 keeps all 256 threads active for the 4-row HC inject.
-            const int grid = (int) ((T + 63) / 64);
-            mmb_small_n_bf16_kernel<4, 64, 128><<<grid, 256, 0, stream>>>(
-                (const uint16_t *) src0->data, xhp, (float *) dst->data, (int) M, K, (int) T);
-        } else {
-            const int grid = (int) ((T + 31) / 32);
-            mmb_small_n_bf16_kernel<8, 32, 128><<<grid, 256, 0, stream>>>(
-                (const uint16_t *) src0->data, xhp, (float *) dst->data, (int) M, K, (int) T);
-        }
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data;
     if (src0->type == GGML_TYPE_IQ4_NL && M <= 384 && K >= 4096 && T >= 2048) {   // tall-M tile: HC down|inject [10240 -> 324], activations read once
         dim3 grid(1, (T + 63) / 64);
@@ -989,7 +915,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const bool big = (M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096);
     uint16_t * Dh = (K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
     bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
-    if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {
+    if (!Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {
         Dh = (uint16_t *) dst->data; store_f32 = false;
     }
     dim3 grid((M + 127) / 128, big ? (T + 255) / 256 : (T + 127) / 128);
@@ -1017,12 +943,9 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     CUDA_CHECK(cudaGetLastError());
 }
 
-bool ggml_cuda_mmb_gatemix() { return mmb_arch(); }
-bool ggml_cuda_mmb_blk16() { return mmb_arch(); }
-bool ggml_cuda_mmb_res16()  { return mmb_arch(); }
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
         const int hc, const float scale, const float bias) {
-    if (!ggml_cuda_mmb_gatemix() || hc != 4 || !mmb_quant_type(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
+    if (!mmb_arch() || hc != 4 || !mmb_quant_type(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     if (K % ggml_blck_size(w->type) != 0) return false;
     if (K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t()) return false;
@@ -1185,23 +1108,14 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         g_mmb_shadow[w->data] = buf; g_mmb_shadow_bytes += bytes;
         return;
     }
-    const bool concat = mmb_is_row_concat(w);
-    if (!concat && !mmb_is_resident_iq4(w)) return;
-    if (concat ? g_mmb_shadow_pair.count({w->src[0]->data, w->src[1]->data}) > 0 : g_mmb_shadow.count(w->data) > 0) return;
+    if (!mmb_is_resident_iq4(w) || g_mmb_shadow.count(w->data) > 0) return;
     const size_t n = (size_t) w->ne[0] * w->ne[1];
     const size_t bytes = n * 2;
     if (g_mmb_shadow_bytes + bytes > MMB_SHADOW_CAP) { static bool warned = false; if (!warned) { GGML_LOG_INFO("MMB_SHADOW cap reached at %.1f MB; further weights stay IQ4_NL\n", g_mmb_shadow_bytes / 1048576.0); warned = true; } return; }
     uint16_t * buf = nullptr;
     if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
-    if (concat) {
-        const size_t n0 = (size_t) w->src[0]->ne[0] * w->src[0]->ne[1], n1 = (size_t) w->src[1]->ne[0] * w->src[1]->ne[1];
-        mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n0 / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->src[0]->data, buf, n0 / 32);
-        mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n1 / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->src[1]->data, buf + n0, n1 / 32);
-        g_mmb_shadow_pair[{w->src[0]->data, w->src[1]->data}] = buf;
-    } else {
-        mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 32);
-        g_mmb_shadow[w->data] = buf;
-    }
+    mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 32);
+    g_mmb_shadow[w->data] = buf;
     CUDA_CHECK(cudaGetLastError());
     g_mmb_shadow_bytes += bytes;
 }
@@ -1218,18 +1132,13 @@ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor *, const ggml_tensor *, cons
 void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {}
 void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {}
 void ggml_cuda_mmb_begin_graph() {}
-uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context &, const ggml_tensor *, size_t) { return nullptr; }
 const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor *) { return nullptr; }
 const uint16_t * ggml_cuda_mmb_bf16_src(const ggml_tensor *) { return nullptr; }
 const void * ggml_cuda_mmb_shadow_ptr(const ggml_tensor *) { return nullptr; }
 uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context &, int, const ggml_tensor *, size_t) { return nullptr; }
-void ggml_cuda_mmb_marks_clear() {}
 size_t ggml_cuda_mmb_marks_count() { return 0; }
 void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor *) {}
 bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor *) { return false; }
-bool ggml_cuda_mmb_gatemix() { return false; }
-bool ggml_cuda_mmb_res16() { return false; }
-bool ggml_cuda_mmb_blk16() { return false; }
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, int, float, float) { return false; }
 bool ggml_cuda_mmb_supported_glu(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
 void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {}
