@@ -1276,33 +1276,27 @@ if(LUCE_TESTS)
 
         # Standalone mmb-vs-library-GEMM differential on one quantized MUL_MAT,
         # against a CPU dequant reference. See the file header.
-        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_mmb_cublas_diff.cpp")
-            luce_add_ggml_gpu_executable(test_mmb_cublas_diff test/unit/test_mmb_cublas_diff.cpp)
-            target_compile_definitions(test_mmb_cublas_diff PRIVATE GGML_USE_HIP)
-            target_link_libraries(test_mmb_cublas_diff PRIVATE ggml-cpu)
-            list(APPEND _raw_unit_test_targets test_mmb_cublas_diff)
-        endif()
+        luce_add_ggml_gpu_executable(test_mmb_cublas_diff test/unit/test_mmb_cublas_diff.cpp)
+        target_compile_definitions(test_mmb_cublas_diff PRIVATE GGML_USE_HIP)
+        target_link_libraries(test_mmb_cublas_diff PRIVATE ggml-cpu)
+        list(APPEND _raw_unit_test_targets test_mmb_cublas_diff)
 
         # Vectorized bf16<->f32 cast vs the scalar fallback, bit-exact.
-        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_convert_vec.cpp")
-            add_executable(test_convert_vec test/unit/test_convert_vec.cpp)
-            set_source_files_properties(test/unit/test_convert_vec.cpp PROPERTIES LANGUAGE HIP)
-            set_target_properties(test_convert_vec PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
-            target_compile_definitions(test_convert_vec PRIVATE GGML_USE_HIP)
-            target_include_directories(test_convert_vec PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
-            target_link_libraries(test_convert_vec PRIVATE
-                ggml ggml-base ${LUCE_GGML_BACKEND_TARGET} hip::host)
-            list(APPEND _raw_unit_test_targets test_convert_vec)
-        endif()
+        add_executable(test_convert_vec test/unit/test_convert_vec.cpp)
+        set_source_files_properties(test/unit/test_convert_vec.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_convert_vec PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
+        target_compile_definitions(test_convert_vec PRIVATE GGML_USE_HIP)
+        target_include_directories(test_convert_vec PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_convert_vec PRIVATE
+            ggml ggml-base ${LUCE_GGML_BACKEND_TARGET} hip::host)
+        list(APPEND _raw_unit_test_targets test_convert_vec)
 
         # ne00==1 scalar get_rows gather vs a reference gather.
-        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_getrows_scalar.cpp")
-            luce_add_ggml_gpu_executable(test_getrows_scalar test/unit/test_getrows_scalar.cpp)
-            target_compile_definitions(test_getrows_scalar PRIVATE GGML_USE_HIP)
-            target_link_libraries(test_getrows_scalar PRIVATE ggml-cpu)
-            list(APPEND _raw_unit_test_targets test_getrows_scalar)
-        endif()
+        luce_add_ggml_gpu_executable(test_getrows_scalar test/unit/test_getrows_scalar.cpp)
+        target_compile_definitions(test_getrows_scalar PRIVATE GGML_USE_HIP)
+        target_link_libraries(test_getrows_scalar PRIVATE ggml-cpu)
+        list(APPEND _raw_unit_test_targets test_getrows_scalar)
 
         # The rocWMMA fragment-layout probe requires the rocWMMA headers; it
         # only builds when the rocWMMA fattn kernel is enabled so the
