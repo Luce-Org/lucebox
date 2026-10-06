@@ -1,9 +1,8 @@
 #include "mmb.cuh"
+#include "qwen4exp-common.cuh"
 #include "unary.cuh"
 #include "convert.cuh"
 #include <unordered_map>
-#include <map>
-#include <utility>
 #include "mmid.cuh"
 #include <vector>
 #include <unordered_set>
@@ -16,8 +15,6 @@ typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 
-__device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
-__device__ __forceinline__ uint32_t mmb_pack2(float a, float b) { return (uint32_t)mmb_f2bf(a) | ((uint32_t)mmb_f2bf(b) << 16); }
 __constant__ int8_t mmb_kv_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 __device__ __forceinline__ float mmb_h2f(uint16_t h) { return (float) __builtin_bit_cast(_Float16, h); }
 
@@ -25,10 +22,10 @@ __global__ void mmb_cvt_f32_bf16(const float * __restrict__ x, uint16_t * __rest
     size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
     if (i + 8 <= n) {
         const float4 a = *(const float4 *)(x + i), b = *(const float4 *)(x + i + 4);
-        uint4 o; o.x = mmb_pack2(a.x, a.y); o.y = mmb_pack2(a.z, a.w); o.z = mmb_pack2(b.x, b.y); o.w = mmb_pack2(b.z, b.w);
+        uint4 o; o.x = q4x_pack2(a.x, a.y); o.y = q4x_pack2(a.z, a.w); o.z = q4x_pack2(b.x, b.y); o.w = q4x_pack2(b.z, b.w);
         *(uint4 *)(y + i) = o;
     } else {
-        for (; i < n; ++i) y[i] = mmb_f2bf(x[i]);
+        for (; i < n; ++i) y[i] = q4x_f2bf(x[i]);
     }
 }
 
@@ -71,8 +68,8 @@ __device__ __forceinline__ void mmb_dq_row36(const uint4 w0, const uint4 w1, con
                 x[h][2] = fmaf((float)((u >> 16) & 0xFFu), d, md);
                 x[h][3] = fmaf((float)(u >> 24), d, md);
             }
-            out[2*w] = mmb_pack2(x[0][0], x[0][1]); out[2*w + 1] = mmb_pack2(x[0][2], x[0][3]);
-            out[8 + 2*w] = mmb_pack2(x[1][0], x[1][1]); out[8 + 2*w + 1] = mmb_pack2(x[1][2], x[1][3]);
+            out[2*w] = q4x_pack2(x[0][0], x[0][1]); out[2*w + 1] = q4x_pack2(x[0][2], x[0][3]);
+            out[8 + 2*w] = q4x_pack2(x[1][0], x[1][1]); out[8 + 2*w + 1] = q4x_pack2(x[1][2], x[1][3]);
         }
     }
 }
@@ -89,7 +86,7 @@ __device__ __forceinline__ void mmb_dq_row68(const uint4 w0, const uint4 w1, con
             const uint32_t v = blk ? ws[9 + w] : ((ws[w] >> 16) | (ws[w + 1] << 16));
             const float e0 = d * (float)(int8_t)(v      ), e1 = d * (float)(int8_t)(v >>  8);
             const float e2 = d * (float)(int8_t)(v >> 16), e3 = d * (float)(int8_t)(v >> 24);
-            out[2*w] = mmb_pack2(e0, e1); out[2*w + 1] = mmb_pack2(e2, e3);
+            out[2*w] = q4x_pack2(e0, e1); out[2*w + 1] = q4x_pack2(e2, e3);
         }
     }
 }
@@ -117,7 +114,7 @@ __device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restri
             // DH_F16: the half copy is F16 (saturating, as the Q8F16 activations) instead of bf16.
             auto pk = [](const float a, const float b) -> uint32_t {
                 if constexpr (DH_F16) return (uint32_t) __builtin_bit_cast(uint16_t, mq_f2h_sat(a)) | ((uint32_t) __builtin_bit_cast(uint16_t, mq_f2h_sat(b)) << 16);
-                else return mmb_pack2(a, b);
+                else return q4x_pack2(a, b);
             };
             if (full && (M & 7) == 0) { *(uint4 *)(Dh + base) = make_uint4(pk(v0.x, v0.y), pk(v0.z, v0.w), pk(v1.x, v1.y), pk(v1.z, v1.w)); }
             else { const float vv[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
@@ -251,56 +248,6 @@ mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ X
         [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, Dh, store_f32, M, [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs);
 }
 
-// Small-N (N<=8) bf16 dense: out[n,t] = sum_k w[n,k]*x[k,t]. The generic mmb tile
-// pads N up to 128 and re-reads x per warp; here every thread owns one (n,t)
-// output, x is staged once per k-tile by the whole block, and w is L2-resident.
-template <int NMAX, int TT, int KT>
-__global__ void __launch_bounds__(256, 2)
-mmb_small_n_bf16_kernel(const uint16_t * __restrict__ W, const uint16_t * __restrict__ X, float * __restrict__ D,
-        const int N, const int K, const int T) {
-    constexpr int NT = NMAX * TT;
-    static_assert(NT == 256, "kernel assumes 256 threads");
-    __shared__ uint16_t xs[KT][TT];
-    __shared__ uint16_t ws[NMAX][KT];
-    const int tid = threadIdx.x;
-    const int t0  = blockIdx.x * TT;
-    const int n   = tid / TT;
-    const int tlc = tid % TT;
-    const int t   = t0 + tlc;
-    float acc = 0.0f;
-    const int nks = K / KT;
-    for (int ks = 0; ks < nks; ++ks) {
-        for (int i = tid; i < KT * TT; i += NT) {
-            const int c = i / KT, r = i % KT, tt = t0 + c;
-            xs[r][c] = (tt < T) ? X[(size_t) tt * K + ks * KT + r] : (uint16_t) 0;
-        }
-        for (int i = tid; i < NMAX * KT; i += NT) {
-            const int nn = i / KT, rr = i % KT;
-            ws[nn][rr] = (nn < N) ? W[(size_t) nn * K + ks * KT + rr] : (uint16_t) 0;
-        }
-        __syncthreads();
-        if (n < N) {
-            #pragma unroll
-            for (int r = 0; r < KT; ++r) {
-                const float wv = __uint_as_float(((uint32_t) ws[n][r]) << 16);
-                const float xv = __uint_as_float(((uint32_t) xs[r][tlc]) << 16);
-                acc += wv * xv;
-            }
-        }
-        __syncthreads();
-    }
-    if (t < T && n < N) D[(size_t) t * N + n] = acc;
-}
-
-#if defined(__HIP_PLATFORM_AMD__)
-__device__ __forceinline__ float gm_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
-__device__ __forceinline__ float gm_add_rn(const float a, const float b) { float r; asm("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
-#else
-__device__ __forceinline__ float gm_mul_rn(const float a, const float b) { return __fmul_rn(a, b); }
-__device__ __forceinline__ float gm_add_rn(const float a, const float b) { return __fadd_rn(a, b); }
-#endif
-__device__ __forceinline__ float gm_sigmoid(const float x) { return 1.0f / (1.0f + expf(-x)); }
-__device__ __forceinline__ float gm_bf2f(const uint16_t h) { return __uint_as_float(((uint32_t) h) << 16); }
 
 template <int HC, int WTYPE = 0, int CH = 32, int TN = 2>
 __global__ void __launch_bounds__(MMB_NT, 2)
@@ -383,18 +330,18 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
             float s = 0.f;
 #pragma unroll
             for (int c = 0; c < HC; ++c) {
-                const float g = __uint_as_float(((uint32_t) mmb_f2bf(acc[c][j][e])) << 16);   // the gate GEMM's BF16 epilogue rounding
-                const float term = gm_mul_rn(gm_bf2f(xr[(size_t)c * E]), gm_sigmoid(g));
-                s = (c == 0) ? term : gm_add_rn(s, term);
+                const float g = __uint_as_float(((uint32_t) q4x_f2bf(acc[c][j][e])) << 16);   // the gate GEMM's BF16 epilogue rounding
+                const float term = q4x_mul_rn(q4x_bf2f(xr[(size_t)c * E]), q4x_sigmoid(g));
+                s = (c == 0) ? term : q4x_add_rn(s, term);
             }
             const float o = scale * s + bias;
             if (store_f32) Out[(size_t)t * E + ch] = o;
-            if (OutH) OutH[(size_t)t * E + ch] = mmb_f2bf(o);
+            if (OutH) OutH[(size_t)t * E + ch] = q4x_f2bf(o);
         }
     }
 }
 
-template <int BM, int BN, int WTM, int WTN, int WTYPE = 0, bool EXPERT_MAJOR = false, bool DH_F16 = false>
+template <int BM, int BN, int WTM, int WTN, int WTYPE = 0, bool DH_F16 = false>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, const uint16_t * __restrict__ Xh, float * __restrict__ D,
         uint16_t * __restrict__ Dh, const bool store_f32,
@@ -409,7 +356,7 @@ mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, con
     const int m0 = blockIdx.x * BM;
     const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
     mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, true, DH_F16>(W + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
-        [&](int i) { return (i < cnt) ? (EXPERT_MAJOR ? r0 + i : ids_src[r0 + i]) : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, As, Bs);
+        [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, As, Bs);
 }
 
 template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, typename XRowFn, typename DRowFn>
@@ -555,7 +502,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     }
 }
 
-template <int BM, int BN, int WTM, int WTN, int WTYPE = 0, bool EXPERT_MAJOR = false>
+template <int BM, int BN, int WTM, int WTN, int WTYPE = 0>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t expert_bytes, const uint16_t * __restrict__ Xh,
         float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32,
@@ -571,22 +518,21 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
     const int m0 = blockIdx.x * BM;
     const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
     mmb_tile_gemm_glu<BM, BN, WTM, WTN, WTYPE, true>(Wg + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, Wu + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
-        [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? (EXPERT_MAJOR ? r0 + i : ids_dst[r0 + i]) : -1; }, m0, cnt, Ag, Au, Bs);
+        [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, Ag, Au, Bs);
 }
 
-// F32 x F32 -> F32 GEMM with F32-equivalent precision on WMMA: each operand is split into F16 hi + F16 lo at tile load and
-// the product is accumulated as hi*hi + hi*lo + lo*hi in F32 (lo*lo ~2^-22 relative, dropped). Used for the F32 MoE router.
+// F32 x F32 -> F32 GEMM on WMMA: the weight is rounded to F16 and the activation split into F16 hi + F16 lo at tile load;
+// each product accumulates w*x_hi + w*x_lo in F32. Used for the F32 MoE router.
 __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo) {
     hi = __builtin_bit_cast(uint16_t, (_Float16) x); lo = __builtin_bit_cast(uint16_t, (_Float16) (x - (float) __builtin_bit_cast(_Float16, hi)));
 }
-#if defined(__gfx1151__) || !defined(__HIP_DEVICE_COMPILE__)
-template <int BM, int BN, int WTM, int WTN, bool TWO, bool X16 = false>
+template <int BM, int BN, int WTM, int WTN, bool X16 = false>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_f32split_kernel(const float * __restrict__ W, const void * __restrict__ Xv, float * __restrict__ D, const int M, const int K, const int T) {
     const float * __restrict__ X = (const float *) Xv;
     const uint16_t * __restrict__ Xh = (const uint16_t *) Xv;
     constexpr int BKs = 32, LS = BKs + 8, WAVES_M = BM / WTM, TM = WTM / 16, TN = WTN / 16;
-    __shared__ __align__(16) uint16_t Ah[BM * LS], Al[BM * LS], Bh[BN * LS], Bl[BN * LS];
+    __shared__ __align__(16) uint16_t Ah[BM * LS], Bh[BN * LS], Bl[BN * LS];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, wm = wave % WAVES_M, wn = wave / WAVES_M;
     const int m0 = blockIdx.x * BM, t0 = blockIdx.y * BN;
     v8f acc[TM][TN];
@@ -600,9 +546,9 @@ mmb_f32split_kernel(const float * __restrict__ W, const void * __restrict__ Xv, 
     for (int k0 = 0; k0 < K; k0 += BKs) {
         for (int idx = tid; idx < A_CH; idx += MMB_NT) { const int row = idx >> 3, c4 = (idx & 7) * 4; const int m = m0 + row;
             float4 v = make_float4(0.f,0.f,0.f,0.f); if (m < M) v = *(const float4 *)(W + (size_t) m * K + k0 + c4);
-            uint16_t h[4], l[4]; mmb_split2(v.x,h[0],l[0]); mmb_split2(v.y,h[1],l[1]); mmb_split2(v.z,h[2],l[2]); mmb_split2(v.w,h[3],l[3]);
-            *(uint2 *)(Ah + row * LS + c4) = make_uint2((uint32_t)h[0] | ((uint32_t)h[1] << 16), (uint32_t)h[2] | ((uint32_t)h[3] << 16));
-            *(uint2 *)(Al + row * LS + c4) = make_uint2((uint32_t)l[0] | ((uint32_t)l[1] << 16), (uint32_t)l[2] | ((uint32_t)l[3] << 16)); }
+            const uint16_t h[4] = { __builtin_bit_cast(uint16_t, (_Float16) v.x), __builtin_bit_cast(uint16_t, (_Float16) v.y),
+                                    __builtin_bit_cast(uint16_t, (_Float16) v.z), __builtin_bit_cast(uint16_t, (_Float16) v.w) };
+            *(uint2 *)(Ah + row * LS + c4) = make_uint2((uint32_t)h[0] | ((uint32_t)h[1] << 16), (uint32_t)h[2] | ((uint32_t)h[3] << 16)); }
         for (int idx = tid; idx < B_CH; idx += MMB_NT) { const int row = idx >> 3, c4 = (idx & 7) * 4; const int t = t0 + row;
             float4 v = make_float4(0.f,0.f,0.f,0.f);
             if (t < T) {
@@ -624,11 +570,10 @@ mmb_f32split_kernel(const float * __restrict__ W, const void * __restrict__ Xv, 
         const int r = lane & 15;
 #pragma unroll
         for (int kk = 0; kk < BKs; kk += 16) {
-            v16s ah[TM], al[TM], bh[TN], bl[TN];
+            v16s ah[TM], bh[TN], bl[TN];
 #pragma unroll
             for (int i = 0; i < TM; ++i) { const int off = (wm * WTM + i * 16 + r) * LS + kk;
-                ah[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ah + off), *(const uint4 *)(Ah + off + 8)});
-                al[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Al + off), *(const uint4 *)(Al + off + 8)}); }
+                ah[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ah + off), *(const uint4 *)(Ah + off + 8)}); }
 #pragma unroll
             for (int j = 0; j < TN; ++j) { const int off = (wn * WTN + j * 16 + r) * LS + kk;
                 bh[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Bh + off), *(const uint4 *)(Bh + off + 8)});
@@ -639,7 +584,6 @@ mmb_f32split_kernel(const float * __restrict__ W, const void * __restrict__ Xv, 
                 for (int j = 0; j < TN; ++j) {
                     acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], ah[i], acc[i][j]);
                     acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bl[j], ah[i], acc[i][j]);
-                    if constexpr (!TWO) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], al[i], acc[i][j]);
                 }
         }
         __syncthreads();
@@ -652,7 +596,6 @@ mmb_f32split_kernel(const float * __restrict__ W, const void * __restrict__ Xv, 
 #pragma unroll
             for (int e = 0; e < 8; ++e) { const int t = t0 + wn * WTN + j * 16 + 2 * e + cn; if (t < T) D[(size_t) t * M + m] = acc[i][j][e]; } }
 }
-#endif
 
 // two tile classes: experts with >= thresh rows get BN_BIG-row tiles, the rest BN_SMALL-row tiles (fewer wasted rows on tiny experts)
 __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t * __restrict__ desc_big, uint32_t * __restrict__ desc_small,
@@ -740,10 +683,10 @@ __global__ void mmb_dq_q6k_bf16_kernel(const uint8_t * __restrict__ W, uint16_t 
             const int8_t q2 = (int8_t)((QL[l + 32] & 0xF) | (((QH[l] >> 2) & 3) << 4)) - 32;
             const int8_t q3 = (int8_t)((QL[l +  0] >>  4) | (((QH[l] >> 4) & 3) << 4)) - 32;
             const int8_t q4 = (int8_t)((QL[l + 32] >>  4) | (((QH[l] >> 6) & 3) << 4)) - 32;
-            Y[l +  0] = mmb_f2bf(d * S[is + 0] * q1);
-            Y[l + 32] = mmb_f2bf(d * S[is + 2] * q2);
-            Y[l + 64] = mmb_f2bf(d * S[is + 4] * q3);
-            Y[l + 96] = mmb_f2bf(d * S[is + 6] * q4);
+            Y[l +  0] = q4x_f2bf(d * S[is + 0] * q1);
+            Y[l + 32] = q4x_f2bf(d * S[is + 2] * q2);
+            Y[l + 64] = q4x_f2bf(d * S[is + 4] * q3);
+            Y[l + 96] = q4x_f2bf(d * S[is + 6] * q4);
         }
     }
 }
@@ -762,11 +705,10 @@ __global__ void mmb_dq_iq4nl_bf16_kernel(const uint8_t * __restrict__ W, uint16_
         const float l1 = d * mmb_kv_iq4nl[(v >>  8) & 0xF], h1 = d * mmb_kv_iq4nl[(v >> 12) & 0xF];
         const float l2 = d * mmb_kv_iq4nl[(v >> 16) & 0xF], h2 = d * mmb_kv_iq4nl[(v >> 20) & 0xF];
         const float l3 = d * mmb_kv_iq4nl[(v >> 24) & 0xF], h3 = d * mmb_kv_iq4nl[(v >> 28) & 0xF];
-        o[2*w] = mmb_pack2(l0, l1); o[2*w + 1] = mmb_pack2(l2, l3); o[8 + 2*w] = mmb_pack2(h0, h1); o[8 + 2*w + 1] = mmb_pack2(h2, h3);
+        o[2*w] = q4x_pack2(l0, l1); o[2*w + 1] = q4x_pack2(l2, l3); o[8 + 2*w] = q4x_pack2(h0, h1); o[8 + 2*w + 1] = q4x_pack2(h2, h3);
     }
 }
 static std::unordered_map<const void *, uint16_t *> g_mmb_shadow;
-static std::map<std::pair<const void *, const void *>, uint16_t *> g_mmb_shadow_pair;   // concat(w0, w1) along rows -> BF16 copy
 static size_t g_mmb_shadow_bytes = 0;
 constexpr size_t MMB_SHADOW_CAP = size_t{6144} << 20;
 static bool mmb_is_resident_q6k(const ggml_tensor * w) { return w && w->type == GGML_TYPE_Q6_K && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768; }
@@ -774,12 +716,7 @@ static bool mmb_is_resident_iq4(const ggml_tensor * w) { return w && w->type == 
 // Q5_K is a handful of attn_output weights; shadowing them routes the GEMM to
 // cuBLAS instead of the ~7 TFLOP/s hand-rolled Q5_K mmb path.
 static bool mmb_is_resident_q5k(const ggml_tensor * w) { return w && w->type == GGML_TYPE_Q5_K && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768; }
-static bool mmb_is_row_concat(const ggml_tensor * w) {
-    return w && w->op == GGML_OP_CONCAT && w->type == GGML_TYPE_IQ4_NL && ggml_get_op_params_i32(w, 0) == 1 && mmb_is_resident_iq4(w->src[0]) && mmb_is_resident_iq4(w->src[1]) &&
-           w->src[0]->ne[0] == w->src[1]->ne[0] && w->ne[0] == w->src[0]->ne[0] && w->ne[1] == w->src[0]->ne[1] + w->src[1]->ne[1];
-}
 static const uint16_t * mmb_shadow_lookup(const ggml_tensor * w) {
-    if (w->op == GGML_OP_CONCAT) { auto it = g_mmb_shadow_pair.find({w->src[0]->data, w->src[1]->data}); return it == g_mmb_shadow_pair.end() ? nullptr : it->second; }
     auto it = g_mmb_shadow.find(w->data); return it == g_mmb_shadow.end() ? nullptr : it->second;
 }
 
@@ -844,7 +781,6 @@ static const int8_t * mmb_q8_lookup(const ggml_tensor * t) {
     return g_mmb_q8_buf && g_mmb_q8_root == mmb_root(t) && g_mmb_q8_data == t->data ? g_mmb_q8_buf->get() : nullptr;
 }
 size_t ggml_cuda_mmb_w8a8_tile_bytes(int T, int K) { return mmb_w8a8_tile_bytes(T, K); }
-void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); g_mmb_f16_only.clear(); }
 size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size() + g_mmb_f16_only.size(); }
 void ggml_cuda_mmb_mark_f16_only(const ggml_tensor * t) { if (mmb_arch()) g_mmb_f16_only.insert(t); }
 bool ggml_cuda_mmb_is_f16_only(const ggml_tensor * t) { return g_mmb_f16_only.count(t) > 0; }
@@ -856,15 +792,9 @@ void ggml_cuda_mmb_release_all() {
     delete g_mmb_q8_buf; g_mmb_q8_buf = nullptr; g_mmb_q8_cap = 0;
     for (int i = 0; i < 4; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
     // Shadow weights are raw cudaMalloc keyed by data pointer and held for the process lifetime.
-    for (auto & e : g_mmb_shadow)      { if (e.second) CUDA_CHECK(cudaFree(e.second)); }
-    for (auto & e : g_mmb_shadow_pair) { if (e.second) CUDA_CHECK(cudaFree(e.second)); }
+    for (auto & e : g_mmb_shadow) { if (e.second) CUDA_CHECK(cudaFree(e.second)); }
     g_mmb_shadow.clear();
-    g_mmb_shadow_pair.clear();
     g_mmb_shadow_bytes = 0;
-}
-uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
-    if (!mmb_enabled() || ggml_nrows(t) < mmb_min_t()) return nullptr;
-    return ggml_cuda_mmb_slot_reserve(ctx, 0, t, n);
 }
 
 // True when a MUL_MAT with weight w and n_tokens rows would take the Q8_0 -> F16 route and can read an F16 activation.
@@ -915,7 +845,6 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     cudaStream_t stream = ctx.stream();
     const int K = (int) src0->ne[0], M = (int) src0->ne[1];
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
-#if defined(__gfx1151__) || !defined(__HIP_DEVICE_COMPILE__)
     if ((src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) && M <= 8) {
         const uint16_t * xb = ggml_cuda_mmb_bf16_src(src1);
         if (mmb_small_m_launch(src0->data, src0->type == GGML_TYPE_BF16, xb ? (const void *) xb : src1->data, xb != nullptr,
@@ -932,12 +861,12 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             // Small M (GDN alpha/beta, 48 rows): a 128x128 tile left T/128 = 16 blocks for the whole GPU. 64x32 tiles give
             // 4x the blocks; each output's K order and hi/lo WMMA sequence are unchanged, so the result is identical.
             const dim3 g(1, (T + 31) / 32);
-            if (xb) mmb_f32split_kernel<64, 32, 16, 16, true, true ><<<g, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
-            else    mmb_f32split_kernel<64, 32, 16, 16, true, false><<<g, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
+            if (xb) mmb_f32split_kernel<64, 32, 16, 16, true ><<<g, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
+            else    mmb_f32split_kernel<64, 32, 16, 16, false><<<g, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
             CUDA_CHECK(cudaGetLastError()); return;
         }
-        if (xb) mmb_f32split_kernel<128, 128, 32, 64, true,  true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
-        else    mmb_f32split_kernel<128, 128, 32, 64, true,  false><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
+        if (xb) mmb_f32split_kernel<128, 128, 32, 64, true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
+        else    mmb_f32split_kernel<128, 128, 32, 64, false><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, xp, (float *) dst->data, M, K, T);
         CUDA_CHECK(cudaGetLastError()); return;
     }
     if (src0->type == GGML_TYPE_Q8_0) {
@@ -952,32 +881,17 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         // Q8_0 -> F16 WMMA (bf16-only activations converted in the tile load, F32 ones via the per-graph F16 cache). A bf16-only dst keeps its in-place bf16 form.
         const bool f16_in = src1->type == GGML_TYPE_F16;
         const uint16_t * xb = f16_in ? nullptr : ggml_cuda_mmb_bf16_src(src1);
-        const bool bf16_dst = ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0;
+        const bool bf16_dst = ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0;
         const void * xa = f16_in ? src1->data : xb ? (const void *) xb : (const void *) mmb_f16_activation(ctx, src1, (size_t) T * K, stream);
         if (mmb_q8f16_launch((const uint8_t *) src0->data, xa, xb ? 1 : 0,
                              bf16_dst ? nullptr : (float *) dst->data, bf16_dst ? (uint16_t *) dst->data : nullptr, T, M, K, stream)) {
             CUDA_CHECK(cudaGetLastError()); return;
         }
     }
-#endif
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && "MMB: F16 activations need the Q8_0 -> F16 route");
     // A bf16-only tensor already lives in the mmb cache as bf16; reading it as f32 would reinterpret bytes.
     const uint16_t * xhp = ggml_cuda_mmb_bf16_src(src1);
     if (!xhp) xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
-    if (src0->type == GGML_TYPE_BF16 && M <= 8 && (K % 128) == 0) {
-        if (M <= 4) {
-            // NMAX=4 keeps all 256 threads active for the 4-row HC inject.
-            const int grid = (int) ((T + 63) / 64);
-            mmb_small_n_bf16_kernel<4, 64, 128><<<grid, 256, 0, stream>>>(
-                (const uint16_t *) src0->data, xhp, (float *) dst->data, (int) M, K, (int) T);
-        } else {
-            const int grid = (int) ((T + 31) / 32);
-            mmb_small_n_bf16_kernel<8, 32, 128><<<grid, 256, 0, stream>>>(
-                (const uint16_t *) src0->data, xhp, (float *) dst->data, (int) M, K, (int) T);
-        }
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data;
     if (src0->type == GGML_TYPE_IQ4_NL && M <= 384 && K >= 4096 && T >= 2048) {   // tall-M tile: HC down|inject [10240 -> 324], activations read once
         dim3 grid(1, (T + 63) / 64);
@@ -989,7 +903,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const bool big = (M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096);
     uint16_t * Dh = (K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
     bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
-    if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {
+    if (!Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {
         Dh = (uint16_t *) dst->data; store_f32 = false;
     }
     dim3 grid((M + 127) / 128, big ? (T + 255) / 256 : (T + 127) / 128);
@@ -1017,12 +931,9 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     CUDA_CHECK(cudaGetLastError());
 }
 
-bool ggml_cuda_mmb_gatemix() { return mmb_arch(); }
-bool ggml_cuda_mmb_blk16() { return mmb_arch(); }
-bool ggml_cuda_mmb_res16()  { return mmb_arch(); }
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
         const int hc, const float scale, const float bias) {
-    if (!ggml_cuda_mmb_gatemix() || hc != 4 || !mmb_quant_type(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
+    if (!mmb_arch() || hc != 4 || !mmb_quant_type(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     if (K % ggml_blck_size(w->type) != 0) return false;
     if (K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t()) return false;
@@ -1065,9 +976,9 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int si1  = (int) (ids->nb[1] / sizeof(int32_t));
     const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
     if (!ggml_cuda_launch_mm_ids_bounded(ctx, (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-            E, T, n_used, ne11, si1, sis1, /*inverse=*/false, stream)) {
+            E, T, n_used, ne11, si1, sis1, stream)) {
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-            E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
+            E, T, n_used, ne11, si1, sis1, stream);
     }
     // Experts under THRESH rows take BN_SMALL-token tiles. Every tile re-streams the expert's weights; at ~40 rows per
     // expert (T=2048, top-10 of 512) 64-token tiles read each expert once where 32 read most twice. The per-output
@@ -1087,8 +998,8 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     mmb_dispatch_quant(src0->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
     if (f16_out) {
-        mmb_routed_kernel<128, BN, 32, 64, WT, false, true><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-        mmb_routed_kernel<128, BN_SMALL, 32, 32, WT, false, true><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+        mmb_routed_kernel<128, BN, 32, 64, WT, true><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+        mmb_routed_kernel<128, BN_SMALL, 32, 32, WT, true><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
     } else {
         mmb_routed_kernel<128, BN, 32, 64, WT><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
         mmb_routed_kernel<128, BN_SMALL, 32, 32, WT><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
@@ -1122,9 +1033,9 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     const int si1  = (int) (ids->nb[1] / sizeof(int32_t));
     const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
     if (!ggml_cuda_launch_mm_ids_bounded(ctx, (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-            E, T, n_used, ne11, si1, sis1, /*inverse=*/false, stream)) {
+            E, T, n_used, ne11, si1, sis1, stream)) {
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-            E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
+            E, T, n_used, ne11, si1, sis1, stream);
     }
     // Experts under THRESH rows take BN_SMALL-token tiles. Every tile re-streams the expert's weights; at ~40 rows per
     // expert (T=2048, top-10 of 512) 64-token tiles read each expert once where 32 read most twice. The per-output
@@ -1185,23 +1096,14 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         g_mmb_shadow[w->data] = buf; g_mmb_shadow_bytes += bytes;
         return;
     }
-    const bool concat = mmb_is_row_concat(w);
-    if (!concat && !mmb_is_resident_iq4(w)) return;
-    if (concat ? g_mmb_shadow_pair.count({w->src[0]->data, w->src[1]->data}) > 0 : g_mmb_shadow.count(w->data) > 0) return;
+    if (!mmb_is_resident_iq4(w) || g_mmb_shadow.count(w->data) > 0) return;
     const size_t n = (size_t) w->ne[0] * w->ne[1];
     const size_t bytes = n * 2;
     if (g_mmb_shadow_bytes + bytes > MMB_SHADOW_CAP) { static bool warned = false; if (!warned) { GGML_LOG_INFO("MMB_SHADOW cap reached at %.1f MB; further weights stay IQ4_NL\n", g_mmb_shadow_bytes / 1048576.0); warned = true; } return; }
     uint16_t * buf = nullptr;
     if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
-    if (concat) {
-        const size_t n0 = (size_t) w->src[0]->ne[0] * w->src[0]->ne[1], n1 = (size_t) w->src[1]->ne[0] * w->src[1]->ne[1];
-        mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n0 / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->src[0]->data, buf, n0 / 32);
-        mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n1 / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->src[1]->data, buf + n0, n1 / 32);
-        g_mmb_shadow_pair[{w->src[0]->data, w->src[1]->data}] = buf;
-    } else {
-        mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 32);
-        g_mmb_shadow[w->data] = buf;
-    }
+    mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 32);
+    g_mmb_shadow[w->data] = buf;
     CUDA_CHECK(cudaGetLastError());
     g_mmb_shadow_bytes += bytes;
 }
@@ -1218,18 +1120,13 @@ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor *, const ggml_tensor *, cons
 void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {}
 void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {}
 void ggml_cuda_mmb_begin_graph() {}
-uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context &, const ggml_tensor *, size_t) { return nullptr; }
 const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor *) { return nullptr; }
 const uint16_t * ggml_cuda_mmb_bf16_src(const ggml_tensor *) { return nullptr; }
 const void * ggml_cuda_mmb_shadow_ptr(const ggml_tensor *) { return nullptr; }
 uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context &, int, const ggml_tensor *, size_t) { return nullptr; }
-void ggml_cuda_mmb_marks_clear() {}
 size_t ggml_cuda_mmb_marks_count() { return 0; }
 void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor *) {}
 bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor *) { return false; }
-bool ggml_cuda_mmb_gatemix() { return false; }
-bool ggml_cuda_mmb_res16() { return false; }
-bool ggml_cuda_mmb_blk16() { return false; }
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, int, float, float) { return false; }
 bool ggml_cuda_mmb_supported_glu(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
 void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {}

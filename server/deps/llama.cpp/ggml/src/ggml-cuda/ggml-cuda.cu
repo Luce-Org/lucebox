@@ -137,7 +137,6 @@ ggml_cuda_qwen4exp_profile ggml_backend_cuda_set_qwen4exp_profile(ggml_cuda_qwen
 }
 
 bool ggml_cuda_qwen4exp_enabled() { return qwen4exp_profile == GGML_CUDA_QWEN4EXP_DEFAULT; }
-bool ggml_cuda_qwen4exp_reference() { return qwen4exp_profile == GGML_CUDA_QWEN4EXP_REFERENCE; }
 
 bool ggml_backend_cuda_qwen4exp_supported(ggml_backend_t backend) {
 #if defined(GGML_USE_HIP)
@@ -3447,20 +3446,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
-    } else if (!split && ggml_cuda_qwen4exp_reference()
-            && src0->ne[1] == 1 && src1->ne[1] > MMVF_MAX_BATCH_SIZE && dst->ne[2] == 1 && dst->ne[3] == 1
-            && src0->type == GGML_TYPE_F32
-            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
-            && ggml_cuda_should_use_mmvf(src1->type, cc, src1->ne, src1->nb, 1)) {
-        // Upstream swaps vector-times-matrix into MMVF. IQ4_NL's F32 shared
-        // expert gate needs the same reduction order for exact comparison.
-        ggml_tensor dst_vec = *dst;
-        dst_vec.ne[0] = src1->ne[1];
-        dst_vec.ne[1] = 1;
-        dst_vec.nb[1] = dst_vec.nb[0]*src1->ne[1];
-        dst_vec.nb[2] = dst_vec.nb[1];
-        dst_vec.nb[3] = dst_vec.nb[1];
-        ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
     } else if (!split && use_mul_mat_f) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_vec_q) {
@@ -3960,64 +3945,38 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_HC_COMBINE_NORM: {
             const int64_t n_embd = dst->ne[0], hc = dst->ne[1], n_tokens = dst->ne[2];
             float * base = (float *) dst->data;
-            auto it = g_hc_marked_xn.find(dst);
+            ggml_cuda_hc_combine_norm_args a{};
+            a.inject   = dst->src[0];
+            a.residual = dst->src[1];
+            a.gamma    = dst->src[3];
             if (ggml_get_op_params_i32(dst, 5) == 1) {
                 // MoE mode: src2 = routed down rows, src4 = route weights, src5 = shared expert, src6 = shared gate logit.
-                ggml_cuda_hc_combine_norm_args a{};
-                a.inject       = dst->src[0];
-                a.residual     = dst->src[1];
-                a.gamma        = dst->src[3];
                 a.moe_down     = dst->src[2];
                 a.moe_w        = dst->src[4];
                 a.moe_shared   = dst->src[5];
                 a.moe_sh_logit = dst->src[6];
                 a.moe_down_f16 = ggml_cuda_mmb_is_f16_only(dst->src[2]);
-                ggml_tensor res_t = *dst;
-                res_t.ne[3] = 1; res_t.data = base; res_t.view_src = nullptr;
-                ggml_tensor xn_t = res_t;
-                xn_t.data = base + (size_t) n_embd * hc * n_tokens;
-                a.out_res = &res_t;
-                const bool marked = it != g_hc_marked_xn.end();
-                a.out_xn       = marked ? const_cast<ggml_tensor *>(it->second) : &xn_t;
-                a.out_xn_bf16  = marked ? (uint16_t *) it->second->data : nullptr;
-                a.store_xn_f32 = !marked;
-                if (marked && g_hc_q8_xn.count(dst)) a.out_q8 = ggml_cuda_mmb_q8_reserve(ctx, it->second, ggml_cuda_mmb_w8a8_tile_bytes((int) n_tokens, (int) (n_embd * hc)));
-                a.s1 = ggml_get_op_params_f32(dst, 0);
-                a.b1 = ggml_get_op_params_f32(dst, 1);
-                a.s2 = ggml_get_op_params_f32(dst, 2);
-                a.b2 = ggml_get_op_params_f32(dst, 3);
-                a.eps = ggml_get_op_params_f32(dst, 4);
-                ggml_cuda_op_hc_combine_norm(ctx, a);
-            } else if (it != g_hc_marked_xn.end()) {
-                // xn is bf16-only: write that channel to the mmb cache and skip its f32 form.
-                ggml_cuda_hc_combine_norm_args a{};
-                a.inject    = dst->src[0];
-                a.residual  = dst->src[1];
-                a.block_out = dst->src[2];
-                a.gamma     = dst->src[3];
-                a.out_xn    = const_cast<ggml_tensor *>(it->second);
-                ggml_tensor res_t = *dst;
-                res_t.ne[3]     = 1;
-                res_t.nb[3]     = dst->nb[3];
-                res_t.data      = base;
-                res_t.view_src  = nullptr;
-                a.out_res = &res_t;
-                a.out_xn_bf16  = (uint16_t *) a.out_xn->data;   // in place; consumers read bf16 from here
-                a.store_xn_f32 = false;
-                if (g_hc_q8_xn.count(dst)) a.out_q8 = ggml_cuda_mmb_q8_reserve(ctx, it->second, ggml_cuda_mmb_w8a8_tile_bytes((int) n_tokens, (int) (n_embd * hc)));
-                a.s1 = ggml_get_op_params_f32(dst, 0);
-                a.b1 = ggml_get_op_params_f32(dst, 1);
-                a.s2 = ggml_get_op_params_f32(dst, 2);
-                a.b2 = ggml_get_op_params_f32(dst, 3);
-                a.eps = ggml_get_op_params_f32(dst, 4);
-                ggml_cuda_op_hc_combine_norm(ctx, a);
             } else {
-                ggml_cuda_hc_combine_norm_ptrs(ctx, dst->src[0], dst->src[1], dst->src[2], dst->src[3],
-                    base, base + (size_t) n_embd * hc * n_tokens, n_embd, hc, n_tokens,
-                    ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1),
-                    ggml_get_op_params_f32(dst, 2), ggml_get_op_params_f32(dst, 3),
-                    ggml_get_op_params_f32(dst, 4));
+                a.block_out = dst->src[2];
             }
+            ggml_tensor res_t = *dst;
+            res_t.ne[3] = 1; res_t.data = base; res_t.view_src = nullptr;
+            ggml_tensor xn_t = res_t;
+            xn_t.data = base + (size_t) n_embd * hc * n_tokens;
+            a.out_res = &res_t;
+            // A marked xn is bf16-only: write that channel in place (consumers read bf16 there) and skip its f32 form.
+            auto it = g_hc_marked_xn.find(dst);
+            const bool marked = it != g_hc_marked_xn.end();
+            a.out_xn       = marked ? const_cast<ggml_tensor *>(it->second) : &xn_t;
+            a.out_xn_bf16  = marked ? (uint16_t *) it->second->data : nullptr;
+            a.store_xn_f32 = !marked;
+            if (marked && g_hc_q8_xn.count(dst)) a.out_q8 = ggml_cuda_mmb_q8_reserve(ctx, it->second, ggml_cuda_mmb_w8a8_tile_bytes((int) n_tokens, (int) (n_embd * hc)));
+            a.s1 = ggml_get_op_params_f32(dst, 0);
+            a.b1 = ggml_get_op_params_f32(dst, 1);
+            a.s2 = ggml_get_op_params_f32(dst, 2);
+            a.b2 = ggml_get_op_params_f32(dst, 3);
+            a.eps = ggml_get_op_params_f32(dst, 4);
+            ggml_cuda_op_hc_combine_norm(ctx, a);
         } break;
 #endif // defined(GGML_USE_HIP)
         case GGML_OP_GROUP_NORM:
@@ -5033,9 +4992,9 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                // Leaf inputs can be recycled after their unfused last use too
-                // (e.g. RoPE positions reused by the following CONT).
-                if (!src) {
+                // qwen4exp graphs also check leaf inputs: they can be recycled after
+                // their unfused last use (e.g. RoPE positions reused by the following CONT).
+                if (!src || (src->op == GGML_OP_NONE && !ggml_cuda_qwen4exp_enabled())) {
                     continue;
                 }
 
@@ -5148,7 +5107,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     }
 
     // ROPE (multi-section, F32) -> PERMUTE -> CONT: the rope writes its rows straight into the CONT layout (qwen4exp Q
-    // for flash attention). Addresses change, values do not. Off for the reference graph.
+    // for flash attention). Addresses change, values do not. qwen4exp graphs only.
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ROPE && ops.begin()[1] == GGML_OP_PERMUTE && ops.begin()[2] == GGML_OP_CONT &&
         ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
         const ggml_tensor * rope = cgraph->nodes[node_idx];
@@ -5156,7 +5115,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * cont = cgraph->nodes[node_idx + 2];
         const int mode = ggml_get_op_params_i32(rope, 2);
         const int outputs[] = { node_idx + 2 };
-        return !ggml_cuda_qwen4exp_reference() && (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION && !(mode & GGML_ROPE_TYPE_TAIL) &&
+        return ggml_cuda_qwen4exp_enabled() && (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION && !(mode & GGML_ROPE_TYPE_TAIL) &&
             rope->type == GGML_TYPE_F32 && rope->src[0]->type == GGML_TYPE_F32 && rope->src[0]->ne[3] == 1 &&
             perm->src[0] == rope && ggml_get_op_params_i32(perm, 0) == 0 &&
             cont->src[0] == perm && cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont) &&
@@ -5580,7 +5539,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // start of fusion operations
                 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
                 if (!disable_fusion) {
-                    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+                    const bool qwen4exp_rdna35 = ggml_cuda_qwen4exp_enabled() &&
+                        GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc);
+                    if (qwen4exp_rdna35) {
                         if (node->op == GGML_OP_CONCAT) {
                             ggml_cuda_ple_conv_match pm;
                             if (ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) {
@@ -5615,9 +5576,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #if defined(GGML_USE_HIP)
                     // HC gate GEMM + mix reduce fold; must precede the generic SIGMOID fusion below.
-                    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+                    if (qwen4exp_rdna35) {
                         ggml_cuda_hc_mix_args hma;
-                        if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() && i + 1 < cgraph->n_nodes) {
+                        if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
                             const ggml_tensor * w  = node->src[0];
                             const ggml_tensor * lo = node->src[1];
                             if (ggml_is_quantized(w->type) && ggml_node_has_n_uses(cgraph, i, 1) &&
@@ -5992,8 +5953,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
 
                     // Bit-exact replacement for the two-kernel GDN normalization.
-                    // Qualified for RDNA3.5 and 128-wide rows.
-                    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                    // Qualified for qwen4exp on RDNA3.5 and 128-wide rows.
+                    if (qwen4exp_rdna35 &&
                         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
                         ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
@@ -6327,7 +6288,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             if (cnt <= 0 || !ma.dst || i < 1 || ggml_nrows(ma.dst) < 512) continue;
             const ggml_tensor * wup = cgraph->nodes[i - 1];
             if (wup->op != GGML_OP_MUL_MAT || ma.gate != wup ||
-                !ggml_cuda_mmb_gatemix() || ma.hc != 4 ||
+                ma.hc != 4 ||
                 !ggml_is_quantized(wup->src[0]->type) || wup->src[1]->type != GGML_TYPE_F32) continue;
             bool ok = true; int nread = 0;
             for (int n = i + cnt; n < cgraph->n_nodes && ok; ++n) {
@@ -6391,8 +6352,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
 #if defined(GGML_USE_HIP)
-    // Pre-dequantize eligible dense weights into a bf16 shadow (outside stream capture).
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
+    // Pre-dequantize eligible dense weights into a bf16 shadow (outside stream capture); qwen4exp graphs only.
+    for (int i = 0; ggml_cuda_qwen4exp_enabled() && i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT) {
             continue;
@@ -7233,7 +7194,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // CUDA/HIP allocations are aligned, but views can start between
             // float4 boundaries. GGML folds nested views into view_offs, which
             // is available even before the scheduler allocates their buffers.
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[0] % 4 == 0 &&
                    op->src[0]->view_offs % sizeof(float4) == 0 &&
                    op->src[0]->nb[1] % sizeof(float4) == 0 &&

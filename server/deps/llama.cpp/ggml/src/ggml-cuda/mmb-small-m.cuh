@@ -3,7 +3,6 @@
 // Bandwidth-bound: one wave per token streams its activation row once (F32 or bf16), the M weight rows
 // (F32 or bf16, L2-resident) are read alongside, and each lane keeps F32 FMA partials that a fixed xor-tree
 // reduces (deterministic). Replaces a 128-row WMMA tile that wasted 124/128 rows and launched T/64 blocks.
-// Self-contained so the standalone microbench can include it.
 
 #include <cstdint>
 

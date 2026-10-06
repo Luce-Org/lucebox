@@ -1,9 +1,5 @@
 #include "gated-norm.cuh"
-
-// same expression as op_sigmoid in unary.cu
-static __device__ __forceinline__ float gn_sigmoid(const float x) {
-    return 1.0f / (1.0f + expf(-x));
-}
+#include "qwen4exp-common.cuh"
 
 // same saturating conversion as mq_f2h_sat in mmb-q8f16.cuh
 static __device__ __forceinline__ half gn_f2h_sat(const float v) {
@@ -21,7 +17,7 @@ static __global__ void gated_rms_norm_f16_kernel(const float * x, const float * 
     const float * zr = z + t * z_st + (int64_t) h * z_sh;
     half * d = dst + ((int64_t) t * nh + h) * ncols;
     if constexpr (!NORM) {
-        for (int col = tid; col < ncols; col += block_size) d[col] = gn_f2h_sat(gn_sigmoid(zr[col]) * xr[col]);
+        for (int col = tid; col < ncols; col += block_size) d[col] = gn_f2h_sat(q4x_sigmoid(zr[col]) * xr[col]);
         return;
     }
     float tmp = 0.0f;
@@ -36,7 +32,7 @@ static __global__ void gated_rms_norm_f16_kernel(const float * x, const float * 
     const float * g  = gamma + (int64_t) (h % gamma_rows) * ncols;
     for (int col = tid; col < ncols; col += block_size) {
         const float v = scale * xr[col] * g[col];
-        d[col] = gn_f2h_sat(gn_sigmoid(zr[col]) * v);
+        d[col] = gn_f2h_sat(q4x_sigmoid(zr[col]) * v);
     }
 }
 
@@ -65,7 +61,7 @@ static __global__ void gated_rms_norm2_f16_kernel(const float * x, const float *
     const float * zr = z + t * z_st + (int64_t) h * z_sh;
     half * d = dst + ((int64_t) t * nh + h) * ncols;
     const float v = scale * xr[gt] * g[gt];
-    d[gt] = gn_f2h_sat(gn_sigmoid(zr[gt]) * v);
+    d[gt] = gn_f2h_sat(q4x_sigmoid(zr[gt]) * v);
 }
 
 void ggml_cuda_op_gated_rms_norm_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

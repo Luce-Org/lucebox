@@ -7,7 +7,6 @@
 
 static thread_local size_t g_gdn_scalar_launch_count = 0;
 static thread_local size_t g_gdn_grouped_cols_launch_count = 0;
-static thread_local size_t g_gdn_tiled_launch_count = 0;
 
 extern "C" size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void) {
     return g_gdn_scalar_launch_count;
@@ -15,10 +14,6 @@ extern "C" size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void) {
 
 extern "C" size_t ggml_backend_cuda_get_gdn_grouped_cols_launch_count(void) {
     return g_gdn_grouped_cols_launch_count;
-}
-
-extern "C" size_t ggml_backend_cuda_get_gdn_tiled_launch_count(void) {
-    return g_gdn_tiled_launch_count;
 }
 
 static bool gdn_grouped_cols_supported(int device) {
@@ -854,7 +849,6 @@ static void launch_gated_delta_net(
         // grouped_cols via these, so the tiled path must not shadow them.
         getenv("LUCE_GDN_FORCE_GROUPED_COLS") == nullptr &&
         getenv("LUCE_GDN_NO_GROUPED_COLS") == nullptr) {
-        ++g_gdn_tiled_launch_count;
         const dim3 tiled_grid(H, n_seqs, 2);
         const dim3 tiled_block(32, 8, 1);
         gated_delta_net_tiled_cuda<128, 8, 8, 16><<<tiled_grid, tiled_block, 0, stream>>>(

@@ -6,7 +6,7 @@
 // test builds both forms on the CUDA/HIP backend and on the CPU backend and
 // requires bit-identical results, for positive and negative positions and for
 // the single-head 2D shape the compressor uses.
-// Also checks the input lifetime of the M-RoPE -> PERMUTE -> CONT fusion.
+// Also checks the input lifetime of the M-RoPE -> PERMUTE -> CONT fusion (a qwen4exp-profile fusion on the GPU).
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #ifdef LUCE_ROPE_TEST_GPU
@@ -260,9 +260,11 @@ TEST_CASE(RopeTailFixture, gpu_mrope_cont_position_alias) {
     if (ggml_backend_cuda_get_device_count() == 0) SKIP("no CUDA/HIP device available");
     backend = ggml_backend_cuda_init(0);
     ggml_backend_cuda_set_graphs_disabled_override(true);
+    const auto previous = ggml_backend_cuda_set_qwen4exp_profile(GGML_CUDA_QWEN4EXP_DEFAULT);
     const bool ok = check_mrope_cont_alias(backend, 24, 1) &&
                     check_mrope_cont_alias(backend, 256, 1) &&
                     check_mrope_cont_alias(backend, 24, 128);
+    ggml_backend_cuda_set_qwen4exp_profile(previous);
     ggml_backend_cuda_set_graphs_disabled_override(false);
     REQUIRE_TRUE(ok);
 }

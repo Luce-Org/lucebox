@@ -1,10 +1,11 @@
-// Regression test for the route-bounded mmid merge.
+// Regression test for the mul_mat_id routing helper.
 //
 // Negative expert ids are DS4 "masked owner routes": they belong to no expert
 // and must not reserve a slot in the compact routing arrays. This drives
 // ggml_cuda_launch_mm_ids_helper directly (the function the mmq/mmf mul_mat_id
-// paths call) and checks the compact contract for the <=256-expert fast path
-// and the classic path, in both forward and inverse (write_inverse) modes.
+// paths call) with ten experts per token (qwen4exp's top-10, padded to 16 lanes
+// per token) and checks the compact contract for the <=256-expert fast path
+// and the classic path.
 //
 // mmid.cuh declares the helper with cudaStream_t; the HIP build maps that to
 // hipStream_t (ggml/src/ggml-cuda/vendors/hip.h:152), so it is declared with the
@@ -24,7 +25,7 @@
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
         int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1,
-        bool write_inverse, hipStream_t stream);
+        hipStream_t stream);
 
 namespace {
 
@@ -35,7 +36,7 @@ bool check(bool cond, const char * what) {
     return cond;
 }
 
-bool run_case(int n_experts, int n_tokens, int n_expert_used, bool write_inverse) {
+bool run_case(int n_experts, int n_tokens, int n_expert_used) {
     const int n_routes = n_tokens * n_expert_used;
     const int si1  = n_expert_used;
     const int sis1 = n_expert_used;
@@ -77,7 +78,7 @@ bool run_case(int n_experts, int n_tokens, int n_expert_used, bool write_inverse
 
     ggml_cuda_launch_mm_ids_helper(d_ids, d_src1, d_dst, d_bounds,
         n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1,
-        write_inverse, (hipStream_t) 0);
+        (hipStream_t) 0);
     hipDeviceSynchronize();
 
     std::vector<int32_t> h_src1((size_t) n_routes), h_dst((size_t) n_routes);
@@ -119,11 +120,7 @@ bool run_case(int n_experts, int n_tokens, int n_expert_used, bool write_inverse
         ok = check(h_ids[(size_t) dstv] == slot_expert[(size_t) i], "dst route matches owning expert") && ok;
         ok = check(!seen[(size_t) dstv], "route appears once") && ok;
         seen[(size_t) dstv] = 1;
-        if (write_inverse) {
-            ok = check(h_src1[(size_t) dstv] == i, "inverse row == compact index") && ok;
-        } else {
-            ok = check(h_src1[(size_t) i] == t * sis1 + (u % nchannels_y), "forward row") && ok;
-        }
+        ok = check(h_src1[(size_t) i] == t * sis1 + (u % nchannels_y), "forward row") && ok;
     }
     for (int r = 0; r < n_routes; ++r) {
         ok = check(seen[(size_t) r] == (h_ids[(size_t) r] >= 0 ? 1 : 0),
@@ -151,12 +148,9 @@ int main() {
 
     bool ok = true;
     for (int n_experts : { 64, 320 }) {
-        for (int inverse = 0; inverse < 2; ++inverse) {
-            const bool c = run_case(n_experts, /*n_tokens=*/64, /*n_expert_used=*/10, inverse != 0);
-            std::printf("[mmid-regress] experts=%d inverse=%d %s\n",
-                n_experts, inverse, c ? "ok" : "FAIL");
-            ok = c && ok;
-        }
+        const bool c = run_case(n_experts, /*n_tokens=*/64, /*n_expert_used=*/10);
+        std::printf("[mmid-regress] experts=%d %s\n", n_experts, c ? "ok" : "FAIL");
+        ok = c && ok;
     }
     ggml_backend_free(backend);
     std::printf("[mmid-regress] %s\n", ok ? "PASS" : "FAIL");

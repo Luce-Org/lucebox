@@ -28,16 +28,14 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-//
-// Self-contained so the standalone microbench can include it.
 
+#include "qwen4exp-common.cuh"
 #include <cstdint>
 
 typedef _Float16 mq_v16h __attribute__((ext_vector_type(16)));
 typedef _Float16 mq_h2   __attribute__((ext_vector_type(2)));
 typedef float    mq_v8f  __attribute__((ext_vector_type(8)));
 
-__device__ __forceinline__ uint16_t mq_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 __device__ __forceinline__ _Float16 mq_f2h_sat(float v) { return (_Float16) (fabsf(v) > 65504.0f ? copysignf(65504.0f, v) : v); }
 
 // XT: activation rows as stored by the graph, 0 = F16, 1 = bf16, 2 = F32. Non-F16 rows are converted to F16
@@ -217,7 +215,7 @@ __global__ void __launch_bounds__(256) mmb_q8f16_kernel(const uint8_t * __restri
                     if (yh) {
                         uint32_t hw[8];
 #pragma unroll
-                        for (int q = 0; q < 8; ++q) hw[q] = (uint32_t) mq_f2bf(src[2 * q]) | ((uint32_t) mq_f2bf(src[2 * q + 1]) << 16);
+                        for (int q = 0; q < 8; ++q) hw[q] = (uint32_t) q4x_f2bf(src[2 * q]) | ((uint32_t) q4x_f2bf(src[2 * q + 1]) << 16);
                         *(uint4 *) (yh + o) = make_uint4(hw[0], hw[1], hw[2], hw[3]);
                         *(uint4 *) (yh + o + 8) = make_uint4(hw[4], hw[5], hw[6], hw[7]);
                     }
@@ -226,7 +224,7 @@ __global__ void __launch_bounds__(256) mmb_q8f16_kernel(const uint8_t * __restri
                     for (int q = 0; q < 16; ++q) {
                         if (rr + rl + q < M) {
                             if (y) y[o + q] = src[q];
-                            if (yh) yh[o + q] = mq_f2bf(src[q]);
+                            if (yh) yh[o + q] = q4x_f2bf(src[q]);
                         }
                     }
                 }

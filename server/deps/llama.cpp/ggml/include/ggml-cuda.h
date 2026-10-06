@@ -254,11 +254,10 @@ GGML_BACKEND_API void ggml_cuda_rocmfp3_mix_unregister(const void * base);
 
 // Calling-thread profile. Scoped qwen4exp callers restore the returned value;
 // other models keep the generic dispatcher. DEFAULT requires a supported backend
-// (checked once at load); REFERENCE is for differential tests.
+// (checked once at load).
 enum ggml_cuda_qwen4exp_profile {
     GGML_CUDA_QWEN4EXP_OFF,
     GGML_CUDA_QWEN4EXP_DEFAULT,
-    GGML_CUDA_QWEN4EXP_REFERENCE,
 };
 GGML_BACKEND_API enum ggml_cuda_qwen4exp_profile ggml_backend_cuda_set_qwen4exp_profile(enum ggml_cuda_qwen4exp_profile profile);
 GGML_BACKEND_API bool ggml_backend_cuda_qwen4exp_supported(ggml_backend_t backend);
