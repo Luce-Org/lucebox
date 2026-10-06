@@ -69,7 +69,86 @@ std::string qwen4exp_template_effort(const std::string & effort) {
     return "xhigh";
 }
 
+// DeepSeek V4.1 tool block, as encoding/encoding.py in the model repo renders
+// it: leading-space DSML tag names and one schema per line.
+static const char DS41_TOOLS_HEADER[] =
+    "## Tools\n\n"
+    "You have access to a set of tools to help answer the user's question. "
+    "You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n"
+    "<｜DSML｜ calls>\n"
+    "<｜DSML｜ invoke name=\"$TOOL_NAME\">\n"
+    "<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n"
+    "...\n"
+    "</｜DSML｜ invoke>\n"
+    "<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n"
+    "...\n"
+    "</｜DSML｜ invoke>\n"
+    "</｜DSML｜ calls>\n\n"
+    "String parameters should be specified as is and set `string=\"true\"`. "
+    "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
+    "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning "
+    "inside <think>...</think> BEFORE any tool calls or final response.\n\n"
+    "Otherwise, output directly after </think> with tool calls or final response.\n\n"
+    "### Available Tool Schemas\n\n";
+
+// Python json.dumps(value, ensure_ascii=False) spelling: ", " and ": "
+// separators, keys in their original order.
+static void append_python_json(std::string & out, const nlohmann::ordered_json & value) {
+    if (value.is_object()) {
+        out += '{';
+        bool first = true;
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            if (!first) out += ", ";
+            first = false;
+            out += nlohmann::ordered_json(it.key()).dump();
+            out += ": ";
+            append_python_json(out, it.value());
+        }
+        out += '}';
+    } else if (value.is_array()) {
+        out += '[';
+        bool first = true;
+        for (const auto & item : value) {
+            if (!first) out += ", ";
+            first = false;
+            append_python_json(out, item);
+        }
+        out += ']';
+    } else {
+        out += value.dump();
+    }
+}
+
+static void append_ds41_tools(std::string & result, const std::string & tools_json) {
+    result += DS41_TOOLS_HEADER;
+    try {
+        const auto tools = nlohmann::ordered_json::parse(tools_json);
+        bool first = true;
+        for (const auto & tool : tools) {
+            if (!first) result += "\n";
+            first = false;
+            append_python_json(result, tool.contains("function") ? tool["function"] : tool);
+        }
+    } catch (const std::exception &) {
+        result += tools_json;
+    }
+    result += "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n";
+}
+
+// V4.1 reasoning budget: 1-100, with the named levels of the model's encoder.
+static int ds41_reasoning_budget(const std::string & effort) {
+    if (effort == "low") return 50;
+    if (effort == "medium") return 62;
+    if (effort == "max") return 100;
+    if (!effort.empty() && effort.find_first_not_of("0123456789") == std::string::npos && effort.size() <= 3) {
+        const int budget = std::stoi(effort);
+        if (budget >= 1 && budget <= 100) return budget;
+    }
+    return 75;
+}
+
 ChatFormat chat_format_for_arch(const std::string & arch) {
+    if (arch == "deepseek41") return ChatFormat::DEEPSEEK41;
     if (arch_is_deepseek4_family(arch)) return ChatFormat::DEEPSEEK4;
     if (arch == "laguna") return ChatFormat::LAGUNA;
     if (arch == "gemma4") return ChatFormat::GEMMA4;
@@ -542,6 +621,66 @@ std::string render_chat_template(
                 result += "<｜end▁of▁sentence｜>";
                 pending_assistant = false;
                 pending_tool_result = false;
+            }
+        }
+
+        if (add_generation_prompt) {
+            result += "<｜Assistant｜>";
+            result += enable_thinking ? "<think>" : "</think>";
+        }
+        break;
+    }
+
+    case ChatFormat::DEEPSEEK41: {
+        // DeepSeek V4.1 Flash, following encoding/encoding.py in the model repo:
+        //   <｜begin▁of▁sentence｜><｜System｜>{effort}{system}\n\n{tools}<｜User｜>{user}<｜Assistant｜></think>
+        // V4.1 differs from V4 in the leading-space DSML tag names (<｜DSML｜ calls>),
+        // a numeric reasoning effort, and <｜System｜> on system turns, including
+        // mid-conversation ones. Tool results join the user turn as
+        // <tool_result> blocks separated by blank lines. Every assistant header is
+        // rendered the same way in every turn, so a completed turn keeps its prefix.
+        const size_t first = !messages.empty() && messages[0].role == "system" ? 1 : 0;
+        result = "<｜begin▁of▁sentence｜>";
+        if (enable_thinking || first == 1 || has_tools) result += "<｜System｜>";
+        if (enable_thinking) {
+            result += "Reasoning Effort: " + std::to_string(ds41_reasoning_budget(reasoning_effort)) +
+                      " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+        }
+        if (first == 1) result += messages[0].content;
+        if (has_tools) {
+            result += "\n\n";
+            append_ds41_tools(result, tools_json);
+        }
+
+        bool in_user_turn = false;
+        bool pending_assistant = false;
+        for (size_t i = first; i < messages.size(); ++i) {
+            const auto & msg = messages[i];
+            if (msg.role == "system") {
+                result += "<｜System｜>";
+                result += msg.content;
+                in_user_turn = false;
+                pending_assistant = true;
+            } else if (msg.role == "user" || msg.role == "tool" || msg.role == "function") {
+                result += in_user_turn ? "\n\n" : "<｜User｜>";
+                if (msg.role == "user") {
+                    result += msg.content;
+                } else {
+                    result += "<tool_result>";
+                    result += msg.content;
+                    result += "</tool_result>";
+                }
+                in_user_turn = true;
+                pending_assistant = true;
+            } else if (msg.role == "assistant") {
+                if (pending_assistant) {
+                    result += "<｜Assistant｜>";
+                    result += enable_thinking ? "<think>" : "</think>";
+                }
+                result += msg.content;
+                result += "<｜end▁of▁sentence｜>";
+                in_user_turn = false;
+                pending_assistant = false;
             }
         }
 

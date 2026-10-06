@@ -3502,6 +3502,109 @@ TEST_CASE(ServerUnitFixture, test_qwen_completed_tool_turn_preserves_generation_
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_dsml_v41_tool_calls) {
+    // DeepSeek V4.1 spells DSML tags with a leading-space name.
+    const std::string text =
+        "I'll read the file.\n\n"
+        "<｜DSML｜ calls>\n"
+        "<｜DSML｜ invoke name=\"read_file\">\n"
+        "<｜DSML｜ parameter name=\"path\" string=\"true\">deepseek4_candidates.cpp</｜DSML｜ parameter>\n"
+        "<｜DSML｜ parameter name=\"limit\" string=\"false\">40</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "read_file"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}},
+                     {"limit", {{"type", "integer"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read_file");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "deepseek4_candidates.cpp");
+        TEST_ASSERT(args["limit"] == 40);
+    }
+    TEST_ASSERT(result.cleaned_text == "I'll read the file.");
+}
+
+// Reference renders from encoding/tests in the DeepSeek-V4.1-Flash model repo.
+TEST_CASE(ServerUnitFixture, test_deepseek41_template_matches_reference_chat) {
+    const std::vector<ChatMessage> msgs = {
+        {"system", "You are a helpful assistant."},
+        {"user", "Hello"},
+        {"assistant", "Hi there! How can I help you?"},
+        {"user", "What is the capital of France?"},
+        {"assistant", "The capital of France is Paris."},
+    };
+    const std::string expected = R"REF(<｜begin▁of▁sentence｜><｜System｜>You are a helpful assistant.<｜User｜>Hello<｜Assistant｜></think>Hi there! How can I help you?<｜end▁of▁sentence｜><｜User｜>What is the capital of France?<｜Assistant｜></think>The capital of France is Paris.<｜end▁of▁sentence｜>)REF";
+    TEST_ASSERT(render_chat_template(msgs, ChatFormat::DEEPSEEK41, false, false) == expected);
+}
+
+TEST_CASE(ServerUnitFixture, test_deepseek41_template_matches_reference_tools) {
+    const std::vector<ChatMessage> msgs = {
+        {"system", "You are a helpful assistant."},
+        {"user", "What's the weather like in Beijing?"},
+    };
+    const std::string tools_json = R"REF([{"type": "function", "function": {"name": "get_weather", "description": "Get the weather for a specific location", "parameters": {"type": "object", "properties": {"location": {"type": "string", "description": "The city name"}, "unit": {"type": "string", "enum": ["celsius", "fahrenheit"], "description": "Temperature unit"}}, "required": ["location"]}}}, {"type": "function", "function": {"name": "search", "description": "Search the web for information", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}, "num_results": {"type": "integer", "description": "Number of results to return"}}, "required": ["query"]}}}])REF";
+    const std::string expected = R"REF(<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)
+
+You are a helpful assistant.
+
+## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<｜DSML｜ calls>" block like the following:
+
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="$TOOL_NAME">
+<｜DSML｜ parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜ parameter>
+...
+</｜DSML｜ invoke>
+<｜DSML｜ invoke name="$TOOL_NAME2">
+...
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.
+
+Otherwise, output directly after </think> with tool calls or final response.
+
+### Available Tool Schemas
+
+{"name": "get_weather", "description": "Get the weather for a specific location", "parameters": {"type": "object", "properties": {"location": {"type": "string", "description": "The city name"}, "unit": {"type": "string", "enum": ["celsius", "fahrenheit"], "description": "Temperature unit"}}, "required": ["location"]}}
+{"name": "search", "description": "Search the web for information", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}, "num_results": {"type": "integer", "description": "Number of results to return"}}, "required": ["query"]}}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+<｜User｜>What's the weather like in Beijing?<｜Assistant｜><think>)REF";
+    TEST_ASSERT(render_chat_template(msgs, ChatFormat::DEEPSEEK41, true, true, tools_json, "high") ==
+                expected);
+}
+
+TEST_CASE(ServerUnitFixture, test_deepseek41_template_tool_results_and_effort) {
+    const std::vector<ChatMessage> msgs = {
+        {"user", "Read a.cpp and b.cpp."},
+        {"assistant", "\n\n<｜DSML｜ calls>\n</｜DSML｜ calls>"},
+        {"tool", "int a;", "call_1"},
+        {"tool", "int b;", "call_2"},
+        {"system", "Be brief."},
+    };
+    const std::string out = render_chat_template(msgs, ChatFormat::DEEPSEEK41, true, true, "", "max");
+    TEST_ASSERT(out.rfind("<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 100 (range 1-100", 0) == 0);
+    TEST_ASSERT(out.find("<｜User｜><tool_result>int a;</tool_result>\n\n<tool_result>int b;</tool_result>"
+                         "<｜System｜>Be brief.<｜Assistant｜><think>") != std::string::npos);
+    TEST_ASSERT(chat_format_for_arch("deepseek41") == ChatFormat::DEEPSEEK41);
+    TEST_ASSERT(chat_format_for_arch("deepseek4") == ChatFormat::DEEPSEEK4);
+}
+
 TEST_CASE(ServerUnitFixture, test_hash_prefix_deterministic) {
     std::vector<int32_t> ids = {100, 200, 300, 400, 500};
     auto h1 = hash_prefix(ids.data(), (int)ids.size());
@@ -3719,6 +3822,7 @@ TEST_CASE(ServerUnitFixture, test_tool_result_prompt_prefix_survives_next_agent_
     const Family families[] = {
         {ChatFormat::QWEN3, "<|im_start|>"},
         {ChatFormat::DEEPSEEK4, "<｜Assistant｜>"},
+        {ChatFormat::DEEPSEEK41, "<｜Assistant｜>"},
         {ChatFormat::GEMMA4, "<|turn>"},
         {ChatFormat::LAGUNA, "<assistant>"},
     };

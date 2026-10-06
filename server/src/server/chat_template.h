@@ -34,6 +34,7 @@ enum class ChatFormat {
     LAGUNA,    // <|begin_of_sentence|><|User|>...<|Assistant|>
     GEMMA4,    // <bos><|turn>role\n...<turn|>\n
     DEEPSEEK4, // <｜begin▁of▁sentence｜>...<｜User｜>...<｜Assistant｜>
+    DEEPSEEK41, // <｜begin▁of▁sentence｜><｜System｜>...<｜User｜>...<｜Assistant｜>
 };
 
 // Render chat messages into the model-specific prompt string.
