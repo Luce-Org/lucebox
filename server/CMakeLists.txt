@@ -1671,6 +1671,8 @@ if(LUCE_TESTS)
     target_link_libraries(bench_ds41_iq_mmid PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
     add_executable(test_ds41_mmid_width_invariance test/unit/test_ds41_mmid_width_invariance.cpp)
     target_link_libraries(test_ds41_mmid_width_invariance PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
+    # Five tokens: the DSpark verify width (q=5) of the DS4.1 profiles.
+    add_test(NAME test_ds41_mmid_width_invariance COMMAND test_ds41_mmid_width_invariance 5 64)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_rocmfp3_mix_registry.cpp")
         # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
         # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,

@@ -27,6 +27,16 @@ struct Case { ggml_type type; const char * surface; int k, n; };
 
 static void fill_blocks(std::vector<uint8_t> & w, ggml_type type, size_t n_blocks, std::mt19937 & rng) {
     const size_t bs = ggml_type_size(type);
+    if (type == GGML_TYPE_Q2_0_ROCMFP2) {                          // ue4m3 scales: tile quantized random blocks
+        constexpr size_t pool = 4096;
+        std::normal_distribution<float> gauss(0.0f, 0.02f);
+        std::vector<float> f(pool * size_t(ggml_blck_size(type)));
+        for (auto & v : f) v = gauss(rng);
+        std::vector<uint8_t> q(pool * bs);
+        ggml_get_type_traits(type)->from_float_ref(f.data(), q.data(), int64_t(f.size()));
+        for (size_t i = 0; i < n_blocks; ++i) std::memcpy(w.data() + i * bs, q.data() + (rng() % pool) * bs, bs);
+        return;
+    }
     std::uniform_real_distribution<float> dscale(0.005f, 0.02f);
     for (auto & b : w) b = uint8_t(rng());
     for (size_t i = 0; i < n_blocks; ++i) {
@@ -191,7 +201,7 @@ int main(int argc, char ** argv) {
     // dispatch and are known to differ on CUDA; they are run as a diagnostic, not as part of the exit status.
     struct T { ggml_type type; bool contract; } types[] = {
         {GGML_TYPE_IQ2_XXS, true}, {GGML_TYPE_IQ2_XS, true}, {GGML_TYPE_IQ3_XXS, true},
-        {GGML_TYPE_Q2_K, true}, {GGML_TYPE_MXFP4, true}, {GGML_TYPE_Q8_0, false},
+        {GGML_TYPE_Q2_K, true}, {GGML_TYPE_MXFP4, true}, {GGML_TYPE_Q2_0_ROCMFP2, true}, {GGML_TYPE_Q8_0, false},
     };
     bool all = true;
     for (int dv = 0; dv < ggml_backend_cuda_get_device_count(); ++dv) {
