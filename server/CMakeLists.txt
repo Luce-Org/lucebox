@@ -1223,21 +1223,21 @@ if(LUCE_TESTS)
             hip::host)
         list(APPEND _raw_unit_test_targets test_gfx1151_width4_dispatch)
 
-        # Guards the route-bounded mmid merge: negative (masked owner) ids must
+        # Guards the mul_mat_id routing helper: negative (masked owner) ids must
         # not reserve holes in the compact routing arrays. Drives the helper for
-        # the fast (<=256 experts) and classic paths, forward and inverse.
-        add_executable(test_ds4_mmid_regression test/unit/test_ds4_mmid_regression.cpp)
-        set_source_files_properties(test/unit/test_ds4_mmid_regression.cpp PROPERTIES LANGUAGE HIP)
-        set_target_properties(test_ds4_mmid_regression PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
-        target_compile_definitions(test_ds4_mmid_regression PRIVATE GGML_USE_HIP)
-        target_include_directories(test_ds4_mmid_regression PRIVATE
+        # the fast (<=256 experts) and classic paths with ten experts per token.
+        add_executable(test_mmid_regression test/unit/test_mmid_regression.cpp)
+        set_source_files_properties(test/unit/test_mmid_regression.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_mmid_regression PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
+        target_compile_definitions(test_mmid_regression PRIVATE GGML_USE_HIP)
+        target_include_directories(test_mmid_regression PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
-        target_link_libraries(test_ds4_mmid_regression PRIVATE
+        target_link_libraries(test_mmid_regression PRIVATE
             ggml
             ggml-base
             ${LUCE_GGML_BACKEND_TARGET}
             hip::host)
-        list(APPEND _raw_unit_test_targets test_ds4_mmid_regression)
+        list(APPEND _raw_unit_test_targets test_mmid_regression)
 
         add_executable(test_qwen35_gdn_verify_fusion test/unit/test_qwen35_gdn_verify_fusion.cpp)
         set_source_files_properties(test/unit/test_qwen35_gdn_verify_fusion.cpp PROPERTIES LANGUAGE HIP)

@@ -1065,9 +1065,9 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int si1  = (int) (ids->nb[1] / sizeof(int32_t));
     const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
     if (!ggml_cuda_launch_mm_ids_bounded(ctx, (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-            E, T, n_used, ne11, si1, sis1, /*inverse=*/false, stream)) {
+            E, T, n_used, ne11, si1, sis1, stream)) {
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-            E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
+            E, T, n_used, ne11, si1, sis1, stream);
     }
     // Experts under THRESH rows take BN_SMALL-token tiles. Every tile re-streams the expert's weights; at ~40 rows per
     // expert (T=2048, top-10 of 512) 64-token tiles read each expert once where 32 read most twice. The per-output
@@ -1122,9 +1122,9 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     const int si1  = (int) (ids->nb[1] / sizeof(int32_t));
     const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
     if (!ggml_cuda_launch_mm_ids_bounded(ctx, (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-            E, T, n_used, ne11, si1, sis1, /*inverse=*/false, stream)) {
+            E, T, n_used, ne11, si1, sis1, stream)) {
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-            E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
+            E, T, n_used, ne11, si1, sis1, stream);
     }
     // Experts under THRESH rows take BN_SMALL-token tiles. Every tile re-streams the expert's weights; at ~40 rows per
     // expert (T=2048, top-10 of 512) 64-token tiles read each expert once where 32 read most twice. The per-output
