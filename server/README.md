@@ -228,7 +228,7 @@ The command shape is `luce_server <model.gguf> [options]`. The first positional 
 
 `luce_server --list-devices [model.gguf]` prints every GPU with its `backend:N` index, architecture and memory, and, given a model, the device `--target-device auto` would choose.
 
-`--profile <name>` applies a qualified hardware and model configuration: `ds4-strix` (DeepSeek V4 on Strix Halo) or `ds4-r9700-strix` (DeepSeek V4 with experts split between an R9700 and Strix Halo). Flags on the command line replace the profile's value, and environment variables that are already set keep theirs. The startup log lists what the profile applied.
+`--profile <name>` applies a qualified hardware and model configuration: `ds4-strix` (DeepSeek V4 on Strix Halo), `ds4-r9700-strix` (DeepSeek V4 with experts split between an R9700 and Strix Halo), `ds41-lucebox` (DeepSeek V4.1 on an R9700, Strix Halo and an SSD) or `ds41-gorgon` (DeepSeek V4.1 on an R9700 beside a 192 GB Ryzen AI Max+ PRO 495, every expert resident). Flags on the command line replace the profile's value, and environment variables that are already set keep theirs. The startup log lists what the profile applied.
 
 ### Core server
 
