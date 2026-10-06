@@ -2490,12 +2490,6 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_prec       prec);
 
-    // Upper bound on the number of finite entries in every mask row (used by
-    // the selected-attention kernel to size its shared-memory reduction).
-    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
-            struct ggml_tensor * a,
-            int32_t              n_kv_max);
-
     // DS4 layout and block-sparse policy for flash_attn_ext. raw_window is the
     // maximum visible span inside the raw-row region. Compressed rows are
     // selected in fixed-size blocks, capped to keep_rows. Zero leaves the

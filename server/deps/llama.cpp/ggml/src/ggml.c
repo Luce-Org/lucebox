@@ -5736,15 +5736,6 @@ void ggml_flash_attn_ext_set_prec(
     ggml_set_op_params_i32(a, 3, prec_i32); // scale is on first pos, max_bias on second
 }
 
-void ggml_flash_attn_ext_set_n_kv_max(
-        struct ggml_tensor * a,
-        int32_t              n_kv_max) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-    GGML_ASSERT(n_kv_max >= 0);
-
-    ggml_set_op_params_i32(a, 4, n_kv_max);
-}
-
 void ggml_flash_attn_ext_set_ds4_sparse(
         struct ggml_tensor * a,
         int                  raw_rows,
