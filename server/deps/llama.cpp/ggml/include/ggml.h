@@ -433,7 +433,8 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_TQ3_0   = 42,  // TurboQuant 3.5 bpv (3-bit Lloyd-Max + FWHT rotation)
+        GGML_TYPE_Q2_0    = 42,  // 2-bit (QK=64): {d} + 2-bit quads, values {-1,0,1,2}*d
+        GGML_TYPE_TQ3_0   = 43,  // TurboQuant 3.5 bpv (3-bit Lloyd-Max + FWHT rotation)
         GGML_TYPE_Q4_0_ROCMFP4      = 100,
         GGML_TYPE_Q4_0_ROCMFP4_FAST = 101,
         GGML_TYPE_Q6_0_ROCMFPX      = 102,
@@ -481,6 +482,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4          = 100,
         GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN     = 101,
         GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT = 102,

@@ -20,7 +20,19 @@ struct mmb_quant_slice {
 template <ggml_type TYPE>
 __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0, uint16_t * dst, const int lane) {
     constexpr int QK = ggml_cuda_type_traits<TYPE>::qk;
-    if constexpr (TYPE == GGML_TYPE_Q4_0) {
+    if constexpr (TYPE == GGML_TYPE_Q2_0) {
+        constexpr int QR = ggml_cuda_type_traits<TYPE>::qr;
+#pragma unroll
+        for (int p = lane; p < 32; p += 8) {
+            const int pos = k0 + 2 * p, ib = pos / QK, qs = (pos % QK) / QR;
+            float2 v;
+            dequantize_q2_0(row, ib, qs, v);
+            const int o = ib * QK + qs - k0;
+            dst[o] = q4x_f2bf(v.x);
+            dst[o + (QR == 1 ? 1 : QK / 2)] = q4x_f2bf(v.y);
+        }
+    }
+    else if constexpr (TYPE == GGML_TYPE_Q4_0) {
         constexpr int QR = ggml_cuda_type_traits<TYPE>::qr;
 #pragma unroll
         for (int p = lane; p < 32; p += 8) {
@@ -197,6 +209,7 @@ __device__ __forceinline__ void mmb_load_quant_tile(const uint8_t * weights, siz
 
 static bool mmb_quant_type(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -226,6 +239,7 @@ static bool mmb_quant_type(ggml_type type) {
 template <typename Fn>
 static void mmb_dispatch_quant(ggml_type type, Fn fn) {
     switch (type) {
+        case GGML_TYPE_Q2_0: fn(std::integral_constant<int, 32 + GGML_TYPE_Q2_0>{}); break;
         case GGML_TYPE_Q4_0: fn(std::integral_constant<int, 32 + GGML_TYPE_Q4_0>{}); break;
         case GGML_TYPE_Q4_1: fn(std::integral_constant<int, 32 + GGML_TYPE_Q4_1>{}); break;
         case GGML_TYPE_Q5_0: fn(std::integral_constant<int, 32 + GGML_TYPE_Q5_0>{}); break;

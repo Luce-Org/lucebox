@@ -138,7 +138,7 @@ int main(int argc, char ** argv) {
                             {"iq4xs", GGML_TYPE_IQ4_XS}, {"iq2xxs", GGML_TYPE_IQ2_XXS},
                             {"iq2xs", GGML_TYPE_IQ2_XS},   {"iq2s", GGML_TYPE_IQ2_S},
                             {"iq3xxs", GGML_TYPE_IQ3_XXS}, {"iq3s", GGML_TYPE_IQ3_S},
-                            {"iq1s", GGML_TYPE_IQ1_S},
+                            {"iq1s", GGML_TYPE_IQ1_S},     {"q2_0", GGML_TYPE_Q2_0},
                             {"q4k", GGML_TYPE_Q4_K},       {"q4_0", GGML_TYPE_Q4_0},
                             {"q5_0", GGML_TYPE_Q5_0},      {"q5_1", GGML_TYPE_Q5_1},
                             {"q5k", GGML_TYPE_Q5_K},       {"q6k", GGML_TYPE_Q6_K} }) {
