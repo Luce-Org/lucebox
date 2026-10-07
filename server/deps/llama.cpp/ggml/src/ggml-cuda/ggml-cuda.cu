@@ -6197,7 +6197,9 @@ extern "C" size_t ggml_backend_cuda_trim_pool(ggml_backend_t backend) {
     while (!cuda_ctx->luce_q8_memo.empty()) {
         cuda_ctx->luce_q8_memo.pop_back();
     }
+#if defined(GGML_USE_HIP)
     ggml_cuda_mmb_release_all(); // MMB caches and the bf16 weight shadows keyed by weight address
+#endif
 
     size_t freed = 0;
     for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
