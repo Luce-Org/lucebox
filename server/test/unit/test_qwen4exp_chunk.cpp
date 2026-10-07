@@ -15,4 +15,6 @@ int main() {
     assert(qwen4exp_fit_chunk(4096, 50000, 4040, workspace) == 4096); // exact fit
     assert(qwen4exp_fit_chunk(4096, 50000, 4041, workspace) == 3840);
     assert(qwen4exp_fit_chunk(4096, 50000, 0, [](int) { return SIZE_MAX; }) == 0);
+    // With memory to spare the chunk stops at the MoE route sort's 32768 tokens.
+    assert(qwen4exp_fit_chunk(131072, size_t(1) << 40, 0, workspace) == 32768);
 }
