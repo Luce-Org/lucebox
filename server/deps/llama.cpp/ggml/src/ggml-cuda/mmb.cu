@@ -791,7 +791,7 @@ void ggml_cuda_mmb_release_all() {
     ggml_cuda_mmb_begin_graph();
     delete g_mmb_q8_buf; g_mmb_q8_buf = nullptr; g_mmb_q8_cap = 0;
     for (int i = 0; i < 4; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
-    // Shadow weights are raw cudaMalloc keyed by data pointer and held for the process lifetime.
+    // Shadow weights are raw cudaMalloc keyed by data pointer: freed here (backend free or pool trim).
     for (auto & e : g_mmb_shadow) { if (e.second) CUDA_CHECK(cudaFree(e.second)); }
     g_mmb_shadow.clear();
     g_mmb_shadow_bytes = 0;
