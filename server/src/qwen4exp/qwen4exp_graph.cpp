@@ -216,9 +216,31 @@ static int layer_index(const Qwen4ExpLayer & L, const Qwen4ExpWeights & w) {
     return il >= 0 && il < (ptrdiff_t) w.layers.size() ? (int) il : -1;
 }
 
-// The router's top-k.
-static ggml_tensor * moe_select(ggml_context * c, ggml_tensor * probs, const Qwen4ExpWeights & w) {
-    return ggml_argsort_top_k(c, probs, (int) w.n_expert_used);
+// Split mode: forwards of up to this many rows (decode, verify, short batches)
+// share one scheduler and keep F32 activations on the link; longer prompt chunks
+// cross it as F16.
+constexpr int64_t kSplitShortRows = 64;
+
+// The router: the top-k picks and their renormalized weights, [n_used, T] each.
+static void moe_router(ggml_context * c, ggml_tensor * cur, const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
+                       ggml_tensor ** sel, ggml_tensor ** wsel) {
+    const int64_t n_tokens = cur->ne[1];
+    ggml_tensor * logits = mm(c, L.ffn_gate_inp, cur);      // [n_expert, T]
+    ggml_tensor * probs  = ggml_soft_max(c, logits);
+    *sel = ggml_argsort_top_k(c, probs, (int) w.n_expert_used);
+    ggml_tensor * probs3 = ggml_reshape_3d(c, probs, 1, w.n_expert, n_tokens);
+    *wsel = ggml_reshape_2d(c, ggml_get_rows(c, probs3, *sel), w.n_expert_used, n_tokens);
+    *wsel = ggml_div(c, *wsel, ggml_clamp(c, ggml_sum_rows(c, *wsel), 6.103515625e-5f, INFINITY));
+}
+
+// The shared expert, [n_embd, T], and its gate logit, [1, T], before the sigmoid.
+static void moe_shared(ggml_context * c, ggml_tensor * cur, const Qwen4ExpLayer & L,
+                       ggml_tensor ** shared, ggml_tensor ** shared_logit) {
+    ggml_tensor * sh_gate = mm(c, L.ffn_gate_shexp, cur);
+    ggml_tensor * sh_up   = mm(c, L.ffn_up_shexp, cur);
+    ggml_tensor * sh_gu   = ggml_swiglu_split(c, sh_gate, sh_up);
+    *shared       = mm(c, L.ffn_down_shexp, sh_gu);
+    *shared_logit = mm(c, L.ffn_gate_inp_shexp, cur);
 }
 
 // Gate, up and down of the routed experts `ids` picks: [n_embd, n_used, T].
@@ -238,15 +260,12 @@ static Qwen4ExpMoeRoute build_moe_route(ggml_context * c, ggml_tensor * cur,
     const int64_t n_tokens = cur->ne[1];
     Qwen4ExpMoeRoute r;
     const int il = layer_index(L, w);
-    ggml_tensor * probs = ggml_soft_max(c, mm(c, L.ffn_gate_inp, cur));               // [n_expert, T]
-    r.sel  = moe_select(c, probs, w);
-    r.wsel = ggml_reshape_2d(c, ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, w.n_expert, n_tokens), r.sel),
-                             w.n_expert_used, n_tokens);
-    r.wsel = ggml_div(c, r.wsel, ggml_clamp(c, ggml_sum_rows(c, r.wsel), 6.103515625e-5f, INFINITY));
-    ggml_tensor * sh_gu = ggml_swiglu_split(c, mm(c, L.ffn_gate_shexp, cur), mm(c, L.ffn_up_shexp, cur));
-    r.shared = ggml_mul(c, mm(c, L.ffn_down_shexp, sh_gu), ggml_sigmoid(c, mm(c, L.ffn_gate_inp_shexp, cur)));
+    moe_router(c, cur, L, w, &r.sel, &r.wsel);
+    ggml_tensor * shared_logit = nullptr;
+    moe_shared(c, cur, L, &r.shared, &shared_logit);
+    r.shared = ggml_mul(c, r.shared, ggml_sigmoid(c, shared_logit));
     // The expert kernels convert their activations to F16 anyway.
-    r.xin = n_tokens > 64 ? ggml_cast(c, cur, GGML_TYPE_F16) : cur;
+    r.xin = n_tokens > kSplitShortRows ? ggml_cast(c, cur, GGML_TYPE_F16) : cur;
     // Decode and verify steps with hot experts: each pick runs on one device,
     // masked (-1) on the other. Single-token steps take the same route as
     // verify rows, so every generated token computes its hot picks with the
@@ -254,7 +273,7 @@ static Qwen4ExpMoeRoute build_moe_route(ggml_context * c, ggml_tensor * cur,
     // depend on the adaptive width. Prompt chunks keep every pick on the expert
     // device: only the matvec kernels take masked ids on gfx1151 (MMQ faults
     // on them).
-    if (n_tokens <= 8 && il >= 0 && il < (int) w.hot_lut.size() && w.hot_lut[il]) {
+    if (n_tokens <= QWEN4EXP_MTP_MAX_VERIFY && il >= 0 && il < (int) w.hot_lut.size() && w.hot_lut[il]) {
         ggml_tensor * flat = ggml_reshape_1d(c, ggml_is_contiguous(r.sel) ? r.sel : ggml_cont(c, r.sel),
                                              w.n_expert_used * n_tokens);
         r.hot = ggml_reshape_2d(c, ggml_get_rows(c, w.hot_lut[il], flat), w.n_expert_used, n_tokens);
@@ -284,7 +303,7 @@ static ggml_tensor * build_moe_routed(ggml_context * c, const Qwen4ExpMoeRoute &
     ggml_tensor * down = moe_experts(c, L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps, cur3, r.sel, &expert_nodes);
     ggml_tensor * routed = ggml_ds4_moe_fused_combine_shared(c, down, r.wsel, nullptr);
     expert_nodes.push_back(routed);
-    if (n_tokens > 64) {   // prompt chunks: the sum crosses back as F16 too
+    if (n_tokens > kSplitShortRows) {   // prompt chunks: the sum crosses back as F16 too
         routed = ggml_cast(c, routed, GGML_TYPE_F16);
         expert_nodes.push_back(routed);
     }
@@ -311,28 +330,12 @@ ggml_tensor * build_moe(ggml_context * c, ggml_tensor * cur,
         ggml_tensor * routed = build_moe_routed(c, r, L, w, *expert_nodes);
         return moe_join(c, routed, r.hot ? build_moe_hot(c, r, w.hot->layers[layer_index(L, w)], w) : r.shared);
     }
-    const int64_t n_embd   = w.n_embd;
-    const int64_t n_tokens = cur->ne[1];
-    const int64_t n_expert = w.n_expert;
-    const int64_t n_used   = w.n_expert_used;
-
-    ggml_tensor * logits = mm(c, L.ffn_gate_inp, cur);      // [n_expert, T]
-    ggml_tensor * probs  = ggml_soft_max(c, logits);
-    ggml_tensor * sel    = moe_select(c, probs, w);  // [n_used, T]
-
-    ggml_tensor * probs3 = ggml_reshape_3d(c, probs, 1, n_expert, n_tokens);
-    ggml_tensor * wsel   = ggml_reshape_2d(c, ggml_get_rows(c, probs3, sel), n_used, n_tokens);
-    wsel = ggml_div(c, wsel, ggml_clamp(c, ggml_sum_rows(c, wsel), 6.103515625e-5f, INFINITY));
-
-    ggml_tensor * cur3 = ggml_reshape_3d(c, cur, n_embd, 1, n_tokens);
+    ggml_tensor * sel = nullptr, * wsel = nullptr;
+    moe_router(c, cur, L, w, &sel, &wsel);
+    ggml_tensor * cur3 = ggml_reshape_3d(c, cur, w.n_embd, 1, cur->ne[1]);
     ggml_tensor * down = moe_experts(c, L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps, cur3, sel);
-
-    ggml_tensor * sh_gate = mm(c, L.ffn_gate_shexp, cur);
-    ggml_tensor * sh_up   = mm(c, L.ffn_up_shexp, cur);
-    ggml_tensor * sh_gu   = ggml_swiglu_split(c, sh_gate, sh_up);
-    ggml_tensor * shared  = mm(c, L.ffn_down_shexp, sh_gu);
-
-    ggml_tensor * shared_logit = mm(c, L.ffn_gate_inp_shexp, cur);
+    ggml_tensor * shared = nullptr, * shared_logit = nullptr;
+    moe_shared(c, cur, L, &shared, &shared_logit);
     if (parts) {   // the caller folds the combine into the next HC_COMBINE_NORM
         *parts = { down, wsel, shared, shared_logit };
         return nullptr;
@@ -365,7 +368,7 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor 
     // Decode, draft and verify steps (up to 8 rows) let the recurrence apply sigmoid(beta) and softplus(alpha + dt_bias)
     // * A to the raw projections, the same expressions as the ops below. Prompt chunks on gfx1151 need the ops: the
     // tiled recurrence takes finished gates.
-    const bool step = T <= 8;
+    const bool step = T <= QWEN4EXP_MTP_MAX_VERIFY;
     const bool raw_gates = step && L.ssm_gate_ba;
     ggml_tensor * beta = ggml_reshape_4d(c, mm(c, L.ssm_beta, cur), 1, Hv, T, 1);
     ggml_tensor * gate;
@@ -1909,7 +1912,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
             // planner probes shapes no request has built (up to 32768 rows at the
             // end of the context); a graph with a node no device runs keeps the
             // single-device estimate, as the scheduler could not place it.
-            ggml_backend_sched_t sched = split_sched_for(T <= 64);
+            ggml_backend_sched_t sched = split_sched_for(T <= kSplitShortRows);
             const ggml_backend_t devices[3] = { backend, w.expert_backend, cache.split_cpu };
             const ggml_tensor * unplaced = nullptr;
             for (int i = 0; i < ggml_graph_n_nodes(gf) && !unplaced; ++i) {
@@ -1929,7 +1932,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
                 size_t sizes[3] = {};
                 ggml_backend_sched_reserve_size(sched, gf, sizes);
                 ggml_backend_sched_reset(sched);
-                if (T <= 64) ++cache.split_short_gen;   // a retained stable graph must allocate again
+                if (T <= kSplitShortRows) ++cache.split_short_gen;   // a retained stable graph must allocate again
                 measure->graph = sizes[0];
             }
         }
@@ -1994,7 +1997,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     if (split) {
         // Weights decide placement (routed experts on the expert device, the
         // rest and the cache on the target); see qwen4exp_pin_split.
-        const bool short_batch = T <= 64;
+        const bool short_batch = T <= kSplitShortRows;
         ggml_backend_sched_t sched = split_sched_for(short_batch);
         split_sched = sched;
         ggml_backend_sched_reset(sched);
@@ -2150,7 +2153,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     {   // verify: every matmul column equals its single-token product (see ggml_backend_cuda_set_mmvq_batch_invariant)
         // Split prompt chunks: no HIP graph capture (long kernels gain nothing, and
         // capture fails on allocating kernels such as the CUB segmented sort).
-        ScopedCudaGraphOverrides invariant(split && T > 64, 0, false, 0, /*mmvq_batch_invariant=*/verify);
+        ScopedCudaGraphOverrides invariant(split && T > kSplitShortRows, 0, false, 0, /*mmvq_batch_invariant=*/verify);
         status = split ? ggml_backend_sched_graph_compute(split_sched, gf) : ggml_backend_graph_compute(backend, gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
