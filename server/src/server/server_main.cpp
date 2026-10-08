@@ -119,7 +119,8 @@ static void print_usage(const char * prog) {
         "                      Defaults to the first block; request model names\n"
         "                      do not change generation routing.\n"
         "  --draft <path>       Draft model for speculative decode (DFlash for Qwen,\n"
-        "                       Gemma and Laguna; DSpark for DeepSeek4)\n"
+        "                       Gemma and Laguna; DSpark for DeepSeek4; MTP for Qwen4Exp).\n"
+        "                       Qwen4Exp auto-discovers <model repo>/MTP/mtp-*.gguf.\n"
         "  --mmproj <path>      Vision projector GGUF: enables image input (Qwen3.5/3.8, DS4V)\n"
         "  --mmproj-device hip:N  Run the DS4V image encoder on another GPU (one-GPU layout)\n"
         "  --port <N>           Listen port (default: 8080)\n"
@@ -185,7 +186,8 @@ static void print_usage(const char * prog) {
         "  --decode-kv-offload-mb <auto|N> RAM budget for active KV suspension (default: auto)\n"
         "                              N is MiB; 0 disables.\n"
         "  --max-concurrency <N>  Maximum concurrent decode sequences\n"
-        "                         (N > 1 enables paged attention; default: 1)\n"
+        "                         (default: 1; qwen4exp: 2..4 full-cache slots;\n"
+        "                          other models: N > 1 enables paged attention)\n"
         "  --admission-coalesce-ms <N>  Idle-to-busy batching window\n"
         "                               (default: 20; 0 disables)\n"
         "  --kv-pool-tokens <N> Total paged K/V pool shared by all\n"
@@ -221,6 +223,8 @@ static void print_usage(const char * prog) {
         "                       (default: 6 with --specla; otherwise off)\n"
         "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
         "                       trimmed per step by drafter confidence; N = fixed base)\n"
+        "                       Qwen4Exp: 0=adaptive k=1..7 (default), 1=off,\n"
+        "                       2..8=fixed k=1..7; width includes the seed token.\n"
         "  --adaptive-experts [tau]  MoE expert-count gating on verify batches\n"
         "                       (near-lossless; default tau 0.80 when passed)\n"
         "  --no-cors            Disable CORS headers\n"
@@ -723,7 +727,13 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             if (model.adaptive_experts_tau.empty()) model.adaptive_experts_tau = tau;
             bargs.adaptive_experts_requested = true;
         } else if (std::strcmp(argv[i], "--verify-width") == 0 && i + 1 < argc) {
-            bargs.verify_width = std::atoi(argv[++i]);
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            const auto parsed = std::from_chars(value, end, bargs.verify_width);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || bargs.verify_width < 0) {
+                std::fprintf(stderr, "--verify-width expects a nonnegative integer, got '%s'\n", value);
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--no-fast-rollback") == 0) {
             fast_rollback_forced_off = true;
             bargs.fast_rollback = false;
@@ -965,7 +975,10 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.model_name.c_str());
         return 2;
     }
-    if (bargs.max_concurrency > 1) bargs.paged_attention = true;
+    // qwen4exp owns full per-slot caches; other concurrent engines use paging.
+    if (bargs.max_concurrency > 1 &&
+        inspect_gguf_model_info(bargs.model_path.c_str()).arch != "qwen4exp")
+        bargs.paged_attention = true;
     if (sconfig.decode_kv_offload_bytes &&
         sconfig.decode_kv_offload_bytes != kAutoKvOffloadBytes && bargs.max_concurrency <= 1) {
         std::fprintf(stderr, "[server] --decode-kv-offload-mb requires --max-concurrency greater than 1\n");

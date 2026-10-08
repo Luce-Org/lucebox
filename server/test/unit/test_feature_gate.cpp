@@ -17,7 +17,6 @@
 
 #include <climits>
 #include <cstdio>
-#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -533,8 +532,39 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     dense.max_concurrency = 2;
     CHECK(!gate_result(dense, "qwen35", PlacementBackend::Cuda).empty());
 
-    // qwen4exp has no paged decode path; multiple slots are always rejected.
-    CHECK(!gate_result(dense, "qwen4exp", PlacementBackend::Cuda).empty());
+    // qwen4exp uses full per-slot caches, selected by the slot count alone.
+    for (const auto backend : {PlacementBackend::Cuda, PlacementBackend::Hip}) {
+        BackendArgs qwen = dense;
+        for (int ctx : {8192, 32768}) {
+            qwen.device.max_ctx = ctx;
+            for (int slots : {1, 2, 3, 4}) {
+                qwen.max_concurrency = slots;
+                CHECK(gate_result(qwen, "qwen4exp", backend).empty());
+            }
+        }
+        qwen.max_concurrency = 5;
+        CHECK(gate_result(qwen, "qwen4exp", backend).find("at most 4") != std::string::npos);
+        qwen.max_concurrency = 0;
+        CHECK(!gate_result(qwen, "qwen4exp", backend).empty());
+        qwen.max_concurrency = 4;
+        qwen.device.max_ctx = 0;
+        CHECK(!gate_result(qwen, "qwen4exp", backend).empty());
+        qwen.device.max_ctx = 32768;
+        qwen.paged_attention = true;
+        CHECK(!gate_result(qwen, "qwen4exp", backend).empty());
+        qwen.paged_attention = false;
+        qwen.kv_pool_tokens = 32768;
+        CHECK(!gate_result(qwen, "qwen4exp", backend).empty());
+        // Slots decode without MTP: implicit discovery is switched off, explicit requests refused.
+        qwen.kv_pool_tokens = 0;
+        qwen.verify_width = 1;
+        CHECK(gate_result(qwen, "qwen4exp", backend).empty());
+        qwen.verify_width = 3;
+        CHECK(gate_result(qwen, "qwen4exp", backend).find("MTP") != std::string::npos);
+        qwen.verify_width = 0;
+        qwen.draft_path = "/nonexistent/mtp.gguf";
+        CHECK(gate_result(qwen, "qwen4exp", backend).find("MTP") != std::string::npos);
+    }
 
     BackendArgs parallel = paged;
     parallel.max_concurrency = 2;
@@ -772,11 +802,29 @@ void test_model_capability_tables() {
     CHECK(!arch_supports_layer_split("qwen4exp"));
     CHECK(!arch_supports_remote_draft("qwen4exp"));
     CHECK(!arch_supports_pflash_compression("qwen4exp"));
-    CHECK(!arch_supports_decode_draft("qwen4exp", false));
+    CHECK(arch_supports_decode_draft("qwen4exp", false));
+    CHECK(arch_supports_verify_width("qwen4exp", false));
+    CHECK(!arch_supports_decode_draft("qwen4exp", true));
+    CHECK(!arch_supports_verify_width("qwen4exp", true));
     CHECK(!arch_supports_paged_attention("qwen4exp", false));
     CHECK(arch_supports_draft_block_size("qwen35", false));
     CHECK(!arch_supports_draft_block_size("qwen35", true));
     CHECK(!arch_supports_draft_block_size("qwen35moe", false));
+}
+
+void test_qwen4exp_mtp_options() {
+    auto args = gate_args_hip_deepseek4();
+    args.draft_path = "/nonexistent/mtp.gguf";
+    for (int width = 0; width <= 8; ++width) {
+        args.verify_width = width;
+        CHECK(gate_result(args, "qwen4exp", PlacementBackend::Hip).empty());
+        CHECK(!warns_about(warn_result(args, "qwen4exp"), "--draft"));
+        CHECK(!warns_about(warn_result(args, "qwen4exp"), "--verify-width"));
+    }
+    for (int width : {-1, 9, INT_MAX}) {
+        args.verify_width = width;
+        CHECK(!gate_result(args, "qwen4exp", PlacementBackend::Hip).empty());
+    }
 }
 
 };
@@ -807,4 +855,5 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_warnings_report_inert_decode_tunables();
     test_feature_warnings_report_inert_moe_options();
     test_model_capability_tables();
+    test_qwen4exp_mtp_options();
 }

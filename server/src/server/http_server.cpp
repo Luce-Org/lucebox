@@ -4123,7 +4123,9 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             effective_prompt, prefix_cache_.chat_markers(),
             {forced_cut, selected_boundary,
              cache.snap_prepared ? cache.snap_cut : 0},
-            /*drop_last_boundary=*/true);
+            // qwen4exp requires the same cuts on hits and misses, even when
+            // a tool-result hit skips capture and a miss captures the tools head.
+            /*drop_last_boundary=*/!(config_.arch == "qwen4exp" && req.ends_with_tool_result));
     }
 
     status_.set_flags(
@@ -4143,10 +4145,9 @@ void HttpServer::finalize_generation_cache(
     const bool generation_produced_output = result.ok() &&
         completion_tokens > 0 && visible_output_seen && !client_disconnected;
 
-    // Continuing a deferred snapshot in place consumes it; its entry must
-    // not stay discoverable.
+    // A deferred restore can be consumed, or a deeper snapshot can replace
+    // its source under memory pressure. Neither entry may stay discoverable.
     if (cache.using_restore && !cache.disk_hit &&
-        agent_turn_cache_slots_.count(cache.cache_slot) &&
         !backend_.snapshot_used(cache.cache_slot)) {
         forget_inline_slot_metadata(cache.cache_slot);
         prefix_cache_.invalidate_inline_snap(cache.cache_slot);

@@ -109,12 +109,75 @@
 #include <cstdio>
 #include <cstring>
 #include <thread>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <array>
 #include <cstdlib>
 #include <string>
 #include <vector>
+
+struct ggml_cuda_qwen_shared_overlap {
+    ggml_backend_cuda_context * ctx = nullptr;
+    cudaEvent_t fork = nullptr;
+    cudaEvent_t done = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_backend_buffer_t private_buffer = nullptr;
+    std::vector<ggml_cuda_qwen_shared_overlap_layer> layers;
+    std::vector<int> fork_indices;
+    std::vector<int> join_indices;
+    std::vector<int> end_indices;
+    bool valid = false;
+    bool warned = false;
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> q8_stream1;
+    uint64_t plan_uid = 0, captured_uid = 0;
+};
+
+extern "C" GGML_BACKEND_API void * ggml_backend_cuda_qwen_shared_overlap_create(ggml_backend_t backend) {
+    if (!backend || !ggml_backend_is_cuda(backend)) return nullptr;
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_OFFSET_AMD + 0x1151) return nullptr;
+    GGML_ASSERT(ctx->curr_stream_no == 0);
+    ggml_cuda_set_device(ctx->device);
+    auto * overlap = new ggml_cuda_qwen_shared_overlap;
+    overlap->ctx = ctx;
+    (void) ctx->stream(ctx->device, 1); // materialize both owner and stream before capture
+    ctx->curr_stream_no = 1;
+    // K=2560: 80 canonical Q8_1 blocks x 36 bytes. K=640 pads to 1024
+    // (32 blocks, 1152 bytes); this owner is not sized for routed/producer work.
+    overlap->q8_stream1 = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx->pool(), 2880);
+    ctx->curr_stream_no = 0;
+    CUDA_CHECK(cudaEventCreateWithFlags(&overlap->fork, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&overlap->done, cudaEventDisableTiming));
+    return overlap;
+}
+
+extern "C" GGML_BACKEND_API void ggml_backend_cuda_qwen_shared_overlap_destroy(void * handle) {
+    auto * overlap = static_cast<ggml_cuda_qwen_shared_overlap *>(handle);
+    if (!overlap) return;
+    if (overlap->ctx->qwen_shared_overlap_active == overlap) overlap->ctx->qwen_shared_overlap_active = nullptr;
+    GGML_ASSERT(!overlap->ctx->qwen_shared_q8);
+    ggml_cuda_set_device(overlap->ctx->device);
+    CUDA_CHECK(cudaEventDestroy(overlap->fork));
+    CUDA_CHECK(cudaEventDestroy(overlap->done));
+    delete overlap;
+}
+
+extern "C" GGML_BACKEND_API void ggml_backend_cuda_qwen_graph_seal(void * handle, ggml_cgraph * graph) {
+    auto * overlap = static_cast<ggml_cuda_qwen_shared_overlap *>(handle);
+    GGML_ASSERT(overlap && overlap->valid && overlap->graph == graph);
+    GGML_ASSERT(graph && graph->uid == 0 && overlap->plan_uid == 0 && overlap->q8_stream1->ptr);
+    graph->uid = ggml_graph_next_uid();
+    overlap->plan_uid = graph->uid;
+    overlap->captured_uid = 0;
+}
+
+extern "C" GGML_BACKEND_API bool ggml_backend_cuda_qwen_shared_overlap_activate(void * handle, ggml_cgraph * graph) {
+    auto * overlap = static_cast<ggml_cuda_qwen_shared_overlap *>(handle);
+    if (!overlap) return false;
+    overlap->ctx->qwen_shared_overlap_active = overlap->valid && overlap->graph == graph ? overlap : nullptr;
+    return overlap->ctx->qwen_shared_overlap_active != nullptr;
+}
 
 #if defined(GGML_USE_HIP)
 static std::unordered_map<const ggml_tensor *, const ggml_tensor *> g_hc_marked_xn;
@@ -5021,6 +5084,156 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 }
 
 
+static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+                               int                                       node_idx,
+                               std::initializer_list<enum ggml_op>       ops,
+                               std::initializer_list<enum ggml_unary_op> unary_ops);
+
+extern "C" GGML_BACKEND_API bool ggml_backend_cuda_qwen_shared_overlap_prepare(
+        void * handle, ggml_cgraph * graph, ggml_backend_buffer_t private_buffer,
+        const ggml_cuda_qwen_shared_overlap_layer * layers, size_t n_layers) {
+    auto * overlap = static_cast<ggml_cuda_qwen_shared_overlap *>(handle);
+    if (!overlap) return false;
+    // A sealed plan can be cleared only after its native captures are retired.
+    GGML_ASSERT(!overlap->plan_uid || (!graph && !private_buffer && !layers && n_layers == 0));
+#ifdef USE_CUDA_GRAPH
+    if (overlap->plan_uid) for (const auto & entry : overlap->ctx->cuda_graphs)
+        GGML_ASSERT(entry.second->uid != overlap->plan_uid ||
+            (!entry.second->instance && !entry.second->graph));
+#endif
+    overlap->plan_uid = overlap->captured_uid = 0;
+    overlap->ctx->qwen_shared_overlap_active = nullptr;
+    overlap->valid = false;
+    overlap->graph = nullptr;
+    overlap->private_buffer = nullptr;
+    overlap->layers.clear();
+    overlap->fork_indices.clear();
+    overlap->join_indices.clear();
+    overlap->end_indices.clear();
+    if (!graph && !private_buffer && !layers && n_layers == 0) return false;
+    auto reject = [&](size_t layer, const char * reason) {
+        if (!overlap->warned) {
+            std::fprintf(stderr, "[qwen4exp] shared overlap disabled at layer %zu: %s\n", layer, reason);
+            overlap->warned = true;
+        }
+        return false;
+    };
+    if (!overlap->q8_stream1 || !overlap->q8_stream1->ptr ||
+        overlap->q8_stream1->actual_size < 2880) return reject(0, "fixed Q8 scratch");
+    if (!graph || !private_buffer || !layers || n_layers != 48 ||
+        overlap->ctx->curr_stream_no != 0 || !overlap->ctx->stream_context().concurrent_events.empty() ||
+        ggml_cuda_info().devices[overlap->ctx->device].cc != GGML_CUDA_CC_OFFSET_AMD + 0x1151) {
+        return reject(0, "graph/context guard");
+    }
+    ggml_cuda_set_device(overlap->ctx->device);
+
+    std::unordered_map<const ggml_tensor *, int> index;
+    std::unordered_map<const ggml_tensor *, int> consumers;
+    index.reserve((size_t) graph->n_nodes);
+    consumers.reserve((size_t) graph->n_nodes);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        index.emplace(graph->nodes[i], i);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (graph->nodes[i]->src[s]) ++consumers[graph->nodes[i]->src[s]];
+        }
+    }
+    auto node_index = [&](const ggml_tensor * tensor) {
+        auto it = index.find(tensor);
+        return it == index.end() ? -1 : it->second;
+    };
+    auto same_activation = [](const ggml_tensor * routed, const ggml_tensor * shared) {
+        const ggml_tensor * x = routed;
+        while (x && (x->op == GGML_OP_RESHAPE || x->op == GGML_OP_VIEW)) x = x->src[0];
+        return x == shared;
+    };
+    auto q8_weight = [](const ggml_tensor * weight, int64_t k, int64_t m) {
+        return weight && weight->type == GGML_TYPE_Q8_0 &&
+            weight->ne[0] == k && weight->ne[1] == m &&
+            weight->ne[2] == 1 && weight->ne[3] == 1 && ggml_is_contiguous(weight);
+    };
+    auto q8_activation = [&](const ggml_tensor * x, int64_t k) {
+        return x && x->type == GGML_TYPE_F32 && x->ne[0] == k &&
+            x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && ggml_is_contiguous(x) &&
+            size_t(GGML_PAD(k, MATRIX_ROW_PADDING)) / QK8_1 * sizeof(block_q8_1) <=
+                overlap->q8_stream1->actual_size;
+    };
+
+    overlap->layers.assign(layers, layers + n_layers);
+    overlap->private_buffer = private_buffer;
+    std::vector<std::pair<uintptr_t, uintptr_t>> private_ranges;
+    private_ranges.reserve(7 * n_layers);
+    for (size_t il = 0; il < overlap->layers.size(); ++il) {
+        const auto & l = overlap->layers[il];
+        ggml_tensor * branch[] = { l.shared_gate, l.shared_up, l.shared_glu, l.shared_down,
+                                   l.shared_logit, l.shared_sigmoid, l.shared_out };
+        if (!l.routed_gate || !l.combine || !l.routed_gate->src[1] ||
+            !l.shared_gate || !l.shared_gate->src[0] || !l.shared_gate->src[1] ||
+            !l.shared_up || !l.shared_up->src[0] || !l.shared_up->src[1] ||
+            !l.shared_down || !l.shared_down->src[0] || !l.shared_down->src[1] ||
+            !l.shared_logit || !l.shared_logit->src[0] || !l.shared_logit->src[1]) return reject(il, "null edge");
+        for (const ggml_tensor * tensor : branch) if (!tensor) return reject(il, "null branch node");
+        const int fork = node_index(l.routed_gate);
+        const int join = node_index(l.shared_gate);
+        const int end = node_index(l.shared_out);
+        const int combine = node_index(l.combine);
+        if (fork < 0 || join <= fork || end != join + 6 || combine <= end) {
+            return reject(il, "node order");
+        }
+        if (!ggml_cuda_qwen4exp_enabled() || getenv("GGML_CUDA_DISABLE_FUSION") ||
+            l.routed_gate->op != GGML_OP_MUL_MAT_ID ||
+            l.shared_gate->op != GGML_OP_MUL_MAT || l.shared_up->op != GGML_OP_MUL_MAT ||
+            l.shared_glu->op != GGML_OP_GLU || l.shared_down->op != GGML_OP_MUL_MAT ||
+            l.shared_logit->op != GGML_OP_MUL_MAT || l.shared_sigmoid->op != GGML_OP_UNARY ||
+            ggml_get_unary_op(l.shared_sigmoid) != GGML_UNARY_OP_SIGMOID ||
+            l.shared_out->op != GGML_OP_MUL || l.combine->op != GGML_OP_DS4_MOE_COMBINE) {
+            return reject(il, "op contract");
+        }
+        if (
+            l.shared_glu->src[0] != l.shared_gate || l.shared_glu->src[1] != l.shared_up ||
+            l.shared_down->src[1] != l.shared_glu ||
+            l.shared_sigmoid->src[0] != l.shared_logit ||
+            !((l.shared_out->src[0] == l.shared_down && l.shared_out->src[1] == l.shared_sigmoid) ||
+              (l.shared_out->src[1] == l.shared_down && l.shared_out->src[0] == l.shared_sigmoid)) ||
+            l.combine->src[2] != l.shared_out ||
+            l.shared_gate->src[1] != l.shared_up->src[1] ||
+            l.shared_gate->src[1] != l.shared_logit->src[1] ||
+            !same_activation(l.routed_gate->src[1], l.shared_gate->src[1])) {
+            return reject(il, "edge contract");
+        }
+        if (!q8_activation(l.shared_gate->src[1], 2560) ||
+            !q8_activation(l.shared_glu, 640) || !ggml_cuda_should_fuse_mul_mat_vec_q(l.shared_down) ||
+            !q8_weight(l.shared_gate->src[0], 2560, 640) ||
+            !q8_weight(l.shared_up->src[0], 2560, 640) ||
+            !q8_weight(l.shared_down->src[0], 640, 2560) ||
+            l.shared_logit->src[0]->type != GGML_TYPE_F32 ||
+            l.shared_logit->src[0]->ne[0] != 2560 || l.shared_logit->src[0]->ne[1] != 1) {
+            return reject(il, "shape/type contract");
+        }
+        if (!ggml_cuda_can_fuse(graph, join, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {})) {
+            return reject(il, "gate/up fusion eligibility");
+        }
+        for (int i = 0; i < 7; ++i) {
+            if (graph->nodes[join + i] != branch[i] || branch[i]->buffer != private_buffer ||
+                !branch[i]->data || branch[i]->view_src) return reject(il, "private output binding");
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(branch[i]->data);
+            const uintptr_t end_i = begin + ggml_nbytes(branch[i]);
+            for (const auto & range : private_ranges) {
+                const uintptr_t other = range.first;
+                const uintptr_t other_end = range.second;
+                if (begin < other_end && other < end_i) return reject(il, "private output alias");
+            }
+            private_ranges.emplace_back(begin, end_i);
+            if (consumers[branch[i]] != 1) return reject(il, "branch is not closed");
+        }
+        overlap->fork_indices.push_back(fork);
+        overlap->join_indices.push_back(join);
+        overlap->end_indices.push_back(end);
+    }
+    overlap->graph = graph;
+    overlap->valid = true;
+    return true;
+}
+
 #include "hc-match.inc"
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
@@ -5380,6 +5593,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
 
     ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
+    ggml_cuda_qwen_shared_overlap * qwen_shared = cuda_ctx->qwen_shared_overlap_active;
+    cuda_ctx->qwen_shared_overlap_active = nullptr; // one activation, one evaluation
+    const bool sealed_sh = qwen_shared && qwen_shared->plan_uid != 0 &&
+        qwen_shared->plan_uid == cgraph->uid;
+    if (sealed_sh) GGML_ASSERT(qwen_shared->valid && qwen_shared->ctx == cuda_ctx &&
+        qwen_shared->graph == cgraph && stream_ctx.concurrent_events.empty());
+    if ((use_cuda_graph && !sealed_sh) || !stream_ctx.concurrent_events.empty() ||
+        !qwen_shared || !qwen_shared->valid || qwen_shared->ctx != cuda_ctx || qwen_shared->graph != cgraph) {
+        qwen_shared = nullptr;
+    }
+    if (qwen_shared && use_cuda_graph && !cuda_graph_update_required)
+        GGML_ASSERT(qwen_shared->captured_uid == cgraph->uid);
+    size_t qwen_shared_layer = 0;
     bool                         is_concurrent_event_active = false;
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
     bool                         should_launch_concurrent_events = false;
@@ -5473,6 +5699,37 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (qwen_shared && qwen_shared_layer < qwen_shared->layers.size()) {
+                    const auto & layer = qwen_shared->layers[qwen_shared_layer];
+                    if (i == qwen_shared->fork_indices[qwen_shared_layer]) {
+                        GGML_ASSERT(cuda_ctx->curr_stream_no == 0 && node == layer.routed_gate);
+                        CUDA_CHECK(cudaEventRecord(qwen_shared->fork, cuda_ctx->stream()));
+                        cudaStream_t shared_stream = cuda_ctx->stream(cuda_ctx->device, 1);
+                        CUDA_CHECK(cudaStreamWaitEvent(shared_stream, qwen_shared->fork));
+                        GGML_ASSERT(!cuda_ctx->qwen_shared_q8);
+                        cuda_ctx->curr_stream_no = 1;
+                        cuda_ctx->qwen_shared_q8 = qwen_shared->q8_stream1->ptr;
+                        cuda_ctx->qwen_shared_q8_bytes = qwen_shared->q8_stream1->actual_size;
+                        const bool gate_up = ggml_cuda_try_fuse_mul_mat_glu(
+                            *cuda_ctx, layer.shared_gate, layer.shared_up, layer.shared_glu);
+                        const bool down = ggml_cuda_compute_forward(*cuda_ctx, layer.shared_down);
+                        const bool logit = ggml_cuda_compute_forward(*cuda_ctx, layer.shared_logit);
+                        const bool sigmoid = ggml_cuda_compute_forward(*cuda_ctx, layer.shared_sigmoid);
+                        const bool gated = ggml_cuda_compute_forward(*cuda_ctx, layer.shared_out);
+                        GGML_ASSERT(gate_up && down && logit && sigmoid && gated);
+                        cuda_ctx->qwen_shared_q8 = nullptr;
+                        cuda_ctx->qwen_shared_q8_bytes = 0;
+                        CUDA_CHECK(cudaEventRecord(qwen_shared->done, shared_stream));
+                        cuda_ctx->curr_stream_no = 0;
+                    } else if (i == qwen_shared->join_indices[qwen_shared_layer]) {
+                        GGML_ASSERT(node == layer.shared_gate);
+                        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), qwen_shared->done));
+                        i = qwen_shared->end_indices[qwen_shared_layer];
+                        prev_i = i;
+                        ++qwen_shared_layer;
+                        continue;
+                    }
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -6018,6 +6275,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
 
+            GGML_ASSERT(!qwen_shared || qwen_shared_layer == qwen_shared->layers.size());
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -6029,6 +6287,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            if (qwen_shared) qwen_shared->captured_uid = cgraph->uid;
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -6050,6 +6309,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (qwen_shared) GGML_ASSERT(qwen_shared->captured_uid == qwen_shared->plan_uid);
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -7577,6 +7837,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
+            if (op->src[1]) return ggml_cuda_top_k_qsa_supported(op);
+            // fall through
         case GGML_OP_ARGSORT:
 #if defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)
             return true;

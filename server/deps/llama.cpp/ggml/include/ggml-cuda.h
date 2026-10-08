@@ -36,6 +36,29 @@ extern "C" {
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
+// Qwen4Exp ordinary T=1 shared-expert overlap. The graph builder supplies
+// exact tensor identities; the CUDA backend validates the complete plan before
+// launching any branch on stream 1.
+struct ggml_cuda_qwen_shared_overlap_layer {
+    struct ggml_tensor * routed_gate;
+    struct ggml_tensor * shared_gate;
+    struct ggml_tensor * shared_up;
+    struct ggml_tensor * shared_glu;
+    struct ggml_tensor * shared_down;
+    struct ggml_tensor * shared_logit;
+    struct ggml_tensor * shared_sigmoid;
+    struct ggml_tensor * shared_out;
+    struct ggml_tensor * combine;
+};
+
+GGML_BACKEND_API void * ggml_backend_cuda_qwen_shared_overlap_create(ggml_backend_t backend);
+GGML_BACKEND_API void   ggml_backend_cuda_qwen_shared_overlap_destroy(void * handle);
+GGML_BACKEND_API bool   ggml_backend_cuda_qwen_shared_overlap_prepare(
+        void * handle, struct ggml_cgraph * graph, ggml_backend_buffer_t private_buffer,
+        const struct ggml_cuda_qwen_shared_overlap_layer * layers, size_t n_layers);
+GGML_BACKEND_API bool   ggml_backend_cuda_qwen_shared_overlap_activate(void * handle, struct ggml_cgraph * graph);
+GGML_BACKEND_API void ggml_backend_cuda_qwen_graph_seal(void * handle, struct ggml_cgraph * graph);
+
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 
 // Configure streams lazily created by this backend context at the device's

@@ -7,6 +7,7 @@
 #pragma once
 
 #include "internal.h"
+#include "qwen4exp_mtp.h"
 #include "ggml-cuda.h"
 #include "common/gguf_mmap.h"
 
@@ -141,6 +142,18 @@ struct Qwen4ExpWeights {
 
     std::vector<Qwen4ExpLayer> layers;
 
+    // MTP draft head from an MTP sidecar: one full-attention layer (blk.<n_layer>) and the nextn
+    // projections; it borrows token_embd/output. mtp_eh_proj is null when no sidecar is loaded.
+    Qwen4ExpLayer mtp;
+    ggml_tensor * mtp_enorm = nullptr, * mtp_hnorm = nullptr, * mtp_eh_proj = nullptr;
+    ggml_tensor * mtp_head_norm = nullptr, * mtp_head_down = nullptr, * mtp_head_up = nullptr;
+
+    // Draft-only gathered output rows and exact CPU-dequantized embeddings.
+    ggml_context * mtp_vocab_ctx = nullptr;
+    ggml_backend_buffer_t mtp_vocab_buf = nullptr;
+    ggml_tensor * mtp_output = nullptr, * mtp_embd = nullptr;
+    std::vector<int32_t> mtp_vocab_ids;
+
     // Config (GGUF `qwen4exp.*`).
     int n_layer               = 48;
     int n_embd                = 2560;
@@ -186,6 +199,7 @@ struct Qwen4ExpWeights {
     std::vector<int64_t> ple_head_vocab_sizes;   // u64 in GGUF
     std::vector<uint64_t> ple_layer_multipliers; // u64 in GGUF
     int32_t ple_eos_token_id  = -1;
+    int32_t ple_image_token_id = -1;   // kept in the MTP draft vocabulary
 
     // Lazy reader of per_layer_token_embd, in whichever shard holds it.
     Qwen4ExpPleReader ple_reader;
@@ -194,14 +208,36 @@ struct Qwen4ExpWeights {
     int32_t eos_chat_id = -1;
 };
 
+// Clears the MTP sidecar layer and its six projection/head pointers so neither can outlive the ggml_context
+// that owns them. Must run on both teardown and load failure: qwen4exp_cache.cpp treats a non-null
+// mtp_eh_proj as "MTP available", and a later load that skips the sidecar (no file, or override "0") never
+// reassigns these fields, so a stale pointer from a prior load would otherwise look valid. Pure field
+// clearing only -- no I/O, safe to unit-test without a GGUF or a GPU.
+inline void reset_qwen4exp_mtp_fields(Qwen4ExpWeights & w) {
+    w.mtp = Qwen4ExpLayer{};
+    w.mtp_enorm = w.mtp_hnorm = w.mtp_eh_proj = nullptr;
+    w.mtp_head_norm = w.mtp_head_down = w.mtp_head_up = nullptr;
+    w.mtp_output = w.mtp_embd = nullptr;
+    w.mtp_vocab_ids.clear();
+}
+
 // Load the autoregressive trunk of a Qwen3.8-Flash-Next (`qwen4exp`) GGUF.
 // Split models ("-00001-of-00003.gguf") load every shard; single-file GGUFs
 // load as one shard. The per_layer_token_embd table is discovered in whichever
-// shard holds it and opened lazily. Returns false and sets last_error on
-// failure.
+// shard holds it and opened lazily. An MTP sidecar (find_qwen4exp_mtp_sidecar)
+// loads as one more shard. Returns false and sets last_error on failure.
 bool load_qwen4exp_gguf(const std::string & path,
                         ggml_backend_t backend,
-                        Qwen4ExpWeights & out);
+                        Qwen4ExpWeights & out,
+                        const std::string & mtp_override = "",
+                        int mtp_vocab = QWEN4EXP_MTP_VOCAB); // empty = discovery, "0" = off
+
+// Discover an MTP sidecar in the Unsloth
+// layout <repo>/<quant>/<model>.gguf -> <repo>/MTP/mtp-*.gguf is searched. Empty when there is none.
+std::string find_qwen4exp_mtp_sidecar(const std::string & model_path);
+
+// The sidecar among the file names of a repo's MTP/ directory: the first mtp-*.gguf in name order, or empty.
+std::string pick_qwen4exp_mtp_sidecar(std::vector<std::string> names);
 
 void free_qwen4exp_weights(Qwen4ExpWeights & w);
 

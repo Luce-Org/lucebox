@@ -1467,6 +1467,8 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_qwen_shared_overlap;
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1490,6 +1492,12 @@ struct ggml_backend_cuda_context {
         std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
     };
     std::vector<luce_q8_memo_entry> luce_q8_memo;
+
+    // Borrowed for one graph evaluation; the decode workspace owns the plan.
+    ggml_cuda_qwen_shared_overlap * qwen_shared_overlap_active = nullptr;
+    // Fixed stream-1 owner is scoped around the closed shared branch only.
+    char * qwen_shared_q8 = nullptr;
+    size_t qwen_shared_q8_bytes = 0;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};

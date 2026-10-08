@@ -2459,6 +2459,16 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   k);
 
+    // Exact-width QSA top-512 on one padded score row. valid is I32[1],
+    // 513 <= min_valid <= *valid <= a->ne[0]. Visible scores are nonnegative
+    // (zero must be +0); the suffix is -1e30. Preserves this backend's top_k
+    // membership AND order, including ties. Query backend support first.
+    GGML_API struct ggml_tensor * ggml_top_k_qsa(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * valid,
+            int                   min_valid);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,

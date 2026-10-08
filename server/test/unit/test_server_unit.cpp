@@ -22,6 +22,7 @@
 #include "server/image_input.h"
 #include "qwen35/qwen35_backend.h"
 #include "qwen4exp/qwen4exp_graph.h"
+#include "common/cuda_graph_overrides.h"
 #include "engine/luce_engine.h"
 #include "server/chat_template.h"
 #include "common/concurrency/seq_engine.h"
@@ -131,7 +132,7 @@ struct SchedulerTestHarness {
     static void finalize_inline_snapshot(
             HttpServer & server, const std::vector<int32_t> & prompt,
             PrefixCache::InlineReservation reservation,
-            int slot, int requested_cut) {
+            int slot, int requested_cut, int restore_slot = -1) {
         ParsedRequest req;
         req.prompt_tokens = prompt;
         HttpServer::PreparedPrompt prepared;
@@ -141,6 +142,8 @@ struct SchedulerTestHarness {
         cache.snap_slot = slot;
         cache.snap_cut = requested_cut;
         cache.snap_prepared = true;
+        cache.using_restore = restore_slot >= 0;
+        cache.cache_slot = restore_slot;
         GenerateResult result;
         result.error.reset();
         server.finalize_generation_cache(
@@ -187,6 +190,7 @@ struct SchedulerTestHarness {
         int restore_slot;   // -1 without a restore
         int prefix_len;
         bool snapshot;      // an inline snapshot is planned
+        std::vector<int> restore_points;
     };
 
     static PreparedCache prepare_cache(
@@ -203,7 +207,7 @@ struct SchedulerTestHarness {
         const auto cache = server.prepare_generation_cache(
             req, prepared, generate_request);
         return {cache.using_restore ? cache.cache_slot : -1, cache.prefix_len,
-                cache.snap_prepared};
+                cache.snap_prepared, generate_request.restore_points};
     }
 };
 }
@@ -5520,6 +5524,55 @@ TEST_CASE(ServerUnitFixture, test_qwen_snapshot_estimate_matches_saved_snapshot)
     ggml_backend_free(cpu);
 }
 
+TEST_CASE(ServerUnitFixture, test_qwen4exp_qsa_batch_boundary) {
+    Qwen4ExpWeights w;
+    w.n_layer = 1;
+    w.layers.resize(1);
+    w.layers[0].is_full_attention = true;
+    w.compress_ratios = {4};
+    w.indexer_head_size = 128;
+    w.indexer_n_head = 4;
+    w.indexer_top_k = 2048;
+    w.n_head = 24;
+    w.n_head_kv = 2;
+    ggml_tensor raw{}, kv{};
+    kv.ne[1] = 32768;
+    Qwen4ExpCache caches[2];
+    for (auto & cache : caches) {
+        cache.indexer_raw = {&raw};
+        cache.attn_k = {&kv};
+    }
+    Qwen4ExpForwardSegment spans[] = {{&caches[0], nullptr, 1, 16},
+                                     {&caches[1], nullptr, 1, 2050}};
+    TEST_ASSERT(qwen4exp_can_batch(w, spans, 2, true)); // 512 blocks + 3 tail tokens
+    spans[1].pos0 = 2051;
+    TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, true)); // first 513th block, before executing
+    TEST_ASSERT(qwen4exp_can_batch(w, spans, 2, false)); // generic device, QSA off
+    std::swap(spans[0], spans[1]);
+    TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, true)); // any slot, independent of order
+    spans[0].pos0 = 16;
+    spans[0].n_tokens = 512;
+    TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, true)); // prefill always runs solo
+    TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, false));
+    spans[0].n_tokens = 1;
+    Qwen4ExpForwardSegment rows[5] = {spans[0], spans[1], spans[0], spans[1], spans[0]};
+    TEST_ASSERT(qwen4exp_can_batch(w, rows, 4, true));
+    TEST_ASSERT(qwen4exp_can_batch(w, rows, 3, true));
+    TEST_ASSERT(!qwen4exp_can_batch(w, rows, 5, true)); // batch-invariant MMID ceiling
+    TEST_ASSERT(!qwen4exp_can_batch(w, rows, 5, false));
+    w.indexer_top_k = 1024;
+    spans[0].pos0 = 1026;
+    spans[0].n_tokens = 1;
+    TEST_ASSERT(qwen4exp_can_batch(w, spans, 2, true));
+    spans[0].pos0++;
+    TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, true)); // use model budget, not a magic 2051
+    w.compress_ratios = {1};
+    TEST_ASSERT(qwen4exp_can_batch(w, spans, 2, true)); // no supported QSA
+    w.compress_ratios = {4};
+    caches[1].indexer_raw.clear();
+    TEST_ASSERT(qwen4exp_can_batch(w, spans, 2, true));
+}
+
 // Qwen4Exp QSA indexer pooling: block b is the mean of the r consecutive token keys r*b .. r*b+r-1
 // (reference modeling_qwen4_exp.py: block_token_indices.view(n, ratio) then mean over the ratio axis).
 TEST_CASE(ServerUnitFixture, test_qwen4exp_profile_is_scoped) {
@@ -5541,9 +5594,43 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_profile_is_scoped) {
     }
     TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_DEFAULT);
     [&] { Qwen4ExpCudaScope optimized(true); TEST_ASSERT(optimized.optimized);
-          TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_DEFAULT) == GGML_CUDA_QWEN4EXP_DEFAULT); }();
+          TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_DEFAULT) == GGML_CUDA_QWEN4EXP_DEFAULT);
+          TEST_ASSERT(!ggml_backend_cuda_set_mmvq_batch_invariant(false));
+          {
+              ScopedCudaGraphOverrides batch(false, 0, false, 0, true);
+              TEST_ASSERT(ggml_backend_cuda_set_mmvq_batch_invariant(true));
+              TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_DEFAULT) == GGML_CUDA_QWEN4EXP_DEFAULT);
+          }
+          TEST_ASSERT(!ggml_backend_cuda_set_mmvq_batch_invariant(false)); }();
     TEST_ASSERT(set(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_OFF);
     ggml_backend_free(cpu);
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen4exp_mtp_profile_and_verify_restore) {
+    using namespace luce::common;
+    auto profile = ggml_backend_cuda_set_qwen4exp_profile;
+    auto invariant = ggml_backend_cuda_set_mmvq_batch_invariant;
+    const auto previous = profile(GGML_CUDA_QWEN4EXP_OFF);
+    const bool previous_invariant = invariant(false);
+    [&] {
+        Qwen4ExpCudaScope scope(true);
+        ScopedCudaGraphOverrides verify(false, 0, false, 0, true);
+        TEST_ASSERT(profile(GGML_CUDA_QWEN4EXP_DEFAULT) == GGML_CUDA_QWEN4EXP_DEFAULT);
+        TEST_ASSERT(invariant(true));
+    }();
+    TEST_ASSERT(profile(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_OFF);
+    TEST_ASSERT(!invariant(false));
+    // Invalid verify/rollback return before any GPU access, restoring the caller's profile.
+    Qwen4ExpWeights weights;
+    weights.gfx1151 = true;
+    Qwen4ExpCache cache;
+    std::vector<float> logits;
+    const int32_t tokens[] = {1, 2};
+    TEST_ASSERT(!qwen4exp_forward(nullptr, weights, cache, tokens, 2, 0, logits, nullptr, true).ok);
+    TEST_ASSERT(profile(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_OFF);
+    TEST_ASSERT(!qwen4exp_verify_rollback(nullptr, weights, cache, 0, 1));
+    TEST_ASSERT(profile(previous) == GGML_CUDA_QWEN4EXP_OFF);
+    TEST_ASSERT(!invariant(previous_invariant));
 }
 
 TEST_CASE(ServerUnitFixture, test_qwen4exp_pool_blocks_averages_consecutive_tokens) {
@@ -5566,6 +5653,30 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_pool_blocks_averages_consecutive_toke
         for (int d = 0; d < idim; ++d) TEST_ASSERT(pd[b * idim + d] == 100.0f * d + (float) (r * b) + 1.5f);
     }
     ggml_free(c);
+}
+
+// The stable T=1 decode span is a function of kv_len alone that reproduces the spans token-by-token decode rebuilt
+// its graph with (((kv_len + 511) / 256) * 256 whenever kv_len outgrew the last one), so an MTP verify row attends
+// over exactly the span plain decode uses at that position.
+TEST_CASE(ServerUnitFixture, test_qwen4exp_stable_kv_span_matches_decode_rebuilds) {
+    for (const int64_t max_ctx : {4096, 32768, 40000}) {
+        for (const int64_t first : {1, 2, 100, 255, 256, 257, 511, 512, 513, 2000, 3999}) {
+            int64_t base = 0, rebuilt = 0;
+            bool same = true;
+            for (int64_t kv = first; kv <= max_ctx; ++kv) {
+                if (rebuilt == 0 || kv > rebuilt) rebuilt = std::min<int64_t>(max_ctx, ((kv + 511) / 256) * 256);
+                same = same && qwen4exp_stable_kv_span(base, max_ctx, kv) == rebuilt;
+            }
+            TEST_ASSERT_MSG(same, "max_ctx=" + std::to_string(max_ctx) + " first=" + std::to_string(first));
+        }
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen4exp_mtp_sidecar_pick) {
+    TEST_ASSERT(pick_qwen4exp_mtp_sidecar({"README.md", "mtp-b-Q8_0.gguf", "model.gguf", "mtp-a-Q8_0.gguf"}) ==
+                "mtp-a-Q8_0.gguf");
+    TEST_ASSERT(pick_qwen4exp_mtp_sidecar({"mtp-.gguf", "mtp-x.bin", "Qwen3.8-Flash-Next.gguf"}).empty());
+    TEST_ASSERT(pick_qwen4exp_mtp_sidecar({}).empty());
 }
 
 // The Qwen report adds up the live cache and each snapshot from the buffers
@@ -6729,6 +6840,30 @@ TEST_CASE(ServerUnitFixture, test_prepare_cache_skips_consumed_snapshot) {
     unlink(path.c_str());
 }
 
+TEST_CASE(ServerUnitFixture, test_prefix_replaced_ancestor_releases_metadata) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto owner = std::make_unique<SlotSetBackend>();
+    auto & backend = *owner;
+    LuceEngine engine(std::move(owner));
+    ServerConfig config;
+    config.prefix_cache_cap = 4;
+    HttpServer server(engine, tokenizer, config);
+    auto & cache = SchedulerTestHarness::prefix_cache(server);
+    const std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102};
+    cache.confirm_inline_snap(0, 2, prompt, true, 100);
+    auto reservation = cache.reserve_inline_snap(prompt, 2, false, 4, 0);
+    TEST_ASSERT(reservation.active());
+    const int slot = reservation.slot();
+    backend.positions[slot] = 4; // backend replaced source slot 0 under pressure
+    SchedulerTestHarness::finalize_inline_snapshot(server, prompt, std::move(reservation), slot, 4, 0);
+    TEST_ASSERT(cache.lookup_candidate(prompt, 2).first == -1);
+    TEST_ASSERT(cache.lookup_candidate(prompt, 6).first == slot);
+    TEST_ASSERT(cache.stats().resident_bytes == 0); // MockBackend estimates zero, old 100 bytes released
+    unlink(path.c_str());
+}
+
 static std::vector<int> prefill_chunk_starts(
         int kv_offset, int prompt_end, const std::vector<int> & points,
         int first_min_tokens = kQwen35MinChunkTokens) {
@@ -6782,11 +6917,12 @@ TEST_CASE(ServerUnitFixture, test_agent_continuation_throttles_snapshot) {
 
     // Slot 0 holds the first 3 tokens, slot 1 a generated-turn checkpoint
     // `filler` + 5 tokens in, and the prompt adds one more turn.
-    const auto prepare = [&](int filler, bool ends_with_tool_result) {
+    const auto prepare = [&](int filler, bool ends_with_tool_result, const char * arch = "qwen4exp") {
         auto backend_owner = std::make_unique<SlotSetBackend>();
         SlotSetBackend & backend = *backend_owner;
         LuceEngine engine(std::move(backend_owner));
         ServerConfig config;
+        config.arch = arch;
         config.prefix_cache_cap = 4;
         HttpServer server(engine, tokenizer, config);
         PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
@@ -6807,6 +6943,15 @@ TEST_CASE(ServerUnitFixture, test_agent_continuation_throttles_snapshot) {
     const auto near = prepare(1, /*ends_with_tool_result=*/true);
     TEST_ASSERT(near.restore_slot == 1);
     TEST_ASSERT(!near.snapshot);
+    // Even a skipped capture must keep the tool-end cut: a cold request can
+    // select a different snapshot, but must use the same prefill boundaries.
+    TEST_ASSERT(near.restore_points.back() == 9);
+    // Preserve the existing boundary policy for every other architecture.
+    for (const char * arch : {"", "qwen35", "qwen35moe", "deepseek4", "qwen3", "gemma4", "laguna"}) {
+        const auto other = prepare(1, true, arch);
+        TEST_ASSERT(other.restore_slot == 1 && !other.snapshot);
+        TEST_ASSERT(other.restore_points.back() == 7);
+    }
 
     const auto chat = prepare(1, /*ends_with_tool_result=*/false);
     TEST_ASSERT(chat.restore_slot == 1);

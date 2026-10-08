@@ -8,16 +8,20 @@
 #include "ggml-cuda.h"
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <limits>
 #include <vector>
 
 static std::vector<float> run(ggml_backend_t be, int T, int n_comp, int kv_start, const std::vector<float> & qv,
-                              const std::vector<ggml_fp16_t> & kv) {
+                              const std::vector<ggml_fp16_t> & kv, bool masked = false) {
     ggml_init_params ip{64 * 1024 * 1024, nullptr, true};
     ggml_context * c = ggml_init(ip);
     ggml_tensor * q = ggml_new_tensor_3d(c, GGML_TYPE_F32, 128, 4, T);
     ggml_tensor * w = ggml_new_tensor_2d(c, GGML_TYPE_F32, 4, T);
     ggml_tensor * k = ggml_new_tensor_2d(c, GGML_TYPE_F16, 128, n_comp);
-    ggml_tensor * s = ggml_ds4_indexer_score(c, q, w, k, kv_start, 4);
+    ggml_tensor * mask = masked ? ggml_new_tensor_2d(c, GGML_TYPE_F32, n_comp, T) : nullptr;
+    ggml_tensor * s = mask ? ggml_ds4_indexer_score_masked(c, q, w, k, mask, 0, 4)
+                          : ggml_ds4_indexer_score(c, q, w, k, kv_start, 4);
     ggml_cgraph * gf = ggml_new_graph(c);
     ggml_build_forward_expand(gf, s);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(c, be);
@@ -25,6 +29,13 @@ static std::vector<float> run(ggml_backend_t be, int T, int n_comp, int kv_start
     std::vector<float> ones((size_t) 4 * T, 1.0f);
     ggml_backend_tensor_set(w, ones.data(), 0, ggml_nbytes(w));
     ggml_backend_tensor_set(k, kv.data(), 0, ggml_nbytes(k));
+    if (mask) {
+        std::vector<float> mv((size_t) n_comp * T, -INFINITY);
+        for (int t = 0; t < T; ++t) {
+            std::fill_n(mv.begin() + (size_t) t * n_comp, std::min(n_comp, (kv_start + t + 1) / 4), 0.0f);
+        }
+        ggml_backend_tensor_set(mask, mv.data(), 0, ggml_nbytes(mask));
+    }
     std::vector<float> out;
     if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS) {
         out.resize((size_t) n_comp * T);
@@ -59,6 +70,24 @@ int main() {
         std::printf("indexer-score T=%-4d visibility_mismatches=%d max_rel_err=%.2e %s\n", T, vis_mismatch, max_rel,
                     pass ? "OK" : "FAIL");
         ok = ok && pass;
+    }
+    // Fixed bucket vs exact width on the SAME backend: require score bits,
+    // including at partial WMMA tiles, and poison all invisible key columns.
+    for (int capacity : {576, 1088, 2112, 4160, 8256, 65536}) {
+        std::vector<float> qv(128 * 4);
+        for (size_t i = 0; i < qv.size(); ++i) qv[i] = std::sin(0.37f * (float) i) * 0.5f;
+        for (int n : {capacity - 64, capacity - 63, capacity - 1, capacity}) {
+            std::vector<ggml_fp16_t> kv((size_t) 128 * capacity);
+            for (size_t i = 0; i < kv.size(); ++i) kv[i] = ggml_fp32_to_fp16(i < (size_t) 128 * n
+                ? std::cos(0.11f * (float) i) * 0.5f : std::numeric_limits<float>::quiet_NaN());
+            const auto want = run(gpu, 1, n, 4 * n - 1, qv, kv);
+            const auto got = run(gpu, 1, capacity, 4 * n - 1, qv, kv, true);
+            bool pass = want.size() == (size_t) n && got.size() == (size_t) capacity &&
+                std::memcmp(want.data(), got.data(), n * sizeof(float)) == 0;
+            for (int b = n; pass && b < capacity; ++b) pass = got[b] == -1.0e30f;
+            std::printf("indexer-score masked capacity=%d valid=%d bits %s\n", capacity, n, pass ? "OK" : "FAIL");
+            ok &= pass;
+        }
     }
     ggml_backend_free(cpu);
     ggml_backend_free(gpu);

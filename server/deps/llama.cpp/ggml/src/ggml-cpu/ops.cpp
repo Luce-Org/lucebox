@@ -8251,6 +8251,8 @@ static void ggml_compute_forward_top_k_f32(
     const int64_t nr = ggml_nrows(src0);
 
     const int top_k = ne0;
+    const int64_t valid = dst->src[1] ? *(const int32_t *) dst->src[1]->data : ne00;
+    GGML_ASSERT(valid >= top_k && valid <= ne00);
 
     int32_t * tmp = (int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
@@ -8261,7 +8263,7 @@ static void ggml_compute_forward_top_k_f32(
             tmp[j] = j;
         }
 
-        std::partial_sort(tmp, tmp + top_k, tmp + ne00, cmp_top_k{src_data});
+        std::partial_sort(tmp, tmp + top_k, tmp + valid, cmp_top_k{src_data});
 
         int32_t * dst_data = (int32_t *)((char *) dst->data + i*nb1);
 

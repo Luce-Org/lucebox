@@ -651,8 +651,8 @@ bool ggml_cuda_mmvq_mmid_grouped_enabled(
         mmid_grouped_arch_ok(cc) && mmid_grouped_device_ok();
 }
 
-// Host function: returns the max batch size for the current arch+type at runtime.
-int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+// Ordinary MMID admission, also used to select the invariant fallback below.
+static int get_mmvq_mmid_max_batch_regular(ggml_type type, int cc) {
     // [TAG_MMID_GROUPED] the grouped kernel handles any supported type up to the
     // MoE batch ceiling; this also keeps CUDA graphs on for these batches.
     // RDNA3/RDNA4 (wave32) share the non-grouped kernel's wave-width warp_reduce.
@@ -703,6 +703,21 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
         }
     }
     return MMVQ_MAX_BATCH_SIZE;
+}
+
+int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    const int limit = get_mmvq_mmid_max_batch_regular(type, cc);
+    // The RDNA3 Q4_K/Q5_K/Q6_K ceiling is four, even though dense invariant
+    // MMVQ admits eight. Verification must not fall through to MMQ (different
+    // activation quantization). Wider invariant MMID uses the tokenwise kernel,
+    // not the MoE kernel whose compiled launch_bounds still impose that ceiling.
+    return limit > 0 && ggml_cuda_mmvq_batch_invariant() ? std::max(limit, MMVQ_MAX_BATCH_SIZE) : limit;
+}
+
+static bool mmid_invariant_tokenwise(ggml_type type, int cc, int64_t ncols) {
+    if (!ggml_cuda_mmvq_batch_invariant() || ncols > MMVQ_MAX_BATCH_SIZE) return false;
+    const int limit = get_mmvq_mmid_max_batch_regular(type, cc);
+    return limit > 0 && ncols > limit;
 }
 
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
@@ -2926,7 +2941,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return e && e[0] == '1' && e[1] == '\0';
     }();
 
-    if (use_tokenwise_mmid && has_ids && ncols_dst > 1) {
+    if (has_ids && ncols_dst > 1 && (use_tokenwise_mmid || mmid_invariant_tokenwise(type, cc, ncols_dst))) {
         constexpr int c_ncols_dst = 1;
         const bool use_small_k = should_use_small_k(c_ncols_dst);
         const uint3 token_sample_ratio_fd = init_fastdiv_values(ncols_dst);
@@ -3566,6 +3581,9 @@ void ggml_cuda_mul_mat_vec_q(
         return !(e && e[0] == '0' && e[1] == '\0');
     }();
     const size_t q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    if (ctx.qwen_shared_q8) GGML_ASSERT(ctx.curr_stream_no == 1 && !ids &&
+        src0->type == GGML_TYPE_Q8_0 && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
+        (ne10 == 2560 || ne10 == 640) && q8_bytes <= ctx.qwen_shared_q8_bytes);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     char * src1_q8_d = nullptr;
     // The src1->q8_1 quantization depends only on src0->type and src1's dims/strides,
@@ -3580,8 +3598,10 @@ void ggml_cuda_mul_mat_vec_q(
     // entry filled on one stream could be read on another while the
     // quantize kernel is still in flight. Skip the memo whenever concurrent
     // streams are active for this evaluation.
+    // Shared overlap also forks stream 1 without generic concurrent_events.
+    // Keep all memo entries on stream 0 and retain the generic concurrency guard.
     const bool use_q8_memo = luce_q8_memo_on && src1->buffer != nullptr &&
-                             ctx.stream_context().concurrent_events.empty();
+                             ctx.curr_stream_no == 0 && ctx.stream_context().concurrent_events.empty();
     if (use_q8_memo) {
         for (const auto & e : ctx.luce_q8_memo) {
             if (e.src1_node == (const void *) src1 && e.src1_data == (const void *) src1_d &&
@@ -3603,6 +3623,8 @@ void ggml_cuda_mul_mat_vec_q(
             ent.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
             q8_dst = ent.buf->ptr;
             ctx.luce_q8_memo.push_back(std::move(ent));
+        } else if (ctx.qwen_shared_q8) {
+            q8_dst = ctx.qwen_shared_q8;
         } else {
             src1_q8_1.alloc(q8_bytes);
             q8_dst = src1_q8_1.ptr;
@@ -3726,7 +3748,7 @@ void ggml_cuda_mul_mat_vec_q(
                 return !(e && e[0] == '0' && e[1] == '\0');
             }();
             const char * variant =
-                tokenwise_mmid ? "tokenwise" :
+                (tokenwise_mmid || mmid_invariant_tokenwise(src0->type, cc, ncols_dst)) ? "tokenwise" :
                 (moe_kernel || ncols_dst > MMVQ_MAX_BATCH_SIZE) ? "moe" : "generic";
             const char * reason =
                 ncols_dst > MMVQ_MAX_MOE_BATCH_SIZE ? "width_gt_16" :
