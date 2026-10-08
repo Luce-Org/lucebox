@@ -14,7 +14,7 @@ with 10 active experts.
 
 | Quant | Where | GTT |
 | --- | --- | --- |
-| UD-Q4_K_XL | [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), `UD-Q4_K_XL/` | 77 GB |
+| UD-Q4_K_XL | [Lucebox/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/Lucebox/Qwen3.8-Flash-Next-GGUF), `UD-Q4_K_XL/` (a byte-identical copy of [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), with the MTP drafter in `MTP/`) | 77 GB |
 | IQ4_NL | [bartowski/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/bartowski/Qwen3.8-Flash-Next-GGUF) | 73 GB |
 | GSQ-RCO IQ3_XXS | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), `IQ3_XXS/` | 47 GB |
 
