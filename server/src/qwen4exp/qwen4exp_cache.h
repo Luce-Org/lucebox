@@ -32,29 +32,36 @@ struct Qwen4ExpInputRing {
     size_t                embd_cap = 0, pos_cap = 0, ple_cap = 0, mask_cap = 0;
 };
 
-// Optional T=1 decode workspace. Reuse the metadata arena and gallocr backing
-// buffers; allocation assignments are remeasured whenever a graph is rebuilt.
+// Optional T=1 decode workspace, also one per MTP verify width. Reuse the metadata arena and gallocr
+// backing buffers; allocation assignments are remeasured whenever a graph is rebuilt.
 struct Qwen4ExpDecodeWorkspace {
     ggml_context * ctx   = nullptr;
     ggml_gallocr_t alloc = nullptr;
+    ggml_backend_sched_t sched = nullptr;   // split mode, verify widths: this graph's own scheduler
     bool planned = false;
 
-    // Stable T=1 graph state. The graph is rebuilt only when the fixed
-    // attention-span bucket changes. QSA visibility, selection width and
-    // pooled-key writes are runtime inputs, including block-completion steps.
+    // Stable graph state: T=1 decode, a verify forward of T rows, or an MTP draft
+    // rank. The graph is rebuilt only when the fixed attention-span bucket changes. QSA visibility,
+    // selection width and pooled-key writes are runtime inputs, including
+    // block-completion steps.
     ggml_cgraph * gf = nullptr;
     ggml_tensor * inp_emb = nullptr;
     ggml_tensor * positions = nullptr;
-    ggml_tensor * mask = nullptr;
+    ggml_tensor * mask = nullptr;     // T=1 dense; verify rows keep their own (row_inputs)
     ggml_tensor * ple_in = nullptr;
-    ggml_tensor * kv_row = nullptr;
+    ggml_tensor * hidden_in = nullptr;   // MTP draft rank 0: the trunk hidden rows
+    ggml_tensor * kv_row = nullptr;   // I32[T]: the K/V and raw indexer rows written
     ggml_tensor * logits = nullptr;
     ggml_tensor * hidden = nullptr;   // final HC residual, set when an MTP sidecar is loaded
     int64_t kv_bucket = 0;
     int64_t qsa_blocks = -1;  // -1 for dense; fixed score capacity otherwise
-    ggml_tensor * qsa_visibility = nullptr;
-    // I32[10]: valid count, four raw rows, destination row, four M-RoPE positions.
+    ggml_tensor * qsa_visibility = nullptr;   // F32 [qsa_blocks, T]
+    // I32[10, T]. Group t: row t's valid block count, then pooling slot t (the
+    // first ceil(T/4) groups): four raw rows, destination row, four M-RoPE positions.
     ggml_tensor * qsa_params = nullptr;
+    // Verify: each row's dense span (0 = QSA) and its mask or M-RoPE positions input.
+    std::vector<int64_t> row_spans;
+    std::vector<ggml_tensor *> row_inputs;
     uint64_t builds = 0;      // smoke-test evidence: metadata addresses can be recycled
     uint64_t replays = 0;
     int qsa_budget = 0;
@@ -64,6 +71,7 @@ struct Qwen4ExpDecodeWorkspace {
     ggml_backend_t backend = nullptr;  // owns native captures; must outlive the workspace
     // Split mode: the nodes pinned to the expert device, and the short-batch
     // scheduler allocation this graph owns (see Qwen4ExpCache::split_short_gen).
+    // A retained graph is never split again: the scheduler rewrites sources.
     std::vector<ggml_tensor *> expert_nodes;
     uint64_t split_gen = 0;
 };
@@ -139,8 +147,14 @@ struct Qwen4ExpCache {
     // Pinned graph-input ring (see Qwen4ExpInputRing).
     Qwen4ExpInputRing input_ring;
 
-    // T=1 decode workspace reuse; the verify and MTP draft graphs keep their own.
-    Qwen4ExpDecodeWorkspace decode_workspace, verify_workspace, mtp_workspace;
+    // T=1 decode workspace reuse; the MTP batches rebuilt per call keep their own,
+    // and each verify width (index = rows) its retained graph and allocation, as
+    // does each MTP draft rank: rank 0 per catch-up width (index = rows), later
+    // ranks per rank (index = rank).
+    Qwen4ExpDecodeWorkspace decode_workspace, mtp_workspace;
+    std::array<Qwen4ExpDecodeWorkspace, QWEN4EXP_MTP_MAX_VERIFY + 1> verify_workspace;
+    std::array<Qwen4ExpDecodeWorkspace, QWEN4EXP_MTP_MAX_VERIFY + 1> mtp_catchup_workspace;
+    std::array<Qwen4ExpDecodeWorkspace, QWEN4EXP_MTP_MAX_DRAFT + 1> mtp_rank_workspace;
 
     // Split mode (Qwen4ExpWeights::expert_backend): schedulers over the target,
     // the expert device and the CPU, reused across forwards.

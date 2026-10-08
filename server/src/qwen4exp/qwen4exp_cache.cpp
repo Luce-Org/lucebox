@@ -194,6 +194,7 @@ void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace) {
         ggml_backend_cuda_graph_invalidate_range(workspace.backend,
             ggml_get_mem_buffer(workspace.ctx), ggml_get_mem_size(workspace.ctx));
     }
+    if (workspace.sched) ggml_backend_sched_free(workspace.sched);
     if (workspace.alloc) ggml_gallocr_free(workspace.alloc);
     if (workspace.ctx) ggml_free(workspace.ctx);
     workspace = {};
@@ -207,8 +208,10 @@ void clear_qwen4exp_batched_decode_workspace(Qwen4ExpBatchedDecodeWorkspace & wo
 
 void free_qwen4exp_cache(Qwen4ExpCache & c) {
     clear_qwen4exp_decode_workspace(c.decode_workspace);
-    clear_qwen4exp_decode_workspace(c.verify_workspace);
+    for (auto & ws : c.verify_workspace) clear_qwen4exp_decode_workspace(ws);
     clear_qwen4exp_decode_workspace(c.mtp_workspace);
+    for (auto & ws : c.mtp_catchup_workspace) clear_qwen4exp_decode_workspace(ws);
+    for (auto & ws : c.mtp_rank_workspace) clear_qwen4exp_decode_workspace(ws);
     if (c.split_sched) { ggml_backend_sched_free(c.split_sched); c.split_sched = nullptr; }
     if (c.split_sched_short) { ggml_backend_sched_free(c.split_sched_short); c.split_sched_short = nullptr; }
     if (c.split_cpu) { ggml_backend_free(c.split_cpu); c.split_cpu = nullptr; }
@@ -251,7 +254,7 @@ void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c) {
     // stream; the memsets below run on another stream and must not race them.
     ggml_backend_synchronize(backend);
     // A reset makes any stable T=1 graph's captured recurrent/KV state stale.
-    // Batched graphs are rebuilt each call and use a separate shared arena.
+    // Retained verify graphs are keyed by spans that the new sequence recomputes.
     clear_qwen4exp_decode_workspace(c.decode_workspace);
     for (ggml_tensor * t : c.ssm_state) {
         if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));

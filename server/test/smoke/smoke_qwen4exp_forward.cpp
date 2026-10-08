@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -454,6 +455,12 @@ int main(int argc, char ** argv) {
     }
 
     Qwen4ExpWeights w;
+    // As the server: LUCE_QWEN4EXP_EXPERT_GPU puts the routed experts on that device (split mode).
+    if (const char * expert_gpu = std::getenv("LUCE_QWEN4EXP_EXPERT_GPU")) {
+        w.expert_backend = ggml_backend_cuda_init(std::atoi(expert_gpu));
+        if (!w.expert_backend) return 77;
+        w.expert_gfx1151 = ggml_backend_cuda_qwen4exp_supported(w.expert_backend);
+    }
     auto t_load0 = std::chrono::steady_clock::now();
     if (!load_qwen4exp_gguf(path, backend, w, draft, mtp_vocab)) {
         std::fprintf(stderr, "[smoke] load_qwen4exp_gguf failed\n");
@@ -728,6 +735,7 @@ int main(int argc, char ** argv) {
 
     free_qwen4exp_cache(cache);
     free_qwen4exp_weights(w);
+    if (w.expert_backend) ggml_backend_free(w.expert_backend);
     ggml_backend_free(backend);
 
     std::printf("[smoke] %s\n", rc == 0 ? "PASS" : "FAIL");

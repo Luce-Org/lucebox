@@ -8,6 +8,7 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -121,6 +122,10 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     const int ratio = w.compress_ratios.empty() ? 1 : std::max(1, *std::max_element(w.compress_ratios.begin(), w.compress_ratios.end()));
     const int dense_end = std::min(cache.max_ctx, w.indexer_top_k + ratio - 1);
     size_t decode = 0, verify = 0, draft = 0, runtime_scratch = 0, runtime_host = 0;
+    // Each verify width retains its own graph allocation; their metadata arenas stay mostly untouched.
+    // So does each MTP draft graph: rank 0 per catch-up width, and every later rank (sized as width 1).
+    std::array<size_t, QWEN4EXP_MTP_MAX_VERIFY + 1> verify_width{}, draft_width{};
+    size_t verify_arena = 0;
     auto retain = [&](const Qwen4ExpGraphMemory & m, size_t & resident) {
         if (m.graph == SIZE_MAX) return false;
         resident = std::max(resident, m.graph + m.metadata);
@@ -134,10 +139,22 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     for (const int end : {dense_end, std::min(cache.max_ctx, dense_end + cache.mtp_draft + 1), cache.max_ctx}) {
         if (!retain(qwen4exp_graph_memory(backend, w, cache, 1, end - 1), decode)) return 0;
         if (mtp) for (int n = 1; n <= cache.mtp_draft + 1 && n <= end; ++n) {
-            if (!retain(qwen4exp_mtp_graph_memory(backend, w, cache, n, end - n), draft)) return 0;
-            if (n > 1 && !retain(qwen4exp_graph_memory(backend, w, cache, n, end - n, true), verify)) return 0;
+            const Qwen4ExpGraphMemory d = qwen4exp_mtp_graph_memory(backend, w, cache, n, end - n);
+            size_t resident = 0;
+            if (!retain(d, resident)) return 0;
+            draft_width[n] = std::max(draft_width[n], d.graph + d.metadata);
+            if (n > 1) {
+                const Qwen4ExpGraphMemory m = qwen4exp_graph_memory(backend, w, cache, n, end - n, true);
+                if (!retain(m, resident)) return 0;
+                verify_width[n] = std::max(verify_width[n], m.graph);
+                verify_arena = std::max(verify_arena, m.metadata);
+            }
         }
     }
+    verify = verify_arena;
+    for (const size_t bytes : verify_width) verify += bytes;
+    for (const size_t bytes : draft_width) draft += bytes;
+    draft += (size_t) cache.mtp_draft * draft_width[1];
     // The decode workspaces stay resident while the next prompt prefills.
     const size_t fixed = (slots - resident_slots) * state + shadow + shadow_tmp +
                          slots * (decode + verify + draft);
@@ -502,8 +519,24 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     long long drafts = 0, accepted = 0, steps = 0;
     std::array<long long, QWEN4EXP_MTP_MAX_VERIFY> width_steps{};
     auto width_policy = qwen4exp_mtp_width_policy(cache_.mtp_draft,
-        spec && cfg_.verify_width == 0, (int) req.prompt.size());
+        spec && cfg_.verify_width == 0, (int) req.prompt.size(), mtp_cost_learned_ ? &mtp_cost_ : nullptr);
     double draft_s = 0.0;
+    auto verify_graphs = [&](uint64_t Qwen4ExpDecodeWorkspace::*count) {
+        uint64_t n = 0;
+        for (const auto & ws : cache_.verify_workspace) n += ws.*count;
+        return n;
+    };
+    auto draft_graphs = [&](uint64_t Qwen4ExpDecodeWorkspace::*count) {
+        uint64_t n = 0;
+        for (const auto & ws : cache_.mtp_catchup_workspace) n += ws.*count;
+        for (const auto & ws : cache_.mtp_rank_workspace) n += ws.*count;
+        return n;
+    };
+    auto built = [&] { return verify_graphs(&Qwen4ExpDecodeWorkspace::builds) + draft_graphs(&Qwen4ExpDecodeWorkspace::builds); };
+    const uint64_t builds0 = verify_graphs(&Qwen4ExpDecodeWorkspace::builds);
+    const uint64_t replays0 = verify_graphs(&Qwen4ExpDecodeWorkspace::replays);
+    const uint64_t draft_builds0 = draft_graphs(&Qwen4ExpDecodeWorkspace::builds);
+    const uint64_t draft_replays0 = draft_graphs(&Qwen4ExpDecodeWorkspace::replays);
     const auto t_dec0 = std::chrono::steady_clock::now();
     int32_t next = sample(logits.data());
     bool more = req.n_gen > 0 && commit(next);
@@ -514,6 +547,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
             req.n_gen - (int) result.tokens.size() - 1, cache_.max_ctx - pos - 1})) : 0;
         const bool verify = k > 0;
         const auto step_start = verify ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const uint64_t step_builds = verify ? built() : 0;
         if (verify) {
             const auto td0 = std::chrono::steady_clock::now();
             if (!qwen4exp_mtp_draft(backend_, weights_, cache_, mtp_tok.data(), mtp_h.data(), (int) mtp_tok.size(),
@@ -566,8 +600,15 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
                        logits.begin() + (size_t) retained * weights_.n_vocab);
         pos += retained;
         if (decode_check_) decode_check_(false, mtp_tok, logits_);
+        // Only a step that replayed its verify and draft graphs times the width; one
+        // that built a graph is slower and counts for acceptance alone.
         if (verify) width_policy.observe(decision.n_accepted + 1, k + 1,
+            built() != step_builds ? -1.0f :
             (float) std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - step_start).count());
+    }
+    if (width_policy.enabled()) {
+        mtp_cost_ = width_policy.cost();
+        mtp_cost_learned_ = true;
     }
     if (cancelled) {
         result.fail(GenerateErrorCode::Cancelled, "cancelled during decode");
@@ -594,11 +635,17 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         const double decoded = (double) result.tokens.size() - 1.0;   // the first token came from the prefill
         std::fprintf(stderr,
             "[qwen4exp-mtp] k=%d drafts=%lld accepted=%lld rate=%.3f tokens_per_step=%.3f draft_ms=%.2f decode=%.2f tok/s "
-            "adaptive=%d steps_k1=%lld steps_k2=%lld steps_k3=%lld steps_k4=%lld steps_k5=%lld steps_k6=%lld steps_k7=%lld\n",
+            "adaptive=%d steps_k1=%lld steps_k2=%lld steps_k3=%lld steps_k4=%lld steps_k5=%lld steps_k6=%lld steps_k7=%lld "
+            "verify_builds=%llu verify_replays=%llu draft_builds=%llu draft_replays=%llu cycle_ms=%.1f+%.2fk\n",
             cache_.mtp_draft, drafts, accepted, (double) accepted / (double) drafts, steps > 0 ? decoded / (double) steps : 0.0,
             1e3 * draft_s / (double) drafts, result.decode_s > 0.0 ? decoded / result.decode_s : 0.0,
             (int) width_policy.enabled(), width_steps[1], width_steps[2], width_steps[3], width_steps[4],
-            width_steps[5], width_steps[6], width_steps[7]);
+            width_steps[5], width_steps[6], width_steps[7],
+            (unsigned long long) (verify_graphs(&Qwen4ExpDecodeWorkspace::builds) - builds0),
+            (unsigned long long) (verify_graphs(&Qwen4ExpDecodeWorkspace::replays) - replays0),
+            (unsigned long long) (draft_graphs(&Qwen4ExpDecodeWorkspace::builds) - draft_builds0),
+            (unsigned long long) (draft_graphs(&Qwen4ExpDecodeWorkspace::replays) - draft_replays0),
+            width_policy.cost().base, width_policy.cost().slope);
     }
 
     guard.complete = true;

@@ -12,23 +12,46 @@ namespace luce::common {
 constexpr int QWEN4EXP_MTP_MAX_DRAFT = 7;
 constexpr int QWEN4EXP_MTP_MAX_VERIFY = QWEN4EXP_MTP_MAX_DRAFT + 1;
 
+// Verify cycle cost = fixed overhead + per-row cost, fitted online. The cost
+// is the device's, not the text's: the backend keeps one across requests and
+// each request starts from it (Qwen4ExpMtpWidth::cost()).
+struct Qwen4ExpMtpCost {
+    double base = 45.0, slope = 20.0;
+    // Ridge prior: 16 synthetic cycles at each end of k=1..7, forgotten
+    // slowly as measurements arrive; all widths share it.
+    double sw = 32.0, sx = 128.0, sxx = 800.0, sy = 32.0 * 45.0 + 128.0 * 20.0, sxy = 128.0 * 45.0 + 800.0 * 20.0;
+    std::array<int, QWEN4EXP_MTP_MAX_VERIFY> samples{};   // per width; the first few are cold graph builds
+    // Measured cycle time per width (warm samples): the policy uses it once a
+    // width has a few, and the linear fit only for widths not measured yet. A
+    // fit alone stays wrong where the policy never goes (its slope is
+    // unidentifiable from one width), which kept a bad prior in charge.
+    std::array<double, QWEN4EXP_MTP_MAX_VERIFY> measured{};
+    std::array<int, QWEN4EXP_MTP_MAX_VERIFY> measured_n{};
+
+    double at(int k) const { return measured_n[k] >= 4 ? measured[k] : base + slope * k; }
+};
+
 // MTP-only, per-request policy. Widths include the seed (k = width - 1).
 // Learn conditional acceptance only at reached depths: a clean short draft
 // says nothing about the next depth, and a rejection is not another failure
 // of every deeper conditional. Products give monotone prefix survivals.
 class Qwen4ExpMtpWidth {
 public:
-    Qwen4ExpMtpWidth(int max_draft, bool adaptive, int prompt_tokens)
-        : cap_(std::clamp(max_draft, 1, QWEN4EXP_MTP_MAX_DRAFT)), adaptive_(adaptive),
-          base_(prompt_tokens >= 32768 ? 47.0 : 45.0) {
+    Qwen4ExpMtpWidth(int max_draft, bool adaptive, int prompt_tokens, const Qwen4ExpMtpCost * learned = nullptr)
+        : cap_(std::clamp(max_draft, 1, QWEN4EXP_MTP_MAX_DRAFT)), adaptive_(adaptive) {
         // Optimistic but finite prior: 16 trials at 90% per reached depth.
         trials_.fill(16.0);
         successes_.fill(16.0 * 0.90);
-        // Ridge prior: 16 synthetic cycles at each end of k=1..7. Forget
-        // slowly as this context supplies measurements; all widths share it.
-        sy_ = 32.0 * base_ + 128.0 * slope_;
-        sxy_ = 128.0 * base_ + 800.0 * slope_;
+        if (learned) {
+            cost_ = *learned;
+        } else if (prompt_tokens >= 32768) {
+            cost_.base = 47.0;
+            cost_.sy = 32.0 * cost_.base + 128.0 * cost_.slope;
+            cost_.sxy = 128.0 * cost_.base + 800.0 * cost_.slope;
+        }
     }
+
+    const Qwen4ExpMtpCost & cost() const { return cost_; }
 
     bool enabled() const { return adaptive_; }
 
@@ -39,7 +62,7 @@ public:
         for (int k = 1; k <= cap_; ++k) {
             survival *= successes_[k] / trials_[k];
             commits += survival;
-            const double utility = commits / (base_ + slope_ * k);
+            const double utility = commits / cost_.at(k);
             if (utility > best) { best = utility; chosen = k; }
         }
         // A wider probe every 17 cycles is unconditional on timing or a
@@ -73,22 +96,28 @@ public:
             successes_[depth] += depth <= accepted;
         }
         if (!std::isfinite(cycle_ms) || cycle_ms <= 0.0f) return;
-        if (++cost_samples_[k] <= 4) return; // cold graph/shape builds
-        const double predicted = base_ + slope_ * k;
+        Qwen4ExpMtpCost & c = cost_;
+        if (++c.samples[k] <= 4) return; // cold graph/shape builds
+        // This width's own average: a running mean, then a 1/16 average; past a
+        // few samples, a spike counts at most twice the average.
+        const int n = ++c.measured_n[k];
+        const double sample = n > 4 ? std::min(double(cycle_ms), 2.0 * c.measured[k]) : double(cycle_ms);
+        c.measured[k] += (sample - c.measured[k]) / std::min(n, 16);
+        const double predicted = c.base + c.slope * k;
         const double measured = std::clamp(double(cycle_ms), predicted * 0.75, predicted * 1.25);
         constexpr double decay = 127.0 / 128.0;
-        sw_ = decay * sw_ + 1.0;
-        sx_ = decay * sx_ + k;
-        sxx_ = decay * sxx_ + k * k;
-        sy_ = decay * sy_ + measured;
-        sxy_ = decay * sxy_ + k * measured;
+        c.sw = decay * c.sw + 1.0;
+        c.sx = decay * c.sx + k;
+        c.sxx = decay * c.sxx + k * k;
+        c.sy = decay * c.sy + measured;
+        c.sxy = decay * c.sxy + k * measured;
         // Fit total cycle cost = fixed overhead + incremental draft/verify
         // row cost. Exploration supplies width variation; priors regularize
         // sparse contexts. No individual wall-time sample chooses a width.
-        const double determinant = sw_ * sxx_ - sx_ * sx_;
+        const double determinant = c.sw * c.sxx - c.sx * c.sx;
         if (determinant > 1e-6) {
-            slope_ = std::max(0.1, (sw_ * sxy_ - sx_ * sy_) / determinant);
-            base_ = std::max(1.0, (sy_ - slope_ * sx_) / sw_);
+            c.slope = std::max(0.1, (c.sw * c.sxy - c.sx * c.sy) / determinant);
+            c.base = std::max(1.0, (c.sy - c.slope * c.sx) / c.sw);
         }
     }
 
@@ -96,15 +125,14 @@ private:
     int cap_, steps_ = 0, warmup_k_ = 3;
     bool adaptive_;
     std::array<double, QWEN4EXP_MTP_MAX_VERIFY> trials_{}, successes_{};
-    std::array<int, QWEN4EXP_MTP_MAX_VERIFY> cost_samples_{};
-    double base_, slope_ = 20.0;
-    double sw_ = 32.0, sx_ = 128.0, sxx_ = 800.0, sy_, sxy_;
+    Qwen4ExpMtpCost cost_;
 };
 
 // Server --verify-width: 0 = adaptive k=1..7, 1 = off, 2..8 = fixed k=1..7.
 // Eight verify rows is the RDNA3 batch-invariant MMVQ/MMID ceiling.
-inline Qwen4ExpMtpWidth qwen4exp_mtp_width_policy(int max_draft, bool adaptive, int prompt_tokens = 0) {
-    return Qwen4ExpMtpWidth(max_draft, adaptive, prompt_tokens);
+inline Qwen4ExpMtpWidth qwen4exp_mtp_width_policy(int max_draft, bool adaptive, int prompt_tokens = 0,
+                                                  const Qwen4ExpMtpCost * learned = nullptr) {
+    return Qwen4ExpMtpWidth(max_draft, adaptive, prompt_tokens, learned);
 }
 
 inline int qwen4exp_mtp_next_width(const Qwen4ExpMtpWidth & policy) {
