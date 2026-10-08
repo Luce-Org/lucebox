@@ -10,9 +10,10 @@
 // (communicator handle, resolved placement, peer identities) live in the
 // cluster runtime objects, not here.
 //
-// Policy (variables.md): features ship as CLI flags. Environment variables are
-// reserved for burn-in kill switches (LUCE_CLUSTER_NO_INGRAPH_ALLREDUCE,
-// LUCE_CLUSTER_NO_GRAPH_CAPTURE) and debug tracing (LUCE_CLUSTER_TRACE).
+// Policy (variables.md): what the operator chooses ships as CLI flags. The
+// measured tuning defaults of cluster mode are environment variables that
+// cluster_launch_env() (server/launch_profiles.h) installs, each with a 0
+// kill switch; debug tracing stays in LUCE_CLUSTER_TRACE.
 
 #pragma once
 

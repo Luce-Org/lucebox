@@ -235,7 +235,9 @@ inline const std::vector<LaunchProfile> & launch_profiles() {
 // Environment defaults of expert-parallel cluster mode (--cluster-size > 1):
 // the measured two-box DeepSeek V4.1 configuration. They are installed before
 // a launch profile's defaults, so they win over a profile but never over a
-// variable that is already set; setting one to 0 turns it off.
+// variable that is already set. Setting a switch to 0 turns it off;
+// LUCE_CLUSTER_FAST_REDUCE_STALL_S=0 turns the stall watchdog off, and the
+// cache slot counts and LUCE_DS4_ENGRAM_PRECOMPUTE take a size.
 inline const std::vector<LaunchProfileEnv> & cluster_launch_env() {
     static const std::vector<LaunchProfileEnv> env = {
         // Decode exchange: the raw-RDMA fast reduce, zero-copy rows on a bf16

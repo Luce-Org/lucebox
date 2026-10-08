@@ -177,6 +177,8 @@ static void print_usage(const char * prog) {
         "                       Experts that keep a token's native routing and stay on\n"
         "                       the primary GPU (JSON {\"layer\": [ids]})\n"
         "  --ds4-prefill <mode> DeepSeek4 prefill: exact, dense, or sparse\n"
+        "                       (default: exact; dense/sparse are experimental\n"
+        "                       and may change generated tokens)\n"
         "  --cluster-rank <r>           This box's rank in [0, N); rank 0 serves HTTP\n"
         "  --cluster-size <N>           Number of ranks (2..8)\n"
         "  --cluster-head <host:port>   Control endpoint; rank 0 binds, workers connect\n"
@@ -188,9 +190,9 @@ static void print_usage(const char * prog) {
         "  --cluster-shared-expert replicate|shard  (default: replicate)\n"
         "  --cluster-allreduce-dtype f32|bf16|auto  (default: auto = f32)\n"
         "  --cluster-timeout-ms <ms>    Collective/control watchdog (default: 30000)\n"
+        "  --cluster-replicate-hot <k>  Replicate each layer's k hottest experts on every rank\n"
         "  --cluster-verify-hash <n>    Debug: cross-rank hidden-state hash every n steps\n"
-        "                       (default: exact; dense/sparse are experimental\n"
-        "                       and may change generated tokens)\n"
+        "  --cluster-selftest           Bootstrap, run the collective self-test, exit\n"
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
         "                       WARNING: >0 drops system prompt / tool definitions\n"
         "                       from attention at long contexts. Use 0 for tools.\n"
@@ -649,6 +651,13 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                     return 2;
                 }
                 bargs.cluster.timeout_ms = (uint32_t) v;
+            } else if (std::strcmp(flag, "--cluster-replicate-hot") == 0) {
+                if (!int_value(bargs.cluster.replicate_hot) || bargs.cluster.replicate_hot < 0) {
+                    std::fprintf(stderr, "[server] --cluster-replicate-hot must be non-negative\n");
+                    return 2;
+                }
+            } else if (std::strcmp(flag, "--cluster-selftest") == 0) {
+                bargs.cluster.selftest = true;
             } else if (std::strcmp(flag, "--cluster-verify-hash") == 0) {
                 if (!int_value(bargs.cluster.verify_hash_every) || bargs.cluster.verify_hash_every < 0) {
                     std::fprintf(stderr, "[server] --cluster-verify-hash must be non-negative\n");
@@ -2354,6 +2363,9 @@ int main(int argc, char ** argv) {
         auto model = std::make_unique<LoadedModel>();
         const int ret = load_model(option, *model, load_balancing);
         if (ret != 0) return ret;
+        // A cluster worker (rank >= 1) has already run to completion inside
+        // load_model and serves no HTTP: its exit code is the process's.
+        if (!model->server) return ret;
         servers.push_back(model->server.get());
         loaded.push_back(std::move(model));
     }

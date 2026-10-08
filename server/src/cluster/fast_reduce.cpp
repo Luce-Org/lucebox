@@ -594,7 +594,7 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
                 {
                     const double w = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - wait_t0).count();
-                    if (w > stall_s && s.seq.load() >= next) {   // allocated, never published
+                    if (stall_s > 0.0 && w > stall_s && s.seq.load() >= next) {   // allocated, never published
                         s.failed.store(true);
                         const uint64_t last = s.seq.load();
                         std::fprintf(stderr,
