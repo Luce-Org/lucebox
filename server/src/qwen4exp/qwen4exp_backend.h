@@ -10,6 +10,7 @@
 
 #include "qwen4exp_internal.h"
 #include "qwen4exp_cache.h"
+#include "qwen4exp_mtp.h"
 #include "qwen4exp_seq_engine.h"
 
 #include "ggml.h"
@@ -101,8 +102,9 @@ private:
     std::vector<Qwen4ExpCache> seq_caches_;
     std::unique_ptr<Qwen4ExpSeqEngine> seq_engine_;
     bool                  parked_  = false;
-    // The adaptive verify width's cost per context regime and acceptance, learned across requests.
-    Qwen4ExpMtpMemory     mtp_memory_;
+    // The adaptive MTP verify width, kept across requests with its costs per context range.
+    AdaptiveSpecWidth     mtp_width_ = qwen4exp_mtp_width_controller();
+    SpecWidthCostMemory   mtp_costs_;
 };
 
 }  // namespace luce::common

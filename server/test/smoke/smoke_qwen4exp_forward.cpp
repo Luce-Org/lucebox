@@ -196,7 +196,7 @@ int run_mtp_check(ggml_backend_t backend, const Qwen4ExpWeights & w, const std::
 
     long long drafts = 0, accepted = 0, steps = 0;
     const int configured_k = cache.mtp_draft;
-    auto policy = qwen4exp_mtp_width_policy(configured_k, adaptive, S);
+    auto policy = qwen4exp_mtp_width_controller();
     auto emit = [&](const float * row) {
         const size_t index = out.size();
         out.push_back(top(row));
@@ -212,7 +212,8 @@ int run_mtp_check(ggml_backend_t backend, const Qwen4ExpWeights & w, const std::
         int pos = S;
         std::vector<int32_t> draft_tokens;
         while (ok && (int) out.size() < n_gen) {
-            const int k = std::min(qwen4exp_mtp_next_width(policy) - 1, n_gen - (int) out.size() - 1);
+            const int width = adaptive ? policy.next_width_cost_aware({}, configured_k + 1) : configured_k + 1;
+            const int k = std::min(width - 1, n_gen - (int) out.size() - 1);
             const bool verify = k > 0;
             std::vector<char> catchup_kv;
             if (verify) {

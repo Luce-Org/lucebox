@@ -2,7 +2,9 @@
 #include "common/adaptive_spec_width.h"
 
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <string>
 #include <vector>
 
 using namespace luce::common;
@@ -419,4 +421,119 @@ TEST_CASE(AdaptiveSpecWidthFixture, clean_draft_explores_one_width_up_on_a_near_
     prose.set_relative_costs(kDs4StepCosts);
     prose.observe(2, 2);
     CHECK(prose.next_width_cost_aware({0.60f, 0.60f, 0.60f, 0.60f}) == 2);
+}
+
+namespace {
+// DS4's configuration (q_cap 5, floor 2, the gfx1151 seed curve) replayed
+// over a fixed sequence of acceptances and step costs, with graph-build
+// outliers, missing timings and two acceptance phase changes. Returns the
+// offered width of every step.
+std::string replay_ds4_configuration(bool confidence) {
+    AdaptiveSpecWidth width(5, 2, true);
+    width.set_relative_costs(kDs4StepCosts);
+    uint32_t rng = 12345u;
+    auto next = [&] { rng = rng * 1664525u + 1013904223u; return (rng >> 8) / 16777216.0f; };
+    std::string out;
+    for (int step = 0; step < 400; ++step) {
+        const float p = step < 150 ? 0.85f : step < 280 ? 0.45f : 0.75f;
+        std::vector<float> conf;
+        if (confidence) conf = {0.9f * p + 0.05f, 0.85f * p, 0.8f * p};
+        const int offered = width.next_width_cost_aware(conf, 5);
+        int accepted = 1;
+        while (accepted < offered && next() < p) ++accepted;
+        float cost = 60.0f + 14.0f * (float) offered + 6.0f * next();
+        if (step % 37 == 5) cost *= 4.0f;
+        if (step % 53 == 7) cost = -1.0f;
+        width.observe(accepted, offered, cost);
+        if (confidence) width.observe_confidence(conf, accepted, offered);
+        out.push_back((char) ('0' + offered));
+    }
+    return out;
+}
+} // namespace
+
+// The decisions an estimate-seeded controller made before shape seeds and
+// measured-cost memory existed: those additions must not move them.
+TEST_CASE(AdaptiveSpecWidthFixture, estimate_seeded_decisions_are_unchanged) {
+    const std::string acceptance_and_cost =
+        "55555544444444444444444223422232333333432332224222222244444444444444444444444444"
+        "22222222222222222222222222222222222224444444444444444444444444444444444444444444"
+        "44444444444444444444444444444442222222222222222222222222222222222222222222222222"
+        "22222222222222222222222222222222222222222222222222222222222222333333333333333333"
+        "33333333333333333333333333333333333333333333333333333333333333333333333333333333";
+    const std::string confidence_head =
+        "55555544434343444444444442444444444444444443333333333333333333333333333333333333"
+        "22222222222222222222222222222222222224444444444444444444444444444444444444222222"
+        "22222222222222222222222222222222222222222222222222222222222222222222222222222222"
+        "22222222222222222222222222222222222222222222222222222222222222444444444444444444"
+        "44444444444444444444444444444444444444444444444444444444555555555555555555555555";
+    CHECK(replay_ds4_configuration(false) == acceptance_and_cost);
+    CHECK(replay_ds4_configuration(true) == confidence_head);
+}
+
+// A shape seed is a curve, not this machine's cost: one measured width scales
+// every unmeasured one, and no unmeasured width is priced above a measured
+// narrower width, so a wider shape the seed overprices still gets offered.
+TEST_CASE(AdaptiveSpecWidthFixture, shape_seed_prices_unmeasured_widths_from_measurements) {
+    AdaptiveSpecWidth width(8, 2, true);
+    // A prior twice as expensive per row as this machine (45 + 20 per draft).
+    std::vector<float> shape(9, 0.0f);
+    for (int w = 2; w <= 8; ++w) shape[(size_t) w] = 45.0f + 20.0f * (float) (w - 1);
+    width.set_relative_costs(shape, AdaptiveSpecWidth::CostSeed::kShape);
+    for (int i = 0; i < AdaptiveSpecWidth::kCostWarmupSamples + 1; ++i) {
+        width.observe(4, 4, 50.0f);   // width 4 measured at 50 (seed 105)
+    }
+    CHECK(near(width.measured_costs()[4], 50.0f));
+    CHECK(!std::isfinite(width.measured_costs()[6]));
+    // High acceptance: a wider width is worth more than its scaled price.
+    for (int i = 0; i < 20; ++i) width.observe(4, 4, 50.0f);
+    CHECK(width.next_width_cost_aware({}, 8) > 4);
+}
+
+TEST_CASE(AdaptiveSpecWidthFixture, shape_seed_clips_build_outliers) {
+    AdaptiveSpecWidth width(4, 2, true);
+    width.set_relative_costs({0.0f, 0.0f, 10.0f, 12.0f, 14.0f},
+                             AdaptiveSpecWidth::CostSeed::kShape);
+    for (int i = 0; i < AdaptiveSpecWidth::kCostWarmupSamples +
+                        AdaptiveSpecWidth::kCostTrustSamples; ++i) {
+        width.observe(3, 3, 40.0f);
+    }
+    width.observe(3, 3, 400.0f);   // a step that also built a graph
+    // The outlier counts as at most kCostOutlierRatio times the mean.
+    CHECK(width.measured_costs()[3] < 40.0f * AdaptiveSpecWidth::kCostOutlierRatio);
+    CHECK(width.measured_costs()[3] > 40.0f);
+}
+
+// Measured costs follow the context range: a long request's timings do not
+// price a short request's widths, and a range never timed starts from the
+// nearest timed one, lightly weighted so its own steps take over.
+TEST_CASE(AdaptiveSpecWidthFixture, cost_memory_keeps_one_set_per_context_range) {
+    AdaptiveSpecWidth width(4, 2, true);
+    width.set_relative_costs({0.0f, 0.0f, 10.0f, 12.0f, 14.0f},
+                             AdaptiveSpecWidth::CostSeed::kShape);
+    width.set_acceptance_model(AdaptiveSpecWidth::AcceptanceModel::kReachedDepths);
+    SpecWidthCostMemory memory;
+    CHECK(SpecWidthCostMemory::range(30) != SpecWidthCostMemory::range(15140));
+
+    memory.load(width, 15140);
+    CHECK(!std::isfinite(width.measured_costs()[3]));
+    for (int i = 0; i < AdaptiveSpecWidth::kCostWarmupSamples +
+                        AdaptiveSpecWidth::kCostTrustSamples; ++i) {
+        width.observe(3, 3, 60.0f);
+    }
+    memory.store(width, 15140);
+
+    memory.load(width, 30);   // never timed: borrows the 16K range's costs
+    CHECK(near(width.measured_costs()[3], 60.0f));
+    for (int i = 0; i < 8; ++i) width.observe(3, 3, 40.0f);
+    CHECK(width.measured_costs()[3] < 47.0f);
+    memory.store(width, 30);
+
+    memory.load(width, 15140);   // its own costs, untouched by the short range
+    CHECK(near(width.measured_costs()[3], 60.0f));
+    // A carried measurement tracks its next sample at once.
+    width.observe(3, 3, 70.0f);
+    CHECK(width.measured_costs()[3] > 60.0f);
+    memory.load(width, 30);
+    CHECK(width.measured_costs()[3] < 47.0f);
 }
