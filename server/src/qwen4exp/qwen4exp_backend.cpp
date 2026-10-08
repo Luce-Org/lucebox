@@ -63,17 +63,17 @@ static bool load_qwen4exp_hot_experts(ggml_backend_t backend, Qwen4ExpWeights & 
         std::fprintf(stderr, "[qwen4exp] hot experts: %s\n", err.c_str());
         return false;
     }
-    const ggml_init_params ip = { 2 * (size_t) w.n_layer * ggml_tensor_overhead(), nullptr, true };
-    w.lut_ctx = ggml_init(ip);
+    ggml_context * lut_ctx = w.derived.open(2 * (size_t) w.n_layer);
     w.hot_lut.assign((size_t) w.n_layer, nullptr);
     w.cold_lut.assign((size_t) w.n_layer, nullptr);
-    for (int il = 0; il < w.n_layer; ++il) {
+    for (int il = 0; lut_ctx && il < w.n_layer; ++il) {
         if (w.hot->layers[(size_t) il].hot_expert_ids.empty()) continue;
-        w.hot_lut[(size_t) il]  = ggml_new_tensor_2d(w.lut_ctx, GGML_TYPE_I32, 1, w.n_expert);
-        w.cold_lut[(size_t) il] = ggml_new_tensor_2d(w.lut_ctx, GGML_TYPE_I32, 1, w.n_expert);
+        w.hot_lut[(size_t) il]  = ggml_new_tensor_2d(lut_ctx, GGML_TYPE_I32, 1, w.n_expert);
+        w.cold_lut[(size_t) il] = ggml_new_tensor_2d(lut_ctx, GGML_TYPE_I32, 1, w.n_expert);
     }
-    w.lut_buf = ggml_backend_alloc_ctx_tensors(w.lut_ctx, backend);
-    if (!w.lut_buf) {
+    if (!w.derived.commit(backend)) {
+        w.hot_lut.clear();
+        w.cold_lut.clear();
         std::fprintf(stderr, "[qwen4exp] hot experts: lookup table allocation failed\n");
         return false;
     }
@@ -250,11 +250,7 @@ bool Qwen4ExpBackend::init() {
     }
     // Split mode: routed experts on a second GPU, everything else on the target.
     if (cfg_.expert_device) {
-        const int expert_gpu = cfg_.expert_device->gpu;
-        if (expert_gpu == cfg_.device.gpu) {
-            std::fprintf(stderr, "[qwen4exp] --expert-device must differ from the target device\n");
-            return false;
-        }
+        const int expert_gpu = cfg_.expert_device->gpu;   // the plan checked it differs from the target
         weights_.expert_backend = ggml_backend_cuda_init(expert_gpu);
         if (!weights_.expert_backend) {
             std::fprintf(stderr, "[qwen4exp] expert backend init failed for GPU %d\n", expert_gpu);
@@ -282,11 +278,8 @@ bool Qwen4ExpBackend::load_target() {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
         return false;
     }
-    // The hot set takes LUCE_EXPERT_BUDGET_MB of the target, 8 GiB by default: the rest
-    // of the target holds the dense weights, KV and prompt-chunk buffers.
-    const uint64_t hot_budget = expert_budget_bytes_from_env();
     if (!load_qwen4exp_hot_experts(backend_, weights_, cfg_.expert_placement_path,
-                                   hot_budget > 0 ? hot_budget : 8ull << 30)) return false;
+                                   expert_budget_bytes_from_env(kQwen4ExpHotExpertBudget))) return false;
     snapshot_budget_ = SIZE_MAX;
     if (cfg_.chunk > 0) {
         chunk_ = weights_.expert_backend ? std::min(cfg_.chunk, kQwen4ExpSplitMaxChunk) : cfg_.chunk;

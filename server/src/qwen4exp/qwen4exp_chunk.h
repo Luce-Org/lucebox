@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 
 namespace luce::common {
@@ -16,6 +17,9 @@ constexpr int kQwen4ExpSplitMaxChunk = 16384;
 constexpr int kQwen4ExpPipelineStreamRows = 4096;
 // Split mode: the smallest chunk that still gives the prompt pipeline two streams.
 constexpr int kQwen4ExpSplitChunkFloor = 2 * kQwen4ExpPipelineStreamRows;
+// Split mode: the hot experts' share of the target unless LUCE_EXPERT_BUDGET_MB sets it. The rest of the target holds
+// the dense weights, the KV cache and the prompt-chunk buffers.
+constexpr uint64_t kQwen4ExpHotExpertBudget = 8ull << 30;
 
 // Largest 256-row tile multiple within a measured workspace budget, capped at
 // max_rows. Above 512, the dense/QSA peak envelope grows with T. Small

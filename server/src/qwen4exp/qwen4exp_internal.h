@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace luce::common {
@@ -129,6 +130,18 @@ private:
     ggml_to_float_t  to_float_  = nullptr;
 };
 
+// Small target-resident constants derived from the weights: the raw-gate parameters, QSA's head weights and the
+// hot-expert lookup tables. Each group opens a no-alloc context, creates its tensors and commits them as one weights
+// buffer; free() releases every group.
+class Qwen4ExpDerived {
+public:
+    ggml_context * open(size_t n_tensors);
+    bool commit(ggml_backend_t backend);   // false: the open group is dropped and its tensors are gone
+    void free();
+private:
+    std::vector<std::pair<ggml_context *, ggml_backend_buffer_t>> blocks_;
+};
+
 struct Qwen4ExpWeights {
     bool gfx1151 = false;  // Cache profile support at load, before any allocation.
     bool qsa = false;      // The QSA kernels run on the target device (gfx1151, RDNA4).
@@ -145,15 +158,10 @@ struct Qwen4ExpWeights {
     // --expert-placement). Verify steps run them there while the expert device
     // runs the rest of the picks.
     std::unique_ptr<MoeHybridStorage> hot;
-    ggml_context *             lut_ctx = nullptr;
-    ggml_backend_buffer_t      lut_buf = nullptr;
     std::vector<ggml_tensor *> hot_lut;    // per layer [1, n_expert] i32: hot slot, -1 if cold (null: no hot experts)
     std::vector<ggml_tensor *> cold_lut;   // per layer [1, n_expert] i32: the expert, -1 if hot
-    ggml_context *             gate_ctx = nullptr;   // the layers' ssm_gate_ba
-    ggml_backend_buffer_t      gate_buf = nullptr;
     ggml_tensor *              qsa_ones = nullptr;   // [indexer_n_head, 128] f32 ones: QSA's uniform head weights
-    ggml_context *             qsa_ctx  = nullptr;
-    ggml_backend_buffer_t      qsa_buf  = nullptr;
+    Qwen4ExpDerived            derived;   // owns hot_lut/cold_lut, qsa_ones and the layers' ssm_gate_ba
 
     CpuEmbedder           embedder;
 
@@ -263,5 +271,7 @@ std::string find_qwen4exp_mtp_sidecar(const std::string & model_path);
 std::string pick_qwen4exp_mtp_sidecar(std::vector<std::string> names);
 
 void free_qwen4exp_weights(Qwen4ExpWeights & w);
+// Release the derived constants and clear every pointer into them.
+void free_qwen4exp_derived(Qwen4ExpWeights & w);
 
 }  // namespace luce::common

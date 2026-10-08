@@ -332,6 +332,40 @@ std::string find_qwen4exp_mtp_sidecar(const std::string & model_path) {
     return name.empty() ? std::string() : (dir / name).string();
 }
 
+ggml_context * Qwen4ExpDerived::open(size_t n_tensors) {
+    const ggml_init_params ip = { n_tensors * ggml_tensor_overhead(), nullptr, true };
+    blocks_.push_back({ ggml_init(ip), nullptr });
+    return blocks_.back().first;
+}
+
+bool Qwen4ExpDerived::commit(ggml_backend_t backend) {
+    auto & [ctx, buf] = blocks_.back();
+    buf = ctx ? ggml_backend_alloc_ctx_tensors(ctx, backend) : nullptr;
+    if (!buf) {
+        if (ctx) ggml_free(ctx);
+        blocks_.pop_back();
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    return true;
+}
+
+void Qwen4ExpDerived::free() {
+    for (auto & [ctx, buf] : blocks_) {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+    }
+    blocks_.clear();
+}
+
+void free_qwen4exp_derived(Qwen4ExpWeights & w) {
+    for (Qwen4ExpLayer & L : w.layers) L.ssm_gate_ba = nullptr;
+    w.qsa_ones = nullptr;
+    w.hot_lut.clear();
+    w.cold_lut.clear();
+    w.derived.free();
+}
+
 // [dt_bias | A] per linear layer, so decode and verify steps hand the raw alpha/beta projections to the recurrence
 // (ggml_gated_delta_net_set_raw_gates) instead of running the add, softplus, mul and sigmoid kernels. Without it the
 // graph keeps those ops.
@@ -345,19 +379,14 @@ static void build_qwen4exp_gate_ba(Qwen4ExpWeights & w, ggml_backend_t backend) 
         linear.push_back(&L);
     }
     if (linear.empty()) return;
-    const ggml_init_params ip = { linear.size() * ggml_tensor_overhead(), nullptr, true };
-    w.gate_ctx = ggml_init(ip);
+    ggml_context * ctx = w.derived.open(linear.size());
     for (Qwen4ExpLayer * L : linear) {
-        L->ssm_gate_ba = ggml_new_tensor_1d(w.gate_ctx, GGML_TYPE_F32, 2 * ggml_nelements(L->ssm_dt_bias));
+        L->ssm_gate_ba = ctx ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * ggml_nelements(L->ssm_dt_bias)) : nullptr;
     }
-    w.gate_buf = ggml_backend_alloc_ctx_tensors(w.gate_ctx, backend);
-    if (!w.gate_buf) {
+    if (!w.derived.commit(backend)) {
         for (Qwen4ExpLayer * L : linear) L->ssm_gate_ba = nullptr;
-        ggml_free(w.gate_ctx);
-        w.gate_ctx = nullptr;
         return;
     }
-    ggml_backend_buffer_set_usage(w.gate_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     std::vector<float> ba;
     for (Qwen4ExpLayer * L : linear) {
         const size_t H = (size_t) ggml_nelements(L->ssm_dt_bias);
@@ -368,39 +397,18 @@ static void build_qwen4exp_gate_ba(Qwen4ExpWeights & w, ggml_backend_t backend) 
     }
 }
 
-static void free_qwen4exp_gate_ba(Qwen4ExpWeights & w) {
-    for (Qwen4ExpLayer & L : w.layers) L.ssm_gate_ba = nullptr;
-    if (w.gate_buf) ggml_backend_buffer_free(w.gate_buf);
-    if (w.gate_ctx) ggml_free(w.gate_ctx);
-    w.gate_buf = nullptr;
-    w.gate_ctx = nullptr;
-}
-
 // QSA scores weigh every indexer head by 1.0: one ones tensor serves every layer and row count up to 128, instead of
 // building the constant in each graph.
 static void build_qwen4exp_qsa_ones(Qwen4ExpWeights & w, ggml_backend_t backend) {
     if (w.indexer_n_head <= 0) return;
-    const ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
-    w.qsa_ctx = ggml_init(ip);
-    w.qsa_ones = ggml_new_tensor_2d(w.qsa_ctx, GGML_TYPE_F32, w.indexer_n_head, 128);
-    w.qsa_buf = ggml_backend_alloc_ctx_tensors(w.qsa_ctx, backend);
-    if (!w.qsa_buf) {
-        ggml_free(w.qsa_ctx);
-        w.qsa_ctx = nullptr;
+    ggml_context * ctx = w.derived.open(1);
+    w.qsa_ones = ctx ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.indexer_n_head, 128) : nullptr;
+    if (!w.derived.commit(backend)) {
         w.qsa_ones = nullptr;
         return;
     }
-    ggml_backend_buffer_set_usage(w.qsa_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     const std::vector<float> ones((size_t) ggml_nelements(w.qsa_ones), 1.0f);
     ggml_backend_tensor_set(w.qsa_ones, ones.data(), 0, ggml_nbytes(w.qsa_ones));
-}
-
-static void free_qwen4exp_qsa_ones(Qwen4ExpWeights & w) {
-    if (w.qsa_buf) ggml_backend_buffer_free(w.qsa_buf);
-    if (w.qsa_ctx) ggml_free(w.qsa_ctx);
-    w.qsa_buf = nullptr;
-    w.qsa_ctx = nullptr;
-    w.qsa_ones = nullptr;
 }
 
 bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
@@ -456,8 +464,7 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         if (out.mtp_vocab_ctx) ggml_free(out.mtp_vocab_ctx);
         out.mtp_vocab_buf = nullptr;
         out.mtp_vocab_ctx = nullptr;
-        free_qwen4exp_gate_ba(out);
-        free_qwen4exp_qsa_ones(out);
+        free_qwen4exp_derived(out);
         reset_qwen4exp_mtp_fields(out);
         for (ShardSource & shard : shards) {
             gguf_free(shard.gctx);
@@ -1011,18 +1018,7 @@ void free_qwen4exp_weights(Qwen4ExpWeights & w) {
         w.expert_buf = nullptr;
     }
     w.hot.reset();
-    if (w.lut_buf) {
-        ggml_backend_buffer_free(w.lut_buf);
-        w.lut_buf = nullptr;
-    }
-    if (w.lut_ctx) {
-        ggml_free(w.lut_ctx);
-        w.lut_ctx = nullptr;
-    }
-    w.hot_lut.clear();
-    w.cold_lut.clear();
-    free_qwen4exp_gate_ba(w);
-    free_qwen4exp_qsa_ones(w);
+    free_qwen4exp_derived(w);
     for (ggml_context * extra : w.extra_meta_ctxs) {
         if (extra) ggml_free(extra);
     }
