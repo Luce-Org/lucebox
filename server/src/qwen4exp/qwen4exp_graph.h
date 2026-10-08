@@ -134,6 +134,8 @@ bool qwen4exp_mtp_draft(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4
 // A slot past the QSA boundary decodes as a stable T=1 QSA row inside the graph; if the
 // backend lacks those rows or more than four slots are active, each slot runs its solo forward.
 // Reference caches also use per-slot solo forwards. The server admits at most four slots.
+// out_hidden, when set, receives slot `hidden_slot`'s final HC residual (n_embd * n_hc floats), as
+// qwen4exp_forward's out_hidden would, so that slot's MTP head can draft once it decodes alone.
 Qwen4ExpForwardResult qwen4exp_forward_batched(
                                        ggml_backend_t backend,
                                        const Qwen4ExpWeights & w,
@@ -142,6 +144,8 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
                                        const int32_t * positions,
                                        int n_slots,
                                        Qwen4ExpBatchedDecodeWorkspace & workspace,
-                                       std::vector<std::vector<float>> & out_logits);
+                                       std::vector<std::vector<float>> & out_logits,
+                                       int hidden_slot = -1,
+                                       std::vector<float> * out_hidden = nullptr);
 
 }  // namespace luce::common

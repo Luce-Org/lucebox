@@ -308,8 +308,6 @@ std::string check_feature_compatibility(
             if (args.device.is_layer_split() || args.device.is_tensor_parallel() ||
                 args.remote_target_shard.enabled())
                 return "qwen4exp full-cache concurrency requires one local target device";
-            if (args.draft_path.has_value() || args.verify_width > 1)
-                return "qwen4exp full-cache concurrency decodes without MTP; drop --draft and --verify-width";
         }
         // Qwen's graph is qualified through 64 lanes. DeepSeek's gathered
         // whole-model graph has a smaller, separately qualified ceiling.

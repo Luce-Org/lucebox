@@ -4,6 +4,7 @@
 #include "qwen4exp_graph.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <limits>
@@ -26,7 +27,8 @@ uint32_t pool_blocks(int max_ctx, size_t slots) {
 Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
         ggml_backend_t backend, const Qwen4ExpWeights & weights,
         std::vector<Qwen4ExpCache *> caches, int max_ctx, int prefill_granule,
-        size_t prefix_allowance)
+        size_t prefix_allowance, int verify_width, AdaptiveSpecWidth * mtp_width,
+        SpecWidthCostMemory * mtp_costs)
     : backend_(backend), weights_(weights), caches_(std::move(caches)),
       pool_(pool_blocks(max_ctx, caches_.size()),
             (uint32_t)caches_.size(), 256),
@@ -34,7 +36,12 @@ Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
       prefill_granule_(std::max(prefill_granule, 1)),
       prefix_allowance_(prefix_allowance),
       checkpoints_((size_t)kPrefixCheckpoints),
-      prefill_cuts_(caches_.size()) {}
+      prefill_cuts_(caches_.size()),
+      mtp_slot_(verify_width != 1 && !caches_.empty() && caches_[0] &&
+                qwen4exp_verify_supported(*caches_[0]) ? 0 : -1),
+      verify_width_(verify_width),
+      mtp_width_(mtp_width ? mtp_width : &own_mtp_width_),
+      mtp_costs_(mtp_costs ? mtp_costs : &own_mtp_costs_) {}
 
 Qwen4ExpSeqEngine::~Qwen4ExpSeqEngine() {
     ggml_backend_synchronize(backend_);
@@ -83,6 +90,15 @@ SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_cold(
     reset_qwen4exp_state(backend_, *caches_[(size_t)result.slot]);
     ggml_backend_synchronize(backend_);
     prefill_cuts_[(size_t)result.slot].clear();
+    if (result.slot == mtp_slot_) {
+        mtp_ = MtpState{};
+        mtp_.live = true;
+        mtp_.context = (int)prompt.size();
+        if (verify_width_ == 0) {   // as the single-slot loop starts a request
+            mtp_costs_->load(*mtp_width_, mtp_.context);
+            mtp_width_->carry_acceptance(QWEN4EXP_MTP_CARRIED_TRIALS);
+        }
+    }
     return result;
 }
 
@@ -159,6 +175,155 @@ SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_with_prefix(
         slots_.slot(slot).pending_capture = plan.capture;
         result.prefix_store.capture = plan.capture;
     }
+    return result;
+}
+
+// A prompt chunk of the MTP slot, as the single-slot loop runs it: chunks
+// fill the draft layer's K/V inline and keep the last trunk row pending; a
+// one-row chunk catches its pair up through the draft layer instead. The
+// pending row before the chunk is the cache's (mtp_prev_hidden at
+// mtp_prev_pos), so a cache restored from a prefix snapshot keeps drafting; a
+// cache without that row prefills plainly and its request decodes undrafted.
+bool Qwen4ExpSeqEngine::mtp_prefill(Qwen4ExpCache & cache, const int32_t * tokens, int n, int pos0,
+                                    std::vector<float> & logits) {
+    const size_t hd = (size_t)weights_.n_embd * weights_.n_hc;
+    mtp_.tok.clear();
+    if (pos0 > 0 && cache.mtp_prev_pos != pos0 - 1) {
+        mtp_.live = false;
+        mtp_.h.clear();
+        return qwen4exp_forward(backend_, weights_, cache, tokens, n, pos0, logits).ok;
+    }
+    mtp_.h.resize(pos0 > 0 ? hd : 0);
+    if (pos0 > 0) ggml_backend_tensor_get(cache.mtp_prev_hidden, mtp_.h.data(), 0, hd * sizeof(float));
+    mtp_.pos = std::max(0, pos0 - 1);
+    std::vector<float> hidden;
+    if (n > 1) {
+        if (!qwen4exp_forward(backend_, weights_, cache, tokens, n, pos0, logits, &hidden, false, true).ok)
+            return false;
+        mtp_.h.swap(hidden);
+        mtp_.pos = pos0 + n - 1;
+        return true;
+    }
+    if (!qwen4exp_forward(backend_, weights_, cache, tokens, 1, pos0, logits, &hidden).ok) return false;
+    if (pos0 > 0) mtp_.tok.assign(tokens, tokens + 1);
+    mtp_.h.insert(mtp_.h.end(), hidden.begin(), hidden.end());
+    if (!mtp_catch_up(cache, 0) || mtp_.h.size() != hd) return false;
+    ggml_backend_tensor_set(cache.mtp_prev_hidden, mtp_.h.data(), 0, hd * sizeof(float));
+    cache.mtp_prev_pos = pos0;
+    return true;
+}
+
+// Run all but `keep` pending pairs through the draft layer (K/V only).
+bool Qwen4ExpSeqEngine::mtp_catch_up(Qwen4ExpCache & cache, size_t keep) {
+    if (mtp_.tok.size() <= keep) return true;
+    const int n = (int)(mtp_.tok.size() - keep);
+    const size_t hd = (size_t)weights_.n_embd * weights_.n_hc;
+    std::vector<float> unused;
+    if (!qwen4exp_mtp_forward(backend_, weights_, cache, mtp_.tok.data(), mtp_.h.data(), n, mtp_.pos,
+                              unused, nullptr, /*kv_only=*/true)) return false;
+    mtp_.h.erase(mtp_.h.begin(), mtp_.h.begin() + (std::ptrdiff_t)((size_t)n * hd));
+    mtp_.tok.erase(mtp_.tok.begin(), mtp_.tok.begin() + n);
+    mtp_.pos += n;
+    return true;
+}
+
+bool Qwen4ExpSeqEngine::mtp_eligible(const StepPlan & plan) const {
+    return mtp_slot_ >= 0 && mtp_.live && plan.prefills.empty() &&
+        plan.decode.size() == 1 && plan.decode[0].slot == mtp_slot_ &&
+        plan.decode[0].allow_speculation;
+}
+
+// Draft, verify and roll back the MTP slot alone: the single-slot loop's step.
+// The accepted drafts are durable children of the output; the last emitted
+// token stays pending for the scheduler, as in one-token decode.
+SeqEngine::StepResult Qwen4ExpSeqEngine::mtp_step(const StepInput & input) {
+    StepResult result;
+    auto fail = [&result](const char * message) -> StepResult {
+        result.decode.clear();
+        result.error = message;
+        return std::move(result);
+    };
+    const int id = input.slot;
+    Qwen4ExpCache & cache = *caches_[(size_t)id];
+    SeqSlot & slot = slots_.slot(id);
+    const int pos = slot.cur_pos;
+    const size_t hd = (size_t)weights_.n_embd * weights_.n_hc;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto verify_builds = [&cache] {
+        uint64_t n = 0;
+        for (const auto & ws : cache.verify_workspace) n += ws.builds;
+        return n;
+    };
+    const uint64_t builds0 = verify_builds();
+
+    mtp_.tok.push_back(input.token);
+    const bool adaptive = verify_width_ == 0;
+    const int width = adaptive ? mtp_width_->next_width_cost_aware({}, cache.mtp_draft + 1) : cache.mtp_draft + 1;
+    const int k = std::max(0, std::min(width - 1, max_context() - pos - 1));
+    // After a stretch beside other requests, fold all but the last pair first.
+    if (k > 0 && mtp_.tok.size() > (size_t)QWEN4EXP_MTP_MAX_VERIFY && !mtp_catch_up(cache, 1))
+        return fail("qwen4exp MTP catch-up failed");
+    std::vector<int32_t> drafts;
+    if (k > 0 && !qwen4exp_mtp_draft(backend_, weights_, cache, mtp_.tok.data(), mtp_.h.data(),
+                                     (int)mtp_.tok.size(), mtp_.pos, k, drafts))
+        return fail("qwen4exp MTP draft failed");
+    const auto t_draft = std::chrono::steady_clock::now();
+    std::array<int32_t, QWEN4EXP_MTP_MAX_VERIFY> in{}, samples{};
+    in[0] = input.token;
+    std::copy(drafts.begin(), drafts.end(), in.begin() + 1);
+    std::vector<float> logits, hidden;
+    if (!qwen4exp_forward(backend_, weights_, cache, in.data(), k + 1, pos, logits, &hidden, k > 0).ok ||
+        logits.size() != (size_t)(k + 1) * weights_.n_vocab || hidden.size() < hd)
+        return fail("qwen4exp MTP verify forward failed");
+    const auto t_verify = std::chrono::steady_clock::now();
+
+    // Sample rows as one-token decode would, each after its own fed token.
+    const size_t history0 = slot.sample_history.size();
+    Qwen4ExpMtpAcceptance decision;
+    for (int i = 0; i <= k; ++i) {
+        slot.sample_history.push_back(in[(size_t)i]);
+        const float * row = logits.data() + (size_t)i * weights_.n_vocab;
+        samples[(size_t)i] = slot.sampler.needs_logit_processing()
+            ? sample_logits(row, weights_.n_vocab, slot.sampler, slot.sample_history, slot.rng)
+            : (int32_t)(std::max_element(row, row + weights_.n_vocab) - row);
+        decision = qwen4exp_mtp_accept(drafts.data(), k, samples.data(), i + 1);
+        if (decision.n_accepted != i + 1 || token_is_eos(samples[(size_t)i])) break;
+    }
+    slot.sample_history.resize(history0);
+    const int retained = decision.n_emitted;
+    if (k > 0) {
+        mtp_.h.assign(hidden.begin(), hidden.begin() + (std::ptrdiff_t)((size_t)retained * hd));
+        mtp_.tok.assign(decision.emitted.begin(), decision.emitted.begin() + retained - 1);
+        mtp_.pos = pos;
+        if (!qwen4exp_verify_rollback(backend_, weights_, cache, pos, retained))
+            return fail("qwen4exp verify rollback failed");
+    } else {
+        mtp_.h.insert(mtp_.h.end(), hidden.begin(), hidden.begin() + (std::ptrdiff_t)hd);
+    }
+    ggml_backend_synchronize(backend_);
+    cache.cur_pos = pos + retained;
+    const auto appended = slots_.append_tokens(id, in.data(), retained);
+    if (!appended.ok || appended.position != pos) return fail("qwen4exp MTP reservation failed");
+    slots_.commit_step(id);
+
+    const auto t_end = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t_end - t0).count();
+    mtp_.draft_s += std::chrono::duration<double>(t_draft - t0).count();
+    mtp_.verify_s += std::chrono::duration<double>(t_verify - t_draft).count();
+    mtp_.verify_builds += verify_builds() - builds0;
+    if (k > 0 && adaptive)
+        mtp_width_->observe(decision.n_accepted + 1, k + 1, verify_builds() != builds0 ? -1.0f : (float)ms);
+    ++mtp_.steps;
+    mtp_.drafts += k;
+    mtp_.accepted += decision.n_accepted;
+    mtp_.tokens += retained;
+    mtp_.decode_s += ms / 1e3;
+
+    DecodeOutput output;
+    output.slot = id;
+    output.token = decision.emitted[(size_t)retained - 1];
+    output.committed_tokens.assign(decision.emitted.begin(), decision.emitted.begin() + retained - 1);
+    result.decode.push_back(std::move(output));
     return result;
 }
 
@@ -245,6 +410,11 @@ bool Qwen4ExpSeqEngine::reserve_decode(const StepPlan & plan) {
         growth[(size_t)input.slot] = 1;
         assigned[(size_t)input.slot] = 1;
     }
+    if (mtp_eligible(plan)) {
+        const int slot = plan.decode[0].slot;
+        growth[(size_t)slot] = std::max(1, std::min(caches_[(size_t)slot]->mtp_draft + 1,
+                                                    max_context() - slots_.slot(slot).cur_pos));
+    }
     const StepPlanLimits limits = step_plan_limits((int)plan.decode.size());
     if (plan.prefills.size() > (size_t)limits.max_prefill_sequences) return false;
     int prefill_total = 0;
@@ -305,6 +475,7 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
         seen[(size_t)slice.slot] = 1;
     }
     if (plan.decode.empty() && plan.prefills.empty()) return result;
+    if (mtp_eligible(plan)) return mtp_step(plan.decode[0]);
 
     struct PendingPrefill {
         int slot;
@@ -360,22 +531,40 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
         tokens.reserve(plan.decode.size());
         positions.reserve(plan.decode.size());
         caches.reserve(plan.decode.size());
+        int hidden_slot = -1;
         for (size_t i = 0; i < plan.decode.size(); ++i) {
             tokens.push_back(plan.decode[i].token);
             positions.push_back(decode_positions[i]);
             caches.push_back(caches_[(size_t) plan.decode[i].slot]);
+            if (plan.decode[i].slot == mtp_slot_ && mtp_.live) hidden_slot = (int)i;
         }
+        // The MTP slot's trunk row keeps its draft layer caught up for when it decodes alone again.
+        std::vector<float> hidden;
         const auto forward = qwen4exp_forward_batched(
             backend_, weights_, caches.data(), tokens.data(), positions.data(),
-            (int)tokens.size(), decode_workspace_, logits);
+            (int)tokens.size(), decode_workspace_, logits, hidden_slot,
+            hidden_slot >= 0 ? &hidden : nullptr);
         if (!forward.ok || logits.size() != tokens.size())
             return fail("qwen4exp batched decode forward failed");
+        if (hidden_slot >= 0) {
+            const size_t hd = (size_t)weights_.n_embd * weights_.n_hc;
+            mtp_.tok.push_back(tokens[(size_t)hidden_slot]);
+            if (hidden.size() != hd) {
+                mtp_.live = false;   // no trunk row: this request decodes without drafts from here on
+            } else {
+                mtp_.h.insert(mtp_.h.end(), hidden.begin(), hidden.end());
+                if (mtp_.tok.size() >= 64 && !mtp_catch_up(*caches_[(size_t)mtp_slot_], 0))
+                    return fail("qwen4exp MTP catch-up failed");
+            }
+        }
     }
     logits.resize(forward_segments.size());
     for (size_t i = plan.decode.size(); i < forward_segments.size(); ++i) {
         const auto & segment = forward_segments[i];
-        if (!qwen4exp_forward(backend_, weights_, *segment.cache, segment.tokens,
-                             segment.n_tokens, segment.pos0, logits[i]).ok)
+        const bool mtp = mtp_slot_ >= 0 && mtp_.live && segment.cache == caches_[(size_t)mtp_slot_];
+        if (mtp ? !mtp_prefill(*segment.cache, segment.tokens, segment.n_tokens, segment.pos0, logits[i])
+                : !qwen4exp_forward(backend_, weights_, *segment.cache, segment.tokens,
+                                    segment.n_tokens, segment.pos0, logits[i]).ok)
             return fail("qwen4exp solo prefill forward failed");
     }
     if (std::any_of(logits.begin(), logits.end(), [this](const auto & row) {
@@ -427,6 +616,22 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
 
 void Qwen4ExpSeqEngine::retire(int slot) {
     if (slot < 0 || slot >= slot_count()) return;
+    if (slot == mtp_slot_ && mtp_.context > 0) {
+        if (mtp_.drafts > 0) {
+            std::fprintf(stderr,
+                "[qwen4exp-mtp] slot=%d drafts=%lld accepted=%lld rate=%.3f tokens_per_step=%.3f "
+                "decode=%.2f tok/s mtp_steps=%lld live=%d step_ms=%.1f draft_ms=%.1f verify_ms=%.1f "
+                "verify_builds=%llu batched_builds=%llu batched_replays=%llu\n",
+                slot, mtp_.drafts, mtp_.accepted, (double)mtp_.accepted / (double)mtp_.drafts,
+                mtp_.steps > 0 ? (double)mtp_.tokens / (double)mtp_.steps : 0.0,
+                mtp_.decode_s > 0.0 ? (double)mtp_.tokens / mtp_.decode_s : 0.0, mtp_.steps, (int)mtp_.live,
+                1e3 * mtp_.decode_s / (double)mtp_.steps, 1e3 * mtp_.draft_s / (double)mtp_.steps,
+                1e3 * mtp_.verify_s / (double)mtp_.steps, (unsigned long long)mtp_.verify_builds,
+                (unsigned long long)decode_workspace_.builds, (unsigned long long)decode_workspace_.replays);
+        }
+        if (verify_width_ == 0) mtp_costs_->store(*mtp_width_, mtp_.context);
+        mtp_ = MtpState{};
+    }
     ggml_backend_synchronize(backend_);
     if (slots_.is_active(slot)) slots_.retire(slot);
     prefill_cuts_[(size_t)slot].clear();

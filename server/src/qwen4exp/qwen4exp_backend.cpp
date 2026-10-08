@@ -173,9 +173,10 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
             batched = std::max(batched, resident);
         }
     }
-    // The decode workspaces stay resident while the next prompt prefills.
+    // The decode workspaces stay resident while the next prompt prefills. Only
+    // this cache drafts and verifies; the other concurrency slots decode only.
     const size_t fixed = (slots - resident_slots) * state + shadow + shadow_tmp +
-                         slots * (decode + verify + draft) + batched;
+                         slots * decode + verify + draft + batched;
     std::fprintf(stderr, "[qwen4exp] chunk-runtime mtp=%d decode=%zu verify=%zu draft=%zu batched=%zu scratch=%zu host=%zu\n",
         (int) mtp, decode, verify, draft, batched, runtime_scratch, runtime_host);
     // Split mode: the expert device's MoE id helper bounds a chunk. With hot experts the target keeps no slack for
@@ -239,12 +240,8 @@ bool Qwen4ExpBackend::init() {
         std::fprintf(stderr, "[qwen4exp] --max-concurrency must be between 1 and 4\n");
         return false;
     }
-    // ponytail: concurrent slots decode without MTP (the seq engine replaces the
-    // serial loop that owns speculation); per-slot MTP is follow-up.
-    if (cfg_.max_concurrency > 1 && cfg_.verify_width != 1) {
-        std::fprintf(stderr, "[qwen4exp] --max-concurrency %d: MTP off\n", cfg_.max_concurrency);
-        cfg_.verify_width = 1;
-    }
+    // MTP stays on with concurrent slots: the first slot's cache drafts and
+    // verifies whenever its request decodes alone (Qwen4ExpSeqEngine).
     if (cfg_.device.is_layer_split()) {
         std::fprintf(stderr, "[qwen4exp] layer split is not supported yet\n");
         return false;
@@ -356,7 +353,8 @@ bool Qwen4ExpBackend::start_seq_engine() {
         caches.push_back(&cache);
     }
     seq_engine_ = std::make_unique<Qwen4ExpSeqEngine>(
-        backend_, weights_, std::move(caches), cfg_.device.max_ctx, chunk_, snapshot_budget_);
+        backend_, weights_, std::move(caches), cfg_.device.max_ctx, chunk_, snapshot_budget_,
+        cfg_.verify_width, &mtp_width_, &mtp_costs_);
     std::fprintf(stderr,
         "[qwen4exp-seq] independent-slot engine enabled: %d full F16 caches, ctx=%d, chunk=%d\n",
         cfg_.max_concurrency, cfg_.device.max_ctx, chunk_);

@@ -2658,13 +2658,13 @@ bool qwen4exp_can_batch(const Qwen4ExpWeights & w,
 
 static Qwen4ExpForwardResult forward_sequential(ggml_backend_t backend,
         const Qwen4ExpWeights & w, const Qwen4ExpForwardSegment * segments, int n_segments,
-        std::vector<std::vector<float>> & out_logits) {
+        std::vector<std::vector<float>> & out_logits, int hidden_slot = -1, std::vector<float> * out_hidden = nullptr) {
     Qwen4ExpForwardResult result;
     out_logits.resize((size_t) n_segments);
     for (int s = 0; s < n_segments; ++s) {
         const auto & segment = segments[s];
         if (!qwen4exp_forward(backend, w, *segment.cache, segment.tokens,
-                segment.n_tokens, segment.pos0, out_logits[s]).ok) {
+                segment.n_tokens, segment.pos0, out_logits[s], s == hidden_slot ? out_hidden : nullptr).ok) {
             out_logits.clear();
             return result;
         }
@@ -2686,7 +2686,7 @@ static int64_t batched_span(const Qwen4ExpCache & cache, int32_t pos, bool qsa) 
 // convolution against the slot's own cache.
 static bool build_batched_decode_nodes(ggml_context * ctx, const Qwen4ExpWeights & w,
         Qwen4ExpCache * const * caches, int n_slots, bool has_ple, bool use_qsa,
-        const std::vector<int64_t> & spans, Qwen4ExpBatchedDecodeWorkspace & ws) {
+        const std::vector<int64_t> & spans, bool with_hidden, Qwen4ExpBatchedDecodeWorkspace & ws) {
     const bool split = w.expert_backend != nullptr;
     const int64_t T = n_slots;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 200000, false);
@@ -2866,6 +2866,13 @@ static bool build_batched_decode_nodes(ggml_context * ctx, const Qwen4ExpWeights
     ws.logits = ggml_mul_mat(ctx, w.output, lb.output_mix(res_hc, xn_next));
     ggml_set_output(ws.logits);
     ggml_build_forward_expand(gf, ws.logits);
+    // Appended after the logits, which keep their node order: the slots' final HC residuals.
+    ws.hidden = nullptr;
+    if (with_hidden) {
+        ws.hidden = ggml_cont(ctx, res_hc);
+        ggml_set_output(ws.hidden);
+        ggml_build_forward_expand(gf, ws.hidden);
+    }
     ws.groups.clear();
     for (const SlotGroup & G : groups) ws.groups.push_back({G.positions, G.s0, G.n});
     ws.gf = gf;
@@ -2876,9 +2883,9 @@ static bool build_batched_decode_nodes(ggml_context * ctx, const Qwen4ExpWeights
 // width's graph, it keeps its own split scheduler beside it.
 static bool build_batched_decode_graph(ggml_backend_t backend, const Qwen4ExpWeights & w,
         Qwen4ExpCache * const * caches, int n_slots, bool has_ple, bool use_qsa,
-        const std::vector<int64_t> & spans, Qwen4ExpBatchedDecodeWorkspace & ws) {
+        const std::vector<int64_t> & spans, bool with_hidden, Qwen4ExpBatchedDecodeWorkspace & ws) {
     ggml_context * ctx = graph_context(&ws, backend, w, caches[0]->max_ctx, /*verify=*/true);
-    if (!ctx || !build_batched_decode_nodes(ctx, w, caches, n_slots, has_ple, use_qsa, spans, ws)) {
+    if (!ctx || !build_batched_decode_nodes(ctx, w, caches, n_slots, has_ple, use_qsa, spans, with_hidden, ws)) {
         return false;
     }
     int64_t kv_len = 0;
@@ -2908,7 +2915,7 @@ Qwen4ExpGraphMemory qwen4exp_batched_graph_memory(ggml_backend_t backend, const 
     Qwen4ExpBatchedDecodeWorkspace plan;
     if (build_batched_decode_nodes(ctx, w, caches.data(), n_slots,
             w.ple_reader.available() && !cache.ple_layer_ids.empty(), w.qsa,
-            std::vector<int64_t>((size_t) n_slots, batched_span(cache, pos, qsa)), plan)) {
+            std::vector<int64_t>((size_t) n_slots, batched_span(cache, pos, qsa)), /*with_hidden=*/true, plan)) {
         memory.graph = 0;
         graph_memory(backend, ctx, plan.gf, w.gfx1151, memory);
     }
@@ -2921,9 +2928,10 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
         Qwen4ExpCache * const * caches, const int32_t * tokens,
         const int32_t * positions, int n_slots,
         Qwen4ExpBatchedDecodeWorkspace & workspace,
-        std::vector<std::vector<float>> & out_logits) {
+        std::vector<std::vector<float>> & out_logits, int hidden_slot, std::vector<float> * out_hidden) {
     Qwen4ExpForwardResult result;
     if (!backend || !caches || !tokens || !positions || n_slots <= 0) return result;
+    if (hidden_slot < 0 || hidden_slot >= n_slots) out_hidden = nullptr;
     const bool split = w.expert_backend != nullptr;
     const Qwen4ExpCudaScope profile(w.gfx1151 || w.expert_gfx1151);
     out_logits.clear();
@@ -2933,7 +2941,7 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
     if (n_slots == 1) {
         if (!caches[0]) return result;
         std::vector<float> logits;
-        result = qwen4exp_forward(backend, w, *caches[0], tokens, 1, positions[0], logits);
+        result = qwen4exp_forward(backend, w, *caches[0], tokens, 1, positions[0], logits, out_hidden);
         if (result.ok) {
             out_logits.assign(1, std::move(logits));
         }
@@ -2959,7 +2967,7 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
             qsa_rows = false;
     }
     if (!qwen4exp_can_batch(w, segments, n_slots, w.qsa, qsa_rows))
-        return forward_sequential(backend, w, segments, n_slots, out_logits);
+        return forward_sequential(backend, w, segments, n_slots, out_logits, hidden_slot, out_hidden);
 
     const bool has_ple = w.ple_reader.available() && !caches[0]->ple_layer_ids.empty();
     const int64_t ple_heads = w.ple_n_heads;
@@ -3020,11 +3028,12 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
             !bootstrap_qsa_prefix(backend, w, *caches[s], positions[s])) return result;
         spans[(size_t) s] = batched_span(*caches[s], positions[s], qsa_slot[(size_t) s]);
     }
+    const bool with_hidden = out_hidden != nullptr;
     const bool replay = workspace.gf && !stable_workspace_stale(workspace, backend, w, caches[0]->max_ctx) &&
-        workspace.spans == spans &&
+        workspace.spans == spans && (workspace.hidden != nullptr) == with_hidden &&
         workspace.caches == std::vector<const Qwen4ExpCache *>(caches, caches + n_slots);
     if (!replay && !build_batched_decode_graph(backend, w, caches, n_slots, has_ple, w.qsa,
-                                               spans, workspace)) return result;
+                                               spans, with_hidden, workspace)) return result;
     ++(replay ? workspace.replays : workspace.builds);
 
     ggml_backend_tensor_set(workspace.inp_emb, emb.data(), 0, emb.size() * sizeof(float));
@@ -3082,6 +3091,16 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
     for (int s = 0; s < n_slots; ++s) {
         out_logits[(size_t) s].assign(packed.begin() + (size_t) s * w.n_vocab,
                                       packed.begin() + (size_t) (s + 1) * w.n_vocab);
+    }
+    if (out_hidden) {
+        const size_t hd = (size_t) w.n_embd * w.n_hc;
+        if ((size_t) ggml_nelements(workspace.hidden) != hd * (size_t) n_slots) {
+            out_hidden->clear();
+        } else {
+            out_hidden->resize(hd);
+            ggml_backend_tensor_get(workspace.hidden, out_hidden->data(), (size_t) hidden_slot * hd * sizeof(float),
+                                    hd * sizeof(float));
+        }
     }
     if (has_ple) {
         for (int s = 0; s < n_slots; ++s) caches[s]->ple_prev = std::move(next_prev[s]);

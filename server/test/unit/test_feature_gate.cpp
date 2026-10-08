@@ -578,15 +578,14 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
         qwen.paged_attention = false;
         qwen.kv_pool_tokens = 32768;
         CHECK(!gate_result(qwen, "qwen4exp", backend).empty());
-        // Slots decode without MTP: implicit discovery is switched off, explicit requests refused.
+        // A request decoding alone drafts with MTP: explicit widths and drafters are accepted.
         qwen.kv_pool_tokens = 0;
-        qwen.verify_width = 1;
-        CHECK(gate_result(qwen, "qwen4exp", backend).empty());
-        qwen.verify_width = 3;
-        CHECK(gate_result(qwen, "qwen4exp", backend).find("MTP") != std::string::npos);
-        qwen.verify_width = 0;
+        for (int width : {0, 1, 3}) {
+            qwen.verify_width = width;
+            CHECK(gate_result(qwen, "qwen4exp", backend).empty());
+        }
         qwen.draft_path = "/nonexistent/mtp.gguf";
-        CHECK(gate_result(qwen, "qwen4exp", backend).find("MTP") != std::string::npos);
+        CHECK(gate_result(qwen, "qwen4exp", backend).empty());
     }
 
     BackendArgs parallel = paged;

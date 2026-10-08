@@ -4,6 +4,7 @@
 #include "common/concurrency/seq_engine.h"
 #include "common/concurrency/seq_slot_manager.h"
 #include "qwen4exp_cache.h"
+#include "qwen4exp_mtp.h"
 
 #include <cstddef>
 #include <memory>
@@ -27,13 +28,28 @@ namespace luce::common {
 // restorable into any slot of the same layout. The scheduler owns their
 // identities (1..kPrefixCheckpoints) and LRU policy; the engine enforces the
 // backend's byte allowance on capture.
+//
+// The first slot's cache carries the MTP draft layer and verify rollback state
+// (one set: its rollback buffers are close to 1 GiB). Admission takes the lowest
+// free slot, so a request arriving at an idle server lands there. It drafts and
+// verifies like the single-slot loop while it is the only decoder with nothing
+// prefilling, returning accepted drafts as committed tokens; beside other work
+// it decodes one token per step in the batched graph, which still returns its
+// final HC residual, so its draft layer stays caught up and drafting resumes
+// once it is alone again. Concurrent serving loads no hot experts, so its
+// verify rows compute every pick where the multi-slot rows do and a request's
+// text does not depend on the other requests. The
+// draft layer's state sits in the cache (K/V, mtp_prev_hidden at mtp_prev_pos)
+// at every prompt-chunk boundary, where prefix snapshots capture it.
 class Qwen4ExpSeqEngine final : public SeqEngine {
 public:
     static constexpr int kPrefixCheckpoints = 64;
 
     Qwen4ExpSeqEngine(ggml_backend_t backend, const Qwen4ExpWeights & weights,
                       std::vector<Qwen4ExpCache *> caches, int max_ctx,
-                      int prefill_granule = 512, size_t prefix_allowance = 0);
+                      int prefill_granule = 512, size_t prefix_allowance = 0,
+                      int verify_width = 1, AdaptiveSpecWidth * mtp_width = nullptr,
+                      SpecWidthCostMemory * mtp_costs = nullptr);
     ~Qwen4ExpSeqEngine() override;
 
     int slot_count() const override { return slots_.slot_count(); }
@@ -60,6 +76,24 @@ private:
     // Rows the slot's next prompt forward covers: up to one granule, the next
     // restore point, a pending capture boundary, the prompt's end and `max_tokens`.
     int prefill_segment(int slot, int max_tokens) const;
+    // Pairs (trunk hidden h_p, token x_{p+1}) of the MTP slot not yet through the
+    // draft layer, from position `pos`. Between steps `h` has one more row than
+    // `tok`: the scheduler's pending token completes the last pair.
+    struct MtpState {
+        bool live = false;
+        std::vector<float> h;
+        std::vector<int32_t> tok;
+        int pos = 0;
+        int context = 0;   // the prompt length: the width controller's context range
+        long long drafts = 0, accepted = 0, steps = 0, tokens = 0;
+        double decode_s = 0.0, draft_s = 0.0, verify_s = 0.0;
+        uint64_t verify_builds = 0;
+    };
+    bool mtp_prefill(Qwen4ExpCache & cache, const int32_t * tokens, int n, int pos0,
+                     std::vector<float> & logits);
+    bool mtp_catch_up(Qwen4ExpCache & cache, size_t keep);
+    bool mtp_eligible(const StepPlan & plan) const;
+    StepResult mtp_step(const StepInput & input);
 
     ggml_backend_t backend_;
     const Qwen4ExpWeights & weights_;
@@ -71,6 +105,15 @@ private:
     size_t prefix_allowance_;
     std::vector<Qwen4ExpSnapshot> checkpoints_;
     std::vector<std::vector<int>> prefill_cuts_;   // per slot: restore points, ascending
+    int mtp_slot_ = -1;
+    int verify_width_ = 1;
+    MtpState mtp_;
+    // The adaptive verify width and its costs per context range: the single-slot
+    // loop's when the backend passes them (else this engine's own).
+    AdaptiveSpecWidth own_mtp_width_ = qwen4exp_mtp_width_controller();
+    SpecWidthCostMemory own_mtp_costs_;
+    AdaptiveSpecWidth * mtp_width_;
+    SpecWidthCostMemory * mtp_costs_;
 };
 
 } // namespace luce::common
