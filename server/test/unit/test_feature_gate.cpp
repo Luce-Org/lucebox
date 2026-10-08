@@ -17,7 +17,6 @@
 
 #include <climits>
 #include <cstdio>
-#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -533,8 +532,39 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     dense.max_concurrency = 2;
     CHECK(!gate_result(dense, "qwen35", PlacementBackend::Cuda).empty());
 
-    // qwen4exp has no paged decode path; multiple slots are always rejected.
-    CHECK(!gate_result(dense, "qwen4exp", PlacementBackend::Cuda).empty());
+    // qwen4exp uses full per-slot caches, selected by the slot count alone.
+    for (const auto backend : {PlacementBackend::Cuda, PlacementBackend::Hip}) {
+        BackendArgs qwen = dense;
+        for (int ctx : {8192, 32768}) {
+            qwen.device.max_ctx = ctx;
+            for (int slots : {1, 2, 3, 4}) {
+                qwen.max_concurrency = slots;
+                CHECK(gate_result(qwen, "qwen4exp", backend).empty());
+            }
+        }
+        qwen.max_concurrency = 5;
+        CHECK(gate_result(qwen, "qwen4exp", backend).find("at most 4") != std::string::npos);
+        qwen.max_concurrency = 0;
+        CHECK(!gate_result(qwen, "qwen4exp", backend).empty());
+        qwen.max_concurrency = 4;
+        qwen.device.max_ctx = 0;
+        CHECK(!gate_result(qwen, "qwen4exp", backend).empty());
+        qwen.device.max_ctx = 32768;
+        qwen.paged_attention = true;
+        CHECK(!gate_result(qwen, "qwen4exp", backend).empty());
+        qwen.paged_attention = false;
+        qwen.kv_pool_tokens = 32768;
+        CHECK(!gate_result(qwen, "qwen4exp", backend).empty());
+        // Slots decode without MTP: implicit discovery is switched off, explicit requests refused.
+        qwen.kv_pool_tokens = 0;
+        qwen.verify_width = 1;
+        CHECK(gate_result(qwen, "qwen4exp", backend).empty());
+        qwen.verify_width = 3;
+        CHECK(gate_result(qwen, "qwen4exp", backend).find("MTP") != std::string::npos);
+        qwen.verify_width = 0;
+        qwen.draft_path = "/nonexistent/mtp.gguf";
+        CHECK(gate_result(qwen, "qwen4exp", backend).find("MTP") != std::string::npos);
+    }
 
     BackendArgs parallel = paged;
     parallel.max_concurrency = 2;
