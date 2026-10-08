@@ -1956,40 +1956,41 @@ static __global__ void mul_mat_vec_q_moe_grouped(
     if constexpr (type == GGML_TYPE_Q2_0_ROCMFP2 && !fp2_packed32 && fp2_prefetch) {
         mul_mat_vec_q_moe_fp2_prefetch<c_rows_per_block, has_fusion>(
             vx, vgate, use_gate, y, kbx_offset, stride_row_x, blocks_per_row_x, tmp, tmp_gate);
-    } else
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1);
-        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+    } else {
+        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
 #pragma unroll
-        for (int i = 0; i < c_rows_per_block; ++i) {
-            if constexpr (fp2_packed32) {
-                tmp[i] += vec_dot_rocmfpx_fp2_q8_1_packed32(
-                    vx, &y[kby],
-                    kbx_offset + i*stride_row_x + kbx, kqs);
-            } else if constexpr (fp3_packed24) {
-                tmp[i] += vec_dot_rocmfpx_fp3_q8_1_packed24(
-                    vx, &y[kby],
-                    kbx_offset + i*stride_row_x + kbx, kqs);
-            } else {
-                tmp[i] += vec_dot_q_cuda(
-                    vx, &y[kby],
-                    kbx_offset + i*stride_row_x + kbx, kqs);
-            }
-            if constexpr (has_fusion) {
-                if (use_gate) {
-                    if constexpr (fp2_packed32) {
-                        tmp_gate[i] += vec_dot_rocmfpx_fp2_q8_1_packed32(
-                            vgate, &y[kby],
-                            kbx_offset + i*stride_row_x + kbx, kqs);
-                    } else if constexpr (fp3_packed24) {
-                        tmp_gate[i] += vec_dot_rocmfpx_fp3_q8_1_packed24(
-                            vgate, &y[kby],
-                            kbx_offset + i*stride_row_x + kbx, kqs);
-                    } else {
-                        tmp_gate[i] += vec_dot_q_cuda(
-                            vgate, &y[kby],
-                            kbx_offset + i*stride_row_x + kbx, kqs);
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                if constexpr (fp2_packed32) {
+                    tmp[i] += vec_dot_rocmfpx_fp2_q8_1_packed32(
+                        vx, &y[kby],
+                        kbx_offset + i*stride_row_x + kbx, kqs);
+                } else if constexpr (fp3_packed24) {
+                    tmp[i] += vec_dot_rocmfpx_fp3_q8_1_packed24(
+                        vx, &y[kby],
+                        kbx_offset + i*stride_row_x + kbx, kqs);
+                } else {
+                    tmp[i] += vec_dot_q_cuda(
+                        vx, &y[kby],
+                        kbx_offset + i*stride_row_x + kbx, kqs);
+                }
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        if constexpr (fp2_packed32) {
+                            tmp_gate[i] += vec_dot_rocmfpx_fp2_q8_1_packed32(
+                                vgate, &y[kby],
+                                kbx_offset + i*stride_row_x + kbx, kqs);
+                        } else if constexpr (fp3_packed24) {
+                            tmp_gate[i] += vec_dot_rocmfpx_fp3_q8_1_packed24(
+                                vgate, &y[kby],
+                                kbx_offset + i*stride_row_x + kbx, kqs);
+                        } else {
+                            tmp_gate[i] += vec_dot_q_cuda(
+                                vgate, &y[kby],
+                                kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
@@ -2814,44 +2815,6 @@ static bool mmvq_q8_0_rdna4_enabled() {
     return enabled;
 }
 
-// A Q8_0 gate/up pair (two MUL_MATs on the same activations) whose SwiGLU-DS4
-// reads exactly their outputs, at 2..8 columns of batch-invariant products on
-// RDNA4: ggml_cuda_mul_mat_vec_q with the gate as fusion runs it as one launch
-// of mul_mat_vec_q8_0_rdna4, bit-identical to the two products and the GLU
-// kernel (the caller rules out split buffers). LUCE_CUDA_MMVQ_Q8_RDNA4_GLU=0
-// keeps three launches.
-bool ggml_cuda_mmvq_rdna4_glu_pair(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu) {
-    static const bool enabled = []() {
-        const char * e = std::getenv("LUCE_CUDA_MMVQ_Q8_RDNA4_GLU");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
-    if (!enabled || !mmvq_q8_0_rdna4_enabled() || !ggml_cuda_mmvq_batch_invariant()) return false;
-    const int device = ggml_cuda_get_device();
-    const int cc = ggml_cuda_info().devices[device].cc;
-    if (!GGML_CUDA_CC_IS_RDNA4(cc) || ggml_cuda_info().devices[device].warp_size != 32 ||
-        get_device_table_id(cc) != MMVQ_PARAMETERS_RDNA4 ||
-        calc_nwarps(GGML_TYPE_Q8_0, 1, MMVQ_PARAMETERS_RDNA4) != 8) {
-        return false;
-    }
-    if (gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT) return false;
-    const ggml_tensor * g0 = gate->src[0];
-    const ggml_tensor * u0 = up->src[0];
-    const ggml_tensor * x  = up->src[1];
-    if (g0->type != GGML_TYPE_Q8_0 || u0->type != GGML_TYPE_Q8_0 || gate->src[1] != x ||
-        !ggml_are_same_shape(g0, u0) || !ggml_are_same_stride(g0, u0) ||
-        x->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
-        x->ne[2] != 1 || x->ne[3] != 1 || g0->ne[2] != 1 || g0->ne[3] != 1) {
-        return false;
-    }
-    if (x->ne[1] < 2 || x->ne[1] > MMVQ_Q8_RDNA4_MAX_COLS) return false;
-    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_DS4 ||
-        glu->src[0] != gate || glu->src[1] != up || ggml_get_op_params_i32(glu, 1) != 0 ||
-        glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
-        return false;
-    }
-    return true;
-}
-
 template <int ncols_dst, int c_rows, int c_vw, int c_row_groups>
 static void mul_mat_vec_q8_0_rdna4_launch_cfg(
         const void * vx, const void * vy, float * dst,
@@ -2967,6 +2930,49 @@ static void mul_mat_vec_q8_0_rdna4_launch(
 #undef Q8_RDNA4_NC
 }
 #endif // defined(GGML_USE_HIP)
+
+// A Q8_0 gate/up pair (two MUL_MATs on the same activations) whose SwiGLU-DS4
+// reads exactly their outputs, at 2..8 columns of batch-invariant products on
+// RDNA4: ggml_cuda_mul_mat_vec_q with the gate as fusion runs it as one launch
+// of mul_mat_vec_q8_0_rdna4, bit-identical to the two products and the GLU
+// kernel (the caller rules out split buffers). LUCE_CUDA_MMVQ_Q8_RDNA4_GLU=0
+// keeps three launches.
+bool ggml_cuda_mmvq_rdna4_glu_pair(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu) {
+#if defined(GGML_USE_HIP)
+    static const bool enabled = []() {
+        const char * e = std::getenv("LUCE_CUDA_MMVQ_Q8_RDNA4_GLU");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    if (!enabled || !mmvq_q8_0_rdna4_enabled() || !ggml_cuda_mmvq_batch_invariant()) return false;
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA4(cc) || ggml_cuda_info().devices[device].warp_size != 32 ||
+        get_device_table_id(cc) != MMVQ_PARAMETERS_RDNA4 ||
+        calc_nwarps(GGML_TYPE_Q8_0, 1, MMVQ_PARAMETERS_RDNA4) != 8) {
+        return false;
+    }
+    if (gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT) return false;
+    const ggml_tensor * g0 = gate->src[0];
+    const ggml_tensor * u0 = up->src[0];
+    const ggml_tensor * x  = up->src[1];
+    if (g0->type != GGML_TYPE_Q8_0 || u0->type != GGML_TYPE_Q8_0 || gate->src[1] != x ||
+        !ggml_are_same_shape(g0, u0) || !ggml_are_same_stride(g0, u0) ||
+        x->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+        x->ne[2] != 1 || x->ne[3] != 1 || g0->ne[2] != 1 || g0->ne[3] != 1) {
+        return false;
+    }
+    if (x->ne[1] < 2 || x->ne[1] > MMVQ_Q8_RDNA4_MAX_COLS) return false;
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_DS4 ||
+        glu->src[0] != gate || glu->src[1] != up || ggml_get_op_params_i32(glu, 1) != 0 ||
+        glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
+        return false;
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(gate, up, glu);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
 
 // True when the single-column launch for this type, device and K is the generic kernel with one wave per row:
 // each lane walks K in the same order and one warp reduction sums the row, which is also what the multi-token
