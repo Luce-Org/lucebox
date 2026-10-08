@@ -25,13 +25,13 @@ uint32_t pool_blocks(int max_ctx, size_t slots) {
 
 Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
         ggml_backend_t backend, const Qwen4ExpWeights & weights,
-        std::vector<Qwen4ExpCache *> caches, int max_ctx, int prefill_chunk,
+        std::vector<Qwen4ExpCache *> caches, int max_ctx, int prefill_granule,
         size_t prefix_allowance)
     : backend_(backend), weights_(weights), caches_(std::move(caches)),
       pool_(pool_blocks(max_ctx, caches_.size()),
             (uint32_t)caches_.size(), 256),
       slots_(pool_, max_ctx),
-      prefill_chunk_(std::max(prefill_chunk, 1)),
+      prefill_granule_(std::max(prefill_granule, 1)),
       prefix_allowance_(prefix_allowance),
       checkpoints_((size_t)kPrefixCheckpoints) {}
 
@@ -206,15 +206,22 @@ PrefixStoreEvent Qwen4ExpSeqEngine::capture_prefix(int slot, PrefixCaptureTicket
 int Qwen4ExpSeqEngine::prefill_segment(int slot, int max_tokens) const {
     const SeqSlot & s = slots_.slot(slot);
     int end = std::min(s.prompt_len, s.cur_pos + max_tokens);
+    end = std::min(end, (s.cur_pos / prefill_granule_ + 1) * prefill_granule_);
     const PrefixCaptureTicket & capture = s.pending_capture;
     if (capture.valid() && s.cur_pos < capture.checkpoint.tokens)
         end = std::min(end, capture.checkpoint.tokens);
     return end - s.cur_pos;
 }
 
+// One granule per prompt forward, whatever the step carries. While slots
+// decode, one granule in total per step bounds the hold on the live streams.
 StepPlanLimits Qwen4ExpSeqEngine::step_plan_limits(int decode_rows) const {
     const int prefill_slots = slot_count() - std::clamp(decode_rows, 0, slot_count());
-    return {prefill_slots, prefill_chunk_, prefill_slots * prefill_chunk_, 1};
+    if (decode_rows > 0) {
+        const int sequences = std::min(prefill_slots, 1);
+        return {sequences, prefill_granule_, sequences * prefill_granule_, prefill_granule_};
+    }
+    return {prefill_slots, prefill_granule_, prefill_slots * prefill_granule_, prefill_granule_};
 }
 
 bool Qwen4ExpSeqEngine::reserve_decode(const StepPlan & plan) {

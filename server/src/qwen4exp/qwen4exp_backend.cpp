@@ -181,7 +181,9 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     // Split mode: the expert device's MoE id helper bounds a chunk. With hot experts the target keeps no slack for
     // its matmul scratch pool, which grows over a long prompt and which the measurements below do not see, so the
     // chunk stays at the floor (still two 4096-row pipeline streams).
-    const int max_rows = !w.expert_backend ? kQwen4ExpMaxChunk
+    // Concurrent serving prefills in fixed granules (see Qwen4ExpSeqEngine).
+    const int max_rows = slots > 1 ? kQwen4ExpConcurrentGranule
+                       : !w.expert_backend ? kQwen4ExpMaxChunk
                        : w.hot ? kQwen4ExpSplitChunkFloor : kQwen4ExpSplitMaxChunk;
     struct Plan { size_t graph = 0, ring = 0, host = 0, scratch = 0; };
     std::vector<std::pair<int, Plan>> plans;   // one per probed chunk size
@@ -294,17 +296,18 @@ bool Qwen4ExpBackend::load_target() {
                                    cfg_.max_concurrency > 1 ? std::string() : cfg_.expert_placement_path,
                                    expert_budget_bytes_from_env(kQwen4ExpHotExpertBudget))) return false;
     snapshot_budget_ = SIZE_MAX;
-    if (cfg_.chunk > 0) {
-        chunk_ = weights_.expert_backend ? std::min(cfg_.chunk, kQwen4ExpSplitMaxChunk) : cfg_.chunk;
-    } else if (cfg_.max_concurrency > 1) {
-        // Cap at the single-slot speed target: a larger chunk only holds the
-        // other slots' decode for longer (and filled 93 GB at 4x32K: 12800 rows).
+    const int explicit_chunk = weights_.expert_backend ? std::min(cfg_.chunk, kQwen4ExpSplitMaxChunk) : cfg_.chunk;
+    if (cfg_.max_concurrency > 1) {
         // Prefix checkpoints: each slot's restore point and capture in flight
-        // plus one shared head, the server's concurrent prefix budget.
+        // plus one shared head, the server's concurrent prefix budget. The
+        // planner caps the prefill granule; an explicit --chunk sets it, and the
+        // allowance is measured either way.
         snapshot_budget_ = (2 * (size_t) cfg_.max_concurrency + 1) * snapshot_bytes_estimate(cache_.max_ctx);
-        chunk_ = std::min(4096, qwen4exp_select_chunk(backend_, weights_, cache_, cfg_.max_concurrency, 1,
-                                                      &snapshot_budget_));
+        const int fit = qwen4exp_select_chunk(backend_, weights_, cache_, cfg_.max_concurrency, 1, &snapshot_budget_);
+        chunk_ = cfg_.chunk > 0 && fit > 0 ? explicit_chunk : fit;
         std::fprintf(stderr, "[qwen4exp] prefix checkpoint allowance=%zu bytes\n", snapshot_budget_);
+    } else if (cfg_.chunk > 0) {
+        chunk_ = explicit_chunk;
     } else {
         snapshot_budget_ = 3 * snapshot_bytes_estimate(cache_.max_ctx);
         chunk_ = qwen4exp_select_chunk(backend_, weights_, cache_, 1, 1, &snapshot_budget_);
@@ -352,10 +355,8 @@ bool Qwen4ExpBackend::start_seq_engine() {
                                    &slot_states_, (int) caches.size())) return false;
         caches.push_back(&cache);
     }
-    // An explicit --chunk leaves no measured prefix allowance; the engine then serves cold.
     seq_engine_ = std::make_unique<Qwen4ExpSeqEngine>(
-        backend_, weights_, std::move(caches), cfg_.device.max_ctx, chunk_,
-        snapshot_budget_ == SIZE_MAX ? 0 : snapshot_budget_);
+        backend_, weights_, std::move(caches), cfg_.device.max_ctx, chunk_, snapshot_budget_);
     std::fprintf(stderr,
         "[qwen4exp-seq] independent-slot engine enabled: %d full F16 caches, ctx=%d, chunk=%d\n",
         cfg_.max_concurrency, cfg_.device.max_ctx, chunk_);

@@ -239,7 +239,11 @@ static bool run_qsa_boundary(Qwen4ExpSeqEngine & engine, ggml_backend_t backend,
         if (qsa) poison_indexer(*caches[s]);
     }
     auto check_step = [&](const SeqEngine::StepPlan & plan) {
-        if (!engine.reserve_decode(plan)) return false;
+        if (!engine.reserve_decode(plan)) {
+            std::fprintf(stderr, "[qsa-boundary] reserve_decode refused decode=%zu prefills=%zu\n",
+                         plan.decode.size(), plan.prefills.size());
+            return false;
+        }
         std::vector<Qwen4ExpForwardSegment> spans;
         std::vector<int> slots;
         for (const auto & row : plan.decode) {
@@ -248,9 +252,11 @@ static bool run_qsa_boundary(Qwen4ExpSeqEngine & engine, ggml_backend_t backend,
         }
         for (const auto & row : plan.prefills) {
             const int pos = caches[row.slot]->cur_pos;
+            const int granule = engine.step_plan_limits(0).max_prefill_tokens_per_sequence;
             slots.push_back(row.slot);
             spans.push_back({caches[row.slot], prompts[row.slot].data() + pos,
-                std::min(row.max_tokens, (int) prompts[row.slot].size() - pos), pos});
+                std::min({row.max_tokens, (int) prompts[row.slot].size() - pos,
+                          (pos / granule + 1) * granule - pos}), pos});
         }
         std::vector<SavedIndexer> expected;
         std::vector<int32_t> expected_tokens;
@@ -264,7 +270,12 @@ static bool run_qsa_boundary(Qwen4ExpSeqEngine & engine, ggml_backend_t backend,
         }
         const auto result = engine.step(plan);
         if (!result.ok() || result.decode.size() != plan.decode.size() ||
-            result.prefills.size() != plan.prefills.size()) return false;
+            result.prefills.size() != plan.prefills.size()) {
+            std::fprintf(stderr, "[qsa-boundary] step failed: '%s' decode=%zu/%zu prefills=%zu/%zu\n",
+                         result.error.c_str(), result.decode.size(), plan.decode.size(),
+                         result.prefills.size(), plan.prefills.size());
+            return false;
+        }
         for (size_t i = 0; i < spans.size(); ++i) {
             const auto & span = spans[i];
             if (span.cache->cur_pos != span.pos0 + span.n_tokens ||
@@ -289,14 +300,24 @@ static bool run_qsa_boundary(Qwen4ExpSeqEngine & engine, ggml_backend_t backend,
         return true;
     };
     bool ok = true;
-    for (int slice = 0; slice < 6 && ok; ++slice) {
+    // A slot past its prompt decodes; the rest prefill within the engine's per-step limits.
+    auto prefilled = [&](int s) { return caches[s]->cur_pos >= (int) prompts[s].size(); };
+    auto all_prefilled = [&] {
+        for (int s = 0; s < N; ++s) if (!prefilled(s)) return false;
+        return true;
+    };
+    for (int slice = 0; slice < 16 && ok && !all_prefilled(); ++slice) {
         SeqEngine::StepPlan plan;
-        for (int s = 0; s < N; ++s) {
-            if (caches[s]->cur_pos == (int) prompts[s].size()) plan.decode.push_back({s, next[s]});
-            else plan.prefills.push_back({s, slice == 4 ? 2 : 512});
+        for (int s = 0; s < N; ++s)
+            if (prefilled(s)) plan.decode.push_back({s, next[s]});
+        const StepPlanLimits limits = engine.step_plan_limits((int) plan.decode.size());
+        for (int s = 0; s < N && (int) plan.prefills.size() < limits.max_prefill_sequences; ++s) {
+            if (prefilled(s)) continue;
+            plan.prefills.push_back({s, slice == 4 ? 2 : limits.max_prefill_tokens_per_sequence});
         }
         ok = check_step(plan);
     }
+    ok = ok && all_prefilled();
     for (int step = 0; step < 64 && ok; ++step) {
         SeqEngine::StepPlan plan;
         // Retire three slots after crossing the threshold and continue solo.

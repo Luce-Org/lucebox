@@ -20,6 +20,9 @@ constexpr int kQwen4ExpSplitChunkFloor = 2 * kQwen4ExpPipelineStreamRows;
 // Split mode: the hot experts' share of the target unless LUCE_EXPERT_BUDGET_MB sets it. The rest of the target holds
 // the dense weights, the KV cache and the prompt-chunk buffers.
 constexpr uint64_t kQwen4ExpHotExpertBudget = 8ull << 30;
+// Concurrent serving: a prompt forward covers at most this many rows per step while other slots
+// decode, so a long prompt holds the live streams for one granule at a time.
+constexpr int kQwen4ExpConcurrentGranule = 2048;
 
 // Largest 256-row tile multiple within a measured workspace budget, capped at
 // max_rows. Above 512, the dense/QSA peak envelope grows with T. Small
@@ -30,6 +33,7 @@ int qwen4exp_fit_chunk(int max_ctx, size_t available, size_t fixed, Measure meas
                      size_t * snapshot_budget = nullptr, int floor_rows = 4096,
                      int max_rows = kQwen4ExpMaxChunk) {
     const size_t budget = available - available / 10;
+    floor_rows = std::min(floor_rows, max_rows);
     if (snapshot_budget) {
         const size_t requested = *snapshot_budget;
         *snapshot_budget = 0;

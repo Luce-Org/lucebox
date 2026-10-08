@@ -14,6 +14,12 @@ namespace luce::common {
 // N-way independent-slot engine. Each slot owns a full cache; the pool is
 // admission/headroom bookkeeping only (there is no paged KV).
 //
+// Prefill advances in fixed granules: every prompt forward ends at the next
+// multiple of the granule (or at a prefix-capture boundary, or the prompt's
+// end), whatever else the step carries, so a prompt's numerics do not depend
+// on concurrent load. While other slots decode, a step runs one granule in
+// total, so a long prompt never holds the live streams for more than one.
+//
 // Prefix checkpoints are prefix-sized device copies of a slot cache
 // (qwen4exp snapshots, the same payload the single-slot path keeps),
 // restorable into any slot of the same layout. The scheduler owns their
@@ -25,7 +31,7 @@ public:
 
     Qwen4ExpSeqEngine(ggml_backend_t backend, const Qwen4ExpWeights & weights,
                       std::vector<Qwen4ExpCache *> caches, int max_ctx,
-                      int prefill_chunk = 512, size_t prefix_allowance = 0);
+                      int prefill_granule = 512, size_t prefix_allowance = 0);
     ~Qwen4ExpSeqEngine() override;
 
     int slot_count() const override { return slots_.slot_count(); }
@@ -49,8 +55,8 @@ private:
     bool restore_prefix(int slot, const std::vector<int32_t> & prompt, PrefixStoreRef checkpoint);
     PrefixStoreEvent capture_prefix(int slot, PrefixCaptureTicket ticket);
     int checkpoint_index(PrefixStoreRef checkpoint) const;
-    // Rows the slot's next prompt forward covers: up to a pending capture
-    // boundary, the prompt's end and `max_tokens`.
+    // Rows the slot's next prompt forward covers: up to the next granule
+    // boundary, a pending capture boundary, the prompt's end and `max_tokens`.
     int prefill_segment(int slot, int max_tokens) const;
 
     ggml_backend_t backend_;
@@ -59,7 +65,7 @@ private:
     PagedKvPool pool_;
     SeqSlotManager slots_;
     Qwen4ExpBatchedDecodeWorkspace decode_workspace_;
-    int prefill_chunk_;
+    int prefill_granule_;
     size_t prefix_allowance_;
     std::vector<Qwen4ExpSnapshot> checkpoints_;
 };
