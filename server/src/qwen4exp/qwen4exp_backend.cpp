@@ -267,6 +267,10 @@ bool Qwen4ExpBackend::init() {
                          cfg_.device.gpu, expert_gpu);
         }
     }
+    return load_target();
+}
+
+bool Qwen4ExpBackend::load_target() {
     if (!load_qwen4exp_gguf(cfg_.model_path, backend_, weights_,
                            cfg_.verify_width == 1 ? "0" : cfg_.draft_path.value_or(""))) {
         std::fprintf(stderr, "[qwen4exp] model load failed: %s\n",
@@ -283,6 +287,7 @@ bool Qwen4ExpBackend::init() {
     const uint64_t hot_budget = expert_budget_bytes_from_env();
     if (!load_qwen4exp_hot_experts(backend_, weights_, cfg_.expert_placement_path,
                                    hot_budget > 0 ? hot_budget : 8ull << 30)) return false;
+    snapshot_budget_ = SIZE_MAX;
     if (cfg_.chunk > 0) {
         chunk_ = weights_.expert_backend ? std::min(cfg_.chunk, kQwen4ExpSplitMaxChunk) : cfg_.chunk;
     } else if (cfg_.max_concurrency > 1) {
@@ -303,6 +308,17 @@ bool Qwen4ExpBackend::init() {
         return false;
     }
     return true;
+}
+
+void Qwen4ExpBackend::release_target() {
+    for (int i = 0; i < kMaxSlots; ++i) snapshot_free(i);
+    tokens_.clear(); logits_.clear();
+    seq_engine_.reset();
+    for (Qwen4ExpCache & cache : seq_caches_) free_qwen4exp_cache(cache);
+    seq_caches_.clear();
+    free_qwen4exp_cache(cache_);
+    free_qwen4exp_weights(weights_);
+    ggml_backend_cuda_trim_pool(backend_); // also frees the bf16 weight shadows keyed by the freed weights' addresses
 }
 
 bool Qwen4ExpBackend::start_seq_engine() {
@@ -339,14 +355,7 @@ bool Qwen4ExpBackend::park(ParkTarget target) {
         return false;
     }
     if (parked_) return true;
-    for (int i = 0; i < kMaxSlots; ++i) snapshot_free(i);
-    tokens_.clear(); logits_.clear();
-    seq_engine_.reset();
-    for (Qwen4ExpCache & cache : seq_caches_) free_qwen4exp_cache(cache);
-    seq_caches_.clear();
-    free_qwen4exp_cache(cache_);
-    free_qwen4exp_weights(weights_);
-    ggml_backend_cuda_trim_pool(backend_); // also frees the bf16 weight shadows keyed by the freed weights' addresses
+    release_target();
     parked_ = true;
     std::printf("[qwen4exp] target parked\n");
     std::fflush(stdout);
@@ -358,21 +367,10 @@ bool Qwen4ExpBackend::unpark(ParkTarget target) {
         return false;
     }
     if (!parked_) return true;
-    if (!load_qwen4exp_gguf(cfg_.model_path, backend_, weights_,
-                           cfg_.verify_width == 1 ? "0" : cfg_.draft_path.value_or(""))) {
-        std::fprintf(stderr, "[qwen4exp] unpark reload failed: %s\n",
-                     luce_last_error());
-        return false;
-    }
-    if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
-                               cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1))) {
-        std::fprintf(stderr, "[qwen4exp] unpark cache creation failed\n");
-        free_qwen4exp_weights(weights_);
-        return false;
-    }
-    // Keep the resolved serving policy across park/unpark (and /props stable).
-    if (!start_seq_engine()) {
-        std::fprintf(stderr, "[qwen4exp] unpark slot allocation failed\n");
+    // The same bring-up as init (the resolved serving policy is kept), sized for the memory free now.
+    if (!load_target()) {
+        std::fprintf(stderr, "[qwen4exp] unpark failed; nothing stays resident\n");
+        release_target();
         return false;
     }
     parked_ = false;
@@ -804,13 +802,7 @@ bool Qwen4ExpBackend::handle_compress(const std::string & line,
 void Qwen4ExpBackend::free_drafter() {}
 
 void Qwen4ExpBackend::shutdown() {
-    for (int i = 0; i < kMaxSlots; ++i) snapshot_free(i);
-    tokens_.clear(); logits_.clear();
-    seq_engine_.reset();
-    for (Qwen4ExpCache & cache : seq_caches_) free_qwen4exp_cache(cache);
-    seq_caches_.clear();
-    free_qwen4exp_cache(cache_);
-    free_qwen4exp_weights(weights_);
+    if (backend_) release_target();
     if (weights_.expert_backend) {
         ggml_backend_free(weights_.expert_backend);
         weights_.expert_backend = nullptr;
