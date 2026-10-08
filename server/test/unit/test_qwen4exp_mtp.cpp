@@ -183,6 +183,52 @@ int main() {
         CHECK(rates[1] >= .98 * rates[0]);
     }
 
+    // Requests in sequence through the backend's memory, as a bench runs them: a short reply, two 16K
+    // summaries whose steps cost 2 ms more per verify row, then a long thinking reply. Widths timed at 16K
+    // must not make the short regime's narrow widths look dear (the memory keeps a cost per context regime),
+    // and the thinking reply must reach the best fixed width's rate.
+    {
+        const std::array<double, 7> s_short{.95, .88, .80, .72, .62, .52, .42};
+        const std::array<double, 7> s_long{.70, .42, .26, .14, .08, .04, .02};
+        const std::array<double, 7> s_think{.88, .75, .64, .42, .33, .25, .18};
+        struct Request { int tokens, context; const std::array<double, 7> * survival; };
+        const std::vector<Request> requests{{256, 30, &s_short}, {128, 15140, &s_long}, {128, 15140, &s_long},
+                                            {334, 65, &s_think}};
+        auto row_cost = [](int width, int context) { return 21.5 + 9.5 * (width - 1) + (context >= 2048 ? 2.0 * width : 0.0); };
+        double think_rate = 0;
+        Qwen4ExpMtpMemory memory;
+        uint32_t random = 7;
+        for (int round = 0; round < 3; ++round) for (const Request & r : requests) {
+            auto policy = memory.start(7, true, r.context);
+            double tokens = 0, elapsed = 0;
+            for (int done = 1; done < r.tokens;) {
+                const int width = qwen4exp_mtp_next_width(policy);
+                random = random * 1664525u + 1013904223u;
+                const double draw = random / 4294967296.0;
+                int accepted = 1;
+                while (accepted < width && draw < (*r.survival)[accepted - 1]) ++accepted;
+                const double cost = row_cost(width, r.context);
+                policy.observe(accepted, width, cost * (done % 2 ? 1.05 : .95));
+                done += accepted;
+                tokens += accepted;
+                elapsed += cost;
+            }
+            memory.finish(policy, r.context);
+            CHECK(policy.evidence().trials[1] >= 1.0);
+            if (round == 2 && r.survival == &s_think) think_rate = tokens / elapsed;
+        }
+        CHECK(Qwen4ExpMtpMemory::regime(30) != Qwen4ExpMtpMemory::regime(15140));
+        // The short regime's cost never saw a 16K step.
+        CHECK(memory.cost[Qwen4ExpMtpMemory::regime(30)].at(3) < row_cost(4, 30) * 1.06);
+        double best = 0, expected = 1;
+        for (int k = 1; k <= 7; ++k) {
+            expected += s_think[k - 1];
+            best = std::max(best, expected / row_cost(k + 1, 65));
+        }
+        std::printf("MTP policy bench sequence: thinking reply at %.3f of the best fixed width\n", think_rate / best);
+        CHECK(think_rate >= 0.97 * best);
+    }
+
     int cases = 0;
     for (int k = 0; k <= QWEN4EXP_MTP_MAX_DRAFT; ++k) {
         std::array<int32_t, QWEN4EXP_MTP_MAX_VERIFY> drafts{11, 22, 33, 44, 55, 66, 77, 88}, samples{};

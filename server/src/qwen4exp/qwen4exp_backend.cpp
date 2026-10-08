@@ -518,8 +518,8 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     // exactly once per emitted token. No RNG draws for unvisited verify rows.
     long long drafts = 0, accepted = 0, steps = 0;
     std::array<long long, QWEN4EXP_MTP_MAX_VERIFY> width_steps{};
-    auto width_policy = qwen4exp_mtp_width_policy(cache_.mtp_draft,
-        spec && cfg_.verify_width == 0, (int) req.prompt.size(), mtp_cost_learned_ ? &mtp_cost_ : nullptr);
+    const int decode_ctx = pos;
+    auto width_policy = mtp_memory_.start(cache_.mtp_draft, spec && cfg_.verify_width == 0, decode_ctx);
     double draft_s = 0.0;
     auto verify_graphs = [&](uint64_t Qwen4ExpDecodeWorkspace::*count) {
         uint64_t n = 0;
@@ -606,10 +606,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
             built() != step_builds ? -1.0f :
             (float) std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - step_start).count());
     }
-    if (width_policy.enabled()) {
-        mtp_cost_ = width_policy.cost();
-        mtp_cost_learned_ = true;
-    }
+    mtp_memory_.finish(width_policy, decode_ctx);
     if (cancelled) {
         result.fail(GenerateErrorCode::Cancelled, "cancelled during decode");
         return result;

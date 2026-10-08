@@ -95,9 +95,8 @@ private:
     std::vector<Qwen4ExpCache> seq_caches_;
     std::unique_ptr<Qwen4ExpSeqEngine> seq_engine_;
     bool                  parked_  = false;
-    // The adaptive verify width's cost model, learned across requests.
-    Qwen4ExpMtpCost       mtp_cost_;
-    bool                  mtp_cost_learned_ = false;
+    // The adaptive verify width's cost per context regime and acceptance, learned across requests.
+    Qwen4ExpMtpMemory     mtp_memory_;
 };
 
 }  // namespace luce::common

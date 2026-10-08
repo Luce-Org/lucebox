@@ -35,13 +35,31 @@ struct Qwen4ExpMtpCost {
 // Learn conditional acceptance only at reached depths: a clean short draft
 // says nothing about the next depth, and a rejection is not another failure
 // of every deeper conditional. Products give monotone prefix survivals.
+// Per-depth acceptance evidence: trials and successes of each reached depth.
+struct Qwen4ExpMtpEvidence {
+    std::array<double, QWEN4EXP_MTP_MAX_VERIFY> trials{}, successes{};
+};
+
 class Qwen4ExpMtpWidth {
 public:
-    Qwen4ExpMtpWidth(int max_draft, bool adaptive, int prompt_tokens, const Qwen4ExpMtpCost * learned = nullptr)
+    Qwen4ExpMtpWidth(int max_draft, bool adaptive, int prompt_tokens, const Qwen4ExpMtpCost * learned = nullptr,
+                     const Qwen4ExpMtpEvidence * evidence = nullptr)
         : cap_(std::clamp(max_draft, 1, QWEN4EXP_MTP_MAX_DRAFT)), adaptive_(adaptive) {
         // Optimistic but finite prior: 16 trials at 90% per reached depth.
         trials_.fill(16.0);
         successes_.fill(16.0 * 0.90);
+        if (evidence) {
+            carried_ = true;
+            // Earlier requests' acceptance, scaled to at most 32 trials per depth so this request's text takes
+            // over within a few dozen cycles. A depth no request reached keeps the prior.
+            for (int d = 1; d <= QWEN4EXP_MTP_MAX_DRAFT; ++d) {
+                const double t = evidence->trials[d];
+                if (t < 1.0) continue;
+                const double scale = std::min(1.0, 32.0 / t);
+                trials_[d] = t * scale;
+                successes_[d] = evidence->successes[d] * scale;
+            }
+        }
         if (learned) {
             cost_ = *learned;
         } else if (prompt_tokens >= 32768) {
@@ -52,6 +70,7 @@ public:
     }
 
     const Qwen4ExpMtpCost & cost() const { return cost_; }
+    Qwen4ExpMtpEvidence evidence() const { return { trials_, successes_ }; }
 
     bool enabled() const { return adaptive_; }
 
@@ -73,9 +92,9 @@ public:
             // phase change where two adjacent widths both look unprofitable.
             if (((steps_ - 16) / 17) % 8 == 7) chosen = cap_;
         }
-        // Require 16 cycles before narrowing below k=3; clean warmup
-        // cycles probe upward immediately so counting reaches k=7 quickly.
-        return (steps_ < 16 ? std::max(chosen, std::min(warmup_k_, cap_)) : chosen) + 1;
+        // Require 16 cycles before narrowing below k=3 (4 when earlier requests' acceptance is carried in);
+        // clean warmup cycles probe upward immediately so counting reaches k=7 quickly.
+        return (steps_ < (carried_ ? 4 : 16) ? std::max(chosen, std::min(warmup_k_, cap_)) : chosen) + 1;
     }
 
     // A missing timing (e.g. the oracle smoke) updates acceptance only.
@@ -123,7 +142,7 @@ public:
 
 private:
     int cap_, steps_ = 0, warmup_k_ = 3;
-    bool adaptive_;
+    bool adaptive_, carried_ = false;
     std::array<double, QWEN4EXP_MTP_MAX_VERIFY> trials_{}, successes_{};
     Qwen4ExpMtpCost cost_;
 };
@@ -131,9 +150,42 @@ private:
 // Server --verify-width: 0 = adaptive k=1..7, 1 = off, 2..8 = fixed k=1..7.
 // Eight verify rows is the RDNA3 batch-invariant MMVQ/MMID ceiling.
 inline Qwen4ExpMtpWidth qwen4exp_mtp_width_policy(int max_draft, bool adaptive, int prompt_tokens = 0,
-                                                  const Qwen4ExpMtpCost * learned = nullptr) {
-    return Qwen4ExpMtpWidth(max_draft, adaptive, prompt_tokens, learned);
+                                                  const Qwen4ExpMtpCost * learned = nullptr,
+                                                  const Qwen4ExpMtpEvidence * evidence = nullptr) {
+    return Qwen4ExpMtpWidth(max_draft, adaptive, prompt_tokens, learned, evidence);
 }
+
+// What the backend keeps across requests. Acceptance is the drafter's on recent text. The cycle cost is the
+// device's, but attention's share of a verify step grows with the context (dense below 2K, then sparse with
+// per-row indexer work), so each context regime keeps its own: widths timed in a 16K request made short
+// replies' narrow widths look about 10% dearer than they are, and the policy drafted too deep.
+struct Qwen4ExpMtpMemory {
+    static constexpr int REGIMES = 4;
+    std::array<Qwen4ExpMtpCost, REGIMES> cost{};
+    std::array<bool, REGIMES> cost_learned{};
+    Qwen4ExpMtpEvidence evidence;
+    bool evidence_learned = false;
+
+    static int regime(int64_t context) {
+        return context < 2048 ? 0 : context < 8192 ? 1 : context < 32768 ? 2 : 3;
+    }
+
+    Qwen4ExpMtpWidth start(int max_draft, bool adaptive, int64_t context) const {
+        const int r = regime(context);
+        return qwen4exp_mtp_width_policy(max_draft, adaptive, (int) std::min<int64_t>(context, 1 << 30),
+                                         cost_learned[r] ? &cost[r] : nullptr,
+                                         evidence_learned ? &evidence : nullptr);
+    }
+
+    void finish(const Qwen4ExpMtpWidth & policy, int64_t context) {
+        if (!policy.enabled()) return;
+        const int r = regime(context);
+        cost[r] = policy.cost();
+        cost_learned[r] = true;
+        evidence = policy.evidence();
+        evidence_learned = true;
+    }
+};
 
 inline int qwen4exp_mtp_next_width(const Qwen4ExpMtpWidth & policy) {
     return policy.next_width();
