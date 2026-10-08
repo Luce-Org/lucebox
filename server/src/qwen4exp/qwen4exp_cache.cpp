@@ -348,6 +348,12 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpCache & c, Qwe
 void restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c) {
     ggml_backend_synchronize(backend); // finish rollback before clearing its source/destination buffer
     clear_qwen4exp_decode_workspace(c.decode_workspace);
+    // The retained verify and MTP graphs were built at the pre-restore position:
+    // rebuild them rather than replay a span from another sequence.
+    for (auto & ws : c.verify_workspace) clear_qwen4exp_decode_workspace(ws);
+    clear_qwen4exp_decode_workspace(c.mtp_workspace);
+    for (auto & ws : c.mtp_catchup_workspace) clear_qwen4exp_decode_workspace(ws);
+    for (auto & ws : c.mtp_rank_workspace) clear_qwen4exp_decode_workspace(ws);
     // Clear masked suffixes too: stable QSA scores the entire bucket.
     ggml_backend_buffer_clear(c.buf, 0);
     for (auto [live, copy] : s.strips) ggml_backend_tensor_copy_async(backend, backend, copy, live);

@@ -191,7 +191,7 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         std::fprintf(stderr, "[qwen4exp] chunk-plan rows=%d graph=%zu ring=%zu host=%zu scratch=%zu required=%zu available=%zu\n",
             n, graph, slots * (inputs + mask), host, scratch, fixed + workspace, available);
         return workspace;
-    }, snapshot_budget);
+    }, snapshot_budget, w.expert_backend ? 8192 : 4096);
     std::fprintf(stderr, "[qwen4exp] chunk-auto ctx=%d slots=%d resident=%d chunk=%d state=%zu fixed=%zu available=%zu headroom=%zu\n",
         cache.max_ctx, slots, resident_slots, chunk, state,
         fixed + (snapshot_budget ? *snapshot_budget : 0), available, available / 10);
@@ -219,6 +219,11 @@ bool Qwen4ExpBackend::init() {
     if (cfg_.max_concurrency > 1 && cfg_.verify_width != 1) {
         std::fprintf(stderr, "[qwen4exp] --max-concurrency %d: MTP off\n", cfg_.max_concurrency);
         cfg_.verify_width = 1;
+    }
+    // The multi-slot decode graph has no split-mode placement yet.
+    if (cfg_.max_concurrency > 1 && cfg_.expert_device) {
+        std::fprintf(stderr, "[qwen4exp] --max-concurrency > 1 is not supported with --expert-device yet\n");
+        return false;
     }
     if (cfg_.device.is_layer_split()) {
         std::fprintf(stderr, "[qwen4exp] layer split is not supported yet\n");
