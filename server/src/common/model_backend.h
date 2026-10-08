@@ -268,6 +268,11 @@ struct ModelBackend {
         return 0;
     }
 
+    // Snapshot bytes the backend admits when it enforces its own allowance
+    // (SIZE_MAX: no allowance). The prefix cache's automatic resident limit
+    // stays within it, so the cache evicts before the backend refuses a capture.
+    virtual size_t snapshot_allowance_bytes() const { return SIZE_MAX; }
+
     // RESTORE <slot> <prompt_path> <n_gen> — restore snapshot + generate.
     // Backend handles the diff-prefill and decode internally.
     GenerateResult restore_and_generate(int slot, const GenerateRequest & req,

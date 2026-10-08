@@ -1436,6 +1436,9 @@ PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
     out.bytes = full_context_bytes * 3;
     const size_t memory = budgetable_memory_bytes();
     if (memory > 0) out.bytes = std::min(out.bytes, memory / 4);
+    // A backend that sized its snapshot allowance against device memory (a
+    // split model's smaller target GPU) refuses captures past it; evict first.
+    out.bytes = std::min(out.bytes, backend.snapshot_allowance_bytes());
     return out;
 }
 

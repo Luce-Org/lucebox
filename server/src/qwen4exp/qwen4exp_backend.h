@@ -67,6 +67,7 @@ public:
     // Prompt forwards end at every restore point (see run()); 4096-token
     // spacing keeps them long enough for the expert reads to pay off.
     int restore_point_spacing() const override { return 4096; }
+    size_t snapshot_allowance_bytes() const override { return snapshot_budget_; }
 
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,
