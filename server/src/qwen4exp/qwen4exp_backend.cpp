@@ -122,6 +122,16 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         for (auto * ctx : w.extra_meta_ctxs) count_shadow(ctx);
     }
     const size_t state = ggml_backend_buffer_get_size(cache.buf);
+    // The other concurrency slots' caches carry no MTP draft layer or verify rollback (only this cache drafts),
+    // so each reserves the trunk part of this cache's buffer.
+    size_t mtp_state = 0;
+    for (const ggml_tensor * t : {cache.mtp_k, cache.mtp_v, cache.mtp_prev_hidden, cache.mtp_chain_hidden,
+                                  cache.mtp_chain_ids, cache.spec_ple}) {
+        if (t) mtp_state += ggml_nbytes(t);
+    }
+    for (const ggml_tensor * t : cache.spec_ssm) mtp_state += ggml_nbytes(t);
+    for (const ggml_tensor * t : cache.spec_conv) mtp_state += ggml_nbytes(t);
+    const size_t slot_state = state > mtp_state ? state - mtp_state : 0;
     const bool mtp = qwen4exp_verify_supported(cache);
     const int ratio = w.compress_ratios.empty() ? 1 : std::max(1, *std::max_element(w.compress_ratios.begin(), w.compress_ratios.end()));
     const int dense_end = std::min(cache.max_ctx, w.indexer_top_k + ratio - 1);
@@ -175,7 +185,7 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     }
     // The decode workspaces stay resident while the next prompt prefills. Only
     // this cache drafts and verifies; the other concurrency slots decode only.
-    const size_t fixed = (slots - resident_slots) * state + shadow + shadow_tmp +
+    const size_t fixed = (slots - resident_slots) * slot_state + shadow + shadow_tmp +
                          slots * decode + verify + draft + batched;
     std::fprintf(stderr, "[qwen4exp] chunk-runtime mtp=%d decode=%zu verify=%zu draft=%zu batched=%zu scratch=%zu host=%zu\n",
         (int) mtp, decode, verify, draft, batched, runtime_scratch, runtime_host);
