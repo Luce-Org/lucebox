@@ -536,7 +536,15 @@ bool run_glu_pair(ggml_backend_t backend, int n_in, int n_full, int n_ff, int ff
 
 // A rank's slice of a Q8_0 contraction: a column-range view flagged with
 // ggml_backend_cuda_mul_mat_whole_row_lanes vs the whole rows times the slice
-// zero-padded to full width (build_shared_ffn_slice's padded form).
+// zero-padded to full width (build_shared_ffn_slice's padded form). The lanes
+// are a HIP layout, so there the two are bit-identical; other backends compute
+// the range's product as usual, and the check is the value to rounding.
+#if defined(GGML_USE_HIP)
+constexpr bool k_col_slice_bit_exact = true;
+#else
+constexpr bool k_col_slice_bit_exact = false;
+#endif
+
 bool run_col_slice(ggml_backend_t backend, int n_out, int n_full, int k_begin, int k_count, int ncols, uint32_t seed) {
     ggml_init_params params{};
     params.mem_size = ggml_tensor_overhead() * 48 + ggml_graph_overhead();
@@ -580,7 +588,10 @@ bool run_col_slice(ggml_backend_t backend, int n_out, int n_full, int k_begin, i
         ggml_backend_tensor_get(ref, a.data(), 0, sizeof(float) * n);
         ggml_backend_tensor_get(fus, b.data(), 0, sizeof(float) * n);
         for (size_t i = 0; i < n; ++i) {
-            if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+            const bool same = k_col_slice_bit_exact
+                ? std::memcmp(&a[i], &b[i], sizeof(float)) == 0
+                : std::fabs(a[i] - b[i]) <= 1e-5f * fmaxf(1.0f, std::fabs(a[i]));
+            if (!same) {
                 std::fprintf(stderr, "col slice mismatch n_out=%d n_full=%d begin=%d count=%d cols=%d at %zu: ref %.9g fused %.9g\n",
                              n_out, n_full, k_begin, k_count, ncols, i, a[i], b[i]);
                 ok = false;
