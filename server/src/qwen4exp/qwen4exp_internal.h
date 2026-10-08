@@ -129,14 +129,6 @@ private:
     ggml_to_float_t  to_float_  = nullptr;
 };
 
-// Research: the router's picks of decode and verify steps, counted per layer
-// (LUCE_QWEN4EXP_ROUTING_STATS_OUT=path; the CSV is rewritten every 64 steps).
-struct Qwen4ExpRouteRecorder {
-    MoeHybridRoutingStats stats;
-    std::string path;
-    int64_t steps = 0;
-};
-
 struct Qwen4ExpWeights {
     bool gfx1151 = false;  // Cache profile support at load, before any allocation.
     bool qsa = false;      // The QSA kernels run on the target device (gfx1151, RDNA4).
@@ -149,9 +141,9 @@ struct Qwen4ExpWeights {
     ggml_backend_t        expert_backend = nullptr;
     ggml_backend_buffer_t expert_buf     = nullptr;
     bool                  expert_gfx1151 = false;
-    // Split mode, research: the most-routed experts copied to the target
-    // (`hot`, from LUCE_QWEN4EXP_HOT_EXPERTS). Decode and verify steps run
-    // them there while the expert device runs the rest of the picks.
+    // Split mode: the most-routed experts copied to the target (`hot`, from
+    // --hot-experts). Verify steps run them there while the expert device
+    // runs the rest of the picks.
     std::unique_ptr<MoeHybridStorage> hot;
     ggml_context *             lut_ctx = nullptr;
     ggml_backend_buffer_t      lut_buf = nullptr;
@@ -162,7 +154,6 @@ struct Qwen4ExpWeights {
     ggml_tensor *              qsa_ones = nullptr;   // [indexer_n_head, 128] f32 ones: QSA's uniform head weights
     ggml_context *             qsa_ctx  = nullptr;
     ggml_backend_buffer_t      qsa_buf  = nullptr;
-    std::unique_ptr<Qwen4ExpRouteRecorder> route_recorder;
 
     CpuEmbedder           embedder;
 

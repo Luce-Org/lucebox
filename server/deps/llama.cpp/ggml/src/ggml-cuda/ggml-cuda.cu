@@ -4419,32 +4419,6 @@ bool ggml_backend_cuda_copy_tensor_async_side(ggml_backend_t backend_src, ggml_b
     return true;
 }
 
-bool ggml_backend_cuda_copy_tensor_async_side_event(ggml_backend_t backend_src, ggml_backend_t backend_dst,
-                                                    const ggml_tensor * src, ggml_tensor * dst,
-                                                    ggml_backend_event_t done) {
-    if (!done || !ggml_cuda_peer_copy_qualifies(backend_src, backend_dst, src, dst)) {
-        return false;
-    }
-    ggml_backend_cuda_context * ctx_src = (ggml_backend_cuda_context *) backend_src->context;
-    ggml_backend_cuda_context * ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
-#if defined(GGML_USE_HIP)
-    ggml_cuda_flush_peer_copy_batch("side-copy-event");
-#endif
-    ggml_cuda_set_device(ctx_src->device);
-    if (!ctx_src->side_copy_stream) {
-        CUDA_CHECK(cudaStreamCreateWithFlags(&ctx_src->side_copy_stream, cudaStreamNonBlocking));
-        CUDA_CHECK(cudaEventCreateWithFlags(&ctx_src->side_copy_ready, cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&ctx_src->side_copy_done, cudaEventDisableTiming));
-    }
-    cudaStream_t side = ctx_src->side_copy_stream;
-    CUDA_CHECK(cudaEventRecord(ctx_src->side_copy_ready, ctx_src->stream()));
-    CUDA_CHECK(cudaStreamWaitEvent(side, ctx_src->side_copy_ready, 0));
-    CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, ctx_dst->device, src->data, ctx_src->device,
-                                   ggml_nbytes(dst), side));
-    CUDA_CHECK(cudaEventRecord((cudaEvent_t) done->context, side));
-    return true;
-}
-
 // A peer copy queued on the source's compute stream with no wait on the
 // destination: the caller records an event on the source backend after it
 // and has the destination wait for that event when it needs the data.

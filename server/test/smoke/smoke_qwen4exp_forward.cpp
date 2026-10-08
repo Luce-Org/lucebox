@@ -398,7 +398,7 @@ int run_mtp_rollback_check(ggml_backend_t backend, const Qwen4ExpWeights & w,
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <shard1.gguf> [seq_len=16] [--token-file FILE] [--split N[:chunk]] [--draft PATH|0] [--mtp N] [--mtp-draft 1..7] [--mtp-vocab 40000|64000|106000] [--mtp-window 32768] [--mtp-all] [--chunk N] [--tg N] [--stable N] [--compare-chunk N]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <shard1.gguf> [seq_len=16] [--token-file FILE] [--split N[:chunk]] [--draft PATH|0] [--mtp N] [--mtp-draft 1..7] [--mtp-vocab 40000|64000|106000] [--mtp-window 32768] [--mtp-all] [--chunk N] [--tg N] [--stable N] [--compare-chunk N] [--expert-gpu N]\n", argv[0]);
         return 2;
     }
     const std::string path = argv[1];
@@ -409,6 +409,7 @@ int main(int argc, char ** argv) {
     bool mtp_all = false;
     std::string draft;
     const char * token_file = nullptr;
+    int expert_gpu = -1;
     auto positive = [](const char * first, const char * last, int & n) {
         const auto r = std::from_chars(first, last, n);
         return r.ec == std::errc{} && r.ptr == last && n > 0;
@@ -438,6 +439,7 @@ int main(int argc, char ** argv) {
             if (!positive(val, val + std::strlen(val), compare_chunk)) return 2;
         }
         else if (opt == "--token-file" && arg + 1 < argc) token_file = argv[++arg];
+        else if (opt == "--expert-gpu" && arg + 1 < argc) expert_gpu = std::atoi(argv[++arg]);
         else if (opt == "--split" && arg + 1 < argc) {
             const char * val = argv[++arg], * end = val + std::strlen(val), * colon = std::strchr(val, ':');
             if (!positive(val, colon ? colon : end, N) || N >= S ||
@@ -455,9 +457,9 @@ int main(int argc, char ** argv) {
     }
 
     Qwen4ExpWeights w;
-    // As the server: LUCE_QWEN4EXP_EXPERT_GPU puts the routed experts on that device (split mode).
-    if (const char * expert_gpu = std::getenv("LUCE_QWEN4EXP_EXPERT_GPU")) {
-        w.expert_backend = ggml_backend_cuda_init(std::atoi(expert_gpu));
+    // As the server's --expert-device: the routed experts on that device (split mode).
+    if (expert_gpu >= 0) {
+        w.expert_backend = ggml_backend_cuda_init(expert_gpu);
         if (!w.expert_backend) return 77;
         w.expert_gfx1151 = ggml_backend_cuda_qwen4exp_supported(w.expert_backend);
     }

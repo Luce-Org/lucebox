@@ -139,6 +139,9 @@ BackendPreparation BackendPlanBuilder::resolve(
     plan.placement_.remote_draft = std::move(args.remote_draft);
     plan.placement_.remote_target_shard =
         std::move(args.remote_target_shard);
+    plan.placement_.expert = std::move(args.expert_device);
+    plan.placement_.hot_experts = std::move(args.hot_experts);
+    plan.placement_.hot_experts_gib = args.hot_experts_gib;
 
     plan.cache_.fa_window = args.fa_window;
     plan.cache_.paged_attention = args.paged_attention;

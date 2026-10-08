@@ -210,37 +210,15 @@ struct Qwen4ExpMoeRoute {
     ggml_tensor * shared = nullptr;   // gated shared expert, [n_embd, T]
 };
 
-// Counts the router picks moe_select kept (decode and verify steps).
-static void record_routes(const Qwen4ExpWeights & w, ggml_cgraph * gf) {
-    Qwen4ExpRouteRecorder * rec = w.route_recorder.get();
-    if (!rec) return;
-    std::vector<int32_t> ids;
-    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-        ggml_tensor * t = ggml_graph_node(gf, i);
-        int il = -1;
-        if (std::sscanf(t->name, "qwen4exp_sel.%d", &il) != 1) continue;
-        ids.resize((size_t) ggml_nelements(t));
-        ggml_backend_tensor_get(t, ids.data(), 0, ids.size() * sizeof(int32_t));
-        rec->stats.observe(il, ids.data(), (int) ids.size());
-    }
-    if (++rec->steps % 64 == 0) rec->stats.save_csv(rec->path);
-}
-
 // The trunk layer index of L, or -1 for a layer outside the trunk (the MTP draft layer).
 static int layer_index(const Qwen4ExpLayer & L, const Qwen4ExpWeights & w) {
     const ptrdiff_t il = &L - w.layers.data();
     return il >= 0 && il < (ptrdiff_t) w.layers.size() ? (int) il : -1;
 }
 
-// The router's top-k; for the route recorder, a named output of decode and verify steps.
-static ggml_tensor * moe_select(ggml_context * c, ggml_tensor * probs, int il, const Qwen4ExpWeights & w) {
-    ggml_tensor * sel = ggml_argsort_top_k(c, probs, (int) w.n_expert_used);
-    if (w.route_recorder && il >= 0 && probs->ne[1] <= 64) {
-        sel = ggml_cont(c, sel);
-        ggml_format_name(sel, "qwen4exp_sel.%d", il);
-        ggml_set_output(sel);
-    }
-    return sel;
+// The router's top-k.
+static ggml_tensor * moe_select(ggml_context * c, ggml_tensor * probs, const Qwen4ExpWeights & w) {
+    return ggml_argsort_top_k(c, probs, (int) w.n_expert_used);
 }
 
 // Gate, up and down of the routed experts `ids` picks: [n_embd, n_used, T].
@@ -261,7 +239,7 @@ static Qwen4ExpMoeRoute build_moe_route(ggml_context * c, ggml_tensor * cur,
     Qwen4ExpMoeRoute r;
     const int il = layer_index(L, w);
     ggml_tensor * probs = ggml_soft_max(c, mm(c, L.ffn_gate_inp, cur));               // [n_expert, T]
-    r.sel  = moe_select(c, probs, il, w);
+    r.sel  = moe_select(c, probs, w);
     r.wsel = ggml_reshape_2d(c, ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, w.n_expert, n_tokens), r.sel),
                              w.n_expert_used, n_tokens);
     r.wsel = ggml_div(c, r.wsel, ggml_clamp(c, ggml_sum_rows(c, r.wsel), 6.103515625e-5f, INFINITY));
@@ -337,7 +315,7 @@ ggml_tensor * build_moe(ggml_context * c, ggml_tensor * cur,
 
     ggml_tensor * logits = mm(c, L.ffn_gate_inp, cur);      // [n_expert, T]
     ggml_tensor * probs  = ggml_soft_max(c, logits);
-    ggml_tensor * sel    = moe_select(c, probs, layer_index(L, w), w);  // [n_used, T]
+    ggml_tensor * sel    = moe_select(c, probs, w);  // [n_used, T]
 
     ggml_tensor * probs3 = ggml_reshape_3d(c, probs, 1, n_expert, n_tokens);
     ggml_tensor * wsel   = ggml_reshape_2d(c, ggml_get_rows(c, probs3, sel), n_used, n_tokens);
@@ -1485,7 +1463,6 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
             out_hidden->resize((size_t) ggml_nelements(ws.hidden));
             ggml_backend_tensor_get(ws.hidden, out_hidden->data(), 0, ggml_nbytes(ws.hidden));
         }
-        record_routes(w, ws.gf);
         return true;
     };
 
@@ -2203,7 +2180,6 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         out_hidden->resize((size_t) ggml_nelements(hidden));
         ggml_backend_tensor_get(hidden, out_hidden->data(), 0, ggml_nbytes(hidden));
     }
-    record_routes(w, gf);
 
     if (!pool) {
         if (galloc) ggml_gallocr_free(galloc);

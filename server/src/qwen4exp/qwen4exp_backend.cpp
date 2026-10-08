@@ -21,12 +21,13 @@
 
 namespace luce::common {
 
-// Split mode, research: copy the most-routed experts (the routing CSV in
-// LUCE_QWEN4EXP_HOT_EXPERTS, LUCE_QWEN4EXP_HOT_GIB of them, default 8) to the
-// target, plus the per-layer lookup tables that send each pick to one device.
-static bool load_qwen4exp_hot_experts(ggml_backend_t backend, Qwen4ExpWeights & w) {
-    const char * path = std::getenv("LUCE_QWEN4EXP_HOT_EXPERTS");
-    if (!path || !*path || !w.expert_backend) return true;
+// Split mode: copy the most-routed experts (the routing-stats CSV `path`, up to
+// `gib` of them) to the target, plus the per-layer lookup tables that send each
+// pick to one device.
+static bool load_qwen4exp_hot_experts(ggml_backend_t backend, Qwen4ExpWeights & w, const std::string & csv,
+                                      double gib) {
+    if (csv.empty() || !w.expert_backend) return true;
+    const char * path = csv.c_str();
     std::string err;
     MoeHybridRoutingStats stats;
     if (!MoeHybridRoutingStats::load_csv(path, stats, &err) ||
@@ -43,8 +44,7 @@ static bool load_qwen4exp_hot_experts(ggml_backend_t backend, Qwen4ExpWeights & 
         descs[(size_t) il].ffn_down_exps = L.ffn_down_exps;
         expert_bytes[(size_t) il] = L.ffn_gate_exps->nb[2] + L.ffn_up_exps->nb[2] + L.ffn_down_exps->nb[2];
     }
-    const char * gib = std::getenv("LUCE_QWEN4EXP_HOT_GIB");
-    const uint64_t budget = (uint64_t) ((gib ? std::atof(gib) : 8.0) * (double) (1ull << 30));
+    const uint64_t budget = (uint64_t) (gib * (double) (1ull << 30));
     MoeHybridPlacement placement;
     if (!MoeHybridPlacement::build_from_stats_with_layer_bytes(stats, expert_bytes, budget, 0, placement, &err)) {
         std::fprintf(stderr, "[qwen4exp] hot experts: placement failed: %s\n", err.c_str());
@@ -230,17 +230,26 @@ bool Qwen4ExpBackend::init() {
                      cfg_.device.gpu);
         return false;
     }
-    // Research: routed experts on a second GPU, everything else on the target.
-    if (const char * expert_gpu = std::getenv("LUCE_QWEN4EXP_EXPERT_GPU")) {
-        weights_.expert_backend = ggml_backend_cuda_init(std::atoi(expert_gpu));
+    if (!cfg_.hot_experts.empty() && !cfg_.expert_device) {
+        std::fprintf(stderr, "[qwen4exp] --hot-experts needs --expert-device\n");
+        return false;
+    }
+    // Split mode: routed experts on a second GPU, everything else on the target.
+    if (cfg_.expert_device) {
+        const int expert_gpu = cfg_.expert_device->gpu;
+        if (expert_gpu == cfg_.device.gpu) {
+            std::fprintf(stderr, "[qwen4exp] --expert-device must differ from the target device\n");
+            return false;
+        }
+        weights_.expert_backend = ggml_backend_cuda_init(expert_gpu);
         if (!weights_.expert_backend) {
-            std::fprintf(stderr, "[qwen4exp] expert backend init failed for GPU %s\n", expert_gpu);
+            std::fprintf(stderr, "[qwen4exp] expert backend init failed for GPU %d\n", expert_gpu);
             return false;
         }
         weights_.expert_gfx1151 = ggml_backend_cuda_qwen4exp_supported(weights_.expert_backend);
         // Direct device-to-device copies for the activations crossing between the two GPUs.
-        if (!enable_peer_access_pair(cfg_.device.gpu, std::atoi(expert_gpu))) {
-            std::fprintf(stderr, "[qwen4exp] peer access between GPU %d and %s unavailable; copies stage through the host\n",
+        if (!enable_peer_access_pair(cfg_.device.gpu, expert_gpu)) {
+            std::fprintf(stderr, "[qwen4exp] peer access between GPU %d and %d unavailable; copies stage through the host\n",
                          cfg_.device.gpu, expert_gpu);
         }
     }
@@ -255,12 +264,7 @@ bool Qwen4ExpBackend::init() {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
         return false;
     }
-    if (!load_qwen4exp_hot_experts(backend_, weights_)) return false;
-    if (const char * stats_path = std::getenv("LUCE_QWEN4EXP_ROUTING_STATS_OUT")) {
-        weights_.route_recorder = std::make_unique<Qwen4ExpRouteRecorder>();
-        weights_.route_recorder->stats.init(weights_.n_layer, weights_.n_expert, weights_.n_expert_used);
-        weights_.route_recorder->path = stats_path;
-    }
+    if (!load_qwen4exp_hot_experts(backend_, weights_, cfg_.hot_experts, cfg_.hot_experts_gib)) return false;
     if (cfg_.chunk > 0) {
         chunk_ = cfg_.chunk;
     } else if (cfg_.max_concurrency > 1) {
@@ -773,7 +777,6 @@ bool Qwen4ExpBackend::handle_compress(const std::string & line,
 void Qwen4ExpBackend::free_drafter() {}
 
 void Qwen4ExpBackend::shutdown() {
-    if (weights_.route_recorder) weights_.route_recorder->stats.save_csv(weights_.route_recorder->path);
     for (int i = 0; i < kMaxSlots; ++i) snapshot_free(i);
     tokens_.clear(); logits_.clear();
     seq_engine_.reset();

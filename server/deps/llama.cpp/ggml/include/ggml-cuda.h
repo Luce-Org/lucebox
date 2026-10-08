@@ -115,12 +115,6 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int de
 GGML_BACKEND_API bool ggml_backend_cuda_copy_tensor_async_side(
         ggml_backend_t backend_src, ggml_backend_t backend_dst,
         const struct ggml_tensor * src, struct ggml_tensor * dst);
-// Like ggml_backend_cuda_copy_tensor_async_side, but the destination does not
-// wait: the copy records `done` (an event of the source device) and the caller
-// has the destination wait on it where it needs the data.
-GGML_BACKEND_API bool ggml_backend_cuda_copy_tensor_async_side_event(
-        ggml_backend_t backend_src, ggml_backend_t backend_dst,
-        const struct ggml_tensor * src, struct ggml_tensor * dst, ggml_backend_event_t done);
 // Order the backend's compute stream after its side-stream copies so far.
 GGML_BACKEND_API void ggml_backend_cuda_join_side_copies(ggml_backend_t backend);
 // Peer copy on the source's compute stream without a destination wait:

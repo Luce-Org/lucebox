@@ -137,9 +137,13 @@ static void print_usage(const char * prog) {
         "                                 LUCE_TARGET_DEVICE\n"
         "  --draft-device <backend:gpu>   Draft device (default: auto:0; DeepSeek4\n"
         "                                 and --target-device auto: the target GPU)\n"
-        "  --expert-device <backend:gpu>  DeepSeek4: keep dense work and hot experts on\n"
-        "                                 the target and run the remaining routed\n"
-        "                                 experts on this GPU in process\n"
+        "  --expert-device <backend:gpu>  DeepSeek4, Qwen3.8-Flash-Next: keep dense work\n"
+        "                                 and hot experts on the target and run the\n"
+        "                                 remaining routed experts on this GPU in process\n"
+        "  --hot-experts <path>           Qwen3.8-Flash-Next with --expert-device: routing\n"
+        "                                 stats CSV; the most-routed experts are copied\n"
+        "                                 to the target for verify steps\n"
+        "  --hot-experts-gib <GiB>        Target memory for --hot-experts (default: 8)\n"
         "  --draft-ipc-bin <path>         Remote backend IPC daemon for mixed backends\n"
         "  --draft-ipc-work-dir <path>    Remote draft IPC scratch directory\n"
         "  --draft-ipc-ring-cap <N>       Remote draft feature ring capacity\n"
@@ -421,6 +425,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             return 2;
         }
         if (load_balancing && (option == "--peer-access" || option == "--expert-device" ||
+            option == "--hot-experts" || option == "--hot-experts-gib" ||
             option == "--no-fast-rollback" || option == "--target-split-fast-rollback" ||
             option == "--adaptive-experts" || option == "--specla" ||
             option == "--specla-top-k" || option.rfind("--kvflash", 0) == 0 ||
@@ -505,6 +510,15 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 return 2;
             }
             model.expert_device = expert;
+            bargs.expert_device = expert;
+        } else if (std::strcmp(argv[i], "--hot-experts") == 0 && i + 1 < argc) {
+            bargs.hot_experts = argv[++i];
+        } else if (std::strcmp(argv[i], "--hot-experts-gib") == 0 && i + 1 < argc) {
+            bargs.hot_experts_gib = std::atof(argv[++i]);
+            if (!(bargs.hot_experts_gib > 0.0)) {
+                std::fprintf(stderr, "[server] --hot-experts-gib needs a positive size in GiB\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--profile") == 0) {
             // main() expands profiles before blocks are parsed.
             std::fprintf(stderr, "[server] --profile needs a profile name (%s)\n",
@@ -1063,15 +1077,18 @@ static void print_target_device_hint(const std::string & model_path,
         better.arch.c_str(), bytes_to_gib(better.total_bytes), backend, choice.index);
 }
 
-// --expert-device: DeepSeek4 in-process expert parallelism. The flag is the
+// --expert-device: in-process expert parallelism. For DeepSeek4 the flag is the
 // command-line spelling of LUCE_DS4_MOE_TP=1 LUCE_DS4_MOE_TP_INPROC=1
-// LUCE_DS4_MOE_TP_GPU=<n> LUCE_DS4_MOE_TP_BACKEND=<backend>.
+// LUCE_DS4_MOE_TP_GPU=<n> LUCE_DS4_MOE_TP_BACKEND=<backend>; Qwen3.8-Flash-Next
+// (qwen4exp) reads it from the backend plan.
 static bool apply_expert_device(const DevicePlacement & expert,
                                 const BackendPlan & plan) {
     const DevicePlacement & target = plan.placement().target;
-    if (!luce::common::arch_is_deepseek4_family(plan.arch())) {
+    const bool qwen4exp = plan.arch() == "qwen4exp";
+    if (!luce::common::arch_is_deepseek4_family(plan.arch()) && !qwen4exp) {
         std::fprintf(stderr,
-            "[server] --expert-device is only valid for DeepSeek V4 / V4.1 models (detected '%s')\n",
+            "[server] --expert-device is only valid for DeepSeek V4 / V4.1 and Qwen3.8-Flash-Next models "
+            "(detected '%s')\n",
             plan.arch().c_str());
         return false;
     }
@@ -1088,6 +1105,7 @@ static bool apply_expert_device(const DevicePlacement & expert,
         std::fprintf(stderr, "[server] --expert-device must differ from the target device\n");
         return false;
     }
+    if (qwen4exp) return true;
     const std::string gpu = std::to_string(expert.gpu);
     set_environment_variable("LUCE_DS4_MOE_TP", "1", true);
     set_environment_variable("LUCE_DS4_MOE_TP_INPROC", "1", true);
@@ -1462,6 +1480,11 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         }
     }
     if (model.expert_device && !apply_expert_device(*model.expert_device, backend_plan)) {
+        return 2;
+    }
+    if (!backend_plan.placement().hot_experts.empty() &&
+        (arch != "qwen4exp" || !model.expert_device)) {
+        std::fprintf(stderr, "[server] --hot-experts needs a Qwen3.8-Flash-Next model and --expert-device\n");
         return 2;
     }
     auto backend_owner = create_backend(backend_plan);

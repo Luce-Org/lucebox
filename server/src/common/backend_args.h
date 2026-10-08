@@ -65,6 +65,12 @@ struct BackendArgs {
     DevicePlacement draft_device;
     RemoteDraftConfig remote_draft;
     RemoteTargetShardConfig remote_target_shard;
+    // Split MoE placement (qwen4exp): routed experts on a second device, and the
+    // most-routed of them also copied to the target. DeepSeek V4 reads
+    // --expert-device through its own expert-parallel path instead.
+    std::optional<DevicePlacement> expert_device;
+    std::string     hot_experts;            // routing-stats CSV; empty = no hot experts
+    double          hot_experts_gib = 8.0;  // target memory for the hot experts
 
     // I/O — only used when running under daemon_loop (legacy). The new
     // server passes -1 and uses on_token callbacks instead.

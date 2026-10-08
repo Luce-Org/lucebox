@@ -228,6 +228,19 @@ inline const std::vector<LaunchProfile> & launch_profiles() {
                 {"GPU_MAX_HW_QUEUES", "8"},
             },
         },
+        {
+            "qwen-next-r9700-strix",
+            "Qwen3.8-Flash-Next with dense work, KV cache and the MTP drafter on "
+            "an R9700 (gfx1201) and the routed experts on Strix Halo (gfx1151); "
+            "add --hot-experts with the box's routing stats to also run the "
+            "most-routed experts on the R9700 during verify",
+            {
+                {"--target-device", "hip:0"},
+                {"--expert-device", "hip:1"},
+                {"--max-ctx", "131072"},
+            },
+            {},
+        },
     };
     return profiles;
 }

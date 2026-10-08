@@ -27,6 +27,11 @@ struct Qwen4ExpBackendConfig {
     std::optional<std::string> draft_path; // MTP sidecar; absent = auto-discover
     int             verify_width = 0;     // 0 = adaptive, 1 = off, 2..8 = fixed
     DevicePlacement device;
+    // Split mode: routed experts on this device; dense work, KV and the hot
+    // experts stay on `device`.
+    std::optional<DevicePlacement> expert_device;
+    std::string     hot_experts;            // routing-stats CSV of the experts copied to `device`
+    double          hot_experts_gib = 8.0;  // memory for them on `device`
     int             chunk     = 0;  // auto: measured allocation budget
     int             max_concurrency = 1;
 };
