@@ -114,7 +114,7 @@ struct ServerConfig {
     // the slot count and the batch engine's checkpoint size at --max-ctx
     // (at least kConcurrentPrefixBudgetFloor); zero means unlimited.
     size_t      concurrent_prefix_cache_max_bytes = kPrefixCacheBudgetAuto;
-    bool        concurrent_paged_prefix_cache = false;
+    bool        concurrent_prefix_cache = false;
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
     // Extend the existing prefix cache through generated tool-call turns.
     bool        agent_turn_cache = false;

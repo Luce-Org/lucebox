@@ -1295,7 +1295,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // Every concurrent engine takes its prefix checkpoints from the scheduler:
     // paged engines copy pages, qwen4exp copies full-cache snapshots. Both use
     // the concurrent budget and no single-sequence superseded pruning.
-    sconfig.concurrent_paged_prefix_cache =
+    sconfig.concurrent_prefix_cache =
         backend_execution.max_concurrency > 1 && sconfig.prefix_cache_cap > 0;
 
     if (sconfig.agent_turn_cache && backend_cache.paged_attention) {
@@ -1784,7 +1784,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         std::fprintf(stderr, "[server] %s\n", prefix_ram.error.c_str());
         return 2;
     }
-    if (sconfig.concurrent_paged_prefix_cache &&
+    if (sconfig.concurrent_prefix_cache &&
         sconfig.prefix_cache_max_bytes != ServerConfig::kPrefixCacheBudgetAuto) {
         std::fprintf(stderr,
             "[server] --prefix-cache-max-mib has no effect with concurrent "
@@ -1792,7 +1792,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
     // Store the resolved value: auto depends on the memory available now,
     // and the budget printed here must be the one the server enforces.
-    if (!sconfig.concurrent_paged_prefix_cache) {
+    if (!sconfig.concurrent_prefix_cache) {
         sconfig.prefix_cache_max_bytes = prefix_ram.bytes;
     }
     if (sconfig.prefix_cache_cap <= 0) {

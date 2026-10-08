@@ -76,7 +76,7 @@ enum class AdmissionDisposition {
 
 void HttpServer::scheduler_loop(SeqEngine & engine) {
     const int n_slots = engine.slot_count();
-    if (config_.concurrent_paged_prefix_cache &&
+    if (config_.concurrent_prefix_cache &&
         config_.concurrent_prefix_cache_max_bytes == ServerConfig::kPrefixCacheBudgetAuto) {
         const size_t per = engine.estimate_prefix_store_bytes(engine.max_context());
         if (per > 0) {

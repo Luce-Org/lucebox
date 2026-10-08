@@ -1400,7 +1400,7 @@ PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
     PrefixCacheBudget out;
     // No prefix cache, nothing to bound (e.g. single-sequence paged serving).
     if (config.prefix_cache_cap <= 0) return out;
-    if (config.concurrent_paged_prefix_cache) {
+    if (config.concurrent_prefix_cache) {
         out.automatic = config.concurrent_prefix_cache_max_bytes ==
             ServerConfig::kPrefixCacheBudgetAuto;
         // Auto starts at the old 4 GiB default; the scheduler resizes it once
@@ -1472,7 +1472,7 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     prefix_cache_.init_full_cache(config.prefill_cache_cap);
     // Single-sequence commits prune superseded snapshots (see
     // trim_snapshots_after_commit); the paged scheduler does not.
-    prefix_cache_.set_prunes_superseded(!config.concurrent_paged_prefix_cache);
+    prefix_cache_.set_prunes_superseded(!config.concurrent_prefix_cache);
     // Fold model+config identity into the layout fingerprint BEFORE init()
     // so compute_layout_id sees it on every learn/verify call. Prevents stale
     // KV hits when the server restarts over the same --kv-cache-dir with a

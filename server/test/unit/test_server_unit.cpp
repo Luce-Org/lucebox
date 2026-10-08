@@ -7655,7 +7655,7 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_budget_resolution) {
     TEST_ASSERT(budget.bytes == 0 && budget.error.empty());
     config.prefix_cache_cap = 32;
     // Concurrent paged serving keeps its own limit, whatever the backend.
-    config.concurrent_paged_prefix_cache = true;
+    config.concurrent_prefix_cache = true;
     config.concurrent_prefix_cache_max_bytes = 4096;
     budget = resolve_prefix_cache_budget(config, unsized);
     TEST_ASSERT(budget.bytes == 4096 && budget.error.empty());
@@ -7914,7 +7914,7 @@ TEST_CASE(ServerUnitFixture,
     config.max_ctx = 64;
     config.prefix_cache_cap = 2;
     config.concurrent_prefix_cache_max_bytes = 1024;
-    config.concurrent_paged_prefix_cache = true;
+    config.concurrent_prefix_cache = true;
     config.admission_coalesce_ms = 0;
     HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
@@ -7990,7 +7990,7 @@ TEST_CASE(ServerUnitFixture,
     config.max_ctx = 64;
     config.prefix_cache_cap = 2;
     config.concurrent_prefix_cache_max_bytes = 1024;
-    config.concurrent_paged_prefix_cache = true;
+    config.concurrent_prefix_cache = true;
     config.admission_coalesce_ms = 0;
     HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
@@ -8050,7 +8050,7 @@ TEST_CASE(ServerUnitFixture,
     config.max_ctx = 64;
     config.prefix_cache_cap = 2;
     config.concurrent_prefix_cache_max_bytes = 1024;
-    config.concurrent_paged_prefix_cache = true;
+    config.concurrent_prefix_cache = true;
     config.admission_coalesce_ms = 0;
     HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
@@ -8105,7 +8105,7 @@ TEST_CASE(ServerUnitFixture,
     config.max_ctx = 64;
     config.prefix_cache_cap = 2;
     config.concurrent_prefix_cache_max_bytes = 1024;
-    config.concurrent_paged_prefix_cache = true;
+    config.concurrent_prefix_cache = true;
     config.admission_coalesce_ms = 0;
     HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
@@ -9501,7 +9501,7 @@ TEST_CASE(ServerUnitFixture, test_server_config_cache_defaults) {
     ServerConfig cfg;
     TEST_ASSERT(cfg.prefix_cache_cap == 32);
     TEST_ASSERT(cfg.concurrent_prefix_cache_max_bytes == ServerConfig::kPrefixCacheBudgetAuto);
-    TEST_ASSERT(!cfg.concurrent_paged_prefix_cache);
+    TEST_ASSERT(!cfg.concurrent_prefix_cache);
     TEST_ASSERT(cfg.prefill_cache_cap == 0);
 }
 
