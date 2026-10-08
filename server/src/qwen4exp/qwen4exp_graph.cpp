@@ -381,23 +381,45 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor 
     ggml_tensor * qkv = mm(c, L.attn_qkv, cur);        // [conv_channels, T]
     ggml_tensor * z   = mm(c, L.attn_gate, cur);       // [d_in, T]
 
-    ggml_tensor * beta = ggml_sigmoid(c,
-        ggml_reshape_4d(c, mm(c, L.ssm_beta, cur), 1, Hv, T, 1));
-    ggml_tensor * alpha = ggml_reshape_3d(c, mm(c, L.ssm_alpha, cur), Hv, T, 1);
-    alpha = ggml_softplus(c, ggml_add(c, alpha, L.ssm_dt_bias));
-    ggml_tensor * gate = ggml_reshape_4d(c, ggml_mul(c, alpha, L.ssm_a), 1, Hv, T, 1);
+    // Decode, draft and verify steps (up to 8 rows) let the recurrence apply sigmoid(beta) and softplus(alpha + dt_bias)
+    // * A to the raw projections, the same expressions as the ops below. Prompt chunks on gfx1151 need the ops: the
+    // tiled recurrence takes finished gates.
+    const bool step = T <= 8;
+    const bool raw_gates = step && L.ssm_gate_ba;
+    ggml_tensor * beta = ggml_reshape_4d(c, mm(c, L.ssm_beta, cur), 1, Hv, T, 1);
+    ggml_tensor * gate;
+    if (raw_gates) {
+        gate = ggml_reshape_4d(c, mm(c, L.ssm_alpha, cur), 1, Hv, T, 1);
+    } else {
+        beta = ggml_sigmoid(c, beta);
+        ggml_tensor * alpha = ggml_reshape_3d(c, mm(c, L.ssm_alpha, cur), Hv, T, 1);
+        alpha = ggml_softplus(c, ggml_add(c, alpha, L.ssm_dt_bias));
+        gate = ggml_reshape_4d(c, ggml_mul(c, alpha, L.ssm_a), 1, Hv, T, 1);
+    }
 
     ggml_tensor * hist = ggml_reshape_3d(c, conv_state, kernel - 1, conv_channels, 1);
     // Keep the transpose as a view: the fused concat+transpose kernel keys off src1->nb[1] == sizeof(float).
     ggml_tensor * qkv_t = ggml_transpose(c, ggml_reshape_2d(c, qkv, conv_channels, T));
     ggml_tensor * conv_input = ggml_concat(c, hist, qkv_t, 0);
 
+    // Steps write the conv history with one strided copy each: the new history, and in a verify step every token's
+    // window at once (window t starts t+1 columns in, so the windows overlap and the source view is widened after it
+    // is made). Prompt chunks keep the CONT copies the gfx1151 conv fusion matches.
     // nb[0] is the element size, so the tail offset is T*nb[0], NOT T*nb[1].
-    ggml_tensor * new_hist = ggml_cont(c, ggml_view_3d(c, conv_input, kernel - 1, conv_channels, 1,
-        conv_input->nb[1], conv_input->nb[2], (size_t) T * conv_input->nb[0]));
-    ggml_build_forward_expand(gf, ggml_cpy(c, new_hist,
+    ggml_tensor * new_hist = ggml_view_3d(c, conv_input, kernel - 1, conv_channels, 1,
+        conv_input->nb[1], conv_input->nb[2], (size_t) T * conv_input->nb[0]);
+    ggml_build_forward_expand(gf, ggml_cpy(c, step ? new_hist : ggml_cont(c, new_hist),
         ggml_reshape_3d(c, conv_state, kernel - 1, conv_channels, 1)));
-    for (int64_t t = 0; spec_conv && t < T; ++t) {
+    if (spec_conv && step) {
+        ggml_tensor * windows = ggml_view_3d(c, conv_input, kernel - 1, conv_channels, 1,
+            conv_input->nb[1], conv_input->nb[2], conv_input->nb[0]);
+        windows->ne[2] = T;
+        windows->nb[2] = conv_input->nb[0];
+        windows->nb[3] = windows->nb[2] * T;
+        ggml_build_forward_expand(gf, ggml_cpy(c, windows, ggml_view_3d(c, spec_conv, kernel - 1, conv_channels, T,
+            spec_conv->nb[1], spec_conv->nb[2], 0)));
+    }
+    for (int64_t t = 0; spec_conv && !step && t < T; ++t) {
         ggml_build_forward_expand(gf, ggml_cpy(c, ggml_cont(c, ggml_view_3d(c, conv_input, kernel - 1, conv_channels, 1,
             conv_input->nb[1], conv_input->nb[2], (t + 1) * conv_input->nb[0])),
             ggml_view_3d(c, spec_conv, kernel - 1, conv_channels, 1,
@@ -412,34 +434,49 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor 
 
     const size_t esz     = ggml_element_size(conv);
     const size_t tstride = (size_t) conv_channels * esz;
-    ggml_tensor * q_raw = ggml_view_3d(c, conv, D, Hk, T, D * esz, tstride, 0);
-    ggml_tensor * k_raw = ggml_view_3d(c, conv, D, Hk, T, D * esz, tstride, D * Hk * esz);
     // Upstream build_gdn_l2_norm is rms_norm(x, eps/n) * (1/sqrt(n)) == x/sqrt(sum(x^2)+eps).
     // ggml_l2_norm instead rounds x*rsqrtf(max(sum(x^2), eps^2)), a ~1e-6 relative difference
     // that seeds the GDN recurrence and flips MoE routing.
-    ggml_tensor * q_c = ggml_scale(c, ggml_rms_norm(c, q_raw, eps / (float) D), 1.0f / sqrtf((float) D));
-    ggml_tensor * k_c = ggml_scale(c, ggml_rms_norm(c, k_raw, eps / (float) D), 1.0f / sqrtf((float) D));
+    ggml_tensor * q_c;
+    ggml_tensor * k_c;
+    if (step) {   // q and k are adjacent in the conv output: one norm and one scale over both, the same per-row math
+        ggml_tensor * qk_c = ggml_scale(c, ggml_rms_norm(c, ggml_view_3d(c, conv, D, 2 * Hk, T, D * esz, tstride, 0),
+            eps / (float) D), 1.0f / sqrtf((float) D));
+        q_c = ggml_view_3d(c, qk_c, D, Hk, T, qk_c->nb[1], qk_c->nb[2], 0);
+        k_c = ggml_view_3d(c, qk_c, D, Hk, T, qk_c->nb[1], qk_c->nb[2], Hk * qk_c->nb[1]);
+    } else {
+        ggml_tensor * q_raw = ggml_view_3d(c, conv, D, Hk, T, D * esz, tstride, 0);
+        ggml_tensor * k_raw = ggml_view_3d(c, conv, D, Hk, T, D * esz, tstride, D * Hk * esz);
+        q_c = ggml_scale(c, ggml_rms_norm(c, q_raw, eps / (float) D), 1.0f / sqrtf((float) D));
+        k_c = ggml_scale(c, ggml_rms_norm(c, k_raw, eps / (float) D), 1.0f / sqrtf((float) D));
+    }
     ggml_tensor * v_c = ggml_view_3d(c, conv, D, Hv, T, D * esz, tstride, 2 * D * Hk * esz);
 
     ggml_tensor * state4 = ggml_reshape_4d(c, ssm_state, D, D, Hv, 1);
-    ggml_tensor * gdn = ggml_gated_delta_net(c, q_c, k_c, v_c, gate, beta, state4);
+    // Steps update the recurrent state in place (each kernel block owns its state columns); prompt chunks keep the
+    // packed final state and its copy, which the gfx1151 tiled recurrence (16+ rows) writes.
+    ggml_tensor * gdn = step ? ggml_gated_delta_net_inplace(c, q_c, k_c, v_c, gate, beta, state4)
+                             : ggml_gated_delta_net(c, q_c, k_c, v_c, gate, beta, state4);
+    if (raw_gates) ggml_gated_delta_net_set_raw_gates(gdn, L.ssm_gate_ba);
     // Only speculative rollback needs per-token intermediate states; skipping keeps the packed result allocatable.
     ggml_gated_delta_net_set_skip_intermediate(gdn, true);
     // The kernel writes them straight to spec_states (same F32 transposed layout as the state, token-major); the
     // packed result stays compact because skip was set first.
     if (spec_states) gdn->src[7] = spec_states;
 
-    // packed: [ attn S_v*H_v*T | final_state S_v*S_v*H_v ]
+    // packed: [ attn S_v*H_v*T | final_state S_v*S_v*H_v (prompt chunks) ]
     ggml_tensor * attn = ggml_view_4d(c, gdn, D, Hv, T, 1,
         ggml_row_size(gdn->type, D),
         ggml_row_size(gdn->type, D * Hv),
         ggml_row_size(gdn->type, D * Hv * T), 0);
-    ggml_tensor * new_state = ggml_view_4d(c, gdn, D, D, Hv, 1,
-        ggml_row_size(gdn->type, D),
-        ggml_row_size(gdn->type, D * D),
-        ggml_row_size(gdn->type, D * D * Hv),
-        ggml_row_size(gdn->type, D * Hv * T));
-    ggml_build_forward_expand(gf, ggml_cpy(c, new_state, state4));
+    if (!step) {
+        ggml_tensor * new_state = ggml_view_4d(c, gdn, D, D, Hv, 1,
+            ggml_row_size(gdn->type, D),
+            ggml_row_size(gdn->type, D * D),
+            ggml_row_size(gdn->type, D * D * Hv),
+            ggml_row_size(gdn->type, D * Hv * T));
+        ggml_build_forward_expand(gf, ggml_cpy(c, new_state, state4));
+    }
 
     // Gated norm written as F16 in one pass, read directly by ssm_out's Q8_0 -> F16 GEMM (same arithmetic as the
     // chain below, so bit-exact).

@@ -54,6 +54,7 @@ struct Qwen4ExpLayer {
     ggml_tensor * ssm_beta       = nullptr;  // per-token beta input projection
     ggml_tensor * ssm_a          = nullptr;  // per-head -A parameter
     ggml_tensor * ssm_dt_bias    = nullptr;  // alpha bias
+    ggml_tensor * ssm_gate_ba    = nullptr;  // [dt_bias | A] f32 [2*H_v]: steps let the recurrence apply the gates
     ggml_tensor * ssm_norm       = nullptr;
     ggml_tensor * ssm_out        = nullptr;
 
@@ -156,6 +157,8 @@ struct Qwen4ExpWeights {
     ggml_backend_buffer_t      lut_buf = nullptr;
     std::vector<ggml_tensor *> hot_lut;    // per layer [1, n_expert] i32: hot slot, -1 if cold (null: no hot experts)
     std::vector<ggml_tensor *> cold_lut;   // per layer [1, n_expert] i32: the expert, -1 if hot
+    ggml_context *             gate_ctx = nullptr;   // the layers' ssm_gate_ba
+    ggml_backend_buffer_t      gate_buf = nullptr;
     std::unique_ptr<Qwen4ExpRouteRecorder> route_recorder;
 
     CpuEmbedder           embedder;

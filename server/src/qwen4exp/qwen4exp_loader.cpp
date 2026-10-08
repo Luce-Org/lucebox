@@ -332,6 +332,50 @@ std::string find_qwen4exp_mtp_sidecar(const std::string & model_path) {
     return name.empty() ? std::string() : (dir / name).string();
 }
 
+// [dt_bias | A] per linear layer, so decode and verify steps hand the raw alpha/beta projections to the recurrence
+// (ggml_gated_delta_net_set_raw_gates) instead of running the add, softplus, mul and sigmoid kernels. Without it the
+// graph keeps those ops.
+static void build_qwen4exp_gate_ba(Qwen4ExpWeights & w, ggml_backend_t backend) {
+    std::vector<Qwen4ExpLayer *> linear;
+    for (Qwen4ExpLayer & L : w.layers) {
+        if (L.is_full_attention || !L.ssm_dt_bias || !L.ssm_a) continue;
+        const int64_t H = ggml_nelements(L.ssm_dt_bias);
+        if (L.ssm_dt_bias->type != GGML_TYPE_F32 || L.ssm_a->type != GGML_TYPE_F32 || ggml_nelements(L.ssm_a) != H ||
+            !ggml_is_contiguous(L.ssm_dt_bias) || !ggml_is_contiguous(L.ssm_a)) return;
+        linear.push_back(&L);
+    }
+    if (linear.empty()) return;
+    const ggml_init_params ip = { linear.size() * ggml_tensor_overhead(), nullptr, true };
+    w.gate_ctx = ggml_init(ip);
+    for (Qwen4ExpLayer * L : linear) {
+        L->ssm_gate_ba = ggml_new_tensor_1d(w.gate_ctx, GGML_TYPE_F32, 2 * ggml_nelements(L->ssm_dt_bias));
+    }
+    w.gate_buf = ggml_backend_alloc_ctx_tensors(w.gate_ctx, backend);
+    if (!w.gate_buf) {
+        for (Qwen4ExpLayer * L : linear) L->ssm_gate_ba = nullptr;
+        ggml_free(w.gate_ctx);
+        w.gate_ctx = nullptr;
+        return;
+    }
+    ggml_backend_buffer_set_usage(w.gate_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<float> ba;
+    for (Qwen4ExpLayer * L : linear) {
+        const size_t H = (size_t) ggml_nelements(L->ssm_dt_bias);
+        ba.resize(2 * H);
+        ggml_backend_tensor_get(L->ssm_dt_bias, ba.data(), 0, H * sizeof(float));
+        ggml_backend_tensor_get(L->ssm_a, ba.data() + H, 0, H * sizeof(float));
+        ggml_backend_tensor_set(L->ssm_gate_ba, ba.data(), 0, 2 * H * sizeof(float));
+    }
+}
+
+static void free_qwen4exp_gate_ba(Qwen4ExpWeights & w) {
+    for (Qwen4ExpLayer & L : w.layers) L.ssm_gate_ba = nullptr;
+    if (w.gate_buf) ggml_backend_buffer_free(w.gate_buf);
+    if (w.gate_ctx) ggml_free(w.gate_ctx);
+    w.gate_buf = nullptr;
+    w.gate_ctx = nullptr;
+}
+
 bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
                         Qwen4ExpWeights & out, const std::string & mtp_override, int mtp_vocab) {
     out.gfx1151 = ggml_backend_cuda_qwen4exp_supported(backend);
@@ -385,6 +429,7 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         if (out.mtp_vocab_ctx) ggml_free(out.mtp_vocab_ctx);
         out.mtp_vocab_buf = nullptr;
         out.mtp_vocab_ctx = nullptr;
+        free_qwen4exp_gate_ba(out);
         reset_qwen4exp_mtp_fields(out);
         for (ShardSource & shard : shards) {
             gguf_free(shard.gctx);
@@ -872,6 +917,8 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
                      mtp_vocab, (long long) nv, ggml_nbytes(out.mtp_output), ggml_nbytes(out.mtp_embd));
     }
 
+    build_qwen4exp_gate_ba(out, backend);
+
     // The PLE lookup table is served lazily from whichever shard holds it
     // (ISTA-DASLab isolates it in a separate shard; bartowski-style splits keep
     // it in shard 1; single-file models trivially have it in `path`).
@@ -945,6 +992,7 @@ void free_qwen4exp_weights(Qwen4ExpWeights & w) {
     }
     w.hot_lut.clear();
     w.cold_lut.clear();
+    free_qwen4exp_gate_ba(w);
     for (ggml_context * extra : w.extra_meta_ctxs) {
         if (extra) ggml_free(extra);
     }
