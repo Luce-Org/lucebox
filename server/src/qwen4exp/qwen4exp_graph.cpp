@@ -1263,6 +1263,710 @@ struct Qwen4ExpStream {
     ggml_tensor * last_cur = nullptr, * last_inject = nullptr, * last_res = nullptr;
 };
 
+// The attention inputs of a run of layers: the whole forward's, or one stream's.
+struct Qwen4ExpLayerInputs {
+    int64_t pos0 = 0, kv_len = 0;
+    int n_pooled = 0;
+    Qwen4ExpQsaMode qsa = QSA_DENSE;
+    ggml_tensor * positions = nullptr, * mask = nullptr, * ple_in = nullptr;
+};
+
+// A layer's attention output, injection and residual, every row: the MTP hidden's FFN half runs on them.
+struct Qwen4ExpBranch {
+    ggml_tensor * cur = nullptr, * inject = nullptr, * res = nullptr;
+};
+
+// The per-layer pieces of a forward graph. The single-stream layers and each stream of a pipelined prompt chunk are
+// built from them.
+struct Qwen4ExpLayerBuilder {
+    ggml_context * ctx;
+    ggml_cgraph * gf;
+    const Qwen4ExpWeights & w;
+    Qwen4ExpCache & cache;
+    bool verify, split, has_ple;
+    std::vector<ggml_tensor *> & expert_nodes;          // split mode: pinned to the expert device
+    ggml_tensor * kv_row = nullptr;                     // stable graphs: the K/V rows this forward writes
+    const std::vector<Qwen4ExpAttnRow> * rows = nullptr;   // verify: each row's T=1 attention inputs
+    const Qwen4ExpDecodeWorkspace * qsa_ws = nullptr;   // stable QSA: the graph's runtime QSA inputs
+    std::vector<int> lin_idx, full_idx, ple_idx;        // per layer: its index among the linear, full and PLE layers
+
+    Qwen4ExpLayerBuilder(ggml_context * ctx, ggml_cgraph * gf, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
+                         bool verify, bool split, bool has_ple, std::vector<ggml_tensor *> & expert_nodes)
+        : ctx(ctx), gf(gf), w(w), cache(cache), verify(verify), split(split), has_ple(has_ple),
+          expert_nodes(expert_nodes), lin_idx(w.n_layer, -1), full_idx(w.n_layer, -1), ple_idx(w.n_layer, -1) {
+        for (size_t i = 0; i < cache.linear_layer_ids.size(); ++i) lin_idx[cache.linear_layer_ids[i]] = (int) i;
+        for (size_t i = 0; i < cache.full_layer_ids.size(); ++i)   full_idx[cache.full_layer_ids[i]] = (int) i;
+        for (size_t i = 0; i < cache.ple_layer_ids.size(); ++i)    ple_idx[cache.ple_layer_ids[i]] = (int) i;
+    }
+
+    // Layer il + 1 starts with PLE, so layer il's output cannot be fused with its attention norm.
+    bool next_is_ple(int il) const { return il + 1 < w.n_layer && w.layers[il + 1].is_ple && has_ple; }
+
+    // Attention half of layer il: PLE, the HC mix into the attention input (from the previous layer's fused norm when
+    // xn_next holds it), and the attention. `inject` receives the mix's injection.
+    ggml_tensor * attn_half(int il, const Qwen4ExpLayerInputs & b, ggml_tensor *& res_hc, ggml_tensor *& xn_next,
+                            ggml_tensor *& inject) {
+        const Qwen4ExpLayer & L = w.layers[il];
+        if (L.is_ple && has_ple) {
+            res_hc = build_ple(ctx, gf, res_hc, b.ple_in, L, w, cache.ple_conv_state[ple_idx[il]],
+                               verify ? cache.spec_ple : nullptr);
+            xn_next = nullptr;   // PLE changed the residual; the norm must rerun
+        }
+        ggml_tensor * cur;
+        if (xn_next != nullptr) {
+            cur = hc_mix_from_xn(ctx, xn_next, L.hc_attn_down, L.hc_attn_up,
+                                 L.hc_attn_inject, &inject, w.n_embd, w.n_hc);
+        } else {
+            cur = hc_mix(ctx, res_hc, L.hc_attn_norm, L.hc_attn_down,
+                         L.hc_attn_up, L.hc_attn_inject, &inject,
+                         w.n_embd, w.n_hc, w.rms_eps);
+        }
+        xn_next = nullptr;
+        if (L.is_full_attention) {
+            const int fi = full_idx[il];
+            return build_full_attn(ctx, gf, cur, L, w,
+                                   cache.attn_k[fi], cache.attn_v[fi], cache.indexer_k[fi],
+                                   w.qsa ? cache.indexer_raw[fi] : nullptr,
+                                   b.positions, b.mask, kv_row, b.kv_len, b.pos0,
+                                   il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0,
+                                   b.n_pooled, b.qsa, rows, qsa_ws);
+        }
+        const int li = lin_idx[il];
+        return build_linear_attn(ctx, gf, cur, L, w, cache.ssm_state[li], cache.conv_state[li],
+                                 verify ? cache.spec_ssm[li] : nullptr, verify ? cache.spec_conv[li] : nullptr);
+    }
+
+    // The last layer's FFN runs on the output row only. Upstream selects output rows before the final HC/FFN, so its
+    // quantized matmuls dispatch with one token (MMV rather than MMQ); this reuses that selection after all attention
+    // cache writes. Earlier rows have no remaining stateful consumers.
+    void last_row(ggml_tensor *& cur, ggml_tensor *& inject, ggml_tensor *& res_hc, int64_t rows_T) {
+        cur = ggml_view_2d(ctx, cur, w.n_embd, 1, cur->nb[1], (rows_T - 1)*cur->nb[1]);
+        inject = ggml_view_2d(ctx, inject, inject->ne[0], 1, inject->nb[1], (rows_T - 1)*inject->nb[1]);
+        res_hc = ggml_view_3d(ctx, res_hc, w.n_embd, w.n_hc, 1,
+                              res_hc->nb[1], res_hc->nb[2], (rows_T - 1)*res_hc->nb[2]);
+    }
+
+    // HC combine of the attention output into the FFN norm, and the HC mix into the MoE input.
+    ggml_tensor * ffn_input(int il, ggml_tensor * cur, ggml_tensor *& inject, ggml_tensor *& res_hc, int64_t layer_T) {
+        const Qwen4ExpLayer & L = w.layers[il];
+        ggml_tensor * ffn_fused = hc_combine_norm(ctx, inject, res_hc, cur,
+            L.hc_ffn_norm, w.n_embd, w.n_hc, layer_T, w.rms_eps);
+        res_hc = hc_norm_res(ctx, ffn_fused, w.n_embd, w.n_hc, layer_T);
+        return hc_mix_from_xn(ctx, hc_norm_xn(ctx, ffn_fused, w.n_embd, w.n_hc, layer_T),
+                              L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, &inject,
+                              w.n_embd, w.n_hc);
+    }
+
+    // HC combine of the MoE output into the residual, fused with the next layer's attention norm (left in xn_next)
+    // unless that layer starts with PLE. Returns the new residual.
+    ggml_tensor * ffn_output(int il, ggml_tensor * moe_out, ggml_tensor * inject, ggml_tensor * res_hc,
+                             int64_t layer_T, ggml_tensor *& xn_next) {
+        if (next_is_ple(il)) {
+            xn_next = nullptr;
+            return hc_combine(ctx, res_hc, moe_out, inject, w.n_embd, w.n_hc, layer_T);
+        }
+        ggml_tensor * gamma = (il + 1 < w.n_layer) ? w.layers[il + 1].hc_attn_norm : w.output_hc_norm;
+        ggml_tensor * f = hc_combine_norm(ctx, inject, res_hc, moe_out,
+            gamma, w.n_embd, w.n_hc, layer_T, w.rms_eps);
+        xn_next = hc_norm_xn(ctx, f, w.n_embd, w.n_hc, layer_T);
+        return hc_norm_res(ctx, f, w.n_embd, w.n_hc, layer_T);
+    }
+
+    // FFN half of layer il: ffn_input, the MoE and ffn_output. Returns the new residual.
+    ggml_tensor * ffn_half(int il, ggml_tensor * cur, ggml_tensor * inject, ggml_tensor * res_hc, int64_t layer_T,
+                           ggml_tensor *& xn_next) {
+        const Qwen4ExpLayer & L = w.layers[il];
+        cur = ffn_input(il, cur, inject, res_hc, layer_T);
+        // Prefill: the MoE combine runs inside the next HC_COMBINE_NORM (one kernel fewer; last-bit numerics change
+        // from FMA contraction in the new kernel, covered by the long-prompt quality gate). Not at T=1: it cost ~1.7% decode.
+        Qwen4ExpMoeParts moe_parts;
+        const bool fold = !split && !next_is_ple(il) && ggml_backend_cuda_mmb_prefill(layer_T);
+        cur = build_moe(ctx, cur, L, w, fold ? &moe_parts : nullptr, split ? &expert_nodes : nullptr);
+        if (!fold) return ffn_output(il, cur, inject, res_hc, layer_T, xn_next);
+        ggml_tensor * gamma = (il + 1 < w.n_layer)
+            ? w.layers[il + 1].hc_attn_norm : w.output_hc_norm;
+        ggml_tensor * f = ggml_hc_combine_norm_moe(ctx, inject, res_hc, moe_parts.down, moe_parts.weights,
+            moe_parts.shared, moe_parts.shared_logit, gamma, 1.0f / (float) w.n_hc, 0.0f, 2.0f, 0.0f, w.rms_eps);
+        xn_next = hc_norm_xn(ctx, f, w.n_embd, w.n_hc, layer_T);
+        return hc_norm_res(ctx, f, w.n_embd, w.n_hc, layer_T);
+    }
+};
+
+// A split prompt chunk as n streams of about 4096 rows (2..4, multiples of 256; the last takes the rest). Per layer
+// the graph is emitted as
+//   R(0) C(n-1,l-1) S(0)  R(1) C(0) S(1)  ...  R(n-1) C(n-2) S(n-1),
+// R = target work (attention, HC, router, shared expert), S = the routed experts on the expert device, C = the
+// target-side combine. A stream's own chain per layer (R, copy, S, copy, C) is longer than either device's share of
+// the layer, so two streams leave the copies on the critical path; more streams keep both devices busy.
+// Creates the streams and their inputs, leaves the last stream's residual and fused norm in res_hc / xn_next and
+// returns the QSA blocks pooled once the chunk computes.
+static int build_pipelined_layers(Qwen4ExpLayerBuilder & lb, int64_t pos0, int64_t T, bool want_hidden,
+                                  std::vector<Qwen4ExpStream> & streams, ggml_tensor *& emb_rows,
+                                  ggml_tensor *& res_hc, ggml_tensor *& xn_next) {
+    const Qwen4ExpWeights & w = lb.w;
+    ggml_context * ctx = lb.ctx;
+    ggml_cgraph * gf = lb.gf;
+    int pipeline_blocks = lb.cache.indexer_blocks;
+    const int64_t r = std::max<int64_t>(1, qsa_ratio(w));
+    const int n_streams = (int) std::clamp<int64_t>(T / kQwen4ExpPipelineStreamRows, 2, 4);
+    streams.resize(n_streams);
+    for (int i = 0; i + 1 < n_streams; ++i) {
+        streams[i].T = std::max<int64_t>(256, (T / n_streams) / 256 * 256);
+    }
+    streams.back().T = T;
+    for (int i = 0; i + 1 < n_streams; ++i) streams.back().T -= streams[i].T;
+    emb_rows = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_embd, T);
+    ggml_set_input(emb_rows);
+    int64_t start = pos0;
+    for (Qwen4ExpStream & st : streams) {
+        st.pos0 = start;
+        start += st.T;
+        st.qsa = qsa_mode(w, lb.cache, st.T, st.pos0, w.qsa);
+        st.n_pooled = pipeline_blocks;   // what the previous stream commits, as for sequential chunks
+        if (st.qsa != QSA_DENSE && (st.pos0 + st.T) / r > w.indexer_top_k / r) {
+            pipeline_blocks = (int) ((st.pos0 + st.T) / r);
+        }
+        st.inp_emb = ggml_view_2d(ctx, emb_rows, w.n_embd, st.T, emb_rows->nb[1], (st.pos0 - pos0) * emb_rows->nb[1]);
+        st.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * st.T);
+        ggml_set_input(st.positions);
+        if (st.qsa == QSA_DENSE) {
+            st.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, st.pos0 + st.T, st.T);
+            ggml_set_input(st.mask);
+        }
+        if (lb.has_ple) {
+            st.ple_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.ple_head_dim * w.ple_n_heads, st.T);
+            ggml_set_input(st.ple_in);
+        }
+        st.res_hc = repeat_dim1(ctx, ggml_reshape_3d(ctx, st.inp_emb, w.n_embd, 1, st.T), w.n_hc);
+    }
+    auto stage_r = [&](Qwen4ExpStream & st, int il) {
+        ggml_tensor * inject = nullptr;
+        ggml_tensor * cur = lb.attn_half(il, { st.pos0, st.pos0 + st.T, st.n_pooled, st.qsa, st.positions, st.mask,
+                                               st.ple_in }, st.res_hc, st.xn_next, inject);
+        st.layer_T = st.T;
+        if (il == w.n_layer - 1) {
+            if (want_hidden) {
+                st.last_cur = cur;
+                st.last_inject = inject;
+                st.last_res = st.res_hc;
+            }
+            if (&st != &streams.back()) {   // only its cache writes are needed
+                ggml_build_forward_expand(gf, cur);
+                st.done = true;
+                return;
+            }
+            if (st.T > 1) {
+                lb.last_row(cur, inject, st.res_hc, st.T);
+                st.layer_T = 1;
+            }
+        }
+        st.inject = inject;
+        cur = lb.ffn_input(il, cur, st.inject, st.res_hc, st.layer_T);
+        st.route = build_moe_route(ctx, cur, w.layers[il], w);
+        for (ggml_tensor * t : { st.route.xin, st.route.sel, st.route.wsel, st.route.shared, st.inject, st.res_hc }) {
+            ggml_build_forward_expand(gf, t);
+        }
+    };
+    auto stage_s = [&](Qwen4ExpStream & st, int il) {
+        if (st.done) return;
+        st.routed = build_moe_routed(ctx, st.route, w.layers[il], w, lb.expert_nodes);
+        ggml_build_forward_expand(gf, st.routed);
+    };
+    auto stage_c = [&](Qwen4ExpStream & st, int il) {
+        if (st.done) return;
+        st.res_hc = lb.ffn_output(il, moe_join(ctx, st.routed, st.route.shared), st.inject, st.res_hc,
+                                  st.layer_T, st.xn_next);
+        if (st.xn_next) ggml_build_forward_expand(gf, st.xn_next);
+        ggml_build_forward_expand(gf, st.res_hc);
+    };
+    for (int il = 0; il < w.n_layer; ++il) {
+        for (int i = 0; i < n_streams; ++i) {
+            stage_r(streams[i], il);
+            if (i > 0) {
+                stage_c(streams[i - 1], il);
+            } else if (il > 0) {
+                stage_c(streams.back(), il - 1);
+            }
+            stage_s(streams[i], il);
+        }
+    }
+    stage_c(streams.back(), w.n_layer - 1);
+    res_hc = streams.back().res_hc;
+    xn_next = streams.back().xn_next;
+    return pipeline_blocks;
+}
+
+// The streams' inputs: embeddings, M-RoPE positions (section-major), the causal masks over each stream's prefix and
+// the PLE rows.
+static void upload_pipeline_inputs(const std::vector<Qwen4ExpStream> & streams, const Qwen4ExpWeights & w,
+                                   const std::vector<float> & emb, const std::vector<float> & ple) {
+    int64_t t0 = 0;
+    for (const Qwen4ExpStream & st : streams) {
+        std::vector<int32_t> sp((size_t) 4 * st.T, 0);
+        for (int64_t i = 0; i < st.T; ++i) {
+            sp[(size_t) i] = sp[(size_t) (st.T + i)] = sp[(size_t) (2 * st.T + i)] = (int32_t) (st.pos0 + i);
+        }
+        ggml_backend_tensor_set(st.inp_emb, emb.data() + (size_t) t0 * w.n_embd, 0, sizeof(float) * w.n_embd * st.T);
+        ggml_backend_tensor_set(st.positions, sp.data(), 0, sizeof(int32_t) * sp.size());
+        if (st.mask) {
+            const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+            const int64_t cols = st.pos0 + st.T;
+            std::vector<ggml_fp16_t> sm((size_t) cols * st.T);
+            for (int64_t row = 0; row < st.T; ++row) {
+                for (int64_t col = 0; col < cols; ++col) {
+                    sm[(size_t) (row * cols + col)] = col <= st.pos0 + row ? zero : ninf;
+                }
+            }
+            ggml_backend_tensor_set(st.mask, sm.data(), 0, sizeof(ggml_fp16_t) * sm.size());
+        }
+        if (st.ple_in) {
+            const size_t row = (size_t) w.ple_head_dim * w.ple_n_heads;
+            ggml_backend_tensor_set(st.ple_in, ple.data() + (size_t) t0 * row, 0, sizeof(float) * row * st.T);
+        }
+        t0 += st.T;
+    }
+}
+
+// True when QSA rows can attend inside a retained graph: ratio-4 indexers with a 2048-key budget, a context within
+// the runtime-count top-k's range, and a backend whose top-k has that variant. No allocation or host readback: the
+// backend is asked about the op. In particular, nondeterministic CUDA DeviceTopK is excluded.
+static bool stable_qsa_supported(ggml_backend_t backend, const Qwen4ExpWeights & w, const Qwen4ExpCache & cache,
+                                 int64_t kv_end) {
+    if (qsa_ratio(w) != 4 || w.indexer_top_k != 2048 || kv_end > 262144) return false;
+    ggml_tensor scores{}, valid{}, selection{};
+    scores.type = GGML_TYPE_F32;
+    scores.ne[0] = std::min<int64_t>(cache.max_ctx, (kv_end + 255) / 256 * 256) / 4;
+    scores.ne[1] = scores.ne[2] = scores.ne[3] = 1;
+    scores.nb[0] = sizeof(float);
+    scores.nb[1] = scores.nb[2] = scores.nb[3] = scores.ne[0] * sizeof(float);
+    valid.type = GGML_TYPE_I32;
+    valid.ne[0] = valid.ne[1] = valid.ne[2] = valid.ne[3] = 1;
+    selection.op = GGML_OP_TOP_K;
+    selection.type = GGML_TYPE_I32;
+    selection.ne[0] = 512;
+    selection.ne[1] = selection.ne[2] = selection.ne[3] = 1;
+    selection.src[0] = &scores;
+    selection.src[1] = &valid;
+    if (!ggml_backend_supports_op(backend, &selection)) return false;
+    for (int il = 0; il < w.n_layer; ++il) {
+        if (w.layers[il].is_full_attention &&
+            (il >= (int) w.compress_ratios.size() || w.compress_ratios[il] != 4)) return false;
+    }
+    return true;
+}
+
+// A retained graph built for another backend, model or context cannot replay.
+static bool stable_workspace_stale(const Qwen4ExpDecodeWorkspace & ws, ggml_backend_t backend,
+                                   const Qwen4ExpWeights & w, int max_ctx) {
+    return ws.backend != backend || ws.model != &w || ws.max_ctx != max_ctx;
+}
+
+// One forward's inputs to a retained (stable) graph, and the host copies that must outlive their asynchronous upload
+// until the graph computes and its outputs are read.
+struct Qwen4ExpStableInputs {
+    ggml_backend_t backend = nullptr;
+    bool split = false;   // the scheduler may place an input in another backend's buffer: upload synchronously
+    bool qsa = false;     // the graph attends QSA rows through runtime inputs
+    int64_t pos0 = 0, T = 0, kv_len = 0;
+    int max_ctx = 0;
+    const std::vector<float> * emb = nullptr, * ple = nullptr;
+    std::vector<float> qsa_visibility;
+    std::vector<int32_t> qsa_params, i32;
+    std::vector<ggml_fp16_t> mask;
+
+    // Async on the target stream; synchronous in split mode.
+    void set(ggml_tensor * t, const void * data, size_t size) const {
+        if (split) ggml_backend_tensor_set(t, data, 0, size);
+        else       ggml_backend_tensor_set_async(backend, t, data, 0, size);
+    }
+};
+
+// Rows pos0..pos0+T-1 (layout: Qwen4ExpDecodeWorkspace::qsa_params): row t sees its (pos0+t+1)/4 complete blocks.
+// Slot s pools block pos0/4+s when this forward completes it; otherwise it recomputes the last block complete before
+// the rows.
+static void upload_stable_qsa(Qwen4ExpStableInputs & in, const Qwen4ExpDecodeWorkspace & ws) {
+    if (!in.qsa) return;
+    const int64_t T = in.T, pos0 = in.pos0;
+    const int64_t blocks = ws.qsa_blocks, last = (pos0 + 1) / 4 - 1;
+    in.qsa_visibility.assign((size_t) (blocks * T), -INFINITY);
+    in.qsa_params.assign((size_t) (10 * T), 0);
+    for (int64_t t = 0; t < T; ++t) {
+        const int64_t n = (pos0 + t + 1) / 4;
+        std::fill_n(in.qsa_visibility.begin() + t * blocks, n, 0.0f);
+        in.qsa_params[10 * t] = (int32_t) n;
+    }
+    for (int64_t s = 0; s < (T + 3) / 4; ++s) {
+        const int64_t block = pos0 / 4 + s;
+        const bool done = block < in.kv_len / 4;
+        int32_t * p = &in.qsa_params[10 * s];
+        for (int i = 0; i < 4; ++i) p[1 + i] = (int32_t) (4 * (done ? block : last) + i);
+        p[5] = done ? (int32_t) block : (in.max_ctx + 3) / 4;
+        p[6] = p[7] = p[8] = p[1];
+    }
+    in.set(ws.qsa_visibility, in.qsa_visibility.data(), in.qsa_visibility.size() * sizeof(float));
+    in.set(ws.qsa_params, in.qsa_params.data(), in.qsa_params.size() * sizeof(int32_t));
+}
+
+// Every position-dependent input of a stable graph: the M-RoPE positions (section-major: 0..2 carry the position, 3
+// is zero), the K/V rows, the dense masks (T=1: over the bucket; verify: each dense row's over its span), each QSA
+// row's positions, QSA.
+static void upload_stable_inputs(Qwen4ExpStableInputs & in, const Qwen4ExpDecodeWorkspace & ws) {
+    const int64_t T = in.T, pos0 = in.pos0;
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+    in.i32.assign((size_t) 9 * T, 0);
+    int32_t * pos = in.i32.data(), * rows = pos + 4 * T, * row_pos = rows + T;
+    for (int64_t i = 0; i < T; ++i) {
+        pos[i] = pos[T + i] = pos[2 * T + i] = rows[i] = (int32_t) (pos0 + i);
+        row_pos[4 * i] = row_pos[4 * i + 1] = row_pos[4 * i + 2] = (int32_t) (pos0 + i);
+    }
+    int64_t mask_elems = ws.mask ? ws.kv_bucket : 0;
+    for (int64_t span : ws.row_spans) mask_elems += span;
+    in.mask.assign((size_t) mask_elems, ninf);
+    ggml_fp16_t * m = in.mask.data();
+    in.set(ws.inp_emb, in.emb->data(), sizeof(float) * in.emb->size());
+    in.set(ws.positions, pos, sizeof(int32_t) * 4 * T);
+    in.set(ws.kv_row, rows, sizeof(int32_t) * T);
+    if (ws.ple_in) in.set(ws.ple_in, in.ple->data(), sizeof(float) * in.ple->size());
+    if (ws.mask) {
+        std::fill_n(m, in.kv_len, zero);
+        in.set(ws.mask, m, sizeof(ggml_fp16_t) * ws.kv_bucket);
+        m += ws.kv_bucket;
+    }
+    for (size_t t = 0; t < ws.row_spans.size(); ++t) {
+        if (ws.row_spans[t] == 0) {
+            if (ws.row_inputs[t]) in.set(ws.row_inputs[t], row_pos + 4 * t, 4 * sizeof(int32_t));
+            continue;
+        }
+        std::fill_n(m, pos0 + t + 1, zero);
+        in.set(ws.row_inputs[t], m, sizeof(ggml_fp16_t) * ws.row_spans[t]);
+        m += ws.row_spans[t];
+    }
+    upload_stable_qsa(in, ws);
+}
+
+// Replay a retained graph with this forward's inputs and read its logits (and hidden rows). A failed compute drops
+// the graph.
+static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace & ws, ggml_backend_sched_t short_sched,
+                             bool verify, std::vector<float> & out_logits, std::vector<float> * out_hidden) {
+    upload_stable_inputs(in, ws);
+    ggml_status status;
+    {   // verify: as built, with batch-invariant matmul columns (see forward_impl)
+        ScopedCudaGraphOverrides invariant(false, 0, false, 0, /*mmvq_batch_invariant=*/verify);
+        status = in.split ? ggml_backend_sched_graph_compute(ws.sched ? ws.sched : short_sched, ws.gf)
+                          : ggml_backend_graph_compute(in.backend, ws.gf);
+    }
+    if (status != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "[qwen4exp] stable graph compute failed\n");
+        clear_qwen4exp_decode_workspace(ws);
+        return false;
+    }
+    out_logits.resize((size_t) ggml_nelements(ws.logits));   // n_vocab, per row when verifying
+    ggml_backend_tensor_get(ws.logits, out_logits.data(), 0, ggml_nbytes(ws.logits));
+    if (out_hidden && ws.hidden) {
+        out_hidden->resize((size_t) ggml_nelements(ws.hidden));
+        ggml_backend_tensor_get(ws.hidden, out_hidden->data(), 0, ggml_nbytes(ws.hidden));
+    }
+    return true;
+}
+
+// Dense decode may not have maintained the pooled QSA prefix: pool the already-cached complete blocks before pos0
+// once. The stable graph handles this forward's own blocks.
+static bool bootstrap_qsa_prefix(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache, int pos0) {
+    ggml_context * bc = ggml_init({8 * 1024 * 1024, nullptr, true});
+    if (!bc) return false;
+    ggml_cgraph * bg = ggml_new_graph_custom(bc, 8192, false);
+    for (size_t fi = 0; fi < cache.full_layer_ids.size(); ++fi) {
+        const auto & L = w.layers[cache.full_layer_ids[fi]];
+        qsa_pooled_keys(bc, bg, L, w, cache.indexer_k[fi], cache.indexer_raw[fi], nullptr,
+                        pos0, 4, cache.indexer_blocks, pos0 / 4);
+    }
+    ggml_gallocr_t ba = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    const bool ok = ba && ggml_gallocr_alloc_graph(ba, bg) &&
+        ggml_backend_graph_compute(backend, bg) == GGML_STATUS_SUCCESS;
+    ggml_backend_cuda_graph_invalidate_range(backend, ggml_get_mem_buffer(bc), ggml_get_mem_size(bc));
+    if (ba) ggml_gallocr_free(ba);
+    ggml_free(bc);
+    if (ok) cache.indexer_blocks = pos0 / 4;
+    return ok;
+}
+
+// The graph's metadata context: a decode or verify workspace's own (`pool`), reset for a rebuild, or a fresh one.
+static ggml_context * graph_context(Qwen4ExpDecodeWorkspace * pool, ggml_backend_t backend, const Qwen4ExpWeights & w,
+                                   int max_ctx, bool verify) {
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 200000 +
+                  ggml_graph_overhead_custom(200000, false) + (1u << 20);
+    ip.no_alloc = true;
+    if (!pool) return ggml_init(ip);
+    if (pool->ctx == nullptr) {
+        pool->ctx = ggml_init(ip);
+    } else {
+        // Retire captures before recycling metadata/allocator addresses. A verify
+        // width rebuilds the same topology at the same addresses for a new span, so
+        // its captures stay and are updated at the next capture; every replay still
+        // checks node properties (as the expert device's captures always have).
+        // Retiring them cost ~30 ms per rebuild on ROCm, one capture per split.
+        if (!verify) {
+            ggml_backend_cuda_graph_invalidate_range(backend,
+                ggml_get_mem_buffer(pool->ctx), ggml_get_mem_size(pool->ctx));
+        }
+        ggml_reset(pool->ctx);
+    }
+    pool->gf = nullptr;
+    pool->backend = backend;
+    pool->model = &w;
+    pool->max_ctx = max_ctx;
+    return pool->ctx;
+}
+
+// Split mode: one scheduler for decode, verify and short batches, one for prompt chunks; a verify width keeps its
+// own short-batch scheduler (and allocation) beside its graph (`pool`). The chunk planner measures the live
+// split-input copies through ggml_backend_sched_reserve_size.
+static ggml_backend_sched_t split_scheduler(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
+                                            Qwen4ExpDecodeWorkspace * pool, bool verify, bool short_batch) {
+    ggml_backend_sched_t & sched = verify && pool ? pool->sched
+                                 : short_batch ? cache.split_sched_short : cache.split_sched;
+    if (!sched) {
+        if (!cache.split_cpu) cache.split_cpu = ggml_backend_cpu_init();
+        ggml_backend_t backends[3] = { backend, w.expert_backend, cache.split_cpu };
+        // Both are parallel: per-copy events make a split wait for its
+        // cross-device inputs on the GPU; a single-copy scheduler instead
+        // synchronizes the receiving device from the host before every such
+        // split, which serializes the two GPUs. Split-input copies live for
+        // the whole graph, so the prompt scheduler keeps one set.
+        sched = ggml_backend_sched_new(backends, nullptr, 3, 200000, true, false);
+        // End a split before a node that brings in a new cross-device input,
+        // so independent target work is queued before that wait and runs
+        // beside the expert device: the other stream's attention in a prompt
+        // chunk; the shared and hot experts in a decode or verify step.
+        ggml_backend_sched_set_late_cross_input_split(sched, true);
+        if (!short_batch) ggml_backend_sched_set_n_copies(sched, 1);   // events without four copy sets
+    }
+    return sched;
+}
+
+// MTP prompt catch-up: the MTP layer's K/V for every (embedding, hidden) pair of the chunk, and the chunk's last
+// hidden row carried into cache.mtp_prev_hidden (`hidden` becomes that row). Returns the pairs' positions input.
+static ggml_tensor * build_mtp_prefill(ggml_context * ctx, ggml_cgraph * gf, const Qwen4ExpWeights & w,
+                                       Qwen4ExpCache & cache, ggml_tensor *& hidden, ggml_tensor * emb_rows,
+                                       int64_t pos0, int64_t T) {
+    const int64_t H = w.n_embd, hc = w.n_hc, hd = H * hc;
+    const int64_t first = pos0 == 0 ? 1 : 0, pairs = T - first, start = pos0 - (1 - first);
+    ggml_tensor * h = ggml_reshape_2d(ctx, hidden, hd, T);
+    if (pos0 > 0) {
+        h = ggml_concat(ctx, cache.mtp_prev_hidden,
+            ggml_view_2d(ctx, h, hd, T - 1, h->nb[1], 0), 1);
+    }
+    ggml_tensor * mtp_positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * pairs);
+    ggml_set_input(mtp_positions);
+    // One submission, but exactly the old 512-row GEMMs, including the first
+    // chunk's short final slice. A single wider GEMM changes the K/V bytes.
+    for (int64_t i = 0; i < pairs; i += 512) {
+        const int64_t n = std::min<int64_t>(512, pairs - i);
+        ggml_tensor * e = ggml_view_2d(ctx, emb_rows, H, n, emb_rows->nb[1], (i + first) * emb_rows->nb[1]);
+        ggml_tensor * hi = ggml_view_2d(ctx, h, hd, n, h->nb[1], i * h->nb[1]);
+        ggml_tensor * p = ggml_reshape_1d(ctx, ggml_cont(ctx,
+            ggml_view_2d(ctx, mtp_positions, n, 4, pairs * sizeof(int32_t), i * sizeof(int32_t))), 4 * n);
+        ggml_tensor * r = mtp_input(ctx, w, e, hi);
+        const auto & L = w.mtp;
+        ggml_tensor * cur = hc_mix(ctx, r, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up,
+            nullptr, nullptr, H, hc, w.rms_eps);
+        build_full_attn(ctx, gf, cur, L, w, cache.mtp_k, cache.mtp_v, nullptr, nullptr,
+            p, nullptr, nullptr, start + i + n, start + i, 4, 0, QSA_DENSE,
+            nullptr, nullptr, /*kv_only=*/true);
+    }
+    // Carry one authoritative hidden row across chunks; only this row is
+    // read back for the first decode step. All prompt pairs stay on device.
+    hidden = ggml_view_2d(ctx, hidden, hd, 1, hidden->nb[2], (T - 1) * hidden->nb[2]);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, hidden, cache.mtp_prev_hidden));
+    return mtp_positions;
+}
+
+// The MTP pairs' M-RoPE positions: pair i sits at the position before its embedding's token.
+static void upload_mtp_positions(ggml_tensor * mtp_positions, int64_t pos0, int64_t T) {
+    const int64_t pairs = T - (pos0 == 0 ? 1 : 0), start = pos0 == 0 ? 0 : pos0 - 1;
+    std::vector<int32_t> p((size_t) 4 * pairs, 0);
+    for (int64_t i = 0; i < pairs; ++i) p[i] = p[pairs + i] = p[2 * pairs + i] = (int32_t) (start + i);
+    ggml_backend_tensor_set(mtp_positions, p.data(), 0, ggml_nbytes(mtp_positions));
+}
+
+// The target's share of the split scheduler, copies included. The planner probes shapes no request has built (up to
+// 32768 rows at the end of the context); a graph with a node no device runs keeps the single-device estimate, as the
+// scheduler could not place it.
+static void measure_split_graph(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
+                                ggml_cgraph * gf, const std::vector<ggml_tensor *> & expert_nodes, int64_t T, int pos0,
+                                bool verify, Qwen4ExpGraphMemory & measure) {
+    ggml_backend_sched_t sched = split_scheduler(backend, w, cache, nullptr, verify, T <= kSplitShortRows);
+    const ggml_backend_t devices[3] = { backend, w.expert_backend, cache.split_cpu };
+    const ggml_tensor * unplaced = nullptr;
+    for (int i = 0; i < ggml_graph_n_nodes(gf) && !unplaced; ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+            node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) continue;
+        if (std::none_of(devices, devices + 3, [&](ggml_backend_t b) { return b && ggml_backend_supports_op(b, node); })) {
+            unplaced = node;
+        }
+    }
+    if (unplaced) {
+        std::fprintf(stderr, "[qwen4exp] split plan T=%lld pos0=%d: %s (%s) runs on no device; single-device estimate\n",
+                     (long long) T, pos0, ggml_op_desc(unplaced), unplaced->name);
+        return;
+    }
+    ggml_backend_sched_reset(sched);
+    qwen4exp_pin_split(sched, gf, backend, w.expert_backend, expert_nodes);
+    size_t sizes[3] = {};
+    ggml_backend_sched_reserve_size(sched, gf, sizes);
+    ggml_backend_sched_reset(sched);
+    if (T <= kSplitShortRows) ++cache.split_short_gen;   // a retained stable graph must allocate again
+    measure.graph = sizes[0];
+}
+
+// Point a prompt chunk's inputs at this call's slot of the pinned host ring before allocation, so the allocator leaves
+// them alone. False when the ring cannot take them (they are then allocated and uploaded as usual).
+static bool place_inputs_in_ring(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache, int64_t T,
+                                 int64_t mask_len, bool has_ple, ggml_tensor * inp_emb, ggml_tensor * positions,
+                                 ggml_tensor * mask, ggml_tensor * ple_in) {
+    const size_t embd_need = static_cast<size_t>(w.n_embd) * T * sizeof(float);
+    const size_t pos_need  = static_cast<size_t>(4) * T * sizeof(int32_t);
+    const size_t ple_need  = has_ple
+        ? static_cast<size_t>(w.ple_head_dim) * w.ple_n_heads * T * sizeof(float) : 0;
+    const size_t mask_need = mask
+        ? static_cast<size_t>(mask_len) * T * sizeof(ggml_fp16_t) : 0;
+    ggml_backend_buffer_type_t host_buft =
+        ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+    if (host_buft == nullptr ||
+        !qwen4exp_input_ring_reserve(cache.input_ring, host_buft, embd_need, pos_need, ple_need, mask_need)) {
+        return false;
+    }
+    // Wait for the graph that last read this slot; the logits read already synchronizes each forward.
+    if (cache.input_ring.writes >= 2) {
+        ggml_backend_synchronize(backend);
+    }
+    const size_t slot = static_cast<size_t>(cache.input_ring.next_slot);
+    cache.input_ring.next_slot = (cache.input_ring.next_slot + 1) % 2;
+    cache.input_ring.writes++;
+    char * slot_base = cache.input_ring.base + slot * cache.input_ring.slot_bytes;
+    ggml_backend_tensor_alloc(cache.input_ring.buf, inp_emb, slot_base + cache.input_ring.embd_off);
+    ggml_backend_tensor_alloc(cache.input_ring.buf, positions, slot_base + cache.input_ring.pos_off);
+    if (mask) {
+        ggml_backend_tensor_alloc(cache.input_ring.buf, mask, slot_base + cache.input_ring.mask_off);
+    }
+    if (ple_in) {
+        ggml_backend_tensor_alloc(cache.input_ring.buf, ple_in, slot_base + cache.input_ring.ple_off);
+    }
+    return true;
+}
+
+// Allocate the graph: on the split scheduler (weights decide placement, see qwen4exp_pin_split), or with the
+// workspace's retained allocator (`pool`), or a fresh one (`galloc`, the caller frees it). On failure the caller
+// frees its context unless the workspace owns it.
+static bool allocate_graph(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
+                           Qwen4ExpDecodeWorkspace * pool, bool verify, ggml_cgraph * gf,
+                           const std::vector<ggml_tensor *> & expert_nodes, int64_t T, int64_t kv_len,
+                           ggml_backend_sched_t & split_sched, ggml_gallocr_t & galloc) {
+    if (w.expert_backend) {
+        split_sched = split_scheduler(backend, w, cache, pool, verify, T <= kSplitShortRows);
+        ggml_backend_sched_reset(split_sched);
+        qwen4exp_pin_split(split_sched, gf, backend, w.expert_backend, expert_nodes);
+        if (!ggml_backend_sched_alloc_graph(split_sched, gf)) {
+            std::fprintf(stderr, "[qwen4exp] split graph alloc failed (T=%lld kv_len=%lld)\n",
+                         (long long) T, (long long) kv_len);
+            return false;
+        }
+        if (split_sched == cache.split_sched_short) ++cache.split_short_gen;
+        return true;
+    }
+    if (pool) {
+        if (pool->alloc == nullptr) {
+            pool->alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        }
+        galloc = pool->alloc;
+    } else {
+        galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!galloc) {
+        std::fprintf(stderr, "[qwen4exp] graph allocator creation failed\n");
+        return false;
+    }
+    // T=1 graphs keep the same broad shape but advancing KV views can change
+    // lifetimes. Recompute assignments while retaining the allocator buffers;
+    // reusing the old index-wise plan produced incorrect tokens.
+    const bool reserve_ok = !pool || !pool->planned || ggml_gallocr_reserve(galloc, gf);
+    if (!reserve_ok || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        std::fprintf(stderr, "[qwen4exp] graph alloc failed (T=%lld kv_len=%lld)\n",
+                     (long long) T, (long long) kv_len);
+        if (pool) {
+            pool->planned = false;
+        } else {
+            ggml_gallocr_free(galloc);
+            galloc = nullptr;
+        }
+        return false;
+    }
+    if (pool) pool->planned = true;
+    return true;
+}
+
+// A rebuilt (not retained) graph's inputs: the embeddings, the M-RoPE positions (section-major [s*T + i]: 0..2 carry
+// the position, 3 is zero), the causal mask over mask_len keys, the PLE rows (into the host ring when `ring` placed
+// them there), and each verify row's mask or positions.
+static void upload_graph_inputs(ggml_tensor * inp_emb, ggml_tensor * positions, ggml_tensor * mask,
+                                ggml_tensor * ple_in, const std::vector<float> & emb, const std::vector<float> & ple,
+                                int64_t pos0, int64_t T, int64_t mask_len, bool ring,
+                                const std::vector<Qwen4ExpAttnRow> & rows) {
+    std::vector<int32_t> pos((size_t) 4 * T, 0);
+    for (int64_t i = 0; i < T; ++i) {
+        const int32_t p = (int32_t) (pos0 + i);
+        pos[(size_t) (0 * T + i)] = p;
+        pos[(size_t) (1 * T + i)] = p;
+        pos[(size_t) (2 * T + i)] = p;
+        pos[(size_t) (3 * T + i)] = 0;
+    }
+    std::vector<ggml_fp16_t> m;
+    if (mask) {
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+        m.resize((size_t) mask_len * T);
+        for (int64_t row = 0; row < T; ++row) {
+            const int64_t vis = pos0 + row;
+            for (int64_t col = 0; col < mask_len; ++col) {
+                m[(size_t) (row * mask_len + col)] = (col <= vis) ? zero : ninf;
+            }
+        }
+    }
+    if (ring) {
+        std::memcpy(inp_emb->data, emb.data(), sizeof(float) * emb.size());
+        std::memcpy(positions->data, pos.data(), sizeof(int32_t) * pos.size());
+        if (mask) {
+            std::memcpy(mask->data, m.data(), sizeof(ggml_fp16_t) * m.size());
+        }
+        if (ple_in) {
+            std::memcpy(ple_in->data, ple.data(), sizeof(float) * ple.size());
+        }
+    } else {
+        ggml_backend_tensor_set(inp_emb, emb.data(), 0, sizeof(float) * emb.size());
+        ggml_backend_tensor_set(positions, pos.data(), 0, sizeof(int32_t) * pos.size());
+        if (mask) {
+            ggml_backend_tensor_set(mask, m.data(), 0, sizeof(ggml_fp16_t) * m.size());
+        }
+        if (ple_in) {
+            ggml_backend_tensor_set(ple_in, ple.data(), 0, sizeof(float) * ple.size());
+        }
+    }
+    for (int64_t t = 0; t < (int64_t) rows.size(); ++t) {
+        const int32_t p = (int32_t) (pos0 + t);
+        if (rows[t].mask) {
+            std::vector<ggml_fp16_t> row_mask((size_t) rows[t].span, ggml_fp32_to_fp16(-INFINITY));
+            std::fill(row_mask.begin(), row_mask.begin() + p + 1, ggml_fp32_to_fp16(0.0f));
+            ggml_backend_tensor_set(rows[t].mask, row_mask.data(), 0, ggml_nbytes(rows[t].mask));
+        } else {
+            const int32_t row_pos[4] = { p, p, p, 0 };
+            ggml_backend_tensor_set(rows[t].positions, row_pos, 0, sizeof row_pos);
+        }
+    }
+}
+
 static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
                                        const Qwen4ExpWeights & w,
                                        Qwen4ExpCache & cache,
@@ -1292,32 +1996,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     }
     const int64_t kv_end = int64_t(pos0) + n_tokens;
     const bool qsa_rows = reuse_ws ? qsa == QSA_DECODE : verify && row_spans.back() == 0;
-    bool stable_qsa = qsa_rows && qsa_ratio(w) == 4 && w.indexer_top_k == 2048 && kv_end <= 262144;
-    if (stable_qsa) {
-        // No allocation/host readback: ask the backend about the runtime-count
-        // variant. In particular, nondeterministic CUDA DeviceTopK is excluded.
-        ggml_tensor scores{}, valid{}, selection{};
-        scores.type = GGML_TYPE_F32;
-        scores.ne[0] = std::min<int64_t>(cache.max_ctx, (kv_end + 255) / 256 * 256) / 4;
-        scores.ne[1] = scores.ne[2] = scores.ne[3] = 1;
-        scores.nb[0] = sizeof(float);
-        scores.nb[1] = scores.nb[2] = scores.nb[3] = scores.ne[0] * sizeof(float);
-        valid.type = GGML_TYPE_I32;
-        valid.ne[0] = valid.ne[1] = valid.ne[2] = valid.ne[3] = 1;
-        selection.op = GGML_OP_TOP_K;
-        selection.type = GGML_TYPE_I32;
-        selection.ne[0] = 512;
-        selection.ne[1] = selection.ne[2] = selection.ne[3] = 1;
-        selection.src[0] = &scores;
-        selection.src[1] = &valid;
-        stable_qsa = ggml_backend_supports_op(backend, &selection);
-    }
-    if (stable_qsa) {
-        for (int il = 0; il < w.n_layer; ++il) {
-            if (w.layers[il].is_full_attention &&
-                (il >= (int) w.compress_ratios.size() || w.compress_ratios[il] != 4)) stable_qsa = false;
-        }
-    }
+    const bool stable_qsa = qsa_rows && stable_qsa_supported(backend, w, cache, kv_end);
     // T=1 decode and verify replay a retained graph, unless QSA rows lack the runtime-count path.
     const bool use_stable_graph = (reuse_ws || verify) && (!qsa_rows || stable_qsa);
     // Context and allocator reused across calls: the T=1 decode workspace, or this verify width's.
@@ -1328,13 +2007,6 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
                      pos0, n_tokens, cache.max_ctx);
         return res;
     }
-
-    std::vector<int> lin_idx(w.n_layer, -1);
-    std::vector<int> full_idx(w.n_layer, -1);
-    for (size_t i = 0; i < cache.linear_layer_ids.size(); ++i) lin_idx[cache.linear_layer_ids[i]] = (int) i;
-    for (size_t i = 0; i < cache.full_layer_ids.size(); ++i)   full_idx[cache.full_layer_ids[i]] = (int) i;
-    std::vector<int> ple_idx(w.n_layer, -1);
-    for (size_t i = 0; i < cache.ple_layer_ids.size(); ++i)    ple_idx[cache.ple_layer_ids[i]] = (int) i;
 
     const bool has_ple = !cache.ple_layer_ids.empty() && w.ple_reader.available();
     const int64_t ple_heads = w.ple_n_heads;
@@ -1367,131 +2039,33 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     // set_rows index keep every graph pointer and property unchanged.
     Qwen4ExpDecodeWorkspace measured_ws;
     Qwen4ExpDecodeWorkspace & stable_ws = measure ? measured_ws : verify ? cache.verify_workspace[T] : cache.decode_workspace;
-    auto stale = [&](const Qwen4ExpDecodeWorkspace & ws) {
-        return ws.backend != backend || ws.model != &w || ws.max_ctx != cache.max_ctx;
-    };
-    if (!measure && cache.decode_workspace.ctx && (!reuse_ws || stale(cache.decode_workspace))) {
+    if (!measure && cache.decode_workspace.ctx &&
+        (!reuse_ws || stable_workspace_stale(cache.decode_workspace, backend, w, cache.max_ctx))) {
         clear_qwen4exp_decode_workspace(cache.decode_workspace);
     }
-    if (!measure && verify && stable_ws.ctx && stale(stable_ws)) clear_qwen4exp_decode_workspace(stable_ws);
+    if (!measure && verify && stable_ws.ctx && stable_workspace_stale(stable_ws, backend, w, cache.max_ctx)) {
+        clear_qwen4exp_decode_workspace(stable_ws);
+    }
     const int64_t bucket_limit = stable_qsa ? std::min(cache.max_ctx, 262144) : cache.max_ctx;
     const int64_t stable_kv_bucket = stable_qsa
         ? std::min<int64_t>(bucket_limit, ((kv_len + 255) / 256) * 256)
         : use_stable_graph && !verify
             ? qwen4exp_stable_kv_span(cache.kv_bucket_base, cache.max_ctx, kv_len)
             : 0;
+    Qwen4ExpStableInputs stable_in;
+    stable_in.backend = backend;
+    stable_in.split = split;
+    stable_in.qsa = stable_qsa;
+    stable_in.pos0 = pos0;
+    stable_in.T = T;
+    stable_in.kv_len = kv_len;
+    stable_in.max_ctx = cache.max_ctx;
+    stable_in.emb = &emb;
+    stable_in.ple = &ple_data;
 
-    // Stable-graph inputs: async on the target stream; in split mode the scheduler
-    // may place an input in another backend's buffer, so set it synchronously.
-    auto set_input = [&](ggml_tensor * t, const void * data, size_t size) {
-        if (split) ggml_backend_tensor_set(t, data, 0, size);
-        else       ggml_backend_tensor_set_async(backend, t, data, 0, size);
-    };
-    // Storage survives until graph_compute/get completes the asynchronous uploads.
-    std::vector<float> qsa_visibility;
-    std::vector<int32_t> qsa_params, stable_i32;
-    std::vector<ggml_fp16_t> stable_mask;
-    // Rows pos0..pos0+T-1 (layout: Qwen4ExpDecodeWorkspace::qsa_params): row t sees
-    // its (pos0+t+1)/4 complete blocks. Slot s pools block pos0/4+s when this forward
-    // completes it; otherwise it recomputes the last block complete before the rows.
-    auto upload_qsa = [&](Qwen4ExpDecodeWorkspace & ws) {
-        if (!stable_qsa) return;
-        const int64_t blocks = ws.qsa_blocks, last = (pos0 + 1) / 4 - 1;
-        qsa_visibility.assign((size_t) (blocks * T), -INFINITY);
-        qsa_params.assign((size_t) (10 * T), 0);
-        for (int64_t t = 0; t < T; ++t) {
-            const int64_t n = (pos0 + t + 1) / 4;
-            std::fill_n(qsa_visibility.begin() + t * blocks, n, 0.0f);
-            qsa_params[10 * t] = (int32_t) n;
-        }
-        for (int64_t s = 0; s < (T + 3) / 4; ++s) {
-            const int64_t block = pos0 / 4 + s;
-            const bool done = block < kv_len / 4;
-            int32_t * p = &qsa_params[10 * s];
-            for (int i = 0; i < 4; ++i) p[1 + i] = (int32_t) (4 * (done ? block : last) + i);
-            p[5] = done ? (int32_t) block : (cache.max_ctx + 3) / 4;
-            p[6] = p[7] = p[8] = p[1];
-        }
-        set_input(ws.qsa_visibility, qsa_visibility.data(), qsa_visibility.size() * sizeof(float));
-        set_input(ws.qsa_params, qsa_params.data(), qsa_params.size() * sizeof(int32_t));
-    };
-    // Every position-dependent input of a stable graph: the M-RoPE positions (section-major:
-    // 0..2 carry the position, 3 is zero), the K/V rows, the dense masks (T=1: over the
-    // bucket; verify: each dense row's over its span), each QSA row's positions, QSA.
-    auto upload_stable = [&](Qwen4ExpDecodeWorkspace & ws) {
-        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
-        stable_i32.assign((size_t) 9 * T, 0);
-        int32_t * pos = stable_i32.data(), * rows = pos + 4 * T, * row_pos = rows + T;
-        for (int64_t i = 0; i < T; ++i) {
-            pos[i] = pos[T + i] = pos[2 * T + i] = rows[i] = (int32_t) (pos0 + i);
-            row_pos[4 * i] = row_pos[4 * i + 1] = row_pos[4 * i + 2] = (int32_t) (pos0 + i);
-        }
-        int64_t mask_elems = ws.mask ? ws.kv_bucket : 0;
-        for (int64_t span : ws.row_spans) mask_elems += span;
-        stable_mask.assign((size_t) mask_elems, ninf);
-        ggml_fp16_t * m = stable_mask.data();
-        set_input(ws.inp_emb, emb.data(), sizeof(float) * emb.size());
-        set_input(ws.positions, pos, sizeof(int32_t) * 4 * T);
-        set_input(ws.kv_row, rows, sizeof(int32_t) * T);
-        if (ws.ple_in) set_input(ws.ple_in, ple_data.data(), sizeof(float) * ple_data.size());
-        if (ws.mask) {
-            std::fill_n(m, kv_len, zero);
-            set_input(ws.mask, m, sizeof(ggml_fp16_t) * ws.kv_bucket);
-            m += ws.kv_bucket;
-        }
-        for (size_t t = 0; t < ws.row_spans.size(); ++t) {
-            if (ws.row_spans[t] == 0) {
-                if (ws.row_inputs[t]) set_input(ws.row_inputs[t], row_pos + 4 * t, 4 * sizeof(int32_t));
-                continue;
-            }
-            std::fill_n(m, pos0 + t + 1, zero);
-            set_input(ws.row_inputs[t], m, sizeof(ggml_fp16_t) * ws.row_spans[t]);
-            m += ws.row_spans[t];
-        }
-        upload_qsa(ws);
-    };
-
-    auto run_stable = [&](Qwen4ExpDecodeWorkspace & ws) -> bool {
-        upload_stable(ws);
-        ggml_status status;
-        {   // verify: as built, with batch-invariant matmul columns (see below)
-            ScopedCudaGraphOverrides invariant(false, 0, false, 0, /*mmvq_batch_invariant=*/verify);
-            status = split ? ggml_backend_sched_graph_compute(ws.sched ? ws.sched : cache.split_sched_short, ws.gf)
-                           : ggml_backend_graph_compute(backend, ws.gf);
-        }
-        if (status != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "[qwen4exp] stable graph compute failed\n");
-            clear_qwen4exp_decode_workspace(ws);
-            return false;
-        }
-        out_logits.resize((size_t) ggml_nelements(ws.logits));   // n_vocab, per row when verifying
-        ggml_backend_tensor_get(ws.logits, out_logits.data(), 0, ggml_nbytes(ws.logits));
-        if (out_hidden && ws.hidden) {
-            out_hidden->resize((size_t) ggml_nelements(ws.hidden));
-            ggml_backend_tensor_get(ws.hidden, out_hidden->data(), 0, ggml_nbytes(ws.hidden));
-        }
-        return true;
-    };
-
-    // Dense decode may not have maintained the pooled prefix. Bootstrap only
-    // already-cached complete blocks once; the stable graph handles this forward's.
-    if (!measure && stable_qsa && cache.indexer_blocks < pos0 / 4) {
-        ggml_context * bc = ggml_init({8 * 1024 * 1024, nullptr, true});
-        if (!bc) return res;
-        ggml_cgraph * bg = ggml_new_graph_custom(bc, 8192, false);
-        for (size_t fi = 0; fi < cache.full_layer_ids.size(); ++fi) {
-            const auto & L = w.layers[cache.full_layer_ids[fi]];
-            qsa_pooled_keys(bc, bg, L, w, cache.indexer_k[fi], cache.indexer_raw[fi], nullptr,
-                            pos0, 4, cache.indexer_blocks, pos0 / 4);
-        }
-        ggml_gallocr_t ba = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        const bool ok = ba && ggml_gallocr_alloc_graph(ba, bg) &&
-            ggml_backend_graph_compute(backend, bg) == GGML_STATUS_SUCCESS;
-        ggml_backend_cuda_graph_invalidate_range(backend, ggml_get_mem_buffer(bc), ggml_get_mem_size(bc));
-        if (ba) ggml_gallocr_free(ba);
-        ggml_free(bc);
-        if (!ok) { clear_qwen4exp_decode_workspace(stable_ws); return res; }
-        cache.indexer_blocks = pos0 / 4;
+    if (!measure && stable_qsa && cache.indexer_blocks < pos0 / 4 && !bootstrap_qsa_prefix(backend, w, cache, pos0)) {
+        clear_qwen4exp_decode_workspace(stable_ws);
+        return res;
     }
     // In split mode the T=1 graph replays only while it still owns the short scheduler's
     // allocation: the scheduler rewrote its cross-device sources, so it is never split again.
@@ -1501,7 +2075,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         (verify ? stable_ws.row_spans == row_spans : kv_len <= stable_ws.kv_bucket && stable_ws.next_pos == pos0) &&
         (!stable_qsa || (stable_ws.kv_bucket == stable_kv_bucket &&
                         stable_ws.qsa_budget == w.indexer_top_k / 4 && cache.indexer_blocks == pos0 / 4))) {
-        if (!run_stable(stable_ws)) return res;
+        if (!run_stable_graph(stable_in, stable_ws, cache.split_sched_short, verify, out_logits, out_hidden)) return res;
         stable_ws.next_pos = (int) kv_len;
         cache.cur_pos = (int) kv_len;
         ++stable_ws.replays;
@@ -1511,264 +2085,27 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         res.ok = true;
         return res;
     }
-    ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() * 200000 +
-                  ggml_graph_overhead_custom(200000, false) + (1u << 20);
-    ip.no_alloc = true;
-    ggml_context * ctx = nullptr;
-    if (pool) {
-        if (pool->ctx == nullptr) {
-            pool->ctx = ggml_init(ip);
-        } else {
-            // Retire captures before recycling metadata/allocator addresses. A verify
-            // width rebuilds the same topology at the same addresses for a new span, so
-            // its captures stay and are updated at the next capture; every replay still
-            // checks node properties (as the expert device's captures always have).
-            // Retiring them cost ~30 ms per rebuild on ROCm, one capture per split.
-            if (!verify) {
-                ggml_backend_cuda_graph_invalidate_range(backend,
-                    ggml_get_mem_buffer(pool->ctx), ggml_get_mem_size(pool->ctx));
-            }
-            ggml_reset(pool->ctx);
-        }
-        ctx = pool->ctx;
-        pool->gf = nullptr;
-        pool->backend = backend;
-        pool->model = &w;
-        pool->max_ctx = cache.max_ctx;
-    } else {
-        ctx = ggml_init(ip);
-    }
+    ggml_context * ctx = graph_context(pool, backend, w, cache.max_ctx, verify);
     if (!ctx) return res;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 200000, false);
     std::vector<ggml_tensor *> expert_nodes;   // split mode: pinned to the expert device
-    // Split mode: one scheduler for decode, verify and short batches, one for
-    // prompt chunks. The chunk planner measures the live split-input copies
-    // through ggml_backend_sched_reserve_size.
-    // A verify width keeps its own short-batch scheduler (and allocation) beside its graph.
-    auto split_sched_for = [&](bool short_batch) -> ggml_backend_sched_t {
-        ggml_backend_sched_t & sched = verify && pool ? pool->sched
-                                     : short_batch ? cache.split_sched_short : cache.split_sched;
-        if (!sched) {
-            if (!cache.split_cpu) cache.split_cpu = ggml_backend_cpu_init();
-            ggml_backend_t backends[3] = { backend, w.expert_backend, cache.split_cpu };
-            // Both are parallel: per-copy events make a split wait for its
-            // cross-device inputs on the GPU; a single-copy scheduler instead
-            // synchronizes the receiving device from the host before every such
-            // split, which serializes the two GPUs. Split-input copies live for
-            // the whole graph, so the prompt scheduler keeps one set.
-            sched = ggml_backend_sched_new(backends, nullptr, 3, 200000, true, false);
-            // End a split before a node that brings in a new cross-device input,
-            // so independent target work is queued before that wait and runs
-            // beside the expert device: the other stream's attention in a prompt
-            // chunk; the shared and hot experts in a decode or verify step.
-            ggml_backend_sched_set_late_cross_input_split(sched, true);
-            if (!short_batch) ggml_backend_sched_set_n_copies(sched, 1);   // events without four copy sets
-        }
-        return sched;
-    };
+    std::vector<Qwen4ExpAttnRow> rows;         // verify: each row's T=1 attention inputs
+    Qwen4ExpLayerBuilder lb(ctx, gf, w, cache, verify, split, has_ple, expert_nodes);
+    lb.rows = verify ? &rows : nullptr;
+    lb.qsa_ws = stable_qsa ? &stable_ws : nullptr;
 
     const int64_t graph_kv_len = use_stable_graph && !verify ? stable_kv_bucket : kv_len;
     const int64_t mask_len = graph_kv_len;
 
-    ggml_tensor * inp_emb = nullptr, * positions = nullptr, * kv_row = nullptr, * mask = nullptr, * ple_in = nullptr;
+    ggml_tensor * inp_emb = nullptr, * positions = nullptr, * mask = nullptr, * ple_in = nullptr;
     ggml_tensor * emb_rows = nullptr;   // every row's embedding (the MTP pairs read it)
     ggml_tensor * res_hc = nullptr, * xn_next = nullptr;
-    std::vector<Qwen4ExpAttnRow> rows;   // verify: each row's T=1 attention inputs
     std::vector<Qwen4ExpStream> streams;
     int pipeline_blocks = cache.indexer_blocks;
-
-    // The per-layer pieces below build both the single-stream layers and each stream of a pipelined prompt chunk.
-    // A block's attention inputs: the whole forward's, or one stream's.
-    struct Block {
-        int64_t pos0 = 0, kv_len = 0;
-        int n_pooled = 0;
-        Qwen4ExpQsaMode qsa = QSA_DENSE;
-        ggml_tensor * positions = nullptr, * mask = nullptr, * ple_in = nullptr;
-    };
-    // Attention half of layer il: PLE, the HC mix into the attention input (from the previous layer's fused norm when
-    // xn_next holds it), and the attention. `inject` receives the mix's injection.
-    auto attn_half = [&](int il, const Block & b, ggml_tensor *& res_hc, ggml_tensor *& xn_next,
-                         ggml_tensor *& inject) -> ggml_tensor * {
-        const Qwen4ExpLayer & L = w.layers[il];
-        if (L.is_ple && has_ple) {
-            res_hc = build_ple(ctx, gf, res_hc, b.ple_in, L, w, cache.ple_conv_state[ple_idx[il]],
-                               verify ? cache.spec_ple : nullptr);
-            xn_next = nullptr;   // PLE changed the residual; the norm must rerun
-        }
-        ggml_tensor * cur;
-        if (xn_next != nullptr) {
-            cur = hc_mix_from_xn(ctx, xn_next, L.hc_attn_down, L.hc_attn_up,
-                                 L.hc_attn_inject, &inject, w.n_embd, w.n_hc);
-        } else {
-            cur = hc_mix(ctx, res_hc, L.hc_attn_norm, L.hc_attn_down,
-                         L.hc_attn_up, L.hc_attn_inject, &inject,
-                         w.n_embd, w.n_hc, w.rms_eps);
-        }
-        xn_next = nullptr;
-        if (L.is_full_attention) {
-            const int fi = full_idx[il];
-            return build_full_attn(ctx, gf, cur, L, w,
-                                   cache.attn_k[fi], cache.attn_v[fi], cache.indexer_k[fi],
-                                   w.qsa ? cache.indexer_raw[fi] : nullptr,
-                                   b.positions, b.mask, kv_row, b.kv_len, b.pos0,
-                                   il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0,
-                                   b.n_pooled, b.qsa, verify ? &rows : nullptr, stable_qsa ? &stable_ws : nullptr);
-        }
-        const int li = lin_idx[il];
-        return build_linear_attn(ctx, gf, cur, L, w, cache.ssm_state[li], cache.conv_state[li],
-                                 verify ? cache.spec_ssm[li] : nullptr, verify ? cache.spec_conv[li] : nullptr);
-    };
-    // The last layer's FFN runs on the output row only. Upstream selects output rows before the final HC/FFN, so its
-    // quantized matmuls dispatch with one token (MMV rather than MMQ); this reuses that selection after all attention
-    // cache writes. Earlier rows have no remaining stateful consumers.
-    auto last_row = [&](ggml_tensor *& cur, ggml_tensor *& inject, ggml_tensor *& res_hc, int64_t rows_T) {
-        cur = ggml_view_2d(ctx, cur, w.n_embd, 1, cur->nb[1], (rows_T - 1)*cur->nb[1]);
-        inject = ggml_view_2d(ctx, inject, inject->ne[0], 1, inject->nb[1], (rows_T - 1)*inject->nb[1]);
-        res_hc = ggml_view_3d(ctx, res_hc, w.n_embd, w.n_hc, 1,
-                              res_hc->nb[1], res_hc->nb[2], (rows_T - 1)*res_hc->nb[2]);
-    };
-    // HC combine of the attention output into the FFN norm, and the HC mix into the MoE input.
-    auto ffn_input = [&](int il, ggml_tensor * cur, ggml_tensor *& inject, ggml_tensor *& res_hc,
-                         int64_t layer_T) -> ggml_tensor * {
-        const Qwen4ExpLayer & L = w.layers[il];
-        ggml_tensor * ffn_fused = hc_combine_norm(ctx, inject, res_hc, cur,
-            L.hc_ffn_norm, w.n_embd, w.n_hc, layer_T, w.rms_eps);
-        res_hc = hc_norm_res(ctx, ffn_fused, w.n_embd, w.n_hc, layer_T);
-        return hc_mix_from_xn(ctx, hc_norm_xn(ctx, ffn_fused, w.n_embd, w.n_hc, layer_T),
-                              L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, &inject,
-                              w.n_embd, w.n_hc);
-    };
-    // HC combine of the MoE output into the residual, fused with the next layer's attention norm (left in xn_next)
-    // unless that layer starts with PLE. Returns the new residual.
-    auto ffn_output = [&](int il, ggml_tensor * moe_out, ggml_tensor * inject, ggml_tensor * res_hc, int64_t layer_T,
-                          ggml_tensor *& xn_next) -> ggml_tensor * {
-        if (il + 1 < w.n_layer && w.layers[il + 1].is_ple && has_ple) {
-            xn_next = nullptr;
-            return hc_combine(ctx, res_hc, moe_out, inject, w.n_embd, w.n_hc, layer_T);
-        }
-        ggml_tensor * gamma = (il + 1 < w.n_layer) ? w.layers[il + 1].hc_attn_norm : w.output_hc_norm;
-        ggml_tensor * f = hc_combine_norm(ctx, inject, res_hc, moe_out,
-            gamma, w.n_embd, w.n_hc, layer_T, w.rms_eps);
-        xn_next = hc_norm_xn(ctx, f, w.n_embd, w.n_hc, layer_T);
-        return hc_norm_res(ctx, f, w.n_embd, w.n_hc, layer_T);
-    };
-    // FFN half of layer il: ffn_input, the MoE and ffn_output. Returns the new residual.
-    auto ffn_half = [&](int il, ggml_tensor * cur, ggml_tensor * inject, ggml_tensor * res_hc, int64_t layer_T,
-                        ggml_tensor *& xn_next) -> ggml_tensor * {
-        const Qwen4ExpLayer & L = w.layers[il];
-        cur = ffn_input(il, cur, inject, res_hc, layer_T);
-        const bool next_ple = (il + 1 < w.n_layer) && w.layers[il + 1].is_ple && has_ple;
-        // Prefill: the MoE combine runs inside the next HC_COMBINE_NORM (one kernel fewer; last-bit numerics change
-        // from FMA contraction in the new kernel, covered by the long-prompt quality gate). Not at T=1: it cost ~1.7% decode.
-        Qwen4ExpMoeParts moe_parts;
-        const bool fold = !split && !next_ple && ggml_backend_cuda_mmb_prefill(layer_T);
-        cur = build_moe(ctx, cur, L, w, fold ? &moe_parts : nullptr, split ? &expert_nodes : nullptr);
-        if (!fold) return ffn_output(il, cur, inject, res_hc, layer_T, xn_next);
-        ggml_tensor * gamma = (il + 1 < w.n_layer)
-            ? w.layers[il + 1].hc_attn_norm : w.output_hc_norm;
-        ggml_tensor * f = ggml_hc_combine_norm_moe(ctx, inject, res_hc, moe_parts.down, moe_parts.weights,
-            moe_parts.shared, moe_parts.shared_logit, gamma, 1.0f / (float) w.n_hc, 0.0f, 2.0f, 0.0f, w.rms_eps);
-        xn_next = hc_norm_xn(ctx, f, w.n_embd, w.n_hc, layer_T);
-        return hc_norm_res(ctx, f, w.n_embd, w.n_hc, layer_T);
-    };
-    struct { ggml_tensor * cur = nullptr, * inject = nullptr, * res = nullptr; } branch;
+    Qwen4ExpBranch branch;   // single stream: the last layer's every-row attention output, for the MTP hidden
 
     if (pipeline) {
-        // n streams of about 4096 rows (2..4, multiples of 256; the last takes
-        // the rest). Per layer the graph is emitted as
-        //   R(0) C(n-1,l-1) S(0)  R(1) C(0) S(1)  ...  R(n-1) C(n-2) S(n-1),
-        // R = target work (attention, HC, router, shared expert), S = the routed
-        // experts on the expert device, C = the target-side combine. A stream's
-        // own chain per layer (R, copy, S, copy, C) is longer than either
-        // device's share of the layer, so two streams leave the copies on the
-        // critical path; more streams keep both devices busy.
-        const int64_t r = std::max<int64_t>(1, qsa_ratio(w));
-        const int n_streams = (int) std::clamp<int64_t>(T / kQwen4ExpPipelineStreamRows, 2, 4);
-        streams.resize(n_streams);
-        for (int i = 0; i + 1 < n_streams; ++i) {
-            streams[i].T = std::max<int64_t>(256, (T / n_streams) / 256 * 256);
-        }
-        streams.back().T = T;
-        for (int i = 0; i + 1 < n_streams; ++i) streams.back().T -= streams[i].T;
-        emb_rows = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_embd, T);
-        ggml_set_input(emb_rows);
-        int64_t start = pos0;
-        for (Qwen4ExpStream & st : streams) {
-            st.pos0 = start;
-            start += st.T;
-            st.qsa = qsa_mode(w, cache, st.T, st.pos0, w.qsa);
-            st.n_pooled = pipeline_blocks;   // what the previous stream commits, as for sequential chunks
-            if (st.qsa != QSA_DENSE && (st.pos0 + st.T) / r > w.indexer_top_k / r) {
-                pipeline_blocks = (int) ((st.pos0 + st.T) / r);
-            }
-            st.inp_emb = ggml_view_2d(ctx, emb_rows, w.n_embd, st.T, emb_rows->nb[1], (st.pos0 - pos0) * emb_rows->nb[1]);
-            st.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * st.T);
-            ggml_set_input(st.positions);
-            if (st.qsa == QSA_DENSE) {
-                st.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, st.pos0 + st.T, st.T);
-                ggml_set_input(st.mask);
-            }
-            if (has_ple) {
-                st.ple_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.ple_head_dim * ple_heads, st.T);
-                ggml_set_input(st.ple_in);
-            }
-            st.res_hc = repeat_dim1(ctx, ggml_reshape_3d(ctx, st.inp_emb, w.n_embd, 1, st.T), w.n_hc);
-        }
-        auto stage_r = [&](Qwen4ExpStream & st, int il) {
-            ggml_tensor * inject = nullptr;
-            ggml_tensor * cur = attn_half(il, { st.pos0, st.pos0 + st.T, st.n_pooled, st.qsa, st.positions, st.mask,
-                                                st.ple_in }, st.res_hc, st.xn_next, inject);
-            st.layer_T = st.T;
-            if (il == w.n_layer - 1) {
-                if (out_hidden) {
-                    st.last_cur = cur;
-                    st.last_inject = inject;
-                    st.last_res = st.res_hc;
-                }
-                if (&st != &streams.back()) {   // only its cache writes are needed
-                    ggml_build_forward_expand(gf, cur);
-                    st.done = true;
-                    return;
-                }
-                if (st.T > 1) {
-                    last_row(cur, inject, st.res_hc, st.T);
-                    st.layer_T = 1;
-                }
-            }
-            st.inject = inject;
-            cur = ffn_input(il, cur, st.inject, st.res_hc, st.layer_T);
-            st.route = build_moe_route(ctx, cur, w.layers[il], w);
-            for (ggml_tensor * t : { st.route.xin, st.route.sel, st.route.wsel, st.route.shared, st.inject, st.res_hc }) {
-                ggml_build_forward_expand(gf, t);
-            }
-        };
-        auto stage_s = [&](Qwen4ExpStream & st, int il) {
-            if (st.done) return;
-            st.routed = build_moe_routed(ctx, st.route, w.layers[il], w, expert_nodes);
-            ggml_build_forward_expand(gf, st.routed);
-        };
-        auto stage_c = [&](Qwen4ExpStream & st, int il) {
-            if (st.done) return;
-            st.res_hc = ffn_output(il, moe_join(ctx, st.routed, st.route.shared), st.inject, st.res_hc,
-                                   st.layer_T, st.xn_next);
-            if (st.xn_next) ggml_build_forward_expand(gf, st.xn_next);
-            ggml_build_forward_expand(gf, st.res_hc);
-        };
-        for (int il = 0; il < w.n_layer; ++il) {
-            for (int i = 0; i < n_streams; ++i) {
-                stage_r(streams[i], il);
-                if (i > 0) {
-                    stage_c(streams[i - 1], il);
-                } else if (il > 0) {
-                    stage_c(streams.back(), il - 1);
-                }
-                stage_s(streams[i], il);
-            }
-        }
-        stage_c(streams.back(), w.n_layer - 1);
-        res_hc = streams.back().res_hc;
-        xn_next = streams.back().xn_next;
+        pipeline_blocks = build_pipelined_layers(lb, pos0, T, out_hidden != nullptr, streams, emb_rows, res_hc, xn_next);
     } else {
         inp_emb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_embd, T);
         ggml_set_input(inp_emb);
@@ -1776,8 +2113,8 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * T);
         ggml_set_input(positions);
         if (use_stable_graph) {
-            kv_row = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
-            ggml_set_input(kv_row);
+            lb.kv_row = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+            ggml_set_input(lb.kv_row);
         }
         if (stable_qsa) {
             stable_ws.kv_bucket = stable_kv_bucket;
@@ -1815,17 +2152,17 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         res_hc = repeat_dim1(ctx,
             ggml_reshape_3d(ctx, inp_emb, w.n_embd, 1, T), w.n_hc);
 
-        const Block block = { pos0, graph_kv_len, cache.indexer_blocks, qsa, positions, mask, ple_in };
+        const Qwen4ExpLayerInputs layer_in = { pos0, graph_kv_len, cache.indexer_blocks, qsa, positions, mask, ple_in };
         for (int il = 0; il < w.n_layer; ++il) {
             ggml_tensor * inject = nullptr;
-            ggml_tensor * cur = attn_half(il, block, res_hc, xn_next, inject);
+            ggml_tensor * cur = lb.attn_half(il, layer_in, res_hc, xn_next, inject);
             int64_t layer_T = T;
             if (!verify && il == w.n_layer - 1 && T > 1) {
                 if (out_hidden) branch = { cur, inject, res_hc };   // every row's FFN half, for the MTP hidden only
-                last_row(cur, inject, res_hc, T);
+                lb.last_row(cur, inject, res_hc, T);
                 layer_T = 1;
             }
-            res_hc = ffn_half(il, cur, inject, res_hc, layer_T, xn_next);
+            res_hc = lb.ffn_half(il, cur, inject, res_hc, layer_T, xn_next);
         }
     }
 
@@ -1849,80 +2186,21 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         ggml_tensor * unused = nullptr;
         if (pipeline) {
             for (Qwen4ExpStream & st : streams) {
-                ggml_tensor * h = ffn_half(w.n_layer - 1, st.last_cur, st.last_inject, st.last_res, st.T, unused);
+                ggml_tensor * h = lb.ffn_half(w.n_layer - 1, st.last_cur, st.last_inject, st.last_res, st.T, unused);
                 hidden = hidden ? ggml_concat(ctx, hidden, h, 2) : h;
             }
         } else {
-            hidden = branch.cur ? ffn_half(w.n_layer - 1, branch.cur, branch.inject, branch.res, T, unused) : res_hc;
+            hidden = branch.cur ? lb.ffn_half(w.n_layer - 1, branch.cur, branch.inject, branch.res, T, unused) : res_hc;
         }
         for (ggml_tensor * t = hidden; t; t = t->view_src) ggml_set_output(t);
         ggml_build_forward_expand(gf, hidden);
     }
-
-    ggml_tensor * mtp_positions = nullptr;
-    if (mtp_prefill) {
-        const int64_t H = w.n_embd, hc = w.n_hc, hd = H * hc;
-        const int64_t first = pos0 == 0 ? 1 : 0, pairs = T - first, start = pos0 - (1 - first);
-        ggml_tensor * h = ggml_reshape_2d(ctx, hidden, hd, T);
-        if (pos0 > 0) {
-            h = ggml_concat(ctx, cache.mtp_prev_hidden,
-                ggml_view_2d(ctx, h, hd, T - 1, h->nb[1], 0), 1);
-        }
-        mtp_positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * pairs);
-        ggml_set_input(mtp_positions);
-        // One submission, but exactly the old 512-row GEMMs, including the first
-        // chunk's short final slice. A single wider GEMM changes the K/V bytes.
-        for (int64_t i = 0; i < pairs; i += 512) {
-            const int64_t n = std::min<int64_t>(512, pairs - i);
-            ggml_tensor * e = ggml_view_2d(ctx, emb_rows, H, n, emb_rows->nb[1], (i + first) * emb_rows->nb[1]);
-            ggml_tensor * hi = ggml_view_2d(ctx, h, hd, n, h->nb[1], i * h->nb[1]);
-            ggml_tensor * p = ggml_reshape_1d(ctx, ggml_cont(ctx,
-                ggml_view_2d(ctx, mtp_positions, n, 4, pairs * sizeof(int32_t), i * sizeof(int32_t))), 4 * n);
-            ggml_tensor * r = mtp_input(ctx, w, e, hi);
-            const auto & L = w.mtp;
-            ggml_tensor * cur = hc_mix(ctx, r, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up,
-                nullptr, nullptr, H, hc, w.rms_eps);
-            build_full_attn(ctx, gf, cur, L, w, cache.mtp_k, cache.mtp_v, nullptr, nullptr,
-                p, nullptr, nullptr, start + i + n, start + i, 4, 0, QSA_DENSE,
-                nullptr, nullptr, /*kv_only=*/true);
-        }
-        // Carry one authoritative hidden row across chunks; only this row is
-        // read back for the first decode step. All prompt pairs stay on device.
-        hidden = ggml_view_2d(ctx, hidden, hd, 1, hidden->nb[2], (T - 1) * hidden->nb[2]);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, hidden, cache.mtp_prev_hidden));
-    }
+    ggml_tensor * mtp_positions = mtp_prefill
+        ? build_mtp_prefill(ctx, gf, w, cache, hidden, emb_rows, pos0, T) : nullptr;
 
     if (measure) {
         graph_memory(backend, ctx, gf, w.gfx1151, *measure);
-        if (split) {
-            // The target's share of the split scheduler, copies included. The
-            // planner probes shapes no request has built (up to 32768 rows at the
-            // end of the context); a graph with a node no device runs keeps the
-            // single-device estimate, as the scheduler could not place it.
-            ggml_backend_sched_t sched = split_sched_for(T <= kSplitShortRows);
-            const ggml_backend_t devices[3] = { backend, w.expert_backend, cache.split_cpu };
-            const ggml_tensor * unplaced = nullptr;
-            for (int i = 0; i < ggml_graph_n_nodes(gf) && !unplaced; ++i) {
-                const ggml_tensor * node = ggml_graph_node(gf, i);
-                if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
-                    node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) continue;
-                if (std::none_of(devices, devices + 3, [&](ggml_backend_t b) { return b && ggml_backend_supports_op(b, node); })) {
-                    unplaced = node;
-                }
-            }
-            if (unplaced) {
-                std::fprintf(stderr, "[qwen4exp] split plan T=%lld pos0=%d: %s (%s) runs on no device; single-device estimate\n",
-                             (long long) T, pos0, ggml_op_desc(unplaced), unplaced->name);
-            } else {
-                ggml_backend_sched_reset(sched);
-                qwen4exp_pin_split(sched, gf, backend, w.expert_backend, expert_nodes);
-                size_t sizes[3] = {};
-                ggml_backend_sched_reserve_size(sched, gf, sizes);
-                ggml_backend_sched_reset(sched);
-                if (T <= kSplitShortRows) ++cache.split_short_gen;   // a retained stable graph must allocate again
-                measure->graph = sizes[0];
-            }
-        }
+        if (split) measure_split_graph(backend, w, cache, gf, expert_nodes, T, pos0, verify, *measure);
         // Graph inputs are included above. Reserve BOTH grow-only UMA ring slots
         // as well (conservative: the normal allocator excludes their tensors).
         const size_t input_bytes = inp_emb == nullptr ? 0 :   // the pipeline's inputs are per stream (no ring)
@@ -1939,93 +2217,13 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         return res;
     }
 
-    // Point input tensors at this call's pinned ring slot before allocation so the gallocr leaves them alone.
-    char * ring_embd = nullptr;
-    char * ring_pos  = nullptr;
-    char * ring_mask = nullptr;
-    char * ring_ple  = nullptr;
-    if (!use_stable_graph && !verify && !pipeline && cache.input_ring.enabled) {
-        const size_t embd_need = static_cast<size_t>(w.n_embd) * T * sizeof(float);
-        const size_t pos_need  = static_cast<size_t>(4) * T * sizeof(int32_t);
-        const size_t ple_need  = has_ple
-            ? static_cast<size_t>(w.ple_head_dim) * ple_heads * T * sizeof(float) : 0;
-        const size_t mask_need = mask
-            ? static_cast<size_t>(mask_len) * T * sizeof(ggml_fp16_t) : 0;
-        ggml_backend_buffer_type_t host_buft =
-            ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
-        if (host_buft != nullptr &&
-            qwen4exp_input_ring_reserve(cache.input_ring, host_buft,
-                                        embd_need, pos_need, ple_need, mask_need)) {
-            // Wait for the graph that last read this slot; the logits read already synchronizes each forward.
-            if (cache.input_ring.writes >= 2) {
-                ggml_backend_synchronize(backend);
-            }
-            const size_t slot = static_cast<size_t>(cache.input_ring.next_slot);
-            cache.input_ring.next_slot = (cache.input_ring.next_slot + 1) % 2;
-            cache.input_ring.writes++;
-            char * slot_base = cache.input_ring.base + slot * cache.input_ring.slot_bytes;
-            ring_embd = slot_base + cache.input_ring.embd_off;
-            ring_pos  = slot_base + cache.input_ring.pos_off;
-            ring_ple  = slot_base + cache.input_ring.ple_off;
-            ring_mask = slot_base + cache.input_ring.mask_off;
-            ggml_backend_tensor_alloc(cache.input_ring.buf, inp_emb, ring_embd);
-            ggml_backend_tensor_alloc(cache.input_ring.buf, positions, ring_pos);
-            if (mask) {
-                ggml_backend_tensor_alloc(cache.input_ring.buf, mask, ring_mask);
-            }
-            if (ple_in) {
-                ggml_backend_tensor_alloc(cache.input_ring.buf, ple_in, ring_ple);
-            }
-        }
-    }
-
+    const bool ring = !use_stable_graph && !verify && !pipeline && cache.input_ring.enabled &&
+        place_inputs_in_ring(backend, w, cache, T, mask_len, has_ple, inp_emb, positions, mask, ple_in);
     ggml_gallocr_t galloc = nullptr;
     ggml_backend_sched_t split_sched = nullptr;
-    if (split) {
-        // Weights decide placement (routed experts on the expert device, the
-        // rest and the cache on the target); see qwen4exp_pin_split.
-        const bool short_batch = T <= kSplitShortRows;
-        ggml_backend_sched_t sched = split_sched_for(short_batch);
-        split_sched = sched;
-        ggml_backend_sched_reset(sched);
-        qwen4exp_pin_split(sched, gf, backend, w.expert_backend, expert_nodes);
-        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-            std::fprintf(stderr, "[qwen4exp] split graph alloc failed (T=%lld kv_len=%lld)\n",
-                         (long long) T, (long long) kv_len);
-            if (!pool) ggml_free(ctx);
-            return res;
-        }
-        if (sched == cache.split_sched_short) ++cache.split_short_gen;
-    } else {
-        if (pool) {
-            if (pool->alloc == nullptr) {
-                pool->alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-            }
-            galloc = pool->alloc;
-        } else {
-            galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        }
-        if (!galloc) {
-            std::fprintf(stderr, "[qwen4exp] graph allocator creation failed\n");
-            if (!pool) ggml_free(ctx);
-            return res;
-        }
-        // T=1 graphs keep the same broad shape but advancing KV views can change
-        // lifetimes. Recompute assignments while retaining the allocator buffers;
-        // reusing the old index-wise plan produced incorrect tokens.
-        const bool reserve_ok = !pool || !pool->planned || ggml_gallocr_reserve(galloc, gf);
-        if (!reserve_ok || !ggml_gallocr_alloc_graph(galloc, gf)) {
-            std::fprintf(stderr, "[qwen4exp] graph alloc failed (T=%lld kv_len=%lld)\n",
-                         (long long) T, (long long) kv_len);
-            if (pool) {
-                pool->planned = false;
-            } else {
-                ggml_gallocr_free(galloc);
-                ggml_free(ctx);
-            }
-            return res;
-        }
-        if (pool) pool->planned = true;
+    if (!allocate_graph(backend, w, cache, pool, verify, gf, expert_nodes, T, kv_len, split_sched, galloc)) {
+        if (!pool) ggml_free(ctx);
+        return res;
     }
 
     if (use_stable_graph) {
@@ -2036,7 +2234,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         stable_ws.positions = positions;
         stable_ws.mask = mask;
         stable_ws.ple_in = ple_in;
-        stable_ws.kv_row = kv_row;
+        stable_ws.kv_row = lb.kv_row;
         stable_ws.logits = logits;
         stable_ws.hidden = hidden;
         stable_ws.kv_bucket = stable_kv_bucket;
@@ -2049,91 +2247,13 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         stable_ws.next_pos = (int) kv_len;
     }
 
-    // M-RoPE sections are section-major [s*T + i]: 0..2 carry the position, 3 is zero.
-    std::vector<int32_t> pos((size_t) 4 * T, 0);
-    for (int64_t i = 0; i < T; ++i) {
-        const int32_t p = (int32_t) (pos0 + i);
-        pos[(size_t) (0 * T + i)] = p;
-        pos[(size_t) (1 * T + i)] = p;
-        pos[(size_t) (2 * T + i)] = p;
-        pos[(size_t) (3 * T + i)] = 0;
-    }
-    std::vector<ggml_fp16_t> m;
-    if (mask && !use_stable_graph) {
-        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
-        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
-        m.resize((size_t) mask_len * T);
-        for (int64_t row = 0; row < T; ++row) {
-            const int64_t vis = pos0 + row;
-            for (int64_t col = 0; col < mask_len; ++col) {
-                m[(size_t) (row * mask_len + col)] = (col <= vis) ? zero : ninf;
-            }
-        }
-    }
-    if (mtp_positions) {
-        const int64_t pairs = T - (pos0 == 0 ? 1 : 0), start = pos0 == 0 ? 0 : pos0 - 1;
-        std::vector<int32_t> p((size_t) 4 * pairs, 0);
-        for (int64_t i = 0; i < pairs; ++i) p[i] = p[pairs + i] = p[2 * pairs + i] = (int32_t) (start + i);
-        ggml_backend_tensor_set(mtp_positions, p.data(), 0, ggml_nbytes(mtp_positions));
-    }
+    if (mtp_positions) upload_mtp_positions(mtp_positions, pos0, T);
     if (pipeline) {
-        int64_t t0 = 0;
-        for (const Qwen4ExpStream & st : streams) {
-            std::vector<int32_t> sp((size_t) 4 * st.T, 0);
-            for (int64_t i = 0; i < st.T; ++i) {
-                sp[(size_t) i] = sp[(size_t) (st.T + i)] = sp[(size_t) (2 * st.T + i)] = (int32_t) (st.pos0 + i);
-            }
-            ggml_backend_tensor_set(st.inp_emb, emb.data() + (size_t) t0 * w.n_embd, 0, sizeof(float) * w.n_embd * st.T);
-            ggml_backend_tensor_set(st.positions, sp.data(), 0, sizeof(int32_t) * sp.size());
-            if (st.mask) {
-                const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
-                const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
-                const int64_t cols = st.pos0 + st.T;
-                std::vector<ggml_fp16_t> sm((size_t) cols * st.T);
-                for (int64_t row = 0; row < st.T; ++row) {
-                    for (int64_t col = 0; col < cols; ++col) {
-                        sm[(size_t) (row * cols + col)] = col <= st.pos0 + row ? zero : ninf;
-                    }
-                }
-                ggml_backend_tensor_set(st.mask, sm.data(), 0, sizeof(ggml_fp16_t) * sm.size());
-            }
-            if (st.ple_in) {
-                const size_t row = (size_t) w.ple_head_dim * ple_heads;
-                ggml_backend_tensor_set(st.ple_in, ple_data.data() + (size_t) t0 * row, 0, sizeof(float) * row * st.T);
-            }
-            t0 += st.T;
-        }
+        upload_pipeline_inputs(streams, w, emb, ple_data);
     } else if (use_stable_graph) {
-        upload_stable(stable_ws);
-    } else if (ring_embd != nullptr) {
-        std::memcpy(inp_emb->data, emb.data(), sizeof(float) * emb.size());
-        std::memcpy(positions->data, pos.data(), sizeof(int32_t) * pos.size());
-        if (mask) {
-            std::memcpy(mask->data, m.data(), sizeof(ggml_fp16_t) * m.size());
-        }
-        if (ple_in) {
-            std::memcpy(ple_in->data, ple_data.data(), sizeof(float) * ple_data.size());
-        }
+        upload_stable_inputs(stable_in, stable_ws);
     } else {
-        ggml_backend_tensor_set(inp_emb, emb.data(), 0, sizeof(float) * emb.size());
-        ggml_backend_tensor_set(positions, pos.data(), 0, sizeof(int32_t) * pos.size());
-        if (mask) {
-            ggml_backend_tensor_set(mask, m.data(), 0, sizeof(ggml_fp16_t) * m.size());
-        }
-        if (ple_in) {
-            ggml_backend_tensor_set(ple_in, ple_data.data(), 0, sizeof(float) * ple_data.size());
-        }
-    }
-    for (int64_t t = 0; !use_stable_graph && t < (int64_t) rows.size(); ++t) {
-        const int32_t p = (int32_t) (pos0 + t);
-        if (rows[t].mask) {
-            std::vector<ggml_fp16_t> row_mask((size_t) rows[t].span, ggml_fp32_to_fp16(-INFINITY));
-            std::fill(row_mask.begin(), row_mask.begin() + p + 1, ggml_fp32_to_fp16(0.0f));
-            ggml_backend_tensor_set(rows[t].mask, row_mask.data(), 0, ggml_nbytes(rows[t].mask));
-        } else {
-            const int32_t row_pos[4] = { p, p, p, 0 };
-            ggml_backend_tensor_set(rows[t].positions, row_pos, 0, sizeof row_pos);
-        }
+        upload_graph_inputs(inp_emb, positions, mask, ple_in, emb, ple_data, pos0, T, mask_len, ring, rows);
     }
 
     ggml_status status;
