@@ -1874,7 +1874,8 @@ static __global__ void mmid_group_prep(
 // (n_expert_used x n_tokens) expert-matrix reads.
 template <ggml_type type, int c_rows_per_block, bool has_fusion,
           bool fp3_packed24 = false, bool fp2_packed32 = false,
-          int tokens_per_group = MMID_GROUPED_DEFAULT_TPG>
+          int tokens_per_group = MMID_GROUPED_DEFAULT_TPG,
+          bool fp2_prefetch = false>
 __launch_bounds__(tokens_per_group*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe_grouped(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ meta,
@@ -1950,6 +1951,12 @@ static __global__ void mul_mat_vec_q_moe_grouped(
     float tmp[c_rows_per_block] = {0.0f};
     float tmp_gate[c_rows_per_block] = {0.0f};
 
+    // ROCmFP2 on gfx1151: the per-expert kernel's prefetching loop, the same
+    // terms in the same kbx order as the loop below (bit-identical).
+    if constexpr (type == GGML_TYPE_Q2_0_ROCMFP2 && !fp2_packed32 && fp2_prefetch) {
+        mul_mat_vec_q_moe_fp2_prefetch<c_rows_per_block, has_fusion>(
+            vx, vgate, use_gate, y, kbx_offset, stride_row_x, blocks_per_row_x, tmp, tmp_gate);
+    } else
     for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
@@ -2049,7 +2056,8 @@ static __global__ void mul_mat_vec_q_moe_grouped(
 
 template <ggml_type type, bool fp3_packed24 = false,
           bool fp2_packed32 = false,
-          int tokens_per_group = MMID_GROUPED_DEFAULT_TPG>
+          int tokens_per_group = MMID_GROUPED_DEFAULT_TPG,
+          bool fp2_prefetch = false>
 static void mul_mat_vec_q_moe_grouped_launch(
         const void * vx, const void * vy, const int32_t * meta, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
@@ -2067,7 +2075,7 @@ static void mul_mat_vec_q_moe_grouped_launch(
     if (has_fusion) {
         mul_mat_vec_q_moe_grouped<
             type, rows_per_block, true, fp3_packed24, fp2_packed32,
-            tokens_per_group>
+            tokens_per_group, fp2_prefetch>
             <<<block_nums, block_dims, 0, stream>>>(
                 vx, vy, meta, fusion, dst, (uint32_t) np, ncols_x,
                 nchannels_y, nrows_x, stride_row_x, stride_col_y,
@@ -2076,13 +2084,25 @@ static void mul_mat_vec_q_moe_grouped_launch(
     } else {
         mul_mat_vec_q_moe_grouped<
             type, rows_per_block, false, fp3_packed24, fp2_packed32,
-            tokens_per_group>
+            tokens_per_group, fp2_prefetch>
             <<<block_nums, block_dims, 0, stream>>>(
                 vx, vy, meta, fusion, dst, (uint32_t) np, ncols_x,
                 nchannels_y, nrows_x, stride_row_x, stride_col_y,
                 stride_col_dst, stride_channel_x, stride_channel_y,
                 stride_channel_dst);
     }
+}
+
+// The prefetching ROCmFP2 loop (mul_mat_vec_q_moe_fp2_prefetch), for the
+// per-expert and the grouped expert kernels: LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH=0/1
+// wins; unset, gfx1151 only.
+static bool mmvq_moe_fp2_prefetch_on(const int cc) {
+    static const int setting = []() {
+        const char * e = std::getenv("LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH");
+        if (e == nullptr) return -1;
+        return (e[0] == '1' && e[1] == '\0') ? 1 : 0;
+    }();
+    return setting >= 0 ? setting == 1 : is_gfx1151(cc);
 }
 
 static bool mul_mat_vec_q_grouped_dispatch(
@@ -2132,6 +2152,13 @@ static bool mul_mat_vec_q_grouped_dispatch(
             if (mmvq_env_flag("LUCE_CUDA_MMVQ_MOE_FP2_PACKED32")) {
                 mul_mat_vec_q_moe_grouped_launch<
                     GGML_TYPE_Q2_0_ROCMFP2, false, true>(
+                        vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd,
+                        nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        max_groups, warp_size, stream);
+            } else if (mmvq_moe_fp2_prefetch_on(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                mul_mat_vec_q_moe_grouped_launch<
+                    GGML_TYPE_Q2_0_ROCMFP2, false, false, MMID_GROUPED_DEFAULT_TPG, true>(
                         vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd,
                         nrows_x, stride_row_x, stride_col_y, stride_col_dst,
                         stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -2453,16 +2480,7 @@ static void mul_mat_vec_q_moe_launch(
             std::getenv("LUCE_CUDA_MMVQ_MOE_FP2_PACKED32");
         return e && e[0] == '1' && e[1] == '\0';
     }();
-    // Explicit LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH wins; unset defaults to the
-    // prefetching ROCmFP2 loop on gfx1151 only.
-    static const int fp2_prefetch_setting = []() {
-        const char * e =
-            std::getenv("LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH");
-        if (e == nullptr) return -1;
-        return (e[0] == '1' && e[1] == '\0') ? 1 : 0;
-    }();
-    const bool fp2_prefetch =
-        fp2_prefetch_setting >= 0 ? fp2_prefetch_setting == 1 : gfx1151;
+    const bool fp2_prefetch = mmvq_moe_fp2_prefetch_on(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
     GGML_UNUSED(fp2_prefetch);
 
 #define GGML_MOE_LAUNCH_RPB(RPB) \
