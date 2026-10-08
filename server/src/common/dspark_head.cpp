@@ -1,4 +1,5 @@
 #include "dspark_head.h"
+#include "pinned_stage.h"
 
 #include "ggml-alloc.h"
 #include "ddtree.h"
@@ -221,6 +222,8 @@ struct MarkovChainGraphCache {
     int n_candidates = -1;
     bool want_confidence = false;
     bool want_logit_margin = false;
+    // Pinned staging for the per-call uploads and readbacks.
+    PinnedStage stage;
 
     bool matches(const DraftWeights & dw, ggml_tensor * head,
                  ggml_backend_t candidate_backend, int candidate_count,
@@ -462,16 +465,21 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
     MarkovChainGraph & g = cache.graph;
 
     // Candidate hidden states start at position 1 (position 0 is the seed).
-    ggml_backend_tensor_set(g.inp_hidden, local_hidden + (size_t)hdim, 0,
-                            sizeof(float) * (size_t)hdim * (size_t)n_cand);
+    // Uploads and readbacks go through pinned slices, so the call costs one
+    // wait for the graph and its outputs instead of a round trip per tensor.
+    const size_t hidden_bytes = sizeof(float) * (size_t)hdim * (size_t)n_cand;
+    PinnedStage & stage = cache.stage;
+    stage.reserve(backend, 2 * hidden_bytes + 3 * sizeof(float) * (size_t)n_cand + 4096);
+    stage.reset();
+    stage.set(backend, g.inp_hidden, local_hidden + (size_t)hdim, 0, hidden_bytes);
     if (want_confidence && g.inp_confidence_hidden) {
         const float * conf_src = confidence_hidden ? confidence_hidden : local_hidden;
-        ggml_backend_tensor_set(g.inp_confidence_hidden, conf_src + (size_t)hdim, 0,
-                                sizeof(float) * (size_t)hdim * (size_t)n_cand);
+        stage.set(backend, g.inp_confidence_hidden, conf_src + (size_t)hdim, 0, hidden_bytes);
     }
-    ggml_backend_tensor_set(g.inp_seed, &last_tok, 0, sizeof(int32_t));
+    stage.set(backend, g.inp_seed, &last_tok, 0, sizeof(int32_t));
 
-    if (ggml_backend_graph_compute(backend, g.gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute_async(backend, g.gf) != GGML_STATUS_SUCCESS) {
+        ggml_backend_synchronize(backend);
         std::fprintf(stderr, "dspark_fused: graph_compute failed\n");
         cache.invalidate();
         return false;
@@ -479,23 +487,35 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
 
     draft_tok.assign((size_t)q_len, 0);
     draft_tok[0] = last_tok;
-    // One synchronize instead of n_cand blocking readbacks.
+    // One synchronize for the graph and every readback.
     std::vector<int32_t> t_out((size_t)n_cand);
     std::vector<float> c_out(want_confidence ? (size_t)n_cand : 0);
     std::vector<float> m_out(want_logit_margin ? (size_t)n_cand : 0);
+    std::vector<const void *> t_src((size_t)n_cand, nullptr);
+    std::vector<const void *> c_src((size_t)n_cand, nullptr);
+    std::vector<const void *> m_src((size_t)n_cand, nullptr);
     for (int i = 0; i < n_cand; ++i) {
-        ggml_backend_tensor_get_async(backend, g.toks[(size_t)i], &t_out[i], 0, sizeof(int32_t));
+        t_src[(size_t)i] = stage.get(backend, g.toks[(size_t)i], 0, sizeof(int32_t));
         if (want_confidence && g.confidence[(size_t)i]) {
-            ggml_backend_tensor_get_async(
-                backend, g.confidence[(size_t)i], &c_out[i], 0, sizeof(float));
+            c_src[(size_t)i] = stage.get(backend, g.confidence[(size_t)i], 0, sizeof(float));
         }
         if (want_logit_margin && g.logit_margin[(size_t)i]) {
-            ggml_backend_tensor_get_async(
-                backend, g.logit_margin[(size_t)i], &m_out[i], 0,
-                sizeof(float));
+            m_src[(size_t)i] = stage.get(backend, g.logit_margin[(size_t)i], 0, sizeof(float));
         }
     }
     ggml_backend_synchronize(backend);
+    for (int i = 0; i < n_cand; ++i) {
+        if (t_src[(size_t)i]) std::memcpy(&t_out[i], t_src[(size_t)i], sizeof(int32_t));
+        else ggml_backend_tensor_get(g.toks[(size_t)i], &t_out[i], 0, sizeof(int32_t));
+        if (want_confidence && g.confidence[(size_t)i]) {
+            if (c_src[(size_t)i]) std::memcpy(&c_out[i], c_src[(size_t)i], sizeof(float));
+            else ggml_backend_tensor_get(g.confidence[(size_t)i], &c_out[i], 0, sizeof(float));
+        }
+        if (want_logit_margin && g.logit_margin[(size_t)i]) {
+            if (m_src[(size_t)i]) std::memcpy(&m_out[i], m_src[(size_t)i], sizeof(float));
+            else ggml_backend_tensor_get(g.logit_margin[(size_t)i], &m_out[i], 0, sizeof(float));
+        }
+    }
     for (int i = 0; i < n_cand; ++i) {
         draft_tok[(size_t)i + 1] = t_out[i];
     }
@@ -506,6 +526,214 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
         g.logit_margin[0]) {
         *logit_margin_out = std::move(m_out);
     }
+    return true;
+}
+
+namespace {
+
+struct SplitChainCache {
+    ggml_context * ctx = nullptr;
+    ggml_cgraph *  gf  = nullptr;
+    ggml_tensor *  inp_hidden = nullptr;
+    ggml_tensor *  inp_confidence_hidden = nullptr;
+    ggml_tensor *  inp_seed = nullptr;
+    std::vector<ggml_tensor *> toks;
+    std::vector<ggml_tensor *> confidence;
+    std::vector<uint8_t> arena;
+    ggml_gallocr_t allocator = nullptr;
+    ggml_backend_t alloc_backend = nullptr;
+    PinnedStage stage;
+    bool built = false;
+    uint64_t generation = 0;
+    const void * lm_head = nullptr;
+    const void * w1 = nullptr;
+    const void * w2 = nullptr;
+    const void * id = nullptr;
+    ggml_backend_t backend = nullptr;
+    int64_t row_offset = -1;
+    int64_t n_rows = -1;
+    int n_candidates = -1;
+    bool want_confidence = false;
+
+    void invalidate() {
+        if (ctx) ggml_free(ctx);
+        ctx = nullptr;
+        gf = nullptr;
+        inp_hidden = inp_confidence_hidden = inp_seed = nullptr;
+        toks.clear();
+        confidence.clear();
+        built = false;
+    }
+};
+
+}  // namespace
+
+bool dspark_markov_chain_vocab_split(const DraftWeights & dw,
+                                     ggml_backend_t backend,
+                                     ggml_tensor * lm_head,
+                                     const DsparkVocabSplit & split,
+                                     const float * local_hidden,
+                                     int n_candidates,
+                                     int32_t last_tok,
+                                     bool read,
+                                     std::vector<int32_t> & draft_tok,
+                                     std::vector<float> * confidence_out,
+                                     const float * confidence_hidden) {
+    if (n_candidates <= 0 || !backend || !lm_head || !dw.dspark.enabled) return false;
+    if (!split.share || !split.pick || !split.markov_w1 || !split.markov_w2) return false;
+    if (split.n_rows <= 0 || split.row_offset < 0 ||
+        split.row_offset + split.n_rows > lm_head->ne[1] ||
+        split.markov_w2->ne[1] < split.n_rows) {
+        return false;
+    }
+    const int hdim = dw.n_embd;
+    if (hdim <= 0 || dw.dspark.markov_rank <= 0) return false;
+    const bool want_confidence = read && confidence_out != nullptr &&
+        dw.dspark.confidence_w != nullptr && dw.dspark.confidence_b != nullptr &&
+        (dw.dspark.confidence_dim == hdim ||
+         dw.dspark.confidence_dim == hdim + dw.dspark.markov_rank);
+    if (confidence_out) confidence_out->clear();
+
+    static thread_local SplitChainCache c;
+    const uint64_t generation = dspark_drafter_generation();
+    const bool reuse = c.built && c.generation == generation && c.lm_head == lm_head &&
+        c.w1 == split.markov_w1 && c.w2 == split.markov_w2 && c.id == split.id &&
+        c.backend == backend && c.row_offset == split.row_offset && c.n_rows == split.n_rows &&
+        c.n_candidates == n_candidates && c.want_confidence == want_confidence;
+    if (!reuse) {
+        c.invalidate();
+        const size_t arena_size = ggml_tensor_overhead() * (size_t) (64 + 24 * n_candidates) +
+                                  ggml_graph_overhead_custom(512, false) + 2 * 1024 * 1024;
+        if (c.arena.size() < arena_size) c.arena.resize(arena_size);
+        ggml_init_params ip{};
+        ip.mem_size   = c.arena.size();
+        ip.mem_buffer = c.arena.data();
+        ip.no_alloc   = true;
+        c.ctx = ggml_init(ip);
+        if (!c.ctx) return false;
+        c.gf = ggml_new_graph_custom(c.ctx, 512, false);
+        c.inp_hidden = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, hdim, n_candidates);
+        ggml_set_input(c.inp_hidden);
+        c.inp_seed = ggml_new_tensor_1d(c.ctx, GGML_TYPE_I32, 1);
+        ggml_set_input(c.inp_seed);
+        if (want_confidence) {
+            c.inp_confidence_hidden = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, hdim, n_candidates);
+            ggml_set_input(c.inp_confidence_hidden);
+        }
+        ggml_tensor * hidden = split.share(c.ctx, c.inp_hidden);
+        ggml_tensor * rows = hidden
+            ? ggml_view_2d(c.ctx, lm_head, lm_head->ne[0], split.n_rows, lm_head->nb[1],
+                           (size_t) split.row_offset * lm_head->nb[1])
+            : nullptr;
+        ggml_tensor * base = rows ? ggml_mul_mat(c.ctx, rows, hidden) : nullptr;   // [n_rows, n_candidates]
+        ggml_tensor * w2 = split.markov_w2->ne[1] == split.n_rows ? split.markov_w2
+            : ggml_view_2d(c.ctx, split.markov_w2, split.markov_w2->ne[0], split.n_rows,
+                           split.markov_w2->nb[1], 0);
+        ggml_tensor * prev_ids = c.inp_seed;
+        for (int i = 0; base && i < n_candidates; ++i) {
+            ggml_tensor * prev_emb = ggml_get_rows(c.ctx, split.markov_w1, prev_ids);
+            ggml_tensor * bias = ggml_mul_mat(c.ctx, w2, prev_emb);
+            ggml_tensor * base_i = ggml_view_2d(c.ctx, base, split.n_rows, 1, base->nb[1],
+                                                (size_t) i * base->nb[1]);
+            ggml_tensor * tok = split.pick(c.ctx, ggml_add(c.ctx, base_i, bias));
+            if (!tok) { base = nullptr; break; }
+            ggml_set_output(tok);
+            ggml_build_forward_expand(c.gf, tok);
+            c.toks.push_back(tok);
+            if (want_confidence) {
+                ggml_tensor * hidden_i = ggml_view_2d(
+                    c.ctx, c.inp_confidence_hidden, hdim, 1, c.inp_confidence_hidden->nb[1],
+                    (size_t) i * c.inp_confidence_hidden->nb[1]);
+                ggml_tensor * conf_in = hidden_i;
+                if (dw.dspark.confidence_dim == hdim + dw.dspark.markov_rank) {
+                    conf_in = ggml_concat(c.ctx, hidden_i, prev_emb, 0);
+                }
+                ggml_tensor * conf = ggml_mul_mat(c.ctx, dw.dspark.confidence_w, conf_in);
+                conf = ggml_add(c.ctx, conf, ggml_reshape_2d(c.ctx, dw.dspark.confidence_b, 1, 1));
+                conf = ggml_sigmoid(c.ctx, conf);
+                ggml_set_output(conf);
+                ggml_build_forward_expand(c.gf, conf);
+                c.confidence.push_back(conf);
+            }
+            prev_ids = tok;
+        }
+        if (!base) {
+            std::fprintf(stderr, "dspark_split: graph build failed\n");
+            c.invalidate();
+            return false;
+        }
+        if (c.allocator && c.alloc_backend != backend) {
+            ggml_gallocr_free(c.allocator);
+            c.allocator = nullptr;
+        }
+        if (!c.allocator) {
+            c.allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            c.alloc_backend = backend;
+        }
+        if (!c.allocator || !ggml_gallocr_alloc_graph(c.allocator, c.gf)) {
+            std::fprintf(stderr, "dspark_split: gallocr_alloc_graph failed\n");
+            c.invalidate();
+            return false;
+        }
+        c.generation = generation;
+        c.lm_head = lm_head;
+        c.w1 = split.markov_w1;
+        c.w2 = split.markov_w2;
+        c.id = split.id;
+        c.backend = backend;
+        c.row_offset = split.row_offset;
+        c.n_rows = split.n_rows;
+        c.n_candidates = n_candidates;
+        c.want_confidence = want_confidence;
+        c.built = true;
+        g_dspark_chain_graph_builds.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    // Candidate hidden states start at slot 1 of the padded block (slot 0 is
+    // the seed). A rank without them leaves the input as it is: the share
+    // node replaces it with the root's columns.
+    const size_t hidden_bytes = sizeof(float) * (size_t) hdim * (size_t) n_candidates;
+    c.stage.reserve(backend, 2 * hidden_bytes + 2 * sizeof(float) * (size_t) n_candidates + 4096);
+    c.stage.reset();
+    if (local_hidden) c.stage.set(backend, c.inp_hidden, local_hidden + (size_t) hdim, 0, hidden_bytes);
+    if (want_confidence) {
+        const float * conf_src = confidence_hidden ? confidence_hidden : local_hidden;
+        if (conf_src) {
+            c.stage.set(backend, c.inp_confidence_hidden, conf_src + (size_t) hdim, 0, hidden_bytes);
+        }
+    }
+    c.stage.set(backend, c.inp_seed, &last_tok, 0, sizeof(int32_t));
+    if (ggml_backend_graph_compute_async(backend, c.gf) != GGML_STATUS_SUCCESS) {
+        ggml_backend_synchronize(backend);
+        std::fprintf(stderr, "dspark_split: graph_compute failed\n");
+        c.invalidate();
+        return false;
+    }
+    if (!read) return true;
+
+    std::vector<const void *> t_src((size_t) n_candidates, nullptr);
+    std::vector<const void *> c_src((size_t) n_candidates, nullptr);
+    for (int i = 0; i < n_candidates; ++i) {
+        t_src[(size_t) i] = c.stage.get(backend, c.toks[(size_t) i], 0, sizeof(int32_t));
+        if (want_confidence) {
+            c_src[(size_t) i] = c.stage.get(backend, c.confidence[(size_t) i], 0, sizeof(float));
+        }
+    }
+    ggml_backend_synchronize(backend);
+    draft_tok.assign((size_t) n_candidates + 1, 0);
+    draft_tok[0] = last_tok;
+    std::vector<float> conf_out(want_confidence ? (size_t) n_candidates : 0);
+    for (int i = 0; i < n_candidates; ++i) {
+        int32_t t = 0;
+        if (t_src[(size_t) i]) std::memcpy(&t, t_src[(size_t) i], sizeof(int32_t));
+        else ggml_backend_tensor_get(c.toks[(size_t) i], &t, 0, sizeof(int32_t));
+        draft_tok[(size_t) i + 1] = t;
+        if (want_confidence) {
+            if (c_src[(size_t) i]) std::memcpy(&conf_out[(size_t) i], c_src[(size_t) i], sizeof(float));
+            else ggml_backend_tensor_get(c.confidence[(size_t) i], &conf_out[(size_t) i], 0, sizeof(float));
+        }
+    }
+    if (want_confidence) *confidence_out = std::move(conf_out);
     return true;
 }
 

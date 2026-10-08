@@ -24,11 +24,15 @@
 #include "deepseek4_dspark.h"
 #include "deepseek4_budget_hook.h"
 #include "deepseek4_internal.h"
+#include "cluster/cluster_decision_hooks.h"
+#include "cluster/fast_reduce.h"
+#include "deepseek4_cluster.h"
 #include "deepseek4_snapshot.h"
 #include "deepseek4_roctx.h"
 #include "internal.h"
 #include "common/adaptive_spec_width.h"
 #include "common/dspark_head.h"
+#include "common/cuda_graph_overrides.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -43,6 +47,7 @@
 #include <cmath>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -240,9 +245,19 @@ public:
             }
         }
         bool copied = false;
+        // One launch for every layer's pair on a CUDA/HIP backend (a blit per
+        // tensor costs a dispatch each, four per layer); the pairs are
+        // disjoint, so their order does not matter.
+        std::vector<ggml_cuda_copy_desc> descs;
+        const bool batch = ggml_backend_is_cuda(backend_);
         auto copy_pair = [&](ggml_tensor * src, ggml_tensor * dst) {
             if (!src) return;
-            ggml_backend_tensor_copy_async(backend_, backend_, src, dst);
+            if (batch && ggml_is_contiguous(src) && ggml_is_contiguous(dst) &&
+                ggml_nbytes(src) == ggml_nbytes(dst)) {
+                descs.push_back({src->data, dst->data, ggml_nbytes(src)});
+            } else {
+                ggml_backend_tensor_copy_async(backend_, backend_, src, dst);
+            }
             copied = true;
         };
         for (const DeepSeek4SpecBoundaryCheckpointLayer & layer :
@@ -251,6 +266,9 @@ public:
             copy_pair(layer.attn_score_src, layer.attn_score_dst);
             copy_pair(layer.index_kv_src, layer.index_kv_dst);
             copy_pair(layer.index_score_src, layer.index_score_dst);
+        }
+        if (!descs.empty()) {
+            ggml_backend_cuda_copy_batch_async(backend_, descs.data(), (int) descs.size());
         }
         return copied;
     }
@@ -316,8 +334,10 @@ bool spec_env_default_on(const char * name) {
 // fixed drafter/head work (DSpark computes its whole proposal block whatever
 // the verify width). Only the ratios matter: q3 costs almost as much as q4,
 // so high-acceptance text settles on q4/q5 while low-acceptance prose drops
-// to q2/q3. observe() refines the table online, so other backends start from
-// this curve instead of importing a DS4 policy. The fused verify cache is
+// to q2/q3. The controller takes the curve as a shape: it scales it to the
+// widths measured on this machine and measures a wider width before trusting
+// the curve's price for it, so a machine with a flatter curve (a two-box
+// cluster verifies q5 for 1.3x the q2 step, not 1.6x) widens on its own. The fused verify cache is
 // sized so every width stays resident across the ratio-4 phases.
 constexpr int kDs4AdaptiveMinWidth = 2;
 // Depths whose confidence-head score decides the width. The head was
@@ -431,7 +451,20 @@ bool device_rollback_enabled() {
 bool rollback_tensor_on(const ggml_tensor * t, ggml_backend_buffer_type_t buft) {
     if (!t) return true;
     const ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
-    return buf && ggml_backend_buffer_get_type(buf) == buft;
+    const bool on = buf && ggml_backend_buffer_get_type(buf) == buft;
+    if (!on) {
+        // Device staging falls back to one copy per saved row; say which
+        // tensor forced that, once.
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::fprintf(stderr,
+                "[ds4-spec] device rollback staging off: %s is in %s, not %s\n",
+                t->name, buf ? ggml_backend_buft_name(ggml_backend_buffer_get_type(buf)) : "(no buffer)",
+                ggml_backend_buft_name(buft));
+        }
+    }
+    return on;
 }
 
 // Device staging needs every saved tensor in the backend's own device memory,
@@ -756,8 +789,13 @@ void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weight
 // and a window is at most two tokens; its remaining rows are rewritten by
 // the next tokens before the window is pooled.
 void spec_restore_window_rows(const Ds4VerifyWindowRows & rows, const DeepSeek4Weights & w,
-                              DeepSeek4Cache & cache, int verify_pos, int commit_pos) {
-    for (size_t il = 0; il < cache.layers.size() && il < rows.kv.size(); ++il) {
+                              DeepSeek4Cache & cache, int verify_pos, int commit_pos,
+                              ggml_backend_t backend) {
+    // Rows the fused verify left on the device go back in one batched copy on
+    // the compute stream, ordered before the next verify reads the state.
+    std::vector<ggml_cuda_copy_desc> copies;
+    for (size_t il = 0; il < cache.layers.size() &&
+                        (il < rows.kv.size() || il < rows.kv_dev.size()); ++il) {
         DeepSeek4LayerCache & lc = cache.layers[il];
         const int ratio = il < w.compress_ratios.size() ? (int) w.compress_ratios[il] : 0;
         if (!deepseek4_is_window_state(lc.attn_compressor, ratio)) continue;
@@ -765,6 +803,21 @@ void spec_restore_window_rows(const Ds4VerifyWindowRows & rows, const DeepSeek4W
         const int window_start = commit_pos / ratio * ratio;
         for (int p = std::max(window_start, verify_pos); p < commit_pos; ++p) {
             const size_t t = (size_t) (p - verify_pos);
+            if (il < rows.kv_dev.size() && t < rows.kv_dev[il].size() &&
+                t < rows.score_dev[il].size()) {
+                const ggml_tensor * kv = rows.kv_dev[il][t];
+                const ggml_tensor * score = rows.score_dev[il][t];
+                if (kv && score && ggml_nbytes(kv) >= row_bytes && ggml_nbytes(score) >= row_bytes) {
+                    const size_t offset = (size_t) (p % ratio) * row_bytes;
+                    copies.push_back({kv->data, (char *) lc.attn_compressor.state_kv->data + offset,
+                                      row_bytes});
+                    copies.push_back({score->data,
+                                      (char *) lc.attn_compressor.state_score->data + offset,
+                                      row_bytes});
+                }
+                continue;
+            }
+            if (il >= rows.kv.size()) continue;
             if (rows.kv[il].size() < (t + 1) * row_bytes ||
                 rows.score[il].size() < (t + 1) * row_bytes) {
                 continue;
@@ -776,6 +829,76 @@ void spec_restore_window_rows(const Ds4VerifyWindowRows & rows, const DeepSeek4W
                                     rows.score[il].data() + t * row_bytes, offset, row_bytes);
         }
     }
+    if (!copies.empty()) {
+        ggml_backend_cuda_copy_batch_async(backend, copies.data(), (int) copies.size());
+    }
+}
+
+// The split draft head's Markov weights on the target's device, for a rank
+// whose drafter sits elsewhere (--draft-device) or whose rows of markov_w2 do
+// not start at row 0: markov_w1 whole (the previous token's row is any row)
+// and the rank's rows of markov_w2. About 100 MB, copied once per drafter.
+struct SplitMarkovCopies {
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor *         w1 = nullptr;
+    ggml_tensor *         w2 = nullptr;
+    uint64_t              generation = 0;
+    ggml_backend_t        backend = nullptr;
+    int64_t               row_offset = -1;
+    int64_t               n_rows = -1;
+
+    void release() {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+        buf = nullptr;
+        ctx = nullptr;
+        w1 = w2 = nullptr;
+    }
+};
+
+bool spec_tensor_on(const ggml_tensor * t, ggml_backend_t backend) {
+    return t && t->buffer &&
+           ggml_backend_buffer_get_type(t->buffer) == ggml_backend_get_default_buffer_type(backend);
+}
+
+bool split_markov_copies(SplitMarkovCopies & m, const DraftWeights & dw, ggml_backend_t backend,
+                         int64_t row_offset, int64_t n_rows) {
+    const uint64_t generation = dspark_drafter_generation();
+    if (m.w1 && m.generation == generation && m.backend == backend &&
+        m.row_offset == row_offset && m.n_rows == n_rows) {
+        return true;
+    }
+    m.release();
+    const ggml_tensor * s1 = dw.dspark.markov_w1;
+    const ggml_tensor * s2 = dw.dspark.markov_w2;
+    if (!s1 || !s2 || !ggml_is_contiguous(s1) || !ggml_is_contiguous(s2) ||
+        row_offset + n_rows > s2->ne[1]) {
+        return false;
+    }
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 4;
+    ip.no_alloc = true;
+    m.ctx = ggml_init(ip);
+    if (!m.ctx) return false;
+    m.w1 = ggml_new_tensor_2d(m.ctx, s1->type, s1->ne[0], s1->ne[1]);
+    m.w2 = ggml_new_tensor_2d(m.ctx, s2->type, s2->ne[0], n_rows);
+    m.buf = ggml_backend_alloc_ctx_tensors(m.ctx, backend);
+    if (!m.buf) {
+        m.release();
+        return false;
+    }
+    std::vector<uint8_t> rows(ggml_nbytes(s1));
+    ggml_backend_tensor_get(s1, rows.data(), 0, rows.size());
+    ggml_backend_tensor_set(m.w1, rows.data(), 0, rows.size());
+    rows.resize((size_t) n_rows * s2->nb[1]);
+    ggml_backend_tensor_get(s2, rows.data(), (size_t) row_offset * s2->nb[1], rows.size());
+    ggml_backend_tensor_set(m.w2, rows.data(), 0, rows.size());
+    m.generation = generation;
+    m.backend = backend;
+    m.row_offset = row_offset;
+    m.n_rows = n_rows;
+    return true;
 }
 
 using SpecClock = std::chrono::steady_clock;
@@ -938,8 +1061,34 @@ bool run_deepseek4_dspark_spec_decode(
         MoeExpertComputeRuntime * expert_runtime,
         MoeHybridRoutingStats * routing_stats,
         DSparkSpecSampling * sampling,
-        DSparkBudgetHook * budget_hook) {
+        DSparkBudgetHook * budget_hook,
+        luce::cluster::Ds4ClusterHooks * cluster_hooks) {
     const int n_embd = target_w.n_embd;
+    // Cluster lockstep (from maikzz32's lucebox-halo-cluster). Only a real
+    // head/worker hook changes behaviour.
+    const bool cluster_spec = cluster_hooks && cluster_hooks->is_cluster();
+    const bool cluster_spec_head = cluster_spec && cluster_hooks->is_head();
+    // Workers verify the head's draft block, never their own, so with
+    // LUCE_CLUSTER_WORKER_SKIP_DRAFT=1 they skip the drafter forward and the
+    // head. The drafter can then sit off the worker's dGPU (--draft-device),
+    // which frees that memory for hot experts.
+    // LUCE_CLUSTER_DRAFT_SPLIT: the drafter itself is split across the ranks
+    // (half the heads and experts each, all-reduces in its graph), so every
+    // rank runs it every step, in the same place in the collective order.
+    const bool draft_split = cluster_spec && drafter.split_size > 1;
+    const bool worker_skips_draft = cluster_spec && !cluster_spec_head && !draft_split &&
+        spec_env_flag("LUCE_CLUSTER_WORKER_SKIP_DRAFT");
+    const uint64_t cluster_req = cluster_hooks ? cluster_hooks->current_request() : 0;
+    // LUCE_CLUSTER_WORKER_KEEPALIVE=1: between its verify and the head's next
+    // draft a worker's GPU is idle for milliseconds, and its first launch after
+    // that started ~1 ms late (wake-up), which the head then waited for at the
+    // first exchange. One sleeping wave keeps it awake until the draft arrives.
+    const bool worker_keepalive = cluster_spec && !cluster_spec_head && !draft_split &&
+        spec_env_flag("LUCE_CLUSTER_WORKER_KEEPALIVE");
+    struct KeepaliveOff {
+        ggml_backend_t backend; bool on;
+        ~KeepaliveOff() { if (on) ggml_backend_cuda_keepalive(backend, false, 0); }
+    } keepalive_off{backend, worker_keepalive};
     const bool hook_on = budget_hook && !budget_hook->close_ids.empty();
     luce::deepseek4::SpecBudgetHookState hook_st;
     bool close_emitted = false;    // the hook's close token reached the stream
@@ -1057,6 +1206,14 @@ bool run_deepseek4_dspark_spec_decode(
         width_cost_ms[(size_t) width] = kDs4VerifyWidthCostMs[width];
     }
     width_controller.set_relative_costs(width_cost_ms);
+    // Step costs belong to the machine, not to the text: every request starts
+    // from the costs the earlier ones measured (their warmup hold re-arms).
+    static std::mutex measured_width_costs_mu;
+    static std::vector<float> measured_width_costs;
+    {
+        std::lock_guard<std::mutex> lock(measured_width_costs_mu);
+        width_controller.set_measured_costs(measured_width_costs);
+    }
     if (timing && width_controller.enabled()) {
         std::fprintf(stderr,
                      "[ds4-spec] adaptive width policy=%s\n",
@@ -1144,6 +1301,81 @@ bool run_deepseek4_dspark_spec_decode(
     if (sampling) target.set_keep_logits(true);   // verify returns every row's logits
     const SpecClock::time_point run_t0 = SpecClock::now();
 
+    // LUCE_CLUSTER_DRAFT_VOCAB_SPLIT=1 (two ranks): the draft head reads the
+    // target's 703 MB Q8_0 lm_head every step (~1.1 ms on the head's dGPU,
+    // while the worker's waits for the block). Split it like the verifier's
+    // head (LUCE_CLUSTER_VOCAB_SPLIT): each rank projects its half of the
+    // vocabulary and of the Markov bias, the head's hidden states reach the
+    // worker exactly, and the ranks agree on every depth's token in the graph.
+    // Same tokens as the unsplit head. Both ranks run it once per step, the
+    // worker right before it waits for the head's block.
+    Ds4ClusterRuntime * split_rt = target_cache.cluster_rt;
+    const bool draft_vocab_split = cluster_spec && split_rt && split_rt->size() == 2 &&
+        split_rt->fast && split_rt->fast->ok() && q_cap >= 2 &&
+        spec_env_flag("LUCE_CLUSTER_DRAFT_VOCAB_SPLIT");
+    DsparkVocabSplit vocab_split;
+    if (draft_vocab_split) {
+        const int split_rank = split_rt->rank();
+        ggml_tensor * head = target.lm_head_tensor();
+        const int64_t V = head->ne[1];
+        const int64_t half = ((V / 2) + 255) / 256 * 256;
+        vocab_split.row_offset = split_rank == 0 ? 0 : half;
+        vocab_split.n_rows = split_rank == 0 ? half : V - half;
+        vocab_split.markov_w1 = dw.dspark.markov_w1;
+        vocab_split.markov_w2 = dw.dspark.markov_w2;
+        if (vocab_split.row_offset != 0 || !spec_tensor_on(dw.dspark.markov_w1, backend) ||
+            !spec_tensor_on(dw.dspark.markov_w2, backend)) {
+            static SplitMarkovCopies split_copies;
+            if (!split_markov_copies(split_copies, dw, backend, vocab_split.row_offset,
+                                     vocab_split.n_rows)) {
+                std::fprintf(stderr, "[ds4-spec] draft vocab split: Markov weight copy failed\n");
+                return false;
+            }
+            vocab_split.markov_w1 = split_copies.w1;
+            vocab_split.markov_w2 = split_copies.w2;
+        }
+        const int64_t r0 = vocab_split.row_offset;
+        // A split drafter leaves the same hidden states on every rank.
+        if (draft_split) {
+            vocab_split.share = [](ggml_context *, ggml_tensor * t) { return t; };
+        } else {
+            vocab_split.share = [split_rt](ggml_context * ctx, ggml_tensor * t) {
+                return ds4_cluster_broadcast_exact_node(ctx, t, *split_rt);
+            };
+        }
+        vocab_split.pick = [split_rt, r0, split_rank](ggml_context * ctx, ggml_tensor * logits) -> ggml_tensor * {
+            ggml_tensor * pair = ggml_ds4_argmax_pair(ctx, logits, (int) r0, split_rank, 2);
+            pair = ds4_cluster_allreduce_node(ctx, pair, *split_rt, /*inplace=*/true);
+            return pair ? ggml_ds4_argmax_pick(ctx, pair, 2) : nullptr;
+        };
+        vocab_split.id = split_rt;
+        static bool split_reported = false;
+        if (!split_reported) {
+            split_reported = true;
+            std::fprintf(stderr, "[ds4-spec] draft vocab split: rank %d rows %lld..%lld of %lld (%s Markov weights)\n",
+                         split_rank, (long long) r0, (long long) (r0 + vocab_split.n_rows), (long long) V,
+                         vocab_split.markov_w1 == dw.dspark.markov_w1 ? "drafter's" : "copied");
+        }
+    }
+    // One split head per step on every rank, in the same place in the
+    // collective order: the head's own, or one whose tokens nobody reads.
+    const auto run_split_head = [&](const float * hidden, bool read, std::vector<int32_t> & toks,
+                                    std::vector<float> * conf, const float * conf_hidden) {
+        const ScopedCudaGraphOverrides head_products(
+            /*disable_graphs=*/false, /*mmvq_max_ncols=*/0,
+            /*skip_property_check=*/false, /*ds4_mix_mmv_max_tokens=*/0,
+            /*mmvq_batch_invariant=*/true);
+        split_rt->node_error.clear();
+        const bool ran = dspark_markov_chain_vocab_split(
+            dw, backend, target.lm_head_tensor(), vocab_split, hidden, q_cap - 1, lt, read,
+            toks, conf, conf_hidden);
+        if (ran && read && !split_rt->node_error.empty()) {
+            std::fprintf(stderr, "[ds4-spec] draft vocab split: %s\n", split_rt->node_error.c_str());
+            return false;
+        }
+        return ran;
+    };
+
     while (n_generated < n_gen) {
         const SpecClock::time_point step_t0 = SpecClock::now();
         const int ctx_len = feat_count < n_swa ? feat_count : n_swa;
@@ -1154,7 +1386,7 @@ bool run_deepseek4_dspark_spec_decode(
 
         // Noise block = [seed] + [MASK]*(block-1).
         SpecClock::time_point t0 = SpecClock::now();
-        if (q_cap >= 2 && !forcing) {
+        if (q_cap >= 2 && (draft_split || (!forcing && !worker_skips_draft))) {
             noise_ids[0] = lt;
             for (int i = 1; i < block; i++) {
                 noise_ids[i] = drafter.mask_token_id;
@@ -1202,6 +1434,7 @@ bool run_deepseek4_dspark_spec_decode(
         draft_tok.clear();
         draft_confidence.clear();
         bool ds_ok = false;
+        bool split_head_ran = false;
         // Batched-verify exactness: the batch must not cross a ratio-4
         // boundary except at its last token (state rows stay distinct and the
         // comp emission matches AR). Boundaries sit at p % 4 == 3. The
@@ -1239,7 +1472,7 @@ bool run_deepseek4_dspark_spec_decode(
                 draft_tok.push_back(budget_hook->close_ids[hook_st.inject_pos + (size_t) i]);
             }
             ds_ok = true;
-        } else if (q_step_cap >= 2) {
+        } else if (q_step_cap >= 2 && !worker_skips_draft) {
             std::memcpy(padded_hidden.data() + n_embd, local_hidden.data(),
                         sizeof(float) * (size_t) n_embd * block);
             if (use_confidence_width) {
@@ -1247,13 +1480,39 @@ bool run_deepseek4_dspark_spec_decode(
                             confidence_hidden.data(),
                             sizeof(float) * (size_t) n_embd * block);
             }
-            ds_ok = dspark_markov_correct_greedy_chain_fused(
+            if (draft_vocab_split) {
+                // Every depth the head always offers, so the worker's graph
+                // matches; the controller's narrower cap keeps the prefix.
+                split_head_ran = true;
+                if (!run_split_head(padded_hidden.data(), /*read=*/true, draft_tok,
+                                    use_confidence_width ? &draft_confidence : nullptr,
+                                    use_confidence_width ? padded_confidence_hidden.data() : nullptr)) {
+                    std::fprintf(stderr, "[ds4-spec] split draft head failed\n");
+                    ok = false;
+                    break;
+                }
+                ds_ok = true;
+                if ((int) draft_tok.size() > q_step_cap) draft_tok.resize((size_t) q_step_cap);
+                if ((int) draft_confidence.size() > q_step_cap - 1) {
+                    draft_confidence.resize((size_t) std::max(0, q_step_cap - 1));
+                }
+            } else {
+                // The head projects every candidate column through the
+                // vocabulary rows; batch-invariant products read those rows
+                // once for all columns on the single-column kernel (the RDNA4
+                // Q8_0 path: 1.67 -> 1.13 ms for four columns on gfx1201).
+                const ScopedCudaGraphOverrides head_products(
+                    /*disable_graphs=*/false, /*mmvq_max_ncols=*/0,
+                    /*skip_property_check=*/false, /*ds4_mix_mmv_max_tokens=*/0,
+                    /*mmvq_batch_invariant=*/true);
+                ds_ok = dspark_markov_correct_greedy_chain_fused(
                             dw, backend, target.lm_head_tensor(), padded_hidden.data(),
                             q_step_cap, lt, draft_tok,
                             use_confidence_width ? &draft_confidence : nullptr,
                             use_confidence_width
                                 ? padded_confidence_hidden.data() : nullptr,
                             nullptr);
+            }
             if (!ds_ok) {
                 ds_ok = dspark_markov_correct_greedy_chain(dw, backend, target,
                             padded_hidden.data(), q_step_cap, lt, 0.0f, draft_tok);
@@ -1305,6 +1564,58 @@ bool run_deepseek4_dspark_spec_decode(
         // tokens (drafted or forced close tokens) that are never returned.
         const int remaining_out = std::max(1, n_gen - n_generated);
         if ((int) draft_tok.size() > remaining_out) draft_tok.resize((size_t) remaining_out);
+        // The split draft head runs on every rank every step: here on a worker
+        // (it then waits for the head's block below with its share already
+        // queued) and on a head step that did not project (forced tokens).
+        if (draft_vocab_split && !split_head_ran) {
+            // A worker's keepalive wave may share a hardware queue with the
+            // compute stream and would hold the head's graph until the wave's
+            // cap (~40 ms a step): stop it, queue the graph, then queue the
+            // wave behind it.
+            if (worker_keepalive) ggml_backend_cuda_keepalive(backend, false, 0);
+            std::vector<int32_t> unused_tok;
+            if (!run_split_head((cluster_spec_head || draft_split) ? padded_hidden.data() : nullptr,
+                                /*read=*/cluster_spec_head, unused_tok, nullptr, nullptr)) {
+                std::fprintf(stderr, "[ds4-spec] split draft head failed\n");
+                ok = false;
+                break;
+            }
+            if (worker_keepalive) ggml_backend_cuda_keepalive(backend, true, 40);
+        }
+        // Cluster lockstep: the head's draft block is authoritative. Every
+        // rank drafts (the drafter forwards run concurrently on all ranks, so
+        // the redundant work costs no wall-clock and keeps every feature
+        // window warm), but only rank 0's block and adaptive width are
+        // verified, so the verify batch is identical everywhere. An EMPTY
+        // block is the head's end marker for a head-only stop (cancel).
+        if (cluster_spec_head) {
+            std::string err;
+            if (!cluster_hooks->decide_draft(cluster_req, (uint32_t) steps, pos, draft_tok, &err)) {
+                std::fprintf(stderr, "[ds4-spec] cluster draft broadcast failed: %s\n", err.c_str());
+                ok = false;
+                break;
+            }
+        } else if (cluster_spec) {
+            std::string err;
+            const bool got_draft =
+                cluster_hooks->decide_draft(cluster_req, (uint32_t) steps, pos, draft_tok, &err);
+            if (worker_keepalive) ggml_backend_cuda_keepalive(backend, false, 0);
+            if (!got_draft) {
+                std::fprintf(stderr, "[ds4-spec] cluster draft missing: %s\n", err.c_str());
+                ok = false;
+                break;
+            }
+            if (draft_tok.empty()) {
+                stop_requested = true;
+                break;
+            }
+            if (draft_tok[0] != lt) {
+                std::fprintf(stderr, "[ds4-spec] cluster draft seed %d != local seed %d\n",
+                             draft_tok[0], lt);
+                ok = false;
+                break;
+            }
+        }
         const int q = (int) draft_tok.size();   // seed + candidates
         if (q >= 0 && q <= q_cap) width_steps[(size_t) q]++;
         tm_head += spec_ms_since(t0);
@@ -1372,6 +1683,7 @@ bool run_deepseek4_dspark_spec_decode(
         const bool verify_ok =
             target.verify_batch(draft_tok, pos, verify_last, &tgt_am);
         tm_verify += spec_ms_since(t0);
+        if (worker_keepalive) ggml_backend_cuda_keepalive(backend, true, 40);
         if (probe_inflight) {
             const SpecClock::time_point probe_t0 = SpecClock::now();
             deepseek4_dspark_draft_wait(drafter_backend);
@@ -1478,6 +1790,32 @@ bool run_deepseek4_dspark_spec_decode(
         // The hook replaced this step's bonus with the close token (and may
         // have cut the step short there).
         const bool close_bonus = hook_on && !hook_was_started && hook_st.started;
+        // Cluster: the head's accept/bonus are authoritative. Workers compute
+        // their own (identical when the expert-parallel graph is exact) but
+        // adopt the head's, so a numerically different argmax on one rank
+        // cannot desynchronize the rollback below.
+        if (cluster_spec) {
+            int32_t accept_msg = accept;
+            int32_t bonus_msg = bonus;
+            uint8_t accept_flags = 0;
+            std::string err;
+            if (!cluster_hooks->decide_accept(cluster_req, (uint32_t) steps,
+                                              accept_msg, bonus_msg, accept_flags, &err)) {
+                std::fprintf(stderr, "[ds4-spec] cluster accept exchange failed: %s\n", err.c_str());
+                ok = false;
+                break;
+            }
+            if (!cluster_spec_head) {
+                if (accept_msg < 1 || accept_msg > q) {
+                    std::fprintf(stderr, "[ds4-spec] cluster accept=%d outside [1,%d]\n",
+                                 accept_msg, q);
+                    ok = false;
+                    break;
+                }
+                accept = accept_msg;
+                bonus = bonus_msg;
+            }
+        }
         const int matched = accept - 1;                       // accepted candidates
         const int commit_pos = pos + accept;                  // seed + accepted candidates in KV
 
@@ -1518,7 +1856,7 @@ bool run_deepseek4_dspark_spec_decode(
             // compressors keep no ratio-4 halves, only pooled windows.
             spec_rollback_apply(rollback, target_w, target_cache, commit_pos, false);
             spec_restore_window_rows(target.last_window_rows(), target_w, target_cache,
-                                     pos, commit_pos);
+                                     pos, commit_pos, backend);
         } else if (!full_snap && accept < q &&
                    q > DS4_CONSERVATIVE_VERIFY_MAX_TOKENS) {
             // Rejected wide (q5) verify over positions [pos, pos + 4].
@@ -1646,7 +1984,49 @@ bool run_deepseek4_dspark_spec_decode(
                 tm_verify / steps, tm_probe_submit / steps,
                 tm_probe_wait / steps, tm_apply / steps, tm_feat / steps);
         }
-        if (hit_eos || stop_requested) break;
+        if (hit_eos || stop_requested) {
+            // Head-local stop while the workers would keep going: send the
+            // empty end marker for the step they are about to ask for. When
+            // the loop ends on every rank anyway (EOS, or the token budget is
+            // exhausted) no marker is sent.
+            if (cluster_spec_head && stop_requested && !hit_eos && n_generated < n_gen) {
+                std::vector<int32_t> end_marker;
+                std::string err;
+                // A split drafter runs on every rank as well: the workers
+                // are in its all-reduces first, so run this rank's share.
+                if (draft_split) {
+                    const int stop_ctx_len = feat_count < n_swa ? feat_count : n_swa;
+                    noise_ids[0] = lt;
+                    for (int i = 1; i < block; i++) noise_ids[i] = drafter.mask_token_id;
+                    if (!target.embed_tokens(noise_ids.data(), block, noise_embed.data()) ||
+                        !deepseek4_dspark_draft_forward(
+                            drafter_backend, drafter, noise_embed.data(),
+                            stop_ctx_len > 0 ? feat_win.data() : nullptr, stop_ctx_len, pos,
+                            local_hidden, use_confidence_width ? &confidence_hidden : nullptr)) {
+                        std::fprintf(stderr, "[ds4-spec] split drafter before the end marker failed\n");
+                        ok = false;
+                    } else {
+                        std::memcpy(padded_hidden.data() + n_embd, local_hidden.data(),
+                                    sizeof(float) * (size_t) n_embd * block);
+                    }
+                }
+                // The workers queue their split head before they read the
+                // marker: release it with the head's share of that step.
+                std::vector<int32_t> unused_tok;
+                if (draft_vocab_split &&
+                    !run_split_head(padded_hidden.data(), /*read=*/true, unused_tok, nullptr, nullptr)) {
+                    std::fprintf(stderr, "[ds4-spec] split draft head before the end marker failed\n");
+                    ok = false;
+                }
+                if (!cluster_hooks->decide_draft(cluster_req, (uint32_t) steps, pos,
+                                                 end_marker, &err)) {
+                    std::fprintf(stderr, "[ds4-spec] cluster end marker failed: %s\n",
+                                 err.c_str());
+                    ok = false;
+                }
+            }
+            break;
+        }
     }
 
     if (hook_on && close_emitted) budget_hook->fired = true;
@@ -1672,6 +2052,19 @@ bool run_deepseek4_dspark_spec_decode(
             q_cap >= 3 ? width_steps[3] : 0,
             q_cap >= 4 ? width_steps[4] : 0,
             q_cap >= 5 ? width_steps[5] : 0);
+        {
+            std::lock_guard<std::mutex> lock(measured_width_costs_mu);
+            measured_width_costs = width_controller.measured_costs();
+        }
+        std::string costs = "[ds4-spec] measured step ms";
+        for (int w = kDs4AdaptiveMinWidth; w <= q_cap; ++w) {
+            const float c = width_controller.measured_costs()[(size_t) w];
+            char buf[32];
+            if (std::isfinite(c)) std::snprintf(buf, sizeof(buf), " q%d=%.1f", w, c);
+            else std::snprintf(buf, sizeof(buf), " q%d=-", w);
+            costs += buf;
+        }
+        std::fprintf(stderr, "%s\n", costs.c_str());
         if (use_confidence_width) {
             // Recent predicted against observed acceptance per depth and
             // the scale the controller applies to the head's scores.

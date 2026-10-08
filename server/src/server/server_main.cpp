@@ -1178,27 +1178,46 @@ static bool apply_expert_device(const DevicePlacement & expert,
     return true;
 }
 
-// Install a profile's environment defaults. Variables that are already set
-// keep their value, and the log names them.
-static void apply_launch_profile_env(const luce::server::LaunchProfile & profile) {
-    if (profile.env.empty()) return;
+// Variables an earlier set of defaults installed (cluster mode before a
+// launch profile): a later set leaves them alone without calling them explicit.
+static std::set<std::string> & installed_env_defaults() {
+    static std::set<std::string> names;
+    return names;
+}
+
+// Install a set of environment defaults. Variables that are already set keep
+// their value, and the log names the ones the operator set.
+static void apply_env_defaults(const std::string & owner,
+                               const std::vector<luce::server::LaunchProfileEnv> & defaults) {
+    if (defaults.empty()) return;
     int applied = 0;
     std::string kept_env;
-    for (const luce::server::LaunchProfileEnv & env : profile.env) {
+    for (const luce::server::LaunchProfileEnv & env : defaults) {
         if (std::getenv(env.name)) {
-            kept_env += std::string(kept_env.empty() ? "" : ", ") + env.name;
+            if (!installed_env_defaults().count(env.name)) {
+                kept_env += std::string(kept_env.empty() ? "" : ", ") + env.name;
+            }
             continue;
         }
         set_environment_variable(env.name, env.value, false);
+        installed_env_defaults().insert(env.name);
         ++applied;
     }
-    std::fprintf(stderr, "[server] profile %s: %d environment defaults applied%s%s\n",
-                 profile.name, applied,
+    std::fprintf(stderr, "[server] %s: %d environment defaults applied%s%s\n",
+                 owner.c_str(), applied,
                  kept_env.empty() ? "" : "; kept explicit ",
                  kept_env.c_str());
 }
 
+static void apply_launch_profile_env(const luce::server::LaunchProfile & profile) {
+    apply_env_defaults(std::string("profile ") + profile.name, profile.env);
+}
+
 static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_model) {
+    // Cluster mode's defaults go in before a profile's, so they win over it.
+    if (model.bargs.cluster.enabled()) {
+        apply_env_defaults("cluster mode", luce::server::cluster_launch_env());
+    }
     if (model.profile) apply_launch_profile_env(*model.profile);
     if (!model.adaptive_experts_tau.empty())
         set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);

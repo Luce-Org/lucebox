@@ -4,6 +4,7 @@
 #include "internal.h"
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace luce::common {
@@ -46,6 +47,42 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               std::vector<float> * confidence_out = nullptr,
                                               const float * confidence_hidden = nullptr,
                                               std::vector<float> * logit_margin_out = nullptr);
+
+// The fused chain with the vocabulary split across ranks that run the same
+// graph in lockstep (a cluster's head and workers). Each rank projects rows
+// [row_offset, row_offset + n_rows) of lm_head and of the Markov bias, so the
+// lm_head read is divided between the ranks' devices. The model supplies the
+// collectives as graph adapters:
+//   share(ctx, hidden) -> the root's hidden columns on every rank, exactly;
+//   pick(ctx, logits)  -> I32 [1], the argmax over every rank's slice
+//                         (ties to the lowest index, as ggml_argmax).
+// The tokens equal the unsplit chain's: each vocabulary row is the same product
+// in either form. Every rank must call this the same number of times with the
+// same n_candidates, in the same order relative to its other collectives.
+// local_hidden (padded as in the fused chain) is read on the root only and may
+// be null elsewhere. read = false enqueues the graph and returns at once: a rank
+// that only takes part, whose stream orders the graph before its next work.
+struct DsparkVocabSplit {
+    int64_t row_offset = 0;
+    int64_t n_rows = 0;
+    ggml_tensor * markov_w1 = nullptr;   // [markov_rank, vocab], on `backend`'s device
+    ggml_tensor * markov_w2 = nullptr;   // [markov_rank, >= n_rows]: its first n_rows rows are this rank's
+    std::function<ggml_tensor *(ggml_context *, ggml_tensor *)> share;
+    std::function<ggml_tensor *(ggml_context *, ggml_tensor *)> pick;
+    const void * id = nullptr;           // identifies share/pick for the graph cache
+};
+
+bool dspark_markov_chain_vocab_split(const DraftWeights & dw,
+                                     ggml_backend_t backend,
+                                     ggml_tensor * lm_head,
+                                     const DsparkVocabSplit & split,
+                                     const float * local_hidden,
+                                     int n_candidates,
+                                     int32_t last_tok,
+                                     bool read,
+                                     std::vector<int32_t> & draft_tok,
+                                     std::vector<float> * confidence_out = nullptr,
+                                     const float * confidence_hidden = nullptr);
 
 // DDTree candidate generation with the Markov correction: base logits for
 // all n_tokens positions in ONE lm_head matmul; rows 1..n-1 get the low-rank

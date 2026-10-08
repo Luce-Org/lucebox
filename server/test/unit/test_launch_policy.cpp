@@ -149,6 +149,19 @@ struct LaunchPolicyFixture : CommonFixture {
         CHECK(find_launch_profile("missing") == nullptr);
     }
 
+    void test_cluster_env_is_well_formed() {
+        // Cluster-mode defaults are switches an operator can turn off with 0,
+        // so every one has a name, a non-empty value and appears once.
+        std::set<std::string> names;
+        for (const LaunchProfileEnv & entry : cluster_launch_env()) {
+            CHECK(entry.name && *entry.name);
+            CHECK(entry.value && *entry.value);
+            CHECK(names.insert(entry.name).second);
+        }
+        CHECK(names.count("LUCE_CLUSTER_FAST_REDUCE") == 1);
+        CHECK(names.count("LUCE_CLUSTER_ATTENTION_PARALLEL") == 1);
+    }
+
     void test_profile_flags_yield_to_explicit_flags() {
         const LaunchProfile * profile = find_launch_profile("ds4-r9700-strix");
         CHECK(profile != nullptr);
@@ -267,6 +280,7 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_auto_device_counts_the_kv_cache();
     test_draft_placement_precedence();
     test_profiles_are_well_formed();
+    test_cluster_env_is_well_formed();
     test_profile_flags_yield_to_explicit_flags();
     test_profile_replaces_documented_recipe();
     test_ds41_profile_is_the_lucebox_recipe();

@@ -6252,6 +6252,181 @@ static void test_ds4_flash_attention_segmented_kv_gpu(bool benchmark = false) {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+// Lane rows (ggml_flash_attn_ext_set_ds4_lane_rows): one split-KV op over
+// several single-token lanes of one raw ring must equal, byte for byte, one
+// op per lane over that lane's own ring state (the old ring with the rows of
+// lanes 0..t written), with per-lane masks and selections.
+static bool run_ds4_lane_rows_case(ggml_backend_t backend, int lanes, int first_row,
+                                   int compressed_rows, bool identity, uint32_t seed) {
+    constexpr int head_dim = 512;
+    constexpr int n_heads = 64;
+    constexpr int raw_rows = 128;
+    const int selected = identity ? compressed_rows : 512;
+    const int n_kv = raw_rows + compressed_rows;
+    ggml_context * ctx = make_test_context(8u << 20);
+    if (!ctx) return false;
+
+    ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads, lanes);
+    ggml_tensor * ring = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head_dim, raw_rows);
+    ggml_tensor * lane_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head_dim, lanes);
+    ggml_tensor * ring_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, lanes);
+    ggml_tensor * comp = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head_dim, compressed_rows);
+    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, lanes);
+    ggml_tensor * topk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, selected, lanes);
+    ggml_tensor * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_heads);
+    ggml_tensor * comp_head = ggml_view_2d(ctx, comp, head_dim, compressed_rows - 1, comp->nb[1], 0);
+    ggml_tensor * comp_tail = ggml_view_2d(ctx, comp, head_dim, 1, comp->nb[1],
+                                           (size_t) (compressed_rows - 1) * comp->nb[1]);
+    const float scale = 1.0f / std::sqrt((float) head_dim);
+    auto make_op = [&](ggml_tensor * q_lanes, ggml_tensor * k, ggml_tensor * m, ggml_tensor * sel) {
+        ggml_tensor * op = ggml_flash_attn_ext(
+            ctx, ggml_permute(ctx, q_lanes, 0, 2, 1, 3), k, k, m, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(op, sinks);
+        ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_ds4_sparse(op, raw_rows, raw_rows, -selected, 32);
+        ggml_flash_attn_ext_set_ds4_kv_segments(op, comp_head, comp_tail);
+        ggml_flash_attn_ext_set_ds4_indexer_topk(op, sel);
+        return op;
+    };
+    ggml_tensor * batched = make_op(q, ring, mask, topk);
+    ggml_flash_attn_ext_set_ds4_lane_rows(batched, ring_rows, lane_kv);
+    ggml_set_output(batched);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 256, false);
+    ggml_build_forward_expand(graph, batched);
+    std::vector<ggml_tensor *> lane_q(lanes), lane_ring(lanes), lane_mask(lanes),
+        lane_topk(lanes), lane_ref(lanes);
+    bool supported = ggml_backend_supports_op(backend, batched);
+    for (int t = 0; t < lanes; ++t) {
+        lane_q[t] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads, 1);
+        lane_ring[t] = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head_dim, raw_rows);
+        lane_mask[t] = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, 1);
+        lane_topk[t] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, selected, 1);
+        lane_ref[t] = make_op(lane_q[t], lane_ring[t], lane_mask[t], lane_topk[t]);
+        ggml_set_output(lane_ref[t]);
+        supported = supported && ggml_backend_supports_op(backend, lane_ref[t]);
+        ggml_build_forward_expand(graph, lane_ref[t]);
+    }
+    if (!supported) {
+        std::fprintf(stderr, " [lane rows unsupported]");
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    bool ok = ggml_gallocr_alloc_graph(alloc, graph);
+    if (ok) {
+        TestLcg rng(seed);
+        std::vector<float> q_data((size_t) head_dim * n_heads * lanes);
+        for (float & v : q_data) v = 0.5f * rng.next();
+        std::vector<ggml_fp16_t> ring_data((size_t) head_dim * raw_rows);
+        for (ggml_fp16_t & v : ring_data) v = ggml_fp32_to_fp16(0.5f * rng.next());
+        std::vector<ggml_fp16_t> lane_data((size_t) head_dim * lanes);
+        for (ggml_fp16_t & v : lane_data) v = ggml_fp32_to_fp16(0.5f * rng.next());
+        std::vector<ggml_fp16_t> comp_data((size_t) head_dim * compressed_rows);
+        for (ggml_fp16_t & v : comp_data) v = ggml_fp32_to_fp16(0.5f * rng.next());
+        std::vector<float> sink_data(n_heads);
+        for (float & v : sink_data) v = rng.next();
+        std::vector<int32_t> rows(lanes);
+        for (int j = 0; j < lanes; ++j) rows[j] = (first_row + j) % raw_rows;
+        // Before the ring wraps, rows past the lane's own are unwritten.
+        const bool wrapped = first_row + lanes > raw_rows || first_row >= raw_rows - 1;
+        std::vector<ggml_fp16_t> mask_data((size_t) n_kv * lanes, ggml_fp32_to_fp16(0.0f));
+        std::vector<int32_t> topk_data((size_t) selected * lanes);
+        for (int t = 0; t < lanes; ++t) {
+            ggml_fp16_t * m = mask_data.data() + (size_t) t * n_kv;
+            if (!wrapped) {
+                for (int r = rows[t] + 1; r < raw_rows; ++r) m[r] = ggml_fp32_to_fp16(-1.0e30f);
+            }
+            const int visible = compressed_rows - (lanes - 1 - t);
+            for (int c = visible; c < compressed_rows; ++c) {
+                m[raw_rows + c] = ggml_fp32_to_fp16(-1.0e30f);
+            }
+            int32_t * s = topk_data.data() + (size_t) t * selected;
+            for (int i = 0; i < selected; ++i) {
+                s[i] = identity ? i : (int32_t) (((int64_t) i * 7919 + t * 131) % compressed_rows);
+            }
+        }
+        ggml_backend_tensor_set(q, q_data.data(), 0, q_data.size() * sizeof(float));
+        ggml_backend_tensor_set(ring, ring_data.data(), 0, ring_data.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(lane_kv, lane_data.data(), 0, lane_data.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(ring_rows, rows.data(), 0, rows.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(comp, comp_data.data(), 0, comp_data.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(topk, topk_data.data(), 0, topk_data.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(sinks, sink_data.data(), 0, sink_data.size() * sizeof(float));
+        for (int t = 0; t < lanes; ++t) {
+            ggml_backend_tensor_set(lane_q[t], q_data.data() + (size_t) t * head_dim * n_heads, 0,
+                                    (size_t) head_dim * n_heads * sizeof(float));
+            std::vector<ggml_fp16_t> own = ring_data;
+            for (int j = 0; j <= t; ++j) {
+                std::memcpy(own.data() + (size_t) rows[j] * head_dim,
+                            lane_data.data() + (size_t) j * head_dim, head_dim * sizeof(ggml_fp16_t));
+            }
+            ggml_backend_tensor_set(lane_ring[t], own.data(), 0, own.size() * sizeof(ggml_fp16_t));
+            ggml_backend_tensor_set(lane_mask[t], mask_data.data() + (size_t) t * n_kv, 0,
+                                    (size_t) n_kv * sizeof(ggml_fp16_t));
+            ggml_backend_tensor_set(lane_topk[t], topk_data.data() + (size_t) t * selected, 0,
+                                    (size_t) selected * sizeof(int32_t));
+        }
+        ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        if (ok) {
+            std::vector<float> all((size_t) head_dim * n_heads * lanes);
+            ggml_backend_tensor_get(batched, all.data(), 0, all.size() * sizeof(float));
+            for (int t = 0; t < lanes && ok; ++t) {
+                std::vector<float> one((size_t) head_dim * n_heads);
+                ggml_backend_tensor_get(lane_ref[t], one.data(), 0, one.size() * sizeof(float));
+                ok = std::memcmp(one.data(), all.data() + (size_t) t * head_dim * n_heads,
+                                 one.size() * sizeof(float)) == 0;
+                if (!ok) {
+                    std::fprintf(stderr, " [lanes=%d first=%d comp=%d %s: lane %d differs]",
+                                 lanes, first_row, compressed_rows,
+                                 identity ? "identity" : "top-k", t);
+                }
+            }
+        }
+    }
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    return ok;
+}
+
+static void test_ds4_flash_attention_lane_rows_gpu() {
+    std::fprintf(stderr, "  test_ds4_flash_attention_lane_rows_gpu ...");
+#if !defined(GGML_USE_HIP)
+    std::fprintf(stderr, " skipped (HIP-only contract)\n");
+    return;
+#endif
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+    ScopedCudaGraphOverrides eager(
+        /*disable_graphs=*/true, /*mmvq_max_ncols=*/0, /*skip_property_check=*/false);
+    ScopedEnvVar split_kv_guard("GGML_CUDA_MLA_SPLIT_KV");
+    ScopedEnvVar split_count_guard("GGML_CUDA_MLA_SPLIT_KV_COUNT");
+    setenv("GGML_CUDA_MLA_SPLIT_KV", "1", 1);
+    int cases = 0;
+    int passed = 0;
+    for (const char * splits : {"4", "8"}) {
+        setenv("GGML_CUDA_MLA_SPLIT_KV_COUNT", splits, 1);
+        for (int lanes : {2, 5}) {
+            for (int first_row : {3, 125, 126}) {
+                for (bool identity : {true, false}) {
+                    const int compressed_rows = identity ? 384 : 1408;
+                    ++cases;
+                    passed += run_ds4_lane_rows_case(
+                        backend, lanes, first_row, compressed_rows, identity,
+                        0x1234567u + (uint32_t) (cases * 977)) ? 1 : 0;
+                }
+            }
+        }
+    }
+    std::fprintf(stderr, " %d/%d cases", passed, cases);
+    TEST_ASSERT_MSG(passed == cases, "lane-row attention differs from per-lane attention");
+    ggml_backend_free(backend);
+    std::fprintf(stderr, passed == cases ? " ok\n" : " FAIL\n");
+}
+
 static void test_ds4_flash_attention_ratio4_maskless_gpu() {
     std::fprintf(stderr,
                  "  test_ds4_flash_attention_ratio4_maskless_gpu ...");
@@ -8984,6 +9159,10 @@ int main(int argc, char ** argv) {
         test_ds4_flash_attention_segmented_kv_gpu();
         return g_failures == 0 ? 0 : 1;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--test-lane-rows") == 0) {
+        test_ds4_flash_attention_lane_rows_gpu();
+        return g_failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--bench-segmented-kv") == 0) {
         test_ds4_flash_attention_segmented_kv_gpu(/*benchmark=*/true);
         return g_failures == 0 ? 0 : 1;
@@ -9131,6 +9310,7 @@ int main(int argc, char ** argv) {
         test_ds4_topk_block_radix_gpu(ncols);
     }
     test_ds4_flash_attention_segmented_kv_gpu();
+    test_ds4_flash_attention_lane_rows_gpu();
     test_ds4_flash_attention_ratio4_maskless_gpu();
     test_ds4_flash_attention_sparse_value_skip_gpu();
     test_ds4_indexer_score_m32_gpu();

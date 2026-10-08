@@ -40,6 +40,10 @@
 #include <string>
 #include <vector>
 
+namespace luce::cluster {
+struct Ds4ClusterHooks;  // cluster/cluster_decision_hooks.h
+}
+
 namespace luce::common {
 
 // The drafter weights. `core` reuses DeepSeek4Weights for the n_layer decoder
@@ -79,13 +83,31 @@ struct DSparkDrafter {
     // architecture makes the target GPU's next GEMM of that name fail.
     bool flash_attention = false;
     std::vector<int> capture_layer_ids;  // [40,41,42]
+
+    // Cluster split (LUCE_CLUSTER_DRAFT_SPLIT=1, two ranks): this rank drafts
+    // with its half of the heads and holds routed experts [expert_first,
+    // expert_first + expert_local); the partial sums meet in two in-graph
+    // all-reduces a layer. split_size 1 = the whole drafter on one rank.
+    int split_rank = 0;
+    int split_size = 1;
+    int expert_first = 0;
+    int expert_local = 0;
+    void * cluster_rt = nullptr;   // the target's Ds4ClusterRuntime, set after load
+};
+
+// A cluster rank's share of the drafter at load: routed experts
+// [rank, rank + 1) * n_expert / size of every expert tensor.
+struct DSparkLoadSplit {
+    int rank = 0;
+    int size = 1;
 };
 
 // Load a "deepseek4-dflash-draft" GGUF into `out`. Returns false on error;
 // deepseek4_dspark_last_error() has the message.
 bool load_deepseek4_dspark_drafter(const std::string & path,
                                    ggml_backend_t backend,
-                                   DSparkDrafter & out);
+                                   DSparkDrafter & out,
+                                   const DSparkLoadSplit * split = nullptr);
 
 // Copy only the DSpark Markov/confidence heads to `backend` and repoint the
 // drafter fields. Decoder-block tensors remain on `core.backend`.
@@ -322,6 +344,9 @@ bool run_deepseek4_dspark_spec_decode(
         DSparkSpecSampling * sampling = nullptr,
         // Non-null for requests with a thinking budget: the hook is applied
         // inside speculative decode (deepseek4_budget_hook.h).
-        DSparkBudgetHook * budget_hook = nullptr);
+        DSparkBudgetHook * budget_hook = nullptr,
+        // Cluster lockstep hooks (from maikzz32's lucebox-halo-cluster): head/worker
+        // hooks broadcast/receive DraftMsg and AcceptMsg; nullptr = one box.
+        luce::cluster::Ds4ClusterHooks * cluster_hooks = nullptr);
 
 }  // namespace luce::common

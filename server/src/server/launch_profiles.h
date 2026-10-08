@@ -232,6 +232,62 @@ inline const std::vector<LaunchProfile> & launch_profiles() {
     return profiles;
 }
 
+// Environment defaults of expert-parallel cluster mode (--cluster-size > 1):
+// the measured two-box DeepSeek V4.1 configuration. They are installed before
+// a launch profile's defaults, so they win over a profile but never over a
+// variable that is already set; setting one to 0 turns it off.
+inline const std::vector<LaunchProfileEnv> & cluster_launch_env() {
+    static const std::vector<LaunchProfileEnv> env = {
+        // Decode exchange: the raw-RDMA fast reduce, zero-copy rows on a bf16
+        // wire, no slot-reuse waits; the hybrid exchange reduces the iGPU's
+        // cold partial with the R9700's hot + shared partial in one export.
+        {"LUCE_CLUSTER_FAST_REDUCE", "1"},
+        {"LUCE_CLUSTER_FAST_REDUCE_ZC", "1"},
+        {"LUCE_CLUSTER_FAST_REDUCE_BF16", "1"},
+        {"LUCE_CLUSTER_FAST_REDUCE_LEAN", "1"},
+        {"LUCE_CLUSTER_FAST_REDUCE_STALL_S", "15"},
+        {"LUCE_CLUSTER_HYBRID_EXCHANGE", "1"},
+        {"LUCE_CLUSTER_HYBRID_ONE_EXPORT", "1"},
+        // Prefill-sized reductions stay on RCCL, in bf16.
+        {"LUCE_CLUSTER_PREFILL_BF16", "1"},
+        // Work split: attention heads, the greedy verify head and the DSpark
+        // draft head are halved across the ranks; each rank loads only its
+        // slices of the dense weights.
+        {"LUCE_CLUSTER_ATTENTION_PARALLEL", "1"},
+        {"LUCE_CLUSTER_VOCAB_SPLIT", "1"},
+        {"LUCE_CLUSTER_DRAFT_VOCAB_SPLIT", "1"},
+        {"LUCE_CLUSTER_DRAFT_SPLIT", "1"},
+        {"LUCE_CLUSTER_WORKER_SKIP_DRAFT", "1"},
+        {"LUCE_CLUSTER_SLICE_WEIGHTS", "1"},
+        // DS4.1 verify step: batched verify lanes, the drafter's context K/V
+        // window, GPU argmax, the drafter swapped out for long prompts (a
+        // cluster rank runs without the prefix cache, so no cached prefix has
+        // to match the swap's chunks), and the Engram projection run inside
+        // the exchange wait.
+        {"LUCE_DS4_GPU_ARGMAX_VERIFY", "1"},
+        {"LUCE_DS4_LANE_BATCH", "1"},
+        {"LUCE_DS4_DRAFT_CONTEXT_KV_CACHE", "1"},
+        {"LUCE_DS4_DRAFT_SWAP", "1"},
+        {"LUCE_DS4_SCHED_DEDICATED_COPIES", "1"},
+        {"LUCE_DS4_HC_BOUNDARY_SPLIT", "1"},
+        {"LUCE_DS4_ENGRAM_PRECOMPUTE", "2560"},
+        {"LUCE_DS4_SHEXP_SLICE_VIEW", "1"},
+        {"LUCE_DS4_TP_CAPTURE_CACHE_SLOTS", "64"},
+        {"LUCE_DS4_TP_FUSED_CACHE_SLOTS", "64"},
+        // Expert products: q8_1 inputs handed to the expert owners, grouped
+        // MUL_MAT_ID, the ROCmFP2 prefetch loop and one peer-copy kernel per
+        // layer.
+        {"LUCE_MOE_Q8_HANDOFF", "1"},
+        {"LUCE_MMID_GROUPED", "1"},
+        {"LUCE_MMID_GROUPED_TYPES", "79"},
+        {"LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH", "1"},
+        {"GGML_CUDA_PEER_COPY_KERNEL", "1"},
+        // The fast reduce reads pinned host rows from the GPU.
+        {"HSA_FORCE_FINE_GRAIN_PCIE", "1"},
+    };
+    return env;
+}
+
 inline const LaunchProfile * find_launch_profile(const std::string & name) {
     for (const LaunchProfile & profile : launch_profiles()) {
         if (name == profile.name) return &profile;

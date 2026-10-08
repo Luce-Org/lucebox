@@ -9,6 +9,8 @@
 //   6. MoE FFN (hash routing + top-k + shared expert + clamped SwiGLU)
 
 #include "deepseek4_internal.h"
+#include "deepseek4_cluster.h"
+#include "cluster/cluster_config.h"
 #include "deepseek4_norm.h"
 #include "deepseek4_image_policy.h"
 #include "deepseek4_vision.h"
@@ -27,6 +29,8 @@
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_stream.h"
 #include "../common/moe_hybrid_types.h"
+#include "../common/pinned_stage.h"
+#include "../common/host_stream_flag.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -46,6 +50,8 @@
 #include <mutex>
 #include <functional>
 #include <limits>
+#include <string>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -2099,6 +2105,12 @@ struct DeepSeek4MlaLaneBindings {
     };
 
     HistoryMode history_mode = HistoryMode::ContiguousRing;
+    // Expert-parallel cluster head split (maikzz32/lucebox-halo-cluster):
+    // build query heads [head_begin, head_begin + head_count) only; 0 = all.
+    // The output projection then yields a partial sum over this rank's
+    // output groups, which the caller all-reduces.
+    int head_begin = 0;
+    int head_count = 0;
     // Raw rows before this position are outside the current window
     // (DeepSeek4LayerCache::swa_floor).
     int swa_floor = 0;
@@ -2154,6 +2166,22 @@ struct DeepSeek4PreparedProjectedLane {
     ggml_tensor * rope_pos = nullptr;
     ggml_tensor * compressor_kv = nullptr;
     ggml_tensor * compressor_score = nullptr;
+};
+
+// Lane batch (LUCE_DS4_LANE_BATCH): a tokenwise verify lane runs its cache
+// mutations and its row selection, then hands the attention to the caller,
+// which attends for every lane in one op (build_mla_lane_batch_attention)
+// and writes the raw ring rows after it.
+struct DeepSeek4LaneDeferral {
+    // In: the caller selects the compressed rows of every lane at once (the
+    // shared top-k of a V4.1 index source and the layers after it).
+    bool          external_selection = false;
+    // Out.
+    bool          deferred = false;
+    ggml_tensor * selection = nullptr;     // I32 [rows, 1]: identity or shared top-k
+    ggml_tensor * comp_source = nullptr;   // compressed rows after this lane's update
+    ggml_tensor * index_comp_source = nullptr;  // index keys after this lane's update
+    int           n_comp_attn = 0;
 };
 
 // Per-layer RoPE parameters. Compressed layers use YaRN scaling, and
@@ -2220,12 +2248,24 @@ static DeepSeek4PreparedProjectedLane build_mla_qkv_projection(
         ggml_tensor * cur,
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
-        int n_tokens, int projection_columns = 0) {
+        int n_tokens, int projection_columns = 0,
+        int head_begin = 0, int head_count = 0) {
     DeepSeek4PreparedProjectedLane out;
     ggml_tensor * qr = ds4_mul_mat_columns(ctx, L.attn_q_a, cur, projection_columns);
     qr = build_rms_norm(ctx, qr, L.attn_q_a_norm, w.rms_eps);
-    ggml_tensor * q = ds4_mul_mat_columns(ctx, L.attn_q_b, qr, projection_columns);
-    q = ggml_reshape_3d(ctx, q, w.head_dim, w.n_head, n_tokens);
+    // Head split: a contiguous range of q_b output rows, so the view stays
+    // contiguous and a codebook registry keyed by pointer still resolves it.
+    const int n_head = head_count > 0 ? head_count : w.n_head;
+    if (head_count == 0 && w.cluster_heads_local > 0) {
+        GGML_ABORT("deepseek4: this rank holds only its attention heads "
+                   "(LUCE_CLUSTER_SLICE_WEIGHTS) but a graph attends with all of them");
+    }
+    ggml_tensor * q_b_w = head_count > 0
+        ? ggml_view_2d(ctx, L.attn_q_b, L.attn_q_b->ne[0], (int64_t) n_head * w.head_dim,
+                       L.attn_q_b->nb[1], (size_t) head_begin * w.head_dim * L.attn_q_b->nb[1])
+        : L.attn_q_b;
+    ggml_tensor * q = ds4_mul_mat_columns(ctx, q_b_w, qr, projection_columns);
+    q = ggml_reshape_3d(ctx, q, w.head_dim, n_head, n_tokens);
     // V4 normalizes every query head to unit RMS after wq_b (model.py:
     // q *= rsqrt(mean(q^2) + eps)); V4.1 dropped that step.
     if (w.attn_q_head_norm) {
@@ -2251,7 +2291,7 @@ static void build_mla_qkv_rope(
         bool fuse_q_rope) {
     if (!fuse_q_rope) {
         p.q = build_tail_rope_3d(ctx, p.q, rope_pos, w.n_rot, w.head_dim,
-                                 w.n_head, n_tokens, rope.freq, rope.scale,
+                                 (int) p.q->ne[1], n_tokens, rope.freq, rope.scale,
                                  rope.ext, rope.attn, w.rope_yarn_beta_fast,
                                  w.rope_yarn_beta_slow, rope.n_ctx_orig);
     }
@@ -2270,24 +2310,47 @@ static ggml_tensor * build_mla_output_projection(
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
         int n_tokens,
-        bool allow_grouped, int projection_columns = 0) {
-    const int group_dim = w.head_dim * (w.n_head / w.n_out_group);
+        bool allow_grouped, int projection_columns = 0,
+        int head_begin = 0, int head_count = 0) {
+    const int heads_per_group = w.n_head / w.n_out_group;
+    const int group_dim = w.head_dim * heads_per_group;
+    // Head split: this rank's heads are whole output groups, so the first
+    // stage takes its groups and the second its columns; the product is a
+    // partial sum over the groups, summed across ranks by the caller.
+    const bool head_split = head_count > 0 && head_count != w.n_head;
+    const int n_groups = head_split ? head_count / heads_per_group : w.n_out_group;
+    const int group_first = head_split ? head_begin / heads_per_group : 0;
     attn_out = ggml_reshape_3d(
-        ctx, attn_out, group_dim, w.n_out_group, n_tokens);
+        ctx, attn_out, group_dim, n_groups, n_tokens);
     attn_out = ggml_permute(ctx, attn_out, 0, 2, 1, 3);
     if (n_tokens == 1) {
         attn_out = ggml_cont(ctx, attn_out);
     }
+    // A cluster rank may hold only its own groups (TargetLoadPlan slices).
+    const int stored_groups = (int) (L.attn_output_a->ne[1] / w.n_lora_o);
+    GGML_ASSERT(stored_groups == w.n_out_group || (head_split && stored_groups == n_groups));
     ggml_tensor * out_a_3d = ggml_reshape_3d(
-        ctx, L.attn_output_a, group_dim, w.n_lora_o, w.n_out_group);
+        ctx, L.attn_output_a, group_dim, w.n_lora_o, stored_groups);
+    if (head_split && stored_groups != n_groups) {
+        out_a_3d = ggml_view_3d(ctx, out_a_3d, group_dim, w.n_lora_o, n_groups,
+                                out_a_3d->nb[1], out_a_3d->nb[2],
+                                (size_t) group_first * out_a_3d->nb[2]);
+    }
     ggml_tensor * attn_low = ds4_mul_mat_columns(ctx, out_a_3d, attn_out, projection_columns);
+    // attn_low is group-major over ne[0] (n_lora_o is the fast axis), so a
+    // contiguous group range is a contiguous column range of wo_b.
+    ggml_tensor * out_b_w = head_split
+        ? ggml_view_2d(ctx, L.attn_output_b, (int64_t) w.n_lora_o * n_groups,
+                       L.attn_output_b->ne[1], L.attn_output_b->nb[1],
+                       ggml_row_size(L.attn_output_b->type, (int64_t) group_first * w.n_lora_o))
+        : L.attn_output_b;
 
     // The grouped source layout is read by MMQ's activation quantizer and by
     // nothing else, so a projection stored unquantized (BF16 attention from a
     // converter that leaves dense tensors alone) takes the plain path.
     // MXFP8 (native FP8 dense) has no MMQ, so it also takes the plain path.
     const bool grouped_output_projection =
-        allow_grouped && n_tokens > 1 && ggml_is_quantized(L.attn_output_b->type) &&
+        allow_grouped && !head_split && n_tokens > 1 && ggml_is_quantized(L.attn_output_b->type) &&
         L.attn_output_b->type != GGML_TYPE_MXFP8 &&
         !ds4_env_flag("LUCE_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
     if (grouped_output_projection) {
@@ -2295,8 +2358,8 @@ static ggml_tensor * build_mla_output_projection(
     }
     attn_low = ggml_cont(ctx, ggml_permute(ctx, attn_low, 0, 2, 1, 3));
     attn_low = ggml_reshape_2d(
-        ctx, attn_low, (int64_t) w.n_lora_o * w.n_out_group, n_tokens);
-    return ds4_mul_mat_columns(ctx, L.attn_output_b, attn_low, projection_columns);
+        ctx, attn_low, (int64_t) w.n_lora_o * n_groups, n_tokens);
+    return ds4_mul_mat_columns(ctx, out_b_w, attn_low, projection_columns);
 }
 
 // One lane's column of a batched prologue. These are views only.
@@ -2312,7 +2375,7 @@ static DeepSeek4PreparedProjectedLane ds4_slice_projected_lane(
         batched.normalized_q_lora->nb[1],
         (size_t) lane * batched.normalized_q_lora->nb[1]);
     out.q = ggml_view_3d(
-        ctx, batched.q, w.head_dim, w.n_head, 1,
+        ctx, batched.q, w.head_dim, batched.q->ne[1], 1,
         batched.q->nb[1], batched.q->nb[2],
         (size_t) lane * batched.q->nb[2]);
     out.kv = ggml_view_2d(
@@ -2328,6 +2391,75 @@ static DeepSeek4PreparedProjectedLane ds4_slice_projected_lane(
             (size_t) lane * batched.compressor_score->nb[1]);
     }
     return out;
+}
+
+// Segmented K/V is a device-class default (HIP backends), with
+// GGML_CUDA_MLA_SEGMENTED_KV=0 as the graph-side kill switch.
+static bool ds4_segmented_kv_enabled(const DeepSeek4Weights & w) {
+    const char * segmented_kv_env =
+        std::getenv("GGML_CUDA_MLA_SEGMENTED_KV");
+    const char * backend_name = w.backend ? ggml_backend_name(w.backend) : nullptr;
+    const bool segmented_kv_default = backend_name &&
+        (std::strstr(backend_name, "HIP") != nullptr ||
+         std::strstr(backend_name, "ROCm") != nullptr);
+    return segmented_kv_env
+        ? segmented_kv_env[0] != '\0' &&
+            std::strcmp(segmented_kv_env, "0") != 0
+        : segmented_kv_default;
+}
+
+// LUCE_DS4_LANE_BATCH=1: the single-token lanes of a tokenwise verify layer
+// attend in one split-KV flash op (build_mla_lane_batch_attention) instead of
+// one op chain per lane plus the concatenation of their contexts.
+static bool ds4_lane_batch_enabled() {
+    static const bool enabled = ds4_env_flag("LUCE_DS4_LANE_BATCH");
+    return enabled;
+}
+
+// A lane batch runs a ratio-1 kv source's compressor for every lane in one
+// width-q pass (LUCE_DS4_LANE_BATCH_COMP=0 keeps one pass per lane). Ratio 1
+// keeps no state: each lane's latent and index key are per-column products,
+// and the MMVF block size does not depend on the column count on RDNA4, so
+// the batched pass writes the rows the lanes would have written.
+static bool ds4_lane_batch_comp_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("LUCE_DS4_LANE_BATCH_COMP");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Whether every single-token lane of a tokenwise verify layer takes the
+// split-KV selection flash on the F16 segmented cache (the path
+// build_mla_attention_lane_core hands to a DeepSeek4LaneDeferral). The lanes
+// must share one padded compressed span so their mask rows line up.
+static bool ds4_lane_batch_layer_ok(const DeepSeek4Weights & w, int il,
+                                    const DeepSeek4LayerCache & lc,
+                                    const DeepSeek4LayerCache & comp_lc,
+                                    int padded, const ggml_tensor * identity_rows) {
+    static const bool f16_kv_lanes = ds4_env_flag("LUCE_DS4_F16_KV_LANES");
+    static const bool explicit_split = ds4_env_flag("LUCE_DS4_EXPLICIT_SPLIT");
+    static const bool i32_repeat = ds4_env_flag("LUCE_CUDA_I32_REPEAT");
+    static const bool no_split_kv = ds4_env_flag("GGML_CUDA_MLA_NO_SPLIT_KV") ||
+                                    ds4_env_flag("GGML_DS4_FA_NO_SPLIT_KV");
+    // Lanes past the sparse threshold leave the Explicit implementation.
+    static const bool sparse_decode = ds4_env_flag("LUCE_DS4_SPARSE_DECODE_FLASH");
+    const int ratio = (int) w.compress_ratios[(size_t) il];
+    if (!ds4_lane_batch_enabled() || ratio <= 0 || padded <= 1 || sparse_decode ||
+        !w.shared_index_topk || w.head_dim != 512 || w.n_rot != 64 ||
+        !w.fused_verify_f16_kv || !f16_kv_lanes || !explicit_split ||
+        no_split_kv || !ds4_segmented_kv_enabled(w) ||
+        !lc.raw_kv || lc.raw_kv->type != GGML_TYPE_F16 ||
+        !comp_lc.comp_kv || comp_lc.comp_kv->type != GGML_TYPE_F16) {
+        return false;
+    }
+    // Lanes without a shared selection attend through the identity row list;
+    // batching it repeats that list on the device (an I32 REPEAT).
+    if (padded <= w.n_indexer_top_k &&
+        (!identity_rows || padded > identity_rows->ne[0] || !i32_repeat)) {
+        return false;
+    }
+    return true;
 }
 
 // `lc` owns the layer's raw ring; `comp_lc` holds the compressed rows it
@@ -2377,11 +2509,16 @@ static ggml_tensor * build_mla_attention_lane_core(
         const DeepSeek4PreparedProjectedLane * prepared = nullptr,
         ggml_tensor ** out_attn_context = nullptr,
         DeepSeek4SpecBoundaryCheckpointLayer * boundary_checkpoint = nullptr,
-        vision::ImageSpanView image_spans = {}) {
+        vision::ImageSpanView image_spans = {},
+        DeepSeek4LaneDeferral * deferral = nullptr) {
 
     const int n_embd    = w.n_embd;
     const int head_dim  = w.head_dim;
-    const int n_head    = w.n_head;
+    const int n_head    = lane.head_count > 0 ? lane.head_count : w.n_head;
+    ggml_tensor * attn_sinks_w = (L.attn_sinks && lane.head_count > 0)
+        ? ggml_view_1d(ctx, L.attn_sinks, n_head,
+                       (size_t) lane.head_begin * ggml_type_size(L.attn_sinks->type))
+        : L.attn_sinks;
     const int n_rot     = w.n_rot;
     const int ratio     = w.compress_ratios[layer_idx];
     const bool gathered_history = lane.history_mode ==
@@ -2391,7 +2528,8 @@ static ggml_tensor * build_mla_attention_lane_core(
     // place. Only gathered paged concurrency supplies a q-wide projection.
     DeepSeek4PreparedProjectedLane projected;
     if (!prepared) {
-        projected = build_mla_qkv_projection(ctx, cur, w, L, n_tokens);
+        projected = build_mla_qkv_projection(ctx, cur, w, L, n_tokens, 0,
+                                             lane.head_begin, lane.head_count);
     }
 
     // ── RoPE on Q and KV (tail rotation on last n_rot dims) ────────
@@ -2532,6 +2670,9 @@ static ggml_tensor * build_mla_attention_lane_core(
     }
     if (!lane.write_raw) {
         // Inactive/padding lanes intentionally have no cache mutation.
+    } else if (deferral) {
+        // Lane batch: the caller writes every lane's row after the one
+        // attention op over all lanes has read the ring.
     } else if (raw_kv_rows) {
         ggml_tensor * kv_f32 = ggml_is_contiguous(kv) ? kv : ggml_cont(ctx, kv);
         raw_kv_source = ggml_set_rows(ctx, lane.raw_kv, kv_f32, raw_kv_rows);
@@ -2685,7 +2826,10 @@ static ggml_tensor * build_mla_attention_lane_core(
     // graph (fused, paged) or in Ds4IndexSelectionStore (host paths).
     const int n_candidate_rows = w.candidate_source_layer >= 0 ? w.candidate_topk_blocks : 0;
     ggml_tensor * const carrier_in = lane.index_selection ? *lane.index_selection : nullptr;
-    if (shared_selection && !selects_topk && carrier_in) {
+    // A lane-batch caller that selects for all lanes stands in for this
+    // lane's selection (and for the index source's scoring).
+    const bool external_selection = deferral && deferral->external_selection;
+    if (shared_selection && !selects_topk && carrier_in && !external_selection) {
         // A selection exists only while a query sees more than top_k rows,
         // the same condition under which the index source built it.
         if (n_comp_live > w.n_indexer_top_k && carrier_in->ne[1] == n_tokens) {
@@ -2696,7 +2840,7 @@ static ggml_tensor * build_mla_attention_lane_core(
                                               carrier_in->nb[1], 0));
         }
     }
-    if (selects_topk) {
+    if (selects_topk && !external_selection) {
         int n_index_comp = 0;
         ggml_tensor * index_visibility_mask = nullptr;
         if (gathered_history) {
@@ -2759,8 +2903,8 @@ static ggml_tensor * build_mla_attention_lane_core(
     // A short-context verify lane without a selection attends to every
     // compressed row: give it the identity row list so it runs the split-KV
     // flash schedule on the F16 cache (LUCE_DS4_EXPLICIT_SPLIT).
-    if (!indexer_topk && cached_inputs && cached_inputs->identity_rows && masked_kv &&
-        n_tokens == 1 && attention_impl == DeepSeek4AttentionImpl::Explicit &&
+    if (!indexer_topk && !external_selection && cached_inputs && cached_inputs->identity_rows &&
+        masked_kv && n_tokens == 1 && attention_impl == DeepSeek4AttentionImpl::Explicit &&
         w.shared_index_topk && head_dim == 512 && n_rot == 64 && !image_spans.size &&
         !gathered_history && cached_inputs->padded_comp > 1 &&
         cached_inputs->padded_comp <= (int) cached_inputs->identity_rows->ne[0]) {
@@ -2768,6 +2912,7 @@ static ggml_tensor * build_mla_attention_lane_core(
                                     cached_inputs->padded_comp, 1,
                                     (size_t) cached_inputs->padded_comp * sizeof(int32_t), 0);
     }
+    const bool has_selection = indexer_topk != nullptr || external_selection;
     // Maskless indexed prefill admission. This repeats the kernel's
     // ratio4_causal support check in fattn.cu exactly (indexed-row capacity,
     // chronological prior window, completed compressed-row frontier): the
@@ -2903,30 +3048,21 @@ static ggml_tensor * build_mla_attention_lane_core(
     // K/V in F16 there.
     static const bool explicit_split = ds4_env_flag("LUCE_DS4_EXPLICIT_SPLIT");
     const bool explicit_selection_f16_kv = explicit_split && fused_explicit_f16_kv &&
-        w.shared_index_topk && indexer_topk && head_dim == 512 &&
+        w.shared_index_topk && has_selection && head_dim == 512 &&
         n_rot == 64 && !image_spans.size;
     // Segmented K/V is a device-class default (HIP backends), with
     // GGML_CUDA_MLA_SEGMENTED_KV=0 as the graph-side kill switch. The two
     // NO_SPLIT_KV flags below are the kernel's own split-KV kill switches
     // (ds4-env.cuh); repeating them here keeps the graph from handing
     // segments to a kernel that will not consume them.
-    const char * segmented_kv_env =
-        std::getenv("GGML_CUDA_MLA_SEGMENTED_KV");
-    const char * backend_name = w.backend ? ggml_backend_name(w.backend) : nullptr;
-    const bool segmented_kv_default = backend_name &&
-        (std::strstr(backend_name, "HIP") != nullptr ||
-         std::strstr(backend_name, "ROCm") != nullptr);
-    const bool segmented_kv_enabled = segmented_kv_env
-        ? segmented_kv_env[0] != '\0' &&
-            std::strcmp(segmented_kv_env, "0") != 0
-        : segmented_kv_default;
+    const bool segmented_kv_enabled = ds4_segmented_kv_enabled(w);
     // Ratio-4 verification already has an exact mask-derived selected-row
     // list. Keep raw, compressed, and preserved overwritten rows as separate
     // dependencies and let the native split-KV kernel address them directly.
     // This removes two O(context) concatenations per indexed layer/step.
     const bool segmented_sparse_f16_kv =
         (fused_sparse_f16_kv || explicit_selection_f16_kv) &&
-        segmented_kv_enabled && indexer_topk && n_tokens <= 8 &&
+        segmented_kv_enabled && has_selection && n_tokens <= 8 &&
         n_comp_attn > 0 && comp_history_source &&
         (old_rows_scratch_f16 || n_comp_attn > 1) &&
         !ds4_env_flag("GGML_CUDA_MLA_NO_SPLIT_KV") &&
@@ -3027,7 +3163,7 @@ static ggml_tensor * build_mla_attention_lane_core(
     // reads only the selected compressed rows: the lane's mask keeps the
     // causal visibility and the selection names the rows (the 2K numerical
     // bands attach each band's slice below).
-    const bool selection_flash = w.shared_index_topk && indexer_topk &&
+    const bool selection_flash = w.shared_index_topk && has_selection &&
         head_dim == 512 && n_rot == 64 && !image_spans.size;
     const bool direct_indexer_topk = ratio == 4
         ? indexer_topk && !image_spans.size &&
@@ -3191,6 +3327,36 @@ static ggml_tensor * build_mla_attention_lane_core(
                 ctx, ggml_cont(ctx, score_mask), indexer_topk, n_raw);
         }
     }
+    if (deferral) {
+        // Lane batch: the caller admits only layers whose lanes take the
+        // split-KV selection flash below on the F16 segmented cache, so the
+        // batched op reproduces each lane's op exactly. Anything else is a
+        // contract violation; fail the build rather than change arithmetic.
+        const bool selection_ok = external_selection
+            ? indexer_topk == nullptr
+            : indexer_topk && indexer_topk->ne[1] == 1;
+        const bool batchable = n_tokens == 1 && masked_kv && score_mask &&
+            selection_flash && direct_indexer_topk && !exact_numerical_bands &&
+            !maskless_direct && explicit_selection_f16_kv && segmented_sparse_f16_kv &&
+            segmented_kv_comp && segmented_kv_tail && !old_rows_scratch_f16 &&
+            attention_impl == DeepSeek4AttentionImpl::Explicit && n_raw == w.n_swa &&
+            raw_score_capacity == w.n_swa && comp_history_source && n_comp_attn > 1 &&
+            selection_ok;
+        if (!batchable) {
+            std::fprintf(stderr,
+                "[deepseek4] layer %d: lane batch needs the split-KV selection "
+                "flash path (selection=%d external=%d segmented=%d f16=%d)\n",
+                layer_idx, indexer_topk != nullptr, external_selection ? 1 : 0,
+                segmented_sparse_f16_kv ? 1 : 0, explicit_selection_f16_kv ? 1 : 0);
+            return nullptr;
+        }
+        deferral->deferred = true;
+        deferral->selection = indexer_topk;
+        deferral->comp_source = comp_history_source;
+        deferral->index_comp_source = index_comp_history_source;
+        deferral->n_comp_attn = n_comp_attn;
+        return comp_history_source;
+    }
     ggml_tensor * context = nullptr;
     bool inverse_rope_fused = false;
     // Decode normally keeps the cheaper explicit path.  Once the trained
@@ -3267,7 +3433,7 @@ static ggml_tensor * build_mla_attention_lane_core(
                     ctx, q_band, k_band, k_band, mask_fa,
                     kq_scale, 0.0f, 0.0f);
                 if (L.attn_sinks) {
-                    ggml_flash_attn_ext_add_sinks(result, L.attn_sinks);
+                    ggml_flash_attn_ext_add_sinks(result, attn_sinks_w);
                 }
                 ggml_flash_attn_ext_set_prec(result, GGML_PREC_F32);
                 ggml_flash_attn_ext_set_ds4_sparse(
@@ -3390,7 +3556,7 @@ static ggml_tensor * build_mla_attention_lane_core(
             context = ggml_flash_attn_ext(ctx, q_fa, k_fa, v_fa, mask_fa,
                                           kq_scale, 0.0f, 0.0f);
             if (L.attn_sinks) {
-                ggml_flash_attn_ext_add_sinks(context, L.attn_sinks);
+                ggml_flash_attn_ext_add_sinks(context, attn_sinks_w);
             }
             ggml_flash_attn_ext_set_prec(context, GGML_PREC_F32);
             // Always publish the raw/compressed boundary. A zero keep count leaves
@@ -3461,13 +3627,21 @@ static ggml_tensor * build_mla_attention_lane_core(
         ggml_tensor * probs = nullptr;
         // Keep long histories on the general softmax path; the fused sink
         // kernel requires shared memory for every attention column.
-        if (L.attn_sinks && !score_mask && n_tokens == 1 && n_attn <= 2048) {
-            // Single-token lanes: scale, sink concat, softmax, and the strided
-            // view (which forced a 2D staging copy before the PV matmul) fold
-            // into one launch. The sink is a virtual last column, so every
-            // reduction matches the concat form bit for bit.
-            ggml_tensor * sinks = ggml_reshape_1d(ctx, L.attn_sinks, n_head);
-            probs = ggml_soft_max_ext_sink_col(ctx, scores, sinks, kq_scale);
+        const bool one_mask_row = score_mask && score_mask->ne[0] == n_attn &&
+            ggml_nrows(score_mask) == 1 && score_mask->nb[0] == ggml_type_size(score_mask->type);
+        if (L.attn_sinks && (!score_mask || one_mask_row) && n_tokens == 1 && n_attn <= 2048) {
+            // Single-token lanes: scale, the additive mask, sink concat,
+            // softmax, and the strided view (which forced a 2D staging copy
+            // before the PV matmul) fold into one launch. The sink is a
+            // virtual last column, so every reduction matches the concat form
+            // bit for bit; with a mask the heads ride on dim 2 so its one row
+            // broadcasts over them as the add did.
+            ggml_tensor * sinks = ggml_reshape_1d(ctx, attn_sinks_w, n_head);
+            probs = score_mask
+                ? ggml_reshape_2d(ctx, ggml_soft_max_ext_sink_col_mask(
+                      ctx, ggml_reshape_3d(ctx, scores, n_attn, 1, n_head),
+                      score_mask, sinks, kq_scale), n_attn, n_head)
+                : ggml_soft_max_ext_sink_col(ctx, scores, sinks, kq_scale);
         } else {
         scores = ggml_scale(ctx, scores, kq_scale);
         if (score_mask) {
@@ -3483,7 +3657,7 @@ static ggml_tensor * build_mla_attention_lane_core(
             }
         }
         if (L.attn_sinks) {
-            ggml_tensor * sink_scores = ggml_reshape_2d(ctx, L.attn_sinks,
+            ggml_tensor * sink_scores = ggml_reshape_2d(ctx, attn_sinks_w,
                                                         1, n_head);
             if (n_tokens > 1) {
                 ggml_tensor * sink_shape = ggml_new_tensor_2d(
@@ -3537,7 +3711,183 @@ static ggml_tensor * build_mla_attention_lane_core(
     }
 
     return build_mla_output_projection(ctx, attn_out, w, L, n_tokens,
-                                       /*allow_grouped=*/true);
+                                       /*allow_grouped=*/true, 0,
+                                       lane.head_begin, lane.head_count);
+}
+
+// The lane batch's I32 [rows, lanes] selection, cached across the layers of
+// one graph: lanes on the identity row list share one device repeat of it per
+// span, and lanes on shared top-k selections concatenate them once per index
+// source (the layers after it carry the same tensors).
+struct Ds4LaneBatchSelections {
+    std::vector<std::pair<int64_t, ggml_tensor *>> identity;
+    std::vector<std::pair<std::vector<ggml_tensor *>, ggml_tensor *>> shared;
+};
+
+static ggml_tensor * ds4_lane_batch_selection(
+        ggml_context * ctx,
+        const std::vector<DeepSeek4LaneDeferral> & lanes,
+        ggml_tensor * identity_rows,
+        Ds4LaneBatchSelections & cache) {
+    GGML_ASSERT(!lanes.empty() && lanes[0].selection);
+    const int64_t rows = lanes[0].selection->ne[0];
+    bool identity = identity_rows != nullptr;
+    std::vector<ggml_tensor *> key;
+    key.reserve(lanes.size());
+    for (const DeepSeek4LaneDeferral & lane : lanes) {
+        GGML_ASSERT(lane.selection && lane.selection->type == GGML_TYPE_I32 &&
+                    lane.selection->ne[0] == rows && lane.selection->ne[1] == 1);
+        identity = identity && lane.selection->view_src == identity_rows &&
+                   lane.selection->view_offs == 0;
+        key.push_back(lane.selection);
+    }
+    if (identity) {
+        for (const auto & entry : cache.identity) {
+            if (entry.first == rows) return entry.second;
+        }
+        ggml_tensor * list = ggml_view_2d(
+            ctx, identity_rows, rows, 1, (size_t) rows * sizeof(int32_t), 0);
+        ggml_tensor * all = ggml_repeat(
+            ctx, list, ggml_new_tensor_2d(ctx, GGML_TYPE_I32, rows, (int64_t) lanes.size()));
+        cache.identity.emplace_back(rows, all);
+        return all;
+    }
+    for (const auto & entry : cache.shared) {
+        if (entry.first == key) return entry.second;
+    }
+    ggml_tensor * all = nullptr;
+    for (ggml_tensor * selection : key) {
+        all = all ? ggml_concat(ctx, all, selection, 1) : selection;
+    }
+    cache.shared.emplace_back(std::move(key), all);
+    return all;
+}
+
+// Lane batch over V4.1's shared top-k (external_selection lanes): an index
+// source scores and selects the compressed rows of every lane in one indexer
+// chain, whose per-token rows (projections, RoPE, QAT, scores, top-k) equal
+// each lane's own single-token chain; the layers after it attend over that
+// selection. `carrier` holds the latest source's [top_k (+ candidate
+// blocks), lanes] selection, as lane_selection does per lane.
+static ggml_tensor * ds4_lane_batch_shared_selection(
+        ggml_context * ctx,
+        const DeepSeek4Weights & w,
+        const DeepSeek4Layer & L,
+        int il,
+        ggml_tensor * qr,                 // [n_lora_q, lanes]
+        ggml_tensor * cur,                // [n_embd, lanes]
+        ggml_tensor * index_comp_source,  // F16 index keys after the lanes' updates
+        int n_comp,                       // the lanes' padded compressed span
+        int kv_start,
+        ggml_tensor * rope_pos,           // I32 [lanes]
+        ggml_tensor * visibility_mask,    // F32 [n_comp, lanes]
+        ggml_tensor ** carrier) {
+    const int top_k = w.n_indexer_top_k;
+    const int64_t lanes = qr->ne[1];
+    const int ratio = (int) w.compress_ratios[(size_t) il];
+    const int n_candidate_rows = w.candidate_source_layer >= 0 ? w.candidate_topk_blocks : 0;
+    if (deepseek4_is_index_source(w, il)) {
+        if (!index_comp_source || index_comp_source->type != GGML_TYPE_F16) return nullptr;
+        const bool uses_candidates = n_candidate_rows > 0 && il >= w.candidate_source_layer;
+        DeepSeek4IndexCandidates candidates;
+        candidates.source = uses_candidates && il == w.candidate_source_layer;
+        if (uses_candidates && !candidates.source && *carrier &&
+            (*carrier)->ne[0] == top_k + n_candidate_rows) {
+            candidates.blocks = ggml_view_2d(
+                ctx, *carrier, n_candidate_rows, (*carrier)->ne[1], (*carrier)->nb[1],
+                (size_t) top_k * sizeof(int32_t));
+        }
+        std::vector<DeepSeek4I32ArrayBinding> bindings;
+        ggml_tensor * selected = deepseek4_build_indexer_topk(
+            ctx, qr, cur, w, L, index_comp_source, n_comp, kv_start, (int) lanes,
+            ratio, rope_pos, visibility_mask, bindings,
+            uses_candidates ? &candidates : nullptr);
+        if (!selected || !bindings.empty() || selected->ne[0] != top_k ||
+            selected->ne[1] != lanes) {
+            return nullptr;
+        }
+        *carrier = candidates.blocks
+            ? ggml_concat(ctx, selected, ggml_cont(ctx, candidates.blocks), 0)
+            : selected;
+        return selected;
+    }
+    if (!*carrier || (*carrier)->ne[1] != lanes) return nullptr;
+    return (*carrier)->ne[0] == top_k ? *carrier
+        : ggml_cont(ctx, ggml_view_2d(ctx, *carrier, top_k, lanes, (*carrier)->nb[1], 0));
+}
+
+// Attention of every single-token lane of a tokenwise verify layer in one
+// split-KV flash op, after each lane ran build_mla_attention_lane_core with a
+// DeepSeek4LaneDeferral (its cache updates and row selection, no raw write).
+// Lane t must see the raw ring as its own decode step does: the rows lanes
+// 0..t wrote and the old contents of the rows later lanes overwrite. The op
+// reads the old ring and takes lanes 0..t's rows from `kv` in place
+// (ggml_flash_attn_ext_set_ds4_lane_rows); the ring is written after it.
+// Mask rows, selections and compressed rows stay per lane, so every lane's
+// context is bit-identical to its own op, without the per-lane launches and
+// the concatenation of the lane contexts. Returns [head_dim * n_head, lanes]
+// before the inverse RoPE, like the lanes' out_attn_context.
+static ggml_tensor * build_mla_lane_batch_attention(
+        ggml_context * ctx,
+        ggml_cgraph * gf,
+        const DeepSeek4Weights & w,
+        const DeepSeek4Layer & L,
+        ggml_tensor * raw_kv,         // F16 [head_dim, n_swa] ring of this layer
+        ggml_tensor * q,              // [head_dim, n_head, lanes] after RoPE
+        ggml_tensor * kv,             // F32 [head_dim, lanes] after RoPE
+        ggml_tensor * ring_rows_i32,  // [lanes] ring row of each lane
+        ggml_tensor * ring_rows_i64,  // [lanes] the same rows for SET_ROWS
+        ggml_tensor * mask_f16,       // F16 [n_swa + compressed, lanes]
+        ggml_tensor * selection,      // I32 [rows, lanes]
+        ggml_tensor * comp_source,    // compressed rows after the lanes' updates
+        int n_comp_attn,
+        int head_begin = 0,           // cluster head split: this rank's heads
+        int head_count = 0) {
+    const int head_dim = w.head_dim;
+    const int n_head = head_count > 0 ? head_count : w.n_head;
+    const int64_t lanes = q->ne[2];
+    GGML_ASSERT(q->ne[1] == n_head);
+    GGML_ASSERT(raw_kv->type == GGML_TYPE_F16 && raw_kv->ne[1] == w.n_swa);
+    GGML_ASSERT(kv->ne[1] == lanes && selection->ne[1] == lanes);
+    GGML_ASSERT(mask_f16->type == GGML_TYPE_F16 && mask_f16->ne[1] == lanes &&
+                mask_f16->ne[0] == (int64_t) w.n_swa + n_comp_attn);
+    GGML_ASSERT(n_comp_attn > 1);
+
+    ggml_tensor * q_fa = ggml_permute(ctx, q, 0, 2, 1, 3);
+    ggml_tensor * ring = ggml_view_2d(ctx, raw_kv, head_dim, w.n_swa, raw_kv->nb[1], 0);
+    ggml_tensor * k_fa = ggml_reshape_3d(ctx, ring, head_dim, w.n_swa, 1);
+    // The lanes' segment split: every compressed row but the last, then the
+    // last one (as each single-token lane presents them).
+    ggml_tensor * comp_head = ggml_view_2d(
+        ctx, comp_source, head_dim, n_comp_attn - 1, comp_source->nb[1], 0);
+    ggml_tensor * comp_tail = ggml_view_2d(
+        ctx, comp_source, head_dim, 1, comp_source->nb[1],
+        (size_t) (n_comp_attn - 1) * comp_source->nb[1]);
+
+    ggml_tensor * context = ggml_flash_attn_ext(
+        ctx, q_fa, k_fa, k_fa, mask_f16,
+        1.0f / sqrtf((float) head_dim), 0.0f, 0.0f);
+    if (L.attn_sinks) {
+        ggml_flash_attn_ext_add_sinks(context, head_count > 0
+            ? ggml_view_1d(ctx, L.attn_sinks, n_head,
+                           (size_t) head_begin * ggml_type_size(L.attn_sinks->type))
+            : L.attn_sinks);
+    }
+    ggml_flash_attn_ext_set_prec(context, GGML_PREC_F32);
+    ggml_flash_attn_ext_set_ds4_sparse(
+        context, w.n_swa, w.n_swa, -(int) selection->ne[0], 32);
+    ggml_flash_attn_ext_set_ds4_kv_segments(context, comp_head, comp_tail);
+    ggml_flash_attn_ext_set_ds4_indexer_topk(context, selection);
+    // The rows the lanes write, in the cache format the ring holds.
+    ggml_tensor * lane_kv = ggml_cast(ctx, kv, GGML_TYPE_F16);
+    ggml_flash_attn_ext_set_ds4_lane_rows(context, ring_rows_i32, lane_kv);
+    ggml_build_forward_expand(gf, context);
+
+    // Write the ring after the op read its old rows (same stream, graph order).
+    ggml_tensor * kv_rows = ggml_is_contiguous(kv) ? kv : ggml_cont(ctx, kv);
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, raw_kv, kv_rows, ring_rows_i64));
+
+    return ggml_reshape_2d(ctx, context, (int64_t) head_dim * n_head, lanes);
 }
 
 // Legacy contiguous-cache adapter.  Both decode and the consecutive q>1
@@ -3562,10 +3912,13 @@ static ggml_tensor * build_mla_attention(
         DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit,
         DeepSeek4SpecBoundaryCheckpointLayer * boundary_checkpoint = nullptr,
         vision::ImageSpanView image_spans = {},
-        ggml_tensor ** index_selection = nullptr) {
+        ggml_tensor ** index_selection = nullptr,
+        int head_begin = 0, int head_count = 0) {
     DeepSeek4MlaLaneBindings lane = deepseek4_contiguous_lane_bindings(
         w, layer_idx, lc, comp_lc, kv_start + n_tokens - 1);
     lane.index_selection = index_selection;
+    lane.head_begin = head_begin;
+    lane.head_count = head_count;
     return build_mla_attention_lane_core(
         ctx, gf, cur, w, L, lane, layer_idx, kv_start, n_tokens,
         cached_inputs, i32_inputs, i32_array_inputs, i64_array_inputs,
@@ -3754,6 +4107,9 @@ struct DeepSeek4PrefillHcPostGraph {
     ggml_tensor * block_out_cold = nullptr;
     ggml_tensor * split = nullptr;
     bool owner_join = false;
+    // Cluster prefill: the joined hot+cold routed partial is all-reduced in
+    // the graph before HC-post (the device-join path of a cluster rank).
+    bool cluster_reduce = false;
 
     bool valid() const {
         return owner_ctx && backend && n_tokens > 0 && sg.ctx && sg.gf &&
@@ -3772,6 +4128,7 @@ struct DeepSeek4PrefillHcPostGraph {
         block_out_cold = nullptr;
         split = nullptr;
         owner_join = false;
+        cluster_reduce = false;
     }
 };
 
@@ -4348,6 +4705,70 @@ static ggml_tensor * build_shared_ffn(
     ggml_tensor * gate_sh = ggml_mul_mat(ctx, L.ffn_gate_shexp, cur);
     ggml_tensor * up_sh = ggml_mul_mat(ctx, L.ffn_up_shexp, cur);
     ggml_tensor * mid_sh = build_clamped_swiglu(ctx, gate_sh, up_sh, w.swiglu_clamp_exp);
+    return ggml_mul_mat(ctx, L.ffn_down_shexp, mid_sh);
+}
+
+// Cluster shared-expert sharding (maikzz32/lucebox-halo-cluster): build only
+// the intermediate range [ff_begin, ff_begin + ff_count) of the shared
+// expert. The result is a PARTIAL SUM of the shared expert over that range,
+// because the down projection contracts over the intermediate axis - so the
+// caller must add it to the routed partial BEFORE the all-reduce, and the
+// reduction then sums both contributions in one message.
+//
+// gate and up are sliced by output row, which is a contiguous view. `down`
+// contracts over the intermediate axis, so slicing it would need a strided
+// view of every row; instead the local intermediate is zero-padded back to
+// full width and the full `down` is applied. The zeros contribute nothing.
+static ggml_tensor * build_shared_ffn_slice(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        const DeepSeek4Weights & w,
+        const DeepSeek4Layer & L,
+        int ff_begin,
+        int ff_count) {
+    if (ff_count <= 0 || !L.ffn_gate_shexp || !L.ffn_up_shexp || !L.ffn_down_shexp) {
+        return build_shared_ffn(ctx, cur, w, L);
+    }
+    const int64_t n_ff = L.ffn_gate_shexp->ne[1];
+    if (ff_begin < 0 || (int64_t) ff_begin + ff_count > n_ff) {
+        return build_shared_ffn(ctx, cur, w, L);
+    }
+    auto row_slice = [&](ggml_tensor * t) {
+        return ggml_view_2d(ctx, t, t->ne[0], (int64_t) ff_count, t->nb[1],
+                            (size_t) ff_begin * t->nb[1]);
+    };
+    ggml_tensor * gate_sh = ggml_mul_mat(ctx, row_slice(L.ffn_gate_shexp), cur);
+    ggml_tensor * up_sh   = ggml_mul_mat(ctx, row_slice(L.ffn_up_shexp), cur);
+    ggml_tensor * mid_sh  = build_clamped_swiglu(ctx, gate_sh, up_sh, w.swiglu_clamp_exp);
+    // LUCE_DS4_SHEXP_SLICE_VIEW=1: contract over this rank's slice only,
+    // through a column view of down (row stride unchanged): half the down
+    // weights read and no zero padding. Bit-identical to the padded product
+    // on the RDNA4 Q8_0 matvec, which gives the slice's blocks the lanes they
+    // take in the whole rows (ggml_backend_cuda_mul_mat_whole_row_lanes);
+    // other kernels sum the slice in their own order.
+    static const bool slice_view = [] {
+        const char * v = std::getenv("LUCE_DS4_SHEXP_SLICE_VIEW");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    if (slice_view && (int64_t) ff_count != n_ff &&
+        ff_begin % ggml_blck_size(L.ffn_down_shexp->type) == 0 &&
+        ff_count % ggml_blck_size(L.ffn_down_shexp->type) == 0) {
+        ggml_tensor * down = ggml_view_2d(ctx, L.ffn_down_shexp, ff_count, L.ffn_down_shexp->ne[1],
+                                          L.ffn_down_shexp->nb[1],
+                                          ggml_row_size(L.ffn_down_shexp->type, ff_begin));
+        ggml_tensor * out = ggml_mul_mat(ctx, down, mid_sh);
+        ggml_backend_cuda_mul_mat_whole_row_lanes(out);
+        return out;
+    }
+    if ((int64_t) ff_count != n_ff) {
+        ggml_tensor * zeros = ggml_scale(ctx, mid_sh, 0.0f);
+        ggml_tensor * padded = nullptr;
+        for (int64_t off = 0; off < n_ff; off += ff_count) {
+            ggml_tensor * piece = (off == (int64_t) ff_begin) ? mid_sh : zeros;
+            padded = padded ? ggml_concat(ctx, padded, piece, 0) : piece;
+        }
+        mid_sh = padded;
+    }
     return ggml_mul_mat(ctx, L.ffn_down_shexp, mid_sh);
 }
 
@@ -6164,6 +6585,18 @@ bool deepseek4_step(
         Ds4VerifyHooks * verify_hooks,
         MoeExpertComputeRuntime * expert_runtime,
         bool need_logits) {
+    if (cache.cluster_rt && moe_hybrid != nullptr) {
+        // Cluster rank: the legacy CPU-HC hybrid step has no all-reduce
+        // insertion point. Route through the per-layer forward, which reduces
+        // the routed partial inside eval_ds4_layer_range_hybrid_ffn.
+        std::vector<float> hc_state;
+        (void) stream_engine; (void) need_logits;
+        return deepseek4_step_layer_range(
+            backend, device, w, cache, hc_state, embed, n_tokens, kv_start,
+            0, w.n_layer, &out_logits, token_ids, telemetry,
+            /*allow_decode_graph_reuse=*/verify_hooks == nullptr, verify_hooks,
+            moe_hybrid, expert_runtime, routing_stats);
+    }
     if (w.moe_hybrid && moe_hybrid != nullptr) {
         if (!deepseek4_cuda_hc_set_device(device)) {
             std::fprintf(stderr,
@@ -6356,6 +6789,150 @@ struct DeepSeek4FusedDecodeCache {
 // Fused verification graphs retain allocators, schedulers, peer events, and
 // model tensor pointers.  Keep them under DeepSeek4Cache ownership so park,
 // reload, and shutdown destroy them before either GPU backend is released.
+// Reads a verify step's Engram rows on a worker thread while the GPU already
+// runs the graph. The keys reach the device through a pinned buffer whose
+// upload waits on the stream for a word the worker raises once the rows are
+// decoded, so the host never blocks on the table reads (preads that mostly
+// miss the page cache: about 0.7 ms a step on the rank that holds the tables,
+// and every other rank waits for its broadcast). The first consumer is the
+// Engram broadcast after layer 0's attention, which hides the read.
+class Ds4EngramAsync {
+public:
+    Ds4EngramAsync() = default;
+    Ds4EngramAsync(const Ds4EngramAsync &) = delete;
+    Ds4EngramAsync & operator=(const Ds4EngramAsync &) = delete;
+    ~Ds4EngramAsync() { stop(); }
+
+    // Starts the read of `count` tokens at `first_pos` into the pinned keys
+    // (`floats` floats). False: the async path is unavailable, read in line.
+    bool start(ggml_backend_t backend, const DeepSeek4Weights & w, DeepSeek4EngramTokens & ctx,
+               const int32_t * tokens, int first_pos, int count, size_t floats) {
+        if (!ggml_backend_is_cuda(backend) || !ggml_backend_cuda_get_stream(backend)) return false;
+        if (!flag_.ready() && !flag_.init()) return false;
+        if (!keys_.reserve(backend, floats * sizeof(float))) return false;
+        keys_.reset();
+        float * dst = static_cast<float *>(keys_.take(floats * sizeof(float)));
+        if (!dst) return false;
+        if (!thread_.joinable()) thread_ = std::thread([this] { run(); });
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            job_w_ = &w;
+            job_ctx_ = &ctx;
+            job_tokens_.assign(tokens, tokens + count);
+            job_first_ = first_pos;
+            job_count_ = count;
+            job_dst_ = dst;
+            job_floats_ = floats;
+            ++seq_;
+            pending_ = true;
+            done_ = false;
+        }
+        cv_.notify_all();
+        return true;
+    }
+
+    // Queues the keys upload on `backend`'s stream behind the worker's word.
+    bool enqueue(ggml_backend_t backend, ggml_tensor * keys) {
+        if (!keys || !keys->buffer || ggml_nbytes(keys) < job_floats_ * sizeof(float)) return false;
+        if (!flag_.enqueue_wait(ggml_backend_cuda_get_stream(backend), seq_)) return false;
+        ggml_backend_tensor_set_async(backend, keys, job_dst_, 0, job_floats_ * sizeof(float));
+        return true;
+    }
+
+    // The same upload into a raw device pointer on `stream` (the Engram
+    // broadcast's buffer, queued from its graph callback).
+    bool enqueue_raw(void * stream, void * dst, size_t bytes) {
+        if (!stream || !dst || bytes > job_floats_ * sizeof(float)) return false;
+        return flag_.enqueue_wait(stream, seq_) &&
+               HostStreamFlag::copy_to_device(stream, dst, job_dst_, bytes);
+    }
+
+    // Waits for the worker. False when the table read failed (the word was
+    // raised anyway so the stream never hangs, but the step is invalid).
+    bool finish(uint64_t * read_us) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return done_; });
+        if (read_us) *read_us += read_us_;
+        if (!ok_) std::fprintf(stderr, "[ds4-fused-verify] async engram read: %s\n", err_.c_str());
+        return ok_;
+    }
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        for (;;) {
+            cv_.wait(lock, [this] { return pending_ || stopping_; });
+            if (stopping_) return;
+            pending_ = false;
+            const uint32_t seq = seq_;
+            lock.unlock();
+            const auto t0 = std::chrono::steady_clock::now();
+            std::string err;
+            const DeepSeek4EngramRuntime * engram = job_w_->engram_runtime.get();
+            const bool ok = engram && engram->prepare(*job_ctx_, job_tokens_.data(), job_first_,
+                                                      (size_t) job_count_, job_dst_, &err);
+            const uint64_t us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            flag_.signal(seq);
+            lock.lock();
+            ok_ = ok;
+            err_ = engram ? err : std::string("no Engram runtime");
+            read_us_ = us;
+            done_ = true;
+            cv_.notify_all();
+        }
+    }
+
+    void stop() {
+        if (!thread_.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+
+    HostStreamFlag flag_;
+    PinnedStage keys_;
+    std::thread thread_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool pending_ = false;
+    bool done_ = true;
+    bool stopping_ = false;
+    bool ok_ = true;
+    std::string err_;
+    uint64_t read_us_ = 0;
+    uint32_t seq_ = 0;
+    const DeepSeek4Weights * job_w_ = nullptr;
+    DeepSeek4EngramTokens * job_ctx_ = nullptr;
+    std::vector<int32_t> job_tokens_;
+    int job_first_ = 0;
+    int job_count_ = 0;
+    float * job_dst_ = nullptr;
+    size_t job_floats_ = 0;
+};
+
+// LUCE_DS4_ENGRAM_ASYNC=0 keeps the in-line verify Engram read.
+static bool ds4_engram_async_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("LUCE_DS4_ENGRAM_ASYNC");
+        return !(v && v[0] == '0' && v[1] == '\0');
+    }();
+    return enabled;
+}
+
+// LUCE_DS4_PINNED_STEP_IO=0 keeps the blocking per-tensor verify uploads and
+// readbacks.
+static bool ds4_pinned_step_io_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("LUCE_DS4_PINNED_STEP_IO");
+        return !(v && v[0] == '0' && v[1] == '\0');
+    }();
+    return enabled;
+}
+
 struct Ds4FusedVerifyCache {
     // Resident verifier shapes for the adaptive-width profile: four widths
     // (q2..q5) across the four ratio-4 phases plus the q5 two-boundary and
@@ -6401,6 +6978,7 @@ struct Ds4FusedVerifyCache {
         ggml_tensor * engram_keys = nullptr; // f32 [cols*key_len, q, n_engram_layers]
         ggml_tensor * rawrows = nullptr;  // i64 [1,q]
         ggml_tensor * saved_rawrows = nullptr; // i32 [q], gather before ring writes
+        ggml_tensor * pos_rows = nullptr;      // i64 [q], kv_start + i: a ratio-1 lane batch's rows
         // Per distinct compress ratio: each token's APE row (i32 [q]) and
         // compressor state row (i64 [1,q]).
         struct RatioRows {
@@ -6417,13 +6995,14 @@ struct Ds4FusedVerifyCache {
         }
         ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap,q], token-major
         ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy output
+        bool vocab_split = false;         // the head covers this rank's vocabulary half (argmax only)
         DeepSeek4SpecBoundaryCheckpoint boundary_checkpoint;
         // Tokenwise verify: the compressor window row each token wrote, per
         // window-state layer (window_layers), [row, layer-major token] for
         // kv and score, read back as Ds4VerifyWindowRows.
         std::vector<int> window_layers;
-        ggml_tensor * window_kv = nullptr;
-        ggml_tensor * window_score = nullptr;
+        std::vector<ggml_tensor *> window_kv_rows;      // layer-major, one per token
+        std::vector<ggml_tensor *> window_score_rows;
         // Reused host staging for the context-sized additive attention mask.
         // Keeping it per slot removes allocation churn in both full and
         // sparse-range mask update modes.
@@ -6443,6 +7022,10 @@ struct Ds4FusedVerifyCache {
         void reset() { *this = Extra{}; }
     };
     std::array<Extra, kSlotCount> extra;
+    // Pinned staging for a step's uploads and readbacks, and the Engram
+    // reader (both shared by the slots: one step runs at a time).
+    PinnedStage stage;
+    std::unique_ptr<Ds4EngramAsync> engram_async;
 
     void destroy() {
         for (auto & slot : slots) slot.destroy(backend, peer_backend);
@@ -6996,9 +7579,12 @@ static bool build_prefill_hc_post_graph(
         ggml_backend_t backend,
         const DeepSeek4Weights & w,
         int n_tokens,
-        bool owner_join = false) {
+        bool owner_join = false,
+        Ds4ClusterRuntime * cluster_rt = nullptr) {
+    const bool cluster_reduce = owner_join && cluster_rt && cluster_rt->size() > 1;
     if (out.valid() && out.owner_ctx == w.ctx && out.backend == backend &&
-        out.n_tokens == n_tokens && out.owner_join == owner_join) {
+        out.n_tokens == n_tokens && out.owner_join == owner_join &&
+        out.cluster_reduce == cluster_reduce) {
         return true;
     }
     out.free();
@@ -7032,6 +7618,23 @@ static bool build_prefill_hc_post_graph(
     ggml_tensor * hc_block_out = out.block_out_cold
         ? ggml_add(out.sg.ctx, out.block_out, out.block_out_cold)
         : out.block_out;
+    if (cluster_reduce) {
+        // The bf16 prefill wire needs a device scratch of n elements.
+        std::string scratch_err;
+        if (!cluster_rt->ensure_scratch(backend, (size_t) w.n_embd * (size_t) n_tokens, &scratch_err)) {
+            std::fprintf(stderr, "[deepseek4-cluster] prefill scratch failed: %s\n", scratch_err.c_str());
+            out.free();
+            return false;
+        }
+        // Every rank holds the routed partial of the experts it owns (rank 0's
+        // also carries the shared expert): one in-graph all-reduce makes the
+        // FFN output whole before HC-post, on the backend stream.
+        hc_block_out = ds4_cluster_allreduce_node(out.sg.ctx, ggml_cont(out.sg.ctx, hc_block_out), *cluster_rt, /*inplace=*/true);
+        if (!hc_block_out) {
+            out.free();
+            return false;
+        }
+    }
     out.sg.hidden_states = ggml_ds4_hc_post(
         out.sg.ctx, out.residual_hc, hc_block_out, out.split, w.n_hc);
     out.sg.gf = ggml_new_graph_custom(out.sg.ctx, 1024, false);
@@ -7048,6 +7651,7 @@ static bool build_prefill_hc_post_graph(
     out.backend = backend;
     out.n_tokens = n_tokens;
     out.owner_join = owner_join;
+    out.cluster_reduce = cluster_reduce;
     return true;
 }
 
@@ -7471,7 +8075,11 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         std::vector<float> & out,
         DeepSeek4StepTelemetry * telemetry,
         const MoeHybridDeviceOutputs * device_outputs = nullptr,
-        int kv_start = 0, vision::ImageSpanView image_spans = {}) {
+        int kv_start = 0, vision::ImageSpanView image_spans = {},
+        // Cluster expert-parallel (per-layer path): mask routes to experts this rank
+        // does not evaluate, all-reduce the routed partial across ranks, then
+        // add the locally computed shared expert. nullptr = single box.
+        Ds4ClusterRuntime * cluster_rt = nullptr) {
     const bool trace_prefill = ds4_env_flag("LUCE_DS4_PREFILL_TRACE");
     if (trace_prefill) {
         std::fprintf(stderr,
@@ -7498,8 +8106,14 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     const bool device_input_enabled =
         !device_input_env || !*device_input_env ||
         std::strcmp(device_input_env, "0") != 0;
+    // A cluster rank on the host path adds the shared expert on the host after
+    // the reduction, which needs the normalized activation back on the host.
+    // With the device join the reduction is a graph node in HC-post instead.
+    const bool cluster_device_join =
+        cluster_rt && cluster_rt->size() > 1 && device_outputs && device_outputs->valid() &&
+        ds4_cluster_prefill_device_join_enabled();
     const bool device_ffn_input =
-        device_input_enabled && layer_storage.n_streamed == 0 &&
+        (!cluster_rt || cluster_device_join) && device_input_enabled && layer_storage.n_streamed == 0 &&
         !expert_compute && moe_expert_major_prefill_enabled(n_tokens) &&
         layer_storage.cold_backend_kind == MoeHybridColdBackend::Gpu &&
         layer_storage.cold_backend && layer_storage.cold_backend != backend &&
@@ -7801,6 +8415,40 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     MoeHybridConfig cfg = make_ds4_moe_hybrid_config(w);
     cfg.n_expert_used = route_width;
     MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
+    // Cluster: the shared expert is replicated on every rank and must not be
+    // part of the reduced partial. Evaluate the routed experts with the shexp
+    // tensors cleared (per-layer equivalent of include_shared=false) and add
+    // the full-desc shared term after the all-reduce below. Routes to
+    // experts another rank evaluates become id -1 / weight 0, which the
+    // hybrid evaluators skip (MoeHybridLayerStorage::foreign_routes).
+    // Slot = token index inside this batch (identical on all ranks).
+    const MoeLayerDesc shared_desc = desc;
+    if (cluster_rt) {
+        if (cluster_rt->cfg &&
+            cluster_rt->cfg->shared_expert == cluster::SharedExpertMode::Rank0) {
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] layer %d: shared expert mode %s not implemented\n",
+                         layer, cluster::shared_expert_mode_name(cluster_rt->cfg->shared_expert));
+            return false;
+        }
+        ds4_cluster_mask_routes(*cluster_rt, layer, selected.data(), weights.data(),
+                                route_width, n_tokens);
+        // Device join: rank 0's hot owner carries the shared expert, so the
+        // in-graph reduction counts it exactly once.
+        // A sliced shared expert is a partial on every rank instead.
+        if (!(cluster_device_join &&
+              (cluster_rt->rank() == 0 || w.cluster_shexp_ff_local > 0))) {
+            if (w.cluster_shexp_ff_local > 0) {
+                std::fprintf(stderr, "[deepseek4-cluster] layer %d: a sliced shared expert "
+                             "needs the device join\n", layer);
+                return false;
+            }
+            desc.ffn_gate_shexp = nullptr;
+            desc.ffn_up_shexp = nullptr;
+            desc.ffn_down_shexp = nullptr;
+            desc.ffn_gate_inp_shexp = nullptr;
+        }
+    }
     ggml_gallocr_t * hot_alloc = persistent_owner_alloc
         ? &hybrid.prefill_hot_alloc : nullptr;
     ggml_gallocr_t * cold_alloc = persistent_owner_alloc
@@ -7811,7 +8459,22 @@ static bool eval_ds4_layer_range_hybrid_ffn(
                      layer);
     }
     const auto owners_t0 = Ds4TimingClock::now();
-    const bool ok = eval_ds4_hybrid(
+    // Cluster: a rank can end up with no active route in a layer (every one
+    // of the 6 routes owned elsewhere). No evaluator is entered then; the
+    // partial is zero and only the all-reduce and the shared expert below
+    // contribute.
+    int cluster_active_routes = -1;
+    if (cluster_rt) {
+        cluster_active_routes = 0;
+        for (int32_t id : selected) {
+            if (id >= 0) ++cluster_active_routes;
+        }
+    }
+    const bool skip_local_experts = cluster_rt && !cluster_device_join && cluster_active_routes == 0;
+    if (skip_local_experts) {
+        out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    }
+    const bool ok = skip_local_experts || eval_ds4_hybrid(
         backend, hybrid.cpu_backend, cfg, desc, &hybrid,
         hybrid.layers[(size_t)layer], nullptr,
         layer, n_embd, route_width,
@@ -7829,7 +8492,50 @@ static bool eval_ds4_layer_range_hybrid_ffn(
                      layer, ok ? "ok" : "failed",
                      ds4_elapsed_us(owners_t0, Ds4TimingClock::now()) / 1000.0);
     }
-    return ok;
+    if (!ok || !cluster_rt || cluster_device_join) return ok;
+
+    // ── Cluster (per-layer path): reduce the routed partial, then add the shared expert ──
+    // `out` is the host copy of this rank's routed partial [n_embd, n_tokens]
+    // (a cluster rank never takes the device_ffn_input / device-join
+    // branches). The all-reduce stages it through the runtime's device
+    // scratch on the backend stream and waits, so the sum is identical on
+    // every rank before HC-post consumes it.
+    if (out.size() != (size_t) n_embd * (size_t) n_tokens) {
+        std::fprintf(stderr,
+                     "[deepseek4-cluster] layer %d: routed partial has %zu floats, expected %zu\n",
+                     layer, out.size(), (size_t) n_embd * (size_t) n_tokens);
+        return false;
+    }
+    std::string cluster_err;
+    if (!ds4_cluster_allreduce_layer_host(
+            *cluster_rt, backend, out.data(),
+            n_embd, n_tokens, layer, telemetry, &cluster_err)) {
+        std::fprintf(stderr, "[deepseek4-cluster] layer %d all-reduce failed: %s\n",
+                     layer, cluster_err.c_str());
+        return false;
+    }
+    if (shared_desc.has_shared_expert()) {
+        if (normed_host.empty()) {
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] layer %d: shared expert needs the host "
+                         "normalized activation\n", layer);
+            return false;
+        }
+        const auto shared_t0 = Ds4TimingClock::now();
+        std::vector<float> shared_out;
+        if (!eval_moe_shared_expert_batched(
+                backend, cfg, shared_desc, hybrid.layers[(size_t)layer],
+                normed_host.data(), n_tokens, shared_out, &cluster_err)) {
+            std::fprintf(stderr, "[deepseek4-cluster] layer %d shared expert failed: %s\n",
+                         layer, cluster_err.c_str());
+            return false;
+        }
+        for (size_t i = 0; i < out.size(); ++i) out[i] += shared_out[i];
+        if (telemetry) {
+            telemetry->ffn_eval_us += ds4_elapsed_us(shared_t0, Ds4TimingClock::now());
+        }
+    }
+    return true;
 }
 
 // Exact-order prefill control: retain the layer-major HC/FFN schedule, but run
@@ -8136,6 +8842,10 @@ static bool ds4_run_verify_attention(
             if (window_rows->kv.size() <= (size_t) il) {
                 window_rows->kv.resize((size_t) il + 1);
                 window_rows->score.resize((size_t) il + 1);
+            }
+            if (window_rows->kv_dev.size() > (size_t) il) {
+                window_rows->kv_dev[(size_t) il].clear();
+                window_rows->score_dev[(size_t) il].clear();
             }
             const size_t row_bytes = ggml_nbytes(window_kv[0]);
             window_rows->kv[(size_t) il].resize(row_bytes * (size_t) n_tokens);
@@ -10027,11 +10737,18 @@ bool deepseek4_step_layer_range(
     const int n_hc = w.n_hc;
     const int hc_dim = n_hc * n_embd;
     const bool is_last_shard = (layer_end >= w.n_layer);
+    // Expert-parallel cluster: the whole-model fused verify/decode graph
+    // carries one in-graph all-reduce per MoE layer once the communicator is
+    // attached; otherwise the per-layer loop below reduces host-side.
+    const bool cluster_mode = cache.cluster_rt != nullptr;
+    const bool cluster_fused_ok =
+        !cluster_mode || ds4_cluster_fused_graph_available(cache.cluster_rt);
     const bool fused_hybrid_ready =
         moe_hybrid && !expert_runtime &&
         moe_hybrid->materialized_cold_experts &&
         moe_hybrid->cold_backend_kind == MoeHybridColdBackend::Gpu &&
-        moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
+        moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend &&
+        cluster_fused_ok;
     const bool wide_verify_candidate =
         n_tokens == DS4_Q5_VERIFY_TOKENS &&
         ds4_env_flag("LUCE_DS4_Q5_VERIFY");
@@ -10450,6 +11167,12 @@ bool deepseek4_step_layer_range(
             scratch.hash_expert_ids, embed, n_tokens, kv_start, *out_logits, token_ids,
             fused_graph_hooks, telemetry, fused_hybrid_ready ? moe_hybrid : nullptr,
             routing_stats);
+        if (cluster_mode && !cache.cluster_rt->node_error.empty()) {
+            std::fprintf(stderr, "[deepseek4-cluster] in-graph collective failed: %s\n",
+                         cache.cluster_rt->node_error.c_str());
+            cache.cluster_rt->node_error.clear();
+            return false;
+        }
         if (vrc < 0) return false;
         if (vrc > 0) {
             const int np = kv_start + n_tokens;
@@ -10532,8 +11255,19 @@ bool deepseek4_step_layer_range(
         }
         if (band_engram_keys) *band_engram_keys = std::move(engram_keys_local);
     }
-    const std::vector<float> & engram_keys =
+    std::vector<float> & engram_keys_mut =
         band_engram_keys && range_has_engram ? *band_engram_keys : engram_keys_local;
+    if (cache.cluster_rt && range_has_engram) {
+        // Engram tables live on rank 0: its rows replace every other rank's.
+        std::string bcast_err;
+        if (!ds4_cluster_broadcast_host(*cache.cluster_rt, backend, engram_keys_mut.data(),
+                                        engram_keys_mut.size(), &bcast_err)) {
+            std::fprintf(stderr, "[deepseek4-cluster] Engram row broadcast failed: %s\n",
+                         bcast_err.c_str());
+            return false;
+        }
+    }
+    const std::vector<float> & engram_keys = engram_keys_mut;
     if (!layer_range_cache.index_selection.ensure(
             backend, w, layer_major_band ? layer_major_band->selection_columns : n_tokens)) {
         std::fprintf(stderr, "[deepseek4] index selection store allocation failed\n");
@@ -10617,7 +11351,7 @@ bool deepseek4_step_layer_range(
                 prefill_hc_post_graph, backend, w, n_tokens) ||
             (moe_hybrid && !build_prefill_hc_post_graph(
                 prefill_moe_hc_post_graph, backend, w, n_tokens,
-                /*owner_join=*/true))) {
+                /*owner_join=*/true, cache.cluster_rt))) {
             std::fprintf(stderr,
                          "[deepseek4-prefill] batched GPU HC initialization failed\n");
             return false;
@@ -11063,6 +11797,15 @@ bool deepseek4_step_layer_range(
                 ggml_tensor * store_view = layer_range_cache.index_selection.view(
                     ctx, layer_major_band ? layer_major_band->selection_first : 0, n_tokens);
                 ggml_tensor * index_selection = store_view;
+                // Cluster head split in the uncached graphs
+                // (prefill bands, short first decodes): each rank attends with
+                // its own output groups and one all-reduce sums the partials.
+                // Every rank takes the same decision (from the band alone).
+                Ds4ClusterRuntime * split_rt = cache.cluster_rt;
+                const bool split_heads = split_rt && split_rt->size() > 1 &&
+                    split_rt->attn_head_count > 0 &&
+                    (w.cluster_heads_local > 0 ||
+                     ds4_cluster_prefill_attention_split(kv_start + n_tokens));
                 attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, comp_lc, il,
                                                kv_start, n_tokens, nullptr,
                                                i32_inputs, i32_array_inputs,
@@ -11071,8 +11814,22 @@ bool deepseek4_step_layer_range(
                                                attention_impl,
                                                /*boundary_checkpoint=*/nullptr,
                                                image_batch ? image_spans : vision::ImageSpanView{},
-                                               &index_selection);
+                                               &index_selection,
+                                               split_heads ? split_rt->attn_head_begin : 0,
+                                               split_heads ? split_rt->attn_head_count : 0);
                 if (!attn_out) { ggml_free(ctx); return false; }
+                if (split_heads) {
+                    std::string scratch_err;
+                    if (!split_rt->ensure_scratch(backend, (size_t) n_embd * (size_t) n_tokens,
+                                                  &scratch_err)) {
+                        std::fprintf(stderr, "[deepseek4-cluster] prefill attention scratch: %s\n",
+                                     scratch_err.c_str());
+                        ggml_free(ctx);
+                        return false;
+                    }
+                    attn_out = ds4_cluster_allreduce_node(ctx, ggml_cont(ctx, attn_out), *split_rt, /*inplace=*/true);
+                    if (!attn_out) { ggml_free(ctx); return false; }
+                }
                 ds4_publish_index_selection(ctx, gf, w, il, store_view, index_selection);
                 ggml_set_output(attn_out);
                 ggml_build_forward_expand(gf, attn_out);
@@ -11542,6 +12299,7 @@ bool deepseek4_step_layer_range(
                     !device_input_env || !*device_input_env ||
                     std::strcmp(device_input_env, "0") != 0;
                 const bool ffn_device_join_possible =
+                    (!cache.cluster_rt || ds4_cluster_prefill_device_join_enabled()) &&
                     device_input_enabled &&
                     moe_expert_major_prefill_enabled(n_tokens) &&
                     layer_storage.cold_backend_kind ==
@@ -11596,7 +12354,8 @@ bool deepseek4_step_layer_range(
                         *moe_hybrid, expert_runtime, routing_stats,
                         ffn_out_host, telemetry,
                         ffn_device_join ? &owner_outputs : nullptr,
-                        kv_start, image_batch ? image_spans : vision::ImageSpanView{});
+                        kv_start, image_batch ? image_spans : vision::ImageSpanView{},
+                        cache.cluster_rt);
                 if (!ffn_eval_ok) {
                     if (pipe) ds4_pipeline_finish_all(*pipe, backend, false);
                     std::fprintf(stderr,
@@ -11997,11 +12756,27 @@ bool deepseek4_prefill_layer_major(
     // turn.
     const int pipeline_bands = deepseek4_prefill_pipeline_bands();
     const bool pipeline_requested = pipeline_bands > 0;
-    const std::vector<int> run_bands = pipeline_requested
+    // A cluster rank pipelines only when every rank does: every band is a
+    // collective, so the ranks agree on pipelining (the parts depend on the
+    // agreed chunks alone, so they match). Without cluster pipelining a rank
+    // keeps the caller's bands whole.
+    const bool cluster_multi = cache.cluster_rt && cache.cluster_rt->size() > 1;
+    const bool cluster_pipeline = !cluster_multi || ds4_cluster_prefill_pipeline_enabled();
+    const std::vector<int> run_bands = pipeline_requested && cluster_pipeline
         ? deepseek4_pipeline_parts(bands, pipeline_bands)
         : bands;
     Ds4PrefillPipeline pipeline_state;
-    const bool pipelined = pipeline_requested && device_residual && !cache.pipeline_off;
+    bool pipelined = pipeline_requested && cluster_pipeline && device_residual && !cache.pipeline_off;
+    if (cluster_multi && pipeline_requested && ds4_cluster_prefill_pipeline_enabled()) {
+        std::vector<int32_t> flags;
+        std::string agree_err;
+        if (!ds4_cluster_allgather_i32(*cache.cluster_rt, backend, pipelined ? 1 : 0, flags, &agree_err)) {
+            std::fprintf(stderr, "[deepseek4-cluster] pipeline agreement failed: %s\n", agree_err.c_str());
+            return false;
+        }
+        for (int32_t v : flags) if (v <= 0) pipelined = false;
+        if (flags.empty()) pipelined = false;
+    }
     {
         static bool logged = false;
         if (pipeline_requested && !logged) {
@@ -12388,9 +13163,14 @@ static ggml_tensor * build_dspark_attention(
         ggml_tensor * neg_block,   // I32[block]    -(block positions)
         ggml_tensor * pos_ctx,     // I32[ctx_len]  absolute positions committed-ctx_len..committed-1
         ggml_tensor * attn_mask,   // F32[ctx_len+block], 0 or -inf
-        bool flash) {              // D=512 flash kernel instead of BLAS products
+        bool flash,                // D=512 flash kernel instead of BLAS products
+        ggml_tensor ** flash_mask_cache = nullptr,  // the F16 flash mask, shared by the layers
+        int head_begin = 0,        // cluster split: this rank's heads; the result is
+        int head_count = 0) {      // then a partial sum over its output groups
     const int head_dim  = w.head_dim;
-    const int n_head    = w.n_head;
+    const int n_head_all = w.n_head;
+    const bool head_split = head_count > 0 && head_count != n_head_all;
+    const int n_head    = head_split ? head_count : n_head_all;
     const int n_rot     = w.n_rot;
     const int n_lora_o  = w.n_lora_o;
     const int n_out_group = w.n_out_group;
@@ -12403,7 +13183,14 @@ static ggml_tensor * build_dspark_attention(
 
     // ── Q path (block queries) ──────────────────────────────────────
     ggml_tensor * qr = build_rms_norm(ctx, ggml_mul_mat(ctx, L.attn_q_a, cur), L.attn_q_a_norm, eps);
-    ggml_tensor * q = ggml_mul_mat(ctx, L.attn_q_b, qr);          // [n_head*head_dim, block]
+    ggml_tensor * q_b_w = head_split
+        ? ggml_view_2d(ctx, L.attn_q_b, L.attn_q_b->ne[0], (int64_t) n_head * head_dim,
+                       L.attn_q_b->nb[1], (size_t) head_begin * head_dim * L.attn_q_b->nb[1])
+        : L.attn_q_b;
+    ggml_tensor * sinks = L.attn_sinks && head_split
+        ? ggml_view_1d(ctx, L.attn_sinks, n_head, (size_t) head_begin * ggml_element_size(L.attn_sinks))
+        : L.attn_sinks;
+    ggml_tensor * q = ggml_mul_mat(ctx, q_b_w, qr);               // [n_head*head_dim, block]
     q = ggml_reshape_3d(ctx, q, head_dim, n_head, block);
     if (w.attn_q_head_norm) {
         q = ggml_rms_norm(ctx, q, eps);                           // per-head unweighted (V4)
@@ -12441,14 +13228,21 @@ static ggml_tensor * build_dspark_attention(
         ggml_tensor * kv_fa = ggml_reshape_3d(ctx, kv_attn, head_dim, n_attn, 1);
         ggml_tensor * mask_fa = nullptr;
         if (attn_mask) {
-            mask_fa = ggml_cast(ctx, ggml_repeat(ctx, ggml_reshape_2d(ctx, attn_mask, n_attn, 1),
-                                                 ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_attn, block)),
-                                GGML_TYPE_F16);
+            // Every layer attends over the same rows: build the F16 mask once.
+            if (flash_mask_cache && *flash_mask_cache &&
+                (*flash_mask_cache)->ne[0] == n_attn && (*flash_mask_cache)->ne[1] == block) {
+                mask_fa = *flash_mask_cache;
+            } else {
+                mask_fa = ggml_cast(ctx, ggml_repeat(ctx, ggml_reshape_2d(ctx, attn_mask, n_attn, 1),
+                                                     ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_attn, block)),
+                                    GGML_TYPE_F16);
+                if (flash_mask_cache) *flash_mask_cache = mask_fa;
+            }
         }
         context = ggml_flash_attn_ext(ctx, q_fa, kv_fa, kv_fa, mask_fa,
                                       1.0f / sqrtf((float) head_dim), 0.0f, 0.0f);
-        if (L.attn_sinks) {
-            ggml_flash_attn_ext_add_sinks(context, L.attn_sinks);
+        if (sinks) {
+            ggml_flash_attn_ext_add_sinks(context, sinks);
         }
         ggml_flash_attn_ext_set_prec(context, GGML_PREC_F32);
         ggml_flash_attn_ext_set_ds4_sparse(context, n_attn, n_attn, 0, 32);
@@ -12466,8 +13260,8 @@ static ggml_tensor * build_dspark_attention(
             scores = ggml_add(ctx, scores, ggml_repeat(ctx, attn_mask, scores));
         }
         ggml_tensor * probs = nullptr;
-        if (L.attn_sinks) {
-            ggml_tensor * sink = ggml_reshape_2d(ctx, L.attn_sinks, 1, n_head);
+        if (sinks) {
+            ggml_tensor * sink = ggml_reshape_2d(ctx, sinks, 1, n_head);
             ggml_tensor * sink_shape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_head * block);
             sink = ggml_repeat(ctx, sink, sink_shape);
             ggml_tensor * sws = ggml_concat(ctx, scores, sink, 0);    // [n_attn+1, n_head*block]
@@ -12486,14 +13280,62 @@ static ggml_tensor * build_dspark_attention(
                                  rope_freq, rope_scale, rope_ext, rope_attn,
                                  w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope_orig);
     ggml_tensor * attn_out = ggml_reshape_2d(ctx, context, head_dim * n_head, block);
-    const int group_dim = head_dim * (n_head / n_out_group);
-    attn_out = ggml_reshape_3d(ctx, attn_out, group_dim, n_out_group, block);
-    attn_out = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));  // [group_dim, block, n_out_group]
+    const int heads_per_group = n_head_all / n_out_group;
+    const int group_dim = head_dim * heads_per_group;
+    const int n_groups = head_split ? n_head / heads_per_group : n_out_group;
+    const int group_first = head_split ? head_begin / heads_per_group : 0;
+    attn_out = ggml_reshape_3d(ctx, attn_out, group_dim, n_groups, block);
+    attn_out = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));  // [group_dim, block, n_groups]
     ggml_tensor * out_a_3d = ggml_reshape_3d(ctx, L.attn_output_a, group_dim, n_lora_o, n_out_group);
-    ggml_tensor * attn_low = ggml_mul_mat(ctx, out_a_3d, attn_out);      // [n_lora_o, block, n_out_group]
-    attn_low = ggml_cont(ctx, ggml_permute(ctx, attn_low, 0, 2, 1, 3));  // [n_lora_o, n_out_group, block]
-    attn_low = ggml_reshape_2d(ctx, attn_low, n_lora_o * n_out_group, block);
-    return ggml_mul_mat(ctx, L.attn_output_b, attn_low);                 // [n_embd, block]
+    if (head_split) {
+        out_a_3d = ggml_view_3d(ctx, out_a_3d, group_dim, n_lora_o, n_groups,
+                                out_a_3d->nb[1], out_a_3d->nb[2],
+                                (size_t) group_first * out_a_3d->nb[2]);
+    }
+    ggml_tensor * attn_low = ggml_mul_mat(ctx, out_a_3d, attn_out);      // [n_lora_o, block, n_groups]
+    attn_low = ggml_cont(ctx, ggml_permute(ctx, attn_low, 0, 2, 1, 3));  // [n_lora_o, n_groups, block]
+    attn_low = ggml_reshape_2d(ctx, attn_low, n_lora_o * n_groups, block);
+    ggml_tensor * out_b_w = head_split
+        ? ggml_view_2d(ctx, L.attn_output_b, (int64_t) n_lora_o * n_groups,
+                       L.attn_output_b->ne[1], L.attn_output_b->nb[1],
+                       ggml_row_size(L.attn_output_b->type, (int64_t) group_first * n_lora_o))
+        : L.attn_output_b;
+    return ggml_mul_mat(ctx, out_b_w, attn_low);                         // [n_embd, block]
+}
+
+// Cluster split MoE: the router and its top-k run on every rank; each rank
+// evaluates the routes that land on its experts (the others map to -1, which
+// the MoE MMVQ skips and the masked combine drops) plus its slice of the
+// shared expert. The result is this rank's partial of the FFN output.
+static ggml_tensor * build_dspark_moe_split(ggml_context * ctx,
+                                            ggml_tensor * cur,
+                                            const DeepSeek4Weights & w,
+                                            const DeepSeek4Layer & L,
+                                            int n_tokens,
+                                            ggml_tensor * expert_lut,    // I32 [1, n_expert, T]
+                                            ggml_tensor * expert_valid,  // F32 [1, n_expert, T]
+                                            int shexp_begin, int shexp_count) {
+    const int n_embd = w.n_embd;
+    const int n_ff_exp = w.n_ff_exp;
+    Ds4MoeRouting routing = build_moe_routing(ctx, cur, w, L, n_tokens, nullptr);
+    const int n_used = (int) routing.selected->ne[0];
+    ggml_tensor * local_ids = ggml_reshape_2d(
+        ctx, ggml_get_rows(ctx, expert_lut, routing.selected), n_used, n_tokens);
+    ggml_tensor * cur_3d = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
+    ggml_tensor * gate_e = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, local_ids);
+    ggml_tensor * up_e = ggml_mul_mat_id(ctx, L.ffn_up_exps, cur_3d, local_ids);
+    ggml_mul_mat_set_mixed_mmq(gate_e, w.mixed_mmq_policy);
+    ggml_mul_mat_set_mixed_mmq(up_e, w.mixed_mmq_policy);
+    gate_e = ggml_reshape_3d(ctx, gate_e, n_ff_exp, n_used, n_tokens);
+    up_e = ggml_reshape_3d(ctx, up_e, n_ff_exp, n_used, n_tokens);
+    ggml_tensor * mid_e = build_clamped_swiglu(ctx, gate_e, up_e, w.swiglu_clamp_exp);
+    ggml_tensor * down_e = ggml_mul_mat_id(ctx, L.ffn_down_exps, mid_e, local_ids);
+    ggml_mul_mat_set_mixed_mmq(down_e, w.mixed_mmq_policy);
+    down_e = ggml_reshape_3d(ctx, down_e, n_embd, n_used, n_tokens);
+    ggml_tensor * routed = ggml_moe_combine_masked(ctx, down_e, routing.weights, expert_valid,
+                                                   routing.selected);
+    ggml_tensor * shared = build_shared_ffn_slice(ctx, cur, w, L, shexp_begin, shexp_count);
+    return ggml_add(ctx, routed, shared);
 }
 
 // Read a small F32 GPU tensor (HC scale, [k]) into host floats.
@@ -12517,119 +13359,164 @@ namespace {
 // committed target-feature columns are projected on the draft GPU; the final
 // normed+RoPE KV window is small enough (<1 MiB at n_swa=128) to retain in a
 // host-side ring and upload as one compact draft-graph input.
-struct DsparkContextKvProjector {
+// One projection graph for a given count of new columns.
+struct DsparkContextKvGraph {
     int n_cols = -1;
-    const void * drafter = nullptr;
-    ggml_backend_t backend = nullptr;
-    std::vector<uint8_t> arena;
     ggml_context * ctx = nullptr;
     ggml_gallocr_t alloc = nullptr;
     ggml_cgraph * gf = nullptr;
     ggml_tensor * inp_features = nullptr;
     ggml_tensor * positions = nullptr;
-    ggml_tensor * out = nullptr;
+    ggml_tensor * out = nullptr;   // [head_dim, n_cols, n_layer]
+    void release() {
+        if (alloc) ggml_gallocr_free(alloc);
+        if (ctx) ggml_free(ctx);
+        *this = DsparkContextKvGraph{};
+    }
+};
+
+struct DsparkContextKvProjector {
+    const void * drafter = nullptr;
+    ggml_backend_t backend = nullptr;
+    // A step projects accepted + 1 new columns, so the count changes from step
+    // to step: one graph per count (slot = n_cols for 1..7, slot 0 for larger
+    // counts such as the first full-window projection) instead of rebuilding
+    // and re-planning one graph whenever the count differs from the last.
+    static constexpr int kGraphSlots = 8;
+    DsparkContextKvGraph graphs[kGraphSlots];
 
     int end_pos = -1;
     int valid = 0;
     std::vector<float> host_kv;
     std::vector<float> projected;
+    PinnedStage stage;   // inputs and the readback of one projection
+
+    // The window stays on the draft device (LUCE_DS4_DRAFT_DEVICE_CONTEXT),
+    // [head_dim, n_swa, n_layer] F32 with the valid rows end-aligned (the
+    // layout the draft graph reads), double-buffered so each step's shift and
+    // append is one batched copy from one buffer into the other.
+    ggml_context * win_ctx = nullptr;
+    ggml_backend_buffer_t win_buf = nullptr;
+    ggml_tensor * win[2] = {nullptr, nullptr};
+    int win_cur = 0;
+    void release() {
+        for (DsparkContextKvGraph & g : graphs) g.release();
+        if (win_buf) ggml_backend_buffer_free(win_buf);
+        if (win_ctx) ggml_free(win_ctx);
+        *this = DsparkContextKvProjector{};
+    }
 };
+
+// Default on; LUCE_DS4_DRAFT_DEVICE_CONTEXT=0 keeps the host-side window.
+static bool dspark_device_context_enabled() {
+    static const bool on = [] {
+        const char * v = std::getenv("LUCE_DS4_DRAFT_DEVICE_CONTEXT");
+        return !(v && v[0] == '0' && v[1] == '\0');
+    }();
+    return on;
+}
 
 thread_local DsparkContextKvProjector g_dspark_ctx_kv;
 
+// Projects n_cols new feature columns to the drafter's per-layer context K/V.
+// out != null: read the [head_dim, n_cols, n_layer] result back (one wait).
+// out == null: leave it on the device in *dev_out, queued on backend's stream.
 static bool dspark_project_context_columns(
         ggml_backend_t backend,
         const DSparkDrafter & d,
         const float * features,
         int n_cols,
         int first_pos,
-        std::vector<float> & out) {
+        std::vector<float> * out,
+        ggml_tensor ** dev_out = nullptr) {
     if (!backend || !features || n_cols <= 0) return false;
     const DeepSeek4Weights & w = d.core;
     const int n_embd = w.n_embd;
     const int fc_in = d.n_target_layers * n_embd;
     const int head_dim = w.head_dim;
     DsparkContextKvProjector & P = g_dspark_ctx_kv;
+    if (P.drafter != (const void *) &d || P.backend != backend) {
+        for (DsparkContextKvGraph & g : P.graphs) g.release();
+        P.drafter = (const void *) &d;
+        P.backend = backend;
+    }
+    DsparkContextKvGraph & G =
+        P.graphs[n_cols < DsparkContextKvProjector::kGraphSlots ? n_cols : 0];
 
-    if (!P.ctx || P.n_cols != n_cols || P.drafter != (const void *) &d ||
-        P.backend != backend) {
-        if (P.alloc && P.backend != backend) {
-            ggml_gallocr_free(P.alloc);
-            P.alloc = nullptr;
-        }
-        if (P.ctx) {
-            ggml_free(P.ctx);
-            P.ctx = nullptr;
-        }
-        P.gf = nullptr;
-        P.inp_features = nullptr;
-        P.positions = nullptr;
-        P.out = nullptr;
-        if (P.arena.empty()) P.arena.resize(32u * 1024 * 1024);
+    if (!G.ctx || G.n_cols != n_cols) {
+        G.release();
         ggml_init_params ip{};
-        ip.mem_size = P.arena.size();
-        ip.mem_buffer = P.arena.data();
+        ip.mem_size = ggml_tensor_overhead() * 512 + ggml_graph_overhead_custom(4096, false);
+        ip.mem_buffer = nullptr;
         ip.no_alloc = true;
-        P.ctx = ggml_init(ip);
-        if (!P.ctx) return false;
-        P.gf = ggml_new_graph_custom(P.ctx, 4096, false);
-        P.inp_features = ggml_new_tensor_2d(
-            P.ctx, GGML_TYPE_F32, fc_in, n_cols);
-        ggml_set_input(P.inp_features);
-        P.positions = ggml_new_tensor_1d(
-            P.ctx, GGML_TYPE_I32, n_cols);
-        ggml_set_input(P.positions);
+        G.ctx = ggml_init(ip);
+        if (!G.ctx) return false;
+        G.gf = ggml_new_graph_custom(G.ctx, 4096, false);
+        G.inp_features = ggml_new_tensor_2d(
+            G.ctx, GGML_TYPE_F32, fc_in, n_cols);
+        ggml_set_input(G.inp_features);
+        G.positions = ggml_new_tensor_1d(
+            G.ctx, GGML_TYPE_I32, n_cols);
+        ggml_set_input(G.positions);
 
         ggml_tensor * feature_norm =
-            ggml_rms_norm(P.ctx, P.inp_features, w.rms_eps);
+            ggml_rms_norm(G.ctx, G.inp_features, w.rms_eps);
         ggml_tensor * main_x = build_rms_norm(
-            P.ctx, ggml_mul_mat(P.ctx, d.main_proj, feature_norm),
+            G.ctx, ggml_mul_mat(G.ctx, d.main_proj, feature_norm),
             d.main_norm, w.rms_eps);
         ggml_tensor * stacked = nullptr;
         for (int il = 0; il < w.n_layer; ++il) {
             const DeepSeek4Layer & L = w.layers[(size_t) il];
             ggml_tensor * kv = build_rms_norm(
-                P.ctx, ggml_mul_mat(P.ctx, L.attn_kv, main_x),
+                G.ctx, ggml_mul_mat(G.ctx, L.attn_kv, main_x),
                 L.attn_kv_a_norm, w.rms_eps);
             kv = build_tail_rope_2d(
-                P.ctx, kv, P.positions, w.n_rot, head_dim, n_cols,
+                G.ctx, kv, G.positions, w.n_rot, head_dim, n_cols,
                 w.rope_freq_base, 1.0f, 0.0f, 1.0f,
                 w.rope_yarn_beta_fast, w.rope_yarn_beta_slow,
                 (int) w.rope_orig_ctx);
-            kv = ggml_reshape_3d(P.ctx, kv, head_dim, n_cols, 1);
-            stacked = stacked ? ggml_concat(P.ctx, stacked, kv, 2) : kv;
+            kv = ggml_reshape_3d(G.ctx, kv, head_dim, n_cols, 1);
+            stacked = stacked ? ggml_concat(G.ctx, stacked, kv, 2) : kv;
         }
-        P.out = ggml_cont(P.ctx, stacked);
-        ggml_set_output(P.out);
-        ggml_build_forward_expand(P.gf, P.out);
-        if (!P.alloc) {
-            P.alloc = ggml_gallocr_new(
-                ggml_backend_get_default_buffer_type(backend));
-        }
-        if (!P.alloc || !ggml_gallocr_alloc_graph(P.alloc, P.gf)) {
-            ggml_free(P.ctx);
-            P.ctx = nullptr;
-            P.gf = nullptr;
+        G.out = ggml_cont(G.ctx, stacked);
+        ggml_set_output(G.out);
+        ggml_build_forward_expand(G.gf, G.out);
+        G.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!G.alloc || !ggml_gallocr_alloc_graph(G.alloc, G.gf)) {
+            G.release();
             return false;
         }
-        P.n_cols = n_cols;
-        P.drafter = (const void *) &d;
-        P.backend = backend;
+        G.n_cols = n_cols;
     }
 
-    ggml_backend_tensor_set(
-        P.inp_features, features, 0,
-        sizeof(float) * (size_t) fc_in * n_cols);
+    // Inputs and the readback go through pinned slices: one wait in all.
+    const size_t in_bytes = sizeof(float) * (size_t) fc_in * n_cols;
+    const size_t out_bytes = sizeof(float) * (size_t) head_dim * n_cols * w.n_layer;
+    const bool pinned = ds4_pinned_step_io_enabled() &&
+        P.stage.reserve(backend, in_bytes + out_bytes + sizeof(int32_t) * (size_t) n_cols + 4096);
+    P.stage.reset();
     std::vector<int32_t> pos((size_t) n_cols);
     for (int i = 0; i < n_cols; ++i) pos[(size_t) i] = first_pos + i;
-    ggml_backend_tensor_set(
-        P.positions, pos.data(), 0, sizeof(int32_t) * pos.size());
-    if (ggml_backend_graph_compute(backend, P.gf) != GGML_STATUS_SUCCESS) {
+    if (pinned) {
+        P.stage.set(backend, G.inp_features, features, 0, in_bytes);
+        P.stage.set(backend, G.positions, pos.data(), 0, sizeof(int32_t) * pos.size());
+    } else {
+        ggml_backend_tensor_set(G.inp_features, features, 0, in_bytes);
+        ggml_backend_tensor_set(G.positions, pos.data(), 0, sizeof(int32_t) * pos.size());
+    }
+    if (ggml_backend_graph_compute_async(backend, G.gf) != GGML_STATUS_SUCCESS) {
+        ggml_backend_synchronize(backend);
         return false;
     }
-    out.resize((size_t) head_dim * n_cols * w.n_layer);
-    ggml_backend_tensor_get(
-        P.out, out.data(), 0, sizeof(float) * out.size());
+    if (!out) {
+        if (dev_out) *dev_out = G.out;
+        return true;
+    }
+    out->resize((size_t) head_dim * n_cols * w.n_layer);
+    const void * src = pinned ? P.stage.get(backend, G.out, 0, out_bytes) : nullptr;
+    ggml_backend_synchronize(backend);
+    if (src) std::memcpy(out->data(), src, out_bytes);
+    else ggml_backend_tensor_get(G.out, out->data(), 0, out_bytes);
     return true;
 }
 
@@ -12639,12 +13526,82 @@ static bool dspark_update_context_kv_cache(
         const float * ctx_features,
         int ctx_len,
         int committed,
-        const std::vector<float> ** out_host_kv) {
+        const std::vector<float> ** out_host_kv,
+        ggml_tensor ** out_dev_kv = nullptr) {
     const DeepSeek4Weights & w = d.core;
     const int n_swa = w.n_swa;
     const int head_dim = w.head_dim;
     const int fc_in = d.n_target_layers * w.n_embd;
     DsparkContextKvProjector & P = g_dspark_ctx_kv;
+    if (out_dev_kv && dspark_device_context_enabled() && ctx_len > 0) {
+        if (!ctx_features || ctx_len > n_swa) return false;
+        // Two device windows, valid rows end-aligned. Zeroed when (re)made;
+        // the valid span only grows until it fills, so the rows ahead of it
+        // stay zero in both buffers.
+        if (!P.win_buf || P.backend != backend || P.drafter != (const void *) &d) {
+            if (P.win_buf) ggml_backend_buffer_free(P.win_buf);
+            if (P.win_ctx) ggml_free(P.win_ctx);
+            P.win_buf = nullptr; P.win_ctx = nullptr; P.win[0] = P.win[1] = nullptr;
+            ggml_init_params ip{};
+            ip.mem_size = ggml_tensor_overhead() * 4;
+            ip.mem_buffer = nullptr;
+            ip.no_alloc = true;
+            P.win_ctx = ggml_init(ip);
+            if (!P.win_ctx) return false;
+            for (int b = 0; b < 2; ++b) {
+                P.win[b] = ggml_new_tensor_3d(P.win_ctx, GGML_TYPE_F32, head_dim, n_swa, w.n_layer);
+            }
+            P.win_buf = ggml_backend_alloc_ctx_tensors(P.win_ctx, backend);
+            if (!P.win_buf) return false;
+            P.end_pos = -1;   // force the full projection below
+        }
+        int n_new = committed - P.end_pos;
+        const bool rebuild =
+            P.drafter != (const void *) &d || P.backend != backend ||
+            P.end_pos < 0 || n_new <= 0 || n_new > ctx_len ||
+            std::min(n_swa, P.valid + n_new) != ctx_len;
+        if (rebuild) {
+            ggml_backend_buffer_clear(P.win_buf, 0);
+            P.win_cur = 0;
+            P.valid = 0;
+            n_new = ctx_len;
+        }
+        const int first_new_pos = committed - n_new;
+        const float * new_features = ctx_features + (size_t) (ctx_len - n_new) * fc_in;
+        ggml_tensor * projected = nullptr;
+        if (!dspark_project_context_columns(backend, d, new_features, n_new, first_new_pos,
+                                            nullptr, &projected) || !projected) {
+            return false;
+        }
+        const int keep = std::max(0, std::min(P.valid, n_swa - n_new));
+        const int valid_next = keep + n_new;
+        const size_t row = sizeof(float) * (size_t) head_dim;
+        const uint8_t * src = (const uint8_t *) P.win[P.win_cur]->data;
+        uint8_t * dst = (uint8_t *) P.win[1 - P.win_cur]->data;
+        const uint8_t * fresh = (const uint8_t *) projected->data;
+        std::vector<ggml_cuda_copy_desc> copies;
+        copies.reserve((size_t) w.n_layer * 2);
+        for (int il = 0; il < w.n_layer; ++il) {
+            const size_t layer = (size_t) il * (size_t) n_swa * row;
+            if (keep > 0) {
+                copies.push_back({src + layer + (size_t) (n_swa - keep) * row,
+                                  dst + layer + (size_t) (n_swa - valid_next) * row,
+                                  (size_t) keep * row});
+            }
+            copies.push_back({fresh + (size_t) il * (size_t) n_new * row,
+                              dst + layer + (size_t) (n_swa - n_new) * row,
+                              (size_t) n_new * row});
+        }
+        ggml_backend_cuda_copy_batch_async(backend, copies.data(), (int) copies.size());
+        P.win_cur = 1 - P.win_cur;
+        P.valid = valid_next;
+        P.end_pos = committed;
+        P.drafter = (const void *) &d;
+        if (P.valid != ctx_len) return false;
+        *out_dev_kv = P.win[P.win_cur];
+        *out_host_kv = nullptr;
+        return true;
+    }
     if (ctx_len <= 0) {
         P.end_pos = committed;
         P.valid = 0;
@@ -12671,7 +13628,7 @@ static bool dspark_update_context_kv_cache(
     const float * new_features =
         ctx_features + (size_t) (ctx_len - n_new) * fc_in;
     if (!dspark_project_context_columns(
-            backend, d, new_features, n_new, first_new_pos, P.projected)) {
+            backend, d, new_features, n_new, first_new_pos, &P.projected)) {
         return false;
     }
 
@@ -12722,8 +13679,13 @@ struct DsparkDraftCache {
     ggml_tensor * attn_mask = nullptr;
     ggml_tensor * out = nullptr;
     ggml_tensor * confidence_out = nullptr;
+    ggml_tensor * expert_lut = nullptr;     // cluster split: global -> local expert, -1 elsewhere
+    ggml_tensor * expert_valid = nullptr;   // cluster split: 1 for this rank's experts
+    std::vector<int32_t> host_expert_lut;
+    std::vector<float> host_expert_valid;
     std::vector<float> padded_ctx;
     std::vector<float> host_attn_mask;
+    PinnedStage stage;   // one forward's inputs and readbacks
     std::vector<std::pair<std::string, ggml_tensor *>> dbg_taps;
     // HC scales are immutable weights: read from the backend once.
     std::vector<std::array<float, 3>> s_attn, s_ffn;
@@ -12746,16 +13708,7 @@ void reset_deepseek4_dspark_runtime_cache() {
     }
     cache = DsparkDraftCache{};
 
-    DsparkContextKvProjector & projector = g_dspark_ctx_kv;
-    if (projector.alloc) {
-        ggml_gallocr_free(projector.alloc);
-        projector.alloc = nullptr;
-    }
-    if (projector.ctx) {
-        ggml_free(projector.ctx);
-        projector.ctx = nullptr;
-    }
-    projector = DsparkContextKvProjector{};
+    g_dspark_ctx_kv.release();
 }
 
 static bool deepseek4_dspark_draft_forward_impl(
@@ -12786,15 +13739,20 @@ static bool deepseek4_dspark_draft_forward_impl(
         : valid_ctx_len;
 
     const std::vector<float> * cached_host_kv = nullptr;
+    ggml_tensor * cached_dev_kv = nullptr;
     if (context_kv_cache && upload_context &&
         !dspark_update_context_kv_cache(
             backend, d, ctx_features, valid_ctx_len, committed,
-            &cached_host_kv)) {
+            &cached_host_kv, &cached_dev_kv)) {
         return false;
     }
 
     DsparkDraftCache & C = g_dspark_draft_cache;
     const bool DS4_DBG = std::getenv("LUCE_DS4_DSPARK_DEBUG") != nullptr;
+    // LUCE_CLUSTER_DRAFT_SPLIT: half the heads and this rank's experts, the
+    // partial sums all-reduced after the attention and after the FFN.
+    Ds4ClusterRuntime * split_rt = d.split_size > 1 ? (Ds4ClusterRuntime *) d.cluster_rt : nullptr;
+    const bool dspark_split = split_rt && split_rt->size() == d.split_size && d.expert_local > 0;
 
     // Context reuse is deliberately strict: never submit a graph with an
     // uninitialized or differently-shaped context tensor.  The normal warm
@@ -12878,6 +13836,16 @@ static bool deepseek4_dspark_draft_forward_impl(
         C.attn_mask = ggml_new_tensor_1d(
             ctx, GGML_TYPE_F32, graph_ctx_len + block);
         ggml_set_input(C.attn_mask);
+        C.expert_lut = nullptr;
+        C.expert_valid = nullptr;
+        if (dspark_split) {
+            C.expert_lut = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 1, w.n_expert, block);
+            ggml_set_input(C.expert_lut);
+            ggml_set_output(C.expert_lut);
+            C.expert_valid = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, w.n_expert, block);
+            ggml_set_input(C.expert_valid);
+            ggml_set_output(C.expert_valid);
+        }
 
         // main_x = main_norm(main_proj(ctx_features)).  Shared across layers.
         ggml_tensor * main_x = nullptr;
@@ -12896,53 +13864,54 @@ static bool deepseek4_dspark_draft_forward_impl(
             dbg_tap("main_x", main_x);
         }
 
-        // HC state: [n_embd, n_hc, block], init = block embeds replicated over streams.
+        // HC state: [n_embd*n_hc, block], init = block embeds replicated over
+        // streams. The HC kernels take a token axis, so every sub-block
+        // boundary is one batched launch per op over all block positions
+        // (the per-position arithmetic is unchanged: rows normalize, mix and
+        // post independently), instead of per-position ops joined by concats.
         ggml_tensor * noise3 = ggml_reshape_3d(ctx, C.inp_noise, n_embd, 1, block);
-        ggml_tensor * hc_cur = ggml_repeat_4d(ctx, noise3, n_embd, n_hc, block, 1);
+        ggml_tensor * hc_cur = ggml_reshape_2d(
+            ctx, ggml_repeat_4d(ctx, noise3, n_embd, n_hc, block, 1),
+            (int64_t) n_embd * n_hc, block);
 
-        auto hc_col = [&](ggml_tensor * hc, int p) -> ggml_tensor * {
-            // Contiguous [n_embd*n_hc] slab for block position p.
-            return ggml_view_1d(ctx, hc, (int64_t) n_embd * n_hc,
-                                (size_t) p * hc->nb[2]);
-        };
         // Staggered pre-mix (V4.1, see ds4_hc_collapse): each sub-block's
         // input collapses the HC copies with the previous sub-block's pre
         // coefficients; the first attention takes copy 0 (identity mix) and
-        // the head the last FFN's. prev_pre[p] is null before layer 0.
+        // the head the last FFN's. prev_pre is null before layer 0.
         const bool staggered = w.hc_staggered_pre;
-        std::vector<ggml_tensor *> prev_pre((size_t) block, nullptr);
-        auto hc_collapse = [&](ggml_tensor * hcf, ggml_tensor * pre) {
-            return ds4_build_hc_collapse(
-                ctx, ggml_reshape_2d(ctx, hcf, (int64_t) n_embd * n_hc, 1), pre, n_embd, n_hc);
+        ggml_tensor * prev_pre = nullptr;   // [n_hc, block]
+        ggml_tensor * flash_mask = nullptr;  // shared by the layers' flash attention
+        // HC pre of one sub-block: returns its input [n_embd, block] and the
+        // split [mix_dim, block] that its HC post consumes.
+        auto hc_pre_block = [&](ggml_tensor * fn, ggml_tensor * base_w,
+                                const std::array<float, 3> & s,
+                                ggml_tensor ** split_out) -> ggml_tensor * {
+            ggml_tensor * normed = ggml_rms_norm(ctx, hc_cur, hc_eps);
+            ggml_tensor * mix = ggml_mul_mat(ctx, fn, normed);        // [mix_dim, block]
+            ggml_tensor * base = ggml_reshape_1d(ctx, base_w, mix_dim);
+            ggml_tensor * pre = ggml_ds4_hc_pre(ctx, mix, base, hc_cur, n_hc,
+                                                w.n_hc_sinkhorn_iter, s[0], s[1], s[2]);
+            const size_t row = block > 1 ? pre->nb[1] : ggml_nbytes(pre);
+            *split_out = ggml_view_2d(ctx, pre, mix_dim, block, row,
+                                      (size_t) n_embd * sizeof(float));
+            if (staggered) {
+                ggml_tensor * in = ds4_build_hc_collapse(ctx, hc_cur, prev_pre, n_embd, n_hc);
+                prev_pre = ds4_hc_split_pre(ctx, *split_out, n_hc);
+                return in;
+            }
+            return ggml_cont(ctx, ggml_view_2d(ctx, pre, n_embd, block, row, 0));
         };
-        auto split_pre = [&](ggml_tensor * split) {
-            return ds4_hc_split_pre(ctx, split, n_hc);
+        auto hc_post_block = [&](ggml_tensor * block_out, ggml_tensor * split) {
+            ggml_tensor * hp = ggml_ds4_hc_post(ctx, hc_cur, block_out, split, n_hc);
+            return ggml_reshape_2d(ctx, hp, (int64_t) n_embd * n_hc, block);
         };
 
         for (int il = 0; il < w.n_layer; il++) {
             const DeepSeek4Layer & L = w.layers[il];
 
-            // ── HC pre (attention), per block position ──────────────────
-            std::vector<ggml_tensor *> split_attn(block), work_cols(block);
-            for (int p = 0; p < block; p++) {
-                ggml_tensor * hcf = hc_col(hc_cur, p);
-                ggml_tensor * normed = ggml_rms_norm(ctx, hcf, hc_eps);
-                ggml_tensor * mix = ggml_mul_mat(ctx, L.hc_attn_fn, normed);
-                mix = ggml_reshape_1d(ctx, mix, mix_dim);
-                ggml_tensor * base = ggml_reshape_1d(ctx, L.hc_attn_base, mix_dim);
-                ggml_tensor * pre = ggml_ds4_hc_pre(ctx, mix, base, hcf, n_hc,
-                                                    w.n_hc_sinkhorn_iter,
-                                                    C.s_attn[il][0], C.s_attn[il][1], C.s_attn[il][2]);
-                split_attn[p] = ggml_view_1d(ctx, pre, mix_dim, (size_t) n_embd * sizeof(float));
-                if (staggered) {
-                    work_cols[p] = hc_collapse(hcf, prev_pre[(size_t) p]);
-                    prev_pre[(size_t) p] = split_pre(split_attn[p]);
-                } else {
-                    work_cols[p] = ggml_reshape_2d(ctx, ggml_view_1d(ctx, pre, n_embd, 0), n_embd, 1);
-                }
-            }
-            ggml_tensor * attn_in = work_cols[0];
-            for (int p = 1; p < block; p++) attn_in = ggml_concat(ctx, attn_in, work_cols[p], 1);
+            // ── HC pre (attention) ──────────────────────────────────────
+            ggml_tensor * split_attn = nullptr;
+            ggml_tensor * attn_in = hc_pre_block(L.hc_attn_fn, L.hc_attn_base, C.s_attn[il], &split_attn);
             ggml_tensor * attn_normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
             ggml_tensor * layer_ctx_kv = nullptr;
             if (context_kv_cache && graph_ctx_len > 0) {
@@ -12951,85 +13920,64 @@ static bool deepseek4_dspark_draft_forward_impl(
                     C.inp_ctx_kv->nb[1],
                     (size_t) il * C.inp_ctx_kv->nb[2]);
             }
+            const int split_heads = dspark_split ? w.n_head / d.split_size : 0;
             ggml_tensor * attn_out = build_dspark_attention(
                                                             ctx, attn_normed, main_x,
                                                             layer_ctx_kv, w, L,
                                                             graph_ctx_len, C.pos_block,
                                                             C.neg_block, C.pos_ctx,
-                                                            C.attn_mask, d.flash_attention);
+                                                            C.attn_mask, d.flash_attention,
+                                                            &flash_mask,
+                                                            d.split_rank * split_heads, split_heads);
+            if (dspark_split) {
+                attn_out = ds4_cluster_allreduce_node(ctx, attn_out, *split_rt, /*inplace=*/true);
+                if (!attn_out) { ggml_free(C.ctx); C.ctx = nullptr; C.gf = nullptr; return false; }
+            }
             dbg_tap(std::string("attn_L") + std::to_string(il), attn_out);
-            // ── HC post (attention), per block position ─────────────────
-            ggml_tensor * hc_next = nullptr;
-            for (int p = 0; p < block; p++) {
-                ggml_tensor * bo = ggml_view_1d(ctx, attn_out, n_embd, (size_t) p * attn_out->nb[1]);
-                ggml_tensor * hp = ggml_ds4_hc_post(ctx, hc_col(hc_cur, p), bo, split_attn[p], n_hc);
-                hp = ggml_reshape_3d(ctx, hp, n_embd, n_hc, 1);
-                hc_next = hc_next ? ggml_concat(ctx, hc_next, hp, 2) : hp;
-            }
-            hc_cur = ggml_cont(ctx, hc_next);
+            // ── HC post (attention) ─────────────────────────────────────
+            hc_cur = hc_post_block(attn_out, split_attn);
 
-            // ── HC pre (FFN), per block position ────────────────────────
-            std::vector<ggml_tensor *> split_ffn(block), fwork(block);
-            for (int p = 0; p < block; p++) {
-                ggml_tensor * hcf = hc_col(hc_cur, p);
-                ggml_tensor * normed = ggml_rms_norm(ctx, hcf, hc_eps);
-                ggml_tensor * mix = ggml_mul_mat(ctx, L.hc_ffn_fn, normed);
-                mix = ggml_reshape_1d(ctx, mix, mix_dim);
-                ggml_tensor * base = ggml_reshape_1d(ctx, L.hc_ffn_base, mix_dim);
-                ggml_tensor * pre = ggml_ds4_hc_pre(ctx, mix, base, hcf, n_hc,
-                                                    w.n_hc_sinkhorn_iter,
-                                                    C.s_ffn[il][0], C.s_ffn[il][1], C.s_ffn[il][2]);
-                split_ffn[p] = ggml_view_1d(ctx, pre, mix_dim, (size_t) n_embd * sizeof(float));
-                if (staggered) {
-                    fwork[p] = hc_collapse(hcf, prev_pre[(size_t) p]);
-                    prev_pre[(size_t) p] = split_pre(split_ffn[p]);
-                } else {
-                    fwork[p] = ggml_reshape_2d(ctx, ggml_view_1d(ctx, pre, n_embd, 0), n_embd, 1);
-                }
-            }
-            ggml_tensor * ffn_in = fwork[0];
-            for (int p = 1; p < block; p++) ffn_in = ggml_concat(ctx, ffn_in, fwork[p], 1);
+            // ── HC pre (FFN) ────────────────────────────────────────────
+            ggml_tensor * split_ffn = nullptr;
+            ggml_tensor * ffn_in = hc_pre_block(L.hc_ffn_fn, L.hc_ffn_base, C.s_ffn[il], &split_ffn);
             ggml_tensor * ffn_normed = build_rms_norm(ctx, ffn_in, L.ffn_norm, w.rms_eps);
-            ggml_tensor * ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, block);
+            ggml_tensor * ffn_out = nullptr;
+            if (dspark_split) {
+                const int shexp_ff = L.ffn_gate_shexp ? (int) L.ffn_gate_shexp->ne[1] : 0;
+                const int shexp_count = shexp_ff / d.split_size;
+                ffn_out = build_dspark_moe_split(ctx, ffn_normed, w, L, block, C.expert_lut,
+                                                 C.expert_valid, d.split_rank * shexp_count,
+                                                 shexp_count);
+                if (ffn_out) {
+                    ffn_out = ds4_cluster_allreduce_node(ctx, ffn_out, *split_rt, /*inplace=*/true);
+                }
+            } else {
+                ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, block);
+            }
             if (!ffn_out) { ggml_free(C.ctx); C.ctx = nullptr; C.gf = nullptr; return false; }
             dbg_tap(std::string("ffn_L") + std::to_string(il), ffn_out);
             // ── HC post (FFN) ───────────────────────────────────────────
-            hc_next = nullptr;
-            for (int p = 0; p < block; p++) {
-                ggml_tensor * bo = ggml_view_1d(ctx, ffn_out, n_embd, (size_t) p * ffn_out->nb[1]);
-                ggml_tensor * hp = ggml_ds4_hc_post(ctx, hc_col(hc_cur, p), bo, split_ffn[p], n_hc);
-                hp = ggml_reshape_3d(ctx, hp, n_embd, n_hc, 1);
-                hc_next = hc_next ? ggml_concat(ctx, hc_next, hp, 2) : hp;
-            }
-            hc_cur = ggml_cont(ctx, hc_next);
+            hc_cur = hc_post_block(ggml_is_contiguous(ffn_out) ? ffn_out : ggml_cont(ctx, ffn_out),
+                                   split_ffn);
             dbg_tap(std::string("hcL") + std::to_string(il), hc_cur);
         }
 
-        // ── Tail: hc_head collapse -> out_norm, per block position ──────
+        // ── Tail: hc_head collapse -> out_norm ──────────────────────────
         // The tied lm_head consumes the normalized state. The confidence head
         // was trained on the HC-collapsed state before this output RMSNorm, so
         // keep both instead of reusing the normalized state for confidence.
-        ggml_tensor * out = nullptr;
-        ggml_tensor * confidence_out = nullptr;
-        for (int p = 0; p < block; p++) {
-            ggml_tensor * hcf = hc_col(hc_cur, p);
-            ggml_tensor * final_2d = nullptr;
-            if (staggered) {
-                final_2d = hc_collapse(hcf, prev_pre[(size_t) p]);
-            } else {
-                ggml_tensor * onorm = ggml_rms_norm(ctx, hcf, hc_eps);
-                ggml_tensor * omix = ggml_mul_mat(ctx, w.output_hc_fn, onorm);
-                omix = ggml_reshape_1d(ctx, omix, n_hc);
-                ggml_tensor * obase = ggml_reshape_1d(ctx, w.output_hc_base, n_hc);
-                ggml_tensor * final_embd = ggml_ds4_hc_out(ctx, omix, obase, hcf, n_hc, C.s_out);
-                final_2d = ggml_reshape_2d(ctx, final_embd, n_embd, 1);
-            }
-            ggml_tensor * hidden_p = build_rms_norm(ctx, final_2d, w.out_norm, w.rms_eps);
-            out = out ? ggml_concat(ctx, out, hidden_p, 1) : hidden_p;
-            confidence_out = confidence_out
-                           ? ggml_concat(ctx, confidence_out, final_2d, 1)
-                           : final_2d;
+        ggml_tensor * final_2d = nullptr;
+        if (staggered) {
+            final_2d = ds4_build_hc_collapse(ctx, hc_cur, prev_pre, n_embd, n_hc);
+        } else {
+            ggml_tensor * onorm = ggml_rms_norm(ctx, hc_cur, hc_eps);
+            ggml_tensor * omix = ggml_mul_mat(ctx, w.output_hc_fn, onorm);   // [n_hc, block]
+            ggml_tensor * obase = ggml_reshape_1d(ctx, w.output_hc_base, n_hc);
+            ggml_tensor * final_embd = ggml_ds4_hc_out(ctx, omix, obase, hc_cur, n_hc, C.s_out);
+            final_2d = ggml_reshape_2d(ctx, final_embd, n_embd, block);
         }
+        ggml_tensor * out = build_rms_norm(ctx, final_2d, w.out_norm, w.rms_eps);
+        ggml_tensor * confidence_out = final_2d;
         ggml_set_output(out);
         ggml_set_output(confidence_out);
         ggml_build_forward_expand(gf, out);
@@ -13059,10 +14007,34 @@ static bool deepseek4_dspark_draft_forward_impl(
     }
 
     // ── Set inputs + compute (cached graph) ─────────────────────────────
-    ggml_backend_tensor_set(C.inp_noise, noise_embed, 0, sizeof(float) * (size_t) n_embd * block);
+    // Every upload and readback of the forward goes through pinned slices,
+    // so it costs one wait instead of a round trip per tensor.
+    const bool pinned_io = ds4_pinned_step_io_enabled() &&
+        C.stage.reserve(backend,
+            (C.inp_noise ? ggml_nbytes(C.inp_noise) : 0) +
+            (C.inp_ctx ? ggml_nbytes(C.inp_ctx) : 0) +
+            (C.inp_ctx_kv ? ggml_nbytes(C.inp_ctx_kv) : 0) +
+            (C.pos_ctx ? ggml_nbytes(C.pos_ctx) : 0) +
+            (C.attn_mask ? ggml_nbytes(C.attn_mask) : 0) +
+            (C.expert_lut ? ggml_nbytes(C.expert_lut) + ggml_nbytes(C.expert_valid) : 0) +
+            2 * (C.out ? ggml_nbytes(C.out) : 0) + 8192);
+    C.stage.reset();
+    const auto set_in = [&](ggml_tensor * t, const void * data, size_t bytes) {
+        if (pinned_io) C.stage.set(backend, t, data, 0, bytes);
+        else ggml_backend_tensor_set(t, data, 0, bytes);
+    };
+    set_in(C.inp_noise, noise_embed, sizeof(float) * (size_t) n_embd * block);
     if (upload_context) {
         if (graph_ctx_len > 0) {
-            if (context_kv_cache) {
+            if (context_kv_cache && cached_dev_kv) {
+                // The device window is already in the input's layout
+                // (graph_ctx_len == n_swa, valid rows end-aligned).
+                if (graph_ctx_len != w.n_swa ||
+                    ggml_nbytes(cached_dev_kv) != ggml_nbytes(C.inp_ctx_kv)) return false;
+                const ggml_cuda_copy_desc to_input{cached_dev_kv->data, C.inp_ctx_kv->data,
+                                                   ggml_nbytes(cached_dev_kv)};
+                ggml_backend_cuda_copy_batch_async(backend, &to_input, 1);
+            } else if (context_kv_cache) {
                 if (!cached_host_kv) return false;
                 const int head_dim = w.head_dim;
                 const int source_stride = w.n_swa * head_dim;
@@ -13081,9 +14053,7 @@ static bool deepseek4_dspark_draft_forward_impl(
                     }
                     upload = C.padded_ctx.data();
                 }
-                ggml_backend_tensor_set(
-                    C.inp_ctx_kv, upload, 0,
-                    sizeof(float) * (size_t) w.n_layer *
+                set_in(C.inp_ctx_kv, upload, sizeof(float) * (size_t) w.n_layer *
                         graph_ctx_len * head_dim);
             } else {
                 const float * upload = ctx_features;
@@ -13099,16 +14069,12 @@ static bool deepseek4_dspark_draft_forward_impl(
                     upload = C.padded_ctx.data();
                 }
                 if (!upload) return false;
-                ggml_backend_tensor_set(
-                    C.inp_ctx, upload, 0,
-                    sizeof(float) * (size_t) fc_in * graph_ctx_len);
+                set_in(C.inp_ctx, upload, sizeof(float) * (size_t) fc_in * graph_ctx_len);
                 std::vector<int32_t> pc(graph_ctx_len);
                 for (int i = 0; i < graph_ctx_len; i++) {
                     pc[i] = committed - graph_ctx_len + i;
                 }
-                ggml_backend_tensor_set(
-                    C.pos_ctx, pc.data(), 0,
-                    sizeof(int32_t) * graph_ctx_len);
+                set_in(C.pos_ctx, pc.data(), sizeof(int32_t) * graph_ctx_len);
             }
         }
         C.host_attn_mask.assign((size_t) graph_ctx_len + block, 0.0f);
@@ -13117,15 +14083,29 @@ static bool deepseek4_dspark_draft_forward_impl(
             C.host_attn_mask[(size_t)i] =
                 -std::numeric_limits<float>::infinity();
         }
-        ggml_backend_tensor_set(
-            C.attn_mask, C.host_attn_mask.data(), 0,
-            sizeof(float) * C.host_attn_mask.size());
+        set_in(C.attn_mask, C.host_attn_mask.data(), sizeof(float) * C.host_attn_mask.size());
         C.valid_ctx_len = valid_ctx_len;
     }
     std::vector<int32_t> pb(block), nb(block);
     for (int i = 0; i < block; i++) { pb[i] = committed + i; nb[i] = -(committed + i); }
-    ggml_backend_tensor_set(C.pos_block, pb.data(), 0, sizeof(int32_t) * block);
-    ggml_backend_tensor_set(C.neg_block, nb.data(), 0, sizeof(int32_t) * block);
+    set_in(C.pos_block, pb.data(), sizeof(int32_t) * block);
+    set_in(C.neg_block, nb.data(), sizeof(int32_t) * block);
+    if (C.expert_lut && C.expert_valid) {
+        const int n_expert = w.n_expert;
+        if (C.host_expert_lut.size() != (size_t) n_expert * block) {
+            C.host_expert_lut.resize((size_t) n_expert * block);
+            C.host_expert_valid.resize((size_t) n_expert * block);
+            for (int t = 0; t < block; ++t) {
+                for (int e = 0; e < n_expert; ++e) {
+                    const bool local = e >= d.expert_first && e < d.expert_first + d.expert_local;
+                    C.host_expert_lut[(size_t) t * n_expert + e] = local ? e - d.expert_first : -1;
+                    C.host_expert_valid[(size_t) t * n_expert + e] = local ? 1.0f : 0.0f;
+                }
+            }
+        }
+        set_in(C.expert_lut, C.host_expert_lut.data(), sizeof(int32_t) * C.host_expert_lut.size());
+        set_in(C.expert_valid, C.host_expert_valid.data(), sizeof(float) * C.host_expert_valid.size());
+    }
 
     // This cache owns a single immutable graph: topology, tensor addresses,
     // and shapes remain fixed until the cache is explicitly rebuilt above.
@@ -13141,23 +14121,31 @@ static bool deepseek4_dspark_draft_forward_impl(
         /*disable_graphs=*/false,
         /*mmvq_max_ncols=*/0,
         /*skip_property_check=*/force_graph_replay);
-    const ggml_status st = out_hidden
-        ? ggml_backend_graph_compute(backend, C.gf)
-        : ggml_backend_graph_compute_async(backend, C.gf);
+    const ggml_status st = ggml_backend_graph_compute_async(backend, C.gf);
     if (st != GGML_STATUS_SUCCESS) {
+        ggml_backend_synchronize(backend);
         // Invalidate: a failed compute leaves no reusable state guarantees.
         ggml_free(C.ctx); C.ctx = nullptr; C.gf = nullptr; C.ctx_len = -1;
         return false;
     }
-    if (!out_hidden) return true;
+    if (!out_hidden) {
+        // The async probe path keeps the pinned inputs until it waits.
+        if (pinned_io) ggml_backend_synchronize(backend);
+        return true;
+    }
 
+    const size_t hidden_bytes = sizeof(float) * (size_t) n_embd * block;
     out_hidden->resize((size_t) n_embd * block);
-    ggml_backend_tensor_get(
-        C.out, out_hidden->data(), 0, sizeof(float) * out_hidden->size());
+    if (confidence_hidden) confidence_hidden->resize((size_t) n_embd * block);
+    const void * hidden_src = pinned_io ? C.stage.get(backend, C.out, 0, hidden_bytes) : nullptr;
+    const void * conf_src = pinned_io && confidence_hidden
+        ? C.stage.get(backend, C.confidence_out, 0, hidden_bytes) : nullptr;
+    ggml_backend_synchronize(backend);
+    if (hidden_src) std::memcpy(out_hidden->data(), hidden_src, hidden_bytes);
+    else ggml_backend_tensor_get(C.out, out_hidden->data(), 0, hidden_bytes);
     if (confidence_hidden) {
-        confidence_hidden->resize((size_t) n_embd * block);
-        ggml_backend_tensor_get(C.confidence_out, confidence_hidden->data(), 0,
-                                sizeof(float) * confidence_hidden->size());
+        if (conf_src) std::memcpy(confidence_hidden->data(), conf_src, hidden_bytes);
+        else ggml_backend_tensor_get(C.confidence_out, confidence_hidden->data(), 0, hidden_bytes);
     }
 
     if (DS4_DBG) {
