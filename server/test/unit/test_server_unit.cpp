@@ -5573,12 +5573,14 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_qsa_batch_boundary) {
     TEST_ASSERT(qwen4exp_can_batch(w, spans, 2, true)); // 512 blocks + 3 tail tokens
     spans[1].pos0 = 2051;
     TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, true)); // first 513th block, before executing
+    TEST_ASSERT(qwen4exp_can_batch(w, spans, 2, true, true)); // stable QSA rows join the batch
     TEST_ASSERT(qwen4exp_can_batch(w, spans, 2, false)); // generic device, QSA off
     std::swap(spans[0], spans[1]);
     TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, true)); // any slot, independent of order
     spans[0].pos0 = 16;
     spans[0].n_tokens = 512;
     TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, true)); // prefill always runs solo
+    TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, true, true));
     TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, false));
     spans[0].n_tokens = 1;
     Qwen4ExpForwardSegment rows[5] = {spans[0], spans[1], spans[0], spans[1], spans[0]};

@@ -87,6 +87,7 @@ private:
     GenerateResult run(const GenerateRequest & req, const DaemonIO & io, int restored, int restore_slot = -1);
     bool snapshot_save_replacing(int slot, int source);
     bool snapshot_fits(int slot, int replaced = -1) const;
+    bool create_main_cache();
     bool start_seq_engine(); // no-op at --max-concurrency 1
     // Weights, caches, hot experts, the prefill chunk and the prefix allowance, then the slot engine: init and
     // unpark share it, so an unpark sizes itself for the memory free at that time. release_target() undoes it.
@@ -101,6 +102,7 @@ private:
     ggml_backend_t        backend_ = nullptr;
     Qwen4ExpWeights       weights_;
     Qwen4ExpCache         cache_;
+    Qwen4ExpSlotStates    slot_states_;   // --max-concurrency > 1: every slot's recurrent state
     int                   chunk_   = 0;
     std::vector<Qwen4ExpCache> seq_caches_;
     std::unique_ptr<Qwen4ExpSeqEngine> seq_engine_;

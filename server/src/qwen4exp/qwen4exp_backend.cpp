@@ -159,11 +159,25 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     for (const size_t bytes : verify_width) verify += bytes;
     for (const size_t bytes : draft_width) draft += bytes;
     draft += (size_t) cache.mtp_draft * draft_width[1];
+    // A multi-slot engine also keeps its batched decode graph resident: plan its widest
+    // shapes, every slot at the end of the dense span, and at the end of the context.
+    size_t batched = 0;
+    if (slots > 1) {
+        const int dense_last = (w.qsa ? dense_end : cache.max_ctx) - 1;
+        for (const bool qsa : {false, true}) {
+            if (qsa && !w.qsa) continue;
+            const Qwen4ExpGraphMemory m = qwen4exp_batched_graph_memory(
+                backend, w, cache, slots, qsa ? cache.max_ctx - 1 : dense_last, qsa);
+            size_t resident = 0;
+            if (!retain(m, resident)) return 0;
+            batched = std::max(batched, resident);
+        }
+    }
     // The decode workspaces stay resident while the next prompt prefills.
     const size_t fixed = (slots - resident_slots) * state + shadow + shadow_tmp +
-                         slots * (decode + verify + draft);
-    std::fprintf(stderr, "[qwen4exp] chunk-runtime mtp=%d decode=%zu verify=%zu draft=%zu scratch=%zu host=%zu\n",
-        (int) mtp, decode, verify, draft, runtime_scratch, runtime_host);
+                         slots * (decode + verify + draft) + batched;
+    std::fprintf(stderr, "[qwen4exp] chunk-runtime mtp=%d decode=%zu verify=%zu draft=%zu batched=%zu scratch=%zu host=%zu\n",
+        (int) mtp, decode, verify, draft, batched, runtime_scratch, runtime_host);
     // Split mode: the expert device's MoE id helper bounds a chunk. With hot experts the target keeps no slack for
     // its matmul scratch pool, which grows over a long prompt and which the measurements below do not see, so the
     // chunk stays at the floor (still two 4096-row pipeline streams).
@@ -229,11 +243,6 @@ bool Qwen4ExpBackend::init() {
         std::fprintf(stderr, "[qwen4exp] --max-concurrency %d: MTP off\n", cfg_.max_concurrency);
         cfg_.verify_width = 1;
     }
-    // The multi-slot decode graph has no split-mode placement yet.
-    if (cfg_.max_concurrency > 1 && cfg_.expert_device) {
-        std::fprintf(stderr, "[qwen4exp] --max-concurrency > 1 is not supported with --expert-device yet\n");
-        return false;
-    }
     if (cfg_.device.is_layer_split()) {
         std::fprintf(stderr, "[qwen4exp] layer split is not supported yet\n");
         return false;
@@ -263,6 +272,8 @@ bool Qwen4ExpBackend::init() {
                          cfg_.device.gpu, expert_gpu);
         }
     }
+    if (cfg_.max_concurrency > 1 && !cfg_.expert_placement_path.empty())
+        std::fprintf(stderr, "[qwen4exp] --expert-placement unused with --max-concurrency > 1: every pick stays on the expert device\n");
     return load_target();
 }
 
@@ -273,12 +284,14 @@ bool Qwen4ExpBackend::load_target() {
                      luce_last_error());
         return false;
     }
-    if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
-                               cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1))) {
+    if (!create_main_cache()) {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
         return false;
     }
-    if (!load_qwen4exp_hot_experts(backend_, weights_, cfg_.expert_placement_path,
+    // Concurrent serving keeps every expert pick on the expert device, so a request
+    // computes the same alone and beside other requests: no hot copies.
+    if (!load_qwen4exp_hot_experts(backend_, weights_,
+                                   cfg_.max_concurrency > 1 ? std::string() : cfg_.expert_placement_path,
                                    expert_budget_bytes_from_env(kQwen4ExpHotExpertBudget))) return false;
     snapshot_budget_ = SIZE_MAX;
     if (cfg_.chunk > 0) {
@@ -310,8 +323,19 @@ void Qwen4ExpBackend::release_target() {
     for (Qwen4ExpCache & cache : seq_caches_) free_qwen4exp_cache(cache);
     seq_caches_.clear();
     free_qwen4exp_cache(cache_);
+    free_qwen4exp_slot_states(slot_states_);
     free_qwen4exp_weights(weights_);
     ggml_backend_cuda_trim_pool(backend_); // also frees the bf16 weight shadows keyed by the freed weights' addresses
+}
+
+// Slot 0 of the concurrency engine; with concurrent slots its recurrent state is
+// the first slab of the slot states the multi-slot decode graph batches over.
+bool Qwen4ExpBackend::create_main_cache() {
+    if (cfg_.max_concurrency > 1 &&
+        !create_qwen4exp_slot_states(backend_, weights_, cfg_.max_concurrency, slot_states_)) return false;
+    return create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
+        cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1),
+        slot_states_.ctx ? &slot_states_ : nullptr, 0);
 }
 
 bool Qwen4ExpBackend::start_seq_engine() {
@@ -319,7 +343,8 @@ bool Qwen4ExpBackend::start_seq_engine() {
     seq_caches_.resize((size_t)cfg_.max_concurrency - 1);
     std::vector<Qwen4ExpCache *> caches{&cache_};
     for (Qwen4ExpCache & cache : seq_caches_) {
-        if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache)) return false;
+        if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache, false, 1,
+                                   &slot_states_, (int) caches.size())) return false;
         caches.push_back(&cache);
     }
     seq_engine_ = std::make_unique<Qwen4ExpSeqEngine>(

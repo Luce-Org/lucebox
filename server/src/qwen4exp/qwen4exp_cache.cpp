@@ -19,8 +19,37 @@ bool qwen4exp_uma_ring_supported(ggml_backend_t backend) {
 
 }  // namespace
 
+bool create_qwen4exp_slot_states(ggml_backend_t backend, const Qwen4ExpWeights & w,
+                                 int n_slots, Qwen4ExpSlotStates & out) {
+    int n_linear = 0;
+    for (int il = 0; il < w.n_layer; ++il) n_linear += !w.layers[il].is_full_attention;
+    if (n_slots < 1 || n_linear == 0) return false;
+    const int64_t conv_channels = 2 * static_cast<int64_t>(w.ssm_n_group) * w.ssm_d_state + w.ssm_d_inner;
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * (2 * (size_t) n_linear + 4);
+    ip.no_alloc = true;
+    out.ctx = ggml_init(ip);
+    if (!out.ctx) return false;
+    for (int i = 0; i < n_linear; ++i) {
+        out.ssm.push_back(ggml_new_tensor_4d(out.ctx, GGML_TYPE_F32, w.ssm_d_state, w.ssm_d_state,
+                                             w.linear_value_heads, n_slots));
+        out.conv.push_back(ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.ssm_d_conv - 1, conv_channels, n_slots));
+    }
+    out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
+    if (!out.buf) { free_qwen4exp_slot_states(out); return false; }
+    out.n_slots = n_slots;
+    return true;
+}
+
+void free_qwen4exp_slot_states(Qwen4ExpSlotStates & s) {
+    if (s.buf) ggml_backend_buffer_free(s.buf);
+    if (s.ctx) ggml_free(s.ctx);
+    s = {};
+}
+
 bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
-                           int max_ctx, Qwen4ExpCache & out, bool mtp, int mtp_draft) {
+                           int max_ctx, Qwen4ExpCache & out, bool mtp, int mtp_draft,
+                           const Qwen4ExpSlotStates * slot_states, int state_slot) {
     const Qwen4ExpCudaScope profile(w.gfx1151);
     // The QSA cell-id kernel is exact for positions below 2^24.
     if (max_ctx <= 0 || max_ctx >= (1 << 24)) {
@@ -29,6 +58,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
         return false;
     }
     if (mtp_draft < 1 || mtp_draft > QWEN4EXP_MTP_MAX_DRAFT) return false;
+    if (slot_states && (state_slot < 0 || state_slot >= slot_states->n_slots)) return false;
     constexpr ggml_type kv_type = GGML_TYPE_F16;
 
     out.full_layer_ids.clear();
@@ -104,11 +134,23 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
                 w.indexer_head_size, max_ctx);
         }
     }
+    if (slot_states && slot_states->ssm.size() != n_linear) return false;
     for (size_t i = 0; i < n_linear; ++i) {
         // Recurrent state is independent of context length.
+        if (slot_states) {
+            ggml_tensor * ssm = slot_states->ssm[i];
+            ggml_tensor * conv = slot_states->conv[i];
+            out.ssm_state[i] = ggml_view_3d(out.ctx, ssm, S_v, S_v, H_v, ssm->nb[1], ssm->nb[2],
+                                            (size_t) state_slot * ssm->nb[3]);
+            out.conv_state[i] = ggml_view_2d(out.ctx, conv, kernel - 1, conv_channels, conv->nb[1],
+                                             (size_t) state_slot * conv->nb[2]);
+            continue;
+        }
         out.ssm_state[i] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, S_v, S_v, H_v);
         out.conv_state[i] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, kernel - 1, conv_channels);
     }
+    out.slot_states = slot_states;
+    out.state_slot = slot_states ? state_slot : -1;
     out.spec_ssm.clear(); out.spec_conv.clear();
     out.spec_ssm_rows.clear(); out.spec_conv_rows.clear();
     out.spec_ple_rows = {};
@@ -201,8 +243,7 @@ void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace) {
 }
 
 void clear_qwen4exp_batched_decode_workspace(Qwen4ExpBatchedDecodeWorkspace & workspace) {
-    if (workspace.alloc) ggml_gallocr_free(workspace.alloc);
-    if (workspace.ctx) ggml_free(workspace.ctx);
+    clear_qwen4exp_decode_workspace(workspace);
     workspace = {};
 }
 
@@ -235,6 +276,8 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
     }
     if (c.buf) { ggml_backend_buffer_free(c.buf); c.buf = nullptr; }
     if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
+    c.slot_states = nullptr;
+    c.state_slot = -1;
     c.attn_k.clear();
     c.attn_v.clear();
     c.mtp_k = c.mtp_v = nullptr;

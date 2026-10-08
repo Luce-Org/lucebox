@@ -58,6 +58,9 @@ Qwen4ExpGraphMemory qwen4exp_graph_memory(ggml_backend_t backend, const Qwen4Exp
     Qwen4ExpCache & cache, int n_tokens, int pos0, bool verify = false);
 Qwen4ExpGraphMemory qwen4exp_mtp_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
     Qwen4ExpCache & cache, int n_tokens, int pos0);
+// The multi-slot decode graph of n_slots rows, each at `pos` (dense, or as QSA rows).
+Qwen4ExpGraphMemory qwen4exp_batched_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
+    Qwen4ExpCache & cache, int n_slots, int pos, bool qsa);
 
 // One independent sequence span for batch eligibility and per-slot solo fallback.
 struct Qwen4ExpForwardSegment {
@@ -67,10 +70,12 @@ struct Qwen4ExpForwardSegment {
     int pos0 = 0;
 };
 
-// Pure decision for validated spans: at most four one-token rows, all dense in the solo path.
-// use_qsa is the cached gfx1151 capability.
+// Pure decision for validated spans: at most four one-token rows, each dense in the solo
+// path, or (with qsa_rows: the backend serves stable QSA rows) a QSA decode.
+// use_qsa is the cached QSA capability.
 bool qwen4exp_can_batch(const Qwen4ExpWeights & w,
-                       const Qwen4ExpForwardSegment * segments, int n_segments, bool use_qsa);
+                       const Qwen4ExpForwardSegment * segments, int n_segments, bool use_qsa,
+                       bool qsa_rows = false);
 
 // Run the trunk. `tokens` has n_tokens entries, processed as one contiguous
 // single-sequence span at positions [pos0, pos0 + n_tokens). On success the
@@ -126,7 +131,8 @@ bool qwen4exp_mtp_draft(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4
 // sequence's KV and recurrent state; `tokens[s]` and `positions[s]` are never
 // interpreted as a common time axis. The shared workspace must outlive calls
 // and is normally owned by the sequence-engine/model instance.
-// If any slot needs QSA or more than four slots are active, use per-slot solo forwards.
+// A slot past the QSA boundary decodes as a stable T=1 QSA row inside the graph; if the
+// backend lacks those rows or more than four slots are active, each slot runs its solo forward.
 // Reference caches also use per-slot solo forwards. The server admits at most four slots.
 Qwen4ExpForwardResult qwen4exp_forward_batched(
                                        ggml_backend_t backend,
