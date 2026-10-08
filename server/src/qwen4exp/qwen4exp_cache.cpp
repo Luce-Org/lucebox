@@ -194,6 +194,14 @@ void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace) {
         ggml_backend_cuda_graph_invalidate_range(workspace.backend,
             ggml_get_mem_buffer(workspace.ctx), ggml_get_mem_size(workspace.ctx));
     }
+    if (workspace.shared_overlap) {
+        // The handle owns events used by submitted work; do not destroy them or
+        // the private branch buffer until every wait has completed.
+        if (workspace.backend) ggml_backend_synchronize(workspace.backend);
+        ggml_backend_cuda_qwen_shared_overlap_destroy(workspace.shared_overlap);
+    }
+    if (workspace.shared_buf) ggml_backend_buffer_free(workspace.shared_buf);
+    if (workspace.shared_ctx) ggml_free(workspace.shared_ctx);
     if (workspace.alloc) ggml_gallocr_free(workspace.alloc);
     if (workspace.ctx) ggml_free(workspace.ctx);
     workspace = {};

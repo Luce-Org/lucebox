@@ -3581,6 +3581,9 @@ void ggml_cuda_mul_mat_vec_q(
         return !(e && e[0] == '0' && e[1] == '\0');
     }();
     const size_t q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    if (ctx.qwen_shared_q8) GGML_ASSERT(ctx.curr_stream_no == 1 && !ids &&
+        src0->type == GGML_TYPE_Q8_0 && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
+        (ne10 == 2560 || ne10 == 640) && q8_bytes <= ctx.qwen_shared_q8_bytes);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     char * src1_q8_d = nullptr;
     // The src1->q8_1 quantization depends only on src0->type and src1's dims/strides,
@@ -3595,8 +3598,10 @@ void ggml_cuda_mul_mat_vec_q(
     // entry filled on one stream could be read on another while the
     // quantize kernel is still in flight. Skip the memo whenever concurrent
     // streams are active for this evaluation.
+    // Shared overlap also forks stream 1 without generic concurrent_events.
+    // Keep all memo entries on stream 0 and retain the generic concurrency guard.
     const bool use_q8_memo = luce_q8_memo_on && src1->buffer != nullptr &&
-                             ctx.stream_context().concurrent_events.empty();
+                             ctx.curr_stream_no == 0 && ctx.stream_context().concurrent_events.empty();
     if (use_q8_memo) {
         for (const auto & e : ctx.luce_q8_memo) {
             if (e.src1_node == (const void *) src1 && e.src1_data == (const void *) src1_d &&
@@ -3618,6 +3623,8 @@ void ggml_cuda_mul_mat_vec_q(
             ent.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
             q8_dst = ent.buf->ptr;
             ctx.luce_q8_memo.push_back(std::move(ent));
+        } else if (ctx.qwen_shared_q8) {
+            q8_dst = ctx.qwen_shared_q8;
         } else {
             src1_q8_1.alloc(q8_bytes);
             q8_dst = src1_q8_1.ptr;

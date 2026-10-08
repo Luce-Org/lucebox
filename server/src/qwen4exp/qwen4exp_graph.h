@@ -95,7 +95,8 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                                        std::vector<float> * out_hidden = nullptr,
                                        bool verify = false,
                                        bool mtp_prefill = false,
-                                       const Qwen4ExpInputs * inputs = nullptr);
+                                       const Qwen4ExpInputs * inputs = nullptr,
+                                       int32_t * out_argmax = nullptr); // stable T=1 only; skips full logit readback
 
 // The cache was created with `mtp` (and a loaded sidecar).
 bool qwen4exp_verify_supported(const Qwen4ExpCache & cache);

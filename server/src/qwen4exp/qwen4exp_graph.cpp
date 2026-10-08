@@ -8,6 +8,7 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +42,66 @@ static void graph_memory(ggml_backend_t backend, ggml_context * ctx, ggml_cgraph
     // for those plus one Q8 activation and two largest-node scratch buffers
     // (conversion/attention and a retired pool allocation during growth).
     memory.scratch = gfx1151 ? (4 + 4 + 4) * 2 * activation + activation + 2 * largest : 2 * largest;
+}
+
+static bool bind_shared_overlap_arena(
+        Qwen4ExpDecodeWorkspace & ws, ggml_backend_t backend,
+        const std::vector<ggml_cuda_qwen_shared_overlap_layer> & layers) {
+    constexpr size_t outputs_per_layer = 7;
+    if (layers.size() != 48) return false;
+
+    auto outputs = [](const ggml_cuda_qwen_shared_overlap_layer & l) {
+        return std::array<ggml_tensor *, outputs_per_layer>{
+            l.shared_gate, l.shared_up, l.shared_glu, l.shared_down,
+            l.shared_logit, l.shared_sigmoid, l.shared_out };
+    };
+    if (!ws.shared_ctx) {
+        auto failed_init = [&] {
+            if (ws.shared_overlap) ggml_backend_cuda_qwen_shared_overlap_destroy(ws.shared_overlap);
+            if (ws.shared_buf) ggml_backend_buffer_free(ws.shared_buf);
+            if (ws.shared_ctx) ggml_free(ws.shared_ctx);
+            ws.shared_overlap = nullptr;
+            ws.shared_buf = nullptr;
+            ws.shared_ctx = nullptr;
+            ws.shared_slots.clear();
+            ws.shared_layers.clear();
+            return false;
+        };
+        ggml_init_params p{};
+        p.mem_size = ggml_tensor_overhead() * (outputs_per_layer * layers.size() + 8) + (1u << 20);
+        p.no_alloc = true;
+        ws.shared_ctx = ggml_init(p);
+        if (!ws.shared_ctx) return false;
+        for (const auto & layer : layers) {
+            for (ggml_tensor * tensor : outputs(layer)) {
+                if (!tensor || tensor->view_src) return failed_init();
+                ws.shared_slots.push_back(ggml_dup_tensor(ws.shared_ctx, tensor));
+            }
+        }
+        ws.shared_buf = ggml_backend_alloc_ctx_tensors(ws.shared_ctx, backend);
+        ws.shared_overlap = ggml_backend_cuda_qwen_shared_overlap_create(backend);
+        if (!ws.shared_buf || !ws.shared_overlap) return failed_init();
+    }
+    if (ws.shared_slots.size() != outputs_per_layer * layers.size()) return false;
+
+    size_t slot = 0;
+    for (const auto & layer : layers) {
+        for (ggml_tensor * tensor : outputs(layer)) {
+            ggml_tensor * storage = ws.shared_slots[slot++];
+            if (!tensor || tensor->view_src || tensor->type != storage->type ||
+                !ggml_are_same_shape(tensor, storage) ||
+                ggml_backend_tensor_alloc(ws.shared_buf, tensor, storage->data) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+        }
+    }
+    ws.shared_layers = layers;
+    return true;
+}
+
+static bool activate_shared_overlap(Qwen4ExpDecodeWorkspace & ws) {
+    return !ws.shared_overlap ||
+        ggml_backend_cuda_qwen_shared_overlap_activate(ws.shared_overlap, ws.gf);
 }
 
 // Grow-only: slots keep their addresses across forwards, so captured CUDA graphs stay valid.
@@ -200,7 +261,8 @@ struct Qwen4ExpMoeParts {
 
 ggml_tensor * build_moe(ggml_context * c, ggml_tensor * cur,
                         const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
-                        Qwen4ExpMoeParts * parts = nullptr) {
+                        Qwen4ExpMoeParts * parts = nullptr,
+                        ggml_cuda_qwen_shared_overlap_layer * overlap = nullptr) {
     const int64_t n_embd   = w.n_embd;
     const int64_t n_tokens = cur->ne[1];
     const int64_t n_expert = w.n_expert;
@@ -225,16 +287,21 @@ ggml_tensor * build_moe(ggml_context * c, ggml_tensor * cur,
     ggml_tensor * sh_gate = mm(c, L.ffn_gate_shexp, cur);
     ggml_tensor * sh_up   = mm(c, L.ffn_up_shexp, cur);
     ggml_tensor * sh_gu   = ggml_swiglu_split(c, sh_gate, sh_up);
-    ggml_tensor * shared  = mm(c, L.ffn_down_shexp, sh_gu);
+    ggml_tensor * shared_down = mm(c, L.ffn_down_shexp, sh_gu);
 
     ggml_tensor * shared_logit = mm(c, L.ffn_gate_inp_shexp, cur);
     if (parts) {   // the caller folds the combine into the next HC_COMBINE_NORM
-        *parts = { down, wsel, shared, shared_logit };
+        *parts = { down, wsel, shared_down, shared_logit };
         return nullptr;
     }
     ggml_tensor * shared_gate = ggml_sigmoid(c, shared_logit);
-    shared = ggml_mul(c, shared, shared_gate);   // [n_embd,T] * [1,T] broadcasts over dim 0
-    return ggml_ds4_moe_fused_combine_shared(c, down, wsel, shared);
+    ggml_tensor * shared = ggml_mul(c, shared_down, shared_gate);   // [n_embd,T] * [1,T] broadcasts over dim 0
+    ggml_tensor * moe_out = ggml_ds4_moe_fused_combine_shared(c, down, wsel, shared);
+    if (overlap) {
+        *overlap = { gate, sh_gate, sh_up, sh_gu, shared_down,
+                     shared_logit, shared_gate, shared, moe_out };
+    }
+    return moe_out;
 }
 
 // ── Linear attention: gated delta net (36 layers) ───────────────────────
@@ -1038,8 +1105,10 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
                                        int pos0,
                                        std::vector<float> & out_logits, std::vector<float> * out_hidden,
                                        bool verify, bool mtp_prefill,
-                                       const Qwen4ExpInputs * inputs, Qwen4ExpGraphMemory * measure) {
+                                       const Qwen4ExpInputs * inputs, int32_t * out_argmax,
+                                       Qwen4ExpGraphMemory * measure) {
     Qwen4ExpForwardResult res;
+    if (out_argmax) *out_argmax = -1;
     if (n_tokens <= 0 || pos0 < 0 || (!tokens && !measure)) return res;
     const Qwen4ExpCudaScope profile(w.gfx1151);
     if (verify && (n_tokens < 2 || n_tokens > cache.mtp_draft + 1 || !qwen4exp_verify_supported(cache))) return res;
@@ -1078,6 +1147,15 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         }
     }
     const bool use_stable_graph = reuse_ws && (qsa == QSA_DENSE || stable_qsa);
+    const bool gpu_argmax = out_argmax && use_stable_graph && !verify;
+    static const bool shared_overlap_requested = [] {
+        const char * value = std::getenv("LUCE_QWEN_SHARED_OVERLAP");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    // Hidden-export, verify and MTP prefill forwards retain the serial path.
+    const bool build_shared_overlap = shared_overlap_requested && use_stable_graph &&
+        !measure && w.gfx1151 && w.n_layer == 48 && n_tokens == 1 &&
+        !verify && !mtp_prefill && !out_hidden && !std::getenv("GGML_CUDA_DISABLE_FUSION");
     // Context and allocator reused across calls: the T=1 decode workspace, or the verify forward's own.
     Qwen4ExpDecodeWorkspace * pool = measure ? nullptr : reuse_ws ? &cache.decode_workspace : verify ? &cache.verify_workspace : nullptr;
     if (pos0 > cache.max_ctx || n_tokens > cache.max_ctx - pos0) {
@@ -1172,13 +1250,19 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
                                           sizeof(float) * ple_data.size());
         }
         upload_qsa(ws);
+        (void) activate_shared_overlap(ws); // a rejected plan uses the serial evaluator
         if (ggml_backend_graph_compute(backend, ws.gf) != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "[qwen4exp] stable graph compute failed\n");
             clear_qwen4exp_decode_workspace(ws);
             return false;
         }
-        out_logits.resize((size_t) w.n_vocab);
-        ggml_backend_tensor_get(ws.logits, out_logits.data(), 0, sizeof(float) * w.n_vocab);
+        if (gpu_argmax && ws.argmax) {
+            out_logits.clear();
+            ggml_backend_tensor_get(ws.argmax, out_argmax, 0, sizeof(*out_argmax));
+        } else {
+            out_logits.resize((size_t) w.n_vocab);
+            ggml_backend_tensor_get(ws.logits, out_logits.data(), 0, sizeof(float) * w.n_vocab);
+        }
         if (out_hidden && ws.hidden) {
             out_hidden->resize((size_t) ggml_nelements(ws.hidden));
             ggml_backend_tensor_get(ws.hidden, out_hidden->data(), 0, ggml_nbytes(ws.hidden));
@@ -1189,6 +1273,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     if (use_stable_graph && decode_ws.gf && kv_len <= decode_ws.kv_bucket &&
         (decode_ws.qsa_blocks >= 0) == stable_qsa && decode_ws.next_pos == pos0 &&
         (decode_ws.hidden != nullptr) == (out_hidden != nullptr) &&
+        (decode_ws.argmax != nullptr) == gpu_argmax &&
         (!stable_qsa || (decode_ws.kv_bucket == stable_kv_bucket &&
                         decode_ws.qsa_budget == w.indexer_top_k / 4 && cache.indexer_blocks == pos0 / 4))) {
         if (!run_stable(decode_ws)) return res;
@@ -1232,6 +1317,10 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
             // Retire captures before recycling metadata/allocator addresses.
             ggml_backend_cuda_graph_invalidate_range(backend,
                 ggml_get_mem_buffer(pool->ctx), ggml_get_mem_size(pool->ctx));
+            if (pool->shared_overlap) {
+                (void) ggml_backend_cuda_qwen_shared_overlap_prepare(
+                    pool->shared_overlap, nullptr, nullptr, nullptr, 0);
+            }
             ggml_reset(pool->ctx);
         }
         ctx = pool->ctx;
@@ -1244,6 +1333,8 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     }
     if (!ctx) return res;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 200000, false);
+    std::vector<ggml_cuda_qwen_shared_overlap_layer> shared_overlap_layers;
+    if (build_shared_overlap) shared_overlap_layers.reserve((size_t) w.n_layer);
 
     const int64_t graph_kv_len = use_stable_graph ? stable_kv_bucket : kv_len;
     const int64_t mask_len = use_stable_graph ? stable_kv_bucket : kv_len;
@@ -1312,7 +1403,12 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         // from FMA contraction in the new kernel, covered by the long-prompt quality gate). Not at T=1: it cost ~1.7% decode.
         Qwen4ExpMoeParts moe_parts;
         const bool fold = !next_ple && ggml_backend_cuda_mmb_prefill(layer_T);
-        cur = build_moe(ctx, cur, L, w, fold ? &moe_parts : nullptr);
+        ggml_cuda_qwen_shared_overlap_layer * overlap = nullptr;
+        if (build_shared_overlap && layer_T == 1 && !fold) {
+            shared_overlap_layers.emplace_back();
+            overlap = &shared_overlap_layers.back();
+        }
+        cur = build_moe(ctx, cur, L, w, fold ? &moe_parts : nullptr, overlap);
 
         if (fold) {
             ggml_tensor * gamma = (il + 1 < w.n_layer)
@@ -1398,6 +1494,14 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     ggml_set_output(logits);
     ggml_set_name(logits, "logits");
     ggml_build_forward_expand(gf, logits);
+    ggml_tensor * argmax = nullptr;
+    if (gpu_argmax) {
+        argmax = ggml_argmax(ctx, logits);
+        const int32_t cpu_first_tie = 1;
+        std::memcpy(argmax->op_params, &cpu_first_tie, sizeof(cpu_first_tie));
+        ggml_set_output(argmax);
+        ggml_build_forward_expand(gf, argmax);
+    }
     // The final HC residual of every row feeds the MTP draft head. Appended after the logits so the logits path keeps
     // its node order; a row-selected prefill builds the other rows' FFN half on the side.
     ggml_tensor * hidden = nullptr;
@@ -1499,6 +1603,9 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         }
     }
 
+    const bool shared_overlap_bound = build_shared_overlap &&
+        bind_shared_overlap_arena(decode_ws, backend, shared_overlap_layers);
+
     ggml_gallocr_t galloc = nullptr;
     if (pool) {
         if (pool->alloc == nullptr) {
@@ -1530,7 +1637,17 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     }
     if (pool) pool->planned = true;
 
+    const bool shared_overlap_prepared = shared_overlap_bound &&
+        ggml_backend_cuda_qwen_shared_overlap_prepare(
+            decode_ws.shared_overlap, gf, decode_ws.shared_buf,
+            decode_ws.shared_layers.data(), decode_ws.shared_layers.size());
+    if (!shared_overlap_prepared && decode_ws.shared_overlap) {
+        // The externally bound tensors also remain valid for serial evaluation.
+        decode_ws.shared_layers.clear();
+    }
+
     if (use_stable_graph) {
+        if (shared_overlap_prepared) ggml_backend_cuda_qwen_graph_seal(decode_ws.shared_overlap, gf);
         decode_ws.gf = gf;
         decode_ws.inp_emb = inp_emb;
         decode_ws.positions = positions;
@@ -1538,6 +1655,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         decode_ws.ple_in = ple_in;
         decode_ws.kv_row = kv_row;
         decode_ws.logits = logits;
+        decode_ws.argmax = argmax;
         decode_ws.hidden = hidden;
         decode_ws.kv_bucket = stable_kv_bucket;
         decode_ws.qsa_blocks = stable_qsa ? stable_kv_bucket / 4 : -1;
@@ -1618,6 +1736,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     ggml_status status;
     {   // verify: every matmul column equals its single-token product (see ggml_backend_cuda_set_mmvq_batch_invariant)
         ScopedCudaGraphOverrides invariant(false, 0, false, 0, /*mmvq_batch_invariant=*/verify);
+        if (shared_overlap_prepared) (void) activate_shared_overlap(decode_ws);
         status = ggml_backend_graph_compute(backend, gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -1642,8 +1761,13 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         cache.indexer_blocks = (int) ((pos0 + T) / qsa_ratio(w));
     }
 
-    out_logits.resize((size_t) ggml_nelements(logits));   // n_vocab, per row when verifying
-    ggml_backend_tensor_get(logits, out_logits.data(), 0, ggml_nbytes(logits));
+    if (gpu_argmax && argmax) {
+        out_logits.clear();
+        ggml_backend_tensor_get(argmax, out_argmax, 0, sizeof(*out_argmax));
+    } else {
+        out_logits.resize((size_t) ggml_nelements(logits));   // n_vocab, per row when verifying
+        ggml_backend_tensor_get(logits, out_logits.data(), 0, ggml_nbytes(logits));
+    }
     if (out_hidden && hidden) {
         out_hidden->resize((size_t) ggml_nelements(hidden));
         ggml_backend_tensor_get(hidden, out_hidden->data(), 0, ggml_nbytes(hidden));
@@ -1860,9 +1984,9 @@ bool qwen4exp_mtp_draft(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4
 Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend, const Qwen4ExpWeights & w,
         Qwen4ExpCache & cache, const int32_t * tokens, int n_tokens, int pos0,
         std::vector<float> & logits, std::vector<float> * out_hidden,
-        bool verify, bool mtp_prefill, const Qwen4ExpInputs * inputs) {
+        bool verify, bool mtp_prefill, const Qwen4ExpInputs * inputs, int32_t * out_argmax) {
     return forward_impl(backend, w, cache, tokens, n_tokens, pos0, logits, out_hidden,
-                        verify, mtp_prefill, inputs, nullptr);
+                        verify, mtp_prefill, inputs, out_argmax, nullptr);
 }
 
 Qwen4ExpGraphMemory qwen4exp_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
@@ -1876,7 +2000,7 @@ Qwen4ExpGraphMemory qwen4exp_graph_memory(ggml_backend_t backend, const Qwen4Exp
     cache.indexer_blocks = pos0 / ratio <= w.indexer_top_k / ratio ? 0 : (int) (pos0 / ratio);
     const bool ok = forward_impl(backend, w, cache, nullptr, n_tokens, pos0, unused,
                                 mtp ? &unused : nullptr, verify, mtp && n_tokens > 1 && !verify,
-                                nullptr, &memory).ok;
+                                nullptr, nullptr, &memory).ok;
     cache.indexer_blocks = blocks;
     cache.kv_bucket_base = bucket_base;
     if (!ok) memory.graph = SIZE_MAX;

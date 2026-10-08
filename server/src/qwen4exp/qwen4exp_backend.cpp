@@ -383,6 +383,13 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     auto sample = [&](const float * row) {
         return (int32_t) sample_logits(row, weights_.n_vocab, req.sampler, history, rng);
     };
+    static const int gpu_argmax_override = [] {
+        const char * value = std::getenv("LUCE_GPU_ARGMAX");
+        if (!value) return -1;
+        return value[0] == '1' && value[1] == '\0' ? 1 : 0;
+    }();
+    // Keep the automatic hardware decision local to this backend instance.
+    const bool gpu_argmax_enabled = gpu_argmax_override < 0 ? weights_.gfx1151 : gpu_argmax_override != 0;
     BudgetHookState budget;   // thinking force-close: keeps the reply reserve of the budget for the answer
     bool cancelled = false;
     // Commits a sampled token, after the budget hook's substitution; false once generation ends.
@@ -427,10 +434,27 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         std::array<int32_t, QWEN4EXP_MTP_MAX_VERIFY> in{}, samples{};
         in[0] = next;
         if (verify) std::copy(draft_tokens.begin(), draft_tokens.end(), in.begin() + 1);
+        int32_t gpu_next = -1;
+        const bool gpu_greedy = gpu_argmax_enabled && !verify && req.sampler.temp <= 0.0f &&
+            !req.sampler.needs_logit_processing() && !decode_check_;
         const Qwen4ExpForwardResult r = qwen4exp_forward(
-            backend_, weights_, cache_, in.data(), k + 1, pos, logits, mtp ? &hidden : nullptr, verify);
+            backend_, weights_, cache_, in.data(), k + 1, pos, logits, mtp ? &hidden : nullptr,
+            verify, false, nullptr, gpu_greedy ? &gpu_next : nullptr);
         if (!r.ok) {
             result.fail(GenerateErrorCode::DecodeFailed, "qwen4exp decode forward failed");
+            return result;
+        }
+        auto read_logits = [&] {
+            if (!logits.empty()) return true;
+            ggml_tensor * device_logits = cache_.decode_workspace.logits;
+            if (!device_logits || ggml_nelements(device_logits) != weights_.n_vocab) return false;
+            logits.resize((size_t) weights_.n_vocab);
+            ggml_backend_tensor_get(device_logits, logits.data(), 0, ggml_nbytes(device_logits));
+            return true;
+        };
+        const bool gpu_choice = gpu_next >= 0 && gpu_next < weights_.n_vocab;
+        if (!gpu_choice && !read_logits()) {
+            result.fail(GenerateErrorCode::DecodeFailed, "qwen4exp GPU argmax fallback failed");
             return result;
         }
         ++steps;
@@ -439,7 +463,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         Qwen4ExpMtpAcceptance decision;
         for (int i = 0; i <= k; ++i) {
             history.push_back(in[i]);
-            int32_t tok = sample(logits.data() + (size_t) i * weights_.n_vocab);
+            int32_t tok = gpu_choice ? gpu_next : sample(logits.data() + (size_t) i * weights_.n_vocab);
             more = commit(tok);
             samples[i] = tok;
             decision = qwen4exp_mtp_accept(draft_tokens.data(), k, samples.data(), i + 1);
@@ -462,8 +486,14 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
             mtp_h.insert(mtp_h.end(), hidden.begin(), hidden.end());
             mtp_tok.push_back(next);
         }
-        logits_.assign(logits.begin() + (size_t) (retained - 1) * weights_.n_vocab,
-                       logits.begin() + (size_t) retained * weights_.n_vocab);
+        if (!more && !cancelled && !read_logits()) {
+            result.fail(GenerateErrorCode::DecodeFailed, "qwen4exp terminal logits readback failed");
+            return result;
+        }
+        if (!logits.empty()) {
+            logits_.assign(logits.begin() + (size_t) (retained - 1) * weights_.n_vocab,
+                           logits.begin() + (size_t) retained * weights_.n_vocab);
+        }
         pos += retained;
         if (decode_check_) decode_check_(false, mtp_tok, logits_);
         if (verify) width_policy.observe(decision.n_accepted + 1, k + 1,
