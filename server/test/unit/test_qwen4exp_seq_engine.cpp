@@ -309,6 +309,86 @@ static bool run_qsa_boundary(Qwen4ExpSeqEngine & engine, ggml_backend_t backend,
     return ok;
 }
 
+// Drive one slot through prompt and `steps` decode tokens the way the
+// scheduler does; returns the sampled tokens (prompt's first, then decode).
+static std::vector<int32_t> drive_slot(Qwen4ExpSeqEngine & engine, int slot, int steps,
+                                       std::vector<SeqEngine::PrefillOutput> * prefills = nullptr) {
+    std::vector<int32_t> out;
+    for (int guard = 0; guard < 256 && out.empty(); ++guard) {
+        SeqEngine::StepPlan plan;
+        plan.prefills.push_back({slot, engine.step_plan_limits(0).max_prefill_tokens_per_sequence});
+        const auto result = engine.step(plan);
+        if (!result.ok() || result.prefills.size() != 1) return {};
+        if (prefills) prefills->push_back(result.prefills[0]);
+        if (result.prefills[0].status == SeqEngine::PrefillOutput::Status::completed)
+            out.push_back(result.prefills[0].token);
+    }
+    while (!out.empty() && (int) out.size() <= steps) {
+        SeqEngine::StepPlan plan;
+        plan.decode.push_back({slot, out.back()});
+        const auto result = engine.step(plan);
+        if (!result.ok() || result.decode.size() != 1) return {};
+        out.push_back(result.decode[0].token);
+    }
+    return out;
+}
+
+// A checkpoint captured by one slot restores into another and continues
+// token for token like the cold run that captured it.
+static bool run_prefix_store(Qwen4ExpSeqEngine & engine, const Qwen4ExpWeights & w) {
+    constexpr int L = 3000, C = 2000, STEPS = 24;
+    if (!engine.supports_prefix_store() || engine.estimate_prefix_store_bytes(C) == 0) return false;
+    for (int s = 0; s < engine.slot_count(); ++s) engine.retire(s);
+    std::vector<int32_t> prompt(L);
+    for (int i = 0; i < L; ++i) prompt[(size_t) i] = (int32_t) ((i * 7919 + 101) % w.n_vocab);
+
+    PrefixStorePlan capture_plan;
+    capture_plan.capture = {1, {1, C}};
+    const auto cold = engine.admit_with_prefix(900, prompt, SamplerCfg{}, capture_plan);
+    if (cold.status != SeqEngine::AdmitResult::Status::admitted || cold.prefix_store.capture != capture_plan.capture)
+        return false;
+    std::vector<SeqEngine::PrefillOutput> prefills;
+    const std::vector<int32_t> cold_tokens = drive_slot(engine, cold.slot, STEPS, &prefills);
+    bool saved = false;
+    for (const auto & p : prefills)
+        saved = saved || (p.prefix_store.status == PrefixStoreEvent::Status::saved &&
+                          p.prefix_store.ticket == capture_plan.capture && p.prefix_store.bytes > 0);
+    engine.retire(cold.slot);
+    if (cold_tokens.size() != STEPS + 1 || !saved) {
+        std::fprintf(stderr, "[prefix-store] cold run tokens=%zu saved=%d\n", cold_tokens.size(), (int) saved);
+        return false;
+    }
+
+    // Hold the capturing slot so the restore lands in another one.
+    std::vector<int32_t> filler(64, 7);
+    const auto blocker = engine.admit(901, filler, SamplerCfg{});
+    PrefixStorePlan restore_plan;
+    restore_plan.restore = {1, C};
+    const auto hit = engine.admit_with_prefix(902, prompt, SamplerCfg{}, restore_plan);
+    const bool cross_slot = blocker.slot == cold.slot && hit.slot != cold.slot;
+    if (hit.status != SeqEngine::AdmitResult::Status::admitted || hit.prefix_store.restored != restore_plan.restore) {
+        std::fprintf(stderr, "[prefix-store] restore was not accepted\n");
+        return false;
+    }
+    const std::vector<int32_t> hit_tokens = drive_slot(engine, hit.slot, STEPS);
+    engine.retire(hit.slot);
+    engine.retire(blocker.slot);
+
+    // A different prompt behind the same checkpoint id must not restore it.
+    std::vector<int32_t> other = prompt;
+    other[10] = (other[10] + 1) % w.n_vocab;
+    const auto stale = engine.admit_with_prefix(903, other, SamplerCfg{}, restore_plan);
+    const bool rejected = stale.status == SeqEngine::AdmitResult::Status::admitted &&
+        stale.prefix_store.invalidated == restore_plan.restore && !stale.prefix_store.restored.valid();
+    engine.retire(stale.slot);
+    engine.discard_prefix_store({1, C});
+
+    const bool same = hit_tokens == cold_tokens;
+    std::fprintf(stderr, "[prefix-store] cross_slot=%d identical=%d stale_rejected=%d\n",
+                 (int) cross_slot, (int) same, (int) rejected);
+    return cross_slot && same && rejected;
+}
+
 static bool run_soak(Qwen4ExpSeqEngine & engine, int n, int round) {
     std::mt19937 rng((uint32_t)(0x51e9 + n * 101 + round));
     std::vector<int32_t> over_ctx((size_t)engine.max_context() + 1, 1);
@@ -387,6 +467,12 @@ int main(int argc, char ** argv) {
         ok = ok && soak_ok;
         std::printf("[qwen4exp-seq] N=%d contract=%s soak=%s\n", n,
                     violations.empty() ? "PASS" : "FAIL", soak_ok ? "PASS" : "FAIL");
+    }
+    {
+        Qwen4ExpSeqEngine engine(backend, weights, ptrs, ctx, 512, size_t(8) << 30);
+        const bool prefix_ok = run_prefix_store(engine, weights);
+        std::printf("[qwen4exp-seq] prefix-store=%s\n", prefix_ok ? "PASS" : "FAIL");
+        ok = ok && prefix_ok;
     }
     {
         Qwen4ExpSeqEngine engine(backend, weights, ptrs, ctx);

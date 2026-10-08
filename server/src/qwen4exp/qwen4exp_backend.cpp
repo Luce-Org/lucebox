@@ -237,8 +237,8 @@ bool Qwen4ExpBackend::init() {
         std::fprintf(stderr, "[qwen4exp] --max-concurrency must be between 1 and 4\n");
         return false;
     }
-    // ponytail: concurrent slots decode without MTP or prefix snapshots (the
-    // seq engine replaces the serial loop that owns both); per-slot MTP is follow-up.
+    // ponytail: concurrent slots decode without MTP (the seq engine replaces the
+    // serial loop that owns speculation); per-slot MTP is follow-up.
     if (cfg_.max_concurrency > 1 && cfg_.verify_width != 1) {
         std::fprintf(stderr, "[qwen4exp] --max-concurrency %d: MTP off\n", cfg_.max_concurrency);
         cfg_.verify_width = 1;
@@ -299,7 +299,12 @@ bool Qwen4ExpBackend::load_target() {
     } else if (cfg_.max_concurrency > 1) {
         // Cap at the single-slot speed target: a larger chunk only holds the
         // other slots' decode for longer (and filled 93 GB at 4x32K: 12800 rows).
-        chunk_ = std::min(4096, qwen4exp_select_chunk(backend_, weights_, cache_, cfg_.max_concurrency, 1));
+        // Prefix checkpoints: each slot's restore point and capture in flight
+        // plus one shared head, the server's concurrent prefix budget.
+        snapshot_budget_ = (2 * (size_t) cfg_.max_concurrency + 1) * snapshot_bytes_estimate(cache_.max_ctx);
+        chunk_ = std::min(4096, qwen4exp_select_chunk(backend_, weights_, cache_, cfg_.max_concurrency, 1,
+                                                      &snapshot_budget_));
+        std::fprintf(stderr, "[qwen4exp] prefix checkpoint allowance=%zu bytes\n", snapshot_budget_);
     } else {
         snapshot_budget_ = 3 * snapshot_bytes_estimate(cache_.max_ctx);
         chunk_ = qwen4exp_select_chunk(backend_, weights_, cache_, 1, 1, &snapshot_budget_);
@@ -347,8 +352,10 @@ bool Qwen4ExpBackend::start_seq_engine() {
                                    &slot_states_, (int) caches.size())) return false;
         caches.push_back(&cache);
     }
+    // An explicit --chunk leaves no measured prefix allowance; the engine then serves cold.
     seq_engine_ = std::make_unique<Qwen4ExpSeqEngine>(
-        backend_, weights_, std::move(caches), cfg_.device.max_ctx, chunk_);
+        backend_, weights_, std::move(caches), cfg_.device.max_ctx, chunk_,
+        snapshot_budget_ == SIZE_MAX ? 0 : snapshot_budget_);
     std::fprintf(stderr,
         "[qwen4exp-seq] independent-slot engine enabled: %d full F16 caches, ctx=%d, chunk=%d\n",
         cfg_.max_concurrency, cfg_.device.max_ctx, chunk_);
@@ -803,7 +810,7 @@ GenerateResult Qwen4ExpBackend::restore_and_generate_impl(
         std::fprintf(stderr, "[qwen4exp-snap] resident slot=%d pos=%d\n", slot, pos);
     } else {
         snapshot_flush_deferred();
-        restore_qwen4exp_snapshot(backend_, snapshots_[slot], cache_);
+        if (!restore_qwen4exp_snapshot(backend_, snapshots_[slot], cache_)) return generate_impl(req, io);
         tokens_ = snapshots_[slot].tokens;
         logits_ = snapshots_[slot].logits;
     }

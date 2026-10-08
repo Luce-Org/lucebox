@@ -234,7 +234,7 @@ static void copies(ggml_backend_t backend) {
         // survive a reset and an unrelated request overwriting the live buffer.
         reset_qwen4exp_state(backend, c);
         ggml_backend_buffer_clear(c.buf, 0xa5);
-        restore_qwen4exp_snapshot(backend, s, c);
+        CHECK(restore_qwen4exp_snapshot(backend, s, c));
         CHECK(c.cur_pos == pos && c.indexer_blocks == pos / 4 && c.mtp_prev_pos == pos - 1);
         CHECK(c.kv_bucket_base == 512 && c.ple_prev == std::vector<int32_t>({11, 12}));
         CHECK(c.spec_tokens == 0 && c.spec_pos == -1);

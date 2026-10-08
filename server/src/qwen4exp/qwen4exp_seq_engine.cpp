@@ -4,6 +4,8 @@
 #include "qwen4exp_graph.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <limits>
 #include <utility>
 
@@ -23,15 +25,19 @@ uint32_t pool_blocks(int max_ctx, size_t slots) {
 
 Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
         ggml_backend_t backend, const Qwen4ExpWeights & weights,
-        std::vector<Qwen4ExpCache *> caches, int max_ctx, int prefill_chunk)
+        std::vector<Qwen4ExpCache *> caches, int max_ctx, int prefill_chunk,
+        size_t prefix_allowance)
     : backend_(backend), weights_(weights), caches_(std::move(caches)),
       pool_(pool_blocks(max_ctx, caches_.size()),
             (uint32_t)caches_.size(), 256),
       slots_(pool_, max_ctx),
-      prefill_chunk_(std::max(prefill_chunk, 1)) {}
+      prefill_chunk_(std::max(prefill_chunk, 1)),
+      prefix_allowance_(prefix_allowance),
+      checkpoints_((size_t)kPrefixCheckpoints) {}
 
 Qwen4ExpSeqEngine::~Qwen4ExpSeqEngine() {
     ggml_backend_synchronize(backend_);
+    for (Qwen4ExpSnapshot & checkpoint : checkpoints_) free_qwen4exp_snapshot(checkpoint);
     clear_qwen4exp_batched_decode_workspace(decode_workspace_);
 }
 
@@ -40,6 +46,12 @@ bool Qwen4ExpSeqEngine::token_is_eos(int32_t token) const {
 }
 
 SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit(
+        uint64_t request_id, const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler) {
+    return admit_cold(request_id, prompt, sampler);
+}
+
+SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_cold(
         uint64_t request_id, const std::vector<int32_t> & prompt,
         const SamplerCfg & sampler) {
     for (int32_t token : prompt) {
@@ -70,6 +82,134 @@ SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit(
     reset_qwen4exp_state(backend_, *caches_[(size_t)result.slot]);
     ggml_backend_synchronize(backend_);
     return result;
+}
+
+size_t Qwen4ExpSeqEngine::estimate_prefix_store_bytes(int tokens) const {
+    if (caches_.empty() || !caches_[0] || tokens <= 0) return 0;
+    size_t host = 0;
+    const size_t device = qwen4exp_snapshot_bytes(backend_, *caches_[0], tokens, &host);
+    if (!device) return 0;
+    return device + host + (size_t(tokens) + std::max(0, weights_.ple_ngram_size - 1)) * sizeof(int32_t);
+}
+
+int Qwen4ExpSeqEngine::checkpoint_index(PrefixStoreRef checkpoint) const {
+    if (!checkpoint.valid() || checkpoint.id > (uint64_t)kPrefixCheckpoints) return -1;
+    return (int)checkpoint.id - 1;
+}
+
+void Qwen4ExpSeqEngine::discard_prefix_store(PrefixStoreRef checkpoint) {
+    const int index = checkpoint_index(checkpoint);
+    if (index >= 0 && checkpoints_[(size_t)index].buf &&
+        checkpoints_[(size_t)index].cur_pos == checkpoint.tokens)
+        free_qwen4exp_snapshot(checkpoints_[(size_t)index]);
+}
+
+// A checkpoint restores only into a cold slot and only when its tokens are the
+// prompt's own prefix; any failure leaves the slot cold.
+bool Qwen4ExpSeqEngine::restore_prefix(int slot, const std::vector<int32_t> & prompt,
+                                       PrefixStoreRef checkpoint) {
+    const int index = checkpoint_index(checkpoint);
+    if (index < 0 || checkpoint.tokens >= (int)prompt.size()) return false;
+    const Qwen4ExpSnapshot & s = checkpoints_[(size_t)index];
+    if (!s.buf || s.cur_pos != checkpoint.tokens ||
+        s.tokens.size() != (size_t)checkpoint.tokens ||
+        !std::equal(s.tokens.begin(), s.tokens.end(), prompt.begin())) return false;
+    Qwen4ExpCache & cache = *caches_[(size_t)slot];
+    if (!restore_qwen4exp_snapshot(backend_, s, cache)) return false;
+    if (!slots_.seed_restored_prefix(slot, checkpoint.tokens).ok) {
+        reset_qwen4exp_state(backend_, cache);
+        ggml_backend_synchronize(backend_);
+        return false;
+    }
+    return true;
+}
+
+SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_with_prefix(
+        uint64_t request_id, const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler, const PrefixStorePlan & plan) {
+    AdmitResult result = admit_cold(request_id, prompt, sampler);
+    if (result.status != AdmitResult::Status::admitted) return result;
+    const int slot = result.slot;
+    slots_.slot(slot).pending_capture = {};
+    if (plan.restore.valid()) {
+        const auto started = std::chrono::steady_clock::now();
+        const bool restored = restore_prefix(slot, prompt, plan.restore);
+        const uint64_t elapsed_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        if (restored) {
+            result.prefix_store.restored = plan.restore;
+            std::fprintf(stderr, "[qwen4exp-seq] restored checkpoint=%llu slot=%d tokens=%d time_ms=%.1f\n",
+                (unsigned long long)plan.restore.id, slot, plan.restore.tokens, (double)elapsed_us / 1000.0);
+        } else {
+            discard_prefix_store(plan.restore);
+            result.prefix_store.invalidated = plan.restore;
+        }
+        result.prefix_store.restore_attempted = true;
+        result.prefix_store.restore_elapsed_us = elapsed_us;
+    }
+    const SeqSlot & seq = slots_.slot(slot);
+    if (!result.prefix_store.invalidated.valid() && plan.capture.valid() &&
+        checkpoint_index(plan.capture.checkpoint) >= 0 &&
+        plan.capture.checkpoint.tokens > seq.cur_pos &&
+        plan.capture.checkpoint.tokens <= seq.prompt_len) {
+        slots_.slot(slot).pending_capture = plan.capture;
+        result.prefix_store.capture = plan.capture;
+    }
+    return result;
+}
+
+PrefixStoreEvent Qwen4ExpSeqEngine::capture_prefix(int slot, PrefixCaptureTicket ticket) {
+    PrefixStoreEvent event;
+    event.ticket = ticket;
+    event.status = PrefixStoreEvent::Status::failed;
+    const int index = checkpoint_index(ticket.checkpoint);
+    if (!ticket.valid() || index < 0 || !slots_.is_prefilling(slot) ||
+        slots_.slot(slot).cur_pos != ticket.checkpoint.tokens ||
+        caches_[(size_t)slot]->cur_pos != ticket.checkpoint.tokens) {
+        event.error = "invalid prefix capture boundary";
+        return event;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    auto elapsed_us = [&started] {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count();
+    };
+    // The capture replaces checkpoint `index`; every other resident one counts against the allowance.
+    size_t resident = 0;
+    for (size_t i = 0; i < checkpoints_.size(); ++i)
+        if (i != (size_t)index && checkpoints_[i].buf)
+            resident += ggml_backend_buffer_get_size(checkpoints_[i].buf);
+    const size_t need = estimate_prefix_store_bytes(ticket.checkpoint.tokens);
+    if (!need || resident > prefix_allowance_ || need > prefix_allowance_ - resident) {
+        event.elapsed_us = elapsed_us();
+        event.error = "qwen4exp prefix checkpoint allowance exhausted";
+        return event;
+    }
+    Qwen4ExpSnapshot & s = checkpoints_[(size_t)index];
+    if (!save_qwen4exp_snapshot(backend_, *caches_[(size_t)slot], s)) {
+        free_qwen4exp_snapshot(s);
+        event.elapsed_us = elapsed_us();
+        event.error = "qwen4exp prefix capture failed";
+        return event;
+    }
+    const std::vector<int32_t> & history = slots_.slot(slot).sample_history;
+    s.tokens.assign(history.begin(), history.begin() + ticket.checkpoint.tokens);
+    event.status = PrefixStoreEvent::Status::saved;
+    event.bytes = ggml_backend_buffer_get_size(s.buf);
+    event.elapsed_us = elapsed_us();
+    std::fprintf(stderr, "[qwen4exp-seq] saved checkpoint=%llu slot=%d tokens=%d bytes=%zu time_ms=%.1f\n",
+        (unsigned long long)ticket.checkpoint.id, slot, ticket.checkpoint.tokens, event.bytes,
+        (double)event.elapsed_us / 1000.0);
+    return event;
+}
+
+int Qwen4ExpSeqEngine::prefill_segment(int slot, int max_tokens) const {
+    const SeqSlot & s = slots_.slot(slot);
+    int end = std::min(s.prompt_len, s.cur_pos + max_tokens);
+    const PrefixCaptureTicket & capture = s.pending_capture;
+    if (capture.valid() && s.cur_pos < capture.checkpoint.tokens)
+        end = std::min(end, capture.checkpoint.tokens);
+    return end - s.cur_pos;
 }
 
 StepPlanLimits Qwen4ExpSeqEngine::step_plan_limits(int decode_rows) const {
@@ -177,8 +317,7 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     }
     for (const PrefillSlice & slice : plan.prefills) {
         const SeqSlot & before = slots_.slot(slice.slot);
-        const int count = std::min(slice.max_tokens,
-                                   before.prompt_len - before.cur_pos);
+        const int count = prefill_segment(slice.slot, slice.max_tokens);
         if (count <= 0) return fail("qwen4exp prefill made no progress");
         const int pos = before.cur_pos;
         segment_tokens.emplace_back(
@@ -249,6 +388,12 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     for (const PendingPrefill & pending : pending_prefills) {
         PrefillOutput output;
         output.slot = pending.slot;
+        const PrefixCaptureTicket capture = slots_.slot(pending.slot).pending_capture;
+        if (capture.valid() &&
+            slots_.slot(pending.slot).cur_pos == capture.checkpoint.tokens) {
+            output.prefix_store = capture_prefix(pending.slot, capture);
+            slots_.slot(pending.slot).pending_capture = {};
+        }
         if (pending.complete) {
             SeqSlot & slot = slots_.slot(pending.slot);
             output.status = PrefillOutput::Status::completed;

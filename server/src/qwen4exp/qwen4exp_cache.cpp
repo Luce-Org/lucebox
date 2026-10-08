@@ -398,13 +398,35 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpCache & c, Qwe
     return true;
 }
 
-void restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c) {
+bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c) {
+    if (!s.buf || !c.buf || s.cur_pos <= 0 || s.cur_pos > c.max_ctx) return false;
+    // The target's strips at the snapshot's position, in the order they were saved.
+    struct Strip { ggml_tensor * t; size_t off, bytes; };
+    std::vector<Strip> target;
+    target.reserve(s.strips.size());
+    snapshot_strips(c, s.cur_pos, s.indexer_blocks, [&](ggml_tensor * t, size_t off, size_t bytes) {
+        target.push_back({t, off, bytes});
+    });
+    if (target.size() != s.strips.size()) return false;
+    for (size_t i = 0; i < target.size(); ++i) {
+        const ggml_tensor * copy = s.strips[i].second;
+        if (target[i].t->type != copy->type || target[i].bytes != ggml_nbytes(copy)) return false;
+    }
+    ggml_context * views = ggml_init({target.size() * ggml_tensor_overhead(), nullptr, true});
+    if (!views) return false;
     ggml_backend_synchronize(backend); // finish rollback before clearing its source/destination buffer
     clear_position_bound_graphs(c);
-    // Clear masked suffixes too: stable QSA scores the entire bucket.
+    // Clear masked suffixes too: stable QSA scores the entire bucket. Stacked slot
+    // states are not in c.buf; the snapshot rewrites this slot's slabs in full.
     ggml_backend_buffer_clear(c.buf, 0);
-    for (auto [live, copy] : s.strips) ggml_backend_tensor_copy_async(backend, backend, copy, live);
+    for (size_t i = 0; i < target.size(); ++i) {
+        ggml_tensor * copy = s.strips[i].second;
+        ggml_tensor * live = ggml_view_1d(views, target[i].t, ggml_nelements(copy), target[i].off);
+        ggml_backend_view_init(live);
+        ggml_backend_tensor_copy_async(backend, backend, copy, live);
+    }
     ggml_backend_synchronize(backend);
+    ggml_free(views);
     c.cur_pos = s.cur_pos;
     c.indexer_blocks = s.indexer_blocks;
     c.mtp_prev_pos = s.mtp_prev_pos;
@@ -412,6 +434,7 @@ void restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & 
     c.ple_prev = s.ple_prev;
     c.spec_pos = -1;
     c.spec_tokens = 0;
+    return true;
 }
 
 }  // namespace luce::common

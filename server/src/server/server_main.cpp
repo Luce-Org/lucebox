@@ -1292,9 +1292,11 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         sconfig.disk_cache_dir.clear();
         sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
     }
+    // Every concurrent engine takes its prefix checkpoints from the scheduler:
+    // paged engines copy pages, qwen4exp copies full-cache snapshots. Both use
+    // the concurrent budget and no single-sequence superseded pruning.
     sconfig.concurrent_paged_prefix_cache =
-        backend_cache.paged_attention && backend_execution.max_concurrency > 1 &&
-        sconfig.prefix_cache_cap > 0;
+        backend_execution.max_concurrency > 1 && sconfig.prefix_cache_cap > 0;
 
     if (sconfig.agent_turn_cache && backend_cache.paged_attention) {
         std::fprintf(stderr,

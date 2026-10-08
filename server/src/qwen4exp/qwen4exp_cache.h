@@ -224,7 +224,9 @@ struct Qwen4ExpSnapshot {
 size_t qwen4exp_snapshot_bytes(ggml_backend_t backend, const Qwen4ExpCache & c, int tokens,
                              size_t * host_bytes = nullptr);
 bool save_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpCache & c, Qwen4ExpSnapshot & s);
-void restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c);
+// Restore into `c`, the cache `s` was saved from or another one with the same layout (a
+// concurrency slot resuming another slot's checkpoint). False, with `c` untouched, otherwise.
+bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c);
 void free_qwen4exp_snapshot(Qwen4ExpSnapshot & s);
 
 }  // namespace luce::common
