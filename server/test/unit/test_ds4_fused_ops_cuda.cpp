@@ -475,6 +475,124 @@ bool run_glu_q8(ggml_backend_t backend, int n_ff, int n_used, int tokens, uint32
     return ok;
 }
 
+// The cluster shared expert's gate/up pair: Q8_0 row slices of wider weights
+// at several columns (batch-invariant MMVQ), fused with SwiGLU-DS4 into one
+// RDNA4 launch (ggml_cuda_mmvq_rdna4_glu_pair) vs the same products kept
+// apart (a copy between each product and the GLU breaks the pattern).
+bool run_glu_pair(ggml_backend_t backend, int n_in, int n_full, int n_ff, int ff_begin, int ncols, uint32_t seed) {
+    ggml_init_params params{};
+    params.mem_size = ggml_tensor_overhead() * 48 + ggml_graph_overhead();
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * gw = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_in, n_full);
+    ggml_tensor * uw = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_in, n_full);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, ncols);
+    for (ggml_tensor * t : {gw, uw, x}) ggml_set_input(t);
+    auto slice = [&](ggml_tensor * w) {
+        return ggml_view_2d(ctx, w, n_in, n_ff, w->nb[1], (size_t) ff_begin * w->nb[1]);
+    };
+    ggml_tensor * fus = ggml_swiglu_ds4_split(ctx, ggml_mul_mat(ctx, slice(gw), x), ggml_mul_mat(ctx, slice(uw), x), 7.0f);
+    ggml_tensor * ref = ggml_swiglu_ds4_split(ctx, ggml_cont(ctx, ggml_mul_mat(ctx, slice(gw), x)),
+                                              ggml_cont(ctx, ggml_mul_mat(ctx, slice(uw), x)), 7.0f);
+    for (ggml_tensor * t : {fus, ref}) ggml_set_output(t);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, fus);
+    ggml_build_forward_expand(gf, ref);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> h_w((size_t) n_in * n_full), h_x((size_t) n_in * ncols);
+    std::vector<uint8_t> h_q(ggml_nbytes(gw));
+    for (ggml_tensor * w : {gw, uw}) {
+        for (float & v : h_w) v = normal(rng) * 0.05f;
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, h_w.data(), h_q.data(), 0, n_full, n_in, nullptr);
+        ggml_backend_tensor_set(w, h_q.data(), 0, h_q.size());
+    }
+    for (float & v : h_x) v = normal(rng);
+    ggml_backend_tensor_set(x, h_x.data(), 0, sizeof(float) * h_x.size());
+    bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    const size_t n = (size_t) n_ff * ncols;
+    std::vector<float> a(n), b(n);
+    if (ok) {
+        ggml_backend_tensor_get(ref, a.data(), 0, sizeof(float) * n);
+        ggml_backend_tensor_get(fus, b.data(), 0, sizeof(float) * n);
+        for (size_t i = 0; i < n; ++i) {
+            if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+                std::fprintf(stderr, "glu pair mismatch n_in=%d n_ff=%d begin=%d cols=%d at %zu: ref %.9g fused %.9g\n",
+                             n_in, n_ff, ff_begin, ncols, i, a[i], b[i]);
+                ok = false;
+                break;
+            }
+        }
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return ok;
+}
+
+// A rank's slice of a Q8_0 contraction: a column-range view flagged with
+// ggml_backend_cuda_mul_mat_whole_row_lanes vs the whole rows times the slice
+// zero-padded to full width (build_shared_ffn_slice's padded form).
+bool run_col_slice(ggml_backend_t backend, int n_out, int n_full, int k_begin, int k_count, int ncols, uint32_t seed) {
+    ggml_init_params params{};
+    params.mem_size = ggml_tensor_overhead() * 48 + ggml_graph_overhead();
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_full, n_out);
+    ggml_tensor * mid = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_count, ncols);
+    for (ggml_tensor * t : {w, mid}) ggml_set_input(t);
+    ggml_tensor * view = ggml_view_2d(ctx, w, k_count, n_out, w->nb[1], ggml_row_size(GGML_TYPE_Q8_0, k_begin));
+    ggml_tensor * fus = ggml_mul_mat(ctx, view, mid);
+    ggml_backend_cuda_mul_mat_whole_row_lanes(fus);
+    ggml_tensor * zeros = ggml_scale(ctx, mid, 0.0f);
+    ggml_tensor * padded = nullptr;
+    for (int off = 0; off < n_full; off += k_count) {
+        ggml_tensor * piece = off == k_begin ? mid : zeros;
+        padded = padded ? ggml_concat(ctx, padded, piece, 0) : piece;
+    }
+    ggml_tensor * ref = ggml_mul_mat(ctx, w, padded);
+    for (ggml_tensor * t : {fus, ref}) ggml_set_output(t);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, fus);
+    ggml_build_forward_expand(gf, ref);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> h_w((size_t) n_full * n_out), h_m((size_t) k_count * ncols);
+    for (float & v : h_w) v = normal(rng) * 0.05f;
+    for (float & v : h_m) v = normal(rng);
+    std::vector<uint8_t> h_q(ggml_nbytes(w));
+    ggml_quantize_chunk(GGML_TYPE_Q8_0, h_w.data(), h_q.data(), 0, n_out, n_full, nullptr);
+    ggml_backend_tensor_set(w, h_q.data(), 0, h_q.size());
+    ggml_backend_tensor_set(mid, h_m.data(), 0, sizeof(float) * h_m.size());
+    bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    const size_t n = (size_t) n_out * ncols;
+    std::vector<float> a(n), b(n);
+    if (ok) {
+        ggml_backend_tensor_get(ref, a.data(), 0, sizeof(float) * n);
+        ggml_backend_tensor_get(fus, b.data(), 0, sizeof(float) * n);
+        for (size_t i = 0; i < n; ++i) {
+            if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+                std::fprintf(stderr, "col slice mismatch n_out=%d n_full=%d begin=%d count=%d cols=%d at %zu: ref %.9g fused %.9g\n",
+                             n_out, n_full, k_begin, k_count, ncols, i, a[i], b[i]);
+                ok = false;
+                break;
+            }
+        }
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return ok;
+}
+
 #if defined(GGML_USE_HIP)
 // rms_norm * w -> tail rope -> F16 copy (the K/V latent of the flash lanes)
 // in one launch vs the three; the reference keeps its rms_norm as an output.
@@ -792,6 +910,19 @@ int main() {
     const int rope_q8_cases[][3] = {{32, 8, 5}, {32, 8, 2}, {64, 8, 3}, {16, 4, 5}};
     for (const auto & rc : rope_q8_cases) {
         if (!run_rope_q8(backend, rc[0], rc[1], rc[2], seed++)) ++failures;
+    }
+    {
+        // Verify-shaped products: batch-invariant MMVQ, as the DS4 verify runs them.
+        const bool prev = ggml_backend_cuda_set_mmvq_batch_invariant(true);
+        const int pair_cases[][5] = {{1024, 64, 32, 0, 5}, {1024, 64, 32, 32, 4}, {5120, 96, 48, 48, 2}, {1024, 64, 32, 32, 8}};
+        for (const auto & pc : pair_cases) {
+            if (!run_glu_pair(backend, pc[0], pc[1], pc[2], pc[3], pc[4], seed++)) ++failures;
+        }
+        const int slice_cases[][5] = {{64, 2304, 0, 1152, 5}, {64, 2304, 1152, 1152, 4}, {96, 4096, 2048, 2048, 3}, {64, 2304, 1152, 1152, 1}};
+        for (const auto & sc : slice_cases) {
+            if (!run_col_slice(backend, sc[0], sc[1], sc[2], sc[3], sc[4], seed++)) ++failures;
+        }
+        ggml_backend_cuda_set_mmvq_batch_invariant(prev);
     }
     ggml_backend_free(backend);
     std::printf("ds4 fused ops: %d failures\n", failures);

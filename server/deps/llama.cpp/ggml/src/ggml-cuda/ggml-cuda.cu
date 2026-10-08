@@ -3140,6 +3140,19 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         return true;
     }
 
+    // RDNA4 Q8_0 gate/up pairs at several columns (the cluster shared expert in
+    // a verify): one launch reads both matrices and writes the SwiGLU-DS4.
+    if (!ids && direct_vector_layout && src1->ne[1] <= ggml_cuda_mmvq_max_ncols() &&
+        !ggml_backend_buft_is_cuda_split(src0->buffer->buft) &&
+        !ggml_backend_buft_is_cuda_split(gate->src[0]->buffer->buft) &&
+        ggml_cuda_mmvq_rdna4_glu_pair(gate, up, glu)) {
+        ggml_cuda_mm_fusion_args_host fusion_data{};
+        fusion_data.gate = gate->src[0];
+        ggml_cuda_set_fusion_glu_params(fusion_data, glu);
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, glu, &fusion_data);
+        return true;
+    }
+
     if (direct_vector_layout && ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
         ggml_cuda_mm_fusion_args_host fusion_data{};
         fusion_data.gate = gate->src[0];
@@ -6283,6 +6296,37 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                     bool fused_mul_mat_vec = false;
                     int fused_node_count = 0;
+
+                    // An RDNA4 Q8_0 gate/up pair whose weights are views (the cluster
+                    // shared expert's row slices): the views launch nothing, so the
+                    // pair and its GLU are the next three nodes that launch something.
+                    if (node->op == GGML_OP_MUL_MAT) {
+                        int j = i + 1;
+                        while (j < cgraph->n_nodes && ggml_cuda_node_is_noop(cgraph->nodes[j])) ++j;
+                        int k = j + 1;
+                        while (k < cgraph->n_nodes && ggml_cuda_node_is_noop(cgraph->nodes[k])) ++k;
+                        if (k < cgraph->n_nodes && j > i + 1 && cgraph->nodes[j]->op == GGML_OP_MUL_MAT &&
+                            cgraph->nodes[k]->op == GGML_OP_GLU &&
+                            cgraph->nodes[k]->src[0] == node && cgraph->nodes[k]->src[1] == cgraph->nodes[j]) {
+                            ggml_tensor * up_n  = cgraph->nodes[j];
+                            ggml_tensor * glu_n = cgraph->nodes[k];
+                            const int idxs[3] = { i, j, k };
+                            const enum ggml_op ops3[3] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
+                            const int outs[1] = { k };
+                            if (ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, ops3, outs, 1) &&
+                                up_n->src[1]->ne[1] <= ggml_cuda_mmvq_max_ncols() &&
+                                !ggml_backend_buft_is_cuda_split(up_n->src[0]->buffer->buft) &&
+                                !ggml_backend_buft_is_cuda_split(node->src[0]->buffer->buft) &&
+                                ggml_cuda_mmvq_rdna4_glu_pair(node, up_n, glu_n)) {
+                                ggml_cuda_mm_fusion_args_host fusion_data{};
+                                fusion_data.gate = node->src[0];
+                                ggml_cuda_set_fusion_glu_params(fusion_data, glu_n);
+                                ggml_cuda_mul_mat_vec_q(*cuda_ctx, up_n->src[0], up_n->src[1], nullptr, glu_n, &fusion_data);
+                                i = k;
+                                continue;
+                            }
+                        }
+                    }
 
                     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
                         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;

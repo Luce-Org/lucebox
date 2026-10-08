@@ -2602,7 +2602,10 @@ static void mul_mat_vec_q_moe_launch(
 // kernel at every width, so decode and verify stay consistent.
 #define MMVQ_Q8_RDNA4_MAX_COLS 8
 
-template <int ncols_dst, int c_rows, int c_vw, int c_row_groups>
+// glu: vx is the up matrix, vx_gate the gate matrix of the same shape; each
+// product keeps the single kernel's partials and reduction, and dst gets
+// ggml_cuda_op_swiglu_ds4_single(gate, up, glu_limit), the GLU kernel's value.
+template <int ncols_dst, int c_rows, int c_vw, int c_row_groups, bool glu = false>
 __launch_bounds__(32*c_vw*c_row_groups, 1)
 static __global__ void mul_mat_vec_q8_0_rdna4(
         const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
@@ -2610,7 +2613,7 @@ static __global__ void mul_mat_vec_q8_0_rdna4(
         const int stride_col_dst, const uint3 channel_ratio, const int stride_channel_x,
         const int stride_channel_y, const int stride_channel_dst, const uint3 sample_ratio,
         const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int kb_off) {
+        const int kb_off, const void * __restrict__ vx_gate, const float glu_limit) {
     constexpr int nvirt = 8;               // waves of the reference block
     constexpr int nq    = nvirt / c_vw;    // virtual waves per physical wave
     static_assert(nvirt % c_vw == 0, "c_vw must divide eight");
@@ -2632,22 +2635,30 @@ static __global__ void mul_mat_vec_q8_0_rdna4(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
     const block_q8_0 * x = ((const block_q8_0 *) vx) + sample_x*stride_sample_x + channel_x*stride_channel_x;
 
+    const block_q8_0 * xg = glu ? ((const block_q8_0 *) vx_gate) + sample_x*stride_sample_x + channel_x*stride_channel_x : x;
+
     const block_q8_0 * xr[c_rows];
+    const block_q8_0 * xgr[c_rows];
     bool row_ok[c_rows];
 #pragma unroll
     for (int r = 0; r < c_rows; ++r) {
         const int row = row_base + r;
         row_ok[r] = row < nrows_x;
-        xr[r] = x + (int64_t) (row_ok[r] ? row : 0)*stride_row_x;
+        xr[r]  = x  + (int64_t) (row_ok[r] ? row : 0)*stride_row_x;
+        xgr[r] = xg + (int64_t) (row_ok[r] ? row : 0)*stride_row_x;
     }
 
     float part[c_rows][ncols_dst][nq];
+    float partg[glu ? c_rows : 1][ncols_dst][nq];
 #pragma unroll
     for (int r = 0; r < c_rows; ++r)
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j)
 #pragma unroll
-            for (int q = 0; q < nq; ++q) part[r][j][q] = 0.0f;
+            for (int q = 0; q < nq; ++q) {
+                part[r][j][q] = 0.0f;
+                if constexpr (glu) partg[r][j][q] = 0.0f;
+            }
 
     // kb_off > 0: the rows are a column range starting at block kb_off of
     // wider rows (ggml_backend_cuda_mul_mat_whole_row_lanes). Each block takes
@@ -2682,12 +2693,26 @@ static __global__ void mul_mat_vec_q8_0_rdna4(
                         sumi = ggml_cuda_dp4a(v1, u1[j], sumi);
                         part[r][j][q] += dx*dy[j] * ((float) sumi);
                     }
+                    if constexpr (glu) {
+                        const block_q8_0 * bg = xgr[r] + kbx;
+                        const int   g0 = get_int_b2(bg->qs, 2*quarter + 0);
+                        const int   g1 = get_int_b2(bg->qs, 2*quarter + 1);
+                        const float dg = bg->d;
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            int sumg = 0;
+                            sumg = ggml_cuda_dp4a(g0, u0[j], sumg);
+                            sumg = ggml_cuda_dp4a(g1, u1[j], sumg);
+                            partg[r][j][q] += dg*dy[j] * ((float) sumg);
+                        }
+                    }
                 }
             }
         }
     }
 
     float sum[c_rows][ncols_dst];
+    float sumg[glu ? c_rows : 1][ncols_dst];
     if constexpr (c_vw == 1) {
 #pragma unroll
         for (int r = 0; r < c_rows; ++r)
@@ -2699,15 +2724,27 @@ static __global__ void mul_mat_vec_q8_0_rdna4(
                     t += part[r][j][q];
                 }
                 sum[r][j] = t;
+                if constexpr (glu) {
+                    float tg = partg[r][j][0];
+#pragma unroll
+                    for (int q = 1; q < nvirt; ++q) {
+                        tg += partg[r][j][q];
+                    }
+                    sumg[r][j] = tg;
+                }
             }
     } else {
         __shared__ float sh[c_row_groups][c_vw][c_rows][ncols_dst][nq][32];
+        __shared__ float shg[glu ? c_row_groups : 1][glu ? c_vw : 1][glu ? c_rows : 1][ncols_dst][glu ? nq : 1][32];
 #pragma unroll
         for (int r = 0; r < c_rows; ++r)
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j)
 #pragma unroll
-                for (int q = 0; q < nq; ++q) sh[rg][g][r][j][q][lane] = part[r][j][q];
+                for (int q = 0; q < nq; ++q) {
+                    sh[rg][g][r][j][q][lane] = part[r][j][q];
+                    if constexpr (glu) shg[rg][g][r][j][q][lane] = partg[r][j][q];
+                }
         __syncthreads();
         if (g != 0) {
             return;
@@ -2722,6 +2759,14 @@ static __global__ void mul_mat_vec_q8_0_rdna4(
                     t += sh[rg][v % c_vw][r][j][v / c_vw][lane];
                 }
                 sum[r][j] = t;
+                if constexpr (glu) {
+                    float tg = shg[rg][0][r][j][0][lane];
+#pragma unroll
+                    for (int v = 1; v < nvirt; ++v) {
+                        tg += shg[rg][v % c_vw][r][j][v / c_vw][lane];
+                    }
+                    sumg[r][j] = tg;
+                }
             }
     }
 
@@ -2731,7 +2776,12 @@ static __global__ void mul_mat_vec_q8_0_rdna4(
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
             const float t = warp_reduce_sum<32>(sum[r][j]);
-            if (lane == 0 && row_ok[r]) {
+            if constexpr (glu) {
+                const float tg = warp_reduce_sum<32>(sumg[r][j]);
+                if (lane == 0 && row_ok[r]) {
+                    dst[j*stride_col_dst + row_base + r] = ggml_cuda_op_swiglu_ds4_single(tg, t, glu_limit);
+                }
+            } else if (lane == 0 && row_ok[r]) {
                 dst[j*stride_col_dst + row_base + r] = t;
             }
         }
@@ -2744,6 +2794,44 @@ static bool mmvq_q8_0_rdna4_enabled() {
         return !(e && e[0] == '0' && e[1] == '\0');
     }();
     return enabled;
+}
+
+// A Q8_0 gate/up pair (two MUL_MATs on the same activations) whose SwiGLU-DS4
+// reads exactly their outputs, at 2..8 columns of batch-invariant products on
+// RDNA4: ggml_cuda_mul_mat_vec_q with the gate as fusion runs it as one launch
+// of mul_mat_vec_q8_0_rdna4, bit-identical to the two products and the GLU
+// kernel (the caller rules out split buffers). LUCE_CUDA_MMVQ_Q8_RDNA4_GLU=0
+// keeps three launches.
+bool ggml_cuda_mmvq_rdna4_glu_pair(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu) {
+    static const bool enabled = []() {
+        const char * e = std::getenv("LUCE_CUDA_MMVQ_Q8_RDNA4_GLU");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    if (!enabled || !mmvq_q8_0_rdna4_enabled() || !ggml_cuda_mmvq_batch_invariant()) return false;
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA4(cc) || ggml_cuda_info().devices[device].warp_size != 32 ||
+        get_device_table_id(cc) != MMVQ_PARAMETERS_RDNA4 ||
+        calc_nwarps(GGML_TYPE_Q8_0, 1, MMVQ_PARAMETERS_RDNA4) != 8) {
+        return false;
+    }
+    if (gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT) return false;
+    const ggml_tensor * g0 = gate->src[0];
+    const ggml_tensor * u0 = up->src[0];
+    const ggml_tensor * x  = up->src[1];
+    if (g0->type != GGML_TYPE_Q8_0 || u0->type != GGML_TYPE_Q8_0 || gate->src[1] != x ||
+        !ggml_are_same_shape(g0, u0) || !ggml_are_same_stride(g0, u0) ||
+        x->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+        x->ne[2] != 1 || x->ne[3] != 1 || g0->ne[2] != 1 || g0->ne[3] != 1) {
+        return false;
+    }
+    if (x->ne[1] < 2 || x->ne[1] > MMVQ_Q8_RDNA4_MAX_COLS) return false;
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_DS4 ||
+        glu->src[0] != gate || glu->src[1] != up || ggml_get_op_params_i32(glu, 1) != 0 ||
+        glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
+        return false;
+    }
+    return true;
 }
 
 template <int ncols_dst, int c_rows, int c_vw, int c_row_groups>
@@ -2760,7 +2848,31 @@ static void mul_mat_vec_q8_0_rdna4_launch_cfg(
     mul_mat_vec_q8_0_rdna4<ncols_dst, c_rows, c_vw, c_row_groups><<<block_nums, block_dims, 0, stream>>>(
         vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, kb_off);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, kb_off, nullptr, 0.0f);
+}
+
+// The gate/up pair with SwiGLU-DS4 (ggml_cuda_mmvq_rdna4_glu_pair): one block
+// shape, two rows per wave over four waves, whose cross-wave partials of both
+// products fit the LDS at eight columns. Every shape is bit-exact, so the pair
+// gives the value of the two table-shaped products and the GLU kernel.
+template <int ncols_dst>
+static void mul_mat_vec_q8_0_rdna4_launch_glu(
+        const void * vx, const void * vx_gate, const void * vy, float * dst, const float glu_limit,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y,
+        const int stride_col_dst, const int nchannels_dst, const uint3 channel_ratio,
+        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int nsamples_dst, const uint3 sample_ratio, const int stride_sample_x,
+        const int stride_sample_y, const int stride_sample_dst, cudaStream_t stream) {
+    constexpr int c_rows = 2, c_vw = 4, c_row_groups = 1;
+    static_assert(2u*c_row_groups*c_vw*c_rows*ncols_dst*(8/c_vw)*32*sizeof(float) <= 65536,
+                  "both products' partials must fit the LDS");
+    constexpr int rows_per_block = c_rows*c_row_groups;
+    const dim3 block_nums((nrows_x + rows_per_block - 1)/rows_per_block, nchannels_dst, nsamples_dst);
+    const dim3 block_dims(32, c_vw*c_row_groups, 1);
+    mul_mat_vec_q8_0_rdna4<ncols_dst, c_rows, c_vw, c_row_groups, true><<<block_nums, block_dims, 0, stream>>>(
+        vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, 0, vx_gate, glu_limit);
 }
 
 template <int ncols_dst>
@@ -2791,13 +2903,34 @@ static void mul_mat_vec_q8_0_rdna4_launch_nc(
 #undef Q8_RDNA4_LAUNCH
 }
 
+// vx_gate set: the gate/up pair (vx is the up matrix), 2..8 columns, no column range.
 static void mul_mat_vec_q8_0_rdna4_launch(
         const void * vx, const void * vy, float * dst, const int ncols_dst,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y,
         const int stride_col_dst, const int nchannels_dst, const uint3 channel_ratio,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_dst, const uint3 sample_ratio, const int stride_sample_x,
-        const int stride_sample_y, const int stride_sample_dst, const int kb_off, cudaStream_t stream) {
+        const int stride_sample_y, const int stride_sample_dst, const int kb_off,
+        const void * vx_gate, const float glu_limit, cudaStream_t stream) {
+    if (vx_gate) {
+        GGML_ASSERT(kb_off == 0);
+#define Q8_RDNA4_GLU_NC(NC) case NC: mul_mat_vec_q8_0_rdna4_launch_glu<NC>(vx, vx_gate, vy, dst, glu_limit, \
+        ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, channel_ratio, \
+        stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio, \
+        stride_sample_x, stride_sample_y, stride_sample_dst, stream); break
+        switch (ncols_dst) {
+            Q8_RDNA4_GLU_NC(2);
+            Q8_RDNA4_GLU_NC(3);
+            Q8_RDNA4_GLU_NC(4);
+            Q8_RDNA4_GLU_NC(5);
+            Q8_RDNA4_GLU_NC(6);
+            Q8_RDNA4_GLU_NC(7);
+            Q8_RDNA4_GLU_NC(8);
+            default: GGML_ABORT("unreachable q8_0 rdna4 glu width");
+        }
+#undef Q8_RDNA4_GLU_NC
+        return;
+    }
 #define Q8_RDNA4_NC(NC) case NC: mul_mat_vec_q8_0_rdna4_launch_nc<NC>(vx, vy, dst, ncols_x, nrows_x, \
         stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, channel_ratio, stride_channel_x, \
         stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio, stride_sample_x, \
@@ -2993,7 +3126,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // arithmetic, packed rows, see mul_mat_vec_q8_0_rdna4.
 #if defined(GGML_USE_HIP)
     if constexpr (type == GGML_TYPE_Q8_0) {
-        if (!has_ids && !has_fusion && (ncols_dst == 1 || width_invariant) &&
+        // A gate/up pair with SwiGLU-DS4 and nothing else fused (see
+        // ggml_cuda_mmvq_rdna4_glu_pair) runs as one launch of this kernel.
+        const bool rdna4_glu = has_fusion && fusion.gate != nullptr && fusion.x_bias == nullptr &&
+            fusion.gate_bias == nullptr && fusion.glu_op == GGML_GLU_OP_SWIGLU_DS4 &&
+            fusion.gate_value_scale == 1.0f && fusion.x_value_scale == 1.0f && kb_off == 0;
+        if (!has_ids && (!has_fusion || rdna4_glu) && (ncols_dst == 1 || width_invariant) &&
             ncols_dst <= MMVQ_Q8_RDNA4_MAX_COLS && GGML_CUDA_CC_IS_RDNA4(cc) &&
             warp_size == 32 && table_id == MMVQ_PARAMETERS_RDNA4 &&
             calc_nwarps(type, 1, table_id) == 8 && mmvq_q8_0_rdna4_enabled()) {
@@ -3001,11 +3139,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 vx, vy, dst, ncols_dst, ncols_x, nrows_x, stride_row_x, stride_col_y,
                 stride_col_dst, nchannels_dst, channel_ratio_fd, stride_channel_x,
                 stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio_fd,
-                stride_sample_x, stride_sample_y, stride_sample_dst, kb_off, stream);
+                stride_sample_x, stride_sample_y, stride_sample_dst, kb_off,
+                rdna4_glu ? fusion.gate : nullptr, fusion.glu_param0, stream);
             return;
         }
     }
 #endif // defined(GGML_USE_HIP)
+    // The generic kernels fuse one column only; several columns are the RDNA4
+    // Q8_0 gate/up pair above (ggml_cuda_mmvq_rdna4_glu_pair).
+    GGML_ASSERT(!has_fusion || has_ids || ncols_dst == 1);
     if constexpr (type == GGML_TYPE_Q8_0) {
         if (width_invariant) {
 #define GGML_MMVQ_INVARIANT_LAUNCH(NC) \
@@ -3564,7 +3706,11 @@ void ggml_cuda_mul_mat_vec_q(
     ggml_cuda_mm_fusion_args_device fusion_local{};
 
     if (fusion) {
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        // Several columns only for the RDNA4 Q8_0 gate/up pair (a gate, no
+        // biases: ggml_cuda_mmvq_rdna4_glu_pair), which switch_ncols_dst runs
+        // on mul_mat_vec_q8_0_rdna4.
+        GGML_ASSERT(  ids || dst->ne[1] == 1 ||
+                    (src0->type == GGML_TYPE_Q8_0 && fusion->gate && !fusion->x_bias && !fusion->gate_bias));
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
