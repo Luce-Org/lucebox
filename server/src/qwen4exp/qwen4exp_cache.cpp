@@ -262,4 +262,91 @@ void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c) {
     c.ple_prev.clear();
 }
 
+namespace {
+// One contiguous strip per KV head; recurrent tensors are copied in full.
+// The same enumeration sizes, saves and restores the snapshot.
+template<class F>
+void snapshot_strips(const Qwen4ExpCache & c, int pos, int blocks, F visit) {
+    auto prefix = [&](ggml_tensor * t, int rows) {
+        if (!t || rows <= 0) return;
+        for (int64_t h = 0; h < t->ne[2]; ++h) visit(t, h * t->nb[2], rows * t->nb[1]);
+    };
+    for (auto * t : c.attn_k) prefix(t, pos);
+    for (auto * t : c.attn_v) prefix(t, pos);
+    for (auto * t : c.indexer_raw) prefix(t, pos);
+    for (auto * t : c.indexer_k) prefix(t, blocks);
+    prefix(c.mtp_k, pos - 1);
+    prefix(c.mtp_v, pos - 1);
+    for (const auto * group : {&c.ssm_state, &c.conv_state, &c.ple_conv_state}) {
+        for (auto * t : *group) if (t) visit(t, 0, ggml_nbytes(t));
+    }
+    if (c.mtp_prev_hidden) visit(c.mtp_prev_hidden, 0, ggml_nbytes(c.mtp_prev_hidden));
+}
+} // namespace
+
+size_t qwen4exp_snapshot_bytes(ggml_backend_t backend, const Qwen4ExpCache & c, int tokens, size_t * host_bytes) {
+    if (host_bytes) *host_bytes = 0;
+    const int pos = std::clamp(tokens, 0, c.max_ctx);
+    if (!pos) return 0;
+    const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_get_default_buffer_type(backend));
+    size_t bytes = 0, count = 0;
+    // The supported QSA layout pools four rows per block. Dense prefill can
+    // have fewer valid blocks; this bound also covers its later completion.
+    snapshot_strips(c, pos, pos / 4, [&](ggml_tensor *, size_t, size_t n) {
+        bytes += (n + alignment - 1) / alignment * alignment;
+        ++count;
+    });
+    if (host_bytes) *host_bytes = (2 * count + 1) * ggml_tensor_overhead() +
+        count * sizeof(std::pair<ggml_tensor *, ggml_tensor *>);
+    return bytes;
+}
+
+void free_qwen4exp_snapshot(Qwen4ExpSnapshot & s) {
+    if (s.buf) ggml_backend_buffer_free(s.buf);
+    if (s.ctx) ggml_free(s.ctx);
+    s = {};
+}
+
+bool save_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpCache & c, Qwen4ExpSnapshot & s) {
+    free_qwen4exp_snapshot(s);
+    if (c.cur_pos <= 0 || (c.mtp_k && c.mtp_prev_pos != c.cur_pos - 1)) return false;
+    size_t count = 0;
+    snapshot_strips(c, c.cur_pos, c.indexer_blocks, [&](ggml_tensor *, size_t, size_t) { ++count; });
+    s.ctx = ggml_init({(2 * count + 1) * ggml_tensor_overhead(), nullptr, true});
+    if (!s.ctx) return false;
+    s.strips.reserve(count);
+    snapshot_strips(c, c.cur_pos, c.indexer_blocks, [&](ggml_tensor * t, size_t off, size_t bytes) {
+        const int64_t n = bytes / ggml_type_size(t->type) * ggml_blck_size(t->type);
+        auto * live = ggml_view_1d(s.ctx, t, n, off);
+        auto * copy = ggml_new_tensor_1d(s.ctx, t->type, n);
+        s.strips.emplace_back(live, copy);
+    });
+    s.buf = ggml_backend_alloc_ctx_tensors(s.ctx, backend);
+    if (!s.buf) { free_qwen4exp_snapshot(s); return false; }
+    for (auto [live, copy] : s.strips) ggml_backend_tensor_copy_async(backend, backend, live, copy);
+    ggml_backend_synchronize(backend);
+    s.cur_pos = c.cur_pos;
+    s.indexer_blocks = c.indexer_blocks;
+    s.mtp_prev_pos = c.mtp_prev_pos;
+    s.kv_bucket_base = c.kv_bucket_base;
+    s.ple_prev = c.ple_prev;
+    return true;
+}
+
+void restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c) {
+    ggml_backend_synchronize(backend); // finish rollback before clearing its source/destination buffer
+    clear_qwen4exp_decode_workspace(c.decode_workspace);
+    // Clear masked suffixes too: stable QSA scores the entire bucket.
+    ggml_backend_buffer_clear(c.buf, 0);
+    for (auto [live, copy] : s.strips) ggml_backend_tensor_copy_async(backend, backend, copy, live);
+    ggml_backend_synchronize(backend);
+    c.cur_pos = s.cur_pos;
+    c.indexer_blocks = s.indexer_blocks;
+    c.mtp_prev_pos = s.mtp_prev_pos;
+    c.kv_bucket_base = s.kv_bucket_base;
+    c.ple_prev = s.ple_prev;
+    c.spec_pos = -1;
+    c.spec_tokens = 0;
+}
+
 }  // namespace luce::common

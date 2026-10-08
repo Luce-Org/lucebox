@@ -132,7 +132,7 @@ struct SchedulerTestHarness {
     static void finalize_inline_snapshot(
             HttpServer & server, const std::vector<int32_t> & prompt,
             PrefixCache::InlineReservation reservation,
-            int slot, int requested_cut) {
+            int slot, int requested_cut, int restore_slot = -1) {
         ParsedRequest req;
         req.prompt_tokens = prompt;
         HttpServer::PreparedPrompt prepared;
@@ -142,6 +142,8 @@ struct SchedulerTestHarness {
         cache.snap_slot = slot;
         cache.snap_cut = requested_cut;
         cache.snap_prepared = true;
+        cache.using_restore = restore_slot >= 0;
+        cache.cache_slot = restore_slot;
         GenerateResult result;
         result.error.reset();
         server.finalize_generation_cache(
@@ -188,6 +190,7 @@ struct SchedulerTestHarness {
         int restore_slot;   // -1 without a restore
         int prefix_len;
         bool snapshot;      // an inline snapshot is planned
+        std::vector<int> restore_points;
     };
 
     static PreparedCache prepare_cache(
@@ -204,7 +207,7 @@ struct SchedulerTestHarness {
         const auto cache = server.prepare_generation_cache(
             req, prepared, generate_request);
         return {cache.using_restore ? cache.cache_slot : -1, cache.prefix_len,
-                cache.snap_prepared};
+                cache.snap_prepared, generate_request.restore_points};
     }
 };
 }
@@ -6781,6 +6784,30 @@ TEST_CASE(ServerUnitFixture, test_prepare_cache_skips_consumed_snapshot) {
     unlink(path.c_str());
 }
 
+TEST_CASE(ServerUnitFixture, test_prefix_replaced_ancestor_releases_metadata) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto owner = std::make_unique<SlotSetBackend>();
+    auto & backend = *owner;
+    LuceEngine engine(std::move(owner));
+    ServerConfig config;
+    config.prefix_cache_cap = 4;
+    HttpServer server(engine, tokenizer, config);
+    auto & cache = SchedulerTestHarness::prefix_cache(server);
+    const std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102};
+    cache.confirm_inline_snap(0, 2, prompt, true, 100);
+    auto reservation = cache.reserve_inline_snap(prompt, 2, false, 4, 0);
+    TEST_ASSERT(reservation.active());
+    const int slot = reservation.slot();
+    backend.positions[slot] = 4; // backend replaced source slot 0 under pressure
+    SchedulerTestHarness::finalize_inline_snapshot(server, prompt, std::move(reservation), slot, 4, 0);
+    TEST_ASSERT(cache.lookup_candidate(prompt, 2).first == -1);
+    TEST_ASSERT(cache.lookup_candidate(prompt, 6).first == slot);
+    TEST_ASSERT(cache.stats().resident_bytes == 0); // MockBackend estimates zero, old 100 bytes released
+    unlink(path.c_str());
+}
+
 static std::vector<int> prefill_chunk_starts(
         int kv_offset, int prompt_end, const std::vector<int> & points,
         int first_min_tokens = kQwen35MinChunkTokens) {
@@ -6834,11 +6861,12 @@ TEST_CASE(ServerUnitFixture, test_agent_continuation_throttles_snapshot) {
 
     // Slot 0 holds the first 3 tokens, slot 1 a generated-turn checkpoint
     // `filler` + 5 tokens in, and the prompt adds one more turn.
-    const auto prepare = [&](int filler, bool ends_with_tool_result) {
+    const auto prepare = [&](int filler, bool ends_with_tool_result, const char * arch = "qwen4exp") {
         auto backend_owner = std::make_unique<SlotSetBackend>();
         SlotSetBackend & backend = *backend_owner;
         LuceEngine engine(std::move(backend_owner));
         ServerConfig config;
+        config.arch = arch;
         config.prefix_cache_cap = 4;
         HttpServer server(engine, tokenizer, config);
         PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
@@ -6859,6 +6887,15 @@ TEST_CASE(ServerUnitFixture, test_agent_continuation_throttles_snapshot) {
     const auto near = prepare(1, /*ends_with_tool_result=*/true);
     TEST_ASSERT(near.restore_slot == 1);
     TEST_ASSERT(!near.snapshot);
+    // Even a skipped capture must keep the tool-end cut: a cold request can
+    // select a different snapshot, but must use the same prefill boundaries.
+    TEST_ASSERT(near.restore_points.back() == 9);
+    // Preserve the existing boundary policy for every other architecture.
+    for (const char * arch : {"", "qwen35", "qwen35moe", "deepseek4", "qwen3", "gemma4", "laguna"}) {
+        const auto other = prepare(1, true, arch);
+        TEST_ASSERT(other.restore_slot == 1 && !other.snapshot);
+        TEST_ASSERT(other.restore_points.back() == 7);
+    }
 
     const auto chat = prepare(1, /*ends_with_tool_result=*/false);
     TEST_ASSERT(chat.restore_slot == 1);

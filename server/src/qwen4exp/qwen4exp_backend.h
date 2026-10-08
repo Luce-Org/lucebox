@@ -49,9 +49,12 @@ public:
                                  const DaemonIO & io) override;
 
     bool snapshot_save(int slot) override;
+    bool snapshot_save_deferred(int slot) override;
+    void snapshot_flush_deferred() override;
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
+    size_t snapshot_bytes_estimate(int tokens) const override;
 
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,
@@ -64,6 +67,17 @@ public:
     void shutdown() override;
 
 private:
+    friend struct Qwen4ExpPrefixTest;
+    // Test-only proposal replacement and retained-logit check; empty in serving.
+    std::function<void(bool, std::vector<int32_t> &, const std::vector<float> &)> decode_check_;
+    GenerateResult run(const GenerateRequest & req, const DaemonIO & io, int restored, int restore_slot = -1);
+    bool snapshot_save_replacing(int slot, int source);
+    bool snapshot_fits(int slot, int replaced = -1) const;
+    size_t snapshot_budget_ = SIZE_MAX; // auto chunk reserves and enforces this allowance
+    std::array<Qwen4ExpSnapshot, kMaxSlots> snapshots_;
+    int live_slot_ = -1;
+    std::vector<int32_t> tokens_;
+    std::vector<float> logits_;
     Qwen4ExpBackendConfig cfg_;
     ggml_backend_t        backend_ = nullptr;
     Qwen4ExpWeights       weights_;

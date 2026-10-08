@@ -8,19 +8,27 @@
 
 namespace luce::common {
 
-// The largest prompt chunk: the gfx1151 MoE route sort serves batches of up to
-// 32768 tokens (ggml_cuda_launch_mm_ids_bounded); past it MUL_MAT_ID falls back
-// to the generic id helper, whose shared memory (4 bytes per token) overflows.
+// The gfx1151 MoE route sort serves at most 32768 prompt rows.
 constexpr int kQwen4ExpMaxChunk = 32768;
 
-// Largest 256-row tile multiple within a measured workspace budget, at most
+// Largest 256-row tile multiple within a measured workspace budget, capped at
 // kQwen4ExpMaxChunk. Above 512, the dense/QSA peak envelope grows with T. Small
 // contexts / low-memory fallbacks also try 256, 128, ... 1. Keep 10% of
-// available memory for runtime, driver and OS growth; private backend scratch
-// is an estimate, not gallocr.
+// available memory for runtime, driver and OS growth.
 template<class Measure>
-int qwen4exp_fit_chunk(int max_ctx, size_t available, size_t fixed, Measure measure) {
+int qwen4exp_fit_chunk(int max_ctx, size_t available, size_t fixed, Measure measure,
+                     size_t * snapshot_budget = nullptr) {
     const size_t budget = available - available / 10;
+    if (snapshot_budget) {
+        const size_t requested = *snapshot_budget;
+        *snapshot_budget = 0;
+        // Prefill speed first: reserve 4096 rows, or the fastest smaller
+        // chunk that fits. Snapshots get only the remaining safe budget.
+        const int floor = qwen4exp_fit_chunk(std::min(max_ctx, 4096), available, fixed, measure);
+        if (!floor) return 0;
+        *snapshot_budget = std::min(requested, budget - fixed - measure(floor));
+        fixed += *snapshot_budget;
+    }
     if (max_ctx <= 0 || fixed >= budget) return 0;
     int best = 0, lo = 2, hi = std::min(max_ctx, kQwen4ExpMaxChunk) / 256;
     while (lo <= hi) {
@@ -37,8 +45,12 @@ int qwen4exp_fit_chunk(int max_ctx, size_t available, size_t fixed, Measure meas
 
 struct Qwen4ExpWeights;
 struct Qwen4ExpCache;
-// Call after the weights and the cache are allocated, before prefill.
+// Call after weights and resident_slots caches are allocated, before prefill.
+// Other slots are reserved arithmetically, without risking trial allocations.
+// Optional prefix allowance: remaining memory after headroom, runtime state,
+// and a 4096-row chunk (or the fastest smaller chunk if 4096 cannot fit).
+// The caller must enforce the returned allowance on later snapshot captures.
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
-    Qwen4ExpCache & cache);
+    Qwen4ExpCache & cache, int slots = 1, int resident_slots = 1, size_t * snapshot_budget = nullptr);
 
 }  // namespace luce::common

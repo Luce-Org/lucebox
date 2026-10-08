@@ -19,7 +19,8 @@
 namespace luce::common {
 
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
-        Qwen4ExpCache & cache) {
+        Qwen4ExpCache & cache, int slots, int resident_slots, size_t * snapshot_budget) {
+    if (slots < 1 || resident_slots < 1 || resident_slots > slots) return 0;
     size_t free_device = 0, total = 0, free_host = 0;
     ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device_id(backend), &free_device, &total);
     ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_host, &total);
@@ -40,6 +41,7 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         count_shadow(w.ctx);
         for (auto * ctx : w.extra_meta_ctxs) count_shadow(ctx);
     }
+    const size_t state = ggml_backend_buffer_get_size(cache.buf);
     const bool mtp = qwen4exp_verify_supported(cache);
     const int ratio = w.compress_ratios.empty() ? 1 : std::max(1, *std::max_element(w.compress_ratios.begin(), w.compress_ratios.end()));
     const int dense_end = std::min(cache.max_ctx, w.indexer_top_k + ratio - 1);
@@ -62,7 +64,8 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         }
     }
     // The decode workspaces stay resident while the next prompt prefills.
-    const size_t fixed = shadow + shadow_tmp + decode + verify + draft;
+    const size_t fixed = (slots - resident_slots) * state + shadow + shadow_tmp +
+                         slots * (decode + verify + draft);
     std::fprintf(stderr, "[qwen4exp] chunk-runtime mtp=%d decode=%zu verify=%zu draft=%zu scratch=%zu host=%zu\n",
         (int) mtp, decode, verify, draft, runtime_scratch, runtime_host);
     struct Plan { size_t graph = 0, ring = 0, host = 0, scratch = 0; };
@@ -92,17 +95,14 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         for (const int tail : {511, 127, 1}) {
             if (tail < n && !measure(tail, cache.max_ctx)) return SIZE_MAX;
         }
-        plans.push_back({n, {graph, inputs + mask, host, scratch}});
-        return graph + inputs + mask + host + scratch;
-    });
-    for (const auto & [rows, p] : plans) {
-        if (rows != chunk) continue;
+        const size_t workspace = graph + slots * (inputs + mask) + host + scratch;
         std::fprintf(stderr, "[qwen4exp] chunk-plan rows=%d graph=%zu ring=%zu host=%zu scratch=%zu required=%zu available=%zu\n",
-            rows, p.graph, p.ring, p.host, p.scratch, fixed + p.graph + p.ring + p.host + p.scratch, available);
-        break;
-    }
-    std::fprintf(stderr, "[qwen4exp] chunk-auto ctx=%d chunk=%d fixed=%zu available=%zu headroom=%zu\n",
-        cache.max_ctx, chunk, fixed, available, available / 10);
+            n, graph, slots * (inputs + mask), host, scratch, fixed + workspace, available);
+        return workspace;
+    }, snapshot_budget);
+    std::fprintf(stderr, "[qwen4exp] chunk-auto ctx=%d slots=%d resident=%d chunk=%d state=%zu fixed=%zu available=%zu headroom=%zu\n",
+        cache.max_ctx, slots, resident_slots, chunk, state,
+        fixed + (snapshot_budget ? *snapshot_budget : 0), available, available / 10);
     return chunk;
 }
 
@@ -139,7 +139,13 @@ bool Qwen4ExpBackend::init() {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
         return false;
     }
-    chunk_ = cfg_.chunk > 0 ? cfg_.chunk : qwen4exp_select_chunk(backend_, weights_, cache_);
+    if (cfg_.chunk > 0) {
+        chunk_ = cfg_.chunk;
+    } else {
+        snapshot_budget_ = 3 * snapshot_bytes_estimate(cache_.max_ctx);
+        chunk_ = qwen4exp_select_chunk(backend_, weights_, cache_, 1, 1, &snapshot_budget_);
+        std::fprintf(stderr, "[qwen4exp] prefix snapshot allowance=%zu bytes\n", snapshot_budget_);
+    }
     if (chunk_ <= 0) {
         std::fprintf(stderr, "[qwen4exp] insufficient prefill memory at the configured context\n");
         return false;
@@ -165,6 +171,8 @@ bool Qwen4ExpBackend::park(ParkTarget target) {
         return false;
     }
     if (parked_) return true;
+    for (int i = 0; i < kMaxSlots; ++i) snapshot_free(i);
+    tokens_.clear(); logits_.clear();
     free_qwen4exp_cache(cache_);
     free_qwen4exp_weights(weights_);
     ggml_backend_cuda_trim_pool(backend_); // also frees the bf16 weight shadows keyed by the freed weights' addresses
@@ -200,7 +208,22 @@ bool Qwen4ExpBackend::unpark(ParkTarget target) {
 
 GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
                                               const DaemonIO & io) {
+    snapshot_flush_deferred();
+    tokens_.clear(); logits_.clear();
+    if (!parked_) reset_qwen4exp_state(backend_, cache_);
+    return run(req, io, 0);
+}
+
+GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO & raw_io, int restored, int restore_slot) {
     GenerateResult result;
+    result.restored_prefix_tokens = restored;
+    const DaemonIO io = raw_io.with_token_callback(req.on_token);
+    // A failed graph may have changed recurrent state. Never publish it.
+    struct Guard {
+        Qwen4ExpBackend & b;
+        bool complete = false;
+        ~Guard() { if (!complete) { b.tokens_.clear(); b.logits_.clear(); } }
+    } guard{*this};
     if (parked_) {
         result.fail(GenerateErrorCode::ModelParked, "qwen4exp target is parked");
         return result;
@@ -209,44 +232,70 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
         result.fail(GenerateErrorCode::PrefillFailed, "empty prompt");
         return result;
     }
+    if (req.prompt.size() > (size_t) cache_.max_ctx ||
+        (int64_t) req.prompt.size() + std::max(0, req.n_gen - 1) > cache_.max_ctx) {
+        result.fail(GenerateErrorCode::ContextOverflow, "qwen4exp request exceeds max_ctx");
+        return result;
+    }
 
-    std::vector<float> logits;
+    std::vector<float> logits = logits_;
     const int chunk = chunk_;
-    int pos = 0;
-
-    // A generate() call starts a fresh sequence.
-    reset_qwen4exp_state(backend_, cache_);
+    int pos = restored;
 
     // MTP speculation (sidecar loaded, default graph, a budget that leaves room for a draft): the draft head
     // predicts x_{p+2} from the pair (h_p, x_{p+1}), h_p being the trunk's final HC residual at p. Pairs at positions
     // [mtp_pos, ...) not yet run through the draft layer: mtp_h holds their hidden rows, mtp_tok the tokens known so
     // far (a pair's token arrives with the next forward).
-    const bool spec = !req.force_ar_decode && req.n_gen > 2 && qwen4exp_verify_supported(cache_);
+    const bool mtp = qwen4exp_verify_supported(cache_);
+    const bool spec = !req.force_ar_decode && req.n_gen > 2 && mtp;
     const size_t hd = (size_t) weights_.n_embd * weights_.n_hc;
     std::vector<float> hidden, mtp_h, mtp_logits;
     std::vector<int32_t> mtp_tok;
-    int mtp_pos = 0;
+    int mtp_pos = std::max(0, pos - 1);
+    if (mtp && pos > 0) {
+        mtp_h.resize(hd);
+        ggml_backend_tensor_get(cache_.mtp_prev_hidden, mtp_h.data(), 0, hd * sizeof(float));
+    }
+
+    // Each restore point starts a chunk in both cold and resumed requests.
+    // Capture cuts are restore points too, including a one-token interval.
+    std::vector<int> cuts = req.restore_points;
+    if (req.snap_slot >= 0 && req.snap_pos > 0) cuts.push_back(req.snap_pos);
+    std::sort(cuts.begin(), cuts.end());
+    auto capture = [&]() {
+        if (req.snap_slot >= 0 && req.snap_pos == pos) snapshot_save_replacing(req.snap_slot, restore_slot);
+    };
 
     const auto t_pre0 = std::chrono::steady_clock::now();
+    auto chunk_end = [&](int offset) {
+        int end = offset + std::min(chunk, (int) req.prompt.size() - offset);
+        const auto cut = std::upper_bound(cuts.begin(), cuts.end(), offset);
+        if (cut != cuts.end()) end = std::min(end, *cut);
+        return end;
+    };
     // Exactly one host-only gather ahead. A future joins before returning on
     // failure/cancellation, so neither the prompt nor the reader can be freed
     // while a worker is using it. No GPU or cache mutation on that thread.
-    auto prepare = [&](size_t offset) {
-        const size_t start = offset > (size_t) (weights_.ple_ngram_size - 1)
-            ? offset - (weights_.ple_ngram_size - 1) : 0;
+    auto prepare = [&](int offset) {
+        const int start = std::max(0, offset - std::max(0, weights_.ple_ngram_size - 1));
         std::vector<int32_t> prev(req.prompt.begin() + start, req.prompt.begin() + offset);
         return qwen4exp_prepare_inputs(weights_, req.prompt.data() + offset,
-            (int) std::min((size_t) chunk, req.prompt.size() - offset), prev);
+            chunk_end(offset) - offset, prev);
     };
-    auto inputs = prepare(0);
-    for (size_t i = 0; i < req.prompt.size();) {
-        const int n = (int) std::min((size_t) chunk, req.prompt.size() - i);
-        const size_t next = i + n;
+    capture();
+    auto inputs = pos < (int) req.prompt.size() ? prepare(pos) : Qwen4ExpInputs{};
+    while (pos < (int) req.prompt.size()) {
+        if (io.is_cancelled()) {
+            result.fail(GenerateErrorCode::Cancelled, "cancelled during prefill");
+            return result;
+        }
+        const int end = chunk_end(pos);
+        const int n = end - pos;
         std::future<Qwen4ExpInputs> pending;
-        if (next < req.prompt.size()) pending = std::async(std::launch::async, prepare, next);
-        const bool mtp_prefill = spec && n > 1;
+        if (end < (int) req.prompt.size()) pending = std::async(std::launch::async, prepare, end);
+        const bool mtp_prefill = mtp && n > 1;
         const Qwen4ExpForwardResult r = qwen4exp_forward(
-            backend_, weights_, cache_, req.prompt.data() + i, n, pos, logits, spec ? &hidden : nullptr,
+            backend_, weights_, cache_, req.prompt.data() + pos, n, pos, logits, mtp ? &hidden : nullptr,
             false, mtp_prefill, &inputs);
         if (!r.ok) {
             result.fail(GenerateErrorCode::PrefillFailed, "qwen4exp prefill forward failed");
@@ -255,7 +304,7 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
         if (mtp_prefill) {
             mtp_h.swap(hidden);
             mtp_pos = pos + n - 1;
-        } else if (spec) {   // single-row chunk: retain the original catch-up path
+        } else if (mtp) {   // single-row chunk: retain the original catch-up path
             mtp_tok.assign(req.prompt.begin() + pos + (pos == 0 ? 1 : 0), req.prompt.begin() + pos + n);
             mtp_h.insert(mtp_h.end(), hidden.begin(), hidden.end());
             const int n_pairs = (int) mtp_tok.size();
@@ -266,17 +315,26 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
             }
             mtp_h.erase(mtp_h.begin(), mtp_h.begin() + (std::ptrdiff_t) ((size_t) n_pairs * hd));
             mtp_pos += n_pairs;
+            ggml_backend_tensor_set(cache_.mtp_prev_hidden, mtp_h.data(), 0, hd * sizeof(float));
+            cache_.mtp_prev_pos = pos;
         }
         pos += n;
+        tokens_.insert(tokens_.end(), req.prompt.begin() + pos - n, req.prompt.begin() + pos);
+        logits_ = logits;
+        capture();
         if (io.is_cancelled()) {
             result.fail(GenerateErrorCode::Cancelled, "cancelled during prefill");
             return result;
         }
         if (pending.valid()) inputs = pending.get();
-        i = next;
     }
     const auto t_pre1 = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_pre1 - t_pre0).count();
+    if (req.n_gen <= 0) {
+        guard.complete = true;
+        result.succeed();
+        return result;
+    }
 
     std::mt19937_64 rng(req.sampler.seed != 0 ? req.sampler.seed
                                               : std::random_device{}());
@@ -308,7 +366,7 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
     const auto t_dec0 = std::chrono::steady_clock::now();
     int32_t next = sample(logits.data());
     bool more = req.n_gen > 0 && commit(next);
-    if (spec) mtp_tok.assign(1, next);
+    if (mtp) mtp_tok.assign(1, next);
     std::vector<int32_t> draft_tokens;
     while (more) {
         const int k = spec ? std::max(0, std::min({qwen4exp_mtp_next_width(width_policy) - 1,
@@ -323,12 +381,13 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
                 return result;
             }
             draft_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - td0).count();
+            if (decode_check_) decode_check_(true, draft_tokens, mtp_h);
         }
         std::array<int32_t, QWEN4EXP_MTP_MAX_VERIFY> in{}, samples{};
         in[0] = next;
         if (verify) std::copy(draft_tokens.begin(), draft_tokens.end(), in.begin() + 1);
         const Qwen4ExpForwardResult r = qwen4exp_forward(
-            backend_, weights_, cache_, in.data(), k + 1, pos, logits, verify ? &hidden : nullptr, verify);
+            backend_, weights_, cache_, in.data(), k + 1, pos, logits, mtp ? &hidden : nullptr, verify);
         if (!r.ok) {
             result.fail(GenerateErrorCode::DecodeFailed, "qwen4exp decode forward failed");
             return result;
@@ -358,8 +417,14 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
                 result.fail(GenerateErrorCode::DecodeFailed, "qwen4exp verify rollback failed");
                 return result;
             }
+        } else if (mtp) {
+            mtp_h.insert(mtp_h.end(), hidden.begin(), hidden.end());
+            mtp_tok.push_back(next);
         }
+        logits_.assign(logits.begin() + (size_t) (retained - 1) * weights_.n_vocab,
+                       logits.begin() + (size_t) retained * weights_.n_vocab);
         pos += retained;
+        if (decode_check_) decode_check_(false, mtp_tok, logits_);
         if (verify) width_policy.observe(decision.n_accepted + 1, k + 1,
             (float) std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - step_start).count());
     }
@@ -367,6 +432,19 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
         result.fail(GenerateErrorCode::Cancelled, "cancelled during decode");
         return result;
     }
+    // Replace speculative MTP rows with committed trunk pairs. Keep exactly
+    // one pending hidden row: x[cur_pos] is still unknown to the live cache.
+    if (mtp) {
+        const int pairs = (int) mtp_tok.size() - 1;
+        if (pairs > 0 && !qwen4exp_mtp_forward(backend_, weights_, cache_, mtp_tok.data(), mtp_h.data(),
+                                               pairs, mtp_pos, mtp_logits, nullptr, true)) {
+            result.fail(GenerateErrorCode::DecodeFailed, "qwen4exp MTP checkpoint catch-up failed");
+            return result;
+        }
+        ggml_backend_tensor_set(cache_.mtp_prev_hidden, mtp_h.data() + (size_t) pairs * hd, 0, hd * sizeof(float));
+        cache_.mtp_prev_pos = pos - 1;
+    }
+    tokens_ = std::move(history);
     const auto t_dec1 = std::chrono::steady_clock::now();
     result.decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
     result.spec_decode_ran = drafts > 0;
@@ -382,38 +460,122 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
             width_steps[5], width_steps[6], width_steps[7]);
     }
 
+    guard.complete = true;
     result.succeed();
     return result;
 }
 
 bool Qwen4ExpBackend::snapshot_save(int slot) {
-    (void) slot;
-    return false;
+    return snapshot_save_replacing(slot, -1);
+}
+
+bool Qwen4ExpBackend::snapshot_save_replacing(int slot, int source) {
+    if (slot < 0 || slot >= kMaxSlots || tokens_.empty() ||
+        tokens_.size() != (size_t) cache_.cur_pos || logits_.empty() ||
+        (cache_.mtp_k && cache_.mtp_prev_pos != cache_.cur_pos - 1)) return false;
+    snapshot_free(slot);
+    // Only replace the restored ancestor, and only under pressure. Plan the
+    // replacement before freeing it; an oversized or unrelated capture must
+    // not destroy the checkpoint we already have.
+    if (!snapshot_fits(slot) && source >= 0 && snapshot_used(source) &&
+        snapshots_[source].tokens.size() < tokens_.size() &&
+        std::equal(snapshots_[source].tokens.begin(), snapshots_[source].tokens.end(), tokens_.begin()) &&
+        snapshot_fits(slot, source)) {
+        std::fprintf(stderr, "[qwen4exp-snap] replace ancestor slot=%d pos=%d with slot=%d pos=%d\n",
+                     source, snapshot_cur_pos(source), slot, cache_.cur_pos);
+        snapshot_free(source);
+    }
+    if (!snapshot_fits(slot)) return false;
+    auto & s = snapshots_[slot];
+    if (!save_qwen4exp_snapshot(backend_, cache_, s)) return false;
+    s.tokens = tokens_;
+    s.logits = logits_;
+    std::fprintf(stderr, "[qwen4exp-snap] slot=%d pos=%d device_bytes=%zu\n",
+                 slot, s.cur_pos, ggml_backend_buffer_get_size(s.buf));
+    return true;
+}
+
+bool Qwen4ExpBackend::snapshot_save_deferred(int slot) {
+    if (slot < 0 || slot >= kMaxSlots || tokens_.empty() ||
+        tokens_.size() != (size_t) cache_.cur_pos || logits_.empty() ||
+        (cache_.mtp_k && cache_.mtp_prev_pos != cache_.cur_pos - 1)) return false;
+    snapshot_flush_deferred();
+    snapshot_free(slot);
+    if (!snapshot_fits(slot)) return false;
+    live_slot_ = slot;
+    return true;
+}
+
+void Qwen4ExpBackend::snapshot_flush_deferred() {
+    const int slot = live_slot_;
+    live_slot_ = -1;
+    if (slot >= 0) snapshot_save(slot);
 }
 
 void Qwen4ExpBackend::snapshot_free(int slot) {
-    (void) slot;
+    if (slot < 0 || slot >= kMaxSlots) return;
+    if (slot == live_slot_) live_slot_ = -1;
+    free_qwen4exp_snapshot(snapshots_[slot]);
 }
 
 bool Qwen4ExpBackend::snapshot_used(int slot) const {
-    (void) slot;
-    return false;
+    return slot >= 0 && slot < kMaxSlots && (slot == live_slot_ || snapshots_[slot].buf);
 }
 
 int Qwen4ExpBackend::snapshot_cur_pos(int slot) const {
-    (void) slot;
-    return 0;
+    if (!snapshot_used(slot)) return 0;
+    return slot == live_slot_ ? cache_.cur_pos : snapshots_[slot].cur_pos;
+}
+
+size_t Qwen4ExpBackend::snapshot_bytes_estimate(int tokens) const {
+    if (!backend_ || !cache_.buf) return 0;
+    const int n = std::clamp(tokens, 0, cache_.max_ctx);
+    if (!n) return 0;
+    size_t host = 0;
+    const size_t device = qwen4exp_snapshot_bytes(backend_, cache_, n, &host);
+    return device + host + (size_t(n) + weights_.n_vocab +
+        std::max(0, weights_.ple_ngram_size - 1)) * sizeof(int32_t);
+}
+
+bool Qwen4ExpBackend::snapshot_fits(int slot, int replaced) const {
+    size_t remaining = snapshot_budget_;
+    for (int i = 0; i < kMaxSlots; ++i) {
+        if (i == slot || i == replaced || !snapshot_used(i)) continue;
+        const size_t bytes = snapshot_bytes_estimate(snapshot_cur_pos(i));
+        if (bytes > remaining) return false;
+        remaining -= bytes;
+    }
+    const size_t bytes = snapshot_bytes_estimate(cache_.cur_pos);
+    if (bytes <= remaining) return true;
+    std::fprintf(stderr, "[qwen4exp-snap] pressure slot=%d bytes=%zu remaining=%zu allowance=%zu\n",
+                 slot, bytes, remaining, snapshot_budget_);
+    return false;
 }
 
 GenerateResult Qwen4ExpBackend::restore_and_generate_impl(
         int slot, const GenerateRequest & req, const DaemonIO & io) {
-    (void) slot;
-    (void) req;
-    (void) io;
-    GenerateResult result;
-    result.fail(GenerateErrorCode::InvalidSnapshotSlot,
-                "qwen4exp snapshots are not implemented yet");
-    return result;
+    if (parked_ || !snapshot_used(slot)) {
+        GenerateResult result;
+        result.fail(parked_ ? GenerateErrorCode::ModelParked : GenerateErrorCode::InvalidSnapshotSlot);
+        return result;
+    }
+    const auto & prefix = slot == live_slot_ ? tokens_ : snapshots_[slot].tokens;
+    // Recurrent state cannot be shortened to an LCP. The server chooses a
+    // shallower checkpoint; stale/direct callers safely fall back to cold.
+    if (prefix.size() > req.prompt.size() || !std::equal(prefix.begin(), prefix.end(), req.prompt.begin())) {
+        return generate_impl(req, io);
+    }
+    const int pos = snapshot_cur_pos(slot);
+    if (slot == live_slot_) {
+        live_slot_ = -1; // consume the zero-copy checkpoint before mutation
+        std::fprintf(stderr, "[qwen4exp-snap] resident slot=%d pos=%d\n", slot, pos);
+    } else {
+        snapshot_flush_deferred();
+        restore_qwen4exp_snapshot(backend_, snapshots_[slot], cache_);
+        tokens_ = snapshots_[slot].tokens;
+        logits_ = snapshots_[slot].logits;
+    }
+    return run(req, io, pos, slot);
 }
 
 bool Qwen4ExpBackend::handle_compress(const std::string & line,
@@ -426,6 +588,8 @@ bool Qwen4ExpBackend::handle_compress(const std::string & line,
 void Qwen4ExpBackend::free_drafter() {}
 
 void Qwen4ExpBackend::shutdown() {
+    for (int i = 0; i < kMaxSlots; ++i) snapshot_free(i);
+    tokens_.clear(); logits_.clear();
     free_qwen4exp_cache(cache_);
     free_qwen4exp_weights(weights_);
     if (backend_) {

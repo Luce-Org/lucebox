@@ -13,6 +13,7 @@
 #include "ggml-backend.h"
 
 #include <vector>
+#include <utility>
 
 namespace luce::common {
 
@@ -140,5 +141,23 @@ void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace);
 // Zero the recurrent state, conv history and pooled-block prefix and reset
 // cur_pos. KV is left intact: the next sequence overwrites it from position 0.
 void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c);
+
+// Prefix-sized device copies. Live strip views remain valid until the cache is
+// freed; callers must release snapshots first. No verify scratch is retained.
+struct Qwen4ExpSnapshot {
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> strips;
+    int cur_pos = 0, indexer_blocks = 0, mtp_prev_pos = -1;
+    int64_t kv_bucket_base = 0;
+    std::vector<int32_t> ple_prev, tokens;
+    std::vector<float> logits;
+};
+
+size_t qwen4exp_snapshot_bytes(ggml_backend_t backend, const Qwen4ExpCache & c, int tokens,
+                             size_t * host_bytes = nullptr);
+bool save_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpCache & c, Qwen4ExpSnapshot & s);
+void restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c);
+void free_qwen4exp_snapshot(Qwen4ExpSnapshot & s);
 
 }  // namespace luce::common
