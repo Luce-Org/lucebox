@@ -10,12 +10,15 @@
 
 #include "qwen4exp_internal.h"
 #include "qwen4exp_cache.h"
+#include "qwen4exp_seq_engine.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
 
 #include <string>
+#include <memory>
 #include <optional>
+#include <vector>
 
 namespace luce::common {
 
@@ -25,6 +28,7 @@ struct Qwen4ExpBackendConfig {
     int             verify_width = 0;     // 0 = adaptive, 1 = off, 2..8 = fixed
     DevicePlacement device;
     int             chunk     = 0;  // auto: measured allocation budget
+    int             max_concurrency = 1;
 };
 
 class Qwen4ExpBackend final : public ModelBackend {
@@ -65,6 +69,7 @@ public:
     void free_drafter() override;
 
     void shutdown() override;
+    SeqEngine * seq_engine() override { return seq_engine_.get(); }
 
 private:
     friend struct Qwen4ExpPrefixTest;
@@ -73,6 +78,7 @@ private:
     GenerateResult run(const GenerateRequest & req, const DaemonIO & io, int restored, int restore_slot = -1);
     bool snapshot_save_replacing(int slot, int source);
     bool snapshot_fits(int slot, int replaced = -1) const;
+    bool start_seq_engine(); // no-op at --max-concurrency 1
     size_t snapshot_budget_ = SIZE_MAX; // auto chunk reserves and enforces this allowance
     std::array<Qwen4ExpSnapshot, kMaxSlots> snapshots_;
     int live_slot_ = -1;
@@ -83,6 +89,8 @@ private:
     Qwen4ExpWeights       weights_;
     Qwen4ExpCache         cache_;
     int                   chunk_   = 0;
+    std::vector<Qwen4ExpCache> seq_caches_;
+    std::unique_ptr<Qwen4ExpSeqEngine> seq_engine_;
     bool                  parked_  = false;
 };
 

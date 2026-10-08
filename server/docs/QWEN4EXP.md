@@ -99,11 +99,32 @@ all three quants.
 | Attention block ratios other than 4, contexts of 2^24 tokens or more | refused at load |
 | gfx1151 kernels: MMB bf16 and Q8_0 -> F16 WMMA GEMMs, fused HC / GDN / PLE, M-RoPE into the flash-attention layout | done |
 | Chat template, reasoning effort, thinking budget, `preserve_thinking`, `sampling_no_thinking` | done |
-| Concurrent serving (`--max-concurrency > 1`) | refused; exact 4-slot serving is a follow-up PR |
+| Concurrent serving (`--max-concurrency 2..4`) | supported, exact independent slots with full per-slot caches; MTP and the prefix cache are single-slot only (MTP is switched off); more than 4 is refused |
 | MTP speculative decoding | sidecar discovered automatically; adaptive k=1..7 by default (code 16K / 64K 32.4 / 28.2 tok/s, counting 43.5), output identical to MTP off; `--verify-width 1` disables, `2..8` selects fixed k=1..7 |
 | Prefix cache | done: snapshots at chat cut points, restored on hits; a 64K agent turn's first token in ~3.5 s instead of ~65 s (131K context). Prefill keeps a 4096-row chunk first and snapshots get the remaining memory, so at 262K context with MTP long prefixes do not fit: use `--max-ctx 131072` or less for agent workloads |
 | Layer split | refused |
 | Other GPUs | generic paths; kernels, defaults and quality gates are tuned and measured on gfx1151 only |
+
+`--max-concurrency 1` keeps the single-sequence path. Values 2 through 4
+enable the sequence engine and batched decode without environment settings.
+Each slot prefills separately with the backend's chunk (auto-sized for every slot, at most 4,096 rows, or `--chunk`) and
+owns a full F16 cache. Dense decode batches use the same MMVQ arithmetic as
+solo decode; when any slot crosses the QSA boundary, decode runs per slot.
+Paging, `--kv-pool-tokens`, and multi-device placement are unsupported.
+The GPU concurrency checks use a 32,768-token context:
+
+```bash
+luce_server MODEL.gguf --max-concurrency 4 --max-ctx 32768 \
+  --prefix-cache-slots 0 --disk-prefix-cache off
+python3 server/test/qwen4exp_concurrency_http.py http://127.0.0.1:8080
+```
+
+The HTTP test checks eight responses (four near 2K and four near 16K) against
+solo requests, including planted-fact recall, and reports aggregate prefill
+and decode rates from `usage.timings`. GPU probes:
+`smoke_qwen4exp_batched MODEL.gguf 2050 3072 1` and
+`test_qwen4exp_seq_engine MODEL.gguf 32768` check logits, cache/indexer state,
+contract/soak, the QSA boundary, and distinct concurrent token streams.
 
 ## Layout
 
@@ -120,7 +141,8 @@ Tests: `test_qwen4exp_qsa_ids` (QSA block selection, GPU and CPU),
 CONT fusion alias), `test_backend_plan` (default prefill chunk), `test_qwen4exp_chunk`
 (memory-sized chunk selection),
 `test_server_unit`, and `smoke_qwen4exp_forward` (split-prefill KLs and
-cancel/reset/reuse on a real GGUF).
+reference comparisons on a real GGUF). `smoke_qwen4exp_batched` also checks
+cancel/reset/reuse and slot isolation.
 
 The smoke binary uses the same gfx1151 defaults as the server:
 

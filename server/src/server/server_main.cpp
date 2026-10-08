@@ -186,7 +186,8 @@ static void print_usage(const char * prog) {
         "  --decode-kv-offload-mb <auto|N> RAM budget for active KV suspension (default: auto)\n"
         "                              N is MiB; 0 disables.\n"
         "  --max-concurrency <N>  Maximum concurrent decode sequences\n"
-        "                         (N > 1 enables paged attention; default: 1)\n"
+        "                         (default: 1; qwen4exp: 2..4 full-cache slots;\n"
+        "                          other models: N > 1 enables paged attention)\n"
         "  --admission-coalesce-ms <N>  Idle-to-busy batching window\n"
         "                               (default: 20; 0 disables)\n"
         "  --kv-pool-tokens <N> Total paged K/V pool shared by all\n"
@@ -974,7 +975,10 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.model_name.c_str());
         return 2;
     }
-    if (bargs.max_concurrency > 1) bargs.paged_attention = true;
+    // qwen4exp owns full per-slot caches; other concurrent engines use paging.
+    if (bargs.max_concurrency > 1 &&
+        inspect_gguf_model_info(bargs.model_path.c_str()).arch != "qwen4exp")
+        bargs.paged_attention = true;
     if (sconfig.decode_kv_offload_bytes &&
         sconfig.decode_kv_offload_bytes != kAutoKvOffloadBytes && bargs.max_concurrency <= 1) {
         std::fprintf(stderr, "[server] --decode-kv-offload-mb requires --max-concurrency greater than 1\n");
