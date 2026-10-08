@@ -1880,6 +1880,17 @@ extern "C" {
             struct ggml_tensor  * sinks,
             float                 scale);
 
+    // ggml_soft_max_ext_sink_col with an additive mask (scale, then the mask,
+    // rounded as separate scale and add launches round them); a is
+    // [n_cols, rows, ...] and mask [n_cols, >= rows, ...] broadcast over
+    // dims 2 and 3.
+    GGML_API struct ggml_tensor * ggml_soft_max_ext_sink_col_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * sinks,
+            float                 scale);
+
     GGML_API void ggml_soft_max_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
@@ -2567,6 +2578,21 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * positions);
 
+    // Run several single-token query lanes of one raw ring in one op, as if
+    // each lane wrote its own ring row and then attended before the next lane
+    // wrote: query token t reads lane_kv row j in place of ring row
+    // ring_rows[j] for every j <= t, and the ring's own contents elsewhere.
+    // ring_rows is I32 [n_query] (row indices into the raw segment), lane_kv
+    // has K's type and is contiguous [D, n_query]. Every other row, the mask
+    // and the selection keep their per-token meaning, so each token's result
+    // equals the single-token op over its own ring state bit for bit. Only the
+    // D=512 split-KV decode kernel consumes it (segmented K/V, indexed mask,
+    // n_query <= 8, no fused RoPE: ring_rows takes the RoPE positions slot).
+    GGML_API void ggml_flash_attn_ext_set_ds4_lane_rows(
+            struct ggml_tensor * a,
+            struct ggml_tensor * ring_rows,
+            struct ggml_tensor * lane_kv);
+
     // True when flash_attn_ext carries the DS4 sparse-layout or fused-RoPE
     // contract. Backends must implement that complete contract or reject it.
     GGML_API bool ggml_flash_attn_ext_is_ds4(
@@ -2684,6 +2710,7 @@ extern "C" {
         GGML_MOE_FUSED_HOST_POST          = -8,
         GGML_MOE_FUSED_HOST_WAIT          = -9,
         GGML_MOE_FUSED_PROTECTED_ROUTES   = -10,
+        GGML_MOE_FUSED_COMBINE_MASKED     = -11,
     };
 
     // Word offsets in ggml_tensor::op_params for the host mailbox pair. All
@@ -2745,10 +2772,32 @@ extern "C" {
             ggml_cluster_allreduce_fn fn,
             void                    * user);
 
+    // The same collective in place: the result is a view of `a`, so the sum
+    // overwrites `a` and no device copy runs ahead of the collective. Only
+    // for an `a` that no other node reads.
+    GGML_API struct ggml_tensor * ggml_cluster_allreduce_inplace(
+            struct ggml_context     * ctx,
+            struct ggml_tensor      * a,
+            ggml_cluster_allreduce_fn fn,
+            void                    * user);
+
     GGML_API struct ggml_tensor * ggml_laguna_moe_combine(
             struct ggml_context * ctx,
             struct ggml_tensor  * experts,
             struct ggml_tensor  * expert_weights);
+
+    // One owner's routed-expert sum: out[:, t] = sum_e experts[:, e, t] *
+    // (weights[e, t] * valid[0, ids[e, t], t]), the masked weight, product and
+    // sum rounded as mul(weights, get_rows(valid, ids)), mul and repeat_back
+    // round them (routes with a zero masked weight add nothing).
+    // experts [n_embd, n_used, T], weights [n_used, T] F32, valid [1, n_expert, T]
+    // F32, ids [n_used, T] I32 (global expert ids).
+    GGML_API struct ggml_tensor * ggml_moe_combine_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * valid,
+            struct ggml_tensor  * ids);
 
     // Coarse DeepSeek-V4 routed-owner op. gate_up contains concatenated gate
     // and up output rows; the backend performs fused gate/up MMVQ + clamped
@@ -2916,6 +2965,23 @@ extern "C" {
     // ggml_ds4_hc_collapse: dst[d, t] = sum_h hc[d + h*n_embd, t] * pre[h, t],
     // rounded as mul, permute and sum_rows round it.
     // hc: F32 [n_embd*n_hc, T] (nb0 = 4), pre: F32 [n_hc, T] (nb0 = 4) -> F32 [n_embd, T].
+    // ggml_ds4_argmax_pair: the argmax of each column of logits [n_rows, T]
+    // (rows row_offset.. of a vocabulary split across n_slots ranks) as one
+    // slot of an F32 [8 * n_slots, T] exchange row: the value's 32 bits and the
+    // global index as eight byte-valued floats (exact through a bf16 sum),
+    // zeros in the other slots. ggml_ds4_argmax_pick reads the summed rows
+    // back: the largest value, ties to the lowest index (I32 [T]).
+    GGML_API struct ggml_tensor * ggml_ds4_argmax_pair(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            int                   row_offset,
+            int                   slot,
+            int                   n_slots);
+    GGML_API struct ggml_tensor * ggml_ds4_argmax_pick(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * pairs,
+            int                   n_slots);
+
     GGML_API struct ggml_tensor * ggml_ds4_hc_collapse(
             struct ggml_context * ctx,
             struct ggml_tensor  * hc,

@@ -384,6 +384,13 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_batch_split_copies(
                                             ggml_backend_sched_t sched,
                                             bool enabled);
+    // Split-input copies get storage of their own (never shared with another
+    // tensor of the graph), so filling one cannot overwrite data a split on
+    // its backend still reads: the scheduler then skips the blocking wait for
+    // the destination backend before each split's copies, and the host keeps
+    // queueing while the devices run. Must be set before allocation.
+    GGML_API void                 ggml_backend_sched_set_dedicated_copies(
+            ggml_backend_sched_t sched, bool enabled);
 
     //
     // Meta backend

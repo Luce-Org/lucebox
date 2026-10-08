@@ -2,6 +2,9 @@
 
 #include "ggml.h"
 #include "ggml-impl.h"
+
+// MUL_MAT op_params[1]: see ggml_backend_cuda_mul_mat_whole_row_lanes.
+#define GGML_CUDA_WHOLE_ROW_LANES 0x574C524B
 #include "ggml-cuda.h"
 
 #include <cerrno>
@@ -1490,6 +1493,15 @@ struct ggml_backend_cuda_context {
         std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
     };
     std::vector<luce_q8_memo_entry> luce_q8_memo;
+
+    // DS4 HC boundary launches (ds4-hc.cu) synchronize their blocks on this
+    // device counter; launches on this context's stream run in order, so the
+    // running count of blocks launched is each launch's target.
+    unsigned long long * ds4_hc_barrier = nullptr;
+    unsigned long long   ds4_hc_barrier_blocks = 0;
+    // The split boundary's mix rows ([64][32] floats) and per-token block
+    // counts (64 uints), allocated with the barrier.
+    void * ds4_hc_split_scratch = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};

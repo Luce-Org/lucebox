@@ -55,6 +55,14 @@ struct soft_max_params {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
+// The sink-column mode reproduces scale, an additive mask and the sink concat
+// as separate launches round them: the scaled score is rounded before the
+// mask is added (no FMA).
+static __device__ __forceinline__ float soft_max_sink_col_value(float x, float scale, float m) {
+#pragma clang fp contract(off)
+    return x*scale + m;
+}
+
 template <bool use_shared, int ncols_template, int block_size_template, typename T>
 static __global__ void soft_max_f32(
         const float * x, const T * mask, const float * sinks, float * dst, const soft_max_params p) {
@@ -100,7 +108,9 @@ static __global__ void soft_max_f32(
 
         const float val = (p.sink_col && col == ncols_x)
             ? sinks[rowx]
-            : x[col]*p.scale + (mask ? slope*t2f32(mask[col]) : 0.0f);
+            : p.sink_col
+                ? soft_max_sink_col_value(x[col], p.scale, mask ? slope*t2f32(mask[col]) : 0.0f)
+                : x[col]*p.scale + (mask ? slope*t2f32(mask[col]) : 0.0f);
 
         // The global-memory cache is dst, which has no slot for the virtual sink.
         if (use_shared || col < ncols_x) {
@@ -456,7 +466,8 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     memcpy(&sink_col, (const int32_t *) dst->op_params + 2, sizeof(int32_t));
     params.sink_col = sink_col;
     if (sink_col) {
-        GGML_ASSERT(src1 == nullptr && src2 != nullptr);
+        GGML_ASSERT(src2 != nullptr);
+        GGML_ASSERT(max_bias == 0.0f);
         GGML_ASSERT(ggml_nelements(src2) == nrows_x);
         params.ncols = ne00 + 1;   // one virtual sink column per row
     }

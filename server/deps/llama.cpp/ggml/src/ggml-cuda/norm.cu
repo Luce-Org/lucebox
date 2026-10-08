@@ -135,7 +135,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false>
+template <int block_size, bool do_multiply = false, bool do_add = false, bool do_q8 = false>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -158,7 +158,9 @@ static __global__ void rms_norm_f32(const float * x,
                                     const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
                                     const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
-                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0)) {
+                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
+                                    block_q8_1 *  q8                   = nullptr,
+                                    const int     ncols_q8             = 0) {
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
 
@@ -200,6 +202,32 @@ static __global__ void rms_norm_f32(const float * x,
     const float mean = tmp / ncols;
     const float scale = rsqrtf(mean + eps);
 
+    if constexpr (do_q8) {
+        // The output's q8_1 form as quantize_q8_1 writes it for MMVQ (rows
+        // padded with zero blocks to ncols_q8): a warp holds one 32-wide
+        // block, reduced in the same butterfly order.
+        static_assert(do_multiply && !do_add, "q8 output is fused with rms_norm * w only");
+        block_q8_1 * yrow = q8 + (int64_t) ((sample*nchannels + channel)*nrows + row) * (ncols_q8 / QK8_1);
+        for (int col = tid; col < ncols_q8; col += block_size) {
+            float v = 0.0f;
+            if (col < ncols) {
+                const int mul_col = fastmodulo(col, mul_ncols_packed);
+                v                 = scale * x[col] * mul[mul_col];
+                dst[col]          = v;
+            }
+            float amax = fabsf(v);
+            float sum  = v;
+            amax = warp_reduce_max<QK8_1>(amax);
+            sum  = warp_reduce_sum<QK8_1>(sum);
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+            yrow[col / QK8_1].qs[col % QK8_1] = q;
+            if (col % QK8_1 == 0) {
+                yrow[col / QK8_1].ds = make_half2(d, sum);
+            }
+        }
+        return;
+    }
     for (int col = tid; col < ncols; col += block_size) {
         if constexpr (do_multiply && do_add) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
@@ -484,7 +512,9 @@ static void rms_norm_mul_f32_cuda(const float *  x,
                                   const uint32_t add_nchannels,
                                   const uint32_t add_nsamples,
                                   const float    eps,
-                                  cudaStream_t   stream) {
+                                  cudaStream_t   stream,
+                                  block_q8_1 *   q8 = nullptr,
+                                  const int      ncols_q8 = 0) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (mul == nullptr) {
         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
@@ -495,16 +525,31 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
         const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
         const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+        const uint3 z = make_uint3(0, 0, 0);
         if (ncols < 1024) {
             const dim3 block_dims(256, 1, 1);
-            rms_norm_f32<256, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
-                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
-                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+            if (q8) {
+                rms_norm_f32<256, true, false, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+                    x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                    mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                    nullptr, 0, 0, 0, z, z, z, z, q8, ncols_q8);
+            } else {
+                rms_norm_f32<256, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+                    x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                    mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+            }
         } else {
             const dim3 block_dims(1024, 1, 1);
-            rms_norm_f32<1024, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
-                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
-                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+            if (q8) {
+                rms_norm_f32<1024, true, false, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+                    x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                    mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                    nullptr, 0, 0, 0, z, z, z, z, q8, ncols_q8);
+            } else {
+                rms_norm_f32<1024, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+                    x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                    mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+            }
         }
     } else {
         const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
@@ -624,7 +669,8 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
-void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
+                                 void * q8_out, int ncols_q8) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
 
@@ -681,7 +727,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
-                          eps, stream);
+                          eps, stream, (block_q8_1 *) q8_out, ncols_q8);
 }
 
 // dflash: ADD (residual) + RMS_NORM + MUL in one launch. `add_tensor` is the

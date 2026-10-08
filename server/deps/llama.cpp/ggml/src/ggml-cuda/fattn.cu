@@ -285,17 +285,15 @@ __global__ static void ds4_fa_mean_comp_blocks_kernel(
 // token. Attention blocks for all query-head groups reuse these four bounds.
 // Internal masked rows remain inside the envelope and are still evaluated as
 // masked, so this changes storage only, not attention semantics.
+// One query token's visible envelope, computed by one warp (lane = lane id).
 template <typename Mask>
-__global__ static void ds4_fa_visibility_bounds_kernel(
+static __device__ __forceinline__ void ds4_fa_visibility_bounds_token(
         const Mask * mask,
         int        * bounds,
-        int          n_tokens,
+        int          t,
         int          n_kv,
-        int          raw_rows) {
-    const int t = (int) blockIdx.x;
-    const int lane = (int) threadIdx.x;
-    if (t >= n_tokens || lane >= warpSize) return;
-
+        int          raw_rows,
+        int          lane) {
     int raw_first = raw_rows;
     int raw_last = -1;
     int comp_first = n_kv;
@@ -345,6 +343,19 @@ __global__ static void ds4_fa_visibility_bounds_kernel(
         token_bounds[2] = comp_first;
         token_bounds[3] = comp_last;
     }
+}
+
+template <typename Mask>
+__global__ static void ds4_fa_visibility_bounds_kernel(
+        const Mask * mask,
+        int        * bounds,
+        int          n_tokens,
+        int          n_kv,
+        int          raw_rows) {
+    const int t = (int) blockIdx.x;
+    const int lane = (int) threadIdx.x;
+    if (t >= n_tokens || lane >= warpSize) return;
+    ds4_fa_visibility_bounds_token<Mask>(mask, bounds, t, n_kv, raw_rows, lane);
 }
 
 // Exact DS4 ratio-4 layer-major visibility without a materialized mask.
@@ -581,7 +592,9 @@ __global__ static void ds4_fa_indexed_rows_parallel_kernel(
 // A shared-memory bitonic sort restores ascending physical-row order, matching
 // the old top-k -> mask -> physical scan path and therefore preserving each
 // reduction lane's accumulation order exactly.
-template <typename Mask, int SORT_WIDTH, bool RATIO4_CAUSAL = false>
+// WITH_BOUNDS: the first warp then also writes the token's visibility
+// envelope (ds4_fa_visibility_bounds_kernel's), saving that launch.
+template <typename Mask, int SORT_WIDTH, bool RATIO4_CAUSAL = false, bool WITH_BOUNDS = false>
 __global__ static void ds4_fa_indexed_rows_topk_kernel(
         const Mask    * mask,
         const int32_t * topk,
@@ -594,7 +607,8 @@ __global__ static void ds4_fa_indexed_rows_topk_kernel(
         int             raw_rows,
         int             capacity,
         int             kv_start = 0,
-        int             causal_ratio = 4) {
+        int             causal_ratio = 4,
+        int           * bounds = nullptr) {
     const int t = (int) blockIdx.x;
     const int tid = (int) threadIdx.x;
     if (t >= n_tokens) return;
@@ -687,25 +701,44 @@ __global__ static void ds4_fa_indexed_rows_topk_kernel(
             }
         }
     }
+
+    if constexpr (WITH_BOUNDS) {
+        if (tid < warpSize) {
+            ds4_fa_visibility_bounds_token<Mask>(mask, bounds, t, n_kv, raw_rows, tid);
+        }
+    }
 }
 
+// bounds: when set, the same launch writes the visibility envelope too.
 template <typename Mask>
 static void ds4_launch_indexed_rows_topk(
         const Mask * mask, const int32_t * topk,
         int * selected_rows, int * selected_counts,
         int * owner_offsets, int * owner_ranks,
         int n_tokens, int n_kv, int raw_rows, int capacity,
-        cudaStream_t stream) {
+        cudaStream_t stream, int * bounds = nullptr) {
     // The learned top-512 stays on its original launch. A batched verifier
     // appends a small saved-raw suffix and needs the next sorting bucket.
     if (capacity <= 512) {
-        ds4_fa_indexed_rows_topk_kernel<Mask, 512><<<n_tokens, 512, 0, stream>>>(
-            mask, topk, selected_rows, selected_counts, owner_offsets, owner_ranks,
-            n_tokens, n_kv, raw_rows, capacity);
+        if (bounds) {
+            ds4_fa_indexed_rows_topk_kernel<Mask, 512, false, true><<<n_tokens, 512, 0, stream>>>(
+                mask, topk, selected_rows, selected_counts, owner_offsets, owner_ranks,
+                n_tokens, n_kv, raw_rows, capacity, 0, 4, bounds);
+        } else {
+            ds4_fa_indexed_rows_topk_kernel<Mask, 512><<<n_tokens, 512, 0, stream>>>(
+                mask, topk, selected_rows, selected_counts, owner_offsets, owner_ranks,
+                n_tokens, n_kv, raw_rows, capacity);
+        }
     } else {
-        ds4_fa_indexed_rows_topk_kernel<Mask, 1024><<<n_tokens, 1024, 0, stream>>>(
-            mask, topk, selected_rows, selected_counts, owner_offsets, owner_ranks,
-            n_tokens, n_kv, raw_rows, capacity);
+        if (bounds) {
+            ds4_fa_indexed_rows_topk_kernel<Mask, 1024, false, true><<<n_tokens, 1024, 0, stream>>>(
+                mask, topk, selected_rows, selected_counts, owner_offsets, owner_ranks,
+                n_tokens, n_kv, raw_rows, capacity, 0, 4, bounds);
+        } else {
+            ds4_fa_indexed_rows_topk_kernel<Mask, 1024><<<n_tokens, 1024, 0, stream>>>(
+                mask, topk, selected_rows, selected_counts, owner_offsets, owner_ranks,
+                n_tokens, n_kv, raw_rows, capacity);
+        }
     }
 }
 
@@ -2487,6 +2520,28 @@ static __device__ __forceinline__ const KV * ds4_fa_segmented_row(
     return preserved_tail + (size_t) (row - compressed_rows) * D;
 }
 
+// Lane rows (ggml_flash_attn_ext_set_ds4_lane_rows): query token t reads lane
+// j's own K/V row in place of ring row lane_row_index[j] for every j <= t.
+// Lanes write distinct ring rows, so at most one lane matches.
+template <typename KV>
+static __device__ __forceinline__ const KV * ds4_fa_lane_row(
+        const KV  * row_ptr,
+        const KV  * lane_kv,
+        const int * lane_row_index,
+        int         token,
+        int         row,
+        int         raw_rows) {
+    constexpr int D = 512;
+    if (row < raw_rows) {
+        for (int j = 0; j <= token; ++j) {
+            if (lane_row_index[j] == row) {
+                return lane_kv + (size_t) j * D;
+            }
+        }
+    }
+    return row_ptr;
+}
+
 // Split-KV decode for indexed MLA.  A single grouped block leaves most of a
 // wide RDNA GPU idle when q is small: DS4 has 64 heads, so the four-head
 // kernel exposes only 16 blocks per layer.  Split the bounded raw+top-k row
@@ -2494,7 +2549,8 @@ static __device__ __forceinline__ const KV * ds4_fa_segmented_row(
 // the states in a second kernel.  The implementation is expressed in terms of
 // the D512 latent-attention contract rather than model weights, so future MLA
 // models using the same layout can reuse it.
-template <typename KV, typename Mask, int HEADS_PER_BLOCK, int N_SPLITS>
+template <typename KV, typename Mask, int HEADS_PER_BLOCK, int N_SPLITS,
+          bool LANE_ROWS = false>
 __global__ static void ds4_flash_attn_d512_indexed_split_stage1_kernel(
         float       * partial,
         const float * q,
@@ -2519,10 +2575,13 @@ __global__ static void ds4_flash_attn_d512_indexed_split_stage1_kernel(
         const int   * indexed_counts,
         int           indexed_capacity,
         ds4_inverse_rope_params inverse_rope,
-        const float * forward_rope_coefficients) {
+        const float * forward_rope_coefficients,
+        const int   * lane_rows,
+        const KV    * lane_kv) {
     constexpr int D = 512;
     constexpr int N_THREADS = 256;
     constexpr int VALUES_PER_THREAD = 4;
+    constexpr int MAX_LANES = 8;
 
     const int token = (int) blockIdx.x;
     const int head_begin = (int) blockIdx.y * HEADS_PER_BLOCK;
@@ -2534,6 +2593,14 @@ __global__ static void ds4_flash_attn_d512_indexed_split_stage1_kernel(
     float * scores = scratch;
     float * reduction = scores + (size_t) HEADS_PER_BLOCK * split_stride;
     float * q_rope_tail = reduction + (size_t) HEADS_PER_BLOCK * N_THREADS;
+
+    __shared__ int lane_row_index[MAX_LANES];
+    if constexpr (LANE_ROWS) {
+        if (tid <= token && tid < MAX_LANES) {
+            lane_row_index[tid] = lane_rows[tid];
+        }
+        __syncthreads();
+    }
 
     const int raw_first = visibility_bounds
         ? visibility_bounds[(size_t) token * 4 + 0] : 0;
@@ -2594,6 +2661,9 @@ __global__ static void ds4_flash_attn_d512_indexed_split_stage1_kernel(
                   k, compressed_kv, preserved_tail_kv, row,
                   materialized_kv_rows, compressed_kv_rows)
             : k + (size_t) row * D;
+        if constexpr (LANE_ROWS) {
+            kr = ds4_fa_lane_row(kr, lane_kv, lane_row_index, token, row, raw_rows);
+        }
         float dot[HEADS_PER_BLOCK] = {};
 #pragma unroll
         for (int d = 0; d < D; ++d) {
@@ -2690,6 +2760,9 @@ __global__ static void ds4_flash_attn_d512_indexed_split_stage1_kernel(
                       v, compressed_kv, preserved_tail_kv, row,
                       materialized_kv_rows, compressed_kv_rows)
                 : v + (size_t) row * D;
+            if constexpr (LANE_ROWS) {
+                vr = ds4_fa_lane_row(vr, lane_kv, lane_row_index, token, row, raw_rows);
+            }
             ds4_fa_load_quad<KV>(vr + d0,
                                  vv0, vv1, vv2, vv3);
             const int score_index = slot - split_begin;
@@ -2819,7 +2892,9 @@ static void ds4_launch_flash_attn_d512_indexed_split(
         ds4_inverse_rope_params inverse_rope,
         const float       * inverse_rope_coefficients,
         const float       * forward_rope_coefficients,
-        cudaStream_t        stream) {
+        cudaStream_t        stream,
+        const int         * lane_rows = nullptr,
+        const KV          * lane_kv = nullptr) {
     constexpr int HEADS_PER_BLOCK = 4;
     const size_t shmem =
         ((size_t) HEADS_PER_BLOCK * split_stride +
@@ -2830,15 +2905,29 @@ static void ds4_launch_flash_attn_d512_indexed_split(
         (unsigned) n_tokens,
         (unsigned) (n_heads / HEADS_PER_BLOCK),
         (unsigned) N_SPLITS);
-    ds4_flash_attn_d512_indexed_split_stage1_kernel<
-        KV, Mask, HEADS_PER_BLOCK, N_SPLITS>
-        <<<stage1_grid, 256, shmem, stream>>>(
-            partial, q, q_stride_token, q_stride_head, k, v,
-            compressed_kv, preserved_tail_kv, mask, sinks,
-            n_tokens, n_heads, n_kv, materialized_kv_rows,
-            compressed_kv_rows, scale, raw_rows, split_stride,
-            visibility_bounds, indexed_rows, indexed_counts,
-            indexed_capacity, inverse_rope, forward_rope_coefficients);
+    if (lane_kv) {
+        ds4_flash_attn_d512_indexed_split_stage1_kernel<
+            KV, Mask, HEADS_PER_BLOCK, N_SPLITS, true>
+            <<<stage1_grid, 256, shmem, stream>>>(
+                partial, q, q_stride_token, q_stride_head, k, v,
+                compressed_kv, preserved_tail_kv, mask, sinks,
+                n_tokens, n_heads, n_kv, materialized_kv_rows,
+                compressed_kv_rows, scale, raw_rows, split_stride,
+                visibility_bounds, indexed_rows, indexed_counts,
+                indexed_capacity, inverse_rope, forward_rope_coefficients,
+                lane_rows, lane_kv);
+    } else {
+        ds4_flash_attn_d512_indexed_split_stage1_kernel<
+            KV, Mask, HEADS_PER_BLOCK, N_SPLITS>
+            <<<stage1_grid, 256, shmem, stream>>>(
+                partial, q, q_stride_token, q_stride_head, k, v,
+                compressed_kv, preserved_tail_kv, mask, sinks,
+                n_tokens, n_heads, n_kv, materialized_kv_rows,
+                compressed_kv_rows, scale, raw_rows, split_stride,
+                visibility_bounds, indexed_rows, indexed_counts,
+                indexed_capacity, inverse_rope, forward_rope_coefficients,
+                nullptr, nullptr);
+    }
     const dim3 stage2_grid((unsigned) n_tokens, (unsigned) n_heads, 1);
     ds4_flash_attn_d512_indexed_split_stage2_kernel<N_SPLITS>
         <<<stage2_grid, 256, 0, stream>>>(
@@ -3121,7 +3210,26 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst)
     const int rope_flags = (int) (packed_rope_flags & 0xffffu);
     const int causal_ratio = (int) (packed_rope_flags >> 16);
     const ggml_tensor * rope_positions = dst->src[6];
-    if (rope_positions &&
+    const ggml_tensor * lane_kv = dst->src[9];
+    if ((rope_flags & 4) != 0) {
+        // Lane rows: src[6] holds the lanes' ring rows (I32), src[9] their
+        // K/V rows. Only the split-KV decode schedule implements them.
+        if ((rope_flags & 3) != 0 || causal_ratio != 0 ||
+            !rope_positions || !lane_kv ||
+            rope_positions->type != GGML_TYPE_I32 ||
+            rope_positions->ne[0] != n_tokens || rope_positions->ne[1] != 1 ||
+            rope_positions->ne[2] != 1 || rope_positions->ne[3] != 1 ||
+            !ggml_is_contiguous(rope_positions) ||
+            !segmented_kv || !indexer_topk || !mask ||
+            mask->type != GGML_TYPE_F16 || !kv_f16 || n_tokens > 8 ||
+            lane_kv->type != K->type || lane_kv->ne[0] != K->ne[0] ||
+            lane_kv->ne[1] != n_tokens || lane_kv->ne[2] != 1 ||
+            lane_kv->ne[3] != 1 || !ggml_is_contiguous(lane_kv)) {
+            return false;
+        }
+    } else if (lane_kv) {
+        return false;
+    } else if (rope_positions &&
         ((rope_flags & 1) == 0 || causal_ratio != 0 ||
          rope_positions->type != GGML_TYPE_I32 ||
          rope_positions->ne[0] != n_tokens || rope_positions->ne[1] != 1 ||
@@ -3141,7 +3249,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst)
         (ds4_layout != 0 && (raw_window <= 0 || sparse_block_size <= 0)) ||
         (sparse_keep_rows != 0 && !mask && !ratio4_causal &&
          causal_ratio == 0) ||
-        (rope_flags & ~3) != 0 ||
+        (rope_flags & ~7) != 0 ||
         ((rope_flags & 2) != 0 && (rope_flags & 1) == 0)) {
         return false;
     }
@@ -3260,6 +3368,10 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
     const int rope_flags = (int) (packed_rope_flags & 0xffffu);
     const int causal_ratio = (int) (packed_rope_flags >> 16);
     const int causal_kv_start = ggml_get_op_params_i32(dst, 8);
+    // Lane rows (bit 2) carry the lanes' ring rows in src[6] and their K/V
+    // rows in src[9]; supported() admits them only on the split-KV schedule.
+    const ggml_tensor * lane_rows = (rope_flags & 4) ? dst->src[6] : nullptr;
+    const ggml_tensor * lane_kv = lane_rows ? dst->src[9] : nullptr;
     const int prior_rows = raw_rows - n_tokens;
     const bool contiguous_causal = !mask && !indexer_topk &&
         causal_ratio > 0 && n_tokens > raw_window &&
@@ -3293,7 +3405,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
     ds4_inverse_rope_params inverse_rope{};
     inverse_rope.enabled = rope_flags & 1;
     inverse_rope.forward_q_enabled = (rope_flags & 2) != 0;
-    if (rope_flags != 0) {
+    if ((rope_flags & 3) != 0) {
         inverse_rope.kv_start = ggml_get_op_params_i32(dst, 8);
         inverse_rope.positions = dst->src[6]
             ? static_cast<const int32_t *>(dst->src[6]->data) : nullptr;
@@ -3452,6 +3564,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
         int * indexed_counts = nullptr;
         int * indexed_owner_offsets = nullptr;
         int * indexed_owner_ranks = nullptr;
+        bool bounds_with_rows = false;
         if (indexed_mask) {
             indexed_rows = indexed_rows_alloc.alloc(
                 (size_t) n_tokens * indexed_capacity);
@@ -3472,12 +3585,15 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                         inverse_rope.kv_start, indexed_causal_ratio);
             } else if (mask->type == GGML_TYPE_F16) {
                 if (indexer_topk) {
+                    // The envelope scan below reads the same mask: one launch.
+                    bounds_with_rows = !contiguous_causal;
                     ds4_launch_indexed_rows_topk<half>(
                         (const half *) mask->data,
                         (const int32_t *) indexer_topk->data,
                         indexed_rows, indexed_counts,
                         indexed_owner_offsets, indexed_owner_ranks,
-                        n_tokens, n_kv, raw_rows, indexed_capacity, stream);
+                        n_tokens, n_kv, raw_rows, indexed_capacity, stream,
+                        bounds_with_rows ? visibility_bounds : nullptr);
                 } else if (parallel_index_scan) {
                     ds4_fa_indexed_rows_parallel_kernel<half><<<n_tokens, 256, 0, stream>>>(
                         (const half *) mask->data, indexed_rows, indexed_counts,
@@ -3493,12 +3609,14 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                 }
             } else {
                 if (indexer_topk) {
+                    bounds_with_rows = !contiguous_causal;
                     ds4_launch_indexed_rows_topk<float>(
                         (const float *) mask->data,
                         (const int32_t *) indexer_topk->data,
                         indexed_rows, indexed_counts,
                         indexed_owner_offsets, indexed_owner_ranks,
-                        n_tokens, n_kv, raw_rows, indexed_capacity, stream);
+                        n_tokens, n_kv, raw_rows, indexed_capacity, stream,
+                        bounds_with_rows ? visibility_bounds : nullptr);
                 } else if (parallel_index_scan) {
                     ds4_fa_indexed_rows_parallel_kernel<float><<<n_tokens, 256, 0, stream>>>(
                         (const float *) mask->data, indexed_rows, indexed_counts,
@@ -3525,6 +3643,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                 (n_tokens + 255) / 256, 256, 0, stream>>>(
                     visibility_bounds, n_tokens, n_kv, raw_rows,
                     raw_window, causal_kv_start, causal_ratio);
+        } else if (bounds_with_rows) {
+            // written by the indexed-rows launch above
         } else if (mask->type == GGML_TYPE_F16) {
             ds4_fa_visibility_bounds_kernel<half><<<n_tokens, 64, 0, stream>>>(
                 (const half *) mask->data, visibility_bounds,
@@ -3826,7 +3946,11 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                         visibility_bounds, indexed_rows, indexed_counts,
                         indexed_capacity, inverse_rope,
                         inverse_rope_coefficients, forward_rope_coefficients,
-                        stream);
+                        stream,
+                        lane_rows ? (const int *) lane_rows->data : nullptr,
+                        lane_rows ? (const half *) lane_kv->data : nullptr);
+                } else if (lane_rows) {
+                    return false;
                 } else if (kv_f32 && mask->type == GGML_TYPE_F32) {
                     ds4_launch_flash_attn_d512_indexed_split<
                         float, float, split_count>(

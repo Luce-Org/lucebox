@@ -5,6 +5,7 @@
 #include "mmvq.cuh"
 #include "convert.cuh"
 
+#include <algorithm>
 #include <cstdlib>
 
 // On HIP the K loops below are unrolled (the "K-loop unroll" pragmas) so the
@@ -432,6 +433,43 @@ static void mul_mat_vec_f_switch_fusion(
 
 }
 
+// The block size the MMVF launch picks for a shape. It sets the partial-sum
+// order, so a fused kernel that repeats MMVF's arithmetic must use it too.
+int ggml_cuda_mmvf_block_size(int device, int64_t ncols, int64_t nrows, int64_t ncols_dst, bool f16_half_acc) {
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+
+    int64_t block_size_best = warp_size;
+    int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
+    int64_t max_block_size  = 256;
+    if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
+        max_block_size = 128;
+    }
+    for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
+        const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
+        if (niter < niter_best) {
+            niter_best      = niter;
+            block_size_best = block_size;
+        }
+    }
+    if (f16_half_acc && ncols_dst == 5) {
+        // RDNA 3.5 has enough independent rows at the drafter's width-5 F16
+        // projections to favor more, smaller Wave32 workgroups. This is a
+        // measured shape table (gfx1151, K=4096: 256 rows -> 128 threads,
+        // 1K-4K rows -> 64 threads); every other shape keeps the generic
+        // choice. The block size sets the partial-sum order, so it is part
+        // of the validated numerics and deliberately not an env tunable.
+        const int cc = ggml_cuda_info().devices[device].cc;
+        if (GGML_CUDA_CC_IS_RDNA3_5(cc) && ncols == 4096) {
+            if (nrows == 256) {
+                block_size_best = 128;
+            } else if (nrows >= 1024 && nrows <= 4096) {
+                block_size_best = 64;
+            }
+        }
+    }
+    return (int) block_size_best;
+}
+
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
 void launch_mul_mat_vec_f_cuda(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -453,36 +491,9 @@ void launch_mul_mat_vec_f_cuda(
     const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
 
-    int64_t block_size_best = warp_size;
-    int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
-    int64_t max_block_size  = 256;
-    if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
-        max_block_size = 128;
-    }
-    for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
-        const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
-        if (niter < niter_best) {
-            niter_best      = niter;
-            block_size_best = block_size;
-        }
-    }
-    if constexpr (std::is_same_v<T, half> && std::is_same_v<type_acc, half> &&
-                  ncols_dst == 5) {
-        // RDNA 3.5 has enough independent rows at the drafter's width-5 F16
-        // projections to favor more, smaller Wave32 workgroups. This is a
-        // measured shape table (gfx1151, K=4096: 256 rows -> 128 threads,
-        // 1K-4K rows -> 64 threads); every other shape keeps the generic
-        // choice. The block size sets the partial-sum order, so it is part
-        // of the validated numerics and deliberately not an env tunable.
-        const int cc = ggml_cuda_info().devices[device].cc;
-        if (GGML_CUDA_CC_IS_RDNA3_5(cc) && ncols == 4096) {
-            if (nrows == 256) {
-                block_size_best = 128;
-            } else if (nrows >= 1024 && nrows <= 4096) {
-                block_size_best = 64;
-            }
-        }
-    }
+    const int64_t block_size_best = ggml_cuda_mmvf_block_size(
+        device, ncols, nrows, ncols_dst,
+        std::is_same_v<T, half> && std::is_same_v<type_acc, half>);
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
@@ -666,6 +677,104 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 }
 
+// Skinny-K single-column F16 matvec (K = 64/128/256 over many rows). The
+// generic kernel gives every row its own block, so a K=256 row is a single
+// 512-byte trip and the launch is bound by block scheduling (~360 GB/s on
+// gfx1201 for the DSpark Markov head, vocab 129280 x rank 256). Here every lane
+// loads 16 bytes, K/8 lanes share a row and one wave covers several rows, which
+// streams the matrix at ~540 GB/s. Sums accumulate in F32, so values can differ
+// from the generic F16-accumulating path in the last bits.
+template <int K>
+static __global__ void __launch_bounds__(256) mul_mat_vec_f16_skinny(
+        const half * __restrict__ x, const float * __restrict__ y, const float * __restrict__ x_bias,
+        float * __restrict__ dst, const int nrows, const int64_t stride_row) {
+    constexpr int warp_size     = ggml_cuda_get_physical_warp_size();
+    constexpr int lanes_per_row = K / 8;
+    static_assert(lanes_per_row <= warp_size, "one row must fit in a wave");
+    constexpr int rows_per_warp = warp_size / lanes_per_row;
+
+    const int lane = threadIdx.x % warp_size;
+    const int warp = threadIdx.x / warp_size;
+    const int sub  = lane % lanes_per_row;
+    const int rsub = lane / lanes_per_row;
+    const int rows_per_block = (blockDim.x / warp_size) * rows_per_warp;
+
+    float yr[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        yr[j] = y[sub*8 + j];
+    }
+
+    // row0 is uniform across the block, so every lane runs the same number of
+    // trips and the shuffle reduction below is always fully populated.
+    for (int row0 = blockIdx.x*rows_per_block; row0 < nrows; row0 += gridDim.x*rows_per_block) {
+        const int row = row0 + warp*rows_per_warp + rsub;
+        float sum = 0.0f;
+        if (row < nrows) {
+            const uint4 q = *((const uint4 *) (x + row*stride_row) + sub);
+            const half2 * h = (const half2 *) &q;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 f = __half22float2(h[j]);
+                sum += f.x*yr[2*j] + f.y*yr[2*j + 1];
+            }
+        }
+        sum = warp_reduce_sum<lanes_per_row>(sum);
+        if (row < nrows && sub == 0) {
+            dst[row] = x_bias ? sum + x_bias[row] : sum;
+        }
+    }
+}
+
+static bool mmvf_skinny_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LUCE_CUDA_MMVF_SKINNY");
+        return !(value && value[0] == '0');
+    }();
+    return enabled;
+}
+
+// Returns true when the skinny kernel handled the product.
+static bool mul_mat_vec_f16_skinny_try(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+                                       ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion, cudaStream_t stream) {
+    if (src0->type != GGML_TYPE_F16 || ids || !mmvf_skinny_enabled()) {
+        return false;
+    }
+    if (fusion && (fusion->gate || fusion->gate_bias)) {
+        return false;
+    }
+    const int64_t K = src0->ne[0];
+    const int64_t nrows = src0->ne[1];
+    if ((K != 64 && K != 128 && K != 256) || nrows < 2048 || nrows > INT32_MAX) {
+        return false;
+    }
+    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        dst->ne[1] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    const int64_t stride_row = src0->nb[1] / ggml_type_size(src0->type);
+    if (src0->nb[1] % 16 != 0 || ((uintptr_t) src0->data) % 16 != 0) {
+        return false;
+    }
+    const float * x_bias = fusion && fusion->x_bias ? (const float *) fusion->x_bias->data : nullptr;
+
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int64_t rows_per_block = (256 / warp_size) * (warp_size / (K / 8));
+    const int64_t nblocks = std::min<int64_t>((nrows + rows_per_block - 1) / rows_per_block, 4096);
+    const half * x = (const half *) src0->data;
+    const float * y = (const float *) src1->data;
+    float * d = (float *) dst->data;
+    switch (K) {
+        case  64: mul_mat_vec_f16_skinny< 64><<<nblocks, 256, 0, stream>>>(x, y, x_bias, d, (int) nrows, stride_row); break;
+        case 128: mul_mat_vec_f16_skinny<128><<<nblocks, 256, 0, stream>>>(x, y, x_bias, d, (int) nrows, stride_row); break;
+        case 256: mul_mat_vec_f16_skinny<256><<<nblocks, 256, 0, stream>>>(x, y, x_bias, d, (int) nrows, stride_row); break;
+        default: return false;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -685,6 +794,10 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     GGML_ASSERT(        nb10       == ts_src1);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
     GGML_ASSERT(        nb0        == ts_dst);
+
+    if (mul_mat_vec_f16_skinny_try(src0, src1, ids, dst, fusion, ctx.stream())) {
+        return;
+    }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst->op_params[0]) : GGML_PREC_F32;

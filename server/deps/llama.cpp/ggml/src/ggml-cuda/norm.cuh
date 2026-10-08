@@ -13,7 +13,10 @@ void ggml_hip_vision_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 #endif
 void ggml_cuda_op_rms_norm_scale(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * scale);
 
-void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
+// q8_out: optional, the output's q8_1 form as MMVQ quantizes it, rows padded
+// to ncols_q8 (a multiple of QK8_1) with zero blocks.
+void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
+                                 void * q8_out = nullptr, int ncols_q8 = 0);
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,

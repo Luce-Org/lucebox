@@ -1,4 +1,5 @@
 #include "cpy.cuh"
+#include "quantize.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
 #include "../../rocmfp4/rocmfp4_hip_scale.cuh"
@@ -627,6 +628,14 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&
         src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
 
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q8_1) {
+        // The q8_1 rows MMVQ reads, from the kernel it quantizes its own
+        // activations with: an MoE owner on another GPU takes its input this way.
+        GGML_ASSERT(contiguous_srcs && ne00 % MATRIX_ROW_PADDING == 0);
+        quantize_row_q8_1_cuda((const float *) src0_ddc, nullptr, src1_ddc, GGML_TYPE_F32,
+                               ne00, ne00, ne00*ne01, ne00*ne01*ne02, ne00, ne01, ne02, src0->ne[3], main_stream);
+        return;
+    }
     if (src0->type == src1->type && contiguous_srcs) {
         GGML_ASSERT(ggml_nbytes(src0) == ggml_nbytes(src1));
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)

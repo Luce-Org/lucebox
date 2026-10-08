@@ -160,6 +160,208 @@ static __global__ void rope_norm(const T *            x,
     store_coaelsced(x0 * cos_theta - x1 * sin_theta, x0 * sin_theta + x1 * cos_theta);
 }
 
+// A forward NORMAL (optionally TAIL) rope without frequency factors, as the
+// fused rope kernels below run it: its launch parameters, read from the ROPE
+// node the way ggml_cuda_op_rope reads them, and one rotated pair with
+// rope_norm's arithmetic.
+struct rope_norm_fwd {
+    int n_dims;
+    int rot_offset;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float theta_scale;
+    rope_corr_dims corr_dims;
+};
+
+static rope_norm_fwd rope_norm_fwd_of(const ggml_tensor * rope, const int ncols) {
+    const int32_t * op = (const int32_t *) rope->op_params;
+    float freq_base, beta_fast, beta_slow;
+    rope_norm_fwd r;
+    r.n_dims = op[1];
+    const int n_ctx_orig = op[4];
+    memcpy(&freq_base,     op +  5, sizeof(float));
+    memcpy(&r.freq_scale,  op +  6, sizeof(float));
+    memcpy(&r.ext_factor,  op +  7, sizeof(float));
+    memcpy(&r.attn_factor, op +  8, sizeof(float));
+    memcpy(&beta_fast,     op +  9, sizeof(float));
+    memcpy(&beta_slow,     op + 10, sizeof(float));
+    r.rot_offset = (op[2] & GGML_ROPE_TYPE_TAIL) ? ncols - r.n_dims : 0;
+    ggml_rope_yarn_corr_dims(r.n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, r.corr_dims.v);
+    r.theta_scale = powf(freq_base, -2.0f / r.n_dims);
+    return r;
+}
+
+static __device__ __forceinline__ void rope_norm_fwd_pair(
+        const rope_norm_fwd & r, const int32_t p, const int i0, const float x0, const float x1,
+        float & o0, float & o1) {
+    if (i0 < r.rot_offset || i0 >= r.rot_offset + r.n_dims) {
+        o0 = x0;
+        o1 = x1;
+        return;
+    }
+    const int j0 = i0 - r.rot_offset;
+    const double theta_base = rope_theta_fp64(p, r.theta_scale, j0/2);
+    float cos_theta;
+    float sin_theta;
+    rope_yarn<true>(theta_base/1.0f, r.freq_scale, r.corr_dims, j0, r.ext_factor, r.attn_factor, cos_theta, sin_theta);
+    o0 = x0 * cos_theta - x1 * sin_theta;
+    o1 = x0 * sin_theta + x1 * cos_theta;
+}
+
+// RMS_NORM * w, then a NORMAL (optionally TAIL) forward ROPE, then the F32 ->
+// F16 copy of the result, one row per block: rms_norm_f32<block_size, mul>'s
+// arithmetic, rope_norm's per pair (no frequency factors) and the cast's
+// rounding, so the F32 rope output and its F16 copy are bit-identical to the
+// three launches they replace. Rows are [ncols] with positions pos[row / ne01].
+template <int block_size>
+static __global__ void rms_norm_rope_f16_kernel(
+        const float * __restrict__ x, const int64_t x_stride,
+        const float * __restrict__ w,
+        float * __restrict__ rope_dst, half * __restrict__ dst_f16,
+        const int ncols, const float eps, const int ne01,
+        const int32_t * __restrict__ pos, const rope_norm_fwd r) {
+    const int row = (int) blockIdx.x;
+    const int tid = (int) threadIdx.x;
+    x += (int64_t) row * x_stride;
+    rope_dst += (int64_t) row * ncols;
+    dst_f16 += (int64_t) row * ncols;
+
+    extern __shared__ float s_normed[];
+    __shared__ float s_sum[32];
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+    for (int col = tid; col < ncols; col += block_size) {
+        s_normed[col] = scale * x[col] * w[col];
+    }
+    __syncthreads();
+
+    const int i2 = row / ne01;
+    for (int p = tid; p < ncols / 2; p += block_size) {
+        const int i0 = 2 * p;
+        float o0;
+        float o1;
+        rope_norm_fwd_pair(r, pos[i2], i0, s_normed[i0 + 0], s_normed[i0 + 1], o0, o1);
+        rope_dst[i0 + 0] = o0;
+        rope_dst[i0 + 1] = o1;
+        dst_f16[i0 + 0] = __float2half(o0);
+        dst_f16[i0 + 1] = __float2half(o1);
+    }
+}
+
+// A forward NORMAL/TAIL rope (rope_norm's arithmetic, no frequency factors)
+// that also writes its output's q8_1 form in the layout MMVQ quantizes a
+// grouped view [G = D * heads_per_group, T, n_groups] of it to: element
+// (d, head, t) -> row (head / hpg) * T + t, column (head % hpg) * D + d. A
+// half-warp holds one 32-wide block (two values per thread); amax and the
+// sum follow quantize_q8_1's 32-lane butterfly exactly.
+static __global__ void rope_norm_q8_kernel(
+        const float * __restrict__ x, float * __restrict__ dst, const int D, const int H, const int T,
+        const int64_t s01, const int64_t s02,
+        const int32_t * __restrict__ pos, const rope_norm_fwd r,
+        block_q8_1 * __restrict__ q8, const int hpg) {
+    const int row = (int) blockIdx.x;            // head + H * token
+    const int p = (int) (blockIdx.y * blockDim.x + threadIdx.x);
+    const int i0 = 2 * p;
+    if (i0 >= D) return;                          // whole half-warps: D % 32 == 0
+    const int head = row % H;
+    const int t = row / H;
+    const float x0 = x[(int64_t) head * s01 + (int64_t) t * s02 + i0 + 0];
+    const float x1 = x[(int64_t) head * s01 + (int64_t) t * s02 + i0 + 1];
+    float o0;
+    float o1;
+    rope_norm_fwd_pair(r, pos[t], i0, x0, x1, o0, o1);
+    dst[(int64_t) row * D + i0 + 0] = o0;
+    dst[(int64_t) row * D + i0 + 1] = o1;
+
+    // quantize_q8_1: lane v of the block holds element v; here thread v/2.
+    float amax = fmaxf(fabsf(o0), fabsf(o1));
+    float v0 = o0;
+    float v1 = o1;
+#pragma unroll
+    for (int off = 8; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off, 16));
+        v0 += __shfl_xor_sync(0xffffffff, v0, off, 16);
+        v1 += __shfl_xor_sync(0xffffffff, v1, off, 16);
+    }
+    const float sum = v0 + v1;
+    const float  d = amax / 127.0f;
+    const int8_t q0 = amax == 0.0f ? 0 : roundf(o0 / d);
+    const int8_t q1 = amax == 0.0f ? 0 : roundf(o1 / d);
+    const int G = D * hpg;
+    const int g = head / hpg;
+    const int64_t col = (int64_t) (head % hpg) * D + i0;
+    const int64_t qi = ((int64_t) g * T + t) * G + col;
+    block_q8_1 * yb = q8 + qi / QK8_1;
+    yb->qs[qi % QK8_1 + 0] = q0;
+    yb->qs[qi % QK8_1 + 1] = q1;
+    if (qi % QK8_1 == 0) {
+        yb->ds = make_half2(d, sum);
+    }
+}
+
+void ggml_cuda_rope_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * rope, void * q8, int hpg) {
+    const ggml_tensor * x = rope->src[0];
+    const int D = (int) x->ne[0];
+    const int H = (int) x->ne[1];
+    const int T = (int) x->ne[2];
+    const dim3 grid(H * T, (D / 2 + 255) / 256, 1);
+    rope_norm_q8_kernel<<<grid, 256, 0, ctx.stream()>>>(
+        (const float *) x->data, (float *) rope->data, D, H, T,
+        x->nb[1] / sizeof(float), x->nb[2] / sizeof(float),
+        (const int32_t *) rope->src[1]->data, rope_norm_fwd_of(rope, D),
+        (block_q8_1 *) q8, hpg);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_rms_norm_rope_f16_supported(int ncols) {
+#if defined(GGML_USE_HIP)
+    return ncols % 2 == 0 && (size_t) ncols * sizeof(float) <= 32u * 1024u;
+#else
+    // Bit-exact on HIP only: nvcc builds with fast math and contracts the
+    // rotation's products differently here than in rope_norm, so CUDA keeps
+    // the three launches.
+    GGML_UNUSED(ncols);
+    return false;
+#endif
+}
+
+void ggml_cuda_rms_norm_rope_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * norm,
+                                 const ggml_tensor * mul, const ggml_tensor * rope, const ggml_tensor * cpy) {
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    float eps = 0.0f;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    const int ncols = (int) x->ne[0];
+    const int nrows = (int) ggml_nrows(x);
+    const ggml_tensor * rope_src = rope->src[0];
+    const int ne01 = (int) rope_src->ne[1];
+
+    const rope_norm_fwd r = rope_norm_fwd_of(rope, ncols);
+
+    const size_t shmem = (size_t) ncols * sizeof(float);
+    const int64_t x_stride = x->nb[1] / sizeof(float);
+    if (ncols < 1024) {
+        rms_norm_rope_f16_kernel<256><<<nrows, 256, shmem, ctx.stream()>>>(
+            (const float *) x->data, x_stride, (const float *) w->data,
+            (float *) rope->data, (half *) cpy->data, ncols, eps, ne01,
+            (const int32_t *) rope->src[1]->data, r);
+    } else {
+        rms_norm_rope_f16_kernel<1024><<<nrows, 1024, shmem, ctx.stream()>>>(
+            (const float *) x->data, x_stride, (const float *) w->data,
+            (float *) rope->data, (half *) cpy->data, ncols, eps, ne01,
+            (const int32_t *) rope->src[1]->data, r);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <bool forward, bool has_ff, typename T, typename D>
 static __global__ void rope_neox(const T *            x,
                                  D *                  dst,
