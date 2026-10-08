@@ -3,6 +3,7 @@
 // hc_mix(ffn) -> MoE -> hc_combine) -> hc_mix(output) -> lm_head. Single sequence.
 
 #include "qwen4exp_graph.h"
+#include "qwen4exp_chunk.h"
 
 #include "common/cuda_graph_overrides.h"
 #include "ggml-cpu.h"
@@ -1683,7 +1684,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         // device's share of the layer, so two streams leave the copies on the
         // critical path; more streams keep both devices busy.
         const int64_t r = std::max<int64_t>(1, qsa_ratio(w));
-        const int n_streams = (int) std::clamp<int64_t>(T / 4096, 2, 4);
+        const int n_streams = (int) std::clamp<int64_t>(T / kQwen4ExpPipelineStreamRows, 2, 4);
         streams.resize(n_streams);
         for (int i = 0; i + 1 < n_streams; ++i) {
             streams[i].T = std::max<int64_t>(256, (T / n_streams) / 256 * 256);

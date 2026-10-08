@@ -136,14 +136,14 @@ ggml_cuda_qwen4exp_profile ggml_backend_cuda_set_qwen4exp_profile(ggml_cuda_qwen
     return previous;
 }
 
-// The profile's kernels and fusions are tuned for gfx1151: with a second GPU in the
-// same graph (split mode) they apply only while that device is current.
 // A qwen4exp graph on any device: its fusions without gfx1151 kernels (WMMA,
 // MMB) apply on the other GPU of a split too.
 bool ggml_cuda_qwen4exp_graph() {
     return qwen4exp_profile == GGML_CUDA_QWEN4EXP_DEFAULT;
 }
 
+// The profile's kernels and fusions are tuned for gfx1151: with a second GPU in the
+// same graph (split mode) they apply only while that device is current.
 bool ggml_cuda_qwen4exp_enabled() {
     return qwen4exp_profile == GGML_CUDA_QWEN4EXP_DEFAULT &&
            GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
@@ -5561,8 +5561,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
                 if (!disable_fusion) {
                     const bool qwen4exp_graph = ggml_cuda_qwen4exp_graph();
-                    const bool qwen4exp_rdna35 = ggml_cuda_qwen4exp_enabled() &&
-                        GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc);
+                    const bool qwen4exp_rdna35 = ggml_cuda_qwen4exp_enabled();
                     if (qwen4exp_graph) {
                         if (node->op == GGML_OP_CONCAT) {
                             ggml_cuda_ple_conv_match pm;

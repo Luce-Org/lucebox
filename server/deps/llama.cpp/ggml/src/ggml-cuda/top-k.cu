@@ -1570,18 +1570,30 @@ static void topk_tiled_block_radix_cuda(
 
 #endif  // GGML_CUDA_USE_HIPCUB
 
+#ifdef GGML_CUDA_USE_HIPCUB
+// GGML_DS4_TOPK_BLOCK_RADIX, read once: 1 forces the block radix top-k on, 0 (or empty) off, -1 when unset.
+static int topk_block_radix_override() {
+    static const int value = [] {
+        const char * env = getenv("GGML_DS4_TOPK_BLOCK_RADIX");
+        return env ? (env[0] != '\0' && strcmp(env, "0") != 0 ? 1 : 0) : -1;
+    }();
+    return value;
+}
+#endif
+
 // QSA's padded selection takes the block radix top-k -- one launch for all rows instead of a device-wide
-// sort per row -- by default on gfx1151 (as every k = 512 top-k there) and gfx1201. Both are stable
+// sort per row -- by default on RDNA3.5 (as every k = 512 top-k there) and RDNA4. Both are stable
 // radix selections, so a row's 512 ids and their order do not change. GGML_DS4_TOPK_BLOCK_RADIX overrides.
 static bool topk_qsa_block_radix(int64_t ncols) {
 #ifdef GGML_CUDA_USE_HIPCUB
     if (ncols <= 1024 || ncols > 32768) {
         return false;
     }
-    const char * env = getenv("GGML_DS4_TOPK_BLOCK_RADIX");
+    if (topk_block_radix_override() >= 0) {
+        return topk_block_radix_override() == 1;
+    }
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const bool radix_default = cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 || cc == GGML_CUDA_CC_OFFSET_AMD + 0x1201;
-    return env ? env[0] != '\0' && strcmp(env, "0") != 0 : radix_default;
+    return GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
 #else
     GGML_UNUSED(ncols);
     return false;
@@ -1596,9 +1608,7 @@ static bool topk_qsa_rows_in_one_call(int64_t ncols) {
         return true;   // no padded route (the runtime-count network runs per row), or the block radix top-k
     }
 #ifdef GGML_CUDA_USE_HIPCUB
-    const char * env = getenv("GGML_DS4_TOPK_BLOCK_RADIX");
-    const bool radix_off = env && (env[0] == '\0' || strcmp(env, "0") == 0);
-    return !radix_off && ncols > 32768;   // the tiled top-k
+    return topk_block_radix_override() != 0 && ncols > 32768;   // the tiled top-k
 #else
     return false;
 #endif
@@ -1713,14 +1723,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 #elif defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)  // CUB_TOP_K_AVAILABLE
 #ifdef GGML_CUDA_USE_HIPCUB
-    const char * block_radix_env = getenv("GGML_DS4_TOPK_BLOCK_RADIX");
-    const int block_radix_cc =
-        ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const bool block_radix_default =
-        block_radix_cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
-    const bool block_radix_enabled = block_radix_env
-        ? block_radix_env[0] != '\0' && strcmp(block_radix_env, "0") != 0
-        : block_radix_default;
+    const bool block_radix_enabled = topk_block_radix_override() >= 0
+        ? topk_block_radix_override() == 1
+        : GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
     if (block_radix_enabled &&
         k == 512 && ncols > 1024 && ncols <= 32768) {
         if (ncols <= 5120) {
@@ -1736,9 +1741,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // and k = 2048 (candidate blocks): the tiled selection, unless the block
     // radix top-k is explicitly off, instead of a device-wide sort whose
     // scratch grows with every score.
-    const bool block_radix_off = block_radix_env &&
-        (block_radix_env[0] == '\0' || strcmp(block_radix_env, "0") == 0);
-    if (!block_radix_off && ncols > 4096 &&
+    if (topk_block_radix_override() != 0 && ncols > 4096 &&
         ((k == 512 && ncols > 32768) || k == 2048)) {
         topk_tiled_block_radix_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
         return;

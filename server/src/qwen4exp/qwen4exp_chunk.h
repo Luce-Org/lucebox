@@ -10,14 +10,21 @@ namespace luce::common {
 
 // The gfx1151 MoE route sort serves at most 32768 prompt rows.
 constexpr int kQwen4ExpMaxChunk = 32768;
+// Split mode: the generic MoE id helper on the expert device serves at most 16384 rows.
+constexpr int kQwen4ExpSplitMaxChunk = 16384;
+// Split mode: a prompt chunk pipelines over 2 to 4 streams of about this many rows.
+constexpr int kQwen4ExpPipelineStreamRows = 4096;
+// Split mode: the smallest chunk that still gives the prompt pipeline two streams.
+constexpr int kQwen4ExpSplitChunkFloor = 2 * kQwen4ExpPipelineStreamRows;
 
 // Largest 256-row tile multiple within a measured workspace budget, capped at
-// kQwen4ExpMaxChunk. Above 512, the dense/QSA peak envelope grows with T. Small
+// max_rows. Above 512, the dense/QSA peak envelope grows with T. Small
 // contexts / low-memory fallbacks also try 256, 128, ... 1. Keep 10% of
 // available memory for runtime, driver and OS growth.
 template<class Measure>
 int qwen4exp_fit_chunk(int max_ctx, size_t available, size_t fixed, Measure measure,
-                     size_t * snapshot_budget = nullptr, int floor_rows = 4096) {
+                     size_t * snapshot_budget = nullptr, int floor_rows = 4096,
+                     int max_rows = kQwen4ExpMaxChunk) {
     const size_t budget = available - available / 10;
     if (snapshot_budget) {
         const size_t requested = *snapshot_budget;
@@ -31,7 +38,7 @@ int qwen4exp_fit_chunk(int max_ctx, size_t available, size_t fixed, Measure meas
         fixed += *snapshot_budget;
     }
     if (max_ctx <= 0 || fixed >= budget) return 0;
-    int best = 0, lo = 2, hi = std::min(max_ctx, kQwen4ExpMaxChunk) / 256;
+    int best = 0, lo = 2, hi = std::min(max_ctx, max_rows) / 256;
     while (lo <= hi) {
         const int mid = lo + (hi - lo) / 2;
         if (measure(mid * 256) <= budget - fixed) { best = mid * 256; lo = mid + 1; }

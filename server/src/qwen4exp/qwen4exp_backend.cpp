@@ -12,7 +12,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <cstdlib>
 #include <cstdio>
 #include <cstdlib>
 #include <future>
@@ -74,6 +73,10 @@ static bool load_qwen4exp_hot_experts(ggml_backend_t backend, Qwen4ExpWeights & 
         w.cold_lut[(size_t) il] = ggml_new_tensor_2d(w.lut_ctx, GGML_TYPE_I32, 1, w.n_expert);
     }
     w.lut_buf = ggml_backend_alloc_ctx_tensors(w.lut_ctx, backend);
+    if (!w.lut_buf) {
+        std::fprintf(stderr, "[qwen4exp] hot experts: lookup table allocation failed\n");
+        return false;
+    }
     uint64_t hot_routes = 0, routes = 0;
     double hot_bytes = 0;
     for (int il = 0; il < w.n_layer; ++il) {
@@ -161,6 +164,11 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
                          slots * (decode + verify + draft);
     std::fprintf(stderr, "[qwen4exp] chunk-runtime mtp=%d decode=%zu verify=%zu draft=%zu scratch=%zu host=%zu\n",
         (int) mtp, decode, verify, draft, runtime_scratch, runtime_host);
+    // Split mode: the expert device's MoE id helper bounds a chunk. With hot experts the target keeps no slack for
+    // its matmul scratch pool, which grows over a long prompt and which the measurements below do not see, so the
+    // chunk stays at the floor (still two 4096-row pipeline streams).
+    const int max_rows = !w.expert_backend ? kQwen4ExpMaxChunk
+                       : w.hot ? kQwen4ExpSplitChunkFloor : kQwen4ExpSplitMaxChunk;
     struct Plan { size_t graph = 0, ring = 0, host = 0, scratch = 0; };
     std::vector<std::pair<int, Plan>> plans;   // one per probed chunk size
     const int chunk = qwen4exp_fit_chunk(cache.max_ctx, available, fixed, [&](int n) {
@@ -192,7 +200,7 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         std::fprintf(stderr, "[qwen4exp] chunk-plan rows=%d graph=%zu ring=%zu host=%zu scratch=%zu required=%zu available=%zu\n",
             n, graph, slots * (inputs + mask), host, scratch, fixed + workspace, available);
         return workspace;
-    }, snapshot_budget, w.expert_backend ? 8192 : 4096);
+    }, snapshot_budget, w.expert_backend ? kQwen4ExpSplitChunkFloor : 4096, max_rows);
     std::fprintf(stderr, "[qwen4exp] chunk-auto ctx=%d slots=%d resident=%d chunk=%d state=%zu fixed=%zu available=%zu headroom=%zu\n",
         cache.max_ctx, slots, resident_slots, chunk, state,
         fixed + (snapshot_budget ? *snapshot_budget : 0), available, available / 10);
@@ -276,7 +284,7 @@ bool Qwen4ExpBackend::init() {
     if (!load_qwen4exp_hot_experts(backend_, weights_, cfg_.expert_placement_path,
                                    hot_budget > 0 ? hot_budget : 8ull << 30)) return false;
     if (cfg_.chunk > 0) {
-        chunk_ = cfg_.chunk;
+        chunk_ = weights_.expert_backend ? std::min(cfg_.chunk, kQwen4ExpSplitMaxChunk) : cfg_.chunk;
     } else if (cfg_.max_concurrency > 1) {
         // Cap at the single-slot speed target: a larger chunk only holds the
         // other slots' decode for longer (and filled 93 GB at 4x32K: 12800 rows).
@@ -286,11 +294,6 @@ bool Qwen4ExpBackend::init() {
         chunk_ = qwen4exp_select_chunk(backend_, weights_, cache_, 1, 1, &snapshot_budget_);
         std::fprintf(stderr, "[qwen4exp] prefix snapshot allowance=%zu bytes\n", snapshot_budget_);
     }
-    if (weights_.expert_backend) chunk_ = std::min(chunk_, 16384);   // the generic MoE id helper's limit
-    // The planner does not see the target's matmul scratch pool, which grows
-    // over a long prompt; with hot experts the target has no slack left for it.
-    // 8192 rows still give the prompt pipeline two 4096-row streams.
-    if (weights_.hot && cfg_.chunk <= 0) chunk_ = std::min(chunk_, 8192);
     if (chunk_ <= 0) {
         std::fprintf(stderr, "[qwen4exp] insufficient prefill memory at the configured context\n");
         return false;
