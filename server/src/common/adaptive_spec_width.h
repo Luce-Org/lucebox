@@ -31,11 +31,16 @@
 //    are calibrated online: observe_confidence() tracks predicted against
 //    observed acceptance per depth and each score is scaled by their ratio,
 //    so an optimistic head stops buying widths the target does not pay for.
-//    Step costs are seeded by set_relative_costs()
-//    and refined online from the observed cost of the offered width; the
-//    first kCostWarmupSamples observations of a seeded width are ignored so a
-//    cold shape-specific graph build cannot poison a calibrated seed. A width
-//    that is not offered keeps its last cost estimate.
+//    Step costs are seeded by set_relative_costs() and measured online from
+//    the observed cost of the offered width; the first kCostWarmupSamples
+//    observations of a seeded width are ignored so a cold shape-specific
+//    graph build cannot poison the estimate. A seed is a shape, not a
+//    measurement of this machine: until a width is measured it is priced at
+//    its seed scaled by the measured/seed ratio of the nearest measured
+//    width, and never above a measured narrower width, so a wider shape the
+//    seed curve overprices gets measured (kCostWarmupSamples + 1 steps)
+//    instead of never being offered. Measured costs survive reset(), and
+//    measured_costs()/set_measured_costs() carry them across controllers.
 //
 //    Survival at depths beyond the offered width is not frozen: a rejection
 //    at depth d is a real zero sample for every deeper prefix, and a clean
@@ -91,6 +96,12 @@ public:
     static constexpr float kCostAlpha = 0.20f;
     // Observations of a seeded width ignored before its cost starts tracking.
     static constexpr int kCostWarmupSamples = 4;
+    // A measured width's sample counts at most this multiple of its estimate:
+    // a step that also built a graph (a new position band, a new request)
+    // costs several times a steady step, and one such outlier must not make
+    // the width look expensive for the following dozen steps. A real cost
+    // rise still lands, at up to kCostAlpha * 25% per step.
+    static constexpr float kCostOutlierRatio = 1.25f;
     // Below this prefix survival a depth has no usable support: the ratio of
     // two near-zero estimates is noise, so the learned conditional acceptance
     // of the next depth is taken against this floor instead.
@@ -124,6 +135,8 @@ public:
           accepted_candidates_ema_(initial_accepted_candidates_),
           prefix_survival_ema_((size_t) std::max(1, max_width_),
                                kSurvivalPrior),
+          width_cost_seed_((size_t) std::max(1, max_width_) + 1,
+                           std::numeric_limits<float>::quiet_NaN()),
           width_cost_ema_((size_t) std::max(1, max_width_) + 1,
                           std::numeric_limits<float>::quiet_NaN()),
           width_cost_samples_((size_t) std::max(1, max_width_) + 1, 0),
@@ -152,6 +165,21 @@ public:
     // positive leave the width unseeded. A backend can seed this from a short
     // calibration and then refine it online through observe().
     void set_relative_costs(const std::vector<float> & costs) {
+        const size_t n = std::min(costs.size(), width_cost_seed_.size());
+        for (size_t width = 0; width < n; ++width) {
+            const float cost = costs[width];
+            if (std::isfinite(cost) && cost > 0.0f) {
+                width_cost_seed_[width] = cost;
+            }
+        }
+    }
+
+    // Measured total step costs indexed by width, in observe() units (NaN
+    // where a width is unmeasured). Costs belong to the machine, not to the
+    // text, so a backend that builds a controller per request can hand them
+    // from one request's controller to the next.
+    const std::vector<float> & measured_costs() const { return width_cost_ema_; }
+    void set_measured_costs(const std::vector<float> & costs) {
         const size_t n = std::min(costs.size(), width_cost_ema_.size());
         for (size_t width = 0; width < n; ++width) {
             const float cost = costs[width];
@@ -182,8 +210,9 @@ public:
     // candidates 0..i-1 were accepted). With no model confidence, use the
     // target-observed prefix survival estimates learned by observe(); a
     // shorter vector is extended with the learned conditional acceptance of
-    // the depths it does not cover. Widths without a usable cost estimate
-    // are skipped; when none is usable the acceptance-only policy decides.
+    // the depths it does not cover. Widths are priced by width_cost(); those
+    // without a usable cost are skipped, and when none is usable the
+    // acceptance-only policy decides.
     int next_width_cost_aware(
             const std::vector<float> & conditional_acceptance,
             int proposed_width) const {
@@ -217,7 +246,7 @@ public:
             }
             expected_commits += survival;
             if (width < min_width_) continue;
-            const float cost = width_cost_ema_[(size_t) width];
+            const float cost = width_cost(width);
             if (!std::isfinite(cost) || cost <= 0.0f) continue;
             const float utility = expected_commits / cost;
             utilities[(size_t) width] = utility;
@@ -318,17 +347,33 @@ public:
         if (std::isfinite(observed_step_cost) && observed_step_cost > 0.0f) {
             float & estimate = width_cost_ema_[(size_t) offered];
             int & samples = width_cost_samples_[(size_t) offered];
-            if (!std::isfinite(estimate) || estimate <= 0.0f) {
-                // No calibrated seed for this width: adopt the first
-                // observation and track from the next one on.
+            const bool measured = std::isfinite(estimate) && estimate > 0.0f;
+            if (!measured && !has_seed(offered)) {
+                // No seed for this width: adopt the first observation and
+                // track from the next one on.
                 estimate = observed_step_cost;
                 samples = kCostWarmupSamples;
             } else if (++samples > kCostWarmupSamples) {
                 // Shape-specific graph construction makes the first few
-                // observations of a seeded width cold outliers. Preserve the
-                // calibrated seed through warmup, then track the live cost.
-                estimate = (1.0f - kCostAlpha) * estimate +
-                           kCostAlpha * observed_step_cost;
+                // observations of a width cold outliers (again after reset():
+                // a new request builds its own shapes). Skip them, then
+                // measure the live cost. Every live sample counts at most
+                // kCostOutlierRatio times the width's price before it: its
+                // estimate, or for the first one the price width_cost() gave
+                // it unmeasured, once another width is measured here (a bare
+                // seed is in another machine's units). A rarely offered width
+                // still meets graph builds after its warmup (a new position
+                // band), and a first sample taken there would keep it
+                // overpriced, and so never offered again, for the process.
+                const float reference = measured ? estimate
+                    : has_other_measured_cost(offered) ? width_cost(offered)
+                    : std::numeric_limits<float>::quiet_NaN();
+                const float sample = std::isfinite(reference) && reference > 0.0f
+                    ? std::min(observed_step_cost, kCostOutlierRatio * reference)
+                    : observed_step_cost;
+                estimate = measured
+                    ? (1.0f - kCostAlpha) * estimate + kCostAlpha * sample
+                    : sample;
             }
         }
 
@@ -433,6 +478,58 @@ private:
         return std::clamp(deeper / shallower, 0.0f, 1.0f);
     }
 
+    bool has_seed(int width) const {
+        const float seed = width_cost_seed_[(size_t) width];
+        return std::isfinite(seed) && seed > 0.0f;
+    }
+
+    bool has_measured_cost(int width) const {
+        const float cost = width_cost_ema_[(size_t) width];
+        return std::isfinite(cost) && cost > 0.0f;
+    }
+
+    bool has_other_measured_cost(int width) const {
+        for (int other = 1; other <= max_width_; ++other) {
+            if (other != width && has_measured_cost(other)) return true;
+        }
+        return false;
+    }
+
+    // Total step cost of a width in observe() units, NaN when it has none.
+    // A measured width answers with its estimate. An unmeasured seeded width
+    // is priced at its seed scaled by the measured/seed ratio of the nearest
+    // measured seeded width (the narrower one on a tie), and no higher than
+    // the widest measured width below it: extra candidates count as free
+    // until their shape is measured, so a seed curve from another machine
+    // cannot keep a profitable width from ever being offered.
+    float width_cost(int width) const {
+        if (has_measured_cost(width)) return width_cost_ema_[(size_t) width];
+        if (!has_seed(width)) return std::numeric_limits<float>::quiet_NaN();
+        float cost = width_cost_seed_[(size_t) width];
+        for (int distance = 1; distance <= max_width_; ++distance) {
+            int scale_width = -1;
+            for (const int other : {width - distance, width + distance}) {
+                if (other >= 1 && other <= max_width_ &&
+                    has_seed(other) && has_measured_cost(other)) {
+                    scale_width = other;
+                    break;
+                }
+            }
+            if (scale_width >= 0) {
+                cost *= width_cost_ema_[(size_t) scale_width] /
+                        width_cost_seed_[(size_t) scale_width];
+                break;
+            }
+        }
+        for (int below = width - 1; below >= 1; --below) {
+            if (has_measured_cost(below)) {
+                cost = std::min(cost, width_cost_ema_[(size_t) below]);
+                break;
+            }
+        }
+        return cost;
+    }
+
     bool max_width_guard_enabled() const {
         return max_width_probe_streak_ > 0 && max_width_ > min_width_;
     }
@@ -452,6 +549,8 @@ private:
     float full_accept_probe_;
     float accepted_candidates_ema_;
     std::vector<float> prefix_survival_ema_;
+    // Seed step-cost curve (a shape) and the measured costs, both by width.
+    std::vector<float> width_cost_seed_;
     std::vector<float> width_cost_ema_;
     std::vector<int> width_cost_samples_;
     // Per-width expected value of the current cost-aware decision; kept as

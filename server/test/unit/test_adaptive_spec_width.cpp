@@ -115,15 +115,74 @@ TEST_CASE(AdaptiveSpecWidthFixture, cost_aware_width_learns_prefix_survival) {
     CHECK(width.next_width_cost_aware({}) == 2);
 }
 
-TEST_CASE(AdaptiveSpecWidthFixture, observed_cost_updates_only_offered_width) {
+TEST_CASE(AdaptiveSpecWidthFixture, measured_cost_rescales_the_unmeasured_seeds) {
     AdaptiveSpecWidth width(4);
     width.set_relative_costs({0.0f, 0.0f, 70.0f, 100.0f, 130.0f});
     CHECK(width.next_width_cost_aware({1.0f, 1.0f, 1.0f}) == 4);
 
+    // q4 measures at twice its seed. The unmeasured q2 and q3 are priced at
+    // twice their seeds too (140, 200), so q4 keeps its place instead of
+    // losing to seeds in other units (4/260 against 3/100).
     for (int i = 0; i < 5; ++i) {
         width.observe(4, 4, 260.0f);
     }
-    CHECK(width.next_width_cost_aware({1.0f, 1.0f, 1.0f}) == 3);
+    CHECK(near(width.measured_costs()[4], 260.0f));
+    CHECK(!std::isfinite(width.measured_costs()[3]));
+    CHECK(width.next_width_cost_aware({1.0f, 1.0f, 1.0f}) == 4);
+}
+
+TEST_CASE(AdaptiveSpecWidthFixture, seed_curve_is_a_shape_scaled_to_the_machine) {
+    AdaptiveSpecWidth width(5, 2);
+    width.set_relative_costs(kDs4StepCosts);
+    // q5 measures at 40% of its seed: this machine is faster than the
+    // seed's. The unmeasured q2 is priced at 40% of its seed too (30, not
+    // 75), so a weak head settles on q2: 1.5/30 beats 2.0/49.2.
+    for (int i = 0; i <= AdaptiveSpecWidth::kCostWarmupSamples; ++i) {
+        width.observe(5, 5, 49.2f);
+    }
+    REQUIRE(near(width.measured_costs()[5], 49.2f));
+    CHECK(width.next_width_cost_aware({0.5f, 0.5f, 0.5f}) == 2);
+    CHECK(width.next_width_cost_aware({0.95f, 0.95f, 0.95f}) == 5);
+}
+
+TEST_CASE(AdaptiveSpecWidthFixture, wider_width_is_measured_before_the_seed_curve_rules_it_out) {
+    // The seed curve prices q5 at 1.64x q2; on this machine it costs 1.37x.
+    AdaptiveSpecWidth width(5, 2);
+    width.set_relative_costs(kDs4StepCosts);
+    const std::vector<float> head = {0.8f, 0.75f, 0.7f};
+    for (int i = 0; i < 12; ++i) {
+        width.observe(2, 2, 38.0f);
+    }
+    // Scaled from q2, q5 would cost 62 and lose (3.2/62 < 1.8/38). Until
+    // q3..q5 are measured they cost no more than the measured q2.
+    CHECK(width.next_width_cost_aware(head) > 2);
+    for (int w = 3; w <= 5; ++w) {
+        for (int i = 0; i <= AdaptiveSpecWidth::kCostWarmupSamples; ++i) {
+            width.observe(w, w, 38.0f + 4.7f * (float) (w - 2));
+        }
+    }
+    // At the measured prices the head decides: q5 commits 3.2 tokens for 52
+    // against 1.8 for 38 at q2, and a weak head goes back to q2.
+    CHECK(width.next_width_cost_aware(head) == 5);
+    CHECK(width.next_width_cost_aware({0.25f, 0.25f, 0.25f}) == 2);
+}
+
+TEST_CASE(AdaptiveSpecWidthFixture, measured_costs_carry_across_controllers) {
+    AdaptiveSpecWidth first(5, 2);
+    first.set_relative_costs(kDs4StepCosts);
+    for (int i = 0; i <= AdaptiveSpecWidth::kCostWarmupSamples; ++i) {
+        first.observe(5, 5, 50.0f);
+    }
+    first.reset();
+    CHECK(near(first.measured_costs()[5], 50.0f));
+
+    AdaptiveSpecWidth second(5, 2);
+    second.set_relative_costs(kDs4StepCosts);
+    second.set_measured_costs(first.measured_costs());
+    CHECK(near(second.measured_costs()[5], 50.0f));
+    CHECK(!std::isfinite(second.measured_costs()[2]));
+    // The carried q5 price rescales the unmeasured q2 at once (30.5).
+    CHECK(second.next_width_cost_aware({0.5f, 0.5f, 0.5f}) == 2);
 }
 
 TEST_CASE(AdaptiveSpecWidthFixture, nearly_free_fifth_slot_stays_profitable) {
@@ -258,20 +317,71 @@ TEST_CASE(AdaptiveSpecWidthFixture, unseeded_width_adopts_first_cost_then_tracks
     CHECK(width.next_width_cost_aware(certain) == 2);
     width.observe(3, 3, 1.0f);   // adopted as the q3 estimate: 3/1 beats 2/1
     CHECK(width.next_width_cost_aware(certain) == 3);
-    width.observe(3, 3, 100.0f); // no warmup hold without a seed: tracks now
+    // No warmup hold without a seed: it tracks from here, a lone spike as an
+    // outlier (at most 1.25x the estimate) and a sustained rise in full.
+    width.observe(3, 3, 100.0f);
+    CHECK(width.next_width_cost_aware(certain) == 3);
+    for (int step = 0; step < 12; ++step) width.observe(3, 3, 100.0f);
     CHECK(width.next_width_cost_aware(certain) == 2);
+}
+
+TEST_CASE(AdaptiveSpecWidthFixture, graph_build_outlier_does_not_flip_the_width) {
+    AdaptiveSpecWidth width(5, 2);
+    width.set_relative_costs(kDs4StepCosts);
+    for (int i = 0; i <= AdaptiveSpecWidth::kCostWarmupSamples; ++i) {
+        width.observe(2, 2, 38.0f);
+        width.observe(3, 3, 41.0f);
+        width.observe(4, 4, 44.0f);
+        width.observe(5, 5, 47.0f);
+    }
+    const std::vector<float> head = {0.97f, 0.96f, 0.95f};
+    REQUIRE(width.next_width_cost_aware(head) == 5);
+    // One q5 step that also built a graph costs 3x: the estimate moves 5%.
+    width.observe(5, 5, 141.0f);
+    CHECK(width.measured_costs()[5] < 50.0f);
+    CHECK(width.next_width_cost_aware(head) == 5);
 }
 
 TEST_CASE(AdaptiveSpecWidthFixture, seeded_width_holds_its_seed_through_warmup) {
     AdaptiveSpecWidth width(3);
     width.set_relative_costs({0.0f, 0.0f, 1.0f, 1.0f});
     const std::vector<float> certain = {1.0f, 1.0f};
+    for (int sample = 0; sample <= AdaptiveSpecWidth::kCostWarmupSamples; ++sample) {
+        width.observe(2, 2, 1.0f);   // q2 measured at its seed
+    }
     for (int sample = 0; sample < AdaptiveSpecWidth::kCostWarmupSamples; ++sample) {
         width.observe(3, 3, 100.0f); // cold graph-build outliers
         CHECK(width.next_width_cost_aware(certain) == 3);
     }
+    // The first live sample counts at most 1.25x the price q3 had (q2's
+    // 1.0); a sustained cost then lands at up to 5% a step, and q3 loses to
+    // q2 once it costs over 1.5.
     width.observe(3, 3, 100.0f);
+    CHECK(near(width.measured_costs()[3], 1.25f));
+    CHECK(width.next_width_cost_aware(certain) == 3);
+    for (int step = 0; step < 5; ++step) width.observe(3, 3, 100.0f);
     CHECK(width.next_width_cost_aware(certain) == 2);
+}
+
+TEST_CASE(AdaptiveSpecWidthFixture, graph_build_on_a_first_live_sample_does_not_price_a_width_out) {
+    // Two-box code: q2, q4 and q5 are measured; q3 is rarely offered, and
+    // the step right after its warmup also built a graph (58.9 ms).
+    AdaptiveSpecWidth width(5, 2);
+    width.set_relative_costs(kDs4StepCosts);
+    for (int i = 0; i <= AdaptiveSpecWidth::kCostWarmupSamples; ++i) {
+        width.observe(2, 2, 36.3f);
+        width.observe(4, 4, 44.0f);
+        width.observe(5, 5, 52.5f);
+    }
+    for (int i = 0; i < AdaptiveSpecWidth::kCostWarmupSamples; ++i) {
+        width.observe(3, 3, 43.7f);
+    }
+    width.observe(3, 3, 58.9f);
+    // Held to 1.25x its unmeasured price (no more than the measured q2).
+    CHECK(width.measured_costs()[3] <= 1.25f * 36.3f + 1e-3f);
+    // Its live cost then tracks down from there.
+    for (int i = 0; i < 12; ++i) width.observe(3, 3, 43.7f);
+    CHECK(width.measured_costs()[3] < 44.0f);
 }
 
 TEST_CASE(AdaptiveSpecWidthFixture, cost_aware_never_exceeds_the_proposal) {
