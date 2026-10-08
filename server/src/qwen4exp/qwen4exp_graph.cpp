@@ -247,11 +247,14 @@ static Qwen4ExpMoeRoute build_moe_route(ggml_context * c, ggml_tensor * cur,
     r.shared = ggml_mul(c, mm(c, L.ffn_down_shexp, sh_gu), ggml_sigmoid(c, mm(c, L.ffn_gate_inp_shexp, cur)));
     // The expert kernels convert their activations to F16 anyway.
     r.xin = n_tokens > 64 ? ggml_cast(c, cur, GGML_TYPE_F16) : cur;
-    // Verify batches with hot experts: each pick runs on one device, masked (-1)
-    // on the other. Only there is the expert device's matvec bandwidth-bound
-    // (a single token pays per call, masked picks or not), and only the
-    // matvec kernels take masked ids on gfx1151 (MMQ faults on them).
-    if (n_tokens >= 2 && n_tokens <= 8 && il >= 0 && il < (int) w.hot_lut.size() && w.hot_lut[il]) {
+    // Decode and verify steps with hot experts: each pick runs on one device,
+    // masked (-1) on the other. Single-token steps take the same route as
+    // verify rows, so every generated token computes its hot picks with the
+    // same tokenwise kernel whatever the verify width, and greedy text does not
+    // depend on the adaptive width. Prompt chunks keep every pick on the expert
+    // device: only the matvec kernels take masked ids on gfx1151 (MMQ faults
+    // on them).
+    if (n_tokens <= 8 && il >= 0 && il < (int) w.hot_lut.size() && w.hot_lut[il]) {
         ggml_tensor * flat = ggml_reshape_1d(c, ggml_is_contiguous(r.sel) ? r.sel : ggml_cont(c, r.sel),
                                              w.n_expert_used * n_tokens);
         r.hot = ggml_reshape_2d(c, ggml_get_rows(c, w.hot_lut[il], flat), w.n_expert_used, n_tokens);
