@@ -658,15 +658,28 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     }
     // Replace speculative MTP rows with committed trunk pairs. Keep exactly
     // one pending hidden row: x[cur_pos] is still unknown to the live cache.
+    // An AR retry runs no drafts and leaves one pair per decoded token, so the
+    // catch-up goes in prompt-chunk-sized forwards. It only serves later drafts
+    // and snapshots: if it fails, the text stands, and the MTP state is marked
+    // incomplete so no snapshot of this sequence is published.
     if (mtp) {
         const int pairs = (int) mtp_tok.size() - 1;
-        if (pairs > 0 && !qwen4exp_mtp_forward(backend_, weights_, cache_, mtp_tok.data(), mtp_h.data(),
-                                               pairs, mtp_pos, mtp_logits, nullptr, true)) {
-            result.fail(GenerateErrorCode::DecodeFailed, "qwen4exp MTP checkpoint catch-up failed");
-            return result;
+        bool caught_up = true;
+        for (int done = 0; caught_up && done < pairs;) {
+            const int n = std::min(pairs - done, std::max(1, chunk));
+            caught_up = qwen4exp_mtp_forward(backend_, weights_, cache_, mtp_tok.data() + done,
+                                             mtp_h.data() + (size_t) done * hd, n, mtp_pos + done,
+                                             mtp_logits, nullptr, true);
+            done += n;
         }
-        ggml_backend_tensor_set(cache_.mtp_prev_hidden, mtp_h.data() + (size_t) pairs * hd, 0, hd * sizeof(float));
-        cache_.mtp_prev_pos = pos - 1;
+        if (caught_up) {
+            ggml_backend_tensor_set(cache_.mtp_prev_hidden, mtp_h.data() + (size_t) pairs * hd, 0, hd * sizeof(float));
+            cache_.mtp_prev_pos = pos - 1;
+        } else {
+            std::fprintf(stderr, "[qwen4exp-mtp] checkpoint catch-up of %d pairs failed; this sequence keeps "
+                                 "its text but publishes no snapshot\n", pairs);
+            cache_.mtp_prev_pos = -1;
+        }
     }
     tokens_ = std::move(history);
     const auto t_dec1 = std::chrono::steady_clock::now();
