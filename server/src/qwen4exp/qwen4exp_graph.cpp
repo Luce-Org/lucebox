@@ -1577,43 +1577,99 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     std::vector<Qwen4ExpStream> streams;
     int pipeline_blocks = cache.indexer_blocks;
 
-    // FFN half of layer il: HC combine into the FFN norm, MoE, and the HC combine fused with the next layer's norm
-    // (left in xn_next). Returns the new residual.
-    auto ffn_half = [&](int il, ggml_tensor * cur, ggml_tensor * inject, ggml_tensor * res_hc, int64_t layer_T,
-                        ggml_tensor *& xn_next) -> ggml_tensor * {
+    // The per-layer pieces below build both the single-stream layers and each stream of a pipelined prompt chunk.
+    // A block's attention inputs: the whole forward's, or one stream's.
+    struct Block {
+        int64_t pos0 = 0, kv_len = 0;
+        int n_pooled = 0;
+        Qwen4ExpQsaMode qsa = QSA_DENSE;
+        ggml_tensor * positions = nullptr, * mask = nullptr, * ple_in = nullptr;
+    };
+    // Attention half of layer il: PLE, the HC mix into the attention input (from the previous layer's fused norm when
+    // xn_next holds it), and the attention. `inject` receives the mix's injection.
+    auto attn_half = [&](int il, const Block & b, ggml_tensor *& res_hc, ggml_tensor *& xn_next,
+                         ggml_tensor *& inject) -> ggml_tensor * {
+        const Qwen4ExpLayer & L = w.layers[il];
+        if (L.is_ple && has_ple) {
+            res_hc = build_ple(ctx, gf, res_hc, b.ple_in, L, w, cache.ple_conv_state[ple_idx[il]],
+                               verify ? cache.spec_ple : nullptr);
+            xn_next = nullptr;   // PLE changed the residual; the norm must rerun
+        }
+        ggml_tensor * cur;
+        if (xn_next != nullptr) {
+            cur = hc_mix_from_xn(ctx, xn_next, L.hc_attn_down, L.hc_attn_up,
+                                 L.hc_attn_inject, &inject, w.n_embd, w.n_hc);
+        } else {
+            cur = hc_mix(ctx, res_hc, L.hc_attn_norm, L.hc_attn_down,
+                         L.hc_attn_up, L.hc_attn_inject, &inject,
+                         w.n_embd, w.n_hc, w.rms_eps);
+        }
+        xn_next = nullptr;
+        if (L.is_full_attention) {
+            const int fi = full_idx[il];
+            return build_full_attn(ctx, gf, cur, L, w,
+                                   cache.attn_k[fi], cache.attn_v[fi], cache.indexer_k[fi],
+                                   w.qsa ? cache.indexer_raw[fi] : nullptr,
+                                   b.positions, b.mask, kv_row, b.kv_len, b.pos0,
+                                   il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0,
+                                   b.n_pooled, b.qsa, verify ? &rows : nullptr, stable_qsa ? &stable_ws : nullptr);
+        }
+        const int li = lin_idx[il];
+        return build_linear_attn(ctx, gf, cur, L, w, cache.ssm_state[li], cache.conv_state[li],
+                                 verify ? cache.spec_ssm[li] : nullptr, verify ? cache.spec_conv[li] : nullptr);
+    };
+    // The last layer's FFN runs on the output row only. Upstream selects output rows before the final HC/FFN, so its
+    // quantized matmuls dispatch with one token (MMV rather than MMQ); this reuses that selection after all attention
+    // cache writes. Earlier rows have no remaining stateful consumers.
+    auto last_row = [&](ggml_tensor *& cur, ggml_tensor *& inject, ggml_tensor *& res_hc, int64_t rows_T) {
+        cur = ggml_view_2d(ctx, cur, w.n_embd, 1, cur->nb[1], (rows_T - 1)*cur->nb[1]);
+        inject = ggml_view_2d(ctx, inject, inject->ne[0], 1, inject->nb[1], (rows_T - 1)*inject->nb[1]);
+        res_hc = ggml_view_3d(ctx, res_hc, w.n_embd, w.n_hc, 1,
+                              res_hc->nb[1], res_hc->nb[2], (rows_T - 1)*res_hc->nb[2]);
+    };
+    // HC combine of the attention output into the FFN norm, and the HC mix into the MoE input.
+    auto ffn_input = [&](int il, ggml_tensor * cur, ggml_tensor *& inject, ggml_tensor *& res_hc,
+                         int64_t layer_T) -> ggml_tensor * {
         const Qwen4ExpLayer & L = w.layers[il];
         ggml_tensor * ffn_fused = hc_combine_norm(ctx, inject, res_hc, cur,
             L.hc_ffn_norm, w.n_embd, w.n_hc, layer_T, w.rms_eps);
         res_hc = hc_norm_res(ctx, ffn_fused, w.n_embd, w.n_hc, layer_T);
-        cur = hc_mix_from_xn(ctx, hc_norm_xn(ctx, ffn_fused, w.n_embd, w.n_hc, layer_T),
-                             L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, &inject,
-                             w.n_embd, w.n_hc);
+        return hc_mix_from_xn(ctx, hc_norm_xn(ctx, ffn_fused, w.n_embd, w.n_hc, layer_T),
+                              L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, &inject,
+                              w.n_embd, w.n_hc);
+    };
+    // HC combine of the MoE output into the residual, fused with the next layer's attention norm (left in xn_next)
+    // unless that layer starts with PLE. Returns the new residual.
+    auto ffn_output = [&](int il, ggml_tensor * moe_out, ggml_tensor * inject, ggml_tensor * res_hc, int64_t layer_T,
+                          ggml_tensor *& xn_next) -> ggml_tensor * {
+        if (il + 1 < w.n_layer && w.layers[il + 1].is_ple && has_ple) {
+            xn_next = nullptr;
+            return hc_combine(ctx, res_hc, moe_out, inject, w.n_embd, w.n_hc, layer_T);
+        }
+        ggml_tensor * gamma = (il + 1 < w.n_layer) ? w.layers[il + 1].hc_attn_norm : w.output_hc_norm;
+        ggml_tensor * f = hc_combine_norm(ctx, inject, res_hc, moe_out,
+            gamma, w.n_embd, w.n_hc, layer_T, w.rms_eps);
+        xn_next = hc_norm_xn(ctx, f, w.n_embd, w.n_hc, layer_T);
+        return hc_norm_res(ctx, f, w.n_embd, w.n_hc, layer_T);
+    };
+    // FFN half of layer il: ffn_input, the MoE and ffn_output. Returns the new residual.
+    auto ffn_half = [&](int il, ggml_tensor * cur, ggml_tensor * inject, ggml_tensor * res_hc, int64_t layer_T,
+                        ggml_tensor *& xn_next) -> ggml_tensor * {
+        const Qwen4ExpLayer & L = w.layers[il];
+        cur = ffn_input(il, cur, inject, res_hc, layer_T);
         const bool next_ple = (il + 1 < w.n_layer) && w.layers[il + 1].is_ple && has_ple;
         // Prefill: the MoE combine runs inside the next HC_COMBINE_NORM (one kernel fewer; last-bit numerics change
         // from FMA contraction in the new kernel, covered by the long-prompt quality gate). Not at T=1: it cost ~1.7% decode.
         Qwen4ExpMoeParts moe_parts;
         const bool fold = !split && !next_ple && ggml_backend_cuda_mmb_prefill(layer_T);
         cur = build_moe(ctx, cur, L, w, fold ? &moe_parts : nullptr, split ? &expert_nodes : nullptr);
-
-        if (fold) {
-            ggml_tensor * gamma = (il + 1 < w.n_layer)
-                ? w.layers[il + 1].hc_attn_norm : w.output_hc_norm;
-            ggml_tensor * f = ggml_hc_combine_norm_moe(ctx, inject, res_hc, moe_parts.down, moe_parts.weights,
-                moe_parts.shared, moe_parts.shared_logit, gamma, 1.0f / (float) w.n_hc, 0.0f, 2.0f, 0.0f, w.rms_eps);
-            res_hc = hc_norm_res(ctx, f, w.n_embd, w.n_hc, layer_T);
-            xn_next = hc_norm_xn(ctx, f, w.n_embd, w.n_hc, layer_T);
-        } else if (next_ple) {
-            res_hc = hc_combine(ctx, res_hc, cur, inject, w.n_embd, w.n_hc, layer_T);
-            xn_next = nullptr;
-        } else {
-            ggml_tensor * gamma = (il + 1 < w.n_layer)
-                ? w.layers[il + 1].hc_attn_norm : w.output_hc_norm;
-            ggml_tensor * f = hc_combine_norm(ctx, inject, res_hc, cur,
-                gamma, w.n_embd, w.n_hc, layer_T, w.rms_eps);
-            res_hc = hc_norm_res(ctx, f, w.n_embd, w.n_hc, layer_T);
-            xn_next = hc_norm_xn(ctx, f, w.n_embd, w.n_hc, layer_T);
-        }
-        return res_hc;
+        if (!fold) return ffn_output(il, cur, inject, res_hc, layer_T, xn_next);
+        ggml_tensor * gamma = (il + 1 < w.n_layer)
+            ? w.layers[il + 1].hc_attn_norm : w.output_hc_norm;
+        ggml_tensor * f = ggml_hc_combine_norm_moe(ctx, inject, res_hc, moe_parts.down, moe_parts.weights,
+            moe_parts.shared, moe_parts.shared_logit, gamma, 1.0f / (float) w.n_hc, 0.0f, 2.0f, 0.0f, w.rms_eps);
+        xn_next = hc_norm_xn(ctx, f, w.n_embd, w.n_hc, layer_T);
+        return hc_norm_res(ctx, f, w.n_embd, w.n_hc, layer_T);
     };
     struct { ggml_tensor * cur = nullptr, * inject = nullptr, * res = nullptr; } branch;
 
@@ -1659,28 +1715,9 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
             st.res_hc = repeat_dim1(ctx, ggml_reshape_3d(ctx, st.inp_emb, w.n_embd, 1, st.T), w.n_hc);
         }
         auto stage_r = [&](Qwen4ExpStream & st, int il) {
-            const Qwen4ExpLayer & L = w.layers[il];
-            if (L.is_ple && has_ple) {
-                st.res_hc = build_ple(ctx, gf, st.res_hc, st.ple_in, L, w, cache.ple_conv_state[ple_idx[il]]);
-                st.xn_next = nullptr;
-            }
             ggml_tensor * inject = nullptr;
-            ggml_tensor * cur = st.xn_next
-                ? hc_mix_from_xn(ctx, st.xn_next, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, &inject, w.n_embd, w.n_hc)
-                : hc_mix(ctx, st.res_hc, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, &inject,
-                         w.n_embd, w.n_hc, w.rms_eps);
-            st.xn_next = nullptr;
-            if (L.is_full_attention) {
-                const int fi = full_idx[il];
-                cur = build_full_attn(ctx, gf, cur, L, w, cache.attn_k[fi], cache.attn_v[fi], cache.indexer_k[fi],
-                                      w.qsa ? cache.indexer_raw[fi] : nullptr, st.positions, st.mask, nullptr,
-                                      st.pos0 + st.T, st.pos0,
-                                      il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0,
-                                      st.n_pooled, st.qsa);
-            } else {
-                const int li = lin_idx[il];
-                cur = build_linear_attn(ctx, gf, cur, L, w, cache.ssm_state[li], cache.conv_state[li]);
-            }
+            ggml_tensor * cur = attn_half(il, { st.pos0, st.pos0 + st.T, st.n_pooled, st.qsa, st.positions, st.mask,
+                                                st.ple_in }, st.res_hc, st.xn_next, inject);
             st.layer_T = st.T;
             if (il == w.n_layer - 1) {
                 if (out_hidden) {
@@ -1693,20 +1730,14 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
                     st.done = true;
                     return;
                 }
-                if (st.T > 1) {   // as below: the last layer's FFN runs on the output row only
-                    cur = ggml_view_2d(ctx, cur, w.n_embd, 1, cur->nb[1], (st.T - 1)*cur->nb[1]);
-                    inject = ggml_view_2d(ctx, inject, inject->ne[0], 1, inject->nb[1], (st.T - 1)*inject->nb[1]);
-                    st.res_hc = ggml_view_3d(ctx, st.res_hc, w.n_embd, w.n_hc, 1,
-                                             st.res_hc->nb[1], st.res_hc->nb[2], (st.T - 1)*st.res_hc->nb[2]);
+                if (st.T > 1) {
+                    last_row(cur, inject, st.res_hc, st.T);
                     st.layer_T = 1;
                 }
             }
-            ggml_tensor * ffn_fused = hc_combine_norm(ctx, inject, st.res_hc, cur, L.hc_ffn_norm,
-                                                      w.n_embd, w.n_hc, st.layer_T, w.rms_eps);
-            st.res_hc = hc_norm_res(ctx, ffn_fused, w.n_embd, w.n_hc, st.layer_T);
-            cur = hc_mix_from_xn(ctx, hc_norm_xn(ctx, ffn_fused, w.n_embd, w.n_hc, st.layer_T),
-                                 L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, &st.inject, w.n_embd, w.n_hc);
-            st.route = build_moe_route(ctx, cur, L, w);
+            st.inject = inject;
+            cur = ffn_input(il, cur, st.inject, st.res_hc, st.layer_T);
+            st.route = build_moe_route(ctx, cur, w.layers[il], w);
             for (ggml_tensor * t : { st.route.xin, st.route.sel, st.route.wsel, st.route.shared, st.inject, st.res_hc }) {
                 ggml_build_forward_expand(gf, t);
             }
@@ -1718,18 +1749,9 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         };
         auto stage_c = [&](Qwen4ExpStream & st, int il) {
             if (st.done) return;
-            ggml_tensor * cur = moe_join(ctx, st.routed, st.route.shared);
-            if (il + 1 < w.n_layer && w.layers[il + 1].is_ple && has_ple) {
-                st.res_hc = hc_combine(ctx, st.res_hc, cur, st.inject, w.n_embd, w.n_hc, st.layer_T);
-                st.xn_next = nullptr;
-            } else {
-                ggml_tensor * gamma = (il + 1 < w.n_layer) ? w.layers[il + 1].hc_attn_norm : w.output_hc_norm;
-                ggml_tensor * f = hc_combine_norm(ctx, st.inject, st.res_hc, cur, gamma,
-                                                  w.n_embd, w.n_hc, st.layer_T, w.rms_eps);
-                st.res_hc = hc_norm_res(ctx, f, w.n_embd, w.n_hc, st.layer_T);
-                st.xn_next = hc_norm_xn(ctx, f, w.n_embd, w.n_hc, st.layer_T);
-                ggml_build_forward_expand(gf, st.xn_next);
-            }
+            st.res_hc = ffn_output(il, moe_join(ctx, st.routed, st.route.shared), st.inject, st.res_hc,
+                                   st.layer_T, st.xn_next);
+            if (st.xn_next) ggml_build_forward_expand(gf, st.xn_next);
             ggml_build_forward_expand(gf, st.res_hc);
         };
         for (int il = 0; il < w.n_layer; ++il) {
@@ -1792,50 +1814,14 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         res_hc = repeat_dim1(ctx,
             ggml_reshape_3d(ctx, inp_emb, w.n_embd, 1, T), w.n_hc);
 
+        const Block block = { pos0, graph_kv_len, cache.indexer_blocks, qsa, positions, mask, ple_in };
         for (int il = 0; il < w.n_layer; ++il) {
-            const Qwen4ExpLayer & L = w.layers[il];
-
-            if (L.is_ple && has_ple) {
-                res_hc = build_ple(ctx, gf, res_hc, ple_in, L, w, cache.ple_conv_state[ple_idx[il]],
-                                   verify ? cache.spec_ple : nullptr);
-                xn_next = nullptr;   // PLE changed the residual; the norm must rerun
-            }
-
             ggml_tensor * inject = nullptr;
-            ggml_tensor * cur;
-            if (xn_next != nullptr) {
-                cur = hc_mix_from_xn(ctx, xn_next, L.hc_attn_down, L.hc_attn_up,
-                                     L.hc_attn_inject, &inject, w.n_embd, w.n_hc);
-            } else {
-                cur = hc_mix(ctx, res_hc, L.hc_attn_norm, L.hc_attn_down,
-                             L.hc_attn_up, L.hc_attn_inject, &inject,
-                             w.n_embd, w.n_hc, w.rms_eps);
-            }
-            xn_next = nullptr;
-            if (L.is_full_attention) {
-                const int fi = full_idx[il];
-                cur = build_full_attn(ctx, gf, cur, L, w,
-                                      cache.attn_k[fi], cache.attn_v[fi], cache.indexer_k[fi],
-                                      w.qsa ? cache.indexer_raw[fi] : nullptr,
-                                      positions, mask, kv_row, graph_kv_len, pos0,
-                                      il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0,
-                                      cache.indexer_blocks, qsa, verify ? &rows : nullptr, stable_qsa ? &stable_ws : nullptr);
-            } else {
-                const int li = lin_idx[il];
-                cur = build_linear_attn(ctx, gf, cur, L, w, cache.ssm_state[li], cache.conv_state[li],
-                                        verify ? cache.spec_ssm[li] : nullptr, verify ? cache.spec_conv[li] : nullptr);
-            }
+            ggml_tensor * cur = attn_half(il, block, res_hc, xn_next, inject);
             int64_t layer_T = T;
             if (!verify && il == w.n_layer - 1 && T > 1) {
                 if (out_hidden) branch = { cur, inject, res_hc };   // every row's FFN half, for the MTP hidden only
-                // Upstream selects output rows before the final HC/FFN, so its
-                // quantized matmuls dispatch with one token (MMV rather than MMQ).
-                // The default path reuses that selection after all attention cache
-                // writes. Earlier rows have no remaining stateful consumers.
-                cur = ggml_view_2d(ctx, cur, w.n_embd, 1, cur->nb[1], (T - 1)*cur->nb[1]);
-                inject = ggml_view_2d(ctx, inject, inject->ne[0], 1, inject->nb[1], (T - 1)*inject->nb[1]);
-                res_hc = ggml_view_3d(ctx, res_hc, w.n_embd, w.n_hc, 1,
-                                     res_hc->nb[1], res_hc->nb[2], (T - 1)*res_hc->nb[2]);
+                last_row(cur, inject, res_hc, T);
                 layer_T = 1;
             }
             res_hc = ffn_half(il, cur, inject, res_hc, layer_T, xn_next);
