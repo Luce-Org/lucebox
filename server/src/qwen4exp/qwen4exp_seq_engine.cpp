@@ -33,7 +33,8 @@ Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
       slots_(pool_, max_ctx),
       prefill_granule_(std::max(prefill_granule, 1)),
       prefix_allowance_(prefix_allowance),
-      checkpoints_((size_t)kPrefixCheckpoints) {}
+      checkpoints_((size_t)kPrefixCheckpoints),
+      prefill_cuts_(caches_.size()) {}
 
 Qwen4ExpSeqEngine::~Qwen4ExpSeqEngine() {
     ggml_backend_synchronize(backend_);
@@ -81,6 +82,7 @@ SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_cold(
     }
     reset_qwen4exp_state(backend_, *caches_[(size_t)result.slot]);
     ggml_backend_synchronize(backend_);
+    prefill_cuts_[(size_t)result.slot].clear();
     return result;
 }
 
@@ -131,6 +133,8 @@ SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_with_prefix(
     if (result.status != AdmitResult::Status::admitted) return result;
     const int slot = result.slot;
     slots_.slot(slot).pending_capture = {};
+    prefill_cuts_[(size_t)slot] = plan.restore_points;
+    std::sort(prefill_cuts_[(size_t)slot].begin(), prefill_cuts_[(size_t)slot].end());
     if (plan.restore.valid()) {
         const auto started = std::chrono::steady_clock::now();
         const bool restored = restore_prefix(slot, prompt, plan.restore);
@@ -205,8 +209,13 @@ PrefixStoreEvent Qwen4ExpSeqEngine::capture_prefix(int slot, PrefixCaptureTicket
 
 int Qwen4ExpSeqEngine::prefill_segment(int slot, int max_tokens) const {
     const SeqSlot & s = slots_.slot(slot);
-    int end = std::min(s.prompt_len, s.cur_pos + max_tokens);
-    end = std::min(end, (s.cur_pos / prefill_granule_ + 1) * prefill_granule_);
+    int end = std::min({s.prompt_len, s.cur_pos + max_tokens, s.cur_pos + prefill_granule_});
+    for (int cut : prefill_cuts_[(size_t)slot]) {
+        if (cut > s.cur_pos) {
+            end = std::min(end, cut);
+            break;
+        }
+    }
     const PrefixCaptureTicket & capture = s.pending_capture;
     if (capture.valid() && s.cur_pos < capture.checkpoint.tokens)
         end = std::min(end, capture.checkpoint.tokens);
@@ -420,6 +429,7 @@ void Qwen4ExpSeqEngine::retire(int slot) {
     if (slot < 0 || slot >= slot_count()) return;
     ggml_backend_synchronize(backend_);
     if (slots_.is_active(slot)) slots_.retire(slot);
+    prefill_cuts_[(size_t)slot].clear();
     reset_qwen4exp_state(backend_, *caches_[(size_t)slot]);
     ggml_backend_synchronize(backend_);
 }

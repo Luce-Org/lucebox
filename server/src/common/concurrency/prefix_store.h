@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace luce::common {
 
@@ -49,6 +50,11 @@ inline bool operator!=(const PrefixCaptureTicket & a,
 struct PrefixStorePlan {
     PrefixStoreRef restore;
     PrefixCaptureTicket capture;
+    // Every prompt position a later request may restore this prefix from
+    // (chat boundaries plus the capture and restore cuts), ascending. An engine
+    // whose prompt numerics depend on where a forward ends cuts prefill at each,
+    // so a prompt's text does not depend on what the cache holds. Empty: no cuts.
+    std::vector<int> restore_points;
 };
 
 struct PrefixStoreAdmission {

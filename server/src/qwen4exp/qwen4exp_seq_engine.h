@@ -14,11 +14,13 @@ namespace luce::common {
 // N-way independent-slot engine. Each slot owns a full cache; the pool is
 // admission/headroom bookkeeping only (there is no paged KV).
 //
-// Prefill advances in fixed granules: every prompt forward ends at the next
-// multiple of the granule (or at a prefix-capture boundary, or the prompt's
-// end), whatever else the step carries, so a prompt's numerics do not depend
-// on concurrent load. While other slots decode, a step runs one granule in
-// total, so a long prompt never holds the live streams for more than one.
+// Prefill advances in fixed granules: every prompt forward ends one granule
+// after the previous one, or earlier at a restore point (the plan's chat
+// boundaries and cache cuts, as the single-slot path cuts), a capture boundary
+// or the prompt's end, whatever else the step carries. So a prompt's numerics
+// depend neither on concurrent load nor on what the prefix cache holds. While
+// other slots decode, a step runs one granule in total, so a long prompt never
+// holds the live streams for more than one.
 //
 // Prefix checkpoints are prefix-sized device copies of a slot cache
 // (qwen4exp snapshots, the same payload the single-slot path keeps),
@@ -55,8 +57,8 @@ private:
     bool restore_prefix(int slot, const std::vector<int32_t> & prompt, PrefixStoreRef checkpoint);
     PrefixStoreEvent capture_prefix(int slot, PrefixCaptureTicket ticket);
     int checkpoint_index(PrefixStoreRef checkpoint) const;
-    // Rows the slot's next prompt forward covers: up to the next granule
-    // boundary, a pending capture boundary, the prompt's end and `max_tokens`.
+    // Rows the slot's next prompt forward covers: up to one granule, the next
+    // restore point, a pending capture boundary, the prompt's end and `max_tokens`.
     int prefill_segment(int slot, int max_tokens) const;
 
     ggml_backend_t backend_;
@@ -68,6 +70,7 @@ private:
     int prefill_granule_;
     size_t prefix_allowance_;
     std::vector<Qwen4ExpSnapshot> checkpoints_;
+    std::vector<std::vector<int>> prefill_cuts_;   // per slot: restore points, ascending
 };
 
 } // namespace luce::common

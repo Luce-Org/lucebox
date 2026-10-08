@@ -2781,6 +2781,8 @@ namespace {
 // Disk-cache staging lives above both PrefixCache pools.
 constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
 
+}  // namespace
+
 // Every position a later request may restore `prompt`'s prefix from: its chat
 // boundaries plus the extra cuts a cache may take (a PPP pin, a fixed disk
 // scope). See GenerateRequest::restore_points. `drop_last_boundary` leaves
@@ -2790,8 +2792,8 @@ constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
 std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
                                        const ChatMarkers & markers,
                                        std::initializer_list<int> cuts,
-                                       bool drop_last_boundary = false,
-                                       int spacing = 0) {
+                                       bool drop_last_boundary,
+                                       int spacing) {
     std::vector<int> points = find_all_boundaries(prompt, markers);
     if (drop_last_boundary && !points.empty()) points.pop_back();
     // A backend that cuts prefill at every restore point gets them spaced.
@@ -2803,6 +2805,8 @@ std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
     points.erase(std::unique(points.begin(), points.end()), points.end());
     return points;
 }
+
+namespace {
 
 struct CompletionTokenCounts {
     int total = 0;

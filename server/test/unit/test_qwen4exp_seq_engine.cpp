@@ -255,8 +255,7 @@ static bool run_qsa_boundary(Qwen4ExpSeqEngine & engine, ggml_backend_t backend,
             const int granule = engine.step_plan_limits(0).max_prefill_tokens_per_sequence;
             slots.push_back(row.slot);
             spans.push_back({caches[row.slot], prompts[row.slot].data() + pos,
-                std::min({row.max_tokens, (int) prompts[row.slot].size() - pos,
-                          (pos / granule + 1) * granule - pos}), pos});
+                std::min({row.max_tokens, (int) prompts[row.slot].size() - pos, granule}), pos});
         }
         std::vector<SavedIndexer> expected;
         std::vector<int32_t> expected_tokens;
@@ -410,6 +409,39 @@ static bool run_prefix_store(Qwen4ExpSeqEngine & engine, const Qwen4ExpWeights &
     return cross_slot && same && rejected;
 }
 
+// With the plan's restore points, a cold prompt's text is the same whether
+// the cache captures it, restores it, or does neither.
+static bool run_prefix_cuts(Qwen4ExpSeqEngine & engine, const Qwen4ExpWeights & w) {
+    constexpr int L = 3000, STEPS = 24;
+    const std::vector<int> cuts = {700, 2000};
+    for (int s = 0; s < engine.slot_count(); ++s) engine.retire(s);
+    std::vector<int32_t> prompt(L);
+    for (int i = 0; i < L; ++i) prompt[(size_t) i] = (int32_t) ((i * 104729 + 7) % w.n_vocab);
+    auto run = [&](uint64_t id, const PrefixStorePlan & plan, bool * restored = nullptr) {
+        const auto admitted = engine.admit_with_prefix(id, prompt, SamplerCfg{}, plan);
+        if (admitted.status != SeqEngine::AdmitResult::Status::admitted) return std::vector<int32_t>{};
+        if (restored) *restored = admitted.prefix_store.restored == plan.restore;
+        auto tokens = drive_slot(engine, admitted.slot, STEPS);
+        engine.retire(admitted.slot);
+        return tokens;
+    };
+    PrefixStorePlan none;
+    none.restore_points = cuts;
+    PrefixStorePlan capture = none;
+    capture.capture = {2, {2, 2000}};
+    PrefixStorePlan restore = none;
+    restore.restore = {2, 2000};
+    const auto cold = run(910, none);
+    const auto captured = run(911, capture);
+    bool restored = false;
+    const auto resumed = run(912, restore, &restored);
+    engine.discard_prefix_store({2, 2000});
+    const bool ok = cold.size() == STEPS + 1 && cold == captured && restored && cold == resumed;
+    std::fprintf(stderr, "[prefix-cuts] cold==captured=%d restored=%d cold==restored=%d\n",
+                 (int) (cold == captured), (int) restored, (int) (cold == resumed));
+    return ok;
+}
+
 static bool run_soak(Qwen4ExpSeqEngine & engine, int n, int round) {
     std::mt19937 rng((uint32_t)(0x51e9 + n * 101 + round));
     std::vector<int32_t> over_ctx((size_t)engine.max_context() + 1, 1);
@@ -493,7 +525,9 @@ int main(int argc, char ** argv) {
         Qwen4ExpSeqEngine engine(backend, weights, ptrs, ctx, 512, size_t(8) << 30);
         const bool prefix_ok = run_prefix_store(engine, weights);
         std::printf("[qwen4exp-seq] prefix-store=%s\n", prefix_ok ? "PASS" : "FAIL");
-        ok = ok && prefix_ok;
+        const bool cuts_ok = run_prefix_cuts(engine, weights);
+        std::printf("[qwen4exp-seq] prefix-cuts=%s\n", cuts_ok ? "PASS" : "FAIL");
+        ok = ok && prefix_ok && cuts_ok;
     }
     {
         Qwen4ExpSeqEngine engine(backend, weights, ptrs, ctx);

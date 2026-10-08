@@ -39,6 +39,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -393,6 +394,15 @@ struct PrefixCacheBudget {
 // per_checkpoint bytes, at least ServerConfig::kConcurrentPrefixBudgetFloor
 // and, above that, at most memory / 4 when memory is known (non-zero).
 size_t auto_concurrent_prefix_budget(size_t per_checkpoint, int slots, size_t memory);
+
+// Every position a later request may restore `prompt`'s prefix from (chat
+// boundaries, spaced by `spacing` as spaced_restore_points does, plus `cuts`),
+// ascending; see GenerateRequest::restore_points.
+std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
+                                       const ChatMarkers & markers,
+                                       std::initializer_list<int> cuts,
+                                       bool drop_last_boundary = false,
+                                       int spacing = 0);
 PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
                                               const ModelBackend & backend);
 
