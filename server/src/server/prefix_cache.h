@@ -91,6 +91,13 @@ int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
                                     bool include_last_message = false,
                                     int reachable_from = 0);
 
+// Restore points spaced at least `min_gap` tokens apart: the first boundary
+// (the system/tools head), then each boundary at least `min_gap` past the last
+// kept one. Prefix-stable: the points of a prompt are the points, up to its
+// end, of every prompt that extends it, so a checkpoint saved at one is a
+// restore point of every later turn. min_gap <= 0 keeps every boundary.
+std::vector<int> spaced_restore_points(const std::vector<int> & boundaries, int min_gap);
+
 // Return true when a PPP forced cut should override normal boundary
 // selection. Once the tools head is already restored, forcing the pin again
 // prevents the cache from deepening into the conversation.
@@ -207,7 +214,10 @@ public:
     // snapshot lands in a different slot and the restore point can slide
     // forward past the deepest slot. `include_last_message` and
     // `reachable_from` are forwarded to select_inline_snapshot_boundary; a
-    // forced cut below `reachable_from` is not forced.
+    // forced cut below `reachable_from` is not forced. With a
+    // `restore_point_spacing` (ModelBackend::restore_point_spacing), the cut
+    // moves down to the deepest spaced restore point, and nothing is reserved
+    // when that adds no prefix.
     InlineReservation reserve_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len = 0,
@@ -216,7 +226,8 @@ public:
         int restore_source_slot = -1,
         InlineSnapshotSize estimate_bytes = {},
         bool include_last_message = false,
-        int reachable_from = 0);
+        int reachable_from = 0,
+        int restore_point_spacing = 0);
 
     // Commit an already-materialized snapshot without a reservation. Used by
     // cache import/bootstrap paths and tests.

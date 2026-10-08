@@ -3862,6 +3862,33 @@ TEST_CASE(ServerUnitFixture, test_tool_result_prompt_prefix_survives_next_agent_
 // cannot reach are skipped: a short system/tools head is not pinned (it would
 // never be saved and the cache would never deepen), and the next reachable
 // boundary is taken instead.
+TEST_CASE(ServerUnitFixture, test_spaced_restore_points) {
+    const std::vector<int> b = {300, 900, 1500, 2600, 2700, 5000, 5100};
+    TEST_ASSERT((spaced_restore_points(b, 2048) == std::vector<int>{300, 2600, 5000}));
+    TEST_ASSERT(spaced_restore_points(b, 0) == b);
+    // Prefix-stable: a shorter prompt keeps the longer prompt's points up to its end.
+    TEST_ASSERT((spaced_restore_points({300, 900, 1500, 2600}, 2048) == std::vector<int>{300, 2600}));
+
+    // A capture moves down to a spaced point, and none is reserved when that adds no prefix.
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(4, tokenizer);
+    const std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102, 3};
+    const std::vector<int> boundaries = find_all_boundaries(prompt, cache.chat_markers());
+    TEST_ASSERT(boundaries.size() >= 2);
+    const int head = boundaries.front();
+    auto plain = cache.reserve_inline_snap(prompt, 0, false, 0, -1, {}, /*include_last_message=*/true);
+    TEST_ASSERT(plain.active() && plain.target_cut() > head);
+    plain.cancel();
+    // A spacing wider than the prompt keeps only the head.
+    auto moved = cache.reserve_inline_snap(prompt, 0, false, 0, -1, {}, true, 0, /*restore_point_spacing=*/64);
+    TEST_ASSERT(moved.active() && moved.target_cut() == head);
+    moved.cancel();
+    auto none = cache.reserve_inline_snap(prompt, head, false, 0, -1, {}, true, 0, 64);
+    TEST_ASSERT(!none.active());
+}
+
 TEST_CASE(ServerUnitFixture, test_inline_snapshot_skips_unreachable_cuts) {
     const std::vector<int> boundaries = {266, 700, 1300, 1800};
     TEST_ASSERT(select_inline_snapshot_boundary(

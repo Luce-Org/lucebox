@@ -2787,9 +2787,12 @@ constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
 std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
                                        const ChatMarkers & markers,
                                        std::initializer_list<int> cuts,
-                                       bool drop_last_boundary = false) {
+                                       bool drop_last_boundary = false,
+                                       int spacing = 0) {
     std::vector<int> points = find_all_boundaries(prompt, markers);
     if (drop_last_boundary && !points.empty()) points.pop_back();
+    // A backend that cuts prefill at every restore point gets them spaced.
+    points = spaced_restore_points(points, spacing);
     for (int cut : cuts) {
         if (cut > 0 && cut < (int) prompt.size()) points.push_back(cut);
     }
@@ -3926,7 +3929,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         scoped_request.snap_slot = kDiskStagingSlot;
         scoped_request.snap_pos = selected_boundary;
         scoped_request.restore_points = prefix_restore_points(
-            scoped_request.prompt, prefix_cache_.chat_markers(), {forced_cut});
+            scoped_request.prompt, prefix_cache_.chat_markers(), {forced_cut},
+            false, backend_.restore_point_spacing());
         DaemonIO scoped_io;
         scoped_io.stream_fd = -1;
         const auto scoped_result =
@@ -4011,7 +4015,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             cold_request.snap_slot = kDiskStagingSlot;
             cold_request.snap_pos = cold_boundary;
             cold_request.restore_points = prefix_restore_points(
-                cold_request.prompt, prefix_cache_.chat_markers(), {forced_cut});
+                cold_request.prompt, prefix_cache_.chat_markers(), {forced_cut},
+                false, backend_.restore_point_spacing());
             DaemonIO cold_io;
             cold_io.stream_fd = -1;
             const auto cold_result = backend_.generate(cold_request, cold_io);
@@ -4060,7 +4065,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             [this](int target_cut) {
                 return backend_.snapshot_bytes_estimate(target_cut);
             },
-            req.ends_with_tool_result, reachable_from);
+            req.ends_with_tool_result, reachable_from,
+            backend_.restore_point_spacing());
         cache.snap_slot = cache.snap_reservation.slot();
         cache.snap_cut = cache.snap_reservation.target_cut();
     };
@@ -4145,7 +4151,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
              cache.snap_prepared ? cache.snap_cut : 0},
             // qwen4exp requires the same cuts on hits and misses, even when
             // a tool-result hit skips capture and a miss captures the tools head.
-            /*drop_last_boundary=*/!(config_.arch == "qwen4exp" && req.ends_with_tool_result));
+            /*drop_last_boundary=*/!(config_.arch == "qwen4exp" && req.ends_with_tool_result),
+            backend_.restore_point_spacing());
     }
 
     status_.set_flags(

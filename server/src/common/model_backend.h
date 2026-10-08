@@ -253,6 +253,12 @@ struct ModelBackend {
     // exactly there.
     virtual int snapshot_granularity() const { return 1; }
 
+    // Minimum token distance between the prompt restore points a backend cuts
+    // prefill at (spaced_restore_points). 0: every chat boundary. A backend
+    // whose prompt numerics depend on where a forward ends cuts at every
+    // restore point, so short messages would mean short, slow forwards.
+    virtual int restore_point_spacing() const { return 0; }
+
     // System-memory bytes a snapshot of the first `tokens` positions would
     // take; positions beyond the cache capacity are clamped to it. Returns
     // 0 when the backend cannot estimate, which disables the prefix cache's
