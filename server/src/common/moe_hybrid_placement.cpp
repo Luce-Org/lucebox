@@ -695,10 +695,15 @@ bool MoeExpertOwnership::load_json(const std::string & path, int layers, int exp
             tmp.owner[i] = Secondary;
         } else if (name == "stream") {
             tmp.owner[i] = Stream;
+        } else if (name == "remote") {
+            // Another expert-parallel cluster rank evaluates this expert.
+            tmp.owner[i] = Stream;
+            if (tmp.remote.empty()) tmp.remote.assign(tmp.owner.size(), 0);
+            tmp.remote[i] = 1;
         } else {
             if (err) {
                 *err = "expert placement entry " + std::to_string(i) +
-                       " must be \"primary\", \"secondary\" or \"stream\"";
+                       " must be \"primary\", \"secondary\", \"stream\" or \"remote\"";
             }
             return false;
         }

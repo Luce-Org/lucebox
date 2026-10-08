@@ -53,6 +53,10 @@ struct MoeHybridConfig {
     // cold-stack experts, and the experts in neither stack are streamed from
     // the model file on demand.
     std::vector<std::vector<int32_t>> cold_expert_ids;
+    // Experts another process evaluates (an expert-parallel cluster rank's
+    // foreign shard, server/src/cluster): never resident here, never
+    // streamed; their routes arrive masked to id -1 and contribute zero.
+    std::vector<std::vector<int32_t>> foreign_expert_ids;
 
     // Cold owner None has no cold experts, so nothing to materialize whatever
     // materialize_cold_experts says.

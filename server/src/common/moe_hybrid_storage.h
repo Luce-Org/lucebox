@@ -106,9 +106,17 @@ struct MoeHybridLayerStorage {
     // the whole cold set when the cold stack is not materialized, otherwise
     // what an explicit cold-stack list leaves out.
     int n_streamed = 0;
+    // Experts another cluster rank evaluates (MoeHybridConfig::
+    // foreign_expert_ids): 1 per such expert. Their routes are masked to -1
+    // before the owners run, which the evaluators then skip.
+    std::vector<uint8_t> foreign_by_global;
+    bool foreign_routes = false;
     bool is_streamed(int global_expert) const {
         if (global_expert < 0 || (size_t) global_expert >= hot_local_by_global.size() ||
             hot_local_by_global[(size_t) global_expert] >= 0) {
+            return false;
+        }
+        if (!foreign_by_global.empty() && foreign_by_global[(size_t) global_expert]) {
             return false;
         }
         const bool cold_stack = down_cold || gate_up_cold;

@@ -337,7 +337,29 @@ static bool assign_cold_experts(const MoeHybridConfig & cfg, int il,
     }
     int owned = 0;
     for (uint8_t hot : is_hot) owned += hot ? 1 : 0;
-    dst.n_streamed = cfg.n_expert - owned - (int)dst.cold_expert_ids.size();
+    int foreign = 0;
+    if (!cfg.foreign_expert_ids.empty()) {
+        if (cfg.foreign_expert_ids.size() != (size_t)cfg.n_layer) {
+            if (err) *err = "foreign expert lists need one list per layer";
+            return false;
+        }
+        dst.foreign_by_global.assign((size_t)cfg.n_expert, 0);
+        dst.foreign_routes = true;
+        for (int32_t expert : cfg.foreign_expert_ids[(size_t)il]) {
+            if (expert < 0 || expert >= cfg.n_expert || is_hot[(size_t)expert] ||
+                dst.cold_local_by_global[(size_t)expert] >= 0 ||
+                dst.foreign_by_global[(size_t)expert]) {
+                if (err) {
+                    *err = "foreign expert " + std::to_string(expert) + " in layer " +
+                           std::to_string(il) + " is out of range, resident, or listed twice";
+                }
+                return false;
+            }
+            dst.foreign_by_global[(size_t)expert] = 1;
+            ++foreign;
+        }
+    }
+    dst.n_streamed = cfg.n_expert - owned - (int)dst.cold_expert_ids.size() - foreign;
     return true;
 }
 

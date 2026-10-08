@@ -169,6 +169,12 @@ struct MoeHybridGraphInputs {
     // neither tensor changes expert placement or routing semantics.
     ggml_tensor * main_output = nullptr;
     ggml_tensor * peer_output = nullptr;
+    // Input, set by the caller before building: return the owners' partials
+    // unjoined (main_output on the main backend, peer_raw on the secondary
+    // owner's backend, output = main_output) so the caller can combine them
+    // itself -- the cluster hybrid exchange adds them on the secondary owner.
+    bool external_join = false;
+    ggml_tensor * peer_raw = nullptr;
     // Backend-affinity hints consumed after the multi-backend scheduler is
     // created. Keeping every intermediate of a routed branch on its weight
     // backend avoids gate/up -> activation -> down ping-pong copies.
