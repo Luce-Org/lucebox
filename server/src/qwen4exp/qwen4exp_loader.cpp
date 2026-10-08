@@ -376,6 +376,33 @@ static void free_qwen4exp_gate_ba(Qwen4ExpWeights & w) {
     w.gate_ctx = nullptr;
 }
 
+// QSA scores weigh every indexer head by 1.0: one ones tensor serves every layer and row count up to 128, instead of
+// building the constant in each graph.
+static void build_qwen4exp_qsa_ones(Qwen4ExpWeights & w, ggml_backend_t backend) {
+    if (w.indexer_n_head <= 0) return;
+    const ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    w.qsa_ctx = ggml_init(ip);
+    w.qsa_ones = ggml_new_tensor_2d(w.qsa_ctx, GGML_TYPE_F32, w.indexer_n_head, 128);
+    w.qsa_buf = ggml_backend_alloc_ctx_tensors(w.qsa_ctx, backend);
+    if (!w.qsa_buf) {
+        ggml_free(w.qsa_ctx);
+        w.qsa_ctx = nullptr;
+        w.qsa_ones = nullptr;
+        return;
+    }
+    ggml_backend_buffer_set_usage(w.qsa_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    const std::vector<float> ones((size_t) ggml_nelements(w.qsa_ones), 1.0f);
+    ggml_backend_tensor_set(w.qsa_ones, ones.data(), 0, ggml_nbytes(w.qsa_ones));
+}
+
+static void free_qwen4exp_qsa_ones(Qwen4ExpWeights & w) {
+    if (w.qsa_buf) ggml_backend_buffer_free(w.qsa_buf);
+    if (w.qsa_ctx) ggml_free(w.qsa_ctx);
+    w.qsa_buf = nullptr;
+    w.qsa_ctx = nullptr;
+    w.qsa_ones = nullptr;
+}
+
 bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
                         Qwen4ExpWeights & out, const std::string & mtp_override, int mtp_vocab) {
     out.gfx1151 = ggml_backend_cuda_qwen4exp_supported(backend);
@@ -430,6 +457,7 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         out.mtp_vocab_buf = nullptr;
         out.mtp_vocab_ctx = nullptr;
         free_qwen4exp_gate_ba(out);
+        free_qwen4exp_qsa_ones(out);
         reset_qwen4exp_mtp_fields(out);
         for (ShardSource & shard : shards) {
             gguf_free(shard.gctx);
@@ -918,6 +946,7 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     }
 
     build_qwen4exp_gate_ba(out, backend);
+    build_qwen4exp_qsa_ones(out, backend);
 
     // The PLE lookup table is served lazily from whichever shard holds it
     // (ISTA-DASLab isolates it in a separate shard; bartowski-style splits keep
@@ -993,6 +1022,7 @@ void free_qwen4exp_weights(Qwen4ExpWeights & w) {
     w.hot_lut.clear();
     w.cold_lut.clear();
     free_qwen4exp_gate_ba(w);
+    free_qwen4exp_qsa_ones(w);
     for (ggml_context * extra : w.extra_meta_ctxs) {
         if (extra) ggml_free(extra);
     }

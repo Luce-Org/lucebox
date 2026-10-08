@@ -5663,8 +5663,8 @@ struct ggml_tensor * ggml_top_k_qsa(
         struct ggml_tensor * a,
         struct ggml_tensor * valid,
         int min_valid) {
-    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_nrows(a) == 1);
-    GGML_ASSERT(valid->type == GGML_TYPE_I32 && ggml_nelements(valid) == 1);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(valid->type == GGML_TYPE_I32 && ggml_nelements(valid) == a->ne[1]);
     GGML_ASSERT(min_valid > 512 && min_valid <= a->ne[0]);
     struct ggml_tensor * result = ggml_top_k(ctx, a, 512);
     result->src[1] = valid;
@@ -9685,6 +9685,20 @@ struct ggml_tensor * ggml_ds4_indexer_score(
         int                   ratio) {
     return ggml_ds4_indexer_score_masked(
         ctx, q, head_weights, index_comp, NULL, kv_start, ratio);
+}
+
+struct ggml_tensor * ggml_ds4_indexer_score_tokenwise(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * head_weights,
+        struct ggml_tensor  * index_comp,
+        struct ggml_tensor  * visibility_mask,
+        int                   ratio) {
+    GGML_ASSERT(visibility_mask);
+    struct ggml_tensor * result = ggml_ds4_indexer_score_masked(
+        ctx, q, head_weights, index_comp, visibility_mask, 0, ratio);
+    ggml_set_op_params_i32(result, 2, 1);
+    return result;
 }
 
 struct ggml_tensor * ggml_qsa_decode_ids(

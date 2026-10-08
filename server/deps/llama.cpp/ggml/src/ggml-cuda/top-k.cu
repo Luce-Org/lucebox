@@ -1570,6 +1570,40 @@ static void topk_tiled_block_radix_cuda(
 
 #endif  // GGML_CUDA_USE_HIPCUB
 
+// QSA's padded selection takes the block radix top-k -- one launch for all rows instead of a device-wide
+// sort per row -- by default on gfx1151 (as every k = 512 top-k there) and gfx1201. Both are stable
+// radix selections, so a row's 512 ids and their order do not change. GGML_DS4_TOPK_BLOCK_RADIX overrides.
+static bool topk_qsa_block_radix(int64_t ncols) {
+#ifdef GGML_CUDA_USE_HIPCUB
+    if (ncols <= 1024 || ncols > 32768) {
+        return false;
+    }
+    const char * env = getenv("GGML_DS4_TOPK_BLOCK_RADIX");
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool radix_default = cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 || cc == GGML_CUDA_CC_OFFSET_AMD + 0x1201;
+    return env ? env[0] != '\0' && strcmp(env, "0") != 0 : radix_default;
+#else
+    GGML_UNUSED(ncols);
+    return false;
+#endif
+}
+
+// Whether the padded QSA route sorts several rows in one call with each row's
+// one-row result: the block radix and tiled top-k work row by row, while the
+// device-wide argsort sorts rows as segments (on CUDA, an unstable sort).
+static bool topk_qsa_rows_in_one_call(int64_t ncols) {
+    if (ncols <= 1024 || topk_qsa_block_radix(ncols)) {
+        return true;   // no padded route (the runtime-count network runs per row), or the block radix top-k
+    }
+#ifdef GGML_CUDA_USE_HIPCUB
+    const char * env = getenv("GGML_DS4_TOPK_BLOCK_RADIX");
+    const bool radix_off = env && (env[0] == '\0' || strcmp(env, "0") == 0);
+    return !radix_off && ncols > 32768;   // the tiled top-k
+#else
+    return false;
+#endif
+}
+
 bool ggml_cuda_top_k_qsa_supported(const ggml_tensor * op) {
 #ifdef CUB_TOP_K_AVAILABLE
     // DeviceTopK requests nondeterministic, unsorted output. Padding has no
@@ -1578,7 +1612,8 @@ bool ggml_cuda_top_k_qsa_supported(const ggml_tensor * op) {
     return false;
 #else
     const bool shape = op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
-        ggml_nrows(op->src[0]) == 1 && op->ne[0] == 512 &&
+        op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+        ggml_nelements(op->src[1]) == op->src[0]->ne[1] && op->ne[0] == 512 &&
         op->src[0]->ne[0] > 512 && op->src[0]->ne[0] <= 65536;
 #if defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)
     return shape;
@@ -1596,28 +1631,66 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     if (dst->src[1]) {
         GGML_ASSERT(ggml_cuda_top_k_qsa_supported(dst));
+        const ggml_tensor * valid_t = dst->src[1];
+        const int64_t nrows = src0->ne[1];
+        // Row r's count: element r of valid, whatever its strides.
+        const auto valid_row = [&](int64_t r) {
+            const int64_t i0 = r % valid_t->ne[0], i1 = r / valid_t->ne[0];
+            return (const int *) ((const char *) valid_t->data + i0*valid_t->nb[0] + i1*valid_t->nb[1]);
+        };
+        if (nrows > 1 && !topk_qsa_rows_in_one_call(src0->ne[0])) {
+            for (int64_t r = 0; r < nrows; ++r) {
+                ggml_tensor src_r = *src0, valid_r = *valid_t, dst_r = *dst;
+                src_r.data = (char *) src0->data + r*src0->nb[1];
+                src_r.ne[1] = 1;
+                valid_r.data = (void *) valid_row(r);
+                valid_r.ne[0] = valid_r.ne[1] = valid_r.ne[2] = valid_r.ne[3] = 1;
+                dst_r.data = (char *) dst->data + r*dst->nb[1];
+                dst_r.ne[1] = 1;
+                dst_r.src[0] = &src_r;
+                dst_r.src[1] = &valid_r;
+                ggml_cuda_op_top_k(ctx, &dst_r);
+            }
+            return;
+        }
         // Above 1024, every existing single-row route is a stable radix sort
         // (including tile merges). On QSA's nonnegative/+0 keys its first 512
         // entries are invariant under appending -1e30. A tile's equal keys
         // retain source order, and merges visit tiles in source order too.
         // The <=1024 network is NOT padding-invariant: use its runtime count.
         if (src0->ne[0] > 1024) {
-            ggml_tensor padded = *dst;
-            padded.src[1] = nullptr;
-            ggml_cuda_op_top_k(ctx, &padded);
+#ifdef GGML_CUDA_USE_HIPCUB
+            if (topk_qsa_block_radix(src0->ne[0])) {
+                const int ncols = (int) src0->ne[0];
+                if (ncols <= 5120) {
+                    topk_block_radix_cuda(src0_d, dst_d, ncols, (int) nrows, 512, stream);
+                } else {
+                    topk_hierarchical_block_radix_cuda(ctx.pool(), src0_d, dst_d, ncols, (int) nrows, 512, stream);
+                }
+            } else
+#endif
+            {
+                ggml_tensor padded = *dst;
+                padded.src[1] = nullptr;
+                ggml_cuda_op_top_k(ctx, &padded);
+            }
         }
         if (ggml_get_op_params_i32(dst, 0) <= 1024) {
-            const int * valid = (const int *) dst->src[1]->data;
+            for (int64_t r = 0; r < nrows; ++r) {
+                const float * x = src0_d + r*src0->ne[0];
+                int * out = dst_d + r*dst->ne[0];
+                const int * valid = valid_row(r);
 #if defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)
-            argsort_qsa_bitonic_cuda(src0_d, dst_d, valid, stream);
+                argsort_qsa_bitonic_cuda(x, out, valid, stream);
 #else
-            const int warp = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-            if (warp == 64) {
-                k_topk_bitonic<512, 64><<<1, 1024, 16384, stream>>>(src0_d, dst_d, 1024, 1024, 512, valid);
-            } else {
-                k_topk_bitonic<512, 32><<<1, 1024, 16384, stream>>>(src0_d, dst_d, 1024, 1024, 512, valid);
-            }
+                const int warp = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+                if (warp == 64) {
+                    k_topk_bitonic<512, 64><<<1, 1024, 16384, stream>>>(x, out, 1024, 1024, 512, valid);
+                } else {
+                    k_topk_bitonic<512, 32><<<1, 1024, 16384, stream>>>(x, out, 1024, 1024, 512, valid);
+                }
 #endif
+            }
         }
         return;
     }

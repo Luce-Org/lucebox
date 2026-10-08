@@ -13,15 +13,16 @@
 #include <vector>
 
 static std::vector<float> run(ggml_backend_t be, int T, int n_comp, int kv_start, const std::vector<float> & qv,
-                              const std::vector<ggml_fp16_t> & kv, bool masked = false) {
+                              const std::vector<ggml_fp16_t> & kv, bool masked = false, bool tokenwise = false) {
     ggml_init_params ip{64 * 1024 * 1024, nullptr, true};
     ggml_context * c = ggml_init(ip);
     ggml_tensor * q = ggml_new_tensor_3d(c, GGML_TYPE_F32, 128, 4, T);
     ggml_tensor * w = ggml_new_tensor_2d(c, GGML_TYPE_F32, 4, T);
     ggml_tensor * k = ggml_new_tensor_2d(c, GGML_TYPE_F16, 128, n_comp);
     ggml_tensor * mask = masked ? ggml_new_tensor_2d(c, GGML_TYPE_F32, n_comp, T) : nullptr;
-    ggml_tensor * s = mask ? ggml_ds4_indexer_score_masked(c, q, w, k, mask, 0, 4)
-                          : ggml_ds4_indexer_score(c, q, w, k, kv_start, 4);
+    ggml_tensor * s = tokenwise ? ggml_ds4_indexer_score_tokenwise(c, q, w, k, mask, 4)
+                    : mask      ? ggml_ds4_indexer_score_masked(c, q, w, k, mask, 0, 4)
+                                : ggml_ds4_indexer_score(c, q, w, k, kv_start, 4);
     ggml_cgraph * gf = ggml_new_graph(c);
     ggml_build_forward_expand(gf, s);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(c, be);
@@ -88,6 +89,24 @@ int main() {
             std::printf("indexer-score masked capacity=%d valid=%d bits %s\n", capacity, n, pass ? "OK" : "FAIL");
             ok &= pass;
         }
+    }
+    // Tokenwise rows (stable verify scoring every row at once) against one-token masked calls on the
+    // SAME backend: score bits per row, at each multi-token width the plain op would specialize.
+    for (int T : {2, 3, 4, 5, 6, 8}) {
+        const int n = 4160, start = 4 * n - 4 * T - 9;
+        std::vector<float> qv((size_t) 128 * 4 * T);
+        std::vector<ggml_fp16_t> kv((size_t) 128 * n);
+        for (size_t i = 0; i < qv.size(); ++i) qv[i] = std::sin(0.37f * (float) i) * 0.5f;
+        for (size_t i = 0; i < kv.size(); ++i) kv[i] = ggml_fp32_to_fp16(std::cos(0.11f * (float) i) * 0.5f);
+        const auto rows = run(gpu, T, n, start, qv, kv, true, true);
+        bool pass = rows.size() == (size_t) n * T;
+        for (int t = 0; pass && t < T; ++t) {
+            const std::vector<float> qt(qv.begin() + (size_t) t * 512, qv.begin() + (size_t) (t + 1) * 512);
+            const auto one = run(gpu, 1, n, start + t, qt, kv, true);
+            pass = one.size() == (size_t) n && std::memcmp(one.data(), rows.data() + (size_t) t * n, n * sizeof(float)) == 0;
+        }
+        std::printf("indexer-score tokenwise T=%d vs one-token bits %s\n", T, pass ? "OK" : "FAIL");
+        ok &= pass;
     }
     ggml_backend_free(cpu);
     ggml_backend_free(gpu);

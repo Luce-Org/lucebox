@@ -607,6 +607,13 @@ static Qwen4ExpQsaRow qsa_row(ggml_context * c, const Qwen4ExpDecodeWorkspace & 
              (int) std::max<int64_t>(513, (ws.kv_bucket - 255 - T) / 4) };
 }
 
+// Every row's QSA inputs at once: [qsa_blocks, T] visibility and the T valid counts (stride: one group).
+static Qwen4ExpQsaRow qsa_rows_all(ggml_context * c, const Qwen4ExpDecodeWorkspace & ws, int64_t T) {
+    return { ggml_view_2d(c, ws.qsa_visibility, ws.qsa_blocks, T, ws.qsa_blocks * sizeof(float), 0),
+             ggml_view_2d(c, ws.qsa_params, 1, T, 10 * sizeof(int32_t), 0),
+             (int) std::max<int64_t>(513, (ws.kv_bucket - 255 - T) / 4) };
+}
+
 static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
         ggml_tensor * Q, ggml_tensor * Kf, ggml_tensor * Vf,
         const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, int64_t ratio,
@@ -640,11 +647,13 @@ static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
 
         ggml_tensor * comp16 = ggml_cast(c,
             ggml_reshape_2d(c, ggml_cont(c, pooled), idim, nb), GGML_TYPE_F16);
-        ggml_tensor * hw = ggml_reshape_2d(c,
-            ggml_scale_bias(c, ggml_scale(c, ggml_arange(c, 0.0f, (float) (nih * T), 1.0f), 0.0f), 0.0f, 1.0f),
-            nih, T);
+        // Every head weighs 1.0: the loaded ones constant, or the same values built in the graph.
+        ggml_tensor * hw = w.qsa_ones && w.qsa_ones->ne[0] == nih && T <= w.qsa_ones->ne[1]
+            ? ggml_view_2d(c, w.qsa_ones, nih, T, w.qsa_ones->nb[1], 0)
+            : ggml_reshape_2d(c, ggml_scale_bias(c, ggml_scale(c, ggml_arange(c, 0.0f, (float) (nih * T), 1.0f), 0.0f),
+                                                 0.0f, 1.0f), nih, T);
         ggml_tensor * summed = ws
-            ? ggml_ds4_indexer_score_masked(c, qi, hw, comp16, ws->visibility, 0, (int) r)
+            ? ggml_ds4_indexer_score_tokenwise(c, qi, hw, comp16, ws->visibility, (int) r)
             : ggml_ds4_indexer_score(c, qi, hw, comp16, (int) kv_start, (int) r);
         blocks = ws ? ggml_top_k_qsa(c, summed, ws->valid, ws->min_valid) : ggml_top_k(c, summed, (int) budget);
     }
@@ -822,7 +831,19 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
         ggml_tensor * pooled = n_after == 0 ? nullptr : qsa_ws
             ? qsa_pooled_keys_stable(c, L, w, indexer_k, indexer_raw, *qsa_ws, T)
             : qsa_pooled_keys(c, gf, L, w, indexer_k, indexer_raw, kraw, pos0, ratio, n_pooled, n_after);
-        for (int64_t t = 0; t < T; ++t) {
+        const bool at_once = qsa_ws && (*rows)[0].qsa != QSA_DENSE;
+        if (at_once) {
+            // Every row is QSA (rows only move away from the dense prefix): score, select and attend for all
+            // rows at once. Each row keeps its T=1 arithmetic -- the batch-invariant indexer projection,
+            // one-token scoring, the one-row top-k and the per-query attention kernel.
+            const int64_t nb = qsa_ws->qsa_blocks;
+            const Qwen4ExpQsaRow in = qsa_rows_all(c, *qsa_ws, T);
+            ggml_tensor * Kr = ggml_view_3d(c, k_cache, D, qsa_ws->kv_bucket, Hk, k_cache->nb[1], k_cache->nb[2], 0);
+            ggml_tensor * Vr = ggml_view_3d(c, v_cache, D, qsa_ws->kv_bucket, Hk, v_cache->nb[1], v_cache->nb[2], 0);
+            attn = build_qsa_attn(c, cur, Q, Kr, Vr, L, w, ratio, positions, pos0,
+                ggml_view_3d(c, pooled, pooled->ne[0], nb, 1, pooled->nb[1], pooled->nb[2], 0), nb, false, &in);
+        }
+        for (int64_t t = 0; !at_once && t < T; ++t) {
             const Qwen4ExpAttnRow & row = (*rows)[t];
             ggml_tensor * q = ggml_view_3d(c, Q, D, Hq, 1, Q->nb[1], Q->nb[2], (size_t) t * Q->nb[2]);
             const int64_t span = row.qsa == QSA_DENSE ? row.span : qsa_ws ? qsa_ws->kv_bucket : pos0 + t + 1;
@@ -1435,7 +1456,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         }
         for (size_t t = 0; t < ws.row_spans.size(); ++t) {
             if (ws.row_spans[t] == 0) {
-                set_input(ws.row_inputs[t], row_pos + 4 * t, 4 * sizeof(int32_t));
+                if (ws.row_inputs[t]) set_input(ws.row_inputs[t], row_pos + 4 * t, 4 * sizeof(int32_t));
                 continue;
             }
             std::fill_n(m, pos0 + t + 1, zero);
@@ -1765,10 +1786,16 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
             mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mask_len, T);
             ggml_set_input(mask);
         }
+        // A stable graph whose rows are all QSA attends them in one pass over the graph's positions.
+        const bool qsa_rows_at_once = stable_qsa && verify && row_spans.front() == 0;
         for (int64_t t = 0; verify && t < T; ++t) {
             Qwen4ExpAttnRow row;
             row.qsa = row_spans[t] > 0 ? QSA_DENSE : QSA_DECODE;
             row.span = row_spans[t];
+            if (row.span == 0 && qsa_rows_at_once) {
+                rows.push_back(row);
+                continue;
+            }
             ggml_tensor *& in = row.span > 0 ? row.mask : row.positions;
             in = row.span > 0 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, row.span, 1) : ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
             ggml_set_input(in);

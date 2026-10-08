@@ -159,6 +159,9 @@ struct Qwen4ExpWeights {
     std::vector<ggml_tensor *> cold_lut;   // per layer [1, n_expert] i32: the expert, -1 if hot
     ggml_context *             gate_ctx = nullptr;   // the layers' ssm_gate_ba
     ggml_backend_buffer_t      gate_buf = nullptr;
+    ggml_tensor *              qsa_ones = nullptr;   // [indexer_n_head, 128] f32 ones: QSA's uniform head weights
+    ggml_context *             qsa_ctx  = nullptr;
+    ggml_backend_buffer_t      qsa_buf  = nullptr;
     std::unique_ptr<Qwen4ExpRouteRecorder> route_recorder;
 
     CpuEmbedder           embedder;
