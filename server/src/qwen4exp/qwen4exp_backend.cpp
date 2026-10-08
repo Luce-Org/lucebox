@@ -179,11 +179,13 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
                          slots * decode + verify + draft + batched;
     std::fprintf(stderr, "[qwen4exp] chunk-runtime mtp=%d decode=%zu verify=%zu draft=%zu batched=%zu scratch=%zu host=%zu\n",
         (int) mtp, decode, verify, draft, batched, runtime_scratch, runtime_host);
-    // Split mode: the expert device's MoE id helper bounds a chunk. With hot experts the target keeps no slack for
-    // its matmul scratch pool, which grows over a long prompt and which the measurements below do not see, so the
-    // chunk stays at the floor (still two 4096-row pipeline streams).
-    // Concurrent serving prefills in fixed granules (see Qwen4ExpSeqEngine).
-    const int max_rows = slots > 1 ? kQwen4ExpConcurrentGranule
+    // The largest chunk. Concurrent serving prefills in fixed granules (see Qwen4ExpSeqEngine): on one GPU a
+    // 2048-row granule halves a live stream's stall behind a long prompt for about 3% of prompt throughput; with the
+    // experts on a second GPU it would cost 12%, so that placement keeps one pipeline stream's rows. Split mode: the
+    // expert device's MoE id helper bounds a chunk, and with hot experts the target keeps no slack for its matmul
+    // scratch pool, which grows over a long prompt and which the measurements below do not see, so the chunk stays
+    // at the floor (still two 4096-row pipeline streams).
+    const int max_rows = slots > 1 ? (w.expert_backend ? kQwen4ExpPipelineStreamRows : kQwen4ExpConcurrentGranule)
                        : !w.expert_backend ? kQwen4ExpMaxChunk
                        : w.hot ? kQwen4ExpSplitChunkFloor : kQwen4ExpSplitMaxChunk;
     struct Plan { size_t graph = 0, ring = 0, host = 0, scratch = 0; };
