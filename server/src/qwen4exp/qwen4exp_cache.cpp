@@ -1,4 +1,5 @@
 #include "qwen4exp_cache.h"
+#include "ggml-cuda.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -19,7 +20,7 @@ bool qwen4exp_uma_ring_supported(ggml_backend_t backend) {
 }  // namespace
 
 bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
-                           int max_ctx, Qwen4ExpCache & out) {
+                           int max_ctx, Qwen4ExpCache & out, bool mtp, int mtp_draft) {
     const Qwen4ExpCudaScope profile(w.gfx1151);
     // The QSA cell-id kernel is exact for positions below 2^24.
     if (max_ctx <= 0 || max_ctx >= (1 << 24)) {
@@ -27,6 +28,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
                      max_ctx, (1 << 24) - 1);
         return false;
     }
+    if (mtp_draft < 1 || mtp_draft > QWEN4EXP_MTP_MAX_DRAFT) return false;
     constexpr ggml_type kv_type = GGML_TYPE_F16;
 
     out.full_layer_ids.clear();
@@ -57,7 +59,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
     }
 
     ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() * (static_cast<size_t>(w.n_layer) * 5 + 16) + 4096;
+    ip.mem_size = ggml_tensor_overhead() * (static_cast<size_t>(w.n_layer) * (8 + 3 * QWEN4EXP_MTP_MAX_VERIFY) + 16) + 4096;
     ip.no_alloc = true;
     out.ctx = ggml_init(ip);
     if (!out.ctx) return false;
@@ -97,7 +99,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
         if (w.indexer_head_size > 0 && ratio > 0) {
             const int64_t max_blocks = (static_cast<int64_t>(max_ctx) + ratio - 1) / ratio;
             out.indexer_k[i] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
-                w.indexer_head_size, max_blocks);
+                w.indexer_head_size, max_blocks + 1);
             out.indexer_raw[i] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
                 w.indexer_head_size, max_ctx);
         }
@@ -107,6 +109,45 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
         out.ssm_state[i] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, S_v, S_v, H_v);
         out.conv_state[i] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, kernel - 1, conv_channels);
     }
+    out.spec_ssm.clear(); out.spec_conv.clear();
+    out.spec_ssm_rows.clear(); out.spec_conv_rows.clear();
+    out.spec_ple_rows = {};
+    out.mtp_draft = mtp_draft;
+    out.spec_ple = nullptr;
+    if (mtp && w.mtp_eh_proj) {   // the MTP draft layer's own K/V (dense attention, no indexer) and the verify rollback
+        out.mtp_k = ggml_new_tensor_3d(out.ctx, kv_type, w.n_embd_head_k, kv_capacity, w.n_head_kv);
+        out.mtp_v = ggml_new_tensor_3d(out.ctx, kv_type, w.n_embd_head_v, kv_capacity, w.n_head_kv);
+        out.mtp_prev_hidden = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd * w.n_hc, 1);
+        out.mtp_chain_hidden = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, hc_dim, 1);
+        out.mtp_chain_ids = ggml_new_tensor_1d(out.ctx, GGML_TYPE_I32, out.mtp_draft);
+        const int count = out.mtp_draft + 1;
+        for (size_t i = 0; i < n_linear; ++i) {
+            ggml_tensor * states = ggml_new_tensor_4d(out.ctx, GGML_TYPE_F32, S_v, S_v, H_v, count);
+            ggml_tensor * conv = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, kernel - 1, conv_channels, count);
+            out.spec_ssm.push_back(states);
+            out.spec_conv.push_back(conv);
+            Qwen4ExpCache::SpecRows sr{}, cr{};
+            for (int t = 0; t < count; ++t) {
+                sr[t] = ggml_view_3d(out.ctx, states, S_v, S_v, H_v, states->nb[1], states->nb[2], t * states->nb[3]);
+                cr[t] = ggml_view_2d(out.ctx, conv, kernel - 1, conv_channels, conv->nb[1], t * conv->nb[2]);
+            }
+            out.spec_ssm_rows.push_back(sr);
+            out.spec_conv_rows.push_back(cr);
+        }
+        if (!out.ple_conv_state.empty()) {
+            out.spec_ple = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, ple_hist, hc_dim, count);
+            for (int t = 0; t < count; ++t) {
+                out.spec_ple_rows[t] = ggml_view_2d(out.ctx, out.spec_ple, ple_hist, hc_dim,
+                    out.spec_ple->nb[1], t * out.spec_ple->nb[2]);
+            }
+        }
+        size_t rollback_bytes = out.spec_ple ? ggml_nbytes(out.spec_ple) : 0;
+        for (auto * t : out.spec_ssm) rollback_bytes += ggml_nbytes(t);
+        for (auto * t : out.spec_conv) rollback_bytes += ggml_nbytes(t);
+        std::fprintf(stderr, "[qwen4exp-mtp] k=%d rollback_bytes=%zu (%.3f MiB), draft_kv_bytes=%zu; allocated once\n",
+            out.mtp_draft, rollback_bytes, rollback_bytes / (1024.0 * 1024.0),
+            ggml_nbytes(out.mtp_k) + ggml_nbytes(out.mtp_v));
+    }
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
     if (!out.buf) {
@@ -115,7 +156,13 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
         return false;
     }
 
+    // Stable scoring converts the whole bucket, including its masked suffix.
+    for (ggml_tensor * t : out.indexer_k) {
+        if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+    }
+
     out.max_ctx = max_ctx;
+    out.cur_pos = 0;
     out.indexer_blocks = 0;
     out.input_ring.enabled = qwen4exp_uma_ring_supported(backend);
     if (out.input_ring.enabled) {
@@ -143,6 +190,10 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
 }
 
 void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace) {
+    if (workspace.ctx && workspace.backend) {
+        ggml_backend_cuda_graph_invalidate_range(workspace.backend,
+            ggml_get_mem_buffer(workspace.ctx), ggml_get_mem_size(workspace.ctx));
+    }
     if (workspace.alloc) ggml_gallocr_free(workspace.alloc);
     if (workspace.ctx) ggml_free(workspace.ctx);
     workspace = {};
@@ -150,6 +201,8 @@ void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace) {
 
 void free_qwen4exp_cache(Qwen4ExpCache & c) {
     clear_qwen4exp_decode_workspace(c.decode_workspace);
+    clear_qwen4exp_decode_workspace(c.verify_workspace);
+    clear_qwen4exp_decode_workspace(c.mtp_workspace);
     if (c.input_ring.buf) {
         ggml_backend_buffer_free(c.input_ring.buf);
         c.input_ring.buf = nullptr;
@@ -160,6 +213,17 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
     if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
     c.attn_k.clear();
     c.attn_v.clear();
+    c.mtp_k = c.mtp_v = nullptr;
+    c.mtp_prev_hidden = nullptr;
+    c.mtp_chain_hidden = c.mtp_chain_ids = nullptr;
+    c.mtp_prev_pos = -1;
+    c.spec_ssm.clear();
+    c.spec_ssm_rows.clear();
+    c.spec_conv_rows.clear();
+    c.spec_conv.clear();
+    c.spec_ple = nullptr;
+    c.spec_ple_rows = {};
+    for (auto & tail : c.spec_ple_prev) tail.clear();
     c.indexer_k.clear();
     c.indexer_raw.clear();
     c.ssm_state.clear();
@@ -169,11 +233,14 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
     c.full_layer_ids.clear();
     c.linear_layer_ids.clear();
     c.ple_prev.clear();
+    c.cur_pos = 0;
     c.max_ctx = 0;
 }
 
 void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c) {
-    (void) backend;
+    // A rejected final MTP verify leaves rollback copies queued on the backend
+    // stream; the memsets below run on another stream and must not race them.
+    ggml_backend_synchronize(backend);
     // A reset makes any stable T=1 graph's captured recurrent/KV state stale.
     // Batched graphs are rebuilt each call and use a separate shared arena.
     clear_qwen4exp_decode_workspace(c.decode_workspace);
@@ -186,7 +253,12 @@ void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c) {
     for (ggml_tensor * t : c.ple_conv_state) {
         if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
     }
+    c.cur_pos = 0;
+    c.spec_pos = -1;
+    c.mtp_prev_pos = -1;
+    c.spec_tokens = 0;
     c.indexer_blocks = 0;
+    c.kv_bucket_base = 0;
     c.ple_prev.clear();
 }
 

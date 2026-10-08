@@ -22,6 +22,7 @@
 #include "server/image_input.h"
 #include "qwen35/qwen35_backend.h"
 #include "qwen4exp/qwen4exp_graph.h"
+#include "common/cuda_graph_overrides.h"
 #include "engine/luce_engine.h"
 #include "server/chat_template.h"
 #include "common/concurrency/seq_engine.h"
@@ -5546,6 +5547,33 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_profile_is_scoped) {
     ggml_backend_free(cpu);
 }
 
+TEST_CASE(ServerUnitFixture, test_qwen4exp_mtp_profile_and_verify_restore) {
+    using namespace luce::common;
+    auto profile = ggml_backend_cuda_set_qwen4exp_profile;
+    auto invariant = ggml_backend_cuda_set_mmvq_batch_invariant;
+    const auto previous = profile(GGML_CUDA_QWEN4EXP_OFF);
+    const bool previous_invariant = invariant(false);
+    [&] {
+        Qwen4ExpCudaScope scope(true);
+        ScopedCudaGraphOverrides verify(false, 0, false, 0, true);
+        TEST_ASSERT(profile(GGML_CUDA_QWEN4EXP_DEFAULT) == GGML_CUDA_QWEN4EXP_DEFAULT);
+        TEST_ASSERT(invariant(true));
+    }();
+    TEST_ASSERT(profile(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_OFF);
+    TEST_ASSERT(!invariant(false));
+    // Invalid verify/rollback return before any GPU access, restoring the caller's profile.
+    Qwen4ExpWeights weights;
+    weights.gfx1151 = true;
+    Qwen4ExpCache cache;
+    std::vector<float> logits;
+    const int32_t tokens[] = {1, 2};
+    TEST_ASSERT(!qwen4exp_forward(nullptr, weights, cache, tokens, 2, 0, logits, nullptr, true).ok);
+    TEST_ASSERT(profile(GGML_CUDA_QWEN4EXP_OFF) == GGML_CUDA_QWEN4EXP_OFF);
+    TEST_ASSERT(!qwen4exp_verify_rollback(nullptr, weights, cache, 0, 1));
+    TEST_ASSERT(profile(previous) == GGML_CUDA_QWEN4EXP_OFF);
+    TEST_ASSERT(!invariant(previous_invariant));
+}
+
 TEST_CASE(ServerUnitFixture, test_qwen4exp_pool_blocks_averages_consecutive_tokens) {
     ggml_init_params ip{1 << 20, nullptr, false};
     ggml_context * c = ggml_init(ip);
@@ -5566,6 +5594,30 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_pool_blocks_averages_consecutive_toke
         for (int d = 0; d < idim; ++d) TEST_ASSERT(pd[b * idim + d] == 100.0f * d + (float) (r * b) + 1.5f);
     }
     ggml_free(c);
+}
+
+// The stable T=1 decode span is a function of kv_len alone that reproduces the spans token-by-token decode rebuilt
+// its graph with (((kv_len + 511) / 256) * 256 whenever kv_len outgrew the last one), so an MTP verify row attends
+// over exactly the span plain decode uses at that position.
+TEST_CASE(ServerUnitFixture, test_qwen4exp_stable_kv_span_matches_decode_rebuilds) {
+    for (const int64_t max_ctx : {4096, 32768, 40000}) {
+        for (const int64_t first : {1, 2, 100, 255, 256, 257, 511, 512, 513, 2000, 3999}) {
+            int64_t base = 0, rebuilt = 0;
+            bool same = true;
+            for (int64_t kv = first; kv <= max_ctx; ++kv) {
+                if (rebuilt == 0 || kv > rebuilt) rebuilt = std::min<int64_t>(max_ctx, ((kv + 511) / 256) * 256);
+                same = same && qwen4exp_stable_kv_span(base, max_ctx, kv) == rebuilt;
+            }
+            TEST_ASSERT_MSG(same, "max_ctx=" + std::to_string(max_ctx) + " first=" + std::to_string(first));
+        }
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen4exp_mtp_sidecar_pick) {
+    TEST_ASSERT(pick_qwen4exp_mtp_sidecar({"README.md", "mtp-b-Q8_0.gguf", "model.gguf", "mtp-a-Q8_0.gguf"}) ==
+                "mtp-a-Q8_0.gguf");
+    TEST_ASSERT(pick_qwen4exp_mtp_sidecar({"mtp-.gguf", "mtp-x.bin", "Qwen3.8-Flash-Next.gguf"}).empty());
+    TEST_ASSERT(pick_qwen4exp_mtp_sidecar({}).empty());
 }
 
 // The Qwen report adds up the live cache and each snapshot from the buffers

@@ -119,7 +119,8 @@ static void print_usage(const char * prog) {
         "                      Defaults to the first block; request model names\n"
         "                      do not change generation routing.\n"
         "  --draft <path>       Draft model for speculative decode (DFlash for Qwen,\n"
-        "                       Gemma and Laguna; DSpark for DeepSeek4)\n"
+        "                       Gemma and Laguna; DSpark for DeepSeek4; MTP for Qwen4Exp).\n"
+        "                       Qwen4Exp auto-discovers <model repo>/MTP/mtp-*.gguf.\n"
         "  --mmproj <path>      Vision projector GGUF: enables image input (Qwen3.5/3.8, DS4V)\n"
         "  --mmproj-device hip:N  Run the DS4V image encoder on another GPU (one-GPU layout)\n"
         "  --port <N>           Listen port (default: 8080)\n"
@@ -221,6 +222,8 @@ static void print_usage(const char * prog) {
         "                       (default: 6 with --specla; otherwise off)\n"
         "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
         "                       trimmed per step by drafter confidence; N = fixed base)\n"
+        "                       Qwen4Exp: 0=adaptive k=1..7 (default), 1=off,\n"
+        "                       2..8=fixed k=1..7; width includes the seed token.\n"
         "  --adaptive-experts [tau]  MoE expert-count gating on verify batches\n"
         "                       (near-lossless; default tau 0.80 when passed)\n"
         "  --no-cors            Disable CORS headers\n"
@@ -723,7 +726,13 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             if (model.adaptive_experts_tau.empty()) model.adaptive_experts_tau = tau;
             bargs.adaptive_experts_requested = true;
         } else if (std::strcmp(argv[i], "--verify-width") == 0 && i + 1 < argc) {
-            bargs.verify_width = std::atoi(argv[++i]);
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            const auto parsed = std::from_chars(value, end, bargs.verify_width);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || bargs.verify_width < 0) {
+                std::fprintf(stderr, "--verify-width expects a nonnegative integer, got '%s'\n", value);
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--no-fast-rollback") == 0) {
             fast_rollback_forced_off = true;
             bargs.fast_rollback = false;

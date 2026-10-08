@@ -7577,6 +7577,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
+            if (op->src[1]) return ggml_cuda_top_k_qsa_supported(op);
+            // fall through
         case GGML_OP_ARGSORT:
 #if defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)
             return true;

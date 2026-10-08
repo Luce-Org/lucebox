@@ -5658,6 +5658,20 @@ struct ggml_tensor * ggml_top_k(
     return result;
 }
 
+struct ggml_tensor * ggml_top_k_qsa(
+        struct ggml_context * ctx,
+        struct ggml_tensor * a,
+        struct ggml_tensor * valid,
+        int min_valid) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_nrows(a) == 1);
+    GGML_ASSERT(valid->type == GGML_TYPE_I32 && ggml_nelements(valid) == 1);
+    GGML_ASSERT(min_valid > 512 && min_valid <= a->ne[0]);
+    struct ggml_tensor * result = ggml_top_k(ctx, a, 512);
+    result->src[1] = valid;
+    ggml_set_op_params_i32(result, 0, min_valid);
+    return result;
+}
+
 // ggml_arange
 
 struct ggml_tensor * ggml_arange(

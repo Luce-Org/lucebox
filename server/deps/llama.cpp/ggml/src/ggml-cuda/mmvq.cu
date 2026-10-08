@@ -651,8 +651,8 @@ bool ggml_cuda_mmvq_mmid_grouped_enabled(
         mmid_grouped_arch_ok(cc) && mmid_grouped_device_ok();
 }
 
-// Host function: returns the max batch size for the current arch+type at runtime.
-int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+// Ordinary MMID admission, also used to select the invariant fallback below.
+static int get_mmvq_mmid_max_batch_regular(ggml_type type, int cc) {
     // [TAG_MMID_GROUPED] the grouped kernel handles any supported type up to the
     // MoE batch ceiling; this also keeps CUDA graphs on for these batches.
     // RDNA3/RDNA4 (wave32) share the non-grouped kernel's wave-width warp_reduce.
@@ -703,6 +703,21 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
         }
     }
     return MMVQ_MAX_BATCH_SIZE;
+}
+
+int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    const int limit = get_mmvq_mmid_max_batch_regular(type, cc);
+    // The RDNA3 Q4_K/Q5_K/Q6_K ceiling is four, even though dense invariant
+    // MMVQ admits eight. Verification must not fall through to MMQ (different
+    // activation quantization). Wider invariant MMID uses the tokenwise kernel,
+    // not the MoE kernel whose compiled launch_bounds still impose that ceiling.
+    return limit > 0 && ggml_cuda_mmvq_batch_invariant() ? std::max(limit, MMVQ_MAX_BATCH_SIZE) : limit;
+}
+
+static bool mmid_invariant_tokenwise(ggml_type type, int cc, int64_t ncols) {
+    if (!ggml_cuda_mmvq_batch_invariant() || ncols > MMVQ_MAX_BATCH_SIZE) return false;
+    const int limit = get_mmvq_mmid_max_batch_regular(type, cc);
+    return limit > 0 && ncols > limit;
 }
 
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
@@ -2926,7 +2941,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return e && e[0] == '1' && e[1] == '\0';
     }();
 
-    if (use_tokenwise_mmid && has_ids && ncols_dst > 1) {
+    if (has_ids && ncols_dst > 1 && (use_tokenwise_mmid || mmid_invariant_tokenwise(type, cc, ncols_dst))) {
         constexpr int c_ncols_dst = 1;
         const bool use_small_k = should_use_small_k(c_ncols_dst);
         const uint3 token_sample_ratio_fd = init_fastdiv_values(ncols_dst);
@@ -3726,7 +3741,7 @@ void ggml_cuda_mul_mat_vec_q(
                 return !(e && e[0] == '0' && e[1] == '\0');
             }();
             const char * variant =
-                tokenwise_mmid ? "tokenwise" :
+                (tokenwise_mmid || mmid_invariant_tokenwise(src0->type, cc, ncols_dst)) ? "tokenwise" :
                 (moe_kernel || ncols_dst > MMVQ_MAX_BATCH_SIZE) ? "moe" : "generic";
             const char * reason =
                 ncols_dst > MMVQ_MAX_MOE_BATCH_SIZE ? "width_gt_16" :

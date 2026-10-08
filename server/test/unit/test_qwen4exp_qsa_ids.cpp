@@ -123,6 +123,77 @@ static Result run(ggml_backend_t be, int T, int budget, int pos0, int r,
     return result;
 }
 
+// Replay one fixed graph through every logical width in buckets around every
+// selection-route boundary. Compare the ordered 512 IDs, not just score values.
+static bool check_runtime_topk(ggml_backend_t be) {
+    bool ok = true;
+    int cases = 0;
+    for (int capacity : {576, 640, 704, 768, 832, 896, 960, 1024, 1088,
+                         2048, 2112, 3072, 3136, 4096, 4160, 5120, 5184,
+                         8192, 8256, 12288, 12352, 16384, 16448, 24576, 24640,
+                         32768, 32832, 65536}) {
+        const int lo = std::max(513, capacity - 64);
+        ggml_context * c = ggml_init({2 * 1024 * 1024, nullptr, true});
+        ggml_tensor * scores = ggml_new_tensor_1d(c, GGML_TYPE_F32, capacity);
+        ggml_tensor * valid = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
+        ggml_set_input(scores);
+        ggml_set_input(valid);
+        ggml_tensor * selected = ggml_top_k_qsa(c, scores, valid, lo);
+        if (!ggml_backend_supports_op(be, selected)) { ggml_free(c); continue; }
+        ggml_cgraph * stable = ggml_new_graph(c);
+        ggml_build_forward_expand(stable, selected);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(c, be);
+        if (!buf) { ggml_free(c); return false; }
+        std::vector<float> data(capacity);
+        std::vector<int32_t> actual(512), expected(512);
+        // Descending counts also catch stale validity/captured input values.
+        for (int n = capacity; ok && n >= lo; --n) {
+            ggml_context * ec = ggml_init({1024 * 1024, nullptr, true});
+            ggml_tensor * exact = ggml_top_k(ec, ggml_view_1d(ec, scores, n, 0), 512);
+            ggml_cgraph * eg = ggml_new_graph(ec);
+            ggml_build_forward_expand(eg, exact);
+            ggml_backend_buffer_t eb = ggml_backend_alloc_ctx_tensors(ec, be);
+            if (!eb) { ggml_free(ec); ok = false; break; }
+            const int32_t count = n;
+            ggml_backend_tensor_set(valid, &count, 0, sizeof(count));
+            for (int pattern = 0; ok && pattern < 5; ++pattern) {
+                for (int i = 0; i < capacity; ++i) {
+                    data[i] = i >= n ? -1.0e30f : pattern == 0 ? 0.0f : pattern == 1 ? 1.0f :
+                        pattern == 2 ? float((i * 37) % 7) : pattern == 3 ? (i < 511 ? 2.0f : 1.0f) :
+                        float((i * 5171) % 65537);
+                }
+                ggml_backend_tensor_set(scores, data.data(), 0, ggml_nbytes(scores));
+                ok = ggml_backend_graph_compute(be, eg) == GGML_STATUS_SUCCESS &&
+                     ggml_backend_graph_compute(be, stable) == GGML_STATUS_SUCCESS;
+                if (ok) {
+                    ggml_backend_tensor_get(selected, actual.data(), 0, ggml_nbytes(selected));
+                    ggml_backend_tensor_get(exact, expected.data(), 0, ggml_nbytes(exact));
+                    ok = actual == expected;
+                }
+                if (!ok) std::fprintf(stderr, "runtime top-k mismatch capacity=%d valid=%d pattern=%d\n",
+                                      capacity, n, pattern);
+                ++cases;
+            }
+#ifndef QSA_IDS_CPU_ONLY
+            if (ggml_backend_is_cuda(be)) ggml_backend_cuda_graph_invalidate_range(
+                be, ggml_get_mem_buffer(ec), ggml_get_mem_size(ec));
+#endif
+            ggml_backend_buffer_free(eb);
+            ggml_free(ec);
+        }
+#ifndef QSA_IDS_CPU_ONLY
+        if (ggml_backend_is_cuda(be)) ggml_backend_cuda_graph_invalidate_range(
+            be, ggml_get_mem_buffer(c), ggml_get_mem_size(c));
+#endif
+        ggml_backend_buffer_free(buf);
+        ggml_free(c);
+        if (!ok) break;
+    }
+    std::printf("qsa runtime top-k: %d ordered tie/replay cases %s\n", cases,
+                !ok ? "FAIL" : cases ? "PASS" : "SKIP (backend lacks exact runtime top-k)");
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     const bool cpu_only = argc == 2 && std::strcmp(argv[1], "--cpu") == 0;
     ggml_backend_t gpu = nullptr;
@@ -133,7 +204,7 @@ int main(int argc, char ** argv) {
     ggml_backend_t cpu = ggml_backend_cpu_init();
     if (!cpu) return 1;
     ggml_backend_cpu_set_n_threads(cpu, 4);
-    bool ok = true;
+    bool ok = check_runtime_topk(gpu ? gpu : cpu);
     int cases = 0;
     // Every tail residue, the dense/QSA transition, and context/block boundaries.
     for (int T : {1, 2, 8, 129}) {

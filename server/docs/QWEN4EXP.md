@@ -36,9 +36,11 @@ evaluation. Device support is resolved once at load; forward scopes only exchang
 the calling thread's profile flag. It does not read qwen4exp environment variables or change the process
 environment; other models retain their own dispatch. Without `--chunk`, the
 prefill chunk is the largest 256-row multiple that fits the memory left after
-weights and caches (7424 rows for UD at 262K context); the banner and
-`/props` report it. Prompt attention accumulates in F32: on UD an 18K prompt
-prefilled in 2048- or 7424-row chunks gives logits bitwise equal to one pass.
+weights, caches and (with MTP) the draft and verify graphs, keeping 10% free:
+UD at 262K context gets 7424 rows without the sidecar and 4864 with MTP. The
+banner and `/props` report it. Prompt attention accumulates in F32: on UD an 18K
+prompt prefilled in 2048- or 7424-row chunks gives logits bitwise equal to one
+pass. Verify rows keep the T=1 attention path, so MTP output equals MTP off.
 
 Build:
 
@@ -98,7 +100,7 @@ all three quants.
 | gfx1151 kernels: MMB bf16 and Q8_0 -> F16 WMMA GEMMs, fused HC / GDN / PLE, M-RoPE into the flash-attention layout | done |
 | Chat template, reasoning effort, thinking budget, `preserve_thinking`, `sampling_no_thinking` | done |
 | Concurrent serving (`--max-concurrency > 1`) | refused; exact 4-slot serving is a follow-up PR |
-| MTP speculative decoding | follow-up PR |
+| MTP speculative decoding | sidecar discovered automatically; adaptive k=1..7 by default (code 16K / 64K 32.4 / 28.2 tok/s, counting 43.5), output identical to MTP off; `--verify-width 1` disables, `2..8` selects fixed k=1..7 |
 | Layer split | refused |
 | Other GPUs | generic paths; kernels, defaults and quality gates are tuned and measured on gfx1151 only |
 
@@ -131,3 +133,19 @@ server/build-hip/smoke_qwen4exp_forward MODEL.gguf 16000 --compare-chunk 4096
 `--compare-chunk N` prefills in N-row chunks against `--chunk` (default 2048)
 and reports the first greedy divergence and the teacher-forced KL over 128
 generated tokens.
+
+MTP uses the same scoped profile for drafting, verification, rollback and the
+K/V fill inside trunk prefill. `--draft PATH` selects a sidecar explicitly;
+without a sidecar the server decodes autoregressively. No MTP environment
+variables are required. The existing global adaptive-width override remains
+readable, but adaptive MTP is enabled by default without it.
+
+```bash
+server/build-hip/smoke_qwen4exp_forward MODEL.gguf 2200 --mtp 128 --mtp-all --chunk 2048
+```
+
+The smoke's `--mtp-draft 1..7` selects one fixed draft cap; `--mtp-all` checks
+all seven at S=16 and the requested sequence length. `--chunk N` controls MTP
+prefill chunks, `--tg N` controls ordinary decode length, and `--stable N`
+checks the final N replayed QSA decode steps against graphs built fresh at each
+step. `--draft PATH|0` selects or disables the smoke sidecar.

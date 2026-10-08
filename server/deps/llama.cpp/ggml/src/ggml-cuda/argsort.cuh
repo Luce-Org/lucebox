@@ -1,5 +1,7 @@
 #include "common.cuh"
 
+void argsort_qsa_bitonic_cuda(const float * x, int * dst, const int * valid, cudaStream_t stream);
+
 void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 #if defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)

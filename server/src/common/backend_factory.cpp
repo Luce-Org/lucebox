@@ -277,6 +277,8 @@ std::unique_ptr<ModelBackend> construct_backend(
     } else if (arch == "qwen4exp") {
         Qwen4ExpBackendConfig cfg;
         cfg.model_path = model.path;
+        cfg.draft_path = speculation.draft_path;
+        cfg.verify_width = speculation.verify_width;
         cfg.device = placement.target;
         cfg.chunk = execution.chunk;
 

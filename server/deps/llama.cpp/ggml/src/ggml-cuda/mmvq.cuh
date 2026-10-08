@@ -9,6 +9,8 @@
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
+// Batch-invariant mode also admits tokenwise MMID up to MMVQ_MAX_BATCH_SIZE.
+// A zero ceiling (unsupported type) is never raised.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
 bool ggml_cuda_mmvq_mmid_grouped_enabled(

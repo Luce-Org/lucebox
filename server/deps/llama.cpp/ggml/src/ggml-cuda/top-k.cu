@@ -251,9 +251,11 @@ static __global__ void k_topk_argmax(const float * x, int * dst, const int ncols
 template <int KPAD, int WARP>
 static __global__ void k_topk_bitonic(const float * x,
                                        int *         dst,
-                                       const int     ncols,
+                                       const int     capacity,
                                        const int     ncols_pad,
-                                       const int     k) {
+                                       const int     k,
+                                       const int *   valid = nullptr) {
+    const int ncols = valid ? *valid : capacity;
     const int col = threadIdx.x;
     const int row = blockIdx.x;
 
@@ -1568,11 +1570,57 @@ static void topk_tiled_block_radix_cuda(
 
 #endif  // GGML_CUDA_USE_HIPCUB
 
+bool ggml_cuda_top_k_qsa_supported(const ggml_tensor * op) {
+#ifdef CUB_TOP_K_AVAILABLE
+    // DeviceTopK requests nondeterministic, unsorted output. Padding has no
+    // exact-tie contract here; keep the caller's original per-step graph.
+    GGML_UNUSED(op);
+    return false;
+#else
+    const bool shape = op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+        ggml_nrows(op->src[0]) == 1 && op->ne[0] == 512 &&
+        op->src[0]->ne[0] > 512 && op->src[0]->ne[0] <= 65536;
+#if defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)
+    return shape;
+#else
+    return shape && op->src[0]->ne[0] <= 1024;
+#endif
+#endif
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
     int *               dst_d  = (int *) dst->data;
     cudaStream_t        stream = ctx.stream();
+
+    if (dst->src[1]) {
+        GGML_ASSERT(ggml_cuda_top_k_qsa_supported(dst));
+        // Above 1024, every existing single-row route is a stable radix sort
+        // (including tile merges). On QSA's nonnegative/+0 keys its first 512
+        // entries are invariant under appending -1e30. A tile's equal keys
+        // retain source order, and merges visit tiles in source order too.
+        // The <=1024 network is NOT padding-invariant: use its runtime count.
+        if (src0->ne[0] > 1024) {
+            ggml_tensor padded = *dst;
+            padded.src[1] = nullptr;
+            ggml_cuda_op_top_k(ctx, &padded);
+        }
+        if (ggml_get_op_params_i32(dst, 0) <= 1024) {
+            const int * valid = (const int *) dst->src[1]->data;
+#if defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)
+            argsort_qsa_bitonic_cuda(src0_d, dst_d, valid, stream);
+#else
+            const int warp = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+            if (warp == 64) {
+                k_topk_bitonic<512, 64><<<1, 1024, 16384, stream>>>(src0_d, dst_d, 1024, 1024, 512, valid);
+            } else {
+                k_topk_bitonic<512, 32><<<1, 1024, 16384, stream>>>(src0_d, dst_d, 1024, 1024, 512, valid);
+            }
+#endif
+        }
+        return;
+    }
 
     // are these asserts truly necessary?
     GGML_ASSERT(src0->type == GGML_TYPE_F32);

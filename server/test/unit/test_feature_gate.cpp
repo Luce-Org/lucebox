@@ -772,11 +772,29 @@ void test_model_capability_tables() {
     CHECK(!arch_supports_layer_split("qwen4exp"));
     CHECK(!arch_supports_remote_draft("qwen4exp"));
     CHECK(!arch_supports_pflash_compression("qwen4exp"));
-    CHECK(!arch_supports_decode_draft("qwen4exp", false));
+    CHECK(arch_supports_decode_draft("qwen4exp", false));
+    CHECK(arch_supports_verify_width("qwen4exp", false));
+    CHECK(!arch_supports_decode_draft("qwen4exp", true));
+    CHECK(!arch_supports_verify_width("qwen4exp", true));
     CHECK(!arch_supports_paged_attention("qwen4exp", false));
     CHECK(arch_supports_draft_block_size("qwen35", false));
     CHECK(!arch_supports_draft_block_size("qwen35", true));
     CHECK(!arch_supports_draft_block_size("qwen35moe", false));
+}
+
+void test_qwen4exp_mtp_options() {
+    auto args = gate_args_hip_deepseek4();
+    args.draft_path = "/nonexistent/mtp.gguf";
+    for (int width = 0; width <= 8; ++width) {
+        args.verify_width = width;
+        CHECK(gate_result(args, "qwen4exp", PlacementBackend::Hip).empty());
+        CHECK(!warns_about(warn_result(args, "qwen4exp"), "--draft"));
+        CHECK(!warns_about(warn_result(args, "qwen4exp"), "--verify-width"));
+    }
+    for (int width : {-1, 9, INT_MAX}) {
+        args.verify_width = width;
+        CHECK(!gate_result(args, "qwen4exp", PlacementBackend::Hip).empty());
+    }
 }
 
 };
@@ -807,4 +825,5 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_warnings_report_inert_decode_tunables();
     test_feature_warnings_report_inert_moe_options();
     test_model_capability_tables();
+    test_qwen4exp_mtp_options();
 }

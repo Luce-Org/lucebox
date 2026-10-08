@@ -165,7 +165,11 @@ static inline __device__ void ggml_cuda_swap(T & a, T & b) {
 #endif
 
 template<ggml_sort_order order>
-static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad) {
+static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int capacity, int ncols_pad,
+                                        const int * valid = nullptr, int top_k = 0) {
+    const int ncols = valid ? *valid : capacity;
+    if (valid && ncols > 1024) return; // uniform device branch, capture-safe
+
     // bitonic sort
     int col = threadIdx.x;
     int row = blockIdx.x;
@@ -267,8 +271,9 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
     }
 
     // copy the result to dst without the padding
-    if (col < ncols) {
-        dst[row * ncols + col] = dst_row[col];
+    const int out_cols = valid ? top_k : ncols;
+    if (col < out_cols) {
+        dst[row * out_cols + col] = dst_row[col];
     }
 }
 
@@ -306,6 +311,13 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
     } else {
         GGML_ABORT("fatal error");
     }
+}
+
+// QSA always has 513..1024 valid columns on this route: exactly the same
+// 1024-lane network and index-validity comparisons as the unpadded call.
+void argsort_qsa_bitonic_cuda(const float * x, int * dst, const int * valid, cudaStream_t stream) {
+    k_argsort_f32_i32<GGML_SORT_ORDER_DESC><<<1, 1024, 1024 * (sizeof(int) + sizeof(float)), stream>>>(
+        x, dst, 1024, 1024, valid, 512);
 }
 
 void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

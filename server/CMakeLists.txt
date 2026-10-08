@@ -1914,6 +1914,19 @@ if(LUCE_TESTS)
         target_include_directories(smoke_qwen3_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_qwen3_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
+    # Pure speculative-prefix/rollback checks: no model, backend or GPU link. The ggml include dir is
+    # needed for qwen4exp_internal.h's struct declarations (ggml_tensor*), not for linking ggml.
+    add_executable(test_qwen4exp_mtp test/unit/test_qwen4exp_mtp.cpp)
+    target_include_directories(test_qwen4exp_mtp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+    add_test(NAME qwen4exp_mtp COMMAND test_qwen4exp_mtp)
+
+    # Exercise synthetic gfx1151 MMID admission without initializing a GPU.
+    add_executable(test_qwen4exp_mtp_dispatch test/unit/test_qwen4exp_mtp_dispatch.cpp)
+    target_link_libraries(test_qwen4exp_mtp_dispatch PRIVATE ggml ${LUCE_GGML_BACKEND_TARGET})
+    add_test(NAME qwen4exp_mtp_dispatch COMMAND test_qwen4exp_mtp_dispatch)
     add_executable(test_qwen4exp_chunk test/unit/test_qwen4exp_chunk.cpp)
     target_include_directories(test_qwen4exp_chunk PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
     target_link_libraries(test_qwen4exp_chunk PRIVATE ggml)
