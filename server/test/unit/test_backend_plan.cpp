@@ -137,20 +137,19 @@ void test_qwen4exp_split_placement_lands_in_placement() {
     expert.backend = PlacementBackend::Hip;
     expert.gpu = 1;
     args.expert_device = expert;
-    args.hot_experts = "/models/routes.csv";
-    args.hot_experts_gib = 6.0;
+    args.expert_placement = "/models/routes.csv";
     BackendPreparation result = resolve(std::move(args), "qwen4exp");
     CHECK(std::holds_alternative<BackendPlan>(result));
     const BackendPlan & plan = std::get<BackendPlan>(result);
     CHECK(plan.placement().expert.has_value());
     CHECK(plan.placement().expert->gpu == 1);
-    CHECK(plan.placement().hot_experts == "/models/routes.csv");
-    CHECK(plan.placement().hot_experts_gib == 6.0);
+    // The same expert-placement field DeepSeek4 reads.
+    CHECK(plan.execution().expert_placement == "/models/routes.csv");
 
     BackendPreparation plain = resolve(plain_args(), "qwen4exp");
     CHECK(std::holds_alternative<BackendPlan>(plain));
     CHECK(!std::get<BackendPlan>(plain).placement().expert.has_value());
-    CHECK(std::get<BackendPlan>(plain).placement().hot_experts.empty());
+    CHECK(std::get<BackendPlan>(plain).execution().expert_placement.empty());
 }
 
 void test_specla_without_fast_rollback_falls_back() {

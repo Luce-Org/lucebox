@@ -69,8 +69,6 @@ struct BackendArgs {
     // most-routed of them also copied to the target. DeepSeek V4 reads
     // --expert-device through its own expert-parallel path instead.
     std::optional<DevicePlacement> expert_device;
-    std::string     hot_experts;            // routing-stats CSV; empty = no hot experts
-    double          hot_experts_gib = 8.0;  // target memory for the hot experts
 
     // I/O — only used when running under daemon_loop (legacy). The new
     // server passes -1 and uses on_token callbacks instead.
@@ -87,7 +85,7 @@ struct BackendArgs {
     bool            ds4_fused_decode = false;
     bool            ds4_fused_verify_f16_kv = false;
     // Expert ownership and routing files (see docs/DS41.md); empty = unused.
-    std::string     ds4_expert_placement;
+    std::string     expert_placement;       // --expert-placement (alias --ds4-expert-placement)
     std::string     ds4_router_bias;
     std::string     ds4_protected_experts;
 

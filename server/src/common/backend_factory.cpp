@@ -281,8 +281,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.verify_width = speculation.verify_width;
         cfg.device = placement.target;
         cfg.expert_device = placement.expert;
-        cfg.hot_experts = placement.hot_experts;
-        cfg.hot_experts_gib = placement.hot_experts_gib;
+        cfg.expert_placement_path = execution.expert_placement;
         cfg.chunk = execution.chunk;
         cfg.max_concurrency = execution.max_concurrency;
 

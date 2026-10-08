@@ -23,11 +23,11 @@
 
 namespace luce::common {
 
-// Split mode: copy the most-routed experts (the routing-stats CSV `path`, up to
-// `gib` of them) to the target, plus the per-layer lookup tables that send each
-// pick to one device.
+// Split mode: copy the most-routed experts of the routing-stats CSV, up to
+// `budget` bytes of them, to the target, plus the per-layer lookup tables that
+// send each pick to one device.
 static bool load_qwen4exp_hot_experts(ggml_backend_t backend, Qwen4ExpWeights & w, const std::string & csv,
-                                      double gib) {
+                                      uint64_t budget) {
     if (csv.empty() || !w.expert_backend) return true;
     const char * path = csv.c_str();
     std::string err;
@@ -46,7 +46,6 @@ static bool load_qwen4exp_hot_experts(ggml_backend_t backend, Qwen4ExpWeights & 
         descs[(size_t) il].ffn_down_exps = L.ffn_down_exps;
         expert_bytes[(size_t) il] = L.ffn_gate_exps->nb[2] + L.ffn_up_exps->nb[2] + L.ffn_down_exps->nb[2];
     }
-    const uint64_t budget = (uint64_t) (gib * (double) (1ull << 30));
     MoeHybridPlacement placement;
     if (!MoeHybridPlacement::build_from_stats_with_layer_bytes(stats, expert_bytes, budget, 0, placement, &err)) {
         std::fprintf(stderr, "[qwen4exp] hot experts: placement failed: %s\n", err.c_str());
@@ -237,8 +236,8 @@ bool Qwen4ExpBackend::init() {
                      cfg_.device.gpu);
         return false;
     }
-    if (!cfg_.hot_experts.empty() && !cfg_.expert_device) {
-        std::fprintf(stderr, "[qwen4exp] --hot-experts needs --expert-device\n");
+    if (!cfg_.expert_placement_path.empty() && !cfg_.expert_device) {
+        std::fprintf(stderr, "[qwen4exp] --expert-placement needs --expert-device\n");
         return false;
     }
     // Split mode: routed experts on a second GPU, everything else on the target.
@@ -271,7 +270,11 @@ bool Qwen4ExpBackend::init() {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
         return false;
     }
-    if (!load_qwen4exp_hot_experts(backend_, weights_, cfg_.hot_experts, cfg_.hot_experts_gib)) return false;
+    // The hot set takes LUCE_EXPERT_BUDGET_MB of the target, 8 GiB by default: the rest
+    // of the target holds the dense weights, KV and prompt-chunk buffers.
+    const uint64_t hot_budget = expert_budget_bytes_from_env();
+    if (!load_qwen4exp_hot_experts(backend_, weights_, cfg_.expert_placement_path,
+                                   hot_budget > 0 ? hot_budget : 8ull << 30)) return false;
     if (cfg_.chunk > 0) {
         chunk_ = cfg_.chunk;
     } else if (cfg_.max_concurrency > 1) {

@@ -31,8 +31,7 @@ struct Qwen4ExpBackendConfig {
     // Split mode: routed experts on this device; dense work, KV and the hot
     // experts stay on `device`.
     std::optional<DevicePlacement> expert_device;
-    std::string     hot_experts;            // routing-stats CSV of the experts copied to `device`
-    double          hot_experts_gib = 8.0;  // memory for them on `device`
+    std::string     expert_placement_path;  // routing-stats CSV: its most-routed experts run on `device`
     int             chunk     = 0;  // auto: measured allocation budget
     int             max_concurrency = 1;
 };

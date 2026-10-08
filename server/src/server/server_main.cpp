@@ -140,10 +140,6 @@ static void print_usage(const char * prog) {
         "  --expert-device <backend:gpu>  DeepSeek4, Qwen3.8-Flash-Next: keep dense work\n"
         "                                 and hot experts on the target and run the\n"
         "                                 remaining routed experts on this GPU in process\n"
-        "  --hot-experts <path>           Qwen3.8-Flash-Next with --expert-device: routing\n"
-        "                                 stats CSV; the most-routed experts are copied\n"
-        "                                 to the target for verify steps\n"
-        "  --hot-experts-gib <GiB>        Target memory for --hot-experts (default: 8)\n"
         "  --draft-ipc-bin <path>         Remote backend IPC daemon for mixed backends\n"
         "  --draft-ipc-work-dir <path>    Remote draft IPC scratch directory\n"
         "  --draft-ipc-ring-cap <N>       Remote draft feature ring capacity\n"
@@ -169,9 +165,13 @@ static void print_usage(const char * prog) {
         "  --ds4-expert-top-k <N>\n"
         "                       Keep and renormalize the highest-ranked N routed experts\n"
         "                       (0=model default; single-device DeepSeek4 only)\n"
-        "  --ds4-expert-placement <FILE>\n"
-        "                       Per-expert owner: primary GPU, secondary GPU or streamed\n"
-        "                       from the model file (JSON, see docs/DS41.md)\n"
+        "  --expert-placement <FILE>\n"
+        "                       Expert placement. DeepSeek4: per-expert owner, primary GPU,\n"
+        "                       secondary GPU or streamed from the model file (JSON, see\n"
+        "                       docs/DS41.md). Qwen3.8-Flash-Next with --expert-device:\n"
+        "                       routing-stats CSV; its most-routed experts, up to\n"
+        "                       LUCE_EXPERT_BUDGET_MB (default 8192), run on the target.\n"
+        "                       Alias: --ds4-expert-placement\n"
         "  --ds4-router-bias <FILE>\n"
         "                       Add f32 [n_layer][n_expert] to the routing selection bias\n"
         "  --ds4-protected-experts <FILE>\n"
@@ -425,7 +425,6 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             return 2;
         }
         if (load_balancing && (option == "--peer-access" || option == "--expert-device" ||
-            option == "--hot-experts" || option == "--hot-experts-gib" ||
             option == "--no-fast-rollback" || option == "--target-split-fast-rollback" ||
             option == "--adaptive-experts" || option == "--specla" ||
             option == "--specla-top-k" || option.rfind("--kvflash", 0) == 0 ||
@@ -511,14 +510,6 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             }
             model.expert_device = expert;
             bargs.expert_device = expert;
-        } else if (std::strcmp(argv[i], "--hot-experts") == 0 && i + 1 < argc) {
-            bargs.hot_experts = argv[++i];
-        } else if (std::strcmp(argv[i], "--hot-experts-gib") == 0 && i + 1 < argc) {
-            bargs.hot_experts_gib = std::atof(argv[++i]);
-            if (!(bargs.hot_experts_gib > 0.0)) {
-                std::fprintf(stderr, "[server] --hot-experts-gib needs a positive size in GiB\n");
-                return 2;
-            }
         } else if (std::strcmp(argv[i], "--profile") == 0) {
             // main() expands profiles before blocks are parsed.
             std::fprintf(stderr, "[server] --profile needs a profile name (%s)\n",
@@ -576,7 +567,8 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 std::fprintf(stderr, "[server] --ds4-expert-top-k must be non-negative\n");
                 return 2;
             }
-        } else if ((std::strcmp(argv[i], "--ds4-expert-placement") == 0 ||
+        } else if ((std::strcmp(argv[i], "--expert-placement") == 0 ||
+                    std::strcmp(argv[i], "--ds4-expert-placement") == 0 ||
                     std::strcmp(argv[i], "--ds4-router-bias") == 0 ||
                     std::strcmp(argv[i], "--ds4-protected-experts") == 0) && i + 1 < argc) {
             // Checked here so a wrong path fails before the model is mapped.
@@ -587,9 +579,9 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 std::fprintf(stderr, "[server] %s: no such file '%s'\n", flag, path);
                 return 2;
             }
-            std::string & dst = std::strcmp(flag, "--ds4-expert-placement") == 0 ? bargs.ds4_expert_placement
-                              : std::strcmp(flag, "--ds4-router-bias") == 0 ? bargs.ds4_router_bias
-                                                                            : bargs.ds4_protected_experts;
+            std::string & dst = std::strcmp(flag, "--ds4-router-bias") == 0 ? bargs.ds4_router_bias
+                              : std::strcmp(flag, "--ds4-protected-experts") == 0 ? bargs.ds4_protected_experts
+                                                                                  : bargs.expert_placement;
             dst = path;
         } else if (std::strcmp(argv[i], "--ds4-prefill") == 0 && i + 1 < argc) {
             const char * mode = argv[++i];
@@ -1480,11 +1472,6 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         }
     }
     if (model.expert_device && !apply_expert_device(*model.expert_device, backend_plan)) {
-        return 2;
-    }
-    if (!backend_plan.placement().hot_experts.empty() &&
-        (arch != "qwen4exp" || !model.expert_device)) {
-        std::fprintf(stderr, "[server] --hot-experts needs a Qwen3.8-Flash-Next model and --expert-device\n");
         return 2;
     }
     auto backend_owner = create_backend(backend_plan);

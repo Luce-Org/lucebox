@@ -99,7 +99,7 @@ UD-Q4_K_XL) on the expert device:
 ```bash
 ./server/build-hip/luce_server \
   Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  --profile qwen-next-r9700-strix --hot-experts routes.csv
+  --profile qwen-next-r9700-strix --expert-placement routes.csv
 ```
 
 The profile sets `--target-device hip:0` (the R9700, gfx1201),
@@ -107,9 +107,10 @@ The profile sets `--target-device hip:0` (the R9700, gfx1201),
 Both GPUs run one scheduler: prompt chunks pipeline over 2 to 4 streams so
 the Strix runs one stream's experts while the R9700 runs another's attention.
 
-`--hot-experts` takes a routing-stats CSV (picks per layer and expert) and
-copies the most-routed experts, up to `--hot-experts-gib` GiB (default 8), to
-the R9700. Decode and verify steps run those picks there while the Strix runs
+`--expert-placement` takes a routing-stats CSV (picks per layer and expert)
+and copies the most-routed experts, up to `LUCE_EXPERT_BUDGET_MB` (default
+8192), to the R9700: the same placement flag and budget the DeepSeek4 expert
+tiers use. Decode and verify steps run those picks there while the Strix runs
 the rest; prompt chunks keep every pick on the Strix. Without the flag every
 pick runs on the Strix.
 
@@ -135,7 +136,7 @@ of hot experts), against the Strix Halo alone:
 | Prefill, 55K prompt | 1,310 tok/s | 1,760 tok/s |
 | Same 16K prompt sent again (prefix cache) | | 2.7 s instead of 10.6 s |
 
-Without `--hot-experts` the split decodes a short reply at 69 tok/s and after
+Without `--expert-placement` the split decodes a short reply at 69 tok/s and after
 a 16K prompt at 44 tok/s. Greedy output is the same with adaptive MTP, a fixed
 `--verify-width` or MTP off (`--verify-width 1`): every generated token runs
 its hot experts on the R9700 with the same kernel.
@@ -157,7 +158,7 @@ allowance comes out of the R9700's memory after an 8192-row prompt chunk.
 | MTP speculative decoding | sidecar discovered automatically; adaptive k=1..7 by default (code 16K / 64K 32.4 / 28.2 tok/s, counting 43.5), output identical to MTP off; `--verify-width 1` disables, `2..8` selects fixed k=1..7 |
 | Prefix cache | done: snapshots at chat cut points, restored on hits; a 64K agent turn's first token in ~3.5 s instead of ~65 s (131K context). Prefill keeps a 4096-row chunk first (8192 in split mode) and snapshots get the remaining memory, so at 262K context with MTP long prefixes do not fit: use `--max-ctx 131072` or less for agent workloads |
 | Layer split | refused |
-| Split mode (`--expert-device`, `--hot-experts`) | routed experts on a second GPU, pipelined prompt chunks, hot experts on the target for decode and verify; measured on R9700 + Strix Halo |
+| Split mode (`--expert-device`, `--expert-placement`) | routed experts on a second GPU, pipelined prompt chunks, hot experts on the target for decode and verify; measured on R9700 + Strix Halo |
 | Other GPUs | generic paths; kernels, defaults and quality gates are tuned and measured on gfx1151, and on gfx1201 as the split-mode target |
 
 `--max-concurrency 1` keeps the single-sequence path. Values 2 through 4

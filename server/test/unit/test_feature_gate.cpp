@@ -354,6 +354,29 @@ void test_feature_gate_ds4_decode_options_require_monolithic_hip() {
         split_topk, "deepseek4", PlacementBackend::Hip).empty());
 }
 
+// One --expert-placement for every expert tier: a DeepSeek4 owner map on a
+// local DeepSeek4, a routing-stats CSV for Qwen3.8-Flash-Next split mode;
+// the DeepSeek4 routing files stay DeepSeek4-only.
+void test_feature_gate_expert_placement_by_architecture() {
+    BackendArgs ds4 = gate_args_hip_deepseek4();
+    ds4.expert_placement = "/nonexistent/placement.json";
+    CHECK(gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
+    CHECK(!gate_result(ds4, "qwen35", PlacementBackend::Hip).empty());
+
+    BackendArgs qwen = gate_args_hip_deepseek4();
+    qwen.expert_placement = "/nonexistent/routes.csv";
+    CHECK(!gate_result(qwen, "qwen4exp", PlacementBackend::Hip).empty());
+    DevicePlacement expert;
+    expert.backend = PlacementBackend::Hip;
+    expert.gpu = 1;
+    qwen.expert_device = expert;
+    CHECK(gate_result(qwen, "qwen4exp", PlacementBackend::Hip).empty());
+
+    BackendArgs bias = qwen;
+    bias.ds4_router_bias = "/nonexistent/bias.bin";
+    CHECK(!gate_result(bias, "qwen4exp", PlacementBackend::Hip).empty());
+}
+
 void test_feature_gate_remote_draft_requires_supported_arch() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
@@ -845,6 +868,7 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_gate_ds4_prefill_requires_deepseek4();
     test_feature_gate_approximate_ds4_prefill_requires_local_hip();
     test_feature_gate_ds4_decode_options_require_monolithic_hip();
+    test_feature_gate_expert_placement_by_architecture();
     test_feature_gate_remote_draft_requires_supported_arch();
     test_feature_gate_layer_split_requires_supported_arch();
     test_feature_gate_paged_attention_requires_monolithic_backend();

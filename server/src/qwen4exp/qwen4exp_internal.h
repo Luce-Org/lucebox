@@ -142,7 +142,7 @@ struct Qwen4ExpWeights {
     ggml_backend_buffer_t expert_buf     = nullptr;
     bool                  expert_gfx1151 = false;
     // Split mode: the most-routed experts copied to the target (`hot`, from
-    // --hot-experts). Verify steps run them there while the expert device
+    // --expert-placement). Verify steps run them there while the expert device
     // runs the rest of the picks.
     std::unique_ptr<MoeHybridStorage> hot;
     ggml_context *             lut_ctx = nullptr;

@@ -1021,11 +1021,9 @@ static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
     if (out.expert_budget > out.mem.total_expert_bytes) {
         out.expert_budget = out.mem.total_expert_bytes;
     }
-    if (const char * cap_env = std::getenv("LUCE_EXPERT_BUDGET_MB")) {
-        const uint64_t cap_bytes = (uint64_t) std::max(0, std::atoi(cap_env)) * 1024ULL * 1024ULL;
-        if (cap_bytes > 0 && cap_bytes < out.expert_budget) {
-            out.expert_budget = cap_bytes;
-        }
+    if (const uint64_t cap_bytes = expert_budget_bytes_from_env();
+        cap_bytes > 0 && cap_bytes < out.expert_budget) {
+        out.expert_budget = cap_bytes;
     }
     if (out.expert_budget == 0) {
         if (err) *err = "no VRAM budget available for DS4 experts";
@@ -2118,7 +2116,7 @@ bool DeepSeek4Backend::load_model() {
         (force_full || need_monolithic)) {
         // A fully resident model has no expert owners to place.
         if (!cfg_.expert_placement_path.empty()) {
-            std::fprintf(stderr, "[deepseek4] --ds4-expert-placement needs the hybrid expert tier, "
+            std::fprintf(stderr, "[deepseek4] --expert-placement needs the hybrid expert tier, "
                          "which this configuration loads fully resident; add --expert-device or "
                          "drop the placement\n");
             return false;

@@ -47,8 +47,6 @@ public:
         RemoteDraftConfig remote_draft;
         RemoteTargetShardConfig remote_target_shard;
         std::optional<DevicePlacement> expert;  // routed experts (qwen4exp split mode)
-        std::string hot_experts;                // routing-stats CSV of the experts copied to the target
-        double hot_experts_gib = 8.0;
     };
 
     struct Cache {

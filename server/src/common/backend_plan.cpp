@@ -140,8 +140,6 @@ BackendPreparation BackendPlanBuilder::resolve(
     plan.placement_.remote_target_shard =
         std::move(args.remote_target_shard);
     plan.placement_.expert = std::move(args.expert_device);
-    plan.placement_.hot_experts = std::move(args.hot_experts);
-    plan.placement_.hot_experts_gib = args.hot_experts_gib;
 
     plan.cache_.fa_window = args.fa_window;
     plan.cache_.paged_attention = args.paged_attention;
@@ -176,7 +174,7 @@ BackendPreparation BackendPlanBuilder::resolve(
     plan.execution_.fused_decode = args.ds4_fused_decode;
     plan.execution_.fused_verify_f16_kv =
         args.ds4_fused_verify_f16_kv;
-    plan.execution_.expert_placement = args.ds4_expert_placement;
+    plan.execution_.expert_placement = args.expert_placement;
     plan.execution_.router_bias = args.ds4_router_bias;
     plan.execution_.protected_experts = args.ds4_protected_experts;
 
