@@ -13,6 +13,9 @@
 namespace luce::common {
 
 namespace {
+// The MTP slot's pending pairs beside other requests run through the draft layer once this many accumulate.
+constexpr size_t kMtpPendingPairs = 64;
+
 uint32_t pool_blocks(int max_ctx, size_t slots) {
     if (max_ctx <= 0 || slots == 0 ||
         slots > std::numeric_limits<uint32_t>::max()) return 0;
@@ -517,7 +520,7 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
                 mtp_.live = false;   // no trunk row: this request decodes without drafts from here on
             } else {
                 pending.h.insert(pending.h.end(), hidden.begin(), hidden.end());
-                if (pending.tok.size() >= 64 &&
+                if (pending.tok.size() >= kMtpPendingPairs &&
                     !qwen4exp_mtp_catch_up(backend_, weights_, *caches_[(size_t)mtp_slot_], pending, 0))
                     return fail("qwen4exp MTP catch-up failed");
             }

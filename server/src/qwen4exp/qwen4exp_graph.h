@@ -38,6 +38,16 @@ ggml_tensor * qwen4exp_pool_blocks(ggml_context * c, ggml_tensor * keys, int64_t
 // (same attention numerics) as plain decode at that position.
 int64_t qwen4exp_stable_kv_span(int64_t & base, int64_t max_ctx, int64_t kv_len);
 
+// The longest context a stable QSA graph attends over: the runtime-count top-k's range.
+constexpr int64_t kQwen4ExpStableQsaMaxCtx = 262144;
+
+// A retained graph's K/V bucket for kv_len keys: whole 256-key blocks, at most max_ctx (and, for QSA rows,
+// kQwen4ExpStableQsaMaxCtx).
+int64_t qwen4exp_kv_bucket(int64_t max_ctx, int64_t kv_len, bool qsa);
+
+// The multi-slot decode graph's row ceiling: RDNA3 MMID supports at most four batch-invariant decode rows.
+constexpr int kQwen4ExpMaxBatchedSlots = 4;
+
 struct Qwen4ExpForwardResult {
     bool ok = false;
 };
@@ -72,7 +82,7 @@ struct Qwen4ExpForwardSegment {
     int pos0 = 0;
 };
 
-// Pure decision for validated spans: at most four one-token rows, each dense in the solo
+// Pure decision for validated spans: at most kQwen4ExpMaxBatchedSlots one-token rows, each dense in the solo
 // path, or (with qsa_rows: the backend serves stable QSA rows) a QSA decode.
 // use_qsa is the cached QSA capability.
 bool qwen4exp_can_batch(const Qwen4ExpWeights & w,
