@@ -516,11 +516,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         if (prefix_supported) {
             // The same cuts on hits and misses, whatever the cache holds (as the
             // single-sequence path passes GenerateRequest::restore_points).
-            prefix_plan.restore_points = prefix_restore_points(
-                req.prompt_tokens, prefix_cache_.chat_markers(),
-                {prefix_plan.restore.tokens, prefix_plan.capture.checkpoint.tokens},
-                /*drop_last_boundary=*/!(config_.arch == "qwen4exp" && req.ends_with_tool_result),
-                backend_.restore_point_spacing());
+            prefix_plan.restore_points = request_restore_points(
+                req.prompt_tokens, req.ends_with_tool_result,
+                {prefix_plan.restore.tokens, prefix_plan.capture.checkpoint.tokens});
         }
         if (prefix_plan.capture.valid()) {
             prepared_capture = PrefixCaptureTxn(

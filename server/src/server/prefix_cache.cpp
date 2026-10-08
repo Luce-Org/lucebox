@@ -316,6 +316,22 @@ std::vector<int> spaced_restore_points(const std::vector<int> & boundaries, int 
     return kept;
 }
 
+std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
+                                       const ChatMarkers & markers,
+                                       std::initializer_list<int> cuts,
+                                       bool drop_last_boundary,
+                                       int spacing) {
+    std::vector<int> points = find_all_boundaries(prompt, markers);
+    if (drop_last_boundary && !points.empty()) points.pop_back();
+    points = spaced_restore_points(points, spacing);
+    for (int cut : cuts) {
+        if (cut > 0 && cut < (int) prompt.size()) points.push_back(cut);
+    }
+    std::sort(points.begin(), points.end());
+    points.erase(std::unique(points.begin(), points.end()), points.end());
+    return points;
+}
+
 bool should_force_inline_snapshot_boundary(
         const std::vector<int> & boundaries,
         int prompt_len,

@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <string>
 #include <vector>
@@ -97,6 +98,19 @@ int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
 // end, of every prompt that extends it, so a checkpoint saved at one is a
 // restore point of every later turn. min_gap <= 0 keeps every boundary.
 std::vector<int> spaced_restore_points(const std::vector<int> & boundaries, int min_gap);
+
+// Every position a later request may restore `prompt`'s prefix from: its chat
+// boundaries, spaced by `spacing` (spaced_restore_points), plus the extra cuts
+// a cache may take (a PPP pin, a fixed disk scope), ascending. See
+// GenerateRequest::restore_points. `drop_last_boundary` leaves out the
+// generation prompt's own boundary: a request that does not snapshot there
+// saves no state past it, so that split would only cost a short extra prefill
+// step (a snapshot there comes back through `cuts`).
+std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
+                                       const ChatMarkers & markers,
+                                       std::initializer_list<int> cuts,
+                                       bool drop_last_boundary = false,
+                                       int spacing = 0);
 
 // Return true when a PPP forced cut should override normal boundary
 // selection. Once the tools head is already restored, forcing the pin again

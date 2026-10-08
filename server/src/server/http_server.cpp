@@ -2781,32 +2781,6 @@ namespace {
 // Disk-cache staging lives above both PrefixCache pools.
 constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
 
-}  // namespace
-
-// Every position a later request may restore `prompt`'s prefix from: its chat
-// boundaries plus the extra cuts a cache may take (a PPP pin, a fixed disk
-// scope). See GenerateRequest::restore_points. `drop_last_boundary` leaves
-// out the generation prompt's own boundary: a request that does not snapshot
-// there saves no state past it, so that split would only cost a short extra
-// prefill step (a snapshot there comes back through `cuts`).
-std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
-                                       const ChatMarkers & markers,
-                                       std::initializer_list<int> cuts,
-                                       bool drop_last_boundary,
-                                       int spacing) {
-    std::vector<int> points = find_all_boundaries(prompt, markers);
-    if (drop_last_boundary && !points.empty()) points.pop_back();
-    // A backend that cuts prefill at every restore point gets them spaced.
-    points = spaced_restore_points(points, spacing);
-    for (int cut : cuts) {
-        if (cut > 0 && cut < (int) prompt.size()) points.push_back(cut);
-    }
-    std::sort(points.begin(), points.end());
-    points.erase(std::unique(points.begin(), points.end()), points.end());
-    return points;
-}
-
-namespace {
 
 struct CompletionTokenCounts {
     int total = 0;
@@ -3713,6 +3687,14 @@ bool HttpServer::forward_upstream(
 #endif
 }
 
+std::vector<int> HttpServer::request_restore_points(const std::vector<int32_t> & prompt,
+                                                    bool ends_with_tool_result,
+                                                    std::initializer_list<int> cuts) const {
+    return prefix_restore_points(prompt, prefix_cache_.chat_markers(), cuts,
+        /*drop_last_boundary=*/!(backend_.prefill_cuts_at_restore_points() && ends_with_tool_result),
+        backend_.restore_point_spacing());
+}
+
 // Cache lookup and snapshot preparation form one lifecycle; confirmation is
 // deferred until generation proves that the snapshot contains useful output.
 HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
@@ -4152,14 +4134,10 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         cache.full_snap_slot, cache.full_snap_pos);
 
     if (!prefix_cache_.disabled() || !disk_cache_.disabled()) {
-        generate_request.restore_points = prefix_restore_points(
-            effective_prompt, prefix_cache_.chat_markers(),
+        generate_request.restore_points = request_restore_points(
+            effective_prompt, req.ends_with_tool_result,
             {forced_cut, selected_boundary,
-             cache.snap_prepared ? cache.snap_cut : 0},
-            // qwen4exp requires the same cuts on hits and misses, even when
-            // a tool-result hit skips capture and a miss captures the tools head.
-            /*drop_last_boundary=*/!(config_.arch == "qwen4exp" && req.ends_with_tool_result),
-            backend_.restore_point_spacing());
+             cache.snap_prepared ? cache.snap_cut : 0});
     }
 
     status_.set_flags(
