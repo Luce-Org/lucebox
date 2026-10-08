@@ -6,7 +6,18 @@
 #include "qsa-decode.cuh"
 
 typedef short v16s __attribute__((ext_vector_type(16)));
+typedef short v8s  __attribute__((ext_vector_type(8)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
+
+// WMMA operand fragments. gfx11: a lane holds all 16 K values of its A/B row (lanes 16-31 mirror 0-15) and C rows
+// 2*e + hi. gfx12: a lane holds K values 8*hi .. 8*hi+7 and C rows 8*hi + e, so C is already in the B layout.
+#if defined(RDNA4)
+typedef v8s qsa3_frag;
+#define qsa3_wmma __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12
+#else
+typedef v16s qsa3_frag;
+#define qsa3_wmma __builtin_amdgcn_wmma_f32_16x16x16_f16_w32
+#endif
 
 #define QSA3_L2E 1.4426950408889634f
 #define QSA3_G 4
@@ -172,7 +183,7 @@ struct qsa3_layout {
     float scale;
 };
 
-#if defined(__gfx1151__) || !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__gfx1151__) || defined(RDNA4) || !defined(__HIP_DEVICE_COMPILE__)
 __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         const float * __restrict__ q, const uint16_t * __restrict__ pk, const uint16_t * __restrict__ pv,
         const uint16_t * __restrict__ mask, const uint16_t * __restrict__ ublk, const uint16_t * __restrict__ umask,
@@ -191,7 +202,7 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
     const uint16_t * gmsk = umask + (size_t) g * s.cap;
     const int nchunks = ucount[g] >> 2;
 
-    v16s qf[3][2];
+    qsa3_frag qf[3][2];
     {
         uint16_t * stage = reinterpret_cast<uint16_t *>(&part[0][0][0]) + w * (48 * 32);   // 3 KB per wave, row stride 64 B
         const _Float16 hs = (_Float16) s.scale;
@@ -213,8 +224,12 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         for (int i = 0; i < 3; ++i)
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
+#if defined(RDNA4)
+                qf[i][t] = __builtin_bit_cast(qsa3_frag, *reinterpret_cast<const uint4 *>(stage + (16*i + r) * 32 + 16*t + 8*hi));
+#else
                 const uint16_t * src = stage + (16*i + r) * 32 + 16*t;
                 qf[i][t] = __builtin_bit_cast(v16s, (uint4[2]){*reinterpret_cast<const uint4 *>(src), *reinterpret_cast<const uint4 *>(src + 8)});
+#endif
             }
         __syncthreads();
     }
@@ -240,19 +255,23 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         const uint32_t v = (j < 2 ? b01 : b23) >> (16 * (j & 1)) & 0xFFFFu;
         return v == 0xFFFFu ? 0 : (int) v;
     };
-    auto load_k = [&](const uint32_t b01, const uint32_t b23, v16s * kf) {
+    auto load_k = [&](const uint32_t b01, const uint32_t b23, qsa3_frag * kf) {
         const int kb = blk_of(b01, b23, r >> 2);
         const uint16_t * krow = pkg + (size_t) kb * 1024 + (r & 3) * 16 + w * 128;
 #pragma unroll
         for (int t = 0; t < 2; ++t) {
+#if defined(RDNA4)
+            kf[t] = __builtin_bit_cast(qsa3_frag, *reinterpret_cast<const uint4 *>(krow + t*64 + 8*hi));
+#else
             const uint4 lo  = *reinterpret_cast<const uint4 *>(krow + t*64);
             const uint4 hi4 = *reinterpret_cast<const uint4 *>(krow + t*64 + 8);
             kf[t] = __builtin_bit_cast(v16s, (uint4[2]){lo, hi4});
+#endif
         }
     };
 
     uint32_t b01 = 0, b23 = 0, m01 = 0, m23 = 0;
-    v16s kf[2];
+    qsa3_frag kf[2];
     if (nchunks > 0) { load_desc(0, b01, b23, m01, m23); load_k(b01, b23, kf); }
 
     for (int c = 0; c < nchunks; ++c) {
@@ -262,10 +281,20 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
 #pragma unroll
             for (int e = 0; e < 8; ++e) { sc[i][e] = 0.f; }
 #pragma unroll
-            for (int t = 0; t < 2; ++t) { sc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf[t], qf[i][t], sc[i]); }
+            for (int t = 0; t < 2; ++t) { sc[i] = qsa3_wmma(kf[t], qf[i][t], sc[i]); }
         }
-        v16s vf[2];
+        qsa3_frag vf[2];
         {
+#if defined(RDNA4)
+            const int kb0 = blk_of(b01, b23, 2*hi), kb1 = blk_of(b01, b23, 2*hi + 1);
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                const int d = 32*w + 16*t + r;
+                const uint2 v0 = *reinterpret_cast<const uint2 *>(pvg + (size_t) kb0 * 1024 + d * 4);
+                const uint2 v1 = *reinterpret_cast<const uint2 *>(pvg + (size_t) kb1 * 1024 + d * 4);
+                vf[t] = __builtin_bit_cast(qsa3_frag, (uint2[2]){v0, v1});
+            }
+#else
             const int kb0 = blk_of(b01, b23, 0), kb1 = blk_of(b01, b23, 1), kb2 = blk_of(b01, b23, 2), kb3 = blk_of(b01, b23, 3);
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
@@ -276,10 +305,11 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
                 const uint2 v3 = *reinterpret_cast<const uint2 *>(pvg + (size_t) kb3 * 1024 + d * 4);
                 vf[t] = __builtin_bit_cast(v16s, (uint2[4]){v0, v1, v2, v3});
             }
+#endif
         }
         // --- prefetch next chunk's descriptor and K fragments ---
         uint32_t nb01 = 0, nb23 = 0, nm01 = 0, nm23 = 0;
-        v16s kfn[2];
+        qsa3_frag kfn[2];
         if (c + 1 < nchunks) { load_desc(c + 1, nb01, nb23, nm01, nm23); load_k(nb01, nb23, kfn); }
         else { kfn[0] = kf[0]; kfn[1] = kf[1]; }
 #pragma unroll
@@ -306,7 +336,11 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
             }
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
+#if defined(RDNA4)
+                const int j = 2*hi + (e >> 2), cc = e & 3;
+#else
                 const int j = e >> 1, cc = 2*(e & 1) + hi;
+#endif
                 const uint32_t mk = ((j < 2 ? m01 : m23) >> (16 * (j & 1))) & 0xFFFFu;
                 const bool kv = (mk >> (own_qi * 4 + cc)) & 1u;
                 if (maskq && kv) { scf[e] += qsa3_h2f(maskq[4 * blk_of(b01, b23, j) + cc]); }
@@ -324,6 +358,14 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
             ls += __shfl_xor(ls, 16);
             l = l * alpha + ls;
             m = mnew;
+#if defined(RDNA4)
+            // this lane's keys 8*hi .. 8*hi+7 of row r are its PV B fragment as is
+            uint32_t pp[4];
+#pragma unroll
+            for (int e2 = 0; e2 < 4; ++e2) { pp[e2] = (uint32_t) qsa3_f2h(p[2*e2]) | ((uint32_t) qsa3_f2h(p[2*e2+1]) << 16); }
+            ptile[w][r*2+hi] = make_uint4(pp[0], pp[1], pp[2], pp[3]);
+            if (hi == 0) { alpha_s[own_row] = alpha; }
+#else
             uint32_t pp[4], po[4];
 #pragma unroll
             for (int e2 = 0; e2 < 4; ++e2) {
@@ -345,6 +387,7 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
                                              (uint32_t) ph[12] | ((uint32_t) ph[13] << 16), (uint32_t) ph[14] | ((uint32_t) ph[15] << 16));
                 alpha_s[own_row] = alpha;
             }
+#endif
         }
         __syncthreads();
         float al[3];
@@ -360,9 +403,13 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         }
 #pragma unroll
         for (int i = 0; i < 3; ++i) {
+#if defined(RDNA4)
+            const qsa3_frag pf = __builtin_bit_cast(qsa3_frag, ptile[i][r*2+hi]);
+#else
             const v16s pf = __builtin_bit_cast(v16s, (uint4[2]){ptile[i][r*2+0], ptile[i][r*2+1]});
+#endif
 #pragma unroll
-            for (int t = 0; t < 2; ++t) { O[i][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vf[t], pf, O[i][t]); }
+            for (int t = 0; t < 2; ++t) { O[i][t] = qsa3_wmma(vf[t], pf, O[i][t]); }
         }
         kf[0] = kfn[0]; kf[1] = kfn[1];
         b01 = nb01; b23 = nb23; m01 = nm01; m23 = nm23;
@@ -378,7 +425,13 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
 #pragma unroll
         for (int t = 0; t < 2; ++t)
 #pragma unroll
-            for (int e = 0; e < 8; ++e) { ostage[r * 32 + 16*t + 2*e + hi] = li > 0.f ? O[i][t][e] / li : 0.f; }
+            for (int e = 0; e < 8; ++e) {
+#if defined(RDNA4)
+                ostage[r * 32 + 16*t + 8*hi + e] = li > 0.f ? O[i][t][e] / li : 0.f;
+#else
+                ostage[r * 32 + 16*t + 2*e + hi] = li > 0.f ? O[i][t][e] / li : 0.f;
+#endif
+            }
         __syncthreads();
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
@@ -396,14 +449,15 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
 #endif
 
 bool ggml_cuda_flash_attn_ext_qsa_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__)
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(RDNA4)
     (void) ctx; (void) dst;
     return false;
 #else
     const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * ids = dst->src[5];
     const auto * packed = dst->src[6], * pv = dst->src[7];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!q || !k || !v || !ids || dst->src[4] || !packed || !pv ||
-        !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) { return false; }
+        (!GGML_CUDA_CC_IS_RDNA3_5(cc) && !GGML_CUDA_CC_IS_RDNA4(cc))) { return false; }
     if (q->ne[1] < 128) { return false; }
     float bias, softcap; memcpy(&bias, (const char *) dst->op_params + 4, 4); memcpy(&softcap, (const char *) dst->op_params + 8, 4);
     if (bias != 0 || softcap != 0 || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
@@ -423,7 +477,7 @@ bool ggml_cuda_flash_attn_ext_qsa_supported(ggml_backend_cuda_context & ctx, con
 }
 
 void ggml_cuda_flash_attn_ext_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__)
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(RDNA4)
     (void) ctx; (void) dst;
     return;
 #else

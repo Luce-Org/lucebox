@@ -8,7 +8,7 @@
 // 512-expert top-10 MoE, per-layer n-gram embedding) into Luzebox's ggml graph
 // style.
 //
-// Single sequence (n_seqs = 1). On gfx1151, multi-row prompt prefill uses QSA
+// Single sequence (n_seqs = 1). On gfx1151 and RDNA4, multi-row prompt prefill uses QSA
 // with F32 accumulation, including below the selection budget. T=1 retains
 // dense attention below the budget and selected attention beyond it. Verify
 // rows use the T=1 attention path at each position, excluding prompt promotion.

@@ -1269,6 +1269,8 @@ if(LUCE_TESTS)
         luce_add_ggml_gpu_executable(test_qwen4exp_qsa_ids test/unit/test_qwen4exp_qsa_ids.cpp)
         target_link_libraries(test_qwen4exp_qsa_ids PRIVATE ggml-cpu)
         list(APPEND _raw_unit_test_targets test_qwen4exp_qsa_ids)
+        luce_add_ggml_gpu_executable(test_qwen4exp_qsa_attn test/unit/test_qwen4exp_qsa_attn.cpp)
+        list(APPEND _raw_unit_test_targets test_qwen4exp_qsa_attn)
 
         luce_add_ggml_gpu_executable(test_fattn_mma256 test/unit/test_fattn_mma256.cpp)
         target_compile_definitions(test_fattn_mma256 PRIVATE GGML_USE_HIP)

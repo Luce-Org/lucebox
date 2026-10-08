@@ -93,6 +93,7 @@ struct TensorAllocation {
     size_t file_size = 0;
     size_t buffer_offset = 0;
     size_t shard = 0;
+    bool on_expert = false;   // routed expert stack placed on the expert backend
 };
 
 // One opened GGUF shard of a (possibly split) model.
@@ -334,6 +335,7 @@ std::string find_qwen4exp_mtp_sidecar(const std::string & model_path) {
 bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
                         Qwen4ExpWeights & out, const std::string & mtp_override, int mtp_vocab) {
     out.gfx1151 = ggml_backend_cuda_qwen4exp_supported(backend);
+    out.qsa = ggml_backend_cuda_qsa_supported(backend);
     const Qwen4ExpCudaScope profile(out.gfx1151);
     // Open every shard of the model; a single-file GGUF is a one-element list. An MTP sidecar
     // (e.g. MTP/mtp-*-shared-Q8_0.gguf) joins as one more shard: its blk.<n_layer> tensors resolve by name like the
@@ -372,6 +374,10 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         if (out.buf) {
             ggml_backend_buffer_free(out.buf);
             out.buf = nullptr;
+        }
+        if (out.expert_buf) {
+            ggml_backend_buffer_free(out.expert_buf);
+            out.expert_buf = nullptr;
         }
         out.embedder.tok_embd_owned.clear();
         out.embedder.tok_embd_bytes = nullptr;
@@ -684,27 +690,38 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         add(layer.ffn_up_shexp); add(layer.ffn_down_shexp);
     }
 
+    std::unordered_set<ggml_tensor *> expert_stacks;
+    if (out.expert_backend) {
+        for (Qwen4ExpLayer & layer : out.layers) {
+            expert_stacks.insert({layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps});
+        }
+    }
     ggml_backend_buffer_type_t buffer_type =
         ggml_backend_get_default_buffer_type(backend);
-    const size_t alignment = ggml_backend_buft_get_alignment(buffer_type);
+    ggml_backend_buffer_type_t expert_type = out.expert_backend
+        ? ggml_backend_get_default_buffer_type(out.expert_backend) : buffer_type;
     std::vector<TensorAllocation> allocations;
     allocations.reserve(wanted.size());
-    size_t allocation_size = 0;
+    size_t allocation_size = 0, expert_size = 0;
     for (size_t s = 0; s < shards.size(); ++s) {
         const int64_t n_tensors = gguf_get_n_tensors(shards[s].gctx);
         for (int64_t tid = 0; tid < n_tensors; ++tid) {
             const char * name = gguf_get_tensor_name(shards[s].gctx, tid);
             ggml_tensor * value = ggml_get_tensor(shards[s].meta, name);
             if (!value || wanted.find(value) == wanted.end()) continue;
-            allocation_size = align_up(allocation_size, alignment);
+            const bool on_expert = expert_stacks.count(value) > 0;
+            ggml_backend_buffer_type_t buft = on_expert ? expert_type : buffer_type;
+            size_t & size = on_expert ? expert_size : allocation_size;
+            size = align_up(size, ggml_backend_buft_get_alignment(buft));
             TensorAllocation allocation;
             allocation.tensor = value;
             allocation.file_offset = gguf_get_data_offset(shards[s].gctx) +
                                      gguf_get_tensor_offset(shards[s].gctx, tid);
             allocation.file_size = gguf_get_tensor_size(shards[s].gctx, tid);
-            allocation.buffer_offset = allocation_size;
+            allocation.buffer_offset = size;
             allocation.shard = s;
-            allocation_size += ggml_backend_buft_get_alloc_size(buffer_type, value);
+            allocation.on_expert = on_expert;
+            size += ggml_backend_buft_get_alloc_size(buft, value);
             allocations.push_back(allocation);
         }
     }
@@ -719,12 +736,16 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     out.buf = ggml_backend_alloc_buffer(backend, allocation_size);
     if (!out.buf) return fail("weight buffer allocation failed");
     ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    char * base = static_cast<char *>(ggml_backend_buffer_get_base(out.buf));
+    if (expert_size > 0) {
+        out.expert_buf = ggml_backend_alloc_buffer(out.expert_backend, expert_size);
+        if (!out.expert_buf) return fail("expert weight buffer allocation failed");
+        ggml_backend_buffer_set_usage(out.expert_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
     for (const TensorAllocation & allocation : allocations) {
-        if (ggml_backend_tensor_alloc(out.buf, allocation.tensor,
+        ggml_backend_buffer_t buffer = allocation.on_expert ? out.expert_buf : out.buf;
+        char * base = static_cast<char *>(ggml_backend_buffer_get_base(buffer));
+        if (ggml_backend_tensor_alloc(buffer, allocation.tensor,
                 base + allocation.buffer_offset) != GGML_STATUS_SUCCESS) {
-            ggml_backend_buffer_free(out.buf);
-            out.buf = nullptr;
             return fail("weight tensor allocation failed");
         }
     }
@@ -889,13 +910,17 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         out.n_layer,
         out.n_layer - out.n_layer / out.full_attention_interval,
         out.n_layer / out.full_attention_interval,
-        allocations.size(), allocation_size / (1024.0 * 1024.0 * 1024.0),
+        allocations.size(), (allocation_size + expert_size) / (1024.0 * 1024.0 * 1024.0),
         shards.size(),
         out.n_expert_used, out.n_expert, out.n_hc, out.hc_lowrank,
         out.ple_layer_ids.size(), out.ple_ngram_size, out.ple_heads_per_ngram,
         static_cast<long long>(out.ple_reader.n_rows()), out.eos_id);
     set_last_error(summary);
     std::fprintf(stderr, "[qwen4exp] %s\n", summary);
+    if (out.expert_buf) {
+        std::fprintf(stderr, "[qwen4exp] split: %.2f GiB on the target device, %.2f GiB of routed experts on the expert device\n",
+                     allocation_size / 1073741824.0, expert_size / 1073741824.0);
+    }
     return true;
 }
 
@@ -905,6 +930,21 @@ void free_qwen4exp_weights(Qwen4ExpWeights & w) {
         ggml_backend_buffer_free(w.buf);
         w.buf = nullptr;
     }
+    if (w.expert_buf) {
+        ggml_backend_buffer_free(w.expert_buf);
+        w.expert_buf = nullptr;
+    }
+    w.hot.reset();
+    if (w.lut_buf) {
+        ggml_backend_buffer_free(w.lut_buf);
+        w.lut_buf = nullptr;
+    }
+    if (w.lut_ctx) {
+        ggml_free(w.lut_ctx);
+        w.lut_ctx = nullptr;
+    }
+    w.hot_lut.clear();
+    w.cold_lut.clear();
     for (ggml_context * extra : w.extra_meta_ctxs) {
         if (extra) ggml_free(extra);
     }

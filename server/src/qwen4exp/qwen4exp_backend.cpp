@@ -2,6 +2,7 @@
 #include "qwen4exp_chunk.h"
 #include "qwen4exp_graph.h"
 
+#include "common/peer_access.h"
 #include "common/sampler.h"
 
 #include "ggml-cuda.h"
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdio>
 #include <cstdlib>
 #include <future>
@@ -17,6 +19,79 @@
 #include <vector>
 
 namespace luce::common {
+
+// Split mode, research: copy the most-routed experts (the routing CSV in
+// LUCE_QWEN4EXP_HOT_EXPERTS, LUCE_QWEN4EXP_HOT_GIB of them, default 8) to the
+// target, plus the per-layer lookup tables that send each pick to one device.
+static bool load_qwen4exp_hot_experts(ggml_backend_t backend, Qwen4ExpWeights & w) {
+    const char * path = std::getenv("LUCE_QWEN4EXP_HOT_EXPERTS");
+    if (!path || !*path || !w.expert_backend) return true;
+    std::string err;
+    MoeHybridRoutingStats stats;
+    if (!MoeHybridRoutingStats::load_csv(path, stats, &err) ||
+        !stats.matches(w.n_layer, w.n_expert, w.n_expert_used)) {
+        std::fprintf(stderr, "[qwen4exp] hot experts: %s: %s\n", path, err.empty() ? "shape mismatch" : err.c_str());
+        return false;
+    }
+    std::vector<MoeLayerDesc> descs((size_t) w.n_layer);
+    std::vector<uint64_t> expert_bytes((size_t) w.n_layer);
+    for (int il = 0; il < w.n_layer; ++il) {
+        const Qwen4ExpLayer & L = w.layers[(size_t) il];
+        descs[(size_t) il].ffn_gate_exps = L.ffn_gate_exps;
+        descs[(size_t) il].ffn_up_exps   = L.ffn_up_exps;
+        descs[(size_t) il].ffn_down_exps = L.ffn_down_exps;
+        expert_bytes[(size_t) il] = L.ffn_gate_exps->nb[2] + L.ffn_up_exps->nb[2] + L.ffn_down_exps->nb[2];
+    }
+    const char * gib = std::getenv("LUCE_QWEN4EXP_HOT_GIB");
+    const uint64_t budget = (uint64_t) ((gib ? std::atof(gib) : 8.0) * (double) (1ull << 30));
+    MoeHybridPlacement placement;
+    if (!MoeHybridPlacement::build_from_stats_with_layer_bytes(stats, expert_bytes, budget, 0, placement, &err)) {
+        std::fprintf(stderr, "[qwen4exp] hot experts: placement failed: %s\n", err.c_str());
+        return false;
+    }
+    MoeHybridConfig cfg;
+    cfg.n_embd = w.n_embd;
+    cfg.n_expert = w.n_expert;
+    cfg.n_expert_used = w.n_expert_used;
+    cfg.n_ff_exp = (int) w.layers[0].ffn_gate_exps->ne[1];
+    cfg.n_layer = w.n_layer;
+    cfg.cold_expert_backend = MoeHybridColdBackend::None;   // the full stacks stay on the expert device
+    cfg.materialize_cold_experts = false;
+    w.hot = std::make_unique<MoeHybridStorage>();
+    if (!build_moe_hybrid_storage(cfg, backend, placement, descs, *w.hot, &err)) {
+        std::fprintf(stderr, "[qwen4exp] hot experts: %s\n", err.c_str());
+        return false;
+    }
+    const ggml_init_params ip = { 2 * (size_t) w.n_layer * ggml_tensor_overhead(), nullptr, true };
+    w.lut_ctx = ggml_init(ip);
+    w.hot_lut.assign((size_t) w.n_layer, nullptr);
+    w.cold_lut.assign((size_t) w.n_layer, nullptr);
+    for (int il = 0; il < w.n_layer; ++il) {
+        if (w.hot->layers[(size_t) il].hot_expert_ids.empty()) continue;
+        w.hot_lut[(size_t) il]  = ggml_new_tensor_2d(w.lut_ctx, GGML_TYPE_I32, 1, w.n_expert);
+        w.cold_lut[(size_t) il] = ggml_new_tensor_2d(w.lut_ctx, GGML_TYPE_I32, 1, w.n_expert);
+    }
+    w.lut_buf = ggml_backend_alloc_ctx_tensors(w.lut_ctx, backend);
+    uint64_t hot_routes = 0, routes = 0;
+    double hot_bytes = 0;
+    for (int il = 0; il < w.n_layer; ++il) {
+        const std::vector<int32_t> & hot = w.hot->layers[(size_t) il].hot_local_by_global;
+        hot_bytes += (double) placement.hot_counts[(size_t) il] * (double) expert_bytes[(size_t) il];
+        for (int e = 0; e < w.n_expert; ++e) {
+            routes += stats.count(il, e);
+            if (w.hot_lut[(size_t) il] && hot[(size_t) e] >= 0) hot_routes += stats.count(il, e);
+        }
+        if (!w.hot_lut[(size_t) il]) continue;
+        std::vector<int32_t> cold((size_t) w.n_expert);
+        for (int e = 0; e < w.n_expert; ++e) cold[(size_t) e] = hot[(size_t) e] >= 0 ? -1 : e;
+        ggml_backend_tensor_set(w.hot_lut[(size_t) il], hot.data(), 0, hot.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(w.cold_lut[(size_t) il], cold.data(), 0, cold.size() * sizeof(int32_t));
+    }
+    std::fprintf(stderr, "[qwen4exp] hot experts: %d of %d (%.2f GiB) on the target, %.1f%% of the profiled picks\n",
+                 placement.total_hot, w.n_layer * w.n_expert, hot_bytes / (1ull << 30),
+                 routes ? 100.0 * (double) hot_routes / (double) routes : 0.0);
+    return true;
+}
 
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         Qwen4ExpCache & cache, int slots, int resident_slots, size_t * snapshot_budget) {
@@ -138,6 +213,20 @@ bool Qwen4ExpBackend::init() {
                      cfg_.device.gpu);
         return false;
     }
+    // Research: routed experts on a second GPU, everything else on the target.
+    if (const char * expert_gpu = std::getenv("LUCE_QWEN4EXP_EXPERT_GPU")) {
+        weights_.expert_backend = ggml_backend_cuda_init(std::atoi(expert_gpu));
+        if (!weights_.expert_backend) {
+            std::fprintf(stderr, "[qwen4exp] expert backend init failed for GPU %s\n", expert_gpu);
+            return false;
+        }
+        weights_.expert_gfx1151 = ggml_backend_cuda_qwen4exp_supported(weights_.expert_backend);
+        // Direct device-to-device copies for the activations crossing between the two GPUs.
+        if (!enable_peer_access_pair(cfg_.device.gpu, std::atoi(expert_gpu))) {
+            std::fprintf(stderr, "[qwen4exp] peer access between GPU %d and %s unavailable; copies stage through the host\n",
+                         cfg_.device.gpu, expert_gpu);
+        }
+    }
     if (!load_qwen4exp_gguf(cfg_.model_path, backend_, weights_,
                            cfg_.verify_width == 1 ? "0" : cfg_.draft_path.value_or(""))) {
         std::fprintf(stderr, "[qwen4exp] model load failed: %s\n",
@@ -148,6 +237,12 @@ bool Qwen4ExpBackend::init() {
                                cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1))) {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
         return false;
+    }
+    if (!load_qwen4exp_hot_experts(backend_, weights_)) return false;
+    if (const char * stats_path = std::getenv("LUCE_QWEN4EXP_ROUTING_STATS_OUT")) {
+        weights_.route_recorder = std::make_unique<Qwen4ExpRouteRecorder>();
+        weights_.route_recorder->stats.init(weights_.n_layer, weights_.n_expert, weights_.n_expert_used);
+        weights_.route_recorder->path = stats_path;
     }
     if (cfg_.chunk > 0) {
         chunk_ = cfg_.chunk;
@@ -160,6 +255,11 @@ bool Qwen4ExpBackend::init() {
         chunk_ = qwen4exp_select_chunk(backend_, weights_, cache_, 1, 1, &snapshot_budget_);
         std::fprintf(stderr, "[qwen4exp] prefix snapshot allowance=%zu bytes\n", snapshot_budget_);
     }
+    if (weights_.expert_backend) chunk_ = std::min(chunk_, 16384);   // the generic MoE id helper's limit
+    // The planner does not see the target's matmul scratch pool, which grows
+    // over a long prompt; with hot experts the target has no slack left for it.
+    // 8192 rows still give the prompt pipeline two 4096-row streams.
+    if (weights_.hot && cfg_.chunk <= 0) chunk_ = std::min(chunk_, 8192);
     if (chunk_ <= 0) {
         std::fprintf(stderr, "[qwen4exp] insufficient prefill memory at the configured context\n");
         return false;
@@ -629,6 +729,7 @@ bool Qwen4ExpBackend::handle_compress(const std::string & line,
 void Qwen4ExpBackend::free_drafter() {}
 
 void Qwen4ExpBackend::shutdown() {
+    if (weights_.route_recorder) weights_.route_recorder->stats.save_csv(weights_.route_recorder->path);
     for (int i = 0; i < kMaxSlots; ++i) snapshot_free(i);
     tokens_.clear(); logits_.clear();
     seq_engine_.reset();
@@ -636,6 +737,10 @@ void Qwen4ExpBackend::shutdown() {
     seq_caches_.clear();
     free_qwen4exp_cache(cache_);
     free_qwen4exp_weights(weights_);
+    if (weights_.expert_backend) {
+        ggml_backend_free(weights_.expert_backend);
+        weights_.expert_backend = nullptr;
+    }
     if (backend_) {
         ggml_backend_free(backend_);
         backend_ = nullptr;

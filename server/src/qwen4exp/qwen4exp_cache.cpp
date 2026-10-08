@@ -87,7 +87,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
 
     // Packed attention reads groups of four keys even for an unaligned
     // logical context limit. Padding is masked by the causal cell IDs.
-    const int64_t align = profile.optimized ? 4 : 1;
+    const int64_t align = w.qsa ? 4 : 1;
     const int64_t kv_capacity = (static_cast<int64_t>(max_ctx) + align - 1) / align * align;
     for (size_t i = 0; i < n_full; ++i) {
         out.attn_k[i] = ggml_new_tensor_3d(out.ctx, kv_type,
@@ -209,6 +209,9 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
     clear_qwen4exp_decode_workspace(c.decode_workspace);
     clear_qwen4exp_decode_workspace(c.verify_workspace);
     clear_qwen4exp_decode_workspace(c.mtp_workspace);
+    if (c.split_sched) { ggml_backend_sched_free(c.split_sched); c.split_sched = nullptr; }
+    if (c.split_sched_short) { ggml_backend_sched_free(c.split_sched_short); c.split_sched_short = nullptr; }
+    if (c.split_cpu) { ggml_backend_free(c.split_cpu); c.split_cpu = nullptr; }
     if (c.input_ring.buf) {
         ggml_backend_buffer_free(c.input_ring.buf);
         c.input_ring.buf = nullptr;

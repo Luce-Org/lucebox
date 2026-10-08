@@ -62,6 +62,10 @@ struct Qwen4ExpDecodeWorkspace {
     int max_ctx = 0;
     const Qwen4ExpWeights * model = nullptr;
     ggml_backend_t backend = nullptr;  // owns native captures; must outlive the workspace
+    // Split mode: the nodes pinned to the expert device, and the short-batch
+    // scheduler allocation this graph owns (see Qwen4ExpCache::split_short_gen).
+    std::vector<ggml_tensor *> expert_nodes;
+    uint64_t split_gen = 0;
 };
 
 // Shared arena for exact-width independent-sequence decode. Unlike the stable
@@ -137,6 +141,13 @@ struct Qwen4ExpCache {
 
     // T=1 decode workspace reuse; the verify and MTP draft graphs keep their own.
     Qwen4ExpDecodeWorkspace decode_workspace, verify_workspace, mtp_workspace;
+
+    // Split mode (Qwen4ExpWeights::expert_backend): schedulers over the target,
+    // the expert device and the CPU, reused across forwards.
+    ggml_backend_sched_t split_sched       = nullptr;   // prompt chunks
+    ggml_backend_sched_t split_sched_short = nullptr;   // decode and short batches
+    uint64_t             split_short_gen   = 0;         // bumped on every short-scheduler allocation
+    ggml_backend_t       split_cpu         = nullptr;
 };
 
 // `mtp` adds the MTP draft layer's K/V and the verify rollback state (needs a loaded sidecar).

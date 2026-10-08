@@ -377,6 +377,26 @@ extern "C" {
                                             ggml_backend_sched_t sched,
                                             bool enabled);
 
+    // Number of input copies, before the first allocation. A parallel scheduler
+    // keeps its per-copy events and persistent split-input copies even with one
+    // copy: GPU-side waits for cross-backend inputs without the extra copies that
+    // only overlapping evaluations need.
+    GGML_API void                 ggml_backend_sched_set_n_copies(ggml_backend_sched_t sched, int n_copies);
+
+    // Eager peer copies: once a split is submitted, the cross-backend inputs it
+    // produced for later splits are copied right away through `fn` (on the
+    // source's side stream, recording `done`); the consumer split waits on
+    // `done` instead of copying when it runs. `fn` returns false when it cannot
+    // copy the pair, and that input is copied the usual way. NULL disables it.
+    // Requires a parallel scheduler: its input copies are not reused within a
+    // graph evaluation.
+    typedef bool (*ggml_backend_sched_eager_copy_fn)(ggml_backend_t src_backend, ggml_backend_t dst_backend,
+                                                    const struct ggml_tensor * src, struct ggml_tensor * dst,
+                                                    ggml_backend_event_t done);
+    GGML_API void                 ggml_backend_sched_set_eager_peer_copies(
+                                            ggml_backend_sched_t sched,
+                                            ggml_backend_sched_eager_copy_fn fn);
+
     // Inputs in one split share a destination and copy generation. Batch
     // unlike-runtime fallbacks through per-backend host arenas, transferring
     // only each tensor's logical payload (including strided/permuted views),

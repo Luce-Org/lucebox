@@ -10,8 +10,11 @@
 #include "qwen4exp_mtp.h"
 #include "ggml-cuda.h"
 #include "common/gguf_mmap.h"
+#include "common/moe_hybrid_routing_stats.h"
+#include "common/moe_hybrid_storage.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -125,12 +128,35 @@ private:
     ggml_to_float_t  to_float_  = nullptr;
 };
 
+// Research: the router's picks of decode and verify steps, counted per layer
+// (LUCE_QWEN4EXP_ROUTING_STATS_OUT=path; the CSV is rewritten every 64 steps).
+struct Qwen4ExpRouteRecorder {
+    MoeHybridRoutingStats stats;
+    std::string path;
+    int64_t steps = 0;
+};
+
 struct Qwen4ExpWeights {
     bool gfx1151 = false;  // Cache profile support at load, before any allocation.
+    bool qsa = false;      // The QSA kernels run on the target device (gfx1151, RDNA4).
     ggml_context *        ctx     = nullptr;  // shard 1 tensor descriptors
     // Descriptor contexts of shards 2..N (split GGUFs); `ctx` covers shard 1.
     std::vector<ggml_context *> extra_meta_ctxs;
     ggml_backend_buffer_t buf     = nullptr;
+    // Split mode: the routed expert stacks live on a second device (set by the
+    // caller before loading, not owned); everything else stays on `backend`.
+    ggml_backend_t        expert_backend = nullptr;
+    ggml_backend_buffer_t expert_buf     = nullptr;
+    bool                  expert_gfx1151 = false;
+    // Split mode, research: the most-routed experts copied to the target
+    // (`hot`, from LUCE_QWEN4EXP_HOT_EXPERTS). Decode and verify steps run
+    // them there while the expert device runs the rest of the picks.
+    std::unique_ptr<MoeHybridStorage> hot;
+    ggml_context *             lut_ctx = nullptr;
+    ggml_backend_buffer_t      lut_buf = nullptr;
+    std::vector<ggml_tensor *> hot_lut;    // per layer [1, n_expert] i32: hot slot, -1 if cold (null: no hot experts)
+    std::vector<ggml_tensor *> cold_lut;   // per layer [1, n_expert] i32: the expert, -1 if hot
+    std::unique_ptr<Qwen4ExpRouteRecorder> route_recorder;
 
     CpuEmbedder           embedder;
 

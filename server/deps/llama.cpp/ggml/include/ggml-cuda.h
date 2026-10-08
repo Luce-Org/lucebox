@@ -115,6 +115,12 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int de
 GGML_BACKEND_API bool ggml_backend_cuda_copy_tensor_async_side(
         ggml_backend_t backend_src, ggml_backend_t backend_dst,
         const struct ggml_tensor * src, struct ggml_tensor * dst);
+// Like ggml_backend_cuda_copy_tensor_async_side, but the destination does not
+// wait: the copy records `done` (an event of the source device) and the caller
+// has the destination wait on it where it needs the data.
+GGML_BACKEND_API bool ggml_backend_cuda_copy_tensor_async_side_event(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const struct ggml_tensor * src, struct ggml_tensor * dst, ggml_backend_event_t done);
 // Order the backend's compute stream after its side-stream copies so far.
 GGML_BACKEND_API void ggml_backend_cuda_join_side_copies(ggml_backend_t backend);
 // Peer copy on the source's compute stream without a destination wait:
@@ -261,6 +267,8 @@ enum ggml_cuda_qwen4exp_profile {
 };
 GGML_BACKEND_API enum ggml_cuda_qwen4exp_profile ggml_backend_cuda_set_qwen4exp_profile(enum ggml_cuda_qwen4exp_profile profile);
 GGML_BACKEND_API bool ggml_backend_cuda_qwen4exp_supported(ggml_backend_t backend);
+// True when the QSA selected-attention kernels (qsa.cu) run on the backend's device: gfx1151 and RDNA4.
+GGML_BACKEND_API bool ggml_backend_cuda_qsa_supported(ggml_backend_t backend);
 
 // True when a matmul with weight w over n_tokens rows can take an F16 activation (HIP MMB Q8_0 -> F16 route).
 GGML_BACKEND_API bool ggml_backend_cuda_mmb_f16_input_ok(const struct ggml_tensor * w, int64_t n_tokens);

@@ -854,6 +854,7 @@ struct ggml_backend_sched {
     // pipeline parallelism support
     int n_copies;
     int cur_copy;
+    bool copy_events;   // parallel: per-copy events and persistent split-input copies
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
     struct ggml_tensor * graph_inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
@@ -882,6 +883,10 @@ struct ggml_backend_sched {
     int deferred_peer_copies_capacity;
     bool split_deferred_peer_copies;
     bool batch_split_copies;
+    ggml_backend_sched_eager_copy_fn eager_copy_fn;
+    // Per source backend, events for eager copies (created on demand, reused per evaluation).
+    ggml_backend_event_t * eager_events[GGML_SCHED_MAX_BACKENDS];
+    int eager_events_capacity[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_buffer_t batch_staging_buffers[GGML_SCHED_MAX_BACKENDS];
     uint8_t * batch_staging_bases[GGML_SCHED_MAX_BACKENDS];
     size_t batch_staging_sizes[GGML_SCHED_MAX_BACKENDS];
@@ -1521,7 +1526,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
+                            if (sched->n_copies > 1 || sched->copy_events) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
@@ -1679,7 +1684,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
     }
 
-    if (sched->n_copies > 1) {
+    if (sched->n_copies > 1 || sched->copy_events) {
         // add input copies as leafs so that they are allocated first
         for (int i = 0; i < sched->n_graph_inputs; i++) {
             struct ggml_tensor * input = sched->graph_inputs[i];
@@ -2330,6 +2335,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // backend may have accepted work even if a later split fails.
     sched->backends_synchronized = false;
 
+    // Eager peer copies: the split producing each cross-backend input, and the
+    // event its eager copy records ([split input offset + input id]).
+    const bool eager = sched->eager_copy_fn != nullptr && sched->copy_events;
+    std::vector<int> eager_offset;
+    std::vector<int> eager_producer;
+    std::vector<ggml_backend_event_t> eager_done;
+    int eager_used[GGML_SCHED_MAX_BACKENDS] = {};
+    if (eager) {
+        eager_offset.resize(sched->n_splits + 1, 0);
+        for (int s = 0; s < sched->n_splits; ++s) {
+            eager_offset[s + 1] = eager_offset[s] + splits[s].n_inputs;
+        }
+        eager_producer.assign(eager_offset[sched->n_splits], -1);
+        eager_done.assign(eager_offset[sched->n_splits], nullptr);
+        for (int j = 0; j < sched->n_splits; ++j) {
+            for (int i = 0; i < splits[j].n_inputs; ++i) {
+                const ggml_tensor * input = splits[j].inputs[i];
+                if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                    continue;
+                }
+                for (int s = j - 1; s >= 0 && eager_producer[eager_offset[j] + i] < 0; --s) {
+                    for (int n = 0; n < splits[s].graph.n_nodes; ++n) {
+                        const ggml_tensor * node = splits[s].graph.nodes[n];
+                        if (node == input || node == input->view_src) {
+                            eager_producer[eager_offset[j] + i] = s;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -2357,6 +2395,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+            if (eager && eager_done[eager_offset[split_id] + input_id]) {
+                // copied when its producer split was submitted
+                ggml_backend_event_wait(split_backend, eager_done[eager_offset[split_id] + input_id]);
+                continue;
+            }
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2544,6 +2587,40 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         copy_destinations_ready[split_backend_id] =
             sched->callback_eval != nullptr;
 
+        // Copy what this split produced for later splits on other backends now,
+        // so the copy waits only for this split, not for work queued after it.
+        for (int j = split_id + 1; eager && j < sched->n_splits; ++j) {
+            if (splits[j].backend_id == split_backend_id) {
+                continue;
+            }
+            for (int i = 0; i < splits[j].n_inputs; ++i) {
+                const int slot = eager_offset[j] + i;
+                const int producer = eager_producer[slot];
+                if (eager_done[slot] || producer < 0 || producer > split_id ||
+                    splits[producer].backend_id != split_backend_id) {
+                    continue;
+                }
+                int & used = eager_used[split_backend_id];
+                if (used == sched->eager_events_capacity[split_backend_id]) {
+                    const int cap = std::max(64, 2 * used);
+                    sched->eager_events[split_backend_id] = (ggml_backend_event_t *) realloc(
+                        sched->eager_events[split_backend_id], cap * sizeof(ggml_backend_event_t));
+                    for (int e = used; e < cap; ++e) {
+                        sched->eager_events[split_backend_id][e] =
+                            ggml_backend_event_new(ggml_backend_get_device(split_backend));
+                    }
+                    sched->eager_events_capacity[split_backend_id] = cap;
+                }
+                ggml_backend_event_t done = sched->eager_events[split_backend_id][used];
+                struct ggml_tensor * input = splits[j].inputs[i];
+                if (done && sched->eager_copy_fn(split_backend, sched->backends[splits[j].backend_id], input,
+                                                 tensor_copy(input, splits[j].backend_id, sched->cur_copy), done)) {
+                    eager_done[slot] = done;
+                    ++used;
+                }
+            }
+        }
+
         // Publish producer completion before a later consumer-backend graph
         // reaches its in-graph event wait. Recording is asynchronous and does
         // not block the host from immediately enqueueing independent work.
@@ -2605,6 +2682,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    sched->copy_events = parallel;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -2674,6 +2752,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         ggml_backend_event_free(sched->deferred_peer_copies[i].event);
     }
     free(sched->deferred_peer_copies);
+    for (int b = 0; b < sched->n_backends; ++b) {
+        for (int i = 0; i < sched->eager_events_capacity[b]; ++i) {
+            ggml_backend_event_free(sched->eager_events[b][i]);
+        }
+        free(sched->eager_events[b]);
+    }
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
@@ -2938,6 +3022,25 @@ void ggml_backend_sched_add_deferred_peer_copy_node(
     deferred->producer_backend_id = -1;
     deferred->producer_split_id = -1;
     deferred->consumer_split_id = -1;
+}
+
+void ggml_backend_sched_set_n_copies(ggml_backend_sched_t sched, int n_copies) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(n_copies >= 1 && n_copies <= sched->n_copies && "copies can only be reduced");
+    GGML_ASSERT(sched->is_reset && !sched->is_alloc && "set the copy count before allocating");
+    for (int b = 0; b < sched->n_backends; ++b) {
+        for (int c = n_copies; c < sched->n_copies; ++c) {
+            ggml_backend_event_free(sched->events[b][c]);
+            sched->events[b][c] = NULL;
+        }
+    }
+    sched->n_copies = n_copies;
+    sched->cur_copy = 0;
+}
+
+void ggml_backend_sched_set_eager_peer_copies(ggml_backend_sched_t sched, ggml_backend_sched_eager_copy_fn fn) {
+    GGML_ASSERT(sched);
+    sched->eager_copy_fn = fn;
 }
 
 void ggml_backend_sched_set_deferred_peer_copy_split(
