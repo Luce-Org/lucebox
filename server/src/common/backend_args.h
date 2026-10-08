@@ -16,6 +16,7 @@
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
 #include "prefill_attention_mode.h"
+#include "cluster/cluster_config.h"
 
 namespace luce::common {
 
@@ -83,6 +84,8 @@ struct BackendArgs {
     // Expert ownership and routing files (see docs/DS41.md); empty = unused.
     std::string     ds4_expert_placement;
     std::string     ds4_router_bias;
+    // Expert-parallel cluster rank (--cluster-*); size 0 = a single box.
+    cluster::ClusterConfig cluster;
     std::string     ds4_protected_experts;
 
     // Attention and speculative-decode options. Individual backends consume

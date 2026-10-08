@@ -407,6 +407,7 @@ std::unique_ptr<ModelBackend> construct_backend(
             cfg.expert_placement_path = execution.expert_placement;
             cfg.router_bias_path = execution.router_bias;
             cfg.protected_experts_path = execution.protected_experts;
+            cfg.cluster = execution.cluster;
             cfg.prefill_mode = execution.prefill_mode;
             cfg.paged_attention = cache.paged_attention;
             cfg.max_concurrency = execution.max_concurrency;
