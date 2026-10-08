@@ -187,43 +187,30 @@ SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_with_prefix(
 bool Qwen4ExpSeqEngine::mtp_prefill(Qwen4ExpCache & cache, const int32_t * tokens, int n, int pos0,
                                     std::vector<float> & logits) {
     const size_t hd = (size_t)weights_.n_embd * weights_.n_hc;
-    mtp_.tok.clear();
+    Qwen4ExpMtpPending & pending = mtp_.pending;
+    pending.tok.clear();
     if (pos0 > 0 && cache.mtp_prev_pos != pos0 - 1) {
         mtp_.live = false;
-        mtp_.h.clear();
+        pending.h.clear();
         return qwen4exp_forward(backend_, weights_, cache, tokens, n, pos0, logits).ok;
     }
-    mtp_.h.resize(pos0 > 0 ? hd : 0);
-    if (pos0 > 0) ggml_backend_tensor_get(cache.mtp_prev_hidden, mtp_.h.data(), 0, hd * sizeof(float));
-    mtp_.pos = std::max(0, pos0 - 1);
+    pending.h.resize(pos0 > 0 ? hd : 0);
+    if (pos0 > 0) ggml_backend_tensor_get(cache.mtp_prev_hidden, pending.h.data(), 0, hd * sizeof(float));
+    pending.pos = std::max(0, pos0 - 1);
     std::vector<float> hidden;
     if (n > 1) {
         if (!qwen4exp_forward(backend_, weights_, cache, tokens, n, pos0, logits, &hidden, false, true).ok)
             return false;
-        mtp_.h.swap(hidden);
-        mtp_.pos = pos0 + n - 1;
+        pending.h.swap(hidden);
+        pending.pos = pos0 + n - 1;
         return true;
     }
     if (!qwen4exp_forward(backend_, weights_, cache, tokens, 1, pos0, logits, &hidden).ok) return false;
-    if (pos0 > 0) mtp_.tok.assign(tokens, tokens + 1);
-    mtp_.h.insert(mtp_.h.end(), hidden.begin(), hidden.end());
-    if (!mtp_catch_up(cache, 0) || mtp_.h.size() != hd) return false;
-    ggml_backend_tensor_set(cache.mtp_prev_hidden, mtp_.h.data(), 0, hd * sizeof(float));
+    if (pos0 > 0) pending.tok.assign(tokens, tokens + 1);
+    pending.h.insert(pending.h.end(), hidden.begin(), hidden.end());
+    if (!qwen4exp_mtp_catch_up(backend_, weights_, cache, pending, 0) || pending.h.size() != hd) return false;
+    ggml_backend_tensor_set(cache.mtp_prev_hidden, pending.h.data(), 0, hd * sizeof(float));
     cache.mtp_prev_pos = pos0;
-    return true;
-}
-
-// Run all but `keep` pending pairs through the draft layer (K/V only).
-bool Qwen4ExpSeqEngine::mtp_catch_up(Qwen4ExpCache & cache, size_t keep) {
-    if (mtp_.tok.size() <= keep) return true;
-    const int n = (int)(mtp_.tok.size() - keep);
-    const size_t hd = (size_t)weights_.n_embd * weights_.n_hc;
-    std::vector<float> unused;
-    if (!qwen4exp_mtp_forward(backend_, weights_, cache, mtp_.tok.data(), mtp_.h.data(), n, mtp_.pos,
-                              unused, nullptr, /*kv_only=*/true)) return false;
-    mtp_.h.erase(mtp_.h.begin(), mtp_.h.begin() + (std::ptrdiff_t)((size_t)n * hd));
-    mtp_.tok.erase(mtp_.tok.begin(), mtp_.tok.begin() + n);
-    mtp_.pos += n;
     return true;
 }
 
@@ -233,21 +220,15 @@ bool Qwen4ExpSeqEngine::mtp_eligible(const StepPlan & plan) const {
         plan.decode[0].allow_speculation;
 }
 
-// Draft, verify and roll back the MTP slot alone: the single-slot loop's step.
-// The accepted drafts are durable children of the output; the last emitted
-// token stays pending for the scheduler, as in one-token decode.
+// The MTP slot alone takes the single-slot loop's step (qwen4exp_mtp_step). The
+// accepted drafts are durable children of the output; the last emitted token
+// stays pending for the scheduler, as in one-token decode.
 SeqEngine::StepResult Qwen4ExpSeqEngine::mtp_step(const StepInput & input) {
     StepResult result;
-    auto fail = [&result](const char * message) -> StepResult {
-        result.decode.clear();
-        result.error = message;
-        return std::move(result);
-    };
     const int id = input.slot;
     Qwen4ExpCache & cache = *caches_[(size_t)id];
     SeqSlot & slot = slots_.slot(id);
     const int pos = slot.cur_pos;
-    const size_t hd = (size_t)weights_.n_embd * weights_.n_hc;
     const auto t0 = std::chrono::steady_clock::now();
     auto verify_builds = [&cache] {
         uint64_t n = 0;
@@ -256,65 +237,47 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::mtp_step(const StepInput & input) {
     };
     const uint64_t builds0 = verify_builds();
 
-    mtp_.tok.push_back(input.token);
-    const bool adaptive = verify_width_ == 0;
-    const int width = adaptive ? mtp_width_->next_width_cost_aware({}, cache.mtp_draft + 1) : cache.mtp_draft + 1;
-    const int k = std::max(0, std::min(width - 1, max_context() - pos - 1));
-    // After a stretch beside other requests, fold all but the last pair first.
-    if (k > 0 && mtp_.tok.size() > (size_t)QWEN4EXP_MTP_MAX_VERIFY && !mtp_catch_up(cache, 1))
-        return fail("qwen4exp MTP catch-up failed");
-    std::vector<int32_t> drafts;
-    if (k > 0 && !qwen4exp_mtp_draft(backend_, weights_, cache, mtp_.tok.data(), mtp_.h.data(),
-                                     (int)mtp_.tok.size(), mtp_.pos, k, drafts))
-        return fail("qwen4exp MTP draft failed");
-    const auto t_draft = std::chrono::steady_clock::now();
-    std::array<int32_t, QWEN4EXP_MTP_MAX_VERIFY> in{}, samples{};
-    in[0] = input.token;
-    std::copy(drafts.begin(), drafts.end(), in.begin() + 1);
-    std::vector<float> logits, hidden;
-    if (!qwen4exp_forward(backend_, weights_, cache, in.data(), k + 1, pos, logits, &hidden, k > 0).ok ||
-        logits.size() != (size_t)(k + 1) * weights_.n_vocab || hidden.size() < hd)
-        return fail("qwen4exp MTP verify forward failed");
-    const auto t_verify = std::chrono::steady_clock::now();
-
-    // Sample rows as one-token decode would, each after its own fed token.
+    // Rows are sampled as one-token decode would, each after its own fed token, up to EOS.
     const size_t history0 = slot.sample_history.size();
-    Qwen4ExpMtpAcceptance decision;
-    for (int i = 0; i <= k; ++i) {
-        slot.sample_history.push_back(in[(size_t)i]);
-        const float * row = logits.data() + (size_t)i * weights_.n_vocab;
-        samples[(size_t)i] = slot.sampler.needs_logit_processing()
+    auto sample_row = [&](int32_t fed, const float * row, int32_t & token) {
+        slot.sample_history.push_back(fed);
+        token = slot.sampler.needs_logit_processing()
             ? sample_logits(row, weights_.n_vocab, slot.sampler, slot.sample_history, slot.rng)
             : (int32_t)(std::max_element(row, row + weights_.n_vocab) - row);
-        decision = qwen4exp_mtp_accept(drafts.data(), k, samples.data(), i + 1);
-        if (decision.n_accepted != i + 1 || token_is_eos(samples[(size_t)i])) break;
-    }
+        return !token_is_eos(token);
+    };
+    mtp_.pending.tok.push_back(input.token);
+    std::vector<float> logits;
+    Qwen4ExpMtpStep step;
+    const bool ok = qwen4exp_mtp_step(backend_, weights_, cache, pos, input.token, max_context() - pos - 1,
+                                      verify_width_ == 0 ? mtp_width_ : nullptr, &mtp_.pending, sample_row,
+                                      logits, step);
     slot.sample_history.resize(history0);
-    const int retained = decision.n_emitted;
-    if (k > 0) {
-        mtp_.h.assign(hidden.begin(), hidden.begin() + (std::ptrdiff_t)((size_t)retained * hd));
-        mtp_.tok.assign(decision.emitted.begin(), decision.emitted.begin() + retained - 1);
-        mtp_.pos = pos;
-        if (!qwen4exp_verify_rollback(backend_, weights_, cache, pos, retained))
-            return fail("qwen4exp verify rollback failed");
-    } else {
-        mtp_.h.insert(mtp_.h.end(), hidden.begin(), hidden.begin() + (std::ptrdiff_t)hd);
+    if (!ok) {
+        result.error = step.error;
+        return result;
     }
+    mtp_.pending.tok.pop_back();   // the scheduler feeds it back as the next step's token
     ggml_backend_synchronize(backend_);
+    const Qwen4ExpMtpAcceptance & decision = step.decision;
+    const int retained = decision.n_emitted;
+    std::array<int32_t, QWEN4EXP_MTP_MAX_VERIFY> fed{};
+    fed[0] = input.token;
+    std::copy(decision.emitted.begin(), decision.emitted.begin() + retained - 1, fed.begin() + 1);
     cache.cur_pos = pos + retained;
-    const auto appended = slots_.append_tokens(id, in.data(), retained);
-    if (!appended.ok || appended.position != pos) return fail("qwen4exp MTP reservation failed");
+    const auto appended = slots_.append_tokens(id, fed.data(), retained);
+    if (!appended.ok || appended.position != pos) {
+        result.error = "qwen4exp MTP reservation failed";
+        return result;
+    }
     slots_.commit_step(id);
 
-    const auto t_end = std::chrono::steady_clock::now();
-    const double ms = std::chrono::duration<double, std::milli>(t_end - t0).count();
-    mtp_.draft_s += std::chrono::duration<double>(t_draft - t0).count();
-    mtp_.verify_s += std::chrono::duration<double>(t_verify - t_draft).count();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    mtp_.draft_s += step.draft_s;
+    mtp_.verify_s += step.verify_s;
     mtp_.verify_builds += verify_builds() - builds0;
-    if (k > 0 && adaptive)
-        mtp_width_->observe(decision.n_accepted + 1, k + 1, verify_builds() != builds0 ? -1.0f : (float)ms);
     ++mtp_.steps;
-    mtp_.drafts += k;
+    mtp_.drafts += step.k;
     mtp_.accepted += decision.n_accepted;
     mtp_.tokens += retained;
     mtp_.decode_s += ms / 1e3;
@@ -548,12 +511,14 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
             return fail("qwen4exp batched decode forward failed");
         if (hidden_slot >= 0) {
             const size_t hd = (size_t)weights_.n_embd * weights_.n_hc;
-            mtp_.tok.push_back(tokens[(size_t)hidden_slot]);
+            Qwen4ExpMtpPending & pending = mtp_.pending;
+            pending.tok.push_back(tokens[(size_t)hidden_slot]);
             if (hidden.size() != hd) {
                 mtp_.live = false;   // no trunk row: this request decodes without drafts from here on
             } else {
-                mtp_.h.insert(mtp_.h.end(), hidden.begin(), hidden.end());
-                if (mtp_.tok.size() >= 64 && !mtp_catch_up(*caches_[(size_t)mtp_slot_], 0))
+                pending.h.insert(pending.h.end(), hidden.begin(), hidden.end());
+                if (pending.tok.size() >= 64 &&
+                    !qwen4exp_mtp_catch_up(backend_, weights_, *caches_[(size_t)mtp_slot_], pending, 0))
                     return fail("qwen4exp MTP catch-up failed");
             }
         }

@@ -58,6 +58,14 @@ inline std::vector<int32_t> qwen4exp_mtp_vocab_ids(int n_vocab, int budget,
     return ids;
 }
 
+// The trunk pairs not yet in the draft layer's K/V: hidden row h[i] (the trunk's final HC residual at position
+// pos + i) and the token tok[i] that followed it. The next draft catches them up first.
+struct Qwen4ExpMtpPending {
+    std::vector<int32_t> tok;
+    std::vector<float> h;
+    int pos = 0;
+};
+
 struct Qwen4ExpMtpAcceptance {
     int n_accepted = 0;
     int n_emitted = 0;

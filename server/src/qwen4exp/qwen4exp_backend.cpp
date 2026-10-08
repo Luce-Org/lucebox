@@ -442,18 +442,17 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     int pos = restored;
 
     // MTP speculation (sidecar loaded, default graph, a budget that leaves room for a draft): the draft head
-    // predicts x_{p+2} from the pair (h_p, x_{p+1}), h_p being the trunk's final HC residual at p. Pairs at positions
-    // [mtp_pos, ...) not yet run through the draft layer: mtp_h holds their hidden rows, mtp_tok the tokens known so
-    // far (a pair's token arrives with the next forward).
+    // predicts x_{p+2} from the pair (h_p, x_{p+1}), h_p being the trunk's final HC residual at p. The pairs not yet
+    // run through the draft layer are pending (a pair's token arrives with the next forward).
     const bool mtp = qwen4exp_verify_supported(cache_);
     const bool spec = !req.force_ar_decode && req.n_gen > 2 && mtp;
     const size_t hd = (size_t) weights_.n_embd * weights_.n_hc;
-    std::vector<float> hidden, mtp_h, mtp_logits;
-    std::vector<int32_t> mtp_tok;
-    int mtp_pos = std::max(0, pos - 1);
+    std::vector<float> hidden;
+    Qwen4ExpMtpPending mtp_pending;
+    mtp_pending.pos = std::max(0, pos - 1);
     if (mtp && pos > 0) {
-        mtp_h.resize(hd);
-        ggml_backend_tensor_get(cache_.mtp_prev_hidden, mtp_h.data(), 0, hd * sizeof(float));
+        mtp_pending.h.resize(hd);
+        ggml_backend_tensor_get(cache_.mtp_prev_hidden, mtp_pending.h.data(), 0, hd * sizeof(float));
     }
 
     // Each restore point starts a chunk in both cold and resumed requests.
@@ -501,20 +500,16 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
             return result;
         }
         if (mtp_prefill) {
-            mtp_h.swap(hidden);
-            mtp_pos = pos + n - 1;
+            mtp_pending.h.swap(hidden);
+            mtp_pending.pos = pos + n - 1;
         } else if (mtp) {   // single-row chunk: retain the original catch-up path
-            mtp_tok.assign(req.prompt.begin() + pos + (pos == 0 ? 1 : 0), req.prompt.begin() + pos + n);
-            mtp_h.insert(mtp_h.end(), hidden.begin(), hidden.end());
-            const int n_pairs = (int) mtp_tok.size();
-            if (n_pairs > 0 && !qwen4exp_mtp_forward(backend_, weights_, cache_, mtp_tok.data(), mtp_h.data(),
-                                                     n_pairs, mtp_pos, mtp_logits, nullptr, /*kv_only=*/true)) {
+            mtp_pending.tok.assign(req.prompt.begin() + pos + (pos == 0 ? 1 : 0), req.prompt.begin() + pos + n);
+            mtp_pending.h.insert(mtp_pending.h.end(), hidden.begin(), hidden.end());
+            if (!qwen4exp_mtp_catch_up(backend_, weights_, cache_, mtp_pending, 0)) {
                 result.fail(GenerateErrorCode::PrefillFailed, "qwen4exp MTP catch-up failed");
                 return result;
             }
-            mtp_h.erase(mtp_h.begin(), mtp_h.begin() + (std::ptrdiff_t) ((size_t) n_pairs * hd));
-            mtp_pos += n_pairs;
-            ggml_backend_tensor_set(cache_.mtp_prev_hidden, mtp_h.data(), 0, hd * sizeof(float));
+            ggml_backend_tensor_set(cache_.mtp_prev_hidden, mtp_pending.h.data(), 0, hd * sizeof(float));
             cache_.mtp_prev_pos = pos;
         }
         pos += n;
@@ -555,8 +550,6 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         return tok != weights_.eos_id && tok != weights_.eos_chat_id && (int) result.tokens.size() < req.n_gen;
     };
 
-    // Sample trunk rows lazily, updating history and applying the budget hook
-    // exactly once per emitted token. No RNG draws for unvisited verify rows.
     long long drafts = 0, accepted = 0, steps = 0;
     std::array<long long, QWEN4EXP_MTP_MAX_VERIFY> width_steps{};
     const int decode_ctx = pos;
@@ -577,7 +570,6 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         for (const auto & ws : cache_.mtp_rank_workspace) n += ws.*count;
         return n;
     };
-    auto built = [&] { return verify_graphs(&Qwen4ExpDecodeWorkspace::builds) + draft_graphs(&Qwen4ExpDecodeWorkspace::builds); };
     const uint64_t builds0 = verify_graphs(&Qwen4ExpDecodeWorkspace::builds);
     const uint64_t replays0 = verify_graphs(&Qwen4ExpDecodeWorkspace::replays);
     const uint64_t draft_builds0 = draft_graphs(&Qwen4ExpDecodeWorkspace::builds);
@@ -585,73 +577,37 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     const auto t_dec0 = std::chrono::steady_clock::now();
     int32_t next = sample(logits.data());
     bool more = req.n_gen > 0 && commit(next);
-    if (mtp) mtp_tok.assign(1, next);
-    std::vector<int32_t> draft_tokens;
+    if (mtp) mtp_pending.tok.assign(1, next);
+    // Each trunk row sampled (lazily, in qwen4exp_mtp_step) updates history and applies the budget hook exactly
+    // once per emitted token. No RNG draws for unvisited verify rows.
+    auto sample_row = [&](int32_t fed, const float * row, int32_t & tok) {
+        history.push_back(fed);
+        tok = sample(row);
+        return commit(tok);
+    };
+    auto on_drafts = [&](std::vector<int32_t> & draft_tokens) {
+        if (decode_check_) decode_check_(true, draft_tokens, mtp_pending.h);
+    };
     while (more) {
-        const int width = adaptive ? mtp_width_.next_width_cost_aware({}, cache_.mtp_draft + 1)
-                                   : cache_.mtp_draft + 1;
-        const int k = spec ? std::max(0, std::min({width - 1,
-            req.n_gen - (int) result.tokens.size() - 1, cache_.max_ctx - pos - 1})) : 0;
-        const bool verify = k > 0;
-        const auto step_start = verify ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const uint64_t step_builds = verify ? built() : 0;
-        if (verify) {
-            const auto td0 = std::chrono::steady_clock::now();
-            if (!qwen4exp_mtp_draft(backend_, weights_, cache_, mtp_tok.data(), mtp_h.data(), (int) mtp_tok.size(),
-                                    mtp_pos, k, draft_tokens)) {
-                result.fail(GenerateErrorCode::DecodeFailed, "qwen4exp MTP draft failed");
-                return result;
-            }
-            draft_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - td0).count();
-            if (decode_check_) decode_check_(true, draft_tokens, mtp_h);
-        }
-        std::array<int32_t, QWEN4EXP_MTP_MAX_VERIFY> in{}, samples{};
-        in[0] = next;
-        if (verify) std::copy(draft_tokens.begin(), draft_tokens.end(), in.begin() + 1);
-        const Qwen4ExpForwardResult r = qwen4exp_forward(
-            backend_, weights_, cache_, in.data(), k + 1, pos, logits, mtp ? &hidden : nullptr, verify);
-        if (!r.ok) {
-            result.fail(GenerateErrorCode::DecodeFailed, "qwen4exp decode forward failed");
+        const int max_k = spec ? std::min(req.n_gen - (int) result.tokens.size() - 1, cache_.max_ctx - pos - 1) : 0;
+        Qwen4ExpMtpStep step;
+        if (!qwen4exp_mtp_step(backend_, weights_, cache_, pos, next, max_k, adaptive ? &mtp_width_ : nullptr,
+                               mtp ? &mtp_pending : nullptr, sample_row, logits, step, on_drafts)) {
+            result.fail(GenerateErrorCode::DecodeFailed, step.error);
             return result;
         }
+        more = step.more;
         ++steps;
-        ++width_steps[k];
-        drafts += k;
-        Qwen4ExpMtpAcceptance decision;
-        for (int i = 0; i <= k; ++i) {
-            history.push_back(in[i]);
-            int32_t tok = sample(logits.data() + (size_t) i * weights_.n_vocab);
-            more = commit(tok);
-            samples[i] = tok;
-            decision = qwen4exp_mtp_accept(draft_tokens.data(), k, samples.data(), i + 1);
-            if (!more || decision.n_accepted != i + 1) break;
-        }
-        const int retained = decision.n_emitted;
-        next = decision.emitted[retained - 1];
-        accepted += decision.n_accepted;
-        if (verify) {
-            // Replace every predicted MTP hidden/KV row with the corresponding
-            // trunk pair on next catch-up, including after a partial accept.
-            mtp_h.assign(hidden.begin(), hidden.begin() + (std::ptrdiff_t) ((size_t) retained * hd));
-            mtp_tok.assign(decision.emitted.begin(), decision.emitted.begin() + retained);
-            mtp_pos = pos;
-            if (!qwen4exp_verify_rollback(backend_, weights_, cache_, pos, retained)) {
-                result.fail(GenerateErrorCode::DecodeFailed, "qwen4exp verify rollback failed");
-                return result;
-            }
-        } else if (mtp) {
-            mtp_h.insert(mtp_h.end(), hidden.begin(), hidden.end());
-            mtp_tok.push_back(next);
-        }
+        ++width_steps[step.k];
+        drafts += step.k;
+        accepted += step.decision.n_accepted;
+        draft_s += step.draft_s;
+        const int retained = step.decision.n_emitted;
+        next = step.decision.emitted[retained - 1];
         logits_.assign(logits.begin() + (size_t) (retained - 1) * weights_.n_vocab,
                        logits.begin() + (size_t) retained * weights_.n_vocab);
         pos += retained;
-        if (decode_check_) decode_check_(false, mtp_tok, logits_);
-        // Only a step that replayed its verify and draft graphs times the width; one
-        // that built a graph is slower and counts for acceptance alone.
-        if (verify && adaptive) mtp_width_.observe(decision.n_accepted + 1, k + 1,
-            built() != step_builds ? -1.0f :
-            (float) std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - step_start).count());
+        if (decode_check_) decode_check_(false, mtp_pending.tok, logits_);
     }
     if (adaptive) mtp_costs_.store(mtp_width_, decode_ctx);
     if (cancelled) {
@@ -665,17 +621,9 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     // and snapshots: if it fails, the text stands, and the MTP state is marked
     // incomplete so no snapshot of this sequence is published.
     if (mtp) {
-        const int pairs = (int) mtp_tok.size() - 1;
-        bool caught_up = true;
-        for (int done = 0; caught_up && done < pairs;) {
-            const int n = std::min(pairs - done, std::max(1, chunk));
-            caught_up = qwen4exp_mtp_forward(backend_, weights_, cache_, mtp_tok.data() + done,
-                                             mtp_h.data() + (size_t) done * hd, n, mtp_pos + done,
-                                             mtp_logits, nullptr, true);
-            done += n;
-        }
-        if (caught_up) {
-            ggml_backend_tensor_set(cache_.mtp_prev_hidden, mtp_h.data() + (size_t) pairs * hd, 0, hd * sizeof(float));
+        const int pairs = (int) mtp_pending.tok.size() - 1;
+        if (qwen4exp_mtp_catch_up(backend_, weights_, cache_, mtp_pending, 1, chunk)) {
+            ggml_backend_tensor_set(cache_.mtp_prev_hidden, mtp_pending.h.data(), 0, hd * sizeof(float));
             cache_.mtp_prev_pos = pos - 1;
         } else {
             std::fprintf(stderr, "[qwen4exp-mtp] checkpoint catch-up of %d pairs failed; this sequence keeps "

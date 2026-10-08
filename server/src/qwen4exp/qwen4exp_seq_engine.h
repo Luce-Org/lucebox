@@ -81,9 +81,7 @@ private:
     // `tok`: the scheduler's pending token completes the last pair.
     struct MtpState {
         bool live = false;
-        std::vector<float> h;
-        std::vector<int32_t> tok;
-        int pos = 0;
+        Qwen4ExpMtpPending pending;   // excludes the token the scheduler feeds next
         int context = 0;   // the prompt length: the width controller's context range
         long long drafts = 0, accepted = 0, steps = 0, tokens = 0;
         double decode_s = 0.0, draft_s = 0.0, verify_s = 0.0;
@@ -91,7 +89,6 @@ private:
     };
     bool mtp_prefill(Qwen4ExpCache & cache, const int32_t * tokens, int n, int pos0,
                      std::vector<float> & logits);
-    bool mtp_catch_up(Qwen4ExpCache & cache, size_t keep);
     bool mtp_eligible(const StepPlan & plan) const;
     StepResult mtp_step(const StepInput & input);
 
