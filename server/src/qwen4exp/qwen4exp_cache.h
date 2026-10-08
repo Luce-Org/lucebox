@@ -215,6 +215,7 @@ struct Qwen4ExpSnapshot {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
     std::vector<std::pair<ggml_tensor *, ggml_tensor *>> strips;
+    bool mtp = false;   // the source cache has the MTP draft layer: its strips close `strips`
     int cur_pos = 0, indexer_blocks = 0, mtp_prev_pos = -1;
     int64_t kv_bucket_base = 0;
     std::vector<int32_t> ple_prev, tokens;
@@ -224,8 +225,11 @@ struct Qwen4ExpSnapshot {
 size_t qwen4exp_snapshot_bytes(ggml_backend_t backend, const Qwen4ExpCache & c, int tokens,
                              size_t * host_bytes = nullptr);
 bool save_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpCache & c, Qwen4ExpSnapshot & s);
-// Restore into `c`, the cache `s` was saved from or another one with the same layout (a
-// concurrency slot resuming another slot's checkpoint). False, with `c` untouched, otherwise.
+// Restore into `c`, the cache `s` was saved from or another one with the same trunk layout (a
+// concurrency slot resuming another slot's checkpoint). The MTP draft layer's state comes along
+// when both caches have the layer; a cache that has it, restored from a snapshot without it, keeps
+// no draft state (mtp_prev_pos -1), so its request decodes without drafts. False, with `c`
+// untouched, when the layouts differ otherwise.
 bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c);
 void free_qwen4exp_snapshot(Qwen4ExpSnapshot & s);
 

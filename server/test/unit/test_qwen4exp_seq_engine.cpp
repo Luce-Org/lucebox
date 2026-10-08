@@ -348,13 +348,17 @@ static std::vector<int32_t> drive_slot(Qwen4ExpSeqEngine & engine, int slot, int
         plan.decode.push_back({slot, out.back()});
         const auto result = engine.step(plan);
         if (!result.ok() || result.decode.size() != 1) return {};
-        out.push_back(result.decode[0].token);
+        const auto & decoded = result.decode[0];   // an MTP slot alone also returns its accepted drafts
+        out.insert(out.end(), decoded.committed_tokens.begin(), decoded.committed_tokens.end());
+        out.push_back(decoded.token);
     }
+    if ((int) out.size() > steps + 1) out.resize((size_t) steps + 1);
     return out;
 }
 
 // A checkpoint captured by one slot restores into another and continues
-// token for token like the cold run that captured it.
+// token for token like the cold run that captured it, both ways between the
+// MTP slot (0, with the draft layer) and a slot without it.
 static bool run_prefix_store(Qwen4ExpSeqEngine & engine, const Qwen4ExpWeights & w) {
     constexpr int L = 3000, C = 2000, STEPS = 24;
     if (!engine.supports_prefix_store() || engine.estimate_prefix_store_bytes(C) == 0) return false;
@@ -403,10 +407,33 @@ static bool run_prefix_store(Qwen4ExpSeqEngine & engine, const Qwen4ExpWeights &
     engine.retire(stale.slot);
     engine.discard_prefix_store({1, C});
 
+    // And back: a slot without the draft layer captures, slot 0 restores and decodes without drafts.
+    const auto holder = engine.admit(904, filler, SamplerCfg{});
+    PrefixStorePlan plain_capture;
+    plain_capture.capture = {2, {2, C}};
+    const auto plain = engine.admit_with_prefix(905, prompt, SamplerCfg{}, plain_capture);
+    std::vector<SeqEngine::PrefillOutput> plain_prefills;
+    const std::vector<int32_t> plain_tokens = drive_slot(engine, plain.slot, STEPS, &plain_prefills);
+    bool plain_saved = false;
+    for (const auto & p : plain_prefills)
+        plain_saved = plain_saved || (p.prefix_store.status == PrefixStoreEvent::Status::saved &&
+                                      p.prefix_store.ticket == plain_capture.capture);
+    engine.retire(plain.slot);
+    engine.retire(holder.slot);
+    PrefixStorePlan back_plan;
+    back_plan.restore = {2, C};
+    const auto back = engine.admit_with_prefix(906, prompt, SamplerCfg{}, back_plan);
+    const bool back_restored = back.status == SeqEngine::AdmitResult::Status::admitted &&
+        back.prefix_store.restored == back_plan.restore && back.slot == holder.slot && plain.slot != holder.slot;
+    const std::vector<int32_t> back_tokens = back_restored ? drive_slot(engine, back.slot, STEPS) : std::vector<int32_t>{};
+    engine.retire(back.slot);
+    engine.discard_prefix_store({2, C});
+
     const bool same = hit_tokens == cold_tokens;
-    std::fprintf(stderr, "[prefix-store] cross_slot=%d identical=%d stale_rejected=%d\n",
-                 (int) cross_slot, (int) same, (int) rejected);
-    return cross_slot && same && rejected;
+    const bool back_same = plain_saved && back_restored && plain_tokens == cold_tokens && back_tokens == cold_tokens;
+    std::fprintf(stderr, "[prefix-store] cross_slot=%d identical=%d stale_rejected=%d back_to_slot0=%d\n",
+                 (int) cross_slot, (int) same, (int) rejected, (int) back_same);
+    return cross_slot && same && rejected && back_same;
 }
 
 // With the plan's restore points, a cold prompt's text is the same whether
@@ -522,12 +549,23 @@ int main(int argc, char ** argv) {
                     violations.empty() ? "PASS" : "FAIL", soak_ok ? "PASS" : "FAIL");
     }
     {
-        Qwen4ExpSeqEngine engine(backend, weights, ptrs, ctx, 512, size_t(8) << 30);
-        const bool prefix_ok = run_prefix_store(engine, weights);
-        std::printf("[qwen4exp-seq] prefix-store=%s\n", prefix_ok ? "PASS" : "FAIL");
-        const bool cuts_ok = run_prefix_cuts(engine, weights);
-        std::printf("[qwen4exp-seq] prefix-cuts=%s\n", cuts_ok ? "PASS" : "FAIL");
-        ok = ok && prefix_ok && cuts_ok;
+        // Slot 0 as the server makes it: the MTP draft layer and its verify state, drafting when alone.
+        Qwen4ExpCache mtp_cache;
+        const bool mtp_ok = create_qwen4exp_cache(backend, weights, ctx, mtp_cache, /*mtp=*/true, QWEN4EXP_MTP_MAX_DRAFT);
+        if (mtp_ok) {
+            std::vector<Qwen4ExpCache *> served = ptrs;
+            served[0] = &mtp_cache;
+            Qwen4ExpSeqEngine engine(backend, weights, served, ctx, 512, size_t(8) << 30, /*verify_width=*/0);
+            const bool prefix_ok = run_prefix_store(engine, weights);
+            std::printf("[qwen4exp-seq] prefix-store=%s\n", prefix_ok ? "PASS" : "FAIL");
+            const bool cuts_ok = run_prefix_cuts(engine, weights);
+            std::printf("[qwen4exp-seq] prefix-cuts=%s\n", cuts_ok ? "PASS" : "FAIL");
+            ok = ok && prefix_ok && cuts_ok;
+        } else {
+            std::fprintf(stderr, "[qwen4exp-seq] MTP cache creation failed\n");
+            ok = false;
+        }
+        free_qwen4exp_cache(mtp_cache);
     }
     {
         Qwen4ExpSeqEngine engine(backend, weights, ptrs, ctx);
