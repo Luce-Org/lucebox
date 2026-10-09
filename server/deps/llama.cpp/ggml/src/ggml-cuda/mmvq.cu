@@ -2884,7 +2884,9 @@ static void mul_mat_vec_q8_0_rdna4_launch_nc(
 #undef Q8_RDNA4_LAUNCH
 }
 
-// vx_gate set: the gate/up pair (vx is the up matrix), 2..8 columns, no column range.
+// vx_gate set: the gate/up pair (vx is the up matrix), 1..8 columns, no column range.
+// One column is a single-token decode, fused by the generic gate/GLU fusion: it
+// takes the same kernel as a verify's columns, so the two stay batch-invariant.
 static void mul_mat_vec_q8_0_rdna4_launch(
         const void * vx, const void * vy, float * dst, const int ncols_dst,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y,
@@ -2900,6 +2902,7 @@ static void mul_mat_vec_q8_0_rdna4_launch(
         stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio, \
         stride_sample_x, stride_sample_y, stride_sample_dst, stream); break
         switch (ncols_dst) {
+            Q8_RDNA4_GLU_NC(1);
             Q8_RDNA4_GLU_NC(2);
             Q8_RDNA4_GLU_NC(3);
             Q8_RDNA4_GLU_NC(4);

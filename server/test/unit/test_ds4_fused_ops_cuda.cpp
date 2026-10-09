@@ -478,7 +478,8 @@ bool run_glu_q8(ggml_backend_t backend, int n_ff, int n_used, int tokens, uint32
 // The cluster shared expert's gate/up pair: Q8_0 row slices of wider weights
 // at several columns (batch-invariant MMVQ), fused with SwiGLU-DS4 into one
 // RDNA4 launch (ggml_cuda_mmvq_rdna4_glu_pair) vs the same products kept
-// apart (a copy between each product and the GLU breaks the pattern).
+// apart (a copy between each product and the GLU breaks the pattern). One
+// column is a single-token decode step, which the generic fusion forms.
 bool run_glu_pair(ggml_backend_t backend, int n_in, int n_full, int n_ff, int ff_begin, int ncols, uint32_t seed) {
     ggml_init_params params{};
     params.mem_size = ggml_tensor_overhead() * 48 + ggml_graph_overhead();
@@ -925,7 +926,8 @@ int main() {
     {
         // Verify-shaped products: batch-invariant MMVQ, as the DS4 verify runs them.
         const bool prev = ggml_backend_cuda_set_mmvq_batch_invariant(true);
-        const int pair_cases[][5] = {{1024, 64, 32, 0, 5}, {1024, 64, 32, 32, 4}, {5120, 96, 48, 48, 2}, {1024, 64, 32, 32, 8}};
+        const int pair_cases[][5] = {{1024, 64, 32, 0, 5}, {1024, 64, 32, 32, 4}, {5120, 96, 48, 48, 2}, {1024, 64, 32, 32, 8},
+                                     {1024, 64, 32, 32, 1}};
         for (const auto & pc : pair_cases) {
             if (!run_glu_pair(backend, pc[0], pc[1], pc[2], pc[3], pc[4], seed++)) ++failures;
         }
