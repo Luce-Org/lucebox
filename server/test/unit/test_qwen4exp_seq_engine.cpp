@@ -6,6 +6,7 @@
 #include "common/concurrency/seq_engine.h"
 #include "seq_engine_contract.h"
 #include "common/sampler.h"
+#include "common/snapshot_backend.h"
 #include "server/tokenizer.h"
 #include "ggml-cuda.h"
 #include "qwen4exp_test_state.h"
@@ -555,12 +556,20 @@ int main(int argc, char ** argv) {
         if (mtp_ok) {
             std::vector<Qwen4ExpCache *> served = ptrs;
             served[0] = &mtp_cache;
-            Qwen4ExpSeqEngine engine(backend, weights, served, ctx, 512, size_t(8) << 30, /*verify_width=*/0);
-            const bool prefix_ok = run_prefix_store(engine, weights);
-            std::printf("[qwen4exp-seq] prefix-store=%s\n", prefix_ok ? "PASS" : "FAIL");
-            const bool cuts_ok = run_prefix_cuts(engine, weights);
-            std::printf("[qwen4exp-seq] prefix-cuts=%s\n", cuts_ok ? "PASS" : "FAIL");
-            ok = ok && prefix_ok && cuts_ok;
+            // Checkpoints in the device's memory, and in system memory as beside a discrete GPU.
+            const ggml_backend_t system = create_snapshot_backend(backend);
+            for (ggml_backend_t store : {backend, system}) {
+                Qwen4ExpSeqEngine engine(backend, weights, served, ctx, 512, size_t(8) << 30, /*verify_width=*/0,
+                                         nullptr, nullptr, store);
+                const char * memory = store == backend ? "device" : "system";
+                const bool prefix_ok = run_prefix_store(engine, weights);
+                std::printf("[qwen4exp-seq] prefix-store(%s)=%s\n", memory, prefix_ok ? "PASS" : "FAIL");
+                const bool cuts_ok = run_prefix_cuts(engine, weights);
+                std::printf("[qwen4exp-seq] prefix-cuts(%s)=%s\n", memory, cuts_ok ? "PASS" : "FAIL");
+                ok = ok && prefix_ok && cuts_ok;
+                if (system == backend) break;
+            }
+            free_snapshot_backend(system, backend);
         } else {
             std::fprintf(stderr, "[qwen4exp-seq] MTP cache creation failed\n");
             ok = false;

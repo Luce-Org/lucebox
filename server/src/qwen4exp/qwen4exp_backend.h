@@ -94,7 +94,8 @@ private:
     // unpark share it, so an unpark sizes itself for the memory free at that time. release_target() undoes it.
     bool load_target();
     void release_target();
-    size_t snapshot_budget_ = SIZE_MAX; // auto chunk reserves and enforces this allowance
+    ggml_backend_t snap_backend_ = nullptr; // prefix snapshot storage: the target, or system memory (see init)
+    size_t snapshot_budget_ = SIZE_MAX; // with snapshots on the target, auto chunk reserves and enforces this allowance
     std::array<Qwen4ExpSnapshot, kMaxSlots> snapshots_;
     int live_slot_ = -1;
     std::vector<int32_t> tokens_;

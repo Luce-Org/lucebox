@@ -31,8 +31,9 @@ Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
         ggml_backend_t backend, const Qwen4ExpWeights & weights,
         std::vector<Qwen4ExpCache *> caches, int max_ctx, int prefill_granule,
         size_t prefix_allowance, int verify_width, AdaptiveSpecWidth * mtp_width,
-        SpecWidthCostMemory * mtp_costs)
-    : backend_(backend), weights_(weights), caches_(std::move(caches)),
+        SpecWidthCostMemory * mtp_costs, ggml_backend_t snapshot_store)
+    : backend_(backend), store_(snapshot_store ? snapshot_store : backend), weights_(weights),
+      caches_(std::move(caches)),
       pool_(pool_blocks(max_ctx, caches_.size()),
             (uint32_t)caches_.size(), 256),
       slots_(pool_, max_ctx),
@@ -108,9 +109,9 @@ SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_cold(
 size_t Qwen4ExpSeqEngine::estimate_prefix_store_bytes(int tokens) const {
     if (caches_.empty() || !caches_[0] || tokens <= 0) return 0;
     size_t host = 0;
-    const size_t device = qwen4exp_snapshot_bytes(backend_, *caches_[0], tokens, &host);
-    if (!device) return 0;
-    return device + host + (size_t(tokens) + std::max(0, weights_.ple_ngram_size - 1)) * sizeof(int32_t);
+    const size_t copies = qwen4exp_snapshot_bytes(store_, *caches_[0], tokens, &host);
+    if (!copies) return 0;
+    return copies + host + (size_t(tokens) + std::max(0, weights_.ple_ngram_size - 1)) * sizeof(int32_t);
 }
 
 int Qwen4ExpSeqEngine::checkpoint_index(PrefixStoreRef checkpoint) const {
@@ -321,7 +322,7 @@ PrefixStoreEvent Qwen4ExpSeqEngine::capture_prefix(int slot, PrefixCaptureTicket
         return event;
     }
     Qwen4ExpSnapshot & s = checkpoints_[(size_t)index];
-    if (!save_qwen4exp_snapshot(backend_, *caches_[(size_t)slot], s)) {
+    if (!save_qwen4exp_snapshot(backend_, store_, *caches_[(size_t)slot], s)) {
         free_qwen4exp_snapshot(s);
         event.elapsed_us = elapsed_us();
         event.error = "qwen4exp prefix capture failed";

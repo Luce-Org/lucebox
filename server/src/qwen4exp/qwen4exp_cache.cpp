@@ -352,11 +352,11 @@ void snapshot_strips(const Qwen4ExpCache & c, int pos, int blocks, bool mtp, F v
 }
 } // namespace
 
-size_t qwen4exp_snapshot_bytes(ggml_backend_t backend, const Qwen4ExpCache & c, int tokens, size_t * host_bytes) {
+size_t qwen4exp_snapshot_bytes(ggml_backend_t store, const Qwen4ExpCache & c, int tokens, size_t * host_bytes) {
     if (host_bytes) *host_bytes = 0;
     const int pos = std::clamp(tokens, 0, c.max_ctx);
     if (!pos) return 0;
-    const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_get_default_buffer_type(backend));
+    const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_get_default_buffer_type(store));
     size_t bytes = 0, count = 0;
     // The supported QSA layout pools four rows per block. Dense prefill can
     // have fewer valid blocks; this bound also covers its later completion.
@@ -375,7 +375,8 @@ void free_qwen4exp_snapshot(Qwen4ExpSnapshot & s) {
     s = {};
 }
 
-bool save_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpCache & c, Qwen4ExpSnapshot & s) {
+bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const Qwen4ExpCache & c,
+                            Qwen4ExpSnapshot & s) {
     free_qwen4exp_snapshot(s);
     if (c.cur_pos <= 0 || (c.mtp_k && c.mtp_prev_pos != c.cur_pos - 1)) return false;
     size_t count = 0;
@@ -389,9 +390,9 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpCache & c, Qwe
         auto * copy = ggml_new_tensor_1d(s.ctx, t->type, n);
         s.strips.emplace_back(live, copy);
     });
-    s.buf = ggml_backend_alloc_ctx_tensors(s.ctx, backend);
+    s.buf = ggml_backend_alloc_ctx_tensors(s.ctx, store);
     if (!s.buf) { free_qwen4exp_snapshot(s); return false; }
-    for (auto [live, copy] : s.strips) ggml_backend_tensor_copy_async(backend, backend, live, copy);
+    for (auto [live, copy] : s.strips) ggml_backend_tensor_copy_async(backend, store, live, copy);
     ggml_backend_synchronize(backend);
     s.cur_pos = c.cur_pos;
     s.indexer_blocks = c.indexer_blocks;

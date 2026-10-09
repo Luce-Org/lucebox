@@ -23,11 +23,11 @@ namespace luce::common {
 // other slots decode, a step runs one granule in total, so a long prompt never
 // holds the live streams for more than one.
 //
-// Prefix checkpoints are prefix-sized device copies of a slot cache
-// (qwen4exp snapshots, the same payload the single-slot path keeps),
-// restorable into any slot of the same layout. The scheduler owns their
-// identities (1..kPrefixCheckpoints) and LRU policy; the engine enforces the
-// backend's byte allowance on capture.
+// Prefix checkpoints are prefix-sized copies of a slot cache (qwen4exp
+// snapshots, the same payload the single-slot path keeps) on `snapshot_store`,
+// the device or system memory, restorable into any slot of the same layout.
+// The scheduler owns their identities (1..kPrefixCheckpoints) and LRU policy;
+// the engine enforces the backend's byte allowance on capture.
 //
 // The first slot's cache carries the MTP draft layer and verify rollback state
 // (one set: its rollback buffers are close to 1 GiB). Admission takes the lowest
@@ -49,7 +49,7 @@ public:
                       std::vector<Qwen4ExpCache *> caches, int max_ctx,
                       int prefill_granule = 512, size_t prefix_allowance = 0,
                       int verify_width = 1, AdaptiveSpecWidth * mtp_width = nullptr,
-                      SpecWidthCostMemory * mtp_costs = nullptr);
+                      SpecWidthCostMemory * mtp_costs = nullptr, ggml_backend_t snapshot_store = nullptr);
     ~Qwen4ExpSeqEngine() override;
 
     int slot_count() const override { return slots_.slot_count(); }
@@ -93,6 +93,7 @@ private:
     StepResult mtp_step(const StepInput & input);
 
     ggml_backend_t backend_;
+    ggml_backend_t store_;   // checkpoint memory: snapshot_store, else the backend
     const Qwen4ExpWeights & weights_;
     std::vector<Qwen4ExpCache *> caches_;
     PagedKvPool pool_;

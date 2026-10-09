@@ -2,6 +2,7 @@
 #include "qwen4exp/qwen4exp_backend.h"
 #include "qwen4exp/qwen4exp_chunk.h"
 #include "qwen4exp/qwen4exp_graph.h"
+#include "common/snapshot_backend.h"
 #include "server/tokenizer.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
@@ -144,7 +145,7 @@ struct Qwen4ExpPrefixTest {
 
     static void budget() {
         Qwen4ExpBackend b({});
-        b.backend_ = ggml_backend_cpu_init();
+        b.backend_ = b.snap_backend_ = ggml_backend_cpu_init();
         CHECK(b.backend_);
         auto & c = b.cache_;
         c.ctx = ggml_init({8 * ggml_tensor_overhead(), nullptr, true});
@@ -199,8 +200,9 @@ static bool same_tokens(const GenerateResult & warm, const GenerateResult & cold
     return warm.ok() && cold.ok() && warm.tokens == cold.tokens;
 }
 
-static void copies(ggml_backend_t backend) {
-    CHECK(backend);
+// `store`: the backend's own memory, or system memory beside a GPU.
+static void copies(ggml_backend_t backend, ggml_backend_t store) {
+    CHECK(backend && store);
     Qwen4ExpCache c;
     c.max_ctx = 63; // packed KV has a padded fourth key beyond the logical limit
     c.ctx = ggml_init({64 * ggml_tensor_overhead(), nullptr, true});
@@ -225,9 +227,10 @@ static void copies(ggml_backend_t backend) {
         }
         c.cur_pos = pos; c.indexer_blocks = pos / 4;
         c.mtp_prev_pos = pos - 1; c.kv_bucket_base = 512; c.ple_prev = {11, 12};
-        CHECK(save_qwen4exp_snapshot(backend, c, s));
+        CHECK(save_qwen4exp_snapshot(backend, store, c, s));
+        CHECK(ggml_backend_buffer_get_type(s.buf) == ggml_backend_get_default_buffer_type(store));
         size_t host = 0;
-        CHECK(ggml_backend_buffer_get_size(s.buf) <= qwen4exp_snapshot_bytes(backend, c, pos, &host));
+        CHECK(ggml_backend_buffer_get_size(s.buf) <= qwen4exp_snapshot_bytes(store, c, pos, &host));
         CHECK(host >= ggml_get_mem_size(s.ctx) + s.strips.capacity() * sizeof(s.strips[0]));
         for (auto [live, copy] : s.strips) CHECK(bytes(live) == bytes(copy));
         // All states, including QSA raw incomplete blocks and MTP carry, must
@@ -251,10 +254,11 @@ static void copies(ggml_backend_t backend) {
         }
     }
     --c.mtp_prev_pos;
-    CHECK(!save_qwen4exp_snapshot(backend, c, s)); // incomplete MTP is not publishable
+    CHECK(!save_qwen4exp_snapshot(backend, store, c, s)); // incomplete MTP is not publishable
     free_qwen4exp_snapshot(s); free_qwen4exp_snapshot(s);
     free_qwen4exp_cache(c);
-    std::puts("PASS prefix snapshot bytes, metadata, overwrite/reset, MTP validity");
+    std::printf("PASS prefix snapshot bytes, metadata, overwrite/reset, MTP validity (%s memory)\n",
+                store == backend ? "device" : "system");
 }
 
 static void memory(ggml_backend_t backend) {
@@ -494,7 +498,10 @@ int main(int argc, char ** argv) {
     Qwen4ExpPrefixTest::budget();
     auto backend = argc > 1 ? ggml_backend_cuda_init(0) : ggml_backend_cpu_init();
     CHECK(backend);
-    copies(backend);
+    copies(backend, backend);
+    const ggml_backend_t store = create_snapshot_backend(backend);
+    if (store != backend) copies(backend, store);
+    free_snapshot_backend(store, backend);
     memory(backend);
     ggml_backend_free(backend);
     // test_qwen4exp_prefix_cache MODEL [width] [chunk] [ctx] [expert_gpu] [placement.csv]

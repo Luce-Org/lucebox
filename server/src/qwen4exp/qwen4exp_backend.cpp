@@ -4,6 +4,7 @@
 
 #include "common/peer_access.h"
 #include "common/sampler.h"
+#include "common/snapshot_backend.h"
 
 #include "ggml-cuda.h"
 
@@ -264,6 +265,10 @@ bool Qwen4ExpBackend::init() {
                      cfg_.device.gpu);
         return false;
     }
+    // Prefix snapshots stay in the gfx1151 iGPU's memory, which is the system's. Beside a GPU with its own memory
+    // they go to system memory (create_snapshot_backend), which leaves that memory to the KV caches.
+    snap_backend_ = ggml_backend_cuda_qwen4exp_supported(backend_) ? backend_ : create_snapshot_backend(backend_);
+    if (!snap_backend_) return false;
     if (!cfg_.expert_placement_path.empty() && !cfg_.expert_device) {
         std::fprintf(stderr, "[qwen4exp] --expert-placement needs --expert-device\n");
         return false;
@@ -305,23 +310,31 @@ bool Qwen4ExpBackend::load_target() {
                                    cfg_.max_concurrency > 1 ? std::string() : cfg_.expert_placement_path,
                                    expert_budget_bytes_from_env(kQwen4ExpHotExpertBudget))) return false;
     snapshot_budget_ = SIZE_MAX;
+    // Snapshots in the target's memory get an allowance the planner sizes and captures respect. In system memory
+    // the server's resident limit bounds them.
+    auto allowance = [this](size_t snapshots) -> size_t * {
+        if (snap_backend_ != backend_) return nullptr;
+        snapshot_budget_ = snapshots * snapshot_bytes_estimate(cache_.max_ctx);
+        return &snapshot_budget_;
+    };
     const int explicit_chunk = weights_.expert_backend ? std::min(cfg_.chunk, kQwen4ExpSplitMaxChunk) : cfg_.chunk;
     if (cfg_.max_concurrency > 1) {
         // Prefix checkpoints: each slot's restore point and capture in flight
         // plus one shared head, the server's concurrent prefix budget. The
         // planner caps the prefill granule; an explicit --chunk sets it, and the
         // allowance is measured either way.
-        snapshot_budget_ = (2 * (size_t) cfg_.max_concurrency + 1) * snapshot_bytes_estimate(cache_.max_ctx);
-        const int fit = qwen4exp_select_chunk(backend_, weights_, cache_, cfg_.max_concurrency, 1, &snapshot_budget_);
+        const int fit = qwen4exp_select_chunk(backend_, weights_, cache_, cfg_.max_concurrency, 1,
+                                              allowance(2 * (size_t) cfg_.max_concurrency + 1));
         chunk_ = cfg_.chunk > 0 && fit > 0 ? explicit_chunk : fit;
-        std::fprintf(stderr, "[qwen4exp] prefix checkpoint allowance=%zu bytes\n", snapshot_budget_);
     } else if (cfg_.chunk > 0) {
         chunk_ = explicit_chunk;
     } else {
-        snapshot_budget_ = 3 * snapshot_bytes_estimate(cache_.max_ctx);
-        chunk_ = qwen4exp_select_chunk(backend_, weights_, cache_, 1, 1, &snapshot_budget_);
-        std::fprintf(stderr, "[qwen4exp] prefix snapshot allowance=%zu bytes\n", snapshot_budget_);
+        chunk_ = qwen4exp_select_chunk(backend_, weights_, cache_, 1, 1, allowance(3));
     }
+    if (snapshot_budget_ != SIZE_MAX)
+        std::fprintf(stderr, "[qwen4exp] prefix snapshot allowance=%zu bytes\n", snapshot_budget_);
+    else if (snap_backend_ != backend_)
+        std::fprintf(stderr, "[qwen4exp] prefix snapshots in system memory\n");
     if (chunk_ <= 0) {
         std::fprintf(stderr, "[qwen4exp] insufficient prefill memory at the configured context\n");
         return false;
@@ -366,7 +379,7 @@ bool Qwen4ExpBackend::start_seq_engine() {
     }
     seq_engine_ = std::make_unique<Qwen4ExpSeqEngine>(
         backend_, weights_, std::move(caches), cfg_.device.max_ctx, chunk_, snapshot_budget_,
-        cfg_.verify_width, &mtp_width_, &mtp_costs_);
+        cfg_.verify_width, &mtp_width_, &mtp_costs_, snap_backend_);
     std::fprintf(stderr,
         "[qwen4exp-seq] independent-slot engine enabled: %d full F16 caches, ctx=%d, chunk=%d\n",
         cfg_.max_concurrency, cfg_.device.max_ctx, chunk_);
@@ -701,10 +714,10 @@ bool Qwen4ExpBackend::snapshot_save_replacing(int slot, int source) {
     }
     if (!snapshot_fits(slot)) return false;
     auto & s = snapshots_[slot];
-    if (!save_qwen4exp_snapshot(backend_, cache_, s)) return false;
+    if (!save_qwen4exp_snapshot(backend_, snap_backend_, cache_, s)) return false;
     s.tokens = tokens_;
     s.logits = logits_;
-    std::fprintf(stderr, "[qwen4exp-snap] slot=%d pos=%d device_bytes=%zu\n",
+    std::fprintf(stderr, "[qwen4exp-snap] slot=%d pos=%d bytes=%zu\n",
                  slot, s.cur_pos, ggml_backend_buffer_get_size(s.buf));
     return true;
 }
@@ -742,12 +755,12 @@ int Qwen4ExpBackend::snapshot_cur_pos(int slot) const {
 }
 
 size_t Qwen4ExpBackend::snapshot_bytes_estimate(int tokens) const {
-    if (!backend_ || !cache_.buf) return 0;
+    if (!snap_backend_ || !cache_.buf) return 0;
     const int n = std::clamp(tokens, 0, cache_.max_ctx);
     if (!n) return 0;
     size_t host = 0;
-    const size_t device = qwen4exp_snapshot_bytes(backend_, cache_, n, &host);
-    return device + host + (size_t(n) + weights_.n_vocab +
+    const size_t copies = qwen4exp_snapshot_bytes(snap_backend_, cache_, n, &host);
+    return copies + host + (size_t(n) + weights_.n_vocab +
         std::max(0, weights_.ple_ngram_size - 1)) * sizeof(int32_t);
 }
 
@@ -803,6 +816,8 @@ void Qwen4ExpBackend::free_drafter() {}
 
 void Qwen4ExpBackend::shutdown() {
     if (backend_) release_target();
+    free_snapshot_backend(snap_backend_, backend_);
+    snap_backend_ = nullptr;
     if (weights_.expert_backend) {
         ggml_backend_free(weights_.expert_backend);
         weights_.expert_backend = nullptr;
