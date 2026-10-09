@@ -93,12 +93,14 @@ private:
     bool snapshot_fits(int slot, int replaced = -1) const;
     bool create_main_cache();
     int plan_chunk(Qwen4ExpChunkPlan * plan = nullptr);
+    int remote_layers_for(const Qwen4ExpChunkPlan & plan, size_t missing) const;
     bool start_seq_engine(); // no-op at --max-concurrency 1
     // Weights, caches, hot experts, the prefill chunk and the prefix allowance, then the slot engine: init and
     // unpark share it, so an unpark sizes itself for the memory free at that time. release_target() undoes it.
     bool load_target();
     void release_target();
     ggml_backend_t snap_backend_ = nullptr; // prefix snapshot storage: the target, or system memory (see init)
+    int remote_layers_ = 0;   // split mode: full-attention layers whose cache rows and attention run on the expert device
     size_t snapshot_budget_ = SIZE_MAX; // with snapshots on the target, auto chunk reserves and enforces this allowance
     std::array<Qwen4ExpSnapshot, kMaxSlots> snapshots_;
     int live_slot_ = -1;

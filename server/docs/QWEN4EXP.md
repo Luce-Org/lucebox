@@ -104,8 +104,11 @@ UD-Q4_K_XL) on the expert device:
 
 The profile sets `--target-device hip:0` (the R9700, gfx1201),
 `--expert-device hip:1` (the Strix Halo, gfx1151) and `--max-ctx auto`: the
-model's 262,144-token context, lowered in steps of 4096 to what the R9700
-holds beside the dense weights and every slot's cache.
+model's 262,144-token context. When the R9700 cannot hold every slot's cache
+beside the dense weights, the last full-attention layers keep their K/V and
+indexer rows on the Strix and run their attention there, as few layers as
+cover the shortfall. The context is lowered in steps of 4096 only once the
+Strix cannot take more.
 Both GPUs run one scheduler: prompt chunks pipeline over 2 to 4 streams so
 the Strix runs one stream's experts while the R9700 runs another's attention.
 
@@ -144,6 +147,10 @@ a 16K prompt at 44 tok/s. Greedy output is the same with adaptive MTP, a fixed
 its hot experts on the R9700 with the same kernel.
 
 With `--max-concurrency 2..4` split mode serves several requests at once.
+Four at once get the full 262,144 tokens with 7 of the 12 attention layers'
+rows on the Strix: a request alone decodes at about 46 tok/s and four
+together at 69 tok/s, against 59 and 78 at 131,072 tokens with every row on
+the R9700.
 Prefix snapshots live in system memory beside the R9700, so its memory holds
 context; the server's resident limit bounds them. On the Strix alone they stay
 in its memory, and `--max-ctx auto` keeps room for one full-context snapshot

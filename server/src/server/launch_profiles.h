@@ -231,7 +231,8 @@ inline const std::vector<LaunchProfile> & launch_profiles() {
         {
             "qwen-next-r9700-strix",
             "Qwen3.8-Flash-Next with dense work, KV cache and the MTP drafter on "
-            "an R9700 (gfx1201) and the routed experts on Strix Halo (gfx1151); "
+            "an R9700 (gfx1201) and the routed experts on Strix Halo (gfx1151), "
+            "which also keeps some attention layers' KV cache when the R9700 is full; "
             "add --expert-placement with the box's routing stats to also run "
             "the most-routed experts on the R9700",
             {

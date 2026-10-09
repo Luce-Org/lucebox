@@ -115,6 +115,13 @@ void free_qwen4exp_slot_states(Qwen4ExpSlotStates & s);
 struct Qwen4ExpCache {
     ggml_context *        ctx     = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
+    // Split mode: the K/V and indexer rows of the last `remote_layers` full-attention layers live on the expert
+    // device, where those layers' attention runs (see Qwen4ExpLayerBuilder::on_cache_device).
+    int                   remote_layers  = 0;
+    ggml_backend_t        remote_backend = nullptr;   // not owned
+    ggml_context *        remote_ctx     = nullptr;
+    ggml_backend_buffer_t remote_buf     = nullptr;
+    bool remote(int fi) const { return fi >= (int) full_layer_ids.size() - remote_layers; }
 
     int       max_ctx  = 0;
     int       cur_pos  = 0;
@@ -198,10 +205,12 @@ struct Qwen4ExpCache {
 
 // `mtp` adds the MTP draft layer's K/V and the verify rollback state (needs a loaded sidecar).
 // `slot_states`: the recurrent state is slab `state_slot` of those (allocated by the caller).
+// `remote_layers`: the last that many full-attention layers keep their rows on w.expert_backend.
 bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
                            int max_ctx, Qwen4ExpCache & out, bool mtp = false,
                            int mtp_draft = 1, // allocate the explicit draft cap once
-                           const Qwen4ExpSlotStates * slot_states = nullptr, int state_slot = -1);
+                           const Qwen4ExpSlotStates * slot_states = nullptr, int state_slot = -1,
+                           int remote_layers = 0);
 
 void free_qwen4exp_cache(Qwen4ExpCache & c);
 

@@ -49,7 +49,7 @@ void free_qwen4exp_slot_states(Qwen4ExpSlotStates & s) {
 
 bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
                            int max_ctx, Qwen4ExpCache & out, bool mtp, int mtp_draft,
-                           const Qwen4ExpSlotStates * slot_states, int state_slot) {
+                           const Qwen4ExpSlotStates * slot_states, int state_slot, int remote_layers) {
     const Qwen4ExpCudaScope profile(w.gfx1151);
     // The QSA cell-id kernel is exact for positions below 2^24.
     if (max_ctx <= 0 || max_ctx >= (1 << 24)) {
@@ -115,22 +115,31 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
         out.ple_conv_state[i] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, ple_hist, hc_dim);
     }
 
+    if (remote_layers < 0 || remote_layers > (int) n_full || (remote_layers > 0 && !w.expert_backend)) return false;
+    out.remote_layers = remote_layers;
+    out.remote_backend = remote_layers > 0 ? w.expert_backend : nullptr;
+    if (remote_layers > 0) {
+        out.remote_ctx = ggml_init({4 * (size_t) remote_layers * ggml_tensor_overhead(), nullptr, true});
+        if (!out.remote_ctx) return false;
+    }
+
     // Packed attention reads groups of four keys even for an unaligned
     // logical context limit. Padding is masked by the causal cell IDs.
     const int64_t align = w.qsa ? 4 : 1;
     const int64_t kv_capacity = (static_cast<int64_t>(max_ctx) + align - 1) / align * align;
     for (size_t i = 0; i < n_full; ++i) {
-        out.attn_k[i] = ggml_new_tensor_3d(out.ctx, kv_type,
+        ggml_context * rows = out.remote((int) i) ? out.remote_ctx : out.ctx;
+        out.attn_k[i] = ggml_new_tensor_3d(rows, kv_type,
             w.n_embd_head_k, kv_capacity, w.n_head_kv);
-        out.attn_v[i] = ggml_new_tensor_3d(out.ctx, kv_type,
+        out.attn_v[i] = ggml_new_tensor_3d(rows, kv_type,
             w.n_embd_head_v, kv_capacity, w.n_head_kv);
         const int il = out.full_layer_ids[i];
         const int ratio = il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0;
         if (w.indexer_head_size > 0 && ratio > 0) {
             const int64_t max_blocks = (static_cast<int64_t>(max_ctx) + ratio - 1) / ratio;
-            out.indexer_k[i] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
+            out.indexer_k[i] = ggml_new_tensor_2d(rows, GGML_TYPE_F32,
                 w.indexer_head_size, max_blocks + 1);
-            out.indexer_raw[i] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
+            out.indexer_raw[i] = ggml_new_tensor_2d(rows, GGML_TYPE_F32,
                 w.indexer_head_size, max_ctx);
         }
     }
@@ -192,9 +201,9 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
     }
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
-    if (!out.buf) {
-        ggml_free(out.ctx);
-        out.ctx = nullptr;
+    if (out.remote_ctx) out.remote_buf = ggml_backend_alloc_ctx_tensors(out.remote_ctx, w.expert_backend);
+    if (!out.buf || (out.remote_ctx && !out.remote_buf)) {
+        free_qwen4exp_cache(out);
         return false;
     }
 
@@ -277,6 +286,10 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
     }
     if (c.buf) { ggml_backend_buffer_free(c.buf); c.buf = nullptr; }
     if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
+    if (c.remote_buf) { ggml_backend_buffer_free(c.remote_buf); c.remote_buf = nullptr; }
+    if (c.remote_ctx) { ggml_free(c.remote_ctx); c.remote_ctx = nullptr; }
+    c.remote_layers = 0;
+    c.remote_backend = nullptr;
     c.slot_states = nullptr;
     c.state_slot = -1;
     c.attn_k.clear();
@@ -393,6 +406,7 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const 
     });
     s.buf = ggml_backend_alloc_ctx_tensors(s.ctx, store);
     if (!s.buf) { free_qwen4exp_snapshot(s); return false; }
+    if (c.remote_backend) ggml_backend_synchronize(c.remote_backend);   // its layers' last K/V writes
     for (auto [live, copy] : s.strips) ggml_backend_tensor_copy_async(backend, store, live, copy);
     ggml_backend_synchronize(backend);
     s.cur_pos = c.cur_pos;
@@ -423,10 +437,12 @@ bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & 
     ggml_context * views = ggml_init({target.size() * ggml_tensor_overhead(), nullptr, true});
     if (!views) return false;
     ggml_backend_synchronize(backend); // finish rollback before clearing its source/destination buffer
+    if (c.remote_backend) ggml_backend_synchronize(c.remote_backend);
     clear_position_bound_graphs(c);
     // Clear masked suffixes too: stable QSA scores the entire bucket. Stacked slot
     // states are not in c.buf; the snapshot rewrites this slot's slabs in full.
     ggml_backend_buffer_clear(c.buf, 0);
+    if (c.remote_buf) ggml_backend_buffer_clear(c.remote_buf, 0);
     for (size_t i = 0; i < target.size(); ++i) {
         ggml_tensor * copy = s.strips[i].second;
         ggml_tensor * live = ggml_view_1d(views, target[i].t, ggml_nelements(copy), target[i].off);

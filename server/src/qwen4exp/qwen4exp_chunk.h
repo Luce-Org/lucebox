@@ -90,7 +90,8 @@ struct Qwen4ExpContextFit {
 struct Qwen4ExpChunkPlan {
     size_t available = 0;       // device memory free beside the weights and the resident cache
     size_t required = 0;        // the other slots' caches, resident graphs, a floor-sized chunk and the headroom
-    size_t position_bytes = 0;  // one context position across every slot's cache
+    size_t position_bytes = 0;  // one context position across every slot's cache on the device
+    size_t layer_bytes = 0;     // one full-attention layer's rows across every slot's cache
 };
 
 struct Qwen4ExpWeights;

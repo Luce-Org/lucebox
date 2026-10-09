@@ -1292,14 +1292,12 @@ Qwen4ExpInputs qwen4exp_prepare_inputs(const Qwen4ExpWeights & w,
     return res;
 }
 
-// Split mode placement: the routed experts on the expert device, every other
-// node and the graph inputs on the target. Left unpinned, the scheduler places
-// a node after its graph-order neighbour, often an expert split, and keeps graph
-// inputs on the CPU, copying them to each split that reads them; a strided view
-// of an input (MTP prefill's per-block positions) cannot be copied as one span.
+// Split mode placement: the routed experts, and the attention of layers whose cache rows live there, on the expert
+// device; every other node and the graph inputs on the target. Left unpinned, the scheduler places a node after its
+// graph-order neighbour, often an expert split, and keeps graph inputs on the CPU, copying them to each split that
+// reads them; a strided view of an input (MTP prefill's per-block positions) cannot be copied as one span.
 static void qwen4exp_pin_split(ggml_backend_sched_t sched, ggml_cgraph * gf, ggml_backend_t target,
                                ggml_backend_t expert, const std::vector<ggml_tensor *> & expert_nodes) {
-    for (ggml_tensor * t : expert_nodes) ggml_backend_sched_set_tensor_backend(sched, t, expert);
     const std::unordered_set<const ggml_tensor *> on_expert(expert_nodes.begin(), expert_nodes.end());
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         ggml_tensor * node = ggml_graph_node(gf, i);
@@ -1312,7 +1310,9 @@ static void qwen4exp_pin_split(ggml_backend_sched_t sched, ggml_cgraph * gf, ggm
         }
         const bool view = node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
                           node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
-        if (!view && !on_expert.count(node) && ggml_backend_supports_op(target, node)) {
+        if (on_expert.count(node)) {
+            ggml_backend_sched_set_tensor_backend(sched, node, expert);
+        } else if (!view && ggml_backend_supports_op(target, node)) {
             ggml_backend_sched_set_tensor_backend(sched, node, target);
         }
     }
@@ -1373,6 +1373,24 @@ struct Qwen4ExpLayerBuilder {
     // Layer il + 1 starts with PLE, so layer il's output cannot be fused with its attention norm.
     bool next_is_ple(int il) const { return il + 1 < w.n_layer && w.layers[il + 1].is_ple && has_ple; }
 
+    // Full-attention layer `fi`'s attention, from its input projections through the output projection: with its
+    // cache rows on the expert device (Qwen4ExpCache::remote), every node `build` adds runs there, beside those rows
+    // and the layer's weights (move_qwen4exp_attention); only the input and the output cross.
+    template<class Build> ggml_tensor * on_cache_device(int fi, Build build) {
+        if (!cache.remote(fi)) return build();
+        ggml_tensor * last = nullptr;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) last = t;
+        ggml_tensor * out = build();
+        for (ggml_tensor * t = last ? ggml_get_next_tensor(ctx, last) : ggml_get_first_tensor(ctx); t;
+             t = ggml_get_next_tensor(ctx, t)) {
+            // Views stay with their source, as qwen4exp_pin_split leaves them; inputs stay on the target.
+            const bool view = t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
+                              t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+            if (!view && !(t->flags & GGML_TENSOR_FLAG_INPUT)) expert_nodes.push_back(t);
+        }
+        return out;
+    }
+
     // The HC mix into layer il's attention input, from the previous layer's fused norm when xn_next holds it
     // (consumed). `inject` receives the mix's injection.
     ggml_tensor * attn_input(int il, ggml_tensor * res_hc, ggml_tensor *& xn_next, ggml_tensor *& inject) {
@@ -1397,12 +1415,14 @@ struct Qwen4ExpLayerBuilder {
         ggml_tensor * cur = attn_input(il, res_hc, xn_next, inject);
         if (L.is_full_attention) {
             const int fi = full_idx[il];
-            return build_full_attn(ctx, gf, cur, L, w,
-                                   cache.attn_k[fi], cache.attn_v[fi], cache.indexer_k[fi],
-                                   w.qsa ? cache.indexer_raw[fi] : nullptr,
-                                   b.positions, b.mask, kv_row, b.kv_len, b.pos0,
-                                   il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0,
-                                   b.n_pooled, b.qsa, rows, qsa_ws);
+            return on_cache_device(fi, [&] {
+                return build_full_attn(ctx, gf, cur, L, w,
+                                       cache.attn_k[fi], cache.attn_v[fi], cache.indexer_k[fi],
+                                       w.qsa ? cache.indexer_raw[fi] : nullptr,
+                                       b.positions, b.mask, kv_row, b.kv_len, b.pos0,
+                                       il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0,
+                                       b.n_pooled, b.qsa, rows, qsa_ws);
+            });
         }
         const int li = lin_idx[il];
         return build_linear_attn(ctx, gf, cur, L, w, cache.ssm_state[li], cache.conv_state[li],
@@ -1760,24 +1780,30 @@ static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace 
 }
 
 // Dense decode may not have maintained the pooled QSA prefix: pool the already-cached complete blocks before pos0
-// once. The stable graph handles this forward's own blocks.
+// once, on the device holding each layer's rows (Qwen4ExpCache::remote). The stable graph handles this forward's own
+// blocks.
 static bool bootstrap_qsa_prefix(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache, int pos0) {
-    ggml_context * bc = ggml_init({8 * 1024 * 1024, nullptr, true});
-    if (!bc) return false;
-    ggml_cgraph * bg = ggml_new_graph_custom(bc, 8192, false);
-    for (size_t fi = 0; fi < cache.full_layer_ids.size(); ++fi) {
-        const auto & L = w.layers[cache.full_layer_ids[fi]];
-        qsa_pooled_keys(bc, bg, L, w, cache.indexer_k[fi], cache.indexer_raw[fi], nullptr,
-                        pos0, 4, cache.indexer_blocks, pos0 / 4);
+    for (ggml_backend_t device : {backend, cache.remote_backend}) {
+        if (!device) continue;
+        ggml_context * bc = ggml_init({8 * 1024 * 1024, nullptr, true});
+        if (!bc) return false;
+        ggml_cgraph * bg = ggml_new_graph_custom(bc, 8192, false);
+        for (size_t fi = 0; fi < cache.full_layer_ids.size(); ++fi) {
+            if (cache.remote((int) fi) != (device != backend)) continue;
+            const auto & L = w.layers[cache.full_layer_ids[fi]];
+            qsa_pooled_keys(bc, bg, L, w, cache.indexer_k[fi], cache.indexer_raw[fi], nullptr,
+                            pos0, 4, cache.indexer_blocks, pos0 / 4);
+        }
+        ggml_gallocr_t ba = ggml_graph_n_nodes(bg) ? ggml_gallocr_new(ggml_backend_get_default_buffer_type(device)) : nullptr;
+        const bool ok = !ggml_graph_n_nodes(bg) || (ba && ggml_gallocr_alloc_graph(ba, bg) &&
+            ggml_backend_graph_compute(device, bg) == GGML_STATUS_SUCCESS);
+        ggml_backend_cuda_graph_invalidate_range(device, ggml_get_mem_buffer(bc), ggml_get_mem_size(bc));
+        if (ba) ggml_gallocr_free(ba);
+        ggml_free(bc);
+        if (!ok) return false;
     }
-    ggml_gallocr_t ba = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    const bool ok = ba && ggml_gallocr_alloc_graph(ba, bg) &&
-        ggml_backend_graph_compute(backend, bg) == GGML_STATUS_SUCCESS;
-    ggml_backend_cuda_graph_invalidate_range(backend, ggml_get_mem_buffer(bc), ggml_get_mem_size(bc));
-    if (ba) ggml_gallocr_free(ba);
-    ggml_free(bc);
-    if (ok) cache.indexer_blocks = pos0 / 4;
-    return ok;
+    cache.indexer_blocks = pos0 / 4;
+    return true;
 }
 
 // The graph's metadata context: a decode or verify workspace's own (`pool`), reset for a rebuild, or a fresh one.
@@ -2904,27 +2930,29 @@ static bool build_batched_decode_nodes(ggml_context * ctx, const Qwen4ExpWeights
         ggml_tensor * cur = lb.attn_input(il, G.res_hc, G.xn_next, G.inject);
 
         if (L.is_full_attention) {
-            ggml_tensor * qfull = mm(ctx, L.wq, cur);
-            ggml_tensor * kraw = mm(ctx, L.wk, cur);
-            ggml_tensor * vraw = mm(ctx, L.wv, cur);
-            if (ws.kv_rows.empty()) {
-                // One mask and K/V row per slot and one M-RoPE position input per group, shared by
-                // every attention layer (a split scheduler tracks at most GGML_SCHED_MAX_SPLIT_INPUTS).
-                for (int s = 0; s < n_slots; ++s) {
-                    const int64_t span = spans[(size_t) s];
-                    ws.masks.push_back(span > 0 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, span, 1) : nullptr);
-                    ws.kv_rows.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1));
-                    if (ws.masks.back()) ggml_set_input(ws.masks.back());
-                    ggml_set_input(ws.kv_rows.back());
+            cur = lb.on_cache_device(lb.full_idx[il], [&] {
+                ggml_tensor * qfull = mm(ctx, L.wq, cur);
+                ggml_tensor * kraw = mm(ctx, L.wk, cur);
+                ggml_tensor * vraw = mm(ctx, L.wv, cur);
+                if (ws.kv_rows.empty()) {
+                    // One mask and K/V row per slot and one M-RoPE position input per group, shared by
+                    // every attention layer (a split scheduler tracks at most GGML_SCHED_MAX_SPLIT_INPUTS).
+                    for (int s = 0; s < n_slots; ++s) {
+                        const int64_t span = spans[(size_t) s];
+                        ws.masks.push_back(span > 0 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, span, 1) : nullptr);
+                        ws.kv_rows.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1));
+                        if (ws.masks.back()) ggml_set_input(ws.masks.back());
+                        ggml_set_input(ws.kv_rows.back());
+                    }
                 }
-            }
-            if (!G.positions) {
-                G.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
-                ggml_set_input(G.positions);
-            }
-            cur = mm(ctx, L.wo, build_full_attn_slots(ctx, gf, qfull, kraw, vraw, cur, G.positions,
-                ws.masks.data() + G.s0, ws.kv_rows.data() + G.s0, spans.data() + G.s0, L, w,
-                caches + G.s0, lb.full_idx[il], use_qsa, qsa.data() + G.s0));
+                if (!G.positions) {
+                    G.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
+                    ggml_set_input(G.positions);
+                }
+                return mm(ctx, L.wo, build_full_attn_slots(ctx, gf, qfull, kraw, vraw, cur, G.positions,
+                    ws.masks.data() + G.s0, ws.kv_rows.data() + G.s0, spans.data() + G.s0, L, w,
+                    caches + G.s0, lb.full_idx[il], use_qsa, qsa.data() + G.s0));
+            });
         } else {
             // Dense input projections are batched; with stacked slot states the conv and
             // recurrence run once for the group, else each slot's sees one row and its own state.

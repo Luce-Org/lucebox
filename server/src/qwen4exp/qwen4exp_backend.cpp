@@ -99,6 +99,36 @@ static bool load_qwen4exp_hot_experts(ggml_backend_t backend, Qwen4ExpWeights & 
     return true;
 }
 
+// Split mode: the last `layers` full-attention layers run their attention on the expert device, beside their cache
+// rows (Qwen4ExpCache::remote_layers), so their projection, norm and indexer weights move there. Layers moved before
+// stay; the target's copies stay in its weights buffer.
+static bool move_qwen4exp_attention(Qwen4ExpWeights & w, int layers) {
+    const ggml_backend_buffer_type_t expert = ggml_backend_get_default_buffer_type(w.expert_backend);
+    std::vector<ggml_tensor **> fields;
+    for (int il = w.n_layer - 1; il >= 0 && layers > 0; --il) {
+        Qwen4ExpLayer & L = w.layers[(size_t) il];
+        if (!L.is_full_attention) continue;
+        --layers;
+        for (ggml_tensor ** f : {&L.wq, &L.wk, &L.wv, &L.wo, &L.q_norm, &L.k_norm,
+                                 &L.indexer_q_proj, &L.indexer_k_proj, &L.indexer_q_norm, &L.indexer_k_norm}) {
+            if (*f && ggml_backend_buffer_get_type((*f)->buffer) != expert) fields.push_back(f);
+        }
+    }
+    if (fields.empty()) return true;
+    ggml_context * ctx = w.derived.open(fields.size());
+    std::vector<ggml_tensor *> moved;
+    for (ggml_tensor ** f : fields) moved.push_back(ctx ? ggml_dup_tensor(ctx, *f) : nullptr);
+    if (!ctx || !w.derived.commit(w.expert_backend)) return false;
+    std::vector<uint8_t> bytes;
+    for (size_t i = 0; i < fields.size(); ++i) {   // through the host: the two GPUs need not reach each other
+        bytes.resize(ggml_nbytes(*fields[i]));
+        ggml_backend_tensor_get(*fields[i], bytes.data(), 0, bytes.size());
+        ggml_backend_tensor_set(moved[i], bytes.data(), 0, bytes.size());
+        *fields[i] = moved[i];
+    }
+    return true;
+}
+
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         Qwen4ExpCache & cache, int slots, int resident_slots, size_t * snapshot_budget, Qwen4ExpChunkPlan * plan) {
     if (slots < 1 || resident_slots < 1 || resident_slots > slots) return 0;
@@ -236,13 +266,15 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         const size_t floor = chunk_workspace(std::min({floor_rows, max_rows, cache.max_ctx}));
         plan->available = available;
         plan->required = floor == SIZE_MAX ? SIZE_MAX : fixed + floor + available / 10;
-        // Every slot's attention and indexer rows; only this cache adds the MTP draft layer's.
-        size_t rows = 0;
+        // Every slot's attention and indexer rows on the target; only this cache adds the MTP draft layer's.
+        size_t rows = 0, layer = 0;
         for (const auto * group : {&cache.attn_k, &cache.attn_v, &cache.indexer_raw, &cache.indexer_k}) {
-            for (const ggml_tensor * t : *group) if (t) rows += ggml_nbytes(t);
+            for (const ggml_tensor * t : *group) if (t && t->buffer == cache.buf) rows += ggml_nbytes(t);
+            if (!group->empty() && group->front()) layer += ggml_nbytes(group->front());
         }
         const size_t mtp_rows = (cache.mtp_k ? ggml_nbytes(cache.mtp_k) : 0) + (cache.mtp_v ? ggml_nbytes(cache.mtp_v) : 0);
         plan->position_bytes = ((size_t) slots * rows + mtp_rows) / cache.max_ctx + 1;
+        plan->layer_bytes = (size_t) slots * layer;
         if (plan->required > available) return 0;   // the context fit moves on without searching smaller chunks
     }
     const int chunk = qwen4exp_fit_chunk(cache.max_ctx, available, fixed, chunk_workspace, snapshot_budget,
@@ -325,9 +357,15 @@ bool Qwen4ExpBackend::load_target() {
     if (!load_qwen4exp_hot_experts(backend_, weights_,
                                    cfg_.max_concurrency > 1 ? std::string() : cfg_.expert_placement_path,
                                    expert_budget_bytes_from_env(kQwen4ExpHotExpertBudget))) return false;
-    // --max-ctx auto: the largest context, up to the trained one, at which every slot's cache, the resident graphs, a
-    // floor-sized prompt chunk and, with snapshots on the target, one full snapshot per slot fit
-    // (Qwen4ExpContextFit). The context found stays: an unpark sizes itself for it.
+    if (remote_layers_ && !move_qwen4exp_attention(weights_, remote_layers_)) {
+        std::fprintf(stderr, "[qwen4exp] moving attention to the expert device failed\n");
+        return false;
+    }
+    // --max-ctx auto: the trained context, or the largest that fits (Qwen4ExpContextFit) with every slot's cache, the
+    // resident graphs, a floor-sized prompt chunk and, with snapshots on the target, one full snapshot per slot. In
+    // split mode a miss first moves the fewest full-attention layers' cache rows and attention to the expert device
+    // that cover it, while that device holds them; the context shrinks once none can move. The layout found stays:
+    // an unpark sizes itself for it.
     for (Qwen4ExpContextFit search;;) {
         Qwen4ExpChunkPlan plan;
         chunk_ = plan_chunk(cfg_.device.fit_ctx ? &plan : nullptr);
@@ -337,23 +375,33 @@ bool Qwen4ExpBackend::load_target() {
             ? (size_t) cfg_.max_concurrency * snapshot_bytes_estimate(ctx) : 0;
         const size_t position = plan.position_bytes + snapshots / ctx;
         const bool fit = plan.required <= plan.available && snapshots <= plan.available - plan.required;
+        const size_t missing = fit ? 0 : plan.required == SIZE_MAX ? (size_t) ctx / 4 * position
+                                                                    : plan.required + snapshots - plan.available;
+        int next = 0;
         if (fit) {
             search.fits = ctx;
             search.spare = plan.available - plan.required - snapshots;
+        } else if (const int remote = remote_layers_for(plan, missing); remote > remote_layers_) {
+            remote_layers_ = remote;
+            if (!move_qwen4exp_attention(weights_, remote_layers_)) {
+                std::fprintf(stderr, "[qwen4exp] moving attention to the expert device failed\n");
+                return false;
+            }
+            next = ctx;   // plan the same context with the rows moved
         } else {
             search.misses = ctx;
-            search.missing = plan.required == SIZE_MAX ? (size_t) ctx / 4 * position
-                                                       : plan.required + snapshots - plan.available;
+            search.missing = missing;
         }
-        int next = search.next(position);
+        if (!next) next = search.next(position);
         if (!next && !search.fits) {
             std::fprintf(stderr, "[qwen4exp] no context fits beside the weights\n");
             return false;
         }
         if (!next) {
             cfg_.device.fit_ctx = false;
-            std::fprintf(stderr, "[qwen4exp] context fitted to the devices: %d tokens, %d at once\n",
-                         search.fits, cfg_.max_concurrency);
+            std::fprintf(stderr, "[qwen4exp] context fitted to the devices: %d tokens, %d at once, %d of %zu "
+                         "attention layers on the expert device\n", search.fits, cfg_.max_concurrency, remote_layers_,
+                         cache_.full_layer_ids.size());
             if (fit) break;
             next = search.fits;   // the last plan missed: plan the fit again
         }
@@ -421,7 +469,23 @@ bool Qwen4ExpBackend::create_main_cache() {
         !create_qwen4exp_slot_states(backend_, weights_, cfg_.max_concurrency, slot_states_)) return false;
     return create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
         cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1),
-        slot_states_.ctx ? &slot_states_ : nullptr, 0);
+        slot_states_.ctx ? &slot_states_ : nullptr, 0, remote_layers_);
+}
+
+// --max-ctx auto in split mode: the full-attention layers to keep on the expert device so a plan that lacks
+// `missing` bytes fits, when that device holds every slot's rows of them beside its own headroom (else the layers
+// already there).
+int Qwen4ExpBackend::remote_layers_for(const Qwen4ExpChunkPlan & plan, size_t missing) const {
+    const int n_full = (int) cache_.full_layer_ids.size();
+    if (!weights_.expert_backend || !plan.layer_bytes || plan.required == SIZE_MAX || remote_layers_ >= n_full)
+        return remote_layers_;
+    const int remote = std::min<int>(n_full, remote_layers_ + (int) ((missing + plan.layer_bytes - 1) / plan.layer_bytes));
+    size_t free_device = 0, total = 0, free_host = 0;
+    ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device_id(weights_.expert_backend), &free_device, &total);
+    ggml_backend_dev_memory(ggml_backend_get_device(weights_.expert_backend), &free_host, &total);
+    const size_t available = std::min(free_device, free_host) +
+                             (cache_.remote_buf ? ggml_backend_buffer_get_size(cache_.remote_buf) : 0);
+    return (size_t) remote * plan.layer_bytes <= available - available / 10 ? remote : remote_layers_;
 }
 
 bool Qwen4ExpBackend::start_seq_engine() {
@@ -430,7 +494,7 @@ bool Qwen4ExpBackend::start_seq_engine() {
     std::vector<Qwen4ExpCache *> caches{&cache_};
     for (Qwen4ExpCache & cache : seq_caches_) {
         if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache, false, 1,
-                                   &slot_states_, (int) caches.size())) return false;
+                                   &slot_states_, (int) caches.size(), remote_layers_)) return false;
         cache.split_owner = &cache_;
         caches.push_back(&cache);
     }
