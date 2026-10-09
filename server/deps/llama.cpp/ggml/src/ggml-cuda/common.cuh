@@ -1495,10 +1495,8 @@ struct ggml_backend_cuda_context {
     std::vector<luce_q8_memo_entry> luce_q8_memo;
 
     // DS4 HC boundary launches (ds4-hc.cu) synchronize their blocks on this
-    // device counter; launches on this context's stream run in order, so the
-    // running count of blocks launched is each launch's target.
-    unsigned long long * ds4_hc_barrier = nullptr;
-    unsigned long long   ds4_hc_barrier_blocks = 0;
+    // device barrier: an arrival count and a generation.
+    unsigned int * ds4_hc_barrier = nullptr;
     // The split boundary's mix rows ([64][32] floats) and per-token block
     // counts (64 uints), allocated with the barrier.
     void * ds4_hc_split_scratch = nullptr;

@@ -692,6 +692,34 @@ static __device__ __forceinline__ float ds4_hc_f32(float x) {
     return x;
 }
 
+// Every block of the grid waits here for the others (one block per token
+// reaches it). The barrier keeps its state on the device only: the last block
+// to arrive zeroes the count and advances the generation the others wait on,
+// so it needs no per-launch target from the host and a CUDA graph can replay
+// the launch. All the grid's blocks must be resident at once.
+static __device__ __forceinline__ void ds4_hc_grid_barrier(unsigned int * barrier, const unsigned int n_blocks) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned int * count = barrier;
+        unsigned int * generation = barrier + 1;
+        const unsigned int gen = atomicAdd(generation, 0u);
+        __threadfence();
+        if (atomicAdd(count, 1u) == n_blocks - 1) {
+            atomicExch(count, 0u);
+            __threadfence();
+            atomicAdd(generation, 1u);
+        } else {
+            while (atomicAdd(generation, 0u) == gen) {
+#if defined(GGML_USE_HIP)
+                __builtin_amdgcn_s_sleep(1);
+#endif
+            }
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+
 template <int NHC, int MMV_BLOCK>
 static __global__ void __launch_bounds__(1024) ds4_hc_boundary_kernel(
         const float * __restrict__ R,         int64_t R_stride,
@@ -705,7 +733,7 @@ static __global__ void __launch_bounds__(1024) ds4_hc_boundary_kernel(
         const int n_embd, const float eps_hc, const float eps_out, const int iters,
         const float pre_scale, const float post_scale, const float comb_scale,
         const int write_pre,
-        unsigned long long * barrier, const unsigned long long barrier_target,
+        unsigned int * barrier,
         block_q8_1 * __restrict__ q8, const int64_t q8_row_blocks) {
     constexpr int block_size = 1024;
     constexpr int mix_dim = 2 * NHC + NHC * NHC;
@@ -844,18 +872,7 @@ static __global__ void __launch_bounds__(1024) ds4_hc_boundary_kernel(
     const float mean_out  = tmp_out / n_embd;
     const float scale_out = rsqrtf(mean_out + eps_out);
 
-    __syncthreads();
-    if (tid == 0) {
-        __threadfence();
-        atomicAdd(barrier, 1ull);
-        while (atomicAdd(barrier, 0ull) < barrier_target) {
-#if defined(GGML_USE_HIP)
-            __builtin_amdgcn_s_sleep(1);
-#endif
-        }
-        __threadfence();
-    }
-    __syncthreads();
+    ds4_hc_grid_barrier(barrier, gridDim.x);
 #pragma unroll
     for (int k = 0; k < DS4_HC_BOUNDARY_MAX_COLS; ++k) {
         const int d = tid + k * block_size;
@@ -895,7 +912,7 @@ static __global__ void __launch_bounds__(1024) ds4_hc_boundary_split_kernel(
         const int n_embd, const float eps_hc, const float eps_out, const int iters,
         const float pre_scale, const float post_scale, const float comb_scale,
         const int write_pre,
-        unsigned long long * barrier, const unsigned long long barrier_target,
+        unsigned int * barrier,
         block_q8_1 * __restrict__ q8, const int64_t q8_row_blocks,
         float * __restrict__ mix_scratch, unsigned int * __restrict__ rows_done) {
     constexpr int block_size = 1024;
@@ -1058,18 +1075,7 @@ static __global__ void __launch_bounds__(1024) ds4_hc_boundary_split_kernel(
     const float mean_out  = tmp_out / n_embd;
     const float scale_out = rsqrtf(mean_out + eps_out);
 
-    __syncthreads();
-    if (tid == 0) {
-        __threadfence();
-        atomicAdd(barrier, 1ull);
-        while (atomicAdd(barrier, 0ull) < barrier_target) {
-#if defined(GGML_USE_HIP)
-            __builtin_amdgcn_s_sleep(1);
-#endif
-        }
-        __threadfence();
-    }
-    __syncthreads();
+    ds4_hc_grid_barrier(barrier, gridDim.x);
 #pragma unroll
     for (int k = 0; k < DS4_HC_BOUNDARY_MAX_COLS; ++k) {
         const int d = tid + k * block_size;
@@ -1116,15 +1122,12 @@ void ggml_cuda_ds4_hc_boundary(
         void * q8_out) {
     GGML_ASSERT(ggml_cuda_ds4_hc_boundary_supported(n_hc, n_embd, mmv_block));
     GGML_ASSERT(n_tokens >= 1 && n_tokens <= 64);
-    // Launches on this context's stream run in order, so a running count of
-    // the blocks they launched is each launch's barrier target.
+    // The output barrier's count and generation (ds4_hc_grid_barrier).
     if (!ctx.ds4_hc_barrier) {
         ggml_cuda_set_device(ctx.device);
-        CUDA_CHECK(cudaMalloc((void **) &ctx.ds4_hc_barrier, sizeof(unsigned long long)));
-        CUDA_CHECK(cudaMemsetAsync(ctx.ds4_hc_barrier, 0, sizeof(unsigned long long), ctx.stream()));
-        ctx.ds4_hc_barrier_blocks = 0;
+        CUDA_CHECK(cudaMalloc((void **) &ctx.ds4_hc_barrier, 2 * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemsetAsync(ctx.ds4_hc_barrier, 0, 2 * sizeof(unsigned int), ctx.stream()));
     }
-    ctx.ds4_hc_barrier_blocks += (unsigned long long) n_tokens;
     const size_t shmem = (size_t) n_embd * n_hc / 2 * sizeof(half2);
     cudaStream_t stream = ctx.stream();
     // LUCE_DS4_HC_BOUNDARY_SPLIT=1: the mix over several blocks per token
@@ -1148,7 +1151,7 @@ void ggml_cuda_ds4_hc_boundary(
             R, R_stride, fn, fn_stride, base, block_out, bo_stride, w, \
             pre_dst, pre_stride, R_next, Rn_stride, out, out_stride, \
             n_embd, eps_hc, eps_out, iters, pre_scale, post_scale, comb_scale, write_pre ? 1 : 0, \
-            ctx.ds4_hc_barrier, ctx.ds4_hc_barrier_blocks, \
+            ctx.ds4_hc_barrier, \
             (block_q8_1 *) q8_out, (int64_t) GGML_PAD(n_embd, MATRIX_ROW_PADDING) / QK8_1, \
             mix_scratch, rows_done)
         switch (mmv_block) {
@@ -1165,7 +1168,7 @@ void ggml_cuda_ds4_hc_boundary(
         R, R_stride, fn, fn_stride, base, block_out, bo_stride, w, \
         pre_dst, pre_stride, R_next, Rn_stride, out, out_stride, \
         n_embd, eps_hc, eps_out, iters, pre_scale, post_scale, comb_scale, write_pre ? 1 : 0, \
-        ctx.ds4_hc_barrier, ctx.ds4_hc_barrier_blocks, \
+        ctx.ds4_hc_barrier, \
         (block_q8_1 *) q8_out, (int64_t) GGML_PAD(n_embd, MATRIX_ROW_PADDING) / QK8_1)
     switch (mmv_block) {
         case  64: DS4_HC_BOUNDARY_LAUNCH(64);  break;

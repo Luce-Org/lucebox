@@ -5696,8 +5696,7 @@ static bool ggml_cuda_try_rope_q8(ggml_backend_cuda_context & ctx, ggml_cgraph *
 static int ggml_cuda_try_ds4_hc_boundary(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
     if (!ggml_cuda_ds4_hc_boundary_enabled()) return -1;
     const int n = cgraph->n_nodes;
-    // The next node at or after j that launches something; the skipped views
-    // are recorded so their single reader can be checked.
+    // The next node at or after j that launches something.
     auto next = [&](int j) {
         while (j < n && ggml_cuda_node_is_noop(cgraph->nodes[j])) ++j;
         return j;
