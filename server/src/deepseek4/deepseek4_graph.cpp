@@ -11798,14 +11798,12 @@ bool deepseek4_step_layer_range(
                     ctx, layer_major_band ? layer_major_band->selection_first : 0, n_tokens);
                 ggml_tensor * index_selection = store_view;
                 // Cluster head split in the uncached graphs
-                // (prefill bands, short first decodes): each rank attends with
-                // its own output groups and one all-reduce sums the partials.
-                // Every rank takes the same decision (from the band alone).
+                // (prefill bands, short first decodes): each rank holds and
+                // attends with its own output groups, and one all-reduce sums
+                // the partials.
                 Ds4ClusterRuntime * split_rt = cache.cluster_rt;
                 const bool split_heads = split_rt && split_rt->size() > 1 &&
-                    split_rt->attn_head_count > 0 &&
-                    (w.cluster_heads_local > 0 ||
-                     ds4_cluster_prefill_attention_split(kv_start + n_tokens));
+                    split_rt->attn_head_count > 0 && w.cluster_heads_local > 0;
                 attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, comp_lc, il,
                                                kv_start, n_tokens, nullptr,
                                                i32_inputs, i32_array_inputs,

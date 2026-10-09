@@ -462,21 +462,6 @@ bool ds4_cluster_init_experts(const std::string & model_path,
     return true;
 }
 
-// ─── Diagnostics ────────────────────────────────────────────────────────
-
-void ds4_cluster_checksum(const float * data, size_t n, double * sum, double * sum_abs) {
-    double s = 0.0;
-    double a = 0.0;
-    if (data) {
-        for (size_t i = 0; i < n; ++i) {
-            s += (double) data[i];
-            a += (double) (data[i] < 0.0f ? -data[i] : data[i]);
-        }
-    }
-    if (sum) *sum = s;
-    if (sum_abs) *sum_abs = a;
-}
-
 bool ds4_cluster_ingraph_allreduce_enabled() {
     static const bool enabled = [] {
         const char * v = std::getenv("LUCE_CLUSTER_NO_INGRAPH_ALLREDUCE");
@@ -497,18 +482,6 @@ bool ds4_cluster_prefill_pipeline_enabled() {
         return ds4_cluster_prefill_device_join_enabled() && v && *v && std::strcmp(v, "0") != 0;
     }();
     return enabled;
-}
-
-bool ds4_cluster_prefill_attention_split(int context_end) {
-    static const bool enabled = [] {
-        const char * v = std::getenv("LUCE_CLUSTER_PREFILL_ATTN_SPLIT");
-        return v && *v && std::strcmp(v, "0") != 0;
-    }();
-    static const int min_rows = [] {
-        const char * v = std::getenv("LUCE_CLUSTER_PREFILL_ATTN_SPLIT_MIN");
-        return v && *v ? std::max(0, std::atoi(v)) : 0;
-    }();
-    return enabled && context_end >= min_rows;
 }
 
 bool ds4_cluster_prefill_device_join_enabled() {
@@ -557,14 +530,6 @@ bool ds4_cluster_fused_graph_available(const Ds4ClusterRuntime * rt) {
                      "in-graph all-reduce per MoE layer\n");
     }
     return true;
-}
-
-bool ds4_cluster_env_prefill_single_token() {
-    static const bool enabled = [] {
-        const char * v = std::getenv("LUCE_CLUSTER_PREFILL_SINGLE_TOKEN");
-        return v && v[0] && std::strcmp(v, "0") != 0;
-    }();
-    return enabled;
 }
 
 // ─── Route masking ──────────────────────────────────────────────────────

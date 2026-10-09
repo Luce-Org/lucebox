@@ -157,14 +157,6 @@ void ds4_cluster_mask_routes(const Ds4ClusterRuntime & rt,
                              int route_width,
                              int n_tokens);
 
-// Diagnostics: sum and sum of |x| over n floats (LUCE_CLUSTER_TRACE lines).
-void ds4_cluster_checksum(const float * data, size_t n, double * sum, double * sum_abs);
-
-// LUCE_CLUSTER_PREFILL_SINGLE_TOKEN=1: run cluster prefill token by token
-// (n_tokens == 1 chunks through the decode path) to bisect multi-token
-// prefill numerics. Cached after the first call.
-bool ds4_cluster_env_prefill_single_token();
-
 // All-reduce a device-resident F32 partial [n_embd, n_tokens] in place on the
 // backend stream. Stays stream-ordered (no host sync) unless rt.trace is set,
 // in which case it waits with cfg->timeout_ms and logs the layer. Updates
@@ -223,14 +215,6 @@ bool ds4_cluster_prefill_device_join_enabled();
 // cluster rank, band count agreed across ranks. Off by default: at the 14 GB
 // hot budget the agreed bands shrink to 512 rows and prefill gets slower.
 bool ds4_cluster_prefill_pipeline_enabled();
-
-// Attention head split in the uncached (prefill) graphs: true when a band
-// whose context ends at `context_end` attends with this rank's heads and
-// all-reduces the partial (opt-in, LUCE_CLUSTER_PREFILL_ATTN_SPLIT=1: measured
-// slower at 2K and even at 30K, where the head-independent indexer dominates; LUCE_CLUSTER_PREFILL_ATTN_SPLIT_MIN sets the context
-// it starts at, default 0). A pure function of the band, so every rank
-// agrees.
-bool ds4_cluster_prefill_attention_split(int context_end);
 
 // True when this runtime may use the fused whole-model graph: the
 // opt-in is set, a real multi-rank communicator is attached, the shared
