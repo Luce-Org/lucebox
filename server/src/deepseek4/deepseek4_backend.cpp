@@ -1302,6 +1302,16 @@ bool DeepSeek4Backend::cluster_agree_prefill_chunk() {
                      "chunk %d -> %d (agreed across ranks)\n", cluster_->rank(),
                      hybrid_prefill_chunk_cap_, agreed, hybrid_long_context_chunk_, long_chunk);
     }
+    // Every prefill chunk reads all of a rank's experts once, so the smallest
+    // rank's chunk sets the whole cluster's prompt speed: name it.
+    for (size_t r = 0; agreed > 0 && cluster_->rank() == 0 && r < caps.size(); ++r) {
+        if (caps[r] == agreed && agreed < kDs4ClusterPipelineMinBand) {
+            std::fprintf(stderr, "[deepseek4-cluster] rank %zu holds every prefill chunk to %d rows; a "
+                         "smaller LUCE_EXPERT_BUDGET_MB on that rank leaves room for longer chunks\n",
+                         r, agreed);
+            break;
+        }
+    }
     hybrid_prefill_chunk_cap_ = agreed;
     hybrid_long_context_chunk_ = long_chunk;
     // The drafter swap's long-prompt chunk is agreed the same way. Every rank

@@ -476,12 +476,15 @@ bool ds4_cluster_ingraph_allreduce_enabled() {
     return enabled;
 }
 
-bool ds4_cluster_prefill_pipeline_enabled() {
-    static const bool enabled = [] {
+bool ds4_cluster_prefill_pipeline_enabled(const std::vector<int> & bands) {
+    if (!ds4_cluster_prefill_device_join_enabled() || bands.empty()) return false;
+    static const int forced = [] {   // -1 unset, 0 off, 1 on
         const char * v = std::getenv("LUCE_CLUSTER_PREFILL_PIPELINE");
-        return ds4_cluster_prefill_device_join_enabled() && v && *v && std::strcmp(v, "0") != 0;
+        return v && *v ? (std::strcmp(v, "0") != 0 ? 1 : 0) : -1;
     }();
-    return enabled;
+    if (forced >= 0) return forced == 1;
+    return std::all_of(bands.begin(), bands.end(),
+                       [](int rows) { return rows >= kDs4ClusterPipelineMinBand; });
 }
 
 bool ds4_cluster_prefill_device_join_enabled() {

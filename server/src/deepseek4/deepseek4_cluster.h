@@ -211,10 +211,14 @@ bool ds4_cluster_attention_parallel_enabled();
 // LUCE_CLUSTER_PREFILL_DEVICE_JOIN (default on): cluster prefill keeps the
 // device-resident hot+cold join and reduces in the HC-post graph.
 bool ds4_cluster_prefill_device_join_enabled();
-// LUCE_CLUSTER_PREFILL_PIPELINE=1 (default off): band-pipelined prefill on a
-// cluster rank, band count agreed across ranks. Off by default: at the 14 GB
-// hot budget the agreed bands shrink to 512 rows and prefill gets slower.
-bool ds4_cluster_prefill_pipeline_enabled();
+// Band-pipelined prefill on a cluster rank: one part's cold FFN runs beside
+// the next part's attention. On when every band of the pass has at least
+// kDs4ClusterPipelineMinBand rows (two boxes, 2K prompt in one band: 649-669
+// -> 710-727 tok/s); smaller bands split into parts too short to pay for it
+// (512-row bands measured slower). LUCE_CLUSTER_PREFILL_PIPELINE=1 forces it
+// on, =0 off. A pure function of the bands, which every rank agrees on.
+constexpr int kDs4ClusterPipelineMinBand = 1536;
+bool ds4_cluster_prefill_pipeline_enabled(const std::vector<int> & bands);
 
 // True when this runtime may use the fused whole-model graph: the
 // opt-in is set, a real multi-rank communicator is attached, the shared

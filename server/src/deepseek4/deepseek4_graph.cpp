@@ -12759,13 +12759,13 @@ bool deepseek4_prefill_layer_major(
     // agreed chunks alone, so they match). Without cluster pipelining a rank
     // keeps the caller's bands whole.
     const bool cluster_multi = cache.cluster_rt && cache.cluster_rt->size() > 1;
-    const bool cluster_pipeline = !cluster_multi || ds4_cluster_prefill_pipeline_enabled();
+    const bool cluster_pipeline = !cluster_multi || ds4_cluster_prefill_pipeline_enabled(bands);
     const std::vector<int> run_bands = pipeline_requested && cluster_pipeline
         ? deepseek4_pipeline_parts(bands, pipeline_bands)
         : bands;
     Ds4PrefillPipeline pipeline_state;
     bool pipelined = pipeline_requested && cluster_pipeline && device_residual && !cache.pipeline_off;
-    if (cluster_multi && pipeline_requested && ds4_cluster_prefill_pipeline_enabled()) {
+    if (cluster_multi && pipeline_requested && cluster_pipeline) {
         std::vector<int32_t> flags;
         std::string agree_err;
         if (!ds4_cluster_allgather_i32(*cache.cluster_rt, backend, pipelined ? 1 : 0, flags, &agree_err)) {
@@ -12781,6 +12781,7 @@ bool deepseek4_prefill_layer_major(
             logged = true;
             std::fprintf(stderr, "[deepseek4] layer-major prefill pipeline %s (%zu bands)\n",
                          pipelined ? "active"
+                         : !cluster_pipeline ? "inactive (cluster bands too short)"
                          : !device_residual ? "inactive (needs the device residual)"
                                             : "inactive (off after a failed prefill)",
                          run_bands.size());
