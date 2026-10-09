@@ -237,7 +237,7 @@ inline const std::vector<LaunchProfile> & launch_profiles() {
             {
                 {"--target-device", "hip:0"},
                 {"--expert-device", "hip:1"},
-                {"--max-ctx", "131072"},
+                {"--max-ctx", "auto"},
             },
             {},
         },

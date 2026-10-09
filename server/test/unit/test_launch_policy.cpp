@@ -6,6 +6,7 @@
 #include "placement/device_select.h"
 #include "server/launch_profiles.h"
 
+#include <algorithm>
 #include <cstring>
 #include <set>
 #include <string>
@@ -254,6 +255,16 @@ struct LaunchPolicyFixture : CommonFixture {
         const std::vector<std::string> merged = launch_profile_args(*profile, given);
         CHECK(!contains_flag(merged, "--draft-device"));
     }
+
+    void test_qwen_next_split_profile_fits_its_context() {
+        // The split fits the context to the R9700; a number on the command line still wins.
+        const LaunchProfile * profile = find_launch_profile("qwen-next-r9700-strix");
+        CHECK(profile != nullptr);
+        const std::vector<std::string> args = launch_profile_args(*profile, {});
+        const auto max_ctx = std::find(args.begin(), args.end(), "--max-ctx");
+        CHECK(max_ctx != args.end() && max_ctx + 1 != args.end() && *(max_ctx + 1) == "auto");
+        CHECK(!contains_flag(launch_profile_args(*profile, {"--max-ctx", "65536"}), "--max-ctx"));
+    }
 };
 
 }  // namespace
@@ -271,4 +282,5 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_profile_replaces_documented_recipe();
     test_ds41_profile_is_the_lucebox_recipe();
     test_ds41_gorgon_profile_is_the_measured_recipe();
+    test_qwen_next_split_profile_fits_its_context();
 }

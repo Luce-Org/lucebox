@@ -158,6 +158,9 @@ struct ModelBackend {
     // Print the "[<arch>-daemon] ready ..." banner on stdout.
     virtual void print_ready_banner() const = 0;
     virtual int prefill_chunk_size() const { return 0; }
+    // The context one sequence can hold, from a backend that can fit it to
+    // its devices (DevicePlacement::fit_ctx); 0 from one that cannot.
+    virtual int context_limit() const { return 0; }
 
     // ── Park / unpark ────────────────────────────────────────────────
     // Backend decides which resources to release/restore. Returns true on

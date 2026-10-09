@@ -59,6 +59,40 @@ int qwen4exp_fit_chunk(int max_ctx, size_t available, size_t fixed, Measure meas
     return 0;
 }
 
+// --max-ctx auto: the next context to try after a plan at `ctx` lacks `missing` bytes, when one context position
+// takes `position_bytes` across every slot. At least one step lower, in multiples of `step`; 0 when none is left.
+inline int qwen4exp_shrink_context(int ctx, size_t missing, size_t position_bytes, int step = 4096) {
+    const int64_t fewer = position_bytes ? (int64_t) std::min<size_t>((missing + position_bytes - 1) / position_bytes,
+                                                                      (size_t) ctx)
+                                         : ctx;
+    const int64_t next = std::min<int64_t>((int64_t) ctx - step, ((int64_t) ctx - fewer) / step * step);
+    return next >= step ? (int) next : 0;
+}
+
+// --max-ctx auto: the search for the largest context that fits.
+struct Qwen4ExpContextFit {
+    int fits = 0, misses = 0;        // the largest context that fit and the smallest that did not (0: none yet)
+    size_t spare = 0, missing = 0;   // the bytes the fit left over and the miss lacked
+
+    // The next context to plan; 0 once settled (the answer is `fits`, none when it is 0). Until a context fits, a
+    // miss shrinks by its shortfall, which overshoots because the graph workspaces shrink with the context too.
+    // Then interpolation between the fit and the miss, kept strictly between them, settles to a `step` multiple.
+    int next(size_t position_bytes, int step = 4096) const {
+        if (!fits) return qwen4exp_shrink_context(misses, missing, position_bytes, step);
+        if (!misses || misses - fits <= step) return 0;
+        const double t = (double) spare / ((double) spare + (double) missing);
+        const int64_t guess = (int64_t) (fits + t * (misses - fits)) / step * step;
+        return (int) std::clamp<int64_t>(guess, (int64_t) fits + step, (int64_t) misses - step);
+    }
+};
+
+// What a chunk plan measured, for fitting the context to the device.
+struct Qwen4ExpChunkPlan {
+    size_t available = 0;       // device memory free beside the weights and the resident cache
+    size_t required = 0;        // the other slots' caches, resident graphs, a floor-sized chunk and the headroom
+    size_t position_bytes = 0;  // one context position across every slot's cache
+};
+
 struct Qwen4ExpWeights;
 struct Qwen4ExpCache;
 // Call after weights and resident_slots caches are allocated, before prefill.
@@ -68,6 +102,7 @@ struct Qwen4ExpCache;
 // that cannot fit).
 // The caller must enforce the returned allowance on later snapshot captures.
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
-    Qwen4ExpCache & cache, int slots = 1, int resident_slots = 1, size_t * snapshot_budget = nullptr);
+    Qwen4ExpCache & cache, int slots = 1, int resident_slots = 1, size_t * snapshot_budget = nullptr,
+    Qwen4ExpChunkPlan * plan = nullptr);
 
 }  // namespace luce::common

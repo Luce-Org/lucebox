@@ -103,7 +103,9 @@ UD-Q4_K_XL) on the expert device:
 ```
 
 The profile sets `--target-device hip:0` (the R9700, gfx1201),
-`--expert-device hip:1` (the Strix Halo, gfx1151) and `--max-ctx 131072`.
+`--expert-device hip:1` (the Strix Halo, gfx1151) and `--max-ctx auto`: the
+model's 262,144-token context, lowered in steps of 4096 to what the R9700
+holds beside the dense weights and every slot's cache.
 Both GPUs run one scheduler: prompt chunks pipeline over 2 to 4 streams so
 the Strix runs one stream's experts while the R9700 runs another's attention.
 
@@ -141,9 +143,11 @@ a 16K prompt at 44 tok/s. Greedy output is the same with adaptive MTP, a fixed
 `--verify-width` or MTP off (`--verify-width 1`): every generated token runs
 its hot experts on the R9700 with the same kernel.
 
-Split mode serves one sequence: `--max-concurrency` above 1 is refused with
-`--expert-device`. The prefix cache works as on the Strix; the snapshot
-allowance comes out of the R9700's memory after an 8192-row prompt chunk.
+With `--max-concurrency 2..4` split mode serves several requests at once.
+Prefix snapshots live in system memory beside the R9700, so its memory holds
+context; the server's resident limit bounds them. On the Strix alone they stay
+in its memory, and `--max-ctx auto` keeps room for one full-context snapshot
+per slot.
 
 ## Support
 
@@ -154,9 +158,9 @@ allowance comes out of the R9700's memory after an 8192-row prompt chunk.
 | Attention block ratios other than 4, contexts of 2^24 tokens or more | refused at load |
 | gfx1151 kernels: MMB bf16 and Q8_0 -> F16 WMMA GEMMs, fused HC / GDN / PLE, M-RoPE into the flash-attention layout | done |
 | Chat template, reasoning effort, thinking budget, `preserve_thinking`, `sampling_no_thinking` | done |
-| Concurrent serving (`--max-concurrency 2..4`) | supported on one GPU, exact independent slots with full per-slot caches; MTP and the prefix cache are single-slot only (MTP is switched off); more than 4, or split mode, is refused |
+| Concurrent serving (`--max-concurrency 2..4`) | supported on one GPU and in split mode, exact independent slots with full per-slot caches; MTP drafts for a request running alone; the prefix cache serves every slot; more than 4 is refused |
 | MTP speculative decoding | sidecar discovered automatically; adaptive k=1..7 by default (code 16K / 64K 32.4 / 28.2 tok/s, counting 43.5), output identical to MTP off; `--verify-width 1` disables, `2..8` selects fixed k=1..7 |
-| Prefix cache | done: snapshots at chat cut points, restored on hits; a 64K agent turn's first token in ~3.5 s instead of ~65 s (131K context). Prefill keeps a 4096-row chunk first (8192 in split mode) and snapshots get the remaining memory, so at 262K context with MTP long prefixes do not fit: use `--max-ctx 131072` or less for agent workloads |
+| Prefix cache | done: snapshots at chat cut points, restored on hits; a 64K agent turn's first token in ~3.5 s instead of ~65 s (131K context). Prefill keeps a 4096-row chunk first (8192 in split mode). Snapshots share the Strix's memory with the caches (`--max-ctx auto` leaves one full-context snapshot per slot) and live in system memory beside a discrete GPU |
 | Layer split | refused |
 | Split mode (`--expert-device`, `--expert-placement`) | routed experts on a second GPU, pipelined prompt chunks, hot experts on the target for decode and verify; measured on R9700 + Strix Halo |
 | Other GPUs | generic paths; kernels, defaults and quality gates are tuned and measured on gfx1151, and on gfx1201 as the split-mode target |

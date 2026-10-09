@@ -51,6 +51,10 @@ struct DevicePlacement {
 
     bool peer_access = false;                 // enable CUDA/HIP peer access between GPUs
     int  max_ctx     = 8192;                  // max KV cache context length
+    // --max-ctx auto: max_ctx is the model's trained context, and a backend
+    // that sizes its own cache lowers it to what its devices hold
+    // (ModelBackend::context_limit reports the result).
+    bool fit_ctx     = false;
 
     bool is_multi_device() const { return layer_split_gpus.size() > 1; }
     bool is_layer_split() const {

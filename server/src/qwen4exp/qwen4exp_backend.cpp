@@ -100,7 +100,7 @@ static bool load_qwen4exp_hot_experts(ggml_backend_t backend, Qwen4ExpWeights & 
 }
 
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
-        Qwen4ExpCache & cache, int slots, int resident_slots, size_t * snapshot_budget) {
+        Qwen4ExpCache & cache, int slots, int resident_slots, size_t * snapshot_budget, Qwen4ExpChunkPlan * plan) {
     if (slots < 1 || resident_slots < 1 || resident_slots > slots) return 0;
     size_t free_device = 0, total = 0, free_host = 0;
     ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device_id(backend), &free_device, &total);
@@ -201,7 +201,7 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
                        : w.hot ? kQwen4ExpSplitChunkFloor : kQwen4ExpSplitMaxChunk;
     struct Plan { size_t graph = 0, ring = 0, host = 0, scratch = 0; };
     std::vector<std::pair<int, Plan>> plans;   // one per probed chunk size
-    const int chunk = qwen4exp_fit_chunk(cache.max_ctx, available, fixed, [&](int n) {
+    auto chunk_workspace = [&](int n) {
         size_t graph = 0, inputs = 0, mask = 0, host = runtime_host, scratch = runtime_scratch;
         // End-of-context QSA workspace, and the largest dense span before QSA.
         // Include an unaligned context tail, which can fall back to dense FA.
@@ -230,7 +230,23 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         std::fprintf(stderr, "[qwen4exp] chunk-plan rows=%d graph=%zu ring=%zu host=%zu scratch=%zu required=%zu available=%zu\n",
             n, graph, slots * (inputs + mask), host, scratch, fixed + workspace, available);
         return workspace;
-    }, snapshot_budget, w.expert_backend ? kQwen4ExpSplitChunkFloor : 4096, max_rows);
+    };
+    const int floor_rows = w.expert_backend ? kQwen4ExpSplitChunkFloor : 4096;
+    if (plan) {
+        const size_t floor = chunk_workspace(std::min({floor_rows, max_rows, cache.max_ctx}));
+        plan->available = available;
+        plan->required = floor == SIZE_MAX ? SIZE_MAX : fixed + floor + available / 10;
+        // Every slot's attention and indexer rows; only this cache adds the MTP draft layer's.
+        size_t rows = 0;
+        for (const auto * group : {&cache.attn_k, &cache.attn_v, &cache.indexer_raw, &cache.indexer_k}) {
+            for (const ggml_tensor * t : *group) if (t) rows += ggml_nbytes(t);
+        }
+        const size_t mtp_rows = (cache.mtp_k ? ggml_nbytes(cache.mtp_k) : 0) + (cache.mtp_v ? ggml_nbytes(cache.mtp_v) : 0);
+        plan->position_bytes = ((size_t) slots * rows + mtp_rows) / cache.max_ctx + 1;
+        if (plan->required > available) return 0;   // the context fit moves on without searching smaller chunks
+    }
+    const int chunk = qwen4exp_fit_chunk(cache.max_ctx, available, fixed, chunk_workspace, snapshot_budget,
+                                         floor_rows, max_rows);
     std::fprintf(stderr, "[qwen4exp] chunk-auto ctx=%d slots=%d resident=%d chunk=%d state=%zu fixed=%zu available=%zu headroom=%zu\n",
         cache.max_ctx, slots, resident_slots, chunk, state,
         fixed + (snapshot_budget ? *snapshot_budget : 0), available, available / 10);
@@ -309,27 +325,45 @@ bool Qwen4ExpBackend::load_target() {
     if (!load_qwen4exp_hot_experts(backend_, weights_,
                                    cfg_.max_concurrency > 1 ? std::string() : cfg_.expert_placement_path,
                                    expert_budget_bytes_from_env(kQwen4ExpHotExpertBudget))) return false;
-    snapshot_budget_ = SIZE_MAX;
-    // Snapshots in the target's memory get an allowance the planner sizes and captures respect. In system memory
-    // the server's resident limit bounds them.
-    auto allowance = [this](size_t snapshots) -> size_t * {
-        if (snap_backend_ != backend_) return nullptr;
-        snapshot_budget_ = snapshots * snapshot_bytes_estimate(cache_.max_ctx);
-        return &snapshot_budget_;
-    };
-    const int explicit_chunk = weights_.expert_backend ? std::min(cfg_.chunk, kQwen4ExpSplitMaxChunk) : cfg_.chunk;
-    if (cfg_.max_concurrency > 1) {
-        // Prefix checkpoints: each slot's restore point and capture in flight
-        // plus one shared head, the server's concurrent prefix budget. The
-        // planner caps the prefill granule; an explicit --chunk sets it, and the
-        // allowance is measured either way.
-        const int fit = qwen4exp_select_chunk(backend_, weights_, cache_, cfg_.max_concurrency, 1,
-                                              allowance(2 * (size_t) cfg_.max_concurrency + 1));
-        chunk_ = cfg_.chunk > 0 && fit > 0 ? explicit_chunk : fit;
-    } else if (cfg_.chunk > 0) {
-        chunk_ = explicit_chunk;
-    } else {
-        chunk_ = qwen4exp_select_chunk(backend_, weights_, cache_, 1, 1, allowance(3));
+    // --max-ctx auto: the largest context, up to the trained one, at which every slot's cache, the resident graphs, a
+    // floor-sized prompt chunk and, with snapshots on the target, one full snapshot per slot fit
+    // (Qwen4ExpContextFit). The context found stays: an unpark sizes itself for it.
+    for (Qwen4ExpContextFit search;;) {
+        Qwen4ExpChunkPlan plan;
+        chunk_ = plan_chunk(cfg_.device.fit_ctx ? &plan : nullptr);
+        if (!cfg_.device.fit_ctx) break;
+        const int ctx = cache_.max_ctx;
+        const size_t snapshots = snap_backend_ == backend_
+            ? (size_t) cfg_.max_concurrency * snapshot_bytes_estimate(ctx) : 0;
+        const size_t position = plan.position_bytes + snapshots / ctx;
+        const bool fit = plan.required <= plan.available && snapshots <= plan.available - plan.required;
+        if (fit) {
+            search.fits = ctx;
+            search.spare = plan.available - plan.required - snapshots;
+        } else {
+            search.misses = ctx;
+            search.missing = plan.required == SIZE_MAX ? (size_t) ctx / 4 * position
+                                                       : plan.required + snapshots - plan.available;
+        }
+        int next = search.next(position);
+        if (!next && !search.fits) {
+            std::fprintf(stderr, "[qwen4exp] no context fits beside the weights\n");
+            return false;
+        }
+        if (!next) {
+            cfg_.device.fit_ctx = false;
+            std::fprintf(stderr, "[qwen4exp] context fitted to the devices: %d tokens, %d at once\n",
+                         search.fits, cfg_.max_concurrency);
+            if (fit) break;
+            next = search.fits;   // the last plan missed: plan the fit again
+        }
+        free_qwen4exp_cache(cache_);
+        cache_ = {};
+        cfg_.device.max_ctx = next;
+        if (!create_main_cache()) {
+            std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
+            return false;
+        }
     }
     if (snapshot_budget_ != SIZE_MAX)
         std::fprintf(stderr, "[qwen4exp] prefix snapshot allowance=%zu bytes\n", snapshot_budget_);
@@ -344,6 +378,27 @@ bool Qwen4ExpBackend::load_target() {
         return false;
     }
     return true;
+}
+
+// The prompt chunk, measured against free memory unless --chunk sets it (concurrent serving measures either way,
+// to size the prefix allowance; so does a context fit, which reads `plan`).
+int Qwen4ExpBackend::plan_chunk(Qwen4ExpChunkPlan * plan) {
+    snapshot_budget_ = SIZE_MAX;
+    // Snapshots in the target's memory get an allowance the planner sizes and captures respect. In system memory
+    // the server's resident limit bounds them.
+    auto allowance = [this](size_t snapshots) -> size_t * {
+        if (snap_backend_ != backend_) return nullptr;
+        snapshot_budget_ = snapshots * snapshot_bytes_estimate(cache_.max_ctx);
+        return &snapshot_budget_;
+    };
+    const int explicit_chunk = weights_.expert_backend ? std::min(cfg_.chunk, kQwen4ExpSplitMaxChunk) : cfg_.chunk;
+    if (cfg_.chunk > 0 && cfg_.max_concurrency == 1 && !plan) return explicit_chunk;
+    // Prefix checkpoints with concurrent slots: each slot's restore point and capture in flight plus one shared
+    // head, the server's concurrent prefix budget. One sequence keeps three.
+    const int slots = cfg_.max_concurrency;
+    const int fit = qwen4exp_select_chunk(backend_, weights_, cache_, slots, 1,
+                                          allowance(slots > 1 ? 2 * (size_t) slots + 1 : 3), plan);
+    return cfg_.chunk > 0 && fit > 0 ? explicit_chunk : fit;
 }
 
 void Qwen4ExpBackend::release_target() {
@@ -361,7 +416,8 @@ void Qwen4ExpBackend::release_target() {
 // Slot 0 of the concurrency engine; with concurrent slots its recurrent state is
 // the first slab of the slot states the multi-slot decode graph batches over.
 bool Qwen4ExpBackend::create_main_cache() {
-    if (cfg_.max_concurrency > 1 &&
+    // The slot states do not depend on the context, so a context fit's rebuilt cache keeps them.
+    if (cfg_.max_concurrency > 1 && !slot_states_.buf &&
         !create_qwen4exp_slot_states(backend_, weights_, cfg_.max_concurrency, slot_states_)) return false;
     return create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
         cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1),

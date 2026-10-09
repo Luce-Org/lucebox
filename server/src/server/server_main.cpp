@@ -125,7 +125,9 @@ static void print_usage(const char * prog) {
         "  --mmproj-device hip:N  Run the DS4V image encoder on another GPU (one-GPU layout)\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
-        "  --max-ctx <N>        Max context length (default: 8192)\n"
+        "  --max-ctx <N|auto>   Max context length (default: 8192). auto: the model's\n"
+        "                       trained context, lowered to what the devices hold\n"
+        "                       (Qwen3.8-Flash-Next)\n"
         "  --max-tokens <N>     Default max output tokens (legacy alias for\n"
         "                       --default-max-tokens; loses to --default-max-tokens\n"
         "                       when both are passed)\n"
@@ -458,7 +460,8 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
             sconfig.host = argv[++i];
         } else if (std::strcmp(argv[i], "--max-ctx") == 0 && i + 1 < argc) {
-            int v = std::atoi(argv[++i]);
+            bargs.device.fit_ctx = std::strcmp(argv[++i], "auto") == 0;
+            int v = bargs.device.fit_ctx ? 0 : std::atoi(argv[i]);
             sconfig.max_ctx = v;
             bargs.device.max_ctx = v;
         } else if (std::strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
@@ -983,6 +986,16 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
     if (bargs.max_concurrency > 1 &&
         inspect_gguf_model_info(bargs.model_path.c_str()).arch != "qwen4exp")
         bargs.paged_attention = true;
+    // --max-ctx auto starts from the trained context; the backend lowers it to what its devices hold.
+    if (bargs.device.fit_ctx) {
+        const GgufMetadata meta = read_gguf_metadata(bargs.model_path, false);
+        if (meta.general_architecture != "qwen4exp" || meta.context_length <= 0) {
+            std::fprintf(stderr, "[server] --max-ctx auto needs a model whose backend fits its context to the "
+                                 "devices (Qwen3.8-Flash-Next); give --max-ctx a token count\n");
+            return 2;
+        }
+        bargs.device.max_ctx = meta.context_length;
+    }
     if (sconfig.decode_kv_offload_bytes &&
         sconfig.decode_kv_offload_bytes != kAutoKvOffloadBytes && bargs.max_concurrency <= 1) {
         std::fprintf(stderr, "[server] --decode-kv-offload-mb requires --max-concurrency greater than 1\n");
@@ -1486,6 +1499,10 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         return 1;
     }
     ModelBackend * backend = backend_owner.get();
+    // --max-ctx auto: serve the context the backend fitted to its devices.
+    if (backend_placement.target.fit_ctx && backend->context_limit() > 0) {
+        sconfig.max_ctx = backend->context_limit();
+    }
     // Cross-check the capability table against the backend that was actually
     // built. arch_supports_remote_draft() admitted this launch from the arch
     // string alone; if the two ever disagree the table is stale, and failing

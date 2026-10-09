@@ -23,6 +23,8 @@
 
 namespace luce::common {
 
+struct Qwen4ExpChunkPlan;
+
 struct Qwen4ExpBackendConfig {
     std::string     model_path;
     std::optional<std::string> draft_path; // MTP sidecar; absent = auto-discover
@@ -49,6 +51,7 @@ public:
     // ModelBackend interface
     void print_ready_banner() const override;
     int prefill_chunk_size() const override { return chunk_; }
+    int context_limit() const override { return cache_.max_ctx; }
 
     bool park(ParkTarget target) override;
     bool unpark(ParkTarget target) override;
@@ -89,6 +92,7 @@ private:
     bool snapshot_save_replacing(int slot, int source);
     bool snapshot_fits(int slot, int replaced = -1) const;
     bool create_main_cache();
+    int plan_chunk(Qwen4ExpChunkPlan * plan = nullptr);
     bool start_seq_engine(); // no-op at --max-concurrency 1
     // Weights, caches, hot experts, the prefill chunk and the prefix allowance, then the slot engine: init and
     // unpark share it, so an unpark sizes itself for the memory free at that time. release_target() undoes it.
