@@ -1,21 +1,20 @@
 // fast_reduce_kernels.cu - the device half of the lean decode-path reduction.
 //
-// Three tiny kernels per reduction, all on the backend's own stream so they sit
-// in the graph exactly where the collective used to:
+// The flags normally go by stream memory operations (hipStreamWriteValue32 and
+// hipStreamWaitValue32, in fast_reduce.cpp). The kernels here are the rest:
 //
-//   set_flag    raise this rank's publish flag once the payload has been
-//               copied out. The copy itself is a DMA, enqueued ahead of this
-//               on the same stream, so stream order is what publishes it.
-//   wait_flags  spin until every peer's flag has arrived.
-//   add_peers   add the peers' partials, by then copied into device memory.
+//   pack, add_zc   the zero-copy path: pack this rank's row into pinned memory
+//                  (f32 or bf16) and add the peer's row straight from it.
+//   add            the copy path: add the peers' partials, by then copied into
+//                  device memory.
+//   hyb_*          the two-rank hybrid exchange (FastReduce::hyb_combine).
+//   set_flag,      the kernel form of the flags, kept for comparison
+//   wait_flags     (LUCE_CLUSTER_FAST_REDUCE_KERNEL_FLAGS=1).
 //
-// WHY THE PAYLOAD IS NOT MOVED BY A KERNEL. It was, and it cost 33 ms per
-// reduction against RCCL's 117 us -- 250 times worse than the thing it was
-// meant to replace. Pinned host memory is mapped uncached for the GPU, so a
-// kernel reading or writing bulk data there crawls; the copy engine does not
-// care, because it is not reading through the GPU's caches. So the payload goes
-// by hipMemcpyAsync and only the flags -- four bytes, three times per
-// reduction -- are touched by a kernel at zero-copy speed.
+// WHY THE COPY PATH MOVES THE PAYLOAD BY DMA. A kernel moving it cost 33 ms per
+// reduction against RCCL's 117 us. Pinned host memory is mapped uncached for
+// the GPU, so a kernel reading or writing bulk data there crawls; the copy
+// engine does not care, because it is not reading through the GPU's caches.
 //
 // WHY THE FLAGS ARE PINNED AND NOT MANAGED. gfx1151 reports XNACK disabled, so
 // the GPU cannot take a page fault, and a managed page the CPU has touched
@@ -23,8 +22,9 @@
 // no fault to be reached -- and the round trip through one measures 0.79 us
 // (server/test/cluster_flag_latency.cu), which is what makes this worth doing.
 //
-// Every spin is bounded and counted. A rank that dies must surface as a visible
-// failure, not as a GPU that never returns.
+// A stream wait has no timeout of its own: the host's progress thread bounds it
+// (LUCE_CLUSTER_FAST_REDUCE_STALL_S) and releases the GPU when a peer is gone.
+// The kernel form's spin is bounded and counted (FastReduce::timed_out).
 
 #include <hip/hip_runtime.h>
 
@@ -248,18 +248,6 @@ void fast_reduce_launch_hyb_final_pub(const void * own_row, const void * peer_ro
 void fast_reduce_launch_hyb_final(const void * own_row, const void * peer_row, float * dst, int n, int bf16,
                                   hipStream_t stream) {
     fast_reduce_launch_hyb_final_pub(own_row, peer_row, dst, n, bf16, nullptr, 0, nullptr, stream);
-}
-
-// A word another device polls, written after every earlier write of this
-// stream's kernels left this device (peer writes, then the flag on the same
-// path, so the reader sees the data once it sees the flag).
-__global__ void fast_reduce_flag_sys_kernel(uint32_t * flag, uint32_t value) {
-    __threadfence_system();
-    __hip_atomic_store(flag, value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-}
-
-void fast_reduce_launch_flag_sys(uint32_t * flag, uint32_t value, hipStream_t stream) {
-    hipLaunchKernelGGL(fast_reduce_flag_sys_kernel, dim3(1), dim3(1), 0, stream, flag, value);
 }
 
 void fast_reduce_launch_pack_pub(const float * src, void * dst, int n, int bf16,

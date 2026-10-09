@@ -16,9 +16,9 @@
 // what arrives. There is no algorithm selection, no protocol negotiation and
 // no proxy handshake -- one RDMA write per peer and a flag.
 //
-// WHAT IT ASSUMES. Unified memory. On Strix Halo there is no separate VRAM, so
-// a pinned host buffer *is* GPU memory: the NIC writes into it and a kernel
-// reads it without a copy and without GPUDirect. It also assumes the ranks run
+// WHAT IT ASSUMES. Pinned host memory that both the NIC and the GPU reach: the
+// NIC writes each peer's row into it, and the GPU reads it there or after a DMA
+// copy, so no GPUDirect is needed. It also assumes the ranks run
 // the same graph in lockstep, so that the n-th reduction on one rank is the
 // n-th on all of them -- which is what the sequence numbers check rather than
 // trust.
@@ -56,12 +56,12 @@ public:
         int         gid_index = 1;       // RoCE v2
         std::string bootstrap_host;      // rank 0's address
         int         bootstrap_port = 9500;
-        // Decode sizes only -- 10240 floats is the largest a step reduces --
-        // and a ring deep enough that the guard against lapping it almost never
-        // fires. It has to be deep: the guard is a stream wait, and a stream
-        // wait that fires stops the GPU running ahead, which is where this
-        // path's speed comes from. Prefill's much larger reductions fall back
-        // to RCCL, where they cost nothing that matters.
+        // Sized for a plain decode step (10240 floats is the largest it
+        // reduces); DeepSeek V4 sizes both for its verify batch. The ring has
+        // to be deep: the guard against lapping it is a stream wait, and a
+        // stream wait that fires stops the GPU running ahead, which is where
+        // this path's speed comes from. Prefill's much larger reductions fall
+        // back to RCCL, where they cost nothing that matters.
         int         max_elems = 16384;   // 64 KiB
         int         slots = 4096;        // a step has ~97
         uint32_t    timeout_ms = 30000;
@@ -104,7 +104,7 @@ public:
     bool hyb_combine(const float * data, size_t n, void * stream, uint64_t k);
     bool hyb_import(float * data, size_t n, void * stream, uint64_t k);
 
-    // Reductions issued and how long the progress thread waited for the GPU,
+    // Reductions issued, and flag waits of the kernel form that timed out,
     // for the telemetry line.
     uint64_t submitted() const;
     uint64_t timed_out() const;
