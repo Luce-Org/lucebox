@@ -186,7 +186,10 @@ struct Qwen4ExpCache {
     std::array<Qwen4ExpDecodeWorkspace, QWEN4EXP_MTP_MAX_DRAFT + 1> mtp_rank_workspace;
 
     // Split mode (Qwen4ExpWeights::expert_backend): schedulers over the target,
-    // the expert device and the CPU, reused across forwards.
+    // the expert device and the CPU, reused across forwards. Concurrency slots
+    // use the first slot's (split_owner): one forward runs at a time, so one
+    // prompt chunk's buffers serve every slot, as the chunk planner counts them.
+    Qwen4ExpCache *      split_owner       = nullptr;   // not owned; null: this cache's own
     ggml_backend_sched_t split_sched       = nullptr;   // prompt chunks
     ggml_backend_sched_t split_sched_short = nullptr;   // decode and short batches
     uint64_t             split_short_gen   = 0;         // bumped on every short-scheduler allocation

@@ -1812,13 +1812,17 @@ static ggml_context * graph_context(Qwen4ExpDecodeWorkspace * pool, ggml_backend
 // Split mode: one scheduler for decode, verify and short batches, one for prompt chunks; a verify width keeps its
 // own short-batch scheduler (and allocation) beside its graph (`pool`). The chunk planner measures the live
 // split-input copies through ggml_backend_sched_reserve_size.
+// The cache whose split schedulers `c` uses (Qwen4ExpCache::split_owner).
+static Qwen4ExpCache & split_owner(Qwen4ExpCache & c) { return c.split_owner ? *c.split_owner : c; }
+
 static ggml_backend_sched_t split_scheduler(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
                                             Qwen4ExpDecodeWorkspace * pool, bool verify, bool short_batch) {
+    Qwen4ExpCache & owner = split_owner(cache);
     ggml_backend_sched_t & sched = verify && pool ? pool->sched
-                                 : short_batch ? cache.split_sched_short : cache.split_sched;
+                                 : short_batch ? owner.split_sched_short : owner.split_sched;
     if (!sched) {
-        if (!cache.split_cpu) cache.split_cpu = ggml_backend_cpu_init();
-        ggml_backend_t backends[3] = { backend, w.expert_backend, cache.split_cpu };
+        if (!owner.split_cpu) owner.split_cpu = ggml_backend_cpu_init();
+        ggml_backend_t backends[3] = { backend, w.expert_backend, owner.split_cpu };
         // Both are parallel: per-copy events make a split wait for its
         // cross-device inputs on the GPU; a single-copy scheduler instead
         // synchronizes the receiving device from the host before every such
@@ -1887,7 +1891,7 @@ static void measure_split_graph(ggml_backend_t backend, const Qwen4ExpWeights & 
                                 ggml_cgraph * gf, const std::vector<ggml_tensor *> & expert_nodes, int64_t T, int pos0,
                                 bool verify, Qwen4ExpGraphMemory & measure) {
     ggml_backend_sched_t sched = split_scheduler(backend, w, cache, nullptr, verify, T <= kSplitShortRows);
-    const ggml_backend_t devices[3] = { backend, w.expert_backend, cache.split_cpu };
+    const ggml_backend_t devices[3] = { backend, w.expert_backend, split_owner(cache).split_cpu };
     const ggml_tensor * unplaced = nullptr;
     for (int i = 0; i < ggml_graph_n_nodes(gf) && !unplaced; ++i) {
         const ggml_tensor * node = ggml_graph_node(gf, i);
@@ -1907,7 +1911,7 @@ static void measure_split_graph(ggml_backend_t backend, const Qwen4ExpWeights & 
     size_t sizes[3] = {};
     ggml_backend_sched_reserve_size(sched, gf, sizes);
     ggml_backend_sched_reset(sched);
-    if (T <= kSplitShortRows) ++cache.split_short_gen;   // a retained stable graph must allocate again
+    if (T <= kSplitShortRows) ++split_owner(cache).split_short_gen;   // a retained stable graph must allocate again
     measure.graph = sizes[0];
 }
 
@@ -1947,23 +1951,36 @@ static bool place_inputs_in_ring(ggml_backend_t backend, const Qwen4ExpWeights &
     return true;
 }
 
+// The CUDA pools keep every block they free, so the growing temporaries of a long prompt can hold the memory a graph
+// allocation needs. Release the devices' cached blocks (ggml_backend_cuda_trim_pool); true when any came back.
+static bool release_cached_pools(ggml_backend_t backend, const Qwen4ExpWeights & w) {
+    size_t freed = ggml_backend_cuda_trim_pool(backend);
+    if (w.expert_backend) freed += ggml_backend_cuda_trim_pool(w.expert_backend);
+    if (freed) std::fprintf(stderr, "[qwen4exp] released %zu MiB of cached pool memory for a graph\n", freed >> 20);
+    return freed > 0;
+}
+
 // Allocate the graph: on the split scheduler (weights decide placement, see qwen4exp_pin_split), or with the
-// workspace's retained allocator (`pool`), or a fresh one (`galloc`, the caller frees it). On failure the caller
-// frees its context unless the workspace owns it.
+// workspace's retained allocator (`pool`), or a fresh one (`galloc`, the caller frees it). A failed allocation
+// retries once with the cached pool memory released. On failure the caller frees its context unless the workspace
+// owns it.
 static bool allocate_graph(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
                            Qwen4ExpDecodeWorkspace * pool, bool verify, ggml_cgraph * gf,
                            const std::vector<ggml_tensor *> & expert_nodes, int64_t T, int64_t kv_len,
                            ggml_backend_sched_t & split_sched, ggml_gallocr_t & galloc) {
     if (w.expert_backend) {
         split_sched = split_scheduler(backend, w, cache, pool, verify, T <= kSplitShortRows);
-        ggml_backend_sched_reset(split_sched);
-        qwen4exp_pin_split(split_sched, gf, backend, w.expert_backend, expert_nodes);
-        if (!ggml_backend_sched_alloc_graph(split_sched, gf)) {
+        auto alloc = [&] {
+            ggml_backend_sched_reset(split_sched);
+            qwen4exp_pin_split(split_sched, gf, backend, w.expert_backend, expert_nodes);
+            return ggml_backend_sched_alloc_graph(split_sched, gf);
+        };
+        if (!alloc() && !(release_cached_pools(backend, w) && alloc())) {
             std::fprintf(stderr, "[qwen4exp] split graph alloc failed (T=%lld kv_len=%lld)\n",
                          (long long) T, (long long) kv_len);
             return false;
         }
-        if (split_sched == cache.split_sched_short) ++cache.split_short_gen;
+        if (split_sched == split_owner(cache).split_sched_short) ++split_owner(cache).split_short_gen;
         return true;
     }
     if (pool) {
@@ -1981,8 +1998,10 @@ static bool allocate_graph(ggml_backend_t backend, const Qwen4ExpWeights & w, Qw
     // T=1 graphs keep the same broad shape but advancing KV views can change
     // lifetimes. Recompute assignments while retaining the allocator buffers;
     // reusing the old index-wise plan produced incorrect tokens.
-    const bool reserve_ok = !pool || !pool->planned || ggml_gallocr_reserve(galloc, gf);
-    if (!reserve_ok || !ggml_gallocr_alloc_graph(galloc, gf)) {
+    auto alloc = [&] {
+        return (!pool || !pool->planned || ggml_gallocr_reserve(galloc, gf)) && ggml_gallocr_alloc_graph(galloc, gf);
+    };
+    if (!alloc() && !(release_cached_pools(backend, w) && alloc())) {
         std::fprintf(stderr, "[qwen4exp] graph alloc failed (T=%lld kv_len=%lld)\n",
                      (long long) T, (long long) kv_len);
         if (pool) {
@@ -2159,11 +2178,13 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     // allocation: the scheduler rewrote its cross-device sources, so it is never split again.
     if (use_stable_graph && stable_ws.gf && (stable_ws.qsa_blocks >= 0) == stable_qsa &&
         (stable_ws.hidden != nullptr) == (out_hidden != nullptr) &&
-        (!split || stable_ws.sched || stable_ws.split_gen == cache.split_short_gen) &&
+        (!split || stable_ws.sched || stable_ws.split_gen == split_owner(cache).split_short_gen) &&
         (verify ? stable_ws.row_spans == row_spans : kv_len <= stable_ws.kv_bucket && stable_ws.next_pos == pos0) &&
         (!stable_qsa || (stable_ws.kv_bucket == stable_kv_bucket &&
                         stable_ws.qsa_budget == w.indexer_top_k / 4 && cache.indexer_blocks == pos0 / 4))) {
-        if (!run_stable_graph(stable_in, stable_ws, cache.split_sched_short, verify, out_logits, out_hidden)) return res;
+        if (!run_stable_graph(stable_in, stable_ws, split_owner(cache).split_sched_short, verify, out_logits, out_hidden)) {
+            return res;
+        }
         stable_ws.next_pos = (int) kv_len;
         cache.cur_pos = (int) kv_len;
         ++stable_ws.replays;
@@ -2311,7 +2332,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
 
     if (use_stable_graph) {
         stable_ws.expert_nodes = expert_nodes;
-        stable_ws.split_gen = cache.split_short_gen;
+        stable_ws.split_gen = split_owner(cache).split_short_gen;
         stable_ws.gf = gf;
         stable_ws.inp_emb = inp_emb;
         stable_ws.positions = positions;
@@ -2356,6 +2377,9 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         }
         return res;
     }
+    // A split prompt chunk's temporaries grow with its position, and the target's pool keeps every block it frees:
+    // a long prompt would leave each chunk's behind until the device runs out. Release them after the chunk.
+    if (split && T > kSplitShortRows) ggml_backend_cuda_trim_pool(backend);
     cache.ple_prev = inputs->ple_prev;
     // Commit only after the graph computed: a failed compute must not mark blocks the kernel never pooled.
     cache.cur_pos = (int) kv_len;

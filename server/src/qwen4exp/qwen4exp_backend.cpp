@@ -431,6 +431,7 @@ bool Qwen4ExpBackend::start_seq_engine() {
     for (Qwen4ExpCache & cache : seq_caches_) {
         if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache, false, 1,
                                    &slot_states_, (int) caches.size())) return false;
+        cache.split_owner = &cache_;
         caches.push_back(&cache);
     }
     seq_engine_ = std::make_unique<Qwen4ExpSeqEngine>(

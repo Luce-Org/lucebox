@@ -268,6 +268,7 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
     if (c.split_sched) { ggml_backend_sched_free(c.split_sched); c.split_sched = nullptr; }
     if (c.split_sched_short) { ggml_backend_sched_free(c.split_sched_short); c.split_sched_short = nullptr; }
     if (c.split_cpu) { ggml_backend_free(c.split_cpu); c.split_cpu = nullptr; }
+    c.split_owner = nullptr;
     if (c.input_ring.buf) {
         ggml_backend_buffer_free(c.input_ring.buf);
         c.input_ring.buf = nullptr;
