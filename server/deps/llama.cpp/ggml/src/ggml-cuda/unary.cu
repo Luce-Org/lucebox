@@ -357,13 +357,49 @@ static __global__ void swiglu_ds4_kernel(const T * gate, const T * up, T * dst, 
     dst[i] = ggml_cuda_op_swiglu_ds4_single(gate_v, up_v, limit);
 }
 
+// swiglu_ds4_kernel that also writes the result's q8_1 form as MMVQ's
+// quantize_q8_1 would (rows of n padded with zero blocks to n_q8): a warp's
+// 32 consecutive elements are one block (n % QK8_1 == 0). Threads past the
+// k results write the padding blocks.
+static __global__ void swiglu_ds4_q8_kernel(const float * gate, const float * up, float * dst,
+                                            const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
+                                            float limit, block_q8_1 * q8, const int64_t n_q8) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    const int64_t rows = k / n;
+    const int64_t pad = n_q8 - n;
+    float v = 0.0f;
+    int64_t qi;  // element index in the padded q8 layout
+    if (i < k) {
+        const int64_t j0 = (i / n) * o0 + (i % n);
+        const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+        v = ggml_cuda_op_swiglu_ds4_single(gate[j0], up[j1], limit);
+        dst[i] = v;
+        qi = (i / n) * n_q8 + (i % n);
+    } else if (i - k < rows * pad) {
+        const int64_t p = i - k;
+        qi = (p / pad) * n_q8 + n + (p % pad);
+    } else {
+        return;   // whole warps only: k and rows * pad are multiples of QK8_1
+    }
+    float amax = fabsf(v);
+    float sum = v;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+    q8[qi / QK8_1].qs[qi % QK8_1] = q;
+    if (qi % QK8_1 == 0) {
+        q8[qi / QK8_1].ds = make_half2(d, sum);
+    }
+}
+
 template <typename T>
 static void swiglu_ds4_cuda(const T * gate, const T * up, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, const float limit, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     swiglu_ds4_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(gate, up, dst, k, n, o0, o1, limit);
 }
 
-void ggml_cuda_op_swiglu_ds4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_swiglu_ds4(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8_out, int ncols_q8) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     void * src0_d = src0->data;
@@ -392,6 +428,16 @@ void ggml_cuda_op_swiglu_ds4(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     const float limit = ggml_get_op_params_f32(dst, 2);
 
+    if (q8_out) {
+        GGML_ASSERT(nc % QK8_1 == 0 && ncols_q8 % QK8_1 == 0 && ncols_q8 >= nc);
+        const int64_t k = ggml_nelements(dst);
+        const int64_t total = k + ggml_nrows(dst) * (ncols_q8 - nc);
+        const int64_t num_blocks = (total + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+        swiglu_ds4_q8_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(
+            (const float *) src0_d, (const float *) src1_d, (float *) dst_d, k, nc,
+            src0_o / sizeof(float), src1_o / sizeof(float), limit, (block_q8_1 *) q8_out, ncols_q8);
+        return;
+    }
     swiglu_ds4_cuda((float *) src0_d, (float *) src1_d, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), limit, stream);
 }
 

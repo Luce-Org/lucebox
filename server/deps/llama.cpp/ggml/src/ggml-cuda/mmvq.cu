@@ -624,6 +624,18 @@ static bool mmid_grouped_type_ok(ggml_type type) {
     }
 }
 
+// [TAG_MMID_GROUPED] LUCE_MMID_PREP_MEMO=0 recomputes the expert grouping for
+// every MUL_MAT_ID (see the grouped path in ggml_cuda_mul_mat_vec_q).
+static bool mmid_prep_memo_on() {
+    static const bool on = [] {
+        const char * e = std::getenv("LUCE_MMID_PREP_MEMO");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+// The memo entry kind of a cached expert grouping (q8_1 entries use a type or -1).
+#define MMID_PREP_MEMO_KIND (-2)
+
 static bool mmid_grouped_device_ok() {
     static const int selected = []() {
         const char * e = std::getenv("LUCE_MMID_GROUPED_DEVICE");
@@ -1862,7 +1874,8 @@ static __global__ void mmid_group_prep(
 // (n_expert_used x n_tokens) expert-matrix reads.
 template <ggml_type type, int c_rows_per_block, bool has_fusion,
           bool fp3_packed24 = false, bool fp2_packed32 = false,
-          int tokens_per_group = MMID_GROUPED_DEFAULT_TPG>
+          int tokens_per_group = MMID_GROUPED_DEFAULT_TPG,
+          bool fp2_prefetch = false>
 __launch_bounds__(tokens_per_group*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe_grouped(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ meta,
@@ -1938,39 +1951,46 @@ static __global__ void mul_mat_vec_q_moe_grouped(
     float tmp[c_rows_per_block] = {0.0f};
     float tmp_gate[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1);
-        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+    // ROCmFP2 on gfx1151: the per-expert kernel's prefetching loop, the same
+    // terms in the same kbx order as the loop below (bit-identical).
+    if constexpr (type == GGML_TYPE_Q2_0_ROCMFP2 && !fp2_packed32 && fp2_prefetch) {
+        mul_mat_vec_q_moe_fp2_prefetch<c_rows_per_block, has_fusion>(
+            vx, vgate, use_gate, y, kbx_offset, stride_row_x, blocks_per_row_x, tmp, tmp_gate);
+    } else {
+        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
 #pragma unroll
-        for (int i = 0; i < c_rows_per_block; ++i) {
-            if constexpr (fp2_packed32) {
-                tmp[i] += vec_dot_rocmfpx_fp2_q8_1_packed32(
-                    vx, &y[kby],
-                    kbx_offset + i*stride_row_x + kbx, kqs);
-            } else if constexpr (fp3_packed24) {
-                tmp[i] += vec_dot_rocmfpx_fp3_q8_1_packed24(
-                    vx, &y[kby],
-                    kbx_offset + i*stride_row_x + kbx, kqs);
-            } else {
-                tmp[i] += vec_dot_q_cuda(
-                    vx, &y[kby],
-                    kbx_offset + i*stride_row_x + kbx, kqs);
-            }
-            if constexpr (has_fusion) {
-                if (use_gate) {
-                    if constexpr (fp2_packed32) {
-                        tmp_gate[i] += vec_dot_rocmfpx_fp2_q8_1_packed32(
-                            vgate, &y[kby],
-                            kbx_offset + i*stride_row_x + kbx, kqs);
-                    } else if constexpr (fp3_packed24) {
-                        tmp_gate[i] += vec_dot_rocmfpx_fp3_q8_1_packed24(
-                            vgate, &y[kby],
-                            kbx_offset + i*stride_row_x + kbx, kqs);
-                    } else {
-                        tmp_gate[i] += vec_dot_q_cuda(
-                            vgate, &y[kby],
-                            kbx_offset + i*stride_row_x + kbx, kqs);
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                if constexpr (fp2_packed32) {
+                    tmp[i] += vec_dot_rocmfpx_fp2_q8_1_packed32(
+                        vx, &y[kby],
+                        kbx_offset + i*stride_row_x + kbx, kqs);
+                } else if constexpr (fp3_packed24) {
+                    tmp[i] += vec_dot_rocmfpx_fp3_q8_1_packed24(
+                        vx, &y[kby],
+                        kbx_offset + i*stride_row_x + kbx, kqs);
+                } else {
+                    tmp[i] += vec_dot_q_cuda(
+                        vx, &y[kby],
+                        kbx_offset + i*stride_row_x + kbx, kqs);
+                }
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        if constexpr (fp2_packed32) {
+                            tmp_gate[i] += vec_dot_rocmfpx_fp2_q8_1_packed32(
+                                vgate, &y[kby],
+                                kbx_offset + i*stride_row_x + kbx, kqs);
+                        } else if constexpr (fp3_packed24) {
+                            tmp_gate[i] += vec_dot_rocmfpx_fp3_q8_1_packed24(
+                                vgate, &y[kby],
+                                kbx_offset + i*stride_row_x + kbx, kqs);
+                        } else {
+                            tmp_gate[i] += vec_dot_q_cuda(
+                                vgate, &y[kby],
+                                kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
@@ -2037,7 +2057,8 @@ static __global__ void mul_mat_vec_q_moe_grouped(
 
 template <ggml_type type, bool fp3_packed24 = false,
           bool fp2_packed32 = false,
-          int tokens_per_group = MMID_GROUPED_DEFAULT_TPG>
+          int tokens_per_group = MMID_GROUPED_DEFAULT_TPG,
+          bool fp2_prefetch = false>
 static void mul_mat_vec_q_moe_grouped_launch(
         const void * vx, const void * vy, const int32_t * meta, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
@@ -2055,7 +2076,7 @@ static void mul_mat_vec_q_moe_grouped_launch(
     if (has_fusion) {
         mul_mat_vec_q_moe_grouped<
             type, rows_per_block, true, fp3_packed24, fp2_packed32,
-            tokens_per_group>
+            tokens_per_group, fp2_prefetch>
             <<<block_nums, block_dims, 0, stream>>>(
                 vx, vy, meta, fusion, dst, (uint32_t) np, ncols_x,
                 nchannels_y, nrows_x, stride_row_x, stride_col_y,
@@ -2064,13 +2085,25 @@ static void mul_mat_vec_q_moe_grouped_launch(
     } else {
         mul_mat_vec_q_moe_grouped<
             type, rows_per_block, false, fp3_packed24, fp2_packed32,
-            tokens_per_group>
+            tokens_per_group, fp2_prefetch>
             <<<block_nums, block_dims, 0, stream>>>(
                 vx, vy, meta, fusion, dst, (uint32_t) np, ncols_x,
                 nchannels_y, nrows_x, stride_row_x, stride_col_y,
                 stride_col_dst, stride_channel_x, stride_channel_y,
                 stride_channel_dst);
     }
+}
+
+// The prefetching ROCmFP2 loop (mul_mat_vec_q_moe_fp2_prefetch), for the
+// per-expert and the grouped expert kernels: LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH=0/1
+// wins; unset, gfx1151 only.
+static bool mmvq_moe_fp2_prefetch_on(const int cc) {
+    static const int setting = []() {
+        const char * e = std::getenv("LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH");
+        if (e == nullptr) return -1;
+        return (e[0] == '1' && e[1] == '\0') ? 1 : 0;
+    }();
+    return setting >= 0 ? setting == 1 : is_gfx1151(cc);
 }
 
 static bool mul_mat_vec_q_grouped_dispatch(
@@ -2120,6 +2153,13 @@ static bool mul_mat_vec_q_grouped_dispatch(
             if (mmvq_env_flag("LUCE_CUDA_MMVQ_MOE_FP2_PACKED32")) {
                 mul_mat_vec_q_moe_grouped_launch<
                     GGML_TYPE_Q2_0_ROCMFP2, false, true>(
+                        vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd,
+                        nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        max_groups, warp_size, stream);
+            } else if (mmvq_moe_fp2_prefetch_on(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                mul_mat_vec_q_moe_grouped_launch<
+                    GGML_TYPE_Q2_0_ROCMFP2, false, false, MMID_GROUPED_DEFAULT_TPG, true>(
                         vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd,
                         nrows_x, stride_row_x, stride_col_y, stride_col_dst,
                         stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -2441,16 +2481,7 @@ static void mul_mat_vec_q_moe_launch(
             std::getenv("LUCE_CUDA_MMVQ_MOE_FP2_PACKED32");
         return e && e[0] == '1' && e[1] == '\0';
     }();
-    // Explicit LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH wins; unset defaults to the
-    // prefetching ROCmFP2 loop on gfx1151 only.
-    static const int fp2_prefetch_setting = []() {
-        const char * e =
-            std::getenv("LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH");
-        if (e == nullptr) return -1;
-        return (e[0] == '1' && e[1] == '\0') ? 1 : 0;
-    }();
-    const bool fp2_prefetch =
-        fp2_prefetch_setting >= 0 ? fp2_prefetch_setting == 1 : gfx1151;
+    const bool fp2_prefetch = mmvq_moe_fp2_prefetch_on(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
     GGML_UNUSED(fp2_prefetch);
 
 #define GGML_MOE_LAUNCH_RPB(RPB) \
@@ -2590,14 +2621,18 @@ static void mul_mat_vec_q_moe_launch(
 // kernel at every width, so decode and verify stay consistent.
 #define MMVQ_Q8_RDNA4_MAX_COLS 8
 
-template <int ncols_dst, int c_rows, int c_vw, int c_row_groups>
+// glu: vx is the up matrix, vx_gate the gate matrix of the same shape; each
+// product keeps the single kernel's partials and reduction, and dst gets
+// ggml_cuda_op_swiglu_ds4_single(gate, up, glu_limit), the GLU kernel's value.
+template <int ncols_dst, int c_rows, int c_vw, int c_row_groups, bool glu = false>
 __launch_bounds__(32*c_vw*c_row_groups, 1)
 static __global__ void mul_mat_vec_q8_0_rdna4(
         const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y,
         const int stride_col_dst, const uint3 channel_ratio, const int stride_channel_x,
         const int stride_channel_y, const int stride_channel_dst, const uint3 sample_ratio,
-        const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+        const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        const int kb_off, const void * __restrict__ vx_gate, const float glu_limit) {
     constexpr int nvirt = 8;               // waves of the reference block
     constexpr int nq    = nvirt / c_vw;    // virtual waves per physical wave
     static_assert(nvirt % c_vw == 0, "c_vw must divide eight");
@@ -2619,28 +2654,41 @@ static __global__ void mul_mat_vec_q8_0_rdna4(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
     const block_q8_0 * x = ((const block_q8_0 *) vx) + sample_x*stride_sample_x + channel_x*stride_channel_x;
 
+    const block_q8_0 * xg = glu ? ((const block_q8_0 *) vx_gate) + sample_x*stride_sample_x + channel_x*stride_channel_x : x;
+
     const block_q8_0 * xr[c_rows];
+    const block_q8_0 * xgr[c_rows];
     bool row_ok[c_rows];
 #pragma unroll
     for (int r = 0; r < c_rows; ++r) {
         const int row = row_base + r;
         row_ok[r] = row < nrows_x;
-        xr[r] = x + (int64_t) (row_ok[r] ? row : 0)*stride_row_x;
+        xr[r]  = x  + (int64_t) (row_ok[r] ? row : 0)*stride_row_x;
+        xgr[r] = xg + (int64_t) (row_ok[r] ? row : 0)*stride_row_x;
     }
 
     float part[c_rows][ncols_dst][nq];
+    float partg[glu ? c_rows : 1][ncols_dst][nq];
 #pragma unroll
     for (int r = 0; r < c_rows; ++r)
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j)
 #pragma unroll
-            for (int q = 0; q < nq; ++q) part[r][j][q] = 0.0f;
+            for (int q = 0; q < nq; ++q) {
+                part[r][j][q] = 0.0f;
+                if constexpr (glu) partg[r][j][q] = 0.0f;
+            }
 
-    for (int k0 = 0; k0 < nb; k0 += 64) {
+    // kb_off > 0: the rows are a column range starting at block kb_off of
+    // wider rows (ggml_backend_cuda_mul_mat_whole_row_lanes). Each block takes
+    // the lane and K step it takes in the whole rows, so every partial adds
+    // the same terms in the same order as the whole rows times a src1 that is
+    // zero outside the range: those products only add exact zeros.
+    for (int k0 = (kb_off/64)*64; k0 < kb_off + nb; k0 += 64) {
 #pragma unroll
         for (int q = 0; q < nq; ++q) {
-            const int kbx = k0 + 8*(g + c_vw*q) + boff;
-            if (kbx < nb) {
+            const int kbx = k0 + 8*(g + c_vw*q) + boff - kb_off;
+            if (kbx >= 0 && kbx < nb) {
                 int   u0[ncols_dst];
                 int   u1[ncols_dst];
                 float dy[ncols_dst];
@@ -2664,12 +2712,26 @@ static __global__ void mul_mat_vec_q8_0_rdna4(
                         sumi = ggml_cuda_dp4a(v1, u1[j], sumi);
                         part[r][j][q] += dx*dy[j] * ((float) sumi);
                     }
+                    if constexpr (glu) {
+                        const block_q8_0 * bg = xgr[r] + kbx;
+                        const int   g0 = get_int_b2(bg->qs, 2*quarter + 0);
+                        const int   g1 = get_int_b2(bg->qs, 2*quarter + 1);
+                        const float dg = bg->d;
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            int sumg = 0;
+                            sumg = ggml_cuda_dp4a(g0, u0[j], sumg);
+                            sumg = ggml_cuda_dp4a(g1, u1[j], sumg);
+                            partg[r][j][q] += dg*dy[j] * ((float) sumg);
+                        }
+                    }
                 }
             }
         }
     }
 
     float sum[c_rows][ncols_dst];
+    float sumg[glu ? c_rows : 1][ncols_dst];
     if constexpr (c_vw == 1) {
 #pragma unroll
         for (int r = 0; r < c_rows; ++r)
@@ -2681,15 +2743,27 @@ static __global__ void mul_mat_vec_q8_0_rdna4(
                     t += part[r][j][q];
                 }
                 sum[r][j] = t;
+                if constexpr (glu) {
+                    float tg = partg[r][j][0];
+#pragma unroll
+                    for (int q = 1; q < nvirt; ++q) {
+                        tg += partg[r][j][q];
+                    }
+                    sumg[r][j] = tg;
+                }
             }
     } else {
         __shared__ float sh[c_row_groups][c_vw][c_rows][ncols_dst][nq][32];
+        __shared__ float shg[glu ? c_row_groups : 1][glu ? c_vw : 1][glu ? c_rows : 1][ncols_dst][glu ? nq : 1][32];
 #pragma unroll
         for (int r = 0; r < c_rows; ++r)
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j)
 #pragma unroll
-                for (int q = 0; q < nq; ++q) sh[rg][g][r][j][q][lane] = part[r][j][q];
+                for (int q = 0; q < nq; ++q) {
+                    sh[rg][g][r][j][q][lane] = part[r][j][q];
+                    if constexpr (glu) shg[rg][g][r][j][q][lane] = partg[r][j][q];
+                }
         __syncthreads();
         if (g != 0) {
             return;
@@ -2704,6 +2778,14 @@ static __global__ void mul_mat_vec_q8_0_rdna4(
                     t += sh[rg][v % c_vw][r][j][v / c_vw][lane];
                 }
                 sum[r][j] = t;
+                if constexpr (glu) {
+                    float tg = shg[rg][0][r][j][0][lane];
+#pragma unroll
+                    for (int v = 1; v < nvirt; ++v) {
+                        tg += shg[rg][v % c_vw][r][j][v / c_vw][lane];
+                    }
+                    sumg[r][j] = tg;
+                }
             }
     }
 
@@ -2713,7 +2795,12 @@ static __global__ void mul_mat_vec_q8_0_rdna4(
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
             const float t = warp_reduce_sum<32>(sum[r][j]);
-            if (lane == 0 && row_ok[r]) {
+            if constexpr (glu) {
+                const float tg = warp_reduce_sum<32>(sumg[r][j]);
+                if (lane == 0 && row_ok[r]) {
+                    dst[j*stride_col_dst + row_base + r] = ggml_cuda_op_swiglu_ds4_single(tg, t, glu_limit);
+                }
+            } else if (lane == 0 && row_ok[r]) {
                 dst[j*stride_col_dst + row_base + r] = t;
             }
         }
@@ -2735,14 +2822,38 @@ static void mul_mat_vec_q8_0_rdna4_launch_cfg(
         const int stride_col_dst, const int nchannels_dst, const uint3 channel_ratio,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_dst, const uint3 sample_ratio, const int stride_sample_x,
-        const int stride_sample_y, const int stride_sample_dst, cudaStream_t stream) {
+        const int stride_sample_y, const int stride_sample_dst, const int kb_off, cudaStream_t stream) {
     constexpr int rows_per_block = c_rows*c_row_groups;
     const dim3 block_nums((nrows_x + rows_per_block - 1)/rows_per_block, nchannels_dst, nsamples_dst);
     const dim3 block_dims(32, c_vw*c_row_groups, 1);
     mul_mat_vec_q8_0_rdna4<ncols_dst, c_rows, c_vw, c_row_groups><<<block_nums, block_dims, 0, stream>>>(
         vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, kb_off, nullptr, 0.0f);
+}
+
+// The gate/up pair with SwiGLU-DS4 (ggml_cuda_mmvq_rdna4_glu_pair): one block
+// shape, two rows per wave over four waves, whose cross-wave partials of both
+// products fit the LDS at eight columns. Every shape is bit-exact, so the pair
+// gives the value of the two table-shaped products and the GLU kernel.
+template <int ncols_dst>
+static void mul_mat_vec_q8_0_rdna4_launch_glu(
+        const void * vx, const void * vx_gate, const void * vy, float * dst, const float glu_limit,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y,
+        const int stride_col_dst, const int nchannels_dst, const uint3 channel_ratio,
+        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int nsamples_dst, const uint3 sample_ratio, const int stride_sample_x,
+        const int stride_sample_y, const int stride_sample_dst, cudaStream_t stream) {
+    constexpr int c_rows = 2, c_vw = 4, c_row_groups = 1;
+    static_assert(2u*c_row_groups*c_vw*c_rows*ncols_dst*(8/c_vw)*32*sizeof(float) <= 65536,
+                  "both products' partials must fit the LDS");
+    constexpr int rows_per_block = c_rows*c_row_groups;
+    const dim3 block_nums((nrows_x + rows_per_block - 1)/rows_per_block, nchannels_dst, nsamples_dst);
+    const dim3 block_dims(32, c_vw*c_row_groups, 1);
+    mul_mat_vec_q8_0_rdna4<ncols_dst, c_rows, c_vw, c_row_groups, true><<<block_nums, block_dims, 0, stream>>>(
+        vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, 0, vx_gate, glu_limit);
 }
 
 template <int ncols_dst>
@@ -2752,12 +2863,12 @@ static void mul_mat_vec_q8_0_rdna4_launch_nc(
         const int stride_col_dst, const int nchannels_dst, const uint3 channel_ratio,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_dst, const uint3 sample_ratio, const int stride_sample_x,
-        const int stride_sample_y, const int stride_sample_dst, cudaStream_t stream) {
+        const int stride_sample_y, const int stride_sample_dst, const int kb_off, cudaStream_t stream) {
 #define Q8_RDNA4_LAUNCH(R, VW, G) \
     mul_mat_vec_q8_0_rdna4_launch_cfg<ncols_dst, R, VW, G>(vx, vy, dst, ncols_x, nrows_x, \
         stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, channel_ratio, \
         stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio, \
-        stride_sample_x, stride_sample_y, stride_sample_dst, stream)
+        stride_sample_x, stride_sample_y, stride_sample_dst, kb_off, stream)
     // Block shapes from the gfx1201 sweep of the DS4.1 dense projections
     // (server/test/bench/bench_ds41_q8_mmvq.cpp). Few rows (attn_kv, 512) or one
     // K step per row (attn_q_b, K=1280): four waves share a row pair's eight
@@ -2773,17 +2884,38 @@ static void mul_mat_vec_q8_0_rdna4_launch_nc(
 #undef Q8_RDNA4_LAUNCH
 }
 
+// vx_gate set: the gate/up pair (vx is the up matrix), 2..8 columns, no column range.
 static void mul_mat_vec_q8_0_rdna4_launch(
         const void * vx, const void * vy, float * dst, const int ncols_dst,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y,
         const int stride_col_dst, const int nchannels_dst, const uint3 channel_ratio,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_dst, const uint3 sample_ratio, const int stride_sample_x,
-        const int stride_sample_y, const int stride_sample_dst, cudaStream_t stream) {
+        const int stride_sample_y, const int stride_sample_dst, const int kb_off,
+        const void * vx_gate, const float glu_limit, cudaStream_t stream) {
+    if (vx_gate) {
+        GGML_ASSERT(kb_off == 0);
+#define Q8_RDNA4_GLU_NC(NC) case NC: mul_mat_vec_q8_0_rdna4_launch_glu<NC>(vx, vx_gate, vy, dst, glu_limit, \
+        ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, channel_ratio, \
+        stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio, \
+        stride_sample_x, stride_sample_y, stride_sample_dst, stream); break
+        switch (ncols_dst) {
+            Q8_RDNA4_GLU_NC(2);
+            Q8_RDNA4_GLU_NC(3);
+            Q8_RDNA4_GLU_NC(4);
+            Q8_RDNA4_GLU_NC(5);
+            Q8_RDNA4_GLU_NC(6);
+            Q8_RDNA4_GLU_NC(7);
+            Q8_RDNA4_GLU_NC(8);
+            default: GGML_ABORT("unreachable q8_0 rdna4 glu width");
+        }
+#undef Q8_RDNA4_GLU_NC
+        return;
+    }
 #define Q8_RDNA4_NC(NC) case NC: mul_mat_vec_q8_0_rdna4_launch_nc<NC>(vx, vy, dst, ncols_x, nrows_x, \
         stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, channel_ratio, stride_channel_x, \
         stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio, stride_sample_x, \
-        stride_sample_y, stride_sample_dst, stream); break
+        stride_sample_y, stride_sample_dst, kb_off, stream); break
     switch (ncols_dst) {
         Q8_RDNA4_NC(1);
         Q8_RDNA4_NC(2);
@@ -2798,6 +2930,49 @@ static void mul_mat_vec_q8_0_rdna4_launch(
 #undef Q8_RDNA4_NC
 }
 #endif // defined(GGML_USE_HIP)
+
+// A Q8_0 gate/up pair (two MUL_MATs on the same activations) whose SwiGLU-DS4
+// reads exactly their outputs, at 2..8 columns of batch-invariant products on
+// RDNA4: ggml_cuda_mul_mat_vec_q with the gate as fusion runs it as one launch
+// of mul_mat_vec_q8_0_rdna4, bit-identical to the two products and the GLU
+// kernel (the caller rules out split buffers). LUCE_CUDA_MMVQ_Q8_RDNA4_GLU=0
+// keeps three launches.
+bool ggml_cuda_mmvq_rdna4_glu_pair(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu) {
+#if defined(GGML_USE_HIP)
+    static const bool enabled = []() {
+        const char * e = std::getenv("LUCE_CUDA_MMVQ_Q8_RDNA4_GLU");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    if (!enabled || !mmvq_q8_0_rdna4_enabled() || !ggml_cuda_mmvq_batch_invariant()) return false;
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA4(cc) || ggml_cuda_info().devices[device].warp_size != 32 ||
+        get_device_table_id(cc) != MMVQ_PARAMETERS_RDNA4 ||
+        calc_nwarps(GGML_TYPE_Q8_0, 1, MMVQ_PARAMETERS_RDNA4) != 8) {
+        return false;
+    }
+    if (gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT) return false;
+    const ggml_tensor * g0 = gate->src[0];
+    const ggml_tensor * u0 = up->src[0];
+    const ggml_tensor * x  = up->src[1];
+    if (g0->type != GGML_TYPE_Q8_0 || u0->type != GGML_TYPE_Q8_0 || gate->src[1] != x ||
+        !ggml_are_same_shape(g0, u0) || !ggml_are_same_stride(g0, u0) ||
+        x->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+        x->ne[2] != 1 || x->ne[3] != 1 || g0->ne[2] != 1 || g0->ne[3] != 1) {
+        return false;
+    }
+    if (x->ne[1] < 2 || x->ne[1] > MMVQ_Q8_RDNA4_MAX_COLS) return false;
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_DS4 ||
+        glu->src[0] != gate || glu->src[1] != up || ggml_get_op_params_i32(glu, 1) != 0 ||
+        glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
+        return false;
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(gate, up, glu);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
 
 // True when the single-column launch for this type, device and K is the generic kernel with one wave per row:
 // each lane walks K in the same order and one warp reduction sums the row, which is also what the multi-token
@@ -2831,7 +3006,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, cudaStream_t stream, const bool ids_tokenwise_samples = false) {
+        const int ids_stride, cudaStream_t stream, const bool ids_tokenwise_samples = false,
+        const int kb_off = 0) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     // Tokens as samples (see the batch-invariant MUL_MAT_ID case below) are a single-column launch.
@@ -2974,7 +3150,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // arithmetic, packed rows, see mul_mat_vec_q8_0_rdna4.
 #if defined(GGML_USE_HIP)
     if constexpr (type == GGML_TYPE_Q8_0) {
-        if (!has_ids && !has_fusion && (ncols_dst == 1 || width_invariant) &&
+        // A gate/up pair with SwiGLU-DS4 and nothing else fused (see
+        // ggml_cuda_mmvq_rdna4_glu_pair) runs as one launch of this kernel.
+        const bool rdna4_glu = has_fusion && fusion.gate != nullptr && fusion.x_bias == nullptr &&
+            fusion.gate_bias == nullptr && fusion.glu_op == GGML_GLU_OP_SWIGLU_DS4 &&
+            fusion.gate_value_scale == 1.0f && fusion.x_value_scale == 1.0f && kb_off == 0;
+        if (!has_ids && (!has_fusion || rdna4_glu) && (ncols_dst == 1 || width_invariant) &&
             ncols_dst <= MMVQ_Q8_RDNA4_MAX_COLS && GGML_CUDA_CC_IS_RDNA4(cc) &&
             warp_size == 32 && table_id == MMVQ_PARAMETERS_RDNA4 &&
             calc_nwarps(type, 1, table_id) == 8 && mmvq_q8_0_rdna4_enabled()) {
@@ -2982,11 +3163,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 vx, vy, dst, ncols_dst, ncols_x, nrows_x, stride_row_x, stride_col_y,
                 stride_col_dst, nchannels_dst, channel_ratio_fd, stride_channel_x,
                 stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio_fd,
-                stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+                stride_sample_x, stride_sample_y, stride_sample_dst, kb_off,
+                rdna4_glu ? fusion.gate : nullptr, fusion.glu_param0, stream);
             return;
         }
     }
 #endif // defined(GGML_USE_HIP)
+    // The generic kernels fuse one column only; several columns are the RDNA4
+    // Q8_0 gate/up pair above (ggml_cuda_mmvq_rdna4_glu_pair).
+    GGML_ASSERT(!has_fusion || has_ids || ncols_dst == 1);
     if constexpr (type == GGML_TYPE_Q8_0) {
         if (width_invariant) {
 #define GGML_MMVQ_INVARIANT_LAUNCH(NC) \
@@ -3329,7 +3514,7 @@ static void mul_mat_vec_q_switch_type(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, cudaStream_t stream) {
+        const int ids_stride, cudaStream_t stream, const int kb_off = 0) {
     switch (type_x) {
         case GGML_TYPE_Q2_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0>
@@ -3365,7 +3550,8 @@ static void mul_mat_vec_q_switch_type(
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+                 /*ids_tokenwise_samples=*/false, kb_off);
             break;
         case GGML_TYPE_MXFP4:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP4>
@@ -3505,10 +3691,18 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+bool ggml_cuda_luce_q8_memo_on() {
+    static const bool on = []() {
+        const char * e = getenv("LUCE_Q8_MEMO");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
-    GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(        src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_Q8_1);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
 
@@ -3536,7 +3730,11 @@ void ggml_cuda_mul_mat_vec_q(
     ggml_cuda_mm_fusion_args_device fusion_local{};
 
     if (fusion) {
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        // Several columns only for the RDNA4 Q8_0 gate/up pair (a gate, no
+        // biases: ggml_cuda_mmvq_rdna4_glu_pair), which switch_ncols_dst runs
+        // on mul_mat_vec_q8_0_rdna4.
+        GGML_ASSERT(  ids || dst->ne[1] == 1 ||
+                    (src0->type == GGML_TYPE_Q8_0 && fusion->gate && !fusion->x_bias && !fusion->gate_bias));
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
@@ -3576,13 +3774,15 @@ void ggml_cuda_mul_mat_vec_q(
     // matmuls of one token is a straight win on every backend measured, and
     // requiring an env var to get the tuned path invites running the slow one
     // by accident. LUCE_Q8_MEMO=0 opts out.
-    static const bool luce_q8_memo_on = []() {
-        const char * e = getenv("LUCE_Q8_MEMO");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
+    static const bool luce_q8_memo_on = ggml_cuda_luce_q8_memo_on();
     const size_t q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     char * src1_q8_d = nullptr;
+    if (src1->type == GGML_TYPE_Q8_1) {
+        // Already the q8_1 rows read below (quantized on another device).
+        GGML_ASSERT(ggml_is_contiguous(src1) && ne10 == ne10_padded);
+        src1_q8_d = (char *) src1->data;
+    }
     // The src1->q8_1 quantization depends only on src0->type and src1's dims/strides,
     // not on ids (ids only affects the matmul kernel's channel/dst strides below), so
     // the memo is valid for MUL_MAT_ID too: gate/up and the shared expert re-quantize
@@ -3595,13 +3795,33 @@ void ggml_cuda_mul_mat_vec_q(
     // entry filled on one stream could be read on another while the
     // quantize kernel is still in flight. Skip the memo whenever concurrent
     // streams are active for this evaluation.
-    const bool use_q8_memo = luce_q8_memo_on && src1->buffer != nullptr &&
+    const bool use_q8_memo = luce_q8_memo_on && src1->buffer != nullptr && src1->type == GGML_TYPE_F32 &&
                              ctx.stream_context().concurrent_events.empty();
+    // quantize_row_q8_1_cuda ignores src0's type and writes rows in their
+    // flattened order, so a contiguous src1 is keyed by the node it reshapes
+    // (a reshape only reinterprets the same bytes), its address, its row
+    // length and its row count: the routed experts' [n_embd, 1, T] input and
+    // the shared expert's [n_embd, T] activations share one quantization.
+    const ggml_tensor * q8_key_node = src1;
+    int64_t q8_key_ne[4] = {ne10, ne11, ne12, ne13};
+    int q8_key_type = (int) src0->type;
+    if (ggml_is_contiguous(src1)) {
+        // src[0], not view_src: view_src is the allocation root and would
+        // skip an in-place node between the reshape and that root.
+        while (q8_key_node->op == GGML_OP_RESHAPE && q8_key_node->src[0]) {
+            q8_key_node = q8_key_node->src[0];
+        }
+        q8_key_ne[1] = ne11*ne12*ne13;
+        q8_key_ne[2] = 1;
+        q8_key_ne[3] = 1;
+        q8_key_type = -1;
+    }
     if (use_q8_memo) {
         for (const auto & e : ctx.luce_q8_memo) {
-            if (e.src1_node == (const void *) src1 && e.src1_data == (const void *) src1_d &&
-                e.src0_type == (int) src0->type &&
-                e.ne[0] == ne10 && e.ne[1] == ne11 && e.ne[2] == ne12 && e.ne[3] == ne13) {
+            if (e.src1_node == (const void *) q8_key_node && e.src1_data == (const void *) src1_d &&
+                e.src0_type == q8_key_type &&
+                e.ne[0] == q8_key_ne[0] && e.ne[1] == q8_key_ne[1] &&
+                e.ne[2] == q8_key_ne[2] && e.ne[3] == q8_key_ne[3]) {
                 src1_q8_d = e.buf->ptr;
                 break;
             }
@@ -3611,10 +3831,10 @@ void ggml_cuda_mul_mat_vec_q(
         char * q8_dst;
         if (use_q8_memo) {
             ggml_backend_cuda_context::luce_q8_memo_entry ent;
-            ent.src1_node = (const void *) src1;
+            ent.src1_node = (const void *) q8_key_node;
             ent.src1_data = (const void *) src1_d;
-            ent.src0_type = (int) src0->type;
-            ent.ne[0] = ne10; ent.ne[1] = ne11; ent.ne[2] = ne12; ent.ne[3] = ne13;
+            ent.src0_type = q8_key_type;
+            ent.ne[0] = q8_key_ne[0]; ent.ne[1] = q8_key_ne[1]; ent.ne[2] = q8_key_ne[2]; ent.ne[3] = q8_key_ne[3];
             ent.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
             q8_dst = ent.buf->ptr;
             ctx.luce_q8_memo.push_back(std::move(ent));
@@ -3671,7 +3891,8 @@ void ggml_cuda_mul_mat_vec_q(
         // Batches above MMID_GROUPED_MAX_PAIRS fall through to the legacy
         // per-expert kernel instead of aborting the request.
         const int np = (int) (nchannels_dst*ncols_dst);
-        ggml_cuda_pool_alloc<int32_t> mmid_meta(ctx.pool(), MMID_META_INTS);
+        ggml_cuda_pool_alloc<int32_t> mmid_meta(ctx.pool());
+        int32_t * meta_d = nullptr;
         float * gate_w = nullptr;
         int gate_w_stride = 0;
         float gate_tau = 0.0f;
@@ -3681,31 +3902,63 @@ void ggml_cuda_mul_mat_vec_q(
             gate_w_stride = (int) (gx->weights->nb[1]/sizeof(float));
             gate_tau      = gx->tau;
         }
-        // Adaptive-k writes -1 drop sentinels, so it must gate a scratch copy:
-        // sibling weights can still take the legacy kernel, which interprets
-        // ids as unsigned. Fixed top-k only reads ids and avoids both the
-        // allocation and the tiny device-to-device copy on every expert op.
-        ggml_cuda_pool_alloc<int32_t> ids_gated(ctx.pool());
-        int32_t * prep_ids = const_cast<int32_t *>(ids_d);
-        int prep_ids_stride = (int) ids_stride;
-        if (gate_w != nullptr) {
-            prep_ids = ids_gated.alloc((size_t) np);
-            prep_ids_stride = (int) nchannels_dst;
-            CUDA_CHECK(cudaMemcpy2DAsync(prep_ids, nchannels_dst*sizeof(int32_t),
-                                         ids_d, ids_stride*sizeof(int32_t),
-                                         nchannels_dst*sizeof(int32_t), ncols_dst,
-                                         cudaMemcpyDeviceToDevice, stream));
+        // The gate, up and down products of an MoE layer read the same ids, so
+        // with fixed top-k (nothing gates them) their expert grouping is the
+        // same: it is computed once per evaluation and kept beside the
+        // memoized q8_1 activations (same lifetime, same LIFO release), keyed
+        // by the ids node like those are by their source node. Only when no
+        // local pool block is outstanding, which the release order needs.
+        const bool prep_memo = gate_w == nullptr && mmid_prep_memo_on() && src1_q8_1.ptr == nullptr &&
+                               ids->buffer != nullptr && ctx.stream_context().concurrent_events.empty();
+        if (prep_memo) {
+            for (const auto & e : ctx.luce_q8_memo) {
+                if (e.src0_type == MMID_PREP_MEMO_KIND && e.src1_node == (const void *) ids &&
+                    e.src1_data == (const void *) ids_d && e.ne[0] == np && e.ne[1] == ncols_dst &&
+                    e.ne[2] == nchannels_dst && e.ne[3] == ids_stride) {
+                    meta_d = (int32_t *) e.buf->ptr;
+                    break;
+                }
+            }
         }
-        // q4/top4 has just 16 pairs. Launch the smallest whole-warp block
-        // instead of 256 threads; __syncthreads() still covers every pair.
-        const int prep_warp = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-        const int prep_threads = ((np + prep_warp - 1)/prep_warp)*prep_warp;
-        mmid_group_prep<<<1, prep_threads, 0, stream>>>(
-            prep_ids, mmid_meta.ptr, (int) nchannels_dst, (int) ncols_dst, prep_ids_stride,
-            gate_w, gate_w_stride, gate_tau);
-        CUDA_CHECK(cudaGetLastError());
+        if (meta_d == nullptr) {
+            if (prep_memo) {
+                ggml_backend_cuda_context::luce_q8_memo_entry ent;
+                ent.src1_node = (const void *) ids;
+                ent.src1_data = (const void *) ids_d;
+                ent.src0_type = MMID_PREP_MEMO_KIND;
+                ent.ne[0] = np; ent.ne[1] = ncols_dst; ent.ne[2] = nchannels_dst; ent.ne[3] = ids_stride;
+                ent.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), MMID_META_INTS*sizeof(int32_t));
+                meta_d = (int32_t *) ent.buf->ptr;
+                ctx.luce_q8_memo.push_back(std::move(ent));
+            } else {
+                meta_d = mmid_meta.alloc(MMID_META_INTS);
+            }
+            // Adaptive-k writes -1 drop sentinels, so it must gate a scratch copy:
+            // sibling weights can still take the legacy kernel, which interprets
+            // ids as unsigned. Fixed top-k only reads ids and avoids both the
+            // allocation and the tiny device-to-device copy on every expert op.
+            ggml_cuda_pool_alloc<int32_t> ids_gated(ctx.pool());
+            int32_t * prep_ids = const_cast<int32_t *>(ids_d);
+            int prep_ids_stride = (int) ids_stride;
+            if (gate_w != nullptr) {
+                prep_ids = ids_gated.alloc((size_t) np);
+                prep_ids_stride = (int) nchannels_dst;
+                CUDA_CHECK(cudaMemcpy2DAsync(prep_ids, nchannels_dst*sizeof(int32_t),
+                                             ids_d, ids_stride*sizeof(int32_t),
+                                             nchannels_dst*sizeof(int32_t), ncols_dst,
+                                             cudaMemcpyDeviceToDevice, stream));
+            }
+            // q4/top4 has just 16 pairs. Launch the smallest whole-warp block
+            // instead of 256 threads; __syncthreads() still covers every pair.
+            const int prep_warp = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+            const int prep_threads = ((np + prep_warp - 1)/prep_warp)*prep_warp;
+            mmid_group_prep<<<1, prep_threads, 0, stream>>>(
+                prep_ids, meta_d, (int) nchannels_dst, (int) ncols_dst, prep_ids_stride,
+                gate_w, gate_w_stride, gate_tau);
+            CUDA_CHECK(cudaGetLastError());
+        }
         if (mul_mat_vec_q_grouped_dispatch(
-                src0->type, src0->data, src1_q8_d, mmid_meta.ptr, fusion_local, dst_d,
+                src0->type, src0->data, src1_q8_d, meta_d, fusion_local, dst_d,
                 (int) ne00, (int) ne01, (int) nchannels_y,
                 (int) s01, (int) stride_col_y, (int) stride_col_dst,
                 (int) s02, (int) stride_channel_y, (int) stride_channel_dst,
@@ -3757,11 +4010,19 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
+    // A flagged column range of Q8_0 rows: its first block in the whole rows
+    // (ggml_backend_cuda_mul_mat_whole_row_lanes).
+    int kb_off = 0;
+    if (!ids && src0->type == GGML_TYPE_Q8_0 && dst->op == GGML_OP_MUL_MAT &&
+        dst->op_params[1] == GGML_CUDA_WHOLE_ROW_LANES &&
+        src0->view_src != nullptr && src0->nb[1] == src0->view_src->nb[1]) {
+        kb_off = (int) ((src0->view_offs % src0->nb[1]) / sizeof(block_q8_0));
+    }
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream, kb_off);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

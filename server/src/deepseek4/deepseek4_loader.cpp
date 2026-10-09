@@ -475,6 +475,17 @@ static bool should_split_ds4_dense_tensor(const char * name, int mask) {
     return false;
 }
 
+// A rank's slice of a dense tensor (TargetLoadPlan slice_*): `count` rows
+// (or columns, or elements of a vector) starting at `first`, out of the
+// file's full rows of `full_ne0` elements.
+struct DS4TensorSlice {
+    enum Kind { None, Rows, Columns } kind = None;
+    int64_t first = 0;
+    int64_t count = 0;
+    int64_t full_ne0 = 0;
+    int64_t full_ne1 = 0;
+};
+
 struct DS4TensorAlloc {
     ggml_tensor * tensor = nullptr;
     size_t tensor_offset = 0;
@@ -483,7 +494,20 @@ struct DS4TensorAlloc {
     size_t buffer_offset = 0;
     bool upload_to_backend = true;
     bool dense_split = false;
+    DS4TensorSlice slice;
 };
+
+// Reshape `t` to its slice, in place (metadata only, before allocation).
+static void ds4_apply_slice_shape(ggml_tensor * t, const DS4TensorSlice & s) {
+    if (s.kind == DS4TensorSlice::Rows) {
+        t->ne[1] = s.count;
+    } else if (s.kind == DS4TensorSlice::Columns) {
+        t->ne[0] = s.count;
+        t->nb[1] = ggml_row_size(t->type, t->ne[0]);
+    }
+    t->nb[2] = t->nb[1] * t->ne[1];
+    t->nb[3] = t->nb[2] * t->ne[2];
+}
 }  // namespace
 
 // ─── Source-layer resolution ────────────────────────────────────────────
@@ -2252,6 +2276,78 @@ bool load_deepseek4_gguf_partial(const std::string & path,
                      dense_tp_mask, 1.0f - strix_fraction, strix_fraction);
     }
 
+    // Cluster rank slices: whole output groups of heads, block-aligned
+    // shared-expert units, or nothing (the full tensors are loaded).
+    int slice_head_first = 0, slice_heads = 0, slice_group_first = 0, slice_groups = 0;
+    int slice_ff_first = 0, slice_ff = 0;
+    if (plan.slice_ranks > 1 && plan.slice_attention &&
+        n_head % (uint32_t) plan.slice_ranks == 0 && n_out_group % (uint32_t) plan.slice_ranks == 0) {
+        slice_heads = (int) n_head / plan.slice_ranks;
+        slice_head_first = plan.slice_rank * slice_heads;
+        slice_groups = (int) n_out_group / plan.slice_ranks;
+        slice_group_first = plan.slice_rank * slice_groups;
+    }
+    if (plan.slice_ranks > 1 && plan.slice_shared_expert &&
+        n_ff_exp % (uint32_t) plan.slice_ranks == 0 &&
+        (n_ff_exp / (uint32_t) plan.slice_ranks) % 256 == 0) {
+        slice_ff = (int) n_ff_exp / plan.slice_ranks;
+        slice_ff_first = plan.slice_rank * slice_ff;
+    }
+    // A slice the quant blocks cannot follow fails the load: keeping that one
+    // tensor whole would no longer match its sliced partner.
+    std::string slice_error;
+    const auto slice_for = [&](const char * name, const ggml_tensor * t) {
+        DS4TensorSlice s;
+        int layer_id = -1;
+        if (!parse_block_tensor_name(name, layer_id)) return s;
+        const auto ends_with = [&](const char * suffix) {
+            const size_t n = std::strlen(name), m = std::strlen(suffix);
+            return n >= m && std::strcmp(name + n - m, suffix) == 0;
+        };
+        s.full_ne0 = t->ne[0];
+        s.full_ne1 = t->ne[1];
+        if (slice_heads > 0 && !std::strstr(name, ".indexer.")) {
+            if (ends_with(".attn_q_b.weight") && t->ne[1] == (int64_t) n_head * head_dim) {
+                s.kind = DS4TensorSlice::Rows;
+                s.first = (int64_t) slice_head_first * head_dim;
+                s.count = (int64_t) slice_heads * head_dim;
+            } else if (ends_with(".attn_sinks.weight") && t->ne[0] == (int64_t) n_head) {
+                s.kind = DS4TensorSlice::Columns;
+                s.first = slice_head_first;
+                s.count = slice_heads;
+            } else if (ends_with(".attn_output_a.weight") &&
+                       t->ne[1] == (int64_t) n_lora_o * n_out_group) {
+                s.kind = DS4TensorSlice::Rows;
+                s.first = (int64_t) slice_group_first * n_lora_o;
+                s.count = (int64_t) slice_groups * n_lora_o;
+            } else if (ends_with(".attn_output_b.weight") &&
+                       t->ne[0] == (int64_t) n_lora_o * n_out_group) {
+                s.kind = DS4TensorSlice::Columns;
+                s.first = (int64_t) slice_group_first * n_lora_o;
+                s.count = (int64_t) slice_groups * n_lora_o;
+            }
+        }
+        if (s.kind == DS4TensorSlice::None && slice_ff > 0) {
+            if ((ends_with(".ffn_gate_shexp.weight") || ends_with(".ffn_up_shexp.weight")) &&
+                t->ne[1] == (int64_t) n_ff_exp) {
+                s.kind = DS4TensorSlice::Rows;
+                s.first = slice_ff_first;
+                s.count = slice_ff;
+            } else if (ends_with(".ffn_down_shexp.weight") && t->ne[0] == (int64_t) n_ff_exp) {
+                s.kind = DS4TensorSlice::Columns;
+                s.first = slice_ff_first;
+                s.count = slice_ff;
+            }
+        }
+        if (s.kind == DS4TensorSlice::Columns && ggml_blck_size(t->type) > 1 &&
+            (s.first % ggml_blck_size(t->type) != 0 || s.count % ggml_blck_size(t->type) != 0)) {
+            if (slice_error.empty()) slice_error = name;
+            s.kind = DS4TensorSlice::None;
+        }
+        return s;
+    };
+    size_t sliced_bytes_saved = 0;
+
     std::vector<DS4TensorAlloc> allocs;
     allocs.reserve(n_tensors);
     size_t total_buf_size = 0;
@@ -2275,6 +2371,14 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         a.upload_to_backend = upload_to_backend;
         a.dense_split = upload_to_backend && split_buft &&
                         should_split_ds4_dense_tensor(tname, dense_tp_mask);
+        if (upload_to_backend && !a.dense_split) {
+            a.slice = slice_for(tname, t);
+            if (a.slice.kind != DS4TensorSlice::None) {
+                const size_t full_bytes = ggml_nbytes(t);
+                ds4_apply_slice_shape(t, a.slice);
+                sliced_bytes_saved += full_bytes - ggml_nbytes(t);
+            }
+        }
         if (upload_to_backend) {
             if (a.dense_split) {
                 split_total_buf_size = align_up_size(
@@ -2292,6 +2396,14 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         if (std::strcmp(tname, "token_embd.weight") == 0) {
             tok_embd_alloc_idx = allocs.size() - 1;
         }
+    }
+
+    if (!slice_error.empty()) {
+        set_last_error("cluster slice of " + slice_error + " is not aligned to its quant blocks; " +
+                       "this model cannot be sliced over " + std::to_string(plan.slice_ranks) + " ranks");
+        gguf_free(gctx);
+        if (meta_ctx) ggml_free(meta_ctx);
+        return false;
     }
 
     // ── Allocate GPU buffer ─────────────────────────────────────────────
@@ -2385,6 +2497,27 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 #endif
     for (auto & a : allocs) {
         if (!a.upload_to_backend) continue;
+        if (a.slice.kind != DS4TensorSlice::None) {
+            // A rank slice: its rows are one contiguous range of the file;
+            // its columns are a range of every row, gathered on the host.
+            const uint8_t * full = (const uint8_t *) mmap.addr + a.file_offset;
+            const size_t full_row = ggml_row_size(a.tensor->type, a.slice.full_ne0);
+            if (a.slice.kind == DS4TensorSlice::Rows) {
+                ggml_backend_tensor_set(a.tensor, full + (size_t) a.slice.first * full_row, 0,
+                                        ggml_nbytes(a.tensor));
+            } else {
+                const size_t row = ggml_row_size(a.tensor->type, a.slice.count);
+                const size_t skip = ggml_row_size(a.tensor->type, a.slice.first);
+                const int64_t rows = a.slice.full_ne1 * a.tensor->ne[2] * a.tensor->ne[3];
+                std::vector<uint8_t> gathered((size_t) rows * row);
+                for (int64_t r = 0; r < rows; ++r) {
+                    std::memcpy(gathered.data() + (size_t) r * row,
+                                full + (size_t) r * full_row + skip, row);
+                }
+                ggml_backend_tensor_set(a.tensor, gathered.data(), 0, gathered.size());
+            }
+            continue;
+        }
         if (read_file && !a.dense_split) {
             spans.push_back({a.tensor, 0, a.file_offset, a.file_size});
             continue;
@@ -2482,6 +2615,17 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         out.embedder.n_embd         = n_embd;
         out.embedder.n_vocab        = (int64_t)n_vocab;
         out.embedder.row_bytes      = a.file_size / (size_t)n_vocab;
+    }
+
+    if (slice_heads > 0 || slice_ff > 0) {
+        out.cluster_heads_local = slice_heads;
+        out.cluster_shexp_ff_local = slice_ff;
+        std::fprintf(stderr, "[deepseek4-cluster] rank %d/%d dense slices: heads %d..%d of %u, "
+                     "shared expert units %d..%d of %u (%.2f GiB not loaded)\n",
+                     plan.slice_rank, plan.slice_ranks, slice_head_first,
+                     slice_head_first + slice_heads - 1, n_head, slice_ff_first,
+                     slice_ff_first + slice_ff - 1, n_ff_exp,
+                     sliced_bytes_saved / 1073741824.0);
     }
 
     // ── Bind tensors to weight struct fields ────────────────────────────

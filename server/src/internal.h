@@ -272,6 +272,14 @@ struct TargetLoadPlan {
     bool metadata_only = false;        // parse tensor descriptors/scales without GPU allocation
     bool expert_metadata_only = false; // keep only routed expert tensor metadata; upload nothing
     bool load_ds4_image_bias = false;
+    // DS4 cluster rank slices: keep only this rank's attention output groups
+    // (attn_q_b rows, attn_sinks, attn_output_a groups, attn_output_b
+    // columns) and its shared-expert intermediate slice (gate/up rows, down
+    // columns) of slice_ranks equal parts.
+    int  slice_rank = 0;
+    int  slice_ranks = 1;
+    bool slice_attention = false;
+    bool slice_shared_expert = false;
 };
 
 // Load a Q4_K_M target model from a GGUF file on disk.

@@ -225,7 +225,8 @@ ggml_tensor * deepseek4_build_engram_apply(ggml_context * ctx,
                                            const DeepSeek4Layer & L,
                                            int n_embd, int n_hc,
                                            float rms_eps,
-                                           ggml_tensor ** gate_out = nullptr);
+                                           ggml_tensor ** gate_out = nullptr,
+                                           ggml_tensor * kv_pre = nullptr);   // engram_wkv @ keys, computed ahead
 
 // Runs the apply on residual copies kept in host memory (the host
 // hyper-connection paths): uploads them with their keys, computes on

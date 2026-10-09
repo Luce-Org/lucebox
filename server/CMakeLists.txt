@@ -59,6 +59,12 @@ set_property(CACHE LUCE_GPU_BACKEND PROPERTY STRINGS cuda hip)
 option(LUCE_ENABLE_MIXED_CUDA_HIP
     "Primary GPU runtime plus an isolated in-process CUDA/HIP peer (Linux only)"
     OFF)
+# Expert-parallel cluster (after maikzz32/lucebox-halo-cluster): one
+# luce_server rank per box, routed experts split across the ranks, one RCCL
+# all-reduce per MoE layer over RoCE. The GPU-free cluster sources (config,
+# protocol, control channel, placement, decisions) are always compiled; ON
+# adds the RCCL communicator.
+option(LUCE_CLUSTER "Multi-box RCCL expert-parallel cluster (HIP only)" OFF)
 string(TOLOWER "${LUCE_GPU_BACKEND}" LUCE_GPU_BACKEND)
 if(LUCE_ENABLE_MIXED_CUDA_HIP)
     # Reject unsupported targets before project() tries to discover both GPU
@@ -199,6 +205,9 @@ endif()
 # No BLAS, no Metal, no Vulkan, no examples/tests/tools.
 
 if(LUCE_GPU_BACKEND STREQUAL "cuda")
+    if(LUCE_CLUSTER)
+        message(FATAL_ERROR "LUCE_CLUSTER requires LUCE_GPU_BACKEND=hip (RCCL)")
+    endif()
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
     if(LUCE_ENABLE_MIXED_CUDA_HIP)
         set(GGML_HIP ON CACHE BOOL "" FORCE)
@@ -234,7 +243,11 @@ elseif(LUCE_GPU_BACKEND STREQUAL "hip")
         set(GGML_CUDA_MODULE OFF CACHE BOOL "" FORCE)
     endif()
     set(GGML_HIP  ON  CACHE BOOL "" FORCE)
-    set(GGML_HIP_RCCL OFF CACHE BOOL "" FORCE)
+    if(LUCE_CLUSTER)
+        set(GGML_HIP_RCCL ON CACHE BOOL "" FORCE)
+    else()
+        set(GGML_HIP_RCCL OFF CACHE BOOL "" FORCE)
+    endif()
     set(GGML_HIP_GRAPHS OFF CACHE BOOL "Enable HIP graph replay (held off: first-capture quality variance, see experiment log E30/T12)")
     set(LUCE_GGML_BACKEND_TARGET ggml-hip)
     set(LUCE_HIP_ARCHITECTURES "" CACHE STRING "HIP GPU targets, e.g. gfx906;gfx1100")
@@ -277,6 +290,31 @@ option(LUCE_ROCMFP2_AFFINE
     OFF)
 if(LUCE_ROCMFP2_AFFINE)
     add_compile_definitions(ROCMFP2_AFFINE=1)
+endif()
+
+# Ranks exchange this build identity in the control-channel Hello and refuse
+# to form a cluster from different binaries.
+if(LUCE_CLUSTER)
+    add_compile_definitions(LUCE_CLUSTER=1 LUCE_CLUSTER_RCCL=1)
+    find_package(Git QUIET)
+    set(_luce_build_sha "unknown")
+    if(GIT_FOUND)
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} describe --always --dirty --tags
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            OUTPUT_VARIABLE _luce_build_sha_out
+            RESULT_VARIABLE _luce_build_sha_rc
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(_luce_build_sha_rc EQUAL 0 AND _luce_build_sha_out)
+            set(_luce_build_sha "${_luce_build_sha_out}")
+        endif()
+        unset(_luce_build_sha_out)
+        unset(_luce_build_sha_rc)
+    endif()
+    add_compile_definitions(LUCE_BUILD_SHA="${_luce_build_sha}")
+    message(STATUS "luce cluster: LUCE_CLUSTER=ON (build sha ${_luce_build_sha})")
+    unset(_luce_build_sha)
 endif()
 
 # HIP Phase 2 — opt-in rocWMMA flashprefill kernels (Strix Halo / gfx1151).
@@ -582,8 +620,10 @@ add_library(luce_common STATIC
     src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp
     src/deepseek4/deepseek4_dspark.cpp
     src/deepseek4/deepseek4_dspark_spec.cpp
+    src/deepseek4/deepseek4_cluster.cpp
     src/deepseek4/deepseek4_vision.cpp
     src/common/gpu_page_pool.cpp
+    src/common/host_stream_flag.cpp
     src/common/vision/image_decode.cpp
     src/common/vision/image_resize.cpp
     src/common/vision/mmproj_file.cpp
@@ -671,6 +711,18 @@ add_library(luce_common STATIC
     src/common/feature_gate.cpp
     src/placement/placement_config.cpp
     src/placement/device_select.cpp
+    # Expert-parallel cluster runtime. GPU-free parts are always compiled;
+    # cluster_comm.cpp's RCCL half and fast_reduce.cpp's RDMA half are under
+    # LUCE_CLUSTER.
+    src/cluster/cluster_config.cpp
+    src/cluster/cluster_protocol.cpp
+    src/cluster/cluster_control.cpp
+    src/cluster/cluster_comm.cpp
+    src/cluster/fast_reduce.cpp
+    src/cluster/cluster_expert_placement.cpp
+    src/cluster/cluster_decision_hooks.cpp
+    src/cluster/cluster_head_backend.cpp
+    src/cluster/cluster_worker_main.cpp
     src/common/layer_split_utils.cpp
     src/common/ddtree.cpp
     src/common/peer_access.cpp
@@ -748,6 +800,19 @@ elseif(LUCE_GPU_BACKEND STREQUAL "hip")
     # hip_compat shim is needed by ALL luce_common sources (peer_access.cpp,
     # dflash_feature_ring.cpp, flashprefill.cpp), not just the SM80_EQUIV path.
     target_include_directories(luce_common PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
+    if(LUCE_CLUSTER)
+        # RCCL communicator plus the f32<->bf16 kernels behind
+        # allreduce_sum_bf16_compressed.
+        find_package(rccl REQUIRED)
+        target_sources(luce_common PRIVATE src/cluster/cluster_comm_kernels.cu)
+        set_source_files_properties(src/cluster/cluster_comm_kernels.cu PROPERTIES LANGUAGE HIP)
+        target_link_libraries(luce_common PUBLIC roc::rccl)
+        # Lean decode all-reduce over raw RDMA (stream wait/write flags, no RCCL kernel).
+        find_library(LUCE_IBVERBS_LIB ibverbs REQUIRED)
+        target_sources(luce_common PRIVATE src/cluster/fast_reduce_kernels.cu)
+        set_source_files_properties(src/cluster/fast_reduce_kernels.cu PROPERTIES LANGUAGE HIP)
+        target_link_libraries(luce_common PUBLIC ${LUCE_IBVERBS_LIB})
+    endif()
 endif()
 
 if(LUCE_GPU_BACKEND STREQUAL "cuda")
@@ -1075,6 +1140,7 @@ if(LUCE_TESTS)
         test_ds4_mix_fitter)
     set(_luce_cpu_cppunit_targets
         test_feature_gate
+        test_cluster_unit
         test_platform_compat
         test_paged_kv_pool
         test_blocking_row_pool
@@ -1375,6 +1441,12 @@ if(LUCE_TESTS)
     target_include_directories(test_qwen35_tensor_parallel PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
     target_link_libraries(test_qwen35_tensor_parallel PRIVATE luce_common)
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_ds41_q8_mmvq.cpp")
+        # Benchmark, not a test: DS4.1 dense Q8_0 projections through the ggml
+        # mul_mat dispatch at 1-4 columns, with the column-identity check.
+        add_executable(bench_ds41_q8_mmvq test/bench/bench_ds41_q8_mmvq.cpp)
+        target_link_libraries(bench_ds41_q8_mmvq PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
+    endif()
     add_executable(test_rope_tail test/unit/test_rope_tail.cpp)
     target_compile_definitions(test_rope_tail PRIVATE LUCE_ROPE_TEST_GPU=1)
     target_link_libraries(test_rope_tail PRIVATE ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
@@ -1681,6 +1753,27 @@ if(LUCE_TESTS)
             target_compile_definitions(test_ggml_rmsnorm_batch PRIVATE GGML_USE_CUDA)
             find_package(CUDAToolkit REQUIRED)
             target_link_libraries(test_ggml_rmsnorm_batch PRIVATE CUDA::cudart)
+        endif()
+    endif()
+    # Cluster unit tests (maikzz32/lucebox-halo-cluster): protocol
+    # round-trips, placement invariants, decision hooks over a socketpair,
+    # control-channel handshake. GPU-free at run time.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_cluster_unit.cpp")
+        add_executable(test_cluster_unit test/unit/test_cluster_unit.cpp)
+        target_include_directories(test_cluster_unit PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_cluster_unit PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET} ggml-base)
+        if(NOT WIN32)
+            target_link_libraries(test_cluster_unit PRIVATE pthread)
+        else()
+            target_link_libraries(test_cluster_unit PRIVATE ws2_32)
+        endif()
+        if(LUCE_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_cluster_unit PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
+            target_link_libraries(test_cluster_unit PRIVATE hip::host)
+        else()
+            target_compile_definitions(test_cluster_unit PRIVATE LUCE_BACKEND_CUDA=1)
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_cluster_unit PRIVATE CUDA::cudart)
         endif()
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ggml_cluster_allreduce.cpp")
@@ -2585,6 +2678,7 @@ if(LUCE_TESTS)
         test_ds4_dmix_entry_validation
         test_ggml_rmsnorm_batch
         test_ggml_cluster_allreduce
+        test_cluster_unit
         test_qwen35_tensor_parallel
         test_deepseek4_hc_cuda
         test_capture_safe_copies

@@ -136,7 +136,8 @@ const char * deepseek4_dspark_last_error() { return g_dspark_err.c_str(); }
 
 bool load_deepseek4_dspark_drafter(const std::string & path,
                                    ggml_backend_t backend,
-                                   DSparkDrafter & out) {
+                                   DSparkDrafter & out,
+                                   const DSparkLoadSplit * split) {
     g_dspark_err.clear();
     ggml_context * meta = nullptr;
     gguf_init_params gip{};
@@ -257,6 +258,26 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     w.layers.resize(n_layer);
     w.backend = backend;
 
+    // A cluster split keeps only this rank's routed experts: a contiguous
+    // range of each expert tensor's expert axis, read straight from the file.
+    const bool expert_split = split && split->size > 1 && split->rank >= 0 &&
+                              split->rank < split->size && w.n_expert % split->size == 0;
+    const int64_t n_expert_local = expert_split ? w.n_expert / split->size : w.n_expert;
+    const int64_t expert_first = expert_split ? (int64_t) split->rank * n_expert_local : 0;
+    const auto is_routed_expert = [](const char * name) {
+        const std::string s(name);
+        const auto ends = [&s](const char * suffix) {
+            const size_t n = std::strlen(suffix);
+            return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+        };
+        return ends("ffn_gate_exps.weight") || ends("ffn_up_exps.weight") ||
+               ends("ffn_down_exps.weight");
+    };
+    out.split_rank = expert_split ? split->rank : 0;
+    out.split_size = expert_split ? split->size : 1;
+    out.expert_first = (int) expert_first;
+    out.expert_local = expert_split ? (int) n_expert_local : 0;
+
     // Validate the complete tensor table before allocating device memory or
     // forming an absolute file offset. The drafter contract intentionally has
     // no embedding/lm-head tensors; rejecting unknown tensors prevents a stray
@@ -305,6 +326,23 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
         return false;
     }
 
+    if (expert_split) {
+        for (int64_t ti = 0; ti < n_tensors; ++ti) {
+            const char * tname = gguf_get_tensor_name(g, ti);
+            if (!is_routed_expert(tname)) continue;
+            ggml_tensor * t = ggml_get_tensor(meta, tname);
+            if (!t || t->ne[2] != w.n_expert || t->ne[3] != 1) {
+                set_err(std::string("cannot split the routed experts of ") + tname);
+                gguf_free(g);
+                ggml_free(meta);
+                out = DSparkDrafter{};
+                return false;
+            }
+            t->ne[2] = n_expert_local;
+            t->nb[3] = t->nb[2] * (size_t) n_expert_local;
+        }
+    }
+
     // ── Allocate validated tensors into one backend buffer ──────────────
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(meta, backend);
     if (!buf) {
@@ -322,8 +360,12 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
         const char * tname = gguf_get_tensor_name(g, ti);
         ggml_tensor * t = ggml_get_tensor(meta, tname);
         const size_t tensor_off = gguf_get_tensor_offset(g, ti);
-        const size_t off  = data_off + tensor_off;  // preflight proved no overflow
-        const size_t size = gguf_get_tensor_size(g, ti);
+        size_t off  = data_off + tensor_off;  // preflight proved no overflow
+        size_t size = gguf_get_tensor_size(g, ti);
+        if (expert_split && is_routed_expert(tname)) {
+            off += (size_t) expert_first * t->nb[2];
+            size = ggml_nbytes(t);
+        }
         staging.resize(size);
         std::memcpy(staging.data(), file_bytes + off, size);
         ggml_backend_tensor_set(t, staging.data(), 0, size);
@@ -482,11 +524,11 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
             expect_shape(L.ffn_exp_probs_b, p + "exp_probs_b.bias", {w.n_expert});
         }
         expect_shape(L.ffn_gate_exps, p + "ffn_gate_exps.weight",
-                     {n_embd, w.n_ff_exp, w.n_expert});
+                     {n_embd, w.n_ff_exp, n_expert_local});
         expect_shape(L.ffn_up_exps, p + "ffn_up_exps.weight",
-                     {n_embd, w.n_ff_exp, w.n_expert});
+                     {n_embd, w.n_ff_exp, n_expert_local});
         expect_shape(L.ffn_down_exps, p + "ffn_down_exps.weight",
-                     {w.n_ff_exp, n_embd, w.n_expert});
+                     {w.n_ff_exp, n_embd, n_expert_local});
         expect_shape(L.ffn_gate_shexp, p + "ffn_gate_shexp.weight", {n_embd, w.n_ff_exp});
         expect_shape(L.ffn_up_shexp, p + "ffn_up_shexp.weight", {n_embd, w.n_ff_exp});
         expect_shape(L.ffn_down_shexp, p + "ffn_down_shexp.weight", {w.n_ff_exp, n_embd});

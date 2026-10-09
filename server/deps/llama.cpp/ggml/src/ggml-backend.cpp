@@ -883,6 +883,7 @@ struct ggml_backend_sched {
     int deferred_peer_copies_capacity;
     bool split_deferred_peer_copies;
     bool batch_split_copies;
+    bool dedicated_copies;
     ggml_backend_buffer_t batch_staging_buffers[GGML_SCHED_MAX_BACKENDS];
     uint8_t * batch_staging_bases[GGML_SCHED_MAX_BACKENDS];
     size_t batch_staging_sizes[GGML_SCHED_MAX_BACKENDS];
@@ -1522,7 +1523,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1 || sched->copy_events) {
+                            if (sched->n_copies > 1 || sched->copy_events || sched->dedicated_copies) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
@@ -2370,7 +2371,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
-                copy_state.wait_for_destination_generation();
+                // (a dedicated copy is not shared with anything the backend still reads,
+                // and the previous evaluation ended with every backend synchronized)
+                if (!sched->dedicated_copies) {
+                    copy_state.wait_for_destination_generation();
+                }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                 ggml_tensor * node = split->graph.nodes[0];
@@ -2968,6 +2973,13 @@ void ggml_backend_sched_set_batch_split_copies(
     GGML_ASSERT(sched);
     GGML_ASSERT(!sched->is_alloc);
     sched->batch_split_copies = enabled;
+}
+
+void ggml_backend_sched_set_dedicated_copies(
+        ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(!sched->is_alloc);
+    sched->dedicated_copies = enabled;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

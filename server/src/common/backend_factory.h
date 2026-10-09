@@ -91,6 +91,7 @@ public:
         std::string expert_placement;
         std::string router_bias;
         std::string protected_experts;
+        cluster::ClusterConfig cluster;
     };
 
     BackendPlan(BackendPlan &&) noexcept = default;

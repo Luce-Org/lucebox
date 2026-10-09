@@ -121,6 +121,9 @@ struct MoeExpertOwnership {
     int n_expert = 0;
     std::vector<uint8_t> owner;    // [n_layer * n_expert] Owner
     std::vector<uint8_t> pinned;   // [n_layer * n_expert] 1 = keep on the primary
+    // [n_layer * n_expert] 1 = "remote": another cluster rank evaluates it.
+    // Held as Stream here; the cluster runtime keeps it out of every tier.
+    std::vector<uint8_t> remote;
 
     bool init(int n_layer, int n_expert, Owner fill);
     static bool load_json(const std::string & path, int n_layer, int n_expert,

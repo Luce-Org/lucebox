@@ -32,6 +32,7 @@
 #include "ggml-backend.h"
 
 #include "internal.h"
+#include "cluster/cluster_config.h"
 #include "common/layer_split_utils.h"
 #include "common/paged_attention_config.h"
 #include "common/prefill_attention_mode.h"
@@ -76,6 +77,12 @@ class MoeStreamedExpertCache;
 struct MoeExpertCacheOptions;
 
 struct DeepSeek4StepTelemetry {
+    // Expert-parallel cluster (server/src/cluster): host time in the
+    // per-layer all-reduce helper, payload bytes handed to the communicator,
+    // and time blocked on the control channel (decisions/drafts from rank 0).
+    uint64_t cluster_allreduce_us = 0;
+    uint64_t cluster_allreduce_bytes = 0;
+    uint64_t cluster_ctrl_wait_us = 0;
     uint64_t total_us = 0;
     uint64_t embed_us = 0;
     uint64_t hc_pre_attn_us = 0;
@@ -248,6 +255,11 @@ struct DeepSeek4Weights {
     int head_dim          = 512;   // = value_dim for DS4
     int n_rot             = 64;    // partial RoPE rotation dims
     int n_out_group       = 8;     // grouped output projection
+    // Cluster rank slices held instead of the full tensors (TargetLoadPlan
+    // slice_*): query heads and shared-expert intermediate units kept, 0 =
+    // the full tensors. The model's n_head / n_ff_exp stay the global ones.
+    int cluster_heads_local = 0;
+    int cluster_shexp_ff_local = 0;
 
     // Low-rank attention dimensions
     int n_lora_q          = 1024;  // Q low-rank bottleneck
@@ -507,7 +519,17 @@ struct DeepSeek4LayerMajorTail {
     std::vector<float> pre;       // [rows][n_hc]
 };
 
+
+// Expert-parallel cluster runtime (deepseek4_cluster.h). Non-null only when
+// the backend runs as one rank of a cluster; the forward then masks routes to
+// other ranks' experts and all-reduces the routed partial.
+struct Ds4ClusterRuntime;
+
 struct DeepSeek4Cache {
+    // Set by DeepSeek4Backend when it runs as a cluster rank; owned by the
+    // backend, never freed here. nullptr keeps every forward path unchanged.
+    Ds4ClusterRuntime * cluster_rt = nullptr;
+
     int cur_pos  = 0;
     int max_ctx  = 0;
     int n_layer  = 0;
@@ -588,6 +610,8 @@ struct DeepSeek4BackendConfig {
     std::string  expert_placement_path;   // three-tier expert ownership (JSON)
     std::string  router_bias_path;        // f32 [n_layer][n_expert] selection bias delta
     std::string  protected_experts_path;  // {"layer": [expert ids]} (JSON)
+    // Expert-parallel cluster rank (--cluster-*); size 0 = a single box.
+    cluster::ClusterConfig cluster;
 };
 
 // ─── Function declarations ──────────────────────────────────────────────
@@ -831,6 +855,11 @@ bool deepseek4_step(
 struct Ds4VerifyWindowRows {
     std::vector<std::vector<uint8_t>> kv;     // [layer] -> [batch token][row bytes]
     std::vector<std::vector<uint8_t>> score;
+    // The fused verify keeps the rows on the device instead: [layer] -> the
+    // verify graph's own row tensors per batch token, valid until that graph
+    // slot runs again (a rollback restores them before the next verify).
+    std::vector<std::vector<const ggml_tensor *>> kv_dev;
+    std::vector<std::vector<const ggml_tensor *>> score_dev;
 };
 
 struct Ds4VerifyHooks {

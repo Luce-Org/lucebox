@@ -373,6 +373,52 @@ static __global__ void moe_combine_vec4_kernel(
         (size_t)t * output_nb1) = sum;
 }
 
+// GGML_MOE_FUSED_COMBINE_MASKED: laguna_moe_combine_kernel with the owner's
+// masked route weight formed inline: w = weights[e, t] * valid[ids[e, t], t],
+// the product the separate mul(weights, get_rows(valid, ids)) rounds.
+static __global__ void moe_combine_masked_kernel(
+    const char * __restrict__ experts,
+    const char * __restrict__ weights,
+    const char * __restrict__ valid,
+    const char * __restrict__ ids,
+    char * __restrict__ output,
+    const int n_embd,
+    const int n_used,
+    const int n_tokens,
+    const size_t experts_nb1,
+    const size_t experts_nb2,
+    const size_t weights_nb1,
+    const size_t valid_nb1,
+    const size_t valid_nb2,
+    const size_t ids_nb1,
+    const size_t output_nb1) {
+    // The replaced mul, mul and repeat_back round every product and sum on
+    // their own. The product must not fuse into the following add: __fmul_rn
+    // keeps it a separate rounding on CUDA, where nvcc ignores the clang
+    // pragma and builds with fast math; on HIP the pragma keeps the plain add
+    // out of an FMA (HIP's __fadd_rn is a header function that would fuse).
+#pragma clang fp contract(off)
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_embd * n_tokens;
+    if (idx >= total) return;
+
+    const int h = idx % n_embd;
+    const int t = idx / n_embd;
+    float sum = 0.0f;
+    for (int e = 0; e < n_used; ++e) {
+        const int32_t id = *(const int32_t *)(ids + (size_t)e * sizeof(int32_t) + (size_t)t * ids_nb1);
+        const float valid_w = *(const float *)(valid + (size_t)id * valid_nb1 + (size_t)t * valid_nb2);
+        const float w = *(const float *)(weights + (size_t)e * sizeof(float) + (size_t)t * weights_nb1) * valid_w;
+        if (w == 0.0f) {
+            continue;
+        }
+        const float v = *(const float *)(experts + (size_t)h * sizeof(float) +
+                                         (size_t)e * experts_nb1 + (size_t)t * experts_nb2);
+        sum = sum + __fmul_rn(v, w);
+    }
+    *(float *)(output + (size_t)h * sizeof(float) + (size_t)t * output_nb1) = sum;
+}
+
 static void launch_moe_combine(
         cudaStream_t stream,
         const char * experts,
@@ -1029,6 +1075,26 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     }
     if (mode == GGML_MOE_FUSED_OWNER_SPLIT) {
         ggml_cuda_op_ds4_moe_owner_split(ctx, dst);
+        return;
+    }
+    if (mode == GGML_MOE_FUSED_COMBINE_MASKED) {
+        const ggml_tensor * experts = dst->src[0];  // [n_embd, n_used, n_tokens]
+        const ggml_tensor * weights = dst->src[1];  // [n_used, n_tokens]
+        const ggml_tensor * valid   = dst->src[2];  // [1, n_expert, n_tokens]
+        const ggml_tensor * ids     = dst->src[3];  // [n_used, n_tokens]
+        GGML_ASSERT(experts->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+        const int n_embd   = (int) experts->ne[0];
+        const int n_used   = (int) experts->ne[1];
+        const int n_tokens = (int) experts->ne[2];
+        const int total = n_embd * n_tokens;
+        constexpr int block = 256;
+        moe_combine_masked_kernel<<<(total + block - 1) / block, block, 0, ctx.stream()>>>(
+            (const char *) experts->data, (const char *) weights->data,
+            (const char *) valid->data, (const char *) ids->data, (char *) dst->data,
+            n_embd, n_used, n_tokens,
+            experts->nb[1], experts->nb[2], weights->nb[1],
+            valid->nb[1], valid->nb[2], ids->nb[1], dst->nb[1]);
+        CUDA_CHECK(cudaGetLastError());
         return;
     }
     if (mode == GGML_MOE_FUSED_COMBINE) {

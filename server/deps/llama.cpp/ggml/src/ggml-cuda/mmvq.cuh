@@ -19,6 +19,8 @@ bool ggml_cuda_mmvq_mmid_grouped_enabled(
 // Set by ggml_backend_cuda_set_mmvq_batch_invariant (calling thread).
 bool ggml_cuda_mmvq_batch_invariant();
 
+bool ggml_cuda_mmvq_rdna4_glu_pair(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu);
+
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
@@ -27,3 +29,8 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
+
+// Whether MMVQ memoizes q8_1 activations within an evaluation (LUCE_Q8_MEMO).
+// A producer that writes an activation's q8_1 form itself may register it in
+// ctx.luce_q8_memo under the key MMVQ uses (see ggml_cuda_mul_mat_vec_q).
+bool ggml_cuda_luce_q8_memo_on();

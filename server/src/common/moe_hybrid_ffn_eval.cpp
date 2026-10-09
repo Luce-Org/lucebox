@@ -49,9 +49,11 @@ inline ggml_tensor * swiglu_maybe_clamped(ggml_context * ctx,
                                           ggml_tensor * up,
                                           float clamp) {
     if (clamp > 1.0e-6f) {
-        // DeepSeek V4 clamps only the upper side of the gate, and both sides of up.
-        gate = ggml_clamp(ctx, gate, -INFINITY, clamp);
-        up   = ggml_clamp(ctx, up,   -clamp, clamp);
+        // DeepSeek V4 clamps only the upper side of the gate, and both sides
+        // of up. One launch: SWIGLU_DS4 applies exactly these two clamps
+        // before silu(gate) * up (the same fminf/fmaxf bounds and the same
+        // silu expression as clamp + clamp + swiglu, which cost three).
+        return ggml_swiglu_ds4_split(ctx, gate, up, clamp);
     }
     return ggml_swiglu_split(ctx, gate, up);
 }
@@ -766,7 +768,9 @@ static bool build_batched_routed_graph(
     std::vector<ggml_tensor *> * backend_nodes = nullptr,
     bool allow_fused_combine = false,
     bool force_fused_combine = false,
-    bool defer_route_reduction = false)
+    bool defer_route_reduction = false,
+    ggml_tensor * combine_valid = nullptr,
+    ggml_tensor * combine_ids = nullptr)
 {
     const auto track = [&](ggml_tensor * t) -> ggml_tensor * {
         if (backend_nodes && t) backend_nodes->push_back(t);
@@ -891,6 +895,14 @@ static bool build_batched_routed_graph(
     ggml_tensor * experts = track(apply_scale2(ctx,
         mixed_mmq(ggml_mul_mat_id(ctx, down_tensor, gu, sel), mixed_mmq_policy), down_scale));
 
+    // The owner's route mask, weights and route sum in one launch (wts are the
+    // unmasked router weights then; see build_moe_owner_remap).
+    if (combine_valid && combine_ids) {
+        GGML_ASSERT(!defer_route_reduction && !tokenwise);
+        *out_routed = track(ggml_moe_combine_masked(ctx, experts, wts, combine_valid, combine_ids));
+        return *out_routed != nullptr;
+    }
+
     // Weight and sum over experts: [n_embd, n_used, n_tokens] * [1, n_used, n_tokens]
     if (!defer_route_reduction && allow_fused_combine &&
         (force_fused_combine || moe_hybrid_graph_policy().fused_combine)) {
@@ -932,6 +944,10 @@ struct MoeOwnerGraphSpec {
     std::vector<ggml_tensor *> * branch_nodes = nullptr;
     ggml_tensor * local_ids = nullptr;
     ggml_tensor * masked_weights = nullptr;
+    // Set when the route mask is applied inside the owner's combine
+    // (ggml_moe_combine_masked): masked_weights are then the router weights.
+    ggml_tensor * combine_valid = nullptr;
+    ggml_tensor * combine_ids = nullptr;
     ggml_tensor * output = nullptr;
 
     bool available() const {
@@ -947,7 +963,8 @@ static bool build_moe_owner_remap(
         int n_tokens,
         int dynamic_main_slots_x4,
         bool main_owner,
-        MoeOwnerGraphSpec & owner) {
+        MoeOwnerGraphSpec & owner,
+        bool mask_in_combine = false) {
     if (!owner.local_by_global ||
         (int) owner.local_by_global->size() != cfg.n_expert ||
         !owner.local_lut || !owner.valid_lut) {
@@ -999,7 +1016,14 @@ static bool build_moe_owner_remap(
         ctx, *owner.local_lut, global_ids));
     mapped = track(ggml_reshape_2d(
         ctx, mapped, cfg.n_expert_used, n_tokens));
-    owner.local_ids = track(ggml_cont(ctx, mapped));
+    // The gathered ids are already dense: a copy would be one more launch.
+    owner.local_ids = ggml_is_contiguous(mapped) ? mapped : track(ggml_cont(ctx, mapped));
+    if (mask_in_combine) {
+        owner.masked_weights = router_weights;
+        owner.combine_valid = *owner.valid_lut;
+        owner.combine_ids = global_ids;
+        return true;
+    }
     ggml_tensor * valid = track(ggml_get_rows(
         ctx, *owner.valid_lut, global_ids));
     valid = track(ggml_reshape_2d(
@@ -1016,10 +1040,50 @@ static bool prepare_moe_owner_branch(
         int n_tokens,
         int dynamic_main_slots_x4,
         bool main_owner,
-        MoeOwnerGraphSpec & owner) {
+        MoeOwnerGraphSpec & owner,
+        bool mask_in_combine = false) {
     return !owner.available() || build_moe_owner_remap(
         ctx, cfg, global_ids, router_weights, n_tokens,
-        dynamic_main_slots_x4, main_owner, owner);
+        dynamic_main_slots_x4, main_owner, owner, mask_in_combine);
+}
+
+// Whether build_moe_owner_branch runs this owner token by token.
+static bool moe_owner_branch_tokenwise(const MoeOwnerGraphSpec & owner, int n_tokens) {
+    const ggml_tensor * dispatch_weights = owner.gate_up ? owner.gate_up : owner.gate;
+    return dispatch_weights && dispatch_weights->type == GGML_TYPE_Q2_0_ROCMFP2 &&
+           !(n_tokens > 1 && moe_hybrid_graph_policy().grouped_mmvq);
+}
+
+// Whether build_batched_routed_graph hands this owner to a coarse DS4 owner
+// op (which weights and sums its routes itself).
+static bool moe_owner_takes_coarse_op(const MoeOwnerGraphSpec & owner, const MoeLayerDesc & desc) {
+    const MoeHybridGraphPolicy & policy = moe_hybrid_graph_policy();
+    if (!policy.coarse_owner || !owner.down) return false;
+    const bool down_fpx = owner.down->type == GGML_TYPE_Q3_0_ROCMFPX;
+    const bool split = policy.coarse_owner_split && owner.gate && owner.up &&
+        owner.gate->type == GGML_TYPE_Q2_0_ROCMFP2 && owner.up->type == GGML_TYPE_Q2_0_ROCMFP2 && down_fpx;
+    const bool fused = owner.gate_up && desc.ffn_gate_up_exps_s == 1.0f &&
+        owner.gate_up->type == GGML_TYPE_Q2_0_ROCMFP2 && down_fpx;
+    return split || fused;
+}
+
+// LUCE_MOE_MASKED_COMBINE=0 keeps the separate route-mask get_rows and mul,
+// the weighting mul and the route-sum repeat_back.
+// LUCE_MOE_Q8_HANDOFF=1: see build_moe_hybrid_ffn_graph.
+static bool moe_q8_handoff_enabled() {
+    static const bool on = [] {
+        const char * v = std::getenv("LUCE_MOE_Q8_HANDOFF");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+static bool moe_masked_combine_enabled() {
+    static const bool on = [] {
+        const char * v = std::getenv("LUCE_MOE_MASKED_COMBINE");
+        return !(v && v[0] == '0' && v[1] == '\0');
+    }();
+    return on;
 }
 
 static void align_moe_owner_routes(
@@ -1062,7 +1126,8 @@ static bool build_moe_owner_branch(
         cfg.n_embd, cfg.n_ff_exp, cfg.n_expert_used, n_tokens,
         cfg.swiglu_clamp, cfg.mixed_mmq_policy, &owner.output, tokenwise,
         owner.branch_nodes, allow_fused_combine,
-        /*force_fused_combine=*/false, canonical_route_join);
+        /*force_fused_combine=*/false, canonical_route_join,
+        owner.combine_valid, owner.combine_ids);
 }
 
 ggml_tensor * build_moe_routed_experts(
@@ -1177,6 +1242,11 @@ static ggml_tensor * build_moe_owner_join(
         if (primary) {
             ggml_build_forward_expand(schedule_graph, primary);
         }
+        if (out.external_join && primary) {
+            out.main_output = primary;
+            out.peer_raw = secondary;
+            return primary;
+        }
         ggml_tensor * secondary_ready =
             ggml_ds4_deferred_peer_copy(ctx, secondary);
         // Diagnostic host-copy paths may prefill this tensor before its split
@@ -1238,6 +1308,7 @@ bool build_moe_hybrid_ffn_graph(
     out.output = nullptr;
     out.main_output = nullptr;
     out.peer_output = nullptr;
+    out.peer_raw = nullptr;
     out.dynamic_route_balance = false;
     if (!ctx || !inp || !global_ids || !router_weights || n_tokens <= 0 ||
         cfg.n_embd <= 0 || cfg.n_ff_exp <= 0 || cfg.n_expert <= 0 ||
@@ -1377,12 +1448,20 @@ bool build_moe_hybrid_ffn_graph(
 
     // Keep graph construction order stable: both remaps, then both optional ID
     // alignments, then both expert branches.
+    // The route mask rides in the owner's combine on the GPU owners (where
+    // the fused combine is allowed) when the branch reduces its own routes.
+    const auto mask_in_combine = [&](const MoeOwnerGraphSpec & owner) {
+        return moe_masked_combine_enabled() && allow_fused_combine &&
+               !canonical_route_join && dynamic_main_slots_x4 == 0 &&
+               !moe_owner_branch_tokenwise(owner, n_tokens) &&
+               !moe_owner_takes_coarse_op(owner, desc);
+    };
     if (!prepare_moe_owner_branch(
             ctx, cfg, global_ids, router_weights, n_tokens,
-            dynamic_main_slots_x4, true, primary_owner) ||
+            dynamic_main_slots_x4, true, primary_owner, mask_in_combine(primary_owner)) ||
         !prepare_moe_owner_branch(
             ctx, cfg, global_ids, router_weights, n_tokens,
-            dynamic_main_slots_x4, false, secondary_owner) ||
+            dynamic_main_slots_x4, false, secondary_owner, mask_in_combine(secondary_owner)) ||
         !prepare_moe_owner_branch(
             ctx, cfg, global_ids, router_weights, n_tokens,
             /*dynamic_main_slots_x4=*/0, false, streamed_owner)) {
@@ -1391,11 +1470,30 @@ bool build_moe_hybrid_ffn_graph(
     align_moe_owner_routes(ctx, n_tokens, primary_owner);
     align_moe_owner_routes(ctx, n_tokens, secondary_owner);
     align_moe_owner_routes(ctx, n_tokens, streamed_owner);
+    // LUCE_MOE_Q8_HANDOFF=1 (secondary owner on a GPU): the secondary owner gets
+    // its input as the q8_1 rows its quantized matvecs read anyway, quantized
+    // once on the main owner. 5,120 floats become 160 blocks of 36 bytes per
+    // token, 3.6x fewer bytes across the link (on an R9700 behind PCIe 3.0 x4
+    // the per-layer handoff grows ~0.25 us per KB), and the secondary owner
+    // skips its own quantization. Same kernel, same bytes: the result is unchanged.
+    // Up to 8 tokens: every quantized type takes MMVQ there (decode, verify).
+    ggml_tensor * inp_secondary = inp;
+    const ggml_tensor * secondary_w = secondary_owner.gate_up ? secondary_owner.gate_up : secondary_owner.gate;
+    if (moe_q8_handoff_enabled() && schedule_graph && secondary_owner.available() && secondary_w &&
+        ggml_is_quantized(secondary_w->type) && inp->type == GGML_TYPE_F32 &&
+        inp->ne[0] % 512 == 0 && inp->ne[1] == n_tokens && n_tokens <= 8) {
+        ggml_tensor * src = ggml_is_contiguous(inp) ? inp : ggml_cont(ctx, inp);
+        ggml_tensor * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_1, inp->ne[0], n_tokens);
+        inp_secondary = ggml_cpy(ctx, src, rows);
+        if (src != inp) out.hot_remap_nodes.push_back(src);
+        out.hot_remap_nodes.push_back(inp_secondary);
+        ggml_build_forward_expand(schedule_graph, inp_secondary);
+    }
     if (!build_moe_owner_branch(
             ctx, cfg, desc, inp, n_tokens, canonical_route_join,
             allow_fused_combine, primary_owner) ||
         !build_moe_owner_branch(
-            ctx, cfg, desc, inp, n_tokens, canonical_route_join,
+            ctx, cfg, desc, inp_secondary, n_tokens, canonical_route_join,
             allow_fused_combine, secondary_owner) ||
         !build_moe_owner_branch(
             ctx, cfg, desc, inp, n_tokens, canonical_route_join,
@@ -1784,7 +1882,8 @@ bool eval_moe_hybrid_ffn_single(
         const int32_t gid = selected_ids[i];
         // Cold owner None: routes masked to -1 by the cluster runtime are
         // evaluated elsewhere and contribute zero here.
-        if (gid < 0 && storage.cold_backend_kind == MoeHybridColdBackend::None) {
+        if (gid < 0 && (storage.cold_backend_kind == MoeHybridColdBackend::None ||
+                        storage.foreign_routes)) {
             continue;
         }
         if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) {
@@ -4393,7 +4492,8 @@ bool eval_moe_hybrid_ffn_gpu_resident(
 
     for (int i = 0; i < n_selected; ++i) {
         const int32_t gid = selected_ids[i];
-        if (gid < 0 && storage.cold_backend_kind == MoeHybridColdBackend::None) continue;
+        if (gid < 0 && (storage.cold_backend_kind == MoeHybridColdBackend::None ||
+                        storage.foreign_routes)) continue;
         if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) return false;
         const int32_t hot_local = storage.hot_local_by_global[(size_t)gid];
         if (hot_local >= 0) {

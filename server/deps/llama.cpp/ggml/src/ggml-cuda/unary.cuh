@@ -81,7 +81,8 @@ void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-void ggml_cuda_op_swiglu_ds4(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+// q8_out: optional, the result's q8_1 form as MMVQ quantizes it (rows padded to ncols_q8).
+void ggml_cuda_op_swiglu_ds4(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8_out = nullptr, int ncols_q8 = 0);
 
 void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 

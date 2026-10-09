@@ -7,6 +7,7 @@
 #pragma once
 
 #include "common/model_backend.h"
+#include "common/cluster_participant.h"
 #include "common/moe_expert_compute.h"
 #include "common/sampler.h"
 #include "../common/moe_hybrid_expert_cache.h"
@@ -39,6 +40,7 @@
 namespace luce::common {
 
 class DeepSeek4ImagePrompt;
+struct Ds4ClusterRuntime;  // deepseek4_cluster.h
 
 // Bounds the sparse heterogeneous prefill arena once accumulated attention
 // context dominates its memory footprint. Decode batching is unaffected.
@@ -73,7 +75,7 @@ bool deepseek4_mix_mmq_prefill_default(
 ggml_mixed_mmq_policy deepseek4_mix_mmq_prefill_policy(
     PrefillAttentionMode mode, const char * gcn_arch, const char * explicit_value);
 
-class DeepSeek4Backend : public ModelBackend {
+class DeepSeek4Backend : public ModelBackend, public IClusterParticipant {
 public:
     explicit DeepSeek4Backend(DeepSeek4BackendConfig cfg);
     ~DeepSeek4Backend() override;
@@ -133,7 +135,34 @@ public:
         return routing_stats_.get();
     }
 
+    // ── Expert-parallel cluster (after maikzz32/lucebox-halo-cluster) ──
+    // set_cluster(&cfg, nullptr) before init() builds this rank's shard
+    // (init() does it from cfg_.cluster); set_cluster(&cfg, comm) once RCCL
+    // is up only attaches the communicator.
+    bool set_cluster(const cluster::ClusterConfig * cfg, cluster::IClusterComm * comm);
+    bool cluster_attach(const cluster::ClusterConfig * cfg,
+                        cluster::IClusterComm * comm) override {
+        return set_cluster(cfg, comm);
+    }
+    uint64_t cluster_placement_hash() const override;
+    void cluster_set_hooks(cluster::Ds4ClusterHooks * hooks) override { hooks_ = hooks; }
+    bool cluster_spec_decode_ready() const override {
+        return spec_enabled_ && spec_drafter_ != nullptr;
+    }
+    uint64_t cluster_resident_expert_bytes() const override;
+    bool cluster_ingraph_allreduce() const override;
+
 private:
+    // Rank-0-decides hooks; nullptr outside a cluster.
+    cluster::Ds4ClusterHooks * hooks_ = nullptr;
+    bool cluster_active() const;
+    bool cluster_worker() const;
+    // Load-time agreements every rank must share: the prefill chunk size and
+    // the drafter (none, whole or split).
+    bool cluster_agree_prefill_chunk();
+    bool cluster_agree_drafter();
+    std::unique_ptr<Ds4ClusterRuntime> cluster_;
+
     DeepSeek4BackendConfig cfg_;
     ggml_backend_t         backend_      = nullptr;
     ggml_backend_t         snap_backend_ = nullptr;

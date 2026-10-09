@@ -58,7 +58,8 @@ ggml_tensor * deepseek4_build_engram_apply(ggml_context * ctx,
                                            const DeepSeek4Layer & L,
                                            int n_embd, int n_hc,
                                            float rms_eps,
-                                           ggml_tensor ** gate_out) {
+                                           ggml_tensor ** gate_out,
+                                           ggml_tensor * kv_pre) {
     if (!ctx || !h || !keys || !L.engram_wkv || !L.engram_q || !L.engram_k) return nullptr;
     const int64_t n_tokens = keys->ne[1];
     GGML_ASSERT(h->ne[0] == n_embd && h->ne[1] == n_hc && h->ne[2] == n_tokens);
@@ -66,10 +67,14 @@ ggml_tensor * deepseek4_build_engram_apply(ggml_context * ctx,
     GGML_ASSERT(L.engram_wkv->ne[1] == (int64_t) n_embd * (n_hc + 1));
 
     // [n_embd * (n_hc + 1), n_tokens]: the n_hc keys first, the value last.
-    ggml_tensor * kv = ggml_mul_mat(ctx, L.engram_wkv, keys);
-    // The F16 projection must accumulate in F32: with F16 accumulation (the
-    // BLAS default on gfx1151) the update drifts past 2e-3 of its RMS.
-    ggml_mul_mat_set_prec(kv, GGML_PREC_F32);
+    ggml_tensor * kv = kv_pre;
+    if (!kv) {
+        kv = ggml_mul_mat(ctx, L.engram_wkv, keys);
+        // The F16 projection must accumulate in F32: with F16 accumulation (the
+        // BLAS default on gfx1151) the update drifts past 2e-3 of its RMS.
+        ggml_mul_mat_set_prec(kv, GGML_PREC_F32);
+    }
+    GGML_ASSERT(kv->ne[0] == L.engram_wkv->ne[1] && kv->ne[1] == n_tokens);
     ggml_tensor * key = ggml_view_3d(ctx, kv, n_embd, n_hc, n_tokens,
                                      (size_t) n_embd * ggml_element_size(kv), kv->nb[1], 0);
     ggml_tensor * value = ggml_view_3d(ctx, kv, n_embd, 1, n_tokens,

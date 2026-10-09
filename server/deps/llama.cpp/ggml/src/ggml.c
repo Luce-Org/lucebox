@@ -4426,6 +4426,25 @@ struct ggml_tensor * ggml_soft_max_ext_sink_col(
     return result;
 }
 
+struct ggml_tensor * ggml_soft_max_ext_sink_col_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * sinks,
+        float                 scale) {
+    struct ggml_tensor * result = ggml_soft_max_ext_sink_col(ctx, a, sinks, scale);
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+        GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type));
+        GGML_ASSERT(mask->ne[0] == a->ne[0]);
+        GGML_ASSERT(mask->ne[1] >= a->ne[1]);
+        GGML_ASSERT(a->ne[2] % mask->ne[2] == 0);
+        GGML_ASSERT(a->ne[3] % mask->ne[3] == 0);
+        result->src[1] = mask;
+    }
+    return result;
+}
+
 void ggml_soft_max_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
@@ -5831,6 +5850,8 @@ void ggml_flash_attn_ext_set_ds4_inverse_rope(
         bool                 q_unrotated) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_ASSERT(kv_start >= 0);
+    // Lane rows (bit 2) hold src[6] for their ring rows; no fused RoPE then.
+    GGML_ASSERT((ggml_get_op_params_i32(a, 7) & 4) == 0);
     // Bit 0: inverse RoPE on attention output. Bit 1: Q still needs forward
     // RoPE. Both directions share the position and YaRN parameters below.
     // Preserve optional DS4 causal-layout metadata in the upper 16 bits so
@@ -5860,6 +5881,31 @@ void ggml_flash_attn_ext_set_ds4_rope_positions(
     GGML_ASSERT(positions->ne[0] == a->src[0]->ne[1]);
     GGML_ASSERT(positions->ne[1] == 1 && positions->ne[2] == 1 && positions->ne[3] == 1);
     a->src[6] = positions;
+}
+
+void ggml_flash_attn_ext_set_ds4_lane_rows(
+        struct ggml_tensor * a,
+        struct ggml_tensor * ring_rows,
+        struct ggml_tensor * lane_kv) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    // src[6] holds the ring rows: no fused RoPE, whose positions live there.
+    GGML_ASSERT((ggml_get_op_params_i32(a, 7) & 0xffff) == 0);
+    GGML_ASSERT(a->src[6] == NULL && a->src[9] == NULL);
+    // One latent K/V tensor (MLA), as for the segmented layout.
+    GGML_ASSERT(a->src[1] == a->src[2]);
+    const int64_t n_query = a->src[0]->ne[1];
+    GGML_ASSERT(ring_rows && ring_rows->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(ring_rows));
+    GGML_ASSERT(ring_rows->ne[0] == n_query && ring_rows->ne[1] == 1 &&
+                ring_rows->ne[2] == 1 && ring_rows->ne[3] == 1);
+    GGML_ASSERT(lane_kv && lane_kv->type == a->src[1]->type);
+    GGML_ASSERT(ggml_is_contiguous(lane_kv));
+    GGML_ASSERT(lane_kv->ne[0] == a->src[1]->ne[0] && lane_kv->ne[1] == n_query &&
+                lane_kv->ne[2] == 1 && lane_kv->ne[3] == 1);
+    const uint32_t flags = (uint32_t) ggml_get_op_params_i32(a, 7);
+    ggml_set_op_params_i32(a, 7, (int32_t) (flags | 4u));
+    a->src[6] = ring_rows;
+    a->src[9] = lane_kv;
 }
 
 bool ggml_flash_attn_ext_is_ds4(const struct ggml_tensor * a) {
@@ -9126,6 +9172,33 @@ struct ggml_tensor * ggml_laguna_moe_combine(
     return result;
 }
 
+struct ggml_tensor * ggml_moe_combine_masked(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * experts,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * valid,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(valid->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(experts->ne[1] == weights->ne[0] && experts->ne[2] == weights->ne[1]);
+    GGML_ASSERT(ids->ne[0] == weights->ne[0] && ids->ne[1] == weights->ne[1]);
+    GGML_ASSERT(valid->ne[0] == 1 && valid->ne[2] == weights->ne[1]);
+    GGML_ASSERT(experts->nb[0] == sizeof(float) && weights->nb[0] == sizeof(float));
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t));
+
+    const int64_t ne[4] = { experts->ne[0], experts->ne[2], 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
+
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = experts;
+    result->src[1] = weights;
+    result->src[2] = valid;
+    result->src[3] = ids;
+
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_COMBINE_MASKED);
+    return result;
+}
+
 struct ggml_tensor * ggml_ds4_moe_owner(
         struct ggml_context * ctx,
         struct ggml_tensor  * input,
@@ -9353,16 +9426,19 @@ struct ggml_tensor * ggml_ds4_deferred_peer_copy(
     return result;
 }
 
-struct ggml_tensor * ggml_cluster_allreduce(
+static struct ggml_tensor * ggml_cluster_allreduce_impl(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a,
         ggml_cluster_allreduce_fn fn,
-        void                    * user) {
+        void                    * user,
+        bool                      inplace) {
     GGML_ASSERT(a->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(a));
     GGML_ASSERT(fn != NULL);
 
-    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    // In place, the backend sees dst->data == src->data and enqueues only
+    // the collective.
+    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
     result->op = GGML_OP_MOE_FUSED;
     result->src[0] = a;
 
@@ -9373,6 +9449,22 @@ struct ggml_tensor * ggml_cluster_allreduce(
            &user, sizeof(user));
 
     return result;
+}
+
+struct ggml_tensor * ggml_cluster_allreduce(
+        struct ggml_context     * ctx,
+        struct ggml_tensor      * a,
+        ggml_cluster_allreduce_fn fn,
+        void                    * user) {
+    return ggml_cluster_allreduce_impl(ctx, a, fn, user, false);
+}
+
+struct ggml_tensor * ggml_cluster_allreduce_inplace(
+        struct ggml_context     * ctx,
+        struct ggml_tensor      * a,
+        ggml_cluster_allreduce_fn fn,
+        void                    * user) {
+    return ggml_cluster_allreduce_impl(ctx, a, fn, user, true);
 }
 
 struct ggml_tensor * ggml_ds4_hc_pre(
@@ -9592,6 +9684,39 @@ struct ggml_tensor * ggml_ds4_router_weights(
     ggml_set_op_params_i32(result, 0, 5);
     ggml_set_op_params_f32(result, 4, clamp_min);
     ggml_set_op_params_f32(result, 5, scale);
+    return result;
+}
+
+// GGML_OP_DS4_HC modes 7 and 8.
+struct ggml_tensor * ggml_ds4_argmax_pair(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        int                   row_offset,
+        int                   slot,
+        int                   n_slots) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits));
+    GGML_ASSERT(n_slots >= 1 && n_slots <= 8 && slot >= 0 && slot < n_slots && row_offset >= 0);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8 * n_slots, logits->ne[1]);
+    result->op = GGML_OP_DS4_HC;
+    result->src[0] = logits;
+    ggml_set_op_params_i32(result, 0, 7);
+    ggml_set_op_params_i32(result, 1, row_offset);
+    ggml_set_op_params_i32(result, 2, slot);
+    ggml_set_op_params_i32(result, 3, n_slots);
+    return result;
+}
+
+struct ggml_tensor * ggml_ds4_argmax_pick(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * pairs,
+        int                   n_slots) {
+    GGML_ASSERT(pairs->type == GGML_TYPE_F32 && ggml_is_contiguous(pairs));
+    GGML_ASSERT(pairs->ne[0] == 8 * n_slots);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, pairs->ne[1]);
+    result->op = GGML_OP_DS4_HC;
+    result->src[0] = pairs;
+    ggml_set_op_params_i32(result, 0, 8);
+    ggml_set_op_params_i32(result, 3, n_slots);
     return result;
 }
 
