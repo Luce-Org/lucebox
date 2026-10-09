@@ -8,7 +8,7 @@
 // 512-expert top-10 MoE, per-layer n-gram embedding) into Luzebox's ggml graph
 // style.
 //
-// Single sequence (n_seqs = 1). On gfx1151, multi-row prompt prefill uses QSA
+// Single sequence (n_seqs = 1). On gfx1151 and RDNA4, multi-row prompt prefill uses QSA
 // with F32 accumulation, including below the selection budget. T=1 retains
 // dense attention below the budget and selected attention beyond it. Verify
 // rows use the T=1 attention path at each position, excluding prompt promotion.
@@ -23,6 +23,8 @@
 #include "ggml-backend.h"
 
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <vector>
 
 namespace luce::common {
@@ -35,6 +37,16 @@ ggml_tensor * qwen4exp_pool_blocks(ggml_context * c, ggml_tensor * keys, int64_t
 // token-by-token decode rebuilds with, as a function of kv_len alone, so a verify row attends over the same span
 // (same attention numerics) as plain decode at that position.
 int64_t qwen4exp_stable_kv_span(int64_t & base, int64_t max_ctx, int64_t kv_len);
+
+// The longest context a stable QSA graph attends over: the runtime-count top-k's range.
+constexpr int64_t kQwen4ExpStableQsaMaxCtx = 262144;
+
+// A retained graph's K/V bucket for kv_len keys: whole 256-key blocks, at most max_ctx (and, for QSA rows,
+// kQwen4ExpStableQsaMaxCtx).
+int64_t qwen4exp_kv_bucket(int64_t max_ctx, int64_t kv_len, bool qsa);
+
+// The multi-slot decode graph's row ceiling: RDNA3 MMID supports at most four batch-invariant decode rows.
+constexpr int kQwen4ExpMaxBatchedSlots = 4;
 
 struct Qwen4ExpForwardResult {
     bool ok = false;
@@ -58,6 +70,9 @@ Qwen4ExpGraphMemory qwen4exp_graph_memory(ggml_backend_t backend, const Qwen4Exp
     Qwen4ExpCache & cache, int n_tokens, int pos0, bool verify = false);
 Qwen4ExpGraphMemory qwen4exp_mtp_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
     Qwen4ExpCache & cache, int n_tokens, int pos0);
+// The multi-slot decode graph of n_slots rows, each at `pos` (dense, or as QSA rows).
+Qwen4ExpGraphMemory qwen4exp_batched_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
+    Qwen4ExpCache & cache, int n_slots, int pos, bool qsa);
 
 // One independent sequence span for batch eligibility and per-slot solo fallback.
 struct Qwen4ExpForwardSegment {
@@ -67,10 +82,12 @@ struct Qwen4ExpForwardSegment {
     int pos0 = 0;
 };
 
-// Pure decision for validated spans: at most four one-token rows, all dense in the solo path.
-// use_qsa is the cached gfx1151 capability.
+// Pure decision for validated spans: at most kQwen4ExpMaxBatchedSlots one-token rows, each dense in the solo
+// path, or (with qsa_rows: the backend serves stable QSA rows) a QSA decode.
+// use_qsa is the cached QSA capability.
 bool qwen4exp_can_batch(const Qwen4ExpWeights & w,
-                       const Qwen4ExpForwardSegment * segments, int n_segments, bool use_qsa);
+                       const Qwen4ExpForwardSegment * segments, int n_segments, bool use_qsa,
+                       bool qsa_rows = false);
 
 // Run the trunk. `tokens` has n_tokens entries, processed as one contiguous
 // single-sequence span at positions [pos0, pos0 + n_tokens). On success the
@@ -122,12 +139,40 @@ bool qwen4exp_mtp_draft(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4
                         const int32_t * tokens, const float * hidden, int n, int pos0, int k,
                         std::vector<int32_t> & drafts);
 
+// Run all but `keep` pending pairs through the draft layer (K/V only), at most max_rows per forward.
+bool qwen4exp_mtp_catch_up(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
+                           Qwen4ExpMtpPending & pending, size_t keep,
+                           int max_rows = std::numeric_limits<int>::max());
+
+struct Qwen4ExpMtpStep {
+    int k = 0;                        // drafts verified
+    Qwen4ExpMtpAcceptance decision;   // emitted[n_emitted - 1] is the next input
+    bool more = true;                 // sample_row's last answer
+    double draft_s = 0.0, verify_s = 0.0;
+    const char * error = nullptr;
+};
+
+// One decode step at `pos` feeding `token`: draft k tokens (the width controller's choice, or the cache's fixed
+// draft count without one, capped at max_k), verify them with the token in one forward, sample each row with
+// sample_row (fed token, logits row, sample out; false ends generation) until a draft is rejected, roll the cache
+// back to the retained rows and let the controller observe the step. `pending` (null: no draft layer) ends with
+// `token` and, on success, with the next input. `logits` receives every verified row. on_drafts (test-only) may
+// replace the drafts before verification.
+bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache, int pos,
+                       int32_t token, int max_k, AdaptiveSpecWidth * width, Qwen4ExpMtpPending * pending,
+                       const std::function<bool(int32_t, const float *, int32_t &)> & sample_row,
+                       std::vector<float> & logits, Qwen4ExpMtpStep & step,
+                       const std::function<void(std::vector<int32_t> &)> & on_drafts = {});
+
 // Decode one next token for each independent slot. `caches[s]` owns that
 // sequence's KV and recurrent state; `tokens[s]` and `positions[s]` are never
 // interpreted as a common time axis. The shared workspace must outlive calls
 // and is normally owned by the sequence-engine/model instance.
-// If any slot needs QSA or more than four slots are active, use per-slot solo forwards.
+// A slot past the QSA boundary decodes as a stable T=1 QSA row inside the graph; if the
+// backend lacks those rows or more than four slots are active, each slot runs its solo forward.
 // Reference caches also use per-slot solo forwards. The server admits at most four slots.
+// out_hidden, when set, receives slot `hidden_slot`'s final HC residual (n_embd * n_hc floats), as
+// qwen4exp_forward's out_hidden would, so that slot's MTP head can draft once it decodes alone.
 Qwen4ExpForwardResult qwen4exp_forward_batched(
                                        ggml_backend_t backend,
                                        const Qwen4ExpWeights & w,
@@ -136,6 +181,8 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
                                        const int32_t * positions,
                                        int n_slots,
                                        Qwen4ExpBatchedDecodeWorkspace & workspace,
-                                       std::vector<std::vector<float>> & out_logits);
+                                       std::vector<std::vector<float>> & out_logits,
+                                       int hidden_slot = -1,
+                                       std::vector<float> * out_hidden = nullptr);
 
 }  // namespace luce::common

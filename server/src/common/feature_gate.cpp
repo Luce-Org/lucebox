@@ -308,8 +308,6 @@ std::string check_feature_compatibility(
             if (args.device.is_layer_split() || args.device.is_tensor_parallel() ||
                 args.remote_target_shard.enabled())
                 return "qwen4exp full-cache concurrency requires one local target device";
-            if (args.draft_path.has_value() || args.verify_width > 1)
-                return "qwen4exp full-cache concurrency decodes without MTP; drop --draft and --verify-width";
         }
         // Qwen's graph is qualified through 64 lanes. DeepSeek's gathered
         // whole-model graph has a smaller, separately qualified ceiling.
@@ -389,11 +387,17 @@ std::string check_feature_compatibility(
                "DeepSeek4 backend";
     }
 
-    // ── expert ownership and routing files × architecture/adapter
-    if ((!args.ds4_expert_placement.empty() || !args.ds4_router_bias.empty() ||
-         !args.ds4_protected_experts.empty()) && !local_ds4) {
-        return "--ds4-expert-placement, --ds4-router-bias and "
-               "--ds4-protected-experts require a single local DeepSeek4 backend";
+    // ── expert placement × architecture/adapter
+    const bool qwen4exp_split = arch == "qwen4exp" && args.expert_device.has_value();
+    if (!args.expert_placement.empty() && !local_ds4 && !qwen4exp_split) {
+        return "--expert-placement requires a single local DeepSeek4 backend, "
+               "or Qwen3.8-Flash-Next with --expert-device";
+    }
+
+    // ── routing files × architecture/adapter
+    if ((!args.ds4_router_bias.empty() || !args.ds4_protected_experts.empty()) && !local_ds4) {
+        return "--ds4-router-bias and --ds4-protected-experts require a single "
+               "local DeepSeek4 backend";
     }
 
     return {};

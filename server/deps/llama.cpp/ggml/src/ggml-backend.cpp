@@ -854,6 +854,7 @@ struct ggml_backend_sched {
     // pipeline parallelism support
     int n_copies;
     int cur_copy;
+    bool copy_events;   // parallel: per-copy events and persistent split-input copies
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
     struct ggml_tensor * graph_inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
@@ -1522,7 +1523,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1 || sched->dedicated_copies) {
+                            if (sched->n_copies > 1 || sched->copy_events || sched->dedicated_copies) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
@@ -1680,7 +1681,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
     }
 
-    if (sched->n_copies > 1) {
+    if (sched->n_copies > 1 || sched->copy_events) {
         // add input copies as leafs so that they are allocated first
         for (int i = 0; i < sched->n_graph_inputs; i++) {
             struct ggml_tensor * input = sched->graph_inputs[i];
@@ -2610,6 +2611,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    sched->copy_events = parallel;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -2943,6 +2945,20 @@ void ggml_backend_sched_add_deferred_peer_copy_node(
     deferred->producer_backend_id = -1;
     deferred->producer_split_id = -1;
     deferred->consumer_split_id = -1;
+}
+
+void ggml_backend_sched_set_n_copies(ggml_backend_sched_t sched, int n_copies) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(n_copies >= 1 && n_copies <= sched->n_copies && "copies can only be reduced");
+    GGML_ASSERT(sched->is_reset && !sched->is_alloc && "set the copy count before allocating");
+    for (int b = 0; b < sched->n_backends; ++b) {
+        for (int c = n_copies; c < sched->n_copies; ++c) {
+            ggml_backend_event_free(sched->events[b][c]);
+            sched->events[b][c] = NULL;
+        }
+    }
+    sched->n_copies = n_copies;
+    sched->cur_copy = 0;
 }
 
 void ggml_backend_sched_set_deferred_peer_copy_split(

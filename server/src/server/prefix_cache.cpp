@@ -307,6 +307,31 @@ int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
     return usable(target) ? target : 0;
 }
 
+std::vector<int> spaced_restore_points(const std::vector<int> & boundaries, int min_gap) {
+    if (min_gap <= 0) return boundaries;
+    std::vector<int> kept;
+    for (int b : boundaries) {
+        if (kept.empty() || b - kept.back() >= min_gap) kept.push_back(b);
+    }
+    return kept;
+}
+
+std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
+                                       const ChatMarkers & markers,
+                                       std::initializer_list<int> cuts,
+                                       bool drop_last_boundary,
+                                       int spacing) {
+    std::vector<int> points = find_all_boundaries(prompt, markers);
+    if (drop_last_boundary && !points.empty()) points.pop_back();
+    points = spaced_restore_points(points, spacing);
+    for (int cut : cuts) {
+        if (cut > 0 && cut < (int) prompt.size()) points.push_back(cut);
+    }
+    std::sort(points.begin(), points.end());
+    points.erase(std::unique(points.begin(), points.end()), points.end());
+    return points;
+}
+
 bool should_force_inline_snapshot_boundary(
         const std::vector<int> & boundaries,
         int prompt_len,
@@ -596,7 +621,8 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         int restore_source_slot,
         InlineSnapshotSize estimate_bytes,
         bool include_last_message,
-        int reachable_from) {
+        int reachable_from,
+        int restore_point_spacing) {
     if (disabled_ || active_inline_reservation_ != 0) return {};
 
     const auto candidates = find_all_boundaries(prompt_ids, markers_);
@@ -642,6 +668,13 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         target_cut = select_inline_snapshot_boundary(
             candidates, restored_prefix_len, prefer_tools_boundary,
             include_last_message, reachable_from);
+    }
+    if (restore_point_spacing > 0 && target_cut > 0) {
+        int point = 0;
+        for (int p : spaced_restore_points(candidates, restore_point_spacing))
+            if (p <= target_cut) point = p;
+        if (point != target_cut) forced = false;
+        target_cut = point > restored_prefix_len && point >= reachable_from ? point : 0;
     }
     if (target_cut <= 0) {
         // An expected no-op when the restored prefix already covers the next

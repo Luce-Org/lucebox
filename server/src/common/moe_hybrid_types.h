@@ -9,10 +9,21 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 namespace luce::common {
+
+// LUCE_EXPERT_BUDGET_MB: the operator's budget, in bytes, for the hot experts
+// on the target GPU; `fallback` when unset or not positive. Backends that size
+// their tier from free memory take it as a cap (fallback 0: no cap).
+inline uint64_t expert_budget_bytes_from_env(uint64_t fallback = 0) {
+    const char * mb = std::getenv("LUCE_EXPERT_BUDGET_MB");
+    const uint64_t bytes = mb ? (uint64_t) std::max(0, std::atoi(mb)) * 1024ULL * 1024ULL : 0;
+    return bytes > 0 ? bytes : fallback;
+}
 
 // ─── GPU SM version query ───────────────────────────────────────────────
 // Returns the compute capability as major*10+minor (e.g. 86 for sm_86).

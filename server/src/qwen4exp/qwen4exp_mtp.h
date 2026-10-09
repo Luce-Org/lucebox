@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/adaptive_spec_width.h"
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -12,104 +14,24 @@ namespace luce::common {
 constexpr int QWEN4EXP_MTP_MAX_DRAFT = 7;
 constexpr int QWEN4EXP_MTP_MAX_VERIFY = QWEN4EXP_MTP_MAX_DRAFT + 1;
 
-// MTP-only, per-request policy. Widths include the seed (k = width - 1).
-// Learn conditional acceptance only at reached depths: a clean short draft
-// says nothing about the next depth, and a rejection is not another failure
-// of every deeper conditional. Products give monotone prefix survivals.
-class Qwen4ExpMtpWidth {
-public:
-    Qwen4ExpMtpWidth(int max_draft, bool adaptive, int prompt_tokens)
-        : cap_(std::clamp(max_draft, 1, QWEN4EXP_MTP_MAX_DRAFT)), adaptive_(adaptive),
-          base_(prompt_tokens >= 32768 ? 47.0 : 45.0) {
-        // Optimistic but finite prior: 16 trials at 90% per reached depth.
-        trials_.fill(16.0);
-        successes_.fill(16.0 * 0.90);
-        // Ridge prior: 16 synthetic cycles at each end of k=1..7. Forget
-        // slowly as this context supplies measurements; all widths share it.
-        sy_ = 32.0 * base_ + 128.0 * slope_;
-        sxy_ = 128.0 * base_ + 800.0 * slope_;
-    }
-
-    bool enabled() const { return adaptive_; }
-
-    int next_width() const {
-        if (!adaptive_) return cap_ + 1;
-        double survival = 1.0, commits = 1.0, best = 0.0;
-        int chosen = 1;
-        for (int k = 1; k <= cap_; ++k) {
-            survival *= successes_[k] / trials_[k];
-            commits += survival;
-            const double utility = commits / (base_ + slope_ * k);
-            if (utility > best) { best = utility; chosen = k; }
-        }
-        // A wider probe every 17 cycles is unconditional on timing or a
-        // clean streak. It refreshes the first censored depth even at k=1.
-        if (steps_ >= 16 && (steps_ - 16) % 17 == 0) {
-            chosen = std::min(cap_, chosen + 1);
-            // Every eighth probe refreshes ALL depths, including after a
-            // phase change where two adjacent widths both look unprofitable.
-            if (((steps_ - 16) / 17) % 8 == 7) chosen = cap_;
-        }
-        // Require 16 cycles before narrowing below k=3; clean warmup
-        // cycles probe upward immediately so counting reaches k=7 quickly.
-        return (steps_ < 16 ? std::max(chosen, std::min(warmup_k_, cap_)) : chosen) + 1;
-    }
-
-    // A missing timing (e.g. the oracle smoke) updates acceptance only.
-    void observe(int accepted_width, int offered_width, float cycle_ms = -1.0f) {
-        if (!adaptive_ || offered_width <= 1) return;
-        const int k = std::clamp(offered_width - 1, 1, cap_);
-        const int accepted = std::clamp(accepted_width - 1, 0, k);
-        ++steps_;
-        warmup_k_ = accepted == k ? std::min(cap_, k + 1) : 3;
-        for (int depth = 1; depth <= std::min(k, accepted + 1); ++depth) {
-            // Bounded evidence adapts to changing text without the old 0.2
-            // EMA's effective five-sample window. Unreached depths stay put.
-            if (trials_[depth] >= 128.0) {
-                trials_[depth] *= 127.0 / 128.0;
-                successes_[depth] *= 127.0 / 128.0;
-            }
-            trials_[depth] += 1.0;
-            successes_[depth] += depth <= accepted;
-        }
-        if (!std::isfinite(cycle_ms) || cycle_ms <= 0.0f) return;
-        if (++cost_samples_[k] <= 4) return; // cold graph/shape builds
-        const double predicted = base_ + slope_ * k;
-        const double measured = std::clamp(double(cycle_ms), predicted * 0.75, predicted * 1.25);
-        constexpr double decay = 127.0 / 128.0;
-        sw_ = decay * sw_ + 1.0;
-        sx_ = decay * sx_ + k;
-        sxx_ = decay * sxx_ + k * k;
-        sy_ = decay * sy_ + measured;
-        sxy_ = decay * sxy_ + k * measured;
-        // Fit total cycle cost = fixed overhead + incremental draft/verify
-        // row cost. Exploration supplies width variation; priors regularize
-        // sparse contexts. No individual wall-time sample chooses a width.
-        const double determinant = sw_ * sxx_ - sx_ * sx_;
-        if (determinant > 1e-6) {
-            slope_ = std::max(0.1, (sw_ * sxy_ - sx_ * sy_) / determinant);
-            base_ = std::max(1.0, (sy_ - slope_ * sx_) / sw_);
-        }
-    }
-
-private:
-    int cap_, steps_ = 0, warmup_k_ = 3;
-    bool adaptive_;
-    std::array<double, QWEN4EXP_MTP_MAX_VERIFY> trials_{}, successes_{};
-    std::array<int, QWEN4EXP_MTP_MAX_VERIFY> cost_samples_{};
-    double base_, slope_ = 20.0;
-    double sw_ = 32.0, sx_ = 128.0, sxx_ = 800.0, sy_, sxy_;
-};
-
-// Server --verify-width: 0 = adaptive k=1..7, 1 = off, 2..8 = fixed k=1..7.
-// Eight verify rows is the RDNA3 batch-invariant MMVQ/MMID ceiling.
-inline Qwen4ExpMtpWidth qwen4exp_mtp_width_policy(int max_draft, bool adaptive, int prompt_tokens = 0) {
-    return Qwen4ExpMtpWidth(max_draft, adaptive, prompt_tokens);
+// The verify-width controller of qwen4exp's MTP: the shared one over widths
+// 2..8 (seed included). Its cost seed is only a shape, a fixed step overhead
+// plus a per-row cost, scaled to this device as widths get timed; acceptance
+// is counted at reached depths, the right model for a chained MTP head whose
+// acceptance can fall off a cliff at one depth. The backend keeps one
+// controller across requests: SpecWidthCostMemory holds its costs per context
+// range, and carry_acceptance() bounds what one request's text tells the next.
+inline AdaptiveSpecWidth qwen4exp_mtp_width_controller() {
+    AdaptiveSpecWidth width(QWEN4EXP_MTP_MAX_VERIFY);
+    std::vector<float> shape(QWEN4EXP_MTP_MAX_VERIFY + 1, 0.0f);
+    for (int w = 2; w <= QWEN4EXP_MTP_MAX_VERIFY; ++w) shape[(size_t) w] = 45.0f + 20.0f * (float) (w - 1);
+    width.set_relative_costs(shape, AdaptiveSpecWidth::CostSeed::kShape);
+    width.set_acceptance_model(AdaptiveSpecWidth::AcceptanceModel::kReachedDepths);
+    return width;
 }
 
-inline int qwen4exp_mtp_next_width(const Qwen4ExpMtpWidth & policy) {
-    return policy.next_width();
-}
+// Evidence one request's text may pass to the next, per depth.
+constexpr float QWEN4EXP_MTP_CARRIED_TRIALS = 32.0f;
 
 // Fixed production choice; smoke/session controls can measure other budgets.
 constexpr int QWEN4EXP_MTP_VOCAB = 64000;
@@ -135,6 +57,14 @@ inline std::vector<int32_t> qwen4exp_mtp_vocab_ids(int n_vocab, int budget,
     for (int id = 0; id < n_vocab; ++id) if (keep[id]) ids.push_back(id);
     return ids;
 }
+
+// The trunk pairs not yet in the draft layer's K/V: hidden row h[i] (the trunk's final HC residual at position
+// pos + i) and the token tok[i] that followed it. The next draft catches them up first.
+struct Qwen4ExpMtpPending {
+    std::vector<int32_t> tok;
+    std::vector<float> h;
+    int pos = 0;
+};
 
 struct Qwen4ExpMtpAcceptance {
     int n_accepted = 0;

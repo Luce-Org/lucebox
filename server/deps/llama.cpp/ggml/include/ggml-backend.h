@@ -377,6 +377,12 @@ extern "C" {
                                             ggml_backend_sched_t sched,
                                             bool enabled);
 
+    // Number of input copies, before the first allocation. A parallel scheduler
+    // keeps its per-copy events and persistent split-input copies even with one
+    // copy: GPU-side waits for cross-backend inputs without the extra copies that
+    // only overlapping evaluations need.
+    GGML_API void                 ggml_backend_sched_set_n_copies(ggml_backend_sched_t sched, int n_copies);
+
     // Inputs in one split share a destination and copy generation. Batch
     // unlike-runtime fallbacks through per-backend host arenas, transferring
     // only each tensor's logical payload (including strided/permuted views),

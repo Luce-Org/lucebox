@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -195,7 +196,7 @@ int run_mtp_check(ggml_backend_t backend, const Qwen4ExpWeights & w, const std::
 
     long long drafts = 0, accepted = 0, steps = 0;
     const int configured_k = cache.mtp_draft;
-    auto policy = qwen4exp_mtp_width_policy(configured_k, adaptive, S);
+    auto policy = qwen4exp_mtp_width_controller();
     auto emit = [&](const float * row) {
         const size_t index = out.size();
         out.push_back(top(row));
@@ -211,7 +212,8 @@ int run_mtp_check(ggml_backend_t backend, const Qwen4ExpWeights & w, const std::
         int pos = S;
         std::vector<int32_t> draft_tokens;
         while (ok && (int) out.size() < n_gen) {
-            const int k = std::min(qwen4exp_mtp_next_width(policy) - 1, n_gen - (int) out.size() - 1);
+            const int width = adaptive ? policy.next_width_cost_aware({}, configured_k + 1) : configured_k + 1;
+            const int k = std::min(width - 1, n_gen - (int) out.size() - 1);
             const bool verify = k > 0;
             std::vector<char> catchup_kv;
             if (verify) {
@@ -397,7 +399,7 @@ int run_mtp_rollback_check(ggml_backend_t backend, const Qwen4ExpWeights & w,
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <shard1.gguf> [seq_len=16] [--token-file FILE] [--split N[:chunk]] [--draft PATH|0] [--mtp N] [--mtp-draft 1..7] [--mtp-vocab 40000|64000|106000] [--mtp-window 32768] [--mtp-all] [--chunk N] [--tg N] [--stable N] [--compare-chunk N]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <shard1.gguf> [seq_len=16] [--token-file FILE] [--split N[:chunk]] [--draft PATH|0] [--mtp N] [--mtp-draft 1..7] [--mtp-vocab 40000|64000|106000] [--mtp-window 32768] [--mtp-all] [--chunk N] [--tg N] [--stable N] [--compare-chunk N] [--expert-gpu N]\n", argv[0]);
         return 2;
     }
     const std::string path = argv[1];
@@ -408,6 +410,7 @@ int main(int argc, char ** argv) {
     bool mtp_all = false;
     std::string draft;
     const char * token_file = nullptr;
+    int expert_gpu = -1;
     auto positive = [](const char * first, const char * last, int & n) {
         const auto r = std::from_chars(first, last, n);
         return r.ec == std::errc{} && r.ptr == last && n > 0;
@@ -437,6 +440,7 @@ int main(int argc, char ** argv) {
             if (!positive(val, val + std::strlen(val), compare_chunk)) return 2;
         }
         else if (opt == "--token-file" && arg + 1 < argc) token_file = argv[++arg];
+        else if (opt == "--expert-gpu" && arg + 1 < argc) expert_gpu = std::atoi(argv[++arg]);
         else if (opt == "--split" && arg + 1 < argc) {
             const char * val = argv[++arg], * end = val + std::strlen(val), * colon = std::strchr(val, ':');
             if (!positive(val, colon ? colon : end, N) || N >= S ||
@@ -454,6 +458,12 @@ int main(int argc, char ** argv) {
     }
 
     Qwen4ExpWeights w;
+    // As the server's --expert-device: the routed experts on that device (split mode).
+    if (expert_gpu >= 0) {
+        w.expert_backend = ggml_backend_cuda_init(expert_gpu);
+        if (!w.expert_backend) return 77;
+        w.expert_gfx1151 = ggml_backend_cuda_qwen4exp_supported(w.expert_backend);
+    }
     auto t_load0 = std::chrono::steady_clock::now();
     if (!load_qwen4exp_gguf(path, backend, w, draft, mtp_vocab)) {
         std::fprintf(stderr, "[smoke] load_qwen4exp_gguf failed\n");
@@ -728,6 +738,7 @@ int main(int argc, char ** argv) {
 
     free_qwen4exp_cache(cache);
     free_qwen4exp_weights(w);
+    if (w.expert_backend) ggml_backend_free(w.expert_backend);
     ggml_backend_free(backend);
 
     std::printf("[smoke] %s\n", rc == 0 ? "PASS" : "FAIL");

@@ -253,6 +253,18 @@ struct ModelBackend {
     // exactly there.
     virtual int snapshot_granularity() const { return 1; }
 
+    // Minimum token distance between the prompt restore points a backend cuts
+    // prefill at (spaced_restore_points). 0: every chat boundary. A backend
+    // whose prompt numerics depend on where a forward ends cuts at every
+    // restore point, so short messages would mean short, slow forwards.
+    virtual int restore_point_spacing() const { return 0; }
+
+    // True when the backend ends a prompt forward at every restore point
+    // (GenerateRequest::restore_points). A tool-result request then keeps its
+    // own last boundary among them, so a hit that skips the capture and a
+    // miss that captures the tools head cut prefill alike.
+    virtual bool prefill_cuts_at_restore_points() const { return false; }
+
     // System-memory bytes a snapshot of the first `tokens` positions would
     // take; positions beyond the cache capacity are clamped to it. Returns
     // 0 when the backend cannot estimate, which disables the prefix cache's
@@ -261,6 +273,11 @@ struct ModelBackend {
         (void)tokens;
         return 0;
     }
+
+    // Snapshot bytes the backend admits when it enforces its own allowance
+    // (SIZE_MAX: no allowance). The prefix cache's automatic resident limit
+    // stays within it, so the cache evicts before the backend refuses a capture.
+    virtual size_t snapshot_allowance_bytes() const { return SIZE_MAX; }
 
     // RESTORE <slot> <prompt_path> <n_gen> — restore snapshot + generate.
     // Backend handles the diff-prefill and decode internally.

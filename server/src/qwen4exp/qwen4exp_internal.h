@@ -10,9 +10,13 @@
 #include "qwen4exp_mtp.h"
 #include "ggml-cuda.h"
 #include "common/gguf_mmap.h"
+#include "common/moe_hybrid_routing_stats.h"
+#include "common/moe_hybrid_storage.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace luce::common {
@@ -51,6 +55,7 @@ struct Qwen4ExpLayer {
     ggml_tensor * ssm_beta       = nullptr;  // per-token beta input projection
     ggml_tensor * ssm_a          = nullptr;  // per-head -A parameter
     ggml_tensor * ssm_dt_bias    = nullptr;  // alpha bias
+    ggml_tensor * ssm_gate_ba    = nullptr;  // [dt_bias | A] f32 [2*H_v]: steps let the recurrence apply the gates
     ggml_tensor * ssm_norm       = nullptr;
     ggml_tensor * ssm_out        = nullptr;
 
@@ -125,12 +130,38 @@ private:
     ggml_to_float_t  to_float_  = nullptr;
 };
 
+// Small target-resident constants derived from the weights: the raw-gate parameters, QSA's head weights and the
+// hot-expert lookup tables. Each group opens a no-alloc context, creates its tensors and commits them as one weights
+// buffer; free() releases every group.
+class Qwen4ExpDerived {
+public:
+    ggml_context * open(size_t n_tensors);
+    bool commit(ggml_backend_t backend);   // false: the open group is dropped and its tensors are gone
+    void free();
+private:
+    std::vector<std::pair<ggml_context *, ggml_backend_buffer_t>> blocks_;
+};
+
 struct Qwen4ExpWeights {
     bool gfx1151 = false;  // Cache profile support at load, before any allocation.
+    bool qsa = false;      // The QSA kernels run on the target device (gfx1151, RDNA4).
     ggml_context *        ctx     = nullptr;  // shard 1 tensor descriptors
     // Descriptor contexts of shards 2..N (split GGUFs); `ctx` covers shard 1.
     std::vector<ggml_context *> extra_meta_ctxs;
     ggml_backend_buffer_t buf     = nullptr;
+    // Split mode: the routed expert stacks live on a second device (set by the
+    // caller before loading, not owned); everything else stays on `backend`.
+    ggml_backend_t        expert_backend = nullptr;
+    ggml_backend_buffer_t expert_buf     = nullptr;
+    bool                  expert_gfx1151 = false;
+    // Split mode: the most-routed experts copied to the target (`hot`, from
+    // --expert-placement). Verify steps run them there while the expert device
+    // runs the rest of the picks.
+    std::unique_ptr<MoeHybridStorage> hot;
+    std::vector<ggml_tensor *> hot_lut;    // per layer [1, n_expert] i32: hot slot, -1 if cold (null: no hot experts)
+    std::vector<ggml_tensor *> cold_lut;   // per layer [1, n_expert] i32: the expert, -1 if hot
+    ggml_tensor *              qsa_ones = nullptr;   // [indexer_n_head, 128] f32 ones: QSA's uniform head weights
+    Qwen4ExpDerived            derived;   // owns hot_lut/cold_lut, qsa_ones and the layers' ssm_gate_ba
 
     CpuEmbedder           embedder;
 
@@ -240,5 +271,7 @@ std::string find_qwen4exp_mtp_sidecar(const std::string & model_path);
 std::string pick_qwen4exp_mtp_sidecar(std::vector<std::string> names);
 
 void free_qwen4exp_weights(Qwen4ExpWeights & w);
+// Release the derived constants and clear every pointer into them.
+void free_qwen4exp_derived(Qwen4ExpWeights & w);
 
 }  // namespace luce::common

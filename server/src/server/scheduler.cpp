@@ -76,7 +76,7 @@ enum class AdmissionDisposition {
 
 void HttpServer::scheduler_loop(SeqEngine & engine) {
     const int n_slots = engine.slot_count();
-    if (config_.concurrent_paged_prefix_cache &&
+    if (config_.concurrent_prefix_cache &&
         config_.concurrent_prefix_cache_max_bytes == ServerConfig::kPrefixCacheBudgetAuto) {
         const size_t per = engine.estimate_prefix_store_bytes(engine.max_context());
         if (per > 0) {
@@ -496,7 +496,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 [&engine](int target_cut) {
                     return engine.estimate_prefix_store_bytes(target_cut);
                 },
-                req.ends_with_tool_result);
+                req.ends_with_tool_result, /*reachable_from=*/0,
+                backend_.restore_point_spacing());
             if (capture_reservation.active()) {
                 const uint64_t capture_id = next_prefix_capture_id++;
                 if (next_prefix_capture_id == 0)
@@ -511,6 +512,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     prefix_plan.capture = {};
                 }
             }
+        }
+        if (prefix_supported) {
+            // The same cuts on hits and misses, whatever the cache holds (as the
+            // single-sequence path passes GenerateRequest::restore_points).
+            prefix_plan.restore_points = request_restore_points(
+                req.prompt_tokens, req.ends_with_tool_result,
+                {prefix_plan.restore.tokens, prefix_plan.capture.checkpoint.tokens});
         }
         if (prefix_plan.capture.valid()) {
             prepared_capture = PrefixCaptureTxn(

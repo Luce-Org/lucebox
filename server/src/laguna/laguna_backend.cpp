@@ -2009,13 +2009,11 @@ bool LagunaBackend::init_hybrid_mode() {
     }
 
     // Manual budget cap (absolute MB)
-    if (const char * cap_env = std::getenv("LUCE_EXPERT_BUDGET_MB")) {
-        uint64_t cap_bytes = (uint64_t)std::atoi(cap_env) * 1024ULL * 1024ULL;
-        if (cap_bytes > 0 && cap_bytes < expert_budget) {
-            std::printf("[laguna-hybrid] capping expert budget from %.2f GiB to %d MB\n",
-                        expert_budget / 1024.0 / 1024.0 / 1024.0, std::atoi(cap_env));
-            expert_budget = cap_bytes;
-        }
+    if (const uint64_t cap_bytes = luce::common::expert_budget_bytes_from_env();
+        cap_bytes > 0 && cap_bytes < expert_budget) {
+        std::printf("[laguna-hybrid] capping expert budget from %.2f GiB to %d MB\n",
+                    expert_budget / 1024.0 / 1024.0 / 1024.0, (int) (cap_bytes >> 20));
+        expert_budget = cap_bytes;
     }
 
     // Percentage-based budget cap

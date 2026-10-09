@@ -239,7 +239,11 @@ static bool run_qsa_boundary(Qwen4ExpSeqEngine & engine, ggml_backend_t backend,
         if (qsa) poison_indexer(*caches[s]);
     }
     auto check_step = [&](const SeqEngine::StepPlan & plan) {
-        if (!engine.reserve_decode(plan)) return false;
+        if (!engine.reserve_decode(plan)) {
+            std::fprintf(stderr, "[qsa-boundary] reserve_decode refused decode=%zu prefills=%zu\n",
+                         plan.decode.size(), plan.prefills.size());
+            return false;
+        }
         std::vector<Qwen4ExpForwardSegment> spans;
         std::vector<int> slots;
         for (const auto & row : plan.decode) {
@@ -248,9 +252,10 @@ static bool run_qsa_boundary(Qwen4ExpSeqEngine & engine, ggml_backend_t backend,
         }
         for (const auto & row : plan.prefills) {
             const int pos = caches[row.slot]->cur_pos;
+            const int granule = engine.step_plan_limits(0).max_prefill_tokens_per_sequence;
             slots.push_back(row.slot);
             spans.push_back({caches[row.slot], prompts[row.slot].data() + pos,
-                std::min(row.max_tokens, (int) prompts[row.slot].size() - pos), pos});
+                std::min({row.max_tokens, (int) prompts[row.slot].size() - pos, granule}), pos});
         }
         std::vector<SavedIndexer> expected;
         std::vector<int32_t> expected_tokens;
@@ -264,7 +269,12 @@ static bool run_qsa_boundary(Qwen4ExpSeqEngine & engine, ggml_backend_t backend,
         }
         const auto result = engine.step(plan);
         if (!result.ok() || result.decode.size() != plan.decode.size() ||
-            result.prefills.size() != plan.prefills.size()) return false;
+            result.prefills.size() != plan.prefills.size()) {
+            std::fprintf(stderr, "[qsa-boundary] step failed: '%s' decode=%zu/%zu prefills=%zu/%zu\n",
+                         result.error.c_str(), result.decode.size(), plan.decode.size(),
+                         result.prefills.size(), plan.prefills.size());
+            return false;
+        }
         for (size_t i = 0; i < spans.size(); ++i) {
             const auto & span = spans[i];
             if (span.cache->cur_pos != span.pos0 + span.n_tokens ||
@@ -289,14 +299,24 @@ static bool run_qsa_boundary(Qwen4ExpSeqEngine & engine, ggml_backend_t backend,
         return true;
     };
     bool ok = true;
-    for (int slice = 0; slice < 6 && ok; ++slice) {
+    // A slot past its prompt decodes; the rest prefill within the engine's per-step limits.
+    auto prefilled = [&](int s) { return caches[s]->cur_pos >= (int) prompts[s].size(); };
+    auto all_prefilled = [&] {
+        for (int s = 0; s < N; ++s) if (!prefilled(s)) return false;
+        return true;
+    };
+    for (int slice = 0; slice < 16 && ok && !all_prefilled(); ++slice) {
         SeqEngine::StepPlan plan;
-        for (int s = 0; s < N; ++s) {
-            if (caches[s]->cur_pos == (int) prompts[s].size()) plan.decode.push_back({s, next[s]});
-            else plan.prefills.push_back({s, slice == 4 ? 2 : 512});
+        for (int s = 0; s < N; ++s)
+            if (prefilled(s)) plan.decode.push_back({s, next[s]});
+        const StepPlanLimits limits = engine.step_plan_limits((int) plan.decode.size());
+        for (int s = 0; s < N && (int) plan.prefills.size() < limits.max_prefill_sequences; ++s) {
+            if (prefilled(s)) continue;
+            plan.prefills.push_back({s, slice == 4 ? 2 : limits.max_prefill_tokens_per_sequence});
         }
         ok = check_step(plan);
     }
+    ok = ok && all_prefilled();
     for (int step = 0; step < 64 && ok; ++step) {
         SeqEngine::StepPlan plan;
         // Retire three slots after crossing the threshold and continue solo.
@@ -306,6 +326,146 @@ static bool run_qsa_boundary(Qwen4ExpSeqEngine & engine, ggml_backend_t backend,
     }
     for (int s = 0; s < N; ++s) engine.retire(s);
     for (auto & cache : solo) free_qwen4exp_cache(cache);
+    return ok;
+}
+
+// Drive one slot through prompt and `steps` decode tokens the way the
+// scheduler does; returns the sampled tokens (prompt's first, then decode).
+static std::vector<int32_t> drive_slot(Qwen4ExpSeqEngine & engine, int slot, int steps,
+                                       std::vector<SeqEngine::PrefillOutput> * prefills = nullptr) {
+    std::vector<int32_t> out;
+    for (int guard = 0; guard < 256 && out.empty(); ++guard) {
+        SeqEngine::StepPlan plan;
+        plan.prefills.push_back({slot, engine.step_plan_limits(0).max_prefill_tokens_per_sequence});
+        const auto result = engine.step(plan);
+        if (!result.ok() || result.prefills.size() != 1) return {};
+        if (prefills) prefills->push_back(result.prefills[0]);
+        if (result.prefills[0].status == SeqEngine::PrefillOutput::Status::completed)
+            out.push_back(result.prefills[0].token);
+    }
+    while (!out.empty() && (int) out.size() <= steps) {
+        SeqEngine::StepPlan plan;
+        plan.decode.push_back({slot, out.back()});
+        const auto result = engine.step(plan);
+        if (!result.ok() || result.decode.size() != 1) return {};
+        const auto & decoded = result.decode[0];   // an MTP slot alone also returns its accepted drafts
+        out.insert(out.end(), decoded.committed_tokens.begin(), decoded.committed_tokens.end());
+        out.push_back(decoded.token);
+    }
+    if ((int) out.size() > steps + 1) out.resize((size_t) steps + 1);
+    return out;
+}
+
+// A checkpoint captured by one slot restores into another and continues
+// token for token like the cold run that captured it, both ways between the
+// MTP slot (0, with the draft layer) and a slot without it.
+static bool run_prefix_store(Qwen4ExpSeqEngine & engine, const Qwen4ExpWeights & w) {
+    constexpr int L = 3000, C = 2000, STEPS = 24;
+    if (!engine.supports_prefix_store() || engine.estimate_prefix_store_bytes(C) == 0) return false;
+    for (int s = 0; s < engine.slot_count(); ++s) engine.retire(s);
+    std::vector<int32_t> prompt(L);
+    for (int i = 0; i < L; ++i) prompt[(size_t) i] = (int32_t) ((i * 7919 + 101) % w.n_vocab);
+
+    PrefixStorePlan capture_plan;
+    capture_plan.capture = {1, {1, C}};
+    const auto cold = engine.admit_with_prefix(900, prompt, SamplerCfg{}, capture_plan);
+    if (cold.status != SeqEngine::AdmitResult::Status::admitted || cold.prefix_store.capture != capture_plan.capture)
+        return false;
+    std::vector<SeqEngine::PrefillOutput> prefills;
+    const std::vector<int32_t> cold_tokens = drive_slot(engine, cold.slot, STEPS, &prefills);
+    bool saved = false;
+    for (const auto & p : prefills)
+        saved = saved || (p.prefix_store.status == PrefixStoreEvent::Status::saved &&
+                          p.prefix_store.ticket == capture_plan.capture && p.prefix_store.bytes > 0);
+    engine.retire(cold.slot);
+    if (cold_tokens.size() != STEPS + 1 || !saved) {
+        std::fprintf(stderr, "[prefix-store] cold run tokens=%zu saved=%d\n", cold_tokens.size(), (int) saved);
+        return false;
+    }
+
+    // Hold the capturing slot so the restore lands in another one.
+    std::vector<int32_t> filler(64, 7);
+    const auto blocker = engine.admit(901, filler, SamplerCfg{});
+    PrefixStorePlan restore_plan;
+    restore_plan.restore = {1, C};
+    const auto hit = engine.admit_with_prefix(902, prompt, SamplerCfg{}, restore_plan);
+    const bool cross_slot = blocker.slot == cold.slot && hit.slot != cold.slot;
+    if (hit.status != SeqEngine::AdmitResult::Status::admitted || hit.prefix_store.restored != restore_plan.restore) {
+        std::fprintf(stderr, "[prefix-store] restore was not accepted\n");
+        return false;
+    }
+    const std::vector<int32_t> hit_tokens = drive_slot(engine, hit.slot, STEPS);
+    engine.retire(hit.slot);
+    engine.retire(blocker.slot);
+
+    // A different prompt behind the same checkpoint id must not restore it.
+    std::vector<int32_t> other = prompt;
+    other[10] = (other[10] + 1) % w.n_vocab;
+    const auto stale = engine.admit_with_prefix(903, other, SamplerCfg{}, restore_plan);
+    const bool rejected = stale.status == SeqEngine::AdmitResult::Status::admitted &&
+        stale.prefix_store.invalidated == restore_plan.restore && !stale.prefix_store.restored.valid();
+    engine.retire(stale.slot);
+    engine.discard_prefix_store({1, C});
+
+    // And back: a slot without the draft layer captures, slot 0 restores and decodes without drafts.
+    const auto holder = engine.admit(904, filler, SamplerCfg{});
+    PrefixStorePlan plain_capture;
+    plain_capture.capture = {2, {2, C}};
+    const auto plain = engine.admit_with_prefix(905, prompt, SamplerCfg{}, plain_capture);
+    std::vector<SeqEngine::PrefillOutput> plain_prefills;
+    const std::vector<int32_t> plain_tokens = drive_slot(engine, plain.slot, STEPS, &plain_prefills);
+    bool plain_saved = false;
+    for (const auto & p : plain_prefills)
+        plain_saved = plain_saved || (p.prefix_store.status == PrefixStoreEvent::Status::saved &&
+                                      p.prefix_store.ticket == plain_capture.capture);
+    engine.retire(plain.slot);
+    engine.retire(holder.slot);
+    PrefixStorePlan back_plan;
+    back_plan.restore = {2, C};
+    const auto back = engine.admit_with_prefix(906, prompt, SamplerCfg{}, back_plan);
+    const bool back_restored = back.status == SeqEngine::AdmitResult::Status::admitted &&
+        back.prefix_store.restored == back_plan.restore && back.slot == holder.slot && plain.slot != holder.slot;
+    const std::vector<int32_t> back_tokens = back_restored ? drive_slot(engine, back.slot, STEPS) : std::vector<int32_t>{};
+    engine.retire(back.slot);
+    engine.discard_prefix_store({2, C});
+
+    const bool same = hit_tokens == cold_tokens;
+    const bool back_same = plain_saved && back_restored && plain_tokens == cold_tokens && back_tokens == cold_tokens;
+    std::fprintf(stderr, "[prefix-store] cross_slot=%d identical=%d stale_rejected=%d back_to_slot0=%d\n",
+                 (int) cross_slot, (int) same, (int) rejected, (int) back_same);
+    return cross_slot && same && rejected && back_same;
+}
+
+// With the plan's restore points, a cold prompt's text is the same whether
+// the cache captures it, restores it, or does neither.
+static bool run_prefix_cuts(Qwen4ExpSeqEngine & engine, const Qwen4ExpWeights & w) {
+    constexpr int L = 3000, STEPS = 24;
+    const std::vector<int> cuts = {700, 2000};
+    for (int s = 0; s < engine.slot_count(); ++s) engine.retire(s);
+    std::vector<int32_t> prompt(L);
+    for (int i = 0; i < L; ++i) prompt[(size_t) i] = (int32_t) ((i * 104729 + 7) % w.n_vocab);
+    auto run = [&](uint64_t id, const PrefixStorePlan & plan, bool * restored = nullptr) {
+        const auto admitted = engine.admit_with_prefix(id, prompt, SamplerCfg{}, plan);
+        if (admitted.status != SeqEngine::AdmitResult::Status::admitted) return std::vector<int32_t>{};
+        if (restored) *restored = admitted.prefix_store.restored == plan.restore;
+        auto tokens = drive_slot(engine, admitted.slot, STEPS);
+        engine.retire(admitted.slot);
+        return tokens;
+    };
+    PrefixStorePlan none;
+    none.restore_points = cuts;
+    PrefixStorePlan capture = none;
+    capture.capture = {2, {2, 2000}};
+    PrefixStorePlan restore = none;
+    restore.restore = {2, 2000};
+    const auto cold = run(910, none);
+    const auto captured = run(911, capture);
+    bool restored = false;
+    const auto resumed = run(912, restore, &restored);
+    engine.discard_prefix_store({2, 2000});
+    const bool ok = cold.size() == STEPS + 1 && cold == captured && restored && cold == resumed;
+    std::fprintf(stderr, "[prefix-cuts] cold==captured=%d restored=%d cold==restored=%d\n",
+                 (int) (cold == captured), (int) restored, (int) (cold == resumed));
     return ok;
 }
 
@@ -387,6 +547,25 @@ int main(int argc, char ** argv) {
         ok = ok && soak_ok;
         std::printf("[qwen4exp-seq] N=%d contract=%s soak=%s\n", n,
                     violations.empty() ? "PASS" : "FAIL", soak_ok ? "PASS" : "FAIL");
+    }
+    {
+        // Slot 0 as the server makes it: the MTP draft layer and its verify state, drafting when alone.
+        Qwen4ExpCache mtp_cache;
+        const bool mtp_ok = create_qwen4exp_cache(backend, weights, ctx, mtp_cache, /*mtp=*/true, QWEN4EXP_MTP_MAX_DRAFT);
+        if (mtp_ok) {
+            std::vector<Qwen4ExpCache *> served = ptrs;
+            served[0] = &mtp_cache;
+            Qwen4ExpSeqEngine engine(backend, weights, served, ctx, 512, size_t(8) << 30, /*verify_width=*/0);
+            const bool prefix_ok = run_prefix_store(engine, weights);
+            std::printf("[qwen4exp-seq] prefix-store=%s\n", prefix_ok ? "PASS" : "FAIL");
+            const bool cuts_ok = run_prefix_cuts(engine, weights);
+            std::printf("[qwen4exp-seq] prefix-cuts=%s\n", cuts_ok ? "PASS" : "FAIL");
+            ok = ok && prefix_ok && cuts_ok;
+        } else {
+            std::fprintf(stderr, "[qwen4exp-seq] MTP cache creation failed\n");
+            ok = false;
+        }
+        free_qwen4exp_cache(mtp_cache);
     }
     {
         Qwen4ExpSeqEngine engine(backend, weights, ptrs, ctx);

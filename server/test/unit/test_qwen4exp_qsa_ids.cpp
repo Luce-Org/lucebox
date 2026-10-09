@@ -194,6 +194,73 @@ static bool check_runtime_topk(ggml_backend_t be) {
     return ok;
 }
 
+// Several rows in one ggml_top_k_qsa (stable verify, one count per row read through a strided view) against each
+// row's one-row call on the same backend: the ordered 512 IDs per row, on tie-heavy rows across the routes.
+static bool check_runtime_topk_rows(ggml_backend_t be) {
+    bool ok = true;
+    int cases = 0;
+    for (int capacity : {1088, 4160, 8256, 16448, 32832}) {
+        const int lo = std::max(513, capacity - 64);
+        for (int T : {2, 4, 8}) {
+            ggml_context * c = ggml_init({4 * 1024 * 1024, nullptr, true});
+            ggml_tensor * scores = ggml_new_tensor_2d(c, GGML_TYPE_F32, capacity, T);
+            ggml_tensor * params = ggml_new_tensor_1d(c, GGML_TYPE_I32, 10 * T);
+            ggml_tensor * one_scores = ggml_new_tensor_1d(c, GGML_TYPE_F32, capacity);
+            ggml_tensor * one_valid = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
+            ggml_tensor * rows = ggml_top_k_qsa(c, scores, ggml_view_2d(c, params, 1, T, 10 * sizeof(int32_t), 0), lo);
+            ggml_tensor * one = ggml_top_k_qsa(c, one_scores, one_valid, lo);
+            if (!ggml_backend_supports_op(be, rows) || !ggml_backend_supports_op(be, one)) { ggml_free(c); continue; }
+            ggml_cgraph * gr = ggml_new_graph(c);
+            ggml_build_forward_expand(gr, rows);
+            ggml_cgraph * g1 = ggml_new_graph(c);
+            ggml_build_forward_expand(g1, one);
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(c, be);
+            if (!buf) { ggml_free(c); return false; }
+            for (int pattern = 0; ok && pattern < 4; ++pattern) {
+                std::vector<float> data((size_t) capacity * T);
+                std::vector<int32_t> p((size_t) 10 * T, 0);
+                for (int t = 0; t < T; ++t) {
+                    const int n = std::max(lo, capacity - 3 * t);
+                    p[(size_t) 10 * t] = n;
+                    for (int i = 0; i < capacity; ++i) {
+                        data[(size_t) t * capacity + i] = i >= n ? -1.0e30f : pattern == 0 ? 0.0f :
+                            pattern == 1 ? float((i * 37 + t) % 7) : pattern == 2 ? (i < 511 + t ? 2.0f : 1.0f) :
+                            float((i * 5171 + t * 13) % 65537);
+                    }
+                }
+                ggml_backend_tensor_set(scores, data.data(), 0, ggml_nbytes(scores));
+                ggml_backend_tensor_set(params, p.data(), 0, ggml_nbytes(params));
+                ok = ggml_backend_graph_compute(be, gr) == GGML_STATUS_SUCCESS;
+                std::vector<int32_t> got((size_t) 512 * T), want(512);
+                if (ok) ggml_backend_tensor_get(rows, got.data(), 0, ggml_nbytes(rows));
+                for (int t = 0; ok && t < T; ++t) {
+                    ggml_backend_tensor_set(one_scores, data.data() + (size_t) t * capacity, 0, ggml_nbytes(one_scores));
+                    ggml_backend_tensor_set(one_valid, &p[(size_t) 10 * t], 0, sizeof(int32_t));
+                    ok = ggml_backend_graph_compute(be, g1) == GGML_STATUS_SUCCESS;
+                    if (ok) {
+                        ggml_backend_tensor_get(one, want.data(), 0, ggml_nbytes(one));
+                        ok = std::equal(want.begin(), want.end(), got.begin() + (size_t) t * 512);
+                    }
+                    if (!ok) std::fprintf(stderr, "top-k rows mismatch capacity=%d T=%d row=%d pattern=%d\n",
+                                          capacity, T, t, pattern);
+                }
+                ++cases;
+            }
+#ifndef QSA_IDS_CPU_ONLY
+            if (ggml_backend_is_cuda(be)) ggml_backend_cuda_graph_invalidate_range(
+                be, ggml_get_mem_buffer(c), ggml_get_mem_size(c));
+#endif
+            ggml_backend_buffer_free(buf);
+            ggml_free(c);
+            if (!ok) break;
+        }
+        if (!ok) break;
+    }
+    std::printf("qsa runtime top-k rows: %d multi-row cases %s\n", cases,
+                !ok ? "FAIL" : cases ? "PASS" : "SKIP (backend lacks exact runtime top-k)");
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     const bool cpu_only = argc == 2 && std::strcmp(argv[1], "--cpu") == 0;
     ggml_backend_t gpu = nullptr;
@@ -205,6 +272,7 @@ int main(int argc, char ** argv) {
     if (!cpu) return 1;
     ggml_backend_cpu_set_n_threads(cpu, 4);
     bool ok = check_runtime_topk(gpu ? gpu : cpu);
+    ok = check_runtime_topk_rows(gpu ? gpu : cpu) && ok;
     int cases = 0;
     // Every tail residue, the dense/QSA transition, and context/block boundaries.
     for (int T : {1, 2, 8, 129}) {

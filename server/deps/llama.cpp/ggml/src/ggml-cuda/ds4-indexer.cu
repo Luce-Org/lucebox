@@ -266,6 +266,8 @@ static __global__ void ds4_indexer_score_wmma_kernel(
 // 128 compressed keys as columns. This performs only useful dot products;
 // the general 16-token kernel above spends 15/16 of its WMMA work on zero rows
 // when n_tokens == 1, which made decode scale linearly with context length.
+// blockIdx.y picks the token: a tokenwise call runs this one-token kernel for
+// each of its tokens in one launch.
 static __global__ void ds4_indexer_score_decode_wmma_kernel(
         float       * scores,
         const float * q,
@@ -276,6 +278,13 @@ static __global__ void ds4_indexer_score_decode_wmma_kernel(
         int           kv_start,
         int           n_head,
         int           ratio) {
+    const int token = (int) blockIdx.y;
+    q += (size_t) token * n_head * 128;
+    weights += (size_t) token * n_head;
+    scores += (size_t) token * n_comp;
+    if (visibility_mask) {
+        visibility_mask += (size_t) token * n_comp;
+    }
     const int tile_c = (int) blockIdx.x * 128;
     const int tid = (int) threadIdx.x;
     const int warp = tid >> 5;
@@ -970,6 +979,21 @@ void ggml_cuda_op_ds4_indexer_score(
         ? ds4_env_flag_enabled(packed_small_name)
         : GGML_CUDA_CC_IS_RDNA3_5(device_info.cc) ||
           GGML_CUDA_CC_IS_RDNA4(device_info.cc);
+    // Tokenwise (ggml_ds4_indexer_score_tokenwise): each token scored by the
+    // one-token kernel, whatever the multi-token kernels would pick.
+    if (ggml_get_op_params_i32(dst, 2) != 0 && wmma_capable && q->type == GGML_TYPE_F32) {
+        const dim3 grid((unsigned) ((n_comp + 127) / 128), (unsigned) n_tokens, 1);
+        ds4_indexer_score_decode_wmma_kernel<<<grid, 256, 0, stream>>>(
+            static_cast<float *>(dst->data),
+            static_cast<const float *>(q->data),
+            static_cast<const float *>(weights->data),
+            static_cast<const half *>(comp->data),
+            visibility_mask
+                ? static_cast<const float *>(visibility_mask->data) : nullptr,
+            n_comp, kv_start, n_head, ratio);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 #if DS4_INDEXER_WMMA_AVAILABLE
 #if defined(GGML_USE_HIP)
     // The M32 switches are read per call on purpose: the unit tests toggle

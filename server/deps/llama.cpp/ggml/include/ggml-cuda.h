@@ -273,6 +273,8 @@ enum ggml_cuda_qwen4exp_profile {
 };
 GGML_BACKEND_API enum ggml_cuda_qwen4exp_profile ggml_backend_cuda_set_qwen4exp_profile(enum ggml_cuda_qwen4exp_profile profile);
 GGML_BACKEND_API bool ggml_backend_cuda_qwen4exp_supported(ggml_backend_t backend);
+// True when the QSA selected-attention kernels (qsa.cu) run on the backend's device: gfx1151 and RDNA4.
+GGML_BACKEND_API bool ggml_backend_cuda_qsa_supported(ggml_backend_t backend);
 
 // True when a matmul with weight w over n_tokens rows can take an F16 activation (HIP MMB Q8_0 -> F16 route).
 GGML_BACKEND_API bool ggml_backend_cuda_mmb_f16_input_ok(const struct ggml_tensor * w, int64_t n_tokens);

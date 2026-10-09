@@ -140,9 +140,9 @@ static void print_usage(const char * prog) {
         "                                 LUCE_TARGET_DEVICE\n"
         "  --draft-device <backend:gpu>   Draft device (default: auto:0; DeepSeek4\n"
         "                                 and --target-device auto: the target GPU)\n"
-        "  --expert-device <backend:gpu>  DeepSeek4: keep dense work and hot experts on\n"
-        "                                 the target and run the remaining routed\n"
-        "                                 experts on this GPU in process\n"
+        "  --expert-device <backend:gpu>  DeepSeek4, Qwen3.8-Flash-Next: keep dense work\n"
+        "                                 and hot experts on the target and run the\n"
+        "                                 remaining routed experts on this GPU in process\n"
         "  --draft-ipc-bin <path>         Remote backend IPC daemon for mixed backends\n"
         "  --draft-ipc-work-dir <path>    Remote draft IPC scratch directory\n"
         "  --draft-ipc-ring-cap <N>       Remote draft feature ring capacity\n"
@@ -168,9 +168,13 @@ static void print_usage(const char * prog) {
         "  --ds4-expert-top-k <N>\n"
         "                       Keep and renormalize the highest-ranked N routed experts\n"
         "                       (0=model default; single-device DeepSeek4 only)\n"
-        "  --ds4-expert-placement <FILE>\n"
-        "                       Per-expert owner: primary GPU, secondary GPU or streamed\n"
-        "                       from the model file (JSON, see docs/DS41.md)\n"
+        "  --expert-placement <FILE>\n"
+        "                       Expert placement. DeepSeek4: per-expert owner, primary GPU,\n"
+        "                       secondary GPU or streamed from the model file (JSON, see\n"
+        "                       docs/DS41.md). Qwen3.8-Flash-Next with --expert-device:\n"
+        "                       routing-stats CSV; its most-routed experts, up to\n"
+        "                       LUCE_EXPERT_BUDGET_MB (default 8192), run on the target.\n"
+        "                       Alias: --ds4-expert-placement\n"
         "  --ds4-router-bias <FILE>\n"
         "                       Add f32 [n_layer][n_expert] to the routing selection bias\n"
         "  --ds4-protected-experts <FILE>\n"
@@ -522,6 +526,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 return 2;
             }
             model.expert_device = expert;
+            bargs.expert_device = expert;
         } else if (std::strcmp(argv[i], "--profile") == 0) {
             // main() expands profiles before blocks are parsed.
             std::fprintf(stderr, "[server] --profile needs a profile name (%s)\n",
@@ -579,7 +584,8 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 std::fprintf(stderr, "[server] --ds4-expert-top-k must be non-negative\n");
                 return 2;
             }
-        } else if ((std::strcmp(argv[i], "--ds4-expert-placement") == 0 ||
+        } else if ((std::strcmp(argv[i], "--expert-placement") == 0 ||
+                    std::strcmp(argv[i], "--ds4-expert-placement") == 0 ||
                     std::strcmp(argv[i], "--ds4-router-bias") == 0 ||
                     std::strcmp(argv[i], "--ds4-protected-experts") == 0) && i + 1 < argc) {
             // Checked here so a wrong path fails before the model is mapped.
@@ -590,9 +596,9 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 std::fprintf(stderr, "[server] %s: no such file '%s'\n", flag, path);
                 return 2;
             }
-            std::string & dst = std::strcmp(flag, "--ds4-expert-placement") == 0 ? bargs.ds4_expert_placement
-                              : std::strcmp(flag, "--ds4-router-bias") == 0 ? bargs.ds4_router_bias
-                                                                            : bargs.ds4_protected_experts;
+            std::string & dst = std::strcmp(flag, "--ds4-router-bias") == 0 ? bargs.ds4_router_bias
+                              : std::strcmp(flag, "--ds4-protected-experts") == 0 ? bargs.ds4_protected_experts
+                                                                                  : bargs.expert_placement;
             dst = path;
         } else if (std::strncmp(argv[i], "--cluster-", 10) == 0) {
             // Expert-parallel cluster flags (maikzz32/lucebox-halo-cluster).
@@ -1153,15 +1159,18 @@ static void print_target_device_hint(const std::string & model_path,
         better.arch.c_str(), bytes_to_gib(better.total_bytes), backend, choice.index);
 }
 
-// --expert-device: DeepSeek4 in-process expert parallelism. The flag is the
+// --expert-device: in-process expert parallelism. For DeepSeek4 the flag is the
 // command-line spelling of LUCE_DS4_MOE_TP=1 LUCE_DS4_MOE_TP_INPROC=1
-// LUCE_DS4_MOE_TP_GPU=<n> LUCE_DS4_MOE_TP_BACKEND=<backend>.
+// LUCE_DS4_MOE_TP_GPU=<n> LUCE_DS4_MOE_TP_BACKEND=<backend>; Qwen3.8-Flash-Next
+// (qwen4exp) reads it from the backend plan.
 static bool apply_expert_device(const DevicePlacement & expert,
                                 const BackendPlan & plan) {
     const DevicePlacement & target = plan.placement().target;
-    if (!luce::common::arch_is_deepseek4_family(plan.arch())) {
+    const bool qwen4exp = plan.arch() == "qwen4exp";
+    if (!luce::common::arch_is_deepseek4_family(plan.arch()) && !qwen4exp) {
         std::fprintf(stderr,
-            "[server] --expert-device is only valid for DeepSeek V4 / V4.1 models (detected '%s')\n",
+            "[server] --expert-device is only valid for DeepSeek V4 / V4.1 and Qwen3.8-Flash-Next models "
+            "(detected '%s')\n",
             plan.arch().c_str());
         return false;
     }
@@ -1178,6 +1187,7 @@ static bool apply_expert_device(const DevicePlacement & expert,
         std::fprintf(stderr, "[server] --expert-device must differ from the target device\n");
         return false;
     }
+    if (qwen4exp) return true;
     const std::string gpu = std::to_string(expert.gpu);
     set_environment_variable("LUCE_DS4_MOE_TP", "1", true);
     set_environment_variable("LUCE_DS4_MOE_TP_INPROC", "1", true);
@@ -1427,9 +1437,11 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         sconfig.disk_cache_dir.clear();
         sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
     }
-    sconfig.concurrent_paged_prefix_cache =
-        backend_cache.paged_attention && backend_execution.max_concurrency > 1 &&
-        sconfig.prefix_cache_cap > 0;
+    // Every concurrent engine takes its prefix checkpoints from the scheduler:
+    // paged engines copy pages, qwen4exp copies full-cache snapshots. Both use
+    // the concurrent budget and no single-sequence superseded pruning.
+    sconfig.concurrent_prefix_cache =
+        backend_execution.max_concurrency > 1 && sconfig.prefix_cache_cap > 0;
 
     if (sconfig.agent_turn_cache && backend_cache.paged_attention) {
         std::fprintf(stderr,
@@ -1933,7 +1945,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         std::fprintf(stderr, "[server] %s\n", prefix_ram.error.c_str());
         return 2;
     }
-    if (sconfig.concurrent_paged_prefix_cache &&
+    if (sconfig.concurrent_prefix_cache &&
         sconfig.prefix_cache_max_bytes != ServerConfig::kPrefixCacheBudgetAuto) {
         std::fprintf(stderr,
             "[server] --prefix-cache-max-mib has no effect with concurrent "
@@ -1941,7 +1953,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
     // Store the resolved value: auto depends on the memory available now,
     // and the budget printed here must be the one the server enforces.
-    if (!sconfig.concurrent_paged_prefix_cache) {
+    if (!sconfig.concurrent_prefix_cache) {
         sconfig.prefix_cache_max_bytes = prefix_ram.bytes;
     }
     if (sconfig.prefix_cache_cap <= 0) {

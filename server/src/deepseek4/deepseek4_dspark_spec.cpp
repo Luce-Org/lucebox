@@ -1205,7 +1205,9 @@ bool run_deepseek4_dspark_spec_decode(
          width <= std::min(q_cap, DS4_Q5_VERIFY_TOKENS); ++width) {
         width_cost_ms[(size_t) width] = kDs4VerifyWidthCostMs[width];
     }
-    width_controller.set_relative_costs(width_cost_ms);
+    // The table is one machine's curve: a shape that prices the widths this
+    // machine has not measured yet, never mixed with its measurements.
+    width_controller.set_relative_costs(width_cost_ms, AdaptiveSpecWidth::CostSeed::kShape);
     // Step costs belong to the machine, not to the text: every request starts
     // from the costs the earlier ones measured (their warmup hold re-arms).
     static std::mutex measured_width_costs_mu;

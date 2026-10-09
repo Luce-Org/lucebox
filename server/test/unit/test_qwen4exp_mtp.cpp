@@ -82,28 +82,22 @@ int main() {
     CHECK(qwen4exp_mtp_vocab_ids(10, 1, {8, 9}) == std::vector<int32_t>({8, 9}));
     CHECK(qwen4exp_mtp_vocab_ids(10, 0, {8}).empty());
 
-    // Fixed overrides ignore all feedback, including invalid/cold timings.
-    for (int k = 1; k <= QWEN4EXP_MTP_MAX_DRAFT; ++k) {
-        auto fixed = qwen4exp_mtp_width_policy(k, false);
-        for (int i = 0; i < 32; ++i) {
-            fixed.observe(1, k + 1, 1000.0f);
-            CHECK(qwen4exp_mtp_next_width(fixed) == k + 1);
-        }
-    }
-    auto recover = qwen4exp_mtp_width_policy(7, true, 66060);
-    for (int i = 0; i < 128; ++i) recover.observe(1, qwen4exp_mtp_next_width(recover));
+    // The MTP verify-width controller (the shared AdaptiveSpecWidth in qwen4exp's configuration). After a
+    // long run of full rejections it still probes wider widths, and a clean run takes it back to the cap.
+    auto recover = qwen4exp_mtp_width_controller();
+    for (int i = 0; i < 128; ++i) recover.observe(1, recover.next_width_cost_aware({}, 8));
     int probes = 0;
     for (int i = 0; i < 64; ++i) {
-        const int w = qwen4exp_mtp_next_width(recover);
+        const int w = recover.next_width_cost_aware({}, 8);
         probes += w > 2;
         recover.observe(1, w);
     }
-    CHECK(probes >= 3); // k=1 cannot suppress the exploration floor
+    CHECK(probes >= 3); // width 2 cannot suppress the probes
     for (int i = 0; i < 1500; ++i) {
-        const int w = qwen4exp_mtp_next_width(recover);
+        const int w = recover.next_width_cost_aware({}, 8);
         recover.observe(w, w);
     }
-    CHECK(qwen4exp_mtp_next_width(recover) == 8);
+    CHECK(recover.next_width_cost_aware({}, 8) == 8);
 
     // Stationary prefix distributions, including a sharp depth-2 cliff. The
     // same latent prefix stream is used regardless of the selected width.
@@ -117,13 +111,13 @@ int main() {
     for (int context : {16000, 66060}) for (const auto & survival : distributions) {
         const double base = context < 32768 ? 45 : 47;
         // Include a substantially different per-context slope to exercise
-        // measured cost adaptation, not merely agreement with the priors.
+        // measured cost adaptation, not merely agreement with the seed shape.
         for (double slope : {16.0, 20.0, 28.0}) for (bool noisy : {false, true}) {
-            auto policy = qwen4exp_mtp_width_policy(7, true, context);
+            auto policy = qwen4exp_mtp_width_controller();
             uint32_t random = 1;
             double tokens = 0, elapsed = 0;
             for (int i = 0; i < 12000; ++i) {
-                const int width = qwen4exp_mtp_next_width(policy);
+                const int width = policy.next_width_cost_aware({}, 8);
                 CHECK(width >= 2 && width <= 8);
                 random = random * 1664525u + 1013904223u;
                 const double draw = random / 4294967296.0;
@@ -134,7 +128,7 @@ int main() {
                 // +/-20% jitter. Accounting uses the true cost, not its noise.
                 const double measured = noisy ? (i < 8 || i == 80 ? cost + 900 :
                                                   cost * (i % 2 ? 1.2 : .8)) : cost;
-                policy.observe(accepted, width, measured);
+                policy.observe(accepted, width, (float) measured);
                 if (i >= 1000) { tokens += accepted; elapsed += cost; }
             }
             double best = 0, expected = 1;
@@ -154,33 +148,80 @@ int main() {
     for (int seed = 1; seed <= 3; ++seed) for (bool counting : {false, true}) {
         double rates[2]{};
         for (int noise = 0; noise < 2; ++noise) {
-            auto policy = qwen4exp_mtp_width_policy(7, true, 66060);
+            auto policy = qwen4exp_mtp_width_controller();
             uint32_t random = seed;
             double elapsed = 0;
             int tokens = 0, steps = 0;
-            std::array<int, 8> histogram{};
+            std::array<int, 9> histogram{};
             while (tokens < (counting ? 511 : 1023)) {
-                const int width = qwen4exp_mtp_next_width(policy);
-                ++histogram[width - 1];
+                const int width = policy.next_width_cost_aware({}, 8);
+                ++histogram[width];
                 random = random * 1664525u + 1013904223u;
                 const double draw = random / 4294967296.0;
                 int accepted = 1;
                 while (accepted < width && draw < distributions[counting ? 0 : 1][accepted - 1]) ++accepted;
                 const double cost = 47 + 20 * (width - 1);
-                policy.observe(accepted, width, noise ? (steps == 80 ? cost + 900 :
-                                                           cost * (steps % 2 ? 1.2 : .8)) : cost);
+                policy.observe(accepted, width, (float) (noise ? (steps == 80 ? cost + 900 :
+                                                                 cost * (steps % 2 ? 1.2 : .8)) : cost));
                 tokens += accepted;
                 elapsed += cost;
                 ++steps;
             }
             rates[noise] = tokens / elapsed;
-            CHECK(histogram[1] < steps / 10);
+            CHECK(histogram[2] < steps / 10);
             std::printf("MTP synthetic %s seed=%d noise=%d tps=%.3f tokens/step=%.3f k1..7=",
                         counting ? "counting" : "code", seed, noise, rates[noise] * 1000, double(tokens) / steps);
-            for (int k = 1; k <= 7; ++k) std::printf("%s%d", k == 1 ? "" : "/", histogram[k]);
+            for (int k = 1; k <= 7; ++k) std::printf("%s%d", k == 1 ? "" : "/", histogram[k + 1]);
             std::printf("\n");
         }
         CHECK(rates[1] >= .98 * rates[0]);
+    }
+
+    // Requests in sequence through one controller, as the backend runs a bench: a short reply, two 16K
+    // summaries whose steps cost 2 ms more per verify row, then a long thinking reply. Widths timed at 16K
+    // must not make the short range's narrow widths look dear (SpecWidthCostMemory keeps a cost set per
+    // context range), and the thinking reply must reach the best fixed width's rate.
+    {
+        const std::array<double, 7> s_short{.95, .88, .80, .72, .62, .52, .42};
+        const std::array<double, 7> s_long{.70, .42, .26, .14, .08, .04, .02};
+        const std::array<double, 7> s_think{.88, .75, .64, .42, .33, .25, .18};
+        struct Request { int tokens, context; const std::array<double, 7> * survival; };
+        const std::vector<Request> requests{{256, 30, &s_short}, {128, 15140, &s_long}, {128, 15140, &s_long},
+                                            {334, 65, &s_think}};
+        auto row_cost = [](int width, int context) { return 21.5 + 9.5 * (width - 1) + (context >= 2048 ? 2.0 * width : 0.0); };
+        double think_rate = 0;
+        auto policy = qwen4exp_mtp_width_controller();
+        SpecWidthCostMemory memory;
+        uint32_t random = 7;
+        for (int round = 0; round < 3; ++round) for (const Request & r : requests) {
+            memory.load(policy, r.context);
+            policy.carry_acceptance(QWEN4EXP_MTP_CARRIED_TRIALS);
+            double tokens = 0, elapsed = 0;
+            for (int done = 1; done < r.tokens;) {
+                const int width = policy.next_width_cost_aware({}, 8);
+                random = random * 1664525u + 1013904223u;
+                const double draw = random / 4294967296.0;
+                int accepted = 1;
+                while (accepted < width && draw < (*r.survival)[accepted - 1]) ++accepted;
+                const double cost = row_cost(width, r.context);
+                policy.observe(accepted, width, (float) (cost * (done % 2 ? 1.05 : .95)));
+                done += accepted;
+                tokens += accepted;
+                elapsed += cost;
+            }
+            memory.store(policy, r.context);
+            if (round == 2 && r.survival == &s_think) think_rate = tokens / elapsed;
+        }
+        // The short range's cost never saw a 16K step.
+        memory.load(policy, 30);
+        CHECK(policy.measured_costs()[4] < row_cost(4, 30) * 1.06);
+        double best = 0, expected = 1;
+        for (int k = 1; k <= 7; ++k) {
+            expected += s_think[k - 1];
+            best = std::max(best, expected / row_cost(k + 1, 65));
+        }
+        std::printf("MTP policy bench sequence: thinking reply at %.3f of the best fixed width\n", think_rate / best);
+        CHECK(think_rate >= 0.97 * best);
     }
 
     int cases = 0;

@@ -39,6 +39,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -108,12 +109,12 @@ struct ServerConfig {
     static constexpr size_t kConcurrentPrefixBudgetFloor = (size_t)4 * 1024 * 1024 * 1024;
     size_t      prefix_cache_max_bytes = kPrefixCacheBudgetAuto;
     // Resident system-memory budget for copied paged checkpoints. The
-    // scheduler enforces it only when concurrent paged prefix storage is
+    // scheduler enforces it only when concurrent prefix storage is
     // active. kPrefixCacheBudgetAuto sizes it when the scheduler starts, from
     // the slot count and the batch engine's checkpoint size at --max-ctx
     // (at least kConcurrentPrefixBudgetFloor); zero means unlimited.
     size_t      concurrent_prefix_cache_max_bytes = kPrefixCacheBudgetAuto;
-    bool        concurrent_paged_prefix_cache = false;
+    bool        concurrent_prefix_cache = false;
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
     // Extend the existing prefix cache through generated tool-call turns.
     bool        agent_turn_cache = false;
@@ -389,10 +390,11 @@ struct PrefixCacheBudget {
     std::string error;        // set when an explicit limit cannot apply;
                               // startup rejects that configuration
 };
-// Automatic concurrent paged prefix budget: 2 x slots + 1 checkpoints of
+// Automatic concurrent prefix budget: 2 x slots + 1 checkpoints of
 // per_checkpoint bytes, at least ServerConfig::kConcurrentPrefixBudgetFloor
 // and, above that, at most memory / 4 when memory is known (non-zero).
 size_t auto_concurrent_prefix_budget(size_t per_checkpoint, int slots, size_t memory);
+
 PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
                                               const ModelBackend & backend);
 
@@ -535,6 +537,13 @@ private:
         bool snap_prepared = false;
     };
 
+    // A request's restore points (prefix_restore_points) on both serving
+    // paths: its chat boundaries spaced for the backend, plus `cuts`. The
+    // generation prompt's own boundary stays only for a tool-result request
+    // on a backend that cuts prefill at every restore point.
+    std::vector<int> request_restore_points(const std::vector<int32_t> & prompt,
+                                            bool ends_with_tool_result,
+                                            std::initializer_list<int> cuts) const;
     GenerationCacheState prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,
         GenerateRequest & generate_request);

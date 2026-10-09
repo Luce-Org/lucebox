@@ -119,6 +119,10 @@ struct Qwen4ExpPrefixTest {
         };
     }
     static void unhook(Qwen4ExpBackend & b) { b.decode_check_ = {}; }
+    // Split mode: the hot experts and their lookup tables are resident on the target.
+    static bool hot_experts_resident(const Qwen4ExpBackend & b) {
+        return b.weights_.hot && !b.weights_.hot_lut.empty();
+    }
     static size_t limit(Qwen4ExpBackend & b, size_t bytes) {
         return std::exchange(b.snapshot_budget_, bytes);
     }
@@ -230,7 +234,7 @@ static void copies(ggml_backend_t backend) {
         // survive a reset and an unrelated request overwriting the live buffer.
         reset_qwen4exp_state(backend, c);
         ggml_backend_buffer_clear(c.buf, 0xa5);
-        restore_qwen4exp_snapshot(backend, s, c);
+        CHECK(restore_qwen4exp_snapshot(backend, s, c));
         CHECK(c.cur_pos == pos && c.indexer_blocks == pos / 4 && c.mtp_prev_pos == pos - 1);
         CHECK(c.kv_bucket_base == 512 && c.ple_prev == std::vector<int32_t>({11, 12}));
         CHECK(c.spec_tokens == 0 && c.spec_pos == -1);
@@ -279,12 +283,22 @@ static void memory(ggml_backend_t backend) {
     free_qwen4exp_cache(c);
 }
 
-static void model(const char * path, int width, int chunk, int ctx) {
+// expert_gpu >= 0 runs split mode (the routed experts on that GPU), with the hot experts of `placement` if given.
+static void model(const char * path, int width, int chunk, int ctx, int expert_gpu, const char * placement) {
     Qwen4ExpBackendConfig cfg;
     cfg.model_path = path; cfg.verify_width = width; cfg.chunk = chunk;
     cfg.device.max_ctx = chunk == 0 && ctx == 262144 ? 131072 : ctx;
+    if (expert_gpu >= 0) {
+        DevicePlacement expert;
+        expert.backend = cfg.device.backend;
+        expert.gpu = expert_gpu;
+        cfg.expert_device = expert;
+        if (placement) cfg.expert_placement_path = placement;
+    }
     Qwen4ExpBackend b(cfg);
     CHECK(b.init());
+    const bool hot = expert_gpu >= 0 && placement;
+    CHECK(Qwen4ExpPrefixTest::hot_experts_resident(b) == hot);
     if (chunk == 0 && ctx == 262144) {
         Qwen4ExpPrefixTest::plan(b, 131072);
         Qwen4ExpPrefixTest::plan(b, 262144);
@@ -467,9 +481,12 @@ static void model(const char * path, int width, int chunk, int ctx) {
     CHECK(b.park(ParkTarget::All));
     CHECK(b.snapshot_bytes_estimate(65536) == 0);
     CHECK(b.unpark(ParkTarget::All));
+    // An unpark brings the target back as init did, hot experts included.
+    CHECK(Qwen4ExpPrefixTest::hot_experts_resident(b) == hot);
     const auto after_unpark = b.generate(r, {});
     CHECK(after_unpark.ok() && after_unpark.tokens == before_park.tokens);
-    std::printf("PASS backend prefix lifecycle, partial match, cancel, resident, MTP rollback width=%d\n", width);
+    std::printf("PASS backend prefix lifecycle, partial match, cancel, resident, MTP rollback width=%d%s\n", width,
+                hot ? ", split with hot experts across park/unpark" : expert_gpu >= 0 ? ", split" : "");
 }
 
 int main(int argc, char ** argv) {
@@ -480,6 +497,8 @@ int main(int argc, char ** argv) {
     copies(backend);
     memory(backend);
     ggml_backend_free(backend);
+    // test_qwen4exp_prefix_cache MODEL [width] [chunk] [ctx] [expert_gpu] [placement.csv]
     if (argc > 1) model(argv[1], argc > 2 ? std::atoi(argv[2]) : 0,
-        argc > 3 ? std::atoi(argv[3]) : 0, argc > 4 ? std::atoi(argv[4]) : 8192);
+        argc > 3 ? std::atoi(argv[3]) : 0, argc > 4 ? std::atoi(argv[4]) : 8192,
+        argc > 5 ? std::atoi(argv[5]) : -1, argc > 6 ? argv[6] : nullptr);
 }

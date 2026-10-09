@@ -31,16 +31,20 @@
 //    are calibrated online: observe_confidence() tracks predicted against
 //    observed acceptance per depth and each score is scaled by their ratio,
 //    so an optimistic head stops buying widths the target does not pay for.
-//    Step costs are seeded by set_relative_costs() and measured online from
+//    Step costs are seeded by set_relative_costs() and refined online from
 //    the observed cost of the offered width; the first kCostWarmupSamples
 //    observations of a seeded width are ignored so a cold shape-specific
-//    graph build cannot poison the estimate. A seed is a shape, not a
-//    measurement of this machine: until a width is measured it is priced at
-//    its seed scaled by the measured/seed ratio of the nearest measured
-//    width, and never above a measured narrower width, so a wider shape the
-//    seed curve overprices gets measured (kCostWarmupSamples + 1 steps)
-//    instead of never being offered. Measured costs survive reset(), and
-//    measured_costs()/set_measured_costs() carry them across controllers.
+//    graph build cannot poison the estimate. A seed is either this machine's
+//    cost (CostSeed::kEstimate: observations refine it, and a width that is
+//    not offered keeps its last estimate) or only the shape of the cost curve
+//    (CostSeed::kShape: a prior or another machine's curve). A shape seed is
+//    never mixed with measurements: an unmeasured width is priced at its seed
+//    scaled by the nearest measured width, and never above a measured
+//    narrower width, so a wider shape the seed overprices gets measured
+//    instead of never being offered. measured_costs()/set_measured_costs()
+//    carry measurements across controllers and requests; SpecWidthCostMemory
+//    keeps one set per context range, since attention's share of a step
+//    grows with the context.
 //
 //    Survival at depths beyond the offered width is not frozen: a rejection
 //    at depth d is a real zero sample for every deeper prefix, and a clean
@@ -48,6 +52,14 @@
 //    observed survivals. So a narrow width never becomes absorbing, yet low
 //    per-candidate acceptance keeps it narrow; when acceptance recovers the
 //    controller re-widens one width per confirming step.
+//
+//    With AcceptanceModel::kReachedDepths the target-observed acceptance is
+//    instead counted per depth, only at depths a step reached: a clean draft
+//    says nothing about the next depth, and a rejection is not another
+//    failure of every deeper candidate. Counts are bounded so the text can
+//    change under them, carry_acceptance() keeps a bounded share of them for
+//    the next request, and every kProbeInterval steps the controller offers
+//    one width wider than its choice so unreached depths stay measured.
 //
 //    The policy widens when the learned survival at the deeper depths makes
 //    the extra candidates worth their cost, and narrows as rejections pull
@@ -69,7 +81,9 @@
 // device. Backend-specific fixed-width overrides still take precedence.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -88,6 +102,13 @@ inline bool adaptive_spec_width_globally_enabled() {
 
 class AdaptiveSpecWidth {
 public:
+    // What a seeded step cost is: this machine's cost, refined online, or only
+    // the shape of the cost curve, scaled to this machine's measurements.
+    enum class CostSeed { kEstimate, kShape };
+    // How target-observed acceptance is learned when no confidence head
+    // scores the step: prefix-survival EMAs (default) or reached-depth counts.
+    enum class AcceptanceModel { kPrefixSurvival, kReachedDepths };
+
     // Prefix-survival estimate for every depth before any evidence.
     static constexpr float kSurvivalPrior = 0.75f;
     // EMA rate of the per-depth prefix-survival estimates.
@@ -96,12 +117,31 @@ public:
     static constexpr float kCostAlpha = 0.20f;
     // Observations of a seeded width ignored before its cost starts tracking.
     static constexpr int kCostWarmupSamples = 4;
-    // A measured width's sample counts at most this multiple of its estimate:
-    // a step that also built a graph (a new position band, a new request)
-    // costs several times a steady step, and one such outlier must not make
-    // the width look expensive for the following dozen steps. A real cost
-    // rise still lands, at up to kCostAlpha * 25% per step.
+    // With a shape seed, a measured width's sample counts at most this
+    // multiple of its price before it: a step that also built a graph (a new
+    // position band, a new request) costs several times a steady step, and
+    // one such outlier must not price the width out for a dozen steps. A real
+    // cost rise still lands, at up to kCostAlpha * 25% per step.
     static constexpr float kCostOutlierRatio = 1.25f;
+    // With a shape seed, a measured width's cost is the running mean of its
+    // live samples, then a 1/kCostWindow average: a step's cost is close to
+    // stationary, and an EMA's short window turns timing jitter into
+    // misordered widths. A carried measurement starts at the full window.
+    static constexpr int kCostWindow = 16;
+    // With a shape seed, a measurement not refreshed for this many timed steps
+    // is stale: the width is priced no higher than its shape price, and its
+    // next sample restarts the mean. A width measured during a slow phase (a
+    // cold start, a busy device) would otherwise never be offered again.
+    static constexpr int kCostStaleSteps = 64;
+    // With a shape seed, live samples a width's mean needs before it prices
+    // the width (and scales the others); until then its shape price stands.
+    static constexpr int kCostTrustSamples = 4;
+    // Reached-depth counts: the prior per depth (an optimistic but finite
+    // belief), the bound past which old evidence decays, and the probe period.
+    static constexpr float kReachedPriorTrials = 16.0f;
+    static constexpr float kReachedPriorRate = 0.90f;
+    static constexpr float kReachedWindow = 128.0f;
+    static constexpr int kProbeInterval = 17;
     // Below this prefix survival a depth has no usable support: the ratio of
     // two near-zero estimates is noise, so the learned conditional acceptance
     // of the next depth is taken against this floor instead.
@@ -140,9 +180,28 @@ public:
           width_cost_ema_((size_t) std::max(1, max_width_) + 1,
                           std::numeric_limits<float>::quiet_NaN()),
           width_cost_samples_((size_t) std::max(1, max_width_) + 1, 0),
+          width_cost_step_((size_t) std::max(1, max_width_) + 1, 0),
           utility_scratch_((size_t) std::max(1, max_width_) + 1, 0.0f),
           confidence_pred_ema_((size_t) std::max(1, max_width_), kSurvivalPrior),
-          confidence_actual_ema_((size_t) std::max(1, max_width_), kSurvivalPrior) {}
+          confidence_actual_ema_((size_t) std::max(1, max_width_), kSurvivalPrior),
+          reached_trials_((size_t) std::max(1, max_width_), kReachedPriorTrials),
+          reached_successes_((size_t) std::max(1, max_width_),
+                             kReachedPriorTrials * kReachedPriorRate) {}
+
+    void set_acceptance_model(AcceptanceModel model) { acceptance_model_ = model; }
+
+    // Reached-depth model: keep at most max_trials of each depth's evidence
+    // for the next request, so earlier text informs it without outweighing
+    // its own first few dozen steps.
+    void carry_acceptance(float max_trials) {
+        for (size_t depth = 1; depth < reached_trials_.size(); ++depth) {
+            const float trials = reached_trials_[depth];
+            if (trials <= max_trials) continue;
+            const float scale = max_trials / trials;
+            reached_trials_[depth] *= scale;
+            reached_successes_[depth] *= scale;
+        }
+    }
 
     // Apply both this feedback cap and an optional model-specific cap.
     int next_width(int proposed_width) const {
@@ -163,29 +222,42 @@ public:
     // Configure total step costs indexed by seed-inclusive width. Values need
     // only be relative to one another; entries that are not finite and
     // positive leave the width unseeded. A backend can seed this from a short
-    // calibration and then refine it online through observe().
-    void set_relative_costs(const std::vector<float> & costs) {
-        const size_t n = std::min(costs.size(), width_cost_seed_.size());
+    // calibration and then refine it online through observe(). With
+    // CostSeed::kShape the values are only a curve shape (see width_cost()).
+    void set_relative_costs(const std::vector<float> & costs,
+                            CostSeed kind = CostSeed::kEstimate) {
+        cost_seed_ = kind;
+        std::vector<float> & seeds =
+            kind == CostSeed::kShape ? width_cost_seed_ : width_cost_ema_;
+        const size_t n = std::min(costs.size(), seeds.size());
         for (size_t width = 0; width < n; ++width) {
             const float cost = costs[width];
             if (std::isfinite(cost) && cost > 0.0f) {
-                width_cost_seed_[width] = cost;
+                seeds[width] = cost;
             }
         }
     }
 
-    // Measured total step costs indexed by width, in observe() units (NaN
-    // where a width is unmeasured). Costs belong to the machine, not to the
-    // text, so a backend that builds a controller per request can hand them
-    // from one request's controller to the next.
+    // Step costs by width in observe() units, NaN where a width has none
+    // (with CostSeed::kEstimate, unmeasured widths report their seed). Costs
+    // belong to the machine, not to the text: a backend hands them from one
+    // request's controller to the next, or keeps one set per context range
+    // (SpecWidthCostMemory). set_measured_costs() replaces them all; a
+    // measured width tracks its next sample without a warmup hold, weighing
+    // the carried cost as `weight` samples (kCostTrustSamples..kCostWindow):
+    // a full window for this context's own costs, the trust floor for costs
+    // borrowed from another context, so the first live samples take over.
     const std::vector<float> & measured_costs() const { return width_cost_ema_; }
-    void set_measured_costs(const std::vector<float> & costs) {
-        const size_t n = std::min(costs.size(), width_cost_ema_.size());
-        for (size_t width = 0; width < n; ++width) {
-            const float cost = costs[width];
-            if (std::isfinite(cost) && cost > 0.0f) {
-                width_cost_ema_[width] = cost;
-            }
+    void set_measured_costs(const std::vector<float> & costs, int weight = kCostWindow) {
+        const int held = kCostWarmupSamples + std::clamp(weight, kCostTrustSamples, kCostWindow);
+        for (size_t width = 0; width < width_cost_ema_.size(); ++width) {
+            const float cost = width < costs.size()
+                ? costs[width] : std::numeric_limits<float>::quiet_NaN();
+            const bool measured = std::isfinite(cost) && cost > 0.0f;
+            width_cost_ema_[width] =
+                measured ? cost : std::numeric_limits<float>::quiet_NaN();
+            width_cost_samples_[width] = measured ? held : 0;
+            width_cost_step_[width] = cost_steps_;
         }
     }
 
@@ -237,7 +309,9 @@ public:
                 survival *= calibrated_confidence(
                     depth, conditional_acceptance[(size_t) depth - 1]);
             } else if (conditional_acceptance.empty()) {
-                survival = prefix_survival_ema_[(size_t) depth];
+                survival = acceptance_model_ == AcceptanceModel::kReachedDepths
+                    ? survival * reached_trials_rate(depth)
+                    : prefix_survival_ema_[(size_t) depth];
             } else {
                 // The head covers fewer depths than the proposal: continue
                 // with the learned conditional acceptance of this depth, the
@@ -255,9 +329,16 @@ public:
                 best_width = width;
             }
         }
-        if (best_width >= 2 && last_draft_clean_ && best_width < proposed &&
-            utilities[(size_t) best_width + 1] >=
-                best_utility * (1.0f - kExploreMargin)) {
+        if (acceptance_model_ == AcceptanceModel::kReachedDepths) {
+            // Reached-depth counts explore on a fixed period: a probe right
+            // after every clean draft would alternate widths step by step
+            // and time each one in a different phase of the device.
+            if (best_width >= 2 && steps_ > 0 && steps_ % kProbeInterval == 0) {
+                best_width = std::min(proposed, best_width + 1);
+            }
+        } else if (best_width >= 2 && last_draft_clean_ && best_width < proposed &&
+                   utilities[(size_t) best_width + 1] >=
+                       best_utility * (1.0f - kExploreMargin)) {
             best_width += 1;
         }
         return best_width >= 0 ? best_width : next_width(proposed);
@@ -283,6 +364,18 @@ public:
         const int accepted = std::clamp(accepted_width, 1, offered);
         const int offered_candidates = offered - 1;
         const int accepted_candidates = accepted - 1;
+        ++steps_;
+        for (int depth = 1;
+             depth <= std::min(offered_candidates, accepted_candidates + 1); ++depth) {
+            float & trials = reached_trials_[(size_t) depth];
+            float & successes = reached_successes_[(size_t) depth];
+            if (trials >= kReachedWindow) {
+                trials *= (kReachedWindow - 1.0f) / kReachedWindow;
+                successes *= (kReachedWindow - 1.0f) / kReachedWindow;
+            }
+            trials += 1.0f;
+            successes += depth <= accepted_candidates ? 1.0f : 0.0f;
+        }
 
         if (max_width_guard_enabled()) {
             if (max_width_cooldown_remaining_ > 0) {
@@ -345,36 +438,7 @@ public:
                        kSurvivalAlpha * sample;
         }
         if (std::isfinite(observed_step_cost) && observed_step_cost > 0.0f) {
-            float & estimate = width_cost_ema_[(size_t) offered];
-            int & samples = width_cost_samples_[(size_t) offered];
-            const bool measured = std::isfinite(estimate) && estimate > 0.0f;
-            if (!measured && !has_seed(offered)) {
-                // No seed for this width: adopt the first observation and
-                // track from the next one on.
-                estimate = observed_step_cost;
-                samples = kCostWarmupSamples;
-            } else if (++samples > kCostWarmupSamples) {
-                // Shape-specific graph construction makes the first few
-                // observations of a width cold outliers (again after reset():
-                // a new request builds its own shapes). Skip them, then
-                // measure the live cost. Every live sample counts at most
-                // kCostOutlierRatio times the width's price before it: its
-                // estimate, or for the first one the price width_cost() gave
-                // it unmeasured, once another width is measured here (a bare
-                // seed is in another machine's units). A rarely offered width
-                // still meets graph builds after its warmup (a new position
-                // band), and a first sample taken there would keep it
-                // overpriced, and so never offered again, for the process.
-                const float reference = measured ? estimate
-                    : has_other_measured_cost(offered) ? width_cost(offered)
-                    : std::numeric_limits<float>::quiet_NaN();
-                const float sample = std::isfinite(reference) && reference > 0.0f
-                    ? std::min(observed_step_cost, kCostOutlierRatio * reference)
-                    : observed_step_cost;
-                estimate = measured
-                    ? (1.0f - kCostAlpha) * estimate + kCostAlpha * sample
-                    : sample;
-            }
+            observe_cost(offered, observed_step_cost);
         }
 
         last_draft_clean_ = accepted_candidates >= offered_candidates;
@@ -451,6 +515,10 @@ public:
                   kSurvivalPrior);
         std::fill(confidence_actual_ema_.begin(), confidence_actual_ema_.end(),
                   kSurvivalPrior);
+        std::fill(reached_trials_.begin(), reached_trials_.end(), kReachedPriorTrials);
+        std::fill(reached_successes_.begin(), reached_successes_.end(),
+                  kReachedPriorTrials * kReachedPriorRate);
+        steps_ = 0;
         full_accept_streak_ = 0;
         max_width_cooldown_remaining_ = 0;
         max_width_active_ = max_width_initially_active_;
@@ -463,21 +531,6 @@ public:
     int max_width() const { return max_width_; }
 
 private:
-    // P(candidate at depth accepted | shallower candidates accepted) as
-    // learned by observe(): s[depth] / s[depth - 1], with s[0] = 1.
-    float calibrated_confidence(int depth, float score) const {
-        return std::clamp(std::clamp(score, 0.0f, 1.0f) * confidence_scale(depth),
-                          0.0f, 1.0f);
-    }
-
-    float learned_conditional_acceptance(int depth) const {
-        const float deeper = prefix_survival_ema_[(size_t) depth];
-        const float shallower = std::max(
-            kSurvivalFloor,
-            depth >= 2 ? prefix_survival_ema_[(size_t) depth - 1] : 1.0f);
-        return std::clamp(deeper / shallower, 0.0f, 1.0f);
-    }
-
     bool has_seed(int width) const {
         const float seed = width_cost_seed_[(size_t) width];
         return std::isfinite(seed) && seed > 0.0f;
@@ -488,46 +541,127 @@ private:
         return std::isfinite(cost) && cost > 0.0f;
     }
 
-    bool has_other_measured_cost(int width) const {
-        for (int other = 1; other <= max_width_; ++other) {
-            if (other != width && has_measured_cost(other)) return true;
-        }
-        return false;
+    // Shape seeds: a width's samples past its warmup, all in its mean.
+    int live_samples(int width) const {
+        return std::max(0, width_cost_samples_[(size_t) width] - kCostWarmupSamples);
+    }
+
+    // Shape seeds: a measured width prices itself once its mean holds
+    // kCostTrustSamples samples; one jittered step must not decide it.
+    bool cost_trusted(int width) const {
+        return has_measured_cost(width) && live_samples(width) >= kCostTrustSamples;
+    }
+
+    bool cost_stale(int width) const {
+        return cost_steps_ - width_cost_step_[(size_t) width] > kCostStaleSteps;
     }
 
     // Total step cost of a width in observe() units, NaN when it has none.
-    // A measured width answers with its estimate. An unmeasured seeded width
-    // is priced at its seed scaled by the measured/seed ratio of the nearest
-    // measured seeded width (the narrower one on a tie), and no higher than
-    // the widest measured width below it: extra candidates count as free
-    // until their shape is measured, so a seed curve from another machine
-    // cannot keep a profitable width from ever being offered.
+    // An estimate seed is the cost itself. With a shape seed a trusted
+    // measurement answers for its width (no higher than its scaled seed once
+    // stale), a width still building its mean answers with its scaled seed,
+    // and a width never timed with its shape price. The reached-depth model
+    // explores with its own periodic probes, so there a never-timed width is
+    // priced at its scaled seed instead: pricing it free would spend a whole
+    // short request timing every width of a cold context.
     float width_cost(int width) const {
-        if (has_measured_cost(width)) return width_cost_ema_[(size_t) width];
+        if (cost_seed_ == CostSeed::kEstimate) return width_cost_ema_[(size_t) width];
+        if (!has_measured_cost(width)) {
+            return acceptance_model_ == AcceptanceModel::kReachedDepths
+                ? scaled_seed(width) : shape_price(width);
+        }
+        if (!cost_trusted(width)) return scaled_seed(width);
+        const float measured = width_cost_ema_[(size_t) width];
+        return cost_stale(width) ? std::min(measured, scaled_seed(width)) : measured;
+    }
+
+    // A width's seed scaled by the measured/seed ratio of the nearest trusted
+    // seeded width (the narrower one on a tie); the bare seed, in another
+    // machine's units, when no width is trusted yet.
+    float scaled_seed(int width, bool * scaled = nullptr) const {
+        if (scaled) *scaled = false;
         if (!has_seed(width)) return std::numeric_limits<float>::quiet_NaN();
-        float cost = width_cost_seed_[(size_t) width];
+        const float seed = width_cost_seed_[(size_t) width];
         for (int distance = 1; distance <= max_width_; ++distance) {
-            int scale_width = -1;
             for (const int other : {width - distance, width + distance}) {
-                if (other >= 1 && other <= max_width_ &&
-                    has_seed(other) && has_measured_cost(other)) {
-                    scale_width = other;
-                    break;
+                if (other >= 1 && other <= max_width_ && other != width &&
+                    has_seed(other) && cost_trusted(other)) {
+                    if (scaled) *scaled = true;
+                    return seed * width_cost_ema_[(size_t) other] /
+                           width_cost_seed_[(size_t) other];
                 }
             }
-            if (scale_width >= 0) {
-                cost *= width_cost_ema_[(size_t) scale_width] /
-                        width_cost_seed_[(size_t) scale_width];
-                break;
-            }
         }
+        return seed;
+    }
+
+    // The price of a width never timed: its scaled seed, and no higher than
+    // the widest trusted width below it. Extra candidates count as free until
+    // their cost is measured, so a seed curve from another machine cannot
+    // keep a profitable width from ever being offered.
+    float shape_price(int width) const {
+        float cost = scaled_seed(width);
         for (int below = width - 1; below >= 1; --below) {
-            if (has_measured_cost(below)) {
+            if (cost_trusted(below)) {
                 cost = std::min(cost, width_cost_ema_[(size_t) below]);
                 break;
             }
         }
         return cost;
+    }
+
+    void observe_cost(int width, float observed) {
+        float & estimate = width_cost_ema_[(size_t) width];
+        int & samples = width_cost_samples_[(size_t) width];
+        if (cost_seed_ == CostSeed::kEstimate) {
+            if (!std::isfinite(estimate) || estimate <= 0.0f) {
+                // No calibrated seed for this width: adopt the first
+                // observation and track from the next one on.
+                estimate = observed;
+                samples = kCostWarmupSamples;
+            } else if (++samples > kCostWarmupSamples) {
+                // Shape-specific graph construction makes the first few
+                // observations of a seeded width cold outliers. Preserve the
+                // calibrated seed through warmup, then track the live cost.
+                estimate = (1.0f - kCostAlpha) * estimate +
+                           kCostAlpha * observed;
+            }
+            return;
+        }
+        ++cost_steps_;
+        // A stale measurement restarts: its next live sample begins a new mean.
+        if (has_measured_cost(width) && cost_stale(width)) samples = kCostWarmupSamples;
+        width_cost_step_[(size_t) width] = cost_steps_;
+        // Skip the cold first samples (again after reset(): a new request
+        // builds its own shapes). Every live sample then counts at most
+        // kCostOutlierRatio times the width's price before it: its trusted
+        // mean, or its seed scaled to this machine.
+        if (++samples <= kCostWarmupSamples) return;
+        bool scaled = false;
+        const float reference = cost_trusted(width) ? estimate : scaled_seed(width, &scaled);
+        const float sample = (cost_trusted(width) || scaled) && reference > 0.0f
+            ? std::min(observed, kCostOutlierRatio * reference) : observed;
+        const int live = std::min(live_samples(width), kCostWindow);
+        estimate = live <= 1 ? sample : estimate + (sample - estimate) / (float) live;
+    }
+
+    // P(candidate at depth accepted | shallower candidates accepted) as
+    // learned by observe(): s[depth] / s[depth - 1], with s[0] = 1.
+    float calibrated_confidence(int depth, float score) const {
+        return std::clamp(std::clamp(score, 0.0f, 1.0f) * confidence_scale(depth),
+                          0.0f, 1.0f);
+    }
+
+    float reached_trials_rate(int depth) const {
+        return reached_successes_[(size_t) depth] / reached_trials_[(size_t) depth];
+    }
+
+    float learned_conditional_acceptance(int depth) const {
+        const float deeper = prefix_survival_ema_[(size_t) depth];
+        const float shallower = std::max(
+            kSurvivalFloor,
+            depth >= 2 ? prefix_survival_ema_[(size_t) depth - 1] : 1.0f);
+        return std::clamp(deeper / shallower, 0.0f, 1.0f);
     }
 
     bool max_width_guard_enabled() const {
@@ -549,15 +683,23 @@ private:
     float full_accept_probe_;
     float accepted_candidates_ema_;
     std::vector<float> prefix_survival_ema_;
-    // Seed step-cost curve (a shape) and the measured costs, both by width.
+    CostSeed cost_seed_ = CostSeed::kEstimate;
+    // Shape seeds (CostSeed::kShape) and the costs in observe() units.
     std::vector<float> width_cost_seed_;
     std::vector<float> width_cost_ema_;
     std::vector<int> width_cost_samples_;
+    // Timed steps observed (shape seeds) and the step each width was last timed.
+    int cost_steps_ = 0;
+    std::vector<int> width_cost_step_;
     // Per-width expected value of the current cost-aware decision; kept as
     // a member so the const decision path allocates nothing.
     mutable std::vector<float> utility_scratch_;
     std::vector<float> confidence_pred_ema_;
     std::vector<float> confidence_actual_ema_;
+    AcceptanceModel acceptance_model_ = AcceptanceModel::kPrefixSurvival;
+    std::vector<float> reached_trials_;
+    std::vector<float> reached_successes_;
+    int steps_ = 0;
     bool last_draft_clean_ = false;
     int max_width_probe_streak_ = 0;
     int max_width_rejection_cooldown_ = 0;
@@ -565,6 +707,42 @@ private:
     int max_width_cooldown_remaining_ = 0;
     bool max_width_initially_active_ = false;
     bool max_width_active_ = false;
+};
+
+// Measured step costs by context range. Attention's share of a verify step
+// grows with the context, so widths timed in a long request make a short
+// request's narrow widths look dearer than they are (and the reverse): a
+// backend that keeps one controller across requests loads the range's costs
+// before a request and stores them after it.
+class SpecWidthCostMemory {
+public:
+    static constexpr int kRanges = 4;
+
+    static int range(int64_t context) {
+        return context < 2048 ? 0 : context < 8192 ? 1 : context < 32768 ? 2 : 3;
+    }
+
+    // A range never timed starts from the nearest timed range (the shorter
+    // one on a tie), weighted lightly so its own steps take over.
+    void load(AdaptiveSpecWidth & width, int64_t context) const {
+        const int own = range(context);
+        for (int distance = 0; distance < kRanges; ++distance) {
+            for (const int other : {own - distance, own + distance}) {
+                if (other < 0 || other >= kRanges || costs_[(size_t) other].empty()) continue;
+                width.set_measured_costs(costs_[(size_t) other],
+                    distance == 0 ? AdaptiveSpecWidth::kCostWindow : AdaptiveSpecWidth::kCostTrustSamples);
+                return;
+            }
+        }
+        width.set_measured_costs({});
+    }
+
+    void store(const AdaptiveSpecWidth & width, int64_t context) {
+        costs_[(size_t) range(context)] = width.measured_costs();
+    }
+
+private:
+    std::array<std::vector<float>, kRanges> costs_;
 };
 
 } // namespace luce::common

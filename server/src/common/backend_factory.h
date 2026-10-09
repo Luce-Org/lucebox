@@ -46,6 +46,7 @@ public:
         DevicePlacement draft;
         RemoteDraftConfig remote_draft;
         RemoteTargetShardConfig remote_target_shard;
+        std::optional<DevicePlacement> expert;  // routed experts (qwen4exp split mode)
     };
 
     struct Cache {

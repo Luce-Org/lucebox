@@ -1,7 +1,7 @@
 #pragma once
 #include "qsa-decode-wmma.cuh"
 
-#if defined(__gfx1151__) || !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__gfx1151__) || defined(RDNA4) || !defined(__HIP_DEVICE_COMPILE__)
 static __global__ __launch_bounds__(256) void qsa_decode_merge(
         const float * partial, float * out, int splits) {
     const int row = blockIdx.x, d = threadIdx.x;
@@ -20,7 +20,8 @@ static __global__ __launch_bounds__(256) void qsa_decode_merge(
 #endif
 
 bool ggml_cuda_flash_attn_ext_qsa_decode_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
-    if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) { return false; }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3_5(cc) && !GGML_CUDA_CC_IS_RDNA4(cc)) { return false; }
     const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * ids = dst->src[5];
     if (!q || !k || !v || !ids || dst->src[4] || dst->src[6] || dst->src[7]) { return false; }
     float bias, cap;
@@ -41,7 +42,7 @@ bool ggml_cuda_flash_attn_ext_qsa_decode_supported(ggml_backend_cuda_context & c
 
 // The WMMA kernel takes one KV head's 12 query heads per block (qwen4exp's GQA, which the graph requires for QSA).
 void ggml_cuda_flash_attn_ext_qsa_decode(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__)
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(RDNA4)
     GGML_UNUSED(ctx); GGML_UNUSED(dst);
 #else
     const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * ids = dst->src[5];

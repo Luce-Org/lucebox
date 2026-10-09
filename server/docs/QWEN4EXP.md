@@ -14,7 +14,7 @@ with 10 active experts.
 
 | Quant | Where | GTT |
 | --- | --- | --- |
-| UD-Q4_K_XL | [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), `UD-Q4_K_XL/` | 77 GB |
+| UD-Q4_K_XL | [Lucebox/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/Lucebox/Qwen3.8-Flash-Next-GGUF), `UD-Q4_K_XL/` (a byte-identical copy of [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), with the MTP drafter in `MTP/`) | 77 GB |
 | IQ4_NL | [bartowski/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/bartowski/Qwen3.8-Flash-Next-GGUF) | 73 GB |
 | GSQ-RCO IQ3_XXS | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), `IQ3_XXS/` | 47 GB |
 
@@ -90,6 +90,61 @@ Quality (lucebox gates, prompts above 512 tokens with a 1,500-token
 preamble): HE / GSM / Math 10 / 10 / 10 and 16K planted-fact recall 3/3 on
 all three quants.
 
+## Running on an R9700 + Strix Halo
+
+With a second GPU, split mode keeps the dense weights, the KV cache and the
+MTP drafter on the target and loads the routed experts (71.7 GiB on
+UD-Q4_K_XL) on the expert device:
+
+```bash
+./server/build-hip/luce_server \
+  Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --profile qwen-next-r9700-strix --expert-placement routes.csv
+```
+
+The profile sets `--target-device hip:0` (the R9700, gfx1201),
+`--expert-device hip:1` (the Strix Halo, gfx1151) and `--max-ctx 131072`.
+Both GPUs run one scheduler: prompt chunks pipeline over 2 to 4 streams so
+the Strix runs one stream's experts while the R9700 runs another's attention.
+
+`--expert-placement` takes a routing-stats CSV (picks per layer and expert)
+and copies the most-routed experts, up to `LUCE_EXPERT_BUDGET_MB` (default
+8192), to the R9700: the same placement flag and budget the DeepSeek4 expert
+tiers use. Decode and verify steps run those picks there while the Strix runs
+the rest; prompt chunks keep every pick on the Strix. Without the flag every
+pick runs on the Strix.
+
+Build for both GPUs with HIP graph replay, which the retained MTP verify and
+draft graphs use:
+
+```bash
+cmake -S server -B server/build-hip -DCMAKE_BUILD_TYPE=Release \
+  -DLUCE_GPU_BACKEND=hip -DLUCE_HIP_ARCHITECTURES="gfx1151;gfx1201" \
+  -DCMAKE_HIP_ARCHITECTURES="gfx1151;gfx1201" -DGGML_HIP_GRAPHS=ON
+cmake --build server/build-hip -j8 --target luce_server
+```
+
+Measured on one box (UD-Q4_K_XL, adaptive MTP, greedy, 131K context, 8 GiB
+of hot experts), against the Strix Halo alone:
+
+| | Strix Halo | R9700 + Strix Halo |
+| --- | --- | --- |
+| Decode, short reply | 40.5 tok/s | 75.5 tok/s |
+| Decode, code reply | 41.4 tok/s | 63.1 tok/s |
+| Decode after a 16K prompt | 24-28 tok/s | 44-45 tok/s |
+| Prefill, 16K prompt | 1,220-1,320 tok/s | 1,820 tok/s |
+| Prefill, 55K prompt | 1,310 tok/s | 1,760 tok/s |
+| Same 16K prompt sent again (prefix cache) | | 2.7 s instead of 10.6 s |
+
+Without `--expert-placement` the split decodes a short reply at 69 tok/s and after
+a 16K prompt at 44 tok/s. Greedy output is the same with adaptive MTP, a fixed
+`--verify-width` or MTP off (`--verify-width 1`): every generated token runs
+its hot experts on the R9700 with the same kernel.
+
+Split mode serves one sequence: `--max-concurrency` above 1 is refused with
+`--expert-device`. The prefix cache works as on the Strix; the snapshot
+allowance comes out of the R9700's memory after an 8192-row prompt chunk.
+
 ## Support
 
 | Piece | State |
@@ -99,11 +154,12 @@ all three quants.
 | Attention block ratios other than 4, contexts of 2^24 tokens or more | refused at load |
 | gfx1151 kernels: MMB bf16 and Q8_0 -> F16 WMMA GEMMs, fused HC / GDN / PLE, M-RoPE into the flash-attention layout | done |
 | Chat template, reasoning effort, thinking budget, `preserve_thinking`, `sampling_no_thinking` | done |
-| Concurrent serving (`--max-concurrency 2..4`) | supported, exact independent slots with full per-slot caches; MTP and the prefix cache are single-slot only (MTP is switched off); more than 4 is refused |
+| Concurrent serving (`--max-concurrency 2..4`) | supported on one GPU, exact independent slots with full per-slot caches; MTP and the prefix cache are single-slot only (MTP is switched off); more than 4, or split mode, is refused |
 | MTP speculative decoding | sidecar discovered automatically; adaptive k=1..7 by default (code 16K / 64K 32.4 / 28.2 tok/s, counting 43.5), output identical to MTP off; `--verify-width 1` disables, `2..8` selects fixed k=1..7 |
-| Prefix cache | done: snapshots at chat cut points, restored on hits; a 64K agent turn's first token in ~3.5 s instead of ~65 s (131K context). Prefill keeps a 4096-row chunk first and snapshots get the remaining memory, so at 262K context with MTP long prefixes do not fit: use `--max-ctx 131072` or less for agent workloads |
+| Prefix cache | done: snapshots at chat cut points, restored on hits; a 64K agent turn's first token in ~3.5 s instead of ~65 s (131K context). Prefill keeps a 4096-row chunk first (8192 in split mode) and snapshots get the remaining memory, so at 262K context with MTP long prefixes do not fit: use `--max-ctx 131072` or less for agent workloads |
 | Layer split | refused |
-| Other GPUs | generic paths; kernels, defaults and quality gates are tuned and measured on gfx1151 only |
+| Split mode (`--expert-device`, `--expert-placement`) | routed experts on a second GPU, pipelined prompt chunks, hot experts on the target for decode and verify; measured on R9700 + Strix Halo |
+| Other GPUs | generic paths; kernels, defaults and quality gates are tuned and measured on gfx1151, and on gfx1201 as the split-mode target |
 
 `--max-concurrency 1` keeps the single-sequence path. Values 2 through 4
 enable the sequence engine and batched decode without environment settings.
@@ -133,15 +189,16 @@ contract/soak, the QSA boundary, and distinct concurrent token streams.
 | `src/qwen4exp/qwen4exp_loader.cpp` | GGUF keys and tensors |
 | `src/qwen4exp/qwen4exp_graph.cpp` | prefill and decode graphs, QSA selection |
 | `src/qwen4exp/qwen4exp_cache.cpp` | KV, recurrent state and QSA indexer cache |
-| `src/qwen4exp/qwen4exp_backend.cpp` | `ModelBackend`: generation loop, gfx1151 profile |
+| `src/qwen4exp/qwen4exp_backend.cpp` | `ModelBackend`: generation loop, gfx1151 profile, split-mode setup and hot experts |
 | `deps/llama.cpp/ggml/src/ggml-cuda/` | QSA, MMB, HC / GDN / PLE and RoPE kernels |
 
 Tests: `test_qwen4exp_qsa_ids` (QSA block selection, GPU and CPU),
 `test_qwen4exp_indexer_score`, `test_rope_tail` (including the M-RoPE ->
 CONT fusion alias), `test_backend_plan` (default prefill chunk), `test_qwen4exp_chunk`
 (memory-sized chunk selection),
-`test_server_unit`, and `smoke_qwen4exp_forward` (split-prefill KLs and
-reference comparisons on a real GGUF). `smoke_qwen4exp_batched` also checks
+`test_qwen4exp_qsa_attn` (QSA attention rows), `test_server_unit`, and
+`smoke_qwen4exp_forward` (split-prefill KLs and reference comparisons on a real
+GGUF; `--expert-gpu N` runs it in split mode). `smoke_qwen4exp_batched` also checks
 cancel/reset/reuse and slot isolation.
 
 The smoke binary uses the same gfx1151 defaults as the server:

@@ -93,6 +93,7 @@ struct TensorAllocation {
     size_t file_size = 0;
     size_t buffer_offset = 0;
     size_t shard = 0;
+    bool on_expert = false;   // routed expert stack placed on the expert backend
 };
 
 // One opened GGUF shard of a (possibly split) model.
@@ -331,9 +332,89 @@ std::string find_qwen4exp_mtp_sidecar(const std::string & model_path) {
     return name.empty() ? std::string() : (dir / name).string();
 }
 
+ggml_context * Qwen4ExpDerived::open(size_t n_tensors) {
+    const ggml_init_params ip = { n_tensors * ggml_tensor_overhead(), nullptr, true };
+    blocks_.push_back({ ggml_init(ip), nullptr });
+    return blocks_.back().first;
+}
+
+bool Qwen4ExpDerived::commit(ggml_backend_t backend) {
+    auto & [ctx, buf] = blocks_.back();
+    buf = ctx ? ggml_backend_alloc_ctx_tensors(ctx, backend) : nullptr;
+    if (!buf) {
+        if (ctx) ggml_free(ctx);
+        blocks_.pop_back();
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    return true;
+}
+
+void Qwen4ExpDerived::free() {
+    for (auto & [ctx, buf] : blocks_) {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+    }
+    blocks_.clear();
+}
+
+void free_qwen4exp_derived(Qwen4ExpWeights & w) {
+    for (Qwen4ExpLayer & L : w.layers) L.ssm_gate_ba = nullptr;
+    w.qsa_ones = nullptr;
+    w.hot_lut.clear();
+    w.cold_lut.clear();
+    w.derived.free();
+}
+
+// [dt_bias | A] per linear layer, so decode and verify steps hand the raw alpha/beta projections to the recurrence
+// (ggml_gated_delta_net_set_raw_gates) instead of running the add, softplus, mul and sigmoid kernels. Without it the
+// graph keeps those ops.
+static void build_qwen4exp_gate_ba(Qwen4ExpWeights & w, ggml_backend_t backend) {
+    std::vector<Qwen4ExpLayer *> linear;
+    for (Qwen4ExpLayer & L : w.layers) {
+        if (L.is_full_attention || !L.ssm_dt_bias || !L.ssm_a) continue;
+        const int64_t H = ggml_nelements(L.ssm_dt_bias);
+        if (L.ssm_dt_bias->type != GGML_TYPE_F32 || L.ssm_a->type != GGML_TYPE_F32 || ggml_nelements(L.ssm_a) != H ||
+            !ggml_is_contiguous(L.ssm_dt_bias) || !ggml_is_contiguous(L.ssm_a)) return;
+        linear.push_back(&L);
+    }
+    if (linear.empty()) return;
+    ggml_context * ctx = w.derived.open(linear.size());
+    for (Qwen4ExpLayer * L : linear) {
+        L->ssm_gate_ba = ctx ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * ggml_nelements(L->ssm_dt_bias)) : nullptr;
+    }
+    if (!w.derived.commit(backend)) {
+        for (Qwen4ExpLayer * L : linear) L->ssm_gate_ba = nullptr;
+        return;
+    }
+    std::vector<float> ba;
+    for (Qwen4ExpLayer * L : linear) {
+        const size_t H = (size_t) ggml_nelements(L->ssm_dt_bias);
+        ba.resize(2 * H);
+        ggml_backend_tensor_get(L->ssm_dt_bias, ba.data(), 0, H * sizeof(float));
+        ggml_backend_tensor_get(L->ssm_a, ba.data() + H, 0, H * sizeof(float));
+        ggml_backend_tensor_set(L->ssm_gate_ba, ba.data(), 0, 2 * H * sizeof(float));
+    }
+}
+
+// QSA scores weigh every indexer head by 1.0: one ones tensor serves every layer and row count up to 128, instead of
+// building the constant in each graph.
+static void build_qwen4exp_qsa_ones(Qwen4ExpWeights & w, ggml_backend_t backend) {
+    if (w.indexer_n_head <= 0) return;
+    ggml_context * ctx = w.derived.open(1);
+    w.qsa_ones = ctx ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.indexer_n_head, 128) : nullptr;
+    if (!w.derived.commit(backend)) {
+        w.qsa_ones = nullptr;
+        return;
+    }
+    const std::vector<float> ones((size_t) ggml_nelements(w.qsa_ones), 1.0f);
+    ggml_backend_tensor_set(w.qsa_ones, ones.data(), 0, ggml_nbytes(w.qsa_ones));
+}
+
 bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
                         Qwen4ExpWeights & out, const std::string & mtp_override, int mtp_vocab) {
     out.gfx1151 = ggml_backend_cuda_qwen4exp_supported(backend);
+    out.qsa = ggml_backend_cuda_qsa_supported(backend);
     const Qwen4ExpCudaScope profile(out.gfx1151);
     // Open every shard of the model; a single-file GGUF is a one-element list. An MTP sidecar
     // (e.g. MTP/mtp-*-shared-Q8_0.gguf) joins as one more shard: its blk.<n_layer> tensors resolve by name like the
@@ -373,12 +454,17 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
             ggml_backend_buffer_free(out.buf);
             out.buf = nullptr;
         }
+        if (out.expert_buf) {
+            ggml_backend_buffer_free(out.expert_buf);
+            out.expert_buf = nullptr;
+        }
         out.embedder.tok_embd_owned.clear();
         out.embedder.tok_embd_bytes = nullptr;
         if (out.mtp_vocab_buf) ggml_backend_buffer_free(out.mtp_vocab_buf);
         if (out.mtp_vocab_ctx) ggml_free(out.mtp_vocab_ctx);
         out.mtp_vocab_buf = nullptr;
         out.mtp_vocab_ctx = nullptr;
+        free_qwen4exp_derived(out);
         reset_qwen4exp_mtp_fields(out);
         for (ShardSource & shard : shards) {
             gguf_free(shard.gctx);
@@ -684,27 +770,38 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         add(layer.ffn_up_shexp); add(layer.ffn_down_shexp);
     }
 
+    std::unordered_set<ggml_tensor *> expert_stacks;
+    if (out.expert_backend) {
+        for (Qwen4ExpLayer & layer : out.layers) {
+            expert_stacks.insert({layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps});
+        }
+    }
     ggml_backend_buffer_type_t buffer_type =
         ggml_backend_get_default_buffer_type(backend);
-    const size_t alignment = ggml_backend_buft_get_alignment(buffer_type);
+    ggml_backend_buffer_type_t expert_type = out.expert_backend
+        ? ggml_backend_get_default_buffer_type(out.expert_backend) : buffer_type;
     std::vector<TensorAllocation> allocations;
     allocations.reserve(wanted.size());
-    size_t allocation_size = 0;
+    size_t allocation_size = 0, expert_size = 0;
     for (size_t s = 0; s < shards.size(); ++s) {
         const int64_t n_tensors = gguf_get_n_tensors(shards[s].gctx);
         for (int64_t tid = 0; tid < n_tensors; ++tid) {
             const char * name = gguf_get_tensor_name(shards[s].gctx, tid);
             ggml_tensor * value = ggml_get_tensor(shards[s].meta, name);
             if (!value || wanted.find(value) == wanted.end()) continue;
-            allocation_size = align_up(allocation_size, alignment);
+            const bool on_expert = expert_stacks.count(value) > 0;
+            ggml_backend_buffer_type_t buft = on_expert ? expert_type : buffer_type;
+            size_t & size = on_expert ? expert_size : allocation_size;
+            size = align_up(size, ggml_backend_buft_get_alignment(buft));
             TensorAllocation allocation;
             allocation.tensor = value;
             allocation.file_offset = gguf_get_data_offset(shards[s].gctx) +
                                      gguf_get_tensor_offset(shards[s].gctx, tid);
             allocation.file_size = gguf_get_tensor_size(shards[s].gctx, tid);
-            allocation.buffer_offset = allocation_size;
+            allocation.buffer_offset = size;
             allocation.shard = s;
-            allocation_size += ggml_backend_buft_get_alloc_size(buffer_type, value);
+            allocation.on_expert = on_expert;
+            size += ggml_backend_buft_get_alloc_size(buft, value);
             allocations.push_back(allocation);
         }
     }
@@ -719,12 +816,16 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     out.buf = ggml_backend_alloc_buffer(backend, allocation_size);
     if (!out.buf) return fail("weight buffer allocation failed");
     ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    char * base = static_cast<char *>(ggml_backend_buffer_get_base(out.buf));
+    if (expert_size > 0) {
+        out.expert_buf = ggml_backend_alloc_buffer(out.expert_backend, expert_size);
+        if (!out.expert_buf) return fail("expert weight buffer allocation failed");
+        ggml_backend_buffer_set_usage(out.expert_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
     for (const TensorAllocation & allocation : allocations) {
-        if (ggml_backend_tensor_alloc(out.buf, allocation.tensor,
+        ggml_backend_buffer_t buffer = allocation.on_expert ? out.expert_buf : out.buf;
+        char * base = static_cast<char *>(ggml_backend_buffer_get_base(buffer));
+        if (ggml_backend_tensor_alloc(buffer, allocation.tensor,
                 base + allocation.buffer_offset) != GGML_STATUS_SUCCESS) {
-            ggml_backend_buffer_free(out.buf);
-            out.buf = nullptr;
             return fail("weight tensor allocation failed");
         }
     }
@@ -851,6 +952,9 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
                      mtp_vocab, (long long) nv, ggml_nbytes(out.mtp_output), ggml_nbytes(out.mtp_embd));
     }
 
+    build_qwen4exp_gate_ba(out, backend);
+    build_qwen4exp_qsa_ones(out, backend);
+
     // The PLE lookup table is served lazily from whichever shard holds it
     // (ISTA-DASLab isolates it in a separate shard; bartowski-style splits keep
     // it in shard 1; single-file models trivially have it in `path`).
@@ -889,13 +993,17 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         out.n_layer,
         out.n_layer - out.n_layer / out.full_attention_interval,
         out.n_layer / out.full_attention_interval,
-        allocations.size(), allocation_size / (1024.0 * 1024.0 * 1024.0),
+        allocations.size(), (allocation_size + expert_size) / (1024.0 * 1024.0 * 1024.0),
         shards.size(),
         out.n_expert_used, out.n_expert, out.n_hc, out.hc_lowrank,
         out.ple_layer_ids.size(), out.ple_ngram_size, out.ple_heads_per_ngram,
         static_cast<long long>(out.ple_reader.n_rows()), out.eos_id);
     set_last_error(summary);
     std::fprintf(stderr, "[qwen4exp] %s\n", summary);
+    if (out.expert_buf) {
+        std::fprintf(stderr, "[qwen4exp] split: %.2f GiB on the target device, %.2f GiB of routed experts on the expert device\n",
+                     allocation_size / 1073741824.0, expert_size / 1073741824.0);
+    }
     return true;
 }
 
@@ -905,6 +1013,12 @@ void free_qwen4exp_weights(Qwen4ExpWeights & w) {
         ggml_backend_buffer_free(w.buf);
         w.buf = nullptr;
     }
+    if (w.expert_buf) {
+        ggml_backend_buffer_free(w.expert_buf);
+        w.expert_buf = nullptr;
+    }
+    w.hot.reset();
+    free_qwen4exp_derived(w);
     for (ggml_context * extra : w.extra_meta_ctxs) {
         if (extra) ggml_free(extra);
     }

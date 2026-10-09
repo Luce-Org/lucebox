@@ -1206,6 +1206,7 @@ const ggml_cuda_device_info & ggml_cuda_info();
 
 void ggml_cuda_set_device(int device);
 bool ggml_cuda_qwen4exp_enabled();
+bool ggml_cuda_qwen4exp_graph();
 int ggml_cuda_get_device();
 
 struct ggml_cuda_pool {

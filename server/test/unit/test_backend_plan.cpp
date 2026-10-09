@@ -131,6 +131,27 @@ void test_qwen4exp_defaults_to_auto_chunks() {
     CHECK(std::get<BackendPlan>(explicit_chunk).execution().chunk == 512);
 }
 
+void test_qwen4exp_split_placement_lands_in_placement() {
+    BackendArgs args = plain_args();
+    DevicePlacement expert;
+    expert.backend = PlacementBackend::Hip;
+    expert.gpu = 1;
+    args.expert_device = expert;
+    args.expert_placement = "/models/routes.csv";
+    BackendPreparation result = resolve(std::move(args), "qwen4exp");
+    CHECK(std::holds_alternative<BackendPlan>(result));
+    const BackendPlan & plan = std::get<BackendPlan>(result);
+    CHECK(plan.placement().expert.has_value());
+    CHECK(plan.placement().expert->gpu == 1);
+    // The same expert-placement field DeepSeek4 reads.
+    CHECK(plan.execution().expert_placement == "/models/routes.csv");
+
+    BackendPreparation plain = resolve(plain_args(), "qwen4exp");
+    CHECK(std::holds_alternative<BackendPlan>(plain));
+    CHECK(!std::get<BackendPlan>(plain).placement().expert.has_value());
+    CHECK(std::get<BackendPlan>(plain).execution().expert_placement.empty());
+}
+
 void test_specla_without_fast_rollback_falls_back() {
     BackendArgs args = plain_args();
     args.draft_path = "/models/draft.gguf";
@@ -243,6 +264,7 @@ TEST_CASE(BackendPlanFixture, backend_plan_suite) {
     test_plan_owns_the_effective_request();
     test_deepseek_options_land_in_execution();
     test_qwen4exp_defaults_to_auto_chunks();
+    test_qwen4exp_split_placement_lands_in_placement();
     test_specla_without_fast_rollback_falls_back();
     test_supported_specla_selects_ddtree();
     test_explicit_specla_tau_is_preserved();

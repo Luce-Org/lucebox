@@ -3862,6 +3862,33 @@ TEST_CASE(ServerUnitFixture, test_tool_result_prompt_prefix_survives_next_agent_
 // cannot reach are skipped: a short system/tools head is not pinned (it would
 // never be saved and the cache would never deepen), and the next reachable
 // boundary is taken instead.
+TEST_CASE(ServerUnitFixture, test_spaced_restore_points) {
+    const std::vector<int> b = {300, 900, 1500, 2600, 2700, 5000, 5100};
+    TEST_ASSERT((spaced_restore_points(b, 2048) == std::vector<int>{300, 2600, 5000}));
+    TEST_ASSERT(spaced_restore_points(b, 0) == b);
+    // Prefix-stable: a shorter prompt keeps the longer prompt's points up to its end.
+    TEST_ASSERT((spaced_restore_points({300, 900, 1500, 2600}, 2048) == std::vector<int>{300, 2600}));
+
+    // A capture moves down to a spaced point, and none is reserved when that adds no prefix.
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(4, tokenizer);
+    const std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102, 3};
+    const std::vector<int> boundaries = find_all_boundaries(prompt, cache.chat_markers());
+    TEST_ASSERT(boundaries.size() >= 2);
+    const int head = boundaries.front();
+    auto plain = cache.reserve_inline_snap(prompt, 0, false, 0, -1, {}, /*include_last_message=*/true);
+    TEST_ASSERT(plain.active() && plain.target_cut() > head);
+    plain.cancel();
+    // A spacing wider than the prompt keeps only the head.
+    auto moved = cache.reserve_inline_snap(prompt, 0, false, 0, -1, {}, true, 0, /*restore_point_spacing=*/64);
+    TEST_ASSERT(moved.active() && moved.target_cut() == head);
+    moved.cancel();
+    auto none = cache.reserve_inline_snap(prompt, head, false, 0, -1, {}, true, 0, 64);
+    TEST_ASSERT(!none.active());
+}
+
 TEST_CASE(ServerUnitFixture, test_inline_snapshot_skips_unreachable_cuts) {
     const std::vector<int> boundaries = {266, 700, 1300, 1800};
     TEST_ASSERT(select_inline_snapshot_boundary(
@@ -5546,12 +5573,14 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_qsa_batch_boundary) {
     TEST_ASSERT(qwen4exp_can_batch(w, spans, 2, true)); // 512 blocks + 3 tail tokens
     spans[1].pos0 = 2051;
     TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, true)); // first 513th block, before executing
+    TEST_ASSERT(qwen4exp_can_batch(w, spans, 2, true, true)); // stable QSA rows join the batch
     TEST_ASSERT(qwen4exp_can_batch(w, spans, 2, false)); // generic device, QSA off
     std::swap(spans[0], spans[1]);
     TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, true)); // any slot, independent of order
     spans[0].pos0 = 16;
     spans[0].n_tokens = 512;
     TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, true)); // prefill always runs solo
+    TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, true, true));
     TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, false));
     spans[0].n_tokens = 1;
     Qwen4ExpForwardSegment rows[5] = {spans[0], spans[1], spans[0], spans[1], spans[0]};
@@ -7414,6 +7443,8 @@ TEST_CASE(ServerUnitFixture, test_save_generated_turn_keys_live_state) {
 // continuation consumed) is dropped and the next deepest entry restored.
 struct SlotSetBackend : MockBackend {
     std::map<int, int> positions;
+    bool cuts_at_restore_points = false;
+    bool prefill_cuts_at_restore_points() const override { return cuts_at_restore_points; }
     bool snapshot_used(int slot) const override {
         return positions.count(slot) != 0;
     }
@@ -7525,12 +7556,13 @@ TEST_CASE(ServerUnitFixture, test_agent_continuation_throttles_snapshot) {
 
     // Slot 0 holds the first 3 tokens, slot 1 a generated-turn checkpoint
     // `filler` + 5 tokens in, and the prompt adds one more turn.
-    const auto prepare = [&](int filler, bool ends_with_tool_result, const char * arch = "qwen4exp") {
+    // `cuts`: the backend cuts prefill at every restore point (qwen4exp).
+    const auto prepare = [&](int filler, bool ends_with_tool_result, bool cuts = true) {
         auto backend_owner = std::make_unique<SlotSetBackend>();
         SlotSetBackend & backend = *backend_owner;
+        backend.cuts_at_restore_points = cuts;
         LuceEngine engine(std::move(backend_owner));
         ServerConfig config;
-        config.arch = arch;
         config.prefix_cache_cap = 4;
         HttpServer server(engine, tokenizer, config);
         PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
@@ -7554,12 +7586,10 @@ TEST_CASE(ServerUnitFixture, test_agent_continuation_throttles_snapshot) {
     // Even a skipped capture must keep the tool-end cut: a cold request can
     // select a different snapshot, but must use the same prefill boundaries.
     TEST_ASSERT(near.restore_points.back() == 9);
-    // Preserve the existing boundary policy for every other architecture.
-    for (const char * arch : {"", "qwen35", "qwen35moe", "deepseek4", "qwen3", "gemma4", "laguna"}) {
-        const auto other = prepare(1, true, arch);
-        TEST_ASSERT(other.restore_slot == 1 && !other.snapshot);
-        TEST_ASSERT(other.restore_points.back() == 7);
-    }
+    // A backend that does not cut prefill at every restore point keeps the existing boundary policy.
+    const auto other = prepare(1, true, /*cuts=*/false);
+    TEST_ASSERT(other.restore_slot == 1 && !other.snapshot);
+    TEST_ASSERT(other.restore_points.back() == 7);
 
     const auto chat = prepare(1, /*ends_with_tool_result=*/false);
     TEST_ASSERT(chat.restore_slot == 1);
@@ -7625,7 +7655,7 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_budget_resolution) {
     TEST_ASSERT(budget.bytes == 0 && budget.error.empty());
     config.prefix_cache_cap = 32;
     // Concurrent paged serving keeps its own limit, whatever the backend.
-    config.concurrent_paged_prefix_cache = true;
+    config.concurrent_prefix_cache = true;
     config.concurrent_prefix_cache_max_bytes = 4096;
     budget = resolve_prefix_cache_budget(config, unsized);
     TEST_ASSERT(budget.bytes == 4096 && budget.error.empty());
@@ -7884,7 +7914,7 @@ TEST_CASE(ServerUnitFixture,
     config.max_ctx = 64;
     config.prefix_cache_cap = 2;
     config.concurrent_prefix_cache_max_bytes = 1024;
-    config.concurrent_paged_prefix_cache = true;
+    config.concurrent_prefix_cache = true;
     config.admission_coalesce_ms = 0;
     HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
@@ -7960,7 +7990,7 @@ TEST_CASE(ServerUnitFixture,
     config.max_ctx = 64;
     config.prefix_cache_cap = 2;
     config.concurrent_prefix_cache_max_bytes = 1024;
-    config.concurrent_paged_prefix_cache = true;
+    config.concurrent_prefix_cache = true;
     config.admission_coalesce_ms = 0;
     HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
@@ -8020,7 +8050,7 @@ TEST_CASE(ServerUnitFixture,
     config.max_ctx = 64;
     config.prefix_cache_cap = 2;
     config.concurrent_prefix_cache_max_bytes = 1024;
-    config.concurrent_paged_prefix_cache = true;
+    config.concurrent_prefix_cache = true;
     config.admission_coalesce_ms = 0;
     HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
@@ -8075,7 +8105,7 @@ TEST_CASE(ServerUnitFixture,
     config.max_ctx = 64;
     config.prefix_cache_cap = 2;
     config.concurrent_prefix_cache_max_bytes = 1024;
-    config.concurrent_paged_prefix_cache = true;
+    config.concurrent_prefix_cache = true;
     config.admission_coalesce_ms = 0;
     HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
@@ -9471,7 +9501,7 @@ TEST_CASE(ServerUnitFixture, test_server_config_cache_defaults) {
     ServerConfig cfg;
     TEST_ASSERT(cfg.prefix_cache_cap == 32);
     TEST_ASSERT(cfg.concurrent_prefix_cache_max_bytes == ServerConfig::kPrefixCacheBudgetAuto);
-    TEST_ASSERT(!cfg.concurrent_paged_prefix_cache);
+    TEST_ASSERT(!cfg.concurrent_prefix_cache);
     TEST_ASSERT(cfg.prefill_cache_cap == 0);
 }
 

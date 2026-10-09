@@ -136,12 +136,33 @@ ggml_cuda_qwen4exp_profile ggml_backend_cuda_set_qwen4exp_profile(ggml_cuda_qwen
     return previous;
 }
 
-bool ggml_cuda_qwen4exp_enabled() { return qwen4exp_profile == GGML_CUDA_QWEN4EXP_DEFAULT; }
+// A qwen4exp graph on any device: its fusions without gfx1151 kernels (WMMA,
+// MMB) apply on the other GPU of a split too.
+bool ggml_cuda_qwen4exp_graph() {
+    return qwen4exp_profile == GGML_CUDA_QWEN4EXP_DEFAULT;
+}
+
+// The profile's kernels and fusions are tuned for gfx1151: with a second GPU in the
+// same graph (split mode) they apply only while that device is current.
+bool ggml_cuda_qwen4exp_enabled() {
+    return qwen4exp_profile == GGML_CUDA_QWEN4EXP_DEFAULT &&
+           GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+}
 
 bool ggml_backend_cuda_qwen4exp_supported(ggml_backend_t backend) {
 #if defined(GGML_USE_HIP)
     return ggml_backend_is_cuda(backend) &&
         ggml_cuda_info().devices[ggml_backend_cuda_get_device_id(backend)].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+#else
+    GGML_UNUSED(backend);
+    return false;
+#endif
+}
+
+bool ggml_backend_cuda_qsa_supported(ggml_backend_t backend) {
+#if defined(GGML_USE_HIP)
+    return ggml_backend_cuda_qwen4exp_supported(backend) || (ggml_backend_is_cuda(backend) &&
+        GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_backend_cuda_get_device_id(backend)].cc));
 #else
     GGML_UNUSED(backend);
     return false;
@@ -5139,7 +5160,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 
                 // qwen4exp graphs also check leaf inputs: they can be recycled after
                 // their unfused last use (e.g. RoPE positions reused by the following CONT).
-                if (!src || (src->op == GGML_OP_NONE && !ggml_cuda_qwen4exp_enabled())) {
+                if (!src || (src->op == GGML_OP_NONE && !ggml_cuda_qwen4exp_graph())) {
                     continue;
                 }
 
@@ -5260,7 +5281,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * cont = cgraph->nodes[node_idx + 2];
         const int mode = ggml_get_op_params_i32(rope, 2);
         const int outputs[] = { node_idx + 2 };
-        return ggml_cuda_qwen4exp_enabled() && (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION && !(mode & GGML_ROPE_TYPE_TAIL) &&
+        return ggml_cuda_qwen4exp_graph() && (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION && !(mode & GGML_ROPE_TYPE_TAIL) &&
             rope->type == GGML_TYPE_F32 && rope->src[0]->type == GGML_TYPE_F32 && rope->src[0]->ne[3] == 1 &&
             perm->src[0] == rope && ggml_get_op_params_i32(perm, 0) == 0 &&
             cont->src[0] == perm && cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont) &&
@@ -6082,9 +6103,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         }
                     }
 
-                    const bool qwen4exp_rdna35 = ggml_cuda_qwen4exp_enabled() &&
-                        GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc);
-                    if (qwen4exp_rdna35) {
+                    const bool qwen4exp_graph = ggml_cuda_qwen4exp_graph();
+                    const bool qwen4exp_rdna35 = ggml_cuda_qwen4exp_enabled();
+                    if (qwen4exp_graph) {
                         if (node->op == GGML_OP_CONCAT) {
                             ggml_cuda_ple_conv_match pm;
                             if (ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) {
@@ -6118,10 +6139,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
 
 #if defined(GGML_USE_HIP)
-                    // HC gate GEMM + mix reduce fold; must precede the generic SIGMOID fusion below.
-                    if (qwen4exp_rdna35) {
+                    // HC gate GEMM + mix reduce fold (the GEMM is gfx1151's), else the mix reduce
+                    // alone; must precede the generic SIGMOID fusion below.
+                    if (qwen4exp_graph) {
                         ggml_cuda_hc_mix_args hma;
-                        if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
+                        if (qwen4exp_rdna35 && node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
                             const ggml_tensor * w  = node->src[0];
                             const ggml_tensor * lo = node->src[1];
                             if (ggml_is_quantized(w->type) && ggml_node_has_n_uses(cgraph, i, 1) &&
