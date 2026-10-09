@@ -157,8 +157,10 @@ private:
     cluster::Ds4ClusterHooks * hooks_ = nullptr;
     bool cluster_active() const;
     bool cluster_worker() const;
-    // Loads, on load_model()'s path, the size every rank must agree on.
+    // Load-time agreements every rank must share: the prefill chunk size and
+    // the drafter (none, whole or split).
     bool cluster_agree_prefill_chunk();
+    bool cluster_agree_drafter();
     std::unique_ptr<Ds4ClusterRuntime> cluster_;
 
     DeepSeek4BackendConfig cfg_;

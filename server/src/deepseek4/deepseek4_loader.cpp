@@ -2293,6 +2293,9 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         slice_ff = (int) n_ff_exp / plan.slice_ranks;
         slice_ff_first = plan.slice_rank * slice_ff;
     }
+    // A slice the quant blocks cannot follow fails the load: keeping that one
+    // tensor whole would no longer match its sliced partner.
+    std::string slice_error;
     const auto slice_for = [&](const char * name, const ggml_tensor * t) {
         DS4TensorSlice s;
         int layer_id = -1;
@@ -2338,7 +2341,8 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         }
         if (s.kind == DS4TensorSlice::Columns && ggml_blck_size(t->type) > 1 &&
             (s.first % ggml_blck_size(t->type) != 0 || s.count % ggml_blck_size(t->type) != 0)) {
-            s.kind = DS4TensorSlice::None;   // not block aligned: keep the full tensor
+            if (slice_error.empty()) slice_error = name;
+            s.kind = DS4TensorSlice::None;
         }
         return s;
     };
@@ -2392,6 +2396,14 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         if (std::strcmp(tname, "token_embd.weight") == 0) {
             tok_embd_alloc_idx = allocs.size() - 1;
         }
+    }
+
+    if (!slice_error.empty()) {
+        set_last_error("cluster slice of " + slice_error + " is not aligned to its quant blocks; " +
+                       "this model cannot be sliced over " + std::to_string(plan.slice_ranks) + " ranks");
+        gguf_free(gctx);
+        if (meta_ctx) ggml_free(meta_ctx);
+        return false;
     }
 
     // ── Allocate GPU buffer ─────────────────────────────────────────────

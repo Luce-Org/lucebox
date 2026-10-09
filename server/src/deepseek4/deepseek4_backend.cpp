@@ -1199,9 +1199,15 @@ bool DeepSeek4Backend::set_cluster(const cluster::ClusterConfig * cfg,
         cluster_->trace = cluster::cluster_env_trace();
         cache_.cluster_rt = cluster_.get();
         if (comm && cfg->size > 1 && !cluster_->fast) {
+            // Every rank must reduce the same way or the collectives desync:
+            // keep the fast path only if all ranks brought it up. Every rank
+            // takes part in the agreement, even one with the switch off.
             const char * fe = std::getenv("LUCE_CLUSTER_FAST_REDUCE");
+            cluster::FastReduce::Config fc;
+            std::unique_ptr<cluster::FastReduce> fast;
+            std::string ferr = "LUCE_CLUSTER_FAST_REDUCE is off";
+            bool up = false;
             if (fe && std::atoi(fe) != 0) {
-                cluster::FastReduce::Config fc;
                 fc.rank = cfg->rank;
                 fc.size = cfg->size;
                 fc.hca = cfg->ib_hca.substr(0, cfg->ib_hca.find(':'));
@@ -1212,20 +1218,28 @@ bool DeepSeek4Backend::set_cluster(const cluster::ClusterConfig * cfg,
                 fc.slots = 256;         // ~6 verify steps of lookahead
                 if (const char * e = std::getenv("LUCE_CLUSTER_FAST_REDUCE_ELEMS")) fc.max_elems = std::max(1024, std::atoi(e));
                 if (const char * e = std::getenv("LUCE_CLUSTER_FAST_REDUCE_SLOTS")) fc.slots = std::max(8, std::atoi(e));
-                auto fast = std::make_unique<cluster::FastReduce>();
-                std::string ferr;
-                if (fast->init(fc, &ferr)) {
-                    cluster_->fast = std::move(fast);
-                    std::fprintf(stderr, "[deepseek4-cluster] rank %d fast reduce up on %s gid %d "
-                                 "(%d floats x %d slots), bootstrap :%d\n", cfg->rank, fc.hca.c_str(),
-                                 fc.gid_index, fc.max_elems, fc.slots, fc.bootstrap_port);
-                } else {
-                    std::fprintf(stderr, "[deepseek4-cluster] rank %d fast reduce unavailable, keeping "
-                                 "RCCL: %s\n", cfg->rank, ferr.c_str());
-                }
+                fast = std::make_unique<cluster::FastReduce>();
+                ferr.clear();
+                up = fast->init(fc, &ferr);
+            }
+            std::vector<int32_t> ups;
+            std::string aerr;
+            if (!ds4_cluster_allgather_i32(*cluster_, backend_, up ? 1 : 0, ups, &aerr)) {
+                std::fprintf(stderr, "[deepseek4-cluster] fast reduce agreement failed: %s\n", aerr.c_str());
+                return false;
+            }
+            const bool all_up = std::all_of(ups.begin(), ups.end(), [](int32_t v) { return v != 0; });
+            if (all_up) {
+                cluster_->fast = std::move(fast);
+                std::fprintf(stderr, "[deepseek4-cluster] rank %d fast reduce up on %s gid %d "
+                             "(%d floats x %d slots), bootstrap :%d\n", cfg->rank, fc.hca.c_str(),
+                             fc.gid_index, fc.max_elems, fc.slots, fc.bootstrap_port);
+            } else if (fast) {
+                std::fprintf(stderr, "[deepseek4-cluster] rank %d fast reduce unavailable, keeping "
+                             "RCCL: %s\n", cfg->rank, up ? "a peer could not bring it up" : ferr.c_str());
             }
         }
-        if (comm && !cluster_agree_prefill_chunk()) return false;
+        if (comm && (!cluster_agree_prefill_chunk() || !cluster_agree_drafter())) return false;
         return true;
     }
     if (backend_ && !w_.layers.empty()) {
@@ -1237,6 +1251,31 @@ bool DeepSeek4Backend::set_cluster(const cluster::ClusterConfig * cfg,
     cluster_->cfg = &cluster_->cfg_storage;
     cluster_->comm = comm;
     cluster_->trace = cluster::cluster_env_trace();
+    return true;
+}
+
+// Drafting changes the shape of every verify step, and a split drafter
+// all-reduces inside its own graph. Rank 0 decides whether a request drafts
+// (no drafter there: every rank decodes AR), so every other rank must draft,
+// and split, the way rank 0 does, or the collectives desync on the first
+// speculative request.
+bool DeepSeek4Backend::cluster_agree_drafter() {
+    const int32_t mine = !spec_enabled_ || !spec_drafter_ ? 0 : spec_drafter_->split_size > 1 ? 2 : 1;
+    std::vector<int32_t> all;
+    std::string err;
+    if (!ds4_cluster_allgather_i32(*cluster_, backend_, mine, all, &err)) {
+        std::fprintf(stderr, "[deepseek4-cluster] drafter agreement failed: %s\n", err.c_str());
+        return false;
+    }
+    static const char * const kMode[] = {"no drafter", "a whole drafter", "a split drafter"};
+    const int32_t head = all.empty() ? 0 : all[0];
+    for (size_t r = 1; head != 0 && r < all.size(); ++r) {
+        if (all[r] == head) continue;
+        std::fprintf(stderr, "[deepseek4-cluster] rank 0 has %s, rank %zu has %s: start every rank "
+                     "with the same drafter and draft device\n", kMode[std::clamp<int32_t>(head, 0, 2)],
+                     r, kMode[std::clamp<int32_t>(all[r], 0, 2)]);
+        return false;
+    }
     return true;
 }
 
