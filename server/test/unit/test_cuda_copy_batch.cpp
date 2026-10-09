@@ -218,3 +218,37 @@ TEST_CASE(CudaCopyBatchFixture, graph_copy_long_run) {
         REQUIRE(runs >= 2);
     }
 }
+
+// ggml_backend_tensor_copy between two devices, the last call having selected the destination (as the scheduler's
+// copy of a graph input to another device does): the destination must hold the source.
+TEST_CASE(CudaCopyBatchFixture, cross_device_tensor_copy) {
+    if (ggml_backend_cuda_get_device_count() < 2) {
+        SKIP("needs two CUDA/HIP devices");
+    }
+    ggml_backend_t gpus[2] = { ggml_backend_cuda_init(0), ggml_backend_cuda_init(1) };
+    REQUIRE(gpus[0] != nullptr);
+    REQUIRE(gpus[1] != nullptr);
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead();
+    ip.no_alloc = true;
+    ggml_context * ctx[2] = { ggml_init(ip), ggml_init(ip) };
+    ggml_tensor * src = ggml_new_tensor_1d(ctx[0], GGML_TYPE_I32, 4);
+    ggml_tensor * dst = ggml_new_tensor_1d(ctx[1], GGML_TYPE_I32, 4);
+    ggml_backend_buffer_t buf[2] = { ggml_backend_alloc_ctx_tensors(ctx[0], gpus[0]),
+                                     ggml_backend_alloc_ctx_tensors(ctx[1], gpus[1]) };
+    REQUIRE(buf[0] != nullptr);
+    REQUIRE(buf[1] != nullptr);
+    const int32_t rows[4] = { 19, 20, 21, 22 }, zero[4] = {};
+    ggml_backend_tensor_set(src, rows, 0, sizeof(rows));
+    ggml_backend_tensor_set(dst, zero, 0, sizeof(zero));   // selects the destination device
+    ggml_backend_tensor_copy(src, dst);
+    int32_t got[4] = {};
+    ggml_backend_tensor_get(dst, got, 0, sizeof(got));
+    std::printf("[cuda-copy-batch] cross-device copy: %d %d %d %d\n", got[0], got[1], got[2], got[3]);
+    for (int i = 0; i < 2; ++i) {
+        ggml_backend_buffer_free(buf[i]);
+        ggml_free(ctx[i]);
+        ggml_backend_free(gpus[i]);
+    }
+    for (int i = 0; i < 4; ++i) REQUIRE(got[i] == rows[i]);
+}

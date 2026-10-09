@@ -1227,6 +1227,10 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
+        // The per-thread stream is the current device's. On ROCm a peer copy queued on another device's stream
+        // completes without writing (an R9700 to a Strix Halo iGPU), so queue it on the source's, as
+        // ggml_backend_cuda_cpy_tensor_async does.
+        ggml_cuda_set_device(src_ctx->device);
         if (src_ctx->device == dst_ctx->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
