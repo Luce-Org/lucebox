@@ -6282,7 +6282,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
             return false;
         };
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
+        // The xn, gate-mix and routed GLU marks assume the fused kernels consume or produce those tensors; with fusion
+        // disabled the unfused ops would read or write them and compute_forward aborts, so skip those marks.
+        static const bool fusion_off = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr;
+        for (int i = 0; i < cgraph->n_nodes && !fusion_off; ++i) {
             const ggml_tensor * op = cgraph->nodes[i];
             if (op->op != GGML_OP_HC_COMBINE_NORM) continue;
             const size_t xn_off = (size_t) op->ne[0] * op->ne[1] * op->ne[2] * sizeof(float);
@@ -6311,7 +6314,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         // Only the gate-mix path with a quantized w_up writes bf16 in place; the reduce fallback writes f32.
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
+        for (int i = 0; i < cgraph->n_nodes && !fusion_off; ++i) {
             ggml_cuda_hc_mix_args ma;
             const int cnt = ggml_cuda_hc_mix_closed(cgraph, i, ma);
             if (cnt <= 0 || !ma.dst || i < 1 || ggml_nrows(ma.dst) < 512) continue;
@@ -6339,7 +6342,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         // The fused routed GLU (gate MMID, up MMID, SWIGLU) writes bf16 in place when every consumer is an MMB
         // MUL_MAT_ID, so its F32 form is never stored. Mirror the fusion's own conditions exactly: a marked GLU that ran
         // unfused would leave F32 where the consumer reads bf16 (compute_forward aborts on that).
-        static const bool fusion_off = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr;
         for (int i = 2; i < cgraph->n_nodes && !fusion_off; ++i) {
             ggml_tensor * glu = cgraph->nodes[i];
             if (glu->op != GGML_OP_GLU || (glu->flags & GGML_TENSOR_FLAG_OUTPUT)) continue;
