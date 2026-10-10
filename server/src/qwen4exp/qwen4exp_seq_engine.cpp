@@ -355,12 +355,17 @@ int Qwen4ExpSeqEngine::prefill_segment(int slot, int max_tokens) const {
 }
 
 // One granule per prompt forward, whatever the step carries. While slots
-// decode, one granule in total per step bounds the hold on the live streams.
+// decode, one granule in total per step bounds the hold on the live streams,
+// and beside a prompt longer than that they then decode alone for as long as
+// the granule took: a granule pays the whole expert read, so a shorter one
+// would not let them run faster, and a long prompt would otherwise give them
+// one token per granule.
 StepPlanLimits Qwen4ExpSeqEngine::step_plan_limits(int decode_rows) const {
     const int prefill_slots = slot_count() - std::clamp(decode_rows, 0, slot_count());
     if (decode_rows > 0) {
         const int sequences = std::min(prefill_slots, 1);
-        return {sequences, prefill_granule_, sequences * prefill_granule_, prefill_granule_};
+        return {sequences, prefill_granule_, sequences * prefill_granule_, prefill_granule_,
+                /*prefill_time_share=*/0.5};
     }
     return {prefill_slots, prefill_granule_, prefill_slots * prefill_granule_, prefill_granule_};
 }

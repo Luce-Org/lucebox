@@ -216,7 +216,8 @@ public:
     }
 
     // Select a boundary, destination, and optional budget victim as one owned
-    // operation. At most one reservation can be live; destroying it cancels
+    // operation. Each prefilling request can hold one; a live reservation's
+    // slot and bytes are out of reach of the others. Destroying it cancels
     // without changing committed metadata.
     // `restored_prefix_len` prevents reserving a slot for a boundary already
     // covered by the restored snapshot. `prefer_tools_boundary` selects the
@@ -229,9 +230,10 @@ public:
     // forward past the deepest slot. `include_last_message` and
     // `reachable_from` are forwarded to select_inline_snapshot_boundary; a
     // forced cut below `reachable_from` is not forced. With a
-    // `restore_point_spacing` (ModelBackend::restore_point_spacing), the cut
-    // moves down to the deepest spaced restore point, and nothing is reserved
-    // when that adds no prefix.
+    // `restore_point_spacing` (ModelBackend::restore_point_spacing), the cut is
+    // the end of the last message, the point the next turn extends; any other
+    // cut moves down to the deepest spaced restore point, and nothing is
+    // reserved when that adds no prefix.
     InlineReservation reserve_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len = 0,
@@ -255,8 +257,10 @@ public:
 
     // Drop the entries that the entry committed in `slot` supersedes: its
     // strict-prefix ancestors, except the shallowest one and protected pins.
-    // Returns the dropped slots; the caller frees their snapshot payloads.
-    std::vector<int> prune_superseded_ancestors(int slot);
+    // Returns the dropped slots (and, with `pruned_tokens`, each one's prefix
+    // length); the caller frees their snapshot payloads.
+    std::vector<int> prune_superseded_ancestors(
+        int slot, std::vector<int> * pruned_tokens = nullptr);
 
     // Evicts committed entries, never `keep_slot` or protected pins, until the
     // resident bytes fit the budget again. Returns the evicted slots; the
@@ -344,7 +348,18 @@ private:
     };
     std::vector<LruEntry> entries_;
     int next_slot_ = 0;
-    uint64_t active_inline_reservation_ = 0;
+    // Captures in flight, one per prefilling request. Each holds its slot (a
+    // free one, or its budget victim's) and its estimated bytes until it
+    // commits, aborts or cancels; no other capture selects that slot.
+    struct ActiveReservation {
+        uint64_t   id;
+        int        slot;
+        PrefixHash key;
+        PrefixHash victim;
+        bool       has_victim;
+        size_t     bytes;
+    };
+    std::vector<ActiveReservation> active_reservations_;
     uint64_t next_inline_reservation_ = 1;
     size_t max_resident_bytes_ = 0;
     bool prunes_superseded_ = false;
@@ -406,6 +421,8 @@ private:
         bool record_hit);
     bool inline_reservation_active(uint64_t id) const;
     void release_inline_reservation(uint64_t id);
+    // A capture in flight writes this slot.
+    bool slot_reserved(int slot) const;
     bool commit_inline_reservation(InlineReservation & reservation,
                                    const std::vector<int32_t> & prompt_ids,
                                    int committed_cut, size_t resident_bytes,

@@ -455,6 +455,17 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         }
 
         // mode_ == StreamMode::CONTENT
+        // The reply starts at its first line of text: the newlines a template
+        // puts after </think> are not part of it (apps would show them as
+        // blank lines on top). Spaces stay: they can indent its first line.
+        if (accumulated_content_.empty()) {
+            const size_t first = window_.find_first_not_of("\r\n");
+            if (first == std::string::npos) {
+                window_.clear();
+                break;
+            }
+            window_.erase(0, first);
+        }
         // Look for <think>, </think>, or supported tool-call starts.
         size_t think_idx = window_.find(THINK_OPEN);
         size_t think_close_idx = window_.find(THINK_CLOSE);
@@ -964,6 +975,8 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             {"total_tokens", prompt_tokens_ + completion_tokens}
         };
         if (timings) {
+            // OpenAI's field for the prompt tokens a cache served.
+            usage_body["prompt_tokens_details"] = {{"cached_tokens", timings->cached_prefix_tokens}};
             usage_body["timings"] = build_timings_json(*timings, completion_tokens);
         }
         json usage = {
@@ -1066,6 +1079,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             {"total_tokens", prompt_tokens_ + completion_tokens}
         };
         if (timings) {
+            resp_usage["input_tokens_details"] = {{"cached_tokens", timings->cached_prefix_tokens}};
             resp_usage["timings"] = build_timings_json(*timings, completion_tokens);
         }
         json shell = {
