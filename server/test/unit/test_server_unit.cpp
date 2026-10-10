@@ -10454,6 +10454,18 @@ TEST_CASE(ServerUnitFixture, test_usage_timings_reports_prefix_cache_work) {
     TEST_ASSERT(j["prefilled_tokens"].get<int>() == 64);
     TEST_ASSERT(j["effective_prompt_tokens"].get<int>() == 8256);
     TEST_ASSERT(j["agent_turn_cache_hit"].get<bool>());
+
+    // Apps read the cached share where OpenAI puts it.
+    for (const auto format : {ApiFormat::OPENAI_CHAT, ApiFormat::RESPONSES}) {
+        auto em = make_emitter(format);
+        em.emit_start();
+        em.emit_token("x");
+        const std::string wire = concat(em.emit_finish(1, &t));
+        const char * field = format == ApiFormat::OPENAI_CHAT
+            ? "\"prompt_tokens_details\":{\"cached_tokens\":8192}"
+            : "\"input_tokens_details\":{\"cached_tokens\":8192}";
+        TEST_ASSERT(wire.find(field) != std::string::npos);
+    }
 }
 
 TEST_CASE(ServerUnitFixture, test_usage_timings_omitted_when_null) {

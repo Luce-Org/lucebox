@@ -975,6 +975,8 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             {"total_tokens", prompt_tokens_ + completion_tokens}
         };
         if (timings) {
+            // OpenAI's field for the prompt tokens a cache served.
+            usage_body["prompt_tokens_details"] = {{"cached_tokens", timings->cached_prefix_tokens}};
             usage_body["timings"] = build_timings_json(*timings, completion_tokens);
         }
         json usage = {
@@ -1077,6 +1079,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             {"total_tokens", prompt_tokens_ + completion_tokens}
         };
         if (timings) {
+            resp_usage["input_tokens_details"] = {{"cached_tokens", timings->cached_prefix_tokens}};
             resp_usage["timings"] = build_timings_json(*timings, completion_tokens);
         }
         json shell = {

@@ -2977,6 +2977,9 @@ json build_openai_completion_response(
         {"completion_tokens_details", {
             {"reasoning_tokens", counts.reasoning},
         }},
+        {"prompt_tokens_details", {
+            {"cached_tokens", timings.cached_prefix_tokens},
+        }},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
         {"spec_decode_ran", result.spec_decode_ran},
@@ -3077,6 +3080,9 @@ json build_responses_api_response(
         {"input_tokens", prompt_tokens},
         {"output_tokens", counts.total},
         {"total_tokens", prompt_tokens + counts.total},
+        {"input_tokens_details", {
+            {"cached_tokens", timings.cached_prefix_tokens},
+        }},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
         {"spec_decode_ran", result.spec_decode_ran},
