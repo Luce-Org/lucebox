@@ -312,19 +312,23 @@ TEST_CASE(ServerUnitFixture, test_pflash_scorer_uses_user_query_before_chat_suff
 
 // Claude Code sends its environment as a system message after the user's
 // first one; a template that takes a system message only first gets it as a
-// user turn in place.
+// user turn in place, and one that takes it anywhere keeps it.
 TEST_CASE(ServerUnitFixture, test_template_gets_late_system_message_as_user_turn) {
-    const std::string tmpl =
+    const std::string strict =
         "{%- for m in messages -%}"
         "{%- if m.role == 'system' and not loop.first -%}"
         "{{- raise_exception('System message must be at the beginning.') -}}"
         "{%- endif -%}"
         "[{{ m.role }}:{{ m.content }}]"
         "{%- endfor -%}";
+    const std::string permissive =
+        "{%- for m in messages -%}[{{ m.role }}:{{ m.content }}]{%- endfor -%}";
     const std::vector<ChatMessage> msgs = {
         {"system", "agent"}, {"user", "hi"}, {"system", "env"}, {"developer", "brief"}};
-    TEST_ASSERT(render_chat_template_jinja(tmpl, msgs, "", "", false, false, "") ==
+    TEST_ASSERT(render_chat_template_jinja(strict, msgs, "", "", false, false, "") ==
                 "[system:agent][user:hi][user:env][user:brief]");
+    TEST_ASSERT(render_chat_template_jinja(permissive, msgs, "", "", false, false, "") ==
+                "[system:agent][user:hi][system:env][developer:brief]");
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_scorer_accepts_responses_string_input) {

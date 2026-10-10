@@ -1046,7 +1046,7 @@ static std::shared_ptr<jinja::program> get_or_parse(const std::string & template
 
 }  // namespace
 
-std::string render_chat_template_jinja(
+static std::string render_jinja(
     const std::string & template_src,
     const std::vector<ChatMessage> & messages,
     const std::string & bos_token,
@@ -1055,7 +1055,8 @@ std::string render_chat_template_jinja(
     bool enable_thinking,
     const std::string & tools_json,
     const std::string & reasoning_effort,
-    int preserve_thinking)
+    int preserve_thinking,
+    bool late_system_as_user)
 {
     if (template_src.empty()) {
         throw std::runtime_error("render_chat_template_jinja: template_src is empty");
@@ -1077,11 +1078,7 @@ std::string render_chat_template_jinja(
                 "normalize with tool-memory replay disabled");
         }
         nlohmann::ordered_json mj;
-        // Templates take a system message only first (Qwen's raise otherwise).
-        // Claude Code sends its environment as a system message after the
-        // user's first one; it reads as a user turn there, in place, so the
-        // prompt before it stays the same and cached.
-        const bool late_system = !messages_j.empty() &&
+        const bool late_system = late_system_as_user && !messages_j.empty() &&
             (m.role == "system" || m.role == "developer");
         mj["role"]    = late_system ? std::string("user") : m.role;
         mj["content"] = m.content;
@@ -1167,6 +1164,35 @@ std::string render_chat_template_jinja(
         return parts->as_string().str();
     } catch (const std::exception & e) {
         throw std::runtime_error(std::string("jinja runtime: ") + e.what());
+    }
+}
+
+std::string render_chat_template_jinja(
+    const std::string & template_src,
+    const std::vector<ChatMessage> & messages,
+    const std::string & bos_token,
+    const std::string & eos_token,
+    bool add_generation_prompt,
+    bool enable_thinking,
+    const std::string & tools_json,
+    const std::string & reasoning_effort,
+    int preserve_thinking)
+{
+    try {
+        return render_jinja(template_src, messages, bos_token, eos_token, add_generation_prompt,
+                            enable_thinking, tools_json, reasoning_effort, preserve_thinking, false);
+    } catch (const std::runtime_error &) {
+        // Some templates take a system message only first (Qwen's raise).
+        // Claude Code sends its environment as a system message after the
+        // user's first one; for such a template it reads as a user turn
+        // there, in place, so the prompt before it stays the same and cached.
+        const bool late_system = messages.size() > 1 &&
+            std::any_of(messages.begin() + 1, messages.end(), [](const ChatMessage & m) {
+                return m.role == "system" || m.role == "developer";
+            });
+        if (!late_system) throw;
+        return render_jinja(template_src, messages, bos_token, eos_token, add_generation_prompt,
+                            enable_thinking, tools_json, reasoning_effort, preserve_thinking, true);
     }
 }
 
