@@ -1470,9 +1470,9 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     curl_global_init(CURL_GLOBAL_DEFAULT);
     #endif
     prefix_cache_.init_full_cache(config.prefill_cache_cap);
-    // Single-sequence commits prune superseded snapshots (see
-    // trim_snapshots_after_commit); the paged scheduler does not.
-    prefix_cache_.set_prunes_superseded(!config.concurrent_prefix_cache);
+    // Commits prune the snapshots they supersede: single-sequence serving in
+    // trim_snapshots_after_commit, the concurrent scheduler as each capture lands.
+    prefix_cache_.set_prunes_superseded(true);
     // Fold model+config identity into the layout fingerprint BEFORE init()
     // so compute_layout_id sees it on every learn/verify call. Prevents stale
     // KV hits when the server restarts over the same --kv-cache-dir with a

@@ -997,7 +997,17 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 using Resolution = PrefixCaptureTxn::Resolution;
                 const Resolution resolution = s.cache_capture.resolve(
                     out.prefix_store, s.job->req.prompt_tokens);
-                if (resolution == Resolution::failed) {
+                if (resolution == Resolution::saved) {
+                    // A conversation's checkpoints are prefixes of each other;
+                    // restores use only the deepest, so the ones it supersedes
+                    // would hold memory the other conversations need.
+                    std::vector<int> tokens;
+                    const auto pruned = prefix_cache_.prune_superseded_ancestors(
+                        (int)out.prefix_store.ticket.checkpoint.id - 1, &tokens);
+                    for (size_t i = 0; i < pruned.size(); ++i) {
+                        engine.discard_prefix_store({(uint64_t)pruned[i] + 1, tokens[i]});
+                    }
+                } else if (resolution == Resolution::failed) {
                     std::fprintf(stderr,
                         "[parallel-pc] capture failed checkpoint=%llu: %s\n",
                         (unsigned long long)
