@@ -219,17 +219,26 @@ static ggml_tensor * build_gemma4_attn_block(
             ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, Krows, kvi));
             ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, Vrows, kvi));
         } else {
+            // Legacy offset-copy mode still needs an explicit split at wrap.
+            // A contiguous view crossing cache_len would write into the next head.
             const int write_pos = is_swa ? (kv_start % cache_len) : kv_start;
-            ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
-                head_dim, n_tokens, n_head_kv,
-                cache_k->nb[1], cache_k->nb[2],
-                cache_k->nb[1] * (size_t)write_pos);
-            ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
-                head_dim, n_tokens, n_head_kv,
-                cache_v->nb[1], cache_v->nb[2],
-                cache_v->nb[1] * (size_t)write_pos);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
+            auto copy_span = [&](ggml_tensor * source, ggml_tensor * cache,
+                                 int src_pos, int dst_pos, int count) {
+                ggml_tensor * src = ggml_view_3d(ctx, source,
+                    head_dim, count, n_head_kv,
+                    source->nb[1], source->nb[2], source->nb[1] * (size_t)src_pos);
+                ggml_tensor * dst = ggml_view_3d(ctx, cache,
+                    head_dim, count, n_head_kv,
+                    cache->nb[1], cache->nb[2], cache->nb[1] * (size_t)dst_pos);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
+            };
+            const int first = std::min(n_tokens, cache_len - write_pos);
+            copy_span(Kcur_T, cache_k, 0, write_pos, first);
+            copy_span(Vcur_T, cache_v, 0, write_pos, first);
+            if (first < n_tokens) {
+                copy_span(Kcur_T, cache_k, first, 0, n_tokens - first);
+                copy_span(Vcur_T, cache_v, first, 0, n_tokens - first);
+            }
         }
     }
     // else: KV-sharing layer — cache already written by source layer
@@ -464,6 +473,17 @@ void gemma4_layer_step_graph_destroy(Gemma4LayerStepGraph & sg) {
     gemma4_layer_step_graph_free(sg);
 }
 
+static bool gemma4_validate_cache_span(const Gemma4Weights & w,
+                                       const Gemma4Cache & cache,
+                                       int start, int count) {
+    if (gemma4_cache_span_fits(w.sliding_window, cache.swa_size,
+                               cache.max_ctx, start, count)) return true;
+    std::fprintf(stderr, "gemma4: unsafe KV span: start=%d count=%d ctx=%d "
+                         "window=%d ring=%d; increase forward headroom\n",
+                 start, count, cache.max_ctx, w.sliding_window, cache.swa_size);
+    return false;
+}
+
 bool build_gemma4_layer_step(
     Gemma4LayerStepGraph & sg,
     const Gemma4Weights &  w,
@@ -477,6 +497,7 @@ bool build_gemma4_layer_step(
     int                    n_tokens,
     int                    kv_start,
     const KvFlashPager *   kvflash) {
+    if (!gemma4_validate_cache_span(w, cache, kv_start, n_tokens)) return false;
     gemma4_layer_step_graph_free(sg);
     if (layer_idx < 0 || layer_idx >= w.n_layer) return false;
     if (kvflash && cache.fa_window > 0) return false;
@@ -636,6 +657,7 @@ bool gemma4_step(
     std::vector<float> &    out_logits,
     const KvFlashPager *    kvflash)
 {
+    if (!gemma4_validate_cache_span(w, cache, kv_start, n_tokens)) return false;
     if (kvflash && cache.fa_window > 0) {
         std::fprintf(stderr, "gemma4_step: kvflash and fa_window are mutually "
                              "exclusive full-attention policies\n");
@@ -901,6 +923,7 @@ bool gemma4_verify_batch(
     std::vector<int32_t> &  out_argmax,
     const KvFlashPager *    kvflash)
 {
+    if (!gemma4_validate_cache_span(w, cache, kv_start, n_tokens)) return false;
     if (kvflash && cache.fa_window > 0) {
         std::fprintf(stderr, "gemma4_verify_batch: kvflash and fa_window are "
                              "mutually exclusive\n");
@@ -925,15 +948,12 @@ bool gemma4_verify_batch(
         ggml_set_input(tok_ids);
     }
 
-    // kvflash: full-layer writes must go through set_rows to land in pool
-    // slots; SWA ring rows ride the same mechanism (pos % swa_size).
-    ggml_tensor * kvi_full = nullptr, * kvi_swa = nullptr;
-    if (kvflash) {
-        kvi_full = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
-        ggml_set_input(kvi_full);
-        kvi_swa = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
-        ggml_set_input(kvi_swa);
-    }
+    // Always use indexed writes: a verification sequence may cross the ring end.
+    // Full layers use absolute positions or kvflash slots; SWA uses modular rows.
+    ggml_tensor * kvi_full = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(kvi_full);
+    ggml_tensor * kvi_swa = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(kvi_swa);
 
     // Attention masks (padded; full width clamps to the full-layer tensor
     // capacity, which is pool-sized under kvflash — must agree with the FA
@@ -1045,10 +1065,8 @@ bool gemma4_verify_batch(
             return false;
         }
         ggml_backend_tensor_set(kvi_full, rows.data(), 0, ggml_nbytes(kvi_full));
-        std::vector<int32_t> ring((size_t)n_tokens);
-        for (int i = 0; i < n_tokens; ++i) ring[(size_t)i] = (kv_start + i) % swa_size;
-        ggml_backend_tensor_set(kvi_swa, ring.data(), 0, ggml_nbytes(kvi_swa));
     } else {
+        ggml_backend_tensor_set(kvi_full, pos.data(), 0, ggml_nbytes(kvi_full));
         mfull.assign((size_t)kv_len_padded * n_tokens, -INFINITY);
         for (int q = 0; q < n_tokens; ++q) {
             const int abs_q = kv_start + q;
@@ -1057,6 +1075,9 @@ bool gemma4_verify_batch(
             }
         }
     }
+    std::vector<int32_t> ring((size_t)n_tokens);
+    for (int i = 0; i < n_tokens; ++i) ring[(size_t)i] = (kv_start + i) % swa_size;
+    ggml_backend_tensor_set(kvi_swa, ring.data(), 0, ggml_nbytes(kvi_swa));
     ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
 
     // SWA ring-buffer mask

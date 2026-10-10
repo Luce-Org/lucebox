@@ -25,6 +25,13 @@ namespace luce::common {
 
 namespace {
 
+static int gemma4_layer_split_ubatch(int configured_chunk) {
+    if (const char * value = std::getenv("LUCE_GEMMA4_LAYER_SPLIT_UBATCH")) {
+        return std::max(1, std::atoi(value));
+    }
+    return configured_chunk > 0 ? configured_chunk : 512;
+}
+
 static bool tensor_ready(const ggml_tensor * t) {
     return t && t->buffer;
 }
@@ -162,7 +169,8 @@ bool Gemma4LayerSplitAdapter::init() {
         if (!create_gemma4_cache_partial(shard.backend, shard.weights,
                                          cfg_.device.max_ctx,
                                          shard.layer_begin, shard.layer_end,
-                                         shard.cache, kvflash_tokens_)) {
+                                         shard.cache, kvflash_tokens_,
+                                         gemma4_layer_split_ubatch(cfg_.chunk))) {
             std::fprintf(stderr,
                 "[gemma4-target-split] cache gpu=%d: %s\n",
                 shard.gpu, luce_last_error());
@@ -276,7 +284,8 @@ bool Gemma4LayerSplitAdapter::init_mixed_target_split() {
         if (!create_gemma4_cache_partial(shard.backend, shard.weights,
                                          cfg_.device.max_ctx,
                                          shard.layer_begin, shard.layer_end,
-                                         shard.cache, kvflash_tokens_)) {
+                                         shard.cache, kvflash_tokens_,
+                                         gemma4_layer_split_ubatch(cfg_.chunk))) {
             std::fprintf(stderr,
                 "[gemma4-target-split] mixed local cache gpu=%d: %s\n",
                 shard.gpu, luce_last_error());
@@ -517,10 +526,7 @@ bool Gemma4LayerSplitAdapter::run_forward(
     const Gemma4Weights & ref = shards_.front().weights;
     const int hidden = ref.n_embd;
     const int n_tokens_total = (int)tokens.size();
-    int ubatch = cfg_.chunk > 0 ? cfg_.chunk : 512;
-    if (const char * e = std::getenv("LUCE_GEMMA4_LAYER_SPLIT_UBATCH")) {
-        ubatch = std::max(1, std::atoi(e));
-    }
+    const int ubatch = gemma4_layer_split_ubatch(cfg_.chunk);
 
     if (base_pos < 0 || base_pos + n_tokens_total > cfg_.device.max_ctx) {
         std::fprintf(stderr,
@@ -614,14 +620,10 @@ bool Gemma4LayerSplitAdapter::run_forward(
         }
 
         for (int start = 0; start < n_tokens_total;) {
-            int n = std::min(ubatch, n_tokens_total - start);
             const int kv_start = base_pos + start;
-            if (shard->cache.swa_size > 0 &&
-                shard->cache.swa_size < shard->cache.max_ctx) {
-                const int swa_remaining =
-                    shard->cache.swa_size - (kv_start % shard->cache.swa_size);
-                n = std::min(n, swa_remaining);
-            }
+            const int n = gemma4_swa_chunk_size(
+                shard->weights.sliding_window, shard->cache.swa_size,
+                shard->cache.max_ctx, kv_start, std::min(ubatch, n_tokens_total - start));
             const bool use_kvflash =
                 kvflash_active() && !gemma4_is_swa_layer(ref, il);
             if (use_kvflash && !kvflash_pager_.alloc_span(kv_start, n)) {
@@ -768,10 +770,7 @@ bool Gemma4LayerSplitAdapter::run_mixed_forward(
     const Gemma4Weights & ref = shards_.front().weights;
     const int hidden = ref.n_embd;
     const int n_tokens_total = (int)tokens.size();
-    int ubatch = cfg_.chunk > 0 ? cfg_.chunk : 512;
-    if (const char * e = std::getenv("LUCE_GEMMA4_LAYER_SPLIT_UBATCH")) {
-        ubatch = std::max(1, std::atoi(e));
-    }
+    const int ubatch = gemma4_layer_split_ubatch(cfg_.chunk);
     if (base_pos < 0 || base_pos + n_tokens_total > cfg_.device.max_ctx) {
         std::fprintf(stderr,
             "[gemma4-target-split] mixed range [%d,%d) exceeds max_ctx=%d\n",
@@ -866,14 +865,10 @@ bool Gemma4LayerSplitAdapter::run_mixed_forward(
         }
 
         for (int start = 0; start < n_tokens_total;) {
-            int n = std::min(ubatch, n_tokens_total - start);
             const int kv_start = base_pos + start;
-            if (shard->cache.swa_size > 0 &&
-                shard->cache.swa_size < shard->cache.max_ctx) {
-                const int swa_remaining =
-                    shard->cache.swa_size - (kv_start % shard->cache.swa_size);
-                n = std::min(n, swa_remaining);
-            }
+            const int n = gemma4_swa_chunk_size(
+                shard->weights.sliding_window, shard->cache.swa_size,
+                shard->cache.max_ctx, kv_start, std::min(ubatch, n_tokens_total - start));
             const bool use_kvflash =
                 kvflash_active() && !gemma4_is_swa_layer(ref, il);
             if (use_kvflash && !kvflash_pager_.alloc_span(kv_start, n)) {
@@ -1480,14 +1475,10 @@ int run_gemma4_target_shard_ipc_daemon(const char * target_path,
                 current_shard = shard;
             }
             for (int start = 0; ok && start < n_tokens;) {
-                int n = std::min(ubatch, n_tokens - start);
                 const int kv_start = req.base_pos + start;
-                if (shard->cache.swa_size > 0 &&
-                    shard->cache.swa_size < shard->cache.max_ctx) {
-                    const int swa_remaining =
-                        shard->cache.swa_size - (kv_start % shard->cache.swa_size);
-                    n = std::min(n, swa_remaining);
-                }
+                const int n = gemma4_swa_chunk_size(
+                    shard->weights.sliding_window, shard->cache.swa_size,
+                    shard->cache.max_ctx, kv_start, std::min(ubatch, n_tokens - start));
                 const bool use_kvflash =
                     kvflash_pool_tokens > 0 &&
                     !gemma4_is_swa_layer(shard->weights, il);

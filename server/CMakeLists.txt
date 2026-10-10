@@ -1068,6 +1068,7 @@ if(LUCE_TESTS)
     # script tests) set the label at their add_test site.
     set(_luce_cpu_ctest_names
         deepseek4_unit
+        test_gemma4_cache_policy
         test_seq_slot_manager
         test_seq_engine_contract
         test_seq_batch_plan
@@ -2048,6 +2049,15 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         find_package(Threads REQUIRED)
         target_link_libraries(test_ds4_engram PRIVATE Threads::Threads)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_gemma4_cache_policy.cpp")
+        # Host-only proof that tentative writes preserve every live SWA window.
+        add_executable(test_gemma4_cache_policy test/unit/test_gemma4_cache_policy.cpp)
+        target_include_directories(test_gemma4_cache_policy PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        list(APPEND _raw_unit_test_targets test_gemma4_cache_policy)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_seq_slot_manager.cpp")
         # Host-side slot bookkeeping test (concurrent serving): no GPU.
