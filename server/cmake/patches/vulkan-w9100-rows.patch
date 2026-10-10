@@ -1,0 +1,21 @@
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2879,6 +2879,18 @@
+     } else if (device->vendor_id == VK_VENDOR_ID_INTEL) {
+         rm_stdq = 2;
+         rm_stdq_int = 2;
++    }
++    // Reuse the isolated W9100 row-count experiment; unset keeps upstream behavior.
++    if (device->vendor_id == VK_VENDOR_ID_AMD && device->properties.deviceID == 0x67a0) {
++        const char * rows = getenv("GGML_VK_W9100_KQ_ROWS");
++        if (rows) {
++            const std::string value(rows);
++            if (value != "1" && value != "2" && value != "4" && value != "8") {
++                throw std::runtime_error("GGML_VK_W9100_KQ_ROWS must be 1, 2, 4 or 8");
++            }
++            rm_kq = uint32_t(std::stoi(value));
++            std::cerr << "ggml_vulkan: W9100 K-quant rows/workgroup=" << rm_kq << std::endl;
++        }
+     }
+     // RDNA3: above four columns, static 4 rows for all types bench faster than the default
+     const bool is_rdna3 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3;

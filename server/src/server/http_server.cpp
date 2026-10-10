@@ -17,6 +17,7 @@
 #endif
 
 #include "http_server.h"
+#include "vulkan_request_policy.h"
 #include "image_input.h"
 #include "engine/luce_engine.h"
 #include "admission.h"
@@ -2206,6 +2207,10 @@ json HttpServer::model_routing_status() {
 // tools, prefix-cache overrides, stop sequences.
 bool HttpServer::parse_common_request_fields(
         SocketHandle fd, const json & body, ParsedRequest & req) {
+    if (unsupported_lfm_vulkan_request(config_.runtime_backend, body)) {
+        send_error(fd, 400, "native LFM Vulkan supports serialized non-streaming greedy text chat, n=1, max_tokens=1..1024; tools, constraints and API logprobs are unsupported");
+        return false;
+    }
     req.stream = body.value("stream", false);
     req.model = config_.model_name;
     req.disk_cache_policy = config_.disk_cache_policy;
@@ -2565,6 +2570,10 @@ bool HttpServer::render_and_tokenize_request(
     }
     req.started_in_thinking = prompt_ends_in_open_think(req.rendered_prompt);
     req.prompt_tokens = tokenizer_.encode(req.rendered_prompt);
+    if (limited_lfm_vulkan(config_.runtime_backend) && tokenizer_.bos_id() >= 0 &&
+        (req.prompt_tokens.empty() || req.prompt_tokens.front() != tokenizer_.bos_id())) {
+        req.prompt_tokens.insert(req.prompt_tokens.begin(), tokenizer_.bos_id());
+    }
     return true;
 }
 
