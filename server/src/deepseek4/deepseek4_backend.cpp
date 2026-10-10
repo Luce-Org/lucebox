@@ -166,6 +166,8 @@ private:
     mutable std::atomic<bool> cancelled_{false};
 };
 
+static size_t ds4_device_headroom_bytes(int device);
+
 namespace {
 using Clock = std::chrono::steady_clock;
 
@@ -981,10 +983,10 @@ static bool fill_profiled_hot_placement(const DeepSeek4Weights & w,
 // uses authoritative router statistics and evaluates every selected expert.
 static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
                                            ggml_backend_t backend,
+                                           int device,
                                            uint64_t kv_bytes,
                                            bool all_cold,
                                            bool with_vision,
-                                           bool paged,
                                            Ds4HybridBudgetInfo & out,
                                            std::string * err) {
     out = {};
@@ -1006,17 +1008,17 @@ static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
     out.core_bytes = moe_hybrid_core_bytes_from_memory(
         "deepseek4", out.gpu_free, out.gpu_total);
     out.kv_bytes = kv_bytes;
+    // Leave the same free-memory floor required by check_device_headroom()
+    // after load, even when LUCE_EXPERT_BUDGET_MB does not cap the hot set.
+    out.safety_bytes = std::max<uint64_t>(out.safety_bytes, ds4_device_headroom_bytes(device));
 
-    // In all-cold mode the KV cache is owned by the secondary (Strix)
-    // backend in the legacy contiguous path, so it does not consume the
-    // primary GPU's expert budget there. Paged serving owns its persistent
-    // page tensors on the primary target.
-    const uint64_t main_charge = all_cold && !paged ? 0 : out.kv_bytes;
+    // Both contiguous and paged KV caches are allocated on the primary,
+    // including when every routed expert belongs to the secondary.
     const uint64_t retained_workspace = with_vision &&
         (vision::detail::hip_bias_launches(backend) || vision::detail::hip_av_launches(backend))
         ? vision::detail::hip_bias_workspace(backend) : 0;
     out.expert_budget = vision::remaining_expert_budget(
-        out.gpu_total, out.core_bytes, main_charge, out.warm_bytes, out.safety_bytes,
+        out.gpu_total, out.core_bytes, out.kv_bytes, out.warm_bytes, out.safety_bytes,
         with_vision ? vision::SCRATCH_RESERVATION : 0, retained_workspace);
     if (out.expert_budget > out.mem.total_expert_bytes) {
         out.expert_budget = out.mem.total_expert_bytes;
@@ -1025,6 +1027,10 @@ static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
         cap_bytes > 0 && cap_bytes < out.expert_budget) {
         out.expert_budget = cap_bytes;
     }
+    // All-cold placement allocates no primary experts, so it does not need
+    // room for even one hot round. The final headroom check still validates
+    // the primary's actual persistent allocations.
+    if (all_cold) return true;
     if (out.expert_budget == 0) {
         if (err) *err = "no VRAM budget available for DS4 experts";
         return false;
@@ -1880,8 +1886,6 @@ bool DeepSeek4Backend::apply_routing_adjustments() {
     }
     return true;
 }
-
-static size_t ds4_device_headroom_bytes(int device);
 
 // Host RAM kept free of the locked expert tier: the OS and this process's
 // own host buffers (a layer-major pass keeps its HC state and embeddings,
@@ -3109,8 +3113,8 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     Ds4HybridBudgetInfo budget;
     const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
     if (!compute_ds4_hybrid_budget_info(
-            w, backend_, kv_bytes, tp.all_on_secondary,
-            vision_ != nullptr, cfg_.paged_attention, budget, err)) {
+            w, backend_, cfg_.device.gpu, kv_bytes, tp.all_on_secondary,
+            vision_ != nullptr, budget, err)) {
         return false;
     }
 

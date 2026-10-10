@@ -226,7 +226,21 @@ RTX mixed-hardware notes before running long prompts.
 
 The command shape is `luce_server <model.gguf> [options]`. The first positional argument selects the target weights. `--model-name` only changes the name reported by the API; it does not select a model file.
 
-`luce_server --list-devices [model.gguf]` prints every GPU with its `backend:N` index, architecture and memory, and, given a model, the device `--target-device auto` would choose.
+`luce_server --list-devices [model.gguf]` prints every GPU with its `backend:N` index, architecture, memory and whether another process is computing on it, and, given a model, the placement `--target-device auto` would choose.
+
+`--target-device auto` places the model from the GPUs' state at startup. It skips a GPU another process holds: on Linux/AMD it reads `/sys/class/kfd/kfd/proc`, where a running server has queues on every GPU it spans before its weights load (free memory alone misses a busy Strix Halo). KFD IDs are matched to the full PCI address, including the function or GPU partition. The log and `--list-devices` report the owning host PID, process/model names when readable, and the GPUs it spans. Each GPU is sized by queried free memory; zero free bytes never falls back to total memory.
+
+Placement order:
+1. A discrete GPU that holds the model alone.
+2. The model's supported multi-GPU technique when the available devices together hold it: DeepSeek V4/V4.1 expert parallel with `--expert-device`, or layer splitting with `--target-devices` for families with a layer-split adapter.
+3. One available GPU that holds it, discrete first.
+4. For backends with expert offload, the roomiest available GPU.
+
+Otherwise auto stops before loading. It preserves requested single-device features: for example, Qwen paged attention or a vision projector, and Gemma/Laguna speculative decoding, prevent automatic layer splitting. A separately placed DeepSeek vision encoder (`--mmproj-device`) prevents automatic expert parallelism. DeepSeek paged expert parallelism requires a HIP `gfx1201` primary and `gfx1151` secondary. With `--profile`, auto chooses only the device, because a profile is qualified for one topology. On an R9700 + Strix Halo machine, the 91.5 GiB DeepSeek V4 model therefore loads expert parallel on both when both are free, on Strix Halo alone when the R9700 is busy, and not at all when Strix Halo is busy. The expert-parallel choice uses no tuning profile; `--profile ds4-r9700-strix` remains the qualified recipe for that topology.
+
+Availability is a startup snapshot, not a GPU reservation: near-simultaneous launches can race. CUDA has no busy-process signal here and uses free memory only. KFD process IDs belong to the host PID namespace; in a container with a separate PID namespace, process labels and self-exclusion are not reliable unless `/proc` and the process share the host PID namespace.
+
+DeepSeek's hybrid hot-expert budget reserves the same headroom floor as its post-load check (1.5 GiB on a discrete primary, 4 GiB on an integrated primary). KV memory remains charged to the primary even when all routed experts run on the secondary. All-cold placement does not require room for a hot expert round.
 
 `--profile <name>` applies a qualified hardware and model configuration: `ds4-strix` (DeepSeek V4 on Strix Halo), `ds4-r9700-strix` (DeepSeek V4 with experts split between an R9700 and Strix Halo), `ds41-lucebox` (DeepSeek V4.1 on an R9700, Strix Halo and an SSD) or `ds41-gorgon` (DeepSeek V4.1 on an R9700 beside a 192 GB Ryzen AI Max+ PRO 495, every expert resident). Flags on the command line replace the profile's value, and environment variables that are already set keep theirs. The startup log lists what the profile applied.
 
@@ -267,7 +281,7 @@ The command shape is `luce_server <model.gguf> [options]`. The first positional 
 
 | Option | Default | Purpose |
 |---|---|---|
-| `--target-device <backend:gpu\|auto>` | `auto:0` or `LUCE_TARGET_DEVICE` | Place the target on a CUDA or HIP device. `auto` picks a GPU the model fits on (discrete before integrated, then the lowest index), else the largest GPU. |
+| `--target-device <backend:gpu\|auto>` | `auto:0` or `LUCE_TARGET_DEVICE` | Place the target on a CUDA or HIP device. `auto` uses available free memory and the model's supported topology, preserving requested features; see the placement policy above. |
 | `--draft-device <backend:gpu>` | `auto:0` | Place the draft on a CUDA or HIP device. DeepSeek V4 and `--target-device auto` default to the target GPU. |
 | `--expert-device <backend:gpu>` | none | DeepSeek V4: keep dense work and hot experts on the target and run the remaining routed experts on this GPU in the same process. |
 | `--target-devices <list>` | one device | Select multiple target devices, such as `cuda:0,cuda:1`. |

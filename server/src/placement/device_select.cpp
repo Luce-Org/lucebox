@@ -6,16 +6,128 @@
 #include "gguf.h"
 #include "kv_quant.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <regex>
 #include <utility>
 
+#if defined(__linux__) && (defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP))
+#include "kfd_topology.h"
+
+#include <unistd.h>
+#endif
+
 namespace luce::common {
+
+namespace {
+
+#if defined(__linux__) && (defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP))
+std::string read_first_line(const std::filesystem::path & path) {
+    std::ifstream in(path);
+    std::string line;
+    std::getline(in, line);
+    return line;
+}
+
+// Another process that holds a GPU, read from /sys/class/kfd/kfd/proc/<pid>:
+// it has compute or copy queues there, or more than 64 MiB of device memory
+// (vram_<gpu_id> also counts an APU's carve-out; it reads as a negative
+// number when unused). Queues appear within a second of a server starting,
+// before its weights load, and a split server holds every GPU it spans.
+// Opening a runtime context alone does neither, so tools that only enumerate
+// devices do not count, and neither does this process.
+struct KfdGpuUser {
+    std::string pid;
+    std::string name;   // /proc/<pid>/comm
+    std::string model;  // first .gguf on its command line
+    std::vector<uint32_t> gpu_ids;
+};
+
+std::string first_gguf_argument(const std::string & pid) {
+    std::ifstream in("/proc/" + pid + "/cmdline", std::ios::binary);
+    std::string arg;
+    while (std::getline(in, arg, '\0')) {
+        if (arg.size() > 5 && arg.compare(arg.size() - 5, 5, ".gguf") == 0) {
+            return std::filesystem::path(arg).filename().string();
+        }
+    }
+    return {};
+}
+
+std::vector<KfdGpuUser> kfd_other_gpu_users(const std::vector<uint32_t> & gpu_ids) {
+    namespace fs = std::filesystem;
+    constexpr long long kMemoryThreshold = 64ll << 20;
+    std::vector<KfdGpuUser> users;
+    std::error_code ec;
+    const std::string self = std::to_string(getpid());
+    // Processes and queues can disappear while this snapshot is read.
+    for (auto proc = fs::directory_iterator("/sys/class/kfd/kfd/proc", ec);
+         !ec && proc != fs::directory_iterator(); proc.increment(ec)) {
+        KfdGpuUser user;
+        user.pid = proc->path().filename().string();
+        if (user.pid == self) continue;
+        std::vector<std::string> queue_gpus;
+        std::error_code queue_ec;
+        for (auto queue = fs::directory_iterator(proc->path() / "queues", queue_ec);
+             !queue_ec && queue != fs::directory_iterator(); queue.increment(queue_ec)) {
+            queue_gpus.push_back(read_first_line(queue->path() / "gpuid"));
+        }
+        for (uint32_t gpu_id : gpu_ids) {
+            const std::string id = std::to_string(gpu_id);
+            const bool queues =
+                std::find(queue_gpus.begin(), queue_gpus.end(), id) != queue_gpus.end();
+            const long long memory = (long long) std::strtoull(
+                read_first_line(proc->path() / ("vram_" + id)).c_str(), nullptr, 10);
+            if (gpu_id && (queues || memory > kMemoryThreshold)) user.gpu_ids.push_back(gpu_id);
+        }
+        if (user.gpu_ids.empty()) continue;
+        user.name = read_first_line("/proc/" + user.pid + "/comm");
+        user.model = first_gguf_argument(user.pid);
+        users.push_back(std::move(user));
+    }
+    return users;
+}
+
+// Mark the devices other processes hold, naming each process, its model and
+// every device it spans: "pid 42 luce_server ds4.gguf on hip:0+hip:1".
+void mark_busy_devices(std::vector<GpuDeviceInfo> & devices,
+                       const std::vector<uint32_t> & gpu_ids) {
+    const std::vector<KfdGpuUser> users = kfd_other_gpu_users(gpu_ids);
+    const std::string backend = placement_backend_name(compiled_placement_backend());
+    for (size_t d = 0; d < devices.size(); ++d) {
+        for (const KfdGpuUser & user : users) {
+            if (!gpu_ids[d] || std::find(user.gpu_ids.begin(), user.gpu_ids.end(),
+                                         gpu_ids[d]) == user.gpu_ids.end()) {
+                continue;
+            }
+            std::string spans;
+            for (size_t other = 0; other < devices.size(); ++other) {
+                if (gpu_ids[other] && std::find(user.gpu_ids.begin(), user.gpu_ids.end(),
+                                                gpu_ids[other]) != user.gpu_ids.end()) {
+                    spans += (spans.empty() ? "" : "+") + backend + ":" +
+                             std::to_string(devices[other].index);
+                }
+            }
+            std::string & by = devices[d].busy_by;
+            by += std::string(by.empty() ? "" : "; ") + "pid " + user.pid +
+                  (user.name.empty() ? "" : " " + user.name) +
+                  (user.model.empty() ? "" : " " + user.model) + " on " + spans;
+            devices[d].busy = true;
+        }
+    }
+}
+#endif
+
+}  // namespace
 
 std::vector<GpuDeviceInfo> enumerate_gpu_devices(bool query_free) {
     std::vector<GpuDeviceInfo> devices;
     const int count = ggml_backend_cuda_get_device_count();
+#if defined(__linux__) && (defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP))
+    std::vector<uint32_t> gpu_ids(query_free ? (size_t) std::max(count, 0) : 0, 0);
+#endif
     for (int i = 0; i < count; ++i) {
         GpuDeviceInfo info;
         info.index = i;
@@ -36,12 +148,23 @@ std::vector<GpuDeviceInfo> enumerate_gpu_devices(bool query_free) {
             info.arch = prop.gcnArchName;
             const size_t features = info.arch.find(':');
             if (features != std::string::npos) info.arch.resize(features);
+#if defined(__linux__)
+            char pci_address[32] = {};
+            if (query_free &&
+                hipDeviceGetPCIBusId(pci_address, sizeof(pci_address), i) == hipSuccess) {
+                gpu_ids[(size_t) i] = detail::kfd_gpu_id(
+                    "/sys/class/kfd/kfd/topology/nodes", pci_address);
+            }
+#endif
 #else
             info.arch = "sm_" + std::to_string(prop.major) + std::to_string(prop.minor);
 #endif
         }
         devices.push_back(std::move(info));
     }
+#if defined(__linux__) && (defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP))
+    if (query_free) mark_busy_devices(devices, gpu_ids);
+#endif
     return devices;
 }
 

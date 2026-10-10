@@ -4,6 +4,7 @@
 
 #include "CppUnitTestFramework.hpp"
 #include "placement/device_select.h"
+#include "common/feature_gate.h"
 #include "server/launch_profiles.h"
 
 #include <algorithm>
@@ -101,6 +102,164 @@ struct LaunchPolicyFixture : CommonFixture {
         const AutoDeviceChoice long_ctx = choose_auto_target_device(devices, 26 * GiB, 5 * GiB);
         CHECK(long_ctx.index == 1);
         CHECK(long_ctx.fits);
+    }
+
+    // R9700 (32 GiB) + Strix Halo, as HIP reports them: the integrated GPU's
+    // total is its address space, its free memory is what a model can use.
+    std::vector<GpuDeviceInfo> r9700_strix(bool r9700_busy, bool strix_busy) {
+        GpuDeviceInfo r9700 = device(0, 32, false);
+        r9700.free_bytes = 31 * GiB;
+        r9700.busy = r9700_busy;
+        r9700.busy_by = r9700_busy ? "pid 42 luce_server" : "";
+        GpuDeviceInfo strix = device(1, 1280, true);
+        strix.free_bytes = 120 * GiB;
+        strix.busy = strix_busy;
+        return {r9700, strix};
+    }
+
+    void test_auto_placement_follows_gpu_availability() {
+        AutoPlacementRequest ds4;
+        ds4.model_bytes = 91 * GiB + GiB / 2;
+        ds4.technique = arch_multi_gpu_technique("deepseek4");
+        CHECK(ds4.technique == MultiGpuTechnique::ExpertParallel);
+
+        // Both free: dense work on the R9700, the other experts on Strix Halo.
+        const AutoPlacement both = choose_auto_placement(r9700_strix(false, false), ds4);
+        CHECK(both.technique == MultiGpuTechnique::ExpertParallel);
+        CHECK(both.gpus == std::vector<int>({0, 1}));
+        CHECK(both.fits);
+
+        // R9700 busy: Strix Halo alone, and the reason names the busy process.
+        const AutoPlacement strix = choose_auto_placement(r9700_strix(true, false), ds4);
+        CHECK(strix.technique == MultiGpuTechnique::None);
+        CHECK(strix.gpus == std::vector<int>({1}));
+        CHECK(strix.reason.find("pid 42 luce_server") != std::string::npos);
+
+        // Strix Halo busy: the R9700 cannot hold DeepSeek4, which cannot
+        // offload, so there is no placement rather than a failed load.
+        CHECK(choose_auto_placement(r9700_strix(false, true), ds4).gpus.empty());
+        CHECK(choose_auto_placement(r9700_strix(true, true), ds4).gpus.empty());
+
+        // A model that cannot offload never lands on a GPU that is too small.
+        AutoPlacementRequest offload = ds4;
+        offload.can_offload = true;
+        CHECK(choose_auto_placement(r9700_strix(false, true), offload).gpus ==
+              std::vector<int>({0}));
+    }
+
+    void test_auto_placement_splits_only_what_one_discrete_gpu_cannot_hold() {
+        AutoPlacementRequest large;
+        large.model_bytes = 48 * GiB;
+        large.technique = arch_multi_gpu_technique("qwen35");
+        CHECK(large.technique == MultiGpuTechnique::LayerSplit);
+
+        // Layers follow free memory: 31 GiB on the R9700, 120 GiB on Strix.
+        const AutoPlacement split = choose_auto_placement(r9700_strix(false, false), large);
+        CHECK(split.technique == MultiGpuTechnique::LayerSplit);
+        CHECK(split.gpus == std::vector<int>({0, 1}));
+        CHECK(split.layer_weights == std::vector<double>({31.0 * GiB, 120.0 * GiB}));
+
+        // A model the R9700 holds alone stays there even when both are free:
+        // splitting it with Strix Halo only slows it down.
+        AutoPlacementRequest small = large;
+        small.model_bytes = 15 * GiB;
+        const AutoPlacement alone = choose_auto_placement(r9700_strix(false, false), small);
+        CHECK(alone.technique == MultiGpuTechnique::None);
+        CHECK(alone.gpus == std::vector<int>({0}));
+
+        // Without a multi-GPU technique (or under a profile) one GPU must fit.
+        AutoPlacementRequest single = large;
+        single.technique = MultiGpuTechnique::None;
+        CHECK(choose_auto_placement(r9700_strix(false, false), single).gpus ==
+              std::vector<int>({1}));
+    }
+
+    void test_auto_placement_never_uses_exhausted_devices() {
+        auto devices = r9700_strix(false, false);
+        devices[0].free_bytes = 0;
+        AutoPlacementRequest request;
+        request.model_bytes = 15 * GiB;
+        request.technique = MultiGpuTechnique::LayerSplit;
+        const AutoPlacement placement = choose_auto_placement(devices, request);
+        CHECK(placement.gpus == std::vector<int>({1}));
+        CHECK(placement.fits);
+
+        devices[1].free_bytes = 0;
+        CHECK(choose_auto_placement(devices, request).gpus.empty());
+        request.can_offload = true;
+        CHECK(choose_auto_placement(devices, request).gpus.empty());
+    }
+
+    void test_auto_placement_preserves_requested_features() {
+        const auto devices = r9700_strix(false, false);
+        AutoPlacementRequest request;
+        request.model_bytes = 48 * GiB;
+        BackendArgs args;
+        args.paged_attention = true;
+        request.technique = auto_multi_gpu_technique("qwen35", args);
+        const AutoPlacement paged = choose_auto_placement(devices, request);
+        CHECK(paged.technique == MultiGpuTechnique::None);
+        CHECK(paged.gpus == std::vector<int>({1}));
+        args.device.backend = compiled_placement_backend();
+        args.device.gpu = paged.gpus.front();
+        CHECK(check_feature_compatibility(args, {}, "qwen35",
+              compiled_placement_backend(), compiled_placement_backend()).empty());
+
+        args.paged_attention = false;
+        args.mmproj_path = "vision.gguf";
+        request.technique = auto_multi_gpu_technique("qwen35", args);
+        CHECK(choose_auto_placement(devices, request).gpus == std::vector<int>({1}));
+
+        args.mmproj_path.reset();
+        args.draft_path = "draft.gguf";
+        request.technique = auto_multi_gpu_technique("gemma4", args);
+        CHECK(choose_auto_placement(devices, request).gpus == std::vector<int>({1}));
+        // Qwen's layer adapter does support its ordinary decode drafter.
+        request.technique = auto_multi_gpu_technique("qwen35", args);
+        CHECK(choose_auto_placement(devices, request).technique == MultiGpuTechnique::LayerSplit);
+    }
+
+    void test_auto_placement_preserves_separate_vision_encoder() {
+        const auto devices = r9700_strix(false, false);
+        BackendArgs args;
+        args.mmproj_path = "vision.gguf";
+        DevicePlacement encoder;
+        encoder.backend = compiled_placement_backend();
+        encoder.gpu = 0;
+        args.mmproj_device = encoder;
+        AutoPlacementRequest request;
+        request.model_bytes = 91 * GiB;
+        request.technique = auto_multi_gpu_technique("deepseek4", args);
+        const AutoPlacement placement = choose_auto_placement(devices, request);
+        CHECK(placement.technique == MultiGpuTechnique::None);
+        CHECK(placement.gpus == std::vector<int>({1}));
+
+        // Without a separately placed encoder, two expert owners are valid.
+        args.mmproj_device.reset();
+        request.technique = auto_multi_gpu_technique("deepseek4", args);
+        CHECK(choose_auto_placement(devices, request).technique ==
+              MultiGpuTechnique::ExpertParallel);
+    }
+
+    void test_paged_expert_parallel_requires_supported_devices() {
+        auto devices = r9700_strix(false, false);
+        devices[0].arch = "gfx1201";
+        devices[1].arch = "gfx1151";
+        AutoPlacementRequest request;
+        request.model_bytes = 91 * GiB;
+        request.technique = MultiGpuTechnique::ExpertParallel;
+        request.paged_expert_parallel = true;
+        const AutoPlacement supported = choose_auto_placement(devices, request);
+        if (compiled_placement_backend() == PlacementBackend::Hip) {
+            CHECK(supported.technique == MultiGpuTechnique::ExpertParallel);
+            CHECK(supported.gpus == std::vector<int>({0, 1}));
+        } else {
+            CHECK(supported.gpus == std::vector<int>({1}));
+        }
+        devices[0].arch = "gfx1100";
+        const AutoPlacement unsupported = choose_auto_placement(devices, request);
+        CHECK(unsupported.technique == MultiGpuTechnique::None);
+        CHECK(unsupported.gpus == std::vector<int>({1}));
     }
 
     void test_draft_placement_precedence() {
@@ -276,6 +435,12 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_auto_device_keeps_first_of_equal_discrete_gpus();
     test_required_bytes_margin();
     test_auto_device_counts_the_kv_cache();
+    test_auto_placement_follows_gpu_availability();
+    test_auto_placement_splits_only_what_one_discrete_gpu_cannot_hold();
+    test_auto_placement_never_uses_exhausted_devices();
+    test_auto_placement_preserves_requested_features();
+    test_paged_expert_parallel_requires_supported_devices();
+    test_auto_placement_preserves_separate_vision_encoder();
     test_draft_placement_precedence();
     test_profiles_are_well_formed();
     test_profile_flags_yield_to_explicit_flags();

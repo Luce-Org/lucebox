@@ -2519,6 +2519,7 @@ if(LUCE_TESTS)
         target_sources(test_feature_gate PRIVATE
             test/unit/test_backend_plan.cpp
             test/unit/test_launch_policy.cpp
+            test/unit/test_kfd_topology.cpp
             src/common/backend_plan.cpp
             src/common/feature_gate.cpp
             src/kv_quant.cpp
