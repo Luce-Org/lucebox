@@ -32,6 +32,10 @@ public:
     // These generation paths neither continue nor copy out a live state.
     bool snapshot_save_deferred(int slot) override { return snapshot_save(slot); }
     bool supports_dflash_spec_decode() const override { return true; }
+    // Its own generate paths do not fill GenerateResult::logprobs.
+    bool supports_logprobs() const override { return false; }
+    // Its hybrid prefill does not run the readouts of the dense graph.
+    bool supports_hidden_states() const override { return false; }
 
     bool set_routing_collector(MoeRoutingCollector * c) override { routing_collector_ = c; return true; }
     const MoeHybridRoutingStats * get_routing_stats() const override { return routing_stats_.get(); }

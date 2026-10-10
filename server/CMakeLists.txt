@@ -663,6 +663,7 @@ add_library(luce_common STATIC
     src/qwen35/layer_split_daemon_loop.cpp
     src/qwen35/qwen35_daemon.cpp
     src/common/sampler.cpp
+    src/common/token_logprobs.cpp
     src/common/backend_precision.cpp
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
@@ -2329,6 +2330,7 @@ if(LUCE_TESTS)
             test/unit/test_paged_kv_offload.cpp
             test/unit/test_anchor_params.cpp
             test/unit/test_derived_scalars.cpp
+            test/unit/test_dflash_capture_layers.cpp
             test/unit/test_adaptive_spec_width.cpp
             test/unit/test_immutable_graph_input_pool.cpp
             test/unit/test_mmq_tile_selection.cpp
@@ -2343,6 +2345,8 @@ if(LUCE_TESTS)
             test/unit/test_bandit_integration.cpp
             test/unit/test_admission.cpp
             test/unit/test_restore_delta.cpp
+            test/unit/test_token_logprobs.cpp
+            test/unit/test_hidden_states.cpp
             test/unit/test_chain_rollback_policy.cpp
             test/unit/test_ddtree_tau.cpp
             test/unit/test_anchor_transitive.cpp
@@ -2455,11 +2459,14 @@ if(LUCE_TESTS)
             test/smoke/smoke_load_target.cpp
             test/smoke/smoke_load_target_laguna.cpp
             test/unit/test_paged_attention.cpp
-            test/unit/test_decode_kv_offload_gpu.cpp)
+            test/unit/test_decode_kv_offload_gpu.cpp
+            test/unit/test_model_swap_gpu.cpp)
         target_include_directories(test_model_smoke PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        target_compile_definitions(test_model_smoke PRIVATE
+            LUCE_TEST_SHARE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/share")
         if(LUCE_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_model_smoke PRIVATE
                 LUCE_BACKEND_HIP=1

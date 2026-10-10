@@ -230,43 +230,54 @@ bool dflash2_select_chains_batched(
     const DraftSelectorWeights & selector = dw.selector;
     const int n_lanes = static_cast<int>(hidden_by_lane.size());
     const int n_cand = q_len - 1;
-    const int K = selector.top_k;
-    const int rank = selector.rank;
+    // A DFlash 1 drafter has no selector: its chain is the per-position
+    // argmax of the shared lm_head, i.e. the top-1 candidate.
+    const bool greedy = !selector.enabled;
+    const int K = greedy ? 1 : selector.top_k;
+    const int rank = greedy ? 1 : selector.rank;
     const int hdim = dw.n_embd;
-    if (!selector.enabled || !selector.hproj || !selector.pred_cb ||
+    if (greedy) {
+        if (!backend || !lm_head || n_lanes <= 0 ||
+            static_cast<int>(last_tokens.size()) != n_lanes ||
+            n_cand <= 0 || hdim <= 0) {
+            return false;
+        }
+    } else if (!selector.hproj || !selector.pred_cb ||
         !selector.succ_cb || !backend || !lm_head || n_lanes <= 0 ||
         static_cast<int>(last_tokens.size()) != n_lanes ||
         n_cand <= 0 || K <= 0 || rank <= 0 || hdim <= 0) {
         return false;
     }
-    DFlash2SelectorLayout selector_layout;
-    selector_layout.rank = rank;
-    selector_layout.top_k = K;
-    selector_layout.hproj_rank = selector.hproj->ne[1];
-    selector_layout.pred_rank = selector.pred_cb->ne[0];
-    selector_layout.pred_vocab = selector.pred_cb->ne[1];
-    selector_layout.succ_rank = selector.succ_cb->ne[0];
-    selector_layout.succ_vocab = selector.succ_cb->ne[1];
-    selector_layout.target_output_vocab = lm_head->ne[1];
-    std::string selector_error;
-    if (!validate_dflash2_selector_layout(
-            selector_layout, selector_error)) {
-        std::fprintf(stderr, "dflash2_select_chains_batched: %s\n",
-                     selector_error.c_str());
-        return false;
-    }
     for (const float * hidden : hidden_by_lane) {
         if (!hidden) return false;
     }
-    for (size_t lane = 0; lane < last_tokens.size(); ++lane) {
-        const int32_t token = last_tokens[lane];
-        if (token < 0 || token >= selector_layout.pred_vocab) {
-            std::fprintf(stderr,
-                         "dflash2_select_chains_batched: lane %zu seed token "
-                         "%d is outside codebook vocab %lld\n",
-                         lane, token,
-                         (long long)selector_layout.pred_vocab);
+    if (!greedy) {
+        DFlash2SelectorLayout selector_layout;
+        selector_layout.rank = rank;
+        selector_layout.top_k = K;
+        selector_layout.hproj_rank = selector.hproj->ne[1];
+        selector_layout.pred_rank = selector.pred_cb->ne[0];
+        selector_layout.pred_vocab = selector.pred_cb->ne[1];
+        selector_layout.succ_rank = selector.succ_cb->ne[0];
+        selector_layout.succ_vocab = selector.succ_cb->ne[1];
+        selector_layout.target_output_vocab = lm_head->ne[1];
+        std::string selector_error;
+        if (!validate_dflash2_selector_layout(
+                selector_layout, selector_error)) {
+            std::fprintf(stderr, "dflash2_select_chains_batched: %s\n",
+                         selector_error.c_str());
             return false;
+        }
+        for (size_t lane = 0; lane < last_tokens.size(); ++lane) {
+            const int32_t token = last_tokens[lane];
+            if (token < 0 || token >= selector_layout.pred_vocab) {
+                std::fprintf(stderr,
+                             "dflash2_select_chains_batched: lane %zu seed token "
+                             "%d is outside codebook vocab %lld\n",
+                             lane, token,
+                             (long long)selector_layout.pred_vocab);
+                return false;
+            }
         }
     }
 
@@ -322,6 +333,20 @@ bool dflash2_select_chains_batched(
         extract_draft_topk(
             logits.data(), n_positions, vocab, K,
             candidate_log_probs.data(), candidate_ids.data(), 1.0f);
+    }
+
+    if (greedy) {
+        draft_tokens.assign(
+            (size_t) n_lanes,
+            std::vector<int32_t>((size_t) q_len));
+        for (int lane = 0; lane < n_lanes; ++lane) {
+            draft_tokens[(size_t) lane][0] = last_tokens[(size_t) lane];
+            for (int depth = 0; depth < n_cand; ++depth) {
+                draft_tokens[(size_t) lane][(size_t) depth + 1] =
+                    candidate_ids[(size_t) (lane * n_cand + depth)];
+            }
+        }
+        return true;
     }
 
     BatchedSelectorGraph & graph = batched_selector_graph();
@@ -407,6 +432,11 @@ bool dflash2_select_chains_batched(
         }
     }
     return true;
+}
+
+void dflash2_batch_release_thread_graphs() {
+    free_projection_graph(projection_graph());
+    free_selector_graph(batched_selector_graph());
 }
 
 }  // namespace luce::common

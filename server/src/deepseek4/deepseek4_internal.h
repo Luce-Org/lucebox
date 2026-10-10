@@ -374,6 +374,9 @@ struct DeepSeek4Weights {
     // bias applied), [n_layer * n_expert], taken once after the adjustments.
     // Empty when a layer has no F32 bias; host routing then reads the device.
     std::vector<float>   selection_bias_host;
+    // The router bias delta was added to these ffn_exp_probs_b (a fresh load
+    // starts false; apply_routing_adjustments refuses a second application).
+    bool router_bias_applied = false;
     bool fused_decode        = false;
     bool fused_verify_f16_kv = false;
 };
@@ -1022,5 +1025,10 @@ struct DeepSeek4Snapshot {
     bool                  owns_storage = true;
 };
 
+
+// Free and total memory of a DS4 device. An integrated GPU without a carve
+// reports its GTT window, which the kernel's TTM limit can set far past the
+// machine's RAM; it then has only what the host has available.
+void ds4_device_memory(int device, size_t * free_b, size_t * total_b);
 
 }  // namespace luce::common

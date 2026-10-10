@@ -128,8 +128,33 @@ public:
     bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return target_parked_; }
 
+    bool supports_eviction(std::string & reason) const override;
+    EvictResult evict(EvictLevel level = EvictLevel::cold) override;
+    bool weights_resident() const override { return !evicted_ || weights_kept_; }
+    size_t weight_device_bytes() const override;
+    bool reinstate(std::string & error) override;
+    bool is_evicted() const override { return evicted_; }
+
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
+    // AR decode and the concurrent engine report logprobs; a logprobs request
+    // never speculates (see generate_impl).
+    bool supports_logprobs() const override { return true; }
+
+    // Hidden states come from the dense target graph: single-device only,
+    // and not through KVFlash's pooled prefill, which evicts context.
+    bool supports_hidden_states() const override {
+        return !cfg_.device.is_tensor_parallel() && !kvflash_active();
+    }
+    HiddenStateShape hidden_state_shape() const override {
+        return {w_.n_layer, w_.n_embd};
+    }
+    bool compute_hidden_states(const std::vector<int32_t> & prompt,
+                               const HiddenStatesSpec & spec,
+                               int snap_slot,
+                               const DaemonIO & io,
+                               HiddenStates & out,
+                               std::string & error) override;
 
     bool snapshot_save(int slot) override;
     bool snapshot_save_deferred(int slot) override;
@@ -330,6 +355,23 @@ private:
     bool target_parked_ = false;
     bool draft_parked_  = false;
 
+    // ── Eviction state ───────────────────────────────────────────────
+    // KV-cache arguments resolved at init. reinstate() replays them instead
+    // of re-deriving from free device memory, so snapshots taken before an
+    // eviction keep matching the rebuilt cache.
+    int  layout_max_verify_tokens_ = 0;
+    int  layout_ctx_alloc_ = 0;
+    bool evicted_ = false;
+    bool weights_kept_ = false;  // evicted warm
+    // Local draft load (+ capture layers, SWA/YaRN/block-size overrides),
+    // shared by init() and reinstate().
+    bool load_local_draft();
+    // Draft feature mirror, shared by init() and reinstate().
+    void init_feature_mirror(bool fixed_chain_enabled);
+    // Frees every device allocation; the shared teardown of evict() and of a
+    // failed reinstate(). Host snapshots are untouched.
+    void release_device_state(bool keep_weights = false);
+
     // Vision projector, loaded next to the target weights when --mmproj is set.
     bool load_vision();
     bool encode_images(const Qwen35ImagePrompt & prompt, Qwen35ImageRows & rows,
@@ -355,6 +397,16 @@ private:
     // without deriving a chunk-local offset from absolute KV position.
     std::size_t     prefill_last_logits_offset_ = 0;
     bool            prefill_last_logits_valid_  = false;
+
+    // do_ar_decode's per-token log-probabilities when sampler_ asks for
+    // them; moved into GenerateResult::logprobs by the generate paths.
+    std::vector<TokenLogprobs> ar_logprobs_;
+    // Set by compute_hidden_states for the duration of its do_prefill: each
+    // prefill chunk reads the spec's layers into it.
+    HiddenStatesAccumulator * hidden_accum_ = nullptr;
+    // Appends the log-probabilities of `token` from the sg_.logits row at
+    // byte offset `logits_offset`.
+    void record_ar_logprobs(std::size_t logits_offset, int32_t token);
 
     // The single-request path owns one live sequence. The allocator and
     // attention op are sequence-aware; concurrent serving uses the engine

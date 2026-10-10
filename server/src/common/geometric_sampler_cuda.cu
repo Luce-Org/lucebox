@@ -571,4 +571,8 @@ bool geometric_compute_probs_cuda(const float * logits,
     return ok;
 }
 
+void geometric_sampler_release_thread_scratch() {
+    scratch.reset();
+}
+
 }  // namespace luce::common

@@ -383,8 +383,20 @@ bool build_target_step(
     const QwenPrefillSegment * prefill_segments,
     int n_prefill_segments,
     int n_logits_rows,
-    bool compact_slots) {
+    bool compact_slots,
+    const QwenHiddenCapture * hidden_captures,
+    int n_hidden_captures) {
     step_graph_free(sg);
+    if (n_hidden_captures < 0 || (n_hidden_captures > 0 && !hidden_captures)) {
+        return false;
+    }
+    for (int k = 0; k < n_hidden_captures; ++k) {
+        const QwenHiddenCapture & hc = hidden_captures[k];
+        if (hc.layer < 0 || hc.layer >= w.n_layer || hc.n_rows <= 0 ||
+            hc.row_begin < 0 || hc.row_begin + hc.n_rows > n_tokens) {
+            return false;
+        }
+    }
 
     // Compact n_seqs is a decode graph bucket width, not the physical
     // slot count. active_slot_ids maps live rows to cache columns and uses -1
@@ -492,6 +504,13 @@ bool build_target_step(
         shape.reserve(shape.size() + (size_t)n_prefill_segments);
         for (int i = 0; i < n_prefill_segments; ++i) {
             shape.push_back(prefill_segments[i].n_tokens);
+        }
+        // Hidden-state readouts add graph nodes; keep those shapes apart.
+        for (int k = 0; k < n_hidden_captures; ++k) {
+            const QwenHiddenCapture & hc = hidden_captures[k];
+            shape.push_back(hc.layer);
+            shape.push_back(hc.row_begin);
+            shape.push_back(hc.n_rows * 2 + (hc.sum ? 1 : 0));
         }
         uint64_t hash = 1469598103934665603ull;
         for (int value : shape) {
@@ -675,12 +694,16 @@ bool build_target_step(
     gi.specla_n_waves             = hld_schedule.n_waves;
     gi.specla_n_boundaries        = hld_schedule.n_boundaries;
     gi.specla_max_parallel_chains = hld_schedule.max_parallel_chains;
+    gi.hidden_captures            = hidden_captures;
+    gi.n_hidden_captures          = n_hidden_captures;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
     sg.logits = go.logits;
     sg.delta_captures = std::move(go.delta_captures);
     sg.moe_selected = std::move(go.moe_selected);
+    sg.hidden_last = std::move(go.hidden_last);
+    sg.hidden_sum = std::move(go.hidden_sum);
     ggml_set_output(sg.logits);
 
     sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);

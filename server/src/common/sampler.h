@@ -34,6 +34,13 @@ struct SamplerCfg {
     float    freq_pen   = 0.0f;
     float    pres_pen   = 0.0f;
 
+    // Per-token log-probability reporting (OpenAI `logprobs`), carried here
+    // because the sampler is what reaches every decode path. -1 = off; else
+    // the number of top alternatives per position (0..kMaxTopLogprobs).
+    // It does not change which token is chosen.
+    int      logprobs_top_n = -1;
+    bool wants_logprobs() const { return logprobs_top_n >= 0; }
+
     // True when any logit modifier is active (penalties or stochastic sampling).
     // Backends should use CPU sample_logits() path when this returns true.
     bool needs_logit_processing() const {

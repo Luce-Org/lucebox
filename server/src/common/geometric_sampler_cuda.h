@@ -77,6 +77,11 @@ bool geometric_compute_probs_cuda(const float * logits,
 // gate the GPU path at runtime.
 bool gpu_sampler_enabled();
 
+// Free the calling thread's device scratch (raw device allocations reused
+// across calls). Model eviction calls it on the worker before the device is
+// handed to another model; the next sample reallocates it.
+void geometric_sampler_release_thread_scratch();
+
 // Whether geometric_sample_logits_cuda can (and should) handle this config
 // entirely on the GPU. false for top_k>0 or top_p in (0,1) — not because
 // geometric_sample_logits_cuda can't be asked to try (it always returns -1

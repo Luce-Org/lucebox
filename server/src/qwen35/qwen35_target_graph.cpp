@@ -396,29 +396,11 @@ bool create_target_cache_partial(const TargetWeights & w,
     }
 
     // ── Zero-initialize all state tensors ─────────────────────────────
-    const bool meta_backend = ggml_backend_buft_is_meta(
-        ggml_backend_get_default_buffer_type(backend));
-    if (meta_backend) {
-        ggml_backend_buffer_clear(out.base_buf, 0);
-        if (out.rollback_buf) ggml_backend_buffer_clear(out.rollback_buf, 0);
-    } else {
-        std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
-        ggml_context * ctx_list[] = { out.base_ctx, out.rollback_ctx };
-        for (int ci = 0; ci < 2; ci++) {
-            ggml_context * c = ctx_list[ci];
-            if (!c) continue;
-            for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr;
-                 t = ggml_get_next_tensor(c, t)) {
-                size_t nb = ggml_nbytes(t);
-                size_t off = 0;
-                while (off < nb) {
-                    size_t chunk = std::min(nb - off, zeros.size());
-                    ggml_backend_tensor_set(t, zeros.data(), off, chunk);
-                    off += chunk;
-                }
-            }
-        }
-    }
+    // On the device (a memset per buffer): uploading host zeros moved the
+    // whole cache over PCIe, ~0.9 s at 64k context on a Gen3 x4 link, which
+    // dominated reinstating an evicted model.
+    ggml_backend_buffer_clear(out.base_buf, 0);
+    if (out.rollback_buf) ggml_backend_buffer_clear(out.rollback_buf, 0);
 
     return true;
 }
@@ -794,6 +776,19 @@ bool migrate_prefill_cache(const TargetWeights & w,
     return true;
 }
 
+namespace {
+// SpecLA commit-graph allocator, reused across steps on the worker thread like
+// the verify step graph. File scope so model eviction can release it.
+thread_local ggml_gallocr_t t_specla_galloc = nullptr;
+}  // namespace
+
+void specla_release_thread_scratch() {
+    if (t_specla_galloc) {
+        ggml_gallocr_free(t_specla_galloc);
+        t_specla_galloc = nullptr;
+    }
+}
+
 // SpecLA DeltaConstruct commit (docs/SPECLA.md): one small graph advancing all
 // delta-net layers' durable SSM states along the accepted path,
 //   S_A = exp(g⁺_A) S0 + Σ_{t∈path} exp(g⁺_A − g⁺_t) k_t ⊗ ṽ_t,
@@ -893,7 +888,6 @@ bool specla_commit_accepted(TargetCache & cache,
         // Persistent metadata arena + allocator, reused across steps like the
         // verify step graph — avoids per-commit gallocr churn.
         static thread_local std::vector<uint8_t> s_arena;
-        static thread_local ggml_gallocr_t s_galloc = nullptr;
         const size_t graph_nodes = (size_t)n_delta * 8 + 64;
         ggml_init_params ip{};
         ip.mem_size = graph_nodes * 4 * ggml_tensor_overhead() +
@@ -944,10 +938,10 @@ bool specla_commit_accepted(TargetCache & cache,
             ggml_build_forward_expand(gf, ggml_cpy(ctx, s_new, S));
         }
 
-        if (!s_galloc) {
-            s_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!t_specla_galloc) {
+            t_specla_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         }
-        ok = s_galloc != nullptr && ggml_gallocr_alloc_graph(s_galloc, gf);
+        ok = t_specla_galloc != nullptr && ggml_gallocr_alloc_graph(t_specla_galloc, gf);
         if (ok) {
             ggml_backend_tensor_set(idx, accepted_idx, 0, sizeof(int32_t) * A);
             ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
@@ -2403,6 +2397,8 @@ QwenGraphOutputs build_qwen35_graph(
     if (in.capture_moe_router && w.is_moe) {
         og_early.moe_selected.assign((size_t)w.n_layer, nullptr);
     }
+    og_early.hidden_last.assign((size_t)in.n_hidden_captures, nullptr);
+    og_early.hidden_sum.assign((size_t)in.n_hidden_captures, nullptr);
 
     // DFlash target layer IDs for feature capture (from TargetWeights config).
     const int * CAPTURE_LAYERS = w.capture_layer_ids;
@@ -2584,6 +2580,30 @@ QwenGraphOutputs build_qwen35_graph(
             og_early.moe_selected[(size_t)il] = moe_selected;
         }
         cur = ggml_add(ctx, ffn, ffn_residual);
+
+        // ── Residual-stream readout (/v1/hidden_states) ──
+        // Before the DFlash capture below, which may `continue`.
+        for (int k = 0; k < in.n_hidden_captures; ++k) {
+            const QwenHiddenCapture & hc = in.hidden_captures[k];
+            if (hc.layer != il) continue;
+            ggml_tensor * rows = ggml_reshape_2d(ctx, cur, hidden, n_tokens);
+            if (rows->type != GGML_TYPE_F32) rows = ggml_cast(ctx, rows, GGML_TYPE_F32);
+            ggml_tensor * last = ggml_cont(ctx, ggml_view_1d(ctx, rows, hidden,
+                (size_t)(hc.row_begin + hc.n_rows - 1) * rows->nb[1]));
+            ggml_set_output(last);
+            ggml_build_forward_expand(gf, last);
+            og_early.hidden_last[(size_t)k] = last;
+            if (hc.sum) {
+                ggml_tensor * range = ggml_view_2d(ctx, rows, hidden, hc.n_rows,
+                    rows->nb[1], (size_t)hc.row_begin * rows->nb[1]);
+                // [n_rows, hidden] -> [1, hidden]: the sum over the range.
+                ggml_tensor * sum = ggml_sum_rows(
+                    ctx, ggml_cont(ctx, ggml_transpose(ctx, range)));
+                ggml_set_output(sum);
+                ggml_build_forward_expand(gf, sum);
+                og_early.hidden_sum[(size_t)k] = sum;
+            }
+        }
 
         // ── DFlash layer feature capture ──
         // Write `cur` into the rolling target_feat buffer. The buffer is a

@@ -429,4 +429,8 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
     return ok;
 }
 
+void geometric_draft_topk_release_thread_scratch() {
+    scratch.reset();
+}
+
 }  // namespace luce::common

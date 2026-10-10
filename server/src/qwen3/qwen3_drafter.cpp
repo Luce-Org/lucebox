@@ -197,7 +197,11 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
 
     if (arch == DrafterArch::Qwen35_0p8b) {
         auto * st = new Qwen35DrafterState();
-        if (!load_target_gguf(gguf_path, out.backend, st->weights)) {
+        // Scoring runs the layers only; skip output_norm + LM head (the
+        // 0.8B ties it to token_embd, which would otherwise be uploaded).
+        TargetLoadPlan plan;
+        plan.load_output = false;
+        if (!load_target_gguf_partial(gguf_path, out.backend, plan, st->weights)) {
             delete st;
             return false;
         }

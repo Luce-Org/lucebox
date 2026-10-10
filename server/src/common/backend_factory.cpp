@@ -226,7 +226,7 @@ std::unique_ptr<ModelBackend> construct_backend(
 
         auto backend = std::make_unique<Qwen35Backend>(std::move(cfg));
         if (!backend->init()) {
-            std::fprintf(stderr, "[backend_factory] Qwen35Backend init failed\n");
+            std::fprintf(stderr, "[backend_factory] Qwen35Backend init failed: %s\n", luce_last_error());
             return nullptr;
         }
         return backend;

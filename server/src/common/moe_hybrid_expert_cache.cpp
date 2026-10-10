@@ -314,6 +314,49 @@ void MoeStreamedExpertCache::destroy() {
     tick_ = 0;
     stats_ = {};
     stopping_ = false;
+    suspended_ = false;
+    loads_in_flight_ = 0;
+}
+
+bool MoeStreamedExpertCache::suspend(std::string * err) {
+    if (!ready()) return true;
+    const auto refuse = [&](const char * why) {
+        if (err) *err = why;
+        return false;
+    };
+    // Launches and calls wait on the loaders: they must end before the
+    // loaders stop.
+    if (in_call_.load(std::memory_order_acquire)) return refuse("an expert-cache call is running");
+    if (mailbox_.busy()) return refuse("a mailbox launch has not ended");
+    std::unique_lock<std::mutex> lk(mu_);
+    if (!staged_.empty() || !acquired_.empty()) return refuse("expert-cache slots are still pinned");
+    for (const Slot & s : slots_) {
+        if (s.pins > 0) return refuse("expert-cache slots are still pinned");
+    }
+    suspended_ = true;
+    // The loads already taken finish (load_slot synchronizes its stream), so
+    // no copy into the pool is left in flight once this returns.
+    cv_.wait(lk, [&] { return loads_in_flight_ == 0; });
+    return true;
+}
+
+void MoeStreamedExpertCache::resume() {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!suspended_) return;
+        suspended_ = false;
+    }
+    cv_.notify_all();
+}
+
+void MoeStreamedExpertCache::release_graphs() {
+    for (auto & kv : graphs_) kv.second.free();
+    graphs_.clear();
+}
+
+bool MoeStreamedExpertCache::suspended() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return suspended_;
 }
 
 MoeStreamedExpertCache::Stats MoeStreamedExpertCache::stats() const {
@@ -334,7 +377,8 @@ void MoeStreamedExpertCache::loader_main(Loader * self) {
     std::unique_lock<std::mutex> lk(mu_);
     while (true) {
         cv_.wait(lk, [&] {
-            return stopping_ || !jobs_.empty() || (warm_next_ < warm_.size() && !warm_blocked_);
+            return stopping_ ||
+                   (!suspended_ && (!jobs_.empty() || (warm_next_ < warm_.size() && !warm_blocked_)));
         });
         if (stopping_) break;
         // Demand and prefetch loads first; the warm start only fills idle time.
@@ -360,10 +404,12 @@ void MoeStreamedExpertCache::loader_main(Loader * self) {
         }
         // Read under the lock: stage() may retouch a loading slot meanwhile.
         const bool bulk = slots_[(size_t) slot].bulk;
+        ++loads_in_flight_;
         lk.unlock();
         uint64_t read_us = 0, upload_us = 0;
         const bool ok = load_slot(*self, slot, bulk, &read_us, &upload_us);
         lk.lock();
+        --loads_in_flight_;
         slots_[(size_t) slot].state = SlotState::Ready;
         if (warm) {
             --warm_loading_;
@@ -1031,7 +1077,7 @@ void MoeStreamedMailbox::destroy() {
     step_ = nullptr;
     channels_.clear();
     jobs_.clear();
-    pending_ = launch_done_ = stopping_ = false;
+    pending_ = launch_done_ = open_ = stopping_ = false;
     error_.clear();
     cache_ = nullptr;
 }
@@ -1050,14 +1096,21 @@ void MoeStreamedMailbox::begin(const std::vector<Job> & jobs, int32_t invalid_ro
     invalid_route_ = invalid_route;
     error_.clear();
     launch_done_ = false;
+    open_ = true;
     pending_ = true;
     cv_.notify_all();
+}
+
+bool MoeStreamedMailbox::busy() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return open_;
 }
 
 bool MoeStreamedMailbox::end(std::string * err) {
     std::unique_lock<std::mutex> lk(mu_);
     launch_done_ = true;
     cv_.wait(lk, [&] { return !pending_; });
+    open_ = false;
     const bool ok = error_.empty();
     if (!ok && err) *err = error_;
     lk.unlock();

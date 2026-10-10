@@ -38,4 +38,8 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
                              int32_t * out_token_ids,
                              float temperature);
 
+// Free the calling thread's device scratch; see
+// geometric_sampler_release_thread_scratch().
+void geometric_draft_topk_release_thread_scratch();
+
 }  // namespace luce::common

@@ -61,6 +61,7 @@ Qwen35SeqEngine::Qwen35SeqEngine(
       scratch_row_(scratch_row),
       fixed_chain_(fixed_chain) {
     const int n_slots = slots_.slot_count();
+    slot_logits_row_.assign(static_cast<size_t>(n_slots), -1);
     slot_draft_kv_.resize(static_cast<size_t>(n_slots));
     seq_lens_.assign(static_cast<size_t>(n_slots), 0);
     reserve_growth_.assign(static_cast<size_t>(n_slots), 0);
@@ -279,6 +280,7 @@ bool Qwen35SeqEngine::chain_spec_input_capable(
     }
     const Qwen35Slot & slot = slots_.slot(input.slot);
     return slot.decoding() && !slot.sampler.needs_logit_processing() &&
+           !slot.sampler.wants_logprobs() &&
            slot.cur_pos >= 1 &&
            slot.cur_pos + (width > 0 ? width : fixed_chain_.width) <=
                slots_.max_context();
@@ -340,8 +342,12 @@ Qwen35SeqEngine::prepare_chain_drafts(
     std::vector<Lane> lanes;
     lanes.reserve(inputs.size());
     const int hidden = b_.w_.n_embd;
+    // The drafter GGUF's MASK id wins over the target default, as in the
+    // single-stream path (the z-lab Qwen3.5-9B drafter trains on 248077).
+    const int32_t mask_id = b_.dw_.mask_token_id >= 0
+        ? b_.dw_.mask_token_id : b_.w_.mask_token_id;
     std::vector<int32_t> noise(
-        static_cast<size_t>(draft_width), b_.w_.mask_token_id);
+        static_cast<size_t>(draft_width), mask_id);
     std::vector<float> noise_embed(
         static_cast<size_t>(hidden) * draft_width);
 
@@ -377,7 +383,7 @@ Qwen35SeqEngine::prepare_chain_drafts(
         }
         noise[0] = input.token;
         std::fill(
-            noise.begin() + 1, noise.end(), b_.w_.mask_token_id);
+            noise.begin() + 1, noise.end(), mask_id);
         if (!b_.w_.embedder.embed(
                 noise.data(), draft_width, noise_embed.data())) {
             reset_lanes();
@@ -415,7 +421,7 @@ Qwen35SeqEngine::prepare_chain_drafts(
         dummies.push_back(std::move(dummy));
     }
     noise[0] = lanes.front().root;
-    std::fill(noise.begin() + 1, noise.end(), b_.w_.mask_token_id);
+    std::fill(noise.begin() + 1, noise.end(), mask_id);
     if (!b_.w_.embedder.embed(
             noise.data(), draft_width, noise_embed.data())) {
         reset_lanes();
@@ -487,6 +493,44 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
         clear_slot_images(result.slot);
         reset_recurrent_slot(b_.cache_, result.slot);
         reset_slot_draft_kv(result.slot);
+    }
+    return result;
+}
+
+bool Qwen35SeqEngine::supports_hidden_states() const {
+    return b_.supports_hidden_states();
+}
+
+SeqEngine::AdmitResult Qwen35SeqEngine::admit_hidden_states(
+        uint64_t request_id,
+        const std::vector<int32_t> & prompt,
+        const HiddenStatesSpec & spec,
+        PrefixCaptureTicket capture) {
+    AdmitResult refused;
+    refused.status = AdmitResult::Status::failed;
+    if (!supports_hidden_states()) {
+        refused.error = "this model does not report hidden states";
+        return refused;
+    }
+    for (int layer : spec.layers) {
+        if (layer < 0 || layer >= b_.w_.n_layer) {
+            refused.error = "hidden-state layer out of range";
+            return refused;
+        }
+    }
+    // Greedy, logprob-free sampler: the prefill's committing row is sampled
+    // like any other, and the token is discarded.
+    AdmitResult result = admit(request_id, prompt, SamplerCfg{});
+    if (result.status != AdmitResult::Status::admitted) return result;
+    if (slot_hidden_.size() < static_cast<size_t>(slots_.slot_count())) {
+        slot_hidden_.resize(static_cast<size_t>(slots_.slot_count()));
+    }
+    slot_hidden_[static_cast<size_t>(result.slot)].emplace(spec, b_.w_.n_embd);
+    // cache_prefix: store the prefill as a checkpoint, never restore one.
+    // The scheduler places the capture at the prompt end, which is already
+    // where the last chunk stops, so the readout's chunking is unchanged.
+    if (arm_capture(result.slot, capture, /*restored_tokens=*/0)) {
+        result.prefix_store.capture = capture;
     }
     return result;
 }
@@ -686,9 +730,11 @@ PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
 
 int32_t Qwen35SeqEngine::sample_graph_row(
         int slot, int logits_row, const int32_t * cached_argmax,
-        std::vector<float> * logits_scratch) {
+        std::vector<float> * logits_scratch,
+        std::optional<TokenLogprobs> * logprobs_out) {
     const TargetWeights & w = b_.w_;
     const int vocab = w.n_vocab;
+    slot_logits_row_[static_cast<size_t>(slot)] = logits_row;
     Qwen35Slot & seq = slots_.slot(slot);
     int32_t token = -1;
     if (seq.sampler.needs_logit_processing()) {
@@ -712,9 +758,36 @@ int32_t Qwen35SeqEngine::sample_graph_row(
             (size_t)logits_row * sizeof(int32_t), sizeof(int32_t));
         ggml_backend_synchronize(b_.target_backend_);
     }
-    return b_.apply_min_tokens_floor(
+    token = b_.apply_min_tokens_floor(
         token, seq.generated_tokens(),
         (size_t)logits_row * (size_t)vocab * sizeof(float));
+    if (logprobs_out && token >= 0 && seq.sampler.wants_logprobs()) {
+        std::vector<float> local_logits;
+        std::vector<float> & logits = logits_scratch
+            ? *logits_scratch
+            : local_logits;
+        logits.resize((size_t)vocab);
+        ggml_backend_tensor_get(
+            b_.sg_.logits, logits.data(),
+            (size_t)logits_row * (size_t)vocab * sizeof(float),
+            sizeof(float) * (size_t)vocab);
+        *logprobs_out = compute_token_logprobs(
+            logits.data(), vocab, token, seq.sampler.logprobs_top_n);
+    }
+    return token;
+}
+
+std::optional<TokenLogprobs> Qwen35SeqEngine::token_logprobs(int slot, int32_t token) {
+    if (slot < 0 || slot >= slot_count() || !slots_.is_active(slot) ||
+        slot_logits_row_[static_cast<size_t>(slot)] < 0) return std::nullopt;
+    const SamplerCfg & sampler = slots_.slot(slot).sampler;
+    if (!sampler.wants_logprobs()) return std::nullopt;
+    const int vocab = b_.w_.n_vocab;
+    logits_buf_.resize(static_cast<size_t>(vocab));
+    ggml_backend_tensor_get(b_.sg_.logits, logits_buf_.data(),
+        static_cast<size_t>(slot_logits_row_[static_cast<size_t>(slot)]) * vocab * sizeof(float),
+        static_cast<size_t>(vocab) * sizeof(float));
+    return compute_token_logprobs(logits_buf_.data(), vocab, token, sampler.logprobs_top_n);
 }
 
 bool Qwen35SeqEngine::upload_block_table_delta(
@@ -963,6 +1036,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         int position = -1;
         int64_t physical_row = -1;
         int32_t pending = -1;
+        std::optional<TokenLogprobs> logprobs;
     };
 
     const int full_width = fixed_chain_.width;
@@ -1443,7 +1517,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         ArLane & lane = ar_lanes[static_cast<size_t>(lane_index)];
         lane.pending = sample_graph_row(
             lane.slot, lane_index,
-            &posterior[static_cast<size_t>(lane_index)], &logits_buf_);
+            &posterior[static_cast<size_t>(lane_index)], &logits_buf_,
+            &lane.logprobs);
         if (lane.pending < 0) {
             result.error = "compact AR sampling failed";
             return result;
@@ -1478,8 +1553,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
                 proposal.tokens.begin() + 1,
                 proposal.tokens.begin() + proposal.accepted);
         } else {
-            output.token =
-                ar_lanes[static_cast<size_t>(ar_for_input[i])].pending;
+            ArLane & lane = ar_lanes[static_cast<size_t>(ar_for_input[i])];
+            output.token = lane.pending;
+            output.logprobs = std::move(lane.logprobs);
         }
         result.decode.push_back(std::move(output));
     }
@@ -1679,6 +1755,27 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                        : std::max(1, n_commits))
         : 0;
 
+    // Residual-stream readouts for hidden-states slots in this step, with
+    // the (prefill index, layer entry) each one feeds.
+    std::vector<QwenHiddenCapture> hidden_captures;
+    std::vector<std::pair<size_t, size_t>> hidden_owners;
+    {
+        int row = 0;
+        for (size_t i = 0; i < prefills.size(); ++i) {
+            const int slot = plan.prefills[i].slot;
+            if (hidden_slot(slot)) {
+                const HiddenStatesSpec & spec =
+                    slot_hidden_[static_cast<size_t>(slot)]->spec();
+                for (size_t k = 0; k < spec.layers.size(); ++k) {
+                    hidden_captures.push_back(
+                        {spec.layers[k], row, prefills[i].chunk, spec.mean});
+                    hidden_owners.emplace_back(i, k);
+                }
+            }
+            row += prefills[i].chunk;
+        }
+    }
+
     bool built = false;
     if (with_prefill) {
         built = build_target_step(
@@ -1697,7 +1794,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             /*paged_max_kv_len=*/max_kv_len,
             /*n_prefill_tokens=*/n_prefill,
             segments.data(), (int)segments.size(), gather_rows,
-            /*compact_slots=*/with_decode);
+            /*compact_slots=*/with_decode,
+            hidden_captures.data(), (int)hidden_captures.size());
     } else {
         built = build_target_step(
             sg, w, b_.cache_, b_.target_backend_,
@@ -1899,13 +1997,36 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         ggml_backend_synchronize(b_.target_backend_);
     }
 
+    if (!hidden_captures.empty()) {
+        std::vector<float> last((size_t)hidden), sum((size_t)hidden);
+        for (size_t c = 0; c < hidden_captures.size(); ++c) {
+            const auto [i, k] = hidden_owners[c];
+            ggml_backend_tensor_get(sg.hidden_last[c], last.data(), 0,
+                                    sizeof(float) * last.size());
+            const bool has_sum = sg.hidden_sum[c] != nullptr;
+            if (has_sum) {
+                ggml_backend_tensor_get(sg.hidden_sum[c], sum.data(), 0,
+                                        sizeof(float) * sum.size());
+            }
+            slot_hidden_[static_cast<size_t>(plan.prefills[i].slot)]->record(
+                k, last.data(), has_sum ? sum.data() : nullptr);
+        }
+        for (size_t i = 0; i < prefills.size(); ++i) {
+            const int slot = plan.prefills[i].slot;
+            if (hidden_slot(slot)) {
+                slot_hidden_[static_cast<size_t>(slot)]->add_rows(prefills[i].chunk);
+            }
+        }
+    }
+
     for (size_t oi = 0; oi < inputs.size(); ++oi) {
         DecodeOutput & out = decode_outputs[oi];
         if (out.failed) continue;
         slots_.commit_step(out.slot);
         const int row = decode_row0 + output_rows_[oi];
         out.token = sample_graph_row(
-            out.slot, row, &argmax_buf_[(size_t)row], &logits_buf_);
+            out.slot, row, &argmax_buf_[(size_t)row], &logits_buf_,
+            &out.logprobs);
     }
 
     int commit_row = 0;
@@ -1923,9 +2044,13 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             out.status = PrefillOutput::Status::completed;
             out.token = sample_graph_row(
                 slot, commit_row, &argmax_buf_[(size_t)commit_row],
-                &logits_buf_);
+                &logits_buf_, &out.logprobs);
             ++commit_row;
             slots_.commit_prefill(slot);
+            if (hidden_slot(slot)) {
+                out.hidden_states =
+                    slot_hidden_[static_cast<size_t>(slot)]->finish();
+            }
         }
         prefill_outputs.push_back(std::move(out));
     }
@@ -1978,6 +2103,8 @@ bool Qwen35SeqEngine::evict_kv(int slot, int32_t pending_token,
 void Qwen35SeqEngine::retire(int slot) {
     offload_.discard(slot);
     clear_slot_images(slot);
+    clear_slot_hidden(slot);
+    slot_logits_row_[static_cast<size_t>(slot)] = -1;
     if (!slots_.is_active(slot)) return;
     reset_slot_draft_kv(slot);
     slots_.retire(slot);

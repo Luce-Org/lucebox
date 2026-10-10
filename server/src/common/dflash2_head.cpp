@@ -69,6 +69,10 @@ uint64_t dflash2_selector_graph_generation() {
     return s_selector_generation.load(std::memory_order_relaxed);
 }
 
+void dflash2_selector_release_thread_graph() {
+    selector_graph_free(selector_graph());
+}
+
 bool dflash2_score_candidates(const DraftWeights & dw,
                               ggml_backend_t backend,
                               DFlashTarget & target,

@@ -13,6 +13,10 @@ namespace luce::common {
 
 namespace {
 
+// Worker-local graph arenas of the head paths below; released by
+// dspark_head_release_thread_scratch().
+thread_local ggml_gallocr_t g_dspark_step_alloc = nullptr;
+
 bool dspark_step(const DraftWeights & dw,
                  ggml_backend_t backend,
                  int32_t prev_token,
@@ -76,7 +80,7 @@ bool dspark_step(const DraftWeights & dw,
         ggml_build_forward_expand(gf, conf);
     }
 
-    static thread_local ggml_gallocr_t galloc = nullptr;
+    ggml_gallocr_t & galloc = g_dspark_step_alloc;
     if (!galloc) {
         galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
@@ -246,6 +250,9 @@ struct MarkovChainGraphCache {
     }
 };
 
+thread_local MarkovChainGraphCache g_dspark_chain_cache;
+thread_local ggml_gallocr_t g_dspark_topk_alloc = nullptr;
+
 bool dspark_chain_graph_cache_disabled() {
     static const bool disabled = [] {
         const char * value = std::getenv("LUCE_DSPARK_NO_CHAIN_GRAPH_CACHE");
@@ -408,7 +415,7 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
     const int hdim   = dw.n_embd;
     const int n_cand = q_len - 1;
 
-    static thread_local MarkovChainGraphCache cache;
+    MarkovChainGraphCache & cache = g_dspark_chain_cache;
     const bool want_confidence = confidence_out != nullptr;
     const bool want_logit_margin = logit_margin_out != nullptr;
     if (confidence_out) confidence_out->clear();
@@ -532,7 +539,7 @@ bool dspark_markov_project_topk(const DraftWeights & dw,
         return false;
     }
 
-    static thread_local ggml_gallocr_t galloc_topk = nullptr;
+    ggml_gallocr_t & galloc_topk = g_dspark_topk_alloc;
     if (!galloc_topk) {
         galloc_topk = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
@@ -573,6 +580,19 @@ bool dspark_markov_project_topk(const DraftWeights & dw,
 
     ggml_free(g.ctx);
     return true;
+}
+
+void dspark_head_release_thread_scratch() {
+    for (ggml_gallocr_t * alloc : {&g_dspark_step_alloc, &g_dspark_topk_alloc}) {
+        if (*alloc) {
+            ggml_gallocr_free(*alloc);
+            *alloc = nullptr;
+        }
+    }
+    MarkovChainGraphCache & cache = g_dspark_chain_cache;
+    cache.invalidate();
+    if (cache.allocator) ggml_gallocr_free(cache.allocator);
+    cache = MarkovChainGraphCache{};
 }
 
 }  // namespace luce::common

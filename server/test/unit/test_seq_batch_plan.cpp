@@ -146,8 +146,10 @@ int main() {
     // A selected prefill may terminate with a per-request error; the
     // scheduler retires only that slot.
     SeqEngine::StepResult prefill_failure = good;
-    prefill_failure.prefills[0] = {
-        1, SeqEngine::PrefillOutput::Status::failed, -1, "prefill failed"};
+    prefill_failure.prefills[0] = {};
+    prefill_failure.prefills[0].slot = 1;
+    prefill_failure.prefills[0].status = SeqEngine::PrefillOutput::Status::failed;
+    prefill_failure.prefills[0].error = "prefill failed";
     CHECK(validate_step_result(work, prefill_failure, 2).empty());
 
     SeqEngine::StepResult bad_row_failure = prefill_failure;
