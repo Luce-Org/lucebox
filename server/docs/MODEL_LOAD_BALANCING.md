@@ -7,9 +7,11 @@ them. If all eligible models are busy, requests enter a bounded waiting queue.
 
 Model placement, primary GPU selection and enabling load balancing are separate
 settings. For example, Qwen can stay on R9700 and DeepSeek4 on Strix Halo while
-either GPU is selected as primary. Every generation request follows this
-capacity-based policy, regardless of the request's `model` field. The response
-identifies the model that actually generated the answer.
+either GPU is selected as primary. By default every generation request follows
+this capacity-based policy, regardless of the request's `model` field;
+`--model-routing name` instead pins a request that names a model to that model
+(see [Name routing](#name-routing)). The response identifies the model that
+actually generated the answer.
 
 Each model keeps its own tokenizer, defaults, backend and scheduler. Clients
 use the existing Chat Completions, Messages and Responses endpoints.
@@ -64,11 +66,187 @@ limit or a promise that every sequence will fit in the KV pool.
 {"model":"auto","messages":[{"role":"user","content":"Write a Python parser."}],"max_tokens":512,"stream":true}
 ```
 
+## Name routing
+
+`--model-routing name` hosts several different models behind one listener and
+lets the client choose among them, like separate servers would, but in one
+process. It loads every model block (it implies `--load-balancing`, with the
+same per-block rules below) and applies one rule per request:
+
+| Request `model` | Generation | `count_tokens` | `/v1/hidden_states` |
+| --- | --- | --- | --- |
+| a block's `--model-name` | that block only; waits for its capacity | that block | that block only; waits for its capacity |
+| omitted, empty or `auto` | balanced as below (primary first) | 400 | 400 |
+| anything else | 404 listing the loaded names | 404 | 404, even with `--unknown-model primary` |
+
+`/v1/hidden_states` pins by name under either `--model-routing` mode:
+activations only mean something for the model that produced them.
+
+A pinned request never spills onto another model: when its block is full it
+waits in the shared routing queue (`--routing-queue-limit`) until that block
+has capacity, the client disconnects or the server stops. A request that can
+never fit that block's context or KV pool gets 400 without waiting.
+`--unknown-model primary` serves unrecognized names on the primary instead of
+answering 404 (the default is `reject`). The option is accepted only with
+`--model-routing name`. `/status/json` and `/props` report
+`routing: "by-name"`; the per-model `models[].{id, capacity, in_flight}` entries
+are unchanged, so a client can read each model's load by its name.
+
+Example: three models in one process, two of them sharing the R9700:
+
+```bash
+luce_server --model-routing name ~/models/Qwen3.8-27B-UD-IQ4_XS.gguf \
+  --host 127.0.0.1 --port 8080 --routing-queue-limit 64 --model-name qwen3.8-27b \
+    --target-device hip:0 \
+    --draft ~/models/qwen38-dflash2-q8_0.gguf --draft-device hip:0 --draft-block-size 16 \
+    --cache-type-k q8_0 --cache-type-v q8_0 \
+    --max-concurrency 4 --kv-pool-tokens 131072 --max-ctx 65536 --max-tokens 32768 \
+  --model ~/models/Qwen3.5-0.8B-Q8_0.gguf --model-name qwen3.5-0.8b \
+    --target-device hip:0 \
+    --max-concurrency 4 --kv-pool-tokens 131072 --max-ctx 32768 \
+  --model ~/models/Qwen3.5-2B-Q8_0.gguf --model-name qwen3.5-2b \
+    --target-device hip:1 \
+    --max-concurrency 4 --kv-pool-tokens 262144 --max-ctx 122880
+```
+
+Two blocks share the R9700 here. Give every block on a shared GPU an explicit
+`--kv-pool-tokens`: without it Qwen sizes its pool from the memory free when
+that block loads, starving the blocks loaded after it.
+
+Per-block options include placement (`--target-device`, `--draft`,
+`--draft-device`, `--draft-block-size`), capacity (`--max-concurrency`,
+`--kv-pool-tokens`, `--max-ctx`), output defaults (`--max-tokens`,
+`--default-max-tokens` and the thinking budgets), Qwen's `--cache-type-k/v`,
+prefix-cache sizes and `--admission-coalesce-ms`. Process-wide: the listener
+(`--host`, `--port`, `--no-cors`, `--routing-queue-limit`, first block only),
+`--model-routing`, `--unknown-model`, environment variables, and GPU graph
+capture (next section). Each batched block also keeps its own copied prefix
+checkpoints, bounded by 4 GiB of host RAM per block.
+
+Request features are checked by the block that serves the request, after
+routing: for example `logprobs` is accepted when the named block's backend
+reports per-token log-probabilities, independently of the primary.
+
+## Swap residency
+
+`--swap-residency` (with `--model-routing name`) serves models that do not fit
+on their GPUs together. Models whose device sets overlap are never resident at
+the same time; a request that names an evicted model swaps it in:
+
+1. the resident models that share a device with it stop admitting and drain
+   (requests that were already waiting for them are served first);
+2. each of them is evicted on its worker: every device allocation it owns is
+   released (weights, draft, KV and recurrent caches, graphs, scratch, backend
+   context and pools), while its host-RAM prefix snapshots stay;
+3. the requested model is reinstated with exactly the device layout it had at
+   load (same context, KV types and pool sizes), so its prefix snapshots
+   restore as before.
+
+The first model block starts resident. A later block whose devices overlap a
+resident one loads on its own and is evicted cold before any resident block
+loads, so the models never need to fit together; a block on devices of its
+own stays resident. Keep-weights applies to runtime swaps. Every block needs an explicit `--target-device`, and `--draft-device` when it has a draft. Requests that omit
+the model or ask for `auto` only use resident models and never trigger a swap;
+when no model is resident and no swap is running they get 503. A failed
+reinstatement reinstates the models evicted for it, answers its waiters 503
+and is not retried for 30 s. Only one swap runs at a time.
+
+`--swap-keep-weights <name,...>` evicts the listed models warm: their weights
+stay in device memory and only the KV cache, graphs and backend context are
+released, so swapping them back in takes milliseconds instead of a weight
+upload. If the model being swapped in then does not fit, the kept weights are
+dropped and the reinstatement retried. Warm eviction applies only between
+single-device models. List the main model, not occasional ones: kept weights
+shrink the room every other model has.
+
+```bash
+luce_server --model-routing name --swap-residency --swap-keep-weights qwen3.8-27b \
+  ~/models/Qwen3.8-27B-UD-IQ4_XS.gguf --model-name qwen3.8-27b \
+    --target-device hip:0 \
+    --draft ~/models/qwen38-dflash2-q8_0.gguf --draft-device hip:0 \
+    --max-ctx 65536 \
+  --model ~/models/Qwen3.5-9B-Q4_K_M.gguf --model-name qwen3.5-9b \
+    --target-device hip:0 \
+    --draft ~/models/qwen35-9b-dflash-q8_0.gguf --draft-device hip:0 \
+    --max-ctx 65536
+```
+
+`Qwen3.5-9B-Q4_K_M.gguf` is from `unsloth/Qwen3.5-9B-GGUF`; the 9B drafter is
+`z-lab/Qwen3.5-9B-DFlash` converted to a Q8_0 GGUF.
+
+Measured on one R9700 (PCIe Gen3 x4) with these two models: a cold
+reinstatement takes 5.1 s for the 27B and 2.1-2.35 s for the 9B, a warm one
+5-9 ms. A 52.7k-token session that comes back after a swap restores its prefix
+snapshot in 2.5 s instead of about 80 s of cold prefill, with greedy output
+identical to a run without the swap.
+
+`/status/json` reports each model's `residency` (`resident`, `evicted` or
+`failed`), `devices`, `weights_resident`, `weight_device_bytes`, `draining`,
+`waiting_for_residency`, `swaps_in`, `last_evict_ms`, `last_reinstate_ms` and
+`last_residency_error`, plus process-wide `swap_residency` and `swap_active`.
+
+Eviction is implemented for the single-device qwen35 backend on the serial
+worker (no `--max-concurrency` > 1, paged attention, KVFlash, tensor
+parallelism or vision, and the draft on the target device); a model whose
+backend cannot be evicted makes `--swap-residency` refuse to start.
+
+DeepSeek V4 with `--expert-device` is evicted partially: only its primary
+device is released, and its secondary expert tier, streamed expert cache and
+host snapshots stay, so swapping it back rereads the primary weights only.
+`/status/json` lists the kept devices as `retained_devices`; another model
+that needs one of them evicts DeepSeek V4 cold first. One model block may set
+`--expert-device` and `--peer-access` (both change process-wide state); a
+DeepSeek V4 block without `--expert-device` is refused while `LUCE_DS4_MOE_TP`
+is set, since it would inherit that expert device. Launch
+profiles that set environment variables are refused with several models, so
+set that environment for the process. For Qwen 3.8 27B on the R9700 beside
+DeepSeek V4.1 with its expert tier on Strix Halo:
+
+```bash
+# ds41-lucebox environment, process-wide (see launch_profiles.h)
+export LUCE_EXPERT_BUDGET_MB=10500 LUCE_DS4_FUSED_VERIFY=1 ROCBLAS_USE_HIPBLASLT=0 # ...
+luce_server --model-routing name --swap-residency \
+  ~/models/Qwen3.8-27B-UD-IQ4_XS.gguf --model-name q27 --target-device hip:0 \
+    --draft ~/models/Qwen3.8-27B-DFlash2-Q8_0.gguf --draft-device hip:0 --max-ctx 65536 \
+  --model ~/models/ds41-lucebox-final.gguf --model-name ds41 \
+    --draft ~/models/DeepSeek-V4.1-Flash-DSpark-draft-Q2K-Q4K.gguf --draft-device hip:0 \
+    --target-device hip:0 --expert-device hip:1 --peer-access --max-ctx 131072 \
+    --chunk 4096 --ds4-prefill dense \
+    --ds4-expert-placement share/deepseek41/placement_lucebox.json \
+    --ds4-router-bias share/deepseek41/router_bias_lucebox_40x384_f32.bin \
+    --ds4-protected-experts share/deepseek41/massive_experts.json
+```
+
+DeepSeek V4.1 starts partially evicted with its Strix Halo tier loaded (run
+it with unlimited locked memory). Swapping it in takes 9-14 s, swapping the
+27B back 7.6-8.4 s, and evicting either takes milliseconds.
+
+## GPU graphs with several models
+
+A process that loads more than one model disables HIP/CUDA graph capture
+(`GGML_CUDA_DISABLE_GRAPHS=1`) unless `LUCE_MULTI_MODEL_GRAPHS=1` is set. Each
+model captures from its own worker thread with relaxed capture mode, and a
+blocking runtime call from another worker (the `cudaStreamPerThread`
+copy-and-synchronize in ggml's tensor get/set, prefix-checkpoint copies)
+invalidates a capture in flight; the capturing worker then aborts. PR #770
+moved the helper copies and replay-log commits off the legacy stream, but still
+measured about two failed runs in three with the two models on different GPUs
+(R9700 and Strix Halo). So separate devices or separate graph caches do not
+make capture safe, and a per-model or per-device relaxation (possible
+mechanically through `GGML_CUDA_DISABLE_GRAPHS_DEVICES` or the per-thread
+override) would still expose the capturing model to the other workers' blocking
+calls. A safe relaxation needs the capture window to exclude other workers'
+blocking calls, which does not exist yet. On the balanced two-27B aggregate
+eager launches cost nothing measurable; small, launch-bound models such as a
+0.8B/2B lose more, which is unmeasured here. `LUCE_MULTI_MODEL_GRAPHS=1`
+remains an at-your-own-risk experiment.
+
 ## How requests are balanced
 
 - Every generation request follows operator-configured priority. An omitted,
   empty, `auto`, explicit model name, or other client alias has the same
-  load-balancing behavior. There is no model pinning. With balancing enabled, requests try the
+  load-balancing behavior. There is no model pinning unless
+  `--model-routing name` is set. With balancing enabled, requests try the
   primary and then the remaining models; without it, only the primary serves.
   This is preference with capacity fallback, not round-robin.
 - The listener reserves an available model slot. Its scheduler then calls
@@ -111,7 +289,8 @@ model identity, regardless of the client alias.
 With balancing enabled, model names must be unique, nonempty and cannot be
 `auto`. With balancing enabled, startup rejects model-block
 options that mutate shared process policy, including KVFlash, Spark, PFlash,
-remote drafts and target splitting. Environment variables remain process-wide;
+remote drafts and target splitting; `--expert-device` and `--peer-access` are
+accepted on one model block. Environment variables remain process-wide;
 this does not establish arbitrary model/environment isolation. Qwen's explicit
 KV types are stored per backend rather than in shared environment state.
 With balancing disabled, the selected primary retains single-model CLI

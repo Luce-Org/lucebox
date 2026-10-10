@@ -35,6 +35,9 @@ extern "C" {
 #define LUCE_DRAFT_LAYERS         5
 #define LUCE_DRAFT_BLOCK_SIZE     16
 #define LUCE_DRAFT_N_TARGET_LAYERS 5  // fc projects 5*hidden -> hidden
+// Capacity of the target-side capture-layer table. Drafters may capture more
+// layers than the 5-layer default (z-lab Qwen3.5-9B DFlash captures 8).
+#define LUCE_DRAFT_MAX_TARGET_LAYERS 16
 #define LUCE_DRAFT_MASK_TOKEN_ID  248070
 
 // target_layer_ids = {1, 16, 31, 46, 61}  (0-indexed into target layers)

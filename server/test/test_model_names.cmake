@@ -44,3 +44,26 @@ check_launch(disabled_second_policy 1 "failed to detect architecture from ${seco
 check_launch(balanced_policy_rejected 2 "changes process-wide policy"
     "${primary}" --model-name qwen --no-fast-rollback
     --model "${secondary}" --model-name ds4 --load-balancing)
+# One block may own the expert device and the peer-access opt-in.
+check_launch(balanced_expert_owner 1 "failed to detect architecture from ${primary}"
+    "${primary}" --model-name qwen
+    --model "${secondary}" --model-name ds4 --expert-device ${BACKEND}:1 --peer-access --load-balancing)
+check_launch(balanced_expert_owners_rejected 2 "only one model block may set them"
+    "${primary}" --model-name qwen --peer-access
+    --model "${secondary}" --model-name ds4 --expert-device ${BACKEND}:1 --load-balancing)
+
+# Swap residency plans device sets before loading, so a draft needs a device.
+check_launch(swap_draft_needs_device 2 "needs an explicit --draft-device"
+    "${primary}" --model-name qwen --target-device ${BACKEND}:0
+    --model "${secondary}" --model-name ds4 --target-device ${BACKEND}:0 --draft "${secondary}"
+    --model-routing name --swap-residency)
+
+# Name routing loads every block, so it applies the balanced-mode name rules.
+check_launch(name_routing_duplicate 2 "--model-name must be unique"
+    "${primary}" --model "${secondary}" --model-routing name)
+check_launch(name_routing_unique 1 "failed to detect architecture from ${primary}"
+    "${primary}" --model-name qwen --model "${secondary}" --model-name ds4
+    --model-routing name --unknown-model primary)
+check_launch(unknown_model_needs_name_routing 2 "--unknown-model requires --model-routing name"
+    "${primary}" --model-name qwen --model "${secondary}" --model-name ds4
+    --load-balancing --unknown-model primary)

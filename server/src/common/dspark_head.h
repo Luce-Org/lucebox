@@ -17,6 +17,11 @@ uint64_t dspark_drafter_generation();
 // Number of fused chain graphs built so far (diagnostic; lets tests assert a
 // cache hit or miss without reaching into the cache).
 uint64_t dspark_chain_graph_build_count();
+// Frees the calling thread's head graph arenas (step, fused chain and top-k
+// paths), which hold device memory on the backend they last ran on. Call on
+// the worker that ran the head, after its device work is synchronized, when
+// that device's memory must be returned (eviction).
+void dspark_head_release_thread_scratch();
 
 bool dspark_markov_correct_greedy_chain(const DraftWeights & dw,
                                         ggml_backend_t backend,

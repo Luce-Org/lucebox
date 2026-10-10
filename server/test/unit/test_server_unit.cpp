@@ -8011,6 +8011,7 @@ public:
         result.slot = chosen;
 
         if (plan.restore.valid()) {
+            restores.push_back(plan.restore);
             result.prefix_store.restore_attempted = true;
             result.prefix_store.restore_elapsed_us = 2500;
             if (unrequested_restore.load(std::memory_order_relaxed)) {
@@ -8055,6 +8056,7 @@ public:
             output.slot = slice.slot;
             output.status = PrefillOutput::Status::completed;
             output.token = 2;
+            if (slot.hidden) output.hidden_states = HiddenStates{};
             if (slot.capture.valid()) {
                 output.prefix_store.status = PrefixStoreEvent::Status::saved;
                 output.prefix_store.ticket = slot.capture;
@@ -8063,6 +8065,23 @@ public:
                 slot.capture = {};
             }
             result.prefills.push_back(std::move(output));
+        }
+        return result;
+    }
+
+    bool supports_hidden_states() const override { return true; }
+    AdmitResult admit_hidden_states(
+            uint64_t request_id,
+            const std::vector<int32_t> & prompt,
+            const HiddenStatesSpec &,
+            PrefixCaptureTicket capture) override {
+        hidden_captures.push_back(capture);
+        PrefixStorePlan plan;
+        plan.capture = capture;
+        AdmitResult result =
+            admit_with_prefix(request_id, prompt, SamplerCfg{}, plan);
+        if (result.status == AdmitResult::Status::admitted) {
+            slots_[(size_t)result.slot].hidden = true;
         }
         return result;
     }
@@ -8077,6 +8096,9 @@ public:
         discarded.push_back(checkpoint);
     }
 
+    // Admission inputs as the scheduler planned them.
+    std::vector<PrefixCaptureTicket> hidden_captures;
+    std::vector<PrefixStoreRef> restores;
     bool saw_capture = false;
     bool saw_stale_restore = false;
     std::atomic<bool> defer_restore{false};
@@ -8089,6 +8111,7 @@ private:
     struct Slot {
         bool active = false;
         bool prefilling = false;
+        bool hidden = false;
         PrefixCaptureTicket capture;
     };
     std::vector<Slot> slots_;
@@ -8173,6 +8196,122 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(stats.restore_attempts == 1);
     TEST_ASSERT(stats.restore_invalidations == 0);
     TEST_ASSERT(stats.restore_stall_us_total == 2500);
+}
+
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_hidden_states_cache_prefix_feeds_next_chat) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<SchedulerPrefixBackend>();
+    SchedulerPrefixBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 2;
+    config.concurrent_prefix_cache_max_bytes = 1024;
+    config.concurrent_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+
+    // A "bare" readout ends at the assistant header; the chat request
+    // that follows appends the template's think block.
+    const std::vector<int32_t> bare = {1, 100, 3, 101, 4};
+    const std::vector<int32_t> chat = {1, 100, 3, 101, 4, 0, 0};
+
+    int plain_sockets[2] = {-1, -1};
+    int hidden_sockets[2] = {-1, -1};
+    int chat_sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, plain_sockets) == 0);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, hidden_sockets) == 0);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, chat_sockets) == 0);
+
+    const auto hidden_job = [&](ServerJob & job, int fd, bool cache_prefix,
+                                const char * id) {
+        job.fd = fd;
+        job.req.format = ApiFormat::OPENAI_CHAT;
+        job.req.prompt_tokens = bare;
+        job.req.stream = false;
+        job.req.model = "scheduler-test";
+        job.req.response_id = id;
+        HiddenStatesRequest hidden;
+        hidden.layers = {0};
+        hidden.cache_prefix = cache_prefix;
+        job.req.hidden_states = hidden;
+        job.req.hidden_spec.layers = {0};
+    };
+    ServerJob plain_job;
+    hidden_job(plain_job, plain_sockets[0], false, "plain-readout");
+    ServerJob cached_job;
+    hidden_job(cached_job, hidden_sockets[0], true, "cached-readout");
+    ServerJob chat_job;
+    chat_job.fd = chat_sockets[0];
+    chat_job.req.format = ApiFormat::OPENAI_CHAT;
+    chat_job.req.prompt_tokens = chat;
+    chat_job.req.max_output = 1;
+    chat_job.req.stream = false;
+    chat_job.req.model = "scheduler-test";
+    chat_job.req.response_id = "chat";
+
+    std::thread scheduler([&] {
+        SchedulerTestHarness::run(server, backend.engine);
+    });
+    const auto run_job = [&](ServerJob & job) {
+        SchedulerTestHarness::enqueue(server, &job);
+        std::unique_lock<std::mutex> lock(job.mu);
+        return job.cv.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return job.done; });
+    };
+    const bool plain_done = run_job(plain_job);
+    const auto after_plain = cache.lookup_candidate(chat, (int)chat.size() - 1);
+    const bool cached_done = run_job(cached_job);
+    const auto after_cached = cache.lookup_candidate(chat, (int)chat.size() - 1);
+    const bool chat_done = run_job(chat_job);
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+
+    const auto read_body = [](int fd) {
+        std::string body;
+        char buf[4096];
+        ssize_t n;
+        while ((n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT)) > 0) {
+            body.append(buf, (size_t)n);
+        }
+        const size_t at = body.find("\r\n\r\n");
+        return at == std::string::npos ? json()
+            : json::parse(body.substr(at + 4), nullptr, false);
+    };
+    const json plain_body = read_body(plain_sockets[1]);
+    const json cached_body = read_body(hidden_sockets[1]);
+    for (int fd : {plain_sockets[0], plain_sockets[1], hidden_sockets[0],
+                   hidden_sockets[1], chat_sockets[0], chat_sockets[1]}) {
+        close(fd);
+    }
+    unlink(path.c_str());
+
+    TEST_ASSERT(plain_done && cached_done && chat_done);
+    // Default readouts leave nothing behind and say nothing about caching.
+    TEST_ASSERT(backend.engine.hidden_captures.size() == 2);
+    TEST_ASSERT(!backend.engine.hidden_captures[0].valid());
+    TEST_ASSERT(after_plain.first == -1);
+    TEST_ASSERT(plain_body.is_object() && !plain_body.contains("cache_prefix"));
+    // cache_prefix captures the whole readout prompt...
+    TEST_ASSERT(backend.engine.hidden_captures[1].valid());
+    TEST_ASSERT(backend.engine.hidden_captures[1].checkpoint.tokens ==
+                (int)bare.size());
+    TEST_ASSERT(after_cached.first >= 0);
+    TEST_ASSERT(after_cached.second == (int)bare.size());
+    TEST_ASSERT(cached_body.is_object());
+    TEST_ASSERT(cached_body["cache_prefix"]["cached_tokens"] ==
+                (int)bare.size());
+    // ...and the chat request extending it restores that checkpoint. The
+    // readouts themselves never restored anything.
+    TEST_ASSERT(backend.engine.restores ==
+                std::vector<PrefixStoreRef>({{
+                    (uint64_t)after_cached.first + 1, (int)bare.size()}}));
 }
 
 TEST_CASE(ServerUnitFixture,

@@ -73,6 +73,42 @@ bool deepseek4_mix_mmq_prefill_default(
 ggml_mixed_mmq_policy deepseek4_mix_mmq_prefill_policy(
     PrefillAttentionMode mode, const char * gcn_arch, const char * explicit_value);
 
+// MoE expert parallelism requested through LUCE_DS4_MOE_TP* (server_main's
+// --expert-device writes them).
+struct Ds4MoeTpConfig {
+    bool requested = false;
+    bool in_process = false;
+    bool backend_valid = true;
+    PlacementBackend secondary_backend = PlacementBackend::Auto;
+    int secondary_gpu = 0;
+    bool all_on_secondary = false;
+    bool concentrate_secondary = false;
+    bool profile_hot_on_secondary = false;
+};
+
+// What a DeepSeek4Backend reads from the process environment, resolved once
+// when init() starts. Everything after that, a reinstatement included, uses
+// these values: the environment can change under a long-lived server (the
+// launch profile and --expert-device write it), and a model that comes back
+// must come back with the devices and modes it was loaded with.
+struct DeepSeek4ResolvedSettings {
+    Ds4MoeTpConfig tp;
+    bool force_full_load = false;   // LUCE_DS4_FORCE_FULL_LOAD
+    bool dense_tp_mask = false;     // LUCE_DS4_DENSE_TP_MASK
+    bool fused_decode_env = false;  // LUCE_DS4_FUSED_DECODE
+    bool decode_all_cold = false;   // LUCE_DS4_DECODE_ALL_COLD
+    // DSpark: --draft, or LUCE_DS4_SPEC with LUCE_DS4_DRAFT.
+    bool spec_requested = false;
+    std::string spec_env_draft_path;
+    // DSpark placement: an explicit --draft-device, else LUCE_DS4_DRAFT_GPU /
+    // LUCE_DS4_DRAFT_BACKEND, else the target.
+    bool draft_backend_valid = true;
+    PlacementBackend draft_backend = PlacementBackend::Auto;
+    int draft_gpu = 0;
+    bool draft_separate_stream = false;  // LUCE_DS4_DRAFT_SEPARATE_STREAM
+    bool draft_low_priority = false;     // LUCE_DS4_DRAFT_LOW_PRIORITY
+};
+
 class DeepSeek4Backend : public ModelBackend {
 public:
     explicit DeepSeek4Backend(DeepSeek4BackendConfig cfg);
@@ -97,6 +133,38 @@ public:
     bool park(ParkTarget target) override;
     bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return parked_; }
+
+    // Eviction (runtime model swapping). Supported for the classic serial
+    // worker with in-process experts on two GPUs of one runtime (the
+    // ds41-lucebox profile); supports_eviction() names what else refuses.
+    //   partial: release the primary device (dense weights, primary expert
+    //            stacks, KV cache, draft, graphs, scratch, backend context);
+    //            keep the secondary expert stack, the streamed expert cache
+    //            (suspended) and the locked host tier.
+    //   cold:    release both devices.
+    //   warm:    refused (DS4 keeps no weights warm).
+    // Host prefix snapshots survive both and restore after reinstate().
+    // partial -> cold releases the retained tier; cold -> partial and a
+    // repeated level do nothing.
+    bool supports_eviction(std::string & reason) const override;
+    EvictResult evict(EvictLevel level = EvictLevel::cold) override;
+    bool reinstate(std::string & error) override;
+    bool is_evicted() const override { return residency_ != Residency::resident; }
+    // Partially evicted, the secondary expert stack is still on its device.
+    bool weights_resident() const override { return residency_ != Residency::fully_evicted; }
+    size_t weight_device_bytes() const override;
+
+    // Where the expert tiers stand, for logs and the eviction tests.
+    struct ExpertTierReport {
+        bool partially_evicted = false;
+        uint64_t primary_upload_bytes = 0;    // into the primary stacks, since load
+        uint64_t secondary_upload_bytes = 0;  // into the secondary stack, since load
+        const void * storage = nullptr;       // identity of the expert storage
+        const void * secondary_base = nullptr; // first secondary stack buffer
+        int stream_cache_slots = 0;
+        bool stream_cache_suspended = false;
+    };
+    ExpertTierReport expert_tier_report() const;
 
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
@@ -135,6 +203,7 @@ public:
 
 private:
     DeepSeek4BackendConfig cfg_;
+    DeepSeek4ResolvedSettings settings_;
     ggml_backend_t         backend_      = nullptr;
     ggml_backend_t         snap_backend_ = nullptr;
     ggml_backend_t         expert_backend_ = nullptr;
@@ -184,7 +253,6 @@ private:
 
     // DSpark speculative decode (opt-in: --draft <gguf>, or
     // LUCE_DS4_SPEC=1 + LUCE_DS4_DRAFT=<gguf>).
-    bool                           spec_requested_ = false;
     bool                           spec_enabled_ = false;
     bool                           spec_drafter_parked_ = false;
     // LUCE_DS4_DRAFT_SWAP: a pinned host mirror of the drafter's core
@@ -341,6 +409,31 @@ private:
                    const DaemonIO & io,
                    ThinkingBudget & budget);
 
+    enum class Residency { resident, partially_evicted, fully_evicted };
+    Residency residency_ = Residency::resident;
+    // DSpark was loaded when the model was evicted: reinstate() reloads it.
+    bool reload_drafter_on_reinstate_ = false;
+    // The placement init() resolved, kept so a reinstatement never places the
+    // experts again (a placement recomputed from the free memory of the
+    // moment would move rows under the retained secondary stack and cache).
+    struct FrozenPlacement {
+        bool valid = false;                   // captured at the end of init()
+        MoeHybridPlacement placement;
+        MoeHybridPlacement decode_placement;
+        std::vector<std::vector<int32_t>> cold_expert_ids;  // explicit secondary set
+        uint64_t spill_carve_reserve = 0;     // secondary host spill, when set
+        uint64_t spill_host_want = 0;
+        size_t stream_expert_bytes = 0;       // fallback stream engine scratch
+        MoeHybridOwnershipRecord ownership;
+        std::vector<float> selection_bias_host;  // after the routing adjustments
+    };
+    FrozenPlacement frozen_;
+    // Eviction steps; each runs on the worker and tolerates partly built state.
+    void release_primary_state();
+    void release_secondary_state();
+    bool reinstate_primary(std::string & error);
+    bool reinstate_full(std::string & error);
+    bool verify_frozen_state(std::string & error) const;
     bool load_model();
     bool init_hybrid_model();
     bool init_streamed_expert_tier();
@@ -351,6 +444,16 @@ private:
     bool validate_prefill_mode() const;
     bool validate_model_features() const;
     bool init_engram();
+    // --ds4-router-bias / --ds4-protected-experts as parsed from their files
+    // the first time (load_routing_adjustments), [n_layer * n_expert] each.
+    struct RoutingInputs {
+        bool parsed = false;
+        int n_layer = 0;
+        int n_expert = 0;
+        std::vector<float> router_bias_delta;
+        std::vector<uint8_t> protected_experts;
+    };
+    RoutingInputs routing_inputs_;
     bool load_routing_adjustments();
     bool apply_routing_adjustments();
     bool upload_protected_routing();

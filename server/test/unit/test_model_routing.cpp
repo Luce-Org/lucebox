@@ -97,6 +97,7 @@ public:
         for (int i = 0; i < 2; ++i) {
             if (active[i]) continue;
             active[i] = true;
+            logprobs_requested[i] = sampler.wants_logprobs();
             prompts.push_back(prompt);
             temperatures.push_back(sampler.temp);
             ++admissions;
@@ -135,12 +136,25 @@ public:
             ++steps;
             result.decode.push_back({input.slot, token, false, {}});
         }
+        for (auto & out : result.prefills) {
+            if (out.token >= 0) out.logprobs = token_logprobs(out.slot, out.token);
+        }
+        for (auto & out : result.decode) {
+            out.logprobs = token_logprobs(out.slot, out.token);
+        }
         // An unfinished fake prefill yields control to the real scheduler,
         // allowing admission and cancellation without timing-based completion.
         lock.unlock();
         std::this_thread::yield();
         return result;
     }
+    std::optional<TokenLogprobs> token_logprobs(int slot, int32_t token) override {
+        if (!logprobs_requested[slot]) return std::nullopt;
+        TokenLogprobs result;
+        result.chosen = {token, -float(token + 1)};
+        return result;
+    }
+    std::array<bool, 2> logprobs_requested{};
     void retire(int slot) override {
         std::lock_guard<std::mutex> lock(mu);
         active.at((size_t)slot) = false;
@@ -280,7 +294,9 @@ public:
 
 struct RoutedBackend : ModelBackend {
     HeldEngine engine;
+    bool logprobs = false;
     SeqEngine * seq_engine() override { return &engine; }
+    bool supports_logprobs() const override { return logprobs; }
     void print_ready_banner() const override {}
     bool park(ParkTarget) override { return true; }
     bool unpark(ParkTarget) override { return true; }
@@ -300,6 +316,38 @@ struct RoutedBackend : ModelBackend {
 // The gate models work boundaries where real backends poll DaemonIO cancellation.
 struct HeldSingleBackend final : RoutedBackend {
     SeqEngine * seq_engine() override { return nullptr; }
+    bool supports_eviction(std::string & reason) const override { reason.clear(); return true; }
+    bool is_evicted() const override { return evicted; }
+    bool weights_resident() const override { return !evicted || kept_level; }
+    EvictResult evict(EvictLevel level) override {
+        ++evict_calls;
+        EvictResult result;
+        if (reject_eviction) {
+            result.error = "injected eviction rejection";
+        } else {
+            evicted = true;
+            kept_level = level != EvictLevel::cold;
+            std::lock_guard<std::mutex> lock(mu);
+            levels.push_back(level);
+            result.status = EvictStatus::ok;
+        }
+        return result;
+    }
+    bool reinstate(std::string & error) override {
+        ++reinstate_calls;
+        if (fail_reinstate) {
+            error = "injected reinstatement failure";
+            return false;
+        }
+        evicted = false;
+        kept_level = false;
+        return true;
+    }
+    bool evicted = false;
+    bool kept_level = false;  // evicted warm or partially
+    std::vector<EvictLevel> levels;  // guarded by mu
+    std::atomic<bool> reject_eviction{false}, fail_reinstate{false};
+    std::atomic<int> evict_calls{0}, reinstate_calls{0};
     GenerateResult generate_impl(const GenerateRequest & req, const DaemonIO & io) override {
         std::unique_lock<std::mutex> lock(mu);
         ++calls;
@@ -388,6 +436,9 @@ public:
     explicit RunningModels(bool single_peer = false, bool single_listener = false,
                            bool load_balancing = true, int queue_limit = 0,
                            bool reverse_priority = false, size_t offload_bytes = 0,
+                           ServerConfig::ModelRouting routing = ServerConfig::ModelRouting::balance,
+                           bool unknown_to_primary = false, bool force_close = false,
+                           bool swap_residency = false, bool two_device_peer = false,
                            const char * first_output = "q") {
         load_tokenizer(first_tok, false, first_output);
         load_tokenizer(second_tok, true, "s");
@@ -406,8 +457,23 @@ public:
         config.model_name = "qwen";
         config.max_ctx = 64;
         config.routing_queue_limit = queue_limit;
+        config.model_routing = routing;
+        config.swap_residency = swap_residency;
+        if (swap_residency) {
+            config.target_device = "hip:0";
+            single.evicted = true;
+        }
+        // The listener keeps weights warm; the peer spans hip:0 and an
+        // expert device hip:1 that a partial eviction keeps.
+        config.swap_keep_weights = two_device_peer;
+        config.unknown_model_to_primary = unknown_to_primary;
         config.decode_kv_offload_bytes = offload_bytes;
         config.default_max_tokens = 4;
+        if (force_close) {
+            config.think_close_token_ids = {3};
+            config.think_max_tokens = 1;
+            config.hard_limit_reply_budget = 1;
+        }
         config.prefix_cache_cap = 0;
         config.ppp_enabled = false;
         config.admission_coalesce_ms = 0;
@@ -422,6 +488,11 @@ public:
         config.model_name = "ds4";
         config.chat_template_src = "y{{ messages[0]['content'] }}";
         config.sampler_defaults.temperature = 0.7f;
+        config.swap_keep_weights = false;
+        if (two_device_peer) {
+            config.residency_devices = {"hip:0", "hip:1"};
+            config.residency_secondary_devices = {"hip:1"};
+        }
         peer_engine = std::make_unique<LuceEngine>(
             single_peer ? std::move(single_owned) : std::move(second_owned));
         peer = std::make_unique<HttpServer>(*peer_engine, second_tok, config);
@@ -611,7 +682,8 @@ TEST_CASE(ModelRoutingFixture, test_responses_nonstream_preserves_prose_and_mult
         "Listing.\n<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>\n"
         "<tool_call>\n<function=read>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>";
     for (bool single : {false, true}) {
-        RunningModels models(false, single, false, 0, false, 0, generated);
+        RunningModels models(false, single, false, 0, false, 0,
+                             ServerConfig::ModelRouting::balance, false, false, false, false, generated);
         models.first.engine.finish();
         models.first_single.finish();
         const json request = json::parse(R"({
@@ -985,6 +1057,158 @@ TEST_CASE(ModelRoutingFixture, test_reversed_priority_ignores_generation_model_n
         models.second.engine.capacity_busy = true;
     }
     ROUTING_CHECK(response_body(models.post(chat("ds4")).read())["model"] == "qwen");
+}
+
+// Name routing pins a named request to its model: it waits for that model's
+// capacity instead of spilling onto an idle one, while auto still balances.
+TEST_CASE(ModelRoutingFixture, test_name_routing_pins_named_requests_without_spilling) {
+    using Routing = ServerConfig::ModelRouting;
+    RunningModels models(false, false, true, 1, false, 0, Routing::name);
+    ROUTING_CHECK(models.get("/v1/models")["data"].size() == 2);
+    ROUTING_CHECK(models.get("/status/json")["routing"] == "by-name");
+    auto a = models.post(chat("ds4"));
+    auto b = models.post(chat("ds4"));
+    models.second.engine.wait_admissions(2);
+    auto waiting = models.post(chat("ds4"));
+    const auto deadline = Clock::now() + 5s;
+    while (models.get("/status/json")["waiting"] != 1) {
+        ROUTING_CHECK(Clock::now() < deadline);
+        std::this_thread::yield();
+    }
+    ROUTING_CHECK(models.first.engine.admissions == 0);
+    const json unknown = response_body(models.post(chat("gpt-4o")).read(), 404);
+    ROUTING_CHECK(unknown["error"]["message"].get<std::string>().find(
+        "available models: qwen, ds4") != std::string::npos);
+    response_body(models.post(chat("gpt-4o"), "/v1/messages/count_tokens").read(), 404);
+    models.first.engine.finish();
+    ROUTING_CHECK(response_body(models.post(chat("auto")).read())["model"] == "qwen");
+    ROUTING_CHECK(response_body(models.post(chat("qwen")).read())["model"] == "qwen");
+    models.second.engine.finish();
+    for (Socket * client : {&a, &b, &waiting}) {
+        ROUTING_CHECK(response_body(client->read())["model"] == "ds4");
+    }
+    ROUTING_CHECK(models.second.engine.admissions == 3);
+}
+
+TEST_CASE(ModelRoutingFixture, test_name_routing_can_serve_unknown_names_on_primary) {
+    RunningModels models(false, false, true, 0, false, 0,
+                         ServerConfig::ModelRouting::name, true);
+    models.first.engine.finish();
+    models.second.engine.finish();
+    ROUTING_CHECK(response_body(models.post(chat("gpt-4o")).read())["model"] == "qwen");
+    ROUTING_CHECK(response_body(models.post(chat("gpt-4o"), "/v1/messages/count_tokens").read())["input_tokens"] == 1);
+    ROUTING_CHECK(models.second.engine.admissions == 0);
+}
+
+// Logprobs support belongs to the model that serves the request, not to the
+// listener's primary.
+TEST_CASE(ModelRoutingFixture, test_swap_failure_restores_resident_and_cools_down) {
+    for (bool reject_eviction : {false, true}) {
+        RunningModels models(true, true, true, 4, false, 0,
+                             ServerConfig::ModelRouting::name, false, false, true);
+        models.first_single.finish();
+        models.single.finish();
+        models.first_single.reject_eviction = reject_eviction;
+        models.single.fail_reinstate = !reject_eviction;
+        response_body(models.post(chat("ds4")).read(), 503);
+        // Every waiter sees the same failed target, without repeating the
+        // drain/eviction or reinstatement during its cooldown.
+        response_body(models.post(chat("ds4")).read(), 503);
+        ROUTING_CHECK(models.first_single.evict_calls == 1);
+        ROUTING_CHECK(models.single.reinstate_calls == (reject_eviction ? 0 : 1));
+        ROUTING_CHECK(models.first_single.reinstate_calls == (reject_eviction ? 0 : 1));
+        const auto status = models.get("/status/json");
+        ROUTING_CHECK(status["models"][0]["residency"] == "resident");
+        ROUTING_CHECK(status["models"][1]["residency"] == "failed");
+        ROUTING_CHECK(status["swap_active"] == false);
+        ROUTING_CHECK(response_body(models.post(chat("auto")).read())["model"] == "qwen");
+    }
+}
+
+TEST_CASE(ModelRoutingFixture, test_swap_cycles_admit_only_the_resident_model) {
+    RunningModels models(true, true, true, 4, false, 0,
+                         ServerConfig::ModelRouting::name, false, false, true);
+    models.first_single.finish();
+    models.single.finish();
+    for (const char * name : {"ds4", "qwen", "ds4"}) {
+        ROUTING_CHECK(response_body(models.post(chat(name)).read())["model"] == name);
+        ROUTING_CHECK(response_body(models.post(chat("auto")).read())["model"] == name);
+    }
+    ROUTING_CHECK(models.first_single.evict_calls == 2);
+    ROUTING_CHECK(models.single.evict_calls == 1);
+    ROUTING_CHECK(models.single.reinstate_calls == 2);
+}
+
+// An automatic request that exceeds the resident model's context never swaps,
+// so it is rejected instead of waiting for a model that will not come in.
+TEST_CASE(ModelRoutingFixture, test_swap_oversized_automatic_request_is_rejected) {
+    RunningModels models(true, true, true, 4, false, 0,
+                         ServerConfig::ModelRouting::name, false, false, true);
+    models.first_single.finish();
+    models.single.finish();
+    auto oversized = chat("auto");
+    oversized["messages"][0]["content"] = std::string(100, 'x');
+    response_body(models.post(oversized).read(), 400);
+    const auto status = models.get("/status/json");
+    ROUTING_CHECK(status["waiting"] == 0);
+    ROUTING_CHECK(status["models"][1]["residency"] == "evicted");
+}
+
+// A model with an expert device gives way to a hip:0-only model partially and
+// keeps hip:1; the model coming back over both devices never leaves the other
+// model's weights warm on hip:0, even when that model keeps weights.
+TEST_CASE(ModelRoutingFixture, test_swap_keeps_secondary_tier_and_needs_primary_whole) {
+    using Level = ModelBackend::EvictLevel;
+    RunningModels models(true, true, true, 4, false, 0,
+                         ServerConfig::ModelRouting::name, false, false, true, true);
+    models.first_single.finish();
+    models.single.finish();
+    for (const char * name : {"ds4", "qwen", "ds4", "qwen"}) {
+        ROUTING_CHECK(response_body(models.post(chat(name)).read())["model"] == name);
+    }
+    ROUTING_CHECK((models.first_single.levels == std::vector<Level>{Level::cold, Level::cold}));
+    ROUTING_CHECK((models.single.levels == std::vector<Level>{Level::partial, Level::partial}));
+    const auto status = models.get("/status/json");
+    ROUTING_CHECK(status["models"][1]["residency"] == "evicted");
+    ROUTING_CHECK(status["models"][1]["weights_resident"] == true);
+    ROUTING_CHECK((status["models"][1]["retained_devices"] == json::array({"hip:1"})));
+    ROUTING_CHECK(status["models"][0]["retained_devices"].empty());
+}
+
+TEST_CASE(ModelRoutingFixture, test_logprobs_follow_budget_substituted_tokens) {
+    RunningModels models(false, false, true, 0, false, 0,
+                         ServerConfig::ModelRouting::name, false, true);
+    models.first.logprobs = true;
+    models.first.engine.finish();
+    auto request = chat("qwen");
+    request["logprobs"] = true;
+    request["max_tokens"] = 2;
+    request["thinking"] = {{"type", "enabled"}, {"budget_tokens", 1}};
+    const json body = response_body(models.post(request).read());
+    const auto & content = body["choices"][0]["logprobs"]["content"];
+    ROUTING_CHECK(content.size() == 2);
+    ROUTING_CHECK(content[1]["token"] == "y");
+    ROUTING_CHECK(content[1]["logprob"] == -4.0f);
+}
+
+TEST_CASE(ModelRoutingFixture, test_logprobs_support_is_decided_by_the_routed_model) {
+    RunningModels models(false, false, true, 0, false, 0, ServerConfig::ModelRouting::name);
+    models.second.logprobs = true;
+    models.first.engine.finish();
+    models.second.engine.finish();
+    auto request = chat("ds4");
+    request["logprobs"] = true;
+    request["top_logprobs"] = 2;
+    const json served = response_body(models.post(request).read());
+    ROUTING_CHECK(served["model"] == "ds4");
+    ROUTING_CHECK(served["choices"][0].contains("logprobs"));
+    // A backend without logprobs serves the request without them, as
+    // before logprobs existed.
+    request["model"] = "qwen";
+    const json plain = response_body(models.post(request).read());
+    ROUTING_CHECK(plain["model"] == "qwen");
+    ROUTING_CHECK(!plain["choices"][0].contains("logprobs"));
+    ROUTING_CHECK(models.first.engine.admissions == 1);
 }
 
 // These tests exercise live HTTP ownership during decode growth. Earlier

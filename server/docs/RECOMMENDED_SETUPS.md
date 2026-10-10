@@ -19,6 +19,20 @@ For long contexts on the 32 GB R9700, `--cache-type-k f16 --cache-type-v f16` de
 
 If a machine has both Strix Halo and an R9700, set `HIP_VISIBLE_DEVICES=<r9700-index>` before using an R9700-only profile. The selected card is then `hip:0` inside the process.
 
+## Small Qwen 3.5 models on Strix Halo
+
+Qwen 3.5 0.8B and 2B chat GGUFs, and classifiers fine-tuned from them, load through the qwen35 backend. They tie the output projection to the token embeddings (the GGUF has no `output.weight`), so the loader uploads `token_embd.weight` as the LM head. Run them without a draft; `--max-concurrency` serves several requests at once from a paged KV pool. On a machine that also has an R9700, check the Strix Halo index with `luce_server --list-devices`.
+
+```bash
+luce_server /path/to/Qwen3.5-0.8B-Q8_0.gguf \
+  --target-device hip:1 \
+  --max-concurrency 4 \
+  --max-ctx 8192 \
+  --port 8294 --model-name qwen3.5-0.8b
+```
+
+To read a classifier's first-token distribution, ask for `max_tokens: 1`, `temperature: 0` and `logprobs: true` with `top_logprobs`; see [Logprobs](API.md#logprobs).
+
 ## DeepSeek V4 on Strix Halo
 
 `--profile ds4-strix` is the qualified launch: it sets `--max-ctx 131072 --chunk 8192 --ds4-fused-decode --ds4-fused-verify-f16-kv --ds4-expert-top-k 6 --ds4-prefill sparse`, and the `gfx1151` device profile installs every kernel and policy default at start (fused five-row verifier, verify width from the DSpark confidence head, sparse prefill kernels), so there is nothing to tune. Any flag you pass replaces the profile's value. Use the adaptive ROCmFPX artifact with all six routed experts on the 128 GB part. Measured this way: 42 tok/s decode and 320 tok/s prefill at 8K, 36 tok/s at 123K, 39 tok/s on code and math, 25 tok/s on prose ([PR #729](https://github.com/Luce-Org/lucebox/pull/729); details in the [DeepSeek V4 guide](DS4.md#experimental-amd-q5-verifier)).

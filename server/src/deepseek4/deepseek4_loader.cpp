@@ -2895,6 +2895,7 @@ void free_deepseek4_weights(DeepSeek4Weights & w) {
     if (w.routing_ctx) { ggml_free(w.routing_ctx); w.routing_ctx = nullptr; }
     w.layers.clear();
     w.selection_bias_host.clear();
+    w.router_bias_applied = false;
     w.embedder.tok_embd_owned.clear();
     w.embedder.tok_embd_bytes = nullptr;
     w.moe_hybrid = false;

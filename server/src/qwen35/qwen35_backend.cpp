@@ -17,6 +17,7 @@
 #include "prefill_helpers.h"
 #include "common/sampler.h"
 #ifdef LUCE_HAVE_GPU_SAMPLER
+#include "common/geometric_draft_topk_cuda.h"
 #include "common/geometric_sampler_cuda.h"
 #include <random>
 #endif
@@ -36,6 +37,7 @@
 #include "flashprefill.h"
 
 #include <algorithm>
+#include <typeinfo>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -238,21 +240,23 @@ static bool qwen35_empty_visible_output(const std::vector<int32_t> & tokens,
 static void apply_drafter_capture_layer_ids(const DraftWeights & dw, TargetWeights & w) {
     if (dw.capture_layer_ids.empty()) return;
     const int n = (int)dw.capture_layer_ids.size();
-    bool ok = (n == w.n_capture_layers);
-    for (int k = 0; ok && k < n; k++)
-        ok = dw.capture_layer_ids[k] >= 0 && dw.capture_layer_ids[k] < w.n_layer;
-    if (!ok) {
+    std::vector<int> before(w.capture_layer_ids,
+                            w.capture_layer_ids + w.n_capture_layers);
+    // The drafter's fc consumes n_target_layers*n_embd features, so its id
+    // list must match that width; the table then takes the drafter's count
+    // (e.g. 8 for the z-lab Qwen3.5-9B DFlash) before any feature buffer is
+    // sized from w.n_capture_layers.
+    if (n != dw.n_target_layers ||
+        !luce::common::adopt_drafter_capture_layers(
+            dw.capture_layer_ids, w.n_layer, LUCE_DRAFT_MAX_TARGET_LAYERS,
+            w.capture_layer_ids, w.n_capture_layers)) {
         std::fprintf(stderr,
-            "[draft]  drafter target_layer_ids invalid (n=%d, slots=%d); "
-            "keeping derived capture layers\n", n, w.n_capture_layers);
+            "[draft]  drafter target_layer_ids invalid (n=%d, fc layers=%d, "
+            "max=%d); keeping derived capture layers\n",
+            n, dw.n_target_layers, LUCE_DRAFT_MAX_TARGET_LAYERS);
         return;
     }
-    bool changed = false;
-    for (int k = 0; k < n; k++) {
-        changed |= w.capture_layer_ids[k] != dw.capture_layer_ids[k];
-        w.capture_layer_ids[k] = dw.capture_layer_ids[k];
-    }
-    if (changed) {
+    if (before != dw.capture_layer_ids) {
         std::printf("[draft]  target capture layers from drafter GGUF:");
         for (int k = 0; k < n; k++) std::printf(" %d", w.capture_layer_ids[k]);
         std::printf("\n");
@@ -357,59 +361,7 @@ bool Qwen35Backend::init() {
         std::printf("[draft]  remote ipc ready gpu=%d cap=%d\n",
                     cfg_.draft_gpu, cap);
     } else if (cfg_.draft_path) {
-        const std::string & dp = *cfg_.draft_path;
-        bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
-            ? load_draft_gguf(*cfg_.draft_path, draft_backend_, dw_, &w_)
-            : load_draft_safetensors(*cfg_.draft_path, draft_backend_, dw_, &w_);
-        if (!draft_ok) {
-            std::fprintf(stderr, "draft load: %s\n", luce_last_error());
-            return false;
-        }
-        std::printf("[draft]  loaded\n");
-        apply_drafter_capture_layer_ids(dw_, w_);
-
-        if (cfg_.draft_swa_window > 0) {
-            const DraftSwaOverrideResult swa =
-                apply_draft_swa_window_override(dw_, cfg_.draft_swa_window);
-            std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
-                        swa.swa_layers, swa.total_layers, swa.effective_window);
-        }
-
-        // Legacy 8-layer drafter YaRN from config flags. Applied here AND in
-        // unpark() so the rotary encoding cannot flip mid-process (it used
-        // to switch from plain RoPE to YaRN on the first park/unpark).
-        if (dw_.rope_ext_factor == 0.0f && dw_.n_layer == 8 && dw_.n_embd == 2048) {
-            float yf = cfg_.draft_yarn_factor > 1.0f ? cfg_.draft_yarn_factor : 64.0f;
-            dw_.rope_freq_scale = 1.0f / yf;
-            dw_.rope_ext_factor = 1.0f; dw_.rope_attn_factor = 1.0f;
-            dw_.rope_beta_fast = cfg_.draft_yarn_beta_fast;
-            dw_.rope_beta_slow = cfg_.draft_yarn_beta_slow;
-            dw_.rope_n_ctx_orig = cfg_.draft_yarn_orig_ctx;
-        }
-
-        // The checkpoint metadata is the drafter's published proposal
-        // horizon. Greedy chain verification keeps output byte-identical to
-        // plain decode at any width, so widening only risks acceptance
-        // depth; it is allowed up to 2x the horizon (measured on Qwen3.8
-        // DFlash2: byte-identical completions across widths 8-24, commits
-        // grow through 16, step time cliffs past 16 with no commit gain).
-        if (cfg_.draft_block_size != 0) {
-            const int checkpoint_block_size = dw_.block_size;
-            if (!draft_block_size_override_supported(
-                    cfg_.draft_block_size, checkpoint_block_size)) {
-                std::fprintf(stderr,
-                    "[draft] --draft-block-size must be in [2, %d] for this "
-                    "drafter (up to 2x the checkpoint horizon); got %d\n",
-                    2 * checkpoint_block_size, cfg_.draft_block_size);
-                return false;
-            }
-            std::printf("[draft]  block size override: %d -> %d%s\n",
-                        checkpoint_block_size, cfg_.draft_block_size,
-                        cfg_.draft_block_size > checkpoint_block_size
-                            ? " (beyond the published horizon; exact greedy verify)"
-                            : "");
-            dw_.block_size = cfg_.draft_block_size;
-        }
+        if (!load_local_draft()) return false;
     }
 
     // Create KV cache
@@ -484,7 +436,7 @@ bool Qwen35Backend::init() {
         !tensor_parallel && !split_gpus_ &&
         target_backend_ == draft_backend_ &&
         cfg_.device.gpu == cfg_.draft_gpu &&
-        dw_.selector.enabled && dw_.block_size > 1 &&
+        dw_.block_size > 1 &&
         dw_.block_size <= 16 && w_.output;
     if (fixed_chain.enabled) {
         fixed_chain.width = dw_.block_size;
@@ -492,9 +444,8 @@ bool Qwen35Backend::init() {
     }
     if (n_slots > 1 && cfg_.draft_path && !fixed_chain.enabled) {
         set_last_error(
-            "concurrent paged DFlash2 requires a selector-enabled local "
-            "same-device draft with block size in [2, 16] and a target "
-            "lm_head");
+            "concurrent paged DFlash requires a local same-device draft "
+            "with block size in [2, 16] and a target lm_head");
         return false;
     }
     const int64_t scratch_tokens = PAGED_BLOCK_SIZE +
@@ -563,6 +514,8 @@ bool Qwen35Backend::init() {
         std::fprintf(stderr, "cache: %s\n", luce_last_error());
         return false;
     }
+    layout_max_verify_tokens_ = max_verify_tokens;
+    layout_ctx_alloc_ = ctx_alloc;
     if (cfg_.paged_attention) {
         const auto supported_type = [](ggml_type type) {
             return type == GGML_TYPE_F16 ||
@@ -656,10 +609,74 @@ bool Qwen35Backend::init() {
         std::fflush(stdout);
     }
 
+    init_feature_mirror(fixed_chain.enabled);
+
+    return true;
+}
+
+bool Qwen35Backend::load_local_draft() {
+    const std::string & dp = *cfg_.draft_path;
+    bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
+        ? load_draft_gguf(*cfg_.draft_path, draft_backend_, dw_, &w_)
+        : load_draft_safetensors(*cfg_.draft_path, draft_backend_, dw_, &w_);
+    if (!draft_ok) {
+        std::fprintf(stderr, "draft load: %s\n", luce_last_error());
+        return false;
+    }
+    std::printf("[draft]  loaded\n");
+    apply_drafter_capture_layer_ids(dw_, w_);
+
+    if (cfg_.draft_swa_window > 0) {
+        const DraftSwaOverrideResult swa =
+            apply_draft_swa_window_override(dw_, cfg_.draft_swa_window);
+        std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
+                    swa.swa_layers, swa.total_layers, swa.effective_window);
+    }
+
+    // Legacy 8-layer drafter YaRN from config flags. Applied here AND in
+    // unpark() so the rotary encoding cannot flip mid-process (it used
+    // to switch from plain RoPE to YaRN on the first park/unpark).
+    if (dw_.rope_ext_factor == 0.0f && dw_.n_layer == 8 && dw_.n_embd == 2048) {
+        float yf = cfg_.draft_yarn_factor > 1.0f ? cfg_.draft_yarn_factor : 64.0f;
+        dw_.rope_freq_scale = 1.0f / yf;
+        dw_.rope_ext_factor = 1.0f; dw_.rope_attn_factor = 1.0f;
+        dw_.rope_beta_fast = cfg_.draft_yarn_beta_fast;
+        dw_.rope_beta_slow = cfg_.draft_yarn_beta_slow;
+        dw_.rope_n_ctx_orig = cfg_.draft_yarn_orig_ctx;
+    }
+
+    // The checkpoint metadata is the drafter's published proposal
+    // horizon. Greedy chain verification keeps output byte-identical to
+    // plain decode at any width, so widening only risks acceptance
+    // depth; it is allowed up to 2x the horizon (measured on Qwen3.8
+    // DFlash2: byte-identical completions across widths 8-24, commits
+    // grow through 16, step time cliffs past 16 with no commit gain).
+    if (cfg_.draft_block_size != 0) {
+        const int checkpoint_block_size = dw_.block_size;
+        if (!draft_block_size_override_supported(
+                cfg_.draft_block_size, checkpoint_block_size)) {
+            std::fprintf(stderr,
+                "[draft] --draft-block-size must be in [2, %d] for this "
+                "drafter (up to 2x the checkpoint horizon); got %d\n",
+                2 * checkpoint_block_size, cfg_.draft_block_size);
+            return false;
+        }
+        std::printf("[draft]  block size override: %d -> %d%s\n",
+                    checkpoint_block_size, cfg_.draft_block_size,
+                    cfg_.draft_block_size > checkpoint_block_size
+                        ? " (beyond the published horizon; exact greedy verify)"
+                        : "");
+        dw_.block_size = cfg_.draft_block_size;
+    }
+    return true;
+}
+
+void Qwen35Backend::init_feature_mirror(bool fixed_chain_enabled) {
+    const bool use_remote_draft = cfg_.remote_draft.enabled();
     // Init feature mirror when draft model is available (needed for spec decode).
     // On single-GPU, this is an F32 conversion buffer; on split-GPU, a cross-device mirror.
     if (cfg_.draft_path && !use_remote_draft &&
-        !fixed_chain.enabled) {
+        !fixed_chain_enabled) {
         const int mirror_cap = std::min({cfg_.draft_ctx_max, cfg_.device.max_ctx,
                                          cache_.target_feat_cap > 0 ? cache_.target_feat_cap : cfg_.device.max_ctx});
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
@@ -669,8 +686,6 @@ bool Qwen35Backend::init() {
             std::fprintf(stderr, "warning: feature mirror init failed, spec decode will use AR fallback\n");
         }
     }
-
-    return true;
 }
 
 bool Qwen35Backend::load_target_model(ggml_backend_t backend, TargetWeights & out) {
@@ -863,6 +878,15 @@ int32_t Qwen35Backend::apply_min_tokens_floor(int32_t tok, int generated,
     return alt;
 }
 
+void Qwen35Backend::record_ar_logprobs(size_t logits_offset, int32_t token) {
+    const int vocab = w_.n_vocab;
+    std::vector<float> row((size_t)vocab);
+    ggml_backend_tensor_get(sg_.logits, row.data(), logits_offset,
+                            sizeof(float) * (size_t)vocab);
+    ar_logprobs_.push_back(compute_token_logprobs(
+        row.data(), vocab, token, sampler_.logprobs_top_n));
+}
+
 SeqEngine * Qwen35Backend::seq_engine() {
     return seq_engine_.get();
 }
@@ -878,6 +902,7 @@ void Qwen35Backend::print_ready_banner() const {
 // ── Park / unpark ───────────────────────────────────────────────────────
 
 bool Qwen35Backend::park(ParkTarget target) {
+    if (evicted_) return true;  // nothing is resident
     materialize_live_snapshot();
     live_snapshot_slot_ = -1;
     const bool want_draft_model = park_target_includes_draft_model(target);
@@ -909,6 +934,10 @@ bool Qwen35Backend::park(ParkTarget target) {
 }
 
 bool Qwen35Backend::unpark(ParkTarget target) {
+    if (evicted_) {
+        std::fprintf(stderr, "[unpark] model is evicted; reinstate it first\n");
+        return false;
+    }
     materialize_live_snapshot();
     live_snapshot_slot_ = -1;
     const bool want_target_model = park_target_includes_target_model(target);
@@ -925,6 +954,10 @@ bool Qwen35Backend::unpark(ParkTarget target) {
             free_target_weights(w_);
             return false;
         }
+        // The reload re-derived evenly spaced capture layers; a resident
+        // drafter still needs the layers it was trained on.
+        if (!draft_parked_ && !use_remote_draft && cfg_.draft_path)
+            apply_drafter_capture_layer_ids(dw_, w_);
         kvflash_drafter_failed_ = false;   // fresh VRAM: allow a retry
         target_parked_ = false;
         std::printf("[unpark] target restored\n"); std::fflush(stdout);
@@ -991,6 +1024,7 @@ bool Qwen35Backend::unpark(ParkTarget target) {
 // ── Snapshots ───────────────────────────────────────────────────────────
 
 bool Qwen35Backend::snapshot_save(int slot) {
+    if (evicted_) return false;
     if (cfg_.paged_attention) {
         static bool warned = false;
         if (!warned) {
@@ -1036,6 +1070,7 @@ int Qwen35Backend::snapshot_granularity() const {
 }
 
 bool Qwen35Backend::snapshot_save_deferred(int slot) {
+    if (evicted_) return false;
     if (generating_ || cfg_.paged_attention || kvflash_active() ||
         slot < 0 || slot >= PREFIX_SLOTS || cache_.cur_pos <= 0) {
         return snapshot_save(slot);
@@ -1090,7 +1125,194 @@ int Qwen35Backend::snapshot_cur_pos(int slot) const {
     return prefix_snapshots_[slot].cur_pos;
 }
 
+// ── Eviction (runtime model swapping) ───────────────────────────────────
+
+bool Qwen35Backend::supports_eviction(std::string & reason) const {
+    // First milestone: one classic worker, dense KV, local same-device draft.
+    // Every other mode owns device state this teardown does not cover yet.
+    if (typeid(*this) != typeid(Qwen35Backend)) {
+        reason = "eviction is not implemented for this Qwen3.5 variant";
+    } else if (concurrent_slots() > 1 || seq_engine_) {
+        reason = "eviction does not support --max-concurrency > 1 yet";
+    } else if (cfg_.paged_attention) {
+        reason = "eviction does not support paged attention yet";
+    } else if (kvflash_active()) {
+        reason = "eviction does not support KVFlash";
+    } else if (cfg_.remote_draft.enabled()) {
+        reason = "eviction does not support a remote draft";
+    } else if (cfg_.device.is_tensor_parallel() || tensor_parallel_) {
+        reason = "eviction does not support tensor parallelism";
+    } else if (split_gpus_) {
+        reason = "eviction requires the draft on the target device";
+    } else if (!cfg_.mmproj_path.empty()) {
+        reason = "eviction does not support vision (--mmproj)";
+    } else if (snap_backend_ == target_backend_) {
+        // Unified memory keeps snapshots in the compute backend we free.
+        reason = "eviction requires host-memory snapshots (discrete GPU)";
+    } else {
+        reason.clear();
+        return true;
+    }
+    return false;
+}
+
+void Qwen35Backend::release_device_state(bool keep_weights) {
+    if (target_backend_) ggml_backend_synchronize(target_backend_);
+    // Consumers before what they reference: the DFlash adapter captured the
+    // backend handle, graphs reference weights and cache tensors.
+    dflash_target_.reset();
+    free_drafter();
+    step_graph_destroy(sg_);
+    step_graph_destroy(draft_sg_);
+    step_graph_destroy(proj_sg_);
+    dflash2_selector_graph_invalidate();
+    // Thread-local device scratch of this (worker) thread.
+    dflash2_release_thread_graphs();
+    specla_release_thread_scratch();
+#ifdef LUCE_HAVE_GPU_SAMPLER
+    geometric_sampler_release_thread_scratch();
+    geometric_draft_topk_release_thread_scratch();
+#endif
+#ifdef LUCE_HAVE_BSA
+    flashprefill::dflash_bsa_free_persistent();
+#endif
+    draft_kv_free(draft_kv_);
+    draft_feature_mirror_free(feature_mirror_);
+    if (!keep_weights) {
+        // A failed reload can own partial allocations while still parked.
+        free_draft_weights(dw_);
+        free_target_weights(w_);
+    }
+    vision_.reset();
+    free_target_cache(cache_);
+    // The backend context owns the device pools (the VMM pool can only be
+    // returned by destroying it), streams and BLAS handles. The draft shares
+    // it in the supported configuration; free each context once.
+    if (draft_backend_ && draft_backend_ != target_backend_) {
+        ggml_backend_free(draft_backend_);
+    }
+    draft_backend_ = nullptr;
+    // Weight buffers belong to the device's buffer type, not to the backend
+    // context, so a warm eviction keeps them across this free.
+    if (target_backend_) ggml_backend_free(target_backend_);
+    target_backend_ = nullptr;
+    if (!keep_weights) {
+        target_parked_ = true;
+        draft_parked_ = true;
+    }
+}
+
+size_t Qwen35Backend::weight_device_bytes() const {
+    if (!weights_resident()) return 0;
+    size_t bytes = 0;
+    if (!target_parked_ && w_.buf) bytes += ggml_backend_buffer_get_size(w_.buf);
+    if (!target_parked_ && w_.gate_buf) bytes += ggml_backend_buffer_get_size(w_.gate_buf);
+    if (!draft_parked_ && dw_.buf) bytes += ggml_backend_buffer_get_size(dw_.buf);
+    return bytes;
+}
+
+ModelBackend::EvictResult Qwen35Backend::evict(EvictLevel level) {
+    EvictResult result;
+    if (level == EvictLevel::partial) {
+        result.error = "partial eviction keeps a secondary expert tier; this model has none";
+        return result;
+    }
+    const bool warm = level == EvictLevel::warm;
+    if (evicted_) {
+        // Warm to cold drops the kept weights; cold to warm cannot bring them back.
+        if (weights_kept_ && !warm) {
+            free_draft_weights(dw_);
+            free_target_weights(w_);
+            target_parked_ = draft_parked_ = true;
+            weights_kept_ = false;
+        }
+        result.status = EvictStatus::ok;
+        return result;
+    }
+    if (!supports_eviction(result.error)) return result;
+    // A deferred snapshot lives only in the device cache: copy it out first.
+    const int deferred_slot = live_snapshot_deferred_ ? live_snapshot_slot_ : -1;
+    materialize_live_snapshot();
+    if (deferred_slot >= 0 && !prefix_snapshots_[deferred_slot].ctx) {
+        result.snapshots_lost = 1;
+        std::fprintf(stderr, "[evict] deferred snapshot slot %d could not be "
+                     "copied to host; it will not restore\n", deferred_slot);
+    }
+    live_snapshot_slot_ = -1;
+    release_device_state(warm);
+    evicted_ = true;
+    weights_kept_ = warm;
+    result.status = EvictStatus::ok;
+    std::printf("[evict] device state released%s\n", warm ? " (weights kept)" : "");
+    std::fflush(stdout);
+    return result;
+}
+
+bool Qwen35Backend::reinstate(std::string & error) {
+    if (!evicted_) return true;
+    if (!supports_eviction(error)) return false;
+    const auto fail = [&](const std::string & what) {
+        error = what;
+        release_device_state();  // kept weights too: the model ends cold
+        weights_kept_ = false;
+        std::fprintf(stderr, "[reinstate] %s\n", what.c_str());
+        return false;
+    };
+    using clock = std::chrono::steady_clock;
+    auto t = clock::now();
+    double stage_ms[5] = {};  // backend, target, draft, cache, mirror
+    const auto lap = [&](int stage) {
+        const auto now = clock::now();
+        stage_ms[stage] = std::chrono::duration<double, std::milli>(now - t).count();
+        t = now;
+    };
+    target_backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
+    if (!target_backend_) return fail("target backend init failed");
+    draft_backend_ = cfg_.draft_path ? target_backend_ : nullptr;
+    lap(0);
+    // Fresh structs: the frees leave hyperparameters and bookkeeping behind,
+    // which stay readable while evicted but must not leak into the reload.
+    cache_ = TargetCache{};
+    if (weights_kept_) {
+        // Warm: the weight buffers are still on the device; point them at
+        // the new context.
+        w_.backend = target_backend_;
+        if (cfg_.draft_path) dw_.backend = draft_backend_;
+    } else {
+        w_ = TargetWeights{};
+        dw_ = DraftWeights{};
+        if (!load_target_model(target_backend_, w_)) {
+            return fail(std::string("target load: ") + luce_last_error());
+        }
+        target_parked_ = false;
+        lap(1);
+        if (cfg_.draft_path) {
+            if (!load_local_draft()) return fail(std::string("draft load: ") + luce_last_error());
+            draft_parked_ = false;
+        }
+        lap(2);
+    }
+    if (!create_target_cache(w_, cfg_.device.max_ctx, layout_max_verify_tokens_,
+                             target_backend_, cache_, /*prefill_only=*/true,
+                             layout_ctx_alloc_, /*paged=*/false, /*n_slots=*/1,
+                             /*fixed_chain=*/false, cfg_.cache_type_k, cfg_.cache_type_v)) {
+        return fail(std::string("cache: ") + luce_last_error());
+    }
+    lap(3);
+    init_feature_mirror(/*fixed_chain_enabled=*/false);
+    lap(4);
+    kvflash_drafter_failed_ = false;
+    evicted_ = false;
+    weights_kept_ = false;
+    std::printf("[reinstate] device state restored: backend %.0f ms, target %.0f ms, "
+                "draft %.0f ms, cache %.0f ms, mirror %.0f ms\n",
+                stage_ms[0], stage_ms[1], stage_ms[2], stage_ms[3], stage_ms[4]);
+    std::fflush(stdout);
+    return true;
+}
+
 size_t Qwen35Backend::snapshot_bytes_estimate(int tokens) const {
+    if (evicted_) return 0;  // cache tensors are freed
     // Paged serving keeps no single-sequence snapshots.
     if (cfg_.paged_attention || !snap_backend_ || tokens <= 0) return 0;
     return estimate_target_cache_snapshot_bytes(
@@ -1116,7 +1338,22 @@ ModelBackend::MemoryReport Qwen35Backend::memory_report_for(
         const TargetCache & cache, const PrefixSnapshot * snapshots,
         int n_snapshots) {
     MemoryReport report;
-    if (!cache.base_buf) return report;
+    const auto add_snapshots = [&] {
+        for (int slot = 0; slot < n_snapshots; ++slot) {
+            const auto & snap = snapshots[slot];
+            if (!snap.ctx || !snap.buf) continue;
+            report.snapshots.push_back({slot, snap.cur_pos,
+                                        ggml_backend_buffer_get_size(snap.buf),
+                                        ggml_backend_buffer_is_host(snap.buf)});
+        }
+    };
+    if (!cache.base_buf) {
+        // Evicted (or not yet initialized): no device cache, but host
+        // snapshots may still be retained.
+        add_snapshots();
+        report.available = !report.snapshots.empty();
+        return report;
+    }
     const auto bytes = [](const ggml_tensor * t) {
         return t ? (uint64_t) ggml_nbytes(t) : (uint64_t) 0;
     };
@@ -1139,13 +1376,7 @@ ModelBackend::MemoryReport Qwen35Backend::memory_report_for(
     const uint64_t named = report.cache.kv_bytes + report.cache.recurrent_bytes +
                            report.cache.draft_feature_bytes;
     report.cache.other_bytes = allocated > named ? allocated - named : 0;
-    for (int slot = 0; slot < n_snapshots; ++slot) {
-        const auto & snap = snapshots[slot];
-        if (!snap.ctx || !snap.buf) continue;
-        report.snapshots.push_back({slot, snap.cur_pos,
-                                    ggml_backend_buffer_get_size(snap.buf),
-                                    ggml_backend_buffer_is_host(snap.buf)});
-    }
+    add_snapshots();
     return report;
 }
 
@@ -1164,7 +1395,7 @@ ModelBackend::SnapshotRef Qwen35Backend::snapshot_ref(int slot) const {
 bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
                                    ggml_backend_buffer_t buf, int cur_pos,
                                    int32_t last_tok) {
-    if (cfg_.paged_attention) return false;
+    if (cfg_.paged_attention || evicted_) return false;
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
     snapshot_free(slot);
 
@@ -1482,6 +1713,7 @@ void Qwen35Backend::shutdown() {
 // ── Release scratch buffers between requests ────────────────────────────
 
 void Qwen35Backend::release_scratch() {
+    if (evicted_) return;
     // Target graph allocator: grows during large prefill batches, not needed
     // between requests. Will be lazily recreated on next build_target_step().
     if (sg_.alloc) {
@@ -1519,6 +1751,11 @@ void Qwen35Backend::release_scratch() {
 
 GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                             const DaemonIO & io) {
+    if (evicted_) {
+        GenerateResult evicted;
+        evicted.fail(GenerateErrorCode::ModelParked, "model is evicted");
+        return evicted;
+    }
     materialize_live_snapshot();
     live_snapshot_slot_ = -1;
     generating_ = true;
@@ -1540,6 +1777,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     if (req.do_sample && sampler_.seed != 0) {
         sampler_rng_.seed(sampler_.seed);
     }
+    ar_logprobs_.clear();
 
     // Zero delta-net recurrent state (SSM + conv) so a fresh prompt doesn't
     // inherit stale hidden state from the previous request. KV cache is
@@ -1630,7 +1868,9 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
         ThinkingBudget budget(req.budget_hook, ar_n_gen);
         // Image requests speculate too: the verify target shifts its rotary
         // positions by rope_delta_, and the drafter only proposes tokens.
-        if (cfg_.paged_attention || req.force_ar_decode) {
+        // Logprobs are recorded by AR decode only.
+        if (cfg_.paged_attention || req.force_ar_decode ||
+            req.sampler.wants_logprobs()) {
             decode_ok = do_ar_decode(committed, budget, result.tokens, out_io,
                                      &result.budget_forced_close,
                                      &result.degenerate_decode_close);
@@ -1663,15 +1903,93 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
+    result.logprobs = std::move(ar_logprobs_);
     result.succeed();
     return result;
 }
 
 // ── Restore + generate ──────────────────────────────────────────────────
 
+bool Qwen35Backend::compute_hidden_states(const std::vector<int32_t> & prompt,
+                                          const HiddenStatesSpec & spec,
+                                          int snap_slot,
+                                          const DaemonIO & io,
+                                          HiddenStates & out,
+                                          std::string & error) {
+    if (evicted_) {
+        error = "model is evicted";
+        return false;
+    }
+    if (concurrent_slots() > 1) {
+        error = "hidden states run through the concurrent slot API";
+        return false;
+    }
+    if (!supports_hidden_states()) {
+        error = "hidden states are unavailable with tensor parallelism or KVFlash";
+        return false;
+    }
+    if (prompt.empty()) {
+        error = "hidden states need a non-empty prompt";
+        return false;
+    }
+    for (int layer : spec.layers) {
+        if (layer < 0 || layer >= w_.n_layer) {
+            error = "hidden-state layer out of range";
+            return false;
+        }
+    }
+    // The prefill below overwrites the live cache: a deferred snapshot is
+    // copied out first, and the live cache stops standing for any slot.
+    materialize_live_snapshot();
+    live_snapshot_slot_ = -1;
+    // Same fresh-sequence setup as generate_impl, minus images and decode.
+    reset_recurrent_state(cache_);
+    if (cfg_.paged_attention) {
+        if (prompt.size() > (uint64_t)cfg_.device.max_ctx) {
+            error = "prompt exceeds max_ctx for paged attention";
+            return false;
+        }
+        if (!begin_paged_sequence((uint32_t)prompt.size())) {
+            error = "paged KV sequence initialization failed";
+            return false;
+        }
+    }
+    struct Guard {
+        Qwen35Backend * backend;
+        ~Guard() {
+            backend->hidden_accum_ = nullptr;
+            backend->end_paged_sequence();
+        }
+    } guard{this};
+
+    HiddenStatesAccumulator accum(spec, w_.n_embd);
+    hidden_accum_ = &accum;
+    // Never restored from a snapshot. A snap_slot only receives the state at
+    // the prompt end: snap_pos == prompt size never falls inside a chunk, so
+    // do_prefill saves after its last chunk without reshaping any of them.
+    const int committed = do_prefill(
+        prompt, io, snap_slot >= 0 ? (int)prompt.size() : -1, snap_slot,
+        /*kv_offset=*/0, /*images=*/nullptr);
+    if (committed < 0) {
+        error = "prefill failed";
+        return false;
+    }
+    if (io.is_cancelled() || accum.rows() != (int)prompt.size()) {
+        error = "prefill cancelled";
+        return false;
+    }
+    out = accum.finish();
+    return true;
+}
+
 GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                                         const GenerateRequest & req,
                                                         const DaemonIO & io) {
+    if (evicted_) {
+        GenerateResult evicted;
+        evicted.fail(GenerateErrorCode::ModelParked, "model is evicted");
+        return evicted;
+    }
     // The live cache already is this snapshot when it was saved (or kept,
     // deferred) after the previous generation and nothing ran since.
     const bool live_restore = slot >= 0 && slot == live_snapshot_slot_ &&
@@ -1737,6 +2055,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     if (req.do_sample && sampler_.seed != 0) {
         sampler_rng_.seed(sampler_.seed);
     }
+    ar_logprobs_.clear();
 
     cache_.cur_pos = snap_pos;
     result.restored_prefix_tokens = snap_pos;
@@ -1814,6 +2133,12 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         // BEFORE its own build_target_step, so a null/freed graph tensor aborts
         // in ggml_backend_tensor_set. Build a single-token decode step graph at
         // the restored position now, mirroring do_ar_decode's per-step build.
+        if (req.sampler.wants_logprobs()) {
+            // No prefill ran, so there is no logits row for the first token.
+            result.fail(GenerateErrorCode::BackendSpecific,
+                        "logprobs are unavailable on an exact snapshot hit");
+            return result;
+        }
         const bool pool = kvflash_active();
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/cache_.cur_pos, /*n_tokens=*/1,
@@ -1841,7 +2166,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         auto t_decode_start = std::chrono::steady_clock::now();
         ThinkingBudget budget(req.budget_hook, req.n_gen);
         bool decode_ok = false;
-        if (req.force_ar_decode) {
+        if (req.force_ar_decode || req.sampler.wants_logprobs()) {
             decode_ok = do_ar_decode(committed, budget, result.tokens, out_io,
                                      &result.budget_forced_close,
                                      &result.degenerate_decode_close);
@@ -1874,6 +2199,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
+    result.logprobs = std::move(ar_logprobs_);
     result.succeed();
     return result;
 }
@@ -2070,6 +2396,13 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // decode-time windowed attention will later read.
         static const bool prefill_timing = std::getenv("LUCE_PREFILL_TIMING") != nullptr;
         const auto t_build0 = std::chrono::steady_clock::now();
+        std::vector<QwenHiddenCapture> hidden_captures;
+        if (hidden_accum_) {
+            for (int layer : hidden_accum_->spec().layers) {
+                hidden_captures.push_back(
+                    {layer, 0, n_tokens, hidden_accum_->spec().mean});
+            }
+        }
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/kv_pos, /*n_tokens=*/n_tokens,
                                with_mask, /*capture=*/true,
@@ -2079,7 +2412,18 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                    (start + n_tokens < prompt_len ? 1 : 0),
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
-                               /*kvflash_mask=*/kvf_paged)) {
+                               /*kvflash_mask=*/kvf_paged,
+                               /*capture_qk=*/false,
+                               /*paged_attention=*/false,
+                               /*n_seqs=*/1, /*seq_slot=*/0,
+                               /*paged_max_kv_len=*/0,
+                               /*n_prefill_tokens=*/0,
+                               /*prefill_segments=*/nullptr,
+                               /*n_prefill_segments=*/0,
+                               /*n_logits_rows=*/0,
+                               /*compact_slots=*/false,
+                               hidden_captures.data(),
+                               (int)hidden_captures.size())) {
             std::fprintf(stderr, "prefill build @%d\n", kv_pos);
             return -1;
         }
@@ -2167,6 +2511,21 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             return -1;
         }
         after_target_compute(sg_, kv_pos, n_tokens);
+
+        if (hidden_accum_) {
+            std::vector<float> last((size_t)hidden), sum((size_t)hidden);
+            for (size_t k = 0; k < hidden_captures.size(); ++k) {
+                ggml_backend_tensor_get(sg_.hidden_last[k], last.data(), 0,
+                                        sizeof(float) * last.size());
+                const bool has_sum = sg_.hidden_sum[k] != nullptr;
+                if (has_sum) {
+                    ggml_backend_tensor_get(sg_.hidden_sum[k], sum.data(), 0,
+                                            sizeof(float) * sum.size());
+                }
+                hidden_accum_->record(k, last.data(), has_sum ? sum.data() : nullptr);
+            }
+            hidden_accum_->add_rows(n_tokens);
+        }
 
         int32_t last_tok = -1;
         const bool is_final_chunk = (start + n_tokens >= prompt_len);
@@ -2421,6 +2780,14 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
             first_tok = cache_.last_tok;
         }
         apply_budget(first_tok);
+        if (sampler_.wants_logprobs()) {
+            // An exact snapshot hit decodes without prefill logits.
+            if (!prefill_last_logits_valid_) {
+                set_last_error("logprobs need the prefill logits row");
+                return false;
+            }
+            record_ar_logprobs(prefill_last_logits_offset_, first_tok);
+        }
         out_tokens.push_back(first_tok);
         io.emit(first_tok);
         if (kvflash_active()) kvflash_history_.push_back(first_tok);
@@ -2560,6 +2927,7 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
             next_tok, (int)out_tokens.size(), /*logits_row_offset=*/0);
 
         apply_budget(next_tok);
+        if (sampler_.wants_logprobs()) record_ar_logprobs(0, next_tok);
 
         out_tokens.push_back(next_tok);
         io.emit(next_tok);

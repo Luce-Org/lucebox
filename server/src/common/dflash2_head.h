@@ -16,6 +16,17 @@ namespace luce::common {
 void dflash2_selector_graph_invalidate();
 uint64_t dflash2_selector_graph_generation();
 
+// Free the calling thread's cached selector, projection and batched-selector
+// graphs together with their device buffers. Invalidation only frees lazily on
+// the next call; model eviction needs the memory back now, so it calls this on
+// the worker thread before releasing the model's backends.
+void dflash2_selector_release_thread_graph();
+void dflash2_batch_release_thread_graphs();
+inline void dflash2_release_thread_graphs() {
+    dflash2_selector_release_thread_graph();
+    dflash2_batch_release_thread_graphs();
+}
+
 // DFlash 2 candidate selector for greedy chain drafting.
 //
 // For every drafted block position the target lm_head logits are reduced to
@@ -37,7 +48,8 @@ bool dflash2_select_chain(const DraftWeights & dw,
 // Same selector, batched over host-resident drafter hidden blocks and using a
 // local target lm_head tensor. The expensive lm_head projection covers every
 // (lane, depth) in one graph, GPU top-K is invoked once, and selector
-// projections/readback are shared across the cohort.
+// projections/readback are shared across the cohort. A drafter without a
+// selector (DFlash 1) gets the per-position lm_head argmax chain instead.
 bool dflash2_select_chains_batched(
     const DraftWeights & dw,
     ggml_backend_t backend,

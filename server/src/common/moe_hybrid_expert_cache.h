@@ -116,6 +116,8 @@ public:
     // releases the launch's slots. False with *err when a layer could not be
     // answered exactly (a load failed or its experts exceed the pool).
     bool end(std::string * err);
+    // A launch was begun and not ended yet.
+    bool busy() const;
 
 private:
     void resolver_main();
@@ -129,13 +131,14 @@ private:
     std::vector<Channel> channels_;
     std::vector<int32_t> slot_of_;
 
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::condition_variable cv_;
     std::thread thread_;
     std::vector<Job> jobs_;
     int32_t invalid_route_ = -1;
     bool pending_ = false;     // a launch is being answered
     bool launch_done_ = false; // end() was called for it
+    bool open_ = false;        // begin() was called, end() not yet
     bool stopping_ = false;
     std::string error_;
 };
@@ -191,6 +194,23 @@ public:
     // under the warm-start rules, the decode slots it evicted anyway (only
     // into empty or bulk slots). Loads only move bytes: outputs never change.
     void set_bulk(bool bulk);
+
+    // Pauses the background work, for a caller that is about to release
+    // device state the cache's users depend on (DS4 partial eviction): the
+    // loaders take no new job or warm load, and the loads already running
+    // finish their copies. The slots keep their experts, queued loads stay
+    // queued (their slots stay Loading) and the warm start keeps its place, so
+    // resume() continues exactly where suspend() stopped. Fails, changing
+    // nothing, while an eval/acquire runs, slots are pinned or a mailbox
+    // launch has not ended: finish those first, since they wait on the
+    // loaders. Idempotent; a cache that is not ready suspends trivially.
+    bool suspend(std::string * err = nullptr);
+    void resume();
+    bool suspended() const;
+    // Drops the cached compute graphs (rebuilt on demand). They are built
+    // over the caller's layer descriptors, so a caller that reloads the
+    // tensors behind those drops them first. Only while no call runs.
+    void release_graphs();
 
     // Adds the weighted output of the streamed routes to out
     // ([n_embd, n_tokens], host). `selected` / `weights` are [n_used,
@@ -339,6 +359,8 @@ private:
     std::chrono::steady_clock::time_point warm_t0_;
     uint64_t tick_ = 0;
     bool stopping_ = false;
+    bool suspended_ = false;           // loaders take no work (suspend())
+    int loads_in_flight_ = 0;          // loads a loader has taken and not finished
     std::vector<std::vector<int32_t>> predicted_;  // per layer, until its eval
     std::vector<int> staged_;          // slots stage() pinned for staged_layer_
     std::vector<int> acquired_;        // slots acquire() pinned

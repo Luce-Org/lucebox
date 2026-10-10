@@ -203,22 +203,196 @@ void MoeHybridStorage::release_graph_caches() {
     }
 }
 
+void MoeHybridStorage::release_prefill_allocators() {
+    for (ggml_gallocr_t * alloc : {&prefill_route_alloc, &prefill_hot_alloc, &prefill_cold_alloc}) {
+        if (*alloc) {
+            ggml_gallocr_free(*alloc);
+            *alloc = nullptr;
+        }
+    }
+}
+
+static bool is_mix_expert_type(const ggml_tensor * t) {
+    return t && (t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX || t->type == GGML_TYPE_Q2_1_ROCMFP2_MIX);
+}
+
+static void free_hot_stack(MoeHybridLayerStorage & layer) {
+    if (layer.hot_buf) {
+        ggml_backend_buffer_free(layer.hot_buf);
+        layer.hot_buf = nullptr;
+    }
+    if (layer.hot_ctx) {
+        ggml_free(layer.hot_ctx);
+        layer.hot_ctx = nullptr;
+    }
+    layer.gate_hot = nullptr;
+    layer.up_hot = nullptr;
+    layer.down_hot = nullptr;
+    layer.gate_up_hot = nullptr;
+}
+
+bool MoeHybridStorage::release_primary_experts(std::string * err) {
+    if (primary_released_) return true;
+    const auto refuse = [&](const char * why) {
+        if (err) *err = why;
+        return false;
+    };
+    if (!has_mmap() || layer_regions.size() != layers.size()) {
+        return refuse("primary experts can only be rebuilt from a retained file mapping");
+    }
+    for (const MoeHybridLayerStorage & layer : layers) {
+        if (layer.cache_slots != 0) return refuse("primary spare cache slots cannot be rebuilt");
+        for (const ggml_tensor * t : {layer.gate_hot, layer.up_hot, layer.down_hot, layer.gate_up_hot}) {
+            if (is_mix_expert_type(t)) return refuse("mixed-qtype primary experts cannot be rebuilt");
+        }
+    }
+    // Graphs and arenas sized over (or pointing at) the hot tensors go first.
+    release_prefill_allocators();
+    release_graph_caches();
+    for (MoeHybridLayerStorage & layer : layers) {
+        ggml_tensor * const hot[4] = {layer.gate_hot, layer.up_hot, layer.down_hot, layer.gate_up_hot};
+        for (int i = 0; i < 4; ++i) {
+            MoeHybridLayerStorage::StackShape & shape = layer.released_hot_shapes[i];
+            shape = {};
+            if (!hot[i]) continue;
+            shape.type = (int) hot[i]->type;
+            for (int d = 0; d < 4; ++d) shape.ne[d] = hot[i]->ne[d];
+        }
+        free_hot_stack(layer);
+        // Not resident until the rebuild has uploaded every stack.
+        std::fill(layer.expert_vram_mask.begin(), layer.expert_vram_mask.end(), 0);
+    }
+    primary_released_ = true;
+    return true;
+}
+
+bool MoeHybridStorage::rebuild_primary_experts(ggml_backend_t gpu_backend, const std::string & path,
+                                               std::string * err) {
+    if (!primary_released_) return true;
+    const auto fail = [&](const std::string & why) {
+        for (MoeHybridLayerStorage & layer : layers) free_hot_stack(layer);
+        if (err) *err = why;
+        return false;
+    };
+    if (!gpu_backend) return fail("no primary backend to rebuild the expert stacks on");
+    std::vector<TensorFileSpan> spans;
+    uint64_t bytes = 0;
+    for (size_t il = 0; il < layers.size(); ++il) {
+        MoeHybridLayerStorage & layer = layers[il];
+        const LayerExpertRegions & regions = layer_regions[il];
+        bool any = false;
+        for (const auto & shape : layer.released_hot_shapes) any = any || shape.type >= 0;
+        if (!any) continue;
+        // The maps the retained cold stack and decode tables index with must
+        // still describe exactly this ordered hot set.
+        for (size_t i = 0; i < layer.hot_expert_ids.size(); ++i) {
+            const int32_t expert = layer.hot_expert_ids[i];
+            if (expert < 0 || (size_t) expert >= layer.hot_local_by_global.size() ||
+                layer.hot_local_by_global[(size_t) expert] != (int32_t) i) {
+                return fail("layer " + std::to_string(il) + ": hot expert map no longer matches its ordered ids");
+            }
+        }
+        ggml_init_params ip{};
+        ip.mem_size = 24 * ggml_tensor_overhead();
+        ip.no_alloc = true;
+        layer.hot_ctx = ggml_init(ip);
+        if (!layer.hot_ctx) return fail("failed to init hot_ctx");
+        ggml_tensor ** const hot[4] = {&layer.gate_hot, &layer.up_hot, &layer.down_hot, &layer.gate_up_hot};
+        for (int i = 0; i < 4; ++i) {
+            const auto & shape = layer.released_hot_shapes[i];
+            if (shape.type < 0) continue;
+            if (shape.ne[2] != (int64_t) layer.hot_expert_ids.size()) {
+                return fail("layer " + std::to_string(il) + ": recorded hot stack does not hold its experts");
+            }
+            *hot[i] = ggml_new_tensor(layer.hot_ctx, (ggml_type) shape.type, 4, shape.ne);
+        }
+        layer.hot_buf = ggml_backend_alloc_ctx_tensors(layer.hot_ctx, gpu_backend);
+        if (!layer.hot_buf) {
+            return fail("failed to allocate hot expert GPU buffer (layer " + std::to_string(il) + ")");
+        }
+        const auto add = [&](ggml_tensor * stack, const ExpertFileRegion & region, size_t expert_bytes) {
+            if (!stack) return true;
+            for (size_t i = 0; i < layer.hot_expert_ids.size(); ++i) {
+                const size_t rel = expert_bytes * (size_t) layer.hot_expert_ids[i];
+                if (expert_bytes == 0 || rel + expert_bytes > region.size) return false;
+                const uint64_t file_offset = (uint64_t) region.offset + rel;
+                if (!spans.empty() && spans.back().tensor == stack &&
+                    spans.back().tensor_offset + spans.back().size == expert_bytes * i &&
+                    spans.back().file_offset + spans.back().size == file_offset) {
+                    spans.back().size += expert_bytes;
+                } else {
+                    spans.push_back({stack, expert_bytes * i, file_offset, expert_bytes});
+                }
+                bytes += expert_bytes;
+            }
+            return true;
+        };
+        if (!add(layer.gate_hot, regions.gate_exps, layer.gate_expert_bytes) ||
+            !add(layer.up_hot, regions.up_exps, layer.up_expert_bytes) ||
+            !add(layer.down_hot, regions.down_exps, layer.down_expert_bytes) ||
+            !add(layer.gate_up_hot, regions.gate_up_exps, layer.gate_up_expert_bytes)) {
+            return fail("layer " + std::to_string(il) + ": hot expert outside its file region");
+        }
+    }
+    if (path.empty()) {
+        const auto * file = static_cast<const uint8_t *>(mmap_data);
+        for (const TensorFileSpan & span : spans) {
+            if (span.file_offset + span.size > mmap_size) return fail("hot expert outside the mapping");
+            ggml_backend_tensor_set(span.tensor, file + span.file_offset, span.tensor_offset, span.size);
+        }
+    } else {
+        std::string load_err;
+        if (!load_tensor_spans(path, mmap_data, mmap_size, spans, &load_err)) {
+            return fail("reading the primary experts: " + load_err);
+        }
+    }
+    for (MoeHybridLayerStorage & layer : layers) {
+        std::fill(layer.expert_vram_mask.begin(), layer.expert_vram_mask.end(), 0);
+        for (int32_t expert : layer.hot_expert_ids) layer.set_expert_hot(expert);
+    }
+    primary_upload_bytes += bytes;
+    primary_released_ = false;
+    return true;
+}
+
+MoeHybridOwnershipRecord MoeHybridOwnershipRecord::capture(const MoeHybridStorage & storage) {
+    MoeHybridOwnershipRecord record;
+    record.layers.reserve(storage.layers.size());
+    for (const MoeHybridLayerStorage & layer : storage.layers) {
+        record.layers.push_back({layer.hot_expert_ids, layer.cold_expert_ids,
+                                 layer.hot_local_by_global, layer.cold_local_by_global,
+                                 layer.decode_hot_local_by_global, layer.decode_cold_local_by_global,
+                                 layer.n_streamed});
+    }
+    return record;
+}
+
+bool MoeHybridOwnershipRecord::matches(const MoeHybridStorage & storage, std::string * err) const {
+    if (storage.layers.size() != layers.size()) {
+        if (err) *err = "expert ownership has a different layer count";
+        return false;
+    }
+    const MoeHybridOwnershipRecord now = capture(storage);
+    for (size_t il = 0; il < layers.size(); ++il) {
+        if (!(now.layers[il] == layers[il])) {
+            if (err) *err = "expert ownership of layer " + std::to_string(il) + " changed";
+            return false;
+        }
+    }
+    return true;
+}
+
+void MoeHybridStorage::rebind_cold_backend(ggml_backend_t backend) {
+    if (cold_backend_kind != MoeHybridColdBackend::Gpu) return;
+    cold_backend = backend;
+    for (MoeHybridLayerStorage & layer : layers) layer.cold_backend = backend;
+}
+
 MoeHybridStorage::~MoeHybridStorage() {
     // Registry entries point into the owner buffers, so remove them before the
     // buffers can be released or their addresses reused.
     unregister_mix_tensors();
-    if (prefill_route_alloc) {
-        ggml_gallocr_free(prefill_route_alloc);
-        prefill_route_alloc = nullptr;
-    }
-    if (prefill_hot_alloc) {
-        ggml_gallocr_free(prefill_hot_alloc);
-        prefill_hot_alloc = nullptr;
-    }
-    if (prefill_cold_alloc) {
-        ggml_gallocr_free(prefill_cold_alloc);
-        prefill_cold_alloc = nullptr;
-    }
+    release_prefill_allocators();
     release_graph_caches();
     for (auto & layer : layers) {
         if (layer.hot_buf) {
@@ -738,6 +912,8 @@ bool build_moe_hybrid_storage_from_file(
                 return false;
             }
 
+            out.primary_upload_bytes += (uint64_t) hot_count *
+                (dst.gate_expert_bytes + dst.up_expert_bytes + dst.down_expert_bytes + dst.gate_up_expert_bytes);
             if (hot_count > 0 && dst.fused_gate_up) {
                 if (!copy_experts(dst.gate_up_hot, fd.gate_up_exps, dst.hot_expert_ids, dst.gate_up_expert_bytes)) return false;
                 if (!copy_experts(dst.down_hot, fd.down_exps, dst.hot_expert_ids, dst.down_expert_bytes)) return false;
@@ -777,6 +953,8 @@ bool build_moe_hybrid_storage_from_file(
                 return false;
             }
 
+            out.secondary_upload_bytes += (uint64_t) cold_count *
+                (dst.gate_expert_bytes + dst.up_expert_bytes + dst.down_expert_bytes + dst.gate_up_expert_bytes);
             if (dst.fused_gate_up) {
                 if (!copy_experts(dst.gate_up_cold, fd.gate_up_exps, dst.cold_expert_ids, dst.gate_up_expert_bytes)) return false;
                 if (!copy_experts(dst.down_cold, fd.down_exps, dst.cold_expert_ids, dst.down_expert_bytes)) return false;

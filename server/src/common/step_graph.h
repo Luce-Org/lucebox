@@ -108,6 +108,9 @@ struct StepGraph {
     std::vector<DeltaNetCapture> delta_captures;
     ggml_tensor * tree_features = nullptr;
     std::vector<ggml_tensor *> moe_selected;
+    // Residual-stream readouts (qwen35 build_target_step hidden_captures).
+    std::vector<ggml_tensor *> hidden_last;
+    std::vector<ggml_tensor *> hidden_sum;
 };
 
 // Reset the per-call graph state (ctx + graph + tensor handles) but KEEP the
@@ -153,6 +156,8 @@ inline void step_graph_free(StepGraph & sg) {
     sg.delta_captures.clear();
     sg.tree_features = nullptr;
     sg.moe_selected.clear();
+    sg.hidden_last.clear();
+    sg.hidden_sum.clear();
     sg.paged_tree_key.reset();
 }
 

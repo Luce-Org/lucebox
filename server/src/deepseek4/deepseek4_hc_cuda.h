@@ -8,6 +8,11 @@ namespace luce::common {
 // before invoking the direct HC helpers.
 bool deepseek4_cuda_hc_set_device(int device);
 
+// Frees the process-wide direct-helper scratch of `device` (a later helper
+// call on it allocates again). For eviction: the scratch is owned by no model
+// object, so a model releasing a device must drop it explicitly.
+void deepseek4_cuda_hc_release_device(int device);
+
 bool deepseek4_cuda_hc_pre_mix(const float * hc_state_host,
                                const void *  fn_device,
                                int           n_embd,

@@ -255,7 +255,9 @@ struct TargetWeights {
     // Computed from n_layer at load time: step = (n_layer - 2) / (N - 1),
     // ids[k] = 1 + k * step.  E.g. 27B→{1,16,31,46,61}, 9B→{1,8,15,22,29}.
     int n_capture_layers = LUCE_DRAFT_N_TARGET_LAYERS;
-    int capture_layer_ids[LUCE_DRAFT_N_TARGET_LAYERS] = {1, 16, 31, 46, 61};
+    // Drafters with explicit target_layer_ids may raise the count up to
+    // LUCE_DRAFT_MAX_TARGET_LAYERS (see resolve_drafter_capture_layers).
+    int capture_layer_ids[LUCE_DRAFT_MAX_TARGET_LAYERS] = {1, 16, 31, 46, 61};
 };
 
 // Check if a token is an end-of-sequence marker for the given target weights.
@@ -813,6 +815,8 @@ bool migrate_prefill_cache(const TargetWeights & w,
 // the next state-resident verify (§5.2). Commits the bank the just-run verify
 // wrote (1 - specla_pending_bank) into durable SSM and conv state, so it must
 // be called before the host-side bank rotation. accepted_idx is in path order.
+// Free the calling thread's SpecLA commit-graph allocator (model eviction).
+void specla_release_thread_scratch();
 bool specla_commit_accepted(TargetCache & cache,
                             ggml_backend_t backend,
                             const int32_t * accepted_idx,
@@ -874,6 +878,17 @@ struct QwenPrefillSegment {
     int token_offset = 0;
     int n_tokens = 0;
     int seq_slot = 0;
+};
+
+// Residual-stream readout for /v1/hidden_states: the output of block `layer`
+// over token rows [row_begin, row_begin + n_rows) of this graph (one prompt
+// chunk). The graph exposes that range's last row and, when `sum`, the sum of
+// its rows, both f32 [n_embd] (QwenGraphOutputs::hidden_last/hidden_sum).
+struct QwenHiddenCapture {
+    int  layer = -1;
+    int  row_begin = 0;
+    int  n_rows = 0;
+    bool sum = false;
 };
 
 struct QwenGraphInputs {
@@ -978,6 +993,10 @@ struct QwenGraphInputs {
     int specla_n_waves = 0;
     int specla_n_boundaries = 0;
     int specla_max_parallel_chains = 0;
+
+    // Optional residual-stream readouts (see QwenHiddenCapture).
+    const QwenHiddenCapture * hidden_captures = nullptr;
+    int n_hidden_captures = 0;
 };
 
 struct QwenGraphOutputs {
@@ -994,6 +1013,10 @@ struct QwenGraphOutputs {
     // One entry per target layer. Populated only when capture_moe_router is
     // true; qwen35 dense layers and non-MoE models leave entries null.
     std::vector<ggml_tensor *> moe_selected;
+    // Parallel to QwenGraphInputs::hidden_captures: f32 [n_embd] outputs;
+    // hidden_sum entries are null where the capture asked for no sum.
+    std::vector<ggml_tensor *> hidden_last;
+    std::vector<ggml_tensor *> hidden_sum;
 };
 
 struct QwenLayerPrefnOutputs {

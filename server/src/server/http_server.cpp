@@ -30,6 +30,7 @@
 #include "common/kv_rotation.h"
 #include "common/sha1.h"
 #include "freeze_history.h"
+#include "utf8_utils.h"
 
 #ifdef LUCE_HAS_CURL
 #include <curl/curl.h>
@@ -675,12 +676,187 @@ void apply_no_thinking_sampler_defaults(const json & body,
     }
 }
 
+int parse_request_logprobs(const json & body, ApiFormat format) {
+    // Only the chat-completions boolean form turns logprobs on. Every other
+    // shape (the legacy completions integer, a non-boolean value, a
+    // top_logprobs without logprobs: true, other endpoints) was ignored
+    // before logprobs existed and still is.
+    if (format != ApiFormat::OPENAI_CHAT) return -1;
+    const auto flag = body.find("logprobs");
+    if (flag == body.end() || !flag->is_boolean() || !flag->get<bool>()) {
+        return -1;
+    }
+    const auto top_it = body.find("top_logprobs");
+    if (top_it == body.end() || top_it->is_null()) return 0;
+    if (!top_it->is_number_integer()) {
+        throw std::invalid_argument("top_logprobs must be an integer");
+    }
+    const int64_t top = top_it->get<int64_t>();
+    if (top < 0 || top > kMaxTopLogprobs) {
+        throw std::invalid_argument(
+            "top_logprobs must be between 0 and " +
+            std::to_string(kMaxTopLogprobs));
+    }
+    return (int) top;
+}
+
+json build_openai_logprobs(
+        const std::vector<TokenLogprobs> & logprobs,
+        const std::function<std::string(int32_t)> & token_bytes) {
+    // OpenAI reports -9999.0 for tokens it considers impossible; JSON has no
+    // -infinity (nlohmann would write null).
+    auto entry = [&](const TokenLogprob & lp) {
+        const std::string raw = token_bytes(lp.token);
+        json bytes = json::array();
+        for (unsigned char c : raw) bytes.push_back((int) c);
+        return json{
+            {"token", utf8_sanitize(raw)},
+            {"logprob", std::isfinite(lp.logprob) ? lp.logprob : -9999.0f},
+            {"bytes", std::move(bytes)},
+        };
+    };
+    json content = json::array();
+    for (const TokenLogprobs & position : logprobs) {
+        json item = entry(position.chosen);
+        json top = json::array();
+        for (const TokenLogprob & alt : position.top) top.push_back(entry(alt));
+        item["top_logprobs"] = std::move(top);
+        content.push_back(std::move(item));
+    }
+    return {{"content", std::move(content)}};
+}
+
 json require_messages_array(const json & body) {
     if (!body.contains("messages") || !body["messages"].is_array() ||
         body["messages"].empty()) {
         throw std::invalid_argument("messages must be a non-empty array");
     }
     return body["messages"];
+}
+
+namespace {
+constexpr size_t kMaxHiddenStateLayers = 256;
+constexpr const char * kChatmlAssistantHeader = "<|im_start|>assistant\n";
+
+const char * pooling_name(HiddenStatesRequest::Pooling pooling) {
+    switch (pooling) {
+        case HiddenStatesRequest::Pooling::mean: return "mean";
+        case HiddenStatesRequest::Pooling::both: return "both";
+        case HiddenStatesRequest::Pooling::last: break;
+    }
+    return "last";
+}
+}  // namespace
+
+HiddenStatesRequest parse_hidden_states_request(const json & body) {
+    HiddenStatesRequest request;
+    if (!body.contains("layers") || !body["layers"].is_array() ||
+        body["layers"].empty()) {
+        throw std::invalid_argument("layers must be a non-empty array of integers");
+    }
+    if (body["layers"].size() > kMaxHiddenStateLayers) {
+        throw std::invalid_argument("layers may name at most " +
+                                    std::to_string(kMaxHiddenStateLayers) + " blocks");
+    }
+    for (const json & layer : body["layers"]) {
+        if (!layer.is_number_integer()) {
+            throw std::invalid_argument("layers must be a non-empty array of integers");
+        }
+        const int64_t value = layer.get<int64_t>();
+        if (value < INT32_MIN || value > INT32_MAX) {
+            throw std::invalid_argument("layer " + std::to_string(value) + " is out of range");
+        }
+        if (std::find(request.layers.begin(), request.layers.end(), (int)value) !=
+            request.layers.end()) {
+            throw std::invalid_argument("layer " + std::to_string(value) + " is repeated");
+        }
+        request.layers.push_back((int)value);
+    }
+    if (body.contains("pooling") && !body["pooling"].is_null()) {
+        const json & pooling = body["pooling"];
+        const std::string value = pooling.is_string() ? pooling.get<std::string>() : "";
+        if (value == "last") request.pooling = HiddenStatesRequest::Pooling::last;
+        else if (value == "mean") request.pooling = HiddenStatesRequest::Pooling::mean;
+        else if (value == "both") request.pooling = HiddenStatesRequest::Pooling::both;
+        else throw std::invalid_argument("pooling must be \"last\", \"mean\" or \"both\"");
+    }
+    if (body.contains("generation_prompt") && !body["generation_prompt"].is_null()) {
+        const json & prompt = body["generation_prompt"];
+        const std::string value = prompt.is_string() ? prompt.get<std::string>() : "";
+        if (value == "bare") request.bare_generation_prompt = true;
+        else if (value != "template") {
+            throw std::invalid_argument(
+                "generation_prompt must be \"template\" or \"bare\"");
+        }
+    }
+    if (body.contains("cache_prefix") && !body["cache_prefix"].is_null()) {
+        if (!body["cache_prefix"].is_boolean()) {
+            throw std::invalid_argument("cache_prefix must be a boolean");
+        }
+        request.cache_prefix = body["cache_prefix"].get<bool>();
+    }
+    return request;
+}
+
+HiddenStatesSpec resolve_hidden_states_spec(const HiddenStatesRequest & request,
+                                            int n_layers) {
+    HiddenStatesSpec spec;
+    spec.mean = request.wants_mean();
+    for (int layer : request.layers) {
+        const int64_t block = layer < 0 ? (int64_t)n_layers + layer : layer;
+        if (block < 0 || block >= n_layers) {
+            throw std::invalid_argument(
+                "layer " + std::to_string(layer) + " is out of range for a " +
+                std::to_string(n_layers) + "-layer model");
+        }
+        spec.layers.push_back((int)block);
+    }
+    return spec;
+}
+
+bool trim_to_assistant_header(std::string & rendered) {
+    const std::string header = kChatmlAssistantHeader;
+    const size_t at = rendered.rfind(header);
+    if (at == std::string::npos) return false;
+    const size_t end = at + header.size();
+    // A closed assistant turn is history, not the generation prompt.
+    if (rendered.find("<|im_end|>", end) != std::string::npos) return false;
+    rendered.resize(end);
+    return true;
+}
+
+json build_hidden_states_response(const std::string & model,
+                                  const HiddenStatesRequest & request,
+                                  int n_layers, int n_embd, int prompt_tokens,
+                                  const HiddenStates & states,
+                                  const std::string & last_token,
+                                  double prefill_ms,
+                                  int cached_prefix_tokens) {
+    json layers = json::object();
+    for (size_t k = 0; k < request.layers.size(); ++k) {
+        json entry = json::object();
+        entry["last"] = k < states.last.size() ? states.last[k] : std::vector<float>{};
+        if (request.wants_mean()) {
+            entry["mean"] = k < states.mean.size() ? states.mean[k] : std::vector<float>{};
+        }
+        layers[std::to_string(request.layers[k])] = std::move(entry);
+    }
+    json body = {
+        {"object", "hidden_states"},
+        {"model", model},
+        {"n_layers", n_layers},
+        {"n_embd", n_embd},
+        {"prompt_tokens", prompt_tokens},
+        {"pooling", pooling_name(request.pooling)},
+        {"generation_prompt", request.bare_generation_prompt ? "bare" : "template"},
+        {"last_token", last_token},
+        {"layers", std::move(layers)},
+        {"timings", {{"prefill_ms", prefill_ms}}},
+    };
+    if (request.cache_prefix) {
+        body["cache_prefix"] = {{"cached_tokens", cached_prefix_tokens}};
+    }
+    return body;
 }
 
 static bool env_flag_enabled(const char * name) {
@@ -1757,6 +1933,51 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
             // CORS belongs to the one listener even when a peer formats output.
             model->config_.enable_cors = config_.enable_cors;
         }
+        if (config_.swap_residency) {
+            for (auto & model : models_) {
+                HttpServer & server = *model.server;
+                std::string reason;
+                if (!server.backend_.supports_eviction(reason)) {
+                    std::fprintf(stderr, "[server] --swap-residency: model %s: %s\n",
+                                 server.config_.model_name.c_str(), reason.c_str());
+                    return 2;
+                }
+                const std::string & target = server.config_.target_device;
+                const std::string & draft = server.config_.draft_device;
+                if (target.empty() || target == "auto") {
+                    std::fprintf(stderr, "[server] --swap-residency: model %s needs an explicit --target-device\n",
+                                 server.config_.model_name.c_str());
+                    return 2;
+                }
+                model.devices = server.config_.residency_devices;
+                if (model.devices.empty()) {
+                    model.devices = {target};
+                    if (!draft.empty() && draft != "auto" && draft != target) model.devices.push_back(draft);
+                }
+                // No worker runs yet, so the backend may be queried here.
+                model.residency = server.backend_.is_evicted() ? Residency::evicted
+                                                               : Residency::resident;
+                model.weights_resident = server.backend_.weights_resident();
+                model.weight_device_bytes = server.backend_.weight_device_bytes();
+                // Startup evicts cold, or partially when the model has
+                // secondary devices; neither keeps warm weights.
+                if (model.residency == Residency::evicted && model.weights_resident) {
+                    model.retained_devices = server.config_.residency_secondary_devices;
+                }
+            }
+            for (size_t i = 0; i < models_.size(); ++i) {
+                for (size_t j = i + 1; j < models_.size(); ++j) {
+                    if (models_[i].residency == Residency::resident &&
+                        models_[j].residency == Residency::resident &&
+                        devices_overlap(models_[i], models_[j])) {
+                        std::fprintf(stderr, "[server] --swap-residency: %s and %s are both resident on a shared device\n",
+                                     models_[i].server->config_.model_name.c_str(),
+                                     models_[j].server->config_.model_name.c_str());
+                        return 2;
+                    }
+                }
+            }
+        }
     }
 
     // Every model is loaded and no worker has started: resolve one shared
@@ -2074,6 +2295,9 @@ void HttpServer::handle_client(SocketHandle fd) {
 
 // Endpoint structure is parsed once by the listener. Model defaults, templates
 // and token IDs are resolved only by the selected model's handler.
+// A failed swap-in answers 503 for this long before it may be retried.
+static constexpr auto kSwapRetryDelay = std::chrono::seconds(30);
+
 bool HttpServer::route_model_request(SocketHandle fd, ParsedRequest & req,
                                      bool count_only) {
     json & body = req.raw_body;
@@ -2083,9 +2307,35 @@ bool HttpServer::route_model_request(SocketHandle fd, ParsedRequest & req,
         send_error(fd, 400, "token counting requires an explicit model name");
         return true;
     }
-    // Generation always follows operator priority. Only token counting needs
-    // an explicit tokenizer, since no generating model has been selected yet.
-    const bool automatic = !count_only;
+    // Activations are only meaningful for the model that produced them, so
+    // a hidden-states request always names its model and never falls back.
+    const bool hidden = req.hidden_states.has_value();
+    if (hidden && unnamed) {
+        send_error(fd, 400, "hidden states require an explicit model name");
+        return true;
+    }
+    // Token counting needs the named model's tokenizer. Generation follows
+    // operator priority unless name routing pins a request to the model it
+    // names; a pinned request waits for that model and never spills over.
+    const bool by_name = config_.model_routing == ServerConfig::ModelRouting::name;
+    RoutedModel * pinned = nullptr;
+    if (count_only || hidden || (by_name && !unnamed)) {
+        for (auto & model : models_) {
+            if (model.server->config_.model_name == requested) pinned = &model;
+        }
+        if (!pinned && by_name && !hidden && config_.unknown_model_to_primary) {
+            pinned = &models_.front();
+        }
+        if (!pinned) {
+            std::string names;
+            for (const auto & model : models_) {
+                names += (names.empty() ? "" : ", ") + model.server->config_.model_name;
+            }
+            send_error(fd, 404, "unknown model '" + requested + "'; available models: " + names);
+            return true;
+        }
+    }
+    const bool automatic = pinned == nullptr;
 
     // A routing reservation owns a backend slot through retirement and output
     // draining. Engine admission, on its worker, remains the KV authority.
@@ -2111,21 +2361,43 @@ bool HttpServer::route_model_request(SocketHandle fd, ParsedRequest & req,
             --owner.routing_waiters_;
         }
     } waiting{*this};
+    // Swap residency: a pinned request waiting for its model to come in.
+    // Token counting needs only the tokenizer, never residency.
+    const bool swapping = config_.swap_residency && !count_only;
+    struct ModelWaiting {
+        HttpServer & owner;
+        RoutedModel * model = nullptr;
+        ~ModelWaiting() {
+            if (!model) return;
+            std::lock_guard<std::mutex> lock(owner.routing_mu_);
+            --model->waiters;
+        }
+    } model_waiting{*this};
 
     std::unordered_set<HttpServer *> unfit;
     for (;;) {
         if (http_detail::inspect_peer_socket(fd) ==
                 http_detail::PeerSocketState::Disconnected) return true;
-        bool known = automatic;
+        bool needs_residency = false;
         for (auto & model : models_) {
-            if (!automatic && requested != model.server->config_.model_name) continue;
-            known = true;
+            if (pinned && &model != pinned) continue;
             if (unfit.count(model.server)) continue;
             {
                 std::lock_guard<std::mutex> lock(routing_mu_);
                 if (stopping_.load()) break;
+                // Only a resident model that is not draining admits. Auto
+                // requests use residents and never trigger a swap.
+                if (swapping && (model.residency != Residency::resident || model.closing)) {
+                    if (&model == pinned) needs_residency = true;
+                    continue;
+                }
                 if (!count_only && model.in_flight >= model.capacity) continue;
                 if (!count_only) ++model.in_flight;
+                if (model_waiting.model == &model) {
+                    --model.waiters;
+                    if (model.cohort_remaining > 0) --model.cohort_remaining;
+                    model_waiting.model = nullptr;
+                }
                 if (waiting.active) {
                     --routing_waiters_;
                     waiting.active = false;
@@ -2147,15 +2419,59 @@ bool HttpServer::route_model_request(SocketHandle fd, ParsedRequest & req,
                 unfit.insert(model.server);
             }
         }
+        if (needs_residency) {
+            std::string error;
+            {
+                std::lock_guard<std::mutex> lock(routing_mu_);
+                if (pinned->residency == Residency::failed &&
+                    std::chrono::steady_clock::now() - pinned->failed_at < kSwapRetryDelay) {
+                    error = pinned->last_error.empty() ? "swap failed" : pinned->last_error;
+                }
+                if (!model_waiting.model) {
+                    model_waiting.model = pinned;
+                    ++pinned->waiters;
+                }
+            }
+            if (!error.empty() || !drive_swap(*pinned, error)) {
+                send_error(fd, 503, "model " + pinned->server->config_.model_name +
+                                    " is unavailable: " + error);
+                return true;
+            }
+            // Swapped in (by this request or a concurrent one): admit now
+            // instead of sleeping out the monitor interval.
+            {
+                std::lock_guard<std::mutex> lock(routing_mu_);
+                if (pinned->residency == Residency::resident && !pinned->closing) continue;
+            }
+        } else if (swapping && automatic) {
+            // Unnamed requests never swap a model in, so they would wait
+            // forever once no resident model can take them (none resident
+            // after a failed swap, or the request exceeds every resident's
+            // context); a swap in progress may bring another one in.
+            bool any_resident = false;
+            {
+                std::lock_guard<std::mutex> lock(routing_mu_);
+                for (const auto & model : models_) {
+                    any_resident = any_resident || (model.residency == Residency::resident &&
+                                                    !unfit.count(model.server));
+                }
+                any_resident = any_resident || swap_active_;
+            }
+            if (!any_resident && !unfit.empty()) {
+                send_error(fd, 400, "request exceeds the context or KV pool capacity of every resident model; "
+                                    "name a model to swap it in");
+                return true;
+            }
+            if (!any_resident) {
+                send_error(fd, 503, "no model is resident; name a model to swap it in");
+                return true;
+            }
+        }
         if (unfit.size() == models_.size()) {
             send_error(fd, 400, "request exceeds the context or KV pool capacity of every model");
             return true;
         }
-        if (!known) {
-            send_error(fd, 404, "unknown model '" + requested + "'");
-            return true;
-        }
-        if (!automatic || stopping_.load()) {
+        if (count_only || stopping_.load()) {
             send_error(fd, 503, "no available model capacity or server stopping");
             return true;
         }
@@ -2179,6 +2495,226 @@ bool HttpServer::route_model_request(SocketHandle fd, ParsedRequest & req,
     }
 }
 
+static bool any_shared(const std::vector<std::string> & a, const std::vector<std::string> & b) {
+    for (const auto & device : a) {
+        if (std::find(b.begin(), b.end(), device) != b.end()) return true;
+    }
+    return false;
+}
+
+bool HttpServer::devices_overlap(const RoutedModel & a, const RoutedModel & b) {
+    return any_shared(a.devices, b.devices);
+}
+
+bool HttpServer::retained_conflict(const RoutedModel & model, const RoutedModel & target) {
+    if (&model == &target || model.residency == Residency::resident) return false;
+    if (!any_shared(model.retained_devices, target.devices)) return false;
+    return !model.retained_warm || target.devices.size() > 1;
+}
+
+ModelBackend::EvictLevel HttpServer::eviction_level(const RoutedModel & model,
+                                                    const RoutedModel & target) {
+    const auto & secondary = model.server->config_.residency_secondary_devices;
+    if (!secondary.empty() && !any_shared(secondary, target.devices)) {
+        return ModelBackend::EvictLevel::partial;
+    }
+    if (model.server->config_.swap_keep_weights &&
+        model.devices.size() == 1 && target.devices.size() == 1) {
+        return ModelBackend::EvictLevel::warm;
+    }
+    return ModelBackend::EvictLevel::cold;
+}
+
+void HttpServer::record_control(RoutedModel & model, const ControlOp & op) {
+    if (!op.ran) return;
+    (op.evict ? model.last_evict_ms : model.last_reinstate_ms) = op.ms;
+    model.weights_resident = op.weights_resident;
+    model.weight_device_bytes = op.weight_device_bytes;
+    if (!op.weights_resident || (!op.evict && op.ok)) {
+        model.retained_devices.clear();
+        model.retained_warm = false;
+    } else if (op.evict && op.ok) {
+        const bool partial = op.level == ModelBackend::EvictLevel::partial;
+        model.retained_devices = partial
+            ? model.server->config_.residency_secondary_devices : model.devices;
+        model.retained_warm = !partial;
+    }
+}
+
+bool HttpServer::drive_swap(RoutedModel & target, std::string & error) {
+    std::vector<RoutedModel *> conflicts;
+    // Already evicted, but still holding memory the target needs.
+    std::vector<RoutedModel *> releasing;
+    {
+        std::lock_guard<std::mutex> lock(routing_mu_);
+        if (swap_active_ || stopping_.load() || target.residency == Residency::resident) {
+            return true;
+        }
+        // Check under the same lock that claims the swap: another request
+        // may have failed this target since the caller last checked it.
+        if (target.residency == Residency::failed &&
+            std::chrono::steady_clock::now() - target.failed_at < kSwapRetryDelay) {
+            error = target.last_error;
+            return false;
+        }
+        for (auto & model : models_) {
+            if (retained_conflict(model, target)) releasing.push_back(&model);
+            if (&model == &target || model.residency != Residency::resident) continue;
+            if (!devices_overlap(model, target)) continue;
+            // Requests that were waiting when it came in are served before
+            // it is swapped away; departed waiters no longer count.
+            if (std::min(model.cohort_remaining, model.waiters) > 0) return true;
+            conflicts.push_back(&model);
+        }
+        swap_active_ = true;
+        for (auto * model : conflicts) model->closing = true;
+    }
+    const std::string & name = target.server->config_.model_name;
+    std::fprintf(stderr, "[residency] swapping in %s (evicting %zu model%s)\n",
+                 name.c_str(), conflicts.size(), conflicts.size() == 1 ? "" : "s");
+
+    const auto finish = [&] {
+        std::lock_guard<std::mutex> lock(routing_mu_);
+        for (auto * model : conflicts) model->closing = false;
+        swap_active_ = false;
+        routing_cv_.notify_all();
+    };
+    // Reinstate models already evicted by this swap after a failure.
+    const auto restore = [&](const std::vector<RoutedModel *> & evicted) {
+        for (auto * model : evicted) {
+            auto op = model->server->post_control(/*evict=*/false);
+            op->wait();
+            std::lock_guard<std::mutex> lock(routing_mu_);
+            record_control(*model, *op);
+            if (op->ok) {
+                model->residency = Residency::resident;
+            } else {
+                model->residency = Residency::failed;
+                model->failed_at = std::chrono::steady_clock::now();
+                model->last_error = op->error;
+            }
+        }
+    };
+
+    // Draining models admit nothing new; wait out their reservations. The
+    // last release may come from a probe that does not notify, so poll too.
+    {
+        std::unique_lock<std::mutex> lock(routing_mu_);
+        for (;;) {
+            bool drained = true;
+            for (auto * model : conflicts) drained = drained && model->in_flight == 0;
+            if (drained) break;
+            routing_cv_.wait_for(lock, std::chrono::milliseconds(50));
+        }
+    }
+
+    std::vector<RoutedModel *> evicted;
+    for (auto * model : conflicts) {
+        auto op = model->server->post_control(/*evict=*/true, eviction_level(*model, target));
+        op->wait();
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> lock(routing_mu_);
+            record_control(*model, *op);
+            ok = op->ok;
+            if (ok) {
+                model->residency = Residency::evicted;
+            } else {
+                // Rejected before any teardown: it stays resident.
+                model->last_error = op->error;
+            }
+        }
+        if (!ok) {
+            error = "evicting " + model->server->config_.model_name + ": " + op->error;
+            {
+                std::lock_guard<std::mutex> lock(routing_mu_);
+                target.residency = Residency::failed;
+                target.failed_at = std::chrono::steady_clock::now();
+                target.last_error = error;
+            }
+            restore(evicted);
+            finish();
+            return false;
+        }
+        evicted.push_back(model);
+    }
+    // A target spanning several devices loads with nothing else's weights on
+    // them, and a retained tier yields to a model that uses its device.
+    for (auto * model : releasing) {
+        auto cold = model->server->post_control(/*evict=*/true, ModelBackend::EvictLevel::cold);
+        cold->wait();
+        {
+            std::lock_guard<std::mutex> lock(routing_mu_);
+            record_control(*model, *cold);
+        }
+        if (!cold->ok) {
+            error = "releasing " + model->server->config_.model_name + ": " + cold->error;
+            {
+                std::lock_guard<std::mutex> lock(routing_mu_);
+                target.residency = Residency::failed;
+                target.failed_at = std::chrono::steady_clock::now();
+                target.last_error = error;
+            }
+            restore(evicted);
+            finish();
+            return false;
+        }
+    }
+
+    auto op = target.server->post_control(/*evict=*/false);
+    op->wait();
+    // Evicted models that still keep weights on the target's devices.
+    std::vector<RoutedModel *> kept;
+    {
+        std::lock_guard<std::mutex> lock(routing_mu_);
+        record_control(target, *op);
+        for (auto & model : models_) {
+            if (&model != &target && model.residency != Residency::resident &&
+                any_shared(model.retained_devices, target.devices)) {
+                kept.push_back(&model);
+            }
+        }
+    }
+    if (!op->ok && !kept.empty()) {
+        // Not enough device memory beside the kept weights: drop every other
+        // model's weights sharing the target's devices, then retry.
+        std::fprintf(stderr, "[residency] %s reinstate failed with weights kept (%s); "
+                     "evicting others cold and retrying\n", name.c_str(), op->error.c_str());
+        for (auto * model : kept) {
+            auto cold = model->server->post_control(/*evict=*/true, ModelBackend::EvictLevel::cold);
+            cold->wait();
+            std::lock_guard<std::mutex> lock(routing_mu_);
+            record_control(*model, *cold);
+        }
+        op = target.server->post_control(/*evict=*/false);
+        op->wait();
+        std::lock_guard<std::mutex> lock(routing_mu_);
+        record_control(target, *op);
+    }
+    if (!op->ok) {
+        {
+            std::lock_guard<std::mutex> lock(routing_mu_);
+            target.residency = Residency::failed;
+            target.failed_at = std::chrono::steady_clock::now();
+            target.last_error = op->error;
+        }
+        error = op->error;
+        restore(evicted);
+        finish();
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(routing_mu_);
+        target.residency = Residency::resident;
+        target.last_error.clear();
+        ++target.swaps_in;
+        target.cohort_remaining = target.waiters;
+    }
+    std::fprintf(stderr, "[residency] %s resident (reinstate %.0f ms)\n", name.c_str(), op->ms);
+    finish();
+    return true;
+}
+
 json HttpServer::model_routing_status() {
     json models = json::array();
     std::lock_guard<std::mutex> lock(routing_mu_);
@@ -2193,10 +2729,24 @@ json HttpServer::model_routing_status() {
             {"target_device", server.config_.target_device},
             {"draft_device", server.config_.draft_device},
             {"max_context", server.config_.max_ctx},
+            {"residency", model.residency == Residency::resident ? "resident"
+                          : model.residency == Residency::evicted ? "evicted" : "failed"},
+            {"devices", model.devices},
+            {"weights_resident", model.weights_resident},
+            {"weight_device_bytes", model.weight_device_bytes},
+            {"retained_devices", model.retained_devices},
+            {"draining", model.closing},
+            {"waiting_for_residency", model.waiters},
+            {"swaps_in", model.swaps_in},
+            {"last_evict_ms", model.last_evict_ms},
+            {"last_reinstate_ms", model.last_reinstate_ms},
+            {"last_residency_error", model.last_error},
             {"props", std::move(props)},
             {"status", server.status_.to_json()}});
     }
-    return {{"routing", "primary-first"}, {"waiting", routing_waiters_},
+    const bool by_name = config_.model_routing == ServerConfig::ModelRouting::name;
+    return {{"routing", by_name ? "by-name" : "primary-first"}, {"waiting", routing_waiters_},
+            {"swap_residency", config_.swap_residency}, {"swap_active", swap_active_},
             {"queue_limit", config_.routing_queue_limit}, {"models", models}};
 }
 
@@ -2225,6 +2775,14 @@ bool HttpServer::parse_common_request_fields(
     }
 
     req.sampler = parse_request_sampler(body, config_.sampler_defaults);
+    req.sampler.logprobs_top_n = parse_request_logprobs(body, req.format);
+    // Logprobs are read per token on the plain decode path; the SSE emitter
+    // has no per-token logprobs channel yet. Where they cannot be produced
+    // the request is served without them, as before logprobs existed.
+    if (req.sampler.wants_logprobs() &&
+        (req.stream || !backend_.supports_logprobs())) {
+        req.sampler.logprobs_top_n = -1;
+    }
     if (body.contains("tools")) req.tools = body["tools"];
     // Tool choice constraint for hint generation.
     if (body.contains("tool_choice")) req.tool_choice = body["tool_choice"];
@@ -2295,6 +2853,15 @@ bool HttpServer::parse_endpoint_request(
                 first_message["content"] = normalize_system_for_cache(req.messages);
             }
         }
+        return true;
+    }
+    if (path == "/v1/hidden_states") {
+        // Chat-style messages rendered through the model's template, but the
+        // response is the prefill's residual stream, not a completion.
+        req.format = ApiFormat::OPENAI_CHAT;
+        req.response_id = generate_id("hs");
+        req.messages = require_messages_array(body);
+        req.hidden_states = parse_hidden_states_request(body);
         return true;
     }
     if (path == "/v1/messages/count_tokens") {
@@ -2563,8 +3130,19 @@ bool HttpServer::render_and_tokenize_request(
         send_error(fd, 500, error);
         return false;
     }
+    if (req.hidden_states && req.hidden_states->bare_generation_prompt &&
+        !trim_to_assistant_header(req.rendered_prompt)) {
+        send_error(fd, 400,
+            "generation_prompt=\"bare\" needs a chat template that ends in an "
+            "open <|im_start|>assistant header");
+        return false;
+    }
     req.started_in_thinking = prompt_ends_in_open_think(req.rendered_prompt);
     req.prompt_tokens = tokenizer_.encode(req.rendered_prompt);
+    if (req.hidden_states && req.prompt_tokens.empty()) {
+        send_error(fd, 400, "hidden states need a non-empty prompt");
+        return false;
+    }
     return true;
 }
 
@@ -2574,7 +3152,8 @@ bool HttpServer::validate_request_context(
         SocketHandle fd, const ParsedRequest & req, bool send_failure) {
     const int prompt_tokens = (int) req.prompt_tokens.size();
     const bool pflash_will_run =
-        !req.images && config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        !req.images && !req.hidden_states &&
+        config_.pflash_mode != ServerConfig::PflashMode::OFF &&
         drafter_tokenizer_ != nullptr &&
         (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
          prompt_tokens >= config_.pflash_threshold);
@@ -2655,6 +3234,9 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
         return models_.empty()
             ? handle_model_request(fd, req, count_tokens_only)
             : route_model_request(fd, req, count_tokens_only);
+    } catch (const std::invalid_argument & e) {
+        send_error(fd, 400, std::string("Invalid request: ") + e.what());
+        return true;
     } catch (const std::exception & e) {
         send_error(fd, 400, std::string("JSON parse error: ") + e.what());
         return true;
@@ -2667,6 +3249,18 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
     try {
         const json & body = req.raw_body;
         if (!parse_common_request_fields(fd, body, req)) return true;
+        if (req.hidden_states) {
+            if (!backend_.supports_hidden_states()) {
+                send_error(fd, 400, "hidden states are not supported by this model backend");
+                return true;
+            }
+            const auto shape = backend_.hidden_state_shape();
+            req.hidden_spec = resolve_hidden_states_spec(*req.hidden_states,
+                                                         shape.n_layers);
+            // Prefill only: nothing is generated or streamed.
+            req.stream = false;
+            req.max_output = 0;
+        }
         // Image extraction and redaction apply only to an image-capable
         // backend; every other backend sees the request exactly as before.
         std::vector<EncodedImage> encoded_images;
@@ -2680,6 +3274,10 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
             if (!prepare_request_images(req.messages, image_policy, normalized,
                                         encoded_images, extraction_error)) {
                 send_error(fd, 400, extraction_error);
+                return true;
+            }
+            if (req.hidden_states && !encoded_images.empty()) {
+                send_error(fd, 400, "hidden states do not accept image input");
                 return true;
             }
             req.messages = std::move(normalized);
@@ -2710,7 +3308,8 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         // PPP rearrange (optional): peel ephemeral system banners into a
         // following system message so the first chat boundary is stable.
         std::vector<ChatMessage> render_messages = chat_messages;
-        if (encoded_images.empty() && config_.ppp_enabled && config_.ppp_rearrange && !req.tools.empty()) {
+        if (encoded_images.empty() && !req.hidden_states && config_.ppp_enabled &&
+            config_.ppp_rearrange && !req.tools.empty()) {
             auto layout = PinFriendlyPrompt::rearrange(chat_messages, true);
             if (layout.rearranged) {
                 render_messages = std::move(layout.messages);
@@ -2941,6 +3540,11 @@ json build_openai_completion_response(
         {"message", message},
         {"finish_reason", finish_reason},
     };
+    if (req.sampler.wants_logprobs() && tokenizer) {
+        choice["logprobs"] = build_openai_logprobs(
+            result.logprobs,
+            [tokenizer](int32_t id) { return tokenizer->token_text(id); });
+    }
     if (req.thinking_opt_in) {
         // finish_details mirrors ds4_eval.c's eval_think_close_info.
         // close_kind is "natural" when the model closed its own thinking
@@ -3679,7 +4283,10 @@ std::vector<int> HttpServer::request_restore_points(const std::vector<int32_t> &
 HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,
         GenerateRequest & generate_request) {
-    if (req.images) return {};
+    // Logprobs need the prefill logits row, which an exact snapshot hit
+    // skips; logprobs requests are short classification prompts, so they
+    // bypass the prefix caches entirely.
+    if (req.images || req.sampler.wants_logprobs()) return {};
     auto & effective_prompt = prepared.tokens;
     // Tool-heavy requests prefer the reusable system/tool boundary under eviction.
     const bool prefer_inline_snap = !req.tools.empty();
@@ -4131,7 +4738,7 @@ void HttpServer::finalize_generation_cache(
         GenerationCacheState & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected) {
-    if (req.images) return;
+    if (req.images || req.sampler.wants_logprobs()) return;
     const auto & effective_prompt = prepared.tokens;
     const bool generation_produced_output = result.ok() &&
         completion_tokens > 0 && visible_output_seen && !client_disconnected;
@@ -4731,7 +5338,8 @@ void HttpServer::send_nonstream_response(
         const std::vector<int32_t> & gen_tokens, int n_gen_cap,
         bool budget_forced_close, bool degenerate_decode_close,
         const GenTimings & gen_timings,
-        ClientSendBuffer * send_buffer) {
+        ClientSendBuffer * send_buffer,
+        std::vector<TokenLogprobs> logprobs) {
     CompletionTokenCounts counts;
     counts.total = (int) gen_tokens.size();
     const bool is_eos = !gen_tokens.empty() &&
@@ -4747,6 +5355,7 @@ void HttpServer::send_nonstream_response(
     result.tokens = gen_tokens;
     result.budget_forced_close = budget_forced_close;
     result.degenerate_decode_close = degenerate_decode_close;
+    result.logprobs = std::move(logprobs);
 
     const json response = build_non_streaming_response(
         req, result, n_gen_cap, gen_timings, counts, emitter, &tokenizer_);
@@ -4763,15 +5372,197 @@ void HttpServer::send_nonstream_response(
 void HttpServer::worker_loop() {
     publish_memory_report();
     while (true) {
-        ServerJob * job = dequeue();
-        if (!job) break;  // stopping
+        run_pending_controls();
+        ServerJob * job = dequeue(/*wake_for_control=*/true);
+        if (!job) {
+            if (stopping_.load()) break;
+            continue;  // a control transition is pending
+        }
 
         process_job(job);
         publish_memory_report();
     }
+    fail_pending_controls("server stopping");
+}
+
+std::shared_ptr<ControlOp> HttpServer::post_control(bool evict,
+                                                    ModelBackend::EvictLevel level) {
+    auto op = std::make_shared<ControlOp>();
+    op->evict = evict;
+    op->level = level;
+    if (backend_.seq_engine()) {
+        op->finish(false, "residency control requires the serial worker");
+        return op;
+    }
+    {
+        std::lock_guard<std::mutex> lock(queue_mu_);
+        if (!stopping_.load()) {
+            control_queue_.push_back(op);
+            queue_cv_.notify_all();
+            return op;
+        }
+    }
+    op->finish(false, "server stopping");
+    return op;
+}
+
+void HttpServer::run_pending_controls() {
+    for (;;) {
+        std::shared_ptr<ControlOp> op;
+        {
+            std::lock_guard<std::mutex> lock(queue_mu_);
+            if (control_queue_.empty()) return;
+            op = std::move(control_queue_.front());
+            control_queue_.pop_front();
+        }
+        const auto start = std::chrono::steady_clock::now();
+        bool ok = false;
+        std::string error;
+        if (op->evict) {
+            const auto result = backend_.evict(op->level);
+            ok = result.status == ModelBackend::EvictStatus::ok;
+            error = result.error;
+            if (result.snapshots_lost > 0) {
+                std::fprintf(stderr, "[residency] %s: %d deferred prefix snapshot%s lost on eviction\n",
+                             config_.model_name.c_str(), result.snapshots_lost,
+                             result.snapshots_lost == 1 ? "" : "s");
+            }
+        } else {
+            ok = backend_.reinstate(error);
+        }
+        op->ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+        op->ran = true;
+        op->weights_resident = backend_.weights_resident();
+        op->weight_device_bytes = backend_.weight_device_bytes();
+        const char * what = !op->evict ? "reinstate"
+            : op->level == ModelBackend::EvictLevel::warm ? "evict (warm)"
+            : op->level == ModelBackend::EvictLevel::partial ? "evict (partial)" : "evict";
+        std::fprintf(stderr, "[residency] %s %s %s in %.0f ms%s%s\n",
+                     config_.model_name.c_str(), what,
+                     ok ? "done" : "FAILED", op->ms, error.empty() ? "" : ": ",
+                     error.c_str());
+        publish_memory_report();
+        op->finish(ok, std::move(error));
+    }
+}
+
+void HttpServer::fail_pending_controls(const std::string & reason) {
+    std::deque<std::shared_ptr<ControlOp>> pending;
+    {
+        std::lock_guard<std::mutex> lock(queue_mu_);
+        pending.swap(control_queue_);
+    }
+    for (auto & op : pending) op->finish(false, reason);
+}
+
+json HttpServer::hidden_states_body(const ParsedRequest & req,
+                                   const HiddenStates & states,
+                                   double prefill_s) {
+    const auto shape = backend_.hidden_state_shape();
+    const std::string last_token = req.prompt_tokens.empty()
+        ? std::string()
+        : utf8_sanitize(tokenizer_.token_text(req.prompt_tokens.back()));
+    return build_hidden_states_response(
+        config_.model_name, *req.hidden_states, shape.n_layers, shape.n_embd,
+        (int)req.prompt_tokens.size(), states, last_token, prefill_s * 1000.0,
+        cached_hidden_prefix_tokens(req));
+}
+
+int HttpServer::cached_hidden_prefix_tokens(const ParsedRequest & req) {
+    if (!req.hidden_states || !req.hidden_states->cache_prefix ||
+        prefix_cache_.disabled()) return 0;
+    return prefix_cache_.lookup_candidate(
+        req.prompt_tokens, (int)req.prompt_tokens.size()).second;
+}
+
+void HttpServer::process_hidden_states_job(ServerJob * job) {
+    const ParsedRequest & req = job->req;
+    {
+        ServerStatus::RequestInfo info;
+        info.model = req.model;
+        info.format = "hidden_states";
+        status_.set_running("", (int)req.prompt_tokens.size(), false, info);
+    }
+    broadcast_status();
+    StatusGuard status_guard{status_};
+
+    DaemonIO io;
+    io.should_cancel = [job]() {
+        return job->client_disconnected.load(std::memory_order_acquire);
+    };
+    // cache_prefix: save the state after the whole prompt as an inline
+    // prefix snapshot, keyed by the prompt, so a chat request extending it
+    // restores instead of prefilling. Nothing is restored here.
+    const int prompt_len = (int)req.prompt_tokens.size();
+    PrefixCache::InlineReservation reservation;
+    if (req.hidden_states->cache_prefix && !prefix_cache_.disabled()) {
+        reservation = prefix_cache_.reserve_inline_snap(
+            req.prompt_tokens, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/false, /*forced_cut=*/prompt_len,
+            /*restore_source_slot=*/-1,
+            [this](int target_cut) {
+                return backend_.snapshot_bytes_estimate(target_cut);
+            });
+    }
+    const int snap_slot = reservation.active() ? reservation.slot() : -1;
+    if (snap_slot >= 0) {
+        forget_inline_slot_metadata(snap_slot);
+        backend_.snapshot_free(snap_slot);
+    }
+
+    HiddenStates states;
+    std::string error;
+    const auto started_at = std::chrono::steady_clock::now();
+    const bool ok = backend_.compute_hidden_states(
+        req.prompt_tokens, req.hidden_spec, snap_slot, io, states, error);
+    const double prefill_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started_at).count();
+    if (snap_slot >= 0) {
+        if (ok && backend_.snapshot_used(snap_slot) &&
+            backend_.snapshot_cur_pos(snap_slot) == prompt_len) {
+            reservation.commit(
+                req.prompt_tokens,
+                backend_.snapshot_bytes_estimate(prompt_len));
+            trim_snapshots_after_commit(snap_slot);
+            slot_tokens_[snap_slot] = req.prompt_tokens;
+        } else {
+            backend_.snapshot_free(snap_slot);
+            reservation.abort();
+        }
+    }
+    backend_.release_scratch();
+    std::fprintf(stderr,
+        "[server] hidden_states DONE %s ok=%s in=%zu layers=%zu prefill=%.1fms%s%s\n",
+        req.response_id.c_str(), ok ? "true" : "false", req.prompt_tokens.size(),
+        req.hidden_spec.layers.size(), prefill_s * 1000.0,
+        ok ? "" : " error=", ok ? "" : error.c_str());
+
+    if (!job->client_disconnected.load(std::memory_order_acquire)) {
+        sock_set_block(job->fd);
+        if (ok) {
+            send_response(job->fd, 200, "application/json",
+                          hidden_states_body(req, states, prefill_s).dump() + "\n");
+        } else {
+            const ResponseError response_error =
+                ResponseError::internal("hidden_states_failed", error);
+            send_response(job->fd, response_error_http_status(response_error),
+                          "application/json",
+                          build_error_response(req.format, response_error,
+                                               req.response_id).dump() + "\n");
+        }
+    }
+    stop_job_stream(job);
+    std::lock_guard<std::mutex> lk(job->mu);
+    job->done = true;
+    job->cv.notify_one();
 }
 
 void HttpServer::process_job(ServerJob * job) {
+    if (job->req.hidden_states) {
+        process_hidden_states_job(job);
+        return;
+    }
     SocketHandle fd = job->fd;
     const auto & req = job->req;
     auto started_at = std::chrono::steady_clock::now();
@@ -5159,10 +5950,13 @@ bool HttpServer::has_pending_jobs() {
     return queue_head_ != nullptr;
 }
 
-ServerJob * HttpServer::dequeue() {
+ServerJob * HttpServer::dequeue(bool wake_for_control) {
     std::unique_lock<std::mutex> lk(queue_mu_);
+    const auto control_pending = [&] {
+        return wake_for_control && !control_queue_.empty();
+    };
     // Use timed wait so the worker periodically wakes to send SSE heartbeats.
-    while (!queue_head_ && !stopping_.load()) {
+    while (!queue_head_ && !control_pending() && !stopping_.load()) {
         if (queue_cv_.wait_for(lk, std::chrono::seconds(30)) == std::cv_status::timeout) {
             // Send SSE heartbeat (comment line) to detect disconnected clients.
             lk.unlock();
@@ -5170,7 +5964,9 @@ ServerJob * HttpServer::dequeue() {
             lk.lock();
         }
     }
-    if (!queue_head_) return nullptr;
+    // Transitions first: the swap manager posts one only once the model is
+    // drained.
+    if (control_pending() || !queue_head_) return nullptr;
     ServerJob * j = queue_head_;
     queue_head_ = j->next;
     if (!queue_head_) queue_tail_ = nullptr;

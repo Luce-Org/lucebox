@@ -24,14 +24,14 @@ MoeHybridStreamEngine::~MoeHybridStreamEngine() {
 MoeHybridStreamEngine::MoeHybridStreamEngine(MoeHybridStreamEngine && o) noexcept
     : pinned_buf_(o.pinned_buf_), pinned_size_(o.pinned_size_),
       gpu_scratch_(o.gpu_scratch_), scratch_size_(o.scratch_size_),
-      backend_(o.backend_),
+      scratch_device_(o.scratch_device_), backend_(o.backend_),
       scratch_gate_(o.scratch_gate_), scratch_up_(o.scratch_up_),
       scratch_down_(o.scratch_down_),
       last_gate_bytes_(o.last_gate_bytes_), last_up_bytes_(o.last_up_bytes_),
       last_down_bytes_(o.last_down_bytes_), stats_(o.stats_) {
     o.stats_ = {};
     o.pinned_buf_ = nullptr; o.pinned_size_ = 0;
-    o.gpu_scratch_ = nullptr; o.scratch_size_ = 0;
+    o.gpu_scratch_ = nullptr; o.scratch_size_ = 0; o.scratch_device_ = -1;
     o.backend_ = nullptr;
     o.scratch_gate_ = nullptr; o.scratch_up_ = nullptr; o.scratch_down_ = nullptr;
     o.last_gate_bytes_ = 0; o.last_up_bytes_ = 0; o.last_down_bytes_ = 0;
@@ -42,6 +42,7 @@ MoeHybridStreamEngine & MoeHybridStreamEngine::operator=(MoeHybridStreamEngine &
         destroy();
         pinned_buf_ = o.pinned_buf_; pinned_size_ = o.pinned_size_;
         gpu_scratch_ = o.gpu_scratch_; scratch_size_ = o.scratch_size_;
+        scratch_device_ = o.scratch_device_;
         backend_ = o.backend_;
         scratch_gate_ = o.scratch_gate_; scratch_up_ = o.scratch_up_;
         scratch_down_ = o.scratch_down_;
@@ -49,7 +50,7 @@ MoeHybridStreamEngine & MoeHybridStreamEngine::operator=(MoeHybridStreamEngine &
         last_down_bytes_ = o.last_down_bytes_;
         stats_ = o.stats_; o.stats_ = {};
         o.pinned_buf_ = nullptr; o.pinned_size_ = 0;
-        o.gpu_scratch_ = nullptr; o.scratch_size_ = 0;
+        o.gpu_scratch_ = nullptr; o.scratch_size_ = 0; o.scratch_device_ = -1;
         o.backend_ = nullptr;
         o.scratch_gate_ = nullptr; o.scratch_up_ = nullptr; o.scratch_down_ = nullptr;
         o.last_gate_bytes_ = 0; o.last_up_bytes_ = 0; o.last_down_bytes_ = 0;
@@ -67,8 +68,28 @@ MoeHybridStreamEngine & MoeHybridStreamEngine::operator=(MoeHybridStreamEngine &
 static constexpr size_t kRegionPad = 4096;
 static constexpr size_t kRegions   = 3;   // gate, up, down (or gate_up, down)
 
+namespace {
+
+// Makes `device` current for this scope (no-op for -1), restoring the
+// caller's device afterwards: a raw allocation belongs to the current device.
+struct ScopedDevice {
+    int previous = -1;
+    explicit ScopedDevice(int device) {
+        if (device < 0 || cudaGetDevice(&previous) != cudaSuccess) {
+            previous = -1;
+            return;
+        }
+        if (previous == device || cudaSetDevice(device) != cudaSuccess) previous = -1;
+    }
+    ~ScopedDevice() {
+        if (previous >= 0) (void) cudaSetDevice(previous);
+    }
+};
+
+}  // namespace
+
 bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend, size_t max_expert_bytes,
-                                 std::string * err) {
+                                 std::string * err, int device) {
     destroy();
     if (!gpu_backend || max_expert_bytes == 0) {
         if (err) *err = "invalid arguments to stream engine init";
@@ -87,7 +108,10 @@ bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend, size_t max_expert_b
     pinned_size_ = alloc_bytes;
 
     // Allocate GPU scratch buffer
-    cuda_err = cudaMalloc(&gpu_scratch_, alloc_bytes);
+    {
+        const ScopedDevice scoped(device);
+        cuda_err = cudaMalloc(&gpu_scratch_, alloc_bytes);
+    }
     if (cuda_err != cudaSuccess) {
         if (err) *err = std::string("cudaMalloc scratch failed: ") + cudaGetErrorString(cuda_err);
         cudaFreeHost(pinned_buf_);
@@ -96,6 +120,7 @@ bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend, size_t max_expert_b
         return false;
     }
     scratch_size_ = alloc_bytes;
+    scratch_device_ = device;
     backend_ = gpu_backend;
     return true;
 }
@@ -106,9 +131,11 @@ bool MoeHybridStreamEngine::is_ready() const {
 
 void MoeHybridStreamEngine::destroy() {
     if (gpu_scratch_) {
+        const ScopedDevice scoped(scratch_device_);
         cudaFree(gpu_scratch_);
         gpu_scratch_ = nullptr;
     }
+    scratch_device_ = -1;
     if (pinned_buf_) {
         cudaFreeHost(pinned_buf_);
         pinned_buf_ = nullptr;

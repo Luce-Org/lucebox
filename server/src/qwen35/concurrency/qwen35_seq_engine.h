@@ -88,6 +88,7 @@ public:
         const PrefixStorePlan & plan) override;
 
     StepResult step(const StepPlan & plan) override;
+    std::optional<TokenLogprobs> token_logprobs(int slot, int32_t token) override;
     StepPlanLimits step_plan_limits(int decode_rows) const override {
         const bool mixed = decode_rows > 0;
         const int per_sequence = mixed ? 512 : 2048;
@@ -126,6 +127,17 @@ public:
 
     bool token_is_eos(int32_t token) const override;
 
+    bool supports_hidden_states() const override;
+    AdmitResult admit_hidden_states(uint64_t request_id,
+                                    const std::vector<int32_t> & prompt,
+                                    const HiddenStatesSpec & spec,
+                                    PrefixCaptureTicket capture) override;
+    // A hidden-states slot accumulates over one pass of its prompt; a
+    // re-prefill would count rows twice.
+    bool kv_recomputable(int slot) const override {
+        return !hidden_slot(slot);
+    }
+
 
 private:
     struct PrefillStage {
@@ -149,6 +161,19 @@ private:
         int rope_delta = 0;
     };
     std::vector<SlotImages> slot_images_;
+
+    // Hidden-states slots (admit_hidden_states): the running readout, fed
+    // by every prefill chunk of the slot and emitted on its commit.
+    std::vector<std::optional<HiddenStatesAccumulator>> slot_hidden_;
+    bool hidden_slot(int slot) const {
+        return slot >= 0 && slot < static_cast<int>(slot_hidden_.size()) &&
+               slot_hidden_[static_cast<size_t>(slot)].has_value();
+    }
+    void clear_slot_hidden(int slot) {
+        if (slot >= 0 && slot < static_cast<int>(slot_hidden_.size())) {
+            slot_hidden_[static_cast<size_t>(slot)].reset();
+        }
+    }
     int rope_delta(int slot) const {
         return slot >= 0 && slot < static_cast<int>(slot_images_.size())
             ? slot_images_[static_cast<size_t>(slot)].rope_delta : 0;
@@ -180,9 +205,12 @@ private:
                               const char * client_message);
     PrefillStage stage_prefill_chunk(int slot, int max_tokens,
                                      std::vector<PrefillOutput> & outputs);
+    // `logprobs_out`, when non-null, receives the chosen token's
+    // log-probabilities if the slot's sampler asks for them.
     int32_t sample_graph_row(int slot, int logits_row,
                              const int32_t * cached_argmax = nullptr,
-                             std::vector<float> * logits_scratch = nullptr);
+                             std::vector<float> * logits_scratch = nullptr,
+                             std::optional<TokenLogprobs> * logprobs_out = nullptr);
     std::vector<uint8_t> select_chain_lanes(
         const StepPlan & plan) const;
     // width: the block the round drafts (0 = the configured block).
@@ -285,6 +313,7 @@ private:
     std::vector<int64_t>     rows_buf_;
     std::vector<int32_t>     argmax_buf_;
     std::vector<float>       logits_buf_;
+    std::vector<int>         slot_logits_row_;
 };
 
 }  // namespace luce::common

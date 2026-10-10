@@ -23,6 +23,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "generation_types.h"
+#include "hidden_states.h"
 #include "sampler.h"
 #include "image_prompt.h"
 #include "concurrency/seq_engine.h"
@@ -169,6 +170,55 @@ struct ModelBackend {
     virtual bool unpark(ParkTarget target) = 0;
     virtual bool is_target_parked() const = 0;
 
+    // ── Eviction (runtime model swapping) ────────────────────────────
+    // evict() releases every device allocation the model owns (weights,
+    // drafts, KV/recurrent caches, graphs, scratch and its backend contexts)
+    // so another model can use the device. Host-side prefix snapshots stay
+    // valid; reinstate() rebuilds the device layout that existed at init
+    // (same context, KV types and sizes), so they restore afterwards.
+    // Both run on the model's worker thread while it is idle. Unlike park(),
+    // which a backend uses for its own transient memory juggling, eviction
+    // always leaves the model with no device state.
+    // cold: release everything. warm: keep the weights in device memory and
+    // release the rest (KV/recurrent cache, graphs, scratch, backend context
+    // with its pools), so a later reinstate only rebuilds the cache.
+    // partial: release the primary device only, keeping a secondary device's
+    // expert tier (DeepSeek V4 with in-process experts; others reject it).
+    enum class EvictLevel { cold, warm, partial };
+    enum class EvictStatus {
+        ok,          // device state released (or already evicted)
+        rejected,    // refused before any teardown; the model is unchanged
+    };
+    struct EvictResult {
+        EvictStatus status = EvictStatus::rejected;
+        std::string error;
+        // Deferred snapshots that could not be copied to host and were freed;
+        // their prefix-cache entries no longer restore.
+        int snapshots_lost = 0;
+    };
+    // Whether this configuration supports eviction; `reason` explains a no.
+    virtual bool supports_eviction(std::string & reason) const {
+        reason = "this backend does not support eviction";
+        return false;
+    }
+    virtual EvictResult evict(EvictLevel level = EvictLevel::cold) {
+        (void) level;
+        EvictResult r;
+        supports_eviction(r.error);
+        return r;
+    }
+    // On failure the model is left evicted with its partial device state
+    // released, so a retry or another model can use the device.
+    virtual bool reinstate(std::string & error) {
+        supports_eviction(error);
+        return false;
+    }
+    virtual bool is_evicted() const { return false; }
+    // Evicted warm: the weights still occupy device memory.
+    virtual bool weights_resident() const { return !is_evicted(); }
+    // Device bytes of the weights (target + draft) while they are resident.
+    virtual size_t weight_device_bytes() const { return 0; }
+
     // ── Generation ───────────────────────────────────────────────────
     // Run a full prefill + decode cycle. Backend owns the strategy
     // (autoregressive, speculative, DDTree, …).
@@ -193,6 +243,39 @@ struct ModelBackend {
 
     virtual GenerateResult generate_impl(const GenerateRequest & req,
                                          const DaemonIO & io) = 0;
+
+    // Whether generate() (with force_ar_decode) and seq_engine() fill
+    // per-token log-probabilities when sampler.wants_logprobs(). The server
+    // rejects logprobs requests for backends that do not.
+    virtual bool supports_logprobs() const { return false; }
+
+    // ── Hidden states (/v1/hidden_states) ────────────────────────────
+    // Whether this backend can report the residual stream after chosen
+    // blocks for a prompt: through compute_hidden_states() when it serves
+    // one request at a time, and through SeqEngine::admit_hidden_states()
+    // when seq_engine() is non-null. The server rejects the request
+    // otherwise.
+    virtual bool supports_hidden_states() const { return false; }
+    struct HiddenStateShape {
+        int n_layers = 0;  // blocks a request may index
+        int n_embd = 0;    // floats per reported vector
+    };
+    virtual HiddenStateShape hidden_state_shape() const { return {}; }
+    // Prefill `prompt` from position zero -- never from a prefix snapshot --
+    // and read `spec`'s layers. No token is decoded. When `snap_slot` >= 0
+    // the state after the whole prompt is also saved into that snapshot
+    // slot (an end-of-prefill save, which leaves the prefill itself
+    // unchanged). Serves the single-request worker only.
+    virtual bool compute_hidden_states(const std::vector<int32_t> & prompt,
+                                       const HiddenStatesSpec & spec,
+                                       int snap_slot,
+                                       const DaemonIO & io,
+                                       HiddenStates & out,
+                                       std::string & error) {
+        (void) prompt; (void) spec; (void) snap_slot; (void) io; (void) out;
+        error = "this model backend does not report hidden states";
+        return false;
+    }
 
     // ── Concurrent serving ───────────────────────────────────────────
     // Backends that can hold several live sequences at once and execute a

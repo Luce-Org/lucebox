@@ -51,11 +51,14 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "common/hidden_states.h"
 #include "common/image_prompt.h"
 #include "common/sampler.h"
+#include "common/token_logprobs.h"
 #include "prefix_store.h"
 
 namespace luce::common {
@@ -198,6 +201,25 @@ public:
         return result;
     }
 
+    // Hidden-states requests (/v1/hidden_states): prefill only. The slot
+    // never decodes: its completed PrefillOutput carries hidden_states and
+    // the scheduler retires it. The prompt is always prefilled from position
+    // zero: admission never restores a checkpoint. A valid `capture`
+    // (cache_prefix; only from an engine reporting supports_prefix_store())
+    // is armed like admit_with_prefix's and reported in
+    // AdmitResult::prefix_store.capture when accepted.
+    virtual bool supports_hidden_states() const { return false; }
+    virtual AdmitResult admit_hidden_states(uint64_t request_id,
+                                            const std::vector<int32_t> & prompt,
+                                            const HiddenStatesSpec & spec,
+                                            PrefixCaptureTicket capture) {
+        (void) request_id; (void) prompt; (void) spec; (void) capture;
+        AdmitResult result;
+        result.status = AdmitResult::Status::failed;
+        result.error = "this engine does not report hidden states";
+        return result;
+    }
+
     // Optional prefix-checkpoint admission. Unsupported engines remain on
     // cold admission and never receive a plan from the scheduler.
     virtual bool supports_prefix_store() const { return false; }
@@ -214,6 +236,12 @@ public:
 
     // Release engine-owned payload without touching server policy metadata.
     virtual void discard_prefix_store(PrefixStoreRef) {}
+
+    // Re-read the last step's logits for a scheduler-substituted token.
+    // Called on the worker before the next step or retirement of this slot.
+    virtual std::optional<TokenLogprobs> token_logprobs(int, int32_t) {
+        return std::nullopt;
+    }
 
     struct StepInput {
         int     slot  = -1;
@@ -232,6 +260,9 @@ public:
         // per-request error instead of silently truncating generation.
         std::string error;
         std::vector<int32_t> committed_tokens;
+        // Log-probabilities of `token` when the slot's sampler asked for them
+        // (such slots never speculate, so committed_tokens stays empty).
+        std::optional<TokenLogprobs> logprobs;
     };
 
     struct PrefillOutput {
@@ -246,6 +277,11 @@ public:
         // Present only for completed: the request's first sampled token,
         // pending until the scheduler feeds it into the next decode step.
         int32_t token = -1;
+        // Log-probabilities of `token`, as for DecodeOutput.
+        std::optional<TokenLogprobs> logprobs;
+        // Present only for completed hidden-states slots (see
+        // admit_hidden_states); `token` is then meaningless.
+        std::optional<HiddenStates> hidden_states;
         // Present only for failed.
         std::string error;
         // A capture ending on this successfully-computed prefill boundary.

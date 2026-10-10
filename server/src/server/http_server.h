@@ -38,10 +38,12 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #if !defined(_WIN32)
@@ -92,12 +94,60 @@ enum class HeartbeatSendResult {
 HeartbeatSendResult try_send_sse_heartbeat(SocketHandle fd, size_t & offset);
 }
 
+// ─── Residency control ──────────────────────────────────────────────────
+// An evict/reinstate transition that runs on a model's worker thread between
+// requests. Owned by shared_ptr so it outlives whoever posted it.
+struct ControlOp {
+    bool evict = true;  // false: reinstate
+    ModelBackend::EvictLevel level = ModelBackend::EvictLevel::cold;  // evictions only
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    bool ok = false;
+    std::string error;
+    double ms = 0.0;
+    // The backend's weight residency once the transition ran, read on the
+    // worker so other threads never query a backend that may be mid-swap.
+    bool ran = false;  // the worker executed it (the fields below are set)
+    bool weights_resident = false;
+    size_t weight_device_bytes = 0;
+
+    void finish(bool success, std::string err) {
+        std::lock_guard<std::mutex> lock(mu);
+        ok = success;
+        error = std::move(err);
+        done = true;
+        cv.notify_all();
+    }
+    void wait() {
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&] { return done; });
+    }
+};
+
 // ─── Server configuration ───────────────────────────────────────────────
 struct ServerConfig {
     std::string host        = "0.0.0.0";
     int         port        = 8080;
     int         max_tokens  = 4096;     // default max output tokens (legacy alias for default_max_tokens)
     int         routing_queue_limit = 32; // waiting auto requests across the listener
+    // How a multi-model listener picks a model for a generation request.
+    // balance: operator priority with capacity fallback; the request's
+    // `model` is ignored. name: a request naming a loaded model runs only on
+    // it (waiting for its capacity); omitted/"auto" still balances.
+    enum class ModelRouting { balance, name };
+    ModelRouting model_routing = ModelRouting::balance;
+    // Name routing: serve an unrecognized model name on the primary instead
+    // of answering 404.
+    bool        unknown_model_to_primary = false;
+    // Swap residency (name routing): models whose devices overlap are not
+    // resident together; a request naming an evicted model swaps it in.
+    bool        swap_residency = false;
+    // Swap residency: this model is evicted warm (its weights stay in device
+    // memory) so switching back skips the weight upload; cold when memory runs
+    // short. Meant for the main model: keeping an occasional model warm
+    // shrinks what the active model can use.
+    bool        swap_keep_weights = false;
     int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
     bool        enable_cors = true;
     std::string model_name  = "luce";
@@ -226,6 +276,12 @@ struct ServerConfig {
     // server_main after CLI parse.
     std::string target_device;
     std::string draft_device;
+    // Every device the model occupies (each layer-split shard, draft, expert
+    // device), for swap residency's overlap and warm-eviction decisions.
+    std::vector<std::string> residency_devices;
+    // The devices a partial eviction keeps (DeepSeek V4's expert device):
+    // a model that does not use them can swap in without releasing them.
+    std::vector<std::string> residency_secondary_devices;
     // Idle-to-busy batching window. It is ignored by single-slot engines and
     // never delays an already decoding request.
     int admission_coalesce_ms = 20;
@@ -327,6 +383,24 @@ PflashQueryWindow find_pflash_query_window(
 
 // ─── Parsed request ─────────────────────────────────────────────────────
 
+// /v1/hidden_states fields beyond `model`, `messages` and
+// `chat_template_kwargs` (see docs/API.md).
+struct HiddenStatesRequest {
+    enum class Pooling { last, mean, both };
+    // As requested: 0-based block index, negative counts from the end.
+    std::vector<int> layers;
+    Pooling pooling = Pooling::last;
+    // "bare": the prompt ends at the assistant header; whatever the template
+    // appends after it (an empty or open think block) is dropped.
+    bool bare_generation_prompt = false;
+    // Keep this prefill in the prefix cache so a chat request whose prompt
+    // extends this one restores it instead of prefilling it again. The
+    // readout itself still comes from a full prefill: this request may store
+    // a checkpoint, never restore one.
+    bool cache_prefix = false;
+    bool wants_mean() const { return pooling != Pooling::last; }
+};
+
 struct ParsedRequest {
     ApiFormat                  format;
     std::vector<int32_t>      prompt_tokens;  // tokenized prompt
@@ -381,6 +455,11 @@ struct ParsedRequest {
     // The prompt ends with tool results. Clients only append after them, so
     // the inline snapshot may cover them (see select_inline_snapshot_boundary).
     bool                      ends_with_tool_result = false;
+    // Set for /v1/hidden_states: a prefill-only request whose response is
+    // the residual stream, not a completion. hidden_spec holds the layers
+    // resolved against the serving model.
+    std::optional<HiddenStatesRequest> hidden_states;
+    HiddenStatesSpec          hidden_spec;
 };
 
 // Resident budget the PrefixCache enforces: the concurrent limit in paged
@@ -419,6 +498,53 @@ SamplerCfg parse_request_sampler(const json & body,
 void apply_no_thinking_sampler_defaults(const json & body,
                                         const SamplingDefaults & no_thinking,
                                         SamplerCfg & sampler);
+
+// Resolve OpenAI chat `logprobs: true` / `top_logprobs` into
+// SamplerCfg::logprobs_top_n (-1 when not requested). Other shapes and
+// endpoints are ignored (-1). With logprobs: true, a top_logprobs that is not
+// an integer in [0, 20] throws std::invalid_argument; route_request's catch
+// turns that into a 400.
+int parse_request_logprobs(const json & body, ApiFormat format);
+
+// OpenAI chat `choices[].logprobs` object for per-token log-probabilities:
+// {"content": [{token, logprob, bytes, top_logprobs: [{token, logprob,
+// bytes}]}]}. `token_bytes` maps an id to its raw bytes, which may be a
+// partial UTF-8 sequence; `bytes` keeps them exact and `token` carries a
+// sanitized copy so the response stays valid JSON.
+json build_openai_logprobs(
+    const std::vector<TokenLogprobs> & logprobs,
+    const std::function<std::string(int32_t)> & token_bytes);
+
+// Parse the /v1/hidden_states fields `layers`, `pooling`,
+// `generation_prompt` and `cache_prefix`. Throws std::invalid_argument for a
+// missing, empty or non-integer `layers`, a repeated layer, an unknown
+// pooling / generation prompt, or a non-boolean `cache_prefix`; the caller
+// answers 400.
+HiddenStatesRequest parse_hidden_states_request(const json & body);
+
+// Resolve requested layers against a model with `n_layers` blocks (negative
+// indices count from the end). Throws std::invalid_argument when one falls
+// outside the model.
+HiddenStatesSpec resolve_hidden_states_spec(const HiddenStatesRequest & request,
+                                            int n_layers);
+
+// generation_prompt="bare": cut a rendered ChatML prompt right after its final,
+// still-open `<|im_start|>assistant\n` header, dropping whatever the template
+// appended (e.g. `<think>\n\n</think>\n\n`). False when the prompt does not
+// end in an open assistant turn.
+bool trim_to_assistant_header(std::string & rendered);
+
+// The /v1/hidden_states response body. `last_token` is the decoded text of
+// the final prompt token. `cached_prefix_tokens` is reported only when the
+// request asked for cache_prefix: how many leading prompt tokens the prefix
+// cache holds once the request is done (0 when nothing could be stored).
+json build_hidden_states_response(const std::string & model,
+                                  const HiddenStatesRequest & request,
+                                  int n_layers, int n_embd, int prompt_tokens,
+                                  const HiddenStates & states,
+                                  const std::string & last_token,
+                                  double prefill_ms,
+                                  int cached_prefix_tokens = 0);
 
 // Read the required `messages` field. Throws std::invalid_argument when
 // it is missing or not a non-empty array; route_request's catch turns
@@ -494,11 +620,21 @@ private:
     bool handle_model_request(SocketHandle fd, ParsedRequest & req, bool count_only,
                               RoutingAdmission * admission = nullptr);
     json model_routing_status();
+    // Swap residency: queue a transition on this model's worker. Completes
+    // with an error at once when the worker is stopping or not serial.
+    std::shared_ptr<ControlOp> post_control(
+        bool evict, ModelBackend::EvictLevel level = ModelBackend::EvictLevel::cold);
 
     // Worker thread: process jobs sequentially. process_job owns the
     // lifecycle of one dequeued request, including signaling completion.
     void worker_loop();
     void process_job(ServerJob * job);
+    // process_job for /v1/hidden_states on the single-request worker.
+    void process_hidden_states_job(ServerJob * job);
+    json hidden_states_body(const ParsedRequest & req,
+                            const HiddenStates & states, double prefill_s);
+    // cache_prefix: the leading prompt tokens the prefix cache now holds.
+    int cached_hidden_prefix_tokens(const ParsedRequest & req);
 
     struct PreparedPrompt {
         std::vector<int32_t> tokens;
@@ -617,7 +753,8 @@ private:
         const std::vector<int32_t> & gen_tokens, int n_gen_cap,
         bool budget_forced_close, bool degenerate_decode_close,
         const GenTimings & gen_timings,
-        ClientSendBuffer * send_buffer = nullptr);
+        ClientSendBuffer * send_buffer = nullptr,
+        std::vector<TokenLogprobs> logprobs = {});
     std::string format_http_response(
         int status, const std::string & content_type,
         const std::string & body);
@@ -669,7 +806,12 @@ private:
 
     // Job queue.
     void enqueue(ServerJob * job);
-    ServerJob * dequeue();
+    // Blocks for the next job. With `wake_for_control` (the serial worker) it
+    // also returns nullptr when a control transition is pending, which
+    // run_pending_controls() then executes.
+    ServerJob * dequeue(bool wake_for_control = false);
+    void run_pending_controls();
+    void fail_pending_controls(const std::string & reason);
     bool has_pending_jobs();
 
     // Members.
@@ -745,15 +887,56 @@ private:
     // Immutable model table after run() starts; only reservations mutate under
     // routing_mu_. A reservation spans parsing through job retirement/output
     // draining, so disconnects never make still-running engine work invisible.
+    enum class Residency { resident, evicted, failed };
     struct RoutedModel {
         HttpServer * server;
         int capacity;
         int in_flight = 0;
+        // Swap residency (guarded by routing_mu_).
+        std::vector<std::string> devices;
+        Residency residency = Residency::resident;
+        bool closing = false;      // draining for an eviction: admits nothing
+        int waiters = 0;           // pinned requests waiting for residency
+        int cohort_remaining = 0;  // waiters to serve before swapping away
+        int swaps_in = 0;
+        double last_evict_ms = 0.0;
+        double last_reinstate_ms = 0.0;
+        std::string last_error;
+        std::chrono::steady_clock::time_point failed_at{};
+        // Weight residency as of the last transition (or startup).
+        bool weights_resident = true;
+        size_t weight_device_bytes = 0;
+        // While evicted, the devices still holding its memory: its own device
+        // for weights kept warm, the secondary devices for a partial eviction.
+        std::vector<std::string> retained_devices;
+        bool retained_warm = false;  // retained_devices hold warm weights
     };
     std::vector<RoutedModel> models_;
     std::mutex routing_mu_;
     std::condition_variable routing_cv_;
     int routing_waiters_ = 0;
+    bool swap_active_ = false;  // one transition at a time (routing_mu_)
+    // Brings `target` in, evicting every resident model whose devices
+    // overlap. Called without routing_mu_; returns false with `error` when
+    // the swap failed. Returns true without work when another swap runs or
+    // the policy defers it (the caller keeps waiting).
+    bool drive_swap(RoutedModel & target, std::string & error);
+    static bool devices_overlap(const RoutedModel & a, const RoutedModel & b);
+    // Whether evicted `model` must release what it retains before `target`
+    // runs: a retained secondary tier on the target's devices, or warm
+    // weights there when the target spans several devices.
+    static bool retained_conflict(const RoutedModel & model, const RoutedModel & target);
+    // How resident `model` gives way to `target`: partial keeps a secondary
+    // device the target does not use; warm keeps weights between two
+    // single-device models; cold otherwise.
+    static ModelBackend::EvictLevel eviction_level(const RoutedModel & model,
+                                                   const RoutedModel & target);
+    // Records a finished transition's timing and weight residency on `model`
+    // (call under routing_mu_).
+    static void record_control(RoutedModel & model, const ControlOp & op);
+
+    // Control transitions for this model's serial worker (queue_mu_).
+    std::deque<std::shared_ptr<ControlOp>> control_queue_;
 
     // Request queue consumed by the serving loop owned by LuceEngine.
     std::mutex                      queue_mu_;

@@ -6656,7 +6656,7 @@ static size_t ds4_decode_attn_cache_budget(DeepSeek4LayerRangeCache & rc) {
         if (rc.device >= 0 && rc.backend && ggml_backend_is_cuda(rc.backend)) {
             size_t free_bytes = 0;
             size_t total_bytes = 0;
-            ggml_backend_cuda_get_device_memory(rc.device, &free_bytes, &total_bytes);
+            ds4_device_memory(rc.device, &free_bytes, &total_bytes);
             (void) total_bytes;
             budget = free_bytes / 4;
         }
@@ -11121,7 +11121,7 @@ bool deepseek4_step_layer_range(
                     if (required_bytes > attn_bytes_before) {
                         size_t free_bytes = 0;
                         size_t total_bytes = 0;
-                        ggml_backend_cuda_get_device_memory(
+                        ds4_device_memory(
                             device, &free_bytes, &total_bytes);
                         (void) total_bytes;
                         // The route and hot-owner arenas belong to the
@@ -11178,7 +11178,7 @@ bool deepseek4_step_layer_range(
                             // arena from growing by only a few dozen MiB.
                             ds4_free_route_and_hot_arenas(moe_hybrid);
                             size_t free_after_evict = 0;
-                            ggml_backend_cuda_get_device_memory(
+                            ds4_device_memory(
                                 device, &free_after_evict, &total_bytes);
                             std::fprintf(stderr,
                                 "[deepseek4] evicted fused decode graphs "
@@ -11955,7 +11955,7 @@ bool deepseek4_prefill_layer_major(
         constexpr size_t kResidualHeadroom = (size_t) 1536 << 20;
         const size_t bytes = (size_t) n_tokens * hc_dim * sizeof(float);
         size_t free_b = 0, total_b = 0;
-        ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+        ds4_device_memory(device, &free_b, &total_b);
         if (free_b > bytes + kResidualHeadroom) {
             ggml_init_params p{};
             p.mem_size = 2 * ggml_tensor_overhead();
@@ -12258,7 +12258,7 @@ void deepseek4_release_prefill_scratch(
     size_t free_before = 0;
     size_t total_bytes = 0;
     if (runtime && runtime->device >= 0) {
-        ggml_backend_cuda_get_device_memory(
+        ds4_device_memory(
             runtime->device, &free_before, &total_bytes);
     }
 
@@ -12278,20 +12278,7 @@ void deepseek4_release_prefill_scratch(
         ds4_layer_major_meta_arena.shrink_to_fit();
         ds4_layer_major_meta_owner = nullptr;
     }
-    if (moe_hybrid) {
-        if (moe_hybrid->prefill_route_alloc) {
-            ggml_gallocr_free(moe_hybrid->prefill_route_alloc);
-            moe_hybrid->prefill_route_alloc = nullptr;
-        }
-        if (moe_hybrid->prefill_hot_alloc) {
-            ggml_gallocr_free(moe_hybrid->prefill_hot_alloc);
-            moe_hybrid->prefill_hot_alloc = nullptr;
-        }
-        if (moe_hybrid->prefill_cold_alloc) {
-            ggml_gallocr_free(moe_hybrid->prefill_cold_alloc);
-            moe_hybrid->prefill_cold_alloc = nullptr;
-        }
-    }
+    if (moe_hybrid) moe_hybrid->release_prefill_allocators();
 
     static const bool report_release = [] {
         const char * value = std::getenv("LUCE_DS4_TIMING");
@@ -12300,7 +12287,7 @@ void deepseek4_release_prefill_scratch(
     }();
     if (report_release && runtime && runtime->device >= 0) {
         size_t free_after = 0;
-        ggml_backend_cuda_get_device_memory(
+        ds4_device_memory(
             runtime->device, &free_after, &total_bytes);
         std::fprintf(stderr,
                      "[deepseek4] released prefill scratch: "

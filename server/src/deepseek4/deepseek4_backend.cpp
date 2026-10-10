@@ -16,10 +16,13 @@
 #include "common/io_utils.h"
 #include "common/peer_access.h"
 #include "common/platform_env.h"
+#include "common/platform_io.h"
 #include "common/sampler.h"
 #include "common/dspark_head.h"
 #include "common/moe_hybrid_expert_cache.h"
 #include "common/moe_hybrid_routing_stats.h"
+#include "common/dspark_head.h"
+#include "deepseek4_hc_cuda.h"
 
 #include <optional>
 #include <nlohmann/json.hpp>
@@ -43,6 +46,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 #include <fstream>
 #include <atomic>
 #include <condition_variable>
@@ -624,17 +630,6 @@ static void configure_gfx1201_hybrid_sub_batch_default(int gpu) {
 #endif
 }
 
-struct Ds4MoeTpConfig {
-    bool requested = false;
-    bool in_process = false;
-    bool backend_valid = true;
-    PlacementBackend secondary_backend = PlacementBackend::Auto;
-    int secondary_gpu = 0;
-    bool all_on_secondary = false;
-    bool concentrate_secondary = false;
-    bool profile_hot_on_secondary = false;
-};
-
 static Ds4MoeTpConfig ds4_moe_tp_config(int local_gpu) {
     Ds4MoeTpConfig result;
     result.requested = env_flag_enabled("LUCE_DS4_MOE_TP");
@@ -689,6 +684,32 @@ static bool ds4_draft_backend(PlacementBackend & out) {
     }
     return parse_placement_backend(raw, out) &&
            out != PlacementBackend::Auto;
+}
+
+static DeepSeek4ResolvedSettings resolve_deepseek4_settings(const DeepSeek4BackendConfig & cfg) {
+    DeepSeek4ResolvedSettings out;
+    out.tp = ds4_moe_tp_config(cfg.device.gpu);
+    out.force_full_load = env_flag_enabled("LUCE_DS4_FORCE_FULL_LOAD");
+    out.dense_tp_mask = env_flag_enabled("LUCE_DS4_DENSE_TP_MASK");
+    out.fused_decode_env = env_flag_enabled("LUCE_DS4_FUSED_DECODE");
+    out.decode_all_cold = env_flag_enabled("LUCE_DS4_DECODE_ALL_COLD");
+    out.spec_requested = !cfg.draft_path.empty() || env_flag_enabled("LUCE_DS4_SPEC");
+    if (const char * path = std::getenv("LUCE_DS4_DRAFT")) out.spec_env_draft_path = path;
+    // server_main makes an explicit --draft-device concrete (auto:N included),
+    // so an auto backend here means "not placed": environment, then target.
+    out.draft_gpu = cfg.device.gpu;
+    if (cfg.draft_device.backend != PlacementBackend::Auto) {
+        out.draft_backend = cfg.draft_device.backend;
+        out.draft_gpu = cfg.draft_device.gpu;
+    } else {
+        if (const char * gpu = std::getenv("LUCE_DS4_DRAFT_GPU")) {
+            out.draft_gpu = std::max(0, std::atoi(gpu));
+        }
+        out.draft_backend_valid = ds4_draft_backend(out.draft_backend);
+    }
+    out.draft_separate_stream = env_flag_enabled("LUCE_DS4_DRAFT_SEPARATE_STREAM");
+    out.draft_low_priority = env_flag_enabled("LUCE_DS4_DRAFT_LOW_PRIORITY");
+    return out;
 }
 
 static double gib(uint64_t bytes) {
@@ -1679,7 +1700,7 @@ bool DeepSeek4Backend::validate_model_features() const {
     // 16,384 compressed rows) does not match the reference yet.
     unsupported = "a CUDA build (V4.1 is qualified on ROCm)";
 #endif
-    if (cfg_.fused_decode || env_flag_enabled("LUCE_DS4_FUSED_DECODE")) {
+    if (cfg_.fused_decode || settings_.fused_decode_env) {
         unsupported = "fused decode";
     } else if (cfg_.fused_verify_f16_kv) {
         unsupported = "the fused verifier's F16 K/V";
@@ -1744,8 +1765,19 @@ bool DeepSeek4Backend::init_engram() {
 // --ds4-protected-experts ({"<layer>": [expert ids], ...}) into the weights.
 bool DeepSeek4Backend::load_routing_adjustments() {
     const size_t n = (size_t) w_.n_layer * (size_t) w_.n_expert;
-    w_.router_bias_delta.clear();
-    w_.protected_experts.clear();
+    if (routing_inputs_.parsed) {
+        // Parsed once: a reload uses the inputs the model was loaded with,
+        // whatever the files hold now.
+        if (routing_inputs_.n_layer != w_.n_layer || routing_inputs_.n_expert != w_.n_expert) {
+            std::fprintf(stderr, "[deepseek4] routing adjustments were parsed for [%d][%d], the model is [%d][%d]\n",
+                         routing_inputs_.n_layer, routing_inputs_.n_expert, w_.n_layer, w_.n_expert);
+            return false;
+        }
+        w_.router_bias_delta = routing_inputs_.router_bias_delta;
+        w_.protected_experts = routing_inputs_.protected_experts;
+        return true;
+    }
+    routing_inputs_ = RoutingInputs{};
     if (!cfg_.router_bias_path.empty()) {
         std::ifstream f(cfg_.router_bias_path, std::ios::binary | std::ios::ate);
         if (!f || (size_t) f.tellg() != n * sizeof(float)) {
@@ -1753,11 +1785,11 @@ bool DeepSeek4Backend::load_routing_adjustments() {
                          cfg_.router_bias_path.c_str(), n, w_.n_layer, w_.n_expert);
             return false;
         }
-        w_.router_bias_delta.resize(n);
+        routing_inputs_.router_bias_delta.resize(n);
         f.seekg(0);
-        f.read(reinterpret_cast<char *>(w_.router_bias_delta.data()), (std::streamsize) (n * sizeof(float)));
+        f.read(reinterpret_cast<char *>(routing_inputs_.router_bias_delta.data()), (std::streamsize) (n * sizeof(float)));
         if (!f) return false;
-        for (float v : w_.router_bias_delta) {
+        for (float v : routing_inputs_.router_bias_delta) {
             if (!std::isfinite(v)) {
                 std::fprintf(stderr, "[deepseek4] router bias %s holds a non-finite value\n",
                              cfg_.router_bias_path.c_str());
@@ -1780,7 +1812,7 @@ bool DeepSeek4Backend::load_routing_adjustments() {
                          cfg_.protected_experts_path.c_str());
             return false;
         }
-        w_.protected_experts.assign(n, 0);
+        routing_inputs_.protected_experts.assign(n, 0);
         for (auto it = j.begin(); it != j.end(); ++it) {
             int layer = -1;
             const std::string & key = it.key();
@@ -1796,10 +1828,15 @@ bool DeepSeek4Backend::load_routing_adjustments() {
                     std::fprintf(stderr, "[deepseek4] protected experts: bad expert in layer %d\n", layer);
                     return false;
                 }
-                w_.protected_experts[(size_t) layer * (size_t) w_.n_expert + (size_t) expert] = 1;
+                routing_inputs_.protected_experts[(size_t) layer * (size_t) w_.n_expert + (size_t) expert] = 1;
             }
         }
     }
+    routing_inputs_.n_layer = w_.n_layer;
+    routing_inputs_.n_expert = w_.n_expert;
+    routing_inputs_.parsed = true;
+    w_.router_bias_delta = routing_inputs_.router_bias_delta;
+    w_.protected_experts = routing_inputs_.protected_experts;
     return true;
 }
 
@@ -1842,6 +1879,12 @@ bool DeepSeek4Backend::upload_protected_routing() {
 // Adds the router bias delta to every layer's selection bias once, so routing
 // pays nothing per token. Mixing weights are unaffected (they never read it).
 bool DeepSeek4Backend::apply_routing_adjustments() {
+    // The delta goes onto the biases exactly as loaded from the file; adding
+    // it to already adjusted ones would shift routing on every reload.
+    if (w_.router_bias_applied) {
+        std::fprintf(stderr, "[deepseek4] routing adjustments are already applied to these weights\n");
+        return false;
+    }
     if (!load_routing_adjustments()) return false;
     if (!w_.router_bias_delta.empty()) {
         std::vector<float> bias((size_t) w_.n_expert);
@@ -1858,6 +1901,7 @@ bool DeepSeek4Backend::apply_routing_adjustments() {
             ggml_backend_tensor_set(t, bias.data(), 0, sizeof(float) * bias.size());
         }
     }
+    w_.router_bias_applied = true;
     if (!upload_protected_routing()) return false;
     // Host routing reads a selection bias per layer and token; keep a copy.
     w_.selection_bias_host.clear();
@@ -1933,6 +1977,8 @@ bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, int secondar
             const uint64_t keep = ds4_host_reserve_bytes(w_, cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192);
             const uint64_t host_want = avail > keep ? avail - keep : 0;
             host_bytes = ggml_backend_cuda_set_host_spill(secondary_gpu, carve_reserve, host_want);
+            frozen_.spill_carve_reserve = carve_reserve;
+            frozen_.spill_host_want = host_want;
             if (host_bytes + (1ULL << 30) < host_want) {
                 std::fprintf(stderr, "[deepseek4] device %d: only %.2f of %.2f GiB of host memory can be locked "
                              "(RLIMIT_MEMLOCK); the rest of these experts stream from the drive. Run as a "
@@ -2080,12 +2126,12 @@ bool DeepSeek4Backend::load_model() {
     // backends, so forcing a full load would disable the requested placement
     // before the TP runtime can initialize. init() has already rejected paged
     // deployments outside the qualified R9700 + Strix Halo topology.
-    const bool force_full = env_flag_enabled("LUCE_DS4_FORCE_FULL_LOAD");
-    const bool heterogeneous_tp = env_flag_enabled("LUCE_DS4_MOE_TP");
+    const bool force_full = settings_.force_full_load;
+    const bool heterogeneous_tp = settings_.tp.requested;
     if (!cfg_.mmproj_path.empty()) {
         // Images run on one HIP GPU holding the whole model, or on two HIP GPUs
         // that split the experts in process. Both need batched sparse prefill.
-        const auto tp = ds4_moe_tp_config(cfg_.device.gpu);
+        const Ds4MoeTpConfig & tp = settings_.tp;
         const bool two_gpu_ok = tp.in_process && tp.backend_valid &&
             tp.secondary_backend == PlacementBackend::Hip &&
             tp.secondary_gpu != cfg_.device.gpu && !tp.all_on_secondary && !force_full;
@@ -2094,7 +2140,7 @@ bool DeepSeek4Backend::load_model() {
         if (target_backend != PlacementBackend::Hip || cfg_.device.is_layer_split() ||
             (cfg_.prefill_mode != PrefillAttentionMode::Sparse && !cfg_.paged_attention) ||
             (tp.requested && !two_gpu_ok) ||
-            env_flag_enabled("LUCE_DS4_DENSE_TP_MASK")) {
+            settings_.dense_tp_mask) {
             std::fprintf(stderr, "[deepseek4] --mmproj requires a HIP target with --ds4-prefill sparse, "
                                  "on one GPU or with in-process expert owners on two distinct GPUs\n");
             return false;
@@ -2207,25 +2253,14 @@ bool DeepSeek4Backend::load_spec_drafter() {
     }
 
     ggml_backend_t draft_backend = backend_;
-    int draft_gpu = cfg_.device.gpu;
-    const bool separate_draft_stream =
-        env_flag_enabled("LUCE_DS4_DRAFT_SEPARATE_STREAM");
-    PlacementBackend draft_kind = PlacementBackend::Auto;
-    // server_main makes an explicit --draft-device concrete (auto:N included),
-    // so an auto backend here means "not placed": environment, then target.
-    if (cfg_.draft_device.backend != PlacementBackend::Auto) {
-        draft_kind = cfg_.draft_device.backend;
-        draft_gpu = cfg_.draft_device.gpu;
-    } else {
-        if (const char * gpu = std::getenv("LUCE_DS4_DRAFT_GPU")) {
-            draft_gpu = std::max(0, std::atoi(gpu));
-        }
-        if (!ds4_draft_backend(draft_kind)) {
-            std::fprintf(stderr,
-                         "[deepseek4] invalid LUCE_DS4_DRAFT_BACKEND; "
-                         "expected cuda or hip\n");
-            return false;
-        }
+    const int draft_gpu = settings_.draft_gpu;
+    const bool separate_draft_stream = settings_.draft_separate_stream;
+    const PlacementBackend draft_kind = settings_.draft_backend;
+    if (!settings_.draft_backend_valid) {
+        std::fprintf(stderr,
+                     "[deepseek4] invalid LUCE_DS4_DRAFT_BACKEND; "
+                     "expected cuda or hip\n");
+        return false;
     }
     const PlacementBackend target_kind = placement_backend_of(backend_);
     if (draft_kind != target_kind || draft_gpu != cfg_.device.gpu ||
@@ -2241,8 +2276,7 @@ bool DeepSeek4Backend::load_spec_drafter() {
             return false;
         }
         draft_backend = spec_backend_;
-        const bool low_priority = separate_draft_stream &&
-            env_flag_enabled("LUCE_DS4_DRAFT_LOW_PRIORITY");
+        const bool low_priority = separate_draft_stream && settings_.draft_low_priority;
         const bool priority_configured = low_priority &&
             backend_pair_capabilities(backend_, spec_backend_).same_runtime &&
             ggml_backend_cuda_set_low_priority_stream(spec_backend_);
@@ -2545,12 +2579,13 @@ bool DeepSeek4Backend::supports_batched_spec_feature_capture(
 bool DeepSeek4Backend::init() {
     // --draft selects DSpark directly; LUCE_DS4_SPEC + LUCE_DS4_DRAFT remain
     // the environment spelling of the same request.
-    spec_requested_ = !cfg_.draft_path.empty() || env_flag_enabled("LUCE_DS4_SPEC");
+    settings_ = resolve_deepseek4_settings(cfg_);
+    const bool spec_requested = settings_.spec_requested;
     if (cfg_.paged_attention) {
         const PlacementBackend target_backend =
             cfg_.device.backend == PlacementBackend::Auto
                 ? compiled_placement_backend() : cfg_.device.backend;
-        const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
+        const Ds4MoeTpConfig & tp = settings_.tp;
         if (target_backend != PlacementBackend::Hip) {
             std::fprintf(stderr,
                 "[deepseek4] paged concurrency requires a local HIP target\n");
@@ -2581,17 +2616,17 @@ bool DeepSeek4Backend::init() {
 
     // Install the gfx1151 DSpark verifier profile first: the MMVQ crossover
     // below reads LUCE_DS4_Q5_VERIFY.
-    if (!configure_gfx1151_dspark_verifier_defaults(cfg_.device.gpu, spec_requested_)) {
+    if (!configure_gfx1151_dspark_verifier_defaults(cfg_.device.gpu, spec_requested)) {
         return false;
     }
     // The shared MMVQ/MMQ crossover defaults to q=3 for NVIDIA. On gfx1151,
     // DSpark q=4 is faster through MMVQ. Keep AR and other devices unchanged,
     // and preserve LUCE_MMVQ_MAX_NCOLS as an explicit override.
-    if (!configure_dspark_mmvq_defaults(cfg_.device.gpu, spec_requested_)) {
+    if (!configure_dspark_mmvq_defaults(cfg_.device.gpu, spec_requested)) {
         return false;
     }
     configure_gfx1151_paged_mmvq_default(cfg_.device.gpu, cfg_.paged_attention,
-                                         spec_requested_);
+                                         spec_requested);
     if (!configure_gfx1151_sparse_prefill_kernel_defaults(
             cfg_.device.gpu, cfg_.prefill_mode)) {
         return false;
@@ -2605,8 +2640,8 @@ bool DeepSeek4Backend::init() {
          (cfg_.prefill_mode != PrefillAttentionMode::Exact &&
           cfg_.prefill_mode != PrefillAttentionMode::Sparse) ||
          cfg_.fused_decode || cfg_.fused_verify_f16_kv ||
-         env_flag_enabled("LUCE_DS4_FUSED_DECODE") ||
-         spec_requested_)) {
+         settings_.fused_decode_env ||
+         spec_requested)) {
         std::fprintf(stderr,
             "[deepseek4] paged serving requires 1..%d local slots, exact "
             "or sparse prefill, and autoregressive non-fused decode\n",
@@ -2702,7 +2737,7 @@ bool DeepSeek4Backend::init() {
         cache_.prefill_mode = cfg_.prefill_mode;
     }
 
-    if (env_flag_enabled("LUCE_DS4_MOE_TP") && !init_moe_tensor_parallel()) {
+    if (settings_.tp.requested && !init_moe_tensor_parallel()) {
         return false;
     }
     if (cfg_.paged_attention && expert_runtime_.compute) {
@@ -2776,10 +2811,9 @@ bool DeepSeek4Backend::init() {
                                  "DSpark drafter\n", cfg_.draft_path.c_str());
             return false;
         }
-    } else if (!cfg_.paged_attention && spec_requested_) {
-        const char * dp = std::getenv("LUCE_DS4_DRAFT");
-        if (dp && *dp) {
-            spec_draft_path_ = dp;
+    } else if (!cfg_.paged_attention && spec_requested) {
+        if (!settings_.spec_env_draft_path.empty()) {
+            spec_draft_path_ = settings_.spec_env_draft_path;
             if (!load_spec_drafter()) {
                 std::fprintf(stderr,
                              "[deepseek4] DSpark drafter load failed; "
@@ -2793,6 +2827,14 @@ bool DeepSeek4Backend::init() {
     if (!size_hybrid_prefill_chunk()) return false;
     if (!setup_draft_swap()) return false;
     image_capable_ = vision_ != nullptr;
+    if (moe_hybrid_) {
+        // What a reinstatement must reproduce exactly (see FrozenPlacement).
+        frozen_.placement = moe_placement_;
+        frozen_.decode_placement = moe_decode_placement_;
+        frozen_.ownership = MoeHybridOwnershipRecord::capture(*moe_hybrid_);
+        frozen_.selection_bias_host = w_.selection_bias_host;
+        frozen_.valid = true;
+    }
     return true;
 }
 
@@ -2803,6 +2845,26 @@ static size_t ds4_device_headroom_bytes(int device) {
     cudaDeviceProp prop{};
     const bool integrated = cudaGetDeviceProperties(&prop, device) == cudaSuccess && prop.integrated;
     return integrated ? ((size_t) 4 << 30) : ((size_t) 3 << 29);
+}
+
+void ds4_device_memory(int device, size_t * free_b, size_t * total_b) {
+    ggml_backend_cuda_get_device_memory(device, free_b, total_b);
+#if defined(__linux__)
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess || !prop.integrated) return;
+    const uint64_t ram = (uint64_t) sysconf(_SC_PHYS_PAGES) * (uint64_t) sysconf(_SC_PAGE_SIZE);
+    if (ram == 0 || *total_b <= ram) return;
+    *total_b = (size_t) ram;
+    *free_b = std::min(*free_b, (size_t) host_available_bytes());
+#endif
+}
+
+// Whether `device` draws on host memory rather than a carve of its own.
+static bool ds4_device_shares_host_memory(int device) {
+    size_t free_b = 0, total_b = 0, raw_free = 0, raw_total = 0;
+    ds4_device_memory(device, &free_b, &total_b);
+    ggml_backend_cuda_get_device_memory(device, &raw_free, &raw_total);
+    return total_b != raw_total;
 }
 
 // Streamed expert cache, sized from what is left after
@@ -2821,7 +2883,11 @@ bool DeepSeek4Backend::init_streamed_expert_tier() {
     cache_opts.direct_all = ggml_backend_cuda_host_spill_bytes(cache_opts.device) > 0;
     {
         size_t free_b = 0, total_b = 0;
-        ggml_backend_cuda_get_device_memory(cache_opts.device, &free_b, &total_b);
+        ds4_device_memory(cache_opts.device, &free_b, &total_b);
+        // Out of host memory, the cache also leaves the host its reserve.
+        if (ds4_device_shares_host_memory(cache_opts.device)) {
+            cache_opts.reserve_bytes += ds4_host_reserve_bytes(w_, cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192);
+        }
         cache_opts.pool_bytes = free_b > cache_opts.reserve_bytes ? free_b - cache_opts.reserve_bytes : 0;
         if (cache_opts.pool_bytes > 0 &&
             init_deepseek4_streamed_expert_cache(w_, *hybrid, cache_opts, expert_cache_, &err)) {
@@ -2861,7 +2927,7 @@ bool DeepSeek4Backend::log_device_memory(const char * when) const {
     bool ok = true;
     for (int device : devices) {
         size_t free_b = 0, total_b = 0;
-        ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+        ds4_device_memory(device, &free_b, &total_b);
         const size_t headroom = ds4_device_headroom_bytes(device);
         const size_t need = when ? headroom / 2 : headroom;
         std::fprintf(stderr, "[deepseek4] device %d memory%s%s: %.2f of %.2f GiB used, %.2f GiB free "
@@ -2963,7 +3029,7 @@ bool DeepSeek4Backend::size_hybrid_prefill_chunk() {
     const HybridPrefillScratch per_token = hybrid_prefill_scratch_per_token(w_, max_ctx, chunk);
     const auto fit = [this](int device, size_t bytes, size_t fixed) {
         size_t free_b = 0, total_b = 0;
-        ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+        ds4_device_memory(device, &free_b, &total_b);
         if (device == cfg_.device.gpu) free_b += prefill_sizing_extra_free_;
         return hybrid_prefill_fit_tokens(free_b, ds4_device_headroom_bytes(device) / 2 + fixed, bytes);
     };
@@ -2971,7 +3037,7 @@ bool DeepSeek4Backend::size_hybrid_prefill_chunk() {
         // A context the smallest chunk cannot prefill at its end is refused
         // at load rather than failing an allocation in the middle of a prompt.
         size_t free_b = 0, total_b = 0;
-        ggml_backend_cuda_get_device_memory(cfg_.device.gpu, &free_b, &total_b);
+        ds4_device_memory(cfg_.device.gpu, &free_b, &total_b);
         const size_t keep = ds4_device_headroom_bytes(cfg_.device.gpu) / 2 + per_token.target_fixed;
         const size_t smallest = 64 * per_token.target;
         if (free_b < keep + smallest) {
@@ -2985,7 +3051,7 @@ bool DeepSeek4Backend::size_hybrid_prefill_chunk() {
     int tokens = fit(cfg_.device.gpu, per_token.target, per_token.target_fixed);
     if (stream_cache_device_ >= 0 && stream_cache_device_ != cfg_.device.gpu) {
         size_t free_b = 0, total_b = 0;
-        ggml_backend_cuda_get_device_memory(stream_cache_device_, &free_b, &total_b);
+        ds4_device_memory(stream_cache_device_, &free_b, &total_b);
         const size_t keep = ds4_device_headroom_bytes(stream_cache_device_) / 2;
         if (free_b < keep + 64 * per_token.second) {
             std::fprintf(stderr,
@@ -3022,7 +3088,7 @@ bool DeepSeek4Backend::init_moe_tensor_parallel() {
         return false;
     }
 
-    const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
+    const Ds4MoeTpConfig & tp = settings_.tp;
     if (tp.in_process) {
         if (!expert_backend_ || !moe_hybrid_->materialized_cold_experts ||
             moe_hybrid_->cold_backend != expert_backend_) {
@@ -3107,7 +3173,7 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
         kv_bytes += paged_plan.total_persistent_bytes;
     }
     Ds4HybridBudgetInfo budget;
-    const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
+    const Ds4MoeTpConfig & tp = settings_.tp;
     if (!compute_ds4_hybrid_budget_info(
             w, backend_, kv_bytes, tp.all_on_secondary,
             vision_ != nullptr, cfg_.paged_attention, budget, err)) {
@@ -3340,7 +3406,13 @@ bool DeepSeek4Backend::init_hybrid_model() {
 
     std::string err;
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
-    if (!compute_uniform_hybrid_placement(
+    // A reinstatement places the experts exactly as init() did; the free
+    // memory and usage profile of the moment would place them differently.
+    const bool reuse_placement = frozen_.valid;
+    if (reuse_placement) {
+        moe_placement_ = frozen_.placement;
+        moe_decode_placement_ = frozen_.decode_placement;
+    } else if (!compute_uniform_hybrid_placement(
             w_, max_ctx, moe_placement_, &moe_decode_placement_, &err)) {
         std::fprintf(stderr, "[deepseek4] failed to compute hybrid placement: %s\n", err.c_str());
         return false;
@@ -3361,7 +3433,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
         return true;
     }
 
-    const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
+    const Ds4MoeTpConfig & tp = settings_.tp;
     const bool inprocess_tp = tp.requested && tp.in_process;
     const PlacementBackend local_kind =
         cfg_.device.backend == PlacementBackend::Auto
@@ -3475,9 +3547,19 @@ bool DeepSeek4Backend::init_hybrid_model() {
         hybrid_cfg.cold_expert_backend = MoeHybridColdBackend::Gpu;
     }
     const int host_spill_gpu = same_runtime_tp ? tp.secondary_gpu : -1;
-    if (!apply_expert_ownership(inprocess_tp, host_spill_gpu, hybrid_cfg)) {
-        if (host_spill_gpu >= 0) ggml_backend_cuda_set_host_spill(host_spill_gpu, 0, 0);
-        return fail_hybrid_init();
+    if (reuse_placement) {
+        if (inprocess_tp) hybrid_cfg.cold_expert_ids = frozen_.cold_expert_ids;
+        if (host_spill_gpu >= 0 && frozen_.spill_host_want > 0) {
+            ggml_backend_cuda_set_host_spill(host_spill_gpu, frozen_.spill_carve_reserve,
+                                             frozen_.spill_host_want);
+        }
+    } else {
+        frozen_.spill_carve_reserve = frozen_.spill_host_want = 0;
+        if (!apply_expert_ownership(inprocess_tp, host_spill_gpu, hybrid_cfg)) {
+            if (host_spill_gpu >= 0) ggml_backend_cuda_set_host_spill(host_spill_gpu, 0, 0);
+            return fail_hybrid_init();
+        }
+        frozen_.cold_expert_ids = hybrid_cfg.cold_expert_ids;
     }
     if (vision_) {
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
@@ -3604,7 +3686,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
         }
     }
 
-    if (env_flag_enabled("LUCE_DS4_DECODE_ALL_COLD")) {
+    if (settings_.decode_all_cold) {
         for (int il = 0; il < w_.n_layer; ++il) {
             MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
             if (layer.cold_local_by_global.size() !=
@@ -3638,7 +3720,8 @@ bool DeepSeek4Backend::init_hybrid_model() {
             std::fprintf(stderr, "[deepseek4] failed to compute streaming expert size\n");
             return fail_hybrid_init();
         }
-        if (!stream_engine_.init(backend_, max_expert_bytes, &err)) {
+        frozen_.stream_expert_bytes = max_expert_bytes;
+        if (!stream_engine_.init(backend_, max_expert_bytes, &err, cfg_.device.gpu)) {
             std::fprintf(stderr, "[deepseek4] failed to init cold-expert stream engine: %s\n",
                          err.c_str());
             return fail_hybrid_init();
@@ -3691,6 +3774,7 @@ void DeepSeek4Backend::print_ready_banner() const {
 }
 
 bool DeepSeek4Backend::park(ParkTarget target) {
+    if (is_evicted()) return true;  // nothing of it is on the primary
     const bool want_draft = park_target_includes_draft_model(target);
     const bool want_target_model = park_target_includes_target_model(target);
 
@@ -3743,6 +3827,10 @@ bool DeepSeek4Backend::park(ParkTarget target) {
 }
 
 bool DeepSeek4Backend::unpark(ParkTarget target) {
+    if (is_evicted()) {
+        std::fprintf(stderr, "[deepseek4] unpark: model is evicted; reinstate it first\n");
+        return false;
+    }
     const bool want_draft = park_target_includes_draft_model(target);
     const bool want_target_model = park_target_includes_target_model(target);
 
@@ -3783,7 +3871,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             return false;
         }
 
-        if (env_flag_enabled("LUCE_DS4_MOE_TP") &&
+        if (settings_.tp.requested &&
             !init_moe_tensor_parallel()) {
             free_deepseek4_cache(cache_);
             release_vision();
@@ -3834,6 +3922,338 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
     if (!draft_swap_.host && !setup_draft_swap()) return false;
     cache_.prefill_mode = cfg_.prefill_mode;
     return true;
+}
+
+// ── Eviction (runtime model swapping) ───────────────────────────────────
+
+bool DeepSeek4Backend::supports_eviction(std::string & reason) const {
+    // An evicted model was supported when it was evicted; its configuration
+    // has not changed since.
+    if (residency_ != Residency::resident) {
+        reason.clear();
+        return true;
+    }
+    const PlacementBackend local_kind = cfg_.device.backend == PlacementBackend::Auto
+        ? compiled_placement_backend() : cfg_.device.backend;
+    const Ds4MoeTpConfig & tp = settings_.tp;
+    // First milestone: one classic worker, fixed in-process expert owners on
+    // two GPUs of one runtime, DSpark (if any) on the target. Every other mode
+    // owns device state this teardown does not cover.
+    if (cfg_.paged_attention || seq_engine_ || cfg_.max_concurrency > 1) {
+        reason = "eviction supports the classic serial worker only (no paged attention or --max-concurrency > 1)";
+    } else if (!cfg_.mmproj_path.empty() || vision_) {
+        reason = "eviction does not support vision (--mmproj)";
+    } else if (pflash_drafter_loaded_) {
+        reason = "eviction does not support a loaded PFlash drafter";
+    } else if (cfg_.device.is_layer_split() || cfg_.device.is_tensor_parallel() || w_.dense_split_buf) {
+        reason = "eviction does not support layer or tensor split";
+    } else if (expert_runtime_.compute) {
+        reason = "eviction does not support out-of-process (remote) experts";
+    } else if (!tp.requested || !tp.in_process || !tp.backend_valid ||
+               tp.secondary_backend != local_kind || tp.secondary_gpu == cfg_.device.gpu) {
+        reason = "eviction requires in-process experts on a second GPU of the same runtime (--expert-device)";
+    } else if (!moe_hybrid_ || !frozen_.valid || !moe_hybrid_->materialized_cold_experts) {
+        reason = "eviction requires the hybrid expert placement with a materialized secondary stack";
+    } else if (!moe_hybrid_->has_mmap()) {
+        reason = "eviction requires the expert file mapping to rebuild the primary experts";
+    } else if (spec_backend_) {
+        reason = "eviction requires DSpark on the target device and stream";
+    } else if (!snap_backend_) {
+        reason = "eviction requires host-memory snapshots";
+    } else {
+        for (const MoeHybridLayerStorage & layer : moe_hybrid_->layers) {
+            if (layer.cache_slots != 0) {
+                reason = "eviction does not support primary spare cache slots";
+                return false;
+            }
+            for (const ggml_tensor * t : {layer.gate_hot, layer.up_hot, layer.down_hot, layer.gate_up_hot}) {
+                if (t && (t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX || t->type == GGML_TYPE_Q2_1_ROCMFP2_MIX)) {
+                    reason = "eviction does not support mixed-qtype experts";
+                    return false;
+                }
+            }
+        }
+        reason.clear();
+        return true;
+    }
+    return false;
+}
+
+// Releases everything this model holds on its primary device. Runs on the
+// worker with no request in flight and the streamed expert cache suspended;
+// also the cleanup of a failed reinstatement, so every step tolerates state
+// that was never built. The secondary stack, the streamed cache and the
+// locked host tier stay.
+void DeepSeek4Backend::release_primary_state() {
+    // Work queued for this model on any context finishes first.
+    for (ggml_backend_t b : {backend_, expert_backend_, spec_backend_}) {
+        if (b) ggml_backend_synchronize(b);
+    }
+    maybe_save_routing_stats();
+    last_logits_.clear();
+    last_logits_pos_ = -1;
+    spec_feat_window_.clear();
+    cache_has_images_ = false;
+    // Consumers before what they reference. The cache owns the fused
+    // decode/verify graphs (their native graph keys are retired with them),
+    // the layer runtime and its arenas.
+    free_deepseek4_cache(cache_);
+    if (moe_hybrid_) {
+        moe_hybrid_->release_graph_caches();
+        moe_hybrid_->release_prefill_allocators();
+    }
+    // Built over the layer descriptors of the weights about to go.
+    expert_cache_.release_graphs();
+    stream_engine_.destroy();
+    // Draft weights, cloned heads and this worker's draft graph caches.
+    release_spec_drafter(/*mark_parked=*/false);
+    dspark_head_release_thread_scratch();
+    if (moe_hybrid_) {
+        std::string err;
+        if (!moe_hybrid_->release_primary_experts(&err)) {
+            std::fprintf(stderr, "[evict] primary experts kept: %s\n", err.c_str());
+        }
+    }
+    // Also this worker's runtime graphs keyed by the weights' context.
+    free_deepseek4_weights(w_);
+    deepseek4_cuda_hc_release_device(cfg_.device.gpu);
+    // Contexts last; they own the device pools, streams and BLAS handles.
+    // The expert backend's buffers belong to its device, not to the context:
+    // freeing the context drops whatever pools it grew while joining with the
+    // primary, and reinstate() recreates it over the same buffers.
+    if (expert_backend_) {
+        ggml_backend_free(expert_backend_);
+        expert_backend_ = nullptr;
+        if (moe_hybrid_) moe_hybrid_->rebind_cold_backend(nullptr);
+    }
+    if (backend_) {
+        ggml_backend_free(backend_);
+        backend_ = nullptr;
+    }
+}
+
+// Releases the retained tier: the streamed cache, the secondary stack with
+// its locked host memory, the file mapping and the secondary scratch.
+void DeepSeek4Backend::release_secondary_state() {
+    if (expert_backend_) ggml_backend_synchronize(expert_backend_);
+    expert_cache_.destroy();  // the cache points at the storage: first
+    expert_runtime_.reset();
+    moe_hybrid_.reset();
+    if (expert_backend_) {
+        ggml_backend_free(expert_backend_);
+        expert_backend_ = nullptr;
+    }
+    if (settings_.tp.secondary_gpu != cfg_.device.gpu) {
+        deepseek4_cuda_hc_release_device(settings_.tp.secondary_gpu);
+    }
+    moe_placement_ = {};
+    moe_decode_placement_ = {};
+    stream_cache_device_ = -1;
+}
+
+ModelBackend::EvictResult DeepSeek4Backend::evict(EvictLevel level) {
+    EvictResult result;
+    if (level == EvictLevel::warm) {
+        result.error = "DeepSeek V4 has no warm eviction; use partial or cold";
+        return result;
+    }
+    const bool full = level == EvictLevel::cold;
+    if (residency_ == Residency::fully_evicted ||
+        (residency_ == Residency::partially_evicted && !full)) {
+        result.status = EvictStatus::ok;
+        return result;
+    }
+    if (residency_ == Residency::partially_evicted) {
+        release_secondary_state();
+        residency_ = Residency::fully_evicted;
+        std::printf("[evict] deepseek4 retained expert tier released\n");
+        std::fflush(stdout);
+        result.status = EvictStatus::ok;
+        return result;
+    }
+    if (!supports_eviction(result.error)) return result;
+    if (!full && stream_cache_device_ == cfg_.device.gpu) {
+        result.error = "partial eviction requires the streamed expert cache on the secondary device";
+        return result;
+    }
+    // Launches that wait on the expert loaders end with their request, so the
+    // loaders can stop now without stranding one. Refused, nothing changed.
+    std::string busy;
+    if (!expert_cache_.suspend(&busy)) {
+        result.error = "the streamed expert cache is busy: " + busy;
+        return result;
+    }
+    const auto t0 = Clock::now();
+    reload_drafter_on_reinstate_ = spec_drafter_ != nullptr;
+    release_primary_state();
+    const double primary_ms = elapsed_s(t0) * 1000.0;
+    if (full) release_secondary_state();
+    residency_ = full ? Residency::fully_evicted : Residency::partially_evicted;
+    result.status = EvictStatus::ok;
+    std::printf("[evict] deepseek4 %s: primary released in %.0f ms%s\n",
+                full ? "cold" : "partial", primary_ms,
+                full ? ", expert tier released" : "; secondary experts and streamed cache kept");
+    std::fflush(stdout);
+    return result;
+}
+
+bool DeepSeek4Backend::verify_frozen_state(std::string & error) const {
+    std::string err;
+    if (!moe_hybrid_ || !frozen_.ownership.matches(*moe_hybrid_, &err)) {
+        error = "expert placement differs from the one the model was loaded with: " + err;
+        return false;
+    }
+    if (w_.selection_bias_host != frozen_.selection_bias_host) {
+        error = "routing biases differ from the ones the model was loaded with";
+        return false;
+    }
+    return true;
+}
+
+// Partial reinstatement: the primary comes back around the retained tier,
+// with the placement init() resolved, and the cache resumes last.
+bool DeepSeek4Backend::reinstate_primary(std::string & error) {
+    const auto fail = [&](const std::string & what) {
+        error = what;
+        // The new primary state goes; the retained tier stays suspended.
+        release_primary_state();
+        return false;
+    };
+    auto t = Clock::now();
+    double stage_ms[6] = {};  // backend, dense, experts, routing, cache, draft
+    const auto lap = [&](int stage) {
+        const auto now = Clock::now();
+        stage_ms[stage] = std::chrono::duration<double, std::milli>(now - t).count();
+        t = now;
+    };
+    backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
+    if (!backend_) return fail("target backend init failed");
+    std::string err;
+    const Ds4MoeTpConfig & tp = settings_.tp;
+    expert_backend_ = init_placement_backend(tp.secondary_backend, tp.secondary_gpu, &err);
+    if (!expert_backend_) return fail("expert backend init failed: " + err);
+    moe_hybrid_->rebind_cold_backend(expert_backend_);
+    lap(0);
+    // The dense tensors only; the routed experts are rebuilt below.
+    TargetLoadPlan plan;
+    plan.skip_expert_tensors = true;
+    if (!load_deepseek4_gguf_partial(cfg_.model_path, backend_, plan, w_)) {
+        return fail(std::string("dense load: ") + luce_last_error());
+    }
+    // What load_model() and init_hybrid_model() set for this placement.
+    w_.moe_hybrid = true;
+    w_.mixed_mmq_policy = moe_hybrid_->mixed_mmq_policy;
+    w_.routed_expert_top_k = cfg_.expert_top_k;
+    w_.fused_decode = false;
+    w_.fused_verify_f16_kv = false;
+    lap(1);
+    if (!moe_hybrid_->rebuild_primary_experts(backend_, cfg_.model_path, &err)) {
+        return fail("primary experts: " + err);
+    }
+    lap(2);
+    if (!apply_routing_adjustments()) return fail("routing adjustments");
+    // As init() and unpark(): the reload re-read the Engram metadata.
+    if (!init_engram()) return fail("Engram tables");
+    lap(3);
+    const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
+    if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
+        return fail("cache allocation (ctx=" + std::to_string(max_ctx) + ")");
+    }
+    cache_.prefill_mode = cfg_.prefill_mode;
+    if (frozen_.stream_expert_bytes > 0 &&
+        !stream_engine_.init(backend_, frozen_.stream_expert_bytes, &err, cfg_.device.gpu)) {
+        return fail("cold-expert stream engine: " + err);
+    }
+    if (!init_moe_tensor_parallel()) return fail("expert parallelism");
+    lap(4);
+    if (reload_drafter_on_reinstate_ && !load_spec_drafter()) return fail("DSpark drafter load");
+    lap(5);
+    if (!verify_frozen_state(err)) return fail(err);
+    expert_cache_.resume();
+    std::printf("[reinstate] deepseek4 primary restored: backend %.0f ms, dense %.0f ms, "
+                "experts %.0f ms, routing %.0f ms, cache %.0f ms, draft %.0f ms\n",
+                stage_ms[0], stage_ms[1], stage_ms[2], stage_ms[3], stage_ms[4], stage_ms[5]);
+    std::fflush(stdout);
+    log_device_memory("after reinstate");
+    return true;
+}
+
+// Full reinstatement: the load path of init() with the frozen placement
+// (init_hybrid_model reuses it), then a fresh streamed cache.
+bool DeepSeek4Backend::reinstate_full(std::string & error) {
+    const auto fail = [&](const std::string & what) {
+        error = what;
+        release_primary_state();
+        release_secondary_state();
+        return false;
+    };
+    const auto t0 = Clock::now();
+    backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
+    if (!backend_) return fail("target backend init failed");
+    if (!load_model()) return fail("model load");
+    if (!moe_hybrid_) return fail("the reload did not produce the hybrid expert placement");
+    if (!apply_routing_adjustments()) return fail("routing adjustments");
+    if (!init_engram()) return fail("Engram tables");
+    const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
+    if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
+        return fail("cache allocation (ctx=" + std::to_string(max_ctx) + ")");
+    }
+    cache_.prefill_mode = cfg_.prefill_mode;
+    if (settings_.tp.requested && !init_moe_tensor_parallel()) return fail("expert parallelism");
+    if (reload_drafter_on_reinstate_ && !load_spec_drafter()) return fail("DSpark drafter load");
+    if (!init_streamed_expert_tier()) return fail("streamed expert cache");
+    std::string err;
+    if (!verify_frozen_state(err)) return fail(err);
+    std::printf("[reinstate] deepseek4 fully restored in %.0f ms\n", elapsed_s(t0) * 1000.0);
+    std::fflush(stdout);
+    log_device_memory("after reinstate");
+    return true;
+}
+
+bool DeepSeek4Backend::reinstate(std::string & error) {
+    if (residency_ == Residency::resident) return true;
+    const bool partial = residency_ == Residency::partially_evicted;
+    if (!(partial ? reinstate_primary(error) : reinstate_full(error))) {
+        std::fprintf(stderr, "[reinstate] deepseek4: %s\n", error.c_str());
+        return false;
+    }
+    residency_ = Residency::resident;
+    return true;
+}
+
+size_t DeepSeek4Backend::weight_device_bytes() const {
+    const auto size = [](ggml_backend_buffer_t b) { return b ? ggml_backend_buffer_get_size(b) : (size_t) 0; };
+    size_t bytes = 0;
+    if (residency_ == Residency::resident) {
+        bytes += size(w_.buf) + size(w_.dense_split_buf) + size(w_.routing_buf);
+        if (spec_drafter_) bytes += size(spec_drafter_->core.buf) + size(spec_drafter_->head_buf);
+    }
+    if (residency_ != Residency::fully_evicted && moe_hybrid_) {
+        for (const MoeHybridLayerStorage & layer : moe_hybrid_->layers) {
+            if (residency_ == Residency::resident) bytes += size(layer.hot_buf);
+            if (moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu) bytes += size(layer.cold_buf);
+        }
+    }
+    return bytes;
+}
+
+DeepSeek4Backend::ExpertTierReport DeepSeek4Backend::expert_tier_report() const {
+    ExpertTierReport report;
+    report.partially_evicted = residency_ == Residency::partially_evicted;
+    if (moe_hybrid_) {
+        report.primary_upload_bytes = moe_hybrid_->primary_upload_bytes;
+        report.secondary_upload_bytes = moe_hybrid_->secondary_upload_bytes;
+        report.storage = moe_hybrid_.get();
+        for (const MoeHybridLayerStorage & layer : moe_hybrid_->layers) {
+            if (layer.cold_buf) {
+                report.secondary_base = ggml_backend_buffer_get_base(layer.cold_buf);
+                break;
+            }
+        }
+    }
+    report.stream_cache_slots = expert_cache_.ready() ? expert_cache_.n_slots() : 0;
+    report.stream_cache_suspended = expert_cache_.ready() && expert_cache_.suspended();
+    return report;
 }
 
 int deepseek4_hybrid_prefill_chunk_tokens(
@@ -4608,6 +5028,10 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
 GenerateResult DeepSeek4Backend::generate_from_state(
         const GenerateRequest & req, const DaemonIO & io, int kv_offset) {
     GenerateResult result;
+    if (is_evicted()) {
+        result.fail(GenerateErrorCode::ModelParked, "model is evicted");
+        return result;
+    }
     DaemonIO out_io = io.with_token_callback(req.on_token);
     auto t0 = Clock::now();
     sampler_ = req.sampler;
@@ -4903,7 +5327,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
 // ── Snapshots ───────────────────────────────────────────────────────────
 
 bool DeepSeek4Backend::snapshot_save(int slot) {
-    if (cache_has_images_) return false;
+    if (cache_has_images_ || is_evicted()) return false;
     if (slot < 0 || slot >= PREFIX_SLOTS || !snap_backend_ ||
         cache_.cur_pos <= 0 || last_logits_pos_ != cache_.cur_pos ||
         w_.n_vocab <= 0 ||
@@ -5041,7 +5465,27 @@ void add_deepseek4_cache_memory(ModelBackend::MemoryReport::Cache & out,
 ModelBackend::MemoryReport DeepSeek4Backend::memory_report() const {
     MemoryReport report;
     const bool paged = paged_cache_.buf != nullptr;
-    if (!paged && !cache_.buf) return report;
+    const auto add_snapshots = [&] {
+        for (int slot = 0; slot < PREFIX_SLOTS; ++slot) {
+            const auto & snap = snapshots_[slot];
+            if (!snap.ctx || !snap.buf) continue;
+            const auto & aux = snapshot_aux_[slot];
+            const uint64_t host_copies =
+                (aux.last_logits.capacity() + aux.spec_feat_window.capacity()) *
+                sizeof(float);
+            report.snapshots.push_back({slot, snap.cur_pos,
+                                        ggml_backend_buffer_get_size(snap.buf),
+                                        ggml_backend_buffer_is_host(snap.buf),
+                                        host_copies});
+        }
+    };
+    if (!paged && !cache_.buf) {
+        // Evicted (or not initialized): no device cache, but the host
+        // snapshots are retained and still count.
+        add_snapshots();
+        report.available = !report.snapshots.empty();
+        return report;
+    }
     report.available = true;
     report.cache.host = ggml_backend_buffer_is_host(paged ? paged_cache_.buf : cache_.buf);
     if (paged) {
@@ -5067,18 +5511,7 @@ ModelBackend::MemoryReport DeepSeek4Backend::memory_report() const {
     // Trimming a vector keeps its allocation, so count capacity, not size.
     report.cache.host_state_bytes =
         (last_logits_.capacity() + spec_feat_window_.capacity()) * sizeof(float);
-    for (int slot = 0; slot < PREFIX_SLOTS; ++slot) {
-        const auto & snap = snapshots_[slot];
-        if (!snap.ctx || !snap.buf) continue;
-        const auto & aux = snapshot_aux_[slot];
-        const uint64_t host_copies =
-            (aux.last_logits.capacity() + aux.spec_feat_window.capacity()) *
-            sizeof(float);
-        report.snapshots.push_back({slot, snap.cur_pos,
-                                    ggml_backend_buffer_get_size(snap.buf),
-                                    ggml_backend_buffer_is_host(snap.buf),
-                                    host_copies});
-    }
+    add_snapshots();
     return report;
 }
 
@@ -5181,6 +5614,10 @@ bool DeepSeek4Backend::snapshot_restore(int slot) {
 GenerateResult DeepSeek4Backend::restore_and_generate_impl(
         int slot, const GenerateRequest & req, const DaemonIO & io) {
     GenerateResult result;
+    if (is_evicted()) {
+        result.fail(GenerateErrorCode::ModelParked, "model is evicted");
+        return result;
+    }
     if (req.images) {
         result.fail(GenerateErrorCode::PrefillFailed, "image requests cannot restore token-only snapshots");
         return result;

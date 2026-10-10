@@ -36,18 +36,24 @@ struct HcCudaScratch {
 
     explicit HcCudaScratch(int device = -1) : owner_device(device) {}
 
-    ~HcCudaScratch() {
+    ~HcCudaScratch() { release(); }
+
+    // Frees every allocation on the owning device; the next ensure()
+    // allocates again. Restores the calling thread's device.
+    void release() {
+        int previous = -1;
+        const bool restore = owner_device >= 0 && cudaGetDevice(&previous) == cudaSuccess &&
+                             previous != owner_device;
         if (owner_device >= 0) {
             (void) cudaSetDevice(owner_device);
         }
-        if (d_state) cudaFree(d_state);
-        if (d_sums) cudaFree(d_sums);
-        if (d_mix) cudaFree(d_mix);
-        if (d_scale) cudaFree(d_scale);
-        if (d_base) cudaFree(d_base);
-        if (d_working) cudaFree(d_working);
-        if (d_post) cudaFree(d_post);
-        if (d_comb) cudaFree(d_comb);
+        for (float ** p : {&d_state, &d_sums, &d_mix, &d_scale, &d_base, &d_working, &d_post, &d_comb}) {
+            if (*p) cudaFree(*p);
+            *p = nullptr;
+        }
+        state_cap = working_cap = 0;
+        batch_cap = 0;
+        if (restore) (void) cudaSetDevice(previous);
     }
 
     bool ensure(size_t hc_dim, size_t n_embd, int n_tokens = 1) {
@@ -403,6 +409,20 @@ bool hc_pre_device_locked(HcCudaScratch & scratch,
 }
 
 } // namespace
+
+void deepseek4_cuda_hc_release_device(int device) {
+    HcScratchSlot * slot = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_scratch_slots_mutex);
+        if (device < 0 || (size_t) device >= g_scratch_slots.size()) return;
+        slot = g_scratch_slots[(size_t) device].get();
+    }
+    if (!slot) return;
+    // The slot itself stays (other threads may hold its address); a helper
+    // running on it finishes first.
+    std::lock_guard<std::mutex> lock(slot->mutex);
+    slot->scratch.release();
+}
 
 bool deepseek4_cuda_hc_set_device(int device) {
     if (device < 0) {

@@ -38,7 +38,11 @@ public:
 
     // Initialize the engine with a maximum expert size (bytes for one expert's
     // gate+up+down tensors). Allocates pinned host buffer and GPU scratch.
-    bool init(ggml_backend_t gpu_backend, size_t max_expert_bytes, std::string * err = nullptr);
+    // The scratch is a raw allocation on `device` (the GPU of gpu_backend),
+    // selected for the allocation and again for the free; -1 keeps the
+    // calling thread's current device, which then must be gpu_backend's.
+    bool init(ggml_backend_t gpu_backend, size_t max_expert_bytes, std::string * err = nullptr,
+              int device = -1);
     bool is_ready() const;
     void destroy();
 
@@ -94,6 +98,7 @@ private:
 
     void * gpu_scratch_     = nullptr;  // GPU device memory for one expert
     size_t scratch_size_    = 0;
+    int    scratch_device_  = -1;       // device gpu_scratch_ was allocated on
     ggml_backend_t backend_ = nullptr;
 
     // Offsets into scratch for last-streamed expert

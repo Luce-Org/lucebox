@@ -84,6 +84,15 @@ struct MoeHybridLayerStorage {
     ggml_tensor * down_hot = nullptr;
     ggml_tensor * gate_up_hot = nullptr;
 
+    // Shape of each hot tensor (gate, up, down, gate_up), recorded by
+    // MoeHybridStorage::release_primary_experts() so the stack is rebuilt
+    // with the same rows; type -1 for an absent tensor.
+    struct StackShape {
+        int type = -1;
+        int64_t ne[4] = {0, 0, 0, 0};
+    };
+    StackShape released_hot_shapes[4];
+
     ggml_context * cold_ctx = nullptr;
     ggml_backend_buffer_t cold_buf = nullptr;
     ggml_tensor * gate_cold = nullptr;
@@ -264,9 +273,42 @@ struct MoeHybridStorage {
     // Per-layer file region metadata for streaming (populated when mmap is active).
     std::vector<LayerExpertRegions> layer_regions;
 
+private:
+    bool primary_released_ = false;
+public:
+
+    // Expert bytes uploaded into the primary (hot) and secondary (cold)
+    // stacks over this storage's life: the build, then every
+    // rebuild_primary_experts(). A partial eviction keeps the secondary count.
+    uint64_t primary_upload_bytes = 0;
+    uint64_t secondary_upload_bytes = 0;
+
     // Remove decode-table registrations while their owner tensors are alive.
     // Safe to call repeatedly, including during failed partial registration.
     void unregister_mix_tensors();
+
+    // Primary-device release for a partial eviction. Frees the hot stacks
+    // (and the graph caches and prefill arenas built over them) while the
+    // expert maps, the cold stacks, the file mapping and the regions stay, so
+    // this object keeps its address for the streamed cache that points at it.
+    // Refused (false, nothing freed) for storage it cannot rebuild exactly:
+    // spare cache slots (a mutable primary population), mixed-qtype experts
+    // (their decode tables come from a sidecar) or no retained mapping.
+    bool release_primary_experts(std::string * err = nullptr);
+    bool primary_experts_released() const { return primary_released_; }
+    // Rebuilds the released hot stacks on `gpu_backend`: the recorded shapes,
+    // the same ordered hot_expert_ids (so every local index and map stays
+    // valid), read from `path` (the mapped file) or, with an empty path,
+    // copied out of the mapping. On failure the partial stacks are freed
+    // again and the storage stays released.
+    bool rebuild_primary_experts(ggml_backend_t gpu_backend, const std::string & path,
+                                 std::string * err = nullptr);
+    // The secondary owner is computed on a caller-owned backend; a caller
+    // that recreates that backend (its buffers belong to the device, not the
+    // backend) points the storage and its layers at the new one.
+    void rebind_cold_backend(ggml_backend_t backend);
+    // Frees the three prefill arenas (route, hot, cold).
+    void release_prefill_allocators();
     bool matches(const MoeHybridConfig & cfg) const;
     bool empty() const;
     bool has_mmap() const { return mmap_data != nullptr && mmap_size > 0; }
@@ -274,6 +316,35 @@ struct MoeHybridStorage {
     // Decode/verify graph arenas are shape caches, not model state. Release
     // them before a new bulk prefill needs substantially larger workspaces.
     void release_graph_caches();
+};
+
+// The expert ownership a storage resolved: per layer the ordered ids of both
+// stacks (their order is each stack's row order), the physical and decode
+// owner maps and the streamed count. Captured once a model is placed, it
+// proves that a reinstated storage computes on exactly the same rows.
+struct MoeHybridOwnershipRecord {
+    struct Layer {
+        std::vector<int32_t> hot_expert_ids;
+        std::vector<int32_t> cold_expert_ids;
+        std::vector<int32_t> hot_local_by_global;
+        std::vector<int32_t> cold_local_by_global;
+        std::vector<int32_t> decode_hot_local_by_global;
+        std::vector<int32_t> decode_cold_local_by_global;
+        int n_streamed = 0;
+        bool operator==(const Layer & o) const {
+            return hot_expert_ids == o.hot_expert_ids && cold_expert_ids == o.cold_expert_ids &&
+                   hot_local_by_global == o.hot_local_by_global &&
+                   cold_local_by_global == o.cold_local_by_global &&
+                   decode_hot_local_by_global == o.decode_hot_local_by_global &&
+                   decode_cold_local_by_global == o.decode_cold_local_by_global &&
+                   n_streamed == o.n_streamed;
+        }
+    };
+    std::vector<Layer> layers;
+
+    static MoeHybridOwnershipRecord capture(const MoeHybridStorage & storage);
+    // False with the first differing layer in *err.
+    bool matches(const MoeHybridStorage & storage, std::string * err = nullptr) const;
 };
 
 // Expert tensor file data for split loading (one entry per expert tensor).

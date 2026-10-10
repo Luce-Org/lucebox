@@ -118,6 +118,21 @@ static void print_usage(const char * prog) {
         "  --load-balancing-primary-gpu <backend:gpu> Select the primary model by its target device.\n"
         "                      Defaults to the first block; request model names\n"
         "                      do not change generation routing.\n"
+        "  --model-routing <balance|name> How several model blocks share requests\n"
+        "                      (default: balance). name loads every block and runs a\n"
+        "                      request naming a block's --model-name only on that\n"
+        "                      block; omitted or auto requests still balance.\n"
+        "  --unknown-model <reject|primary> Name routing: answer an unrecognized\n"
+        "                      model name with 404 (default) or serve it on the primary.\n"
+        "  --swap-residency    With --model-routing name: models sharing a device\n"
+        "                      are not resident together; a request naming an\n"
+        "                      evicted model swaps it in (prefix snapshots kept).\n"
+        "                      The first model block starts resident.\n"
+        "  --swap-keep-weights <name,...> With --swap-residency: these models keep\n"
+        "                      their weights in device memory while evicted, so a\n"
+        "                      swap back rebuilds only the KV cache (cold when memory\n"
+        "                      runs short). List the main model, not occasional ones:\n"
+        "                      their weights would shrink the active model's room.\n"
         "  --draft <path>       Draft model for speculative decode (DFlash for Qwen,\n"
         "                       Gemma and Laguna; DSpark for DeepSeek4; MTP for Qwen4Exp).\n"
         "                       Qwen4Exp auto-discovers <model repo>/MTP/mtp-*.gguf.\n"
@@ -426,8 +441,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             std::fprintf(stderr, "[server] %s belongs in the first model block: there is one listener\n", argv[i]);
             return 2;
         }
-        if (load_balancing && (option == "--peer-access" || option == "--expert-device" ||
-            option == "--no-fast-rollback" || option == "--target-split-fast-rollback" ||
+        if (load_balancing && (option == "--no-fast-rollback" || option == "--target-split-fast-rollback" ||
             option == "--adaptive-experts" || option == "--specla" ||
             option == "--specla-top-k" || option.rfind("--kvflash", 0) == 0 ||
             option.rfind("--spark", 0) == 0)) {
@@ -1140,6 +1154,38 @@ static void apply_launch_profile_env(const luce::server::LaunchProfile & profile
                  kept_env.c_str());
 }
 
+// Residency compares device names, so auto:N names the compiled backend's
+// device N, the one it runs on.
+static std::string residency_device_name(DevicePlacement device) {
+    if (device.backend == PlacementBackend::Auto) device.backend = compiled_placement_backend();
+    return placement_device_name(device);
+}
+
+// Every device a model block occupies, for swap residency: each layer-split
+// shard (or the single target), the draft device and the expert device.
+static std::vector<std::string> residency_devices(const DevicePlacement & target,
+                                                  const DevicePlacement * draft,
+                                                  const DevicePlacement * expert) {
+    std::vector<std::string> list;
+    const auto add = [&](const DevicePlacement & placement) {
+        const std::string device = residency_device_name(placement);
+        if (std::find(list.begin(), list.end(), device) == list.end()) list.push_back(device);
+    };
+    if (target.is_multi_device()) {
+        for (size_t i = 0; i < target.layer_split_gpus.size(); ++i) {
+            DevicePlacement shard;
+            shard.backend = target.layer_split_backend(i);
+            shard.gpu = target.layer_split_gpus[i];
+            add(shard);
+        }
+    } else {
+        add(target);
+    }
+    if (draft) add(*draft);
+    if (expert) add(*expert);
+    return list;
+}
+
 static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_model) {
     if (model.profile) apply_launch_profile_env(*model.profile);
     if (!model.adaptive_experts_tau.empty())
@@ -1433,8 +1479,9 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         }
     }
 
-    // Create backend.
-    g_peer_access_opt_in = backend_placement.target.peer_access;
+    // Create backend. Peer access is process-wide: one block opts in for the
+    // process, and blocks loaded later must not turn it off.
+    if (backend_placement.target.peer_access) g_peer_access_opt_in = true;
     std::fprintf(stderr, "[server] creating backend...\n");
     if (spark_autotune) {
         // Self-tuning hot/cold MoE residency: enable the bounded expert cache
@@ -1487,6 +1534,16 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         }
     }
     if (model.expert_device && !apply_expert_device(*model.expert_device, backend_plan)) {
+        return 2;
+    }
+    // DeepSeek4 reads its expert device from the process environment, which
+    // another block's --expert-device sets; residency would not list it.
+    if (multi_model && !model.expert_device &&
+        luce::common::arch_is_deepseek4_family(backend_plan.arch()) &&
+        env_flag_enabled("LUCE_DS4_MOE_TP")) {
+        std::fprintf(stderr, "[server] model %s: DeepSeek4 without --expert-device would inherit the "
+                             "process-wide LUCE_DS4_MOE_TP expert device; give it --expert-device or "
+                             "unset LUCE_DS4_MOE_TP\n", model.sconfig.model_name.c_str());
         return 2;
     }
     auto backend_owner = create_backend(backend_plan);
@@ -1879,6 +1936,15 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     sconfig.draft_device  = backend_speculation.draft_path
                                 ? placement_device_name(backend_placement.draft)
                                 : std::string();
+    sconfig.residency_devices = residency_devices(
+        backend_placement.target,
+        backend_speculation.draft_path ? &backend_placement.draft : nullptr,
+        model.expert_device ? &*model.expert_device : nullptr);
+    if (model.expert_device) {
+        const std::string expert = residency_device_name(*model.expert_device);
+        if (expert != residency_device_name(backend_placement.target))
+            sconfig.residency_secondary_devices = {expert};
+    }
     // Tokenizer ID: best-effort. The Tokenizer class doesn't currently
     // expose the GGUF metadata key it was loaded from, so leave empty
     // and let /props report null. (Add a getter on Tokenizer later.)
@@ -2102,10 +2168,28 @@ int main(int argc, char ** argv) {
     // main's argv and outlive every backend, including factories borrowing paths.
     std::vector<std::vector<char *>> model_args(1, {argv[0]});
     bool load_balancing = false;
+    auto model_routing = ServerConfig::ModelRouting::balance;
+    bool unknown_model_to_primary = false;
+    bool unknown_model_set = false;
+    bool swap_residency = false;
+    std::set<std::string> swap_keep_weights;  // model names evicted warm
     std::string primary_gpu;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--load-balancing") == 0) {
             load_balancing = true;
+        } else if (std::strcmp(argv[i], "--swap-residency") == 0) {
+            swap_residency = true;
+        } else if (std::strcmp(argv[i], "--swap-keep-weights") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                std::fprintf(stderr, "[server] --swap-keep-weights requires model names (comma-separated)\n");
+                return 2;
+            }
+            std::string names = argv[++i];
+            for (size_t start = 0; start <= names.size();) {
+                const size_t end = std::min(names.find(',', start), names.size());
+                if (end > start) swap_keep_weights.insert(names.substr(start, end - start));
+                start = end + 1;
+            }
         } else if (std::strcmp(argv[i], "--load-balancing-primary-gpu") == 0) {
             DevicePlacement device;
             if (!primary_gpu.empty() || i + 1 >= argc ||
@@ -2116,6 +2200,25 @@ int main(int argc, char ** argv) {
             }
             primary_gpu = placement_device_name(device);
             ++i;
+        } else if (std::strcmp(argv[i], "--model-routing") == 0) {
+            const char * value = i + 1 < argc ? argv[++i] : "";
+            if (std::strcmp(value, "balance") == 0) {
+                model_routing = ServerConfig::ModelRouting::balance;
+            } else if (std::strcmp(value, "name") == 0) {
+                model_routing = ServerConfig::ModelRouting::name;
+            } else {
+                std::fprintf(stderr, "[server] --model-routing expects balance or name\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--unknown-model") == 0) {
+            const char * value = i + 1 < argc ? argv[++i] : "";
+            if (std::strcmp(value, "reject") == 0 || std::strcmp(value, "primary") == 0) {
+                unknown_model_to_primary = std::strcmp(value, "primary") == 0;
+                unknown_model_set = true;
+            } else {
+                std::fprintf(stderr, "[server] --unknown-model expects reject or primary\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--model") == 0) {
             if (i + 1 >= argc || argv[i + 1][0] == '-') {
                 std::fprintf(stderr, "[server] --model requires a model path\n");
@@ -2128,10 +2231,27 @@ int main(int argc, char ** argv) {
         }
     }
     const bool multi_model = model_args.size() > 1;
-    if (load_balancing && !multi_model) {
-        std::fprintf(stderr, "[server] --load-balancing requires at least two model blocks\n");
+    const bool name_routing = model_routing == ServerConfig::ModelRouting::name;
+    if (unknown_model_set && !name_routing) {
+        std::fprintf(stderr, "[server] --unknown-model requires --model-routing name\n");
         return 2;
     }
+    if (!swap_keep_weights.empty() && !swap_residency) {
+        std::fprintf(stderr, "[server] --swap-keep-weights requires --swap-residency\n");
+        return 2;
+    }
+    if (swap_residency && !name_routing) {
+        std::fprintf(stderr, "[server] --swap-residency requires --model-routing name\n");
+        return 2;
+    }
+    if ((load_balancing || name_routing) && !multi_model) {
+        std::fprintf(stderr, "[server] %s requires at least two model blocks\n",
+                     name_routing ? "--model-routing name" : "--load-balancing");
+        return 2;
+    }
+    // Name routing serves every block, so it loads them all under the same
+    // per-model scoping rules as load balancing.
+    if (name_routing) load_balancing = true;
     // Profile tokens are referenced by model_args for the process lifetime.
     static std::vector<std::unique_ptr<std::string>> profile_storage;
     std::vector<const luce::server::LaunchProfile *> profiles(model_args.size());
@@ -2160,6 +2280,18 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
+    // --expert-device and --peer-access set process-wide state (the DeepSeek4
+    // expert environment, the peer-access opt-in), so one block may own them.
+    if (load_balancing) {
+        const auto owners = std::count_if(options.begin(), options.end(), [](const ModelOptions & o) {
+            return o.expert_device.has_value() || o.bargs.device.peer_access;
+        });
+        if (owners > 1) {
+            std::fprintf(stderr, "[server] --expert-device and --peer-access change process-wide policy; "
+                                 "only one model block may set them\n");
+            return 2;
+        }
+    }
 
     // Listener policy belongs to the first CLI block, independently of priority.
     const ServerConfig listener_config = options.front().sconfig;
@@ -2185,8 +2317,11 @@ int main(int argc, char ** argv) {
     // Several GPU models in one process capture HIP/CUDA graphs from different
     // worker threads. Under relaxed capture, a blocking call from one worker
     // (prefix-cache checkpoint copies, host reads) invalidates the capture in
-    // flight on the other, so replicas fail intermittently. Eager launches cost
-    // ~4% on one R9700 and nothing measurable on the balanced aggregate.
+    // flight on the other, so replicas fail intermittently. This was observed
+    // with the models on different GPUs (R9700 + Strix Halo): separate devices
+    // or graph caches do not make capture safe, only keeping other workers'
+    // blocking calls out of an open capture would. Eager launches cost ~4% on
+    // one R9700 and nothing measurable on the balanced aggregate.
     // LUCE_MULTI_MODEL_GRAPHS=1 keeps graphs on (ggml reads any value of
     // GGML_CUDA_DISABLE_GRAPHS as disabled, so it cannot be the opt-out).
     if (options.size() > 1) {
@@ -2207,9 +2342,24 @@ int main(int argc, char ** argv) {
         option.sconfig.port = listener_config.port;
         option.sconfig.enable_cors = listener_config.enable_cors;
         option.sconfig.routing_queue_limit = listener_config.routing_queue_limit;
+        option.sconfig.model_routing = model_routing;
+        option.sconfig.swap_residency = swap_residency;
+        option.sconfig.swap_keep_weights = swap_keep_weights.count(option.sconfig.model_name) > 0;
+        option.sconfig.unknown_model_to_primary = unknown_model_to_primary;
+    }
+    for (const auto & name : swap_keep_weights) {
+        const bool known = std::any_of(options.begin(), options.end(), [&](const ModelOptions & o) {
+            return o.sconfig.model_name == name;
+        });
+        if (!known) {
+            std::fprintf(stderr, "[server] --swap-keep-weights: no model block named '%s'\n", name.c_str());
+            return 2;
+        }
     }
     std::fprintf(stderr, "[server] load balancing %s; primary=%s target=%s\n",
-        load_balancing ? "enabled" : "disabled", options.front().sconfig.model_name.c_str(),
+        name_routing ? "by request model name (auto balances)"
+                     : load_balancing ? "enabled" : "disabled",
+        options.front().sconfig.model_name.c_str(),
         options.front().target_device_auto
             ? "auto" : placement_device_name(options.front().bargs.device).c_str());
 
@@ -2226,17 +2376,110 @@ int main(int argc, char ** argv) {
         }
     }
 
-    std::vector<std::unique_ptr<LoadedModel>> loaded;
+    std::vector<std::unique_ptr<LoadedModel>> loaded(options.size());
     std::vector<HttpServer *> servers;
     // All initialization (including backend environment defaults) finishes
     // before starting any scheduler. No worker observes model-loading mutations.
-    for (auto & option : options) {
-        auto model = std::make_unique<LoadedModel>();
-        const int ret = load_model(option, *model, load_balancing);
-        if (ret != 0) return ret;
-        servers.push_back(model->server.get());
-        loaded.push_back(std::move(model));
+    // Swap residency never needs the models to fit together: each later block
+    // whose devices overlap a model that stays resident loads and is evicted
+    // on its own, before loading the blocks that start resident.
+    // The device sets here come from the command line; the listener checks
+    // the resolved ones again once every block is loaded.
+    std::vector<bool> evict_at_startup(options.size(), false);
+    std::vector<bool> evict_partially(options.size(), false);
+    if (swap_residency) {
+        std::vector<std::vector<std::string>> planned(options.size());
+        for (size_t m = 0; m < options.size(); ++m) {
+            const ModelOptions & option = options[m];
+            const std::string & name = option.sconfig.model_name;
+            if (option.target_device_auto) {
+                std::fprintf(stderr, "[server] --swap-residency: model %s needs an explicit --target-device\n",
+                             name.c_str());
+                return 2;
+            }
+            const bool has_draft = option.bargs.draft_path.has_value();
+            // An unplaced draft goes where its backend decides (Qwen: GPU 0,
+            // DeepSeek4: the target), which is unknown before the model loads.
+            if (has_draft && !option.draft_device_set) {
+                std::fprintf(stderr, "[server] --swap-residency: model %s needs an explicit --draft-device\n",
+                             name.c_str());
+                return 2;
+            }
+            const DevicePlacement draft = resolve_draft_placement(
+                option.bargs.draft_device, option.draft_device_set, option.bargs.device,
+                /*target_auto=*/false);
+            planned[m] = residency_devices(option.bargs.device, has_draft ? &draft : nullptr,
+                                           option.expert_device ? &*option.expert_device : nullptr);
+        }
+        const auto overlap = [&](size_t a, size_t b) {
+            for (const auto & device : planned[a]) {
+                if (std::find(planned[b].begin(), planned[b].end(), device) != planned[b].end()) return true;
+            }
+            return false;
+        };
+        std::vector<size_t> resident = {0};
+        for (size_t m = 1; m < options.size(); ++m) {
+            evict_at_startup[m] = std::any_of(resident.begin(), resident.end(),
+                                              [&](size_t r) { return overlap(m, r); });
+            if (!evict_at_startup[m]) resident.push_back(m);
+        }
+        // An evicted block keeps its expert device (a partial eviction) when
+        // no resident block and no other kept tier uses it.
+        std::vector<std::string> kept;
+        for (size_t m = 1; m < options.size(); ++m) {
+            const auto & expert = options[m].expert_device;
+            if (!evict_at_startup[m] || !expert) continue;
+            const std::string device = residency_device_name(*expert);
+            if (device == residency_device_name(options[m].bargs.device)) continue;
+            const bool used = std::find(kept.begin(), kept.end(), device) != kept.end() ||
+                std::any_of(resident.begin(), resident.end(), [&](size_t r) {
+                    return std::find(planned[r].begin(), planned[r].end(), device) != planned[r].end();
+                });
+            if (used) continue;
+            evict_partially[m] = true;
+            kept.push_back(device);
+        }
     }
+    std::vector<size_t> load_order;
+    // Load every initially evicted block before any resident block: later
+    // blocks can overlap a non-primary resident as well as the primary.
+    for (size_t m = 0; m < options.size(); ++m) {
+        if (evict_at_startup[m]) load_order.push_back(m);
+    }
+    for (size_t m = 0; m < options.size(); ++m) {
+        if (!evict_at_startup[m]) load_order.push_back(m);
+    }
+    for (size_t m : load_order) {
+        auto model = std::make_unique<LoadedModel>();
+        const int ret = load_model(options[m], *model, load_balancing);
+        if (ret != 0) return ret;
+        if (swap_residency) {
+            ModelBackend & backend = model->engine->backend();
+            std::string reason;
+            if (!backend.supports_eviction(reason)) {
+                std::fprintf(stderr, "[server] --swap-residency: model %s: %s\n",
+                             options[m].sconfig.model_name.c_str(), reason.c_str());
+                return 2;
+            }
+        }
+        if (evict_at_startup[m]) {
+            ModelBackend & backend = model->engine->backend();
+            // Startup must fit one model at a time. Keep-weights applies to
+            // runtime swaps, where a failed warm swap can retry cold.
+            const auto evicted = backend.evict(evict_partially[m]
+                ? ModelBackend::EvictLevel::partial : ModelBackend::EvictLevel::cold);
+            if (evicted.status != ModelBackend::EvictStatus::ok) {
+                std::fprintf(stderr, "[server] --swap-residency: evicting %s at startup: %s\n",
+                             options[m].sconfig.model_name.c_str(), evicted.error.c_str());
+                return 2;
+            }
+            std::fprintf(stderr, "[server] %s loaded and evicted%s (swap residency)\n",
+                         options[m].sconfig.model_name.c_str(),
+                         evict_partially[m] ? " partially" : "");
+        }
+        loaded[m] = std::move(model);
+    }
+    for (auto & model : loaded) servers.push_back(model->server.get());
     g_server = servers.front();
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGINT, signal_handler);

@@ -168,6 +168,9 @@ bool build_hybrid_full_layer_step(
 // input mapping every token to its slot-local feature-ring destination. This
 // keeps accepted-path replay graph-stable and leaves legacy offset capture
 // unchanged for callers that do not use paged serving.
+// `hidden_captures` — optional residual-stream readouts over row ranges of
+// this graph (see QwenHiddenCapture); results land in sg.hidden_last /
+// sg.hidden_sum, parallel to the array.
 bool build_target_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -192,7 +195,9 @@ bool build_target_step(
     const QwenPrefillSegment * prefill_segments = nullptr,
     int n_prefill_segments = 0,
     int n_logits_rows = 0,
-    bool compact_slots = false);
+    bool compact_slots = false,
+    const QwenHiddenCapture * hidden_captures = nullptr,
+    int n_hidden_captures = 0);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(

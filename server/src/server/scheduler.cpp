@@ -48,6 +48,10 @@ struct SchedSlot {
     std::optional<ResponseError> error;
     bool finished = false;
     std::vector<int32_t> gen_tokens;   // committed + pending, in order
+    // Parallel to gen_tokens when the request asked for logprobs.
+    std::vector<TokenLogprobs> logprobs;
+    // /v1/hidden_states: the prefill's readout. Such a slot never decodes.
+    std::optional<HiddenStates> hidden_states;
     int32_t pending_tok = -1;          // sampled, fed back next step
     // Buffered client output (see client_send_buffer.h): chunks append here and
     // a non-blocking flush runs every scheduler iteration, so one slow
@@ -206,9 +210,22 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // delta into send_buffer, and parks the token in pending_tok as the next
     // step's input for this slot. Sets s.finished — but never retires the
     // slot — on EOS, gen cap, stop-sequence hit, or degenerate repetition.
-    auto advance_slot = [&](SchedSlot & s, int32_t tok) {
+    // `logprobs` is the engine's report for the sampled token, if any.
+    auto advance_slot = [&](int slot, SchedSlot & s, int32_t tok,
+                            const std::optional<TokenLogprobs> & logprobs) {
         tok = s.budget.apply(tok).token;
         s.gen_tokens.push_back(tok);
+        if (logprobs) {
+            const auto actual = logprobs->chosen.token == tok
+                ? logprobs : engine.token_logprobs(slot, tok);
+            if (!actual) {
+                s.error = to_response_error({GenerateErrorCode::DecodeFailed,
+                    "logprobs unavailable for the substituted token"});
+                s.finished = true;
+                return;
+            }
+            s.logprobs.push_back(*actual);
+        }
         const bool cont = deliver_generation_token(
             s.job, s.job->req, *s.emitter, tok, s.completion_tokens,
             s.send_buffer);
@@ -300,6 +317,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                         "application/json", body.dump() + "\n"));
                 }
             }
+        } else if (req.hidden_states && !s.client_disconnected) {
+            s.send_buffer.append(format_http_response(
+                200, "application/json",
+                hidden_states_body(req, s.hidden_states ? *s.hidden_states
+                                                        : HiddenStates{},
+                                   s.prefill_s).dump() + "\n"));
         } else if (req.stream && !s.client_disconnected) {
             const bool is_eos = !s.gen_tokens.empty() &&
                 engine.token_is_eos(s.gen_tokens.back());
@@ -314,7 +337,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             send_nonstream_response(req, s.fd, *s.emitter, s.gen_tokens,
                                     s.n_gen_cap, s.budget.forced_close(),
                                     s.degenerate_close, gen_timings,
-                                    &s.send_buffer);
+                                    &s.send_buffer, std::move(s.logprobs));
         }
 
         const double elapsed_s = std::chrono::duration<double>(
@@ -392,7 +415,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                          req.max_output)
             : req.max_output;
 
-        if (n_gen_cap < 1) {
+        if (n_gen_cap < 1 && !req.hidden_states) {
             // Degenerate ask: reply with an empty completion, no slot needed.
             SseEmitter emitter(req.format, req.response_id, req.model,
                                (int)req.prompt_tokens.size(), req.tools,
@@ -445,8 +468,17 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         int restore_policy_slot = -1;
         // Tokens alone do not identify an image: image requests never touch
         // the prefix cache.
-        const bool prefix_supported = !req.images &&
+        // Hidden-states requests must prefill every token themselves: they
+        // never restore. With cache_prefix they may still leave a checkpoint
+        // of the whole prompt behind for a chat request that extends it.
+        const bool prefix_supported = !req.images && !req.hidden_states &&
             engine.supports_prefix_store() && !prefix_cache_.disabled();
+        const bool hidden_capture = req.hidden_states &&
+            req.hidden_states->cache_prefix &&
+            engine.supports_prefix_store() && !prefix_cache_.disabled();
+        const auto estimate_bytes = [&engine](int target_cut) {
+            return engine.estimate_prefix_store_bytes(target_cut);
+        };
         if (prefix_supported) {
             const auto hit = prefix_cache_.lookup_candidate(
                 req.prompt_tokens,
@@ -469,24 +501,30 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 /*prefer_tools_boundary=*/!req.tools.empty(),
                 req.pin_end_token,
                 restore_policy_slot,
-                [&engine](int target_cut) {
-                    return engine.estimate_prefix_store_bytes(target_cut);
-                },
+                estimate_bytes,
                 req.ends_with_tool_result, /*reachable_from=*/0,
                 backend_.restore_point_spacing());
-            if (capture_reservation.active()) {
-                const uint64_t capture_id = next_prefix_capture_id++;
-                if (next_prefix_capture_id == 0)
-                    next_prefix_capture_id = 1;
-                prefix_plan.capture.id = capture_id;
-                prefix_plan.capture.checkpoint = {
-                    (uint64_t)capture_reservation.slot() + 1,
-                    capture_reservation.target_cut()};
-                if (prefix_plan.restore.valid() &&
-                    prefix_plan.capture.checkpoint == prefix_plan.restore) {
-                    capture_reservation.cancel();
-                    prefix_plan.capture = {};
-                }
+        } else if (hidden_capture) {
+            // The cut is the prompt end, where the readout's last chunk
+            // already stops, so capturing reshapes no prefill chunk.
+            capture_reservation = prefix_cache_.reserve_inline_snap(
+                req.prompt_tokens, /*restored_prefix_len=*/0,
+                /*prefer_tools_boundary=*/false,
+                /*forced_cut=*/(int)req.prompt_tokens.size(),
+                /*restore_source_slot=*/-1, estimate_bytes);
+        }
+        if (capture_reservation.active()) {
+            const uint64_t capture_id = next_prefix_capture_id++;
+            if (next_prefix_capture_id == 0)
+                next_prefix_capture_id = 1;
+            prefix_plan.capture.id = capture_id;
+            prefix_plan.capture.checkpoint = {
+                (uint64_t)capture_reservation.slot() + 1,
+                capture_reservation.target_cut()};
+            if (prefix_plan.restore.valid() &&
+                prefix_plan.capture.checkpoint == prefix_plan.restore) {
+                capture_reservation.cancel();
+                prefix_plan.capture = {};
             }
         }
         if (prefix_supported) {
@@ -505,7 +543,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         // Admission only claims the slot and queues the prompt. Prefill
         // advances one chunk per engine step alongside live decode.
         const PrefixStorePlan requested_plan = prefix_plan;
-        auto ar = req.images
+        auto ar = req.hidden_states
+            ? engine.admit_hidden_states(
+                  next_request_id, req.prompt_tokens, req.hidden_spec,
+                  requested_plan.capture)
+            : req.images
             ? engine.admit_images(
                   next_request_id, req.prompt_tokens, req.sampler, req.images)
             : prefix_supported
@@ -978,9 +1020,14 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 s.finished = true;
                 continue;
             }
+            // Only the final token carries logprobs; slots that asked for
+            // them never speculate, so it is the only token.
+            size_t consumed = 0;
             consume_decode_output_tokens(out, [&](int32_t token) {
                 if (s.finished) return false;
-                advance_slot(s, token);
+                const bool last = consumed++ == out.committed_tokens.size();
+                advance_slot(out.slot, s, token,
+                             last ? out.logprobs : std::optional<TokenLogprobs>{});
                 return !s.finished;
             });
         }
@@ -1021,6 +1068,23 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 s.finished = true;
                 continue;
             }
+            if (out.status == PrefillStatus::completed &&
+                s.job->req.hidden_states) {
+                s.prefilling = false;
+                s.prefill_s = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - s.started_at).count();
+                s.decode_started_at = std::chrono::steady_clock::now();
+                s.hidden_states = out.hidden_states;
+                if (!s.hidden_states) {
+                    s.error = to_response_error({GenerateErrorCode::PrefillFailed,
+                        "engine completed a hidden-states prefill without a readout"});
+                }
+                // Retired in this iteration's reap, before any decode plan.
+                s.finished = true;
+                publish_live_count();
+                deferred_retry_at = {};
+                continue;
+            }
             if (out.status == PrefillStatus::completed) {
                 s.prefilling = false;
                 publish_live_count();
@@ -1035,7 +1099,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     s.prefill_s = std::chrono::duration<double>(
                         s.decode_started_at - s.started_at).count();
                 }
-                advance_slot(s, out.token);
+                advance_slot(out.slot, s, out.token, out.logprobs);
                 continue;
             }
         }

@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <vector>
+
 namespace luce::common {
 
 // Linear search for layer_idx in capture_layer_ids[0..n_capture_layers).
@@ -14,5 +16,17 @@ namespace luce::common {
 int target_capture_index(const int * capture_layer_ids,
                          int n_capture_layers,
                          int layer_idx);
+
+// Adopt a drafter's explicit capture layers (GGUF dflash.target_layer_ids)
+// into a target capture table of `max_slots` entries. The count follows the
+// drafter (its fc width), not the 5-layer default: capturing different layers
+// than the drafter was trained on silently destroys acceptance. Returns false
+// and leaves the table untouched when the list is empty, longer than the
+// table, or names a layer outside [0, target_n_layer).
+bool adopt_drafter_capture_layers(const std::vector<int> & drafter_ids,
+                                  int target_n_layer,
+                                  int max_slots,
+                                  int * capture_layer_ids,
+                                  int & n_capture_layers);
 
 }  // namespace luce::common
