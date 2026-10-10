@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <thread>
 
@@ -36,6 +37,9 @@ struct SchedSlot {
     SocketHandle fd = kInvalidSocket;
     std::unique_ptr<SseEmitter> emitter;
     bool prefilling = false;
+    // Prompt tokens still to prefill, less each step's grant (a step can end
+    // its chunk early, so it may run low). A recomputed request counts as long.
+    int prompt_left = 0;
     uint64_t admission_order = 0;
     std::chrono::steady_clock::time_point started_at{};
     std::chrono::steady_clock::time_point decode_started_at{};
@@ -663,6 +667,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         s.started_at = started_at;
         s.decode_started_at = started_at;  // sane on prefill failure
         s.cached_prefix_tokens = prefix.restored.tokens;
+        s.prompt_left = (int)req.prompt_tokens.size() - prefix.restored.tokens;
         s.cache_capture = std::move(prepared_capture);
         s.n_gen_cap = std::min(
             n_gen_cap,
@@ -703,6 +708,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     std::vector<PrefillCandidate> prefill_candidates;
     prefill_candidates.reserve((size_t)n_slots);
     size_t prefill_round_robin_start = 0;
+    // The decoding requests' turn beside a long prompt
+    // (StepPlanLimits::prefill_time_share): no prompt chunk joins a step that
+    // has them until it ends.
+    std::chrono::steady_clock::time_point decode_only_until{};
 
     while (true) {
         // Phase 1 — Admission: deferred job first (FIFO), then the queue.
@@ -823,6 +832,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     auto & s = slots[(size_t)oldest];
                     if (oldest_state.recompute) {
                         s.prefilling = true;
+                        s.prompt_left = std::numeric_limits<int>::max();
                         s.pending_tok = -1;
                         std::fprintf(stderr,
                             "[parallel] slot %d resumed via re-prefill\n",
@@ -876,9 +886,24 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     prefill_candidates.push_back({i, s.admission_order});
                 }
             }
-            step_plan.prefills = plan_prefill_slices(prefill_candidates,
-                engine.step_plan_limits((int)step_plan.decode.size()),
-                prefill_round_robin_start);
+            const bool decoders_turn = !step_plan.decode.empty() &&
+                std::chrono::steady_clock::now() < decode_only_until;
+            const auto limits = engine.step_plan_limits((int)step_plan.decode.size());
+            // Prompts that finish in one step go first, without the longer
+            // ones: a question asked beside a long document answers after one
+            // short forward, not after the document's next chunk.
+            const auto fits_one_step = [&](const PrefillCandidate & c) {
+                return slots[(size_t)c.slot].prompt_left <= limits.max_prefill_tokens_per_sequence;
+            };
+            if (std::any_of(prefill_candidates.begin(), prefill_candidates.end(), fits_one_step) &&
+                !std::all_of(prefill_candidates.begin(), prefill_candidates.end(), fits_one_step)) {
+                prefill_candidates.erase(std::remove_if(prefill_candidates.begin(), prefill_candidates.end(),
+                    [&](const PrefillCandidate & c) { return !fits_one_step(c); }),
+                    prefill_candidates.end());
+            }
+            step_plan.prefills = decoders_turn
+                ? std::vector<PrefillSlice>{}
+                : plan_prefill_slices(prefill_candidates, limits, prefill_round_robin_start);
         };
         build_plan();
         while (!engine.reserve_decode(step_plan)) {
@@ -944,7 +969,27 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         if (!prefill_candidates.empty()) ++prefill_round_robin_start;
         if (step_plan.decode.empty() && step_plan.prefills.empty()) continue;
 
+        const auto step_started = std::chrono::steady_clock::now();
         SeqEngine::StepResult step_result = engine.step(step_plan);
+        // A prompt longer than one step's chunk shares the time with the
+        // decoding requests; one that fits (an agent's next turn, even when a
+        // prefix capture splits it in two forwards) does not hold them up.
+        const auto step_limits = engine.step_plan_limits((int)step_plan.decode.size());
+        bool long_prompt = false;
+        for (const PrefillSlice & slice : step_plan.prefills) {
+            int & left = slots[(size_t)slice.slot].prompt_left;
+            long_prompt |= left > step_limits.max_prefill_tokens_per_sequence;
+            if (left != std::numeric_limits<int>::max()) left = std::max(0, left - slice.max_tokens);
+        }
+        if (long_prompt && !step_plan.decode.empty()) {
+            const double share = step_limits.prefill_time_share;
+            if (share > 0.0 && share < 1.0) {
+                const auto now = std::chrono::steady_clock::now();
+                decode_only_until = now + std::chrono::duration_cast<
+                    std::chrono::steady_clock::duration>(
+                        (now - step_started) * ((1.0 - share) / share));
+            }
+        }
         const std::string protocol_error =
             validate_step_result(step_plan, step_result, n_slots);
         if (!protocol_error.empty()) {

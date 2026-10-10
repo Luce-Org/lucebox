@@ -78,6 +78,10 @@ struct StepPlanLimits {
     int max_prefill_tokens_per_sequence = 512;
     int max_prefill_tokens_total = 512;
     int prefill_allocation_quantum = 512;
+    // While requests decode, the share of wall time a prompt that needs more
+    // than one step may take: after each of its chunks, the decoding requests
+    // step alone for the rest. 1: a prompt chunk rides every step.
+    double prefill_time_share = 1.0;
 };
 
 // Select the oldest eligible sequences, then distribute the step's token

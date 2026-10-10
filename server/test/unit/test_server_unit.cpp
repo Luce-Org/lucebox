@@ -66,7 +66,10 @@
 #include <string>
 #include <unordered_set>
 #include <type_traits>
+#include <array>
+#include <mutex>
 #include <thread>
+#include <tuple>
 #include <vector>
 #include <limits>
 #if !defined(_WIN32)
@@ -8354,6 +8357,184 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(stats.restore_attempts == 1);
     TEST_ASSERT(stats.restore_invalidations == 1);
     TEST_ASSERT(stats.restore_stall_us_total == 2500);
+}
+
+// A prompt that takes several steps shares the time with a decoding request:
+// after each of its chunks the decoder steps alone for as long as the chunk
+// took. Prompt steps here take 40 ms and decode steps 2 ms.
+class TimeShareEngine final : public SeqEngine {
+public:
+    int slot_count() const override { return 2; }
+    int max_context() const override { return 4096; }
+    bool token_is_eos(int32_t) const override { return false; }
+    StepPlanLimits step_plan_limits(int decode_rows) const override {
+        return {decode_rows > 0 ? 1 : 2, 16, 32, 16, /*prefill_time_share=*/0.5};
+    }
+    AdmitResult admit(uint64_t, const std::vector<int32_t> & prompt, const SamplerCfg &) override {
+        AdmitResult result;
+        const int slot = !slots_[0].active ? 0 : !slots_[1].active ? 1 : -1;
+        if (slot < 0) {
+            result.status = AdmitResult::Status::busy;
+            return result;
+        }
+        slots_[(size_t)slot] = {true, (int)prompt.size()};
+        result.status = AdmitResult::Status::admitted;
+        result.slot = slot;
+        return result;
+    }
+    StepResult step(const StepPlan & plan) override {
+        StepResult result;
+        for (const StepInput & input : plan.decode) result.decode.push_back({input.slot, 7, false, {}});
+        for (const PrefillSlice & slice : plan.prefills) {
+            Slot & slot = slots_[(size_t)slice.slot];
+            slot.remaining -= std::min(slot.remaining, slice.max_tokens);
+            PrefillOutput out;
+            out.slot = slice.slot;
+            out.status = slot.remaining == 0 ? PrefillOutput::Status::completed
+                                             : PrefillOutput::Status::advanced;
+            if (slot.remaining == 0) out.token = 7;
+            result.prefills.push_back(out);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(plan.prefills.empty() ? 2 : 40));
+        std::lock_guard<std::mutex> lock(mu);
+        steps.push_back({(int)plan.decode.size(), (int)plan.prefills.size()});
+        std::vector<int> chunk_slots;
+        for (const PrefillSlice & slice : plan.prefills) chunk_slots.push_back(slice.slot);
+        prompt_slots.push_back(std::move(chunk_slots));
+        return result;
+    }
+    void retire(int slot) override { slots_[(size_t)slot] = {}; }
+
+    std::mutex mu;
+    std::vector<std::pair<int, int>> steps;  // (decode rows, prompt chunks)
+    std::vector<std::vector<int>> prompt_slots;  // the slots each step prefilled
+
+private:
+    struct Slot { bool active = false; int remaining = 0; };
+    std::array<Slot, 2> slots_{};
+};
+
+struct TimeShareBackend : MockBackend {
+    TimeShareEngine engine;
+    SeqEngine * seq_engine() override { return &engine; }
+};
+
+TEST_CASE(ServerUnitFixture, test_scheduler_gives_decoders_time_beside_a_long_prompt) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<TimeShareBackend>();
+    TimeShareBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+
+    int fds[4] = {-1, -1, -1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds + 2) == 0);
+    const auto make_job = [](ServerJob & job, int fd, int prompt, int output, const char * id) {
+        job.fd = fd;
+        job.req.format = ApiFormat::OPENAI_CHAT;
+        job.req.prompt_tokens.assign((size_t)prompt, 100);
+        job.req.max_output = output;
+        job.req.stream = false;
+        job.req.model = "scheduler-test";
+        job.req.response_id = id;
+    };
+    // A chat that decodes, then a prompt of 8 chunks beside it.
+    ServerJob chat, document;
+    make_job(chat, fds[0], 4, 400, "chat");
+    make_job(document, fds[2], 128, 1, "document");
+    SchedulerTestHarness::enqueue(server, &chat);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    SchedulerTestHarness::enqueue(server, &document);
+    const auto wait_done = [](ServerJob & job) {
+        std::unique_lock<std::mutex> lock(job.mu);
+        return job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; });
+    };
+    const bool done = wait_done(document) && wait_done(chat);
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+    unlink(path.c_str());
+    TEST_ASSERT(done);
+
+    // Between two chunks of the long prompt that ran beside the chat, the chat
+    // stepped alone: several decode-only steps, not none.
+    int chunks_beside = 0, alone_between = 0, alone_run = 0;
+    bool after_chunk = false;
+    for (const auto & [decode, chunks] : backend.engine.steps) {
+        if (chunks > 0 && decode > 0) {
+            if (after_chunk) alone_between = std::max(alone_between, alone_run);
+            ++chunks_beside;
+            after_chunk = true;
+            alone_run = 0;
+        } else if (chunks == 0 && decode > 0 && after_chunk) {
+            ++alone_run;
+        }
+    }
+    TEST_ASSERT(chunks_beside >= 2);
+    TEST_ASSERT(alone_between >= 5);
+}
+
+// A prompt that fits in one step runs before a longer one, alone.
+TEST_CASE(ServerUnitFixture, test_scheduler_runs_a_short_prompt_before_a_long_one) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<TimeShareBackend>();
+    TimeShareBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+
+    int fds[4] = {-1, -1, -1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds + 2) == 0);
+    ServerJob document, question;
+    for (auto [job, fd, prompt, id] : {std::tuple{&document, fds[0], 128, "document"},
+                                       std::tuple{&question, fds[2], 4, "question"}}) {
+        job->fd = fd;
+        job->req.format = ApiFormat::OPENAI_CHAT;
+        job->req.prompt_tokens.assign((size_t)prompt, 100);
+        job->req.max_output = 1;
+        job->req.stream = false;
+        job->req.model = "scheduler-test";
+        job->req.response_id = id;
+    }
+    SchedulerTestHarness::enqueue(server, &document);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    SchedulerTestHarness::enqueue(server, &question);
+    const auto wait_done = [](ServerJob & job) {
+        std::unique_lock<std::mutex> lock(job.mu);
+        return job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; });
+    };
+    const bool done = wait_done(question) && wait_done(document);
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+    unlink(path.c_str());
+    TEST_ASSERT(done);
+
+    // The question's step carried only the question; the document went on after.
+    int question_step = -1, last_document_step = -1;
+    for (int i = 0; i < (int)backend.engine.prompt_slots.size(); ++i) {
+        const auto & chunk_slots = backend.engine.prompt_slots[(size_t)i];
+        if (chunk_slots == std::vector<int>{1}) question_step = i;
+        if (std::find(chunk_slots.begin(), chunk_slots.end(), 0) != chunk_slots.end()) last_document_step = i;
+    }
+    TEST_ASSERT(question_step > 0);
+    TEST_ASSERT(last_document_step > question_step);
 }
 
 TEST_CASE(ServerUnitFixture,
