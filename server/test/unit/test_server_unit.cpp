@@ -310,6 +310,23 @@ TEST_CASE(ServerUnitFixture, test_pflash_scorer_uses_user_query_before_chat_suff
     TEST_ASSERT((int)rendered.size() - window.end == 10);
 }
 
+// Claude Code sends its environment as a system message after the user's
+// first one; a template that takes a system message only first gets it as a
+// user turn in place.
+TEST_CASE(ServerUnitFixture, test_template_gets_late_system_message_as_user_turn) {
+    const std::string tmpl =
+        "{%- for m in messages -%}"
+        "{%- if m.role == 'system' and not loop.first -%}"
+        "{{- raise_exception('System message must be at the beginning.') -}}"
+        "{%- endif -%}"
+        "[{{ m.role }}:{{ m.content }}]"
+        "{%- endfor -%}";
+    const std::vector<ChatMessage> msgs = {
+        {"system", "agent"}, {"user", "hi"}, {"system", "env"}, {"developer", "brief"}};
+    TEST_ASSERT(render_chat_template_jinja(tmpl, msgs, "", "", false, false, "") ==
+                "[system:agent][user:hi][user:env][user:brief]");
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_scorer_accepts_responses_string_input) {
     ToolMemory tool_memory;
     const auto messages = normalize_chat_messages(
@@ -2752,7 +2769,8 @@ TEST_CASE(ServerUnitFixture, test_emitter_funcname_tool_buffer_detection) {
         TEST_ASSERT(args["path"] == "/tmp/tool-input.md");
     }
     TEST_ASSERT(em.accumulated_text().find("<funcname>") == std::string::npos);
-    TEST_ASSERT(em.accumulated_text() == "\n\n");
+    // The newlines before the call are not reply text.
+    TEST_ASSERT(em.accumulated_text().empty());
     TEST_ASSERT(wire.find("\"finish_reason\":\"tool_calls\"") !=
                 std::string::npos);
 }
@@ -5141,6 +5159,10 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_thinks_by_default) {
     TEST_ASSERT(by_default.thinking_enabled && by_default.thinking_opt_in);
     const ParsedRequest off = resolve_qwen4exp_reasoning({{"thinking", {{"type", "disabled"}}}});
     TEST_ASSERT(!off.thinking_enabled && !off.thinking_opt_in);
+    // Claude Code's "adaptive" leaves it to the model: the default.
+    const ParsedRequest adaptive = resolve_qwen4exp_reasoning({{"thinking", {{"type", "adaptive"}}}});
+    TEST_ASSERT(adaptive.thinking_enabled && adaptive.thinking_opt_in);
+    TEST_ASSERT(!resolve_qwen_reasoning({{"thinking", {{"type", "adaptive"}}}}).thinking_enabled);
     const ParsedRequest kw_off = resolve_qwen4exp_reasoning({{"chat_template_kwargs", {{"enable_thinking", false}}}});
     TEST_ASSERT(!kw_off.thinking_enabled && !kw_off.thinking_opt_in);
     TEST_ASSERT(!resolve_qwen_reasoning(json::object()).thinking_enabled);

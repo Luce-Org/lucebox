@@ -455,6 +455,17 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         }
 
         // mode_ == StreamMode::CONTENT
+        // The reply starts at its first line of text: the newlines a template
+        // puts after </think> are not part of it (apps would show them as
+        // blank lines on top). Spaces stay: they can indent its first line.
+        if (accumulated_content_.empty()) {
+            const size_t first = window_.find_first_not_of("\r\n");
+            if (first == std::string::npos) {
+                window_.clear();
+                break;
+            }
+            window_.erase(0, first);
+        }
         // Look for <think>, </think>, or supported tool-call starts.
         size_t think_idx = window_.find(THINK_OPEN);
         size_t think_close_idx = window_.find(THINK_CLOSE);

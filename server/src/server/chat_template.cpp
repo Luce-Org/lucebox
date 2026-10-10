@@ -1077,7 +1077,13 @@ std::string render_chat_template_jinja(
                 "normalize with tool-memory replay disabled");
         }
         nlohmann::ordered_json mj;
-        mj["role"]    = m.role;
+        // Templates take a system message only first (Qwen's raise otherwise).
+        // Claude Code sends its environment as a system message after the
+        // user's first one; it reads as a user turn there, in place, so the
+        // prompt before it stays the same and cached.
+        const bool late_system = !messages_j.empty() &&
+            (m.role == "system" || m.role == "developer");
+        mj["role"]    = late_system ? std::string("user") : m.role;
         mj["content"] = m.content;
         if (!m.tool_call_id.empty()) {
             mj["tool_call_id"] = m.tool_call_id;

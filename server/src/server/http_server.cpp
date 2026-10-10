@@ -2415,7 +2415,9 @@ void apply_request_reasoning(
     }
     if (body.contains("thinking") && body["thinking"].is_object()) {
         const auto & thinking = body["thinking"];
-        if (thinking.contains("type")) {
+        // "adaptive" (Claude Code's default) leaves thinking to the model: the
+        // same as no thinking field.
+        if (thinking.contains("type") && thinking.value("type", "") != "adaptive") {
             const bool enabled = thinking.value("type", "") == "enabled";
             enable_thinking = enabled;
             req.thinking_opt_in = enabled;
@@ -2560,7 +2562,9 @@ bool HttpServer::render_and_tokenize_request(
     if (!render_messages_to_text(chat_messages, req,
                                  /*add_generation_prompt=*/true,
                                  req.rendered_prompt, error)) {
-        send_error(fd, 500, error);
+        // The template rejected these messages: a client error, which a
+        // client must not retry as it would a server failure.
+        send_error(fd, 400, error);
         return false;
     }
     req.started_in_thinking = prompt_ends_in_open_think(req.rendered_prompt);
