@@ -8416,16 +8416,19 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(stats.restore_stall_us_total == 2500);
 }
 
-// A prompt that takes several steps shares the time with a decoding request:
-// after each of its chunks the decoder steps alone for as long as the chunk
-// took. Prompt steps here take 40 ms and decode steps 2 ms.
+// A long prompt shares the time with a decoding request: after each of its
+// chunks the decoder steps alone for as long as the chunk took. Prompt steps
+// here take 40 ms and decode steps 2 ms.
 class TimeShareEngine final : public SeqEngine {
 public:
+    explicit TimeShareEngine(int long_prompt_tokens = 0)
+        : long_prompt_tokens_(long_prompt_tokens) {}
     int slot_count() const override { return 2; }
     int max_context() const override { return 4096; }
     bool token_is_eos(int32_t) const override { return false; }
     StepPlanLimits step_plan_limits(int decode_rows) const override {
-        return {decode_rows > 0 ? 1 : 2, 16, 32, 16, /*prefill_time_share=*/0.5};
+        return {decode_rows > 0 ? 1 : 2, 16, 32, 16, /*prefill_time_share=*/0.5,
+                long_prompt_tokens_};
     }
     AdmitResult admit(uint64_t, const std::vector<int32_t> & prompt, const SamplerCfg &) override {
         AdmitResult result;
@@ -8469,18 +8472,22 @@ public:
 private:
     struct Slot { bool active = false; int remaining = 0; };
     std::array<Slot, 2> slots_{};
+    int long_prompt_tokens_;
 };
 
 struct TimeShareBackend : MockBackend {
+    explicit TimeShareBackend(int long_prompt_tokens = 0) : engine(long_prompt_tokens) {}
     TimeShareEngine engine;
     SeqEngine * seq_engine() override { return &engine; }
 };
 
-TEST_CASE(ServerUnitFixture, test_scheduler_gives_decoders_time_beside_a_long_prompt) {
+// A chat that decodes, then a 128-token prompt (8 chunks) beside it. Returns
+// the most decode-only steps the chat took between two of the prompt's chunks.
+static int decode_only_steps_between_chunks(int long_prompt_tokens) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    auto backend_owner = std::make_unique<TimeShareBackend>();
+    auto backend_owner = std::make_unique<TimeShareBackend>(long_prompt_tokens);
     TimeShareBackend & backend = *backend_owner;
     LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
@@ -8502,7 +8509,6 @@ TEST_CASE(ServerUnitFixture, test_scheduler_gives_decoders_time_beside_a_long_pr
         job.req.model = "scheduler-test";
         job.req.response_id = id;
     };
-    // A chat that decodes, then a prompt of 8 chunks beside it.
     ServerJob chat, document;
     make_job(chat, fds[0], 4, 400, "chat");
     make_job(document, fds[2], 128, 1, "document");
@@ -8521,8 +8527,6 @@ TEST_CASE(ServerUnitFixture, test_scheduler_gives_decoders_time_beside_a_long_pr
     unlink(path.c_str());
     TEST_ASSERT(done);
 
-    // Between two chunks of the long prompt that ran beside the chat, the chat
-    // stepped alone: several decode-only steps, not none.
     int chunks_beside = 0, alone_between = 0, alone_run = 0;
     bool after_chunk = false;
     for (const auto & [decode, chunks] : backend.engine.steps) {
@@ -8536,7 +8540,15 @@ TEST_CASE(ServerUnitFixture, test_scheduler_gives_decoders_time_beside_a_long_pr
         }
     }
     TEST_ASSERT(chunks_beside >= 2);
-    TEST_ASSERT(alone_between >= 5);
+    return alone_between;
+}
+
+TEST_CASE(ServerUnitFixture, test_scheduler_gives_decoders_time_beside_a_long_prompt) {
+    // Between two chunks of the long prompt that ran beside the chat, the chat
+    // stepped alone: several decode-only steps, not none.
+    TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/0) >= 5);
+    // A prompt under the engine's long-prompt size keeps every step.
+    TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/256) == 0);
 }
 
 // A prompt that fits in one step runs before a longer one, alone.

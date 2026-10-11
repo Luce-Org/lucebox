@@ -88,6 +88,10 @@ public:
         const PrefixStorePlan & plan) override;
 
     StepResult step(const StepPlan & plan) override;
+    // A step that carries a prompt chunk decodes without the drafter, one
+    // token per request. Beside a prompt of more than 8192 new tokens (a
+    // document, not an agent's next step), the decoding requests get half
+    // the time back in steps of their own, with it.
     StepPlanLimits step_plan_limits(int decode_rows) const override {
         const bool mixed = decode_rows > 0;
         const int per_sequence = mixed ? 512 : 2048;
@@ -103,6 +107,8 @@ public:
             per_sequence,
             std::min(max_prefills_ * per_sequence, total_cap),
             prefill_quantum_,
+            /*prefill_time_share=*/mixed ? 0.5 : 1.0,
+            /*time_share_prompt_tokens=*/8192,
         };
     }
 

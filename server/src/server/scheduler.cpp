@@ -38,8 +38,11 @@ struct SchedSlot {
     std::unique_ptr<SseEmitter> emitter;
     bool prefilling = false;
     // Prompt tokens still to prefill, less each step's grant (a step can end
-    // its chunk early, so it may run low). A recomputed request counts as long.
+    // its chunk early, so it may run low), and the new tokens the prompt
+    // brought (StepPlanLimits::time_share_prompt_tokens). A recomputed
+    // request counts as long.
     int prompt_left = 0;
+    int prompt_new = 0;
     uint64_t admission_order = 0;
     std::chrono::steady_clock::time_point started_at{};
     std::chrono::steady_clock::time_point decode_started_at{};
@@ -667,6 +670,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         s.decode_started_at = started_at;  // sane on prefill failure
         s.cached_prefix_tokens = prefix.restored.tokens;
         s.prompt_left = (int)req.prompt_tokens.size() - prefix.restored.tokens;
+        s.prompt_new = s.prompt_left;
         s.cache_capture = std::move(prepared_capture);
         s.n_gen_cap = std::min(
             n_gen_cap,
@@ -832,6 +836,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     if (oldest_state.recompute) {
                         s.prefilling = true;
                         s.prompt_left = std::numeric_limits<int>::max();
+                        s.prompt_new = std::numeric_limits<int>::max();
                         s.pending_tok = -1;
                         std::fprintf(stderr,
                             "[parallel] slot %d resumed via re-prefill\n",
@@ -970,15 +975,19 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
         const auto step_started = std::chrono::steady_clock::now();
         SeqEngine::StepResult step_result = engine.step(step_plan);
-        // A prompt longer than one step's chunk shares the time with the
-        // decoding requests; one that fits (an agent's next turn, even when a
-        // prefix capture splits it in two forwards) does not hold them up.
+        // A long prompt shares the time with the decoding requests, from its
+        // first chunk to its last; a short one (an agent's next turn, even when
+        // a prefix capture splits it in two forwards) does not hold them up.
         const auto step_limits = engine.step_plan_limits((int)step_plan.decode.size());
+        const int long_prompt_tokens = step_limits.time_share_prompt_tokens > 0
+            ? step_limits.time_share_prompt_tokens
+            : step_limits.max_prefill_tokens_per_sequence;
         bool long_prompt = false;
         for (const PrefillSlice & slice : step_plan.prefills) {
-            int & left = slots[(size_t)slice.slot].prompt_left;
-            long_prompt |= left > step_limits.max_prefill_tokens_per_sequence;
-            if (left != std::numeric_limits<int>::max()) left = std::max(0, left - slice.max_tokens);
+            SchedSlot & s = slots[(size_t)slice.slot];
+            long_prompt |= s.prompt_new > long_prompt_tokens;
+            if (s.prompt_left != std::numeric_limits<int>::max())
+                s.prompt_left = std::max(0, s.prompt_left - slice.max_tokens);
         }
         if (long_prompt && !step_plan.decode.empty()) {
             const double share = step_limits.prefill_time_share;
