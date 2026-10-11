@@ -1574,6 +1574,44 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_multiple_parameters) {
     TEST_ASSERT(result.cleaned_text.empty());
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_dash_parameter_names) {
+    // DeepSeek V4.1 calling Claude Code's Grep, whose flags are named -i and -n.
+    const std::string text =
+        "I'll explore the repository.\n\n"
+        "<｜DSML｜tool_calls>\n\n"
+        "<｜DSML｜invoke name=\"Grep\">\n"
+        "<｜DSML｜parameter name=\"pattern\" string=\"true\">prefix.?cache|PrefixCache</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"output_mode\" string=\"true\">files_with_matches</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"-i\" string=\"false\">true</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"-n\" string=\"false\">true</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "Grep"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"pattern", {{"type", "string"}}},
+                     {"output_mode", {{"type", "string"}}},
+                     {"-i", {{"type", "boolean"}}},
+                     {"-n", {{"type", "boolean"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "Grep");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["pattern"] == "prefix.?cache|PrefixCache");
+        TEST_ASSERT(args["-i"] == true);
+        TEST_ASSERT(args["-n"] == true);
+    }
+    TEST_ASSERT(result.cleaned_text == "I'll explore the repository.");
+}
+
 TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_edit_tool) {
     const std::string text =
         "<｜DSML｜tool_calls>\n"

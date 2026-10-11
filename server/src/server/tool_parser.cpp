@@ -67,14 +67,17 @@ static const char TOOL_CODE_OPEN[] = "<tool_code>";
 static const char ATTRIBUTE_PARAMETER_OPEN[] = "<parameter name=";
 static const char ARG_KEY_OPEN[] = "<arg_key>";
 
+// Parameter names may start with '-': Claude Code's Grep takes -i, -n, -A, -B
+// and -C, and a call whose names no pattern matches is dropped whole.
+//
 // Where an unclosed attribute-style parameter value ends: at a line break that
 // is followed by a complete sibling open tag carrying only name/string
 // attributes. Anything looser fires on literal tag text inside verbatim values
 // (echo '<param>', or XML content such as <param name="x" value="y"/>).
 #define SIBLING_PARAM_BOUNDARY \
     R"(\n(?=\s*<(?:｜DSML｜)?(?:param|parameter)\s+)" \
-    R"((?:name\s*=\s*["']?[A-Za-z_][\w.\-]*["']?(?:\s+string\s*=\s*["']?[^\s"'>]+["']?)?)" \
-    R"(|string\s*=\s*["']?[^\s"'>]+["']?\s+name\s*=\s*["']?[A-Za-z_][\w.\-]*["']?)\s*>))"
+    R"((?:name\s*=\s*["']?-?[A-Za-z_][\w.\-]*["']?(?:\s+string\s*=\s*["']?[^\s"'>]+["']?)?)" \
+    R"(|string\s*=\s*["']?[^\s"'>]+["']?\s+name\s*=\s*["']?-?[A-Za-z_][\w.\-]*["']?)\s*>))"
 
 
 
@@ -356,13 +359,13 @@ static const std::regex & re_bare_tool_name_xml() {
 
 static const std::regex & re_attribute_tool_xml() {
     static std::regex r(
-        R"re(<parameter\s+name\s*=\s*"([A-Za-z_][\w.\-]*)"\s*>([\s\S]*?)</function>)re");
+        R"re(<parameter\s+name\s*=\s*"(-?[A-Za-z_][\w.\-]*)"\s*>([\s\S]*?)</function>)re");
     return r;
 }
 
 static const std::regex & re_attribute_parameter_xml() {
     static std::regex r(
-        R"re(<parameter\s+name\s*=\s*"([A-Za-z_][\w.\-]*)"\s*>([\s\S]*?)</parameter>)re");
+        R"re(<parameter\s+name\s*=\s*"(-?[A-Za-z_][\w.\-]*)"\s*>([\s\S]*?)</parameter>)re");
     return r;
 }
 
@@ -380,7 +383,7 @@ static const std::regex & re_space_function_xml() {
 
 static const std::regex & re_complete_parameter_xml() {
     static std::regex r(
-        R"(<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
+        R"(<parameter=(-?[A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
     return r;
 }
 
@@ -731,8 +734,8 @@ static bool parse_xml_tool_call_body(const std::string & body, const json & tool
     // 3. Extract parameter key-value pairs:
     // a. Attribute style: <(param|parameter) name="key" string="true|false">value</...> or <parameter=key>value</parameter>
     static const std::regex re_attr_param(
-        R"(<(?:｜DSML｜)?(?:param|parameter)\s+(?:name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s+string\s*=\s*["']?true["']?|string\s*=\s*["']?true["']?\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)\s*>([\s\S]*?)(?:</(?:｜DSML｜)?(?:param|parameter)\s*>|)" SIBLING_PARAM_BOUNDARY R"(|(?![\s\S])))"
-        R"(|<(?:｜DSML｜)?(?:param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>([\s\S]*?)(?:</(?:｜DSML｜)?(?:param|parameter)\s*>|)" SIBLING_PARAM_BOUNDARY R"(|(?![\s\S]))|<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
+        R"(<(?:｜DSML｜)?(?:param|parameter)\s+(?:name\s*=\s*["']?(-?[A-Za-z_][\w.\-]*)["']?\s+string\s*=\s*["']?true["']?|string\s*=\s*["']?true["']?\s+name\s*=\s*["']?(-?[A-Za-z_][\w.\-]*)["']?)\s*>([\s\S]*?)(?:</(?:｜DSML｜)?(?:param|parameter)\s*>|)" SIBLING_PARAM_BOUNDARY R"(|(?![\s\S])))"
+        R"(|<(?:｜DSML｜)?(?:param|parameter)\s+name\s*=\s*["']?(-?[A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>([\s\S]*?)(?:</(?:｜DSML｜)?(?:param|parameter)\s*>|)" SIBLING_PARAM_BOUNDARY R"(|(?![\s\S]))|<parameter=(-?[A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
     auto pbegin = std::sregex_iterator(trimmed_params.begin(), trimmed_params.end(), re_attr_param);
     auto pend = std::sregex_iterator();
     if (pbegin != pend) {
@@ -1562,8 +1565,8 @@ ToolParseResult parse_tool_calls(const std::string & raw_text, const json & tool
             R"(([\s\S]*?))"
             R"((?:</(?:｜DSML｜)?invoke\s*>(?=\s*(?:<(?:｜DSML｜)?invoke[\s/>]|</(?:｜DSML｜)?(?:function_calls|tool_calls)\s*>|\{|(?![\s\S])))|(?=<(?:｜DSML｜)?invoke[\s/>])|(?=</(?:｜DSML｜)?(?:function_calls|tool_calls)\s*>)|(?![\s\S])))");
         static const std::regex re_param(
-            R"(<(?:｜DSML｜)?(param|parameter)\s+(?:name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s+string\s*=\s*["']?true["']?|string\s*=\s*["']?true["']?\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)\s*>([\s\S]*?)(?:</(?:｜DSML｜)?\1\s*>|)" SIBLING_PARAM_BOUNDARY R"(|(?![\s\S])))"
-            R"(|<(?:｜DSML｜)?(param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>([\s\S]*?)(?:</(?:｜DSML｜)?\5\s*>|)" SIBLING_PARAM_BOUNDARY R"(|(?![\s\S])))");
+            R"(<(?:｜DSML｜)?(param|parameter)\s+(?:name\s*=\s*["']?(-?[A-Za-z_][\w.\-]*)["']?\s+string\s*=\s*["']?true["']?|string\s*=\s*["']?true["']?\s+name\s*=\s*["']?(-?[A-Za-z_][\w.\-]*)["']?)\s*>([\s\S]*?)(?:</(?:｜DSML｜)?\1\s*>|)" SIBLING_PARAM_BOUNDARY R"(|(?![\s\S])))"
+            R"(|<(?:｜DSML｜)?(param|parameter)\s+name\s*=\s*["']?(-?[A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>([\s\S]*?)(?:</(?:｜DSML｜)?\5\s*>|)" SIBLING_PARAM_BOUNDARY R"(|(?![\s\S])))");
 
         auto fbegin = std::sregex_iterator(text.begin(), text.end(), re_block);
         auto fend = std::sregex_iterator();
