@@ -52,8 +52,11 @@ PrefixHash hash_prefix(const int32_t * ids, int count);
 
 // Prefix-aware inline eviction: given cached prefixes in LRU order (0 = oldest),
 // return the index of the oldest "leaf" — an entry that is not a strict prefix
-// of any other — so shared ancestors stay resident. Pointer overload is the
-// core (no token copies); the value overload is for tests.
+// of any other — so shared ancestors stay resident. A turn kept between a
+// conversation's head and its newest snapshot (see
+// PrefixCache::prune_superseded_ancestors) goes before any leaf: it only
+// serves an edit of the last message. Pointer overload is the core (no token
+// copies); the value overload is for tests.
 //
 // protected_lru (optional, same size): entries marked true are skipped.
 // Without skip_index, if every leaf is protected, the oldest protected leaf
@@ -73,23 +76,21 @@ int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru
                                const std::vector<bool> * protected_lru = nullptr,
                                int skip_index = -1);
 
-// Pick the inline snapshot boundary for a request.
-// Default: boundary before the current user turn (second-to-last marker),
-// only when it advances past an already-restored prefix. A person may edit
-// or resend that turn, so the snapshot stops before it.
-// include_last_message cuts at the last marker instead, the start of the
-// generation prompt. Use it when the prompt ends with tool results: clients
-// append to them and never rewrite them, so the next request reuses them.
-// When prefer_tools_boundary is set (tool-heavy agent requests), prefer the
-// first marker (system+tools head) until that cut is already restored — this
-// is the sticky "thin pin" Python tool-split used to keep under multi-chat
-// eviction. Returns 0 when there is no useful new boundary.
+// Pick the inline snapshot boundary for a request: the last marker, the end
+// of the prompt's last message and the start of the generation prompt, only
+// when it advances past an already-restored prefix. That is the point the
+// next turn extends: a person's follow-up, or an agent's next step after its
+// tool results. A person who edits that message resumes from the previous
+// turn's snapshot instead (PrefixCache::prune_superseded_ancestors keeps it).
+// When prefer_head is set (a conversation's first turn, or a tool-heavy agent
+// request), prefer the first marker (the system/tools head) until that cut is
+// already restored, so new conversations on the same head restore it.
+// Returns 0 when there is no useful new boundary.
 // Cuts below `reachable_from` (the first position the backend can save at,
 // see ModelBackend::snapshot_granularity) are skipped.
 int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
                                     int restored_prefix_len = 0,
-                                    bool prefer_tools_boundary = false,
-                                    bool include_last_message = false,
+                                    bool prefer_head = false,
                                     int reachable_from = 0);
 
 // Restore points spaced at least `min_gap` tokens apart: the first boundary
@@ -220,20 +221,19 @@ public:
     // slot and bytes are out of reach of the others. Destroying it cancels
     // without changing committed metadata.
     // `restored_prefix_len` prevents reserving a slot for a boundary already
-    // covered by the restored snapshot. `prefer_tools_boundary` selects the
-    // system/tools head first (see select_inline_snapshot_boundary). When
+    // covered by the restored snapshot. `prefer_tools_boundary` pins the
+    // system/tools head first (see select_inline_snapshot_boundary), as a
+    // conversation's first turn saves it too. When
     // `forced_cut` > restored, that cut is used instead (PPP pin_end,
     // including mid-message LCP cuts). `restore_source_slot` (default -1) is
     // the slot this request restores from; it is never chosen as the
     // eviction or budget victim and the free-slot path skips it, so the new
     // snapshot lands in a different slot and the restore point can slide
-    // forward past the deepest slot. `include_last_message` and
-    // `reachable_from` are forwarded to select_inline_snapshot_boundary; a
-    // forced cut below `reachable_from` is not forced. With a
-    // `restore_point_spacing` (ModelBackend::restore_point_spacing), the cut is
-    // the end of the last message, the point the next turn extends; any other
-    // cut moves down to the deepest spaced restore point, and nothing is
-    // reserved when that adds no prefix.
+    // forward past the deepest slot. `reachable_from` is forwarded to
+    // select_inline_snapshot_boundary; a forced cut below it is not forced.
+    // With a `restore_point_spacing` (ModelBackend::restore_point_spacing), a
+    // cut other than the end of the last message moves down to the deepest
+    // spaced restore point, and nothing is reserved when that adds no prefix.
     InlineReservation reserve_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len = 0,
@@ -241,7 +241,6 @@ public:
         int forced_cut = 0,
         int restore_source_slot = -1,
         InlineSnapshotSize estimate_bytes = {},
-        bool include_last_message = false,
         int reachable_from = 0,
         int restore_point_spacing = 0);
 
@@ -256,7 +255,9 @@ public:
     void invalidate_inline_snap(int slot);
 
     // Drop the entries that the entry committed in `slot` supersedes: its
-    // strict-prefix ancestors, except the shallowest one and protected pins.
+    // strict-prefix ancestors, except the shallowest one, protected pins and,
+    // while the resident budget holds it, the deepest one: the previous turn,
+    // where an edit of the last message resumes.
     // Returns the dropped slots (and, with `pruned_tokens`, each one's prefix
     // length); the caller frees their snapshot payloads.
     std::vector<int> prune_superseded_ancestors(

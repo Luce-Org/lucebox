@@ -269,9 +269,9 @@ struct ModelBackend {
     virtual int restore_point_spacing() const { return 0; }
 
     // True when the backend ends a prompt forward at every restore point
-    // (GenerateRequest::restore_points). A tool-result request then keeps its
-    // own last boundary among them, so a hit that skips the capture and a
-    // miss that captures the tools head cut prefill alike.
+    // (GenerateRequest::restore_points). A request then keeps its own last
+    // boundary among them, where its snapshot goes, so a hit that skips the
+    // capture and a miss that captures cut prefill alike.
     virtual bool prefill_cuts_at_restore_points() const { return false; }
 
     // System-memory bytes a snapshot of the first `tokens` positions would

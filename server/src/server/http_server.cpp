@@ -3677,10 +3677,9 @@ bool HttpServer::forward_upstream(
 }
 
 std::vector<int> HttpServer::request_restore_points(const std::vector<int32_t> & prompt,
-                                                    bool ends_with_tool_result,
                                                     std::initializer_list<int> cuts) const {
     return prefix_restore_points(prompt, prefix_cache_.chat_markers(), cuts,
-        /*drop_last_boundary=*/!(backend_.prefill_cuts_at_restore_points() && ends_with_tool_result),
+        /*drop_last_boundary=*/!backend_.prefill_cuts_at_restore_points(),
         backend_.restore_point_spacing());
 }
 
@@ -4043,8 +4042,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             [this](int target_cut) {
                 return backend_.snapshot_bytes_estimate(target_cut);
             },
-            req.ends_with_tool_result, reachable_from,
-            backend_.restore_point_spacing());
+            reachable_from, backend_.restore_point_spacing());
         cache.snap_slot = cache.snap_reservation.slot();
         cache.snap_cut = cache.snap_reservation.target_cut();
     };
@@ -4124,7 +4122,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
 
     if (!prefix_cache_.disabled() || !disk_cache_.disabled()) {
         generate_request.restore_points = request_restore_points(
-            effective_prompt, req.ends_with_tool_result,
+            effective_prompt,
             {forced_cut, selected_boundary,
              cache.snap_prepared ? cache.snap_cut : 0});
     }

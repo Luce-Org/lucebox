@@ -240,6 +240,19 @@ int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> &
         }
         return false;
     };
+    auto has_ancestor = [&](int i) {
+        for (int j = 0; j < n; j++) {
+            if (j == i) continue;
+            if (is_strict_prefix(*ids_lru[j], *ids_lru[i])) return true;
+        }
+        return false;
+    };
+    // A turn kept between a conversation's head and its newest snapshot only
+    // serves an edit of the last message: it goes first.
+    for (int i = 0; i < n; i++) {
+        if (i == skip_index || is_protected(i)) continue;
+        if (is_ancestor(i) && has_ancestor(i)) return i;
+    }
     // Oldest-first scan: prefer an unprotected leaf so sticky tools pins
     // survive. skip_index (the in-flight restore source) is never a victim.
     int oldest_protected_leaf = -1;
@@ -286,25 +299,21 @@ int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru
 
 int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
                                     int restored_prefix_len,
-                                    bool prefer_tools_boundary,
-                                    bool include_last_message,
+                                    bool prefer_head,
                                     int reachable_from) {
     if (boundaries.empty()) return 0;
     const auto usable = [&](int cut) {
         return cut > restored_prefix_len && cut >= reachable_from;
     };
-    // Tool-heavy cold path: pin the system+tools head (first marker) before
-    // deepening into conversation turns. Matches Python thin-pin semantics.
-    // A head the backend cannot save is skipped: it is cheap to prefill, and
-    // waiting for it would keep the cache from ever saving a deeper cut.
-    if (prefer_tools_boundary) {
-        const int tools_cut = boundaries.front();
-        if (usable(tools_cut)) return tools_cut;
+    // Save the system/tools head (first marker) before deepening into
+    // conversation turns. A head the backend cannot save is skipped: it is
+    // cheap to prefill, and waiting for it would keep the cache from ever
+    // saving a deeper cut.
+    if (prefer_head) {
+        const int head = boundaries.front();
+        if (usable(head)) return head;
     }
-    const int target = boundaries.size() >= 2 && !include_last_message
-        ? boundaries[boundaries.size() - 2]
-        : boundaries.back();
-    return usable(target) ? target : 0;
+    return usable(boundaries.back()) ? boundaries.back() : 0;
 }
 
 std::vector<int> spaced_restore_points(const std::vector<int> & boundaries, int min_gap) {
@@ -636,33 +645,29 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         int forced_cut,
         int restore_source_slot,
         InlineSnapshotSize estimate_bytes,
-        bool include_last_message,
         int reachable_from,
         int restore_point_spacing) {
     if (disabled_) return {};
 
     const auto candidates = find_all_boundaries(prompt_ids, markers_);
-    // A backend that cuts prefill at its restore points saves the prompt up to
-    // the end of its last message, the point the next turn extends: a person's
-    // follow-up, or the agent's next step after a tool result. The cut adds
-    // only a forward over the generation prompt after it, where the turn
-    // before it would make the next one prefill again up to `spacing` tokens.
-    if (restore_point_spacing > 0) include_last_message = true;
-    // A long tail past a short system/tools head (an agent's first turn, cold
-    // or with only the shared head restored): snapshot at the last message
-    // boundary instead of the head, or the first follow-up re-prefills the
-    // whole turn. That boundary is the end of the prompt unless the template
-    // appends tokens after it. Only a short head gives up its own pin this
-    // way, so a new conversation that shares it re-prefills at most
-    // LUCE_PC_DEEP_FIRST_MAX_HEAD tokens (default 2048).
-    // LUCE_PC_DEEP_FIRST_MIN is the tail length that triggers it (default
-    // 4096 tokens; 0 keeps the head pin). Values that are not a whole
-    // non-negative integer keep the defaults.
-    // Only the tool-request path pins the head, so only it changes. A forced
-    // pin still ahead of the restored prefix (an explicit pin_end, or PPP's
-    // pin of a head seen before) wins and keeps its protection, and a prompt
-    // the resident budget could never hold keeps the head pin instead of
-    // saving nothing.
+    // A conversation's first turn (one message past a head it did not
+    // restore) saves its system head, which every new conversation on that
+    // head restores; each later turn saves its end. Tool requests keep their
+    // system/tools head pinned until it is restored (prefer_tools_boundary).
+    bool prefer_head = prefer_tools_boundary ||
+        (candidates.size() == 2 && restored_prefix_len < candidates.front());
+    // A long tail past a short head (a first turn, cold or with only the
+    // shared head restored): snapshot at the last message boundary instead of
+    // the head, or the first follow-up re-prefills the whole turn. Only a
+    // short head gives up its own pin this way, so a new conversation that
+    // shares it re-prefills at most LUCE_PC_DEEP_FIRST_MAX_HEAD tokens
+    // (default 2048). LUCE_PC_DEEP_FIRST_MIN is the tail length that triggers
+    // it (default 4096 tokens; 0 keeps the head pin). Values that are not a
+    // whole non-negative integer keep the defaults.
+    // A forced pin still ahead of the restored prefix (an explicit pin_end, or
+    // PPP's pin of a head seen before) wins and keeps its protection, and a
+    // prompt the resident budget could never hold keeps the head pin instead
+    // of saving nothing.
     static const int deep_first_min = env_nonneg_int("LUCE_PC_DEEP_FIRST_MIN", 4096);
     static const int deep_first_max_head = env_nonneg_int("LUCE_PC_DEEP_FIRST_MAX_HEAD", 2048);
     const auto whole_prompt_fits = [&]() {
@@ -670,14 +675,14 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         const size_t bytes = estimate_bytes ? estimate_bytes((int) prompt_ids.size()) : 0;
         return bytes != 0 && bytes <= max_resident_bytes_;
     };
-    if (deep_first_min > 0 && prefer_tools_boundary && !candidates.empty() &&
+    if (deep_first_min > 0 && prefer_head && !candidates.empty() &&
         restored_prefix_len <= candidates.front() &&
         forced_cut <= restored_prefix_len &&
         candidates.front() <= deep_first_max_head &&
         (int) prompt_ids.size() - candidates.front() >= deep_first_min &&
         whole_prompt_fits()) {
+        prefer_head = false;
         prefer_tools_boundary = false;
-        include_last_message = true;
     }
     int target_cut = 0;
     bool forced = false;
@@ -688,8 +693,7 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         forced = true;
     } else {
         target_cut = select_inline_snapshot_boundary(
-            candidates, restored_prefix_len, prefer_tools_boundary,
-            include_last_message, reachable_from);
+            candidates, restored_prefix_len, prefer_head, reachable_from);
     }
     if (restore_point_spacing > 0 && target_cut > 0 &&
         target_cut != candidates.back()) {
@@ -823,16 +827,32 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
                 }
                 return true;
             };
+            const auto is_middle = [&](int candidate) {
+                if (is_leaf(candidate)) return false;
+                for (int i = 0; i < (int)entries_.size(); ++i) {
+                    if (i != candidate &&
+                        is_strict_prefix(entries_[(size_t)i].ids,
+                                         entries_[(size_t)candidate].ids)) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            // A turn kept behind a conversation's newest snapshot first (see
+            // select_inline_evict_victim), then leaves, then the rest;
+            // unprotected entries before protected ones.
             int victim = -1;
-            for (int pass = 0; pass < 4 && victim < 0; ++pass) {
-                const bool require_leaf = pass < 2;
-                const bool allow_protected = pass == 1 || pass == 3;
+            for (int pass = 0; pass < 5 && victim < 0; ++pass) {
+                const bool require_middle = pass == 0;
+                const bool require_leaf = pass == 1 || pass == 2;
+                const bool allow_protected = pass == 2 || pass == 4;
                 for (int i = 0; i < (int)entries_.size(); ++i) {
                     if (restore_source_slot >= 0 &&
                         entries_[(size_t)i].slot == restore_source_slot)
                         continue;
                     if (slot_reserved(entries_[(size_t)i].slot)) continue;
                     if (!fits(i)) continue;
+                    if (require_middle && !is_middle(i)) continue;
                     if (require_leaf && !is_leaf(i)) continue;
                     if (!allow_protected && entries_[(size_t)i].protect)
                         continue;
@@ -978,11 +998,13 @@ int PrefixCache::pick_evict_victim(int skip_index) const {
 
 std::vector<int> PrefixCache::superseded_entries(
         const int32_t * ids, size_t len) const {
-    // An agent conversation saves one snapshot per turn, each a strict
-    // prefix of the next. Restores only ever use the deepest one, so the
-    // intermediate turns are dead weight. Keep the shallowest ancestor (the
-    // system/tools head that a compacted or sibling conversation reuses)
-    // and any protected pin.
+    // A conversation saves one snapshot per turn, each a strict prefix of the
+    // next. Restores use the deepest one, or the one before it when a person
+    // edits their last message; the turns before those are dead weight. Keep
+    // the shallowest ancestor (the system/tools head that a compacted or
+    // sibling conversation reuses) and any protected pin. The previous turn
+    // is in the list: prune_superseded_ancestors keeps it while the budget
+    // holds it, and a capture's budget counts it as freed.
     std::vector<int> out;
     int shallowest = -1;
     for (int i = 0; i < (int)entries_.size(); ++i) {
@@ -1006,7 +1028,23 @@ std::vector<int> PrefixCache::prune_superseded_ancestors(
     if (newest < 0) return pruned;
     const auto & newest_ids = entries_[(size_t)newest].ids;
     const size_t newest_len = newest_ids.size();
-    const auto superseded = superseded_entries(newest_ids.data(), newest_len);
+    auto superseded = superseded_entries(newest_ids.data(), newest_len);
+    // Keep the previous turn, the deepest of them, if the budget holds it
+    // once the others are gone.
+    int previous = -1;
+    size_t others = 0;
+    for (const int i : superseded) {
+        if (previous < 0 ||
+            entries_[(size_t)i].ids.size() > entries_[(size_t)previous].ids.size()) {
+            previous = i;
+        }
+        others += entries_[(size_t)i].resident_bytes;
+    }
+    if (previous >= 0) others -= entries_[(size_t)previous].resident_bytes;
+    if (previous >= 0 &&
+        (max_resident_bytes_ == 0 || resident_bytes_ - others <= max_resident_bytes_)) {
+        superseded.erase(std::find(superseded.begin(), superseded.end(), previous));
+    }
     size_t freed = 0;
     // Erase from the back so earlier indices stay valid.
     for (auto it = superseded.rbegin(); it != superseded.rend(); ++it) {

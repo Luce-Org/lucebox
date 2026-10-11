@@ -3420,17 +3420,18 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     };
     TEST_ASSERT(find_all_boundaries(prompt, markers) ==
                 std::vector<int>({3, 5, 8, 10}));
-    // The default snapshot cut stays before the current user turn.
+    // The snapshot cut is the end of the last message, which the next turn
+    // extends.
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    find_all_boundaries(prompt, markers)) == 8);
+                    find_all_boundaries(prompt, markers)) == 10);
 
-    // A first turn snapshots its system text, so a new session on the same
+    // A first turn prefers its system text, so a new session on the same
     // system prompt restores it instead of prefilling it again.
     const std::vector<int32_t> first_turn = {1, 100, 3, 101, 4};
     TEST_ASSERT(find_all_boundaries(first_turn, markers) ==
                 std::vector<int>({3, 5}));
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    find_all_boundaries(first_turn, markers)) == 3);
+                    find_all_boundaries(first_turn, markers), 0, true) == 3);
     // Tool-heavy requests pin the same system head.
     TEST_ASSERT(select_inline_snapshot_boundary(
                     find_all_boundaries(prompt, markers), 0, true) == 3);
@@ -3549,13 +3550,17 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_long_first_turn_snapshots_whole_p
         r.cancel();
     }
 
-    // A request without tools never pinned the head; it keeps its usual cut
-    // (the start of the last message) rather than a whole-prompt snapshot.
+    // A first turn without tools saves the same way: its long message whole,
+    // and the head when the message is short.
     {
         PrefixCache cache(2, tokenizer);
         auto r = cache.reserve_inline_snap(
             short_head, /*restored_prefix_len=*/0,
             /*prefer_tools_boundary=*/false);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == (int) short_head.size());
+        r.cancel();
+        r = cache.reserve_inline_snap(short_tail);
         TEST_ASSERT(r.active());
         TEST_ASSERT(r.target_cut() == 3);
         r.cancel();
@@ -4046,26 +4051,15 @@ TEST_CASE(ServerUnitFixture, test_find_boundaries_clean_prompt_unchanged) {
 
 TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_advances_past_restore) {
     const std::vector<int> boundaries = {100, 240, 380, 520};
-    // Second-to-last is the boundary before the current user turn.
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries) == 380);
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 240) == 380);
+    // The last boundary, the end of the last message: a person's follow-up
+    // and an agent's next step after its tool results both extend it.
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries) == 520);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 380) == 520);
     // Do not reserve a snapshot when the restore already covers that point.
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 380) == 0);
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 500) == 0);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 520) == 0);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 600) == 0);
     TEST_ASSERT(select_inline_snapshot_boundary({}, 0) == 0);
     TEST_ASSERT(select_inline_snapshot_boundary({100}, 0) == 100);
-}
-
-TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_includes_trailing_tool_result) {
-    const std::vector<int> boundaries = {100, 240, 380, 520};
-    // A prompt ending in tool results is snapshotted through them, up to
-    // the generation prompt, because the next agent turn only appends.
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 0, false, true) == 520);
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 380, false, true) == 520);
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 520, false, true) == 0);
-    // The cold tools head still comes first.
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 0, true, true) == 100);
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true, true) == 520);
 }
 
 // Families with a trailing role marker can snapshot through the tool results.
@@ -4118,9 +4112,9 @@ TEST_CASE(ServerUnitFixture, test_spaced_restore_points) {
     // Prefix-stable: a shorter prompt keeps the longer prompt's points up to its end.
     TEST_ASSERT((spaced_restore_points({300, 900, 1500, 2600}, 2048) == std::vector<int>{300, 2600}));
 
-    // With spacing, a capture is the end of the last message, the point the
-    // next turn extends, even for a chat (no tool result); a cut short of it
-    // moves down to a spaced point, and none is reserved when that adds no prefix.
+    // A capture is the end of the last message, the point the next turn
+    // extends; with spacing, a cut short of it moves down to a spaced point,
+    // and none is reserved when that adds no prefix.
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
@@ -4129,18 +4123,18 @@ TEST_CASE(ServerUnitFixture, test_spaced_restore_points) {
     const std::vector<int> boundaries = find_all_boundaries(prompt, cache.chat_markers());
     TEST_ASSERT(boundaries.size() >= 3);
     const int head = boundaries.front();
-    auto plain = cache.reserve_inline_snap(prompt, 0, false, 0, -1, {}, /*include_last_message=*/false);
-    TEST_ASSERT(plain.active() && plain.target_cut() == boundaries[boundaries.size() - 2]);
+    auto plain = cache.reserve_inline_snap(prompt);
+    TEST_ASSERT(plain.active() && plain.target_cut() == boundaries.back());
     plain.cancel();
     // A spacing wider than the whole prompt still keeps the last message's end.
-    auto last = cache.reserve_inline_snap(prompt, 0, false, 0, -1, {}, false, 0, /*restore_point_spacing=*/64);
+    auto last = cache.reserve_inline_snap(prompt, 0, false, 0, -1, {}, 0, /*restore_point_spacing=*/64);
     TEST_ASSERT(last.active() && last.target_cut() == boundaries.back());
     last.cancel();
     // A pinned cut in the middle moves down to the head, the only spaced point.
-    auto moved = cache.reserve_inline_snap(prompt, 0, false, /*forced_cut=*/boundaries[1], -1, {}, false, 0, 64);
+    auto moved = cache.reserve_inline_snap(prompt, 0, false, /*forced_cut=*/boundaries[1], -1, {}, 0, 64);
     TEST_ASSERT(moved.active() && moved.target_cut() == head);
     moved.cancel();
-    auto none = cache.reserve_inline_snap(prompt, boundaries.back(), false, 0, -1, {}, false, 0, 64);
+    auto none = cache.reserve_inline_snap(prompt, boundaries.back(), false, 0, -1, {}, 0, 64);
     TEST_ASSERT(!none.active());
 }
 
@@ -4155,13 +4149,13 @@ TEST_CASE(ServerUnitFixture, test_inline_captures_in_flight_hold_their_slots) {
     const std::vector<int32_t> b = {1, 200, 3, 201, 4};
     const std::vector<int32_t> c = {1, 300, 3, 301, 4};
     const auto bytes = [](int) { return (size_t)400; };
-    auto first = cache.reserve_inline_snap(a, 0, false, 0, -1, bytes, true);
-    auto twin = cache.reserve_inline_snap(a, 0, false, 0, -1, bytes, true);
-    auto second = cache.reserve_inline_snap(b, 0, false, 0, -1, bytes, true);
+    auto first = cache.reserve_inline_snap(a, 0, false, 0, -1, bytes);
+    auto twin = cache.reserve_inline_snap(a, 0, false, 0, -1, bytes);
+    auto second = cache.reserve_inline_snap(b, 0, false, 0, -1, bytes);
     TEST_ASSERT(first.active() && !twin.active() && second.active());
     TEST_ASSERT(first.slot() != second.slot());
     // Both slots are held, and a third capture would not fit the budget anyway.
-    auto third = cache.reserve_inline_snap(c, 0, false, 0, -1, bytes, true);
+    auto third = cache.reserve_inline_snap(c, 0, false, 0, -1, bytes);
     TEST_ASSERT(!third.active());
     TEST_ASSERT(second.commit(b, 400));
     TEST_ASSERT(first.commit(a, 400));
@@ -4173,20 +4167,18 @@ TEST_CASE(ServerUnitFixture, test_inline_captures_in_flight_hold_their_slots) {
 TEST_CASE(ServerUnitFixture, test_inline_snapshot_skips_unreachable_cuts) {
     const std::vector<int> boundaries = {266, 700, 1300, 1800};
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    boundaries, 0, true, false, /*reachable_from=*/512) == 1300);
-    TEST_ASSERT(select_inline_snapshot_boundary(
-                    boundaries, 0, true, true, 512) == 1800);
+                    boundaries, 0, true, /*reachable_from=*/512) == 1800);
     // A reachable head is still pinned first.
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    boundaries, 0, true, false, 1) == 266);
+                    boundaries, 0, true, 1) == 266);
     // Nothing reachable yet: no reservation, prefill stays cold.
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    {100, 300}, 0, true, true, 512) == 0);
+                    {100, 300}, 0, true, 512) == 0);
     // Restored at 1024 with 512-token chunks: 1300 lies in the first chunk.
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    boundaries, 1024, false, false, 1024 + 512) == 0);
+                    {266, 1300}, 1024, false, 1024 + 512) == 0);
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    boundaries, 1024, false, true, 1024 + 512) == 1800);
+                    boundaries, 1024, false, 1024 + 512) == 1800);
     // A PPP pin the backend cannot save is not forced.
     TEST_ASSERT(!should_force_inline_snapshot_boundary(
                     boundaries, 2000, 0, true, 266, 512));
@@ -4201,7 +4193,7 @@ TEST_CASE(ServerUnitFixture, test_inline_snapshot_skips_unreachable_cuts) {
     const std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102, 3};
     auto capture = cache.reserve_inline_snap(
         prompt, 0, /*prefer_tools_boundary=*/true, /*forced_cut=*/2, -1, {},
-        /*include_last_message=*/false, /*reachable_from=*/3);
+        /*reachable_from=*/3);
     TEST_ASSERT(capture.active());
     TEST_ASSERT(capture.target_cut() > 2);
     capture.cancel();
@@ -4222,9 +4214,9 @@ TEST_CASE(ServerUnitFixture, test_inline_snapshot_prefers_tools_boundary_until_r
     const std::vector<int> boundaries = {100, 240, 380, 520};
     // Cold tool-heavy: pin system+tools head (first marker), not deepen cut.
     TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 0, true) == 100);
-    // After tools head is restored, deepen to second-to-last.
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true) == 380);
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 380, true) == 0);
+    // After tools head is restored, deepen to the end of the last message.
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true) == 520);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 520, true) == 0);
     TEST_ASSERT(select_inline_snapshot_boundary({100}, 0, true) == 100);
     TEST_ASSERT(select_inline_snapshot_boundary({100}, 100, true) == 0);
 }
@@ -4240,7 +4232,7 @@ TEST_CASE(ServerUnitFixture, test_forced_tools_pin_yields_to_deepen_after_restor
     // later conversation boundary instead of forcing the nearby pin again.
     TEST_ASSERT(!should_force_inline_snapshot_boundary(
         boundaries, 600, 100, true, 110));
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true) == 380);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true) == 520);
 
     // Without tools preference, a still-unrestored forced cut retains its
     // original behavior.
@@ -4431,10 +4423,17 @@ TEST_CASE(ServerUnitFixture, test_evict_single_is_zero) {
 }
 
 TEST_CASE(ServerUnitFixture, test_evict_chain_keeps_ancestors) {
-    // Oldest-first chain: [s] < [s,a] < [s,a,b]. Only the longest is a leaf, so
-    // the short shared ancestors are kept and the victim is the deepest entry.
+    // Oldest-first chain: [s] < [s,a] < [s,a,b]. [s,a] sits between the head
+    // and the newest turn, kept only for an edit of the last message: it goes
+    // first. Then the leaf, and the shared head last.
     std::vector<std::vector<int32_t>> ids = {{9}, {9, 1}, {9, 1, 2}};
-    TEST_ASSERT(select_inline_evict_victim(ids) == 2);
+    TEST_ASSERT(select_inline_evict_victim(ids) == 1);
+    ids = {{9}, {9, 1, 2}};
+    TEST_ASSERT(select_inline_evict_victim(ids) == 1);
+    // A protected turn in between stays; the leaf goes.
+    ids = {{9}, {9, 1}, {9, 1, 2}};
+    std::vector<bool> protect = {false, true, false};
+    TEST_ASSERT(select_inline_evict_victim(ids, &protect) == 2);
 }
 
 TEST_CASE(ServerUnitFixture, test_evict_unrelated_falls_back_to_lru) {
@@ -4540,11 +4539,12 @@ TEST_CASE(ServerUnitFixture, test_slide_restore_source_never_evicted) {
         const int victim = select_inline_evict_victim(ids, nullptr, skip);
         TEST_ASSERT(victim >= 0 && victim != skip);
     }
-    // Linear chain whose only leaf is the restore source: evict the
-    // shallowest unprotected ancestor instead of cancelling everything.
-    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 3) == 0);
-    // With a free leaf the usual leaf preference still applies.
-    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 0) == 3);
+    // Linear chain whose only leaf is the restore source: evict a turn kept
+    // between the head and the newest instead of cancelling everything.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 3) == 1);
+    // Otherwise the shallowest unprotected ancestor.
+    ids = {{9}, {9, 1}};
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 1) == 0);
 }
 
 // (c) The protected tools pin is never evicted, even when it is the
@@ -4718,25 +4718,40 @@ TEST_CASE(ServerUnitFixture, test_prune_superseded_ancestors) {
     cache.confirm_inline_snap(3, (int)sibling.size(), sibling, false, 20);
     cache.confirm_inline_snap(4, (int)t3.size(), t3, false, 40);
 
+    // The head and the previous turn stay; the turn before that goes.
     auto pruned = cache.prune_superseded_ancestors(4);
-    std::sort(pruned.begin(), pruned.end());
-    TEST_ASSERT(pruned == std::vector<int>({1, 2}));
-    TEST_ASSERT(cache.stats().in_use == 3);
-    TEST_ASSERT(cache.stats().resident_bytes == 70);
+    TEST_ASSERT(pruned == std::vector<int>({1}));
+    TEST_ASSERT(cache.stats().in_use == 4);
+    TEST_ASSERT(cache.stats().resident_bytes == 100);
     TEST_ASSERT(cache.lookup(t3).first == 4);
     TEST_ASSERT(cache.lookup(sibling).first == 3);
+    // A person who edits the last message resumes from the previous turn.
+    std::vector<int32_t> edited = t2;
+    edited.insert(edited.end(), {3, 104});
+    TEST_ASSERT(cache.lookup(edited).first == 2);
     // Pruning again finds nothing left to drop.
     TEST_ASSERT(cache.prune_superseded_ancestors(4).empty());
     // A slot without an entry prunes nothing.
     TEST_ASSERT(cache.prune_superseded_ancestors(7).empty());
 
+    // The previous turn goes too when the resident budget cannot hold it.
+    PrefixCache tight(8, tokenizer, /*max_resident_bytes=*/70);
+    tight.confirm_inline_snap(0, (int)head.size(), head, false, 10);
+    tight.confirm_inline_snap(1, (int)t2.size(), t2, false, 30);
+    tight.confirm_inline_snap(2, (int)t3.size(), t3, false, 40);
+    TEST_ASSERT(tight.prune_superseded_ancestors(2) == std::vector<int>({1}));
+    TEST_ASSERT(tight.stats().resident_bytes == 50);
+
     // A protected pin that is not the shallowest ancestor also survives.
+    std::vector<int32_t> t4 = t3;
+    t4.insert(t4.end(), {4, 104});
     PrefixCache pinned(8, tokenizer);
     pinned.confirm_inline_snap(0, (int)head.size(), head);
     pinned.confirm_inline_snap(1, (int)t1.size(), t1, /*protect=*/true);
     pinned.confirm_inline_snap(2, (int)t2.size(), t2);
     pinned.confirm_inline_snap(3, (int)t3.size(), t3);
-    TEST_ASSERT(pinned.prune_superseded_ancestors(3) == std::vector<int>({2}));
+    pinned.confirm_inline_snap(4, (int)t4.size(), t4);
+    TEST_ASSERT(pinned.prune_superseded_ancestors(4) == std::vector<int>({2}));
     unlink(path.c_str());
 }
 
@@ -7576,24 +7591,29 @@ TEST_CASE(ServerUnitFixture, test_inline_snapshot_finalization_prunes_chain) {
     turn1.insert(turn1.end(), {3, 101});
     std::vector<int32_t> turn2 = turn1;
     turn2.insert(turn2.end(), {4, 102});
+    std::vector<int32_t> turn3 = turn2;
+    turn3.insert(turn3.end(), {3, 103});
     cache.confirm_inline_snap(0, (int)head.size(), head);
     cache.confirm_inline_snap(1, (int)turn1.size(), turn1);
+    cache.confirm_inline_snap(2, (int)turn2.size(), turn2);
 
     auto reservation = cache.reserve_inline_snap(
-        turn2, (int)turn1.size(), /*prefer_tools_boundary=*/false,
-        /*forced_cut=*/(int)turn2.size(), /*restore_source_slot=*/1);
+        turn3, (int)turn2.size(), /*prefer_tools_boundary=*/false,
+        /*forced_cut=*/(int)turn3.size(), /*restore_source_slot=*/2);
     TEST_ASSERT(reservation.active());
     const int slot = reservation.slot();
-    TEST_ASSERT(slot != 0 && slot != 1);
+    TEST_ASSERT(slot != 0 && slot != 1 && slot != 2);
     backend.saved_slot = slot;
-    backend.saved_position = (int)turn2.size();
+    backend.saved_position = (int)turn3.size();
     SchedulerTestHarness::finalize_inline_snapshot(
-        server, turn2, std::move(reservation), slot,
-        /*requested_cut=*/(int)turn2.size());
+        server, turn3, std::move(reservation), slot,
+        /*requested_cut=*/(int)turn3.size());
 
+    // The head and the previous turn stay.
     TEST_ASSERT(backend.freed == std::vector<int>({1}));
-    TEST_ASSERT(cache.stats().in_use == 2);
-    TEST_ASSERT(cache.lookup(turn2).first == slot);
+    TEST_ASSERT(cache.stats().in_use == 3);
+    TEST_ASSERT(cache.lookup(turn3).first == slot);
+    TEST_ASSERT(cache.lookup(turn2).first == 2);
     std::vector<int32_t> other = head;
     other.insert(other.end(), {3, 999});
     TEST_ASSERT(cache.lookup(other).first == 0);
@@ -8163,8 +8183,8 @@ struct SchedulerPrefixBackend : MockBackend {
 };
 
 // Concurrent serving: two requests admitted together both capture, and a
-// conversation's new checkpoint frees the one it supersedes (keeping the
-// shallowest, the shared head).
+// conversation's new checkpoint frees the ones it supersedes (keeping the
+// shallowest, the shared head, and the previous turn for an edit).
 TEST_CASE(ServerUnitFixture,
           test_scheduler_captures_concurrently_and_prunes_superseded) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
@@ -8177,7 +8197,7 @@ TEST_CASE(ServerUnitFixture,
     ServerConfig config;
     config.arch = "qwen35";
     config.max_ctx = 64;
-    config.prefix_cache_cap = 4;
+    config.prefix_cache_cap = 8;
     config.concurrent_prefix_cache_max_bytes = 4096;
     config.concurrent_prefix_cache = true;
     config.admission_coalesce_ms = 0;
@@ -8217,35 +8237,46 @@ TEST_CASE(ServerUnitFixture,
     });
     const bool ab_done = wait_done(a) && wait_done(b);
 
-    // One conversation, two more turns: the second turn's checkpoint is
-    // superseded by the third's and freed; the head stays.
+    // One conversation, three more turns, each saved at its end: the fourth
+    // turn's checkpoint supersedes the second's, which is freed; the head and
+    // the third turn stay.
     const std::vector<int32_t> turn2 = {1, 100, 3, 101, 4, 102, 2, 3, 103, 4};
     std::vector<int32_t> turn3 = turn2;
     turn3.insert(turn3.end(), {104, 2, 3, 105, 4});
+    std::vector<int32_t> turn4 = turn3;
+    turn4.insert(turn4.end(), {106, 2, 3, 107, 4});
     ServerJob * second = make_job(turn2, "turn2");
     SchedulerTestHarness::enqueue(server, second);
     const bool second_done = wait_done(second);
     ServerJob * third = make_job(turn3, "turn3");
     SchedulerTestHarness::enqueue(server, third);
     const bool third_done = wait_done(third);
+    ServerJob * fourth = make_job(turn4, "turn4");
+    SchedulerTestHarness::enqueue(server, fourth);
+    const bool fourth_done = wait_done(fourth);
 
     SchedulerTestHarness::stop(server);
     scheduler.join();
     for (const int fd : fds) close(fd);
     unlink(path.c_str());
 
-    TEST_ASSERT(ab_done && second_done && third_done);
+    TEST_ASSERT(ab_done && second_done && third_done && fourth_done);
     // Both heads were captured although their requests prefilled together.
     TEST_ASSERT(cache.lookup_candidate({1, 100, 3, 101, 4, 9}, 5).second == 3);
     TEST_ASSERT(cache.lookup_candidate({1, 200, 3, 201, 4, 9}, 5).second == 3);
-    std::vector<int32_t> next = turn3;
+    std::vector<int32_t> next = turn4;
     next.push_back(9);
-    TEST_ASSERT(cache.lookup_candidate(next, (int)next.size() - 1).second == 13);
+    TEST_ASSERT(cache.lookup_candidate(next, (int)next.size() - 1).second == 20);
+    // An edit of the last message resumes from the third turn's end.
+    std::vector<int32_t> edited = turn3;
+    edited.insert(edited.end(), {106, 2, 3, 999, 4});
+    TEST_ASSERT(cache.lookup_candidate(edited, (int)edited.size() - 1).second == 15);
     // The turn-2 checkpoint is gone from the cache and freed in the engine.
-    TEST_ASSERT(cache.lookup_candidate(
-        {1, 100, 3, 101, 4, 102, 2, 3, 103, 4, 9}, 10).second == 3);
+    std::vector<int32_t> after_turn2 = turn2;
+    after_turn2.push_back(9);
+    TEST_ASSERT(cache.lookup_candidate(after_turn2, 10).second == 3);
     bool freed_turn2 = false;
-    for (const auto & ref : backend.engine.discarded) freed_turn2 |= ref.tokens == 8;
+    for (const auto & ref : backend.engine.discarded) freed_turn2 |= ref.tokens == 10;
     TEST_ASSERT(freed_turn2);
 }
 
