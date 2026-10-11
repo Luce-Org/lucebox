@@ -84,6 +84,31 @@ The binary lands at `server/build/test_dflash`.
 
 ---
 
+### Native AMD HIP build
+
+The C++ runtime also supports AMD GPUs through HIP. This native configuration was verified on a Ryzen AI MAX+ 395 (Strix Halo, `gfx1151`) with Ubuntu 26.04.1 LTS, ROCm 10.1.0 (HIP 7.16.26385), GCC 15.2, and CMake 4.2.3, using Lucebox commit `ae039d0acc2f03cd0e8cff33836ad05e4f64d310`.
+
+Initialize the vendored dependencies, then configure and build the server:
+
+```bash
+git submodule update --init --recursive
+cmake -S server -B server/build-hip -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_FLAGS="-isystem /opt/rocm/core-10.1/include" \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/core-10.1/lib/llvm/bin/clang++ \
+  -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm/core-10.1 \
+  -DCMAKE_HIP_FLAGS="-isystem /opt/rocm/core-10.1/include -isystem /opt/rocm/core-10.1/include/hip" \
+  -DLUCE_GPU_BACKEND=hip \
+  -DLUCE_HIP_ARCHITECTURES=gfx1151 \
+  -DGGML_HIP_MMQ_MFMA=ON \
+  -DGGML_HIP_NO_VMM=ON
+cmake --build server/build-hip --target luce_server -j4
+```
+
+Use your system ROCm paths if they differ. For Strix Halo, set `LUCE_HIP_ARCHITECTURES` to `gfx1151`. Keep a separate build directory when switching between CUDA and HIP so CMake does not reuse a cache configured for another backend.
+
+---
+
 ## Model files
 
 Download models before running the server:
