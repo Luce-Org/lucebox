@@ -3,6 +3,7 @@
 #include "fattn-common.cuh"
 #include "mma.cuh"
 
+#include <algorithm>
 #include <atomic>
 #include <cfloat>
 #include <cstdlib>
@@ -16,6 +17,20 @@ static constexpr int PAGED_ATTN_MAX_PACKED_WARPS = 8;
 static __host__ __device__ __forceinline__ int32_t paged_attn_ceil_div(
         int64_t dividend, int32_t divisor) {
     return (int32_t) (dividend / divisor + (dividend % divisor != 0));
+}
+
+// Most partitions a launch may split the context into: each one keeps a
+// head-dim row of halves and a float2 per output row, and the context alone
+// asks for one per 1024 tokens. A 2048-row prompt chunk 118K tokens deep ran
+// the R9700 out of memory on those partials, beside the weights and the KV
+// cache. Its rows give such a chunk its parallelism, so it covers the
+// context with fewer, longer partitions instead.
+static int32_t paged_attn_partials_cap(int64_t output_rows, int32_t head_dim) {
+    constexpr int64_t budget = 256ll << 20;
+    const int64_t per_partition =
+        output_rows * ((int64_t) head_dim * (int64_t) sizeof(half) + (int64_t) sizeof(float2));
+    const int64_t cap = per_partition > 0 ? budget / per_partition : PAGED_ATTN_MAX_PARTITIONS;
+    return (int32_t) std::max<int64_t>(1, std::min<int64_t>(cap, PAGED_ATTN_MAX_PARTITIONS));
 }
 
 // Partition count for n_blocks of context: enough partitions to cover the
@@ -978,6 +993,10 @@ static bool try_launch_paged_attn(
     if (min_partitions > partition_limit) {
         min_partitions = partition_limit;
     }
+    const int32_t partition_cap = paged_attn_partials_cap(output_rows, D);
+    if (min_partitions > partition_cap) {
+        min_partitions = partition_cap;
+    }
     const int32_t tree_blocks = paged_attn_ceil_div(tree_width, block_size);
     const int64_t partitionable_blocks =
         block_table->ne[0] + (parent_ids ? tree_blocks : 0);
@@ -993,7 +1012,7 @@ static bool try_launch_paged_attn(
     const int32_t live_blocks =
         paged_attn_ceil_div(live_tokens, block_size);
     int32_t n_partitions = paged_attn_partitions(
-        live_blocks, min_partitions, PAGED_ATTN_MAX_PARTITIONS);
+        live_blocks, min_partitions, partition_cap);
 
     // Test/debug override used to exercise both the direct and partials paths
     // independently of device-specific occupancy. Values outside the valid
@@ -2162,11 +2181,15 @@ static bool try_launch_paged_attn_wmma(ggml_backend_cuda_context & ctx, ggml_ten
     if (min_partitions > partition_limit) {
         min_partitions = partition_limit;
     }
+    const int32_t partition_cap = paged_attn_partials_cap((int64_t) n_rows * n_head, 256);
+    if (min_partitions > partition_cap) {
+        min_partitions = partition_cap;
+    }
     if (min_partitions > partitionable_blocks) {
         min_partitions = partitionable_blocks;
     }
     int32_t n_partitions =
-        paged_attn_partitions(n_logical_blocks, min_partitions, PAGED_ATTN_MAX_PARTITIONS);
+        paged_attn_partitions(n_logical_blocks, min_partitions, partition_cap);
     // Test/debug override, applied after the occupancy floor like the decode
     // launcher: the floor above would otherwise silently raise any forced
     // value <= 32 back to 32 and defeat partition bisection experiments.
