@@ -179,6 +179,64 @@ current monolithic Qwen3.5/Qwen3.6 path uses DDTree with tested defaults.
 Hardware- or checkpoint-specific overrides remain available through
 `--ddtree-budget`, `--ddtree-tau`, `--specla-top-k`, and `--draft-swa`.
 
+### Managed local routing gateway
+
+`--luce-mix` enables an installed pair/topology launcher before model loading:
+
+```bash
+LUCE_MIX_LAUNCHER=/path/to/luce-mix ./build/luce_server --luce-mix --help
+```
+
+The launcher defaults to `luce-mix` on `PATH`; `LUCE_MIX_LAUNCHER` selects an
+explicit executable. It receives `--engine <this binary>` and the remaining
+arguments unchanged, resolves its model-pair and topology options, then execs
+the engine with normal model blocks and the managed gateway below. There is no
+extra resident launcher process. Exactly which pair presets are available is
+owned by the installed launcher. `--print-profile <name>` exports the engine's
+resolved profile flags and environment defaults as JSON so launchers can reuse
+qualified tuning without copying it.
+
+On POSIX hosts, `--routing-gateway /absolute/path/to/gateway` starts an installed
+routing gateway alongside the engine. Combine it with `--model-routing name`
+and explicit `--model-name` values. For example:
+
+```bash
+./build/luce_server models/default.gguf --model-name default --target-device hip:0 \
+  --host 127.0.0.1 --port 8080 \
+  --model models/pro.gguf --model-name pro --target-device hip:0 \
+  --model-routing name --swap-residency \
+  --routing-gateway /opt/local-routing/start-gateway
+```
+
+Clients use port 8080, served by the gateway. The engine binds only to
+`127.0.0.1:8491`; `--routing-engine-port` changes this internal port, which must
+differ from the public port. The gateway owns model selection and request
+policy. The engine owns scheduling, residency and model inference.
+
+The executable receives these arguments (without a shell):
+
+```text
+--engine-url http://127.0.0.1:8491 --host 127.0.0.1 --port 8080
+```
+
+Install the gateway and its dependencies separately. Its wrapper should `exec`
+the gateway, honor these listener arguments, and use the engine URL for model
+backends. Startup happens after model loading. The engine terminates the gateway
+on shutdown, waits up to five seconds before killing it, and exits with an error
+if the gateway exits unexpectedly. A missing executable fails before loading
+models. The public API surface in this mode is whichever endpoints the installed
+gateway supports; engine-only endpoints remain on the internal listener.
+
+Requests from the gateway must name the configured engine model. A named request
+for an evicted model waits for conflicting requests to drain and triggers its
+reinstatement; `auto` or a missing model only selects among resident models.
+`/props` and `/status/json` expose model IDs, residency, retained devices, capacity,
+queue counts and swap counters for a gateway that needs runtime state. Thinking
+arms can set `thinking.budget_tokens` and `thinking.reply_budget` within the
+request's `max_tokens` limit. Non-streaming Chat Completions expose
+`choices[].finish_details.close_kind` for forced thinking closure; streamed text
+alone does not provide an exact thinking-budget boundary.
+
 ### Compression proxy mode
 
 `luce_server` can run as a **PFlash compression proxy** in front of any

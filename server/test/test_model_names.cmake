@@ -67,3 +67,40 @@ check_launch(name_routing_unique 1 "failed to detect architecture from ${primary
 check_launch(unknown_model_needs_name_routing 2 "--unknown-model requires --model-routing name"
     "${primary}" --model-name qwen --model "${secondary}" --model-name ds4
     --load-balancing --unknown-model primary)
+
+check_launch(gateway_missing_path 2 "--routing-gateway requires an executable path"
+    "${primary}" --routing-gateway)
+check_launch(gateway_bad_port 2 "--routing-engine-port requires a port from 1 to 65535"
+    "${primary}" --routing-engine-port 70000)
+check_launch(gateway_port_without_gateway 2 "--routing-engine-port requires --routing-gateway"
+    "${primary}" --routing-engine-port 8492)
+if(UNIX)
+    check_launch(gateway_missing_executable 2 "requires name routing and an executable path"
+        "${primary}" --model-routing name --routing-gateway "${primary}")
+    check_launch(gateway_port_collision 2 "gateway and engine ports must differ"
+        "${primary}" --model-name default --port 8491
+        --model "${secondary}" --model-name pro --model-routing name
+        --routing-gateway /bin/true)
+endif()
+
+check_launch(profile_unknown 2 "--print-profile requires a profile name"
+    --print-profile missing-profile)
+execute_process(COMMAND "${SERVER}" --print-profile ds41-lucebox
+    RESULT_VARIABLE profile_status OUTPUT_VARIABLE profile_json ERROR_VARIABLE profile_error)
+string(JSON profile_name GET "${profile_json}" name)
+string(JSON profile_budget GET "${profile_json}" env LUCE_EXPERT_BUDGET_MB)
+if(NOT profile_status EQUAL 0 OR NOT profile_name STREQUAL "ds41-lucebox" OR NOT profile_budget STREQUAL "10500")
+    message(FATAL_ERROR "Profile export failed: ${profile_error} ${profile_json}")
+endif()
+if(UNIX)
+    set(mix_launcher "${CMAKE_CURRENT_BINARY_DIR}/test-luce-mix-launcher")
+    file(WRITE "${mix_launcher}" "#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+    file(CHMOD "${mix_launcher}" PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
+    execute_process(COMMAND "${CMAKE_COMMAND}" -E env "LUCE_MIX_LAUNCHER=${mix_launcher}"
+        "${SERVER}" --luce-mix --mix-pair "small+big" --mix-big-topology strix-only --mix-big-model "path with spaces.gguf"
+        RESULT_VARIABLE mix_status OUTPUT_VARIABLE mix_args ERROR_VARIABLE mix_error TIMEOUT 10)
+    if(NOT mix_status EQUAL 0 OR NOT mix_args MATCHES "--engine\n[^\n]+\n--mix-pair\nsmall[+]big\n--mix-big-topology\nstrix-only\n--mix-big-model\npath with spaces.gguf\n")
+        message(FATAL_ERROR "Luce Mix handoff failed (${mix_status}): ${mix_error} ${mix_args}")
+    endif()
+    file(REMOVE "${mix_launcher}")
+endif()

@@ -393,6 +393,7 @@ TEST_CASE(ModelSwapGpuFixture, DeepSeek4PartialEvictionKeepsSecondaryTierAndSnap
     }
     constexpr auto partial = ModelBackend::EvictLevel::partial;
     const size_t baseline = device_free(0);
+    setenv("LUCE_DS4_HYBRID_F16_VERIFY_KV", "1", 1);
     auto backend = make_ds41_backend(model, draft);
     auto * ds4 = dynamic_cast<DeepSeek4Backend *>(backend.get());
     SWAP_CHECK(ds4);
@@ -427,6 +428,9 @@ TEST_CASE(ModelSwapGpuFixture, DeepSeek4PartialEvictionKeepsSecondaryTierAndSnap
     // move the experts (reinstate verifies the placement and biases).
     setenv("LUCE_DS4_MOE_TP_GPU", "0", 1);
     setenv("LUCE_EXPERT_BUDGET_MB", "1", 1);
+    // Reinstatement must retain the captured verification mode too, for
+    // both partial and cold restores below (checked by verify_frozen_state).
+    setenv("LUCE_DS4_HYBRID_F16_VERIFY_KV", "0", 1);
     reinstate(*backend, "DS4 (partial)");
     const auto back = ds4->expert_tier_report();
     SWAP_CHECK(back.secondary_upload_bytes == loaded.secondary_upload_bytes);  // no secondary re-read

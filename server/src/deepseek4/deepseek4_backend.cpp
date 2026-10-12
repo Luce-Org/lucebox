@@ -693,6 +693,7 @@ static DeepSeek4ResolvedSettings resolve_deepseek4_settings(const DeepSeek4Backe
     out.force_full_load = env_flag_enabled("LUCE_DS4_FORCE_FULL_LOAD");
     out.dense_tp_mask = env_flag_enabled("LUCE_DS4_DENSE_TP_MASK");
     out.fused_decode_env = env_flag_enabled("LUCE_DS4_FUSED_DECODE");
+    out.hybrid_f16_verify_kv = env_flag_enabled("LUCE_DS4_HYBRID_F16_VERIFY_KV");
     out.decode_all_cold = env_flag_enabled("LUCE_DS4_DECODE_ALL_COLD");
     out.spec_requested = !cfg.draft_path.empty() || env_flag_enabled("LUCE_DS4_SPEC");
     if (const char * path = std::getenv("LUCE_DS4_DRAFT")) out.spec_env_draft_path = path;
@@ -2230,7 +2231,7 @@ bool DeepSeek4Backend::load_model() {
                  "backend default");
     w_.fused_decode = cfg_.fused_decode && !moe_hybrid_;
     w_.fused_verify_f16_kv = (cfg_.fused_verify_f16_kv && !moe_hybrid_) ||
-        (moe_hybrid_ && env_flag_enabled("LUCE_DS4_HYBRID_F16_VERIFY_KV"));
+        (moe_hybrid_ && settings_.hybrid_f16_verify_kv);
     if (moe_hybrid_ && w_.fused_verify_f16_kv) {
         std::fprintf(stderr, "[deepseek4] hybrid tier: F16 verify K/V on (LUCE_DS4_HYBRID_F16_VERIFY_KV)\n");
     }
@@ -4106,6 +4107,10 @@ bool DeepSeek4Backend::verify_frozen_state(std::string & error) const {
         error = "expert placement differs from the one the model was loaded with: " + err;
         return false;
     }
+    if (w_.fused_verify_f16_kv != settings_.hybrid_f16_verify_kv) {
+        error = "hybrid F16 verification mode differs from the one the model was loaded with";
+        return false;
+    }
     if (w_.selection_bias_host != frozen_.selection_bias_host) {
         error = "routing biases differ from the ones the model was loaded with";
         return false;
@@ -4148,7 +4153,7 @@ bool DeepSeek4Backend::reinstate_primary(std::string & error) {
     w_.mixed_mmq_policy = moe_hybrid_->mixed_mmq_policy;
     w_.routed_expert_top_k = cfg_.expert_top_k;
     w_.fused_decode = false;
-    w_.fused_verify_f16_kv = false;
+    w_.fused_verify_f16_kv = settings_.hybrid_f16_verify_kv;
     lap(1);
     if (!moe_hybrid_->rebuild_primary_experts(backend_, cfg_.model_path, &err)) {
         return fail("primary experts: " + err);

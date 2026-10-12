@@ -2326,6 +2326,7 @@ if(LUCE_TESTS)
             test/unit/test_unit_main.cpp
             test/unit/test_server_unit.cpp
             test/unit/test_model_routing.cpp
+            test/unit/test_routing_gateway.cpp
             test/unit/test_luce_engine.cpp
             test/unit/test_paged_kv_offload.cpp
             test/unit/test_anchor_params.cpp

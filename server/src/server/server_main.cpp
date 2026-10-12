@@ -14,6 +14,7 @@
 #include "http_server.h"
 #include "chat_template.h"
 #include "launch_profiles.h"
+#include "routing_gateway.h"
 #include "model_card.h"
 #include "common/backend_factory.h"
 #include "common/chain_rollback_policy.h"
@@ -118,6 +119,12 @@ static void print_usage(const char * prog) {
         "  --load-balancing-primary-gpu <backend:gpu> Select the primary model by its target device.\n"
         "                      Defaults to the first block; request model names\n"
         "                      do not change generation routing.\n"
+        "  --luce-mix          Resolve a model pair/topology with the installed luce-mix launcher\n"
+        "                      (override its path with LUCE_MIX_LAUNCHER; --luce-mix --help).\n"
+        "  --print-profile <name> Print resolved profile flags and environment as JSON\n"
+        "  --routing-gateway <exe> Start a local gateway on --host/--port (POSIX).\n"
+        "                       Requires name routing; backend moves to loopback.\n"
+        "  --routing-engine-port <N> Internal backend port (default: 8491).\n"
         "  --model-routing <balance|name> How several model blocks share requests\n"
         "                      (default: balance). name loads every block and runs a\n"
         "                      request naming a block's --model-name only on that\n"
@@ -2216,6 +2223,53 @@ static bool expand_launch_profile(std::vector<char *> & block,
 }
 
 int main(int argc, char ** argv) {
+    // The private launcher resolves pair/topology before any device or model
+    // initialization, then execs this binary with ordinary model blocks.
+    if (std::any_of(argv + 1, argv + argc, [](const char * arg) {
+            return std::strcmp(arg, "--luce-mix") == 0;
+        })) {
+#ifdef _WIN32
+        std::fprintf(stderr, "[server] --luce-mix requires a POSIX host\n");
+        return 2;
+#else
+        const char * launcher = std::getenv("LUCE_MIX_LAUNCHER");
+        if (!launcher || !*launcher) launcher = "luce-mix";
+        std::error_code error;
+        const auto self = std::filesystem::read_symlink("/proc/self/exe", error);
+        std::string executable = error ? argv[0] : self.string();
+        std::vector<char *> args = {const_cast<char *>(launcher),
+            const_cast<char *>("--engine"), executable.data()};
+        for (int i = 1; i < argc; ++i)
+            if (std::strcmp(argv[i], "--luce-mix") != 0) args.push_back(argv[i]);
+        args.push_back(nullptr);
+        execvp(launcher, args.data());
+        std::fprintf(stderr, "[server] cannot start Luce Mix launcher '%s': %s; "
+                             "install it on PATH or set LUCE_MIX_LAUNCHER\n",
+                     launcher, std::strerror(errno));
+        return 2;
+#endif
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--print-profile") == 0) {
+        const auto * profile = argc == 3 ? luce::server::find_launch_profile(argv[2]) : nullptr;
+        if (!profile) {
+            std::fprintf(stderr, "[server] --print-profile requires a profile name (%s)\n",
+                         luce::server::launch_profile_names().c_str());
+            return 2;
+        }
+        nlohmann::json flags = nlohmann::json::array(), env = nlohmann::json::object();
+        for (const auto & flag : profile->flags) {
+            flags.push_back(flag.flag);
+            if (flag.value) {
+                const std::string value = flag.value;
+                flags.push_back(value.rfind("share/", 0) == 0
+                    ? resolve_profile_data_path(value, argv[0]) : value);
+            }
+        }
+        for (const auto & entry : profile->env) env[entry.name] = entry.value;
+        const nlohmann::json result = {{"name", profile->name}, {"flags", flags}, {"env", env}};
+        std::puts(result.dump().c_str());
+        return 0;
+    }
     if (argc >= 2 && std::strcmp(argv[1], "--list-devices") == 0) {
         if (argc > 3) {
             std::fprintf(stderr, "Usage: %s --list-devices [model.gguf]\n", argv[0]);
@@ -2234,9 +2288,28 @@ int main(int argc, char ** argv) {
     bool swap_residency = false;
     std::set<std::string> swap_keep_weights;  // model names evicted warm
     std::string primary_gpu;
+    std::string routing_gateway;
+    int routing_engine_port = 8491;
+    bool routing_engine_port_set = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--load-balancing") == 0) {
             load_balancing = true;
+        } else if (std::strcmp(argv[i], "--routing-gateway") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                std::fprintf(stderr, "[server] --routing-gateway requires an executable path\n");
+                return 2;
+            }
+            routing_gateway = argv[++i];
+        } else if (std::strcmp(argv[i], "--routing-engine-port") == 0) {
+            const char * value = i + 1 < argc ? argv[++i] : "";
+            const char * end = value + std::strlen(value);
+            const auto parsed = std::from_chars(value, end, routing_engine_port);
+            if (parsed.ec != std::errc{} || parsed.ptr != end ||
+                routing_engine_port < 1 || routing_engine_port > 65535) {
+                std::fprintf(stderr, "[server] --routing-engine-port requires a port from 1 to 65535\n");
+                return 2;
+            }
+            routing_engine_port_set = true;
         } else if (std::strcmp(argv[i], "--swap-residency") == 0) {
             swap_residency = true;
         } else if (std::strcmp(argv[i], "--swap-keep-weights") == 0) {
@@ -2292,6 +2365,21 @@ int main(int argc, char ** argv) {
     }
     const bool multi_model = model_args.size() > 1;
     const bool name_routing = model_routing == ServerConfig::ModelRouting::name;
+    if (routing_engine_port_set && routing_gateway.empty()) {
+        std::fprintf(stderr, "[server] --routing-engine-port requires --routing-gateway\n");
+        return 2;
+    }
+    if (!routing_gateway.empty()) {
+#ifdef _WIN32
+        std::fprintf(stderr, "[server] --routing-gateway requires a POSIX host\n");
+        return 2;
+#else
+        if (!name_routing || access(routing_gateway.c_str(), X_OK) != 0) {
+            std::fprintf(stderr, "[server] --routing-gateway requires name routing and an executable path\n");
+            return 2;
+        }
+#endif
+    }
     if (unknown_model_set && !name_routing) {
         std::fprintf(stderr, "[server] --unknown-model requires --model-routing name\n");
         return 2;
@@ -2354,7 +2442,17 @@ int main(int argc, char ** argv) {
     }
 
     // Listener policy belongs to the first CLI block, independently of priority.
-    const ServerConfig listener_config = options.front().sconfig;
+    ServerConfig listener_config = options.front().sconfig;
+    const std::string gateway_host = listener_config.host;
+    const int gateway_port = listener_config.port;
+    if (!routing_gateway.empty()) {
+        if (gateway_port == routing_engine_port) {
+            std::fprintf(stderr, "[server] gateway and engine ports must differ\n");
+            return 2;
+        }
+        listener_config.host = "127.0.0.1";
+        listener_config.port = routing_engine_port;
+    }
     if (!primary_gpu.empty()) {
         size_t selected = options.size();
         for (size_t m = 0; m < options.size(); ++m) {
@@ -2543,7 +2641,15 @@ int main(int argc, char ** argv) {
     g_server = servers.front();
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGINT, signal_handler);
+    luce::server::RoutingGateway gateway;
+    if (!routing_gateway.empty() &&
+        !gateway.start(routing_gateway, gateway_host, gateway_port, routing_engine_port,
+                       [server = g_server] { server->request_stop(); })) {
+        g_server = nullptr;
+        return 1;
+    }
     const int ret = load_balancing ? g_server->run(servers) : g_server->run();
+    gateway.stop();
     g_server = nullptr;
-    return ret;
+    return gateway.failed() ? 1 : ret;
 }

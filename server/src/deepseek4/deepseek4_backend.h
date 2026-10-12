@@ -96,6 +96,7 @@ struct DeepSeek4ResolvedSettings {
     bool force_full_load = false;   // LUCE_DS4_FORCE_FULL_LOAD
     bool dense_tp_mask = false;     // LUCE_DS4_DENSE_TP_MASK
     bool fused_decode_env = false;  // LUCE_DS4_FUSED_DECODE
+    bool hybrid_f16_verify_kv = false; // LUCE_DS4_HYBRID_F16_VERIFY_KV
     bool decode_all_cold = false;   // LUCE_DS4_DECODE_ALL_COLD
     // DSpark: --draft, or LUCE_DS4_SPEC with LUCE_DS4_DRAFT.
     bool spec_requested = false;
