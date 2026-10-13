@@ -1,4 +1,5 @@
 #include "dflash_draft_kv.h"
+#include "draft_attn_mask.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -31,10 +32,21 @@ static bool draft_kv_init_impl(DraftKvState & st,
     st.kv_total   = mask_align_up(cap + dw.block_size + 1, MASK_KV_PAD);
     st.fc_in      = dw.n_target_layers * dw.n_embd;
     st.any_full = st.any_swa = false;
+    bool seen_causal_swa = false, seen_noncausal_swa = false;
     for (int i = 0; i < dw.n_layer; i++) {
-        if (dw.layers[i].is_swa && !disable_swa) st.any_swa = true;
-        else                                     st.any_full = true;
+        if (dw.layers[i].is_swa && !disable_swa) {
+            st.any_swa = true;
+            (dw.layers[i].is_causal ? seen_causal_swa : seen_noncausal_swa) = true;
+        } else {
+            st.any_full = true;
+        }
     }
+    if (seen_causal_swa && seen_noncausal_swa) {
+        std::fprintf(stderr,
+            "[draft-kv] mixed causal/non-causal SWA layers are not supported\n");
+        return false;
+    }
+    st.swa_causal = !seen_noncausal_swa;
 
     // ── persistent memory: caches + inputs (outside gallocr, stable, zeroed)
     const size_t n_mem_tensors = 2 * (size_t)dw.n_layer + 10;
@@ -317,25 +329,13 @@ bool draft_kv_begin_step(DraftKvState & st,
                                 sizeof(uint16_t) * mask_elems);
     }
     if (st.mask_swa) {
-        // The window is anchored at `committed` for ALL noise rows on purpose:
-        // this replicates the legacy one-shot drafter graph, which windows the
-        // ctx via a single view [ctx_len - swa_window, ctx_len) shared by every
-        // query row. A per-row lower bound would change the trained drafter's
-        // attention pattern (and measured acceptance).
-        const int eff_win = (dw.swa_window > 0 && win > dw.swa_window)
-                                ? dw.swa_window : win;
-        const int swa_lo = committed - eff_win;
-        st.mask_hbuf.assign(mask_elems, F16_NEG_INF);
-        for (int s = 0; s < st.cap; s++) {
-            const int32_t p = st.slot_pos[(size_t)s];
-            if (p >= swa_lo && p < committed) st.mask_hbuf[(size_t)s] = F16_ZERO;
-        }
-        for (int q = 1; q < st.q_len; q++)
-            std::memcpy(st.mask_hbuf.data() + (size_t)q * st.kv_total,
-                        st.mask_hbuf.data(), sizeof(uint16_t) * (size_t)st.kv_total);
-        for (int q = 0; q < st.q_len; q++)
-            for (int j = 0; j <= q; j++)
-                st.mask_hbuf[(size_t)q * st.kv_total + (size_t)(st.cap + j)] = F16_ZERO;
+        // Causal (DFlash 1): the window is anchored at `committed` for ALL
+        // noise rows on purpose, replicating the legacy one-shot drafter graph
+        // (a per-row bound would change the trained pattern). Non-causal
+        // (upstream DFlash 2): per-query window, noise fully visible.
+        st.mask_hbuf = build_draft_swa_mask(st.cap, st.kv_total, st.q_len, committed,
+                                            st.slot_pos.data(), dw.swa_window,
+                                            st.swa_causal);
         ggml_backend_tensor_set(st.mask_swa, st.mask_hbuf.data(), 0,
                                 sizeof(uint16_t) * mask_elems);
     }

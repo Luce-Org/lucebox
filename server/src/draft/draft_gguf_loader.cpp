@@ -27,6 +27,7 @@
 #include "internal.h"
 #include "common/dflash2_selector_validation.h"
 #include "common/draft_swa.h"
+#include "common/dflash2_upstream_schema.h"
 #include "common/derived_scalars.h"
 #include "common/gguf_mmap.h"
 #include "common/tensor_file_reader.h"
@@ -38,6 +39,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -137,9 +139,10 @@ bool load_draft_gguf(const std::string & path,
         arch_s = arch;
         if (arch_s != "qwen35-dflash-draft" &&
             arch_s != "dflash-draft" &&
-            arch_s != "gemma4-dflash-draft") {
+            arch_s != "gemma4-dflash-draft" &&
+            arch_s != kUpstreamDflashArch) {
             set_last_error(std::string("unexpected draft arch: ") + arch +
-                           " (expected qwen35-dflash-draft, dflash-draft, or gemma4-dflash-draft)");
+                           " (expected qwen35-dflash-draft, dflash-draft, gemma4-dflash-draft, or dflash)");
             gguf_free(gctx);
             return false;
         }
@@ -149,6 +152,7 @@ bool load_draft_gguf(const std::string & path,
     const char * A = arch_s.c_str();
     char key[128];
 
+    const bool upstream = (arch_s == kUpstreamDflashArch);
     auto read_u32 = [&](const char * suffix, uint32_t fallback) -> uint32_t {
         std::snprintf(key, sizeof(key), "%s.%s", A, suffix);
         return get_u32_or(gctx, key, fallback);
@@ -166,7 +170,68 @@ bool load_draft_gguf(const std::string & path,
     const uint32_t n_head    = read_u32("attention.head_count",    0);
     const uint32_t n_head_kv = read_u32("attention.head_count_kv", 0);
     const uint32_t head_dim  = read_u32("attention.key_length",    0);
-    const uint32_t block_sz  = read_u32("dflash.block_size",       0);
+    // Upstream DFlash 2 (arch "dflash"): un-nested keys, mapped by a pure fn.
+    UpstreamDflashHParams uhp;
+    if (upstream) {
+        UpstreamDflashKv kv;
+        kv.n_layer = n_layer;
+        kv.n_embd  = n_embd;
+        if (const ggml_tensor * fc = ggml_get_tensor(meta_ctx, "fc.weight"))
+            kv.fc_in = (uint32_t)fc->ne[0];
+        if (target) kv.target_n_layer = target->n_layer;
+        auto opt_u32 = [&](const char * suffix) -> std::optional<uint32_t> {
+            std::snprintf(key, sizeof(key), "%s.%s", A, suffix);
+            const int64_t id = gguf_find_key(gctx, key);
+            if (id < 0) return std::nullopt;
+            return gguf_get_val_u32(gctx, id);
+        };
+        kv.block_size       = opt_u32("block_size");
+        kv.conv_kernel_size = opt_u32("conv_kernel_size");
+        kv.conv_group_size  = opt_u32("conv_group_size");
+        kv.selector_rank    = opt_u32("selector_rank");
+        kv.selector_top_k   = opt_u32("selector_top_k");
+        kv.sliding_window   = opt_u32("attention.sliding_window");
+        {
+            const int64_t id = gguf_find_key(gctx, "tokenizer.ggml.mask_token_id");
+            if (id >= 0) kv.mask_token_id = gguf_get_val_u32(gctx, id);
+        }
+        {
+            std::snprintf(key, sizeof(key), "%s.attention.causal", A);
+            const int64_t id = gguf_find_key(gctx, key);
+            if (id >= 0) kv.causal = gguf_get_val_bool(gctx, id);
+        }
+        {
+            std::snprintf(key, sizeof(key), "%s.target_layers", A);
+            const int64_t id = gguf_find_key(gctx, key);
+            if (id >= 0 && gguf_get_kv_type(gctx, id) == GGUF_TYPE_ARRAY &&
+                gguf_get_arr_type(gctx, id) == GGUF_TYPE_INT32) {
+                const int32_t * v = (const int32_t *)gguf_get_arr_data(gctx, id);
+                kv.target_layers.assign(v, v + gguf_get_arr_n(gctx, id));
+            }
+        }
+        {
+            std::snprintf(key, sizeof(key), "%s.attention.sliding_window_pattern", A);
+            const int64_t id = gguf_find_key(gctx, key);
+            if (id >= 0 && gguf_get_kv_type(gctx, id) == GGUF_TYPE_ARRAY &&
+                gguf_get_arr_type(gctx, id) == GGUF_TYPE_BOOL) {
+                const bool * v = (const bool *)gguf_get_arr_data(gctx, id);
+                kv.sliding_window_pattern.assign(v, v + gguf_get_arr_n(gctx, id));
+            }
+        }
+        std::snprintf(key, sizeof(key), "%s.logit_scale", A);
+        kv.has_logit_scale = gguf_find_key(gctx, key) >= 0;
+        std::snprintf(key, sizeof(key), "%s.final_logit_softcapping", A);
+        kv.has_logit_softcap = gguf_find_key(gctx, key) >= 0;
+        std::snprintf(key, sizeof(key), "%s.hyper_connection_count", A);
+        kv.has_hyper_connection = gguf_find_key(gctx, key) >= 0;
+        std::string uerr;
+        if (!resolve_upstream_dflash_hparams(kv, uhp, uerr)) {
+            set_last_error(uerr);
+            ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+            return false;
+        }
+    }
+    const uint32_t block_sz  = upstream ? uhp.block_size : read_u32("dflash.block_size", 0);
     uint32_t n_tgt_lay       = read_u32("dflash.n_target_layers",  0);
     const uint32_t domino_meta_enabled = read_u32("dflash.domino.enabled", 0);
     const uint32_t domino_meta_gru     = read_u32("dflash.domino.gru_hidden_dim", 0);
@@ -179,7 +244,10 @@ bool load_draft_gguf(const std::string & path,
     // Explicit captured target-layer ids (data-driven). Lets any DFlash drafter
     // load without a hardcoded per-arch set; the array length also backstops
     // n_target_layers when the scalar KV is absent.
-    {
+    if (upstream) {
+        out.capture_layer_ids = uhp.capture_layer_ids;
+        n_tgt_lay = (uint32_t)out.capture_layer_ids.size();
+    } else {
         std::snprintf(key, sizeof(key), "%s.%s", A, "dflash.target_layer_ids");
         const int64_t target_ids_id = gguf_find_key(gctx, key);
         if (target_ids_id >= 0 &&
@@ -224,7 +292,8 @@ bool load_draft_gguf(const std::string & path,
     // token than the target-side default, and drafting with the wrong mask
     // embedding silently destroys acceptance.
     {
-        const uint32_t mask_meta = read_u32("dflash.mask_token_id", 0);
+        const uint32_t mask_meta = upstream ? uhp.mask_token_id
+                                            : read_u32("dflash.mask_token_id", 0);
         if (mask_meta != 0) {
             if (target && target->n_vocab > 0 && mask_meta >= (uint32_t)target->n_vocab) {
                 set_last_error("draft GGUF: dflash.mask_token_id outside the target vocab");
@@ -298,9 +367,15 @@ bool load_draft_gguf(const std::string & path,
     }
     out.layers.assign((size_t)n_layer, DraftLayer{});
 
-    auto g = [&](const char * name) -> ggml_tensor * {
-        return ggml_get_tensor(meta_ctx, name);
+    // Upstream llama.cpp DFlash 2 GGUFs name some tensors differently; try
+    // the canonical (our converter) name first, then the upstream alias.
+    auto lookup = [&](const std::string & name) -> ggml_tensor * {
+        if (ggml_tensor * t = ggml_get_tensor(meta_ctx, name.c_str())) return t;
+        if (!upstream) return nullptr;
+        const std::string alias = upstream_dflash_tensor_alias(name);
+        return alias.empty() ? nullptr : ggml_get_tensor(meta_ctx, alias.c_str());
     };
+    auto g = [&](const char * name) -> ggml_tensor * { return lookup(name); };
     auto g_any = [&](const char * a, const char * b) -> ggml_tensor * {
         if (ggml_tensor * t = g(a)) return t;
         return g(b);
@@ -336,7 +411,7 @@ bool load_draft_gguf(const std::string & path,
         char name[128];
         auto fnd = [&](const char * suffix) -> ggml_tensor * {
             std::snprintf(name, sizeof(name), "blk.%d.%s", il, suffix);
-            return ggml_get_tensor(meta_ctx, name);
+            return lookup(name);
         };
         DraftLayer & L = out.layers[il];
         L.attn_norm = fnd("attn_norm.weight");
@@ -509,7 +584,8 @@ bool load_draft_gguf(const std::string & path,
 
     // DFlash 2: dynamic convs in every layer + candidate selector head.
     {
-        const int conv_k = (int)read_u32("dflash.dflash2.conv_kernel_size", 0);
+        const int conv_k = upstream ? (int)uhp.conv_kernel_size
+                                    : (int)read_u32("dflash.dflash2.conv_kernel_size", 0);
         int n_conv = 0;
         for (const DraftLayer & L : out.layers) {
             if (L.attn_conv.present() && L.mlp_conv.present()) n_conv++;
@@ -523,7 +599,8 @@ bool load_draft_gguf(const std::string & path,
                 return false;
             }
             out.conv_kernel_size = conv_k;
-            out.conv_group_size  = (int)read_u32("dflash.dflash2.conv_group_size", 16);
+            out.conv_group_size  = upstream ? (int)uhp.conv_group_size
+                                            : (int)read_u32("dflash.dflash2.conv_group_size", 16);
             if (out.conv_group_size <= 0 || out.n_embd % out.conv_group_size != 0) {
                 char b[192];
                 std::snprintf(b, sizeof(b),
@@ -568,7 +645,8 @@ bool load_draft_gguf(const std::string & path,
         out.selector.hproj   = g("dflash.selector.hproj.weight");
         out.selector.pred_cb = g("dflash.selector.pred_cb");
         out.selector.succ_cb = g("dflash.selector.succ_cb");
-        const uint32_t sel_rank = read_u32("dflash.dflash2.selector_rank", 0);
+        const uint32_t sel_rank = upstream ? uhp.selector_rank
+                                           : read_u32("dflash.dflash2.selector_rank", 0);
         if (out.selector.hproj || out.selector.pred_cb || out.selector.succ_cb || sel_rank) {
             if (!out.selector.hproj || !out.selector.pred_cb || !out.selector.succ_cb) {
                 set_last_error("draft GGUF: DFlash 2 selector tensors incomplete "
@@ -577,7 +655,8 @@ bool load_draft_gguf(const std::string & path,
                 return false;
             }
             out.selector.rank  = sel_rank ? (int)sel_rank : (int)out.selector.hproj->ne[1];
-            out.selector.top_k = (int)read_u32("dflash.dflash2.selector_top_k", 16);
+            out.selector.top_k = upstream ? (int)uhp.selector_top_k
+                                          : (int)read_u32("dflash.dflash2.selector_top_k", 16);
             if (out.selector.top_k <= 0 || out.selector.top_k > 256) {
                 set_last_error("draft GGUF: dflash.dflash2.selector_top_k out of range (1..256)");
                 ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
@@ -644,6 +723,28 @@ bool load_draft_gguf(const std::string & path,
         out.swa_pattern_loaded = true;
         for (size_t il = 0; il < n; il++) {
             out.layers[il].is_swa = pattern[il];
+        }
+    }
+    // attention.causal=false (upstream DFlash 2): SWA layers keep every noise
+    // column visible and window the ctx per query row. Absent == causal, so
+    // DFlash 1 drafters and our own DFlash 2 GGUFs behave exactly as before.
+    {
+        bool causal = true;
+        if (upstream) {
+            causal = uhp.causal;
+        } else {
+            std::snprintf(key, sizeof(key), "%s.%s", A, "attention.causal");
+            const int64_t cid = gguf_find_key(gctx, key);
+            if (cid >= 0 && gguf_get_kv_type(gctx, cid) == GGUF_TYPE_BOOL)
+                causal = gguf_get_val_bool(gctx, cid);
+        }
+        for (DraftLayer & L : out.layers) L.is_causal = causal;
+        if (!causal) {
+            int n_nc_swa = 0;
+            for (const DraftLayer & L : out.layers) n_nc_swa += L.is_swa ? 1 : 0;
+            std::fprintf(stderr,
+                "[draft GGUF] non-causal attention: %d/%d layers sliding-window "
+                "(window=%d)\n", n_nc_swa, out.n_layer, out.swa_window);
         }
     }
     const DraftSwaOverrideResult swa =
@@ -809,6 +910,17 @@ bool load_draft_gguf(const std::string & path,
             std::fprintf(stderr,
                          "[draft GGUF] context K/V layer input norm enabled\n");
         }
+    }
+
+    if (upstream) {
+        std::fprintf(stderr,
+            "[draft GGUF] upstream DFlash 2: block=%d conv=k%d/g%d selector=r%d/k%d "
+            "mask_id=%d window=%d causal=%d capture_ids=",
+            out.block_size, out.conv_kernel_size, out.conv_group_size,
+            out.selector.rank, out.selector.top_k, out.mask_token_id,
+            out.swa_window, (int)out.layers[0].is_causal);
+        for (int32_t id : out.capture_layer_ids) std::fprintf(stderr, "%d ", id);
+        std::fprintf(stderr, "\n");
     }
 
     char summary[192];
