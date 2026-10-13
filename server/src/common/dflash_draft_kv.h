@@ -71,6 +71,7 @@ struct DraftKvState {
     const void *          built_for = nullptr;  // DraftWeights the graph was built against
     int64_t               next_pos = 0;  // first ctx position not yet appended
     std::vector<int32_t>  slot_pos;      // absolute position per ring slot, -1 empty
+    bool                  swa_causal = true; // false: upstream DFlash 2 non-causal SWA masks
     std::vector<uint16_t> mask_hbuf;
     std::vector<int32_t>  i32_hbuf;
 };

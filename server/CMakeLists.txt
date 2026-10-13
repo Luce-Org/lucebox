@@ -2507,6 +2507,16 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_dflash2_selector_validation)
     endif()
+    foreach(_dflash2_host_test IN ITEMS test_dflash2_upstream_schema test_draft_attn_mask)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/${_dflash2_host_test}.cpp")
+            # Pure host-side upstream DFlash 2 schema mapping / draft mask tests: no GPU.
+            add_executable(${_dflash2_host_test} test/unit/${_dflash2_host_test}.cpp)
+            target_include_directories(${_dflash2_host_test} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/src
+                ${CMAKE_CURRENT_SOURCE_DIR}/test)
+            list(APPEND _raw_unit_test_targets ${_dflash2_host_test})
+        endif()
+    endforeach()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_draft_swa.cpp")
         # Pure host-side draft SWA metadata/override policy tests.
         add_executable(test_draft_swa test/unit/test_draft_swa.cpp)

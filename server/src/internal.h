@@ -350,6 +350,9 @@ struct DraftLayer {
     DraftConvWeights attn_conv;         // optional DFlash 2 conv around attention
     DraftConvWeights mlp_conv;          // optional DFlash 2 conv around the MLP
     bool is_swa = false;  // true for SWA layers (Qwen3.6 pattern)
+    // false only for upstream DFlash 2 GGUFs (dflash.attention.causal=false):
+    // noise columns fully visible + per-query sliding window over the ctx.
+    bool is_causal = true;
     bool attn_gate_per_head = false;
 };
 
