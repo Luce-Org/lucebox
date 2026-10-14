@@ -126,6 +126,11 @@ struct SchedulerTestHarness {
         return server.prefix_cache_;
     }
 
+    static int ram_restorable_prefix_tokens(
+            HttpServer & server, const std::vector<int32_t> & prompt) {
+        return server.ram_restorable_prefix_tokens(prompt);
+    }
+
     static void enqueue(HttpServer & server, ServerJob * job) {
         server.enqueue(job);
     }
@@ -9097,6 +9102,89 @@ TEST_CASE(ServerUnitFixture, test_default_snapshot_detach_refuses_pooled_snapsho
     TEST_ASSERT(out.empty());
     TEST_ASSERT(backend.freed == 1);
     ggml_free(backend.ctx);
+}
+
+// PFlash admission asks the server how much of a prompt a restore would skip.
+// The answer is the backend's: a KVFlash live session can cover more than the
+// snapshot the prefix cache holds, and the default trusts the snapshot.
+struct LiveSessionBackend : ShortInlineSnapshotBackend {
+    int live_cut = 0;
+    mutable int seen_slot = -2;
+    mutable int seen_slot_tokens = -2;
+    int restorable_prefix(const std::vector<int32_t> &, int slot,
+                          int slot_tokens) const override {
+        seen_slot = slot;
+        seen_slot_tokens = slot_tokens;
+        return live_cut > slot_tokens ? live_cut : slot_tokens;
+    }
+};
+
+TEST_CASE(ServerUnitFixture, test_ram_restorable_prefix_defers_to_the_backend) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<LiveSessionBackend>();
+    LiveSessionBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.prefix_cache_cap = 2;
+    HttpServer server(engine, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+    const std::vector<int32_t> prompt = {1, 100, 3, 101};
+
+    // No snapshot: the backend is asked with slot -1 and 0 tokens, so a live
+    // session alone is reported.
+    backend.live_cut = 3000;
+    TEST_ASSERT(SchedulerTestHarness::ram_restorable_prefix_tokens(server, prompt) == 3000);
+    TEST_ASSERT(backend.seen_slot == -1);
+    TEST_ASSERT(backend.seen_slot_tokens == 0);
+
+    auto reservation = cache.reserve_inline_snap(
+        prompt, /*restored_prefix_len=*/0,
+        /*prefer_tools_boundary=*/false, /*forced_cut=*/4);
+    TEST_ASSERT(reservation.active());
+    backend.saved_slot = reservation.slot();
+    backend.saved_position = 3;
+    SchedulerTestHarness::finalize_inline_snapshot(
+        server, prompt, std::move(reservation), backend.saved_slot,
+        /*requested_cut=*/4);
+
+    // The backend's cut beats the snapshot's 3 tokens.
+    TEST_ASSERT(SchedulerTestHarness::ram_restorable_prefix_tokens(server, prompt) == 3000);
+    TEST_ASSERT(backend.seen_slot == backend.saved_slot);
+    TEST_ASSERT(backend.seen_slot_tokens == 3);
+
+    // A smaller live cut leaves the snapshot's tokens.
+    backend.live_cut = 2;
+    TEST_ASSERT(SchedulerTestHarness::ram_restorable_prefix_tokens(server, prompt) == 3);
+}
+
+TEST_CASE(ServerUnitFixture, test_ram_restorable_prefix_default_is_the_snapshot_tokens) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<ShortInlineSnapshotBackend>();
+    ShortInlineSnapshotBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.prefix_cache_cap = 2;
+    HttpServer server(engine, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+    const std::vector<int32_t> prompt = {1, 100, 3, 101};
+    TEST_ASSERT(SchedulerTestHarness::ram_restorable_prefix_tokens(server, prompt) == 0);
+
+    auto reservation = cache.reserve_inline_snap(
+        prompt, /*restored_prefix_len=*/0,
+        /*prefer_tools_boundary=*/false, /*forced_cut=*/4);
+    TEST_ASSERT(reservation.active());
+    backend.saved_slot = reservation.slot();
+    backend.saved_position = 3;
+    SchedulerTestHarness::finalize_inline_snapshot(
+        server, prompt, std::move(reservation), backend.saved_slot,
+        /*requested_cut=*/4);
+    TEST_ASSERT(SchedulerTestHarness::ram_restorable_prefix_tokens(server, prompt) == 3);
 }
 
 // Qwen saves at the chunk boundary at or before the requested cut. The entry
