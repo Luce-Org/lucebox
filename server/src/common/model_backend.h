@@ -453,7 +453,9 @@ struct ModelBackend {
     // the backend exports no SnapshotRef.
     virtual OwnedSnapshot snapshot_detach(int slot) {
         const SnapshotRef ref = snapshot_ref(slot);
-        OwnedSnapshot out = ref.ctx
+        // A pooled snapshot keeps its KV outside ref.ctx; a copy would reach
+        // the disk writer with no KV.
+        OwnedSnapshot out = ref.ctx && !ref.pooled
             ? OwnedSnapshot::clone_to_host(ref.ctx, ref.cur_pos, ref.last_tok)
             : OwnedSnapshot{};
         snapshot_free(slot);
