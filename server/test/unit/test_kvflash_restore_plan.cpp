@@ -5,6 +5,8 @@
 #include "../../src/qwen35/prefill_helpers.h"
 
 #include <cstdlib>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -76,4 +78,92 @@ TEST_CASE(KvflashRestorePlanFixture, consume_flag_is_off_unless_exactly_one) {
     setenv("LUCE_KVFLASH_RESTORE_CONSUME", "1", 1);
     CHECK(kvflash_restore_consume_enabled());
     unsetenv("LUCE_KVFLASH_RESTORE_CONSUME");
+}
+
+// ---- S6: KVFlash prefill on an absolute grid ------------------------------
+
+using luce::common::kvflash_prefill_batches;
+using luce::common::kvflash_prefill_batch_end;
+using Batches = std::vector<std::pair<int, int>>;
+
+namespace {
+constexpr int kU = 512;
+
+// Invariants of every plan: contiguous cover of [start, end); every batch but
+// the first starts on the grid; every batch is within max_batch; every batch
+// but the last (the end-of-prompt remainder) ends on the grid.
+void check_plan(const Batches & b, int start, int end, int grid, int max_batch) {
+    if (start >= end) { if (!b.empty()) throw std::runtime_error("non-empty plan for empty range"); return; }
+    if (b.empty() || b.front().first != start || b.back().second != end)
+        throw std::runtime_error("plan does not cover the range");
+    for (size_t i = 0; i < b.size(); i++) {
+        if (b[i].second <= b[i].first) throw std::runtime_error("empty batch");
+        if (b[i].second - b[i].first > max_batch) throw std::runtime_error("batch over max");
+        if (i > 0 && b[i].first != b[i - 1].second) throw std::runtime_error("gap or overlap");
+        if (i > 0 && b[i].first % grid != 0) throw std::runtime_error("batch starts off-grid");
+        if (i + 1 < b.size() && b[i].second % grid != 0) throw std::runtime_error("inner batch ends off-grid");
+    }
+}
+} // namespace
+
+TEST_CASE(KvflashRestorePlanFixture, grid_plan_cold_prompt_lengths) {
+    for (int n : {1, 511, 512, 513, 18813}) {
+        check_plan(kvflash_prefill_batches(0, n, kU, kU), 0, n, kU, kU);
+    }
+    CHECK(kvflash_prefill_batches(0, 1, kU, kU) == (Batches{{0, 1}}));
+    CHECK(kvflash_prefill_batches(0, 511, kU, kU) == (Batches{{0, 511}}));
+    CHECK(kvflash_prefill_batches(0, 512, kU, kU) == (Batches{{0, 512}}));
+    CHECK(kvflash_prefill_batches(0, 513, kU, kU) == (Batches{{0, 512}, {512, 513}}));
+    const Batches big = kvflash_prefill_batches(0, 18813, kU, kU);
+    CHECK(big.size() == 37);                       // 36 full cells + 381-token remainder
+    CHECK(big.back() == (std::pair<int, int>{18432, 18813}));
+}
+
+TEST_CASE(KvflashRestorePlanFixture, grid_plan_off_grid_starts_run_to_the_grid_first) {
+    // 18432 = 36 * 512 is on the grid.
+    CHECK(kvflash_prefill_batches(18432, 18813, kU, kU) == (Batches{{18432, 18813}}));
+    // 18813 is off-grid: the first batch ends at the next grid point 18944.
+    CHECK(kvflash_prefill_batches(18813, 19000, kU, kU) == (Batches{{18813, 18944}, {18944, 19000}}));
+    const Batches b = kvflash_prefill_batches(18813, 20000, kU, kU);
+    CHECK(b.front() == (std::pair<int, int>{18813, 18944}));
+    CHECK(b[1] == (std::pair<int, int>{18944, 19456}));
+    check_plan(b, 18813, 20000, kU, kU);
+    // A chunk-aligned off-grid start (what a consuming restore produces).
+    const Batches r = kvflash_prefill_batches(18560, 19500, kU, kU);
+    CHECK(r.front() == (std::pair<int, int>{18560, 18944}));
+    check_plan(r, 18560, 19500, kU, kU);
+}
+
+TEST_CASE(KvflashRestorePlanFixture, grid_plan_max_batch_multiples_and_not) {
+    for (int mb : {512, 1024, 1536, 640, 768, 1000, 4096}) {
+        for (int start : {0, 18432, 18813, 18560}) {
+            for (int n : {1, 511, 513, 18813}) {
+                check_plan(kvflash_prefill_batches(start, start + n, kU, mb), start, start + n, kU, mb);
+            }
+        }
+    }
+    // 1024 packs two cells per batch; 640 (not a multiple) still packs one.
+    CHECK(kvflash_prefill_batches(0, 2048, kU, 1024) == (Batches{{0, 1024}, {1024, 2048}}));
+    CHECK(kvflash_prefill_batches(0, 2048, kU, 640) ==
+          (Batches{{0, 512}, {512, 1024}, {1024, 1536}, {1536, 2048}}));
+    // A start 1 token below a grid point folds the gap into a wider first batch
+    // when max_batch allows it, so no 1-token mid-prompt batch exists.
+    CHECK(kvflash_prefill_batches(1023, 3000, kU, 1024).front() == (std::pair<int, int>{1023, 1536}));
+}
+
+TEST_CASE(KvflashRestorePlanFixture, grid_plan_small_max_batch_shrinks_the_grid) {
+    // max_batch below U: the grid becomes max_batch so the invariants hold.
+    check_plan(kvflash_prefill_batches(0, 1000, kU, 192), 0, 1000, 192, 192);
+    CHECK(kvflash_prefill_batches(5, 5, kU, kU).empty());
+    CHECK(kvflash_prefill_batches(9, 3, kU, kU).empty());
+}
+
+TEST_CASE(KvflashRestorePlanFixture, grid_plan_batch_end_matches_the_list) {
+    // The stateless per-position form (used by the prefill loop) and the list agree.
+    for (int start : {0, 18813, 18560}) {
+        const int end = start + 5000;
+        for (const auto & p : kvflash_prefill_batches(start, end, kU, 1024)) {
+            CHECK(kvflash_prefill_batch_end(p.first, end, kU, 1024) == p.second);
+        }
+    }
 }

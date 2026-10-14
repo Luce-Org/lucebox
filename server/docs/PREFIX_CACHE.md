@@ -477,6 +477,12 @@ tokens after the snapshot. Without it a pooled snapshot is dropped and the
 request re-prefills the whole prompt from position 0. A pooled snapshot is
 never read as a dense snapshot and never half-applied.
 
+**512-token prefill grid.** Pooled prefill (a prompt too long for the pool, or a suffix prefill after a pooled
+restore) runs on an absolute grid of 512 tokens, a multiple of the
+64-token chunk. A batch never starts off the grid
+except the first one after an off-grid resume, so where a cut falls does not
+depend on where an earlier request started.
+
 ## File Map
 
 | File | Role |

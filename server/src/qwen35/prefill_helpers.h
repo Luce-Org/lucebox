@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <utility>
 #include <vector>
 
 namespace luce::common {
@@ -62,6 +63,41 @@ inline int kvflash_pooled_ubatch(int prefill_ubatch, int chunk_tokens, int pool_
         ub = std::max(chunk_tokens, (pool_tokens / chunk_tokens) * chunk_tokens);
     }
     return ub;
+}
+
+// KVFlash pooled prefill on an ABSOLUTE grid of `grid` tokens (U = 512, a
+// multiple of the 64-token pager chunk). Batches never start off-grid, except
+// the first one after an off-grid resume, so a cut cannot depend on where an
+// earlier request happened to start and the unaligned batch accounting of the
+// old `min(ubatch, remaining)` plan cannot occur.
+//
+// End of the batch starting at `pos`: the largest grid point within `max_batch`
+// of `pos` (so an off-grid start runs to the grid first, and a start just below
+// a grid point folds into a wider batch when max_batch >= 2 * grid), capped at
+// `end`. Every batch but the first starts on the grid; every batch but the last
+// ends on it. Minimum size: no explicit floor is needed. A non-first,
+// non-final batch is at least one grid cell (>= 64 tokens, far above the 2
+// tokens that gave NaNs on the R9700); the first batch is at least the gap to
+// the grid point, which is >= 64 for the chunk-aligned starts KVFlash produces
+// (consuming restores are chunk-aligned). The one short batch is the
+// end-of-prompt remainder (as in the dense path); the GPU gate covers
+// remainders 1..64. If max_batch < grid the grid shrinks to max_batch; a
+// max_batch that is not a multiple of the grid is rounded down to one.
+inline int kvflash_prefill_batch_end(int pos, int end, int grid, int max_batch) {
+    const int g = max_batch < grid ? std::max(1, max_batch) : grid;
+    const int maxb = (std::max(max_batch, 1) / g) * g;
+    return std::min(end, ((pos + maxb) / g) * g);
+}
+
+inline std::vector<std::pair<int, int>> kvflash_prefill_batches(int start, int end, int grid,
+                                                                int max_batch) {
+    std::vector<std::pair<int, int>> out;
+    for (int pos = start; pos < end;) {
+        const int e = kvflash_prefill_batch_end(pos, end, grid, max_batch);
+        out.emplace_back(pos, e);
+        pos = e;
+    }
+    return out;
 }
 
 // LUCE_KVFLASH_RESTORE_CONSUME=1 opts in to carrying a pooled KVFlash session

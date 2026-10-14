@@ -2349,9 +2349,11 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // numerics). A snapshot requested at a restore point is then exact.
         // Between restore points chunks keep to the ubatch grid: attention
         // over chunks off it is markedly slower.
-        // Pooled kvflash prefill keeps its own chunking and never snapshots.
+        // Pooled kvflash prefill runs on an absolute 512-token grid (see
+        // kvflash_prefill_batch_end) and never snapshots mid-batch.
         const int n_tokens = kvf_paged
-            ? std::min(prefill_ubatch, prompt_len - start)
+            ? kvflash_prefill_batch_end(kv_pos, kv_offset + prompt_len,
+                                        kQwen35PrefillUbatch, prefill_ubatch) - kv_pos
             : qwen35_prefill_chunk_tokens(
                   kv_pos, prompt_len - start, prefill_ubatch, restore_points,
                   start == 0 && restored_off_grid ? kQwen35OffGridLeadTokens
