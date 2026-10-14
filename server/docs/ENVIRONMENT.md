@@ -89,6 +89,8 @@ profile and the requirements checked at startup.
 | `LUCE_MOE_TP_*` / `LUCE_MOE_HYBRID_PREFILL_EAGER` | unset | BURN-IN: model-neutral names for common heterogeneous-MoE scheduling and kernel policy. Existing `LUCE_DS4_*` names remain compatibility aliases. |
 | `LUCE_MMID_TELEMETRY` | unset | DEBUG: report MUL_MAT_ID dispatch, MMVQ variant, and per-node graph compatibility. |
 | `LUCE_KVFLASH` | unset | Prefer the CLI: `--kvflash` (token count or `auto`). |
+| `LUCE_KVFLASH_SESSION` | on (unset or any value but `0`) | The one switch for KVFlash session restore on the Qwen3.5 backend: the DeltaNet state ladder and live restore from the running session. Set `0` to turn both off, so every request re-prefills from the last server snapshot (this is the cold arm of the Gate A test). Only has an effect when `--kvflash` is active. It does not gate the 512-token prefill grid, which always applies to pooled prefill. See [PREFIX_CACHE.md](PREFIX_CACHE.md#kvflash-session-restore). |
+| `LUCE_KVFLASH_STATE_LADDER_MIB` | 3072 | Memory budget in MiB for the DeltaNet state ladder (the state-only checkpoints that make live restore possible); the least recently used checkpoints are evicted past it. Read once at first use. Lower it on small GPUs or when other buffers need the space; raise it for very long sessions that need more rungs. |
 | `LUCE_KVFLASH_RESTORE_CONSUME` | unset (off) | OPT-IN: `1` saves pooled KVFlash snapshots in the prefix cache and restores them, so a repeat request prefills only the suffix after the cached prefix. Unset or `0` keeps the old behavior: pooled snapshots are refused and the request re-prefills. Pooled snapshots are never written to the disk cache. |
 | `LUCE_KVFLASH_DEBUG_RESIDENT` | unset | DEBUG: when set, logs a `[kvflash-dbg]` line after each prefill with the resident chunk ranges and a hash of the score ledger. Leave unset in production. |
 | `LUCE_PREFIX_CACHE_SLOTS` | 32 | Container-entrypoint equivalent of `--prefix-cache-slots`; not read directly by the native binary. |
@@ -282,6 +284,8 @@ profile and the requirements checked at startup.
 - `LUCE_KVFLASH_MAX_POOL` - kvflash_pager.h
 - `LUCE_KVFLASH_POLICY` - kvflash_pager.h
 - `LUCE_KVFLASH_RESTORE_CONSUME` - prefill_helpers.h
+- `LUCE_KVFLASH_SESSION` - prefill_helpers.h
+- `LUCE_KVFLASH_STATE_LADDER_MIB` - qwen35_backend.cpp
 - `LUCE_KVFLASH_TAU` - gemma4_backend.cpp, gemma4_layer_split_adapter.cpp, laguna_backend.cpp, laguna_layer_split_adapter.cpp, qwen35_layer_split_adapter.cpp
 - `LUCE_LAGUNA_AUTO_HEAD_MAJOR` - laguna_backend.cpp
 - `LUCE_LAGUNA_CACHE_SLOTS` - laguna_backend.cpp

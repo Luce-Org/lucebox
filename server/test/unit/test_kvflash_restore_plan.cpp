@@ -46,6 +46,91 @@ TEST_CASE(KvflashRestorePlanFixture, degenerate_geometry_falls_back) {
     CHECK(kvflash_restore_plan(true, true, 640, 0, false) == KvflashRestorePlan::Reject);
 }
 
+// A dense snapshot (restored prefix 7039) plus a prompt that crosses the pool
+// (8192, chunk 64) cannot continue densely and the pooled prefill needs a fresh
+// request: the plan must re-prefill the whole prompt, never fail.
+TEST_CASE(KvflashRestorePlanFixture, dense_restore_that_outgrows_the_pool_reprefills) {
+    CHECK(kvflash_restore_plan(false, false, 7039, 64, true, 7039 + 1354, 8192) == KvflashRestorePlan::FullReprefill);
+    CHECK(kvflash_restore_plan(false, false, 316, 64, true, 9000, 8192) == KvflashRestorePlan::FullReprefill);
+    CHECK(kvflash_restore_plan(true,  false, 316, 64, true, 9000, 8192) == KvflashRestorePlan::FullReprefill);
+}
+
+TEST_CASE(KvflashRestorePlanFixture, dense_restore_inside_the_pool_stays_dense) {
+    CHECK(kvflash_restore_plan(false, false, 7039, 64, true, 8000, 8192) == KvflashRestorePlan::Dense);
+    CHECK(kvflash_restore_plan(false, false, 7039, 64, true, 8192 - 64, 8192) == KvflashRestorePlan::Dense);
+    CHECK(kvflash_restore_plan(false, false, 7039, 64, true, 8192 - 63, 8192) == KvflashRestorePlan::FullReprefill);
+    // kvflash off (pool 0) or an exact hit: untouched.
+    CHECK(kvflash_restore_plan(false, false, 7039, 64, true, 20000, 0) == KvflashRestorePlan::Dense);
+    CHECK(kvflash_restore_plan(false, false, 9000, 64, true, 9000, 8192) == KvflashRestorePlan::Dense);
+}
+
+// ---- restorable prefix: the cut a restore would take ----------------------
+
+using luce::common::kvflash_restorable_tokens;
+
+namespace {
+// Snapshot-side arguments are (has_snapshot, consume, pooled, snap_pos,
+// slot_tokens); geometry is chunk 64, pool 65536, a 40000-token prompt.
+int restorable(bool has, bool consume, bool pooled, int snap_pos, int slot_tokens,
+               int live_cut, bool session = true) {
+    return kvflash_restorable_tokens(has, consume, pooled, snap_pos, slot_tokens,
+                                     64, 40000, 65536, session, live_cut);
+}
+} // namespace
+
+TEST_CASE(KvflashRestorePlanFixture, restorable_live_session_alone_is_reported) {
+    CHECK(restorable(false, false, false, 0, 0, 32000) == 32000);
+}
+
+TEST_CASE(KvflashRestorePlanFixture, restorable_nothing_is_zero_never_negative) {
+    CHECK(restorable(false, false, false, 0, 0, -1) == 0);
+    CHECK(restorable(false, true, true, 20032, 20032, -1) == 0);
+}
+
+TEST_CASE(KvflashRestorePlanFixture, restorable_dense_snapshot_loses_to_a_longer_live_cut) {
+    CHECK(restorable(true, false, false, 20000, 20000, 32000) == 32000);
+    CHECK(restorable(true, false, false, 20000, 20000, 10000) == 20000);
+    CHECK(restorable(true, false, false, 20000, 20000, 20000) == 20000);
+}
+
+TEST_CASE(KvflashRestorePlanFixture, restorable_dense_snapshot_without_a_live_cut_is_trusted) {
+    CHECK(restorable(true, false, false, 20000, 20000, -1) == 20000);
+    CHECK(restorable(true, true, false, 20000, 20000, -1) == 20000);
+}
+
+TEST_CASE(KvflashRestorePlanFixture, restorable_misaligned_pooled_snapshot_is_thrown_away) {
+    // The backend would re-prefill the whole prompt, so the cache restores 0.
+    CHECK(restorable(true, true, true, 20001, 20001, -1) == 0);
+    // ...unless the live session still covers a prefix.
+    CHECK(restorable(true, true, true, 20001, 20001, 18000) == 18000);
+}
+
+TEST_CASE(KvflashRestorePlanFixture, restorable_aligned_pooled_snapshot_consumes) {
+    CHECK(restorable(true, true, true, 20032, 20032, -1) == 20032);
+    CHECK(restorable(true, true, true, 20032, 20032, 30000) == 30000);
+}
+
+TEST_CASE(KvflashRestorePlanFixture, restorable_pooled_snapshot_with_consume_off_is_zero) {
+    CHECK(restorable(true, false, true, 20032, 20032, -1) == 0);
+    CHECK(restorable(true, false, true, 20032, 20032, 9000) == 9000);
+}
+
+TEST_CASE(KvflashRestorePlanFixture, restorable_is_capped_by_the_tokens_the_slot_matches) {
+    CHECK(restorable(true, false, false, 20000, 15000, -1) == 15000);
+    CHECK(restorable(true, true, true, 20032, 12800, -1) == 12800);
+    // The live cut is not capped by the slot.
+    CHECK(restorable(true, false, false, 20000, 15000, 32000) == 32000);
+}
+
+TEST_CASE(KvflashRestorePlanFixture, restorable_dense_snapshot_outgrowing_the_pool) {
+    // 40000-token prompt, pool 8192: a dense prefix cannot continue densely.
+    // Without the live session it re-prefills whole; with it the pager adopts.
+    CHECK(kvflash_restorable_tokens(true, false, false, 7039, 7039, 64, 40000, 8192,
+                                    /*session=*/false, -1) == 0);
+    CHECK(kvflash_restorable_tokens(true, false, false, 7039, 7039, 64, 40000, 8192,
+                                    /*session=*/true, -1) == 7039);
+}
+
 TEST_CASE(KvflashRestorePlanFixture, history_cold_prefill_is_just_the_tokens) {
     const std::vector<int32_t> tok = {5, 6, 7};
     const auto h = kvflash_restore_history(tok, 0, nullptr);
