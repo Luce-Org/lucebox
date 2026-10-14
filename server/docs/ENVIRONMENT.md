@@ -89,6 +89,8 @@ profile and the requirements checked at startup.
 | `LUCE_MOE_TP_*` / `LUCE_MOE_HYBRID_PREFILL_EAGER` | unset | BURN-IN: model-neutral names for common heterogeneous-MoE scheduling and kernel policy. Existing `LUCE_DS4_*` names remain compatibility aliases. |
 | `LUCE_MMID_TELEMETRY` | unset | DEBUG: report MUL_MAT_ID dispatch, MMVQ variant, and per-node graph compatibility. |
 | `LUCE_KVFLASH` | unset | Prefer the CLI: `--kvflash` (token count or `auto`). |
+| `LUCE_KVFLASH_RESTORE_CONSUME` | unset (off) | OPT-IN: `1` saves pooled KVFlash snapshots in the prefix cache and restores them, so a repeat request prefills only the suffix after the cached prefix. Unset or `0` keeps the old behavior: pooled snapshots are refused and the request re-prefills. Pooled snapshots are never written to the disk cache. |
+| `LUCE_KVFLASH_DEBUG_RESIDENT` | unset | DEBUG: when set, logs a `[kvflash-dbg]` line after each prefill with the resident chunk ranges and a hash of the score ledger. Leave unset in production. |
 | `LUCE_PREFIX_CACHE_SLOTS` | 32 | Container-entrypoint equivalent of `--prefix-cache-slots`; not read directly by the native binary. |
 | `LUCE_PREFIX_CACHE_MAX_MIB` | auto | Container-entrypoint equivalent of `--prefix-cache-max-mib`; not read directly by the native binary. |
 | `LUCE_PREFILL_CACHE_SLOTS` | 0 | Container-entrypoint equivalent of `--prefill-cache-slots`; not read directly by the native binary. |
@@ -275,9 +277,11 @@ profile and the requirements checked at startup.
 - `LUCE_HIP_BACKEND_PATH` - dynamic_backend.cpp
 - `LUCE_IGNORE_EOS` - laguna_backend.cpp
 - `LUCE_KVFLASH` - gemma4_backend.cpp, gemma4_layer_split_adapter.cpp, kvflash_pager.h, laguna_backend.cpp, laguna_layer_split_adapter.cpp, qwen35_backend.cpp, qwen35_layer_split_adapter.cpp
+- `LUCE_KVFLASH_DEBUG_RESIDENT` - qwen35_backend.cpp
 - `LUCE_KVFLASH_DRAFTER` - kvflash_pager.h
 - `LUCE_KVFLASH_MAX_POOL` - kvflash_pager.h
 - `LUCE_KVFLASH_POLICY` - kvflash_pager.h
+- `LUCE_KVFLASH_RESTORE_CONSUME` - prefill_helpers.h
 - `LUCE_KVFLASH_TAU` - gemma4_backend.cpp, gemma4_layer_split_adapter.cpp, laguna_backend.cpp, laguna_layer_split_adapter.cpp, qwen35_layer_split_adapter.cpp
 - `LUCE_LAGUNA_AUTO_HEAD_MAJOR` - laguna_backend.cpp
 - `LUCE_LAGUNA_CACHE_SLOTS` - laguna_backend.cpp

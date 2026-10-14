@@ -427,6 +427,7 @@ struct ModelBackend {
         ggml_backend_buffer_t buf     = nullptr;
         int                   cur_pos = 0;
         int32_t               last_tok = -1;  // last prefill token (for decode seeding)
+        bool                  pooled  = false; // KV lives in a pager blob, not in ctx tensors
     };
 
     // Export a snapshot's tensor context + buffer for read-only access.

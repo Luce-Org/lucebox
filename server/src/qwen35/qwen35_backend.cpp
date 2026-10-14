@@ -1010,6 +1010,24 @@ bool Qwen35Backend::unpark(ParkTarget target) {
 
 // ── Snapshots ───────────────────────────────────────────────────────────
 
+// Save the pooled KV as a pager blob. The recurrent state (SSM/conv) is
+// captured from the live cache, so the snapshot position must be the live
+// position: `snap_boundary` has to equal cache_.cur_pos (a chunk multiple at a
+// pooled-prefill ubatch boundary, the prompt end otherwise). Only the chunks
+// covering [0, snap_boundary) are serialized; a partial last chunk is included
+// whole. Anything else would pair KV and recurrent state from different
+// positions, so it is refused.
+bool Qwen35Backend::snapshot_save_pooled_at(int slot, int snap_boundary) {
+    if (slot < 0 || slot >= PREFIX_SLOTS || !kvflash_active()) return false;
+    if (snap_boundary <= 0 || snap_boundary != cache_.cur_pos) return false;
+    const int chunk = kvflash_pager_.chunk_tokens();
+    const int n_chunks = (snap_boundary + chunk - 1) / chunk;
+    const std::vector<uint8_t> blob = kvflash_pager_.serialize(n_chunks);
+    return snapshot_target_cache(w_, cache_, snap_backend_,
+                                 prefix_snapshots_[slot],
+                                 /*skip_kv=*/true, &blob);
+}
+
 bool Qwen35Backend::snapshot_save(int slot) {
     if (cfg_.paged_attention) {
         static bool warned = false;
@@ -1024,20 +1042,25 @@ bool Qwen35Backend::snapshot_save(int slot) {
     }
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
     // kvflash: snapshots right-size to cur_pos, which is a LOGICAL position
-    // that can exceed the physical pool once decode has paged, and they copy
-    // rows assuming the identity layout, which pooled prefill / eviction
-    // breaks. Snapshots of pooled state need page-table serialization
-    // (follow-up); identity-mapped prefill-time snapshots remain valid.
+    // that can exceed the physical pool once decode has paged, and dense
+    // snapshots copy rows assuming the identity layout, which pooled prefill /
+    // eviction breaks. Pooled state is saved as a pager blob instead
+    // (LUCE_KVFLASH_RESTORE_CONSUME=1); without it the old refusal stands.
     if (kvflash_active() &&
         (cache_.cur_pos > kvflash_tokens_ || !kvflash_pager_.is_identity())) {
-        static bool warned = false;
-        if (!warned) {
-            std::fprintf(stderr, "[kvflash] snapshot skipped: cur_pos %d exceeds "
-                                 "pool %d (pooled snapshots are a follow-up)\n",
-                         cache_.cur_pos, kvflash_tokens_);
-            warned = true;
+        if (!luce::common::kvflash_restore_consume_enabled()) {
+            static bool warned = false;
+            if (!warned) {
+                std::fprintf(stderr, "[kvflash] snapshot skipped: cur_pos %d exceeds "
+                                     "pool %d (set LUCE_KVFLASH_RESTORE_CONSUME=1 to save "
+                                     "pooled snapshots)\n",
+                             cache_.cur_pos, kvflash_tokens_);
+                warned = true;
+            }
+            return false;
         }
-        return false;
+        live_snapshot_slot_ = -1;
+        return snapshot_save_pooled_at(slot, cache_.cur_pos);
     }
     // A deferred snapshot is the live state; copy it out while it still is.
     // Copying it out already saves this slot when it is the deferred one.
@@ -1178,16 +1201,17 @@ ModelBackend::SnapshotRef Qwen35Backend::snapshot_ref(int slot) const {
     ref.buf      = snap.buf;
     ref.cur_pos  = snap.cur_pos;
     ref.last_tok = snap.last_tok;
+    ref.pooled   = snap.is_pooled;
     return ref;
 }
 
 // Hand a PrefixSnapshot's payload to an OwnedSnapshot and leave it empty.
 // Only full states (dense, paged) are useful on disk; a thin KV-only one is
-// freed instead. A payload outside host memory is copied to host first.
+// freed instead, and so is a pooled one (its KV lives in the pager blob, which
+// an OwnedSnapshot cannot carry). A payload outside host memory is copied to
+// host first.
 static OwnedSnapshot take_prefix_snapshot(PrefixSnapshot & snap) {
-    if (!snap.ctx || !snap.buf ||
-        (snap.layout != PrefixSnapshot::Layout::dense &&
-         snap.layout != PrefixSnapshot::Layout::paged)) {
+    if (!snap.ctx || !snap.buf || !snap.disk_persistable()) {
         free_prefix_snapshot(snap);
         return {};
     }
@@ -1952,6 +1976,24 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     const int snap_pos = live_restore ? cache_.cur_pos
                                       : prefix_snapshots_[slot].cur_pos;
 
+    // A KVFlash pooled snapshot either feeds the suffix-only prefill (consume,
+    // LUCE_KVFLASH_RESTORE_CONSUME=1) or is dropped for a full re-prefill from 0.
+    // It is never read as a dense snapshot and never half-applied.
+    const bool snap_pooled = !live_restore && prefix_snapshots_[slot].is_pooled;
+    const KvflashRestorePlan plan = kvflash_restore_plan(
+        kvflash_restore_consume_enabled(), snap_pooled, snap_pos,
+        kvflash_active() ? kvflash_pager_.chunk_tokens() : 0,
+        !req.prompt.empty());
+    if (plan == KvflashRestorePlan::Reject) {
+        result.fail(GenerateErrorCode::BackendSpecific,
+                    "kvflash: pooled snapshot cannot be restored (misaligned or "
+                    "consume off) and the request carries no prompt to re-prefill");
+        out_io.emit(-1);
+        return result;
+    }
+    const bool consume = plan == KvflashRestorePlan::Consume;
+    const bool full_reprefill = plan == KvflashRestorePlan::FullReprefill;
+
     if (live_restore) {
         // The live cache already is this snapshot (saved after the previous
         // generation, nothing ran since). Only the rows past it differ from
@@ -1962,15 +2004,28 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         // mask-less FA span, so rows beyond the restored prefix must be ZERO,
         // not leftovers from the previous request. cudaMemset is ~0.2ms.
         if (cache_.base_buf) ggml_backend_buffer_clear(cache_.base_buf, 0);
-        // Decoding on a cache the restore did not fill yields garbage.
-        if (!restore_target_cache(prefix_snapshots_[slot], cache_)) {
-            std::fprintf(stderr, "[qwen35] restore slot=%d failed: %s\n",
-                         slot, luce_last_error());
-            cache_.cur_pos = 0;
-            result.fail(GenerateErrorCode::InvalidSnapshotSlot,
-                        std::string("snapshot restore failed: ") + luce_last_error());
-            out_io.emit(-1);
-            return result;
+        if (full_reprefill) {
+            std::fprintf(stderr,
+                "[kvflash] pooled snapshot (pos=%d) not consumable: full re-prefill "
+                "of %zu prompt tokens\n", snap_pos, req.prompt.size());
+            reset_recurrent_state(cache_);
+        } else {
+            // Decoding on a cache the restore did not fill yields garbage.
+            const bool restored = consume
+                ? (restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/true) &&
+                   kvflash_restore_pooled(prefix_snapshots_[slot], req.prompt))
+                : restore_target_cache(prefix_snapshots_[slot], cache_);
+            if (!restored) {
+                std::fprintf(stderr, "[qwen35] restore slot=%d failed: %s\n",
+                             slot, luce_last_error());
+                cache_.cur_pos = 0;
+                result.fail(consume ? GenerateErrorCode::BackendSpecific
+                                    : GenerateErrorCode::InvalidSnapshotSlot,
+                            consume ? std::string("kvflash: pooled snapshot restore failed")
+                                    : std::string("snapshot restore failed: ") + luce_last_error());
+                out_io.emit(-1);
+                return result;
+            }
         }
     }
 
@@ -1980,8 +2035,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         sampler_rng_.seed(sampler_.seed);
     }
 
-    cache_.cur_pos = snap_pos;
-    result.restored_prefix_tokens = snap_pos;
+    cache_.cur_pos = full_reprefill ? 0 : snap_pos;
+    result.restored_prefix_tokens = full_reprefill ? 0 : snap_pos;
 
     // FIX(prefix-cache + spec-decode): restore_target_cache brings back KV /
     // recurrent state / target_feat, but the draft-side feature mirror is left
@@ -2018,11 +2073,32 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     // only the delta at KV positions [snap_pos, snap_pos + delta.size()).
     int committed = snap_pos;
     const int prompt_len = (int)req.prompt.size();
-    if (prompt_len > snap_pos) {
+    if (full_reprefill) {
+        auto t_prefill_start = std::chrono::steady_clock::now();
+        committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot,
+                               /*kv_offset=*/0, nullptr, req.restore_points);
+        if (committed < 0) {
+            result.fail(GenerateErrorCode::PrefillFailed);
+            return result;
+        }
+        result.prefill_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_prefill_start).count();
+    } else if (prompt_len > snap_pos) {
         auto t_prefill_start = std::chrono::steady_clock::now();
         std::vector<int32_t> delta = restore_prompt_delta(req.prompt, snap_pos);
+        if (consume) {
+            std::printf("[kvflash] pooled restore: consume kv_offset=%d suffix=%d "
+                        "prompt=%d\n", snap_pos, (int)delta.size(), prompt_len);
+            std::fflush(stdout);
+        }
+        struct ConsumeScope {
+            bool & flag;
+            ~ConsumeScope() { flag = false; }
+        } consume_scope{kvflash_consume_restore_};
+        kvflash_consume_restore_ = consume;
         committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot,
-                               /*kv_offset=*/snap_pos, nullptr, req.restore_points);
+                               /*kv_offset=*/snap_pos, nullptr, req.restore_points,
+                               consume ? &req.prompt : nullptr);
         if (committed < 0) {
             result.fail(GenerateErrorCode::PrefillFailed);
             return result;
@@ -2131,7 +2207,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                int snap_pos, int snap_slot,
                                int kv_offset,
                                const Qwen35ImageRows * images,
-                               const std::vector<int> & restore_points) {
+                               const std::vector<int> & restore_points,
+                               const std::vector<int32_t> * full_prompt) {
     if (images && kv_offset != 0) {
         std::fprintf(stderr, "prefill: an image prompt must start at position 0\n");
         return -1;
@@ -2198,9 +2275,18 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     // pool fills (constant VRAM, linear time). Restore offsets are not
     // supported in the pooled path (a relocated prefix cannot be restored
     // identity-style in the first place).
-    const bool kvf_paged = kvflash_active() &&
-        kv_offset + prompt_len > kvflash_tokens_ - kvflash_pager_.chunk_tokens();
-    if (kvf_paged && kv_offset != 0) {
+    // A consuming restore (kvflash_restore_pooled already rebuilt the pager
+    // from the snapshot blob) continues the pooled prefill at kv_offset.
+    const bool kvf_consume = kvflash_active() && kvflash_consume_restore_ && kv_offset > 0;
+    if (kvf_consume && kv_offset % kvflash_pager_.chunk_tokens() != 0) {
+        std::fprintf(stderr, "[kvflash] consuming restore at unaligned offset %d "
+                             "(chunk %d)\n", kv_offset, kvflash_pager_.chunk_tokens());
+        set_last_error("kvflash: unaligned pooled restore offset");
+        return -1;
+    }
+    const bool kvf_paged = kvflash_active() && (kvf_consume ||
+        kv_offset + prompt_len > kvflash_tokens_ - kvflash_pager_.chunk_tokens());
+    if (kvf_paged && kv_offset != 0 && !kvf_consume) {
         std::fprintf(stderr,
             "[kvflash] restored prefix (%d) + prompt (%d) exceeds pool %d; "
             "pooled prefill requires a fresh request\n",
@@ -2212,15 +2298,21 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // Chunk-aligned but not one-chunk ubatches; see kvflash_pooled_ubatch.
         const int kvf_chunk = kvflash_pager_.chunk_tokens();
         prefill_ubatch = kvflash_pooled_ubatch(prefill_ubatch, kvf_chunk, kvflash_tokens_);
-        kvflash_pager_.reset();
-        if (kvflash_qk_policy_) {
-            kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
-            kvflash_qk_pooled_upto_ = 0;
+        if (!kvf_consume) {   // a consuming restore keeps the restored pager
+            kvflash_pager_.reset();
+            if (kvflash_qk_policy_) {
+                kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
+                kvflash_qk_pooled_upto_ = 0;
+            }
         }
         std::printf("[kvflash] pooled prefill: %d tokens through a %d-token pool "
                     "(%d-token chunks, ubatch=%d, evicting)\n",
                     prompt_len, kvflash_tokens_, kvf_chunk, prefill_ubatch);
         std::fflush(stdout);
+    } else if (kvflash_active() && kv_offset == 0) {
+        // Dense prefill rebuilds the pager only at completion. A boundary
+        // snapshot before then must not see the previous request's mapping.
+        kvflash_pager_.reset();
     }
 
     // Skip KV-cache migration when resuming from a snapshot — the cache was
@@ -2278,6 +2370,20 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                     std::printf("[snap] boundary slot=%d cur_pos=%d (req snap_pos=%d)\n",
                                 snap_slot, kv_pos, snap_pos);
                     std::fflush(stdout);
+                }
+            } else if (kvf_paged && kv_pos > kv_offset &&
+                       luce::common::kvflash_restore_consume_enabled()) {
+                // kv_pos starts a pooled ubatch (chunk multiple); cur_pos is
+                // already kv_pos. Serialize the pager chunks [0, kv_pos/chunk).
+                cache_.cur_pos = kv_pos;
+                if (snapshot_save_pooled_at(snap_slot, kv_pos)) {
+                    std::printf("[snap] pooled boundary slot=%d cur_pos=%d "
+                                "(req snap_pos=%d chunks=%d)\n", snap_slot,
+                                kv_pos, snap_pos, kv_pos / kvflash_pager_.chunk_tokens());
+                    std::fflush(stdout);
+                } else {
+                    std::fprintf(stderr, "[kvflash] pooled boundary snapshot failed "
+                                         "at kv_pos=%d\n", kv_pos);
                 }
             } else if (kvf_paged) {
                 std::fprintf(stderr, "[kvflash] boundary snapshot skipped: pooled "
@@ -2458,11 +2564,11 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (kvf_paged) {
             // The pager mapping was built live during the pooled prefill;
             // only the history / hygiene parts of the sync apply.
-            kvflash_history_.assign(tokens.begin(), tokens.end());
+            kvflash_history_ = kvflash_restore_history(tokens, kv_offset, full_prompt);
             kvflash_pager_.zero_free_blocks();
             kvflash_mask_epoch_ = (uint64_t)-1;
         } else {
-            kvflash_sync_prefill(committed, tokens, kv_offset);
+            kvflash_sync_prefill(committed, tokens, kv_offset, full_prompt);
         }
     }
 
@@ -2479,6 +2585,11 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
     }
 
+    if (kvflash_active() && std::getenv("LUCE_KVFLASH_DEBUG_RESIDENT")) {
+        std::printf("[kvflash-dbg] after prefill kv_offset=%d committed=%d resident=%s\n", kv_offset, committed,
+                    kvflash_pager_.debug_resident(committed / kvflash_pager_.chunk_tokens()).c_str());
+        std::fflush(stdout);
+    }
     return committed;
 }
 
@@ -2486,7 +2597,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
 void Qwen35Backend::kvflash_sync_prefill(int committed,
                                          const std::vector<int32_t> & tokens,
-                                         int kv_offset) {
+                                         int kv_offset,
+                                         const std::vector<int32_t> * full_prompt) {
     // Prefill (and snapshot restore) place rows physically contiguous at
     // [0, committed): rebuild the pager mapping identity-style and reset
     // the token history to match.
@@ -2500,12 +2612,9 @@ void Qwen35Backend::kvflash_sync_prefill(int committed,
             std::fprintf(stderr, "[kvflash] prefill slot mismatch %d != %d\n", slot, p);
         }
     }
-    if (kv_offset == 0) {
-        kvflash_history_.assign(tokens.begin(), tokens.end());
-    } else {
-        kvflash_history_.resize((size_t)kv_offset, 0);  // restored prefix ids unknown
-        kvflash_history_.insert(kvflash_history_.end(), tokens.begin(), tokens.end());
-    }
+    // Restored-prefix ids are real when the caller knows the full prompt,
+    // zeros otherwise.
+    kvflash_history_ = kvflash_restore_history(tokens, kv_offset, full_prompt);
     // Slots past the prompt still hold the previous request's rows; the
     // maskless qwen35moe pipelined decode reads the whole padded pool span.
     kvflash_pager_.zero_free_blocks();
@@ -2515,6 +2624,40 @@ void Qwen35Backend::kvflash_sync_prefill(int committed,
         kvflash_qk_pooled_upto_ = 0;
         kvflash_qk_pool_to(committed);
     }
+}
+
+// Rebuild the pager from a pooled snapshot's blob so a suffix-only prefill can
+// continue it: resident chunks return to the pool, the rest stay host-backed.
+// QK policy: the pooled keys are not in the blob, so the resident chunks are
+// re-pooled from the restored rows; evicted chunks score as missing (0) until
+// paged back in (rebuilding them from the blob's score ledger is a follow-up).
+bool Qwen35Backend::kvflash_restore_pooled(const PrefixSnapshot & snap,
+                                           const std::vector<int32_t> & prompt) {
+    const int ct = kvflash_pager_.chunk_tokens();
+    if (!kvflash_active() || ct <= 0 || snap.kvflash_blob.empty()) return false;
+    if (!kvflash_pager_.deserialize(snap.kvflash_blob.data(), snap.kvflash_blob.size())) {
+        std::fprintf(stderr, "[kvflash] pager deserialize failed\n");
+        return false;
+    }
+    if (kvflash_pager_.n_chunks() != (snap.cur_pos + ct - 1) / ct) {
+        std::fprintf(stderr, "[kvflash] snapshot blob has %d chunks for pos %d\n",
+                     kvflash_pager_.n_chunks(), snap.cur_pos);
+        return false;
+    }
+    kvflash_pager_.zero_free_blocks();
+    kvflash_mask_epoch_ = (uint64_t)-1;
+    kvflash_scores_.clear();
+    kvflash_history_ = kvflash_restore_history({}, snap.cur_pos, &prompt);
+    if (kvflash_qk_policy_) {
+        kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
+        const int sealed = snap.cur_pos / ct;
+        for (int c = 0; c < sealed; c++) {
+            const int blk = kvflash_pager_.block_of(c);
+            if (blk >= 0) kvflash_qk_pool_.pool_chunk(cache_.attn_k, blk, ct, c);
+        }
+        kvflash_qk_pooled_upto_ = sealed;
+    }
+    return true;
 }
 
 // Pool post-RoPE keys for chunks sealed before `committed` (QK policy).

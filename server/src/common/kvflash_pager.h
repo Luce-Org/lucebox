@@ -525,6 +525,29 @@ public:
         return events;
     }
 
+    // Debug: resident chunk ids as "a-b,c" ranges, and a hash of the score
+    // ledger of chunks < upto (LUCE_KVFLASH_DEBUG_RESIDENT).
+    std::string debug_resident(int upto) const {
+        std::string out;
+        char buf[48];
+        for (int c = 0, n = (int)chunks_.size(); c < n;) {
+            if (chunks_[(size_t)c].block < 0) { c++; continue; }
+            int e = c;
+            while (e + 1 < n && chunks_[(size_t)e + 1].block >= 0) e++;
+            std::snprintf(buf, sizeof buf, "%s%d-%d", out.empty() ? "" : ",", c, e);
+            out += buf;
+            c = e + 1;
+        }
+        uint64_t h = 1469598103934665603ULL;
+        for (int c = 0; c < upto && c < (int)chunks_.size(); c++) {
+            uint32_t b; const float sc = chunks_[(size_t)c].score;
+            std::memcpy(&b, &sc, 4);
+            h = (h ^ b) * 1099511628211ULL;
+        }
+        std::snprintf(buf, sizeof buf, " nchunks=%d ledger_hash=%016llx", (int)chunks_.size(), (unsigned long long)h);
+        return out + buf;
+    }
+
     // Per-chunk relevance ledger (QK scorer): set before serialize() so the
     // scores round-trip. -inf = never scored.
     void set_chunk_score(int c, float s) {
