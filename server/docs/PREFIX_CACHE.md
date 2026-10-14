@@ -450,6 +450,33 @@ back to the system/tools head and re-read most of the conversation.
 The in-memory cache limit is 63 slots. Backend slot 63 is reserved for disk
 cache staging, preventing disk loads from overwriting a live in-memory entry.
 
+## KVFlash session restore
+
+KVFlash (the `--kvflash` option) keeps only a fixed pool of KV rows on the GPU and
+pages the rest. That breaks the ordinary prefix snapshot, which copies rows
+assuming they sit contiguously, so the Qwen3.5 backend has its own restore
+paths. The switch is listed in [ENVIRONMENT.md](ENVIRONMENT.md)
+(`LUCE_KVFLASH_RESTORE_CONSUME`).
+
+**Pooled snapshots.** When the live cache has outgrown the pool (or the pager
+is no longer identity-mapped), a snapshot is saved as a pager blob stored inside
+the prefix snapshot instead of as dense KV rows. It is taken at the current
+position and only used for a restore when that position is a multiple of the
+64-token pager chunk. The blob is saved only when
+`LUCE_KVFLASH_RESTORE_CONSUME=1`; otherwise the snapshot is skipped with a
+one-time log line.
+
+**Never on disk.** The disk cache (see Disk Session Cache above) writes a
+snapshot only when it leaves RAM. `take_prefix_snapshot` frees a pooled
+snapshot instead of handing it over, because an `OwnedSnapshot` cannot carry
+the pager blob. A file on disk therefore never lacks the KV it claims to hold.
+
+**Suffix-only restore.** With `LUCE_KVFLASH_RESTORE_CONSUME=1`, a pooled
+snapshot rebuilds the pager and KV pool, and the request prefills only the
+tokens after the snapshot. Without it a pooled snapshot is dropped and the
+request re-prefills the whole prompt from position 0. A pooled snapshot is
+never read as a dense snapshot and never half-applied.
+
 ## File Map
 
 | File | Role |

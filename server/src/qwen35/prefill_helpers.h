@@ -64,6 +64,52 @@ inline int kvflash_pooled_ubatch(int prefill_ubatch, int chunk_tokens, int pool_
     return ub;
 }
 
+// LUCE_KVFLASH_RESTORE_CONSUME=1 opts in to carrying a pooled KVFlash session
+// across turns: pooled prefix snapshots are saved and a restore consumes them
+// instead of re-prefilling the prompt. Default OFF.
+inline bool kvflash_restore_consume_enabled() {
+    const char * v = std::getenv("LUCE_KVFLASH_RESTORE_CONSUME");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+// What a restore does with a snapshot. Dense: the existing path. Consume:
+// pooled snapshot, pager blob restored, only the suffix prefills. FullReprefill:
+// drop the snapshot and prefill the whole prompt from 0. Reject: fail the
+// request (a pooled snapshot cannot be used and the full prompt is unknown).
+enum class KvflashRestorePlan { Dense, Consume, FullReprefill, Reject };
+
+// A pooled snapshot resumes only at a whole pager chunk: a restored prefix
+// that ends mid-chunk would need the partial chunk re-sealed. Anything that
+// cannot consume must re-prefill the WHOLE prompt (never just the suffix).
+inline KvflashRestorePlan kvflash_restore_plan(bool consume_enabled, bool is_pooled,
+                                               int kv_offset, int chunk_tokens,
+                                               bool have_full_prompt) {
+    if (!is_pooled) return KvflashRestorePlan::Dense;
+    if (consume_enabled && kv_offset > 0 && chunk_tokens > 0 &&
+        kv_offset % chunk_tokens == 0) {
+        return KvflashRestorePlan::Consume;
+    }
+    return have_full_prompt ? KvflashRestorePlan::FullReprefill
+                            : KvflashRestorePlan::Reject;
+}
+
+// Token history for [0, kv_offset + suffix): real ids for the restored prefix
+// when the full prompt is known, zeros otherwise (the old behaviour).
+inline std::vector<int32_t> kvflash_restore_history(
+        const std::vector<int32_t> & suffix, int kv_offset,
+        const std::vector<int32_t> * full_prompt) {
+    std::vector<int32_t> h;
+    if (kv_offset > 0) {
+        if (full_prompt && (int)full_prompt->size() >= kv_offset) {
+            h.assign(full_prompt->begin(), full_prompt->begin() + kv_offset);
+        } else {
+            h.assign((size_t)kv_offset, 0);
+        }
+    }
+    h.insert(h.end(), suffix.begin(), suffix.end());
+    return h;
+}
+
 // GGML M-RoPE consumes positions axis-major:
 //   [all temporal][all height][all width][all extra].
 // position_stride is the complete token width of the destination tensor;

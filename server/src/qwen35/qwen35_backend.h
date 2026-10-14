@@ -135,6 +135,8 @@ public:
                                  const DaemonIO & io) override;
 
     bool snapshot_save(int slot) override;
+    // Pooled (KVFlash) save: pager blob of chunks [0, boundary/chunk) + recurrent state.
+    bool snapshot_save_pooled_at(int slot, int snap_boundary);
     bool snapshot_save_deferred(int slot) override;
     void snapshot_flush_deferred() override { materialize_live_snapshot(); }
     void snapshot_free(int slot) override;
@@ -280,8 +282,16 @@ protected:
     void kvflash_qk_pool_to(int committed);
     // Rebuild pager mapping after (re)prefill: positions [0, committed)
     // occupy pool slots identity-mapped (prefill is contiguous).
+    // `full_prompt` (optional) supplies the real ids of the restored prefix
+    // [0, kv_offset) for the scorer history; null keeps zeros.
     void kvflash_sync_prefill(int committed, const std::vector<int32_t> & tokens,
-                              int kv_offset);
+                              int kv_offset,
+                              const std::vector<int32_t> * full_prompt = nullptr);
+    // Rebuild the pager (and QK pool) from a pooled snapshot for a consuming
+    // restore (LUCE_KVFLASH_RESTORE_CONSUME=1).
+    bool kvflash_restore_pooled(const PrefixSnapshot & snap,
+                                const std::vector<int32_t> & prompt);
+    bool kvflash_consume_restore_ = false;   // set around the suffix do_prefill
     // Upload the slot-validity mask (host rebuild on epoch change, device
     // upload every step — the input's buffer region is reused by compute).
     void kvflash_upload_mask();
@@ -414,7 +424,8 @@ private:
                    int snap_pos = -1, int snap_slot = -1,
                    int kv_offset = 0,
                    const Qwen35ImageRows * images = nullptr,
-                   const std::vector<int> & restore_points = {});
+                   const std::vector<int> & restore_points = {},
+                   const std::vector<int32_t> * full_prompt = nullptr);
 
     // Speculative decode loop: draft → verify → accept until EOS/max.
     // The generation's controller observes every emitted token, including the
