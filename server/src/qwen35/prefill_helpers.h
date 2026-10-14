@@ -108,25 +108,185 @@ inline bool kvflash_restore_consume_enabled() {
     return v != nullptr && v[0] == '1' && v[1] == '\0';
 }
 
+// ─── DeltaNet state checkpoint ladder (S7) ────────────────────────
+// Recurrent state cannot be sliced back to an earlier position, so a prefix
+// reuse at common-prefix length L needs a state checkpoint at some C <= L.
+// Rungs, all multiples of `grid` (= the S6 batch ends): the system/tools head
+// (rounded down), every `stride` tokens, and the grid point at or below the
+// prompt end. A head < 0 (unknown) leaves that rung out.
+inline std::vector<int> kvflash_state_ladder_positions(int head, int end, int grid, int stride) {
+    std::vector<int> out;
+    if (grid <= 0 || end < grid) return out;
+    if (head >= grid) out.push_back(head / grid * grid);
+    if (stride > 0) {
+        const int s = (stride + grid - 1) / grid * grid;
+        for (int p = s; p <= end; p += s) out.push_back(p);
+    }
+    out.push_back(end / grid * grid);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    while (!out.empty() && out.back() > end) out.pop_back();
+    return out;
+}
+
+// Greatest checkpoint position C <= L, or -1. `positions` need not be sorted.
+inline int kvflash_ladder_pick(const std::vector<int> & positions, int L) {
+    int best = -1;
+    for (int c : positions) if (c <= L && c > best) best = c;
+    return best;
+}
+
+struct KvflashLadderEntry {
+    int      pos;
+    uint64_t tick;   // last use / insertion order; larger is newer
+};
+
+// Positions to evict (least recently used first) so that
+// entries.size() * ckpt_bytes <= budget_bytes. The head checkpoint (pos ==
+// head_pos) and the newest entry (greatest tick) are never evicted, so the
+// result may leave the store over budget when only those remain.
+inline std::vector<int> kvflash_ladder_evict(const std::vector<KvflashLadderEntry> & entries,
+                                             size_t budget_bytes, size_t ckpt_bytes,
+                                             int head_pos) {
+    std::vector<KvflashLadderEntry> cand;
+    uint64_t newest = 0;
+    for (const auto & e : entries) newest = std::max(newest, e.tick);
+    for (const auto & e : entries) {
+        if (e.pos != head_pos && e.tick != newest) cand.push_back(e);
+    }
+    std::sort(cand.begin(), cand.end(),
+              [](const KvflashLadderEntry & a, const KvflashLadderEntry & b) { return a.tick < b.tick; });
+    std::vector<int> out;
+    size_t total = entries.size() * ckpt_bytes;
+    for (const auto & e : cand) {
+        if (total <= budget_bytes) break;
+        out.push_back(e.pos);
+        total -= ckpt_bytes;
+    }
+    return out;
+}
+
+// LUCE_KVFLASH_SESSION is the one switch for KVFlash session restore: the DeltaNet
+// state ladder and live restore. Default ON (callers also require KVFlash itself
+// to be active); LUCE_KVFLASH_SESSION=0 turns both off. Pure so it is unit-testable.
+inline bool kvflash_session_flag(const char * v) {
+    return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+}
+
+inline bool kvflash_session_enabled() {
+    return kvflash_session_flag(std::getenv("LUCE_KVFLASH_SESSION"));
+}
+
+// History after a decode phase: history[0:base] followed by the generated ids
+// out_tokens[out_entry:]. Rebuilds from `base` rather than appending, so it is
+// idempotent over an AR fallback that already pushed some of the same ids.
+inline void kvflash_history_set_generated(std::vector<int32_t> & history, size_t base,
+                                          const std::vector<int32_t> & out_tokens,
+                                          size_t out_entry) {
+    history.resize(std::min(base, history.size()));
+    if (out_entry < out_tokens.size())
+        history.insert(history.end(), out_tokens.begin() + out_entry, out_tokens.end());
+}
+
+// Decision for a restore from the live session (S8a).
+//   L             longest common prefix of the prompt and the live history,
+//                 capped at cur_pos (the history is exact only up to there)
+//   C             checkpoint to resume from: greatest rung <= L, or -1. Also
+//                 capped at prompt_len-1: the last prompt token must run so
+//                 prefill produces the logits decode starts from.
+//   replay_from   first prompt index to prefill (C, or 0 without a rung)
+//   discard_above rungs strictly above this describe diverged history
+struct KvflashLiveRestore {
+    int L = 0;
+    int C = -1;
+    int replay_from = 0;
+    int discard_above = 0;
+};
+
+inline KvflashLiveRestore kvflash_live_restore_decide(
+        const std::vector<int32_t> & prompt, const std::vector<int32_t> & history,
+        int cur_pos, const std::vector<int> & ladder_positions) {
+    KvflashLiveRestore d;
+    const size_t cap = std::min<size_t>({prompt.size(), history.size(),
+                                         (size_t)std::max(cur_pos, 0)});
+    size_t l = 0;
+    while (l < cap && prompt[l] == history[l]) l++;
+    d.L = (int)l;
+    d.discard_above = d.L;
+    const int pickable = std::min(d.L, (int)prompt.size() - 1);
+    const int c = kvflash_ladder_pick(ladder_positions, pickable);
+    if (c > 0) { d.C = c; d.replay_from = c; }
+    return d;
+}
+
 // What a restore does with a snapshot. Dense: the existing path. Consume:
-// pooled snapshot, pager blob restored, only the suffix prefills. FullReprefill:
-// drop the snapshot and prefill the whole prompt from 0. Reject: fail the
-// request (a pooled snapshot cannot be used and the full prompt is unknown).
-enum class KvflashRestorePlan { Dense, Consume, FullReprefill, Reject };
+// pooled snapshot, pager blob restored, only the suffix prefills. AdoptDense:
+// dense snapshot whose prompt outgrows the pool; its rows already sit in the
+// pool tensor in the identity layout (chunk c in block c), so the pager adopts
+// them by bookkeeping and the pooled prefill continues from the cut.
+// FullReprefill: drop the snapshot and prefill the whole prompt from 0.
+// Reject: fail the request (a pooled snapshot cannot be used and the full
+// prompt is unknown).
+enum class KvflashRestorePlan { Dense, Consume, FullReprefill, Reject, AdoptDense };
 
 // A pooled snapshot resumes only at a whole pager chunk: a restored prefix
 // that ends mid-chunk would need the partial chunk re-sealed. Anything that
 // cannot consume must re-prefill the WHOLE prompt (never just the suffix).
+// adopt_dense (live restore on) keeps a dense prefix across the pool boundary.
 inline KvflashRestorePlan kvflash_restore_plan(bool consume_enabled, bool is_pooled,
                                                int kv_offset, int chunk_tokens,
-                                               bool have_full_prompt) {
-    if (!is_pooled) return KvflashRestorePlan::Dense;
+                                               bool have_full_prompt,
+                                               int total_tokens = 0, int pool_tokens = 0,
+                                               bool adopt_dense = false) {
+    if (!is_pooled) {
+        // A dense snapshot cannot continue into a pooled prefill unless the
+        // pager adopts its rows, so a prompt that outgrows the pool otherwise
+        // re-prefills whole.
+        if (have_full_prompt && pool_tokens > 0 && kv_offset > 0 &&
+            total_tokens > kv_offset && total_tokens > pool_tokens - chunk_tokens)
+            return adopt_dense ? KvflashRestorePlan::AdoptDense
+                               : KvflashRestorePlan::FullReprefill;
+        return KvflashRestorePlan::Dense;
+    }
     if (consume_enabled && kv_offset > 0 && chunk_tokens > 0 &&
         kv_offset % chunk_tokens == 0) {
         return KvflashRestorePlan::Consume;
     }
     return have_full_prompt ? KvflashRestorePlan::FullReprefill
                             : KvflashRestorePlan::Reject;
+}
+
+// Prompt tokens the server's snapshot lets the request skip under `plan`.
+inline int kvflash_server_cut(KvflashRestorePlan plan, int snap_pos) {
+    return plan == KvflashRestorePlan::FullReprefill || plan == KvflashRestorePlan::Reject
+        ? 0 : snap_pos;
+}
+
+// Server snapshot (restore_and_generate) or live session (S8a): the larger cut
+// wins, ties keep the server snapshot (no state restore needed). A live cut of
+// -1 means no usable rung.
+enum class KvflashResume { Server, Live };
+inline KvflashResume kvflash_pick_resume(int server_cut, int live_cut) {
+    return live_cut > server_cut ? KvflashResume::Live : KvflashResume::Server;
+}
+
+// Prompt tokens a restore would skip: the larger of the server snapshot's cut
+// (capped by the tokens the slot matches; 0 without a snapshot) and the live
+// session's cut. Mirrors the choice restore_and_generate_impl makes, so a
+// cache reports what the backend takes rather than what the snapshot holds.
+inline int kvflash_restorable_tokens(bool has_snapshot, bool consume_enabled, bool is_pooled,
+                                     int snap_pos, int slot_tokens, int chunk_tokens,
+                                     int prompt_tokens, int pool_tokens,
+                                     bool session_enabled, int live_cut) {
+    const int server = has_snapshot
+        ? std::min(slot_tokens,
+                   kvflash_server_cut(kvflash_restore_plan(consume_enabled, is_pooled, snap_pos,
+                                                           chunk_tokens, prompt_tokens > 0,
+                                                           prompt_tokens, pool_tokens,
+                                                           session_enabled),
+                                      snap_pos))
+        : 0;
+    return std::max({server, live_cut, 0});
 }
 
 // Token history for [0, kv_offset + suffix): real ids for the restored prefix

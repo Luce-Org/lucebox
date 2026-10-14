@@ -660,7 +660,8 @@ bool snapshot_target_cache(const TargetWeights & w,
                            ggml_backend_t backend,
                            PrefixSnapshot & snap,
                            bool skip_kv = false,
-                           const std::vector<uint8_t> * kvflash_blob = nullptr);
+                           const std::vector<uint8_t> * kvflash_blob = nullptr,
+                           bool skip_target_feat = false);  // no drafter: omit the feature ring
 
 // Restore `cache` from `snap`. cache must already exist (created via
 // create_target_cache) and have matching shapes. Sets cache.cur_pos =
