@@ -507,6 +507,11 @@ the same arguments the restore itself uses, so callers such as prefix-cache
 accounting see what the backend will take rather than what the snapshot holds.
 With KVFlash inactive it returns `slot_tokens`.
 
+PFlash admission uses it too: `HttpServer::ram_restorable_prefix_tokens` finds the
+snapshot the prefix cache would restore (or none) and returns the backend's
+answer for it, so a KVFlash live session counts as restorable even when the
+cache holds no matching snapshot.
+
 ## File Map
 
 | File | Role |
