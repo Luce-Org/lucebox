@@ -2471,7 +2471,10 @@ if(LUCE_TESTS)
             test/unit/test_ds4_spec_sampling.cpp
             test/unit/test_ds4_env.cpp
             test/unit/test_kvflash_ubatch.cpp
+            test/unit/test_kvflash_state_ladder.cpp
             test/unit/test_kvflash_restore_plan.cpp
+            test/unit/test_kvflash_live_restore.cpp
+            test/unit/test_kvflash_resume.cpp
             test/unit/test_qwen35_mask_upload.cpp
             test/unit/test_adaptive_keep_ratio.cpp
             test/unit/test_skip_park_guard.cpp

@@ -455,8 +455,9 @@ cache staging, preventing disk loads from overwriting a live in-memory entry.
 KVFlash (the `--kvflash` option) keeps only a fixed pool of KV rows on the GPU and
 pages the rest. That breaks the ordinary prefix snapshot, which copies rows
 assuming they sit contiguously, so the Qwen3.5 backend has its own restore
-paths. The switch is listed in [ENVIRONMENT.md](ENVIRONMENT.md)
-(`LUCE_KVFLASH_RESTORE_CONSUME`).
+paths. The switches are listed in [ENVIRONMENT.md](ENVIRONMENT.md)
+(`LUCE_KVFLASH_SESSION`, `LUCE_KVFLASH_RESTORE_CONSUME`,
+`LUCE_KVFLASH_STATE_LADDER_MIB`).
 
 **Pooled snapshots.** When the live cache has outgrown the pool (or the pager
 is no longer identity-mapped), a snapshot is saved as a pager blob stored inside
@@ -477,11 +478,34 @@ tokens after the snapshot. Without it a pooled snapshot is dropped and the
 request re-prefills the whole prompt from position 0. A pooled snapshot is
 never read as a dense snapshot and never half-applied.
 
+**DeltaNet state ladder and live restore.** Qwen3.5 layers include DeltaNet
+(recurrent) layers whose state cannot be rebuilt from KV rows. While a pooled
+prefill runs, the backend captures state-only checkpoints (recurrent and
+convolution state, no KV) at ladder positions, evicting the least recently used
+ones past `LUCE_KVFLASH_STATE_LADDER_MIB` (default 3072). The KV rows of the
+running session are still in the pool, so a new request whose prompt shares a
+prefix with the live session can resume from the largest checkpoint at or
+below the shared prefix, without any saved snapshot. The ladder is cleared at
+every cold prefill and is not used with paged attention.
+
+**Choosing the resume point.** For each request the backend compares the
+server snapshot cut (0 if the snapshot is dropped or refused) with the live cut
+and takes the larger. A tie keeps the server snapshot, which needs no state
+restore.
+
 **512-token prefill grid.** Pooled prefill (a prompt too long for the pool, or a suffix prefill after a pooled
-restore) runs on an absolute grid of 512 tokens, a multiple of the
+restore; independent of `LUCE_KVFLASH_SESSION`) runs on an absolute grid of 512 tokens, a multiple of the
 64-token chunk. A batch never starts off the grid
 except the first one after an off-grid resume, so where a cut falls does not
 depend on where an earlier request started.
+
+**`restorable_prefix` hook.** `ModelBackend::restorable_prefix(prompt, slot,
+slot_tokens)` returns how many prompt tokens a restore would actually skip. The
+default returns `slot_tokens` (trust the snapshot). The Qwen3.5 backend
+returns the larger of the server snapshot cut and the live cut, computed from
+the same arguments the restore itself uses, so callers such as prefix-cache
+accounting see what the backend will take rather than what the snapshot holds.
+With KVFlash inactive it returns `slot_tokens`.
 
 ## File Map
 

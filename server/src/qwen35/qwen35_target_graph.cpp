@@ -2826,7 +2826,8 @@ static bool create_dense_snapshot_layout(const TargetWeights & w,
                                          const TargetCache & cache,
                                          int token_count,
                                          PrefixSnapshot & snap,
-                                         bool skip_kv = false) {
+                                         bool skip_kv = false,
+                                         bool skip_target_feat = false) {
     const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
     const int n_delta     = w.n_layer - n_full_attn;               // 48
     const int total_tensors = (skip_kv ? 0 : 2 * n_full_attn) + 2 * n_delta + 1; // 65
@@ -2875,7 +2876,7 @@ static bool create_dense_snapshot_layout(const TargetWeights & w,
     }
 
     // Right-sized target_feat: [fc_in, min(token_count, target_feat_cap)]
-    if (cache.target_feat) {
+    if (cache.target_feat && !skip_target_feat) {
         ggml_tensor * tf = cache.target_feat;
         const int feat_len = std::min(token_count, cache.target_feat_cap);
         snap.target_feat_snap = ggml_new_tensor_2d(snap.ctx, tf->type, tf->ne[0], feat_len);
@@ -2905,7 +2906,8 @@ bool snapshot_target_cache(const TargetWeights & w,
                            ggml_backend_t backend,
                            PrefixSnapshot & snap,
                            bool skip_kv,
-                           const std::vector<uint8_t> * kvflash_blob) {
+                           const std::vector<uint8_t> * kvflash_blob,
+                           bool skip_target_feat) {
     if (cache.n_seq_slots > 1) {
         set_last_error("snapshot_target_cache: multi-slot caches are unsupported");
         return false;
@@ -2929,7 +2931,7 @@ bool snapshot_target_cache(const TargetWeights & w,
         snap.cur_pos != snap_pos;
     if (needs_alloc) {
         free_prefix_snapshot(snap);
-        if (!create_dense_snapshot_layout(w, cache, snap_pos, snap, skip_kv)) {
+        if (!create_dense_snapshot_layout(w, cache, snap_pos, snap, skip_kv, skip_target_feat)) {
             set_last_error("PrefixSnapshot ggml_init failed");
             return false;
         }
