@@ -9072,6 +9072,33 @@ struct ShortInlineSnapshotBackend : MockBackend {
     }
 };
 
+// The default snapshot_detach feeds the disk writer; a pooled (KVFlash)
+// snapshot keeps its KV in a pager blob outside the exported ggml context, so
+// it must never be detached as if it were a full dense state.
+struct PooledRefBackend : MockBackend {
+    ggml_context * ctx = nullptr;
+    int freed = 0;
+    SnapshotRef snapshot_ref(int) const override {
+        SnapshotRef r;
+        r.ctx = ctx;
+        r.cur_pos = 4096;
+        r.pooled = true;
+        return r;
+    }
+    void snapshot_free(int) override { freed++; }
+};
+
+TEST_CASE(ServerUnitFixture, test_default_snapshot_detach_refuses_pooled_snapshots) {
+    ggml_init_params ip{1 << 16, nullptr, true};
+    PooledRefBackend backend;
+    backend.ctx = ggml_init(ip);
+    TEST_ASSERT(backend.ctx != nullptr);
+    OwnedSnapshot out = backend.snapshot_detach(0);
+    TEST_ASSERT(out.empty());
+    TEST_ASSERT(backend.freed == 1);
+    ggml_free(backend.ctx);
+}
+
 // Qwen saves at the chunk boundary at or before the requested cut. The entry
 // stays keyed at the requested cut so the next request treats that cut as
 // covered and deepens past it; only the disk/shutdown key uses the saved rows.
