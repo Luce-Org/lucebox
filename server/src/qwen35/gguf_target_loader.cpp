@@ -559,6 +559,9 @@ bool load_target_gguf_partial(const std::string & path,
         std::printf("[loader] eos_id=%d eos_chat_id=%d\n", out.eos_id, out.eos_chat_id);
     }
     out.image_pad_id = find_token_id(gctx, QWEN35_IMAGE_PAD_TOKEN);
+    out.im_start_id  = find_token_id(gctx, "<|im_start|>");
+    out.assistant_id = find_token_id(gctx, "assistant");
+    out.newline_id   = find_token_id(gctx, "\xC4\x8A");   // byte-level BPE "\n"
 
     // Compute capture layer IDs: evenly spaced through the target layers.
     // step = (n_layer - 2) / (N - 1), ids[k] = 1 + k * step.
