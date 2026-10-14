@@ -493,11 +493,21 @@ server snapshot cut (0 if the snapshot is dropped or refused) with the live cut
 and takes the larger. A tie keeps the server snapshot, which needs no state
 restore.
 
+**Turn checkpoints.** At generation end the backend records a checkpoint at the
+final cache position, and the prompt is cut at chat turn boundaries, so the
+next turn can resume exactly where the last one ended. These belong to the same
+switch: `LUCE_KVFLASH_SESSION=0` disables the ladder, live restore, and turn
+checkpoints together. It is on by default and only matters when KVFlash is
+active.
+
 **512-token prefill grid.** Pooled prefill (a prompt too long for the pool, or a suffix prefill after a pooled
 restore; independent of `LUCE_KVFLASH_SESSION`) runs on an absolute grid of 512 tokens, a multiple of the
 64-token chunk. A batch never starts off the grid
 except the first one after an off-grid resume, so where a cut falls does not
-depend on where an earlier request started.
+depend on where an earlier request started. Turn cuts (only with the session
+switch on) are the only other batch boundaries, and they depend only on the prompt tokens, so a restore at a cut
+replays exactly the batches a cold prefill runs from there on. This is what
+lets restored and cold answers match byte for byte.
 
 **`restorable_prefix` hook.** `ModelBackend::restorable_prefix(prompt, slot,
 slot_tokens)` returns how many prompt tokens a restore would actually skip. The

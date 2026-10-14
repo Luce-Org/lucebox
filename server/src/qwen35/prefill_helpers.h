@@ -83,17 +83,29 @@ inline int kvflash_pooled_ubatch(int prefill_ubatch, int chunk_tokens, int pool_
 // end-of-prompt remainder (as in the dense path); the GPU gate covers
 // remainders 1..64. If max_batch < grid the grid shrinks to max_batch; a
 // max_batch that is not a multiple of the grid is rounded down to one.
-inline int kvflash_prefill_batch_end(int pos, int end, int grid, int max_batch) {
+//
+//
+// S9b: `cuts` are extra batch boundaries off the grid (kvflash_turn_cuts): a
+// batch that would straddle one ends there, and the batch after it runs to the
+// next grid point. The cut set is a pure function of the prompt tokens and is
+// applied on every prefill, so a restore at any cut replays exactly the
+// batches a cold prefill runs from there on. Cuts at or before `pos` or at or
+// after the natural end are no-ops.
+inline int kvflash_prefill_batch_end(int pos, int end, int grid, int max_batch,
+                                     const std::vector<int> & cuts = {}) {
     const int g = max_batch < grid ? std::max(1, max_batch) : grid;
     const int maxb = (std::max(max_batch, 1) / g) * g;
-    return std::min(end, ((pos + maxb) / g) * g);
+    int e = std::min(end, ((pos + maxb) / g) * g);
+    for (int c : cuts) if (c > pos && c < e) e = c;
+    return e;
 }
 
 inline std::vector<std::pair<int, int>> kvflash_prefill_batches(int start, int end, int grid,
-                                                                int max_batch) {
+                                                                int max_batch,
+                                                                const std::vector<int> & cuts = {}) {
     std::vector<std::pair<int, int>> out;
     for (int pos = start; pos < end;) {
-        const int e = kvflash_prefill_batch_end(pos, end, grid, max_batch);
+        const int e = kvflash_prefill_batch_end(pos, end, grid, max_batch, cuts);
         out.emplace_back(pos, e);
         pos = e;
     }
@@ -113,8 +125,10 @@ inline bool kvflash_restore_consume_enabled() {
 // reuse at common-prefix length L needs a state checkpoint at some C <= L.
 // Rungs, all multiples of `grid` (= the S6 batch ends): the system/tools head
 // (rounded down), every `stride` tokens, and the grid point at or below the
-// prompt end. A head < 0 (unknown) leaves that rung out.
-inline std::vector<int> kvflash_state_ladder_positions(int head, int end, int grid, int stride) {
+// prompt end. A head < 0 (unknown) leaves that rung out. S9b: `turn_cut` > 0
+// (the off-grid turn rung, see kvflash_turn_cut) is added when it is <= end.
+inline std::vector<int> kvflash_state_ladder_positions(int head, int end, int grid, int stride,
+                                                       int turn_cut = -1) {
     std::vector<int> out;
     if (grid <= 0 || end < grid) return out;
     if (head >= grid) out.push_back(head / grid * grid);
@@ -123,10 +137,37 @@ inline std::vector<int> kvflash_state_ladder_positions(int head, int end, int gr
         for (int p = s; p <= end; p += s) out.push_back(p);
     }
     out.push_back(end / grid * grid);
+    if (turn_cut > 0) out.push_back(turn_cut);
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
     while (!out.empty() && out.back() > end) out.pop_back();
     return out;
+}
+
+// S9b turn cuts: every position just after an `<|im_start|> assistant \n` header,
+// ascending, excluding a header that ends the prompt. The turn rung is the last one.
+// Pend - k for the last one: the position just after the last `<|im_start|> assistant \n`
+// header of `prompt`, i.e. Pend - k, where k is the length of the generation
+// suffix (the think block). The next turn's template re-renders the assistant
+// turn as `<|im_start|>assistant\n` + content, so its common prefix with this
+// prompt ends exactly here. -1 when there is no header, an id is unknown (< 0),
+// or the header ends the prompt (nothing after it, k = 0: no use).
+inline std::vector<int> kvflash_turn_cuts(const std::vector<int32_t> & prompt, int32_t im_start,
+                                          int32_t assistant, int32_t newline) {
+    std::vector<int> out;
+    if (im_start < 0 || assistant < 0 || newline < 0) return out;
+    for (int i = 3; i < (int)prompt.size(); i++) {
+        if (prompt[i - 3] == im_start && prompt[i - 2] == assistant && prompt[i - 1] == newline)
+            out.push_back(i);
+    }
+    return out;
+}
+
+// The last of them (the generation prompt of the turn), or -1.
+inline int kvflash_turn_cut(const std::vector<int32_t> & prompt, int32_t im_start,
+                            int32_t assistant, int32_t newline) {
+    const std::vector<int> c = kvflash_turn_cuts(prompt, im_start, assistant, newline);
+    return c.empty() ? -1 : c.back();
 }
 
 // Greatest checkpoint position C <= L, or -1. `positions` need not be sorted.
@@ -167,14 +208,23 @@ inline std::vector<int> kvflash_ladder_evict(const std::vector<KvflashLadderEntr
 }
 
 // LUCE_KVFLASH_SESSION is the one switch for KVFlash session restore: the DeltaNet
-// state ladder and live restore. Default ON (callers also require KVFlash itself
-// to be active); LUCE_KVFLASH_SESSION=0 turns both off. Pure so it is unit-testable.
+// state ladder, live restore, generation-end checkpoint (S9) and per-turn
+// checkpoints (S9b). Default ON (callers also require KVFlash itself to be
+// active); LUCE_KVFLASH_SESSION=0 turns all four off. Pure so it is unit-testable.
 inline bool kvflash_session_flag(const char * v) {
     return !(v != nullptr && v[0] == '0' && v[1] == '\0');
 }
 
 inline bool kvflash_session_enabled() {
     return kvflash_session_flag(std::getenv("LUCE_KVFLASH_SESSION"));
+}
+
+// Position of the generation-end checkpoint: cur_pos, where KV and DeltaNet
+// state hold exactly history[0:cur_pos] (a final pending token is in the
+// history but not in KV). -1 when the history does not cover cur_pos, e.g. a
+// decode path that does not record generated ids.
+inline int kvflash_gen_ckpt_pos(int cur_pos, size_t history_size) {
+    return cur_pos > 0 && history_size >= (size_t)cur_pos ? cur_pos : -1;
 }
 
 // History after a decode phase: history[0:base] followed by the generated ids

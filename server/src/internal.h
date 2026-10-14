@@ -246,6 +246,10 @@ struct TargetWeights {
     // Token the chat template repeats once per image token; -1 when the
     // vocabulary has none (a model without image input).
     int32_t image_pad_id = -1;
+    // Chat-header token ids for the KVFlash turn rung (S9b); -1 when absent.
+    int32_t im_start_id  = -1;
+    int32_t assistant_id = -1;
+    int32_t newline_id   = -1;
 
     // DFlash noise mask token ID (from target tokenizer, used by draft model).
     // Default: Qwen tokenizer's mask token. Overridden by GGUF metadata if available.
