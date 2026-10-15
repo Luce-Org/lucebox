@@ -103,6 +103,9 @@ struct GenerateResult {
     double decode_s = 0.0;
     // Prompt tokens confirmed by the backend's physical snapshot restore.
     int restored_prefix_tokens = 0;
+    // The backend decided the cut of a restore itself, so restored_prefix_tokens
+    // is authoritative even at 0 (a snapshot it dropped for a full re-prefill).
+    bool restore_cut_reported = false;
     // Distinguishes engine-injected thinking closure from a natural close.
     bool budget_forced_close = false;
     // True when the post-close watchdog stopped a repetition loop.
@@ -135,5 +138,16 @@ struct GenerateResult {
         error = GenerateError{code, std::move(detail)};
     }
 };
+
+// The prefix_len the chat DONE line reports: the server's own (snapshot or
+// disk-hit position) unless the backend made the cut. A backend that does not
+// set restore_cut_reported keeps the old rule: its cut only counts when the
+// server restored nothing.
+inline int reported_prefix_len(bool using_restore, int server_prefix_len,
+                               const GenerateResult & result) {
+    if (result.restore_cut_reported) return result.restored_prefix_tokens;
+    return (!using_restore && result.restored_prefix_tokens > 0)
+        ? result.restored_prefix_tokens : server_prefix_len;
+}
 
 } // namespace luce::common

@@ -3,6 +3,7 @@
 // chunks, and the state-ladder rungs a dense prefill can capture.
 // CPU only, no GPU.
 #include "CppUnitTestFramework.hpp"
+#include "../../src/common/generation_types.h"
 #include "../../src/common/kvflash_pager.h"
 #include "../../src/qwen35/prefill_helpers.h"
 
@@ -120,4 +121,32 @@ TEST_CASE(KvflashResumeFixture, dense_rung_bounds_replay_to_one_cell_plus_new_to
     CHECK(rungs.back() == 7680);
     CHECK(kvflash_ladder_pick(rungs, 8108) == 7680);
     CHECK(8108 - 7680 < 512 + 13);
+}
+
+// ── the prefix_len the chat DONE line reports ───────────────────────
+
+TEST_CASE(KvflashResumeFixture, prefix_len_is_the_backends_cut_after_a_reprefill) {
+    GenerateResult r;
+    r.restored_prefix_tokens = 0;
+    r.restore_cut_reported = true;
+    // Disk hit of 11600 rows that the backend dropped for a full re-prefill.
+    CHECK(reported_prefix_len(true, 11600, r) == 0);
+    // A live-session cut larger or smaller than the server's snapshot.
+    r.restored_prefix_tokens = 13917;
+    CHECK(reported_prefix_len(true, 11954, r) == 13917);
+    r.restored_prefix_tokens = 512;
+    CHECK(reported_prefix_len(true, 11954, r) == 512);
+}
+
+TEST_CASE(KvflashResumeFixture, prefix_len_keeps_other_backends_numbers) {
+    GenerateResult r;  // restore_cut_reported stays false
+    // Restore: the server's snapshot length, whatever the backend counted.
+    CHECK(reported_prefix_len(true, 900, r) == 900);
+    r.restored_prefix_tokens = 900;
+    CHECK(reported_prefix_len(true, 900, r) == 900);
+    // No restore, backend reports a cut (live session): the cut.
+    CHECK(reported_prefix_len(false, 0, r) == 900);
+    // No restore, no cut.
+    r.restored_prefix_tokens = 0;
+    CHECK(reported_prefix_len(false, 0, r) == 0);
 }
