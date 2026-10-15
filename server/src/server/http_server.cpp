@@ -10167,9 +10167,9 @@ void HttpServer::process_job(ServerJob * job) {
             finish.c_str(),
             using_restore ? "true" : "false",
             cache_slot,
-            // The cut the backend actually made (live-session restore), else the server's.
-            (!using_restore && result.restored_prefix_tokens > 0)
-                ? result.restored_prefix_tokens : prefix_len,
+            // The cut the backend actually made (live-session restore, or 0 after a
+            // re-prefill of a snapshot it dropped), else the server's.
+            luce::common::reported_prefix_len(using_restore, prefix_len, result),
             result.prefill_s,
             result.decode_s,
             decode_tok_s,
