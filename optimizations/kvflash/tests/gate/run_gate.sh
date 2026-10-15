@@ -4,6 +4,7 @@
 #   MODE = dflash2 : the same with a DFlash2 draft model (needs KV_DRAFT=<draft.gguf>)
 # Required: KV_GATE_DIR (output, lock and TMPDIR live under it), KV_MODEL. Optional: KV_DRAFT, KV_PORT.
 # The caller picks the GPU (export CUDA_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES); this script sets no device variable.
+# Each arm gets its own empty disk KV cache ($KV_GATE_DIR/kv-cache-A, -B), so arm A is a cold prefill whatever is in ~/.cache.
 # Parity: default KV type, --max-ctx 131072, --kvflash 8192, temp 0 seed 1, turn-1 ~12500 filler tokens (G4_T1),
 # 10 turns, max_tokens 80. One server at a time (flock).
 set -u
@@ -21,7 +22,7 @@ exec 9>"$G/server.lock"; flock -n 9 || { echo "another gate holds the lock" >&2;
 pgrep -x luce_server >/dev/null && { echo "a luce_server is already running" >&2; exit 3; }
 echo "bin=$BIN md5=$(md5sum "$BIN" | cut -d' ' -f1) mode=$MODE turns=$TURNS out=$D" | tee "$D/provenance.txt"
 cd "$HERE/scripts"
-python3 -I gate4_live.py A > "$D/gate4_A.out" 2>&1 || { echo "arm A failed, see $D/gate4_A.out"; exit 1; }
-python3 -I gate4_live.py B > "$D/gate4_B.out" 2>&1 || { echo "arm B failed, see $D/gate4_B.out"; exit 1; }
+KV_CACHE_DIR=$G/kv-cache-A python3 -I gate4_live.py A > "$D/gate4_A.out" 2>&1 || { echo "arm A failed, see $D/gate4_A.out"; exit 1; }
+KV_CACHE_DIR=$G/kv-cache-B python3 -I gate4_live.py B > "$D/gate4_B.out" 2>&1 || { echo "arm B failed, see $D/gate4_B.out"; exit 1; }
 python3 -I cmp_gate.py "$D" | tee "$D/cmp.out"
 exit "${PIPESTATUS[0]}"
