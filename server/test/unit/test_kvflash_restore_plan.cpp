@@ -61,7 +61,23 @@ TEST_CASE(KvflashRestorePlanFixture, dense_restore_inside_the_pool_stays_dense) 
     CHECK(kvflash_restore_plan(false, false, 7039, 64, true, 8192 - 63, 8192) == KvflashRestorePlan::FullReprefill);
     // kvflash off (pool 0) or an exact hit: untouched.
     CHECK(kvflash_restore_plan(false, false, 7039, 64, true, 20000, 0) == KvflashRestorePlan::Dense);
-    CHECK(kvflash_restore_plan(false, false, 9000, 64, true, 9000, 8192) == KvflashRestorePlan::Dense);
+    CHECK(kvflash_restore_plan(false, false, 8192, 64, true, 8192, 8192) == KvflashRestorePlan::Dense);
+}
+
+// A dense snapshot longer than the pool (a disk entry written by a server with
+// no pool, or a larger one) cannot be written into the pool tensor, whatever
+// the prompt length and whether or not the pager may adopt dense rows.
+TEST_CASE(KvflashRestorePlanFixture, dense_snapshot_longer_than_the_pool_always_reprefills) {
+    // Exact hit: nothing left to prefill, still too long for the pool.
+    CHECK(kvflash_restore_plan(false, false, 9000, 64, true, 9000, 8192) == KvflashRestorePlan::FullReprefill);
+    CHECK(kvflash_restore_plan(false, false, 11600, 64, true, 11606, 8192, /*adopt_dense=*/true) == KvflashRestorePlan::FullReprefill);
+    CHECK(kvflash_restore_plan(false, false, 11600, 64, true, 11606, 8192, false) == KvflashRestorePlan::FullReprefill);
+    CHECK(kvflash_restore_plan(false, false, 8193, 64, true, 8193, 8192, true) == KvflashRestorePlan::FullReprefill);
+    // No prompt to re-prefill from: refuse rather than write out of bounds.
+    CHECK(kvflash_restore_plan(false, false, 11600, 64, false, 0, 8192, true) == KvflashRestorePlan::Reject);
+    // The server cut of a re-prefill is 0, so nothing is reported restorable.
+    CHECK(luce::common::kvflash_restorable_tokens(true, false, false, 11600, 11600, 64, 11606, 8192,
+                                    /*session=*/true, -1) == 0);
 }
 
 // ---- restorable prefix: the cut a restore would take ----------------------

@@ -55,6 +55,9 @@ TEST_CASE(KvflashResumeFixture, dense_over_pool_adopts_only_when_enabled) {
     // Without the full prompt there is nothing to adopt into.
     CHECK(kvflash_restore_plan(false, false, 8089, 64, false, 9435, 8192, true)
           == KvflashRestorePlan::Dense);
+    // Adoption keeps rows already in the pool tensor: a snapshot longer than the pool has none.
+    CHECK(kvflash_restore_plan(false, false, 8193, 64, true, 9435, 8192, true)
+          == KvflashRestorePlan::FullReprefill);
 }
 
 // Dense prefill places chunk c in block c. A fresh pager hands blocks out in
