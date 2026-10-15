@@ -1,5 +1,5 @@
 """Shared helpers for KVFlash GPU gates. Python 3 stdlib only. Run with python3 -I."""
-import json, os, subprocess, time, urllib.request, signal, re
+import json, os, shutil, subprocess, time, urllib.request, signal, re
 
 ROOT = os.environ["KV_ROOT"]  # per-run output dir (required)
 BIN = os.environ["KV_BIN"]  # luce_server binary (required)
@@ -21,8 +21,13 @@ class Server:
             if k.startswith("LUCE_KVFLASH_"):
                 del e[k]
         e.update(self.env)
+        # The disk KV cache never carries state in from outside or from an earlier
+        # server: KV_CACHE_DIR (required) is emptied at every start and passed as --kv-cache-dir.
+        cdir = os.environ["KV_CACHE_DIR"]
+        shutil.rmtree(cdir, ignore_errors=True)
+        os.makedirs(cdir)
         args = [BIN, MODEL, "--host", "127.0.0.1", "--port", str(PORT), "--max-ctx", MAX_CTX,
-                "--kvflash", POOL, "--model-name", "luce"] + os.environ.get("KV_EXTRA", "").split() + self.extra
+                "--kvflash", POOL, "--model-name", "luce"] + ["--kv-cache-dir", cdir] + os.environ.get("KV_EXTRA", "").split() + self.extra
         self.f = open(self.log, "w")
         self.p = subprocess.Popen(args, stdout=self.f, stderr=subprocess.STDOUT, env=e,
                                   stdin=subprocess.DEVNULL)
