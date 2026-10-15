@@ -33,6 +33,11 @@ probe answer with a cold reference (a fresh server that sees only that probe).
 
 ## Parity settings
 
+Disk KV cache: every server starts on its own empty `--kv-cache-dir` under
+`KV_GATE_DIR` (`kv-cache-A`, `kv-cache-B`, `kv-cache-scenarios`), so no entry from
+`~/.cache` or from an earlier run can turn a cold arm into a restore. Check
+`disk_hit=false` in the `chat CACHE` lines.
+
 Both arms and all references use the same settings: the same model file,
 default KV cache type, `--max-ctx 131072`, `--kvflash 8192` (pool size in
 tokens), temperature 0, seed 1, a first turn of about 12500 filler tokens, 10
