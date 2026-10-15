@@ -2146,7 +2146,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     }
     if (plan == KvflashRestorePlan::Reject) {
         result.fail(GenerateErrorCode::BackendSpecific,
-                    "kvflash: pooled snapshot cannot be restored (misaligned or "
+                    "kvflash: snapshot cannot be restored (misaligned pooled or longer than the pool, or "
                     "consume off) and the request carries no prompt to re-prefill");
         out_io.emit(-1);
         return result;
