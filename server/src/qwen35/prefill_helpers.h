@@ -239,6 +239,12 @@ inline KvflashRestorePlan kvflash_restore_plan(bool consume_enabled, bool is_poo
                                                int total_tokens = 0, int pool_tokens = 0,
                                                bool adopt_dense = false) {
     if (!is_pooled) {
+        // The pool tensor holds pool_tokens rows: a longer dense snapshot (a disk
+        // entry from a server with no pool or a larger one) cannot be written
+        // into it, not even to be adopted. Re-prefill whole.
+        if (pool_tokens > 0 && kv_offset > pool_tokens)
+            return have_full_prompt ? KvflashRestorePlan::FullReprefill
+                                    : KvflashRestorePlan::Reject;
         // A dense snapshot cannot continue into a pooled prefill unless the
         // pager adopts its rows, so a prompt that outgrows the pool otherwise
         // re-prefills whole.
