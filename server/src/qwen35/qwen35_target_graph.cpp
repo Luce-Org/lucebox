@@ -3053,6 +3053,12 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
             return false;
         }
         if (!sk || !dk || !sv || !dv) continue;
+        // A bounded KVFlash pool allocates fewer rows than max_ctx: a dense
+        // snapshot longer than the pool must not be written into it.
+        if (snap_pos > dk->ne[1] || snap_pos > dv->ne[1]) {
+            set_last_error("restore_target_cache: snapshot longer than the KV cache rows");
+            return false;
+        }
         const size_t k_strip = (size_t)snap_pos * sk->nb[1];
         const size_t v_strip = (size_t)snap_pos * sv->nb[1];
         for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
