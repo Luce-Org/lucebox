@@ -1979,6 +1979,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                &req.prompt);
         // Publish the cut actually made (the server reports it as pt/prefix_len).
         result.restored_prefix_tokens = live_cut;
+        result.restore_cut_reported = true;
     } else {
         committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot,
                                /*kv_offset=*/0, has_images ? &image_rows : nullptr,
@@ -2213,6 +2214,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
 
     cache_.cur_pos = full_reprefill ? 0 : snap_pos;
     result.restored_prefix_tokens = full_reprefill ? 0 : snap_pos;
+    result.restore_cut_reported = true;
 
     // FIX(prefix-cache + spec-decode): restore_target_cache brings back KV /
     // recurrent state / target_feat, but the draft-side feature mirror is left
@@ -2295,6 +2297,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         reset_recurrent_state(cache_);
         cache_.cur_pos = 0;
         result.restored_prefix_tokens = 0;
+        result.restore_cut_reported = true;
         auto t_prefill_start = std::chrono::steady_clock::now();
         committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot,
                                /*kv_offset=*/0, nullptr, req.restore_points);
