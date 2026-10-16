@@ -121,7 +121,9 @@ KvFlashConfig race_cfg() {
 
 // Returns the number of chunks whose bytes differ from rpat after the run;
 // throws on any setup or CUDA failure.
-int run_round(int n_chunks) {
+// `wire_stream`: register the compute stream with the pager (device-side wait,
+// what Qwen35Backend does) instead of relying on the default host wait.
+int run_round(int n_chunks, bool wire_stream) {
     CudaHarness h;
     KvFlashPager p;
     need(p.attach(race_cfg(), h.k, h.v), "pager attach failed");
@@ -131,6 +133,7 @@ int run_round(int n_chunks) {
     std::vector<uint8_t *> staging;
     int bad = 0;
     try {
+        if (wire_stream) p.set_compute_stream(cs);
         for (int c = 0; c < n_chunks; c++) {         // all host work up front
             uint8_t * st = nullptr;
             cu(cudaMallocHost(&st, h.chunk_bytes()), "cudaMallocHost(staging)");
@@ -198,18 +201,18 @@ int race_rounds() {
 }
 
 // Corrupted chunks over all rounds. Returns "" or the failure message.
-std::string stress(int & corrupted_chunks) {
+std::string stress(bool wire_stream, int & corrupted_chunks) {
     try {
         const int rounds = race_rounds();
         int corrupted_rounds = 0;
         corrupted_chunks = 0;
         for (int r = 0; r < rounds; r++) {
-            const int bad = run_round(24);
+            const int bad = run_round(24, wire_stream);
             corrupted_rounds += bad > 0;
             corrupted_chunks += bad;
         }
-        std::fprintf(stderr, "[race] rounds=%d corrupted_rounds=%d corrupted_chunks=%d\n",
-                     rounds, corrupted_rounds, corrupted_chunks);
+        std::fprintf(stderr, "[race] wire_stream=%d rounds=%d corrupted_rounds=%d corrupted_chunks=%d\n",
+                     (int)wire_stream, rounds, corrupted_rounds, corrupted_chunks);
     } catch (const std::exception & e) {
         return e.what();
     }
@@ -221,6 +224,41 @@ std::string stress(int & corrupted_chunks) {
 TEST_CASE(KvflashPagerCudaRaceFixture, reused_slot_write_is_ordered_after_queued_page_out) {
     if (ggml_backend_cuda_get_device_count() < 1) SKIP("no CUDA device");
     int bad = -1;
-    CHECK_EQUAL(stress(bad), std::string());
+    CHECK_EQUAL(stress(/*wire_stream=*/false, bad), std::string());
     CHECK_EQUAL(bad, 0);
+}
+
+TEST_CASE(KvflashPagerCudaRaceFixture, reused_slot_write_is_ordered_with_registered_compute_stream) {
+    if (ggml_backend_cuda_get_device_count() < 1) SKIP("no CUDA device");
+    int bad = -1;
+    CHECK_EQUAL(stress(/*wire_stream=*/true, bad), std::string());
+    CHECK_EQUAL(bad, 0);
+}
+
+// attach() must drop a registered compute stream: the caller may destroy it
+// before reattaching, and a stale handle must never be waited on. A failed
+// wait on a destroyed stream aborts the process, so a regression here shows up
+// as a crashed test run, not a failed check; the test detects only what the
+// CUDA runtime reports for a destroyed handle (it may not report it, and on
+// HIP builds the registered stream is ignored altogether). It needs no GPU fault.
+TEST_CASE(KvflashPagerCudaRaceFixture, reattach_forgets_a_destroyed_compute_stream) {
+    if (ggml_backend_cuda_get_device_count() < 1) SKIP("no CUDA device");
+    std::string err;
+    try {
+        CudaHarness h;
+        KvFlashPager p;
+        need(p.attach(race_cfg(), h.k, h.v), "pager attach failed");
+        cudaStream_t cs = nullptr;
+        cu(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking), "cudaStreamCreateWithFlags");
+        p.set_compute_stream(cs);
+        cu(cudaStreamDestroy(cs), "cudaStreamDestroy");
+        need(p.attach(race_cfg(), h.k, h.v), "pager reattach failed");
+        for (int c = 0; c < 24; c++)                 // fills the pool and pages out
+            need(p.slot_for((int64_t)c * kRChunk) >= 0, "slot_for failed after reattach");
+        p.synchronize_paging();
+        cu(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    } catch (const std::exception & e) {
+        err = e.what();
+    }
+    CHECK_EQUAL(err, std::string());
 }

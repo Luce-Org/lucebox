@@ -654,6 +654,11 @@ bool Qwen35Backend::init() {
             std::fprintf(stderr, "kvflash: pager attach failed (pool=%d)\n", kvflash_tokens_);
             return false;
         }
+        // Page-out and recall run on the pager's own stream; make the compute
+        // stream wait for them on the device before it touches a reused slot
+        // (without this, slot_for() waits on the host instead).
+        if (!tensor_parallel_ && target_backend_ && ggml_backend_is_cuda(target_backend_))
+            kvflash_pager_.set_compute_stream(ggml_backend_cuda_get_stream(target_backend_));
         if (kvflash_qk_policy_) {
             KvFlashQkDims qd;
             qd.n_layers   = (int)cache_.attn_k.size();
