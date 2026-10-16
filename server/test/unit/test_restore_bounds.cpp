@@ -90,3 +90,22 @@ TEST_CASE(RestoreBoundsFixture, dense_snapshot_that_fits_the_kv_rows_restores) {
     CHECK(r.cache.cur_pos == 8);
     ggml_backend_free(be);
 }
+
+// Adoption (a disk snapshot handed to the backend) compares the snapshot to the live cache. A snapshot written
+// by a larger KVFlash pool has more rows than this pool's physical capacity: it must be refused at adoption, so
+// the lookup counts a miss. Adopted, the restore returns InvalidSnapshotSlot and the request fails.
+TEST_CASE(RestoreBoundsFixture, a_snapshot_with_more_rows_than_the_destination_capacity_is_not_adoptable) {
+    using luce::common::attn_snapshot_adoptable;
+    ggml_backend_t be = ggml_backend_cpu_init();
+    CHECK(be != nullptr);
+    KvPair pool(be, 8);
+    KvPair big(be, 12);
+    KvPair exact(be, 8);
+    CHECK(!attn_snapshot_adoptable(big.k, pool.k, 12));   // 12 rows into 8
+    CHECK(!attn_snapshot_adoptable(big.v, pool.v, 12));
+    CHECK(attn_snapshot_adoptable(exact.k, pool.k, 8));   // exactly the capacity
+    CHECK(!attn_snapshot_adoptable(exact.k, pool.k, 7));  // rows must equal cur_pos
+    KvPair roomy(be, 16);
+    CHECK(attn_snapshot_adoptable(big.k, roomy.k, 12));   // a destination with room takes it
+    ggml_backend_free(be);
+}

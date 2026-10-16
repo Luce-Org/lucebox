@@ -653,6 +653,14 @@ bool snapshot_target_cache(const TargetWeights & w,
 // those will be repopulated by the first decode step's verify forward.
 bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache);
 
+// Can an attention K or V snapshot tensor (cur_pos rows) be adopted by this destination cache tensor?
+// Pure decision for Qwen35Backend::snapshot_adopt: type and per-row shape must match and the snapshot must
+// hold exactly cur_pos rows.
+inline bool attn_snapshot_adoptable(const ggml_tensor * snap, const ggml_tensor * dst, int cur_pos) {
+    return snap && dst && snap->type == dst->type && snap->ne[0] == dst->ne[0] &&
+           snap->ne[2] == dst->ne[2] && snap->ne[3] == dst->ne[3] && snap->ne[1] == cur_pos;
+}
+
 // Zero the full-attention K/V rows at positions >= `pos` (what a
 // clear-then-restore leaves past a restored prefix).
 void clear_kv_rows_from(TargetCache & cache, int pos);

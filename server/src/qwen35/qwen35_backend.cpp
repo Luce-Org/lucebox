@@ -1369,10 +1369,8 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
     for (int i = 0; i < n_full_attn && !mismatch; ++i) {
         const ggml_tensor * ck = i < (int)cache_.attn_k.size() ? cache_.attn_k[i] : nullptr;
         const ggml_tensor * cv = i < (int)cache_.attn_v.size() ? cache_.attn_v[i] : nullptr;
-        if (!same_rows(snap.attn_k_snap[i], ck) ||
-            !same_rows(snap.attn_v_snap[i], cv) ||
-            snap.attn_k_snap[i]->ne[1] != cur_pos ||
-            snap.attn_v_snap[i]->ne[1] != cur_pos) {
+        if (!attn_snapshot_adoptable(snap.attn_k_snap[i], ck, cur_pos) ||
+            !attn_snapshot_adoptable(snap.attn_v_snap[i], cv, cur_pos)) {
             mismatch = "attention KV";
         }
     }
