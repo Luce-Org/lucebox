@@ -2825,10 +2825,11 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
 static bool create_dense_snapshot_layout(const TargetWeights & w,
                                          const TargetCache & cache,
                                          int token_count,
-                                         PrefixSnapshot & snap) {
+                                         PrefixSnapshot & snap,
+                                         bool skip_kv = false) {
     const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
     const int n_delta     = w.n_layer - n_full_attn;               // 48
-    const int total_tensors = 2 * n_full_attn + 2 * n_delta + 1; // 65
+    const int total_tensors = (skip_kv ? 0 : 2 * n_full_attn) + 2 * n_delta + 1; // 65
     ggml_init_params ip{};
     ip.mem_size   = (size_t)(total_tensors + 16) * ggml_tensor_overhead();
     ip.mem_buffer = nullptr;
@@ -2836,13 +2837,17 @@ static bool create_dense_snapshot_layout(const TargetWeights & w,
     snap.ctx = ggml_init(ip);
     if (!snap.ctx) return false;
 
-    snap.attn_k_snap.assign(n_full_attn, nullptr);
-    snap.attn_v_snap.assign(n_full_attn, nullptr);
+    snap.attn_k_snap.clear();
+    snap.attn_v_snap.clear();
+    if (!skip_kv) {  // pooled: KV lives in the pager blob, no dense K/V tensors
+        snap.attn_k_snap.assign(n_full_attn, nullptr);
+        snap.attn_v_snap.assign(n_full_attn, nullptr);
+    }
     snap.ssm_state_snap.assign(n_delta, nullptr);
     snap.conv_state_snap.assign(n_delta, nullptr);
 
     // Right-sized KV: [head_dim, token_count, n_head_kv]
-    for (int i = 0; i < n_full_attn; i++) {
+    for (int i = 0; i < (skip_kv ? 0 : n_full_attn); i++) {
         ggml_tensor * sk = cache.attn_k[i];
         ggml_tensor * sv = cache.attn_v[i];
         if (!sk || !sv) continue;
@@ -2898,7 +2903,9 @@ size_t estimate_target_cache_snapshot_bytes(const TargetWeights & w,
 bool snapshot_target_cache(const TargetWeights & w,
                            const TargetCache & cache,
                            ggml_backend_t backend,
-                           PrefixSnapshot & snap) {
+                           PrefixSnapshot & snap,
+                           bool skip_kv,
+                           const std::vector<uint8_t> * kvflash_blob) {
     if (cache.n_seq_slots > 1) {
         set_last_error("snapshot_target_cache: multi-slot caches are unsupported");
         return false;
@@ -2918,10 +2925,11 @@ bool snapshot_target_cache(const TargetWeights & w,
     // magnitude smaller than [head_dim, max_ctx, n_head_kv] for short prefixes.
     const bool needs_alloc = snap.ctx == nullptr ||
         snap.layout != PrefixSnapshot::Layout::dense ||
+        snap.is_pooled != skip_kv ||
         snap.cur_pos != snap_pos;
     if (needs_alloc) {
         free_prefix_snapshot(snap);
-        if (!create_dense_snapshot_layout(w, cache, snap_pos, snap)) {
+        if (!create_dense_snapshot_layout(w, cache, snap_pos, snap, skip_kv)) {
             set_last_error("PrefixSnapshot ggml_init failed");
             return false;
         }
@@ -2944,7 +2952,8 @@ bool snapshot_target_cache(const TargetWeights & w,
     }
 
     // Copy KV strip-by-strip (right-sized snapshot is smaller than cache).
-    for (int i = 0; i < n_full_attn; i++) {
+    // skip_kv: KV is carried by the pager blob instead.
+    for (int i = 0; i < (skip_kv ? 0 : n_full_attn); i++) {
         ggml_tensor * sk = cache.attn_k[i];
         ggml_tensor * dk = snap.attn_k_snap[i];
         ggml_tensor * sv = cache.attn_v[i];
@@ -2986,6 +2995,9 @@ bool snapshot_target_cache(const TargetWeights & w,
     snap.max_ctx         = cache.max_ctx;
     snap.target_feat_cap = cache.target_feat_cap;
     snap.layout          = PrefixSnapshot::Layout::dense;
+    snap.is_pooled       = skip_kv;
+    if (skip_kv && kvflash_blob) snap.kvflash_blob = *kvflash_blob;
+    else                         snap.kvflash_blob.clear();
 
     return true;
 }
@@ -3005,9 +3017,14 @@ void clear_kv_rows_from(TargetCache & cache, int pos) {
     }
 }
 
-bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
+bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
+                          bool skip_kv) {
     if (snap.layout != PrefixSnapshot::Layout::dense) {
         set_last_error("restore_target_cache: snapshot is not dense");
+        return false;
+    }
+    if (snap.is_pooled != skip_kv) {
+        set_last_error("restore_target_cache: pooled/dense snapshot mismatch");
         return false;
     }
     if (cache.n_seq_slots > 1) {
@@ -3026,8 +3043,8 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
     // allocated against. A mismatch (stale snapshot from a different daemon
     // run, or a snap captured before a model swap) would index past
     // cache.attn_k / .ssm_state / .conv_state and silently corrupt memory.
-    if (snap.attn_k_snap.size() != cache.attn_k.size() ||
-        snap.attn_v_snap.size() != cache.attn_v.size() ||
+    if ((!skip_kv && (snap.attn_k_snap.size() != cache.attn_k.size() ||
+                      snap.attn_v_snap.size() != cache.attn_v.size())) ||
         snap.ssm_state_snap.size()  != cache.ssm_state.size() ||
         snap.conv_state_snap.size() != cache.conv_state.size()) {
         set_last_error("restore_target_cache: layer-count mismatch (stale snapshot?)");
@@ -3038,11 +3055,11 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
         return false;
     }
 
-    const int n_full_attn = (int)snap.attn_k_snap.size();
+    const int n_full_attn = skip_kv ? 0 : (int)snap.attn_k_snap.size();
     const int n_delta     = (int)snap.ssm_state_snap.size();
     const int snap_pos    = snap.cur_pos;
 
-    // KV: strip-by-strip copy from right-sized snapshot into full-size cache.
+    // KV: strip-by-strip copy (skip_kv: restored separately via pager deserialize) from right-sized snapshot into full-size cache.
     for (int i = 0; i < n_full_attn; i++) {
         ggml_tensor * sk = snap.attn_k_snap[i];
         ggml_tensor * dk = cache.attn_k[i];
@@ -3489,6 +3506,9 @@ void free_prefix_snapshot(PrefixSnapshot & snap) {
     snap.layout          = PrefixSnapshot::Layout::empty;
     snap.kv_start        = 0;
     snap.kv_end          = 0;
+    snap.is_pooled       = false;
+    snap.kvflash_blob.clear();
+    snap.kvflash_blob.shrink_to_fit();
 }
 
 bool snapshot_target_cache_thin(const TargetWeights & w,
