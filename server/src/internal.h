@@ -246,6 +246,10 @@ struct TargetWeights {
     // Token the chat template repeats once per image token; -1 when the
     // vocabulary has none (a model without image input).
     int32_t image_pad_id = -1;
+    // Chat-header token ids for the KVFlash turn rung (S9b); -1 when absent.
+    int32_t im_start_id  = -1;
+    int32_t assistant_id = -1;
+    int32_t newline_id   = -1;
 
     // DFlash noise mask token ID (from target tokenizer, used by draft model).
     // Default: Qwen tokenizer's mask token. Overridden by GGUF metadata if available.
@@ -635,6 +639,19 @@ struct PrefixSnapshot {
     //     [HEAD_DIM, kv_end-kv_start, N_HEAD_KV] (smaller than cache).
     //   - ssm_state_snap, conv_state_snap, target_feat_snap are NOT
     //     allocated (THIN snapshots are KV-only).
+
+    // Pooled snapshots (KVFlash resident pool): KV is NOT copied as a dense
+    // range; attn_k_snap/attn_v_snap stay empty and the pager-serialized KV
+    // lives in kvflash_blob (valid iff is_pooled). Plain dense path only.
+    bool                 is_pooled    = false;
+    std::vector<uint8_t> kvflash_blob;
+
+    // Only a full dense/paged ggml state may go to the SSD tier. An
+    // OwnedSnapshot holds tensors only, so a pooled snapshot (KV in the pager
+    // blob) would be written with no KV and restore garbage: never persist it.
+    bool disk_persistable() const {
+        return !is_pooled && (layout == Layout::dense || layout == Layout::paged);
+    }
 };
 
 // Snapshot the slim state of `cache` into `snap`. KV tensors are RIGHT-SIZED
@@ -645,13 +662,17 @@ struct PrefixSnapshot {
 bool snapshot_target_cache(const TargetWeights & w,
                            const TargetCache & cache,
                            ggml_backend_t backend,
-                           PrefixSnapshot & snap);
+                           PrefixSnapshot & snap,
+                           bool skip_kv = false,
+                           const std::vector<uint8_t> * kvflash_blob = nullptr,
+                           bool skip_target_feat = false);  // no drafter: omit the feature ring
 
 // Restore `cache` from `snap`. cache must already exist (created via
 // create_target_cache) and have matching shapes. Sets cache.cur_pos =
 // snap.cur_pos. Does NOT touch ssm_intermediate / conv_input_cache —
 // those will be repopulated by the first decode step's verify forward.
-bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache);
+bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
+                          bool skip_kv = false);
 
 // Zero the full-attention K/V rows at positions >= `pos` (what a
 // clear-then-restore leaves past a restored prefix).

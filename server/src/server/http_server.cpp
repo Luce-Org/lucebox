@@ -6955,21 +6955,29 @@ http_detail::PflashRestorablePrefix HttpServer::restorable_prefix_tokens(
 
 int HttpServer::ram_restorable_prefix_tokens(
         const std::vector<int32_t> & prompt) {
-    if (prefix_cache_.disabled()) return 0;
-    int limit = (int) prompt.size();
+    // The snapshot the generation path would restore, if any; the backend then
+    // says what a restore really skips (a KVFlash live session can cover more,
+    // or a pooled snapshot less, than the snapshot itself holds).
+    int snapshot_slot = -1;
+    int snapshot_tokens = 0;
+    int limit = prefix_cache_.disabled() ? 0 : (int) prompt.size();
     while (limit > 0) {
         const auto [slot, length] =
             prefix_cache_.lookup_candidate(prompt, limit);
-        if (slot < 0 || length <= 0) return 0;
+        if (slot < 0 || length <= 0) break;
         if (backend_.snapshot_used(slot)) {
             const int position = backend_.snapshot_cur_pos(slot);
-            if (position > 0) return (std::min)(length, position);
+            if (position > 0) {
+                snapshot_slot = slot;
+                snapshot_tokens = (std::min)(length, position);
+                break;
+            }
         }
         // A key whose snapshot is gone: try the next shorter one; the
         // generation path invalidates it when it gets there.
         limit = length - 1;
     }
-    return 0;
+    return backend_.restorable_prefix(prompt, snapshot_slot, snapshot_tokens);
 }
 
 json HttpServer::pflash_failure_counters_json() const {
@@ -10345,7 +10353,9 @@ void HttpServer::process_job(ServerJob * job) {
             finish.c_str(),
             using_restore ? "true" : "false",
             cache_slot,
-            prefix_len,
+            // The cut the backend actually made (live-session restore, or 0 after a
+            // re-prefill of a snapshot it dropped), else the server's.
+            luce::common::reported_prefix_len(using_restore, prefix_len, result),
             result.prefill_s,
             result.decode_s,
             decode_tok_s,
