@@ -38,11 +38,14 @@
 //  the decode thread via ggml_backend_tensor_get/set.  Host backing
 //  buffers are cudaMallocHost-pinned for maximum PCIe throughput.
 //  alloc_span() synchronises page_stream_ only if a page-in was issued
-//  (H2D must complete before the next attention forward); page-outs fire
-//  and are forgotten—the DMA completes during the subsequent forward
-//  pass.  On the same stream, page-out D2H always precedes the slot
-//  zero (cudaMemsetAsync), which in turn precedes any page-in H2D, so
-//  host_data is coherent by the time it is read back.
+//  (H2D must complete before the next attention forward).  Page-outs are
+//  queued, but slot_for() does not hand out the block they freed until the
+//  compute stream is ordered after them: a device-side wait if the backend
+//  registered its stream (CUDA), otherwise a host wait.  So the nested
+//  default-path allocation can sync after a page-out, and the new K/V write
+//  cannot overtake the copy or the zeroing.  On the same stream, page-out D2H
+//  always precedes the slot zero (cudaMemsetAsync), which in turn precedes any
+//  page-in H2D, so host_data is coherent by the time it is read back.
 
 #pragma once
 
@@ -65,6 +68,13 @@
 #if defined(LUCE_BACKEND_CUDA) || defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 #include "gpu_runtime_compat.h"
 #define KVFLASH_HAS_ASYNC_DMA 1
+// ponytail: the device-side fence re-records one event per fence, which CUDA
+// allows and HIP documents as undefined while an earlier record is pending. HIP
+// builds therefore stay on the host wait (one stall per reused block after a
+// page-out on AMD). Upgrade: an event per pending record, or a HIP-verified reuse.
+#if !defined(LUCE_BACKEND_HIP) && !defined(GGML_USE_HIP)
+#define KVFLASH_EVENT_FENCE 1
+#endif
 #endif
 
 namespace luce::common {
@@ -149,6 +159,12 @@ public:
                          "falls back to the (blocking) default stream\n");
             page_stream_ = nullptr;
         }
+#ifdef KVFLASH_EVENT_FENCE
+        if (cudaEventCreateWithFlags(&page_event_, cudaEventDisableTiming) != cudaSuccess) {
+            page_event_ = nullptr;   // set_compute_stream() then keeps the host wait
+            cudaGetLastError();
+        }
+#endif
 #endif
         return true;
     }
@@ -163,9 +179,7 @@ public:
     // Cumulative stats are kept; the epoch advances so cached masks refill.
     void reset() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        if (page_stream_) {
-            cudaStreamSynchronize(page_stream_);
-        }
+        sync_page_stream_();
         for (auto & st : chunks_) {
             if (st.host_data) {
                 cudaError_t err = cudaFreeHost(st.host_data);
@@ -200,9 +214,7 @@ public:
     void zero_free_blocks() {
         for (int b : free_blocks_) zero_block(b);
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        if (page_stream_) {
-            cudaStreamSynchronize(page_stream_);
-        }
+        sync_page_stream_();
 #endif
     }
 
@@ -264,6 +276,8 @@ public:
                 has_pending_page_in_ = true;
 #endif
             }
+            // The caller uses this block on the compute stream next.
+            fence_page_work_();
         }
         st.last_use = ++clock_;
         return st.block * cfg_.chunk_tokens + (int)(pos % cfg_.chunk_tokens);
@@ -303,13 +317,31 @@ public:
         return slot_for((int64_t)c * cfg_.chunk_tokens) >= 0;
     }
 
+    // Optional fast path (CUDA). The stream that consumes the pool (the
+    // backend's compute stream) is non-blocking, so it is NOT implicitly
+    // ordered with page_stream_. By default slot_for() therefore waits on the
+    // host for the queued page work before it hands out a block. With the
+    // compute stream registered here it instead makes that stream wait on the
+    // device, with no host stall for that fence (recall in alloc_span() and
+    // reselect() still waits on the host). Call after attach(), which clears
+    // it. Only register a stream that runs EVERY graph touching the pool: a
+    // pool spread over several devices (layer split) has one compute stream
+    // per device and must stay on the default. Ignored on HIP builds.
+    void set_compute_stream(void * stream) {
+#ifdef KVFLASH_EVENT_FENCE
+        compute_stream_ = (cudaStream_t)stream;
+#else
+        (void)stream;
+#endif
+    }
+
     // Block until queued page DMA on page_stream_ completes. Hot paths
     // (alloc_span/reselect) batch this internally after their recalls; callers
     // that issue page_in()/page_out() directly and then read device KV (tests,
     // tools) must call this first. No-op when async DMA is compiled out.
     void synchronize_paging() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        cudaStreamSynchronize(page_stream_);  // page_stream_==nullptr syncs the default stream
+        sync_page_stream_();
 #endif
         has_pending_page_in_ = false;
     }
@@ -493,6 +525,7 @@ private:
                 }
             }
         }
+        page_work_queued_ = true;
 #else
         uint8_t * p = (uint8_t *)st.host_data.data();
         for (size_t l = 0; l < attn_k_.size(); l++) {
@@ -534,6 +567,51 @@ private:
                 }
             }
         }
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        page_work_queued_ = true;
+#endif
+    }
+
+#ifdef KVFLASH_HAS_ASYNC_DMA
+    // A failed stream or event call means ordering can no longer be guaranteed
+    // (sticky error), and continuing could hand out an unfenced block: abort, like
+    // CUDA_CHECK in ggml-cuda.
+    void check_(cudaError_t err, const char * call) const {
+        if (err != cudaSuccess)
+            GGML_ABORT("[kvflash] %s failed: %s (pool %d tokens, chunk %d tokens)",
+                       call, cudaGetErrorString(err), cfg_.pool_tokens, cfg_.chunk_tokens);
+    }
+
+    // Host wait for the queued page work. With no tensor storage nothing was
+    // queued; with device tensors but no page stream the work ran on the
+    // default stream.
+    void sync_page_stream_() {
+        if (page_stream_ || !attn_k_.empty())
+            check_(cudaStreamSynchronize(page_stream_), "cudaStreamSynchronize(page)");
+        page_work_queued_ = false;
+    }
+#endif
+
+    // Order a block about to be reused after the page work queued on
+    // page_stream_ (the page-out copy and zeroing of its old contents, or the
+    // recall copy into it); otherwise the compute stream's write of the new
+    // row can land before the copy (the archive then holds the new bytes) or
+    // before the zeroing (the new row is wiped).
+    // ponytail: without a registered compute stream this is a host wait, one
+    // stall per new chunk after a page-out; registering the stream removes it.
+    void fence_page_work_() {
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        if (!page_work_queued_) return;
+#ifdef KVFLASH_EVENT_FENCE
+        if (compute_stream_ && page_event_) {
+            check_(cudaEventRecord(page_event_, page_stream_), "cudaEventRecord(page)");
+            check_(cudaStreamWaitEvent(compute_stream_, page_event_, 0), "cudaStreamWaitEvent(compute)");
+            page_work_queued_ = false;
+            return;
+        }
+#endif
+        sync_page_stream_();
+#endif
     }
 
     // Release page_stream_ and all pinned host_data buffers.
@@ -547,6 +625,14 @@ private:
             cudaStreamDestroy(page_stream_);
             page_stream_ = nullptr;
         }
+#ifdef KVFLASH_EVENT_FENCE
+        if (page_event_) {
+            cudaEventDestroy(page_event_);
+            page_event_ = nullptr;
+        }
+        compute_stream_ = nullptr;   // a reattach must not wait on a stream the caller has since destroyed
+#endif
+        page_work_queued_ = false;
         // Free pinned host buffers unconditionally: page_out() may have
         // allocated them even when stream creation failed (default-stream path).
         for (auto & st : chunks_) {
@@ -580,6 +666,11 @@ private:
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
     cudaStream_t page_stream_ = nullptr;
+    bool         page_work_queued_ = false;   // work on page_stream_ no consumer has waited for
+#ifdef KVFLASH_EVENT_FENCE
+    cudaStream_t compute_stream_ = nullptr;   // consumer of the pool; see set_compute_stream()
+    cudaEvent_t  page_event_ = nullptr;
+#endif
 #endif
     bool has_pending_page_in_ = false;
 };

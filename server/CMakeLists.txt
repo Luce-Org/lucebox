@@ -2519,6 +2519,7 @@ if(LUCE_TESTS)
             list(APPEND _server_unit_sources
                 test/unit/test_gpu_sampler_cuda.cpp
                 test/unit/test_cuda_pool_shutdown.cpp
+                test/unit/test_kvflash_pager_cuda_race.cpp
                 test/unit/test_draft_topk_cuda.cpp)
         endif()
         add_executable(test_server_unit ${_server_unit_sources})
