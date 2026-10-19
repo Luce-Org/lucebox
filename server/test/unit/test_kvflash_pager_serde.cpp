@@ -3,7 +3,7 @@
 // backend, no GPU: the cache tensors live in a CPU buffer, so every code path
 // that moves bytes between pool and host backing is exercised for real.
 #include "CppUnitTestFramework.hpp"
-#include "../../src/common/kvflash_pager.h"
+#include "kvflash_pager_test_host.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -136,6 +136,7 @@ TEST_CASE(KvflashPagerSerdeFixture, floor_to_chunk_aligns_down) {
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, roundtrip_preserves_residency_bytes_and_host_copies) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
     KvFlashPager pa;
     build_source(A, pa, 1);
@@ -176,6 +177,7 @@ TEST_CASE(KvflashPagerSerdeFixture, roundtrip_preserves_residency_bytes_and_host
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, roundtrip_of_all_host_backed_chunks) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
     KvFlashPager pa;
     build_source(A, pa, 2);
@@ -197,6 +199,7 @@ TEST_CASE(KvflashPagerSerdeFixture, roundtrip_of_all_host_backed_chunks) {
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, partial_serialize_keeps_only_first_chunks) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
     KvFlashPager pa;
     build_source(A, pa, 3);
@@ -229,6 +232,7 @@ TEST_CASE(KvflashPagerSerdeFixture, partial_serialize_keeps_only_first_chunks) {
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, ledger_scores_roundtrip) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
     KvFlashPager pa;
     build_source(A, pa, 4);
@@ -258,6 +262,7 @@ TEST_CASE(KvflashPagerSerdeFixture, ledger_scores_roundtrip) {
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, reset_pager_is_identity_so_dense_snapshots_ignore_stale_mapping) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
     KvFlashPager pa;
     build_source(A, pa, 3);
@@ -268,6 +273,7 @@ TEST_CASE(KvflashPagerSerdeFixture, reset_pager_is_identity_so_dense_snapshots_i
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, serialized_dtype_is_recorded) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
     KvFlashPager pa;
     build_source(A, pa, 5);
@@ -280,6 +286,7 @@ TEST_CASE(KvflashPagerSerdeFixture, serialized_dtype_is_recorded) {
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, malformed_blobs_are_rejected_without_touching_state) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
     KvFlashPager pa;
     build_source(A, pa, 6);
@@ -336,6 +343,7 @@ TEST_CASE(KvflashPagerSerdeFixture, malformed_blobs_are_rejected_without_touchin
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, pin_range_is_half_open_and_pinned_chunks_are_never_evicted) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
     KvFlashPager p;
     REQUIRE(p.attach(make_cfg(), A.k, A.v));
@@ -392,6 +400,7 @@ TEST_CASE(KvflashPagerSerdeFixture, pin_range_is_half_open_and_pinned_chunks_are
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, no_new_api_use_keeps_eviction_unchanged) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
     // Without pins or scores the victim is the oldest unprotected chunk.
     Harness A;
     KvFlashPager p;

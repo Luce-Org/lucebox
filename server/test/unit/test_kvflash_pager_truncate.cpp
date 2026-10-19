@@ -3,7 +3,7 @@
 // leave a state indistinguishable from a pager that only ever saw P tokens.
 // CPU ggml backend, no GPU.
 #include "CppUnitTestFramework.hpp"
-#include "../../src/common/kvflash_pager.h"
+#include "kvflash_pager_test_host.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -172,6 +172,7 @@ TEST_CASE(KvflashPagerTruncateFixture, inside_tail_window) {
 }
 
 TEST_CASE(KvflashPagerTruncateFixture, after_eviction_and_page_out) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A, R;
     KvFlashPager pa, pr;
     must(pa.attach(make_cfg(), A.k, A.v));
@@ -246,6 +247,7 @@ TEST_CASE(KvflashPagerTruncateFixture, pins_beyond_p_are_dropped) {
 }
 
 TEST_CASE(KvflashPagerTruncateFixture, serialize_truncate_serialize_roundtrip) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A, R, B;
     KvFlashPager pa, pr, pb;
     must(pa.attach(make_cfg(), A.k, A.v));
@@ -270,6 +272,7 @@ TEST_CASE(KvflashPagerTruncateFixture, serialize_truncate_serialize_roundtrip) {
 // of a pager that only ever appended C tokens, or the replay after a live
 // restore attends over a different chunk set than a cold prefill does.
 TEST_CASE(KvflashPagerTruncateFixture, truncate_leaves_the_resident_set_a_fresh_pager_reaches) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
     for (int P : {12 * kChunk + 10, 12 * kChunk, 9 * kChunk + 63, 5 * kChunk}) {
         Harness A, R;
         KvFlashPager pa, pr;
