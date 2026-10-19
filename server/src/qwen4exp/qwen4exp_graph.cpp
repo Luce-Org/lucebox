@@ -416,10 +416,26 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor 
                 spec_conv->nb[1], spec_conv->nb[2], t * spec_conv->nb[2])));
     }
 
+    // q/k L2 norm folded into the gfx1151 gdn_conv_direct epilogue (same arithmetic as the RMS_NORM -> SCALE kernel it
+    // replaces, bit-exact); LUCE_GDN_NORM_LEGACY=1 keeps the two separate norm passes. The gate mirrors
+    // gdn_conv_check's shape rule (T >= 256, C % 256 == 0); the generic SSM_CONV kernel aborts if the fusion still
+    // fails to match, so a silently un-normalised q/k cannot reach the recurrence.
+    static const bool conv_qknorm_env = [] {
+        const char * value = std::getenv("LUCE_GDN_NORM_LEGACY");
+        return !(value && std::strcmp(value, "0") != 0);
+    }();
+    const bool conv_qknorm = conv_qknorm_env && !step && D == 128 && T >= 256 &&
+                             conv_channels % 256 == 0 && (2 * Hk * D) % 256 == 0;
     ggml_tensor * conv_op = ggml_ssm_conv(c, conv_input, L.ssm_conv1d);
     // The gfx1151 fusion reads CONCAT's input at this later node. src[3] is
     // unused by ordinary SSM_CONV and gives the allocator the real lifetime.
     conv_op->src[3] = qkv_t;
+    if (conv_qknorm) {
+        const int32_t qk_channels = (int32_t) (2 * Hk * D);
+        const float   norm_p[3]   = { eps / (float) D, 1.0f / sqrtf((float) D), 0.0f };   // eps, scale, bias
+        memcpy((int32_t *) conv_op->op_params + 1, &qk_channels, sizeof qk_channels);
+        memcpy((float *) conv_op->op_params + 2, norm_p, sizeof norm_p);
+    }
     ggml_tensor * conv = ggml_silu(c, conv_op);
 
     const size_t esz     = ggml_element_size(conv);
@@ -437,8 +453,10 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor 
     } else {
         ggml_tensor * q_raw = ggml_view_3d(c, conv, D, Hk, T, D * esz, tstride, 0);
         ggml_tensor * k_raw = ggml_view_3d(c, conv, D, Hk, T, D * esz, tstride, D * Hk * esz);
-        q_c = ggml_scale(c, ggml_rms_norm(c, q_raw, eps / (float) D), 1.0f / sqrtf((float) D));
-        k_c = ggml_scale(c, ggml_rms_norm(c, k_raw, eps / (float) D), 1.0f / sqrtf((float) D));
+        // With conv_qknorm the conv epilogue already wrote these channels normalised, so the raw views feed the
+        // recurrence directly (contiguous rows, same strides for q and k, as ggml_gated_delta_net requires).
+        q_c = conv_qknorm ? q_raw : ggml_scale(c, ggml_rms_norm(c, q_raw, eps / (float) D), 1.0f / sqrtf((float) D));
+        k_c = conv_qknorm ? k_raw : ggml_scale(c, ggml_rms_norm(c, k_raw, eps / (float) D), 1.0f / sqrtf((float) D));
     }
     ggml_tensor * v_c = ggml_view_3d(c, conv, D, Hv, T, D * esz, tstride, 2 * D * Hk * esz);
 

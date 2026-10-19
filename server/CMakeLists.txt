@@ -1362,6 +1362,38 @@ if(LUCE_TESTS)
         list(APPEND _raw_unit_test_targets test_mul_mat_host_input)
         luce_add_ggml_gpu_executable(test_rms_norm_scale test/unit/test_rms_norm_scale.cpp)
         list(APPEND _raw_unit_test_targets test_rms_norm_scale)
+        # Guards the wave-per-row gated norm kernels (GDN tail ncols=128 with gamma,
+        # attention gate ncols=256 without) against the block-per-row kernels they
+        # replace: byte-identical F16 rows at T in {1,7,333,4096}.
+        add_executable(test_gated_norm_wave_parity test/unit/test_gated_norm_wave_parity.cpp)
+        set_source_files_properties(test/unit/test_gated_norm_wave_parity.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_gated_norm_wave_parity PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
+        target_compile_definitions(test_gated_norm_wave_parity PRIVATE GGML_USE_HIP)
+        target_include_directories(test_gated_norm_wave_parity PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        target_link_libraries(test_gated_norm_wave_parity PRIVATE
+            ggml
+            ggml-base
+            ${LUCE_GGML_BACKEND_TARGET}
+            hip::host)
+        list(APPEND _raw_unit_test_targets test_gated_norm_wave_parity)
+        # Guards the GDN q/k L2 norm folded into the gfx1151 conv epilogue against
+        # the plain conv + rms_norm_scale chain: bit-identical q/k and v channels
+        # at T in {256,333,4096} for the qwen4exp 10240-channel layout.
+        add_executable(test_gdn_conv_qknorm_parity test/unit/test_gdn_conv_qknorm_parity.cpp)
+        set_source_files_properties(test/unit/test_gdn_conv_qknorm_parity.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_gdn_conv_qknorm_parity PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
+        target_compile_definitions(test_gdn_conv_qknorm_parity PRIVATE GGML_USE_HIP)
+        target_include_directories(test_gdn_conv_qknorm_parity PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        target_link_libraries(test_gdn_conv_qknorm_parity PRIVATE
+            ggml
+            ggml-base
+            ${LUCE_GGML_BACKEND_TARGET}
+            hip::host)
+        list(APPEND _raw_unit_test_targets test_gdn_conv_qknorm_parity)
         # Guards the QSA3 prefill union builder (qsa.cu): the bitmap kernel
         # (default), the compacting rows kernel + merge (LUCE_ATTN_PREFILL_LEGACY=1)
         # and the legacy rank-sort rows kernel must all
