@@ -197,6 +197,19 @@ int ggml_cuda_mmvq_invariant_rows_override() {
     return ggml_cuda_mmvq_invariant_rows_override_value;
 }
 
+static thread_local int ggml_cuda_mmvq_invariant_lds_override_value = -1;
+
+extern "C" int ggml_backend_cuda_set_mmvq_invariant_lds_override(int waves) {
+    GGML_ASSERT(waves == -1 || waves == 0 || waves == 4 || waves == 8 || waves == 16 || waves == 32);
+    const int previous = ggml_cuda_mmvq_invariant_lds_override_value;
+    ggml_cuda_mmvq_invariant_lds_override_value = waves;
+    return previous;
+}
+
+int ggml_cuda_mmvq_invariant_lds_override() {
+    return ggml_cuda_mmvq_invariant_lds_override_value;
+}
+
 extern "C" int ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(int max_tokens) {
     GGML_ASSERT(max_tokens >= 0 && max_tokens <= GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS);
     const int previous = ggml_cuda_ds4_mix_mmv_max_tokens;
