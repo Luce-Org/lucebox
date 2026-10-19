@@ -3,6 +3,8 @@
 #include "ggml.h"
 #include "rope.cuh"
 
+#include <cstring>
+
 struct rope_corr_dims {
     float v[2];
 };
@@ -526,12 +528,13 @@ static __global__ void rope_multi(const T *            x,
 // rope_multi with one block per (token, sample) and one thread per rotation pair: the angle is computed once and
 // applied to every head (rope_multi recomputes it per head in one 256-thread block per row, half of them idle).
 // dst strides are free, so a following PERMUTE + CONT is written directly. Same per-element math.
-template <bool forward, bool has_ff, typename T>
+// use_tab: cos/sin come from the per-forward table (rope_multi_table) instead of the FP64 angle code.
+template <bool forward, bool has_ff, bool use_tab, typename T>
 static __global__ void rope_multi_heads(const T * x, T * dst, const int ne00, const int ne01, const int ne02,
         const int s01, const int s02, const int s03, const int s1, const int s2, const int s3, const int n_dims,
         const int32_t * pos, const float freq_scale, const float ext_factor, const float attn_factor,
         const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors,
-        const mrope_sections sections, const bool is_imrope) {
+        const mrope_sections sections, const bool is_imrope, const float2 * tab) {
     const uint32_t i2 = blockIdx.x, i3 = blockIdx.y;
     for (int j = threadIdx.x; j < ne00 / 2; j += blockDim.x) {
         const int i0 = 2 * j;
@@ -545,8 +548,14 @@ static __global__ void rope_multi_heads(const T * x, T * dst, const int ne00, co
         }
         float cos_theta;
         float sin_theta;
-        rope_multi_cs<forward, has_ff>(i0, pos, i2, ne02, freq_scale, ext_factor, attn_factor, corr_dims,
-            theta_scale, freq_factors, sections, is_imrope, cos_theta, sin_theta);
+        if constexpr (use_tab) {
+            const float2 cs = tab[i2 * (n_dims / 2) + i0 / 2];
+            cos_theta = cs.x;
+            sin_theta = cs.y;
+        } else {
+            rope_multi_cs<forward, has_ff>(i0, pos, i2, ne02, freq_scale, ext_factor, attn_factor, corr_dims,
+                theta_scale, freq_factors, sections, is_imrope, cos_theta, sin_theta);
+        }
         for (int i1 = threadIdx.y; i1 < ne01; i1 += blockDim.y) {
             const int idst = i0 / 2 + i1 * s1 + i2 * s2 + i3 * s3, ix = i0 / 2 + i1 * s01 + i2 * s02 + i3 * s03;
             const float x0 = x[ix + 0];
@@ -557,6 +566,92 @@ static __global__ void rope_multi_heads(const T * x, T * dst, const int ne00, co
             dst[idst + n_dims/2] = fmaf(x1, cos_theta, __fmul_rn(x0, sin_theta));
         }
     }
+}
+
+// Per-forward cos/sin table for the per-token path: the FP64 angle depends only on (token, pair), so Q, K and
+// the indexer q of every layer share one table per positions tensor (48 angle kernels per Qwen4exp prefill
+// become 2 table builds). tab[i2 * n_dims/2 + i0/2] is exactly what rope_multi_heads computed inline, so the
+// output is bit-identical. Entries are keyed by the positions node, its data pointer and a generation bumped
+// per graph compute (ggml_cuda_rope_begin_graph), so a recycled pool address can never serve a stale table.
+// LUCE_ATTN_PREFILL_LEGACY=1 restores the inline angle code.
+template <bool forward, bool has_ff>
+static __global__ void rope_multi_table(float2 * tab, const int n_dims, const int ne02, const int32_t * pos,
+        const float freq_scale, const float ext_factor, const float attn_factor, const rope_corr_dims corr_dims,
+        const float theta_scale, const float * freq_factors, const mrope_sections sections, const bool is_imrope) {
+    const uint32_t i2 = blockIdx.x;
+    for (int j = threadIdx.x; j < n_dims / 2; j += blockDim.x) {
+        float c, s;
+        rope_multi_cs<forward, has_ff>(2 * j, pos, i2, ne02, freq_scale, ext_factor, attn_factor, corr_dims,
+            theta_scale, freq_factors, sections, is_imrope, c, s);
+        tab[i2 * (n_dims / 2) + j] = make_float2(c, s);
+    }
+}
+
+struct rope_table_key {
+    const void *    node;
+    const int32_t * pos;
+    const float *   freq_factors;
+    uint64_t        gen;
+    int             device, ne02, n_dims;
+    float           freq_scale, ext_factor, attn_factor, theta_scale;
+    rope_corr_dims  corr_dims;
+    mrope_sections  sections;
+    bool            is_imrope, forward;
+};
+
+struct rope_table_entry {
+    rope_table_key key;
+    float2 *       tab = nullptr;
+    size_t         cap = 0;   // float2 elements
+};
+
+static rope_table_entry g_rope_tab[2];   // main + pooled positions; grow when a model needs more
+static int              g_rope_tab_next = 0;
+static uint64_t         g_rope_gen      = 1;
+
+void ggml_cuda_rope_begin_graph() { ++g_rope_gen; }
+
+template <bool forward>
+static const float2 * rope_multi_table_get(const void * pos_node, const int32_t * pos, const int ne02, const int n_dims,
+        const float freq_scale, const float ext_factor, const float attn_factor, const rope_corr_dims corr_dims,
+        const float theta_scale, const float * freq_factors, const mrope_sections sections, const bool is_imrope,
+        cudaStream_t stream) {
+    static const bool enabled = [] { const char * e = getenv("LUCE_ATTN_PREFILL_LEGACY"); return !(e && atoi(e)); }();
+    if (!enabled || pos_node == nullptr) {
+        return nullptr;
+    }
+    rope_table_key key{};
+    key.node = pos_node; key.pos = pos; key.freq_factors = freq_factors; key.gen = g_rope_gen;
+    key.device = ggml_cuda_get_device(); key.ne02 = ne02; key.n_dims = n_dims;
+    key.freq_scale = freq_scale; key.ext_factor = ext_factor; key.attn_factor = attn_factor; key.theta_scale = theta_scale;
+    key.corr_dims = corr_dims; key.sections = sections; key.is_imrope = is_imrope; key.forward = forward;
+    for (const rope_table_entry & e : g_rope_tab) {
+        if (e.tab && memcmp(&e.key, &key, sizeof key) == 0) {
+            return e.tab;
+        }
+    }
+    rope_table_entry & e = g_rope_tab[g_rope_tab_next];
+    g_rope_tab_next = (g_rope_tab_next + 1) % 2;
+    const size_t need = (size_t) ne02 * (n_dims / 2);
+    if (e.cap < need || (e.tab && e.key.device != key.device)) {
+        if (e.tab) {
+            ggml_cuda_set_device(e.key.device);
+            CUDA_CHECK(cudaFree(e.tab));
+            ggml_cuda_set_device(key.device);
+        }
+        CUDA_CHECK(cudaMalloc(&e.tab, need * sizeof(float2)));
+        e.cap = need;
+    }
+    e.key = key;
+    const int bx = std::min(128, std::max(32, n_dims / 2));
+    if (freq_factors == nullptr) {
+        rope_multi_table<forward, false><<<ne02, bx, 0, stream>>>(e.tab, n_dims, ne02, pos, freq_scale, ext_factor,
+            attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+    } else {
+        rope_multi_table<forward, true><<<ne02, bx, 0, stream>>>(e.tab, n_dims, ne02, pos, freq_scale, ext_factor,
+            attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+    }
+    return e.tab;
 }
 
 template <bool forward, bool has_ff, typename T>
@@ -722,6 +817,7 @@ static void rope_multi_cuda(const T *            x,
                             const int            n_dims,
                             const int            nr,
                             const int32_t *      pos,
+                            const void *         pos_node,
                             const float          freq_scale,
                             const float          freq_base,
                             const float          ext_factor,
@@ -748,12 +844,17 @@ static void rope_multi_cuda(const T *            x,
     if (per_token) {   // prefill: one block per token (decode keeps rope_multi's per-row blocks)
         const int bx = std::min(128, std::max(32, ne00 / 2)), ne03 = nr / (ne01 * ne02);
         const dim3 hb(bx, 256 / bx, 1), hg(ne02, ne03, 1);
-        if (freq_factors == nullptr) {
-            rope_multi_heads<forward, false, T><<<hg, hb, 0, stream>>>(x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3,
-                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+        const float2 * tab = rope_multi_table_get<forward>(pos_node, pos, ne02, n_dims, freq_scale, ext_factor,
+            attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope, stream);
+        if (tab != nullptr) {
+            rope_multi_heads<forward, false, true, T><<<hg, hb, 0, stream>>>(x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3,
+                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope, tab);
+        } else if (freq_factors == nullptr) {
+            rope_multi_heads<forward, false, false, T><<<hg, hb, 0, stream>>>(x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3,
+                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope, nullptr);
         } else {
-            rope_multi_heads<forward, true, T><<<hg, hb, 0, stream>>>(x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3,
-                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+            rope_multi_heads<forward, true, false, T><<<hg, hb, 0, stream>>>(x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3,
+                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope, nullptr);
         }
     } else {
         if (freq_factors == nullptr) {
@@ -938,11 +1039,11 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
     } else if (is_mrope && !is_vision) {
         if (src0->type == GGML_TYPE_F32) {
             rope_multi_cuda<forward>((const float *) src0_d, (float *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
-                                     s2, s3, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor,
+                                     s2, s3, n_dims, nr, pos, src1, freq_scale, freq_base, ext_factor, attn_factor,
                                      corr_dims, freq_factors, sections, is_imrope, stream);
         } else if (src0->type == GGML_TYPE_F16) {
             rope_multi_cuda<forward>((const half *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
-                                     s2, s3, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor,
+                                     s2, s3, n_dims, nr, pos, src1, freq_scale, freq_base, ext_factor, attn_factor,
                                      corr_dims, freq_factors, sections, is_imrope, stream);
         } else {
             GGML_ABORT("fatal error");

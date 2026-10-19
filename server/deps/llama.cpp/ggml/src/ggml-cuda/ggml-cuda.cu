@@ -6832,6 +6832,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // Empty containers are left alone: graphs without the qwen4exp profile never fill them,
     // and another backend may be computing on another thread.
     ggml_cuda_mmb_begin_graph();
+    ggml_cuda_rope_begin_graph();
     if (!g_hc_marked_xn.empty()) g_hc_marked_xn.clear();
     if (!g_hc_q8_xn.empty()) g_hc_q8_xn.clear();
 
