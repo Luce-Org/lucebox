@@ -1362,6 +1362,10 @@ if(LUCE_TESTS)
         list(APPEND _raw_unit_test_targets test_mul_mat_host_input)
         luce_add_ggml_gpu_executable(test_rms_norm_scale test/unit/test_rms_norm_scale.cpp)
         list(APPEND _raw_unit_test_targets test_rms_norm_scale)
+        # Guards the 16-byte strided same-type CPY (cpy.cu cpy_vec16, the qwen4exp K/V cache append): byte-identical
+        # to a host reference on the vector-eligible shapes and on the shapes that fall back to the scalar kernel.
+        luce_add_ggml_gpu_executable(test_cpy_vec_parity test/unit/test_cpy_vec_parity.cpp)
+        list(APPEND _raw_unit_test_targets test_cpy_vec_parity)
         luce_add_ggml_gpu_executable(test_qwen4exp_indexer_score test/unit/test_qwen4exp_indexer_score.cpp)
         target_link_libraries(test_qwen4exp_indexer_score PRIVATE ggml-cpu)
         list(APPEND _raw_unit_test_targets test_qwen4exp_indexer_score)
