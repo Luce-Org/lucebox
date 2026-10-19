@@ -1322,6 +1322,23 @@ if(LUCE_TESTS)
             hip::host)
         list(APPEND _raw_unit_test_targets test_mmid_regression)
 
+        # Guards the row-split GDN prefill recurrence (default for T>1 on
+        # RDNA3.5) against the legacy tiled kernel: same attention output and
+        # final state within float32 reassociation noise at T in {1,5,33,512,4096}.
+        add_executable(test_gdn_rowsplit_parity test/unit/test_gdn_rowsplit_parity.cpp)
+        set_source_files_properties(test/unit/test_gdn_rowsplit_parity.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_gdn_rowsplit_parity PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
+        target_compile_definitions(test_gdn_rowsplit_parity PRIVATE GGML_USE_HIP)
+        target_include_directories(test_gdn_rowsplit_parity PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        target_link_libraries(test_gdn_rowsplit_parity PRIVATE
+            ggml
+            ggml-base
+            ${LUCE_GGML_BACKEND_TARGET}
+            hip::host)
+        list(APPEND _raw_unit_test_targets test_gdn_rowsplit_parity)
+
         add_executable(test_qwen35_gdn_verify_fusion test/unit/test_qwen35_gdn_verify_fusion.cpp)
         set_source_files_properties(test/unit/test_qwen35_gdn_verify_fusion.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_qwen35_gdn_verify_fusion PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")

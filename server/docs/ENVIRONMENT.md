@@ -31,6 +31,7 @@ profile and the requirements checked at startup.
 | `LUCE_MIX_WMMA_GLU` | 1 | =0 keeps the separate SwiGLU-DS4 kernel instead of folding it into the MIX WMMA up launch. |
 | `GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS` | unset | DEBUG: force the paged-attention context partition count (both routes) to bisect partition-overlap and overhead behaviour. |
 | `LUCE_QWEN35_MASK_FULL_WIDTH` | unset | KILL SWITCH (burn-in): =1 restores the full max_ctx-wide causal-mask upload on the Qwen3.5/3.6/3.8 prefill and verify paths. By default only the columns flash attention reads (the live window rounded up to 256, plus one 256 stride) are built and copied. |
+| `LUCE_GDN_LEGACY` | unset | KILL SWITCH: =1 restores the tiled gated-delta-net prefill kernel on the qwen4exp S_v=128 chain path (RDNA3.5, T>=2). By default the row-split recurrence runs there; its output differs from the tiled kernel by float32 reassociation noise. |
 | `LUCE_PREFILL_UBATCH` | backend-dependent (512 in `qwen35_backend.cpp`; 16/384 in `layer_split_daemon.cpp`; `cfg_.chunk` in `qwen35_layer_split_adapter.cpp`) | Prefill ubatch. Under pooled kvflash prefill it is rounded down to a multiple of the pager chunk (never below one chunk) and clamped to the pool, instead of being forced to one chunk per ubatch. |
 | `LUCE_DRAFT_KV` | 1 | KILL SWITCH (remove after burn-in): =0 restores the legacy per-step drafter window recompute instead of the ring cache. |
 | `LUCE_LAGUNA_SWA_RING` | 1 | KILL SWITCH (remove after burn-in): =0 keeps SWA layers on pool-sized caches under KVFlash. |
