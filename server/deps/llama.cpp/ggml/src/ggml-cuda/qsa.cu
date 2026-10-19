@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "qsa.cuh"
+#include "gated-norm.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -277,13 +278,18 @@ struct qsa3_layout {
     size_t q1, q2, o1, o2, m1;
     int nk, n_q, gqa, cap;
     float scale;
+    // GATED: out is F16 [d, head, query] (o1/o2 bytes), gate is the F32 [d, head, query] view (g1 head, g2 query
+    // stride bytes) and the store writes gn_f2h_sat(gn_sigmoid(gate) * attn) -- gated_rms_norm_f16_kernel<256, false>.
+    const float * gate;
+    size_t g1, g2;
 };
 
 #if defined(__gfx1151__) || defined(RDNA4) || !defined(__HIP_DEVICE_COMPILE__)
+template <bool GATED>
 __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         const float * __restrict__ q, const uint16_t * __restrict__ pk, const uint16_t * __restrict__ pv,
         const uint16_t * __restrict__ mask, const uint16_t * __restrict__ ublk, const uint16_t * __restrict__ umask,
-        const int * __restrict__ ucount, float * __restrict__ out, const qsa3_layout s) {
+        const int * __restrict__ ucount, void * __restrict__ out, const qsa3_layout s) {
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, r = lane & 15, hi = lane >> 4;
     const int g = blockIdx.x, kvh = blockIdx.y;
     __shared__ float4 part[3][8][64];
@@ -535,8 +541,17 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
             const int row = 16*i + rr, qi = row / 12, h = row - 12*qi;
             const int query = QSA3_G * g + qi;
             if (query < s.n_q) {
-                float * dst = reinterpret_cast<float *>(reinterpret_cast<char *>(out) + (size_t) query * s.o2 + (size_t) (kvh * s.gqa + h) * s.o1) + 32*w + dq;
-                *reinterpret_cast<float4 *>(dst) = *reinterpret_cast<const float4 *>(ostage + rr * 32 + dq);
+                const float4 o = *reinterpret_cast<const float4 *>(ostage + rr * 32 + dq);
+                if constexpr (GATED) {
+                    const float4 z = *reinterpret_cast<const float4 *>(reinterpret_cast<const char *>(s.gate) + (size_t) query * s.g2 + (size_t) (kvh * s.gqa + h) * s.g1 + (size_t) (32*w + dq) * 4);
+                    uint16_t * dst = reinterpret_cast<uint16_t *>(reinterpret_cast<char *>(out) + (size_t) query * s.o2 + (size_t) (kvh * s.gqa + h) * s.o1) + 32*w + dq;
+                    const uint16_t h0 = __half_as_ushort(gn_f2h_sat(gn_sigmoid(z.x) * o.x)), h1 = __half_as_ushort(gn_f2h_sat(gn_sigmoid(z.y) * o.y));
+                    const uint16_t h2 = __half_as_ushort(gn_f2h_sat(gn_sigmoid(z.z) * o.z)), h3 = __half_as_ushort(gn_f2h_sat(gn_sigmoid(z.w) * o.w));
+                    *reinterpret_cast<uint2 *>(dst) = make_uint2((uint32_t) h0 | ((uint32_t) h1 << 16), (uint32_t) h2 | ((uint32_t) h3 << 16));
+                } else {
+                    float * dst = reinterpret_cast<float *>(reinterpret_cast<char *>(out) + (size_t) query * s.o2 + (size_t) (kvh * s.gqa + h) * s.o1) + 32*w + dq;
+                    *reinterpret_cast<float4 *>(dst) = o;
+                }
             }
         }
         __syncthreads();
@@ -582,7 +597,7 @@ extern "C" GGML_BACKEND_API int ggml_cuda_qsa3_union_cap(int ns) { return (QSA3_
 extern "C" GGML_BACKEND_API void ggml_cuda_qsa3_union_launch(
         const int * ids, size_t i1, int n_q, int ns, int nk, int * srow, int * sflag,
         uint16_t * ublk, uint16_t * umask, int * ucount, int phases, int rows_variant, cudaStream_t stream) {
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__)
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(RDNA4)
     (void) ids; (void) i1; (void) n_q; (void) ns; (void) nk; (void) srow; (void) sflag; (void) ublk; (void) umask;
     (void) ucount; (void) phases; (void) rows_variant; (void) stream;
 #else
@@ -620,20 +635,60 @@ extern "C" GGML_BACKEND_API void ggml_cuda_qsa3_attn_launch(
         const float * q, size_t q1, size_t q2, const uint16_t * pk, const uint16_t * pv, const uint16_t * mask, size_t m1,
         const uint16_t * ublk, const uint16_t * umask, const int * ucount, int n_q, int ns, int nk, int n_kv_head,
         float scale, float * out, size_t o1, size_t o2, cudaStream_t stream) {
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__)
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(RDNA4)
     (void) q; (void) q1; (void) q2; (void) pk; (void) pv; (void) mask; (void) m1; (void) ublk; (void) umask; (void) ucount;
     (void) n_q; (void) ns; (void) nk; (void) n_kv_head; (void) scale; (void) out; (void) o1; (void) o2; (void) stream;
 #else
     const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;
-    qsa3_layout layout{q1, q2, o1, o2, m1, nk, n_q, 12, ggml_cuda_qsa3_union_cap(ns), scale};
-    qsa3_attn_kernel<<<dim3(ngroups, n_kv_head), dim3(256), 0, stream>>>(q, pk, pv, mask, ublk, umask, ucount, out, layout);
+    qsa3_layout layout{q1, q2, o1, o2, m1, nk, n_q, 12, ggml_cuda_qsa3_union_cap(ns), scale, nullptr, 0, 0};
+    qsa3_attn_kernel<false><<<dim3(ngroups, n_kv_head), dim3(256), 0, stream>>>(q, pk, pv, mask, ublk, umask, ucount, out, layout);
     CUDA_CHECK(cudaGetLastError());
 #endif
 }
 
-void ggml_cuda_flash_attn_ext_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+extern "C" GGML_BACKEND_API void ggml_cuda_qsa3_attn_gated_launch(
+        const float * q, size_t q1, size_t q2, const uint16_t * pk, const uint16_t * pv, const uint16_t * mask, size_t m1,
+        const uint16_t * ublk, const uint16_t * umask, const int * ucount, int n_q, int ns, int nk, int n_kv_head,
+        float scale, const float * gate, size_t g1, size_t g2, uint16_t * out, size_t o1, size_t o2, cudaStream_t stream) {
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(RDNA4)
-    (void) ctx; (void) dst;
+    (void) q; (void) q1; (void) q2; (void) pk; (void) pv; (void) mask; (void) m1; (void) ublk; (void) umask; (void) ucount;
+    (void) n_q; (void) ns; (void) nk; (void) n_kv_head; (void) scale; (void) gate; (void) g1; (void) g2; (void) out; (void) o1;
+    (void) o2; (void) stream;
+#else
+    const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;
+    qsa3_layout layout{q1, q2, o1, o2, m1, nk, n_q, 12, ggml_cuda_qsa3_union_cap(ns), scale, gate, g1, g2};
+    qsa3_attn_kernel<true><<<dim3(ngroups, n_kv_head), dim3(256), 0, stream>>>(q, pk, pv, mask, ublk, umask, ucount, out, layout);
+    CUDA_CHECK(cudaGetLastError());
+#endif
+}
+
+bool ggml_cuda_qsa_gate_enabled() {
+    static const bool enabled = [] { const char * e = getenv("LUCE_ATTN_FUSE_LEGACY"); return !(e && atoi(e)); }();
+    return enabled;
+}
+
+bool ggml_cuda_flash_attn_ext_qsa_gate_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const ggml_tensor * gated) {
+    if (!gated || gated->op != GGML_OP_GATED_RMS_NORM_F16 || gated->src[0] != dst || gated->src[1] != nullptr ||
+        !ggml_cuda_flash_attn_ext_qsa_supported(ctx, dst)) { return false; }
+    const ggml_tensor * q = dst->src[0], * z = gated->src[2];
+    // z: the [d, head, query] F32 view of the [q | gate] projection; 16-byte rows for the float4 gate loads.
+    return gated->type == GGML_TYPE_F16 && ggml_is_contiguous(gated) && gated->ne[0] == q->ne[0] * q->ne[2] &&
+        gated->ne[1] == q->ne[1] && z->type == GGML_TYPE_F32 && z->ne[0] == q->ne[0] && z->ne[1] == q->ne[2] &&
+        z->ne[2] == q->ne[1] && z->ne[3] == 1 && z->nb[0] == sizeof(float) && z->nb[1] % 16 == 0 && z->nb[2] % 16 == 0 &&
+        uintptr_t(z->data) % 16 == 0;
+}
+
+static void qsa_prefill_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * gated);
+
+void ggml_cuda_flash_attn_ext_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) { qsa_prefill_run(ctx, dst, nullptr); }
+
+void ggml_cuda_flash_attn_ext_qsa_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * gated) {
+    qsa_prefill_run(ctx, dst, gated);
+}
+
+static void qsa_prefill_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * gated) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(RDNA4)
+    (void) ctx; (void) dst; (void) gated;
     return;
 #else
     const auto * q = dst->src[0], * k = dst->src[1], * m = dst->src[3], * ids = dst->src[5], * pk = dst->src[6], * pv = dst->src[7];
@@ -652,6 +707,15 @@ void ggml_cuda_flash_attn_ext_qsa(ggml_backend_cuda_context & ctx, ggml_tensor *
     }();
     ggml_cuda_qsa3_union_launch((const int *) ids->data, ids->nb[1], n_q, ns, nk, srow.get(), sflag.get(),
                                 ublk.get(), umask.get(), ucount.get(), 3, rows_variant, ctx.stream());
+    if (gated != nullptr) {   // sigmoid(gate) * attn -> F16 [d*heads, query] straight from the store
+        const ggml_tensor * z = gated->src[2];
+        ggml_cuda_qsa3_attn_gated_launch((const float *) q->data, q->nb[1], q->nb[2], (const uint16_t *) pk->data,
+                                   (const uint16_t *) pv->data, m ? (const uint16_t *) m->data : nullptr, m ? m->nb[1] : 0,
+                                   ublk.get(), umask.get(), ucount.get(), n_q, ns, nk, (int) k->ne[2], scale,
+                                   (const float *) z->data, z->nb[1], z->nb[2],
+                                   (uint16_t *) gated->data, (size_t) q->ne[0] * sizeof(uint16_t), gated->nb[1], ctx.stream());
+        return;
+    }
     ggml_cuda_qsa3_attn_launch((const float *) q->data, q->nb[1], q->nb[2], (const uint16_t *) pk->data,
                                (const uint16_t *) pv->data, m ? (const uint16_t *) m->data : nullptr, m ? m->nb[1] : 0,
                                ublk.get(), umask.get(), ucount.get(), n_q, ns, nk, (int) k->ne[2], scale,

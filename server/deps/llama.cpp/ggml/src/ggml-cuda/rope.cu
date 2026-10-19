@@ -3,6 +3,8 @@
 #include "ggml.h"
 #include "rope.cuh"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 struct rope_corr_dims {
@@ -568,6 +570,78 @@ static __global__ void rope_multi_heads(const T * x, T * dst, const int ne00, co
     }
 }
 
+// RMS_NORM -> MUL -> ROPE (multi-section, per-token path) in one launch: one 256-thread block per token loops over
+// the heads; each head row is reduced with rms_norm_f32<256, true>'s thread mapping and block_reduce (one column per
+// thread, same partial-sum form, same tree), scaled as (scale * x) * gamma into LDS, then rotated with the exact
+// expressions of rope_multi_heads. The norm input is read once through its own strides (the strided [q | gate]
+// projection view), so the separate norm kernel's write + read of the normalised rows disappears. Bit-identical
+// to the three-kernel chain. gamma is [ne00] or [ne00, ne01] (per head). ncols <= 256.
+struct rope_norm_args {
+    const float * gamma = nullptr;
+    int           gamma_heads = 1;
+    float         eps = 0.0f;
+};
+
+template <bool forward, bool has_ff, bool use_tab>
+static __global__ void __launch_bounds__(256) rope_multi_heads_norm(const float * x, float * dst, const int ne00,
+        const int ne01, const int ne02, const int s01, const int s02, const int s03, const int s1, const int s2,
+        const int s3, const int n_dims, const int32_t * pos, const float freq_scale, const float ext_factor,
+        const float attn_factor, const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors,
+        const mrope_sections sections, const bool is_imrope, const float2 * tab, const rope_norm_args na) {
+    const uint32_t i2 = blockIdx.x, i3 = blockIdx.y;
+    const int tid = threadIdx.x;
+    __shared__ float s_sum[32];
+    __shared__ float row[256];
+    // this thread's rotation pair (same angle source as rope_multi_heads: the per-forward table or the FP64 code)
+    const int  j   = tid, i0 = 2 * j;
+    const bool pair = j < ne00 / 2, rot = pair && i0 < n_dims;
+    float cos_theta = 0.0f, sin_theta = 0.0f;
+    if (rot) {
+        if constexpr (use_tab) {
+            const float2 cs = tab[i2 * (n_dims / 2) + j];
+            cos_theta = cs.x;
+            sin_theta = cs.y;
+        } else {
+            rope_multi_cs<forward, has_ff>(i0, pos, i2, ne02, freq_scale, ext_factor, attn_factor, corr_dims,
+                theta_scale, freq_factors, sections, is_imrope, cos_theta, sin_theta);
+        }
+    }
+    for (int i1 = 0; i1 < ne01; ++i1) {
+        const float * xr = x + i1 * s01 + i2 * s02 + i3 * s03;
+        float tmp = 0.0f;
+        for (int col = tid; col < ne00; col += 256) {
+            const float xi = xr[col];
+            tmp += xi * xi;
+        }
+        tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
+        const float mean  = tmp / ne00;
+        const float scale = rsqrtf(mean + na.eps);
+        const float * g = na.gamma + (na.gamma_heads > 1 ? (int64_t) i1 * ne00 : 0);
+        for (int col = tid; col < ne00; col += 256) {
+            row[col] = scale * xr[col] * g[col];
+        }
+        __syncthreads();
+        if (pair) {
+            const int idst = i1 * s1 + i2 * s2 + i3 * s3;
+            if (!rot) {
+                dst[idst + i0 + 0] = row[i0 + 0];
+                dst[idst + i0 + 1] = row[i0 + 1];
+            } else {
+                const float x0 = row[j];
+                const float x1 = row[j + n_dims/2];
+                dst[idst + j]            = fmaf(x0, cos_theta, -__fmul_rn(x1, sin_theta));
+                dst[idst + j + n_dims/2] = fmaf(x1, cos_theta, __fmul_rn(x0, sin_theta));
+            }
+        }
+        __syncthreads();
+    }
+}
+
+bool ggml_cuda_norm_rope_enabled() {
+    static const bool enabled = [] { const char * e = getenv("LUCE_ATTN_FUSE_LEGACY"); return !(e && atoi(e)); }();
+    return enabled;
+}
+
 // Per-forward cos/sin table for the per-token path: the FP64 angle depends only on (token, pair), so Q, K and
 // the indexer q of every layer share one table per positions tensor (48 angle kernels per Qwen4exp prefill
 // become 2 table builds). tab[i2 * n_dims/2 + i0/2] is exactly what rope_multi_heads computed inline, so the
@@ -826,7 +900,8 @@ static void rope_multi_cuda(const T *            x,
                             const float *        freq_factors,
                             const mrope_sections sections,
                             const bool           is_imrope,
-                            cudaStream_t         stream) {
+                            cudaStream_t         stream,
+                            const rope_norm_args * norm = nullptr) {
     GGML_ASSERT(ne00 % 2 == 0);
     const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
     const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
@@ -841,6 +916,31 @@ static void rope_multi_cuda(const T *            x,
 #else
     const bool per_token = false;
 #endif
+    if (norm != nullptr) {   // fused RMS_NORM -> MUL -> ROPE (the matcher only admits the per-token F32 case)
+        GGML_ASSERT(per_token && ne00 <= 256);
+        if constexpr (std::is_same_v<T, float>) {
+            const int ne03 = nr / (ne01 * ne02);
+            const dim3 hg(ne02, ne03, 1);
+            const float2 * tab = rope_multi_table_get<forward>(pos_node, pos, ne02, n_dims, freq_scale, ext_factor,
+                attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope, stream);
+            if (tab != nullptr) {
+                rope_multi_heads_norm<forward, false, true><<<hg, 256, 0, stream>>>(x, dst, ne00, ne01, ne02, s01, s02, s03,
+                    s1, s2, s3, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors,
+                    sections, is_imrope, tab, *norm);
+            } else if (freq_factors == nullptr) {
+                rope_multi_heads_norm<forward, false, false><<<hg, 256, 0, stream>>>(x, dst, ne00, ne01, ne02, s01, s02, s03,
+                    s1, s2, s3, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors,
+                    sections, is_imrope, nullptr, *norm);
+            } else {
+                rope_multi_heads_norm<forward, true, false><<<hg, 256, 0, stream>>>(x, dst, ne00, ne01, ne02, s01, s02, s03,
+                    s1, s2, s3, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors,
+                    sections, is_imrope, nullptr, *norm);
+            }
+        } else {
+            GGML_ABORT("fused norm+rope is F32 only");
+        }
+        return;
+    }
     if (per_token) {   // prefill: one block per token (decode keeps rope_multi's per-row blocks)
         const int bx = std::min(128, std::max(32, ne00 / 2)), ne03 = nr / (ne01 * ne02);
         const dim3 hb(bx, 256 / bx, 1), hg(ne02, ne03, 1);
@@ -916,10 +1016,20 @@ template <bool forward>
 void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
                             ggml_tensor *               dst,
                             const ggml_tensor *         set_rows = nullptr,
-                            const ggml_tensor *         perm_cont = nullptr) {
-    const ggml_tensor * src0 = dst->src[0];
+                            const ggml_tensor *         perm_cont = nullptr,
+                            const ggml_tensor *         norm = nullptr,
+                            const ggml_tensor *         mul = nullptr) {
+    // Fused RMS_NORM -> MUL -> ROPE: the rotation reads the norm's input (its own strides) and applies gamma itself.
+    const ggml_tensor * src0 = norm != nullptr ? norm->src[0] : dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * src2 = dst->src[2];
+    rope_norm_args norm_args;
+    if (norm != nullptr) {
+        const ggml_tensor * gamma = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+        norm_args.gamma       = (const float *) gamma->data;
+        norm_args.gamma_heads = (int) gamma->ne[1];
+        memcpy(&norm_args.eps, norm->op_params, sizeof(float));
+    }
 
     const float * src0_d = (const float *)src0->data;
     const float * src1_d = (const float *)src1->data;
@@ -1040,7 +1150,8 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
         if (src0->type == GGML_TYPE_F32) {
             rope_multi_cuda<forward>((const float *) src0_d, (float *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
                                      s2, s3, n_dims, nr, pos, src1, freq_scale, freq_base, ext_factor, attn_factor,
-                                     corr_dims, freq_factors, sections, is_imrope, stream);
+                                     corr_dims, freq_factors, sections, is_imrope, stream,
+                                     norm != nullptr ? &norm_args : nullptr);
         } else if (src0->type == GGML_TYPE_F16) {
             rope_multi_cuda<forward>((const half *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
                                      s2, s3, n_dims, nr, pos, src1, freq_scale, freq_base, ext_factor, attn_factor,
@@ -1096,4 +1207,14 @@ void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rope
 
 void ggml_cuda_op_rope_permuted(ggml_backend_cuda_context & ctx, ggml_tensor * rope, ggml_tensor * cont) {
     ggml_cuda_op_rope_impl<true>(ctx, rope, nullptr, cont);
+}
+
+void ggml_cuda_op_norm_rope(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * rope,
+                            ggml_tensor * cont) {
+    static const bool debug = getenv("LUCE_NORM_ROPE_DEBUG") != nullptr;   // the unit test counts these lines
+    if (debug) {
+        fprintf(stderr, "[norm-rope] fused ne=[%lld,%lld,%lld] cont=%d\n", (long long) rope->ne[0], (long long) rope->ne[1],
+                (long long) rope->ne[2], cont != nullptr);
+    }
+    ggml_cuda_op_rope_impl<true>(ctx, rope, nullptr, cont, norm, mul);
 }

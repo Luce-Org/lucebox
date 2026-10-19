@@ -1362,6 +1362,23 @@ if(LUCE_TESTS)
         list(APPEND _raw_unit_test_targets test_mul_mat_host_input)
         luce_add_ggml_gpu_executable(test_rms_norm_scale test/unit/test_rms_norm_scale.cpp)
         list(APPEND _raw_unit_test_targets test_rms_norm_scale)
+        # Guards the fused RMS_NORM -> MUL -> ROPE [-> PERMUTE -> CONT] kernel (rope.cu): the qwen4exp Q/K/indexer
+        # chains must match (LUCE_NORM_ROPE_DEBUG=1 lines) and hash-equal the separate kernels (LUCE_ATTN_FUSE_LEGACY=1).
+        luce_add_ggml_gpu_executable(test_norm_rope_fusion test/unit/test_norm_rope_fusion.cpp)
+        list(APPEND _raw_unit_test_targets test_norm_rope_fusion)
+        # Guards the qsa3 attention store with the sigmoid gate folded in (qsa.cu): byte-identical F16 to the plain
+        # store + gate kernel. gfx1151 only.
+        add_executable(test_qsa3_gate_parity test/unit/test_qsa3_gate_parity.cpp)
+        set_source_files_properties(test/unit/test_qsa3_gate_parity.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_qsa3_gate_parity PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
+        target_compile_definitions(test_qsa3_gate_parity PRIVATE GGML_USE_HIP)
+        target_include_directories(test_qsa3_gate_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_qsa3_gate_parity PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET} hip::host)
+        list(APPEND _raw_unit_test_targets test_qsa3_gate_parity)
+        # Guards the hc grouped norm node order (qwen4exp_graph.cpp hc_mix): gamma view expanded first makes
+        # RMS_NORM and MUL adjacent (fusable) and hash-equal to the legacy order.
+        luce_add_ggml_gpu_executable(test_hc_norm_mul_fusion test/unit/test_hc_norm_mul_fusion.cpp)
+        list(APPEND _raw_unit_test_targets test_hc_norm_mul_fusion)
         # Guards the wave-per-row gated norm kernels (GDN tail ncols=128 with gamma,
         # attention gate ncols=256 without) against the block-per-row kernels they
         # replace: byte-identical F16 rows at T in {1,7,333,4096}.

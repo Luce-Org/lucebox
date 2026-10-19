@@ -1,6 +1,16 @@
 #pragma once
 #include "common.cuh"
 
+// same expression as op_sigmoid in unary.cu
+static __device__ __forceinline__ float gn_sigmoid(const float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// same saturating conversion as mq_f2h_sat in mmb-q8f16.cuh
+static __device__ __forceinline__ half gn_f2h_sat(const float v) {
+    return __float2half(fabsf(v) > 65504.0f ? copysignf(65504.0f, v) : v);
+}
+
 // Fused gated RMS norm for the qwen4exp gated-delta-net tail: rms_norm(x) * gamma * sigmoid(z), written as F16 so the
 // following Q8_0 -> F16 GEMM reads it directly. Same arithmetic as rms_norm_f32<256, true> + unary_mul(sigmoid) + the
 // MMB F16 activation conversion, so it is bit-exact against that chain.

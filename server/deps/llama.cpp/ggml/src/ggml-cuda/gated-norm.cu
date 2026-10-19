@@ -3,11 +3,6 @@
 #include <cstdlib>
 #include <cstring>
 
-// same saturating conversion as mq_f2h_sat in mmb-q8f16.cuh
-static __device__ __forceinline__ half gn_f2h_sat(const float v) {
-    return __float2half(fabsf(v) > 65504.0f ? copysignf(65504.0f, v) : v);
-}
-
 // One block per (head, token) row, the thread mapping and reduction of rms_norm_f32<256, true>.
 // NORM = false: sigmoid(z) * x only (the attention output gate), same product as unary_mul(sigmoid).
 template <int block_size, bool NORM>

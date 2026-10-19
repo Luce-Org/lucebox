@@ -84,6 +84,7 @@
 #include "ggml-cuda/ds4-hc.cuh"
 #include "ggml-cuda/ds4-indexer.cuh"
 #include "ggml-cuda/qsa-ids.cuh"
+#include "ggml-cuda/qsa.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -5262,6 +5263,51 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, 3, outputs, 1);
     }
 
+    // RMS_NORM -> MUL -> ROPE (multi-section, F32, per-token path) [-> PERMUTE -> CONT]: rope.cu
+    // rope_multi_heads_norm (qwen4exp attention Q/K and indexer q). Rows <= 256, gamma [ne0] or [ne0, heads], no
+    // frequency factors, T >= 64 (the per-token rope path). Bit-identical to the separate kernels.
+    if ((ops.size() == 3 || ops.size() == 5) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL &&
+        ops.begin()[2] == GGML_OP_ROPE &&
+        (ops.size() == 3 || (ops.begin()[3] == GGML_OP_PERMUTE && ops.begin()[4] == GGML_OP_CONT))) {
+        const int last = node_idx + (int) ops.size() - 1;
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { last })) {
+            return false;
+        }
+        const ggml_tensor * norm = cgraph->nodes[node_idx];
+        const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * rope = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * x    = norm->src[0];
+        const ggml_tensor * gamma = mul->src[0] == norm ? mul->src[1] : mul->src[1] == norm ? mul->src[0] : nullptr;
+        const int mode = ggml_get_op_params_i32(rope, 2);
+        const int outputs[] = { last };
+        float eps;
+        memcpy(&eps, norm->op_params, sizeof(float));
+        bool ok = gamma != nullptr && rope->src[0] == mul && rope->src[2] == nullptr &&
+            (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION && !(mode & GGML_ROPE_TYPE_TAIL) &&
+            x->type == GGML_TYPE_F32 && norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+            gamma->type == GGML_TYPE_F32 && rope->type == GGML_TYPE_F32 && eps >= 0.0f &&
+            x->nb[0] == sizeof(float) && x->ne[0] <= 256 && x->ne[0] % 2 == 0 && x->ne[2] >= 64 && x->ne[3] == 1 &&
+            ggml_are_same_shape(norm, mul) && ggml_are_same_shape(mul, rope) && ggml_is_contiguous(gamma) &&
+            gamma->ne[0] == x->ne[0] && (gamma->ne[1] == 1 || gamma->ne[1] == x->ne[1]) && gamma->ne[2] == 1 &&
+            gamma->ne[3] == 1 && ggml_get_op_params_i32(rope, 1) <= x->ne[0];
+        if (ok && ops.size() == 5) {
+            const ggml_tensor * perm = cgraph->nodes[node_idx + 3];
+            const ggml_tensor * cont = cgraph->nodes[node_idx + 4];
+            ok = perm->src[0] == rope && ggml_get_op_params_i32(perm, 0) == 0 &&
+                cont->src[0] == perm && cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont);
+        }
+        return ok && ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), outputs, 1);
+    }
+
+    // FLASH_ATTN_EXT (qsa3 prefill kernel) -> GATED_RMS_NORM_F16 without gamma (the attention output gate
+    // sigmoid(z) * attn -> F16): the attention store applies the gate itself (qsa.cu). The kernel/shape test
+    // (ggml_cuda_flash_attn_ext_qsa_gate_supported) runs at the dispatch site, which has the device context.
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_FLASH_ATTN_EXT && ops.begin()[1] == GGML_OP_GATED_RMS_NORM_F16) {
+        const int outputs[] = { node_idx + 1 };
+        return ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 1 }) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, 2, outputs, 1);
+    }
+
     // dflash: residual ADD + RMS_NORM + MUL. The add output stays live (it is
     // the next residual), so this is a subgraph fusion with two outputs.
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM &&
@@ -6550,6 +6596,30 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
                         ggml_cuda_op_add_rms_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
                         i += 2;
+                        continue;
+                    }
+
+                    // RMS_NORM -> MUL -> ROPE [-> PERMUTE -> CONT] in one kernel (qwen4exp attention Q/K, indexer q);
+                    // ahead of the RMS_NORM + MUL pair below, which would otherwise claim the first two nodes.
+                    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_norm_rope_enabled()) {
+                        if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_PERMUTE, GGML_OP_CONT }, {})) {
+                            ggml_cuda_op_norm_rope(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2], cgraph->nodes[i+4]);
+                            i += 4;
+                            continue;
+                        }
+                        if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
+                            ggml_cuda_op_norm_rope(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2], nullptr);
+                            i += 2;
+                            continue;
+                        }
+                    }
+
+                    // qsa3 prefill attention with the sigmoid output gate applied in its store (F16 out for wo).
+                    if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_qsa_gate_enabled() && i + 1 < cgraph->n_nodes &&
+                        ggml_cuda_flash_attn_ext_qsa_gate_supported(*cuda_ctx, node, cgraph->nodes[i+1]) &&
+                        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_FLASH_ATTN_EXT, GGML_OP_GATED_RMS_NORM_F16 }, {})) {
+                        ggml_cuda_flash_attn_ext_qsa_gated(*cuda_ctx, node, cgraph->nodes[i+1]);
+                        i++;
                         continue;
                     }
 
