@@ -703,7 +703,7 @@ static void qsa_prefill_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     ggml_cuda_pool_alloc<int>      sflag(ctx.pool(), (size_t) n_q);
     static const int rows_variant = [] {
         const char * u = getenv("LUCE_ATTN_PREFILL_LEGACY");
-        return u && atoi(u) ? 1 : 2;
+        return u && atoi(u) ? 0 : 2;
     }();
     ggml_cuda_qsa3_union_launch((const int *) ids->data, ids->nb[1], n_q, ns, nk, srow.get(), sflag.get(),
                                 ublk.get(), umask.get(), ucount.get(), 3, rows_variant, ctx.stream());
