@@ -960,6 +960,22 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
 
 // ── Per-layer n-gram embedding (PLE) ────────────────────────────────────
 
+// The PLE grouped norm: RMS_NORM over [n_embd, hc, T] then MUL by the gamma weight viewed [n_embd, hc]. The gamma
+// view is expanded into the graph first so RMS_NORM and MUL are adjacent nodes and the backend fuses them (the fused
+// kernel forms (scale * x) * gamma with the same two roundings). Visited as the MUL's operand the RESHAPE landed
+// between them and the three sites per forward ran rms_norm_f32 + op_mul.
+// LUCE_PLE_FUSE_LEGACY=1 keeps that order.
+static bool ple_norm_mul_legacy() {
+    static const bool v = [] { const char * e = std::getenv("LUCE_PLE_FUSE_LEGACY"); return e && std::atoi(e); }();
+    return v;
+}
+static ggml_tensor * ple_grouped_norm(ggml_context * c, ggml_cgraph * gf, ggml_tensor * x, ggml_tensor * nw,
+                                      int64_t n_embd, int64_t hc, int64_t T, float eps) {
+    ggml_tensor * gamma = ggml_reshape_2d(c, nw, n_embd, hc);
+    if (!ple_norm_mul_legacy()) ggml_build_forward_expand(gf, gamma);
+    return ggml_mul(c, ggml_rms_norm(c, ggml_reshape_3d(c, x, n_embd, hc, T), eps), gamma);
+}
+
 // spec_state (verify forward): receives the conv history after each token.
 ggml_tensor * build_ple(ggml_context * c, ggml_cgraph * gf, ggml_tensor * hidden,
                         ggml_tensor * ple_emb, const Qwen4ExpLayer & L,
@@ -974,13 +990,7 @@ ggml_tensor * build_ple(ggml_context * c, ggml_cgraph * gf, ggml_tensor * hidden
     ggml_tensor * key   = mm(c, L.ple_key,   ple_emb);   // [hc_dim, T]
     ggml_tensor * value = mm(c, L.ple_value, ple_emb);   // [n_embd, T]
 
-    auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * nw) {
-        ggml_tensor * t = ggml_reshape_3d(c, x, n_embd, hc, T);
-        t = ggml_rms_norm(c, t, eps);
-        t = ggml_reshape_2d(c, t, hc_dim, T);
-        t = ggml_mul(c, t, nw);
-        return ggml_reshape_3d(c, t, n_embd, hc, T);
-    };
+    auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * nw) { return ple_grouped_norm(c, gf, x, nw, n_embd, hc, T, eps); };
 
     key = grouped_norm(key, L.ple_norm_key);
     ggml_tensor * query = grouped_norm(hidden, L.ple_norm_query);
@@ -1033,7 +1043,8 @@ ggml_tensor * build_ple(ggml_context * c, ggml_cgraph * gf, ggml_tensor * hidden
         ggml_tensor * term = ggml_mul(c, shifted, wk);
         conv_out = conv_out ? ggml_add(c, conv_out, term) : term;
     }
-    conv_out = ggml_reshape_3d(c, ggml_cont(c, ggml_silu(c, conv_out)), n_embd, hc, T);
+    // silu's output is a fresh contiguous tensor (reshape asserts it): no CONT (it was a 169 MB copyBuffer at p4096).
+    conv_out = ggml_reshape_3d(c, ggml_silu(c, conv_out), n_embd, hc, T);
 
     ggml_tensor * ple_out = ggml_add(c, hidden, ggml_add(c, gated, conv_out));
     // Expand now so the conv matcher sees a contiguous concat -> state -> taps -> silu subgraph.
@@ -1214,11 +1225,7 @@ static ggml_tensor * build_ple_row(ggml_context * c, ggml_cgraph * gf,
         const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, ggml_tensor * state) {
     const int64_t n_embd = w.n_embd, hc = w.n_hc, hc_dim = n_embd * hc;
     const float eps = w.rms_eps;
-    auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * nw) {
-        ggml_tensor * t = ggml_rms_norm(c, ggml_reshape_3d(c, x, n_embd, hc, 1), eps);
-        return ggml_reshape_3d(c, ggml_mul(c, ggml_reshape_2d(c, t, hc_dim, 1), nw),
-                               n_embd, hc, 1);
-    };
+    auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * nw) { return ple_grouped_norm(c, gf, x, nw, n_embd, hc, 1, eps); };
     key = grouped_norm(key, L.ple_norm_key);
     ggml_tensor * query = grouped_norm(hidden, L.ple_norm_query);
     ggml_tensor * score = ggml_scale(c, ggml_sum_rows(c, ggml_mul(c, key, query)),
@@ -1255,7 +1262,7 @@ static ggml_tensor * build_ple_row(ggml_context * c, ggml_cgraph * gf,
         ggml_tensor * term = ggml_mul(c, shifted, wk);
         conv_out = conv_out ? ggml_add(c, conv_out, term) : term;
     }
-    conv_out = ggml_reshape_3d(c, ggml_cont(c, ggml_silu(c, conv_out)), n_embd, hc, 1);
+    conv_out = ggml_reshape_3d(c, ggml_silu(c, conv_out), n_embd, hc, 1);
     return ggml_add(c, hidden, ggml_add(c, gated, conv_out));
 }
 

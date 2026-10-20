@@ -1436,6 +1436,14 @@ if(LUCE_TESTS)
         # to a host reference on the vector-eligible shapes and on the shapes that fall back to the scalar kernel.
         luce_add_ggml_gpu_executable(test_cpy_vec_parity test/unit/test_cpy_vec_parity.cpp)
         list(APPEND _raw_unit_test_targets test_cpy_vec_parity)
+        # Guards the fused PLE conv matcher (ple-conv.cu): the qwen4exp subgraph must match (no LUCE_PLE_DEBUG
+        # "no match" lines) and hash-equal the unfused nodes (child process under LUCE_PLE_FUSE_LEGACY=1).
+        luce_add_ggml_gpu_executable(test_ple_conv_fusion test/unit/test_ple_conv_fusion.cpp)
+        list(APPEND _raw_unit_test_targets test_ple_conv_fusion)
+        # Guards the PLE grouped norm node order: with the gamma view expanded first RMS_NORM and MUL are adjacent (the
+        # backend fuses them) and the output hash equals the unfused order.
+        luce_add_ggml_gpu_executable(test_ple_norm_mul_fusion test/unit/test_ple_norm_mul_fusion.cpp)
+        list(APPEND _raw_unit_test_targets test_ple_norm_mul_fusion)
         luce_add_ggml_gpu_executable(test_qwen4exp_indexer_score test/unit/test_qwen4exp_indexer_score.cpp)
         target_link_libraries(test_qwen4exp_indexer_score PRIVATE ggml-cpu)
         list(APPEND _raw_unit_test_targets test_qwen4exp_indexer_score)
