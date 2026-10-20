@@ -3,7 +3,9 @@
 // Rebuilds the qwen4exp attention chains: Q from the strided [q | gate] projection view [256,24,T] -> norm -> gamma
 // -> M-RoPE (n_dims 64) -> permute -> cont (the 5-op chain), K [256,2,T] and the indexer q [128,4,T] without the
 // permute (the 3-op chain). The fused arm must match on every chain (LUCE_NORM_ROPE_DEBUG=1 "[norm-rope] fused"
-// lines, 3 per compute) and hash-equal the legacy arm (child process). SKIP (77) without a GPU.
+// lines, 3 per compute) and hash-equal the legacy arm (child process). Without the qwen4exp profile (a Qwen3.5-style
+// q/k-norm M-RoPE graph) nothing may fuse: the switch must change neither the output nor the kernels. SKIP (77)
+// without a GPU.
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
@@ -83,9 +85,10 @@ uint64_t run_all(ggml_backend_t gpu, bool & ok) {
     return h;
 }
 
-// Child: this binary with --hash, stdout+stderr merged. Returns the hash line; counts "[norm-rope] fused" lines.
-bool child(const char * self, const char * env, uint64_t & hash, int & fused) {
-    const std::string cmd = std::string(env) + " '" + self + "' --hash 2>&1";
+// Child: this binary with `mode` (--hash, or --hash-off without the qwen4exp profile), stdout+stderr merged.
+// Returns the hash line; counts "[norm-rope] fused" lines.
+bool child(const char * self, const char * env, const char * mode, uint64_t & hash, int & fused) {
+    const std::string cmd = std::string(env) + " '" + self + "' " + mode + " 2>&1";
     FILE * f = popen(cmd.c_str(), "r");
     if (!f) return false;
     char line[256]; bool got = false; fused = 0;
@@ -100,10 +103,12 @@ bool child(const char * self, const char * env, uint64_t & hash, int & fused) {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    if (argc > 1 && !std::strcmp(argv[1], "--hash")) {
+    if (argc > 1 && (!std::strcmp(argv[1], "--hash") || !std::strcmp(argv[1], "--hash-off"))) {
         ggml_backend_t gpu = ggml_backend_cuda_init(0);
         if (!gpu) return 77;
-        ggml_backend_cuda_set_qwen4exp_profile(GGML_CUDA_QWEN4EXP_DEFAULT);   // the fusions are gated on the qwen4exp profile
+        if (!std::strcmp(argv[1], "--hash")) {
+            ggml_backend_cuda_set_qwen4exp_profile(GGML_CUDA_QWEN4EXP_DEFAULT);   // the fusions are gated on the qwen4exp profile
+        }
         bool ok = true;
         const uint64_t h = run_all(gpu, ok);
         ggml_backend_free(gpu);
@@ -116,10 +121,16 @@ int main(int argc, char ** argv) {
         ggml_backend_free(gpu);
     }
     uint64_t hf = 0, hl = 0; int nf = 0, nl = 0;
-    const bool gf = child(argv[0], "LUCE_NORM_ROPE_DEBUG=1 LUCE_ATTN_FUSE_LEGACY=0", hf, nf);
-    const bool gl = child(argv[0], "LUCE_ATTN_FUSE_LEGACY=1", hl, nl);
-    const bool ok = gf && gl && hf == hl && nf == 9 && nl == 0;   // 3 chains x 3 sizes fused, none on the legacy arm
-    std::printf("[norm-rope-fusion] fused %llx (fused lines %d, want 9) legacy %llx (fused lines %d) %s\n",
-                (unsigned long long) hf, nf, (unsigned long long) hl, nl, ok ? "PASS" : "FAIL");
+    uint64_t of = 0, ol = 0; int nof = 0, nol = 0;
+    const bool gf = child(argv[0], "LUCE_NORM_ROPE_DEBUG=1 LUCE_ATTN_FUSE_LEGACY=0", "--hash", hf, nf);
+    const bool gl = child(argv[0], "LUCE_ATTN_FUSE_LEGACY=1", "--hash", hl, nl);
+    const bool go = child(argv[0], "LUCE_NORM_ROPE_DEBUG=1 LUCE_ATTN_FUSE_LEGACY=0", "--hash-off", of, nof);
+    const bool gol = child(argv[0], "LUCE_NORM_ROPE_DEBUG=1 LUCE_ATTN_FUSE_LEGACY=1", "--hash-off", ol, nol);
+    // qwen4exp: 3 chains x 3 sizes fused, none on the legacy arm. Profile off: none fused, same output either way.
+    const bool ok = gf && gl && hf == hl && nf == 9 && nl == 0 && go && gol && of == ol && nof == 0 && nol == 0;
+    std::printf("[norm-rope-fusion] fused %llx (fused lines %d, want 9) legacy %llx (fused lines %d); "
+                "profile off %s %llx (fused lines %d, want 0) legacy %llx %s\n",
+                (unsigned long long) hf, nf, (unsigned long long) hl, nl, go ? "ran" : "CRASHED",
+                (unsigned long long) of, nof, (unsigned long long) ol, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

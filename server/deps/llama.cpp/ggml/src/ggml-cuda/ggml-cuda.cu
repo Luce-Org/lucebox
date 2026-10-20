@@ -6615,6 +6615,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
 
                     // qsa3 prefill attention with the sigmoid output gate applied in its store (F16 out for wo).
+                    // qsa.cu is built for HIP only, like the qsa calls in fattn.cu.
+#if defined(GGML_USE_HIP)
                     if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_qsa_gate_enabled() && i + 1 < cgraph->n_nodes &&
                         ggml_cuda_flash_attn_ext_qsa_gate_supported(*cuda_ctx, node, cgraph->nodes[i+1]) &&
                         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_FLASH_ATTN_EXT, GGML_OP_GATED_RMS_NORM_F16 }, {})) {
@@ -6622,6 +6624,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         i++;
                         continue;
                     }
+#endif
 
                     // Bit-exact replacement for the two-kernel GDN normalization.
                     // Qualified for qwen4exp on RDNA3.5 and 128-wide rows.

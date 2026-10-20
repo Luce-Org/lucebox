@@ -637,9 +637,15 @@ static __global__ void __launch_bounds__(256) rope_multi_heads_norm(const float 
     }
 }
 
+// The fused kernel is rope_multi_cuda's per-token path, which runs only for qwen4exp on HIP RDNA3.5. Other q/k-norm
+// M-RoPE graphs (Qwen3.5, CUDA builds) keep the separate kernels.
 bool ggml_cuda_norm_rope_enabled() {
+#if defined(GGML_USE_HIP)
     static const bool enabled = [] { const char * e = getenv("LUCE_ATTN_FUSE_LEGACY"); return !(e && atoi(e)); }();
-    return enabled;
+    return enabled && ggml_cuda_qwen4exp_enabled();
+#else
+    return false;
+#endif
 }
 
 // Per-forward cos/sin table for the per-token path: the FP64 angle depends only on (token, pair), so Q, K and
