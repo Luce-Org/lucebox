@@ -132,6 +132,14 @@ TEST_CASE(KvflashLiveRestoreFixture, gen_ckpt_position_needs_history_to_cover_cu
     CHECK(kvflash_gen_ckpt_pos(-3, 10) == -1);
 }
 
+TEST_CASE(KvflashLiveRestoreFixture, early_stop_inside_a_verified_block_needs_a_state_repair) {
+    CHECK(spec_early_stop_needs_repair(4, 2, false));    // EOS or cancel mid-block
+    CHECK(spec_early_stop_needs_repair(4, 1, false));
+    CHECK(!spec_early_stop_needs_repair(4, 4, false));   // whole block emitted (EOS last)
+    CHECK(!spec_early_stop_needs_repair(1, 1, false));   // plain decode step
+    CHECK(!spec_early_stop_needs_repair(4, 2, true));    // budget close rewinds on its own
+}
+
 // ---- spec decode: committed ids are appended to the history ---------------
 
 TEST_CASE(KvflashLiveRestoreFixture, history_append_takes_generated_ids_after_entry) {

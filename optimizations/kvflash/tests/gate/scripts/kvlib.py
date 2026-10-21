@@ -27,7 +27,7 @@ class Server:
         shutil.rmtree(cdir, ignore_errors=True)
         os.makedirs(cdir)
         args = [BIN, MODEL, "--host", "127.0.0.1", "--port", str(PORT), "--max-ctx", MAX_CTX,
-                "--kvflash", POOL, "--model-name", "luce"] + ["--kv-cache-dir", cdir] + os.environ.get("KV_EXTRA", "").split() + self.extra
+                "--model-name", "luce"] + ([] if POOL == "off" else ["--kvflash", POOL]) + ["--kv-cache-dir", cdir] + os.environ.get("KV_EXTRA", "").split() + self.extra
         self.f = open(self.log, "w")
         self.p = subprocess.Popen(args, stdout=self.f, stderr=subprocess.STDOUT, env=e,
                                   stdin=subprocess.DEVNULL)

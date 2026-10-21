@@ -38,6 +38,7 @@ Disk KV cache: every server starts on its own empty `--kv-cache-dir` under
 `~/.cache` or from an earlier run can turn a cold arm into a restore. Check
 `disk_hit=false` in the `chat CACHE` lines.
 
+Both gate arms (not the scenarios) also run `--no-kv-cache --prefix-cache-slots 0`.
 Both arms and all references use the same settings: the same model file,
 default KV cache type, `--max-ctx 131072`, `--kvflash 8192` (pool size in
 tokens), temperature 0, seed 1, a first turn of about 12500 filler tokens, 10
@@ -60,6 +61,17 @@ export KV_PORT=18290                     # optional
 run_gate.sh /path/to/luce_server plain 10      # BINARY MODE [TURNS] [TAG]
 run_scenarios.sh /path/to/luce_server all      # BINARY [1|2|3|all] [TAG]
 ```
+
+`KV_SCRIPT=gate5_verbatim.py` runs the generation-end checkpoint variant: each
+prompt is the previous prompt plus the generated tokens verbatim (one user
+message carrying the ChatML transcript), so a live restore can resume at the
+generation-end rung. The default `gate4_live.py` re-renders the chat template,
+which strips the think block, so its prompts never reach that rung. Both arms
+run with `--no-kv-cache --prefix-cache-slots 0`; without that, arm A restores
+from the RAM prefix cache and is not cold. `KV_B_ARGS` replaces
+`--prefix-cache-slots 0` for arm B only (e.g. `--prefix-cache-slots 32
+--agent-turn-cache` with `KV_POOL=off` to test main's turn cache without
+KVFlash).
 
 Output goes to `$KV_GATE_DIR/out/<mode>-<tag>/` (`provenance.txt` with the
 binary path and md5, `gate4_A.out`, `gate4_B.out`, `cmp.out`) and

@@ -2,6 +2,12 @@
 # usage: KV_GATE_DIR=<dir> KV_MODEL=<model.gguf> run_gate.sh BINARY MODE [TURNS] [TAG]
 #   MODE = plain   : session gate (A LUCE_KVFLASH_SESSION=0 cold re-prefill, B LUCE_KVFLASH_SESSION=1 live restore)
 #   MODE = dflash2 : the same with a DFlash2 draft model (needs KV_DRAFT=<draft.gguf>)
+# KV_SCRIPT = gate4_live.py (default: chat-template re-render, the next prompt does not contain the generated think block)
+#           | gate5_verbatim.py (each prompt = previous prompt + generated tokens verbatim, so live restore reaches the
+#             generation-end rung; use this one to test gen ckpts)
+# Neither arm uses the disk KV cache or, by default, the RAM prefix cache (--prefix-cache-slots 0), so arm A is a cold
+# prefill and arm B can only restore from the KVFlash session. KV_B_ARGS replaces "--prefix-cache-slots 0" for arm B only
+# (e.g. "--prefix-cache-slots 32 --agent-turn-cache"); KV_POOL=off starts without --kvflash.
 # Required: KV_GATE_DIR (output, lock and TMPDIR live under it), KV_MODEL. Optional: KV_DRAFT, KV_PORT.
 # The caller picks the GPU (export CUDA_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES); this script sets no device variable.
 # Each arm gets its own empty disk KV cache ($KV_GATE_DIR/kv-cache-A, -B), so arm A is a cold prefill whatever is in ~/.cache.
@@ -16,13 +22,16 @@ G=$KV_GATE_DIR; D=$G/out/$MODE-$TAG; mkdir -p "$D" "$G/tmp"
 export TMPDIR=$G/tmp KV_ROOT=$D KV_BIN=$BIN KV_PORT=${KV_PORT:-18290} G4_TURNS=$TURNS KV_MODEL
 if [ "$MODE" = dflash2 ]; then
   [ -n "${KV_DRAFT:-}" ] || { echo "SKIP: mode dflash2 needs KV_DRAFT=<draft.gguf>" >&2; exit 0; }
-  export KV_EXTRA="--draft $KV_DRAFT"
-elif [ "$MODE" != plain ]; then echo "bad MODE" >&2; exit 2; fi
+  BASE_EXTRA="--draft $KV_DRAFT"
+elif [ "$MODE" = plain ]; then BASE_EXTRA=""
+else echo "bad MODE" >&2; exit 2; fi
+BASE_EXTRA="$BASE_EXTRA --no-kv-cache"
+SCRIPT=${KV_SCRIPT:-gate4_live.py}
 exec 9>"$G/server.lock"; flock -n 9 || { echo "another gate holds the lock" >&2; exit 3; }
 pgrep -x luce_server >/dev/null && { echo "a luce_server is already running" >&2; exit 3; }
 echo "bin=$BIN md5=$(md5sum "$BIN" | cut -d' ' -f1) mode=$MODE turns=$TURNS out=$D" | tee "$D/provenance.txt"
 cd "$HERE/scripts"
-KV_CACHE_DIR=$G/kv-cache-A python3 -I gate4_live.py A > "$D/gate4_A.out" 2>&1 || { echo "arm A failed, see $D/gate4_A.out"; exit 1; }
-KV_CACHE_DIR=$G/kv-cache-B python3 -I gate4_live.py B > "$D/gate4_B.out" 2>&1 || { echo "arm B failed, see $D/gate4_B.out"; exit 1; }
+KV_EXTRA="$BASE_EXTRA --prefix-cache-slots 0" KV_CACHE_DIR=$G/kv-cache-A python3 -I $SCRIPT A > "$D/gate4_A.out" 2>&1 || { echo "arm A failed, see $D/gate4_A.out"; exit 1; }
+KV_EXTRA="$BASE_EXTRA ${KV_B_ARGS:---prefix-cache-slots 0}" KV_CACHE_DIR=$G/kv-cache-B python3 -I $SCRIPT B > "$D/gate4_B.out" 2>&1 || { echo "arm B failed, see $D/gate4_B.out"; exit 1; }
 python3 -I cmp_gate.py "$D" | tee "$D/cmp.out"
 exit "${PIPESTATUS[0]}"

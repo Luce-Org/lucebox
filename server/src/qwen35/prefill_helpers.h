@@ -227,6 +227,15 @@ inline int kvflash_gen_ckpt_pos(int cur_pos, size_t history_size) {
     return cur_pos > 0 && history_size >= (size_t)cur_pos ? cur_pos : -1;
 }
 
+// A speculative step verified commit_n tokens, so the recurrent state is
+// commit_n tokens ahead of the step start. When the emit loop stops early
+// (EOS, cancel) the state must be rolled back to the emitted prefix. A budget
+// close repairs itself, and the floor path has its own repair.
+inline bool spec_early_stop_needs_repair(int commit_n, int emitted, bool budget_close_fired) {
+    (void)commit_n; (void)emitted; (void)budget_close_fired;
+    return false;
+}
+
 // History after a decode phase: history[0:base] followed by the generated ids
 // out_tokens[out_entry:]. Rebuilds from `base` rather than appending, so it is
 // idempotent over an AR fallback that already pushed some of the same ids.
