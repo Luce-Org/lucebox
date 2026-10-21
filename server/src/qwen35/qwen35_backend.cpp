@@ -2084,8 +2084,9 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     }
 
     // S9: checkpoint the DeltaNet state at the generation end so the next turn
-    // resumes after the answer. After any speculative rollback cur_pos is the
-    // committed position, where KV and state hold exactly history[0:G].
+    // resumes after the answer. Speculative rollback and the early-stop repair
+    // (EOS, cancel inside a verified block) leave cur_pos at the committed
+    // position, where KV and state hold exactly history[0:G].
     if (kvflash_session_enabled() && kvflash_active() && !cfg_.paged_attention &&
         !has_images && req.n_gen > 0) {
         const int G = kvflash_gen_ckpt_pos(cache_.cur_pos, kvflash_history_.size());
@@ -4846,6 +4847,28 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                     vocab_v, sampler_, out_tokens, sampler_rng_);
             } else {
                 last_tok = replay_last_tok;
+            }
+            // The target ran all commit_n tokens. After an early stop (EOS,
+            // cancel) its recurrent state and feature ring are ahead of the
+            // emitted prefix: restore the pre-step snapshot and replay only
+            // the emitted tokens, as the floor path does. A budget close is
+            // repaired below.
+            if (spec_early_stop_needs_repair(commit_n, emitted, budget_close_fired)) {
+                if (!target->restore_kv()) {
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                cache_.cur_pos = committed;
+                std::vector<int32_t> replay_prefix(replay_tok.begin(),
+                                                   replay_tok.begin() + emitted);
+                int prefix_last_tok = -1;
+                if (!target->verify_batch(replay_prefix, committed,
+                                          prefix_last_tok, nullptr)) {
+                    std::fprintf(stderr, "spec-decode: early-stop prefix replay failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                target_forwards++;
             }
             committed += emitted;
         }

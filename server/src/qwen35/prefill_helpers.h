@@ -232,8 +232,7 @@ inline int kvflash_gen_ckpt_pos(int cur_pos, size_t history_size) {
 // (EOS, cancel) the state must be rolled back to the emitted prefix. A budget
 // close repairs itself, and the floor path has its own repair.
 inline bool spec_early_stop_needs_repair(int commit_n, int emitted, bool budget_close_fired) {
-    (void)commit_n; (void)emitted; (void)budget_close_fired;
-    return false;
+    return emitted < commit_n && !budget_close_fired;
 }
 
 // History after a decode phase: history[0:base] followed by the generated ids
