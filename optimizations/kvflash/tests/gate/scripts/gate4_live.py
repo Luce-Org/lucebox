@@ -1,13 +1,14 @@
 """Gate 4 (S8a): 10-turn chat.
   A: python3 -I gate4_live.py A     LUCE_KVFLASH_SESSION=0 (cold re-prefill); writes gate4_A.json (prompts + answers)
   B: python3 -I gate4_live.py B     LUCE_KVFLASH_SESSION=1 (live restore), replays A's prompts verbatim
-  C: python3 -I gate4_live.py C     negative: B setup, turns 1-5 as A, turn 6 with a middle message edited
 Env: G4_T1 (turn-1 filler tokens, default 12500), G4_TURNS (10)."""
 import sys, os, json, time, statistics
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kvlib import *
 
 mode = sys.argv[1]
+if mode not in ("A", "B"):
+    sys.exit(__doc__)
 T1 = int(os.environ.get("G4_T1", "12500"))
 TURNS = int(os.environ.get("G4_TURNS", "10"))
 SYS = {"role": "system", "content": "You are a careful assistant who reads long record dumps. Keep answers short (two sentences)."}
@@ -23,7 +24,7 @@ def user_msg(t):
 # One switch: LUCE_KVFLASH_SESSION is on by default with --kvflash; =0 is the cold re-prefill reference.
 env = {"LUCE_KVFLASH_SESSION": "0" if mode == "A" else "1"}
 log = f"{ROOT}/gate4_{mode}.log"
-ref = json.load(open(f"{ROOT}/gate4_A.json")) if mode in ("B", "C") else None
+ref = json.load(open(f"{ROOT}/gate4_A.json")) if mode == "B" else None
 rec = []
 
 
@@ -40,10 +41,6 @@ with Server(log, env=env):
     for t in range(1, TURNS + 1):
         if ref:
             msgs = json.loads(json.dumps(ref[t - 1]["messages"]))
-            if False:  # q38spec: C = live arm without drafter, replays A verbatim
-                # edit the user message of turn 3 (a middle message); keep everything else
-                idx = [i for i, m in enumerate(msgs) if m["role"] == "user"][2]
-                msgs[idx]["content"] = msgs[idx]["content"].replace("Update 3.0", "Update 3.0 (EDITED)", 1)
         else:
             msgs = msgs + [{"role": "user", "content": user_msg(t)}]
         pos = os.path.getsize(log)
