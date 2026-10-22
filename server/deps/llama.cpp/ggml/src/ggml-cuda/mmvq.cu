@@ -876,7 +876,7 @@ static int mmvq_invariant_rows(int64_t nrows_x, mmvq_parameter_table_id table_id
 }
 
 // LDS activation staging on the same launch: waves per block (0 = off). Override API, then
-// LUCE_MMVQ_INVARIANT_LDS (0 = off, 4 / 8 / 16 waves), then the default. A block of that many waves
+// LUCE_MMVQ_INVARIANT_LDS (0 = off, 4 / 8 / 16 / 32 waves), then the default. A block of that many waves
 // (each with its `rpb` weight rows) copies the T columns' q8_1 blocks into LDS, MMVQ_INVARIANT_LDS_CHUNK
 // blocks per column at a time, and every wave reads the activation from LDS instead of streaming it
 // through L0/L1 once per weight row; the weight stream stays as it is. Compiled for rows 2 with 4 / 8 / 16 /
@@ -901,7 +901,16 @@ static int mmvq_invariant_lds_blocks(int nsm) {
     }();
     return env_blocks > 0 ? env_blocks : 2*nsm;
 }
-static int mmvq_invariant_lds_waves(int64_t nrows_x, int rpb, mmvq_parameter_table_id table_id) {
+// The requested waves if a compiled launch takes them, else 0. A block holds at most 1024 threads,
+// so 32 waves need 32-lane waves. Wave64 GCN/CDNA is refused today by its two-warp table entry too.
+static constexpr int mmvq_invariant_lds_fit(int waves, int rpb, int nwarps, int64_t nrows_x, int warp_size) {
+    return (waves == 4 || waves == 8 || waves == 16 || waves == 32) && waves*warp_size <= 1024 &&
+           !(rpb == 1 && waves != 8) && !(rpb == 4 && waves != 16) && nwarps == 1 && nrows_x % (rpb*waves) == 0
+        ? waves : 0;
+}
+static_assert(mmvq_invariant_lds_fit(32, 2, 1, 4096, 32) == 32 && mmvq_invariant_lds_fit(32, 2, 1, 4096, 64) == 0 &&
+              mmvq_invariant_lds_fit(16, 4, 1, 4096, 64) == 16, "a block holds at most 1024 threads");
+static int mmvq_invariant_lds_waves(int64_t nrows_x, int rpb, mmvq_parameter_table_id table_id, int warp_size) {
     static const int env_waves = []() {
         const char * e = std::getenv("LUCE_MMVQ_INVARIANT_LDS");
         return e ? std::atoi(e) : -1;
@@ -909,10 +918,7 @@ static int mmvq_invariant_lds_waves(int64_t nrows_x, int rpb, mmvq_parameter_tab
     int waves = ggml_cuda_mmvq_invariant_lds_override();
     if (waves < 0) waves = env_waves;
     if (waves < 0) waves = MMVQ_INVARIANT_LDS_DEFAULT;
-    if (waves != 4 && waves != 8 && waves != 16 && waves != 32) return 0;
-    if ((rpb == 1 && waves != 8) || (rpb == 4 && waves != 16)) return 0;
-    if (calc_nwarps(GGML_TYPE_Q8_0, 1, table_id) != 1 || nrows_x % (rpb*waves) != 0) return 0;
-    return waves;
+    return mmvq_invariant_lds_fit(waves, rpb, calc_nwarps(GGML_TYPE_Q8_0, 1, table_id), nrows_x, warp_size);
 }
 
 // Dense projections at two to sixteen columns use the same weight row for
@@ -3377,7 +3383,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     if constexpr (type == GGML_TYPE_Q8_0) {
         if (width_invariant) {
             const int rpb = mmvq_invariant_rows(nrows_x, table_id);
-            const int lds_waves = mmvq_invariant_lds_waves(nrows_x, rpb, table_id);
+            const int lds_waves = mmvq_invariant_lds_waves(nrows_x, rpb, table_id, warp_size);
             const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
             const bool lds_whole = lds_waves > 0 && !has_fusion && mmvq_invariant_lds_whole(ncols_dst, ncols_x/QK8_0);
             const int lds_bytes = lds_waves > 0
