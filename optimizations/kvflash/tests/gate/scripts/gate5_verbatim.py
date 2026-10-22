@@ -1,8 +1,10 @@
 """Like gate4_live.py, but every turn's prompt is the previous prompt + the generated tokens verbatim,
 so live restore can reach the generation-end rung G (a chat template re-render strips the think block and never does).
 One user message carries the whole transcript as ChatML text. A: LUCE_KVFLASH_SESSION=0 (cold). B: =1, replays A's prompts.
+Thinking off only: the chain copies the empty think block the template pre-fills, so a turn that streams reasoning exits.
+B exits nonzero when live restore ran but no turn resumed at the generation-end checkpoint (C == G).
 Writes gate4_<mode>.json/.log so cmp_gate.py works unchanged."""
-import sys, os, json, time
+import sys, os, json, time, re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kvlib import *
 
@@ -21,6 +23,12 @@ def seg_since(pos):
     time.sleep(0.7)
     with open(log, errors="replace") as f:
         f.seek(pos); return f.read().splitlines()
+
+def consumed(gen, live):
+    """This turn's live restore resumed at the generation-end checkpoint (C == G) and did not fall back to a cold prefill."""
+    g = {m.group(1) for l in gen for m in [re.search(r"gen ckpt check: G=(\d+)", l)] if m}
+    c = {m.group(1) for l in live for m in [re.search(r"live restore: L=\d+ C=(\d+)", l)] if m}
+    return bool(g & c) and not any("failed" in l for l in live)
 
 def chat_raw(content, mt):
     body = json.dumps({"model": "luce", "messages": [{"role": "user", "content": content}], "temperature": 0, "seed": 1,
@@ -51,11 +59,15 @@ with Server(log, env=env):
         pos = os.path.getsize(log)
         o = chat_raw(content, 80)
         seg = seg_since(pos)
+        live, gen = [l for l in seg if "live restore" in l], [l for l in seg if "gen ckpt" in l]
         r = dict(turn=t, content=content, answer=o["text"], reasoning=o["reasoning"], finish=o["finish"], prompt_tokens=o["pt"], ct=o["ct"], tps=None,
-                 live=[l for l in seg if "live restore" in l], gen=[l for l in seg if "gen ckpt" in l])
+                 live=live, gen=gen, consumed=consumed(gen, live))
         rec.append(r)
         print(json.dumps({k: v for k, v in r.items() if k != "content"}), flush=True)
-        # next prompt = this prompt + generated tokens (think block + answer + EOS) + the next user turn, as raw ChatML
-        gen = ("<think>" + o["reasoning"] + "</think>\n\n" if o["reasoning"] is not None else "") + o["text"]
-        content = content + "<|im_end|>\n<|im_start|>assistant\n" + "<think>\n\n</think>\n\n" + o["text"] + "<|im_end|>\n<|im_start|>user\n" + upd(t + 1)
+        if o["reasoning"]:
+            sys.exit(f"turn {t} streamed reasoning; the verbatim chain needs thinking off")
+        # next prompt = this prompt + the pre-filled empty think block + answer + EOS + the next user turn, as raw ChatML
+        content = content + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n" + o["text"] + "<|im_end|>\n<|im_start|>user\n" + upd(t + 1)
 json.dump(rec, open(f"{ROOT}/gate4_{mode}.json", "w"), indent=1)
+if mode == "B" and any(r["live"] for r in rec) and not any(r["consumed"] for r in rec):
+    sys.exit("live restore ran but no turn resumed at the generation-end checkpoint (C == G)")
