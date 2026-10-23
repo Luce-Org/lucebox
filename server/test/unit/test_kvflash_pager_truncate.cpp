@@ -63,7 +63,12 @@ KvFlashConfig make_cfg() {
 
 void must(bool ok) { if (!ok) throw std::runtime_error("kvflash truncate helper precondition failed"); }
 
-uint8_t pat(int c, size_t i) { return (uint8_t)(c * 53 + i * 31 + 7); }
+// Mixed per (chunk, byte offset in chunk) so no two segments share bytes.
+uint8_t pat(int c, size_t i) {
+    uint32_t x = (uint32_t)c * 2654435761u ^ (uint32_t)i * 2246822519u;
+    x ^= x >> 15; x *= 2246822519u; x ^= x >> 13; x *= 3266489917u; x ^= x >> 16;
+    return (uint8_t)(x >> 24) | 1u;
+}
 
 // Write logical chunk c's rows [0, nrows) with a deterministic pattern; rows
 // >= nrows stay zero (what a pager that only saw nrows tokens holds).

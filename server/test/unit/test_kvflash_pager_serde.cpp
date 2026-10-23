@@ -82,8 +82,14 @@ void for_each_segment(Harness & h, int block, F && fn) {
     }
 }
 
-// Deterministic per-(logical chunk, seed) byte pattern, never all-zero.
-uint8_t pat(int c, int seed, size_t i) { return (uint8_t)(c * 53 + seed * 29 + i * 31 + 7); }
+// Deterministic per-(logical chunk, seed, byte offset in chunk) pattern. `i` is
+// the offset across the whole chunk, so every segment gets different bytes (a
+// linear pattern with a short period repeated identically in each segment).
+uint8_t pat(int c, int seed, size_t i) {
+    uint32_t x = (uint32_t)c * 2654435761u ^ (uint32_t)seed * 40503u ^ (uint32_t)i * 2246822519u;
+    x ^= x >> 15; x *= 2246822519u; x ^= x >> 13; x *= 3266489917u; x ^= x >> 16;
+    return (uint8_t)(x >> 24) | 1u;   // never zero: a zeroed segment is detected too
+}
 
 void stamp_chunk(Harness & h, const KvFlashPager & p, int c, int seed) {
     const int block = p.block_of(c);
@@ -512,4 +518,35 @@ TEST_CASE(KvflashPagerSerdeFixture, never_materialized_holes_stay_holes_through_
     bad[kHdr + 7 * cb + 3 * kLedgerEntry] = 1;       // chunk 3 "resident"...
     bad[kHdr + 7 * cb + 3 * kLedgerEntry + 1] = 0;   // ...but not materialized
     CHECK(!pb.deserialize(bad.data(), bad.size()));
+}
+
+// The fill pattern must tell segments apart: a segment is 512 bytes here, so a
+// pattern that repeats every 256 bytes made whole K/V/head/layer segments
+// interchangeable and a swapped-segment bug invisible.
+TEST_CASE(KvflashPagerSerdeFixture, fill_pattern_detects_swapped_segments) {
+    Harness A;
+    KvFlashPager pa;
+    REQUIRE(pa.attach(make_cfg(), A.k, A.v));
+    REQUIRE(pa.alloc_span(0, kChunk));
+    struct Seg { ggml_tensor * t; size_t off, len; };
+    std::vector<Seg> segs;
+    for_each_segment(A, pa.block_of(0), [&](ggml_tensor * t, size_t off, size_t len) {
+        segs.push_back({t, off, len});
+    });
+    REQUIRE(segs.size() == (size_t)(kNLayer * 2 * kNHeadKv));
+    // Swap segments i and j in place, check, swap back.
+    auto swapped_is_caught = [&](size_t i, size_t j) {
+        stamp_chunk(A, pa, 0, 3);
+        std::vector<uint8_t> a(segs[i].len), b(segs[j].len);
+        ggml_backend_tensor_get(segs[i].t, a.data(), segs[i].off, a.size());
+        ggml_backend_tensor_get(segs[j].t, b.data(), segs[j].off, b.size());
+        ggml_backend_tensor_set(segs[i].t, b.data(), segs[i].off, b.size());
+        ggml_backend_tensor_set(segs[j].t, a.data(), segs[j].off, a.size());
+        return !chunk_matches(A, pa, 0, 3);
+    };
+    stamp_chunk(A, pa, 0, 3);
+    REQUIRE(chunk_matches(A, pa, 0, 3));
+    for (size_t i = 0; i < segs.size(); i++)
+        for (size_t j = i + 1; j < segs.size(); j++)
+            CHECK(swapped_is_caught(i, j));   // head, K<->V and layer swaps alike
 }
