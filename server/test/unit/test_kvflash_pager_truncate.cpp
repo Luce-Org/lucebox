@@ -22,7 +22,7 @@ namespace {
 struct KvflashPagerTruncateFixture {};
 
 constexpr int kHeadDim = 4, kPool = 512, kNHeadKv = 2, kNLayer = 2, kChunk = 64;
-constexpr size_t kHdr = 8 + 8 * 4;
+constexpr size_t kHdr = 8 + 9 * 4;
 constexpr size_t kChunkBytes = (size_t)kChunk * kHeadDim * 2 * kNHeadKv * kNLayer * 2;
 
 struct Harness {

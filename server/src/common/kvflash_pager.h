@@ -551,9 +551,10 @@ public:
     // read from the pool tensors, paged-out chunks from their host backing
     // (pinned host_data on async-DMA builds), never-written chunks are zero.
     //
-    // Layout, magic "KVFLASH1" (little-endian u64):
-    //   8 x uint32 header: nc, chunk_tokens, n_head_kv, k_seg_bytes,
-    //                      v_seg_bytes, chunk_bytes, ggml_type(K), has_ledger(=1)
+    // Layout, magic "KVFLASH2" (little-endian u64):
+    //   9 x uint32 header: nc, chunk_tokens, n_head_kv, k_seg_bytes,
+    //                      v_seg_bytes, chunk_bytes, ggml_type(K), has_ledger(=1),
+    //                      ggml_type(V)
     //   nc x chunk_bytes   KV bytes, segment order of copy_chunk()
     //   nc x 8 bytes       ledger: u8 was_resident, 3 pad, f32 score
     // Not serialized: physical block numbers, LRU order, pins.
@@ -565,9 +566,9 @@ public:
         std::vector<uint8_t> out(kBlobHdr + kv_bytes + (size_t)nc * kLedgerEntry, 0);
         uint8_t * p = out.data();
         std::memcpy(p, &kBlobMagic, 8); p += 8;
-        const uint32_t hdr[8] = {(uint32_t)nc, (uint32_t)cfg_.chunk_tokens,
+        const uint32_t hdr[9] = {(uint32_t)nc, (uint32_t)cfg_.chunk_tokens,
             (uint32_t)n_head_kv_, (uint32_t)k_seg_bytes_, (uint32_t)v_seg_bytes_,
-            (uint32_t)chunk_bytes_, live_k_type_(), 1u};
+            (uint32_t)chunk_bytes_, live_k_type_(), 1u, live_v_type_()};
         std::memcpy(p, hdr, sizeof(hdr));
         for (int c = 0; c < nc; ++c) {
             const ChunkState & st = chunks_[(size_t)c];
@@ -600,7 +601,7 @@ public:
     }
 
     // Replace the pager state with a serialize() blob. The blob is fully
-    // validated (magic, geometry, KV dtype, length, resident count <= pool)
+    // validated (magic, geometry, K and V dtype, length, resident count <= pool)
     // BEFORE any state is touched: a rejected blob returns false and leaves
     // the pager as it was. On success: reset() semantics (pins cleared),
     // chunks that were resident get a pool block (identity order, bytes
@@ -614,12 +615,12 @@ public:
         uint64_t magic = 0;
         std::memcpy(&magic, data, 8);
         if (magic != kBlobMagic) return false;
-        uint32_t h[8];
+        uint32_t h[9];
         std::memcpy(h, data + 8, sizeof(h));
         const size_t nc = h[0];
         if ((int)h[1] != cfg_.chunk_tokens || (int)h[2] != n_head_kv_ ||
             h[3] != k_seg_bytes_ || h[4] != v_seg_bytes_ || h[5] != chunk_bytes_ ||
-            h[6] != live_k_type_() || h[7] != 1u) {
+            h[6] != live_k_type_() || h[7] != 1u || h[8] != live_v_type_()) {
             return false;
         }
         // Overflow-safe length check: nc comes from the (untrusted) blob.
@@ -660,12 +661,16 @@ public:
     }
 
 private:
-    static constexpr uint64_t kBlobMagic = 0x4b56464c41534831ULL;  // "KVFLASH1"
-    static constexpr size_t kBlobHdr = sizeof(uint64_t) + 8 * sizeof(uint32_t);
+    static constexpr uint64_t kBlobMagic = 0x4b56464c41534832ULL;  // "KVFLASH2"
+    static constexpr size_t kBlobHdr = sizeof(uint64_t) + 9 * sizeof(uint32_t);
     static constexpr size_t kLedgerEntry = 8;
 
     uint32_t live_k_type_() const {
         return !attn_k_.empty() && attn_k_[0] ? (uint32_t)attn_k_[0]->type
+                                              : (uint32_t)GGML_TYPE_F16;
+    }
+    uint32_t live_v_type_() const {
+        return !attn_v_.empty() && attn_v_[0] ? (uint32_t)attn_v_[0]->type
                                               : (uint32_t)GGML_TYPE_F16;
     }
     void synchronize_page_stream_() const {

@@ -22,8 +22,8 @@ namespace {
 struct KvflashPagerSerdeFixture {};
 
 constexpr int kHeadDim = 4, kPool = 512, kNHeadKv = 2, kNLayer = 2, kChunk = 64;
-// KVFLASH1 blob header: 8-byte magic + 8 x uint32.
-constexpr size_t kHdr = 8 + 8 * 4;
+// KVFLASH2 blob header: 8-byte magic + 9 x uint32.
+constexpr size_t kHdr = 8 + 9 * 4;
 constexpr size_t kLedgerEntry = 8;
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 
@@ -34,7 +34,7 @@ struct Harness {
     ggml_backend_buffer_t   buf = nullptr;
     std::vector<ggml_tensor *> k, v;
 
-    Harness() {
+    explicit Harness(ggml_type vtype = GGML_TYPE_F16) {
         backend = ggml_backend_cpu_init();
         ggml_init_params ip{};
         ip.mem_size = (size_t)(kNLayer * 2 + 8) * ggml_tensor_overhead();
@@ -42,7 +42,7 @@ struct Harness {
         ctx = ggml_init(ip);
         for (int l = 0; l < kNLayer; l++) {
             k.push_back(ggml_new_tensor_3d(ctx, GGML_TYPE_F16, kHeadDim, kPool, kNHeadKv));
-            v.push_back(ggml_new_tensor_3d(ctx, GGML_TYPE_F16, kHeadDim, kPool, kNHeadKv));
+            v.push_back(ggml_new_tensor_3d(ctx, vtype, kHeadDim, kPool, kNHeadKv));
         }
         buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     }
@@ -146,7 +146,7 @@ TEST_CASE(KvflashPagerSerdeFixture, roundtrip_preserves_residency_bytes_and_host
     const std::vector<uint8_t> blob = pa.serialize();
     REQUIRE(blob.size() == kHdr + 6 * (size_t)(kChunk * kHeadDim * 2 * kNHeadKv * kNLayer * 2) +
                            6 * kLedgerEntry);
-    REQUIRE(std::memcmp(blob.data(), "1HSALFVK", 8) == 0);  // "KVFLASH1" little-endian u64
+    REQUIRE(std::memcmp(blob.data(), "2HSALFVK", 8) == 0);  // "KVFLASH2" little-endian u64
 
     Harness B;
     KvFlashPager pb;
@@ -285,6 +285,30 @@ TEST_CASE(KvflashPagerSerdeFixture, serialized_dtype_is_recorded) {
     CHECK(pb.serialized_kv_k_type() == (uint32_t)GGML_TYPE_F16);
 }
 
+TEST_CASE(KvflashPagerSerdeFixture, deserialize_rejects_a_changed_v_dtype_and_the_old_format) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
+    Harness A;
+    KvFlashPager pa;
+    build_source(A, pa, 7);
+    const std::vector<uint8_t> blob = pa.serialize();
+
+    // Same K, V changed F16 -> BF16: identical byte geometry, different values.
+    Harness B(GGML_TYPE_BF16);
+    KvFlashPager pb;
+    REQUIRE(pb.attach(make_cfg(), B.k, B.v));
+    CHECK(!pb.deserialize(blob.data(), blob.size()));
+    CHECK(pb.n_chunks() == 0);
+
+    // A blob in the previous format (KVFLASH1, 8-field header) is refused.
+    auto old = blob;
+    std::memcpy(old.data(), "1HSALFVK", 8);
+    Harness C;
+    KvFlashPager pc;
+    REQUIRE(pc.attach(make_cfg(), C.k, C.v));
+    CHECK(!pc.deserialize(old.data(), old.size()));
+    CHECK(pc.deserialize(blob.data(), blob.size()));
+}
+
 TEST_CASE(KvflashPagerSerdeFixture, malformed_blobs_are_rejected_without_touching_state) {
     SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
@@ -324,6 +348,7 @@ TEST_CASE(KvflashPagerSerdeFixture, malformed_blobs_are_rejected_without_touchin
     { auto b = good; b[8 + 12] ^= 0xFF; CHECK(rejected(b)); } // k_seg_bytes mismatch
     { auto b = good; b[8 + 20] ^= 0xFF; CHECK(rejected(b)); } // chunk_bytes mismatch
     { auto b = good; b[8 + 24] ^= 0x01; CHECK(rejected(b)); } // KV dtype mismatch
+    { auto b = good; b[8 + 32] ^= 0x01; CHECK(rejected(b)); } // V dtype mismatch
     { auto b = good; b[8 + 28] = 7;     CHECK(rejected(b)); } // unknown ledger flag
     { auto b = good; std::memset(&b[8], 0xFF, 4); CHECK(rejected(b)); }  // nc = 0xFFFFFFFF (overflow)
     { auto b = good; b[8] = 7;          CHECK(rejected(b)); } // nc claims more chunks than the blob holds
