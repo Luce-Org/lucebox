@@ -26,7 +26,8 @@ get() {  # repo revision path name
 get Comfy-Org/MOSS-Image 3284a1dbb351e3396d70f39f2a71cbf6ed2ef1bb \
     diffusion_models/moss_image_sft_bf16.safetensors moss_image_sft_bf16.safetensors
 get Comfy-Org/MOSS-Image 3284a1dbb351e3396d70f39f2a71cbf6ed2ef1bb vae/flux2-vae.safetensors flux2-vae.safetensors
-get unsloth/Qwen3.5-9B-GGUF 3885219b6810b007914f3a7950a8d1b469d598a5 Qwen3.5-9B-Q8_0.gguf Qwen3.5-9B-Q8_0.gguf
+# Our byte-for-byte copy of unsloth/Qwen3.5-9B-GGUF at 3885219b, so the file stays downloadable.
+get Lucebox/Qwen3.5-9B-GGUF 4577338b9093794ef7006ff1e41bffc095af4246 Qwen3.5-9B-Q8_0.gguf Qwen3.5-9B-Q8_0.gguf
 
 if [ ! -s "$dir/moss-image.gguf" ]; then
     python3 "$here/../../server/scripts/convert_moss_image.py" --dit "$dir/moss_image_sft_bf16.safetensors" \
