@@ -34,15 +34,15 @@ struct Harness {
     ggml_backend_buffer_t   buf = nullptr;
     std::vector<ggml_tensor *> k, v;
 
-    explicit Harness(ggml_type vtype = GGML_TYPE_F16) {
+    explicit Harness(ggml_type vtype = GGML_TYPE_F16, int pool = kPool) {
         backend = ggml_backend_cpu_init();
         ggml_init_params ip{};
         ip.mem_size = (size_t)(kNLayer * 2 + 8) * ggml_tensor_overhead();
         ip.no_alloc = true;
         ctx = ggml_init(ip);
         for (int l = 0; l < kNLayer; l++) {
-            k.push_back(ggml_new_tensor_3d(ctx, GGML_TYPE_F16, kHeadDim, kPool, kNHeadKv));
-            v.push_back(ggml_new_tensor_3d(ctx, vtype, kHeadDim, kPool, kNHeadKv));
+            k.push_back(ggml_new_tensor_3d(ctx, GGML_TYPE_F16, kHeadDim, pool, kNHeadKv));
+            v.push_back(ggml_new_tensor_3d(ctx, vtype, kHeadDim, pool, kNHeadKv));
         }
         buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     }
@@ -435,4 +435,23 @@ TEST_CASE(KvflashPagerSerdeFixture, no_new_api_use_keeps_eviction_unchanged) {
     CHECK(p.is_resident(0));
     CHECK(!p.is_resident(1));
     CHECK(p.is_resident(8));
+}
+
+TEST_CASE(KvflashPagerSerdeFixture, attach_clears_pins_from_a_previous_attach) {
+    // 16-block pool: the deadlock guard allows 9 pins (1 sink + 4 tail + 9 + 2 <= 16).
+    Harness Big(GGML_TYPE_F16, 2 * kPool);
+    KvFlashConfig big = make_cfg();
+    big.pool_tokens = 2 * kPool;
+    KvFlashPager p;
+    REQUIRE(p.attach(big, Big.k, Big.v));
+    p.pin_range(1 * kChunk, 9 * kChunk);   // chunks 1..8
+    REQUIRE(p.is_pinned(1));
+    REQUIRE(p.is_pinned(8));
+
+    // Re-attach to the 8-block pool: stale pins would protect every chunk and
+    // starve allocation (sink + 7 pinned = the whole pool, no victim left).
+    Harness Small;
+    REQUIRE(p.attach(make_cfg(), Small.k, Small.v));
+    for (int c = 0; c < 9; c++) CHECK(!p.is_pinned(c));
+    CHECK(p.alloc_span(0, 12 * kChunk));
 }

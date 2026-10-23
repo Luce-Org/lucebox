@@ -146,6 +146,7 @@ public:
         free_blocks_.clear();
         for (int b = n_blocks_ - 1; b >= 0; b--) free_blocks_.push_back(b);
         chunks_.clear();
+        pinned_.clear();   // pins belong to the previous pool geometry
         stats_ = {};
         clock_ = 0;
         has_pending_page_in_ = false;
