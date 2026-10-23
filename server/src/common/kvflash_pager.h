@@ -161,6 +161,13 @@ public:
         return true;
     }
 
+    // Host backing is pinned (cudaMallocHost) on GPU builds. Pass false to use
+    // pageable memory instead: slower DMA, but works where pinned allocation is
+    // unavailable (hosted CI with a stub driver, CPU-backend tests). Set it
+    // before the first page_out/deserialize; each chunk remembers how its own
+    // buffer was allocated. No effect on builds without async DMA.
+    void set_pinned_host_backing(bool pinned) { pinned_host_ = pinned; }
+
     // Optional: custom block hand-out order (e.g. shuffled placement in
     // relocation tests). `order[i]` = i-th block to hand out.
     void set_block_order(const std::vector<int> & order) {
@@ -174,16 +181,7 @@ public:
         if (page_stream_) {
             cudaStreamSynchronize(page_stream_);
         }
-        for (auto & st : chunks_) {
-            if (st.host_data) {
-                cudaError_t err = cudaFreeHost(st.host_data);
-                if (err != cudaSuccess) {
-                    std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
-                                 cudaGetErrorString(err));
-                }
-                st.host_data = nullptr;
-            }
-        }
+        for (auto & st : chunks_) free_host_buffer_(st);
 #endif
         chunks_.clear();
         free_blocks_.clear();
@@ -397,12 +395,7 @@ public:
         ChunkState & st = chunks_[c];
         if (has_tensor_storage() && !st.on_host) {
 #ifdef KVFLASH_HAS_ASYNC_DMA
-            cudaError_t err = cudaMallocHost(&st.host_data, chunk_bytes_);
-            if (err != cudaSuccess) {
-                std::fprintf(stderr, "[kvflash] cudaMallocHost failed: %s\n",
-                             cudaGetErrorString(err));
-                return false;
-            }
+            if (!alloc_host_buffer_(st)) return false;
 #else
             st.host_data.resize(chunk_bytes_);
 #endif
@@ -661,8 +654,7 @@ public:
             if (has_tensor_storage() && materialized) {
                 const uint8_t * src = kv + c * chunk_bytes_;
 #ifdef KVFLASH_HAS_ASYNC_DMA
-                if (cudaMallocHost(&st.host_data, chunk_bytes_) != cudaSuccess) {
-                    st.host_data = nullptr;
+                if (!alloc_host_buffer_(st)) {
                     reset();   // frees the host buffers allocated so far
                     return false;
                 }
@@ -708,7 +700,8 @@ private:
         uint64_t last_use = 0;
         float    score    = -std::numeric_limits<float>::infinity();  // QK ledger
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        void *   host_data = nullptr; // cudaMallocHost-pinned; allocated on first page_out
+        void *   host_data = nullptr; // pinned (cudaMallocHost) unless host_pinned is false
+        bool     host_pinned = true;  // how host_data was allocated, so it is freed the same way
 #else
         std::vector<uint8_t> host_data;
 #endif
@@ -737,6 +730,35 @@ private:
     }
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
+    bool alloc_host_buffer_(ChunkState & st) {
+        if (pinned_host_) {
+            const cudaError_t err = cudaMallocHost(&st.host_data, chunk_bytes_);
+            if (err != cudaSuccess) {
+                std::fprintf(stderr, "[kvflash] cudaMallocHost failed: %s\n",
+                             cudaGetErrorString(err));
+                st.host_data = nullptr;
+                return false;
+            }
+        } else if (!(st.host_data = std::malloc(chunk_bytes_))) {
+            return false;
+        }
+        st.host_pinned = pinned_host_;
+        return true;
+    }
+    void free_host_buffer_(ChunkState & st) {
+        if (!st.host_data) return;
+        if (!st.host_pinned) {
+            std::free(st.host_data);
+        } else {
+            const cudaError_t err = cudaFreeHost(st.host_data);
+            if (err != cudaSuccess) {
+                std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
+                             cudaGetErrorString(err));
+            }
+        }
+        st.host_data = nullptr;
+    }
+
     // True when the tensor lives in host memory (CPU backend / partial offload):
     // cudaMemcpyAsync/cudaMemsetAsync on such pointers are invalid.
     static bool is_host_tensor_(const ggml_tensor * t) {
@@ -833,14 +855,7 @@ private:
     // Free one chunk's host backing store.
     void release_host_(ChunkState & st) {
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        if (st.host_data) {
-            cudaError_t err = cudaFreeHost(st.host_data);
-            if (err != cudaSuccess) {
-                std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
-                             cudaGetErrorString(err));
-            }
-            st.host_data = nullptr;
-        }
+        free_host_buffer_(st);
 #else
         std::vector<uint8_t>().swap(st.host_data);
 #endif
@@ -896,16 +911,7 @@ private:
         }
         // Free pinned host buffers unconditionally: page_out() may have
         // allocated them even when stream creation failed (default-stream path).
-        for (auto & st : chunks_) {
-            if (st.host_data) {
-                cudaError_t err = cudaFreeHost(st.host_data);
-                if (err != cudaSuccess) {
-                    std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
-                                 cudaGetErrorString(err));
-                }
-                st.host_data = nullptr;
-            }
-        }
+        for (auto & st : chunks_) free_host_buffer_(st);
 #endif
         has_pending_page_in_ = false;
     }
@@ -931,6 +937,7 @@ private:
     cudaStream_t page_stream_ = nullptr;
 #endif
     bool has_pending_page_in_ = false;
+    bool pinned_host_ = true;
 };
 
 // ── Shared backend helpers ─────────────────────────────────────────────

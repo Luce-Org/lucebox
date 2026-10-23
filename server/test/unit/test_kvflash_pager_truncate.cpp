@@ -122,7 +122,7 @@ std::vector<int32_t> slot_pos(const KvFlashPager & p) {
 
 TEST_CASE(KvflashPagerTruncateFixture, at_chunk_edge_frees_trailing_blocks) {
     Harness A, R;
-    KvFlashPager pa, pr;
+    TestPager pa, pr;
     must(pa.attach(make_cfg(), A.k, A.v));
     must(pr.attach(make_cfg(), R.k, R.v));
     append(A, pa, 0, 5 * kChunk);
@@ -142,7 +142,7 @@ TEST_CASE(KvflashPagerTruncateFixture, at_chunk_edge_frees_trailing_blocks) {
 
 TEST_CASE(KvflashPagerTruncateFixture, mid_chunk_zeroes_tail_rows_and_append_resumes) {
     Harness A, R;
-    KvFlashPager pa, pr;
+    TestPager pa, pr;
     must(pa.attach(make_cfg(), A.k, A.v));
     must(pr.attach(make_cfg(), R.k, R.v));
     const int P = 2 * kChunk + 17;
@@ -163,7 +163,7 @@ TEST_CASE(KvflashPagerTruncateFixture, mid_chunk_zeroes_tail_rows_and_append_res
 
 TEST_CASE(KvflashPagerTruncateFixture, inside_tail_window) {
     Harness A, R;
-    KvFlashPager pa, pr;
+    TestPager pa, pr;
     must(pa.attach(make_cfg(), A.k, A.v));
     must(pr.attach(make_cfg(), R.k, R.v));
     append(A, pa, 0, 7 * kChunk);
@@ -177,9 +177,8 @@ TEST_CASE(KvflashPagerTruncateFixture, inside_tail_window) {
 }
 
 TEST_CASE(KvflashPagerTruncateFixture, after_eviction_and_page_out) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A, R;
-    KvFlashPager pa, pr;
+    TestPager pa, pr;
     must(pa.attach(make_cfg(), A.k, A.v));
     must(pr.attach(make_cfg(), R.k, R.v));
     // 12 chunks on an 8-block pool: eviction has run, some chunks are host-only.
@@ -199,7 +198,7 @@ TEST_CASE(KvflashPagerTruncateFixture, after_eviction_and_page_out) {
     // Truncate down into the evicted region: chunk 3 may live on host only.
     const int P2 = 3 * kChunk + 40;
     Harness R2;
-    KvFlashPager pr2;
+    TestPager pr2;
     must(pr2.attach(make_cfg(), R2.k, R2.v));
     append(R2, pr2, 0, P2);
     pa.truncate(P2);
@@ -213,7 +212,7 @@ TEST_CASE(KvflashPagerTruncateFixture, after_eviction_and_page_out) {
 
 TEST_CASE(KvflashPagerTruncateFixture, to_zero_and_beyond_length) {
     Harness A, R;
-    KvFlashPager pa, pr;
+    TestPager pa, pr;
     must(pa.attach(make_cfg(), A.k, A.v));
     must(pr.attach(make_cfg(), R.k, R.v));
     append(A, pa, 0, 3 * kChunk);
@@ -228,7 +227,7 @@ TEST_CASE(KvflashPagerTruncateFixture, to_zero_and_beyond_length) {
     CHECK(pa.resident_blocks() == 0);
     CHECK(pa.stats().host_bytes == 0);
     Harness E;
-    KvFlashPager pe;
+    TestPager pe;
     must(pe.attach(make_cfg(), E.k, E.v));
     CHECK(pa.serialize() == pe.serialize());
     append(A, pa, 0, 2 * kChunk);           // usable again from scratch
@@ -237,7 +236,7 @@ TEST_CASE(KvflashPagerTruncateFixture, to_zero_and_beyond_length) {
 
 TEST_CASE(KvflashPagerTruncateFixture, pins_beyond_p_are_dropped) {
     Harness A;
-    KvFlashPager pa;
+    TestPager pa;
     must(pa.attach(make_cfg(), A.k, A.v));
     append(A, pa, 0, 6 * kChunk);
     pa.pin_range(3 * kChunk, 4 * kChunk);   // chunk 3 (guard allows one pin on an 8-block pool)
@@ -252,9 +251,8 @@ TEST_CASE(KvflashPagerTruncateFixture, pins_beyond_p_are_dropped) {
 }
 
 TEST_CASE(KvflashPagerTruncateFixture, serialize_truncate_serialize_roundtrip) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A, R, B;
-    KvFlashPager pa, pr, pb;
+    TestPager pa, pr, pb;
     must(pa.attach(make_cfg(), A.k, A.v));
     must(pr.attach(make_cfg(), R.k, R.v));
     must(pb.attach(make_cfg(), B.k, B.v));
@@ -277,10 +275,9 @@ TEST_CASE(KvflashPagerTruncateFixture, serialize_truncate_serialize_roundtrip) {
 // of a pager that only ever appended C tokens, or the replay after a live
 // restore attends over a different chunk set than a cold prefill does.
 TEST_CASE(KvflashPagerTruncateFixture, truncate_leaves_the_resident_set_a_fresh_pager_reaches) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     for (int P : {12 * kChunk + 10, 12 * kChunk, 9 * kChunk + 63, 5 * kChunk}) {
         Harness A, R;
-        KvFlashPager pa, pr;
+        TestPager pa, pr;
         must(pa.attach(make_cfg(), A.k, A.v));
         must(pr.attach(make_cfg(), R.k, R.v));
         append(A, pa, 0, 20 * kChunk);          // long decode: tail is resident, prompt chunks on host
@@ -303,9 +300,8 @@ TEST_CASE(KvflashPagerTruncateFixture, truncate_leaves_the_resident_set_a_fresh_
 // A score ledger must not crowd protected chunks (sink, tail window, pins) out
 // of the refill: a fresh pager always holds them, so truncate must too.
 TEST_CASE(KvflashPagerTruncateFixture, refill_keeps_protected_chunks_resident_under_a_scorer) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
-    KvFlashPager pa;
+    TestPager pa;
     must(pa.attach(make_cfg(), A.k, A.v));
     append(A, pa, 0, 20 * kChunk);
     pa.score_hook = [](int c) { return -(float)c; };   // older chunks outrank newer ones

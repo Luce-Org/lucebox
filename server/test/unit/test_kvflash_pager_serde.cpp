@@ -142,9 +142,8 @@ TEST_CASE(KvflashPagerSerdeFixture, floor_to_chunk_aligns_down) {
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, roundtrip_preserves_residency_bytes_and_host_copies) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
-    KvFlashPager pa;
+    TestPager pa;
     build_source(A, pa, 1);
     REQUIRE(pa.block_of(2) >= 0 && pa.block_of(2) != 2);  // relocated, not identity
     REQUIRE(!pa.is_resident(3));                          // paged out at serialize time
@@ -155,7 +154,7 @@ TEST_CASE(KvflashPagerSerdeFixture, roundtrip_preserves_residency_bytes_and_host
     REQUIRE(std::memcmp(blob.data(), "2HSALFVK", 8) == 0);  // "KVFLASH2" little-endian u64
 
     Harness B;
-    KvFlashPager pb;
+    TestPager pb;
     REQUIRE(pb.attach(make_cfg(), B.k, B.v));
     // Pre-existing state must be discarded by deserialize.
     REQUIRE(pb.alloc_span(0, 2 * kChunk));
@@ -183,16 +182,15 @@ TEST_CASE(KvflashPagerSerdeFixture, roundtrip_preserves_residency_bytes_and_host
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, roundtrip_of_all_host_backed_chunks) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
-    KvFlashPager pa;
+    TestPager pa;
     build_source(A, pa, 2);
     for (int c : {0, 1, 2, 4, 5}) REQUIRE(pa.page_out(c));
     REQUIRE(pa.resident_blocks() == 0);
     const std::vector<uint8_t> blob = pa.serialize();
 
     Harness B;
-    KvFlashPager pb;
+    TestPager pb;
     REQUIRE(pb.attach(make_cfg(), B.k, B.v));
     REQUIRE(pb.deserialize(blob.data(), blob.size()));
     CHECK(pb.resident_blocks() == 0);
@@ -205,16 +203,15 @@ TEST_CASE(KvflashPagerSerdeFixture, roundtrip_of_all_host_backed_chunks) {
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, partial_serialize_keeps_only_first_chunks) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
-    KvFlashPager pa;
+    TestPager pa;
     build_source(A, pa, 3);
     const std::vector<uint8_t> full = pa.serialize();
     const std::vector<uint8_t> part = pa.serialize(4);
     REQUIRE(part.size() < full.size());
 
     Harness B;
-    KvFlashPager pb;
+    TestPager pb;
     REQUIRE(pb.attach(make_cfg(), B.k, B.v));
     REQUIRE(pb.deserialize(part.data(), part.size()));
     CHECK(pb.n_chunks() == 4);
@@ -238,9 +235,8 @@ TEST_CASE(KvflashPagerSerdeFixture, partial_serialize_keeps_only_first_chunks) {
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, ledger_scores_roundtrip) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
-    KvFlashPager pa;
+    TestPager pa;
     build_source(A, pa, 4);
     pa.set_chunk_score(4, -3.5f);
     CHECK(pa.chunk_score(5) == 50.0f);
@@ -250,7 +246,7 @@ TEST_CASE(KvflashPagerSerdeFixture, ledger_scores_roundtrip) {
 
     const std::vector<uint8_t> blob = pa.serialize();
     Harness B;
-    KvFlashPager pb;
+    TestPager pb;
     REQUIRE(pb.attach(make_cfg(), B.k, B.v));
     REQUIRE(pb.deserialize(blob.data(), blob.size()));
     for (int c = 0; c < 6; c++) CHECK(pb.chunk_score(c) == pa.chunk_score(c));
@@ -258,7 +254,7 @@ TEST_CASE(KvflashPagerSerdeFixture, ledger_scores_roundtrip) {
     CHECK(pb.chunk_score(4) == -3.5f);
     // A chunk never scored stays at the unset sentinel through the roundtrip.
     Harness C;
-    KvFlashPager pc;
+    TestPager pc;
     REQUIRE(pc.attach(make_cfg(), C.k, C.v));
     REQUIRE(pc.alloc_span(0, 2 * kChunk));
     const std::vector<uint8_t> blob2 = pc.serialize();
@@ -268,9 +264,8 @@ TEST_CASE(KvflashPagerSerdeFixture, ledger_scores_roundtrip) {
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, reset_pager_is_identity_so_dense_snapshots_ignore_stale_mapping) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
-    KvFlashPager pa;
+    TestPager pa;
     build_source(A, pa, 3);
     REQUIRE(!pa.is_identity());   // previous request left a paged mapping
     pa.reset();
@@ -279,28 +274,26 @@ TEST_CASE(KvflashPagerSerdeFixture, reset_pager_is_identity_so_dense_snapshots_i
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, serialized_dtype_is_recorded) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
-    KvFlashPager pa;
+    TestPager pa;
     build_source(A, pa, 5);
     const std::vector<uint8_t> blob = pa.serialize();
     Harness B;
-    KvFlashPager pb;
+    TestPager pb;
     REQUIRE(pb.attach(make_cfg(), B.k, B.v));
     REQUIRE(pb.deserialize(blob.data(), blob.size()));
     CHECK(pb.serialized_kv_k_type() == (uint32_t)GGML_TYPE_F16);
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, deserialize_rejects_a_changed_v_dtype_and_the_old_format) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
-    KvFlashPager pa;
+    TestPager pa;
     build_source(A, pa, 7);
     const std::vector<uint8_t> blob = pa.serialize();
 
     // Same K, V changed F16 -> BF16: identical byte geometry, different values.
     Harness B(GGML_TYPE_BF16);
-    KvFlashPager pb;
+    TestPager pb;
     REQUIRE(pb.attach(make_cfg(), B.k, B.v));
     CHECK(!pb.deserialize(blob.data(), blob.size()));
     CHECK(pb.n_chunks() == 0);
@@ -309,21 +302,20 @@ TEST_CASE(KvflashPagerSerdeFixture, deserialize_rejects_a_changed_v_dtype_and_th
     auto old = blob;
     std::memcpy(old.data(), "1HSALFVK", 8);
     Harness C;
-    KvFlashPager pc;
+    TestPager pc;
     REQUIRE(pc.attach(make_cfg(), C.k, C.v));
     CHECK(!pc.deserialize(old.data(), old.size()));
     CHECK(pc.deserialize(blob.data(), blob.size()));
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, malformed_blobs_are_rejected_without_touching_state) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
-    KvFlashPager pa;
+    TestPager pa;
     build_source(A, pa, 6);
     const std::vector<uint8_t> good = pa.serialize();
 
     Harness B;
-    KvFlashPager pb;
+    TestPager pb;
     REQUIRE(pb.attach(make_cfg(), B.k, B.v));
     REQUIRE(pb.alloc_span(0, 3 * kChunk));
     for (int c = 0; c < 3; c++) stamp_chunk(B, pb, c, 9);
@@ -374,9 +366,8 @@ TEST_CASE(KvflashPagerSerdeFixture, malformed_blobs_are_rejected_without_touchin
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, pin_range_is_half_open_and_pinned_chunks_are_never_evicted) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
-    KvFlashPager p;
+    TestPager p;
     REQUIRE(p.attach(make_cfg(), A.k, A.v));
 
     // [64, 128) is exactly chunk 1; chunk 2 (token 128) is outside.
@@ -431,10 +422,9 @@ TEST_CASE(KvflashPagerSerdeFixture, pin_range_is_half_open_and_pinned_chunks_are
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, no_new_api_use_keeps_eviction_unchanged) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     // Without pins or scores the victim is the oldest unprotected chunk.
     Harness A;
-    KvFlashPager p;
+    TestPager p;
     REQUIRE(p.attach(make_cfg(), A.k, A.v));
     REQUIRE(p.alloc_span(0, 8 * kChunk));
     REQUIRE(p.alloc_span(8 * kChunk, kChunk));   // evicts chunk 1 (sink 0 protected)
@@ -448,7 +438,7 @@ TEST_CASE(KvflashPagerSerdeFixture, attach_clears_pins_from_a_previous_attach) {
     Harness Big(GGML_TYPE_F16, 2 * kPool);
     KvFlashConfig big = make_cfg();
     big.pool_tokens = 2 * kPool;
-    KvFlashPager p;
+    TestPager p;
     REQUIRE(p.attach(big, Big.k, Big.v));
     p.pin_range(1 * kChunk, 9 * kChunk);   // chunks 1..8
     REQUIRE(p.is_pinned(1));
@@ -464,7 +454,7 @@ TEST_CASE(KvflashPagerSerdeFixture, attach_clears_pins_from_a_previous_attach) {
 
 TEST_CASE(KvflashPagerSerdeFixture, pin_range_rejects_positions_beyond_the_chunk_index_range) {
     Harness A;
-    KvFlashPager p;
+    TestPager p;
     REQUIRE(p.attach(make_cfg(), A.k, A.v));
     // Chunk index 2^31 used to narrow to a negative int, skip the resize and
     // write pinned_ out of bounds.
@@ -484,9 +474,8 @@ TEST_CASE(KvflashPagerSerdeFixture, pin_range_rejects_positions_beyond_the_chunk
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, never_materialized_holes_stay_holes_through_a_roundtrip) {
-    SKIP_WITHOUT_PAGER_HOST_BACKING();
     Harness A;
-    KvFlashPager pa;
+    TestPager pa;
     REQUIRE(pa.attach(make_cfg(), A.k, A.v));
     REQUIRE(pa.alloc_span(0, 2 * kChunk));
     for (int c = 0; c < 2; c++) stamp_chunk(A, pa, c, 8);
@@ -497,7 +486,7 @@ TEST_CASE(KvflashPagerSerdeFixture, never_materialized_holes_stay_holes_through_
     const std::vector<uint8_t> blob = pa.serialize();
 
     Harness B;
-    KvFlashPager pb;
+    TestPager pb;
     REQUIRE(pb.attach(make_cfg(), B.k, B.v));
     REQUIRE(pb.deserialize(blob.data(), blob.size()));
     // A hole is not recallable zero KV, and holds no host copy.
@@ -525,7 +514,7 @@ TEST_CASE(KvflashPagerSerdeFixture, never_materialized_holes_stay_holes_through_
 // interchangeable and a swapped-segment bug invisible.
 TEST_CASE(KvflashPagerSerdeFixture, fill_pattern_detects_swapped_segments) {
     Harness A;
-    KvFlashPager pa;
+    TestPager pa;
     REQUIRE(pa.attach(make_cfg(), A.k, A.v));
     REQUIRE(pa.alloc_span(0, kChunk));
     struct Seg { ggml_tensor * t; size_t off, len; };
@@ -549,4 +538,29 @@ TEST_CASE(KvflashPagerSerdeFixture, fill_pattern_detects_swapped_segments) {
     for (size_t i = 0; i < segs.size(); i++)
         for (size_t j = i + 1; j < segs.size(); j++)
             CHECK(swapped_is_caught(i, j));   // head, K<->V and layer swaps alike
+}
+
+TEST_CASE(KvflashPagerSerdeFixture, pageable_host_backing_pages_out_and_in_bit_exact) {
+    // Explicit pageable mode: the path hosted CI (no pinned memory) relies on.
+    Harness A;
+    KvFlashPager p;
+    p.set_pinned_host_backing(false);
+    REQUIRE(p.attach(make_cfg(), A.k, A.v));
+    REQUIRE(p.alloc_span(0, 3 * kChunk));
+    for (int c = 0; c < 3; c++) stamp_chunk(A, p, c, 11);
+    REQUIRE(p.page_out(1));
+    REQUIRE(!p.is_resident(1));
+    CHECK(p.stats().host_bytes > 0);
+    REQUIRE(p.page_in(1));
+    p.synchronize_paging();
+    CHECK(chunk_matches(A, p, 1, 11));
+    const std::vector<uint8_t> blob = p.serialize();
+    Harness B;
+    KvFlashPager q;
+    q.set_pinned_host_backing(false);
+    REQUIRE(q.attach(make_cfg(), B.k, B.v));
+    REQUIRE(q.deserialize(blob.data(), blob.size()));
+    for (int c = 0; c < 3; c++) CHECK(chunk_matches(B, q, c, 11));
+    q.truncate(kChunk);   // frees pageable host buffers; reset frees the rest
+    CHECK(q.n_chunks() == 1);
 }
