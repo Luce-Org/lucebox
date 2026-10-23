@@ -455,3 +455,24 @@ TEST_CASE(KvflashPagerSerdeFixture, attach_clears_pins_from_a_previous_attach) {
     for (int c = 0; c < 9; c++) CHECK(!p.is_pinned(c));
     CHECK(p.alloc_span(0, 12 * kChunk));
 }
+
+TEST_CASE(KvflashPagerSerdeFixture, pin_range_rejects_positions_beyond_the_chunk_index_range) {
+    Harness A;
+    KvFlashPager p;
+    REQUIRE(p.attach(make_cfg(), A.k, A.v));
+    // Chunk index 2^31 used to narrow to a negative int, skip the resize and
+    // write pinned_ out of bounds.
+    const int64_t c31 = (int64_t)1 << 31;
+    p.pin_range(c31 * kChunk, c31 * kChunk + 1);
+    p.pin_range(c31 * kChunk - 1, c31 * kChunk + 1);
+    // Huge span: bounded scan, refused whole (it could never fit the pool).
+    p.pin_range(0, (int64_t)1 << 40);
+    p.pin_range(0, std::numeric_limits<int64_t>::max());
+    // In int range but absurd: must not allocate a gigabyte of pin flags.
+    p.pin_range((int64_t)1 << 36, ((int64_t)1 << 36) + 1);
+    for (int c : {0, 1, 7, 1 << 20, 1 << 30, std::numeric_limits<int>::max()}) CHECK(!p.is_pinned(c));
+    CHECK(!p.is_pinned(-1));
+    // Valid pins still work afterwards.
+    p.pin_range(1 * kChunk, 2 * kChunk);
+    CHECK(p.is_pinned(1));
+}

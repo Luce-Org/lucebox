@@ -300,8 +300,22 @@ public:
     // no-ops.
     void pin_range(int64_t tok_lo, int64_t tok_hi) {
         if (!attached() || tok_lo < 0 || tok_hi <= tok_lo) return;
-        const int c_lo = (int)(tok_lo / cfg_.chunk_tokens);
-        const int c_hi = (int)((tok_hi - 1) / cfg_.chunk_tokens);   // inclusive
+        // Validate in 64 bits BEFORE narrowing to a chunk index: a position past
+        // 2^31 chunks would wrap negative and index pinned_ out of bounds, and a
+        // span longer than the pool could never be pinned anyway (so the scan
+        // below stays O(pool) and pinned_ stays small).
+        const int64_t lo64 = tok_lo / cfg_.chunk_tokens;
+        const int64_t hi64 = (tok_hi - 1) / cfg_.chunk_tokens;      // inclusive
+        if (hi64 >= kMaxPinChunks || hi64 - lo64 + 1 > n_blocks_) {
+            std::fprintf(stderr,
+                "[kvflash] pin_range [%lld,%lld) refused: chunks [%lld,%lld] "
+                "outside the pinnable range (< %d chunks, span <= %d)\n",
+                (long long)tok_lo, (long long)tok_hi, (long long)lo64,
+                (long long)hi64, kMaxPinChunks, n_blocks_);
+            return;
+        }
+        const int c_lo = (int)lo64;
+        const int c_hi = (int)hi64;
         int pinned = 0, fresh = 0;
         for (uint8_t f : pinned_) pinned += f;
         for (int c = c_lo; c <= c_hi; c++) fresh += !is_pinned(c);
@@ -665,6 +679,7 @@ private:
     static constexpr uint64_t kBlobMagic = 0x4b56464c41534832ULL;  // "KVFLASH2"
     static constexpr size_t kBlobHdr = sizeof(uint64_t) + 9 * sizeof(uint32_t);
     static constexpr size_t kLedgerEntry = 8;
+    static constexpr int kMaxPinChunks = 1 << 22;   // pin flags stay <= 4 MiB
 
     uint32_t live_k_type_() const {
         return !attn_k_.empty() && attn_k_[0] ? (uint32_t)attn_k_[0]->type
