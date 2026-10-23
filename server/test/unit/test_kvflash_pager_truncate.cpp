@@ -294,3 +294,21 @@ TEST_CASE(KvflashPagerTruncateFixture, truncate_leaves_the_resident_set_a_fresh_
         for (int c = 0; c < pa.n_chunks(); c++) CHECK(pa.chunk_score(c) == pr.chunk_score(c));
     }
 }
+
+// A score ledger must not crowd protected chunks (sink, tail window, pins) out
+// of the refill: a fresh pager always holds them, so truncate must too.
+TEST_CASE(KvflashPagerTruncateFixture, refill_keeps_protected_chunks_resident_under_a_scorer) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
+    Harness A;
+    KvFlashPager pa;
+    must(pa.attach(make_cfg(), A.k, A.v));
+    append(A, pa, 0, 20 * kChunk);
+    pa.score_hook = [](int c) { return -(float)c; };   // older chunks outrank newer ones
+    pa.truncate(12 * kChunk);
+    pa.synchronize_paging();
+    REQUIRE(pa.n_chunks() == 12);
+    std::vector<int> resident;
+    for (int c = 0; c < pa.n_chunks(); c++) if (pa.is_resident(c)) resident.push_back(c);
+    // sink 0 + tail window 7..11, then the two best discretionary chunks (1, 2).
+    CHECK(resident == (std::vector<int>{0, 1, 2, 7, 8, 9, 10, 11}));
+}

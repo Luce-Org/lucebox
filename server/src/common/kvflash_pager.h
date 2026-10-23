@@ -249,11 +249,18 @@ public:
         std::vector<int> host;
         for (int c = 0; c < (int)chunks_.size(); c++)
             if (chunks_[(size_t)c].block < 0 && chunks_[(size_t)c].on_host) host.push_back(c);
+        // Protected chunks (sink, tail window, pins) come back first, exactly
+        // as a fresh pager would hold them; only the rest is ranked.
+        auto prot = [&](int c) {
+            return c < cfg_.sink_chunks || c > cur_chunk_ - 1 - cfg_.tail_window_chunks ||
+                   is_pinned(c);
+        };
+        auto mid = std::stable_partition(host.begin(), host.end(), prot);
         if (score_hook)
-            std::stable_sort(host.begin(), host.end(),
+            std::stable_sort(mid, host.end(),
                              [&](int a, int b) { return score_hook(a) > score_hook(b); });
         else
-            std::reverse(host.begin(), host.end());          // newest first
+            std::reverse(mid, host.end());                   // newest first
         std::vector<int> take(host.begin(),
                               host.begin() + std::min(host.size(), free_blocks_.size()));
         std::sort(take.begin(), take.end());                  // recall oldest first
