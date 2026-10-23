@@ -476,3 +476,40 @@ TEST_CASE(KvflashPagerSerdeFixture, pin_range_rejects_positions_beyond_the_chunk
     p.pin_range(1 * kChunk, 2 * kChunk);
     CHECK(p.is_pinned(1));
 }
+
+TEST_CASE(KvflashPagerSerdeFixture, never_materialized_holes_stay_holes_through_a_roundtrip) {
+    SKIP_WITHOUT_PAGER_HOST_BACKING();
+    Harness A;
+    KvFlashPager pa;
+    REQUIRE(pa.attach(make_cfg(), A.k, A.v));
+    REQUIRE(pa.alloc_span(0, 2 * kChunk));
+    for (int c = 0; c < 2; c++) stamp_chunk(A, pa, c, 8);
+    REQUIRE(pa.alloc_span(6 * kChunk, 1));   // jump: chunks 2..5 are holes, never written
+    stamp_chunk(A, pa, 6, 8);
+    REQUIRE(pa.n_chunks() == 7);
+    for (int c = 2; c < 6; c++) REQUIRE(pa.block_of(c) == -1);
+    const std::vector<uint8_t> blob = pa.serialize();
+
+    Harness B;
+    KvFlashPager pb;
+    REQUIRE(pb.attach(make_cfg(), B.k, B.v));
+    REQUIRE(pb.deserialize(blob.data(), blob.size()));
+    // A hole is not recallable zero KV, and holds no host copy.
+    for (int c = 2; c < 6; c++) CHECK(!pb.page_in(c));
+    CHECK(pb.stats().host_bytes == 3 * (int64_t)(blob.size() - kHdr - 7 * kLedgerEntry) / 7);
+    // reselect() must not pick them either, however well they score.
+    pb.score_hook = [](int c) { return c >= 2 && c < 6 ? 1e6f : (float)c; };
+    pb.reselect();
+    for (int c = 2; c < 6; c++) CHECK(!pb.is_resident(c));
+    for (int c : {0, 1, 6}) { CHECK(pb.is_resident(c)); CHECK(chunk_matches(B, pb, c, 8)); }
+    // The hole survives a second serialize unchanged.
+    pb.score_hook = nullptr;
+    CHECK(pb.serialize() == blob);
+
+    // A blob claiming a resident chunk that was never materialized is corrupt.
+    auto bad = blob;
+    const size_t cb = (blob.size() - kHdr - 7 * kLedgerEntry) / 7;
+    bad[kHdr + 7 * cb + 3 * kLedgerEntry] = 1;       // chunk 3 "resident"...
+    bad[kHdr + 7 * cb + 3 * kLedgerEntry + 1] = 0;   // ...but not materialized
+    CHECK(!pb.deserialize(bad.data(), bad.size()));
+}

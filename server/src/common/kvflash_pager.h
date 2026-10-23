@@ -571,7 +571,8 @@ public:
     //                      v_seg_bytes, chunk_bytes, ggml_type(K), has_ledger(=1),
     //                      ggml_type(V)
     //   nc x chunk_bytes   KV bytes, segment order of copy_chunk()
-    //   nc x 8 bytes       ledger: u8 was_resident, 3 pad, f32 score
+    //   nc x 8 bytes       ledger: u8 was_resident, u8 materialized, 2 pad, f32 score
+    //                      (a hole left by a failed allocation is not materialized)
     // Not serialized: physical block numbers, LRU order, pins.
     std::vector<uint8_t> serialize(int max_chunks = -1) const {
         synchronize_page_stream_();   // queued D2H must land in host_data first
@@ -610,6 +611,7 @@ public:
             }
             uint8_t * lp = out.data() + kBlobHdr + kv_bytes + (size_t)c * kLedgerEntry;
             lp[0] = st.block >= 0 ? 1u : 0u;
+            lp[1] = (st.block >= 0 || st.on_host) ? 1u : 0u;
             std::memcpy(lp + 4, &st.score, 4);
         }
         return out;
@@ -643,7 +645,11 @@ public:
         const uint8_t * kv = data + kBlobHdr;
         const uint8_t * lp = kv + nc * chunk_bytes_;
         size_t n_resident = 0;
-        for (size_t c = 0; c < nc; ++c) n_resident += lp[c * kLedgerEntry] != 0;
+        for (size_t c = 0; c < nc; ++c) {
+            const uint8_t res = lp[c * kLedgerEntry], mat = lp[c * kLedgerEntry + 1];
+            if (mat > 1 || (res != 0 && mat == 0)) return false;   // resident implies materialized
+            n_resident += res != 0;
+        }
         if (n_resident > (size_t)n_blocks_) return false;
 
         reset();
@@ -651,7 +657,8 @@ public:
         chunks_.resize(nc);
         for (size_t c = 0; c < nc; ++c) {
             ChunkState & st = chunks_[c];
-            if (has_tensor_storage()) {
+            const bool materialized = lp[c * kLedgerEntry + 1] != 0;
+            if (has_tensor_storage() && materialized) {
                 const uint8_t * src = kv + c * chunk_bytes_;
 #ifdef KVFLASH_HAS_ASYNC_DMA
                 if (cudaMallocHost(&st.host_data, chunk_bytes_) != cudaSuccess) {
@@ -665,7 +672,7 @@ public:
 #endif
                 stats_.host_bytes += (int64_t)chunk_bytes_;
             }
-            st.on_host = true;
+            st.on_host = materialized;   // a hole stays a hole, not recallable zero KV
             std::memcpy(&st.score, lp + c * kLedgerEntry + 4, 4);
             // slot_for()'s recall branch copies host_data into the new block.
             if (lp[c * kLedgerEntry] != 0) slot_for((int64_t)c * cfg_.chunk_tokens);
