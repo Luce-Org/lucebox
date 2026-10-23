@@ -10043,9 +10043,66 @@ struct Ds4PagedGatheredRuntime {
     ggml_backend_t hybrid_cold_backend = nullptr;
 };
 
+// A gathered graph's scheduler buffer grows with its lanes' histories (a
+// four-lane round with one 40K-token lane measured 196 MiB, 304 MiB at 46K),
+// and a long lane moves to a new history bucket every few rounds, so its old
+// shapes do not recur. Bounded only by ds4_fused_cache_make_room's headroom,
+// they held 3.2 GiB by the end of one 40K-token reply (5.6 GiB at 46K) and
+// left the next long prompt's prefill short of memory. Keep the built graphs,
+// plus one more of the largest, within LUCE_DS4_PAGED_GRAPH_CACHE_MB (default
+// 1024) by dropping the least recently used, but always keep the two most
+// recently used. Short histories (about 20 MiB a graph) stay far below it.
+static size_t ds4_paged_graph_cache_budget() {
+    static const size_t budget = [] {
+        const char * raw = std::getenv("LUCE_DS4_PAGED_GRAPH_CACHE_MB");
+        const long mb = raw && *raw ? std::strtol(raw, nullptr, 10) : 1024L;
+        return (size_t) std::max(1L, mb) << 20;
+    }();
+    return budget;
+}
+
+static size_t ds4_fused_slot_bytes(const DeepSeek4FusedDecodeGraph & slot, ggml_backend_t backend) {
+    ggml_backend_sched_t sched = slot.built() ? slot.sched : nullptr;
+    for (int k = 0; sched && k < ggml_backend_sched_get_n_backends(sched); ++k) {
+        if (ggml_backend_sched_get_backend(sched, k) == backend) {
+            return ggml_backend_sched_get_buffer_size(sched, backend);
+        }
+    }
+    return 0;
+}
+
+static void ds4_paged_graph_cache_trim(Ds4FusedVerifyCache & vc, size_t slot_limit,
+                                       ggml_backend_t backend) {
+    const size_t budget = ds4_paged_graph_cache_budget();
+    for (;;) {
+        size_t built = 0, bytes = 0, largest = 0, lru = slot_limit;
+        for (size_t i = 0; i < slot_limit; ++i) {
+            if (!vc.slots[i].built()) continue;
+            const size_t b = ds4_fused_slot_bytes(vc.slots[i], backend);
+            ++built;
+            bytes += b;
+            largest = std::max(largest, b);
+            if (lru == slot_limit || vc.slots[i].last_use < vc.slots[lru].last_use) lru = i;
+        }
+        if (built <= 2 || bytes + largest <= budget) return;
+        vc.slots[lru].destroy(vc.backend, vc.peer_backend);
+        vc.extra[lru].reset();
+    }
+}
+
 void deepseek4_release_paged_gathered_runtime(DeepSeek4PagedCache & cache) {
     delete static_cast<Ds4PagedGatheredRuntime *>(cache.gathered_runtime);
     cache.gathered_runtime = nullptr;
+}
+
+void deepseek4_release_paged_gathered_graphs(DeepSeek4PagedCache & cache) {
+    auto * rt = static_cast<Ds4PagedGatheredRuntime *>(cache.gathered_runtime);
+    if (!rt) return;
+    Ds4FusedVerifyCache & vc = rt->model.fused_verify_graph_cache;
+    if (vc.backend) ggml_backend_synchronize(vc.backend);
+    if (vc.peer_backend && vc.peer_backend != vc.backend) ggml_backend_synchronize(vc.peer_backend);
+    // The next step rebuilds its shape (and re-binds the cache to its backends).
+    vc.destroy();
 }
 
 bool deepseek4_paged_gathered_step(
@@ -10202,6 +10259,7 @@ bool deepseek4_paged_gathered_step(
         }
     }
     if (!fg) {
+        ds4_paged_graph_cache_trim(vc, slot_limit, backend);
         ds4_fused_cache_make_room(vc, slot_limit, backend);
         size_t pick = 0;
         for (size_t i = 0; i < slot_limit; ++i) {

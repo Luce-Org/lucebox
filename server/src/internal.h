@@ -268,6 +268,9 @@ struct TargetLoadPlan {
     int  layer_begin = 0;     // inclusive
     int  layer_end   = -1;    // exclusive; <0 means all layers
     bool load_output = true;  // output_norm + lm_head
+    // false leaves the lm_head out while load_output still keeps output_norm
+    // (a text encoder reads the final normed hidden states, not logits).
+    bool load_lm_head = true;
     bool skip_expert_tensors = false;  // skip ffn_*_exps from GPU (for hybrid MoE split load)
     bool metadata_only = false;        // parse tensor descriptors/scales without GPU allocation
     bool expert_metadata_only = false; // keep only routed expert tensor metadata; upload nothing

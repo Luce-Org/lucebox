@@ -171,6 +171,7 @@ private:
     };
     struct PreparedChainRound {
         std::vector<PreparedChainDraft> drafts;
+        int width = 0;  // verify width, chosen once before drafting
     };
 
     int max_prefills_;
@@ -197,7 +198,7 @@ private:
     DraftFeatureMirror * slot_feature_mirror(int slot);
     DraftKvState * ensure_slot_draft_kv(int slot, bool batched = false);
     void reset_slot_draft_kv(int slot);
-    // The block a round with these selected lanes drafts.
+    // The longest block a round with these selected lanes drafts.
     int chain_draft_width(const std::vector<uint8_t> & selected) const;
     std::optional<PreparedChainRound> prepare_chain_drafts(
         const std::vector<StepInput> & inputs,
@@ -209,7 +210,7 @@ private:
     // keeps its own AdaptiveSpecWidth: a round's cost depends on the graph's
     // rows (bucket lanes x width), while the width that maximizes committed
     // tokens per unit cost does not depend on how many lanes share it.
-    // cap: the longest chain the round drafted (0 = the configured block).
+    // cap: the longest chain the round may draft (0 = the configured block).
     int choose_chain_width(int bucket, int cap = 0);
     void observe_chain_width(int bucket, int width,
                              const std::vector<size_t> & accepted,
@@ -240,6 +241,10 @@ private:
         std::vector<double> depth_trials;
         std::vector<double> depth_accepts;
         std::vector<float>  conditional;  // reused per round
+        // Consecutive clean rounds rejected as host-contention outliers, and
+        // the round at which every width is timed again.
+        int       slow_streak = 0;
+        long long recalibrate_at = 0;
         explicit ChainWidthState(int max_width)
             : controller(max_width, 2, true),
               offers(static_cast<size_t>(max_width) + 1, 0),
@@ -261,15 +266,20 @@ private:
     // Rounds with two or more lanes draft a shorter block than the configured
     // one: a long block pays for itself only when one request decodes alone
     // (verify cost grows with lanes x width, acceptance stays per lane).
-    // batched_dw_ is b_.dw_ with that block size, copied again at every
-    // batched round so it always holds the live tensors (a draft park and
-    // unpark reloads b_.dw_); it is never freed. 0 = every round drafts the
+    // Such a round drafts exactly the verify width its bucket's controller
+    // picks, at most batched_draft_width_. 0 = every round drafts the
     // configured block.
+    // batched_dw_ is b_.dw_ with block size batched_draft_width_, copied
+    // again at every batched round so it always holds the live tensors (a
+    // draft park and unpark reloads b_.dw_); it is never freed. Each slot
+    // keeps one state sized for that block whatever width it drafts, so its
+    // context never lags; a narrower round reads the leading positions of
+    // the state through its width's own packed graph.
     int batched_draft_width_ = 0;
     DraftWeights batched_dw_;
     std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_batched_;
     std::vector<std::unique_ptr<DraftKvState>> dummy_draft_kv_batched_;
-    DraftKvBatchGraph batch_draft_graph_batched_;
+    std::map<int, DraftKvBatchGraph> batch_draft_graphs_batched_;  // by width
 
     // Hoisted per-step buffers (reused across step() calls).
     std::vector<int>         reserve_growth_;

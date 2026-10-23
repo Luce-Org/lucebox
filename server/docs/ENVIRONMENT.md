@@ -20,11 +20,11 @@ profile and the requirements checked at startup.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LUCE_ADAPTIVE_SPEC_WIDTH` | unset | BURN-IN: =1 enables the shared acceptance-feedback verify-width controller for single-request speculative decoding. Fixed width is the production default there; backend-specific overrides take precedence. In the Qwen3.5/3.6/3.8 concurrent engine (`--max-concurrency` > 1), DFlash2 chain speculation (fixed-chain rounds with a local drafter) uses the controller by default, choosing 4/8/block per round from per-depth acceptance and measured round cost; =0 restores the fixed block width there. Other drafters and non-speculative serving are unaffected. |
+| `LUCE_ADAPTIVE_SPEC_WIDTH` | unset | BURN-IN: =1 enables the shared acceptance-feedback verify-width controller for single-request speculative decoding. Fixed width is the production default there; backend-specific overrides take precedence. In the Qwen3.5/3.6/3.8 concurrent engine (`--max-concurrency` > 1), DFlash2 chain speculation (fixed-chain rounds with a local drafter) uses the controller by default, choosing 4/6/8/block per round from per-depth acceptance and measured round cost; =0 restores the fixed block width there. Other drafters and non-speculative serving are unaffected. |
 | `LUCE_FA256_MMA` | 1 on RDNA4 | KILL SWITCH (burn-in): =0 restores the generic tile kernel for head-256 attention on RDNA4. With the default 1, prefill-sized head-256 batches take the rocWMMA kernel below ~32K KV and the raw-MMA kernel beyond (rocWMMA requires a `GGML_HIP_ROCWMMA_FATTN` build; without it the raw-MMA kernel covers all shapes). |
 | `LUCE_FA256_WMMA` | unset | A/B: =1 forces the rocWMMA kernel on head-256 RDNA4 shapes whose KV length is a multiple of 256, bypassing the KV-length crossover (requires a `GGML_HIP_ROCWMMA_FATTN` build). |
 | `LUCE_FA256_WMMA_MAX_KV` | 32768 | KV length above which the head-256 tensor-core route switches from the rocWMMA kernel to the raw-MMA kernel in `GGML_HIP_ROCWMMA_FATTN` builds (measured crossover on gfx1201). |
-| `LUCE_PAGED_WMMA` | unset (0) | BURN-IN: =1 routes paged full-attention layers (RDNA4, head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Differential-tested against the decode kernel; single-prompt TTFT -21% at 12K and -42% at 44K, batched 8K-pool prefill slightly ahead. |
+| `LUCE_PAGED_WMMA` | 1 | KILL SWITCH: =0 returns paged full-attention layers (RDNA4, head 256, F16/Q8_0/Q4_0 KV, non-tree) from the WMMA kernel to the V_DOT2 decode kernel. Differential-tested against it; on the R9700 (Qwen 3.8 27B, 8 slots, q8_0 KV) a 31K prompt prefills in 33.8 s (was 54.1) and a 62K one in 82.4 s (was 167.4), and 8 streams decode 5% faster. |
 | `LUCE_MIX_WMMA_PREFILL` | 1 on RDNA3.5 | KILL SWITCH (burn-in): =0 returns prefill-sized ROCmFP2/FP3 MIX mul_mat_id batches to MMQ. By default they run on the F16 WMMA routed-expert GEMM (F16 operands, F32 accumulation, so not bit-identical to MMQ). |
 | `LUCE_MIX_WMMA_MIN_TOKENS` | 64 | Smallest batch (tokens) that takes the MIX WMMA GEMM; a whole number >= 1, anything else keeps the default. |
 | `LUCE_MIX_WMMA_BN` | auto (64 or 128) | A/B: force the MIX WMMA route-tile width (64, 96 or 128); by default it follows the mean routes per expert. |
@@ -130,7 +130,7 @@ profile and the requirements checked at startup.
 - `LUCE_KV_TQ3` - kv_quant.cpp, qwen3_drafter.cpp
 - `LUCE_KV_V` - kv_quant.cpp, laguna_backend.cpp
 - `LUCE_LM_HEAD_FIX` - http_server.cpp
-- `LUCE_PAGED_WMMA` - paged-attn.cu (ggml-cuda) (=1 routes paged full-attention layers to the WMMA kernel; RDNA4 only, F16/Q8_0/Q4_0, non-tree)
+- `LUCE_PAGED_WMMA` - paged-attn.cu (ggml-cuda) (default on: paged full-attention layers run the WMMA kernel; =0 returns them to V_DOT2; RDNA4 only, F16/Q8_0/Q4_0, non-tree)
 - `LUCE_DS4_LATE_CONTEXT_BEGIN` - deepseek4/deepseek4_backend.cpp (hybrid prefill position where chunks shrink to 1K; default 32768)
 - `LUCE_DS4_LONG_CONTEXT_CHUNK` - deepseek4/deepseek4_backend.cpp (hybrid prefill chunk cap for prompts ending above 4K; default 2048 on R9700 + Strix Halo, 1024 elsewhere)
 - `LUCE_DS41_DECODER_BOUNDED_REPLAY` - deepseek4/deepseek4_backend.cpp (=1: the V4.1 decoder SWA bounded replay: prompt rows before the last n_swa run only the layers up to the last KV source; approximate by design, the model is trained for it; set by `--profile ds41-gorgon`)

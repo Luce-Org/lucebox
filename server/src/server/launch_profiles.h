@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -317,6 +319,35 @@ inline const std::vector<std::pair<int, float>> & pflash_release_curve() {
     static const std::vector<std::pair<int, float>> curve = {
         {16384, 0.315f}, {32768, 0.270f}, {65536, 0.270f}, {120000, 0.225f}};
     return curve;
+}
+
+// Appends the TOKENS:RATIO points of one --prefill-curve argument to `curve`.
+// Points may share an argument, separated by spaces or commas, so a quoted
+// "16384:0.315 32768:0.270" reads the same as two arguments. A point needs
+// TOKENS > 0 and 0 < RATIO <= 1 with nothing after the ratio.
+inline bool parse_pflash_curve_arg(const char * arg, std::vector<std::pair<int, float>> & curve,
+                                   std::string & error) {
+    const auto is_sep = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == ','; };
+    const char * p = arg;
+    while (*p) {
+        if (is_sep(*p)) { ++p; continue; }
+        const char * end = p;
+        while (*end && !is_sep(*end)) ++end;
+        const std::string point(p, end);
+        p = end;
+        errno = 0;
+        char * tok_end = nullptr;
+        const long tok = std::strtol(point.c_str(), &tok_end, 10);
+        char * ratio_end = nullptr;
+        const float ratio = (*tok_end == ':') ? std::strtof(tok_end + 1, &ratio_end) : 0.0f;
+        if (tok_end == point.c_str() || *tok_end != ':' || ratio_end == tok_end + 1 || *ratio_end != '\0' ||
+            errno != 0 || tok <= 0 || tok > INT_MAX || !(ratio > 0.0f && ratio <= 1.0f)) {
+            error = "bad point '" + point + "' (expected TOKENS:RATIO with TOKENS > 0 and 0 < RATIO <= 1)";
+            return false;
+        }
+        curve.push_back({(int) tok, ratio});
+    }
+    return true;
 }
 
 inline std::vector<LaunchProfileEnv> pflash_release_env() {

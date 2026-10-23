@@ -73,10 +73,15 @@ same cached conversation, so it works for any model the server runs.
    answer of the same request goes out as is. An answer that ends by asking the
    user something is not checked.
 
+A request with `tool_choice: "none"` gets none of the above. If the model
+calls a tool anyway, it is asked once more with a note that tools are not
+available; if it still calls one, the calls are dropped and its text goes out
+with `finish_reason: "stop"`, so no tool call reaches the client.
+
 Each request logs one `[tool-checks]` line with what ran. A streaming request
 receives the checked turn as SSE events, with keep-alive comments while the
-checks run. Requests without tools, with `tool_choice: "none"`, and the
-Anthropic and Responses endpoints are served as before.
+checks run. Requests without tools and the Anthropic and Responses endpoints
+are served as before.
 
 `--no-tool-checks` turns the checks off for the server; `"tool_checks": false`
 (top level or under `extra_body`) turns them off for one request, and

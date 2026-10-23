@@ -100,6 +100,10 @@ MoeStreamedExpertCache::~MoeStreamedExpertCache() {
     destroy();
 }
 
+size_t moe_streamed_graph_nodes(int n_tokens) {
+    return std::max<size_t>(2048, 64 + 32 * (size_t) std::max(n_tokens, 0));
+}
+
 size_t moe_expert_slot_stride(size_t largest_expert_bytes, const std::vector<size_t> & type_sizes) {
     size_t unit = 1;
     for (size_t ts : type_sizes) {
@@ -663,9 +667,9 @@ void MoeStreamedExpertCache::prefetch(int layer, const int32_t * experts, int n)
 
 bool MoeStreamedExpertCache::build_graph(Graph & g, int view, const MoeLayerDesc & desc,
                                          int n_routes, int n_tokens, std::string * err) {
+    const size_t nodes = moe_streamed_graph_nodes(n_tokens);
     ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() * (64 + 32 * (size_t) n_tokens) +
-                  ggml_graph_overhead_custom(2048, false);
+    ip.mem_size = ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false);
     ip.no_alloc = true;
     g.ctx = ggml_init(ip);
     if (!g.ctx) {
@@ -687,7 +691,7 @@ bool MoeStreamedExpertCache::build_graph(Graph & g, int view, const MoeLayerDesc
         return false;
     }
     ggml_set_output(g.out);
-    g.gf = ggml_new_graph_custom(g.ctx, 2048, false);
+    g.gf = ggml_new_graph_custom(g.ctx, nodes, false);
     ggml_build_forward_expand(g.gf, g.out);
     g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
     if (!g.alloc || !ggml_gallocr_alloc_graph(g.alloc, g.gf)) {

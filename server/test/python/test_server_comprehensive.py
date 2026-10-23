@@ -750,7 +750,7 @@ def test_pflash_flags_accepted(server_bin):
     usage = _usage(server_bin)
     for flag in ("--prefill-compression", "--prefill-threshold",
                  "--prefill-drafter", "--prefill-skip-park",
-                 "--prefill-keep-ratio"):
+                 "--prefill-drafter-device", "--prefill-keep-ratio"):
         assert flag in usage, f"usage lacks {flag}: {usage[:300]}"
 
 

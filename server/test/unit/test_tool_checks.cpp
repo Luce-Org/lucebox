@@ -48,7 +48,10 @@ static void test_requested() {
     CHECK(requested(body, true));
     CHECK(!requested(body, false));
     body["tool_choice"] = "none";
+    CHECK(requested(body, true));
+    body["tool_checks"] = false;
     CHECK(!requested(body, true));
+    body.erase("tool_checks");
     body.erase("tool_choice");
     body["extra_body"] = {{"tool_checks", false}};
     CHECK(!requested(body, true));
@@ -87,6 +90,47 @@ static void test_agent_request() {
     body.erase("reasoning_effort");
     body["chat_template_kwargs"] = {{"enable_thinking", false}};
     CHECK(!agent_request(body, kEffort).contains("reasoning_effort"));
+
+    // tool_choice "none" skips the normal rules and reasoning changes.
+    body.erase("chat_template_kwargs");
+    body["tool_choice"] = "none";
+    const json tools_off_request = agent_request(body, kEffort);
+    CHECK(!tools_off_request.contains("reasoning_effort"));
+    CHECK(tools_off_request["messages"] == body["messages"]);
+    CHECK(!requested(tools_off_request, true));
+}
+
+static void test_tool_free_reply() {
+    json body = {{"tools", tools()}, {"messages", json::array({user("hi")})}};
+    const json calls = assistant_calls(json::array({call("call_1", "get_order", "{}")}));
+    CHECK(!tools_off(body));
+    CHECK(!needs_tool_free_reply(body, calls));
+    const json forced = {{"type", "function"}, {"function", {{"name", "get_order"}}}};
+    for (const json & choice : {json("auto"), json("required"), forced}) {
+        body["tool_choice"] = choice;
+        CHECK(!tools_off(body));
+        CHECK(!needs_tool_free_reply(body, calls));
+    }
+    body["tool_choice"] = "none";
+    CHECK(tools_off(body));
+    CHECK(needs_tool_free_reply(body, calls));
+    CHECK(!needs_tool_free_reply(body, answer("Done.")));
+    body["tool_choice"] = {{"type", "none"}};
+    CHECK(tools_off(body));
+    CHECK(needs_tool_free_reply(body, calls));
+
+    // A reply that still calls tools goes out as its text alone.
+    json response = {{"choices", json::array({{
+        {"index", 0}, {"finish_reason", "tool_calls"}, {"message", calls}}})}};
+    (*reply_message(response))["content"] = "Listing.";
+    drop_calls(response);
+    CHECK(!needs_tool_free_reply(body, *reply_message(response)));
+    CHECK((*reply_message(response))["content"] == "Listing.");
+    CHECK(response["choices"][0]["finish_reason"] == "stop");
+    response["choices"][0]["message"] = calls;
+    (*reply_message(response))["content"] = nullptr;
+    drop_calls(response);
+    CHECK((*reply_message(response))["content"] == "");
 }
 
 static void test_replan() {
@@ -218,6 +262,7 @@ int main() {
     test_requested();
     test_agent_request();
     test_replan();
+    test_tool_free_reply();
     test_final_check();
     test_fresh_calls();
     test_note();

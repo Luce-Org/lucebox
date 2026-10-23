@@ -2961,13 +2961,14 @@ if(LUCE_TESTS)
         endforeach()
         # test_paged_attn_wmma runs one route per process (the env selects it
         # and the launch counter pins it), so the auto-registered case above
-        # only ever exercises V_DOT2. Register the WMMA pass as a second case;
-        # the test fails on a route mismatch, so CI now gates both routes.
+        # only ever exercises the default WMMA route. Register the V_DOT2 pass
+        # as a second case; the test fails on a route mismatch, so CI gates
+        # both routes and each writes its own dump.
         if(TARGET test_paged_attn_wmma)
-            add_test(NAME paged_attn_wmma_route COMMAND test_paged_attn_wmma)
-            set_tests_properties(paged_attn_wmma_route PROPERTIES
+            add_test(NAME paged_attn_vdot2_route COMMAND test_paged_attn_wmma)
+            set_tests_properties(paged_attn_vdot2_route PROPERTIES
                 SKIP_RETURN_CODE 77
-                ENVIRONMENT "LUCE_PAGED_WMMA=1")
+                ENVIRONMENT "LUCE_PAGED_WMMA=0")
         endif()
         unset(_unit_ctest_name)
         unset(_cppunit_target_index)
@@ -3229,6 +3230,40 @@ if(LUCE_TESTS)
     endif()
 endif()
 
+# ─── MOSS-Image: text-to-image engine inside luce_server ────────────
+# luce_server runs it when the model GGUF's architecture is moss-image. The
+# kernels are RDNA4 (gfx12) WMMA; on other GPUs the engine refuses to load.
+# Like the DS4V vision ops it needs the hipBLASLt development package, and
+# builds without it (or without zlib) leave the engine out.
+option(LUCE_MOSS_IMAGE "Build the MOSS-Image text-to-image engine into luce_server (HIP)" ON)
+if(LUCE_SERVER AND LUCE_MOSS_IMAGE AND LUCE_GPU_BACKEND STREQUAL "hip")
+    find_package(hipblaslt QUIET)
+    find_package(ZLIB QUIET)
+    if(NOT hipblaslt_FOUND OR NOT ZLIB_FOUND)
+        message(STATUS "hipBLASLt or zlib not found: luce_server without MOSS-Image")
+    else()
+        set(_luce_moss_image_kernels
+            src/moss_image/dit_kernels.cu
+            src/moss_image/sampler_kernels.cu
+            src/moss_image/vae_kernels.cu)
+        add_library(luce_moss_image STATIC
+            src/moss_image/blas.cpp
+            src/moss_image/image_server.cpp
+            src/moss_image/pipeline.cpp
+            src/moss_image/png.cpp
+            src/moss_image/text_encoder.cpp
+            src/moss_image/weights.cpp
+            ${_luce_moss_image_kernels})
+        set_source_files_properties(${_luce_moss_image_kernels} PROPERTIES LANGUAGE HIP)
+        set_target_properties(luce_moss_image PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
+        target_include_directories(luce_moss_image PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        target_compile_definitions(luce_moss_image PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
+        target_link_libraries(luce_moss_image
+            PUBLIC luce_common
+            PRIVATE roc::hipblaslt ZLIB::ZLIB)
+    endif()
+endif()
+
 if(LUCE_SERVER)
 
     # ─── luce_server: native C++ HTTP server ─────────────────────────
@@ -3280,6 +3315,10 @@ if(LUCE_SERVER)
         if(CURL_FOUND)
             target_compile_definitions(luce_server PRIVATE LUCE_HAS_CURL=1)
             target_link_libraries(luce_server PRIVATE CURL::libcurl)
+        endif()
+        if(TARGET luce_moss_image)
+            target_compile_definitions(luce_server PRIVATE LUCE_MOSS_IMAGE=1)
+            target_link_libraries(luce_server PRIVATE luce_moss_image)
         endif()
         if(LUCE_GPU_BACKEND STREQUAL "cuda")
             find_package(CUDAToolkit REQUIRED)

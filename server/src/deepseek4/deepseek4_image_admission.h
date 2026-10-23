@@ -87,7 +87,9 @@ bool assess_deepseek4_image_admission(
 // Reads metadata and backend allocation-size functions only; no device buffers,
 // expert copies, graph execution, file mapping, or table registration occur.
 // Supported scope matches DS4's materialized same-runtime two-GPU owner path
-// with zero cache slots. Duplicate mode must match the storage environment.
+// with zero cache slots: the cold stack is every non-hot expert, or the
+// explicit per-layer cold list with the rest streamed from the model file.
+// Duplicate mode must match the storage environment.
 bool estimate_deepseek4_image_storage(
     const common::DeepSeek4Weights & weights,
     const common::MoeHybridPlacement & placement,
