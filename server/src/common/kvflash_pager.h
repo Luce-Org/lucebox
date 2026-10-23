@@ -68,6 +68,14 @@
 #define KVFLASH_HAS_ASYNC_DMA 1
 #endif
 
+// serialize()/deserialize() write and read integers and floats in host byte
+// order, so the blob is little-endian only on little-endian hosts. There is no
+// byte-swapping encoder; refuse to build where the blob would not be portable.
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+              "KvFlashPager blobs are written in host byte order and are defined as little-endian");
+#endif
+
 namespace luce::common {
 
 // Largest multiple of chunk_tokens that is <= pos. Aligns a snapshot boundary
@@ -559,7 +567,8 @@ public:
     // read from the pool tensors, paged-out chunks from their host backing
     // (pinned host_data on async-DMA builds), never-written chunks are zero.
     //
-    // Layout, magic "KVFLASH2" (little-endian u64):
+    // Layout, magic "KVFLASH2" (u64); all integers and floats are written in host
+    // byte order, which the static_assert at the top of this file pins to little-endian:
     //   9 x uint32 header: nc, chunk_tokens, n_head_kv, k_seg_bytes,
     //                      v_seg_bytes, chunk_bytes, ggml_type(K), has_ledger(=1),
     //                      ggml_type(V)

@@ -564,3 +564,18 @@ TEST_CASE(KvflashPagerSerdeFixture, pageable_host_backing_pages_out_and_in_bit_e
     q.truncate(kChunk);   // frees pageable host buffers; reset frees the rest
     CHECK(q.n_chunks() == 1);
 }
+
+TEST_CASE(KvflashPagerSerdeFixture, blob_fields_are_little_endian) {
+    Harness A;
+    TestPager p;
+    REQUIRE(p.attach(make_cfg(), A.k, A.v));
+    REQUIRE(p.alloc_span(0, 2 * kChunk));
+    p.set_chunk_score(1, 1.0f);   // IEEE-754 0x3f800000
+    const std::vector<uint8_t> blob = p.serialize();
+    const size_t cb = (blob.size() - kHdr - 2 * kLedgerEntry) / 2;
+    const uint8_t nc_le[4] = {2, 0, 0, 0}, chunk_tokens_le[4] = {kChunk, 0, 0, 0};
+    CHECK(std::memcmp(&blob[8], nc_le, 4) == 0);
+    CHECK(std::memcmp(&blob[12], chunk_tokens_le, 4) == 0);
+    const uint8_t one_le[4] = {0x00, 0x00, 0x80, 0x3f};
+    CHECK(std::memcmp(&blob[kHdr + 2 * cb + kLedgerEntry + 4], one_le, 4) == 0);
+}
