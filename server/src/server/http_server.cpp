@@ -4829,8 +4829,9 @@ json build_anthropic_response(
 
 json build_responses_api_response(
         const ParsedRequest & req, const GenerateResult & result,
-        const GenTimings & timings, const CompletionTokenCounts & counts,
-        const SseEmitter & emitter) {
+        int generation_cap, const GenTimings & timings,
+        const CompletionTokenCounts & counts, const SseEmitter & emitter,
+        const Tokenizer * tokenizer = nullptr) {
     // The same items as the stream's response.completed: the assistant
     // message first, then one function_call item per call.
     const json output = responses_output_items(
@@ -4848,14 +4849,22 @@ json build_responses_api_response(
         {"accept_rate", result.accept_rate},
         {"spec_decode_ran", result.spec_decode_ran},
     };
-    return {
+    json response = {
         {"id", req.response_id},
         {"object", "response"},
-        {"status", "completed"},
         {"model", req.model},
         {"output", output},
         {"usage", usage},
     };
+    // Same length-vs-EOS distinction as finish_reason / stop_reason above:
+    // a turn cut at the cap is "incomplete" (max_output_tokens).
+    const bool is_eos = tokenizer && !result.tokens.empty() &&
+        (result.tokens.back() == tokenizer->eos_id() ||
+         result.tokens.back() == tokenizer->eos_chat_id());
+    set_responses_status(response,
+        emitter.finish_reason() != "tool_calls" && !is_eos &&
+        counts.total >= generation_cap);
+    return response;
 }
 
 json build_non_streaming_response(
@@ -4872,7 +4881,7 @@ json build_non_streaming_response(
             req, result, generation_cap, timings, counts, emitter, tokenizer);
     case ApiFormat::RESPONSES:
         return build_responses_api_response(
-            req, result, timings, counts, emitter);
+            req, result, generation_cap, timings, counts, emitter, tokenizer);
     default:
         return {{"text", emitter.accumulated_text()}};
     }

@@ -537,6 +537,14 @@ class TestReasoning:
 # POST /v1/responses — OpenAI Responses API
 # ═══════════════════════════════════════════════════════════════════
 
+def assert_responses_status(response):
+    """A 16-token cap can cut the reply: "incomplete" is then the contract."""
+    if response["status"] == "incomplete":
+        assert response["incomplete_details"] == {"reason": "max_output_tokens"}
+    else:
+        assert response["status"] == "completed"
+
+
 class TestResponsesAPI:
     def test_responses_non_streaming(self, client):
         r = post_json(client, "/v1/responses", {
@@ -549,7 +557,7 @@ class TestResponsesAPI:
         assert r.status_code == 200
         data = r.json()
         assert data["object"] == "response"
-        assert data["status"] == "completed"
+        assert_responses_status(data)
         assert data["id"].startswith("resp")
         assert data["model"] == MODEL_NAME
         # output
@@ -578,7 +586,7 @@ class TestResponsesAPI:
         assert r.status_code == 200
         data = r.json()
         assert data["object"] == "response"
-        assert data["status"] == "completed"
+        assert_responses_status(data)
 
     def test_responses_with_instructions(self, client):
         """Instructions map to system message."""
@@ -607,12 +615,14 @@ class TestResponsesAPI:
         assert "response.created" in event_types
         assert "response.output_item.added" in event_types
         assert "response.content_part.added" in event_types
-        assert "response.completed" in event_types
+        terminals = {"response.completed", "response.incomplete"}
+        assert terminals & set(event_types)
 
-        # Find the completed event and validate structure
+        # Find the terminal event and validate structure
         for et, data in events:
-            if et == "response.completed" and data:
-                assert data["response"]["status"] == "completed"
+            if et in terminals and data:
+                assert_responses_status(data["response"])
+                assert et == "response." + data["response"]["status"]
                 assert "usage" in data["response"]
 
     def test_responses_streaming_has_text_deltas(self, client):

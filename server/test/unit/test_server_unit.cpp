@@ -4232,6 +4232,42 @@ TEST_CASE(ServerUnitFixture, test_emitter_responses_structure) {
     TEST_ASSERT(finish_str.find("response.completed") != std::string::npos);
 }
 
+// The Responses stream's terminal event: response.incomplete with
+// incomplete_details.reason "max_output_tokens" when the turn hit the
+// output-token cap (clients such as Codex and Repo2RLEnv retry on it),
+// response.completed otherwise -- including an EOS that lands on the cap.
+static json responses_terminal(bool at_cap, bool ended_on_eos,
+                               std::string & event_type) {
+    auto em = make_emitter(ApiFormat::RESPONSES);
+    em.emit_start();
+    em.emit_token("Hi there! How are you doing today?");
+    const std::string last =
+        em.emit_finish(at_cap ? 10 : 4, nullptr, 10, ended_on_eos).back();
+    const size_t ev = last.find("event: ");
+    event_type = last.substr(ev + 7, last.find('\n', ev) - ev - 7);
+    const size_t at = last.find("data: ");
+    return json::parse(last.substr(at + 6, last.find('\n', at) - at - 6));
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_responses_incomplete_at_output_cap) {
+    std::string event_type;
+    const json data = responses_terminal(true, false, event_type);
+    TEST_ASSERT(event_type == "response.incomplete");
+    TEST_ASSERT(data["type"] == "response.incomplete");
+    TEST_ASSERT(data["response"]["status"] == "incomplete");
+    TEST_ASSERT(data["response"]["incomplete_details"]["reason"] == "max_output_tokens");
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_responses_completed_below_cap_or_on_eos) {
+    for (const bool at_cap_on_eos : {false, true}) {
+        std::string event_type;
+        const json data = responses_terminal(at_cap_on_eos, at_cap_on_eos, event_type);
+        TEST_ASSERT(event_type == "response.completed");
+        TEST_ASSERT(data["response"]["status"] == "completed");
+        TEST_ASSERT(data["response"]["incomplete_details"].is_null());
+    }
+}
+
 TEST_CASE(ServerUnitFixture, test_emitter_responses_bare_function_tool_call) {
     json tools = json::array({{
         {"type", "function"},

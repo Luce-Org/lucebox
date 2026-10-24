@@ -151,11 +151,11 @@ class TestSmoke:
                 events.append(evt)
                 if evt.get("type") == "response.output_text.delta":
                     text += evt.get("delta", "")
-                if evt.get("type") == "response.completed":
+                if evt.get("type") in ("response.completed", "response.incomplete"):
                     has_completed = True
 
         assert events, "no events received"
-        assert has_completed, "no response.completed event"
+        assert has_completed, "no response.completed or response.incomplete event"
         assert text, "accumulated text is empty"
         assert any(e.get("type") == "response.created" for e in events)
         print(f"    → generated: {text!r}")

@@ -112,6 +112,16 @@ json responses_output_items(const std::string & message_id,
     return items;
 }
 
+void set_responses_status(json & response, bool hit_output_cap) {
+    if (hit_output_cap) {
+        response["status"] = "incomplete";
+        response["incomplete_details"] = {{"reason", "max_output_tokens"}};
+    } else {
+        response["status"] = "completed";
+        response["incomplete_details"] = nullptr;
+    }
+}
+
 // ─── Constructor ────────────────────────────────────────────────────────
 
 SseEmitter::SseEmitter(ApiFormat format,
@@ -1074,7 +1084,8 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             }));
         }
 
-        // response.completed
+        // response.completed, or response.incomplete when the turn hit the
+        // output-token cap.
         json resp_usage = {
             {"input_tokens", prompt_tokens_},
             {"output_tokens", completion_tokens},
@@ -1086,13 +1097,17 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         }
         json shell = {
             {"id", request_id_}, {"object", "response"},
-            {"created_at", created_at_}, {"status", "completed"},
+            {"created_at", created_at_},
             {"model", model_name_},
             {"output", final_output},
             {"output_text", accumulated_content_},
             {"usage", resp_usage}
         };
-        out.push_back(format_responses_event("response.completed", {{"response", shell}}));
+        const bool hit_output_cap = fr == "length";
+        set_responses_status(shell, hit_output_cap);
+        out.push_back(format_responses_event(
+            hit_output_cap ? "response.incomplete" : "response.completed",
+            {{"response", shell}}));
         break;
     }
 

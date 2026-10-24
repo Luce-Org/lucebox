@@ -71,6 +71,12 @@ nlohmann::json responses_output_items(const std::string & message_id,
                                       const std::string & text,
                                       const std::vector<ToolCall> & calls);
 
+// Sets a Responses API response object's terminal status. A turn that hit
+// the output-token cap is "incomplete" with incomplete_details.reason
+// "max_output_tokens" (the OpenAI Responses contract; clients retry on it),
+// any other turn is "completed".
+void set_responses_status(nlohmann::json & response, bool hit_output_cap);
+
 // Manages SSE streaming for a single request.
 class SseEmitter {
 public:
