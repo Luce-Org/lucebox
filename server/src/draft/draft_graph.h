@@ -92,10 +92,13 @@ struct DraftKvLaneInputs {
 
 // Build one cached draft step for all lanes. Dense weight projections share
 // the packed column axis; positions, cache writes and attention stay per lane.
+// width: noise positions per lane, which every lane input holds exactly
+// (0 = w.block_size).
 std::vector<DraftGraphOutputs> build_draft_kv_steps(
     ggml_context *                         ctx,
     ggml_cgraph *                          gf,
     const DraftWeights &                   w,
-    const std::vector<DraftKvLaneInputs> & lanes);
+    const std::vector<DraftKvLaneInputs> & lanes,
+    int                                    width = 0);
 
 } // namespace luce::common

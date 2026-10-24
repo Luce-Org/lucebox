@@ -509,13 +509,14 @@ std::vector<DraftGraphOutputs> build_draft_kv_steps(
         ggml_context *                         ctx,
         ggml_cgraph *                          gf,
         const DraftWeights &                   w,
-        const std::vector<DraftKvLaneInputs> & lanes) {
+        const std::vector<DraftKvLaneInputs> & lanes,
+        int                                    width) {
     const size_t n_lanes = lanes.size();
     if (!ctx || !gf || n_lanes == 0) {
         return {};
     }
 
-    const int q_len = w.block_size;
+    const int q_len = width > 0 ? width : w.block_size;
     const int n_head = w.n_head;
     const int n_kv = w.n_head_kv;
     const int head_dim = w.head_dim;

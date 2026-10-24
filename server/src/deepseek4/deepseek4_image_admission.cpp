@@ -170,13 +170,24 @@ bool estimate_deepseek4_image_storage(
     if (duplicate != enabled("LUCE_MOE_DUPLICATE_HOT_ON_COLD")) {
         return fail(error, "image admission duplicate mode differs from storage environment");
     }
+    // An explicit cold list (expert ownership) is the whole cold stack, as
+    // storage builds it; the experts it leaves out stream from the model file
+    // and own no device storage.
+    const bool explicit_cold = !config.cold_expert_ids.empty();
+    if (explicit_cold && (config.cold_expert_ids.size() != size_t(w.n_layer) || duplicate)) {
+        return fail(error, "explicit cold-stack owners need one list per layer and no duplicated hot experts");
+    }
     const auto hot_buft = ggml_backend_get_default_buffer_type(primary);
     const auto cold_buft = ggml_backend_get_default_buffer_type(cold);
     if (!hot_buft || !cold_buft) return fail(error, "owner buffer type is missing");
     for (int layer_index = 0; layer_index < w.n_layer; ++layer_index) {
         const auto & layer = w.layers[size_t(layer_index)];
         const uint64_t hot_count = uint64_t(placement.hot_counts[size_t(layer_index)]);
-        const uint64_t cold_count = duplicate ? uint64_t(w.n_expert) : uint64_t(w.n_expert) - hot_count;
+        const uint64_t cold_count = explicit_cold ? uint64_t(config.cold_expert_ids[size_t(layer_index)].size())
+            : duplicate ? uint64_t(w.n_expert) : uint64_t(w.n_expert) - hot_count;
+        if (hot_count + (duplicate ? 0 : cold_count) > uint64_t(w.n_expert)) {
+            return fail(error, "cold-stack owners exceed the layer's non-hot experts");
+        }
         if (enabled("LUCE_DS4_DECODE_ALL_COLD") && cold_count != uint64_t(w.n_expert)) {
             return fail(error, "decode-all-cold requires a full physical cold stack before allocation");
         }

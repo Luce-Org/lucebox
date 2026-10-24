@@ -3,6 +3,8 @@
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
 #include "../../rocmfp4/rocmfp4_hip_scale.cuh"
+#include <cstdlib>
+#include <type_traits>
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -264,12 +266,61 @@ cudaStream_t stream) {
         (cx, cdst, ne);
 }
 
+// Same-type strided copy at 16 bytes per thread (VEC elements): both tensors have a contiguous innermost dim that
+// is a multiple of VEC elements and 16-byte aligned rows/bases, so chunk ci of the flattened index space is one
+// aligned uint4 on each side. Bit-exact (a copy). The qwen4exp K/V cache append (f16 [256, T, Hk] permuted into the
+// cache view) ran cpy_scalar one element per thread at ~36 GB/s.
+// LUCE_CPY_VEC_LEGACY=1 keeps the scalar kernel.
+template <int VEC>
+static __global__ void cpy_vec16(const char * cx, char * cdst, const int64_t nchunks,
+                                 const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+                                 const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
+    const int64_t ci = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (ci >= nchunks) {
+        return;
+    }
+    const int64_t i = ci * VEC;
+    const int64_t i03 = i / (ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03 * ne00 * ne01 * ne02) / (ne00 * ne01);
+    const int64_t i01 = (i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00) / ne00;
+    const int64_t i00 = i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00 - i01 * ne00;
+    const int64_t i13 = i / (ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13 * ne10 * ne11 * ne12) / (ne10 * ne11);
+    const int64_t i11 = (i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11) / ne10;
+    const int64_t i10 = i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11 - i11 * ne10;
+    *(uint4 *) (cdst + i10 * (16 / VEC) + i11 * nb11 + i12 * nb12 + i13 * nb13) =
+        *(const uint4 *) (cx + i00 * (16 / VEC) + i01 * nb01 + i02 * nb02 + i03 * nb03);
+}
+
+static bool cpy_vec_legacy() {
+    static const bool v = [] { const char * e = getenv("LUCE_CPY_VEC_LEGACY"); return e && atoi(e) != 0; }();
+    return v;
+}
+
+template <typename T>
+static bool cpy_vec16_ok(const char * cx, const char * cdst, const int64_t ne00, const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+                         const int64_t ne10, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
+    constexpr int VEC = 16 / sizeof(T);
+    return !cpy_vec_legacy() && nb00 == (int64_t) sizeof(T) && nb10 == (int64_t) sizeof(T) && ne00 % VEC == 0 && ne10 % VEC == 0 &&
+        ((nb01 | nb02 | nb03 | nb11 | nb12 | nb13) & 15) == 0 && (((uintptr_t) cx | (uintptr_t) cdst) & 15) == 0;
+}
+
 template<typename src_t, typename dst_t, bool transposed = false>
 static void ggml_cpy_scalar_cuda(
     const char * cx, char * cdst, const int64_t ne,
     const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
 
+    if constexpr (!transposed && std::is_same<src_t, dst_t>::value) {
+        if (cpy_vec16_ok<src_t>(cx, cdst, ne00, nb00, nb01, nb02, nb03, ne10, nb10, nb11, nb12, nb13)) {
+            constexpr int VEC = 16 / sizeof(src_t);
+            const int64_t nchunks = ne / VEC, num_blocks = (nchunks + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+            GGML_ASSERT(num_blocks < UINT_MAX);
+            cpy_vec16<VEC><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
+                (cx, cdst, nchunks, ne00, ne01, ne02, nb01, nb02, nb03, ne10, ne11, ne12, nb11, nb12, nb13);
+            return;
+        }
+    }
     if (transposed) {
         GGML_ASSERT(ne == ne00*ne01*ne02);  // ne[3] is 1 assumed
         int64_t ne00n, ne01n, ne02n;

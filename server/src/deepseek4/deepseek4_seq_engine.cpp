@@ -210,6 +210,9 @@ bool DeepSeek4SeqEngine::staging_in_flight(int slot) const {
 namespace {
 constexpr int kHybridStagedRowsWithDecode = 1024;
 constexpr int kHybridStagedRowsWithoutDecode = 2048;
+// A prompt or context this long gets the decode graphs and pools cleared
+// before its prefill and after it retires.
+constexpr int kLongStagedPromptTokens = 4096;
 }  // namespace
 
 void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
@@ -231,6 +234,12 @@ void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
                 continue;
             }
             std::string error;
+            if (staged.done == 0 && staged.prefix >= kLongStagedPromptTokens) {
+                // The decode graphs cached for other slots' histories (about
+                // 1 GiB once a lane is long) must not hold the memory this
+                // prompt's prefill arenas need.
+                b_.release_paged_decode_graphs();
+            }
             const auto t0 = std::chrono::steady_clock::now();
             const int before = staged.done;
             // Each heterogeneous chunk pays a large fixed cost (every cold
@@ -315,15 +324,42 @@ void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
             staged_pass_.reset();
         }
     }
+    // A shared pass still in flight keeps its members' staging caches; any
+    // other request's can be released between its slices (each slice builds
+    // its graphs anew, and the pass's hidden state is its own buffer).
+    const auto in_staged_pass = [&](const PendingImage & pending) {
+        if (!staged_pass_) return false;
+        for (const auto & member : staged_pass_->members) {
+            if (member.slot == pending.slot && member.request_id == pending.staged.request_id) return true;
+        }
+        return false;
+    };
     for (auto & pending : pending_images_) {
         DeepSeek4StagedPrefill & staged = pending.staged;
-        if (!staged.error.empty() || staged.done < staged.prefix || !staged.staging) continue;
+        if (!staged.staging) continue;
+        if (!staged.error.empty()) {
+            // Failed: its arenas go now (the slot is failed when planned),
+            // or once the shared pass holding them completes.
+            if (!in_staged_pass(pending)) {
+                b_.release_staged_prefill_scratch(*staged.staging);
+                staged.staging = nullptr;
+            }
+            continue;
+        }
+        if (staged.done < staged.prefix) continue;
         if (!import_deepseek4_paged_slot(
                 *staged.staging, staged.prefix, b_.paged_cache_, uint32_t(pending.slot),
                 host_tables_.data() + size_t(pending.slot) * stride_, stride_, staged.error) &&
             staged.error.empty()) {
             staged.error = "staged image prefill could not be copied into the paged slot";
         }
+        // The prompt is in the paged slot: its batch-width prefill arenas
+        // (above 1 GiB after a 40K-token prompt) and the pools' cached
+        // temporaries would otherwise stay until this staging cache's next
+        // prompt, and another slot's long prompt then runs out of memory. A
+        // finished prompt is never in the pass still in flight (members count
+        // their rows when their pass completes), so this runs beside one too.
+        b_.release_staged_prefill_scratch(*staged.staging);
         // Copied (or failed): the staging cache is free for the next request.
         staged.staging = nullptr;
     }
@@ -684,9 +720,12 @@ void DeepSeek4SeqEngine::retire(int slot) {
     if (slot >= 0 && size_t(slot) < slot_has_images_.size()) slot_has_images_[size_t(slot)] = 0;
     offload_.discard(slot);
     if (!slots_.is_active(slot)) return;
+    const bool long_context = slots_.slot(slot).cur_pos >= kLongStagedPromptTokens;
     slots_.retire(slot);
     reset_deepseek4_paged_slot(b_.paged_cache_, (uint32_t)slot);
     std::fill_n(host_tables_.data() + (size_t)slot * stride_, stride_, -1);
+    // Its long-history decode graphs serve no other slot.
+    if (long_context) b_.release_paged_decode_graphs();
 }
 
 } // namespace luce::common

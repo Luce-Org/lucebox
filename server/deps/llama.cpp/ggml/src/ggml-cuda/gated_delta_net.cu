@@ -3,10 +3,11 @@
 #include <cuda_fp16.h>
 #endif
 #include <cstdlib>
-#include <type_traits>
 
 static thread_local size_t g_gdn_scalar_launch_count = 0;
 static thread_local size_t g_gdn_grouped_cols_launch_count = 0;
+static thread_local size_t g_gdn_tiled_launch_count = 0;
+static thread_local size_t g_gdn_rowsplit_launch_count = 0;
 
 extern "C" size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void) {
     return g_gdn_scalar_launch_count;
@@ -14,6 +15,14 @@ extern "C" size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void) {
 
 extern "C" size_t ggml_backend_cuda_get_gdn_grouped_cols_launch_count(void) {
     return g_gdn_grouped_cols_launch_count;
+}
+
+extern "C" size_t ggml_backend_cuda_get_gdn_tiled_launch_count(void) {
+    return g_gdn_tiled_launch_count;
+}
+
+extern "C" size_t ggml_backend_cuda_get_gdn_rowsplit_launch_count(void) {
+    return g_gdn_rowsplit_launch_count;
 }
 
 static bool gdn_grouped_cols_supported(int device) {
@@ -806,6 +815,315 @@ gated_delta_net_tiled_cuda(const float * q,
     }
 }
 
+
+// Row-split recurrence for S_v = 128 prefill. Layout adapted from gufo's
+// GdnRowSplitKernelT (MIT, github.com/gufo-org/gufo b93bd5c); its license:
+//
+// MIT License
+//
+// Copyright (c) 2026 gufo contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
+// Four lanes own one 128-key state
+// row as contiguous 32-float segments (8 float4), so a row dot product needs
+// only two cross-lane steps; each lane carries ROWS rows and the q/k slices
+// read from LDS are reused across them. Windows of WIN tokens are staged
+// through double-buffered LDS with two windows of global loads in flight.
+// Chain path only, one sequence, no intermediates (same gate as the tiled
+// kernel it replaces; LUCE_GDN_LEGACY=1 restores the tiled kernel).
+#if defined(GGML_USE_HIP)
+// HIP's float4 is a union wrapper that keeps the prefetch ring in scratch;
+// the native vector type stays in VGPRs.
+typedef float gdn_f4 __attribute__((ext_vector_type(4)));
+static __device__ __forceinline__ float gdn_rcp(float x) { return __builtin_amdgcn_rcpf(x); }
+#else
+typedef float4 gdn_f4;
+static __device__ __forceinline__ float gdn_rcp(float x) { return __frcp_rn(x); }
+#endif
+
+// Sum over the 4 lanes of a row group (lanes 4i..4i+3).
+static __device__ __forceinline__ float gdn_row4_reduce_sum(float x) {
+#if defined(GDN_DPP_REDUCE)
+    x += gdn_dpp_row_xmask<1>(x);
+    x += gdn_dpp_row_xmask<2>(x);
+#else
+    x += __shfl_xor_sync(0xffffffff, x, 1);
+    x += __shfl_xor_sync(0xffffffff, x, 2);
+#endif
+    return x;
+}
+
+template <int ROWS, int WAVES, int WIN>
+__global__ void __launch_bounds__(WAVES * 32)
+gated_delta_net_rowsplit_cuda(const float * q, const float * k, const float * v, const float * g, const float * beta,
+                              const float * curr_state, float * dst, float * state,
+                              int H, int n_tokens, int neqk1,
+                              int64_t sq1, int64_t sq2, int64_t sv1, int64_t sv2, int64_t sb1, int64_t sb2,
+                              float scale) {
+    constexpr int D   = 128;
+    constexpr int VEC = 8;             // gdn_f4 per lane segment (32 keys)
+    constexpr int NT  = WAVES * 32;
+    constexpr int RPW = 8 * ROWS;      // rows per wave (8 row groups of 4 lanes)
+    constexpr int RPB = RPW * WAVES;   // rows per block
+    constexpr int AHEAD = 2;           // windows of global loads in flight
+    constexpr int QK_CHUNKS = WIN * 32 * 2;
+    constexpr int QK_PT = QK_CHUNKS / NT;
+    constexpr int V_PT  = (WIN * RPB) / NT;
+    static_assert(D % RPB == 0, "rows per block must divide D");
+    static_assert(QK_CHUNKS % NT == 0 && (WIN * RPB) % NT == 0, "window chunks must split evenly");
+    static_assert(2 * WIN <= NT, "g/beta per window");
+
+    const int h    = blockIdx.y;
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+    const int seg  = lane & 3;
+    const int rg   = lane >> 2;
+    const int kh   = h % neqk1;
+    const int row0 = blockIdx.x * RPB;
+    const auto row_local = [&](int rr) { return wave * RPW + rr * 8 + rg; };
+
+    __shared__ gdn_f4 s_qk[2][2][WIN][32];
+    __shared__ float  s_v[2][WIN][RPB];
+    __shared__ float  s_m[2][WIN][2];
+
+    gdn_f4 s[ROWS][VEC];
+#pragma unroll
+    for (int rr = 0; rr < ROWS; ++rr) {
+        const gdn_f4 * st = (const gdn_f4 *) (curr_state + ((int64_t) h * D + row0 + row_local(rr)) * D) + seg * VEC;
+#pragma unroll
+        for (int i = 0; i < VEC; ++i) s[rr][i] = st[i];
+    }
+
+    // Window chunk ownership. q/k: chunk c -> (which, token, gdn_f4 index);
+    // a token's 32 gdn_f4 are stored [i][seg] so a row's 4 lanes read adjacent 16B.
+    const float * qk_src[QK_PT]; int qk_tok[QK_PT], qk_which[QK_PT], qk_slot[QK_PT];
+#pragma unroll
+    for (int j = 0; j < QK_PT; ++j) {
+        const int c = tid + j * NT;
+        qk_which[j] = c / (WIN * 32);
+        const int rem = c % (WIN * 32);
+        qk_tok[j] = rem / 32;
+        const int vec = rem % 32;
+        qk_src[j]  = (qk_which[j] ? k : q) + (int64_t) kh * sq1 + vec * 4;
+        qk_slot[j] = (vec % VEC) * 4 + vec / VEC;
+    }
+    const float * v_src[V_PT]; int v_tok[V_PT], v_row[V_PT];
+#pragma unroll
+    for (int j = 0; j < V_PT; ++j) {
+        const int e = tid + j * NT;
+        v_tok[j] = e / RPB;
+        v_row[j] = e % RPB;
+        v_src[j] = v + (int64_t) h * sv1 + row0 + v_row[j];
+    }
+    const int m_tok = tid >> 1, m_idx = tid & 1;
+    const float * m_src = (m_idx ? beta : g) + (int64_t) h * sb1;
+
+    struct Window { gdn_f4 qk[QK_PT]; float vv[V_PT]; float m; };
+    Window r0, r1;
+    const auto load_window = [&](int w, Window & r) {
+        const int last = n_tokens - 1;
+#pragma unroll
+        for (int j = 0; j < QK_PT; ++j) {
+            const int t = min(w * WIN + qk_tok[j], last);
+            r.qk[j] = *(const gdn_f4 *) (qk_src[j] + (int64_t) t * sq2);
+        }
+#pragma unroll
+        for (int j = 0; j < V_PT; ++j) {
+            const int t = min(w * WIN + v_tok[j], last);
+            r.vv[j] = v_src[j][(int64_t) t * sv2];
+        }
+        if (tid < 2 * WIN) {
+            const int t = min(w * WIN + m_tok, last);
+            r.m = m_src[(int64_t) t * sb2];
+        }
+    };
+    const auto commit_window = [&](const Window & r, int lds) {
+#pragma unroll
+        for (int j = 0; j < QK_PT; ++j) s_qk[lds][qk_which[j]][qk_tok[j]][qk_slot[j]] = r.qk[j];
+#pragma unroll
+        for (int j = 0; j < V_PT; ++j) s_v[lds][v_tok[j]][v_row[j]] = r.vv[j];
+        if (tid < 2 * WIN) s_m[lds][m_tok][m_idx] = m_idx ? r.m : expf(r.m);
+    };
+
+    const int n_windows = (n_tokens + WIN - 1) / WIN;
+    load_window(0, r0);
+    if (n_windows > 1) load_window(1, r1);
+    commit_window(r0, 0);
+    __syncthreads();
+
+    const auto window = [&](int w, Window & cur, const Window & next) {
+        if (w >= n_windows) return;
+        const int lds = w & 1;
+        if (w + AHEAD < n_windows) load_window(w + AHEAD, cur);
+        const int t_end = min(WIN, n_tokens - w * WIN);
+        // Token t's k slice and scalars are already in registers when its
+        // state chain starts; token t+1's are fetched under t's attn dot.
+        gdn_f4 kc[VEC];
+#pragma unroll
+        for (int i = 0; i < VEC; ++i) kc[i] = s_qk[lds][1][0][i * 4 + seg];
+        float gv = s_m[lds][0][0], bt = s_m[lds][0][1], vr[ROWS];
+#pragma unroll
+        for (int rr = 0; rr < ROWS; ++rr) vr[rr] = s_v[lds][0][row_local(rr)];
+        // Scaled state: S = c * St. Then
+        //   kv    = c * (St.k)
+        //   c    <- g*c ; delta = (v - g*kv)*beta
+        //   St   += k * (delta / c)          (one in-place FMA per element)
+        //   attn  = c * (St.q)
+        // St is folded back (St *= c, c = 1) at the end of each window, or
+        // earlier when c gets small, so the decay costs 64 multiplies per
+        // window instead of per token.
+        float c = 1.0f;
+        const auto fold = [&]() {
+#pragma unroll
+            for (int rr = 0; rr < ROWS; ++rr)
+#pragma unroll
+                for (int i = 0; i < VEC; ++i) {
+                    s[rr][i].x *= c; s[rr][i].y *= c; s[rr][i].z *= c; s[rr][i].w *= c;
+                }
+            c = 1.0f;
+        };
+        const auto token = [&](int tl) {
+            float u[ROWS][4];
+#pragma unroll
+            for (int rr = 0; rr < ROWS; ++rr) {
+                u[rr][0] = s[rr][0].x * kc[0].x; u[rr][1] = s[rr][0].y * kc[0].y;
+                u[rr][2] = s[rr][0].z * kc[0].z; u[rr][3] = s[rr][0].w * kc[0].w;
+#pragma unroll
+                for (int i = 1; i < VEC; ++i) {
+                    u[rr][0] = fmaf(s[rr][i].x, kc[i].x, u[rr][0]);
+                    u[rr][1] = fmaf(s[rr][i].y, kc[i].y, u[rr][1]);
+                    u[rr][2] = fmaf(s[rr][i].z, kc[i].z, u[rr][2]);
+                    u[rr][3] = fmaf(s[rr][i].w, kc[i].w, u[rr][3]);
+                }
+            }
+            gdn_f4 qc[VEC];
+#pragma unroll
+            for (int i = 0; i < VEC; ++i) qc[i] = s_qk[lds][0][tl][i * 4 + seg];
+            float U[ROWS];
+#pragma unroll
+            for (int rr = 0; rr < ROWS; ++rr) U[rr] = (u[rr][0] + u[rr][1]) + (u[rr][2] + u[rr][3]);
+#pragma unroll
+            for (int rr = 0; rr < ROWS; ++rr) U[rr] = gdn_row4_reduce_sum(U[rr]);
+            // Scale of the decayed state. Real gates underflow expf(g) to 0;
+            // c is floored at 1e-24 so 1/c stays finite. The floor misstates
+            // the decayed state by at most 1e-24*|St| <= 1e-12 (St is folded
+            // whenever c < 1e-12), far below float32 noise, and the true gc
+            // is still used for the delta term.
+            const float gc = gv * c;
+            c = fmaxf(gc, 1e-24f);
+            const float inv_c = gdn_rcp(c);
+#pragma unroll
+            for (int rr = 0; rr < ROWS; ++rr) {
+                const float dsc = (fmaf(-gc, U[rr], vr[rr]) * bt) * inv_c;
+#pragma unroll
+                for (int i = 0; i < VEC; ++i) {
+                    s[rr][i].x = fmaf(kc[i].x, dsc, s[rr][i].x);
+                    s[rr][i].y = fmaf(kc[i].y, dsc, s[rr][i].y);
+                    s[rr][i].z = fmaf(kc[i].z, dsc, s[rr][i].z);
+                    s[rr][i].w = fmaf(kc[i].w, dsc, s[rr][i].w);
+                }
+            }
+            // Next token's k slice and scalars (clamped: the last read is unused).
+            const int tn = min(tl + 1, WIN - 1);
+#pragma unroll
+            for (int i = 0; i < VEC; ++i) kc[i] = s_qk[lds][1][tn][i * 4 + seg];
+            const float gvn = s_m[lds][tn][0], btn = s_m[lds][tn][1];
+            float vrn[ROWS];
+#pragma unroll
+            for (int rr = 0; rr < ROWS; ++rr) vrn[rr] = s_v[lds][tn][row_local(rr)];
+            const int t = w * WIN + tl;
+            float * out = dst + ((int64_t) t * H + h) * D + row0;
+            const float cs = c * scale;
+#pragma unroll
+            for (int rr = 0; rr < ROWS; ++rr) {
+                float pa0 = s[rr][0].x * qc[0].x, pa1 = s[rr][0].y * qc[0].y;
+                float pa2 = s[rr][0].z * qc[0].z, pa3 = s[rr][0].w * qc[0].w;
+#pragma unroll
+                for (int i = 1; i < VEC; ++i) {
+                    pa0 = fmaf(s[rr][i].x, qc[i].x, pa0);
+                    pa1 = fmaf(s[rr][i].y, qc[i].y, pa1);
+                    pa2 = fmaf(s[rr][i].z, qc[i].z, pa2);
+                    pa3 = fmaf(s[rr][i].w, qc[i].w, pa3);
+                }
+                float attn = (pa0 + pa1) + (pa2 + pa3);
+                attn = gdn_row4_reduce_sum(attn);
+                // All four lanes hold the full sum; the duplicate stores coalesce
+                // and keep the loop branch-free.
+                out[row_local(rr)] = attn * cs;
+            }
+            gv = gvn; bt = btn;
+#pragma unroll
+            for (int rr = 0; rr < ROWS; ++rr) vr[rr] = vrn[rr];
+        };
+        for (int tl = 0; tl < t_end; ++tl) {
+            token(tl);
+            if (c < 1e-12f) fold();  // block-uniform: g is per head
+        }
+        fold();
+        // The other LDS slot was last read before the previous barrier.
+        if (w + 1 < n_windows) commit_window(next, lds ^ 1);
+        __syncthreads();
+    };
+    for (int w = 0; w < n_windows; w += 2) {
+        window(w, r0, r1);
+        window(w + 1, r1, r0);
+    }
+#pragma unroll
+    for (int rr = 0; rr < ROWS; ++rr) {
+        gdn_f4 * st = (gdn_f4 *) (state + ((int64_t) h * D + row0 + row_local(rr)) * D) + seg * VEC;
+#pragma unroll
+        for (int i = 0; i < VEC; ++i) st[i] = s[rr][i];
+    }
+}
+// Production configuration: 2 rows per lane, 4 waves per block (64 rows),
+// 8-token windows -> grid (2, H) x 128 threads.
+constexpr int GDN_ROWSPLIT_ROWS  = 2;
+constexpr int GDN_ROWSPLIT_WAVES = 4;
+constexpr int GDN_ROWSPLIT_WIN   = 8;
+
+// Launches the S_v=128 chain-mode prefill recurrence: the row-split kernel,
+// or the legacy tiled kernel when `legacy`. Shared by launch_gated_delta_net
+// and test_gdn_rowsplit_parity.cpp, which drives both arms on synthetic data.
+void ggml_cuda_gdn_prefill_kernel_launch(
+        bool legacy,
+        const float * q, const float * k, const float * v, const float * g, const float * beta,
+        const float * state_in, float * dst, float * state_out,
+        int H, int Hk, int n_tokens,
+        int64_t sq1, int64_t sq2, int64_t sv1, int64_t sv2, int64_t sb1, int64_t sb2,
+        float scale, cudaStream_t stream) {
+    if (legacy) {
+        const uint3 neqk1_magic = init_fastdiv_values(Hk);
+        const uint3 rq3_magic   = init_fastdiv_values(1);
+        gated_delta_net_tiled_cuda<128, 8, 8, 16><<<dim3(H, 1, 2), dim3(32, 8, 1), 0, stream>>>(
+            q, k, v, g, beta, state_in, dst, state_out, H, n_tokens,
+            sq1, sq2, 0, sv1, sv2, 0, sb1, sb2, 0, neqk1_magic, rq3_magic, scale);
+        return;
+    }
+    constexpr int rows_per_block = 8 * GDN_ROWSPLIT_ROWS * GDN_ROWSPLIT_WAVES;
+    gated_delta_net_rowsplit_cuda<GDN_ROWSPLIT_ROWS, GDN_ROWSPLIT_WAVES, GDN_ROWSPLIT_WIN>
+        <<<dim3(128 / rows_per_block, H), dim3(GDN_ROWSPLIT_WAVES * 32), 0, stream>>>(
+            q, k, v, g, beta, state_in, dst, state_out, H, n_tokens, Hk,
+            sq1, sq2, sv1, sv2, sb1, sb2, scale);
+}
+
 template <bool KDA, bool TREE_MODE, bool WRITE_INTER, typename InterT = float>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -837,24 +1155,28 @@ static void launch_gated_delta_net(
     const bool ampere_nvidia = GGML_CUDA_CC_IS_NVIDIA(cc)
                             && cc >= GGML_CUDA_CC_AMPERE
                             && cc <  GGML_CUDA_CC_ADA_LOVELACE;
-    // Tiled recurrence (qwen4exp graphs only): chain path, S_v=128 GDA at prefill
-    // batch sizes on RDNA3.5. Excludes tree, mapped verify, intermediate capture, raw gates and
-    // multi-sequence batches, which the scalar/grouped kernels still own.
+    // Prefill recurrence (row-split, or tiled with LUCE_GDN_LEGACY=1): chain
+    // path only, S_v=128 GDA at T>1 on RDNA3.5. Excludes tree, mapped verify,
+    // intermediate capture, raw gates and multi-sequence batches, which the
+    // scalar/grouped kernels still own; T=1 decode keeps the grouped kernel.
+    // qwen4exp graphs only, as for the tiled kernel this replaces.
     if (ggml_cuda_qwen4exp_enabled() && !KDA && !TREE_MODE && !WRITE_INTER &&
         active_slot_ids_d == nullptr && persist_inter_d == nullptr &&
         replay_log_d == nullptr && gate_bias == nullptr && gate_A == nullptr &&
         state_out_d != nullptr && n_seqs == 1 && S_v == 128 && H == 48 &&
-        GGML_CUDA_CC_IS_RDNA3_5(cc) && n_tokens >= 16 && n_tokens <= 32768 &&
+        GGML_CUDA_CC_IS_RDNA3_5(cc) && n_tokens >= 2 && n_tokens <= 32768 &&
         // Explicit route overrides win: the qualification test pins scalar or
         // grouped_cols via these, so the tiled path must not shadow them.
         getenv("LUCE_GDN_FORCE_GROUPED_COLS") == nullptr &&
         getenv("LUCE_GDN_NO_GROUPED_COLS") == nullptr) {
-        const dim3 tiled_grid(H, n_seqs, 2);
-        const dim3 tiled_block(32, 8, 1);
-        gated_delta_net_tiled_cuda<128, 8, 8, 16><<<tiled_grid, tiled_block, 0, stream>>>(
-            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, H, n_tokens,
-            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
-            neqk1_magic, rq3_magic, scale);
+        static const bool legacy = getenv("LUCE_GDN_LEGACY") != nullptr;
+        if (legacy) {
+            ++g_gdn_tiled_launch_count;
+        } else {
+            ++g_gdn_rowsplit_launch_count;
+        }
+        ggml_cuda_gdn_prefill_kernel_launch(legacy, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d,
+                                            H, neqk1, n_tokens, sq1, sq2, sv1, sv2, sb1, sb2, scale, stream);
         return;
     }
 

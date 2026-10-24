@@ -68,6 +68,11 @@ class MoeStreamedExpertCache;
 // sizes. With one type this is the largest expert itself.
 size_t moe_expert_slot_stride(size_t largest_expert_bytes, const std::vector<size_t> & type_sizes);
 
+// Tensors and graph nodes of one streamed-expert evaluation over n_tokens rows.
+// A tokenwise owner (ROCmFP2 without grouped MMVQ, as paged serving runs it)
+// builds one routed sub-graph per row, so both grow with the rows.
+size_t moe_streamed_graph_nodes(int n_tokens);
+
 // Resolves a device graph's streamed routes without returning control to the
 // host. Per layer the graph posts its route ids to host-mapped memory
 // (ggml_host_mailbox_post) and later waits for the answer

@@ -73,7 +73,9 @@ Qwen35SeqEngine::Qwen35SeqEngine(
     if (!fixed_chain_ready_) return;
 
     // Candidate verify widths: a few shapes keep graph builds and captures
-    // bounded while covering the measured optimum at 1..8 lanes.
+    // bounded while covering the measured optimum at 1..8 lanes. Width 6 is
+    // the 8-lane optimum on an R9700 (Qwen 3.8 27B + DFlash2): 91 ms rounds
+    // instead of 104 ms at width 8 for 5% fewer accepted tokens.
     // On by default for batched serving (measured: never slower than the
     // fixed block, +6-37% aggregate at 2-8 lanes); LUCE_ADAPTIVE_SPEC_WIDTH=0
     // restores the fixed block width.
@@ -81,7 +83,7 @@ Qwen35SeqEngine::Qwen35SeqEngine(
         const char * env = std::getenv("LUCE_ADAPTIVE_SPEC_WIDTH");
         adaptive_chain_width_ = !(env && env[0] == '0' && env[1] == '\0');
     }
-    for (int width : {4, 8, fixed_chain_.width}) {
+    for (int width : {4, 6, 8, fixed_chain_.width}) {
         if (width >= 2 && width <= fixed_chain_.width &&
             std::find(chain_width_choices_.begin(), chain_width_choices_.end(),
                       width) == chain_width_choices_.end()) {
@@ -89,10 +91,13 @@ Qwen35SeqEngine::Qwen35SeqEngine(
         }
     }
     std::sort(chain_width_choices_.begin(), chain_width_choices_.end());
-    // Batched rounds draft the native DFlash2 block (8) when the configured
-    // block is longer. Measured on an R9700, Qwen 3.8 27B + DFlash2 at block
-    // 16: 8 lanes 146 -> 189 tok/s; one lane keeps block 16, unchanged.
-    // LUCE_BATCHED_DRAFT_WIDTH=<n> picks another width, 0 turns it off.
+    // Batched rounds draft at most the native DFlash2 block (8) when the
+    // configured block is longer. Measured on an R9700, Qwen 3.8 27B +
+    // DFlash2 at block 16: 8 lanes 146 -> 189 tok/s; one lane keeps block
+    // 16, unchanged. Below that they draft exactly the chosen verify width:
+    // at 8 lanes a width-6 round that drafts 6 instead of 8 takes 89.0
+    // instead of 91.5 ms at equal acceptance.
+    // LUCE_BATCHED_DRAFT_WIDTH=<n> picks another maximum, 0 turns it off.
     {
         const char * env = std::getenv("LUCE_BATCHED_DRAFT_WIDTH");
         const int want = env ? std::atoi(env) : 8;
@@ -103,7 +108,8 @@ Qwen35SeqEngine::Qwen35SeqEngine(
             batched_draft_width_ = want;
             slot_draft_kv_batched_.resize(static_cast<size_t>(n_slots));
             std::fprintf(stderr,
-                "[parallel] batched rounds draft block %d (one lane: %d)\n",
+                "[parallel] batched rounds draft the verify width, at most "
+                "%d (one lane: %d)\n",
                 want, fixed_chain_.width);
         } else if (env && want != 0 && !supported) {
             // only the verify widths below the block have graphs
@@ -202,7 +208,9 @@ Qwen35SeqEngine::~Qwen35SeqEngine() {
 
 void Qwen35SeqEngine::release_draft_graphs() {
     draft_kv_batch_free(batch_draft_graph_);
-    draft_kv_batch_free(batch_draft_graph_batched_);
+    for (auto & entry : batch_draft_graphs_batched_) {
+        draft_kv_batch_free(entry.second);
+    }
     for (auto * dummies : {&dummy_draft_kv_, &dummy_draft_kv_batched_}) {
         for (std::unique_ptr<DraftKvState> & state : *dummies) {
             if (state) draft_kv_free(*state);
@@ -288,9 +296,9 @@ std::vector<uint8_t>
 Qwen35SeqEngine::select_chain_lanes(const StepPlan & plan) const {
     std::vector<uint8_t> selected(plan.decode.size(), 0);
     if (!plan.prefills.empty()) return selected;
-    // Two or more lanes draft the batched block, so near the context limit a
-    // lane qualifies when that shorter block fits; a lane alone drafts the
-    // configured block and needs room for all of it.
+    // Two or more lanes draft at most the batched block, so near the context
+    // limit a lane qualifies when that shorter block fits; a lane alone
+    // drafts the configured block and needs room for all of it.
     if (batched_draft_width_ > 0) {
         size_t lanes = 0;
         for (size_t i = 0; i < plan.decode.size(); ++i) {
@@ -316,19 +324,27 @@ Qwen35SeqEngine::prepare_chain_drafts(
     }
     PreparedChainRound round;
     round.drafts.resize(inputs.size());
-    // Two or more lanes draft the shorter batched block (batched_draft_width_),
-    // with the live draft tensors.
-    const int draft_width = chain_draft_width(selected);
-    const bool batched = draft_width != fixed_chain_.width;
+    // The round's width comes from the controller of the verify graph bucket
+    // its lanes fill. Two or more lanes draft exactly that width (at most
+    // batched_draft_width_) with the live draft tensors; one lane drafts the
+    // configured block and verifies its leading prefix.
+    const int max_width = chain_draft_width(selected);
+    const int lane_count = static_cast<int>(
+        std::count(selected.begin(), selected.end(), uint8_t{1}));
+    round.width = choose_chain_width(
+        chain_decode_bucket_width(lane_count), max_width);
+    const bool batched = max_width != fixed_chain_.width;
+    const int draft_width = batched ? round.width : max_width;
     if (batched) {
         batched_dw_ = b_.dw_;
-        batched_dw_.block_size = draft_width;
+        batched_dw_.block_size = batched_draft_width_;
     }
     const DraftWeights & dw = batched ? batched_dw_ : b_.dw_;
     std::vector<std::unique_ptr<DraftKvState>> & dummies =
         batched ? dummy_draft_kv_batched_ : dummy_draft_kv_;
-    DraftKvBatchGraph & draft_graph =
-        batched ? batch_draft_graph_batched_ : batch_draft_graph_;
+    DraftKvBatchGraph & draft_graph = batched
+        ? batch_draft_graphs_batched_[draft_width]
+        : batch_draft_graph_;
 
     struct Lane {
         size_t input_index = 0;
@@ -371,7 +387,7 @@ Qwen35SeqEngine::prepare_chain_drafts(
         lanes.push_back({i, input.slot, input.token, state, mirror});
         if (!draft_kv_begin_step(
                 *state, dw, b_.draft_backend_, *mirror,
-                slots_.slot(input.slot).cur_pos)) {
+                slots_.slot(input.slot).cur_pos, draft_width)) {
             reset_lanes();
             return std::nullopt;
         }
@@ -426,7 +442,7 @@ Qwen35SeqEngine::prepare_chain_drafts(
             dummies[static_cast<size_t>(i)].get();
         if (!draft_kv_begin_step(
                 *dummy, dw, b_.draft_backend_,
-                *lanes.front().mirror, 1)) {
+                *lanes.front().mirror, 1, draft_width)) {
             reset_lanes();
             return std::nullopt;
         }
@@ -441,7 +457,7 @@ Qwen35SeqEngine::prepare_chain_drafts(
     std::vector<std::vector<int32_t>> proposals;
     if (!draft_kv_batch_compute(
             draft_graph, dw, b_.draft_backend_,
-            batch_states, hidden_blocks) ||
+            batch_states, hidden_blocks, draft_width) ||
         hidden_blocks.size() != batch_states.size()) {
         reset_lanes();
         return std::nullopt;
@@ -814,6 +830,13 @@ constexpr int kChainWidthCalibrationSamples = 2;
 // A width that keeps landing on rounds with AR peers or a graph rebuild
 // stops being forced after this many offers.
 constexpr int kChainWidthCalibrationMaxOffers = 8;
+// Round times are wall clock: a busy host can stretch them 2-3x for a while.
+// A clean round slower than this many times its width's cost is not a cost
+// sample, unless kChainWidthSlowStreak rounds in a row are (the new normal).
+constexpr float kChainWidthOutlierRatio = 1.5f;
+constexpr int kChainWidthSlowStreak = 32;
+// Rounds per bucket between full recalibrations of every width's cost.
+constexpr long long kChainWidthRecalibrationRounds = 1024;
 // Per-round decay of the depth statistics, so they follow the live mix.
 constexpr double kChainDepthDecay = 0.98;
 // Beta prior on each conditional acceptance (mean 0.7, weight 2 trials).
@@ -831,6 +854,17 @@ int Qwen35SeqEngine::choose_chain_width(int bucket, int cap) {
     // shorter batched block, so their controller never offers more.
     const int full = std::min(
         requested, static_cast<int>(state.depth_trials.size()));
+    // A width the controller stopped offering keeps the cost it was last
+    // timed at; time every width again now and then, so a cost measured
+    // while the host was busy cannot keep a width out for good.
+    if (state.rounds >= state.recalibrate_at) {
+        if (state.rounds > 0) {
+            std::fill(state.offers.begin(), state.offers.end(), 0);
+            std::fill(state.samples.begin(), state.samples.end(), 0);
+            state.controller.set_measured_costs({});
+        }
+        state.recalibrate_at = state.rounds + kChainWidthRecalibrationRounds;
+    }
     for (int width : chain_width_choices_) {
         if (width > full) break;
         const size_t w = static_cast<size_t>(width);
@@ -875,7 +909,19 @@ void Qwen35SeqEngine::observe_chain_width(
     offers = std::min(offers + 1, kChainWidthCalibrationMaxOffers);
     // Every lane is an acceptance sample; the round is one cost sample when
     // it is clean (step_ms < 0 marks a round that is not).
-    const float cost = step_ms > 0.0 ? static_cast<float>(step_ms) : -1.0f;
+    float cost = step_ms > 0.0 ? static_cast<float>(step_ms) : -1.0f;
+    if (cost > 0.0f) {
+        const std::vector<float> & costs = state.controller.measured_costs();
+        const float known = static_cast<size_t>(width) < costs.size()
+            ? costs[static_cast<size_t>(width)] : 0.0f;
+        if (std::isfinite(known) && known > 0.0f &&
+            cost > kChainWidthOutlierRatio * known &&
+            ++state.slow_streak < kChainWidthSlowStreak) {
+            cost = -1.0f;
+        } else {
+            state.slow_streak = 0;
+        }
+    }
     if (cost > 0.0f) {
         int & samples = state.samples[static_cast<size_t>(width)];
         samples = std::min(samples + 1, kChainWidthCalibrationSamples);
@@ -929,6 +975,8 @@ void Qwen35SeqEngine::observe_chain_width(
                      (long long) state.rounds,
                      state.lane_rounds ? state.accepted_sum / state.lane_rounds : 0.0);
         for (int choice : chain_width_choices_) {
+            // a batched bucket only tracks widths up to its own block
+            if (static_cast<size_t>(choice) >= state.offers.size()) break;
             std::fprintf(stderr, " w%d=%d", choice,
                          state.offers[static_cast<size_t>(choice)]);
         }
@@ -1085,21 +1133,20 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     const int spec_count = static_cast<int>(proposals.size());
     const int ar_count = static_cast<int>(ar_lanes.size());
     const int tree_bucket = chain_decode_bucket_width(spec_count);
-    // The drafter always proposes the full block; a narrower round verifies
-    // the leading prefix of every chain, which is the same chain truncated.
+    // prepare_chain_drafts chose the width from this bucket's controller.
     // Controllers are keyed by the verify graph bucket: the graph is built
     // for tree_bucket lanes (missing lanes are padding), so a round's cost is
     // set by the bucket and width, not by how many lanes are real.
-    // A batched round drafted a shorter block: verify at most that much.
-    int drafted = full_width;
-    for (const Proposal & proposal : proposals) {
-        drafted = std::min(drafted, static_cast<int>(proposal.tokens.size()));
-    }
-    const int tree_width = choose_chain_width(tree_bucket, drafted);
-    if (tree_width < full_width) {
-        for (Proposal & proposal : proposals) {
-            proposal.tokens.resize(static_cast<size_t>(tree_width));
+    // A lane alone drafted the full block; a narrower round verifies its
+    // leading prefix, which is the same chain truncated.
+    const int tree_width = prepared_round.width;
+    for (Proposal & proposal : proposals) {
+        if (tree_width < 2 ||
+            proposal.tokens.size() < static_cast<size_t>(tree_width)) {
+            result.error = "prepared DFlash2 chain is shorter than its width";
+            return result;
         }
+        proposal.tokens.resize(static_cast<size_t>(tree_width));
     }
     const int tree_rows_count = tree_width * tree_bucket;
     const int total_rows = ar_count + tree_rows_count;
@@ -1478,6 +1525,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             output.committed_tokens.assign(
                 proposal.tokens.begin() + 1,
                 proposal.tokens.begin() + proposal.accepted);
+            output.spec_offered = static_cast<int>(proposal.tokens.size());
+            output.spec_accepted = static_cast<int>(proposal.verified);
         } else {
             output.token =
                 ar_lanes[static_cast<size_t>(ar_for_input[i])].pending;
@@ -1936,7 +1985,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
 bool Qwen35SeqEngine::reserve_decode(const StepPlan & plan) {
     std::fill(reserve_growth_.begin(), reserve_growth_.end(), 0);
     const auto chains = select_chain_lanes(plan);
-    const int chain_width = chain_draft_width(chains);      // what the round will draft and verify
+    const int chain_width = chain_draft_width(chains);      // the most the round can draft and verify
     for (size_t i = 0; i < plan.decode.size(); ++i) {
         const int slot = plan.decode[i].slot;
         if (slot < 0 || slot >= slots_.slot_count() ||

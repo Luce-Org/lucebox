@@ -784,6 +784,10 @@ void log_deepseek4_step_telemetry(
     const char * phase, int tokens, int steps, double wall_s,
     const DeepSeek4StepTelemetry & telemetry);
 void deepseek4_release_paged_gathered_runtime(DeepSeek4PagedCache & cache);
+// Drop the paged runtime's cached gathered decode graphs and their scheduler
+// buffers, which grow with each lane's history; the next step rebuilds its
+// shape. Model mirrors, KV and slot state stay.
+void deepseek4_release_paged_gathered_graphs(DeepSeek4PagedCache & cache);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
 // Release only reproducible large-batch graph arenas after prefill. KV/model
 // state and the DSpark feature tail remain live for the following decode.

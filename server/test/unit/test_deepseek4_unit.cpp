@@ -22,6 +22,7 @@
 #include "common/layer_split_runtime.h"
 #include "common/layer_split_utils.h"
 #include "common/moe_hybrid_ffn_eval.h"
+#include "common/moe_hybrid_expert_cache.h"
 #include "deepseek4/deepseek4_dspark.h"
 #include "deepseek4/deepseek4_engram.h"
 
@@ -2528,6 +2529,52 @@ struct ImageAdmissionFakeOwner {
     }
 };
 
+// Paged serving leaves grouped MMVQ off, so a ROCmFP2 owner of the streamed
+// expert cache builds one routed sub-graph per prompt row. A 300-row prefill
+// chunk needs more than the 2,048 nodes the cache once fixed (it aborted in
+// ggml_visit_parents on a 128 GB box); the cache sizes its graph by rows.
+static void test_streamed_expert_graph_fits_tokenwise_prefill() {
+    std::fprintf(stderr, "test_streamed_expert_graph_fits_tokenwise_prefill...");
+    const int n_tokens = 300, n_routes = 6, n_slots = 8;
+    const int64_t width = std::max<int64_t>(256, ggml_blck_size(GGML_TYPE_Q2_0_ROCMFP2));
+    ggml_init_params wp{};
+    wp.mem_size = 8 * ggml_tensor_overhead();
+    wp.no_alloc = true;
+    ggml_context * weights = ggml_init(wp);
+    const size_t nodes = moe_streamed_graph_nodes(n_tokens);
+    ggml_init_params gp{};
+    gp.mem_size = ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false);
+    gp.no_alloc = true;
+    ggml_context * ctx = ggml_init(gp);
+    TEST_ASSERT(weights && ctx);
+    if (!weights || !ctx) return;
+    ggml_tensor * gate = ggml_new_tensor_3d(weights, GGML_TYPE_Q2_0_ROCMFP2, width, width, n_slots);
+    ggml_tensor * up = ggml_new_tensor_3d(weights, GGML_TYPE_Q2_0_ROCMFP2, width, width, n_slots);
+    ggml_tensor * down = ggml_new_tensor_3d(weights, GGML_TYPE_Q2_0_ROCMFP2, width, width, n_slots);
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, n_tokens);
+    ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_routes, n_tokens);
+    ggml_tensor * wts = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_routes, n_tokens);
+    MoeHybridConfig cfg;
+    cfg.n_embd = int(width);
+    cfg.n_ff_exp = int(width);
+    cfg.n_expert = n_slots;
+    cfg.n_expert_used = n_routes;
+    const MoeLayerDesc desc;
+    ggml_tensor * out = build_moe_routed_experts(ctx, cfg, desc, gate, up, down, nullptr,
+                                                 inp, sel, wts, n_routes, n_tokens);
+    TEST_ASSERT(out != nullptr);
+    if (out) {
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, nodes, false);
+        ggml_build_forward_expand(gf, out);
+        TEST_ASSERT(size_t(ggml_graph_n_nodes(gf)) <= nodes);
+        const bool grouped = std::getenv("LUCE_MOE_TP_GROUPED_MMVQ") || std::getenv("LUCE_DS4_TP_GROUPED_MMVQ");
+        TEST_ASSERT(grouped || ggml_graph_n_nodes(gf) > 2048);
+    }
+    ggml_free(ctx);
+    ggml_free(weights);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_image_storage_admission_metadata() {
     std::fprintf(stderr, "test_image_storage_admission_metadata...");
     using namespace luce::vision;
@@ -2650,6 +2697,29 @@ static void test_image_storage_admission_metadata() {
     TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
         &hot.backend, &cold.backend, false, split, error));
     config.materialize_cold_experts = true;
+
+    // Expert ownership: the explicit cold list is the whole cold stack and
+    // the expert it leaves out streams, so it costs the cold owner nothing.
+    config.cold_expert_ids = {{0, 3}};
+    ImageStorageEstimate owned;
+    TEST_ASSERT(estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, owned, error));
+    TEST_ASSERT(owned.hot_payload_bytes == initial.hot_payload_bytes);
+    TEST_ASSERT(owned.cold_payload_bytes == 2 * 17408);
+    TEST_ASSERT(owned.cold_allocation_bytes == 2 * 17408 + 3 * 512);
+    TEST_ASSERT(owned.cold_mix_table_bytes == 2 * (17 + 17 + 33));
+    config.cold_expert_ids = {{0, 1, 3}, {}};
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, owned, error));
+    config.cold_expert_ids = {{0, 1, 2, 3}};
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, owned, error));
+    setenv("LUCE_MOE_DUPLICATE_HOT_ON_COLD", "1", 1);
+    config.cold_expert_ids = {{0, 3}};
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, true, owned, error));
+    unsetenv("LUCE_MOE_DUPLICATE_HOT_ON_COLD");
+    config.cold_expert_ids.clear();
 
     // Actual wrapper sees the fake device's exhausted snapshot. It cannot pass
     // regardless of the machine's memory; no positive case reads /proc. The
@@ -5142,6 +5212,18 @@ static void test_prefill_restore_points() {
     TEST_ASSERT(Backend::restore_safe_prefill_tokens(0, 64, points) == 64);
     TEST_ASSERT(Backend::restore_safe_prefill_tokens(36, 64, points) == 64);
     TEST_ASSERT(Backend::restore_safe_prefill_tokens(0, 1024, {}) == 1024);
+
+    // After a restore, a restore point only rows ahead does not leave a chunk
+    // for the decode-shaped path: the chunk runs on to the next one.
+    const std::vector<int> view = {33000, 33007, 47758};
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(32998, 2048, view) == 9);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(32998, 3, view) == 3);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(16762, 2048, {16764, 16770}) == 8);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(32998, 6, {33000}) == 6);
+    // A restore on a boundary, as without PFlash, keeps its chunks.
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(46915, 2048, {46915, 58553}) == 2048);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(100, 1024, points) == 200);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(0, 1024, {}) == 1024);
 
     // The chunks after any restore point are the ones a cold prefill runs.
     const auto chunk_starts = [&](int from, int end, int chunk) {
@@ -9436,6 +9518,7 @@ int main(int argc, char ** argv) {
     test_image_bias_loader_opt_in_contract(backend);
     test_image_batch_admission_before_execution(backend);
     test_image_storage_admission_metadata();
+    test_streamed_expert_graph_fits_tokenwise_prefill();
     test_image_admission_resource_snapshots();
     test_dspark_loader_contract_and_bounds(backend);
     test_dspark_confidence_uses_separate_hidden(backend);

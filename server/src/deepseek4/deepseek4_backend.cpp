@@ -1465,6 +1465,23 @@ DeepSeek4Cache * DeepSeek4Backend::image_staging_cache(int slot) {
     return image_staging_caches_[size_t(slot) - 1].get();
 }
 
+static void ds4_trim_device_pools(ggml_backend_t backend, const MoeHybridStorage * moe_hybrid) {
+    ggml_backend_cuda_trim_pool(backend);
+    if (moe_hybrid && moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend) {
+        ggml_backend_cuda_trim_pool(moe_hybrid->cold_backend);
+    }
+}
+
+void DeepSeek4Backend::release_staged_prefill_scratch(DeepSeek4Cache & staging) {
+    deepseek4_release_prefill_scratch(staging, moe_hybrid_.get());
+    ds4_trim_device_pools(backend_, moe_hybrid_.get());
+}
+
+void DeepSeek4Backend::release_paged_decode_graphs() {
+    deepseek4_release_paged_gathered_graphs(paged_cache_);
+    ds4_trim_device_pools(backend_, moe_hybrid_.get());
+}
+
 bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item) {
     // Without images the item is a text prompt (sparse text staging).
     const auto * images = item.images
@@ -3172,10 +3189,13 @@ bool DeepSeek4Backend::init_streamed_expert_tier() {
     MoeHybridStorage * hybrid = moe_hybrid_.get();
     if (!hybrid || !hybrid->stream_engine || stream_cache_device_ < 0) return true;
     std::string err;
-    // The cache takes what the device has left beyond its headroom.
+    // The cache takes what the device has left beyond its headroom, less room
+    // for what it allocates after sizing its slots (its backend, the pinned
+    // loader staging and the mapped mailbox, which an APU takes from the same
+    // memory); without it the load check finds the device a few MiB short.
     MoeExpertCacheOptions cache_opts;
     cache_opts.device = stream_cache_device_;
-    cache_opts.reserve_bytes = ds4_device_headroom_bytes(cache_opts.device);
+    cache_opts.reserve_bytes = ds4_device_headroom_bytes(cache_opts.device) + ((size_t) 128 << 20);
     cache_opts.direct_path = cfg_.model_path;
     // Once experts are locked in host memory the page cache is too small to
     // hold the streamed tier, so every load reads the drive directly.
@@ -3374,6 +3394,21 @@ int DeepSeek4Backend::restore_safe_prefill_tokens(int pos, int requested_tokens,
     const auto next = std::upper_bound(restore_points.begin(), restore_points.end(), pos);
     return next != restore_points.end() && *next < pos + requested_tokens
         ? *next - pos : requested_tokens;
+}
+
+// The first chunk after a restored prefix. A restore point fewer than
+// DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS rows past the restore would leave a chunk
+// for the decode-shaped path, which at a long context runs out of memory beside
+// the model. PFlash re-renders the end of the last turn, so its snapshot can land
+// a few tokens before the next turn's boundary. That chunk runs on to the next
+// restore point instead, and the chunks after it still match a cold prefill.
+int DeepSeek4Backend::restored_prefill_first_tokens(int pos, int requested_tokens,
+                                                    const std::vector<int> & restore_points) {
+    int n_tok = restore_safe_prefill_tokens(pos, requested_tokens, restore_points);
+    while (n_tok < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS && n_tok < requested_tokens) {
+        n_tok += restore_safe_prefill_tokens(pos + n_tok, requested_tokens - n_tok, restore_points);
+    }
+    return n_tok;
 }
 
 bool DeepSeek4Backend::init_moe_tensor_parallel() {
@@ -4518,7 +4553,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         // A batched chunk's numerics depend on where it starts. Start one at
         // every position a later request may restore from, so the chunks after
         // a restore are exactly the ones a cold prefill of the prompt runs.
-        n_tok = restore_safe_prefill_tokens(pos, n_tok, restore_points);
+        n_tok = kv_offset > 0 && i == 0
+            ? restored_prefill_first_tokens(pos, n_tok, restore_points)
+            : restore_safe_prefill_tokens(pos, n_tok, restore_points);
         // The replay rows start a chunk of their own.
         if (replay && i < replay_from && i + n_tok > replay_from) {
             n_tok = replay_from - i;

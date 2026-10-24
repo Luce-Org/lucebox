@@ -175,12 +175,11 @@ static bool should_load_target_tensor(const char * name,
                                       int layer_begin,
                                       int layer_end,
                                       bool load_output,
+                                      bool load_lm_head,
                                       bool skip_expert_tensors = false) {
     if (std::strcmp(name, "token_embd.weight") == 0) return false;
-    if (std::strcmp(name, "output_norm.weight") == 0 ||
-        std::strcmp(name, "output.weight") == 0) {
-        return load_output;
-    }
+    if (std::strcmp(name, "output_norm.weight") == 0) return load_output;
+    if (std::strcmp(name, "output.weight") == 0) return load_output && load_lm_head;
     int layer_id = -1;
     if (parse_block_tensor_name(name, layer_id)) {
         if (layer_id < layer_begin || layer_id >= layer_end) return false;
@@ -576,10 +575,10 @@ bool load_target_gguf_partial(const std::string & path,
     };
     out.tok_embd = g("token_embd.weight");
     out.out_norm = g("output_norm.weight");
-    out.output   = g("output.weight");
+    out.output   = plan.load_lm_head ? g("output.weight") : nullptr;
     // Tied-embedding exports omit output.weight; that is only fatal when the
     // load plan needs the lm_head (the PFlash drafter never computes logits).
-    if (!out.tok_embd || !out.out_norm || (!out.output && plan.load_output)) {
+    if (!out.tok_embd || !out.out_norm || (!out.output && plan.load_output && plan.load_lm_head)) {
         set_last_error("missing top-level tensors (token_embd/output_norm/output)");
         gguf_free(gctx);
         return false;
@@ -694,7 +693,7 @@ bool load_target_gguf_partial(const std::string & path,
     for (int64_t tid = 0; tid < n_tensors; tid++) {
         const char * tname = gguf_get_tensor_name(gctx, tid);
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
-        if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
+        if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.load_lm_head, plan.skip_expert_tensors)) {
             continue;
         }
         TargetTensorAlloc a;
@@ -1008,7 +1007,7 @@ bool load_target_gguf_partial(const std::string & path,
         }
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
         if (!t) continue;
-        if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
+        if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.load_lm_head, plan.skip_expert_tensors)) {
             continue;
         }
         spans.push_back({t, 0, off, sz});

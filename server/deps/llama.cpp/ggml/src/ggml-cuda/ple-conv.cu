@@ -5,6 +5,9 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
+// LUCE_PLE_FUSE_LEGACY=1 keeps the unfused PLE conv graph.
+static bool ple_conv_enabled() { static const bool v = [] { const char * e = getenv("LUCE_PLE_FUSE_LEGACY"); return !(e && atoi(e) != 0); }(); return v; }
 
 template <int K, int DIL, int TT, typename W>
 static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __restrict__ saved_state, const float * __restrict__ x,
@@ -31,19 +34,25 @@ static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __re
     }
 }
 
+// LUCE_PLE_DEBUG=1: report where the matcher gives up (line of ple-conv.cu), to attribute an unfused PLE conv.
+static bool ple_conv_debug() { static const bool v = [] { const char * e = getenv("LUCE_PLE_DEBUG"); return e && atoi(e) != 0; }(); return v; }
+#define PLE_FAIL do { if (ple_conv_debug()) fprintf(stderr, "[ple-conv] no match at node %d: ple-conv.cu:%d\n", i, __LINE__); return false; } while (0)
 static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv_match & m) {
-    if (i < 0 || i + 2 >= cgraph->n_nodes) return false;
+    if (!ple_conv_enabled() || i < 0 || i + 2 >= cgraph->n_nodes) PLE_FAIL;
     const ggml_tensor * cc = cgraph->nodes[i];
-    if ((cc->flags & GGML_TENSOR_FLAG_OUTPUT) || cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cc, 0) != 0) return false;
+    if ((cc->flags & GGML_TENSOR_FLAG_OUTPUT) || cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cc, 0) != 0) PLE_FAIL;
     const ggml_tensor * st = cc->src[0]; const ggml_tensor * tr = cc->src[1];
-    if (!st || !tr || st->type != GGML_TYPE_F32 || tr->type != GGML_TYPE_F32 || tr->op != GGML_OP_TRANSPOSE || !tr->view_src) return false;
-    const ggml_tensor * x = tr->view_src;
-    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1) return false;
+    if (!st || !tr || st->type != GGML_TYPE_F32 || tr->type != GGML_TYPE_F32 || tr->op != GGML_OP_TRANSPOSE || !tr->view_src) PLE_FAIL;
+    // The transposed input is a reshape_2d([C, T]) of the grouped-norm output whose root is 3-D [n_embd, hc, T];
+    // take the logical shape from the reshape and the contiguity from the root (the kernel reads tr->data as [T][C]).
+    const ggml_tensor * x = tr->src[0];
+    if (!x || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(tr->view_src) ||
+        x->ne[2] != 1 || x->ne[3] != 1 || x->view_offs != 0 || ggml_nelements(x) != ggml_nelements(tr->view_src)) PLE_FAIL;
     const int64_t C = x->ne[0], T = x->ne[1], H = st->ne[0];
-    if (H != 9 || st->ne[1] != C || st->ne[2] != 1 || !ggml_is_contiguous(st)) return false;
-    if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) return false;
-    if (cc->ne[0] != T + H || cc->ne[1] != C || cc->ne[2] != 1 || !ggml_is_contiguous(cc) || T < 256 || C % 256 != 0) return false;
-    if (cgraph->nodes[i + 1]->op != GGML_OP_VIEW || cgraph->nodes[i + 1]->view_src != cc) return false;
+    if (H != 9 || st->ne[1] != C || st->ne[2] != 1 || !ggml_is_contiguous(st)) PLE_FAIL;
+    if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) PLE_FAIL;
+    if (cc->ne[0] != T + H || cc->ne[1] != C || cc->ne[2] != 1 || !ggml_is_contiguous(cc) || T < 256 || C % 256 != 0) PLE_FAIL;
+    if (cgraph->nodes[i + 1]->op != GGML_OP_VIEW || cgraph->nodes[i + 1]->view_src != cc) PLE_FAIL;
     int64_t tail_from = T + H; int first_tap = -1, ntaps = 0; const ggml_tensor * wroot = nullptr; const ggml_tensor * chain = nullptr; int silu = -1;
     const ggml_tensor * tap_out[4] = {nullptr,nullptr,nullptr,nullptr};
     std::vector<const ggml_tensor *> allowed_views, casts;
@@ -52,15 +61,15 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
         const ggml_tensor * t = cgraph->nodes[n];
         if (t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SILU && chain && t->src[0] == chain) { silu = n; break; }
         if (t->op == GGML_OP_VIEW && t->view_src == cc && t->ne[0] == H) {
-            if (t->ne[1] != C || t->ne[2] != 1 || t->ne[3] != 1 || t->nb[1] != cc->nb[1] || t->view_offs % sizeof(float) || t->view_offs / sizeof(float) + H > T + H) return false;
+            if (t->ne[1] != C || t->ne[2] != 1 || t->ne[3] != 1 || t->nb[1] != cc->nb[1] || t->view_offs % sizeof(float) || t->view_offs / sizeof(float) + H > T + H) PLE_FAIL;
             allowed_views.push_back(t);
             tail_from = std::min(tail_from, (int64_t)(t->view_offs / sizeof(float))); continue; }
         if (t->op == GGML_OP_CONT && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc && t->src[0]->ne[0] == H) continue;
         if (t->op == GGML_OP_CPY) continue;
         if (t->op == GGML_OP_CONT && t->src[0]->op == GGML_OP_TRANSPOSE && t->src[0]->view_src == cc) {
-            if (ntaps >= 4 || t->ne[0] != C || t->ne[1] != T) return false;
+            if (ntaps >= 4 || t->ne[0] != C || t->ne[1] != T) PLE_FAIL;
             m.starts[ntaps] = (int) (t->src[0]->view_offs / sizeof(float));
-            if (m.starts[ntaps] != ntaps * 3) return false;
+            if (m.starts[ntaps] != ntaps * 3) PLE_FAIL;
             allowed_views.push_back(t->src[0]);
             allowed_views.push_back(t->src[0]->src[0]);
             if (first_tap < 0) first_tap = n;
@@ -70,52 +79,52 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
         if (t->op == GGML_OP_MUL) {
             const ggml_tensor * a = t->src[0]; const ggml_tensor * b = t->src[1];
             int k = -1; for (int q = 0; q < ntaps; ++q) if (tap_out[q] == a || tap_out[q] == b) k = q;
-            if (k != terms++) return false;
+            if (k != terms++) PLE_FAIL;
             const ggml_tensor * wk = (tap_out[k] == a) ? b : a;
-            if (wk->type != GGML_TYPE_F32 || wk->ne[0] != C || ggml_nelements(wk) != C) return false;
+            if (wk->type != GGML_TYPE_F32 || wk->ne[0] != C || ggml_nelements(wk) != C) PLE_FAIL;
             const ggml_tensor * src = wk;
             if (src->op == GGML_OP_CPY) { casts.push_back(src); src = src->src[0]; }
             while (src && (src->op == GGML_OP_RESHAPE || src->op == GGML_OP_VIEW)) src = src->src[0];
-            if (!src || src->op != GGML_OP_CONT) return false;
-            const ggml_tensor * wv = src->src[0]; if (!wv || wv->op != GGML_OP_VIEW || !wv->view_src) return false;
+            if (!src || src->op != GGML_OP_CONT) PLE_FAIL;
+            const ggml_tensor * wv = src->src[0]; if (!wv || wv->op != GGML_OP_VIEW || !wv->view_src) PLE_FAIL;
             const ggml_tensor * W = wv->view_src;
-            if ((W->type != GGML_TYPE_F16 && W->type != GGML_TYPE_F32) || W->ne[0] != 4 || W->ne[1] != C || !ggml_is_contiguous(W)) return false;
-            if (wv->view_offs != (size_t) k * ggml_type_size(W->type) || wv->nb[1] != W->nb[1]) return false;
-            if (wroot && wroot != W) return false; wroot = W;
+            if ((W->type != GGML_TYPE_F16 && W->type != GGML_TYPE_F32) || W->ne[0] != 4 || W->ne[1] != C || !ggml_is_contiguous(W)) PLE_FAIL;
+            if (wv->view_offs != (size_t) k * ggml_type_size(W->type) || wv->nb[1] != W->nb[1]) PLE_FAIL;
+            if (wroot && wroot != W) PLE_FAIL; wroot = W;
             if (k == 0) chain = t; else { /* add comes next */ }
             tap_out[k] = t;
             continue;
         }
         if (t->op == GGML_OP_ADD) {
-            if (!chain) return false;
+            if (!chain) PLE_FAIL;
             const ggml_tensor * a = t->src[0]; const ggml_tensor * b = t->src[1];
             int k = -1; for (int q = 1; q < ntaps; ++q) if (tap_out[q] == b && a == chain) k = q;
-            if (k != ++adds) return false;
+            if (k != ++adds) PLE_FAIL;
             chain = t; continue;
         }
-        return false;
+        PLE_FAIL;
     }
-    if (silu < 0 || ntaps != 4 || terms != 4 || adds != 3 || !wroot || first_tap < 0) return false;
+    if (silu < 0 || ntaps != 4 || terms != 4 || adds != 3 || !wroot || first_tap < 0) PLE_FAIL;
     const ggml_tensor * su = cgraph->nodes[silu];
-    if (su->type != GGML_TYPE_F32 || !ggml_is_contiguous(su) || su->ne[0] != C || su->ne[1] != T) return false;
+    if (su->type != GGML_TYPE_F32 || !ggml_is_contiguous(su) || su->ne[0] != C || su->ne[1] != T) PLE_FAIL;
     for (int n = i + 1; n < cgraph->n_nodes; ++n) {
         const ggml_tensor * t = cgraph->nodes[n];
         bool reads_concat = t->view_src == cc;
         for (const auto * src : t->src) reads_concat |= src == cc;
-        if (reads_concat && std::find(allowed_views.begin(), allowed_views.end(), t) == allowed_views.end()) return false;
+        if (reads_concat && std::find(allowed_views.begin(), allowed_views.end(), t) == allowed_views.end()) PLE_FAIL;
         if (n < first_tap && t->op == GGML_OP_CPY && t->src[1]) {
             const auto * dst = t->src[1]->view_src ? t->src[1]->view_src : t->src[1];
-            if (dst == (x->view_src ? x->view_src : x) || dst == (st->view_src ? st->view_src : st)) return false;
+            if (dst == (x->view_src ? x->view_src : x) || dst == (st->view_src ? st->view_src : st)) PLE_FAIL;
         }
-        if (n >= first_tap && n <= silu && t->op == GGML_OP_CPY && std::find(casts.begin(), casts.end(), t) == casts.end()) return false;
+        if (n >= first_tap && n <= silu && t->op == GGML_OP_CPY && std::find(casts.begin(), casts.end(), t) == casts.end()) PLE_FAIL;
     }
     for (const auto * cast : casts) {
-        if (cast->src[1] != cast || cast->view_src || (cast->flags & GGML_TENSOR_FLAG_OUTPUT)) return false;
+        if (cast->src[1] != cast || cast->view_src || (cast->flags & GGML_TENSOR_FLAG_OUTPUT)) PLE_FAIL;
         for (int n = 0; n < cgraph->n_nodes; ++n) {
             if (n >= first_tap && n <= silu) continue;
             const auto * t = cgraph->nodes[n];
-            if (t->view_src == cast) return false;
-            for (const auto * src : t->src) if (src == cast) return false;
+            if (t->view_src == cast) PLE_FAIL;
+            for (const auto * src : t->src) if (src == cast) PLE_FAIL;
         }
     }
     std::vector<const ggml_tensor *> checkpoint_dsts;
@@ -133,7 +142,7 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
              std::find(checkpoint_dsts.begin(), checkpoint_dsts.end(), cgraph->nodes[n]) != checkpoint_dsts.end())) ||
             std::find(casts.begin(), casts.end(), cgraph->nodes[n]) != casts.end()) outputs.push_back(n);
     }
-    if (!ggml_can_fuse_subgraph_ext(cgraph, indices.data(), (int) indices.size(), ops.data(), outputs.data(), (int) outputs.size())) return false;
+    if (!ggml_can_fuse_subgraph_ext(cgraph, indices.data(), (int) indices.size(), ops.data(), outputs.data(), (int) outputs.size())) PLE_FAIL;
     m.concat_idx = i; m.first_tap_idx = first_tap; m.silu_idx = silu; m.input = tr; m.state = st; m.concat = cc; m.w = wroot; m.out = cgraph->nodes[silu];
     m.C = C; m.T = T; m.H = H; m.K = 4; m.dil = 3; m.tail_from = tail_from;
     return true;

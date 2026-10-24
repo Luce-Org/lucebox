@@ -3694,8 +3694,7 @@ bool HttpServer::attach_output_constraint(SocketHandle fd, ParsedRequest & req) 
         send_error(fd, 400, error);
         return false;
     }
-    const bool tools_off = req.tool_choice == "none" ||
-        http_detail::string_member(req.tool_choice, "type") == "none";
+    const bool tools_off = tool_checks::tool_choice_is_none(req.tool_choice);
     const bool has_tools = req.tools.is_array() && !req.tools.empty() && !tools_off;
     const bool must_call = has_tools && http_detail::tool_choice_requires_call(req.tool_choice);
     if (schema.is_null() && !must_call) return true;
@@ -4477,9 +4476,27 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
     }
     open_stream();
 
+    // If the model calls a tool when tool_choice is "none", retry
+    // once with a note that tools are unavailable. If the retry still
+    // calls one, drop its calls and send its text, so no tool call
+    // reaches the client.
+    const bool tools_off = tc::tools_off(request);
+    const char * tool_free = "-";
     const char * replan = "-";
     const char * final_check = "-";
-    if (tc::needs_replan(*reply)) {
+    if (tc::needs_tool_free_reply(request, *reply)) {
+        json again;
+        if (pass(tc::with_note(request, *reply, tc::kNoToolsNote), again)) {
+            response = std::move(again);
+            reply = tc::reply_message(response);
+        }
+        tool_free = "replaced";
+        if (tc::needs_tool_free_reply(request, *reply)) {
+            tc::drop_calls(response);
+            tool_free = "dropped";
+        }
+    }
+    if (!tools_off && tc::needs_replan(*reply)) {
         json again;
         json * again_reply = pass(tc::with_note(request, *reply, tc::kReplanNote), again)
             ? tc::reply_message(again) : nullptr;
@@ -4491,7 +4508,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
             replan = "replanned";
         }
     }
-    if (tc::needs_final_check(messages, *reply, checked_calls_)) {
+    if (!tools_off && tc::needs_final_check(messages, *reply, checked_calls_)) {
         json again;
         json * again_reply = pass(tc::with_note(request, *reply, tc::kFinalNote), again)
             ? tc::reply_message(again) : nullptr;
@@ -4504,8 +4521,8 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
             final_check = "more_work";
         }
     }
-    std::fprintf(stderr, "[tool-checks] %s replan=%s final_check=%s ms=%lld\n",
-                 response.value("id", std::string()).c_str(), replan, final_check,
+    std::fprintf(stderr, "[tool-checks] %s tool_free=%s replan=%s final_check=%s ms=%lld\n",
+                 response.value("id", std::string()).c_str(), tool_free, replan, final_check,
                  (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - started).count());
 
