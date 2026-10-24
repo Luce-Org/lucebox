@@ -15,8 +15,6 @@ namespace luce::common {
 namespace {
 
 constexpr int kCpb = 2;        // chunks per block: q registers are reused across them
-constexpr int kMaxBlk = 8;     // D <= 256 (the shared K tile is sized for it)
-constexpr int kMaxCt = 64;
 constexpr int kTop = 8;        // kExactTopPlanes
 
 __device__ __forceinline__ int dp4a_i8(int a, int b, int c) {
@@ -48,18 +46,19 @@ struct PartArgs {
 };
 
 // grid (ceil(C / kCpb), HK, L); block threads cover the tile's G * nq planes of this (layer, kv head), looping when fewer.
+// NBLK (= D / 32) and CT are compile-time so the q block and the loops stay in registers.
+template <int NBLK, int CT>
 __global__ void partials_kernel(KPtrs kp, PartArgs a, const int * __restrict__ src, const int8_t * __restrict__ q8,
                                 const uint16_t * __restrict__ qd, float * __restrict__ part) {
-    __shared__ __align__(16) int   sq[kCpb][kMaxCt * kMaxBlk * 8];   // K int8 payload, repacked 4-byte aligned [t][b][8]
-    __shared__ float               sd[kCpb][kMaxCt * kMaxBlk];       // K block scales
+    __shared__ __align__(16) int   sq[kCpb][CT * NBLK * 8];   // K int8 payload, repacked 4-byte aligned [t][b][8]
+    __shared__ float               sd[kCpb][CT * NBLK];       // K block scales
     const int l = blockIdx.z, hk = blockIdx.y, c0 = blockIdx.x * kCpb;
     const int nc = min(kCpb, a.C - c0);
-    const int ntb = a.ct * a.nblk;
     for (int cc = 0; cc < nc; cc++) {
         const int s = src[c0 + cc];
-        const uint8_t * base = s >= 0 ? kp.pool[l] + (size_t)hk * kp.pool_nb2 + (size_t)s * a.ct * a.nblk * 34
-                                      : kp.copy[l] + (size_t)hk * kp.copy_nb2 + (size_t)(-1 - s) * a.ct * a.nblk * 34;
-        for (int blk = threadIdx.x; blk < ntb; blk += blockDim.x) {
+        const uint8_t * base = s >= 0 ? kp.pool[l] + (size_t)hk * kp.pool_nb2 + (size_t)s * CT * NBLK * 34
+                                      : kp.copy[l] + (size_t)hk * kp.copy_nb2 + (size_t)(-1 - s) * CT * NBLK * 34;
+        for (int blk = threadIdx.x; blk < CT * NBLK; blk += blockDim.x) {
             const uint8_t * bp = base + (size_t)blk * 34;
             const unsigned short dh = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
             sd[cc][blk] = __half2float(__ushort_as_half(dh));
@@ -71,45 +70,62 @@ __global__ void partials_kernel(KPtrs kp, PartArgs a, const int * __restrict__ s
     }
     __syncthreads();
     const int P = a.nq * a.G;
-    const float scale = 1.0f / sqrtf((float)a.D);
+    const float scale = 1.0f / sqrtf((float)(NBLK * 32));
     for (int p = threadIdx.x; p < P; p += blockDim.x) {
         const int i = p / a.G, g = p - i * a.G;
         const int x = l * a.Hq + hk * a.G + g;
         const size_t qi = ((size_t)(a.q0 + i) * a.planes + x);
-        const int4 * qp = reinterpret_cast<const int4 *>(q8 + qi * a.D);
-        int qv[kMaxBlk * 8];
-        float qs[kMaxBlk];
-        for (int b = 0; b < a.nblk; b++) {
+        const int4 * qp = reinterpret_cast<const int4 *>(q8 + qi * (NBLK * 32));
+        int qv[NBLK * 8];
+        float qs[NBLK];
+#pragma unroll
+        for (int b = 0; b < NBLK; b++) {
             const int4 v0 = qp[2 * b], v1 = qp[2 * b + 1];
             qv[b * 8 + 0] = v0.x; qv[b * 8 + 1] = v0.y; qv[b * 8 + 2] = v0.z; qv[b * 8 + 3] = v0.w;
             qv[b * 8 + 4] = v1.x; qv[b * 8 + 5] = v1.y; qv[b * 8 + 6] = v1.z; qv[b * 8 + 7] = v1.w;
-            qs[b] = __half2float(__ushort_as_half(qd[qi * a.nblk + b]));
+            qs[b] = __half2float(__ushort_as_half(qd[qi * NBLK + b]));
         }
         for (int cc = 0; cc < nc; cc++) {
-            float lg[kMaxCt];
-            float mx = -INFINITY;
-            for (int t = 0; t < a.ct; t++) {
+            // online max / sum-exp over the chunk's tokens (no logits array)
+            float mx = -INFINITY, sum = 0.0f;
+#pragma unroll 2
+            for (int t = 0; t < CT; t++) {
                 float acc = 0.0f;
-                for (int b = 0; b < a.nblk; b++) {
-                    const int4 * kv = reinterpret_cast<const int4 *>(&sq[cc][(t * a.nblk + b) * 8]);
+#pragma unroll
+                for (int b = 0; b < NBLK; b++) {
+                    const int4 * kv = reinterpret_cast<const int4 *>(&sq[cc][(t * NBLK + b) * 8]);
                     const int4 k0 = kv[0], k1 = kv[1];
                     int isum = 0;
                     isum = dp4a_i8(k0.x, qv[b * 8 + 0], isum); isum = dp4a_i8(k0.y, qv[b * 8 + 1], isum);
                     isum = dp4a_i8(k0.z, qv[b * 8 + 2], isum); isum = dp4a_i8(k0.w, qv[b * 8 + 3], isum);
                     isum = dp4a_i8(k1.x, qv[b * 8 + 4], isum); isum = dp4a_i8(k1.y, qv[b * 8 + 5], isum);
                     isum = dp4a_i8(k1.z, qv[b * 8 + 6], isum); isum = dp4a_i8(k1.w, qv[b * 8 + 7], isum);
-                    acc += (sd[cc][t * a.nblk + b] * qs[b]) * (float)isum;
+                    acc += (sd[cc][t * NBLK + b] * qs[b]) * (float)isum;
                 }
-                lg[t] = acc * scale;
-                mx = fmaxf(mx, lg[t]);
+                const float lgt = acc * scale;
+                const float mn = fmaxf(mx, lgt);
+                sum = sum * expf(mx - mn) + expf(lgt - mn);   // first token: expf(-inf) * 0 = 0 (mx = -inf)
+                mx = mn;
             }
-            float sum = 0.0f;
-            for (int t = 0; t < a.ct; t++) sum += expf(lg[t] - mx);
             float * o = part + (((size_t)i * a.planes + x) * a.C + (c0 + cc)) * 2;
             o[0] = mx;
             o[1] = sum;
         }
     }
+}
+
+template <int NBLK, int CT>
+static void launch_partials(dim3 grid, int threads, cudaStream_t st, const KPtrs & kp, const PartArgs & a, const int * src, const int8_t * q8,
+                            const uint16_t * qd, float * part) {
+    partials_kernel<NBLK, CT><<<grid, threads, 0, st>>>(kp, a, src, q8, qd, part);
+}
+
+static bool dispatch_partials(int nblk, int ct, dim3 grid, int threads, cudaStream_t st, const KPtrs & kp, const PartArgs & a, const int * src,
+                              const int8_t * q8, const uint16_t * qd, float * part) {
+#define KV_CASE(NB, CT) if (nblk == NB && ct == CT) { launch_partials<NB, CT>(grid, threads, st, kp, a, src, q8, qd, part); return true; }
+    KV_CASE(8, 64) KV_CASE(8, 32) KV_CASE(8, 16) KV_CASE(4, 64) KV_CASE(4, 32) KV_CASE(4, 16) KV_CASE(2, 64) KV_CASE(2, 16)
+#undef KV_CASE
+    return false;
 }
 
 // per (query, plane): M = max local max over chunks that hold keys, Z = sum s * exp(m - M)
@@ -202,7 +218,7 @@ bool kvflash_fused_run(KvFlashFusedWs * ws, const KvFlashFusedGeom & g, const Kv
     auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     auto fail = [&](const char * m) { if (err) *err = m; return false; };
     const int nblk = g.D / 32, G = g.Hq / std::max(g.HK, 1), planes = g.L * g.Hq;
-    if (!ws || g.L <= 0 || g.L > kFusedMaxLayers || g.HK <= 0 || g.Hq % g.HK || g.D % 32 || nblk > kMaxBlk || g.ct <= 0 || g.ct > kMaxCt || g.C <= 0 || g.nq <= 0)
+    if (!ws || g.L <= 0 || g.L > kFusedMaxLayers || g.HK <= 0 || g.Hq % g.HK || g.D % 32 || nblk > 8 || g.ct <= 0 || g.C <= 0 || g.nq <= 0)
         return fail("fused kernel: unsupported geometry");
     if ((int)k.pool.size() != g.L || (int)k.src.size() != g.C) return fail("fused kernel: bad K sources");
     bool any_copy = false;
@@ -237,7 +253,7 @@ bool kvflash_fused_run(KvFlashFusedWs * ws, const KvFlashFusedGeom & g, const Kv
         const int threads = std::min(256, (P + 31) / 32 * 32);
         const auto ta = clk::now();
         dim3 grid((g.C + kCpb - 1) / kCpb, g.HK, g.L);
-        partials_kernel<<<grid, threads, 0, st>>>(kp, a, ws->src, ws->q8, ws->qd, ws->part);
+        if (!dispatch_partials(nblk, g.ct, grid, threads, st, kp, a, ws->src, ws->q8, ws->qd, ws->part)) return fail("fused kernel: unsupported (D, chunk tokens)");
         if (!ck(cudaGetLastError(), "partials launch", err) || !ck(cudaStreamSynchronize(st), "partials", err)) return false;
         const auto tb = clk::now();
         plane_reduce_kernel<<<nqt * planes, 256, 0, st>>>(ws->part, g.C, planes, ws->mz);

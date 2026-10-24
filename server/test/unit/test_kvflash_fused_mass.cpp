@@ -238,4 +238,51 @@ TEST_CASE(KvflashFusedMassFixture, device_kernel_tiles_the_queries_without_chang
     CHECK(t1 == 1);
     CHECK(t2 > 1);
 }
+
+// Timing probe, off unless LUCE_FUSED_BENCH=<chunks> is set: random q8_0 K on the device, 128 queries, qwen35 shape.
+TEST_CASE(KvflashFusedMassFixture, bench_device_kernel_when_asked) {
+    const char * env = std::getenv("LUCE_FUSED_BENCH");
+    if (!env) SKIP("LUCE_FUSED_BENCH not set");
+    const int C = std::atoi(env), L = 16, HK = 4, Hq = 24, D = 256, ct = 64, nq = 128, nblk = D / 32;
+    ggml_backend_t be = ggml_backend_cuda_init(0);
+    REQUIRE(be != nullptr);
+    ggml_init_params ip{ggml_tensor_overhead() * (size_t)(L + 4), nullptr, true};
+    ggml_context * ctx = ggml_init(ip);
+    std::vector<ggml_tensor *> pool;
+    for (int l = 0; l < L; l++) pool.push_back(ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, D, (int64_t)C * ct, HK));
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    REQUIRE(buf != nullptr);
+    std::mt19937 rng(1);
+    std::vector<uint8_t> blob((size_t)64 << 20);
+    for (size_t i = 0; i < blob.size(); i += 34) {
+        const uint16_t d = ggml_fp32_to_fp16(0.02f);
+        std::memcpy(&blob[i], &d, 2);
+        for (int j = 0; j < 32 && i + 2 + j < blob.size(); j++) blob[i + 2 + j] = (uint8_t)(int8_t)((int)(rng() % 255) - 127);
+    }
+    for (auto * t : pool)
+        for (size_t off = 0; off < ggml_nbytes(t); off += blob.size())
+            ggml_backend_tensor_set(t, blob.data(), off, std::min(blob.size(), ggml_nbytes(t) - off));
+    KvFlashFusedK k;
+    k.src.resize((size_t)C);
+    for (int c = 0; c < C; c++) k.src[(size_t)c] = c;
+    for (auto * t : pool) k.pool.push_back((const uint8_t *)t->data);
+    k.pool_nb2 = pool[0]->nb[2];
+    const size_t LH = (size_t)L * Hq;
+    std::vector<int8_t> q8((size_t)nq * LH * D);
+    std::vector<uint16_t> qd((size_t)nq * LH * nblk);
+    for (auto & v : q8) v = (int8_t)((int)(rng() % 255) - 127);
+    for (auto & v : qd) v = ggml_fp32_to_fp16(0.01f);
+    KvFlashFusedGeom g; g.L = L; g.HK = HK; g.Hq = Hq; g.D = D; g.ct = ct; g.C = C; g.nq = nq;
+    KvFlashFusedWs * ws = kvflash_fused_ws_new();
+    std::vector<float> a((size_t)nq * C), b(a.size()), c2(a.size());
+    KvFlashFusedTiming tm;
+    std::string err;
+    for (int rep = 0; rep < 3; rep++) {
+        REQUIRE(kvflash_fused_run(ws, g, k, q8.data(), qd.data(), (size_t)256 << 20, a.data(), b.data(), c2.data(), &tm, &err));
+        std::fprintf(stderr, "bench C=%d: up %.1f kernel %.1f reduce %.1f down %.1f ms, tiles %d, partials %.0f MiB\n", C, tm.up_ms, tm.kernel_ms,
+                     tm.reduce_ms, tm.down_ms, tm.tiles, tm.partial_bytes / 1048576.0);
+    }
+    kvflash_fused_ws_free(ws);
+    ggml_backend_buffer_free(buf); ggml_free(ctx); ggml_backend_free(be);
+}
 #endif
