@@ -338,6 +338,15 @@ struct ModelBackend {
     virtual bool snapshot_used(int slot) const = 0;
     virtual int  snapshot_cur_pos(int slot) const = 0;
 
+    // Prompt tokens a request for `prompt` would skip, given the server's best
+    // snapshot (`slot`, -1 for none, matching `slot_tokens` of the prompt). The
+    // default trusts the snapshot; a backend that keeps more (KVFlash's live
+    // session) or cannot use a snapshot says so. No side effects.
+    virtual int restorable_prefix(const std::vector<int32_t> & prompt, int slot, int slot_tokens) const {
+        (void) prompt; (void) slot;
+        return slot_tokens;
+    }
+
     // A snapshot lands at least this many positions past the restore point,
     // so a cut closer than that cannot be saved. Backends that start a
     // prefill chunk at every restore point (Qwen: beyond this distance) save
@@ -389,9 +398,11 @@ struct ModelBackend {
         }
         // A deferred snapshot the first attempt continued in place no
         // longer exists (snapshot_save_deferred()); prefill the prompt.
-        GenerateResult merged =
-            merge_empty_spec_retry_result(result, generate_impl(retry, io));
-        merged.restored_prefix_tokens = 0;
+        GenerateResult again = generate_impl(retry, io);
+        const int again_prefix = again.restored_prefix_tokens;
+        GenerateResult merged = merge_empty_spec_retry_result(result, std::move(again));
+        // Only the retry's own cut counts (a live-session restore can reuse a prefix).
+        merged.restored_prefix_tokens = again_prefix;
         return merged;
     }
 
@@ -430,6 +441,7 @@ struct ModelBackend {
         ggml_backend_buffer_t buf     = nullptr;
         int                   cur_pos = 0;
         int32_t               last_tok = -1;  // last prefill token (for decode seeding)
+        bool                  pooled  = false; // KV lives in a pager blob, not in ctx tensors
     };
 
     // Export a snapshot's tensor context + buffer for read-only access.
@@ -455,7 +467,9 @@ struct ModelBackend {
     // the backend exports no SnapshotRef.
     virtual OwnedSnapshot snapshot_detach(int slot) {
         const SnapshotRef ref = snapshot_ref(slot);
-        OwnedSnapshot out = ref.ctx
+        // A pooled snapshot keeps its KV outside ref.ctx; a copy would reach
+        // the disk writer with no KV.
+        OwnedSnapshot out = ref.ctx && !ref.pooled
             ? OwnedSnapshot::clone_to_host(ref.ctx, ref.cur_pos, ref.last_tok)
             : OwnedSnapshot{};
         snapshot_free(slot);
