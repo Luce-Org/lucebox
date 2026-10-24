@@ -1,7 +1,7 @@
 // Fused exact chunk-mass kernel (Amendment 10): one pass over K, per (query, plane, chunk) a local max and local sum-exp, no
 // stored logits; then a small reduce per plane and a per-chunk aggregate (mean, top-8 mean, max over planes).
-// Numerics follow ggml's MMQ path for q8_0 K x f32 q: q is quantized to q8_1 per 32-block (fp16 scale, round half away),
-// the dot is an int8 dp4a per block, logit = scale * sum_b (dK_b * dQ_b) * isum_b in ascending block order.
+// Numerics follow ggml's MMQ path for q8_0 K x f32 q (quantize_mmq_q8_1, layout D4): per 32-block d_inv = 127 / amax, q = roundf(x * d_inv),
+// dQ = 1 / d_inv as a float; the dot is an int8 dp4a per block, logit = scale * sum_b (dK_b * dQ_b) * isum_b in ascending block order.
 // Compiled on CUDA and HIP (LANGUAGE HIP through the hip_compat shim, as geometric_draft_topk_cuda.cu); LUCE_HAVE_KVFLASH_FUSED_MASS.
 
 #pragma once
@@ -39,8 +39,8 @@ class KvFlashFusedWs;
 KvFlashFusedWs * kvflash_fused_ws_new();
 void kvflash_fused_ws_free(KvFlashFusedWs *);
 
-// q8 (host): [nq][L*Hq][D] int8 and qd: [nq][L*Hq][D/32] fp16 bits. Outputs (host) [nq][C] each.
-bool kvflash_fused_run(KvFlashFusedWs * ws, const KvFlashFusedGeom & g, const KvFlashFusedK & k, const int8_t * q8, const uint16_t * qd,
+// q8 (host): [nq][L*Hq][D] int8 and qd: [nq][L*Hq][D/32] float scales. Outputs (host) [nq][C] each.
+bool kvflash_fused_run(KvFlashFusedWs * ws, const KvFlashFusedGeom & g, const KvFlashFusedK & k, const int8_t * q8, const float * qd,
                        size_t max_partial_bytes, float * out_mean, float * out_top, float * out_max, KvFlashFusedTiming * tm,
                        std::string * err);
 
