@@ -49,7 +49,7 @@ struct PartArgs {
 // NBLK (= D / 32) and CT are compile-time so the q block and the loops stay in registers.
 template <int NBLK, int CT>
 __global__ void partials_kernel(KPtrs kp, PartArgs a, const int * __restrict__ src, const int8_t * __restrict__ q8,
-                                const uint16_t * __restrict__ qd, float * __restrict__ part) {
+                                const float * __restrict__ qd, float * __restrict__ part) {
     __shared__ __align__(16) int   sq[kCpb][CT * NBLK * 8];   // K int8 payload, repacked 4-byte aligned [t][b][8]
     __shared__ float               sd[kCpb][CT * NBLK];       // K block scales
     const int l = blockIdx.z, hk = blockIdx.y, c0 = blockIdx.x * kCpb;
@@ -83,7 +83,7 @@ __global__ void partials_kernel(KPtrs kp, PartArgs a, const int * __restrict__ s
             const int4 v0 = qp[2 * b], v1 = qp[2 * b + 1];
             qv[b * 8 + 0] = v0.x; qv[b * 8 + 1] = v0.y; qv[b * 8 + 2] = v0.z; qv[b * 8 + 3] = v0.w;
             qv[b * 8 + 4] = v1.x; qv[b * 8 + 5] = v1.y; qv[b * 8 + 6] = v1.z; qv[b * 8 + 7] = v1.w;
-            qs[b] = __half2float(__ushort_as_half(qd[qi * NBLK + b]));
+            qs[b] = qd[qi * NBLK + b];
         }
         for (int cc = 0; cc < nc; cc++) {
             // online max / sum-exp over the chunk's tokens (no logits array)
@@ -116,12 +116,12 @@ __global__ void partials_kernel(KPtrs kp, PartArgs a, const int * __restrict__ s
 
 template <int NBLK, int CT>
 static void launch_partials(dim3 grid, int threads, cudaStream_t st, const KPtrs & kp, const PartArgs & a, const int * src, const int8_t * q8,
-                            const uint16_t * qd, float * part) {
+                            const float * qd, float * part) {
     partials_kernel<NBLK, CT><<<grid, threads, 0, st>>>(kp, a, src, q8, qd, part);
 }
 
 static bool dispatch_partials(int nblk, int ct, dim3 grid, int threads, cudaStream_t st, const KPtrs & kp, const PartArgs & a, const int * src,
-                              const int8_t * q8, const uint16_t * qd, float * part) {
+                              const int8_t * q8, const float * qd, float * part) {
 #define KV_CASE(NB, CT) if (nblk == NB && ct == CT) { launch_partials<NB, CT>(grid, threads, st, kp, a, src, q8, qd, part); return true; }
     KV_CASE(8, 64) KV_CASE(8, 32) KV_CASE(8, 16) KV_CASE(4, 64) KV_CASE(4, 32) KV_CASE(4, 16) KV_CASE(2, 64) KV_CASE(2, 16)
 #undef KV_CASE
@@ -196,7 +196,7 @@ public:
         if (stream) cudaStreamDestroy(stream);
     }
     cudaStream_t stream = nullptr;
-    int8_t * q8 = nullptr; uint16_t * qd = nullptr; int * src = nullptr; float * part = nullptr; float * mz = nullptr; float * out = nullptr;
+    int8_t * q8 = nullptr; float * qd = nullptr; int * src = nullptr; float * part = nullptr; float * mz = nullptr; float * out = nullptr;
     size_t q8_b = 0, qd_b = 0, src_b = 0, part_b = 0, mz_b = 0, out_b = 0;
     template <class T> bool grow(T *& p, size_t & have, size_t need, std::string * err) {
         if (need <= have) return true;
@@ -211,7 +211,7 @@ public:
 KvFlashFusedWs * kvflash_fused_ws_new() { return new KvFlashFusedWs(); }
 void kvflash_fused_ws_free(KvFlashFusedWs * w) { delete w; }
 
-bool kvflash_fused_run(KvFlashFusedWs * ws, const KvFlashFusedGeom & g, const KvFlashFusedK & k, const int8_t * q8, const uint16_t * qd,
+bool kvflash_fused_run(KvFlashFusedWs * ws, const KvFlashFusedGeom & g, const KvFlashFusedK & k, const int8_t * q8, const float * qd,
                        size_t max_partial_bytes, float * out_mean, float * out_top, float * out_max, KvFlashFusedTiming * tm,
                        std::string * err) {
     using clk = std::chrono::steady_clock;
@@ -232,14 +232,14 @@ bool kvflash_fused_run(KvFlashFusedWs * ws, const KvFlashFusedGeom & g, const Kv
     int tile = (int)std::min<size_t>((size_t)g.nq, std::max<size_t>(max_partial_bytes / per_q, 1));
     if (tile < g.nq && tile > 8) tile -= tile % 8;
     if (!ws->stream && !ck(cudaStreamCreate(&ws->stream), "cudaStreamCreate", err)) return false;
-    if (!ws->grow(ws->q8, ws->q8_b, (size_t)g.nq * planes * g.D, err) || !ws->grow(ws->qd, ws->qd_b, (size_t)g.nq * planes * nblk * 2, err) ||
+    if (!ws->grow(ws->q8, ws->q8_b, (size_t)g.nq * planes * g.D, err) || !ws->grow(ws->qd, ws->qd_b, (size_t)g.nq * planes * nblk * sizeof(float), err) ||
         !ws->grow(ws->src, ws->src_b, (size_t)g.C * sizeof(int), err) || !ws->grow(ws->part, ws->part_b, (size_t)tile * per_q, err) ||
         !ws->grow(ws->mz, ws->mz_b, (size_t)tile * planes * 2 * sizeof(float), err) || !ws->grow(ws->out, ws->out_b, (size_t)3 * g.nq * g.C * sizeof(float), err))
         return false;
     cudaStream_t st = ws->stream;
     const auto t0 = clk::now();
     if (!ck(cudaMemcpyAsync(ws->q8, q8, (size_t)g.nq * planes * g.D, cudaMemcpyHostToDevice, st), "h2d q8", err) ||
-        !ck(cudaMemcpyAsync(ws->qd, qd, (size_t)g.nq * planes * nblk * 2, cudaMemcpyHostToDevice, st), "h2d qd", err) ||
+        !ck(cudaMemcpyAsync(ws->qd, qd, (size_t)g.nq * planes * nblk * sizeof(float), cudaMemcpyHostToDevice, st), "h2d qd", err) ||
         !ck(cudaMemcpyAsync(ws->src, k.src.data(), (size_t)g.C * sizeof(int), cudaMemcpyHostToDevice, st), "h2d src", err) ||
         !ck(cudaStreamSynchronize(st), "sync up", err))
         return false;
