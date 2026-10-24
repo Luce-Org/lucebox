@@ -158,7 +158,7 @@ TEST_CASE(KvflashFusedMassFixture, q8_reference_is_close_to_the_float_scorer) {
 namespace {
 // Device run of the fused kernel on `s` (Q8_0): chunks alternate between the pool tensors (shuffled blocks) and the device copy.
 // Returns the worst relative difference against the CPU reference with the same numerics; -1 on a setup failure.
-double fused_gpu_worst(const FSynth & s, size_t max_partial_bytes, double floor_abs, int * tiles) {
+double fused_gpu_worst(const FSynth & s, size_t max_partial_bytes, double floor_abs, int * tiles, int impl = 0) {
     ggml_backend_t be = ggml_backend_cuda_init(0);
     if (!be) return -1;
     const int L = s.d.n_layers, HK = s.d.n_kv_heads, D = s.d.head_dim, ct = s.ct, C = s.C, nq = (int)s.q.size();
@@ -190,7 +190,7 @@ double fused_gpu_worst(const FSynth & s, size_t max_partial_bytes, double floor_
     k.pool_nb2 = pool[0]->nb[2]; k.copy_nb2 = copy[0]->nb[2];
     std::vector<int8_t> q8(s.q.size() * (size_t)LH * D); std::vector<float> qd(s.q.size() * (size_t)LH * nblk);
     for (size_t i = 0; i < s.q.size(); i++) kvflash_quantize_q8_1(s.q[i].data(), LH * D, &q8[i * LH * D], &qd[i * LH * nblk]);
-    KvFlashFusedGeom g; g.L = L; g.HK = HK; g.Hq = s.d.n_q_heads; g.D = D; g.ct = ct; g.C = C; g.nq = nq;
+    KvFlashFusedGeom g; g.L = L; g.HK = HK; g.Hq = s.d.n_q_heads; g.D = D; g.ct = ct; g.C = C; g.nq = nq; g.impl = impl;
     KvFlashFusedWs * ws = kvflash_fused_ws_new();
     std::vector<float> om((size_t)nq * C), ot((size_t)nq * C), ox((size_t)nq * C);
     KvFlashFusedTiming tm;
@@ -237,6 +237,16 @@ TEST_CASE(KvflashFusedMassFixture, device_kernel_tiles_the_queries_without_chang
     CHECK(a <= 1e-5); CHECK(b <= 1e-5);
     CHECK(t1 == 1);
     CHECK(t2 > 1);
+}
+
+TEST_CASE(KvflashFusedMassFixture, dp4a_impl_matches_and_wmma_impl_is_refused_off_gfx12) {
+    FSynth s;
+    s.build(GGML_TYPE_Q8_0, 3, 6, 2, 64, 41, 16, 5, 9);
+    const double w = fused_gpu_worst(s, (size_t)1 << 30, 1e-8, nullptr, 1);
+    CHECK(w >= 0); CHECK(w <= 1e-5);
+#if !defined(GGML_USE_HIP)
+    CHECK(fused_gpu_worst(s, (size_t)1 << 30, 1e-8, nullptr, 2) < 0);   // CUDA has no gfx12 WMMA kernel: explicit request fails, auto falls back
+#endif
 }
 
 // Timing probe, off unless LUCE_FUSED_BENCH=<chunks> is set: random q8_0 K on the device, 128 queries, qwen35 shape.

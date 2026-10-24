@@ -19,6 +19,7 @@ struct KvFlashFusedGeom {
     int L = 0, HK = 0, Hq = 0, D = 0, ct = 0;   // Hq % HK == 0, D % 32 == 0
     int C = 0;                                  // sealed chunks (the sealed bound: only these are read)
     int nq = 0;
+    int impl = 0;   // 0 auto (int8 WMMA on gfx12, dp4a elsewhere), 1 dp4a, 2 WMMA (fails off gfx12)
 };
 
 // Where the K of each chunk lives: layer l's q8_0 tensor [D, tokens, HK] in device memory, rows of 34-byte blocks.
