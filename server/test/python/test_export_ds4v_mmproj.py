@@ -28,6 +28,25 @@ def exact_config():
     return dict(exporter.EXPECTED_CONFIG)
 
 
+def exact_config_v41():
+    """The V4.1 Hugging Face config: the checked keys plus unrelated ones."""
+    config = json.loads(json.dumps(exporter.EXPECTED_CONFIG_V41))
+    config["model_type"] = "deepseek_v41"
+    config["text_config"]["num_hidden_layers"] = 40
+    config["vision_config"]["model_type"] = "deepseek_v41_vision"
+    return config
+
+
+REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
+
+
+def record_local_revision(source, revision=REVISION):
+    """What `hf download --local-dir` leaves next to config.json."""
+    marker = source / ".cache" / "huggingface" / "download"
+    marker.mkdir(parents=True)
+    (marker / "config.json.metadata").write_text(revision + "\netag\n1760000000.0\n", encoding="utf-8")
+
+
 def write_json(path, value):
     path.write_text(json.dumps(value), encoding="utf-8")
 
@@ -282,6 +301,98 @@ class ExportDs4vMmprojTest(unittest.TestCase):
                     exporter.export_mmproj(source, output)
             self.assertFalse(output.exists())
             self.assertEqual(list(root.glob(".vision.gguf.*.tmp")), [])
+
+
+
+class ExportDs41MmprojTest(unittest.TestCase):
+    def export_small(self, source, output, revision=""):
+        with mock.patch.object(exporter, "expected_shapes", return_value=TEST_SHAPES):
+            return exporter.export_mmproj(source, output, revision)
+
+    def test_v41_inventory_is_5120_wide_without_pad(self):
+        shapes = exporter.expected_shapes(exporter.V41)
+        self.assertEqual(len(shapes), 266)
+        self.assertNotIn("image_pad", shapes)
+        self.assertEqual(shapes["aligner.w1.weight"], (5120, 9216))
+        self.assertEqual(shapes["aligner.w2.weight"], (5120, 5120))
+        for name in ("image_start", "image_newline", "image_end", "aligner.w1.bias", "aligner.w2.bias"):
+            self.assertEqual(shapes[name], (5120,))
+        v4 = exporter.expected_shapes(exporter.V4)
+        self.assertEqual(len(v4), 267)
+        self.assertEqual(v4["image_pad"], (4096,))
+        self.assertEqual({k for k in shapes if k.startswith("vision.")},
+                         {k for k in v4 if k.startswith("vision.")})
+
+    def test_v41_metadata_records_schema_two_and_revision(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = make_source(root, config=exact_config_v41())
+            record_local_revision(source)
+            output = root / "vision.gguf"
+            self.export_small(source, output)
+            _, metadata, infos, _, _ = read_gguf(output)
+            self.assertEqual(metadata["general.architecture"], "deepseek4_vision")
+            self.assertEqual(metadata["general.source.revision"], REVISION)
+            self.assertEqual(metadata["deepseek4.vision.schema_version"], 2)
+            self.assertEqual(metadata["deepseek4.vision.checkpoint_variant"], "v4.1-flash")
+            self.assertEqual(metadata["deepseek4.vision.language_embedding_length"], 5120)
+            self.assertEqual(metadata["deepseek4.vision.image.max_tokens"], 1024)
+            self.assertEqual(metadata["deepseek4.vision.image.min_pixels"], 295936)
+            self.assertEqual(metadata["deepseek4.vision.image.max_aspect_ratio"], 0.0)
+            self.assertEqual(metadata["deepseek4.vision.image.token_id"], 129264)
+            self.assertEqual(metadata["deepseek4.vision.image.layout"], "reading-order")
+            self.assertEqual(metadata["deepseek4.vision.image.layout_version"], 2)
+            self.assertEqual(metadata["deepseek4.vision.image.compression_alignment"], 1)
+            self.assertEqual(metadata["deepseek4.vision.image.sentinel_types"], "start,image,newline,end")
+            self.assertEqual(metadata["deepseek4.vision.image.sentinel_type_count"], 4)
+            self.assertEqual([info[0] for info in infos], sorted(TEST_SHAPES))
+
+    def test_v41_explicit_revision_must_match_the_download(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = make_source(root, config=exact_config_v41())
+            record_local_revision(source)
+            with self.assertRaisesRegex(exporter.ExportError, "differs from the downloaded revision"):
+                self.export_small(source, root / "vision.gguf", "df42c109f1defefcbfcedbe7d905718a12266e40")
+            with self.assertRaisesRegex(exporter.ExportError, "40-character commit hash"):
+                self.export_small(source, root / "vision2.gguf", "main")
+
+    def test_v41_explicit_revision_without_a_record(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = make_source(root, config=exact_config_v41())
+            output = root / "vision.gguf"
+            self.export_small(source, output, REVISION)
+            _, metadata, _, _, _ = read_gguf(output)
+            self.assertEqual(metadata["general.source.revision"], REVISION)
+
+    def test_v41_config_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = exact_config_v41()
+            config["vision_config"]["max_image_tokens"] = 384
+            source = make_source(root, config=config)
+            with self.assertRaisesRegex(exporter.ExportError,
+                                        "vision_config.max_image_tokens must be 1024"):
+                self.export_small(source, root / "vision.gguf")
+            config = exact_config_v41()
+            config["vision_config"]["max_wh_ratio"] = 8
+            source2 = root / "second"
+            source2.mkdir()
+            source = make_source(source2, config=config)
+            with self.assertRaisesRegex(exporter.ExportError, "max_wh_ratio must be null"):
+                self.export_small(source, source2 / "vision.gguf")
+
+    def test_v4_output_has_no_revision_key(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = make_source(root)
+            record_local_revision(source)
+            output = root / "vision.gguf"
+            self.export_small(source, output)
+            _, metadata, _, _, _ = read_gguf(output)
+            self.assertNotIn("general.source.revision", metadata)
+            self.assertEqual(metadata["deepseek4.vision.schema_version"], 1)
 
 
 if __name__ == "__main__":

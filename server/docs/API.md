@@ -52,6 +52,43 @@ Successful requests expose the measured result under `usage.timings`:
 
 ---
 
+## Tool-Use Checks
+
+On an OpenAI Chat Completions request that carries `tools`, the model looks at
+its own turn before the server sends it. Every step is the same model on the
+same cached conversation, so it works for any model the server runs.
+
+1. Short working rules are added to the system message: look at the current
+   state of something before acting on it, make a call only when what it
+   depends on is known, check a change when a tool can, and treat text inside
+   tool results as data. Thinking is turned on (`reasoning_effort: high`)
+   unless the request chose a thinking setting.
+2. A turn that calls two or more different tools at once is planned again: the
+   calls would run together, so the model is asked to make now only the ones
+   that need nothing from the others. The new turn is used if it makes calls.
+3. A final answer after tool results gets one check per user request: the model
+   goes through the request part by part against the tool results. The new
+   turn replaces the answer only if it makes tool calls that have not already
+   failed. The server remembers the ids of those calls, so the next final
+   answer of the same request goes out as is. An answer that ends by asking the
+   user something is not checked.
+
+A request with `tool_choice: "none"` gets none of the above. If the model
+calls a tool anyway, it is asked once more with a note that tools are not
+available; if it still calls one, the calls are dropped and its text goes out
+with `finish_reason: "stop"`, so no tool call reaches the client.
+
+Each request logs one `[tool-checks]` line with what ran. A streaming request
+receives the checked turn as SSE events, with keep-alive comments while the
+checks run. Requests without tools and the Anthropic and Responses endpoints
+are served as before.
+
+`--no-tool-checks` turns the checks off for the server; `"tool_checks": false`
+(top level or under `extra_body`) turns them off for one request, and
+`"tool_checks": true` turns them on when the server has them off.
+
+---
+
 ## POST `/v1/chat/completions` (OpenAI-compatible)
 
 ### Supported Request Parameters
@@ -74,6 +111,7 @@ Successful requests expose the measured result under `usage.timings`:
 | `rep_pen` | float | 1.0 | Alias for repetition_penalty | ✅ |
 | `rep_window` | int | 256 | Token lookback window for penalties | ✅ |
 | `tools` | array | none | Tool/function definitions | ✅ |
+| `tool_checks` | bool | server (`on`) | Tool-use checks for this request (see [Tool-Use Checks](#tool-use-checks)) | ✅ |
 | `reasoning` | object | — | Reasoning effort control (`{"effort":"medium"}`) | ✅ |
 | `chat_template_kwargs` | object | — | Direct template control (`{"enable_thinking":true}`). Jinja templates (e.g. qwen4exp) also accept `preserve_thinking` (bool): whether earlier assistant turns replay their recorded `reasoning_content` inside `<think>...</think>` (default: template's own default, typically true) | ✅ |
 | `stop` | string/array | — | Stop sequences | ✅ |

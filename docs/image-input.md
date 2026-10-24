@@ -8,6 +8,7 @@ model is started with its vision projector, `--mmproj <file>`. Without
 | --- | --- | --- | --- |
 | Qwen3.8-27B | [`Qwen3.8-27B-IQ4_XS-pure.gguf`](https://huggingface.co/Lucebox/Qwen3.8-27B-IQ4_XS-fast-GGUF) (any Qwen3.5 / Qwen3.8 dense GGUF works) | [`Qwen3.8-27B-mmproj-Q8_0.gguf`](https://huggingface.co/Lucebox/Qwen3.8-27B-IQ4_XS-fast-GGUF), or any published `qwen3vl_merger` mmproj | one GPU, any backend |
 | DeepSeek V4 Flash Vision (DS4V) | [`DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3) | [`DeepSeek-V4-Flash-Vision-Exp-mmproj-BF16.gguf`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3) | HIP: a Strix Halo alone, or R9700 + Strix Halo |
+| DeepSeek V4.1 Flash | [`DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf`](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF) (any V4.1 GGUF of the same checkpoint) | [`DeepSeek-V4.1-Flash-1017-mmproj-BF16.gguf`](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF), the checkpoint's own encoder | HIP: R9700 + Ryzen AI Max, the V4.1 profiles |
 
 **Status: experimental.** Both models answer image questions correctly end to
 end; see each model's verification notes for what has and has not been
@@ -83,6 +84,23 @@ Time to the first token, with the published launch above and ChartQA charts.
 Answers are identical in both layouts. `--mmproj-device` applies to this one-GPU
 layout; with the experts split across both GPUs the encoder already runs on the
 R9700.
+
+### DeepSeek V4.1 Flash
+
+Add `--mmproj` with the encoder of the target's own checkpoint to the V4.1
+launch ([DS41.md](../server/docs/DS41.md#image-input)):
+
+```bash
+hf download Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF \
+  DeepSeek-V4.1-Flash-1017-mmproj-BF16.gguf --local-dir models
+./server/build-hip/luce_server models/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf \
+  --profile ds41-gorgon \
+  --draft models/DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf \
+  --mmproj models/DeepSeek-V4.1-Flash-1017-mmproj-BF16.gguf
+```
+
+The server refuses a V4 Vision projector on V4.1 (and the reverse), and an
+encoder exported from another V4.1 checkpoint than the target's.
 
 ### Send an image
 

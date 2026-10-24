@@ -26,6 +26,10 @@ struct ImageRequestPolicy {
     // Text that stands for one image in the rendered prompt; the backend's
     // chat template maps it to the model's image marker. Users may not send it.
     std::string placeholder;
+    // Joins the text parts of a message that holds an image, placeholders
+    // included, when the model's own encoder does so (DeepSeek: a blank line).
+    // Empty: the parts are concatenated as for any message.
+    std::string part_separator;
 };
 
 bool parse_image_data_url(std::string_view url, EncodedImage & image,
@@ -35,7 +39,8 @@ bool extract_chat_images(const nlohmann::json & messages,
                          nlohmann::json & normalized,
                          std::vector<EncodedImage> & images,
                          std::string & error,
-                         const ImageInputLimits & limits = {});
+                         const ImageInputLimits & limits = {},
+                         std::string_view part_separator = {});
 bool prepare_request_images(const nlohmann::json & messages,
                             const ImageRequestPolicy & policy,
                             nlohmann::json & normalized,

@@ -29,11 +29,15 @@ struct Resources {
     ggml_backend_t backend = nullptr;
     DraftWeights weights;
     std::array<DraftKvState, N_LANES> states;
+    std::array<DraftKvState, N_LANES> narrow_states;
     DraftKvBatchGraph batch;
 
     ~Resources() {
         draft_kv_batch_free(batch);
         for (DraftKvState & state : states) {
+            draft_kv_free(state);
+        }
+        for (DraftKvState & state : narrow_states) {
             draft_kv_free(state);
         }
         free_draft_weights(weights);
@@ -388,6 +392,125 @@ bool check_packed_append_caches(
     return true;
 }
 
+// A packed step narrower than the block over the full-width lane states,
+// whose noise scratch rows past the width still hold the full-width step's
+// K/V. It must match states sized for the narrow block, and must move when
+// the full-attention mask shows those rows.
+bool check_narrow_step(
+        Resources & resources,
+        const std::vector<DraftKvState *> & lane_states,
+        const std::array<int, N_LANES> & committed) {
+    const int width = resources.weights.block_size / 2;
+    if (width < 2) {
+        std::fprintf(stderr,
+            "draft narrow qualification: block %d is too short\n",
+            resources.weights.block_size);
+        return false;
+    }
+    DraftWeights narrow_weights = resources.weights;
+    narrow_weights.block_size = width;
+    const size_t elements =
+        static_cast<size_t>(resources.weights.n_embd) *
+        static_cast<size_t>(width);
+    DraftFeatureMirror unused_ring;
+    std::array<std::vector<float>, N_LANES> reference;
+    for (int lane = 0; lane < N_LANES; ++lane) {
+        const size_t index = static_cast<size_t>(lane);
+        DraftKvState & wide = resources.states[index];
+        DraftKvState & narrow = resources.narrow_states[index];
+        if (!draft_kv_init(narrow, narrow_weights, resources.backend,
+                           CAPACITY, nullptr)) {
+            std::fprintf(stderr,
+                "draft narrow qualification: lane %d init failed\n", lane);
+            return false;
+        }
+        narrow.slot_pos = wide.slot_pos;
+        narrow.next_pos = wide.next_pos;
+        if (!draft_kv_begin_step(
+                narrow, narrow_weights, resources.backend, unused_ring,
+                committed[index]) ||
+            !draft_kv_begin_step(
+                wide, resources.weights, resources.backend, unused_ring,
+                committed[index], width)) {
+            std::fprintf(stderr,
+                "draft narrow qualification: lane %d step inputs failed\n",
+                lane);
+            return false;
+        }
+        std::vector<float> embedding(elements);
+        ggml_backend_tensor_get(wide.inp_embed, embedding.data(), 0,
+                                elements * sizeof(float));
+        ggml_backend_tensor_set(narrow.inp_embed, embedding.data(), 0,
+                                elements * sizeof(float));
+        if (ggml_backend_graph_compute(resources.backend, narrow.gf) !=
+            GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr,
+                "draft narrow qualification: lane %d compute failed\n", lane);
+            return false;
+        }
+        reference[index].resize(elements);
+        ggml_backend_tensor_get(narrow.hidden_states, reference[index].data(),
+                                0, elements * sizeof(float));
+    }
+
+    std::vector<std::vector<float>> packed;
+    if (!draft_kv_batch_compute(resources.batch, resources.weights,
+                                resources.backend, lane_states, packed,
+                                width)) {
+        std::fprintf(stderr,
+            "draft narrow qualification: packed compute failed\n");
+        return false;
+    }
+    for (int lane = 0; lane < N_LANES; ++lane) {
+        const float error = max_abs_diff(
+            reference[static_cast<size_t>(lane)],
+            packed[static_cast<size_t>(lane)]);
+        std::printf("draft narrow lane=%d width=%d max_abs=%.6g\n",
+                    lane, width, error);
+        if (error > MAX_ABS_ERROR) {
+            std::fprintf(stderr,
+                "draft narrow qualification: lane %d exceeds tolerance %.6g\n",
+                lane, MAX_ABS_ERROR);
+            return false;
+        }
+    }
+
+    if (!resources.states.front().mask_full) {
+        std::printf(
+            "draft narrow qualification passed width=%d (causal masks only)\n",
+            width);
+        return true;
+    }
+    for (int lane = 0; lane < N_LANES; ++lane) {
+        if (!draft_kv_begin_step(
+                resources.states[static_cast<size_t>(lane)],
+                resources.weights, resources.backend, unused_ring,
+                committed[static_cast<size_t>(lane)])) {
+            return false;
+        }
+    }
+    if (!draft_kv_batch_compute(resources.batch, resources.weights,
+                                resources.backend, lane_states, packed,
+                                width)) {
+        return false;
+    }
+    float shown = 0.0f;
+    for (int lane = 0; lane < N_LANES; ++lane) {
+        shown = std::max(shown, max_abs_diff(
+            reference[static_cast<size_t>(lane)],
+            packed[static_cast<size_t>(lane)]));
+    }
+    std::printf("draft narrow stale rows shown max_abs=%.6g\n", shown);
+    if (shown <= MAX_ABS_ERROR) {
+        std::fprintf(stderr,
+            "draft narrow qualification: showing the stale noise rows "
+            "stays within tolerance, so the check cannot see them\n");
+        return false;
+    }
+    std::printf("draft narrow qualification passed width=%d\n", width);
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -558,6 +681,9 @@ int main(int argc, char ** argv) {
                 lane, MAX_ABS_ERROR);
             return 1;
         }
+    }
+    if (!check_narrow_step(resources, lane_states, committed)) {
+        return 1;
     }
 
     std::printf("draft %s three-lane qualification passed\n",

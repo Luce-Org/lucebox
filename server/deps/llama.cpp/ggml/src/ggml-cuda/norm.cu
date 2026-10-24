@@ -266,6 +266,15 @@ static __global__ void rms_norm_scale_f32(
     }
 }
 
+extern "C" { GGML_BACKEND_API int ggml_cuda_test_rms_norm_scale(const float * x, float * dst, int ncols, int nrows,
+        int nchannels, int nsamples, int64_t stride_row, int64_t stride_channel, int64_t stride_sample, float eps,
+        float post_scale, float bias, void * stream) {
+    if (!x || !dst || ncols <= 0 || nrows <= 0 || nchannels <= 0 || nsamples <= 0) return 0;
+    rms_norm_scale_f32<<<dim3(nrows, nchannels, nsamples), 128, 32 * sizeof(float), (cudaStream_t) stream>>>(
+        x, dst, ncols, stride_row, stride_channel, stride_sample, eps, post_scale, bias);
+    return cudaGetLastError() == cudaSuccess;
+} }
+
 void ggml_cuda_op_rms_norm_scale(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * scale) {
     const ggml_tensor * x = norm->src[0];
     float eps, params[2];

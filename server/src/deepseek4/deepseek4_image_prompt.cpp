@@ -15,7 +15,7 @@ PreparedImagePrompt fail(ImagePromptError error,const std::string & message) {
 }
 PreparedImagePrompt prepare_image_prompt(const std::vector<std::int32_t> & tokens,
     const std::vector<ImagePatchInput> & images,const ImagePromptLimits & limits,
-    const ImageTokenizerContract & tokenizer) {
+    const ImageTokenizerContract & tokenizer,const PreprocessConfig & recipe) {
     if (tokenizer.vocabulary!=129280 || tokenizer.marker!=129264)
         return fail(ImagePromptError::InvalidContract,"unsupported image tokenizer contract");
     if (limits.context_capacity==0 || limits.context_capacity>std::numeric_limits<int>::max() ||
@@ -45,10 +45,11 @@ PreparedImagePrompt prepare_image_prompt(const std::vector<std::int32_t> & token
                 (uint64_t(plan.vit_rows)+2)/3!=plan.aligner_rows ||
                 (uint64_t(plan.vit_cols)+2)/3!=plan.aligner_cols)
                 return fail(ImagePromptError::InvalidPlan,where+"inconsistent patch/grid dimensions");
-            // Source safe_resize reserves three leading pads regardless of the
-            // eventual position. Reuse the core layout builder for that bound.
+            // V4's source safe_resize reserves three leading pads regardless of
+            // the eventual position (V4.1 has none). Reuse the core layout
+            // builder for that bound.
             ImageLayout maximum_padding;
-            if (!build_image_layout(plan.aligner_rows,plan.aligner_cols,0,maximum_padding))
+            if (!build_image_layout(plan.aligner_rows,plan.aligner_cols,0,maximum_padding,recipe))
                 return fail(ImagePromptError::InvalidPlan,where+"source image token budget exceeded");
             // The validated layout bounds the aligner grid, hence this product.
             const uint64_t expected=uint64_t(plan.vit_rows)*plan.vit_cols*588;
@@ -69,7 +70,7 @@ PreparedImagePrompt prepare_image_prompt(const std::vector<std::int32_t> & token
             if (token==tokenizer.marker) {
                 const auto & plan=images[layouts.size()].plan;
                 ImageLayout layout;
-                if (!build_image_layout(plan.aligner_rows,plan.aligner_cols,position,layout))
+                if (!build_image_layout(plan.aligner_rows,plan.aligner_cols,position,layout,recipe))
                     return fail(ImagePromptError::InvalidPlan,"image layout could not be built");
                 added=layout.types.size();
                 layouts.push_back(std::move(layout));

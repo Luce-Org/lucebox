@@ -437,6 +437,34 @@ struct LaunchPolicyFixture : CommonFixture {
         CHECK(max_ctx != args.end() && max_ctx + 1 != args.end() && *(max_ctx + 1) == "auto");
         CHECK(!contains_flag(launch_profile_args(*profile, {"--max-ctx", "65536"}), "--max-ctx"));
     }
+
+    void test_pflash_curve_arg_accepts_quoted_and_split_points() {
+        // One quoted argument and separate arguments give the same curve.
+        std::vector<std::pair<int, float>> quoted;
+        std::string error;
+        CHECK(parse_pflash_curve_arg("16384:0.315 32768:0.270 65536:0.270 120000:0.225", quoted, error));
+        CHECK(quoted == pflash_release_curve());
+
+        std::vector<std::pair<int, float>> split;
+        for (const char * arg : {"16384:0.315", "32768:0.270", "65536:0.270", "120000:0.225"}) {
+            CHECK(parse_pflash_curve_arg(arg, split, error));
+        }
+        CHECK(split == quoted);
+
+        std::vector<std::pair<int, float>> commas;
+        CHECK(parse_pflash_curve_arg("16384:0.315,32768:0.270", commas, error));
+        CHECK(commas.size() == 2 && commas[1].first == 32768);
+    }
+
+    void test_pflash_curve_arg_rejects_bad_points() {
+        for (const char * bad : {"16384", "16384:", ":0.3", "0:0.3", "-5:0.3", "16384:0", "16384:1.5",
+                                 "16384:0.3x", "16k:0.3", "16384:0.3:1", "99999999999:0.3"}) {
+            std::vector<std::pair<int, float>> curve;
+            std::string error;
+            CHECK(!parse_pflash_curve_arg(bad, curve, error));
+            CHECK(!error.empty());
+        }
+    }
 };
 
 }  // namespace
@@ -462,4 +490,6 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_ds41_profile_is_the_lucebox_recipe();
     test_ds41_gorgon_profile_is_the_measured_recipe();
     test_qwen_next_split_profile_fits_its_context();
+    test_pflash_curve_arg_accepts_quoted_and_split_points();
+    test_pflash_curve_arg_rejects_bad_points();
 }

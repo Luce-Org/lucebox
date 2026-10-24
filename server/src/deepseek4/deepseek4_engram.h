@@ -80,10 +80,17 @@ public:
         if (token < 0 || (size_t) token >= token_map_.size()) return pad_id_;
         return token_map_[(size_t) token];
     }
+    // A text token, i.e. one of the vocabulary. Positions that carry anything
+    // else (the engine's image-span ids, at and above the vocabulary) are dead:
+    // no n-gram reaches across them (engram.py NgramHashState.DEAD).
+    bool is_text(int32_t token) const {
+        return token >= 0 && (size_t) token < token_map_.size();
+    }
 
     // Row ids for `count` consecutive tokens, advancing `history`.
     // `dead` (optional, one byte per token) marks positions that carry no
-    // n-gram (image spans); text-only callers pass nullptr.
+    // n-gram; ids outside the text vocabulary (the engine's image-span ids)
+    // are dead without it.
     // out: [count][n_layers][cols], every row id already offset into its
     // layer's table.
     void hash(DeepSeek4EngramHistory & history,
@@ -219,6 +226,9 @@ private:
 //   gate_c = sigmoid(sign(dot_c) * sqrt(max(|dot_c|, 1e-6)))
 //   h_c   += gate_c * value
 // The reference's rsqrt(mean(x^2) + eps) factors are exactly ggml_rms_norm.
+// `keep` (optional, F32 [1, 1, n_tokens]): 1 for a text position, 0 for an
+// image position, whose gate is shut so its copies pass through untouched
+// (model.py Engram.forward token_mask). Without it every position updates.
 ggml_tensor * deepseek4_build_engram_apply(ggml_context * ctx,
                                            ggml_tensor * h,
                                            ggml_tensor * keys,
@@ -226,7 +236,8 @@ ggml_tensor * deepseek4_build_engram_apply(ggml_context * ctx,
                                            int n_embd, int n_hc,
                                            float rms_eps,
                                            ggml_tensor ** gate_out = nullptr,
-                                           ggml_tensor * kv_pre = nullptr);   // engram_wkv @ keys, computed ahead
+                                           ggml_tensor * kv_pre = nullptr,   // engram_wkv @ keys, computed ahead
+                                           ggml_tensor * keep = nullptr);
 
 // Runs the apply on residual copies kept in host memory (the host
 // hyper-connection paths): uploads them with their keys, computes on
@@ -242,16 +253,18 @@ public:
     void release();
 
     // hc: [n_tokens][n_hc * n_embd], keys: [n_tokens][cols * key_len].
+    // `dead` (optional, one byte per token): image positions, left untouched.
     bool run(ggml_backend * backend, const DeepSeek4Layer & L, int n_embd, int n_hc, float rms_eps,
-             float * hc, const float * keys, int n_tokens);
+             float * hc, const float * keys, int n_tokens, const uint8_t * dead = nullptr);
     // The same update in place on a device residual: hc_dev is a contiguous
     // F32 [n_hc * n_embd, n_tokens] tensor on `backend`; only the keys upload.
     bool run_device(ggml_backend * backend, const DeepSeek4Layer & L, int n_embd, int n_hc, float rms_eps,
-                    ggml_tensor * hc_dev, const float * keys, int n_tokens);
+                    ggml_tensor * hc_dev, const float * keys, int n_tokens, const uint8_t * dead = nullptr);
 
 private:
     bool run_chunks(ggml_backend * backend, const DeepSeek4Layer & L, int n_embd, int n_hc, float rms_eps,
-                    float * hc_host, ggml_tensor * hc_dev, const float * keys, int n_tokens);
+                    float * hc_host, ggml_tensor * hc_dev, const float * keys, int n_tokens,
+                    const uint8_t * dead);
 
     ggml_gallocr * alloc_ = nullptr;
     ggml_backend * alloc_backend_ = nullptr;

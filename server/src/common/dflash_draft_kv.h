@@ -100,11 +100,15 @@ void draft_kv_free(DraftKvState & st);
 // feature ring if more than a_step rows are missing) and fill all step
 // inputs (append rows, positions, masks). After this the caller uploads
 // inp_embed and computes st.gf; the draft hidden is st.hidden_states.
+// width: noise positions the next step drafts, at most st.q_len
+// (0 = st.q_len). The full-attention mask hides the noise scratch rows past
+// it, which still hold the K/V of an earlier, wider step.
 bool draft_kv_begin_step(DraftKvState & st,
                          const DraftWeights & dw,
                          ggml_backend_t backend,
                          const DraftFeatureMirror & ring,
-                         int committed);
+                         int committed,
+                         int width = 0);
 
 struct DraftKvBatchGraph {
     DraftKvBatchGraph() = default;
@@ -112,7 +116,7 @@ struct DraftKvBatchGraph {
     DraftKvBatchGraph & operator=(const DraftKvBatchGraph &) = delete;
 
     int n_lanes = 0;
-    int q_len = 0;
+    int q_len = 0;  // noise positions per lane
     const void * built_for = nullptr;
     ggml_backend_t backend = nullptr;
     std::vector<DraftKvState *> lane_states;
@@ -129,11 +133,17 @@ void draft_kv_batch_free(DraftKvBatchGraph & batch);
 // All lane states must already have draft_kv_begin_step() inputs and
 // inp_embed uploaded. The packed graph computes the shared backbone and
 // returns one host-visible hidden-state block per lane.
+// width: noise positions each lane drafts, at most dw.block_size
+// (0 = dw.block_size). A narrower step reads the leading positions of the
+// lane inputs, filled by draft_kv_begin_step for the same width. A graph is
+// rebuilt when the width changes, so a caller that alternates widths keeps
+// one DraftKvBatchGraph per width.
 bool draft_kv_batch_compute(
     DraftKvBatchGraph & batch,
     const DraftWeights & dw,
     ggml_backend_t backend,
     const std::vector<DraftKvState *> & lane_states,
-    std::vector<std::vector<float>> & hidden_by_lane);
+    std::vector<std::vector<float>> & hidden_by_lane,
+    int width = 0);
 
 }  // namespace luce::common
