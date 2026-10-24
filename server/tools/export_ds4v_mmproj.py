@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Extract the DeepSeek-V4 vision projector from parent safetensors.
+"""Extract a DeepSeek vision projector from parent safetensors.
+
+Two checkpoints carry one: DeepSeek-V4-Flash-Vision-Exp (flat config.json,
+4096-wide language model, schema 1) and DeepSeek-V4.1-Flash (nested
+config.json with text_config and vision_config, 5120-wide language model,
+schema 2). The config's shape picks the variant; nothing else is guessed.
 
 The exporter is intentionally standard-library-only. It copies the BF16 tensor
 payloads byte for byte and writes a small GGUF v3 header around them; it never
@@ -9,6 +14,7 @@ loads, converts, or quantizes tensor values.
 import argparse
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -31,6 +37,11 @@ MAX_INDEX_BYTES = 64 * 1024 * 1024
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_SAFETENSORS_HEADER_BYTES = 128 * 1024 * 1024
 COPY_CHUNK_BYTES = 8 * 1024 * 1024
+
+# DeepSeek-V4-Flash-Vision-Exp and DeepSeek-V4.1-Flash.
+V4 = "v4"
+V41 = "v4.1"
+REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class ExportError(RuntimeError):
@@ -61,17 +72,24 @@ def _is_projector_tensor(name: str) -> bool:
     return name.startswith("vision.") or name.startswith("aligner.") or name.startswith("image_")
 
 
-def expected_shapes() -> Dict[str, Tuple[int, ...]]:
-    """Return the complete, source-name-preserving DS4V projector inventory."""
+def language_width(variant: str) -> int:
+    return 5120 if variant == V41 else 4096
+
+
+def expected_shapes(variant: str = V4) -> Dict[str, Tuple[int, ...]]:
+    """Return the complete, source-name-preserving projector inventory.
+
+    The two checkpoints share the vision tower; the aligner projects into the
+    language model's width, and V4.1 has no image_pad delimiter."""
+    width = language_width(variant)
     shapes = {
-        "aligner.w1.bias": (4096,),
-        "aligner.w1.weight": (4096, 9216),
-        "aligner.w2.bias": (4096,),
-        "aligner.w2.weight": (4096, 4096),
-        "image_end": (4096,),
-        "image_newline": (4096,),
-        "image_pad": (4096,),
-        "image_start": (4096,),
+        "aligner.w1.bias": (width,),
+        "aligner.w1.weight": (width, 9216),
+        "aligner.w2.bias": (width,),
+        "aligner.w2.weight": (width, width),
+        "image_end": (width,),
+        "image_newline": (width,),
+        "image_start": (width,),
         "vision.norm.weight": (1024,),
         "vision.patch_embed.proj.bias": (1024,),
         "vision.patch_embed.proj.weight": (1024, 3 * 14 * 14),
@@ -88,6 +106,8 @@ def expected_shapes() -> Dict[str, Tuple[int, ...]]:
             prefix + ".norm1.weight": (1024,),
             prefix + ".norm2.weight": (1024,),
         })
+    if variant == V4:
+        shapes["image_pad"] = (width,)
     return shapes
 
 
@@ -106,9 +126,32 @@ EXPECTED_CONFIG = {
     "vision_max_wh_ratio": 8,
 }
 
+# DeepSeek-V4.1-Flash: the Hugging Face config nests the two towers.
+EXPECTED_CONFIG_V41 = {
+    "image_token_id": 129264,
+    "text_config": {
+        "hidden_size": 5120,
+        "vocab_size": 129280,
+    },
+    "vision_config": {
+        "num_hidden_layers": 32,
+        "hidden_size": 1024,
+        "num_attention_heads": 16,
+        "intermediate_size": 2816,
+        "patch_size": 14,
+        "rope_theta": 10000.0,
+        "downsample_ratio": 3,
+        "max_image_tokens": 1024,
+        "min_pixels": 295936,
+        "max_wh_ratio": None,
+    },
+}
 
-def metadata() -> List[Tuple[str, str, object]]:
-    """Metadata contract consumed by the future DS4V vision loader."""
+
+def metadata(variant: str = V4, source_revision: str = "") -> List[Tuple[str, str, object]]:
+    """Metadata contract consumed by the engine's DeepSeek vision loader."""
+    if variant == V41:
+        return metadata_v41(source_revision)
     return [
         ("general.architecture", "string", "deepseek4_vision"),
         ("general.name", "string", "DeepSeek-V4 vision projector"),
@@ -144,6 +187,57 @@ def metadata() -> List[Tuple[str, str, object]]:
         ("deepseek4.vision.aligner.patch_layout", "string", "channel-first-unfold"),
         ("deepseek4.vision.aligner.activation", "string", "gelu-exact"),
     ]
+
+
+def metadata_v41(source_revision: str = "") -> List[Tuple[str, str, object]]:
+    """Schema 2: the same tower, a 5120-wide projection and the V4.1 image span.
+
+    An image is [start] + ([image] * columns + [newline]) * rows + [end] in
+    reading order, at most 1024 tokens, with no padding and no aspect limit.
+    The source revision lets the engine refuse an encoder exported from a
+    different checkpoint than the language model it is paired with."""
+    entries = [
+        ("general.architecture", "string", "deepseek4_vision"),
+        ("general.name", "string", "DeepSeek-V4.1 vision projector"),
+        ("general.type", "string", "mmproj"),
+        ("general.alignment", "uint32", GGUF_ALIGNMENT),
+    ]
+    if source_revision:
+        entries.append(("general.source.revision", "string", source_revision))
+    entries += [
+        ("deepseek4.vision.schema_version", "uint32", 2),
+        ("deepseek4.vision.checkpoint_variant", "string", "v4.1-flash"),
+        ("deepseek4.vision.block_count", "uint32", 32),
+        ("deepseek4.vision.embedding_length", "uint32", 1024),
+        ("deepseek4.vision.attention.head_count", "uint32", 16),
+        ("deepseek4.vision.attention.head_dimension", "uint32", 64),
+        ("deepseek4.vision.attention.rope_layout", "string", "2d-half-split-height-width"),
+        ("deepseek4.vision.feed_forward_length", "uint32", 2816),
+        ("deepseek4.vision.patch_size", "uint32", 14),
+        ("deepseek4.vision.rope.freq_base", "float32", 10000.0),
+        ("deepseek4.vision.downsample_ratio", "uint32", 3),
+        ("deepseek4.vision.aligner_input_length", "uint32", 9216),
+        ("deepseek4.vision.language_embedding_length", "uint32", 5120),
+        ("deepseek4.vision.vocabulary_size", "uint32", 129280),
+        ("deepseek4.vision.attention.layer_norm_rms_epsilon", "float32", 1e-6),
+        ("deepseek4.vision.image.token_id", "uint32", 129264),
+        ("deepseek4.vision.image.max_tokens", "uint32", 1024),
+        ("deepseek4.vision.image.min_pixels", "uint32", 295936),
+        ("deepseek4.vision.image.max_aspect_ratio", "float32", 0.0),
+        ("deepseek4.vision.image.normalization_mean", "float32_array", (0.5, 0.5, 0.5)),
+        ("deepseek4.vision.image.normalization_std", "float32_array", (0.5, 0.5, 0.5)),
+        ("deepseek4.vision.image.patch_layout", "string", "channel-major"),
+        ("deepseek4.vision.image.layout", "string", "reading-order"),
+        ("deepseek4.vision.image.layout_version", "uint32", 2),
+        ("deepseek4.vision.image.layout_recipe", "string", "row-newline"),
+        ("deepseek4.vision.image.compression_alignment", "uint32", 1),
+        ("deepseek4.vision.image.sentinel_types", "string", "start,image,newline,end"),
+        ("deepseek4.vision.image.sentinel_type_count", "uint32", 4),
+        ("deepseek4.vision.aligner.padding", "string", "bottom-right"),
+        ("deepseek4.vision.aligner.patch_layout", "string", "channel-first-unfold"),
+        ("deepseek4.vision.aligner.activation", "string", "gelu-exact"),
+    ]
+    return entries
 
 
 def _unique_object(pairs: Iterable[Tuple[str, object]]) -> Dict[str, object]:
@@ -186,16 +280,50 @@ def _source_child(root: Path, name: str, description: str) -> Path:
     return resolved
 
 
-def _validate_config(config: Mapping[str, object]) -> None:
-    for key, expected in EXPECTED_CONFIG.items():
+def _check_values(config: Mapping[str, object], expected_values: Mapping[str, object], where: str) -> None:
+    for key, expected in expected_values.items():
+        name = where + key
         if key not in config:
-            raise ExportError("config.json is missing required key %s" % key)
+            raise ExportError("config.json is missing required key %s" % name)
         actual = config[key]
-        if isinstance(expected, float):
+        if isinstance(expected, dict):
+            if not isinstance(actual, dict):
+                raise ExportError("config %s must be an object" % name)
+            _check_values(actual, expected, name + ".")
+        elif expected is None:
+            if actual is not None:
+                raise ExportError("config %s must be null, got %r" % (name, actual))
+        elif isinstance(expected, float):
             if not isinstance(actual, (int, float)) or isinstance(actual, bool) or float(actual) != expected:
-                raise ExportError("config %s must be %r, got %r" % (key, expected, actual))
+                raise ExportError("config %s must be %r, got %r" % (name, expected, actual))
         elif actual != expected or isinstance(actual, bool):
-            raise ExportError("config %s must be %r, got %r" % (key, expected, actual))
+            raise ExportError("config %s must be %r, got %r" % (name, expected, actual))
+
+
+def _validate_config(config: Mapping[str, object]) -> str:
+    """Checks the fixed recipe and returns the variant the config describes."""
+    if "vision_config" in config or "text_config" in config:
+        _check_values(config, EXPECTED_CONFIG_V41, "")
+        return V41
+    _check_values(config, EXPECTED_CONFIG, "")
+    return V4
+
+
+def _local_revision(root: Path) -> str:
+    """The commit a download came from, when the directory records it.
+
+    `hf download --local-dir` keeps one metadata file per downloaded file whose
+    first line is the commit hash; a cache snapshot is named after it."""
+    marker = root / ".cache" / "huggingface" / "download" / "config.json.metadata"
+    try:
+        first = marker.read_text(encoding="utf-8").splitlines()[0].strip()
+    except (OSError, UnicodeError, IndexError):
+        first = ""
+    if REVISION_RE.match(first):
+        return first
+    if root.parent.name == "snapshots" and REVISION_RE.match(root.name):
+        return root.name
+    return ""
 
 
 def _parse_safetensors_header(path: Path) -> Tuple[int, Mapping[str, object], os.stat_result]:
@@ -255,17 +383,23 @@ def _validate_tensor_entry(name: str, entry: object, data_bytes: int) -> Tuple[s
     return dtype, tuple(shape), start, end
 
 
-def discover_tensors(source_dir: Path) -> List[SourceTensor]:
+def source_variant(source_dir: Path) -> Tuple[str, str]:
+    """The checkpoint variant and its recorded revision ("" when unknown)."""
     try:
         root = source_dir.resolve(strict=True)
     except OSError as exc:
         raise ExportError("source directory does not exist: %s" % source_dir) from exc
     if not root.is_dir():
         raise ExportError("source is not a directory: %s" % root)
-
     config_path = _source_child(root, "config.json", "config")
+    variant = _validate_config(_read_json(config_path, MAX_CONFIG_BYTES, "config"))
+    return variant, _local_revision(root)
+
+
+def discover_tensors(source_dir: Path) -> List[SourceTensor]:
+    variant, _ = source_variant(source_dir)
+    root = source_dir.resolve(strict=True)
     index_path = _source_child(root, "model.safetensors.index.json", "safetensors index")
-    _validate_config(_read_json(config_path, MAX_CONFIG_BYTES, "config"))
     index = _read_json(index_path, MAX_INDEX_BYTES, "safetensors index")
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict):
@@ -273,7 +407,7 @@ def discover_tensors(source_dir: Path) -> List[SourceTensor]:
     if any(not isinstance(name, str) or not isinstance(shard, str) for name, shard in weight_map.items()):
         raise ExportError("safetensors weight_map keys and values must be strings")
 
-    expected = expected_shapes()
+    expected = expected_shapes(variant)
     selected = {name: shard for name, shard in weight_map.items() if _is_projector_tensor(name)}
     missing = sorted(set(expected) - set(selected))
     extra = sorted(set(selected) - set(expected))
@@ -366,8 +500,9 @@ def _align(value: int, alignment: int = GGUF_ALIGNMENT) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
-def _build_header(tensors: Sequence[SourceTensor]) -> Tuple[bytes, List[OutputTensor]]:
-    metadata_entries = metadata()
+def _build_header(tensors: Sequence[SourceTensor], variant: str = V4,
+                  source_revision: str = "") -> Tuple[bytes, List[OutputTensor]]:
+    metadata_entries = metadata(variant, source_revision)
     output_tensors = []
     offset = 0
     tensor_info = bytearray()
@@ -432,9 +567,16 @@ def _validate_output_path(output_path: Path) -> Path:
     return output
 
 
-def export_mmproj(source_dir: Path, output_path: Path) -> Tuple[int, int]:
+def export_mmproj(source_dir: Path, output_path: Path, source_revision: str = "") -> Tuple[int, int]:
+    variant, recorded = source_variant(source_dir)
+    if source_revision and not REVISION_RE.match(source_revision):
+        raise ExportError("source revision must be a 40-character commit hash: %r" % source_revision)
+    if source_revision and recorded and source_revision != recorded:
+        raise ExportError("source revision %s differs from the downloaded revision %s" % (
+            source_revision, recorded))
+    revision = source_revision or recorded
     tensors = discover_tensors(source_dir)
-    header, output_tensors = _build_header(tensors)
+    header, output_tensors = _build_header(tensors, variant, revision if variant == V41 else "")
     output = _validate_output_path(output_path)
 
     temp_fd = -1
@@ -485,17 +627,24 @@ def export_mmproj(source_dir: Path, output_path: Path) -> Tuple[int, int]:
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Losslessly extract the DeepSeek-V4 vision projector into standalone GGUF v3.")
+        description="Losslessly extract a DeepSeek V4 or V4.1 vision projector into standalone GGUF v3.")
     parser.add_argument("source_dir", type=Path,
                         help="parent model directory containing config.json, index, and shards")
     parser.add_argument("output", type=Path, help="new output GGUF path; existing paths are refused")
+    parser.add_argument("--source-revision", default="",
+                        help="checkpoint commit (V4.1); read from an `hf download --local-dir` "
+                             "directory when omitted")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] = ()) -> int:
     args = _parse_args(argv or sys.argv[1:])
     try:
-        tensor_count, payload_bytes = export_mmproj(args.source_dir, args.output)
+        variant, recorded = source_variant(args.source_dir)
+        if variant == V41 and not (args.source_revision or recorded):
+            print("warning: no source revision recorded; the engine cannot check that this encoder "
+                  "matches its language model (pass --source-revision)", file=sys.stderr)
+        tensor_count, payload_bytes = export_mmproj(args.source_dir, args.output, args.source_revision)
     except ExportError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1

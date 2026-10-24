@@ -247,6 +247,9 @@ struct DeepSeek4Weights {
     // Model family, general.architecture: "deepseek4" (V4 Flash) or
     // "deepseek41" (V4.1 Flash). Metadata keys are read as `arch + "."`.
     std::string arch      = "deepseek4";
+    // general.source.revision: the checkpoint commit the file was converted
+    // from, when the converter recorded it (a vision projector must match).
+    std::string source_revision;
     int n_layer           = 43;
     int n_embd            = 4096;
     int n_vocab           = 129280;
@@ -404,6 +407,15 @@ inline bool deepseek4_is_eos_tok(int tok, const DeepSeek4Weights & w) {
 // Source-layer indirection. The loader always fills the arrays; weights built
 // by hand (tests) fall back to the V4 rule: every compressing layer owns its
 // rows and the ratio-4 layers carry the indexer.
+// DeepSeek V4.1 Flash (general.architecture = deepseek41), as opposed to
+// V4 Flash and V4 Flash Vision (deepseek4). For images the families differ in
+// kind, not in tuning: V4.1's decoder attends causally over an image (its
+// router and Engram are what see image positions) and its encoder projects
+// into 5120 dimensions; V4 Vision's image blocks attend within themselves.
+inline bool deepseek4_is_v41(const DeepSeek4Weights & w) {
+    return w.arch == "deepseek41";
+}
+
 inline bool deepseek4_is_kv_source(const DeepSeek4Weights & w, int il) {
     if (il < 0 || (size_t) il >= w.compress_ratios.size()) return false;
     if (w.kv_source_flags.empty()) return w.compress_ratios[(size_t) il] > 0;
@@ -684,14 +696,16 @@ ggml_tensor * deepseek4_indexer_visibility_suffix(
 bool ds4_engram_read_keys(const DeepSeek4Weights & w, DeepSeek4EngramTokens & ctx,
                           const int32_t * token_ids, int kv_start, int n_tokens,
                           std::vector<float> & keys, DeepSeek4StepTelemetry * telemetry);
+// `token_ids` (optional): the step's ids; image positions among them (ids
+// outside the text vocabulary) keep their copies untouched.
 bool ds4_engram_apply_host(ggml_backend_t backend, const DeepSeek4Weights & w, int il,
                            const std::vector<float> & keys, float * hc_state, int n_tokens,
                            DeepSeek4EngramApplyRunner & runner,
-                           DeepSeek4StepTelemetry * telemetry);
+                           DeepSeek4StepTelemetry * telemetry, const int32_t * token_ids = nullptr);
 bool ds4_engram_apply_device(ggml_backend_t backend, const DeepSeek4Weights & w, int il,
                              const std::vector<float> & keys, ggml_tensor * hc_dev, int n_tokens,
                              DeepSeek4EngramApplyRunner & runner,
-                             DeepSeek4StepTelemetry * telemetry);
+                             DeepSeek4StepTelemetry * telemetry, const int32_t * token_ids = nullptr);
 
 // The Engram constants and table locations of a GGUF, without loading any
 // tensor (tools and tests).
@@ -770,6 +784,10 @@ void log_deepseek4_step_telemetry(
     const char * phase, int tokens, int steps, double wall_s,
     const DeepSeek4StepTelemetry & telemetry);
 void deepseek4_release_paged_gathered_runtime(DeepSeek4PagedCache & cache);
+// Drop the paged runtime's cached gathered decode graphs and their scheduler
+// buffers, which grow with each lane's history; the next step rebuilds its
+// shape. Model mirrors, KV and slot state stay.
+void deepseek4_release_paged_gathered_graphs(DeepSeek4PagedCache & cache);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
 // Release only reproducible large-batch graph arenas after prefill. KV/model
 // state and the DSpark feature tail remain live for the following decode.

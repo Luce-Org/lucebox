@@ -1,13 +1,15 @@
-// Shared guard for the CPU-backend KvFlashPager tests that page chunks out.
-// On GPU builds the pager's host backing is pinned (cudaMallocHost), which
-// fails on a runner without a driver or device; those cases skip there and
-// run on the GPU runners.
+// Shared setup for the CPU-backend KvFlashPager tests. The cache tensors live
+// in host memory, so no case here moves bytes over a GPU stream; the only GPU
+// dependency is the pager's pinned host backing (cudaMallocHost), which fails
+// on a runner with a stub driver or no device. TestPager falls back to
+// pageable host memory there, so every logic case (serde, truncate, pins,
+// scores) runs on hosted CI exactly as on a GPU runner.
 #pragma once
 #include "../../src/common/kvflash_pager.h"
 
 namespace luce::common {
 
-inline bool pager_host_backing_available() {
+inline bool pager_pinned_host_available() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
     void * p = nullptr;
     if (cudaMallocHost(&p, 256) != cudaSuccess) {
@@ -19,7 +21,8 @@ inline bool pager_host_backing_available() {
     return true;
 }
 
-}  // namespace luce::common
+struct TestPager : KvFlashPager {
+    TestPager() { set_pinned_host_backing(pager_pinned_host_available()); }
+};
 
-#define SKIP_WITHOUT_PAGER_HOST_BACKING() \
-    do { if (!luce::common::pager_host_backing_available()) SKIP("pinned host memory unavailable (no GPU runtime)"); } while (0)
+}  // namespace luce::common

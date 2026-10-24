@@ -672,6 +672,9 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         ssm_conv_specla_hld_cuda(ctx, dst);
         return;
     }
+    // The qwen4exp graph folds the GDN q/k norm into the conv (op_params[1] != 0) only when the gfx1151
+    // gdn_conv_direct fusion owns the node; reaching the generic kernel would silently skip the norm.
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 1) == 0 && "SSM_CONV: folded q/k norm requested but the gdn_conv_direct fusion did not match");
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
     // dflash27b_ggml: optional src[2] = parent_ids (i32) enables tree mode

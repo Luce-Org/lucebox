@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <string_view>
 
 namespace luce::common {
 
@@ -20,6 +21,25 @@ inline constexpr int DEEPSEEK4_MAX_PAGED_SEQUENCES = 6;
 inline constexpr int DEEPSEEK4_MAX_GATHERED_ROWS = 16;
 // Routed-expert part width for packed steps: the RDNA3 MUL_MAT_ID MMVQ ceiling.
 inline constexpr int DEEPSEEK4_MAX_MOE_ROWS_PER_PART = 8;
+
+// Expert-owner switches paged DeepSeek V4.1 serving is not qualified with:
+// with them it has faulted the GPU (server/docs/DS41.md). Under
+// --paged-attention a launch profile's default for one of them is left out;
+// one the operator sets is refused by the backend.
+inline constexpr const char * DEEPSEEK41_PAGED_UNQUALIFIED_ENV[] = {
+    "LUCE_DS4_TP_GROUPED_MMVQ", "LUCE_MOE_TP_GROUPED_MMVQ", "LUCE_MMID_GROUPED",
+    "LUCE_DS4_TP_NATIVE_ROUTE_WIDTH", "LUCE_DS4_TP_MASKED_ROUTES",
+    "LUCE_DS4_TP_BATCH_SPLIT_COPIES", "GGML_CUDA_BATCH_PEER_COPIES", "GGML_BATCH_PEER_COPIES",
+    "LUCE_DS4_TP_DEVICE_JOIN", "LUCE_MOE_TP_DEVICE_JOIN", "LUCE_DS4_TP_DEVICE_JOIN_SPLIT",
+    "LUCE_DS4_TP_FUSED_HC_JOIN", "LUCE_DS4_TP_ROUTE_PREFORK", "LUCE_MOE_TP_ROUTE_PREFORK",
+    "LUCE_DS4_TP_COARSE_OWNER", "LUCE_MOE_TP_COARSE_OWNER", "LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS",
+    "LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK",
+};
+
+inline bool deepseek41_paged_unqualified_env(std::string_view name) {
+    return std::any_of(std::begin(DEEPSEEK41_PAGED_UNQUALIFIED_ENV), std::end(DEEPSEEK41_PAGED_UNQUALIFIED_ENV),
+                       [&](const char * listed) { return name == listed; });
+}
 
 constexpr int paged_block_count(int max_ctx) {
     return (max_ctx + PAGED_BLOCK_SIZE - 1) / PAGED_BLOCK_SIZE;

@@ -38,11 +38,14 @@
 //  the decode thread via ggml_backend_tensor_get/set.  Host backing
 //  buffers are cudaMallocHost-pinned for maximum PCIe throughput.
 //  alloc_span() synchronises page_stream_ only if a page-in was issued
-//  (H2D must complete before the next attention forward); page-outs fire
-//  and are forgotten—the DMA completes during the subsequent forward
-//  pass.  On the same stream, page-out D2H always precedes the slot
-//  zero (cudaMemsetAsync), which in turn precedes any page-in H2D, so
-//  host_data is coherent by the time it is read back.
+//  (H2D must complete before the next attention forward).  Page-outs are
+//  queued, but slot_for() does not hand out the block they freed until the
+//  compute stream is ordered after them: a device-side wait if the backend
+//  registered its stream (CUDA), otherwise a host wait.  So the nested
+//  default-path allocation can sync after a page-out, and the new K/V write
+//  cannot overtake the copy or the zeroing.  On the same stream, page-out D2H
+//  always precedes the slot zero (cudaMemsetAsync), which in turn precedes any
+//  page-in H2D, so host_data is coherent by the time it is read back.
 
 #pragma once
 
@@ -66,6 +69,21 @@
 #if defined(LUCE_BACKEND_CUDA) || defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 #include "gpu_runtime_compat.h"
 #define KVFLASH_HAS_ASYNC_DMA 1
+// ponytail: the device-side fence re-records one event per fence, which CUDA
+// allows and HIP documents as undefined while an earlier record is pending. HIP
+// builds therefore stay on the host wait (one stall per reused block after a
+// page-out on AMD). Upgrade: an event per pending record, or a HIP-verified reuse.
+#if !defined(LUCE_BACKEND_HIP) && !defined(GGML_USE_HIP)
+#define KVFLASH_EVENT_FENCE 1
+#endif
+#endif
+
+// serialize()/deserialize() write and read integers and floats in host byte
+// order, so the blob is little-endian only on little-endian hosts. There is no
+// byte-swapping encoder; refuse to build where the blob would not be portable.
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+              "KvFlashPager blobs are written in host byte order and are defined as little-endian");
 #endif
 
 namespace luce::common {
@@ -146,6 +164,7 @@ public:
         free_blocks_.clear();
         for (int b = n_blocks_ - 1; b >= 0; b--) free_blocks_.push_back(b);
         chunks_.clear();
+        pinned_.clear();   // pins belong to the previous pool geometry
         stats_ = {};
         clock_ = 0;
         has_pending_page_in_ = false;
@@ -156,9 +175,22 @@ public:
                          "falls back to the (blocking) default stream\n");
             page_stream_ = nullptr;
         }
+#ifdef KVFLASH_EVENT_FENCE
+        if (cudaEventCreateWithFlags(&page_event_, cudaEventDisableTiming) != cudaSuccess) {
+            page_event_ = nullptr;   // set_compute_stream() then keeps the host wait
+            cudaGetLastError();
+        }
+#endif
 #endif
         return true;
     }
+
+    // Host backing is pinned (cudaMallocHost) on GPU builds. Pass false to use
+    // pageable memory instead: slower DMA, but works where pinned allocation is
+    // unavailable (hosted CI with a stub driver, CPU-backend tests). Set it
+    // before the first page_out/deserialize; each chunk remembers how its own
+    // buffer was allocated. No effect on builds without async DMA.
+    void set_pinned_host_backing(bool pinned) { pinned_host_ = pinned; }
 
     // Optional: custom block hand-out order (e.g. shuffled placement in
     // relocation tests). `order[i]` = i-th block to hand out.
@@ -170,19 +202,8 @@ public:
     // Cumulative stats are kept; the epoch advances so cached masks refill.
     void reset() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        if (page_stream_) {
-            cudaStreamSynchronize(page_stream_);
-        }
-        for (auto & st : chunks_) {
-            if (st.host_data) {
-                cudaError_t err = cudaFreeHost(st.host_data);
-                if (err != cudaSuccess) {
-                    std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
-                                 cudaGetErrorString(err));
-                }
-                st.host_data = nullptr;
-            }
-        }
+        sync_page_stream_();
+        for (auto & st : chunks_) free_host_buffer_(st);
 #endif
         chunks_.clear();
         free_blocks_.clear();
@@ -249,11 +270,18 @@ public:
         std::vector<int> host;
         for (int c = 0; c < (int)chunks_.size(); c++)
             if (chunks_[(size_t)c].block < 0 && chunks_[(size_t)c].on_host) host.push_back(c);
+        // Protected chunks (sink, tail window, pins) come back first, exactly
+        // as a fresh pager would hold them; only the rest is ranked.
+        auto prot = [&](int c) {
+            return c < cfg_.sink_chunks || c > cur_chunk_ - 1 - cfg_.tail_window_chunks ||
+                   is_pinned(c);
+        };
+        auto mid = std::stable_partition(host.begin(), host.end(), prot);
         if (score_hook)
-            std::stable_sort(host.begin(), host.end(),
+            std::stable_sort(mid, host.end(),
                              [&](int a, int b) { return score_hook(a) > score_hook(b); });
         else
-            std::reverse(host.begin(), host.end());          // newest first
+            std::reverse(mid, host.end());                   // newest first
         std::vector<int> take(host.begin(),
                               host.begin() + std::min(host.size(), free_blocks_.size()));
         std::sort(take.begin(), take.end());                  // recall oldest first
@@ -270,9 +298,7 @@ public:
     void zero_free_blocks() {
         for (int b : free_blocks_) zero_block(b);
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        if (page_stream_) {
-            cudaStreamSynchronize(page_stream_);
-        }
+        sync_page_stream_();
 #endif
     }
 
@@ -292,8 +318,22 @@ public:
     // no-ops.
     void pin_range(int64_t tok_lo, int64_t tok_hi) {
         if (!attached() || tok_lo < 0 || tok_hi <= tok_lo) return;
-        const int c_lo = (int)(tok_lo / cfg_.chunk_tokens);
-        const int c_hi = (int)((tok_hi - 1) / cfg_.chunk_tokens);   // inclusive
+        // Validate in 64 bits BEFORE narrowing to a chunk index: a position past
+        // 2^31 chunks would wrap negative and index pinned_ out of bounds, and a
+        // span longer than the pool could never be pinned anyway (so the scan
+        // below stays O(pool) and pinned_ stays small).
+        const int64_t lo64 = tok_lo / cfg_.chunk_tokens;
+        const int64_t hi64 = (tok_hi - 1) / cfg_.chunk_tokens;      // inclusive
+        if (hi64 >= kMaxPinChunks || hi64 - lo64 + 1 > n_blocks_) {
+            std::fprintf(stderr,
+                "[kvflash] pin_range [%lld,%lld) refused: chunks [%lld,%lld] "
+                "outside the pinnable range (< %d chunks, span <= %d)\n",
+                (long long)tok_lo, (long long)tok_hi, (long long)lo64,
+                (long long)hi64, kMaxPinChunks, n_blocks_);
+            return;
+        }
+        const int c_lo = (int)lo64;
+        const int c_hi = (int)hi64;
         int pinned = 0, fresh = 0;
         for (uint8_t f : pinned_) pinned += f;
         for (int c = c_lo; c <= c_hi; c++) fresh += !is_pinned(c);
@@ -364,6 +404,8 @@ public:
                 has_pending_page_in_ = true;
 #endif
             }
+            // The caller uses this block on the compute stream next.
+            fence_page_work_();
         }
         st.last_use = ++clock_;
         return st.block * cfg_.chunk_tokens + (int)(pos % cfg_.chunk_tokens);
@@ -375,12 +417,7 @@ public:
         ChunkState & st = chunks_[c];
         if (has_tensor_storage() && !st.on_host) {
 #ifdef KVFLASH_HAS_ASYNC_DMA
-            cudaError_t err = cudaMallocHost(&st.host_data, chunk_bytes_);
-            if (err != cudaSuccess) {
-                std::fprintf(stderr, "[kvflash] cudaMallocHost failed: %s\n",
-                             cudaGetErrorString(err));
-                return false;
-            }
+            if (!alloc_host_buffer_(st)) return false;
 #else
             st.host_data.resize(chunk_bytes_);
 #endif
@@ -403,13 +440,31 @@ public:
         return slot_for((int64_t)c * cfg_.chunk_tokens) >= 0;
     }
 
+    // Optional fast path (CUDA). The stream that consumes the pool (the
+    // backend's compute stream) is non-blocking, so it is NOT implicitly
+    // ordered with page_stream_. By default slot_for() therefore waits on the
+    // host for the queued page work before it hands out a block. With the
+    // compute stream registered here it instead makes that stream wait on the
+    // device, with no host stall for that fence (recall in alloc_span() and
+    // reselect() still waits on the host). Call after attach(), which clears
+    // it. Only register a stream that runs EVERY graph touching the pool: a
+    // pool spread over several devices (layer split) has one compute stream
+    // per device and must stay on the default. Ignored on HIP builds.
+    void set_compute_stream(void * stream) {
+#ifdef KVFLASH_EVENT_FENCE
+        compute_stream_ = (cudaStream_t)stream;
+#else
+        (void)stream;
+#endif
+    }
+
     // Block until queued page DMA on page_stream_ completes. Hot paths
     // (alloc_span/reselect) batch this internally after their recalls; callers
     // that issue page_in()/page_out() directly and then read device KV (tests,
     // tools) must call this first. No-op when async DMA is compiled out.
     void synchronize_paging() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        cudaStreamSynchronize(page_stream_);  // page_stream_==nullptr syncs the default stream
+        sync_page_stream_();
 #endif
         has_pending_page_in_ = false;
     }
@@ -567,23 +622,50 @@ public:
     // read from the pool tensors, paged-out chunks from their host backing
     // (pinned host_data on async-DMA builds), never-written chunks are zero.
     //
-    // Layout, magic "KVFLASH1" (little-endian u64):
-    //   8 x uint32 header: nc, chunk_tokens, n_head_kv, k_seg_bytes,
-    //                      v_seg_bytes, chunk_bytes, ggml_type(K), has_ledger(=1)
+    // Layout, magic "KVFLASH3" (u64); all integers and floats are written in host
+    // byte order, which the static_assert at the top of this file pins to little-endian:
+    //   9 x uint32 header: nc, chunk_tokens, n_head_kv, k_seg_bytes,
+    //                      v_seg_bytes, chunk_bytes, ggml_type(K), has_ledger(=1),
+    //                      ggml_type(V)
     //   nc x chunk_bytes   KV bytes, segment order of copy_chunk()
-    //   nc x 8 bytes       ledger: u8 was_resident, 3 pad, f32 score
-    // Not serialized: physical block numbers, LRU order, pins.
+    //   nc x 8 bytes       ledger: u8 was_resident, u8 materialized, 2 pad, f32 score
+    //                      (a hole left by a failed allocation is not materialized)
+    //   pool layout:       u32 n_blocks, u32 n_free, u64 use clock,
+    //                      nc x (i32 block or -1, u32 0, u64 LRU rank, 0 if not resident),
+    //                      n_free x i32 free blocks in free-list order (back = next)
+    // The pool layout lets deserialize() put every chunk back in its own block
+    // with its LRU stamp, so a restored pager is the pager that was saved:
+    // attention then reads the same slots in the same order as a cold prefill,
+    // and later evictions pick the same victims. Chunks past max_chunks give
+    // their blocks to the free list. Not serialized: pins.
     std::vector<uint8_t> serialize(int max_chunks = -1) const {
         synchronize_page_stream_();   // queued D2H must land in host_data first
         const int nc = (max_chunks >= 0 && max_chunks < (int)chunks_.size())
                        ? max_chunks : (int)chunks_.size();
         const size_t kv_bytes = (size_t)nc * chunk_bytes_;
-        std::vector<uint8_t> out(kBlobHdr + kv_bytes + (size_t)nc * kLedgerEntry, 0);
+        std::vector<int32_t> free_list(free_blocks_.begin(), free_blocks_.end());
+        for (int c = (int)chunks_.size() - 1; c >= nc; --c)   // dropped tail: handed out last
+            if (chunks_[(size_t)c].block >= 0) free_list.insert(free_list.begin(), chunks_[(size_t)c].block);
+        const size_t ledger_end = kBlobHdr + kv_bytes + (size_t)nc * kLedgerEntry;
+        // LRU stamps as dense ranks among the resident chunks (0 elsewhere):
+        // eviction only compares stamps and new ones always exceed the clock,
+        // so ranks behave exactly like the raw clock values, and two pagers
+        // that would evict alike serialize alike.
+        std::vector<uint64_t> stamps;
+        for (int c = 0; c < nc; ++c)
+            if (chunks_[(size_t)c].block >= 0) stamps.push_back(chunks_[(size_t)c].last_use);
+        std::sort(stamps.begin(), stamps.end());
+        stamps.erase(std::unique(stamps.begin(), stamps.end()), stamps.end());
+        auto rank_of = [&](uint64_t u) {
+            return (uint64_t)(std::lower_bound(stamps.begin(), stamps.end(), u) - stamps.begin()) + 1;
+        };
+        std::vector<uint8_t> out(ledger_end + kPoolHdr + (size_t)nc * kPoolEntry +
+                                 free_list.size() * sizeof(int32_t), 0);
         uint8_t * p = out.data();
         std::memcpy(p, &kBlobMagic, 8); p += 8;
-        const uint32_t hdr[8] = {(uint32_t)nc, (uint32_t)cfg_.chunk_tokens,
+        const uint32_t hdr[9] = {(uint32_t)nc, (uint32_t)cfg_.chunk_tokens,
             (uint32_t)n_head_kv_, (uint32_t)k_seg_bytes_, (uint32_t)v_seg_bytes_,
-            (uint32_t)chunk_bytes_, live_k_type_(), 1u};
+            (uint32_t)chunk_bytes_, live_k_type_(), 1u, live_v_type_()};
         std::memcpy(p, hdr, sizeof(hdr));
         for (int c = 0; c < nc; ++c) {
             const ChunkState & st = chunks_[(size_t)c];
@@ -610,52 +692,103 @@ public:
             }
             uint8_t * lp = out.data() + kBlobHdr + kv_bytes + (size_t)c * kLedgerEntry;
             lp[0] = st.block >= 0 ? 1u : 0u;
+            lp[1] = (st.block >= 0 || st.on_host) ? 1u : 0u;
             std::memcpy(lp + 4, &st.score, 4);
+            uint8_t * pe = out.data() + ledger_end + kPoolHdr + (size_t)c * kPoolEntry;
+            const int32_t blk = st.block;
+            const uint64_t rank = st.block >= 0 ? rank_of(st.last_use) : 0;
+            std::memcpy(pe, &blk, 4);
+            std::memcpy(pe + 8, &rank, 8);
         }
+        uint8_t * ph = out.data() + ledger_end;
+        const uint32_t pool_hdr[2] = {(uint32_t)n_blocks_, (uint32_t)free_list.size()};
+        const uint64_t clock = stamps.size();
+        std::memcpy(ph, pool_hdr, 8);
+        std::memcpy(ph + 8, &clock, 8);
+        if (!free_list.empty())
+            std::memcpy(ph + kPoolHdr + (size_t)nc * kPoolEntry, free_list.data(),
+                        free_list.size() * sizeof(int32_t));
         return out;
     }
 
     // Replace the pager state with a serialize() blob. The blob is fully
-    // validated (magic, geometry, KV dtype, length, resident count <= pool)
-    // BEFORE any state is touched: a rejected blob returns false and leaves
-    // the pager as it was. On success: reset() semantics (pins cleared),
-    // chunks that were resident get a pool block (identity order, bytes
-    // restored), the rest stay host-backed and recallable via page_in(), and
-    // scores are restored. Pool slot numbers and LRU order are NOT preserved,
-    // only the logical residency set. Callers must rebuild slot masks (epoch
-    // advances). Returns false (pager reset/empty) only if a pinned host
-    // buffer cannot be allocated.
+    // validated (magic, geometry, K and V dtype, length, resident count <= pool,
+    // pool layout) BEFORE any state is touched: a rejected blob returns false
+    // and leaves the pager as it was. On success: reset() semantics (pins
+    // cleared), chunks that were resident get a pool block (bytes restored),
+    // the rest stay host-backed and recallable via page_in(), and scores are
+    // restored. When the pool has the saved block count, every resident chunk
+    // gets its saved block, LRU stamp, use clock and free-list order back, so
+    // the pager is exactly the one that was saved; with a different pool size
+    // only the logical residency set is kept (identity block order). Callers
+    // must rebuild slot masks (epoch advances). Returns false (pager
+    // reset/empty) only if a pinned host buffer cannot be allocated.
     bool deserialize(const uint8_t * data, size_t n) {
         if (!attached() || !data || n < kBlobHdr) return false;
         uint64_t magic = 0;
         std::memcpy(&magic, data, 8);
         if (magic != kBlobMagic) return false;
-        uint32_t h[8];
+        uint32_t h[9];
         std::memcpy(h, data + 8, sizeof(h));
         const size_t nc = h[0];
         if ((int)h[1] != cfg_.chunk_tokens || (int)h[2] != n_head_kv_ ||
             h[3] != k_seg_bytes_ || h[4] != v_seg_bytes_ || h[5] != chunk_bytes_ ||
-            h[6] != live_k_type_() || h[7] != 1u) {
+            h[6] != live_k_type_() || h[7] != 1u || h[8] != live_v_type_()) {
             return false;
         }
-        // Overflow-safe length check: nc comes from the (untrusted) blob.
-        if (nc > (n - kBlobHdr) / (chunk_bytes_ + kLedgerEntry)) return false;
+        // Overflow-safe length checks: nc and n_free come from the (untrusted) blob.
+        if (n - kBlobHdr < kPoolHdr) return false;
+        if (nc > (n - kBlobHdr - kPoolHdr) / (chunk_bytes_ + kLedgerEntry + kPoolEntry)) return false;
         const uint8_t * kv = data + kBlobHdr;
         const uint8_t * lp = kv + nc * chunk_bytes_;
+        const uint8_t * ph = lp + nc * kLedgerEntry;
+        const uint8_t * pe = ph + kPoolHdr;
+        uint32_t pool_hdr[2];
+        std::memcpy(pool_hdr, ph, 8);
+        const size_t n_free = pool_hdr[1];
+        const size_t fixed = kBlobHdr + nc * (chunk_bytes_ + kLedgerEntry + kPoolEntry) + kPoolHdr;
+        if (n_free > (n - fixed) / sizeof(int32_t)) return false;
+        const uint8_t * fl = pe + nc * kPoolEntry;
         size_t n_resident = 0;
-        for (size_t c = 0; c < nc; ++c) n_resident += lp[c * kLedgerEntry] != 0;
+        for (size_t c = 0; c < nc; ++c) {
+            const uint8_t res = lp[c * kLedgerEntry], mat = lp[c * kLedgerEntry + 1];
+            if (mat > 1 || (res != 0 && mat == 0)) return false;   // resident implies materialized
+            n_resident += res != 0;
+        }
         if (n_resident > (size_t)n_blocks_) return false;
+        // Exact layout only into a pool of the saved size; the saved blocks
+        // and free list must then be a permutation of the pool's blocks.
+        const bool exact = (int64_t)pool_hdr[0] == (int64_t)n_blocks_;
+        if (exact) {
+            if (n_resident + n_free != (size_t)n_blocks_) return false;
+            std::vector<uint8_t> used((size_t)n_blocks_, 0);
+            auto take = [&](int32_t b) {
+                if (b < 0 || b >= n_blocks_ || used[(size_t)b]) return false;
+                used[(size_t)b] = 1;
+                return true;
+            };
+            for (size_t c = 0; c < nc; ++c) {
+                int32_t b;
+                std::memcpy(&b, pe + c * kPoolEntry, 4);
+                if (lp[c * kLedgerEntry] != 0 ? !take(b) : b != -1) return false;
+            }
+            for (size_t i = 0; i < n_free; ++i) {
+                int32_t b;
+                std::memcpy(&b, fl + i * sizeof(int32_t), 4);
+                if (!take(b)) return false;
+            }
+        }
 
         reset();
         last_serialized_kv_k_type_ = h[6];
         chunks_.resize(nc);
         for (size_t c = 0; c < nc; ++c) {
             ChunkState & st = chunks_[c];
-            if (has_tensor_storage()) {
+            const bool materialized = lp[c * kLedgerEntry + 1] != 0;
+            if (has_tensor_storage() && materialized) {
                 const uint8_t * src = kv + c * chunk_bytes_;
 #ifdef KVFLASH_HAS_ASYNC_DMA
-                if (cudaMallocHost(&st.host_data, chunk_bytes_) != cudaSuccess) {
-                    st.host_data = nullptr;
+                if (!alloc_host_buffer_(st)) {
                     reset();   // frees the host buffers allocated so far
                     return false;
                 }
@@ -665,10 +798,33 @@ public:
 #endif
                 stats_.host_bytes += (int64_t)chunk_bytes_;
             }
-            st.on_host = true;
+            st.on_host = materialized;   // a hole stays a hole, not recallable zero KV
             std::memcpy(&st.score, lp + c * kLedgerEntry + 4, 4);
+            if (exact) continue;
             // slot_for()'s recall branch copies host_data into the new block.
             if (lp[c * kLedgerEntry] != 0) slot_for((int64_t)c * cfg_.chunk_tokens);
+        }
+        if (exact) {
+            free_blocks_.resize(n_free);
+            if (n_free > 0) std::memcpy(free_blocks_.data(), fl, n_free * sizeof(int32_t));
+            for (size_t c = 0; c < nc; ++c) {
+                ChunkState & st = chunks_[c];
+                int32_t b;
+                std::memcpy(&b, pe + c * kPoolEntry, 4);
+                std::memcpy(&st.last_use, pe + c * kPoolEntry + 8, 8);
+                if (b < 0) continue;
+                st.block = b;
+                if (st.on_host) {   // recall into the saved block, as slot_for() would
+                    copy_chunk((int)c, b, /*to_host=*/false);
+                    stats_.page_ins++;
+                    stats_.moved_bytes += chunk_bytes_;
+#ifdef KVFLASH_HAS_ASYNC_DMA
+                    has_pending_page_in_ = true;
+#endif
+                }
+            }
+            std::memcpy(&clock_, ph + 8, 8);
+            epoch_++;
         }
         if (nc > 0 && cur_chunk_ < (int)nc - 1) cur_chunk_ = (int)nc - 1;
         if (has_pending_page_in_) synchronize_paging();   // async recalls settle
@@ -676,12 +832,19 @@ public:
     }
 
 private:
-    static constexpr uint64_t kBlobMagic = 0x4b56464c41534831ULL;  // "KVFLASH1"
-    static constexpr size_t kBlobHdr = sizeof(uint64_t) + 8 * sizeof(uint32_t);
+    static constexpr uint64_t kBlobMagic = 0x4b56464c41534833ULL;  // "KVFLASH3"
+    static constexpr size_t kBlobHdr = sizeof(uint64_t) + 9 * sizeof(uint32_t);
     static constexpr size_t kLedgerEntry = 8;
+    static constexpr size_t kPoolHdr = 2 * sizeof(uint32_t) + sizeof(uint64_t);
+    static constexpr size_t kPoolEntry = 16;
+    static constexpr int kMaxPinChunks = 1 << 22;   // pin flags stay <= 4 MiB
 
     uint32_t live_k_type_() const {
         return !attn_k_.empty() && attn_k_[0] ? (uint32_t)attn_k_[0]->type
+                                              : (uint32_t)GGML_TYPE_F16;
+    }
+    uint32_t live_v_type_() const {
+        return !attn_v_.empty() && attn_v_[0] ? (uint32_t)attn_v_[0]->type
                                               : (uint32_t)GGML_TYPE_F16;
     }
     void synchronize_page_stream_() const {
@@ -696,7 +859,8 @@ private:
         uint64_t last_use = 0;
         float    score    = -std::numeric_limits<float>::infinity();  // QK ledger
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        void *   host_data = nullptr; // cudaMallocHost-pinned; allocated on first page_out
+        void *   host_data = nullptr; // pinned (cudaMallocHost) unless host_pinned is false
+        bool     host_pinned = true;  // how host_data was allocated, so it is freed the same way
 #else
         std::vector<uint8_t> host_data;
 #endif
@@ -725,6 +889,35 @@ private:
     }
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
+    bool alloc_host_buffer_(ChunkState & st) {
+        if (pinned_host_) {
+            const cudaError_t err = cudaMallocHost(&st.host_data, chunk_bytes_);
+            if (err != cudaSuccess) {
+                std::fprintf(stderr, "[kvflash] cudaMallocHost failed: %s\n",
+                             cudaGetErrorString(err));
+                st.host_data = nullptr;
+                return false;
+            }
+        } else if (!(st.host_data = std::malloc(chunk_bytes_))) {
+            return false;
+        }
+        st.host_pinned = pinned_host_;
+        return true;
+    }
+    void free_host_buffer_(ChunkState & st) {
+        if (!st.host_data) return;
+        if (!st.host_pinned) {
+            std::free(st.host_data);
+        } else {
+            const cudaError_t err = cudaFreeHost(st.host_data);
+            if (err != cudaSuccess) {
+                std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
+                             cudaGetErrorString(err));
+            }
+        }
+        st.host_data = nullptr;
+    }
+
     // True when the tensor lives in host memory (CPU backend / partial offload):
     // cudaMemcpyAsync/cudaMemsetAsync on such pointers are invalid.
     static bool is_host_tensor_(const ggml_tensor * t) {
@@ -774,6 +967,7 @@ private:
                 }
             }
         }
+        page_work_queued_ = true;
 #else
         uint8_t * p = (uint8_t *)st.host_data.data();
         for (size_t l = 0; l < attn_k_.size(); l++) {
@@ -816,19 +1010,64 @@ private:
                 }
             }
         }
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        page_work_queued_ = true;
+#endif
+    }
+
+#ifdef KVFLASH_HAS_ASYNC_DMA
+    // A failed stream or event call means ordering can no longer be guaranteed
+    // (sticky error), and continuing could hand out an unfenced block: abort, like
+    // CUDA_CHECK in ggml-cuda.
+    void check_(cudaError_t err, const char * call) const {
+        if (err != cudaSuccess)
+            GGML_ABORT("[kvflash] %s failed: %s (pool %d tokens, chunk %d tokens)",
+                       call, cudaGetErrorString(err), cfg_.pool_tokens, cfg_.chunk_tokens);
+    }
+
+    // Host wait for the queued page work. Host (CPU-backend) tensors are paged
+    // with memcpy, so with no page stream and no device tensor nothing was
+    // queued; with device tensors but no page stream the work ran on the
+    // default stream.
+    void sync_page_stream_() {
+        if (page_stream_ || has_device_tensor_())
+            check_(cudaStreamSynchronize(page_stream_), "cudaStreamSynchronize(page)");
+        page_work_queued_ = false;
+    }
+
+    bool has_device_tensor_() const {
+        for (const ggml_tensor * t : attn_k_) if (t && !is_host_tensor_(t)) return true;
+        for (const ggml_tensor * t : attn_v_) if (t && !is_host_tensor_(t)) return true;
+        return false;
+    }
+#endif
+
+    // Order a block about to be reused after the page work queued on
+    // page_stream_ (the page-out copy and zeroing of its old contents, or the
+    // recall copy into it); otherwise the compute stream's write of the new
+    // row can land before the copy (the archive then holds the new bytes) or
+    // before the zeroing (the new row is wiped).
+    // ponytail: without a registered compute stream this is a host wait, one
+    // stall per new chunk after a page-out; registering the stream removes it.
+    void fence_page_work_() {
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        if (!page_work_queued_) return;
+#ifdef KVFLASH_EVENT_FENCE
+        if (compute_stream_ && page_event_) {
+            check_(cudaEventRecord(page_event_, page_stream_), "cudaEventRecord(page)");
+            check_(cudaStreamWaitEvent(compute_stream_, page_event_, 0), "cudaStreamWaitEvent(compute)");
+            page_work_queued_ = false;
+            return;
+        }
+#endif
+        sync_page_stream_();
+#endif
     }
 
     // Free one chunk's host backing store.
     void release_host_(ChunkState & st) {
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        if (st.host_data) {
-            cudaError_t err = cudaFreeHost(st.host_data);
-            if (err != cudaSuccess) {
-                std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
-                             cudaGetErrorString(err));
-            }
-            st.host_data = nullptr;
-        }
+        free_host_buffer_(st);
 #else
         std::vector<uint8_t>().swap(st.host_data);
 #endif
@@ -882,18 +1121,17 @@ private:
             cudaStreamDestroy(page_stream_);
             page_stream_ = nullptr;
         }
+#ifdef KVFLASH_EVENT_FENCE
+        if (page_event_) {
+            cudaEventDestroy(page_event_);
+            page_event_ = nullptr;
+        }
+        compute_stream_ = nullptr;   // a reattach must not wait on a stream the caller has since destroyed
+#endif
+        page_work_queued_ = false;
         // Free pinned host buffers unconditionally: page_out() may have
         // allocated them even when stream creation failed (default-stream path).
-        for (auto & st : chunks_) {
-            if (st.host_data) {
-                cudaError_t err = cudaFreeHost(st.host_data);
-                if (err != cudaSuccess) {
-                    std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
-                                 cudaGetErrorString(err));
-                }
-                st.host_data = nullptr;
-            }
-        }
+        for (auto & st : chunks_) free_host_buffer_(st);
 #endif
         has_pending_page_in_ = false;
     }
@@ -917,8 +1155,14 @@ private:
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
     cudaStream_t page_stream_ = nullptr;
+    bool         page_work_queued_ = false;   // work on page_stream_ no consumer has waited for
+#ifdef KVFLASH_EVENT_FENCE
+    cudaStream_t compute_stream_ = nullptr;   // consumer of the pool; see set_compute_stream()
+    cudaEvent_t  page_event_ = nullptr;
+#endif
 #endif
     bool has_pending_page_in_ = false;
+    bool pinned_host_ = true;
 };
 
 // ── Shared backend helpers ─────────────────────────────────────────────

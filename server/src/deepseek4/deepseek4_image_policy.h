@@ -7,7 +7,7 @@
 
 namespace luce::vision {
 
-constexpr size_t MAX_IMAGE_EXPERTS = 256;
+constexpr size_t MAX_IMAGE_EXPERTS = 384;  // V4 256, V4.1 384
 struct ImageExpertSelection {
     size_t count = 0;
     std::array<int32_t, MAX_IMAGE_EXPERTS> indices{};

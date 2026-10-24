@@ -217,6 +217,9 @@ struct ModelBackend {
     // turns into the image marker, and binds decoded images to a rendered prompt.
     virtual bool supports_images() const { return false; }
     virtual std::string image_placeholder() const { return {}; }
+    // Joins the text parts of a message that holds an image when the model's
+    // encoder does (ImageRequestPolicy::part_separator); empty concatenates.
+    virtual std::string image_part_separator() const { return {}; }
     virtual ImagePrepareStatus prepare_images(std::vector<int32_t> & tokens,
                                               std::vector<EncodedImage> images,
                                               uint64_t context_capacity,

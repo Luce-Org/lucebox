@@ -9964,7 +9964,8 @@ bool deepseek4_validate_image_batch(
     if (!spans.size) return true;
     const auto fail = [&](const char * message) { error = message; return false; };
     if (count <= 0 || position < 0 || int64_t(position) + count > cache.max_ctx ||
-        !vision::valid_image_spans(spans, uint64_t(std::max(0, cache.max_ctx))))
+        !vision::valid_image_spans(spans, uint64_t(std::max(0, cache.max_ctx)),
+                                   vision::max_image_block_tokens(deepseek4_is_v41(w))))
         return fail("invalid image batch bounds");
     const uint64_t end = uint64_t(position) + uint64_t(count);
     for (size_t i = 0; i < spans.size; ++i) {
@@ -9985,13 +9986,24 @@ bool deepseek4_validate_image_batch(
         }
     }
     if (!has_images) return true;
-    // Images run through a batched sparse prefill: the single-GPU layer-major
-    // path, or the two-GPU path with both expert owners materialized on GPUs.
-    if (cache.prefill_mode != PrefillAttentionMode::Sparse || count <= 4 ||
+    // V4 images run through a batched sparse prefill: the single-GPU
+    // layer-major path, or the two-GPU path with both expert owners
+    // materialized on GPUs; their blocks attend bidirectionally, which only
+    // the sparse attention builds. V4.1's decoder is causal over images (only
+    // its router and Engram see them), so its dense prefill takes them too,
+    // on the two-owner path that carries the Engram image mask.
+    const bool causal_images = deepseek4_is_v41(w);
+    const bool mode_ok = causal_images
+        ? cache.prefill_mode != PrefillAttentionMode::Exact
+        : cache.prefill_mode == PrefillAttentionMode::Sparse;
+    if (!mode_ok || count <= 4 ||
         count > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS ||
         w.layers.size() != size_t(w.n_layer) || cache.layers.size() != size_t(w.n_layer) ||
         w.compress_ratios.size() != size_t(w.n_layer))
-        return fail("image batch requires batched sparse prefill");
+        return fail(causal_images ? "image batch requires batched (dense or sparse) prefill"
+                                  : "image batch requires batched sparse prefill");
+    if (causal_images && (!hybrid || !w.moe_hybrid))
+        return fail("DeepSeek V4.1 images run on the two-owner hybrid prefill");
     if ((hybrid || w.moe_hybrid) &&
         (!hybrid || !w.moe_hybrid || !hybrid->materialized_cold_experts ||
          hybrid->cold_backend_kind != MoeHybridColdBackend::Gpu || !hybrid->cold_backend ||
@@ -10001,18 +10013,24 @@ bool deepseek4_validate_image_batch(
         const auto & layer = w.layers[size_t(il)];
         const auto & state = cache.layers[size_t(il)];
         const auto bias = layer.ffn_gate_bias_vl;
-        const int ratio = int(w.compress_ratios[size_t(il)]);
         if (!bias || bias->type != GGML_TYPE_F32 || bias->ne[0] != w.n_expert ||
             ggml_nelements(bias) != w.n_expert || !state.raw_kv)
             return fail("image decoder is missing a validated router bias or attention state");
-        if (ratio && (!layer.attn_compressor_ape || !layer.attn_compressor_kv ||
-            !layer.attn_compressor_gate || !layer.attn_compressor_norm || !state.comp_kv ||
-            !state.attn_compressor.state_kv || !state.attn_compressor.state_score))
+        // The layer's own cache, as the cache builder laid it out: V4's
+        // compressing layers each own rows and state; V4.1's sources own
+        // the rows the other layers read, and its ratio-1 rows need no state.
+        // V4.1's compressor weights were checked by its loader.
+        const DeepSeek4LayerGeometry g = deepseek4_layer_geometry(w, il);
+        const bool v4_weights = !deepseek4_is_v41(w);
+        if (g.has_comp && (!state.comp_kv ||
+            (g.has_comp_state() && (!state.attn_compressor.state_kv || !state.attn_compressor.state_score)) ||
+            (v4_weights && (!layer.attn_compressor_ape || !layer.attn_compressor_kv ||
+                            !layer.attn_compressor_gate || !layer.attn_compressor_norm))))
             return fail("image decoder has incomplete attention compressor state");
-        if (ratio == 4 && (!layer.indexer_compressor_ape || !layer.indexer_compressor_kv ||
-            !layer.indexer_compressor_gate || !layer.indexer_compressor_norm ||
-            !state.index_comp_kv || !state.indexer_compressor.state_kv ||
-            !state.indexer_compressor.state_score))
+        if (g.has_index && (!state.index_comp_kv ||
+            (g.has_index_state() && (!state.indexer_compressor.state_kv || !state.indexer_compressor.state_score)) ||
+            (v4_weights && (!layer.indexer_compressor_ape || !layer.indexer_compressor_kv ||
+                            !layer.indexer_compressor_gate || !layer.indexer_compressor_norm))))
             return fail("image decoder has incomplete indexer compressor state");
     }
     return true;
@@ -10025,9 +10043,66 @@ struct Ds4PagedGatheredRuntime {
     ggml_backend_t hybrid_cold_backend = nullptr;
 };
 
+// A gathered graph's scheduler buffer grows with its lanes' histories (a
+// four-lane round with one 40K-token lane measured 196 MiB, 304 MiB at 46K),
+// and a long lane moves to a new history bucket every few rounds, so its old
+// shapes do not recur. Bounded only by ds4_fused_cache_make_room's headroom,
+// they held 3.2 GiB by the end of one 40K-token reply (5.6 GiB at 46K) and
+// left the next long prompt's prefill short of memory. Keep the built graphs,
+// plus one more of the largest, within LUCE_DS4_PAGED_GRAPH_CACHE_MB (default
+// 1024) by dropping the least recently used, but always keep the two most
+// recently used. Short histories (about 20 MiB a graph) stay far below it.
+static size_t ds4_paged_graph_cache_budget() {
+    static const size_t budget = [] {
+        const char * raw = std::getenv("LUCE_DS4_PAGED_GRAPH_CACHE_MB");
+        const long mb = raw && *raw ? std::strtol(raw, nullptr, 10) : 1024L;
+        return (size_t) std::max(1L, mb) << 20;
+    }();
+    return budget;
+}
+
+static size_t ds4_fused_slot_bytes(const DeepSeek4FusedDecodeGraph & slot, ggml_backend_t backend) {
+    ggml_backend_sched_t sched = slot.built() ? slot.sched : nullptr;
+    for (int k = 0; sched && k < ggml_backend_sched_get_n_backends(sched); ++k) {
+        if (ggml_backend_sched_get_backend(sched, k) == backend) {
+            return ggml_backend_sched_get_buffer_size(sched, backend);
+        }
+    }
+    return 0;
+}
+
+static void ds4_paged_graph_cache_trim(Ds4FusedVerifyCache & vc, size_t slot_limit,
+                                       ggml_backend_t backend) {
+    const size_t budget = ds4_paged_graph_cache_budget();
+    for (;;) {
+        size_t built = 0, bytes = 0, largest = 0, lru = slot_limit;
+        for (size_t i = 0; i < slot_limit; ++i) {
+            if (!vc.slots[i].built()) continue;
+            const size_t b = ds4_fused_slot_bytes(vc.slots[i], backend);
+            ++built;
+            bytes += b;
+            largest = std::max(largest, b);
+            if (lru == slot_limit || vc.slots[i].last_use < vc.slots[lru].last_use) lru = i;
+        }
+        if (built <= 2 || bytes + largest <= budget) return;
+        vc.slots[lru].destroy(vc.backend, vc.peer_backend);
+        vc.extra[lru].reset();
+    }
+}
+
 void deepseek4_release_paged_gathered_runtime(DeepSeek4PagedCache & cache) {
     delete static_cast<Ds4PagedGatheredRuntime *>(cache.gathered_runtime);
     cache.gathered_runtime = nullptr;
+}
+
+void deepseek4_release_paged_gathered_graphs(DeepSeek4PagedCache & cache) {
+    auto * rt = static_cast<Ds4PagedGatheredRuntime *>(cache.gathered_runtime);
+    if (!rt) return;
+    Ds4FusedVerifyCache & vc = rt->model.fused_verify_graph_cache;
+    if (vc.backend) ggml_backend_synchronize(vc.backend);
+    if (vc.peer_backend && vc.peer_backend != vc.backend) ggml_backend_synchronize(vc.peer_backend);
+    // The next step rebuilds its shape (and re-binds the cache to its backends).
+    vc.destroy();
 }
 
 bool deepseek4_paged_gathered_step(
@@ -10184,6 +10259,7 @@ bool deepseek4_paged_gathered_step(
         }
     }
     if (!fg) {
+        ds4_paged_graph_cache_trim(vc, slot_limit, backend);
         ds4_fused_cache_make_room(vc, slot_limit, backend);
         size_t pick = 0;
         for (size_t i = 0; i < slot_limit; ++i) {
@@ -11429,7 +11505,8 @@ bool deepseek4_step_layer_range(
                 hc_state_backend = prefill_hc_post_graph.residual_hc;
             }
             if (!ds4_engram_apply_device(backend, w, il, engram_keys, prefill_hc_post_graph.residual_hc,
-                                         n_tokens, layer_range_cache.engram_apply, telemetry)) {
+                                         n_tokens, layer_range_cache.engram_apply, telemetry,
+                                         token_ids)) {
                 return false;
             }
             engram_done_on_device = true;
@@ -11441,7 +11518,7 @@ bool deepseek4_step_layer_range(
         if (!engram_done_on_device && !engram_keys.empty() &&
             ((hc_state_backend && !use_backend_prefill_hc) ||
              !ds4_engram_apply_host(backend, w, il, engram_keys, hc_state.data(), n_tokens,
-                                    layer_range_cache.engram_apply, telemetry))) {
+                                    layer_range_cache.engram_apply, telemetry, token_ids))) {
             if (hc_state_backend) {
                 std::fprintf(stderr, "[deepseek4] engram needs the host hyper-connection path\n");
             }
@@ -11769,6 +11846,9 @@ bool deepseek4_step_layer_range(
                 Ds4ClusterRuntime * split_rt = cache.cluster_rt;
                 const bool split_heads = split_rt && split_rt->size() > 1 &&
                     split_rt->attn_head_count > 0 && w.cluster_heads_local > 0;
+                // Only V4's image blocks change attention (bidirectional within
+                // a block); V4.1 attends causally, so its batch keeps every
+                // text fast path.
                 attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, comp_lc, il,
                                                kv_start, n_tokens, nullptr,
                                                i32_inputs, i32_array_inputs,
@@ -11776,7 +11856,8 @@ bool deepseek4_step_layer_range(
                                                &f32_array_inputs,
                                                attention_impl,
                                                /*boundary_checkpoint=*/nullptr,
-                                               image_batch ? image_spans : vision::ImageSpanView{},
+                                               image_batch && !deepseek4_is_v41(w)
+                                                   ? image_spans : vision::ImageSpanView{},
                                                &index_selection,
                                                split_heads ? split_rt->attn_head_begin : 0,
                                                split_heads ? split_rt->attn_head_count : 0);

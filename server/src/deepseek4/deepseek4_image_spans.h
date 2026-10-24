@@ -7,10 +7,17 @@
 namespace luce::vision {
 
 inline constexpr size_t DS4V_MAX_IMAGES = common::MAX_REQUEST_IMAGES;
+// Most tokens one image block may take: DeepSeek-V4-Flash-Vision-Exp 384
+// (its compression pads included), DeepSeek-V4.1-Flash 1024.
 inline constexpr uint64_t DS4V_MAX_IMAGE_BLOCK_TOKENS = 384;
+inline constexpr uint64_t DS41V_MAX_IMAGE_BLOCK_TOKENS = 1024;
+inline constexpr uint64_t max_image_block_tokens(bool v41) {
+    return v41 ? DS41V_MAX_IMAGE_BLOCK_TOKENS : DS4V_MAX_IMAGE_BLOCK_TOKENS;
+}
 
-inline bool valid_image_spans(ImageSpanView spans, uint64_t prompt_size) {
-    return valid_image_spans(spans, prompt_size, DS4V_MAX_IMAGES, DS4V_MAX_IMAGE_BLOCK_TOKENS);
+inline bool valid_image_spans(ImageSpanView spans, uint64_t prompt_size,
+                              uint64_t max_block_tokens = DS4V_MAX_IMAGE_BLOCK_TOKENS) {
+    return valid_image_spans(spans, prompt_size, DS4V_MAX_IMAGES, max_block_tokens);
 }
 
 // Rows the next staged prefill chunk takes at `position`, with `remaining`

@@ -142,15 +142,23 @@ static ggml_tensor * hc_mix_body(ggml_context * c, ggml_tensor * xn, ggml_tensor
     return mixed;
 }
 
-ggml_tensor * hc_mix(ggml_context * c, ggml_tensor * x, ggml_tensor * w_norm,
+ggml_tensor * hc_mix(ggml_context * c, ggml_cgraph * gf, ggml_tensor * x, ggml_tensor * w_norm,
                      ggml_tensor * w_down, ggml_tensor * w_up, ggml_tensor * w_inject,
                      ggml_tensor ** inject, int64_t n_embd, int64_t hc, float eps) {
     const int64_t hc_dim = hc * n_embd;
     const int64_t nt     = x->ne[2];
 
+    // gamma applied on the 3-D norm output (w_norm viewed [n_embd, hc]) so the backend fuses RMS_NORM + MUL into
+    // one kernel; the fused kernel forms (scale * x) * gamma with the same two roundings as the separate ops.
+    // The gamma view is expanded into the graph first: visited as the MUL's second operand it would land between
+    // RMS_NORM and MUL in node order and defeat the (adjacent-node) fusion. LUCE_ATTN_FUSE_LEGACY=1 keeps the
+    // old order.
+    static const bool legacy = [] { const char * e = std::getenv("LUCE_ATTN_FUSE_LEGACY"); return e && std::atoi(e); }();
+    ggml_tensor * gamma = ggml_reshape_2d(c, w_norm, n_embd, hc);
+    if (!legacy) ggml_build_forward_expand(gf, gamma);
     ggml_tensor * xn = ggml_rms_norm(c, x, eps);          // per (hc, token)
+    xn = ggml_mul(c, xn, gamma);                          // [n_embd, hc, nt] gamma
     xn = ggml_reshape_2d(c, xn, hc_dim, nt);
-    xn = ggml_mul(c, xn, w_norm);                         // [hc_dim, nt] gamma
 
     return hc_mix_body(c, xn, w_down, w_up, w_inject, inject, n_embd, hc);
 }
@@ -416,10 +424,26 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor 
                 spec_conv->nb[1], spec_conv->nb[2], t * spec_conv->nb[2])));
     }
 
+    // q/k L2 norm folded into the gfx1151 gdn_conv_direct epilogue (same arithmetic as the RMS_NORM -> SCALE kernel it
+    // replaces, bit-exact); LUCE_GDN_NORM_LEGACY=1 keeps the two separate norm passes. The gate mirrors
+    // gdn_conv_check's shape rule (T >= 256, C % 256 == 0); the generic SSM_CONV kernel aborts if the fusion still
+    // fails to match, so a silently un-normalised q/k cannot reach the recurrence.
+    static const bool conv_qknorm_env = [] {
+        const char * value = std::getenv("LUCE_GDN_NORM_LEGACY");
+        return !(value && std::strcmp(value, "0") != 0);
+    }();
+    const bool conv_qknorm = conv_qknorm_env && !step && D == 128 && T >= 256 &&
+                             conv_channels % 256 == 0 && (2 * Hk * D) % 256 == 0;
     ggml_tensor * conv_op = ggml_ssm_conv(c, conv_input, L.ssm_conv1d);
     // The gfx1151 fusion reads CONCAT's input at this later node. src[3] is
     // unused by ordinary SSM_CONV and gives the allocator the real lifetime.
     conv_op->src[3] = qkv_t;
+    if (conv_qknorm) {
+        const int32_t qk_channels = (int32_t) (2 * Hk * D);
+        const float   norm_p[3]   = { eps / (float) D, 1.0f / sqrtf((float) D), 0.0f };   // eps, scale, bias
+        memcpy((int32_t *) conv_op->op_params + 1, &qk_channels, sizeof qk_channels);
+        memcpy((float *) conv_op->op_params + 2, norm_p, sizeof norm_p);
+    }
     ggml_tensor * conv = ggml_silu(c, conv_op);
 
     const size_t esz     = ggml_element_size(conv);
@@ -437,8 +461,10 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor 
     } else {
         ggml_tensor * q_raw = ggml_view_3d(c, conv, D, Hk, T, D * esz, tstride, 0);
         ggml_tensor * k_raw = ggml_view_3d(c, conv, D, Hk, T, D * esz, tstride, D * Hk * esz);
-        q_c = ggml_scale(c, ggml_rms_norm(c, q_raw, eps / (float) D), 1.0f / sqrtf((float) D));
-        k_c = ggml_scale(c, ggml_rms_norm(c, k_raw, eps / (float) D), 1.0f / sqrtf((float) D));
+        // With conv_qknorm the conv epilogue already wrote these channels normalised, so the raw views feed the
+        // recurrence directly (contiguous rows, same strides for q and k, as ggml_gated_delta_net requires).
+        q_c = conv_qknorm ? q_raw : ggml_scale(c, ggml_rms_norm(c, q_raw, eps / (float) D), 1.0f / sqrtf((float) D));
+        k_c = conv_qknorm ? k_raw : ggml_scale(c, ggml_rms_norm(c, k_raw, eps / (float) D), 1.0f / sqrtf((float) D));
     }
     ggml_tensor * v_c = ggml_view_3d(c, conv, D, Hv, T, D * esz, tstride, 2 * D * Hk * esz);
 
@@ -916,7 +942,16 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
     // Q8_0 -> F16 GEMM. Same product as below, so bit-exact.
     if (w.gfx1151 && ggml_backend_cuda_mmb_f16_input_ok(L.wo, T)) {
         ggml_tensor * gate3 = ggml_view_3d(c, qfull, D, Hq, T, 2 * D * qe, 2 * D * Hq * qe, D * qe);
-        return mm(c, L.wo, ggml_gated_f16(c, attn, gate3));
+        // Expanded first so the VIEW node does not sit between FLASH_ATTN_EXT and GATED_RMS_NORM_F16: the qsa3
+        // prefill store folds the gate in only when the two are adjacent (LUCE_ATTN_FUSE_LEGACY=1 keeps them apart).
+        ggml_build_forward_expand(gf, gate3);
+        ggml_tensor * gated = ggml_gated_f16(c, attn, gate3);
+        // The fused store still reads the attention operands (q, packed K/V, ids) while it writes `gated`; the
+        // allocator frees them right after FLASH_ATTN_EXT and would hand their blocks to `gated`, which the
+        // backend's memory-range check refuses. Holding them as extra (unread) operands keeps them live.
+        const int held[] = { 0, 1, 2, 5, 6, 7 };   // q, K, V, ids, packed K, packed V
+        for (int s = 0; s < 6; ++s) gated->src[3 + s] = attn->src[held[s]];
+        return mm(c, L.wo, gated);
     }
     ggml_tensor * attn2 = ggml_reshape_2d(c, attn, D * Hq, T);
     attn2 = ggml_mul(c, attn2, ggml_sigmoid(c, gate));
@@ -924,6 +959,22 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
 }
 
 // ── Per-layer n-gram embedding (PLE) ────────────────────────────────────
+
+// The PLE grouped norm: RMS_NORM over [n_embd, hc, T] then MUL by the gamma weight viewed [n_embd, hc]. The gamma
+// view is expanded into the graph first so RMS_NORM and MUL are adjacent nodes and the backend fuses them (the fused
+// kernel forms (scale * x) * gamma with the same two roundings). Visited as the MUL's operand the RESHAPE landed
+// between them and the three sites per forward ran rms_norm_f32 + op_mul.
+// LUCE_PLE_FUSE_LEGACY=1 keeps that order.
+static bool ple_norm_mul_legacy() {
+    static const bool v = [] { const char * e = std::getenv("LUCE_PLE_FUSE_LEGACY"); return e && std::atoi(e); }();
+    return v;
+}
+static ggml_tensor * ple_grouped_norm(ggml_context * c, ggml_cgraph * gf, ggml_tensor * x, ggml_tensor * nw,
+                                      int64_t n_embd, int64_t hc, int64_t T, float eps) {
+    ggml_tensor * gamma = ggml_reshape_2d(c, nw, n_embd, hc);
+    if (!ple_norm_mul_legacy()) ggml_build_forward_expand(gf, gamma);
+    return ggml_mul(c, ggml_rms_norm(c, ggml_reshape_3d(c, x, n_embd, hc, T), eps), gamma);
+}
 
 // spec_state (verify forward): receives the conv history after each token.
 ggml_tensor * build_ple(ggml_context * c, ggml_cgraph * gf, ggml_tensor * hidden,
@@ -939,13 +990,7 @@ ggml_tensor * build_ple(ggml_context * c, ggml_cgraph * gf, ggml_tensor * hidden
     ggml_tensor * key   = mm(c, L.ple_key,   ple_emb);   // [hc_dim, T]
     ggml_tensor * value = mm(c, L.ple_value, ple_emb);   // [n_embd, T]
 
-    auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * nw) {
-        ggml_tensor * t = ggml_reshape_3d(c, x, n_embd, hc, T);
-        t = ggml_rms_norm(c, t, eps);
-        t = ggml_reshape_2d(c, t, hc_dim, T);
-        t = ggml_mul(c, t, nw);
-        return ggml_reshape_3d(c, t, n_embd, hc, T);
-    };
+    auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * nw) { return ple_grouped_norm(c, gf, x, nw, n_embd, hc, T, eps); };
 
     key = grouped_norm(key, L.ple_norm_key);
     ggml_tensor * query = grouped_norm(hidden, L.ple_norm_query);
@@ -998,7 +1043,8 @@ ggml_tensor * build_ple(ggml_context * c, ggml_cgraph * gf, ggml_tensor * hidden
         ggml_tensor * term = ggml_mul(c, shifted, wk);
         conv_out = conv_out ? ggml_add(c, conv_out, term) : term;
     }
-    conv_out = ggml_reshape_3d(c, ggml_cont(c, ggml_silu(c, conv_out)), n_embd, hc, T);
+    // silu's output is a fresh contiguous tensor (reshape asserts it): no CONT (it was a 169 MB copyBuffer at p4096).
+    conv_out = ggml_reshape_3d(c, ggml_silu(c, conv_out), n_embd, hc, T);
 
     ggml_tensor * ple_out = ggml_add(c, hidden, ggml_add(c, gated, conv_out));
     // Expand now so the conv matcher sees a contiguous concat -> state -> taps -> silu subgraph.
@@ -1179,11 +1225,7 @@ static ggml_tensor * build_ple_row(ggml_context * c, ggml_cgraph * gf,
         const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, ggml_tensor * state) {
     const int64_t n_embd = w.n_embd, hc = w.n_hc, hc_dim = n_embd * hc;
     const float eps = w.rms_eps;
-    auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * nw) {
-        ggml_tensor * t = ggml_rms_norm(c, ggml_reshape_3d(c, x, n_embd, hc, 1), eps);
-        return ggml_reshape_3d(c, ggml_mul(c, ggml_reshape_2d(c, t, hc_dim, 1), nw),
-                               n_embd, hc, 1);
-    };
+    auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * nw) { return ple_grouped_norm(c, gf, x, nw, n_embd, hc, 1, eps); };
     key = grouped_norm(key, L.ple_norm_key);
     ggml_tensor * query = grouped_norm(hidden, L.ple_norm_query);
     ggml_tensor * score = ggml_scale(c, ggml_sum_rows(c, ggml_mul(c, key, query)),
@@ -1220,7 +1262,7 @@ static ggml_tensor * build_ple_row(ggml_context * c, ggml_cgraph * gf,
         ggml_tensor * term = ggml_mul(c, shifted, wk);
         conv_out = conv_out ? ggml_add(c, conv_out, term) : term;
     }
-    conv_out = ggml_reshape_3d(c, ggml_cont(c, ggml_silu(c, conv_out)), n_embd, hc, 1);
+    conv_out = ggml_reshape_3d(c, ggml_silu(c, conv_out), n_embd, hc, 1);
     return ggml_add(c, hidden, ggml_add(c, gated, conv_out));
 }
 
@@ -1397,7 +1439,7 @@ struct Qwen4ExpLayerBuilder {
         const Qwen4ExpLayer & L = w.layers[il];
         ggml_tensor * cur = xn_next != nullptr
             ? hc_mix_from_xn(ctx, xn_next, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, &inject, w.n_embd, w.n_hc)
-            : hc_mix(ctx, res_hc, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, &inject,
+            : hc_mix(ctx, gf, res_hc, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, &inject,
                      w.n_embd, w.n_hc, w.rms_eps);
         xn_next = nullptr;
         return cur;
@@ -1488,7 +1530,7 @@ struct Qwen4ExpLayerBuilder {
     ggml_tensor * output_mix(ggml_tensor * res_hc, ggml_tensor * xn_next) const {
         return xn_next != nullptr
             ? hc_mix_from_xn(ctx, xn_next, w.output_hc_down, w.output_hc_up, nullptr, nullptr, w.n_embd, w.n_hc)
-            : hc_mix(ctx, res_hc, w.output_hc_norm, w.output_hc_down, w.output_hc_up, nullptr, nullptr,
+            : hc_mix(ctx, gf, res_hc, w.output_hc_norm, w.output_hc_down, w.output_hc_up, nullptr, nullptr,
                      w.n_embd, w.n_hc, w.rms_eps);
     }
 };
@@ -1889,7 +1931,7 @@ static ggml_tensor * build_mtp_prefill(ggml_context * ctx, ggml_cgraph * gf, con
             ggml_view_2d(ctx, mtp_positions, n, 4, pairs * sizeof(int32_t), i * sizeof(int32_t))), 4 * n);
         ggml_tensor * r = mtp_input(ctx, w, e, hi);
         const auto & L = w.mtp;
-        ggml_tensor * cur = hc_mix(ctx, r, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up,
+        ggml_tensor * cur = hc_mix(ctx, gf, r, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up,
             nullptr, nullptr, H, hc, w.rms_eps);
         build_full_attn(ctx, gf, cur, L, w, cache.mtp_k, cache.mtp_v, nullptr, nullptr,
             p, nullptr, nullptr, start + i + n, start + i, 4, 0, QSA_DENSE,
@@ -2555,7 +2597,7 @@ bool mtp_forward_batch(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
     // One trunk-style layer (upstream-order HC helpers; dense attention on the draft layer's own K/V).
     const Qwen4ExpLayer & L = w.mtp;
     ggml_tensor * inject = nullptr;
-    ggml_tensor * cur = hc_mix(ctx, res, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, &inject,
+    ggml_tensor * cur = hc_mix(ctx, gf, res, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, &inject,
                                H, hc, w.rms_eps);
     // Decode still attends densely over the entire prompt; prefill only fills its K/V.
     cur = build_full_attn(ctx, gf, cur, L, w, cache.mtp_k, cache.mtp_v, /*indexer_k=*/nullptr, /*indexer_raw=*/nullptr,
@@ -2569,13 +2611,13 @@ bool mtp_forward_batch(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
             inject = ggml_view_2d(ctx, inject, hc, 1, inject->nb[1], (T - 1) * inject->nb[1]);
         }
         res = hc_combine(ctx, res, cur, inject, H, hc, output_T);
-        cur = hc_mix(ctx, res, L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, &inject, H, hc, w.rms_eps);
+        cur = hc_mix(ctx, gf, res, L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, &inject, H, hc, w.rms_eps);
         res = hc_combine(ctx, res, build_moe(ctx, cur, L, w), inject, H, hc, output_T);
 
         ggml_tensor * last = ggml_view_3d(ctx, res, H, hc, 1, res->nb[1], res->nb[2], (size_t) (output_T - 1) * res->nb[2]);
         draft_hidden = out_hidden ? ggml_cont(ctx, last) : nullptr;
         if (draft_hidden) { ggml_set_output(draft_hidden); ggml_build_forward_expand(gf, draft_hidden); }
-        ggml_tensor * head = hc_mix(ctx, last, w.mtp_head_norm, w.mtp_head_down, w.mtp_head_up, nullptr, nullptr,
+        ggml_tensor * head = hc_mix(ctx, gf, last, w.mtp_head_norm, w.mtp_head_down, w.mtp_head_up, nullptr, nullptr,
                                     H, hc, w.rms_eps);
         logits = ggml_mul_mat(ctx, device_draft ? w.mtp_output : w.output, head);
         if (device_draft) {
