@@ -72,6 +72,59 @@ inline bool kvflash_fused_partials_ref(const KvFlashExactKeys & keys, const KvFl
     return true;
 }
 
+// ── MMQ numerics (what the device kernel computes) ───────────────────────────────────────────────────────────────
+// q is quantized to q8_1 per 32-block as ggml-cuda's quantize_q8_1 does: d = amax / 127 (stored fp16), q = round-half-away(x / d).
+// K is read as q8_0 blocks (fp16 scale + 32 int8). logit = scale * sum_b (dK_b * dQ_b) * isum_b, blocks in ascending order.
+inline void kvflash_quantize_q8_1(const float * x, int n, int8_t * q, uint16_t * d_half) {
+    for (int b = 0; b < n / 32; b++) {
+        float amax = 0.0f;
+        for (int j = 0; j < 32; j++) amax = std::max(amax, std::fabs(x[b * 32 + j]));
+        const float d = amax / 127.0f;
+        d_half[b] = ggml_fp32_to_fp16(d);
+        for (int j = 0; j < 32; j++) q[b * 32 + j] = amax == 0.0f ? 0 : (int8_t)std::round(x[b * 32 + j] / d);
+    }
+}
+
+// qs8/qd: per query [LH * D] int8 and [LH * D / 32] fp16 bits. keys.type must be Q8_0.
+inline bool kvflash_fused_partials_q8_ref(const KvFlashExactKeys & keys, const KvFlashQkDims & d, int nq, const int8_t * qs8,
+                                          const uint16_t * qd, KvFlashFusedPartials & out) {
+    const int C = keys.n_chunks, ct = keys.chunk_tokens, D = d.head_dim, nblk = D / 32;
+    const int group = d.n_kv_heads > 0 ? d.n_q_heads / d.n_kv_heads : 0;
+    if (nq <= 0 || C <= 0 || ct <= 0 || D % 32 || group <= 0 || !keys.seg || keys.type != GGML_TYPE_Q8_0) return false;
+    out.nq = nq; out.planes = d.n_layers * d.n_q_heads; out.chunks = C;
+    out.v.assign((size_t)nq * out.planes * C * 2, 0.0f);
+    const float scale = 1.0f / std::sqrt((float)D);
+    std::vector<float> lg((size_t)ct);
+    for (int c = 0; c < C; c++)
+        for (int l = 0; l < d.n_layers; l++)
+            for (int hk = 0; hk < d.n_kv_heads; hk++) {
+                const uint8_t * p = keys.seg(c, l, hk);
+                for (int i = 0; i < nq; i++)
+                    for (int g = 0; g < group; g++) {
+                        const int x = l * d.n_q_heads + hk * group + g;
+                        if (!p) { out.m(i, x, c) = -INFINITY; out.s(i, x, c) = 0.0f; continue; }
+                        const size_t qi = (size_t)i * out.planes + x;
+                        float mx = -INFINITY;
+                        for (int t = 0; t < ct; t++) {
+                            float acc = 0.0f;
+                            for (int b = 0; b < nblk; b++) {
+                                const uint8_t * bk = p + ((size_t)t * nblk + b) * 34;
+                                uint16_t dk; std::memcpy(&dk, bk, 2);
+                                int isum = 0;
+                                for (int j = 0; j < 32; j++) isum += (int)(int8_t)bk[2 + j] * (int)qs8[qi * D + (size_t)b * 32 + j];
+                                acc += (ggml_fp16_to_fp32(dk) * ggml_fp16_to_fp32(qd[qi * nblk + b])) * (float)isum;
+                            }
+                            lg[(size_t)t] = acc * scale;
+                            mx = std::max(mx, lg[(size_t)t]);
+                        }
+                        float sum = 0.0f;
+                        for (int t = 0; t < ct; t++) sum += std::exp(lg[(size_t)t] - mx);
+                        out.m(i, x, c) = mx; out.s(i, x, c) = sum;
+                    }
+            }
+    return true;
+}
+
 inline void kvflash_fused_reduce_ref(const KvFlashFusedPartials & p, const KvFlashQkDims &,
                                      std::vector<std::vector<float>> & outs, std::vector<KvFlashMassPlanes> & planes) {
     constexpr int K = kExactTopPlanes;

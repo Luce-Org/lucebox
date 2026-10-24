@@ -8,6 +8,11 @@
 #include "kvflash_exact_mass.h"
 #include "kvflash_fused_mass.h"
 #include "kvflash_mass_synth.h"   // the reference scorer
+#ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
+#include "kvflash_fused_mass_cuda.h"
+#include "ggml-backend.h"
+#include "ggml-cuda.h"
+#endif
 
 #include <random>
 #include <vector>
@@ -127,3 +132,110 @@ TEST_CASE(KvflashFusedMassFixture, sharp_logits_do_not_overflow) {
     for (auto & x : s.q) for (auto & v : x) v *= 12.0f;   // logits in the hundreds
     CHECK(check_worst(worst_vs_reference(s, 1e-6), 1e-4));
 }
+
+// The MMQ-numerics reference stays near the float exact scorer (q is int8-quantized, as in today's graph).
+TEST_CASE(KvflashFusedMassFixture, q8_reference_is_close_to_the_float_scorer) {
+    FSynth s;
+    s.build(GGML_TYPE_Q8_0, 2, 12, 2, 64, 20, 8, 3, 21);
+    std::vector<int8_t> q8; std::vector<uint16_t> qd;
+    const int LH = s.d.n_layers * s.d.n_q_heads, D = s.d.head_dim;
+    q8.resize(s.q.size() * LH * D); qd.resize(s.q.size() * LH * D / 32);
+    for (size_t i = 0; i < s.q.size(); i++) kvflash_quantize_q8_1(s.q[i].data(), LH * D, &q8[i * LH * D], &qd[i * LH * D / 32]);
+    KvFlashFusedPartials a, b;
+    REQUIRE(kvflash_fused_partials_ref(s.keys, s.d, s.qptrs(), a));
+    REQUIRE(kvflash_fused_partials_q8_ref(s.keys, s.d, (int)s.q.size(), q8.data(), qd.data(), b));
+    std::vector<std::vector<float>> oa, ob;
+    std::vector<KvFlashMassPlanes> pa, pb;
+    kvflash_fused_reduce_ref(a, s.d, oa, pa);
+    kvflash_fused_reduce_ref(b, s.d, ob, pb);
+    double w = 0;
+    for (size_t i = 0; i < oa.size(); i++) for (size_t c = 0; c < oa[i].size(); c++) w = std::max(w, rel(oa[i][c], ob[i][c]));
+    std::fprintf(stderr, "q8 vs float mean worst %.3g\n", w);
+    CHECK(w < 0.1);
+}
+
+#ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
+namespace {
+// Device run of the fused kernel on `s` (Q8_0): chunks alternate between the pool tensors (shuffled blocks) and the device copy.
+// Returns the worst relative difference against the CPU reference with the same numerics; -1 on a setup failure.
+double fused_gpu_worst(const FSynth & s, size_t max_partial_bytes, double floor_abs, int * tiles) {
+    ggml_backend_t be = ggml_backend_cuda_init(0);
+    if (!be) return -1;
+    const int L = s.d.n_layers, HK = s.d.n_kv_heads, D = s.d.head_dim, ct = s.ct, C = s.C, nq = (int)s.q.size();
+    const int LH = L * s.d.n_q_heads, nblk = D / 32;
+    const int NB = C / 2 + 3, cap = C + 5;
+    ggml_init_params ip{ggml_tensor_overhead() * (size_t)(2 * L + 4), nullptr, true};
+    ggml_context * ctx = ggml_init(ip);
+    std::vector<ggml_tensor *> pool, copy;
+    for (int l = 0; l < L; l++) {
+        pool.push_back(ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, D, (int64_t)NB * ct, HK));
+        copy.push_back(ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, D, (int64_t)cap * ct, HK));
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    if (!buf) return -1;
+    KvFlashFusedK k;
+    k.src.resize((size_t)C);
+    int nextblk = NB - 1;
+    for (int c = 0; c < C; c++) k.src[(size_t)c] = (c % 2 == 0 && nextblk >= 0) ? nextblk-- : -1 - c;   // pool blocks in reverse, rest in the copy
+    for (int l = 0; l < L; l++)
+        for (int h = 0; h < HK; h++)
+            for (int c = 0; c < C; c++) {
+                const uint8_t * seg = s.keys.seg(c, l, h);
+                const int sc = k.src[(size_t)c];
+                ggml_tensor * t = sc >= 0 ? pool[(size_t)l] : copy[(size_t)l];
+                const size_t at = (size_t)h * t->nb[2] + (size_t)(sc >= 0 ? sc : -1 - sc) * ct * t->nb[1];
+                ggml_backend_tensor_set(t, seg, at, s.seg_bytes);
+            }
+    for (int l = 0; l < L; l++) { k.pool.push_back((const uint8_t *)pool[(size_t)l]->data); k.copy.push_back((const uint8_t *)copy[(size_t)l]->data); }
+    k.pool_nb2 = pool[0]->nb[2]; k.copy_nb2 = copy[0]->nb[2];
+    std::vector<int8_t> q8(s.q.size() * (size_t)LH * D); std::vector<uint16_t> qd(s.q.size() * (size_t)LH * nblk);
+    for (size_t i = 0; i < s.q.size(); i++) kvflash_quantize_q8_1(s.q[i].data(), LH * D, &q8[i * LH * D], &qd[i * LH * nblk]);
+    KvFlashFusedGeom g; g.L = L; g.HK = HK; g.Hq = s.d.n_q_heads; g.D = D; g.ct = ct; g.C = C; g.nq = nq;
+    KvFlashFusedWs * ws = kvflash_fused_ws_new();
+    std::vector<float> om((size_t)nq * C), ot((size_t)nq * C), ox((size_t)nq * C);
+    KvFlashFusedTiming tm;
+    std::string err;
+    const bool ok = kvflash_fused_run(ws, g, k, q8.data(), qd.data(), max_partial_bytes, om.data(), ot.data(), ox.data(), &tm, &err);
+    kvflash_fused_ws_free(ws);
+    ggml_backend_buffer_free(buf); ggml_free(ctx); ggml_backend_free(be);
+    if (!ok) { std::fprintf(stderr, "fused run failed: %s\n", err.c_str()); return -1; }
+    if (tiles) *tiles = tm.tiles;
+    KvFlashFusedPartials parts;
+    if (!kvflash_fused_partials_q8_ref(s.keys, s.d, nq, q8.data(), qd.data(), parts)) return -1;
+    std::vector<std::vector<float>> ro; std::vector<KvFlashMassPlanes> rp;
+    kvflash_fused_reduce_ref(parts, s.d, ro, rp);
+    double w = 0;
+    for (int i = 0; i < nq; i++)
+        for (int c = 0; c < C; c++) {
+            const size_t o = (size_t)i * C + c;
+            if (ro[(size_t)i][(size_t)c] > floor_abs) w = std::max(w, rel(ro[(size_t)i][(size_t)c], om[o]));
+            if (rp[(size_t)i].top[(size_t)c] > floor_abs) w = std::max(w, rel(rp[(size_t)i].top[(size_t)c], ot[o]));
+            if (rp[(size_t)i].max[(size_t)c] > floor_abs) w = std::max(w, rel(rp[(size_t)i].max[(size_t)c], ox[o]));
+        }
+    return w;
+}
+}  // namespace
+
+TEST_CASE(KvflashFusedMassFixture, device_kernel_matches_the_cpu_reference) {
+    FSynth s;
+    s.build(GGML_TYPE_Q8_0, 3, 6, 2, 64, 41, 16, 5, 9);   // G = 3, 18 planes
+    int tiles = 0;
+    const double w = fused_gpu_worst(s, (size_t)1 << 30, 1e-8, &tiles);
+    std::fprintf(stderr, "device vs reference worst %.3g (tiles %d)\n", w, tiles);
+    CHECK(w >= 0);
+    CHECK(w <= 1e-5);
+}
+
+TEST_CASE(KvflashFusedMassFixture, device_kernel_tiles_the_queries_without_changing_scores) {
+    FSynth s;
+    s.build(GGML_TYPE_Q8_0, 2, 24, 4, 128, 67, 64, 19, 4);   // G = 6, 48 planes, ct 64, D 128
+    int t1 = 0, t2 = 0;
+    const double a = fused_gpu_worst(s, (size_t)1 << 30, 1e-8, &t1);
+    const double b = fused_gpu_worst(s, (size_t)48 * 67 * 2 * 4 * 4, 1e-8, &t2);   // 4 queries per tile
+    std::fprintf(stderr, "device vs reference worst %.3g / %.3g (tiles %d / %d)\n", a, b, t1, t2);
+    CHECK(a >= 0); CHECK(b >= 0);
+    CHECK(a <= 1e-5); CHECK(b <= 1e-5);
+    CHECK(t1 == 1);
+    CHECK(t2 > 1);
+}
+#endif

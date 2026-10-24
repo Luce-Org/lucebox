@@ -872,9 +872,13 @@ if(LUCE_GPU_BACKEND STREQUAL "hip")
     target_sources(luce_common PRIVATE src/common/specla_commit_cuda.cu)
     set_source_files_properties(src/common/specla_commit_cuda.cu
         PROPERTIES LANGUAGE HIP)
+    # Fused exact chunk-mass kernel for the KVFlash GPU scorer (Amendment 10); same shared-.cu pattern.
+    target_sources(luce_common PRIVATE src/common/kvflash_fused_mass_cuda.cu)
+    set_source_files_properties(src/common/kvflash_fused_mass_cuda.cu PROPERTIES LANGUAGE HIP)
     # PUBLIC so test consumers (test_dflash / test_draft_topk_cuda) also take the
     # GPU draft top-K path instead of the CPU fallback.
     target_compile_definitions(luce_common PUBLIC LUCE_HAVE_DRAFT_TOPK=1)
+    target_compile_definitions(luce_common PUBLIC LUCE_HAVE_KVFLASH_FUSED_MASS=1)
     if(LUCE_HIP_SM80_EQUIV)
         find_path(LUCE_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
             HINTS "${_luce_rocm_root}/include" /opt/rocm/include
@@ -907,11 +911,13 @@ elseif(LUCE_GPU_BACKEND STREQUAL "cuda")
         src/flashprefill_select.cpp
         src/flashprefill.cpp
         src/common/geometric_draft_topk_cuda.cu
-        src/common/specla_commit_cuda.cu)
+        src/common/specla_commit_cuda.cu
+        src/common/kvflash_fused_mass_cuda.cu)
     # PUBLIC so consumers (e.g. the test_dflash executable) also see the macro
     # and take the GPU draft top-K path instead of the CPU fallback. Same macro
     # name as the HIP branch above (backend-neutral).
     target_compile_definitions(luce_common PUBLIC LUCE_HAVE_DRAFT_TOPK=1)
+    target_compile_definitions(luce_common PUBLIC LUCE_HAVE_KVFLASH_FUSED_MASS=1)
     # GPU port of the sample_logits chain. Compiled in by default; the path is
     # then opted into at runtime via the LUCE_GPU_SAMPLE env var. Turn the
     # whole thing off at configure time with -DLUCE_GPU_SAMPLER=OFF.
