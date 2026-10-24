@@ -1,0 +1,103 @@
+name: Release (Windows)
+
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+    paths:
+      - 'server/**'
+      - '.github/workflows/release-windows.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - '.github/workflows/release-windows.yml'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build Windows release package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
+
+      - uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
+        with:
+          cuda: '12.8.0'
+          method: network
+          sub-packages: '["nvcc", "cudart", "thrust", "visual_studio_integration"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
+
+      - name: Configure CMake
+        run: |
+          cmake -B server/build -S server `
+            -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DDFLASH27B_ENABLE_BSA=OFF `
+            -DDFLASH27B_FA_ALL_QUANTS=ON `
+            -DDFLASH27B_TESTS=OFF `
+            -DDFLASH27B_SERVER=ON
+
+      - name: Build dflash_server
+        run: cmake --build server/build --config Release --target dflash_server -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Assemble release package
+        shell: pwsh
+        run: |
+          $pkg = "dflash-server-windows-x64"
+          New-Item -ItemType Directory -Force -Path $pkg/scripts
+          New-Item -ItemType Directory -Force -Path $pkg/share
+          New-Item -ItemType Directory -Force -Path $pkg/docs
+
+          # Binary
+          Copy-Item server/build/Release/dflash_server.exe $pkg/ -ErrorAction SilentlyContinue
+          if (-not (Test-Path "$pkg/dflash_server.exe")) {
+            Copy-Item server/build/dflash_server.exe $pkg/
+          }
+
+          # Status page
+          Copy-Item server/share/status.html $pkg/share/
+
+          # Python launcher
+          Copy-Item server/scripts/run.py $pkg/scripts/
+
+          # User manual
+          Copy-Item docs/USER_MANUAL.md $pkg/docs/
+
+          # Version info
+          $tag = "${{ github.ref_name }}"
+          Set-Content -Path "$pkg/VERSION.txt" -Value "DFlash Server $tag`nBuilt from ${{ github.sha }}"
+
+          # Zip
+          Compress-Archive -Path $pkg/* -DestinationPath "$pkg.zip"
+          echo "PACKAGE_NAME=$pkg" >> $env:GITHUB_ENV
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: ${{ env.PACKAGE_NAME }}.zip
+
+  release:
+    name: Create GitHub Release
+    needs: build-windows
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dflash-server-windows-x64
+
+      - name: Create Release
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          files: dflash-server-windows-x64.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') }}
