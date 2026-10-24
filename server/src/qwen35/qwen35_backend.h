@@ -21,6 +21,7 @@
 #include "ddtree.h"
 
 #include <limits>
+#include <map>
 #include "dflash_feature_ring.h"
 #include "common/dflash_draft_kv.h"
 #include "common/concurrency/paged_kv_pool.h"
@@ -135,11 +136,17 @@ public:
                                  const DaemonIO & io) override;
 
     bool snapshot_save(int slot) override;
+    // Pooled (KVFlash) save: pager blob of chunks [0, boundary/chunk) + recurrent state.
+    bool snapshot_save_pooled_at(int slot, int snap_boundary);
     bool snapshot_save_deferred(int slot) override;
     void snapshot_flush_deferred() override { materialize_live_snapshot(); }
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
+    // With KVFlash on: the larger of the snapshot cut a restore would take and
+    // the live session's cut. Otherwise `slot_tokens`.
+    int  restorable_prefix(const std::vector<int32_t> & prompt, int slot,
+                           int slot_tokens) const override;
     // The first prefill chunk after a restore runs up to 64 tokens
     // (kQwen35OffGridLeadTokens), so a closer restore point starts no chunk.
     int  snapshot_granularity() const override;
@@ -280,8 +287,24 @@ protected:
     void kvflash_qk_pool_to(int committed);
     // Rebuild pager mapping after (re)prefill: positions [0, committed)
     // occupy pool slots identity-mapped (prefill is contiguous).
+    // `full_prompt` (optional) supplies the real ids of the restored prefix
+    // [0, kv_offset) for the scorer history; null keeps zeros.
     void kvflash_sync_prefill(int committed, const std::vector<int32_t> & tokens,
-                              int kv_offset);
+                              int kv_offset,
+                              const std::vector<int32_t> * full_prompt = nullptr);
+    // Rebuild the pager (and QK pool) from a pooled snapshot for a consuming
+    // restore (LUCE_KVFLASH_RESTORE_CONSUME=1).
+    bool kvflash_restore_pooled(const PrefixSnapshot & snap,
+                                const std::vector<int32_t> & prompt);
+    bool kvflash_consume_restore_ = false;   // set around the suffix do_prefill
+    // S8a: restore the single live KVFlash session (pager + KV rows + token
+    // history) from the DeltaNet ladder checkpoint C <= LCP(prompt, history).
+    // Returns C and leaves the cache at cur_pos == C, or -1 for the cold path.
+    // Gated by LUCE_KVFLASH_SESSION (default on; =0 disables).
+    int  kvflash_live_restore(const std::vector<int32_t> & prompt);
+    int  kvflash_live_cut_peek(const std::vector<int32_t> & prompt) const;
+    bool kvflash_live_restore_active_ = false;   // set around the suffix do_prefill
+    int  kvflash_gen_ckpt_pos_ = -1;             // S9: G of the last generation-end rung
     // Upload the slot-validity mask (host rebuild on epoch change, device
     // upload every step — the input's buffer region is reused by compute).
     void kvflash_upload_mask();
@@ -337,6 +360,18 @@ private:
     // table before any copy.
     bool adopt_paged_snapshot(int slot, ggml_context * ctx,
                               ggml_backend_buffer_t buf, int cur_pos);
+
+    // S7 (gated by LUCE_KVFLASH_SESSION): state-only (skip_kv) DeltaNet checkpoints at
+    // ladder positions, owned by the backend. Keyed by position only; cleared
+    // at every cold prefill (kv_offset == 0), so they describe the prompt of
+    // the current/last pooled prefill. Per-session identity is S8.
+    struct StateCheckpoint { PrefixSnapshot snap; uint64_t tick = 0; };
+    std::map<int, StateCheckpoint> state_ladder_;
+    uint64_t state_ladder_tick_ = 0;
+    int      state_ladder_head_ = -1;
+    size_t   state_ladder_ckpt_bytes_ = 0;   // bytes of one checkpoint (fixed)
+    void   state_ladder_clear();
+    bool   state_ladder_capture(int pos);    // cache_.cur_pos must == pos
 
     // ── Park state ───────────────────────────────────────────────────
     bool target_parked_ = false;
@@ -414,7 +449,8 @@ private:
                    int snap_pos = -1, int snap_slot = -1,
                    int kv_offset = 0,
                    const Qwen35ImageRows * images = nullptr,
-                   const std::vector<int> & restore_points = {});
+                   const std::vector<int> & restore_points = {},
+                   const std::vector<int32_t> * full_prompt = nullptr);
 
     // Speculative decode loop: draft → verify → accept until EOS/max.
     // The generation's controller observes every emitted token, including the

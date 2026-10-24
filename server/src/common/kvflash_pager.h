@@ -580,6 +580,29 @@ public:
         return events;
     }
 
+    // Debug: resident chunk ids as "a-b,c" ranges, and a hash of the score
+    // ledger of chunks < upto (LUCE_KVFLASH_DEBUG_RESIDENT).
+    std::string debug_resident(int upto) const {
+        std::string out;
+        char buf[48];
+        for (int c = 0, n = (int)chunks_.size(); c < n;) {
+            if (chunks_[(size_t)c].block < 0) { c++; continue; }
+            int e = c;
+            while (e + 1 < n && chunks_[(size_t)e + 1].block >= 0) e++;
+            std::snprintf(buf, sizeof buf, "%s%d-%d", out.empty() ? "" : ",", c, e);
+            out += buf;
+            c = e + 1;
+        }
+        uint64_t h = 1469598103934665603ULL;
+        for (int c = 0; c < upto && c < (int)chunks_.size(); c++) {
+            uint32_t b; const float sc = chunks_[(size_t)c].score;
+            std::memcpy(&b, &sc, 4);
+            h = (h ^ b) * 1099511628211ULL;
+        }
+        std::snprintf(buf, sizeof buf, " nchunks=%d ledger_hash=%016llx", (int)chunks_.size(), (unsigned long long)h);
+        return out + buf;
+    }
+
     // Per-chunk relevance ledger (QK scorer): set before serialize() so the
     // scores round-trip. -inf = never scored.
     void set_chunk_score(int c, float s) {
@@ -599,7 +622,7 @@ public:
     // read from the pool tensors, paged-out chunks from their host backing
     // (pinned host_data on async-DMA builds), never-written chunks are zero.
     //
-    // Layout, magic "KVFLASH2" (u64); all integers and floats are written in host
+    // Layout, magic "KVFLASH3" (u64); all integers and floats are written in host
     // byte order, which the static_assert at the top of this file pins to little-endian:
     //   9 x uint32 header: nc, chunk_tokens, n_head_kv, k_seg_bytes,
     //                      v_seg_bytes, chunk_bytes, ggml_type(K), has_ledger(=1),
@@ -607,13 +630,37 @@ public:
     //   nc x chunk_bytes   KV bytes, segment order of copy_chunk()
     //   nc x 8 bytes       ledger: u8 was_resident, u8 materialized, 2 pad, f32 score
     //                      (a hole left by a failed allocation is not materialized)
-    // Not serialized: physical block numbers, LRU order, pins.
+    //   pool layout:       u32 n_blocks, u32 n_free, u64 use clock,
+    //                      nc x (i32 block or -1, u32 0, u64 LRU rank, 0 if not resident),
+    //                      n_free x i32 free blocks in free-list order (back = next)
+    // The pool layout lets deserialize() put every chunk back in its own block
+    // with its LRU stamp, so a restored pager is the pager that was saved:
+    // attention then reads the same slots in the same order as a cold prefill,
+    // and later evictions pick the same victims. Chunks past max_chunks give
+    // their blocks to the free list. Not serialized: pins.
     std::vector<uint8_t> serialize(int max_chunks = -1) const {
         synchronize_page_stream_();   // queued D2H must land in host_data first
         const int nc = (max_chunks >= 0 && max_chunks < (int)chunks_.size())
                        ? max_chunks : (int)chunks_.size();
         const size_t kv_bytes = (size_t)nc * chunk_bytes_;
-        std::vector<uint8_t> out(kBlobHdr + kv_bytes + (size_t)nc * kLedgerEntry, 0);
+        std::vector<int32_t> free_list(free_blocks_.begin(), free_blocks_.end());
+        for (int c = (int)chunks_.size() - 1; c >= nc; --c)   // dropped tail: handed out last
+            if (chunks_[(size_t)c].block >= 0) free_list.insert(free_list.begin(), chunks_[(size_t)c].block);
+        const size_t ledger_end = kBlobHdr + kv_bytes + (size_t)nc * kLedgerEntry;
+        // LRU stamps as dense ranks among the resident chunks (0 elsewhere):
+        // eviction only compares stamps and new ones always exceed the clock,
+        // so ranks behave exactly like the raw clock values, and two pagers
+        // that would evict alike serialize alike.
+        std::vector<uint64_t> stamps;
+        for (int c = 0; c < nc; ++c)
+            if (chunks_[(size_t)c].block >= 0) stamps.push_back(chunks_[(size_t)c].last_use);
+        std::sort(stamps.begin(), stamps.end());
+        stamps.erase(std::unique(stamps.begin(), stamps.end()), stamps.end());
+        auto rank_of = [&](uint64_t u) {
+            return (uint64_t)(std::lower_bound(stamps.begin(), stamps.end(), u) - stamps.begin()) + 1;
+        };
+        std::vector<uint8_t> out(ledger_end + kPoolHdr + (size_t)nc * kPoolEntry +
+                                 free_list.size() * sizeof(int32_t), 0);
         uint8_t * p = out.data();
         std::memcpy(p, &kBlobMagic, 8); p += 8;
         const uint32_t hdr[9] = {(uint32_t)nc, (uint32_t)cfg_.chunk_tokens,
@@ -647,20 +694,35 @@ public:
             lp[0] = st.block >= 0 ? 1u : 0u;
             lp[1] = (st.block >= 0 || st.on_host) ? 1u : 0u;
             std::memcpy(lp + 4, &st.score, 4);
+            uint8_t * pe = out.data() + ledger_end + kPoolHdr + (size_t)c * kPoolEntry;
+            const int32_t blk = st.block;
+            const uint64_t rank = st.block >= 0 ? rank_of(st.last_use) : 0;
+            std::memcpy(pe, &blk, 4);
+            std::memcpy(pe + 8, &rank, 8);
         }
+        uint8_t * ph = out.data() + ledger_end;
+        const uint32_t pool_hdr[2] = {(uint32_t)n_blocks_, (uint32_t)free_list.size()};
+        const uint64_t clock = stamps.size();
+        std::memcpy(ph, pool_hdr, 8);
+        std::memcpy(ph + 8, &clock, 8);
+        if (!free_list.empty())
+            std::memcpy(ph + kPoolHdr + (size_t)nc * kPoolEntry, free_list.data(),
+                        free_list.size() * sizeof(int32_t));
         return out;
     }
 
     // Replace the pager state with a serialize() blob. The blob is fully
-    // validated (magic, geometry, K and V dtype, length, resident count <= pool)
-    // BEFORE any state is touched: a rejected blob returns false and leaves
-    // the pager as it was. On success: reset() semantics (pins cleared),
-    // chunks that were resident get a pool block (identity order, bytes
-    // restored), the rest stay host-backed and recallable via page_in(), and
-    // scores are restored. Pool slot numbers and LRU order are NOT preserved,
-    // only the logical residency set. Callers must rebuild slot masks (epoch
-    // advances). Returns false (pager reset/empty) only if a pinned host
-    // buffer cannot be allocated.
+    // validated (magic, geometry, K and V dtype, length, resident count <= pool,
+    // pool layout) BEFORE any state is touched: a rejected blob returns false
+    // and leaves the pager as it was. On success: reset() semantics (pins
+    // cleared), chunks that were resident get a pool block (bytes restored),
+    // the rest stay host-backed and recallable via page_in(), and scores are
+    // restored. When the pool has the saved block count, every resident chunk
+    // gets its saved block, LRU stamp, use clock and free-list order back, so
+    // the pager is exactly the one that was saved; with a different pool size
+    // only the logical residency set is kept (identity block order). Callers
+    // must rebuild slot masks (epoch advances). Returns false (pager
+    // reset/empty) only if a pinned host buffer cannot be allocated.
     bool deserialize(const uint8_t * data, size_t n) {
         if (!attached() || !data || n < kBlobHdr) return false;
         uint64_t magic = 0;
@@ -674,10 +736,19 @@ public:
             h[6] != live_k_type_() || h[7] != 1u || h[8] != live_v_type_()) {
             return false;
         }
-        // Overflow-safe length check: nc comes from the (untrusted) blob.
-        if (nc > (n - kBlobHdr) / (chunk_bytes_ + kLedgerEntry)) return false;
+        // Overflow-safe length checks: nc and n_free come from the (untrusted) blob.
+        if (n - kBlobHdr < kPoolHdr) return false;
+        if (nc > (n - kBlobHdr - kPoolHdr) / (chunk_bytes_ + kLedgerEntry + kPoolEntry)) return false;
         const uint8_t * kv = data + kBlobHdr;
         const uint8_t * lp = kv + nc * chunk_bytes_;
+        const uint8_t * ph = lp + nc * kLedgerEntry;
+        const uint8_t * pe = ph + kPoolHdr;
+        uint32_t pool_hdr[2];
+        std::memcpy(pool_hdr, ph, 8);
+        const size_t n_free = pool_hdr[1];
+        const size_t fixed = kBlobHdr + nc * (chunk_bytes_ + kLedgerEntry + kPoolEntry) + kPoolHdr;
+        if (n_free > (n - fixed) / sizeof(int32_t)) return false;
+        const uint8_t * fl = pe + nc * kPoolEntry;
         size_t n_resident = 0;
         for (size_t c = 0; c < nc; ++c) {
             const uint8_t res = lp[c * kLedgerEntry], mat = lp[c * kLedgerEntry + 1];
@@ -685,6 +756,28 @@ public:
             n_resident += res != 0;
         }
         if (n_resident > (size_t)n_blocks_) return false;
+        // Exact layout only into a pool of the saved size; the saved blocks
+        // and free list must then be a permutation of the pool's blocks.
+        const bool exact = (int64_t)pool_hdr[0] == (int64_t)n_blocks_;
+        if (exact) {
+            if (n_resident + n_free != (size_t)n_blocks_) return false;
+            std::vector<uint8_t> used((size_t)n_blocks_, 0);
+            auto take = [&](int32_t b) {
+                if (b < 0 || b >= n_blocks_ || used[(size_t)b]) return false;
+                used[(size_t)b] = 1;
+                return true;
+            };
+            for (size_t c = 0; c < nc; ++c) {
+                int32_t b;
+                std::memcpy(&b, pe + c * kPoolEntry, 4);
+                if (lp[c * kLedgerEntry] != 0 ? !take(b) : b != -1) return false;
+            }
+            for (size_t i = 0; i < n_free; ++i) {
+                int32_t b;
+                std::memcpy(&b, fl + i * sizeof(int32_t), 4);
+                if (!take(b)) return false;
+            }
+        }
 
         reset();
         last_serialized_kv_k_type_ = h[6];
@@ -707,8 +800,31 @@ public:
             }
             st.on_host = materialized;   // a hole stays a hole, not recallable zero KV
             std::memcpy(&st.score, lp + c * kLedgerEntry + 4, 4);
+            if (exact) continue;
             // slot_for()'s recall branch copies host_data into the new block.
             if (lp[c * kLedgerEntry] != 0) slot_for((int64_t)c * cfg_.chunk_tokens);
+        }
+        if (exact) {
+            free_blocks_.resize(n_free);
+            if (n_free > 0) std::memcpy(free_blocks_.data(), fl, n_free * sizeof(int32_t));
+            for (size_t c = 0; c < nc; ++c) {
+                ChunkState & st = chunks_[c];
+                int32_t b;
+                std::memcpy(&b, pe + c * kPoolEntry, 4);
+                std::memcpy(&st.last_use, pe + c * kPoolEntry + 8, 8);
+                if (b < 0) continue;
+                st.block = b;
+                if (st.on_host) {   // recall into the saved block, as slot_for() would
+                    copy_chunk((int)c, b, /*to_host=*/false);
+                    stats_.page_ins++;
+                    stats_.moved_bytes += chunk_bytes_;
+#ifdef KVFLASH_HAS_ASYNC_DMA
+                    has_pending_page_in_ = true;
+#endif
+                }
+            }
+            std::memcpy(&clock_, ph + 8, 8);
+            epoch_++;
         }
         if (nc > 0 && cur_chunk_ < (int)nc - 1) cur_chunk_ = (int)nc - 1;
         if (has_pending_page_in_) synchronize_paging();   // async recalls settle
@@ -716,9 +832,11 @@ public:
     }
 
 private:
-    static constexpr uint64_t kBlobMagic = 0x4b56464c41534832ULL;  // "KVFLASH2"
+    static constexpr uint64_t kBlobMagic = 0x4b56464c41534833ULL;  // "KVFLASH3"
     static constexpr size_t kBlobHdr = sizeof(uint64_t) + 9 * sizeof(uint32_t);
     static constexpr size_t kLedgerEntry = 8;
+    static constexpr size_t kPoolHdr = 2 * sizeof(uint32_t) + sizeof(uint64_t);
+    static constexpr size_t kPoolEntry = 16;
     static constexpr int kMaxPinChunks = 1 << 22;   // pin flags stay <= 4 MiB
 
     uint32_t live_k_type_() const {
