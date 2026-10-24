@@ -2621,6 +2621,7 @@ if(LUCE_TESTS)
             test/unit/test_ds4_spec_sampling.cpp
             test/unit/test_ds4_env.cpp
             test/unit/test_kvflash_ubatch.cpp
+            test/unit/test_kvflash_restore_plan.cpp
             test/unit/test_dflash_window.cpp
             test/unit/test_qwen35_mask_upload.cpp
             test/unit/test_adaptive_keep_ratio.cpp
@@ -2648,6 +2649,7 @@ if(LUCE_TESTS)
             test/unit/test_kv_quant.cpp
             test/unit/test_kvflash_pager_serde.cpp
             test/unit/test_kvflash_pager_truncate.cpp
+            test/unit/test_pooled_snapshot_blob.cpp
             test/unit/test_kvflash_placement.cpp
             test/unit/test_kvflash_pool_sizing.cpp
             test/unit/test_kvflash_qk.cpp
