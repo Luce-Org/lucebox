@@ -1162,7 +1162,8 @@ if(LUCE_TESTS)
         test_blocking_row_pool
         test_rope_tail
         test_kernel_qualification_core
-        test_cuda_copy_batch)
+        test_cuda_copy_batch
+        test_sampled_verify)
 
     # Standalone check of the DS4 MIX histogram fitter: reuses the converter
     # source with its main() renamed away, so it needs the converter's
@@ -2334,6 +2335,18 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_chain_spec_shapes)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_sampled_verify.cpp")
+        # Single-chain sampled-verify: the committed tokens against exact AR
+        # sampling of a fake target. Host sampler only.
+        add_executable(test_sampled_verify
+            test/unit/test_sampled_verify.cpp
+            src/common/sampler.cpp
+            src/common/output_constraint.cpp
+            src/common/gbnf.cpp)
+        target_include_directories(test_sampled_verify PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_dflash2_selector_validation.cpp")
         # Pure host-side selector metadata/layout validation: no GPU.
         add_executable(test_dflash2_selector_validation
@@ -2900,7 +2913,8 @@ if(LUCE_TESTS)
         test_rocmfp_mix_slice_matvec
         test_rocmfp_mix_gateup_glu
         test_rocmfp_mix_glu_fusable
-        test_cuda_copy_batch)
+        test_cuda_copy_batch
+        test_sampled_verify)
     foreach(_cppunit_target IN LISTS _new_cppunit_test_targets)
         if(TARGET ${_cppunit_target})
             target_sources(${_cppunit_target} PRIVATE test/unit/test_unit_main.cpp)
