@@ -137,7 +137,7 @@ TEST_CASE(KvflashFusedMassFixture, sharp_logits_do_not_overflow) {
 TEST_CASE(KvflashFusedMassFixture, q8_reference_is_close_to_the_float_scorer) {
     FSynth s;
     s.build(GGML_TYPE_Q8_0, 2, 12, 2, 64, 20, 8, 3, 21);
-    std::vector<int8_t> q8; std::vector<uint16_t> qd;
+    std::vector<int8_t> q8; std::vector<float> qd;
     const int LH = s.d.n_layers * s.d.n_q_heads, D = s.d.head_dim;
     q8.resize(s.q.size() * LH * D); qd.resize(s.q.size() * LH * D / 32);
     for (size_t i = 0; i < s.q.size(); i++) kvflash_quantize_q8_1(s.q[i].data(), LH * D, &q8[i * LH * D], &qd[i * LH * D / 32]);
@@ -188,7 +188,7 @@ double fused_gpu_worst(const FSynth & s, size_t max_partial_bytes, double floor_
             }
     for (int l = 0; l < L; l++) { k.pool.push_back((const uint8_t *)pool[(size_t)l]->data); k.copy.push_back((const uint8_t *)copy[(size_t)l]->data); }
     k.pool_nb2 = pool[0]->nb[2]; k.copy_nb2 = copy[0]->nb[2];
-    std::vector<int8_t> q8(s.q.size() * (size_t)LH * D); std::vector<uint16_t> qd(s.q.size() * (size_t)LH * nblk);
+    std::vector<int8_t> q8(s.q.size() * (size_t)LH * D); std::vector<float> qd(s.q.size() * (size_t)LH * nblk);
     for (size_t i = 0; i < s.q.size(); i++) kvflash_quantize_q8_1(s.q[i].data(), LH * D, &q8[i * LH * D], &qd[i * LH * nblk]);
     KvFlashFusedGeom g; g.L = L; g.HK = HK; g.Hq = s.d.n_q_heads; g.D = D; g.ct = ct; g.C = C; g.nq = nq;
     KvFlashFusedWs * ws = kvflash_fused_ws_new();
@@ -269,9 +269,9 @@ TEST_CASE(KvflashFusedMassFixture, bench_device_kernel_when_asked) {
     k.pool_nb2 = pool[0]->nb[2];
     const size_t LH = (size_t)L * Hq;
     std::vector<int8_t> q8((size_t)nq * LH * D);
-    std::vector<uint16_t> qd((size_t)nq * LH * nblk);
+    std::vector<float> qd((size_t)nq * LH * nblk);
     for (auto & v : q8) v = (int8_t)((int)(rng() % 255) - 127);
-    for (auto & v : qd) v = ggml_fp32_to_fp16(0.01f);
+    for (auto & v : qd) v = 0.01f;
     KvFlashFusedGeom g; g.L = L; g.HK = HK; g.Hq = Hq; g.D = D; g.ct = ct; g.C = C; g.nq = nq;
     KvFlashFusedWs * ws = kvflash_fused_ws_new();
     std::vector<float> a((size_t)nq * C), b(a.size()), c2(a.size());

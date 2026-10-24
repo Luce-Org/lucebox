@@ -73,21 +73,22 @@ inline bool kvflash_fused_partials_ref(const KvFlashExactKeys & keys, const KvFl
 }
 
 // ── MMQ numerics (what the device kernel computes) ───────────────────────────────────────────────────────────────
-// q is quantized to q8_1 per 32-block as ggml-cuda's quantize_q8_1 does: d = amax / 127 (stored fp16), q = round-half-away(x / d).
+// q is quantized per 32-block as ggml-cuda's quantize_mmq_q8_1 does for q8_0 K (layout D4): d_inv = 127 / amax, q = roundf(x * d_inv),
+// the block scale is the float 1 / d_inv (no fp16 rounding).
 // K is read as q8_0 blocks (fp16 scale + 32 int8). logit = scale * sum_b (dK_b * dQ_b) * isum_b, blocks in ascending order.
-inline void kvflash_quantize_q8_1(const float * x, int n, int8_t * q, uint16_t * d_half) {
+inline void kvflash_quantize_q8_1(const float * x, int n, int8_t * q, float * d_out) {
     for (int b = 0; b < n / 32; b++) {
         float amax = 0.0f;
         for (int j = 0; j < 32; j++) amax = std::max(amax, std::fabs(x[b * 32 + j]));
-        const float d = amax / 127.0f;
-        d_half[b] = ggml_fp32_to_fp16(d);
-        for (int j = 0; j < 32; j++) q[b * 32 + j] = amax == 0.0f ? 0 : (int8_t)std::round(x[b * 32 + j] / d);
+        const float d_inv = 127.0f / amax;
+        d_out[b] = amax == 0.0f ? 0.0f : 1.0f / d_inv;
+        for (int j = 0; j < 32; j++) q[b * 32 + j] = amax == 0.0f ? 0 : (int8_t)std::round(x[b * 32 + j] * d_inv);
     }
 }
 
-// qs8/qd: per query [LH * D] int8 and [LH * D / 32] fp16 bits. keys.type must be Q8_0.
+// qs8/qd: per query [LH * D] int8 and [LH * D / 32] float scales. keys.type must be Q8_0.
 inline bool kvflash_fused_partials_q8_ref(const KvFlashExactKeys & keys, const KvFlashQkDims & d, int nq, const int8_t * qs8,
-                                          const uint16_t * qd, KvFlashFusedPartials & out) {
+                                          const float * qd, KvFlashFusedPartials & out) {
     const int C = keys.n_chunks, ct = keys.chunk_tokens, D = d.head_dim, nblk = D / 32;
     const int group = d.n_kv_heads > 0 ? d.n_q_heads / d.n_kv_heads : 0;
     if (nq <= 0 || C <= 0 || ct <= 0 || D % 32 || group <= 0 || !keys.seg || keys.type != GGML_TYPE_Q8_0) return false;
@@ -112,7 +113,7 @@ inline bool kvflash_fused_partials_q8_ref(const KvFlashExactKeys & keys, const K
                                 uint16_t dk; std::memcpy(&dk, bk, 2);
                                 int isum = 0;
                                 for (int j = 0; j < 32; j++) isum += (int)(int8_t)bk[2 + j] * (int)qs8[qi * D + (size_t)b * 32 + j];
-                                acc += (ggml_fp16_to_fp32(dk) * ggml_fp16_to_fp32(qd[qi * nblk + b])) * (float)isum;
+                                acc += (ggml_fp16_to_fp32(dk) * qd[qi * nblk + b]) * (float)isum;
                             }
                             lg[(size_t)t] = acc * scale;
                             mx = std::max(mx, lg[(size_t)t]);
