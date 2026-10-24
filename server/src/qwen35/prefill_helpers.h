@@ -112,6 +112,23 @@ inline std::vector<std::pair<int, int>> kvflash_prefill_batches(int start, int e
     return out;
 }
 
+// Where a pooled prefill takes the boundary snapshot requested at snap_pos: the
+// last batch start in (start, snap_pos] that is a multiple of `chunk`, or -1.
+// A pooled snapshot is only consumable at a chunk multiple, and a turn cut can
+// start a batch off it, so the batch holding snap_pos does not always qualify.
+// snap_pos at or past `end` is the end-of-prefill snapshot's job: -1 here.
+inline int kvflash_pooled_snapshot_pos(int start, int end, int grid, int max_batch,
+                                       const std::vector<int> & cuts, int snap_pos,
+                                       int chunk) {
+    if (snap_pos <= start || snap_pos >= end || chunk <= 0) return -1;
+    int best = -1;
+    for (const auto & b : kvflash_prefill_batches(start, end, grid, max_batch, cuts)) {
+        if (b.first > snap_pos) break;
+        if (b.first > start && b.first % chunk == 0) best = b.first;
+    }
+    return best;
+}
+
 // LUCE_KVFLASH_RESTORE_CONSUME=1 opts in to carrying a pooled KVFlash session
 // across turns: pooled prefix snapshots are saved and a restore consumes them
 // instead of re-prefilling the prompt. Default OFF.

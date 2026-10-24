@@ -2596,6 +2596,15 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         ladder = kvflash_state_ladder_positions(snap_pos, kv_offset + prompt_len,
                                                 kQwen35PrefillUbatch, 8192, turn_cut);
     }
+    // Pooled boundary snapshot: the last chunk-aligned batch start <= snap_pos
+    // (a turn cut can start the batch that holds snap_pos off the chunk grid,
+    // and a pooled snapshot there could never be consumed).
+    const int pooled_snap_at =
+        kvf_paged && snap_slot >= 0
+            ? kvflash_pooled_snapshot_pos(kv_offset, kv_offset + prompt_len, kQwen35PrefillUbatch,
+                                          prefill_ubatch, turn_cuts, snap_pos,
+                                          kvflash_pager_.chunk_tokens())
+            : -1;
 
     // Chunked prefill
     std::vector<float> embed_buf((size_t)hidden * prefill_ubatch);
@@ -2625,6 +2634,25 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // later request that shares only that prefix still restores a valid
         // hit. (Rounding UP would include tokens past the cut, e.g. a user
         // message another request does not share.)
+        // Pooled: the snapshot lands on pooled_snap_at, which is this batch's
+        // start or an earlier one; the batch holding snap_pos then only clears
+        // the request.
+        if (kvf_paged && snap_slot >= 0 && kv_pos == pooled_snap_at &&
+            luce::common::kvflash_restore_consume_enabled()) {
+            // kv_pos starts a pooled ubatch on a chunk multiple; cur_pos is
+            // already kv_pos. Serialize the pager chunks [0, kv_pos/chunk).
+            cache_.cur_pos = kv_pos;
+            if (snapshot_save_pooled_at(snap_slot, kv_pos)) {
+                std::printf("[snap] pooled boundary slot=%d cur_pos=%d "
+                            "(req snap_pos=%d chunks=%d)\n", snap_slot,
+                            kv_pos, snap_pos, kv_pos / kvflash_pager_.chunk_tokens());
+                std::fflush(stdout);
+            } else {
+                std::fprintf(stderr, "[kvflash] pooled boundary snapshot failed "
+                                     "at kv_pos=%d\n", kv_pos);
+            }
+            snap_slot = -1;
+        }
         if (snap_slot >= 0 && snap_pos >= 0 &&
             kv_pos <= snap_pos && snap_pos < kv_pos + n_tokens) {
             if (kv_pos > kv_offset && !kvf_paged) {   // skip degenerate / relocated
@@ -2634,23 +2662,11 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                 snap_slot, kv_pos, snap_pos);
                     std::fflush(stdout);
                 }
-            } else if (kvf_paged && kv_pos > kv_offset &&
-                       luce::common::kvflash_restore_consume_enabled()) {
-                // kv_pos starts a pooled ubatch (chunk multiple); cur_pos is
-                // already kv_pos. Serialize the pager chunks [0, kv_pos/chunk).
-                cache_.cur_pos = kv_pos;
-                if (snapshot_save_pooled_at(snap_slot, kv_pos)) {
-                    std::printf("[snap] pooled boundary slot=%d cur_pos=%d "
-                                "(req snap_pos=%d chunks=%d)\n", snap_slot,
-                                kv_pos, snap_pos, kv_pos / kvflash_pager_.chunk_tokens());
-                    std::fflush(stdout);
-                } else {
-                    std::fprintf(stderr, "[kvflash] pooled boundary snapshot failed "
-                                         "at kv_pos=%d\n", kv_pos);
-                }
             } else if (kvf_paged) {
-                std::fprintf(stderr, "[kvflash] boundary snapshot skipped: pooled "
-                                     "prefill relocates chunks\n");
+                std::fprintf(stderr, "[kvflash] boundary snapshot skipped: %s\n",
+                             luce::common::kvflash_restore_consume_enabled()
+                                 ? "no chunk-aligned batch start at or below the cut"
+                                 : "pooled prefill relocates chunks");
             }
             snap_pos = -1;
             snap_slot = -1;

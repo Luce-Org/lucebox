@@ -185,6 +185,7 @@ TEST_CASE(KvflashRestorePlanFixture, consume_flag_is_off_unless_exactly_one) {
 
 using luce::common::kvflash_prefill_batches;
 using luce::common::kvflash_prefill_batch_end;
+using luce::common::kvflash_pooled_snapshot_pos;
 using Batches = std::vector<std::pair<int, int>>;
 
 namespace {
@@ -317,4 +318,26 @@ TEST_CASE(KvflashRestorePlanFixture, replay_from_a_cut_matches_the_cold_batches)
             CHECK(kvflash_prefill_batches(c, 5000, kU, mb, cuts) == tail);
         }
     }
+}
+
+// ---- Pooled boundary snapshot on a chunk multiple ---------------------------
+
+TEST_CASE(KvflashRestorePlanFixture, pooled_snapshot_skips_batch_starts_off_the_chunk_grid) {
+    // Turn 2 of pooled_restore_identity.sh at N=20000: restored at 18432, cuts
+    // at 18815 and 18848, snapshot requested at 18846. The batch holding it
+    // starts at the cut 18815 (not a chunk multiple), and 18432 is the restore
+    // point itself, so there is nothing consumable to save.
+    CHECK(kvflash_pooled_snapshot_pos(18432, 18852, kU, kU, {18815, 18848}, 18846, 64) == -1);
+    // Cold turn 1: the batch holding 18813 starts on the grid at 18432.
+    CHECK(kvflash_pooled_snapshot_pos(0, 18819, kU, kU, {18815}, 18813, 64) == 18432);
+    // A cut that is a chunk multiple qualifies.
+    CHECK(kvflash_pooled_snapshot_pos(0, 2000, kU, kU, {1280}, 1300, 64) == 1280);
+    // An off-chunk cut falls back to the batch start before it.
+    CHECK(kvflash_pooled_snapshot_pos(0, 2000, kU, kU, {1300}, 1400, 64) == 1024);
+    // Without cuts it is the start of the batch that holds snap_pos.
+    CHECK(kvflash_pooled_snapshot_pos(0, 2000, kU, kU, {}, 1600, 64) == 1536);
+    // snap_pos at the start, at or past the end, or unset: none.
+    CHECK(kvflash_pooled_snapshot_pos(512, 2000, kU, kU, {}, 512, 64) == -1);
+    CHECK(kvflash_pooled_snapshot_pos(0, 2000, kU, kU, {}, 2000, 64) == -1);
+    CHECK(kvflash_pooled_snapshot_pos(0, 2000, kU, kU, {}, -1, 64) == -1);
 }
