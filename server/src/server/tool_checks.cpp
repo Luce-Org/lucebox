@@ -212,6 +212,11 @@ bool tools_off(const json & body) {
            tool_choice_is_none(body["tool_choice"]);
 }
 
+json callable_tools(const json & tools, const json & tool_choice, bool checks_pass) {
+    if (!checks_pass && tool_choice_is_none(tool_choice)) return json::array();
+    return tools;
+}
+
 json agent_request(const json & body, const std::string & effort) {
     json request = body;
     request["stream"] = false;

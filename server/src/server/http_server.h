@@ -802,6 +802,9 @@ struct ParsedRequest {
     json                      tools;
     // Tool choice constraint (stored for hint generation)
     json                      tool_choice;
+    // A tool-checks pass (tool_checks.h): its reply keeps the tool calls the
+    // model makes under tool_choice "none", so the checks can retry.
+    bool                      tool_checks_pass = false;
     // Original messages (for response formatting)
     json                      messages;
     // Original request body (for upstream proxy forwarding)

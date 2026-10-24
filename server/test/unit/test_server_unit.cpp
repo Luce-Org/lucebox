@@ -12,6 +12,7 @@
 
 #include "server/sse_emitter.h"
 #include "server/tool_parser.h"
+#include "server/tool_checks.h"
 #include "server/model_card.h"
 #include "server/response_error.h"
 #include "server/prefix_cache.h"
@@ -7351,6 +7352,44 @@ TEST_CASE(ServerUnitFixture, test_emitter_suppresses_undeclared_bailing_tool_blo
     TEST_ASSERT(em.accumulated_text() == "Visible answer");
     TEST_ASSERT(em.accumulated_text().find("weather") == std::string::npos);
     TEST_ASSERT(em.accumulated_text().find("Rome") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_drops_tool_call_under_tool_choice_none) {
+    const auto reply = [](const json & tool_choice, bool checks_pass) {
+        auto em = make_emitter(ApiFormat::OPENAI_CHAT,
+                               tool_checks::callable_tools(qwen_read_probe_tools(),
+                                                           tool_choice, checks_pass));
+        em.emit_start();
+        for (const std::string & raw_token : {
+                 std::string("Reading it."), std::string("<tool_call>"),
+                 std::string("\n<function=read_probe>\n<parameter=filePath>\nREADME.md\n"
+                             "</parameter>\n</function>\n"),
+                 std::string("</tool_call>")}) {
+            if (!em.suppress_undeclared_tool_protocol_token(raw_token)) {
+                em.emit_token(raw_token);
+            }
+        }
+        const std::string sse = concat(em.emit_finish(10));
+        return std::make_tuple(em.tool_calls().size(), em.finish_reason(),
+                               em.accumulated_text(), sse);
+    };
+
+    for (const json & none : {json("none"), json{{"type", "none"}}}) {
+        const auto [calls, finish, text, sse] = reply(none, false);
+        TEST_ASSERT(calls == 0);
+        TEST_ASSERT(finish == "stop");
+        TEST_ASSERT(text == "Reading it.");
+        TEST_ASSERT(sse.find("tool_calls") == std::string::npos);
+        TEST_ASSERT(sse.find("read_probe") == std::string::npos);
+    }
+
+    const auto [auto_calls, auto_finish, auto_text, auto_sse] = reply("auto", false);
+    TEST_ASSERT(auto_calls == 1);
+    TEST_ASSERT(auto_finish == "tool_calls");
+
+    // A tool-checks pass sees the call, so the checks can retry without it.
+    const auto [pass_calls, pass_finish, pass_text, pass_sse] = reply("none", true);
+    TEST_ASSERT(pass_calls == 1);
 }
 
 TEST_CASE(ServerUnitFixture, test_bailingmoe3_router_builds_group_mask) {

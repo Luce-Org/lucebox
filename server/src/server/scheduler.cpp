@@ -481,7 +481,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         if (n_gen_cap < 1) {
             // Degenerate ask: reply with an empty completion, no slot needed.
             SseEmitter emitter(req.format, req.response_id, req.model,
-                               usage_prompt_tokens(req), req.tools,
+                               usage_prompt_tokens(req),
+                               tool_checks::callable_tools(
+                                   req.tools, req.tool_choice, req.tool_checks_pass),
                                &tool_memory_, req.stop_sequences,
                                req.started_in_thinking);
             GenTimings t{
@@ -810,7 +812,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         // can still try another model; no tokenizer/model identity is on wire.
         auto emitter = std::make_unique<SseEmitter>(
             req.format, req.response_id, req.model,
-            usage_prompt_tokens(req), req.tools, &tool_memory_,
+            usage_prompt_tokens(req),
+            tool_checks::callable_tools(req.tools, req.tool_choice,
+                                        req.tool_checks_pass),
+            &tool_memory_,
             req.stop_sequences, req.started_in_thinking);
         if (req.stream) {
             bool ok = send_sse_headers(job);

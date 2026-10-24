@@ -4403,6 +4403,7 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
         inner.raw_body = request;
         inner.output_format = http_detail::request_output_format(request.dump());
         parse_endpoint_request("/v1/chat/completions", inner.raw_body, inner, count_only);
+        inner.tool_checks_pass = true;
         handle_model_request(pair[0], inner, false, admission ? &outcome : nullptr);
     } catch (const std::exception & e) {
         send_error(pair[0], 500, e.what());
@@ -10192,7 +10193,9 @@ void HttpServer::process_job(ServerJob * job) {
 
     // Create SSE emitter for streaming state machine.
     SseEmitter emitter(req.format, req.response_id, req.model,
-                       (int)req.prompt_tokens.size(), req.tools,
+                       (int)req.prompt_tokens.size(),
+                       tool_checks::callable_tools(req.tools, req.tool_choice,
+                                                   req.tool_checks_pass),
                        &tool_memory_,
                        req.stop_sequences,
                        req.started_in_thinking);
