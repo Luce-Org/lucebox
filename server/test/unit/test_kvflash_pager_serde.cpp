@@ -22,9 +22,18 @@ namespace {
 struct KvflashPagerSerdeFixture {};
 
 constexpr int kHeadDim = 4, kPool = 512, kNHeadKv = 2, kNLayer = 2, kChunk = 64;
-// KVFLASH2 blob header: 8-byte magic + 9 x uint32.
+// KVFLASH3 blob header: 8-byte magic + 9 x uint32. After the KV bytes and the
+// ledger comes the pool layout: 16-byte header, 16 bytes per chunk, 4 per free block.
 constexpr size_t kHdr = 8 + 9 * 4;
 constexpr size_t kLedgerEntry = 8;
+constexpr size_t kPoolHdr = 16, kPoolEntry = 16;
+
+// chunk_bytes as the blob header records it (header field 5).
+size_t blob_chunk_bytes(const std::vector<uint8_t> & b) {
+    uint32_t cb = 0;
+    std::memcpy(&cb, b.data() + 8 + 5 * 4, 4);
+    return cb;
+}
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 
 // pool 512 / chunk 64 = 8 blocks; sink 1 + tail 4 + 2 = 7 <= 8 blocks.
@@ -149,9 +158,10 @@ TEST_CASE(KvflashPagerSerdeFixture, roundtrip_preserves_residency_bytes_and_host
     REQUIRE(!pa.is_resident(3));                          // paged out at serialize time
 
     const std::vector<uint8_t> blob = pa.serialize();
+    // 5 resident chunks in an 8-block pool leave 3 free blocks.
     REQUIRE(blob.size() == kHdr + 6 * (size_t)(kChunk * kHeadDim * 2 * kNHeadKv * kNLayer * 2) +
-                           6 * kLedgerEntry);
-    REQUIRE(std::memcmp(blob.data(), "2HSALFVK", 8) == 0);  // "KVFLASH2" little-endian u64
+                           6 * kLedgerEntry + kPoolHdr + 6 * kPoolEntry + 3 * 4);
+    REQUIRE(std::memcmp(blob.data(), "3HSALFVK", 8) == 0);  // "KVFLASH3" little-endian u64
 
     Harness B;
     TestPager pb;
@@ -228,7 +238,7 @@ TEST_CASE(KvflashPagerSerdeFixture, partial_serialize_keeps_only_first_chunks) {
     CHECK(pa.serialize(-1) == full);
     // max_chunks == 0 is a valid, empty snapshot.
     const std::vector<uint8_t> none = pa.serialize(0);
-    CHECK(none.size() == kHdr);
+    CHECK(none.size() == kHdr + kPoolHdr + 8 * 4);   // no chunks, all 8 blocks free
     REQUIRE(pb.deserialize(none.data(), none.size()));
     CHECK(pb.n_chunks() == 0);
     CHECK(pb.resident_blocks() == 0);
@@ -298,13 +308,16 @@ TEST_CASE(KvflashPagerSerdeFixture, deserialize_rejects_a_changed_v_dtype_and_th
     CHECK(!pb.deserialize(blob.data(), blob.size()));
     CHECK(pb.n_chunks() == 0);
 
-    // A blob in the previous format (KVFLASH1, 8-field header) is refused.
-    auto old = blob;
-    std::memcpy(old.data(), "1HSALFVK", 8);
+    // Blobs in the previous formats (KVFLASH1, 8-field header; KVFLASH2, no
+    // pool layout) are refused.
     Harness C;
     TestPager pc;
     REQUIRE(pc.attach(make_cfg(), C.k, C.v));
-    CHECK(!pc.deserialize(old.data(), old.size()));
+    for (const char * magic : {"1HSALFVK", "2HSALFVK"}) {
+        auto old = blob;
+        std::memcpy(old.data(), magic, 8);
+        CHECK(!pc.deserialize(old.data(), old.size()));
+    }
     CHECK(pc.deserialize(blob.data(), blob.size()));
 }
 
@@ -351,10 +364,10 @@ TEST_CASE(KvflashPagerSerdeFixture, malformed_blobs_are_rejected_without_touchin
     { auto b = good; std::memset(&b[8], 0xFF, 4); CHECK(rejected(b)); }  // nc = 0xFFFFFFFF (overflow)
     { auto b = good; b[8] = 7;          CHECK(rejected(b)); } // nc claims more chunks than the blob holds
     {   // ledger claims more resident chunks (40) than the pool has blocks (8)
-        const size_t cb = (good.size() - kHdr - 6 * kLedgerEntry) / 6;
+        const size_t cb = blob_chunk_bytes(good);
         std::vector<uint8_t> b(good.begin(), good.begin() + kHdr);
         b[8] = 40;  // nc = 40 (little-endian u32)
-        b.resize(kHdr + 40 * cb + 40 * kLedgerEntry, 0);
+        b.resize(kHdr + 40 * cb + 40 * kLedgerEntry + kPoolHdr + 40 * kPoolEntry, 0);
         for (size_t c = 0; c < 40; c++) b[kHdr + 40 * cb + c * kLedgerEntry] = 1;
         CHECK(rejected(b));
     }
@@ -491,7 +504,7 @@ TEST_CASE(KvflashPagerSerdeFixture, never_materialized_holes_stay_holes_through_
     REQUIRE(pb.deserialize(blob.data(), blob.size()));
     // A hole is not recallable zero KV, and holds no host copy.
     for (int c = 2; c < 6; c++) CHECK(!pb.page_in(c));
-    CHECK(pb.stats().host_bytes == 3 * (int64_t)(blob.size() - kHdr - 7 * kLedgerEntry) / 7);
+    CHECK(pb.stats().host_bytes == 3 * (int64_t)blob_chunk_bytes(blob));
     // reselect() must not pick them either, however well they score.
     pb.score_hook = [](int c) { return c >= 2 && c < 6 ? 1e6f : (float)c; };
     pb.reselect();
@@ -503,7 +516,7 @@ TEST_CASE(KvflashPagerSerdeFixture, never_materialized_holes_stay_holes_through_
 
     // A blob claiming a resident chunk that was never materialized is corrupt.
     auto bad = blob;
-    const size_t cb = (blob.size() - kHdr - 7 * kLedgerEntry) / 7;
+    const size_t cb = blob_chunk_bytes(blob);
     bad[kHdr + 7 * cb + 3 * kLedgerEntry] = 1;       // chunk 3 "resident"...
     bad[kHdr + 7 * cb + 3 * kLedgerEntry + 1] = 0;   // ...but not materialized
     CHECK(!pb.deserialize(bad.data(), bad.size()));
@@ -572,10 +585,68 @@ TEST_CASE(KvflashPagerSerdeFixture, blob_fields_are_little_endian) {
     REQUIRE(p.alloc_span(0, 2 * kChunk));
     p.set_chunk_score(1, 1.0f);   // IEEE-754 0x3f800000
     const std::vector<uint8_t> blob = p.serialize();
-    const size_t cb = (blob.size() - kHdr - 2 * kLedgerEntry) / 2;
+    const size_t cb = blob_chunk_bytes(blob);
     const uint8_t nc_le[4] = {2, 0, 0, 0}, chunk_tokens_le[4] = {kChunk, 0, 0, 0};
     CHECK(std::memcmp(&blob[8], nc_le, 4) == 0);
     CHECK(std::memcmp(&blob[12], chunk_tokens_le, 4) == 0);
     const uint8_t one_le[4] = {0x00, 0x00, 0x80, 0x3f};
     CHECK(std::memcmp(&blob[kHdr + 2 * cb + kLedgerEntry + 4], one_le, 4) == 0);
+}
+
+// A restored pager is the saved one: same block per chunk, same free list and
+// LRU order, so from the same point it evicts the same victims and puts new
+// chunks in the same blocks as the source. Attention then reads the same slots
+// in the same order, which is what lets a suffix-only restore match a cold
+// prefill byte for byte.
+TEST_CASE(KvflashPagerSerdeFixture, roundtrip_keeps_blocks_and_lru_so_later_evictions_match) {
+    Harness A, B;
+    TestPager pa, pb;
+    build_source(A, pa, 4);                       // chunk 2 relocated, chunk 3 on host
+    must(pa.alloc_span(6 * kChunk, 2 * kChunk));  // 7 resident, 1 block free
+    for (int c = 6; c < 8; c++) stamp_chunk(A, pa, c, 4);
+    const std::vector<uint8_t> blob = pa.serialize();
+    REQUIRE(pb.attach(make_cfg(), B.k, B.v));
+    REQUIRE(pb.alloc_span(0, 3 * kChunk));        // state that deserialize must replace
+    REQUIRE(pb.deserialize(blob.data(), blob.size()));
+    CHECK(pb.serialize() == blob);
+    auto same_layout = [&]() {
+        bool ok = pa.n_chunks() == pb.n_chunks();
+        for (int c = 0; ok && c < pa.n_chunks(); c++) ok = pa.block_of(c) == pb.block_of(c);
+        return ok;
+    };
+    CHECK(same_layout());
+    for (int c = 0; c < 8; c++) if (pa.is_resident(c)) CHECK(chunk_matches(B, pb, c, 4));
+    // Six more chunks: one into the free block, then five LRU evictions.
+    for (int c = 8; c < 14; c++) {
+        must(pa.alloc_span(c * kChunk, kChunk));
+        must(pb.alloc_span(c * kChunk, kChunk));
+        stamp_chunk(A, pa, c, 4);
+        stamp_chunk(B, pb, c, 4);
+        CHECK(same_layout());
+    }
+    CHECK(pa.serialize() == pb.serialize());
+}
+
+// Into a pool of a different size the saved blocks do not apply: the chunks
+// load in identity order, as KVFLASH2 did, with the same residency and bytes.
+TEST_CASE(KvflashPagerSerdeFixture, roundtrip_into_another_pool_size_keeps_residency) {
+    Harness A;
+    TestPager pa;
+    build_source(A, pa, 5);
+    const std::vector<uint8_t> blob = pa.serialize();
+    Harness B(GGML_TYPE_F16, 2 * kPool);
+    TestPager pb;
+    KvFlashConfig cfg = make_cfg();
+    cfg.pool_tokens = 2 * kPool;
+    REQUIRE(pb.attach(cfg, B.k, B.v));
+    REQUIRE(pb.deserialize(blob.data(), blob.size()));
+    CHECK(pb.n_chunks() == 6);
+    CHECK(pb.resident_blocks() == 5);
+    int next = 0;
+    for (int c = 0; c < 6; c++) {
+        CHECK(pb.is_resident(c) == pa.is_resident(c));
+        if (!pb.is_resident(c)) continue;
+        CHECK(pb.block_of(c) == next++);
+        CHECK(chunk_matches(B, pb, c, 5));
+    }
 }
