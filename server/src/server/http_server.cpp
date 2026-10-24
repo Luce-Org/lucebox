@@ -1800,6 +1800,7 @@ SamplerCfg parse_request_sampler(const json & body,
         "top_k", defaults.has_top_k ? defaults.top_k : 0);
     if (body.contains("seed")) {
         sampler.seed = body["seed"].get<uint64_t>();
+        sampler.has_seed = true;
     }
 
     // OpenAI-style additive penalties.

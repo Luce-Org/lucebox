@@ -762,8 +762,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     sampler_config() = req.sampler;
-    if (req.do_sample && sampler_config().seed != 0) {
-        sampler_rng_engine().seed(sampler_config().seed);
+    if (req.do_sample) {
+        sampler_rng_engine().seed(request_rng_seed(sampler_config()));
     }
 
     reset_recurrent_state(target_cache());
@@ -1494,8 +1494,8 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
     }
 
     sampler_config() = req.sampler;
-    if (req.do_sample && sampler_config().seed != 0) {
-        sampler_rng_engine().seed(sampler_config().seed);
+    if (req.do_sample) {
+        sampler_rng_engine().seed(request_rng_seed(sampler_config()));
     }
 
     if (req.n_gen > 0 && sampler_config().temp > 0) {

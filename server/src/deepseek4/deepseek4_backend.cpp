@@ -5087,8 +5087,8 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     DaemonIO out_io = io.with_token_callback(req.on_token);
     auto t0 = Clock::now();
     sampler_ = req.sampler;
-    if (req.do_sample && sampler_.seed != 0) {
-        sampler_rng_.seed(sampler_.seed);
+    if (req.do_sample) {
+        sampler_rng_.seed(request_rng_seed(sampler_));
     }
 
     if (kv_offset < 0 || kv_offset > (int) req.prompt.size()) {

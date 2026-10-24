@@ -1784,8 +1784,8 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
         return result;
     }
     sampler_ = req.sampler;
-    if (req.do_sample && sampler_.seed != 0) {
-        sampler_rng_.seed(sampler_.seed);
+    if (req.do_sample) {
+        sampler_rng_.seed(request_rng_seed(sampler_));
     }
 
     // Zero delta-net recurrent state (SSM + conv) so a fresh prompt doesn't
@@ -1990,8 +1990,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
 
     // Now generate from restored state
     sampler_ = req.sampler;
-    if (req.do_sample && sampler_.seed != 0) {
-        sampler_rng_.seed(sampler_.seed);
+    if (req.do_sample) {
+        sampler_rng_.seed(request_rng_seed(sampler_));
     }
 
     cache_.cur_pos = snap_pos;

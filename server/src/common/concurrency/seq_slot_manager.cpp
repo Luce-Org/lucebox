@@ -189,9 +189,10 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
     s.sampler = sampler;
     s.sample_history = prompt;
     // Same predicate the engine uses to pick CPU sampling over GPU argmax:
-    // a seed only means anything when the sampler actually draws.
+    // a seed only means anything when the sampler actually draws. Without
+    // one, each request gets its own stream, as on the single-lane path.
     if (sampler.needs_logit_processing()) {
-        s.rng.seed(sampler.seed);
+        s.rng.seed(request_rng_seed(sampler));
     } else {
         s.rng.seed(std::random_device{}());
     }

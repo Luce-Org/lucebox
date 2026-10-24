@@ -523,8 +523,8 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
     ThinkingBudget budget(req.budget_hook, req.n_gen);
     DaemonIO out_io = io.with_token_callback(req.on_token);
     sampler_ = req.sampler;
-    if (req.do_sample && sampler_.seed != 0) {
-        sampler_rng_.seed(sampler_.seed);
+    if (req.do_sample) {
+        sampler_rng_.seed(request_rng_seed(sampler_));
     }
 
     cache_.cur_pos = 0;  // reset cache for fresh generation
@@ -703,8 +703,8 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
 
     // Set up sampler
     sampler_ = req.sampler;
-    if (req.do_sample && sampler_.seed != 0) {
-        sampler_rng_.seed(sampler_.seed);
+    if (req.do_sample) {
+        sampler_rng_.seed(request_rng_seed(sampler_));
     }
 
     // Only prefill the tokens after the restored prefix

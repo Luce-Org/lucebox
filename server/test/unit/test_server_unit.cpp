@@ -6449,6 +6449,20 @@ TEST_CASE(ServerUnitFixture, test_parse_request_sampler_applies_defaults_and_ove
     TEST_ASSERT(std::fabs(sampler.rep_pen - 1.1f) < 0.001f);
 }
 
+// The stream a request samples from: no "seed" field gives fresh entropy on
+// every request; any explicit seed, zero and UINT64_MAX included, is the seed.
+TEST_CASE(ServerUnitFixture, test_parse_request_sampler_tells_no_seed_from_seed_zero) {
+    const SamplingDefaults defaults;
+    const uint64_t max_seed = std::numeric_limits<uint64_t>::max();
+    const SamplerCfg unseeded =
+        parse_request_sampler({{"temperature", 1.0f}}, defaults);
+    TEST_ASSERT(request_rng_seed(unseeded) != request_rng_seed(unseeded));
+    TEST_ASSERT(request_rng_seed(parse_request_sampler(
+        {{"temperature", 1.0f}, {"seed", 0}}, defaults)) == 0);
+    TEST_ASSERT(request_rng_seed(parse_request_sampler(
+        {{"temperature", 1.0f}, {"seed", max_seed}}, defaults)) == max_seed);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // sampling_no_thinking: per-card sampler defaults for requests whose final
 // thinking state resolves to OFF (e.g. Qwen3.8-Flash-Next's instruct-mode
