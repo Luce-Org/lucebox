@@ -210,7 +210,10 @@ inline std::vector<int> kvflash_ladder_evict(const std::vector<KvflashLadderEntr
 // LUCE_KVFLASH_SESSION is the one switch for KVFlash session restore: the DeltaNet
 // state ladder, live restore, generation-end checkpoint (S9) and per-turn
 // checkpoints (S9b). Default ON (callers also require KVFlash itself to be
-// active); LUCE_KVFLASH_SESSION=0 turns all four off. Pure so it is unit-testable.
+// active); LUCE_KVFLASH_SESSION=0 turns all four off. The turn cuts as batch
+// boundaries are not gated (they apply to every pooled prefill, like the 512
+// grid), so the session-off arm batches like the session-on arm. Pure so it is
+// unit-testable.
 inline bool kvflash_session_flag(const char * v) {
     return !(v != nullptr && v[0] == '0' && v[1] == '\0');
 }

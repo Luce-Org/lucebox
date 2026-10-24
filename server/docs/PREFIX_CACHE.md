@@ -504,8 +504,8 @@ active.
 restore; independent of `LUCE_KVFLASH_SESSION`) runs on an absolute grid of 512 tokens, a multiple of the
 64-token chunk. A batch never starts off the grid
 except the first one after an off-grid resume, so where a cut falls does not
-depend on where an earlier request started. Turn cuts (only with the session
-switch on) are the only other batch boundaries, and they depend only on the prompt tokens, so a restore at a cut
+depend on where an earlier request started. Turn cuts (also independent of the session
+switch, so the session-off reference runs the same batches) are the only other batch boundaries, and they depend only on the prompt tokens, so a restore at a cut
 replays exactly the batches a cold prefill runs from there on. This is what
 lets restored and cold answers match byte for byte.
 

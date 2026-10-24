@@ -2575,9 +2575,12 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     std::vector<int> ladder;
     int turn_cut = -1;
     std::vector<int> turn_cuts;
-    if (kvflash_active() && !images && kvflash_session_enabled()) {
-        // Every prefill (cold included, ladder or not) cuts after every assistant
-        // header, so a restore at a turn rung replays the batches a cold prefill ran.
+    if (kvflash_active() && !images) {
+        // Every pooled prefill (cold included, ladder or not, session on or off)
+        // cuts after every assistant header, so a restore at a turn rung replays
+        // the batches a cold prefill ran. Like the 512 grid this does not depend
+        // on LUCE_KVFLASH_SESSION: the session-off arm is the cold reference, and
+        // with cuts only on one side the two arms batch, and round, differently.
         turn_cuts = kvflash_turn_cuts(tokens, w_.im_start_id, w_.assistant_id, w_.newline_id);
         for (int & c : turn_cuts) c += kv_offset;
     }
