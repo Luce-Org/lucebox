@@ -59,14 +59,13 @@ class DflashClient:
                  chain_seed: bool = True,
                  fa_window: Optional[int] = None,
                  kv_tq3: Optional[bool] = None,
-                 lm_head_fix: Optional[bool] = None,
                  boot_timeout_s: float = 60.0,
                  boot_vram_mib: int = 18000):
         """Spawn the patched dflash daemon as a subprocess.
 
-        Defaults for fa_window / kv_tq3 / lm_head_fix come from
-        ``config.LUCE_REQUIRED_ENV`` and are the only flags pflash relies on.
-        Override per-call only when you know what you're doing.
+        Defaults for fa_window / kv_tq3 come from ``config.LUCE_REQUIRED_ENV``
+        and are the only flags pflash relies on. Override per-call only when
+        you know what you're doing.
         """
         self.bin_path = bin_path
         self.target_path = target_path
@@ -77,7 +76,6 @@ class DflashClient:
         env_overrides = {
             "LUCE_FA_WINDOW": str(0 if fa_window is None else fa_window),
             "LUCE_KV_TQ3": "1" if (kv_tq3 if kv_tq3 is not None else True) else "0",
-            "LUCE_LM_HEAD_FIX": "1" if lm_head_fix else "0",
         }
         env = {**os.environ, **config.LUCE_REQUIRED_ENV, **env_overrides}
         bin_dir = os.path.dirname(os.path.abspath(bin_path))

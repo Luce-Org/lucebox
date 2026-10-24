@@ -135,19 +135,14 @@ Untagged variables are operational tuning knobs.
 | `LUCE_KV_F16` | F16 KV cache. |
 | `LUCE_KV_K` / `LUCE_KV_V` | Per-side (K/V) KV quantization. |
 | `LUCE_KV_Q4` / `LUCE_KV_TQ3` / `LUCE_KV_TBQ` | Quantized KV formats (Q4 / TQ3 / TBQ). |
-| `LUCE_PFLASH_K_TYPE` | PFlash K dtype. |
 
 ## FlashPrefill / prefill
 
 | Variable | Purpose |
 |---|---|
-| `LUCE_FP_USE_BSA` | Use block-sparse attention in flash prefill. |
-| `LUCE_FP_ALPHA` | FlashPrefill alpha parameter. |
-| `LUCE_FP_CHUNK_S` | FlashPrefill chunk size. |
-| `LUCE_FP_NOPE_TAIL` | NoPE tail handling in flash prefill. |
+| `LUCE_FP_USE_BSA` | Gemma 4 sliding-window prefill: dispatch the FlashPrefill sparse forward through the BSA launcher (CUTLASS on CUDA, rocWMMA on HIP). Enabled by presence; on by default with PFlash. The PFlash scorer does not read it. |
 | `LUCE_FP_HIP_ROW` | HIP row-kernel path for flash prefill. |
-| `LUCE_FP_SKIP_PREWARM` | Skip flash-prefill prewarm. |
-| `LUCE_FP_PROFILE` / `LUCE_FP_DUMP_COUNTS` / `LUCE_FP_DEBUG_LAYER0` | 🐛 **debug** FlashPrefill profiling/debug. |
+| `LUCE_FP_PROFILE` / `LUCE_FP_DUMP_COUNTS` | 🐛 **debug** FlashPrefill profiling/debug. |
 | `LUCE_PREFILL_MODE` | Prefill mode selector. |
 | `LUCE_PREFILL_THRESHOLD` | Prefill length threshold. |
 | `LUCE_PREFILL_DRAFTER` | Drafter participation during prefill. |
@@ -307,7 +302,6 @@ Untagged variables are operational tuning knobs.
 |---|---|
 | `LUCE_PROF` | 🐛 **debug** Comma list of profilers (`step,verify,prefill`). |
 | `LUCE_TQ3_VERIFY` | See Verification (also a debug quant path). |
-| `LUCE_LM_HEAD_FIX` | ⚠️ **removal candidate** LM-head correctness fix toggle. |
 | `LUCE_TESTS` | 🧪 **test/bench** Enable test-only code paths (build). |
 
 ## Benchmark / harness

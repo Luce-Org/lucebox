@@ -33,7 +33,6 @@
 #include "ggml-cuda.h"
 #include "ggml-backend-impl.h"
 #include "common/snapshot_backend.h"
-#include "pflash_ggml_adapter.h"
 #include "flashprefill.h"
 
 #include <algorithm>

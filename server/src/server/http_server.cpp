@@ -1720,7 +1720,7 @@ static bool curl_forward(const std::string & url,
 //   - field removed
 //   - existing field's semantics change (units, nullability, type)
 // Do NOT bump for additive changes (new fields, new sections).
-static constexpr int  kPropsSchema  = 2;
+static constexpr int  kPropsSchema  = 3;
 static constexpr char kServerName[] = "luce-dflash";
 #ifndef LUCE_SERVER_VERSION
 #define LUCE_SERVER_VERSION "0.0.0+cpp"
@@ -1998,20 +1998,9 @@ json build_props_body(const ServerConfig & config,
             {"keep_ratio",   nullptr},
             {"drafter_gguf", nullptr},
             {"skip_park",    nullptr},
-            {"bsa_enabled",  nullptr},
-            {"bsa_alpha",    nullptr},
-            {"lm_head_fix",  nullptr},
             {"draft_residency", draft_residency_policy_name(config.draft_residency)},
         };
     } else {
-        const char * bsa_env = std::getenv("LUCE_FP_USE_BSA");
-        const char * alpha_env = std::getenv("LUCE_FP_ALPHA");
-        const char * lmfix_env = std::getenv("LUCE_LM_HEAD_FIX");
-        json bsa_alpha = nullptr;
-        if (alpha_env && *alpha_env) {
-            try { bsa_alpha = std::stod(alpha_env); }
-            catch (const std::exception &) { bsa_alpha = nullptr; }
-        }
         std::string mode_str =
             (config.pflash_mode == ServerConfig::PflashMode::AUTO)   ? "auto"   :
             (config.pflash_mode == ServerConfig::PflashMode::ALWAYS) ? "always" : "off";
@@ -2024,9 +2013,6 @@ json build_props_body(const ServerConfig & config,
                               ? json(nullptr)
                               : json(config.pflash_drafter_path)},
             {"skip_park",    config.pflash_skip_park},
-            {"bsa_enabled",  (bsa_env != nullptr && *bsa_env && std::strcmp(bsa_env, "0") != 0)},
-            {"bsa_alpha",    bsa_alpha},
-            {"lm_head_fix",  (lmfix_env != nullptr && *lmfix_env && std::strcmp(lmfix_env, "0") != 0)},
             {"draft_residency", draft_residency_policy_name(config.draft_residency)},
         };
     }

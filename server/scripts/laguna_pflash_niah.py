@@ -215,8 +215,6 @@ class PflashDaemon:
         r, w = os.pipe()
         self.r = r
         env = os.environ.copy()
-        env.setdefault("LUCE_FP_USE_BSA", "1")
-        env.setdefault("LUCE_FP_ALPHA", "0.85")
         cmd = [str(bin_path), str(drafter_gguf), f"--stream-fd={w}"]
         self.proc = subprocess.Popen(cmd, env=env, pass_fds=(w,),
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,

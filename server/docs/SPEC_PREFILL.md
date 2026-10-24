@@ -7,9 +7,10 @@ This doc is the build / runtime / tunables reference for the C++ daemon
 path described in [`optimizations/pflash/README.md`](../../optimizations/pflash/README.md) and on the
 [blog post](https://lucebox.com/blog/pflash):
 
-- **Drafter** (Qwen3-0.6B) loaded via a custom forward (`qwen3_*`)
-  with the FlashPrefill block-sparse attention kernel for long-context
-  scoring.
+- **Drafter** (Qwen3.5-0.8B) scores the prompt in-process: blocks 0-14
+  on the qwen35 graph (Gated DeltaNet plus ggml flash-attention), then
+  block 15's NoPE Q/K attention mass, optionally through a trained
+  scoring head (`src/pflash/`).
 - **Target** (Qwen3.6-27B Q4_K_M) loaded directly via ggml.
 - **Speculative decode** between draft + target with rollback / DDTree.
 
@@ -21,35 +22,30 @@ single RTX 3090 (24 GB). No PyTorch at runtime.
 ```
 git submodule update --init --recursive
 mkdir build && cd build
-cmake -DCMAKE_CUDA_ARCHITECTURES=86 -DLUCE_ENABLE_BSA=ON ..
+cmake -DCMAKE_CUDA_ARCHITECTURES=86 ..
 cmake --build . --target test_dflash test_flashprefill_kernels -- -j8
 ```
 
 Required:
-- CUDA Toolkit 12.0+ (sm_80+ for BSA path; sm_86 RTX 3090 is the
-  reference target).
+- CUDA Toolkit 12.0+ (sm_86 RTX 3090 is the reference target).
 - `git submodule update --init --recursive` to pull
   `deps/Block-Sparse-Attention` (with cutlass). `deps/llama.cpp` is vendored
   directly and keeps only the `ggml` subtree.
 
 CMake options:
 - `LUCE_ENABLE_BSA=ON` (default) — build the Block-Sparse-Attention
-  kernel for sparse FA forward. Required for the long-context perf claim.
-  Turn OFF only on sm<80.
+  launcher for the FlashPrefill sparse forward, which Gemma 4's
+  sliding-window prefill uses. The PFlash scorer does not. Turn OFF on
+  sm<80.
 - `LUCE_FA_ALL_QUANTS=ON` (default) — compile ggml-cuda fattn for
   all KV-quant pairs (needed for asymmetric Q4_0 K + Q8_0 V cache). Off
   cuts build time ~3x but breaks the 128K target gen path.
 
 ## Runtime tunables
 
-```
-LUCE_FP_USE_BSA=1    # dispatch sparse FA forward through BSA (sm_80+)
-LUCE_FP_ALPHA=0.85   # block-selection threshold (default 0.12);
-                       # higher = stricter = fewer K-blocks per Q-row.
-LUCE_FP_PROFILE=1    # log mean/score/select/forward stage timings
-```
-
-See `src/flashprefill.h` for the full list and defaults.
+PFlash's switches are listed in [PFlash configuration](PFLASH_CONFIGURATION.md).
+The `LUCE_FP_*` variables in `src/flashprefill.h` tune the FlashPrefill
+kernels, which the PFlash scorer does not run.
 
 ## Mixed backend placement
 
@@ -59,9 +55,10 @@ PFlash phase or DFlash draft-process boundary. See
 
 ## Performance
 
-NIAH single-needle end-to-end on RTX 3090 (Qwen3.6-27B Q4_K_M target,
-Qwen3.5-0.8B drafter, in-process daemon, `LUCE_FP_USE_BSA=1`,
-`LUCE_FP_ALPHA=0.85`, `keep_ratio=0.05`):
+PFlash v1, before the Qwen3.5-0.8B scorer replaced it in #746: NIAH
+single-needle end-to-end on RTX 3090 (Qwen3.6-27B Q4_K_M target,
+Qwen3-0.6B drafter on the BSA sparse forward, in-process daemon,
+`keep_ratio=0.05`):
 
 | Source S | dflash TTFT | llama.cpp baseline | Speedup | NIAH |
 |----------|------------:|-------------------:|--------:|:----:|

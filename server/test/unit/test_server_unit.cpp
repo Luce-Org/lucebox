@@ -15096,8 +15096,8 @@ TEST_CASE(ServerUnitFixture, test_props_budget_envelope_shape) {
     TEST_ASSERT(body["model_card"]["max_tokens"].get<int>() == 32768);
     TEST_ASSERT(be["default_max_tokens"].get<int>() == 16000);
 
-    // Sanity: props_schema bumped to 2 (breaking change).
-    TEST_ASSERT(body["server"]["props_schema"].get<int>() == 2);
+    // Sanity: props_schema 3 (schema 3 dropped three pflash fields).
+    TEST_ASSERT(body["server"]["props_schema"].get<int>() == 3);
 }
 
 // ─── /props.runtime captures full config (§4.16) ──────────────────────

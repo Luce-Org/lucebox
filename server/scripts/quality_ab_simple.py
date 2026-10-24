@@ -39,16 +39,11 @@ CONFIGS = {
     "prefix_on_f16":    {  # prefix cache + f16 K-cache (tests KV-quantization hypothesis)
         "flags": ["--prefix-cache-slots", "4", "--prefill-compression", "off", "--kv-f16"],
     },
-    "compression_on":   {  # only pflash compression (no prefix cache; BSA is part of the pflash defaults)
+    "compression_on":   {  # only pflash compression (no prefix cache)
         "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "always"],
     },
-    "bsa_on":           {  # only BSA in pflash (no prefix cache)
-        "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "off"],
-        "env":   {"LUCE_FP_USE_BSA": "1"},
-    },
-    "all_on":           {  # prefix + pflash compression + BSA
+    "all_on":           {  # prefix cache + pflash compression
         "flags": ["--prefix-cache-slots", "4", "--prefill-compression", "always"],
-        "env":   {"LUCE_FP_USE_BSA": "1"},
     },
 }
 
