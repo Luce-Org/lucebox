@@ -1263,6 +1263,8 @@ private:
     bool render_and_tokenize_request(
         SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
         ParsedRequest & req);
+    std::vector<ChatMessage> defuse_message_control_tokens(
+        const std::vector<ChatMessage> & messages) const;
     bool render_messages_to_text(
         const std::vector<ChatMessage> & chat_messages,
         const ParsedRequest & req, bool add_generation_prompt,

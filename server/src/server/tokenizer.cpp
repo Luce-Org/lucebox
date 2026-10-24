@@ -582,6 +582,7 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
                 const std::string & tok = id_to_token_[i];
                 if (!tok.empty()) {
                     added_tokens_.push_back({tok, (int32_t)i});
+                    if (ttype == 3) control_tokens_.push_back(tok);
                 }
             }
         }
@@ -606,7 +607,11 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
                     tok.compare(0, open.size(), open) == 0 &&
                     tok.compare(tok.size() - close.size(), close.size(), close) == 0;
                 for (const char * m : kDsMarkers) marker = marker || tok == m;
-                if (marker) { added_tokens_.push_back({tok, (int32_t)i}); ++repaired; }
+                if (marker) {
+                    added_tokens_.push_back({tok, (int32_t)i});
+                    if (tok.compare(0, open.size(), open) == 0) control_tokens_.push_back(tok);
+                    ++repaired;
+                }
             }
             if (repaired > 0) {
                 std::fprintf(stderr, "[tokenizer] %zu DeepSeek control tokens were typed "
@@ -675,10 +680,50 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
     return true;
 }
 
+// Plain text without the defuse marks (see defuse_control_tokens).
+static std::string strip_defuse_marks(const std::string & text) {
+    const std::string mark = Tokenizer::kDefuseMark;
+    size_t at = text.find(mark);
+    if (at == std::string::npos) return text;
+    std::string out;
+    out.reserve(text.size());
+    size_t from = 0;
+    for (; at != std::string::npos; at = text.find(mark, from)) {
+        out.append(text, from, at - from);
+        from = at + mark.size();
+    }
+    out.append(text, from, std::string::npos);
+    return out;
+}
+
+std::string Tokenizer::defuse_control_tokens(const std::string & text,
+                                             const std::string & keep) const {
+    if (control_tokens_.empty()) return text;
+    std::string out;
+    size_t copied = 0;
+    for (size_t pos = 0; pos < text.size(); ++pos) {
+        if (!keep.empty() && text.compare(pos, keep.size(), keep) == 0) {
+            pos += keep.size() - 1;
+            continue;
+        }
+        for (const std::string & tok : control_tokens_) {
+            if (text.compare(pos, tok.size(), tok) != 0) continue;
+            if (out.empty()) out.reserve(text.size() + 16);
+            out.append(text, copied, pos + 1 - copied);
+            out += kDefuseMark;
+            copied = pos + 1;
+            break;
+        }
+    }
+    if (copied == 0) return text;
+    out.append(text, copied, std::string::npos);
+    return out;
+}
+
 std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
     // If no added tokens, fast path: pre-tokenize → BPE entire text.
     if (added_tokens_.empty()) {
-        std::vector<std::string> pieces = pre_tokenize(text);
+        std::vector<std::string> pieces = pre_tokenize(strip_defuse_marks(text));
         std::vector<int32_t> ids;
         for (const auto & piece : pieces) {
             auto piece_ids = bpe_encode_piece(piece);
@@ -715,7 +760,7 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
         }
 
         // Pre-tokenize + BPE the normal segment.
-        std::string segment = text.substr(pos, next_special - pos);
+        std::string segment = strip_defuse_marks(text.substr(pos, next_special - pos));
         std::vector<std::string> pieces = pre_tokenize(segment);
         for (const auto & piece : pieces) {
             auto piece_ids = bpe_encode_piece(piece);

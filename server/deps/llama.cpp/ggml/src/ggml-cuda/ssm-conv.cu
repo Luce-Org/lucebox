@@ -611,6 +611,10 @@ static __global__ void dflash_dyn_conv_f32(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int l = blockIdx.y;
     if (c >= C || l >= T) return;
+    // blockIdx.z is the lane: each lane is an independent [C, T] block.
+    x   += (int64_t)blockIdx.z * T * C;
+    out += (int64_t)blockIdx.z * T * C;
+    dyn += (int64_t)blockIdx.z * T * dyn_ld;
     const int g = c / gs;
     float acc;
     {
@@ -635,16 +639,17 @@ static void ggml_cuda_op_dflash_dyn_conv(ggml_backend_cuda_context & ctx, ggml_t
     const ggml_tensor * dyn  = dst->src[2];
     const int C    = (int)x->ne[0];
     const int T    = (int)x->ne[1];
+    const int L    = (int)x->ne[2];
     const int site = ggml_get_op_params_i32(dst, 1);
     const int K    = ggml_get_op_params_i32(dst, 2);
     const int gs   = ggml_get_op_params_i32(dst, 3);
     GGML_ASSERT(gs > 0 && C % gs == 0);
     const dim3 block(256);
-    const dim3 grid((unsigned)((C + 255) / 256), (unsigned)T, 1);
+    const dim3 grid((unsigned)((C + 255) / 256), (unsigned)T, (unsigned)L);
     dflash_dyn_conv_f32<<<grid, block, 0, ctx.stream()>>>(
         (const float *)x->data, (const float *)base->data, (const float *)dyn->data,
         (float *)dst->data, C, T, C / gs, gs, site, K,
-        (int64_t)(base->nb[1] / sizeof(float)), (int64_t)(dyn->nb[1] / sizeof(float)));
+        (int64_t)(base->nb[1] / sizeof(float)), (int64_t)dyn->ne[0]);
 }
 
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst) {

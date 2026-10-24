@@ -57,6 +57,18 @@ public:
     // chat and tool markup such as <|im_start|>, <tool_call>).
     bool is_added_token(int32_t id) const;
 
+    // Client text rendered into a chat template must not open or close
+    // turns: a file an agent reads may well contain <|im_end|>. This marks
+    // every control token in `text` (<|im_start|>, <|im_end|>,
+    // <|endoftext|>, ...) with kDefuseMark after its first byte, so encode()
+    // spells it as plain text. User-defined markup (<think>, <tool_call>)
+    // keeps matching, as in the HF tokenizers. Occurrences of `keep` (an
+    // image placeholder the server put there) are left alone.
+    std::string defuse_control_tokens(const std::string & text,
+                                      const std::string & keep = {}) const;
+    // U+FDD0, a Unicode noncharacter. encode() drops it from plain text.
+    static constexpr const char * kDefuseMark = "\xEF\xB7\x90";
+
 private:
     // Pre-tokenize text into pieces using Qwen3/3.5 regex pattern.
     std::vector<std::string> pre_tokenize(const std::string & text) const;
@@ -76,6 +88,9 @@ private:
     // Added special tokens (e.g. <think>, </think>) — sorted longest-first
     // for greedy matching during encode.
     std::vector<std::pair<std::string, int32_t>> added_tokens_;
+    // The control-typed subset (turn and document markers), for
+    // defuse_control_tokens.
+    std::vector<std::string> control_tokens_;
 
     // Special token IDs
     int32_t bos_id_ = -1;

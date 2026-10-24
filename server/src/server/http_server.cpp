@@ -4042,14 +4042,58 @@ void apply_request_reasoning(
     // reply reserve falls back to --hard-limit-reply-budget.)
 }
 
+// Client strings rendered into the template carry no control tokens: see
+// Tokenizer::defuse_control_tokens. Replayed turns are the server's own
+// generated text and keep their exact tokens.
+std::vector<ChatMessage> HttpServer::defuse_message_control_tokens(
+        const std::vector<ChatMessage> & messages) const {
+    const std::string keep = config_.image_input_enabled
+        ? backend_.image_placeholder()
+        : std::string();
+    std::function<void(json &)> defuse_json = [&](json & value) {
+        if (value.is_string()) {
+            value = tokenizer_.defuse_control_tokens(
+                value.get<std::string>());
+        } else if (value.is_object()) {
+            // Keys are client text too.
+            json defused = json::object();
+            for (auto & [key, item] : value.items()) {
+                defuse_json(item);
+                defused[tokenizer_.defuse_control_tokens(key)] =
+                    std::move(item);
+            }
+            value = std::move(defused);
+        } else if (value.is_array()) {
+            for (auto & item : value) defuse_json(item);
+        }
+    };
+    std::vector<ChatMessage> out = messages;
+    for (ChatMessage & message : out) {
+        if (message.tool_calls_replayed) continue;
+        message.content =
+            tokenizer_.defuse_control_tokens(message.content, keep);
+        message.reasoning_content =
+            tokenizer_.defuse_control_tokens(message.reasoning_content);
+        message.tool_name =
+            tokenizer_.defuse_control_tokens(message.tool_name);
+        for (ChatToolCall & call : message.tool_calls) {
+            call.name = tokenizer_.defuse_control_tokens(call.name);
+            defuse_json(call.arguments);
+        }
+    }
+    return out;
+}
+
 bool HttpServer::render_messages_to_text(
         const std::vector<ChatMessage> & chat_messages,
         const ParsedRequest & req, bool add_generation_prompt,
         std::string & rendered, std::string & error) {
     std::string tools_json;
     if (req.tools.is_array() && !req.tools.empty()) {
-        tools_json = req.tools.dump();
+        tools_json = tokenizer_.defuse_control_tokens(req.tools.dump());
     }
+    const std::vector<ChatMessage> defused =
+        defuse_message_control_tokens(chat_messages);
 
     if (!config_.chat_template_src.empty()) {
         // Custom templates receive structured calls and normalized schemas;
@@ -4066,7 +4110,7 @@ bool HttpServer::render_messages_to_text(
             : std::string();
         try {
             rendered = render_chat_template_jinja(
-                config_.chat_template_src, chat_messages, bos, eos,
+                config_.chat_template_src, defused, bos, eos,
                 add_generation_prompt,
                 req.thinking_enabled, tools_json,
                 config_.arch == "qwen4exp" ? qwen4exp_template_effort(req.reasoning_effort) : std::string(),
@@ -4077,7 +4121,7 @@ bool HttpServer::render_messages_to_text(
         }
     } else {
         rendered = render_chat_template(
-            chat_messages, chat_format_, add_generation_prompt,
+            defused, chat_format_, add_generation_prompt,
             req.thinking_enabled, tools_json, req.reasoning_effort);
     }
 
