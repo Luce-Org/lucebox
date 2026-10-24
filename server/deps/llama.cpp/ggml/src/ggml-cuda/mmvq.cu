@@ -855,6 +855,72 @@ static bool is_gfx1151(const int cc) {
     return cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
 }
 
+// Weight rows per wave on the batch-invariant Q8_0 multi-column launch. Override API, then
+// LUCE_MMVQ_INVARIANT_ROWS (1 = one row per wave as before, 2 / 4), then the default of two; only
+// where the device runs the single-column shape as one wave and the row count divides evenly.
+// gfx1151, qwen4exp T=5 verify: one row per wave streams the five-column
+// activation once per weight row and runs 1.45-1.8x off the single-column launch on the same bytes;
+// two rows share those loads (-3.8 ms per T=5 call across the dense Q8_0 trunk, every shape at or
+// below one row), four rows starve the 320-640-row projections and give the large ones nothing back.
+static int mmvq_invariant_rows(int64_t nrows_x, mmvq_parameter_table_id table_id) {
+    static const int env_rows = []() {
+        const char * e = std::getenv("LUCE_MMVQ_INVARIANT_ROWS");
+        return e ? std::atoi(e) : 0;
+    }();
+    int rows = ggml_cuda_mmvq_invariant_rows_override();
+    if (rows == 0) rows = env_rows;
+    if (rows == 0) rows = 2;
+    if (rows != 2 && rows != 4) return 1;
+    if (calc_nwarps(GGML_TYPE_Q8_0, 1, table_id) != 1 || nrows_x % rows != 0) return 1;
+    return rows;
+}
+
+// LDS activation staging on the same launch: waves per block (0 = off). Override API, then
+// LUCE_MMVQ_INVARIANT_LDS (0 = off, 4 / 8 / 16 / 32 waves), then the default. A block of that many waves
+// (each with its `rpb` weight rows) copies the T columns' q8_1 blocks into LDS, MMVQ_INVARIANT_LDS_CHUNK
+// blocks per column at a time, and every wave reads the activation from LDS instead of streaming it
+// through L0/L1 once per weight row; the weight stream stays as it is. Compiled for rows 2 with 4 / 8 / 16 /
+// 32 waves, rows 1 with 8 and rows 4 with 16; the row count must divide into whole blocks.
+#define MMVQ_INVARIANT_LDS_CHUNK 128
+#define MMVQ_INVARIANT_LDS_DEFAULT 16
+#define MMVQ_INVARIANT_LDS_MAX_BYTES 65536
+#define MMVQ_INVARIANT_LDS_PERSIST_MAX_ROWS 32768
+// Whole-K staging: the T columns' blocks fit the block's LDS, so a block stages them once and its waves
+// take weight-row groups from a block-local counter. Up to MMVQ_INVARIANT_LDS_PERSIST_MAX_ROWS rows the
+// launch is LUCE_MMVQ_INVARIANT_LDS_BLOCKS persistent blocks (default two per multiprocessor, 40 on gfx1151; the 2560-12288-row trunk
+// projections gain 5-10% over a block per 16 row groups), above it a block per 16 row groups (the 248320-row
+// lm head loses 4% to the per-group dispensing). Otherwise the activation is staged MMVQ_INVARIANT_LDS_CHUNK
+// blocks per column at a time and every wave handles one row group.
+static constexpr __host__ __device__ bool mmvq_invariant_lds_whole(int ncols_dst, int blocks_per_row) {
+    return ncols_dst*blocks_per_row*(int) sizeof(block_q8_1) <= MMVQ_INVARIANT_LDS_MAX_BYTES;
+}
+static int mmvq_invariant_lds_blocks(int nsm) {
+    static const int env_blocks = []() {
+        const char * e = std::getenv("LUCE_MMVQ_INVARIANT_LDS_BLOCKS");
+        return e ? std::atoi(e) : 0;
+    }();
+    return env_blocks > 0 ? env_blocks : 2*nsm;
+}
+// The requested waves if a compiled launch takes them, else 0. A block holds at most 1024 threads,
+// so 32 waves need 32-lane waves. Wave64 GCN/CDNA is refused today by its two-warp table entry too.
+static constexpr int mmvq_invariant_lds_fit(int waves, int rpb, int nwarps, int64_t nrows_x, int warp_size) {
+    return (waves == 4 || waves == 8 || waves == 16 || waves == 32) && waves*warp_size <= 1024 &&
+           !(rpb == 1 && waves != 8) && !(rpb == 4 && waves != 16) && nwarps == 1 && nrows_x % (rpb*waves) == 0
+        ? waves : 0;
+}
+static_assert(mmvq_invariant_lds_fit(32, 2, 1, 4096, 32) == 32 && mmvq_invariant_lds_fit(32, 2, 1, 4096, 64) == 0 &&
+              mmvq_invariant_lds_fit(16, 4, 1, 4096, 64) == 16, "a block holds at most 1024 threads");
+static int mmvq_invariant_lds_waves(int64_t nrows_x, int rpb, mmvq_parameter_table_id table_id, int warp_size) {
+    static const int env_waves = []() {
+        const char * e = std::getenv("LUCE_MMVQ_INVARIANT_LDS");
+        return e ? std::atoi(e) : -1;
+    }();
+    int waves = ggml_cuda_mmvq_invariant_lds_override();
+    if (waves < 0) waves = env_waves;
+    if (waves < 0) waves = MMVQ_INVARIANT_LDS_DEFAULT;
+    return mmvq_invariant_lds_fit(waves, rpb, calc_nwarps(GGML_TYPE_Q8_0, 1, table_id), nrows_x, warp_size);
+}
+
 // Dense projections at two to sixteen columns use the same weight row for
 // every column. Decode each packed ROCmFP4 fragment once while preserving the
 // original per-column DP4A and floating-point accumulation order, so every
@@ -970,12 +1036,58 @@ static __device__ __forceinline__ float vec_dot_iq_shared_grid(
     return d * sumi;
 }
 
+// vec_dot_q8_0_q8_1 with the q8_1 block's ints (ds, then qs) taken from an LDS copy of the block: the same
+// weight ints, the same activation ints and scales, the same vec_dot_q8_0_q8_1_impl chain.
+static __device__ __forceinline__ float vec_dot_q8_0_q8_1_lds(
+        const void * __restrict__ vbq, const int kbx, const int iqs, const int * ublk) {
+    const block_q8_0 * bq8_0 = (const block_q8_0 *) vbq + kbx;
+    int v[VDR_Q8_0_Q8_1_MMVQ];
+    int u[VDR_Q8_0_Q8_1_MMVQ];
+#pragma unroll
+    for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+        v[i] = get_int_b2(bq8_0->qs, iqs + i);
+        u[i] = ublk[1 + iqs + i];
+    }
+    const int ds_bits = ublk[0];
+    half2 ds;
+    memcpy(&ds, &ds_bits, sizeof(ds));
+    return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(ds));
+}
+
+// Copy blocks [c0, c0 + nbc) of every column of y into LDS, column after column (nbc*9 ints each); 16-byte
+// vectors where both ends are aligned, ints otherwise.
+template <int ncols>
+static __device__ __forceinline__ void mmvq_stage_q8_1_cols(
+        int * lds, const block_q8_1 * __restrict__ y, const uint32_t stride_col_y, const int c0, const int nbc,
+        const int ltid, const int nthreads) {
+    const int nints = nbc*(int) (sizeof(block_q8_1)/sizeof(int));
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+        const int * src = (const int *) (y + j*stride_col_y + c0);
+        int * dst = lds + j*nints;
+        if ((((uintptr_t) src) & 15) == 0 && (((uintptr_t) dst) & 15) == 0) {
+            const int nvec = nints/4;
+            for (int e = ltid; e < nvec; e += nthreads) {
+                ((int4 *) dst)[e] = ((const int4 *) src)[e];
+            }
+            for (int e = nvec*4 + ltid; e < nints; e += nthreads) {
+                dst[e] = src[e];
+            }
+        } else {
+            for (int e = ltid; e < nints; e += nthreads) {
+                dst[e] = src[e];
+            }
+        }
+    }
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false,
           int fixed_ncols_x = 0, bool unroll_k_loop_2 = false,
           bool reuse_rocmfp4_weights = false,
           bool c_fp3_packed24 = false, bool c_fp4_x4 = false,
-          bool c_width_invariant = false, int c_row_warps = 1, int c_wave_rows = 1>
-__launch_bounds__(calc_nwarps(type, c_width_invariant ? 1 : ncols_dst, get_device_table_id())*c_row_warps*ggml_cuda_get_physical_warp_size(), 1)
+          bool c_width_invariant = false, int c_row_warps = 1, int c_wave_rows = 1, int c_invariant_rpb = 1,
+          int c_invariant_lds_waves = 0>
+__launch_bounds__(calc_nwarps(type, c_width_invariant ? 1 : ncols_dst, get_device_table_id())*(c_invariant_lds_waves > 0 ? c_invariant_lds_waves : c_row_warps)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids, const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -999,7 +1111,13 @@ static __global__ void mul_mat_vec_q(
     // wave share the activation loads. The host launches it only where the
     // table picks one wave and one row.
     static_assert(c_wave_rows == 1 || c_row_warps > 1, "rows per wave need the multi-row block");
+    // c_invariant_rpb > 1 hands a width-invariant wave several weight rows: the per-row kbx traversal, per-lane
+    // accumulation and warp reduction are those of the single-row launch, the wave only shares the activation loads.
+    // Only meaningful on the single-wave block shape (the host selects it only there); other tables keep theirs.
+    static_assert(c_invariant_rpb == 1 || (c_width_invariant && c_row_warps == 1),
+                  "invariant rows per wave need a width-invariant single-row-warp launch");
     constexpr int rows_per_cuda_block = c_row_warps > 1 ? c_wave_rows :
+        (c_invariant_rpb > 1 && nwarps == 1 && !small_k) ? c_invariant_rpb :
         calc_rows_per_block(shape_cols, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -1014,15 +1132,26 @@ static __global__ void mul_mat_vec_q(
         NO_DEVICE_CODE;
         return;
     }
+    // c_invariant_lds_waves > 0: that many width-invariant waves share a block (and its LDS copy of the
+    // activation), each with its own rows_per_cuda_block weight rows; same contract as c_row_warps.
+    // The host launches it only where the device table runs the single-column shape as one wave (the
+    // host compilation pass and other tables see a plain kernel).
+    static_assert(c_invariant_lds_waves == 0 ||
+                  (type == GGML_TYPE_Q8_0 && c_width_invariant && c_row_warps == 1 &&
+                   MMVQ_INVARIANT_LDS_CHUNK % (vdr*warp_size/qi) == 0),
+                  "LDS-staged invariant launch needs Q8_0 width-invariant rows and whole iterations per chunk");
+    constexpr int lds_waves = (c_invariant_lds_waves > 0 && nwarps == 1 && rows_per_cuda_block == c_invariant_rpb)
+        ? c_invariant_lds_waves : 0;
+    constexpr int block_row_waves = c_row_warps > 1 ? c_row_warps : (lds_waves > 0 ? lds_waves : 1);
 #if defined(GGML_USE_HIP)
     // threadIdx.y is wave-uniform here; readfirstlane makes the row, and so
     // the weight and dst addressing, scalar.
-    const     int warp_row = c_row_warps > 1 ? __builtin_amdgcn_readfirstlane(threadIdx.y) : 0;
+    const     int warp_row = block_row_waves > 1 ? __builtin_amdgcn_readfirstlane(threadIdx.y) : 0;
 #else
-    const     int warp_row = c_row_warps > 1 ? (int) threadIdx.y : 0;
+    const     int warp_row = block_row_waves > 1 ? (int) threadIdx.y : 0;
 #endif // defined(GGML_USE_HIP)
-    const     int tid = c_row_warps > 1 ? (int) threadIdx.x : (int) (warp_size*threadIdx.y + threadIdx.x);
-    const     int row0 = rows_per_cuda_block*(c_row_warps*(int) blockIdx.x + warp_row);
+    const     int tid = block_row_waves > 1 ? (int) threadIdx.x : (int) (warp_size*threadIdx.y + threadIdx.x);
+    const     int row0 = rows_per_cuda_block*(block_row_waves*(int) blockIdx.x + warp_row);
     const     int blocks_per_row_x = (fixed_ncols_x > 0 ? fixed_ncols_x : ncols_x) / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
@@ -1121,7 +1250,7 @@ static __global__ void mul_mat_vec_q(
             const float * x_bias_base = x_bias + sample_dst*stride_sample_dst + row0;
             // 1. Hide latency by prefetching bias and gate here
             // 2. load only on threads that won't die after partial sum calculation
-            if (threadIdx.x < rows_per_cuda_block && (c_row_warps > 1 || threadIdx.y == 0) &&
+            if (threadIdx.x < rows_per_cuda_block && (block_row_waves > 1 || threadIdx.y == 0) &&
                 (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
@@ -1136,7 +1265,7 @@ static __global__ void mul_mat_vec_q(
         }
         if (use_gate_bias) {
             const float * gate_bias_base = gate_bias + sample_dst*stride_sample_dst + row0;
-            if (threadIdx.x < rows_per_cuda_block && (c_row_warps > 1 || threadIdx.y == 0) &&
+            if (threadIdx.x < rows_per_cuda_block && (block_row_waves > 1 || threadIdx.y == 0) &&
                 (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
@@ -1305,6 +1434,94 @@ static __global__ void mul_mat_vec_q(
                             if (use_gate) {
                                 tmp_gate[j][i] += vec_dot_q_mmvq<type, c_fp3_packed24>(
                                     vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if constexpr (lds_waves > 0) {
+        // The block stages the T activation columns' q8_1 blocks (their 36-byte memory layout, verbatim) in
+        // LDS and its waves dot weight rows against them from there. Whole-K staging (the columns fit the
+        // LDS): staged once, then the waves take row groups of rows_per_cuda_block rows from a block-local
+        // counter, block b owning row groups b, b + gridDim.x, b + 2 gridDim.x, ... so the launch sweeps the
+        // weights front to back like the one-column kernel (ids_stride carries the row count on this launch;
+        // ids is null; a per-block contiguous share put every block's stream on the same 4 KiB phase on
+        // attn_qkv and cost 30%). Otherwise MMVQ_INVARIANT_LDS_CHUNK blocks per
+        // column at a time for the wave's single row group. Either way each lane visits the kbx sequence of
+        // the one-column kernel (chunk bounds are multiples of blocks_per_iter), the q8_0/q8_1 ints and
+        // scales are the same values read from LDS instead of global memory, and the dp4a chain, per-lane
+        // accumulation and warp reduction are untouched.
+        extern __shared__ int mmvq_act_lds[];
+        constexpr int ints_per_block = sizeof(block_q8_1)/sizeof(int);
+        constexpr int lds_threads = warp_size*lds_waves;
+        const int ltid = warp_size*threadIdx.y + threadIdx.x;
+        const int kqs = vdr * (tid % (qi/vdr));
+        const int kbx_base = sample_x*stride_sample_x + channel_x*stride_channel_x;
+        if (!has_fusion && mmvq_invariant_lds_whole(ncols_dst, blocks_per_row_x)) {
+            __shared__ int next_rg;
+            const int nints = blocks_per_row_x*ints_per_block;
+            mmvq_stage_q8_1_cols<ncols_dst>(mmvq_act_lds, y, stride_col_y, 0, blocks_per_row_x, ltid, lds_threads);
+            if (ltid == 0) {
+                next_rg = 0;
+            }
+            __syncthreads();
+            const int nrg = (int) ids_stride / rows_per_cuda_block;
+            float * dst_base = dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst;
+            for (;;) {
+                int rg = 0;
+                if (threadIdx.x == 0) {
+                    rg = atomicAdd(&next_rg, 1);
+                }
+                rg = blockIdx.x + __shfl_sync(0xffffffff, rg, 0, warp_size)*gridDim.x;
+                if (rg >= nrg) {
+                    break;
+                }
+                const int rowp = rg*rows_per_cuda_block;
+                const int kbx_offset = kbx_base + rowp*stride_row_x;
+                float acc[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+                for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        const int * ublk = mmvq_act_lds + j*nints + kbx*ints_per_block;
+#pragma unroll
+                        for (int i = 0; i < rows_per_cuda_block; ++i) {
+                            acc[j][i] += vec_dot_q8_0_q8_1_lds(vx, kbx_offset + i*stride_row_x + kbx, kqs, ublk);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        acc[j][i] = warp_reduce_sum<warp_size>(acc[j][i]);
+                    }
+                    if (threadIdx.x < rows_per_cuda_block) {
+                        dst_base[j*stride_col_dst + rowp + threadIdx.x] = acc[j][threadIdx.x];
+                    }
+                }
+            }
+            return;
+        }
+        const int kbx_offset = kbx_base + row0*stride_row_x;
+        for (int c0 = 0; c0 < blocks_per_row_x; c0 += MMVQ_INVARIANT_LDS_CHUNK) {
+            const int nbc = min(MMVQ_INVARIANT_LDS_CHUNK, blocks_per_row_x - c0);
+            const int nints = nbc*ints_per_block;
+            if (c0 > 0) {
+                __syncthreads();  // every wave is done with the previous chunk
+            }
+            mmvq_stage_q8_1_cols<ncols_dst>(mmvq_act_lds, y, stride_col_y, c0, nbc, ltid, lds_threads);
+            __syncthreads();
+            for (int kbx = c0 + tid / (qi/vdr); kbx < c0 + nbc; kbx += blocks_per_iter) {
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const int * ublk = mmvq_act_lds + j*nints + (kbx - c0)*ints_per_block;
+#pragma unroll
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        tmp[j][i] += vec_dot_q8_0_q8_1_lds(vx, kbx_offset + i*stride_row_x + kbx, kqs, ublk);
+                        if constexpr (has_fusion) {
+                            if (use_gate) {
+                                tmp_gate[j][i] += vec_dot_q8_0_q8_1_lds(vgate, kbx_offset + i*stride_row_x + kbx, kqs, ublk);
                             }
                         }
                     }
@@ -2198,13 +2415,15 @@ template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false,
-        const bool width_invariant = false) {
+        const bool width_invariant = false, const int invariant_rpb = 1, const int invariant_lds_waves = 0) {
     const int shape_cols = width_invariant ? 1 : ncols_dst;
     const int nwarps = calc_nwarps(type, shape_cols, table_id);
-    const int rpb = calc_rows_per_block(shape_cols, table_id, small_k, nwarps);
-    const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
+    const int rpb = (width_invariant && invariant_rpb > 1 && nwarps == 1 && !small_k)
+        ? invariant_rpb : calc_rows_per_block(shape_cols, table_id, small_k, nwarps);
+    const int block_waves = invariant_lds_waves > 0 ? invariant_lds_waves : 1;
+    const int64_t nblocks = (nrows_x + rpb*block_waves - 1) / (rpb*block_waves);
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
-    const dim3 block_dims(warp_size, nwarps, 1);
+    const dim3 block_dims(warp_size, nwarps*block_waves, 1);
     return {block_nums, block_dims};
 }
 
@@ -2212,7 +2431,7 @@ template<ggml_type type, int c_ncols_dst, bool small_k = false,
          int fixed_ncols_x = 0, bool unroll_k_loop_2 = false,
          bool reuse_rocmfp4_weights = false,
          bool fp3_packed24 = false, bool fp4_x4 = false,
-         bool width_invariant = false, int row_warps = 1, int wave_rows = 1>
+         bool width_invariant = false, int row_warps = 1, int wave_rows = 1, int invariant_rpb = 1, int invariant_lds_waves = 0>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -2226,7 +2445,7 @@ static void mul_mat_vec_q_switch_fusion(
     if (has_fusion) {
         mul_mat_vec_q<type, c_ncols_dst, true, small_k, fixed_ncols_x,
                       unroll_k_loop_2, reuse_rocmfp4_weights, fp3_packed24,
-                      fp4_x4, width_invariant, row_warps, wave_rows><<<block_nums, block_dims, nbytes_shared, stream>>>
+                      fp4_x4, width_invariant, row_warps, wave_rows, invariant_rpb, invariant_lds_waves><<<block_nums, block_dims, nbytes_shared, stream>>>
             (vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
              channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
              sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ids_tokenwise_samples);
@@ -2235,7 +2454,7 @@ static void mul_mat_vec_q_switch_fusion(
 
     mul_mat_vec_q<type, c_ncols_dst, false, small_k, fixed_ncols_x,
                   unroll_k_loop_2, reuse_rocmfp4_weights, fp3_packed24,
-                  fp4_x4, width_invariant, row_warps, wave_rows><<<block_nums, block_dims, nbytes_shared, stream>>>
+                  fp4_x4, width_invariant, row_warps, wave_rows, invariant_rpb, invariant_lds_waves><<<block_nums, block_dims, nbytes_shared, stream>>>
         (vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ids_tokenwise_samples);
@@ -3163,18 +3382,43 @@ static void mul_mat_vec_q_switch_ncols_dst(
     GGML_ASSERT(!has_fusion || has_ids || ncols_dst == 1);
     if constexpr (type == GGML_TYPE_Q8_0) {
         if (width_invariant) {
-#define GGML_MMVQ_INVARIANT_LAUNCH(NC) \
-            case NC: { \
+            const int rpb = mmvq_invariant_rows(nrows_x, table_id);
+            const int lds_waves = mmvq_invariant_lds_waves(nrows_x, rpb, table_id, warp_size);
+            const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+            const bool lds_whole = lds_waves > 0 && !has_fusion && mmvq_invariant_lds_whole(ncols_dst, ncols_x/QK8_0);
+            const int lds_bytes = lds_waves > 0
+                ? ncols_dst*(lds_whole ? ncols_x/QK8_0 : std::min<int>(MMVQ_INVARIANT_LDS_CHUNK, ncols_x/QK8_0))*(int) sizeof(block_q8_1) : 0;
+            // Whole-K staging runs persistent blocks up to MMVQ_INVARIANT_LDS_PERSIST_MAX_ROWS rows: at most
+            // LUCE_MMVQ_INVARIANT_LDS_BLOCKS (two per CU), never more than the row groups give each wave one; the
+            // kernel learns the row count through ids_stride.
+            const int64_t lds_nrg = nrows_x / rpb;
+            const int lds_grid = lds_whole ? (int) std::max<int64_t>(1, std::min<int64_t>(
+                nrows_x <= MMVQ_INVARIANT_LDS_PERSIST_MAX_ROWS
+                    ? mmvq_invariant_lds_blocks(ggml_cuda_info().devices[ggml_cuda_get_device()].nsm) : INT32_MAX,
+                (lds_nrg + lds_waves - 1) / lds_waves)) : 0;
+#define GGML_MMVQ_INVARIANT_LAUNCH_RPB(NC, RPB, LDSW) \
+            case NC*128 + RPB*16 + LDSW/4: { \
                 std::pair<dim3, dim3> dims = calc_launch_params<type>( \
-                    NC, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, true); \
-                mul_mat_vec_q_switch_fusion<type, NC, false, 0, false, false, false, false, true>( \
+                    NC, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, true, RPB, LDSW); \
+                if (lds_whole) dims.first.x = lds_grid; \
+                mul_mat_vec_q_switch_fusion<type, NC, false, 0, false, false, false, false, true, 1, 1, RPB, LDSW>( \
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, \
                     stride_row_x, stride_col_y, stride_col_dst, \
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, \
                     sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, \
-                    dims.first, dims.second, 0, ids_stride, stream); \
+                    dims.first, dims.second, lds_bytes, LDSW > 0 ? (uint32_t) nrows_x : ids_stride, stream); \
             } break
-            switch (ncols_dst) {
+#define GGML_MMVQ_INVARIANT_LAUNCH(NC) \
+            GGML_MMVQ_INVARIANT_LAUNCH_RPB(NC, 1, 0); \
+            GGML_MMVQ_INVARIANT_LAUNCH_RPB(NC, 2, 0); \
+            GGML_MMVQ_INVARIANT_LAUNCH_RPB(NC, 4, 0); \
+            GGML_MMVQ_INVARIANT_LAUNCH_RPB(NC, 1, 8); \
+            GGML_MMVQ_INVARIANT_LAUNCH_RPB(NC, 2, 4); \
+            GGML_MMVQ_INVARIANT_LAUNCH_RPB(NC, 2, 8); \
+            GGML_MMVQ_INVARIANT_LAUNCH_RPB(NC, 2, 16); \
+            GGML_MMVQ_INVARIANT_LAUNCH_RPB(NC, 2, 32); \
+            GGML_MMVQ_INVARIANT_LAUNCH_RPB(NC, 4, 16)
+            switch (ncols_dst*128 + rpb*16 + lds_waves/4) {
                 GGML_MMVQ_INVARIANT_LAUNCH(2);
                 GGML_MMVQ_INVARIANT_LAUNCH(3);
                 GGML_MMVQ_INVARIANT_LAUNCH(4);
@@ -3185,6 +3429,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 default: GGML_ABORT("unreachable batch-invariant width");
             }
 #undef GGML_MMVQ_INVARIANT_LAUNCH
+#undef GGML_MMVQ_INVARIANT_LAUNCH_RPB
             return;
         }
     }

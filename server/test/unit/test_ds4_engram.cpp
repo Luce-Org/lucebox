@@ -265,6 +265,24 @@ TEST_CASE(DeepSeek4EngramFixture, dead_slot_blocks_longer_ngrams) {
     CHECK(std::equal(fresh.begin(), fresh.end(), blocked.begin() + 2 * kLayers * kCols));
 }
 
+TEST_CASE(DeepSeek4EngramFixture, ids_outside_the_vocabulary_are_not_text) {
+    // The engine's image-span ids sit at and above the vocabulary: dead slots.
+    DeepSeek4EngramHasher hasher;
+    CHECK(make_hasher(hasher, nullptr));
+    CHECK(hasher.is_text(0) && hasher.is_text(kVocab - 1));
+    CHECK(!hasher.is_text(kVocab) && !hasher.is_text(kVocab + 4) && !hasher.is_text(-1));
+    // An image-span id hashes as a dead slot: the token after it starts fresh.
+    const int32_t with_image[3] = {7, kVocab + 2, 39};
+    const int32_t text[3] = {7, 0, 39};
+    const uint8_t dead[3] = {0, 1, 0};
+    std::vector<uint32_t> from_ids(3 * kLayers * kCols), from_mask(3 * kLayers * kCols);
+    DeepSeek4EngramHistory h1, h2;
+    hasher.hash(h1, with_image, nullptr, 3, from_ids.data());
+    hasher.hash(h2, text, dead, 3, from_mask.data());
+    CHECK(from_ids == from_mask);
+    CHECK(h1.tail[0] == h2.tail[0] && h1.tail[1] == DeepSeek4EngramHistory::kDead);
+}
+
 TEST_CASE(DeepSeek4EngramFixture, init_rejects_inconsistent_constants) {
     DeepSeek4EngramHasher hasher;
     std::vector<uint64_t> offsets, rows;

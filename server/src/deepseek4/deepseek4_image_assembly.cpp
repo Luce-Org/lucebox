@@ -21,7 +21,9 @@ bool finite(const std::vector<float> & values) {
 }
 void layout_valid(const ImageLayout & layout) {
     const auto & span = layout.span;
-    require(valid_image_spans({&span, 1}, span.block_end) &&
+    // The builder held the block to its checkpoint's budget; here only the
+    // larger of the two bounds the arithmetic.
+    require(valid_image_spans({&span, 1}, span.block_end, DS41V_MAX_IMAGE_BLOCK_TOKENS) &&
             span.block_end - span.block_begin == layout.types.size(), "invalid image layout span");
     size_t images = 0;
     for (size_t row = 0; row < layout.types.size(); ++row) {
@@ -48,9 +50,10 @@ void layout_valid(const ImageLayout & layout) {
     }
 }
 void sentinels_valid(const ImageSentinels & s, size_t dimension) {
-    for (const auto * row : {&s.start, &s.pad, &s.newline, &s.end}) {
+    for (const auto * row : {&s.start, &s.newline, &s.end}) {
         require(row->size() == dimension && dimension && finite(*row), "invalid image sentinel row");
     }
+    require(s.pad.empty() || (s.pad.size() == dimension && finite(s.pad)), "invalid image sentinel row");
 }
 void cancelled(const ImageCancelled & callback) {
     require(!callback || !callback(), "image materialization cancelled");
@@ -73,7 +76,10 @@ bool assemble_image_rows(const ImageLayout & layout, const ImageRaster & raster,
             const float * source = nullptr;
             switch (layout.types[row]) {
                 case ImageTokenType::Start: source = sentinels.start.data(); break;
-                case ImageTokenType::Pad: source = sentinels.pad.data(); break;
+                case ImageTokenType::Pad:
+                    require(!sentinels.pad.empty(), "image layout pads but the projector has no pad row");
+                    source = sentinels.pad.data();
+                    break;
                 case ImageTokenType::Newline: source = sentinels.newline.data(); break;
                 case ImageTokenType::End: source = sentinels.end.data(); break;
                 case ImageTokenType::Image:

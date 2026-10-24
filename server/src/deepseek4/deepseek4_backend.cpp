@@ -7,6 +7,7 @@
 #include "thinking_budget.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_image_spans.h"
+#include "../common/paged_attention_config.h"
 #include "deepseek4_image_budget.h"
 #include "deepseek4_image_assembly.h"
 #include "deepseek4_image_admission.h"
@@ -1409,7 +1410,7 @@ ImagePrepareStatus DeepSeek4Backend::prepare_images(
             encoded_bytes += image.bytes.size();
             auto decoded = vision::decode_image({image.bytes.data(), image.bytes.size()});
             if (!decoded) { error = decoded.status.message; return ImagePrepareStatus::invalid; }
-            auto processed = vision::preprocess_rgb(decoded.image.view(), 0);
+            auto processed = vision::preprocess_rgb(decoded.image.view(), 0, image_recipe());
             if (!processed) { error = processed.status.message; return ImagePrepareStatus::invalid; }
             patches.push_back({processed.image.plan, std::move(processed.image.patches_bf16)});
         }
@@ -1417,11 +1418,12 @@ ImagePrepareStatus DeepSeek4Backend::prepare_images(
         limits.context_capacity = context_capacity;
         limits.output_reserve = output_reserve;
         limits.max_expanded_tokens = std::min(context_capacity, vision::MAX_PREPARED_PROMPT_TOKENS);
-        auto prepared = vision::prepare_image_prompt(tokens, patches, limits);
+        auto prepared = vision::prepare_image_prompt(tokens, patches, limits, {}, image_recipe());
         if (!prepared) { error = prepared.message; return ImagePrepareStatus::invalid; }
         auto binding = std::shared_ptr<DeepSeek4ImagePrompt>(
             new DeepSeek4ImagePrompt(this, std::move(prepared), std::move(images)));
-        if (!vision::valid_image_spans(binding->spans(), binding->prepared_.tokens.size())) {
+        if (!vision::valid_image_spans(binding->spans(), binding->prepared_.tokens.size(),
+                                       vision::max_image_block_tokens(deepseek4_is_v41(w_)))) {
             error = "invalid prepared image spans";
             return ImagePrepareStatus::invalid;
         }
@@ -1463,6 +1465,23 @@ DeepSeek4Cache * DeepSeek4Backend::image_staging_cache(int slot) {
     return image_staging_caches_[size_t(slot) - 1].get();
 }
 
+static void ds4_trim_device_pools(ggml_backend_t backend, const MoeHybridStorage * moe_hybrid) {
+    ggml_backend_cuda_trim_pool(backend);
+    if (moe_hybrid && moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend) {
+        ggml_backend_cuda_trim_pool(moe_hybrid->cold_backend);
+    }
+}
+
+void DeepSeek4Backend::release_staged_prefill_scratch(DeepSeek4Cache & staging) {
+    deepseek4_release_prefill_scratch(staging, moe_hybrid_.get());
+    ds4_trim_device_pools(backend_, moe_hybrid_.get());
+}
+
+void DeepSeek4Backend::release_paged_decode_graphs() {
+    deepseek4_release_paged_gathered_graphs(paged_cache_);
+    ds4_trim_device_pools(backend_, moe_hybrid_.get());
+}
+
 bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item) {
     // Without images the item is a text prompt (sparse text staging).
     const auto * images = item.images
@@ -1479,15 +1498,10 @@ bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item) {
     return true;
 }
 
-bool DeepSeek4Backend::run_staged_text_chunk(StagedPrefill & item, int max_rows,
-                                             std::string & error) {
+int DeepSeek4Backend::staged_chunk_rows(const StagedPrefill & item, int max_rows) const {
     constexpr int min_rows = DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS;
-    if (item.images || !item.staging || item.finished() ||
-        !moe_hybrid_ || !(expert_runtime_.compute || expert_backend_)) {
-        error = "staged text prefill is not available for this placement";
-        return false;
-    }
     const int remaining = item.prefix - item.done;
+    if (remaining <= 0) return 0;
     // The row budget is the caller's (it trades decode stalls against the
     // per-chunk fixed cost); only the late-context scratch bound applies.
     // Same placement-aware cap as single-request sparse prefill: only the
@@ -1495,13 +1509,54 @@ bool DeepSeek4Backend::run_staged_text_chunk(StagedPrefill & item, int max_rows,
     const int capped = deepseek4_hybrid_prefill_chunk_tokens(
         std::max(min_rows, max_rows), item.prefix,
         hybrid_prefill_chunk_cap_, hybrid_long_context_chunk_);
+    const auto * images = item.images
+        ? dynamic_cast<const DeepSeek4ImagePrompt *>(item.images.get()) : nullptr;
+    if (images) {
+        // Whole image blocks only; a block with the short text before it may
+        // exceed the budget.
+        return vision::staged_prefill_chunk(images->spans(), uint64_t(item.done), remaining,
+                                            std::max(min_rows, capped), min_rows);
+    }
     int n = deepseek4_hybrid_prefill_step_tokens(
         std::max(min_rows, capped), item.done, remaining);
     n = std::min(n, remaining);
     if (n < remaining && remaining - n < min_rows) n = remaining - min_rows;
     if (n < min_rows) n = remaining;  // the whole short tail in one chunk
+    return n;
+}
+
+bool DeepSeek4Backend::staged_chunk_ready(const StagedPrefill & item, int max_rows) const {
+    const auto * images = item.images
+        ? dynamic_cast<const DeepSeek4ImagePrompt *>(item.images.get()) : nullptr;
+    if (!images) return true;
+    if (images->stream_failed()) return true;  // run_staged_chunk reports it
+    const int n = staged_chunk_rows(item, max_rows);
+    return n <= 0 || images->images_ready(size_t(item.done), size_t(n));
+}
+
+bool DeepSeek4Backend::run_staged_chunk(StagedPrefill & item, int max_rows,
+                                        std::string & error) {
+    const auto * images = item.images
+        ? dynamic_cast<const DeepSeek4ImagePrompt *>(item.images.get()) : nullptr;
+    if ((item.images && (!images || !staged_images_use_chunks())) || !item.staging ||
+        item.finished() || !moe_hybrid_ || !(expert_runtime_.compute || expert_backend_)) {
+        error = "staged prefill is not available for this placement";
+        return false;
+    }
+    if (images && images->stream_failed()) {
+        error = "image encoding failed";
+        return false;
+    }
+    const int n = staged_chunk_rows(item, max_rows);
+    if (n <= 0) {
+        error = "staged prefill could not be chunked";
+        return false;
+    }
     std::vector<float> embed(size_t(n) * size_t(w_.n_embd));
-    if (!w_.embedder.embed(item.prompt.data() + item.done, n, embed.data())) {
+    const bool embedded = images
+        ? images->embed_chunk(w_.embedder, size_t(item.done), n, embed.data())
+        : w_.embedder.embed(item.prompt.data() + item.done, n, embed.data());
+    if (!embedded) {
         error = "staged prefill embedding failed";
         return false;
     }
@@ -1512,8 +1567,8 @@ bool DeepSeek4Backend::run_staged_text_chunk(StagedPrefill & item, int max_rows,
             item.prompt.data() + item.done, nullptr,
             /*allow_decode_graph_reuse=*/true, nullptr, moe_hybrid_.get(),
             expert_runtime_.compute ? &expert_runtime_ : nullptr,
-            routing_stats_.get(), vision::ImageSpanView{})) {
-        error = "staged text prefill failed";
+            routing_stats_.get(), images ? images->spans() : vision::ImageSpanView{})) {
+        error = images ? "staged image prefill failed" : "staged text prefill failed";
         return false;
     }
     item.done += n;
@@ -1828,8 +1883,28 @@ bool DeepSeek4Backend::init_single_gpu_vision() {
 #endif
 }
 
+vision::PreprocessConfig DeepSeek4Backend::image_recipe() const {
+    const vision::VisionConfig * config = vision_ ? vision_->config() : nullptr;
+    return config && config->variant == vision::VisionVariant::V41
+        ? vision::v41_preprocess_config() : vision::PreprocessConfig{};
+}
+
 bool DeepSeek4Backend::load_vision() {
     if (cfg_.mmproj_path.empty()) return true;
+    // V4 image blocks attend bidirectionally, which only the sparse attention
+    // builds (batched serving prefills its images into a sparse staging cache);
+    // V4.1 attends causally over images, so its dense prefill takes them.
+    if (!deepseek4_is_v41(w_) && cfg_.prefill_mode != PrefillAttentionMode::Sparse &&
+        !cfg_.paged_attention) {
+        std::fprintf(stderr, "[deepseek4] --mmproj with DeepSeek V4 requires --ds4-prefill sparse\n");
+        return false;
+    }
+    if (deepseek4_is_v41(w_) && cfg_.prefill_mode == PrefillAttentionMode::Exact &&
+        !cfg_.paged_attention) {
+        std::fprintf(stderr, "[deepseek4] --mmproj with DeepSeek V4.1 needs a batched prefill "
+                             "(--ds4-prefill dense or sparse)\n");
+        return false;
+    }
     // The projector checks the decoder's width and vocabulary when it loads.
     // Here: every layer carries a finite F32[n_expert] image router bias.
     std::vector<float> values(size_t(w_.n_expert));
@@ -1868,13 +1943,24 @@ bool DeepSeek4Backend::load_vision() {
         std::fprintf(stderr, "[deepseek4] projector load failed: %s\n", error.c_str());
         return false;
     }
+    const vision::VisionConfig & vision_cfg = *runtime->config();
+    const bool v41_projector = vision_cfg.variant == vision::VisionVariant::V41;
+    const std::string mismatch =
+        vision::projector_mismatch(vision_cfg, deepseek4_is_v41(w_), w_.source_revision);
+    if (!mismatch.empty()) {
+        std::fprintf(stderr, "[deepseek4] %s\n", mismatch.c_str());
+        return false;
+    }
     std::fprintf(stderr,
-        "[deepseek4] vision weights=%.3f GiB scratch reservation=%.3f GiB on %s\n",
+        "[deepseek4] vision weights=%.3f GiB scratch reservation=%.3f GiB on %s (DeepSeek %s projector%s%s)\n",
         gib(runtime->weight_bytes()), gib(vision::SCRATCH_RESERVATION),
-        vision_backend_ ? "the --mmproj-device GPU" : "the target GPU, before expert placement");
+        vision_backend_ ? "the --mmproj-device GPU" : "the target GPU, before expert placement",
+        v41_projector ? "V4.1" : "V4",
+        vision_cfg.source_revision.empty() ? "" : ", checkpoint ",
+        vision_cfg.source_revision.empty() ? "" : vision_cfg.source_revision.substr(0, 8).c_str());
     vision::ImageSentinels sentinels;
     if (!runtime->sentinel(vision::Sentinel::Start, sentinels.start, error) ||
-        !runtime->sentinel(vision::Sentinel::Pad, sentinels.pad, error) ||
+        (vision_cfg.has_pad_sentinel && !runtime->sentinel(vision::Sentinel::Pad, sentinels.pad, error)) ||
         !runtime->sentinel(vision::Sentinel::Newline, sentinels.newline, error) ||
         !runtime->sentinel(vision::Sentinel::End, sentinels.end, error)) {
         std::fprintf(stderr, "[deepseek4] projector sentinels unavailable: %s\n", error.c_str());
@@ -1910,8 +1996,6 @@ bool DeepSeek4Backend::validate_model_features() const {
         unsupported = "the fused verifier's F16 K/V";
     } else if (cfg_.device.is_layer_split()) {
         unsupported = "layer split";
-    } else if (!cfg_.mmproj_path.empty()) {
-        unsupported = "--mmproj";
     }
     if (!w_.protected_experts.empty() && !w_.moe_hybrid) {
         std::fprintf(stderr, "[deepseek4] --ds4-protected-experts applies on the host routing of the "
@@ -1927,16 +2011,7 @@ bool DeepSeek4Backend::validate_model_features() const {
     // only: with these switches it has faulted the GPU (see DS41.md, known
     // limits), so refuse them until that is understood.
     if (cfg_.paged_attention) {
-        static const char * const unqualified[] = {
-            "LUCE_DS4_TP_GROUPED_MMVQ", "LUCE_MOE_TP_GROUPED_MMVQ", "LUCE_MMID_GROUPED",
-            "LUCE_DS4_TP_NATIVE_ROUTE_WIDTH", "LUCE_DS4_TP_MASKED_ROUTES",
-            "LUCE_DS4_TP_BATCH_SPLIT_COPIES", "GGML_CUDA_BATCH_PEER_COPIES", "GGML_BATCH_PEER_COPIES",
-            "LUCE_DS4_TP_DEVICE_JOIN", "LUCE_MOE_TP_DEVICE_JOIN", "LUCE_DS4_TP_DEVICE_JOIN_SPLIT",
-            "LUCE_DS4_TP_FUSED_HC_JOIN", "LUCE_DS4_TP_ROUTE_PREFORK", "LUCE_MOE_TP_ROUTE_PREFORK",
-            "LUCE_DS4_TP_COARSE_OWNER", "LUCE_MOE_TP_COARSE_OWNER", "LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS",
-            "LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK",
-        };
-        for (const char * name : unqualified) {
+        for (const char * name : DEEPSEEK41_PAGED_UNQUALIFIED_ENV) {
             if (env_flag_enabled(name)) {
                 std::fprintf(stderr, "[deepseek4] %s is not qualified with paged serving of %s "
                              "(see server/docs/DS41.md); unset it or drop --paged-attention\n",
@@ -2354,19 +2429,17 @@ bool DeepSeek4Backend::load_model() {
     const bool heterogeneous_tp = env_flag_enabled("LUCE_DS4_MOE_TP");
     if (!cfg_.mmproj_path.empty()) {
         // Images run on one HIP GPU holding the whole model, or on two HIP GPUs
-        // that split the experts in process. Both need batched sparse prefill.
+        // that split the experts in process. The prefill each model family
+        // needs is checked once its weights name the family (load_vision).
         const auto tp = ds4_moe_tp_config(cfg_.device.gpu);
         const bool two_gpu_ok = tp.in_process && tp.backend_valid &&
             tp.secondary_backend == PlacementBackend::Hip &&
             tp.secondary_gpu != cfg_.device.gpu && !tp.all_on_secondary && !force_full;
-        // Batched serving keeps exact prefill for text; its image admissions
-        // prefill into a sparse staging cache instead.
         if (target_backend != PlacementBackend::Hip || cfg_.device.is_layer_split() ||
-            (cfg_.prefill_mode != PrefillAttentionMode::Sparse && !cfg_.paged_attention) ||
             (tp.requested && !two_gpu_ok) ||
             env_flag_enabled("LUCE_DS4_DENSE_TP_MASK")) {
-            std::fprintf(stderr, "[deepseek4] --mmproj requires a HIP target with --ds4-prefill sparse, "
-                                 "on one GPU or with in-process expert owners on two distinct GPUs\n");
+            std::fprintf(stderr, "[deepseek4] --mmproj requires a HIP target, on one GPU or with "
+                                 "in-process expert owners on two distinct GPUs\n");
             return false;
         }
         if (cfg_.mmproj_gpu >= 0 && tp.requested) {
@@ -3116,10 +3189,13 @@ bool DeepSeek4Backend::init_streamed_expert_tier() {
     MoeHybridStorage * hybrid = moe_hybrid_.get();
     if (!hybrid || !hybrid->stream_engine || stream_cache_device_ < 0) return true;
     std::string err;
-    // The cache takes what the device has left beyond its headroom.
+    // The cache takes what the device has left beyond its headroom, less room
+    // for what it allocates after sizing its slots (its backend, the pinned
+    // loader staging and the mapped mailbox, which an APU takes from the same
+    // memory); without it the load check finds the device a few MiB short.
     MoeExpertCacheOptions cache_opts;
     cache_opts.device = stream_cache_device_;
-    cache_opts.reserve_bytes = ds4_device_headroom_bytes(cache_opts.device);
+    cache_opts.reserve_bytes = ds4_device_headroom_bytes(cache_opts.device) + ((size_t) 128 << 20);
     cache_opts.direct_path = cfg_.model_path;
     // Once experts are locked in host memory the page cache is too small to
     // hold the streamed tier, so every load reads the drive directly.
@@ -3318,6 +3394,21 @@ int DeepSeek4Backend::restore_safe_prefill_tokens(int pos, int requested_tokens,
     const auto next = std::upper_bound(restore_points.begin(), restore_points.end(), pos);
     return next != restore_points.end() && *next < pos + requested_tokens
         ? *next - pos : requested_tokens;
+}
+
+// The first chunk after a restored prefix. A restore point fewer than
+// DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS rows past the restore would leave a chunk
+// for the decode-shaped path, which at a long context runs out of memory beside
+// the model. PFlash re-renders the end of the last turn, so its snapshot can land
+// a few tokens before the next turn's boundary. That chunk runs on to the next
+// restore point instead, and the chunks after it still match a cold prefill.
+int DeepSeek4Backend::restored_prefill_first_tokens(int pos, int requested_tokens,
+                                                    const std::vector<int> & restore_points) {
+    int n_tok = restore_safe_prefill_tokens(pos, requested_tokens, restore_points);
+    while (n_tok < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS && n_tok < requested_tokens) {
+        n_tok += restore_safe_prefill_tokens(pos + n_tok, requested_tokens - n_tok, restore_points);
+    }
+    return n_tok;
 }
 
 bool DeepSeek4Backend::init_moe_tensor_parallel() {
@@ -4462,7 +4553,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         // A batched chunk's numerics depend on where it starts. Start one at
         // every position a later request may restore from, so the chunks after
         // a restore are exactly the ones a cold prefill of the prompt runs.
-        n_tok = restore_safe_prefill_tokens(pos, n_tok, restore_points);
+        n_tok = kv_offset > 0 && i == 0
+            ? restored_prefill_first_tokens(pos, n_tok, restore_points)
+            : restore_safe_prefill_tokens(pos, n_tok, restore_points);
         // The replay rows start a chunk of their own.
         if (replay && i < replay_from && i + n_tok > replay_from) {
             n_tok = replay_from - i;

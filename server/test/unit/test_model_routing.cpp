@@ -99,7 +99,7 @@ public:
             active[i] = true;
             prompts.push_back(prompt);
             temperatures.push_back(sampler.temp);
-            ++admissions;
+            admission_of[(size_t)i] = ++admissions;
             cv.notify_all();
             return {AdmitResult::Status::admitted, i, {}};
         }
@@ -120,9 +120,10 @@ public:
             return result;
         }
         for (const auto & slice : plan.prefills) {
+            const int32_t first = admission_of[(size_t)slice.slot] > 1 ? subsequent_first_token : 0;
             result.prefills.push_back({slice.slot,
                 release ? PrefillOutput::Status::completed : PrefillOutput::Status::advanced,
-                release ? 0 : -1, {}});
+                release ? first : -1, {}});
         }
         for (const auto & input : plan.decode) {
             ROUTING_CHECK(!suspended[(size_t)input.slot]);
@@ -274,6 +275,8 @@ public:
     bool release = false, fail_next = false, block_step = false, inside_block = false;
     int attempts = 0;
     int admissions = 0, retirements = 0;
+    int32_t subsequent_first_token = 0;
+    std::array<int, 2> admission_of{};
     std::vector<std::vector<int32_t>> prompts;
     std::vector<float> temperatures;
 };
@@ -640,6 +643,39 @@ TEST_CASE(ModelRoutingFixture, test_responses_nonstream_preserves_prose_and_mult
                           json({{"path", index == 1 ? "." : "README.md"}}));
         }
         ROUTING_CHECK(output.at(1).at("call_id") != output.at(2).at("call_id"));
+    }
+}
+
+TEST_CASE(ModelRoutingFixture, test_tool_choice_none_re_asks_once_for_a_tool_free_reply) {
+    const char * calls =
+        "Listing.\n<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=read>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>";
+    json request = chat();
+    request["tool_choice"] = "none";
+    request["tools"] = json::parse(R"([
+        {"type": "function", "function": {"name": "ls",
+         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}},
+        {"type": "function", "function": {"name": "read",
+         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}
+    ])");
+    // Test both a successful retry and one that still calls tools.
+    for (int32_t re_ask_token : {3, 0}) {
+        RunningModels models(false, false, false, 0, false, 0, calls);
+        {
+            std::lock_guard<std::mutex> lock(models.first.engine.mu);
+            models.first.engine.subsequent_first_token = re_ask_token;
+        }
+        models.first.engine.finish();
+        const auto body = response_body(models.post(request).read());
+        const auto & choice = body.at("choices").at(0);
+        // Either way no tool call reaches the client: a retry that still
+        // calls tools goes out as its text alone.
+        const std::string content = choice.at("message").at("content");
+        ROUTING_CHECK(re_ask_token == 3 ? content == "y" : content.rfind("Listing.", 0) == 0);
+        ROUTING_CHECK(!choice.at("message").contains("tool_calls"));
+        ROUTING_CHECK(choice.at("finish_reason") == "stop");
+        std::lock_guard<std::mutex> lock(models.first.engine.mu);
+        ROUTING_CHECK(models.first.engine.admissions == 2);
     }
 }
 

@@ -10,6 +10,8 @@ struct ImageRaster {
     size_t rows = 0, columns = 0;
     std::vector<float> values;
 };
+// `pad` stays empty for a projector without an image_pad row (V4.1), whose
+// layouts never contain a Pad position.
 struct ImageSentinels {
     std::vector<float> start, pad, newline, end;
 };

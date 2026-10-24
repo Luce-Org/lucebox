@@ -54,6 +54,17 @@ int main() {
         check(messages[0]["content"][1]["image_url"]["url"] == jpeg, "input JSON mutated");
         check(normalized.dump().find("base64") == std::string::npos, "normalized messages retain bytes");
 
+        // A model whose encoder joins a message's text parts (DeepSeek: a blank
+        // line) gets one string, placeholders included; other messages stay.
+        json mixed = messages;
+        mixed.push_back({{"role", "user"}, {"content", json::array({text_part("no"), text_part("image")})}});
+        check(extract_chat_images(mixed, IMAGE_PLACEHOLDER, normalized, images, error, {}, "\n\n"),
+              "separator request rejected");
+        check(normalized[0]["content"] == "before\n\n" + std::string(IMAGE_PLACEHOLDER) + "\n\nbetween\n\n" +
+              IMAGE_PLACEHOLDER + "\n\nafter", "image message parts not joined by the separator");
+        check(normalized[1]["content"] == mixed[1]["content"], "a message without images was joined");
+        check(images.size() == 2, "separator changed the images");
+
         const json plain = json::array({{{"role", "user"}, {"content", "hello"}},
                                        {{"role", "assistant"}, {"content", "hi"}, {"tool_calls", json::array()}}});
         check(extract_chat_images(plain, IMAGE_PLACEHOLDER, normalized, images, error) && normalized == plain && images.empty(), "text-only request changed");

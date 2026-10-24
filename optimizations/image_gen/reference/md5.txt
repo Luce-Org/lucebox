@@ -1,0 +1,8 @@
+# The images bench.sh makes, for CHECK=1: 1024x1024, seed 42, the text encoder on the model's R9700 (gfx1201) and the
+# GEMM kernels of moss-image-gemm.txt (hipBLASLt 100202). Fields: steps, sampler, scheduler, CFG, prompt, md5.
+8 er_sde simple 1 cat 4e5b2d6ffc3932820e7da45a3b77b095
+8 er_sde simple 1 poster 99aa540f03c4730bfb1fe1884fc557a6
+8 er_sde simple 1 street 47102df523537362c3d5412b719c3d3c
+8 er_sde simple 2.5 cat 13f35954390f9db39e773f137715fbee
+8 er_sde simple 2.5 poster 4e3f306b7ff8379f1f5358fbb9e8ef39
+8 er_sde simple 2.5 street 598874a60afda9616808e2ffb45317c1

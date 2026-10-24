@@ -98,7 +98,8 @@ bool parse_image_data_url(std::string_view url, EncodedImage & image,
 bool extract_chat_images(const nlohmann::json & messages, std::string_view placeholder,
                          nlohmann::json & normalized,
                          std::vector<EncodedImage> & images,
-                         std::string & error, const ImageInputLimits & limits) {
+                         std::string & error, const ImageInputLimits & limits,
+                         std::string_view part_separator) {
     normalized = nullptr;
     images.clear();
     error.clear();
@@ -115,6 +116,7 @@ bool extract_chat_images(const nlohmann::json & messages, std::string_view place
             auto & content = message["content"];
             if (!content.is_array()) continue;
             std::string text_segment;
+            const size_t images_before = collected.size();
             for (auto & part : content) {
                 require(part.is_object(), "each content part must be an object");
                 const auto type = part.value("type", std::string());
@@ -150,6 +152,21 @@ bool extract_chat_images(const nlohmann::json & messages, std::string_view place
                 part = {{"type", "text"}, {"text", std::string(placeholder)}};
             }
             require(!reserved_placeholder(text_segment, placeholder), "text contains the reserved image placeholder");
+            if (!part_separator.empty() && collected.size() > images_before) {
+                // The model's encoder renders a message with images as its
+                // text parts, the image placeholders among them, joined by the
+                // separator (DeepSeek encoding.py process_image_messages).
+                std::string joined;
+                bool first = true;
+                for (const auto & part : content) {
+                    const auto type = part.value("type", std::string());
+                    if (type != "text" && type != "input_text" && type != "output_text") continue;
+                    if (!first) joined += part_separator;
+                    joined += part.value("text", std::string());
+                    first = false;
+                }
+                content = std::move(joined);
+            }
         }
         normalized = std::move(result);
         images = std::move(collected);
@@ -205,7 +222,8 @@ bool prepare_request_images(const nlohmann::json & messages,
     if (policy.chat_completions) {
         nlohmann::json prepared;
         std::vector<EncodedImage> extracted;
-        if (!extract_chat_images(messages, policy.placeholder, prepared, extracted, error, limits)) return false;
+        if (!extract_chat_images(messages, policy.placeholder, prepared, extracted, error, limits,
+                                 policy.part_separator)) return false;
         if (contains_image_content(prepared)) {
             error = "images must be user content-array image_url parts";
             return false;
