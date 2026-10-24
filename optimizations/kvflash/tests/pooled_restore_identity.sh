@@ -58,7 +58,11 @@ start_server() {  # $1 = consume flag, $2 = log file
     [ -n "${CHAT_TEMPLATE:-}" ] && args+=(--chat-template-file "$CHAT_TEMPLATE")
     # shellcheck disable=SC2206
     [ -n "${EXTRA_ARGS:-}" ] && args+=($EXTRA_ARGS)
-    LUCE_KVFLASH_RESTORE_CONSUME="$1" "$SERVER_BIN" "${args[@]}" >"$2" 2>&1 &
+    # Session off in both runs: with it on, a live restore at a turn cut beats
+    # the pooled snapshot (and also skips the reference re-prefill), so this
+    # test would no longer exercise the path it is about. The session has its
+    # own test in tests/gate.
+    LUCE_KVFLASH_SESSION=0 LUCE_KVFLASH_RESTORE_CONSUME="$1" "$SERVER_BIN" "${args[@]}" >"$2" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 300); do
         curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null 2>&1 && return 0
