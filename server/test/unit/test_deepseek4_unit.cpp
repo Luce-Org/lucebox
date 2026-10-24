@@ -22,6 +22,7 @@
 #include "common/layer_split_runtime.h"
 #include "common/layer_split_utils.h"
 #include "common/moe_hybrid_ffn_eval.h"
+#include "common/moe_hybrid_expert_cache.h"
 #include "deepseek4/deepseek4_dspark.h"
 #include "deepseek4/deepseek4_engram.h"
 
@@ -1675,6 +1676,79 @@ static void test_engram_apply_synthetic(ggml_backend_t backend, const char * nam
     std::fprintf(stderr, " out %.2e gate %.2e %s\n", e.out_rel, e.gate_abs, g_failures ? "done" : "ok");
 }
 
+// Image positions (V4.1 image input): the runner's dead mask shuts their gate,
+// so their copies come back bit for bit, while every text position gets exactly
+// the update it gets without a mask. Runs on 300 tokens (two runner parts, a
+// dead run across the boundary).
+static void test_engram_apply_image_rows_untouched(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_engram_apply_image_rows_untouched (%s) ...", name);
+    constexpr int n_embd = 128, n_hc = 4, key_width = 6 * 32, n_tokens = 300;
+    TestLcg rng(20261018u);
+    const bool f32_weights = ggml_backend_is_cpu(backend);
+    const int n_out = n_embd * (n_hc + 1);
+    std::vector<float> wkv((size_t) key_width * n_out), q((size_t) n_embd * n_hc), k(q.size()),
+                       keys((size_t) key_width * n_tokens), h((size_t) n_embd * n_hc * n_tokens);
+    for (auto & v : wkv) v = ggml_fp16_to_fp32(ggml_fp32_to_fp16(0.08f * rng.next()));
+    for (auto & v : q) v = 1.0f + 0.5f * rng.next();
+    for (auto & v : k) v = 1.0f + 0.5f * rng.next();
+    for (auto & v : keys) v = ggml_fp16_to_fp32(ggml_fp32_to_fp16(2.0f * rng.next()));
+    for (auto & v : h) v = 3.0f * rng.next();
+    std::vector<uint8_t> dead((size_t) n_tokens, 0);
+    for (int t = 10; t < 41; ++t) dead[(size_t) t] = 1;
+    for (int t = 250; t < 262; ++t) dead[(size_t) t] = 1;   // across the 256-token part boundary
+    dead[(size_t) n_tokens - 1] = 1;
+
+    ggml_init_params params{};
+    params.mem_size = 16 * ggml_tensor_overhead();
+    params.no_alloc = true;
+    ggml_context * wctx = ggml_init(params);
+    ggml_tensor * wkv_t = ggml_new_tensor_2d(wctx, f32_weights ? GGML_TYPE_F32 : GGML_TYPE_F16, key_width, n_out);
+    ggml_tensor * q_t = ggml_new_tensor_2d(wctx, GGML_TYPE_F32, n_embd, n_hc);
+    ggml_tensor * k_t = ggml_new_tensor_2d(wctx, GGML_TYPE_F32, n_embd, n_hc);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+    TEST_ASSERT_MSG(wbuf != nullptr, "engram weight buffer");
+    if (!wbuf) { ggml_free(wctx); return; }
+    if (f32_weights) {
+        ggml_backend_tensor_set(wkv_t, wkv.data(), 0, wkv.size() * sizeof(float));
+    } else {
+        std::vector<ggml_fp16_t> wkv16(wkv.size());
+        ggml_fp32_to_fp16_row(wkv.data(), wkv16.data(), (int64_t) wkv.size());
+        ggml_backend_tensor_set(wkv_t, wkv16.data(), 0, wkv16.size() * sizeof(ggml_fp16_t));
+    }
+    ggml_backend_tensor_set(q_t, q.data(), 0, q.size() * sizeof(float));
+    ggml_backend_tensor_set(k_t, k.data(), 0, k.size() * sizeof(float));
+    DeepSeek4Layer L{};
+    L.engram_wkv = wkv_t;
+    L.engram_q = q_t;
+    L.engram_k = k_t;
+
+    std::vector<float> plain = h, masked = h;
+    DeepSeek4EngramApplyRunner runner;
+    TEST_ASSERT_MSG(runner.run(backend, L, n_embd, n_hc, 1e-20f, plain.data(), keys.data(), n_tokens),
+                    "engram apply without a mask");
+    TEST_ASSERT_MSG(runner.run(backend, L, n_embd, n_hc, 1e-20f, masked.data(), keys.data(), n_tokens,
+                               dead.data()), "engram apply with image rows");
+    const size_t row = (size_t) n_embd * n_hc;
+    size_t image_changed = 0, text_differs = 0, text_updated = 0;
+    for (int t = 0; t < n_tokens; ++t) {
+        const size_t at = (size_t) t * row;
+        const bool same_as_input = std::memcmp(masked.data() + at, h.data() + at, row * sizeof(float)) == 0;
+        if (dead[(size_t) t]) {
+            image_changed += !same_as_input;
+        } else {
+            text_differs += std::memcmp(masked.data() + at, plain.data() + at, row * sizeof(float)) != 0;
+            text_updated += !same_as_input;
+        }
+    }
+    TEST_ASSERT_MSG(image_changed == 0, "an image position was updated");
+    TEST_ASSERT_MSG(text_differs == 0, "a text position differs from the unmasked apply");
+    TEST_ASSERT_MSG(text_updated > 0, "the text positions were not updated at all");
+    runner.release();
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(wctx);
+    std::fprintf(stderr, " %s\n", image_changed == 0 && text_differs == 0 ? "ok" : "FAILED");
+}
+
 // The released tables and weights (LUCE_DS4_ENGRAM_GGUF=<V4.1 GGUF>): hash a
 // token run, read its rows through the runtime (in two chunks, carrying the
 // n-gram context), and apply each Engram layer on `backend` against the
@@ -2455,6 +2529,52 @@ struct ImageAdmissionFakeOwner {
     }
 };
 
+// Paged serving leaves grouped MMVQ off, so a ROCmFP2 owner of the streamed
+// expert cache builds one routed sub-graph per prompt row. A 300-row prefill
+// chunk needs more than the 2,048 nodes the cache once fixed (it aborted in
+// ggml_visit_parents on a 128 GB box); the cache sizes its graph by rows.
+static void test_streamed_expert_graph_fits_tokenwise_prefill() {
+    std::fprintf(stderr, "test_streamed_expert_graph_fits_tokenwise_prefill...");
+    const int n_tokens = 300, n_routes = 6, n_slots = 8;
+    const int64_t width = std::max<int64_t>(256, ggml_blck_size(GGML_TYPE_Q2_0_ROCMFP2));
+    ggml_init_params wp{};
+    wp.mem_size = 8 * ggml_tensor_overhead();
+    wp.no_alloc = true;
+    ggml_context * weights = ggml_init(wp);
+    const size_t nodes = moe_streamed_graph_nodes(n_tokens);
+    ggml_init_params gp{};
+    gp.mem_size = ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false);
+    gp.no_alloc = true;
+    ggml_context * ctx = ggml_init(gp);
+    TEST_ASSERT(weights && ctx);
+    if (!weights || !ctx) return;
+    ggml_tensor * gate = ggml_new_tensor_3d(weights, GGML_TYPE_Q2_0_ROCMFP2, width, width, n_slots);
+    ggml_tensor * up = ggml_new_tensor_3d(weights, GGML_TYPE_Q2_0_ROCMFP2, width, width, n_slots);
+    ggml_tensor * down = ggml_new_tensor_3d(weights, GGML_TYPE_Q2_0_ROCMFP2, width, width, n_slots);
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, n_tokens);
+    ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_routes, n_tokens);
+    ggml_tensor * wts = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_routes, n_tokens);
+    MoeHybridConfig cfg;
+    cfg.n_embd = int(width);
+    cfg.n_ff_exp = int(width);
+    cfg.n_expert = n_slots;
+    cfg.n_expert_used = n_routes;
+    const MoeLayerDesc desc;
+    ggml_tensor * out = build_moe_routed_experts(ctx, cfg, desc, gate, up, down, nullptr,
+                                                 inp, sel, wts, n_routes, n_tokens);
+    TEST_ASSERT(out != nullptr);
+    if (out) {
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, nodes, false);
+        ggml_build_forward_expand(gf, out);
+        TEST_ASSERT(size_t(ggml_graph_n_nodes(gf)) <= nodes);
+        const bool grouped = std::getenv("LUCE_MOE_TP_GROUPED_MMVQ") || std::getenv("LUCE_DS4_TP_GROUPED_MMVQ");
+        TEST_ASSERT(grouped || ggml_graph_n_nodes(gf) > 2048);
+    }
+    ggml_free(ctx);
+    ggml_free(weights);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_image_storage_admission_metadata() {
     std::fprintf(stderr, "test_image_storage_admission_metadata...");
     using namespace luce::vision;
@@ -2577,6 +2697,29 @@ static void test_image_storage_admission_metadata() {
     TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
         &hot.backend, &cold.backend, false, split, error));
     config.materialize_cold_experts = true;
+
+    // Expert ownership: the explicit cold list is the whole cold stack and
+    // the expert it leaves out streams, so it costs the cold owner nothing.
+    config.cold_expert_ids = {{0, 3}};
+    ImageStorageEstimate owned;
+    TEST_ASSERT(estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, owned, error));
+    TEST_ASSERT(owned.hot_payload_bytes == initial.hot_payload_bytes);
+    TEST_ASSERT(owned.cold_payload_bytes == 2 * 17408);
+    TEST_ASSERT(owned.cold_allocation_bytes == 2 * 17408 + 3 * 512);
+    TEST_ASSERT(owned.cold_mix_table_bytes == 2 * (17 + 17 + 33));
+    config.cold_expert_ids = {{0, 1, 3}, {}};
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, owned, error));
+    config.cold_expert_ids = {{0, 1, 2, 3}};
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, owned, error));
+    setenv("LUCE_MOE_DUPLICATE_HOT_ON_COLD", "1", 1);
+    config.cold_expert_ids = {{0, 3}};
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, true, owned, error));
+    unsetenv("LUCE_MOE_DUPLICATE_HOT_ON_COLD");
+    config.cold_expert_ids.clear();
 
     // Actual wrapper sees the fake device's exhausted snapshot. It cannot pass
     // regardless of the machine's memory; no positive case reads /proc. The
@@ -5069,6 +5212,18 @@ static void test_prefill_restore_points() {
     TEST_ASSERT(Backend::restore_safe_prefill_tokens(0, 64, points) == 64);
     TEST_ASSERT(Backend::restore_safe_prefill_tokens(36, 64, points) == 64);
     TEST_ASSERT(Backend::restore_safe_prefill_tokens(0, 1024, {}) == 1024);
+
+    // After a restore, a restore point only rows ahead does not leave a chunk
+    // for the decode-shaped path: the chunk runs on to the next one.
+    const std::vector<int> view = {33000, 33007, 47758};
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(32998, 2048, view) == 9);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(32998, 3, view) == 3);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(16762, 2048, {16764, 16770}) == 8);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(32998, 6, {33000}) == 6);
+    // A restore on a boundary, as without PFlash, keeps its chunks.
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(46915, 2048, {46915, 58553}) == 2048);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(100, 1024, points) == 200);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(0, 1024, {}) == 1024);
 
     // The chunks after any restore point are the ones a cold prefill runs.
     const auto chunk_starts = [&](int from, int end, int chunk) {
@@ -9334,6 +9489,7 @@ int main(int argc, char ** argv) {
     test_indexer_score_cpu(backend);
     test_indexer_mask_cpu(backend);
     test_engram_apply_synthetic(backend, "cpu");
+    test_engram_apply_image_rows_untouched(backend, "cpu");
     test_engram_apply_released_weights(backend, "cpu");
     test_v41_indexer_topk(backend, "cpu");
     test_v41_candidate_blocks(backend, "cpu");
@@ -9362,6 +9518,7 @@ int main(int argc, char ** argv) {
     test_image_bias_loader_opt_in_contract(backend);
     test_image_batch_admission_before_execution(backend);
     test_image_storage_admission_metadata();
+    test_streamed_expert_graph_fits_tokenwise_prefill();
     test_image_admission_resource_snapshots();
     test_dspark_loader_contract_and_bounds(backend);
     test_dspark_confidence_uses_separate_hidden(backend);
@@ -9402,6 +9559,7 @@ int main(int argc, char ** argv) {
         if (gpu) {
             for (int mode = 0; mode < 3; ++mode) test_dspark_compressor_rollback(gpu, mode);
             test_engram_apply_synthetic(gpu, "gpu");
+            test_engram_apply_image_rows_untouched(gpu, "gpu");
             test_engram_apply_released_weights(gpu, "gpu");
             test_v41_indexer_topk(gpu, "gpu");
             test_v41_candidate_blocks(gpu, "gpu");

@@ -1,8 +1,10 @@
 #include "common.cuh"
 #include "qsa.cuh"
+#include "gated-norm.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #include "qsa-decode.cuh"
 
 typedef short v16s __attribute__((ext_vector_type(16)));
@@ -50,6 +52,56 @@ __global__ __launch_bounds__(256) void qsa3_rows_kernel(
         }
     }
     if (tid == 0) { sflag[q] = unsorted; }
+}
+
+// kernel A, compacting variant (default; LUCE_ATTN_PREFILL_LEGACY=1 restores the previous kernels). qsa_decode_ids
+// writes every row sorted by block but fills the unused budget with future blocks, i.e. -1 cells *between* the
+// selected cells and the tail cells, so the legacy sortedness check fails for every query before position
+// indexer_top_k and the O(ns^2) rank sort ran on half the rows (5 ms per layer at p4096). Here the valid entries
+// are compacted in order (block scan), the compacted row is written to srow[q] (SENT-padded) and only a row
+// that is still out of order is bitonic-sorted in LDS. sflag[q] = 1 always: the merge kernel reads srow.
+__global__ __launch_bounds__(256) void qsa3_rows_compact_kernel(
+        const int * __restrict__ ids, const size_t i1, const int ns, const int nk, const int sort_size,
+        int * __restrict__ srow, int * __restrict__ sflag) {
+    extern __shared__ int ent[];   // sort_size ints
+    __shared__ int wsum[8];
+    __shared__ int unsorted;
+    const int q = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int * row = reinterpret_cast<const int *>(reinterpret_cast<const char *>(ids) + (size_t) q * i1);
+    const int per = (ns + 255) / 256, j0 = tid * per, j1 = min(ns, j0 + per);
+    int cnt = 0;
+    for (int j = j0; j < j1; ++j) { const int key = row[j]; cnt += key >= 0 && key < nk; }
+    int scan = cnt;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) { const int v = __shfl_up(scan, off); if (lane >= off) { scan += v; } }
+    if (lane == 31) { wsum[w] = scan; }
+    if (tid == 0) { unsorted = 0; }
+    __syncthreads();
+    int pos = scan - cnt, total = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { pos += i < w ? wsum[i] : 0; total += wsum[i]; }
+    for (int j = j0; j < j1; ++j) { const int key = row[j]; if (key >= 0 && key < nk) { ent[pos++] = key; } }
+    for (int j = total + tid; j < sort_size; j += 256) { ent[j] = QSA3_SENT; }
+    __syncthreads();
+    for (int j = tid; j + 1 < total; j += 256) { if (ent[j] > ent[j+1]) { unsorted = 1; } }
+    __syncthreads();
+    if (unsorted) {
+        for (int width = 2; width <= sort_size; width <<= 1) {
+            for (int stride = width >> 1; stride > 0; stride >>= 1) {
+                for (int j = tid; j < sort_size; j += 256) {
+                    const int peer = j ^ stride;
+                    if (peer > j) {
+                        const int a = ent[j], b = ent[peer];
+                        if ((j & width) == 0 ? a > b : a < b) { ent[j] = b; ent[peer] = a; }
+                    }
+                }
+                __syncthreads();
+            }
+        }
+    }
+    int * dst = srow + (size_t) q * ns;
+    for (int j = tid; j < ns; j += 256) { dst[j] = ent[j]; }
+    if (tid == 0) { sflag[q] = 1; }
 }
 
 // kernel B: one workgroup (128 lanes) per group of 4 queries. Lane = key sub-range; the range boundaries are the
@@ -177,17 +229,67 @@ __global__ __launch_bounds__(QSA3_MERGE_LANES) void qsa3_merge_kernel(
     }
 }
 
+// kernel C (default; LUCE_ATTN_PREFILL_LEGACY=1 restores rows + merge): the whole union in one pass per group.
+// Each group scatters its 4 rows' valid keys into an LDS array of 16-bit masks indexed by block (ds_or_b32),
+// then compacts the non-zero entries with a block scan: ascending order for free, no row sort, no 4-way merge.
+// LDS is nb*4 bytes (20 KB at max-ctx 20480); the launcher falls back to rows + merge past 48 KB.
+__global__ __launch_bounds__(256) void qsa3_union_bitmap_kernel(
+        const int * __restrict__ ids, const size_t i1, const int n_q, const int ns, const int nk,
+        uint16_t * __restrict__ ublk, uint16_t * __restrict__ umask, int * __restrict__ ucount, const int cap) {
+    extern __shared__ unsigned bm[];   // nb masks, bit 4*qi + cell
+    __shared__ int wsum[8];
+    const int g = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int nb = (nk + 3) >> 2;
+    for (int b = tid; b < nb; b += 256) { bm[b] = 0u; }
+    __syncthreads();
+#pragma unroll
+    for (int qi = 0; qi < QSA3_G; ++qi) {
+        const int q = QSA3_G * g + qi;
+        if (q < n_q) {
+            const int * row = reinterpret_cast<const int *>(reinterpret_cast<const char *>(ids) + (size_t) q * i1);
+            for (int j = tid; j < ns; j += 256) {
+                const int key = row[j];
+                if (key >= 0 && key < nk) { atomicOr(&bm[key >> 2], 1u << (4 * qi + (key & 3))); }
+            }
+        }
+    }
+    __syncthreads();
+    const int per = (nb + 255) / 256, b0 = tid * per, b1 = min(nb, b0 + per);
+    int cnt = 0;
+    for (int b = b0; b < b1; ++b) { cnt += bm[b] != 0u; }
+    int scan = cnt;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) { const int v = __shfl_up(scan, off); if (lane >= off) { scan += v; } }
+    if (lane == 31) { wsum[w] = scan; }
+    __syncthreads();
+    int pos = scan - cnt, total = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { pos += i < w ? wsum[i] : 0; total += wsum[i]; }
+    uint16_t * ob = ublk + (size_t) g * cap, * om = umask + (size_t) g * cap;
+    for (int b = b0; b < b1; ++b) { const unsigned m = bm[b]; if (m) { ob[pos] = (uint16_t) b; om[pos] = (uint16_t) m; ++pos; } }
+    if (tid == 255) {
+        int t = total;
+        while (t & 3) { ob[t] = 0xFFFFu; om[t] = 0; ++t; }
+        ucount[g] = t;
+    }
+}
+
 struct qsa3_layout {
     size_t q1, q2, o1, o2, m1;
     int nk, n_q, gqa, cap;
     float scale;
+    // GATED: out is F16 [d, head, query] (o1/o2 bytes), gate is the F32 [d, head, query] view (g1 head, g2 query
+    // stride bytes) and the store writes gn_f2h_sat(gn_sigmoid(gate) * attn) -- gated_rms_norm_f16_kernel<256, false>.
+    const float * gate;
+    size_t g1, g2;
 };
 
 #if defined(__gfx1151__) || defined(RDNA4) || !defined(__HIP_DEVICE_COMPILE__)
+template <bool GATED>
 __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         const float * __restrict__ q, const uint16_t * __restrict__ pk, const uint16_t * __restrict__ pv,
         const uint16_t * __restrict__ mask, const uint16_t * __restrict__ ublk, const uint16_t * __restrict__ umask,
-        const int * __restrict__ ucount, float * __restrict__ out, const qsa3_layout s) {
+        const int * __restrict__ ucount, void * __restrict__ out, const qsa3_layout s) {
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, r = lane & 15, hi = lane >> 4;
     const int g = blockIdx.x, kvh = blockIdx.y;
     __shared__ float4 part[3][8][64];
@@ -439,8 +541,17 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
             const int row = 16*i + rr, qi = row / 12, h = row - 12*qi;
             const int query = QSA3_G * g + qi;
             if (query < s.n_q) {
-                float * dst = reinterpret_cast<float *>(reinterpret_cast<char *>(out) + (size_t) query * s.o2 + (size_t) (kvh * s.gqa + h) * s.o1) + 32*w + dq;
-                *reinterpret_cast<float4 *>(dst) = *reinterpret_cast<const float4 *>(ostage + rr * 32 + dq);
+                const float4 o = *reinterpret_cast<const float4 *>(ostage + rr * 32 + dq);
+                if constexpr (GATED) {
+                    const float4 z = *reinterpret_cast<const float4 *>(reinterpret_cast<const char *>(s.gate) + (size_t) query * s.g2 + (size_t) (kvh * s.gqa + h) * s.g1 + (size_t) (32*w + dq) * 4);
+                    uint16_t * dst = reinterpret_cast<uint16_t *>(reinterpret_cast<char *>(out) + (size_t) query * s.o2 + (size_t) (kvh * s.gqa + h) * s.o1) + 32*w + dq;
+                    const uint16_t h0 = __half_as_ushort(gn_f2h_sat(gn_sigmoid(z.x) * o.x)), h1 = __half_as_ushort(gn_f2h_sat(gn_sigmoid(z.y) * o.y));
+                    const uint16_t h2 = __half_as_ushort(gn_f2h_sat(gn_sigmoid(z.z) * o.z)), h3 = __half_as_ushort(gn_f2h_sat(gn_sigmoid(z.w) * o.w));
+                    *reinterpret_cast<uint2 *>(dst) = make_uint2((uint32_t) h0 | ((uint32_t) h1 << 16), (uint32_t) h2 | ((uint32_t) h3 << 16));
+                } else {
+                    float * dst = reinterpret_cast<float *>(reinterpret_cast<char *>(out) + (size_t) query * s.o2 + (size_t) (kvh * s.gqa + h) * s.o1) + 32*w + dq;
+                    *reinterpret_cast<float4 *>(dst) = o;
+                }
             }
         }
         __syncthreads();
@@ -476,35 +587,138 @@ bool ggml_cuda_flash_attn_ext_qsa_supported(ggml_backend_cuda_context & ctx, con
 #endif
 }
 
-void ggml_cuda_flash_attn_ext_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// Raw launchers, exported so the prefill microbench and the LUCE_TESTS parity test can drive the
+// kernels without a ggml graph. The union scratch is: ublk/umask [ngroups x cap] u16, ucount [ngroups],
+// srow [n_q x ns], sflag [n_q]; cap = ggml_cuda_qsa3_union_cap(ns).
+extern "C" GGML_BACKEND_API int ggml_cuda_qsa3_union_cap(int ns) { return (QSA3_G * ns + 3) & ~3; }
+
+// variant: 0 = legacy rank-sort rows kernel + merge, 1 = compacting rows kernel + merge (phases bit 1 = rows,
+// bit 2 = merge), 2 = single bitmap kernel (runs in the merge phase; srow/sflag unused).
+extern "C" GGML_BACKEND_API void ggml_cuda_qsa3_union_launch(
+        const int * ids, size_t i1, int n_q, int ns, int nk, int * srow, int * sflag,
+        uint16_t * ublk, uint16_t * umask, int * ucount, int phases, int rows_variant, cudaStream_t stream) {
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(RDNA4)
-    (void) ctx; (void) dst;
+    (void) ids; (void) i1; (void) n_q; (void) ns; (void) nk; (void) srow; (void) sflag; (void) ublk; (void) umask;
+    (void) ucount; (void) phases; (void) rows_variant; (void) stream;
+#else
+    const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;
+    const int cap = ggml_cuda_qsa3_union_cap(ns);
+    const size_t bm_bytes = (size_t) ((nk + 3) >> 2) * sizeof(unsigned);
+    if (rows_variant == 2 && bm_bytes > 48 * 1024) { rows_variant = 1; }
+    if (rows_variant == 2) {
+        if (phases & 2) {
+            qsa3_union_bitmap_kernel<<<dim3(ngroups), dim3(256), bm_bytes, stream>>>(ids, i1, n_q, ns, nk, ublk, umask, ucount, cap);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
+    if (phases & 1) {
+        if (rows_variant == 0) {
+            qsa3_rows_kernel<<<dim3(n_q), dim3(256), (size_t) ns * sizeof(int), stream>>>(ids, i1, ns, nk, srow, sflag);
+        } else {
+            int sort_size = 1;
+            while (sort_size < ns) { sort_size <<= 1; }
+            qsa3_rows_compact_kernel<<<dim3(n_q), dim3(256), (size_t) sort_size * sizeof(int), stream>>>(
+                ids, i1, ns, nk, sort_size, srow, sflag);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (phases & 2) {
+        qsa3_merge_kernel<<<dim3(ngroups), dim3(QSA3_MERGE_LANES), (size_t) QSA3_G * ns * sizeof(int), stream>>>(
+            ids, i1, n_q, ns, nk, srow, sflag, ublk, umask, ucount, cap);
+        CUDA_CHECK(cudaGetLastError());
+    }
+#endif
+}
+
+extern "C" GGML_BACKEND_API void ggml_cuda_qsa3_attn_launch(
+        const float * q, size_t q1, size_t q2, const uint16_t * pk, const uint16_t * pv, const uint16_t * mask, size_t m1,
+        const uint16_t * ublk, const uint16_t * umask, const int * ucount, int n_q, int ns, int nk, int n_kv_head,
+        float scale, float * out, size_t o1, size_t o2, cudaStream_t stream) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(RDNA4)
+    (void) q; (void) q1; (void) q2; (void) pk; (void) pv; (void) mask; (void) m1; (void) ublk; (void) umask; (void) ucount;
+    (void) n_q; (void) ns; (void) nk; (void) n_kv_head; (void) scale; (void) out; (void) o1; (void) o2; (void) stream;
+#else
+    const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;
+    qsa3_layout layout{q1, q2, o1, o2, m1, nk, n_q, 12, ggml_cuda_qsa3_union_cap(ns), scale, nullptr, 0, 0};
+    qsa3_attn_kernel<false><<<dim3(ngroups, n_kv_head), dim3(256), 0, stream>>>(q, pk, pv, mask, ublk, umask, ucount, out, layout);
+    CUDA_CHECK(cudaGetLastError());
+#endif
+}
+
+extern "C" GGML_BACKEND_API void ggml_cuda_qsa3_attn_gated_launch(
+        const float * q, size_t q1, size_t q2, const uint16_t * pk, const uint16_t * pv, const uint16_t * mask, size_t m1,
+        const uint16_t * ublk, const uint16_t * umask, const int * ucount, int n_q, int ns, int nk, int n_kv_head,
+        float scale, const float * gate, size_t g1, size_t g2, uint16_t * out, size_t o1, size_t o2, cudaStream_t stream) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(RDNA4)
+    (void) q; (void) q1; (void) q2; (void) pk; (void) pv; (void) mask; (void) m1; (void) ublk; (void) umask; (void) ucount;
+    (void) n_q; (void) ns; (void) nk; (void) n_kv_head; (void) scale; (void) gate; (void) g1; (void) g2; (void) out; (void) o1;
+    (void) o2; (void) stream;
+#else
+    const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;
+    qsa3_layout layout{q1, q2, o1, o2, m1, nk, n_q, 12, ggml_cuda_qsa3_union_cap(ns), scale, gate, g1, g2};
+    qsa3_attn_kernel<true><<<dim3(ngroups, n_kv_head), dim3(256), 0, stream>>>(q, pk, pv, mask, ublk, umask, ucount, out, layout);
+    CUDA_CHECK(cudaGetLastError());
+#endif
+}
+
+bool ggml_cuda_qsa_gate_enabled() {
+    static const bool enabled = [] { const char * e = getenv("LUCE_ATTN_FUSE_LEGACY"); return !(e && atoi(e)); }();
+    return enabled;
+}
+
+bool ggml_cuda_flash_attn_ext_qsa_gate_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const ggml_tensor * gated) {
+    if (!gated || gated->op != GGML_OP_GATED_RMS_NORM_F16 || gated->src[0] != dst || gated->src[1] != nullptr ||
+        !ggml_cuda_flash_attn_ext_qsa_supported(ctx, dst)) { return false; }
+    const ggml_tensor * q = dst->src[0], * z = gated->src[2];
+    // z: the [d, head, query] F32 view of the [q | gate] projection; 16-byte rows for the float4 gate loads.
+    return gated->type == GGML_TYPE_F16 && ggml_is_contiguous(gated) && gated->ne[0] == q->ne[0] * q->ne[2] &&
+        gated->ne[1] == q->ne[1] && z->type == GGML_TYPE_F32 && z->ne[0] == q->ne[0] && z->ne[1] == q->ne[2] &&
+        z->ne[2] == q->ne[1] && z->ne[3] == 1 && z->nb[0] == sizeof(float) && z->nb[1] % 16 == 0 && z->nb[2] % 16 == 0 &&
+        uintptr_t(z->data) % 16 == 0;
+}
+
+static void qsa_prefill_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * gated);
+
+void ggml_cuda_flash_attn_ext_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) { qsa_prefill_run(ctx, dst, nullptr); }
+
+void ggml_cuda_flash_attn_ext_qsa_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * gated) {
+    qsa_prefill_run(ctx, dst, gated);
+}
+
+static void qsa_prefill_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * gated) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(RDNA4)
+    (void) ctx; (void) dst; (void) gated;
     return;
 #else
     const auto * q = dst->src[0], * k = dst->src[1], * m = dst->src[3], * ids = dst->src[5], * pk = dst->src[6], * pv = dst->src[7];
     float scale; memcpy(&scale, dst->op_params, 4);
     const int n_q = (int) q->ne[1], ns = (int) ids->ne[0], nk = (int) k->ne[1];
     const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;
-    const int cap = (QSA3_G * ns + 3) & ~3;
+    const int cap = ggml_cuda_qsa3_union_cap(ns);
     ggml_cuda_pool_alloc<uint16_t> ublk(ctx.pool(), (size_t) ngroups * cap);
     ggml_cuda_pool_alloc<uint16_t> umask(ctx.pool(), (size_t) ngroups * cap);
     ggml_cuda_pool_alloc<int>      ucount(ctx.pool(), (size_t) ngroups);
     ggml_cuda_pool_alloc<int>      srow(ctx.pool(), (size_t) n_q * ns);
     ggml_cuda_pool_alloc<int>      sflag(ctx.pool(), (size_t) n_q);
-    {
-        qsa3_rows_kernel<<<dim3(n_q), dim3(256), (size_t) ns * sizeof(int), ctx.stream()>>>(
-            (const int *) ids->data, ids->nb[1], ns, nk, srow.get(), sflag.get());
-        CUDA_CHECK(cudaGetLastError());
-        qsa3_merge_kernel<<<dim3(ngroups), dim3(QSA3_MERGE_LANES), (size_t) QSA3_G * ns * sizeof(int), ctx.stream()>>>(
-            (const int *) ids->data, ids->nb[1], n_q, ns, nk,
-            (const int *) srow.get(), (const int *) sflag.get(), ublk.get(), umask.get(), ucount.get(), cap);
-        CUDA_CHECK(cudaGetLastError());
+    static const int rows_variant = [] {
+        const char * u = getenv("LUCE_ATTN_PREFILL_LEGACY");
+        return u && atoi(u) ? 0 : 2;
+    }();
+    ggml_cuda_qsa3_union_launch((const int *) ids->data, ids->nb[1], n_q, ns, nk, srow.get(), sflag.get(),
+                                ublk.get(), umask.get(), ucount.get(), 3, rows_variant, ctx.stream());
+    if (gated != nullptr) {   // sigmoid(gate) * attn -> F16 [d*heads, query] straight from the store
+        const ggml_tensor * z = gated->src[2];
+        ggml_cuda_qsa3_attn_gated_launch((const float *) q->data, q->nb[1], q->nb[2], (const uint16_t *) pk->data,
+                                   (const uint16_t *) pv->data, m ? (const uint16_t *) m->data : nullptr, m ? m->nb[1] : 0,
+                                   ublk.get(), umask.get(), ucount.get(), n_q, ns, nk, (int) k->ne[2], scale,
+                                   (const float *) z->data, z->nb[1], z->nb[2],
+                                   (uint16_t *) gated->data, (size_t) q->ne[0] * sizeof(uint16_t), gated->nb[1], ctx.stream());
+        return;
     }
-    qsa3_layout layout{q->nb[1], q->nb[2], dst->nb[1], dst->nb[2], m ? m->nb[1] : 0, nk, n_q, 12, cap, scale};
-    qsa3_attn_kernel<<<dim3(ngroups, k->ne[2]), dim3(256), 0, ctx.stream()>>>(
-        (const float *) q->data, (const uint16_t *) pk->data, (const uint16_t *) pv->data,
-        m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
-        (const int *) ucount.get(), (float *) dst->data, layout);
-    CUDA_CHECK(cudaGetLastError());
+    ggml_cuda_qsa3_attn_launch((const float *) q->data, q->nb[1], q->nb[2], (const uint16_t *) pk->data,
+                               (const uint16_t *) pv->data, m ? (const uint16_t *) m->data : nullptr, m ? m->nb[1] : 0,
+                               ublk.get(), umask.get(), ucount.get(), n_q, ns, nk, (int) k->ne[2], scale,
+                               (float *) dst->data, dst->nb[1], dst->nb[2], ctx.stream());
 #endif
 }

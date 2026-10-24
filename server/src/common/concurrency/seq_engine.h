@@ -243,6 +243,14 @@ public:
         // per-request error instead of silently truncating generation.
         std::string error;
         std::vector<int32_t> committed_tokens;
+        // A speculative row's verifier positions this step, counted as the
+        // engine's single-lane decode counts them for accept_rate: offered
+        // (drafted) and accepted. The scheduler caps them by the request's
+        // output budget and the tokens it took, as SpecAcceptanceStats
+        // does. Both stay 0 when the row decoded one token without the
+        // drafter.
+        int spec_offered = 0;
+        int spec_accepted = 0;
     };
 
     struct PrefillOutput {

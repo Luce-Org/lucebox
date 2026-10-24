@@ -59,7 +59,8 @@ ggml_tensor * deepseek4_build_engram_apply(ggml_context * ctx,
                                            int n_embd, int n_hc,
                                            float rms_eps,
                                            ggml_tensor ** gate_out,
-                                           ggml_tensor * kv_pre) {
+                                           ggml_tensor * kv_pre,
+                                           ggml_tensor * keep) {
     if (!ctx || !h || !keys || !L.engram_wkv || !L.engram_q || !L.engram_k) return nullptr;
     const int64_t n_tokens = keys->ne[1];
     GGML_ASSERT(h->ne[0] == n_embd && h->ne[1] == n_hc && h->ne[2] == n_tokens);
@@ -94,6 +95,10 @@ ggml_tensor * deepseek4_build_engram_apply(ggml_context * ctx,
     ggml_tensor * mag = ggml_sqrt(ctx, ggml_clamp(ctx, ggml_abs(ctx, dot), 1e-6f, INFINITY));
     ggml_tensor * sign = ggml_scale_bias(ctx, ggml_step(ctx, ggml_neg(ctx, dot)), -2.0f, 1.0f);
     ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul(ctx, sign, mag));
+    if (keep) {
+        GGML_ASSERT(keep->ne[0] == 1 && keep->ne[1] == 1 && keep->ne[2] == n_tokens);
+        gate = ggml_mul(ctx, gate, keep);   // x * 1 is exact: text rows are unchanged
+    }
     if (gate_out) *gate_out = gate;
 
     // h_c += gate_c * value
@@ -108,25 +113,26 @@ void DeepSeek4EngramApplyRunner::release() {
 }
 
 bool DeepSeek4EngramApplyRunner::run(ggml_backend_t backend, const DeepSeek4Layer & L, int n_embd, int n_hc,
-                                     float rms_eps, float * hc, const float * keys, int n_tokens) {
-    return hc && run_chunks(backend, L, n_embd, n_hc, rms_eps, hc, nullptr, keys, n_tokens);
+                                     float rms_eps, float * hc, const float * keys, int n_tokens,
+                                     const uint8_t * dead) {
+    return hc && run_chunks(backend, L, n_embd, n_hc, rms_eps, hc, nullptr, keys, n_tokens, dead);
 }
 
 bool DeepSeek4EngramApplyRunner::run_device(ggml_backend_t backend, const DeepSeek4Layer & L, int n_embd,
                                             int n_hc, float rms_eps, ggml_tensor * hc_dev,
-                                            const float * keys, int n_tokens) {
+                                            const float * keys, int n_tokens, const uint8_t * dead) {
     if (!hc_dev || hc_dev->type != GGML_TYPE_F32 || !ggml_is_contiguous(hc_dev) ||
         ggml_nelements(hc_dev) != (int64_t) n_embd * n_hc * n_tokens) {
         return false;
     }
-    return run_chunks(backend, L, n_embd, n_hc, rms_eps, nullptr, hc_dev, keys, n_tokens);
+    return run_chunks(backend, L, n_embd, n_hc, rms_eps, nullptr, hc_dev, keys, n_tokens, dead);
 }
 
 // The residual comes from and returns to host memory (hc_host) or is
 // updated in place on the device (hc_dev); only the keys upload then.
 bool DeepSeek4EngramApplyRunner::run_chunks(ggml_backend_t backend, const DeepSeek4Layer & L, int n_embd,
                                             int n_hc, float rms_eps, float * hc_host, ggml_tensor * hc_dev,
-                                            const float * keys, int n_tokens) {
+                                            const float * keys, int n_tokens, const uint8_t * dead) {
     if (!backend || !L.engram_wkv || n_tokens <= 0) return false;
     if (alloc_backend_ != backend) {
         release();
@@ -152,7 +158,20 @@ bool DeepSeek4EngramApplyRunner::run_chunks(ggml_backend_t backend, const DeepSe
         ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, key_width, count);
         if (!hc_dev) ggml_set_input(h);
         ggml_set_input(k);
-        ggml_tensor * out = deepseek4_build_engram_apply(ctx, h, k, L, n_embd, n_hc, rms_eps);
+        // Image positions in this part: a 0/1 gate mask, built only when needed.
+        std::vector<float> keep_values;
+        for (int t = 0; dead && t < count; ++t) {
+            if (!dead[first + t]) continue;
+            if (keep_values.empty()) keep_values.assign((size_t) count, 1.0f);
+            keep_values[(size_t) t] = 0.0f;
+        }
+        ggml_tensor * keep = nullptr;
+        if (!keep_values.empty()) {
+            keep = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, count);
+            ggml_set_input(keep);
+        }
+        ggml_tensor * out = deepseek4_build_engram_apply(ctx, h, k, L, n_embd, n_hc, rms_eps,
+                                                         nullptr, nullptr, keep);
         if (!out) { ggml_free(ctx); return false; }
         if (hc_dev) out = ggml_cpy(ctx, out, h);
         ggml_set_output(out);
@@ -164,6 +183,7 @@ bool DeepSeek4EngramApplyRunner::run_chunks(ggml_backend_t backend, const DeepSe
                 ggml_backend_tensor_set(h, hc_host + (size_t) first * hc_width, 0, sizeof(float) * hc_width * count);
             }
             ggml_backend_tensor_set(k, keys + (size_t) first * key_width, 0, sizeof(float) * key_width * count);
+            if (keep) ggml_backend_tensor_set(keep, keep_values.data(), 0, sizeof(float) * keep_values.size());
             ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
         }
         if (ok && !hc_dev) {
@@ -205,17 +225,31 @@ bool ds4_engram_read_keys(const DeepSeek4Weights & w, DeepSeek4EngramTokens & ct
     return true;
 }
 
+// Image positions of a step: the ids outside the text vocabulary. Empty when
+// the step has none (every text-only step), which keeps the plain apply.
+static std::vector<uint8_t> ds4_engram_dead(const DeepSeek4Weights & w, const int32_t * token_ids,
+                                            int n_tokens) {
+    std::vector<uint8_t> dead;
+    for (int t = 0; token_ids && t < n_tokens; ++t) {
+        if (token_ids[t] >= 0 && token_ids[t] < w.n_vocab) continue;
+        if (dead.empty()) dead.assign((size_t) n_tokens, 0);
+        dead[(size_t) t] = 1;
+    }
+    return dead;
+}
+
 bool ds4_engram_apply_host(ggml_backend_t backend, const DeepSeek4Weights & w, int il,
                            const std::vector<float> & keys, float * hc_state, int n_tokens,
                            DeepSeek4EngramApplyRunner & runner,
-                           DeepSeek4StepTelemetry * telemetry) {
+                           DeepSeek4StepTelemetry * telemetry, const int32_t * token_ids) {
     const DeepSeek4EngramRuntime * engram = w.engram_runtime.get();
     const int e = engram ? engram->layer_index(il) : -1;
     if (e < 0) return true;
     const auto t0 = std::chrono::steady_clock::now();
     const float * layer_keys = keys.data() + (size_t) e * (size_t) n_tokens * engram->key_floats();
+    const std::vector<uint8_t> dead = ds4_engram_dead(w, token_ids, n_tokens);
     if (!runner.run(backend, w.layers[(size_t) il], w.n_embd, w.n_hc, w.rms_eps,
-                    hc_state, layer_keys, n_tokens)) {
+                    hc_state, layer_keys, n_tokens, dead.empty() ? nullptr : dead.data())) {
         std::fprintf(stderr, "[deepseek4] engram apply failed at layer %d\n", il);
         return false;
     }
@@ -226,14 +260,15 @@ bool ds4_engram_apply_host(ggml_backend_t backend, const DeepSeek4Weights & w, i
 bool ds4_engram_apply_device(ggml_backend_t backend, const DeepSeek4Weights & w, int il,
                              const std::vector<float> & keys, ggml_tensor * hc_dev, int n_tokens,
                              DeepSeek4EngramApplyRunner & runner,
-                             DeepSeek4StepTelemetry * telemetry) {
+                             DeepSeek4StepTelemetry * telemetry, const int32_t * token_ids) {
     const DeepSeek4EngramRuntime * engram = w.engram_runtime.get();
     const int e = engram ? engram->layer_index(il) : -1;
     if (e < 0) return true;
     const auto t0 = std::chrono::steady_clock::now();
     const float * layer_keys = keys.data() + (size_t) e * (size_t) n_tokens * engram->key_floats();
+    const std::vector<uint8_t> dead = ds4_engram_dead(w, token_ids, n_tokens);
     if (!runner.run_device(backend, w.layers[(size_t) il], w.n_embd, w.n_hc, w.rms_eps,
-                           hc_dev, layer_keys, n_tokens)) {
+                           hc_dev, layer_keys, n_tokens, dead.empty() ? nullptr : dead.data())) {
         std::fprintf(stderr, "[deepseek4] engram device apply failed at layer %d\n", il);
         return false;
     }

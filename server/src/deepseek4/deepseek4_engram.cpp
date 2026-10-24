@@ -73,8 +73,10 @@ void DeepSeek4EngramHasher::hash(DeepSeek4EngramHistory & history,
     const int n = max_ngram_;
     uint32_t ids[DeepSeek4EngramHistory::kMaxTail + 1];
     for (size_t i = 0; i < count; ++i) {
-        const int32_t current = (dead && dead[i]) ? DeepSeek4EngramHistory::kDead
-                                                  : compress(tokens[i]);
+        // A position marked dead, or one that carries no text token (the
+        // engine's image-span ids), takes no part in any n-gram.
+        const int32_t current = ((dead && dead[i]) || !is_text(tokens[i]))
+            ? DeepSeek4EngramHistory::kDead : compress(tokens[i]);
         // A dead slot blocks every longer n-gram that would cross it.
         bool blocked = false;
         for (int j = 0; j < n; ++j) {
@@ -223,8 +225,11 @@ bool DeepSeek4EngramRuntime::row_ids(const DeepSeek4EngramTokens & ctx, const in
                             " is not known";
             return false;
         }
-        history.tail[j] = hasher_.compress(t);
+        history.tail[j] = hasher_.is_text(t) ? hasher_.compress(t) : DeepSeek4EngramHistory::kDead;
     }
+    // Image positions are dead (the hasher's rule for ids outside the text
+    // vocabulary): their own rows are never applied, and the text after an
+    // image hashes as if the sequence started there.
     ids.resize(count * (size_t) hasher_.n_layers() * (size_t) hasher_.cols());
     hasher_.hash(history, tokens, nullptr, count, ids.data());
     return true;

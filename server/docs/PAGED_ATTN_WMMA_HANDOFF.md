@@ -1,6 +1,6 @@
 # paged_attn_wmma — handoff
 
-Status: LANDED, env-gated (`LUCE_PAGED_WMMA`, default off), RDNA4-only.
+Status: LANDED, on by default (`LUCE_PAGED_WMMA=0` opts out), RDNA4-only.
 Stage-1 kernel: `paged_attn_wmma` in `paged-attn.cu`, a paged port of the
 contiguous `fattn-mma-f16.cuh` machinery. This file keeps the non-obvious
 invariants, the bug classes already hit, and the qualification state. Read the
@@ -52,7 +52,7 @@ landed code; do not re-derive the assembly.
 
 ## Qualification
 
-`test_paged_attn_wmma` diffs the WMMA route (env=1, pinned by the
+`test_paged_attn_wmma` diffs the WMMA route (the default, pinned by the
 `g_paged_attn_wmma256` launch counter) against V_DOT2 (env=0, counter must stay
 0). The CPU backend ABORTS on `GGML_OP_PAGED_ATTN` (`ggml-cpu.c:2247`), so the
 two GPU routes are compared against each other. Cases: 512/8192 prefill, mixed
@@ -87,8 +87,8 @@ gather latency was already hidden; `cp.async` is `!GGML_USE_HIP`-gated).
 Build with the ROCm CI flags, then run both routes and the comparator:
 
 ```
-ctest -R '^test_paged_attn_wmma$'                     # V_DOT2
-ctest -R '^paged_attn_wmma_route$'                    # LUCE_PAGED_WMMA=1
+ctest -R '^test_paged_attn_wmma$'                     # WMMA (default)
+ctest -R '^paged_attn_vdot2_route$'                   # LUCE_PAGED_WMMA=0
 python3 server/test/bench/compare_paged_attn.py \
     paged_attn_out_vdot2.bin paged_attn_out_wmma.bin
 ```

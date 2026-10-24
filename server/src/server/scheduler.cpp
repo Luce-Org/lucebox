@@ -11,6 +11,7 @@
 #include "http_server.h"
 #include "common/concurrency/seq_engine.h"
 #include "common/output_constraint.h"
+#include "common/spec_acceptance.h"
 #include "parallel_prefix_txn.h"
 #include "response_error.h"
 
@@ -71,6 +72,9 @@ struct SchedSlot {
     luce::common::BudgetHook hook;
     luce::common::ThinkingBudget budget;
     bool degenerate_close = false;
+    // Speculative verifier positions over the request's rounds (see
+    // SeqEngine::DecodeOutput), for its /status perf record.
+    luce::common::SpecAcceptanceStats acceptance;
 };
 
 // Outcome of one admission attempt. The three cases differ in who owns the
@@ -361,6 +365,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 ? (double)computed_prompt_tokens / s.prefill_s : 0.0;
             perf.decode_tok_s = decode_s > 0.0
                 ? (double)s.completion_tokens / decode_s : 0.0;
+            perf.spec_decode = s.acceptance.offered() > 0;
+            perf.accept_rate = s.acceptance.rate();
             status_.record_perf(perf);
         }
 
@@ -1333,11 +1339,20 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 s.finished = true;
                 continue;
             }
+            const int room = s.n_gen_cap - (int)s.gen_tokens.size();
+            const size_t generated = s.gen_tokens.size();
             consume_decode_output_tokens(out, [&](int32_t token) {
                 if (s.finished) return false;
                 advance_slot(s, token);
                 return !s.finished;
             });
+            // Capped as the single-lane decode caps it: positions past the
+            // output budget, or past an EOS, could not be used.
+            if (out.spec_offered > 0) {
+                s.acceptance.record_chain(
+                    out.spec_accepted, out.spec_offered,
+                    (int)(s.gen_tokens.size() - generated), room);
+            }
         }
         using PrefillStatus = SeqEngine::PrefillOutput::Status;
         for (const auto & out : step_result.prefills) {

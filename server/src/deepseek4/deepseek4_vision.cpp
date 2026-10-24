@@ -24,14 +24,16 @@ struct Meta {
     ggml_context * c = nullptr;
     ~Meta() { if (g) gguf_free(g); if (c) ggml_free(c); }
 };
-std::map<std::string, std::array<int64_t,4>> inventory() {
+std::map<std::string, std::array<int64_t,4>> inventory(const VisionConfig & config) {
     std::map<std::string, std::array<int64_t,4>> result;
     auto add = [&](const std::string & n, int64_t a, int64_t b = 1) { result[n] = {a,b,1,1}; };
+    const int64_t width = config.language_dimension;
     add("vision.patch_embed.proj.weight",588,1024); add("vision.patch_embed.proj.bias",1024);
     add("vision.norm.weight",1024);
-    add("aligner.w1.weight",9216,4096); add("aligner.w1.bias",4096);
-    add("aligner.w2.weight",4096,4096); add("aligner.w2.bias",4096);
-    for (auto n : {"image_start","image_pad","image_newline","image_end"}) add(n,4096);
+    add("aligner.w1.weight",9216,width); add("aligner.w1.bias",width);
+    add("aligner.w2.weight",width,width); add("aligner.w2.bias",width);
+    for (auto n : {"image_start","image_newline","image_end"}) add(n,width);
+    if (config.has_pad_sentinel) add("image_pad",width);
     for (int i=0;i<32;++i) {
         const auto p = "vision.blocks." + std::to_string(i);
         add(p+".norm1.weight",1024); add(p+".norm2.weight",1024);
@@ -41,7 +43,7 @@ std::map<std::string, std::array<int64_t,4>> inventory() {
     }
     return result;
 }
-void validate_metadata(gguf_context * g, int dimension, int vocabulary) {
+void validate_metadata(gguf_context * g, int dimension, int vocabulary, VisionConfig & config) {
     auto key = [&](const std::string & n, gguf_type type) {
         auto id = gguf_find_key(g,n.c_str());
         require(id >= 0 && gguf_get_kv_type(g,id)==type,"missing or wrong metadata type: "+n);
@@ -59,6 +61,46 @@ void validate_metadata(gguf_context * g, int dimension, int vocabulary) {
     str("general.architecture","deepseek4_vision"); str("general.type","mmproj");
     integer("general.alignment",32);
     const std::string p="deepseek4.vision.";
+    const auto schema = gguf_find_key(g,(p+"schema_version").c_str());
+    require(schema>=0 && gguf_get_kv_type(g,schema)==GGUF_TYPE_UINT32,"missing or wrong metadata type: "+p+"schema_version");
+    if (gguf_get_val_u32(g,schema)==2) {
+        // DeepSeek-V4.1-Flash: the same tower, a 5120-wide projection and the
+        // reading-order image span (export_ds4v_mmproj.py metadata_v41).
+        str(p+"checkpoint_variant","v4.1-flash");
+        for (auto entry : std::map<std::string,uint32_t>{{"block_count",32},
+                {"embedding_length",1024},{"attention.head_count",16},{"attention.head_dimension",64},
+                {"feed_forward_length",2816},{"patch_size",14},{"downsample_ratio",3},{"aligner_input_length",9216},
+                {"language_embedding_length",5120},{"vocabulary_size",129280},{"image.token_id",129264},
+                {"image.max_tokens",1024},{"image.min_pixels",295936},{"image.layout_version",2},
+                {"image.compression_alignment",1},{"image.sentinel_type_count",4}}) integer(p+entry.first,entry.second);
+        require(dimension==5120 && vocabulary==129280,
+                "this vision projector is DeepSeek V4.1's (5120 wide); the language model is not");
+        real(p+"rope.freq_base",10000.f); real(p+"attention.layer_norm_rms_epsilon",1e-6f);
+        real(p+"image.max_aspect_ratio",0.f);
+        for (auto entry : std::map<std::string,const char *>{{"attention.rope_layout","2d-half-split-height-width"},
+                {"image.patch_layout","channel-major"},{"image.layout","reading-order"},
+                {"image.layout_recipe","row-newline"},{"image.sentinel_types","start,image,newline,end"},
+                {"aligner.padding","bottom-right"},{"aligner.patch_layout","channel-first-unfold"},
+                {"aligner.activation","gelu-exact"}}) str(p+entry.first,entry.second);
+        for (auto n : {"image.normalization_mean","image.normalization_std"}) {
+            auto id = key(p+n,GGUF_TYPE_ARRAY);
+            require(gguf_get_arr_type(g,id)==GGUF_TYPE_FLOAT32 && gguf_get_arr_n(g,id)==3,"bad normalization array");
+            const auto * values = static_cast<const float *>(gguf_get_arr_data(g,id));
+            require(values[0]==.5f && values[1]==.5f && values[2]==.5f,"unsupported normalization");
+        }
+        config.variant = VisionVariant::V41;
+        config.language_dimension = 5120;
+        config.max_image_tokens = 1024;
+        config.has_pad_sentinel = false;
+        const auto revision = gguf_find_key(g,"general.source.revision");
+        if (revision>=0) {
+            require(gguf_get_kv_type(g,revision)==GGUF_TYPE_STRING,"wrong metadata type: general.source.revision");
+            config.source_revision = gguf_get_val_str(g,revision);
+        }
+        return;
+    }
+    require(dimension!=5120,"this vision projector is DeepSeek V4 Vision's (4096 wide); "
+            "DeepSeek V4.1 needs one exported from its own checkpoint");
     for (auto entry : std::map<std::string,uint32_t>{{"schema_version",1},{"block_count",32},
             {"embedding_length",1024},{"attention.head_count",16},{"attention.head_dimension",64},
             {"feed_forward_length",2816},{"patch_size",14},{"downsample_ratio",3},{"aligner_input_length",9216},
@@ -249,6 +291,41 @@ Tensor * attention(ggml_context * c,Tensor * q,Tensor * k,Tensor * v,ggml_backen
     out=ggml_cont(c,ggml_permute(c,out,0,2,1,3));
     return rounded(c,ggml_reshape_2d(c,out,out->ne[0]*out->ne[1],out->ne[2]));
 }
+int64_t attention_query_block(int64_t patches) {
+    // scores + probabilities: 2 * patches * block * heads * 4 bytes.
+    constexpr int64_t budget=512LL*1024*1024;
+    const int64_t block=budget/(2*16*int64_t(sizeof(float))*std::max<int64_t>(patches,1));
+    return std::clamp<int64_t>(block/16*16,16,std::max<int64_t>(patches,16));
+}
+Tensor * attention_blocked(ggml_context * c,Tensor * q,Tensor * k,Tensor * v,int64_t block,ggml_backend_t backend) {
+    // q, k, v: [64, heads, N]. The operand order and pre-scaling are attention()'s.
+    q=ggml_cont(c,ggml_permute(c,q,0,2,1,3));   // [64, N, heads]
+    k=ggml_cont(c,ggml_permute(c,k,0,2,1,3));
+    const float scale=float(std::sqrt(1.0/std::sqrt(double(q->ne[0]))));
+    auto keys=ggml_scale(c,k,scale);
+    auto queries=ggml_scale(c,q,scale);
+    auto values=ggml_cont(c,ggml_permute(c,v,1,2,0,3)); // [N, 64, heads]
+    const int64_t n=q->ne[1];
+    require(block>0,"invalid attention query block");
+    const bool source_softmax=hip_bias_workspace(backend) && n>=16 && n<=4096;
+    require(!hip_bias_workspace(backend) || !source_softmax || hip_softmax_capable(backend),
+            "HIP source-order vision softmax unavailable");
+    Tensor * out=nullptr;
+    for(int64_t first=0;first<n;first+=block) {
+        const int64_t rows=std::min(block,n-first);
+        auto query=ggml_cont(c,ggml_view_3d(c,queries,queries->ne[0],rows,queries->ne[2],
+                                             queries->nb[1],queries->nb[2],size_t(first)*queries->nb[1]));
+        auto scores=ggml_mul_mat(c,keys,query);   // [N, rows, heads]
+        ggml_mul_mat_set_prec(scores,GGML_PREC_F32);
+        Tensor * probabilities=source_softmax ? ggml_soft_max_vision_f32(c,scores) : ggml_soft_max(c,scores);
+        if(source_softmax) require(ggml_backend_supports_op(backend,probabilities),"HIP vision softmax unsupported");
+        auto part=ggml_mul_mat(c,values,probabilities);  // [64, rows, heads]
+        ggml_mul_mat_set_prec(part,GGML_PREC_F32);
+        out=out ? ggml_concat(c,out,part,1) : part;
+    }
+    out=ggml_cont(c,ggml_permute(c,out,0,2,1,3));        // [64, heads, N]
+    return rounded(c,ggml_reshape_2d(c,out,out->ne[0]*out->ne[1],out->ne[2]));
+}
 Tensor * unfold(ggml_context * c,Tensor * x,PatchGrid grid,int channels) {
     x=ggml_reshape_3d(c,x,channels,grid.width,grid.height);
     x=ggml_cont(c,ggml_permute(c,x,2,0,1,3)); // [width,height,channels]
@@ -257,6 +334,26 @@ Tensor * unfold(ggml_context * c,Tensor * x,PatchGrid grid,int channels) {
     auto out=ggml_im2col(c,kernel,x,3,3,0,0,1,1,true,GGML_TYPE_F32);
     return ggml_reshape_2d(c,out,channels*9,((grid.width+2)/3)*((grid.height+2)/3));
 }
+}
+std::string projector_mismatch(const VisionConfig & projector,bool model_is_v41,
+                               const std::string & model_revision) {
+    const bool v41=projector.variant==VisionVariant::V41;
+    if(v41!=model_is_v41) {
+        return std::string("the vision projector is DeepSeek ")+(v41 ? "V4.1" : "V4")+
+               "'s, the model is DeepSeek "+(model_is_v41 ? "V4.1" : "V4");
+    }
+    if(!projector.source_revision.empty() && !model_revision.empty() &&
+       projector.source_revision!=model_revision) {
+        return "the vision projector comes from checkpoint "+projector.source_revision+
+               ", the model from "+model_revision+"; export the projector from the model's checkpoint";
+    }
+    return {};
+}
+uint64_t image_block_tokens(VisionVariant variant,uint64_t rows,uint64_t columns) {
+    if(!rows || !columns) return 0;
+    if(variant==VisionVariant::V41) return rows*(columns+1)+2;
+    const uint64_t padded_rows=rows+rows%2, row_length=columns+1;
+    return padded_rows*row_length+2+(padded_rows/2*row_length%2)*2+3;
 }
 struct VisionRuntime::Impl {
     VisionConfig config;
@@ -325,8 +422,9 @@ bool VisionRuntime::load(const std::string & path,ggml_backend_t backend,int dim
         Meta meta;
         meta.g=gguf_init_from_file(path.c_str(),{true,&meta.c});
         require(meta.g && meta.c,"could not parse vision GGUF");
-        validate_metadata(meta.g,dimension,vocabulary);
-        auto expected=inventory();
+        VisionConfig config;
+        validate_metadata(meta.g,dimension,vocabulary,config);
+        auto expected=inventory(config);
         require(gguf_get_n_tensors(meta.g)==int64_t(expected.size()),"wrong projector tensor count");
         common::GgufMmap mapped;
         if(!mapped.open(path,error)) throw std::runtime_error(error);
@@ -348,6 +446,7 @@ bool VisionRuntime::load(const std::string & path,ggml_backend_t backend,int dim
         for(size_t i=1;i<ranges.size();++i) require(ranges[i].first>=ranges[i-1].second,"overlapping tensor data");
         require(expected.empty(),"missing projector tensor");
         auto candidate=std::make_unique<Impl>();
+        candidate->config=config;
         candidate->backend=backend;
         candidate->weights=meta.c; meta.c=nullptr;
         candidate->buffer=ggml_backend_alloc_ctx_tensors(candidate->weights,backend);
@@ -371,10 +470,9 @@ bool VisionRuntime::encode(const std::vector<float> & patches,PatchGrid grid,Vis
         const int64_t n=int64_t(grid.height)*grid.width;
         const int64_t aligner_height=(grid.height+2)/3, aligner_width=(grid.width+2)/3;
         const int64_t rows=aligner_height*aligner_width;
-        const int64_t padded_height=aligner_height+aligner_height%2;
-        const int64_t row_length=aligner_width+1;
-        const int64_t block_tokens=padded_height*row_length+2+(padded_height/2*row_length%2)*2;
-        require(block_tokens+3<=impl_->config.max_image_tokens,"patch grid exceeds image token budget");
+        const auto & config=impl_->config;
+        require(image_block_tokens(config.variant,uint64_t(aligner_height),uint64_t(aligner_width))<=
+                uint64_t(config.max_image_tokens),"patch grid exceeds image token budget");
         require(patches.size()==size_t(n)*588,"patch count/shape mismatch");
         require(!detail::hip_bias_workspace(impl_->backend) || n>=16,
                 "HIP source-order vision normalization requires at least 16 patches");
@@ -406,7 +504,11 @@ bool VisionRuntime::encode(const std::vector<float> & patches,PatchGrid grid,Vis
             };
             auto q=detail::rotate(g.c,slice(0),cosine,sine);
             auto k=detail::rotate(g.c,slice(1),cosine,sine);
-            auto attention=detail::attention(g.c,q,k,slice(2),impl_->backend);
+            // V4 keeps the qualified whole-image attention; V4.1's images are
+            // up to three times wider, so its queries run in blocks.
+            auto attention=config.variant==VisionVariant::V41
+                ? detail::attention_blocked(g.c,q,k,slice(2),detail::attention_query_block(n),impl_->backend)
+                : detail::attention(g.c,q,k,slice(2),impl_->backend);
             auto projected=impl_->linear(g.c,attention,p+".attn.wo");
             auto residual=rounded(g.c,ggml_add(g.c,input,projected));
             auto mlp=impl_->linear(g.c,impl_->norm(g.c,residual,p+".norm2"),p+".mlp.w1",false);
@@ -443,7 +545,7 @@ bool VisionRuntime::encode(const std::vector<float> & patches,PatchGrid grid,Vis
             result.embeddings=impl_->execute(g,input,x,y,observer);
         }
         for(float value:result.embeddings) require(std::isfinite(value),"non-finite vision output");
-        result.rows=int(rows); result.columns=4096; output=std::move(result);
+        result.rows=int(rows); result.columns=config.language_dimension; output=std::move(result);
         return true;
     } catch(const std::exception & e) { error=e.what(); return false; }
 }
@@ -456,9 +558,13 @@ bool VisionRuntime::sentinel(Sentinel identity,std::vector<float> & output,std::
         case Sentinel::Newline: name="image_newline"; break; case Sentinel::End: name="image_end"; break;
         default: error="invalid sentinel identity"; return false;
     }
-    std::vector<ggml_bf16_t> raw(4096);
+    if(identity==Sentinel::Pad && !impl_->config.has_pad_sentinel) {
+        error="this vision projector has no image_pad row"; return false;
+    }
+    const size_t width=size_t(impl_->config.language_dimension);
+    std::vector<ggml_bf16_t> raw(width);
     ggml_backend_tensor_get(impl_->weight(name),raw.data(),0,raw.size()*sizeof(ggml_bf16_t));
-    output.resize(4096);
+    output.resize(width);
     ggml_bf16_to_fp32_row(raw.data(),output.data(),int64_t(raw.size()));
     return true;
 }

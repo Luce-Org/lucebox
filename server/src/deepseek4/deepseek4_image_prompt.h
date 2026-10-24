@@ -39,10 +39,13 @@ struct PreparedImagePrompt {
 // Consumes final rendered token IDs and already-preprocessed image inputs.
 // Success owns independent copies of patches and layouts. Failure owns no
 // partial tokens/images. No decoding, model execution, or cache policy occurs.
+// `recipe` is the checkpoint's (PreprocessConfig{} for V4,
+// v41_preprocess_config() for V4.1); the images were planned with it.
 PreparedImagePrompt prepare_image_prompt(
     const std::vector<std::int32_t> & rendered_tokens,
     const std::vector<ImagePatchInput> & images,
     const ImagePromptLimits & limits = {},
-    const ImageTokenizerContract & tokenizer = {});
+    const ImageTokenizerContract & tokenizer = {},
+    const PreprocessConfig & recipe = {});
 
 } // namespace luce::vision

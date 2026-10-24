@@ -10,17 +10,42 @@
 
 namespace luce::vision {
 
+// How an image's aligner grid becomes decoder positions.
+enum class ImageLayoutKind {
+    // DeepSeek-V4-Flash-Vision-Exp: row pairs interleaved by column, rows
+    // padded to even, compression padding to a multiple of four positions.
+    RowPairInterleave,
+    // DeepSeek-V4.1-Flash: [start] + ([image] * columns + [newline]) * rows
+    // + [end], aligner rows in reading order, no padding.
+    ReadingOrder,
+};
+
+// The fixed recipe of one checkpoint. The defaults are DeepSeek-V4's;
+// v41_preprocess_config() is DeepSeek-V4.1's. No other combination is valid.
 struct PreprocessConfig {
     std::uint32_t patch_size = 14;
     std::uint32_t downsample_ratio = 3;
     std::uint32_t max_tokens = 384;
     std::uint64_t min_pixels = 147456;
-    std::uint32_t max_aspect_ratio = 8;
-    std::uint32_t compress_pad_to = 4;
+    std::uint32_t max_aspect_ratio = 8;   // 0: no width limit
+    std::uint32_t compress_pad_to = 4;    // 1: no compression padding
     std::uint32_t vocab_size = 129280;
     float normalization_mean = 0.5F;
     float normalization_std = 0.5F;
+    ImageLayoutKind layout = ImageLayoutKind::RowPairInterleave;
 };
+
+// DeepSeek-V4.1-Flash inference/image_processor.py: up to 1024 tokens, a
+// 544x544 pixel floor, no aspect limit (always ImageOps.pad), reading order.
+inline PreprocessConfig v41_preprocess_config() {
+    PreprocessConfig config;
+    config.max_tokens = 1024;
+    config.min_pixels = 295936;
+    config.max_aspect_ratio = 0;
+    config.compress_pad_to = 1;
+    config.layout = ImageLayoutKind::ReadingOrder;
+    return config;
+}
 
 struct PreprocessLimits {
     // The RGB entrypoint receives caller-owned memory, but validates these limits

@@ -201,11 +201,11 @@ static int64_t concurrent_fixed_cache_bytes(
         (int64_t)sizeof(float);
     const int64_t recurrent =
         state_per_layer * n_delta * (int64_t)n_slots;
+    // Must match the target ring allocated in create_target_cache_partial.
+    const int64_t target_feat_cap = std::min(max_ctx, 4096);
     const int64_t target_feat =
         (int64_t)w.n_capture_layers * w.n_embd *
-        (fixed_chain
-             ? (int64_t)std::min(max_ctx, 4096) * n_slots + 1
-             : (int64_t)std::min(max_ctx, 4096)) *
+        (fixed_chain ? target_feat_cap * n_slots + 1 : target_feat_cap) *
         (int64_t)sizeof(uint16_t);
     const int64_t q_capture =
         (int64_t)w.n_embd_head_k * w.n_head * n_full_attn *
@@ -345,7 +345,7 @@ bool Qwen35Backend::init() {
     if (cfg_.draft_path && use_remote_draft) {
         const int cap = cfg_.remote_draft.ring_cap > 0
             ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
-            : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
+            : dflash_draft_context_cap(cfg_.device.max_ctx, cfg_.draft_ctx_max);
         if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, *cfg_.draft_path,
                                  cfg_.draft_gpu, cap,
                                  cfg_.remote_draft.work_dir)) {
@@ -576,10 +576,16 @@ bool Qwen35Backend::init() {
         : (cfg_.paged_attention
                ? paged_token_capacity(cfg_.device.max_ctx)
                : kvflash_tokens_);
+    // The deep feature history is a qwen35moe-specific fix. Dense Qwen 27B
+    // does not exhibit the history cliff and pays a large VRAM/latency tax for
+    // it, so preserve its established 4K ring.
+    const int target_feat_cap = luce::common::dflash_feature_ring_cap(
+        cfg_.device.max_ctx, cfg_.draft_path && w_.is_moe);
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, ctx_alloc,
                              cfg_.paged_attention, n_slots,
-                             fixed_chain.enabled, cfg_.cache_type_k, cfg_.cache_type_v)) {
+                             fixed_chain.enabled, cfg_.cache_type_k, cfg_.cache_type_v,
+                             target_feat_cap)) {
         std::fprintf(stderr, "cache: %s\n", luce_last_error());
         return false;
     }
@@ -654,6 +660,11 @@ bool Qwen35Backend::init() {
             std::fprintf(stderr, "kvflash: pager attach failed (pool=%d)\n", kvflash_tokens_);
             return false;
         }
+        // Page-out and recall run on the pager's own stream; make the compute
+        // stream wait for them on the device before it touches a reused slot
+        // (without this, slot_for() waits on the host instead).
+        if (!tensor_parallel_ && target_backend_ && ggml_backend_is_cuda(target_backend_))
+            kvflash_pager_.set_compute_stream(ggml_backend_cuda_get_stream(target_backend_));
         if (kvflash_qk_policy_) {
             KvFlashQkDims qd;
             qd.n_layers   = (int)cache_.attn_k.size();
@@ -677,11 +688,16 @@ bool Qwen35Backend::init() {
     }
 
     // Init feature mirror when draft model is available (needed for spec decode).
-    // On single-GPU, this is an F32 conversion buffer; on split-GPU, a cross-device mirror.
+    // On single-GPU, this is a conversion buffer; on split-GPU, a cross-device mirror.
+    // Cap at the drafter's trained window (DFLASH_DRAFTER_TRAINED_CTX), not at
+    // draft_ctx_max: the old floor let the drafter see only a shallow suffix, so
+    // accept collapsed once committed exceeded it (8K+).
     if (cfg_.draft_path && !use_remote_draft &&
         !fixed_chain.enabled) {
-        const int mirror_cap = std::min({cfg_.draft_ctx_max, cfg_.device.max_ctx,
-                                         cache_.target_feat_cap > 0 ? cache_.target_feat_cap : cfg_.device.max_ctx});
+        const int mirror_cap = w_.is_moe
+            ? luce::common::dflash_drafter_window(cfg_.device.max_ctx)
+            : std::min({cfg_.draft_ctx_max, cfg_.device.max_ctx,
+                        cache_.target_feat_cap > 0 ? cache_.target_feat_cap : cfg_.device.max_ctx});
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
                                        cfg_.draft_gpu, cfg_.device.gpu, mirror_cap,
                                        w_.n_capture_layers,
@@ -953,7 +969,7 @@ bool Qwen35Backend::unpark(ParkTarget target) {
         if (use_remote_draft) {
             const int cap = cfg_.remote_draft.ring_cap > 0
                 ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
-                : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
+                : dflash_draft_context_cap(cfg_.device.max_ctx, cfg_.draft_ctx_max);
             if (!remote_draft_.start(
                     cfg_.remote_draft.ipc_bin, *cfg_.draft_path,
                                      cfg_.draft_gpu, cap,
@@ -1393,10 +1409,8 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
     for (int i = 0; i < n_full_attn && !mismatch; ++i) {
         const ggml_tensor * ck = i < (int)cache_.attn_k.size() ? cache_.attn_k[i] : nullptr;
         const ggml_tensor * cv = i < (int)cache_.attn_v.size() ? cache_.attn_v[i] : nullptr;
-        if (!same_rows(snap.attn_k_snap[i], ck) ||
-            !same_rows(snap.attn_v_snap[i], cv) ||
-            snap.attn_k_snap[i]->ne[1] != cur_pos ||
-            snap.attn_v_snap[i]->ne[1] != cur_pos) {
+        if (!attn_snapshot_adoptable(snap.attn_k_snap[i], ck, cur_pos) ||
+            !attn_snapshot_adoptable(snap.attn_v_snap[i], cv, cur_pos)) {
             mismatch = "attention KV";
         }
     }
@@ -3511,12 +3525,11 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         }
 
         // 2. Draft compute (skipped on plain-decode burst steps)
-        constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
         bool used_draft_kv = false;
         if (!ar_step) {
             const int ring_cap = use_remote_draft ? remote_draft_.ring_cap() : feature_mirror_.cap;
-            const int draft_ctx = std::min(committed,
-                std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)));
+            const int draft_cap = dflash_draft_context_cap(ring_cap, cfg_.draft_ctx_max);
+            const int draft_ctx = std::min(committed, draft_cap);
             const int draft_start = committed - draft_ctx;
             int mirror_slot0 = 0;
             const bool use_mirror_view =
@@ -3544,8 +3557,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                     draft_kv_free(draft_kv_);
                 }
                 if (use_draft_kv && !draft_kv_.gf) {
-                    const int kv_cap = std::min(ring_cap,
-                        std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max));
+                    const int kv_cap = draft_cap;
                     if (!draft_kv_init(draft_kv_, dw_, draft_backend_, kv_cap, nullptr)) {
                         draft_kv_free(draft_kv_);
                         use_draft_kv = false;
@@ -3576,7 +3588,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                     if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
                                           draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
                                           committed,
-                                          /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
+                                          /*ctx_len_max=*/draft_cap)) {
                         std::fprintf(stderr, "spec-decode: draft build failed\n");
                         step_graph_destroy(draft_sg);
                         return false;

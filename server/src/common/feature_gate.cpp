@@ -57,19 +57,22 @@ std::string check_feature_compatibility(
     }
 
     // ── vision projector × architecture / placement
+    // DeepSeek V4 Vision and DeepSeek V4.1 Flash share the DeepSeek4 image
+    // path; the backend checks that the projector matches the model.
+    const bool deepseek_vision = arch_is_deepseek4_family(arch);
     if (args.mmproj_path.has_value()) {
-        if ((arch != "deepseek4" && arch != "qwen35") || args.device.is_layer_split() ||
+        if ((!deepseek_vision && arch != "qwen35") || args.device.is_layer_split() ||
             args.device.is_tensor_parallel() || args.remote_target_shard.enabled() ||
-            (arch == "deepseek4" && args.max_concurrency != 1 && !args.paged_attention)) {
+            (deepseek_vision && args.max_concurrency != 1 && !args.paged_attention)) {
             return "--mmproj requires a local DeepSeek4 or Qwen3.5 backend that is not split "
                    "across GPUs by layer or tensor (DeepSeek4 batching needs --paged-attention)";
         }
-        if (arch == "deepseek4" && target_backend != PlacementBackend::Hip) {
+        if (deepseek_vision && target_backend != PlacementBackend::Hip) {
             return "--mmproj with DeepSeek4 requires a HIP backend";
         }
     }
     if (args.mmproj_device.has_value()) {
-        if (!args.mmproj_path.has_value() || arch != "deepseek4" ||
+        if (!args.mmproj_path.has_value() || !deepseek_vision ||
             args.mmproj_device->backend != PlacementBackend::Hip ||
             args.mmproj_device->gpu == args.device.gpu) {
             return "--mmproj-device needs --mmproj, a DeepSeek4 target, and a HIP GPU "

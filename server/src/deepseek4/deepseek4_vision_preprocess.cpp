@@ -163,6 +163,81 @@ PreprocessStatus solve_resize_ratio(
     return grid_tokens(best_height, best_width, config, grid);
 }
 
+// V4.1 image_processor.py llm_grid / num_image_tokens.
+PreprocessStatus reading_order_grid(
+    std::uint32_t height,
+    std::uint32_t width,
+    const PreprocessConfig & config,
+    GridTokens & result) {
+    if (height == 0 || width == 0 || height % config.patch_size != 0 ||
+        width % config.patch_size != 0) {
+        return fail(PreprocessError::ResizePlanFailed,
+                    "planned dimensions must be nonzero patch multiples");
+    }
+    const std::uint64_t rows =
+        (height / config.patch_size + config.downsample_ratio - 1) / config.downsample_ratio;
+    const std::uint64_t cols =
+        (width / config.patch_size + config.downsample_ratio - 1) / config.downsample_ratio;
+    std::uint64_t tokens = 0;
+    if (rows == 0 || cols == 0 || rows > std::numeric_limits<std::uint32_t>::max() ||
+        cols > std::numeric_limits<std::uint32_t>::max() ||
+        !checked_mul(rows, cols + 1, tokens) || !checked_add(tokens, 2, tokens)) {
+        return fail(PreprocessError::ResizePlanFailed, "aligner grid is out of range");
+    }
+    result.rows = static_cast<std::uint32_t>(rows);
+    result.cols = static_cast<std::uint32_t>(cols);
+    result.tokens = tokens;
+    return ok();
+}
+
+// V4.1 image_processor.py solve_resize_ratio: the largest aspect-preserving
+// size whose grid fits max_tokens, collapsing to one column or one row when
+// the image is too tall or too wide for even that. The float operations and
+// their order are the source's (Python floats are IEEE doubles).
+PreprocessStatus solve_reading_order_resize(
+    std::uint32_t height,
+    std::uint32_t width,
+    const PreprocessConfig & config,
+    std::uint32_t & best_height,
+    std::uint32_t & best_width) {
+    const std::uint64_t max_tokens = config.max_tokens;
+    if (max_tokens <= 3 || height == 0 || width == 0) {
+        return fail(PreprocessError::ResizePlanFailed, "resize budget is too small");
+    }
+    const double ratio = static_cast<double>(height) / static_cast<double>(width);
+    const double max_width_float =
+        std::sqrt(static_cast<double>(max_tokens - 2) / ratio + 0.25) - 0.5;
+    const double max_height_float = max_width_float * ratio;
+    const std::uint64_t cell =
+        static_cast<std::uint64_t>(config.patch_size) * config.downsample_ratio;
+    std::uint64_t solved_height = 0;
+    std::uint64_t solved_width = 0;
+    if (max_width_float < 1.0) {
+        solved_height = (max_tokens - 2) / 2 * cell;
+        solved_width = cell;
+    } else if (max_height_float < 1.0) {
+        solved_height = cell;
+        solved_width = (max_tokens - 3) * cell;
+    } else {
+        const double beta = std::min(
+            std::floor(max_width_float) * static_cast<double>(cell) / static_cast<double>(width),
+            std::floor(max_height_float) * static_cast<double>(cell) / static_cast<double>(height));
+        solved_height = static_cast<std::uint64_t>(
+            std::floor(static_cast<double>(height) * beta / config.patch_size)) * config.patch_size;
+        solved_width = static_cast<std::uint64_t>(
+            std::floor(static_cast<double>(width) * beta / config.patch_size)) * config.patch_size;
+    }
+    if (solved_width == 0 || solved_height == 0 ||
+        solved_width > std::numeric_limits<std::uint32_t>::max() ||
+        solved_height > std::numeric_limits<std::uint32_t>::max()) {
+        return fail(PreprocessError::ResizePlanFailed,
+                    "resize solver produced out-of-range dimensions");
+    }
+    best_height = static_cast<std::uint32_t>(solved_height);
+    best_width = static_cast<std::uint32_t>(solved_width);
+    return ok();
+}
+
 PreprocessStatus pillow_resize(
     const std::vector<std::uint8_t> & input,
     int input_width,
@@ -294,8 +369,9 @@ PreprocessStatus make_patches(
 }  // namespace
 
 PreprocessStatus validate_config(const PreprocessConfig & config) {
-    const PreprocessConfig expected;
-    if (config.patch_size != expected.patch_size ||
+    const PreprocessConfig expected = config.layout == ImageLayoutKind::ReadingOrder
+        ? v41_preprocess_config() : PreprocessConfig{};
+    if (config.layout != expected.layout || config.patch_size != expected.patch_size ||
         config.downsample_ratio != expected.downsample_ratio ||
         config.max_tokens != expected.max_tokens ||
         config.min_pixels != expected.min_pixels ||
@@ -305,7 +381,7 @@ PreprocessStatus validate_config(const PreprocessConfig & config) {
         config.normalization_mean != expected.normalization_mean ||
         config.normalization_std != expected.normalization_std) {
         return fail(PreprocessError::InvalidConfig,
-                    "preprocessing config does not match the fixed DeepSeek-V4 vision recipe");
+                    "preprocessing config does not match a fixed DeepSeek vision recipe");
     }
     return ok();
 }
@@ -344,14 +420,17 @@ PreprocessStatus plan_image(
         return status;
     }
 
-    const bool direct_resize =
+    // V4.1 has no aspect limit (vision_max_wh_ratio is None): no clamp, and
+    // every image goes through ImageOps.pad.
+    const bool limited_aspect = config.max_aspect_ratio != 0;
+    const bool direct_resize = limited_aspect &&
         static_cast<std::uint64_t>(width) >=
         static_cast<std::uint64_t>(height) * config.max_aspect_ratio;
     std::uint64_t planned_width = width;
     std::uint64_t planned_height = height;
     const std::uint64_t max_width =
         static_cast<std::uint64_t>(height) * config.max_aspect_ratio;
-    if (planned_width > max_width) {
+    if (limited_aspect && planned_width > max_width) {
         planned_width = max_width;
     }
 
@@ -383,7 +462,27 @@ PreprocessStatus plan_image(
     std::uint32_t best_width = static_cast<std::uint32_t>(aligned_width);
     std::uint32_t best_height = static_cast<std::uint32_t>(aligned_height);
     GridTokens grid;
-    if (const auto status = grid_tokens(best_height, best_width, config, grid); !status) {
+    if (config.layout == ImageLayoutKind::ReadingOrder) {
+        // V4.1 safe_resize: one solve when the natural size costs too much.
+        if (const auto status = reading_order_grid(best_height, best_width, config, grid); !status) {
+            return status;
+        }
+        if (grid.tokens > config.max_tokens) {
+            if (const auto status = solve_reading_order_resize(
+                    static_cast<std::uint32_t>(planned_height),
+                    static_cast<std::uint32_t>(planned_width), config, best_height, best_width);
+                !status) {
+                return status;
+            }
+            if (const auto status = reading_order_grid(best_height, best_width, config, grid); !status) {
+                return status;
+            }
+            if (grid.tokens > config.max_tokens) {
+                return fail(PreprocessError::ResizePlanFailed,
+                            "could not solve image dimensions within the token budget");
+            }
+        }
+    } else if (const auto status = grid_tokens(best_height, best_width, config, grid); !status) {
         return status;
     }
 
@@ -394,7 +493,7 @@ PreprocessStatus plan_image(
     const std::uint32_t image_budget = config.max_tokens - reserved;
     std::uint32_t solver_budget = image_budget;
     std::uint32_t attempts = 0;
-    while (grid.tokens > image_budget) {
+    while (config.layout == ImageLayoutKind::RowPairInterleave && grid.tokens > image_budget) {
         if (solver_budget <= 2 || ++attempts > config.max_tokens) {
             return fail(PreprocessError::ResizePlanFailed,
                         "could not solve image dimensions within the token budget");
@@ -440,6 +539,38 @@ PreprocessStatus build_image_layout(
     }
     if (aligner_rows == 0 || aligner_cols == 0) {
         return fail(PreprocessError::InvalidDimensions, "aligner grid dimensions must be positive");
+    }
+    if (config.layout == ImageLayoutKind::ReadingOrder) {
+        std::uint64_t total = 0;
+        if (!checked_mul(aligner_rows, static_cast<std::uint64_t>(aligner_cols) + 1, total) ||
+            !checked_add(total, 2, total)) {
+            return fail(PreprocessError::TokenBudgetExceeded, "layout token count overflow");
+        }
+        if (total > config.max_tokens) {
+            std::ostringstream message;
+            message << "image layout needs " << total << " tokens, limit is " << config.max_tokens;
+            return fail(PreprocessError::TokenBudgetExceeded, message.str());
+        }
+        std::uint64_t block_end = 0;
+        if (!checked_add(start_position, total, block_end)) {
+            return fail(PreprocessError::PositionOverflow, "absolute image span overflow");
+        }
+        layout.types.clear();
+        layout.permutation.clear();
+        layout.types.reserve(static_cast<std::size_t>(total));
+        layout.permutation.reserve(static_cast<std::size_t>(aligner_rows) * aligner_cols);
+        layout.types.push_back(ImageTokenType::Start);
+        for (std::uint64_t row = 0; row < aligner_rows; ++row) {
+            for (std::uint64_t column = 0; column < aligner_cols; ++column) {
+                layout.types.push_back(ImageTokenType::Image);
+                layout.permutation.push_back(static_cast<std::int64_t>(row * aligner_cols + column));
+            }
+            layout.types.push_back(ImageTokenType::Newline);
+        }
+        layout.types.push_back(ImageTokenType::End);
+        // Causal decoder: the whole block is the image, none of it pads.
+        layout.span = {start_position, start_position, block_end, block_end};
+        return ok();
     }
 
     const std::uint64_t leading_pad =

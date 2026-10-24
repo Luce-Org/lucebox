@@ -290,6 +290,8 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::mtp_step(const StepInput & input) {
     output.slot = id;
     output.token = decision.emitted[(size_t)retained - 1];
     output.committed_tokens.assign(decision.emitted.begin(), decision.emitted.begin() + retained - 1);
+    output.spec_offered = step.k;
+    output.spec_accepted = decision.n_accepted;
     result.decode.push_back(std::move(output));
     return result;
 }
