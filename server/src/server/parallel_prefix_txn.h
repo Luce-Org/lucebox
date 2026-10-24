@@ -49,6 +49,11 @@ public:
                 reservation_.target_cut()};
     }
 
+    // The prompt length this capture will save; 0 once it resolved.
+    int target_tokens() const {
+        return active() ? ticket_.checkpoint.tokens : 0;
+    }
+
     Resolution resolve(
             const PrefixStoreEvent & event,
             const std::vector<int32_t> & prompt) {

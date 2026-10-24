@@ -233,6 +233,13 @@ static void print_usage(const char * prog) {
         "                          other models: N > 1 enables paged attention)\n"
         "  --admission-coalesce-ms <N>  Idle-to-busy batching window\n"
         "                               (default: 20; 0 disables)\n"
+        "  --shared-prefix-wait-min-tokens <N>  A prompt that starts with a\n"
+        "                               prefix another request is saving waits\n"
+        "                               for it when it is N+ tokens longer than\n"
+        "                               what it can restore (default: 512; 0 off)\n"
+        "  --thinking-loop-repeats <N>  Continuous batching: close thinking once one\n"
+        "                               64-token span of it has appeared N >= 2 times\n"
+        "                               (default: 6; 0 off)\n"
         "  --kv-pool-tokens <N> Total paged K/V pool shared by all\n"
         "                       --max-concurrency slots, in tokens\n"
         "                       By default, Qwen sizes the pool from available device\n"
@@ -794,6 +801,34 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 sconfig.admission_coalesce_ms > 1000) {
                 std::fprintf(stderr,
                     "[server] --admission-coalesce-ms must be in [0,1000]\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--shared-prefix-wait-min-tokens") == 0 &&
+                   i + 1 < argc) {
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            const auto parsed = std::from_chars(
+                value, end, sconfig.shared_prefix_wait_min_tokens);
+            if (parsed.ec != std::errc{} || parsed.ptr != end ||
+                sconfig.shared_prefix_wait_min_tokens < 0) {
+                std::fprintf(stderr,
+                    "[server] --shared-prefix-wait-min-tokens must be a "
+                    "non-negative integer\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--thinking-loop-repeats") == 0 &&
+                   i + 1 < argc) {
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            const auto parsed = std::from_chars(
+                value, end, sconfig.thinking_loop_repeats);
+            if (parsed.ec != std::errc{} || parsed.ptr != end ||
+                sconfig.thinking_loop_repeats < 0 ||
+                sconfig.thinking_loop_repeats == 1) {
+                // One appearance is not a loop.
+                std::fprintf(stderr,
+                    "[server] --thinking-loop-repeats must be 0 or at "
+                    "least 2\n");
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--kv-pool-tokens") == 0 && i + 1 < argc) {
@@ -2172,6 +2207,8 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     std::fprintf(stderr, "[server] │  chunk           = %d\n", backend->prefill_chunk_size() > 0 ? backend->prefill_chunk_size() : backend_execution.chunk);
     std::fprintf(stderr, "[server] │  admission_wait  = %d ms\n",
                  sconfig.admission_coalesce_ms);
+    std::fprintf(stderr, "[server] │  prefix_wait_min = %d tokens\n",
+                 sconfig.shared_prefix_wait_min_tokens);
     if (arch_is_deepseek4_family(arch)) {
         std::fprintf(stderr, "[server] │  ds4_fused      = %s\n",
                      backend_execution.fused_decode ? "ON" : "off");

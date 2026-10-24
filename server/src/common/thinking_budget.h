@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace luce::common {
@@ -20,6 +21,13 @@ struct BudgetHook {
     // disables natural-close detection.
     std::vector<int32_t> marker_token_ids;
     int hard_limit_remaining = 0;
+    // Thinking that goes round in circles (greedy decoding's failure: the
+    // same draft rewritten again and again, or an exact loop): once one span
+    // of loop_span tokens has appeared loop_repeats times, it ends the way
+    // the hard limit does, when the decoder arms the close (arm_loop_close).
+    // 0 repeats disables.
+    int loop_span = 64;
+    int loop_repeats = 0;
 };
 
 // The reply reserve comes out of the request's output cap. When the cap is at
@@ -57,6 +65,12 @@ public:
             hook_->marker_token_ids.size() > 1) {
             marker_tail_.reserve(hook_->marker_token_ids.size() - 1);
         }
+        if (hook_ && !hook_->close_token_ids.empty() &&
+            hook_->loop_repeats > 1 && hook_->loop_span > 0) {
+            loop_ring_.assign((size_t)hook_->loop_span, 0);
+            loop_drop_ = 1;
+            for (int i = 1; i < hook_->loop_span; ++i) loop_drop_ *= kLoopBase;
+        }
     }
     ThinkingBudget(BudgetHook &&, int) = delete;
 
@@ -76,7 +90,18 @@ public:
     // follows the handoff; a natural close disables this restriction.
     bool needs_ar_tail(int max_block_tokens) const {
         return !settled() &&
-               remaining_ - hook_->hard_limit_remaining <= max_block_tokens;
+               (looping_ ||
+                remaining_ - hook_->hard_limit_remaining <= max_block_tokens);
+    }
+
+    // Thinking repeats itself (see BudgetHook::loop_repeats) and has not
+    // closed yet.
+    bool looping() const { return looping_ && !settled(); }
+    // The next accepted token starts the close. A decoder that cannot
+    // replace a token inside a verified block arms it before a step that
+    // emits a single token.
+    void arm_loop_close() {
+        if (looping()) loop_armed_ = true;
     }
 
     std::size_t pending_close_tokens() const {
@@ -103,8 +128,9 @@ public:
             marker_tail_.clear();
             return {candidate, false};
         }
-        if (remaining > hook_->hard_limit_remaining) {
+        if (remaining > hook_->hard_limit_remaining && !loop_armed_) {
             remember(candidate);
+            if (!looping_ && !loop_ring_.empty()) looping_ = repeats(candidate);
             return {candidate, false};
         }
         forced_ = true;
@@ -141,6 +167,17 @@ private:
         return true;
     }
 
+    // Counts each loop_span-token window of thinking by a rolling hash.
+    bool repeats(int32_t token) {
+        const size_t span = loop_ring_.size();
+        const size_t at = (size_t)(loop_seen_ % span);
+        if (loop_seen_ >= (long long)span) loop_hash_ -= (uint64_t)loop_ring_[at] * loop_drop_;
+        loop_hash_ = loop_hash_ * kLoopBase + (uint64_t)(uint32_t)token;
+        loop_ring_[at] = token;
+        if (++loop_seen_ < (long long)span) return false;
+        return ++loop_windows_[loop_hash_] >= hook_->loop_repeats;
+    }
+
     void remember(int32_t token) {
         const auto size = hook_->marker_token_ids.size();
         if (size < 2) return;
@@ -157,6 +194,14 @@ private:
     bool forced_ = false;
     std::size_t inject_pos_ = 0;
     std::vector<int32_t> marker_tail_;
+    static constexpr uint64_t kLoopBase = 0x9E3779B97F4A7C15ull;
+    std::vector<int32_t> loop_ring_;  // the last loop_span thinking tokens
+    std::unordered_map<uint64_t, int> loop_windows_;
+    uint64_t loop_hash_ = 0;
+    uint64_t loop_drop_ = 0;  // kLoopBase^(loop_span - 1)
+    long long loop_seen_ = 0;
+    bool looping_ = false;
+    bool loop_armed_ = false;
 };
 
 }  // namespace luce::common

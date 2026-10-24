@@ -2074,6 +2074,7 @@ json build_props_body(const ServerConfig & config,
             {"chunk",           config.chunk},
             {"continuous_batching", {
                 {"admission_coalesce_ms", config.admission_coalesce_ms},
+                {"shared_prefix_wait_min_tokens", config.shared_prefix_wait_min_tokens},
                 {"decode_kv_offload_bytes", config.decode_kv_offload_bytes},
             }},
             // Device placement strings (e.g. "auto:0", "cuda:0"). Empty
@@ -2103,6 +2104,7 @@ json build_props_body(const ServerConfig & config,
             {"model_card_source",       config.model_card_source_label},
             {"default_max_tokens",      config.default_max_tokens},
             {"hard_limit_reply_budget", config.hard_limit_reply_budget},
+            {"thinking_loop_repeats", config.thinking_loop_repeats},
             {"think_max_tokens",        config.think_max_tokens},
             {"effort_tiers", {
                 {"low",    config.effort_tiers.low},
@@ -4374,9 +4376,10 @@ private:
 }  // namespace
 
 bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * admission,
-                                       int & status, std::string & body) {
+                                       int & status, std::string & body,
+                                       SocketHandle client_fd) {
 #if defined(_WIN32)
-    (void) request; (void) admission;
+    (void) request; (void) admission; (void) client_fd;
     status = 501;
     body = json({{"error", {{"message", "tool checks need socketpair"}}}}).dump();
     return true;
@@ -4388,9 +4391,24 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
         return true;
     }
     std::string raw;
-    std::thread reader([&raw, in = pair[1]] {
+    std::thread reader([&raw, in = pair[1], client_fd] {
         char buf[65536];
         for (;;) {
+            // The client leaving ends the inner request too: shutting the pair
+            // down reads as a disconnect to the job waiting on it, which the
+            // scheduler retires instead of generating for nobody.
+            struct pollfd pfd = {in, POLLIN, 0};
+            const int ready = ::poll(&pfd, 1, (int) kClientMonitorInterval.count());
+            if (ready < 0 && sock_is_eintr(sock_errno())) continue;
+            if (ready == 0) {
+                if (client_fd != kInvalidSocket &&
+                    http_detail::inspect_peer_socket(client_fd) ==
+                        http_detail::PeerSocketState::Disconnected) {
+                    ::shutdown(in, SHUT_RDWR);
+                    break;
+                }
+                continue;
+            }
             const ssize_t n = ::recv(in, buf, sizeof(buf), 0);
             if (n > 0) raw.append(buf, (size_t) n);
             else if (n == 0 || !sock_is_eintr(sock_errno())) break;
@@ -4453,14 +4471,14 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         }
         int status = 0;
         std::string raw;
-        if (!inner_chat_completion(body, nullptr, status, raw) || status != 200) return false;
+        if (!inner_chat_completion(body, nullptr, status, raw, fd) || status != 200) return false;
         response = json::parse(raw, nullptr, false);
         return !response.is_discarded() && tc::reply_message(response) != nullptr;
     };
 
     int status = 0;
     std::string raw;
-    if (!inner_chat_completion(request, admission, status, raw)) return true;
+    if (!inner_chat_completion(request, admission, status, raw, fd)) return true;
     json response = json::parse(raw, nullptr, false);
     json * reply = status == 200 && !response.is_discarded() ? tc::reply_message(response) : nullptr;
     if (!reply) {
@@ -10546,6 +10564,19 @@ ServerJob * HttpServer::try_dequeue() {
     if (!queue_head_) queue_tail_ = nullptr;
     job->next = nullptr;
     return job;
+}
+
+int HttpServer::queued_shared_prefix(const std::vector<int32_t> & prompt) {
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    size_t best = 0;
+    for (const ServerJob * job = queue_head_; job; job = job->next) {
+        if (job->req.images) continue;
+        const std::vector<int32_t> & other = job->req.prompt_tokens;
+        const size_t n = std::min(prompt.size(), other.size());
+        best = std::max(best, (size_t)(std::mismatch(
+            prompt.begin(), prompt.begin() + n, other.begin()).first - prompt.begin()));
+    }
+    return (int)best;
 }
 
 ServerJob * HttpServer::dequeue_for(

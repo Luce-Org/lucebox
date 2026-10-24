@@ -72,6 +72,7 @@ struct SchedSlot {
     luce::common::BudgetHook hook;
     luce::common::ThinkingBudget budget;
     bool degenerate_close = false;
+    bool loop_close_armed = false;
     // Speculative verifier positions over the request's rounds (see
     // SeqEngine::DecodeOutput), for its /status perf record.
     luce::common::SpecAcceptanceStats acceptance;
@@ -120,6 +121,22 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // of the line so FIFO order survives the deferral.
     ServerJob * deferred = nullptr;
     std::chrono::steady_clock::time_point deferred_retry_at{};
+    // Requests waiting for the prefix another slot is prefilling to be
+    // saved (see find_prefix_leader), oldest first. They hold no slot, so
+    // the line behind them keeps moving.
+    struct PrefixWaiter {
+        ServerJob * job = nullptr;
+        int leader = -1;
+        uint64_t leader_order = 0;
+        int cut = 0;
+        int leader_left = 0;
+        std::chrono::steady_clock::time_point since{};
+        std::chrono::steady_clock::time_point progressed_at{};
+    };
+    std::vector<PrefixWaiter> prefix_waiters;
+    // A leader that prefills nothing for this long (parked, or starved by
+    // longer prompts) releases its waiters to prefill on their own.
+    constexpr auto kPrefixLeaderStall = std::chrono::seconds(30);
 
     // Disk session cache. Checkpoints that leave RAM (a capture replacing
     // its reservation's victim) are written by the disk writer thread; a
@@ -621,17 +638,45 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             // checkpoint lands in a different slot so the restore point can
             // slide forward past the deepest slot (same rule as the classic
             // worker's restore_source_slot).
-            capture_reservation = prefix_cache_.reserve_inline_snap(
-                req.prompt_tokens,
-                prefix_plan.restore.valid()
-                    ? prefix_plan.restore.tokens : 0,
-                /*prefer_tools_boundary=*/!req.tools.empty(),
-                req.pin_end_token,
-                restore_policy_slot,
-                [&engine](int target_cut) {
-                    return engine.estimate_prefix_store_bytes(target_cut);
-                },
-                /*reachable_from=*/0, backend_.restore_point_spacing());
+            const int restored_len =
+                prefix_plan.restore.valid() ? prefix_plan.restore.tokens : 0;
+            const auto reserve_capture = [&](int forced_cut) {
+                return prefix_cache_.reserve_inline_snap(
+                    req.prompt_tokens, restored_len,
+                    /*prefer_tools_boundary=*/!req.tools.empty(),
+                    forced_cut,
+                    restore_policy_slot,
+                    [&engine](int target_cut) {
+                        return engine.estimate_prefix_store_bytes(target_cut);
+                    },
+                    /*reachable_from=*/0, backend_.restore_point_spacing());
+            };
+            capture_reservation = reserve_capture(req.pin_end_token);
+            // Subagents launched together: when the requests still queued
+            // share more of this prompt than its own capture keeps whole
+            // (system messages that differ only after the tools), it
+            // captures the shared prefix instead, for them to restore.
+            const int wait_min = config_.shared_prefix_wait_min_tokens;
+            if (capture_reservation.active() && wait_min > 0 &&
+                req.pin_end_token <= restored_len) {
+                const int own_cut = capture_reservation.target_cut();
+                const int shared = queued_shared_prefix(req.prompt_tokens);
+                if (shared < own_cut && shared - restored_len >= wait_min) {
+                    capture_reservation.cancel();
+                    capture_reservation = reserve_capture(shared);
+                    if (capture_reservation.active() &&
+                        capture_reservation.target_cut() <= shared &&
+                        capture_reservation.target_cut() - restored_len >= wait_min) {
+                        std::fprintf(stderr,
+                            "[pc] %s captures the %d-token prefix it shares with "
+                            "queued requests, not %d\n", req.response_id.c_str(),
+                            capture_reservation.target_cut(), own_cut);
+                    } else {
+                        capture_reservation.cancel();
+                        capture_reservation = reserve_capture(req.pin_end_token);
+                    }
+                }
+            }
             if (capture_reservation.active()) {
                 const uint64_t capture_id = next_prefix_capture_id++;
                 if (next_prefix_capture_id == 0)
@@ -854,11 +899,78 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             s.hook.close_token_ids = config_.think_close_token_ids;
             s.hook.marker_token_ids = config_.think_marker_token_ids;
             s.hook.hard_limit_remaining = eff_reply_for_n_gen;
+            s.hook.loop_repeats = config_.thinking_loop_repeats;
         }
         s.budget = luce::common::ThinkingBudget(s.hook, s.n_gen_cap);
         live_slots++;
         publish_live_count();
         return AdmissionDisposition::Admitted;
+    };
+
+    // The slot whose prefill will save the deepest prefix of this prompt, at
+    // least shared_prefix_wait_min_tokens past what the prompt restores now
+    // and short of the whole prompt; -1 when no live capture is worth the
+    // wait. Subagents launched together share their system prompt and tools:
+    // the first one admitted saves them, the others restore them instead of
+    // prefilling the same tokens beside it.
+    auto find_prefix_leader = [&](const ServerJob * job) {
+        const int min_tokens = config_.shared_prefix_wait_min_tokens;
+        const std::vector<int32_t> & prompt = job->req.prompt_tokens;
+        if (min_tokens <= 0 || job->req.images ||
+            !engine.supports_prefix_store() || prefix_cache_.disabled()) {
+            return -1;
+        }
+        int leader = -1, best_cut = 0;
+        for (int i = 0; i < n_slots; ++i) {
+            const SchedSlot & s = slots[(size_t)i];
+            if (!s.job || !s.prefilling || parked(i)) continue;
+            const int cut = s.cache_capture.target_tokens();
+            const std::vector<int32_t> & other = s.job->req.prompt_tokens;
+            if (cut < min_tokens || cut <= best_cut ||
+                cut >= (int)prompt.size() || cut > (int)other.size() ||
+                !std::equal(prompt.begin(), prompt.begin() + cut,
+                            other.begin())) {
+                continue;
+            }
+            leader = i;
+            best_cut = cut;
+        }
+        if (leader < 0) return -1;
+        const int restorable = prefix_cache_.lookup_candidate(
+            prompt, (int)prompt.size() - 1).second;
+        return best_cut - restorable >= min_tokens ? leader : -1;
+    };
+    // The oldest waiter whose wait is over: its leader saved the prefix (or
+    // gave up on it), stopped prefilling, stalled, or its client left.
+    auto take_ready_waiter = [&]() -> ServerJob * {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = prefix_waiters.begin(); it != prefix_waiters.end(); ++it) {
+            PrefixWaiter & w = *it;
+            const SchedSlot & leader = slots[(size_t)w.leader];
+            const char * reason = nullptr;
+            if (w.job->client_disconnected.load(std::memory_order_acquire)) {
+                reason = "client left";
+            } else if (!leader.job || leader.admission_order != w.leader_order ||
+                       !leader.prefilling ||
+                       leader.cache_capture.target_tokens() != w.cut) {
+                reason = "prefix capture resolved";
+            } else if (leader.prompt_left != w.leader_left) {
+                w.leader_left = leader.prompt_left;
+                w.progressed_at = now;
+            } else if (now - w.progressed_at > kPrefixLeaderStall) {
+                reason = "leader stalled";
+            }
+            if (!reason) continue;
+            ServerJob * job = w.job;
+            std::fprintf(stderr,
+                "[pc] %s waited %.1fs for a %d-token shared prefix: %s\n",
+                job->req.response_id.c_str(),
+                std::chrono::duration<double>(now - w.since).count(),
+                w.cut, reason);
+            prefix_waiters.erase(it);
+            return job;
+        }
+        return nullptr;
     };
 
     // Scheduler loop. Every iteration walks the same five phases:
@@ -887,6 +999,15 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // (StepPlanLimits::prefill_time_share): no prompt chunk joins a step that
     // has them until it ends.
     std::chrono::steady_clock::time_point decode_only_until{};
+    // Longest burst a decode output carries (0: unknown, no bursts while a
+    // thinking budget can still replace a token).
+    const int max_decode_tokens = engine.max_decode_tokens();
+    // Steps in a row that ran short prompts while longer ones waited. After
+    // kShortFirstSteps, the longer ones join the next step: short prompts
+    // arriving one after another (agents' next turns) cannot stall them.
+    constexpr int kShortFirstSteps = 4;
+    int short_first_steps = 0;
+    bool held_long_prompts = false, long_prompt_waiting = false, long_prompt_in_step = false;
 
     // PFlash. A prompt over the compression threshold leaves the line for
     // the compression thread: live slots keep decoding while the drafter
@@ -1015,6 +1136,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             ServerJob * job = deferred;
             deferred = nullptr;
             bool woke_from_idle = false;
+            // Then the waiters whose shared prefix is ready (they were
+            // dequeued before anything still in the queue).
+            if (!job) job = take_ready_waiter();
+            const bool fresh = job == nullptr;
             if (!job) {
                 if (live_slots == 0 && drains.empty()) {
                     // Fully idle: no stream is waiting on us, so give the
@@ -1059,6 +1184,33 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             if (job->pflash_error_status != 0) {
                 fail_preparation(job);
                 continue;
+            }
+            if (fresh) {
+                const int leader = find_prefix_leader(job);
+                if (leader >= 0) {
+                    const SchedSlot & l = slots[(size_t)leader];
+                    const auto now = std::chrono::steady_clock::now();
+                    if (job->parallel_started_at ==
+                            std::chrono::steady_clock::time_point{}) {
+                        job->parallel_started_at = now;
+                    }
+                    PrefixWaiter w;
+                    w.job = job;
+                    w.leader = leader;
+                    w.leader_order = l.admission_order;
+                    w.cut = l.cache_capture.target_tokens();
+                    w.leader_left = l.prompt_left;
+                    w.since = now;
+                    w.progressed_at = now;
+                    std::fprintf(stderr,
+                        "[pc] %s waits for the %d-token prefix %s is "
+                        "prefilling (prompt %zu tokens)\n",
+                        job->req.response_id.c_str(), w.cut,
+                        l.job->req.response_id.c_str(),
+                        job->req.prompt_tokens.size());
+                    prefix_waiters.push_back(w);
+                    continue;
+                }
             }
             const AdmissionDisposition outcome = admit_job(job);
             if (outcome == AdmissionDisposition::Loading) {
@@ -1183,6 +1335,18 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
         // Phase 3 — Build the resident cohort. Parked requests retain their
         // socket/emitter and pending token, but never enter a device graph.
+        // A slot whose thinking loops closes it at its next single-token
+        // step: the close replaces that token, never one inside a burst.
+        const auto arm_loop_close = [&](int i) {
+            SchedSlot & s = slots[(size_t)i];
+            if (!s.budget.looping() || s.loop_close_armed) return;
+            s.budget.arm_loop_close();
+            s.loop_close_armed = true;
+            std::fprintf(stderr,
+                "[parallel] %s thinking repeats itself after %zu tokens: "
+                "closing it\n", s.job->req.response_id.c_str(),
+                s.gen_tokens.size());
+        };
         auto build_plan = [&]() {
             step_plan.decode.clear();
             prefill_candidates.clear();
@@ -1191,9 +1355,15 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 if (!s.job || parked(i)) continue;
                 if (!s.prefilling) {
                     // A grammar masks one position at a time: no bursts.
+                    // While thinking, a burst must not reach the token the
+                    // budget replaces: none closes inside it.
+                    const bool budget_clear = s.budget.settled() ||
+                        (max_decode_tokens > 0 &&
+                         !s.budget.needs_ar_tail(max_decode_tokens));
+                    if (!budget_clear) arm_loop_close(i);
                     step_plan.decode.push_back(
                         {i, s.pending_tok,
-                         s.budget.settled() && !s.job->req.sampler.constraint});
+                         budget_clear && !s.job->req.sampler.constraint});
                 } else {
                     prefill_candidates.push_back({i, s.admission_order});
                 }
@@ -1207,8 +1377,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             const auto fits_one_step = [&](const PrefillCandidate & c) {
                 return slots[(size_t)c.slot].prompt_left <= limits.max_prefill_tokens_per_sequence;
             };
-            if (std::any_of(prefill_candidates.begin(), prefill_candidates.end(), fits_one_step) &&
-                !std::all_of(prefill_candidates.begin(), prefill_candidates.end(), fits_one_step)) {
+            long_prompt_waiting =
+                !std::all_of(prefill_candidates.begin(), prefill_candidates.end(), fits_one_step);
+            held_long_prompts = !decoders_turn && long_prompt_waiting &&
+                short_first_steps < kShortFirstSteps &&
+                std::any_of(prefill_candidates.begin(), prefill_candidates.end(), fits_one_step);
+            if (held_long_prompts) {
                 prefill_candidates.erase(std::remove_if(prefill_candidates.begin(), prefill_candidates.end(),
                     [&](const PrefillCandidate & c) { return !fits_one_step(c); }),
                     prefill_candidates.end());
@@ -1216,6 +1390,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             step_plan.prefills = decoders_turn
                 ? std::vector<PrefillSlice>{}
                 : plan_prefill_slices(prefill_candidates, limits, prefill_round_robin_start);
+            long_prompt_in_step = std::any_of(step_plan.prefills.begin(), step_plan.prefills.end(),
+                [&](const PrefillSlice & slice) {
+                    return slots[(size_t)slice.slot].prompt_left > limits.max_prefill_tokens_per_sequence;
+                });
         };
         build_plan();
         while (!engine.reserve_decode(step_plan)) {
@@ -1280,20 +1458,30 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
         if (!prefill_candidates.empty()) ++prefill_round_robin_start;
         if (step_plan.decode.empty() && step_plan.prefills.empty()) continue;
+        if (held_long_prompts) ++short_first_steps;
+        else if (long_prompt_in_step || !long_prompt_waiting) short_first_steps = 0;
 
         const auto step_started = std::chrono::steady_clock::now();
         SeqEngine::StepResult step_result = engine.step(step_plan);
-        // A long prompt shares the time with the decoding requests, from its
-        // first chunk to its last; a short one (an agent's next turn, even when
-        // a prefix capture splits it in two forwards) does not hold them up.
+        // Long prompt work shares the time with the decoding requests, from
+        // its first chunk to its last; a short prompt (an agent's next turn,
+        // even when a prefix capture splits it in two forwards) does not hold
+        // them up. The work is every prompt still prefilling, not one: an
+        // agent's subagents arrive together, each prompt short, and the
+        // decoding requests beside them would otherwise wait for all of them.
         const auto step_limits = engine.step_plan_limits((int)step_plan.decode.size());
         const int long_prompt_tokens = step_limits.time_share_prompt_tokens > 0
             ? step_limits.time_share_prompt_tokens
             : step_limits.max_prefill_tokens_per_sequence;
-        bool long_prompt = false;
+        long long prompt_work = 0;
+        for (int i = 0; i < n_slots; ++i) {
+            const SchedSlot & s = slots[(size_t)i];
+            if (s.job && s.prefilling) prompt_work += s.prompt_new;
+        }
+        const bool long_prompt = !step_plan.prefills.empty() &&
+            prompt_work > long_prompt_tokens;
         for (const PrefillSlice & slice : step_plan.prefills) {
             SchedSlot & s = slots[(size_t)slice.slot];
-            long_prompt |= s.prompt_new > long_prompt_tokens;
             if (s.prompt_left != std::numeric_limits<int>::max())
                 s.prompt_left = std::max(0, s.prompt_left - slice.max_tokens);
         }
@@ -1371,9 +1559,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     (int)out.prefix_store.ticket.checkpoint.id - 1;
                 // The checkpoint this capture replaced in its slot (the
                 // reservation's victim) left RAM: write it to disk unless it
-                // was only an edit backup. Claimed on every outcome.
-                OwnedSnapshot displaced = disk_enabled
-                    ? backend_.snapshot_take_displaced(captured) : OwnedSnapshot{};
+                // was only an edit backup. Claimed on every outcome, and
+                // freed here when there is no disk to write it to.
+                OwnedSnapshot displaced = backend_.snapshot_take_displaced(captured);
                 for (auto & evicted : prefix_cache_.take_evicted()) {
                     if (evicted.slot != captured) {
                         // A further checkpoint the capture's resident-budget
@@ -1551,6 +1739,18 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     service_drains();
     for (DrainJob & d : drains) finish_job(d.job);
     drains.clear();
+    // Neither has a response committed: both are answered like the queue.
+    for (const PrefixWaiter & w : prefix_waiters) {
+        const ParsedRequest & req = w.job->req;
+        const ResponseError error = ResponseError::unavailable(
+            "server_shutting_down", "server shutting down");
+        const json body = build_error_response(
+            req.format, error, req.response_id);
+        send_response(w.job->fd, response_error_http_status(error),
+                      "application/json", body.dump() + "\n");
+        finish_job(w.job);
+    }
+    prefix_waiters.clear();
     if (deferred) {
         // No response has been committed for a deferred admission.
         const ParsedRequest & req = deferred->req;

@@ -9723,6 +9723,7 @@ public:
                 result.prefix_store.invalidated = plan.restore;
             } else {
                 result.prefix_store.restored = plan.restore;
+                restored.push_back(plan.restore);
             }
         }
         if (!result.prefix_store.invalidated.valid() &&
@@ -9783,6 +9784,7 @@ public:
     std::atomic<bool> unrequested_restore{false};
     std::atomic<bool> malformed_restore{false};
     std::vector<PrefixStoreRef> discarded;
+    std::vector<PrefixStoreRef> restored;
 
 private:
     struct Slot {
@@ -9894,6 +9896,88 @@ TEST_CASE(ServerUnitFixture,
     bool freed_turn2 = false;
     for (const auto & ref : backend.engine.discarded) freed_turn2 |= ref.tokens == 10;
     TEST_ASSERT(freed_turn2);
+}
+
+// Subagents launched together share their head: the first one admitted saves
+// it, and the next one waits for that checkpoint and restores it instead of
+// prefilling the same tokens beside it. With the wait off, both prefill cold.
+// `task_in_system`: each task ends the system message (as hermes's
+// subagents' do, after the tools), so the shared prefix ends mid-message.
+static std::vector<PrefixStoreRef> run_shared_head_pair(int wait_min_tokens,
+                                                        bool task_in_system = false) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<SchedulerPrefixBackend>();
+    SchedulerPrefixBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 8;
+    config.concurrent_prefix_cache_max_bytes = 4096;
+    config.concurrent_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    config.shared_prefix_wait_min_tokens = wait_min_tokens;
+    HttpServer server(engine, tokenizer, config);
+
+    std::vector<std::unique_ptr<ServerJob>> jobs;
+    std::vector<int> fds;
+    for (const int32_t task : {101, 201}) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        fds.push_back(sockets[0]);
+        fds.push_back(sockets[1]);
+        auto job = std::make_unique<ServerJob>();
+        job->fd = sockets[0];
+        job->req.format = ApiFormat::OPENAI_CHAT;
+        job->req.prompt_tokens = task_in_system
+            ? std::vector<int32_t>{1, 100, 101, 102, task, 3, 50, 4}
+            : std::vector<int32_t>{1, 100, 3, task, 4};
+        job->req.max_output = 1;
+        job->req.stream = false;
+        job->req.model = "scheduler-test";
+        job->req.response_id = "subagent-" + std::to_string(task);
+        SchedulerTestHarness::enqueue(server, job.get());
+        jobs.push_back(std::move(job));
+    }
+    std::thread scheduler([&] {
+        SchedulerTestHarness::run(server, backend.engine);
+    });
+    bool done = true;
+    for (const auto & job : jobs) {
+        std::unique_lock<std::mutex> lock(job->mu);
+        done &= job->cv.wait_for(lock, std::chrono::seconds(5),
+                                 [&] { return job->done; });
+    }
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+    unlink(path.c_str());
+
+    TEST_ASSERT(done);
+    return backend.engine.restored;
+}
+
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_subagents_restore_the_head_the_first_one_saves) {
+    const auto restored = run_shared_head_pair(/*wait_min_tokens=*/2);
+    TEST_ASSERT(restored.size() == 1);
+    TEST_ASSERT(restored[0].tokens == 3);
+    TEST_ASSERT(run_shared_head_pair(/*wait_min_tokens=*/0).empty());
+    // A head shorter than the minimum is not worth the wait.
+    TEST_ASSERT(run_shared_head_pair(/*wait_min_tokens=*/4).empty());
+}
+
+// The system messages differ at their end: the first one admitted captures
+// what it shares with the one still queued, not its whole system message.
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_subagents_share_a_prefix_that_ends_mid_message) {
+    const auto restored = run_shared_head_pair(/*wait_min_tokens=*/2, /*task_in_system=*/true);
+    TEST_ASSERT(restored.size() == 1);
+    TEST_ASSERT(restored[0].tokens == 4);
+    TEST_ASSERT(run_shared_head_pair(/*wait_min_tokens=*/0, /*task_in_system=*/true).empty());
 }
 
 TEST_CASE(ServerUnitFixture,
@@ -10039,7 +10123,7 @@ class TimeShareEngine final : public SeqEngine {
 public:
     explicit TimeShareEngine(int long_prompt_tokens = 0)
         : long_prompt_tokens_(long_prompt_tokens) {}
-    int slot_count() const override { return 2; }
+    int slot_count() const override { return (int)slots_.size(); }
     int max_context() const override { return 4096; }
     bool token_is_eos(int32_t) const override { return false; }
     StepPlanLimits step_plan_limits(int decode_rows) const override {
@@ -10048,7 +10132,9 @@ public:
     }
     AdmitResult admit(uint64_t, const std::vector<int32_t> & prompt, const SamplerCfg &) override {
         AdmitResult result;
-        const int slot = !slots_[0].active ? 0 : !slots_[1].active ? 1 : -1;
+        int slot = -1;
+        for (int i = 0; i < (int)slots_.size() && slot < 0; ++i)
+            if (!slots_[(size_t)i].active) slot = i;
         if (slot < 0) {
             result.status = AdmitResult::Status::busy;
             return result;
@@ -10072,14 +10158,28 @@ public:
             result.prefills.push_back(out);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(plan.prefills.empty() ? 2 : 40));
-        std::lock_guard<std::mutex> lock(mu);
+        std::unique_lock<std::mutex> lock(mu);
         steps.push_back({(int)plan.decode.size(), (int)plan.prefills.size()});
         std::vector<int> chunk_slots;
         for (const PrefillSlice & slice : plan.prefills) chunk_slots.push_back(slice.slot);
         prompt_slots.push_back(std::move(chunk_slots));
+        stepped_.notify_all();
+        released_.wait(lock, [&] { return !held_; });
         return result;
     }
     void retire(int slot) override { slots_[(size_t)slot] = {}; }
+
+    // While held, the scheduler waits after each step, so a test can queue
+    // work at a known point of the schedule.
+    void hold() { std::lock_guard<std::mutex> lock(mu); held_ = true; }
+    void release() {
+        { std::lock_guard<std::mutex> lock(mu); held_ = false; }
+        released_.notify_all();
+    }
+    bool wait_steps(size_t n) {
+        std::unique_lock<std::mutex> lock(mu);
+        return stepped_.wait_for(lock, std::chrono::seconds(10), [&] { return steps.size() >= n; });
+    }
 
     std::mutex mu;
     std::vector<std::pair<int, int>> steps;  // (decode rows, prompt chunks)
@@ -10087,8 +10187,10 @@ public:
 
 private:
     struct Slot { bool active = false; int remaining = 0; };
-    std::array<Slot, 2> slots_{};
+    std::array<Slot, 3> slots_{};
     int long_prompt_tokens_;
+    std::condition_variable stepped_, released_;
+    bool held_ = false;
 };
 
 struct TimeShareBackend : MockBackend {
@@ -10097,9 +10199,10 @@ struct TimeShareBackend : MockBackend {
     SeqEngine * seq_engine() override { return &engine; }
 };
 
-// A chat that decodes, then a 128-token prompt (8 chunks) beside it. Returns
-// the most decode-only steps the chat took between two of the prompt's chunks.
-static int decode_only_steps_between_chunks(int long_prompt_tokens) {
+// A chat that decodes, then prompts (128 tokens each: 8 chunks) beside it.
+// Returns the most decode-only steps the chat took between two prompt chunks.
+static int decode_only_steps_between_chunks(int long_prompt_tokens,
+                                            int prompts = 1) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
@@ -10113,9 +10216,9 @@ static int decode_only_steps_between_chunks(int long_prompt_tokens) {
     config.admission_coalesce_ms = 0;
     HttpServer server(engine, tokenizer, config);
 
-    int fds[4] = {-1, -1, -1, -1};
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds + 2) == 0);
+    int fds[6] = {-1, -1, -1, -1, -1, -1};
+    for (int i = 0; i <= prompts; ++i)
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds + 2 * i) == 0);
     const auto make_job = [](ServerJob & job, int fd, int prompt, int output, const char * id) {
         job.fd = fd;
         job.req.format = ApiFormat::OPENAI_CHAT;
@@ -10125,21 +10228,24 @@ static int decode_only_steps_between_chunks(int long_prompt_tokens) {
         job.req.model = "scheduler-test";
         job.req.response_id = id;
     };
-    ServerJob chat, document;
+    ServerJob chat, documents[2];
     make_job(chat, fds[0], 4, 400, "chat");
-    make_job(document, fds[2], 128, 1, "document");
+    for (int i = 0; i < prompts; ++i)
+        make_job(documents[i], fds[2 + 2 * i], 128, 1, i ? "document-2" : "document");
     SchedulerTestHarness::enqueue(server, &chat);
     std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    SchedulerTestHarness::enqueue(server, &document);
+    for (int i = 0; i < prompts; ++i) SchedulerTestHarness::enqueue(server, &documents[i]);
     const auto wait_done = [](ServerJob & job) {
         std::unique_lock<std::mutex> lock(job.mu);
         return job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; });
     };
-    const bool done = wait_done(document) && wait_done(chat);
+    bool done = true;
+    for (int i = 0; i < prompts; ++i) done &= wait_done(documents[i]);
+    done &= wait_done(chat);
     SchedulerTestHarness::stop(server);
     scheduler.join();
-    for (const int fd : fds) close(fd);
+    for (const int fd : fds) if (fd >= 0) close(fd);
     unlink(path.c_str());
     TEST_ASSERT(done);
 
@@ -10165,6 +10271,13 @@ TEST_CASE(ServerUnitFixture, test_scheduler_gives_decoders_time_beside_a_long_pr
     TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/0) >= 5);
     // A prompt under the engine's long-prompt size keeps every step.
     TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/256) == 0);
+}
+
+// Subagents starting together: two prompts, each under the long-prompt size,
+// are long work together, and the chat beside them gets its time back.
+TEST_CASE(ServerUnitFixture, test_scheduler_gives_decoders_time_beside_prompts_together) {
+    TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/200, /*prompts=*/2) >= 5);
+    TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/300, /*prompts=*/2) == 0);
 }
 
 // A prompt that fits in one step runs before a longer one, alone.
@@ -10220,6 +10333,192 @@ TEST_CASE(ServerUnitFixture, test_scheduler_runs_a_short_prompt_before_a_long_on
     }
     TEST_ASSERT(question_step > 0);
     TEST_ASSERT(last_document_step > question_step);
+}
+
+// An engine that thinks in a loop of 10, 11, 12 and answers (EOS) once the
+// close marker is fed back. It bursts four tokens when allowed.
+class LoopingThinkerEngine final : public SeqEngine {
+public:
+    int slot_count() const override { return 1; }
+    int max_context() const override { return 4096; }
+    bool token_is_eos(int32_t token) const override { return token == 2; }
+    int max_decode_tokens() const override { return 4; }
+    StepPlanLimits step_plan_limits(int) const override { return {1, 64, 64, 64}; }
+    AdmitResult admit(uint64_t, const std::vector<int32_t> &, const SamplerCfg &) override {
+        AdmitResult result;
+        result.status = active_ ? AdmitResult::Status::busy : AdmitResult::Status::admitted;
+        result.slot = 0;
+        active_ = true;
+        return result;
+    }
+    StepResult step(const StepPlan & plan) override {
+        StepResult result;
+        for (const PrefillSlice & slice : plan.prefills) {
+            PrefillOutput out;
+            out.slot = slice.slot;
+            out.status = PrefillOutput::Status::completed;
+            out.token = next();
+            result.prefills.push_back(out);
+        }
+        for (const StepInput & input : plan.decode) {
+            closed_ |= input.token == 31;
+            DecodeOutput out;
+            out.slot = input.slot;
+            const int burst = input.allow_speculation ? 4 : 1;
+            for (int i = 1; i < burst; ++i) out.committed_tokens.push_back(next());
+            out.token = next();
+            steps.push_back({input.token, input.allow_speculation, (int)out.committed_tokens.size()});
+            result.decode.push_back(std::move(out));
+        }
+        return result;
+    }
+    void retire(int) override { active_ = false; }
+
+    struct Step { int32_t input; bool speculation; int committed; };
+    std::vector<Step> steps;
+
+private:
+    int32_t next() { return closed_ ? 2 : (int32_t)(10 + n_++ % 3); }
+    bool active_ = false;
+    bool closed_ = false;
+    int n_ = 0;
+};
+
+struct LoopingThinkerBackend : MockBackend {
+    LoopingThinkerEngine engine;
+    SeqEngine * seq_engine() override { return &engine; }
+};
+
+// Thinking speculates while the budget is far from its close, and a loop
+// closes it: the close starts on a step that emitted one token, never inside
+// a burst, and the request answers instead of looping to its cap.
+TEST_CASE(ServerUnitFixture, test_scheduler_thinking_speculates_and_a_loop_closes_it) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<LoopingThinkerBackend>();
+    LoopingThinkerBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    config.think_close_token_ids = {30, 31};
+    config.think_marker_token_ids = {31};
+    config.thinking_loop_repeats = 6;
+    HttpServer server(engine, tokenizer, config);
+
+    int fds[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ServerJob job;
+    job.fd = fds[0];
+    job.req.format = ApiFormat::OPENAI_CHAT;
+    job.req.prompt_tokens = {1, 100, 3, 101, 4};
+    job.req.max_output = 400;
+    job.req.thinking_opt_in = true;
+    job.req.per_req_phase1_cap = 300;
+    job.req.per_req_reply_budget = 50;
+    job.req.stream = false;
+    job.req.model = "scheduler-test";
+    job.req.response_id = "thinker";
+    SchedulerTestHarness::enqueue(server, &job);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    bool done = false;
+    {
+        std::unique_lock<std::mutex> lock(job.mu);
+        done = job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; });
+    }
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    close(fds[0]);
+    close(fds[1]);
+    unlink(path.c_str());
+    TEST_ASSERT(done);
+
+    const auto & steps = backend.engine.steps;
+    int bursts = 0, generated = 1, close_step = -1;
+    for (int i = 0; i < (int)steps.size(); ++i) {
+        if (close_step < 0 && steps[(size_t)i].input == 30) close_step = i;
+        bursts += close_step < 0 && steps[(size_t)i].committed > 0;
+        generated += steps[(size_t)i].committed + 1;
+    }
+    TEST_ASSERT(bursts > 0);           // thinking speculated before its close
+    TEST_ASSERT(close_step > 0);       // the loop was closed
+    TEST_ASSERT(!steps[(size_t)close_step - 1].speculation);
+    TEST_ASSERT(steps[(size_t)close_step - 1].committed == 0);
+    TEST_ASSERT(generated < 120);      // well short of the thinking cap
+}
+
+// Short prompts arriving one after another hold a longer one back for a
+// few steps at most.
+TEST_CASE(ServerUnitFixture, test_scheduler_short_prompts_do_not_stall_a_long_one) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<TimeShareBackend>();
+    TimeShareBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+
+    constexpr int kQuestions = 12;
+    std::vector<int> fds;
+    std::vector<ServerJob> jobs(kQuestions + 1);
+    for (int i = 0; i <= kQuestions; ++i) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        fds.push_back(sockets[0]);
+        fds.push_back(sockets[1]);
+        ServerJob & job = jobs[(size_t)i];
+        job.fd = sockets[0];
+        job.req.format = ApiFormat::OPENAI_CHAT;
+        job.req.prompt_tokens.assign(i ? 4 : 128, 100);
+        job.req.max_output = 1;
+        job.req.stream = false;
+        job.req.model = "scheduler-test";
+        job.req.response_id = i ? "question" : "document";
+    }
+    // The questions arrive after the document's first chunk, with seven left.
+    backend.engine.hold();
+    SchedulerTestHarness::enqueue(server, &jobs[0]);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    const bool started = backend.engine.wait_steps(1);
+    for (int i = 1; i <= kQuestions; ++i) SchedulerTestHarness::enqueue(server, &jobs[(size_t)i]);
+    backend.engine.release();
+    TEST_ASSERT(started);
+    bool done = true;
+    for (ServerJob & job : jobs) {
+        std::unique_lock<std::mutex> lock(job.mu);
+        done &= job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; });
+    }
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+    unlink(path.c_str());
+    TEST_ASSERT(done);
+
+    // The longest run of steps that prefilled questions while the document,
+    // with chunks left, sat out.
+    int last_document_step = -1;
+    for (int i = 0; i < (int)backend.engine.prompt_slots.size(); ++i) {
+        const auto & chunk_slots = backend.engine.prompt_slots[(size_t)i];
+        if (std::find(chunk_slots.begin(), chunk_slots.end(), 0) != chunk_slots.end()) last_document_step = i;
+    }
+    int run = 0, longest = 0;
+    for (int i = 0; i < last_document_step; ++i) {
+        const auto & chunk_slots = backend.engine.prompt_slots[(size_t)i];
+        if (chunk_slots.empty()) continue;
+        const bool document = std::find(chunk_slots.begin(), chunk_slots.end(), 0) != chunk_slots.end();
+        run = document ? 0 : run + 1;
+        longest = std::max(longest, run);
+    }
+    TEST_ASSERT(longest >= 1);  // the questions still go first
+    TEST_ASSERT(longest <= 4);
 }
 
 // Every decode step verifies a drafted chain of 8 positions; the first step
@@ -14082,6 +14381,61 @@ TEST_CASE(ServerUnitFixture, test_disk_session_concurrent_eviction_and_restore) 
     TEST_ASSERT(disk.stats().pending_files == 0);
     TEST_ASSERT(disk.longest_prefix({1, 300, 3, 301, 4, 9}).len == 3);
     rm_rf(dir);
+    unlink(path.c_str());
+}
+
+// Without a disk cache, the checkpoint a capture displaces is freed rather
+// than left in the backend until its slot is captured again.
+TEST_CASE(ServerUnitFixture, test_concurrent_capture_frees_displaced_without_disk) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<DiskCheckpointBackend>();
+    DiskCheckpointBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 2;  // a third conversation displaces the first
+    config.prefix_cache_max_bytes = 0;
+    config.concurrent_prefix_cache_max_bytes = 4096;
+    config.concurrent_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+    TEST_ASSERT(SchedulerTestHarness::disk_cache(server).disabled());
+
+    std::vector<std::unique_ptr<ServerJob>> jobs;
+    std::vector<int> fds;
+    const auto run_one = [&](std::vector<int32_t> prompt, const char * id) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        fds.push_back(sockets[0]);
+        fds.push_back(sockets[1]);
+        auto job = std::make_unique<ServerJob>();
+        job->fd = sockets[0];
+        job->req.format = ApiFormat::OPENAI_CHAT;
+        job->req.prompt_tokens = std::move(prompt);
+        job->req.max_output = 1;
+        job->req.stream = false;
+        job->req.model = "scheduler-test";
+        job->req.response_id = id;
+        jobs.push_back(std::move(job));
+        ServerJob * j = jobs.back().get();
+        SchedulerTestHarness::enqueue(server, j);
+        std::unique_lock<std::mutex> lock(j->mu);
+        return j->cv.wait_for(lock, std::chrono::seconds(5), [&] { return j->done; });
+    };
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    const bool abc = run_one({1, 100, 3, 101, 4}, "a") &&
+                     run_one({1, 200, 3, 201, 4}, "b") &&
+                     run_one({1, 300, 3, 301, 4}, "c");
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+
+    TEST_ASSERT(abc);
+    TEST_ASSERT(backend.displaced.empty());
     unlink(path.c_str());
 }
 

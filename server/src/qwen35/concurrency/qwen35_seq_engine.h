@@ -90,9 +90,10 @@ public:
 
     StepResult step(const StepPlan & plan) override;
     // A step that carries a prompt chunk decodes without the drafter, one
-    // token per request. Beside a prompt of more than 8192 new tokens (a
-    // document, not an agent's next step), the decoding requests get half
-    // the time back in steps of their own, with it.
+    // token per request. Beside prompts of more than 8192 new tokens
+    // together (a document, or subagents starting at once; not an agent's
+    // next step), the decoding requests get half the time back in steps of
+    // their own, with them.
     StepPlanLimits step_plan_limits(int decode_rows) const override {
         const bool mixed = decode_rows > 0;
         const int per_sequence = mixed ? 512 : 2048;
@@ -132,6 +133,9 @@ public:
                              const ImagePromptHandle & images) override;
 
     bool token_is_eos(int32_t token) const override;
+    int max_decode_tokens() const override {
+        return fixed_chain_ready_ ? fixed_chain_.width : 1;
+    }
 
 
 private:

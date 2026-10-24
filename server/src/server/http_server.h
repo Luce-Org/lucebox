@@ -238,6 +238,18 @@ struct ServerConfig {
     // Idle-to-busy batching window. It is ignored by single-slot engines and
     // never delays an already decoding request.
     int admission_coalesce_ms = 20;
+    // A request whose prompt starts with the prefix another admitted request
+    // is about to checkpoint waits for that checkpoint instead of prefilling
+    // the same tokens beside it (an agent's subagents share their system
+    // prompt and tools). Only a prefix this many tokens past what the request
+    // can already restore is worth the wait; zero turns the wait off.
+    int shared_prefix_wait_min_tokens = 512;
+    // Under continuous batching, thinking that has written one 64-token span
+    // this many times is going round in circles (BudgetHook::loop_repeats)
+    // and is closed like an exhausted thinking budget: greedy decoding
+    // otherwise rewrites the same draft until the budget runs out. The
+    // single-slot decoders do not read it. Zero disables.
+    int thinking_loop_repeats = 6;
     // Auto resolves after all models load, before workers start. Zero disables.
     size_t decode_kv_offload_bytes = luce::common::kAutoKvOffloadBytes;
 
@@ -995,9 +1007,11 @@ private:
                                 RoutingAdmission * admission);
     // One inner non-streaming chat completion. False when the router's
     // admission turned it away (nothing was sent); otherwise `status` and
-    // `body` hold the HTTP response.
+    // `body` hold the HTTP response. When `client_fd` disconnects, the inner
+    // request ends as a disconnected request does, freeing its slot.
     bool inner_chat_completion(const json & request, RoutingAdmission * admission,
-                               int & status, std::string & body);
+                               int & status, std::string & body,
+                               SocketHandle client_fd = kInvalidSocket);
     json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the
@@ -1222,6 +1236,8 @@ private:
 
     // Non-blocking dequeue used for admission polling between decode steps.
     ServerJob * try_dequeue();
+    // The longest prefix `prompt` shares with a job still in the queue.
+    int queued_shared_prefix(const std::vector<int32_t> & prompt);
     // Bounded wait used only during an idle-to-busy admission window.
     ServerJob * dequeue_for(
         std::chrono::steady_clock::duration timeout);
