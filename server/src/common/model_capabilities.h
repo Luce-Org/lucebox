@@ -49,7 +49,7 @@ struct ArchCapabilities {
     // Placement-independent.
     bool layer_split;         // has a LayerSplitAdapter (--target-devices)
     bool remote_draft;        // draft over IPC (--draft-ipc-bin)
-    bool pflash_compression;  // PFlash prefill compression (--prefill-compression)
+    bool pflash_compression;  // PFlash prefill compression (--pflash on)
     bool expert_offload;      // hot/cold MoE expert residency (--spark, --freq,
                               // --collect-routing, --adaptive-experts). Note
                               // deepseek4 is mixture-of-experts but has no such

@@ -151,7 +151,7 @@ except a head at or below `--kv-cache-cold-max` tokens or, without one, the
 shallowest (a longer head).
 
 Compressed prompts (PFlash, FlowKV) are not raw history and get no disk key,
-except a prompt served from a PFlash unified view (`PFLASH_UNIFIED=1`): its
+except a prompt served from a PFlash unified view: its
 key is the tokens it served, and the view itself is kept on disk too, so the
 conversation's next request serves the same tokens again and restores them. A
 request whose disk scope is not `full` gives its snapshots no key either.
@@ -165,7 +165,8 @@ view, a one-line header indexed at startup; at most 256 views, the least
 recently written dropped first, and the cache's TTL applies, counted from a
 view's last write and checked at startup and at every lookup (a view in use
 returns to RAM and is written again when it leaves). Views written for another
-model, template or context (the cache's identity salt) are never read. A view
+model, template or context (the cache's identity salt), or under older paging
+rules (a version in the same identity), are never read. A view
 file that does not load, or whose offsets and per-line and per-unit data do not
 agree, is deleted and the request proceeds without it. A conversation served
 raw after a PFlash failure, or handed to the chat view, loses its views in RAM
@@ -239,8 +240,7 @@ snapshot slots: both run without a disk cache (logged at startup).
 **Cache-aware admission.** PFlash's admission counts the deeper of the RAM
 prefix snapshot and the deepest disk entry for the prompt
 (`DiskPrefixCache::longest_prefix`, an index lookup that reads no file; ties
-go to RAM), in the chat view (`PFLASH_ADMISSION=cache`) and in the unified view
-(`PFLASH_UNIFIED=1`). A conversation restored after a restart, or written out
+go to RAM), in the chat view (`PFLASH_ADMISSION=cache`) and in the unified view. A conversation restored after a restart, or written out
 on eviction, is then cached history: the unified view serves it raw, from disk,
 and pages only new long content, instead of handing a cold history to the chat
 view. The disk counts only with `--kv-cache-dir` set and the request's disk

@@ -696,8 +696,8 @@ components:
           example: null
         mode:
           type: string
-          enum: ["off", "auto", "always"]
-          description: Activation mode for PFlash.
+          enum: ["off", "on"]
+          description: PFlash state (`--pflash on|off`).
           example: "off"
         skip_park:
           type: ["boolean", "null"]
@@ -706,7 +706,7 @@ components:
         threshold:
           type: ["integer", "null"]
           minimum: 0
-          description: Token-count threshold for AUTO mode.
+          description: Prompts from this many tokens are compressed.
           example: null
 
     Memory:

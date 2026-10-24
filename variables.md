@@ -148,7 +148,7 @@ Untagged variables are operational tuning knobs.
 | `LUCE_FP_HIP_ROW` | HIP row-kernel path for flash prefill. |
 | `LUCE_FP_SKIP_PREWARM` | Skip flash-prefill prewarm. |
 | `LUCE_FP_PROFILE` / `LUCE_FP_DUMP_COUNTS` / `LUCE_FP_DEBUG_LAYER0` | 🐛 **debug** FlashPrefill profiling/debug. |
-| `LUCE_PREFILL_MODE` | Prefill mode selector. |
+| `LUCE_PFLASH` | Docker entrypoint: `on` passes `--pflash on`. |
 | `LUCE_PREFILL_THRESHOLD` | Prefill length threshold. |
 | `LUCE_PREFILL_DRAFTER` | Drafter participation during prefill. |
 | `LUCE_PREFILL_KEEP` | Keep prefill cache across requests. |

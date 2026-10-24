@@ -376,9 +376,6 @@ inline std::vector<LaunchProfileEnv> pflash_release_env() {
         {"PFLASH_ADMISSION", "cache"},
         {"PFLASH_ARRIVE", "1"},
         {"PFLASH_CHAT_REBUILD_MIN_TOKENS", "65536"},
-        // Chats and agent sessions share the unified view: only the newest
-        // turn's long content is paged, and recall is gated.
-        {"PFLASH_UNIFIED", "1"},
     };
     const bool segment_probe = set("PFLASH_SEGMENT_PROBE_GGUF");
     if (segment_probe) env.push_back({"PFLASH_SELECT_SEGMENTS", "probe"});

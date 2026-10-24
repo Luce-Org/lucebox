@@ -307,7 +307,8 @@ static void print_usage(const char * prog) {
         "  --kvflash-tau <N>             Drafter-policy reselect interval (default: 64)\n"
         "\n"
         "PFlash (speculative prefill compression):\n"
-        "  --prefill-compression off|auto|always  (default: off)\n"
+        "  --pflash on|off             Compress prompts from --prefill-threshold\n"
+        "                              tokens (default: off)\n"
         "  --prefill-threshold <N>     Auto threshold for a prompt or aggregate\n"
         "                              aged history (default: 32000; 16384 with\n"
         "                              PFLASH_SCORING_HEAD_GGUF, the release profile)\n"
@@ -957,19 +958,21 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         } else if (std::strcmp(argv[i], "--reasoning-effort-max") == 0 && i + 1 < argc) {
             sconfig.effort_tiers.max = std::atoi(argv[++i]);
             cli_set.effort_max = true;
-        } else if (std::strcmp(argv[i], "--prefill-compression") == 0 && i + 1 < argc) {
-            const char * mode = argv[++i];
-            if (std::strcmp(mode, "auto") == 0)
-                sconfig.pflash_mode = ServerConfig::PflashMode::AUTO;
-            else if (std::strcmp(mode, "always") == 0)
-                sconfig.pflash_mode = ServerConfig::PflashMode::ALWAYS;
-            else if (std::strcmp(mode, "off") == 0)
-                sconfig.pflash_mode = ServerConfig::PflashMode::OFF;
-            else {
-                std::fprintf(stderr, "[server] unknown --prefill-compression mode: '%s' (expected: auto, always, off)\n", mode);
+        } else if (std::strcmp(argv[i], "--pflash") == 0 || std::strncmp(argv[i], "--pflash=", 9) == 0) {
+            const char * value = argv[i][8] == '=' ? argv[i] + 9 : (i + 1 < argc ? argv[++i] : "");
+            if (std::strcmp(value, "on") == 0) {
+                sconfig.pflash = true;
+            } else if (std::strcmp(value, "off") == 0) {
+                sconfig.pflash = false;
+            } else {
+                std::fprintf(stderr, "[server] --pflash takes on or off, not '%s'\n", value);
                 print_usage(argv[0]);
                 return 1;
             }
+        } else if (std::strcmp(argv[i], "--prefill-compression") == 0) {
+            std::fprintf(stderr, "[server] --prefill-compression was replaced by --pflash on|off "
+                                 "(auto is on; for always, add --prefill-threshold 0)\n");
+            return 1;
         } else if (std::strcmp(argv[i], "--prefill-threshold") == 0 && i + 1 < argc) {
             sconfig.pflash_threshold = std::atoi(argv[++i]);
             model.pflash_threshold_set = true;
@@ -1186,7 +1189,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
     }
     if (load_balancing && (bargs.device.is_multi_device() ||
             bargs.remote_draft.enabled() || bargs.remote_target_shard.enabled() ||
-            sconfig.pflash_mode != ServerConfig::PflashMode::OFF ||
+            sconfig.pflash ||
             !sconfig.pflash_upstream_base.empty() || sconfig.lazy_draft ||
             sconfig.freq_tracking || !sconfig.collect_routing_path.empty())) {
         std::fprintf(stderr, "[server] model '%s' requires local serving; compression, sharding, request-scoped drafts and routing collection are unsupported with load balancing\n", sconfig.model_name.c_str());
@@ -1428,7 +1431,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         std::fprintf(stderr, "[server] --prefill-drafter-device %s\n", refusal);
         return 2;
     }
-    if (sconfig.pflash_mode != ServerConfig::PflashMode::OFF) {
+    if (sconfig.pflash) {
         const bool drafter_beside_target = pflash_drafter_beside_target(
             bargs.device, model.pflash_drafter_device);
         // A trained scoring head serves the measured release profile for
@@ -1606,7 +1609,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
 
     BackendAdmissionContext backend_admission;
     backend_admission.pflash_enabled =
-        sconfig.pflash_mode != ServerConfig::PflashMode::OFF;
+        sconfig.pflash;
     backend_admission.pflash_drafter_configured =
         !sconfig.pflash_drafter_path.empty();
     backend_admission.draft_residency = sconfig.draft_residency;
@@ -1722,7 +1725,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             backend_placement.target,
             pflash_drafter_device(backend_placement.draft, model.pflash_drafter_device),
             backend_placement.remote_draft,
-            sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
+            sconfig.pflash);
     sconfig.pflash_drafter_gpu = pflash_placement.drafter_gpu;
     sconfig.pflash_remote_drafter = pflash_placement.remote_drafter;
     sconfig.pflash_remote = pflash_placement.remote;
@@ -1777,7 +1780,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // The PFlash scorer (Qwen3.5 drafter) runs ggml attention and reads none of
     // the FlashPrefill kernel switches. LUCE_FP_USE_BSA stays on with PFlash so
     // Gemma 4's sliding-window prefill keeps the BSA launcher it had before.
-    bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
+    bool pflash_enabled = sconfig.pflash;
     if (pflash_enabled) {
         set_environment_variable("LUCE_FP_USE_BSA", "1", false);
     }
@@ -1786,7 +1789,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         !(pflash_enabled || backend_speculation.draft_path)) {
         std::fprintf(stderr,
             "[server] --draft-residency=request-scoped ignored: requires "
-            "--prefill-compression or --draft\n");
+            "--pflash on or --draft\n");
         sconfig.draft_residency = DraftResidencyPolicy::Auto;
         sconfig.lazy_draft = false;
     }
@@ -1810,8 +1813,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             std::fprintf(stderr, "[server] drafter tokenizer load failed\n");
             return 1;
         }
-        std::fprintf(stderr, "[server] pflash: mode=%s threshold=%d keep=%.3f drafter_gpu=%d skip_park=%d\n",
-                     sconfig.pflash_mode == ServerConfig::PflashMode::AUTO ? "auto" : "always",
+        std::fprintf(stderr, "[server] pflash: threshold=%d keep=%.3f drafter_gpu=%d skip_park=%d\n",
                      sconfig.pflash_threshold, sconfig.pflash_keep_ratio,
                      sconfig.pflash_drafter_gpu,
                      (int)sconfig.pflash_skip_park);
@@ -2249,8 +2251,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     std::fprintf(stderr, "[server] │  cache_type_v    = %s\n",
         cache_type_v.empty() ? "family default" : cache_type_v.c_str());
     std::fprintf(stderr, "[server] │  pflash          = %s\n",
-        sconfig.pflash_mode == ServerConfig::PflashMode::AUTO ? "auto" :
-        sconfig.pflash_mode == ServerConfig::PflashMode::ALWAYS ? "always" : "off");
+        sconfig.pflash ? "on" : "off");
     if (pflash_enabled) {
         std::fprintf(stderr, "[server] │  pflash_threshold= %d\n", sconfig.pflash_threshold);
         if (sconfig.pflash_curve.empty()) {

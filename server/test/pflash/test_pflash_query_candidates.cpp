@@ -162,7 +162,6 @@ TEST_CASE(PFlashQueryCandidatesFixture, release_profile_is_the_default_with_a_tr
 
     luce_test::ScopedEnvVar head{"PFLASH_SCORING_HEAD_GGUF", "head.gguf"};
     REQUIRE(has("PFLASH_SELECT_MODE") && !has("PFLASH_SELECT_SEGMENTS") && !has("PFLASH_SELECT_QUERY_PROBE"));
-    REQUIRE(has("PFLASH_UNIFIED"));
     {
         Vars vars;
         install(vars);

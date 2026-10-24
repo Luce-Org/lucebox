@@ -100,7 +100,7 @@ def compress_server(server_bin, spawn_luce_server):
             "--max-ctx", "8192",
             "--prefix-cache-slots", "4",
             "--prefill-cache-slots", "4",
-            "--prefill-compression", "auto",
+            "--pflash", "on",
             "--prefill-threshold", "32000",
             "--prefill-keep-ratio", "0.05",
             "--prefill-drafter", str(drafter),

@@ -363,8 +363,8 @@ PFlash (speculative prefill compression) state. When `enabled =
 false` and/or `mode = "off"`, all other fields are `null`. When
 enabled, fields carry the runtime configuration:
 
-- `mode` — `"off" | "auto" | "always"`
-- `threshold` — token-count threshold for AUTO mode
+- `mode` — `"off" | "on"` (`--pflash`)
+- `threshold` — prompts at least this many tokens long are compressed
 - `keep_ratio` — fraction of tokens retained after compression
 - `drafter_gguf` — path to the compression drafter GGUF
 - `skip_park` — whether to skip park/unpark (large-VRAM GPUs)

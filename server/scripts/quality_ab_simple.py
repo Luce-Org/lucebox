@@ -25,29 +25,29 @@ PROMPTS = [
 
 CONFIGS = {
     "baseline":         {  # everything off — reference run
-        "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "off"],
+        "flags": ["--prefix-cache-slots", "0", "--pflash", "off"],
     },
     "baseline_2":       {  # IDENTICAL to baseline — sanity check for determinism
-        "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "off"],
+        "flags": ["--prefix-cache-slots", "0", "--pflash", "off"],
     },
     "prefix_on":        {  # only prefix cache enabled (default tq3_0 K-cache)
-        "flags": ["--prefix-cache-slots", "4", "--prefill-compression", "off"],
+        "flags": ["--prefix-cache-slots", "4", "--pflash", "off"],
     },
     "baseline_f16":     {  # f16 K-cache, no caches — proper reference for prefix_on_f16
-        "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "off", "--kv-f16"],
+        "flags": ["--prefix-cache-slots", "0", "--pflash", "off", "--kv-f16"],
     },
     "prefix_on_f16":    {  # prefix cache + f16 K-cache (tests KV-quantization hypothesis)
-        "flags": ["--prefix-cache-slots", "4", "--prefill-compression", "off", "--kv-f16"],
+        "flags": ["--prefix-cache-slots", "4", "--pflash", "off", "--kv-f16"],
     },
     "compression_on":   {  # only pflash compression (no prefix cache; BSA is part of the pflash defaults)
-        "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "always"],
+        "flags": ["--prefix-cache-slots", "0", "--pflash", "on", "--prefill-threshold", "0"],
     },
     "bsa_on":           {  # only BSA in pflash (no prefix cache)
-        "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "off"],
+        "flags": ["--prefix-cache-slots", "0", "--pflash", "off"],
         "env":   {"LUCE_FP_USE_BSA": "1"},
     },
     "all_on":           {  # prefix + pflash compression + BSA
-        "flags": ["--prefix-cache-slots", "4", "--prefill-compression", "always"],
+        "flags": ["--prefix-cache-slots", "4", "--pflash", "on", "--prefill-threshold", "0"],
         "env":   {"LUCE_FP_USE_BSA": "1"},
     },
 }
@@ -91,8 +91,8 @@ def wait_ready(proc, timeout=180):
 
 def spawn(name, cfg, log_path):
     flags = list(cfg["flags"])
-    if "--prefill-compression" in flags:
-        idx = flags.index("--prefill-compression")
+    if "--pflash" in flags:
+        idx = flags.index("--pflash")
         if flags[idx + 1] != "off" and DRAFTER:
             flags += ["--prefill-drafter", DRAFTER]
     # Translate --kv-f16 shorthand to explicit cache type flags.

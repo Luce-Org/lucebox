@@ -1,6 +1,6 @@
 #pragma once
 
-// PFLASH_UNIFIED=1: one view/recall mechanism for chat and agent sessions
+// The unified view: one view/recall mechanism for chat and agent sessions
 // (server/README.md, PFlash).
 // The pure parts: the tool list, line-structure detection, region layout,
 // marker and label text, greedy admission of units under a cap, re-read
@@ -223,7 +223,8 @@ struct Region {
 struct Piece {
     int begin = 0;                       // served target tokens [begin, end)
     int end = 0;
-    std::string kind;                    // raw, paged_text, preamble, marker, recall_wrapper, recall_label, recall_text, generation
+    std::string kind;                    // raw, paged_text, preamble, marker, recall_wrapper, recall_label,
+                                         // recall_text, chat_view, generation
     int region = -1;
     int turn = -1;
 };
@@ -284,6 +285,10 @@ private:
 // anything that is not a complete view whose offsets and per-unit and per-line vectors agree.
 nlohmann::json view_to_json(const View & view);
 bool view_from_json(const nlohmann::json & j, View & view, std::string & error);
+
+// The paging rules' version, part of a stored view's identity: a view paged under older rules is never served again.
+// 2: a line over its region's cap hands the request to the chat view (it was dropped whole).
+inline constexpr int kViewPagingVersion = 2;
 
 // Views of shortened conversations kept on disk next to the KV cache, so a conversation survives a restart or the
 // RAM store's eviction: written when a view leaves the RAM store and at shutdown, read on a RAM miss. One file per

@@ -194,7 +194,7 @@ SERVER_PROFILES: dict[str, ServerProfile] = {
             "--cache-type-v", "q8_0",
             "--prefix-cache-slots", "0",
             "--prefill-cache-slots", "0",
-            "--prefill-compression", "auto",
+            "--pflash", "on",
             "--prefill-threshold", "4096",
             "--prefill-keep-ratio", "0.10",
             "--lazy-draft",

@@ -175,7 +175,7 @@ The pool is wired into the qwen35 backend behind `--kvflash <tokens>`
    41-token prompt + 1400 generated = 1441 logical through a 1024-slot
    pool (live LRU eviction mid-request). Coherent story end to end,
    36.9 tok/s, clean finish. Second request (per-request pager reset) ok.
-2. WITH pflash: `--kvflash 2048 --prefill-compression always
+2. WITH pflash: `--kvflash 2048 --pflash on
    --prefill-threshold 256 --prefill-drafter <Qwen3.5-0.8B>`. Compression
    1468 -> 60 tokens, then `[kvflash] drafter scorer attached (tau=64)`
    automatically; 400 coherent tokens answering from the compressed

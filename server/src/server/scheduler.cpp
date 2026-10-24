@@ -901,8 +901,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         if (!pflash_concurrent || job->pflash_prepared || job->req.images) {
             return false;
         }
-        return config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
-            (int)job->req.prompt_tokens.size() >= config_.pflash_threshold;
+        return (int)job->req.prompt_tokens.size() >= config_.pflash_threshold;
     };
     auto pflash_prepare = [this](ServerJob * job) {
         if (job->client_disconnected.load(std::memory_order_acquire)) return;

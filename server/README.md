@@ -193,7 +193,7 @@ server is byte-identical to local-inference mode.
 
 ```bash
 ./build/luce_server models/Qwen3.6-27B-Q4_K_M.gguf \
-  --prefill-compression auto --prefill-threshold 10000 \
+  --pflash on --prefill-threshold 10000 \
   --prefill-drafter models/Qwen3.5-0.8B-BF16.gguf \
   --prefill-curve 10000:0.5 40000:0.2 100000:0.1 \
   --prefill-upstream-base http://127.0.0.1:8099 \
@@ -391,14 +391,14 @@ With a trained scoring head (`PFLASH_SCORING_HEAD_GGUF`), every PFlash setting
 left unset takes the measured release profile: threshold 16384, the curve
 `16384:0.315 32768:0.270 65536:0.270 120000:0.225`, budget selection over probe
 segments, the request-probe query and the unified view for chats and agent
-sessions (`PFLASH_UNIFIED=1`, below). Without a head the built-in defaults
+sessions (below). Without a head the built-in defaults
 below apply. The [PFlash configuration reference](docs/PFLASH_CONFIGURATION.md)
 lists both, the validated overrides and the active experiments.
 
 | Option | Default | Purpose |
 |---|---|---|
-| `--prefill-compression off\|auto\|always` | `off` | Select when PFlash compresses a prompt. |
-| `--prefill-threshold <N>` | `32000` (`16384` with a head) | Token threshold used by auto mode. |
+| `--pflash on\|off` | `off` | Turn PFlash prompt compression on. |
+| `--prefill-threshold <N>` | `32000` (`16384` with a head) | Prompts from this many tokens are compressed; `0` compresses every prompt. |
 | `--prefill-keep-ratio <F>` | `0.05` (the release curve with a head) | Fraction of source tokens kept. |
 | `--prefill-curve T:R [T:R ...]` | none (the release curve with a head) | Piecewise keep-ratio curve; overrides the flat ratio. |
 | `--prefill-drafter <path>` | none | PFlash drafter GGUF (Qwen3.5-0.8B). |
@@ -485,7 +485,7 @@ appends each compressed request's served prompt as JSONL, for evidence
 checks in evaluations.
 
 Coding-agent sessions (with `PFLASH_ADMISSION=cache` and
-`--prefill-compression auto`): in a conversation with tool activity (the
+`--pflash on`): in a conversation with tool activity (the
 request defines `tools`, or its history has an assistant tool call or a tool
 result) PFlash never compresses the agent's history or any tool output. By
 default it compresses nothing in such a session: every request is served raw
@@ -509,10 +509,9 @@ drafter selection (up to 48 s more per follow-up in a 10-turn coding session on
 an R9700; the session took 281 s against 258 s with full prefill). Chats
 without tools are not affected.
 
-`PFLASH_UNIFIED=1` (on in the release profile, which also gives it the
-strict-selection environment and `PFLASH_ADMISSION=cache` it needs;
-`PFLASH_UNIFIED=0` turns it off) serves chat and agent sessions with
-one mechanism, the unified view. Only the newest turn is ever paged: the user
+With a strict-selection environment whose scorer gives per-candidate scores
+(the release profile, which also sets the `PFLASH_ADMISSION=cache` it needs),
+chat and agent sessions are served by one mechanism, the unified view. Only the newest turn is ever paged: the user
 messages since the last reply, or the tool results of the last tool call. A
 message there with at least `--prefill-threshold` droppable tokens that can be
 cut into lines becomes a region, and only what the drafter selection keeps of
@@ -536,20 +535,28 @@ re-read of a paged tool output is served verbatim. A view that would no longer f
 context starts over from the raw prompt.
 
 Requests the unified view does not take are handed back to the chat view
-described above and served exactly as without the flag: a request without a
+described above, which serves them as on its own: a request without a
 messages array, a remote drafter, a turn structure or generation prompt it
 cannot read, and a conversation it would start (no stored view continues it)
 whose uncached history before the newest turn, with newest content that
-cannot be cut into lines, reaches `--prefill-threshold` (reason `uncached`,
-or `reset_uncached` when a stored view could not continue), and a selection
-that gives no per-candidate scores (`unscored_selection`: the legacy or split
-scorer, `PFLASH_QWEN35_LEGACY_SCORER=1`, or the fold strategy). A conversation
-handed back, or served raw after a PFlash failure, loses its unified views, so
-no later turn continues one. Such a conversation stays with the chat view while its history is
-uncached. The view trace records `pflash.unified = {decision: handback,
-reason}` for these requests. Without a strict-selection environment the
-unified view serves nothing (startup says so) and every request takes the
-chat view.
+cannot be cut into lines or has a line longer than its region's cap (one long
+line of prose could only be dropped whole), reaches `--prefill-threshold`
+(reason `uncached`,
+or `reset_uncached` when a stored view could not continue). A conversation
+handed back, or served raw after a PFlash failure, loses its unified views.
+After an `uncached` or `reset_uncached` hand-back the unified view adopts what
+the chat view served as the conversation's new view (no regions: what the
+chat view left out of it cannot be recalled), so the next turn continues it
+append-only and reuses its prefix. A tool session the chat view serves whole
+is adopted the same way; after a PFlash failure served raw nothing is adopted
+and the next turn starts a view of its own. The other hand-backs recur on every
+request of their kind. The view trace records `pflash.unified = {decision:
+handback, reason}` for these requests, and the unified stats count adoptions
+(`adopt.<reason>`). Without a strict-selection environment, or with a
+selection that gives no per-candidate scores (the legacy or split scorer,
+`PFLASH_QWEN35_LEGACY_SCORER=1`, or the fold strategy), the unified view is
+off (startup says so for the scorer) and every request takes the chat view.
+`PFLASH_UNIFIED` is no longer read (startup warns when it is set).
 `PFLASH_AGENT_PASTE`, `PFLASH_ARRIVE`, `PFLASH_CHAT_RECALL` and the other
 chat-view knobs apply only to handed-back requests. `PFLASH_RECALL_SOURCE`
 was removed.

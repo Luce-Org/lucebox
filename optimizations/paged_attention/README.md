@@ -53,7 +53,7 @@ context stays resident and evicts cold chunks. Paging keeps every token.
 
 **Rejected at startup** (exit 2, with the reason): `--draft`, `--ddtree`,
 `--target-devices`, `--target-shard-ipc-bin`, a non-zero `--fa-window`,
-`--prefill-compression`, and `LUCE_KVFLASH`. The rules live with every other
+`--pflash on`, and `LUCE_KVFLASH`. The rules live with every other
 launch-admission rule in `check_feature_compatibility()`; which architecture and
 placement they are allowed on is one row in `model_capabilities.h`.
 

@@ -96,21 +96,21 @@ For an OpenAI-compatible server with transparent compression on long prompts, ru
 
 | Flag | Choices / type | Default | Effect |
 |---|---|:---:|---|
-| `--prefill-compression` | `off` / `auto` / `always` | `off` | When to run pflash. `auto` compresses when total prompt ≥ threshold; `always` compresses every request. |
-| `--prefill-threshold` | int (tokens) | `32000` | Token threshold for `auto` mode. `16384` with a trained scoring head. |
+| `--pflash` | `on` / `off` | `off` | Run pflash on prompts of at least `--prefill-threshold` tokens. |
+| `--prefill-threshold` | int (tokens) | `32000` | Token threshold for compression. `16384` with a trained scoring head; `0` compresses every request. |
 | `--prefill-keep-ratio` | float `(0, 1]` | `0.05` | Fraction of source tokens to keep after compression. `0.02` for 128K, `0.10` for 32K. With a trained scoring head and no ratio flag, the release curve `16384:0.315 32768:0.270 65536:0.270 120000:0.225` applies. |
-| `--prefill-drafter` | path to `.gguf` | required when not `off` | Drafter weights (Qwen3.5-0.8B BF16 GGUF). |
+| `--prefill-drafter` | path to `.gguf` | required with `--pflash on` | Drafter weights (Qwen3.5-0.8B BF16 GGUF). |
 | `--prefill-drafter-tokenizer` | HF repo id | `Qwen/Qwen3.5-0.8B` | HF tokenizer for the drafter vocab. |
 
 With `PFLASH_SCORING_HEAD_GGUF` set, every unset PFlash setting takes the measured release profile; see [PFlash configuration](../../server/docs/PFLASH_CONFIGURATION.md#release-profile).
 
-When `--prefill-compression != off`, the server auto-sets `LUCE_LM_HEAD_FIX=0` and `LUCE_FA_WINDOW=0` (matching the bench harness — needed so the post-compress draft graph fits on a 24 GB card without OOM).
+With `--pflash on`, the server auto-sets `LUCE_LM_HEAD_FIX=0` and `LUCE_FA_WINDOW=0` (matching the bench harness — needed so the post-compress draft graph fits on a 24 GB card without OOM).
 
 ```bash
 ./server/build/luce_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft  server/models/draft/model.safetensors \
   --max-ctx 8192 --fa-window 0 \
-  --prefill-compression auto \
+  --pflash on \
   --prefill-threshold 4096 \
   --prefill-keep-ratio 0.02 \
   --prefill-drafter server/models/Qwen3.5-0.8B-BF16.gguf

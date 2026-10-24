@@ -242,8 +242,7 @@ struct ServerConfig {
     size_t decode_kv_offload_bytes = luce::common::kAutoKvOffloadBytes;
 
     // PFlash (speculative prefill compression)
-    enum class PflashMode { OFF, AUTO, ALWAYS };
-    PflashMode  pflash_mode      = PflashMode::OFF;
+    bool        pflash           = false;   // --pflash on: compress prompts from pflash_threshold tokens
     int         pflash_threshold = 32000;   // token count threshold for AUTO mode
     float       pflash_keep_ratio = 0.05f;  // fraction of tokens to keep
     std::string pflash_drafter_path;        // path to drafter GGUF (Qwen3.5-0.8B)
@@ -720,7 +719,7 @@ PflashAdmission pflash_cache_admission(
 // assistant tool call or a tool result (normalized messages, any API format).
 bool pflash_has_tool_activity(const json & tools,
                               const std::vector<ChatMessage> & messages) noexcept;
-// Tool sessions (cache admission, --prefill-compression auto). In a
+// Tool sessions (cache admission, --pflash on). In a
 // conversation with tool activity (a "tool session") the agent's history and
 // tool output are never compressed. By default nothing in a tool session is:
 // it is served raw, full prefill (``KeepHistory``). PFLASH_AGENT_PASTE=1
@@ -1019,9 +1018,13 @@ private:
         int snapshot_cut = -1;
         // PFlash details for usage.timings.pflash (see build_timings_json).
         nlohmann::json pflash_stats;
-        // PFLASH_UNIFIED=1: why the unified view handed this request to the chat view ("" = it did not).
+        // Why the unified view handed this request to the chat view ("" = it did not).
         std::string unified_handback;
-        // PFLASH_UNIFIED=1: served from a unified view. A compressed one may still get a disk key (its served tokens):
+        // A hand-back the unified view continues from once the chat view has served it (a cold history, or newest
+        // content it cannot page): this request's drafter ids and where its generation prompt starts in them.
+        std::vector<int32_t> unified_adopt_drafter_ids;
+        int unified_adopt_drafter_gen_begin = -1;
+        // Served from a unified view (or adopted by one). A compressed one may still get a disk key (its served tokens):
         // the view is kept on disk too, so a resumed conversation serves the same tokens again.
         bool unified_view = false;
         int error_status = 0;
@@ -1042,14 +1045,14 @@ private:
     // their paths.
     bool pflash_concurrent_serving() {
         return backend_.seq_engine() != nullptr && config_.arch == "qwen35" &&
-               config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+               config_.pflash &&
                drafter_tokenizer_ != nullptr;
     }
     void apply_flowkv_compression(const ParsedRequest & req,
                                   PreparedPrompt & prepared);
     std::string apply_pflash_compression(const ParsedRequest & req,
                                          PreparedPrompt & prepared);
-    // PFLASH_UNIFIED=1, after the shared query and pins: pages the newest turn's large uncached content
+    // After the shared query and pins, when the selection gives per-candidate scores: pages the newest turn's large uncached content
     // (a user message, or listed tool outputs), continues the conversation's view, and recalls unheld units of
     // earlier regions at a new user question. ``request`` carries the drafter ids, the pinned spans and the
     // learned query; ``messages`` the normalised messages the prompt was rendered from. ``handback`` set (the
@@ -1065,6 +1068,12 @@ private:
     // later from one of its views: drops the lineages these raw tokens would continue, in RAM and on disk. Returns
     // how many.
     size_t forget_unified_views(const std::vector<int32_t> & raw_tokens);
+    // The chat view served a request the unified view handed back with an adoption (unified_adopt_*): what it served
+    // becomes the conversation's unified view, with no regions, so the next turn continues it append-only.
+    void adopt_unified_view(const ParsedRequest & req, PreparedPrompt & prepared);
+    // The generation prompt in target tokens: the drafter ids from ``generation_begin`` re-encoded.
+    std::vector<int32_t> pflash_generation_tokens(const std::vector<int32_t> & drafter_ids,
+                                                  int generation_begin) const;
     // Multi-turn: serve the conversation's previous view plus this turn's
     // new material -- verbatim below PFLASH_CHAT_COMPRESS_NEW_TOKENS, else
     // the parts the fresh selection keeps -- with the segments the fresh
@@ -1085,6 +1094,7 @@ private:
         const http_detail::PflashChatTurnSpan & turn,
         const std::vector<int32_t> * fresh,
         const std::vector<PFlashTokenSpan> * kept_spans,
+        const std::vector<PFlashTokenSpan> & pins,
         std::vector<int32_t> & served,
         int & snapshot_cut,
         nlohmann::json & stats,
@@ -1321,11 +1331,11 @@ private:
     // Multi-turn PFlash views, matched by raw prompt prefix.
     http_detail::PflashChatViewStore pflash_views_;
 
-    // PFLASH_UNIFIED=1, read once at construction: one view and recall mechanism for chat
-    // and agent sessions. Unset, none of it runs and nothing below is read.
+    // Read once at construction: one view and recall mechanism for chat and agent sessions, on when the PFlash
+    // selection gives per-candidate scores. Off, none of it runs and nothing below is read.
     bool pflash_unified_ = false;
     bool pflash_unified_recall_ = true;
-    // PFLASH_RECALL_GATE=<theta> (default 0.075 under PFLASH_UNIFIED=1): recall only
+    // PFLASH_RECALL_GATE=<theta> (default 0.075): recall only
     // while the head mass on unheld units is at least theta of the context mass; also skips the drafter pass when
     // every unit of every region is held. < 0 = "off" (fill each region's cap).
     double pflash_recall_gate_ = -1.0;

@@ -36,23 +36,23 @@ DATASET = PROJECT_ROOT / "server/eval/humaneval_plus/humanevalplus.jsonl"
 
 CONFIGS = {
     "baseline": {
-        "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "off"],
+        "flags": ["--prefix-cache-slots", "0", "--pflash", "off"],
         "env":   {"LUCE_FP_USE_BSA": "0"},
     },
     "prefix_on": {
-        "flags": ["--prefix-cache-slots", "4", "--prefill-compression", "off"],
+        "flags": ["--prefix-cache-slots", "4", "--pflash", "off"],
         "env":   {"LUCE_FP_USE_BSA": "0"},
     },
     "compression_on": {
-        "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "always"],
+        "flags": ["--prefix-cache-slots", "0", "--pflash", "on", "--prefill-threshold", "0"],
         "env":   {"LUCE_FP_USE_BSA": "0"},
     },
     "compression_auto": {
-        "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "auto"],
+        "flags": ["--prefix-cache-slots", "0", "--pflash", "on"],
         "env":   {"LUCE_FP_USE_BSA": "0"},
     },
     "all_on": {
-        "flags": ["--prefix-cache-slots", "4", "--prefill-compression", "always"],
+        "flags": ["--prefix-cache-slots", "4", "--pflash", "on", "--prefill-threshold", "0"],
         "env":   {"LUCE_FP_USE_BSA": "1"},
     },
 }
@@ -114,8 +114,8 @@ def wait_ready(proc, timeout=240):
 
 def spawn(name, cfg, log_path):
     flags = list(cfg["flags"])
-    if "--prefill-compression" in flags:
-        idx = flags.index("--prefill-compression")
+    if "--pflash" in flags:
+        idx = flags.index("--pflash")
         if idx + 1 < len(flags) and flags[idx + 1] != "off" and "--prefill-drafter" not in flags:
             flags += ["--prefill-drafter", DRAFTER]
     cmd = [
