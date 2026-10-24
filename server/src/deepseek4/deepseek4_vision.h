@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -9,12 +10,34 @@
 
 namespace luce::vision {
 
+// The two checkpoints that carry this tower. They share every ViT and aligner
+// operation; they differ in the language width the aligner projects into,
+// the image span the decoder sees, and V4.1's lack of an image_pad row.
+enum class VisionVariant {
+    V4,    // DeepSeek-V4-Flash-Vision-Exp, projector schema 1
+    V41,   // DeepSeek-V4.1-Flash, projector schema 2
+};
 struct VisionConfig {
+    VisionVariant variant = VisionVariant::V4;
     int layers = 32, dimension = 1024, heads = 16, intermediate = 2816;
     int patch_size = 14, downsample = 3, language_dimension = 4096, vocabulary = 129280;
     int max_image_tokens = 384;
     float rope_theta = 10000.0f, rms_epsilon = 1e-6f;
+    bool has_pad_sentinel = true;
+    // Checkpoint commit the projector was exported from; empty when unknown.
+    std::string source_revision;
 };
+// Image tokens an aligner grid of rows x columns costs in the decoder.
+// V4: the row-pair layout with its padding and the three compression pads
+// the source budget reserves. V4.1: [start] + (columns + newline) * rows + [end].
+uint64_t image_block_tokens(VisionVariant variant, uint64_t rows, uint64_t columns);
+// Why `projector` cannot serve this model, or "" when it can: the family must
+// match (V4.1's projector is 5120 wide, V4 Vision's 4096), and so must the
+// checkpoint when both files record it. An encoder is trained with its own
+// checkpoint's language weights (DeepSeek's October update retrained both),
+// so one from another checkpoint would load and quietly misread images.
+std::string projector_mismatch(const VisionConfig & projector, bool model_is_v41,
+                               const std::string & model_revision);
 struct PatchGrid { int height, width; };
 enum class Sentinel { Start, Pad, Newline, End };
 struct VisionOutput {
@@ -36,6 +59,8 @@ public:
     ~VisionRuntime();
     VisionRuntime(const VisionRuntime &) = delete;
     VisionRuntime & operator=(const VisionRuntime &) = delete;
+    // Reads the variant from the projector's schema version and refuses a
+    // projector whose language width or vocabulary differs from the model's.
     bool load(const std::string & path, ggml_backend_t backend,
               int language_dimension, int vocabulary, std::string & error);
     bool encode(const std::vector<float> & channel_major_patches, PatchGrid grid,
@@ -75,6 +100,15 @@ void rotary_tables(PatchGrid grid, std::vector<float> & cosine, std::vector<floa
 ggml_tensor * rotate(ggml_context *, ggml_tensor *, ggml_tensor * cosine, ggml_tensor * sine);
 ggml_tensor * attention(ggml_context *, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
                         ggml_backend_t backend = nullptr);
+// The same attention over query blocks of at most `block` rows: V4.1 images
+// reach ~9.2K patches, whose full [N, N, heads] scores alone would take 5.4 GB.
+// Each query row still sees every key, so the softmax is the full one; it is
+// the source-order HIP kernel while N fits it (4096 keys), ggml's otherwise.
+ggml_tensor * attention_blocked(ggml_context *, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+                                int64_t block, ggml_backend_t backend = nullptr);
+// Query rows per block for N patches: the block's scores and probabilities
+// stay under 512 MiB.
+int64_t attention_query_block(int64_t patches);
 ggml_tensor * unfold(ggml_context *, ggml_tensor *, PatchGrid, int channels);
 }
 } // namespace luce::vision

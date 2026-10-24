@@ -24,6 +24,7 @@ allowed below. Valid integer overrides retain their existing upper clamps.
 | `--prefill-threshold` | `32000` | `16384` | Auto admission threshold, in droppable tokens |
 | `--prefill-keep-ratio` | `0.05` | curve | Flat ratio; `--prefill-curve tokens:ratio ...` overrides it. The release curve is `16384:0.315 32768:0.270 65536:0.270 120000:0.225`; either flag replaces it |
 | `--prefill-skip-park` | off | | Keep the target resident while the drafter scores; see the release profile |
+| `--prefill-drafter-device` | the `--draft-device` | | `backend:gpu` the drafter scores on, in process (the target's backend, one explicit `--target-device`); on another GPU than the target nothing is reserved or parked on the target's |
 | `PFLASH_ADMISSION` | `length` | `cache` | `length` or `cache`; cache admission accounts for restorable target KV |
 | `PFLASH_UNIFIED` | `0` | `1` | One view and recall mechanism for chats and agent sessions: only the newest turn's long uncached content is paged, in whole lines. Needs a strict-selection environment; the chat-view settings below apply only to the requests it hands back. See the [server README](../README.md#pflash) |
 | `PFLASH_REGION_TOOLS` | `*` | | Under the unified view: tools whose outputs may be paged; a comma-separated list names tools, empty pages none |

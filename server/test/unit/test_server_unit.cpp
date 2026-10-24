@@ -139,6 +139,10 @@ struct SchedulerTestHarness {
         server.queue_cv_.notify_all();
     }
 
+    static json status_json(const HttpServer & server) {
+        return server.status_.to_json();
+    }
+
     static void finalize_inline_snapshot(
             HttpServer & server, const std::vector<int32_t> & prompt,
             PrefixCache::InlineReservation reservation,
@@ -7023,6 +7027,67 @@ TEST_CASE(ServerUnitFixture, test_pflash_placement_disabled_never_remote) {
     TEST_ASSERT(!placement.remote.enabled());
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_drafter_device_overrides_the_decode_drafters) {
+    DevicePlacement draft;
+    draft.backend = PlacementBackend::Hip;
+    draft.gpu = 0;
+    DevicePlacement own;
+    own.backend = PlacementBackend::Hip;
+    own.gpu = 1;
+    TEST_ASSERT(pflash_drafter_device(draft, std::nullopt).gpu == 0);
+    TEST_ASSERT(pflash_drafter_device(draft, own).gpu == 1);
+
+    RemoteDraftConfig remote;
+    remote.ipc_bin = "/tmp/backend_ipc_daemon";
+    auto placement = resolve_pflash_drafter_placement(
+        draft, pflash_drafter_device(draft, own), remote, /*pflash_enabled=*/true);
+    TEST_ASSERT(placement.drafter_gpu == 1);
+    // Same backend on another GPU: scored in process, not through IPC.
+    TEST_ASSERT(!placement.remote_drafter);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_drafter_beside_target) {
+    DevicePlacement target;
+    target.backend = PlacementBackend::Hip;
+    target.gpu = 0;
+    DevicePlacement same = target;
+    DevicePlacement other = target;
+    other.gpu = 1;
+    DevicePlacement unset;
+    unset.backend = PlacementBackend::Auto;
+    unset.gpu = 0;
+    // No device of its own: it follows the decode drafter, on the target's GPU.
+    TEST_ASSERT(pflash_drafter_beside_target(target, std::nullopt));
+    TEST_ASSERT(pflash_drafter_beside_target(target, same));
+    TEST_ASSERT(!pflash_drafter_beside_target(target, other));
+    // An unset backend is the compiled one, so hip:0 and auto:0 are one GPU here.
+    if (compiled_placement_backend() == PlacementBackend::Hip) {
+        TEST_ASSERT(pflash_drafter_beside_target(target, unset));
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_drafter_device_refusal) {
+    DevicePlacement target;
+    target.backend = PlacementBackend::Hip;
+    target.gpu = 0;
+    DevicePlacement other = target;
+    other.gpu = 1;
+    // Without its own device nothing is refused, whatever the target.
+    TEST_ASSERT(pflash_drafter_device_refusal(target, true, std::nullopt) == nullptr);
+    // Another GPU on the target's backend scores in process.
+    TEST_ASSERT(pflash_drafter_device_refusal(target, false, other) == nullptr);
+    // auto picks the target's GPU after the pool and parking are sized.
+    TEST_ASSERT(pflash_drafter_device_refusal(target, true, other) != nullptr);
+    // A layer-split target loads its drafter on its first GPU.
+    DevicePlacement split;
+    TEST_ASSERT(parse_placement_device_list("hip:0,hip:1", split));
+    TEST_ASSERT(pflash_drafter_device_refusal(split, false, other) != nullptr);
+    // Another backend would need the IPC drafter.
+    DevicePlacement cuda = other;
+    cuda.backend = target.backend == PlacementBackend::Cuda ? PlacementBackend::Hip : PlacementBackend::Cuda;
+    TEST_ASSERT(pflash_drafter_device_refusal(target, false, cuda) != nullptr);
+}
+
 TEST_CASE(ServerUnitFixture, test_draft_residency_parse) {
     DraftResidencyPolicy policy = DraftResidencyPolicy::Auto;
     TEST_ASSERT(parse_draft_residency_policy("auto", policy));
@@ -10182,6 +10247,99 @@ TEST_CASE(ServerUnitFixture, test_scheduler_runs_a_short_prompt_before_a_long_on
     }
     TEST_ASSERT(question_step > 0);
     TEST_ASSERT(last_document_step > question_step);
+}
+
+// Every decode step verifies a drafted chain of 8 positions; the first step
+// accepts 4 of them, the second 2.
+class SpecRoundEngine final : public SeqEngine {
+public:
+    int slot_count() const override { return 1; }
+    int max_context() const override { return 4096; }
+    bool token_is_eos(int32_t) const override { return false; }
+    StepPlanLimits step_plan_limits(int) const override { return {1, 16, 16, 16}; }
+    AdmitResult admit(uint64_t, const std::vector<int32_t> &, const SamplerCfg &) override {
+        AdmitResult result;
+        result.status = AdmitResult::Status::admitted;
+        result.slot = 0;
+        return result;
+    }
+    StepResult step(const StepPlan & plan) override {
+        StepResult result;
+        for (const StepInput & input : plan.decode) {
+            DecodeOutput out;
+            out.slot = input.slot;
+            out.committed_tokens = {8, 7, 8};
+            out.token = 7;
+            out.spec_offered = 8;
+            out.spec_accepted = rounds++ == 0 ? 4 : 2;
+            result.decode.push_back(std::move(out));
+        }
+        for (const PrefillSlice & slice : plan.prefills) {
+            PrefillOutput out;
+            out.slot = slice.slot;
+            out.status = PrefillOutput::Status::completed;
+            out.token = 7;
+            result.prefills.push_back(out);
+        }
+        return result;
+    }
+    void retire(int) override {}
+
+    int rounds = 0;
+};
+
+struct SpecRoundBackend : MockBackend {
+    SpecRoundEngine engine;
+    SeqEngine * seq_engine() override { return &engine; }
+};
+
+// A request the parallel scheduler decoded with drafted rounds reports, in
+// its /status perf record, that it speculated and the rounds' acceptance.
+TEST_CASE(ServerUnitFixture, test_scheduler_perf_record_reports_speculative_rounds) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<SpecRoundBackend>();
+    SpecRoundBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+
+    int fds[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ServerJob job;
+    job.fd = fds[0];
+    job.req.format = ApiFormat::OPENAI_CHAT;
+    job.req.prompt_tokens.assign(4, 100);
+    job.req.max_output = 9;  // the prefill's token, then two rounds of 4
+    job.req.stream = false;
+    job.req.model = "scheduler-test";
+    job.req.response_id = "spec";
+    SchedulerTestHarness::enqueue(server, &job);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    bool done = false;
+    {
+        std::unique_lock<std::mutex> lock(job.mu);
+        done = job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; });
+    }
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+    unlink(path.c_str());
+    TEST_ASSERT(done);
+    TEST_ASSERT(backend.engine.rounds == 2);
+
+    const json perf = SchedulerTestHarness::status_json(server)["perf_history"];
+    TEST_ASSERT(perf.size() == 1);
+    TEST_ASSERT(perf[0]["completion_tokens"] == 9);
+    TEST_ASSERT(perf[0]["spec_decode"] == true);
+    // The second round had room for 4 of its 8 positions, as single-lane
+    // decode counts a round that reaches the output budget.
+    TEST_ASSERT(std::abs(perf[0]["accept_rate"].get<double>() - 6.0 / 12.0) < 1e-6);
 }
 
 TEST_CASE(ServerUnitFixture,

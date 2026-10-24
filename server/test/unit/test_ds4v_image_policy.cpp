@@ -29,10 +29,13 @@ int main() {
             check(result.count==0 && !error.empty(), "failure result/error contract");
         };
         reject(nullptr,bias,4,2); reject(scores,nullptr,4,2);
-        reject(scores,bias,0,0); reject(scores,bias,257,2);
+        reject(scores,bias,0,0);
         reject(scores,bias,4,0); reject(scores,bias,4,5);
         reject(scores,bias,4,2,0); reject(scores,bias,4,2,-1);
         reject(scores,bias,4,2,std::numeric_limits<float>::infinity());
+        std::array<float,MAX_IMAGE_EXPERTS+1> many{}, many_bias{};
+        many.fill(1.0f);
+        reject(many.data(),many_bias.data(),MAX_IMAGE_EXPERTS+1,2);
         float invalid[] = {-1,2,3,4}; reject(invalid,bias,4,2);
         invalid[0]=std::numeric_limits<float>::quiet_NaN(); reject(invalid,bias,4,2);
         invalid[0]=std::numeric_limits<float>::infinity(); reject(scores,invalid,4,2);

@@ -1882,6 +1882,9 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             return false;
         }
         out.arch = arch;
+        const int64_t rid = gguf_find_key(gctx, "general.source.revision");
+        out.source_revision = rid >= 0 && gguf_get_kv_type(gctx, rid) == GGUF_TYPE_STRING
+            ? gguf_get_val_str(gctx, rid) : "";
     }
     const bool is_v41 = out.arch == "deepseek41";
     // Every model key is `<arch>.<name>`. Two converters write deepseek41 files:

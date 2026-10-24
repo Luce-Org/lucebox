@@ -21,6 +21,7 @@
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
+#include "tool_checks.h"
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
 #include "freeze_history.h"
@@ -123,6 +124,9 @@ struct ServerConfig {
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
     // Extend the existing prefix cache through generated tool-call turns.
     bool        agent_turn_cache = false;
+    // Tool-use checks on OpenAI chat requests with tools (tool_checks.h).
+    // A request turns them off or on with "tool_checks": false / true.
+    bool        tool_checks = true;
 
     // Pin-Friendly Prompt Processor (PPP): LCP pin_end + optional rearrange.
     // See docs/PIN_FRIENDLY_PROMPT.md. Env: LUCE_PPP=0|1,
@@ -985,6 +989,15 @@ private:
     bool route_model_request(SocketHandle fd, ParsedRequest & req, bool count_only);
     bool handle_model_request(SocketHandle fd, ParsedRequest & req, bool count_only,
                               RoutingAdmission * admission = nullptr);
+    // Tool-use checks: the request runs as inner chat completions through
+    // handle_model_request, and the checked reply goes to the client.
+    bool serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
+                                RoutingAdmission * admission);
+    // One inner non-streaming chat completion. False when the router's
+    // admission turned it away (nothing was sent); otherwise `status` and
+    // `body` hold the HTTP response.
+    bool inner_chat_completion(const json & request, RoutingAdmission * admission,
+                               int & status, std::string & body);
     json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the
@@ -1348,6 +1361,8 @@ private:
     // Disk key of each RAM snapshot slot (written on eviction/shutdown).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
     std::unordered_set<int> agent_turn_cache_slots_;
+    // Calls a tool-use final check added (tool_checks.h).
+    tool_checks::CheckedCalls checked_calls_;
     // Replay blob stored with each slot's disk snapshot.
     std::unordered_map<int, std::string> slot_aux_;
     std::vector<int> request_session_slots_;

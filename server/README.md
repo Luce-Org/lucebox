@@ -205,7 +205,7 @@ New PFlash flags:
 
 | Flag | Purpose |
 |---|---|
-| `--prefill-curve T:R [T:R ...]` | Piecewise keep-ratio curve. Linear interpolation over `(tokens, ratio)` breakpoints, e.g. `10000:0.5 40000:0.2 100000:0.1` (2× compression at 10K tokens, 5× at 40K, 10× at 100K+). Overrides `--prefill-keep-ratio`; a per-session bandit override still takes precedence. |
+| `--prefill-curve T:R [T:R ...]` | Piecewise keep-ratio curve. Linear interpolation over `(tokens, ratio)` breakpoints, e.g. `10000:0.5 40000:0.2 100000:0.1` (2× compression at 10K tokens, 5× at 40K, 10× at 100K+). Points may be separate arguments or one quoted list. Overrides `--prefill-keep-ratio`; a per-session bandit override still takes precedence. |
 | `--prefill-upstream-base <URL>` | OpenAI-compatible upstream base URL. Enables proxy mode. |
 | `--prefill-upstream-key <KEY>` | Bearer token sent to the upstream. |
 | `--prefill-upstream-model <NAME>` | Model name sent on forwarded requests. |
@@ -403,6 +403,7 @@ lists both, the validated overrides and the active experiments.
 | `--prefill-curve T:R [T:R ...]` | none (the release curve with a head) | Piecewise keep-ratio curve; overrides the flat ratio. |
 | `--prefill-drafter <path>` | none | PFlash drafter GGUF (Qwen3.5-0.8B). |
 | `--prefill-skip-park` | off | Keep target and decode draft resident while PFlash runs. |
+| `--prefill-drafter-device <backend:gpu>` | the `--draft-device` | Device the PFlash drafter scores on, in process: a GPU on the target's backend, with one explicit `--target-device` (not `auto` or `--target-devices`). On another GPU than the target, concurrent serving reserves nothing for it in the paged pool and a single request is not parked, so the target's GPU keeps its memory for context. |
 | `--prefill-upstream-base <URL>` | none | Enable compression-proxy mode. |
 | `--prefill-upstream-key <KEY>` | none | Bearer token for the upstream. |
 | `--prefill-upstream-model <NAME>` | none | Model name forwarded upstream. |

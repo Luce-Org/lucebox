@@ -169,6 +169,20 @@ GGML_BACKEND_API bool ggml_backend_cuda_set_mmvq_batch_invariant(bool enabled);
 // at the range's reads. Other kernels compute the range's product as usual.
 GGML_BACKEND_API void ggml_backend_cuda_mul_mat_whole_row_lanes(struct ggml_tensor * mul_mat);
 
+// Calling-thread override of the weight rows per wave on the batch-invariant
+// Q8_0 multi-column launch (mmvq.cu c_invariant_rpb): 0 = LUCE_MMVQ_INVARIANT_ROWS
+// / the default policy, 1 / 2 / 4 = forced. Each row keeps its single-column
+// K traversal, per-lane accumulation and warp reduction; a wave only shares
+// the activation loads across its rows. Returns the previous setting.
+GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_invariant_rows_override(int rows);
+
+// Calling-thread override of the LDS activation staging on the same launch
+// (mmvq.cu c_invariant_lds_waves): -1 = LUCE_MMVQ_INVARIANT_LDS / the default
+// policy, 0 = off (every wave streams the T activation columns itself), 4 / 8 /
+// 16 = that many waves per block stage the columns' q8_1 blocks in LDS once
+// and dot their own rows against them. Same per-row chain. Returns the previous.
+GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_invariant_lds_override(int waves);
+
 // Calling-thread DS4 mixed-expert dispatch ceiling, scoped to a graph compute.
 // Accepts 0 (the default of five) or 1..16; returns the previous ceiling.
 GGML_BACKEND_API int ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(int max_tokens);

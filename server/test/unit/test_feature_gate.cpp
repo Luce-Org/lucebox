@@ -867,6 +867,44 @@ void test_qwen4exp_mtp_options() {
     }
 }
 
+void test_deepseek41_paged_unqualified_switches() {
+    // The backend refuses these under paged V4.1 serving, and the server
+    // leaves a profile's defaults for them out; ordinary switches stay.
+    CHECK(deepseek41_paged_unqualified_env("LUCE_DS4_TP_GROUPED_MMVQ"));
+    CHECK(deepseek41_paged_unqualified_env("LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK"));
+    CHECK(deepseek41_paged_unqualified_env("GGML_CUDA_BATCH_PEER_COPIES"));
+    CHECK(!deepseek41_paged_unqualified_env("LUCE_DS4_FUSE_ROUTER"));
+    CHECK(!deepseek41_paged_unqualified_env("LUCE_DS4_TP_GROUPED"));
+    CHECK(!deepseek41_paged_unqualified_env(""));
+}
+
+void test_feature_gate_vision_projector_by_architecture() {
+    // DeepSeek V4 Vision and V4.1 Flash share the DeepSeek4 image path (the
+    // backend matches the projector to the model); other families refuse it.
+    BackendArgs args = gate_args_hip_deepseek4();
+    args.mmproj_path = "/nonexistent/vision.gguf";
+    for (const char * arch : {"deepseek4", "deepseek41"}) {
+        CHECK(gate_result(args, arch, PlacementBackend::Hip).empty());
+        CHECK(!gate_result(args, arch, PlacementBackend::Cuda).empty());
+    }
+    CHECK(gate_result(args, "qwen35", PlacementBackend::Hip).empty());
+    CHECK(!gate_result(args, "laguna", PlacementBackend::Hip).empty());
+    // Batched DeepSeek serving takes images through the paged engine only.
+    args.max_concurrency = 4;
+    CHECK(!gate_result(args, "deepseek41", PlacementBackend::Hip).empty());
+    args.paged_attention = true;
+    CHECK(gate_result(args, "deepseek41", PlacementBackend::Hip).empty());
+    // A separate encoder GPU: any DeepSeek target, never the target's GPU.
+    DevicePlacement encoder;
+    encoder.backend = PlacementBackend::Hip;
+    encoder.gpu = 1;
+    args.mmproj_device = encoder;
+    CHECK(gate_result(args, "deepseek41", PlacementBackend::Hip).empty());
+    encoder.gpu = 0;
+    args.mmproj_device = encoder;
+    CHECK(!gate_result(args, "deepseek41", PlacementBackend::Hip).empty());
+}
+
 };
 }  // namespace
 
@@ -897,4 +935,6 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_warnings_report_inert_moe_options();
     test_model_capability_tables();
     test_qwen4exp_mtp_options();
+    test_feature_gate_vision_projector_by_architecture();
+    test_deepseek41_paged_unqualified_switches();
 }

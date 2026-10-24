@@ -268,6 +268,9 @@ struct TargetLoadPlan {
     int  layer_begin = 0;     // inclusive
     int  layer_end   = -1;    // exclusive; <0 means all layers
     bool load_output = true;  // output_norm + lm_head
+    // false leaves the lm_head out while load_output still keeps output_norm
+    // (a text encoder reads the final normed hidden states, not logits).
+    bool load_lm_head = true;
     bool skip_expert_tensors = false;  // skip ffn_*_exps from GPU (for hybrid MoE split load)
     bool metadata_only = false;        // parse tensor descriptors/scales without GPU allocation
     bool expert_metadata_only = false; // keep only routed expert tensor metadata; upload nothing
@@ -669,6 +672,15 @@ bool snapshot_target_cache(const TargetWeights & w,
 bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
                           bool skip_kv = false);
 
+// Can an attention K or V snapshot tensor (cur_pos rows) be adopted by this destination cache tensor?
+// Pure decision for Qwen35Backend::snapshot_adopt: type and per-row shape must match and the snapshot must
+// hold exactly cur_pos rows, which the destination must have the physical rows for.
+inline bool attn_snapshot_adoptable(const ggml_tensor * snap, const ggml_tensor * dst, int cur_pos) {
+    return snap && dst && snap->type == dst->type && snap->ne[0] == dst->ne[0] &&
+           snap->ne[2] == dst->ne[2] && snap->ne[3] == dst->ne[3] && snap->ne[1] == cur_pos &&
+           cur_pos <= dst->ne[1];   // physical capacity: a larger pool's snapshot is a miss, not a failed restore
+}
+
 // Zero the full-attention K/V rows at positions >= `pos` (what a
 // clear-then-restore leaves past a restored prefix).
 void clear_kv_rows_from(TargetCache & cache, int pos);
@@ -780,7 +792,8 @@ bool create_target_cache(const TargetWeights & w,
                          int n_seq_slots = 1,
                          bool concurrent_tree = false,
                          ggml_type cache_type_k = GGML_TYPE_COUNT,
-                         ggml_type cache_type_v = GGML_TYPE_COUNT);
+                         ggml_type cache_type_v = GGML_TYPE_COUNT,
+                         int target_feat_cap = 4096);
 
 // `f32_ssm_intermediates` enables exact per-token checkpoints for the opt-in
 // layer-split fast rollback path. The default preserves the established Q8_0
@@ -800,7 +813,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  int n_seq_slots = 1,
                                  bool concurrent_tree = false,
                          ggml_type cache_type_k = GGML_TYPE_COUNT,
-                         ggml_type cache_type_v = GGML_TYPE_COUNT);
+                         ggml_type cache_type_v = GGML_TYPE_COUNT,
+                         int target_feat_cap = 4096);
 
 void free_target_cache(TargetCache & c);
 
