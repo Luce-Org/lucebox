@@ -15,15 +15,41 @@
 #include "common/step_graph.h"
 
 #include "ggml-cuda.h"
+#include "gguf.h"
 #include "common/snapshot_backend.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace luce::common {
+
+// Read only draft metadata: cache allocation precedes loading draft weights
+// and feature capture. The verifier's span guard also checks the actual width.
+static int gemma4_max_forward_tokens(const Gemma4BackendConfig & cfg) {
+    int count = std::max(1, cfg.chunk);
+    if (!cfg.draft_path) return count;
+    gguf_init_params params{};
+    params.no_alloc = true;
+    gguf_context * meta = gguf_init_from_file(cfg.draft_path->c_str(), params);
+    if (!meta) return count; // The normal draft loader reports invalid files.
+    const int64_t arch_id = gguf_find_key(meta, "general.architecture");
+    if (arch_id >= 0 && gguf_get_kv_type(meta, arch_id) == GGUF_TYPE_STRING) {
+        const std::string key = std::string(gguf_get_val_str(meta, arch_id)) +
+                                ".dflash.block_size";
+        const int64_t id = gguf_find_key(meta, key.c_str());
+        if (id >= 0 && gguf_get_kv_type(meta, id) == GGUF_TYPE_UINT32) {
+            const uint32_t width = gguf_get_val_u32(meta, id);
+            if (width <= uint32_t(std::numeric_limits<int>::max()))
+                count = std::max(count, int(width));
+        }
+    }
+    gguf_free(meta);
+    return count;
+}
 
 // ── Ctor / dtor ────────────────────────────────────────────────────────
 
@@ -54,7 +80,7 @@ bool Gemma4Backend::init() {
 
     kvflash_read_config();
     if (!create_gemma4_cache(backend_, w_, cfg_.device.max_ctx, cache_,
-                             kvflash_tokens_)) {
+                             kvflash_tokens_, gemma4_max_forward_tokens(cfg_))) {
         std::fprintf(stderr, "[gemma4] cache alloc failed\n");
         return false;
     }
@@ -129,7 +155,7 @@ bool Gemma4Backend::unpark(ParkTarget target) {
 
         // Recreate KV cache
         if (!create_gemma4_cache(backend_, w_, cfg_.device.max_ctx, cache_,
-                                 kvflash_tokens_)) {
+                                 kvflash_tokens_, gemma4_max_forward_tokens(cfg_))) {
             std::fprintf(stderr, "[gemma4] unpark: failed to recreate cache\n");
             free_gemma4_weights(w_);
             return false;
