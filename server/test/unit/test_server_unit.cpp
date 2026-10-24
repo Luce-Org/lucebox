@@ -213,17 +213,21 @@ struct SchedulerTestHarness {
         return server.agent_turn_cache_slots_.count(slot) != 0;
     }
 
-    // `own_snapshot_slot` is the inline snapshot the request itself took.
+    // `own_snapshot_slot` is the inline snapshot the request itself took,
+    // `restored_slot` the checkpoint it restored from.
     static bool save_generated_turn(
             HttpServer & server, const std::vector<int32_t> & prompt,
             const std::vector<int32_t> & generated,
             const std::vector<int32_t> & canonical,
             int own_snapshot_slot = -1,
-            DiskPrefixCacheMode disk_scope = DiskPrefixCacheMode::Full) {
+            DiskPrefixCacheMode disk_scope = DiskPrefixCacheMode::Full,
+            int restored_slot = -1) {
         HttpServer::GenerationCacheState cache;
         cache.disk_policy.mode = disk_scope;
         cache.snap_prepared = own_snapshot_slot >= 0;
         cache.snap_slot = own_snapshot_slot;
+        cache.using_restore = restored_slot >= 0;
+        cache.cache_slot = restored_slot;
         return server.save_generated_turn(prompt, generated, canonical, cache);
     }
 
@@ -6035,17 +6039,17 @@ TEST_CASE(ServerUnitFixture, test_slide_restore_source_never_evicted) {
     TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 1) == 0);
 }
 
-// (c) The protected tools pin is never evicted, even when it is the
-// shallowest ancestor and the only other entry besides the restore source.
-TEST_CASE(ServerUnitFixture, test_slide_protected_pin_never_evicted) {
+// (c) The restore source's own tools pin is never evicted, even when it is
+// the shallowest ancestor and the only other entry besides the restore source.
+TEST_CASE(ServerUnitFixture, test_slide_restore_source_pin_never_evicted) {
     std::vector<std::vector<int32_t>> ids = {
         {9}, {9, 1}, {9, 1, 2}, {9, 1, 2, 3},
     };
     std::vector<bool> protect = {true, false, false, false};
     TEST_ASSERT(select_inline_evict_victim(ids, &protect, 3) == 1);
 
-    // Only the protected pin and the restore source remain: no safe victim,
-    // so no snapshot is reserved instead of destroying the pin.
+    // Only the restore source and its pin remain: no safe victim, so no
+    // snapshot is reserved instead of destroying the pin.
     std::vector<std::vector<int32_t>> two = {{9}, {9, 1}};
     std::vector<bool> two_prot = {true, false};
     TEST_ASSERT(select_inline_evict_victim(two, &two_prot, 1) == -1);
@@ -6081,6 +6085,51 @@ TEST_CASE(ServerUnitFixture, test_slide_protected_pin_never_evicted) {
     unlink(path.c_str());
 }
 
+// (c2) A cache full of other conversations' pins still takes the restored
+// conversation's next snapshot: the least recently used pin that is a leaf
+// goes. Otherwise the conversation never saves another turn.
+TEST_CASE(ServerUnitFixture, test_slide_full_cache_of_pins_evicts_oldest_pin) {
+    // {9} heads the restore source; {7} and {8} head other conversations.
+    std::vector<std::vector<int32_t>> ids = {{9}, {7}, {8}, {9, 1}};
+    std::vector<bool> protect = {true, true, true, false};
+    TEST_ASSERT(select_inline_evict_victim(ids, &protect, 3) == 1);
+
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(3, tokenizer);
+    TEST_ASSERT(!cache.disabled());
+
+    const std::vector<int32_t> other = {1, 200, 4, 201};
+    const std::vector<int32_t> head = {1, 100, 4, 101};
+    std::vector<int32_t> deep = head;
+    deep.insert(deep.end(), {3, 102});
+    std::vector<int32_t> deeper = deep;
+    deeper.insert(deeper.end(), {4, 103});
+    cache.confirm_inline_snap(0, (int) other.size(), other, /*protect=*/true);
+    cache.confirm_inline_snap(1, (int) head.size(), head, /*protect=*/true);
+    cache.confirm_inline_snap(2, (int) deep.size(), deep);
+
+    const auto hit = cache.lookup(deeper);
+    TEST_ASSERT(hit.first == 2 && hit.second == (int) deep.size());
+    auto next = cache.reserve_inline_snap(
+        deeper, hit.second, false, (int) deeper.size(), hit.first);
+    TEST_ASSERT(next.active() && next.slot() == 0);
+    TEST_ASSERT(next.commit(deeper));
+
+    std::vector<int32_t> after = deeper;
+    after.insert(after.end(), {3, 104});
+    const auto grown = cache.lookup(after);
+    TEST_ASSERT(grown.first == 0 && grown.second == (int) deeper.size());
+    std::vector<int32_t> sibling = head;
+    sibling.insert(sibling.end(), {3, 999});
+    TEST_ASSERT(cache.lookup(sibling).first == 1);
+    std::vector<int32_t> other_next = other;
+    other_next.insert(other_next.end(), {3, 999});
+    TEST_ASSERT(cache.lookup(other_next).first == -1);
+    unlink(path.c_str());
+}
+
 // (d) Branching conversations are unchanged: with two leaves, the oldest
 // non-restore-source leaf is still the victim.
 TEST_CASE(ServerUnitFixture, test_slide_branching_oldest_leaf_unchanged) {
@@ -6091,9 +6140,9 @@ TEST_CASE(ServerUnitFixture, test_slide_branching_oldest_leaf_unchanged) {
     TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 2) == 1);
     // Restore source is the older leaf: the remaining leaf is the victim.
     TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 1) == 2);
-    // A protected leaf is never evicted: with the restore source skipped and
-    // the only remaining leaf protected, the shallowest unprotected ancestor
-    // is the victim instead.
+    // A protected leaf goes last: with the restore source skipped and the
+    // only remaining leaf protected, the shallowest unprotected ancestor is
+    // the victim instead.
     std::vector<bool> protect = {false, true, false};
     TEST_ASSERT(select_inline_evict_victim(ids, &protect, 2) == 0);
 }
@@ -9334,6 +9383,52 @@ TEST_CASE(ServerUnitFixture, test_save_generated_turn_keys_live_state) {
         std::vector<int32_t> diverged = prompt;
         diverged.insert(diverged.end(), {250, 7});
         TEST_ASSERT(cache.lookup(diverged).first == 1);
+    }
+    {
+        // The same holds for the checkpoint the request restored from while
+        // the backend still holds it.
+        auto backend_owner = std::make_unique<LiveStateBackend>();
+        LiveStateBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.prefix_cache_cap = 3;
+        HttpServer server(engine, tokenizer, config);
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        cache.confirm_inline_snap(0, 2, prompt);
+        cache.confirm_inline_snap(1, 4, prompt);
+        cache.confirm_inline_snap(2, 3, std::vector<int32_t>{1, 100, 9});
+        backend.saved_slot = 1;
+        backend.saved_position = 4;
+        backend.live_position = 6;
+        TEST_ASSERT(SchedulerTestHarness::save_generated_turn(
+            server, prompt, generated, canonical, /*own_snapshot_slot=*/-1,
+            DiskPrefixCacheMode::Full, /*restored_slot=*/1));
+        TEST_ASSERT(backend.saved_slot == 2);
+        std::vector<int32_t> diverged = prompt;
+        diverged.insert(diverged.end(), {250, 7});
+        TEST_ASSERT(cache.lookup(diverged).first == 1);
+    }
+    {
+        // A live restore consumed its checkpoint and finalization dropped
+        // the entry, so its slot is free. Here it is the only free slot, and
+        // the turn is saved there. Refusing it saves nothing on every other
+        // turn of a full cache.
+        auto backend_owner = std::make_unique<LiveStateBackend>();
+        LiveStateBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.prefix_cache_cap = 3;
+        HttpServer server(engine, tokenizer, config);
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        cache.confirm_inline_snap(0, 3, std::vector<int32_t>{1, 100, 9});
+        cache.confirm_inline_snap(1, 3, std::vector<int32_t>{1, 100, 8});
+        backend.live_position = 6;
+        TEST_ASSERT(SchedulerTestHarness::save_generated_turn(
+            server, prompt, generated, canonical, /*own_snapshot_slot=*/-1,
+            DiskPrefixCacheMode::Full, /*restored_slot=*/2));
+        std::vector<int32_t> next = canonical;
+        next.insert(next.end(), {8, 9});
+        TEST_ASSERT(cache.lookup(next).first == 2);
     }
     unlink(path.c_str());
 }

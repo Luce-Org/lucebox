@@ -279,13 +279,15 @@ int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> &
             }
         }
         if (shallowest_ancestor >= 0) return shallowest_ancestor;
-        // Only the restore source and/or protected pins remain: destroying
-        // either would throw away the stable tools head or the in-flight
-        // restore, so there is no safe victim.
-        return -1;
     }
+    // Every other leaf is a pin. Give up the least recently used one: its
+    // head costs one re-prefill, while refusing leaves the restored
+    // conversation unable to save any later turn. A leaf is never an
+    // ancestor of the restore source.
     if (oldest_protected_leaf >= 0) return oldest_protected_leaf;
-    return 0;  // unreachable (the longest entry is always a leaf); pure-LRU fallback
+    // Only the restore source and its ancestors remain. Without a restore
+    // source this is unreachable: the longest entry is always a leaf.
+    return skip_index >= 0 ? -1 : 0;
 }
 
 int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru,
@@ -769,6 +771,15 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         if (!active.has_victim) ++reserved_free_slots;
         pending_bytes += active.bytes;
     }
+    const auto log_no_slot = [&](const char * reason) {
+        int pins = 0;
+        for (const auto & entry : entries_) pins += entry.protect ? 1 : 0;
+        std::fprintf(stderr,
+            "[pc] inline snap skipped, %s: entries=%zu protected=%d "
+            "in_flight=%zu cap=%d restore_slot=%d cut=%d\n",
+            reason, entries_.size(), pins, active_reservations_.size(), cap_,
+            restore_source_slot, target_cut);
+    };
     if ((int)entries_.size() + reserved_free_slots >= cap_) {
         // At capacity — reserve a slot without evicting yet. Prefix-aware: prefer
         // the oldest leaf so shared ancestor prefixes (reused by later branches)
@@ -779,9 +790,10 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         const int victim = pick_evict_victim(
             restore_source_slot >= 0 ? find_slot_entry(restore_source_slot) : -1);
         if (victim < 0) {
-            // Nothing safe to evict (only the restore source and/or protected
-            // pins remain). Skip this snapshot; the restore point stays put
-            // rather than being destroyed.
+            // Only the restore source and its pinned ancestors remain, or a
+            // capture in flight holds the victim. Skip this snapshot; the
+            // restore point stays put rather than being destroyed.
+            log_no_slot("no evictable entry");
             return {};
         }
         victim_key = entries_[(size_t)victim].hash;
@@ -809,7 +821,10 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
             slot = candidate;
             break;
         }
-        if (slot < 0) return {};
+        if (slot < 0) {
+            log_no_slot("no free slot");
+            return {};
+        }
         next_slot_ = (slot + 1) % cap_;
     }
 
@@ -1209,7 +1224,8 @@ std::vector<int> PrefixCache::enforce_resident_budget(
         const int keep = find_slot_entry(keep_slot);
         if (keep < 0) break;
         // Oldest unprotected leaf first, then the shallowest unprotected
-        // ancestor; never the new entry or a protected pin.
+        // ancestor, then the oldest pin that is a leaf; never the new entry
+        // or a pinned ancestor of it.
         const int victim = pick_evict_victim(keep);
         if (victim < 0) break;
         const int slot = entries_[(size_t)victim].slot;

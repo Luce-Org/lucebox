@@ -58,16 +58,15 @@ PrefixHash hash_prefix(const int32_t * ids, int count);
 // serves an edit of the last message. Pointer overload is the core (no token
 // copies); the value overload is for tests.
 //
-// protected_lru (optional, same size): entries marked true are skipped.
-// Without skip_index, if every leaf is protected, the oldest protected leaf
-// is the last resort. With skip_index set, protected entries stay ineligible
-// and the function may return -1 instead (see skip_index below).
+// protected_lru (optional, same size): entries marked true go last. When
+// every other leaf is protected, the oldest protected leaf is the victim.
 // skip_index (default -1): the in-flight restore source, never a victim; if it
 // is the only unprotected leaf, evict the shallowest non-protected ancestor
-// instead so the restore point can slide. The protected pin is never evicted.
+// instead so the restore point can slide, before any protected leaf. A
+// protected ancestor of the restore source is never evicted.
 //
 // Returns the victim index [0, n-1]; -1 if skip_index is set and only the
-// restore source and/or protected pins remain; 0 if ids_lru is empty or,
+// restore source and its ancestors remain; 0 if ids_lru is empty or,
 // impossibly, no leaf exists.
 int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> & ids_lru,
                                const std::vector<bool> * protected_lru = nullptr,
@@ -276,9 +275,9 @@ public:
     std::vector<int> prune_superseded_ancestors(
         int slot, std::vector<int> * pruned_tokens = nullptr);
 
-    // Evicts committed entries, never `keep_slot` or protected pins, until the
-    // resident bytes fit the budget again. Returns the evicted slots; the
-    // caller frees their snapshot payloads.
+    // Evicts committed entries, pins last and never `keep_slot` or a pinned
+    // ancestor of it, until the resident bytes fit the budget again. Returns
+    // the evicted slots; the caller frees their snapshot payloads.
     // `persist` (optional) gets persist_on_evict() of each evicted slot,
     // decided before it was erased.
     std::vector<int> enforce_resident_budget(
