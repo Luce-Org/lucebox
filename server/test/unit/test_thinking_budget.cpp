@@ -523,3 +523,57 @@ TEST_CASE(BudgetHookFixture, spec_matches_ar_rule) {
 }
 
 }  // namespace BudgetHookTests
+
+namespace {
+
+// Distinct token ids [first, first + n): text with no period of its own.
+std::vector<int32_t> distinct_tokens(int32_t first, int n) {
+    std::vector<int32_t> out((size_t) n);
+    for (int i = 0; i < n; ++i) out[(size_t) i] = first + i;
+    return out;
+}
+
+void append(std::vector<int32_t> & out, const std::vector<int32_t> & part) {
+    out.insert(out.end(), part.begin(), part.end());
+}
+
+// Feeds `reply` one token at a time, as the decoders call the watchdog.
+// Returns {tokens emitted when it fired, period}, or {0, 0} if it never did.
+std::pair<size_t, int> first_loop(const std::vector<int32_t> & reply) {
+    std::vector<int32_t> emitted;
+    for (int32_t token : reply) {
+        emitted.push_back(token);
+        if (const int period = luce::common::post_close_loop_period(emitted)) {
+            return {emitted.size(), period};
+        }
+    }
+    return {0, 0};
+}
+
+}  // namespace
+
+namespace PostCloseLoopTests {
+
+// A test file that reads the same range again to check a cache repeats a line
+// on purpose. Cutting there truncated a tool call mid-argument.
+TEST_CASE(BudgetHookFixture, repeated_code_line_is_not_a_loop) {
+    const auto line = distinct_tokens(500, 21);
+    std::vector<int32_t> reply = distinct_tokens(1000, 400);
+    for (int i = 0; i < 3; ++i) append(reply, line);
+    append(reply, distinct_tokens(2000, 200));
+    REQUIRE(first_loop(reply) == std::make_pair(size_t{0}, 0));
+}
+
+// The aime2025-02 shape: a ~50-token phrase repeated verbatim until max_tokens.
+TEST_CASE(BudgetHookFixture, verbatim_runaway_is_cut_within_a_few_periods) {
+    const int content = 400, period = 50;
+    const auto phrase = distinct_tokens(500, period);
+    std::vector<int32_t> reply = distinct_tokens(1000, content);
+    for (int i = 0; i < 80; ++i) append(reply, phrase);  // until the reply reserve runs out
+    const auto [emitted, found] = first_loop(reply);
+    REQUIRE(found == period);
+    REQUIRE(emitted > (size_t) content);
+    REQUIRE(emitted - (size_t) content <= (size_t) (6 * period));
+}
+
+}  // namespace PostCloseLoopTests

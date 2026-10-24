@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -158,5 +159,33 @@ private:
     std::size_t inject_pos_ = 0;
     std::vector<int32_t> marker_tail_;
 };
+
+// Degenerate-decode watchdog for the reply after a forced close. Returns the
+// period of a verbatim loop at the end of `tokens`, or 0. The aime2025-02 case
+// at think_max=4k produces a ~50-token phrase that repeats verbatim until
+// max_tokens — pure waste.
+//
+// A loop counts only once the last kLoopTokens tokens all repeat with period
+// P. One repeat is not a loop: replies repeat a line on purpose (a test that
+// reads the same range twice to check a cache, identical table rows or list
+// items), and cutting there truncated a tool call mid-argument. A real loop
+// runs until max_tokens, so waiting kLoopTokens costs a few hundred tokens of
+// the reply reserve, while legitimate repeats span far fewer tokens.
+//
+// Sweep contiguous periods 12..80: fixed periods missed the aime02 loop
+// (period ~50), and shorter cycles show up as one of their multiples.
+inline int post_close_loop_period(const std::vector<int32_t> & tokens) {
+    constexpr int kMinPeriod = 12, kMaxPeriod = 80;
+    constexpr int kLoopTokens = 256;
+    static_assert(kLoopTokens >= 3 * kMaxPeriod,
+                  "a loop must span at least three periods");
+    if (tokens.size() < (std::size_t) kLoopTokens) return 0;
+    const auto tail = tokens.end() - kLoopTokens;
+    for (int P = kMinPeriod; P <= kMaxPeriod; P++) {
+        // Every tail token equals the token P before it.
+        if (std::equal(tail + P, tokens.end(), tail)) return P;
+    }
+    return 0;
+}
 
 }  // namespace luce::common

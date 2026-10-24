@@ -2847,43 +2847,21 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
         }
 
         // Degenerate-decode watchdog. Once we're past the budget-hook's
-        // close sequence (model in post-`</think>` content phase), watch
-        // for repetition loops. The aime2025-02 case at think_max=4k
-        // produces a ~50-token phrase that repeats verbatim until
-        // max_tokens — pure waste.
-        //
-        // Sweep several common loop periods. For each period P we check
-        // if the last P tokens equal the previous P tokens (one full
-        // repeat). One match is enough; the model has already burned 2P
-        // tokens at that point and isn't getting out. The minimum-3
-        // bar would catch tighter cycles but waits ~3P tokens to fire,
-        // which is wasteful for P ≥ 32. Periods are tuned to common
-        // failure modes: short loops (16-24) for "we have X, X, X"
-        // patterns, longer (48-64) for full-sentence restates like the
-        // aime02 case.
+        // close sequence (model in post-`</think>` content phase), stop a
+        // verbatim repetition loop. The rule and why one repeat is not
+        // enough: post_close_loop_period (common/thinking_budget.h).
         if (budget.forced_close() && !budget.injecting())
         {
-            // Sweep contiguous periods 12..80. Any P where the last P
-            // tokens equal the previous P tokens means a loop of that
-            // period. Stop early on first match. Fixed periods missed
-            // the aime02 case which loops with period ~50; dense sweep
-            // covers any period in this range.
-            auto end = out_tokens.end();
-            const int avail = (int)out_tokens.size();
-            for (int P = 12; P <= 80; P++) {
-                if (avail < 2 * P) break;  // larger P also won't have data
-                if (std::equal(end - 2*P, end - P, end - P)) {
-                    std::fprintf(stderr,
-                        "[degenerate-decode] post-close period=%d repeated — "
-                        "breaking AR loop at committed=%d, content_tokens=%zu\n",
-                        P, committed,
-                        out_tokens.size() - out_tokens_at_entry);
-                    if (degenerate_close_out) *degenerate_close_out = true;
-                    goto degenerate_break;
-                }
+            if (const int P = post_close_loop_period(out_tokens)) {
+                std::fprintf(stderr,
+                    "[degenerate-decode] post-close period=%d repeated — "
+                    "breaking AR loop at committed=%d, content_tokens=%zu\n",
+                    P, committed,
+                    out_tokens.size() - out_tokens_at_entry);
+                if (degenerate_close_out) *degenerate_close_out = true;
+                break;
             }
         }
-        if (false) { degenerate_break: break; }
     }
 
     auto t_dec1_ar = std::chrono::steady_clock::now();

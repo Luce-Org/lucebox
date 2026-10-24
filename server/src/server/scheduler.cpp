@@ -315,21 +315,16 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 return;
             }
         }
-        // Post-close repetition watchdog (periods 12..80), mirrors
-        // do_ar_decode's sweep once the close sequence has fully injected.
+        // Post-close repetition watchdog, the same rule as do_ar_decode
+        // (post_close_loop_period) once the close sequence has fully injected.
         if (s.budget.forced_close() && !s.budget.injecting()) {
-            const auto end = s.gen_tokens.end();
-            const int avail = (int)s.gen_tokens.size();
-            for (int P = 12; P <= 80; P++) {
-                if (avail < 2 * P) break;
-                if (std::equal(end - 2 * P, end - P, end - P)) {
-                    std::fprintf(stderr,
-                        "[parallel] post-close period=%d repeated — "
-                        "stopping slot\n", P);
-                    s.degenerate_close = true;
-                    s.finished = true;
-                    return;
-                }
+            if (const int P = post_close_loop_period(s.gen_tokens)) {
+                std::fprintf(stderr,
+                    "[parallel] post-close period=%d repeated — "
+                    "stopping slot\n", P);
+                s.degenerate_close = true;
+                s.finished = true;
+                return;
             }
         }
     };
