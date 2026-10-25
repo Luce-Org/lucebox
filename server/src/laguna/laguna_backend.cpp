@@ -1294,8 +1294,8 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     const bool should_emit = req.stream || (bool)out_io.on_token;
     const int N = (int)req.prompt.size();
     sampler_ = req.sampler;
-    if (req.do_sample && sampler_.seed != 0) {
-        sampler_rng_.seed(sampler_.seed);
+    if (req.do_sample) {
+        sampler_rng_.seed(request_rng_seed(sampler_));
     }
 
     if (N + req.n_gen > args_.max_ctx) {
@@ -1516,8 +1516,8 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         return result;
     }
     sampler_ = req.sampler;
-    if (req.do_sample && sampler_.seed != 0) {
-        sampler_rng_.seed(sampler_.seed);
+    if (req.do_sample) {
+        sampler_rng_.seed(request_rng_seed(sampler_));
     }
 
     if (!laguna_snapshot_restore(snapshots_[slot], cache_)) {
@@ -2651,8 +2651,8 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
     DaemonIO out_io = io.with_token_callback(req.on_token);
     const bool should_emit = req.stream || (bool)out_io.on_token;
     const int N = (int)req.prompt.size();
-    if (req.do_sample && req.sampler.seed != 0) {
-        sampler_rng_.seed(req.sampler.seed);
+    if (req.do_sample) {
+        sampler_rng_.seed(request_rng_seed(req.sampler));
     }
 
     if (N + req.n_gen > args_.max_ctx) {

@@ -40,13 +40,12 @@ Long-context prefill is O(S²): vanilla llama.cpp on a single RTX 3090 takes **~
 
 - C++/CUDA daemon-resident drafter + scoring + target generation, all in one process, one ggml allocator.
 - Custom Qwen3.5-0.8B BF16 forward (`src/pflash/qwen35_loader.cpp` + the qwen35 target graph) — no libllama.
-- 4 CUDA kernels for the FlashPrefill `mean_K → score → select → sparse_fwd` algorithm (`flashprefill_kernels.cu`).
-- BSA ([mit-han-lab/Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention), FA-2 derived, sm_80+) for the long-context drafter forward, wired without `libtorch` via 3 ATen/c10 header stubs (`server/deps/bsa_stubs/`).
+- Scoring runs the drafter's blocks 0–14 (Gated DeltaNet layers plus a few full-attention layers on ggml flash-attention), then block 15's NoPE Q/K attention mass from the query window, optionally through a trained scoring head. No sparse attention kernel is involved.
 - 128K → 2.6K span selection at `keep_ratio=0.05`, NIAH retrieved at every measured context, decode ~74 tok/s downstream.
 
 ## Results
 
-NIAH single-needle, RTX 3090 24 GB, Qwen3.6-27B Q4_K_M target, Qwen3-0.6B drafter, `LUCE_FP_USE_BSA=1`, `LUCE_FP_ALPHA=0.85`, `keep_ratio=0.05`.
+PFlash v1 (the Qwen3-0.6B drafter with a BSA sparse forward, replaced by the Qwen3.5-0.8B scorer in #746): NIAH single-needle, RTX 3090 24 GB, Qwen3.6-27B Q4_K_M target, `keep_ratio=0.05`.
 
 | Source S | dflash TTFT | llama.cpp baseline | Speedup | NIAH |
 |---|:---:|:---:|:---:|:---:|
@@ -60,15 +59,13 @@ Decode after prefill: ~74 tok/s (dflash spec decode + DDTree). The pipeline is t
 PFlash is the algorithm. The implementation lives in [`../../server/`](../../server/) as part of the luce daemon. The `optimizations/pflash/` directory in this repo only contains the Python tooling for **benchmarking** (NIAH case generation, bench harness around the daemon stdin protocol). Production deploys hit the luce daemon directly.
 
 ```bash
-# 1. from the repo root, install Python deps and build dflash with the BSA
-#    kernel (sm_80+; ~10 min cold compile pulls cutlass)
+# 1. from the repo root, install Python deps and build the server
 cd lucebox-hub
 uv sync
 git submodule update --init --recursive
-cmake -B server/build -S dflash -DCMAKE_BUILD_TYPE=Release \
-                             -DCMAKE_CUDA_ARCHITECTURES=86 \
-                             -DLUCE_ENABLE_BSA=ON
-cmake --build server/build --target test_dflash test_flashprefill_kernels -j
+cmake -B server/build -S server -DCMAKE_BUILD_TYPE=Release \
+                             -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build server/build --target test_dflash -j
 
 # 2. fetch weights (target + spec-decode draft + drafter scorer)
 uv run hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir server/models/
@@ -104,8 +101,6 @@ For an OpenAI-compatible server with transparent compression on long prompts, ru
 
 With `PFLASH_SCORING_HEAD_GGUF` set, every unset PFlash setting takes the measured release profile; see [PFlash configuration](../../server/docs/PFLASH_CONFIGURATION.md#release-profile).
 
-When `--prefill-compression != off`, the server auto-sets `LUCE_LM_HEAD_FIX=0` and `LUCE_FA_WINDOW=0` (matching the bench harness — needed so the post-compress draft graph fits on a 24 GB card without OOM).
-
 ```bash
 ./server/build/luce_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft  server/models/draft/model.safetensors \
@@ -130,7 +125,7 @@ The dflash daemon runs persistently and accepts these commands on stdin (newline
 | `generate <prompt_ids.bin> <n_gen> <out_ids.bin>` | Target spec-decode on the (already compressed) prompt. Streams committed token ids on stdout. |
 | `park draft` / `park target` / `park` | Free draft / target / both weights from VRAM. |
 | `unpark draft` / `unpark target` / `unpark` | Restore weights from disk to VRAM. |
-| `free drafter` | Release the spec-prefill drafter context (drafter weights + KV + BSA scratch). |
+| `free drafter` | Release the spec-prefill drafter context (drafter weights + KV). |
 
 Typical flow at 128K on a 24 GB card: `park target` → `compress` → `free drafter` → `unpark target` → `unpark draft` → `generate` → `park draft`.
 
@@ -138,16 +133,14 @@ Typical flow at 128K on a 24 GB card: `park target` → `compress` → `free dra
 
 ## Runtime tunables
 
-Everything is configured via env vars on the daemon process. Full list in [`../../server/src/flashprefill.h`](../../server/src/flashprefill.h).
+PFlash's selection, query, chat-view and evaluation switches are listed in [PFlash configuration](../../server/docs/PFLASH_CONFIGURATION.md). On the daemon process:
 
 | Env var | Default | Purpose |
 |---|:---:|---|
-| `LUCE_FP_USE_BSA` | `0` | Set to `1` to dispatch the sparse FA forward through the BSA cutlass kernel (sm_80+). Required for the headline 10.4× number; without it the WMMA fallback is used (slower at long ctx). |
-| `LUCE_FP_ALPHA` | `0.12` | Block-selection threshold. Higher = stricter = fewer K-blocks per Q-row. `0.85` is the bench setting; `0.99` cuts another second at 128K with a small NIAH-margin loss. |
-| `LUCE_FP_PROFILE` | `0` | Set to `1` to log per-stage timings (`mean_K / score / select / forward`). |
-| `LUCE_FP_DUMP_COUNTS` | `0` | Set to `1` to dump per-row K-block counts for debugging keep-ratio tuning. |
-| `LUCE_FA_WINDOW` | (auto) | Set to `0` to force full attention on the compressed prompt (recommended). |
+| `LUCE_FA_WINDOW` | `0` (set by the bench client) | Sliding window of the target's full-attention layers; `0` keeps full attention on the compressed prompt. Unset, `test_dflash` uses 2048. |
 | `LUCE_KV_K` / `LUCE_KV_V` | (auto) | KV-cache quant types. `q4_0` / `q4_0` is the bench setting. `tq3_0` saves another ~4 GB at 128K. |
+
+The `LUCE_FP_*` FlashPrefill switches do not affect PFlash: the scorer does not run the FlashPrefill kernels.
 
 ## How it works
 
@@ -158,9 +151,9 @@ prompt (≤ 128K tokens)
 ┌──────────────────────────────────────────────┐
 │  drafter (in-process)                        │
 │   custom Qwen3.5-0.8B BF16 forward in ggml   │
-│   FlashPrefill block-sparse via BSA (≥ 32K)  │
-│   tail-attention scoring → score [S]         │
-│   chunk(128) + alpha-threshold → top blocks  │
+│   blocks 0-14 (GDN + full attention)         │
+│   block 15 Q/K attention mass → score [S]    │
+│   chunks + keep-ratio budget → kept spans    │
 └──────────────────────────────────────────────┘
    │
    ▼
@@ -181,14 +174,14 @@ prompt (≤ 128K tokens)
 
 **Drafter forward.** The Qwen3.5-0.8B drafter (`src/pflash/qwen35_drafter.cpp` on the qwen35 target graph) runs the model's first fifteen blocks and scores the context with block 15's NoPE Q/K attention-mass head; `PFLASH_QWEN35_LEGACY_SCORER=1` selects the all-layer running-max scorer instead.
 
-**Scoring + selection.** Tail attention `Q[-N:] @ K^T / sqrt(d)` per layer/head, max over (L, H), mean over the tail window. Block-level threshold by `alpha * mean(scores)` selects which K-blocks each Q-block attends to. Configurable via `LUCE_FP_ALPHA`.
+**Scoring + selection.** Each token's score is the attention mass the query window puts on it at block 15 (or the trained head's score). Chunks are taken by relevance until the keep-ratio budget is spent, after the structurally required spans (instructions, the query, the generation prompt). The budget comes from `--prefill-keep-ratio` or the `--prefill-curve` keep-ratio curve.
 
-**Memory budget on 24 GB.** Drafter scoring at 128K needs ~7-10 GB (drafter + KV + BSA scratch). Target + draft idle is ~18 GB. They can't coexist. The daemon's `park` / `unpark` / `free drafter` commands sequence VRAM occupancy across the request:
+**Memory budget on 24 GB.** Drafter scoring at 128K needs ~7-10 GB (drafter + KV + scratch). Target + draft idle is ~18 GB. They can't coexist. The daemon's `park` / `unpark` / `free drafter` commands sequence VRAM occupancy across the request:
 
 ```
 1. park draft + target          # daemon idles at ~3 GB
 2. drafter loaded + scored      # ~10 GB peak
-3. free drafter                 # release drafter weights + KV + BSA scratch
+3. free drafter                 # release drafter weights + KV
 4. unpark target                # ~16 GB
 5. unpark draft                 # +draft weights for spec decode
 6. generate                     # spec decode the compressed prompt
@@ -205,8 +198,7 @@ The algorithms are not ours:
 
 What we built:
 
-- C++/CUDA port of the FlashPrefill algorithm: 4 kernels (`mean_K / score / select / sparse_fwd`), no Triton dependency.
-- BSA ([mit-han-lab/Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention)) wired without `libtorch` via 3 ATen/c10 header stubs (`server/deps/bsa_stubs/`).
+- C++/CUDA port of the FlashPrefill algorithm (4 kernels, `mean_K / score / select / sparse_fwd`, no Triton) and BSA ([mit-han-lab/Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention)) wired without `libtorch`. They ran the v1 drafter forward; today Gemma 4's sliding-window prefill uses them, and the PFlash scorer does not.
 - Custom Qwen3.5-0.8B BF16 forward so the drafter runs through the same ggml allocator as the 27B target.
 - Daemon stdin protocol (`compress` / `generate` / `park` / `unpark` / `free drafter`) so target + drafter coexist on a 24 GB card.
 - NIAH harness against `llama-bench` for end-to-end validation.
@@ -214,9 +206,8 @@ What we built:
 ## Scope and limits
 
 - **Single 24 GB GPU** target (RTX 3090 reference). On 32+ GB cards, drafter + target can coexist and the park/unpark dance disappears.
-- **Qwen3.6-27B Q4_K_M target + Qwen3.5-0.8B drafter** is the validated pair. Other targets/drafters need keep_ratio + alpha re-calibration.
+- **Qwen3.6-27B Q4_K_M target + Qwen3.5-0.8B drafter** is the validated pair. Other targets/drafters need keep-ratio re-calibration.
 - **NIAH single-needle** is the only retrieval task validated end-to-end. Multi-doc QA, long-form code retrieval, etc. still TBD.
-- **sm_80+** required for BSA (RTX 3090 sm_86 is the reference). On sm_75 (Turing) the build auto-disables BSA and falls back to the WMMA path; expect a slower drafter forward at long ctx.
 
 ## Operator notes
 

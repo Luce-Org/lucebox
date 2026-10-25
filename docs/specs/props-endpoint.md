@@ -159,7 +159,7 @@ truth for what the authored card says.
 ### 4.3 `build_info`
 
 ```
-"build_info": "luce-dflash v0.0.0+cpp props_schema=2"
+"build_info": "luce-dflash v0.0.0+cpp props_schema=3"
 ```
 
 A single string carrying: server name, build version, and the
@@ -347,12 +347,9 @@ format and resolution order.
 
 ```json
 "pflash": {
-  "bsa_alpha":   null,
-  "bsa_enabled": null,
   "drafter_gguf": null,
   "enabled":     false,
   "keep_ratio":  null,
-  "lm_head_fix": null,
   "mode":        "off",
   "skip_park":   null,
   "threshold":   null
@@ -368,8 +365,6 @@ enabled, fields carry the runtime configuration:
 - `keep_ratio` — fraction of tokens retained after compression
 - `drafter_gguf` — path to the compression drafter GGUF
 - `skip_park` — whether to skip park/unpark (large-VRAM GPUs)
-- `bsa_enabled` / `bsa_alpha` / `lm_head_fix` — backend-specific
-  PFlash tunables
 
 ### 4.12 `prefix_cache`
 
@@ -593,10 +588,13 @@ and an empty snapshot list.
 
 `build_info` includes `props_schema=<n>`. The integer `n` bumps
 when the response shape changes in a way that breaks existing
-clients. The current schema is `2`.
+clients. The current schema is `3`.
 
 ### 5.0 Changelog
 
+- **`3`** — `pflash` drops `bsa_enabled`, `bsa_alpha` and
+  `lm_head_fix`. PFlash reads none of them; they echoed environment
+  variables of the removed Qwen3-0.6B drafter.
 - **`2`** — `model_card` is now the wholesale on-disk sidecar JSON
   (or `null` when family/hard fallback was used). Runtime-resolved
   budget knobs that used to live under `model_card`
@@ -657,7 +655,7 @@ version increments.
       "max":    81408
     }
   },
-  "build_info": "luce-dflash v0.0.0+cpp props_schema=2",
+  "build_info": "luce-dflash v0.0.0+cpp props_schema=3",
   "capabilities": {
     "reasoning_supported":   true,
     "speculative_supported": true,
@@ -724,12 +722,9 @@ version increments.
   },
   "model_path": "/.../Qwen3.6-27B-Q4_K_M.gguf",
   "pflash": {
-    "bsa_alpha":   null,
-    "bsa_enabled": null,
     "drafter_gguf": null,
     "enabled":     false,
     "keep_ratio":  null,
-    "lm_head_fix": null,
     "mode":        "off",
     "skip_park":   null,
     "threshold":   null

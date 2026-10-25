@@ -475,13 +475,6 @@ def make_niah_text(tokenizer, token_count: int, case_idx: int, needle_fraction: 
     return text, key, answer, actual
 
 
-def make_pflash_env(args) -> dict[str, str]:
-    env = {"LUCE_FP_ALPHA": str(args.pflash_alpha)}
-    if args.pflash_use_bsa:
-        env["LUCE_FP_USE_BSA"] = "1"
-    return env
-
-
 def fmt(value, nd: int = 2) -> str:
     if value is None:
         return "n/a"
@@ -512,7 +505,7 @@ def run_cases(args, cases: list[tuple[str, str, str | None, str | None]]) -> Non
         backend=args.pflash_backend,
         visible_devices=args.pflash_visible_devices,
         log_path=args.report_dir / "pflash_daemon.log",
-        env=make_pflash_env(args),
+        env={},
     )
     results: list[CompressionCase] = []
     target_failures: list[dict[str, int | str]] = []
@@ -780,8 +773,6 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--lookahead", type=int, default=2)
     ap.add_argument("--chunk-size", type=int, default=32)
     ap.add_argument("--pool-kernel", type=int, default=13)
-    ap.add_argument("--pflash-alpha", type=float, default=0.99)
-    ap.add_argument("--pflash-use-bsa", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--pflash-k-type", default=None,
                     choices=["f16", "bf16", "q8_0", "q4_0", "q4_1"],
                     help="persistent PFlash drafter K cache type; default follows drafter compute type")

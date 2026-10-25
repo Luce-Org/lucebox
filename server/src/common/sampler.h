@@ -29,6 +29,10 @@ struct SamplerCfg {
     float    rep_pen    = 1.0f;     // multiplicative repetition penalty (HF-style)
     int      rep_window = 256;
     uint64_t seed       = 0;
+    // The request named a seed. Lets an explicit seed 0 stay reproducible;
+    // transports that carry only `seed` (daemon samp= tail, cluster wire)
+    // leave it false, so there seed 0 still means "no seed".
+    bool     has_seed   = false;
 
     // OpenAI-style additive penalties (applied per-token to logits before softmax).
     // frequency_penalty: subtract freq_pen * count(token_in_history) from logit.
@@ -49,7 +53,21 @@ struct SamplerCfg {
         return temp > 0.0f || rep_pen > 1.0f || freq_pen != 0.0f || pres_pen != 0.0f ||
                constraint != nullptr;
     }
+
+    // True when draws must be reproducible from `seed`. Otherwise (OpenAI
+    // semantics) every request samples from a fresh random stream.
+    bool seeded() const { return has_seed || seed != 0; }
 };
+
+// The seed a request's sampling stream starts from: `seed` when seeded(),
+// otherwise 64 fresh bits. Every sampled request is seeded with it, so an
+// unseeded request never continues the stream an earlier request left behind
+// (a seeded request before it would otherwise make it repeat).
+inline uint64_t request_rng_seed(const SamplerCfg & cfg) {
+    if (cfg.seeded()) return cfg.seed;
+    std::random_device rd;
+    return ((uint64_t)rd() << 32) ^ (uint64_t)rd();
+}
 
 // Returns the chosen token id. cfg.temp == 0 -> caller should use argmax;
 // the chain assumes a positive temperature and falls back to a small floor.

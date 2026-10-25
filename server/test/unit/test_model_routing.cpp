@@ -527,7 +527,7 @@ TEST_CASE(ModelRoutingFixture, test_two_plus_two_preserves_batching_and_independ
     const auto codex = models.get("/v1/models?client_version=test")["models"];
     ROUTING_CHECK(codex.size() == 2 && codex[1]["slug"] == "ds4");
     const auto props = models.get("/props");
-    ROUTING_CHECK(props["server"]["props_schema"] == 2);
+    ROUTING_CHECK(props["server"]["props_schema"] == 3);
     ROUTING_CHECK(props["models"][1]["props"]["model_alias"] == "ds4");
 }
 

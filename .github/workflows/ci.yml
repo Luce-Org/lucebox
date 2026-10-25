@@ -88,7 +88,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           # Compile-only coverage for GPU/model tests the hosted runner can't run.
           cmake --build build --target \
-            test_dflash test_generate test_flash_attn_sparse test_model_smoke \
+            test_dflash test_generate test_model_smoke \
             test_concat_transpose test_kernel_qualification_gdn \
             test_kernel_qualification_moe_ds4 -j$(nproc)
 
@@ -163,20 +163,17 @@ jobs:
           # TEMPORARY (2026-09-09): the lucebox-rtx3090 runner is offline
           # (NVIDIA driver not responding since 2026-09-07), so every run of
           # this entry fails before the checkout step. Restore the entry once
-          # the runner is back. The sparse-attention smoke is 3090-only and
-          # does not run while this is commented out.
+          # the runner is back.
           # - job_name: GPU tests (self-hosted RTX 3090, sm_86)
           #   runner: lucebox-rtx3090
           #   arch: "86"
           #   compute_cap: "8.6"
           #   concurrency_group: lucebox-rtx3090-gpu-runner
-          #   sparse_attention: "true"
           - job_name: GPU tests (self-hosted DGX GB10, sm_121 verifier)
             runner: dgx-gb10
             arch: "121"
             compute_cap: "12.1"
             concurrency_group: dgx-gb10-a197-gpu-runner
-            sparse_attention: "false"
     runs-on: [self-hosted, "${{ matrix.runner }}"]
     timeout-minutes: 30
     env:
@@ -184,7 +181,6 @@ jobs:
       CUDACXX: /usr/local/cuda/bin/nvcc
       CUDA_ARCH: ${{ matrix.arch }}
       EXPECTED_COMPUTE_CAP: ${{ matrix.compute_cap }}
-      RUN_SPARSE_ATTENTION_TEST: ${{ matrix.sparse_attention }}
     concurrency:
       group: ${{ matrix.concurrency_group }}
       cancel-in-progress: false
@@ -234,16 +230,10 @@ jobs:
             test_cuda_copy_batch
             test_ds4_fused_ops_cuda
           )
-          if [[ "$RUN_SPARSE_ATTENTION_TEST" == "true" ]]; then
-            targets+=(test_flash_attn_sparse)
-          fi
           cmake --build build --target "${targets[@]}" -j"$(nproc)"
 
       - name: Run focused NVIDIA verifier tests
         run: |
-          if [[ "$RUN_SPARSE_ATTENTION_TEST" == "true" ]]; then
-            ./server/build/test_flash_attn_sparse
-          fi
           ./server/build/test_deepseek4_mmid_grouped_cuda
           ./server/build/test_deepseek4_unit
           ./server/build/test_ds4_fused_ops_cuda

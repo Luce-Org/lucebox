@@ -537,9 +537,11 @@ int main() {
         CHECK(is_admitted(c));
         CHECK(mgr.slot(0).rng() != first);
 
-        // Zero is a valid deterministic seed, not a request for entropy.
+        // An explicit zero is a valid deterministic seed, not a request for
+        // entropy.
         mgr.retire(0);
         cfg.seed = 0;
+        cfg.has_seed = true;
         auto zero_a = admit(mgr, 4, prompt_tokens(4), cfg);
         CHECK(is_admitted(zero_a));
         const uint64_t zero_first = mgr.slot(0).rng();
@@ -547,6 +549,27 @@ int main() {
         auto zero_b = admit(mgr, 5, prompt_tokens(4), cfg);
         CHECK(is_admitted(zero_b));
         CHECK(mgr.slot(0).rng() == zero_first);
+    }
+
+    // A sampled request without a seed draws a fresh stream per admission,
+    // like the single-lane backends: concurrent requests differ, and so does
+    // the next request in a reused slot. Before this, every unseeded request
+    // started from seed 0, so one prompt sampled N times gave one answer.
+    {
+        PagedKvPool pool(4, 2, /*block_size=*/16);
+        Qwen35SlotManager mgr(pool, 64);
+        SamplerCfg cfg = greedy_sampler();
+        cfg.temp = 1.0f;            // sampled, no seed field in the request
+        CHECK(cfg.needs_logit_processing());
+        auto a = admit(mgr, 1, prompt_tokens(4), cfg);
+        auto b = admit(mgr, 2, prompt_tokens(4), cfg);
+        CHECK(is_admitted(a) && is_admitted(b));
+        const uint64_t a_first = mgr.slot(a.slot).rng();
+        CHECK(a_first != mgr.slot(b.slot).rng());
+        mgr.retire(a.slot);
+        auto c = admit(mgr, 3, prompt_tokens(4), cfg);
+        CHECK(is_admitted(c) && c.slot == a.slot);
+        CHECK(mgr.slot(c.slot).rng() != a_first);
     }
 
     // A greedy sampler never draws, so its seed is irrelevant and admission
