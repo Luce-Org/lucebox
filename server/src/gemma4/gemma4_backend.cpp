@@ -645,8 +645,8 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
 
     DaemonIO out_io = io.with_token_callback(req.on_token);
     sampler_ = req.sampler;
-    if (req.do_sample && sampler_.seed != 0) {
-        sampler_rng_.seed(sampler_.seed);
+    if (req.do_sample) {
+        sampler_rng_.seed(request_rng_seed(sampler_));
     }
 
     cache_.cur_pos = 0;
@@ -814,8 +814,8 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
 
     // Set up sampler
     sampler_ = req.sampler;
-    if (req.do_sample && sampler_.seed != 0) {
-        sampler_rng_.seed(sampler_.seed);
+    if (req.do_sample) {
+        sampler_rng_.seed(request_rng_seed(sampler_));
     }
 
     // Diff-prefill: only prefill tokens beyond the cached prefix

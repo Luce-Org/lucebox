@@ -674,8 +674,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         return result;
     }
 
-    std::mt19937_64 rng(req.sampler.seed != 0 ? req.sampler.seed
-                                              : std::random_device{}());
+    std::mt19937_64 rng(request_rng_seed(req.sampler));
     std::vector<int32_t> history = req.prompt;
     auto sample = [&](const float * row) {
         return (int32_t) sample_logits(row, weights_.n_vocab, req.sampler, history, rng);

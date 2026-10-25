@@ -13,7 +13,12 @@ info:
     The integer reported as `server.props_schema` (and as the
     trailing token of `build_info`) bumps when the response shape
     changes in a backward-incompatible way. The current schema is
-    `2`.
+    `3`.
+
+    Schema `3` (breaking change vs. `2`): `pflash` no longer carries
+    `bsa_enabled`, `bsa_alpha` or `lm_head_fix`. PFlash reads none of
+    them; they echoed environment variables of the removed Qwen3-0.6B
+    drafter.
 
     Schema `2` (breaking change vs. `1`): `model_card` is now the
     wholesale on-disk sidecar JSON (or `null` when family / hard
@@ -83,7 +88,7 @@ paths:
                         high: 32256
                         x-high: 56832
                         max: 81408
-                    build_info: "luce-dflash v0.0.0+cpp props_schema=2"
+                    build_info: "luce-dflash v0.0.0+cpp props_schema=3"
                     capabilities:
                       reasoning_supported: true
                       speculative_supported: true
@@ -153,12 +158,9 @@ paths:
                         max: 81408
                     model_path: "/.../Qwen3.6-27B-Q4_K_M.gguf"
                     pflash:
-                      bsa_alpha: null
-                      bsa_enabled: null
                       drafter_gguf: null
                       enabled: false
                       keep_ratio: null
-                      lm_head_fix: null
                       mode: "off"
                       skip_park: null
                       threshold: null
@@ -194,7 +196,7 @@ paths:
                         supports_top_p: true
                     server:
                       name: "luce-dflash"
-                      props_schema: 2
+                      props_schema: 3
                       version: "0.0.0+cpp"
                     speculative:
                       enabled: true
@@ -246,7 +248,7 @@ components:
             Single-string identity: `<server_name> v<version>
             props_schema=<n>`. Matches the structured `server`
             object. Bumps `props_schema` on breaking changes.
-          example: "luce-dflash v0.0.0+cpp props_schema=2"
+          example: "luce-dflash v0.0.0+cpp props_schema=3"
         capabilities:
           $ref: "#/components/schemas/Capabilities"
         daemon:
@@ -658,25 +660,13 @@ components:
         configuration fields are `null`.
       type: object
       required:
-        - bsa_alpha
-        - bsa_enabled
         - drafter_gguf
         - enabled
         - keep_ratio
-        - lm_head_fix
         - mode
         - skip_park
         - threshold
       properties:
-        bsa_alpha:
-          type: ["number", "null"]
-          format: double
-          description: BSA alpha tunable (env `LUCE_FP_ALPHA`).
-          example: null
-        bsa_enabled:
-          type: ["boolean", "null"]
-          description: BSA toggle (env `LUCE_FP_USE_BSA`).
-          example: null
         drafter_gguf:
           type: ["string", "null"]
           description: Path to the compression drafter GGUF.
@@ -689,10 +679,6 @@ components:
           type: ["number", "null"]
           format: float
           description: Fraction of tokens retained after compression.
-          example: null
-        lm_head_fix:
-          type: ["boolean", "null"]
-          description: Backend-specific lm_head_fix tunable (env `LUCE_LM_HEAD_FIX`).
           example: null
         mode:
           type: string
@@ -1011,8 +997,8 @@ components:
           description: |
             Integer schema version. Bumps when the response shape
             changes in a backward-incompatible way (see §5 of
-            props-endpoint.md). Current value is `2`.
-          example: 2
+            props-endpoint.md). Current value is `3`.
+          example: 3
         version:
           type: string
           description: Build version string (semver + build tag).

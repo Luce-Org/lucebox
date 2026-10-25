@@ -507,8 +507,8 @@ bool Qwen35LayerSplitAdapter::load_draft() {
 
 void Qwen35LayerSplitAdapter::begin_request(const GenerateRequest & req) {
     sampler_ = req.sampler;
-    if (req.do_sample && sampler_.seed != 0) {
-        sampler_rng_.seed(sampler_.seed);
+    if (req.do_sample) {
+        sampler_rng_.seed(request_rng_seed(sampler_));
     }
 }
 

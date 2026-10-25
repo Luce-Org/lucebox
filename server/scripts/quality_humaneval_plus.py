@@ -37,23 +37,18 @@ DATASET = PROJECT_ROOT / "server/eval/humaneval_plus/humanevalplus.jsonl"
 CONFIGS = {
     "baseline": {
         "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "off"],
-        "env":   {"LUCE_FP_USE_BSA": "0"},
     },
     "prefix_on": {
         "flags": ["--prefix-cache-slots", "4", "--prefill-compression", "off"],
-        "env":   {"LUCE_FP_USE_BSA": "0"},
     },
     "compression_on": {
         "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "always"],
-        "env":   {"LUCE_FP_USE_BSA": "0"},
     },
     "compression_auto": {
         "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "auto"],
-        "env":   {"LUCE_FP_USE_BSA": "0"},
     },
     "all_on": {
         "flags": ["--prefix-cache-slots", "4", "--prefill-compression", "always"],
-        "env":   {"LUCE_FP_USE_BSA": "1"},
     },
 }
 

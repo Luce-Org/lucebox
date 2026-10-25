@@ -943,8 +943,7 @@ elseif(LUCE_GPU_BACKEND STREQUAL "cuda")
 
     if(_luce_has_sm80)
         target_sources(luce_common PRIVATE
-            src/flashprefill_kernels.cu
-            src/pflash_ggml_adapter.cpp)
+            src/flashprefill_kernels.cu)
         target_compile_definitions(luce_common PRIVATE
             LUCE_HAVE_CUDA_WMMA_FLASHPREFILL=1
             LUCE_HAVE_SM80_FLASHPREFILL=1)
@@ -3119,19 +3118,6 @@ if(LUCE_TESTS)
             target_link_libraries(${_t} PRIVATE CUDA::cudart)
         endif()
     endforeach()
-
-    # Gated on the same condition as src/pflash_ggml_adapter.cpp above:
-    # the adapter is only compiled into luce_common when the CUDA arch list
-    # includes an sm_80+ target, so this test can only link there too.
-    if(LUCE_GPU_BACKEND STREQUAL "cuda" AND _luce_has_sm80
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_flash_attn_sparse.cpp")
-        add_executable(test_flash_attn_sparse test/unit/test_flash_attn_sparse.cpp)
-        target_link_libraries(test_flash_attn_sparse PRIVATE luce_common ggml ggml-cuda ggml-base)
-        target_include_directories(test_flash_attn_sparse PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
-            ${LUCE_SRC_INCLUDE_DIRS})
-    endif()
     endif()
 
     if((LUCE_GPU_BACKEND STREQUAL "cuda" OR

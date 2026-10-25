@@ -138,7 +138,6 @@ profile and the requirements checked at startup.
 - `LUCE_KV_Q4` - kv_quant.cpp
 - `LUCE_KV_TQ3` - kv_quant.cpp, qwen3_drafter.cpp
 - `LUCE_KV_V` - kv_quant.cpp, laguna_backend.cpp
-- `LUCE_LM_HEAD_FIX` - http_server.cpp
 - `LUCE_PAGED_WMMA` - paged-attn.cu (ggml-cuda) (default on: paged full-attention layers run the WMMA kernel; =0 returns them to V_DOT2; RDNA4 only, F16/Q8_0/Q4_0, non-tree)
 - `LUCE_DS4_LATE_CONTEXT_BEGIN` - deepseek4/deepseek4_backend.cpp (hybrid prefill position where chunks shrink to 1K; default 32768)
 - `LUCE_DS4_LONG_CONTEXT_CHUNK` - deepseek4/deepseek4_backend.cpp (hybrid prefill chunk cap for prompts ending above 4K; default 2048 on R9700 + Strix Halo, 1024 elsewhere)
@@ -272,15 +271,10 @@ profile and the requirements checked at startup.
 - `LUCE_FEAT_RING_CAP` - dflash_feature_ring.h
 - `LUCE_FEATURE_DTYPE` - dflash_feature_ring.cpp
 - `LUCE_KV_ROTATE` - qwen35_target_graph.cpp (set to 1 to force FWHT K rotation on; off by default for f16/q8_0 caches, on for narrower types)
-- `LUCE_FP_ALPHA` - http_server.cpp, qwen3_graph.cpp, server_main.cpp
-- `LUCE_FP_CHUNK_S` - qwen3_graph.cpp
-- `LUCE_FP_DEBUG_LAYER0` - qwen3_graph.cpp
 - `LUCE_FP_DUMP_COUNTS` - flashprefill.cpp
 - `LUCE_FP_HIP_ROW` - flashprefill_kernels.cu
-- `LUCE_FP_NOPE_TAIL` - qwen3_graph.cpp
 - `LUCE_FP_PROFILE` - flashprefill.cpp
-- `LUCE_FP_SKIP_PREWARM` - qwen3_drafter.cpp
-- `LUCE_FP_USE_BSA` - flashprefill.cpp, http_server.cpp, server_main.cpp
+- `LUCE_FP_USE_BSA` - flashprefill.cpp, server_main.cpp (Gemma 4 sliding-window prefill; the PFlash scorer does not read it)
 - `LUCE_G4_BSA_CHUNK` - gemma4_graph.cpp
 - `LUCE_GEMMA4_LAYER_SPLIT_UBATCH` - gemma4_layer_split_adapter.cpp
 - `LUCE_GEMMA4_NO_KVPAD` - gemma4_graph.cpp
