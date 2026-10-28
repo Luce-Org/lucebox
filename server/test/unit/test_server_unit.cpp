@@ -218,6 +218,18 @@ struct SchedulerTestHarness {
         return server.agent_turn_cache_slots_.count(slot) != 0;
     }
 
+    // One HTTP request through the serving path: parsing, rendering, the
+    // worker started by start_worker(), and the response written to `fd`.
+    static bool start_worker(HttpServer & server) { return server.start_worker(); }
+    static bool route(HttpServer & server, SocketHandle fd, const std::string & path,
+                      const json & body) {
+        HttpServer::HttpRequest request;
+        request.method = "POST";
+        request.path = path;
+        request.body = body.dump();
+        return server.route_request(fd, request);
+    }
+
     // `own_snapshot_slot` is the inline snapshot the request itself took,
     // `restored_slot` the checkpoint it restored from.
     static bool save_generated_turn(
@@ -9710,6 +9722,248 @@ TEST_CASE(ServerUnitFixture, test_save_generated_turn_keys_live_state) {
         TEST_ASSERT(cache.lookup(next).first == 2);
     }
     unlink(path.c_str());
+}
+
+// Serves every generation with `reply`, keeping the state a real backend
+// would: an inline snapshot at the planned cut, and after decode the prompt
+// plus every generated token but the last (sampled, never decoded).
+struct ScriptedReplyBackend : MockBackend {
+    std::vector<int32_t> reply;
+    std::vector<std::vector<int32_t>> prompts;
+    int restored_prefix = 0;
+    std::map<int, int> positions;
+    int live_position = 0;
+
+    bool snapshot_save(int slot) override {
+        positions[slot] = live_position;
+        return true;
+    }
+    void snapshot_free(int slot) override { positions.erase(slot); }
+    bool snapshot_used(int slot) const override { return positions.count(slot) != 0; }
+    int snapshot_cur_pos(int slot) const override {
+        const auto it = positions.find(slot);
+        return it == positions.end() ? 0 : it->second;
+    }
+
+    GenerateResult serve(const GenerateRequest & req, const DaemonIO & io) {
+        prompts.push_back(req.prompt);
+        if (req.snap_slot >= 0 && req.snap_pos > 0) positions[req.snap_slot] = req.snap_pos;
+        GenerateResult result;
+        result.succeed();
+        for (const int32_t token : reply) {
+            result.tokens.push_back(token);
+            if (io.on_token && !io.on_token(token)) break;
+        }
+        live_position = (int) (req.prompt.size() + result.tokens.size()) - 1;
+        return result;
+    }
+    GenerateResult generate_impl(const GenerateRequest & req, const DaemonIO & io) override {
+        return serve(req, io);
+    }
+    GenerateResult restore_and_generate_impl(int slot, const GenerateRequest & req,
+                                             const DaemonIO & io) override {
+        restored_prefix = snapshot_cur_pos(slot);
+        GenerateResult result = serve(req, io);
+        result.restored_prefix_tokens = restored_prefix;
+        return result;
+    }
+};
+
+// Qwen-shaped vocabulary: the think and tool markers are single tokens, and
+// "\n\n" and "\n\n\n" are distinct newline tokens.
+static std::string write_thinking_tool_tokenizer_fixture() {
+    std::string printable = "\n";
+    for (char c = ' '; c <= '~'; ++c) printable += c;
+    return write_pflash_bpe_tokenizer_fixture(
+        {"\n\n", "\n\n\n"}, printable,
+        {"<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>",
+         "</tool_call>", "<tool_response>", "</tool_response>"});
+}
+
+// A stateless agent's two requests to `server`: a thinking tool-call turn,
+// then the conversation with the call's result. `reply` sets what the backend
+// generates next. Returns the generated turn: the model closes its thinking
+// with the </think> token followed by the "\n\n" token, then calls a tool and
+// ends its turn.
+static std::vector<int32_t> send_thinking_tool_turn(
+        HttpServer & server, const Tokenizer & tokenizer,
+        const std::function<void(std::vector<int32_t>)> & reply) {
+    std::vector<int32_t> generated = tokenizer.encode(
+        "I will read a.py first.\n</think>\n\n<tool_call>\n<function=read>\n"
+        "<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>");
+    generated.push_back(tokenizer.eos_chat_id());
+
+    const json tools = json::array({{
+        {"type", "function"},
+        {"function", {
+            {"name", "read"},
+            {"description", "Read a file"},
+            {"parameters", {
+                {"type", "object"},
+                {"properties", {{"path", {{"type", "string"}}}}},
+                {"required", json::array({"path"})}}}}}}});
+    const auto chat = [&](const json & messages) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        const json body = {
+            {"model", "test"},
+            {"messages", messages},
+            {"tools", tools},
+            {"max_tokens", 256},
+            {"chat_template_kwargs", {{"enable_thinking", true}}},
+            // Only the client's requests reach the backend.
+            {"tool_checks", false},
+        };
+        TEST_ASSERT(SchedulerTestHarness::route(
+            server, sockets[0], "/v1/chat/completions", body));
+        close(sockets[0]);
+        std::string wire;
+        char buf[4096];
+        ssize_t n = 0;
+        while ((n = read(sockets[1], buf, sizeof(buf))) > 0) wire.append(buf, (size_t) n);
+        close(sockets[1]);
+        const size_t body_at = wire.find("\r\n\r\n");
+        TEST_ASSERT_MSG(body_at != std::string::npos, wire);
+        return json::parse(wire.substr(body_at + 4));
+    };
+
+    json messages = json::array({
+        {{"role", "system"}, {"content", "You are a coding agent."}},
+        {{"role", "user"}, {"content", "Read a.py."}},
+    });
+    reply(generated);
+    const json first = chat(messages);
+    const json message = first["choices"][0]["message"];
+    TEST_ASSERT_MSG(message.contains("tool_calls") && message["tool_calls"].size() == 1,
+                    first.dump());
+    messages.push_back(message);
+    messages.push_back({{"role", "tool"},
+                        {"tool_call_id", message["tool_calls"][0]["id"]},
+                        {"content", "print(1)"}});
+    reply({tokenizer.eos_chat_id()});
+    chat(messages);
+    return generated;
+}
+
+// Where `next` stops following `prompt` + `generated`; empty when it extends
+// them.
+static std::string generated_turn_gap(
+        const Tokenizer & tokenizer, std::vector<int32_t> turn,
+        const std::vector<int32_t> & generated, const std::vector<int32_t> & next) {
+    turn.insert(turn.end(), generated.begin(), generated.end());
+    size_t same = 0;
+    while (same < turn.size() && same < next.size() && turn[same] == next[same]) ++same;
+    if (same == turn.size() && next.size() > turn.size()) return {};
+    return "next prompt leaves the generated turn at token " + std::to_string(same) +
+           " of " + std::to_string(turn.size()) + ": " +
+           tokenizer.decode({next.begin() + (long) same,
+                             next.begin() + (long) std::min(next.size(), same + 4)});
+}
+
+// A stateless agent sends the thinking tool-call turn back with its tool
+// result. The next prompt must hold the turn exactly as generated (previous
+// prompt + generated tokens), and the server's checkpoint of the generated
+// turn must serve it, so only the tool result is prefilled.
+TEST_CASE(ServerUnitFixture, test_thinking_tool_turn_replays_as_generated) {
+    const std::string path = write_thinking_tool_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<ScriptedReplyBackend>();
+    ScriptedReplyBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 4;
+    HttpServer server(engine, tokenizer, config);
+    TEST_ASSERT(SchedulerTestHarness::start_worker(server));
+
+    const std::vector<int32_t> generated = send_thinking_tool_turn(
+        server, tokenizer, [&](std::vector<int32_t> reply) { backend.reply = std::move(reply); });
+    unlink(path.c_str());
+
+    TEST_ASSERT(backend.prompts.size() == 2);
+    if (backend.prompts.size() != 2) return;
+    const std::string gap = generated_turn_gap(
+        tokenizer, backend.prompts[0], generated, backend.prompts[1]);
+    TEST_ASSERT_MSG(gap.empty(), gap);
+    const int turn = (int) (backend.prompts[0].size() + generated.size());
+    TEST_ASSERT_MSG(backend.restored_prefix == turn - 1,
+                    "restored " + std::to_string(backend.restored_prefix) + " of " +
+                    std::to_string(turn));
+}
+
+// The concurrent engine samples `reply` for every request: the token that
+// ends each prompt's prefill, then one token per decode step.
+class ScriptedReplyEngine final : public SeqEngine {
+public:
+    int32_t eos = -1;
+    std::vector<int32_t> reply;
+    std::vector<std::vector<int32_t>> prompts;
+
+    int slot_count() const override { return 1; }
+    int max_context() const override { return 4096; }
+    bool token_is_eos(int32_t token) const override { return token == eos; }
+    StepPlanLimits step_plan_limits(int) const override { return {1, 4096, 4096, 4096}; }
+    AdmitResult admit(uint64_t, const std::vector<int32_t> & prompt, const SamplerCfg &) override {
+        prompts.push_back(prompt);
+        next_ = 0;
+        AdmitResult result;
+        result.status = AdmitResult::Status::admitted;
+        result.slot = 0;
+        return result;
+    }
+    StepResult step(const StepPlan & plan) override {
+        StepResult result;
+        for (const StepInput & input : plan.decode) {
+            result.decode.push_back({input.slot, reply[std::min(next_++, reply.size() - 1)], false, {}});
+        }
+        for (const PrefillSlice & slice : plan.prefills) {
+            PrefillOutput out;
+            out.slot = slice.slot;
+            out.status = PrefillOutput::Status::completed;
+            out.token = reply[std::min(next_++, reply.size() - 1)];
+            result.prefills.push_back(out);
+        }
+        return result;
+    }
+    void retire(int) override {}
+
+private:
+    size_t next_ = 0;
+};
+
+struct ScriptedReplySeqBackend : MockBackend {
+    ScriptedReplyEngine engine;
+    SeqEngine * seq_engine() override { return &engine; }
+};
+
+// Under continuous batching too, the thinking tool-call turn comes back on the
+// next request exactly as generated.
+TEST_CASE(ServerUnitFixture, test_concurrent_thinking_tool_turn_replays_as_generated) {
+    const std::string path = write_thinking_tool_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<ScriptedReplySeqBackend>();
+    ScriptedReplyEngine & seq = backend_owner->engine;
+    seq.eos = tokenizer.eos_chat_id();
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+    TEST_ASSERT(SchedulerTestHarness::start_worker(server));
+
+    const std::vector<int32_t> generated = send_thinking_tool_turn(
+        server, tokenizer, [&](std::vector<int32_t> reply) { seq.reply = std::move(reply); });
+    unlink(path.c_str());
+
+    TEST_ASSERT(seq.prompts.size() == 2);
+    if (seq.prompts.size() != 2) return;
+    const std::string gap = generated_turn_gap(
+        tokenizer, seq.prompts[0], generated, seq.prompts[1]);
+    TEST_ASSERT_MSG(gap.empty(), gap);
 }
 
 // A hit whose backend snapshot is gone (a deferred snapshot a live

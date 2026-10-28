@@ -9882,20 +9882,16 @@ bool HttpServer::save_generated_turn(
     return true;
 }
 
-void HttpServer::remember_agent_turn(
-        const ParsedRequest & req, const PreparedPrompt & prepared,
-        const GenerationCacheState & cache, const GenerateResult & result,
-        const SseEmitter & emitter, int completion_tokens,
-        bool visible_output_seen, bool client_disconnected,
-        bool replay_cache) {
+std::vector<ChatMessage> HttpServer::remember_tool_turn(
+        const ParsedRequest & req, const std::vector<int32_t> & tokens,
+        const SseEmitter & emitter) {
     const bool supported_format = req.format == ApiFormat::OPENAI_CHAT ||
         req.format == ApiFormat::RESPONSES;
-    const bool valid_tool_turn = result.ok() && completion_tokens > 0 &&
-        visible_output_seen && !client_disconnected && !req.tools.empty() &&
-        !emitter.tool_calls().empty() && !emitter.accumulated_raw().empty();
+    const bool tool_turn = !req.tools.empty() && !emitter.tool_calls().empty() &&
+        !emitter.accumulated_raw().empty();
     // Arbitrary Jinja templates need structured calls to render their results;
     // raw-turn caching cannot preserve that contract.
-    if (!supported_format || !valid_tool_turn || !config_.chat_template_src.empty()) return;
+    if (!supported_format || !tool_turn || !config_.chat_template_src.empty()) return {};
 
     std::vector<ChatMessage> messages =
         normalize_chat_messages(req.messages, req.format, tool_memory_, true);
@@ -9910,16 +9906,25 @@ void HttpServer::remember_agent_turn(
             sentinel_rendered, render_error)) {
         std::fprintf(stderr, "[agent-turn-cache] render skipped: %s\n",
                      render_error.c_str());
-        return;
+        return {};
     }
     // Preserve template-injected generation text (for example Qwen's
     // <think> prefix) in tool memory so the next stateless request renders the
     // same token stream as the checkpointed generation.
+    // The turn is the text of the generated tokens, not the emitter's text:
+    // the emitter receives the think markers in their client form (`</think>`
+    // arrives as "</think>\n"), which would add a token to the replayed turn.
+    // The end-of-turn token is not part of it: the template closes the turn.
+    std::vector<int32_t> generated = tokens;
+    if (!generated.empty() && (generated.back() == tokenizer_.eos_id() ||
+                               generated.back() == tokenizer_.eos_chat_id())) {
+        generated.pop_back();
+    }
     std::string assistant_content;
     if (!http_detail::canonical_assistant_content(
             req.rendered_prompt, sentinel_rendered, kSentinel,
-            emitter.accumulated_raw(), assistant_content)) {
-        return;
+            tokenizer_.decode(generated), assistant_content)) {
+        return {};
     }
     messages.back().content = assistant_content;
 
@@ -9929,6 +9934,21 @@ void HttpServer::remember_agent_turn(
     std::vector<std::string> call_ids;
     for (const auto & call : emitter.tool_calls()) call_ids.push_back(call.id);
     tool_memory_.remember(call_ids, assistant_content);
+    return messages;
+}
+
+void HttpServer::remember_agent_turn(
+        const ParsedRequest & req, const PreparedPrompt & prepared,
+        const GenerationCacheState & cache, const GenerateResult & result,
+        const SseEmitter & emitter, int completion_tokens,
+        bool visible_output_seen, bool client_disconnected,
+        bool replay_cache) {
+    if (!result.ok() || completion_tokens <= 0 || !visible_output_seen ||
+        client_disconnected) {
+        return;
+    }
+    std::vector<ChatMessage> messages = remember_tool_turn(req, result.tokens, emitter);
+    if (messages.empty()) return;
 
     if (!replay_cache || req.images) return;
     if (prefix_cache_.disabled()) return;
@@ -9944,6 +9964,7 @@ void HttpServer::remember_agent_turn(
     }
 
     std::string canonical_rendered;
+    std::string render_error;
     if (!render_messages_to_text(
             messages, req, /*add_generation_prompt=*/false,
             canonical_rendered, render_error)) {

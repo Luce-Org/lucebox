@@ -1166,6 +1166,14 @@ private:
         const std::vector<int32_t> & generated,
         const std::vector<int32_t> & canonical,
         const GenerationCacheState & cache);
+    // Remember a tool-call turn in tool memory as the text of its generated
+    // `tokens`, with the text the generation prompt opened it with, so the
+    // next stateless request renders the turn as it was generated. Returns the
+    // conversation with the turn appended, or nothing when there is no turn
+    // to remember.
+    std::vector<ChatMessage> remember_tool_turn(
+        const ParsedRequest & req, const std::vector<int32_t> & tokens,
+        const SseEmitter & emitter);
     void remember_agent_turn(
         const ParsedRequest & req, const PreparedPrompt & prepared,
         const GenerationCacheState & cache, const GenerateResult & result,

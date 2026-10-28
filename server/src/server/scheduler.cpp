@@ -401,6 +401,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                                     s.degenerate_close, gen_timings,
                                     &s.send_buffer);
         }
+        // Before the reply goes out, which the client's next request follows.
+        if (!s.error && !s.client_disconnected && s.completion_tokens > 0) {
+            remember_tool_turn(req, s.gen_tokens, *s.emitter);
+        }
 
         const double elapsed_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - s.started_at).count();
