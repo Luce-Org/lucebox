@@ -32,10 +32,10 @@ struct ChatMessage {
     // Optional tool_call_id for tool result messages.
     std::string tool_call_id;
     // Optional prior <think> text for assistant messages (OpenAI-compatible
-    // `reasoning_content` / `reasoning` fields on request history). Only the
-    // Jinja renderer consumes this — exposed to templates as
-    // `message.reasoning_content` so official templates (e.g. qwen4exp) can
-    // decide whether to replay it inside <think>...</think>.
+    // `reasoning_content` / `reasoning` fields on request history). Jinja
+    // templates get it as `message.reasoning_content` and decide whether to
+    // replay it inside <think>...</think> (e.g. qwen4exp); the built-in Qwen
+    // renderer replays it for the turns after the last user query.
     std::string reasoning_content;
     std::vector<ChatToolCall> tool_calls;
     // On a memory hit, content is the original raw turn. Calls retain only
