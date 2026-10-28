@@ -131,6 +131,11 @@ public:
                                                                                       : PagedKvStatus::BlocksExhausted;
     }
 
+    // Pages the live (or just parked) request pushed out since it was admitted; 0 for a free or unknown slot.
+    int64_t page_outs(int slot) const {
+        if (slot < 0 || slot >= (int)slots_.size() || (!slots_[(size_t)slot].live && !slots_[(size_t)slot].parked)) return 0;
+        return pagers_[(size_t)slot]->stats().page_outs - slots_[(size_t)slot].base_page_outs;
+    }
     // Rows a live slot may still append inside its reservation (0 for a slot that is free, parked or out of range).
     // A chain round accepts up to its width, which can pass the last reserved block when the request is nearly done.
     int64_t append_room(int slot) const {
