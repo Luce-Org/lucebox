@@ -160,6 +160,22 @@ TEST_CASE(KvflashSlotKvFixture, trim_to_len_keeps_a_chunk_the_accepted_rows_fill
     CHECK(p.n_chunks() == 2);
 }
 
+TEST_CASE(KvflashSlotKvFixture, page_outs_counts_this_requests_evictions_only) {
+    World w;
+    PagedKvSequenceHandle a;
+    REQUIRE(w.kv->acquire_reserved(1, (kQ + 4) * kChunk, a) == PagedKvStatus::Ok);
+    CHECK(w.kv->page_outs((int)a.slot) == 0);
+    REQUIRE(w.kv->append(a, kQ * kChunk));
+    CHECK(w.kv->page_outs((int)a.slot) == 0);                     // the slice is full, nothing evicted yet
+    w.kv->append(a, kChunk);                                      // queues the victim's page-out
+    CHECK(w.kv->page_outs((int)a.slot) >= 1);
+    CHECK(w.kv->page_outs(-1) == 0);
+    CHECK(w.kv->release(a) == PagedKvStatus::Ok);
+    PagedKvSequenceHandle b;
+    REQUIRE(w.kv->acquire_reserved(2, 2 * kChunk, b) == PagedKvStatus::Ok);
+    CHECK(w.kv->page_outs((int)b.slot) == 0);                     // a new request starts from zero
+}
+
 TEST_CASE(KvflashSlotKvFixture, rollback_and_clear_rewind_the_pager) {
     World w;
     PagedKvSequenceHandle a;
