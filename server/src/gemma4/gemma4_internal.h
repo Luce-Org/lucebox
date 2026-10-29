@@ -10,7 +10,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -159,12 +161,46 @@ bool load_gemma4_gguf_partial(const std::string & path,
 
 void free_gemma4_weights(Gemma4Weights & w);
 
+// A multi-position forward writes all new KV before any query reads it.
+// Retain a full committed window plus the longest tentative/prefill span.
+// Padding matches the CUDA flash-attention span; it does not widen attention.
+inline int gemma4_swa_capacity(int window, int max_ctx, int max_forward_tokens) {
+    if (max_ctx <= 0 || max_forward_tokens <= 0) return 0;
+    const int64_t needed = window > 0
+        ? std::min<int64_t>(max_ctx, int64_t(window) + max_forward_tokens)
+        : max_ctx;
+    const int64_t padded = (needed + 255) & ~int64_t(255);
+    return padded <= std::numeric_limits<int>::max() ? int(padded) : 0;
+}
+
+// Check before graph construction or writes, including callers that bypass
+// the backend. Full-context storage never wraps within a valid request.
+inline bool gemma4_cache_span_fits(int window, int capacity, int max_ctx,
+                                  int start, int count) {
+    if (start < 0 || count <= 0 || start > max_ctx || count > max_ctx - start ||
+        capacity <= 0) return false;
+    return capacity >= max_ctx ||
+           (window > 0 && int64_t(window) + count <= capacity);
+}
+
+// Layer-split prefill can request a larger chunk than a shard reserved,
+// especially across IPC. Keep each actual forward within its headroom and
+// retain the existing split-at-ring-end behavior.
+inline int gemma4_swa_chunk_size(int window, int capacity, int max_ctx,
+                                 int start, int requested) {
+    if (start < 0 || start >= max_ctx || requested <= 0 || capacity <= 0) return 0;
+    if (capacity < max_ctx && window <= 0) return 0;
+    const int headroom = capacity >= max_ctx ? max_ctx : capacity - window;
+    return std::max(0, std::min({requested, max_ctx - start, headroom,
+                               capacity - start % capacity}));
+}
+
 // KV cache
 struct Gemma4Cache {
     int cur_pos  = 0;
     int max_ctx  = 0;
     int n_layer  = 0;
-    int swa_size = 0;   // ring-buffer size for SWA layers (= sliding_window)
+    int swa_size = 0;   // physical SWA ring capacity, including forward headroom
     int fa_window = 0;  // sparse decode window for full-attn layers (0 = full)
     int32_t last_tok = -1;  // argmax of last prefill token (for spec-decode entry)
 
@@ -192,15 +228,19 @@ struct Gemma4Cache {
 // tensors are allocated at ctx_alloc rows (the resident pool); SWA layers
 // keep their sliding-window ring buffers (already bounded). cache.max_ctx
 // stays the logical bound. 0 = allocate full layers at max_ctx (default).
+// max_forward_tokens bounds prefill/verification sequence length (not request
+// batch size). The SWA ring retains window + this headroom, padded to 256.
 bool  create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
-                           int max_ctx, Gemma4Cache & out, int ctx_alloc = 0);
+                           int max_ctx, Gemma4Cache & out, int ctx_alloc = 0,
+                           int max_forward_tokens = 512);
 bool  create_gemma4_cache_partial(ggml_backend_t backend,
                                   const Gemma4Weights & w,
                                   int max_ctx,
                                   int layer_begin,
                                   int layer_end,
                                   Gemma4Cache & out,
-                                  int ctx_alloc = 0);
+                                  int ctx_alloc = 0,
+                                  int max_forward_tokens = 512);
 void  free_gemma4_cache(Gemma4Cache & c);
 
 // Allocate target_feat ring buffer (call after draft load determines n_capture_layers).
