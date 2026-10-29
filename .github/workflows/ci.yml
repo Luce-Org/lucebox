@@ -305,10 +305,11 @@ jobs:
     env:
       HIP_VISIBLE_DEVICES: ${{ matrix.device_index }}
       EXPECTED_HIP_ARCH: ${{ matrix.arch }}
-      LUCE_TEST_MODEL_QWEN35: /opt/models/Qwen3.6-27B-Q4_K_M.gguf
-      LUCE_TEST_MODEL_QWEN3: /opt/models/Qwen3-0.6B-BF16.gguf
-      LUCE_TEST_MODEL_DEEPSEEK4: /opt/models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf
-      DS4_TEST_MODEL: /opt/models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf
+      # The models this box serves: Qwen 3.8 27B (qwen35 architecture, as the target
+      # loader expects) and DeepSeek V4.1 Flash's DSpark drafter (the 383 GB model
+      # itself runs only across both GPUs; serve-smoke-amd below serves it).
+      LUCE_TEST_MODEL_QWEN35: /opt/models/Qwen3.8-27B-UD-IQ4_XS.gguf
+      LUCE_TEST_MODEL_DEEPSEEK41_DRAFT: /opt/models/DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf
     concurrency:
       group: lucebox3-${{ matrix.concurrency_key }}-runner
       cancel-in-progress: false
@@ -375,7 +376,7 @@ jobs:
               test_ds4_moe_combine_cuda test_ds4_fused_ops_cuda test_ds4_maskless_prefill \
               test_recurrent_snapshot test_server_unit test_draft_topk_cuda test_rocmfp3_mix_registry \
               test_rocmfp_mix_slice_matvec test_rocmfp_mix_gateup_glu \
-              test_ds4_mix_registry_teardown test_ds4_load_transactional \
+              test_ds4_mix_registry_teardown test_ds4_dspark_load \
               test_model_smoke test_batched_gdn \
               test_kernel_qualification_core test_kernel_qualification_gdn \
               test_kernel_qualification_moe_ds4 \
@@ -400,13 +401,26 @@ jobs:
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" --output-on-failure \
             -R '^test_capture_safe_copies\.' --no-tests=error
 
+      - name: Model files are on the box
+        # A model-backed test skips, and the step passes, when its file is missing:
+        # Qwen 3.6's smoke load skipped that way on every run once the file was gone.
+        run: |
+          for model in "$LUCE_TEST_MODEL_QWEN35" "$LUCE_TEST_MODEL_DEEPSEEK41_DRAFT"; do
+            [ -r "$model" ] || { echo "::error::$model is missing or not readable by $(id -un)"; exit 1; }
+          done
+
       - name: Run model-backed ROCm tests
         if: matrix.arch == 'gfx1151'
         run: |
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R '^(ds4_load_transactional|test_model_smoke\.SmokeLoadTarget\.LoadsConfiguredModel)$' \
+            -R '^test_model_smoke\.SmokeLoadTarget\.LoadsConfiguredModel$' \
             --no-tests=error
+
+      - name: Load DeepSeek V4.1's DSpark drafter and run its forward
+        # The drafter's bindings and a forward that must come out finite, on each GPU.
+        run: |
+          "$RUNNER_TEMP/rocmfp-build/test_ds4_dspark_load" "$LUCE_TEST_MODEL_DEEPSEEK41_DRAFT"
 
       - name: Build + test affine ROCmFP2 GPU paths
         # Keep the default wire-format build above and compile the affine layout
@@ -429,6 +443,55 @@ jobs:
           ctest --test-dir "$RUNNER_TEMP/rocmfp-affine-build" \
             --output-on-failure \
             -R 'rocmfpx_reference|rocmfpx_mmq|deepseek4_mmid_grouped_cuda'
+
+  serve-smoke-amd:
+    name: Serve Qwen 3.8 27B and DeepSeek V4.1 Flash (lucebox3 / ROCm)
+    # The two models lucebox3 serves, started as Lucebox Manage starts them, each
+    # asked to count to 30 with its drafter's drafts accepted (.github/ci/serve_smoke.sh).
+    # Qwen 3.8 27B runs on the R9700 with the DFlash2 drafter, eight at once. DeepSeek
+    # V4.1 Flash is 383 GB, so it runs only across both GPUs and the SSD (the
+    # ds41-lucebox profile), with the DSpark drafter; it replaces the V4 the per-device
+    # job loaded for ds4_load_transactional, a qtype-105 load V4.1 files (qtype 107)
+    # cannot run. After gpu-tests-amd on the same runner, so a kernel failure stops it
+    # before the model loads.
+    needs: [gpu-tests-amd]
+    runs-on: [self-hosted, lucebox3]
+    timeout-minutes: 45
+    env:
+      LUCE_TEST_MODEL_QWEN38: /opt/models/Qwen3.8-27B-UD-IQ4_XS.gguf
+      LUCE_TEST_MODEL_QWEN38_DRAFT: /opt/models/Qwen3.8-27B-DFlash2-Q8_0.gguf
+      LUCE_TEST_MODEL_DEEPSEEK41: /opt/models/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf
+      LUCE_TEST_MODEL_DEEPSEEK41_DRAFT: /opt/models/DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf
+    concurrency:
+      group: lucebox3-serve-runner
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Build luce_server for the R9700 and the Strix Halo
+        # The build server/docs/DS41.md gives for this recipe.
+        run: |
+          cmake -S server -B "$RUNNER_TEMP/serve-build" \
+            -DLUCE_GPU_BACKEND=hip \
+            -DLUCE_HIP_ARCHITECTURES='gfx1151;gfx1201' \
+            -DCMAKE_HIP_ARCHITECTURES='gfx1151;gfx1201' \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/serve-build" --target luce_server --parallel 8
+
+      - name: Serve Qwen 3.8 27B with DFlash2, eight at once
+        # Lucebox Manage's launch (run-qwen38-server.sh) at its 204,800-token context.
+        run: |
+          .github/ci/serve_smoke.sh qwen3.8-27b 8 "$RUNNER_TEMP/serve-build/luce_server" \
+            "$LUCE_TEST_MODEL_QWEN38" --target-device hip:0 \
+            --draft "$LUCE_TEST_MODEL_QWEN38_DRAFT" --draft-device hip:0 --draft-block-size 16 \
+            --paged-attention --max-concurrency 8 --kv-pool-tokens 204800 --max-ctx 204800 \
+            --cache-type-k q8_0 --cache-type-v q8_0
+
+      - name: Serve DeepSeek V4.1 Flash with DSpark
+        run: |
+          .github/ci/serve_smoke.sh deepseek-v4.1-flash 1 "$RUNNER_TEMP/serve-build/luce_server" \
+            "$LUCE_TEST_MODEL_DEEPSEEK41" --profile ds41-lucebox \
+            --draft "$LUCE_TEST_MODEL_DEEPSEEK41_DRAFT"
 
   build-windows:
     name: Build Windows (MSVC + CUDA, library + server targets)
