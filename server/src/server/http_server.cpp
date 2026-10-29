@@ -7752,6 +7752,8 @@ std::string HttpServer::apply_unified_view(
         if (render_messages_to_text(placeholder_messages, req, /*add_generation_prompt=*/true, rendered, error) &&
             http_detail::pflash_content_char_spans(rendered, placeholders, contents, text, chars, error)) {
             for (auto & c : newest) {
+                // Rendered empty: no placeholder, so no span; it must not pull newest_begin or recall to token 0.
+                if (placeholders[c.message].empty()) continue;
                 c.located = true;
                 c.cb = chars[c.message].first;
                 c.ce = chars[c.message].second;
