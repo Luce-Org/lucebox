@@ -276,6 +276,43 @@ jobs:
       #       -H 'Content-Type: application/json' \
       #       -d '{"prompt":"The capital of France is","max_tokens":8}' | grep -q '"text"'
 
+  plan-lucebox3:
+    name: Plan the lucebox3 jobs from the changed files
+    # lucebox3 runs one job at a time, about 30 minutes a pull request, so a pull
+    # request runs only what its files can affect (.github/ci/ci_plan.py): Qwen 3.8
+    # code serves only Qwen 3.8, DeepSeek V4.1 code only V4.1, tests skip both serve
+    # checks, docs and Python tooling skip lucebox3. Shared code, other models and
+    # any path the rules don't name run everything, as do pushes to main and manual
+    # runs. The jobs read each output as "run unless 'false'", so a plan that fails
+    # or prints nothing runs everything.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Only a plan step that succeeded counts: one that printed its outputs, then
+    # failed (writing the step summary), leaves them empty, and everything runs.
+    outputs:
+      gpu: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.gpu || '' }}
+      qwen38: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.qwen38 || '' }}
+      ds41: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.ds41 || '' }}
+    steps:
+      # A pull request checks out its merge commit: parent 1 is main, so the diff
+      # from it is what the pull request changes.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+          sparse-checkout: .github/ci
+
+      - name: Plan
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            python3 .github/ci/ci_plan.py --base HEAD^1 --head HEAD >> "$GITHUB_OUTPUT"
+          else
+            python3 .github/ci/ci_plan.py --full >> "$GITHUB_OUTPUT"
+          fi
+
   gpu-tests-amd:
     name: GPU tests (${{ matrix.device_name }}, ${{ matrix.arch }} / ROCm)
     # Companion to the NVIDIA jobs: lucebox3 carries both an R9700 and the Strix
@@ -287,7 +324,9 @@ jobs:
     # approves the workflow run (approval_policy=all_external_contributors).
     # Gate only on the fast workspace check, not the hosted CPU build. The two AMD
     # matrix jobs share one physical runner and therefore execute one at a time.
-    needs: [uv-workspace]
+    # !cancelled() keeps a failed plan from skipping the job: it then runs.
+    needs: [uv-workspace, plan-lucebox3]
+    if: ${{ !cancelled() && needs.uv-workspace.result == 'success' && needs.plan-lucebox3.outputs.gpu != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -453,8 +492,12 @@ jobs:
     # ds41-lucebox profile), with the DSpark drafter; it replaces the V4 the per-device
     # job loaded for ds4_load_transactional, a qtype-105 load V4.1 files (qtype 107)
     # cannot run. After gpu-tests-amd on the same runner, so a kernel failure stops it
-    # before the model loads.
-    needs: [gpu-tests-amd]
+    # before the model loads. Each model's step runs when plan-lucebox3 says the
+    # change can affect it.
+    needs: [gpu-tests-amd, plan-lucebox3]
+    if: >-
+      ${{ !cancelled() && needs.gpu-tests-amd.result == 'success' &&
+      (needs.plan-lucebox3.outputs.qwen38 != 'false' || needs.plan-lucebox3.outputs.ds41 != 'false') }}
     runs-on: [self-hosted, lucebox3]
     timeout-minutes: 45
     env:
@@ -480,6 +523,7 @@ jobs:
 
       - name: Serve Qwen 3.8 27B with DFlash2, eight at once
         # Lucebox Manage's launch (run-qwen38-server.sh) at its 204,800-token context.
+        if: needs.plan-lucebox3.outputs.qwen38 != 'false'
         run: |
           .github/ci/serve_smoke.sh qwen3.8-27b 8 "$RUNNER_TEMP/serve-build/luce_server" \
             "$LUCE_TEST_MODEL_QWEN38" --target-device hip:0 \
@@ -488,6 +532,7 @@ jobs:
             --cache-type-k q8_0 --cache-type-v q8_0
 
       - name: Serve DeepSeek V4.1 Flash with DSpark
+        if: needs.plan-lucebox3.outputs.ds41 != 'false'
         run: |
           .github/ci/serve_smoke.sh deepseek-v4.1-flash 1 "$RUNNER_TEMP/serve-build/luce_server" \
             "$LUCE_TEST_MODEL_DEEPSEEK41" --profile ds41-lucebox \
