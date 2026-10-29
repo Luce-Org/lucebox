@@ -117,7 +117,7 @@ inline const std::vector<LaunchProfile> & launch_profiles() {
                 {"--target-device", "hip:0"},
                 {"--expert-device", "hip:1"},
                 {"--peer-access", nullptr},
-                {"--max-ctx", "131072"},
+                {"--max-ctx", "204800"},
                 {"--chunk", "4096"},
                 {"--ds4-prefill", "dense"},
                 // share/... values resolve against the install (server_main.cpp).

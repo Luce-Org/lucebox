@@ -372,7 +372,7 @@ struct LaunchPolicyFixture : CommonFixture {
             for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == flag) return args[i + 1];
             return {};
         };
-        CHECK(value_of("--max-ctx") == "131072");
+        CHECK(value_of("--max-ctx") == "204800");
         CHECK(value_of("--chunk") == "4096");
         CHECK(value_of("--ds4-prefill") == "dense");
         CHECK(value_of("--expert-device") == "hip:1");
