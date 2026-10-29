@@ -78,6 +78,15 @@ TEST_CASE(UmaBudget, counts_the_driver_page_pool_after_a_run) {
     CHECK_FALSE(ggml_cuda_uma_alloc_fits(86 * GiB, (size_t) available, kStrixRam));
 }
 
+// With hugetlbfs pages configured, llama.cpp's UMA query reports the free huge
+// pages and the device interface credits no pool beside them.
+TEST_CASE(UmaBudget, reads_whether_huge_pages_are_configured) {
+    CHECK_FALSE(ggml_cuda_uma_huge_pages_configured("MemTotal: 131072000 kB\nHugePages_Total:        0\n"));
+    CHECK_TRUE(ggml_cuda_uma_huge_pages_configured("MemTotal: 131072000 kB\nHugePages_Total:    20000\n"));
+    CHECK_FALSE(ggml_cuda_uma_huge_pages_configured("MemTotal: 131072000 kB\n"));
+    CHECK_FALSE(ggml_cuda_uma_huge_pages_configured(nullptr));
+}
+
 // A missing MemAvailable is unknown (the caller keeps the old behaviour and
 // admits); a MemAvailable of zero is a reading, and with no driver pool to
 // add, nothing fits in it.
@@ -112,7 +121,174 @@ TEST_CASE(UmaBudget, cgroup_limit_bounds_the_budget) {
     CHECK_FALSE(ggml_cuda_uma_alloc_fits(60 * GiB, (size_t) available, kStrixRam));
 }
 
+// Strix Halo under 6.17.0-1033-oem reported 121.6 of 1280 GiB free however
+// much was allocated. With 101.8 GiB of experts in place, 18.7 GiB of RAM
+// available and 365 MiB of its 512 MiB carve left, the device can take the
+// carve left and that RAM: 19.1 GiB, not 121.6. DeepSeek's sizing keeps the
+// managed-buffer reserve (7.8 GiB) out of the RAM as well: 11.2 GiB.
+TEST_CASE(UmaBudget, bounds_a_free_that_does_not_follow_allocations) {
+    const uint64_t carve = 512ULL << 20, carve_used = 147ULL << 20;
+    const uint64_t ram_available = 18 * (uint64_t) GiB + 7 * GiB / 10;
+    size_t free = 121 * GiB + 6 * GiB / 10, total = 1280 * GiB;
+    ggml_cuda_uma_bound_device_memory(&free, &total, carve, carve_used, ram_available, kStrixRam);
+    CHECK_TRUE(free == (carve - carve_used) + ram_available);
+    CHECK_TRUE(total == carve + kStrixRam);
+
+    const uint64_t ram_room = ram_available - ggml_cuda_uma_reserve_bytes(kStrixRam);
+    free = 121 * GiB + 6 * GiB / 10;
+    ggml_cuda_uma_bound_device_memory(&free, &total, carve, carve_used, ram_room, kStrixRam);
+    CHECK_TRUE(free == (carve - carve_used) + ram_room);
+}
+
+// Under 6.17.0-1032-oem the same box reported 125.09 GiB in all and a free
+// that followed allocations (11.40 GiB with the experts in place), under what
+// the RAM allows: both figures stay as they are.
+TEST_CASE(UmaBudget, keeps_a_free_that_follows_allocations) {
+    size_t free = 11 * GiB + 4 * GiB / 10, total = kStrixRam;
+    ggml_cuda_uma_bound_device_memory(&free, &total, 512ULL << 20, 147ULL << 20, 20 * (uint64_t) GiB, kStrixRam);
+    CHECK_TRUE(free == 11 * GiB + 4 * GiB / 10);
+    CHECK_TRUE(total == kStrixRam);
+}
+
+// A runtime that reports less than RAM allows (a GTT limit below RAM, or DGX
+// Spark's, which leaves out reclaimable page cache) keeps its figure.
+TEST_CASE(UmaBudget, keeps_a_free_below_what_ram_allows) {
+    size_t free = 50 * GiB, total = 96 * GiB;
+    ggml_cuda_uma_bound_device_memory(&free, &total, 0, 0, 80 * (uint64_t) GiB, kStrixRam);
+    CHECK_TRUE(free == 50 * GiB);
+    CHECK_TRUE(total == 96 * GiB);
+}
+
+// A large carve is the device's own memory, outside MemAvailable: with 60 of
+// 64 GiB of it free and only 10 GiB of RAM available, the device can still
+// take its 60 GiB.
+TEST_CASE(UmaBudget, counts_the_carve_beside_ram) {
+    size_t free = 60 * GiB, total = 64 * GiB;
+    ggml_cuda_uma_bound_device_memory(&free, &total, 64 * (uint64_t) GiB, 4 * (uint64_t) GiB,
+                                      10 * (uint64_t) GiB, 64 * GiB);
+    CHECK_TRUE(free == 60 * GiB);
+    CHECK_TRUE(total == 64 * GiB);
+}
+
+// No RAM to take leaves only the carve; no carve either leaves nothing.
+TEST_CASE(UmaBudget, no_ram_leaves_the_carve) {
+    size_t free = 100 * GiB, total = 1280 * GiB;
+    ggml_cuda_uma_bound_device_memory(&free, &total, GiB, GiB / 2, 0, kStrixRam);
+    CHECK_TRUE(free == GiB / 2);
+    free = 100 * GiB;
+    ggml_cuda_uma_bound_device_memory(&free, &total, 0, 0, 0, kStrixRam);
+    CHECK_TRUE(free == 0);
+}
+
+// The device interface's RAM is MemAvailable, as llama.cpp reports it, unless
+// the driver's page pool holds more than the managed-buffer reserve: right
+// after DeepSeek stopped on a 125 GiB box MemAvailable read 59 GiB with 60 GiB
+// in the pool, and the figure is what one managed buffer could take, 119 GiB
+// less the 7.8 GiB reserve. A buffer sized from all of it is still admitted;
+// one sized from MemAvailable plus the whole pool was not. An idle box, or a
+// pool smaller than the reserve, reads MemAvailable; a cgroup bounds it.
+TEST_CASE(UmaBudget, shared_ram_counts_the_pool_beyond_the_reserve) {
+    const size_t reserve = ggml_cuda_uma_reserve_bytes(kStrixRam);
+    const uint64_t after_swap = ggml_cuda_uma_shared_ram_bytes(59 * (uint64_t) GiB, 119 * (uint64_t) GiB, kStrixRam);
+    CHECK_TRUE(after_swap == 119 * (uint64_t) GiB - reserve);
+    CHECK_TRUE(ggml_cuda_uma_alloc_fits((size_t) after_swap, 119 * GiB, kStrixRam));
+    CHECK_FALSE(ggml_cuda_uma_alloc_fits(119 * GiB - GiB, 119 * GiB, kStrixRam));
+    CHECK_TRUE(ggml_cuda_uma_shared_ram_bytes(122 * (uint64_t) GiB, 122 * (uint64_t) GiB, kStrixRam) ==
+               122 * (uint64_t) GiB);
+    CHECK_TRUE(ggml_cuda_uma_shared_ram_bytes(100 * (uint64_t) GiB, 103 * (uint64_t) GiB, kStrixRam) ==
+               100 * (uint64_t) GiB);
+    CHECK_TRUE(ggml_cuda_uma_shared_ram_bytes(120 * (uint64_t) GiB, 4 * (uint64_t) GiB, kStrixRam) ==
+               4 * (uint64_t) GiB);
+    CHECK_TRUE(ggml_cuda_uma_shared_ram_bytes(0, 0, kStrixRam) == 0);
+}
+
+// The device interface reports that RAM, not an integrated GPU's carve
+// besides: on a 64 GiB APU with 60 GiB of carve free, 16 GiB of MemAvailable
+// and 8 GiB in the pool, 20 GiB, which one managed buffer can take, not 80. A
+// buffer sized from 80 would go to managed memory (above 45% of RAM), which
+// takes RAM alone.
+TEST_CASE(UmaBudget, shared_free_leaves_out_the_carve) {
+    const uint64_t shared_ram = ggml_cuda_uma_shared_ram_bytes(16 * (uint64_t) GiB, 24 * (uint64_t) GiB, 64 * GiB);
+    CHECK_TRUE(shared_ram == 20 * (uint64_t) GiB);
+    CHECK_TRUE(ggml_cuda_uma_shared_free_bytes(60 * GiB, shared_ram, false) == 20 * GiB);
+    CHECK_TRUE(ggml_cuda_uma_alloc_fits(20 * GiB, 24 * GiB, 64 * GiB));
+    CHECK_TRUE(ggml_cuda_uma_shared_free_bytes(121 * GiB, 0, false) == 0);
+}
+
+// Allocations stay in the device heap without managed memory on the device
+// (hipMallocManaged unsupported, even with GGML_CUDA_ENABLE_UNIFIED_MEMORY), or
+// with automatic managed memory turned off and not forced on.
+TEST_CASE(UmaBudget, heap_only_without_managed_memory) {
+    CHECK_TRUE(ggml_cuda_uma_heap_only(false, false, false));
+    CHECK_TRUE(ggml_cuda_uma_heap_only(false, true, false));
+    CHECK_TRUE(ggml_cuda_uma_heap_only(true, false, true));
+    CHECK_FALSE(ggml_cuda_uma_heap_only(true, true, true));
+    CHECK_FALSE(ggml_cuda_uma_heap_only(true, false, false));
+}
+
+// There the heap, which a GTT limit bounds, is the limit: with 30 GiB free in
+// it and 60 GiB of RAM to share, 30 GiB, not 60. With managed memory, 60.
+TEST_CASE(UmaBudget, shared_free_keeps_the_heap_limit_without_managed_memory) {
+    CHECK_TRUE(ggml_cuda_uma_shared_free_bytes(30 * GiB, 60 * (uint64_t) GiB, true) == 30 * GiB);
+    CHECK_TRUE(ggml_cuda_uma_shared_free_bytes(30 * GiB, 60 * (uint64_t) GiB, false) == 60 * GiB);
+    // A heap limit above what RAM allows is no limit.
+    CHECK_TRUE(ggml_cuda_uma_shared_free_bytes(121 * GiB, 60 * (uint64_t) GiB, true) == 60 * GiB);
+}
+
+// A discrete GPU with GGML_CUDA_ENABLE_UNIFIED_MEMORY: on a 64 GiB host with 12 GiB of MemAvailable and
+// 24 GiB more in the pool, 36 GiB less the 4 GiB reserve, where llama.cpp's
+// query gave 12.
+TEST_CASE(UmaBudget, shared_free_of_a_discrete_gpu_in_unified_memory_counts_the_pool) {
+    const uint64_t shared_ram = ggml_cuda_uma_shared_ram_bytes(12 * (uint64_t) GiB, 36 * (uint64_t) GiB, 64 * GiB);
+    CHECK_TRUE(shared_ram == 32 * (uint64_t) GiB);
+    CHECK_TRUE(ggml_cuda_uma_shared_free_bytes(32 * GiB, shared_ram, false) == 32 * GiB);
+}
+
+// DeepSeek's Strix stack: the device heap (what the runtime allows of the room)
+// beside the locked host tier, at most the room, each less the 9.5 GiB carve
+// reserve. On an APU with a 64 GiB carve whose runtime reports the carve alone
+// (60 GiB free), 60 GiB of RAM (56.25 after the reserve) and 54 GiB lockable:
+// 50.5 GiB in the heap and 54 on the host, 104.5 GiB, within the 106.75 GiB
+// room; capped at the heap alone it was 50.5. More host tier than RAM is left
+// stops at the room. Without a carve the heap is the room already, and a host
+// tier adds nothing beyond it.
+TEST_CASE(UmaBudget, tiered_capacity_keeps_the_host_tier_beside_a_large_carve) {
+    constexpr uint64_t carve_reserve = 9 * (uint64_t) GiB + GiB / 2;
+    const uint64_t room = ggml_cuda_uma_room_bytes(64 * (uint64_t) GiB, 4 * (uint64_t) GiB,
+                                                   60 * (uint64_t) GiB - ggml_cuda_uma_reserve_bytes(60 * GiB));
+    CHECK_TRUE(room == 116 * (uint64_t) GiB + GiB / 4);
+    const uint64_t heap = 60 * (uint64_t) GiB - carve_reserve;
+    CHECK_TRUE(ggml_cuda_uma_tiered_capacity(heap, 54 * (uint64_t) GiB, room - carve_reserve) ==
+               104 * (uint64_t) GiB + GiB / 2);
+    CHECK_TRUE(ggml_cuda_uma_tiered_capacity(heap, 80 * (uint64_t) GiB, room - carve_reserve) == room - carve_reserve);
+    const uint64_t strix = 113 * (uint64_t) GiB - carve_reserve;
+    CHECK_TRUE(ggml_cuda_uma_tiered_capacity(strix, 0, strix) == strix);
+    CHECK_TRUE(ggml_cuda_uma_tiered_capacity(strix, 100 * (uint64_t) GiB, strix) == strix);
+    CHECK_TRUE(ggml_cuda_uma_tiered_capacity(UINT64_MAX, 1, strix) == strix);
+}
+
 #if defined(__linux__)
+// The carve comes from amdgpu's mem_info_vram_total and mem_info_vram_used
+// under the device's PCI directory; a device without them reports none.
+TEST_CASE(UmaBudget, reads_the_carve_from_sysfs) {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() /
+        ("luce_test_pci_" + std::to_string((long long) getpid()));
+    fs::remove_all(root);
+    fs::create_directories(root / "0000:c5:00.0");
+    fs::create_directories(root / "0000:01:00.0");
+    std::ofstream(root / "0000:c5:00.0" / "mem_info_vram_total") << "536870912\n";
+    std::ofstream(root / "0000:c5:00.0" / "mem_info_vram_used") << "154140672\n";
+
+    uint64_t total = 0, used = 0;
+    CHECK_TRUE(ggml_cuda_uma_carve_bytes_at(root.string(), "0000:c5:00.0", &total, &used));
+    CHECK_TRUE(total == 536870912ULL);
+    CHECK_TRUE(used == 154140672ULL);
+    CHECK_FALSE(ggml_cuda_uma_carve_bytes_at(root.string(), "0000:01:00.0", &total, &used));
+    CHECK_FALSE(ggml_cuda_uma_carve_bytes_at(root.string(), "0000:ff:00.0", &total, &used));
+    fs::remove_all(root);
+}
+
 // The walk from the process's group to the root takes the smallest room. A
 // group whose memory.current cannot be read keeps its limit as the room
 // instead of dropping it: there the child's 4 GiB limit binds, not the
