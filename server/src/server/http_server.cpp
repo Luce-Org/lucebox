@@ -769,6 +769,14 @@ PflashChatTurnSpan pflash_chat_query_turn(
     return chosen;
 }
 
+std::string_view pflash_template_trim(std::string_view text) {
+    // The chat template's ``|trim`` (jinja strip: C isspace on each byte).
+    const auto space = [] (char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; };
+    while (!text.empty() && space(text.front())) text.remove_prefix(1);
+    while (!text.empty() && space(text.back())) text.remove_suffix(1);
+    return text;
+}
+
 bool pflash_content_char_spans(
         const std::string & placeholder_render,
         const std::vector<std::string> & placeholders,
@@ -781,30 +789,41 @@ bool pflash_content_char_spans(
         error = "placeholder and content counts differ";
         return false;
     }
-    std::string rebuilt;
-    rebuilt.reserve(prompt_text.size());
-    size_t cursor = 0;
+    // Where each placeholder is rendered, exactly once. Not necessarily in message order: DeepSeek renders each
+    // run of tool results in the order of the calls that asked for them.
+    std::vector<std::pair<size_t, size_t>> found;   // (position in the render, message)
     for (size_t i = 0; i < placeholders.size(); ++i) {
         const std::string & ph = placeholders[i];
         if (ph.empty()) continue;
-        const size_t at = placeholder_render.find(ph, cursor);
-        if (at == std::string::npos ||
-            placeholder_render.find(ph, at + ph.size()) != std::string::npos) {
-            error = "message " + std::to_string(i) + " is not rendered exactly once, in order";
+        const size_t at = placeholder_render.find(ph);
+        if (at == std::string::npos || placeholder_render.find(ph, at + ph.size()) != std::string::npos) {
+            error = "message " + std::to_string(i) + " is not rendered exactly once";
+            spans.assign(placeholders.size(), {0, 0});
             return false;
         }
-        rebuilt.append(placeholder_render, cursor, at - cursor);
-        spans[i] = {rebuilt.size(), rebuilt.size() + contents[i].size()};
-        rebuilt += contents[i];
-        cursor = at + ph.size();
+        found.emplace_back(at, i);
     }
-    rebuilt.append(placeholder_render, cursor, std::string::npos);
-    if (rebuilt != prompt_text) {
-        error = "the template does not render message contents verbatim";
-        spans.assign(placeholders.size(), {0, 0});
-        return false;
+    std::sort(found.begin(), found.end());
+    // Contents go back verbatim, or trimmed: templates such as Qwen 3.8's trim every message, so a tool output
+    // ending in a newline is rendered without it. Either way the result must equal the prompt byte for byte.
+    for (const bool trimmed : {false, true}) {
+        std::string rebuilt;
+        rebuilt.reserve(prompt_text.size());
+        size_t cursor = 0;
+        for (const auto & [at, i] : found) {
+            const std::string_view content = trimmed ? pflash_template_trim(contents[i])
+                                                     : std::string_view(contents[i]);
+            rebuilt.append(placeholder_render, cursor, at - cursor);
+            spans[i] = {rebuilt.size(), rebuilt.size() + content.size()};
+            rebuilt += content;
+            cursor = at + placeholders[i].size();
+        }
+        rebuilt.append(placeholder_render, cursor, std::string::npos);
+        if (rebuilt == prompt_text) return true;
     }
-    return true;
+    error = "the template does not render message contents verbatim";
+    spans.assign(placeholders.size(), {0, 0});
+    return false;
 }
 
 PFlashTokenSpan pflash_char_span_tokens(
@@ -5753,20 +5772,30 @@ std::string HttpServer::apply_pflash_compression(
                     // by a cand_v5 probe; any failure falls the request back to today's windows).
                     {
                         auto & all = request_probe_messages;
-                        std::vector<ChatMessage> placeholder_messages = messages;
-                        std::vector<std::string> placeholders(messages.size());
-                        std::vector<std::string> contents(messages.size());
-                        for (size_t index = 0; index < messages.size() && all.all_error.empty(); ++index) {
-                            const std::string & role = messages[index].role;
+                        // The messages in the order the template renders them (DeepSeek sorts each run of tool
+                        // results by call), so the spans ascend; the render itself is unchanged.
+                        std::vector<ChatMessage> ordered = messages;
+                        if (config_.chat_template_src.empty()) {
+                            const std::vector<size_t> order = chat_message_render_order(messages, chat_format_);
+                            for (size_t i = 0; i < order.size(); ++i) ordered[i] = messages[order[i]];
+                        }
+                        std::vector<ChatMessage> placeholder_messages = ordered;
+                        std::vector<std::string> placeholders(ordered.size());
+                        std::vector<std::string> contents(ordered.size());
+                        for (size_t index = 0; index < ordered.size() && all.all_error.empty(); ++index) {
+                            const std::string & role = ordered[index].role;
                             if (role != "system" && role != "user" && role != "assistant" && role != "tool") {
                                 all.all_error = "unsupported message role " + role;
                                 break;
                             }
                             all.all_roles.push_back(role);
-                            contents[index] = messages[index].content;
-                            // An empty content (an assistant turn that only calls tools) has no tokens to map, and
-                            // a placeholder there would change how the template renders the turn.
-                            if (role == "system" || contents[index].empty()) continue;   // never a candidate nor in E
+                            contents[index] = ordered[index].content;
+                            // An empty content (an assistant turn that only calls tools, or only whitespace, which a
+                            // trimming template renders empty) has no tokens to map, and a placeholder there would
+                            // change how the template renders the turn.
+                            if (role == "system" || http_detail::pflash_template_trim(contents[index]).empty()) {
+                                continue;   // never a candidate nor in E
+                            }
                             placeholders[index] = "\x1e" "PFLASH-MESSAGE-" + std::to_string(index) + "\x1f";
                             placeholder_messages[index].content = placeholders[index];
                         }
@@ -7708,7 +7737,11 @@ std::string HttpServer::apply_unified_view(
         std::vector<ChatMessage> placeholder_messages = messages;
         std::vector<std::string> placeholders(messages.size());
         std::vector<std::string> contents(messages.size());
-        for (const auto & c : newest) {
+        for (auto & c : newest) {
+            if (http_detail::pflash_template_trim(messages[c.message].content).empty()) {
+                if (c.skip.empty()) c.skip = "empty";
+                continue;
+            }
             placeholders[c.message] = "\x1e" "PFLASH-UNIFIED-" + std::to_string(c.message) + "\x1f";
             contents[c.message] = messages[c.message].content;
             placeholder_messages[c.message].content = placeholders[c.message];

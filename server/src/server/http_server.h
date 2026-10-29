@@ -49,6 +49,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #if !defined(_WIN32)
 #include <unistd.h>
@@ -587,9 +588,13 @@ PflashChatTurnSpan pflash_chat_query_turn(
 // does not map that way -- the caller then maps by sentinel renders.
 // cand_v4 / stage 2 (STAGE2-CONTRACT.md section 1): the character span of every message's exact content in
 // ``prompt_text``, from ``placeholder_render`` -- a render of the same messages with content i replaced by
-// ``placeholders[i]`` ("" = left as is). Each non-empty placeholder must occur exactly once, in message order, and
-// putting the contents back must give ``prompt_text`` byte for byte (a template that rewrites content fails).
-// ``spans[i]`` = {begin, end} characters ({0, 0} for a message left as is). False + ``error`` otherwise.
+// ``placeholders[i]`` ("" = left as is). Each non-empty placeholder must occur exactly once (in any order: DeepSeek
+// renders tool results in call order), and
+// putting the contents back -- verbatim, or all trimmed as by a template's ``|trim`` -- must give ``prompt_text``
+// byte for byte (a template that rewrites content otherwise fails). ``spans[i]`` = {begin, end} characters of the
+// content as rendered ({0, 0} for a message left as is). False + ``error`` otherwise.
+// ``text`` without the leading and trailing whitespace a chat template's ``|trim`` removes (C isspace).
+std::string_view pflash_template_trim(std::string_view text);
 bool pflash_content_char_spans(
     const std::string & placeholder_render,
     const std::vector<std::string> & placeholders,

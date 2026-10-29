@@ -5446,6 +5446,22 @@ TEST_CASE(ServerUnitFixture, test_deepseek41_template_tool_results_and_effort) {
     TEST_ASSERT(chat_format_for_arch("deepseek4") == ChatFormat::DEEPSEEK4);
 }
 
+TEST_CASE(ServerUnitFixture, test_deepseek_render_order_puts_tool_results_in_call_order) {
+    // Results that arrive out of call order: DeepSeek renders them in call order, other formats as given.
+    std::vector<ChatMessage> msgs = {
+        {"user", "two reads", ""},
+        {"assistant", "", ""},
+        {"tool", "second", "call_2"},
+        {"tool", "first", "call_1"},
+    };
+    msgs[1].tool_calls = {{"call_1", "read", json::object()}, {"call_2", "read", json::object()}};
+    TEST_ASSERT(chat_message_render_order(msgs, ChatFormat::DEEPSEEK4) == std::vector<size_t>({0, 1, 3, 2}));
+    TEST_ASSERT(chat_message_render_order(msgs, ChatFormat::DEEPSEEK41) == std::vector<size_t>({0, 1, 3, 2}));
+    TEST_ASSERT(chat_message_render_order(msgs, ChatFormat::QWEN3).empty());
+    std::swap(msgs[2], msgs[3]);
+    TEST_ASSERT(chat_message_render_order(msgs, ChatFormat::DEEPSEEK4).empty());
+}
+
 TEST_CASE(ServerUnitFixture, test_hash_prefix_deterministic) {
     std::vector<int32_t> ids = {100, 200, 300, 400, 500};
     auto h1 = hash_prefix(ids.data(), (int)ids.size());

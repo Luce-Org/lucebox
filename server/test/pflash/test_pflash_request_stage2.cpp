@@ -270,6 +270,20 @@ TEST_CASE(PFlashStage2Fixture, content_spans_come_from_a_verbatim_placeholder_re
     REQUIRE_FALSE(pflash_content_char_spans(render, {"", "@9@", "@2@"}, {"S", " hi ", "ok"}, prompt, spans, error));
     REQUIRE_FALSE(pflash_content_char_spans(render + "@2@", {"", "@1@", "@2@"}, {"S", " hi ", "ok"}, prompt, spans,
                                             error));
+    // A template that trims every message (Qwen 3.8): the contents go back trimmed, spans on the rendered text.
+    const std::string trimmed = "<s>sys\nS<e>\n<u>\nhi<e>\n<t>\nout<e>\n<g>";
+    const std::string trimmed_render = "<s>sys\nS<e>\n<u>\n@1@<e>\n<t>\n@2@<e>\n<g>";
+    REQUIRE(pflash_content_char_spans(trimmed_render, {"", "@1@", "@2@"}, {"S", " hi ", "out\n\n"}, trimmed, spans,
+                                      error));
+    REQUIRE(spans[1].first == trimmed.find("hi") && spans[1].second == spans[1].first + 2);
+    REQUIRE(spans[2].first == trimmed.find("out") && spans[2].second == spans[2].first + 3);
+    REQUIRE(luce::common::http_detail::pflash_template_trim(" \t\nx y\r\n") == "x y");
+    // A template that renders messages out of order (DeepSeek sorts tool results by call): spans where they are.
+    const std::string swapped = "<s>sys\nS<e>\n<t>\nb<e>\n<t>\na<e>\n<g>";
+    const std::string swapped_render = "<s>sys\nS<e>\n<t>\n@2@<e>\n<t>\n@1@<e>\n<g>";
+    REQUIRE(pflash_content_char_spans(swapped_render, {"", "@1@", "@2@"}, {"S", "a", "b"}, swapped, spans, error));
+    REQUIRE(spans[1].first == swapped.find("a") && spans[2].first == swapped.find("b"));
+    REQUIRE(spans[2].first < spans[1].first);
     // Tokens overlapping [5, 9): token starts 0, 4, 6, 9, 12 -> tokens 1 ([4,6)), 2 ([6,9)).
     const std::vector<size_t> starts = {0, 4, 6, 9, 12};
     REQUIRE(pflash_char_span_tokens(starts, 15, 5, 9) == PFlashTokenSpan({1, 3}));
