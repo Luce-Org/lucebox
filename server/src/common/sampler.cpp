@@ -18,6 +18,18 @@
 namespace luce::common {
 
 namespace {
+#ifdef LUCE_HAVE_GPU_SAMPLER
+// The two GPU paths sample_logits_chain may take; sample_logits_host_only
+// reads the same decisions.
+bool gpu_full_sample_path(const SamplerCfg & cfg) {
+    return gpu_sampler_enabled() && gpu_sampler_supports(cfg);
+}
+bool gpu_probs_path(const SamplerCfg & cfg, int vocab) {
+    const bool need_top_k = cfg.top_k > 0 && cfg.top_k < vocab;
+    const bool need_top_p = cfg.top_p > 0.0f && cfg.top_p < 1.0f;
+    return cfg.temp > 0.0f && need_top_p && !need_top_k && gpu_sampler_enabled();
+}
+#endif
 
 // Binary search (quickselect via std::nth_element) for the smallest index
 // `cut` such that the descending-by-value prefix cand[0,cut) has cumulative
@@ -159,7 +171,7 @@ int sample_logits_chain(const float * logits_in,
     // GPU path (on by default; set LUCE_GPU_SAMPLE=0 to disable). top_k>0,
     // top_p in (0,1) (both unsupported on the GPU, see geometric_sampler_cuda.h),
     // and any CUDA error return -1 and fall through to the CPU chain below.
-    if (gpu_sampler_enabled() && gpu_sampler_supports(cfg)) {
+    if (gpu_full_sample_path(cfg)) {
         const int g = geometric_sample_logits_cuda(logits_in, vocab, cfg, history, r_uniform,
                                          /*logits_on_device=*/false);
         if (g >= 0) return g;
@@ -178,7 +190,7 @@ int sample_logits_chain(const float * logits_in,
     // deliberately excluded: its CPU cost is already cheap (partial_sort
     // scales with k, not vocab), so the GPU round trip would make it slower,
     // not faster (measured regression, not just "no win").
-    if (cfg.temp > 0.0f && need_top_p && !need_top_k && gpu_sampler_enabled()) {
+    if (gpu_probs_path(cfg, vocab)) {
         std::vector<float> gpu_probs(vocab);
         if (geometric_compute_probs_cuda(logits_in, vocab, cfg, history,
                                          gpu_probs.data(), /*logits_on_device=*/false)) {
@@ -262,6 +274,16 @@ int sample_logits_chain(const float * logits_in,
 }
 
 }  // namespace
+
+bool sample_logits_host_only(const SamplerCfg & cfg, int vocab) {
+#ifdef LUCE_HAVE_GPU_SAMPLER
+    return !gpu_full_sample_path(cfg) && !gpu_probs_path(cfg, vocab);
+#else
+    (void) cfg;
+    (void) vocab;
+    return true;
+#endif
+}
 
 int sample_logits(const float * logits_in,
                   int vocab,
