@@ -1,0 +1,19 @@
+{
+  "name": "DeepSeek V4.1 Flash",
+  "source": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "verified_at": "2026-10-29",
+  "max_tokens": 262144,
+  "hard_limit_reply_budget": 4096,
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+  },
+  "reasoning_effort_tiers": {
+    "low": 32256,
+    "medium": 129024,
+    "high": 258048,
+    "x-high": 258048,
+    "max": 258048
+  },
+  "notes": "Transcribed from the upstream card's recommended parameters: temperature 1.0, top_p 1.0, a 1M-token context window and max_tokens of 256K or more, taken as 262144. The card states no effort budgets, so the tiers are the ratio defaults of docs/specs/thinking-budget.md section 3.3 for that max_tokens (no complex-problem value, so x-high and max equal high), written out; each is capped at max_ctx minus hard_limit_reply_budget. top_k, min_p and the penalties are absent because the card does not state them. Lucebox's V4.1 Flash GGUFs report general.name 'DeepSeek V4.1 Flash'. Without this file the server fell to the deepseek4 family fallback, which states no sampler, so every request that did not set one was sampled greedily (temperature 0)."
+}

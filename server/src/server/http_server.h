@@ -794,6 +794,7 @@ struct ParsedRequest {
     ImagePromptHandle         images;
     std::string               rendered_prompt;
     int                       max_output   = 4096;
+    bool                      max_output_from_client = false;  // else the card's default
     bool                      stream       = true;
     SamplerCfg                sampler;
     std::string               model;

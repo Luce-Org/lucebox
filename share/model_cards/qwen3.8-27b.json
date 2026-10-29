@@ -1,0 +1,33 @@
+{
+  "name": "Qwen3.8 27B",
+  "source": "https://huggingface.co/Qwen/Qwen3.8-27B",
+  "verified_at": "2026-10-29",
+  "max_tokens": 131072,
+  "complex_problem_max_tokens": 262144,
+  "hard_limit_reply_budget": 4096,
+  "thinking_terminator_hint": "Considering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n",
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0
+  },
+  "sampling_no_thinking": {
+    "temperature": 0.7,
+    "top_p": 0.80,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "repetition_penalty": 1.0
+  },
+  "reasoning_effort_tiers": {
+    "low": 15872,
+    "medium": 63488,
+    "high": 126976,
+    "x-high": 192512,
+    "max": 258048
+  },
+  "notes": "Transcribed from the upstream card. Sampling: thinking mode temperature 1.0, top_p 0.95, top_k 20, min_p 0, presence_penalty 0, repetition_penalty 1.0; instruct (non-thinking) mode 0.7, 0.80, 20, 0, 1.5, 1.0. Output length: the card says to set it to 131,072 tokens for a final response and to 262,144 for reasoning content, taken here as max_tokens and complex_problem_max_tokens; the context is 262,144 natively. The tiers are the ratio defaults of docs/specs/thinking-budget.md section 3.3 for those two values, written out as qwen3.6-27b.json does. The terminator hint is the Qwen3 one qwen3.6-27b.json uses (same qwen35 architecture). Lucebox's Qwen 3.8 27B GGUFs report general.name 'Qwen3.8-27B' or 'Qwen3.8 27B', both found as qwen3.8-27b. Without this file the server fell to the qwen35 family fallback, which states no sampler, so requests that did not set one were sampled greedily (temperature 0)."
+}

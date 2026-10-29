@@ -3730,6 +3730,7 @@ bool HttpServer::parse_common_request_fields(
     // visible reply after thinking.
     req.max_output =
         resolve_max_output_tokens(body, config_.default_max_tokens);
+    req.max_output_from_client = resolve_max_output_tokens(body, 0) > 0;
     // Spec §4.4: clamp request max_tokens to --default-max-tokens.
     if (req.max_output > config_.default_max_tokens) {
         std::fprintf(stderr,
@@ -4097,7 +4098,7 @@ bool HttpServer::validate_request_context(
         !req.images && config_.pflash &&
         drafter_tokenizer_ != nullptr &&
         prompt_tokens >= config_.pflash_threshold;
-    if (!routed && !pflash_will_run) {
+    if (trims_reply(routed, req.max_output_from_client, pflash_will_run)) {
         const int fitted =
             fit_reply_to_context(prompt_tokens, req.max_output, config_.max_ctx);
         if (fitted > 0 && fitted < req.max_output) {
@@ -4287,7 +4288,8 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         std::string image_error;
         const ImagePrepareStatus image_status = backend_.prepare_images(
                 req.prompt_tokens, std::move(encoded_images),
-                uint64_t(std::max(0, config_.max_ctx)), uint64_t(std::max(0, req.max_output)),
+                uint64_t(std::max(0, config_.max_ctx)),
+                uint64_t(image_output_reserve(req.max_output, config_.hard_limit_reply_budget)),
                 req.images, image_error);
         if (image_status != ImagePrepareStatus::ok) {
             // A full image gate is capacity, not a bad request: clients retry 503.
