@@ -4093,7 +4093,8 @@ bool HttpServer::render_messages_to_text(
     } else {
         rendered = render_chat_template(
             chat_messages, chat_format_, add_generation_prompt,
-            req.thinking_enabled, tools_json, req.reasoning_effort);
+            req.thinking_enabled, tools_json, req.reasoning_effort,
+            req.preserve_thinking, config_.qwen_template_rules);
     }
 
     return true;

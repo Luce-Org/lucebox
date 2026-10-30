@@ -8409,6 +8409,194 @@ TEST_CASE(ServerUnitFixture, test_normalize_openai_tool_calls_without_memory) {
     }
 }
 
+// A tool-call turn the server no longer remembers (restart, eviction) comes
+// back with its thinking as reasoning_content. The Qwen templates replay the
+// thinking of the turns after the last user message, as the model generated
+// them; turns before it keep their visible text only.
+TEST_CASE(ServerUnitFixture, test_qwen_render_replays_reasoning_after_last_user) {
+    ToolMemory tool_memory;
+    const json messages = json::array({
+        {{"role", "user"}, {"content", "hi"}},
+        {{"role", "assistant"}, {"content", "Hello."}, {"reasoning_content", "Greet back."}},
+        {{"role", "user"}, {"content", "fix the bug"}},
+        {{"role", "assistant"}, {"content", "\n\nLet me look."},
+         {"reasoning_content", "\nOpen the file first.\n"},
+         {"tool_calls", json::array({
+             {{"id", "call_1"}, {"type", "function"},
+              {"function", {{"name", "bash"}, {"arguments", "{\"command\": \"ls\"}"}}}}})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "a.py"}},
+        {{"role", "assistant"}, {"content", nullptr}, {"reasoning", "Read a.py."},
+         {"tool_calls", json::array({
+             {{"id", "call_2"}, {"type", "function"},
+              {"function", {{"name", "read"}, {"arguments", "{\"path\": \"a.py\"}"}}}}})}},
+        {{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", "print(1)"}},
+    });
+    const std::string rendered = render_chat_template(
+        normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory),
+        ChatFormat::QWEN3, /*add_generation_prompt=*/true, /*enable_thinking=*/true);
+    TEST_ASSERT_MSG(rendered ==
+        "<|im_start|>user\nhi<|im_end|>\n"
+        "<|im_start|>assistant\nHello.<|im_end|>\n"
+        "<|im_start|>user\nfix the bug<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nOpen the file first.\n</think>\n\nLet me look.\n\n"
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n"
+        "</function>\n</tool_call><|im_end|>\n"
+        "<|im_start|>user\n<tool_response>\na.py\n</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nRead a.py.\n</think>\n\n"
+        "<tool_call>\n<function=read>\n<parameter=path>\na.py\n</parameter>\n"
+        "</function>\n</tool_call><|im_end|>\n"
+        "<|im_start|>user\n<tool_response>\nprint(1)\n</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n", rendered);
+}
+
+// The models' own chat templates, from the GGUF metadata (tokenizer.chat_template).
+static std::string read_qwen_chat_template(const char * name) {
+    const std::string path = std::string(LUCE_TEST_FIXTURES_DIR) + "/qwen-chat-templates/" + name;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("missing chat template fixture " + path);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+// A query, a thinking turn, a second query and a thinking tool-call turn.
+static std::vector<ChatMessage> qwen_two_query_history() {
+    ToolMemory tool_memory;
+    return normalize_chat_messages(json::array({
+        {{"role", "user"}, {"content", "hi"}},
+        {{"role", "assistant"}, {"content", "Hello."}, {"reasoning_content", "Greet back."}},
+        {{"role", "user"}, {"content", "fix the bug"}},
+        {{"role", "assistant"}, {"content", "Let me look."}, {"reasoning_content", "Open the file."},
+         {"tool_calls", json::array({
+             {{"id", "call_1"}, {"type", "function"},
+              {"function", {{"name", "bash"}, {"arguments", "{\"command\": \"ls\"}"}}}}})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "a.py"}},
+    }), ApiFormat::OPENAI_CHAT, tool_memory);
+}
+
+// The built-in renderer follows the model's template on the turns before the
+// last user query: Qwen3.8 keeps their thinking unless the request sets
+// preserve_thinking=false; Qwen3.5 drops it whatever the request says. The
+// template's effort line appears only when the request names an effort.
+TEST_CASE(ServerUnitFixture, test_qwen_render_follows_gguf_template_history_and_effort) {
+    const auto qwen38 = qwen_template_rules(read_qwen_chat_template("Qwen3.8-27B.jinja"));
+    const auto qwen35 = qwen_template_rules(read_qwen_chat_template("Qwen3.5-9B.jinja"));
+    const std::string kept = "<|im_start|>assistant\n<think>\nGreet back.\n</think>\n\nHello.<|im_end|>\n";
+    const std::string dropped = "<|im_start|>assistant\nHello.<|im_end|>\n";
+    const std::string recent = "<|im_start|>assistant\n<think>\nOpen the file.\n</think>\n\nLet me look.";
+    const std::string first_turn = "<|im_start|>user\nhi<|im_end|>";
+    struct Case { const char * name; const QwenTemplateRules * rules; int preserve_thinking; bool keeps; };
+    const Case cases[] = {
+        {"qwen3.8 default", &qwen38, -1, true},
+        {"qwen3.8 preserve_thinking=true", &qwen38, 1, true},
+        {"qwen3.8 preserve_thinking=false", &qwen38, 0, false},
+        {"qwen3.5 default", &qwen35, -1, false},
+        {"qwen3.5 preserve_thinking=true", &qwen35, 1, false},
+    };
+    for (const auto & c : cases) {
+        const std::string rendered = render_chat_template(
+            qwen_two_query_history(), ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+            /*enable_thinking=*/true, "", "", c.preserve_thinking, *c.rules);
+        TEST_ASSERT_MSG(rendered.find(c.keeps ? kept : dropped) != std::string::npos, c.name);
+        TEST_ASSERT_MSG(rendered.find(recent) != std::string::npos, c.name);
+        TEST_ASSERT_MSG(rendered.rfind(first_turn, 0) == 0, c.name);  // no effort line by default
+    }
+
+    struct Effort { const char * effort; const QwenTemplateRules * rules; const char * line; };
+    const Effort efforts[] = {
+        {"low", &qwen38, "Reasoning effort is set to low. Keep your thinking brief and focused, moving "
+                         "directly to the conclusion without unnecessary elaboration."},
+        {"medium", &qwen38, nullptr},
+        {"high", &qwen38, "Reasoning effort is set to xhigh. Please think carefully through the task, validate "
+                          "key assumptions, consider plausible alternatives, and prioritize correctness, "
+                          "consistency, and clarity in the final answer."},
+        {"high", &qwen35, nullptr},
+    };
+    for (const auto & e : efforts) {
+        const std::vector<ChatMessage> query = {{"user", "hi", "", ""}};
+        const std::string rendered = render_chat_template(
+            query, ChatFormat::QWEN3, true, /*enable_thinking=*/true, "", e.effort, -1, *e.rules);
+        const std::string expected = (e.line ? "<|im_start|>system\n" + std::string(e.line) + "<|im_end|>\n" : "") +
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        TEST_ASSERT_MSG(rendered == expected, rendered);
+        // Thinking off: no effort line.
+        TEST_ASSERT(render_chat_template(query, ChatFormat::QWEN3, true, false, "", e.effort, -1, *e.rules)
+                        .find("Reasoning effort") == std::string::npos);
+    }
+}
+
+// The built-in renderer and the model's own Jinja template render the same
+// multi-turn agent conversation byte for byte: system, the tools, a thinking
+// turn before the last query, thinking tool-call turns, a cut reply and a
+// continue prompt.
+// The built-in default (no effort named) equals the template at "medium",
+// which states no effort. Not covered: raw turns replayed from tool memory,
+// which the Jinja path refuses (and which keep their thinking wherever they sit).
+TEST_CASE(ServerUnitFixture, test_qwen_render_matches_gguf_templates) {
+    ToolMemory tool_memory;
+    const auto messages = normalize_chat_messages(json::array({
+        {{"role", "system"}, {"content", "You are a coding agent."}},
+        {{"role", "user"}, {"content", "hi"}},
+        {{"role", "assistant"}, {"content", "Hello."}, {"reasoning_content", "Greet back."}},
+        {{"role", "user"}, {"content", "fix the bug"}},
+        {{"role", "assistant"}, {"content", "Let me look."}, {"reasoning_content", "Open the file."},
+         {"tool_calls", json::array({
+             {{"id", "call_1"}, {"type", "function"},
+              {"function", {{"name", "bash"}, {"arguments", "{\"command\": \"ls -la\"}"}}}}})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "a.py\nb.py"}},
+        {{"role", "assistant"}, {"content", nullptr}, {"reasoning_content", "Read both."},
+         {"tool_calls", json::array({
+             {{"id", "call_2"}, {"type", "function"},
+              {"function", {{"name", "read"}, {"arguments", "{\"path\": \"a.py\"}"}}}},
+             {{"id", "call_3"}, {"type", "function"},
+              {"function", {{"name", "read"}, {"arguments", "{\"path\": \"b.py\"}"}}}}})}},
+        {{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", "print(1)"}},
+        {{"role", "tool"}, {"tool_call_id", "call_3"}, {"content", "print(2)"}},
+        {{"role", "assistant"}, {"content", "The bug is"}, {"reasoning_content", "a.py prints 1."}},
+        {{"role", "user"}, {"content", "continue"}},
+    }), ApiFormat::OPENAI_CHAT, tool_memory);
+    // The same two tools as Chat Completions, Responses and Anthropic send
+    // them, held as the server holds request JSON (keys sorted).
+    const json bash_schema = {{"type", "object"}, {"required", json::array({"command"})},
+                              {"properties", {{"command", {{"type", "string"}}},
+                                              {"timeout", {{"type", "integer"}, {"default", 30}}}}}};
+    const json read_schema = {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}};
+    const char * bash_doc = "Run a shell command; prints \"stdout\".";
+    const char * read_doc = "Read a file (UTF-8, e.g. café.py).";
+    const std::pair<const char *, std::string> tool_sets[] = {
+        {"chat", json::array({
+            {{"type", "function"}, {"function", {{"name", "bash"}, {"description", bash_doc}, {"parameters", bash_schema}}}},
+            {{"type", "function"}, {"function", {{"name", "read"}, {"description", read_doc}, {"parameters", read_schema}}}},
+        }).dump()},
+        {"responses", json::array({
+            {{"type", "function"}, {"name", "bash"}, {"description", bash_doc}, {"parameters", bash_schema}},
+            {{"type", "function"}, {"name", "read"}, {"description", read_doc}, {"parameters", read_schema}},
+        }).dump()},
+        {"anthropic", json::array({
+            {{"name", "bash"}, {"description", bash_doc}, {"input_schema", bash_schema}},
+            {{"name", "read"}, {"description", read_doc}, {"input_schema", read_schema}},
+        }).dump()},
+    };
+
+    for (const char * name : {"Qwen3.8-27B.jinja", "Qwen3.5-9B.jinja"}) {
+        const std::string tmpl = read_qwen_chat_template(name);
+        const auto rules = qwen_template_rules(tmpl);
+        for (const auto & [shape, tools] : tool_sets) {
+            for (const int preserve_thinking : {-1, 0, 1}) {
+                for (const char * effort : {"", "low", "medium", "high"}) {
+                    const std::string label = std::string(name) + " tools=" + shape + " preserve_thinking=" +
+                        std::to_string(preserve_thinking) + " effort=" + effort;
+                    const std::string builtin = render_chat_template(
+                        messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+                        /*enable_thinking=*/true, tools, effort, preserve_thinking, rules);
+                    const std::string jinja = render_chat_template_jinja(
+                        tmpl, messages, "", "", true, true, tools,
+                        qwen4exp_template_effort(*effort ? effort : "medium"), preserve_thinking);
+                    TEST_ASSERT_MSG(builtin == jinja, label + "\n--- built-in\n" + builtin + "\n--- jinja\n" + jinja);
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE(ServerUnitFixture, test_normalize_openai_tool_argument_shapes) {
     ToolMemory tool_memory;
     const json nested = {
@@ -18528,6 +18716,8 @@ static PflashKeepHistoryRun run_keep_history_session(
             tools.is_array() && !tools.empty() ? tools.dump() : ""));
         cover += rendered.back();
     }
+    // The server's own text: the recall block the served prompt may carry.
+    cover += "[Earlier in this conversation]\n[End of earlier excerpts]\n";
     const std::string path = write_pflash_bpe_tokenizer_fixture(
         {"user", "assistant", "system", "\n", "tool"}, cover);
     Tokenizer tokenizer;
