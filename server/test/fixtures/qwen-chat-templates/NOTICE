@@ -1,0 +1,9 @@
+Chat templates copied byte for byte from the tokenizer.chat_template GGUF
+metadata of Unsloth's quantizations of the models below. Both models are
+released under the Apache License 2.0
+(https://www.apache.org/licenses/LICENSE-2.0).
+
+Qwen3.8-27B.jinja  Qwen3.8-27B-UD-IQ4_XS.gguf, base model Qwen/Qwen3.8-27B;
+                   includes Unsloth's template fixes (developer role, merged
+                   system messages, tool calling)
+Qwen3.5-9B.jinja   Qwen3.5-9B-Q4_K_M.gguf, base model Qwen/Qwen3.5-9B
