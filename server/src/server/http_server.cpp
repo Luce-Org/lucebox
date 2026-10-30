@@ -45,6 +45,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <memory>
 #include <climits>
 #include <cctype>
 #include <cmath>
@@ -4233,12 +4234,10 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
 bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
                                       bool count_tokens_only,
                                       RoutingAdmission * admission) {
-#if !defined(_WIN32)
     if (!count_tokens_only && req.format == ApiFormat::OPENAI_CHAT &&
         tool_checks::requested(req.raw_body, config_.tool_checks)) {
         return serve_with_tool_checks(fd, req, admission);
     }
-#endif
     try {
         const json & body = req.raw_body;
         if (!parse_common_request_fields(fd, body, req)) return true;
@@ -4386,16 +4385,86 @@ private:
 
 }  // namespace
 
-bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * admission,
-                                       int & status, std::string & body) {
+namespace {
+
+// shutdown() half-close that means "no more sending" on each platform.
 #if defined(_WIN32)
-    (void) request; (void) admission;
-    status = 501;
-    body = json({{"error", {{"message", "tool checks need socketpair"}}}}).dump();
+constexpr int kShutdownWrite = SD_SEND;
+#else
+constexpr int kShutdownWrite = SHUT_WR;
+#endif
+
+// A connected, blocking socket pair for an in-process round trip. POSIX has
+// socketpair(2); Windows does not, so a loopback listener stands in: the
+// writer and the reader only ever talk to each other.
+bool create_socket_pair(SocketHandle pair[2]) {
+#if defined(_WIN32)
+    SOCKET listener = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET) return false;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    int addr_len = static_cast<int>(sizeof(addr));
+    bool ok = ::bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0 &&
+              ::listen(listener, 1) == 0 &&
+              ::getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &addr_len) == 0;
+    SOCKET writer = INVALID_SOCKET;
+    SOCKET reader = INVALID_SOCKET;
+    if (ok) {
+        writer = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        ok = writer != INVALID_SOCKET &&
+             ::connect(writer, reinterpret_cast<sockaddr *>(&addr), addr_len) == 0;
+    }
+    if (ok) {
+        // Only the socket connected above may be accepted: another local
+        // process could otherwise win this accept race on our listener.
+        sockaddr_in expect{};
+        int expect_len = static_cast<int>(sizeof(expect));
+        ok = ::getsockname(writer, reinterpret_cast<sockaddr *>(&expect), &expect_len) == 0;
+        for (int attempt = 0; ok && attempt < 8 && reader == INVALID_SOCKET; ++attempt) {
+            sockaddr_in peer{};
+            int peer_len = static_cast<int>(sizeof(peer));
+            SOCKET candidate = ::accept(listener, reinterpret_cast<sockaddr *>(&peer), &peer_len);
+            if (candidate == INVALID_SOCKET) {
+                ok = false;
+                break;
+            }
+            if (peer.sin_family == expect.sin_family &&
+                peer.sin_port == expect.sin_port &&
+                peer.sin_addr.s_addr == expect.sin_addr.s_addr) {
+                reader = candidate;
+            } else {
+                ::closesocket(candidate);
+            }
+        }
+        ok = ok && reader != INVALID_SOCKET;
+    }
+    ::closesocket(listener);
+    if (!ok) {
+        if (writer != INVALID_SOCKET) ::closesocket(writer);
+        if (reader != INVALID_SOCKET) ::closesocket(reader);
+        return false;
+    }
+    pair[0] = writer;
+    pair[1] = reader;
     return true;
 #else
-    int pair[2];
-    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+    int fd[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fd) != 0) return false;
+    pair[0] = fd[0];
+    pair[1] = fd[1];
+    return true;
+#endif
+}
+
+}  // namespace
+
+bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * admission,
+                                       int & status, std::string & body,
+                                       bool * dropped_tool_call) {
+    SocketHandle pair[2];
+    if (!create_socket_pair(pair)) {
         status = 500;
         body = json({{"error", {{"message", std::string("socketpair: ") + sock_strerror()}}}}).dump();
         return true;
@@ -4416,11 +4485,14 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
         inner.raw_body = request;
         inner.output_format = http_detail::request_output_format(request.dump());
         parse_endpoint_request("/v1/chat/completions", inner.raw_body, inner, count_only);
+        auto dropped = std::make_shared<bool>(false);
+        inner.dropped_tool_call_out = dropped;
         handle_model_request(pair[0], inner, false, admission ? &outcome : nullptr);
+        if (dropped_tool_call) *dropped_tool_call = *dropped;
     } catch (const std::exception & e) {
         send_error(pair[0], 500, e.what());
     }
-    ::shutdown(pair[0], SHUT_WR);
+    ::shutdown(pair[0], kShutdownWrite);
     reader.join();
     socket_close(pair[0]);
     socket_close(pair[1]);
@@ -4432,7 +4504,6 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
     status = raw.size() > 12 && raw.rfind("HTTP/1.1 ", 0) == 0 ? std::atoi(raw.c_str() + 9) : 500;
     body = head_end == std::string::npos ? raw : raw.substr(head_end + 4);
     return true;
-#endif
 }
 
 bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
@@ -4460,20 +4531,23 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
     if (!admission) open_stream();
 
     // A pass that fails leaves the reply it would have replaced.
-    auto pass = [&](const json & body, json & response) {
+    auto pass = [&](const json & body, json & response, bool * dropped = nullptr) {
         if (http_detail::inspect_peer_socket(fd) == http_detail::PeerSocketState::Disconnected) {
             return false;
         }
         int status = 0;
         std::string raw;
-        if (!inner_chat_completion(body, nullptr, status, raw) || status != 200) return false;
+        bool dropped_here = false;
+        if (!inner_chat_completion(body, nullptr, status, raw, &dropped_here) || status != 200) return false;
+        if (dropped) *dropped = dropped_here;
         response = json::parse(raw, nullptr, false);
         return !response.is_discarded() && tc::reply_message(response) != nullptr;
     };
 
     int status = 0;
     std::string raw;
-    if (!inner_chat_completion(request, admission, status, raw)) return true;
+    bool dropped_call = false;
+    if (!inner_chat_completion(request, admission, status, raw, &dropped_call)) return true;
     json response = json::parse(raw, nullptr, false);
     json * reply = status == 200 && !response.is_discarded() ? tc::reply_message(response) : nullptr;
     if (!reply) {
@@ -4509,6 +4583,36 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
             tool_free = "dropped";
         }
     }
+    // A reply whose tool-call syntax produced no callable call has had that
+    // text dropped, so the turn would go out as prose and the work would never
+    // start. Re-ask once: the note names the tools this session has and asks
+    // for a call that can run. A dropped call is usually a call to a tool that
+    // does not exist here, but it can also be a declared tool whose arguments
+    // did not parse, so the note covers both without claiming which.
+    const char * dropped = "-";
+    if (!tools_off && dropped_call &&
+        (!reply->contains("tool_calls") || (*reply)["tool_calls"].empty())) {
+        // Record the attempt up front: a failed pass keeps the first reply, and
+        // the log still has to show that recovery was tried.
+        dropped = "kept";
+        json again;
+        bool again_dropped = false;
+        if (pass(tc::with_note(request, *reply, tc::dropped_call_note(request)), again,
+                 &again_dropped) && !again_dropped) {
+            // The first reply's tool text was suppressed, so keeping it would
+            // hand the client empty content. Any retry whose own call did not
+            // also drop is better: a tool call, or a plain answer.
+            json * again_reply = tc::reply_message(again);
+            if (again_reply) {
+                const bool retried_with_call =
+                    again_reply->contains("tool_calls") &&
+                    !(*again_reply)["tool_calls"].empty();
+                response = std::move(again);
+                reply = tc::reply_message(response);
+                dropped = retried_with_call ? "replanned" : "answered";
+            }
+        }
+    }
     if (!tools_off && tc::needs_replan(*reply)) {
         json again;
         json * again_reply = pass(tc::with_note(request, *reply, tc::kReplanNote), again)
@@ -4534,8 +4638,10 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
             final_check = "more_work";
         }
     }
-    std::fprintf(stderr, "[tool-checks] %s tool_free=%s replan=%s final_check=%s ms=%lld\n",
-                 response.value("id", std::string()).c_str(), tool_free, replan, final_check,
+    std::fprintf(stderr,
+                 "[tool-checks] %s tool_free=%s dropped=%s replan=%s final_check=%s ms=%lld\n",
+                 response.value("id", std::string()).c_str(), tool_free, dropped, replan,
+                 final_check,
                  (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - started).count());
 
@@ -10275,6 +10381,11 @@ void HttpServer::send_nonstream_response(
 
     const json response = build_non_streaming_response(
         req, result, n_gen_cap, gen_timings, counts, emitter, &tokenizer_);
+    // The tool buffer is parsed while the response is built, so the flag is
+    // only readable now.
+    if (req.dropped_tool_call_out && emitter.dropped_tool_call()) {
+        *req.dropped_tool_call_out = true;
+    }
 
     const std::string body = response.dump() + "\n";
     if (send_buffer) {
@@ -10637,6 +10748,11 @@ void HttpServer::process_job(ServerJob * job) {
     } else if (!req.stream && !client_disconnected) {
         const json response = build_non_streaming_response(
             req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
+        // The tool buffer is parsed while the response is built, so the flag is
+        // only readable now.
+        if (req.dropped_tool_call_out && emitter.dropped_tool_call()) {
+            *req.dropped_tool_call_out = true;
+        }
         remember_agent_turn(
             req, prepared, cache, result, emitter, completion_tokens,
             visible_output_seen, client_disconnected,

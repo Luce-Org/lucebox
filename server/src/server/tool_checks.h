@@ -3,13 +3,17 @@
 // For an OpenAI chat request that carries tools, the server
 //   1. adds short working rules to the system message and turns thinking on,
 //      unless the client chose a thinking setting itself;
-//   2. re-plans a turn that calls two or more different tools at once: the
+//   2. re-asks once when a reply carried tool-call syntax that produced no
+//      callable call - it named a tool the request never declared, or its
+//      arguments did not parse: the call was dropped, so the model is told
+//      which tools this session has and asked to make a call that can run;
+//   3. re-plans a turn that calls two or more different tools at once: the
 //      calls would run together, so the model is asked to make now only the
 //      ones that need nothing from the others;
-//   3. checks a final answer given after tool results, once per user request:
+//   4. checks a final answer given after tool results, once per user request:
 //      the model goes through the request part by part, and its new turn is
 //      kept only if it makes tool calls that have not already failed;
-//   4. if the model calls a tool when tool_choice is "none", retry once with
+//   5. if the model calls a tool when tool_choice is "none", retry once with
 //      a note that tools are unavailable and skip the other tool checks; if
 //      the retry still calls one, its calls are dropped and its text is the
 //      answer, so no tool call reaches the client.
@@ -71,6 +75,12 @@ json agent_request(const json & body, const std::string & effort);
 
 // `request` continued with the model's `reply` and a note from the server.
 json with_note(const json & request, const json & reply, const char * note);
+json with_note(const json & request, const json & reply, const std::string & note);
+
+// Note for a turn whose tool call was dropped, either because it named a tool
+// the request never declared or because its arguments did not parse: lists the
+// tools that do exist and asks for a call that can run.
+std::string dropped_call_note(const json & request);
 
 // The assistant message of a chat.completion response, or nullptr.
 json * reply_message(json & response);

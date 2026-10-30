@@ -6,6 +6,7 @@
 #include <set>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace luce::common::tool_checks {
 
@@ -237,6 +238,39 @@ json agent_request(const json & body, const std::string & effort) {
 }
 
 json with_note(const json & request, const json & reply, const char * note) {
+    return with_note(request, reply, std::string(note));
+}
+
+std::string dropped_call_note(const json & request) {
+    std::vector<std::string> names;
+    if (request.contains("tools") && request["tools"].is_array()) {
+        for (const auto & tool : request["tools"]) {
+            const json & fn = tool.is_object() && tool.contains("function")
+                ? tool["function"] : tool;
+            if (!fn.is_object() || !fn.contains("name") || !fn["name"].is_string()) continue;
+            names.push_back(fn["name"].get<std::string>());
+        }
+    }
+    std::string note =
+        "Reviewer note, not from the user: your last message carried a tool call "
+        "that could not be run, either because the call did not parse or because "
+        "it named a tool that is not available in this session. ";
+    if (!names.empty()) {
+        note += "The tools you can call here are: ";
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (i) note += ", ";
+            note += names[i];
+        }
+        note += ". ";
+    }
+    note +=
+        "Make now the call that actually gets this step done, using one of those "
+        "tools, or answer as text if none of them fits. Do not mention this note "
+        "in your reply.";
+    return note;
+}
+
+json with_note(const json & request, const json & reply, const std::string & note) {
     json next = request;
     json assistant = {{"role", "assistant"}, {"content", text_of(reply.value("content", json()))}};
     if (!calls_of(reply).empty()) assistant["tool_calls"] = calls_of(reply);

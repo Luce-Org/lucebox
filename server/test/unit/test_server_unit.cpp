@@ -12,6 +12,7 @@
 
 #include "server/sse_emitter.h"
 #include "server/tool_parser.h"
+#include "server/tool_checks.h"
 #include "server/model_card.h"
 #include "server/response_error.h"
 #include "server/prefix_cache.h"
@@ -20606,4 +20607,51 @@ TEST_CASE(ServerUnitFixture, test_last_error_is_per_thread) {
     other.join();
     TEST_ASSERT(seen_by_other == "drafter error");
     TEST_ASSERT(std::string(luce_last_error()) == "scheduler error");
+}
+
+// ---------------------------------------------------------------------------
+// Undeclared-tool recovery: the emitter reports a buffered call that produced
+// no callable call, and the tool-check note names the tools that do exist.
+// ---------------------------------------------------------------------------
+
+TEST_CASE(ServerUnitFixture, test_emitter_flags_dropped_undeclared_tool_call) {
+    const json tools = shell_tools();
+    const std::string declared = tools[0]["name"].get<std::string>();
+
+    // A call to a tool that was never declared keeps no call and is reported.
+    SseEmitter dropped = make_emitter(ApiFormat::ANTHROPIC, tools);
+    dropped.emit_start();
+    for (const auto & e : dropped.emit_token(
+             "Looking around.\n<tool_call>\n<function=search_files>\n"
+             "<parameter=pattern>\n*.db\n</parameter>\n</function>\n</tool_call>"))
+        (void) e;
+    for (const auto & e : dropped.emit_finish(20)) (void) e;
+    TEST_ASSERT(dropped.tool_calls().empty());
+    TEST_ASSERT(dropped.dropped_tool_call());
+
+    // The same syntax naming the declared tool stays a normal call.
+    SseEmitter kept = make_emitter(ApiFormat::ANTHROPIC, tools);
+    kept.emit_start();
+    for (const auto & e : kept.emit_token(
+             "Running.\n<tool_call>\n<function=" + declared +
+             ">\n<parameter=command>\ngit status\n</parameter>\n</function>\n</tool_call>"))
+        (void) e;
+    for (const auto & e : kept.emit_finish(20)) (void) e;
+    TEST_ASSERT(kept.tool_calls().size() == 1);
+    TEST_ASSERT(!kept.dropped_tool_call());
+}
+
+TEST_CASE(ServerUnitFixture, test_undeclared_note_names_declared_tools) {
+    const json tools = shell_tools();
+    const std::string declared = tools[0]["name"].get<std::string>();
+    const json request = {{"model", "test-model"}, {"tools", tools}};
+    const std::string note = tool_checks::undeclared_note(request);
+    TEST_ASSERT(note.find("not available in this session") != std::string::npos);
+    TEST_ASSERT(note.find(declared) != std::string::npos);
+
+    // Without declared tools the note still explains the situation.
+    const json bare = {{"model", "test-model"}};
+    const std::string bare_note = tool_checks::undeclared_note(bare);
+    TEST_ASSERT(!bare_note.empty());
+    TEST_ASSERT(bare_note.find("The tools you can call here are") == std::string::npos);
 }

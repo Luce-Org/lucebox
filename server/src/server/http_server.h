@@ -36,6 +36,7 @@
 #include "pflash_unified.h"
 #include "pflash/pflash_selection.h"
 #include <nlohmann/json.hpp>
+#include <memory>
 
 #include <atomic>
 #include <array>
@@ -807,6 +808,11 @@ struct ParsedRequest {
     json                      tools;
     // Tool choice constraint (stored for hint generation)
     json                      tool_choice;
+    // The reply carried tool-call syntax that produced no callable call, so
+    // the text was dropped instead of sent. Tool checks re-ask once on this.
+    // A shared target, because the worker that builds the response owns a
+    // copy of this request.
+    std::shared_ptr<bool>     dropped_tool_call_out;
     // Original messages (for response formatting)
     json                      messages;
     // Original request body (for upstream proxy forwarding)
@@ -1004,7 +1010,8 @@ private:
     // admission turned it away (nothing was sent); otherwise `status` and
     // `body` hold the HTTP response.
     bool inner_chat_completion(const json & request, RoutingAdmission * admission,
-                               int & status, std::string & body);
+                               int & status, std::string & body,
+                               bool * dropped_tool_call = nullptr);
     json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the

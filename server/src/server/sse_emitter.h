@@ -132,6 +132,11 @@ public:
     // Get the parsed tool calls (after emit_finish).
     const std::vector<ToolCall> & tool_calls() const { return tool_calls_; }
 
+    // True when the reply carried tool-call syntax that produced no call this
+    // request was allowed to make (an undeclared name, or a body the parser
+    // could not read), so the text was dropped instead of sent as content.
+    bool dropped_tool_call() const { return dropped_tool_call_; }
+
     // Get the reasoning text (after emit_finish).
     const std::string & reasoning_text() const { return reasoning_text_; }
 
@@ -203,6 +208,7 @@ private:
     std::string  utf8_tail_;
     std::string  tool_buffer_;      // accumulated tool text
     bool         tool_buffer_fallback_to_content_ = false;
+    bool         dropped_tool_call_ = false;
     std::string  accumulated_content_;
     std::string  accumulated_raw_;  // all raw text for tool memory
     std::string  reasoning_text_;

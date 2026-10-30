@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -27,6 +28,7 @@ static bool starts_with_potential_bare_json_tool(const std::string & text,
     size_t first = text.find_first_not_of(" \t\n\r");
     return first != std::string::npos && text[first] == '{';
 }
+
 
 static std::string gen_item_id() {
     static std::atomic<uint64_t> ctr{0};
@@ -951,6 +953,9 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                 "request_id=%s format=%d bytes=%zu text='%s'\n",
                 request_id_.c_str(), (int)format_, tool_buffer_.size(),
                 escaped.c_str());
+            // Any call that failed to parse is a lost turn: the text is not
+            // sent and nothing runs, whatever the reason the parser rejected it.
+            dropped_tool_call_ = true;
 
             if (tool_from_reasoning_) {
                 size_t think_close = find_top_level_think_close(tool_buffer_, tools_);
