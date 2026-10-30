@@ -60,6 +60,7 @@ Untagged variables are operational tuning knobs.
 | `LUCE_GPU_BACKEND` / `LUCE_BACKEND_CUDA` / `LUCE_BACKEND_HIP` | Backend selection (build/compile-time). |
 | `LUCE_HIP_NO_AUTO_UMA` | Disable automatic HIP UMA (unified memory) selection. |
 | `LUCE_HIP_UMA_MIN_FRAC` | Minimum VRAM fraction before HIP UMA kicks in. |
+| `LUCE_HIP_UMA_NO_RAM_CHECK` | 🔀 **kill-switch** Skip the check that fails a managed buffer on an integrated GPU when it does not fit in available RAM, and the bound of an integrated GPU's free memory by that RAM (`ggml_backend_cuda_get_device_memory`, `ggml_backend_cuda_get_device_room`). |
 | `LUCE_WAVE_SIZE` | HIP wave size (compile flag, e.g. gfx1151 needs 32). |
 
 ## Speculative decoding — drafter

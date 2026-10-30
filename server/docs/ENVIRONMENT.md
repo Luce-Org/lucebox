@@ -50,6 +50,7 @@ profile and the requirements checked at startup.
 | `GGML_CUDA_GRAPH_STATS` | unset | DEBUG: per-graph CUDA-graph replay/capture/eager counters. |
 | `GGML_CUDA_GRAPH_STATS_EVERY` | 200 | DEBUG: print period for the stats above (clamped to >=1). |
 | `LUCE_HIP_NO_AUTO_UMA` | unset | Disables automatic unified-memory placement on integrated GPUs. The qwen4exp gfx1151 profile disables it through a scoped code setting, without changing the environment. |
+| `LUCE_HIP_UMA_NO_RAM_CHECK` | unset | KILL SWITCH (burn-in, to be removed once the check has soaked): set to any value, even `0`, to let a managed (unified) buffer on an integrated GPU through even when it is larger than the available RAM (MemAvailable plus the pages the GPU driver holds for reuse) minus a reserve (1/16 of RAM, 1 to 8 GiB). By default such a buffer fails up front as out of memory: a managed allocation does not fail for lack of RAM, so a shortfall would otherwise end in the OOM killer. Inside a container, the room under its cgroup memory limit bounds the available RAM. It also stops the bound of an integrated GPU's free memory by its own VRAM left plus the available RAM (`ggml_backend_cuda_get_device_memory`, and `ggml_backend_cuda_get_device_room` with the reserve kept, which DeepSeek sizes its Strix expert stack, streamed expert cache and load check from): they then report the runtime's figures. |
 | `LUCE_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |
 | `LUCE_ADAPTIVE_K_DENSE` | per-model default | CSV of MoE layers kept dense under adaptive-K (DFlash capture layers). Warned-inert on families that do not thread layer indices yet. |
 | `LUCE_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. |
@@ -174,6 +175,7 @@ profile and the requirements checked at startup.
 - `LUCE_MIX_WMMA_MIN_TOKENS` - ggml-cuda/mix-wmma-moe.cu
 - `LUCE_MIX_WMMA_BN` - ggml-cuda/mix-wmma-moe.cu
 - `LUCE_MIX_WMMA_GLU` - ggml-cuda/ggml-cuda.cu
+- `LUCE_HIP_UMA_NO_RAM_CHECK` - ggml-cuda/ggml-cuda.cu (KILL SWITCH: set to any value to skip the RAM check of managed buffers on integrated GPUs and the RAM bound of their free memory)
 - `LUCE_CUDA_MMVQ_FP4_X4` - deepseek4_backend.cpp, mmvq.cu
 - `LUCE_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS` - moe_hybrid_ffn_eval.cpp
 - `LUCE_CUDA_MMVQ_MOE_FP3_PACKED24` - deepseek4_backend.cpp, mmvq.cu

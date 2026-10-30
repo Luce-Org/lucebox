@@ -139,11 +139,12 @@ bool device_free(ggml_backend_t backend, ImageMemoryDomain domain, uint64_t & av
     ggml_backend_dev_memory(ggml_backend_get_device(backend), &free, &total);
     if (!total) return fail(error, "device memory query returned no capacity");
     // GGML's UMA query can legitimately report free RAM above dedicated total.
+    // For a host-shared device (integrated, or GGML_CUDA_ENABLE_UNIFIED_MEMORY,
+    // as the query decides it too) it already counts the pages the amdgpu
+    // driver holds for reuse, where they can be estimated at all
+    // (ggml_cuda_uma_shared_free_bytes); dedicated VRAM has no such pool.
+    (void) domain;
     available = free;
-    // A host-shared device reports MemAvailable, which leaves out the pages the
-    // GPU driver holds for reuse. Dedicated VRAM has no such pool.
-    if (domain == ImageMemoryDomain::HostShared &&
-        !add(available, common::reclaimable_gpu_page_pool_bytes())) return fail(error, "device availability overflow");
     return true;
 }
 } // namespace

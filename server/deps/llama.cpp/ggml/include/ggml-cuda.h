@@ -135,7 +135,20 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(v
 
 GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
+// The runtime's figures (cudaMemGetInfo); on an integrated GPU at most what its
+// allocations can take, its own VRAM left plus the RAM available now
+// (ggml-cuda/uma-budget.h), since the runtime's free need not follow what is
+// allocated there. LUCE_HIP_UMA_NO_RAM_CHECK set leaves them as they are.
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
+// The same, keeping out of the RAM the reserve of the managed-buffer check (1/16 of
+// RAM, 1 to 8 GiB). True when that bound applied; discrete GPUs, an unknown RAM and
+// LUCE_HIP_UMA_NO_RAM_CHECK set get the runtime's figures and false.
+GGML_BACKEND_API bool ggml_backend_cuda_get_device_room(int device, size_t * free, size_t * total);
+// What an integrated GPU's allocations can take with those that spill to (locked) host
+// memory: its own VRAM left plus the RAM a managed buffer could take now, whatever its
+// runtime reports, which on an APU with a large carve may be the carve alone. False,
+// `room` untouched, where ggml_backend_cuda_get_device_room returns false.
+GGML_BACKEND_API bool ggml_backend_cuda_get_uma_room(int device, size_t * room);
 
 // Current compute stream of a CUDA/HIP backend (cudaStream_t / hipStream_t
 // returned as an opaque pointer), so work submitted outside ggml can be

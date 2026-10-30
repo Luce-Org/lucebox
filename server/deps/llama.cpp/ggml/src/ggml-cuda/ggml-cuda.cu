@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/uma-budget.h"
 #include "ggml-cuda/vision-bias.cuh"
 #include "ggml-cuda/vision-rotary.cuh"
 #include "ggml-cuda/vision-softmax.cuh"
@@ -323,6 +324,20 @@ static bool ggml_cuda_device_is_integrated(int device) {
     return device >= 0 && device < GGML_CUDA_MAX_DEVICES && integrated[device];
 }
 
+static bool ggml_cuda_device_has_managed_memory(int device) {
+    static const std::array<bool, GGML_CUDA_MAX_DEVICES> managed = []() {
+        std::array<bool, GGML_CUDA_MAX_DEVICES> flags{};
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess) { n = 0; }
+        for (int i = 0; i < n && i < GGML_CUDA_MAX_DEVICES; i++) {
+            cudaDeviceProp prop;
+            flags[i] = (cudaGetDeviceProperties(&prop, i) == cudaSuccess && prop.managedMemory);
+        }
+        return flags;
+    }();
+    return device >= 0 && device < GGML_CUDA_MAX_DEVICES && managed[device];
+}
+
 static bool ggml_cuda_device_use_uma(int device, size_t size) {
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         return true;
@@ -486,11 +501,77 @@ size_t ggml_backend_cuda_host_spill_bytes(int device) {
     return g_host_spill[device].host_used;
 }
 
+#if defined(__linux__)
+// RAM a managed allocation on an integrated GPU can take now (ggml-cuda/uma-budget.h):
+// MemAvailable plus the driver's page pool, within cgroup limits. False when unknown.
+// `pool_known`, when given, says whether the pool could be estimated (amdgpu's counters),
+// and `mem_available` gets MemAvailable alone.
+static bool ggml_cuda_uma_ram_available(uint64_t * available, bool * pool_known = nullptr,
+                                        uint64_t * mem_available = nullptr) {
+    std::string meminfo;
+    uint64_t live_gpu_host = 0;
+    const bool live_known = ggml_cuda_uma_live_gpu_host_bytes(&live_gpu_host);
+    uint64_t cgroup_room = 0;
+    const bool limited = ggml_cuda_uma_cgroup_room_bytes(&cgroup_room);
+    if (pool_known) {
+        *pool_known = live_known;
+    }
+    if (!ggml_cuda_uma_read_meminfo(&meminfo) ||
+        !ggml_cuda_uma_available_bytes(meminfo.c_str(), live_known ? &live_gpu_host : nullptr,
+                                       limited ? &cgroup_room : nullptr, available)) {
+        return false;
+    }
+    if (mem_available) {
+        (void) ggml_cuda_uma_available_bytes(meminfo.c_str(), nullptr, nullptr, mem_available);
+    }
+    return true;
+}
+#endif // defined(__linux__)
+
+// A managed allocation on an integrated GPU can succeed for more memory than is
+// free, so check it against the RAM available now (ggml-cuda/uma-budget.h) and
+// fail it like any out-of-memory allocation. Bypass: LUCE_HIP_UMA_NO_RAM_CHECK=1.
+static bool ggml_cuda_uma_ram_admits(int device, size_t size) {
+#if defined(__linux__)
+    if (getenv("LUCE_HIP_UMA_NO_RAM_CHECK") != nullptr || !ggml_cuda_device_is_integrated(device)) {
+        return true;
+    }
+    uint64_t available = 0;
+    if (!ggml_cuda_uma_ram_available(&available)) {
+        return true; // RAM unknown: admit, as before the check existed
+    }
+    const size_t total_ram = ggml_cuda_total_ram_bytes();
+    if (ggml_cuda_uma_alloc_fits(size, (size_t) available, total_ram)) {
+        return true;
+    }
+    GGML_LOG_ERROR("ggml_cuda: device %d managed alloc %.1f GiB does not fit in %.1f GiB available RAM "
+                   "(with the GPU driver's reclaimable pages, within cgroup limits) minus a %.1f GiB reserve; "
+                   "failing it as out of memory "
+                   "(LUCE_HIP_UMA_NO_RAM_CHECK=1 to bypass)\n",
+                   device, (double) size / 1073741824.0, (double) available / 1073741824.0,
+                   (double) ggml_cuda_uma_reserve_bytes(total_ram) / 1073741824.0);
+    return false;
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(size);
+    return true;
+#endif // defined(__linux__)
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device, bool * out_managed = nullptr) {
     ggml_cuda_set_device(device);
     cudaError_t err;
     bool managed = false;
     if (ggml_cuda_device_use_uma(device, size)) {
+        // Only buffers (out_managed set) are checked: their allocation failure
+        // reaches the caller as a null buffer, while the pools and split
+        // tensors abort on any error (CUDA_CHECK). A device without managed
+        // memory is not: its cudaMallocManaged fails as unsupported and the
+        // buffer takes the cudaMalloc fallback below.
+        if (out_managed != nullptr && ggml_cuda_device_has_managed_memory(device) &&
+            !ggml_cuda_uma_ram_admits(device, size)) {
+            return cudaErrorMemoryAllocation;
+        }
         err = cudaMallocManaged(ptr, size);
         if (err == cudaSuccess) {
             managed = true;
@@ -531,7 +612,8 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device,
         // memory so the carve and GTT are usable together; same opt-out as
         // the auto-UMA path above.
         if (err != cudaSuccess && !ggml_cuda_qwen4exp_enabled() && getenv("LUCE_HIP_NO_AUTO_UMA") == nullptr &&
-            ggml_cuda_device_is_integrated(device)) {
+            ggml_cuda_device_is_integrated(device) &&
+            (out_managed == nullptr || ggml_cuda_uma_ram_admits(device, size))) {
             (void)hipGetLastError();
             err = cudaMallocManaged(ptr, size);
             if (err == cudaSuccess) {
@@ -7590,10 +7672,104 @@ void ggml_backend_cuda_get_device_description(int device, char * description, si
     snprintf(description, description_size, "%s", prop.name);
 }
 
+#if defined(__linux__)
+// Own VRAM (the BIOS carve) of an amdgpu device, read from sysfs under its PCI
+// bus id (ggml-cuda/uma-budget.h). False when the device reports none.
+static bool ggml_cuda_device_carve(int device, uint64_t * total, uint64_t * used) {
+    static const std::array<std::string, GGML_CUDA_MAX_DEVICES> pci_bus_ids = []() {
+        std::array<std::string, GGML_CUDA_MAX_DEVICES> ids{};
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess) { n = 0; }
+        for (int i = 0; i < n && i < GGML_CUDA_MAX_DEVICES; i++) {
+            cudaDeviceProp prop;
+            if (cudaGetDeviceProperties(&prop, i) == cudaSuccess) {
+                char id[16] = {};
+                snprintf(id, sizeof(id), "%04x:%02x:%02x.0", prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+                ids[i] = id;
+            }
+        }
+        return ids;
+    }();
+    return device >= 0 && device < GGML_CUDA_MAX_DEVICES && !pci_bus_ids[device].empty() &&
+           ggml_cuda_uma_carve_bytes(pci_bus_ids[device], total, used);
+}
+
+// What an integrated GPU's allocations can take, in parts: the RAM available
+// now, less the reserve of the managed-buffer check when `keep_reserve`, else
+// as the device interface counts it (ggml_cuda_uma_shared_ram_bytes), and its
+// own VRAM (ggml_cuda_uma_room_bytes adds them up). False for a discrete GPU,
+// an unknown RAM or LUCE_HIP_UMA_NO_RAM_CHECK set.
+static bool ggml_cuda_uma_room_parts(int device, bool keep_reserve, uint64_t * ram, uint64_t * carve_total,
+                                     uint64_t * carve_used) {
+    if (getenv("LUCE_HIP_UMA_NO_RAM_CHECK") != nullptr || !ggml_cuda_device_is_integrated(device)) {
+        return false;
+    }
+    uint64_t mem_available = 0;
+    if (!ggml_cuda_uma_ram_available(ram, nullptr, &mem_available)) {
+        return false;
+    }
+    const size_t total_ram = ggml_cuda_total_ram_bytes();
+    if (keep_reserve) {
+        const uint64_t reserve = ggml_cuda_uma_reserve_bytes(total_ram);
+        *ram = *ram > reserve ? *ram - reserve : 0;
+    } else {
+        *ram = ggml_cuda_uma_shared_ram_bytes(mem_available, *ram, total_ram);
+    }
+    // A device that does not report its own VRAM is taken to have none.
+    if (!ggml_cuda_device_carve(device, carve_total, carve_used)) {
+        *carve_total = *carve_used = 0;
+    }
+    return true;
+}
+
+// Bounds an integrated GPU's runtime figures by that room
+// (ggml_cuda_uma_bound_device_memory); false, the figures as they are, where
+// ggml_cuda_uma_room_parts has none.
+static bool ggml_cuda_uma_bound(int device, size_t * free, size_t * total, bool keep_reserve) {
+    uint64_t ram = 0, carve_total = 0, carve_used = 0;
+    if (!ggml_cuda_uma_room_parts(device, keep_reserve, &ram, &carve_total, &carve_used)) {
+        return false;
+    }
+    ggml_cuda_uma_bound_device_memory(free, total, carve_total, carve_used, ram, ggml_cuda_total_ram_bytes());
+    return true;
+}
+#endif // defined(__linux__)
+
 void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total) {
     ggml_cuda_set_device(device);
 
     CUDA_CHECK(cudaMemGetInfo(free, total));
+#if defined(__linux__)
+    // lucebox: an integrated GPU's runtime free need not follow what it has
+    // allocated; at most its own VRAM left plus the RAM available (uma-budget.h).
+    ggml_cuda_uma_bound(device, free, total, false);
+#endif // defined(__linux__)
+}
+
+bool ggml_backend_cuda_get_device_room(int device, size_t * free, size_t * total) {
+    ggml_cuda_set_device(device);
+    CUDA_CHECK(cudaMemGetInfo(free, total));
+#if defined(__linux__)
+    return ggml_cuda_uma_bound(device, free, total, true);
+#else
+    GGML_UNUSED(device);
+    return false;
+#endif // defined(__linux__)
+}
+
+bool ggml_backend_cuda_get_uma_room(int device, size_t * room) {
+#if defined(__linux__)
+    uint64_t ram = 0, carve_total = 0, carve_used = 0;
+    if (!ggml_cuda_uma_room_parts(device, true, &ram, &carve_total, &carve_used)) {
+        return false;
+    }
+    *room = (size_t) ggml_cuda_uma_room_bytes(carve_total, carve_used, ram);
+    return true;
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(room);
+    return false;
+#endif // defined(__linux__)
 }
 
 void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
@@ -7670,7 +7846,8 @@ static const char * ggml_backend_cuda_device_get_description(ggml_backend_dev_t 
 
 #if defined(__linux__)
 // Helper function to get available memory from /proc/meminfo for UMA systems
-static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_kb, long * free_swap_kb) {
+static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_kb, long * free_swap_kb,
+                                                       bool * huge_pages = nullptr) {
     FILE * meminfo_file = nullptr;
     // 2KB buffer for reading /proc/meminfo since it does not report size info, should be enough
     const size_t BUFFER_SIZE = 2048;
@@ -7738,6 +7915,9 @@ static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_k
         // Hugetlbfs pages are not swappable.
         *free_swap_kb = 0;
     }
+    if (huge_pages) {
+        *huge_pages = huge_tlb_total_pages != 0 && huge_tlb_total_pages != -1;
+    }
 
     GGML_LOG_DEBUG("%s: final available_memory_kb: %ld\n", __func__, *available_memory_kb);
     return true;
@@ -7760,14 +7940,41 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
     bool is_uma = prop.integrated > 0 || uma_env;
 
     if (is_uma) {
+        const size_t runtime_free = *free;
         // For UMA systems (like DGX Spark), use system memory info
         long available_memory_kb = 0;
         long free_swap_kb = 0;
+        bool huge_pages = false;
 
-        if (ggml_backend_cuda_get_available_uma_memory(&available_memory_kb, &free_swap_kb) && available_memory_kb > 0) {
+        if (ggml_backend_cuda_get_available_uma_memory(&available_memory_kb, &free_swap_kb, &huge_pages) && available_memory_kb > 0) {
             *free = (size_t)available_memory_kb * 1024;
         } else {
             GGML_LOG_ERROR("%s: /proc/meminfo reading failed, using cudaMemGetInfo\n", __func__);
+        }
+
+        // lucebox: with amdgpu's counters, also the driver's page pool beyond
+        // the managed-buffer reserve, which MemAvailable leaves out, within
+        // cgroup limits (ggml_cuda_uma_shared_ram_bytes); an integrated GPU's
+        // total at most its own VRAM plus RAM (uma-budget.h,
+        // ggml_cuda_uma_shared_free_bytes). Allocations that stay in the device
+        // heap (ggml_cuda_uma_heap_only) keep the runtime's free as their
+        // limit. Free huge pages, and GPUs without amdgpu's counters (DGX
+        // Spark), keep the figure above.
+        uint64_t available = 0, mem_available = 0;
+        bool pool_known = false;
+        if (!huge_pages && ggml_cuda_uma_ram_available(&available, &pool_known, &mem_available) && pool_known) {
+            const bool heap_only = ggml_cuda_uma_heap_only(
+                ggml_cuda_device_has_managed_memory(ctx->device), uma_env,
+                ggml_cuda_qwen4exp_enabled() || getenv("LUCE_HIP_NO_AUTO_UMA") != nullptr);
+            const uint64_t shared_ram = ggml_cuda_uma_shared_ram_bytes(mem_available, available, ggml_cuda_total_ram_bytes());
+            *free = ggml_cuda_uma_shared_free_bytes(runtime_free, shared_ram, heap_only);
+            uint64_t carve_total = 0, carve_used = 0;
+            if (prop.integrated > 0 && ggml_cuda_device_carve(ctx->device, &carve_total, &carve_used)) {
+                const uint64_t capacity = carve_total + ggml_cuda_total_ram_bytes();
+                if (capacity < *total) {
+                    *total = (size_t) capacity;
+                }
+            }
         }
     }
 #endif // defined(__linux__)
