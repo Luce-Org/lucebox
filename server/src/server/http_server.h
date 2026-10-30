@@ -292,6 +292,9 @@ struct ServerConfig {
     // the Anthropic tool_use envelope, e.g. froggeric Qwen3.6 template.
     std::string chat_template_src;          // literal Jinja source (loaded from file)
     std::string chat_template_path;         // path it was loaded from (logged at startup)
+    // The GGUF template's rules the built-in Qwen renderer follows (past
+    // thinking, effort line); unused when chat_template_src is set.
+    QwenTemplateRules qwen_template_rules;
 
     // Expert frequency tracking (--freq): print frequency analysis at shutdown.
     bool        freq_tracking = false;
@@ -852,10 +855,10 @@ struct ParsedRequest {
     // hard_limit_reply_budget. Values are already clamped to those ceilings.
     int                       per_req_phase1_cap   = -1;
     int                       per_req_reply_budget = -1;
-    // Jinja-path only: `preserve_thinking` from `chat_template_kwargs`.
-    // Tri-state: -1 = not set (template default applies, typically true),
-    // 0 = false, 1 = true. Controls whether official templates (e.g.
-    // qwen4exp) replay earlier assistant turns' recorded <think> block
+    // `preserve_thinking` from `chat_template_kwargs`. Tri-state: -1 = not
+    // set (template default applies), 0 = false, 1 = true. Templates that
+    // read it (e.g. Qwen3.8, qwen4exp), and the built-in Qwen renderer
+    // following them, replay earlier assistant turns' recorded <think> block
     // (message.reasoning_content) or strip it.
     int                       preserve_thinking = -1;
     // Stop sequences (OpenAI "stop" + Anthropic "stop_sequences")

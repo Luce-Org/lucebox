@@ -2693,6 +2693,8 @@ if(LUCE_TESTS)
                 LUCE_BACKEND_CUDA=1
                 LUCE_CUDA_MIN_SM=${_luce_cuda_min_sm})
         endif()
+        target_compile_definitions(test_server_unit PRIVATE
+            LUCE_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
         if(CURL_FOUND)
             target_compile_definitions(test_server_unit PRIVATE LUCE_HAS_CURL=1)
         endif()

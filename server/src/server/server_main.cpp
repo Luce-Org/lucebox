@@ -2002,6 +2002,21 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         std::fprintf(stderr, "[server] using the GGUF chat template (%zu bytes)\n",
                      sconfig.chat_template_src.size());
     }
+    // The built-in Qwen renderer follows the GGUF template on earlier turns'
+    // thinking and on the effort line.
+    if (sconfig.chat_template_src.empty() && chat_format_for_arch(general_arch) == ChatFormat::QWEN3) {
+        sconfig.qwen_template_rules = qwen_template_rules(backend_model.metadata.chat_template);
+        const auto & rules = sconfig.qwen_template_rules;
+        std::string efforts;
+        for (const auto & [effort, line] : rules.effort_lines) efforts += (efforts.empty() ? "" : ",") + effort;
+        std::fprintf(stderr,
+                     "[server] GGUF chat template: earlier turns %s their thinking%s; "
+                     "turns without reasoning %s; effort lines: %s\n",
+                     rules.keeps_past_thinking ? "keep" : "drop",
+                     rules.reads_preserve_thinking ? " (preserve_thinking overrides)" : "",
+                     rules.empty_thinking ? "get an empty thinking block" : "render as text only",
+                     efforts.empty() ? "none" : efforts.c_str());
+    }
 
     // Apply each tunable to sconfig only if the operator did NOT set it
     // via CLI. CLI always wins (spec §3.1 source #1).
