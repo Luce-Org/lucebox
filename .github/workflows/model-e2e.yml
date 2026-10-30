@@ -1,0 +1,314 @@
+name: Model e2e
+
+# Real model runs on lucebox3: build luce_server for one GPU, load a model, send
+# a fixed prompt suite with greedy decoding (.github/ci/e2e/prompts.json) and
+# compare with the last good run on main (the baseline). Qwen3.8-27B runs on the
+# R9700, DeepSeek V4 Flash on the Strix Halo iGPU. Per-model files, flags and
+# GPUs live in .github/ci/e2e/select_models.py.
+#
+# What fails the job: a crash, hang, GPU error in the kernel log, a server that will
+# not load or stop, a failed request, or two or more checks that passed on the
+# baseline and now fail. Changed output text, a single regressed check, slower
+# decode or slower loading only warn: kernel changes legitimately flip near-tie
+# tokens. See run_model_e2e.py for the details.
+#
+# When it runs:
+#   - only when a maintainer adds the `e2e` label to a PR. It runs the models the
+#     PR touches (select_models.py), or every model when it touches neither DS4,
+#     Qwen nor shared server code. To test new pushes, remove the label and add
+#     it again;
+#   - on every merge to main, for the models whose code changed since their
+#     baseline. A run that does not fail becomes the new baseline;
+#   - on manual dispatch (refreshes the baselines when `update_baseline` is
+#     ticked on main).
+#
+# Baselines: baseline runs on main upload their result as the artifact
+# `model-e2e-baseline-<model>-<device>`, and every job compares with the newest
+# one (find_baseline.py).
+#
+# Bounded: 35 minutes per job. If someone is using lucebox3's GPUs by hand it
+# waits up to 4 minutes, then skips with a warning rather than failing. A clean
+# pass is remembered by tree hash, configuration and baseline, so re-running
+# identical code against the same baseline is instant.
+#
+# Measured on lucebox5 (same hardware): a cold luce_server build takes ~100 s per
+# architecture; the suite takes ~30 s for Qwen and ~80 s for DS4 including a warm
+# model load.
+#
+# SECURITY: same model as ci.yml. Fork PRs run only after a maintainer approves
+# the run, and only users with triage access can add the `e2e` label. Baselines
+# are only taken from pushes to or dispatched runs on main, so PR code cannot
+# replace them. The build directory and remembered passes persist on lucebox3
+# (~/.cache/lucebox-e2e), so approved PR code could tamper with them. Clear that
+# directory if you suspect it.
+#
+# Models are read from vars.LUCEBOX_MODELS_DIR, default /opt/models.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [labeled]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      models:
+        description: Models to run
+        type: choice
+        options: [all, qwen, ds4]
+        default: all
+      update_baseline:
+        description: Upload passing results as the new baseline (main only)
+        type: boolean
+        default: false
+
+# Re-adding `e2e` replaces a PR's running e2e. The label is part of the group so
+# that adding any other label (a run whose jobs all skip) cancels nothing. Runs
+# on main never cancel a running one; a newer merge may replace a waiting one,
+# which is fine because it runs everything changed since the baselines.
+concurrency:
+  group: model-e2e-${{ github.ref }}-${{ github.event.label.name || github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  actions: read # find and download the baseline artifacts
+  contents: read
+  pull-requests: read
+
+jobs:
+  select:
+    name: Select models
+    if: github.event_name != 'pull_request' || github.event.label.name == 'e2e'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      any: ${{ steps.pick.outputs.any }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          sparse-checkout: .github/ci/e2e
+
+      - name: Pick models
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          DISPATCH_MODELS: ${{ inputs.models }}
+        run: |
+          set -euo pipefail
+          select=.github/ci/e2e/select_models.py
+          case "$EVENT" in
+            pull_request)
+              matrix=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename' \
+                | python3 "$select" --mode paths --fallback-all)
+              ;;
+            workflow_dispatch)
+              matrix=$(python3 "$select" --mode "$DISPATCH_MODELS")
+              ;;
+            push) matrix=$(python3 "$select" --mode all) ;;
+          esac
+          only_changed=()
+          if [ "$EVENT" = push ]; then only_changed=(--only-changed "$GITHUB_SHA"); fi
+          matrix=$(python3 .github/ci/e2e/find_baseline.py --repo "$GITHUB_REPOSITORY" \
+            "${only_changed[@]}" <<<"$matrix")
+          echo "Selected: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "any=$(jq '.include | length > 0' <<<"$matrix")" >> "$GITHUB_OUTPUT"
+
+  e2e:
+    name: e2e ${{ matrix.model }} (${{ matrix.device_name }})
+    needs: select
+    if: needs.select.outputs.any == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    # The runner runs one job at a time, so e2e jobs never share lucebox3's GPUs
+    # with each other or with gpu-tests-amd.
+    runs-on: [self-hosted, lucebox3]
+    timeout-minutes: 35
+    env:
+      MODEL: ${{ matrix.model }}
+      DEVICE: ${{ matrix.device }}
+      ARCH: ${{ matrix.arch }}
+      HIP_VISIBLE_DEVICES: ${{ matrix.hip_index }}
+      SERVER_ARGS: ${{ matrix.server_args }}
+      OUT_DIR: ${{ github.workspace }}/e2e-out
+      UPDATE_BASELINE: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.update_baseline == true) }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: KFD health
+        run: |
+          set -euo pipefail
+          bash .github/ci/kfd_health.sh "$RUNNER_TEMP/rocminfo.out"
+          grep -qw "$ARCH" "$RUNNER_TEMP/rocminfo.out" || { echo "::error::no $ARCH GPU"; exit 1; }
+
+      - name: Download the baseline
+        if: matrix.baseline_run != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: model-e2e-baseline-${{ matrix.model }}-${{ matrix.device }}
+          run-id: ${{ matrix.baseline_run }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/baseline
+
+      - name: Check the models and earlier passes
+        id: cfg
+        env:
+          MODEL_DIR: ${{ vars.LUCEBOX_MODELS_DIR || '/opt/models' }}
+          TARGET_FILE: ${{ matrix.target }}
+          DRAFT_FILE: ${{ matrix.draft }}
+        run: |
+          set -euo pipefail
+          TARGET=$MODEL_DIR/$TARGET_FILE
+          DRAFT=${DRAFT_FILE:+$MODEL_DIR/$DRAFT_FILE}
+          BASELINE=$RUNNER_TEMP/baseline/baseline.json
+          state=$HOME/.cache/lucebox-e2e
+          mkdir -p "$state/passed"
+          {
+            echo "TARGET=$TARGET"
+            echo "DRAFT=$DRAFT"
+            echo "BASELINE=$BASELINE"
+            echo "BUILD_DIR=$state/build-$ARCH"
+          } >> "$GITHUB_ENV"
+
+          # The draft is part of the tested configuration, not optional: without
+          # it the job would test target-only decoding and still look green.
+          missing=""
+          for f in "$TARGET" ${DRAFT:+"$DRAFT"}; do
+            if [ ! -f "$f" ]; then missing="$missing $f"; fi
+          done
+          if [ -n "$missing" ]; then
+            msg="Model weights not found on $(hostname):$missing"
+            echo "## Model e2e ($MODEL) skipped: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+              echo "::warning title=Model e2e skipped::$msg"
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error title=Model e2e unavailable::$msg"
+            exit 1
+          fi
+
+          # A result is remembered for everything that decides it: the tree, the
+          # model, device and flags, the model files, ROCm, and the baseline it
+          # was judged against (a new baseline can turn a pass into a failure).
+          key=$(
+            {
+              git rev-parse 'HEAD^{tree}'
+              printf '%s\n' "$MODEL" "$DEVICE" "$TARGET" "$DRAFT" "$SERVER_ARGS"
+              stat -c '%n %s %Y' "$TARGET" ${DRAFT:+"$DRAFT"}
+              cat /opt/rocm/.info/version 2>/dev/null || true
+              if [ -f "$BASELINE" ]; then sha256sum < "$BASELINE"; else echo "no baseline"; fi
+            } | sha256sum | cut -c1-32
+          )
+          echo "PASS_MARKER=$state/passed/$key" >> "$GITHUB_ENV"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ -f "$state/passed/$key" ]; then
+            {
+              echo "This exact tree, configuration and baseline already passed cleanly; skipping."
+              echo "The report of that run:"
+              echo
+              cat "$state/passed/$key"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "Already passed (key $key); skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the GPUs to be free
+        id: gpu
+        if: steps.cfg.outputs.run == 'true'
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          bash .github/ci/e2e/gpu_wait.sh 240 | tee "$RUNNER_TEMP/gpu_wait.out"
+          grep '^state=' "$RUNNER_TEMP/gpu_wait.out" | tail -1 >> "$GITHUB_OUTPUT"
+
+      - name: Build luce_server (${{ matrix.arch }})
+        if: steps.gpu.outputs.state == 'free'
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          # The build directory persists between runs so only changed files
+          # rebuild. Start over when it belongs to a different checkout path.
+          if [ -f "$BUILD_DIR/CMakeCache.txt" ] &&
+             ! grep -qxF "CMAKE_HOME_DIRECTORY:INTERNAL=$PWD/server" "$BUILD_DIR/CMakeCache.txt"; then
+            rm -rf "$BUILD_DIR"
+          fi
+          launcher=()
+          if command -v ccache >/dev/null; then
+            launcher=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+                      -DCMAKE_HIP_COMPILER_LAUNCHER=ccache)
+          fi
+          cmake -S server -B "$BUILD_DIR" \
+            -DLUCE_GPU_BACKEND=hip \
+            -DLUCE_HIP_ARCHITECTURES="$ARCH" \
+            -DGGML_HIP_GRAPHS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            "${launcher[@]}"
+          cmake --build "$BUILD_DIR" --target luce_server --parallel "$(nproc)"
+
+      - name: Run the prompt suite
+        id: run
+        if: steps.gpu.outputs.state == 'free'
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          extra=()
+          if [ -n "$DRAFT" ]; then extra+=(--draft "$DRAFT"); fi
+          if [ "$UPDATE_BASELINE" = true ]; then extra+=(--write-baseline "$OUT_DIR/baseline.json"); fi
+          # DS4 loads in ~30 s from the page cache but ~185 s from disk.
+          python3 .github/ci/e2e/run_model_e2e.py \
+            --model "$MODEL" --device "$DEVICE" \
+            --server "$BUILD_DIR/luce_server" \
+            --target "$TARGET" \
+            --server-args "$SERVER_ARGS" \
+            --port "$((18200 + HIP_VISIBLE_DEVICES))" \
+            --baseline "$BASELINE" "${extra[@]}" \
+            --load-timeout 480 --request-timeout 120 --budget 300 \
+            --out-dir "$OUT_DIR"
+
+      # Only a clean pass: a skipped re-run shows the old report but raises no
+      # warnings, so a warning must be seen again on every run.
+      - name: Remember the pass
+        if: steps.run.outcome == 'success'
+        run: |
+          verdict=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["verdict"])' \
+            "$OUT_DIR/result.json")
+          if [ "$verdict" = pass ]; then cp "$OUT_DIR/report.md" "$PASS_MARKER"; fi
+
+      # The run writes baseline.json only when it did not fail.
+      - name: Upload the new baseline
+        if: steps.run.outcome == 'success' && env.UPDATE_BASELINE == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: model-e2e-baseline-${{ matrix.model }}-${{ matrix.device }}
+          path: e2e-out/baseline.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish the report
+        if: always()
+        env:
+          GPU_STATE: ${{ steps.gpu.outputs.state }}
+        run: |
+          if [ -f "$OUT_DIR/report.md" ]; then
+            cat "$OUT_DIR/report.md" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$GPU_STATE" = busy ]; then
+            echo "## Model e2e ($MODEL) skipped: the GPUs were busy" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Stop leftover servers
+        if: always()
+        run: pkill -f "${BUILD_DIR:-/nonexistent}/luce_server" || true
+
+      - name: Upload results
+        if: always() && steps.run.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: model-e2e-${{ matrix.model }}
+          path: e2e-out/
+          if-no-files-found: ignore
+          retention-days: 14
