@@ -2618,6 +2618,7 @@ if(LUCE_TESTS)
             test/unit/test_spec_acceptance.cpp
             test/unit/test_output_constraint.cpp
             test/unit/test_ds4_spec_sampling.cpp
+            test/unit/test_penalty_history.cpp
             test/unit/test_ds4_env.cpp
             test/unit/test_kvflash_ubatch.cpp
             test/unit/test_kvflash_state_ladder.cpp

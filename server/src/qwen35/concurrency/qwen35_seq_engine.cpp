@@ -719,7 +719,7 @@ int32_t Qwen35SeqEngine::sample_graph_row(
             sizeof(float) * (size_t)vocab);
         ggml_backend_synchronize(b_.target_backend_);
         token = sample_logits(logits.data(), vocab, seq.sampler,
-                              seq.sample_history, seq.rng);
+                              seq.penalty_history(), seq.rng);
     } else if (cached_argmax) {
         token = *cached_argmax;
     } else {
