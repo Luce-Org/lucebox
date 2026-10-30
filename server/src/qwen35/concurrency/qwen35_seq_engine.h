@@ -39,6 +39,8 @@
 
 namespace luce::common {
 
+class BlockingRowPool;
+
 class Qwen35Backend;
 
 struct FixedChainConfig {
@@ -212,9 +214,13 @@ private:
     // tokens per unit cost does not depend on how many lanes share it.
     // cap: the longest chain the round may draft (0 = the configured block).
     int choose_chain_width(int bucket, int cap = 0);
+    // sampled[lane]: the lane verified by the sampled walk; readback_ms and
+    // walk_ms: the round's sampled-lane logits copy and walk times.
     void observe_chain_width(int bucket, int width,
                              const std::vector<size_t> & accepted,
-                             double step_ms);
+                             const std::vector<uint8_t> & sampled,
+                             double step_ms, double readback_ms,
+                             double walk_ms);
     PrefixStoreEvent capture_prefix(
         int slot, PrefixCaptureTicket ticket);
     bool arm_capture(
@@ -233,8 +239,16 @@ private:
         std::vector<int>  offers;   // rounds offered at each width
         std::vector<int>  samples;  // clean cost samples at each width
         long long rounds = 0;
-        double    accepted_sum = 0.0;
-        size_t    lane_rounds = 0;
+        // Accepted rows by greedy and sampled lanes, and the sampled lanes'
+        // cost: logits copy and walk time over the rounds that had sampled
+        // lanes.
+        double    greedy_accepted_sum = 0.0;
+        size_t    greedy_lane_rounds = 0;
+        double    sampled_accepted_sum = 0.0;
+        size_t    sampled_lane_rounds = 0;
+        long long sampled_rounds = 0;
+        double    readback_ms_sum = 0.0;
+        double    walk_ms_sum = 0.0;
         // Per-depth trials and acceptances (decayed). A depth is a trial
         // only when it was offered and every shallower candidate was
         // accepted, so a narrow width does not bias the deeper estimates.
@@ -258,6 +272,12 @@ private:
     std::map<int, ChainWidthState> chain_width_by_bucket_;
     std::chrono::steady_clock::time_point chain_round_t0_{};
     std::vector<size_t> chain_accepted_scratch_;
+    std::vector<uint8_t> chain_sampled_scratch_;
+    // Sampled chain lanes (LUCE_SAMPLED_VERIFY=1): each lane's verify rows,
+    // copied to the host, and the pool their walks run on (made on the
+    // first round with two sampled lanes).
+    std::vector<float> chain_sampled_rows_;
+    std::unique_ptr<BlockingRowPool> chain_sampled_pool_;
     ggml_context *  feature_view_ctx_ = nullptr;
     std::vector<DraftFeatureMirror> slot_feature_mirrors_;
     std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;

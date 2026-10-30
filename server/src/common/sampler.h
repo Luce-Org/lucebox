@@ -37,6 +37,9 @@ struct SamplerCfg {
     // OpenAI-style additive penalties (applied per-token to logits before softmax).
     // frequency_penalty: subtract freq_pen * count(token_in_history) from logit.
     // presence_penalty:  subtract pres_pen * 1(token_appeared_in_history) from logit.
+    // On the qwen3, qwen35 (single-lane and concurrent), qwen35moe and gemma4
+    // paths the history is the tokens generated for the request, not the
+    // prompt, so all three penalties read the last rep_window generated tokens.
     // Range: [-2.0, 2.0], default 0.0 (no effect).
     float    freq_pen   = 0.0f;
     float    pres_pen   = 0.0f;
@@ -77,6 +80,11 @@ int sample_logits(const float * logits_in,
                   const SamplerCfg & cfg,
                   const std::vector<int32_t> & history,
                   std::mt19937_64 & rng);
+
+// True when sample_logits with this config runs on the host only. Otherwise
+// it may take a GPU sampler path, which uses the calling thread's current
+// device: call it from the thread that owns the model's device.
+bool sample_logits_host_only(const SamplerCfg & cfg, int vocab);
 
 // The distribution sample_logits draws from, after the whole chain (penalties,
 // top_k, temperature, top_p) as (probability, token) pairs summing to 1. With
