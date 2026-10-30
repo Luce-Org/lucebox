@@ -10249,7 +10249,8 @@ void HttpServer::send_nonstream_response(
         const std::vector<int32_t> & gen_tokens, int n_gen_cap,
         bool budget_forced_close, bool degenerate_decode_close,
         const GenTimings & gen_timings,
-        ClientSendBuffer * send_buffer) {
+        ClientSendBuffer * send_buffer,
+        const luce::common::SpecAcceptanceStats * acceptance) {
     CompletionTokenCounts counts;
     counts.total = (int) gen_tokens.size();
     const bool is_eos = !gen_tokens.empty() &&
@@ -10265,6 +10266,10 @@ void HttpServer::send_nonstream_response(
     result.tokens = gen_tokens;
     result.budget_forced_close = budget_forced_close;
     result.degenerate_decode_close = degenerate_decode_close;
+    if (acceptance) {
+        result.spec_decode_ran = acceptance->offered() > 0;
+        result.accept_rate = acceptance->rate();
+    }
 
     const json response = build_non_streaming_response(
         req, result, n_gen_cap, gen_timings, counts, emitter, &tokenizer_);

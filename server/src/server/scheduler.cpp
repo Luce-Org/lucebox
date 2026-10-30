@@ -399,7 +399,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             send_nonstream_response(req, s.fd, *s.emitter, s.gen_tokens,
                                     s.n_gen_cap, s.budget.forced_close(),
                                     s.degenerate_close, gen_timings,
-                                    &s.send_buffer);
+                                    &s.send_buffer, &s.acceptance);
         }
 
         const double elapsed_s = std::chrono::duration<double>(

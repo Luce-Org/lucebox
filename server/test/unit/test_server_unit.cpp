@@ -10657,7 +10657,8 @@ struct SpecRoundBackend : MockBackend {
 };
 
 // A request the parallel scheduler decoded with drafted rounds reports, in
-// its /status perf record, that it speculated and the rounds' acceptance.
+// its response usage and its /status perf record, that it speculated and
+// the rounds' acceptance.
 TEST_CASE(ServerUnitFixture, test_scheduler_perf_record_reports_speculative_rounds) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
@@ -10691,10 +10692,23 @@ TEST_CASE(ServerUnitFixture, test_scheduler_perf_record_reports_speculative_roun
     }
     SchedulerTestHarness::stop(server);
     scheduler.join();
+    std::string reply;
+    char buf[4096];
+    ssize_t got;
+    while ((got = recv(fds[1], buf, sizeof(buf), MSG_DONTWAIT)) > 0) {
+        reply.append(buf, (size_t)got);
+    }
     for (const int fd : fds) close(fd);
     unlink(path.c_str());
     TEST_ASSERT(done);
     TEST_ASSERT(backend.engine.rounds == 2);
+
+    // The response's usage reports the same speculation as /status.
+    const size_t body = reply.find("\r\n\r\n");
+    TEST_ASSERT(body != std::string::npos);
+    const json usage = json::parse(reply.substr(body + 4))["usage"];
+    TEST_ASSERT(usage["spec_decode_ran"] == true);
+    TEST_ASSERT(std::abs(usage["accept_rate"].get<double>() - 6.0 / 12.0) < 1e-6);
 
     const json perf = SchedulerTestHarness::status_json(server)["perf_history"];
     TEST_ASSERT(perf.size() == 1);

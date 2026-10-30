@@ -18,6 +18,7 @@
 #include "common/model_backend.h"
 #include "common/concurrency/paged_kv_offload.h"
 #include "common/output_constraint.h"
+#include "common/spec_acceptance.h"
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
@@ -1253,7 +1254,8 @@ private:
         const std::vector<int32_t> & gen_tokens, int n_gen_cap,
         bool budget_forced_close, bool degenerate_decode_close,
         const GenTimings & gen_timings,
-        ClientSendBuffer * send_buffer = nullptr);
+        ClientSendBuffer * send_buffer = nullptr,
+        const luce::common::SpecAcceptanceStats * acceptance = nullptr);
     std::string format_http_response(
         int status, const std::string & content_type,
         const std::string & body);
