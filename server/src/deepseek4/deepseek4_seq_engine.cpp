@@ -2,6 +2,8 @@
 
 #include "deepseek4_backend.h"
 #include "deepseek4_page_layout.h"
+#include "deepseek4_snapshot.h"
+#include "common/model_backend.h"
 #include "common/sampler.h"
 
 #include <algorithm>
@@ -34,7 +36,13 @@ DeepSeek4SeqEngine::DeepSeek4SeqEngine(
       stride_(table_stride),
       host_tables_((size_t)pool.max_sequences() * table_stride, -1),
       reserve_growth_((size_t)pool.max_sequences(), 0),
-      slot_has_images_((size_t)pool.max_sequences(), 0) {}
+      slot_has_images_((size_t)pool.max_sequences(), 0),
+      checkpoints_(ModelBackend::kMaxSlots),
+      capture_events_((size_t)pool.max_sequences()) {}
+
+DeepSeek4SeqEngine::~DeepSeek4SeqEngine() {
+    for (Checkpoint & checkpoint : checkpoints_) free_deepseek4_snapshot(checkpoint.snap);
+}
 
 bool DeepSeek4SeqEngine::token_is_eos(int32_t token) const {
     return deepseek4_is_eos_tok(token, b_.w_);
@@ -66,9 +74,15 @@ StepPlanLimits DeepSeek4SeqEngine::step_plan_limits(
 SeqEngine::AdmitResult DeepSeek4SeqEngine::admit(
         uint64_t request_id, const std::vector<int32_t> & prompt,
         const SamplerCfg & sampler) {
+    return admit_text(request_id, prompt, sampler, {});
+}
+
+SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_text(
+        uint64_t request_id, const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler, const std::vector<int> & restore_points) {
     AdmitResult result = admit_slot(request_id, prompt, sampler);
     if (result.status == AdmitResult::Status::admitted &&
-        !stage_text_prompt(request_id, result.slot, prompt) &&
+        !stage_text_prompt(request_id, result.slot, prompt, restore_points) &&
         !slots_.is_active(result.slot)) {
         result.status = AdmitResult::Status::failed;
         result.slot = -1;
@@ -78,12 +92,29 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit(
 }
 
 bool DeepSeek4SeqEngine::stage_text_prompt(
-        uint64_t request_id, int slot, const std::vector<int32_t> & prompt) {
+        uint64_t request_id, int slot, const std::vector<int32_t> & prompt,
+        const std::vector<int> & restore_points, const DeepSeek4Snapshot * from) {
     // Short prompts prefill in the gathered batch; staging pays off once a
     // prompt spans many sixteen-row (one-row on the hybrid path) steps.
     constexpr int kMinStagedTextTokens = 64;
-    const int prefix = int(prompt.size()) - 1;
-    if (!b_.text_staging_available() || int(prompt.size()) < kMinStagedTextTokens ||
+    constexpr int min_rows = DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS;
+    int prefix = int(prompt.size()) - 1;
+    // A chunk ends at every restore point, as in the one-request prefill, so
+    // the chunks after a restore are the ones a cold prefill of the prompt
+    // runs. A point closer than a layer-major chunk to the one kept before it
+    // is skipped: that depends only on the points before it, which the prompt
+    // shares with the one whose checkpoint it restores.
+    std::vector<int> cuts;
+    for (int point : restore_points) {
+        if (point < prefix && point - (cuts.empty() ? 0 : cuts.back()) >= min_rows) cuts.push_back(point);
+    }
+    const int start = from ? from->cur_pos : 0;
+    cuts.erase(cuts.begin(), std::lower_bound(cuts.begin(), cuts.end(), start + min_rows));
+    // Rows too few for a chunk after the last cut go to the gathered prefill
+    // with the last token.
+    const int last = cuts.empty() ? start : cuts.back();
+    if (prefix - last < min_rows) prefix = last;
+    if (!b_.text_staging_available() || (!from && int(prompt.size()) < kMinStagedTextTokens) ||
         prompt.size() > size_t(b_.cache_.max_ctx) || staging_in_flight(slot)) {
         return false;
     }
@@ -92,8 +123,9 @@ bool DeepSeek4SeqEngine::stage_text_prompt(
     pending.staged.request_id = request_id;
     pending.staged.prompt = prompt;
     pending.staged.prefix = prefix;
+    pending.staged.cuts = std::move(cuts);
     pending.staged.staging = b_.image_staging_cache(slot);
-    if (!pending.staged.staging || !b_.begin_staged_prefill(pending.staged)) {
+    if (!pending.staged.staging || !b_.begin_staged_prefill(pending.staged, from)) {
         return false;  // nothing seeded yet: the gathered prefill still works
     }
     SeqSlotManager::PrefillChunk seeded = slots_.seed_restored_prefix(slot, prefix);
@@ -192,6 +224,131 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_images(
     return result;
 }
 
+bool DeepSeek4SeqEngine::supports_prefix_store() const {
+    return b_.text_staging_available() && b_.snap_backend_;
+}
+
+size_t DeepSeek4SeqEngine::estimate_prefix_store_bytes(int tokens) const {
+    return supports_prefix_store() ? b_.staged_checkpoint_bytes(tokens) : 0;
+}
+
+// The checkpoint `ref` names, if it still holds that many tokens. A restore
+// checks its tokens too: from a capture's save until the scheduler hears of
+// it, the id still names the entry the capture replaced.
+DeepSeek4SeqEngine::Checkpoint * DeepSeek4SeqEngine::find_checkpoint(PrefixStoreRef ref) {
+    if (!ref.valid() || ref.id > checkpoints_.size()) return nullptr;
+    Checkpoint & checkpoint = checkpoints_[size_t(ref.id - 1)];
+    return checkpoint.snap.ctx && checkpoint.snap.cur_pos == ref.tokens &&
+           checkpoint.tokens.size() == size_t(ref.tokens) ? &checkpoint : nullptr;
+}
+
+void DeepSeek4SeqEngine::discard_prefix_store(PrefixStoreRef ref) {
+    if (Checkpoint * checkpoint = find_checkpoint(ref)) {
+        free_deepseek4_snapshot(checkpoint->snap);
+        checkpoint->tokens.clear();
+    }
+}
+
+SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_with_prefix(
+        uint64_t request_id, const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler, const PrefixStorePlan & plan) {
+    if (!plan.restore.valid()) {
+        AdmitResult result = admit_text(request_id, prompt, sampler, plan.restore_points);
+        if (result.status == AdmitResult::Status::admitted && arm_capture(result.slot, plan.capture)) {
+            result.prefix_store.capture = plan.capture;
+        }
+        return result;
+    }
+    AdmitResult result = admit_slot(request_id, prompt, sampler);
+    if (result.status != AdmitResult::Status::admitted) return result;
+    if (staging_in_flight(result.slot)) {
+        // Restoring needs this slot's staging cache, still in a shared pass.
+        retire(result.slot);
+        result.status = AdmitResult::Status::busy;
+        result.slot = -1;
+        result.error = "staging cache is still in use";
+        return result;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    Checkpoint * from = find_checkpoint(plan.restore);
+    const bool matches = from && plan.restore.tokens < int(prompt.size()) &&
+        std::equal(from->tokens.begin(), from->tokens.end(), prompt.begin());
+    const bool restored = matches && stage_text_prompt(request_id, result.slot, prompt,
+                                                       plan.restore_points, &from->snap);
+    const uint64_t elapsed_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count());
+    if (restored) {
+        result.prefix_store.restored = plan.restore;
+        std::fprintf(stderr, "[parallel-pc] restored checkpoint=%llu seq_slot=%d tokens=%d time_ms=%.1f\n",
+                     (unsigned long long)plan.restore.id, result.slot, plan.restore.tokens, elapsed_us / 1000.0);
+    } else {
+        // A payload holding other tokens is a newer capture's: keep it.
+        if (matches) discard_prefix_store(plan.restore);
+        retire(result.slot);
+        result = admit_text(request_id, prompt, sampler, plan.restore_points);
+        result.prefix_store.invalidated = plan.restore;
+    }
+    result.prefix_store.restore_attempted = true;
+    result.prefix_store.restore_elapsed_us = elapsed_us;
+    if (restored && arm_capture(result.slot, plan.capture)) result.prefix_store.capture = plan.capture;
+    return result;
+}
+
+bool DeepSeek4SeqEngine::arm_capture(int slot, PrefixCaptureTicket ticket) {
+    PendingImage * pending = pending_image(slot);
+    if (!pending || pending->staged.images || !ticket.valid() ||
+        ticket.checkpoint.id > checkpoints_.size()) return false;
+    // Only where a chunk ends: at a cut or at the end of the staged rows.
+    const DeepSeek4StagedPrefill & staged = pending->staged;
+    const int cut = ticket.checkpoint.tokens;
+    if (cut <= staged.done || (cut != staged.prefix &&
+        !std::binary_search(staged.cuts.begin(), staged.cuts.end(), cut))) return false;
+    pending->capture = ticket;
+    return true;
+}
+
+void DeepSeek4SeqEngine::save_capture(PendingImage & pending) {
+    DeepSeek4StagedPrefill & staged = pending.staged;
+    const PrefixCaptureTicket ticket = pending.capture;
+    pending.capture = {};
+    PrefixStoreEvent event;
+    event.ticket = ticket;
+    event.status = PrefixStoreEvent::Status::failed;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int tokens = ticket.checkpoint.tokens;
+    Checkpoint & checkpoint = checkpoints_[size_t(ticket.checkpoint.id - 1)];
+    if (staged.done != tokens || staged.staging->cur_pos != tokens) {
+        event.error = "staged prefill did not stop at the capture cut";
+    } else {
+        ggml_backend_synchronize(b_.backend_);
+        checkpoint.tokens.clear();
+        if (deepseek4_snapshot_save(*staged.staging, b_.snap_backend_, checkpoint.snap)) {
+            checkpoint.tokens.assign(staged.prompt.begin(), staged.prompt.begin() + tokens);
+            event.status = PrefixStoreEvent::Status::saved;
+            event.bytes = ggml_backend_buffer_get_size(checkpoint.snap.buf);
+        } else {
+            event.error = "prefix checkpoint could not be saved";
+        }
+    }
+    event.elapsed_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count());
+    if (event.status == PrefixStoreEvent::Status::saved) {
+        std::fprintf(stderr, "[parallel-pc] saved checkpoint=%llu seq_slot=%d tokens=%d bytes=%zu time_ms=%.1f\n",
+                     (unsigned long long)ticket.checkpoint.id, pending.slot, tokens, event.bytes,
+                     event.elapsed_us / 1000.0);
+    }
+    capture_events_[size_t(pending.slot)] = std::move(event);
+}
+
+void DeepSeek4SeqEngine::report_captures(std::vector<PrefillOutput> & outputs) {
+    for (PrefillOutput & out : outputs) {
+        PrefixStoreEvent & event = capture_events_[size_t(out.slot)];
+        if (!event.attempted() || out.status == PrefillOutput::Status::failed) continue;
+        out.prefix_store = std::move(event);
+        event = {};
+    }
+}
+
 DeepSeek4SeqEngine::PendingImage * DeepSeek4SeqEngine::pending_image(int slot) {
     for (auto & pending : pending_images_) {
         if (pending.slot == slot) return &pending;
@@ -213,6 +370,10 @@ constexpr int kHybridStagedRowsWithoutDecode = 2048;
 // A prompt or context this long gets the decode graphs and pools cleared
 // before its prefill and after it retires.
 constexpr int kLongStagedPromptTokens = 4096;
+// A prompt staging this many rows gets the decode and verify graphs retired
+// before its first chunk (deepseek4_step_layer_range's bulk prefill cleanup,
+// which runs only for a chunk this wide at position 0).
+constexpr int kBulkPrefillRows = 512;
 }  // namespace
 
 void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
@@ -234,7 +395,10 @@ void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
                 continue;
             }
             std::string error;
-            if (staged.done == 0 && staged.prefix >= kLongStagedPromptTokens) {
+            if (staged.done == staged.restored && staged.prefix - staged.done >= kBulkPrefillRows) {
+                b_.prepare_staged_prefill(*staged.staging);
+            }
+            if (staged.done == staged.restored && staged.prefix >= kLongStagedPromptTokens) {
                 // The decode graphs cached for other slots' histories (about
                 // 1 GiB once a lane is long) must not hold the memory this
                 // prompt's prefill arenas need.
@@ -345,6 +509,9 @@ void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
                 staged.staging = nullptr;
             }
             continue;
+        }
+        if (pending.capture.valid() && staged.done >= pending.capture.checkpoint.tokens) {
+            save_capture(pending);
         }
         if (staged.done < staged.prefix) continue;
         if (!import_deepseek4_paged_slot(
@@ -549,7 +716,10 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
             {slice.slot, (int) lane_tokens.size() - 1, commit});
     }
 
-    if (lane_tokens.empty()) return result;
+    if (lane_tokens.empty()) {
+        report_captures(result.prefills);
+        return result;
+    }
     if (lane_tokens.size() > (size_t) DEEPSEEK4_MAX_GATHERED_ROWS) {
         return fail_step("DeepSeek4 gathered step exceeds sixteen rows");
     }
@@ -642,6 +812,7 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
         log_deepseek4_step_telemetry(phase, (int)lane_tokens.size(), 1,
             std::chrono::duration<double>(Clock::now() - phase_t0).count(), telemetry);
     }
+    report_captures(result.prefills);
     return result;
 }
 
@@ -717,7 +888,14 @@ void DeepSeek4SeqEngine::retire(int slot) {
     pending_images_.erase(std::remove_if(pending_images_.begin(), pending_images_.end(),
                                          [slot](const PendingImage & p) { return p.slot == slot; }),
                           pending_images_.end());
-    if (slot >= 0 && size_t(slot) < slot_has_images_.size()) slot_has_images_[size_t(slot)] = 0;
+    if (slot >= 0 && size_t(slot) < slot_has_images_.size()) {
+        slot_has_images_[size_t(slot)] = 0;
+        // A capture not yet reported: the scheduler cancels its transaction
+        // with the slot, so nothing will commit the payload it saved.
+        PrefixStoreEvent & event = capture_events_[size_t(slot)];
+        if (event.status == PrefixStoreEvent::Status::saved) discard_prefix_store(event.ticket.checkpoint);
+        event = {};
+    }
     offload_.discard(slot);
     if (!slots_.is_active(slot)) return;
     const bool long_context = slots_.slot(slot).cur_pos >= kLongStagedPromptTokens;
