@@ -340,8 +340,18 @@ jobs:
             device_index: "1"
             concurrency_key: strix-halo
     runs-on: [self-hosted, lucebox3]
-    timeout-minutes: 20
+    # Up to 120 minutes waiting for development work on the box, and room to
+    # rerun steps stopped for it (.github/ci/box_step.sh).
+    timeout-minutes: 180
+    defaults:
+      run:
+        # Every run step waits while someone else uses the box's GPUs, and
+        # steps aside and reruns when someone starts to.
+        shell: bash ${{ github.workspace }}/.github/ci/box_step.sh {0}
     env:
+      BOX_WAIT_MINUTES: 120
+      # Each run of a step; the whole job had 20 minutes before it could wait.
+      BOX_STEP_MINUTES: 20
       HIP_VISIBLE_DEVICES: ${{ matrix.device_index }}
       EXPECTED_HIP_ARCH: ${{ matrix.arch }}
       # The models this box serves: Qwen 3.8 27B (qwen35 architecture, as the target
@@ -357,9 +367,12 @@ jobs:
 
       - name: KFD health (diagnose instead of hanging)
         # rocminfo on a wedged KFD blocks in uninterruptible sleep and eats
-        # the whole 20-minute job timeout. Probe with a hard timeout first,
+        # the whole job timeout. Probe with a hard timeout first,
         # and when it hangs, dump the evidence (D-state holders, dmesg) so
         # the job fails in seconds with a diagnosis instead of silently.
+        # The probe only reads, for 15 seconds at most, so it runs at once
+        # rather than in box_step.sh: a wedged process would make it wait.
+        shell: bash -e {0}
         run: |
           # A wedged KFD puts rocminfo in UNINTERRUPTIBLE sleep: timeout(1)
           # cannot kill it and a foreground wait blocks until the job
@@ -499,8 +512,18 @@ jobs:
       ${{ !cancelled() && needs.gpu-tests-amd.result == 'success' &&
       (needs.plan-lucebox3.outputs.qwen38 != 'false' || needs.plan-lucebox3.outputs.ds41 != 'false') }}
     runs-on: [self-hosted, lucebox3]
-    timeout-minutes: 45
+    # Up to 120 minutes waiting for development work on the box, and room to
+    # rerun steps stopped for it (.github/ci/box_step.sh).
+    timeout-minutes: 210
+    defaults:
+      run:
+        # Every run step waits while someone else uses the box's GPUs, and
+        # steps aside and reruns when someone starts to.
+        shell: bash ${{ github.workspace }}/.github/ci/box_step.sh {0}
     env:
+      BOX_WAIT_MINUTES: 120
+      # Each run of a step; the whole job had 45 minutes before it could wait.
+      BOX_STEP_MINUTES: 45
       LUCE_TEST_MODEL_QWEN38: /opt/models/Qwen3.8-27B-UD-IQ4_XS.gguf
       LUCE_TEST_MODEL_QWEN38_DRAFT: /opt/models/Qwen3.8-27B-DFlash2-Q8_0.gguf
       LUCE_TEST_MODEL_DEEPSEEK41: /opt/models/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf
