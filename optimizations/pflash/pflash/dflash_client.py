@@ -91,6 +91,7 @@ class DflashClient:
         self.r_pipe: int = -1
         self.w_pipe: int = -1
         self.proc = None
+        self._stdout_thread = None
         try:
             self.r_pipe, self.w_pipe = os.pipe()
             # subprocess.Popen pass_fds is POSIX-only. On Windows, mark the pipe
@@ -137,26 +138,41 @@ class DflashClient:
 
     def _start_stdout_reader(self):
         def _reader():
-            if self.proc.stdout is None:
+            if self.proc is None or self.proc.stdout is None:
                 return
+            stdout = self.proc.stdout
             mirror_stdout = True
-            for raw in iter(self.proc.stdout.readline, b""):
-                try:
-                    line = raw.decode(errors="replace")
-                except AttributeError:
-                    line = str(raw)
-                self._stdout_tail.append(line.rstrip())
-                del self._stdout_tail[:-20]
-                if any(marker in line for marker in _READY_MARKERS):
-                    self._ready_event.set()
-                if mirror_stdout:
+            try:
+                while True:
                     try:
-                        sys.stdout.write(line)
-                        sys.stdout.flush()
-                    except (BrokenPipeError, OSError, ValueError):
-                        mirror_stdout = False
+                        raw = stdout.readline()
+                    except (ValueError, OSError):
+                        break
+                    if not raw:
+                        break
+                    try:
+                        line = raw.decode(errors="replace")
+                    except AttributeError:
+                        line = str(raw)
+                    self._stdout_tail.append(line.rstrip())
+                    del self._stdout_tail[:-20]
+                    if any(marker in line for marker in _READY_MARKERS):
+                        self._ready_event.set()
+                    if mirror_stdout:
+                        try:
+                            sys.stdout.write(line)
+                            sys.stdout.flush()
+                        except (BrokenPipeError, OSError, ValueError):
+                            mirror_stdout = False
+            finally:
+                try:
+                    stdout.close()
+                except Exception:
+                    pass
 
-        threading.Thread(target=_reader, name="dflash-daemon-stdout", daemon=True).start()
+        self._stdout_thread = threading.Thread(
+            target=_reader, name="dflash-daemon-stdout", daemon=True)
+        self._stdout_thread.start()
 
     def _read_vram_used_mib(self) -> Optional[int]:
         """GPU memory allocated since daemon spawn, in MiB.
@@ -309,11 +325,13 @@ class DflashClient:
                     except Exception:
                         pass
             finally:
-                try:
-                    if self.proc.stdout:
+                if self._stdout_thread is not None and self._stdout_thread.is_alive():
+                    self._stdout_thread.join(timeout=timeout)
+                elif self._stdout_thread is None and self.proc.stdout:
+                    try:
                         self.proc.stdout.close()
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
     def __enter__(self) -> DflashClient:
         return self

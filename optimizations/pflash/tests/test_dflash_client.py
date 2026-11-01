@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pflash.dflash_client import DflashClient
 
 
-def create_mock_daemon(ready: bool = True, exit_code: int | None = None) -> str:
+def create_mock_daemon(ready: bool = True, exit_code: int | None = None,
+                       continuous_output: bool = False) -> str:
     """Create a temporary Python executable that mocks the dflash daemon protocol."""
     script = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
     if exit_code is not None:
@@ -22,8 +23,25 @@ import sys
 sys.exit({exit_code})
 """
     else:
+        chatter_code = """
+import threading, time
+running = True
+def chatter():
+    i = 0
+    while running:
+        try:
+            sys.stdout.write(f"chatter line {i}\\n")
+            sys.stdout.flush()
+            i += 1
+            time.sleep(0.005)
+        except Exception:
+            break
+threading.Thread(target=chatter, daemon=True).start()
+""" if continuous_output else "running = False"
+        stop_chatter = "running = False\n" if continuous_output else ""
         body = f"""#!/usr/bin/env python3
 import os, struct, sys
+{chatter_code}
 
 stream_fd = None
 for arg in sys.argv:
@@ -37,7 +55,7 @@ if {ready}:
 while True:
     line = sys.stdin.readline()
     if not line:
-        break
+        {stop_chatter}        break
     if stream_fd is not None:
         parts = line.strip().split()
         if len(parts) == 2 and parts[1].isdigit():
@@ -244,6 +262,45 @@ class TestDflashClient(unittest.TestCase):
             with self.assertRaises(OSError):
                 os.fstat(r_pipe)
             self.assertIsNotNone(client.proc.poll())
+        finally:
+            os.unlink(daemon)
+
+    def test_shutdown_while_reader_active(self):
+        daemon = create_mock_daemon(ready=True, continuous_output=True)
+        try:
+            client = DflashClient(
+                bin_path=daemon,
+                target_path="dummy",
+                draft_path="dummy",
+                boot_timeout_s=5.0,
+                boot_vram_mib=0,
+            )
+            r_pipe = client.r_pipe
+            self.assertGreaterEqual(r_pipe, 0)
+            os.fstat(r_pipe)
+
+            # Confirm reader thread is running and stdout is open
+            self.assertIsNotNone(client._stdout_thread)
+            self.assertTrue(client._stdout_thread.is_alive())
+            stdout = client.proc.stdout
+            self.assertIsNotNone(stdout)
+            self.assertFalse(stdout.closed)
+
+            # Close while reader is actively reading lines
+            client.close()
+
+            # Verify thread terminated cleanly without uncaught exceptions
+            self.assertFalse(client._stdout_thread.is_alive())
+            self.assertEqual(client.r_pipe, -1)
+            self.assertIsNotNone(client.proc.poll())
+            with self.assertRaises(OSError):
+                os.fstat(r_pipe)
+
+            # Verify stdout was closed by the reader thread
+            self.assertTrue(stdout.closed)
+
+            # Idempotent second call
+            client.close()
         finally:
             os.unlink(daemon)
 
