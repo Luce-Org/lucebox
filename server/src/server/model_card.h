@@ -99,6 +99,11 @@ struct ModelCard {
     std::string       thinking_marker;
     std::string       thinking_terminator_hint;
 
+    // The chat codec (server/chat_codec.h) that renders this model's official
+    // template; empty for the arch's default codec, else its built-in
+    // renderer. --chat-codec and --chat-template-file override it.
+    std::string       chat_codec;
+
     // Phase-1 ceiling derived from `max_tokens - hard_limit_reply_budget`.
     // Convenience: also the spec's `think_max` quantity (§3.3 formula).
     int think_max_tokens = 15488;

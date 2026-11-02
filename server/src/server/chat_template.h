@@ -2,27 +2,29 @@
 //
 // Renders chat messages (system/user/assistant/tool) into the model-specific
 // token format. Hard-coded for supported architectures:
-//   - Qwen3/3.5: <|im_start|>role\ncontent<|im_end|>\n
 //   - BailingMoE3: <role>SYSTEM/HUMAN/ASSISTANT</role>...<|role_end|>
 //   - Laguna: XML-style role blocks
 //   - Gemma4: <|turn>role\ncontent<turn|>\n
-//   - DeepSeek V4/V4.1: role tokens with DSML tool-call blocks
+//
+// The Qwen and DeepSeek families have no renderer here: they render with
+// their chat codec (chat_codec.h) or a --chat-template-file.
 
 #pragma once
 
 #include <nlohmann/json.hpp>
 
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace luce::common {
 
 // Model-independent assistant call. Arguments are decoded once on a memory
-// miss; renderers choose the model's native syntax.
+// miss, in the client's key order; renderers choose the model's native syntax.
 struct ChatToolCall {
     std::string id;
     std::string name;
-    nlohmann::json arguments;
+    nlohmann::ordered_json arguments;
 };
 
 // A single message in a chat conversation.
@@ -34,9 +36,12 @@ struct ChatMessage {
     // Optional prior <think> text for assistant messages (OpenAI-compatible
     // `reasoning_content` / `reasoning` fields on request history). Jinja
     // templates get it as `message.reasoning_content` and decide whether to
-    // replay it inside <think>...</think> (e.g. qwen4exp); the built-in Qwen
-    // renderer replays it for the turns after the last user query.
+    // replay it inside <think>...</think> (e.g. qwen4exp); the chat codecs
+    // replay it where their official templates do.
     std::string reasoning_content;
+    // The client sent a reasoning field (even an empty one): it is part of the
+    // turn as sent, so turn memory must match it.
+    bool reasoning_sent = false;
     std::vector<ChatToolCall> tool_calls;
     // On a memory hit, content is the original raw turn. Calls retain only
     // their IDs/names for result association; do not render them a second time.
@@ -46,12 +51,9 @@ struct ChatMessage {
 
 // Chat template format.
 enum class ChatFormat {
-    QWEN3,     // <|im_start|>role\n...<|im_end|>\n
     BAILINGMOE3, // <role>SYSTEM/HUMAN/ASSISTANT</role>...<|role_end|>
     LAGUNA,    // <|begin_of_sentence|><|User|>...<|Assistant|>
     GEMMA4,    // <bos><|turn>role\n...<turn|>\n
-    DEEPSEEK4, // <｜begin▁of▁sentence｜>...<｜User｜>...<｜Assistant｜>
-    DEEPSEEK41, // <｜begin▁of▁sentence｜><｜System｜>...<｜User｜>...<｜Assistant｜>
 };
 
 // Render chat messages into the model-specific prompt string.
@@ -60,32 +62,20 @@ enum class ChatFormat {
 // If `add_generation_prompt` is true, appends the assistant turn prefix
 // at the end (so the model starts generating as assistant).
 //
-// `enable_thinking` controls Qwen3/3.5 think mode:
-//   true  → assistant starts open-ended (model will produce <think>...</think>)
-//   false → assistant starts with <think>\n\n</think>\n\n (skip thinking)
+// `enable_thinking` selects the template's thinking mode.
 //
 // `tools_json` is an optional JSON string containing the tool definitions
 // array. Each renderer injects the corresponding native tool preamble.
-//
-// `reasoning_effort` is the normalized model-facing effort. DeepSeek V4 uses
-// low, high, and max; high and max prepend the official encoding prefixes.
 std::string render_chat_template(
     const std::vector<ChatMessage> & messages,
     ChatFormat format,
     bool add_generation_prompt = true,
     bool enable_thinking = false,
-    const std::string & tools_json = "",
-    const std::string & reasoning_effort = "");
+    const std::string & tools_json = "");
 
-// Detect the appropriate chat format for an architecture.
-ChatFormat chat_format_for_arch(const std::string & arch);
-
-// The order in which ``render_chat_template`` renders ``messages``: index i of
-// the result is the message rendered i-th. DeepSeek V4 / V4.1 results carry no
-// IDs in the prompt, so each run of tool results is rendered in the order of
-// the calls that asked for them; other formats render messages as given (an
-// empty result means as given).
-std::vector<size_t> chat_message_render_order(const std::vector<ChatMessage> & messages, ChatFormat format);
+// The built-in renderer of an architecture; none for those that render only
+// with their chat codec (the Qwen and DeepSeek families).
+std::optional<ChatFormat> chat_format_for_arch(const std::string & arch);
 
 // Render chat messages via a Jinja chat template (e.g. froggeric Qwen3.6
 // template, or any of the llama.cpp models/templates/*.jinja files).
@@ -125,6 +115,16 @@ std::string render_chat_template_jinja(
     const std::string & tools_json = "",
     const std::string & reasoning_effort = "",
     int preserve_thinking = -1);
+
+// Tool definitions as official templates expect them: Chat Completions'
+// {type, function: {name, description, parameters}}, from any API's shape
+// (Responses flattens the function; Anthropic names the schema input_schema).
+// Key order is kept.
+nlohmann::ordered_json openai_tool_definitions(nlohmann::ordered_json tools);
+
+// Python json.dumps(value, ensure_ascii=False): the Hugging Face templates'
+// |tojson. ", " and ": " separators, keys in the value's order.
+std::string python_json_dumps(const nlohmann::ordered_json & value);
 
 // Qwen3.8-Flash-Next's template knows the efforts low, medium and xhigh (its default); Lucebox's high, x-high and
 // max map to xhigh. Empty stays empty so the template applies its own default.

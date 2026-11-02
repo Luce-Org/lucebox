@@ -256,6 +256,7 @@ DeepSeek's hybrid hot-expert budget reserves the same headroom floor as its post
 | `--default-max-tokens <N>` | model card or `16000` | Output cap when a request omits a token limit. |
 | `--model-name <name>` | `luce` | API alias returned by `/v1/models` and responses. It does not change the loaded weights. |
 | `--chat-template-file <path>` | model default | Jinja chat-template override. |
+| `--chat-codec <name>` | the model card's codec, else the arch's | Renders the model's official chat template to tokens: `qwen3.8` (Qwen3.8 27B and Flash-Next), `qwen3.6` (Qwen3.6 27B and 35B-A3B), `qwen3.5` (Qwen3.5 27B and 35B-A3B, the `qwen35`/`qwen35moe` default without a card), `deepseek4.1` (DeepSeek V4.1 Flash), `deepseek4` (DeepSeek V4 Flash). `test/chat_golden` checks them against the official templates and lists the deliberate differences: control-token text in a message stays text, and Qwen3.5 keeps earlier thinking unless the request sets `preserve_thinking: false`. `none` uses the arch's built-in renderer, which only Gemma 4, Laguna and BailingMoE3 have; the Qwen and DeepSeek archs render with a codec or `--chat-template-file`. |
 | `--no-cors` | CORS enabled | Disable CORS headers. |
 
 ### Speculative decode
@@ -603,8 +604,11 @@ engine's `--max-ctx` or the drafter's trained context, and never below the
 prompt itself.
 A request's `pflash_query` string replaces the derived query and keeps its
 whole span; it is meant for benchmarks. `PFLASH_SELECT_QUERY_PARSER=latest_user`
-selects the benchmark parser, which finds the latest user message through
-sentinel renders.
+selects the benchmark parser, which reads the latest user message's span
+from the chat codec. PFlash maps the prompt (each message, the tool
+definitions) from the codec's render, so it needs the model's codec: the
+server refuses `--pflash on` with `--chat-template-file` or `--chat-codec none`
+on the Qwen and DeepSeek families.
 
 `PFLASH_SEGMENT_PROBE_GGUF` loads a segment probe (schema
 `qwen3_5_0_8b_segment_probe_v1`): a 264K-parameter network on the same block-14
@@ -1138,7 +1142,7 @@ Tool-call history from OpenAI Chat Completions, Responses, and Anthropic Message
 is normalized into model-independent calls (IDs, names, and typed arguments).
 The selected renderer then emits the model's native protocol: Qwen function
 blocks, Bailing/Laguna argument blocks, DeepSeek V4/V4.1 DSML, or Gemma tool
-calls and responses. Tool results retain their call IDs and resolve function
+calls and responses (DeepSeek V4.1 and Qwen3.8 through their chat codec). Tool results retain their call IDs and resolve function
 names from the corresponding calls, including out-of-order parallel results.
 DeepSeek V4/V4.1 follow the reference encoder: results are reordered by call ID
 into call order before rendering their ID-less result blocks, while intervening

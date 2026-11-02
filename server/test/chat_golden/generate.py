@@ -5,9 +5,13 @@ prepares an OpenAI Chat Completions request for it: tool-call arguments decoded 
 `reasoning` read as `reasoning_content`, the request's `chat_template_kwargs` and
 `reasoning_effort` passed to the template. The template runs in transformers' sandboxed Jinja.
 
-DeepSeek V4.1 has no Jinja template: its reference is a Python encoder (encoding/encoding.py in
-the model repo). This script does not run it; it takes the encoder's own golden pairs
-(encoding/tests/test_input_N.json, test_output_N.txt) as data instead.
+DeepSeek V4 and V4.1 have no Jinja template: their reference is DeepSeek's Python encoder
+(encoding/encoding_dsv4.py and encoding/encoding.py in the model repos, which SGLang also serves
+them with, through deepseek-recipe, and vLLM with adapted copies). Each case is prepared the way
+vLLM's V4 or V4.1 tokenizer prepares a request (tools on the system message, thinking on unless
+the request turns it off, effort "high" by default) and encoded by the encoder at the pinned
+revision, loaded from its file. The encoder's own golden pairs (encoding/tests/test_input_N.json,
+test_output_N.txt) are kept beside the cases as official_N.
 
     uv run --project server python server/test/chat_golden/generate.py
 
@@ -19,6 +23,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 from typing import Any
@@ -43,10 +48,26 @@ MODELS: dict[str, dict[str, str]] = {
         "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
         "kind": "jinja",
     },
+    "qwen3.6-27b": {
+        "repo": "Qwen/Qwen3.6-27B",
+        "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+        "kind": "jinja",
+    },
+    # The 35B-A3B ships the same chat template.
+    "qwen3.5-27b": {
+        "repo": "Qwen/Qwen3.5-27B",
+        "revision": "fc05daec18b0a78c049392ed2e771dde82bdf654",
+        "kind": "jinja",
+    },
+    "deepseek-v4-flash": {
+        "repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+        "kind": "deepseek-v4-encoder",
+    },
     "deepseek-v4.1-flash": {
         "repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
         "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
-        "kind": "deepseek-v41-fixtures",
+        "kind": "deepseek-v41-encoder",
     },
 }
 
@@ -118,14 +139,102 @@ class JinjaReference:
         return hashlib.sha256(self.template.encode()).hexdigest()
 
 
-class DeepseekV41Fixtures:
+def deepseek_v41_request(body: dict[str, Any]) -> dict[str, Any]:
+    """encode_messages' arguments for a Chat Completions request, as vLLM's V4.1 tokenizer
+    builds them (vllm/tokenizers/deepseek_v41.py)."""
+    conversation = []
+    for message in copy.deepcopy(body["messages"]):
+        if "reasoning" in message:
+            message["reasoning_content"] = message.pop("reasoning")
+        content = message.get("content")
+        if isinstance(content, list):
+            message["content"] = "\n\n".join(
+                part.get("text", "") for part in content if part.get("type") == "text"
+            )
+        conversation.append(message)
+    if body.get("tools"):
+        system = next((m for m in conversation if m["role"] == "system"), None)
+        if system is None:
+            system = {"role": "system", "content": ""}
+            conversation.insert(0, system)
+        system["tools"] = copy.deepcopy(body["tools"])
+    kwargs = body.get("chat_template_kwargs") or {}
+    thinking = bool(kwargs.get("thinking") or kwargs.get("enable_thinking"))
+    if "thinking" not in kwargs and "enable_thinking" not in kwargs:
+        thinking = True
+    effort = body.get("reasoning_effort", kwargs.get("reasoning_effort"))
+    if effort == "none":
+        thinking, effort = False, None
+    return {
+        "messages": conversation,
+        "thinking_mode": "thinking" if thinking else "chat",
+        "drop_thinking": kwargs.get("drop_thinking", True),
+        "reasoning_effort": "high" if effort is None else effort,
+    }
+
+
+def deepseek_v4_request(body: dict[str, Any]) -> dict[str, Any]:
+    """encode_messages' arguments for a Chat Completions request, as vLLM's V4 tokenizer builds
+    them (vllm/tokenizers/deepseek_v4.py), from the conversation its generic renderer hands it
+    (text parts joined with '\n')."""
+    conversation = []
+    for message in copy.deepcopy(body["messages"]):
+        if "reasoning" in message:
+            message["reasoning_content"] = message.pop("reasoning")
+        content = message.get("content")
+        if isinstance(content, list):
+            message["content"] = "\n".join(
+                part.get("text", "") for part in content if part.get("type") == "text"
+            )
+        conversation.append(message)
+    if body.get("tools"):
+        system = next((m for m in conversation if m["role"] == "system"), None)
+        if system is None:
+            system = {"role": "system"}
+            conversation.insert(0, system)
+        system["tools"] = copy.deepcopy(body["tools"])
+    kwargs = body.get("chat_template_kwargs") or {}
+    thinking = bool(kwargs.get("thinking") or kwargs.get("enable_thinking"))
+    if "thinking" not in kwargs and "enable_thinking" not in kwargs:
+        thinking = True
+    mode = "thinking" if thinking else "chat"
+    effort = body.get("reasoning_effort", kwargs.get("reasoning_effort"))
+    if not isinstance(effort, str):
+        effort = "high" if thinking else None
+    elif effort == "none":
+        mode, effort = "chat", None
+    elif effort in ("low", "minimal", "medium"):
+        effort = "low"
+    elif effort != "max":
+        effort = "high"
+    return {
+        "messages": conversation,
+        "thinking_mode": mode,
+        "drop_thinking": kwargs.get("drop_thinking", True),
+        "reasoning_effort": effort,
+    }
+
+
+class DeepseekReference:
     def __init__(self, spec: dict[str, str]):
         self.spec = spec
+        v41 = spec["kind"] == "deepseek-v41-encoder"
+        self.prepare = deepseek_v41_request if v41 else deepseek_v4_request
         self.raw = Tokenizer.from_file(str(download(spec, "tokenizer.json")))
-        self.readme = download(spec, "encoding/README.md").read_bytes()
+        self.source = download(spec, "encoding/encoding.py" if v41 else "encoding/encoding_dsv4.py")
+        # Imported from its file: nothing from the download's directory joins sys.path.
+        module_spec = importlib.util.spec_from_file_location("deepseek_encoding", self.source)
+        self.encoding = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(self.encoding)
 
-    def cases(self, _cases: list[dict[str, Any]], _model: str) -> dict[str, Any]:
+    def cases(self, cases: list[dict[str, Any]], model: str) -> dict[str, Any]:
         out = {}
+        for case in cases:
+            if model not in case.get("models", MODELS):
+                continue
+            text = self.encoding.encode_messages(**self.prepare(case["body"]))
+            tokens = self.raw.encode(text, add_special_tokens=False).ids
+            out[case["id"]] = {"text": text, "tokens": tokens}
         n = 1
         while True:
             try:
@@ -138,8 +247,20 @@ class DeepseekV41Fixtures:
                     raise
                 break
             text = expected.read_text()
+            given = json.loads(given.read_text())
+            if self.spec["kind"] == "deepseek-v4-encoder":
+                # As test_encoding_dsv4.py encodes them: thinking but for the 4th, at the encoder's
+                # default effort (low: no effort prompt), case 1's tools on its first message.
+                raw = given
+                given = {
+                    "messages": raw["messages"] if isinstance(raw, dict) else raw,
+                    "thinking_mode": "chat" if n == 4 else "thinking",
+                    "reasoning_effort": "low",
+                }
+                if isinstance(raw, dict) and "tools" in raw:
+                    given["tools"] = raw["tools"]
             out[f"official_{n}"] = {
-                "input": json.loads(given.read_text()),
+                "input": given,
                 "text": text,
                 "tokens": self.raw.encode(text, add_special_tokens=False).ids,
             }
@@ -147,7 +268,7 @@ class DeepseekV41Fixtures:
         return out
 
     def source_digest(self) -> str:
-        return hashlib.sha256(self.readme).hexdigest()
+        return hashlib.sha256(self.source.read_bytes()).hexdigest()
 
 
 def dump_expected(out: dict[str, Any]) -> str:
@@ -176,7 +297,7 @@ def main() -> None:
     for name in args.models:
         spec = MODELS[name]
         reference: Any = (
-            JinjaReference(spec) if spec["kind"] == "jinja" else DeepseekV41Fixtures(spec)
+            JinjaReference(spec) if spec["kind"] == "jinja" else DeepseekReference(spec)
         )
         out = {
             "model": name,

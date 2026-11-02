@@ -17,6 +17,7 @@
 #endif
 
 #include "http_server.h"
+#include "api_adapters.h"
 #include "image_input.h"
 #include "engine/luce_engine.h"
 #include "admission.h"
@@ -446,33 +447,6 @@ PFlashTokenSpan pflash_decoded_text_span(
     return {first, after};
 }
 
-int pflash_query_search_end_from_sentinel(
-        const std::vector<int32_t> & original,
-        const std::vector<int32_t> & sentinel) noexcept {
-    size_t common_suffix = 0;
-    while (common_suffix < original.size() &&
-           common_suffix < sentinel.size() &&
-           original[original.size() - common_suffix - 1] ==
-               sentinel[sentinel.size() - common_suffix - 1]) {
-        ++common_suffix;
-    }
-    if (common_suffix == 0 || common_suffix >= original.size()) {
-        return -1;
-    }
-    return static_cast<int>(original.size() - common_suffix);
-}
-int pflash_query_search_begin_from_sentinel(
-        const std::vector<int32_t> & original,
-        const std::vector<int32_t> & sentinel) noexcept {
-    size_t common_prefix = 0;
-    while (common_prefix < original.size() &&
-           common_prefix < sentinel.size() &&
-           original[common_prefix] == sentinel[common_prefix]) {
-        ++common_prefix;
-    }
-    if (common_prefix >= original.size()) return -1;
-    return static_cast<int>(common_prefix);
-}
 
 PflashInstructionMessagePlan plan_pflash_instruction_messages(
         const std::vector<ChatMessage> & messages) {
@@ -481,36 +455,14 @@ PflashInstructionMessagePlan plan_pflash_instruction_messages(
         const auto & message = messages[index];
         const bool instruction_role =
             message.role == "system" || message.role == "developer";
-        if (instruction_role && !message.content.empty()) {
+        // A blank instruction has nothing to keep (Qwen's template drops it).
+        if (instruction_role && !python_strip(message.content).empty()) {
             plan.instruction_messages.push_back(index);
         }
     }
     return plan;
 }
 
-PFlashTokenSpan pflash_changed_token_span(
-        const std::vector<int32_t> & original,
-        const std::vector<int32_t> & variant) noexcept {
-    size_t common_prefix = 0;
-    while (common_prefix < original.size() &&
-           common_prefix < variant.size() &&
-           original[common_prefix] == variant[common_prefix]) {
-        ++common_prefix;
-    }
-
-    size_t common_suffix = 0;
-    while (common_suffix < original.size() - common_prefix &&
-           common_suffix < variant.size() - common_prefix &&
-           original[original.size() - common_suffix - 1] ==
-               variant[variant.size() - common_suffix - 1]) {
-        ++common_suffix;
-    }
-
-    const int begin = static_cast<int>(common_prefix);
-    const int end = static_cast<int>(original.size() - common_suffix);
-    return end > begin ? PFlashTokenSpan{begin, end}
-                       : PFlashTokenSpan{-1, -1};
-}
 
 namespace {
 
@@ -771,62 +723,6 @@ PflashChatTurnSpan pflash_chat_query_turn(
     return chosen;
 }
 
-std::string_view pflash_template_trim(std::string_view text) {
-    // The chat template's ``|trim`` (jinja strip: C isspace on each byte).
-    const auto space = [] (char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; };
-    while (!text.empty() && space(text.front())) text.remove_prefix(1);
-    while (!text.empty() && space(text.back())) text.remove_suffix(1);
-    return text;
-}
-
-bool pflash_content_char_spans(
-        const std::string & placeholder_render,
-        const std::vector<std::string> & placeholders,
-        const std::vector<std::string> & contents,
-        const std::string & prompt_text,
-        std::vector<std::pair<size_t, size_t>> & spans,
-        std::string & error) {
-    spans.assign(placeholders.size(), {0, 0});
-    if (contents.size() != placeholders.size()) {
-        error = "placeholder and content counts differ";
-        return false;
-    }
-    // Where each placeholder is rendered, exactly once. Not necessarily in message order: DeepSeek renders each
-    // run of tool results in the order of the calls that asked for them.
-    std::vector<std::pair<size_t, size_t>> found;   // (position in the render, message)
-    for (size_t i = 0; i < placeholders.size(); ++i) {
-        const std::string & ph = placeholders[i];
-        if (ph.empty()) continue;
-        const size_t at = placeholder_render.find(ph);
-        if (at == std::string::npos || placeholder_render.find(ph, at + ph.size()) != std::string::npos) {
-            error = "message " + std::to_string(i) + " is not rendered exactly once";
-            spans.assign(placeholders.size(), {0, 0});
-            return false;
-        }
-        found.emplace_back(at, i);
-    }
-    std::sort(found.begin(), found.end());
-    // Contents go back verbatim, or trimmed: templates such as Qwen 3.8's trim every message, so a tool output
-    // ending in a newline is rendered without it. Either way the result must equal the prompt byte for byte.
-    for (const bool trimmed : {false, true}) {
-        std::string rebuilt;
-        rebuilt.reserve(prompt_text.size());
-        size_t cursor = 0;
-        for (const auto & [at, i] : found) {
-            const std::string_view content = trimmed ? pflash_template_trim(contents[i])
-                                                     : std::string_view(contents[i]);
-            rebuilt.append(placeholder_render, cursor, at - cursor);
-            spans[i] = {rebuilt.size(), rebuilt.size() + content.size()};
-            rebuilt += content;
-            cursor = at + placeholders[i].size();
-        }
-        rebuilt.append(placeholder_render, cursor, std::string::npos);
-        if (rebuilt == prompt_text) return true;
-    }
-    error = "the template does not render message contents verbatim";
-    spans.assign(placeholders.size(), {0, 0});
-    return false;
-}
 
 PFlashTokenSpan pflash_char_span_tokens(
         const std::vector<size_t> & token_begin, size_t text_size, size_t begin, size_t end) {
@@ -837,97 +733,6 @@ PFlashTokenSpan pflash_char_span_tokens(
     const int first = upper == token_begin.begin() ? 0 : (int) (upper - token_begin.begin() - 1);
     const int last = (int) (std::lower_bound(token_begin.begin(), token_begin.end(), end) - token_begin.begin());
     return last > first ? PFlashTokenSpan{first, last} : PFlashTokenSpan{0, 0};
-}
-
-bool pflash_human_message_spans(
-        const Tokenizer & tokenizer,
-        const std::vector<int32_t> & prompt,
-        const std::vector<PflashChatTurn> & turns,
-        const std::vector<ChatMessage> & messages,
-        size_t count,
-        std::vector<PFlashTokenSpan> & out) {
-    out.clear();
-    const auto trim = [] (const std::string & text) {
-        const char * space = " \t\n\r";
-        const size_t begin = text.find_first_not_of(space);
-        if (begin == std::string::npos) return std::string();
-        return text.substr(begin, text.find_last_not_of(space) - begin + 1);
-    };
-    std::vector<size_t> human;
-    std::vector<std::string> human_text;
-    for (size_t index = 0; index < messages.size(); ++index) {
-        if (messages[index].role != "user") continue;
-        human.push_back(index);
-        human_text.push_back(trim(messages[index].content));
-    }
-    const DecodedPrompt decoded = decode_prompt_with_offsets(tokenizer, prompt);
-    const auto char_at = [&](int token) {
-        return token < (int) prompt.size() ? decoded.token_begin[(size_t) token] : decoded.text.size();
-    };
-    std::vector<std::string> turn_text(turns.size());
-    std::vector<uint8_t> turn_usable(turns.size(), 0);
-    for (size_t index = 0; index < turns.size(); ++index) {
-        const auto & turn = turns[index];
-        if (turn.role == "assistant" || turn.role == "model" ||
-            turn.role == "system" || turn.role == "developer" ||
-            turn.content_begin < 0 || turn.content_end < turn.content_begin ||
-            turn.content_end > (int) prompt.size()) {
-            continue;
-        }
-        turn_usable[index] = 1;
-        turn_text[index] = trim(tokenizer.decode(std::vector<int32_t>(
-            prompt.begin() + turn.content_begin, prompt.begin() + turn.content_end)));
-    }
-    const size_t wanted = (std::min)(count, human.size());
-    for (size_t k = 0; k < wanted; ++k) {
-        const size_t h = human.size() - 1 - k;
-        const std::string & content = human_text[h];
-        if (content.empty()) {
-            out.push_back({0, 0});
-            continue;
-        }
-        size_t same = 0;
-        size_t rank_from_end = 0;
-        for (size_t j = 0; j < human.size(); ++j) {
-            if (human_text[j] != content) continue;
-            ++same;
-            if (j > h) ++rank_from_end;
-        }
-        std::vector<size_t> matches;
-        for (size_t index = 0; index < turns.size(); ++index) {
-            if (turn_usable[index] && turn_text[index] == content) matches.push_back(index);
-        }
-        if (matches.size() != same) {
-            out.clear();
-            return false;
-        }
-        const auto & turn = turns[matches[matches.size() - 1 - rank_from_end]];
-        // The span of the message's exact content, its own leading and
-        // trailing whitespace included (the turn bounds trim whatever
-        // whitespace surrounds it): every token overlapping those characters.
-        const std::string & raw = messages[human[h]].content;
-        const size_t lead = raw.find_first_not_of(" \t\n\r");
-        const size_t seg_begin = char_at(turn.content_begin);
-        const size_t seg_end = char_at(turn.content_end);
-        const std::string seg = decoded.text.substr(seg_begin, seg_end - seg_begin);
-        const size_t seg_lead = seg.find_first_not_of(" \t\n\r");
-        if (seg_lead == std::string::npos || seg_begin + seg_lead < lead) {
-            out.clear();
-            return false;
-        }
-        const size_t char_begin = seg_begin + seg_lead - lead;
-        const size_t char_end = char_begin + raw.size();
-        if (char_end > decoded.text.size() ||
-            decoded.text.compare(char_begin, raw.size(), raw) != 0) {
-            out.clear();
-            return false;
-        }
-        const int begin = token_at_offset(decoded, char_begin);
-        const int end = (int) (std::lower_bound(decoded.token_begin.begin(),
-            decoded.token_begin.end(), char_end) - decoded.token_begin.begin());
-        out.push_back({begin, end});
-    }
-    return true;
 }
 
 int pflash_chat_skeleton_tokens() noexcept {
@@ -1978,18 +1783,25 @@ static std::string build_stall_tool_prefix(const json & tools,
     return prefix;
 }
 
+// The codec of the model's family. It renders the prompt unless a Jinja
+// template does; its request rules (the reasoning controls) hold either way.
+static std::unique_ptr<ChatCodec> model_chat_codec(const ServerConfig & config) {
+    if (!config.chat_codec.empty()) return make_chat_codec(config.chat_codec);
+    return make_chat_codec(default_chat_codec_for_arch(config.arch.empty() ? "qwen35" : config.arch));
+}
+
 // Build the /props response body.
 //
 // Non-static so unit tests can call it directly (declared in http_server.h).
 json build_props_body(const ServerConfig & config,
                       const PrefixCache & prefix_cache,
                       const ToolMemory & tool_memory) {
-    // arch-gated capabilities (mirrors Python _capabilities()).
+    // The Qwen and DeepSeek families reason and call tools, through their codecs.
     const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
-    const bool is_deepseek4 = (arch_is_deepseek4_family(config.arch));
-    const bool reasoning_supported = is_qwen || is_deepseek4;
+    const auto codec = model_chat_codec(config);
+    const bool reasoning_supported = codec != nullptr;
     const bool speculative_supported = is_qwen;
-    const bool tools_supported = is_qwen || arch_is_deepseek4_family(config.arch);
+    const bool tools_supported = codec != nullptr;
 
     auto pcs  = prefix_cache.stats();
     auto pcfs = prefix_cache.full_stats();
@@ -2011,16 +1823,8 @@ json build_props_body(const ServerConfig & config,
     // all activate the phase-1 envelope. Advertise the full set when the
     // arch supports reasoning so clients can negotiate the higher tiers.
     json reasoning_efforts = json::array();
-    if (is_qwen) {
-        reasoning_efforts.push_back("low");
-        reasoning_efforts.push_back("medium");
-        reasoning_efforts.push_back("high");
-        reasoning_efforts.push_back("x-high");
-        reasoning_efforts.push_back("max");
-    } else if (is_deepseek4) {
-        reasoning_efforts.push_back("low");
-        reasoning_efforts.push_back("high");
-        reasoning_efforts.push_back("max");
+    if (codec) {
+        for (const auto & tier : codec->effort_tiers()) reasoning_efforts.push_back(tier);
     }
 
     json server = {
@@ -2209,256 +2013,6 @@ json build_props_body(const ServerConfig & config,
     return body;
 }
 
-// Normalize Anthropic's `system` field (top-level on /v1/messages and
-// /v1/messages/count_tokens) into a leading `{role:"system", content:...}`
-// entry on `messages`. Accepts either a flat string or an array of typed
-// blocks (`[{type:"text", text:"..."}]`), and strips any
-// `x-anthropic-billing-header:`-prefixed block injected by Claude Code so
-// it never reaches the model or the token counter.
-//
-// Side-effect: prepends a system message to `messages` when the body has
-// a non-empty `system` field after billing-header filtering. No-op
-// otherwise. Both endpoints call this with identical semantics — having
-// one helper guarantees token counting and generation can't drift.
-static void normalize_anthropic_system(const json & body, json & messages) {
-    if (!body.contains("system")) return;
-    // Delegate strip to the pure fn; insert as system message.
-    std::string text = luce::common::normalize_system_for_cache(body["system"]);
-    if (!text.empty()) {
-        json sys_msg = {{"role", "system"}, {"content", text}};
-        messages.insert(messages.begin(), sys_msg);
-    }
-}
-
-static json normalize_tool_arguments(const json * arguments) {
-    if (!arguments) return json::object();
-    if (arguments->is_object()) return *arguments;
-    if (arguments->is_string()) {
-        const auto & text = arguments->get_ref<const std::string &>();
-        if (text.empty()) return json::object();
-        auto parsed = json::parse(text, nullptr, false);
-        if (parsed.is_object()) return parsed;
-    }
-    // Retain malformed/non-object arguments rather than silently losing them.
-    return json{{"arguments", *arguments}};
-}
-
-// Text of an Anthropic tool_result block: a string, or the text blocks of an
-// array (images and documents have no text form here).
-static std::string anthropic_tool_result_text(const json & block) {
-    if (!block.contains("content")) return {};
-    const auto & content = block["content"];
-    if (content.is_string()) return content.get<std::string>();
-    std::string text;
-    if (content.is_array()) {
-        for (const auto & part : content) {
-            if (!part.is_object() || part.value("type", "") != "text") continue;
-            if (!text.empty()) text += "\n";
-            text += part.value("text", "");
-        }
-    }
-    return text;
-}
-
-std::vector<ChatMessage> normalize_chat_messages(
-    const json & messages,
-    ApiFormat format,
-    ToolMemory & tool_memory,
-    bool replay_tool_memory) {
-    std::vector<ChatMessage> chat_msgs;
-    std::vector<std::string> system_parts;
-    ChatMessage response_turn;
-    std::vector<const json *> response_arguments;
-
-    auto append_call = [](ChatMessage & message, std::vector<const json *> & arguments,
-                          const json & function, std::string id, const char * argument_key) {
-        message.tool_calls.push_back({std::move(id), function.value("name", ""), {}});
-        const auto supplied = function.find(argument_key);
-        arguments.push_back(supplied == function.end() ? nullptr : &*supplied);
-    };
-    auto finish_calls = [&](ChatMessage & message, const std::vector<const json *> & arguments) {
-        if (message.tool_calls.empty()) return;
-        std::string raw;
-        if (replay_tool_memory && !tool_memory.disabled()) {
-            std::vector<std::string> ids;
-            ids.reserve(message.tool_calls.size());
-            for (const auto & call : message.tool_calls) ids.push_back(call.id);
-            // Empty IDs remain in the lookup: partial/id-less turns cannot replay.
-            raw = tool_memory.lookup(ids);
-        }
-        if (!raw.empty()) {
-            message.content = std::move(raw);
-            message.tool_calls_replayed = true;
-        } else {
-            for (size_t i = 0; i < message.tool_calls.size(); ++i) {
-                message.tool_calls[i].arguments = normalize_tool_arguments(arguments[i]);
-            }
-        }
-    };
-    auto flush_response_turn = [&]() {
-        if (response_turn.role.empty()) return;
-        finish_calls(response_turn, response_arguments);
-        chat_msgs.push_back(std::move(response_turn));
-        response_turn = {};
-        response_arguments.clear();
-    };
-
-    if (messages.is_array()) {
-        for (const auto & m : messages) {
-            if (format == ApiFormat::RESPONSES && m.is_object()) {
-                const std::string item_type = m.value("type", "message");
-                if (item_type == "function_call") {
-                    response_turn.role = "assistant";
-                    append_call(response_turn, response_arguments, m,
-                                m.value("call_id", m.value("id", "")), "arguments");
-                    continue;
-                }
-                if (item_type != "message" || m.value("role", "user") != "assistant") {
-                    flush_response_turn();
-                }
-                if (item_type == "function_call_output") {
-                    std::string output;
-                    if (m.contains("output") && m["output"].is_string()) {
-                        output = m["output"].get<std::string>();
-                    } else if (m.contains("output")) {
-                        output = m["output"].dump();
-                    }
-                    chat_msgs.push_back({"tool", std::move(output),
-                                         m.value("call_id", m.value("id", ""))});
-                    continue;
-                }
-            }
-
-            // Responses splits one assistant turn into message/function_call
-            // items. Keep adjacent items together for both raw and cold replay.
-            const std::string role = m.value("role", "user");
-            const bool response_assistant = format == ApiFormat::RESPONSES && role == "assistant";
-            ChatMessage local_message;
-            std::vector<const json *> local_arguments;
-            ChatMessage & cm = response_assistant ? response_turn : local_message;
-            auto & arguments = response_assistant ? response_arguments : local_arguments;
-            cm.role = role;
-
-            // Carry a replayed assistant turn's prior <think> text through to
-            // the Jinja renderer as message.reasoning_content (OpenAI/DeepSeek
-            // dialect; `reasoning` is the OpenRouter/Anthropic-gateway flat
-            // alias — same field the response side emits, see
-            // format_response_message's reasoning_content/reasoning/
-            // reasoning_details trio below).
-            if (cm.role == "assistant") {
-                if (m.contains("reasoning_content") && m["reasoning_content"].is_string()) {
-                    cm.reasoning_content = m["reasoning_content"].get<std::string>();
-                } else if (m.contains("reasoning") && m["reasoning"].is_string()) {
-                    cm.reasoning_content = m["reasoning"].get<std::string>();
-                }
-            }
-
-            const bool anthropic_blocks = format == ApiFormat::ANTHROPIC &&
-                m.contains("content") && m["content"].is_array();
-
-            // Anthropic tool results precede any user text in the same turn.
-            if (anthropic_blocks && cm.role == "user") {
-                bool has_results = false;
-                std::string text;
-                for (const auto & part : m["content"]) {
-                    if (!part.is_object()) continue;
-                    const std::string ptype = part.value("type", "");
-                    if (ptype == "tool_result") {
-                        chat_msgs.push_back({"tool", anthropic_tool_result_text(part),
-                                             part.value("tool_use_id", "")});
-                        has_results = true;
-                    } else if (ptype == "text") {
-                        text += part.value("text", "");
-                    }
-                }
-                if (has_results) {
-                    if (!text.empty()) chat_msgs.push_back({"user", std::move(text)});
-                    continue;
-                }
-            }
-
-            if (cm.role == "assistant" && m.contains("tool_calls") &&
-                m["tool_calls"].is_array()) {
-                cm.tool_calls.reserve(cm.tool_calls.size() + m["tool_calls"].size());
-                arguments.reserve(arguments.size() + m["tool_calls"].size());
-                for (const auto & tc : m["tool_calls"]) {
-                    if (!tc.is_object()) continue;
-                    const auto function = tc.find("function");
-                    if (function == tc.end() || !function->is_object()) continue;
-                    append_call(cm, arguments, *function, tc.value("id", ""), "arguments");
-                }
-            }
-            if (anthropic_blocks && cm.role == "assistant") {
-                for (const auto & part : m["content"]) {
-                    if (!part.is_object() || part.value("type", "") != "tool_use") continue;
-                    append_call(cm, arguments, part, part.value("id", ""), "input");
-                }
-            }
-
-            if (!response_assistant) finish_calls(cm, arguments);
-            if (!cm.tool_calls_replayed) {
-                std::string text;
-                if (m.contains("content") && m["content"].is_string()) {
-                    text = m["content"].get<std::string>();
-                } else if (m.contains("content") && m["content"].is_array()) {
-                    for (const auto & part : m["content"]) {
-                        if (!part.is_object()) continue;
-                        const std::string ptype = part.value("type", "");
-                        if (ptype == "text" || ptype == "input_text" || ptype == "output_text") {
-                            text += part.value("text", "");
-                        }
-                    }
-                }
-                if (!text.empty()) {
-                    if (cm.content.empty()) {
-                        cm.content = std::move(text);
-                    } else {
-                        cm.content += "\n\n";
-                        cm.content += text;
-                    }
-                }
-            }
-            if (cm.role == "tool" || cm.role == "function") {
-                cm.tool_call_id = m.value("tool_call_id", "");
-                cm.tool_name = m.value("name", "");
-            }
-            if (response_assistant) continue;
-
-            if (format == ApiFormat::RESPONSES && (cm.role == "system" || cm.role == "developer")) {
-                system_parts.push_back(std::move(cm.content));
-            } else {
-                chat_msgs.push_back(std::move(cm));
-            }
-        }
-        flush_response_turn();
-    } else if (messages.is_string()) {
-        chat_msgs.push_back({"user", messages.get<std::string>()});
-    }
-
-    if (!system_parts.empty()) {
-        std::string merged_system;
-        for (size_t i = 0; i < system_parts.size(); i++) {
-            if (i) merged_system += "\n\n";
-            merged_system += system_parts[i];
-        }
-        chat_msgs.insert(chat_msgs.begin(), {"system", std::move(merged_system)});
-    }
-
-    // Resolve names only after the message vector is stable; views avoid
-    // copying IDs/names while associating out-of-order tool results.
-    std::unordered_map<std::string_view, std::string_view> tool_names;
-    for (auto & message : chat_msgs) {
-        for (const auto & call : message.tool_calls) {
-            if (!call.id.empty()) tool_names[call.id] = call.name;
-        }
-        if (message.tool_name.empty() && !message.tool_call_id.empty()) {
-            const auto name = tool_names.find(message.tool_call_id);
-            if (name != tool_names.end()) message.tool_name = name->second;
-        }
-    }
-    return chat_msgs;
-}
-
 // ─── Disk-cache identity salt ───────────────────────────────────────────
 // Compute a 16-byte salt from inputs that affect KV cache validity:
 //   model path + stat(size + mtime)  [covers rope/yarn — GGUF-derived],
@@ -2533,9 +2087,14 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
                      path.c_str());
     }
 
-    // Hash chat_template_src separately (can be large; fold as digest).
+    // Hash chat_template_src separately (can be large; fold as digest). A chat
+    // codec's ID (name and version) joins it: a rendering change invalidates.
     uint8_t tmpl_digest[20] = {};
-    sha1_hash(cfg.chat_template_src.data(), cfg.chat_template_src.size(), tmpl_digest);
+    std::string prompt_format = cfg.chat_template_src;
+    if (const auto codec = make_chat_codec(cfg.chat_codec)) {
+        prompt_format += std::string(1, '\0') + "chat-codec:" + codec->id();
+    }
+    sha1_hash(prompt_format.data(), prompt_format.size(), tmpl_digest);
 
     // Serialization: path_len(4) + path + file_size(8) + file_mtime(8) + max_ctx(4) + tmpl_digest(20) + k_rotated(1).
     std::vector<uint8_t> buf;
@@ -2702,6 +2261,15 @@ PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
     return out;
 }
 
+// The codec the server renders with: the configured one, else (without a
+// Jinja template) the arch's when the arch has no built-in renderer. An
+// unset arch (tests) is the Qwen3.5 dense one.
+static std::string server_chat_codec(const ServerConfig & config) {
+    if (!config.chat_codec.empty() || !config.chat_template_src.empty()) return config.chat_codec;
+    const std::string arch = config.arch.empty() ? std::string("qwen35") : config.arch;
+    return chat_format_for_arch(arch) ? std::string() : default_chat_codec_for_arch(arch);
+}
+
 HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                        Tokenizer & tokenizer,
                        const ServerConfig & config)
@@ -2709,7 +2277,8 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     , backend_(engine.backend())
     , tokenizer_(tokenizer)
     , config_(config)
-    , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
+    , chat_format_(chat_format_for_arch(config.arch))
+    , chat_codec_(make_chat_codec(server_chat_codec(config)))
     , prefix_cache_(config.prefix_cache_cap, tokenizer,
           resolve_prefix_cache_budget(config, engine.backend()).bytes)
     , disk_cache_({config.disk_cache_dir,
@@ -2719,6 +2288,9 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                    config.disk_cache_cold_max_tokens,
                    disk_cache_ttl_seconds(config.disk_cache_ttl_hours)}, backend_)
 {
+    if (!config_.chat_codec.empty() && !chat_codec_) {
+        throw std::invalid_argument("unknown chat codec: " + config_.chat_codec);
+    }
     config_.image_input_enabled = backend_.supports_images() &&
         config_.pflash_upstream_base.empty() &&
         (!backend_.seq_engine() || backend_.seq_engine()->supports_images());
@@ -3730,9 +3302,10 @@ bool HttpServer::attach_output_constraint(SocketHandle fd, ParsedRequest & req) 
     const bool must_call = has_tools && http_detail::tool_choice_requires_call(req.tool_choice);
     if (schema.is_null() && !must_call) return true;
 
-    // With tools the reply may call one first; a forced call must.
-    std::vector<std::string> openers = has_tools ? tool_call_openers(req.tools)
-                                                 : std::vector<std::string>{};
+    // With tools the reply may call one first; a forced call must. A codec
+    // allows only its template's call format.
+    std::vector<std::string> openers;
+    if (has_tools) openers = chat_codec_ ? chat_codec_->tool_call_openers() : tool_call_openers(req.tools);
     std::string grammar;
     try {
         grammar = http_detail::output_constraint_grammar(
@@ -3916,6 +3489,8 @@ void apply_request_reasoning(
     req.per_req_phase1_cap = -1;
     req.per_req_reply_budget = -1;
     req.preserve_thinking = -1;
+    // The model's API reads the effort words and the template's kwargs.
+    const auto codec = model_chat_codec(config);
 
     auto apply_reasoning_effort = [&](const std::string & effort) {
         if (effort == "none") {
@@ -3925,34 +3500,14 @@ void apply_request_reasoning(
             return;
         }
 
-        // Five-tier vocabulary (spec §4.2). Unknown tier → high.
+        // Five-tier vocabulary (spec §4.2), as the model's API reads the word.
+        const std::string tier = codec ? codec->effort_tier(effort) : lucebox_effort_tier(effort);
         int tier_value = config.effort_tiers.high;
-        if (effort == "minimal" || effort == "low") {
-            tier_value = config.effort_tiers.low;
-            normalized_effort = "low";
-        } else if (effort == "medium") {
-            tier_value = config.effort_tiers.medium;
-            normalized_effort = arch_is_deepseek4_family(config.arch) ? "high" : "medium";
-        } else if (effort == "xhigh") {
-            // DeepSeek V4 Flash's OpenAI-compatible APIs map xhigh to high.
-            // Other architectures retain Lucebox's x-high tier alias.
-            if (arch_is_deepseek4_family(config.arch)) {
-                tier_value = config.effort_tiers.high;
-                normalized_effort = "high";
-            } else {
-                tier_value = config.effort_tiers.x_high;
-                normalized_effort = "x-high";
-            }
-        } else if (effort == "x-high") {
-            // Hyphenated x-high is Lucebox's explicit five-tier extension.
-            tier_value = config.effort_tiers.x_high;
-            normalized_effort = arch_is_deepseek4_family(config.arch) ? "max" : "x-high";
-        } else if (effort == "max") {
-            tier_value = config.effort_tiers.max;
-            normalized_effort = "max";
-        } else {
-            normalized_effort = "high";
-        }
+        if (tier == "low") tier_value = config.effort_tiers.low;
+        else if (tier == "medium") tier_value = config.effort_tiers.medium;
+        else if (tier == "x-high") tier_value = config.effort_tiers.x_high;
+        else if (tier == "max") tier_value = config.effort_tiers.max;
+        normalized_effort = codec ? codec->template_effort(tier) : tier;
 
         effort_phase1_cap = tier_value;
         effort_set = true;
@@ -3969,10 +3524,19 @@ void apply_request_reasoning(
             enable_thinking = true;
         }
     }
+    // An integer effort, where the template has its own scale.
+    auto apply_integer_effort = [&](const json & value) {
+        if (!codec || !codec->integer_effort() || !value.is_number_integer()) return;
+        const int64_t effort = value.get<int64_t>();
+        if (effort < 1 || effort > 100) return;
+        apply_reasoning_effort("high");
+        normalized_effort = std::to_string(effort);
+    };
     if (!effort_set && body.contains("reasoning_effort") &&
         body["reasoning_effort"].is_string()) {
         apply_reasoning_effort(body["reasoning_effort"].get<std::string>());
     }
+    if (!effort_set && body.contains("reasoning_effort")) apply_integer_effort(body["reasoning_effort"]);
     if (body.contains("thinking") && body["thinking"].is_object()) {
         const auto & thinking = body["thinking"];
         // "adaptive" (Claude Code's default) leaves thinking to the model: the
@@ -3999,6 +3563,7 @@ void apply_request_reasoning(
             apply_reasoning_effort(
                 kwargs["reasoning_effort"].get<std::string>());
         }
+        if (!effort_set && kwargs.contains("reasoning_effort")) apply_integer_effort(kwargs["reasoning_effort"]);
         if (kwargs.contains("thinking") && kwargs["thinking"].is_boolean()) {
             enable_thinking = kwargs["thinking"].get<bool>();
         }
@@ -4009,13 +3574,18 @@ void apply_request_reasoning(
             kwargs["preserve_thinking"].is_boolean()) {
             req.preserve_thinking = kwargs["preserve_thinking"].get<bool>() ? 1 : 0;
         }
+        // DeepSeek's encoder option (encode_messages' drop_thinking).
+        if (codec && codec->drop_thinking_kwarg() && kwargs.contains("drop_thinking") &&
+            kwargs["drop_thinking"].is_boolean()) {
+            req.preserve_thinking = kwargs["drop_thinking"].get<bool>() ? 0 : 1;
+        }
     }
-    // DeepSeek uses high whenever thinking is enabled without an explicit
-    // model-facing effort. Only API-style thinking.type="enabled" also selects
-    // the high budget tier; bare template toggles affect rendering alone.
-    if (enable_thinking && arch_is_deepseek4_family(config.arch) &&
-        normalized_effort.empty()) {
-        normalized_effort = "high";
+    // The template's effort when thinking is on without one (DeepSeek: high).
+    // Only API-style thinking.type="enabled" also selects the high budget
+    // tier; bare template toggles affect rendering alone.
+    if (enable_thinking && codec && normalized_effort.empty() &&
+        !codec->default_effort().empty()) {
+        normalized_effort = codec->default_effort();
         if (req.thinking_opt_in) {
             effort_phase1_cap = config.effort_tiers.high;
             effort_set = true;
@@ -4074,16 +3644,80 @@ void apply_request_reasoning(
     // reply reserve falls back to --hard-limit-reply-budget.)
 }
 
+// The request's tool definitions in the client's key order (none once a
+// caller has emptied req.tools).
+static nlohmann::ordered_json prompt_tools(const ParsedRequest & req) {
+    if (!req.tools.is_array() || req.tools.empty()) return nullptr;
+    if (req.ordered_tools.is_array() && req.ordered_tools.size() == req.tools.size()) {
+        return req.ordered_tools;
+    }
+    return req.tools;
+}
+
+static bool render_with_codec(
+        const ChatCodec & codec, const std::string & image_marker, TurnMemory & memory,
+        const std::vector<ChatMessage> & chat_messages, const ParsedRequest & req,
+        bool add_generation_prompt, RenderedPrompt & prompt, std::string & error) {
+    const nlohmann::ordered_json tools = prompt_tools(req);
+    ChatCodecInput input;
+    input.messages = &chat_messages;
+    input.tools = &tools;
+    input.add_generation_prompt = add_generation_prompt;
+    input.enable_thinking = req.thinking_enabled;
+    input.reasoning_effort = req.reasoning_effort;
+    input.preserve_thinking = req.preserve_thinking;
+    input.image_marker = image_marker;
+    input.memory = &memory;
+    if (codec.render(input, prompt, error)) return true;
+    error = "chat template rejected the messages: " + error;
+    return false;
+}
+
+bool HttpServer::render_messages_to_tokens(
+        const std::vector<ChatMessage> & chat_messages,
+        const ParsedRequest & req, bool add_generation_prompt,
+        std::string & rendered, std::vector<int32_t> & tokens,
+        std::string & error, std::string * context) {
+    if (context) context->clear();
+    if (!chat_codec_) {
+        if (!render_messages_to_text(chat_messages, req, add_generation_prompt, rendered, error)) {
+            return false;
+        }
+        tokens = tokenizer_.encode(rendered);
+        return true;
+    }
+    RenderedPrompt prompt;
+    if (!render_with_codec(*chat_codec_, backend_.image_placeholder(), turn_memory_, chat_messages, req,
+                           add_generation_prompt, prompt, error)) {
+        return false;
+    }
+    rendered = prompt.text();
+    tokens = prompt.tokens(tokenizer_);
+    if (context) *context = std::move(prompt.context);
+    return true;
+}
+
 bool HttpServer::render_messages_to_text(
         const std::vector<ChatMessage> & chat_messages,
         const ParsedRequest & req, bool add_generation_prompt,
         std::string & rendered, std::string & error) {
+    if (chat_codec_) {
+        RenderedPrompt prompt;
+        if (!render_with_codec(*chat_codec_, backend_.image_placeholder(), turn_memory_, chat_messages, req,
+                               add_generation_prompt, prompt, error)) {
+            return false;
+        }
+        rendered = prompt.text();
+        return true;
+    }
     std::string tools_json;
     if (req.tools.is_array() && !req.tools.empty()) {
         tools_json = req.tools.dump();
     }
 
     if (!config_.chat_template_src.empty()) {
+        // Templates see the client's key order, as with Hugging Face.
+        if (!tools_json.empty()) tools_json = prompt_tools(req).dump();
         // Custom templates receive structured calls and normalized schemas;
         // unlike the built-in renderers, they cannot safely replay raw turns.
         //
@@ -4107,10 +3741,13 @@ bool HttpServer::render_messages_to_text(
             error = std::string("chat template (jinja) render failed: ") + e.what();
             return false;
         }
+    } else if (!chat_format_) {
+        error = "this model renders only with its chat codec or a --chat-template-file";
+        return false;
     } else {
         rendered = render_chat_template(
-            chat_messages, chat_format_, add_generation_prompt,
-            req.thinking_enabled, tools_json, req.reasoning_effort);
+            chat_messages, *chat_format_, add_generation_prompt,
+            req.thinking_enabled, tools_json);
     }
 
     return true;
@@ -4121,16 +3758,16 @@ bool HttpServer::render_and_tokenize_request(
         SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
         ParsedRequest & req) {
     std::string error;
-    if (!render_messages_to_text(chat_messages, req,
-                                 /*add_generation_prompt=*/true,
-                                 req.rendered_prompt, error)) {
+    if (!render_messages_to_tokens(chat_messages, req,
+                                   /*add_generation_prompt=*/true,
+                                   req.rendered_prompt, req.prompt_tokens, error,
+                                   &req.prompt_context)) {
         // The template rejected these messages: a client error, which a
         // client must not retry as it would a server failure.
         send_error(fd, 400, error);
         return false;
     }
     req.started_in_thinking = prompt_ends_in_open_think(req.rendered_prompt);
-    req.prompt_tokens = tokenizer_.encode(req.rendered_prompt);
     return true;
 }
 
@@ -4240,6 +3877,18 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
         req.output_format = http_detail::request_output_format(hr.body);
         if (!parse_endpoint_request(
                 hr.path, req.raw_body, req, count_tokens_only)) return false;
+        if (hr.body.find("\"tools\"") != std::string::npos) {
+            // json sorts object keys; the prompt shows tools as the client wrote them.
+            const auto ordered = nlohmann::ordered_json::parse(hr.body, nullptr, false);
+            if (ordered.is_object() && ordered.contains("tools")) req.ordered_tools = ordered["tools"];
+        }
+        if (req.format == ApiFormat::ANTHROPIC && hr.body.find("\"tool_use\"") != std::string::npos) {
+            // json sorts object keys; a call's input renders as the client wrote it.
+            const auto ordered = nlohmann::ordered_json::parse(hr.body, nullptr, false);
+            if (ordered.is_object() && ordered.contains("messages")) {
+                keep_anthropic_input_order(ordered["messages"], req.messages);
+            }
+        }
         return models_.empty()
             ? handle_model_request(fd, req, count_tokens_only)
             : route_model_request(fd, req, count_tokens_only);
@@ -4282,7 +3931,7 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
 
         const std::vector<ChatMessage> chat_messages =
             normalize_chat_messages(req.messages, req.format, tool_memory_,
-                                    config_.chat_template_src.empty());
+                                    replays_call_ids(), text_part_separator());
         req.ends_with_tool_result =
             http_detail::ends_with_tool_result(chat_messages);
         // Reasoning must be applied BEFORE rendering: the template injects
@@ -4477,7 +4126,8 @@ bool create_socket_pair(SocketHandle pair[2]) {
 bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * admission,
                                        int & status, std::string & body,
                                        SocketHandle client_fd, bool * dropped_tool_call,
-                                       bool note_pass) {
+                                       bool note_pass,
+                                       const nlohmann::ordered_json * ordered_tools) {
     SocketHandle pair[2];
     if (!create_socket_pair(pair)) {
         status = 500;
@@ -4517,6 +4167,10 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
         parse_endpoint_request("/v1/chat/completions", inner.raw_body, inner, count_only);
         auto dropped = std::make_shared<bool>(false);
         inner.dropped_tool_call_out = dropped;
+        if (ordered_tools && ordered_tools->is_array() && inner.raw_body.contains("tools") &&
+            json(*ordered_tools) == inner.raw_body["tools"]) {
+            inner.ordered_tools = *ordered_tools;
+        }
         inner.tool_checks_pass = true;
         inner.tool_checks_note = note_pass;
         handle_model_request(pair[0], inner, false, admission ? &outcome : nullptr);
@@ -4571,7 +4225,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         std::string raw;
         bool dropped_here = false;
         if (!inner_chat_completion(body, nullptr, status, raw, fd, &dropped_here,
-                                   /*note_pass=*/true) ||
+                                   /*note_pass=*/true, &req.ordered_tools) ||
             status != 200) {
             return false;
         }
@@ -4583,7 +4237,10 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
     int status = 0;
     std::string raw;
     bool dropped_call = false;
-    if (!inner_chat_completion(request, admission, status, raw, fd, &dropped_call)) return true;
+    if (!inner_chat_completion(request, admission, status, raw, fd, &dropped_call,
+                               /*note_pass=*/false, &req.ordered_tools)) {
+        return true;
+    }
     json response = json::parse(raw, nullptr, false);
     json * reply = status == 200 && !response.is_discarded() ? tc::reply_message(response) : nullptr;
     if (!reply) {
@@ -4693,362 +4350,11 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
 
 // ─── Worker thread ──────────────────────────────────────────────────────
 
-// Non-streaming response serialization is API-specific but independent of
-// prompt preparation and model execution.
-
 namespace {
 
 // Disk-cache staging lives above both PrefixCache pools.
 constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
 
-
-struct CompletionTokenCounts {
-    int total = 0;
-    int reasoning = 0;
-    int content = 0;
-};
-
-enum class TokenDelivery {
-    kSkip,      // EOS or internal control marker — never reaches the emitter
-    kThinkTag,  // thinking-boundary marker mapped to its <think> text form
-    kText,      // ordinary text (token_text may still be empty)
-};
-
-// Classifies one generated token for delivery to the SseEmitter, filling
-// `text` with the deliverable form for kThinkTag / kText. Shared by the
-// streaming on_token callback and the non-streaming replay: the two paths
-// MUST classify identically, or the reasoning/content split diverges
-// between streamed and non-streamed responses.
-TokenDelivery classify_generated_token(
-        Tokenizer & tokenizer, SseEmitter & emitter,
-        int32_t token, std::string & text) {
-    if (token == tokenizer.eos_id() || token == tokenizer.eos_chat_id()) {
-        return TokenDelivery::kSkip;
-    }
-
-    const std::string & raw = tokenizer.raw_token(token);
-    if (emitter.suppress_undeclared_tool_protocol_token(raw)) {
-        return TokenDelivery::kSkip;
-    }
-
-    // Gemma4 thinking channel (<|channel> / <channel|>) and Qwen3.6
-    // thinking markers share one mapped dialect. The Qwen markers
-    // <think> (id 248068) and </think> (id 248069) are SINGLE special
-    // tokens in the added_tokens vocab: without this mapping they would
-    // hit the generic "<...>" strip below and be silently dropped, the
-    // emitter would never see the reasoning→content transition, and the
-    // whole answer would land in reasoning_content with empty content.
-    if (raw == "<|channel>" || raw == "<think>") {
-        text = "<think>";
-        return TokenDelivery::kThinkTag;
-    }
-    if (raw == "<channel|>" || raw == "</think>") {
-        text = "</think>\n";
-        return TokenDelivery::kThinkTag;
-    }
-
-    // Bailing V3 stores its tool-call XML delimiters as added special
-    // tokens. They are part of the model's public output protocol, not chat
-    // control markers: keep them so the shared parser can reconstruct an
-    // OpenAI `tool_calls` object. Stripping them leaves only three unrelated
-    // text lines (function name, argument name, value).
-    if (raw == "<tool_call>" || raw == "</tool_call>" ||
-        raw == "<arg_key>" || raw == "</arg_key>" ||
-        raw == "<arg_value>" || raw == "</arg_value>") {
-        text = raw;
-        return TokenDelivery::kText;
-    }
-
-    // Other special tokens are internal control markers. Byte-fallback
-    // tokens such as <0xAB> are text and must still reach the emitter.
-    if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') {
-        return TokenDelivery::kSkip;
-    }
-    if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>' &&
-        !(raw.size() == 6 && raw[1] == '0' && raw[2] == 'x')) {
-        return TokenDelivery::kSkip;
-    }
-
-    text = tokenizer.token_text(token);
-    return TokenDelivery::kText;
-}
-
-CompletionTokenCounts feed_non_streaming_tokens(
-        const std::vector<int32_t> & tokens, Tokenizer & tokenizer,
-        SseEmitter & emitter, int generation_cap) {
-    // The live token callback already classified these tokens on this
-    // emitter; a reply cut off inside a suppressed block left it open.
-    emitter.restart_tool_protocol_suppression();
-    for (int32_t token : tokens) {
-        std::string text;
-        const TokenDelivery delivery =
-            classify_generated_token(tokenizer, emitter, token, text);
-        if (delivery == TokenDelivery::kSkip) continue;
-
-        emitter.emit_token(text);
-        // Matching the streaming path, only ordinary text is checked
-        // against stop sequences — think-tag markers never count.
-        if (delivery == TokenDelivery::kText && emitter.stop_hit()) break;
-    }
-
-    CompletionTokenCounts counts;
-    counts.total = (int) tokens.size();
-    const bool is_eos = !tokens.empty() &&
-        (tokens.back() == tokenizer.eos_id() ||
-         tokens.back() == tokenizer.eos_chat_id());
-    emitter.emit_finish(counts.total, nullptr, generation_cap, is_eos);
-
-    // Split reasoning vs content at the emitter's REASONING→CONTENT
-    // transition; see first_content_token_index() in sse_emitter.h.
-    // Skipped specials mean `emitted` can be below counts.total — the
-    // remainder is unattributed (e.g. TOOL_BUFFER).
-    const int first_content = emitter.first_content_token_index();
-    const int emitted = emitter.emit_token_count();
-    counts.reasoning = first_content < 0 ? emitted : first_content;
-    counts.content = first_content < 0 ? 0 : emitted - first_content;
-    return counts;
-}
-
-json build_openai_completion_response(
-        const ParsedRequest & req, const GenerateResult & result,
-        int generation_cap, const GenTimings & timings,
-        const CompletionTokenCounts & counts, const SseEmitter & emitter,
-        const Tokenizer * tokenizer = nullptr) {
-    json message = {
-        {"role", "assistant"},
-        {"content", emitter.accumulated_text()},
-    };
-    if (!emitter.reasoning_text().empty()) {
-        // Multi-dialect reasoning emission — same text, three keys. See
-        // docs/specs/thinking-budget.md "Response shape — multi-dialect
-        // aliasing".
-        //   reasoning_content : DeepSeek R1 / dflash primary
-        //   reasoning         : OpenRouter / Anthropic-gateway flat
-        //   reasoning_details : typed-block list; single block.
-        const std::string & reasoning = emitter.reasoning_text();
-        message["reasoning_content"] = reasoning;
-        message["reasoning"] = reasoning;
-        message["reasoning_details"] = json::array({
-            {{"type", "reasoning.text"}, {"text", reasoning}},
-        });
-    }
-    if (!emitter.tool_calls().empty()) {
-        json tool_calls = json::array();
-        for (const auto & tool_call : emitter.tool_calls()) {
-            tool_calls.push_back({
-                {"id", tool_call.id},
-                {"type", "function"},
-                {"function", {
-                    {"name", tool_call.name},
-                    {"arguments", tool_call.arguments},
-                }},
-            });
-        }
-        message["tool_calls"] = tool_calls;
-    }
-    // The emitter only knows "stop" / "tool_calls"; it cannot see that the
-    // daemon hit the n_gen cap. Derive "length" from the committed-token
-    // count — OpenAI-compatible clients (open-webui, Cline) gate retry
-    // logic on finish_reason == "length".
-    const bool is_eos = tokenizer && !result.tokens.empty() &&
-        (result.tokens.back() == tokenizer->eos_id() ||
-         result.tokens.back() == tokenizer->eos_chat_id());
-    std::string finish_reason = emitter.finish_reason();
-    if (finish_reason == "stop" && !is_eos && counts.total >= generation_cap) {
-        finish_reason = "length";
-    }
-    // Degenerate decode (post-close repetition-loop watchdog) also reports
-    // "length": OpenAI/Anthropic/Gemini all collapse budget-class events
-    // into one closed enum, with richer signal in sidecar fields below.
-    if (result.degenerate_decode_close) finish_reason = "length";
-
-    json choice = {
-        {"index", 0},
-        {"message", message},
-        {"finish_reason", finish_reason},
-    };
-    if (req.thinking_opt_in) {
-        // finish_details mirrors ds4_eval.c's eval_think_close_info.
-        // close_kind is "natural" when the model closed its own thinking
-        // block, "hard" when the BudgetHook force-closed it at the budget
-        // boundary. See docs/specs/thinking-budget.md "v2 design".
-        choice["finish_details"] = {
-            {"close_kind", result.budget_forced_close ? "hard" : "natural"},
-            {"thinking_tokens", counts.reasoning},
-            {"content_tokens", counts.content},
-            {"total_tokens", counts.total},
-        };
-        // Honest signaling: the answer after an aborted repetition loop is
-        // unreliable; surface that without breaking the finish_reason enum.
-        if (result.degenerate_decode_close) {
-            choice["finish_details"]["degenerate_decode"] = true;
-        }
-    }
-
-    // usage.completion_tokens_details.reasoning_tokens — OpenAI o1/o3
-    // standard location; kept in sync with finish_details.thinking_tokens.
-    // usage.timings — per-request prefill/decode wall clock, additive to
-    // the OpenAI shape (ignored by clients that don't recognize it).
-    // spec_decode_ran disambiguates a real zero-acceptance speculative run
-    // from an autoregressive fallback. See docs/specs/thinking-budget.md §6.3.
-    const int prompt_tokens = usage_prompt_tokens(req);
-    const json usage = {
-        {"prompt_tokens", prompt_tokens},
-        {"completion_tokens", counts.total},
-        {"total_tokens", prompt_tokens + counts.total},
-        {"completion_tokens_details", {
-            {"reasoning_tokens", counts.reasoning},
-        }},
-        {"prompt_tokens_details", {
-            {"cached_tokens", timings.cached_prefix_tokens},
-        }},
-        {"timings", build_timings_json(timings, counts.total)},
-        {"accept_rate", result.accept_rate},
-        {"spec_decode_ran", result.spec_decode_ran},
-    };
-    return {
-        {"id", req.response_id},
-        {"object", "chat.completion"},
-        {"created", std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count()},
-        {"model", req.model},
-        {"choices", json::array({choice})},
-        {"usage", usage},
-    };
-}
-
-json build_anthropic_response(
-        const ParsedRequest & req, const GenerateResult & result,
-        int generation_cap, const GenTimings & timings,
-        const CompletionTokenCounts & counts, const SseEmitter & emitter,
-        const Tokenizer * tokenizer = nullptr) {
-    json content = json::array();
-    if (!emitter.reasoning_text().empty()) {
-        content.push_back({
-            {"type", "thinking"},
-            {"thinking", emitter.reasoning_text()},
-        });
-    }
-    // Tool-only replies intentionally omit an empty text block; Anthropic
-    // clients expect the tool_use blocks to stand alone.
-    if (!emitter.accumulated_text().empty()) {
-        content.push_back({
-            {"type", "text"},
-            {"text", emitter.accumulated_text()},
-        });
-    }
-    for (const auto & tool_call : emitter.tool_calls()) {
-        json input = json::object();
-        if (!tool_call.arguments.empty()) {
-            json parsed = json::parse(tool_call.arguments, nullptr, false);
-            if (!parsed.is_discarded() && parsed.is_object()) {
-                input = std::move(parsed);
-            } else {
-                input = {{"_raw", tool_call.arguments}};
-            }
-        }
-        content.push_back({
-            {"type", "tool_use"},
-            {"id", tool_call.id},
-            {"name", tool_call.name},
-            {"input", std::move(input)},
-        });
-    }
-
-    // stop_reason is Anthropic's analog of finish_reason, with the same
-    // length-vs-EOS distinction — Cline / Anthropic SDK clients gate
-    // retry logic on stop_reason == "max_tokens".
-    const bool is_eos = tokenizer && !result.tokens.empty() &&
-        (result.tokens.back() == tokenizer->eos_id() ||
-         result.tokens.back() == tokenizer->eos_chat_id());
-    std::string stop_reason;
-    if (emitter.finish_reason() == "tool_calls") {
-        stop_reason = "tool_use";
-    } else if (!is_eos && counts.total >= generation_cap) {
-        stop_reason = "max_tokens";
-    } else {
-        stop_reason = "end_turn";
-    }
-
-    const json usage = {
-        {"input_tokens", usage_prompt_tokens(req)},
-        {"output_tokens", counts.total},
-        {"timings", build_timings_json(timings, counts.total)},
-        {"accept_rate", result.accept_rate},
-        {"spec_decode_ran", result.spec_decode_ran},
-    };
-    return {
-        {"id", req.response_id},
-        {"type", "message"},
-        {"role", "assistant"},
-        {"model", req.model},
-        {"content", content},
-        {"stop_reason", stop_reason},
-        {"usage", usage},
-    };
-}
-
-json build_responses_api_response(
-        const ParsedRequest & req, const GenerateResult & result,
-        const GenTimings & timings, const CompletionTokenCounts & counts,
-        const SseEmitter & emitter) {
-    // The same items as the stream's response.completed: the assistant
-    // message first, then one function_call item per call.
-    const json output = responses_output_items(
-        req.response_id + "_msg", emitter.accumulated_text(), emitter.tool_calls());
-
-    const int prompt_tokens = usage_prompt_tokens(req);
-    const json usage = {
-        {"input_tokens", prompt_tokens},
-        {"output_tokens", counts.total},
-        {"total_tokens", prompt_tokens + counts.total},
-        {"input_tokens_details", {
-            {"cached_tokens", timings.cached_prefix_tokens},
-        }},
-        {"timings", build_timings_json(timings, counts.total)},
-        {"accept_rate", result.accept_rate},
-        {"spec_decode_ran", result.spec_decode_ran},
-    };
-    json response = {
-        {"id", req.response_id},
-        {"object", "response"},
-        {"model", req.model},
-        {"output", output},
-        {"usage", usage},
-    };
-    set_responses_status(response, emitter.hit_output_cap());
-    return response;
-}
-
-json build_non_streaming_response(
-        const ParsedRequest & req, const GenerateResult & result,
-        int generation_cap, const GenTimings & timings,
-        const CompletionTokenCounts & counts, SseEmitter & emitter,
-        const Tokenizer * tokenizer = nullptr) {
-    switch (req.format) {
-    case ApiFormat::OPENAI_CHAT:
-        return build_openai_completion_response(
-            req, result, generation_cap, timings, counts, emitter, tokenizer);
-    case ApiFormat::ANTHROPIC:
-        return build_anthropic_response(
-            req, result, generation_cap, timings, counts, emitter, tokenizer);
-    case ApiFormat::RESPONSES:
-        return build_responses_api_response(
-            req, result, timings, counts, emitter);
-    default:
-        return {{"text", emitter.accumulated_text()}};
-    }
-}
-
-json build_non_streaming_response(
-        const ParsedRequest & req, const GenerateResult & result,
-        int generation_cap, const GenTimings & timings, Tokenizer & tokenizer,
-        SseEmitter & emitter) {
-    const CompletionTokenCounts counts = feed_non_streaming_tokens(
-        result.tokens, tokenizer, emitter, generation_cap);
-    return build_non_streaming_response(
-        req, result, generation_cap, timings, counts, emitter, &tokenizer);
-}
 
 // Prompt preparation applies exactly one compression policy: FlowKV for
 // continuations, a verbatim turn-one anchor, or whole-prompt PFlash.
@@ -5283,13 +4589,14 @@ void HttpServer::apply_flowkv_compression(
     }
 
     const std::vector<ChatMessage> chat_messages = normalize_chat_messages(
-        modified_messages, req.format, tool_memory_, config_.chat_template_src.empty());
+        modified_messages, req.format, tool_memory_, replays_call_ids(), text_part_separator());
 
     std::string rendered;
+    std::vector<int32_t> rendered_tokens;
     std::string render_error;
-    if (!render_messages_to_text(
+    if (!render_messages_to_tokens(
             chat_messages, req, /*add_generation_prompt=*/true,
-            rendered, render_error)) {
+            rendered, rendered_tokens, render_error)) {
         std::fprintf(stderr,
             "[flowkv] re-render failed (%s) — skipping\n",
             render_error.c_str());
@@ -5297,7 +4604,7 @@ void HttpServer::apply_flowkv_compression(
     }
 
     const int tokens_before = (int) prepared.tokens.size();
-    prepared.tokens = tokenizer_.encode(rendered);
+    prepared.tokens = std::move(rendered_tokens);
     prepared.compressed = true;
     prepared.flowkv = true;
     std::fprintf(stderr,
@@ -5407,6 +4714,18 @@ std::string HttpServer::apply_pflash_compression(
     http_detail::PflashChatTurnSpan chat_turn;
     // The unified view: the normalised messages the prompt was rendered from (unused otherwise).
     std::vector<ChatMessage> unified_messages;
+    // Where each message and the tool definitions sit in the prompt (character
+    // offsets into prompt_text), from the codec's render of the messages, and
+    // the drafter tokens' offsets into the same text.
+    RenderedPrompt prompt_layout;
+    http_detail::DecodedPrompt drafter_text;
+    // The drafter tokens overlapping a span of the prompt; {-1, -1} for none.
+    const auto drafter_span = [&] (const PromptSpan & span) -> PFlashTokenSpan {
+        if (!span.valid() || span.end == span.begin) return {-1, -1};
+        const PFlashTokenSpan tokens = http_detail::pflash_char_span_tokens(
+            drafter_text.token_begin, drafter_text.text.size(), span.begin, span.end);
+        return tokens.end > tokens.begin ? tokens : PFlashTokenSpan{-1, -1};
+    };
     if (!experiment.configured || tail_parser) {
         ChatMarkers chat_markers;
         if (resolve_chat_markers(tokenizer_, chat_markers)) {
@@ -5421,11 +4740,26 @@ std::string HttpServer::apply_pflash_compression(
         try {
             auto messages =
                 normalize_chat_messages(req.messages, req.format, tool_memory_,
-                                        config_.chat_template_src.empty());
+                                        replays_call_ids(), text_part_separator());
             if (messages.empty()) {
                 return "PFlash strict selection normalized messages are empty";
             }
             if (pflash_unified_) unified_messages = messages;
+            std::string layout_error;
+            if (!chat_codec_) {
+                return "PFlash strict selection needs the model's chat codec";
+            }
+            if (!render_with_codec(*chat_codec_, backend_.image_placeholder(), turn_memory_, messages, req,
+                                   /*add_generation_prompt=*/true, prompt_layout, layout_error)) {
+                return "PFlash strict selection render failed: " + layout_error;
+            }
+            if (prompt_layout.text() != prompt_text) {
+                return "PFlash strict selection: the messages do not render the prompt";
+            }
+            drafter_text = http_detail::decode_prompt_with_offsets(*drafter_tokenizer_, drafter_ids);
+            if (drafter_text.text != prompt_text) {
+                return "PFlash strict selection: the drafter tokens do not decode to the prompt";
+            }
 
             int last_user_index = -1;
             for (int index = (int) messages.size() - 1; index >= 0; --index) {
@@ -5447,88 +4781,8 @@ std::string HttpServer::apply_pflash_compression(
                 boundary_index = last_user_index;
             }
 
-            static constexpr const char * kContentBegin =
-                "__LUCE_PFLASH_CONTENT_BEGIN_02C47F91__";
-            static constexpr const char * kContentEnd =
-                "__LUCE_PFLASH_CONTENT_END_6E6B61A8__";
-            const auto map_message_content = [&] (
-                    size_t message_index,
-                    int & content_begin,
-                    int & content_end,
-                    std::string & boundary_error) -> bool {
-                auto begin_messages = messages;
-                begin_messages[message_index].content =
-                    std::string(kContentBegin) +
-                    begin_messages[message_index].content;
-                auto end_messages = messages;
-                end_messages[message_index].content += kContentEnd;
-
-                std::string begin_rendered;
-                std::string end_rendered;
-                if (!render_messages_to_text(
-                        begin_messages, req, /*add_generation_prompt=*/true,
-                        begin_rendered, boundary_error)) {
-                    boundary_error = "content-start render failed: " +
-                        boundary_error;
-                    return false;
-                }
-                boundary_error.clear();
-                if (!render_messages_to_text(
-                        end_messages, req, /*add_generation_prompt=*/true,
-                        end_rendered, boundary_error)) {
-                    boundary_error = "content-end render failed: " +
-                        boundary_error;
-                    return false;
-                }
-
-                const auto begin_ids = drafter_tokenizer_->encode(
-                    tokenizer_.decode(tokenizer_.encode(begin_rendered)));
-                const auto end_ids = drafter_tokenizer_->encode(
-                    tokenizer_.decode(tokenizer_.encode(end_rendered)));
-                content_begin =
-                    http_detail::pflash_query_search_begin_from_sentinel(
-                        drafter_ids, begin_ids);
-                content_end =
-                    http_detail::pflash_query_search_end_from_sentinel(
-                        drafter_ids, end_ids);
-                if (content_begin < 0 || content_end <= content_begin ||
-                    content_end >= (int) drafter_ids.size()) {
-                    boundary_error = "content boundary mapping failed";
-                    return false;
-                }
-                return true;
-            };
-            const auto map_rendered_message = [&] (
-                    size_t message_index,
-                    PFlashTokenSpan & message_span,
-                    std::string & boundary_error) -> bool {
-                auto without_message = messages;
-                without_message.erase(without_message.begin() + message_index);
-
-                std::string without_message_rendered;
-                if (!render_messages_to_text(
-                        without_message, req, /*add_generation_prompt=*/true,
-                        without_message_rendered, boundary_error)) {
-                    boundary_error = "message-removal render failed: " +
-                        boundary_error;
-                    return false;
-                }
-                const auto without_message_ids = drafter_tokenizer_->encode(
-                    tokenizer_.decode(tokenizer_.encode(
-                        without_message_rendered)));
-                message_span = http_detail::pflash_changed_token_span(
-                    drafter_ids, without_message_ids);
-                if (message_span.begin < 0) {
-                    boundary_error =
-                        "complete rendered message did not map to a prompt span";
-                    return false;
-                }
-                return true;
-            };
-
-            std::string boundary_error;
             // Chat default: the latest user turn's content bounds come from
-            // the rendered prompt's control markers — no sentinel re-renders.
+            // the rendered prompt's control markers.
             if (tail_parser && chat_turn.valid()) {
                 query_content_begin = chat_turn.content_begin;
                 query_content_end = chat_turn.content_end;
@@ -5539,20 +4793,17 @@ std::string HttpServer::apply_pflash_compression(
                 }
             }
             if (query_content_begin < 0) {
-                // Marker-less prompts (and the benchmark's latest_user
-                // parser) still locate the boundary through sentinel
-                // renders of the boundary message.
+                // Otherwise (the benchmark's latest_user parser) the
+                // boundary message's content, where the codec rendered it.
                 if (boundary_index < 0 ||
                     (semantic_parser && !raw_text_input &&
                      last_user_text.empty())) {
                     return "PFlash strict selection latest-user boundary is unavailable";
                 }
-                if (!map_message_content(
-                        (size_t) boundary_index,
-                        query_content_begin, query_content_end,
-                        boundary_error)) {
-                    return "PFlash strict selection " + boundary_error;
-                }
+                const PFlashTokenSpan content =
+                    drafter_span(prompt_layout.messages[(size_t) boundary_index].content);
+                query_content_begin = content.begin;
+                query_content_end = content.end;
             }
             if (query_content_begin < 0 ||
                 query_content_end <= query_content_begin ||
@@ -5596,13 +4847,11 @@ std::string HttpServer::apply_pflash_compression(
                     http_detail::plan_pflash_instruction_messages(messages);
                 for (size_t instruction_index :
                         instruction_plan.instruction_messages) {
-                    PFlashTokenSpan instruction_span;
-                    boundary_error.clear();
-                    if (!map_rendered_message(
-                            instruction_index, instruction_span,
-                            boundary_error)) {
-                        return "PFlash strict selection instruction mapping failed: " +
-                            boundary_error;
+                    const PFlashTokenSpan instruction_span =
+                        drafter_span(prompt_layout.messages[instruction_index].turn);
+                    if (instruction_span.begin < 0) {
+                        return "PFlash strict selection instruction mapping failed: "
+                            "the message did not map to a prompt span";
                     }
                     (messages[instruction_index].role == "system"
                         ? system_spans : instruction_role_spans)
@@ -5610,22 +4859,7 @@ std::string HttpServer::apply_pflash_compression(
                 }
 
                 if (!req.tools.is_null() && !req.tools.empty()) {
-                    ParsedRequest tool_free_req = req;
-                    tool_free_req.tools = json::array();
-                    std::string tool_free_rendered;
-                    boundary_error.clear();
-                    if (!render_messages_to_text(
-                            messages, tool_free_req,
-                            /*add_generation_prompt=*/true,
-                            tool_free_rendered, boundary_error)) {
-                        return "PFlash strict selection tool mapping failed: " +
-                            boundary_error;
-                    }
-                    const auto tool_free_ids = drafter_tokenizer_->encode(
-                        tokenizer_.decode(tokenizer_.encode(tool_free_rendered)));
-                    const PFlashTokenSpan tool_span =
-                        http_detail::pflash_changed_token_span(
-                            drafter_ids, tool_free_ids);
+                    const PFlashTokenSpan tool_span = drafter_span(prompt_layout.tools);
                     if (tool_span.begin < 0) {
                         return "PFlash strict selection tool mapping failed: "
                             "tools did not produce a retained prompt span";
@@ -5824,156 +5058,75 @@ std::string HttpServer::apply_pflash_compression(
                 // The content spans of the latest ``count`` human messages
                 // (role "user" after normalisation: tool results are role
                 // "tool" from every API format, also when the template renders
-                // them inside a user turn), latest first: by the rendered
-                // prompt's chat markers, else by sentinel renders.
+                // them inside a user turn), latest first; {0, 0} for one that
+                // renders empty.
                 std::vector<size_t> mapped_human;   // indices of the last map_human_messages call
                 const auto map_human_messages = [&] (
-                        size_t count, std::vector<PFlashTokenSpan> & out,
-                        std::string & error) -> const char * {
-                    std::vector<size_t> human;
-                    for (size_t index = messages.size();
-                         index-- > 0 && human.size() < count;) {
-                        if (messages[index].role == "user") human.push_back(index);
-                    }
-                    mapped_human = human;
-                    recent_turns(0);   // resolves marker_turns
-                    if (http_detail::pflash_human_message_spans(
-                            *drafter_tokenizer_, drafter_ids, marker_turns.turns, messages,
-                            human.size(), out)) {
-                        return "markers";
-                    }
+                        size_t count, std::vector<PFlashTokenSpan> & out) {
+                    mapped_human.clear();
                     out.clear();
-                    for (size_t index : human) {
-                        const std::string & content = messages[index].content;
-                        if (content.find_first_not_of(" \t\n\r") == std::string::npos) {
-                            out.push_back({0, 0});
-                            continue;
-                        }
-                        int begin = -1;
-                        int end = -1;
-                        std::string mapping_error;
-                        if (!map_message_content(index, begin, end, mapping_error)) {
-                            out.clear();
-                            error = mapping_error;
-                            break;
-                        }
-                        out.push_back({begin, end});
+                    for (size_t index = messages.size();
+                         index-- > 0 && mapped_human.size() < count;) {
+                        if (messages[index].role != "user") continue;
+                        mapped_human.push_back(index);
+                        const PFlashTokenSpan span = drafter_span(prompt_layout.messages[index].content);
+                        out.push_back(span.begin < 0 ? PFlashTokenSpan{0, 0} : span);
                     }
-                    return "sentinel";
                 };
                 // V2-A3 candidates: the content spans of the last ``count``
-                // non-system messages (latest first), found in render order
-                // from the generation prompt backwards: each message's content
-                // (trimmed) must occur before the previous match.
+                // non-system messages (latest first); {0, 0} for one that
+                // renders empty.
                 const auto map_recent_messages = [&] (
                         int count, std::vector<PFlashTokenSpan> & spans,
-                        std::vector<int> & indices, std::string & error) {
-                    recent_turns(0);
-                    const http_detail::DecodedPrompt decoded =
-                        http_detail::decode_prompt_with_offsets(*drafter_tokenizer_, drafter_ids);
-                    size_t cursor = decoded.text.size();
-                    if (marker_turns.generation_begin > 0 &&
-                        marker_turns.generation_begin < (int) drafter_ids.size()) {
-                        cursor = decoded.token_begin[(size_t) marker_turns.generation_begin];
-                    }
+                        std::vector<int> & indices) {
                     for (size_t index = messages.size();
                          index-- > 0 && (int) spans.size() < count;) {
                         if (messages[index].role == "system") continue;
-                        const std::string & raw = messages[index].content;
-                        const size_t lead = raw.find_first_not_of(" \t\n\r");
-                        if (lead == std::string::npos) {
-                            spans.push_back({0, 0});
-                            indices.push_back((int) index);
-                            continue;
-                        }
-                        const size_t tail = raw.find_last_not_of(" \t\n\r");
-                        const std::string content = raw.substr(lead, tail - lead + 1);
-                        if (content.size() > cursor) {
-                            error = "recent message content does not fit before the next one";
-                            spans.clear();
-                            indices.clear();
-                            return;
-                        }
-                        const size_t at = decoded.text.rfind(content, cursor - content.size());
-                        if (at == std::string::npos) {
-                            error = "recent message content not found in render order";
-                            spans.clear();
-                            indices.clear();
-                            return;
-                        }
-                        const int begin = http_detail::token_at_offset(decoded, at);
-                        const int end = (int) (std::lower_bound(
-                            decoded.token_begin.begin(), decoded.token_begin.end(),
-                            at + content.size()) - decoded.token_begin.begin());
-                        spans.push_back({begin, end});
+                        const PFlashTokenSpan span = drafter_span(prompt_layout.messages[index].content);
+                        spans.push_back(span.begin < 0 ? PFlashTokenSpan{0, 0} : span);
                         indices.push_back((int) index);
-                        cursor = at;
                     }
                 };
                 if (experiment.query_probe) {
-                    const char * mapping = map_human_messages(
-                        luce::pflash::kRequestMessages, request_probe_messages.human,
-                        request_probe_messages.error);
+                    map_human_messages(luce::pflash::kRequestMessages, request_probe_messages.human);
                     for (size_t index : mapped_human) {
                         request_probe_messages.human_index.push_back((int) index);
                     }
                     map_recent_messages(INT_MAX,   // every non-system message (V2-A5)
                                         request_probe_messages.recent,
-                                        request_probe_messages.recent_index,
-                                        request_probe_messages.recent_error);
+                                        request_probe_messages.recent_index);
                     // cand_v5 / stage 2 (STAGE2-CONTRACT.md section 1): every message's role and the tokens
-                    // overlapping its exact content, from one render with a placeholder per content (read only
-                    // by a cand_v5 probe; any failure falls the request back to today's windows).
+                    // overlapping its exact content, where the codec rendered it (read only by a cand_v5 probe;
+                    // any failure falls the request back to today's windows).
                     {
                         auto & all = request_probe_messages;
                         // The messages in the order the template renders them (DeepSeek sorts each run of tool
-                        // results by call), so the spans ascend; the render itself is unchanged.
-                        std::vector<ChatMessage> ordered = messages;
-                        if (config_.chat_template_src.empty()) {
-                            const std::vector<size_t> order = chat_message_render_order(messages, chat_format_);
-                            for (size_t i = 0; i < order.size(); ++i) ordered[i] = messages[order[i]];
+                        // results by call), so the spans ascend. One with no part of its own sits after the one
+                        // before it.
+                        std::vector<size_t> order(messages.size());
+                        std::vector<size_t> at(messages.size(), 0);
+                        for (size_t index = 0; index < messages.size(); ++index) {
+                            order[index] = index;
+                            const PromptSpan & turn = prompt_layout.messages[index].turn;
+                            at[index] = turn.valid() ? turn.begin : (index == 0 ? 0 : at[index - 1]);
                         }
-                        std::vector<ChatMessage> placeholder_messages = ordered;
-                        std::vector<std::string> placeholders(ordered.size());
-                        std::vector<std::string> contents(ordered.size());
-                        for (size_t index = 0; index < ordered.size() && all.all_error.empty(); ++index) {
-                            const std::string & role = ordered[index].role;
+                        std::stable_sort(order.begin(), order.end(),
+                                         [&](size_t a, size_t b) { return at[a] < at[b]; });
+                        for (size_t index : order) {
+                            const std::string & role = messages[index].role;
                             if (role != "system" && role != "user" && role != "assistant" && role != "tool") {
                                 all.all_error = "unsupported message role " + role;
+                                all.all_roles.clear();
+                                all.all_spans.clear();
                                 break;
                             }
                             all.all_roles.push_back(role);
-                            contents[index] = ordered[index].content;
-                            // An empty content (an assistant turn that only calls tools, or only whitespace, which a
-                            // trimming template renders empty) has no tokens to map, and a placeholder there would
-                            // change how the template renders the turn.
-                            if (role == "system" || http_detail::pflash_template_trim(contents[index]).empty()) {
-                                continue;   // never a candidate nor in E
-                            }
-                            placeholders[index] = "\x1e" "PFLASH-MESSAGE-" + std::to_string(index) + "\x1f";
-                            placeholder_messages[index].content = placeholders[index];
-                        }
-                        std::string placeholder_render;
-                        if (all.all_error.empty() &&
-                            !render_messages_to_text(placeholder_messages, req, /*add_generation_prompt=*/true,
-                                                     placeholder_render, all.all_error)) {
-                            all.all_error = "placeholder render failed: " + all.all_error;
-                        }
-                        if (all.all_error.empty()) {
-                            const http_detail::DecodedPrompt decoded =
-                                http_detail::decode_prompt_with_offsets(*drafter_tokenizer_, drafter_ids);
-                            std::vector<std::pair<size_t, size_t>> chars;
-                            if (http_detail::pflash_content_char_spans(placeholder_render, placeholders, contents,
-                                                                       decoded.text, chars, all.all_error)) {
-                                for (const auto & span : chars) {
-                                    all.all_spans.push_back(http_detail::pflash_char_span_tokens(
-                                        decoded.token_begin, decoded.text.size(), span.first, span.second));
-                                }
-                            }
-                        }
-                        if (!all.all_error.empty()) {
-                            all.all_roles.clear();
-                            all.all_spans.clear();
+                            // A system message is never a candidate nor in E; an empty content (an assistant
+                            // turn that only calls tools) has no tokens.
+                            const PFlashTokenSpan span = role == "system"
+                                ? PFlashTokenSpan{-1, -1}
+                                : drafter_span(prompt_layout.messages[index].content);
+                            all.all_spans.push_back(span.begin < 0 ? PFlashTokenSpan{0, 0} : span);
                         }
                     }
                     std::string spans;
@@ -5987,11 +5140,9 @@ std::string HttpServer::apply_pflash_compression(
                             std::to_string(span.end) + ")";
                     }
                     std::fprintf(stderr,
-                        "[pflash-request-probe] human messages=%zu mapped by %s:%s%s%s recent:%s\n",
-                        request_probe_messages.human.size(), mapping,
+                        "[pflash-request-probe] human messages=%zu:%s recent:%s\n",
+                        request_probe_messages.human.size(),
                         spans.empty() ? " none" : spans.c_str(),
-                        request_probe_messages.error.empty() ? "" : " error: ",
-                        request_probe_messages.error.c_str(),
                         turn_spans.empty() ? " none" : turn_spans.c_str());
                     std::fflush(stderr);
                 }
@@ -6000,8 +5151,7 @@ std::string HttpServer::apply_pflash_compression(
                 // far back, a chat's last turn).
                 if (experiment.query_head && tail_parser) {
                     std::vector<PFlashTokenSpan> latest;
-                    std::string head_error;
-                    map_human_messages(1, latest, head_error);
+                    map_human_messages(1, latest);
                     if (!latest.empty() && latest[0].end > latest[0].begin) {
                         human_query_content = latest[0];
                     }
@@ -6252,7 +5402,7 @@ std::string HttpServer::apply_pflash_compression(
         else if (!http_detail::pflash_selection_gives_lifts(experiment)) not_ready = "unscored_selection";
         else if (unified_messages.empty()) not_ready = "messages_unreadable";
         std::string handback;
-        auto unified_error = apply_unified_view(req, prepared, chat_turn, unified_messages,
+        auto unified_error = apply_unified_view(req, prepared, chat_turn, unified_messages, prompt_layout,
                                                 std::move(unified_request), experiment.chunk_size, not_ready,
                                                 handback);
         if (handback.empty()) return unified_error;
@@ -6303,7 +5453,7 @@ std::string HttpServer::apply_pflash_compression(
                     // second time.
                     normalize_chat_messages(
                         req.messages, req.format, tool_memory_,
-                        /*replay_tool_memory=*/false)) ? 1 : 0;
+                        /*replay_tool_memory=*/false, text_part_separator())) ? 1 : 0;
             } catch (const std::exception & e) {
                 // Unreadable messages: the rules do not apply.
                 tool_error = e.what();
@@ -7749,7 +6899,7 @@ size_t HttpServer::forget_unified_views(const std::vector<int32_t> & raw_tokens)
 std::string HttpServer::apply_unified_view(
         const ParsedRequest & req, PreparedPrompt & prepared,
         const http_detail::PflashChatTurnSpan & turn,
-        const std::vector<ChatMessage> & messages,
+        const std::vector<ChatMessage> & messages, const RenderedPrompt & layout,
         ModelBackend::CompressRequest request, int chunk_size,
         const std::string & not_ready, std::string & handback) {
     namespace pu = pflash_unified;
@@ -7886,42 +7036,31 @@ std::string HttpServer::apply_unified_view(
             newest.push_back(std::move(c));
         }
     }
-    // Their exact content in the prompt text, from one render with a placeholder per newest message.
-    if (!newest.empty()) {
-        std::vector<ChatMessage> placeholder_messages = messages;
-        std::vector<std::string> placeholders(messages.size());
-        std::vector<std::string> contents(messages.size());
-        for (auto & c : newest) {
-            if (http_detail::pflash_template_trim(messages[c.message].content).empty()) {
-                if (c.skip.empty()) c.skip = "empty";
-                continue;
-            }
-            placeholders[c.message] = "\x1e" "PFLASH-UNIFIED-" + std::to_string(c.message) + "\x1f";
-            contents[c.message] = messages[c.message].content;
-            placeholder_messages[c.message].content = placeholders[c.message];
+    // Their exact content in the prompt text, where the codec rendered it.
+    const bool laid_out = layout.messages.size() == messages.size() && layout.text() == text;
+    if (!laid_out && !newest.empty()) {
+        count("unlocated");
+        std::fprintf(stderr, "[pflash-unified] newest turn not located (the layout is not this prompt's): "
+                             "nothing is paged\n");
+    }
+    for (auto & c : newest) {
+        if (!laid_out) {
+            c.skip = "unlocated";
+            continue;
         }
-        std::string rendered;
-        std::string error;
-        std::vector<std::pair<size_t, size_t>> chars;
-        if (render_messages_to_text(placeholder_messages, req, /*add_generation_prompt=*/true, rendered, error) &&
-            http_detail::pflash_content_char_spans(rendered, placeholders, contents, text, chars, error)) {
-            for (auto & c : newest) {
-                // Rendered empty: no placeholder, so no span; it must not pull newest_begin or recall to token 0.
-                if (placeholders[c.message].empty()) continue;
-                c.located = true;
-                c.cb = chars[c.message].first;
-                c.ce = chars[c.message].second;
-                c.db = http_detail::token_at_offset(dd, c.cb);
-                c.de = token_from(dd, c.ce);
-                c.tb = http_detail::token_at_offset(td, c.cb);
-                c.te = token_from(td, c.ce);
-            }
-        } else {
-            count("unlocated");
-            std::fprintf(stderr, "[pflash-unified] newest turn not located (%s): nothing is paged\n",
-                         error.c_str());
-            for (auto & c : newest) c.skip = "unlocated";
+        const PromptSpan & span = layout.messages[c.message].content;
+        // Rendered empty: no span; it must not pull newest_begin or recall to token 0.
+        if (!span.valid() || span.end == span.begin) {
+            if (c.skip.empty()) c.skip = "empty";
+            continue;
         }
+        c.located = true;
+        c.cb = span.begin;
+        c.ce = span.end;
+        c.db = http_detail::token_at_offset(dd, c.cb);
+        c.de = token_from(dd, c.ce);
+        c.tb = http_detail::token_at_offset(td, c.cb);
+        c.te = token_from(td, c.ce);
     }
     const auto candidate_lines = [&] (Candidate & c) -> const pu::Lines & {
         if (!c.lines_ready) {
@@ -9031,8 +8170,9 @@ bool HttpServer::forward_upstream(
         ? req.model : config_.pflash_upstream_model;
 
     if (prepared.compressed) {
-        std::string compressed_text = tokenizer_.decode(prepared.tokens);
-        compressed_text += "\n<|im_start|>assistant\n";
+        // The compressed prompt keeps the template's generation prompt (the
+        // assistant header, in the model's own format): send it as it is.
+        const std::string compressed_text = tokenizer_.decode(prepared.tokens);
 
         json body;
         body["model"] = upstream_model;
@@ -9781,7 +8921,7 @@ std::string HttpServer::session_replay_blob(const ParsedRequest & req,
     json entries = json::array();
     if (tool_memory_.disabled()) return std::string();
     const auto messages =
-        normalize_chat_messages(req.messages, req.format, tool_memory_, true);
+        normalize_chat_messages(req.messages, req.format, tool_memory_, true, text_part_separator());
     for (const auto & m : messages) {
         if (!m.tool_calls_replayed || m.content.empty()) continue;
         json ids = json::array();
@@ -10084,11 +9224,14 @@ std::vector<ChatMessage> HttpServer::remember_tool_turn(
     const bool tool_turn = !req.tools.empty() && !emitter.tool_calls().empty() &&
         !emitter.accumulated_raw().empty();
     // Arbitrary Jinja templates need structured calls to render their results;
-    // raw-turn caching cannot preserve that contract.
-    if (!supported_format || !tool_turn || !config_.chat_template_src.empty()) return {};
+    // raw-turn caching cannot preserve that contract. A chat codec keeps the
+    // turn in turn memory instead (remember_codec_turn).
+    if (chat_codec_ || !supported_format || !tool_turn || !config_.chat_template_src.empty()) {
+        return {};
+    }
 
     std::vector<ChatMessage> messages =
-        normalize_chat_messages(req.messages, req.format, tool_memory_, true);
+        normalize_chat_messages(req.messages, req.format, tool_memory_, true, text_part_separator());
     static constexpr const char * kSentinel =
         "__LUCE_AGENT_TURN_CONTENT_7A21D9__";
     messages.push_back({"assistant", kSentinel});
@@ -10131,42 +9274,99 @@ std::vector<ChatMessage> HttpServer::remember_tool_turn(
     return messages;
 }
 
+bool HttpServer::remember_codec_turn(const ParsedRequest & req, const std::vector<int32_t> & generated,
+                                     TurnMemory * memory, ChatMessage & message) {
+    // Only a turn the model ended: a cut-off reply is not one a client sends back as it is.
+    if (!chat_codec_ || generated.empty() ||
+        (generated.back() != tokenizer_.eos_chat_id() && generated.back() != tokenizer_.eos_id())) {
+        return false;
+    }
+    const std::vector<int32_t> reply(generated.begin(), generated.end() - 1);
+    TurnMemory::Turn turn;
+    if (!chat_codec_->generated_turn(req.rendered_prompt, req.prompt_tokens, reply, tokenizer_,
+                                     req.tools, message, turn)) {
+        return false;
+    }
+    // The turn's key: the prompt it followed. Not with images, whose markers
+    // stand in the key for any image, nor for a tool-checks note pass, whose
+    // prompt the client never sends back.
+    turn.context = req.prompt_context;
+    if (memory && !req.images && !req.tool_checks_note && !turn.context.empty()) {
+        memory->remember(message, std::move(turn));
+    }
+    return true;
+}
+
+void HttpServer::remember_codec_turn(const ParsedRequest & req, const std::vector<int32_t> & generated) {
+    ChatMessage message;
+    remember_codec_turn(req, generated, &turn_memory_, message);
+}
+
 void HttpServer::remember_agent_turn(
         const ParsedRequest & req, const PreparedPrompt & prepared,
         const GenerationCacheState & cache, const GenerateResult & result,
         const SseEmitter & emitter, int completion_tokens,
         bool visible_output_seen, bool client_disconnected,
         bool replay_cache) {
+    ChatMessage codec_turn;
+    const bool codec_turn_read = chat_codec_ && result.ok() && !client_disconnected &&
+        remember_codec_turn(req, result.tokens, replay_cache ? nullptr : &turn_memory_, codec_turn);
     if (!result.ok() || completion_tokens <= 0 || !visible_output_seen ||
         client_disconnected) {
         return;
     }
-    std::vector<ChatMessage> messages = remember_tool_turn(req, result.tokens, emitter);
-    if (messages.empty()) return;
 
-    // A tool-checks note pass renders a conversation the client never sends
-    // back: its calls' text is remembered above, its turn is not checkpointed.
-    if (!replay_cache || req.images || req.tool_checks_note) return;
-    if (prefix_cache_.disabled()) return;
-    // Cache only stateless-equivalent prompts. Compression and token rewrites
-    // need a separate replay contract.
-    if (prepared.compressed || prepared.tokens != req.prompt_tokens) return;
-
-    auto & replayed_turn = messages.back();
-    replayed_turn.tool_calls_replayed = true;
-    replayed_turn.tool_calls.reserve(emitter.tool_calls().size());
-    for (const auto & call : emitter.tool_calls()) {
-        replayed_turn.tool_calls.push_back({call.id, call.name, {}});
-    }
-
-    std::string canonical_rendered;
+    std::vector<int32_t> canonical_tokens;
     std::string render_error;
-    if (!render_messages_to_text(
-            messages, req, /*add_generation_prompt=*/false,
-            canonical_rendered, render_error)) {
-        return;
+    if (chat_codec_) {
+        const bool supported_format = req.format == ApiFormat::OPENAI_CHAT ||
+            req.format == ApiFormat::RESPONSES;
+        const bool tool_turn = !req.tools.empty() && !emitter.tool_calls().empty() &&
+            !emitter.accumulated_raw().empty();
+        if (!supported_format || !tool_turn || !config_.chat_template_src.empty()) return;
+        // The next request's turn is the generated one, from turn memory.
+        if (!codec_turn_read) return;
+        // A tool-checks note pass renders a conversation the client never
+        // sends back: its turn is not checkpointed.
+        if (!replay_cache || req.images || req.tool_checks_note) return;
+        if (prefix_cache_.disabled()) return;
+        // Cache only stateless-equivalent prompts. Compression and token rewrites
+        // need a separate replay contract.
+        if (prepared.compressed || prepared.tokens != req.prompt_tokens) return;
+        std::vector<ChatMessage> messages =
+            normalize_chat_messages(req.messages, req.format, tool_memory_, false, text_part_separator());
+        messages.push_back(std::move(codec_turn));
+        std::string canonical_rendered;
+        if (!render_messages_to_tokens(messages, req, /*add_generation_prompt=*/false,
+                                       canonical_rendered, canonical_tokens, render_error)) {
+            return;
+        }
+    } else {
+        std::vector<ChatMessage> messages = remember_tool_turn(req, result.tokens, emitter);
+        if (messages.empty()) return;
+
+        // A tool-checks note pass renders a conversation the client never sends
+        // back: its calls' text is remembered above, its turn is not checkpointed.
+        if (!replay_cache || req.images || req.tool_checks_note) return;
+        if (prefix_cache_.disabled()) return;
+        // Cache only stateless-equivalent prompts. Compression and token rewrites
+        // need a separate replay contract.
+        if (prepared.compressed || prepared.tokens != req.prompt_tokens) return;
+
+        auto & replayed_turn = messages.back();
+        replayed_turn.tool_calls_replayed = true;
+        replayed_turn.tool_calls.reserve(emitter.tool_calls().size());
+        for (const auto & call : emitter.tool_calls()) {
+            replayed_turn.tool_calls.push_back({call.id, call.name, {}});
+        }
+
+        std::string canonical_rendered;
+        if (!render_messages_to_tokens(
+                messages, req, /*add_generation_prompt=*/false,
+                canonical_rendered, canonical_tokens, render_error)) {
+            return;
+        }
     }
-    std::vector<int32_t> canonical_tokens = tokenizer_.encode(canonical_rendered);
     if (save_generated_turn(prepared.tokens, result.tokens, canonical_tokens,
                             cache)) {
         return;
@@ -10545,11 +9745,12 @@ void HttpServer::process_job(ServerJob * job) {
     // Create SSE emitter for streaming state machine.
     SseEmitter emitter(req.format, req.response_id, req.model,
                        (int)req.prompt_tokens.size(), req.tools,
-                       &tool_memory_,
+                       chat_codec_ ? nullptr : &tool_memory_,
                        req.stop_sequences,
                        req.started_in_thinking,
                        tool_checks::tool_calls_allowed(req.tool_choice,
                                                        req.tool_checks_pass));
+    emitter.set_chat_codec(chat_codec_.get());
 
     // Emit initial SSE events only for local generation. The upstream owns
     // the proxied event sequence.
@@ -10808,7 +10009,7 @@ void HttpServer::process_job(ServerJob * job) {
          result.tokens.back() == tokenizer_.eos_chat_id());
     if (req.stream && !client_disconnected) {
         auto final_chunks = emitter.emit_finish(
-            completion_tokens, &gen_timings, n_gen_cap, is_eos);
+            completion_tokens, &gen_timings, n_gen_cap, is_eos, result.degenerate_decode_close);
         remember_agent_turn(
             req, prepared, cache, result, emitter, completion_tokens,
             visible_output_seen, client_disconnected,

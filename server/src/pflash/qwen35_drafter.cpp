@@ -1989,9 +1989,7 @@ static std::vector<int32_t> strict_score_impl(
                 std::vector<luce::pflash::PFlashRequestCandidate> candidates;
                 const auto & hidx = experiment.request_human_index;
                 const auto & ridx = experiment.request_recent_index;
-                if (!experiment.request_recent_error.empty()) {
-                    request_trace.fallback = "message_mapping: " + experiment.request_recent_error;
-                } else if (hidx.size() != experiment.request_messages.size() ||
+                if (hidx.size() != experiment.request_messages.size() ||
                     ridx.size() != experiment.request_recent.size()) {
                     request_trace.fallback = "message_mapping: candidate indices missing";
                 } else {

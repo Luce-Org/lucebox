@@ -21,6 +21,7 @@
 #include "common/spec_acceptance.h"
 #include "tokenizer.h"
 #include "chat_template.h"
+#include "chat_codec.h"
 #include "tool_memory.h"
 #include "tool_checks.h"
 #include "prefix_cache.h"
@@ -291,11 +292,13 @@ struct ServerConfig {
     double      disk_cache_shutdown_flush_s = 120.0;
     DiskPrefixCachePolicy disk_cache_policy;
 
-    // Optional Jinja chat template (overrides the hardcoded ChatFormat::QWEN3
-    // / LAGUNA renderer when non-empty). Used for tool-using agents that need
-    // the Anthropic tool_use envelope, e.g. froggeric Qwen3.6 template.
+    // Optional Jinja chat template (overrides the codec or built-in renderer
+    // when non-empty).
     std::string chat_template_src;          // literal Jinja source (loaded from file)
     std::string chat_template_path;         // path it was loaded from (logged at startup)
+    // Chat codec (chat_codec.h) rendering the model's official template to
+    // tokens, e.g. "qwen3.8". Empty: chat_template_src, the built-in renderer, or the arch's codec when it has no built-in renderer.
+    std::string chat_codec;
 
     // Expert frequency tracking (--freq): print frequency analysis at shutdown.
     bool        freq_tracking = false;
@@ -368,13 +371,6 @@ struct PflashInstructionMessagePlan {
 
 PflashInstructionMessagePlan plan_pflash_instruction_messages(
     const std::vector<ChatMessage> & messages);
-
-// Return the conservative token interval in `original` changed by rendering
-// a request variant. Used to retain tool definitions independently of where
-// an arbitrary chat template places them.
-PFlashTokenSpan pflash_changed_token_span(
-    const std::vector<int32_t> & original,
-    const std::vector<int32_t> & variant) noexcept;
 
 // Sort and merge overlapping/adjacent mapped spans before selector validation.
 std::vector<PFlashTokenSpan> canonicalize_pflash_token_spans(
@@ -594,58 +590,10 @@ PflashChatTurnSpan pflash_chat_query_turn(
     const Tokenizer & tokenizer,
     const std::vector<int32_t> & prompt);
 
-// PFLASH_SELECT_QUERY_PROBE=1: the content spans of the last ``count``
-// messages whose ROLE is "user" (latest first), found among the rendered
-// ``turns`` by exact content. A message maps when its trimmed content
-// equals the trimmed decoded content of exactly as many turns (other than
-// assistant/model/system/developer turns) as there are user messages with
-// that content; equal contents map in order. The span covers every token
-// overlapping the message's exact content, its own leading/trailing
-// whitespace included. A message with empty content maps to the empty span
-// {0, 0}. False (``out`` cleared) when any message
-// does not map that way -- the caller then maps by sentinel renders.
-// cand_v4 / stage 2 (STAGE2-CONTRACT.md section 1): the character span of every message's exact content in
-// ``prompt_text``, from ``placeholder_render`` -- a render of the same messages with content i replaced by
-// ``placeholders[i]`` ("" = left as is). Each non-empty placeholder must occur exactly once (in any order: DeepSeek
-// renders tool results in call order), and
-// putting the contents back -- verbatim, or all trimmed as by a template's ``|trim`` -- must give ``prompt_text``
-// byte for byte (a template that rewrites content otherwise fails). ``spans[i]`` = {begin, end} characters of the
-// content as rendered ({0, 0} for a message left as is). False + ``error`` otherwise.
-// ``text`` without the leading and trailing whitespace a chat template's ``|trim`` removes (C isspace).
-std::string_view pflash_template_trim(std::string_view text);
-bool pflash_content_char_spans(
-    const std::string & placeholder_render,
-    const std::vector<std::string> & placeholders,
-    const std::vector<std::string> & contents,
-    const std::string & prompt_text,
-    std::vector<std::pair<size_t, size_t>> & spans,
-    std::string & error);
 // The tokens whose character extent [token_begin[t], token_begin[t+1]) overlaps [begin, end) (the last token ends
 // at ``text_size``); {0, 0} when the range is empty.
 PFlashTokenSpan pflash_char_span_tokens(
     const std::vector<size_t> & token_begin, size_t text_size, size_t begin, size_t end);
-
-bool pflash_human_message_spans(
-    const Tokenizer & tokenizer,
-    const std::vector<int32_t> & prompt,
-    const std::vector<PflashChatTurn> & turns,
-    const std::vector<ChatMessage> & messages,
-    size_t count,
-    std::vector<PFlashTokenSpan> & out);
-
-// Return the original prompt offset immediately before the stable trailing
-// suffix shared with a version whose latest user message carries a sentinel.
-// Invalid when no such bounded suffix can establish the semantic boundary.
-int pflash_query_search_end_from_sentinel(
-    const std::vector<int32_t> & original,
-    const std::vector<int32_t> & sentinel) noexcept;
-
-// Return the first token offset affected by a version whose selected message
-// content carries a leading sentinel. This is a conservative lower bound for
-// the selected content in the original rendered prompt.
-int pflash_query_search_begin_from_sentinel(
-    const std::vector<int32_t> & original,
-    const std::vector<int32_t> & sentinel) noexcept;
 
 // The served view's provenance pieces as [[begin, end, "raw"|"recall"], ...].
 json pflash_view_pieces_json(const std::vector<PflashViewPiece> & pieces);
@@ -816,6 +764,9 @@ struct ParsedRequest {
     std::vector<int32_t>      prompt_tokens;  // tokenized prompt
     ImagePromptHandle         images;
     std::string               rendered_prompt;
+    // With a chat codec, the turn-memory key of the turn generated after the
+    // prompt (RenderedPrompt::context).
+    std::string               prompt_context;
     int                       max_output   = 4096;
     bool                      max_output_from_client = false;  // else the card's default
     bool                      stream       = true;
@@ -823,6 +774,8 @@ struct ParsedRequest {
     std::string               model;
     // Tool definitions (stored as JSON for response formatting)
     json                      tools;
+    // The same definitions in the client's key order, for the prompt.
+    nlohmann::ordered_json    ordered_tools;
     // Tool choice constraint (stored for hint generation)
     json                      tool_choice;
     // The reply carried tool-call syntax that produced no callable call, so
@@ -865,11 +818,10 @@ struct ParsedRequest {
     // hard_limit_reply_budget. Values are already clamped to those ceilings.
     int                       per_req_phase1_cap   = -1;
     int                       per_req_reply_budget = -1;
-    // Jinja-path only: `preserve_thinking` from `chat_template_kwargs`.
-    // Tri-state: -1 = not set (template default applies, typically true),
-    // 0 = false, 1 = true. Controls whether official templates (e.g.
-    // qwen4exp) replay earlier assistant turns' recorded <think> block
-    // (message.reasoning_content) or strip it.
+    // `preserve_thinking` from `chat_template_kwargs` (`drop_thinking` for
+    // DeepSeek), for the codec and the Jinja template alike. -1 = not set
+    // (the template's default: Qwen3.8 keeps earlier thinking, Qwen3.6
+    // drops it), 0 = drop, 1 = keep earlier assistant turns' <think>.
     int                       preserve_thinking = -1;
     // Stop sequences (OpenAI "stop" + Anthropic "stop_sequences")
     std::vector<std::string>  stop_sequences;
@@ -1006,7 +958,7 @@ public:
     void set_drafter_tokenizer(Tokenizer * tok) { drafter_tokenizer_ = tok; }
 
     // Set the chat template format (detected from model arch).
-    void set_chat_format(ChatFormat fmt) { chat_format_ = fmt; }
+    void set_chat_format(std::optional<ChatFormat> fmt) { chat_format_ = fmt; }
 
     // Start one listener. Optional model contexts are borrowed until run()
     // returns and must include this first. Model names must be explicit and unique.
@@ -1048,12 +1000,15 @@ private:
     // request ends as a disconnected request does, freeing its slot. A reply
     // that dropped unparseable tool-call syntax reports it through
     // `dropped_tool_call` so the checks can re-ask once. `note_pass` marks a
-    // pass that adds a note (ParsedRequest::tool_checks_note).
+    // pass that adds a note (ParsedRequest::tool_checks_note). ordered_tools:
+    // the outer request's tools in the client's key order, kept when the inner
+    // request sends the same tools.
     bool inner_chat_completion(const json & request, RoutingAdmission * admission,
                                int & status, std::string & body,
                                SocketHandle client_fd = kInvalidSocket,
                                bool * dropped_tool_call = nullptr,
-                               bool note_pass = false);
+                               bool note_pass = false,
+                               const nlohmann::ordered_json * ordered_tools = nullptr);
     json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the
@@ -1112,13 +1067,14 @@ private:
     // After the shared query and pins, when the selection gives per-candidate scores: pages the newest turn's large uncached content
     // (a user message, or listed tool outputs), continues the conversation's view, and recalls unheld units of
     // earlier regions at a new user question. ``request`` carries the drafter ids, the pinned spans and the
-    // learned query; ``messages`` the normalised messages the prompt was rendered from. ``handback`` set (the
+    // learned query; ``messages`` the normalised messages the prompt was rendered from, ``layout`` the codec's
+    // render of them (where each message sits in the prompt). ``handback`` set (the
     // reason): the view did not take the request -- ``not_ready`` non-empty, a prompt it cannot cut, or a conversation it would
     // start while a threshold's worth of uncached, unpinned prompt lies outside its regions -- and the chat view
     // (the release path) serves it; nothing of the unified view's state changed.
     std::string apply_unified_view(const ParsedRequest & req, PreparedPrompt & prepared,
                                    const http_detail::PflashChatTurnSpan & turn,
-                                   const std::vector<ChatMessage> & messages,
+                                   const std::vector<ChatMessage> & messages, const RenderedPrompt & layout,
                                    ModelBackend::CompressRequest request, int chunk_size,
                                    const std::string & not_ready, std::string & handback);
     // A conversation that left the unified view (a raw fallback, or a hand-back to the chat view) is not continued
@@ -1223,14 +1179,20 @@ private:
         const std::vector<int32_t> & generated,
         const std::vector<int32_t> & canonical,
         const GenerationCacheState & cache);
-    // Remember a tool-call turn in tool memory as the text of its generated
-    // `tokens`, with the text the generation prompt opened it with, so the
-    // next stateless request renders the turn as it was generated. Returns the
-    // conversation with the turn appended, or nothing when there is no turn
-    // to remember.
+    // Without a chat codec: remember a tool-call turn in tool memory as the
+    // text of its generated `tokens`, with the text the generation prompt
+    // opened it with, so the next stateless request renders the turn as it was
+    // generated. Returns the conversation with the turn appended, or nothing
+    // when there is no turn to remember.
     std::vector<ChatMessage> remember_tool_turn(
         const ParsedRequest & req, const std::vector<int32_t> & tokens,
         const SseEmitter & emitter);
+    // With a chat codec: remember the assistant turn a reply ended, so the
+    // client's echo of it renders as generated.
+    void remember_codec_turn(const ParsedRequest & req, const std::vector<int32_t> & generated);
+    // The same, also reading the turn into `message`; `memory` null reads only.
+    bool remember_codec_turn(const ParsedRequest & req, const std::vector<int32_t> & generated,
+                             TurnMemory * memory, ChatMessage & message);
     void remember_agent_turn(
         const ParsedRequest & req, const PreparedPrompt & prepared,
         const GenerationCacheState & cache, const GenerateResult & result,
@@ -1345,6 +1307,14 @@ private:
         const std::vector<ChatMessage> & chat_messages,
         const ParsedRequest & req, bool add_generation_prompt,
         std::string & rendered, std::string & error);
+    // The prompt as text and as tokens. With a chat codec the tokens are the
+    // codec's, not the text re-encoded.
+    // `context`, when given, gets RenderedPrompt::context (empty without a codec).
+    bool render_messages_to_tokens(
+        const std::vector<ChatMessage> & chat_messages,
+        const ParsedRequest & req, bool add_generation_prompt,
+        std::string & rendered, std::vector<int32_t> & tokens,
+        std::string & error, std::string * context = nullptr);
     // A direct request's max_tokens is trimmed to the context its prompt
     // leaves; a routed one (another model may hold it whole) is refused
     // without a response, so the router can try the next model.
@@ -1385,11 +1355,18 @@ private:
     Tokenizer &      tokenizer_;
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
     ServerConfig     config_;
-    ChatFormat       chat_format_;
+    std::optional<ChatFormat> chat_format_;  // the built-in renderer; none for codec-only archs
+    std::unique_ptr<ChatCodec> chat_codec_;  // null: chat_template_src or chat_format_
     std::once_flag   constraint_vocab_once_;
     std::shared_ptr<const ConstraintVocab> constraint_vocab_;
     PFlashDrafterIpcClient pflash_remote_;
     ToolMemory       tool_memory_;
+    TurnMemory       turn_memory_;  // generated turns, for the chat codec
+    // Call-ID tool memory replays raw turns into the built-in renderers; the
+    // chat codec uses turn memory, and Jinja templates neither.
+    bool replays_call_ids() const { return config_.chat_template_src.empty() && !chat_codec_; }
+    // Between the text parts of a message's content array, as the template joins them.
+    const char * text_part_separator() const { return chat_codec_ ? chat_codec_->text_part_separator() : ""; }
     PrefixCache      prefix_cache_;
     DiskPrefixCache  disk_cache_;
 
