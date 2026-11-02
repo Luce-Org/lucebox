@@ -102,6 +102,7 @@ struct Qwen35Config {
 
     // Speculative decode strategy
     bool         fast_rollback   = true;
+    bool         fast_rollback_explicit = false;  // opts in to fast rollback under --kvflash
     bool         seq_verify      = false;
     // SpecLA state-resident verification (--specla). specla_top_k keeps the
     // LUCE_SPECLA_TOPK env as its default for non-CLI harnesses

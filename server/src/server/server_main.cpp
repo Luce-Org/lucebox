@@ -274,7 +274,8 @@ static void print_usage(const char * prog) {
         "  --no-tool-checks    Serve chat requests with tools without the tool-use\n"
         "                       checks (rules, re-plan, final self-check; default: on)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
-        "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
+        "  --fast-rollback     Enable speculative fast rollback (default: on; with --kvflash\n"
+        "                      the default is exact rollback and this flag opts in)\n"
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --specla            Enable speculative linear-attention verification\n"
         "                       when supported (Qwen3.6 uses DDTree automatically)\n"
@@ -911,6 +912,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.prefill_cache_cap = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--fast-rollback") == 0) {
             bargs.fast_rollback = true;
+            bargs.fast_rollback_explicit = true;
         } else if (std::strcmp(argv[i], "--specla") == 0) {
             bargs.specla_mode = true;
             bargs.fast_rollback = true;

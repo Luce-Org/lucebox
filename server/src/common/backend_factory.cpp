@@ -215,6 +215,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.draft_swa_window   = cache.draft_swa_window;
         cfg.draft_ctx_max      = cache.draft_ctx_max;
         cfg.fast_rollback      = speculation.fast_rollback;
+        cfg.fast_rollback_explicit = speculation.fast_rollback_explicit;
         cfg.seq_verify         = speculation.seq_verify;
         cfg.specla_mode        = speculation.specla_mode;
         cfg.specla_top_k       = speculation.specla_top_k;
