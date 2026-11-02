@@ -278,11 +278,14 @@ struct SchedulerTestHarness {
 
     static PreparedCache prepare_cache(
             HttpServer & server, const std::vector<int32_t> & prompt,
-            bool ends_with_tool_result = false) {
+            bool ends_with_tool_result = false, bool tool_checks_pass = false,
+            bool tool_checks_note = false) {
         ParsedRequest req;
         req.prompt_tokens = prompt;
         req.response_id = "test";
         req.ends_with_tool_result = ends_with_tool_result;
+        req.tool_checks_pass = tool_checks_pass;
+        req.tool_checks_note = tool_checks_note;
         HttpServer::PreparedPrompt prepared;
         prepared.tokens = prompt;
         GenerateRequest generate_request;
@@ -10247,6 +10250,56 @@ TEST_CASE(ServerUnitFixture, test_agent_continuation_throttles_snapshot) {
     const auto far = prepare(2100, /*ends_with_tool_result=*/true);
     TEST_ASSERT(far.restore_slot == 1);
     TEST_ASSERT(far.snapshot);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_tool_check_passes_keep_the_clients_checkpoints) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    // Slot 0 holds the head, slot 1 the previous turn's generated-turn
+    // checkpoint, and the prompt adds its tool result: an ordinary agent
+    // turn restores slot 1 and skips its own snapshot
+    // (test_agent_continuation_throttles_snapshot). `warm` false: empty cache.
+    const auto prepare = [&](bool tool_checks_pass, bool tool_checks_note,
+                             bool warm = true) {
+        auto backend_owner = std::make_unique<SlotSetBackend>();
+        SlotSetBackend & backend = *backend_owner;
+        backend.cuts_at_restore_points = true;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.prefix_cache_cap = 4;
+        HttpServer server(engine, tokenizer, config);
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+
+        std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102};
+        const int checkpoint = (int) prompt.size();
+        prompt.insert(prompt.end(), {3, 103, 4});
+        if (warm) {
+            cache.confirm_inline_snap(0, 3, prompt);
+            cache.confirm_inline_snap(1, checkpoint, prompt);
+            SchedulerTestHarness::mark_agent_turn(server, 1);
+            backend.positions[0] = 3;
+            backend.positions[1] = checkpoint;
+        }
+        return SchedulerTestHarness::prepare_cache(
+            server, prompt, /*ends_with_tool_result=*/true, tool_checks_pass,
+            tool_checks_note);
+    };
+
+    const auto plain = prepare(false, false);
+    TEST_ASSERT(plain.restore_slot == 1 && !plain.snapshot);
+    // A note pass may replace a first pass's reply, and the client then
+    // continues from the end of this prompt: the first pass keeps it.
+    const auto first = prepare(true, false);
+    TEST_ASSERT(first.restore_slot == 1 && first.snapshot);
+    // The note pass's own conversation never comes back: it restores, and
+    // checkpoints nothing, warm or cold.
+    const auto note = prepare(true, true);
+    TEST_ASSERT(note.restore_slot == 1 && !note.snapshot);
+    TEST_ASSERT(prepare(false, false, /*warm=*/false).snapshot);
+    TEST_ASSERT(!prepare(true, true, /*warm=*/false).snapshot);
     unlink(path.c_str());
 }
 

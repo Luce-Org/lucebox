@@ -827,6 +827,10 @@ struct ParsedRequest {
     // A tool-checks pass (tool_checks.h): its reply keeps the tool calls the
     // model makes under tool_choice "none", so the checks can retry.
     bool                      tool_checks_pass = false;
+    // A tool-checks pass that adds a note after the model's reply
+    // (tool_checks::with_note). The client never sends that conversation
+    // back, so the pass keeps no checkpoint and no generated turn of it.
+    bool                      tool_checks_note = false;
     // Original messages (for response formatting)
     json                      messages;
     // Original request body (for upstream proxy forwarding)
@@ -1036,9 +1040,11 @@ private:
     // admission turned it away (nothing was sent); otherwise `status` and
     // `body` hold the HTTP response. When `client_fd` disconnects, the inner
     // request ends as a disconnected request does, freeing its slot.
+    // `note_pass` marks a pass that adds a note (ParsedRequest::tool_checks_note).
     bool inner_chat_completion(const json & request, RoutingAdmission * admission,
                                int & status, std::string & body,
-                               SocketHandle client_fd = kInvalidSocket);
+                               SocketHandle client_fd = kInvalidSocket,
+                               bool note_pass = false);
     json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the
