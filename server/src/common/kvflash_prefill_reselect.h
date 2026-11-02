@@ -54,7 +54,6 @@ inline int kvflash_last_user_turn(const std::vector<int32_t> & prompt, int32_t i
 struct KvFlashMode4Plan {
     int  r = -1;
     bool run = false;
-    int  reserve_chunks = -1;
 };
 inline KvFlashMode4Plan kvflash_mode4_plan(const std::vector<int32_t> & tokens, int kv_offset,
                                            int32_t im_start, int32_t user) {
