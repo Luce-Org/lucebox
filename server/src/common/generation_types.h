@@ -45,7 +45,9 @@ struct GenerateRequest {
     // Immutable model/request policy. Decode owns one ThinkingBudget instance
     // for the whole generation; a strategy handoff must not restart it.
     BudgetHook budget_hook;
-    // Set only for the single autoregressive retry after empty spec output.
+    // Decode autoregressively: the retry after empty spec output, and a
+    // request under a grammar on a backend that does not speculate under one
+    // (ModelBackend::speculates_under_constraint).
     bool force_ar_decode = false;
 };
 

@@ -27,6 +27,7 @@
 #include "ggml-cpu.h"
 #include "generation_types.h"
 #include "sampler.h"
+#include "output_constraint.h"
 #include "image_prompt.h"
 #include "concurrency/seq_engine.h"
 #include "placement/draft_residency.h"
@@ -270,6 +271,8 @@ struct ModelBackend {
             result.decode_s);
         GenerateRequest retry = req;
         retry.force_ar_decode = true;
+        // The grammar moved over what the first attempt emitted.
+        if (retry.sampler.constraint) retry.sampler.constraint->reset();
         return merge_empty_spec_retry_result(result, generate_impl(retry, io));
     }
 
@@ -392,6 +395,7 @@ struct ModelBackend {
             slot, result.decode_s);
         GenerateRequest retry = req;
         retry.force_ar_decode = true;
+        if (retry.sampler.constraint) retry.sampler.constraint->reset();
         if (snapshot_used(slot)) {
             return merge_empty_spec_retry_result(
                 result, restore_and_generate_impl(slot, retry, io));
@@ -599,6 +603,11 @@ struct ModelBackend {
     // Returns true if this backend can participate in DFlash spec decode
     // (i.e. it implements the DFlashTarget interface).
     virtual bool supports_dflash_spec_decode() const { return false; }
+    // generate() speculates for a request whose output follows a grammar
+    // (SamplerCfg::constraint), keeping exactly the tokens autoregressive
+    // decoding would. Otherwise the server decodes such a request
+    // autoregressively (GenerateRequest::force_ar_decode).
+    virtual bool speculates_under_constraint() const { return false; }
 
     // Return the DFlashTarget adapter for this backend. Only valid when
     // supports_dflash_spec_decode() returns true. Default returns nullptr.

@@ -11,10 +11,10 @@
 //   - the commit point advances it with every token the request keeps: the
 //     scheduler (advance_slot) for paged engines, the token callback for the
 //     single-request path.
-// Both run on the request's worker thread. Masks are only valid for the next
-// position, so a constrained request never speculates: SamplerCfg marks it as
-// needing logit processing, the scheduler disables speculation for it and the
-// single-request path decodes it autoregressively.
+// Both run on the request's worker thread. A speculative verify checks drafted
+// tokens against a snapshot() it advances over them, ahead of the commit
+// point; backends that do not (ModelBackend::speculates_under_constraint) and
+// the scheduler decode a constrained request autoregressively.
 
 #pragma once
 
@@ -84,9 +84,14 @@ public:
     void accept(int32_t token);
     // Back to the start, for a request that decodes again from its prompt.
     void reset();
+    // A copy at the current position, to advance over tokens the request has
+    // not kept yet (a speculative verify's drafts).
+    std::shared_ptr<OutputConstraint> snapshot() const;
 
 private:
     enum class State { waiting, engaged, released, broken };
+
+    OutputConstraint(const OutputConstraint & other);
 
     State initial_state() const;
     void feed(const std::string & text, int32_t token);
@@ -95,7 +100,7 @@ private:
     bool starts_release(const std::string & piece) const;
 
     std::shared_ptr<const ConstraintVocab> vocab_;
-    std::unique_ptr<gbnf::Matcher> initial_;
+    std::shared_ptr<const gbnf::Matcher> initial_;
     std::unique_ptr<gbnf::Matcher> grammar_;
     Options options_;
     State state_ = State::engaged;

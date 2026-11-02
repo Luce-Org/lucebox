@@ -9478,8 +9478,10 @@ void HttpServer::prepare_generation_inputs(
     inputs.request.n_gen = inputs.generation_cap;
     inputs.request.sampler = req.sampler;
     inputs.request.do_sample = req.sampler.needs_logit_processing();
-    // A grammar masks one position at a time: no speculative blocks.
-    inputs.request.force_ar_decode = req.sampler.constraint != nullptr;
+    // A grammar masks one position at a time: backends that do not check
+    // drafts against it decode autoregressively.
+    inputs.request.force_ar_decode =
+        req.sampler.constraint != nullptr && !backend_.speculates_under_constraint();
     // Tokens are delivered through DaemonIO so all API formats share the
     // same disconnect and streaming state machine.
     inputs.request.stream = false;

@@ -3172,8 +3172,10 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
             // GPU sample straight from the device logits tensor, skipping the
             // full ~vocab-wide D2H copy (the same payoff LUCE_GPU_ARGMAX gets
             // for greedy). Falls back to the CPU chain on -1.
+            // The GPU draw does not see the grammar: sample_logits checks it.
             int g_tok = -1;
             if (gpu_sampler_enabled() && gpu_sampler_supports(sampler_) &&
+                !sampler_.constraint &&
                 sg_.logits && sg_.logits->data &&
                 !ggml_backend_buft_is_meta(
                     ggml_backend_get_default_buffer_type(target_backend_))) {
@@ -3508,8 +3510,16 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
     // verification is unaffected, but the logit TAIL drifts at long
     // context and top-k sampling draws degenerate tokens from it
     // (reproduced at 24K: 0/12 tool calls with fa-window 2048, 4/4 with 0).
+    // Greedy under a grammar speculates without sampled verify: the walk
+    // checks the target's argmax against a snapshot of the grammar and reads
+    // a row only where the grammar rejects it (constrained_greedy_walk). Full
+    // attention for the same reason as sampled verify: a rejected argmax
+    // picks from the rest of the row.
+    const bool constrained_greedy =
+        sampler_.greedy_under_constraint() && cfg_.fa_window == 0;
     const bool sampled_verify = kSampledVerify &&
         sampler_.needs_logit_processing() &&
+        !sampler_.greedy_under_constraint() &&
         cfg_.fa_window == 0;
 
     // Check if we can use speculative decode:
@@ -3528,7 +3538,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         && (cfg_.remote_draft.enabled()
             ? remote_draft_.active()
             : feature_mirror_.target_feat != nullptr)
-        && (!sampler_.needs_logit_processing() || sampled_verify);
+        && (!sampler_.needs_logit_processing() || sampled_verify || constrained_greedy);
 
     if (!can_spec) {
         // AR consumes the prefill candidate and retains this controller.
@@ -3576,6 +3586,18 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 "(match=%d) top_logit=%.3f\n",
                 am, cache_.last_tok, am == cache_.last_tok, best);
         }
+        last_tok = sample_logits(first_logits.data(), w_.n_vocab, sampler_,
+                                 out_tokens, sampler_rng_);
+        cache_.last_tok = last_tok;
+    }
+    // Constrained greedy: the prefill's argmax is the first token when the
+    // grammar allows it, the masked argmax otherwise, as in do_ar_decode.
+    if (constrained_greedy && out_tokens.empty() && !sampler_.constraint->allows(last_tok)) {
+        if (!prefill_last_logits_valid_) return false;
+        std::vector<float> first_logits(w_.n_vocab);
+        ggml_backend_tensor_get(sg_.logits, first_logits.data(),
+                                prefill_last_logits_offset_,
+                                sizeof(float) * (size_t)w_.n_vocab);
         last_tok = sample_logits(first_logits.data(), w_.n_vocab, sampler_,
                                  out_tokens, sampler_rng_);
         cache_.last_tok = last_tok;
@@ -3938,7 +3960,8 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
              kvflash_pager_.identity_prefix_covers(committed));
         const bool use_tree_verify =
             cfg_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
-            !use_remote_draft && q_len > 1 && tree_special_inactive && !ar_step;
+            !use_remote_draft && q_len > 1 && tree_special_inactive && !ar_step &&
+            !sampler_.constraint;  // the tree walk has no per-node grammar state
 
         // Chain-verify length for this step. The DSpark confidence gate may
         // truncate the drafted block (adaptive block length); q_len stays the
@@ -4616,6 +4639,30 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                         i < accept_n - 1 ? draft_tok[i + 1] : walk.bonus);
                 }
             }
+        } else if (constrained_greedy) {
+            // Rewrites target_tok with the grammar's choice at every row it
+            // reaches, so the bonus and the fast-rollback root below are the
+            // tokens constrained AR decoding commits.
+            bool rows_read = false;
+            int vocab_v = 0;
+            accept_n = constrained_greedy_walk(
+                target_tok.data(), v_len, draft_tok.data(), sampler_,
+                [&](int row, int & vocab) -> const float * {
+                    if (!rows_read) {
+                        if (!target->read_verify_logits(v_len, verify_logits)) return nullptr;
+                        vocab_v = (int)(verify_logits.size() / (size_t)v_len);
+                        rows_read = true;
+                    }
+                    vocab = vocab_v;
+                    return verify_logits.data() + (size_t)row * (size_t)vocab_v;
+                });
+            if (accept_n == 0) {
+                std::fprintf(stderr, "spec-decode: verify logits read failed\n");
+                if (step_has_snapshot) target->restore_kv();
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            bonus_tok = (accept_n < v_len) ? target_tok[accept_n - 1] : -1;
         } else {
             for (int i = 0; i < v_len - 1; i++) {
                 if (draft_tok[i + 1] == target_tok[i]) accept_n++;
@@ -4881,6 +4928,21 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                                                draw);
             } else {
                 last_tok = replay_last_tok;
+                // The replay's argmax, or a walk row the budget hook changed
+                // the token before: checked against the grammar where the
+                // commit point left it, the next root's position.
+                if (constrained_greedy && commit_n > 0 &&
+                    !sampler_.constraint->allows(last_tok)) {
+                    if (!target->read_verify_logits(commit_n, verify_logits)) {
+                        std::fprintf(stderr, "spec-decode: verify logits read failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    const int vocab_v = (int)(verify_logits.size() / (size_t)commit_n);
+                    last_tok = sample_logits(
+                        verify_logits.data() + (size_t)(commit_n - 1) * (size_t)vocab_v,
+                        vocab_v, sampler_, out_tokens, sampler_rng_);
+                }
             }
             // The target ran all commit_n tokens. After an early stop (EOS,
             // cancel) its recurrent state and feature ring are ahead of the

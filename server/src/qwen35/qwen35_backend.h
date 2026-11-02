@@ -179,6 +179,9 @@ public:
                             const DaemonIO & io) override;
 
     bool supports_dflash_spec_decode() const override { return !cfg_.paged_attention; }
+    // Chain verify checks drafts against a snapshot of the grammar (greedy,
+    // and sampled verify); tree verify stays off for such requests.
+    bool speculates_under_constraint() const override { return !cfg_.paged_attention; }
     DFlashTarget * dflash_target() override;
 
     // Image input (--mmproj). Requests with images prefill through the normal

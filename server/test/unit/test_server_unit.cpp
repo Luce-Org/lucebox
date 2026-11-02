@@ -10774,6 +10774,58 @@ TEST_CASE(ServerUnitFixture, test_chat_codec_keeps_pflash_placeholders) {
     }
 }
 
+// tool_choice "required" with the deepseek4.1 codec: the grammar lets the reply open a call only
+// in DSML (after "\n\n", as the encoder writes it), and the call reads back.
+TEST_CASE(ServerUnitFixture, test_chat_codec_forced_call_grammar_deepseek41) {
+    ChatGoldenTokenizer tok("", {"<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>"},
+                            {"<｜User｜>", "<｜Assistant｜>", "<｜System｜>", "<think>", "</think>", "｜DSML｜"});
+    const auto corpus = read_chat_golden<nlohmann::ordered_json>("cases.json");
+    struct Capture : ScriptedReplyBackend {
+        std::shared_ptr<OutputConstraint> constraint;
+        GenerateResult generate_impl(const GenerateRequest & req, const DaemonIO & io) override {
+            // As it stands before the reply: generation advances the request's own.
+            if (req.sampler.constraint) constraint = req.sampler.constraint->snapshot();
+            return serve(req, io);
+        }
+    };
+    auto backend_owner = std::make_unique<Capture>();
+    Capture & backend = *backend_owner;
+    backend.reply = tok.tokenizer.encode(
+        "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read\">\n"
+        "<｜DSML｜ parameter name=\"path\" string=\"true\">/a</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n</｜DSML｜ calls>");
+    backend.reply.push_back(tok.tokenizer.token_to_id("<｜end▁of▁sentence｜>"));
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "deepseek41";
+    config.max_ctx = 32768;
+    config.prefix_cache_cap = 0;
+    config.chat_codec = "deepseek4.1";
+    HttpServer server(engine, tok.tokenizer, config);
+    server.set_chat_format(chat_format_for_arch(config.arch));
+    TEST_ASSERT(SchedulerTestHarness::start_worker(server));
+    nlohmann::ordered_json body = {{"model", "test"}, {"max_tokens", 64}, {"tool_checks", false},
+                                   {"tools", corpus["tools"]}, {"tool_choice", "required"},
+                                   {"reasoning_effort", "none"},
+                                   {"messages", {{{"role", "user"}, {"content", "Read /a."}}}}};
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    TEST_ASSERT(SchedulerTestHarness::route_body(server, sockets[0], "/v1/chat/completions", body.dump()));
+    close(sockets[0]);
+    std::string wire;
+    char buf[4096];
+    for (ssize_t n; (n = read(sockets[1], buf, sizeof(buf))) > 0;) wire.append(buf, (size_t) n);
+    close(sockets[1]);
+    TEST_ASSERT_MSG(backend.constraint != nullptr, wire.substr(0, 300));
+    // The reply opens with "\n\n<｜DSML｜ calls>", not "<tool_call>" or any other format.
+    TEST_ASSERT(backend.constraint->allows(tok.tokenizer.encode("\n").front()));
+    TEST_ASSERT(!backend.constraint->allows(tok.tokenizer.encode("<").front()));
+    const json response = json::parse(wire.substr(wire.find("\r\n\r\n") + 4));
+    const json & message = response["choices"][0]["message"];
+    TEST_ASSERT_MSG(message.contains("tool_calls") && message["tool_calls"].size() == 1, response.dump());
+    TEST_ASSERT(message["tool_calls"][0]["function"]["arguments"] == "{\"path\":\"/a\"}");
+}
+
 // Tool checks (on by default) serve a request through inner requests; their prompt must still
 // show the tools in the client's key order, as the official template does.
 TEST_CASE(ServerUnitFixture, test_chat_codec_tool_checks_keep_tool_order) {

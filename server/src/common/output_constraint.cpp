@@ -40,6 +40,21 @@ OutputConstraint::OutputConstraint(std::shared_ptr<const ConstraintVocab> vocab,
     reset();
 }
 
+OutputConstraint::OutputConstraint(const OutputConstraint & other)
+    : vocab_(other.vocab_),
+      initial_(other.initial_),
+      grammar_(std::make_unique<gbnf::Matcher>(*other.grammar_)),
+      options_(other.options_),
+      state_(other.state_),
+      tail_(other.tail_),
+      head_(other.head_),
+      release_window_(other.release_window_),
+      started_(other.started_) {}
+
+std::shared_ptr<OutputConstraint> OutputConstraint::snapshot() const {
+    return std::shared_ptr<OutputConstraint>(new OutputConstraint(*this));
+}
+
 OutputConstraint::State OutputConstraint::initial_state() const {
     return options_.wait_for.empty() ? State::engaged : State::waiting;
 }

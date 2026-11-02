@@ -57,6 +57,14 @@ struct SamplerCfg {
                constraint != nullptr;
     }
 
+    // Greedy decoding whose only logit processing is a grammar: the token at
+    // each position is the argmax when the grammar allows it, and the masked
+    // argmax otherwise, so a verify can check the target's argmax first.
+    bool greedy_under_constraint() const {
+        return constraint != nullptr && temp <= 0.0f && rep_pen <= 1.0f &&
+               freq_pen == 0.0f && pres_pen == 0.0f;
+    }
+
     // True when draws must be reproducible from `seed`. Otherwise (OpenAI
     // semantics) every request samples from a fresh random stream.
     bool seeded() const { return has_seed || seed != 0; }
