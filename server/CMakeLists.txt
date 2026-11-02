@@ -2890,6 +2890,8 @@ if(LUCE_TESTS)
             test/unit/test_kvflash_m4_reuse.cpp
             test/unit/test_pflash_probe_boundary.cpp
             test/unit/test_kvflash_pin_preamble.cpp
+            test/unit/test_kvflash_spec_serial.cpp
+            test/unit/test_spec_rollback_policy.cpp
             test/unit/test_qwen35moe_routing_stats.cpp
             test/unit/test_qwen35moe_expert_placement.cpp
             test/unit/test_qwen35moe_swap_manager.cpp
