@@ -3,6 +3,7 @@
 #pragma once
 
 #include "attn_masks.h"
+#include "common/thinking_budget.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -289,6 +291,175 @@ inline bool spec_early_stop_needs_repair(int commit_n, int emitted, bool budget_
     return emitted < commit_n && !budget_close_fired;
 }
 
+// Tokens a speculative step commits: the accepted draft tokens plus the
+// target's bonus token, clamped to the generation budget left. Without a bonus
+// (fast rollback keeps the bonus for the next step) it is accept_n clamped.
+inline int spec_commit_n(int accept_n, bool has_bonus, int budget_left) {
+    return std::min(accept_n + (has_bonus ? 1 : 0), budget_left);
+}
+
+// Where a speculative step leaves the target once its emit loop is done.
+// committed = position at the step start, commit_n = tokens the block verified
+// (the state is that far ahead), emitted = tokens the emit loop sent before it
+// stopped. A step that ends the request (EOS, cancel, stop string, the last
+// budget token) or fires a budget close ends in AR's state: the last emitted
+// token is pending, its row is not in the cache and the recurrent state has
+// not consumed it. AR emits a token before forwarding it, so it always ends
+// that way; a spec block forwards the whole verified prefix, so the snapshot is
+// restored and only the tokens before the last emitted one are replayed.
+//   - not terminal, whole block emitted: nothing to repair, state at committed + emitted.
+//   - terminal or budget close: restore, replay emitted - 1 tokens, state at
+//     committed + emitted - 1.
+// The spec loop runs exactly this, and pools QK keys only at new_committed.
+struct SpecStepSettle {
+    bool repair;         // restore the pre-step snapshot, then replay replay_n tokens
+    int  replay_n;       // emitted tokens to replay after the restore
+    int  new_committed;  // cache position once the step is settled
+};
+inline SpecStepSettle spec_step_settle(int committed, int commit_n, int emitted,
+                                       bool budget_close_fired, bool terminal) {
+    SpecStepSettle r{};
+    if (budget_close_fired || terminal) {
+        r.repair = true;
+        r.replay_n = emitted > 0 ? emitted - 1 : 0;
+    } else {
+        r.repair = spec_early_stop_needs_repair(commit_n, emitted, false);
+        r.replay_n = emitted;
+    }
+    r.new_committed = committed + r.replay_n;
+    return r;
+}
+
+// Adaptive reselect interval: a rescore costs ~0.11 ms per history token (full 0.6B re-prefill; measured 0.9 s @8K,
+// ~46 s bisected @256K), while decode produces ~30 tok/s. Capping rescore overhead at ~15% of decode time gives
+// tau ~= history / 45; the configured tau0 is the floor.
+constexpr int kKvFlashTauHistoryDivisor = 45;
+inline int kvflash_reselect_tau(int tau0, size_t history) {
+    return std::max(tau0, (int)(history / kKvFlashTauHistoryDivisor));
+}
+
+// AR's decode-time reselection (kvflash_maybe_reselect) runs after the g-th
+// generated token when g % tau(g) == 0, tau(g) = kvflash_reselect_tau(tau0, hist0 + g),
+// hist0 = history size before the first generated token. A spec step advances
+// several tokens: this lists every g in (prev_g, g] AR would have reselected
+// at, so spec reselects at the same boundaries.
+inline std::vector<int> kvflash_reselect_points(size_t hist0, int prev_g, int g, int tau0) {
+    std::vector<int> v;
+    if (tau0 <= 0) return v;
+    for (int i = std::max(prev_g, 0) + 1; i <= g; i++) {
+        if (i % kvflash_reselect_tau(tau0, hist0 + (size_t)i) == 0) v.push_back(i);
+    }
+    return v;
+}
+
+// Where AR's decode-time reselections fall, as cache positions. AR reselects
+// right after it emits generated token r (r % tau(r) == 0) and before it
+// forwards that token, so the reselect sits at the position of token r. A spec
+// step at p0 that has emitted g0 tokens verifies the seed (token g0 + 1) at p0
+// and token r at p0 + (r - g0 - 1). Lists the points inside rows (p0, p0 + n);
+// the seed's own point (r == g0 + 1) is handled before the step.
+inline std::vector<int> kvflash_reselect_positions(size_t hist0, int g0, int p0, int n, int tau0) {
+    std::vector<int> v;
+    for (int r : kvflash_reselect_points(hist0, g0 + 1, g0 + n, tau0))
+        v.push_back(p0 + (r - g0 - 1));
+    return v;
+}
+
+// How many rows of a proposed verify span n a spec step at p0 may run so it
+// stays AR-equivalent under KVFlash. AR reselects before the token at a
+// reselect point and allocates one pool chunk at a time, so a span
+//   - never contains a reselect point except at its first row (the step that
+//     starts there reselects first, from the query of the row before it), and
+//   - never reaches into a chunk that is not allocated yet, except p0's own
+//     (the first row always allocates it, as AR does); a rejected tail would
+//     leave the speculative allocation, and its eviction, behind.
+// chunk_tokens <= 0: no KVFlash, no chunk bound. Result is in [1, n].
+inline int kvflash_verify_span_cap(int p0, int n, const std::vector<int> & reselect_positions,
+                                   int chunk_tokens,
+                                   const std::function<bool(int)> & chunk_allocated) {
+    int cap = std::max(n, 1);
+    for (int p : reselect_positions)
+        if (p > p0) cap = std::min(cap, p - p0);
+    if (chunk_tokens > 0) {
+        const int c0 = p0 / chunk_tokens;
+        for (int i = 1; i < cap; i++) {
+            const int c = (p0 + i) / chunk_tokens;
+            if (c != c0 && !chunk_allocated(c)) { cap = i; break; }
+        }
+    }
+    return cap;
+}
+
+// The token AR records in history for the pending seed. AR applies the
+// thinking budget before it records the token and reselects, so a forced close
+// (or any replacement) already shows there. The spec loop reselects at the step
+// start, before the seed's budget accounting at emission: apply it to a copy
+// and leave the real controller to the emission.
+inline int32_t kvflash_reselect_seed_token(const ThinkingBudget & budget, int32_t seed) {
+    ThinkingBudget copy = budget;
+    return copy.apply(seed).token;
+}
+
+// A spec step never starts on a seed that opens a pool chunk the pool has not
+// allocated. AR emits a token before it forwards it, so a request that ends on
+// that emission (last budget token, cancel, stop string, EOS) never allocates
+// the chunk. A spec step verifies the seed first, and the verify allocates the
+// chunk (and may evict an older one) that a terminal repair cannot undo:
+// restore_kv() puts back recurrent state only. That one seed takes the AR
+// single-token step (emit, then forward) and the next spec step starts after it.
+inline bool kvflash_seed_takes_ar_step(int committed, int chunk_tokens,
+                                       const std::function<bool(int)> & is_resident) {
+    return chunk_tokens > 0 && !is_resident(committed / chunk_tokens);
+}
+
+// The span cap of the spec step at p0, from what the step knows at its start:
+// the history base, the history guard's entry, and out_tokens.size(). The seed
+// is pending, not in out_tokens, so g0 counts only tokens emitted before it.
+inline int kvflash_step_span_cap(size_t hist_base, size_t guard_entry, size_t out_size,
+                                 int p0, int n, int tau0, int chunk_tokens,
+                                 const std::function<bool(int)> & chunk_allocated) {
+    const int g0 = (int)(out_size - guard_entry);
+    return kvflash_verify_span_cap(
+        p0, n, kvflash_reselect_positions(hist_base, g0, p0, n, tau0),
+        chunk_tokens, chunk_allocated);
+}
+
+// The verify pass stages the query of each of its rows (positions
+// stage_base .. stage_base + stage_n - 1). After acceptance q_cap must hold
+// what AR holds: the query of the last consumed row, position new_committed -
+// 1. Returns that row's index in the stage, or -1 when it is not staged (then
+// q_cap keeps its value). Rejected rows are never picked.
+inline int kvflash_q_stage_row(int stage_base, int stage_n, int new_committed) {
+    const int row = new_committed - 1 - stage_base;
+    return stage_base >= 0 && row >= 0 && row < stage_n ? row : -1;
+}
+
+// Pool slots for the rows [base, base + n) of a verify block, allocated up
+// front (a chunk boundary may evict). false = the pool had no slot for row
+// *failed: nothing was run yet, so the caller can finish the request with
+// plain decode instead of failing it.
+template <class Pager>
+inline bool kvflash_verify_slots(Pager & pager, int base, int n, std::vector<int> & slots, int * failed) {
+    slots.resize((size_t)n);
+    for (int i = 0; i < n; i++) {
+        slots[(size_t)i] = pager.slot_for(base + i);
+        if (slots[(size_t)i] < 0) {
+            if (failed) *failed = base + i;
+            return false;
+        }
+    }
+    return true;
+}
+
+// Chunks [from, to) that kvflash_qk_pool_to still has to pool once the
+// committed position is `committed`: chunks sealed (fully below committed)
+// that are not pooled yet. The pooled index never moves back.
+struct QkPoolRange { int from; int to; };
+inline QkPoolRange kvflash_qk_pool_range(int pooled_upto, int committed, int chunk_tokens) {
+    const int sealed = chunk_tokens > 0 ? committed / chunk_tokens : 0;
+    return {pooled_upto, std::max(pooled_upto, sealed)};
+}
+
 // History after a decode phase: history[0:base] followed by the generated ids
 // out_tokens[out_entry:]. Rebuilds from `base` rather than appending, so it is
 // idempotent over an AR fallback that already pushed some of the same ids.
@@ -298,6 +469,19 @@ inline void kvflash_history_set_generated(std::vector<int32_t> & history, size_t
     history.resize(std::min(base, history.size()));
     if (out_entry < out_tokens.size())
         history.insert(history.end(), out_tokens.begin() + out_entry, out_tokens.end());
+}
+
+// The history a reselect at generated token g scores: the prompt (base), the
+// tokens emitted so far, the pending seed as AR records it (budget applied) when
+// g is the seed's own point, cut to g generated tokens.
+inline void kvflash_reselect_history(std::vector<int32_t> & history, size_t base,
+                                     const std::vector<int32_t> & out_tokens, size_t out_entry,
+                                     int g, int g_seed, const ThinkingBudget & budget,
+                                     int32_t last_tok) {
+    kvflash_history_set_generated(history, base, out_tokens, out_entry);
+    if (g == g_seed && last_tok >= 0)
+        history.push_back(kvflash_reselect_seed_token(budget, last_tok));
+    history.resize(base + (size_t)g);
 }
 
 // Decision for a restore from the live session (S8a).

@@ -3660,11 +3660,7 @@ int Qwen35Backend::kvflash_rewind_turn(const PrefixSnapshot & snap, bool zero_st
 
 void Qwen35Backend::kvflash_maybe_reselect(int generated) {
     if (kvflash_tau_ <= 0) return;
-    // Adaptive tau: a rescore costs ~0.11 ms per history token (full 0.6B
-    // re-prefill; measured 0.9 s @8K, ~46 s bisected @256K), while decode
-    // produces ~30 tok/s. Capping rescore overhead at ~15% of decode time
-    // gives tau ~= history/45. The configured tau is the floor.
-    const int tau = std::max<int>(kvflash_tau_, (int)(kvflash_history_.size() / 45));
+    const int tau = kvflash_reselect_tau(kvflash_tau_, kvflash_history_.size());
     if (generated % tau != 0) return;
     // Lazy-load the drafter only when a rescore is actually due, so the
     // first tokens of the first request never pay the load.
