@@ -273,7 +273,9 @@ protected:
     // positions map to pool slots via kvflash_pager_, cold chunks page to
     // host. Policy-agnostic: with no scorer the pager is LRU; when the
     // pflash drafter is loaded it becomes the reselect scorer (every
-    // kvflash_tau_ decoded tokens). Forces AR decode (no spec).
+    // kvflash_tau_ decoded tokens). With a draft model the serial path
+    // speculates too: spec steps stay AR-equivalent (see do_spec_decode);
+    // --ddtree with KVFlash is refused at startup.
     // Protected: the MoE subclass routes its pipelined decode loops and
     // hybrid prefill through the same pager/history/reselect state.
     KvFlashPager                   kvflash_pager_;
@@ -594,7 +596,8 @@ private:
                       std::vector<int32_t> & out_tokens,
                       const DaemonIO & io,
                       bool * forced_close_out,
-                      bool * degenerate_close_out);
+                      bool * degenerate_close_out,
+                      size_t reselect_origin = SIZE_MAX);
 
     bool begin_paged_sequence(uint32_t prompt_tokens);
     // Allocates the next paged K/V row and uploads this step's block-table /

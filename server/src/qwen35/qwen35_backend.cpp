@@ -3122,15 +3122,15 @@ bool Qwen35Backend::kvflash_restore_pooled(const PrefixSnapshot & snap,
 // restored state) — it is skipped and scores missing (0) until repooled.
 void Qwen35Backend::kvflash_qk_pool_to(int committed) {
     const int ct = kvflash_pager_.chunk_tokens();
-    const int sealed = committed / ct;
-    for (int c = kvflash_qk_pooled_upto_; c < sealed; c++) {
+    const auto range = kvflash_qk_pool_range(kvflash_qk_pooled_upto_, committed, ct);
+    for (int c = range.from; c < range.to; c++) {
         const int blk = kvflash_pager_.block_of(c);
         if (blk < 0 || !kvflash_qk_pool_.pool_chunk(cache_.attn_k, blk, ct, c)) {
             std::fprintf(stderr, "[kvflash-qk] pool_chunk failed for chunk %d "
                                  "(block %d); chunk scores as missing\n", c, blk);
         }
     }
-    kvflash_qk_pooled_upto_ = std::max(kvflash_qk_pooled_upto_, sealed);
+    kvflash_qk_pooled_upto_ = range.to;
 }
 
 // Regroup the last n_tok tokens' queries of the batch just computed from
@@ -3660,6 +3660,17 @@ int Qwen35Backend::kvflash_rewind_turn(const PrefixSnapshot & snap, bool zero_st
     return 1;
 }
 
+bool Qwen35Backend::kvflash_q_cap_from_stage(int new_committed) {
+    const int row = kvflash_q_stage_row(cache_.q_stage_base, cache_.q_stage_n, new_committed);
+    if (row < 0 || !cache_.q_stage || !cache_.q_cap) return false;
+    const size_t bytes = ggml_nbytes(cache_.q_cap);
+    if (cache_.q_stage->nb[3] != bytes) return false;
+    std::vector<uint8_t> q(bytes);
+    ggml_backend_tensor_get(cache_.q_stage, q.data(), (size_t)row * bytes, bytes);
+    ggml_backend_tensor_set(cache_.q_cap, q.data(), 0, bytes);
+    return true;
+}
+
 void Qwen35Backend::kvflash_maybe_reselect(int generated) {
     if (kvflash_tau_ <= 0) return;
     const int tau = kvflash_reselect_tau(kvflash_tau_, kvflash_history_.size());
@@ -3695,8 +3706,12 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
                                   std::vector<int32_t> & out_tokens,
                                   const DaemonIO & io,
                                   bool * forced_close_out,
-                                  bool * degenerate_close_out) {
+                                  bool * degenerate_close_out,
+                                  size_t reselect_origin) {
     const size_t out_tokens_at_entry = out_tokens.size();
+    // A spec step that hands off passes the request's output origin, so the
+    // reselect boundaries stay global; AR entered directly counts from here.
+    const size_t reselect_from = reselect_origin == SIZE_MAX ? out_tokens_at_entry : reselect_origin;
     auto apply_budget = [&](int32_t & tok) {
         const int remaining = budget.remaining();
         const bool was_forced = budget.forced_close();
@@ -3891,7 +3906,7 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
         if (pool) {
             kvflash_history_.push_back(next_tok);
             if (kvflash_qk_policy_) kvflash_qk_pool_to(committed);
-            kvflash_maybe_reselect((int)(out_tokens.size() - out_tokens_at_entry));
+            kvflash_maybe_reselect((int)(out_tokens.size() - reselect_from));   // generated tokens counted from the request's output origin
         }
         if (io.is_cancelled()) break;
 
@@ -4204,6 +4219,14 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
 
     out_spec_ran = true;
 
+    // Verify passes stage each row's query for q_cap (see reselect_before_step).
+    struct QStageGuard {
+        TargetCache & c;
+        QStageGuard(TargetCache & cache, bool on) : c(cache) { c.q_stage_on = on && c.q_stage; c.q_stage_n = 0; c.q_stage_base = -1; }
+        ~QStageGuard() { c.q_stage_on = false; c.q_stage_n = 0; c.q_stage_base = -1; }
+    } q_stage_guard{cache_, kvflash_active() && kvflash_qk_policy_};
+    int n_span_clamped = 0;
+
     // KVFlash history: every committed id (accepted drafts, bonus, replay and
     // injected tokens) lands in out_tokens in order; mirror them into
     // kvflash_history_ on every exit so live restore sees the answer.
@@ -4423,6 +4446,9 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                      n_generated > 0 ? (double)target_forwards / n_generated : 0.0,
                      n_draft_steps > 0 ? (double)target_forwards / n_draft_steps : 0.0);
         rollback_diag.print(rollback_policy, stderr);
+        if (kvflash_active())
+            std::fprintf(stderr, "[kvflash] spec verify span clamps=%d (reselect point or unallocated chunk)\n",
+                         n_span_clamped);
     };
 
     // kvflash: an in-pool prompt prefills contiguously without registering
@@ -4459,7 +4485,62 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             ? (float)(t_spec_step_ema / t_ar_step_ema) : adaptive.step_ratio;
     };
 
+    // QK pooling has one call site per settled position: the top of every
+    // iteration (all commit paths end up there) and every exit. It must never
+    // run inside a step: a forced budget close moves the position back after
+    // the emit loop, and a chunk pooled from the unrepaired block would keep
+    // the replaced token's key.
+    auto pool_settled = [&]() {
+        if (!kvflash_active()) return;
+        if (kvflash_qk_policy_) kvflash_qk_pool_to(committed);
+    };
+    // Decode-time reselection: AR reselects right after it emits generated
+    // token g (g % tau == 0), before it forwards that token. At a step start
+    // the seed (last_tok) is token g0 + 1, pending at `committed`, so the
+    // reselect for it runs here, from q_cap = the query of the last consumed
+    // row (committed - 1, taken from the verify stage). The verify span is
+    // clamped (kvflash_step_span_cap) so no later point falls inside a step:
+    // every reselect runs at a step start, with the resident set and the query
+    // AR has there.
+    int reselect_done_g = 0;
+    auto reselect_before_step = [&]() {
+        if (!kvflash_active()) return;
+        const int g_seed = (int)(out_tokens.size() - history_guard.entry) + 1;
+        const std::vector<int> pts =
+            kvflash_reselect_points(history_guard.base, reselect_done_g, g_seed, kvflash_tau_);
+        reselect_done_g = std::max(reselect_done_g, g_seed);
+        if (pts.empty()) return;
+        if (kvflash_qk_policy_) kvflash_q_cap_from_stage(committed);
+        for (int g : pts) {
+            kvflash_reselect_history(kvflash_history_, history_guard.base, out_tokens,
+                                     history_guard.entry, g, g_seed, budget, last_tok);
+            kvflash_maybe_reselect(g);
+        }
+    };
+    // Every handoff to AR from the spec loop: AR continues the same request, so
+    // it gets the history with every emitted token and the request's output
+    // origin (its reselect boundaries are global, not counted from the handoff).
+    auto ar_tail = [&]() -> bool {
+        if (kvflash_active())
+            kvflash_history_set_generated(kvflash_history_, history_guard.base, out_tokens,
+                                          history_guard.entry);
+        return do_ar_decode(committed, budget, out_tokens, io, forced_close_out,
+                            degenerate_close_out, history_guard.entry);
+    };
+    // The one exit from the spec loop to AR: settle the pool, finish the speculative state, then either end the
+    // request (`ended`) or continue it with plain decode. Both close the stream.
+    auto finish_to_ar = [&](bool ended) -> bool {
+        pool_settled();
+        if (!finish_speculative_state()) return false;
+        const bool ok = ended || ar_tail();
+        log_target_forward_stats();
+        io.emit(-1);
+        return ok;
+    };
+
     while (budget.remaining() > 0) {
+        pool_settled();
+        reselect_before_step();
         const int need_commit_budget = budget.remaining();
         // Plain-decode step inside the spec loop: no drafter forward, verify
         // the seed token only. Features are still captured, so the drafter
@@ -4491,13 +4572,82 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 last_tok, (int)out_tokens.size());
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.back();
-            if (!finish_speculative_state()) return false;
-            bool ok = do_ar_decode(committed, budget, out_tokens, io,
-                                    forced_close_out, degenerate_close_out);
-            log_target_forward_stats();
-            io.emit(-1);
-            return ok;
+            return finish_to_ar(false);
         }
+
+        // KVFlash: a spec step never starts on a seed that opens a chunk the
+        // pool has not allocated. That seed takes the AR single-token step:
+        // emit, then forward, which allocates the chunk exactly as AR does (a
+        // request that ends on the emission never allocates it; restore_kv()
+        // could not undo a verify's allocation). The next spec step starts
+        // after it. (LUCE_MIN_TOKENS with KVFlash is refused at startup, so no
+        // floor case reaches here.)
+        if (kvflash_active() && last_tok >= 0 &&
+            kvflash_seed_takes_ar_step(
+                committed, kvflash_pager_.chunk_tokens(),
+                [&](int c) { return kvflash_pager_.is_resident(c); })) {
+            // AR's state when the request ends or closes here: the last emitted
+            // token is pending, not forwarded.
+            auto hand_to_ar = [&](bool ended) -> bool {
+                cache_.cur_pos = committed;
+                cache_.last_tok = out_tokens.back();
+                step_graph_destroy(draft_sg);
+                out_accept_rate = acceptance.rate();
+                return finish_to_ar(ended);
+            };
+            const int remaining = budget.remaining();
+            const auto decision = budget.apply(last_tok);
+            if (decision.cut) {
+                std::fprintf(stderr,
+                    "[budget-hook] spec-decode force-close at remaining=%d: "
+                    "overriding token %d with close token %d\n",
+                    remaining, last_tok, decision.token);
+                if (forced_close_out) *forced_close_out = true;
+            }
+            out_tokens.push_back(decision.token);
+            io.emit(decision.token);
+            const bool ended = budget.remaining() <= 0 || io.is_cancelled() ||
+                               IS_EOS_TOK(decision.token, w_);
+            if (ended || decision.cut) return hand_to_ar(ended);
+            // Forward the emitted token (features captured for the drafter).
+            const std::vector<int32_t> hop_tok(1, decision.token);
+            int hop_last_tok = -1;
+            if (!target->verify_batch(hop_tok, committed, hop_last_tok, &target_tok,
+                                      /*capture_ssm_intermediates=*/true)) {
+                if (target->verify_pool_exhausted()) {
+                    std::fprintf(stderr,
+                        "[kvflash] spec AR step: pool exhausted at committed=%d, "
+                        "finishing the request with AR\n", committed);
+                    return hand_to_ar(false);
+                }
+                std::fprintf(stderr, "spec-decode: AR step forward failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            target_forwards++;
+            if (use_remote_draft && cache_.target_feat) {
+                if (!sync_remote_draft_features(committed, 1)) {
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+            } else if (feature_mirror_.target_feat && cache_.target_feat) {
+                if (!sync_local_draft_features(committed, 1)) {
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+            }
+            if (sampled_verify && target->read_verify_logits(1, verify_logits)) {
+                last_tok = sample_logits(verify_logits.data(), (int)verify_logits.size(),
+                                         sampler_, out_tokens, sampler_rng_);
+            } else {
+                last_tok = target_tok[0];
+            }
+            committed += 1;
+            cache_.cur_pos = committed;
+            n_generated += 1;
+            continue;
+        }
+        // end of the AR hop
 
         // 1. Build noise input for draft. The drafter GGUF's own MASK id
         // wins over the target-side default (the loader resolved the
@@ -5220,6 +5370,22 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             }
         }
 
+        // 3a-quater. KVFlash: keep the span AR-equivalent. No reselect point
+        // inside the span but its first row, and no chunk allocated ahead of
+        // the first row's own (a rejected tail or a terminal repair would leave
+        // the allocation and its eviction behind).
+        if (kvflash_active()) {
+            const int cap = kvflash_step_span_cap(
+                history_guard.base, history_guard.entry, out_tokens.size(), committed, v_len,
+                kvflash_tau_, kvflash_pager_.chunk_tokens(),
+                [&](int c) { return kvflash_pager_.is_resident(c); });
+            if (cap < v_len) {
+                v_len = cap;
+                if ((int)draft_tok.size() > cap) draft_tok.resize((size_t)cap);
+                n_span_clamped++;
+            }
+        }
+
         // 3b. Tool call hint injection: override draft tokens with pre-known
         // structural tokens for near-100% acceptance.
         int hint_fill = 0;
@@ -5240,8 +5406,11 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         //    A plain-decode step verifies only the (always accepted) seed, so
         //    it never rolls back: skip the snapshot copy — unless an armed
         //    emit-phase hook could still force a restore+replay this step.
+        //    Under KVFlash every step snapshots: io.emit can end the request
+        //    (cancel, stop string) after the verify, and the terminal repair
+        //    needs the pre-step state to leave the last token pending.
         const bool step_has_snapshot =
-            !ar_step || !budget.settled() || stall_replay_armed;
+            kvflash_active() || !ar_step || !budget.settled() || stall_replay_armed;
         const auto profile_snapshot_start = profile_start();
         if (step_has_snapshot && !target->snapshot_kv()) {
             step_graph_destroy(draft_sg);
@@ -5253,6 +5422,40 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         const auto profile_verify_start = profile_start();
         if (!target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok,
                                    /*capture_ssm_intermediates=*/true)) {
+            // KVFlash pool exhaustion is not a spec failure: no state was
+            // touched, so the rest of the request runs as plain decode.
+            if (target->verify_pool_exhausted()) {
+                std::fprintf(stderr,
+                    "[kvflash] spec verify: pool exhausted at committed=%d, "
+                    "finishing the request with AR\n", committed);
+                if (!target->restore_kv()) {
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                step_graph_destroy(draft_sg);
+                cache_.cur_pos = committed;
+                // Spec convention at a step boundary: last_tok is the verified
+                // next token, pending at `committed` and not emitted yet (the
+                // emit lags one step); out_tokens.back() is the previous seed,
+                // already forwarded at committed - 1. AR keeps its pending
+                // token emitted and last in out_tokens, so emit it now;
+                // do_ar_decode then forwards it at `committed`, once.
+                if (!out_tokens.empty()) {
+                    if (last_tok < 0) {
+                        std::fprintf(stderr, "spec-decode: verify failed (no pending token)\n");
+                        return false;
+                    }
+                    const bool was_forced = budget.forced_close();
+                    const int32_t pend = budget.apply(last_tok).token;
+                    if (budget.forced_close() && !was_forced && forced_close_out) *forced_close_out = true;
+                    out_tokens.push_back(pend);
+                    io.emit(pend);
+                    cache_.last_tok = pend;
+                    return finish_to_ar(budget.remaining() <= 0 || io.is_cancelled() || IS_EOS_TOK(pend, w_));
+                }
+                cache_.last_tok = last_tok;
+                return finish_to_ar(false);
+            }
             std::fprintf(stderr, "spec-decode: verify failed\n");
             // Only restore when this step actually took the snapshot;
             // otherwise the copy-back would be up to a whole burst stale.
@@ -5370,11 +5573,8 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             n_hint_proposed += hint_fill;
             n_hint_accepted += std::min(hint_fill, accept_n - 1);
         }
-        int commit_n  = accept_n + (bonus_tok >= 0 ? 1 : 0);
-        if (commit_n > need_commit_budget) {
-            commit_n = need_commit_budget;
-            if (commit_n <= accept_n) bonus_tok = -1;
-        }
+        int commit_n  = spec_commit_n(accept_n, bonus_tok >= 0, need_commit_budget);
+        if (commit_n <= accept_n) bonus_tok = -1;
 
         // 6. Fix state: adaptive fast-rollback vs legacy replay.
         //    Fast-rollback (implicit bonus, skip replay) is profitable when
@@ -5531,6 +5731,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             if (IS_EOS_TOK(replay_tok[i], w_)) { hit_eos = true; break; }
         }
         int injected = 0;
+        SpecStepSettle settle{};
         if (floor_to_ar) {
             if (!target->restore_kv()) {
                 step_graph_destroy(draft_sg);
@@ -5642,26 +5843,43 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             // The target ran all commit_n tokens. After an early stop (EOS,
             // cancel) its recurrent state and feature ring are ahead of the
             // emitted prefix: restore the pre-step snapshot and replay only
-            // the emitted tokens, as the floor path does. A budget close is
+            // the emitted tokens, as the floor path does. Under KVFlash a step
+            // that ends the request (EOS, cancel, stop string, last budget
+            // token) must end in AR's state, the last emitted token pending:
+            // replay the emitted tokens but the last. A budget close is
             // repaired below.
-            if (spec_early_stop_needs_repair(commit_n, emitted, budget_close_fired)) {
+            const bool terminal_step = kvflash_active() &&
+                (hit_eos || io.is_cancelled() || budget.remaining() <= 0);
+            settle = spec_step_settle(committed, commit_n, emitted, budget_close_fired, terminal_step);
+            if (settle.repair && !budget_close_fired) {
+                // Evidence line: the G3c cases count these to prove the path ran.
+                if (kvflash_active() && spec_early_stop_needs_repair(commit_n, emitted, false)) {
+                    std::fprintf(stderr,
+                        "[kvflash] spec early-stop repair #%d: commit_n=%d emitted=%d "
+                        "committed=%d (cancel=%d eos=%d)\n",
+                        ++spec_early_stop_repairs_, commit_n, emitted, committed,
+                        (int)io.is_cancelled(), (int)hit_eos);
+                }
                 if (!target->restore_kv()) {
                     step_graph_destroy(draft_sg);
                     return false;
                 }
                 cache_.cur_pos = committed;
-                std::vector<int32_t> replay_prefix(replay_tok.begin(),
-                                                   replay_tok.begin() + emitted);
-                int prefix_last_tok = -1;
-                if (!target->verify_batch(replay_prefix, committed,
-                                          prefix_last_tok, nullptr)) {
-                    std::fprintf(stderr, "spec-decode: early-stop prefix replay failed\n");
-                    step_graph_destroy(draft_sg);
-                    return false;
+                if (settle.replay_n > 0) {
+                    std::vector<int32_t> replay_prefix(replay_tok.begin(),
+                                                       replay_tok.begin() + settle.replay_n);
+                    int prefix_last_tok = -1;
+                    if (!target->verify_batch(replay_prefix, committed,
+                                              prefix_last_tok, nullptr)) {
+                        std::fprintf(stderr, "spec-decode: early-stop prefix replay failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    target_forwards++;
                 }
-                target_forwards++;
             }
-            committed += emitted;
+            // A budget close is settled below, after the snapshot restore.
+            if (!budget_close_fired) committed = settle.new_committed;
         }
         cache_.cur_pos = committed;
         n_generated += emitted + injected;
@@ -5710,18 +5928,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
             out_accept_rate = acceptance.rate();
-            if (budget.remaining() <= 0 || io.is_cancelled() || hit_eos) {
-                if (!finish_speculative_state()) return false;
-                log_target_forward_stats();
-                io.emit(-1);
-                return true;
-            }
-            if (!finish_speculative_state()) return false;
-            bool ok = do_ar_decode(committed, budget, out_tokens, io,
-                                    forced_close_out, degenerate_close_out);
-            log_target_forward_stats();
-            io.emit(-1);
-            return ok;
+            return finish_to_ar(budget.remaining() <= 0 || io.is_cancelled() || hit_eos);
         }
         // Budget hook close: close[0] was emitted as this step's last token.
         // Roll back to the pre-step snapshot and replay only the tokens
@@ -5735,9 +5942,14 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             }
             committed = committed_at_step;
             cache_.cur_pos = committed;
-            if (emitted > 1) {
+            if (kvflash_active())
+                std::fprintf(stderr, "[kvflash] spec budget-close repair: step_start=%d emitted=%d "
+                                     "pooled_upto=%d chunk_tokens=%d\n",
+                             committed_at_step, emitted, kvflash_qk_pooled_upto_,
+                             kvflash_pager_.chunk_tokens());
+            if (settle.replay_n > 0) {
                 std::vector<int32_t> replay_prefix(replay_tok.begin(),
-                                                   replay_tok.begin() + emitted - 1);
+                                                   replay_tok.begin() + settle.replay_n);
                 int prefix_last_tok = -1;
                 if (!target->verify_batch(replay_prefix, committed,
                                           prefix_last_tok, nullptr)) {
@@ -5747,28 +5959,18 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 }
                 target_forwards++;
             }
-            committed += emitted - 1;
+            committed = settle.new_committed;
             cache_.cur_pos = committed;
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
             out_accept_rate = acceptance.rate();
-            if (budget.remaining() <= 0 || io.is_cancelled() ||
-                IS_EOS_TOK(out_tokens.back(), w_)) {
-                if (!finish_speculative_state()) return false;
-                log_target_forward_stats();
-                io.emit(-1);
-                return true;
-            }
-            if (!finish_speculative_state()) return false;
-            bool ok = do_ar_decode(committed, budget, out_tokens, io,
-                                    forced_close_out, degenerate_close_out);
-            log_target_forward_stats();
-            io.emit(-1);
-            return ok;
+            return finish_to_ar(budget.remaining() <= 0 || io.is_cancelled() ||
+                                IS_EOS_TOK(out_tokens.back(), w_));
         }
         if (hit_eos) break;
     }
 
+    pool_settled();
     if (!finish_speculative_state()) {
         step_graph_destroy(draft_sg);
         return false;
