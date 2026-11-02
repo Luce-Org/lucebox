@@ -2701,6 +2701,9 @@ if(LUCE_TESTS)
         if(CURL_FOUND)
             target_compile_definitions(test_server_unit PRIVATE LUCE_HAS_CURL=1)
         endif()
+        # The chat golden corpus (test/chat_golden), read at run time.
+        target_compile_definitions(test_server_unit PRIVATE
+            LUCE_CHAT_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/chat_golden")
         if(CURL_FOUND)
             target_link_libraries(test_server_unit PRIVATE CURL::libcurl)
         endif()

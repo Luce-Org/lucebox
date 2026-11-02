@@ -10306,6 +10306,241 @@ TEST_CASE(ServerUnitFixture, test_concurrent_thinking_tool_turn_replays_as_gener
 }
 #endif  // !defined(_WIN32)
 
+#if defined(LUCE_CHAT_GOLDEN_DIR)
+// ── Chat golden corpus (test/chat_golden) ──────────────────────────────────
+// The prompt Lucebox serves must be the one the model's official chat template
+// renders; test/chat_golden/generate.py writes those references.
+// known_divergences.json lists the cases that still differ, each with the
+// reason. A case that differs without a listing fails, and so does a listed
+// case that now matches, so the list stays the current state.
+
+static json read_chat_golden(const std::string & name) {
+    std::ifstream in(std::string(LUCE_CHAT_GOLDEN_DIR) + "/" + name);
+    TEST_ASSERT_MSG(in.good(), "missing test/chat_golden/" + name);
+    return json::parse(in);
+}
+
+// Where `got` first leaves `want`, with the text around it.
+static std::string chat_golden_diff(const std::string & want, const std::string & got) {
+    size_t at = 0;
+    while (at < want.size() && at < got.size() && want[at] == got[at]) ++at;
+    const size_t from = at > 80 ? at - 80 : 0;
+    const auto quote = [&](const std::string & text) {
+        return json(text.substr((std::min)(from, text.size()), 200))
+            .dump(-1, ' ', false, json::error_handler_t::replace);
+    };
+    return "differs at byte " + std::to_string(at) + "\n      official: " + quote(want) +
+           "\n      lucebox:  " + quote(got);
+}
+
+static std::string chat_golden_token_diff(const std::vector<int32_t> & want,
+                                          const std::vector<int32_t> & got,
+                                          const Tokenizer & tokenizer) {
+    size_t at = 0;
+    while (at < want.size() && at < got.size() && want[at] == got[at]) ++at;
+    const auto piece = [&](const std::vector<int32_t> & ids) {
+        const size_t end = (std::min)(ids.size(), at + 6);
+        return json(tokenizer.decode({ids.begin() + (long) (std::min)(at, ids.size()),
+                                      ids.begin() + (long) end}))
+            .dump(-1, ' ', false, json::error_handler_t::replace);
+    };
+    return "tokens differ at " + std::to_string(at) + " of " + std::to_string(want.size()) +
+           "\n      official: " + piece(want) + "\n      lucebox:  " + piece(got);
+}
+
+// Compares every case against its listing in known_divergences.json[`section`][`model`];
+// `check` returns "" when the case matches, else what differs. Returns the failures.
+static std::string check_chat_golden(
+        const std::string & model, const std::string & section, const json & cases,
+        const std::function<std::string(const std::string &, const json &)> & check) {
+    const json known = read_chat_golden("known_divergences.json");
+    const json listed = known.value(section, json::object()).value(model, json::object());
+    std::string failures;
+    int matched = 0;
+    for (const auto & [id, expected] : cases.items()) {
+        const std::string diff = check(id, expected);
+        const bool is_listed = listed.contains(id);
+        if (diff.empty()) ++matched;
+        if (!diff.empty() && !is_listed) {
+            failures += "  " + model + " " + id + " (not in known_divergences." + section +
+                        "): " + diff + "\n";
+        } else if (diff.empty() && is_listed) {
+            failures += "  " + model + " " + id + " now matches: remove it from known_divergences." +
+                        section + "\n";
+        } else if (!diff.empty()) {
+            std::fprintf(stderr, "[chat-golden] %s %s (known: %s): %s\n", model.c_str(),
+                         id.c_str(), listed[id].get<std::string>().c_str(), diff.c_str());
+        }
+    }
+    std::fprintf(stderr, "[chat-golden] %s %s: %d of %zu cases match the official template\n",
+                 model.c_str(), section.c_str(), matched, cases.size());
+    return failures;
+}
+
+// With LUCE_CHAT_GOLDEN_DUMP set to a directory, Lucebox's prompt for each case is written
+// there as <model>.<case>.txt, to read beside expected/<model>.json.
+static void dump_chat_golden(const std::string & model, const std::string & id,
+                             const std::string & text) {
+    const char * dir = std::getenv("LUCE_CHAT_GOLDEN_DUMP");
+    if (!dir || !*dir) return;
+    std::ofstream(std::string(dir) + "/" + model + "." + id + ".txt", std::ios::binary) << text;
+}
+
+// The tokenizer the checks render with: the real one when `env` names the model's GGUF
+// (token IDs are then compared too), else a byte-level fixture with the model's control
+// tokens, which round-trips any prompt text exactly.
+struct ChatGoldenTokenizer {
+    Tokenizer tokenizer;
+    bool real = false;
+    std::string fixture;
+
+    ChatGoldenTokenizer(const char * env, const std::vector<std::string> & control) {
+        const char * gguf = std::getenv(env);
+        if (gguf && *gguf) {
+            real = true;
+            TEST_ASSERT_MSG(tokenizer.load_from_gguf(gguf), std::string("cannot load ") + gguf);
+            return;
+        }
+        std::string bytes;
+        for (int b = 0; b < 256; ++b) bytes.push_back((char) b);
+        fixture = write_pflash_bpe_tokenizer_fixture({}, bytes, control);
+        TEST_ASSERT(tokenizer.load_from_gguf(fixture.c_str()));
+    }
+    ~ChatGoldenTokenizer() {
+        if (!fixture.empty()) unlink(fixture.c_str());
+    }
+};
+
+static const std::vector<std::string> kQwenControlTokens = {
+    "<|endoftext|>", "<|im_end|>", "<|im_start|>", "<think>", "</think>",
+    "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>"};
+
+#if !defined(_WIN32)  // socketpair()
+// The prompt the server builds for an OpenAI chat request `body`, through the whole
+// request path (API parsing, normalization, rendering, tokenization).
+static std::vector<int32_t> chat_golden_served_prompt(
+        Tokenizer & tokenizer, const ServerConfig & config, json body,
+        std::string & error) {
+    auto backend_owner = std::make_unique<ScriptedReplyBackend>();
+    ScriptedReplyBackend & backend = *backend_owner;
+    backend.reply = {tokenizer.eos_chat_id()};
+    LuceEngine engine(std::move(backend_owner));
+    HttpServer server(engine, tokenizer, config);
+    server.set_chat_format(chat_format_for_arch(config.arch));
+    TEST_ASSERT(SchedulerTestHarness::start_worker(server));
+
+    body["model"] = "test";
+    body["max_tokens"] = 1;
+    // The checks add messages of their own; the corpus is about rendering.
+    body["tool_checks"] = false;
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    TEST_ASSERT(SchedulerTestHarness::route(server, sockets[0], "/v1/chat/completions", body));
+    close(sockets[0]);
+    std::string wire;
+    char buf[4096];
+    ssize_t n = 0;
+    while ((n = read(sockets[1], buf, sizeof(buf))) > 0) wire.append(buf, (size_t) n);
+    close(sockets[1]);
+    if (backend.prompts.empty()) {
+        error = "request failed: " + wire.substr(0, 300);
+        return {};
+    }
+    return backend.prompts[0];
+}
+
+// Qwen3.8 27B (built-in renderer) and Qwen3.8-Flash-Next (its Jinja template), against the
+// official Qwen3.8 template over cases.json. Set LUCE_CHAT_GOLDEN_QWEN38_GGUF to a Qwen3.8
+// GGUF to compare token IDs as well.
+TEST_CASE(ServerUnitFixture, test_chat_golden_qwen38) {
+    ChatGoldenTokenizer tok("LUCE_CHAT_GOLDEN_QWEN38_GGUF", kQwenControlTokens);
+    const json corpus = read_chat_golden("cases.json");
+    std::map<std::string, json> bodies;
+    for (const auto & item : corpus["cases"]) {
+        json body = item["body"];
+        if (body.value("tools", json()) == "$tools") body["tools"] = corpus["tools"];
+        bodies[item["id"].get<std::string>()] = body;
+    }
+    struct Model { const char * name; const char * arch; bool jinja; };
+    std::string failures;
+    for (const Model & model : {Model{"qwen3.8-27b", "qwen35", false},
+                                Model{"qwen3.8-flash-next", "qwen4exp", true}}) {
+        const json expected = read_chat_golden(std::string("expected/") + model.name + ".json");
+        ServerConfig config;
+        config.arch = model.arch;
+        config.max_ctx = 32768;
+        config.prefix_cache_cap = 0;
+        if (model.jinja) {
+            config.chat_template_src = expected["template"].get<std::string>();
+        }
+        std::map<std::string, std::vector<int32_t>> served;
+        failures += check_chat_golden(model.name, "text", expected["cases"],
+                          [&](const std::string & id, const json & want) {
+            std::string error;
+            served[id] = chat_golden_served_prompt(tok.tokenizer, config, bodies.at(id), error);
+            if (!error.empty()) return error;
+            dump_chat_golden(model.name, id, tok.tokenizer.decode(served[id]));
+            return want["text"] == tok.tokenizer.decode(served[id])
+                ? std::string()
+                : chat_golden_diff(want["text"], tok.tokenizer.decode(served[id]));
+        });
+        if (!tok.real) continue;
+        failures += check_chat_golden(model.name, "tokens", expected["cases"],
+                          [&](const std::string & id, const json & want) {
+            const auto ids = want["tokens"].get<std::vector<int32_t>>();
+            return ids == served[id] ? std::string()
+                                     : chat_golden_token_diff(ids, served[id], tok.tokenizer);
+        });
+    }
+    TEST_ASSERT_MSG(failures.empty(), "\n" + failures);
+}
+#endif  // !defined(_WIN32)
+
+// DeepSeek V4.1 against DeepSeek's own encoder fixtures (encoding/tests in the model repo).
+// The cases are whole conversations, not requests, so they go through normalization and the
+// renderer directly. Set LUCE_CHAT_GOLDEN_DS41_GGUF to compare token IDs as well.
+TEST_CASE(ServerUnitFixture, test_chat_golden_deepseek41) {
+    ChatGoldenTokenizer tok("LUCE_CHAT_GOLDEN_DS41_GGUF",
+                            {"<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜User｜>",
+                             "<｜Assistant｜>", "<｜System｜>"});
+    const json expected = read_chat_golden("expected/deepseek-v4.1-flash.json");
+    std::map<std::string, std::string> rendered;
+    const auto render = [&](const json & input) {
+        // A bare message list, or {messages, tools, thinking_mode, reasoning_effort}.
+        const json messages = input.is_array() ? input : input["messages"];
+        const json tools = input.is_object() ? input.value("tools", json::array()) : json::array();
+        const bool thinking = input.is_object() && input.value("thinking_mode", "chat") == "thinking";
+        ToolMemory memory;
+        const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, memory);
+        const bool generation = !messages.empty() && messages.back().value("role", "") != "assistant";
+        std::string effort = input.is_object() ? input.value("reasoning_effort", "") : "";
+        if (thinking && effort.empty()) effort = "high";
+        return render_chat_template(chat, ChatFormat::DEEPSEEK41, generation, thinking,
+                                    tools.empty() ? "" : tools.dump(), effort);
+    };
+    std::string failures = check_chat_golden("deepseek-v4.1-flash", "text", expected["cases"],
+                      [&](const std::string & id, const json & want) {
+        try {
+            rendered[id] = render(want["input"]);
+        } catch (const std::exception & e) {
+            return std::string("render threw: ") + e.what();
+        }
+        dump_chat_golden("deepseek-v4.1-flash", id, rendered[id]);
+        return want["text"] == rendered[id] ? std::string()
+                                            : chat_golden_diff(want["text"], rendered[id]);
+    });
+    if (tok.real) {
+        failures += check_chat_golden("deepseek-v4.1-flash", "tokens", expected["cases"],
+                          [&](const std::string & id, const json & want) {
+            const auto ids = want["tokens"].get<std::vector<int32_t>>();
+            const auto got = tok.tokenizer.encode(rendered[id]);
+            return ids == got ? std::string() : chat_golden_token_diff(ids, got, tok.tokenizer);
+        });
+    }
+    TEST_ASSERT_MSG(failures.empty(), "\n" + failures);
+}
+#endif  // defined(LUCE_CHAT_GOLDEN_DIR)
+
 // Tool memory keeps a generated turn minus its end-of-turn token, and the
 // template closes the turn again. A Laguna GGUF has no EOT key, and its
 // backend ends turns at </assistant> even when the vocabulary has

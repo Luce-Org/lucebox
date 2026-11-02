@@ -1,0 +1,97 @@
+{
+ "about": "Cases where Lucebox's prompt still differs from the official template, with the reason. test_chat_golden_* fails on a difference not listed here and on a listed case that matches. `text` compares the rendered prompt; `tokens` compares token IDs (only with a real GGUF tokenizer).",
+ "text": {
+  "qwen3.8-27b": {
+   "chat_thinking": "no reasoning-effort line in the system message (the template adds one when thinking is on)",
+   "chat_no_system_thinking": "no reasoning-effort line in the system message (the template adds one when thinking is on)",
+   "effort_low": "no reasoning-effort line in the system message (the template adds one when thinking is on)",
+   "history_thinking": "no reasoning-effort line in the system message (the template adds one when thinking is on); drops the thinking of earlier assistant turns (the template keeps it: preserve_thinking defaults to true)",
+   "history_thinking_not_preserved": "no reasoning-effort line in the system message (the template adds one when thinking is on)",
+   "history_thinking_off": "drops the thinking of earlier assistant turns (the template keeps it: preserve_thinking defaults to true)",
+   "history_reasoning_alias": "no reasoning-effort line in the system message (the template adds one when thinking is on); drops the thinking of earlier assistant turns (the template keeps it: preserve_thinking defaults to true)",
+   "tools_first_turn": "no reasoning-effort line in the system message (the template adds one when thinking is on); tools as one compact JSON array with sorted keys (the template: one tool per line, the client's key order, ', ' and ': ' separators)",
+   "tools_no_system": "no reasoning-effort line in the system message (the template adds one when thinking is on); tools as one compact JSON array with sorted keys (the template: one tool per line, the client's key order, ', ' and ': ' separators)",
+   "tool_loop_single": "no reasoning-effort line in the system message (the template adds one when thinking is on); tools as one compact JSON array with sorted keys (the template: one tool per line, the client's key order, ', ' and ': ' separators); drops the thinking of the assistant turns after the last user message",
+   "tool_loop_content_and_call": "no reasoning-effort line in the system message (the template adds one when thinking is on); tools as one compact JSON array with sorted keys (the template: one tool per line, the client's key order, ', ' and ': ' separators); drops the thinking of the assistant turns after the last user message",
+   "tool_loop_parallel": "no reasoning-effort line in the system message (the template adds one when thinking is on); tools as one compact JSON array with sorted keys (the template: one tool per line, the client's key order, ', ' and ': ' separators); drops the thinking of the assistant turns after the last user message",
+   "tool_loop_two_rounds": "no reasoning-effort line in the system message (the template adds one when thinking is on); tools as one compact JSON array with sorted keys (the template: one tool per line, the client's key order, ', ' and ': ' separators); drops the thinking of the assistant turns after the last user message; call arguments sorted by name, not in the client's order",
+   "tool_loop_then_new_user": "no reasoning-effort line in the system message (the template adds one when thinking is on); tools as one compact JSON array with sorted keys (the template: one tool per line, the client's key order, ', ' and ': ' separators); drops the thinking of earlier assistant turns (the template keeps it: preserve_thinking defaults to true)",
+   "tool_args_types": "no reasoning-effort line in the system message (the template adds one when thinking is on); tools as one compact JSON array with sorted keys (the template: one tool per line, the client's key order, ', ' and ': ' separators); call arguments sorted by name, not in the client's order; drops the thinking of the assistant turns after the last user message",
+   "tool_args_empty": "no reasoning-effort line in the system message (the template adds one when thinking is on); tools as one compact JSON array with sorted keys (the template: one tool per line, the client's key order, ', ' and ': ' separators); drops the thinking of the assistant turns after the last user message",
+   "tool_loop_thinking_off": "tools as one compact JSON array with sorted keys (the template: one tool per line, the client's key order, ', ' and ': ' separators); no empty <think></think> block on assistant turns without reasoning",
+   "tool_turn_without_reasoning": "no reasoning-effort line in the system message (the template adds one when thinking is on); tools as one compact JSON array with sorted keys (the template: one tool per line, the client's key order, ', ' and ': ' separators); no empty <think></think> block on assistant turns without reasoning",
+   "user_wraps_tool_response": "no reasoning-effort line in the system message (the template adds one when thinking is on); tools as one compact JSON array with sorted keys (the template: one tool per line, the client's key order, ', ' and ': ' separators); drops the thinking of the assistant turns after the last user message",
+   "whitespace_edges": "no reasoning-effort line in the system message (the template adds one when thinking is on); message contents not trimmed (the template trims every content); drops the thinking of earlier assistant turns (the template keeps it: preserve_thinking defaults to true)",
+   "think_tags_in_content": "no reasoning-effort line in the system message (the template adds one when thinking is on); no empty <think></think> block on assistant turns without reasoning",
+   "multiline_code": "message contents not trimmed (the template trims every content)"
+  },
+  "qwen3.8-flash-next": {
+   "tools_first_turn": "object keys sorted (nlohmann::json), not in the client's order",
+   "tools_no_system": "object keys sorted (nlohmann::json), not in the client's order",
+   "tool_loop_single": "object keys sorted (nlohmann::json), not in the client's order",
+   "tool_loop_content_and_call": "object keys sorted (nlohmann::json), not in the client's order",
+   "tool_loop_parallel": "object keys sorted (nlohmann::json), not in the client's order",
+   "tool_loop_two_rounds": "object keys sorted (nlohmann::json), not in the client's order; call arguments sorted by name, not in the client's order",
+   "tool_loop_then_new_user": "object keys sorted (nlohmann::json), not in the client's order",
+   "tool_args_types": "object keys sorted (nlohmann::json), not in the client's order; call arguments sorted by name, not in the client's order",
+   "tool_args_empty": "object keys sorted (nlohmann::json), not in the client's order",
+   "tool_loop_thinking_off": "object keys sorted (nlohmann::json), not in the client's order",
+   "tool_turn_without_reasoning": "object keys sorted (nlohmann::json), not in the client's order",
+   "user_wraps_tool_response": "object keys sorted (nlohmann::json), not in the client's order",
+   "whitespace_edges": "the Jinja engine's trim strips ASCII whitespace only (Python's also strips Unicode spaces such as U+00A0 and U+3000)"
+  },
+  "deepseek-v4.1-flash": {
+   "official_1": "object keys sorted (nlohmann::json), not in the client's order; drops the reasoning of the tool-call turn after the last user message; a closed final assistant turn in thinking mode renders as '<think>' + content, without its reasoning or '</think>'",
+   "official_3": "no <｜latest_reminder｜> role, and no tools on a mid-conversation system message",
+   "official_4": "no <｜latest_reminder｜> role",
+   "official_5": "image parts are not rendered on this path: the server renders images through its image pipeline, which this test does not drive"
+  }
+ },
+ "tokens": {
+  "qwen3.8-27b": {
+   "chat_thinking": "follows from the text difference",
+   "chat_no_system_thinking": "follows from the text difference",
+   "effort_low": "follows from the text difference",
+   "history_thinking": "follows from the text difference",
+   "history_thinking_not_preserved": "follows from the text difference",
+   "history_thinking_off": "follows from the text difference",
+   "history_reasoning_alias": "follows from the text difference",
+   "tools_first_turn": "follows from the text difference",
+   "tools_no_system": "follows from the text difference",
+   "tool_loop_single": "follows from the text difference",
+   "tool_loop_content_and_call": "follows from the text difference",
+   "tool_loop_parallel": "follows from the text difference",
+   "tool_loop_two_rounds": "follows from the text difference",
+   "tool_loop_then_new_user": "follows from the text difference",
+   "tool_args_types": "follows from the text difference",
+   "tool_args_empty": "follows from the text difference",
+   "tool_loop_thinking_off": "follows from the text difference",
+   "tool_turn_without_reasoning": "follows from the text difference",
+   "user_wraps_tool_response": "follows from the text difference",
+   "whitespace_edges": "follows from the text difference",
+   "think_tags_in_content": "follows from the text difference",
+   "multiline_code": "follows from the text difference"
+  },
+  "qwen3.8-flash-next": {
+   "tools_first_turn": "follows from the text difference",
+   "tools_no_system": "follows from the text difference",
+   "tool_loop_single": "follows from the text difference",
+   "tool_loop_content_and_call": "follows from the text difference",
+   "tool_loop_parallel": "follows from the text difference",
+   "tool_loop_two_rounds": "follows from the text difference",
+   "tool_loop_then_new_user": "follows from the text difference",
+   "tool_args_types": "follows from the text difference",
+   "tool_args_empty": "follows from the text difference",
+   "tool_loop_thinking_off": "follows from the text difference",
+   "tool_turn_without_reasoning": "follows from the text difference",
+   "user_wraps_tool_response": "follows from the text difference",
+   "whitespace_edges": "follows from the text difference"
+  },
+  "deepseek-v4.1-flash": {
+   "official_1": "follows from the text difference",
+   "official_3": "follows from the text difference",
+   "official_4": "follows from the text difference",
+   "official_5": "follows from the text difference"
+  }
+ }
+}
