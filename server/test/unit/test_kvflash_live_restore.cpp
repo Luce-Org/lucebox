@@ -138,7 +138,7 @@ TEST_CASE(KvflashLiveRestoreFixture, history_append_skips_tokens_before_entry) {
     CHECK(hist[51] == 4);
 }
 
-// ---- Stage S (PREREG_G3C): spec step commit, settle, gen rung, QK pooling ----
+// ---- Stage S: spec step commit, settle, gen rung, QK pooling ----
 
 // S-U1: the budget clamp of one spec step (production: spec loop, step 5).
 TEST_CASE(KvflashLiveRestoreFixture, spec_commit_n_bonus_is_clamped_by_the_budget) {

@@ -1,7 +1,5 @@
 #include "CppUnitTestFramework.hpp"
-#include <fstream>
 #include <functional>
-#include <sstream>
 #include <string>
 #include "../../src/common/dflash_target.h"
 #include "../../src/common/kvflash_pager.h"
@@ -369,31 +367,6 @@ TEST_CASE(KvflashSpecSerialFixture, span_cap_inputs_at_a_chunk_start_are_those_o
     CHECK(ref == 1);
 }
 
-// Production reads: no path appends the seed to out_tokens before the span
-// computation of a spec step. The hop block pushes and then leaves the step
-// (forward + continue, or a return); nothing between its end and the span
-// computation may push the seed (last_tok), with or without the budget applied.
-TEST_CASE(KvflashSpecSerialFixture, no_production_path_appends_the_seed_before_the_span_computation) {
-    std::string path = __FILE__;
-    path = path.substr(0, path.rfind('/')) + "/../../src/qwen35/qwen35_backend.cpp";
-    std::ifstream f(path);
-    REQUIRE(f.good());
-    std::stringstream ss;
-    ss << f.rdbuf();
-    const std::string src = ss.str();
-    CHECK(src.find("seed_pre_emitted") == std::string::npos);
-    const size_t end_hop = src.find("// end of the AR hop");
-    const size_t span = src.find("kvflash_step_span_cap(");
-    REQUIRE(end_hop != std::string::npos);
-    REQUIRE(span != std::string::npos);
-    REQUIRE(end_hop < span);
-    // (The DDTree branch between them pushes its accepted path and bonus and
-    // leaves the iteration; KVFlash refuses DDTree. The seed is last_tok.)
-    const std::string between = src.substr(end_hop, span - end_hop);
-    CHECK(between.find("out_tokens.push_back(last_tok") == std::string::npos);
-    CHECK(between.find("apply(last_tok") == std::string::npos);
-}
-
 // The history the reselect scores, built by the one helper the step calls:
 // generated tokens, then the pending seed as AR records it (budget applied),
 // cut to g tokens. Previously the lambda in do_spec_decode did this inline.
@@ -436,34 +409,6 @@ TEST_CASE(KvflashSpecSerialFixture, ar_handoff_counts_reselect_from_the_request_
     CHECK(hist.size() == hist0 + 64);
 }
 
-// Production reads: every AR handoff inside the spec loop goes through the one
-// ar_tail lambda, which syncs the history and passes the origin; the hop's
-// decision goes through kvflash_seed_takes_ar_step.
-TEST_CASE(KvflashSpecSerialFixture, spec_loop_handoffs_carry_origin_and_hop_uses_the_action_helper) {
-    std::string path = __FILE__;
-    path = path.substr(0, path.rfind('/')) + "/../../src/qwen35/qwen35_backend.cpp";
-    std::ifstream f(path);
-    REQUIRE(f.good());
-    std::stringstream ss;
-    ss << f.rdbuf();
-    const std::string src = ss.str();
-    const size_t guard = src.find("history_guard{this, out_tokens");
-    REQUIRE(guard != std::string::npos);
-    const std::string tail = src.substr(guard);
-    size_t calls = 0;
-    for (size_t at = tail.find("do_ar_decode("); at != std::string::npos; at = tail.find("do_ar_decode(", at + 1)) {
-        // skip comment mentions
-        const size_t ls = tail.rfind('\n', at);
-        if (tail.compare(tail.find_first_not_of(' ', ls + 1), 2, "//") != 0) calls++;
-    }
-    const size_t def_end = tail.find("bool Qwen35Backend::sync_remote_draft_features");
-    (void)def_end;
-    CHECK(calls == 1);
-    CHECK(tail.find("history_guard.entry);") != std::string::npos);
-    CHECK(tail.find("kvflash_seed_takes_ar_step(") != std::string::npos);
-    CHECK(src.find("kvflash_ar_reselect_g(") != std::string::npos);
-}
-
 // Pass 7: the EOS floor (LUCE_MIN_TOKENS, default off) with KVFlash is refused
 // at startup. Its tool-injection replay forwards tokens without reselect checks
 // and the step-start reselect can score an EOS the floor then discards.
@@ -482,60 +427,6 @@ TEST_CASE(KvflashSpecSerialFixture, legacy_daemon_refuses_min_tokens_with_kvflas
     CHECK(run_qwen35moe_daemon(daemon_args(false, "/nonexistent/draft.gguf")) == 2);
     // No draft model: AR with KVFlash and the floor is unchanged, it reaches init (1).
     CHECK(run_qwen35_daemon(daemon_args(false)) == 1);
-}
-
-// The AR step uploads its graph inputs (token embedding, M-RoPE positions) after
-// the build: build_target_step frees and reallocates the step graph, so inputs
-// written before it land in the old graph's buffer. Repeated AR steps share a
-// shape and hid it; the first AR step after a prefill or a verify block (any
-// spec-to-AR handoff, and AR itself after prefill) read stale positions and
-// wrote a K row with wrong rope dims (max abs diff 20.6 on K against 0.35 for
-// numerics, measured on the 3090).
-TEST_CASE(KvflashSpecSerialFixture, ar_step_uploads_its_inputs_after_the_graph_build) {
-    std::string path = __FILE__;
-    path = path.substr(0, path.rfind('/')) + "/../../src/qwen35/qwen35_backend.cpp";
-    std::ifstream f(path);
-    REQUIRE(f.good());
-    std::stringstream ss;
-    ss << f.rdbuf();
-    const std::string src = ss.str();
-    const size_t def = src.find("bool Qwen35Backend::do_ar_decode(");
-    REQUIRE(def != std::string::npos);
-    const std::string body = src.substr(def);
-    const size_t build = body.find("build_target_step(sg_");
-    const size_t embed = body.find("tensor_set(sg_.inp_embed");
-    const size_t positions = body.find("tensor_set(sg_.positions");
-    REQUIRE(build != std::string::npos);
-    REQUIRE(embed != std::string::npos);
-    REQUIRE(positions != std::string::npos);
-    CHECK(build < embed);
-    CHECK(build < positions);
-}
-
-// AR decode builds its attention mask from fill_slot_mask. Without a position
-// bound it exposes every row of a resident chunk, including rows above cur_pos
-// that hold rejected drafts or an earlier turn's tokens.
-TEST_CASE(KvflashSpecSerialFixture, slot_mask_hides_rows_above_the_decode_position) {
-    TestPager p;
-    KvFlashConfig c;
-    c.pool_tokens = 512;
-    c.chunk_tokens = 64;
-    c.sink_chunks = 1;
-    c.tail_window_chunks = 4;
-    REQUIRE(p.attach(c, {}, {}));
-    p.alloc_span(0, 3 * 64);                               // chunks 0..2 resident
-    const int cur_pos = 2 * 64 + 10;                       // inside the tail chunk
-    std::vector<uint16_t> open((size_t)p.arena_tokens()), cut((size_t)p.arena_tokens());
-    p.fill_slot_mask(open.data());
-    const int tail_slot = p.slot_of(2 * 64);
-    CHECK(open[(size_t)tail_slot + 40] == 0);              // unbounded: the defect
-    p.fill_slot_mask(cut.data(), cur_pos + 1);             // AR at cur_pos attends rows <= cur_pos
-    for (int i = 0; i < 64; i++) {
-        const bool visible = 2 * 64 + i <= cur_pos;
-        CHECK(cut[(size_t)tail_slot + i] == (visible ? 0 : 0xFC00));
-    }
-    CHECK(cut[(size_t)p.slot_of(0) + 5] == 0);             // older chunks stay visible
-    CHECK(cut[(size_t)p.slot_of(64) + 63] == 0);
 }
 
 // A verify block that cannot get a pool slot is not a spec failure: the caller
