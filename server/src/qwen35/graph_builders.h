@@ -19,6 +19,9 @@
 #include "internal.h"         // TargetWeights, TargetCache
 #include "delta_net_specla.h"
 
+#include <cstdint>
+#include <functional>
+
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -226,6 +229,18 @@ bool build_target_step_paged_tree(
     int tree_scratch_stride,
     int kq_stride_pad = KQ_MASK_PAD,
     int mapped_ar_seqs = 0);
+
+// One AR decode step: run `build` (a build_target_step call for one token),
+// then upload the token's embedding (`n_embd` floats) into sg.inp_embed and
+// its M-RoPE positions {rope_pos, rope_pos, rope_pos, 0} into sg.positions.
+// Every build_* frees sg and creates fresh input tensors, so the uploads must
+// follow the build to land in the graph that will compute.
+bool build_ar_step_with_inputs(
+    StepGraph & sg,
+    const std::function<bool()> & build,
+    const float * embed,
+    int n_embd,
+    int32_t rope_pos);
 
 // LM-head projection: project draft hidden states through the target output matrix.
 bool build_lm_head_projection_step(
