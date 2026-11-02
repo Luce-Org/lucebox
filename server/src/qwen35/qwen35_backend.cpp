@@ -2881,6 +2881,7 @@ void Qwen35Backend::kvflash_sync_prefill(int committed,
                                          const std::vector<int32_t> & tokens,
                                          int kv_offset,
                                          const std::vector<int32_t> * full_prompt) {
+    kvflash_require_base_zero(kvflash_pager_, "kvflash_sync_prefill");
     // Prefill (and snapshot restore) place rows physically contiguous at
     // [0, committed): rebuild the pager mapping identity-style and reset
     // the token history to match.
@@ -2961,6 +2962,7 @@ void Qwen35Backend::kvflash_qk_pool_to(int committed) {
 
 void Qwen35Backend::kvflash_upload_mask() {
     if (!sg_.attn_mask) return;
+    kvflash_require_base_zero(kvflash_pager_, "kvflash_upload_mask");
     const size_t need = (size_t)sg_.attn_mask->ne[0] * sg_.attn_mask->ne[1];
     if (kvflash_mask_buf_.size() != need || kvflash_pager_.epoch() != kvflash_mask_epoch_) {
         kvflash_mask_buf_.assign(need, F16_NEG_INF);

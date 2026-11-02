@@ -74,7 +74,7 @@ bool fill_qwen35_kvflash_inputs(
     if (!sg.attn_mask) return true;
     const size_t kvd = (size_t)sg.attn_mask->ne[0];
     const int q_pad = (int)sg.attn_mask->ne[1];
-    std::vector<int32_t> slot_pos((size_t)pager.pool_tokens(), -1);
+    std::vector<int32_t> slot_pos((size_t)pager.arena_tokens(), -1);
     pager.fill_slot_pos(slot_pos.data());
     std::vector<uint16_t> mask((size_t)kvd * q_pad, F16_NEG_INF);
     const int s_hi = std::min((int)kvd, (int)slot_pos.size());

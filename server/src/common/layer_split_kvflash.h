@@ -28,6 +28,12 @@ inline bool layer_split_kvflash_sync_identity(
             prefix, committed);
         return false;
     }
+    if (pager.row_base() != 0) {   // identity sync writes rows from 0: a slot slice is not that
+        std::fprintf(stderr,
+            "[%s][kvflash] identity sync refused: pager is a slot slice (row_base %d)\n",
+            prefix, pager.row_base());
+        return false;
+    }
     if (committed > pool_tokens) {
         std::fprintf(stderr,
             "[%s][kvflash] prefix (%d) exceeds resident pool %d\n",
