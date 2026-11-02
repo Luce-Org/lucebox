@@ -1537,6 +1537,11 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
     if (!model.adaptive_experts_tau.empty())
         set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
+    // The shipped KVFlash recall settings come first, so an explicit
+    // --kvflash-policy below still replaces the policy default.
+    if (!model.kvflash_pool.empty())
+        apply_env_defaults("KVFlash recall",
+            luce::server::kvflash_recall_env(inspect_gguf_model_info(model.bargs.model_path.c_str()).arch));
     if (!model.kvflash_pool.empty())
         set_environment_variable("LUCE_KVFLASH", model.kvflash_pool.c_str(), true);
     if (!model.kvflash_policy.empty())

@@ -705,6 +705,38 @@ struct LaunchPolicyFixture : CommonFixture {
             CHECK(!error.empty());
         }
     }
+
+    void test_kvflash_recall_defaults_need_a_qwen35_target() {
+        // On another architecture nothing is installed (the caller only asks when --kvflash was given).
+        CHECK(kvflash_recall_env("deepseek41").empty());
+        CHECK(kvflash_recall_env("qwen35moe").empty());
+        CHECK(kvflash_recall_env("").empty());
+    }
+
+    void test_kvflash_recall_defaults_are_the_shipped_profile() {
+        // The shipped recall profile, one flag. These literals are the values the profile installed before it
+        // became named constants; the ninth, LUCE_KVFLASH_SCORER_DEVICE=gpu, is now fixed in the backend.
+        const std::vector<std::pair<std::string, std::string>> expected = {
+            {"LUCE_KVFLASH_POLICY", "qk"},
+            {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
+            {"LUCE_KVFLASH_RESELECT_SCORER", "exact"},
+            {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
+            {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"},
+            {"LUCE_KVFLASH_SELECT_UNIT", "2"},
+            {"LUCE_KVFLASH_PREAMBLE_ROWS", "6144"},
+            {"LUCE_KVFLASH_UQ_QUERIES", "64"},
+        };
+        const std::vector<LaunchProfileEnv> env = kvflash_recall_env("qwen35");
+        CHECK(env.size() == expected.size());
+        std::set<std::string> names;
+        for (const LaunchProfileEnv & entry : env) {
+            CHECK(names.insert(entry.name).second);
+            const auto hit = std::find_if(expected.begin(), expected.end(),
+                [&](const auto & e) { return e.first == entry.name; });
+            CHECK(hit != expected.end());
+            if (hit != expected.end()) CHECK(hit->second == entry.value);
+        }
+    }
 };
 
 }  // namespace
@@ -737,6 +769,8 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_ds41_r9700_gorgon_profile_is_the_measured_recipe();
     test_ds41_gorgon_profile_keeps_the_model_resident();
     test_qwen_next_split_profile_fits_its_context();
+    test_kvflash_recall_defaults_need_a_qwen35_target();
+    test_kvflash_recall_defaults_are_the_shipped_profile();
     test_pflash_curve_arg_accepts_quoted_and_split_points();
     test_pflash_curve_arg_rejects_bad_points();
 }
