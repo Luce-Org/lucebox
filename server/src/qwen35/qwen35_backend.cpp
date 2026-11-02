@@ -2837,14 +2837,18 @@ void Qwen35Backend::kvflash_qk_pool_to(int committed) {
     kvflash_qk_pooled_upto_ = std::max(kvflash_qk_pooled_upto_, sealed);
 }
 
-void Qwen35Backend::kvflash_upload_mask() {
+void Qwen35Backend::kvflash_upload_mask(int cur_pos) {
     if (!sg_.attn_mask) return;
     kvflash_require_base_zero(kvflash_pager_, "kvflash_upload_mask");
     const size_t need = (size_t)sg_.attn_mask->ne[0] * sg_.attn_mask->ne[1];
-    if (kvflash_mask_buf_.size() != need || kvflash_pager_.epoch() != kvflash_mask_epoch_) {
+    // The decode step at cur_pos attends rows <= cur_pos only: rows above it hold
+    // rejected drafts or an earlier turn's tokens and must stay hidden.
+    if (kvflash_mask_buf_.size() != need || kvflash_pager_.epoch() != kvflash_mask_epoch_ ||
+        cur_pos != kvflash_mask_pos_) {
         kvflash_mask_buf_.assign(need, F16_NEG_INF);
-        kvflash_pager_.fill_slot_mask(kvflash_mask_buf_.data());   // q row 0
+        kvflash_pager_.fill_slot_mask(kvflash_mask_buf_.data(), (int64_t)cur_pos + 1);   // q row 0
         kvflash_mask_epoch_ = kvflash_pager_.epoch();
+        kvflash_mask_pos_ = cur_pos;
     }
     // Upload before EVERY compute: the input tensor's buffer region is
     // reused by graph execution, so a stale upload reads back as garbage.
@@ -3029,7 +3033,7 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
                                     sizeof(int64_t) * n_head_kv);
         }
         if (pool) {
-            kvflash_upload_mask();
+            kvflash_upload_mask(committed);
         } else if (w_.is_bailingmoe3) {
             upload_qwen35_causal_mask(
                 sg_.attn_mask, committed, 1, cfg_.kq_stride_pad);
