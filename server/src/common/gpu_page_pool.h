@@ -25,4 +25,13 @@ uint64_t reclaimable_gpu_page_pool_bytes();
 // Same estimate from caller-supplied text, for tests.
 uint64_t reclaimable_gpu_page_pool_bytes(const char * meminfo_text, uint64_t live_gpu_host_bytes);
 
+// The pool where a host-shared device's free memory (ggml_backend_dev_memory)
+// leaves it out: with hugetlbfs pages configured that figure is the free huge
+// pages alone. Elsewhere it already counts the pool, where it can be estimated,
+// and this is 0.
+uint64_t gpu_page_pool_bytes_beside_device_free();
+
+// Same from caller-supplied text, for tests.
+uint64_t gpu_page_pool_bytes_beside_device_free(const char * meminfo_text, uint64_t live_gpu_host_bytes);
+
 } // namespace luce::common

@@ -3,6 +3,7 @@
 
 #include <cstdio>
 
+using luce::common::gpu_page_pool_bytes_beside_device_free;
 using luce::common::reclaimable_gpu_page_pool_bytes;
 
 static int failures = 0;
@@ -50,6 +51,14 @@ int main() {
         "Hugetlb:         50000000 kB\n";  // includes a pool of another page size
     check(reclaimable_gpu_page_pool_bytes(mixed_huge, 0) == (100000000ULL - 10000000 - 50000000) * 1024 - GiB,
           "Hugetlb covers huge page pools of every size");
+
+    // The device's free memory counts the pool except beside free huge pages.
+    check(gpu_page_pool_bytes_beside_device_free(meminfo, 0) == 0,
+          "no huge pages: the device query already counts the pool");
+    check(gpu_page_pool_bytes_beside_device_free(huge, 5 * GiB) == reclaimable_gpu_page_pool_bytes(huge, 5 * GiB) &&
+              gpu_page_pool_bytes_beside_device_free(huge, 5 * GiB) > 0,
+          "huge pages: the device query reports them alone, so the pool goes beside");
+    check(gpu_page_pool_bytes_beside_device_free(nullptr, 0) == 0, "empty input beside the device query");
 
     check(reclaimable_gpu_page_pool_bytes("MemFree: 5 kB\n", 0) == 0, "no MemTotal, no estimate");
     check(reclaimable_gpu_page_pool_bytes("", 0) == 0 && reclaimable_gpu_page_pool_bytes(nullptr, 0) == 0,
