@@ -269,6 +269,7 @@ protected:
     std::vector<uint16_t>          kvflash_mask_buf_;    // host mirror of slot mask
     std::string                    kvflash_drafter_path_; // LUCE_KVFLASH_DRAFTER
     uint64_t                       kvflash_mask_epoch_ = (uint64_t)-1;
+    int                            kvflash_mask_pos_ = -1;   // decode position the cached mask was cut at
     int  kvflash_tokens_ = 0;                       // 0 = off
     int  kvflash_tau_    = 64;
     bool kvflash_drafter_failed_ = false;           // don't retry a failed load
@@ -309,9 +310,9 @@ protected:
     int  kvflash_live_cut_peek(const std::vector<int32_t> & prompt) const;
     bool kvflash_live_restore_active_ = false;   // set around the suffix do_prefill
     int  kvflash_gen_ckpt_pos_ = -1;             // S9: G of the last generation-end rung
-    // Upload the slot-validity mask (host rebuild on epoch change, device
+    // Upload the slot-validity mask (host rebuild on epoch or decode-position change, device
     // upload every step — the input's buffer region is reused by compute).
-    void kvflash_upload_mask();
+    void kvflash_upload_mask(int cur_pos);
     // Drafter rescore + reselect every kvflash_tau_ generated tokens.
     void kvflash_maybe_reselect(int generated);
     // Attach the drafter scorer if a drafter path is configured and the
