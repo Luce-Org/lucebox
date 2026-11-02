@@ -184,6 +184,43 @@ TEST_CASE(KvflashExactMassFixture, stage_rows_exist_only_in_a_kvflash_process) {
     CHECK(kvflash_q_stage_rows(16) == 0);
 }
 
+TEST_CASE(KvflashExactMassFixture, per_token_query_capture_exists_only_in_a_kvflash_process) {
+    luce_test::ScopedEnvVar off("LUCE_KVFLASH", nullptr);
+    CHECK(kvflash_q_cap_all_rows() == 0);              // KVFlash off: the cache is the one main builds
+    {
+        luce_test::ScopedEnvVar on("LUCE_KVFLASH", "auto");
+        CHECK(kvflash_q_cap_all_rows() == kQueryCaptureTokens);
+    }
+    {
+        luce_test::ScopedEnvVar pool("LUCE_KVFLASH", "16384");
+        CHECK(kvflash_q_cap_all_rows() == kQueryCaptureTokens);
+    }
+    luce_test::ScopedEnvVar zero("LUCE_KVFLASH", "0");
+    CHECK(kvflash_q_cap_all_rows() == 0);
+}
+TEST_CASE(KvflashExactMassFixture, uq_queries_env_is_off_by_default_and_capped_at_the_capture_window) {
+    {
+        luce_test::ScopedEnvVar e("LUCE_KVFLASH_UQ_QUERIES", nullptr);
+        CHECK(kvflash_uq_queries() == 0);
+    }
+    {
+        luce_test::ScopedEnvVar e("LUCE_KVFLASH_UQ_QUERIES", "16");
+        CHECK(kvflash_uq_queries() == 16);
+    }
+    {
+        luce_test::ScopedEnvVar e("LUCE_KVFLASH_UQ_QUERIES", "64");
+        CHECK(kvflash_uq_queries() == 64);
+    }
+    {
+        luce_test::ScopedEnvVar e("LUCE_KVFLASH_UQ_QUERIES", "512");
+        CHECK(kvflash_uq_queries() == kQueryCaptureTokens);   // the graph keeps 64 rows per batch
+    }
+    for (const char * bad : {"0", "-3", "junk", ""}) {
+        luce_test::ScopedEnvVar e("LUCE_KVFLASH_UQ_QUERIES", bad);
+        CHECK(kvflash_uq_queries() == 0);
+    }
+}
+
 // ---- fast scorer vs the double-precision reference -------------------------
 namespace {
 struct FastCase {
