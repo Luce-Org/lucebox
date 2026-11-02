@@ -39,6 +39,7 @@
 #include "qwen35moe_ffn.h"
 #include "common/chain_rollback_policy.h"
 #include "common/kv_rotation.h"
+#include "common/kvflash_query_capture.h"
 #include "common/specla_commit_cuda.h"
 
 #include "ggml-alloc.h"
@@ -292,6 +293,12 @@ bool create_target_cache_partial(const TargetWeights & w,
         out.q_cap = ggml_new_tensor_3d(out.base_ctx, GGML_TYPE_F32,
                                        head_dim, w.n_head, n_full_attn);
         ggml_set_name(out.q_cap, "q_cap");
+        if (const int T = luce::common::kvflash_q_cap_all_rows(); T > 0) {
+            out.q_cap_all_tokens = T;
+            out.q_cap_all = ggml_new_tensor_4d(out.base_ctx, GGML_TYPE_F32,
+                                               head_dim, T, w.n_head, n_full_attn);
+            ggml_set_name(out.q_cap_all, "q_cap_all");
+        }
 
         // Paged-attention metadata is persistent like the K/V pool itself so
         // decode steps can update it append-only; a gallocr graph input would
@@ -502,6 +509,8 @@ void free_target_cache(TargetCache & c) {
     c.specla_pending_count = 0;
     c.target_feat = nullptr;
     c.q_cap = nullptr;
+    c.q_cap_all = nullptr;
+    c.q_cap_all_tokens = 0;
     c.cur_pos = 0;
 }
 
@@ -2480,6 +2489,19 @@ QwenGraphOutputs build_qwen35_graph(
                     cache.q_cap->nb[1], cache.q_cap->nb[1],
                     (size_t)fa_idx * cache.q_cap->nb[2]);
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
+                if (cache.q_cap_all) {
+                    // The last T tokens' Q (T = min(n_tokens, capacity)),
+                    // [head_dim, T, n_head] into plane fa_idx of q_cap_all.
+                    const int T = std::min<int>(n_tokens, cache.q_cap_all_tokens);
+                    ggml_tensor * qs = ggml_cont(ctx, ggml_view_3d(ctx, q_fa,
+                        q_fa->ne[0], T, q_fa->ne[2], q_fa->nb[1], q_fa->nb[2],
+                        (size_t)(n_tokens - T) * q_fa->nb[1]));
+                    ggml_tensor * qd = ggml_view_3d(ctx, cache.q_cap_all,
+                        cache.q_cap_all->ne[0], T, cache.q_cap_all->ne[2],
+                        cache.q_cap_all->nb[1], cache.q_cap_all->nb[2],
+                        (size_t)fa_idx * cache.q_cap_all->nb[3]);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx, qs, qd));
+                }
             }
             fa_idx++;
         } else {
