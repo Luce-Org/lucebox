@@ -5862,6 +5862,33 @@ TEST_CASE(ServerUnitFixture, test_ppp_master_toggle_gates_tools_boundary_pinning
     TEST_ASSERT(!ppp_prefers_tools_boundary(false, false));
 }
 
+TEST_CASE(ServerUnitFixture, test_agent_turn_cache_defaults_on_where_it_can_run) {
+    const std::optional<bool> unset;
+    // No flag: on for one sequence with prefix slots, quietly off elsewhere.
+    auto choice = resolve_agent_turn_cache(unset, true, 32);
+    TEST_ASSERT(choice.enabled && !choice.error);
+    choice = resolve_agent_turn_cache(unset, false, 32);
+    TEST_ASSERT(!choice.enabled && !choice.error);
+    choice = resolve_agent_turn_cache(unset, true, 0);
+    TEST_ASSERT(!choice.enabled && !choice.error);
+
+    // --no-agent-turn-cache turns it off and never fails a launch.
+    choice = resolve_agent_turn_cache(false, true, 32);
+    TEST_ASSERT(!choice.enabled && !choice.error);
+    choice = resolve_agent_turn_cache(false, false, 0);
+    TEST_ASSERT(!choice.enabled && !choice.error);
+
+    // --agent-turn-cache still refuses a launch that cannot honour it.
+    choice = resolve_agent_turn_cache(true, true, 32);
+    TEST_ASSERT(choice.enabled && !choice.error);
+    choice = resolve_agent_turn_cache(true, false, 32);
+    TEST_ASSERT(!choice.enabled && choice.error &&
+                std::strstr(choice.error, "--max-concurrency"));
+    choice = resolve_agent_turn_cache(true, true, 0);
+    TEST_ASSERT(!choice.enabled && choice.error &&
+                std::strstr(choice.error, "prefix cache"));
+}
+
 TEST_CASE(ServerUnitFixture, test_ppp_tool_prefix_source_ignores_pflash_view) {
     // A 600-token system/tools turn closed by im_end (50) + '\n' (10), then
     // the next turn's role start (40): the head boundary follows it.

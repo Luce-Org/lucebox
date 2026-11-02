@@ -1797,6 +1797,21 @@ bool ppp_prefers_tools_boundary(bool ppp_enabled, bool has_tools) {
     return ppp_enabled && has_tools;
 }
 
+AgentTurnCacheChoice resolve_agent_turn_cache(
+        std::optional<bool> requested, bool single_sequence,
+        int prefix_cache_slots) {
+    const char * unsupported =
+        !single_sequence
+            ? "--agent-turn-cache is not yet supported with "
+              "--paged-attention or --max-concurrency"
+        : prefix_cache_slots <= 0
+            ? "--agent-turn-cache requires an enabled inline prefix cache"
+            : nullptr;
+    if (!requested) return {unsupported == nullptr, nullptr};
+    if (*requested && unsupported) return {false, unsupported};
+    return {*requested, nullptr};
+}
+
 const std::vector<int32_t> & ppp_tool_prefix_source(
         bool compressed, const std::vector<int32_t> & request_tokens,
         const std::vector<int32_t> & served_tokens) {
