@@ -70,6 +70,27 @@ TEST_CASE(AdmissionFixture, test_reply_fits_what_the_prompt_leaves) {
                                   131072, false));
 }
 
+TEST_CASE(AdmissionFixture, test_images_reserve_at_most_the_reply_budget) {
+    // DeepSeek V4.1's card asks 262144 by default, more than its 204,800-token
+    // context: the images keep room for the reply budget, and the reply is then
+    // trimmed to what they leave.
+    CHECK(image_output_reserve(262144, 4096) == 4096);
+    CHECK(image_output_reserve(1024, 4096) == 1024);
+    CHECK(image_output_reserve(262144, 0) == 0);
+    CHECK(image_output_reserve(-1, 4096) == 0);
+    CHECK(fit_reply_to_context(200000, 262144, 204800) == 4800);
+}
+
+TEST_CASE(AdmissionFixture, test_a_default_reply_is_trimmed_even_when_routed) {
+    CHECK(trims_reply(false, true, false));
+    CHECK(trims_reply(false, false, false));
+    // The router sends a sized reply whole to a model with room for it; the
+    // card's default may fit no model whole.
+    CHECK(!trims_reply(true, true, false));
+    CHECK(trims_reply(true, false, false));
+    CHECK(!trims_reply(false, false, true));
+}
+
 // With compression on, --max-ctx is the longest raw prompt PFlash takes (the drafter scores it whole): a prompt
 // that fills the context passes even when its reply would not fit, since compression makes room; a longer one is
 // refused.

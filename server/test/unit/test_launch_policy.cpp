@@ -1,6 +1,7 @@
 // Unit tests for launch policy: `--target-device auto` selection and
 // `--profile` expansion. Both are pure functions over resolved facts, so
-// they need no model file or GPU.
+// they need no model file or GPU; the profiles are the repository's model
+// cards (LUCE_MODEL_CARDS_SOURCE_DIR).
 
 #include "CppUnitTestFramework.hpp"
 #include "placement/device_select.h"
@@ -9,6 +10,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -34,6 +37,38 @@ bool contains_flag(const std::vector<std::string> & args, const char * flag) {
         if (arg == flag) return true;
     }
     return false;
+}
+
+CardProfiles card_profiles(const std::string & stem) {
+    CardProfiles card;
+    std::string error;
+    const std::filesystem::path path =
+        std::filesystem::path(LUCE_MODEL_CARDS_SOURCE_DIR) / (stem + ".json");
+    if (!std::filesystem::exists(path) || !load_card_profiles(path, card, error)) {
+        throw std::runtime_error("model card " + stem + ": " + error);
+    }
+    return card;
+}
+
+LaunchProfile card_profile(const char * stem, const char * name) {
+    const CardProfiles card = card_profiles(stem);
+    const LaunchProfile * profile = card.find(name);
+    if (!profile) throw std::runtime_error(std::string("no profile ") + name + " in " + stem);
+    return *profile;
+}
+
+std::string value_of(const std::vector<std::string> & args, const char * flag) {
+    for (size_t i = 0; i + 1 < args.size(); ++i) {
+        if (args[i] == flag) return args[i + 1];
+    }
+    return {};
+}
+
+std::string env_of(const LaunchProfile & profile, const char * name) {
+    for (const LaunchProfileEnv & entry : profile.env) {
+        if (entry.name == name) return entry.value;
+    }
+    return {};
 }
 
 struct LaunchPolicyFixture : CommonFixture {
@@ -293,20 +328,156 @@ struct LaunchPolicyFixture : CommonFixture {
         CHECK(d.gpu == 0);
     }
 
-    void test_profiles_are_well_formed() {
+    void test_card_profiles_are_well_formed() {
+        // Profile names and aliases are unique across the cards (--profile
+        // finds one by either in any card), and the share/ files they name ship
+        // with the server.
         std::set<std::string> names;
-        for (const LaunchProfile & profile : launch_profiles()) {
-            CHECK(names.insert(profile.name).second);
-            CHECK(find_launch_profile(profile.name) == &profile);
-            std::set<std::string> env;
-            for (const LaunchProfileEnv & entry : profile.env) {
-                CHECK(env.insert(entry.name).second);
-            }
-            for (const LaunchProfileFlag & flag : profile.flags) {
-                CHECK(std::strncmp(flag.flag, "--", 2) == 0);
+        int defaults = 0;
+        for (const std::filesystem::path & path : model_card_files(LUCE_MODEL_CARDS_SOURCE_DIR)) {
+            CardProfiles card;
+            std::string error;
+            CHECK(load_card_profiles(path, card, error));
+            CHECK(error.empty());
+            defaults += !card.default_profiles.empty();
+            for (const LaunchProfile & profile : card.profiles) {
+                CHECK(names.insert(profile.name).second);
+                for (const std::string & alias : profile.aliases) CHECK(names.insert(alias).second);
+                CHECK(!profile.summary.empty());
+                CHECK(!profile.gpus.empty());
+                std::set<std::string> env;
+                for (const LaunchProfileEnv & entry : profile.env) {
+                    CHECK(env.insert(entry.name).second);
+                }
+                for (const LaunchProfileFlag & flag : profile.flags) {
+                    CHECK(flag.flag.rfind("--", 0) == 0);
+                    if (flag.value.rfind("share/", 0) == 0) {
+                        CHECK(std::filesystem::exists(
+                            std::filesystem::path(LUCE_SERVER_SOURCE_DIR) / flag.value));
+                    }
+                }
             }
         }
-        CHECK(find_launch_profile("missing") == nullptr);
+        CHECK(names.size() == 9);  // eight profiles and one alias
+        CHECK(defaults == 2);
+        // ds41-halo's earlier name still selects it.
+        const CardProfiles ds41 = card_profiles("deepseek-v4.1-flash");
+        CHECK(ds41.find("ds41-lucebox") == ds41.find("ds41-halo"));
+        CHECK(ds41.find("ds41-lucebox")->name == "ds41-halo");
+        // A card that is missing has no profiles; one that cannot be read is an error.
+        CardProfiles none;
+        std::string error;
+        CHECK(load_card_profiles(std::filesystem::path(LUCE_MODEL_CARDS_SOURCE_DIR) / "missing.json",
+                                 none, error));
+        CHECK(none.profiles.empty() && error.empty());
+        CHECK(!load_card_profiles(LUCE_MODEL_CARDS_SOURCE_DIR, none, error));
+        CHECK(!error.empty());
+        CHECK(card_profiles("qwen3.8-27b").default_profiles == std::vector<std::string>({"qwen38-r9700"}));
+        // The 192 GB layouts first: the 128 GB Lucebox has the same GPUs, less memory.
+        CHECK(card_profiles("deepseek-v4.1-flash").default_profiles ==
+              std::vector<std::string>({"ds41-r9700-gorgon", "ds41-gorgon", "ds41-halo"}));
+        // The others are picked with --profile only.
+        CHECK(card_profiles("deepseek-v4-flash-0731-rocmfpx").default_profiles.empty());
+        CHECK(card_profiles("qwen3.8-flash-next").default_profiles.empty());
+    }
+
+    void test_card_profiles_reject_malformed_entries() {
+        const char * bad[] = {
+            R"({"profiles": []})",
+            R"({"profiles": {"none": {}}})",
+            R"({"profiles": {"p": {"flags": {"max-ctx": "1"}}}})",
+            R"({"profiles": {"p": {"flags": {"--no-paged-attention": true}}}})",
+            R"({"profiles": {"p": {"flags": {"--paged-attention": false}}}})",
+            R"({"profiles": {"p": {"flags": {"--max-ctx": 4096}}}})",
+            R"({"profiles": {"p": {"flags": {"--profile": "q"}}}})",
+            R"({"profiles": {"p": {"env": {"LUCE_X": 1}}}})",
+            R"({"profiles": {"p": {"gpus": ["1201"]}}})",
+            R"({"profiles": {"p": {"typo": "x"}}})",
+            R"({"profiles": {"p": {"aliases": "q"}}})",
+            R"({"profiles": {"p": {"aliases": ["none"]}}})",
+            R"({"profiles": {"p": {"aliases": [""]}}})",
+            R"({"profiles": {"p": {"aliases": ["p"]}}})",
+            R"({"profiles": {"p": {"aliases": ["q"]}, "q": {}}})",
+            R"({"profiles": {"p": {}, "q": {"aliases": ["p"]}}})",
+            R"({"profiles": {"p": {}}, "default_profile": "q"})",
+            R"({"profiles": {"p": {}}, "default_profile": "p"})",  // a default names its GPUs
+            R"({"profiles": {"p": {"gpus": ["gfx1201"]}}, "default_profile": []})",
+            R"({"profiles": {"p": {"gpus": ["gfx1201"]}}, "default_profile": ["p", "p"]})",
+            R"({"profiles": {"p": {"gpus": ["gfx1201"]}}, "default_profile": ["p", "q"]})",
+            R"({"profiles": {"p": {"gpus": ["gfx1201"]}}, "default_profile": 1})",
+            R"({"profiles": {"p": {"gpus": ["gfx1201"], "min_gpu_memory_gib": 32}}})",
+            R"({"profiles": {"p": {"gpus": ["gfx1201"], "min_gpu_memory_gib": [-1]}}})",
+            R"({"profiles": {"p": {"gpus": ["gfx1201"], "min_gpu_memory_gib": [31.5]}}})",
+            R"({"profiles": {"p": {"gpus": ["gfx1201"], "min_gpu_memory_gib": [0, 32]}}})",
+            R"({"profiles": {"p": {"gpus": ["gfx1201", "gfx1151"], "min_gpu_memory_gib": [32]}}})",
+            "{",
+        };
+        for (const char * text : bad) {
+            CardProfiles card;
+            std::string error;
+            CHECK(!parse_card_profiles(text, card, error));
+            CHECK(!error.empty());
+        }
+        CardProfiles card;
+        std::string error;
+        CHECK(parse_card_profiles(R"({"name": "no profiles"})", card, error));
+        CHECK(card.profiles.empty() && card.default_profiles.empty());
+        // Flags keep the card's order; true marks a flag without a value.
+        CHECK(parse_card_profiles(
+            R"({"profiles": {"p": {"gpus": ["gfx1201"], "flags": {"--z": "1", "--a": true}}},)"
+            R"( "default_profile": "p"})", card, error));
+        CHECK(card.default_profiles == std::vector<std::string>({"p"}));
+        CHECK(launch_profile_args(*card.find("p"), {}) ==
+              std::vector<std::string>({"--z", "1", "--a"}));
+        // Several defaults keep their order; an alias names its profile.
+        CHECK(parse_card_profiles(
+            R"({"profiles": {"p": {"gpus": ["gfx1201"], "aliases": ["old"]},)"
+            R"( "q": {"gpus": ["gfx1151"], "min_gpu_memory_gib": [160]}},)"
+            R"( "default_profile": ["q", "old"]})", card, error));
+        CHECK(card.default_profiles == std::vector<std::string>({"q", "p"}));
+        CHECK(card.find("q")->min_gpu_memory_gib == std::vector<uint64_t>({160}));
+    }
+
+    void test_default_profile_needs_its_gpus_first() {
+        const LaunchProfile qwen = card_profile("qwen3.8-27b", "qwen38-r9700");
+        const LaunchProfile ds41 = card_profile("deepseek-v4.1-flash", "ds41-halo");
+        // GPUs as KFD reports them: the R9700's VRAM, and the iGPU's GTT.
+        const VisibleGpu r9700{"gfx1201", 32ull << 30}, strix{"gfx1151", 96ull << 30},
+            gorgon{"gfx1151", 176ull << 30}, gorgon_default_gtt{"gfx1151", 94ull << 30};
+        // The Lucebox: R9700 as hip:0, Strix Halo as hip:1.
+        CHECK(profile_gpus_match(qwen, {r9700, strix}));
+        CHECK(profile_gpus_match(ds41, {r9700, strix}));
+        // The R9700 alone (ROCR_VISIBLE_DEVICES=0) runs Qwen but not V4.1's split.
+        CHECK(profile_gpus_match(qwen, {r9700}));
+        CHECK(!profile_gpus_match(ds41, {r9700}));
+        // Strix Halo first, or another GPU: neither.
+        CHECK(!profile_gpus_match(qwen, {strix, r9700}));
+        CHECK(!profile_gpus_match(ds41, {strix, r9700}));
+        CHECK(!profile_gpus_match(qwen, {}));
+        LaunchProfile anywhere = qwen;
+        anywhere.gpus.clear();
+        CHECK(!profile_gpus_match(anywhere, {r9700}));
+
+        // The DeepSeek V4.1 card tells its boxes apart by the iGPU's memory.
+        const CardProfiles card = card_profiles("deepseek-v4.1-flash");
+        auto applied = [&](const std::vector<VisibleGpu> & visible) {
+            const LaunchProfile * profile = default_profile_for(card, visible);
+            return profile ? profile->name : std::string("none");
+        };
+        CHECK(applied({r9700, strix}) == "ds41-halo");
+        CHECK(applied({r9700, gorgon}) == "ds41-r9700-gorgon");
+        CHECK(applied({gorgon}) == "ds41-gorgon");
+        CHECK(applied({gorgon, r9700}) == "ds41-gorgon");
+        // A 192 GB board whose GTT limit was not raised gets the 128 GB layout.
+        CHECK(applied({r9700, gorgon_default_gtt}) == "ds41-halo");
+        CHECK(applied({gorgon_default_gtt}) == "none");
+        CHECK(applied({strix}) == "none");
+        CHECK(applied({r9700}) == "none");
+        // The minimum is inclusive.
+        CHECK(applied({{"gfx1151", 160ull << 30}}) == "ds41-gorgon");
+        CHECK(applied({{"gfx1151", (160ull << 30) - 1}}) == "none");
+        CHECK(profile_gpus_text(*card.find("ds41-r9700-gorgon")) == "gfx1201,gfx1151 160+ GiB");
+        CHECK(visible_gpus_text({r9700, strix}) == "gfx1201 32 GiB,gfx1151 96 GiB");
     }
 
     void test_cluster_env_is_well_formed() {
@@ -314,8 +485,8 @@ struct LaunchPolicyFixture : CommonFixture {
         // so every one has a name, a non-empty value and appears once.
         std::set<std::string> names;
         for (const LaunchProfileEnv & entry : cluster_launch_env()) {
-            CHECK(entry.name && *entry.name);
-            CHECK(entry.value && *entry.value);
+            CHECK(!entry.name.empty());
+            CHECK(!entry.value.empty());
             CHECK(names.insert(entry.name).second);
         }
         CHECK(names.count("LUCE_CLUSTER_FAST_REDUCE") == 1);
@@ -323,17 +494,16 @@ struct LaunchPolicyFixture : CommonFixture {
     }
 
     void test_profile_flags_yield_to_explicit_flags() {
-        const LaunchProfile * profile = find_launch_profile("ds4-r9700-strix");
-        CHECK(profile != nullptr);
+        const LaunchProfile profile = card_profile("deepseek-v4-flash-0731-rocmfpx", "ds4-r9700-strix");
 
-        const std::vector<std::string> all = launch_profile_args(*profile, {});
+        const std::vector<std::string> all = launch_profile_args(profile, {});
         CHECK(contains_flag(all, "--expert-device"));
         CHECK(contains_flag(all, "--target-device"));
 
         const std::vector<std::string> explicit_args = {
             "--max-ctx", "65536", "--target-devices", "hip:0,hip:1"};
         const std::vector<std::string> merged =
-            launch_profile_args(*profile, explicit_args);
+            launch_profile_args(profile, explicit_args);
         CHECK(!contains_flag(merged, "--max-ctx"));
         // --target-devices and --target-device select the same setting.
         CHECK(!contains_flag(merged, "--target-device"));
@@ -341,101 +511,161 @@ struct LaunchPolicyFixture : CommonFixture {
         CHECK(!contains_flag(merged, "65536"));
     }
 
+    void test_no_flag_leaves_a_profile_flag_out() {
+        CHECK(dropped_profile_flag("--no-peer-access") == "--peer-access");
+        CHECK(dropped_profile_flag("--no-") == "");
+        CHECK(dropped_profile_flag("--peer-access") == "");
+        const LaunchProfile ds41 = card_profile("deepseek-v4.1-flash", "ds41-halo");
+        const std::vector<std::string> args =
+            launch_profile_args(ds41, {}, {"--peer-access", "--ds4-router-bias"});
+        CHECK(!contains_flag(args, "--peer-access"));
+        CHECK(!contains_flag(args, "--ds4-router-bias"));
+        CHECK(value_of(args, "--max-ctx") == "204800");
+        CHECK(value_of(args, "--ds4-expert-placement") == "share/deepseek41/placement_lucebox.json");
+        const CardProfiles card = card_profiles("deepseek-v4.1-flash");
+        CHECK(card.sets("--peer-access"));
+        CHECK(!card.sets("--kv-cache"));  // --no-kv-cache stays the parser's
+        // --no-target-devices leaves out a profile's --target-device, as an
+        // explicit --target-devices replaces it.
+        CHECK(card.sets("--target-devices"));
+        CHECK(!contains_flag(launch_profile_args(ds41, {}, {"--target-devices"}), "--target-device"));
+    }
+
+    void test_qwen38_profile_is_the_lucebox_launch() {
+        // Lucebox Manage's launch (run-qwen38-server.sh) at its 204,800-token
+        // context, one request at a time, so --pflash on runs on it as is;
+        // batching is the caller's (--paged-attention --max-concurrency N).
+        const LaunchProfile profile = card_profile("qwen3.8-27b", "qwen38-r9700");
+        CHECK(profile.gpus == std::vector<std::string>({"gfx1201"}));
+        CHECK(profile.env.empty());
+        const std::vector<std::string> args = launch_profile_args(profile, {"--draft", "drafter.gguf"});
+        CHECK(value_of(args, "--target-device") == "hip:0");
+        CHECK(value_of(args, "--draft-device") == "hip:0");
+        CHECK(value_of(args, "--draft-block-size") == "16");
+        CHECK(!contains_flag(args, "--paged-attention"));
+        CHECK(!contains_flag(args, "--max-concurrency"));
+        CHECK(!contains_flag(args, "--kv-pool-tokens"));
+        CHECK(value_of(args, "--max-ctx") == "204800");
+        CHECK(value_of(args, "--cache-type-k") == "q8_0");
+        CHECK(value_of(args, "--cache-type-v") == "q8_0");
+    }
+
+    void test_profile_sets_the_draft_block_size_only_for_a_local_drafter() {
+        // The engine refuses --draft-block-size without a drafter loaded in
+        // process, so the default profile must not add it to a model launched
+        // without one. --draft-device stays: PFlash places its drafter with it.
+        const LaunchProfile profile = card_profile("qwen3.8-27b", "qwen38-r9700");
+        const std::vector<std::string> alone = launch_profile_args(profile, {});
+        CHECK(!contains_flag(alone, "--draft-block-size"));
+        CHECK(value_of(alone, "--draft-device") == "hip:0");
+        CHECK(value_of(alone, "--max-ctx") == "204800");
+        const std::vector<std::string> remote = launch_profile_args(
+            profile, {"--draft", "drafter.gguf", "--draft-ipc-bin", "daemon"});
+        CHECK(!contains_flag(remote, "--draft-block-size"));
+    }
+
+    void test_qwen38_halo_profile_runs_on_the_lucebox_igpu() {
+        // Picked with --profile only: the R9700 stays free for another model.
+        const LaunchProfile profile = card_profile("qwen3.8-27b", "qwen38-halo");
+        CHECK(profile.gpus == std::vector<std::string>({"gfx1201", "gfx1151"}));
+        const std::vector<std::string> args = launch_profile_args(profile, {"--draft", "drafter.gguf"});
+        CHECK(value_of(args, "--target-device") == "hip:1");
+        CHECK(value_of(args, "--draft-device") == "hip:1");
+        CHECK(value_of(args, "--draft-block-size") == "16");
+        CHECK(value_of(args, "--max-ctx") == "204800");
+        CHECK(value_of(args, "--cache-type-k") == "q8_0");
+        CHECK(!contains_flag(args, "--paged-attention"));
+    }
+
     void test_profile_replaces_documented_recipe() {
         // The qualified R9700 + Strix recipe in docs/DS4.md, minus the variables
         // that --expert-device and --draft now express as flags.
-        const LaunchProfile * profile = find_launch_profile("ds4-r9700-strix");
-        CHECK(profile != nullptr);
-        for (const LaunchProfileEnv & entry : profile->env) {
-            const std::string name = entry.name;
-            CHECK(name != "LUCE_DS4_MOE_TP");
-            CHECK(name != "LUCE_DS4_MOE_TP_INPROC");
-            CHECK(name != "LUCE_DS4_MOE_TP_GPU");
-            CHECK(name != "LUCE_DS4_SPEC");
-            CHECK(name != "LUCE_DS4_DRAFT");
+        const LaunchProfile profile = card_profile("deepseek-v4-flash-0731-rocmfpx", "ds4-r9700-strix");
+        for (const LaunchProfileEnv & entry : profile.env) {
+            CHECK(entry.name != "LUCE_DS4_MOE_TP");
+            CHECK(entry.name != "LUCE_DS4_MOE_TP_INPROC");
+            CHECK(entry.name != "LUCE_DS4_MOE_TP_GPU");
+            CHECK(entry.name != "LUCE_DS4_SPEC");
+            CHECK(entry.name != "LUCE_DS4_DRAFT");
         }
-        CHECK(profile->env.size() == 37);
+        CHECK(profile.env.size() == 37);
     }
 
     void test_ds41_profile_is_the_lucebox_recipe() {
         // The DS41.md recommended launch: three expert owners through flags,
         // the shipped Lucebox files, no environment spelling of the owners.
-        const LaunchProfile * profile = find_launch_profile("ds41-lucebox");
-        CHECK(profile != nullptr);
-        const std::vector<std::string> args = launch_profile_args(*profile, {});
-        CHECK(contains_flag(args, "--expert-device"));
-        CHECK(contains_flag(args, "--ds4-expert-placement"));
-        CHECK(contains_flag(args, "--ds4-router-bias"));
-        CHECK(contains_flag(args, "--ds4-protected-experts"));
+        const LaunchProfile profile = card_profile("deepseek-v4.1-flash", "ds41-halo");
+        CHECK(profile.gpus == std::vector<std::string>({"gfx1201", "gfx1151"}));
+        const std::vector<std::string> args = launch_profile_args(profile, {});
+        CHECK(contains_flag(args, "--peer-access"));
         // The measured recipe (DS41.md): these values move the numbers.
-        const auto value_of = [&](const char * flag) -> std::string {
-            for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == flag) return args[i + 1];
-            return {};
-        };
-        CHECK(value_of("--max-ctx") == "131072");
-        CHECK(value_of("--chunk") == "4096");
-        CHECK(value_of("--ds4-prefill") == "dense");
-        CHECK(value_of("--expert-device") == "hip:1");
-        CHECK(value_of("--ds4-expert-placement") == "share/deepseek41/placement_lucebox.json");
-        CHECK(value_of("--ds4-router-bias") == "share/deepseek41/router_bias_lucebox_40x384_f32.bin");
-        CHECK(value_of("--ds4-protected-experts") == "share/deepseek41/massive_experts.json");
-        bool budget = false;
-        for (const LaunchProfileEnv & entry : profile->env) {
-            budget = budget || (std::string(entry.name) == "LUCE_EXPERT_BUDGET_MB" &&
-                                std::string(entry.value) == "10500");
-        }
-        CHECK(budget);
-        for (const LaunchProfileEnv & entry : profile->env) {
-            const std::string name = entry.name;
-            CHECK(name != "LUCE_DS4_MOE_TP");
-            CHECK(name != "LUCE_DS4_MOE_TP_INPROC");
-            CHECK(name != "LUCE_DS4_SPEC");
-            CHECK(name != "LUCE_DS4_DRAFT");
+        CHECK(value_of(args, "--max-ctx") == "204800");
+        CHECK(value_of(args, "--chunk") == "4096");
+        CHECK(value_of(args, "--ds4-prefill") == "dense");
+        CHECK(value_of(args, "--expert-device") == "hip:1");
+        CHECK(value_of(args, "--ds4-expert-placement") == "share/deepseek41/placement_lucebox.json");
+        CHECK(value_of(args, "--ds4-router-bias") == "share/deepseek41/router_bias_lucebox_40x384_f32.bin");
+        CHECK(value_of(args, "--ds4-protected-experts") == "share/deepseek41/massive_experts.json");
+        CHECK(env_of(profile, "LUCE_EXPERT_BUDGET_MB") == "10500");
+        CHECK(env_of(profile, "GPU_MAX_HW_QUEUES") == "8");
+        CHECK(profile.env.size() == 22);
+        for (const LaunchProfileEnv & entry : profile.env) {
+            CHECK(entry.name != "LUCE_DS4_MOE_TP");
+            CHECK(entry.name != "LUCE_DS4_MOE_TP_INPROC");
+            CHECK(entry.name != "LUCE_DS4_SPEC");
+            CHECK(entry.name != "LUCE_DS4_DRAFT");
         }
     }
 
-    void test_ds41_gorgon_profile_is_the_measured_recipe() {
+    void test_ds41_r9700_gorgon_profile_is_the_measured_recipe() {
         // Every expert resident (no SSD tier): the placement and router bias
         // come from the command line, the drafter shares the R9700.
-        const LaunchProfile * profile = find_launch_profile("ds41-gorgon");
-        CHECK(profile != nullptr);
-        const std::vector<std::string> args = launch_profile_args(*profile, {});
-        const auto value_of = [&](const char * flag) -> std::string {
-            for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == flag) return args[i + 1];
-            return {};
-        };
-        CHECK(value_of("--target-device") == "hip:0");
-        CHECK(value_of("--expert-device") == "hip:1");
-        CHECK(value_of("--draft-device") == "hip:0");
-        CHECK(value_of("--ds4-prefill") == "dense");
+        const LaunchProfile profile = card_profile("deepseek-v4.1-flash", "ds41-r9700-gorgon");
+        const std::vector<std::string> args = launch_profile_args(profile, {});
+        CHECK(value_of(args, "--target-device") == "hip:0");
+        CHECK(value_of(args, "--expert-device") == "hip:1");
+        CHECK(value_of(args, "--draft-device") == "hip:0");
+        CHECK(value_of(args, "--ds4-prefill") == "dense");
+        CHECK(value_of(args, "--max-ctx") == "262144");
         CHECK(!contains_flag(args, "--ds4-expert-placement"));
         CHECK(!contains_flag(args, "--ds4-router-bias"));
-        const auto env_of = [&](const char * name) -> std::string {
-            for (const LaunchProfileEnv & entry : profile->env) {
-                if (std::string(entry.name) == name) return entry.value;
-            }
-            return {};
-        };
-        CHECK(env_of("LUCE_EXPERT_BUDGET_MB") == "12000");
-        CHECK(env_of("LUCE_DS41_DECODER_BOUNDED_REPLAY") == "1");
-        CHECK(env_of("LUCE_DS4_PREFILL_PIPELINE") == "2");
+        CHECK(env_of(profile, "LUCE_EXPERT_BUDGET_MB") == "12000");
+        CHECK(env_of(profile, "LUCE_DS41_DECODER_BOUNDED_REPLAY") == "1");
+        CHECK(env_of(profile, "LUCE_DS4_PREFILL_PIPELINE") == "2");
         // The drafter swap stays opt-in: cache hits must match a full prefill.
-        CHECK(env_of("LUCE_DS4_DRAFT_SWAP").empty());
-        CHECK(env_of("GGML_CUDA_MLA_SPLIT_KV_COUNT") == "8");
+        CHECK(env_of(profile, "LUCE_DS4_DRAFT_SWAP").empty());
+        CHECK(env_of(profile, "GGML_CUDA_MLA_SPLIT_KV_COUNT") == "8");
+        CHECK(profile.env.size() == 50);
         // A flag given on the command line replaces the profile's value.
-        const std::vector<std::string> given = {"--draft-device", "hip:1"};
-        const std::vector<std::string> merged = launch_profile_args(*profile, given);
+        const std::vector<std::string> merged = launch_profile_args(profile, {"--draft-device", "hip:1"});
         CHECK(!contains_flag(merged, "--draft-device"));
+    }
+
+    void test_ds41_gorgon_profile_keeps_the_model_resident() {
+        // One gfx1151 holds the whole model: no second owner, and nothing that
+        // acts on the hybrid tier, which the engine refuses for a resident model.
+        const LaunchProfile profile = card_profile("deepseek-v4.1-flash", "ds41-gorgon");
+        const std::vector<std::string> args = launch_profile_args(profile, {});
+        CHECK(profile.gpus == std::vector<std::string>({"gfx1151"}));
+        CHECK(profile.min_gpu_memory_gib == std::vector<uint64_t>({160}));
+        CHECK(value_of(args, "--target-device") == "hip:0");
+        CHECK(value_of(args, "--ds4-prefill") == "dense");
+        CHECK(value_of(args, "--max-ctx") == "131072");
+        for (const char * flag : {"--expert-device", "--draft-device", "--peer-access",
+                                  "--ds4-protected-experts", "--ds4-expert-placement",
+                                  "--ds4-router-bias"}) {
+            CHECK(!contains_flag(args, flag));
+        }
+        CHECK(env_of(profile, "LUCE_EXPERT_BUDGET_MB").empty());
+        CHECK(env_of(profile, "LUCE_ROCMFP2_WMMA_PREFILL") == "1");
     }
 
     void test_qwen_next_split_profile_fits_its_context() {
         // The split fits the context to the R9700; a number on the command line still wins.
-        const LaunchProfile * profile = find_launch_profile("qwen-next-r9700-strix");
-        CHECK(profile != nullptr);
-        const std::vector<std::string> args = launch_profile_args(*profile, {});
-        const auto max_ctx = std::find(args.begin(), args.end(), "--max-ctx");
-        CHECK(max_ctx != args.end() && max_ctx + 1 != args.end() && *(max_ctx + 1) == "auto");
-        CHECK(!contains_flag(launch_profile_args(*profile, {"--max-ctx", "65536"}), "--max-ctx"));
+        const LaunchProfile profile = card_profile("qwen3.8-flash-next", "qwen-next-r9700-strix");
+        const std::vector<std::string> args = launch_profile_args(profile, {});
+        CHECK(value_of(args, "--max-ctx") == "auto");
+        CHECK(!contains_flag(launch_profile_args(profile, {"--max-ctx", "65536"}), "--max-ctx"));
     }
 
     void test_pflash_curve_arg_accepts_quoted_and_split_points() {
@@ -483,12 +713,19 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_paged_expert_parallel_requires_supported_devices();
     test_auto_placement_preserves_separate_vision_encoder();
     test_draft_placement_precedence();
-    test_profiles_are_well_formed();
+    test_card_profiles_are_well_formed();
+    test_card_profiles_reject_malformed_entries();
+    test_default_profile_needs_its_gpus_first();
     test_cluster_env_is_well_formed();
     test_profile_flags_yield_to_explicit_flags();
+    test_no_flag_leaves_a_profile_flag_out();
+    test_qwen38_profile_is_the_lucebox_launch();
+    test_profile_sets_the_draft_block_size_only_for_a_local_drafter();
+    test_qwen38_halo_profile_runs_on_the_lucebox_igpu();
     test_profile_replaces_documented_recipe();
     test_ds41_profile_is_the_lucebox_recipe();
-    test_ds41_gorgon_profile_is_the_measured_recipe();
+    test_ds41_r9700_gorgon_profile_is_the_measured_recipe();
+    test_ds41_gorgon_profile_keeps_the_model_resident();
     test_qwen_next_split_profile_fits_its_context();
     test_pflash_curve_arg_accepts_quoted_and_split_points();
     test_pflash_curve_arg_rejects_bad_points();

@@ -16,5 +16,72 @@
     "x-high": 393216,
     "max": 393216
   },
+  "profiles": {
+    "ds4-strix": {
+      "summary": "DeepSeek V4 Flash on one Strix Halo (gfx1151); the gfx1151 device profile supplies the kernel defaults",
+      "gpus": ["gfx1151"],
+      "flags": {
+        "--max-ctx": "131072",
+        "--chunk": "8192",
+        "--ds4-fused-decode": true,
+        "--ds4-fused-verify-f16-kv": true,
+        "--ds4-expert-top-k": "6",
+        "--ds4-prefill": "sparse"
+      }
+    },
+    "ds4-r9700-strix": {
+      "summary": "DeepSeek V4 Flash with dense work and hot experts on an R9700 (gfx1201) and the remaining experts on Strix Halo (gfx1151)",
+      "gpus": ["gfx1201", "gfx1151"],
+      "flags": {
+        "--target-device": "hip:0",
+        "--expert-device": "hip:1",
+        "--peer-access": true,
+        "--max-ctx": "18432",
+        "--chunk": "2048",
+        "--ds4-fused-decode": true,
+        "--ds4-expert-top-k": "6",
+        "--ds4-prefill": "sparse"
+      },
+      "env": {
+        "LUCE_EXPERT_BUDGET_MB": "14350",
+        "LUCE_DS4_SPEC_Q": "5",
+        "LUCE_DS4_Q5_VERIFY": "1",
+        "LUCE_DS4_FUSED_VERIFY": "1",
+        "LUCE_DS4_FUSED_HYBRID_DECODE": "1",
+        "LUCE_DS4_PINNED_ROLLBACK": "1",
+        "LUCE_DS4_GPU_ARGMAX_VERIFY": "1",
+        "LUCE_DS4_DRAFT_CONTEXT_KV_CACHE": "1",
+        "LUCE_DS4_TP_ROUTE_PREFORK": "1",
+        "LUCE_DS4_TP_DEVICE_JOIN": "1",
+        "LUCE_DS4_TP_DEVICE_JOIN_SPLIT": "1",
+        "LUCE_DS4_TP_FUSED_HC_JOIN": "1",
+        "LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS": "1",
+        "LUCE_DS4_TP_COARSE_OWNER": "1",
+        "LUCE_DS4_TP_NATIVE_ROUTE_WIDTH": "1",
+        "LUCE_DS4_TP_MASKED_ROUTES": "1",
+        "LUCE_DS4_TP_GROUPED_MMVQ": "1",
+        "LUCE_DS4_TP_CAPTURE_CACHE_SLOTS": "4",
+        "LUCE_MOE_TP_DYNAMIC_ROUTE_BALANCE": "1",
+        "LUCE_MOE_TP_DYNAMIC_MAIN_SLOTS_X4": "13",
+        "LUCE_MOE_DUPLICATE_HOT_ON_COLD": "1",
+        "LUCE_MOE_FULL_COLD_PARALLEL": "1",
+        "LUCE_MOE_PREFILL_PERSISTENT_OWNER_ALLOC": "1",
+        "LUCE_DS4_HYBRID_PREFILL_GPU_HC": "1",
+        "LUCE_DS4_HYBRID_PREFILL_EAGER": "1",
+        "GGML_CUDA_BATCH_PEER_COPIES": "1",
+        "LUCE_MMID_GROUPED": "1",
+        "LUCE_MMID_GROUPED_TYPES": "8",
+        "LUCE_MMID_GROUPED_DEVICE": "1",
+        "LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK": "2",
+        "LUCE_CUDA_MMVQ_MOE_FP3_PACKED24": "1",
+        "LUCE_CUDA_MMVQ_FP4_X4": "1",
+        "LUCE_DS4_DIRECT_INDEXER_TOPK": "1",
+        "GGML_DS4_TOPK_BLOCK_RADIX": "1",
+        "LUCE_DS4_MIX_MMQ_PREFILL": "1",
+        "LUCE_CUDA_I32_REPEAT": "1",
+        "ROCBLAS_USE_HIPBLASLT": "0"
+      }
+    }
+  },
   "notes": "Transcribed from the upstream card's deployment section: 'we recommend setting the sampling parameters to temperature = 1.0, with top_p = 0.95 for agentic scenarios and top_p = 1.0 otherwise. For the high and max reasoning effort levels, we recommend a maximum output length of 384K tokens.' 384K is taken as 393216. top_p is the non-agentic 1.0; a deployment doing tool calling should override to 0.95 per that same sentence, which is why the agentic value is not baked in here. top_k / min_p / penalties are deliberately ABSENT: the upstream card does not state them and generation_config.json carries only temperature and top_p, so inventing values would misattribute them to DeepSeek. Upstream exposes three reasoning_effort levels (low, high, max) against this server's five, so medium is interpolated at 50% and x-high pinned to max rather than fabricating intermediate recommendations. These are model-capability figures; the server still clamps every tier to max_ctx minus hard_limit_reply_budget, so an 8192-context deployment sees 4096 rather than 384K. Without this file the arch falls to the hard fallback, whose 16000-token ceiling is a generic placeholder rather than anything measured about this model, and /props.model_card reports null so a client cannot discover the real budgets at all."
 }

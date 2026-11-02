@@ -1161,7 +1161,8 @@ if(LUCE_TESTS)
         test_blocking_row_pool
         test_rope_tail
         test_kernel_qualification_core
-        test_cuda_copy_batch)
+        test_cuda_copy_batch
+        test_uma_budget)
 
     # Standalone check of the DS4 MIX histogram fitter: reuses the converter
     # source with its main() renamed away, so it needs the converter's
@@ -1184,6 +1185,10 @@ if(LUCE_TESTS)
     add_executable(
         test_kernel_qualification_core
         test/unit/test_kernel_qualification_core.cpp)
+
+    # Header-only RAM check for managed allocations on integrated GPUs
+    # (ggml-cuda/uma-budget.h); it needs no GPU toolkit to build or run.
+    add_executable(test_uma_budget test/unit/test_uma_budget.cpp)
 
     # Header-only platform shims must remain independently buildable and
     # runnable on hosted Windows workers without a GPU.
@@ -2618,6 +2623,8 @@ if(LUCE_TESTS)
             test/unit/test_spec_acceptance.cpp
             test/unit/test_output_constraint.cpp
             test/unit/test_ds4_spec_sampling.cpp
+            test/unit/test_penalty_history.cpp
+            test/unit/test_chain_sampled_verify.cpp
             test/unit/test_ds4_env.cpp
             test/unit/test_kvflash_ubatch.cpp
             test/unit/test_kvflash_state_ladder.cpp
@@ -2633,6 +2640,7 @@ if(LUCE_TESTS)
             test/unit/test_restore_delta.cpp
             test/unit/test_restore_bounds.cpp
             test/unit/test_chain_rollback_policy.cpp
+            test/unit/test_sampled_verify.cpp
             test/unit/test_ddtree_tau.cpp
             test/unit/test_anchor_transitive.cpp
             test/pflash/test_pflash_drafter_ipc.cpp
@@ -2660,6 +2668,7 @@ if(LUCE_TESTS)
             test/unit/test_qwen35moe_swap_manager.cpp
             test/unit/test_mmq_streamk_schedule.cpp
             test/unit/test_moe_hybrid_storage.cpp
+            test/unit/test_meta_buffer_oom.cpp
             test/unit/test_tensor_file_reader.cpp)
         if(LUCE_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _server_unit_sources
@@ -2830,6 +2839,11 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/src/common
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        # The launch profiles are the repository's model cards.
+        target_link_libraries(test_feature_gate PRIVATE nlohmann_json::nlohmann_json)
+        target_compile_definitions(test_feature_gate PRIVATE
+            LUCE_MODEL_CARDS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../share/model_cards"
+            LUCE_SERVER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
         # compiled_placement_backend() is decided by these defines, so the
         # gate must be tested with the same ones the server is built with.
         if(LUCE_GPU_BACKEND STREQUAL "hip")
@@ -2904,7 +2918,8 @@ if(LUCE_TESTS)
         test_rocmfp_mix_slice_matvec
         test_rocmfp_mix_gateup_glu
         test_rocmfp_mix_glu_fusable
-        test_cuda_copy_batch)
+        test_cuda_copy_batch
+        test_uma_budget)
     foreach(_cppunit_target IN LISTS _new_cppunit_test_targets)
         if(TARGET ${_cppunit_target})
             target_sources(${_cppunit_target} PRIVATE test/unit/test_unit_main.cpp)
@@ -3339,7 +3354,7 @@ if(LUCE_SERVER)
             )
             install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/share/status.html"
                     DESTINATION share)
-            # The ds41-lucebox profile's data files, found next to the binary
+            # The ds41-halo profile's data files, found next to the binary
             # (build/share, <prefix>/share) like status.html.
             add_custom_command(TARGET luce_server POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_directory

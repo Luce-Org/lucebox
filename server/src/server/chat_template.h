@@ -80,6 +80,13 @@ std::string render_chat_template(
 // Detect the appropriate chat format for an architecture.
 ChatFormat chat_format_for_arch(const std::string & arch);
 
+// The order in which ``render_chat_template`` renders ``messages``: index i of
+// the result is the message rendered i-th. DeepSeek V4 / V4.1 results carry no
+// IDs in the prompt, so each run of tool results is rendered in the order of
+// the calls that asked for them; other formats render messages as given (an
+// empty result means as given).
+std::vector<size_t> chat_message_render_order(const std::vector<ChatMessage> & messages, ChatFormat format);
+
 // Render chat messages via a Jinja chat template (e.g. froggeric Qwen3.6
 // template, or any of the llama.cpp models/templates/*.jinja files).
 //

@@ -1,5 +1,8 @@
 #include "platform_io.h"
 
+// Shared with the RAM check for managed allocations in ggml-cuda.
+#include "../../deps/llama.cpp/ggml/src/ggml-cuda/uma-budget.h"
+
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -212,19 +215,6 @@ size_t mapped_resident_bytes(const void * map, uint64_t offset, size_t size) {
     return std::min(size, resident * page);
 }
 
-#if defined(__linux__)
-// First unsigned number in a file; false when absent (e.g. memory.max "max").
-static bool read_u64_file(const std::string & path, uint64_t & out) {
-    FILE * f = std::fopen(path.c_str(), "r");
-    if (!f) return false;
-    unsigned long long v = 0;
-    const bool ok = std::fscanf(f, "%llu", &v) == 1;
-    std::fclose(f);
-    out = (uint64_t) v;
-    return ok;
-}
-#endif
-
 uint64_t host_available_bytes() {
 #if defined(__linux__)
     FILE * f = std::fopen("/proc/meminfo", "r");
@@ -238,29 +228,8 @@ uint64_t host_available_bytes() {
     std::fclose(f);
     // A container sees the host's MemAvailable: bound it by the room left
     // under each cgroup v2 memory limit from this process's group upward.
-    std::string group;
-    if (FILE * cg = std::fopen("/proc/self/cgroup", "r")) {
-        while (std::fgets(line, sizeof(line), cg)) {
-            if (std::strncmp(line, "0::", 3) == 0) {
-                group = line + 3;
-                while (!group.empty() && (group.back() == '\n' || group.back() == '\r')) group.pop_back();
-                break;
-            }
-        }
-        std::fclose(cg);
-    }
-    // The walk ends at the mount root "/" (checked once): a container with
-    // its own cgroup namespace sees its group as "/", its limit at the root.
-    while (!group.empty()) {
-        uint64_t max = 0, cur = 0;
-        const std::string dir = "/sys/fs/cgroup" + (group == "/" ? std::string() : group);
-        if (read_u64_file(dir + "/memory.max", max) && read_u64_file(dir + "/memory.current", cur)) {
-            const uint64_t room = max > cur ? max - cur : 0;
-            if (bytes == 0 || room < bytes) bytes = room;
-        }
-        if (group == "/") break;
-        group.resize(group.rfind('/') == 0 ? 1 : group.rfind('/'));
-    }
+    uint64_t room = 0;
+    if (ggml_cuda_uma_cgroup_room_bytes(&room) && (bytes == 0 || room < bytes)) bytes = room;
     return bytes;
 #else
     return 0;

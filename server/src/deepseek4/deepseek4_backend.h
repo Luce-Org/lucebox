@@ -365,7 +365,16 @@ private:
     // worker with --mmproj-device, otherwise encoded here.
     bool encode_image_request(const std::vector<int32_t> & prompt, const ImagePromptHandle & images,
                               std::string & error);
-    bool begin_staged_prefill(StagedPrefill & item);
+    // Resets the item's staging cache, then restores `from` into it when
+    // given (a text prompt's prefix checkpoint): staging continues after it.
+    bool begin_staged_prefill(StagedPrefill & item, const DeepSeek4Snapshot * from = nullptr);
+    // Before a staged prompt's first chunk: what a fresh prompt's first bulk
+    // chunk retires before it allocates (deepseek4_step_layer_range does that
+    // only for a wide chunk at position 0; a restore or a cut rules it out).
+    void prepare_staged_prefill(DeepSeek4Cache & staging);
+    // Host bytes of a prefix checkpoint of `tokens` positions (a staging
+    // cache snapshot without the single-request aux sidecar).
+    size_t staged_checkpoint_bytes(int tokens) const;
     // A finished (or failed) staged prompt: retire the staging cache's
     // prefill arenas and the device pools' cached temporaries, as the
     // single-request path does after its prefill.

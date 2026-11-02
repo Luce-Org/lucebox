@@ -655,6 +655,16 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
     bos_id_ = get_i32("tokenizer.ggml.bos_token_id");
     eos_id_ = get_i32("tokenizer.ggml.eos_token_id");
     eos_chat_id_ = get_i32("tokenizer.ggml.eot_token_id");
+    const int arch_key = gguf_find_key(gctx, "general.architecture");
+    const char * arch = arch_key >= 0 ? gguf_get_val_str(gctx, arch_key) : nullptr;
+    if (eos_chat_id_ < 0 && arch && std::strcmp(arch, "laguna") == 0) {
+        // Laguna GGUFs ship only the EOS token; the backend ends a turn at
+        // </assistant> (laguna_target_loader.cpp), and so must the server.
+        // Checked before the markers below, which the backend never uses
+        // for Laguna even when the vocabulary has them.
+        auto eot = token_to_id_.find("</assistant>");
+        if (eot != token_to_id_.end()) eos_chat_id_ = eot->second;
+    }
     if (eos_chat_id_ < 0) {
         // Qwen3 uses <|im_end|> as EOT.
         auto eot = token_to_id_.find("<|im_end|>");

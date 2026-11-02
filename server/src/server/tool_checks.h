@@ -68,6 +68,12 @@ bool requested(const json & body, bool server_default);
 bool tool_choice_is_none(const json & tool_choice);
 bool tools_off(const json & body);
 
+// Whether a reply may call the request's tools: not under tool_choice "none".
+// The emitter drops a call the model makes anyway, so no tool call reaches the
+// client, with or without tool checks. A tool-checks pass keeps its calls:
+// rule 4 has to see that call to retry.
+bool tool_calls_allowed(const json & tool_choice, bool checks_pass);
+
 // The request the model answers: rules added to the system message, thinking
 // on at `effort` unless the client chose, non-streaming, and checks off so the
 // inner request takes the plain path.

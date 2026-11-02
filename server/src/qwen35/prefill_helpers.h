@@ -6,6 +6,8 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <utility>
@@ -42,6 +44,35 @@ inline int qwen35_prefill_chunk_tokens(int kv_pos, int remaining, int ubatch,
     if (next != restore_points.end()) end = std::min(end, *next);
     end = std::min(end, (after / ubatch + 1) * ubatch);
     return end - kv_pos;
+}
+
+// Prefill tokens between trims of the legacy (non-VMM) device pools; see
+// do_prefill. Flash attention converts the quantized K and V of the whole
+// context so far to f16 in pool temporaries, so every few chunks of a long
+// prefill ask for a little more than the pool's largest cached block. The pool
+// allocates a new block (5% look-ahead) and keeps the outgrown ones, so its
+// cache grows with the prompt: one cold 125K-token prefill on a 32 GB R9700
+// had cached 5.7 GiB when VRAM ran out at about 87K tokens. Trimming every
+// 8192 tokens (16 chunks) kept that prefill at 28.1 GB instead of the full
+// card, for the same prefill time.
+inline constexpr int kQwen35PrefillPoolTrimTokens = 8192;
+
+// LUCE_PREFILL_POOL_TRIM_TOKENS: unset or empty keeps the default interval, 0
+// turns the trims off, a positive count sets the interval. Anything else,
+// including a count past INT_MAX, keeps the default and clears *valid.
+inline int qwen35_prefill_pool_trim_tokens(const char * value, bool * valid) {
+    *valid = true;
+    if (value == nullptr || value[0] == '\0') return kQwen35PrefillPoolTrimTokens;
+    char * end = nullptr;
+    // strtol saturates instead of failing: at LONG_MAX, which is INT_MAX on
+    // Windows, only errno tells an overflow from a valid count.
+    errno = 0;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || errno == ERANGE || parsed < 0 || parsed > INT_MAX) {
+        *valid = false;
+        return kQwen35PrefillPoolTrimTokens;
+    }
+    return (int)parsed;
 }
 
 inline int qwen35_prefill_ubatch(int fallback) {

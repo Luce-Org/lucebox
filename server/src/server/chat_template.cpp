@@ -413,6 +413,11 @@ static void append_gemma_tool_calls(std::string & out, const ChatMessage & msg) 
     }
 }
 
+std::vector<size_t> chat_message_render_order(const std::vector<ChatMessage> & messages, ChatFormat format) {
+    if (format == ChatFormat::DEEPSEEK4 || format == ChatFormat::DEEPSEEK41) return dsml_message_order(messages);
+    return {};
+}
+
 ChatFormat chat_format_for_arch(const std::string & arch) {
     if (arch == "deepseek41") return ChatFormat::DEEPSEEK41;
     if (arch_is_deepseek4_family(arch)) return ChatFormat::DEEPSEEK4;

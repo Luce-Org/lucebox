@@ -36,6 +36,12 @@ DUAL_AMD_QWEN='device hip:0 arch=gfx1201 type=discrete total_mib=32624 free_mib=
 device hip:1 arch=gfx1151 type=integrated total_mib=98304 free_mib=98000 name=AMD Radeon Graphics
 model arch=qwen35 size_mib=13592 path=/models/qwen.gguf
 auto hip:0 fits=yes total_mib=32624 reason=first discrete GPU that fits the model'
+# Qwen 3.8 27B on the Lucebox: its model card's default profile matches.
+LUCEBOX_QWEN38='device hip:0 arch=gfx1201 type=discrete total_mib=32624 free_mib=32000 name=AMD Radeon AI PRO R9700
+device hip:1 arch=gfx1151 type=integrated total_mib=98304 free_mib=98000 name=AMD Radeon Graphics
+model arch=qwen35 size_mib=13592 path=/models/qwen.gguf
+profile name=qwen38-r9700 gpus=gfx1201
+auto hip:0 fits=yes total_mib=32624 reason=first discrete GPU that fits the model'
 RTX_24G='device cuda:0 arch=sm_86 type=discrete total_mib=24576 free_mib=24000 name=NVIDIA GeForce RTX 3090
 model arch=qwen35 size_mib=15000 path=/models/qwen.gguf
 auto cuda:0 fits=yes total_mib=24576 reason=first discrete GPU that fits the model'
@@ -142,6 +148,18 @@ has_pair "$out" --max-ctx 65536 || fail "explicit LUCE_MAX_CTX dropped with a pr
 out="$(run_entrypoint FAKE_PROBE="$DUAL_AMD_DS4" LUCE_PROFILE=ds4-strix -- --profile ds4-r9700-strix)"
 [ "$(grep -Fxc "SERVER_ARG=--profile" <<<"$out")" = 1 ] || fail "two --profile flags reach luce_server"
 has_pair "$out" --profile ds4-r9700-strix || fail "command-line --profile does not replace LUCE_PROFILE"
+
+# The model card's default profile owns the context too, without a --profile;
+# --profile none hands the context back to the entrypoint.
+out="$(run_entrypoint FAKE_PROBE="$LUCEBOX_QWEN38" --)"
+has_flag "$out" --max-ctx && fail "entrypoint --max-ctx overrides the model card's profile"
+has_flag "$out" --profile && fail "the model card's profile is forwarded as --profile"
+grep -q "profile=qwen38-r9700" "$TMP_DIR/stderr" || fail "the model card's profile is not reported"
+out="$(run_entrypoint FAKE_PROBE="$LUCEBOX_QWEN38" -- --profile none)"
+has_flag "$out" --max-ctx || fail "--profile none does not size the context"
+has_pair "$out" --profile none || fail "--profile none not forwarded"
+out="$(run_entrypoint FAKE_PROBE="$LUCEBOX_QWEN38" -- --model /models/second.gguf)"
+has_flag "$out" --max-ctx || fail "the default profile is assumed for a launch of two models"
 
 # ── drafts follow the target architecture ──────────────────────────────────
 out="$(run_entrypoint FAKE_PROBE="$DUAL_AMD_DS4" LUCE_DRAFT="$TMP_DIR/drafts" --)"

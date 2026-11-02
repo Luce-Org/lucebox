@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/lucebox/lucebox-hub/blob/main/share/model_cards/_schema.json",
   "title": "luce model card sidecar",
-  "description": "Sidecar JSON carrying per-model defaults transcribed from the upstream model card. Read by luce_server at startup to set --default-max-tokens, --think-max-tokens, sampler, and reasoning.effort tier values. See docs/specs/thinking-budget.md §3.3 for the full field reference.",
+  "description": "Sidecar JSON carrying the per-model defaults Lucebox serves with, starting from the upstream model card. Read by luce_server at startup to set --default-max-tokens, --think-max-tokens, sampler, and reasoning.effort tier values. See docs/specs/thinking-budget.md §3.3 for the full field reference.",
   "type": "object",
   "additionalProperties": false,
   "required": ["name", "source", "verified_at", "max_tokens"],
@@ -52,9 +52,13 @@
       "type": "string",
       "description": "Optional. Trained directive injected mid-stream when the budget hook fires. Tells the MODEL to wrap up. Tokenized at startup; the AR decode loop overrides sampled tokens with this sequence verbatim when `(n_gen - generated) <= hard_limit_reply_budget`. The server does NOT auto-append the marker — if the operator wants the close marker in the inject, they include it in the hint. This lets callers test whether a hint alone induces self-close (model emits marker itself) vs a full directive+marker (we force the close). For Qwen3.x the canonical hint per the Qwen3 technical report (arXiv 2505.09388) DOES include the marker: 'Considering the limited time by the user, I have to give the solution based on the thinking directly now.\\n</think>\\n\\n'. If empty, the server emits the bare `thinking_marker` only — safe but the model may continue derivation in content space."
     },
+    "default_sampling": {
+      "enum": ["greedy", "sampling"],
+      "description": "Optional. greedy: a request that sets no temperature decodes greedily, and one that does not sample (no temperature, or 0) gets no penalties; `sampling` and `sampling_no_thinking` fill in only for a request that sets a temperature above 0. sampling (the default): they fill in for every request."
+    },
     "sampling": {
       "type": "object",
-      "description": "Optional. Recommended sampler defaults; used when the request omits a field.",
+      "description": "Optional. The upstream card's sampler recipe; used when the request omits a field (with default_sampling greedy, only when it samples).",
       "additionalProperties": false,
       "properties": {
         "temperature":        { "type": "number" },
@@ -93,6 +97,55 @@
     "notes": {
       "type": "string",
       "description": "Optional. Free-form notes about provenance, caveats, or non-card-derived choices."
+    },
+    "default_profile": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true }
+      ],
+      "description": "Optional. The profile luce_server applies to this model served alone, without --profile, when the visible GPUs start with the profile's gpus and have its min_gpu_memory_gib; with a list, the first that matches. Each must name one of `profiles` that lists its gpus (luce_server and its unit tests check this; JSON Schema cannot)."
+    },
+    "profiles": {
+      "type": "object",
+      "description": "Optional. Launch profiles by name (names and aliases unique across the cards; not none), picked with --profile <name>. Everything a profile sets is a default: command-line flags replace it, --no-<flag> leaves a flag out, and environment variables already set keep their value.",
+      "propertyNames": { "not": { "const": "none" } },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "aliases": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1, "not": { "const": "none" } },
+            "uniqueItems": true,
+            "description": "Earlier names --profile still accepts for this profile."
+          },
+          "summary": { "type": "string", "description": "What the profile runs where; logged at startup." },
+          "gpus": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^gfx" },
+            "description": "GPU architectures the profile was qualified on, from hip:0 upward."
+          },
+          "min_gpu_memory_gib": {
+            "type": "array",
+            "items": { "type": "integer", "minimum": 0 },
+            "description": "The memory each of gpus needs to take this profile by default, in GiB as KFD reports it (a discrete GPU's VRAM; on the Strix Halo, its GTT size); 0 for any. One per gpus entry."
+          },
+          "flags": {
+            "type": "object",
+            "propertyNames": { "pattern": "^--(?!no-|profile$)" },
+            "additionalProperties": {
+              "oneOf": [ { "type": "string", "minLength": 1 }, { "const": true } ]
+            },
+            "description": "luce_server flags in order: a string value, or true for a flag without one. share/... values resolve against the install."
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "Environment defaults installed at model load."
+          },
+          "notes": { "type": "string", "description": "Why the values are what they are." }
+        }
+      }
     }
   }
 }

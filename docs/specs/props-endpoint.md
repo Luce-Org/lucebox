@@ -220,14 +220,15 @@ Field names use llama.cpp conventions (`repeat_penalty`, not
 `repetition_penalty`) for compatibility with `/props` consumers
 written against llama-server.
 
-These values are the server's hard-coded sampler defaults
-(`temperature=0.0`, `top_p=1.0`, `top_k=0`, `min_p=0.0`,
-`repeat_penalty=1.0`) and **do not** reflect the loaded model
-card's `sampling` block. The model card's sampler defaults are
-applied at request-parse time when a request omits a sampler
-field; `/props` only carries the server-wide knobs. To see the
-card's sampler values, read the sidecar JSON or the startup
-banner.
+Each value is the loaded model card's `sampling` value when the card
+sets one, else the server's hard-coded default (`temperature=0.0`,
+`top_p=1.0`, `top_k=0`, `min_p=0.0`, `repeat_penalty=1.0`). The loaded
+card is the model's sidecar card, else the family fallback for its
+architecture (`model_card_source` says which). A card
+with `default_sampling: greedy` reports the hard-coded values: a
+request that sets no temperature decodes greedily, and the card's
+`sampling` block fills in only for a request that sets a temperature
+above 0. The block itself is under `model_card` (§4.10).
 
 ### 4.7 `full_cache`
 

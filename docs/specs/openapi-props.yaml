@@ -372,11 +372,15 @@ components:
 
     DefaultGenerationSettings:
       description: |
-        Server-wide sampler defaults applied when a request omits
-        the corresponding field. Uses llama.cpp wire conventions
-        (`repeat_penalty`, not `repetition_penalty`). Does NOT
-        reflect the loaded model card's `sampling` block — those
-        are applied at request-parse time.
+        Sampler defaults applied when a request omits the
+        corresponding field. Uses llama.cpp wire conventions
+        (`repeat_penalty`, not `repetition_penalty`). Each value is
+        the loaded model card's `sampling` value (the sidecar card,
+        else the family fallback) when it sets one, else the
+        hard-coded default shown in the example. A card with
+        `default_sampling: greedy` reports the hard-coded values: its
+        `sampling` block applies only to a request that sets a
+        temperature above 0.
       type: object
       required:
         - min_p

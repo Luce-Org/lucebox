@@ -85,9 +85,9 @@ static std::string self_bin_dir() {
 //   (d) ./share/model_cards/                          (cwd, dev runs)
 //   (e) $LUCE_MODEL_CARDS_DIR                       (explicit override)
 //
-// Returns first hit or empty string. Each candidate is logged to stderr so
-// operators can see which path was probed.
-static std::string find_model_cards_dir(const std::string & repo_root_hint) {
+// Returns first hit or empty string. The choice (or the miss) is logged to
+// stderr when `log` is set, so operators can see which path was used.
+std::string find_model_cards_dir(const std::string & repo_root_hint, bool log) {
     std::vector<std::string> candidates;
     if (!repo_root_hint.empty()) {
         candidates.push_back(repo_root_hint + "/share/model_cards");
@@ -114,13 +114,15 @@ static std::string find_model_cards_dir(const std::string & repo_root_hint) {
     for (const auto & c : candidates) {
         std::error_code ec;
         if (fs::is_directory(c, ec)) {
-            std::fprintf(stderr, "[model_card] using cards dir: %s\n", c.c_str());
+            if (log) std::fprintf(stderr, "[model_card] using cards dir: %s\n", c.c_str());
             return c;
         }
     }
-    std::fprintf(stderr,
-        "[model_card] no share/model_cards/ directory found; "
-        "tried %zu candidate(s)\n", candidates.size());
+    if (log) {
+        std::fprintf(stderr,
+            "[model_card] no share/model_cards/ directory found; "
+            "tried %zu candidate(s)\n", candidates.size());
+    }
     return {};
 }
 
@@ -256,6 +258,18 @@ static bool load_sidecar(const std::string & path, ModelCard & out, std::string 
         // thinking state resolves to OFF. See model_card.h for the
         // has_*-false-means-absent fallback contract.
         parse_sampling_defaults(j["sampling_no_thinking"], out.sampling_no_thinking);
+    }
+    if (j.contains("default_sampling")) {
+        const std::string mode = j["default_sampling"].is_string()
+            ? j["default_sampling"].get<std::string>() : std::string();
+        if (mode == "greedy") {
+            out.sampling.greedy = true;
+            out.sampling_no_thinking.greedy = true;
+        } else if (mode != "sampling") {
+            std::fprintf(stderr,
+                "[model_card] %s: default_sampling takes greedy or sampling\n",
+                path.c_str());
+        }
     }
 
     if (j.contains("reasoning_effort_tiers") && j["reasoning_effort_tiers"].is_object()) {

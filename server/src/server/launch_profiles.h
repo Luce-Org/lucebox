@@ -1,18 +1,35 @@
-// Named launch profiles (`--profile <name>`).
+// Launch profiles (`--profile <name>`).
 //
 // A profile is a qualified hardware + model configuration: the server flags
-// and the tuning environment a documented recipe needs, under one name.
+// and the tuning environment a documented recipe needs, under one name. The
+// profiles live in the model cards (share/model_cards/<model>.json), beside
+// the model's other Lucebox defaults. A card may name default profiles, and
+// luce_server applies the first one whose qualified GPUs, with the memory it
+// needs of each, are the first ones visible to a single model;
+// `--profile <name>` picks another profile and `--profile none` applies none.
+//
 // Everything a profile sets is a default. Flags given on the command line
-// replace the profile's value for that flag, and environment variables that
-// are already set keep their value, so a profile never overrides an explicit
-// choice.
+// replace the profile's value for that flag, `--no-<flag>` leaves a profile
+// flag out, and environment variables that are already set keep their value,
+// so a profile never overrides an explicit choice.
 
 #pragma once
 
+#include "placement/kfd_topology.h"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,234 +37,278 @@
 namespace luce::server {
 
 struct LaunchProfileFlag {
-    const char * flag;
-    const char * value;  // nullptr for boolean flags
+    std::string flag;
+    std::string value;  // empty for boolean flags
 };
 
 struct LaunchProfileEnv {
-    const char * name;
-    const char * value;
+    std::string name;
+    std::string value;
 };
 
 struct LaunchProfile {
-    const char * name;
-    const char * summary;
+    std::string name;
+    std::vector<std::string> aliases;  // earlier names --profile still accepts
+    std::string summary;
+    // The GPU architectures the profile was qualified on, from hip:0 upward,
+    // and the memory (GiB, as KFD reports it) each needs; empty: any.
+    std::vector<std::string> gpus;
+    std::vector<uint64_t> min_gpu_memory_gib;
     std::vector<LaunchProfileFlag> flags;
     std::vector<LaunchProfileEnv> env;
 };
 
-inline const std::vector<LaunchProfile> & launch_profiles() {
-    static const std::vector<LaunchProfile> profiles = {
-        {
-            "ds4-strix",
-            "DeepSeek V4 Flash on one Strix Halo (gfx1151); the gfx1151 device "
-            "profile supplies the kernel defaults",
-            {
-                {"--max-ctx", "131072"},
-                {"--chunk", "8192"},
-                {"--ds4-fused-decode", nullptr},
-                {"--ds4-fused-verify-f16-kv", nullptr},
-                {"--ds4-expert-top-k", "6"},
-                {"--ds4-prefill", "sparse"},
-            },
-            {},
-        },
-        {
-            "ds4-r9700-strix",
-            "DeepSeek V4 Flash with dense work and hot experts on an R9700 "
-            "(gfx1201) and the remaining experts on Strix Halo (gfx1151)",
-            {
-                {"--target-device", "hip:0"},
-                {"--expert-device", "hip:1"},
-                {"--peer-access", nullptr},
-                {"--max-ctx", "18432"},
-                {"--chunk", "2048"},
-                {"--ds4-fused-decode", nullptr},
-                {"--ds4-expert-top-k", "6"},
-                {"--ds4-prefill", "sparse"},
-            },
-            {
-                {"LUCE_EXPERT_BUDGET_MB", "14350"},
-                {"LUCE_DS4_SPEC_Q", "5"},
-                {"LUCE_DS4_Q5_VERIFY", "1"},
-                {"LUCE_DS4_FUSED_VERIFY", "1"},
-                {"LUCE_DS4_FUSED_HYBRID_DECODE", "1"},
-                {"LUCE_DS4_PINNED_ROLLBACK", "1"},
-                {"LUCE_DS4_GPU_ARGMAX_VERIFY", "1"},
-                {"LUCE_DS4_DRAFT_CONTEXT_KV_CACHE", "1"},
-                {"LUCE_DS4_TP_ROUTE_PREFORK", "1"},
-                {"LUCE_DS4_TP_DEVICE_JOIN", "1"},
-                {"LUCE_DS4_TP_DEVICE_JOIN_SPLIT", "1"},
-                {"LUCE_DS4_TP_FUSED_HC_JOIN", "1"},
-                {"LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS", "1"},
-                {"LUCE_DS4_TP_COARSE_OWNER", "1"},
-                {"LUCE_DS4_TP_NATIVE_ROUTE_WIDTH", "1"},
-                {"LUCE_DS4_TP_MASKED_ROUTES", "1"},
-                {"LUCE_DS4_TP_GROUPED_MMVQ", "1"},
-                {"LUCE_DS4_TP_CAPTURE_CACHE_SLOTS", "4"},
-                {"LUCE_MOE_TP_DYNAMIC_ROUTE_BALANCE", "1"},
-                {"LUCE_MOE_TP_DYNAMIC_MAIN_SLOTS_X4", "13"},
-                {"LUCE_MOE_DUPLICATE_HOT_ON_COLD", "1"},
-                {"LUCE_MOE_FULL_COLD_PARALLEL", "1"},
-                {"LUCE_MOE_PREFILL_PERSISTENT_OWNER_ALLOC", "1"},
-                {"LUCE_DS4_HYBRID_PREFILL_GPU_HC", "1"},
-                {"LUCE_DS4_HYBRID_PREFILL_EAGER", "1"},
-                {"GGML_CUDA_BATCH_PEER_COPIES", "1"},
-                {"LUCE_MMID_GROUPED", "1"},
-                {"LUCE_MMID_GROUPED_TYPES", "8"},
-                {"LUCE_MMID_GROUPED_DEVICE", "1"},
-                {"LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK", "2"},
-                {"LUCE_CUDA_MMVQ_MOE_FP3_PACKED24", "1"},
-                {"LUCE_CUDA_MMVQ_FP4_X4", "1"},
-                {"LUCE_DS4_DIRECT_INDEXER_TOPK", "1"},
-                {"GGML_DS4_TOPK_BLOCK_RADIX", "1"},
-                {"LUCE_DS4_MIX_MMQ_PREFILL", "1"},
-                {"LUCE_CUDA_I32_REPEAT", "1"},
-                {"ROCBLAS_USE_HIPBLASLT", "0"},
-            },
-        },
-        {
-            "ds41-lucebox",
-            "DeepSeek V4.1 Flash on the Lucebox: dense work, hot experts and the "
-            "drafter on the R9700 (gfx1201), a second expert stack on Strix Halo "
-            "(gfx1151, carve plus locked host memory), the rest streamed from SSD; "
-            "the Lucebox placement and router bias from share/deepseek41 (next to "
-            "the binary, or server/share from the repository root)",
-            {
-                {"--target-device", "hip:0"},
-                {"--expert-device", "hip:1"},
-                {"--peer-access", nullptr},
-                {"--max-ctx", "131072"},
-                {"--chunk", "4096"},
-                {"--ds4-prefill", "dense"},
-                // share/... values resolve against the install (server_main.cpp).
-                {"--ds4-expert-placement", "share/deepseek41/placement_lucebox.json"},
-                {"--ds4-router-bias", "share/deepseek41/router_bias_lucebox_40x384_f32.bin"},
-                {"--ds4-protected-experts", "share/deepseek41/massive_experts.json"},
-            },
-            {
-                {"LUCE_EXPERT_BUDGET_MB", "10500"},
-                {"LUCE_DS4_FUSED_VERIFY", "1"},
-                {"LUCE_DS4_FUSED_HYBRID_DECODE", "1"},
-                {"LUCE_DS4_PINNED_ROLLBACK", "1"},
-                {"LUCE_DS4_TP_ROUTE_PREFORK", "1"},
-                {"LUCE_DS4_TP_DEVICE_JOIN", "1"},
-                {"LUCE_DS4_TP_DEVICE_JOIN_SPLIT", "1"},
-                {"LUCE_DS4_TP_FUSED_HC_JOIN", "1"},
-                {"LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS", "1"},
-                {"LUCE_DS4_TP_COARSE_OWNER", "1"},
-                {"LUCE_DS4_TP_NATIVE_ROUTE_WIDTH", "1"},
-                {"LUCE_DS4_TP_MASKED_ROUTES", "1"},
-                {"LUCE_DS4_TP_GROUPED_MMVQ", "1"},
-                {"LUCE_DS4_TP_CAPTURE_CACHE_SLOTS", "4"},
-                {"LUCE_MOE_FULL_COLD_PARALLEL", "1"},
-                {"GGML_CUDA_BATCH_PEER_COPIES", "1"},
-                {"LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK", "2"},
-                {"LUCE_CUDA_I32_REPEAT", "1"},
-                {"LUCE_DS4_DIRECT_INDEXER_TOPK", "1"},
-                {"GGML_DS4_TOPK_BLOCK_RADIX", "1"},
-                {"ROCBLAS_USE_HIPBLASLT", "0"},
-                {"GPU_MAX_HW_QUEUES", "8"},
-            },
-        },
-        {
-            "ds41-gorgon",
-            "DeepSeek V4.1 Flash on an R9700 (gfx1201) beside a 192 GB Gorgon "
-            "Halo (gfx1151) with every expert resident: dense work, hot experts "
-            "and the drafter on the R9700, the other experts on the Gorgon; "
-            "decoder SWA bounded replay and a pipelined layer-major prefill; "
-            "pass the expert placement and router bias for the box",
-            {
-                {"--target-device", "hip:0"},
-                {"--expert-device", "hip:1"},
-                {"--draft-device", "hip:0"},
-                {"--peer-access", nullptr},
-                {"--max-ctx", "131072"},
-                {"--chunk", "4096"},
-                {"--ds4-prefill", "dense"},
-                {"--ds4-protected-experts", "share/deepseek41/massive_experts.json"},
-            },
-            {
-                {"LUCE_EXPERT_BUDGET_MB", "12000"},
-                {"LUCE_DS4_LONG_CONTEXT_CHUNK", "4096"},
-                // Prefill: bounded replay, layer-major bands with the residual
-                // and Engram on the R9700, both owners joined on the device,
-                // the Gorgon's cold FFN of one band under the next band's
-                // attention, WMMA for plain ROCmFP2 experts, one arena.
-                {"LUCE_DS41_DECODER_BOUNDED_REPLAY", "1"},
-                {"LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL", "1"},
-                {"LUCE_DS4_ENGRAM_DEVICE", "1"},
-                {"LUCE_DS4_SPLIT_DEVICE_JOIN", "1"},
-                {"LUCE_DS4_GROUPED_HYBRID_PREFILL", "1"},
-                {"LUCE_ROCMFP2_WMMA_PREFILL", "1"},
-                {"LUCE_DS4_PREFILL_PIPELINE", "2"},
-                {"LUCE_DS4_PREFILL_ARENA_CHUNK_MB", "0"},
-                {"LUCE_DS4_DEVICE_TOPK", "1"},
-                // The cold owner's input crosses PCIe on a side stream.
-                {"LUCE_MOE_SIDE_COPY", "1"},
-                // Prefill attention on the R9700's matrix cores: F16 K/V
-                // rows into the WMMA D512 kernels (the gfx1151 set; its
-                // indexer and causal-window defaults are slower on gfx1201).
-                {"LUCE_DS4_PREFILL_F16_KV_ALL", "1"},
-                {"GGML_CUDA_MLA_STREAM_WMMA", "1"},
-                {"GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS", "2"},
-                {"GGML_CUDA_MLA_DENSE_WMMA", "1"},
-                {"GGML_CUDA_MLA_DENSE_HIGH_RATIO", "1"},
-                // Decode and verify: F16 K/V on every lane, split-KV flash
-                // (eight splits, short lanes included), fused router and HC
-                // collapse (both bit-exact).
-                {"LUCE_DS4_HYBRID_F16_VERIFY_KV", "1"},
-                {"LUCE_DS4_F16_KV_LANES", "1"},
-                {"GGML_CUDA_MLA_SPLIT_KV", "1"},
-                {"GGML_CUDA_MLA_SPLIT_KV_COUNT", "8"},
-                {"LUCE_DS4_EXPLICIT_SPLIT", "1"},
-                {"LUCE_DS4_FUSE_ROUTER", "1"},
-                {"LUCE_DS4_FUSE_COLLAPSE", "1"},
-                {"LUCE_DS4_MASK_F16_ONCE", "1"},
-                {"LUCE_DS4_SPEC_Q", "5"},
-                {"LUCE_DS4_Q5_VERIFY", "1"},
-                {"LUCE_DS4_COMP_PAD_STRIDE", "128"},
-                {"LUCE_DS4_ADAPTIVE_WIDTH", "1"},
-                // The ds41-lucebox owner and kernel settings.
-                {"LUCE_DS4_FUSED_VERIFY", "1"},
-                {"LUCE_DS4_FUSED_HYBRID_DECODE", "1"},
-                {"LUCE_DS4_PINNED_ROLLBACK", "1"},
-                {"LUCE_DS4_TP_ROUTE_PREFORK", "1"},
-                {"LUCE_DS4_TP_DEVICE_JOIN", "1"},
-                {"LUCE_DS4_TP_DEVICE_JOIN_SPLIT", "1"},
-                {"LUCE_DS4_TP_FUSED_HC_JOIN", "1"},
-                {"LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS", "1"},
-                {"LUCE_DS4_TP_COARSE_OWNER", "1"},
-                {"LUCE_DS4_TP_NATIVE_ROUTE_WIDTH", "1"},
-                {"LUCE_DS4_TP_MASKED_ROUTES", "1"},
-                {"LUCE_DS4_TP_GROUPED_MMVQ", "1"},
-                {"LUCE_DS4_TP_CAPTURE_CACHE_SLOTS", "4"},
-                {"LUCE_MOE_FULL_COLD_PARALLEL", "1"},
-                {"GGML_CUDA_BATCH_PEER_COPIES", "1"},
-                {"LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK", "2"},
-                {"LUCE_CUDA_I32_REPEAT", "1"},
-                {"LUCE_DS4_DIRECT_INDEXER_TOPK", "1"},
-                {"GGML_DS4_TOPK_BLOCK_RADIX", "1"},
-                {"ROCBLAS_USE_HIPBLASLT", "0"},
-                {"GPU_MAX_HW_QUEUES", "8"},
-            },
-        },
-        {
-            "qwen-next-r9700-strix",
-            "Qwen3.8-Flash-Next with dense work, KV cache and the MTP drafter on "
-            "an R9700 (gfx1201) and the routed experts on Strix Halo (gfx1151), "
-            "which also keeps some attention layers' KV cache when the R9700 is full; "
-            "add --expert-placement with the box's routing stats to also run "
-            "the most-routed experts on the R9700",
-            {
-                {"--target-device", "hip:0"},
-                {"--expert-device", "hip:1"},
-                {"--max-ctx", "auto"},
-            },
-            {},
-        },
+// Flags that select the same setting. A profile's --target-device yields to
+// an explicit --target-devices as well as to an explicit --target-device.
+inline bool launch_flags_overlap(const std::string & a, const std::string & b) {
+    auto target = [](const std::string & f) {
+        return f == "--target-device" || f == "--target-devices";
     };
-    return profiles;
+    return a == b || (target(a) && target(b));
+}
+
+// The profiles of one model card, and the ones it applies by default.
+struct CardProfiles {
+    std::vector<LaunchProfile> profiles;
+    std::vector<std::string> default_profiles;  // in order; the first that matches applies
+
+    // The profile with this name or alias.
+    const LaunchProfile * find(const std::string & name) const {
+        for (const LaunchProfile & profile : profiles) {
+            if (profile.name == name ||
+                std::find(profile.aliases.begin(), profile.aliases.end(), name) != profile.aliases.end()) {
+                return &profile;
+            }
+        }
+        return nullptr;
+    }
+
+    // Whether a profile of this card sets `flag` (or a flag of the same setting).
+    bool sets(const std::string & flag) const {
+        for (const LaunchProfile & profile : profiles) {
+            for (const LaunchProfileFlag & entry : profile.flags) {
+                if (launch_flags_overlap(entry.flag, flag)) return true;
+            }
+        }
+        return false;
+    }
+};
+
+// Reads the "profiles" and "default_profile" fields of a model card. A card
+// without them has no profiles. Flags keep the card's order.
+inline bool parse_card_profiles(const std::string & text, CardProfiles & out, std::string & error) {
+    using json = nlohmann::ordered_json;
+    out = {};
+    json card;
+    try {
+        card = json::parse(text);
+    } catch (const json::exception & e) {
+        error = e.what();
+        return false;
+    }
+    if (!card.is_object()) {
+        error = "not a JSON object";
+        return false;
+    }
+    if (card.contains("profiles")) {
+        if (!card["profiles"].is_object()) {
+            error = "profiles is not an object";
+            return false;
+        }
+        std::set<std::string> names;
+        for (const auto & item : card["profiles"].items()) {
+            LaunchProfile profile;
+            profile.name = item.key();
+            const std::string where = "profile " + profile.name + ": ";
+            if (profile.name.empty() || profile.name == "none" || !item.value().is_object()) {
+                error = where + "needs a name other than none and an object";
+                return false;
+            }
+            if (!names.insert(profile.name).second) {
+                error = where + "the name is already another profile's alias";
+                return false;
+            }
+            for (const auto & field : item.value().items()) {
+                const std::string & key = field.key();
+                const json & value = field.value();
+                if (key == "summary" && value.is_string()) {
+                    profile.summary = value.get<std::string>();
+                } else if (key == "notes" && value.is_string()) {
+                    // For the reader: why the values are what they are.
+                } else if (key == "aliases" && value.is_array()) {
+                    for (const json & alias : value) {
+                        if (!alias.is_string() || alias.get<std::string>().empty() ||
+                            alias.get<std::string>() == "none" ||
+                            !names.insert(alias.get<std::string>()).second) {
+                            error = where + "aliases takes names no other profile or alias has, other than none";
+                            return false;
+                        }
+                        profile.aliases.push_back(alias.get<std::string>());
+                    }
+                } else if (key == "gpus" && value.is_array()) {
+                    for (const json & gpu : value) {
+                        if (!gpu.is_string() || gpu.get<std::string>().rfind("gfx", 0) != 0) {
+                            error = where + "gpus takes architecture names such as gfx1201";
+                            return false;
+                        }
+                        profile.gpus.push_back(gpu.get<std::string>());
+                    }
+                } else if (key == "min_gpu_memory_gib" && value.is_array()) {
+                    for (const json & gib : value) {
+                        if (!gib.is_number_unsigned()) {
+                            error = where + "min_gpu_memory_gib takes whole GiB, one per gpus entry";
+                            return false;
+                        }
+                        profile.min_gpu_memory_gib.push_back(gib.get<uint64_t>());
+                    }
+                } else if (key == "flags" && value.is_object()) {
+                    for (const auto & flag : value.items()) {
+                        const bool boolean = flag.value().is_boolean() && flag.value().get<bool>();
+                        if (flag.key().rfind("--", 0) != 0 || flag.key().rfind("--no-", 0) == 0 ||
+                            flag.key() == "--profile" ||
+                            !(boolean || (flag.value().is_string() &&
+                                          !flag.value().get<std::string>().empty()))) {
+                            error = where + "flag '" + flag.key() +
+                                    "' needs a --name and a string value, or true";
+                            return false;
+                        }
+                        profile.flags.push_back(
+                            {flag.key(), boolean ? std::string() : flag.value().get<std::string>()});
+                    }
+                } else if (key == "env" && value.is_object()) {
+                    for (const auto & env : value.items()) {
+                        if (env.key().empty() || !env.value().is_string()) {
+                            error = where + "env value of '" + env.key() + "' is not a string";
+                            return false;
+                        }
+                        profile.env.push_back({env.key(), env.value().get<std::string>()});
+                    }
+                } else {
+                    error = where + "unexpected field '" + key + "' or value";
+                    return false;
+                }
+            }
+            if (!profile.min_gpu_memory_gib.empty() &&
+                profile.min_gpu_memory_gib.size() != profile.gpus.size()) {
+                error = where + "min_gpu_memory_gib takes whole GiB, one per gpus entry";
+                return false;
+            }
+            out.profiles.push_back(std::move(profile));
+        }
+    }
+    if (card.contains("default_profile")) {
+        // One name, or several to try in order.
+        const json & names = card["default_profile"];
+        const json list = names.is_array() ? names : json::array({names});
+        for (const json & name : list) {
+            const LaunchProfile * profile =
+                name.is_string() ? out.find(name.get<std::string>()) : nullptr;
+            if (!profile || profile->gpus.empty() ||
+                std::find(out.default_profiles.begin(), out.default_profiles.end(), profile->name) !=
+                    out.default_profiles.end()) {
+                error = "default_profile must name profiles of the card that list their gpus, "
+                        "each once";
+                return false;
+            }
+            out.default_profiles.push_back(profile->name);
+        }
+        if (out.default_profiles.empty()) {
+            error = "default_profile must name profiles of the card that list their gpus, each once";
+            return false;
+        }
+    }
+    return true;
+}
+
+// A card's profiles; a card that does not exist has none.
+inline bool load_card_profiles(const std::filesystem::path & card, CardProfiles & out,
+                               std::string & error) {
+    out = {};
+    std::error_code ec;
+    const std::filesystem::file_status status = std::filesystem::status(card, ec);
+    if (status.type() == std::filesystem::file_type::not_found) return true;
+    if (ec || status.type() != std::filesystem::file_type::regular) {
+        error = card.string() + ": " + (ec ? ec.message() : std::string("not a regular file"));
+        return false;
+    }
+    std::ifstream in(card);
+    std::stringstream text;
+    text << in.rdbuf();
+    if (!in || !parse_card_profiles(text.str(), out, error)) {
+        error = card.string() + ": " + (error.empty() ? "cannot read" : error);
+        return false;
+    }
+    return true;
+}
+
+// The model cards in a directory, by file name (the schema is not one).
+inline std::vector<std::filesystem::path> model_card_files(const std::filesystem::path & dir) {
+    std::vector<std::filesystem::path> cards;
+    std::error_code ec;
+    for (auto entry = std::filesystem::directory_iterator(dir, ec);
+         !ec && entry != std::filesystem::directory_iterator(); entry.increment(ec)) {
+        const std::filesystem::path & path = entry->path();
+        if (path.extension() == ".json" && path.filename().string().rfind('_', 0) != 0) {
+            cards.push_back(path);
+        }
+    }
+    std::sort(cards.begin(), cards.end());
+    return cards;
+}
+
+using VisibleGpu = luce::common::detail::KfdGpu;
+
+// Whether a profile's GPUs are the first visible ones, in order, each with
+// the memory the profile needs of it.
+inline bool profile_gpus_match(const LaunchProfile & profile, const std::vector<VisibleGpu> & visible) {
+    if (profile.gpus.empty() || visible.size() < profile.gpus.size()) return false;
+    for (size_t i = 0; i < profile.gpus.size(); ++i) {
+        if (visible[i].arch != profile.gpus[i]) return false;
+        if (i < profile.min_gpu_memory_gib.size() &&
+            visible[i].memory_bytes < (profile.min_gpu_memory_gib[i] << 30)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The first of a card's default profiles that matches the visible GPUs.
+inline const LaunchProfile * default_profile_for(const CardProfiles & card,
+                                                 const std::vector<VisibleGpu> & visible) {
+    for (const std::string & name : card.default_profiles) {
+        const LaunchProfile * profile = card.find(name);
+        if (profile && profile_gpus_match(*profile, visible)) return profile;
+    }
+    return nullptr;
+}
+
+inline std::string join_names(const std::vector<std::string> & names) {
+    std::string out;
+    for (const std::string & name : names) out += (out.empty() ? "" : ",") + name;
+    return out;
+}
+
+// For messages: "gfx1201,gfx1151 160+ GiB", the GPUs a profile was qualified on.
+inline std::string profile_gpus_text(const LaunchProfile & profile) {
+    std::string out;
+    for (size_t i = 0; i < profile.gpus.size(); ++i) {
+        out += (i ? "," : "") + profile.gpus[i];
+        if (i < profile.min_gpu_memory_gib.size() && profile.min_gpu_memory_gib[i] > 0) {
+            out += " " + std::to_string(profile.min_gpu_memory_gib[i]) + "+ GiB";
+        }
+    }
+    return out;
+}
+
+// For messages: "gfx1201 32 GiB,gfx1151 96 GiB".
+inline std::string visible_gpus_text(const std::vector<VisibleGpu> & visible) {
+    std::string out;
+    for (const VisibleGpu & gpu : visible) {
+        char gib[32];
+        std::snprintf(gib, sizeof(gib), " %.0f GiB", (double) gpu.memory_bytes / (1ull << 30));
+        out += (out.empty() ? "" : ",") + gpu.arch + gib;
+    }
+    return out;
 }
 
 // Environment defaults of expert-parallel cluster mode (--cluster-size > 1):
@@ -393,40 +454,32 @@ inline std::vector<LaunchProfileEnv> pflash_release_env() {
     return env;
 }
 
-inline const LaunchProfile * find_launch_profile(const std::string & name) {
-    for (const LaunchProfile & profile : launch_profiles()) {
-        if (name == profile.name) return &profile;
-    }
-    return nullptr;
+// The flag `--no-<flag>` leaves out of a profile ("--no-peer-access" ->
+// "--peer-access"), or empty for a token of another form.
+inline std::string dropped_profile_flag(const std::string & token) {
+    return token.rfind("--no-", 0) == 0 && token.size() > 5 ? "--" + token.substr(5) : std::string();
 }
 
-inline std::string launch_profile_names() {
-    std::string names;
-    for (const LaunchProfile & profile : launch_profiles()) {
-        if (!names.empty()) names += ", ";
-        names += profile.name;
-    }
-    return names;
-}
-
-// Flags that select the same setting. A profile's --target-device yields to
-// an explicit --target-devices as well as to an explicit --target-device.
-inline bool launch_flags_overlap(const std::string & a, const std::string & b) {
-    auto target = [](const std::string & f) {
-        return f == "--target-device" || f == "--target-devices";
-    };
-    return a == b || (target(a) && target(b));
-}
-
-// Profile flags the command line has not already set, flattened into argv
-// tokens. `given` holds the tokens of the model block the profile applies to.
+// Profile flags the command line has not already set or dropped, flattened
+// into argv tokens. `given` holds the tokens of the model block the profile
+// applies to; `dropped` the flags its --no-<flag> tokens leave out.
 inline std::vector<std::string> launch_profile_args(
     const LaunchProfile & profile,
-    const std::vector<std::string> & given)
+    const std::vector<std::string> & given,
+    const std::set<std::string> & dropped = {})
 {
+    // --draft-block-size reshapes a drafter loaded in process (--draft without
+    // --draft-ipc-bin), and the engine refuses it otherwise; a profile sets it
+    // only for such a block, so a model launched without its drafter still runs.
+    const auto has = [&](const char * flag) {
+        return std::find(given.begin(), given.end(), flag) != given.end();
+    };
+    const bool local_drafter = has("--draft") && !has("--draft-ipc-bin");
     std::vector<std::string> out;
     for (const LaunchProfileFlag & entry : profile.flags) {
-        bool explicit_flag = false;
+        if (entry.flag == "--draft-block-size" && !local_drafter) continue;
+        bool explicit_flag = std::any_of(dropped.begin(), dropped.end(),
+            [&](const std::string & flag) { return launch_flags_overlap(flag, entry.flag); });
         for (const std::string & token : given) {
             if (launch_flags_overlap(token, entry.flag)) {
                 explicit_flag = true;
@@ -434,8 +487,8 @@ inline std::vector<std::string> launch_profile_args(
             }
         }
         if (explicit_flag) continue;
-        out.emplace_back(entry.flag);
-        if (entry.value) out.emplace_back(entry.value);
+        out.push_back(entry.flag);
+        if (!entry.value.empty()) out.push_back(entry.value);
     }
     return out;
 }

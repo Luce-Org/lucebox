@@ -19,7 +19,8 @@
 #                             "none" runs without a draft)
 #   LUCE_TARGET_DEVICE        backend:gpu or auto (default: auto, which picks
 #                             a GPU the model fits on; see `devices`)
-#   LUCE_PROFILE              luce_server --profile name
+#   LUCE_PROFILE              luce_server --profile name (default: the model
+#                             card's profile for these GPUs, if any; none: none)
 #   LUCE_ARGS                 extra luce_server flags, split on whitespace
 #   LUCE_MAX_CTX              context length (default: from the GPU's memory)
 #   LUCE_HOST, LUCE_PORT      listen address (default: 0.0.0.0:8080)
@@ -224,6 +225,14 @@ fi
 # A --profile in the arguments replaces LUCE_PROFILE; luce_server takes one.
 PROFILE_ARG="$(arg_value --profile "${ALL_ARGS[@]}")"
 PROFILE="${PROFILE_ARG:-${LUCE_PROFILE:-}}"
+# Without one, luce_server applies the model card's default profile to a model
+# served alone when the GPUs it was qualified on come first (the probe names
+# it); none applies none.
+APPLIED_PROFILE="$PROFILE"
+if [ -z "$PROFILE" ] && ! has_arg --model "${ALL_ARGS[@]}"; then
+    APPLIED_PROFILE="$(probe_field profile name)"
+fi
+[ "$APPLIED_PROFILE" = none ] && APPLIED_PROFILE=""
 
 # The device the model will run on, for sizing: an explicit single device, else
 # the auto choice. A profile may name its own device, so with a profile only an
@@ -236,7 +245,7 @@ if [ -z "$TARGET_DEVICES" ]; then
     if [ -z "$USED_DEVICE" ] && [ "$LUCE_TARGET_DEVICE" != auto ]; then
         USED_DEVICE="$LUCE_TARGET_DEVICE"
     fi
-    if [ -z "$PROFILE" ] && { [ -z "$USED_DEVICE" ] || [ "$USED_DEVICE" = auto ]; }; then
+    if [ -z "$APPLIED_PROFILE" ] && { [ -z "$USED_DEVICE" ] || [ "$USED_DEVICE" = auto ]; }; then
         USED_DEVICE="$(awk '$1 == "auto" { print $2; exit }' <<<"$PROBE")"
     fi
     [ "$USED_DEVICE" = auto ] && USED_DEVICE=""
@@ -265,7 +274,7 @@ fi
 MAX_CTX_ARG="$(arg_value --max-ctx "${ALL_ARGS[@]}")"
 LAZY_EXPLICIT="${LUCE_LAZY:-}"
 GPU_GB=$((GPU_MIB / 1024))
-if [ -z "${LUCE_MAX_CTX:-}" ] && [ -z "$PROFILE" ] && [ "$GPU_GB" -gt 0 ]; then
+if [ -z "${LUCE_MAX_CTX:-}" ] && [ -z "$APPLIED_PROFILE" ] && [ "$GPU_GB" -gt 0 ]; then
     IS_WSL=0
     if grep -qi microsoft /proc/version 2>/dev/null || [ -e /proc/sys/fs/binfmt_misc/WSLInterop ]; then
         IS_WSL=1
@@ -286,7 +295,7 @@ if [ -z "${LUCE_MAX_CTX:-}" ] && [ -z "$PROFILE" ] && [ "$GPU_GB" -gt 0 ]; then
         LUCE_MAX_CTX=131072
     fi
 fi
-[ -n "$PROFILE" ] || : "${LUCE_MAX_CTX:=16384}"
+[ -n "$APPLIED_PROFILE" ] || : "${LUCE_MAX_CTX:=16384}"
 
 # Qwen3.6 DFlash drafters use sliding-window attention; older GGUFs lack the
 # metadata, so keep the documented default for them.
@@ -305,7 +314,7 @@ else
     resolve_draft "$MODEL_ARCH"
 fi
 
-if [ "$MODEL_ARCH" = deepseek4 ] && [ -z "$PROFILE" ] && [ "$PAGED" = 0 ]; then
+if [ "$MODEL_ARCH" = deepseek4 ] && [ -z "$APPLIED_PROFILE" ] && [ "$PAGED" = 0 ]; then
     case "$(awk -v dev="$USED_DEVICE" '$1 == "device" && $2 == dev { print $3 }' <<<"$PROBE")" in
         arch=gfx1151) info "DeepSeek V4 on Strix Halo: add --profile ds4-strix for the qualified serving profile" ;;
     esac
@@ -368,7 +377,7 @@ fi
 # Operator flags go last: luce_server keeps the last value of a repeated flag.
 CMD+=("${ALL_ARGS[@]}")
 
-info "lucebox-hub starting: target=$(basename "$LUCE_TARGET") arch=${MODEL_ARCH:-unknown} device=$TARGET_DESC max_ctx=${MAX_CTX_ARG:-${LUCE_MAX_CTX:-profile}}${PROFILE:+ profile=$PROFILE}"
+info "lucebox-hub starting: target=$(basename "$LUCE_TARGET") arch=${MODEL_ARCH:-unknown} device=$TARGET_DESC max_ctx=${MAX_CTX_ARG:-${LUCE_MAX_CTX:-profile}}${APPLIED_PROFILE:+ profile=$APPLIED_PROFILE}"
 
 cd "$LUCE_DIR"
 exec "${CMD[@]}"

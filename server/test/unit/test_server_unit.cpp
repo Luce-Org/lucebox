@@ -219,6 +219,18 @@ struct SchedulerTestHarness {
         return server.agent_turn_cache_slots_.count(slot) != 0;
     }
 
+    // One HTTP request through the serving path: parsing, rendering, the
+    // worker started by start_worker(), and the response written to `fd`.
+    static bool start_worker(HttpServer & server) { return server.start_worker(); }
+    static bool route(HttpServer & server, SocketHandle fd, const std::string & path,
+                      const json & body) {
+        HttpServer::HttpRequest request;
+        request.method = "POST";
+        request.path = path;
+        request.body = body.dump();
+        return server.route_request(fd, request);
+    }
+
     // `own_snapshot_slot` is the inline snapshot the request itself took,
     // `restored_slot` the checkpoint it restored from.
     static bool save_generated_turn(
@@ -5447,6 +5459,22 @@ TEST_CASE(ServerUnitFixture, test_deepseek41_template_tool_results_and_effort) {
     TEST_ASSERT(chat_format_for_arch("deepseek4") == ChatFormat::DEEPSEEK4);
 }
 
+TEST_CASE(ServerUnitFixture, test_deepseek_render_order_puts_tool_results_in_call_order) {
+    // Results that arrive out of call order: DeepSeek renders them in call order, other formats as given.
+    std::vector<ChatMessage> msgs = {
+        {"user", "two reads", ""},
+        {"assistant", "", ""},
+        {"tool", "second", "call_2"},
+        {"tool", "first", "call_1"},
+    };
+    msgs[1].tool_calls = {{"call_1", "read", json::object()}, {"call_2", "read", json::object()}};
+    TEST_ASSERT(chat_message_render_order(msgs, ChatFormat::DEEPSEEK4) == std::vector<size_t>({0, 1, 3, 2}));
+    TEST_ASSERT(chat_message_render_order(msgs, ChatFormat::DEEPSEEK41) == std::vector<size_t>({0, 1, 3, 2}));
+    TEST_ASSERT(chat_message_render_order(msgs, ChatFormat::QWEN3).empty());
+    std::swap(msgs[2], msgs[3]);
+    TEST_ASSERT(chat_message_render_order(msgs, ChatFormat::DEEPSEEK4).empty());
+}
+
 TEST_CASE(ServerUnitFixture, test_hash_prefix_deterministic) {
     std::vector<int32_t> ids = {100, 200, 300, 400, 500};
     auto h1 = hash_prefix(ids.data(), (int)ids.size());
@@ -6828,6 +6856,65 @@ TEST_CASE(ServerUnitFixture, test_sampler_defaults_no_thinking_absent_keeps_toda
     TEST_ASSERT(std::fabs(sampler.pres_pen - 0.0f) < 0.001f);
 }
 
+// A greedy card (`default_sampling: greedy`, Qwen 3.8 27B and DeepSeek V4.1
+// Flash): a request that does not sample decodes greedily with no penalties,
+// whatever the thinking state, so the drafter stays on; one that sets a
+// temperature above 0 gets the card's sampling recipe for what it omits.
+TEST_CASE(ServerUnitFixture, test_greedy_card_samples_only_when_the_request_does) {
+    ServerConfig config = qwen4exp_dual_sampling_config();
+    config.sampler_defaults.greedy = true;
+    config.sampler_defaults_no_thinking.greedy = true;
+    const json no_thinking = {{"enable_thinking", false}};
+
+    for (const json & body : {json::object(), json{{"chat_template_kwargs", no_thinking}},
+                              json{{"temperature", 0}, {"chat_template_kwargs", no_thinking}}}) {
+        const SamplerCfg greedy = resolve_request_sampler(body, config);
+        TEST_ASSERT(greedy.temp == 0.0f);
+        TEST_ASSERT(greedy.pres_pen == 0.0f);
+        TEST_ASSERT(greedy.rep_pen == 1.0f);
+        TEST_ASSERT(!greedy.needs_logit_processing());
+    }
+
+    const SamplerCfg thinking = resolve_request_sampler({{"temperature", 0.6f}}, config);
+    TEST_ASSERT(std::fabs(thinking.temp - 0.6f) < 0.001f);
+    TEST_ASSERT(std::fabs(thinking.top_p - 0.95f) < 0.001f);
+    TEST_ASSERT(thinking.top_k == 20);
+    TEST_ASSERT(thinking.pres_pen == 0.0f);
+
+    const SamplerCfg instruct = resolve_request_sampler(
+        {{"temperature", 0.6f}, {"chat_template_kwargs", no_thinking}}, config);
+    TEST_ASSERT(std::fabs(instruct.temp - 0.6f) < 0.001f);
+    TEST_ASSERT(std::fabs(instruct.top_p - 0.80f) < 0.001f);
+    TEST_ASSERT(std::fabs(instruct.pres_pen - 1.5f) < 0.001f);
+
+    // A field the request sets is its own, greedy or not.
+    const SamplerCfg penalized = resolve_request_sampler({{"presence_penalty", 0.5f}}, config);
+    TEST_ASSERT(penalized.temp == 0.0f);
+    TEST_ASSERT(std::fabs(penalized.pres_pen - 0.5f) < 0.001f);
+}
+
+TEST_CASE(ServerUnitFixture, test_model_card_parses_default_sampling) {
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() / "luce-mc-default-sampling-test";
+    fs::remove_all(root);
+    fs::create_directories(root / "share" / "model_cards");
+    const auto write = [&](const char * stem, const char * mode) {
+        std::ofstream((root / "share" / "model_cards" / (std::string(stem) + ".json")).string())
+            << "{\"name\":\"" << stem << "\",\"source\":\"test\",\"verified_at\":\"2026-10-29\","
+            << "\"max_tokens\":32768,\"default_sampling\":\"" << mode << "\","
+            << "\"sampling\":{\"temperature\":1.0}}";
+    };
+    write("greedy-model", "greedy");
+    write("sampled-model", "sampling");
+    const auto greedy = luce::common::resolve_model_card("", "greedy-model", "qwen35", root.string());
+    const auto sampled = luce::common::resolve_model_card("", "sampled-model", "qwen35", root.string());
+    fs::remove_all(root);
+
+    TEST_ASSERT(greedy.sampling.greedy && greedy.sampling_no_thinking.greedy);
+    TEST_ASSERT(greedy.sampling.has_temperature && greedy.sampling.temperature == 1.0f);
+    TEST_ASSERT(!sampled.sampling.greedy && !sampled.sampling_no_thinking.greedy);
+}
+
 TEST_CASE(ServerUnitFixture, test_require_messages_array_rejects_invalid) {
     const json valid = {{"messages", json::array({
         {{"role", "user"}, {"content", "hi"}},
@@ -7570,6 +7657,75 @@ TEST_CASE(ServerUnitFixture, test_emitter_suppresses_undeclared_bailing_tool_blo
     TEST_ASSERT(em.accumulated_text() == "Visible answer");
     TEST_ASSERT(em.accumulated_text().find("weather") == std::string::npos);
     TEST_ASSERT(em.accumulated_text().find("Rome") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_drops_tool_call_under_tool_choice_none) {
+    const auto emitter_for = [](const json & tool_choice, bool checks_pass) {
+        return SseEmitter(ApiFormat::OPENAI_CHAT, "test_id_001", "test-model", 10,
+                          qwen_read_probe_tools(), nullptr, {}, false,
+                          tool_checks::tool_calls_allowed(tool_choice, checks_pass));
+    };
+    // The call as single delimiter tokens (Qwen), and spelled as ordinary
+    // text with its delimiters split across tokens.
+    const std::vector<std::string> delimiter_tokens = {
+        "Reading it.", "<tool_call>",
+        "\n<function=read_probe>\n<parameter=filePath>\nREADME.md\n"
+        "</parameter>\n</function>\n",
+        "</tool_call>"};
+    const std::vector<std::string> text_tokens = {
+        "Reading it.", "<tool", "_call>\n<function=read",
+        "_probe>\n<parameter=filePath>\nREADME.md\n</parameter>\n</function>\n</tool",
+        "_call>"};
+    const auto reply = [&](const json & tool_choice, bool checks_pass,
+                           const std::vector<std::string> & tokens) {
+        auto em = emitter_for(tool_choice, checks_pass);
+        em.emit_start();
+        for (const std::string & raw_token : tokens) {
+            if (!em.suppress_undeclared_tool_protocol_token(raw_token)) {
+                em.emit_token(raw_token);
+            }
+        }
+        const std::string sse = concat(em.emit_finish(10));
+        return std::make_tuple(em.tool_calls().size(), em.finish_reason(),
+                               em.accumulated_text(), sse);
+    };
+
+    for (const auto * tokens : {&delimiter_tokens, &text_tokens}) {
+        for (const json & none : {json("none"), json{{"type", "none"}}}) {
+            const auto [calls, finish, text, sse] = reply(none, false, *tokens);
+            TEST_ASSERT(calls == 0);
+            TEST_ASSERT(finish == "stop");
+            TEST_ASSERT(text == "Reading it.");
+            TEST_ASSERT(sse.find("tool_call") == std::string::npos);
+            TEST_ASSERT(sse.find("read_probe") == std::string::npos);
+        }
+
+        const auto [auto_calls, auto_finish, auto_text, auto_sse] =
+            reply("auto", false, *tokens);
+        TEST_ASSERT(auto_calls == 1);
+        TEST_ASSERT(auto_finish == "tool_calls");
+
+        // A tool-checks pass sees the call, so the checks can retry without it.
+        const auto [pass_calls, pass_finish, pass_text, pass_sse] =
+            reply("none", true, *tokens);
+        TEST_ASSERT(pass_calls == 1);
+    }
+
+    // Non-streaming: the live callback classifies a reply cut off inside the
+    // call, then the replay classifies the same tokens again and keeps the
+    // text before the call.
+    auto em = emitter_for("none", false);
+    const std::vector<std::string> cut_off = {
+        "Reading it.", "<tool_call>", "\n<function=read_probe>\n<parameter=filePath>\n"};
+    for (const auto & raw_token : cut_off) em.suppress_undeclared_tool_protocol_token(raw_token);
+    em.restart_tool_protocol_suppression();
+    em.emit_start();
+    for (const auto & raw_token : cut_off) {
+        if (!em.suppress_undeclared_tool_protocol_token(raw_token)) em.emit_token(raw_token);
+    }
+    em.emit_finish(10);
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text() == "Reading it.");
 }
 
 TEST_CASE(ServerUnitFixture, test_bailingmoe3_router_builds_group_mask) {
@@ -9713,6 +9869,178 @@ TEST_CASE(ServerUnitFixture, test_save_generated_turn_keys_live_state) {
     unlink(path.c_str());
 }
 
+#if !defined(_WIN32)  // socketpair()
+// Serves every generation with `reply`, keeping the state a real backend
+// would: an inline snapshot at the planned cut, and after decode the prompt
+// plus every generated token but the last (sampled, never decoded).
+struct ScriptedReplyBackend : MockBackend {
+    std::vector<int32_t> reply;
+    std::vector<std::vector<int32_t>> prompts;
+    int restored_prefix = 0;
+    std::map<int, int> positions;
+    int live_position = 0;
+
+    bool snapshot_save(int slot) override {
+        positions[slot] = live_position;
+        return true;
+    }
+    void snapshot_free(int slot) override { positions.erase(slot); }
+    bool snapshot_used(int slot) const override { return positions.count(slot) != 0; }
+    int snapshot_cur_pos(int slot) const override {
+        const auto it = positions.find(slot);
+        return it == positions.end() ? 0 : it->second;
+    }
+
+    GenerateResult serve(const GenerateRequest & req, const DaemonIO & io) {
+        prompts.push_back(req.prompt);
+        if (req.snap_slot >= 0 && req.snap_pos > 0) positions[req.snap_slot] = req.snap_pos;
+        GenerateResult result;
+        result.succeed();
+        for (const int32_t token : reply) {
+            result.tokens.push_back(token);
+            if (io.on_token && !io.on_token(token)) break;
+        }
+        live_position = (int) (req.prompt.size() + result.tokens.size()) - 1;
+        return result;
+    }
+    GenerateResult generate_impl(const GenerateRequest & req, const DaemonIO & io) override {
+        return serve(req, io);
+    }
+    GenerateResult restore_and_generate_impl(int slot, const GenerateRequest & req,
+                                             const DaemonIO & io) override {
+        restored_prefix = snapshot_cur_pos(slot);
+        GenerateResult result = serve(req, io);
+        result.restored_prefix_tokens = restored_prefix;
+        return result;
+    }
+};
+
+// A stateless agent sends the thinking tool-call turn back with its tool
+// result. The next prompt must hold the turn exactly as generated (previous
+// prompt + generated tokens), and the server's checkpoint of the generated
+// turn must serve it, so only the tool result is prefilled.
+TEST_CASE(ServerUnitFixture, test_thinking_tool_turn_replays_as_generated) {
+    // Qwen-shaped vocabulary: the think and tool markers are single tokens,
+    // and "\n\n" and "\n\n\n" are distinct newline tokens.
+    std::string printable = "\n";
+    for (char c = ' '; c <= '~'; ++c) printable += c;
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"\n\n", "\n\n\n"}, printable,
+        {"<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>",
+         "</tool_call>", "<tool_response>", "</tool_response>"});
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    // The model closes its thinking with the </think> token followed by the
+    // "\n\n" token, then calls a tool and ends its turn.
+    std::vector<int32_t> generated = tokenizer.encode(
+        "I will read a.py first.\n</think>\n\n<tool_call>\n<function=read>\n"
+        "<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>");
+    generated.push_back(tokenizer.eos_chat_id());
+
+    auto backend_owner = std::make_unique<ScriptedReplyBackend>();
+    ScriptedReplyBackend & backend = *backend_owner;
+    backend.reply = generated;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 4;
+    HttpServer server(engine, tokenizer, config);
+    TEST_ASSERT(SchedulerTestHarness::start_worker(server));
+
+    const json tools = json::array({{
+        {"type", "function"},
+        {"function", {
+            {"name", "read"},
+            {"description", "Read a file"},
+            {"parameters", {
+                {"type", "object"},
+                {"properties", {{"path", {{"type", "string"}}}}},
+                {"required", json::array({"path"})}}}}}}});
+    const auto chat = [&](const json & messages) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        const json body = {
+            {"model", "test"},
+            {"messages", messages},
+            {"tools", tools},
+            {"max_tokens", 64},
+            {"chat_template_kwargs", {{"enable_thinking", true}}},
+            // Only the client's requests reach the backend.
+            {"tool_checks", false},
+        };
+        TEST_ASSERT(SchedulerTestHarness::route(
+            server, sockets[0], "/v1/chat/completions", body));
+        close(sockets[0]);
+        std::string wire;
+        char buf[4096];
+        ssize_t n = 0;
+        while ((n = read(sockets[1], buf, sizeof(buf))) > 0) wire.append(buf, (size_t) n);
+        close(sockets[1]);
+        const size_t body_at = wire.find("\r\n\r\n");
+        TEST_ASSERT_MSG(body_at != std::string::npos, wire);
+        return json::parse(wire.substr(body_at + 4));
+    };
+
+    json messages = json::array({
+        {{"role", "system"}, {"content", "You are a coding agent."}},
+        {{"role", "user"}, {"content", "Read a.py."}},
+    });
+    const json first = chat(messages);
+    const json reply = first["choices"][0]["message"];
+    TEST_ASSERT_MSG(reply.contains("tool_calls") && reply["tool_calls"].size() == 1,
+                    first.dump());
+    messages.push_back(reply);
+    messages.push_back({{"role", "tool"},
+                        {"tool_call_id", reply["tool_calls"][0]["id"]},
+                        {"content", "print(1)"}});
+    backend.reply = {tokenizer.eos_chat_id()};
+    chat(messages);
+    unlink(path.c_str());
+
+    TEST_ASSERT(backend.prompts.size() == 2);
+    if (backend.prompts.size() != 2) return;
+    std::vector<int32_t> turn = backend.prompts[0];
+    turn.insert(turn.end(), generated.begin(), generated.end());
+    const std::vector<int32_t> & next = backend.prompts[1];
+    size_t same = 0;
+    while (same < turn.size() && same < next.size() && turn[same] == next[same]) ++same;
+    TEST_ASSERT_MSG(same == turn.size() && next.size() > turn.size(),
+                    "next prompt leaves the generated turn at token " +
+                    std::to_string(same) + " of " + std::to_string(turn.size()) +
+                    ": " + tokenizer.decode({next.begin() + (long) same,
+                                             next.begin() + (long) std::min(next.size(), same + 4)}));
+    TEST_ASSERT_MSG(backend.restored_prefix == (int) turn.size() - 1,
+                    "restored " + std::to_string(backend.restored_prefix) + " of " +
+                    std::to_string(turn.size()));
+}
+#endif  // !defined(_WIN32)
+
+// Tool memory keeps a generated turn minus its end-of-turn token, and the
+// template closes the turn again. A Laguna GGUF has no EOT key, and its
+// backend ends turns at </assistant> even when the vocabulary has
+// <|im_end|>: the server must too, or the replayed turn holds two
+// </assistant>.
+TEST_CASE(ServerUnitFixture, test_laguna_end_of_turn_matches_backend) {
+    gguf_context * g = gguf_init_empty();
+    const char * tokens[] = {"x", "<|EOS|>", "<|im_end|>", "<assistant>", "</assistant>"};
+    const uint32_t token_types[] = {1, 3, 3, 3, 3};
+    gguf_set_val_str(g, "general.architecture", "laguna");
+    gguf_set_arr_str(g, "tokenizer.ggml.tokens", tokens, 5);
+    gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32, token_types, 5);
+    gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
+    gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 1);
+    const std::string path = test_tmp_path("luce_test_laguna_eot.gguf").string();
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    unlink(path.c_str());
+    TEST_ASSERT_MSG(tokenizer.eos_chat_id() == 4,
+                    "eos_chat_id=" + std::to_string(tokenizer.eos_chat_id()));
+}
+
 // A hit whose backend snapshot is gone (a deferred snapshot a live
 // continuation consumed) is dropped and the next deepest entry restored.
 struct SlotSetBackend : MockBackend {
@@ -9818,6 +10146,25 @@ TEST_CASE(ServerUnitFixture, test_qwen35_prefill_chunks) {
         1003, 1300, {1010, 1100}, kQwen35OffGridLeadTokens);
     TEST_ASSERT(off_grid.size() >= 2 &&
                 off_grid[1] - off_grid[0] >= kQwen35OffGridLeadTokens);
+}
+
+// Long prefills trim the legacy device pools by default (a cold 125K-token
+// prompt filled a 32 GB card without it); 0 opts out, and a bad value keeps
+// the default rather than turning the trims off.
+TEST_CASE(ServerUnitFixture, test_qwen35_prefill_pool_trim_tokens) {
+    bool valid = false;
+    TEST_ASSERT(kQwen35PrefillPoolTrimTokens > 0);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens(nullptr, &valid) == kQwen35PrefillPoolTrimTokens && valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("", &valid) == kQwen35PrefillPoolTrimTokens && valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("0", &valid) == 0 && valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("2048", &valid) == 2048 && valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("-1", &valid) == kQwen35PrefillPoolTrimTokens && !valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("8k", &valid) == kQwen35PrefillPoolTrimTokens && !valid);
+    // Past INT_MAX keeps the default too, also where long is 32 bits and
+    // strtol saturates at INT_MAX (Windows).
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("2147483647", &valid) == INT_MAX && valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("2147483648", &valid) == kQwen35PrefillPoolTrimTokens && !valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("99999999999999999999", &valid) == kQwen35PrefillPoolTrimTokens && !valid);
 }
 
 // An agent turn that continues a generated-turn checkpoint skips its own
@@ -10098,6 +10445,7 @@ public:
                 result.prefix_store.invalidated = plan.restore;
             } else {
                 result.prefix_store.restored = plan.restore;
+                restored.push_back(plan.restore);
             }
         }
         if (!result.prefix_store.invalidated.valid() &&
@@ -10111,8 +10459,10 @@ public:
 
     StepResult step(const StepPlan & plan) override {
         StepResult result;
+        if (const int ms = step_delay_ms.load(std::memory_order_relaxed))
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
         for (const StepInput & input : plan.decode) {
-            result.decode.push_back({input.slot, 2, false, {}});
+            result.decode.push_back({input.slot, decode_token.load(std::memory_order_relaxed), false, {}});
         }
         for (const PrefillSlice & slice : plan.prefills) {
             if (slice.slot < 0 || slice.slot >= (int)slots_.size() ||
@@ -10128,7 +10478,7 @@ public:
             PrefillOutput output;
             output.slot = slice.slot;
             output.status = PrefillOutput::Status::completed;
-            output.token = 2;
+            output.token = decode_token.load(std::memory_order_relaxed);
             if (slot.capture.valid()) {
                 output.prefix_store.status = PrefixStoreEvent::Status::saved;
                 output.prefix_store.ticket = slot.capture;
@@ -10157,7 +10507,10 @@ public:
     std::atomic<bool> returned_busy_before_restore{false};
     std::atomic<bool> unrequested_restore{false};
     std::atomic<bool> malformed_restore{false};
+    std::atomic<int> decode_token{2};   // every token; 2 is EOS: one per request
+    std::atomic<int> step_delay_ms{0};
     std::vector<PrefixStoreRef> discarded;
+    std::vector<PrefixStoreRef> restored;
 
 private:
     struct Slot {
@@ -10269,6 +10622,158 @@ TEST_CASE(ServerUnitFixture,
     bool freed_turn2 = false;
     for (const auto & ref : backend.engine.discarded) freed_turn2 |= ref.tokens == 10;
     TEST_ASSERT(freed_turn2);
+}
+
+// Subagents launched together share their head: the first one admitted saves
+// it, and the next one waits for that checkpoint and restores it instead of
+// prefilling the same tokens beside it. With the wait off, both prefill cold.
+// `task_in_system`: each task ends the system message (as hermes's
+// subagents' do, after the tools), so the shared prefix ends mid-message.
+static std::vector<PrefixStoreRef> run_shared_head_pair(int wait_min_tokens,
+                                                        bool task_in_system = false) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<SchedulerPrefixBackend>();
+    SchedulerPrefixBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 8;
+    config.concurrent_prefix_cache_max_bytes = 4096;
+    config.concurrent_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    config.shared_prefix_wait_min_tokens = wait_min_tokens;
+    HttpServer server(engine, tokenizer, config);
+
+    std::vector<std::unique_ptr<ServerJob>> jobs;
+    std::vector<int> fds;
+    for (const int32_t task : {101, 201}) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        fds.push_back(sockets[0]);
+        fds.push_back(sockets[1]);
+        auto job = std::make_unique<ServerJob>();
+        job->fd = sockets[0];
+        job->req.format = ApiFormat::OPENAI_CHAT;
+        job->req.prompt_tokens = task_in_system
+            ? std::vector<int32_t>{1, 100, 101, 102, task, 3, 50, 4}
+            : std::vector<int32_t>{1, 100, 3, task, 4};
+        job->req.max_output = 1;
+        job->req.stream = false;
+        job->req.model = "scheduler-test";
+        job->req.response_id = "subagent-" + std::to_string(task);
+        SchedulerTestHarness::enqueue(server, job.get());
+        jobs.push_back(std::move(job));
+    }
+    std::thread scheduler([&] {
+        SchedulerTestHarness::run(server, backend.engine);
+    });
+    bool done = true;
+    for (const auto & job : jobs) {
+        std::unique_lock<std::mutex> lock(job->mu);
+        done &= job->cv.wait_for(lock, std::chrono::seconds(5),
+                                 [&] { return job->done; });
+    }
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+    unlink(path.c_str());
+
+    TEST_ASSERT(done);
+    return backend.engine.restored;
+}
+
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_subagents_restore_the_head_the_first_one_saves) {
+    const auto restored = run_shared_head_pair(/*wait_min_tokens=*/2);
+    TEST_ASSERT(restored.size() == 1);
+    TEST_ASSERT(restored[0].tokens == 3);
+    TEST_ASSERT(run_shared_head_pair(/*wait_min_tokens=*/0).empty());
+    // A head shorter than the minimum is not worth the wait.
+    TEST_ASSERT(run_shared_head_pair(/*wait_min_tokens=*/4).empty());
+}
+
+// The system messages differ at their end: the first one admitted captures
+// what it shares with the one still queued, not its whole system message.
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_subagents_share_a_prefix_that_ends_mid_message) {
+    const auto restored = run_shared_head_pair(/*wait_min_tokens=*/2, /*task_in_system=*/true);
+    TEST_ASSERT(restored.size() == 1);
+    TEST_ASSERT(restored[0].tokens == 4);
+    TEST_ASSERT(run_shared_head_pair(/*wait_min_tokens=*/0, /*task_in_system=*/true).empty());
+}
+
+// A subagent waiting for another's prefix whose client leaves is finished at
+// once, even while every slot is busy and nothing can be admitted.
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_finishes_a_prefix_waiter_whose_client_left) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<SchedulerPrefixBackend>();
+    SchedulerPrefixBackend & backend = *backend_owner;
+    backend.engine.decode_token = 7;     // not EOS: both slots keep decoding
+    backend.engine.step_delay_ms = 20;   // ~60 steps: over a second
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 8;
+    config.concurrent_prefix_cache_max_bytes = 4096;
+    config.concurrent_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    config.shared_prefix_wait_min_tokens = 2;
+    HttpServer server(engine, tokenizer, config);
+
+    // The leader and the waiter share their head; the third takes the other
+    // slot, so the waiter has nowhere to go.
+    std::vector<std::unique_ptr<ServerJob>> jobs;
+    std::vector<int> fds;
+    for (const auto & prompt : {std::vector<int32_t>{1, 100, 3, 101, 4},
+                                std::vector<int32_t>{1, 100, 3, 201, 4},
+                                std::vector<int32_t>{1, 300, 5, 301, 4}}) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        fds.push_back(sockets[0]);
+        fds.push_back(sockets[1]);
+        auto job = std::make_unique<ServerJob>();
+        job->fd = sockets[0];
+        job->req.format = ApiFormat::OPENAI_CHAT;
+        job->req.prompt_tokens = prompt;
+        job->req.max_output = 400;
+        job->req.stream = false;
+        job->req.model = "scheduler-test";
+        job->req.response_id = "job-" + std::to_string(jobs.size());
+        SchedulerTestHarness::enqueue(server, job.get());
+        jobs.push_back(std::move(job));
+    }
+    std::thread scheduler([&] {
+        SchedulerTestHarness::run(server, backend.engine);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ServerJob & waiter = *jobs[1];
+    waiter.client_disconnected.store(true, std::memory_order_release);
+    bool waiter_done = false;
+    {
+        std::unique_lock<std::mutex> lock(waiter.mu);
+        waiter_done = waiter.cv.wait_for(lock, std::chrono::milliseconds(500),
+                                         [&] { return waiter.done; });
+    }
+    bool slots_busy = true;
+    for (const size_t i : {(size_t)0, (size_t)2}) {
+        std::lock_guard<std::mutex> lock(jobs[i]->mu);
+        slots_busy &= !jobs[i]->done;
+    }
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+    unlink(path.c_str());
+
+    TEST_ASSERT(slots_busy);   // both other requests were still decoding
+    TEST_ASSERT(waiter_done);
 }
 
 TEST_CASE(ServerUnitFixture,
@@ -10414,7 +10919,7 @@ class TimeShareEngine final : public SeqEngine {
 public:
     explicit TimeShareEngine(int long_prompt_tokens = 0)
         : long_prompt_tokens_(long_prompt_tokens) {}
-    int slot_count() const override { return 2; }
+    int slot_count() const override { return (int)slots_.size(); }
     int max_context() const override { return 4096; }
     bool token_is_eos(int32_t) const override { return false; }
     StepPlanLimits step_plan_limits(int decode_rows) const override {
@@ -10423,7 +10928,9 @@ public:
     }
     AdmitResult admit(uint64_t, const std::vector<int32_t> & prompt, const SamplerCfg &) override {
         AdmitResult result;
-        const int slot = !slots_[0].active ? 0 : !slots_[1].active ? 1 : -1;
+        int slot = -1;
+        for (int i = 0; i < (int)slots_.size() && slot < 0; ++i)
+            if (!slots_[(size_t)i].active) slot = i;
         if (slot < 0) {
             result.status = AdmitResult::Status::busy;
             return result;
@@ -10447,14 +10954,28 @@ public:
             result.prefills.push_back(out);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(plan.prefills.empty() ? 2 : 40));
-        std::lock_guard<std::mutex> lock(mu);
+        std::unique_lock<std::mutex> lock(mu);
         steps.push_back({(int)plan.decode.size(), (int)plan.prefills.size()});
         std::vector<int> chunk_slots;
         for (const PrefillSlice & slice : plan.prefills) chunk_slots.push_back(slice.slot);
         prompt_slots.push_back(std::move(chunk_slots));
+        stepped_.notify_all();
+        released_.wait(lock, [&] { return !held_; });
         return result;
     }
     void retire(int slot) override { slots_[(size_t)slot] = {}; }
+
+    // While held, the scheduler waits after each step, so a test can queue
+    // work at a known point of the schedule.
+    void hold() { std::lock_guard<std::mutex> lock(mu); held_ = true; }
+    void release() {
+        { std::lock_guard<std::mutex> lock(mu); held_ = false; }
+        released_.notify_all();
+    }
+    bool wait_steps(size_t n) {
+        std::unique_lock<std::mutex> lock(mu);
+        return stepped_.wait_for(lock, std::chrono::seconds(10), [&] { return steps.size() >= n; });
+    }
 
     std::mutex mu;
     std::vector<std::pair<int, int>> steps;  // (decode rows, prompt chunks)
@@ -10462,8 +10983,10 @@ public:
 
 private:
     struct Slot { bool active = false; int remaining = 0; };
-    std::array<Slot, 2> slots_{};
+    std::array<Slot, 3> slots_{};
     int long_prompt_tokens_;
+    std::condition_variable stepped_, released_;
+    bool held_ = false;
 };
 
 struct TimeShareBackend : MockBackend {
@@ -10472,9 +10995,10 @@ struct TimeShareBackend : MockBackend {
     SeqEngine * seq_engine() override { return &engine; }
 };
 
-// A chat that decodes, then a 128-token prompt (8 chunks) beside it. Returns
-// the most decode-only steps the chat took between two of the prompt's chunks.
-static int decode_only_steps_between_chunks(int long_prompt_tokens) {
+// A chat that decodes, then prompts (128 tokens each: 8 chunks) beside it.
+// Returns the most decode-only steps the chat took between two prompt chunks.
+static int decode_only_steps_between_chunks(int long_prompt_tokens,
+                                            int prompts = 1) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
@@ -10488,9 +11012,9 @@ static int decode_only_steps_between_chunks(int long_prompt_tokens) {
     config.admission_coalesce_ms = 0;
     HttpServer server(engine, tokenizer, config);
 
-    int fds[4] = {-1, -1, -1, -1};
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds + 2) == 0);
+    int fds[6] = {-1, -1, -1, -1, -1, -1};
+    for (int i = 0; i <= prompts; ++i)
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds + 2 * i) == 0);
     const auto make_job = [](ServerJob & job, int fd, int prompt, int output, const char * id) {
         job.fd = fd;
         job.req.format = ApiFormat::OPENAI_CHAT;
@@ -10500,21 +11024,34 @@ static int decode_only_steps_between_chunks(int long_prompt_tokens) {
         job.req.model = "scheduler-test";
         job.req.response_id = id;
     };
-    ServerJob chat, document;
+    ServerJob chat, documents[2];
     make_job(chat, fds[0], 4, 400, "chat");
-    make_job(document, fds[2], 128, 1, "document");
+    for (int i = 0; i < prompts; ++i)
+        make_job(documents[i], fds[2 + 2 * i], 128, 1, i ? "document-2" : "document");
     SchedulerTestHarness::enqueue(server, &chat);
     std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    SchedulerTestHarness::enqueue(server, &document);
+    // Queue the prompts while the scheduler waits after a step, so they are
+    // admitted together and prefill side by side.
+    backend.engine.hold();
+    size_t stepped = 0;
+    {
+        std::lock_guard<std::mutex> lock(backend.engine.mu);
+        stepped = backend.engine.steps.size();
+    }
+    TEST_ASSERT(backend.engine.wait_steps(stepped + 1));
+    for (int i = 0; i < prompts; ++i) SchedulerTestHarness::enqueue(server, &documents[i]);
+    backend.engine.release();
     const auto wait_done = [](ServerJob & job) {
         std::unique_lock<std::mutex> lock(job.mu);
         return job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; });
     };
-    const bool done = wait_done(document) && wait_done(chat);
+    bool done = true;
+    for (int i = 0; i < prompts; ++i) done &= wait_done(documents[i]);
+    done &= wait_done(chat);
     SchedulerTestHarness::stop(server);
     scheduler.join();
-    for (const int fd : fds) close(fd);
+    for (const int fd : fds) if (fd >= 0) close(fd);
     unlink(path.c_str());
     TEST_ASSERT(done);
 
@@ -10540,6 +11077,13 @@ TEST_CASE(ServerUnitFixture, test_scheduler_gives_decoders_time_beside_a_long_pr
     TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/0) >= 5);
     // A prompt under the engine's long-prompt size keeps every step.
     TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/256) == 0);
+}
+
+// Subagents starting together: two prompts, each under the long-prompt size,
+// are long work together, and the chat beside them gets its time back.
+TEST_CASE(ServerUnitFixture, test_scheduler_gives_decoders_time_beside_prompts_together) {
+    TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/200, /*prompts=*/2) >= 5);
+    TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/300, /*prompts=*/2) == 0);
 }
 
 // A prompt that fits in one step runs before a longer one, alone.
@@ -10597,6 +11141,216 @@ TEST_CASE(ServerUnitFixture, test_scheduler_runs_a_short_prompt_before_a_long_on
     TEST_ASSERT(last_document_step > question_step);
 }
 
+// An engine that thinks in a loop of 10, 11, 12 and answers (EOS) once the
+// close marker is fed back. It bursts four tokens when allowed.
+class LoopingThinkerEngine final : public SeqEngine {
+public:
+    int slot_count() const override { return 1; }
+    int max_context() const override { return 4096; }
+    bool token_is_eos(int32_t token) const override { return token == 2; }
+    int max_decode_tokens() const override { return 4; }
+    StepPlanLimits step_plan_limits(int) const override { return {1, 64, 64, 64}; }
+    AdmitResult admit(uint64_t, const std::vector<int32_t> &, const SamplerCfg &) override {
+        AdmitResult result;
+        result.status = active_ ? AdmitResult::Status::busy : AdmitResult::Status::admitted;
+        result.slot = 0;
+        active_ = true;
+        return result;
+    }
+    StepResult step(const StepPlan & plan) override {
+        StepResult result;
+        for (const PrefillSlice & slice : plan.prefills) {
+            PrefillOutput out;
+            out.slot = slice.slot;
+            out.status = PrefillOutput::Status::completed;
+            out.token = next();
+            result.prefills.push_back(out);
+        }
+        for (const StepInput & input : plan.decode) {
+            closed_ |= input.token == 31;
+            DecodeOutput out;
+            out.slot = input.slot;
+            const int burst = input.allow_speculation ? 4 : 1;
+            for (int i = 1; i < burst; ++i) out.committed_tokens.push_back(next());
+            out.token = next();
+            steps.push_back({input.token, input.allow_speculation, (int)out.committed_tokens.size()});
+            result.decode.push_back(std::move(out));
+        }
+        return result;
+    }
+    void retire(int) override { active_ = false; }
+
+    struct Step { int32_t input; bool speculation; int committed; };
+    std::vector<Step> steps;
+
+private:
+    int32_t next() { return closed_ ? 2 : (int32_t)(10 + n_++ % 3); }
+    bool active_ = false;
+    bool closed_ = false;
+    int n_ = 0;
+};
+
+struct LoopingThinkerBackend : MockBackend {
+    LoopingThinkerEngine engine;
+    SeqEngine * seq_engine() override { return &engine; }
+};
+
+// Runs one greedy thinking request whose thinking loops through the
+// scheduler; loop_repeats < 0 keeps the default --thinking-loop-repeats.
+static std::vector<LoopingThinkerEngine::Step> run_looping_thinker(int loop_repeats) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<LoopingThinkerBackend>();
+    LoopingThinkerBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    config.think_close_token_ids = {30, 31};
+    config.think_marker_token_ids = {31};
+    if (loop_repeats >= 0) config.thinking_loop_repeats = loop_repeats;
+    HttpServer server(engine, tokenizer, config);
+
+    int fds[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ServerJob job;
+    job.fd = fds[0];
+    job.req.format = ApiFormat::OPENAI_CHAT;
+    job.req.prompt_tokens = {1, 100, 3, 101, 4};
+    job.req.max_output = 400;
+    job.req.thinking_opt_in = true;
+    job.req.per_req_phase1_cap = 300;
+    job.req.per_req_reply_budget = 50;
+    job.req.stream = false;
+    job.req.model = "scheduler-test";
+    job.req.response_id = "thinker";
+    SchedulerTestHarness::enqueue(server, &job);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    bool done = false;
+    {
+        std::unique_lock<std::mutex> lock(job.mu);
+        done = job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; });
+    }
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    close(fds[0]);
+    close(fds[1]);
+    unlink(path.c_str());
+    TEST_ASSERT(done);
+    return backend.engine.steps;
+}
+
+// Tokens generated before the step that feeds the first close token, or -1
+// when thinking never closed.
+static int tokens_before_close(const std::vector<LoopingThinkerEngine::Step> & steps) {
+    int generated = 1;
+    for (const auto & step : steps) {
+        if (step.input == 30) return generated;
+        generated += step.committed + 1;
+    }
+    return -1;
+}
+
+// Thinking speculates while the budget is far from its close, and with
+// --thinking-loop-repeats a loop closes it: the close starts on a step that
+// emitted one token, never inside a burst, and the request answers instead of
+// looping to its cap.
+TEST_CASE(ServerUnitFixture, test_scheduler_thinking_speculates_and_a_loop_closes_it) {
+    const auto steps = run_looping_thinker(6);
+    int bursts = 0, close_step = -1;
+    for (int i = 0; i < (int)steps.size(); ++i) {
+        if (close_step < 0 && steps[(size_t)i].input == 30) close_step = i;
+        bursts += close_step < 0 && steps[(size_t)i].committed > 0;
+    }
+    TEST_ASSERT(bursts > 0);           // thinking speculated before its close
+    TEST_ASSERT(close_step > 0);       // the loop was closed
+    TEST_ASSERT(!steps[(size_t)close_step - 1].speculation);
+    TEST_ASSERT(steps[(size_t)close_step - 1].committed == 0);
+    TEST_ASSERT(tokens_before_close(steps) < 120);  // well short of the thinking cap
+}
+
+// By default the server leaves looping thinking alone, as vLLM and SGLang do:
+// only the thinking budget the request asked for closes it.
+TEST_CASE(ServerUnitFixture, test_scheduler_thinking_loop_runs_to_its_budget_by_default) {
+    // The loop closes thinking at ~80 tokens when the closer is on; by
+    // default it runs to the request's 300-token thinking cap.
+    TEST_ASSERT(tokens_before_close(run_looping_thinker(-1)) >= 300);
+}
+
+// Short prompts arriving one after another hold a longer one back for a
+// few steps at most.
+TEST_CASE(ServerUnitFixture, test_scheduler_short_prompts_do_not_stall_a_long_one) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<TimeShareBackend>();
+    TimeShareBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+
+    constexpr int kQuestions = 12;
+    std::vector<int> fds;
+    std::vector<ServerJob> jobs(kQuestions + 1);
+    for (int i = 0; i <= kQuestions; ++i) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        fds.push_back(sockets[0]);
+        fds.push_back(sockets[1]);
+        ServerJob & job = jobs[(size_t)i];
+        job.fd = sockets[0];
+        job.req.format = ApiFormat::OPENAI_CHAT;
+        job.req.prompt_tokens.assign(i ? 4 : 128, 100);
+        job.req.max_output = 1;
+        job.req.stream = false;
+        job.req.model = "scheduler-test";
+        job.req.response_id = i ? "question" : "document";
+    }
+    // The questions arrive after the document's first chunk, with seven left.
+    backend.engine.hold();
+    SchedulerTestHarness::enqueue(server, &jobs[0]);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    const bool started = backend.engine.wait_steps(1);
+    for (int i = 1; i <= kQuestions; ++i) SchedulerTestHarness::enqueue(server, &jobs[(size_t)i]);
+    backend.engine.release();
+    TEST_ASSERT(started);
+    bool done = true;
+    for (ServerJob & job : jobs) {
+        std::unique_lock<std::mutex> lock(job.mu);
+        done &= job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; });
+    }
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+    unlink(path.c_str());
+    TEST_ASSERT(done);
+
+    // The longest run of steps that prefilled questions while the document,
+    // with chunks left, sat out.
+    int last_document_step = -1;
+    for (int i = 0; i < (int)backend.engine.prompt_slots.size(); ++i) {
+        const auto & chunk_slots = backend.engine.prompt_slots[(size_t)i];
+        if (std::find(chunk_slots.begin(), chunk_slots.end(), 0) != chunk_slots.end()) last_document_step = i;
+    }
+    int run = 0, longest = 0;
+    for (int i = 0; i < last_document_step; ++i) {
+        const auto & chunk_slots = backend.engine.prompt_slots[(size_t)i];
+        if (chunk_slots.empty()) continue;
+        const bool document = std::find(chunk_slots.begin(), chunk_slots.end(), 0) != chunk_slots.end();
+        run = document ? 0 : run + 1;
+        longest = std::max(longest, run);
+    }
+    TEST_ASSERT(longest >= 1);  // the questions still go first
+    TEST_ASSERT(longest <= 4);
+}
+
 // Every decode step verifies a drafted chain of 8 positions; the first step
 // accepts 4 of them, the second 2.
 class SpecRoundEngine final : public SeqEngine {
@@ -10642,7 +11396,8 @@ struct SpecRoundBackend : MockBackend {
 };
 
 // A request the parallel scheduler decoded with drafted rounds reports, in
-// its /status perf record, that it speculated and the rounds' acceptance.
+// its response usage and its /status perf record, that it speculated and
+// the rounds' acceptance.
 TEST_CASE(ServerUnitFixture, test_scheduler_perf_record_reports_speculative_rounds) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
@@ -10676,10 +11431,23 @@ TEST_CASE(ServerUnitFixture, test_scheduler_perf_record_reports_speculative_roun
     }
     SchedulerTestHarness::stop(server);
     scheduler.join();
+    std::string reply;
+    char buf[4096];
+    ssize_t got;
+    while ((got = recv(fds[1], buf, sizeof(buf), MSG_DONTWAIT)) > 0) {
+        reply.append(buf, (size_t)got);
+    }
     for (const int fd : fds) close(fd);
     unlink(path.c_str());
     TEST_ASSERT(done);
     TEST_ASSERT(backend.engine.rounds == 2);
+
+    // The response's usage reports the same speculation as /status.
+    const size_t body = reply.find("\r\n\r\n");
+    TEST_ASSERT(body != std::string::npos);
+    const json usage = json::parse(reply.substr(body + 4))["usage"];
+    TEST_ASSERT(usage["spec_decode_ran"] == true);
+    TEST_ASSERT(std::abs(usage["accept_rate"].get<double>() - 6.0 / 12.0) < 1e-6);
 
     const json perf = SchedulerTestHarness::status_json(server)["perf_history"];
     TEST_ASSERT(perf.size() == 1);
@@ -14475,6 +15243,61 @@ TEST_CASE(ServerUnitFixture, test_disk_session_concurrent_eviction_and_restore) 
     unlink(path.c_str());
 }
 
+// Without a disk cache, the checkpoint a capture displaces is freed rather
+// than left in the backend until its slot is captured again.
+TEST_CASE(ServerUnitFixture, test_concurrent_capture_frees_displaced_without_disk) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<DiskCheckpointBackend>();
+    DiskCheckpointBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 2;  // a third conversation displaces the first
+    config.prefix_cache_max_bytes = 0;
+    config.concurrent_prefix_cache_max_bytes = 4096;
+    config.concurrent_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+    TEST_ASSERT(SchedulerTestHarness::disk_cache(server).disabled());
+
+    std::vector<std::unique_ptr<ServerJob>> jobs;
+    std::vector<int> fds;
+    const auto run_one = [&](std::vector<int32_t> prompt, const char * id) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        fds.push_back(sockets[0]);
+        fds.push_back(sockets[1]);
+        auto job = std::make_unique<ServerJob>();
+        job->fd = sockets[0];
+        job->req.format = ApiFormat::OPENAI_CHAT;
+        job->req.prompt_tokens = std::move(prompt);
+        job->req.max_output = 1;
+        job->req.stream = false;
+        job->req.model = "scheduler-test";
+        job->req.response_id = id;
+        jobs.push_back(std::move(job));
+        ServerJob * j = jobs.back().get();
+        SchedulerTestHarness::enqueue(server, j);
+        std::unique_lock<std::mutex> lock(j->mu);
+        return j->cv.wait_for(lock, std::chrono::seconds(5), [&] { return j->done; });
+    };
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    const bool abc = run_one({1, 100, 3, 101, 4}, "a") &&
+                     run_one({1, 200, 3, 201, 4}, "b") &&
+                     run_one({1, 300, 3, 301, 4}, "c");
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+
+    TEST_ASSERT(abc);
+    TEST_ASSERT(backend.displaced.empty());
+    unlink(path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_disk_session_concurrent_respects_request_scope) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
@@ -17052,6 +17875,29 @@ TEST_CASE(ServerUnitFixture, test_emitter_tool_only_bare_name_remains_zero_arg_c
         TEST_ASSERT(em.tool_calls()[0].arguments == "{}");
     }
     TEST_ASSERT(em.accumulated_text().empty());
+}
+
+// Under tool_choice "none" there is no call to recognise: a reply that is
+// only a declared tool's name is the answer, not a call to drop.
+TEST_CASE(ServerUnitFixture, test_emitter_bare_name_is_content_under_tool_choice_none) {
+    json tools = json::array({
+        {
+            {"type", "function"},
+            {"function", {
+                {"name", "ping"},
+                {"parameters", {{"type", "object"}, {"properties", json::object()}}}
+            }}
+        }
+    });
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "test_id_001", "test-model", 10, tools,
+                  nullptr, {}, false, tool_checks::tool_calls_allowed("none", false));
+    em.emit_start();
+    em.emit_token("ping");
+    em.emit_finish(1);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.finish_reason() == "stop");
+    TEST_ASSERT(em.accumulated_text() == "ping");
 }
 
 TEST_CASE(ServerUnitFixture, test_parse_function_calls_mixed_invoke_and_json_line_siblings) {

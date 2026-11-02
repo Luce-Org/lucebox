@@ -21,6 +21,7 @@
 #include "common/sampler.h"
 #include "common/concurrency/seq_engine.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <random>
 #include <string>
@@ -60,6 +61,17 @@ struct SeqSlot {
         return sample_history.size() > (size_t)original_prompt_len
             ? (int)(sample_history.size() - (size_t)original_prompt_len)
             : 0;
+    }
+
+    // What the sampler's penalties read: the tokens generated for this
+    // request (the prompt excluded, as on the single-lane path and in the
+    // OpenAI meaning of presence/frequency penalties), cut to the sampler's
+    // rep_window, which the sampler would apply anyway.
+    std::vector<int32_t> penalty_history() const {
+        const int gen = generated_tokens();
+        const int keep = std::max(0, std::min(gen, sampler.rep_window));
+        return std::vector<int32_t>(sample_history.end() - keep,
+                                    sample_history.end());
     }
 
     bool active() const { return phase != SeqSlotPhase::free; }

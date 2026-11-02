@@ -4,6 +4,7 @@
 #include "common/chain_rollback_policy.h"
 #include "common/adaptive_spec_width.h"
 #include "common/spec_acceptance.h"
+#include "common/sampled_verify.h"
 #include "common/draft_block_size.h"
 #include "common/draft_swa.h"
 #include "placement/skip_park_guard.h"
@@ -2475,24 +2476,21 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     const int prompt_len = (int)tokens.size();
     prefill_last_logits_valid_ = false;
 
-    // The HIP legacy pool retains freed graph temporaries. During a long,
-    // shape-changing prefill those cached blocks can fragment VRAM until the
-    // next allocation fails even though a large part of the pool is idle.
-    // Trimming is deliberately opt-in and performed only between completed
-    // chunks: ggml_backend_cuda_trim_pool() synchronizes the backend and
-    // retires captured graphs before returning cached blocks to the driver.
+    // Legacy (non-VMM) CUDA/HIP pools keep every temporary block a long
+    // prefill outgrows (see kQwen35PrefillPoolTrimTokens), so return them to
+    // the driver every so many tokens, between completed chunks:
+    // ggml_backend_cuda_trim_pool() synchronizes the backend and retires
+    // captured graphs before freeing cached blocks.
     static const int prefill_pool_trim_tokens = []() {
         const char * value = std::getenv("LUCE_PREFILL_POOL_TRIM_TOKENS");
-        if (value == nullptr || value[0] == '\0') return 0;
-        char * end = nullptr;
-        const long parsed = std::strtol(value, &end, 10);
-        if (end == value || *end != '\0' || parsed <= 0 || parsed > INT_MAX) {
+        bool valid = true;
+        const int tokens = qwen35_prefill_pool_trim_tokens(value, &valid);
+        if (!valid) {
             std::fprintf(stderr,
-                "[vram] ignoring invalid LUCE_PREFILL_POOL_TRIM_TOKENS=%s\n",
-                value);
-            return 0;
+                "[vram] ignoring invalid LUCE_PREFILL_POOL_TRIM_TOKENS=%s; "
+                "trimming every %d tokens\n", value, tokens);
         }
-        return (int)parsed;
+        return tokens;
     }();
     int64_t next_prefill_pool_trim = prefill_pool_trim_tokens > 0
         ? ((int64_t)kv_offset / prefill_pool_trim_tokens + 1) * prefill_pool_trim_tokens
@@ -4565,6 +4563,9 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         // token (it is already a valid target sample at that position).
         int accept_n = 1;
         int bonus_tok = -1;
+        // The sampled walk, kept after the paths below defer bonus_tok: its
+        // draws seed the next round (sampled_verify_next).
+        SampledVerifyWalk walk;
         if (sampled_verify) {
             if (!target->read_verify_logits(v_len, verify_logits)) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
@@ -4597,35 +4598,25 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                     }
                 }
             }
-            // Penalty history must match AR exactly: when AR samples the
-            // token after X, X is already in out_tokens. The seed
-            // draft_tok[0] is committed by this step's replay but not yet
-            // in out_tokens, so add it before the walk — without it the
-            // repetition penalty never sees the seed and the sampled
-            // distribution drifts from AR whenever penalties are active.
+            // Penalty history must match AR exactly: AR's history is
+            // out_tokens; the walk adds the seed and the kept drafts.
             verify_history = out_tokens;
-            verify_history.push_back(draft_tok[0]);
-            bool mismatched = false;
-            for (int i = 0; i < v_len - 1; i++) {
-                const int s = sample_logits(
-                    verify_logits.data() + (size_t)i * vocab_v, vocab_v,
-                    sampler_, verify_history, sampler_rng_);
-                if (kSvDebug && n_draft_steps < 3 && i < 4) {
+            walk = sampled_verify_walk(verify_logits.data(), vocab_v, v_len,
+                                       draft_tok.data(), sampler_,
+                                       verify_history, sampler_rng_);
+            accept_n = walk.accepted;
+            bonus_tok = walk.bonus;
+            if (kSvDebug && n_draft_steps < 3) {
+                // Row i drew draft_tok[i + 1] up to the bonus row.
+                const int draws = accept_n - (walk.bonus < 0 ? 1 : 0);
+                for (int i = 0; i < std::min(draws, 4); i++) {
                     std::fprintf(stderr,
                         "[sv-debug] step=%d pos=%d seed/draft0=%d draft=%d "
                         "sampled=%d\n",
-                        n_draft_steps, i, draft_tok[0], draft_tok[i + 1], s);
-                }
-                if (draft_tok[i + 1] == s) {
-                    accept_n++;
-                    verify_history.push_back(s);
-                } else {
-                    bonus_tok = s;
-                    mismatched = true;
-                    break;
+                        n_draft_steps, i, draft_tok[0], draft_tok[i + 1],
+                        i < accept_n - 1 ? draft_tok[i + 1] : walk.bonus);
                 }
             }
-            (void)mismatched;
         } else {
             for (int i = 0; i < v_len - 1; i++) {
                 if (draft_tok[i + 1] == target_tok[i]) accept_n++;
@@ -4866,15 +4857,29 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             // (draft_tok[0]), so it must itself be a sample from the target
             // distribution. replay_last_tok is the argmax — seeding with it
             // injects one greedy token per step, which biases the output and
-            // locks long generations into repetition loops.
-            if (sampled_verify && !replay_tok.empty() &&
-                target->read_verify_logits((int)replay_tok.size(), verify_logits)) {
-                const int vocab_v =
-                    (int)(verify_logits.size() / replay_tok.size());
-                last_tok = sample_logits(
-                    verify_logits.data() +
-                        (replay_tok.size() - 1) * (size_t)vocab_v,
-                    vocab_v, sampler_, out_tokens, sampler_rng_);
+            // locks long generations into repetition loops. When the walk
+            // drew the kept tip's row (fast rollback leaves its bonus
+            // uncommitted), that draw is the sample; a second draw from the
+            // row would favour the rejected draft token (sampled_verify_next).
+            // Like every committed token, the seed passes the emit loop of the
+            // step that commits it. There an EOS below LUCE_MIN_TOKENS meets
+            // only the tool-stall recovery: this path has no other min-token
+            // floor (apply_min_tokens_floor runs on the AR path alone).
+            if (sampled_verify && commit_n > 0) {
+                // Rows of the latest verify (the walk, or the replay): row r
+                // holds the logits after committed token r.
+                auto draw = [&](int row) -> int32_t {
+                    if (!target->read_verify_logits(commit_n, verify_logits)) {
+                        return replay_last_tok;
+                    }
+                    const int vocab_v =
+                        (int)(verify_logits.size() / (size_t)commit_n);
+                    return sample_logits(
+                        verify_logits.data() + (size_t)row * (size_t)vocab_v,
+                        vocab_v, sampler_, out_tokens, sampler_rng_);
+                };
+                last_tok = sampled_verify_next(walk, draft_tok.data(), commit_n,
+                                               draw);
             } else {
                 last_tok = replay_last_tok;
             }

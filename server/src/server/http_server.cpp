@@ -770,6 +770,14 @@ PflashChatTurnSpan pflash_chat_query_turn(
     return chosen;
 }
 
+std::string_view pflash_template_trim(std::string_view text) {
+    // The chat template's ``|trim`` (jinja strip: C isspace on each byte).
+    const auto space = [] (char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; };
+    while (!text.empty() && space(text.front())) text.remove_prefix(1);
+    while (!text.empty() && space(text.back())) text.remove_suffix(1);
+    return text;
+}
+
 bool pflash_content_char_spans(
         const std::string & placeholder_render,
         const std::vector<std::string> & placeholders,
@@ -782,30 +790,41 @@ bool pflash_content_char_spans(
         error = "placeholder and content counts differ";
         return false;
     }
-    std::string rebuilt;
-    rebuilt.reserve(prompt_text.size());
-    size_t cursor = 0;
+    // Where each placeholder is rendered, exactly once. Not necessarily in message order: DeepSeek renders each
+    // run of tool results in the order of the calls that asked for them.
+    std::vector<std::pair<size_t, size_t>> found;   // (position in the render, message)
     for (size_t i = 0; i < placeholders.size(); ++i) {
         const std::string & ph = placeholders[i];
         if (ph.empty()) continue;
-        const size_t at = placeholder_render.find(ph, cursor);
-        if (at == std::string::npos ||
-            placeholder_render.find(ph, at + ph.size()) != std::string::npos) {
-            error = "message " + std::to_string(i) + " is not rendered exactly once, in order";
+        const size_t at = placeholder_render.find(ph);
+        if (at == std::string::npos || placeholder_render.find(ph, at + ph.size()) != std::string::npos) {
+            error = "message " + std::to_string(i) + " is not rendered exactly once";
+            spans.assign(placeholders.size(), {0, 0});
             return false;
         }
-        rebuilt.append(placeholder_render, cursor, at - cursor);
-        spans[i] = {rebuilt.size(), rebuilt.size() + contents[i].size()};
-        rebuilt += contents[i];
-        cursor = at + ph.size();
+        found.emplace_back(at, i);
     }
-    rebuilt.append(placeholder_render, cursor, std::string::npos);
-    if (rebuilt != prompt_text) {
-        error = "the template does not render message contents verbatim";
-        spans.assign(placeholders.size(), {0, 0});
-        return false;
+    std::sort(found.begin(), found.end());
+    // Contents go back verbatim, or trimmed: templates such as Qwen 3.8's trim every message, so a tool output
+    // ending in a newline is rendered without it. Either way the result must equal the prompt byte for byte.
+    for (const bool trimmed : {false, true}) {
+        std::string rebuilt;
+        rebuilt.reserve(prompt_text.size());
+        size_t cursor = 0;
+        for (const auto & [at, i] : found) {
+            const std::string_view content = trimmed ? pflash_template_trim(contents[i])
+                                                     : std::string_view(contents[i]);
+            rebuilt.append(placeholder_render, cursor, at - cursor);
+            spans[i] = {rebuilt.size(), rebuilt.size() + content.size()};
+            rebuilt += content;
+            cursor = at + placeholders[i].size();
+        }
+        rebuilt.append(placeholder_render, cursor, std::string::npos);
+        if (rebuilt == prompt_text) return true;
     }
-    return true;
+    error = "the template does not render message contents verbatim";
+    spans.assign(placeholders.size(), {0, 0});
+    return false;
 }
 
 PFlashTokenSpan pflash_char_span_tokens(
@@ -1787,16 +1806,19 @@ const std::vector<int32_t> & ppp_tool_prefix_source(
 
 // Sampler parameters. When the request omits a value, fall back to the
 // model card's sampling defaults (spec §3.3); when the card doesn't
-// supply one either, use the hard-coded default.
+// supply one either, use the hard-coded default. A greedy card's values
+// apply only to a request that sets a temperature above 0.
 SamplerCfg parse_request_sampler(const json & body,
                                  const SamplingDefaults & defaults) {
     SamplerCfg sampler;
     sampler.temp = body.value(
-        "temperature", defaults.has_temperature ? defaults.temperature : 0.0f);
+        "temperature",
+        defaults.has_temperature && !defaults.greedy ? defaults.temperature : 0.0f);
+    const bool card = !defaults.greedy || sampler.temp > 0.0f;
     sampler.top_p = body.value(
-        "top_p", defaults.has_top_p ? defaults.top_p : 1.0f);
+        "top_p", card && defaults.has_top_p ? defaults.top_p : 1.0f);
     sampler.top_k = body.value(
-        "top_k", defaults.has_top_k ? defaults.top_k : 0);
+        "top_k", card && defaults.has_top_k ? defaults.top_k : 0);
     if (body.contains("seed")) {
         sampler.seed = body["seed"].get<uint64_t>();
         sampler.has_seed = true;
@@ -1806,14 +1828,14 @@ SamplerCfg parse_request_sampler(const json & body,
     sampler.freq_pen = body.value("frequency_penalty", 0.0f);
     sampler.pres_pen = body.value(
         "presence_penalty",
-        defaults.has_presence_penalty ? defaults.presence_penalty : 0.0f);
+        card && defaults.has_presence_penalty ? defaults.presence_penalty : 0.0f);
     // HuggingFace-style multiplicative repetition penalty (also used by
     // vLLM, llama.cpp, etc.). Accepts both "repetition_penalty" and the
     // shorter "rep_pen" for daemon compatibility.
     sampler.rep_pen = body.value(
         "repetition_penalty",
         body.value("rep_pen",
-                   defaults.has_repetition_penalty
+                   card && defaults.has_repetition_penalty
                        ? defaults.repetition_penalty
                        : 1.0f));
     if (body.contains("rep_window")) {
@@ -1827,7 +1849,9 @@ void apply_no_thinking_sampler_defaults(const json & body,
                                         SamplerCfg & sampler) {
     // Mirrors the body-key checks in parse_request_sampler: only backfill a
     // field the request left unset, and only when the card actually
-    // supplied a no-thinking value for it.
+    // supplied a no-thinking value for it. A greedy card backfills only a
+    // request that samples.
+    if (no_thinking.greedy && !(sampler.temp > 0.0f)) return;
     if (no_thinking.has_temperature && !body.contains("temperature")) {
         sampler.temp = no_thinking.temperature;
     }
@@ -2021,15 +2045,17 @@ json build_props_body(const ServerConfig & config,
     // here regardless of what the model card said, which caused gemma4
     // benchmarks to silently run at temp=0 (degenerate-decode collapse)
     // when the model card specifies temp=1.0/top_p=0.95/top_k=64.
+    // A greedy card's values are for requests that sample, not defaults.
     const auto & smp = config.sampler_defaults;
+    const bool card = !smp.greedy;
     json body = {
         {"default_generation_settings", {
             {"n_ctx",          config.max_ctx},
-            {"temperature",    smp.has_temperature        ? smp.temperature        : 0.0f},
-            {"top_p",          smp.has_top_p              ? smp.top_p              : 1.0f},
-            {"top_k",          smp.has_top_k              ? smp.top_k              : 0},
-            {"min_p",          smp.has_min_p              ? smp.min_p              : 0.0f},
-            {"repeat_penalty", smp.has_repetition_penalty ? smp.repetition_penalty : 1.0f},
+            {"temperature",    card && smp.has_temperature        ? smp.temperature        : 0.0f},
+            {"top_p",          card && smp.has_top_p              ? smp.top_p              : 1.0f},
+            {"top_k",          card && smp.has_top_k              ? smp.top_k              : 0},
+            {"min_p",          card && smp.has_min_p              ? smp.min_p              : 0.0f},
+            {"repeat_penalty", card && smp.has_repetition_penalty ? smp.repetition_penalty : 1.0f},
         }},
         {"model_alias", config.model_name},
         {"model_path",  config.model_path},
@@ -2057,6 +2083,7 @@ json build_props_body(const ServerConfig & config,
             {"chunk",           config.chunk},
             {"continuous_batching", {
                 {"admission_coalesce_ms", config.admission_coalesce_ms},
+                {"shared_prefix_wait_min_tokens", config.shared_prefix_wait_min_tokens},
                 {"decode_kv_offload_bytes", config.decode_kv_offload_bytes},
             }},
             // Device placement strings (e.g. "auto:0", "cuda:0"). Empty
@@ -2086,6 +2113,7 @@ json build_props_body(const ServerConfig & config,
             {"model_card_source",       config.model_card_source_label},
             {"default_max_tokens",      config.default_max_tokens},
             {"hard_limit_reply_budget", config.hard_limit_reply_budget},
+            {"thinking_loop_repeats", config.thinking_loop_repeats},
             {"think_max_tokens",        config.think_max_tokens},
             {"effort_tiers", {
                 {"low",    config.effort_tiers.low},
@@ -3731,6 +3759,7 @@ bool HttpServer::parse_common_request_fields(
     // visible reply after thinking.
     req.max_output =
         resolve_max_output_tokens(body, config_.default_max_tokens);
+    req.max_output_from_client = resolve_max_output_tokens(body, 0) > 0;
     // Spec §4.4: clamp request max_tokens to --default-max-tokens.
     if (req.max_output > config_.default_max_tokens) {
         std::fprintf(stderr,
@@ -4098,7 +4127,7 @@ bool HttpServer::validate_request_context(
         !req.images && config_.pflash &&
         drafter_tokenizer_ != nullptr &&
         prompt_tokens >= config_.pflash_threshold;
-    if (!routed && !pflash_will_run) {
+    if (trims_reply(routed, req.max_output_from_client, pflash_will_run)) {
         const int fitted =
             fit_reply_to_context(prompt_tokens, req.max_output, config_.max_ctx);
         if (fitted > 0 && fitted < req.max_output) {
@@ -4286,7 +4315,8 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         std::string image_error;
         const ImagePrepareStatus image_status = backend_.prepare_images(
                 req.prompt_tokens, std::move(encoded_images),
-                uint64_t(std::max(0, config_.max_ctx)), uint64_t(std::max(0, req.max_output)),
+                uint64_t(std::max(0, config_.max_ctx)),
+                uint64_t(image_output_reserve(req.max_output, config_.hard_limit_reply_budget)),
                 req.images, image_error);
         if (image_status != ImagePrepareStatus::ok) {
             // A full image gate is capacity, not a bad request: clients retry 503.
@@ -4434,7 +4464,7 @@ bool create_socket_pair(SocketHandle pair[2]) {
 
 bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * admission,
                                        int & status, std::string & body,
-                                       bool * dropped_tool_call) {
+                                       SocketHandle client_fd, bool * dropped_tool_call) {
     SocketHandle pair[2];
     if (!create_socket_pair(pair)) {
         status = 500;
@@ -4442,6 +4472,9 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
         return true;
     }
     std::string raw;
+#if defined(_WIN32)
+    // Winsock has no poll(); the client-disconnect check stays POSIX-only.
+    (void) client_fd;
     std::thread reader([&raw, in = pair[1]] {
         char buf[65536];
         for (;;) {
@@ -4450,6 +4483,31 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
             else if (n == 0 || !sock_is_eintr(sock_errno())) break;
         }
     });
+#else
+    std::thread reader([&raw, in = pair[1], client_fd] {
+        char buf[65536];
+        for (;;) {
+            // The client leaving ends the inner request too: shutting the pair
+            // down reads as a disconnect to the job waiting on it, which the
+            // scheduler retires instead of generating for nobody.
+            struct pollfd pfd = {in, POLLIN, 0};
+            const int ready = ::poll(&pfd, 1, (int) kClientMonitorInterval.count());
+            if (ready < 0 && sock_is_eintr(sock_errno())) continue;
+            if (ready == 0) {
+                if (client_fd != kInvalidSocket &&
+                    http_detail::inspect_peer_socket(client_fd) ==
+                        http_detail::PeerSocketState::Disconnected) {
+                    ::shutdown(in, SHUT_RDWR);
+                    break;
+                }
+                continue;
+            }
+            const ssize_t n = ::recv(in, buf, sizeof(buf), 0);
+            if (n > 0) raw.append(buf, (size_t) n);
+            else if (n == 0 || !sock_is_eintr(sock_errno())) break;
+        }
+    });
+#endif
     RoutingAdmission outcome = RoutingAdmission::handled;
     try {
         ParsedRequest inner;
@@ -4459,6 +4517,7 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
         parse_endpoint_request("/v1/chat/completions", inner.raw_body, inner, count_only);
         auto dropped = std::make_shared<bool>(false);
         inner.dropped_tool_call_out = dropped;
+        inner.tool_checks_pass = true;
         handle_model_request(pair[0], inner, false, admission ? &outcome : nullptr);
         if (dropped_tool_call) *dropped_tool_call = *dropped;
     } catch (const std::exception & e) {
@@ -4510,7 +4569,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         int status = 0;
         std::string raw;
         bool dropped_here = false;
-        if (!inner_chat_completion(body, nullptr, status, raw, &dropped_here) || status != 200) return false;
+        if (!inner_chat_completion(body, nullptr, status, raw, fd, &dropped_here) || status != 200) return false;
         if (dropped) *dropped = dropped_here;
         response = json::parse(raw, nullptr, false);
         return !response.is_discarded() && tc::reply_message(response) != nullptr;
@@ -4519,7 +4578,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
     int status = 0;
     std::string raw;
     bool dropped_call = false;
-    if (!inner_chat_completion(request, admission, status, raw, &dropped_call)) return true;
+    if (!inner_chat_completion(request, admission, status, raw, fd, &dropped_call)) return true;
     json response = json::parse(raw, nullptr, false);
     json * reply = status == 200 && !response.is_discarded() ? tc::reply_message(response) : nullptr;
     if (!reply) {
@@ -4712,6 +4771,9 @@ TokenDelivery classify_generated_token(
 CompletionTokenCounts feed_non_streaming_tokens(
         const std::vector<int32_t> & tokens, Tokenizer & tokenizer,
         SseEmitter & emitter, int generation_cap) {
+    // The live token callback already classified these tokens on this
+    // emitter; a reply cut off inside a suppressed block left it open.
+    emitter.restart_tool_protocol_suppression();
     for (int32_t token : tokens) {
         std::string text;
         const TokenDelivery delivery =
@@ -5859,20 +5921,30 @@ std::string HttpServer::apply_pflash_compression(
                     // by a cand_v5 probe; any failure falls the request back to today's windows).
                     {
                         auto & all = request_probe_messages;
-                        std::vector<ChatMessage> placeholder_messages = messages;
-                        std::vector<std::string> placeholders(messages.size());
-                        std::vector<std::string> contents(messages.size());
-                        for (size_t index = 0; index < messages.size() && all.all_error.empty(); ++index) {
-                            const std::string & role = messages[index].role;
+                        // The messages in the order the template renders them (DeepSeek sorts each run of tool
+                        // results by call), so the spans ascend; the render itself is unchanged.
+                        std::vector<ChatMessage> ordered = messages;
+                        if (config_.chat_template_src.empty()) {
+                            const std::vector<size_t> order = chat_message_render_order(messages, chat_format_);
+                            for (size_t i = 0; i < order.size(); ++i) ordered[i] = messages[order[i]];
+                        }
+                        std::vector<ChatMessage> placeholder_messages = ordered;
+                        std::vector<std::string> placeholders(ordered.size());
+                        std::vector<std::string> contents(ordered.size());
+                        for (size_t index = 0; index < ordered.size() && all.all_error.empty(); ++index) {
+                            const std::string & role = ordered[index].role;
                             if (role != "system" && role != "user" && role != "assistant" && role != "tool") {
                                 all.all_error = "unsupported message role " + role;
                                 break;
                             }
                             all.all_roles.push_back(role);
-                            contents[index] = messages[index].content;
-                            // An empty content (an assistant turn that only calls tools) has no tokens to map, and
-                            // a placeholder there would change how the template renders the turn.
-                            if (role == "system" || contents[index].empty()) continue;   // never a candidate nor in E
+                            contents[index] = ordered[index].content;
+                            // An empty content (an assistant turn that only calls tools, or only whitespace, which a
+                            // trimming template renders empty) has no tokens to map, and a placeholder there would
+                            // change how the template renders the turn.
+                            if (role == "system" || http_detail::pflash_template_trim(contents[index]).empty()) {
+                                continue;   // never a candidate nor in E
+                            }
                             placeholders[index] = "\x1e" "PFLASH-MESSAGE-" + std::to_string(index) + "\x1f";
                             placeholder_messages[index].content = placeholders[index];
                         }
@@ -7814,7 +7886,11 @@ std::string HttpServer::apply_unified_view(
         std::vector<ChatMessage> placeholder_messages = messages;
         std::vector<std::string> placeholders(messages.size());
         std::vector<std::string> contents(messages.size());
-        for (const auto & c : newest) {
+        for (auto & c : newest) {
+            if (http_detail::pflash_template_trim(messages[c.message].content).empty()) {
+                if (c.skip.empty()) c.skip = "empty";
+                continue;
+            }
             placeholders[c.message] = "\x1e" "PFLASH-UNIFIED-" + std::to_string(c.message) + "\x1f";
             contents[c.message] = messages[c.message].content;
             placeholder_messages[c.message].content = placeholders[c.message];
@@ -7825,6 +7901,8 @@ std::string HttpServer::apply_unified_view(
         if (render_messages_to_text(placeholder_messages, req, /*add_generation_prompt=*/true, rendered, error) &&
             http_detail::pflash_content_char_spans(rendered, placeholders, contents, text, chars, error)) {
             for (auto & c : newest) {
+                // Rendered empty: no placeholder, so no span; it must not pull newest_begin or recall to token 0.
+                if (placeholders[c.message].empty()) continue;
                 c.located = true;
                 c.cb = chars[c.message].first;
                 c.ce = chars[c.message].second;
@@ -10021,10 +10099,19 @@ void HttpServer::remember_agent_turn(
     // Preserve template-injected generation text (for example Qwen's
     // <think> prefix) in tool memory so the next stateless request renders the
     // same token stream as the checkpointed generation.
+    // The turn is the text of the generated tokens, not the emitter's text:
+    // the emitter receives the think markers in their client form (`</think>`
+    // arrives as "</think>\n"), which would add a token to the replayed turn.
+    // The end-of-turn token is not part of it: the template closes the turn.
+    std::vector<int32_t> generated = result.tokens;
+    if (!generated.empty() && (generated.back() == tokenizer_.eos_id() ||
+                               generated.back() == tokenizer_.eos_chat_id())) {
+        generated.pop_back();
+    }
     std::string assistant_content;
     if (!http_detail::canonical_assistant_content(
             req.rendered_prompt, sentinel_rendered, kSentinel,
-            emitter.accumulated_raw(), assistant_content)) {
+            tokenizer_.decode(generated), assistant_content)) {
         return;
     }
     messages.back().content = assistant_content;
@@ -10318,7 +10405,8 @@ void HttpServer::send_nonstream_response(
         const std::vector<int32_t> & gen_tokens, int n_gen_cap,
         bool budget_forced_close, bool degenerate_decode_close,
         const GenTimings & gen_timings,
-        ClientSendBuffer * send_buffer) {
+        ClientSendBuffer * send_buffer,
+        const luce::common::SpecAcceptanceStats * acceptance) {
     CompletionTokenCounts counts;
     counts.total = (int) gen_tokens.size();
     const bool is_eos = !gen_tokens.empty() &&
@@ -10334,6 +10422,10 @@ void HttpServer::send_nonstream_response(
     result.tokens = gen_tokens;
     result.budget_forced_close = budget_forced_close;
     result.degenerate_decode_close = degenerate_decode_close;
+    if (acceptance) {
+        result.spec_decode_ran = acceptance->offered() > 0;
+        result.accept_rate = acceptance->rate();
+    }
 
     const json response = build_non_streaming_response(
         req, result, n_gen_cap, gen_timings, counts, emitter, &tokenizer_);
@@ -10431,7 +10523,9 @@ void HttpServer::process_job(ServerJob * job) {
                        (int)req.prompt_tokens.size(), req.tools,
                        &tool_memory_,
                        req.stop_sequences,
-                       req.started_in_thinking);
+                       req.started_in_thinking,
+                       tool_checks::tool_calls_allowed(req.tool_choice,
+                                                       req.tool_checks_pass));
 
     // Emit initial SSE events only for local generation. The upstream owns
     // the proxied event sequence.
@@ -10789,6 +10883,19 @@ ServerJob * HttpServer::try_dequeue() {
     if (!queue_head_) queue_tail_ = nullptr;
     job->next = nullptr;
     return job;
+}
+
+int HttpServer::queued_shared_prefix(const std::vector<int32_t> & prompt) {
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    size_t best = 0;
+    for (const ServerJob * job = queue_head_; job; job = job->next) {
+        if (job->req.images) continue;
+        const std::vector<int32_t> & other = job->req.prompt_tokens;
+        const size_t n = std::min(prompt.size(), other.size());
+        best = std::max(best, (size_t)(std::mismatch(
+            prompt.begin(), prompt.begin() + n, other.begin()).first - prompt.begin()));
+    }
+    return (int)best;
 }
 
 ServerJob * HttpServer::dequeue_for(

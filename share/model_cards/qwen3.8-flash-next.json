@@ -22,5 +22,16 @@
     "presence_penalty": 1.5,
     "repetition_penalty": 1.0
   },
+  "profiles": {
+    "qwen-next-r9700-strix": {
+      "summary": "Qwen3.8-Flash-Next with dense work, KV cache and the MTP drafter on an R9700 (gfx1201) and the routed experts on Strix Halo (gfx1151), which also keeps some attention layers' KV cache when the R9700 is full; add --expert-placement with the box's routing stats to also run the most-routed experts on the R9700",
+      "gpus": ["gfx1201", "gfx1151"],
+      "flags": {
+        "--target-device": "hip:0",
+        "--expert-device": "hip:1",
+        "--max-ctx": "auto"
+      }
+    }
+  },
   "notes": "Thinking-mode sampling from the model card and generation_config.json. The card allows up to 262,144 reasoning + 131,072 answer tokens; max_tokens stays within lucebox context budgets. The 8,192-token reply reserve covers the visible restatement this model writes after a forced close. The terminator is Qwen's budget-forcing text (QwenLM/Qwen3 quickstart). Unsloth UD and bartowski GGUFs report general.name 'Qwen3.8 Flash Next'. `sampling_no_thinking` is the card's instruct (non-thinking) sampling set, applied to requests whose final thinking state resolves to OFF (e.g. chat_template_kwargs.enable_thinking=false, reasoning.effort=\"none\", thinking.type=\"disabled\")."
 }

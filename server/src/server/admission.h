@@ -30,6 +30,27 @@ inline int fit_reply_to_context(int prompt_tokens, int max_output, int max_ctx)
     return (std::max)(0, (std::min)(max_output, max_ctx - prompt_tokens));
 }
 
+// The reply an image request keeps room for while its images expand. The reply
+// is trimmed afterwards to what the expanded prompt leaves, as a text request's
+// is (fit_reply_to_context), so the images reserve at most the reply budget. The
+// whole reply would leave them no room once a card's default reply nears the
+// context, and refuse every image request without max_tokens once it passes it
+// (DeepSeek V4.1's 262144 against its 204,800-token context).
+inline int image_output_reserve(int max_output, int hard_limit_reply_budget)
+{
+    return (std::max)(0, (std::min)(max_output, hard_limit_reply_budget));
+}
+
+// Whether a request's reply is trimmed to the context its prompt leaves. A
+// routed request keeps a reply its client sized, so the router can send it
+// whole to a model with room for it. A reply the client left to the card's
+// default (DeepSeek V4.1's 262144) may fit no model whole, so it is trimmed as
+// a direct request's is. PFlash makes its own room.
+inline bool trims_reply(bool routed, bool client_sized_reply, bool pflash_will_run)
+{
+    return !pflash_will_run && (!routed || !client_sized_reply);
+}
+
 inline bool should_reject_oversized(int prompt_tokens, int max_output,
                                     int max_ctx, bool compression_enabled)
 {

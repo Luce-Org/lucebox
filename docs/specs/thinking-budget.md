@@ -58,8 +58,9 @@ value, in this order:
 2. **Model card sidecar.** A JSON file at
    `share/model_cards/<name>.json`, where `<name>` is the loaded
    GGUF's `general.name` metadata normalized to lowercase with
-   spaces replaced by `-`. Carries values from the upstream model
-   card (HuggingFace README or `generation_config.json`).
+   spaces replaced by `-`. Carries the defaults Lucebox serves with,
+   starting from the upstream model card (HuggingFace README or
+   `generation_config.json`).
 3. **Per-family fallback table**, built into the C++ server, keyed
    on the detected architecture (e.g. `qwen35`, `gemma4`, `laguna`).
    A coarse safety net for known families when no sidecar is shipped.
@@ -94,9 +95,11 @@ model card sidecar, family fallback, or hard fallback in turn.
 ### 3.3 Model card sidecar
 
 Each known model has a sidecar JSON at
-`share/model_cards/<name>.json`. The file carries values transcribed
-from the upstream model card so future-us can reason about
-provenance:
+`share/model_cards/<name>.json`. The file carries the defaults Lucebox
+serves with, starting from values transcribed from the upstream model
+card. `source` and `verified_at` keep the provenance, and `notes`
+records each value Lucebox sets differently. The card also holds the
+model's launch profiles (`profiles`, see `share/model_cards/README.md`):
 
 ```json
 {
@@ -126,7 +129,9 @@ Fields:
 | `max_tokens` | The card's standard recommended combined cap. Drives `default_max_tokens`. |
 | `complex_problem_max_tokens` | Optional. The card's recommendation for hard reasoning / benchmark workloads. Drives the `x-high` and `max` effort tiers, which sit *above* `default_max_tokens` when this field is present — they are admissible as long as they fit under `max_ctx − hard_limit_reply_budget`. If omitted, both collapse to the `high` tier value. |
 | `hard_limit_reply_budget` | Optional. Tokens reserved post-`</think>` for the visible answer phase, used both to derive `think_max_tokens = max_tokens − hard_limit_reply_budget` and as the force-close trigger inside `do_ar_decode` / `do_spec_decode` (when `n_gen − generated ≤ hard_limit_reply_budget`, the engine overrides the next sampled token with `</think>`). Default 4096 (raised from 512 on 2026-05-25). The original 512 came from `ds4_eval.c`, sized for DeepSeek-V4-flash's terse style, but it silently truncated almost every other model mid-answer — bench results from `server/docs/experiments/gemma4-26b-thinking-control-2026-05-25.md` showed every force-closed thinking probe getting cut off mid-coordinate-geometry-proof at 512. Without priors on a specific model, 4096 is the safer default; terse models should override down. Qwen3.6, Gemma 4 26B, Gemma 4 31B all ship 4096 in their sidecars. |
-| `sampling` | Recommended sampler params. Used as defaults when the request doesn't pin sampler values. |
+| `default_sampling` | Optional. `greedy` or `sampling` (the default). With `greedy`, a request that sets no temperature decodes greedily, and a request that does not sample (no temperature, or 0) gets no penalties whatever the blocks below say; the blocks fill in only for a request that sets a temperature above 0. The cards of the models Lucebox serves (Qwen 3.8 27B, DeepSeek V4.1 Flash) are greedy. |
+| `sampling` | Sampler defaults from the upstream card, used for the fields a request doesn't pin (with `default_sampling: greedy`, only when it samples). |
+| `sampling_no_thinking` | Optional. Same shape as `sampling`, applied instead of it to a request whose final thinking state is off. |
 | `reasoning_effort_tiers` | Explicit phase-1 budgets per tier. Override any computed default. Whichever tiers are present win; missing tiers fall through to the computed defaults below. |
 
 If the sidecar omits `reasoning_effort_tiers`, tier values are

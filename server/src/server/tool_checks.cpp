@@ -213,6 +213,10 @@ bool tools_off(const json & body) {
            tool_choice_is_none(body["tool_choice"]);
 }
 
+bool tool_calls_allowed(const json & tool_choice, bool checks_pass) {
+    return checks_pass || !tool_choice_is_none(tool_choice);
+}
+
 json agent_request(const json & body, const std::string & effort) {
     json request = body;
     request["stream"] = false;

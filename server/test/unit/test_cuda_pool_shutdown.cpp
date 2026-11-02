@@ -49,8 +49,16 @@ void CudaPoolShutdownFixture::exercise_pool_trim(
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     REQUIRE(buffer != nullptr);
 
-    std::vector<uint8_t> weights_data(ggml_nbytes(weights), 0);
-    std::vector<float> input_data((size_t) k, 1.0f);
+    // Distinct values, so an evaluation that reads a stale temporary shows
+    // in the output.
+    std::vector<float> weights_f32((size_t) (k * n));
+    for (size_t i = 0; i < weights_f32.size(); ++i) {
+        weights_f32[i] = (float) ((int) (i % 17) - 8) / 8.0f;
+    }
+    std::vector<uint8_t> weights_data(ggml_nbytes(weights));
+    ggml_quantize_chunk(GGML_TYPE_Q4_0, weights_f32.data(), weights_data.data(), 0, n, k, nullptr);
+    std::vector<float> input_data((size_t) k);
+    for (int64_t i = 0; i < k; ++i) input_data[(size_t) i] = (float) (i % 7) / 7.0f - 0.5f;
     ggml_backend_tensor_set(weights, weights_data.data(), 0, weights_data.size());
     ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
 
@@ -59,10 +67,19 @@ void CudaPoolShutdownFixture::exercise_pool_trim(
         ggml_backend_synchronize(backend);
         return status;
     };
+    auto read_output = [&]() {
+        std::vector<float> values((size_t) n);
+        ggml_backend_tensor_get(output, values.data(), 0, values.size() * sizeof(float));
+        return values;
+    };
 
     // Two stable evaluations warm and capture graph replay when enabled.
     REQUIRE(compute() == GGML_STATUS_SUCCESS);
     REQUIRE(compute() == GGML_STATUS_SUCCESS);
+    const std::vector<float> before = read_output();
+    bool nonzero = false;
+    for (float v : before) nonzero = nonzero || v != 0.0f;
+    REQUIRE(nonzero);
 
     // LUCE_Q8_MEMO intentionally retains a pool allocation after compute.
     // Trimming must first release that memo, then return its cached block to
@@ -80,8 +97,10 @@ void CudaPoolShutdownFixture::exercise_pool_trim(
 
     // A legacy trim must retire graph executables that captured the released
     // memo address. Recomputing the same graph must recapture rather than
-    // replaying a stale pointer. VMM pools safely keep the existing replay.
+    // replaying a stale pointer, and give the same result. VMM pools safely
+    // keep the existing replay.
     REQUIRE(compute() == GGML_STATUS_SUCCESS);
+    REQUIRE(read_output() == before);
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);

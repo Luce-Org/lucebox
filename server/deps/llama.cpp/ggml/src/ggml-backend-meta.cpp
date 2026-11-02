@@ -1719,7 +1719,14 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     bufs.reserve(n_simple_bufts);
     for (size_t i = 0; i < n_simple_bufts; i++) {
         bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
-        GGML_ASSERT(bufs.back() != nullptr);
+        if (bufs.back() == nullptr) {
+            // A device out of memory fails the meta buffer like any other.
+            bufs.pop_back();
+            for (ggml_backend_buffer_t buf : bufs) {
+                ggml_backend_buffer_free(buf);
+            }
+            return nullptr;
+        }
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
@@ -1754,6 +1761,7 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
         ggml_backend_meta_buffer_init_tensor_impl(meta_buf_ctx->stc_static, t);
         t->data = (void *) 0x2000000000000000; // FIXME
     }
+    ggml_context * const meta_ctx = ctx;
     for (size_t i = 0; i < n_simple_bufts; i++) {
         ggml_context * ctx = meta_buf_ctx->stc_static.ctxs[i].get();
         ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
@@ -1775,7 +1783,20 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
                 t->buffer = meta_buf_ctx->bufs[i].get();
             }
         }
-        GGML_ASSERT(meta_buf_ctx->bufs[i]);
+        if (!meta_buf_ctx->bufs[i]) {
+            // A device allocation that fails (out of memory, or a slice
+            // context with nothing to allocate, which
+            // ggml_backend_alloc_ctx_tensors_from_buft also reports as NULL)
+            // fails the meta allocation, as it would for one device. The
+            // meta buffer owns the device buffers allocated so far; the
+            // tensors go back to unallocated so they can be placed elsewhere.
+            ggml_backend_buffer_free(meta_buf);
+            for (ggml_tensor * t = ggml_get_first_tensor(meta_ctx); t != nullptr; t = ggml_get_next_tensor(meta_ctx, t)) {
+                t->buffer = nullptr;
+                t->data   = nullptr;
+            }
+            return nullptr;
+        }
         meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
     }
     return meta_buf;

@@ -94,7 +94,7 @@ launch ([DS41.md](../server/docs/DS41.md#image-input)):
 hf download Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF \
   DeepSeek-V4.1-Flash-1017-mmproj-BF16.gguf --local-dir models
 ./server/build-hip/luce_server models/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf \
-  --profile ds41-gorgon \
+  --profile ds41-r9700-gorgon \
   --draft models/DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf \
   --mmproj models/DeepSeek-V4.1-Flash-1017-mmproj-BF16.gguf
 ```

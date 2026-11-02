@@ -213,7 +213,7 @@ It needs no calibration files.
 the 37 tuning variables of the qualified recipe (`LUCE_EXPERT_BUDGET_MB=14350`,
 `LUCE_DS4_SPEC_Q=5`, `LUCE_DS4_Q5_VERIFY=1`, the `LUCE_DS4_TP_*` join and
 routing switches, and the grouped MMVQ kernels; the full list is in
-`src/server/launch_profiles.h`). Flags on the command line replace the
+`share/model_cards/deepseek-v4-flash-0731-rocmfpx.json`). Flags on the command line replace the
 profile's value, and variables already set in the environment keep theirs;
 the startup log names each one it kept. The profile's `--expert-device` is a
 flag like any other, so it sets the `LUCE_DS4_MOE_TP*` variables below; pass

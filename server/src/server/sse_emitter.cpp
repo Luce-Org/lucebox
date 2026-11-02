@@ -133,12 +133,14 @@ SseEmitter::SseEmitter(ApiFormat format,
                        const json & tools,
                        ToolMemory * tool_memory,
                        const std::vector<std::string> & stop_sequences,
-                       bool started_in_thinking)
+                       bool started_in_thinking,
+                       bool tool_calls_allowed)
     : format_(format)
     , request_id_(request_id)
     , model_name_(model_name)
     , prompt_tokens_(prompt_tokens)
     , tools_(tools)
+    , tool_calls_allowed_(tool_calls_allowed)
     , tool_memory_(tool_memory)
     , mode_(started_in_thinking ? StreamMode::REASONING : StreamMode::CONTENT)
     , active_kind_(started_in_thinking ? "thinking" : "text")
@@ -154,7 +156,7 @@ SseEmitter::SseEmitter(ApiFormat format,
 
 bool SseEmitter::suppress_undeclared_tool_protocol_token(
         const std::string & raw_token) {
-    if (has_request_tools(tools_)) return false;
+    if (tool_calls_allowed_ && has_request_tools(tools_)) return false;
 
     if (raw_token == "<tool_call>") {
         suppress_undeclared_tool_protocol_ = true;
@@ -605,6 +607,33 @@ void SseEmitter::emit_content_delta(std::vector<std::string> & out,
 
 // ─── Reasoning delta emission (format-specific) ─────────────────────────
 
+void SseEmitter::emit_tool_buffer_text(std::vector<std::string> & out,
+                                       const std::string & text) {
+    if (text.empty()) return;
+    size_t think_close = text.find(THINK_CLOSE);
+    if (think_close != std::string::npos) {
+        std::string reasoning = text.substr(0, think_close);
+        std::string content = text.substr(think_close + THINK_CLOSE_LEN);
+        if (first_content_token_index_ == -1) {
+            first_content_token_index_ = content.empty() ? emit_token_count_ : std::max(0, emit_token_count_ - 1);
+        }
+        if (!reasoning.empty()) {
+            reasoning_text_ += reasoning;
+            emit_reasoning_delta(out, reasoning);
+        }
+        if (!content.empty()) {
+            accumulated_content_ += content;
+            emit_content_delta(out, content);
+        }
+    } else if (tool_from_reasoning_) {
+        reasoning_text_ += text;
+        emit_reasoning_delta(out, text);
+    } else {
+        accumulated_content_ += text;
+        emit_content_delta(out, text);
+    }
+}
+
 void SseEmitter::emit_reasoning_delta(std::vector<std::string> & out,
                                       const std::string & text) {
     if (text.empty()) return;
@@ -770,13 +799,14 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         // detokenizer removed, and with no <arg_key> there is no trigger).
         // Only accept a tool-only content section: matching the final word of
         // ordinary prose would turn text such as "I cannot read" into a call.
+        // Under tool_choice "none" the bare name stays the answer.
         bool zero_arg_call = false;
         const char * ws = " \t\r\n";
         const bool prior_content_is_whitespace =
             accumulated_content_.find_first_not_of(ws) == std::string::npos;
         const size_t name_start = window_.find_first_not_of(ws);
-        if (has_request_tools(tools_) && prior_content_is_whitespace &&
-            name_start != std::string::npos) {
+        if (tool_calls_allowed_ && has_request_tools(tools_) &&
+            prior_content_is_whitespace && name_start != std::string::npos) {
             const size_t name_end = window_.find_last_not_of(ws);
             const std::string candidate =
                 window_.substr(name_start, name_end - name_start + 1);
@@ -811,9 +841,14 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
     std::string fr = "stop";
     if (mode_ == StreamMode::TOOL_BUFFER && !tool_buffer_.empty()) {
         auto parsed = parse_tool_calls(tool_buffer_, tools_);
-        tool_calls_ = std::move(parsed.tool_calls);
+        // Under tool_choice "none" a call the model makes anyway is dropped:
+        // the text around it is the answer and the finish reason stays stop.
+        const bool drop_calls = !tool_calls_allowed_ && !parsed.tool_calls.empty();
+        if (!drop_calls) tool_calls_ = std::move(parsed.tool_calls);
 
-        if (!tool_calls_.empty()) {
+        if (drop_calls) {
+            emit_tool_buffer_text(out, parsed.cleaned_text);
+        } else if (!tool_calls_.empty()) {
             static const bool log_tools = []() {
                 const char * e = std::getenv("LUCE_LOG_TOOL_CALLS");
                 if (!e || !*e) return false;
@@ -844,32 +879,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                 tool_memory_->remember(ids, accumulated_raw_);
             }
 
-            // Emit any cleaned text from the tool buffer
-            if (!parsed.cleaned_text.empty()) {
-                size_t think_close = parsed.cleaned_text.find(THINK_CLOSE);
-                if (think_close != std::string::npos) {
-                    std::string reasoning = parsed.cleaned_text.substr(0, think_close);
-                    std::string content = parsed.cleaned_text.substr(think_close + THINK_CLOSE_LEN);
-                    if (first_content_token_index_ == -1) {
-                        first_content_token_index_ = content.empty() ? emit_token_count_ : std::max(0, emit_token_count_ - 1);
-                    }
-                    if (!reasoning.empty()) {
-                        reasoning_text_ += reasoning;
-                        emit_reasoning_delta(out, reasoning);
-                    }
-                    if (!content.empty()) {
-                        accumulated_content_ += content;
-                        emit_content_delta(out, content);
-                    }
-                } else if (tool_from_reasoning_) {
-                    reasoning_text_ += parsed.cleaned_text;
-                    emit_reasoning_delta(out, parsed.cleaned_text);
-                } else {
-                    accumulated_content_ += parsed.cleaned_text;
-                    emit_content_delta(out, parsed.cleaned_text);
-                }
-            }
-
+            emit_tool_buffer_text(out, parsed.cleaned_text);
             fr = "tool_calls";
 
             // Format-specific tool call events

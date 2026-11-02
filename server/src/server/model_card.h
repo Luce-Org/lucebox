@@ -46,6 +46,12 @@ struct SamplingDefaults {
     bool  has_min_p              = false;
     bool  has_presence_penalty   = false;
     bool  has_repetition_penalty = false;
+
+    // The card's `default_sampling` is "greedy": a request that sets no
+    // temperature decodes greedily, and one that does not sample (no
+    // temperature, or 0) gets no penalties. The values above fill in only
+    // for a request that samples (temperature > 0).
+    bool  greedy = false;
 };
 
 // Resolved model card. `source_label` is a short, operator-facing tag
@@ -108,6 +114,11 @@ struct ModelCard {
 // "Qwen3.6 27B" -> "qwen3.6-27b". Lowercases, replaces spaces with `-`,
 // strips characters outside `[a-z0-9.-]`. Exposed for tests/banner.
 std::string normalize_model_card_stem(const std::string & general_name);
+
+// The share/model_cards/ directory: `repo_root_hint`/share/model_cards, then
+// $LUCE_MODEL_CARDS_DIR, then next to the binary (install and build trees),
+// then under the working directory. Empty when none exists.
+std::string find_model_cards_dir(const std::string & repo_root_hint = "", bool log = true);
 
 // Resolve the model card for the loaded GGUF.
 //

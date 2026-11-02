@@ -522,4 +522,61 @@ TEST_CASE(BudgetHookFixture, spec_matches_ar_rule) {
     REQUIRE(forced_seeds > 0);
 }
 
+// Thinking that writes one span loop_repeats times is looping; the close
+// waits for the decoder to arm it, then replaces the next token as the hard
+// limit would.
+TEST_CASE(BudgetHookFixture, a_thinking_loop_closes_once_armed) {
+    auto hook = make_hook(kClose3, kMarker, 2);
+    hook.loop_span = 4;
+    hook.loop_repeats = 3;
+    ThinkingBudget budget(hook, 1000);
+    // A draft, rewritten with a change between copies: the 4-token span
+    // 7 8 9 10 appears a second time, not a third.
+    for (int32_t token : {7, 8, 9, 10, 20, 7, 8, 9, 10, 21, 7, 8, 9}) {
+        expect_step(budget, token, token, false);
+    }
+    REQUIRE(!budget.looping());
+    REQUIRE(!budget.needs_ar_tail(4));
+    expect_step(budget, 10, 10, false);
+    REQUIRE(budget.looping());
+    // Bursts stop; tokens pass through until the close is armed.
+    REQUIRE(budget.needs_ar_tail(4));
+    expect_step(budget, 22, 22, false);
+    budget.arm_loop_close();
+    expect_step(budget, 23, 101, true);
+    expect_step(budget, 24, 102, true);
+    expect_step(budget, 103, 103, false);
+    REQUIRE(budget.forced_close());
+    REQUIRE(budget.settled());
+    REQUIRE(!budget.looping());
+}
+
+TEST_CASE(BudgetHookFixture, thinking_that_varies_or_closes_is_no_loop) {
+    auto hook = make_hook(kClose3, kMarker, 2);
+    hook.loop_span = 4;
+    hook.loop_repeats = 3;
+    // A phrase repeated with something new inside every copy.
+    ThinkingBudget varied(hook, 1000);
+    for (int32_t round = 0; round < 50; ++round) {
+        for (int32_t token : {7, 8, 200 + round, 9}) {
+            expect_step(varied, token, token, false);
+        }
+    }
+    REQUIRE(!varied.looping());
+    // Disabled: an exact loop never counts.
+    auto off = make_hook(kClose3, kMarker, 2);
+    ThinkingBudget disabled(off, 1000);
+    for (int i = 0; i < 100; ++i) expect_step(disabled, 7, 7, false);
+    REQUIRE(!disabled.looping());
+    // A loop that ends in the model's own close is settled.
+    ThinkingBudget closed(hook, 1000);
+    for (int i = 0; i < 10; ++i) expect_step(closed, 7, 7, false);
+    REQUIRE(closed.looping());
+    expect_step(closed, 103, 103, false);
+    REQUIRE(closed.naturally_closed());
+    REQUIRE(!closed.looping());
+    closed.arm_loop_close();
+    expect_step(closed, 7, 7, false);
+}
+
 }  // namespace BudgetHookTests

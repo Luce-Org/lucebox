@@ -18,6 +18,7 @@
 #include "common/model_backend.h"
 #include "common/concurrency/paged_kv_offload.h"
 #include "common/output_constraint.h"
+#include "common/spec_acceptance.h"
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
@@ -50,6 +51,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #if !defined(_WIN32)
 #include <unistd.h>
@@ -239,6 +241,20 @@ struct ServerConfig {
     // Idle-to-busy batching window. It is ignored by single-slot engines and
     // never delays an already decoding request.
     int admission_coalesce_ms = 20;
+    // A request whose prompt starts with the prefix another admitted request
+    // is about to checkpoint waits for that checkpoint instead of prefilling
+    // the same tokens beside it (an agent's subagents share their system
+    // prompt and tools). Only a prefix this many tokens past what the request
+    // can already restore is worth the wait; zero turns the wait off.
+    int shared_prefix_wait_min_tokens = 512;
+    // Under continuous batching, thinking that has written one 64-token span
+    // this many times is going round in circles (BudgetHook::loop_repeats)
+    // and is closed like an exhausted thinking budget: greedy decoding
+    // otherwise rewrites the same draft until the budget runs out. The
+    // single-slot decoders do not read it. Off (zero) by default: like vLLM
+    // and SGLang, the server does not rewrite what the model generates
+    // unless asked to.
+    int thinking_loop_repeats = 0;
     // Auto resolves after all models load, before workers start. Zero disables.
     size_t decode_kv_offload_bytes = luce::common::kAutoKvOffloadBytes;
 
@@ -588,9 +604,13 @@ PflashChatTurnSpan pflash_chat_query_turn(
 // does not map that way -- the caller then maps by sentinel renders.
 // cand_v4 / stage 2 (STAGE2-CONTRACT.md section 1): the character span of every message's exact content in
 // ``prompt_text``, from ``placeholder_render`` -- a render of the same messages with content i replaced by
-// ``placeholders[i]`` ("" = left as is). Each non-empty placeholder must occur exactly once, in message order, and
-// putting the contents back must give ``prompt_text`` byte for byte (a template that rewrites content fails).
-// ``spans[i]`` = {begin, end} characters ({0, 0} for a message left as is). False + ``error`` otherwise.
+// ``placeholders[i]`` ("" = left as is). Each non-empty placeholder must occur exactly once (in any order: DeepSeek
+// renders tool results in call order), and
+// putting the contents back -- verbatim, or all trimmed as by a template's ``|trim`` -- must give ``prompt_text``
+// byte for byte (a template that rewrites content otherwise fails). ``spans[i]`` = {begin, end} characters of the
+// content as rendered ({0, 0} for a message left as is). False + ``error`` otherwise.
+// ``text`` without the leading and trailing whitespace a chat template's ``|trim`` removes (C isspace).
+std::string_view pflash_template_trim(std::string_view text);
 bool pflash_content_char_spans(
     const std::string & placeholder_render,
     const std::vector<std::string> & placeholders,
@@ -795,6 +815,7 @@ struct ParsedRequest {
     ImagePromptHandle         images;
     std::string               rendered_prompt;
     int                       max_output   = 4096;
+    bool                      max_output_from_client = false;  // else the card's default
     bool                      stream       = true;
     SamplerCfg                sampler;
     std::string               model;
@@ -807,6 +828,9 @@ struct ParsedRequest {
     // A shared target, because the worker that builds the response owns a
     // copy of this request.
     std::shared_ptr<bool>     dropped_tool_call_out;
+    // A tool-checks pass (tool_checks.h): its reply keeps the tool calls the
+    // model makes under tool_choice "none", so the checks can retry.
+    bool                      tool_checks_pass = false;
     // Original messages (for response formatting)
     json                      messages;
     // Original request body (for upstream proxy forwarding)
@@ -889,7 +913,9 @@ size_t auto_concurrent_prefix_budget(size_t per_checkpoint, int slots, size_t me
 PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
                                               const ModelBackend & backend);
 
-// Parse request sampler fields, applying model-card defaults where present.
+// Parse request sampler fields, applying model-card defaults where present
+// (a greedy card's defaults apply only to a request that sets a temperature
+// above 0).
 SamplerCfg parse_request_sampler(const json & body,
                                  const SamplingDefaults & defaults);
 
@@ -1000,10 +1026,14 @@ private:
                                 RoutingAdmission * admission);
     // One inner non-streaming chat completion. False when the router's
     // admission turned it away (nothing was sent); otherwise `status` and
-    // `body` hold the HTTP response.
-    bool inner_chat_completion(const json & request, RoutingAdmission * admission,
-                               int & status, std::string & body,
-                               bool * dropped_tool_call = nullptr);
+     // `body` hold the HTTP response. When `client_fd` disconnects, the inner
+     // request ends as a disconnected request does, freeing its slot. A reply
+     // that dropped unparseable tool-call syntax reports it through
+     // `dropped_tool_call` so the checks can re-ask once.
+     bool inner_chat_completion(const json & request, RoutingAdmission * admission,
+                                int & status, std::string & body,
+                                SocketHandle client_fd = kInvalidSocket,
+                                bool * dropped_tool_call = nullptr);
     json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the
@@ -1239,6 +1269,8 @@ private:
 
     // Non-blocking dequeue used for admission polling between decode steps.
     ServerJob * try_dequeue();
+    // The longest prefix `prompt` shares with a job still in the queue.
+    int queued_shared_prefix(const std::vector<int32_t> & prompt);
     // Bounded wait used only during an idle-to-busy admission window.
     ServerJob * dequeue_for(
         std::chrono::steady_clock::duration timeout);
@@ -1254,7 +1286,8 @@ private:
         const std::vector<int32_t> & gen_tokens, int n_gen_cap,
         bool budget_forced_close, bool degenerate_decode_close,
         const GenTimings & gen_timings,
-        ClientSendBuffer * send_buffer = nullptr);
+        ClientSendBuffer * send_buffer = nullptr,
+        const luce::common::SpecAcceptanceStats * acceptance = nullptr);
     std::string format_http_response(
         int status, const std::string & content_type,
         const std::string & body);
