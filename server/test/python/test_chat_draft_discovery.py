@@ -3,9 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import io
 
-
-CHAT_PATH = Path(__file__).resolve().parents[1] / "examples" / "chat.py"
+CHAT_PATH = Path(__file__).resolve().parents[2] / "examples" / "chat.py"
 SPEC = importlib.util.spec_from_file_location("chat_example", CHAT_PATH)
 chat = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(chat)
@@ -74,6 +74,36 @@ class DraftDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "no DFlash draft"):
             self.resolve(root=self.root / "missing")
 
+    def test_warns_when_target_version_has_no_match(self):
+        draft = self.create_file("dflash-draft-3.5-q4_k_m.gguf")
+        with patch.object(chat.sys, "stderr", new_callable=io.StringIO) as output:
+            self.assertEqual(self.resolve(), draft)
+
+        self.assertIn("no draft filename matches Qwen3.6", output.getvalue())
+        self.assertIn(str(draft), output.getvalue())
+
+    def test_warns_when_multiple_candidates_remain(self):
+        draft = self.create_file("dflash-draft-3.6-bf16.gguf")
+        self.create_file("dflash-draft-3.6-q4_k_m.gguf")
+        with patch.object(chat.sys, "stderr", new_callable=io.StringIO) as output:
+            self.assertEqual(self.resolve(), draft)
+
+        self.assertIn("multiple draft files found", output.getvalue())
+        self.assertIn(str(draft), output.getvalue())
+
+    def test_single_matching_draft_has_no_warning(self):
+        draft = self.create_file("dflash-draft-3.6-q4_k_m.gguf")
+        with patch.object(chat.sys, "stderr", new_callable=io.StringIO) as output:
+            self.assertEqual(self.resolve(), draft)
+
+        self.assertEqual(output.getvalue(), "")
+
+    def test_safetensors_fallback_has_no_version_warning(self):
+        draft = self.create_file("model.safetensors")
+        with patch.object(chat.sys, "stderr", new_callable=io.StringIO) as output:
+            self.assertEqual(self.resolve(), draft)
+
+        self.assertEqual(output.getvalue(), "")
 
 if __name__ == "__main__":
     unittest.main()

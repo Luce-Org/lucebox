@@ -55,6 +55,20 @@ def resolve_draft() -> Path:
                     ]
                     if preferred:
                         matches = preferred
+                    elif pattern != "model.safetensors":
+                        print(
+                            f"[chat.py] no draft filename matches Qwen{version}; "
+                            f"using {matches[0]}",
+                            file=sys.stderr,
+                        )
+
+                if len(matches) > 1:
+                    print(
+                        f"[chat.py] multiple draft files found; "
+                        f"using {matches[0]}",
+                        file=sys.stderr,
+                    )
+
 
                 return matches[0]
 
