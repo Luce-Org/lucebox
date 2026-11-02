@@ -319,7 +319,14 @@ protected:
     std::vector<uint8_t>    kvflash_exact_buf_;              // pageable fallback for the bulk D2H copy of the pool K
     ggml_backend_buffer_t   kvflash_exact_pin_ = nullptr;    // pinned host buffer for it, reused across reselects
     bool                    kvflash_exact_pin_failed_ = false;
+    // LUCE_KVFLASH_PREAMBLE_ROWS: pool capacity added on top of LUCE_KVFLASH for the pinned
+    // system+tools preamble (tokens, chunk multiple); kvflash_preamble_rows_ = R clamped to it. 0 = off.
+    int                     kvflash_preamble_reserve_ = 0;
+    int                     kvflash_preamble_rows_ = 0;
+    int                     kvflash_preamble_end_ = 0;       // preamble end of the current request's prompt
+    // Pins the preamble chunks (ids: the full prompt, null = reuse the last end). Returns the chunks pinned.
     void kvflash_uq_append(std::vector<const float *> & qs, int sealed, size_t qsize, size_t n_v2);
+    int  kvflash_apply_preamble_pin(const std::vector<int32_t> * ids, bool log);
     // LUCE_KVFLASH_UQ_QUERIES: the latest human question's last N queries, kept next to kvflash_history_.
     int                     kvflash_uq_queries_ = 0;
     std::vector<luce::common::KvFlashUqStore> kvflash_uq_stores_;   // LRU (front = newest), keyed by {hi, hash ids[0,hi)}
