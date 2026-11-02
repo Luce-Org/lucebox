@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
 """Regression tests for file descriptor lifecycle and subprocess cleanup in chat.py stream_generate."""
 
 import errno
 import importlib.util
+import multiprocessing as mp
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,78 @@ CHAT_PATH = Path(__file__).resolve().parents[2] / "examples" / "chat.py"
 SPEC = importlib.util.spec_from_file_location("chat_example", CHAT_PATH)
 chat = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(chat)
+
+
+def _run_with_process_group_timeout(fn, timeout_s=5.0):
+    """Run fn in a dedicated worker process inside its own process group.
+
+    If fn blocks (e.g. on pipe buffer deadlock), the entire process group
+    is terminated with SIGKILL and the worker process is reaped, preventing
+    deadlocks from hanging test runs while ensuring no orphaned processes remain.
+    """
+    ctx = mp.get_context("fork")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+
+    def _worker():
+        parent_conn.close()
+        os.setpgrp()
+        try:
+            res = fn()
+            child_conn.send(("ok", res))
+        except BaseException as e:
+            try:
+                child_conn.send(("err", e))
+            except Exception:
+                try:
+                    child_conn.send(("err", RuntimeError(repr(e))))
+                except Exception:
+                    pass
+        finally:
+            child_conn.close()
+
+    worker = ctx.Process(target=_worker)
+
+    def _terminate_worker():
+        if worker.is_alive():
+            if worker.pid is not None:
+                try:
+                    os.killpg(worker.pid, signal.SIGKILL)
+                except OSError:
+                    if worker.is_alive():
+                        try:
+                            worker.kill()
+                        except (ProcessLookupError, OSError):
+                            pass
+                    try:
+                        os.killpg(worker.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+            worker.join()
+
+    try:
+        try:
+            worker.start()
+        finally:
+            child_conn.close()
+
+        has_data = parent_conn.poll(timeout_s)
+        if not has_data:
+            _terminate_worker()
+            return "timed_out", None
+
+        try:
+            status, payload = parent_conn.recv()
+        except EOFError:
+            worker.join()
+            return "crashed", None
+
+        worker.join(timeout=1.0)
+        _terminate_worker()
+
+        return status, payload
+    finally:
+        parent_conn.close()
+        _terminate_worker()
 
 
 class MockTokenizer:
@@ -144,6 +217,14 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
             os.fstat(r)
         self.assertEqual(ctx.exception.errno, errno.EBADF)
 
+        # Child process must have been reaped by stream_generate
+        self.assertEqual(len(self.allocated_procs), 1)
+        proc = self.allocated_procs[0]
+        self.assertIsNotNone(
+            proc.returncode,
+            "Child process was not reaped by stream_generate",
+        )
+
     def test_early_termination_on_stop_token_closes_read_descriptor(self):
         # 999 is stop token; child also emits 30 afterwards
         result = self._call_stream_generate(tokens="10,999,30", stop_ids={999})
@@ -156,11 +237,13 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
             os.fstat(r)
         self.assertEqual(ctx.exception.errno, errno.EBADF)
 
-        # Verify child process was reaped by proc.wait(), not left as a zombie
+        # Verify child process was reaped by stream_generate before any poll() call
         self.assertEqual(len(self.allocated_procs), 1)
         proc = self.allocated_procs[0]
-        self.assertIsNotNone(proc.poll(), "Child process was not reaped after early stop")
-        self.assertIsInstance(proc.returncode, int)
+        self.assertIsNotNone(
+            proc.returncode,
+            "Child process was not reaped by stream_generate",
+        )
 
     def test_exception_during_reading_closes_read_descriptor(self):
         tok = MockTokenizer(raise_on_id=20)
@@ -174,11 +257,13 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
             os.fstat(r)
         self.assertEqual(ctx.exception.errno, errno.EBADF)
 
-        # Child process must also be reaped on exception
+        # Child process must also be reaped by stream_generate on exception
         self.assertEqual(len(self.allocated_procs), 1)
         proc = self.allocated_procs[0]
-        self.assertIsNotNone(proc.poll(), "Child process was not reaped after exception")
-        self.assertIsInstance(proc.returncode, int)
+        self.assertIsNotNone(
+            proc.returncode,
+            "Child process was not reaped by stream_generate",
+        )
 
     def test_repeated_invocations_do_not_leak_descriptors(self):
         proc_fd_dir = Path("/proc/self/fd")
@@ -203,7 +288,10 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
         self.assertEqual(len(self.allocated_pipes), 5)
         self.assertEqual(len(self.allocated_procs), 5)
         for proc in self.allocated_procs:
-            self.assertIsNotNone(proc.poll())
+            self.assertIsNotNone(
+                proc.returncode,
+                "Child process was not reaped by stream_generate",
+            )
             self.assertIsNone(proc.stderr, "stderr should be DEVNULL, not an open PIPE")
 
         if has_proc_fd:
@@ -216,27 +304,53 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
             )
 
     def test_child_producing_substantial_stderr_does_not_deadlock(self):
-        # 128 KiB exceeds standard 64 KiB OS pipe buffers; deadlocks if stderr were an unread PIPE
-        env = os.environ.copy()
-        env["MOCK_STDERR_BYTES"] = "131072"
-        env["MOCK_TOKENS"] = "1,2,3"
-        with patch.dict(os.environ, env):
-            result = chat.stream_generate(
-                tok=MockTokenizer(),
-                bin_path=Path(sys.executable),
-                target=self.mock_script,
-                draft=self.draft,
-                prompt_bin=self.prompt_bin,
-                n_gen=10,
-                budget=16,
-                stop_ids=set(),
-            )
-        self.assertEqual(result, "[1][2][3]")
-        self.assertEqual(len(self.allocated_procs), 1)
-        proc = self.allocated_procs[0]
-        # Verify stderr was redirected to DEVNULL, not captured as an open pipe
-        self.assertIsNone(proc.stderr)
-        self.assertIsNotNone(proc.poll())
+        # 128 KiB exceeds standard 64 KiB OS pipe buffers; deadlocks if stderr were an unread PIPE.
+        # Run inside a process group with a 5.0s timeout to guarantee bounded execution and
+        # clean teardown if a deadlock were to occur.
+        def run_target():
+            env = os.environ.copy()
+            env["MOCK_STDERR_BYTES"] = "131072"
+            env["MOCK_TOKENS"] = "1,2,3"
+            orig_popen = subprocess.Popen
+            captured = []
+
+            def tracked_popen(*args, **kwargs):
+                p = orig_popen(*args, **kwargs)
+                captured.append(p)
+                return p
+
+            with patch.object(subprocess, "Popen", side_effect=tracked_popen):
+                with patch.dict(os.environ, env):
+                    result = chat.stream_generate(
+                        tok=MockTokenizer(),
+                        bin_path=Path(sys.executable),
+                        target=self.mock_script,
+                        draft=self.draft,
+                        prompt_bin=self.prompt_bin,
+                        n_gen=10,
+                        budget=16,
+                        stop_ids=set(),
+                    )
+            proc = captured[0] if captured else None
+            return {
+                "result": result,
+                "stderr_is_none": proc.stderr is None if proc else False,
+                "returncode": proc.returncode if proc else None,
+            }
+
+        status, payload = _run_with_process_group_timeout(run_target, timeout_s=5.0)
+        self.assertNotEqual(
+            status,
+            "timed_out",
+            "stream_generate deadlocked when child produced substantial stderr output",
+        )
+        self.assertEqual(status, "ok")
+        self.assertEqual(payload["result"], "[1][2][3]")
+        self.assertTrue(payload["stderr_is_none"], "stderr was not DEVNULL")
+        self.assertIsNotNone(
+            payload["returncode"],
+            "Child process was not reaped by stream_generate",
+        )
 
     def test_process_launch_failure_cleans_up_both_descriptors(self):
         nonexistent_bin = self.root / "nonexistent_binary_xyz"
@@ -260,7 +374,3 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
         with self.assertRaises(OSError) as ctx_w:
             os.fstat(w)
         self.assertEqual(ctx_w.exception.errno, errno.EBADF)
-
-
-if __name__ == "__main__":
-    unittest.main()
