@@ -70,6 +70,7 @@ typedef long ssize_t;
 #define MSG_NOSIGNAL   0
 #define MSG_DONTWAIT   0
 #define SHUT_RDWR      SD_BOTH
+#define SHUT_WR        SD_SEND
 #define socklen_t      int
 #define poll(fds,nfds,timeout)  WSAPoll(fds,nfds,timeout)
 // Replace fcntl(F_GETFL) / fcntl(F_SETFL, O_NONBLOCK) with ioctlsocket
@@ -4390,11 +4391,7 @@ private:
 namespace {
 
 // shutdown() half-close that means "no more sending" on each platform.
-#if defined(_WIN32)
-constexpr int kShutdownWrite = SD_SEND;
-#else
 constexpr int kShutdownWrite = SHUT_WR;
-#endif
 
 // A connected, blocking socket pair for an in-process round trip. POSIX has
 // socketpair(2); Windows does not, so a loopback listener stands in: the
@@ -4472,18 +4469,6 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
         return true;
     }
     std::string raw;
-#if defined(_WIN32)
-    // Winsock has no poll(); the client-disconnect check stays POSIX-only.
-    (void) client_fd;
-    std::thread reader([&raw, in = pair[1]] {
-        char buf[65536];
-        for (;;) {
-            const ssize_t n = ::recv(in, buf, sizeof(buf), 0);
-            if (n > 0) raw.append(buf, (size_t) n);
-            else if (n == 0 || !sock_is_eintr(sock_errno())) break;
-        }
-    });
-#else
     std::thread reader([&raw, in = pair[1], client_fd] {
         char buf[65536];
         for (;;) {
@@ -4507,7 +4492,6 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
             else if (n == 0 || !sock_is_eintr(sock_errno())) break;
         }
     });
-#endif
     RoutingAdmission outcome = RoutingAdmission::handled;
     try {
         ParsedRequest inner;
