@@ -36,6 +36,12 @@ struct Qwen35DaemonArgs {
     bool         use_feature_mirror = false;
 };
 
+// The daemon takes the pool size from LUCE_KVFLASH only. Returns 2 (after a
+// one-line stderr message) for the combinations luce_server refuses at startup,
+// --ddtree with KVFlash and LUCE_MIN_TOKENS with a draft model and KVFlash, and
+// 0 otherwise. Both daemons call it before init.
+int qwen35_daemon_kvflash_gate(const Qwen35DaemonArgs & args);
+
 // Run the qwen35 daemon loop. Returns 0 on clean exit, 1 on init failure.
 int run_qwen35_daemon(const Qwen35DaemonArgs & args);
 
