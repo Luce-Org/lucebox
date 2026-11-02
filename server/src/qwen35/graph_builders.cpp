@@ -1034,10 +1034,11 @@ bool build_ar_step_with_inputs(
     const float * embed,
     int n_embd,
     int32_t rope_pos) {
+    if (!build()) return false;
     ggml_backend_tensor_set(sg.inp_embed, embed, 0, sizeof(float) * (size_t)n_embd);
     const int32_t pos4[4] = {rope_pos, rope_pos, rope_pos, 0};
     ggml_backend_tensor_set(sg.positions, pos4, 0, sizeof(int32_t) * 4);
-    return build();
+    return true;
 }
 
 }  // namespace luce::common
