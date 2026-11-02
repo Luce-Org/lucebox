@@ -190,6 +190,21 @@ public:
                               const std::vector<int32_t> & prompt,
                               const SamplerCfg & sampler) = 0;
 
+    // Cold admission with the generation bound the scheduler has already
+    // clamped (at most max_context - prompt + 1), for an engine that reserves
+    // capacity for the whole request. `meta` carries the request's session
+    // identity (empty when the client sent none). The default ignores both.
+    // Image and prefix-store admissions carry neither.
+    struct AdmitMeta { std::string sid, client; };
+    virtual AdmitResult admit_bounded(uint64_t request_id,
+                                      const std::vector<int32_t> & prompt,
+                                      const SamplerCfg & sampler,
+                                      int max_new_tokens,
+                                      const AdmitMeta & meta = {}) {
+        (void) max_new_tokens; (void) meta;
+        return admit(request_id, prompt, sampler);
+    }
+
     // Image requests. The engine keeps the payload with the slot for as long
     // as the slot lives, so a re-prefill after eviction sees the images again.
     // Engines without image support refuse; the server only routes images to

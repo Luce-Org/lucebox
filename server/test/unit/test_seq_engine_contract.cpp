@@ -251,6 +251,19 @@ static bool mentions(const std::vector<std::string> & violations,
 
 int main() {
     {
+        // The default admit_bounded ignores the bound and the meta and admits like admit().
+        FakeSeqEngine engine(1);
+        const auto result = engine.admit_bounded(
+            1, std::vector<int32_t>{1, 2, 3}, SamplerCfg{}, /*max_new_tokens=*/5,
+            SeqEngine::AdmitMeta{"sid", "client"});
+        CHECK(result.status == SeqEngine::AdmitResult::Status::admitted);
+        engine.retire(result.slot);
+        const auto invalid = engine.admit_bounded(
+            2, std::vector<int32_t>{}, SamplerCfg{}, 5);
+        CHECK(invalid.status != SeqEngine::AdmitResult::Status::admitted);
+    }
+
+    {
         FakeSeqEngine engine(1);
         PrefixStorePlan plan;
         plan.restore = {3, 8};
