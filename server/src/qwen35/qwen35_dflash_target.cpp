@@ -417,6 +417,7 @@ bool Qwen35DFlashTarget::verify_batch(
         int & last_tok,
         std::vector<int32_t> * all_argmax,
         bool capture_ssm_intermediates) {
+    verify_pool_exhausted_ = false;
     const int n_tokens = (int)tokens.size();
     if (n_tokens <= 0) return false;
 
@@ -428,20 +429,26 @@ bool Qwen35DFlashTarget::verify_batch(
     // a chunk boundary; protections keep sinks + the tail window safe).
     std::vector<int> slots;
     if (pool) {
-        slots.resize(n_tokens);
-        for (int i = 0; i < n_tokens; i++) {
-            slots[i] = pager_->slot_for(base_pos + i);
-            if (slots[i] < 0) {
-                std::fprintf(stderr, "verify_batch: pool slot alloc failed @%d\n", base_pos + i);
-                return false;
-            }
+        int failed = -1;
+        if (!kvflash_verify_slots(*pager_, base_pos, n_tokens, slots, &failed)) {
+            std::fprintf(stderr, "verify_batch: pool slot alloc failed @%d\n", failed);
+            verify_pool_exhausted_ = true;
+            return false;
         }
     }
 
-    // kvflash's set_rows KV-write is mutually exclusive with delta-intermediate
-    // capture (graph_builders gates use_kv_write_rows on !capture_delta_intermediate);
-    // skip capture under the pager so --ddtree + --kvflash doesn't fail verify.
-    const bool do_capture = fast_rollback_ && capture_ssm_intermediates && pager_ == nullptr;
+    // Under the pager the set_rows KV write (full-attention layers) and the
+    // delta-intermediate capture (DeltaNet layers) coexist, so fast rollback
+    // applies. Tree verify uses its own graph, unaffected.
+    const bool do_capture = fast_rollback_ && capture_ssm_intermediates;
+
+    // KVFlash: stage each row's query so the backend can hand q_cap the last
+    // accepted row (AR's q_cap) after acceptance. Rejected rows stay in the
+    // stage and are never read.
+    const bool stage_q = pool && cache_.q_stage_on && cache_.q_stage &&
+                         n_tokens <= cache_.q_stage_rows;
+    cache_.q_stage_base = -1;
+    cache_.q_stage_n = 0;
 
     // KEEP_BASE (gdn_single_commit.h): this verify leaves ssm_state
     // at its pre-verify value; rollback_to commits the intermediate.
@@ -473,7 +480,8 @@ bool Qwen35DFlashTarget::verify_batch(
                            /*n_prefill_segments=*/0, /*n_logits_rows=*/0,
                            /*compact_slots=*/false, verify_top_n_,
                            /*keep_base_ssm_state=*/keep_base,
-                           replay_slot_ids)) {
+                           replay_slot_ids,
+                           /*capture_q_stage=*/stage_q)) {
         std::fprintf(stderr, "verify_batch: build_target_step failed (base=%d n=%d)\n", base_pos, n_tokens);
         return false;
     }
@@ -566,6 +574,10 @@ bool Qwen35DFlashTarget::verify_batch(
         *all_argmax = std::move(argmax_buf);
     }
 
+    if (stage_q) {
+        cache_.q_stage_base = base_pos;
+        cache_.q_stage_n = n_tokens;
+    }
     cache_.cur_pos = base_pos + n_tokens;
     return true;
 }
@@ -1136,11 +1148,10 @@ bool Qwen35DFlashTarget::restore_kv() {
 }
 
 bool Qwen35DFlashTarget::supports_fast_rollback() const {
-    // KVFlash requires the set-rows write path, which is mutually exclusive
-    // with recurrent capture. Report the runtime capability, not just the
-    // requested mode, so callers snapshot and replay instead of attempting a
-    // rollback from missing/stale captures.
-    return fast_rollback_ && pager_ == nullptr;
+    // Report the runtime capability, not just the requested mode, so callers
+    // snapshot and replay instead of attempting a rollback from missing/stale
+    // captures. Must match verify_batch()'s do_capture.
+    return fast_rollback_;
 }
 
 bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
