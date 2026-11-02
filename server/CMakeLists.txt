@@ -2840,6 +2840,7 @@ if(LUCE_TESTS)
             test/unit/test_kvflash_exact_mass.cpp
             test/unit/test_kvflash_gpu_mass.cpp
             test/unit/test_kvflash_uq.cpp
+            test/unit/test_kvflash_prefill_reselect.cpp
             test/unit/test_qwen35moe_routing_stats.cpp
             test/unit/test_qwen35moe_expert_placement.cpp
             test/unit/test_qwen35moe_swap_manager.cpp
