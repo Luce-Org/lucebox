@@ -5852,7 +5852,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 (hit_eos || io.is_cancelled() || budget.remaining() <= 0);
             settle = spec_step_settle(committed, commit_n, emitted, budget_close_fired, terminal_step);
             if (settle.repair && !budget_close_fired) {
-                // Evidence line: the G3c cases count these to prove the path ran.
+                // Evidence line: benches count these to prove the path ran.
                 if (kvflash_active() && spec_early_stop_needs_repair(commit_n, emitted, false)) {
                     std::fprintf(stderr,
                         "[kvflash] spec early-stop repair #%d: commit_n=%d emitted=%d "
