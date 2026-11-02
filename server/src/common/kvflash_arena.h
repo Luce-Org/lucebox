@@ -1,0 +1,97 @@
+// KvFlashArena: the page stream and the completion point
+// shared by every slot pager of one engine. Members only queue copies
+// (batch submit, no hidden waits); the step plan's single Fence orders the
+// compute stream, and complete_all() is the one host wait after which their
+// paged-out blocks become allocatable again.
+//
+// The arena must outlive its members: a member's destructor synchronizes the
+// shared stream.
+
+#pragma once
+
+#include "kvflash_pager.h"
+
+#include <algorithm>
+#include <functional>
+#include <vector>
+
+namespace luce::common {
+
+class KvFlashArena {
+public:
+    KvFlashArena() {
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        if (cudaStreamCreate(&stream_) != cudaSuccess) { stream_ = nullptr; (void)cudaGetLastError(); }
+        host_wait_ = [this] { if (stream_) cudaStreamSynchronize(stream_); };
+#endif
+    }
+    ~KvFlashArena() {
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        if (stream_) { cudaStreamSynchronize(stream_); cudaStreamDestroy(stream_); }
+        if (event_) cudaEventDestroy(event_);
+#endif
+    }
+    KvFlashArena(const KvFlashArena &) = delete;
+    KvFlashArena & operator=(const KvFlashArena &) = delete;
+
+    void * stream() const {
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        return stream_;
+#else
+        return nullptr;
+#endif
+    }
+
+    // Join before attach(): the stream is chosen there. False if already
+    // attached or already a member.
+    bool add(KvFlashPager & p) {
+        if (p.attached() || std::find(members_.begin(), members_.end(), &p) != members_.end()) return false;
+        p.set_external_page_stream(stream());
+        p.set_batch_submit(true);
+        members_.push_back(&p);
+        return true;
+    }
+    void remove(KvFlashPager & p) {
+        members_.erase(std::remove(members_.begin(), members_.end(), &p), members_.end());
+    }
+
+    // The completion phase: if any member has a page-out in flight, ONE host
+    // wait for the shared stream (every member's copy and zeroing is on it),
+    // then each member releases its settled blocks. Returns whether it waited.
+    bool complete_all() {
+        bool pending = false;
+        for (KvFlashPager * p : members_) pending = pending || p->pending_free_blocks() > 0;
+        if (!pending) return false;
+        if (host_wait_) host_wait_();
+        for (KvFlashPager * p : members_) p->complete(p->last_record());
+        return true;
+    }
+
+    // The step's one compute-stream join (the plan's Fence): later compute work
+    // runs after every queued copy and zero, with no host stall.
+    void join_compute(void * compute_stream) {
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        if (!stream_ || !event_ready_()) { if (host_wait_) host_wait_(); return; }
+        cudaEventRecord(event_, stream_);
+        cudaStreamWaitEvent((cudaStream_t)compute_stream, event_, 0);
+#else
+        (void)compute_stream;
+#endif
+    }
+
+protected:   // the test fixture swaps host_wait_
+#ifdef KVFLASH_HAS_ASYNC_DMA
+    bool event_ready_() {
+        if (!event_ && cudaEventCreateWithFlags(&event_, cudaEventDisableTiming) != cudaSuccess) {
+            event_ = nullptr; (void)cudaGetLastError();
+        }
+        return event_ != nullptr;
+    }
+    cudaStream_t stream_ = nullptr;
+    cudaEvent_t  event_ = nullptr;
+#endif
+    std::function<void()> host_wait_;
+    std::vector<KvFlashPager *> members_;
+};
+
+}  // namespace luce::common

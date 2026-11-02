@@ -2873,6 +2873,11 @@ if(LUCE_TESTS)
             test/unit/test_kv_quant.cpp
             test/unit/test_kvflash_pager_serde.cpp
             test/unit/test_kvflash_pager_truncate.cpp
+            test/unit/test_kvflash_slot_pager.cpp
+            test/unit/test_kvflash_slot_plan.cpp
+            test/unit/test_kvflash_step_driver.cpp
+            test/unit/test_kvflash_arena.cpp
+            test/unit/test_kvflash_slot_kv.cpp
             test/unit/test_pooled_snapshot_blob.cpp
             test/unit/test_kvflash_placement.cpp
             test/unit/test_kvflash_pool_sizing.cpp

@@ -186,6 +186,7 @@ public:
     void retire(int slot);
 
     int slot_count() const { return (int)slots_.size(); }
+    bool parkable() const { return kv_.parkable(); }
     int max_context() const { return max_ctx_; }
     int decoding_count() const;
     bool is_active(int slot) const;
