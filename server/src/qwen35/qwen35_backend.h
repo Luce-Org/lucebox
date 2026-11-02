@@ -319,6 +319,7 @@ protected:
     // scorer is missing (lazy-loads the drafter on first need; also heals
     // after a residency release frees it). No-op without a path.
     void kvflash_ensure_scorer();
+    bool kvflash_load_drafter();
 
 private:
     // ── GPU backends ─────────────────────────────────────────────────

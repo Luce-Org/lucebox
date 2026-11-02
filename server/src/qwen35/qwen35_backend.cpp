@@ -2862,25 +2862,30 @@ void Qwen35Backend::kvflash_upload_mask(int cur_pos) {
 // recency-only LRU. Loads lazily on the first reselect that needs it (and
 // re-attaches after a draft-residency release frees the drafter).
 void Qwen35Backend::kvflash_ensure_scorer() {
-    if (kvflash_scorer_ || kvflash_drafter_path_.empty() || kvflash_drafter_failed_) {
+    if (kvflash_scorer_ || kvflash_drafter_path_.empty() || kvflash_drafter_failed_ || !kvflash_load_drafter()) {
         return;
-    }
-    if (!drafter_loaded_) {
-        ggml_backend_synchronize(target_backend_);
-        if (draft_backend_) ggml_backend_synchronize(draft_backend_);
-        std::fprintf(stderr, "[kvflash] loading drafter for residency scoring: %s\n",
-                     kvflash_drafter_path_.c_str());
-        if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
-                          cfg_.device.gpu, drafter_ctx_)) {
-            std::fprintf(stderr, "[kvflash] drafter load failed (%s); staying on "
-                                 "LRU residency\n", luce_last_error());
-            kvflash_drafter_failed_ = true;
-            return;
-        }
-        drafter_loaded_ = true;
     }
     kvflash_scorer_ = std::make_unique<KvFlashDrafterScorer>(&drafter_ctx_);
     std::fprintf(stderr, "[kvflash] drafter scorer attached (tau=%d)\n", kvflash_tau_);
+}
+
+// The residency drafter, loaded beside the target on first use; false after a failed load (not retried).
+bool Qwen35Backend::kvflash_load_drafter() {
+    if (drafter_loaded_) return true;
+    if (kvflash_drafter_path_.empty() || kvflash_drafter_failed_) return false;
+    ggml_backend_synchronize(target_backend_);
+    if (draft_backend_) ggml_backend_synchronize(draft_backend_);
+    std::fprintf(stderr, "[kvflash] loading drafter for residency scoring: %s\n",
+                 kvflash_drafter_path_.c_str());
+    if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
+                      cfg_.device.gpu, drafter_ctx_)) {
+        std::fprintf(stderr, "[kvflash] drafter load failed (%s); staying on "
+                             "LRU residency\n", luce_last_error());
+        kvflash_drafter_failed_ = true;
+        return false;
+    }
+    drafter_loaded_ = true;
+    return true;
 }
 
 void Qwen35Backend::kvflash_maybe_reselect(int generated) {
