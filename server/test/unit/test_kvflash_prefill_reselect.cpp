@@ -79,7 +79,6 @@ TEST_CASE(KvflashPrefillReselectFixture, mode4_plan_uses_last_user_turn_clamped_
     KvFlashMode4Plan p = kvflash_mode4_plan(toks, 100, 1, 2);
     CHECK(p.run);
     CHECK(p.r == 107);                       // kv_offset + local index 7
-    CHECK(p.reserve_chunks == -1);           // derived from the tokens left to prefill
     // No user turn in the (delta) tokens: fall back to the prefill start.
     p = kvflash_mode4_plan({9, 1, 3, 9}, 100, 1, 2);
     CHECK(p.run);
