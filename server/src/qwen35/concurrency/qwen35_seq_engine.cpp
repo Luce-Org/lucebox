@@ -11,8 +11,10 @@
 #include "graph_builders.h"
 #include "attn_masks.h"
 #include "prefill_helpers.h"
+#include "common/blocking_row_pool.h"
 #include "common/concurrency/chain_spec_shapes.h"
 #include "common/dflash2_head.h"
+#include "common/sampled_verify.h"
 #include "common/sampler.h"
 #include "internal.h"
 #include "ggml-cuda.h"
@@ -21,6 +23,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -39,6 +42,16 @@ std::vector<PagedKvTensor> qwen_paged_kv_planes(const TargetCache & cache,
         }
     }
     return planes;
+}
+
+// LUCE_SAMPLED_VERIFY=1 (the single-lane switch): sampled lanes join
+// batched chain rounds, verified by the single-lane sampled walk.
+bool sampled_verify_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LUCE_SAMPLED_VERIFY");
+        return value != nullptr && std::string(value) == "1";
+    }();
+    return enabled;
 }
 } // namespace
 
@@ -286,7 +299,8 @@ bool Qwen35SeqEngine::chain_spec_input_capable(
         return false;
     }
     const Qwen35Slot & slot = slots_.slot(input.slot);
-    return slot.decoding() && !slot.sampler.needs_logit_processing() &&
+    return slot.decoding() &&
+           chain_sampler_spec_capable(slot.sampler, sampled_verify_enabled()) &&
            slot.cur_pos >= 1 &&
            slot.cur_pos + (width > 0 ? width : fixed_chain_.width) <=
                slots_.max_context();
@@ -898,7 +912,8 @@ int Qwen35SeqEngine::choose_chain_width(int bucket, int cap) {
 
 void Qwen35SeqEngine::observe_chain_width(
         int bucket, int width, const std::vector<size_t> & accepted,
-        double step_ms) {
+        const std::vector<uint8_t> & sampled, double step_ms,
+        double readback_ms, double walk_ms) {
     if (!adaptive_chain_width_) return;
     auto it = chain_width_by_bucket_.find(bucket);
     if (it == chain_width_by_bucket_.end()) return;
@@ -964,15 +979,42 @@ void Qwen35SeqEngine::observe_chain_width(
         }
     }
     ++state.rounds;
+    bool any_sampled = false;
     for (size_t lane = 0; lane < accepted.size(); ++lane) {
-        state.accepted_sum += static_cast<double>(accepted[lane]);
+        const double lane_accepted = static_cast<double>(accepted[lane]);
+        if (lane < sampled.size() && sampled[lane]) {
+            state.sampled_accepted_sum += lane_accepted;
+            ++state.sampled_lane_rounds;
+            any_sampled = true;
+        } else {
+            state.greedy_accepted_sum += lane_accepted;
+            ++state.greedy_lane_rounds;
+        }
     }
-    state.lane_rounds += accepted.size();
+    if (any_sampled) {
+        ++state.sampled_rounds;
+        state.readback_ms_sum += readback_ms;
+        state.walk_ms_sum += walk_ms;
+    }
     if (state.rounds % 1024 == 0) {
+        const auto mean = [](double sum, double count) {
+            return count > 0.0 ? sum / count : 0.0;
+        };
+        const double sampled_rounds =
+            static_cast<double>(state.sampled_rounds);
         std::fprintf(stderr, "[parallel] adaptive width bucket=%d rounds=%lld "
-                     "mean_accepted=%.2f offers:", bucket,
-                     (long long) state.rounds,
-                     state.lane_rounds ? state.accepted_sum / state.lane_rounds : 0.0);
+                     "mean_accepted=%.2f greedy=%.2f sampled=%.2f "
+                     "sampled_readback_ms=%.2f sampled_walk_ms=%.2f offers:",
+                     bucket, (long long) state.rounds,
+                     mean(state.greedy_accepted_sum + state.sampled_accepted_sum,
+                          static_cast<double>(state.greedy_lane_rounds +
+                                              state.sampled_lane_rounds)),
+                     mean(state.greedy_accepted_sum,
+                          static_cast<double>(state.greedy_lane_rounds)),
+                     mean(state.sampled_accepted_sum,
+                          static_cast<double>(state.sampled_lane_rounds)),
+                     mean(state.readback_ms_sum, sampled_rounds),
+                     mean(state.walk_ms_sum, sampled_rounds));
         for (int choice : chain_width_choices_) {
             // a batched bucket only tracks widths up to its own block
             if (static_cast<size_t>(choice) >= state.offers.size()) break;
@@ -1001,6 +1043,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         size_t accepted = 0;
         size_t verified = 0;  // target-verified prefix before policy clamps
         int32_t pending = -1;
+        // A sampled lane: its verify rows on the host, and the walk.
+        const float * sampled_rows = nullptr;
+        SampledVerifyWalk walk;
         Qwen35SlotManager::StepAppend append;
         int seq_len = -1;
     };
@@ -1299,14 +1344,99 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         graph.argmax_tokens, posterior.data(), 0,
         sizeof(int32_t) * posterior.size());
 
+    // Sampled lanes verify by the single-lane sampled walk over their own
+    // rows (sampled_verify.h); greedy lanes keep the argmax prefix.
+    // A lane's tree_width rows are contiguous: one copy per sampled lane.
+    const int vocab = b_.w_.n_vocab;
+    const size_t lane_floats =
+        static_cast<size_t>(tree_width) * static_cast<size_t>(vocab);
+    std::vector<int> sampled_lanes;
+    for (int lane_index = 0; lane_index < spec_count; ++lane_index) {
+        const Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
+        if (slots_.slot(proposal.slot).sampler.needs_logit_processing()) {
+            sampled_lanes.push_back(lane_index);
+        }
+    }
+    double readback_ms = 0.0;
+    double walk_ms = 0.0;
+    if (!sampled_lanes.empty()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t floats = sampled_lanes.size() * lane_floats;
+        if (chain_sampled_rows_.size() < floats) {
+            chain_sampled_rows_.resize(floats);
+        }
+        for (size_t k = 0; k < sampled_lanes.size(); ++k) {
+            Proposal & proposal =
+                proposals[static_cast<size_t>(sampled_lanes[k])];
+            const int row_base = ar_count + sampled_lanes[k] * tree_width;
+            proposal.sampled_rows = chain_sampled_rows_.data() + k * lane_floats;
+            ggml_backend_tensor_get(
+                graph.logits, chain_sampled_rows_.data() + k * lane_floats,
+                static_cast<size_t>(row_base) * static_cast<size_t>(vocab) *
+                    sizeof(float),
+                sizeof(float) * lane_floats);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        // Lanes are independent (own rows, sampler, RNG and history), so
+        // their walks run in parallel, except a lane whose sampler may take
+        // a GPU path: that one runs here, on the thread that owns the
+        // device. Each walk extends a copy of its slot's penalty history;
+        // commit_step appends the kept tokens below. A draw the min-token
+        // floor would replace ends the walk, so the floor rewrites it once,
+        // as the pending token.
+        const auto walk = [&](int k) {
+            Proposal & proposal =
+                proposals[static_cast<size_t>(
+                    sampled_lanes[static_cast<size_t>(k)])];
+            Qwen35Slot & seq = slots_.slot(proposal.slot);
+            std::vector<int32_t> history = seq.penalty_history();
+            const int generated = seq.generated_tokens();
+            proposal.walk = sampled_verify_walk(
+                proposal.sampled_rows, vocab, tree_width,
+                proposal.tokens.data(), seq.sampler, history, seq.rng,
+                [&](int32_t token, int position) {
+                    return token_is_eos(token) &&
+                           generated + position < min_tokens;
+                });
+            proposal.verified = static_cast<size_t>(proposal.walk.accepted);
+        };
+        std::vector<int> pooled;
+        std::vector<int> on_thread;
+        for (size_t k = 0; k < sampled_lanes.size(); ++k) {
+            const Proposal & proposal =
+                proposals[static_cast<size_t>(sampled_lanes[k])];
+            const bool host_only = sample_logits_host_only(
+                slots_.slot(proposal.slot).sampler, vocab);
+            (host_only ? pooled : on_thread).push_back(static_cast<int>(k));
+        }
+        if (pooled.size() >= 2) {
+            if (!chain_sampled_pool_) {
+                chain_sampled_pool_ = std::make_unique<BlockingRowPool>();
+            }
+            chain_sampled_pool_->run_custom(
+                static_cast<int>(pooled.size()),
+                [&](int j) { walk(pooled[static_cast<size_t>(j)]); });
+        } else {
+            for (int k : pooled) walk(k);
+        }
+        for (int k : on_thread) walk(k);
+        const auto t2 = std::chrono::steady_clock::now();
+        readback_ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        walk_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    }
+
     for (int lane_index = 0; lane_index < spec_count; ++lane_index) {
         Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
         const int row_base = ar_count + lane_index * tree_width;
         const int32_t * lane_posterior =
             posterior.data() + static_cast<size_t>(row_base);
-        size_t accepted = chain_verified_prefix(
-            proposal.tokens, lane_posterior, static_cast<size_t>(tree_width));
-        proposal.verified = accepted;
+        if (!proposal.sampled_rows) {
+            proposal.verified = chain_verified_prefix(
+                proposal.tokens, lane_posterior,
+                static_cast<size_t>(tree_width));
+        }
+        size_t accepted = proposal.verified;
         const int room =
             slots_.max_context() - slots_.slot(proposal.slot).cur_pos;
         accepted = std::min(accepted, static_cast<size_t>(std::max(0, room)));
@@ -1478,9 +1608,28 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
         const int graph_row = ar_count + lane_index * tree_width +
             static_cast<int>(proposal.accepted) - 1;
-        proposal.pending = sample_graph_row(
-            proposal.slot, graph_row,
-            &posterior[static_cast<size_t>(graph_row)], &logits_buf_);
+        if (proposal.sampled_rows) {
+            // The walk's draw at the kept tip, or one fresh draw from the
+            // tip's row (already on the host) with the committed history.
+            Qwen35Slot & seq = slots_.slot(proposal.slot);
+            const int32_t next = sampled_verify_next(
+                proposal.walk, proposal.tokens.data(),
+                static_cast<int>(proposal.accepted), [&](int row) {
+                    return sample_logits(
+                        proposal.sampled_rows +
+                            static_cast<size_t>(row) *
+                                static_cast<size_t>(vocab),
+                        vocab, seq.sampler, seq.penalty_history(), seq.rng);
+                });
+            proposal.pending = b_.apply_min_tokens_floor(
+                next, seq.generated_tokens(),
+                static_cast<size_t>(graph_row) * static_cast<size_t>(vocab) *
+                    sizeof(float));
+        } else {
+            proposal.pending = sample_graph_row(
+                proposal.slot, graph_row,
+                &posterior[static_cast<size_t>(graph_row)], &logits_buf_);
+        }
         if (proposal.pending < 0) {
             result.error = "fixed chain sampling failed";
             return result;
@@ -1499,18 +1648,22 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
 
     if (adaptive_chain_width_) {
         std::vector<size_t> & accepted = chain_accepted_scratch_;
+        std::vector<uint8_t> & sampled = chain_sampled_scratch_;
         accepted.clear();
+        sampled.clear();
         // Model acceptance, not the committed length: the room and
         // min-token clamps are serving policy, not rejections.
         for (const Proposal & proposal : proposals) {
             accepted.push_back(proposal.verified);
+            sampled.push_back(proposal.sampled_rows ? 1 : 0);
         }
         const double step_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - chain_round_t0_).count();
         // Rounds with AR peers or a fresh graph still teach acceptance, but
         // their time is not the cost of this width at this lane count.
-        observe_chain_width(tree_bucket, tree_width, accepted,
-                            ar_count == 0 && !graph_rebuilt ? step_ms : -1.0);
+        observe_chain_width(tree_bucket, tree_width, accepted, sampled,
+                            ar_count == 0 && !graph_rebuilt ? step_ms : -1.0,
+                            readback_ms, walk_ms);
     }
 
     result.decode.reserve(inputs.size());

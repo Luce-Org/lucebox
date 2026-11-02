@@ -15,6 +15,16 @@ namespace luce::common {
 // draw at its position, so the output follows autoregressive sampling
 // exactly, and the draft only decides how far one verify goes.
 
+// Whether a lane's sampler lets it join a batched chain round. A greedy lane
+// verifies by argmax; a sampled lane only with sampled verify on. A grammar
+// masks one position at a time, which a block verify cannot honour (the
+// scheduler already keeps such lanes out).
+inline bool chain_sampler_spec_capable(const SamplerCfg & cfg,
+                                       bool sampled_verify) {
+    if (!cfg.needs_logit_processing()) return true;
+    return sampled_verify && !cfg.constraint;
+}
+
 struct SampledVerifyWalk {
     int     accepted = 1;  // the root plus the drafts that matched a draw
     int32_t bonus = -1;    // the draw that ended the walk; -1 when all matched
