@@ -157,6 +157,7 @@ BackendPreparation BackendPlanBuilder::resolve(
     plan.speculation_.draft_path = std::move(args.draft_path);
     plan.speculation_.draft_block_size = args.draft_block_size;
     plan.speculation_.fast_rollback = args.fast_rollback;
+    plan.speculation_.fast_rollback_explicit = args.fast_rollback_explicit;
     plan.speculation_.seq_verify = args.seq_verify;
     plan.speculation_.specla_mode = args.specla_mode;
     plan.speculation_.specla_top_k = args.specla_top_k;
