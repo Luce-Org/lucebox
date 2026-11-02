@@ -5197,6 +5197,17 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         draft_swap_out()) {
         hybrid_prefill_chunk_cap_ = draft_swap_.cap_without;
     }
+    // Every disposable prefill and decode arena, and the pools' cached blocks.
+    const auto release_prefill_arenas = [&] {
+        deepseek4_release_retry_scratch(cache_, moe_hybrid_.get());
+        ds4_trim_device_pools(backend_, moe_hybrid_.get());
+    };
+    // A fresh prompt's first bulk chunk retires the previous request's decode
+    // and verify graphs before it allocates (deepseek4_step_layer_range, at
+    // position 0 only). A restored prompt would prefill beside them and run
+    // out of device memory where a fresh one fits.
+    constexpr int kBulkPrefillTokens = 512;
+    if (kv_offset > 0 && prefill_tokens >= kBulkPrefillTokens) release_prefill_arenas();
     committed = run_prefill();
     // A pipelined hybrid prefill that ran out of device memory is retried
     // once from the request's starting state with every disposable arena
@@ -5207,7 +5218,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     if (committed < 0 && moe_hybrid_ && deepseek4_prefill_pipeline_bands() > 0 &&
         !cache_.pipeline_off && !out_io.is_cancelled() && !images && !cluster_ &&
         (kv_offset == 0 || prefill_retry_slot_ >= 0)) {
-        deepseek4_release_retry_scratch(cache_, moe_hybrid_.get());
+        release_prefill_arenas();
         cache_.pipeline_off = true;
         const bool restored = kv_offset == 0 || snapshot_restore(prefill_retry_slot_);
         std::fprintf(stderr, "[deepseek4] prefill failed; retrying once from pos %d with the pipeline off%s\n",
@@ -5238,6 +5249,9 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         }
     }
     if (committed < 0) {
+        // Otherwise its arenas stay, and every later restored prompt (which
+        // never reaches the position-0 cleanup) fails on them.
+        release_prefill_arenas();
         result.fail(GenerateErrorCode::PrefillFailed);
         return result;
     }
