@@ -248,6 +248,14 @@ bool match_partial_char(const Element * pos, PartialUtf8 partial_utf8) {
         }
     }
 
+    // ED and F4 are the only lead bytes that need their max values
+    // limited to exclude values UTF-8 doesn't allow
+    if (n_remain == 2 && partial_value == 0xD) {
+        high = 0xD7FF;
+    } else if (n_remain == 3 && partial_value == 0x4) {
+        high = 0x10FFFF;
+    }
+
     do {
         if (pos[1].type == ElementType::CHAR_RNG_UPPER) {
             if (pos->value <= high && low <= pos[1].value) return is_positive_char;
@@ -422,6 +430,19 @@ bool detect_left_recursion(const Rules & rules, size_t rule_index,
     return false;
 }
 
+bool is_continuation_byte(uint8_t byte, uint32_t value, int n_remain) {
+    if ((byte >> 6) != 2) return false;
+    // For the value to be < 0x10 with two bytes remaining the lead must encode 3-bytes.
+    if (n_remain == 2 && value < 0x10) {
+        if (value == 0x0) return byte >= 0xA0;  // for E0, a second byte below 0xA0 would make an overlong encoding
+        if (value == 0xD) return byte <= 0x9F;  // for ED, a second byte above 0x9F is invalid UTF-8
+    } else if (n_remain == 3) {
+        if (value == 0x0) return byte >= 0x90;  // for F0, a second byte below 0x90 would make an overlong encoding
+        if (value == 0x4) return byte <= 0x8F;  // for F4, a second byte above 0x8F is invalid UTF-8
+    }
+    return true;
+}
+
 }  // namespace
 
 std::pair<std::vector<uint32_t>, PartialUtf8> decode_utf8(
@@ -435,13 +456,19 @@ std::pair<std::vector<uint32_t>, PartialUtf8> decode_utf8(
     uint32_t value    = partial_start.value;
     int      n_remain = partial_start.n_remain;
 
+    const auto invalid = [&code_points]() {
+        code_points.clear();
+        code_points.push_back(0);
+        return std::make_pair(std::move(code_points), PartialUtf8{ 0, -1 });
+    };
+    if (n_remain < 0) return invalid();
+
     // continue the previous decode, if any
     while (*pos != 0 && n_remain > 0) {
         const uint8_t next_byte = static_cast<uint8_t>(*pos);
-        if ((next_byte >> 6) != 2) {
+        if (!is_continuation_byte(next_byte, value, n_remain)) {
             // invalid sequence, abort
-            code_points.push_back(0);
-            return std::make_pair(std::move(code_points), PartialUtf8{ 0, -1 });
+            return invalid();
         }
         value = (value << 6) + (next_byte & 0x3F);
         ++pos;
@@ -458,11 +485,9 @@ std::pair<std::vector<uint32_t>, PartialUtf8> decode_utf8(
         const uint8_t highbits   = first_byte >> 4;
         n_remain = lookup[highbits] - 1;
 
-        if (n_remain < 0) {
-            // invalid sequence, abort
-            code_points.clear();
-            code_points.push_back(0);
-            return std::make_pair(std::move(code_points), PartialUtf8{ 0, n_remain });
+        // ASCII and C2-F4 are the only valid leading bytes.
+        if (n_remain < 0 || first_byte == 0xC0 || first_byte == 0xC1 || first_byte > 0xF4) {
+            return invalid();
         }
 
         const uint8_t mask = (1 << (7 - n_remain)) - 1;
@@ -470,7 +495,9 @@ std::pair<std::vector<uint32_t>, PartialUtf8> decode_utf8(
 
         ++pos;
         while (*pos != 0 && n_remain > 0) {
-            value = (value << 6) + (static_cast<uint8_t>(*pos) & 0x3F);
+            const uint8_t next_byte = static_cast<uint8_t>(*pos);
+            if (!is_continuation_byte(next_byte, value, n_remain)) return invalid();
+            value = (value << 6) + (next_byte & 0x3F);
             ++pos;
             --n_remain;
         }
