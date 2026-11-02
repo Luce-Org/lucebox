@@ -21412,17 +21412,17 @@ TEST_CASE(ServerUnitFixture, test_emitter_flags_dropped_undeclared_tool_call) {
     TEST_ASSERT(!kept.dropped_tool_call());
 }
 
-TEST_CASE(ServerUnitFixture, test_undeclared_note_names_declared_tools) {
+TEST_CASE(ServerUnitFixture, test_dropped_note_names_declared_tools) {
     const json tools = shell_tools();
     const std::string declared = tools[0]["name"].get<std::string>();
     const json request = {{"model", "test-model"}, {"tools", tools}};
-    const std::string note = tool_checks::undeclared_note(request);
+    const std::string note = tool_checks::dropped_call_note(request);
     TEST_ASSERT(note.find("not available in this session") != std::string::npos);
     TEST_ASSERT(note.find(declared) != std::string::npos);
 
     // Without declared tools the note still explains the situation.
     const json bare = {{"model", "test-model"}};
-    const std::string bare_note = tool_checks::undeclared_note(bare);
+    const std::string bare_note = tool_checks::dropped_call_note(bare);
     TEST_ASSERT(!bare_note.empty());
     TEST_ASSERT(bare_note.find("The tools you can call here are") == std::string::npos);
 }
