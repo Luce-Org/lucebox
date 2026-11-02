@@ -9363,6 +9363,165 @@ static void test_paged_lone_prompt_limits() {
     TEST_ASSERT(single.size() == 1 && single[0].max_tokens == 1);
 }
 
+// Paged prefix checkpoints: a staged prompt stops at its capture cut, the
+// capture saves the staging cache there, and a later prompt that starts with
+// the same tokens resumes staging from it.
+static void test_paged_prefix_checkpoints() {
+    std::fprintf(stderr, "  paged prefix checkpoints...");
+    constexpr int min_rows = DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS;
+    DeepSeek4Backend backend{DeepSeek4BackendConfig{}};
+
+    // The staged chunks end exactly at every cut, then run on to the prefix.
+    DeepSeek4StagedPrefill item;
+    item.prefix = 3000;
+    item.cuts = {1499, 2600};
+    int at_cuts = 0;
+    while (item.done < item.prefix) {
+        const int n = backend.staged_chunk_rows(item, 2048);
+        TEST_ASSERT(n >= min_rows && n <= item.stop() - item.done);
+        if (n < min_rows || n > item.stop() - item.done) break;
+        item.done += n;
+        at_cuts += std::binary_search(item.cuts.begin(), item.cuts.end(), item.done);
+    }
+    TEST_ASSERT(at_cuts == 2 && item.done == item.prefix);
+
+    constexpr int ctx = 128;
+    backend.backend_ = ggml_backend_cpu_init();
+    backend.snap_backend_ = ggml_backend_cpu_init();
+    backend.cfg_.paged_attention = true;
+    backend.text_staging_ = true;
+    backend.w_.n_layer = 1;
+    backend.w_.n_embd = 4;
+    backend.w_.n_hc = 1;
+    backend.w_.n_vocab = 3;
+    backend.w_.head_dim = 4;
+    backend.w_.n_swa = 8;
+    backend.w_.n_indexer_head_dim = 2;
+    backend.w_.compress_ratios = {4};
+    backend.image_staging_caches_.push_back(std::make_unique<DeepSeek4Cache>());
+    if (!backend.backend_ || !backend.snap_backend_ ||
+        !create_deepseek4_cache(backend.backend_, backend.w_, ctx, backend.cache_) ||
+        !create_deepseek4_cache(backend.backend_, backend.w_, ctx, *backend.image_staging_caches_[0])) {
+        TEST_ASSERT_MSG(false, "staging caches could not be created");
+        return;
+    }
+    PagedKvPool pool(32, 2, 16);
+    DeepSeek4SeqEngine engine(backend, pool, ctx, 16);
+    TEST_ASSERT(engine.supports_prefix_store());
+    using Status = SeqEngine::AdmitResult::Status;
+    std::vector<int32_t> prompt(80);
+    std::iota(prompt.begin(), prompt.end(), 1);
+
+    // As if the prefill had run to `cut`: a known state in the staging cache.
+    const auto reach = [](DeepSeek4StagedPrefill & staged, int cut) {
+        DeepSeek4Cache & cache = *staged.staging;
+        write_tensor_pattern(cache.layers[0].raw_kv, 13);
+        write_tensor_pattern(cache.layers[0].comp_kv, 31);
+        write_tensor_pattern(cache.hc_state, 47);
+        cache.cur_pos = staged.done = cut;
+        cache.layers[0].n_comp = cache.layers[0].n_index_comp = cut / 4;
+    };
+
+    // Restore points closer than a chunk to the one kept before them are
+    // skipped (so is a capture there), and the rows after the last cut, too
+    // few for a chunk, go to the gathered prefill.
+    PrefixStorePlan plan;
+    plan.restore_points = {3, 30, 32, 64, 66, 77};
+    plan.capture = {1, {3, 66}};
+    auto admitted = engine.admit_with_prefix(1, prompt, SamplerCfg{}, plan);
+    auto * pending = engine.pending_image(admitted.slot);
+    TEST_ASSERT(admitted.status == Status::admitted && !admitted.prefix_store.capture.valid());
+    TEST_ASSERT(pending && pending->staged.cuts == std::vector<int>({30, 64, 77}) &&
+                pending->staged.prefix == 77);
+    engine.retire(admitted.slot);
+
+    plan.restore_points = {30, 64};
+    plan.capture = {2, {3, 64}};
+    admitted = engine.admit_with_prefix(2, prompt, SamplerCfg{}, plan);
+    TEST_ASSERT(admitted.status == Status::admitted && admitted.prefix_store.capture == plan.capture);
+    pending = engine.pending_image(admitted.slot);
+    TEST_ASSERT(pending && pending->staged.stop() == 30);
+    if (!pending) return;
+    pending->staged.done = 30;
+    TEST_ASSERT(pending->staged.stop() == 64);
+    reach(pending->staged, 64);
+    const auto raw = read_tensor_bytes(pending->staged.staging->layers[0].raw_kv);
+    const auto comp = read_tensor_rows(pending->staged.staging->layers[0].comp_kv, 16);
+    engine.save_capture(*pending);
+    TEST_ASSERT(pending->staged.stop() == pending->staged.prefix);
+    // Reported with the slot's next prefill output, never a failed one.
+    std::vector<SeqEngine::PrefillOutput> outputs(1);
+    outputs[0].slot = admitted.slot;
+    outputs[0].status = SeqEngine::PrefillOutput::Status::failed;
+    engine.report_captures(outputs);
+    TEST_ASSERT(!outputs[0].prefix_store.attempted());
+    outputs[0].status = SeqEngine::PrefillOutput::Status::advanced;
+    engine.report_captures(outputs);
+    const PrefixStoreEvent & event = outputs[0].prefix_store;
+    TEST_ASSERT(event.status == PrefixStoreEvent::Status::saved && event.ticket == plan.capture);
+    TEST_ASSERT(event.bytes > 0 && event.bytes == engine.estimate_prefix_store_bytes(64));
+    engine.retire(admitted.slot);
+
+    // The next turn stages from the checkpoint.
+    prompt.resize(100, 7);
+    PrefixStorePlan next;
+    next.restore = plan.capture.checkpoint;
+    next.restore_points = {30, 64, 90};
+    admitted = engine.admit_with_prefix(3, prompt, SamplerCfg{}, next);
+    TEST_ASSERT(admitted.status == Status::admitted && admitted.prefix_store.restore_attempted &&
+                admitted.prefix_store.restored == next.restore);
+    pending = engine.pending_image(admitted.slot);
+    TEST_ASSERT(pending && pending->staged.done == 64 && pending->staged.restored == 64 &&
+                pending->staged.prefix == 99 && pending->staged.stop() == 90);
+    if (!pending) return;
+    const DeepSeek4Cache & restored = *pending->staged.staging;
+    TEST_ASSERT(restored.cur_pos == 64 && restored.layers[0].n_comp == 16);
+    TEST_ASSERT(read_tensor_bytes(restored.layers[0].raw_kv) == raw);
+    TEST_ASSERT(read_tensor_rows(restored.layers[0].comp_kv, 16) == comp);
+    engine.retire(admitted.slot);
+
+    // A restore at a skipped point: the first chunk still spans a chunk's rows.
+    PrefixStorePlan skipped = next;
+    skipped.restore_points = {30, 62, 64, 68, 90};
+    admitted = engine.admit_with_prefix(7, prompt, SamplerCfg{}, skipped);
+    pending = engine.pending_image(admitted.slot);
+    TEST_ASSERT(admitted.prefix_store.restored == next.restore && pending &&
+                pending->staged.cuts == std::vector<int>({90}));
+    engine.retire(admitted.slot);
+
+    // Too few rows after the restore for a chunk: the gathered prefill takes them.
+    const std::vector<int32_t> short_tail(prompt.begin(), prompt.begin() + 66);
+    admitted = engine.admit_with_prefix(4, short_tail, SamplerCfg{}, next);
+    pending = engine.pending_image(admitted.slot);
+    TEST_ASSERT(admitted.prefix_store.restored == next.restore && pending &&
+                pending->staged.prefix == 64 && pending->staged.finished());
+    engine.retire(admitted.slot);
+
+    // Other tokens under that id: admitted cold, and the payload stays.
+    prompt[10] = 0;
+    admitted = engine.admit_with_prefix(5, prompt, SamplerCfg{}, next);
+    TEST_ASSERT(admitted.status == Status::admitted && admitted.prefix_store.restore_attempted &&
+                admitted.prefix_store.invalidated == next.restore && !admitted.prefix_store.restored.valid());
+    TEST_ASSERT(engine.find_checkpoint(next.restore) != nullptr);
+    engine.retire(admitted.slot);
+
+    // A capture its request never reported goes with the slot.
+    plan.capture = {3, {5, 64}};
+    admitted = engine.admit_with_prefix(6, prompt, SamplerCfg{}, plan);
+    pending = engine.pending_image(admitted.slot);
+    TEST_ASSERT(pending != nullptr);
+    if (!pending) return;
+    reach(pending->staged, 64);
+    engine.save_capture(*pending);
+    TEST_ASSERT(engine.find_checkpoint(plan.capture.checkpoint) != nullptr);
+    engine.retire(admitted.slot);
+    TEST_ASSERT(engine.find_checkpoint(plan.capture.checkpoint) == nullptr);
+
+    engine.discard_prefix_store(next.restore);
+    TEST_ASSERT(engine.find_checkpoint(next.restore) == nullptr);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_paged_cache_allocation(ggml_backend_t backend) {
     std::fprintf(stderr, "  paged cache allocation and slot reset...");
     DeepSeek4Weights weights;
@@ -9473,6 +9632,7 @@ int main(int argc, char ** argv) {
     }
 
     test_paged_lone_prompt_limits();
+    test_paged_prefix_checkpoints();
     test_paged_cache_allocation(backend);
     test_compressor_pooling_correctness(backend);
     test_moe_expert_major_default_threshold();

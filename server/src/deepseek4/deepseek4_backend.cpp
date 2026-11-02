@@ -1482,25 +1482,38 @@ void DeepSeek4Backend::release_paged_decode_graphs() {
     ds4_trim_device_pools(backend_, moe_hybrid_.get());
 }
 
-bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item) {
+bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item, const DeepSeek4Snapshot * from) {
     // Without images the item is a text prompt (sparse text staging).
     const auto * images = item.images
         ? dynamic_cast<const DeepSeek4ImagePrompt *>(item.images.get()) : nullptr;
     if ((item.images && !images) || (!images && !text_staging_) ||
         !item.staging || item.prefix < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS ||
-        item.prefix > int(item.prompt.size()) || item.prefix > item.staging->max_ctx) {
+        item.prefix > int(item.prompt.size()) || item.prefix > item.staging->max_ctx ||
+        (from && (item.images || from->cur_pos > item.prefix))) {
         item.error = "invalid staged prefill request";
         return false;
     }
     reset_deepseek4_cache(*item.staging);
     item.staging->prefill_mode = PrefillAttentionMode::Sparse;
-    item.done = 0;
+    item.done = item.restored = 0;
+    if (from) {
+        if (!deepseek4_snapshot_restore(*from, *item.staging)) {
+            item.error = "prefix checkpoint could not be restored";
+            return false;
+        }
+        item.done = item.restored = from->cur_pos;
+    }
     return true;
+}
+
+void DeepSeek4Backend::prepare_staged_prefill(DeepSeek4Cache & staging) {
+    deepseek4_release_retry_scratch(staging, moe_hybrid_.get());
+    ds4_trim_device_pools(backend_, moe_hybrid_.get());
 }
 
 int DeepSeek4Backend::staged_chunk_rows(const StagedPrefill & item, int max_rows) const {
     constexpr int min_rows = DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS;
-    const int remaining = item.prefix - item.done;
+    const int remaining = item.stop() - item.done;
     if (remaining <= 0) return 0;
     // The row budget is the caller's (it trades decode stalls against the
     // per-chunk fixed cost); only the late-context scratch bound applies.
@@ -1607,7 +1620,7 @@ bool DeepSeek4Backend::begin_staged_pass(const std::vector<StagedPrefill *> & it
         } else {
             // Text: the budget's worth of rows, never leaving a tail below the
             // layer-major minimum for the next pass.
-            const int remaining = item->prefix - item->done;
+            const int remaining = item->stop() - item->done;
             n = std::min(remaining, budget);
             if (n < remaining && remaining - n < min_rows) n = remaining - min_rows;
             // A short tail that fits the remaining budget goes in whole.
@@ -5492,6 +5505,33 @@ int DeepSeek4Backend::snapshot_cur_pos(int slot) const {
     return snapshots_[slot].cur_pos;
 }
 
+// Host bytes of a snapshot of `cache` at `tokens` positions, with `aux`'s
+// sidecar when given.
+static size_t ds4_declared_snapshot_bytes(const DeepSeek4Cache & cache, const DeepSeek4Weights & w,
+                                          ggml_backend_t snap_backend, int tokens,
+                                          const DeepSeek4SnapshotAux * aux) {
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() *
+                  (deepseek4_snapshot_tensor_count(cache.n_layer, aux != nullptr) + 4) + 4096;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return 0;
+    DeepSeek4Snapshot layout;
+    size_t bytes = 0;
+    if (deepseek4_snapshot_declare_at(ctx, cache, tokens, w.compress_ratios,
+                                      0, cache.n_layer, nullptr, aux, layout)) {
+        bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            ctx, ggml_backend_get_default_buffer_type(snap_backend));
+    }
+    ggml_free(ctx);
+    return bytes;
+}
+
+size_t DeepSeek4Backend::staged_checkpoint_bytes(int tokens) const {
+    if (!cfg_.paged_attention || !cache_.ctx || !snap_backend_ || tokens <= 0) return 0;
+    return ds4_declared_snapshot_bytes(cache_, w_, snap_backend_, tokens, nullptr);
+}
+
 size_t DeepSeek4Backend::snapshot_bytes_estimate(int tokens) const {
     // Paged serving keeps no single-sequence snapshots.
     if (cfg_.paged_attention || !cache_.ctx || !snap_backend_ || tokens <= 0) {
@@ -5510,21 +5550,7 @@ size_t DeepSeek4Backend::snapshot_bytes_estimate(int tokens) const {
     aux.n_logits = n_logits;
     aux.spec_feat = n_features ? &kDeclared : nullptr;
     aux.n_spec_feat = n_features;
-
-    ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() *
-                  (deepseek4_snapshot_tensor_count(cache_.n_layer, true) + 4) + 4096;
-    ip.no_alloc = true;
-    ggml_context * ctx = ggml_init(ip);
-    if (!ctx) return 0;
-    DeepSeek4Snapshot layout;
-    size_t bytes = 0;
-    if (deepseek4_snapshot_declare_at(ctx, cache_, tokens, w_.compress_ratios,
-                                      0, cache_.n_layer, nullptr, &aux, layout)) {
-        bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
-            ctx, ggml_backend_get_default_buffer_type(snap_backend_));
-    }
-    ggml_free(ctx);
+    const size_t bytes = ds4_declared_snapshot_bytes(cache_, w_, snap_backend_, tokens, &aux);
     return bytes ? bytes + (n_logits + n_features) * sizeof(float) : 0;
 }
 
