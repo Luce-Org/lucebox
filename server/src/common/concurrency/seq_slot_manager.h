@@ -186,6 +186,7 @@ public:
     void retire(int slot);
 
     int slot_count() const { return (int)slots_.size(); }
+    bool parkable() const { return kv_.parkable(); }
     int max_context() const { return max_ctx_; }
     // Free counts the blocks neither appended nor reserved by any slot; a
     // parked slot holds none until it resumes.

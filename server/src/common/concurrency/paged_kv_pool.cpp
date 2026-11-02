@@ -18,6 +18,8 @@ const char * paged_kv_status_string(PagedKvStatus status) {
             return "sequence slots exhausted";
         case PagedKvStatus::BlocksExhausted:
             return "physical blocks exhausted";
+        case PagedKvStatus::CapacityExceeded:
+            return "request exceeds the host budget";
         case PagedKvStatus::StaleHandle:
             return "stale sequence handle";
     }
