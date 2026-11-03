@@ -133,7 +133,7 @@ profile and the requirements checked at startup.
 | `LUCE_KVFLASH_RECALL_BLOCKS` | 6 with `--kvflash` on qwen35, else 0 | A/B: number of recalled blocks of `LUCE_KVFLASH_SELECT_UNIT` chunks kept beside the newest chunks. 0 is the plain recency pool. |
 | `LUCE_KVFLASH_SELECT_UNIT` | 2 with `--kvflash` on qwen35, else 10 | A/B: chunks per recall unit; the recall budget stays 10 x `LUCE_KVFLASH_RECALL_BLOCKS` chunks. |
 | `LUCE_KVFLASH_SCORE_POOL_RECENT` | 1 with `--kvflash` on qwen35, else 0 | A/B: =1 scores mode 4 on the recency pool, so the first pass of a request does not run under the previous request's pool. =0 turns that off. |
-| `LUCE_KVFLASH_PREAMBLE_ROWS` | 6144 with `--kvflash` on qwen35, else 0 | Extra pool rows (rounded up to a chunk, clamped by `--max-ctx`) that hold the pinned system+tools preamble outside the history budget. 0 turns the pin and the extra VRAM off. |
+| `LUCE_KVFLASH_PREAMBLE_ROWS` | 1152 with `--kvflash` on qwen35, else 0 | Extra pool rows (rounded up to a chunk, clamped by `--max-ctx`) that hold the pinned system+tools preamble outside the history budget. 0 turns the pin and the extra VRAM off. |
 | `LUCE_KVFLASH_UQ_QUERIES` | 64 with `--kvflash` on qwen35, else 0 | The last N (at most 64) queries of the latest human turn join the selector's queries. 0 off. Serial path only; off under tensor parallelism. |
 
 ## Full inventory (generated)

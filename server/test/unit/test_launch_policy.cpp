@@ -713,6 +713,12 @@ struct LaunchPolicyFixture : CommonFixture {
         CHECK(kvflash_recall_env("").empty());
     }
 
+    void test_kvflash_recall_preamble_reserve_is_18_chunks() {
+        // The reserve grows the resident pool and every decode step attends the whole pool: 6144 rows (+37.5%) cost
+        // 4.7% decode, so the default is the 18 chunks of 64 that hold the measured 1064-token preamble pin.
+        CHECK(KvflashRecallProfile::preamble_rows == 18 * 64);
+    }
+
     void test_kvflash_recall_defaults_are_the_shipped_profile() {
         // The shipped recall profile, one flag. These literals are the values the profile installed before it
         // became named constants; the ninth, LUCE_KVFLASH_SCORER_DEVICE=gpu, is now fixed in the backend.
@@ -723,7 +729,7 @@ struct LaunchPolicyFixture : CommonFixture {
             {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
             {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"},
             {"LUCE_KVFLASH_SELECT_UNIT", "2"},
-            {"LUCE_KVFLASH_PREAMBLE_ROWS", "6144"},
+            {"LUCE_KVFLASH_PREAMBLE_ROWS", "1152"},
             {"LUCE_KVFLASH_UQ_QUERIES", "64"},
         };
         const std::vector<LaunchProfileEnv> env = kvflash_recall_env("qwen35");
@@ -770,6 +776,7 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_ds41_gorgon_profile_keeps_the_model_resident();
     test_qwen_next_split_profile_fits_its_context();
     test_kvflash_recall_defaults_need_a_qwen35_target();
+    test_kvflash_recall_preamble_reserve_is_18_chunks();
     test_kvflash_recall_defaults_are_the_shipped_profile();
     test_pflash_curve_arg_accepts_quoted_and_split_points();
     test_pflash_curve_arg_rejects_bad_points();
