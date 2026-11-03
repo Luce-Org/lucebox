@@ -7,6 +7,7 @@ Tokens print as they are committed. Model reloads once per turn;
 a daemon-mode binary that keeps the model resident is a planned follow-up.
 """
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -30,11 +31,50 @@ SYSTEM = "You are a concise, helpful assistant."
 def resolve_draft() -> Path:
     if DRAFT_ROOT.is_file():
         return DRAFT_ROOT
+
     if DRAFT_ROOT.is_dir():
-        for st in DRAFT_ROOT.rglob("model.safetensors"):
-            return st
+        for pattern in (
+            "dflash-draft-*.gguf",
+            "*.gguf",
+            "model.safetensors",
+        ):
+            matches = sorted(
+                path for path in DRAFT_ROOT.rglob(pattern)
+                if path.is_file()
+            )
+            if matches:
+                version_match = re.search(
+                    r"[Qq]wen(\d+\.\d+)", TARGET.name
+                )
+                if version_match:
+                    version = version_match.group(1)
+                    preferred = [
+                        path for path in matches
+                        if f"-{version}-" in path.name
+                        or f"-{version}." in path.name
+                    ]
+                    if preferred:
+                        matches = preferred
+                    elif pattern != "model.safetensors":
+                        print(
+                            f"[chat.py] no draft filename matches Qwen{version}; "
+                            f"using {matches[0]}",
+                            file=sys.stderr,
+                        )
+
+                if len(matches) > 1:
+                    print(
+                        f"[chat.py] multiple draft files found; "
+                        f"using {matches[0]}",
+                        file=sys.stderr,
+                    )
+
+
+                return matches[0]
+
     sys.exit(
-        f"draft weights not found under {DRAFT_ROOT}. Download them as documented in the README."
+        f"no DFlash draft GGUF or model.safetensors under {DRAFT_ROOT}. "
+        "Download it as documented in the README."
     )
 
 
