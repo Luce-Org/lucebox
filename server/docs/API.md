@@ -81,10 +81,10 @@ available; if it still calls one, the calls are dropped and its text goes out
 with `finish_reason: "stop"`, so no tool call reaches the client.
 
 A pass that asks the model again renders a conversation the client never
-sends back, so it saves no prefix checkpoint of it. The first pass always saves
-one at the end of the client's prompt, even when that prompt continues an
-Agent Turn Cache checkpoint: if a later pass replaces the turn, the client's
-next request continues from there.
+sends back, so it saves no prefix checkpoint of it. The first pass plans its
+prompt-end checkpoint as an ordinary request does, even when its prompt
+continues an Agent Turn Cache checkpoint: if a later pass replaces the turn,
+the client's next request continues from there.
 
 Each request logs one `[tool-checks]` line with what ran. A streaming request
 receives the checked turn as SSE events, with keep-alive comments while the
