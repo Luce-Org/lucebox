@@ -23,4 +23,21 @@ uint64_t reclaimable_gpu_page_pool_bytes() {
 #endif
 }
 
+uint64_t gpu_page_pool_bytes_beside_device_free(const char * meminfo_text, uint64_t live_gpu_host_bytes) {
+    return ggml_cuda_uma_huge_pages_configured(meminfo_text)
+               ? ggml_cuda_uma_page_pool_bytes(meminfo_text, live_gpu_host_bytes)
+               : 0;
+}
+
+uint64_t gpu_page_pool_bytes_beside_device_free() {
+#if defined(__linux__)
+    std::string meminfo;
+    uint64_t live = 0;
+    if (!ggml_cuda_uma_read_meminfo(&meminfo) || !ggml_cuda_uma_live_gpu_host_bytes(&live)) return 0;
+    return gpu_page_pool_bytes_beside_device_free(meminfo.c_str(), live);
+#else
+    return 0;
+#endif
+}
+
 } // namespace luce::common

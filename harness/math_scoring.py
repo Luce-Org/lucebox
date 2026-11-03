@@ -8,6 +8,7 @@ answers should import from here rather than maintaining a local copy.
 from __future__ import annotations
 
 import re
+from fractions import Fraction
 
 
 def _extract_boxed(text: str) -> str | None:
@@ -61,6 +62,82 @@ def _normalize_math(s: str | None) -> str:
     return s
 
 
+_COMMA_NUM_RE = re.compile(r"^[+-]?\d{1,3}(,\d{3})+(\.\d+)?$")
+_FRAC_RE = re.compile(r"^([+-]?)\s*\\frac\s*\{([^}]+)\}\s*\{([^}]+)\}$")
+_MIXED_RE = re.compile(r"^([+-]?)\s*([0-9,]+)\s*\\frac\s*\{([^}]+)\}\s*\{([^}]+)\}$")
+
+
+def _strip_valid_commas(s: str) -> str | None:
+    """Validate comma placement and remove separators if valid.
+
+    Accepts correctly grouped thousands (e.g. '1,000', '12,345', '1,234,567').
+    Rejects malformed grouping (e.g. '1,2', '12,34', '1,23,456').
+    Returns s unchanged if no commas are present.
+    """
+    if "," not in s:
+        return s
+    if _COMMA_NUM_RE.match(s):
+        return s.replace(",", "")
+    return None
+
+
+def _parse_numeric_value(s: str) -> Fraction | None:
+    """Parse a normalized math answer string into an exact Fraction.
+
+    Handles integers, decimal numbers, signed simple fractions, and signed
+    mixed fractions. Enforces strict thousands comma validation.
+    Returns None for symbolic or non-numeric expressions.
+    """
+    if not s:
+        return None
+
+    # 1. Plain float or integer (with comma validation)
+    clean = _strip_valid_commas(s.strip())
+    if clean is not None:
+        try:
+            return Fraction(clean)
+        except (ValueError, ZeroDivisionError):
+            pass
+
+    # 2. Mixed fraction: [+-]? whole \frac{num}{den}
+    m = _MIXED_RE.match(s)
+    if m:
+        try:
+            sign = -1 if m.group(1) == "-" else 1
+            whole_str = _strip_valid_commas(m.group(2).strip())
+            num_str = _strip_valid_commas(m.group(3).strip())
+            den_str = _strip_valid_commas(m.group(4).strip())
+            if whole_str is None or num_str is None or den_str is None:
+                return None
+            whole = Fraction(whole_str)
+            num = Fraction(num_str)
+            den = Fraction(den_str)
+            if den == 0:
+                return None
+            return sign * (whole + num / den)
+        except (ValueError, ZeroDivisionError):
+            pass
+
+    # 3. Simple fraction: [+-]? \frac{num}{den}
+    m = _FRAC_RE.match(s)
+    if m:
+        try:
+            sign = -1 if m.group(1) == "-" else 1
+            num_str = _strip_valid_commas(m.group(2).strip())
+            den_str = _strip_valid_commas(m.group(3).strip())
+            if num_str is None or den_str is None:
+                return None
+            num = Fraction(num_str)
+            den = Fraction(den_str)
+            if den == 0:
+                return None
+            return sign * (num / den)
+        except (ValueError, ZeroDivisionError):
+            pass
+
+    return None
+
+
 def _math_equiv(pred: str | None, gold: str | None) -> bool:
     """Check if two math answers are equivalent."""
     if pred is None or gold is None:
@@ -73,32 +150,10 @@ def _math_equiv(pred: str | None, gold: str | None) -> bool:
     g_c = re.sub(r"\s*\\frac", r"\\frac", g)
     if p_c == g_c:
         return True
-    try:
-        pf = float(p.replace(",", ""))
-        gf = float(g.replace(",", ""))
-        return abs(pf - gf) < 1e-6
-    except (ValueError, TypeError):
-        pass
-    mixed_pat = re.compile(r"^(\d+)\s*\\frac\s*\{(\d+)\}\s*\{(\d+)\}$")
-    for s, other in [(p, g), (g, p)]:
-        m = mixed_pat.match(s)
-        if m:
-            try:
-                val = float(m.group(1)) + float(m.group(2)) / float(m.group(3))
-                oval = float(other.replace(",", ""))
-                if abs(val - oval) < 1e-6:
-                    return True
-            except (ValueError, ZeroDivisionError):
-                pass
-    frac_pat = re.compile(r"^\\frac\s*\{([^}]+)\}\s*\{([^}]+)\}$")
-    for s, other in [(p, g), (g, p)]:
-        m = frac_pat.search(s)
-        if m:
-            try:
-                val = float(m.group(1)) / float(m.group(2))
-                oval = float(other.replace(",", ""))
-                if abs(val - oval) < 1e-6:
-                    return True
-            except (ValueError, ZeroDivisionError):
-                pass
+
+    val_p = _parse_numeric_value(p)
+    val_g = _parse_numeric_value(g)
+    if val_p is not None and val_g is not None:
+        return abs(val_p - val_g) < 1e-6
+
     return False

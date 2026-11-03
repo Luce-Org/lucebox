@@ -81,6 +81,11 @@ int sample_logits(const float * logits_in,
                   const std::vector<int32_t> & history,
                   std::mt19937_64 & rng);
 
+// True when sample_logits with this config runs on the host only. Otherwise
+// it may take a GPU sampler path, which uses the calling thread's current
+// device: call it from the thread that owns the model's device.
+bool sample_logits_host_only(const SamplerCfg & cfg, int vocab);
+
 // The distribution sample_logits draws from, after the whole chain (penalties,
 // top_k, temperature, top_p) as (probability, token) pairs summing to 1. With
 // temp <= 0 it is the single post-penalty argmax. Speculative sampling uses it

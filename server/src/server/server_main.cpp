@@ -264,9 +264,12 @@ static void print_usage(const char * prog) {
         "                       checkpoints (default: auto = 2 x --max-concurrency + 1\n"
         "                       checkpoints at --max-ctx, at least 4096 MiB; above\n"
         "                       that at most 1/4 of available memory; 0 unlimited)\n"
-        "  --agent-turn-cache         When the next request renders a tool-call turn\n"
+        "  --agent-turn-cache   When the next request renders a tool-call turn\n"
         "                       with other tokens, prefill it into the prefix\n"
-        "                       cache while idle\n"
+        "                       cache while idle. Default: on with one sequence at\n"
+        "                       a time and prefix slots; elsewhere asking for it\n"
+        "                       fails the launch\n"
+        "  --no-agent-turn-cache Turn that replay off\n"
         "  --no-tool-checks    Serve chat requests with tools without the tool-use\n"
         "                       checks (rules, re-plan, final self-check; default: on)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
@@ -432,6 +435,9 @@ struct ModelOptions {
     std::string cache_type_v;  // explicit --cache-type-v override
     bool fast_rollback_forced_off = false;
     bool target_split_fast_rollback_cli = false;
+    // --agent-turn-cache (true) or --no-agent-turn-cache (false); unset turns
+    // it on wherever it can run (resolve_agent_turn_cache).
+    std::optional<bool> agent_turn_cache;
     bool target_device_auto = false;   // --target-device auto
     bool target_device_from_env = false;  // the device came from LUCE_TARGET_DEVICE
     bool draft_device_set = false;     // --draft-device given explicitly
@@ -874,7 +880,9 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--agent-turn-cache") == 0) {
-            sconfig.agent_turn_cache = true;
+            model.agent_turn_cache = true;
+        } else if (std::strcmp(argv[i], "--no-agent-turn-cache") == 0) {
+            model.agent_turn_cache = false;
         } else if (std::strcmp(argv[i], "--no-tool-checks") == 0) {
             sconfig.tool_checks = false;
         } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {
@@ -1744,17 +1752,15 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     sconfig.concurrent_prefix_cache =
         backend_execution.max_concurrency > 1 && sconfig.prefix_cache_cap > 0;
 
-    if (sconfig.agent_turn_cache && backend_cache.paged_attention) {
-        std::fprintf(stderr,
-            "[server] --agent-turn-cache is not yet supported with "
-            "--paged-attention or --max-concurrency\n");
+    const AgentTurnCacheChoice agent_turn = resolve_agent_turn_cache(
+        model.agent_turn_cache,
+        !backend_cache.paged_attention && backend_execution.max_concurrency <= 1,
+        sconfig.prefix_cache_cap);
+    if (agent_turn.error) {
+        std::fprintf(stderr, "[server] %s\n", agent_turn.error);
         return 2;
     }
-    if (sconfig.agent_turn_cache && sconfig.prefix_cache_cap <= 0) {
-        std::fprintf(stderr,
-            "[server] --agent-turn-cache requires an enabled inline prefix cache\n");
-        return 2;
-    }
+    sconfig.agent_turn_cache = agent_turn.enabled;
 
     // Sync max_ctx: if --max-ctx was not provided, use the backend's default.
     // This prevents the HTTP server from accepting prompts larger than the

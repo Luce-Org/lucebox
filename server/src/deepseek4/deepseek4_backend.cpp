@@ -36,6 +36,8 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+// ggml_cuda_uma_tiered_capacity (header-only, as server/src/common uses it).
+#include "../../deps/llama.cpp/ggml/src/ggml-cuda/uma-budget.h"
 
 #include <algorithm>
 #include <charconv>
@@ -1482,25 +1484,38 @@ void DeepSeek4Backend::release_paged_decode_graphs() {
     ds4_trim_device_pools(backend_, moe_hybrid_.get());
 }
 
-bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item) {
+bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item, const DeepSeek4Snapshot * from) {
     // Without images the item is a text prompt (sparse text staging).
     const auto * images = item.images
         ? dynamic_cast<const DeepSeek4ImagePrompt *>(item.images.get()) : nullptr;
     if ((item.images && !images) || (!images && !text_staging_) ||
         !item.staging || item.prefix < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS ||
-        item.prefix > int(item.prompt.size()) || item.prefix > item.staging->max_ctx) {
+        item.prefix > int(item.prompt.size()) || item.prefix > item.staging->max_ctx ||
+        (from && (item.images || from->cur_pos > item.prefix))) {
         item.error = "invalid staged prefill request";
         return false;
     }
     reset_deepseek4_cache(*item.staging);
     item.staging->prefill_mode = PrefillAttentionMode::Sparse;
-    item.done = 0;
+    item.done = item.restored = 0;
+    if (from) {
+        if (!deepseek4_snapshot_restore(*from, *item.staging)) {
+            item.error = "prefix checkpoint could not be restored";
+            return false;
+        }
+        item.done = item.restored = from->cur_pos;
+    }
     return true;
+}
+
+void DeepSeek4Backend::prepare_staged_prefill(DeepSeek4Cache & staging) {
+    deepseek4_release_retry_scratch(staging, moe_hybrid_.get());
+    ds4_trim_device_pools(backend_, moe_hybrid_.get());
 }
 
 int DeepSeek4Backend::staged_chunk_rows(const StagedPrefill & item, int max_rows) const {
     constexpr int min_rows = DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS;
-    const int remaining = item.prefix - item.done;
+    const int remaining = item.stop() - item.done;
     if (remaining <= 0) return 0;
     // The row budget is the caller's (it trades decode stalls against the
     // per-chunk fixed cost); only the late-context scratch bound applies.
@@ -1607,7 +1622,7 @@ bool DeepSeek4Backend::begin_staged_pass(const std::vector<StagedPrefill *> & it
         } else {
             // Text: the budget's worth of rows, never leaving a tail below the
             // layer-major minimum for the next pass.
-            const int remaining = item->prefix - item->done;
+            const int remaining = item->stop() - item->done;
             n = std::min(remaining, budget);
             if (n < remaining && remaining - n < min_rows) n = remaining - min_rows;
             // A short tail that fits the remaining budget goes in whole.
@@ -2244,7 +2259,20 @@ bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, int secondar
                              avail / 1073741824.0, keep / 1073741824.0);
             }
         }
-        const uint64_t capacity = (free_bytes > carve_reserve ? free_bytes - carve_reserve : 0) + host_bytes;
+        uint64_t capacity = (free_bytes > carve_reserve ? free_bytes - carve_reserve : 0) + host_bytes;
+        size_t heap = 0, total = 0, room = 0;
+        if (secondary_gpu >= 0 && ggml_backend_cuda_get_device_room(secondary_gpu, &heap, &total) &&
+            ggml_backend_cuda_get_uma_room(secondary_gpu, &room)) {
+            // An integrated device's free_bytes is MemAvailable, which leaves
+            // out the driver's page pool (60 GiB after DeepSeek stopped on a
+            // 125 GiB box), and the locked host tier is the same RAM again.
+            // The device heap takes what its runtime allows of the room (on an
+            // APU with a large carve, the carve), the host tier the rest, and
+            // the two no more than the room, its own VRAM left and the RAM with
+            // the pool, less the carve reserve.
+            capacity = ggml_cuda_uma_tiered_capacity(heap > carve_reserve ? heap - carve_reserve : 0, host_bytes,
+                                                     room > carve_reserve ? room - carve_reserve : 0);
+        }
         secondary_budget = capacity;
     }
 
@@ -3177,10 +3205,13 @@ bool DeepSeek4Backend::init() {
 // Free memory a device must keep after every persistent allocation: room for
 // the graph compute buffers allocated at the first request, and on an APU for
 // the driver, so no allocation spills past the carve into shared (SVM) memory.
-static size_t ds4_device_headroom_bytes(int device) {
+static bool ds4_device_integrated(int device) {
     cudaDeviceProp prop{};
-    const bool integrated = cudaGetDeviceProperties(&prop, device) == cudaSuccess && prop.integrated;
-    return integrated ? ((size_t) 4 << 30) : ((size_t) 3 << 29);
+    return cudaGetDeviceProperties(&prop, device) == cudaSuccess && prop.integrated;
+}
+
+static size_t ds4_device_headroom_bytes(int device) {
+    return ds4_device_integrated(device) ? ((size_t) 4 << 30) : ((size_t) 3 << 29);
 }
 
 // Streamed expert cache, sized from what is left after
@@ -3193,16 +3224,23 @@ bool DeepSeek4Backend::init_streamed_expert_tier() {
     // for what it allocates after sizing its slots (its backend, the pinned
     // loader staging and the mapped mailbox, which an APU takes from the same
     // memory); without it the load check finds the device a few MiB short.
+    // An APU's room is the RAM it shares with the host, so every host
+    // allocation until the check counts too, and the driver's page pool in
+    // that room is an estimate good to about 0.8 GiB: on Strix Halo
+    // (ds41-lucebox) 0.6 GiB went between sizing and the check.
     MoeExpertCacheOptions cache_opts;
     cache_opts.device = stream_cache_device_;
-    cache_opts.reserve_bytes = ds4_device_headroom_bytes(cache_opts.device) + ((size_t) 128 << 20);
+    cache_opts.reserve_bytes = ds4_device_headroom_bytes(cache_opts.device) +
+                               (ds4_device_integrated(cache_opts.device) ? ((size_t) 3 << 29) : ((size_t) 128 << 20));
     cache_opts.direct_path = cfg_.model_path;
     // Once experts are locked in host memory the page cache is too small to
     // hold the streamed tier, so every load reads the drive directly.
     cache_opts.direct_all = ggml_backend_cuda_host_spill_bytes(cache_opts.device) > 0;
     {
+        // On an APU, what its allocations can take (ggml_backend_cuda_get_device_room):
+        // its runtime's free need not follow what the stacks took.
         size_t free_b = 0, total_b = 0;
-        ggml_backend_cuda_get_device_memory(cache_opts.device, &free_b, &total_b);
+        ggml_backend_cuda_get_device_room(cache_opts.device, &free_b, &total_b);
         cache_opts.pool_bytes = free_b > cache_opts.reserve_bytes ? free_b - cache_opts.reserve_bytes : 0;
         if (cache_opts.pool_bytes > 0 &&
             init_deepseek4_streamed_expert_cache(w_, *hybrid, cache_opts, expert_cache_, &err)) {
@@ -3242,7 +3280,7 @@ bool DeepSeek4Backend::log_device_memory(const char * when) const {
     bool ok = true;
     for (int device : devices) {
         size_t free_b = 0, total_b = 0;
-        ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+        ggml_backend_cuda_get_device_room(device, &free_b, &total_b);
         const size_t headroom = ds4_device_headroom_bytes(device);
         const size_t need = when ? headroom / 2 : headroom;
         std::fprintf(stderr, "[deepseek4] device %d memory%s%s: %.2f of %.2f GiB used, %.2f GiB free "
@@ -3344,7 +3382,7 @@ bool DeepSeek4Backend::size_hybrid_prefill_chunk() {
     const HybridPrefillScratch per_token = hybrid_prefill_scratch_per_token(w_, max_ctx, chunk);
     const auto fit = [this](int device, size_t bytes, size_t fixed) {
         size_t free_b = 0, total_b = 0;
-        ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+        ggml_backend_cuda_get_device_room(device, &free_b, &total_b);
         if (device == cfg_.device.gpu) free_b += prefill_sizing_extra_free_;
         return hybrid_prefill_fit_tokens(free_b, ds4_device_headroom_bytes(device) / 2 + fixed, bytes);
     };
@@ -3352,7 +3390,7 @@ bool DeepSeek4Backend::size_hybrid_prefill_chunk() {
         // A context the smallest chunk cannot prefill at its end is refused
         // at load rather than failing an allocation in the middle of a prompt.
         size_t free_b = 0, total_b = 0;
-        ggml_backend_cuda_get_device_memory(cfg_.device.gpu, &free_b, &total_b);
+        ggml_backend_cuda_get_device_room(cfg_.device.gpu, &free_b, &total_b);
         const size_t keep = ds4_device_headroom_bytes(cfg_.device.gpu) / 2 + per_token.target_fixed;
         const size_t smallest = 64 * per_token.target;
         if (free_b < keep + smallest) {
@@ -3366,7 +3404,7 @@ bool DeepSeek4Backend::size_hybrid_prefill_chunk() {
     int tokens = fit(cfg_.device.gpu, per_token.target, per_token.target_fixed);
     if (stream_cache_device_ >= 0 && stream_cache_device_ != cfg_.device.gpu) {
         size_t free_b = 0, total_b = 0;
-        ggml_backend_cuda_get_device_memory(stream_cache_device_, &free_b, &total_b);
+        ggml_backend_cuda_get_device_room(stream_cache_device_, &free_b, &total_b);
         const size_t keep = ds4_device_headroom_bytes(stream_cache_device_) / 2;
         if (free_b < keep + 64 * per_token.second) {
             std::fprintf(stderr,
@@ -5184,6 +5222,17 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         draft_swap_out()) {
         hybrid_prefill_chunk_cap_ = draft_swap_.cap_without;
     }
+    // Every disposable prefill and decode arena, and the pools' cached blocks.
+    const auto release_prefill_arenas = [&] {
+        deepseek4_release_retry_scratch(cache_, moe_hybrid_.get());
+        ds4_trim_device_pools(backend_, moe_hybrid_.get());
+    };
+    // A fresh prompt's first bulk chunk retires the previous request's decode
+    // and verify graphs before it allocates (deepseek4_step_layer_range, at
+    // position 0 only). A restored prompt would prefill beside them and run
+    // out of device memory where a fresh one fits.
+    constexpr int kBulkPrefillTokens = 512;
+    if (kv_offset > 0 && prefill_tokens >= kBulkPrefillTokens) release_prefill_arenas();
     committed = run_prefill();
     // A pipelined hybrid prefill that ran out of device memory is retried
     // once from the request's starting state with every disposable arena
@@ -5194,7 +5243,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     if (committed < 0 && moe_hybrid_ && deepseek4_prefill_pipeline_bands() > 0 &&
         !cache_.pipeline_off && !out_io.is_cancelled() && !images && !cluster_ &&
         (kv_offset == 0 || prefill_retry_slot_ >= 0)) {
-        deepseek4_release_retry_scratch(cache_, moe_hybrid_.get());
+        release_prefill_arenas();
         cache_.pipeline_off = true;
         const bool restored = kv_offset == 0 || snapshot_restore(prefill_retry_slot_);
         std::fprintf(stderr, "[deepseek4] prefill failed; retrying once from pos %d with the pipeline off%s\n",
@@ -5225,6 +5274,9 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         }
     }
     if (committed < 0) {
+        // Otherwise its arenas stay, and every later restored prompt (which
+        // never reaches the position-0 cleanup) fails on them.
+        release_prefill_arenas();
         result.fail(GenerateErrorCode::PrefillFailed);
         return result;
     }
@@ -5492,6 +5544,33 @@ int DeepSeek4Backend::snapshot_cur_pos(int slot) const {
     return snapshots_[slot].cur_pos;
 }
 
+// Host bytes of a snapshot of `cache` at `tokens` positions, with `aux`'s
+// sidecar when given.
+static size_t ds4_declared_snapshot_bytes(const DeepSeek4Cache & cache, const DeepSeek4Weights & w,
+                                          ggml_backend_t snap_backend, int tokens,
+                                          const DeepSeek4SnapshotAux * aux) {
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() *
+                  (deepseek4_snapshot_tensor_count(cache.n_layer, aux != nullptr) + 4) + 4096;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return 0;
+    DeepSeek4Snapshot layout;
+    size_t bytes = 0;
+    if (deepseek4_snapshot_declare_at(ctx, cache, tokens, w.compress_ratios,
+                                      0, cache.n_layer, nullptr, aux, layout)) {
+        bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            ctx, ggml_backend_get_default_buffer_type(snap_backend));
+    }
+    ggml_free(ctx);
+    return bytes;
+}
+
+size_t DeepSeek4Backend::staged_checkpoint_bytes(int tokens) const {
+    if (!cfg_.paged_attention || !cache_.ctx || !snap_backend_ || tokens <= 0) return 0;
+    return ds4_declared_snapshot_bytes(cache_, w_, snap_backend_, tokens, nullptr);
+}
+
 size_t DeepSeek4Backend::snapshot_bytes_estimate(int tokens) const {
     // Paged serving keeps no single-sequence snapshots.
     if (cfg_.paged_attention || !cache_.ctx || !snap_backend_ || tokens <= 0) {
@@ -5510,21 +5589,7 @@ size_t DeepSeek4Backend::snapshot_bytes_estimate(int tokens) const {
     aux.n_logits = n_logits;
     aux.spec_feat = n_features ? &kDeclared : nullptr;
     aux.n_spec_feat = n_features;
-
-    ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() *
-                  (deepseek4_snapshot_tensor_count(cache_.n_layer, true) + 4) + 4096;
-    ip.no_alloc = true;
-    ggml_context * ctx = ggml_init(ip);
-    if (!ctx) return 0;
-    DeepSeek4Snapshot layout;
-    size_t bytes = 0;
-    if (deepseek4_snapshot_declare_at(ctx, cache_, tokens, w_.compress_ratios,
-                                      0, cache_.n_layer, nullptr, &aux, layout)) {
-        bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
-            ctx, ggml_backend_get_default_buffer_type(snap_backend_));
-    }
-    ggml_free(ctx);
+    const size_t bytes = ds4_declared_snapshot_bytes(cache_, w_, snap_backend_, tokens, &aux);
     return bytes ? bytes + (n_logits + n_features) * sizeof(float) : 0;
 }
 
