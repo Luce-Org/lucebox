@@ -93,13 +93,53 @@ def stream_generate(tok, bin_path: Path, target: Path, draft: Path,
     with tempfile.TemporaryDirectory() as d:
         out_bin = Path(d) / "out.bin"
         r, w = os.pipe()
-        cmd = [str(bin_path), str(target), str(draft), str(prompt_bin),
-               str(n_gen), str(out_bin),
-               "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
-               f"--stream-fd={w}"]
-        proc = subprocess.Popen(cmd, pass_fds=(w,),
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE)
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                os.set_inheritable(w, True)
+                stream_fd_val = int(msvcrt.get_osfhandle(w))
+            else:
+                stream_fd_val = w
+
+            cmd = [
+                str(bin_path),
+                str(target),
+                str(draft),
+                str(prompt_bin),
+                str(n_gen),
+                str(out_bin),
+                "--fast-rollback",
+                "--ddtree",
+                f"--ddtree-budget={budget}",
+                f"--stream-fd={stream_fd_val}",
+            ]
+
+            if sys.platform == "win32":
+                proc = subprocess.Popen(
+                    cmd,
+                    close_fds=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                proc = subprocess.Popen(
+                    cmd,
+                    pass_fds=(w,),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except BaseException:
+            try:
+                os.close(r)
+            except OSError:
+                pass
+            try:
+                os.close(w)
+            except OSError:
+                pass
+            raise
+
         os.close(w)
 
         text = ""
@@ -118,6 +158,10 @@ def stream_generate(tok, bin_path: Path, target: Path, draft: Path,
             proc.terminate()
             raise
         finally:
+            try:
+                os.close(r)
+            except OSError:
+                pass
             proc.wait()
         return text
 
