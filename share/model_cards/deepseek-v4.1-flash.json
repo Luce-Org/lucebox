@@ -63,7 +63,7 @@
       "summary": "DeepSeek V4.1 Flash on an R9700 (gfx1201) beside a 192 GB Gorgon Halo (gfx1151) with every expert resident: dense work, hot experts and the drafter on the R9700, the other experts on the Gorgon; decoder SWA bounded replay and a pipelined layer-major prefill; pass the expert placement and router bias for the box. One request at a time with --draft; for several at once add --paged-attention --max-concurrency N --ds4-prefill sparse, without --draft",
       "gpus": ["gfx1201", "gfx1151"],
       "min_gpu_memory_gib": [0, 160],
-      "notes": "Prefill: bounded replay, layer-major bands with the residual and Engram on the R9700, both owners joined on the device, the Gorgon's cold FFN of one band under the next band's attention, WMMA for plain ROCmFP2 experts, one arena; the cold owner's input crosses PCIe on a side stream. Prefill attention on the R9700's matrix cores: F16 K/V rows into the WMMA D512 kernels (the gfx1151 set; its indexer and causal-window defaults are slower on gfx1201). Decode and verify: F16 K/V on every lane, split-KV flash (eight splits, short lanes included), fused router and HC collapse (both bit-exact). The rest are the ds41-halo owner and kernel settings.",
+      "notes": "Prefill: bounded replay, layer-major bands with the residual and Engram on the R9700, both owners joined on the device, the Gorgon's cold FFN of one band under the next band's attention, WMMA for plain ROCmFP2 experts, one arena; the cold owner's input crosses PCIe on a side stream. Prefill attention on the R9700's matrix cores: F16 K/V rows into the WMMA D512 kernels (the gfx1151 set; its indexer and causal-window defaults are slower on gfx1201). Decode and verify: F16 K/V on every lane, split-KV flash (eight splits, short lanes included), fused router and HC collapse (both bit-exact). From the two-box serving profile, byte-identical here: the single-token verify lanes attend in one split-KV flash op, one peer-copy kernel per handoff on dedicated copy streams, grouped MUL_MAT_ID, the ROCmFP2 prefetch loop, GPU argmax, the drafter's context K/V cache and fine-grain pinned host memory (decode: code 44 -> 53-56 tok/s, a 2K-token document 36-38 -> 47.5-48, see DS41.md). The rest are the ds41-halo owner and kernel settings.",
       "flags": {
         "--target-device": "hip:0",
         "--expert-device": "hip:1",
@@ -124,7 +124,17 @@
         "LUCE_DS4_DIRECT_INDEXER_TOPK": "1",
         "GGML_DS4_TOPK_BLOCK_RADIX": "1",
         "ROCBLAS_USE_HIPBLASLT": "0",
-        "GPU_MAX_HW_QUEUES": "8"
+        "GPU_MAX_HW_QUEUES": "8",
+        "LUCE_DS4_LANE_BATCH": "1",
+        "LUCE_DS4_SCHED_DEDICATED_COPIES": "1",
+        "LUCE_DS4_HC_BOUNDARY_SPLIT": "1",
+        "GGML_CUDA_PEER_COPY_KERNEL": "1",
+        "LUCE_MMID_GROUPED": "1",
+        "LUCE_MMID_GROUPED_TYPES": "79",
+        "LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH": "1",
+        "LUCE_DS4_GPU_ARGMAX_VERIFY": "1",
+        "LUCE_DS4_DRAFT_CONTEXT_KV_CACHE": "1",
+        "HSA_FORCE_FINE_GRAIN_PCIE": "1"
       }
     },
     "ds41-gorgon": {
