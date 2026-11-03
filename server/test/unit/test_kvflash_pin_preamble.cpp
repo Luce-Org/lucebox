@@ -64,7 +64,7 @@ TEST_CASE(KvflashPinPreambleFixture, preamble_end_no_system_is_zero) {
     CHECK(kvflash_preamble_end({S, SYS, NL, 7, S, U}, S, -1) == 0);
 }
 
-// ---- pool sizing -----------------------------------------------------------
+// ---- reserve sizing -----------------------------------------------------------
 TEST_CASE(KvflashPinPreambleFixture, preamble_reserve_rounds_up_to_a_chunk) {
     CHECK(kvflash_preamble_reserve_tokens(0, 64) == 0);
     CHECK(kvflash_preamble_reserve_tokens(-5, 64) == 0);
@@ -73,14 +73,6 @@ TEST_CASE(KvflashPinPreambleFixture, preamble_reserve_rounds_up_to_a_chunk) {
     CHECK(kvflash_preamble_reserve_tokens(7168, 64) == 7168);
     CHECK(kvflash_preamble_reserve_tokens(7169, 64) == 7232);
     CHECK(kvflash_preamble_reserve_tokens(100, 0) == 0);
-}
-TEST_CASE(KvflashPinPreambleFixture, pool_with_preamble_adds_reserve_and_clamps) {
-    CHECK(kvflash_pool_with_preamble(8192, 0, 131072, 64) == 8192);        // off: untouched
-    CHECK(kvflash_pool_with_preamble(0, 7168, 131072, 64) == 0);           // KVFlash off stays off
-    CHECK(kvflash_pool_with_preamble(8192, 7168, 131072, 64) == 15360);
-    CHECK(kvflash_pool_with_preamble(8192, 7168, 10000, 64) == 9984);      // max_ctx clamp, 256 multiple
-    CHECK(kvflash_pool_with_preamble(8192, 128, 131072, 64) == 8448);      // keeps the pool's 256-token stride
-    CHECK(kvflash_pool_with_preamble(8192, 7168, 4096, 64) == 8192);       // max_ctx below the pool: never shrinks it
 }
 TEST_CASE(KvflashPinPreambleFixture, preamble_rows_env) {
     {
