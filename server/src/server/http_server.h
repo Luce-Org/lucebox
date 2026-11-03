@@ -125,7 +125,9 @@ struct ServerConfig {
     size_t      concurrent_prefix_cache_max_bytes = kPrefixCacheBudgetAuto;
     bool        concurrent_prefix_cache = false;
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
-    // Extend the existing prefix cache through generated tool-call turns.
+    // Replay a generated tool-call turn the next request renders with other
+    // tokens, so the prefix cache still extends through it. The launch turns
+    // it on wherever it can run (resolve_agent_turn_cache).
     bool        agent_turn_cache = false;
     // Tool-use checks on OpenAI chat requests with tools (tool_checks.h).
     // A request turns them off or on with "tool_checks": false / true.
@@ -831,6 +833,10 @@ struct ParsedRequest {
     // A tool-checks pass (tool_checks.h): its reply keeps the tool calls the
     // model makes under tool_choice "none", so the checks can retry.
     bool                      tool_checks_pass = false;
+    // A tool-checks pass that adds a note after the model's reply
+    // (tool_checks::with_note). The client never sends that conversation
+    // back, so the pass keeps no checkpoint and no generated turn of it.
+    bool                      tool_checks_note = false;
     // Original messages (for response formatting)
     json                      messages;
     // Original request body (for upstream proxy forwarding)
@@ -954,6 +960,18 @@ void apply_request_reasoning(const json & body,
 // toggle. Kept as a small policy helper so the disabled path is testable.
 bool ppp_prefers_tools_boundary(bool ppp_enabled, bool has_tools);
 
+// Whether the Agent Turn Cache runs. `requested` is --agent-turn-cache
+// (true), --no-agent-turn-cache (false) or neither. The cache replays turns
+// into the single-sequence inline prefix cache, so it is on by default
+// wherever that cache exists. Asked for anywhere else, `error` says why the
+// launch cannot honour it.
+struct AgentTurnCacheChoice {
+    bool         enabled = false;
+    const char * error   = nullptr;
+};
+AgentTurnCacheChoice resolve_agent_turn_cache(
+    std::optional<bool> requested, bool single_sequence, int prefix_cache_slots);
+
 // The tokens PPP remembers as a recent tool head: what the client sent, never
 // a PFlash view. A view is the server's own rewrite; one that dropped a token
 // of the system/tools head (e.g. the system turn's "<|im_end|>\n") would make
@@ -1026,14 +1044,16 @@ private:
                                 RoutingAdmission * admission);
     // One inner non-streaming chat completion. False when the router's
     // admission turned it away (nothing was sent); otherwise `status` and
-     // `body` hold the HTTP response. When `client_fd` disconnects, the inner
-     // request ends as a disconnected request does, freeing its slot. A reply
-     // that dropped unparseable tool-call syntax reports it through
-     // `dropped_tool_call` so the checks can re-ask once.
-     bool inner_chat_completion(const json & request, RoutingAdmission * admission,
-                                int & status, std::string & body,
-                                SocketHandle client_fd = kInvalidSocket,
-                                bool * dropped_tool_call = nullptr);
+    // `body` hold the HTTP response. When `client_fd` disconnects, the inner
+    // request ends as a disconnected request does, freeing its slot. A reply
+    // that dropped unparseable tool-call syntax reports it through
+    // `dropped_tool_call` so the checks can re-ask once. `note_pass` marks a
+    // pass that adds a note (ParsedRequest::tool_checks_note).
+    bool inner_chat_completion(const json & request, RoutingAdmission * admission,
+                               int & status, std::string & body,
+                               SocketHandle client_fd = kInvalidSocket,
+                               bool * dropped_tool_call = nullptr,
+                               bool note_pass = false);
     json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the
