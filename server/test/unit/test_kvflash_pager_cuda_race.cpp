@@ -356,6 +356,8 @@ std::string truncate_run(bool host_chunk) {
         p.synchronize_paging();
         need(p.is_resident(2) || host_chunk, "chunk 2 lost");
         if (!p.is_resident(2)) { need(p.page_in(2), "page_in failed"); p.synchronize_paging(); }
+        need(!p.is_resident(3), "chunk 3 survived the truncate");
+        need(p.resident_blocks() == 3, "chunk 3's block did not return to the free pool");
         const size_t row_bytes = h.k[0]->nb[1];
         std::vector<uint8_t> got(cb);
         for (int c = 0; c < 3; c++) {

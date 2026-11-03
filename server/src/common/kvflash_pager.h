@@ -141,10 +141,9 @@ public:
         if (attn_k.size() != attn_v.size()) return false;
         // Reject a tensor that cannot hold the pool BEFORE touching any state,
         // so a failed attach leaves the previous attachment intact.
-        if (!attn_k.empty()) {
-            const int64_t need_rows = (int64_t)cfg.row_base + cfg.pool_tokens;
-            if ((int64_t)attn_k[0]->ne[1] < need_rows || (int64_t)attn_v[0]->ne[1] < need_rows) return false;
-        }
+        const int64_t need_rows = (int64_t)cfg.row_base + cfg.pool_tokens;
+        for (size_t l = 0; l < attn_k.size(); l++)
+            if ((int64_t)attn_k[l]->ne[1] < need_rows || (int64_t)attn_v[l]->ne[1] < need_rows) return false;
 
         cleanup_();   // release pinned buffers + stream from any prior attach
 
@@ -896,6 +895,8 @@ public:
         const int nc = serialized_chunks_(max_chunks);
         const size_t kv_bytes = (size_t)nc * chunk_bytes_;
         std::vector<int32_t> free_list(free_blocks_.begin(), free_blocks_.end());
+        // A block awaiting its page-out record holds no resident chunk: free in the layout.
+        for (const auto & pf : pending_free_) free_list.insert(free_list.begin(), pf.first);
         for (int c = (int)chunks_.size() - 1; c >= nc; --c)   // dropped tail: handed out last
             if (chunks_[(size_t)c].block >= 0) free_list.insert(free_list.begin(), chunks_[(size_t)c].block);
         const size_t ledger_end = kBlobHdr + kv_bytes + (size_t)nc * kLedgerEntry;

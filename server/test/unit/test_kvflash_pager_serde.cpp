@@ -1264,6 +1264,27 @@ TEST_CASE(KvflashPagerSerdeFixture, deferred_free_holds_blocks_until_their_recor
     REQUIRE(p.alloc_span(11 * kChunk, kChunk));   // immediate reuse again
 }
 
+// The blob is a layout snapshot: a block waiting on its page-out record holds no
+// resident chunk, so it is written as free and a same-size pool takes the blob back.
+TEST_CASE(KvflashPagerSerdeFixture, kvflash3_blob_with_deferred_free_pending_loads_back) {
+    TestPager p;
+    REQUIRE(p.attach(make_cfg(), {}, {}));
+    REQUIRE(p.alloc_span(0, 8 * kChunk));
+    p.set_deferred_free(true);
+    REQUIRE(p.page_out(1));
+    REQUIRE(p.page_out(2));
+    REQUIRE(p.pending_free_blocks() == 2);
+    const std::vector<uint8_t> blob = p.serialize();
+    TestPager q;
+    REQUIRE(q.attach(make_cfg(), {}, {}));
+    REQUIRE(q.deserialize(blob.data(), blob.size()));
+    CHECK(!q.is_resident(1));
+    CHECK(!q.is_resident(2));
+    CHECK(q.is_resident(3));
+    CHECK(q.resident_blocks() == 6);
+    CHECK(q.serialize() == blob);
+}
+
 // A page-out planned against an earlier generation is stale after reset(),
 // attach() or abort_step(): it must not evict the new request's chunk.
 TEST_CASE(KvflashPagerSerdeFixture, page_out_checked_refuses_a_stale_generation_and_protected_chunks) {
@@ -1356,6 +1377,17 @@ TEST_CASE(KvflashPagerSerdeFixture, row_base_attach_refuses_bad_base_and_short_t
     REQUIRE(p.attach(cfg_at(0), {t.k}, {t.v}));
     REQUIRE(p.alloc_span(0, 2 * kChunk));
     CHECK(!p.attach(cfg_at(kBaseChunks), {t.k}, {t.v}));
+    CHECK(p.row_base() == 0);                         // the failed attach left the previous one intact
+    CHECK(p.n_chunks() == 2);
+}
+
+TEST_CASE(KvflashPagerSerdeFixture, attach_refuses_a_later_layer_tensor_too_short_for_the_slice) {
+    TallHarness a(kTotalChunks * kChunk), b((kBaseChunks + kPoolChunks) * kChunk - 1);
+    TestPager p;
+    REQUIRE(p.attach(cfg_at(0), {a.k}, {a.v}));
+    REQUIRE(p.alloc_span(0, 2 * kChunk));
+    CHECK(!p.attach(cfg_at(kBaseChunks), {a.k, b.k}, {a.v, a.v}));   // layer 1 K is short
+    CHECK(!p.attach(cfg_at(kBaseChunks), {a.k, a.k}, {a.v, b.v}));   // layer 1 V is short
     CHECK(p.row_base() == 0);                         // the failed attach left the previous one intact
     CHECK(p.n_chunks() == 2);
 }
