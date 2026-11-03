@@ -88,67 +88,91 @@ class DflashClient:
             ld_extra = [bin_dir, os.path.join(bin_dir, "bin")]
             env["LD_LIBRARY_PATH"] = ":".join(
                 ld_extra + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
-        self.r_pipe, self.w_pipe = os.pipe()
-        # subprocess.Popen pass_fds is POSIX-only. On Windows, mark the pipe
-        # write-end inheritable, convert it to a Win32 HANDLE, and pass that
-        # handle value as --stream-fd; the child inherits via close_fds=False.
-        if sys.platform == "win32":
-            import msvcrt
-            os.set_inheritable(self.w_pipe, True)
-            stream_fd_val = int(msvcrt.get_osfhandle(self.w_pipe))
-        else:
-            stream_fd_val = self.w_pipe
-        cmd = [bin_path, target_path, draft_path,
-               "--daemon", "--fast-rollback", "--ddtree",
-               f"--ddtree-budget={ddtree_budget}",
-               f"--max-ctx={max_ctx}",
-               f"--stream-fd={stream_fd_val}"]
-        if ddtree_temp is not None:
-            cmd.append(f"--ddtree-temp={ddtree_temp}")
-        if not chain_seed:
-            cmd.append("--ddtree-no-chain-seed")
-        log.info("spawning dflash daemon: %s", " ".join(cmd))
-        # Capture free-memory baseline before spawning so _wait_until_loaded can
-        # measure the delta on AMD unified-memory APUs (hipMemGetInfo approach).
-        self._initial_hip_free_mib: int = _hip_free_mib()
-        if sys.platform == "win32":
-            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                         stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT,
-                                         close_fds=False, env=env)
-        else:
-            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                         stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT,
-                                         pass_fds=(self.w_pipe,), env=env)
-        self._start_stdout_reader()
-        os.close(self.w_pipe)
-        self._wait_until_loaded(timeout=boot_timeout_s, vram_mib=boot_vram_mib)
-        # Park draft by default; user calls unpark when needed
-        self._send("park draft\n")
+        self.r_pipe: int = -1
+        self.w_pipe: int = -1
+        self.proc = None
+        self._stdout_thread = None
+        try:
+            self.r_pipe, self.w_pipe = os.pipe()
+            # subprocess.Popen pass_fds is POSIX-only. On Windows, mark the pipe
+            # write-end inheritable, convert it to a Win32 HANDLE, and pass that
+            # handle value as --stream-fd; the child inherits via close_fds=False.
+            if sys.platform == "win32":
+                import msvcrt
+                os.set_inheritable(self.w_pipe, True)
+                stream_fd_val = int(msvcrt.get_osfhandle(self.w_pipe))
+            else:
+                stream_fd_val = self.w_pipe
+            cmd = [bin_path, target_path, draft_path,
+                   "--daemon", "--fast-rollback", "--ddtree",
+                   f"--ddtree-budget={ddtree_budget}",
+                   f"--max-ctx={max_ctx}",
+                   f"--stream-fd={stream_fd_val}"]
+            if ddtree_temp is not None:
+                cmd.append(f"--ddtree-temp={ddtree_temp}")
+            if not chain_seed:
+                cmd.append("--ddtree-no-chain-seed")
+            log.info("spawning dflash daemon: %s", " ".join(cmd))
+            # Capture free-memory baseline before spawning so _wait_until_loaded can
+            # measure the delta on AMD unified-memory APUs (hipMemGetInfo approach).
+            self._initial_hip_free_mib: int = _hip_free_mib()
+            if sys.platform == "win32":
+                self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                             stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT,
+                                             close_fds=False, env=env)
+            else:
+                self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                             stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT,
+                                             pass_fds=(self.w_pipe,), env=env)
+            self._start_stdout_reader()
+            os.close(self.w_pipe)
+            self.w_pipe = -1
+            self._wait_until_loaded(timeout=boot_timeout_s, vram_mib=boot_vram_mib)
+            # Park draft by default; user calls unpark when needed
+            self._send("park draft\n")
+        except Exception:
+            self.close()
+            raise
 
     def _start_stdout_reader(self):
         def _reader():
-            if self.proc.stdout is None:
+            if self.proc is None or self.proc.stdout is None:
                 return
+            stdout = self.proc.stdout
             mirror_stdout = True
-            for raw in iter(self.proc.stdout.readline, b""):
-                try:
-                    line = raw.decode(errors="replace")
-                except AttributeError:
-                    line = str(raw)
-                self._stdout_tail.append(line.rstrip())
-                del self._stdout_tail[:-20]
-                if any(marker in line for marker in _READY_MARKERS):
-                    self._ready_event.set()
-                if mirror_stdout:
+            try:
+                while True:
                     try:
-                        sys.stdout.write(line)
-                        sys.stdout.flush()
-                    except (BrokenPipeError, OSError, ValueError):
-                        mirror_stdout = False
+                        raw = stdout.readline()
+                    except (ValueError, OSError):
+                        break
+                    if not raw:
+                        break
+                    try:
+                        line = raw.decode(errors="replace")
+                    except AttributeError:
+                        line = str(raw)
+                    self._stdout_tail.append(line.rstrip())
+                    del self._stdout_tail[:-20]
+                    if any(marker in line for marker in _READY_MARKERS):
+                        self._ready_event.set()
+                    if mirror_stdout:
+                        try:
+                            sys.stdout.write(line)
+                            sys.stdout.flush()
+                        except (BrokenPipeError, OSError, ValueError):
+                            mirror_stdout = False
+            finally:
+                try:
+                    stdout.close()
+                except Exception:
+                    pass
 
-        threading.Thread(target=_reader, name="dflash-daemon-stdout", daemon=True).start()
+        self._stdout_thread = threading.Thread(
+            target=_reader, name="dflash-daemon-stdout", daemon=True)
+        self._stdout_thread.start()
 
     def _read_vram_used_mib(self) -> Optional[int]:
         """GPU memory allocated since daemon spawn, in MiB.
@@ -176,7 +200,7 @@ class DflashClient:
                 if "Used Memory" in line:
                     return int(line.split()[-1]) // (1024 * 1024)
         except (FileNotFoundError, subprocess.CalledProcessError,
-                subprocess.TimeoutExpired, (ValueError, StopIteration)):
+                subprocess.TimeoutExpired, ValueError, StopIteration):
             pass
         # NVIDIA.
         return _query_nvidia_vram_mib()
@@ -273,11 +297,44 @@ class DflashClient:
         return toks
 
     def close(self, timeout: float = 5.0):
-        try:
-            self.proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            self.proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
+        if self.w_pipe >= 0:
+            try:
+                os.close(self.w_pipe)
+            except OSError:
+                pass
+            self.w_pipe = -1
+        if self.r_pipe >= 0:
+            try:
+                os.close(self.r_pipe)
+            except OSError:
+                pass
+            self.r_pipe = -1
+        if self.proc is not None:
+            try:
+                if self.proc.stdin:
+                    self.proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                try:
+                    self.proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    try:
+                        self.proc.wait(timeout=timeout)
+                    except Exception:
+                        pass
+            finally:
+                if self._stdout_thread is not None and self._stdout_thread.is_alive():
+                    self._stdout_thread.join(timeout=timeout)
+                elif self._stdout_thread is None and self.proc.stdout:
+                    try:
+                        self.proc.stdout.close()
+                    except Exception:
+                        pass
+
+    def __enter__(self) -> DflashClient:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()

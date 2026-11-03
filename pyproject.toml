@@ -39,7 +39,7 @@ select = ["F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 # Repo root on sys.path so tests can import harness/, server/ helpers.
 pythonpath = ["."]
-testpaths = ["server/test/python", "harness", ".github/ci"]
+testpaths = ["server/test/python", "harness", ".github/ci", "optimizations/pflash/tests"]
 addopts = "-ra --strict-markers"
 markers = [
     "server: needs a running luce_server (use --base-url URL or --launch MODEL)",
