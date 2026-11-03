@@ -20,6 +20,20 @@ std::string check_feature_compatibility(
         return "failed to detect model architecture";
     }
 
+    // Only the backends marked kvflash in model_capabilities.h read
+    // LUCE_KVFLASH; on any other architecture --kvflash would be dropped
+    // without a word.
+    if (admission.kvflash_requested() && !arch_supports_kvflash(arch)) {
+        std::string supported;
+        for (const ArchCapabilities & caps : kArchCapabilities) {
+            if (!caps.kvflash) continue;
+            if (!supported.empty()) supported += ", ";
+            supported += caps.arch;
+        }
+        return "--kvflash is not supported on architecture '" + arch +
+               "' (supported: " + supported + ")";
+    }
+
     if (arch == "qwen4exp" && (args.verify_width < 0 || args.verify_width > 8)) {
         return "qwen4exp --verify-width expects 0 (adaptive), 1 (off), or 2..8 (fixed k=1..7)";
     }
