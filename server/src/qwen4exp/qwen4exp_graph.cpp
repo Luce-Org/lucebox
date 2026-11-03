@@ -1894,15 +1894,20 @@ static ggml_backend_sched_t split_scheduler(ggml_backend_t backend, const Qwen4E
         // Both are parallel: per-copy events make a split wait for its
         // cross-device inputs on the GPU; a single-copy scheduler instead
         // synchronizes the receiving device from the host before every such
-        // split, which serializes the two GPUs. Split-input copies live for
-        // the whole graph, so the prompt scheduler keeps one set.
+        // split, which serializes the two GPUs.
         sched = ggml_backend_sched_new(backends, nullptr, 3, kQwen4ExpGraphNodes, true, false);
         // End a split before a node that brings in a new cross-device input,
         // so independent target work is queued before that wait and runs
         // beside the expert device: the other stream's attention in a prompt
         // chunk; the shared and hot experts in a decode or verify step.
         ggml_backend_sched_set_late_cross_input_split(sched, true);
-        if (!short_batch) ggml_backend_sched_set_n_copies(sched, 1);   // events without four copy sets
+        if (!short_batch) {
+            // The prompt scheduler keeps one copy set, and each layer's routed sum and router inputs live from the
+            // split that sent them across until their last reader, not for the whole chunk: about half of a
+            // chunk's target workspace (48 layers of [n_embd, T] per row), which the hot experts can use instead.
+            ggml_backend_sched_set_n_copies(sched, 1);
+            ggml_backend_sched_set_anchored_copies(sched, true);
+        }
     }
     return sched;
 }
@@ -2726,8 +2731,10 @@ bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
                        int32_t token, int max_k, AdaptiveSpecWidth * width, Qwen4ExpMtpPending * pending,
                        const std::function<bool(int32_t, const float *, int32_t &)> & sample_row,
                        std::vector<float> & logits, Qwen4ExpMtpStep & step,
-                       const std::function<void(std::vector<int32_t> &)> & on_drafts) {
+                       const std::function<void(std::vector<int32_t> &)> & on_drafts,
+                       const int32_t * lookup_drafts, int n_lookup) {
     step = {};
+    const bool lookup = pending != nullptr && lookup_drafts != nullptr && n_lookup > 0;
     const size_t hd = (size_t) w.n_embd * w.n_hc;
     auto graph_builds = [&cache] {
         uint64_t n = 0;
@@ -2736,14 +2743,21 @@ bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
         for (const auto & ws : cache.mtp_rank_workspace) n += ws.builds;
         return n;
     };
-    const int n_width = width ? width->next_width_cost_aware({}, cache.mtp_draft + 1) : cache.mtp_draft + 1;
+    // Lookup drafts set the width themselves; otherwise the adaptive controller picks it from the acceptance and step
+    // costs it has learned. The draft head's own probabilities do not help it here: a width chosen from them, with
+    // the drafts read back together, verified narrower batches for no gain (R9700 + Strix Halo: explain 8K
+    // 63.3 -> 61.7 tok/s).
+    const int n_width = lookup ? std::min(n_lookup, cache.mtp_draft) + 1
+                      : width ? width->next_width_cost_aware({}, cache.mtp_draft + 1) : cache.mtp_draft + 1;
     const int k = pending ? std::max(0, std::min(n_width - 1, max_k)) : 0;
     const bool verify = k > 0;
     step.k = k;
     const auto t0 = std::chrono::steady_clock::now();
     const uint64_t builds0 = verify ? graph_builds() : 0;
     std::vector<int32_t> drafts;
-    if (verify) {
+    if (verify && lookup) {
+        drafts.assign(lookup_drafts, lookup_drafts + k);
+    } else if (verify) {
         // After a stretch of plain decode, fold all but the last pair first: a draft catches up at most a verify's.
         if (pending->tok.size() > (size_t) cache.mtp_draft + 1 && !qwen4exp_mtp_catch_up(backend, w, cache, *pending, 1)) {
             step.error = "qwen4exp MTP catch-up failed";
@@ -2776,11 +2790,18 @@ bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
     }
     const int retained = decision.n_emitted;
     if (verify) {
-        // Replace every predicted MTP hidden/KV row with the corresponding
-        // trunk pair on next catch-up, including after a partial accept.
-        pending->h.assign(hidden.begin(), hidden.begin() + (std::ptrdiff_t) ((size_t) retained * hd));
-        pending->tok.assign(decision.emitted.begin(), decision.emitted.begin() + retained);
-        pending->pos = pos;
+        if (lookup) {
+            // The draft layer did not run: its pending pairs are still owed, then the retained ones (as plain
+            // decode adds its one pair). The next MTP round catches them all up.
+            pending->h.insert(pending->h.end(), hidden.begin(), hidden.begin() + (std::ptrdiff_t) ((size_t) retained * hd));
+            pending->tok.insert(pending->tok.end(), decision.emitted.begin(), decision.emitted.begin() + retained);
+        } else {
+            // Replace every predicted MTP hidden/KV row with the corresponding
+            // trunk pair on next catch-up, including after a partial accept.
+            pending->h.assign(hidden.begin(), hidden.begin() + (std::ptrdiff_t) ((size_t) retained * hd));
+            pending->tok.assign(decision.emitted.begin(), decision.emitted.begin() + retained);
+            pending->pos = pos;
+        }
         if (!qwen4exp_verify_rollback(backend, w, cache, pos, retained)) {
             step.error = "qwen4exp verify rollback failed";
             return false;
@@ -2791,8 +2812,12 @@ bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
     }
     // Only a step that replayed its verify and draft graphs times the width; one
     // that built a graph is slower and counts for acceptance alone.
-    if (verify && width) width->observe(decision.n_accepted + 1, k + 1, graph_builds() != builds0 ? -1.0f :
-        (float) std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    step.lookup = verify && lookup;
+    if (verify) {
+        step.round_ms = graph_builds() != builds0 ? -1.0
+            : std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    if (verify && width && !step.lookup) width->observe(decision.n_accepted + 1, k + 1, (float) step.round_ms);
     return true;
 }
 

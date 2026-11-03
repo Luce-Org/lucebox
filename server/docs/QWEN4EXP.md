@@ -113,11 +113,18 @@ Both GPUs run one scheduler: prompt chunks pipeline over 2 to 4 streams so
 the Strix runs one stream's experts while the R9700 runs another's attention.
 
 `--expert-placement` takes a routing-stats CSV (picks per layer and expert)
-and copies the most-routed experts, up to `LUCE_EXPERT_BUDGET_MB` (default
-8192), to the R9700: the same placement flag and budget the DeepSeek4 expert
-tiers use. Decode and verify steps run those picks there while the Strix runs
-the rest; prompt chunks keep every pick on the Strix. Without the flag every
-pick runs on the Strix.
+and copies the most-routed experts to the R9700, in the memory the fitted
+context and the largest prompt chunk leave there (at most
+`LUCE_EXPERT_BUDGET_MB`, the budget the DeepSeek4 expert tiers also read), so
+they shrink neither. Decode and verify steps run those picks there while the
+Strix runs the rest; prompt chunks keep every pick on the Strix. Without the
+flag every pick runs on the Strix. A prompt chunk's copies between the GPUs
+live from the split that sends them until their last reader
+(`ggml_backend_sched_set_anchored_copies`), not for the whole chunk: a
+16384-row chunk's R9700 workspace drops from 8.5 GB to 3.5 GB, so at 131K
+context 11.6 GiB of hot experts fit beside it (R9700 + Strix Halo, 8K / 32K
+prompts: decode 53.6 / 46.4 -> 58.0 / 53.6 tok/s, prompt speed within run-to-run
+spread).
 
 Build for both GPUs with HIP graph replay, which the retained MTP verify and
 draft graphs use:
@@ -166,8 +173,8 @@ per slot.
 | gfx1151 kernels: MMB bf16 and Q8_0 -> F16 WMMA GEMMs, fused HC / GDN / PLE, M-RoPE into the flash-attention layout | done |
 | Chat template, reasoning effort, thinking budget, `preserve_thinking`, `sampling_no_thinking` | done |
 | Concurrent serving (`--max-concurrency 2..4`) | supported on one GPU and in split mode, exact independent slots with full per-slot caches; MTP drafts for a request running alone; the prefix cache serves every slot; more than 4 is refused |
-| MTP speculative decoding | sidecar discovered automatically; adaptive k=1..7 by default (code 16K / 64K 32.4 / 28.2 tok/s, counting 43.5), output identical to MTP off; `--verify-width 1` disables, `2..8` selects fixed k=1..7 |
-| Prefix cache | done: snapshots at chat cut points, restored on hits; a 64K agent turn's first token in ~3.5 s instead of ~65 s (131K context). Prefill keeps a 4096-row chunk first (8192 in split mode). Snapshots share the Strix's memory with the caches (`--max-ctx auto` leaves one full-context snapshot per slot) and live in system memory beside a discrete GPU |
+| MTP speculative decoding | sidecar discovered automatically; adaptive k=1..7 by default (code 16K / 64K 32.4 / 28.2 tok/s, counting 43.5), output identical to MTP off; `--verify-width 1` disables, `2..8` selects fixed k=1..7; with adaptive MTP a round verifies prompt-lookup drafts instead when they are expected to commit more tokens per ms (code edits on R9700 + Strix Halo 66.1 -> 74.3 tok/s; `LUCE_QWEN4EXP_LOOKUP=0` turns it off) |
+| Prefix cache | done: snapshots at chat cut points, restored on hits; a 64K agent turn's first token in ~3.5 s instead of ~65 s (131K context). Prefill keeps a 4096-row chunk first (8192 in split mode) and widens it toward 8192 rows while one full-context snapshot still fits (Strix Halo at 131K context: 5,376 rows, 32K prompt 1,166 -> 1,240 tok/s). Snapshots share the Strix's memory with the caches (`--max-ctx auto` leaves one full-context snapshot per slot) and live in system memory beside a discrete GPU |
 | Layer split | refused |
 | Split mode (`--expert-device`, `--expert-placement`) | routed experts on a second GPU, pipelined prompt chunks, hot experts on the target for decode and verify; measured on R9700 + Strix Halo |
 | Other GPUs | generic paths; kernels, defaults and quality gates are tuned and measured on gfx1151, and on gfx1201 as the split-mode target |

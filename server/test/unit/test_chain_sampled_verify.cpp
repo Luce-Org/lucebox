@@ -390,6 +390,13 @@ TEST_CASE(ChainSampledVerifyFixture, host_only_sampler_configs) {
     SamplerCfg card;
     card.temp = 1.0f; card.top_k = 20; card.top_p = 0.95f;
     CHECK(sample_logits_host_only(card, 248320));
+    // Greedy without penalties scans the host row on every build, the lowest id winning a tie.
+    SamplerCfg greedy;
+    CHECK(sample_logits_host_only(greedy, 248320));
+    std::vector<float> row(16, 0.0f);
+    row[3] = row[9] = 2.0f;
+    std::mt19937_64 rng(1);
+    CHECK(sample_logits(row.data(), (int) row.size(), greedy, {}, rng) == 3);
     // Without top_k, a build with the GPU sampler may sample on the GPU
     // (unless LUCE_GPU_SAMPLE=0); the engine keeps such lanes on its own
     // thread. Without the GPU sampler every config is host-only.

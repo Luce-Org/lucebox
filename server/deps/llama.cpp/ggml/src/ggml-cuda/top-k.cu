@@ -1723,9 +1723,14 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 #elif defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)  // CUB_TOP_K_AVAILABLE
 #ifdef GGML_CUDA_USE_HIPCUB
+    // RDNA4 as well: the device-wide sort below keeps four copies of the scores in the pool (2.7 GB for a
+    // 16384-row prompt chunk at 80K context), which ran an R9700 holding hot experts out of memory. The block radix
+    // top-k is also the faster one there at every row count (R9700: 4 rows of 8192 scores 0.05 vs 0.16 ms, 4096 rows
+    // 2.3 vs 6.7 ms; bench_ds4_topk), and both are stable radix selections: the same ids in the same order.
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool block_radix_enabled = topk_block_radix_override() >= 0
         ? topk_block_radix_override() == 1
-        : GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+        : GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
     if (block_radix_enabled &&
         k == 512 && ncols > 1024 && ncols <= 32768) {
         if (ncols <= 5120) {

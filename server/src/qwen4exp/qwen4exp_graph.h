@@ -149,6 +149,8 @@ struct Qwen4ExpMtpStep {
     Qwen4ExpMtpAcceptance decision;   // emitted[n_emitted - 1] is the next input
     bool more = true;                 // sample_row's last answer
     double draft_s = 0.0, verify_s = 0.0;
+    double round_ms = -1.0;           // the whole step's time; -1 when it built a graph (not a steady-state sample)
+    bool lookup = false;              // the verified drafts were the caller's lookup drafts, not the MTP's
     const char * error = nullptr;
 };
 
@@ -157,12 +159,15 @@ struct Qwen4ExpMtpStep {
 // sample_row (fed token, logits row, sample out; false ends generation) until a draft is rejected, roll the cache
 // back to the retained rows and let the controller observe the step. `pending` (null: no draft layer) ends with
 // `token` and, on success, with the next input. `logits` receives every verified row. on_drafts (test-only) may
-// replace the drafts before verification.
+// replace the drafts before verification. lookup_drafts (n_lookup > 0, with a draft layer) are verified instead of
+// the MTP's: the draft layer does not run, its pending pairs stay and gain the retained ones, and the width
+// controller does not observe the round (common/prompt_lookup.h prices it).
 bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache, int pos,
                        int32_t token, int max_k, AdaptiveSpecWidth * width, Qwen4ExpMtpPending * pending,
                        const std::function<bool(int32_t, const float *, int32_t &)> & sample_row,
                        std::vector<float> & logits, Qwen4ExpMtpStep & step,
-                       const std::function<void(std::vector<int32_t> &)> & on_drafts = {});
+                       const std::function<void(std::vector<int32_t> &)> & on_drafts = {},
+                       const int32_t * lookup_drafts = nullptr, int n_lookup = 0);
 
 // Decode one next token for each independent slot. `caches[s]` owns that
 // sequence's KV and recurrent state; `tokens[s]` and `positions[s]` are never

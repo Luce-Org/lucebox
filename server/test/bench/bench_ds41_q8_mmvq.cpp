@@ -39,6 +39,12 @@ int main(int argc, char ** argv) {
         {"shexp_gu",    5120,   2304, 1},
         {"shexp_down",  2304,   5120, 1},
         {"output",      5120, 129280, 1},
+        // qwen4exp (split mode's R9700): short hyper-connection and shared-expert rows, and a long one
+        {"q4x_hc_up",    320,  10240, 1},
+        {"q4x_hc_down", 10240,   320, 1},
+        {"q4x_sh_down",  640,   2560, 1},
+        {"q4x_sh_gu",   2560,    640, 1},
+        {"q4x_qkv",     2560,  10240, 1},
         // non-Q8_0 dense products of the same verify step
         {"hc_fn_f16",  20480,     24, 1, GGML_TYPE_F16},
         {"compr_f16",   5120,    512, 1, GGML_TYPE_F16},

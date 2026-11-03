@@ -6,6 +6,7 @@
 #pragma once
 
 #include "common/model_backend.h"
+#include "common/prompt_lookup.h"
 #include "placement/placement_config.h"
 
 #include "qwen4exp_internal.h"
@@ -98,6 +99,7 @@ private:
     // Weights, caches, hot experts, the prefill chunk and the prefix allowance, then the slot engine: init and
     // unpark share it, so an unpark sizes itself for the memory free at that time. release_target() undoes it.
     bool load_target();
+    bool load_hot_experts();
     void release_target();
     ggml_backend_t snap_backend_ = nullptr; // prefix snapshot storage: the target, or system memory (see init)
     int remote_layers_ = 0;   // split mode: full-attention layers whose cache rows and attention run on the expert device
@@ -118,6 +120,10 @@ private:
     // The adaptive MTP verify width, kept across requests with its costs per context range.
     AdaptiveSpecWidth     mtp_width_ = qwen4exp_mtp_width_controller();
     SpecWidthCostMemory   mtp_costs_;
+    // Prompt lookup beside the adaptive MTP: the index is rebuilt per request, the policy's costs and acceptance
+    // carry across requests like the width controller's.
+    PromptLookup          lookup_;
+    PromptLookupPolicy    lookup_policy_{QWEN4EXP_MTP_MAX_VERIFY};
 };
 
 }  // namespace luce::common

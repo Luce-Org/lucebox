@@ -3288,7 +3288,7 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     }
 
     // RDNA4 Q8_0 gate/up pairs at several columns (the cluster shared expert in
-    // a verify): one launch reads both matrices and writes the SwiGLU-DS4.
+    // a verify, qwen4exp's shared expert): one launch reads both matrices and writes the SwiGLU.
     if (!ids && direct_vector_layout && src1->ne[1] <= ggml_cuda_mmvq_max_ncols() &&
         !ggml_backend_buft_is_cuda_split(src0->buffer->buft) &&
         !ggml_backend_buft_is_cuda_split(gate->src[0]->buffer->buft) &&

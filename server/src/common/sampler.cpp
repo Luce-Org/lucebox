@@ -18,6 +18,11 @@
 namespace luce::common {
 
 namespace {
+// Greedy with no penalty configured: sample_logits_chain scans the host row for its maximum.
+bool greedy_scan(const SamplerCfg & cfg) {
+    return cfg.temp <= 0.0f && cfg.rep_pen <= 1.0f && cfg.freq_pen == 0.0f && cfg.pres_pen == 0.0f;
+}
+
 #ifdef LUCE_HAVE_GPU_SAMPLER
 // The two GPU paths sample_logits_chain may take; sample_logits_host_only
 // reads the same decisions.
@@ -154,6 +159,17 @@ int sample_logits_chain(const float * logits_in,
                         const SamplerCfg & cfg,
                         const std::vector<int32_t> & history,
                         std::mt19937_64 & rng) {
+    // Greedy with no penalty to apply: the highest logit, the lowest id on ties (as the CPU chain below and the
+    // GPU kernel pick). The row is already on the host, so one scan beats both the candidate copy below and the
+    // GPU path, which uploads the whole row again (a vocab-wide copy per sampled row, over PCIe on a discrete
+    // card) to scan it there.
+    if (vocab > 0 && (greedy_scan(cfg) || (cfg.temp <= 0.0f && history.empty()))) {
+        int best = 0;
+        for (int i = 1; i < vocab; ++i) {
+            if (logits_in[i] > logits_in[best]) best = i;
+        }
+        return best;
+    }
     // Draw the single uniform up front, exactly once, and only when we will
     // actually sample (temp>0; greedy returns before any draw). It is then
     // threaded through every path below — the full-GPU draw, the GPU-assisted
@@ -277,7 +293,7 @@ int sample_logits_chain(const float * logits_in,
 
 bool sample_logits_host_only(const SamplerCfg & cfg, int vocab) {
 #ifdef LUCE_HAVE_GPU_SAMPLER
-    return !gpu_full_sample_path(cfg) && !gpu_probs_path(cfg, vocab);
+    return greedy_scan(cfg) || (!gpu_full_sample_path(cfg) && !gpu_probs_path(cfg, vocab));
 #else
     (void) cfg;
     (void) vocab;
