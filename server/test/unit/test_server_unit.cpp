@@ -9945,62 +9945,61 @@ struct ScriptedReplyBackend : MockBackend {
     }
 };
 
-// A stateless agent sends the thinking tool-call turn back with its tool
-// result. The next prompt must hold the turn exactly as generated (previous
-// prompt + generated tokens), and the server's checkpoint of the generated
-// turn must serve it, so only the tool result is prefilled.
-TEST_CASE(ServerUnitFixture, test_thinking_tool_turn_replays_as_generated) {
-    // Qwen-shaped vocabulary: the think and tool markers are single tokens,
-    // and "\n\n" and "\n\n\n" are distinct newline tokens.
+// Qwen-shaped vocabulary: the think and tool markers are single tokens, and
+// "\n\n" and "\n\n\n" are distinct newline tokens.
+static std::string write_thinking_tool_tokenizer_fixture() {
     std::string printable = "\n";
     for (char c = ' '; c <= '~'; ++c) printable += c;
-    const std::string path = write_pflash_bpe_tokenizer_fixture(
+    return write_pflash_bpe_tokenizer_fixture(
         {"\n\n", "\n\n\n"}, printable,
         {"<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>",
          "</tool_call>", "<tool_response>", "</tool_response>"});
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+}
 
-    // The model closes its thinking with the </think> token followed by the
-    // "\n\n" token, then calls a tool and ends its turn.
+// How a client talks to the server in send_thinking_tool_turn.
+enum class ToolTurnApi { chat, chat_stream, responses };
+
+// A stateless agent's two requests to `server` over `api`: a thinking
+// tool-call turn, then the conversation with the call's result. `reply` sets
+// what the backend generates next. Returns the generated turn: the model
+// closes its thinking with the </think> token followed by the "\n\n" token,
+// then calls a tool and ends its turn.
+static std::vector<int32_t> send_thinking_tool_turn(
+        HttpServer & server, const Tokenizer & tokenizer,
+        const std::function<void(std::vector<int32_t>)> & reply,
+        ToolTurnApi api = ToolTurnApi::chat) {
     std::vector<int32_t> generated = tokenizer.encode(
         "I will read a.py first.\n</think>\n\n<tool_call>\n<function=read>\n"
         "<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>");
     generated.push_back(tokenizer.eos_chat_id());
 
-    auto backend_owner = std::make_unique<ScriptedReplyBackend>();
-    ScriptedReplyBackend & backend = *backend_owner;
-    backend.reply = generated;
-    LuceEngine engine(std::move(backend_owner));
-    ServerConfig config;
-    config.max_ctx = 4096;
-    config.prefix_cache_cap = 4;
-    HttpServer server(engine, tokenizer, config);
-    TEST_ASSERT(SchedulerTestHarness::start_worker(server));
-
-    const json tools = json::array({{
-        {"type", "function"},
-        {"function", {
-            {"name", "read"},
-            {"description", "Read a file"},
-            {"parameters", {
-                {"type", "object"},
-                {"properties", {{"path", {{"type", "string"}}}}},
-                {"required", json::array({"path"})}}}}}}});
-    const auto chat = [&](const json & messages) {
+    const json parameters = {
+        {"type", "object"},
+        {"properties", {{"path", {{"type", "string"}}}}},
+        {"required", json::array({"path"})}};
+    const bool responses = api == ToolTurnApi::responses;
+    const json tools = responses
+        ? json::array({{{"type", "function"}, {"name", "read"},
+                        {"description", "Read a file"}, {"parameters", parameters}}})
+        : json::array({{{"type", "function"},
+                        {"function", {{"name", "read"}, {"description", "Read a file"},
+                                      {"parameters", parameters}}}}});
+    // The response body, or the data payloads of a stream's events.
+    const auto send = [&](const json & history) {
         int sockets[2] = {-1, -1};
         TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
-        const json body = {
+        json body = {
             {"model", "test"},
-            {"messages", messages},
             {"tools", tools},
-            {"max_tokens", 64},
             {"chat_template_kwargs", {{"enable_thinking", true}}},
             // Only the client's requests reach the backend.
             {"tool_checks", false},
         };
+        body[responses ? "input" : "messages"] = history;
+        body[responses ? "max_output_tokens" : "max_tokens"] = 256;
+        if (api == ToolTurnApi::chat_stream) body["stream"] = true;
         TEST_ASSERT(SchedulerTestHarness::route(
-            server, sockets[0], "/v1/chat/completions", body));
+            server, sockets[0], responses ? "/v1/responses" : "/v1/chat/completions", body));
         close(sockets[0]);
         std::string wire;
         char buf[4096];
@@ -10009,40 +10008,203 @@ TEST_CASE(ServerUnitFixture, test_thinking_tool_turn_replays_as_generated) {
         close(sockets[1]);
         const size_t body_at = wire.find("\r\n\r\n");
         TEST_ASSERT_MSG(body_at != std::string::npos, wire);
-        return json::parse(wire.substr(body_at + 4));
+        if (api != ToolTurnApi::chat_stream) return json::parse(wire.substr(body_at + 4));
+        json events = json::array();
+        for (size_t at = wire.find("data: ", body_at); at != std::string::npos;
+             at = wire.find("data: ", at)) {
+            at += 6;
+            const std::string data = wire.substr(at, wire.find('\n', at) - at);
+            if (data != "[DONE]") events.push_back(json::parse(data));
+        }
+        return events;
     };
 
-    json messages = json::array({
+    json history = json::array({
         {{"role", "system"}, {"content", "You are a coding agent."}},
         {{"role", "user"}, {"content", "Read a.py."}},
     });
-    const json first = chat(messages);
-    const json reply = first["choices"][0]["message"];
-    TEST_ASSERT_MSG(reply.contains("tool_calls") && reply["tool_calls"].size() == 1,
-                    first.dump());
-    messages.push_back(reply);
-    messages.push_back({{"role", "tool"},
-                        {"tool_call_id", reply["tool_calls"][0]["id"]},
-                        {"content", "print(1)"}});
-    backend.reply = {tokenizer.eos_chat_id()};
-    chat(messages);
+    reply(generated);
+    const json first = send(history);
+    std::string call_id;
+    if (responses) {
+        // The client sends the output items back, then the call's result.
+        for (const auto & item : first["output"]) {
+            history.push_back(item);
+            if (item["type"] == "function_call") call_id = item["call_id"];
+        }
+        history.push_back({{"type", "function_call_output"}, {"call_id", call_id},
+                           {"output", "print(1)"}});
+    } else {
+        json message = {{"role", "assistant"}, {"content", ""}};
+        if (api == ToolTurnApi::chat) {
+            message = first["choices"][0]["message"];
+        } else {
+            // The client assembles the streamed deltas into the message.
+            std::string reasoning;
+            json call = {{"type", "function"}, {"function", {{"arguments", ""}}}};
+            for (const auto & event : first) {
+                if (!event.contains("choices") || event["choices"].empty()) continue;
+                const json & delta = event["choices"][0].value("delta", json::object());
+                if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
+                    reasoning += delta["reasoning_content"].get<std::string>();
+                }
+                for (const auto & part : delta.value("tool_calls", json::array())) {
+                    if (part.contains("id")) call["id"] = part["id"];
+                    const json & function = part.value("function", json::object());
+                    if (function.contains("name")) call["function"]["name"] = function["name"];
+                    if (function.contains("arguments")) {
+                        call["function"]["arguments"] = call["function"]["arguments"]
+                            .get<std::string>() + function["arguments"].get<std::string>();
+                    }
+                }
+            }
+            message["reasoning_content"] = reasoning;
+            if (call.contains("id")) message["tool_calls"] = json::array({call});
+        }
+        TEST_ASSERT_MSG(message.contains("tool_calls") && message["tool_calls"].size() == 1,
+                        first.dump());
+        if (message.contains("tool_calls") && !message["tool_calls"].empty()) {
+            call_id = message["tool_calls"][0].value("id", "");
+        }
+        history.push_back(message);
+        history.push_back({{"role", "tool"}, {"tool_call_id", call_id},
+                           {"content", "print(1)"}});
+    }
+    TEST_ASSERT_MSG(!call_id.empty(), first.dump());
+    reply({tokenizer.eos_chat_id()});
+    send(history);
+    return generated;
+}
+
+// Where `next` stops following `prompt` + `generated`; empty when it extends
+// them.
+static std::string generated_turn_gap(
+        const Tokenizer & tokenizer, std::vector<int32_t> turn,
+        const std::vector<int32_t> & generated, const std::vector<int32_t> & next) {
+    turn.insert(turn.end(), generated.begin(), generated.end());
+    size_t same = 0;
+    while (same < turn.size() && same < next.size() && turn[same] == next[same]) ++same;
+    if (same == turn.size() && next.size() > turn.size()) return {};
+    return "next prompt leaves the generated turn at token " + std::to_string(same) +
+           " of " + std::to_string(turn.size()) + ": " +
+           tokenizer.decode({next.begin() + (long) same,
+                             next.begin() + (long) std::min(next.size(), same + 4)});
+}
+
+// A stateless agent sends the thinking tool-call turn back with its tool
+// result. The next prompt must hold the turn exactly as generated (previous
+// prompt + generated tokens), and the server's checkpoint of the generated
+// turn must serve it, so only the tool result is prefilled.
+TEST_CASE(ServerUnitFixture, test_thinking_tool_turn_replays_as_generated) {
+    const std::string path = write_thinking_tool_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<ScriptedReplyBackend>();
+    ScriptedReplyBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 4;
+    HttpServer server(engine, tokenizer, config);
+    TEST_ASSERT(SchedulerTestHarness::start_worker(server));
+
+    const std::vector<int32_t> generated = send_thinking_tool_turn(
+        server, tokenizer, [&](std::vector<int32_t> reply) { backend.reply = std::move(reply); });
     unlink(path.c_str());
 
     TEST_ASSERT(backend.prompts.size() == 2);
     if (backend.prompts.size() != 2) return;
-    std::vector<int32_t> turn = backend.prompts[0];
-    turn.insert(turn.end(), generated.begin(), generated.end());
-    const std::vector<int32_t> & next = backend.prompts[1];
-    size_t same = 0;
-    while (same < turn.size() && same < next.size() && turn[same] == next[same]) ++same;
-    TEST_ASSERT_MSG(same == turn.size() && next.size() > turn.size(),
-                    "next prompt leaves the generated turn at token " +
-                    std::to_string(same) + " of " + std::to_string(turn.size()) +
-                    ": " + tokenizer.decode({next.begin() + (long) same,
-                                             next.begin() + (long) std::min(next.size(), same + 4)}));
-    TEST_ASSERT_MSG(backend.restored_prefix == (int) turn.size() - 1,
+    const std::string gap = generated_turn_gap(
+        tokenizer, backend.prompts[0], generated, backend.prompts[1]);
+    TEST_ASSERT_MSG(gap.empty(), gap);
+    const int turn = (int) (backend.prompts[0].size() + generated.size());
+    TEST_ASSERT_MSG(backend.restored_prefix == turn - 1,
                     "restored " + std::to_string(backend.restored_prefix) + " of " +
-                    std::to_string(turn.size()));
+                    std::to_string(turn));
+}
+
+// The concurrent engine samples `reply` for every request: the token that
+// ends each prompt's prefill, then one token per decode step.
+class ScriptedReplyEngine final : public SeqEngine {
+public:
+    int32_t eos = -1;
+    std::vector<int32_t> reply;
+    std::vector<std::vector<int32_t>> prompts;
+
+    int slot_count() const override { return 1; }
+    int max_context() const override { return 4096; }
+    bool token_is_eos(int32_t token) const override { return token == eos; }
+    StepPlanLimits step_plan_limits(int) const override { return {1, 4096, 4096, 4096}; }
+    AdmitResult admit(uint64_t, const std::vector<int32_t> & prompt, const SamplerCfg &) override {
+        prompts.push_back(prompt);
+        next_ = 0;
+        AdmitResult result;
+        result.status = AdmitResult::Status::admitted;
+        result.slot = 0;
+        return result;
+    }
+    StepResult step(const StepPlan & plan) override {
+        StepResult result;
+        for (const StepInput & input : plan.decode) {
+            result.decode.push_back({input.slot, reply[std::min(next_++, reply.size() - 1)], false, {}});
+        }
+        for (const PrefillSlice & slice : plan.prefills) {
+            PrefillOutput out;
+            out.slot = slice.slot;
+            out.status = PrefillOutput::Status::completed;
+            out.token = reply[std::min(next_++, reply.size() - 1)];
+            result.prefills.push_back(out);
+        }
+        return result;
+    }
+    void retire(int) override {}
+
+private:
+    size_t next_ = 0;
+};
+
+struct ScriptedReplySeqBackend : MockBackend {
+    ScriptedReplyEngine engine;
+    SeqEngine * seq_engine() override { return &engine; }
+};
+
+// Under continuous batching too, the thinking tool-call turn comes back on the
+// next request exactly as generated: streamed or not, and over Responses.
+TEST_CASE(ServerUnitFixture, test_concurrent_thinking_tool_turn_replays_as_generated) {
+    const std::string path = write_thinking_tool_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    std::string failures;
+    for (const ToolTurnApi api :
+         {ToolTurnApi::chat, ToolTurnApi::chat_stream, ToolTurnApi::responses}) {
+        auto backend_owner = std::make_unique<ScriptedReplySeqBackend>();
+        ScriptedReplyEngine & seq = backend_owner->engine;
+        seq.eos = tokenizer.eos_chat_id();
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.arch = "qwen35";
+        config.max_ctx = 4096;
+        config.prefix_cache_cap = 0;
+        config.admission_coalesce_ms = 0;
+        HttpServer server(engine, tokenizer, config);
+        TEST_ASSERT(SchedulerTestHarness::start_worker(server));
+
+        const std::vector<int32_t> generated = send_thinking_tool_turn(
+            server, tokenizer, [&](std::vector<int32_t> reply) { seq.reply = std::move(reply); },
+            api);
+
+        const std::string name = api == ToolTurnApi::chat ? "chat"
+            : api == ToolTurnApi::chat_stream ? "chat stream" : "responses";
+        if (seq.prompts.size() != 2) {
+            failures += name + ": " + std::to_string(seq.prompts.size()) + " prompts\n";
+            continue;
+        }
+        const std::string gap = generated_turn_gap(
+            tokenizer, seq.prompts[0], generated, seq.prompts[1]);
+        if (!gap.empty()) failures += name + ": " + gap + "\n";
+    }
+    unlink(path.c_str());
+    TEST_ASSERT_MSG(failures.empty(), failures);
 }
 #endif  // !defined(_WIN32)
 
