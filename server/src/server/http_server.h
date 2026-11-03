@@ -37,6 +37,7 @@
 #include "pflash_unified.h"
 #include "pflash/pflash_selection.h"
 #include <nlohmann/json.hpp>
+#include <memory>
 
 #include <atomic>
 #include <array>
@@ -824,6 +825,11 @@ struct ParsedRequest {
     json                      tools;
     // Tool choice constraint (stored for hint generation)
     json                      tool_choice;
+    // The reply carried tool-call syntax that produced no callable call, so
+    // the text was dropped instead of sent. Tool checks re-ask once on this.
+    // A shared target, because the worker that builds the response owns a
+    // copy of this request.
+    std::shared_ptr<bool>     dropped_tool_call_out;
     // A tool-checks pass (tool_checks.h): its reply keeps the tool calls the
     // model makes under tool_choice "none", so the checks can retry.
     bool                      tool_checks_pass = false;
@@ -1039,11 +1045,14 @@ private:
     // One inner non-streaming chat completion. False when the router's
     // admission turned it away (nothing was sent); otherwise `status` and
     // `body` hold the HTTP response. When `client_fd` disconnects, the inner
-    // request ends as a disconnected request does, freeing its slot.
-    // `note_pass` marks a pass that adds a note (ParsedRequest::tool_checks_note).
+    // request ends as a disconnected request does, freeing its slot. A reply
+    // that dropped unparseable tool-call syntax reports it through
+    // `dropped_tool_call` so the checks can re-ask once. `note_pass` marks a
+    // pass that adds a note (ParsedRequest::tool_checks_note).
     bool inner_chat_completion(const json & request, RoutingAdmission * admission,
                                int & status, std::string & body,
                                SocketHandle client_fd = kInvalidSocket,
+                               bool * dropped_tool_call = nullptr,
                                bool note_pass = false);
     json model_routing_status();
 
