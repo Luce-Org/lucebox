@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <utility>
 
@@ -241,13 +242,31 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::mtp_step(const StepInput & input) {
     };
     const uint64_t builds0 = verify_builds();
 
-    // Rows are sampled as one-token decode would, each after its own fed token, up to EOS.
+    // Rows are sampled as one-token decode would, each after its own fed token, up to EOS, and read only when
+    // sampled. Greedy rows take the device's pick (token already holds it), the lowest id of the maximum as
+    // max_element finds it; a top_k draw first tries the row's top candidates (sample_logits_top). Kill switch:
+    // LUCE_GPU_ARGMAX=0 reads every row back.
+    static const bool gpu_argmax = [] {
+        const char * e = std::getenv("LUCE_GPU_ARGMAX");
+        return e == nullptr || e[0] != '0';
+    }();
+    const Qwen4ExpRows rows = !gpu_argmax ? Qwen4ExpRows::all
+                            : slot.sampler.needs_logit_processing() ? Qwen4ExpRows::lazy : Qwen4ExpRows::greedy;
+    const int top_n = rows == Qwen4ExpRows::lazy ? sample_logits_top_n(slot.sampler, weights_.n_vocab) : 0;
     const size_t history0 = slot.sample_history.size();
-    auto sample_row = [&](int32_t fed, const float * row, int32_t & token) {
+    auto sample_row = [&](int32_t fed, const Qwen4ExpRow & row, int32_t & token) {
         slot.sample_history.push_back(fed);
-        token = slot.sampler.needs_logit_processing()
-            ? sample_logits(row, weights_.n_vocab, slot.sampler, slot.sample_history, slot.rng)
-            : (int32_t)(std::max_element(row, row + weights_.n_vocab) - row);
+        if (row.picked) return !token_is_eos(token);
+        const int t = row.top_n > 0 ? sample_logits_top(row.top_vals, row.top_ids, row.top_n, weights_.n_vocab,
+                                                        slot.sampler, slot.sample_history, slot.rng) : -1;
+        if (t >= 0) {
+            token = t;
+        } else {
+            const float * logits = row.logits();
+            token = slot.sampler.needs_logit_processing()
+                ? sample_logits(logits, weights_.n_vocab, slot.sampler, slot.sample_history, slot.rng)
+                : (int32_t)(std::max_element(logits, logits + weights_.n_vocab) - logits);
+        }
         return !token_is_eos(token);
     };
     mtp_.pending.tok.push_back(input.token);
@@ -255,7 +274,7 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::mtp_step(const StepInput & input) {
     Qwen4ExpMtpStep step;
     const bool ok = qwen4exp_mtp_step(backend_, weights_, cache, pos, input.token, max_context() - pos - 1,
                                       verify_width_ == 0 ? mtp_width_ : nullptr, &mtp_.pending, sample_row,
-                                      logits, step);
+                                      logits, step, {}, nullptr, 0, rows, top_n);
     slot.sample_history.resize(history0);
     if (!ok) {
         result.error = step.error;

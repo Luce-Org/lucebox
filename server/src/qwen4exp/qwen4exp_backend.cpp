@@ -763,10 +763,27 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         lookup_.append(&next, 1);
     }
     // Each trunk row sampled (lazily, in qwen4exp_mtp_step) updates history and applies the budget hook exactly
-    // once per emitted token. No RNG draws for unvisited verify rows.
-    auto sample_row = [&](int32_t fed, const float * row, int32_t & tok) {
+    // once per emitted token. No RNG draws for unvisited verify rows, and no reads of them: a greedy request takes
+    // each row's pick from the device (tok already holds it, the host scan's pick); a top_k draw first tries the
+    // row's top candidates, the same draw sample_logits makes from the whole row, which it reads only when the
+    // candidates cannot settle the cut. Kill switch: LUCE_GPU_ARGMAX=0 reads every row back.
+    static const bool gpu_argmax = [] {
+        const char * e = std::getenv("LUCE_GPU_ARGMAX");
+        return e == nullptr || e[0] != '0';
+    }();
+    const Qwen4ExpRows rows = !gpu_argmax || decode_check_ ? Qwen4ExpRows::all
+                            : sample_logits_is_argmax(req.sampler) ? Qwen4ExpRows::greedy : Qwen4ExpRows::lazy;
+    const int top_n = rows == Qwen4ExpRows::lazy ? sample_logits_top_n(req.sampler, weights_.n_vocab) : 0;
+    int top_rows = 0, top_misses = 0;
+    auto sample_row = [&](int32_t fed, const Qwen4ExpRow & row, int32_t & tok) {
         history.push_back(fed);
-        tok = sample(row);
+        if (!row.picked) {
+            const int t = row.top_n > 0 ? sample_logits_top(row.top_vals, row.top_ids, row.top_n, weights_.n_vocab,
+                                                            req.sampler, history, rng) : -1;
+            top_rows += row.top_n > 0;
+            top_misses += row.top_n > 0 && t < 0;
+            tok = t >= 0 ? t : sample(row.logits());
+        }
         return commit(tok);
     };
     auto on_drafts = [&](std::vector<int32_t> & draft_tokens) {
@@ -787,7 +804,8 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         }
         if (!qwen4exp_mtp_step(backend_, weights_, cache_, pos, next, max_k, adaptive ? &mtp_width_ : nullptr,
                                mtp ? &mtp_pending : nullptr, sample_row, logits, step, on_drafts,
-                               pick.lookup ? look.data() : nullptr, pick.lookup ? pick.width - 1 : 0)) {
+                               pick.lookup ? look.data() : nullptr, pick.lookup ? pick.width - 1 : 0,
+                               rows, top_n)) {
             result.fail(GenerateErrorCode::DecodeFailed, step.error);
             return result;
         }
@@ -808,8 +826,12 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         draft_s += step.draft_s;
         const int retained = step.decision.n_emitted;
         next = step.decision.emitted[retained - 1];
-        logits_.assign(logits.begin() + (size_t) (retained - 1) * weights_.n_vocab,
-                       logits.begin() + (size_t) retained * weights_.n_vocab);
+        if (rows == Qwen4ExpRows::all) {
+            logits_.assign(logits.begin() + (size_t) (retained - 1) * weights_.n_vocab,
+                           logits.begin() + (size_t) retained * weights_.n_vocab);
+        } else if (!step.more) {
+            logits_.swap(logits);   // the last emitted row
+        }
         pos += retained;
         if (decode_check_) decode_check_(false, mtp_pending.tok, logits_);
     }
@@ -854,7 +876,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
             "[qwen4exp-mtp] k=%d drafts=%lld accepted=%lld rate=%.3f tokens_per_step=%.3f draft_ms=%.2f decode=%.2f tok/s "
             "adaptive=%d steps_k1=%lld steps_k2=%lld steps_k3=%lld steps_k4=%lld steps_k5=%lld steps_k6=%lld steps_k7=%lld "
             "verify_builds=%llu verify_replays=%llu draft_builds=%llu draft_replays=%llu width_ms=%s "
-            "lookup=%d lookup_rounds=%lld lookup_drafts=%lld lookup_accepted=%lld\n",
+            "lookup=%d lookup_rounds=%lld lookup_drafts=%lld lookup_accepted=%lld top_n=%d top_rows=%d top_misses=%d\n",
             cache_.mtp_draft, drafts, accepted, (double) accepted / (double) drafts, steps > 0 ? decoded / (double) steps : 0.0,
             1e3 * draft_s / (double) drafts, result.decode_s > 0.0 ? decoded / result.decode_s : 0.0,
             (int) adaptive, width_steps[1], width_steps[2], width_steps[3], width_steps[4],
@@ -863,7 +885,8 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
             (unsigned long long) (verify_graphs(&Qwen4ExpDecodeWorkspace::replays) - replays0),
             (unsigned long long) (draft_graphs(&Qwen4ExpDecodeWorkspace::builds) - draft_builds0),
             (unsigned long long) (draft_graphs(&Qwen4ExpDecodeWorkspace::replays) - draft_replays0),
-            width_costs.c_str(), (int) use_lookup, lookup_rounds, lookup_drafts, lookup_accepted);
+            width_costs.c_str(), (int) use_lookup, lookup_rounds, lookup_drafts, lookup_accepted, top_n, top_rows,
+            top_misses);
     }
 
     guard.complete = true;

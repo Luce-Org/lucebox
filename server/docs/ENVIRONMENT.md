@@ -39,6 +39,7 @@ profile and the requirements checked at startup.
 | `LUCE_ATTN_FUSE_LEGACY` | unset | KILL SWITCH: =1 restores the separate kernels of the qwen4exp attention norm sites: RMS_NORM, MUL and ROPE (Q, K, indexer q) run as three launches instead of one, the QSA3 prefill attention and its sigmoid output gate run as two kernels, and the hc grouped norm is built with its gamma view between RMS_NORM and MUL. By default each fused form is bit-identical to the chain it replaces. |
 | `LUCE_GDN_NORM_LEGACY` | unset | KILL SWITCH: =1 restores the block-per-row gated RMS norm and the separate q/k RMS norm + scale passes of the qwen4exp gated-delta-net layers. By default one wave owns a 128-column gated-norm row and the q/k norm is folded into the conv epilogue on gfx1151 (bit-identical). |
 | `LUCE_CPY_VEC_LEGACY` | unset | KILL SWITCH: =1 keeps the one-element-per-thread kernel for strided same-type copies. By default a copy whose rows and bases are 16-byte aligned moves one 16-byte chunk per thread (the byte-identical K/V cache append on the qwen4exp graphs). |
+| `LUCE_GPU_ARGMAX` | 1 | KILL SWITCH: =0 reads every logits row back to the host. By default a greedy request without penalties or grammar (Qwen3.5/3.6 decode, Qwen3.8-Flash-Next decode and verify) takes each row's pick from a device argmax, the lowest id on ties as the host scan picks, and reads back one id per row instead of the row (a 5-row verify is 5 MB of logits); on Qwen3.8-Flash-Next a sampled request with a top_k reads each row's top candidates (32 or 64 ids and logits, from a device top-k) and draws from them the token the whole row gives, reading the row only when they cannot settle the draw, and any other request reads only the verify rows it samples, one at a time. |
 | `LUCE_QWEN4EXP_LOOKUP` | 1 | KILL SWITCH (burn-in): =0 verifies only the MTP drafter's tokens on Qwen3.8-Flash-Next. By default, beside adaptive MTP, a round verifies prompt-lookup drafts instead (the tokens that followed an earlier copy of the current suffix) when their expected tokens per millisecond beat the MTP's (`common/prompt_lookup.h`). Greedy output is the target's either way. |
 | `LUCE_PLE_FUSE_LEGACY` | unset | KILL SWITCH: =1 restores the unfused qwen4exp PLE prefill: the conv (concat, four transposed taps, mul, add, silu) runs as separate nodes instead of one fused launch, and the PLE grouped norm keeps its gamma view between RMS_NORM and MUL. By default both fused forms are bit-identical to the chain they replace. |
 | `LUCE_PREFILL_UBATCH` | backend-dependent (512 in `qwen35_backend.cpp`; 16/384 in `layer_split_daemon.cpp`; `cfg_.chunk` in `qwen35_layer_split_adapter.cpp`) | Prefill ubatch. Under pooled kvflash prefill it is rounded down to a multiple of the pager chunk (never below one chunk) and clamped to the pool, instead of being forced to one chunk per ubatch. |
@@ -283,7 +284,7 @@ profile and the requirements checked at startup.
 - `LUCE_G4_BSA_CHUNK` - gemma4_graph.cpp
 - `LUCE_GEMMA4_LAYER_SPLIT_UBATCH` - gemma4_layer_split_adapter.cpp
 - `LUCE_GEMMA4_NO_KVPAD` - gemma4_graph.cpp
-- `LUCE_GPU_ARGMAX` - qwen35_backend.cpp
+- `LUCE_GPU_ARGMAX` - qwen35_backend.cpp, qwen4exp_backend.cpp, qwen4exp_seq_engine.cpp
 - `LUCE_GPU_DRAFT_TOPK` - qwen35_dflash_target.cpp
 - `LUCE_GPU_SAMPLE` - geometric_sampler_cuda.cu
 - `LUCE_GPU_VERIFY_ARGMAX` - qwen35_dflash_target.cpp

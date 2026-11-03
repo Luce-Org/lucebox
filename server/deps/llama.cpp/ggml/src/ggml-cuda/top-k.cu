@@ -1742,12 +1742,14 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
         return;
     }
-    // Rows past the 8-tile merge (the indexer beyond 32K compressed rows)
-    // and k = 2048 (candidate blocks): the tiled selection, unless the block
-    // radix top-k is explicitly off, instead of a device-wide sort whose
-    // scratch grows with every score.
-    if (topk_block_radix_override() != 0 && ncols > 4096 &&
-        ((k == 512 && ncols > 32768) || k == 2048)) {
+    // Rows past the 8-tile merge (the indexer beyond 32K compressed rows),
+    // k = 2048 (candidate blocks) and a sampler's top candidates over the
+    // vocabulary (k = 32 or 64 of 248K logits): the tiled selection, unless
+    // the block radix top-k is explicitly off, instead of a device-wide sort
+    // whose scratch grows with every score. Both are stable radix selections:
+    // the same ids in the same order.
+    if (topk_block_radix_override() != 0 && ncols > 4096 && k >= 32 && k <= 2048 && (k & (k - 1)) == 0 &&
+        (k != 512 || ncols > 32768)) {
         topk_tiled_block_radix_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
         return;
     }

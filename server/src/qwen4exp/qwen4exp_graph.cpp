@@ -1796,10 +1796,47 @@ static void upload_stable_inputs(Qwen4ExpStableInputs & in, const Qwen4ExpDecode
     upload_stable_qsa(in, ws);
 }
 
+// A T=1 decode or verify graph's outputs: the logits rows and what may be read in their place (Qwen4ExpRowOutputs).
+struct Qwen4ExpRowTensors {
+    ggml_tensor * logits = nullptr;
+    ggml_tensor * greedy = nullptr;   // null when the rows cannot stay on the device
+    ggml_tensor * top_ids = nullptr;
+    ggml_tensor * top_vals = nullptr;
+    int top_n = 0;
+};
+
+// With out_rows and a graph that built its row outputs (t.greedy): the rows' top candidates when asked for, their
+// greedy picks otherwise, and out_logits left empty. The logits rows otherwise.
+static void read_forward_outputs(const Qwen4ExpRowTensors & t, std::vector<float> & out_logits,
+                                 Qwen4ExpRowOutputs * out_rows) {
+    if (out_rows) {
+        out_rows->on_device = t.greedy != nullptr && t.top_n == out_rows->top_n;
+        out_rows->greedy.clear();
+        out_rows->top_vals.clear();
+        out_rows->top_ids.clear();
+    }
+    if (out_rows && out_rows->on_device) {
+        out_logits.clear();
+        if (t.top_n > 0) {
+            out_rows->top_vals.resize((size_t) ggml_nelements(t.top_vals));
+            out_rows->top_ids.resize((size_t) ggml_nelements(t.top_ids));
+            ggml_backend_tensor_get(t.top_vals, out_rows->top_vals.data(), 0, ggml_nbytes(t.top_vals));
+            ggml_backend_tensor_get(t.top_ids, out_rows->top_ids.data(), 0, ggml_nbytes(t.top_ids));
+        } else {
+            out_rows->greedy.resize((size_t) ggml_nelements(t.greedy));
+            ggml_backend_tensor_get(t.greedy, out_rows->greedy.data(), 0, ggml_nbytes(t.greedy));
+        }
+        return;
+    }
+    out_logits.resize((size_t) ggml_nelements(t.logits));   // n_vocab, per row when verifying
+    ggml_backend_tensor_get(t.logits, out_logits.data(), 0, ggml_nbytes(t.logits));
+}
+
 // Replay a retained graph with this forward's inputs and read its logits (and hidden rows). A failed compute drops
 // the graph.
 static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace & ws, ggml_backend_sched_t short_sched,
-                             bool verify, std::vector<float> & out_logits, std::vector<float> * out_hidden) {
+                             bool verify, std::vector<float> & out_logits, std::vector<float> * out_hidden,
+                             Qwen4ExpRowOutputs * out_rows) {
     upload_stable_inputs(in, ws);
     ggml_status status;
     {   // verify: as built, with batch-invariant matmul columns (see forward_impl)
@@ -1812,8 +1849,7 @@ static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace 
         clear_qwen4exp_decode_workspace(ws);
         return false;
     }
-    out_logits.resize((size_t) ggml_nelements(ws.logits));   // n_vocab, per row when verifying
-    ggml_backend_tensor_get(ws.logits, out_logits.data(), 0, ggml_nbytes(ws.logits));
+    read_forward_outputs({ws.logits, ws.greedy, ws.top_ids, ws.top_vals, ws.top_n}, out_logits, out_rows);
     if (out_hidden && ws.hidden) {
         out_hidden->resize((size_t) ggml_nelements(ws.hidden));
         ggml_backend_tensor_get(ws.hidden, out_hidden->data(), 0, ggml_nbytes(ws.hidden));
@@ -2156,7 +2192,8 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
                                        int pos0,
                                        std::vector<float> & out_logits, std::vector<float> * out_hidden,
                                        bool verify, bool mtp_prefill,
-                                       const Qwen4ExpInputs * inputs, Qwen4ExpGraphMemory * measure) {
+                                       const Qwen4ExpInputs * inputs, Qwen4ExpGraphMemory * measure,
+                                       Qwen4ExpRowOutputs * out_rows = nullptr) {
     Qwen4ExpForwardResult res;
     if (n_tokens <= 0 || pos0 < 0 || (!tokens && !measure)) return res;
     const Qwen4ExpCudaScope profile(w.gfx1151 || w.expert_gfx1151);
@@ -2251,13 +2288,16 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     // allocation: the scheduler rewrote its cross-device sources, so it is never split again.
     if (use_stable_graph && stable_ws.gf && (stable_ws.qsa_blocks >= 0) == stable_qsa &&
         (stable_ws.hidden != nullptr) == (out_hidden != nullptr) &&
+        stable_ws.top_n == (out_rows ? out_rows->top_n : 0) &&
         (!split || stable_ws.sched || stable_ws.split_gen == split_owner(cache).split_short_gen) &&
         (verify ? stable_ws.row_spans == row_spans : kv_len <= stable_ws.kv_bucket && stable_ws.next_pos == pos0) &&
         (!stable_qsa || (stable_ws.kv_bucket == stable_kv_bucket &&
                         stable_ws.qsa_budget == w.indexer_top_k / 4 && cache.indexer_blocks == pos0 / 4))) {
-        if (!run_stable_graph(stable_in, stable_ws, split_owner(cache).split_sched_short, verify, out_logits, out_hidden)) {
+        if (!run_stable_graph(stable_in, stable_ws, split_owner(cache).split_sched_short, verify, out_logits, out_hidden,
+                              out_rows)) {
             return res;
         }
+        if (out_rows && out_rows->on_device) res.logits = stable_ws.logits;
         stable_ws.next_pos = (int) kv_len;
         cache.cur_pos = (int) kv_len;
         ++stable_ws.replays;
@@ -2372,6 +2412,25 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         for (ggml_tensor * t = hidden; t; t = t->view_src) ggml_set_output(t);
         ggml_build_forward_expand(gf, hidden);
     }
+    // Each row's greedy pick: a greedy request reads T ids instead of T vocabulary rows (5 MB for a 5-row verify).
+    // A sampled request whose sampler draws from the top candidates reads T * top_n of them instead.
+    Qwen4ExpRowTensors row_outputs;
+    row_outputs.logits = logits;
+    if (reuse_ws || verify) {
+        row_outputs.greedy = ggml_argmax(ctx, logits);
+        ggml_set_output(row_outputs.greedy);
+        ggml_build_forward_expand(gf, row_outputs.greedy);
+        row_outputs.top_n = out_rows ? out_rows->top_n : 0;
+    }
+    if (row_outputs.top_n > 0) {
+        row_outputs.top_ids = ggml_top_k(ctx, logits, row_outputs.top_n);
+        row_outputs.top_vals = ggml_get_rows(ctx, ggml_reshape_3d(ctx, logits, 1, logits->ne[0], logits->ne[1]),
+                                             row_outputs.top_ids);
+        for (ggml_tensor * t : {row_outputs.top_ids, row_outputs.top_vals}) {
+            ggml_set_output(t);
+            ggml_build_forward_expand(gf, t);
+        }
+    }
     ggml_tensor * mtp_positions = mtp_prefill
         ? build_mtp_prefill(ctx, gf, w, cache, hidden, emb_rows, pos0, T) : nullptr;
 
@@ -2413,6 +2472,10 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         stable_ws.ple_in = ple_in;
         stable_ws.kv_row = lb.kv_row;
         stable_ws.logits = logits;
+        stable_ws.greedy = row_outputs.greedy;
+        stable_ws.top_ids = row_outputs.top_ids;
+        stable_ws.top_vals = row_outputs.top_vals;
+        stable_ws.top_n = row_outputs.top_n;
         stable_ws.hidden = hidden;
         stable_ws.kv_bucket = stable_kv_bucket;
         stable_ws.qsa_blocks = stable_qsa ? stable_kv_bucket / 4 : -1;
@@ -2467,8 +2530,10 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         cache.indexer_blocks = (int) ((pos0 + T) / qsa_ratio(w));
     }
 
-    out_logits.resize((size_t) ggml_nelements(logits));   // n_vocab, per row when verifying
-    ggml_backend_tensor_get(logits, out_logits.data(), 0, ggml_nbytes(logits));
+    // A pool (T=1 decode, verify) keeps the graph's tensors until its next forward: only then may the rows stay.
+    if (!pool) row_outputs.greedy = nullptr;
+    read_forward_outputs(row_outputs, out_logits, out_rows);
+    if (out_rows && out_rows->on_device) res.logits = logits;
     if (out_hidden && hidden) {
         out_hidden->resize((size_t) ggml_nelements(hidden));
         ggml_backend_tensor_get(hidden, out_hidden->data(), 0, ggml_nbytes(hidden));
@@ -2729,10 +2794,10 @@ bool qwen4exp_mtp_catch_up(ggml_backend_t backend, const Qwen4ExpWeights & w, Qw
 
 bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache, int pos,
                        int32_t token, int max_k, AdaptiveSpecWidth * width, Qwen4ExpMtpPending * pending,
-                       const std::function<bool(int32_t, const float *, int32_t &)> & sample_row,
+                       const std::function<bool(int32_t, const Qwen4ExpRow &, int32_t &)> & sample_row,
                        std::vector<float> & logits, Qwen4ExpMtpStep & step,
                        const std::function<void(std::vector<int32_t> &)> & on_drafts,
-                       const int32_t * lookup_drafts, int n_lookup) {
+                       const int32_t * lookup_drafts, int n_lookup, Qwen4ExpRows rows, int top_n) {
     step = {};
     const bool lookup = pending != nullptr && lookup_drafts != nullptr && n_lookup > 0;
     const size_t hd = (size_t) w.n_embd * w.n_hc;
@@ -2775,20 +2840,55 @@ bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
     in[0] = token;
     std::copy(drafts.begin(), drafts.end(), in.begin() + 1);
     std::vector<float> hidden;
-    if (!qwen4exp_forward(backend, w, cache, in.data(), k + 1, pos, logits, pending ? &hidden : nullptr, verify).ok) {
+    Qwen4ExpRowOutputs out;
+    out.top_n = rows == Qwen4ExpRows::lazy ? top_n : 0;
+    const Qwen4ExpForwardResult forward = qwen4exp_forward(backend, w, cache, in.data(), k + 1, pos, logits,
+        pending ? &hidden : nullptr, verify, false, nullptr, rows != Qwen4ExpRows::all ? &out : nullptr);
+    if (!forward.ok) {
         step.error = "qwen4exp decode forward failed";
         return false;
     }
+    const size_t row_bytes = (size_t) w.n_vocab * sizeof(float);
+    int read = -1;   // the row `logits` holds when the rows stayed on the device
+    auto read_row = [&](int i) {
+        if (read != i) {
+            logits.resize((size_t) w.n_vocab);
+            ggml_backend_tensor_get(forward.logits, logits.data(), (size_t) i * row_bytes, row_bytes);
+            read = i;
+        }
+        return (const float *) logits.data();
+    };
     step.draft_s = std::chrono::duration<double>(t_draft - t0).count();
     step.verify_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_draft).count();
     // Rows are sampled lazily, each after its own fed token: no draws for rows past a rejection.
     Qwen4ExpMtpAcceptance & decision = step.decision;
     for (int i = 0; i <= k; ++i) {
-        step.more = sample_row(in[(size_t) i], logits.data() + (size_t) i * w.n_vocab, samples[(size_t) i]);
+        Qwen4ExpRow row;
+        if (!out.on_device) {
+            row.read = [&logits, &w, i] { return (const float *) logits.data() + (size_t) i * w.n_vocab; };
+        } else if (rows == Qwen4ExpRows::greedy) {
+            row.picked = true;
+            samples[(size_t) i] = out.greedy[(size_t) i];
+        } else {
+            row.read = [&read_row, i] { return read_row(i); };
+            if (out.top_n > 0) {
+                row.top_n = out.top_n;
+                row.top_vals = out.top_vals.data() + (size_t) i * out.top_n;
+                row.top_ids = out.top_ids.data() + (size_t) i * out.top_n;
+            }
+        }
+        step.more = sample_row(in[(size_t) i], row, samples[(size_t) i]);
         decision = qwen4exp_mtp_accept(drafts.data(), k, samples.data(), i + 1);
         if (!step.more || decision.n_accepted != i + 1) break;
     }
     const int retained = decision.n_emitted;
+    if (out.on_device && !step.more) {
+        read_row(retained - 1);   // generation ends: the caller keeps the last emitted row
+    } else if (!out.on_device && rows != Qwen4ExpRows::all) {
+        // A graph that read every row: keep the last emitted one, as the device paths leave it.
+        logits.erase(logits.begin(), logits.begin() + (size_t) (retained - 1) * w.n_vocab);
+        logits.resize((size_t) w.n_vocab);
+    }
     if (verify) {
         if (lookup) {
             // The draft layer did not run: its pending pairs are still owed, then the retained ones (as plain
@@ -2824,9 +2924,9 @@ bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
 Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend, const Qwen4ExpWeights & w,
         Qwen4ExpCache & cache, const int32_t * tokens, int n_tokens, int pos0,
         std::vector<float> & logits, std::vector<float> * out_hidden,
-        bool verify, bool mtp_prefill, const Qwen4ExpInputs * inputs) {
+        bool verify, bool mtp_prefill, const Qwen4ExpInputs * inputs, Qwen4ExpRowOutputs * out_rows) {
     return forward_impl(backend, w, cache, tokens, n_tokens, pos0, logits, out_hidden,
-                        verify, mtp_prefill, inputs, nullptr);
+                        verify, mtp_prefill, inputs, nullptr, out_rows);
 }
 
 Qwen4ExpGraphMemory qwen4exp_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,

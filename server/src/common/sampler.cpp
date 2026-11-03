@@ -18,6 +18,12 @@
 namespace luce::common {
 
 namespace {
+// The order of every top_k cut: the higher logit first, the lower id on ties. A cut and its order then do not
+// depend on the sort implementation, so a device top-k can reproduce them (sample_logits_top).
+bool ranks_before(const std::pair<float, int> & a, const std::pair<float, int> & b) {
+    return a.first > b.first || (a.first == b.first && a.second < b.second);
+}
+
 // Greedy with no penalty configured: sample_logits_chain scans the host row for its maximum.
 bool greedy_scan(const SamplerCfg & cfg) {
     return cfg.temp <= 0.0f && cfg.rep_pen <= 1.0f && cfg.freq_pen == 0.0f && cfg.pres_pen == 0.0f;
@@ -154,6 +160,9 @@ void apply_sampler_penalties(const SamplerCfg & cfg, const std::vector<int32_t> 
     }
 }
 
+int draw_after_cut(std::vector<std::pair<float, int>> & cand, const SamplerCfg & cfg, bool need_top_k,
+                   bool need_top_p, double r_uniform);
+
 int sample_logits_chain(const float * logits_in,
                         int vocab,
                         const SamplerCfg & cfg,
@@ -236,11 +245,16 @@ int sample_logits_chain(const float * logits_in,
     // inverse-CDF draw below are order-independent, so the common case (plain
     // temperature sampling, no truncation) skips sorting entirely.
     if (need_top_k) {
-        std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(),
-                          [](auto & a, auto & b){ return a.first > b.first; });
+        std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(), ranks_before);
         cand.resize(cfg.top_k);
     }
+    return draw_after_cut(cand, cfg, need_top_k, need_top_p, r_uniform);
+}
 
+// The chain after the top_k cut: softmax(temp), top_p, the draw. `cand` holds the top_k candidates in rank order
+// when need_top_k, otherwise the whole row.
+int draw_after_cut(std::vector<std::pair<float, int>> & cand, const SamplerCfg & cfg, bool need_top_k,
+                   bool need_top_p, double r_uniform) {
     const float inv_t = 1.0f / std::max(1e-3f, cfg.temp);
     const float maxv_logit = need_top_k
         ? cand.front().first
@@ -290,6 +304,55 @@ int sample_logits_chain(const float * logits_in,
 }
 
 }  // namespace
+
+bool sample_logits_is_argmax(const SamplerCfg & cfg) {
+    return greedy_scan(cfg) && !cfg.constraint;
+}
+
+int sample_logits_top_n(const SamplerCfg & cfg, int vocab) {
+    // A sampled top_k draw only (the chain's GPU paths never take a top_k), no grammar, and penalties that can only
+    // lower a logit: an outside token then stays at or below the candidates' floor.
+    if (cfg.temp <= 0.0f || cfg.top_k <= 0 || cfg.top_k >= vocab || cfg.constraint ||
+        cfg.freq_pen < 0.0f || cfg.pres_pen < 0.0f) {
+        return 0;
+    }
+    // Penalized candidates can drop out of the top_k: keep twice as many then.
+    const bool penalized = cfg.rep_pen > 1.0f || cfg.freq_pen > 0.0f || cfg.pres_pen > 0.0f;
+    int n = 32;
+    while (n < (penalized ? 2 * cfg.top_k : cfg.top_k)) n *= 2;
+    return n <= 2048 && n < vocab ? n : 0;
+}
+
+int sample_logits_top(const float * vals, const int32_t * ids, int n, int vocab, const SamplerCfg & cfg,
+                      const std::vector<int32_t> & history, std::mt19937_64 & rng) {
+    const int need = sample_logits_top_n(cfg, vocab);
+    if (need == 0 || n < need || n >= vocab) return -1;
+    thread_local std::vector<std::pair<float, int>> cand;
+    cand.resize((size_t) n);
+    float floor = INFINITY;
+    for (int i = 0; i < n; ++i) {
+        if (std::isnan(vals[i])) return -1;   // the whole row's chain decides how a NaN ranks
+        cand[(size_t) i] = {vals[i], (int) ids[i]};
+        floor = std::min(floor, vals[i]);
+    }
+    float outside = 0.0f;   // a token outside the candidates: its penalized logit stays at or below floor
+    apply_sampler_penalties(cfg, history, vocab, [&](int t) -> float & {
+        for (auto & c : cand) {
+            if (c.second == t) return c.first;
+        }
+        return outside;
+    });
+    std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(), ranks_before);
+    // Settled when the cut's last entry is above floor: every token outside is at or below it. At floor, an
+    // outside token could tie it and rank before it by id.
+    if (!(cand[(size_t) cfg.top_k - 1].first > floor)) return -1;
+    cand.resize((size_t) cfg.top_k);
+    // The chain's one uniform, drawn as sample_logits_chain draws it.
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    const double r_uniform = u(rng);
+    const bool need_top_p = cfg.top_p > 0.0f && cfg.top_p < 1.0f;
+    return draw_after_cut(cand, cfg, true, need_top_p, r_uniform);
+}
 
 bool sample_logits_host_only(const SamplerCfg & cfg, int vocab) {
 #ifdef LUCE_HAVE_GPU_SAMPLER
@@ -354,8 +417,7 @@ void sampler_distribution(const float * logits_in,
     if (need_top_k) {
         cand.resize(vocab);
         for (int i = 0; i < vocab; i++) cand[i] = {z[i], i};
-        std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(),
-                          [](auto & a, auto & b){ return a.first > b.first; });
+        std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(), ranks_before);
         cand.resize(cfg.top_k);
     } else {
         // Masses as sample_logits computes them for its cutoff:
