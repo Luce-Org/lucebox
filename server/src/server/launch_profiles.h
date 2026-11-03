@@ -381,7 +381,7 @@ struct KvflashRecallProfile {
     static constexpr const char * reselect_scorer  = "exact";
     static constexpr int          recall_blocks    = 6;
     static constexpr int          select_unit      = 2;      // chunks per recall unit
-    static constexpr int          preamble_rows    = 6144;   // extra pool rows for the pinned preamble
+    static constexpr int          preamble_rows    = 1152;   // extra pool rows for the pinned preamble: 18 chunks of 64, every decode step attends the whole pool
     static constexpr int          uq_queries       = 64;
     static constexpr int          score_pool_recent = 1;     // mode 4 scores on the recency pool
 };
