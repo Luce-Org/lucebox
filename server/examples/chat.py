@@ -93,13 +93,19 @@ def stream_generate(tok, bin_path: Path, target: Path, draft: Path,
     with tempfile.TemporaryDirectory() as d:
         out_bin = Path(d) / "out.bin"
         r, w = os.pipe()
-        cmd = [str(bin_path), str(target), str(draft), str(prompt_bin),
-               str(n_gen), str(out_bin),
-               "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
-               f"--stream-fd={w}"]
-        proc = subprocess.Popen(cmd, pass_fds=(w,),
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE)
+        try:
+            cmd = [str(bin_path), str(target), str(draft), str(prompt_bin),
+                   str(n_gen), str(out_bin),
+                   "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
+                   f"--stream-fd={w}"]
+            proc = subprocess.Popen(cmd, pass_fds=(w,),
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+        except BaseException:
+            os.close(r)
+            os.close(w)
+            raise
+
         os.close(w)
 
         text = ""
@@ -118,6 +124,10 @@ def stream_generate(tok, bin_path: Path, target: Path, draft: Path,
             proc.terminate()
             raise
         finally:
+            try:
+                os.close(r)
+            except OSError:
+                pass
             proc.wait()
         return text
 
