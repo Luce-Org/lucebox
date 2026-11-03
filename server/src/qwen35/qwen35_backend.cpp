@@ -3102,16 +3102,14 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
         int32_t tok = out_tokens.back();
 
         if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
-        ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
         const int32_t rope_pos = committed + rope_delta_;
-        int32_t pos4[4] = {rope_pos, rope_pos, rope_pos, 0};
-        ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
 
         // kvflash: graph carries a slot-validity mask alongside the
         // step-invariant set_rows write; the FA span clamps to the pool.
         const bool pool = kvflash_active();
         const bool paged = cfg_.paged_attention;
-        if (!build_target_step(sg_, w_, cache_, target_backend_,
+        if (!build_ar_step_with_inputs(sg_, [&] {
+            return build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/committed, /*n_tokens=*/1,
                                /*with_mask=*/pool || w_.is_bailingmoe3,
                                /*capture=*/false,
@@ -3122,7 +3120,8 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/pool,
                                /*capture_qk=*/pool && kvflash_qk_policy_,
-                               /*paged_attention=*/paged)) {
+                               /*paged_attention=*/paged);
+        }, embed_buf, hidden, rope_pos)) {
             return false;
         }
 
