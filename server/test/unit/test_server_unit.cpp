@@ -8439,6 +8439,104 @@ TEST_CASE(ServerUnitFixture, test_normalize_openai_tool_calls_without_memory) {
     }
 }
 
+// A tool-call turn the server no longer remembers (restart, eviction) comes
+// back with its thinking as reasoning_content. The Qwen templates replay the
+// thinking of the turns after the last user message, as the model generated
+// them; turns before it keep their visible text only.
+TEST_CASE(ServerUnitFixture, test_qwen_render_replays_reasoning_after_last_user) {
+    ToolMemory tool_memory;
+    const json messages = json::array({
+        {{"role", "user"}, {"content", "hi"}},
+        {{"role", "assistant"}, {"content", "Hello."}, {"reasoning_content", "Greet back."}},
+        {{"role", "user"}, {"content", "fix the bug"}},
+        {{"role", "assistant"}, {"content", "\n\nLet me look."},
+         {"reasoning_content", "\nOpen the file first.\n"},
+         {"tool_calls", json::array({
+             {{"id", "call_1"}, {"type", "function"},
+              {"function", {{"name", "bash"}, {"arguments", "{\"command\": \"ls\"}"}}}}})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "a.py"}},
+        {{"role", "assistant"}, {"content", nullptr}, {"reasoning", "Read a.py."},
+         {"tool_calls", json::array({
+             {{"id", "call_2"}, {"type", "function"},
+              {"function", {{"name", "read"}, {"arguments", "{\"path\": \"a.py\"}"}}}}})}},
+        {{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", "print(1)"}},
+    });
+    const std::string rendered = render_chat_template(
+        normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory),
+        ChatFormat::QWEN3, /*add_generation_prompt=*/true, /*enable_thinking=*/true);
+    TEST_ASSERT_MSG(rendered ==
+        "<|im_start|>user\nhi<|im_end|>\n"
+        "<|im_start|>assistant\nHello.<|im_end|>\n"
+        "<|im_start|>user\nfix the bug<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nOpen the file first.\n</think>\n\nLet me look.\n\n"
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n"
+        "</function>\n</tool_call><|im_end|>\n"
+        "<|im_start|>user\n<tool_response>\na.py\n</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nRead a.py.\n</think>\n\n"
+        "<tool_call>\n<function=read>\n<parameter=path>\na.py\n</parameter>\n"
+        "</function>\n</tool_call><|im_end|>\n"
+        "<|im_start|>user\n<tool_response>\nprint(1)\n</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n", rendered);
+}
+
+// The last user query as the Qwen templates find it: a user message that only
+// wraps tool responses (Python's strip(), so Unicode spaces around it count as
+// whitespace) does not end the tool loop; any other user message does. A turn
+// whose content is only whitespace puts its calls right after </think>.
+TEST_CASE(ServerUnitFixture, test_qwen_render_last_user_query_boundary) {
+    ToolMemory tool_memory;
+    json messages = json::array({
+        {{"role", "user"}, {"content", "go"}},
+        {{"role", "assistant"}, {"content", " \n"}, {"reasoning_content", "List it."},
+         {"tool_calls", json::array({
+             {{"id", "call_1"}, {"type", "function"},
+              {"function", {{"name", "bash"}, {"arguments", "{\"command\": \"ls\"}"}}}}})}},
+        {{"role", "user"},
+         {"content", " <tool_response>\nok\n</tool_response>　\n"}},
+    });
+    const auto render = [&]() {
+        return render_chat_template(
+            normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory),
+            ChatFormat::QWEN3, /*add_generation_prompt=*/false, /*enable_thinking=*/true);
+    };
+    const std::string turn =
+        "<|im_start|>assistant\n<think>\nList it.\n</think>\n\n"
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n"
+        "</function>\n</tool_call><|im_end|>\n";
+    const std::string in_loop = render();
+    TEST_ASSERT_MSG(in_loop.find(turn) != std::string::npos, in_loop);
+
+    messages.push_back({{"role", "user"}, {"content", "thanks"}});
+    const std::string after_query = render();
+    TEST_ASSERT_MSG(after_query.find("List it.") == std::string::npos, after_query);
+}
+
+// A turn replayed from tool memory already holds its thinking: the client's
+// reasoning_content for it adds no second <think> block, and the raw text is
+// rendered byte for byte.
+TEST_CASE(ServerUnitFixture, test_qwen_render_memory_hit_ignores_client_reasoning) {
+    ToolMemory tool_memory;
+    const std::string raw =
+        "<think>\nList it.\n</think>\n\n<tool_call>\n<function=bash>\n"
+        "<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>";
+    tool_memory.remember({"call_1"}, raw);
+    const json messages = json::array({
+        {{"role", "user"}, {"content", "go"}},
+        {{"role", "assistant"}, {"content", ""}, {"reasoning_content", "List it."},
+         {"tool_calls", json::array({
+             {{"id", "call_1"}, {"type", "function"},
+              {"function", {{"name", "bash"}, {"arguments", "{\"command\": \"ls\"}"}}}}})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "ok"}},
+    });
+    const std::string rendered = render_chat_template(
+        normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory),
+        ChatFormat::QWEN3, /*add_generation_prompt=*/false, /*enable_thinking=*/true);
+    TEST_ASSERT_MSG(rendered ==
+        "<|im_start|>user\ngo<|im_end|>\n"
+        "<|im_start|>assistant\n" + raw + "<|im_end|>\n"
+        "<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n", rendered);
+}
+
 TEST_CASE(ServerUnitFixture, test_normalize_openai_tool_argument_shapes) {
     ToolMemory tool_memory;
     const json nested = {

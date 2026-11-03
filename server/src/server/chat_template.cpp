@@ -14,6 +14,7 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace luce::common {
@@ -158,12 +159,43 @@ static void append_tool_argument(std::string & out, const nlohmann::json & value
     else append_python_json(out, value);
 }
 
+// Jinja's `trim`, which is Python's str.strip(): without the leading and
+// trailing characters Python counts as whitespace, the Unicode ones included.
+static std::string_view trim_whitespace(std::string_view text) {
+    // In UTF-8: U+0009-000D, U+001C-0020, U+0085, U+00A0, U+1680,
+    // U+2000-200A, U+2028, U+2029, U+202F, U+205F, U+3000.
+    static constexpr std::string_view spaces[] = {
+        "\t", "\n", "\v", "\f", "\r", "\x1c", "\x1d", "\x1e", "\x1f", " ",
+        "\xc2\x85", "\xc2\xa0", "\xe1\x9a\x80",
+        "\xe2\x80\x80", "\xe2\x80\x81", "\xe2\x80\x82", "\xe2\x80\x83",
+        "\xe2\x80\x84", "\xe2\x80\x85", "\xe2\x80\x86", "\xe2\x80\x87",
+        "\xe2\x80\x88", "\xe2\x80\x89", "\xe2\x80\x8a",
+        "\xe2\x80\xa8", "\xe2\x80\xa9", "\xe2\x80\xaf", "\xe2\x81\x9f",
+        "\xe3\x80\x80",
+    };
+    const auto strip = [&](bool front) {
+        for (const std::string_view space : spaces) {
+            if (text.size() < space.size()) continue;
+            if (front ? text.substr(0, space.size()) == space
+                      : text.substr(text.size() - space.size()) == space) {
+                front ? text.remove_prefix(space.size()) : text.remove_suffix(space.size());
+                return true;
+            }
+        }
+        return false;
+    };
+    while (strip(/*front=*/true)) {}
+    while (strip(/*front=*/false)) {}
+    return text;
+}
+
+// `after_text`: the turn's text precedes the calls.
 static void append_xml_tool_calls(std::string & out, const ChatMessage & msg,
-                                  ChatFormat format) {
+                                  ChatFormat format, bool after_text) {
     if (msg.tool_calls_replayed) return;
     for (size_t i = 0; i < msg.tool_calls.size(); ++i) {
         const auto & call = msg.tool_calls[i];
-        if (i != 0 || !msg.content.empty()) {
+        if (i != 0 || after_text) {
             out += format == ChatFormat::QWEN3 && i == 0 ? "\n\n" : "\n";
         }
         if (format == ChatFormat::QWEN3) {
@@ -518,7 +550,7 @@ std::string render_chat_template(
                     result += "<think></think>";
                 }
                 result += msg.content;
-                append_xml_tool_calls(result, msg, format);
+                append_xml_tool_calls(result, msg, format, !msg.content.empty());
                 result += "<|role_end|>";
             } else if (msg.role == "tool") {
                 if (!in_tool_response) {
@@ -576,6 +608,22 @@ std::string render_chat_template(
             result += "<|im_end|>\n";
         }
 
+        // The last user query: user turns that only carry tool responses do
+        // not count.
+        size_t last_query = messages.size();
+        for (size_t i = messages.size(); i-- > 0;) {
+            if (messages[i].role != "user") continue;
+            const std::string_view content = trim_whitespace(messages[i].content);
+            static constexpr std::string_view open = "<tool_response>";
+            static constexpr std::string_view close = "</tool_response>";
+            if (!(content.substr(0, open.size()) == open &&
+                  content.size() >= close.size() &&
+                  content.substr(content.size() - close.size()) == close)) {
+                last_query = i;
+                break;
+            }
+        }
+
         // Render remaining messages.
         bool in_tool_response = false;
         for (size_t i = start_idx; i < messages.size(); i++) {
@@ -602,8 +650,22 @@ std::string render_chat_template(
                 result += "<|im_start|>";
                 result += msg.role;
                 result += '\n';
-                result += msg.content;
-                if (msg.role == "assistant") append_xml_tool_calls(result, msg, format);
+                std::string_view content = msg.content;
+                // As the Qwen templates do, an assistant turn after the last
+                // user query replays its thinking (a raw turn from tool memory
+                // already holds it). Earlier turns keep their text only.
+                const std::string_view reasoning = trim_whitespace(msg.reasoning_content);
+                if (msg.role == "assistant" && last_query < i &&
+                    !msg.tool_calls_replayed && !reasoning.empty()) {
+                    result += "<think>\n";
+                    result += reasoning;
+                    result += "\n</think>\n\n";
+                    content = trim_whitespace(content);
+                }
+                result += content;
+                if (msg.role == "assistant") {
+                    append_xml_tool_calls(result, msg, format, !content.empty());
+                }
                 result += "<|im_end|>\n";
             }
         }
@@ -720,7 +782,7 @@ std::string render_chat_template(
                 // (including any embedded <think>...</think> blocks).
                 result += "<assistant>\n";
                 result += msg.content;
-                append_xml_tool_calls(result, msg, format);
+                append_xml_tool_calls(result, msg, format, !msg.content.empty());
                 result += "\n</assistant>\n";
             } else if (msg.role == "tool") {
                 result += "<tool_response>\n";
