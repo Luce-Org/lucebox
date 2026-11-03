@@ -825,6 +825,7 @@ void test_model_capability_tables() {
     CHECK(!arch_supports_layer_split("qwen36"));
     CHECK(!arch_supports_remote_draft("qwen36"));
     CHECK(!arch_supports_pflash_compression("qwen36"));
+    CHECK(!arch_supports_kvflash("qwen36"));
     CHECK(!arch_supports_decode_draft("qwen36", false));
     CHECK(!arch_supports_ddtree("qwen36", false));
     CHECK(!arch_supports_verify_width("qwen36", false));
@@ -923,6 +924,11 @@ void test_feature_gate_kvflash_requires_reading_arch() {
         CHECK(!gate_result(args, arch, PlacementBackend::Cuda, automatic).empty());
         CHECK(gate_result(args, arch, PlacementBackend::Cuda).empty());
     }
+    // The refusal lists the architectures that do read it, from the table.
+    const std::string refusal =
+        gate_result(args, "deepseek41", PlacementBackend::Cuda, fixed);
+    CHECK(refusal.find("(supported: qwen35, qwen35moe, laguna, gemma4)") !=
+          std::string::npos);
 }
 
 };
