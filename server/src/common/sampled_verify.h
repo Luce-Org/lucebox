@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/output_constraint.h"
 #include "common/sampler.h"
 
 #include <cstddef>
@@ -38,22 +39,31 @@ struct SampledVerifyWalk {
 // the rewrite applies once, as in autoregressive decoding. history is the
 // penalty history before the root; the walk appends the root and each kept
 // draft, so every draw sees the history autoregressive sampling would.
+// cfg.constraint is at the position of tokens[0] (the commit point has not
+// kept it yet); the walk draws from a snapshot it advances over the root and
+// each kept draft, so every draw sees the grammar state decoding would.
 template <typename Stops>
 inline SampledVerifyWalk sampled_verify_walk(
         const float * rows, int vocab, int width, const int32_t * tokens,
         const SamplerCfg & cfg, std::vector<int32_t> & history,
         std::mt19937_64 & rng, Stops stops) {
     SampledVerifyWalk walk;
+    SamplerCfg round = cfg;
+    if (round.constraint) {
+        round.constraint = cfg.constraint->snapshot();
+        round.constraint->accept(tokens[0]);
+    }
     history.push_back(tokens[0]);
     for (int i = 0; i + 1 < width; ++i) {
         const int32_t token = sample_logits(
             rows + static_cast<size_t>(i) * static_cast<size_t>(vocab), vocab,
-            cfg, history, rng);
+            round, history, rng);
         if (token != tokens[i + 1] || stops(token, i + 1)) {
             walk.bonus = token;
             break;
         }
         history.push_back(token);
+        if (round.constraint) round.constraint->accept(token);
         ++walk.accepted;
     }
     return walk;
@@ -65,6 +75,39 @@ inline SampledVerifyWalk sampled_verify_walk(
         std::mt19937_64 & rng) {
     return sampled_verify_walk(rows, vocab, width, tokens, cfg, history, rng,
                                [](int32_t, int) { return false; });
+}
+
+// Greedy verify of a chain draft under a grammar (cfg.greedy_under_constraint(),
+// cfg.constraint at the position of the root tokens[0]). argmax[i] is the
+// target's argmax of row i, the logits after tokens[0..i]. Where the grammar
+// rejects it, row(i, vocab) returns the row's logits (null when they cannot
+// be read) and the sampler picks the token as autoregressive decoding does.
+// The walk rewrites argmax[i] with that token for every row it reaches (the
+// last one included) and returns how many tokens it keeps, the root and the
+// drafts that equal it, as the unconstrained greedy accept does; 0 when a
+// row could not be read.
+template <typename Row>
+inline int constrained_greedy_walk(int32_t * argmax, int width, const int32_t * tokens,
+                                   const SamplerCfg & cfg, Row row) {
+    SamplerCfg round = cfg;
+    round.constraint = cfg.constraint->snapshot();
+    OutputConstraint & grammar = *round.constraint;
+    grammar.accept(tokens[0]);
+    static const std::vector<int32_t> no_history;  // greedy: no penalties
+    std::mt19937_64 unused_rng;                     // greedy: no draws
+    int accepted = 1;
+    for (int i = 0; i < width; ++i) {
+        if (!grammar.allows(argmax[i])) {
+            int vocab = 0;
+            const float * logits = row(i, vocab);
+            if (logits == nullptr) return 0;
+            argmax[i] = sample_logits(logits, vocab, round, no_history, unused_rng);
+        }
+        if (i + 1 == width || tokens[i + 1] != argmax[i]) break;
+        grammar.accept(argmax[i]);
+        ++accepted;
+    }
+    return accepted;
 }
 
 // The token after the first `kept` committed tokens (root included), which

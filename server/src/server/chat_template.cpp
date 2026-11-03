@@ -1,7 +1,6 @@
 // Chat template renderer implementation.
 
 #include "chat_template.h"
-#include "common/model_capabilities.h"
 
 #include "jinja/lexer.h"
 #include "jinja/parser.h"
@@ -11,43 +10,14 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <charconv>
+#include <cmath>
 #include <memory>
-#include <numeric>
+#include <optional>
 #include <stdexcept>
-#include <string_view>
 #include <utility>
 
 namespace luce::common {
-
-// Qwen3.5 tool preamble — matches the official Jinja template exactly.
-static const char QWEN3_TOOL_PREAMBLE[] =
-    "# Tools\n\nYou have access to the following functions:\n\n<tools>";
-
-static const char QWEN3_TOOL_SUFFIX[] =
-    "\n</tools>\n\n"
-    "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
-    "<tool_call>\n"
-    "<function=example_function_name>\n"
-    "<parameter=example_parameter_1>\n"
-    "value_1\n"
-    "</parameter>\n"
-    "<parameter=example_parameter_2>\n"
-    "This is the value for the second parameter\n"
-    "that can span\n"
-    "multiple lines\n"
-    "</parameter>\n"
-    "</function>\n"
-    "</tool_call>\n\n"
-    "<IMPORTANT>\n"
-    "Reminder:\n"
-    "- Function calls MUST follow the specified format: an inner <function=...></function> "
-    "block must be nested within <tool_call></tool_call> XML tags\n"
-    "- Required parameters MUST be specified\n"
-    "- You may provide optional reasoning for your function call in natural language "
-    "BEFORE the function call, but NOT after\n"
-    "- If there is no function call available, answer the question like normal with your "
-    "current knowledge and do not tell the user about function calls\n"
-    "</IMPORTANT>";
 
 // Appends "<available_tools>\n{tool}\n...</available_tools>\n\n" to result.
 // Each tool is pretty-printed as compact JSON; falls back to the raw
@@ -68,32 +38,79 @@ static void append_available_tools(std::string & result,
     result += "</available_tools>\n\n";
 }
 
+nlohmann::ordered_json openai_tool_definitions(nlohmann::ordered_json tools) {
+    if (!tools.is_array()) return tools;
+    for (auto & tool : tools) {
+        if (!tool.is_object()) continue;
+        if (!tool.contains("function") && tool.contains("name")) {
+            auto function = std::move(tool);
+            function.erase("type");
+            tool = nlohmann::ordered_json::object();
+            tool["type"] = "function";
+            tool["function"] = std::move(function);
+        }
+        if (!tool.contains("function") || !tool["function"].is_object()) continue;
+        auto & function = tool["function"];
+        const auto input_schema = function.find("input_schema");
+        if (input_schema != function.end()) {
+            if (!function.contains("parameters")) {
+                auto schema = std::move(*input_schema);
+                function.erase("input_schema");
+                function["parameters"] = std::move(schema);
+            } else {
+                function.erase("input_schema");
+            }
+        }
+    }
+    return tools;
+}
+
 std::string qwen4exp_template_effort(const std::string & effort) {
     if (effort.empty() || effort == "low" || effort == "medium") return effort;
     return "xhigh";
 }
 
-// DeepSeek V4.1 tool block, as encoding/encoding.py in the model repo renders
-// it: leading-space DSML tag names and one schema per line.
-static const char DS41_TOOLS_HEADER[] =
-    "## Tools\n\n"
-    "You have access to a set of tools to help answer the user's question. "
-    "You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n"
-    "<｜DSML｜ calls>\n"
-    "<｜DSML｜ invoke name=\"$TOOL_NAME\">\n"
-    "<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n"
-    "...\n"
-    "</｜DSML｜ invoke>\n"
-    "<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n"
-    "...\n"
-    "</｜DSML｜ invoke>\n"
-    "</｜DSML｜ calls>\n\n"
-    "String parameters should be specified as is and set `string=\"true\"`. "
-    "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
-    "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning "
-    "inside <think>...</think> BEFORE any tool calls or final response.\n\n"
-    "Otherwise, output directly after </think> with tool calls or final response.\n\n"
-    "### Available Tool Schemas\n\n";
+// Python's repr(float), which json.dumps writes: the shortest digits that
+// read back, in positional notation for decimal exponents -4 < e <= 16, else
+// as d.ddde+XX; whole numbers keep ".0".
+static std::string python_float_repr(double value) {
+    if (std::isnan(value)) return "NaN";
+    if (std::isinf(value)) return value < 0 ? "-Infinity" : "Infinity";
+    char buf[64];
+    const auto res = std::to_chars(buf, buf + sizeof(buf), value, std::chars_format::scientific);
+    const std::string sci(buf, res.ptr);  // e.g. "-1.25e+15"
+    const size_t e = sci.find('e');
+    std::string mantissa = sci.substr(0, e);
+    const int exponent = std::stoi(sci.substr(e + 1));
+    std::string sign;
+    if (!mantissa.empty() && mantissa[0] == '-') {
+        sign = "-";
+        mantissa.erase(0, 1);
+    }
+    std::string digits;
+    for (char c : mantissa) {
+        if (c != '.') digits += c;
+    }
+    const int decpt = exponent + 1;  // digits[0] sits just before this position
+    if (decpt <= -4 || decpt > 16) {
+        std::string out = sign + digits.substr(0, 1);
+        if (digits.size() > 1) out += "." + digits.substr(1);
+        const int shown = decpt - 1;
+        out += shown < 0 ? "e-" : "e+";
+        const std::string magnitude = std::to_string(shown < 0 ? -shown : shown);
+        out += (magnitude.size() < 2 ? "0" : "") + magnitude;
+        return out;
+    }
+    std::string out = sign;
+    if (decpt <= 0) {
+        out += "0." + std::string((size_t) -decpt, '0') + digits;
+    } else if ((size_t) decpt >= digits.size()) {
+        out += digits + std::string((size_t) decpt - digits.size(), '0') + ".0";
+    } else {
+        out += digits.substr(0, (size_t) decpt) + "." + digits.substr((size_t) decpt);
+    }
+    return out;
+}
 
 // Python json.dumps(value, ensure_ascii=False) spelling: ", " and ": "
 // separators, keys in their original order.
@@ -119,37 +136,17 @@ static void append_python_json(std::string & out, const Json & value) {
             append_python_json(out, item);
         }
         out += ']';
+    } else if (value.is_number_float()) {
+        out += python_float_repr(value.template get<double>());
     } else {
         out += value.dump();
     }
 }
 
-static void append_ds41_tools(std::string & result, const std::string & tools_json) {
-    result += DS41_TOOLS_HEADER;
-    try {
-        const auto tools = nlohmann::ordered_json::parse(tools_json);
-        bool first = true;
-        for (const auto & tool : tools) {
-            if (!first) result += "\n";
-            first = false;
-            append_python_json(result, tool.contains("function") ? tool["function"] : tool);
-        }
-    } catch (const std::exception &) {
-        result += tools_json;
-    }
-    result += "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n";
-}
-
-// V4.1 reasoning budget: 1-100, with the named levels of the model's encoder.
-static int ds41_reasoning_budget(const std::string & effort) {
-    if (effort == "low") return 50;
-    if (effort == "medium") return 62;
-    if (effort == "max") return 100;
-    if (!effort.empty() && effort.find_first_not_of("0123456789") == std::string::npos && effort.size() <= 3) {
-        const int budget = std::stoi(effort);
-        if (budget >= 1 && budget <= 100) return budget;
-    }
-    return 75;
+std::string python_json_dumps(const nlohmann::ordered_json & value) {
+    std::string out;
+    append_python_json(out, value);
+    return out;
 }
 
 // The XML-like formats deliberately leave string arguments unescaped. JSON
@@ -159,162 +156,31 @@ static void append_tool_argument(std::string & out, const nlohmann::json & value
     else append_python_json(out, value);
 }
 
-// Jinja's `trim`, which is Python's str.strip(): without the leading and
-// trailing characters Python counts as whitespace, the Unicode ones included.
-static std::string_view trim_whitespace(std::string_view text) {
-    // In UTF-8: U+0009-000D, U+001C-0020, U+0085, U+00A0, U+1680,
-    // U+2000-200A, U+2028, U+2029, U+202F, U+205F, U+3000.
-    static constexpr std::string_view spaces[] = {
-        "\t", "\n", "\v", "\f", "\r", "\x1c", "\x1d", "\x1e", "\x1f", " ",
-        "\xc2\x85", "\xc2\xa0", "\xe1\x9a\x80",
-        "\xe2\x80\x80", "\xe2\x80\x81", "\xe2\x80\x82", "\xe2\x80\x83",
-        "\xe2\x80\x84", "\xe2\x80\x85", "\xe2\x80\x86", "\xe2\x80\x87",
-        "\xe2\x80\x88", "\xe2\x80\x89", "\xe2\x80\x8a",
-        "\xe2\x80\xa8", "\xe2\x80\xa9", "\xe2\x80\xaf", "\xe2\x81\x9f",
-        "\xe3\x80\x80",
-    };
-    const auto strip = [&](bool front) {
-        for (const std::string_view space : spaces) {
-            if (text.size() < space.size()) continue;
-            if (front ? text.substr(0, space.size()) == space
-                      : text.substr(text.size() - space.size()) == space) {
-                front ? text.remove_prefix(space.size()) : text.remove_suffix(space.size());
-                return true;
-            }
-        }
-        return false;
-    };
-    while (strip(/*front=*/true)) {}
-    while (strip(/*front=*/false)) {}
-    return text;
-}
-
-// `after_text`: the turn's text precedes the calls.
 static void append_xml_tool_calls(std::string & out, const ChatMessage & msg,
-                                  ChatFormat format, bool after_text) {
+                                  ChatFormat format) {
     if (msg.tool_calls_replayed) return;
     for (size_t i = 0; i < msg.tool_calls.size(); ++i) {
         const auto & call = msg.tool_calls[i];
-        if (i != 0 || after_text) {
-            out += format == ChatFormat::QWEN3 && i == 0 ? "\n\n" : "\n";
-        }
-        if (format == ChatFormat::QWEN3) {
-            out += "<tool_call>\n<function=";
-            out += call.name;
-            out += ">\n";
-            for (auto it = call.arguments.begin(); it != call.arguments.end(); ++it) {
-                out += "<parameter=";
-                out += it.key();
-                out += ">\n";
-                append_tool_argument(out, it.value());
-                out += "\n</parameter>\n";
-            }
-            out += "</function>\n</tool_call>";
-        } else {
-            // Ling and Laguna's shipped templates put the first key directly
-            // after the name, unlike the illustrative preamble.
-            out += "<tool_call>";
-            out += call.name;
-            for (auto it = call.arguments.begin(); it != call.arguments.end(); ++it) {
-                out += "<arg_key>";
-                out += it.key();
-                out += "</arg_key>\n<arg_value>";
-                append_tool_argument(out, it.value());
-                out += "</arg_value>";
-                if (format == ChatFormat::LAGUNA) out += '\n';
-            }
-            if (format == ChatFormat::BAILINGMOE3) out += '\n';
-            out += "</tool_call>";
-        }
-    }
-}
-
-static void append_dsml_tool_calls(std::string & out, const ChatMessage & msg,
-                                   bool v41) {
-    if (msg.tool_calls_replayed || msg.tool_calls.empty()) return;
-    out += v41 ? "\n\n<｜DSML｜ calls>\n" : "\n\n<｜DSML｜tool_calls>\n";
-    for (size_t i = 0; i < msg.tool_calls.size(); ++i) {
-        if (i != 0) out += '\n';
-        const auto & call = msg.tool_calls[i];
-        out += v41 ? "<｜DSML｜ invoke name=\"" : "<｜DSML｜invoke name=\"";
+        // The built-in renderers have always listed arguments by name.
+        const nlohmann::json arguments = call.arguments;
+        if (i != 0 || !msg.content.empty()) out += '\n';
+        // Ling and Laguna's shipped templates put the first key directly
+        // after the name, unlike the illustrative preamble.
+        out += "<tool_call>";
         out += call.name;
-        out += "\">\n";
-        bool first = true;
-        for (auto it = call.arguments.begin(); it != call.arguments.end(); ++it) {
-            if (!first) out += '\n';
-            first = false;
-            out += v41 ? "<｜DSML｜ parameter name=\"" : "<｜DSML｜parameter name=\"";
+        for (auto it = arguments.begin(); it != arguments.end(); ++it) {
+            out += "<arg_key>";
             out += it.key();
-            out += it.value().is_string() ? "\" string=\"true\">" : "\" string=\"false\">";
+            out += "</arg_key>\n<arg_value>";
             append_tool_argument(out, it.value());
-            out += v41 ? "</｜DSML｜ parameter>" : "</｜DSML｜parameter>";
+            out += "</arg_value>";
+            if (format == ChatFormat::LAGUNA) out += '\n';
         }
-        out += v41 ? "\n</｜DSML｜ invoke>" : "\n</｜DSML｜invoke>";
+        if (format == ChatFormat::BAILINGMOE3) out += '\n';
+        out += "</tool_call>";
     }
-    out += v41 ? "\n</｜DSML｜ calls>" : "\n</｜DSML｜tool_calls>";
 }
 
-// DeepSeek results carry no IDs in the prompt. Match the reference encoder:
-// sort only tool-result slots within each user/tool run, leaving user text
-// in place. Return an empty permutation for already ordered histories.
-static std::vector<size_t> dsml_message_order(const std::vector<ChatMessage> & messages) {
-    std::vector<size_t> order;
-    const std::vector<ChatToolCall> * calls = nullptr;
-    const auto is_result = [](const ChatMessage & msg) {
-        return msg.role == "tool" || msg.role == "function";
-    };
-    for (size_t begin = 0; begin < messages.size();) {
-        const auto & msg = messages[begin];
-        if (msg.role == "assistant" && !msg.tool_calls.empty()) calls = &msg.tool_calls;
-        if (!calls || (msg.role != "user" && !is_result(msg))) {
-            ++begin;
-            continue;
-        }
-        const auto rank = [&](size_t index) {
-            const auto & id = messages[index].tool_call_id;
-            if (!id.empty()) {
-                for (size_t i = 0; i < calls->size(); ++i) {
-                    if ((*calls)[i].id == id) return i;
-                }
-            }
-            return size_t{0};  // Reference fallback for absent/unknown IDs.
-        };
-        size_t end = begin;
-        size_t previous = 0;
-        bool sorted = true;
-        for (; end < messages.size(); ++end) {
-            if (messages[end].role != "user" && !is_result(messages[end])) break;
-            if (!is_result(messages[end])) continue;
-            const size_t current = rank(end);
-            if (current < previous) sorted = false;
-            previous = current;
-        }
-        if (!sorted) {
-            if (order.empty()) {
-                order.resize(messages.size());
-                std::iota(order.begin(), order.end(), size_t{0});
-            }
-            // Sorting (rank, original index) keeps equal-rank results stable
-            // without copying message bodies or allocating a sort buffer.
-            std::vector<std::pair<size_t, size_t>> results;
-            results.reserve(end - begin);
-            for (size_t i = begin; i < end; ++i) {
-                if (is_result(messages[i])) results.emplace_back(rank(i), i);
-            }
-            std::sort(results.begin(), results.end());
-            size_t next = 0;
-            for (size_t i = begin; i < end; ++i) {
-                if (is_result(messages[i])) order[i] = results[next++].second;
-            }
-        }
-        begin = end;
-    }
-    return order;
-}
-
-// Google's canonical template (google/gemma-4-26B-A4B-it/chat_template.jinja)
-// uses special string delimiters and bare keys recursively for calls and
-// responses, not JSON or Python repr().
 static void append_gemma_string(std::string & out, const std::string & value,
                                 bool uppercase = false) {
     out += "<|\"|>";
@@ -440,24 +306,17 @@ static void append_gemma_tool_calls(std::string & out, const ChatMessage & msg) 
     for (const auto & call : msg.tool_calls) {
         out += "<|tool_call>call:";
         out += call.name;
-        append_gemma_value(out, call.arguments);
+        append_gemma_value(out, nlohmann::json(call.arguments));
         out += "<tool_call|>";
     }
 }
 
-std::vector<size_t> chat_message_render_order(const std::vector<ChatMessage> & messages, ChatFormat format) {
-    if (format == ChatFormat::DEEPSEEK4 || format == ChatFormat::DEEPSEEK41) return dsml_message_order(messages);
-    return {};
-}
-
-ChatFormat chat_format_for_arch(const std::string & arch) {
-    if (arch == "deepseek41") return ChatFormat::DEEPSEEK41;
-    if (arch_is_deepseek4_family(arch)) return ChatFormat::DEEPSEEK4;
+std::optional<ChatFormat> chat_format_for_arch(const std::string & arch) {
     if (arch == "laguna") return ChatFormat::LAGUNA;
     if (arch == "gemma4") return ChatFormat::GEMMA4;
     if (arch == "bailingmoe3") return ChatFormat::BAILINGMOE3;
-    // qwen35, qwen36, qwen3, qwen4exp use the Qwen3/ChatML format
-    return ChatFormat::QWEN3;
+    // The Qwen and DeepSeek families render with their chat codec (or a --chat-template-file).
+    return std::nullopt;
 }
 
 std::string render_chat_template(
@@ -465,8 +324,7 @@ std::string render_chat_template(
     ChatFormat format,
     bool add_generation_prompt,
     bool enable_thinking,
-    const std::string & tools_json,
-    const std::string & reasoning_effort)
+    const std::string & tools_json)
 {
     std::string result;
     bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
@@ -550,7 +408,7 @@ std::string render_chat_template(
                     result += "<think></think>";
                 }
                 result += msg.content;
-                append_xml_tool_calls(result, msg, format, !msg.content.empty());
+                append_xml_tool_calls(result, msg, format);
                 result += "<|role_end|>";
             } else if (msg.role == "tool") {
                 if (!in_tool_response) {
@@ -572,121 +430,6 @@ std::string render_chat_template(
         if (add_generation_prompt) {
             result += "<role>ASSISTANT</role>\n<think>";
             if (!enable_thinking) result += "</think>";
-        }
-        break;
-    }
-
-    case ChatFormat::QWEN3: {
-        // Qwen3/3.5 ChatML format:
-        //   <|im_start|>system\n[tool preamble +] content<|im_end|>\n
-        //   <|im_start|>user\nHello<|im_end|>\n
-        //   <|im_start|>assistant\n...
-
-        // Determine if the first message is a system message.
-        size_t start_idx = 0;
-        std::string system_content;
-        if (!messages.empty() && messages[0].role == "system") {
-            system_content = messages[0].content;
-            start_idx = 1;
-        }
-
-        // Emit system message with tool preamble if tools are present.
-        if (has_tools) {
-            result += "<|im_start|>system\n";
-            result += QWEN3_TOOL_PREAMBLE;
-            result += '\n';
-            result += tools_json;
-            result += QWEN3_TOOL_SUFFIX;
-            if (!system_content.empty()) {
-                result += "\n\n";
-                result += system_content;
-            }
-            result += "<|im_end|>\n";
-        } else if (!system_content.empty()) {
-            result += "<|im_start|>system\n";
-            result += system_content;
-            result += "<|im_end|>\n";
-        }
-
-        // The last user query: user turns that only carry tool responses do
-        // not count.
-        size_t last_query = messages.size();
-        for (size_t i = messages.size(); i-- > 0;) {
-            if (messages[i].role != "user") continue;
-            const std::string_view content = trim_whitespace(messages[i].content);
-            static constexpr std::string_view open = "<tool_response>";
-            static constexpr std::string_view close = "</tool_response>";
-            if (!(content.substr(0, open.size()) == open &&
-                  content.size() >= close.size() &&
-                  content.substr(content.size() - close.size()) == close)) {
-                last_query = i;
-                break;
-            }
-        }
-
-        // Render remaining messages.
-        bool in_tool_response = false;
-        for (size_t i = start_idx; i < messages.size(); i++) {
-            const auto & msg = messages[i];
-
-            if (msg.role == "tool") {
-                // Qwen3.5 template: tool responses are grouped inside a user
-                // message wrapped in <tool_response> tags.
-                if (!in_tool_response) {
-                    result += "<|im_start|>user";
-                    in_tool_response = true;
-                }
-                result += "\n<tool_response>\n";
-                result += msg.content;
-                result += "\n</tool_response>";
-                // Close user block if next message is not a tool message.
-                bool next_is_tool = (i + 1 < messages.size() &&
-                                     messages[i + 1].role == "tool");
-                if (!next_is_tool) {
-                    result += "<|im_end|>\n";
-                    in_tool_response = false;
-                }
-            } else {
-                result += "<|im_start|>";
-                result += msg.role;
-                result += '\n';
-                std::string_view content = msg.content;
-                // As the Qwen templates do, an assistant turn after the last
-                // user query replays its thinking (a raw turn from tool memory
-                // already holds it). Earlier turns keep their text only.
-                const std::string_view reasoning = trim_whitespace(msg.reasoning_content);
-                if (msg.role == "assistant" && last_query < i &&
-                    !msg.tool_calls_replayed && !reasoning.empty()) {
-                    result += "<think>\n";
-                    result += reasoning;
-                    result += "\n</think>\n\n";
-                    content = trim_whitespace(content);
-                }
-                result += content;
-                if (msg.role == "assistant") {
-                    append_xml_tool_calls(result, msg, format, !content.empty());
-                }
-                result += "<|im_end|>\n";
-            }
-        }
-
-        if (add_generation_prompt) {
-            result += "<|im_start|>assistant\n";
-            if (!enable_thinking) {
-                // Qwen3 thinking disabled: inject closed think block so the
-                // model skips reasoning and generates the answer directly.
-                result += "<think>\n\n</think>\n\n";
-            } else {
-                // Qwen3.6 enable_thinking: pre-open the thinking block so the
-                // model actually enters reasoning mode. Verified against the
-                // official Qwen3.6 chat_template.jinja:
-                //   enable_thinking=true  → suffix `assistant\n<think>\n`
-                //   enable_thinking=false → suffix `assistant\n<think>\n\n</think>\n\n`
-                // Without this prefix, Qwen3.6 stays in non-thinking mode
-                // even when the client opts in, defeating the thinking-budget
-                // mechanism entirely.
-                result += "<think>\n";
-            }
         }
         break;
     }
@@ -782,7 +525,7 @@ std::string render_chat_template(
                 // (including any embedded <think>...</think> blocks).
                 result += "<assistant>\n";
                 result += msg.content;
-                append_xml_tool_calls(result, msg, format, !msg.content.empty());
+                append_xml_tool_calls(result, msg, format);
                 result += "\n</assistant>\n";
             } else if (msg.role == "tool") {
                 result += "<tool_response>\n";
@@ -922,157 +665,6 @@ std::string render_chat_template(
         break;
     }
 
-    case ChatFormat::DEEPSEEK4: {
-        // DeepSeek V4 Flash DSML renderer, matching the ds4 reference server:
-        //   <｜begin▁of▁sentence｜>{system}<｜User｜>{user}<｜Assistant｜></think>
-        // Completed assistant turns are terminated with <｜end▁of▁sentence｜>.
-        std::string system_content;
-        for (const auto & msg : messages) {
-            if (msg.role != "system") continue;
-            if (!system_content.empty()) system_content += "\n\n";
-            system_content += msg.content;
-        }
-
-        result = "<｜begin▁of▁sentence｜>";
-        if (enable_thinking && reasoning_effort == "high") {
-            result += "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n";
-            result += "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n";
-            result += "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
-        } else if (enable_thinking && reasoning_effort == "max") {
-            result += "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n";
-            result += "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n";
-            result += "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
-        }
-        if (has_tools) {
-            result += "## Tools\n\n"
-                      "You have access to a set of tools to help answer the user question. "
-                      "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n"
-                      "<｜DSML｜tool_calls>\n"
-                      "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
-                      "<｜DSML｜parameter name=\"$PARAM_STRING\" string=\"true\">string_value</｜DSML｜parameter>\n"
-                      "<｜DSML｜parameter name=\"$PARAM_JSON\" string=\"false\">[1, 2, 3]</｜DSML｜parameter>\n"
-                      "</｜DSML｜invoke>\n"
-                      "<｜DSML｜invoke name=\"$TOOL_NAME2\">\n"
-                      "...\n"
-                      "</｜DSML｜invoke>\n"
-                      "</｜DSML｜tool_calls>\n\n"
-                      "String parameters should be specified as is and set `string=\"true\"`. "
-                      "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
-                      "### Available Tool Schemas\n\n";
-            append_available_tools(result, tools_json);
-            result += "\nYou MUST strictly follow the defined tool schemas to invoke tool calls.\n\n";
-        }
-        result += system_content;
-
-        bool pending_assistant = false;
-        bool pending_tool_result = false;
-        const auto order = dsml_message_order(messages);
-        for (size_t i = 0; i < messages.size(); ++i) {
-            const auto & msg = messages[order.empty() ? i : order[i]];
-            if (msg.role == "system") {
-                continue;
-            } else if (msg.role == "user") {
-                result += "<｜User｜>";
-                result += msg.content;
-                pending_assistant = true;
-                pending_tool_result = false;
-            } else if (msg.role == "tool" || msg.role == "function") {
-                result += pending_tool_result ? "\n\n" : "<｜User｜>";
-                result += "<tool_result>";
-                result += msg.content;
-                result += "</tool_result>";
-                pending_assistant = true;
-                pending_tool_result = true;
-            } else if (msg.role == "assistant") {
-                if (pending_assistant) {
-                    result += "<｜Assistant｜>";
-                    result += enable_thinking ? "<think>" : "</think>";
-                }
-                // Cold API history contains visible prose, not raw reasoning.
-                if (enable_thinking && !msg.tool_calls_replayed && !msg.tool_calls.empty()) {
-                    result += "</think>";
-                }
-                result += msg.content;
-                append_dsml_tool_calls(result, msg, false);
-                // The official V4 encoder ends tool-call turns with EOS too.
-                result += "<｜end▁of▁sentence｜>";
-                pending_assistant = false;
-                pending_tool_result = false;
-            }
-        }
-
-        if (add_generation_prompt) {
-            result += "<｜Assistant｜>";
-            result += enable_thinking ? "<think>" : "</think>";
-        }
-        break;
-    }
-
-    case ChatFormat::DEEPSEEK41: {
-        // DeepSeek V4.1 Flash, following encoding/encoding.py in the model repo:
-        //   <｜begin▁of▁sentence｜><｜System｜>{effort}{system}\n\n{tools}<｜User｜>{user}<｜Assistant｜></think>
-        // V4.1 differs from V4 in the leading-space DSML tag names (<｜DSML｜ calls>),
-        // a numeric reasoning effort, and <｜System｜> on system turns, including
-        // mid-conversation ones. Tool results join the user turn as
-        // <tool_result> blocks separated by blank lines. Every assistant header is
-        // rendered the same way in every turn, so a completed turn keeps its prefix.
-        const size_t first = !messages.empty() && messages[0].role == "system" ? 1 : 0;
-        result = "<｜begin▁of▁sentence｜>";
-        if (enable_thinking || first == 1 || has_tools) result += "<｜System｜>";
-        if (enable_thinking) {
-            result += "Reasoning Effort: " + std::to_string(ds41_reasoning_budget(reasoning_effort)) +
-                      " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
-        }
-        if (first == 1) result += messages[0].content;
-        if (has_tools) {
-            result += "\n\n";
-            append_ds41_tools(result, tools_json);
-        }
-
-        bool in_user_turn = false;
-        bool pending_assistant = false;
-        const auto order = dsml_message_order(messages);
-        for (size_t i = first; i < messages.size(); ++i) {
-            const auto & msg = messages[order.empty() ? i : order[i]];
-            if (msg.role == "system") {
-                result += "<｜System｜>";
-                result += msg.content;
-                in_user_turn = false;
-                pending_assistant = true;
-            } else if (msg.role == "user" || msg.role == "tool" || msg.role == "function") {
-                result += in_user_turn ? "\n\n" : "<｜User｜>";
-                if (msg.role == "user") {
-                    result += msg.content;
-                } else {
-                    result += "<tool_result>";
-                    result += msg.content;
-                    result += "</tool_result>";
-                }
-                in_user_turn = true;
-                pending_assistant = true;
-            } else if (msg.role == "assistant") {
-                if (pending_assistant) {
-                    result += "<｜Assistant｜>";
-                    result += enable_thinking ? "<think>" : "</think>";
-                }
-                if (enable_thinking && !msg.tool_calls_replayed && !msg.tool_calls.empty()) {
-                    result += "</think>";
-                }
-                result += msg.content;
-                append_dsml_tool_calls(result, msg, true);
-                // V4.1 retains EOS after its distinct, leading-space DSML tags.
-                result += "<｜end▁of▁sentence｜>";
-                in_user_turn = false;
-                pending_assistant = false;
-            }
-        }
-
-        if (add_generation_prompt) {
-            result += "<｜Assistant｜>";
-            result += enable_thinking ? "<think>" : "</think>";
-        }
-        break;
-    }
     }
 
     return result;
@@ -1185,32 +777,7 @@ static std::string render_jinja(
     bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
     if (has_tools) {
         try {
-            inputs["tools"] = nlohmann::ordered_json::parse(tools_json);
-            // Chat Completions wraps functions, Responses flattens them, and
-            // Anthropic names the parameter schema input_schema. Templates
-            // receive the same OpenAI-shaped function definition for all three.
-            for (auto & tool : inputs["tools"]) {
-                if (!tool.is_object()) continue;
-                if (!tool.contains("function") && tool.contains("name")) {
-                    auto function = std::move(tool);
-                    function.erase("type");
-                    tool = nlohmann::ordered_json::object();
-                    tool["type"] = "function";
-                    tool["function"] = std::move(function);
-                }
-                if (!tool.contains("function") || !tool["function"].is_object()) continue;
-                auto & function = tool["function"];
-                const auto input_schema = function.find("input_schema");
-                if (input_schema != function.end()) {
-                    if (!function.contains("parameters")) {
-                        auto schema = std::move(*input_schema);
-                        function.erase("input_schema");
-                        function["parameters"] = std::move(schema);
-                    } else {
-                        function.erase("input_schema");
-                    }
-                }
-            }
+            inputs["tools"] = openai_tool_definitions(nlohmann::ordered_json::parse(tools_json));
         } catch (const std::exception & e) {
             throw std::runtime_error(
                 std::string("render_chat_template_jinja: failed to parse tools JSON: ") + e.what());

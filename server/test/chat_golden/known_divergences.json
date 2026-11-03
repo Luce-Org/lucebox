@@ -1,0 +1,80 @@
+{
+  "about": "Cases where Lucebox's prompt still differs from the official template, with the reason, per model and prompt path (<model>/codec: --chat-codec; /codec_official: the codec with preserve_thinking false, Qwen3.5's official prompt; /jinja: the Jinja engine with the official template). test_chat_golden_* fails on a difference not listed here and on a listed case that matches. `text` compares the rendered prompt; `tokens` compares token IDs (only with a real GGUF tokenizer).",
+  "text": {
+    "qwen3.8-flash-next/jinja": {
+      "whitespace_edges": "the Jinja engine's trim strips ASCII whitespace only (Python's also strips Unicode spaces such as U+00A0 and U+3000)",
+      "float_values": "the Jinja engine's tojson writes floats as C++ does (1e+15), not as Python's json.dumps (1000000000000000.0)"
+    },
+    "deepseek-v4.1-flash/codec": {
+      "official_3": "the encoder's latest_reminder role, which no API request can send: the codec rejects the conversation",
+      "official_4": "the encoder's latest_reminder role, which no API request can send: the codec rejects the conversation",
+      "official_5": "image parts are not rendered on this path: the server renders images through its image pipeline, which this test does not drive"
+    },
+    "qwen3.6-27b/jinja": {
+      "whitespace_edges": "the Jinja engine's trim strips ASCII whitespace only (Python's also strips Unicode spaces such as U+00A0 and U+3000)",
+      "float_values": "the Jinja engine's tojson writes floats as C++ does (1e+15), not as Python's json.dumps (1000000000000000.0)"
+    },
+    "qwen3.5-27b/codec": {
+      "history_reasoning_alias": "deliberate: the codec keeps earlier turns' thinking by default (the Qwen3.5 template drops it, as vLLM, SGLang, llama.cpp and Ollama do), so a new user question leaves the history as it was for the prefix cache and PFlash; preserve_thinking false renders the official prompt (qwen3.5-27b/codec_official)",
+      "history_thinking": "deliberate: the codec keeps earlier turns' thinking by default (the Qwen3.5 template drops it, as vLLM, SGLang, llama.cpp and Ollama do), so a new user question leaves the history as it was for the prefix cache and PFlash; preserve_thinking false renders the official prompt (qwen3.5-27b/codec_official)",
+      "history_thinking_off": "deliberate: the codec keeps earlier turns' thinking by default (the Qwen3.5 template drops it, as vLLM, SGLang, llama.cpp and Ollama do), so a new user question leaves the history as it was for the prefix cache and PFlash; preserve_thinking false renders the official prompt (qwen3.5-27b/codec_official)",
+      "think_tags_in_content": "deliberate: the codec keeps earlier turns' thinking by default (the Qwen3.5 template drops it, as vLLM, SGLang, llama.cpp and Ollama do), so a new user question leaves the history as it was for the prefix cache and PFlash; preserve_thinking false renders the official prompt (qwen3.5-27b/codec_official)",
+      "tool_loop_then_new_user": "deliberate: the codec keeps earlier turns' thinking by default (the Qwen3.5 template drops it, as vLLM, SGLang, llama.cpp and Ollama do), so a new user question leaves the history as it was for the prefix cache and PFlash; preserve_thinking false renders the official prompt (qwen3.5-27b/codec_official)",
+      "whitespace_edges": "deliberate: the codec keeps earlier turns' thinking by default (the Qwen3.5 template drops it, as vLLM, SGLang, llama.cpp and Ollama do), so a new user question leaves the history as it was for the prefix cache and PFlash; preserve_thinking false renders the official prompt (qwen3.5-27b/codec_official)"
+    },
+    "deepseek-v4-flash/codec": {
+      "official_3": "the encoder's latest_reminder role, which no API request can send: the codec rejects the conversation",
+      "official_4": "the encoder's latest_reminder role, which no API request can send: the codec rejects the conversation"
+    },
+    "qwen3.5-27b/jinja": {
+      "whitespace_edges": "the Jinja engine's trim strips ASCII whitespace only (Python's also strips Unicode spaces such as U+00A0 and U+3000)",
+      "float_values": "the Jinja engine's tojson writes floats as C++ does (1e+15), not as Python's json.dumps (1000000000000000.0)"
+    }
+  },
+  "tokens": {
+    "qwen3.8-27b/codec": {
+      "control_text_in_user": "deliberate: control-token text the user typed (<|im_end|>, <|im_start|>) stays text instead of becoming the control token, so a message cannot close its turn or open another; Hugging Face tokenizers match it"
+    },
+    "qwen3.8-flash-next/codec": {
+      "control_text_in_user": "deliberate: control-token text the user typed (<|im_end|>, <|im_start|>) stays text instead of becoming the control token, so a message cannot close its turn or open another; Hugging Face tokenizers match it"
+    },
+    "qwen3.8-flash-next/jinja": {
+      "whitespace_edges": "follows from the text difference",
+      "float_values": "follows from the text difference"
+    },
+    "deepseek-v4.1-flash/codec": {
+      "control_text_in_user_ds": "deliberate: turn-marker text the user typed (<｜User｜>, <｜Assistant｜>) stays text instead of becoming the marker token, so a message cannot close its turn or open another; Hugging Face tokenizers match it (the V4.1 vocabulary types the markers user-defined, so the codec lists them as literal)",
+      "official_3": "follows from the text difference",
+      "official_4": "follows from the text difference",
+      "official_5": "follows from the text difference"
+    },
+    "qwen3.6-27b/codec": {
+      "control_text_in_user": "deliberate: control-token text the user typed (<|im_end|>, <|im_start|>) stays text instead of becoming the control token, so a message cannot close its turn or open another; Hugging Face tokenizers match it"
+    },
+    "qwen3.6-27b/jinja": {
+      "whitespace_edges": "follows from the text difference",
+      "float_values": "follows from the text difference"
+    },
+    "deepseek-v4-flash/codec": {
+      "control_text_in_user_ds": "deliberate: turn-marker text the user typed (<｜User｜>, <｜Assistant｜>) stays text instead of becoming the marker token, so a message cannot close its turn or open another; Hugging Face tokenizers match it (the V4 vocabulary types the markers user-defined, so the codec lists them as literal)",
+      "official_3": "follows from the text difference",
+      "official_4": "follows from the text difference"
+    },
+    "qwen3.5-27b/codec": {
+      "control_text_in_user": "deliberate: control-token text the user typed (<|im_end|>, <|im_start|>) stays text instead of becoming the control token, so a message cannot close its turn or open another; Hugging Face tokenizers match it",
+      "history_reasoning_alias": "follows from the text difference",
+      "history_thinking": "follows from the text difference",
+      "history_thinking_off": "follows from the text difference",
+      "think_tags_in_content": "follows from the text difference",
+      "tool_loop_then_new_user": "follows from the text difference",
+      "whitespace_edges": "follows from the text difference"
+    },
+    "qwen3.5-27b/codec_official": {
+      "control_text_in_user": "deliberate: control-token text the user typed (<|im_end|>, <|im_start|>) stays text instead of becoming the control token, so a message cannot close its turn or open another; Hugging Face tokenizers match it"
+    },
+    "qwen3.5-27b/jinja": {
+      "whitespace_edges": "follows from the text difference",
+      "float_values": "follows from the text difference"
+    }
+  }
+}

@@ -23,6 +23,12 @@ public:
     ~Qwen35MoeBackend() override = default;
 
     bool init() override;
+    // The hybrid spec-decode path does not check drafts against a grammar:
+    // constrained requests decode autoregressively. All hot (no hybrid
+    // storage), generation is the base Qwen3.5 path, which does.
+    bool speculates_under_constraint() const override {
+        return !target_weights().moe_hybrid && Qwen35Backend::speculates_under_constraint();
+    }
 
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;

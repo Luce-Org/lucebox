@@ -408,7 +408,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             auto final_chunks =
                 s.emitter->emit_finish(
                     s.completion_tokens, &gen_timings,
-                    s.n_gen_cap, is_eos);
+                    s.n_gen_cap, is_eos, s.degenerate_close);
             for (const auto & chunk : final_chunks) {
                 s.send_buffer.append(chunk);
             }
@@ -419,8 +419,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                                     &s.send_buffer, &s.acceptance);
         }
         // Before the reply goes out, which the client's next request follows.
-        if (!s.error && !s.client_disconnected && s.completion_tokens > 0) {
-            remember_tool_turn(req, s.gen_tokens, *s.emitter);
+        if (!s.error && !s.client_disconnected) {
+            remember_codec_turn(req, s.gen_tokens);
+            if (s.completion_tokens > 0) remember_tool_turn(req, s.gen_tokens, *s.emitter);
         }
 
         const double elapsed_s = std::chrono::duration<double>(
@@ -861,10 +862,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         // can still try another model; no tokenizer/model identity is on wire.
         auto emitter = std::make_unique<SseEmitter>(
             req.format, req.response_id, req.model,
-            usage_prompt_tokens(req), req.tools, &tool_memory_,
+            usage_prompt_tokens(req), req.tools, chat_codec_ ? nullptr : &tool_memory_,
             req.stop_sequences, req.started_in_thinking,
             tool_checks::tool_calls_allowed(req.tool_choice,
                                             req.tool_checks_pass));
+        emitter->set_chat_codec(chat_codec_.get());
         if (req.stream) {
             bool ok = send_sse_headers(job);
             if (ok) {

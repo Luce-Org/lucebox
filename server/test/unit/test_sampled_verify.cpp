@@ -3,8 +3,12 @@
 // AR sampling of the target. A fake target and drafter run the backend's
 // step: sampled_verify_walk over the verify rows, the budget clamp, the
 // fast-rollback bonus drop, then the next seed from sampled_verify_next.
+// Under a grammar, sampled and greedy verify must also match constrained AR
+// decoding, the grammar advanced over each committed token.
 
 #include "CppUnitTestFramework.hpp"
+#include "common/gbnf.h"
+#include "common/output_constraint.h"
 #include "common/sampled_verify.h"
 #include "common/sampler.h"
 
@@ -16,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <random>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -89,6 +94,20 @@ constexpr int kNeverFastRollback = INT_MAX;
 // cut the walk's prefix.
 enum class Seed { kBackend, kAlwaysRedraw, kRedrawAfterClamp };
 
+// Letters a..f, one per token, under a grammar that alternates [abc] and
+// [def]: the tokens it allows flip at every position, so a verify that checks
+// a row against the grammar one position off is caught.
+std::shared_ptr<OutputConstraint> alternating_grammar() {
+    std::vector<std::string> pieces;
+    for (int t = 0; t < kVocab; ++t) pieces.push_back(std::string(1, (char)('a' + t)));
+    std::string error;
+    auto matcher = gbnf::Matcher::compile("root ::= ([abc] [def])*", "root", error);
+    if (!matcher) std::fprintf(stderr, "grammar error: %s\n", error.c_str());
+    return std::make_shared<OutputConstraint>(ConstraintVocab::build(std::move(pieces), {}),
+                                              std::move(matcher),
+                                              OutputConstraint::Options{});
+}
+
 struct StepPolicy {
     // rollback_policy.fast_rollback_threshold on a target that supports fast
     // rollback; kNeverFastRollback is legacy replay, which commits the bonus.
@@ -97,6 +116,8 @@ struct StepPolicy {
     // like the budget clamp but without ending the generation.
     int max_commit = INT_MAX;
     Seed seed = Seed::kBackend;
+    // Hand the walk a grammar one token ahead of the root's position.
+    bool grammar_off_by_one = false;
 };
 
 // One generation of `length` tokens through the backend's chain step. The
@@ -109,6 +130,8 @@ std::vector<int32_t> generate(const FakeModel & target, const Drafter & drafter,
                               std::mt19937_64 & rng) {
     std::vector<int32_t> context = prompt;
     std::vector<int32_t> out;
+    // The commit point advances the grammar over every kept token.
+    if (sampler.constraint) sampler.constraint->reset();
     // The prefill's first token is sampled like any other.
     int32_t last_tok = sample_logits(target.logits(context), kVocab, sampler,
                                      out, rng);
@@ -131,8 +154,13 @@ std::vector<int32_t> generate(const FakeModel & target, const Drafter & drafter,
             rows.insert(rows.end(), row, row + kVocab);
         }
         verify_history = out;
+        SamplerCfg walk_sampler = sampler;
+        if (policy.grammar_off_by_one && sampler.constraint) {
+            walk_sampler.constraint = sampler.constraint->snapshot();
+            walk_sampler.constraint->accept(last_tok);
+        }
         const SampledVerifyWalk walk = sampled_verify_walk(
-            rows.data(), kVocab, v_len, draft_tok.data(), sampler,
+            rows.data(), kVocab, v_len, draft_tok.data(), walk_sampler,
             verify_history, rng);
         const int accept_n = walk.accepted;
         int bonus_tok = walk.bonus;
@@ -149,6 +177,7 @@ std::vector<int32_t> generate(const FakeModel & target, const Drafter & drafter,
             const int32_t token = (i < accept_n) ? draft_tok[(size_t)i] : bonus_tok;
             context.push_back(token);
             out.push_back(token);
+            if (sampler.constraint) sampler.constraint->accept(token);
         }
 
         // The tip row (commit_n - 1) is the target after the committed tokens.
@@ -181,14 +210,19 @@ std::vector<double> exact_distribution(const FakeModel & target,
     for (int i = 0; i < length; ++i) cells *= kVocab;
     std::vector<double> probs(cells, 0.0);
     std::vector<std::pair<float, int>> dist;
+    SamplerCfg position = sampler;
     for (size_t cell = 0; cell < cells; ++cell) {
         std::vector<int32_t> seq = prompt, generated;
         double p = 1.0;
         size_t code = cell;
+        if (sampler.constraint) {
+            sampler.constraint->reset();
+            position.constraint = sampler.constraint->snapshot();
+        }
         for (int i = 0; i < length && p > 0.0; ++i) {
             const int32_t token = (int32_t)(code % kVocab);
             code /= kVocab;
-            sampler_distribution(target.logits(seq), kVocab, sampler, generated,
+            sampler_distribution(target.logits(seq), kVocab, position, generated,
                                  dist);
             double q = 0.0;
             for (const auto & entry : dist) {
@@ -197,6 +231,7 @@ std::vector<double> exact_distribution(const FakeModel & target,
             p *= q;
             seq.push_back(token);
             generated.push_back(token);
+            if (position.constraint) position.constraint->accept(token);
         }
         probs[cell] = p;
     }
@@ -262,6 +297,101 @@ SamplerCfg penalized_sampler() {
     sampler.top_k = 4;
     sampler.rep_pen = 1.3f;
     return sampler;
+}
+
+// Temperature alone: under a grammar, rejection sampling then draws from the
+// masked distribution exactly, which is what exact_distribution computes.
+SamplerCfg constrained_sampler() {
+    SamplerCfg sampler;
+    sampler.temp = 0.9f;
+    sampler.constraint = alternating_grammar();
+    return sampler;
+}
+
+// Greedy decoding under the sampler's grammar, as the backend's chain step
+// runs it: the target's argmax rows, constrained_greedy_walk, the budget
+// clamp, fast rollback or replay, and the next root checked against the
+// grammar at the commit point. With `walk_grammar_off_by_one` the walk is
+// handed a grammar a token ahead.
+std::vector<int32_t> generate_greedy(const FakeModel & target, const Drafter & drafter,
+                                     const SamplerCfg & sampler,
+                                     const std::vector<int32_t> & prompt, int width,
+                                     int length, int fast_rollback_threshold,
+                                     bool walk_grammar_off_by_one = false) {
+    std::vector<int32_t> context = prompt;
+    std::vector<int32_t> out;
+    std::mt19937_64 rng(0);
+    sampler.constraint->reset();
+    auto constrained_argmax = [&](const std::vector<int32_t> & seq) {
+        const int32_t best = target.argmax(seq);
+        if (sampler.constraint->allows(best)) return best;
+        return (int32_t)sample_logits(target.logits(seq), kVocab, sampler, out, rng);
+    };
+    int32_t last_tok = constrained_argmax(context);
+    while ((int)out.size() < length) {
+        const int need_commit_budget = length - (int)out.size();
+        std::vector<int32_t> draft_tok = {last_tok};
+        std::vector<int32_t> seq = context;
+        seq.push_back(last_tok);
+        for (int32_t token : drafter(seq, width - 1)) draft_tok.push_back(token);
+        const int v_len = (int)draft_tok.size();
+        std::vector<int32_t> target_tok;
+        std::vector<std::vector<int32_t>> row_seq;
+        for (int i = 0; i < v_len; ++i) {
+            if (i > 0) seq.push_back(draft_tok[(size_t)i]);
+            target_tok.push_back(target.argmax(seq));
+            row_seq.push_back(seq);
+        }
+        SamplerCfg walk_sampler = sampler;
+        if (walk_grammar_off_by_one) {
+            walk_sampler.constraint = sampler.constraint->snapshot();
+            walk_sampler.constraint->accept(last_tok);
+        }
+        const int accept_n = constrained_greedy_walk(
+            target_tok.data(), v_len, draft_tok.data(), walk_sampler,
+            [&](int row, int & vocab) {
+                vocab = kVocab;
+                return target.logits(row_seq[(size_t)row]);
+            });
+        int bonus_tok = accept_n < v_len ? target_tok[(size_t)accept_n - 1] : -1;
+        int commit_n = accept_n + (bonus_tok >= 0 ? 1 : 0);
+        if (commit_n > need_commit_budget) {
+            commit_n = need_commit_budget;
+            if (commit_n <= accept_n) bonus_tok = -1;
+        }
+        int32_t replay_last_tok = -1;
+        if (accept_n >= fast_rollback_threshold) {
+            bonus_tok = -1;
+            commit_n = std::min(accept_n, need_commit_budget);
+            replay_last_tok = target_tok[(size_t)commit_n - 1];
+        }
+        for (int i = 0; i < commit_n; ++i) {
+            const int32_t token = (i < accept_n) ? draft_tok[(size_t)i] : bonus_tok;
+            context.push_back(token);
+            out.push_back(token);
+            sampler.constraint->accept(token);
+        }
+        // Replay: the target's plain argmax after the committed tokens.
+        if (replay_last_tok < 0) replay_last_tok = target.argmax(context);
+        last_tok = sampler.constraint->allows(replay_last_tok)
+            ? replay_last_tok : constrained_argmax(context);
+    }
+    return out;
+}
+
+std::vector<int32_t> generate_greedy_ar(const FakeModel & target, const SamplerCfg & sampler,
+                                        const std::vector<int32_t> & prompt, int length) {
+    std::vector<int32_t> context = prompt;
+    std::vector<int32_t> out;
+    std::mt19937_64 rng(0);
+    sampler.constraint->reset();
+    while ((int)out.size() < length) {
+        const int32_t token = sample_logits(target.logits(context), kVocab, sampler, out, rng);
+        context.push_back(token);
+        out.push_back(token);
+        sampler.constraint->accept(token);
+    }
+    return out;
 }
 
 // Each draw's row index, returned as 1000 + row.
@@ -368,4 +498,62 @@ TEST_CASE(SampledVerifyFixture, next_reuses_the_draw_at_the_kept_tip) {
     CHECK(sampled_verify_next(walk, tokens, 3, std::ref(rec)) == 1002);
     CHECK((rec.rows == std::vector<int>{3, 2}));
     CHECK(sampled_verify_next(walk, tokens, 0, std::ref(rec)) == -1);
+}
+
+// Under a grammar the walk draws from a snapshot advanced over the root and
+// each kept draft: still exact against constrained AR sampling, and a grammar
+// one token off is caught.
+TEST_CASE(SampledVerifyFixture, constrained_tokens_match_constrained_ar_sampling) {
+    const FakeModel target(11, 2.0f);
+    const SamplerCfg sampler = constrained_sampler();
+    const Drafter drafters[] = {greedy_drafter(target), noise_drafter(5)};
+    for (const Drafter & drafter : drafters) {
+        for (int threshold : {1, kNeverFastRollback}) {
+            StepPolicy policy;
+            policy.fast_rollback_threshold = threshold;
+            CHECK(total_variation(target, drafter, sampler, policy, 7) < kTvBound);
+        }
+    }
+    StepPolicy clamp;
+    clamp.max_commit = 1;
+    CHECK(total_variation(target, greedy_drafter(target), sampler, clamp, 7) < kTvBound);
+    StepPolicy off;
+    off.grammar_off_by_one = true;
+    CHECK(total_variation(target, greedy_drafter(target), sampler, off, 7) > 2 * kTvBound);
+}
+
+// Greedy verify under a grammar commits exactly the tokens constrained greedy
+// AR decoding does, whichever drafter, width and rollback policy.
+TEST_CASE(SampledVerifyFixture, constrained_greedy_matches_constrained_ar) {
+    SamplerCfg sampler;
+    sampler.constraint = alternating_grammar();
+    const std::vector<int32_t> prompt = {1, 2};
+    constexpr int kTokens = 24;
+    int rewritten_runs = 0;
+    for (uint64_t model_seed = 1; model_seed <= 40; ++model_seed) {
+        const FakeModel target(model_seed, 2.0f);
+        const std::vector<int32_t> ar = generate_greedy_ar(target, sampler, prompt, kTokens);
+        // The grammar changes the argmax path for most models.
+        std::vector<int32_t> context = prompt, plain;
+        for (int i = 0; i < kTokens; ++i) {
+            plain.push_back(target.argmax(context));
+            context.push_back(plain.back());
+        }
+        if (plain != ar) ++rewritten_runs;
+        const Drafter drafters[] = {greedy_drafter(target), noise_drafter(model_seed)};
+        for (const Drafter & drafter : drafters) {
+            for (int width : {1, 2, 4}) {
+                for (int threshold : {1, 3, kNeverFastRollback}) {
+                    CHECK((generate_greedy(target, drafter, sampler, prompt, width, kTokens,
+                                           threshold) == ar));
+                }
+            }
+        }
+    }
+    CHECK(rewritten_runs >= 30);
+    // A grammar one token off commits other tokens.
+    const FakeModel target(3, 2.0f);
+    CHECK((generate_greedy(target, greedy_drafter(target), sampler, prompt, 4, kTokens, 1,
+                           /*walk_grammar_off_by_one=*/true) !=
+           generate_greedy_ar(target, sampler, prompt, kTokens)));
 }

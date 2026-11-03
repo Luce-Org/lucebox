@@ -250,6 +250,10 @@ static bool load_sidecar(const std::string & path, ModelCard & out, std::string 
             j["thinking_terminator_hint"].get<std::string>();
     }
 
+    if (j.contains("chat_codec") && j["chat_codec"].is_string()) {
+        out.chat_codec = j["chat_codec"].get<std::string>();
+    }
+
     if (j.contains("sampling") && j["sampling"].is_object()) {
         parse_sampling_defaults(j["sampling"], out.sampling);
     }

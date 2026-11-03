@@ -5,6 +5,7 @@
   "max_tokens": 393216,
   "complex_problem_max_tokens": 393216,
   "hard_limit_reply_budget": 4096,
+  "chat_codec": "deepseek4",
   "sampling": {
     "temperature": 1.0,
     "top_p": 1.0

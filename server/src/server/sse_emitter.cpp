@@ -1,6 +1,7 @@
 // SSE emitter implementation — streaming state machine for all 3 API formats.
 
 #include "sse_emitter.h"
+#include "chat_codec.h"
 #include "utf8_utils.h"
 
 #include <algorithm>
@@ -775,7 +776,8 @@ static size_t find_top_level_think_close(const std::string & buf, const json & t
 std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                                                  const GenTimings * timings,
                                                  int generation_cap,
-                                                 bool ended_on_eos) {
+                                                 bool ended_on_eos,
+                                                 bool degenerate) {
     if (terminal_) return {};
     terminal_ = true;
     std::vector<std::string> out;
@@ -840,7 +842,14 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
     // Parse tool calls from buffer
     std::string fr = "stop";
     if (mode_ == StreamMode::TOOL_BUFFER && !tool_buffer_.empty()) {
-        auto parsed = parse_tool_calls(tool_buffer_, tools_);
+        ToolParseResult parsed;
+        if (!chat_codec_ || !chat_codec_->parse_tool_calls(tool_buffer_, tools_, parsed)) {
+            if (chat_codec_) {
+                std::fprintf(stderr, "[server] [tool_call] request_id=%s: not in the %s template's "
+                             "format, read heuristically\n", request_id_.c_str(), chat_codec_->id().c_str());
+            }
+            parsed = parse_tool_calls(tool_buffer_, tools_);
+        }
         // Under tool_choice "none" a call the model makes anyway is dropped:
         // the text around it is the answer and the finish reason stays stop.
         const bool drop_calls = !tool_calls_allowed_ && !parsed.tool_calls.empty();
@@ -983,9 +992,9 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         }
     }
 
-    hit_output_cap_ = !stop_hit_ && !ended_on_eos &&
-        generation_cap >= 0 && completion_tokens >= generation_cap;
-    if (fr == "stop" && hit_output_cap_) fr = "length";
+    hit_output_cap_ = degenerate || (!stop_hit_ && !ended_on_eos &&
+        generation_cap >= 0 && completion_tokens >= generation_cap);
+    if (degenerate || (fr == "stop" && hit_output_cap_)) fr = "length";
     finish_reason_ = fr;
 
     // Format-specific final events
@@ -1030,10 +1039,11 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         }
         // stop_reason reflects the model's actual finish: "tool_use" when
         // any tool calls were emitted (downstream SDKs pivot on this to feed
-        // tool_result back), else "end_turn" or "max_tokens".
-        const char * stop_reason = tool_calls_.empty()
-            ? (fr == "length" ? "max_tokens" : "end_turn")
-            : "tool_use";
+        // tool_result back), else "end_turn" or "max_tokens"; a degenerate
+        // decode is "max_tokens" either way.
+        const char * stop_reason = degenerate ? "max_tokens"
+            : !tool_calls_.empty() ? "tool_use"
+            : fr == "length" ? "max_tokens" : "end_turn";
         json anth_usage = {{"output_tokens", completion_tokens}};
         if (timings) {
             anth_usage["timings"] = build_timings_json(*timings, completion_tokens);

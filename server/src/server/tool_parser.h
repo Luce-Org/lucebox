@@ -50,6 +50,12 @@ std::vector<std::string> tool_call_openers(const json & tools);
 // opener split across token boundaries.
 size_t tool_syntax_holdback(const json & tools);
 
+// A fresh tool-call ID ("call_" + 24 hex digits).
+std::string new_tool_call_id();
+
+// The parameter schemas (`properties`) of declared tool `name`; {} if none.
+json tool_parameter_properties(const json & tools, const std::string & name);
+
 // Parse tool calls from generated text. `tools` is the tool definitions
 // (used for type coercion and allow-list filtering). May be null/empty.
 ToolParseResult parse_tool_calls(const std::string & text,

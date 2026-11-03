@@ -380,7 +380,15 @@ static void print_usage(const char * prog) {
         "Chat template (optional, overrides the model-family renderer):\n"
         "  --chat-template-file <path>  Load a Jinja chat template file.\n"
         "                               Receives structured tool calls and schemas.\n"
-        "                               Empty files use the built-in template.\n"
+        "                               An empty file is ignored.\n"
+        "  --chat-codec <name>          Render the model's official template to tokens\n"
+        "                               (qwen3.8: Qwen3.8 27B and Flash-Next; qwen3.6:\n"
+        "                               Qwen3.6; qwen3.5: Qwen3.5; deepseek4.1,\n"
+        "                               deepseek4: DeepSeek V4.1 and V4 Flash).\n"
+        "                               Default: the\n"
+        "                               model card's codec, else the arch's; none: the\n"
+        "                               built-in renderer (Gemma 4, Laguna and\n"
+        "                               BailingMoE3 only).\n"
         "\n"
         "MoE expert placement:\n"
         "  --spark                      Enable self-tuning hot/cold expert placement\n"
@@ -475,6 +483,8 @@ struct ModelOptions {
     // rely on it actually capping output).
     bool legacy_max_tokens_set = false;
     int  legacy_max_tokens_val = 0;
+    // --chat-codec was passed (a name, or none): the model card's codec does not apply.
+    bool chat_codec_set = false;
 
 };
 
@@ -518,6 +528,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
     auto & cli_set = model.cli_set;
     auto & legacy_max_tokens_set = model.legacy_max_tokens_set;
     auto & legacy_max_tokens_val = model.legacy_max_tokens_val;
+    auto & chat_codec_set = model.chat_codec_set;
     bool target_device_seen = false;
     bool target_devices_seen = false;
     bargs.model_path = argv[1];
@@ -1076,6 +1087,18 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         } else if (std::strcmp(argv[i], "--lazy-draft") == 0) {
             sconfig.lazy_draft = true;
             sconfig.draft_residency = DraftResidencyPolicy::RequestScoped;
+        } else if (std::strcmp(argv[i], "--chat-codec") == 0 && i + 1 < argc) {
+            sconfig.chat_codec = argv[++i];
+            chat_codec_set = true;
+            if (sconfig.chat_codec == "none") {
+                sconfig.chat_codec.clear();
+            } else if (!make_chat_codec(sconfig.chat_codec)) {
+                std::string names;
+                for (const auto & name : chat_codec_names()) names += (names.empty() ? "" : ", ") + name;
+                std::fprintf(stderr, "[server] unknown --chat-codec '%s' (expected: %s)\n",
+                             sconfig.chat_codec.c_str(), names.c_str());
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "--chat-template-file") == 0 && i + 1 < argc) {
             const char * path = argv[++i];
             std::FILE * f = std::fopen(path, "rb");
@@ -1087,14 +1110,12 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             long n = std::ftell(f);
             std::fseek(f, 0, SEEK_SET);
             if (n <= 0) {
-                // The usage text promises "Empty or missing falls back to the
-                // hardcoded template." Honor that: log a warning and leave
-                // chat_template_src empty so http_server.cpp falls through to
-                // the hardcoded QWEN3/LAGUNA renderer, instead of aborting
-                // startup.
+                // An empty file is ignored (as the usage text says): the
+                // model's own prompt format applies, its codec or the arch's
+                // built-in renderer.
                 std::fclose(f);
                 std::fprintf(stderr, "[server] --chat-template-file: '%s' is empty, "
-                                     "falling back to hardcoded template\n", path);
+                                     "using the model's default prompt format\n", path);
             } else {
                 sconfig.chat_template_src.resize((size_t)n);
                 size_t got = std::fread(sconfig.chat_template_src.data(), 1, (size_t)n, f);
@@ -1566,6 +1587,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     auto & fast_rollback_forced_off = model.fast_rollback_forced_off;
     auto & target_split_fast_rollback_cli = model.target_split_fast_rollback_cli;
     auto & cli_set = model.cli_set;
+    auto & chat_codec_set = model.chat_codec_set;
     auto & legacy_max_tokens_set = model.legacy_max_tokens_set;
     auto & legacy_max_tokens_val = model.legacy_max_tokens_val;
     if (fast_rollback_forced_off) {
@@ -1999,14 +2021,34 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         general_arch,
         /*repo_root_hint=*/"");
 
-    // Qwen3.8-Flash-Next renders with the GGUF's own chat template (reasoning-effort instruction, thinking default,
-    // tool format), as llama.cpp does, unless --chat-template-file overrides it.
-    if (general_arch == "qwen4exp" && sconfig.chat_template_src.empty() &&
-        !backend_model.metadata.chat_template.empty()) {
-        sconfig.chat_template_src = backend_model.metadata.chat_template;
-        sconfig.chat_template_path = "gguf:tokenizer.chat_template";
-        std::fprintf(stderr, "[server] using the GGUF chat template (%zu bytes)\n",
-                     sconfig.chat_template_src.size());
+    // The model card names the codec of the model's official template; without one, the arch's codec applies.
+    if (!chat_codec_set && sconfig.chat_template_src.empty()) {
+        const std::string name = !card.chat_codec.empty() ? card.chat_codec : default_chat_codec_for_arch(general_arch);
+        if (make_chat_codec(name)) {
+            sconfig.chat_codec = name;
+        } else if (!name.empty()) {
+            std::fprintf(stderr, "[server] model card names unknown chat codec '%s'; ignoring it\n", name.c_str());
+        }
+    }
+    if (!sconfig.chat_codec.empty() && !sconfig.chat_template_src.empty()) {
+        std::fprintf(stderr, "[server] --chat-codec and --chat-template-file both set the prompt format; "
+                             "pass one\n");
+        return 1;
+    }
+    if (!sconfig.chat_codec.empty()) {
+        std::fprintf(stderr, "[server] chat codec %s renders the prompt\n",
+                     make_chat_codec(sconfig.chat_codec)->id().c_str());
+    } else if (sconfig.chat_template_src.empty() && !chat_format_for_arch(general_arch)) {
+        std::fprintf(stderr, "[server] %s has no built-in renderer: drop --chat-codec none, "
+                             "or pass a Jinja template with --chat-template-file\n",
+                     general_arch.c_str());
+        return 1;
+    }
+    // PFlash maps the prompt (each message, the tool definitions) from the codec's render.
+    if (sconfig.pflash && sconfig.chat_codec.empty() && arch_supports_pflash_compression(general_arch)) {
+        std::fprintf(stderr, "[server] PFlash needs the model's chat codec: drop --chat-template-file and "
+                             "--chat-codec none, or turn PFlash off\n");
+        return 1;
     }
 
     // Apply each tunable to sconfig only if the operator did NOT set it

@@ -52,6 +52,7 @@ for the full field reference.
 | `max_tokens` | yes | The card's standard recommendation. |
 | `download_urls` | no | Map of variant tag (e.g. `Q4_K_M`, `bf16`) to GGUF download URL. Used by deployment tooling. |
 | `complex_problem_max_tokens` | no | For hard reasoning / benchmarking. Used to compute `x-high` and `max` effort tiers. |
+| `chat_codec` | no | The chat codec that renders the model's official template to tokens (`qwen3.8`, `qwen3.6`, `qwen3.5`, `deepseek4.1`, `deepseek4`). `server/test/chat_golden` checks it against the template and lists the deliberate differences (control-token text in a message stays text). The server uses it unless `--chat-codec` (a name, or `none`) or `--chat-template-file` is passed. Absent: the arch's codec (`deepseek41`: `deepseek4.1`, `deepseek4`: `deepseek4`, `qwen4exp`: `qwen3.8`, `qwen35` and `qwen35moe`: `qwen3.5`), else its built-in renderer. |
 | `default_sampling` | no | `greedy`: a request that does not sample decodes greedily with no penalties, and `sampling` fills in only for one that sets a temperature above 0. `sampling` (the default): `sampling` fills in for every request. |
 | `sampling` | no | The upstream sampler recipe, for fields a request leaves out. `min_p` is read and shown in `/props`, but the sampler does not apply it. |
 | `sampling_no_thinking` | no | The same for requests whose thinking is off. |

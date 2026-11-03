@@ -52,6 +52,10 @@
       "type": "string",
       "description": "Optional. Trained directive injected mid-stream when the budget hook fires. Tells the MODEL to wrap up. Tokenized at startup; the AR decode loop overrides sampled tokens with this sequence verbatim when `(n_gen - generated) <= hard_limit_reply_budget`. The server does NOT auto-append the marker — if the operator wants the close marker in the inject, they include it in the hint. This lets callers test whether a hint alone induces self-close (model emits marker itself) vs a full directive+marker (we force the close). For Qwen3.x the canonical hint per the Qwen3 technical report (arXiv 2505.09388) DOES include the marker: 'Considering the limited time by the user, I have to give the solution based on the thinking directly now.\\n</think>\\n\\n'. If empty, the server emits the bare `thinking_marker` only — safe but the model may continue derivation in content space."
     },
+    "chat_codec": {
+      "enum": ["qwen3.8", "qwen3.6", "qwen3.5", "deepseek4.1", "deepseek4"],
+      "description": "Optional. The chat codec that renders this model's official chat template to tokens (server/src/server/chat_codec.h), checked against server/test/chat_golden, which lists the deliberate differences (control-token text in a message stays text). The server uses it unless --chat-codec (a name, or none) or --chat-template-file is passed. Absent: the arch's codec (deepseek41: deepseek4.1, deepseek4: deepseek4, qwen4exp: qwen3.8, qwen35 and qwen35moe: qwen3.5), else its built-in renderer."
+    },
     "default_sampling": {
       "enum": ["greedy", "sampling"],
       "description": "Optional. greedy: a request that sets no temperature decodes greedily, and one that does not sample (no temperature, or 0) gets no penalties; `sampling` and `sampling_no_thinking` fill in only for a request that sets a temperature above 0. sampling (the default): they fill in for every request."

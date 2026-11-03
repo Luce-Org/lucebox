@@ -5,6 +5,7 @@
   "max_tokens": 204800,
   "hard_limit_reply_budget": 4096,
   "default_sampling": "greedy",
+  "chat_codec": "deepseek4.1",
   "sampling": {
     "temperature": 1.0,
     "top_p": 1.0

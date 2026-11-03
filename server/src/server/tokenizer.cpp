@@ -534,6 +534,17 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
 // ─── Public API ─────────────────────────────────────────────────────────
 
 bool Tokenizer::load_from_gguf(const char * model_path) {
+    // A second load replaces the vocabulary: nothing of the first one stays.
+    id_to_token_.clear();
+    token_to_id_.clear();
+    merge_rank_.clear();
+    added_tokens_.clear();
+    user_added_tokens_.clear();
+    control_ids_.clear();
+    bos_id_ = eos_id_ = eos_chat_id_ = -1;
+    pre_type_ = PreTokenizer::QWEN35;
+    is_sentencepiece_ = false;
+
     struct gguf_init_params params = { /*.no_alloc=*/ true, /*.ctx=*/ nullptr };
     struct gguf_context * gctx = gguf_init_from_file(model_path, params);
     if (!gctx) {
@@ -582,6 +593,7 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
                 const std::string & tok = id_to_token_[i];
                 if (!tok.empty()) {
                     added_tokens_.push_back({tok, (int32_t)i});
+                    if (ttype == 3) control_ids_.push_back((int32_t)i);
                 }
             }
         }
@@ -618,6 +630,10 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
                   [](const auto & a, const auto & b) {
                       return a.first.size() > b.first.size();
                   });
+        std::sort(control_ids_.begin(), control_ids_.end());
+        for (const auto & entry : added_tokens_) {
+            if (!is_control_token(entry.second)) user_added_tokens_.push_back(entry);
+        }
         std::fprintf(stderr, "[tokenizer] added_tokens: %zu special tokens\n",
                      added_tokens_.size());
     }
@@ -685,9 +701,26 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
     return true;
 }
 
-std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
+std::vector<int32_t> Tokenizer::encode(const std::string & text, bool match_control) const {
+    return encode_matching(text, match_control ? added_tokens_ : user_added_tokens_);
+}
+
+std::vector<int32_t> Tokenizer::encode(const std::string & text, bool match_control,
+                                       const std::vector<int32_t> & literal) const {
+    if (literal.empty()) return encode(text, match_control);
+    std::vector<std::pair<std::string, int32_t>> added;
+    for (const auto & entry : match_control ? added_tokens_ : user_added_tokens_) {
+        if (std::find(literal.begin(), literal.end(), entry.second) == literal.end()) {
+            added.push_back(entry);
+        }
+    }
+    return encode_matching(text, added);
+}
+
+std::vector<int32_t> Tokenizer::encode_matching(
+        const std::string & text, const std::vector<std::pair<std::string, int32_t>> & added) const {
     // If no added tokens, fast path: pre-tokenize → BPE entire text.
-    if (added_tokens_.empty()) {
+    if (added.empty()) {
         std::vector<std::string> pieces = pre_tokenize(text);
         std::vector<int32_t> ids;
         for (const auto & piece : pieces) {
@@ -704,7 +737,7 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
     while (pos < text.size()) {
         // Try to match any added token at current position.
         bool matched = false;
-        for (const auto & [tok_str, tok_id] : added_tokens_) {
+        for (const auto & [tok_str, tok_id] : added) {
             if (pos + tok_str.size() <= text.size() &&
                 text.compare(pos, tok_str.size(), tok_str) == 0) {
                 ids.push_back(tok_id);
@@ -717,7 +750,7 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
 
         // Find the next special token (or end of string).
         size_t next_special = text.size();
-        for (const auto & [tok_str, tok_id] : added_tokens_) {
+        for (const auto & [tok_str, tok_id] : added) {
             size_t found = text.find(tok_str, pos);
             if (found != std::string::npos && found < next_special) {
                 next_special = found;
@@ -851,6 +884,10 @@ bool Tokenizer::is_added_token(int32_t id) const {
         if (entry.second == id) return true;
     }
     return false;
+}
+
+bool Tokenizer::is_control_token(int32_t id) const {
+    return std::binary_search(control_ids_.begin(), control_ids_.end(), id);
 }
 
 int32_t Tokenizer::token_to_id(const std::string & token) const {

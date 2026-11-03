@@ -743,6 +743,7 @@ add_library(luce_common STATIC
     # ── Server components (tokenizer, chat template) ──
     src/server/tokenizer.cpp
     src/server/chat_template.cpp
+    src/server/chat_codec.cpp
     src/server/tool_parser.cpp
     src/server/json_schema_grammar.cpp
     src/server/tool_hint.cpp
@@ -2682,6 +2683,7 @@ if(LUCE_TESTS)
         add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
+            src/server/api_adapters.cpp
             src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
@@ -2701,6 +2703,9 @@ if(LUCE_TESTS)
         if(CURL_FOUND)
             target_compile_definitions(test_server_unit PRIVATE LUCE_HAS_CURL=1)
         endif()
+        # The chat golden corpus (test/chat_golden), read at run time.
+        target_compile_definitions(test_server_unit PRIVATE
+            LUCE_CHAT_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/chat_golden")
         if(CURL_FOUND)
             target_link_libraries(test_server_unit PRIVATE CURL::libcurl)
         endif()
@@ -3292,6 +3297,7 @@ if(LUCE_SERVER)
         add_executable(luce_server
             src/server/server_main.cpp
             src/server/http_server.cpp
+            src/server/api_adapters.cpp
             src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp

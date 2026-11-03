@@ -29,8 +29,16 @@ public:
     bool load_from_gguf(const char * model_path);
 
     // ─── Encode ──────────────────────────────────────────────────────
-    // Tokenize a UTF-8 string into token IDs.
-    std::vector<int32_t> encode(const std::string & text) const;
+    // Tokenize a UTF-8 string into token IDs. Added tokens spelled in the text
+    // become their IDs, as Hugging Face tokenizers do. With match_control false,
+    // control tokens (<|im_start|>, <|im_end|>, ...) stay ordinary text and only
+    // user-defined ones (<think>, <tool_call>, ...) are matched: chat codecs
+    // encode message text this way and insert the control tokens by ID.
+    std::vector<int32_t> encode(const std::string & text, bool match_control = true) const;
+    // As above, with the added tokens in `literal` kept as ordinary text too
+    // (a codec's turn markers that the GGUF types user-defined).
+    std::vector<int32_t> encode(const std::string & text, bool match_control,
+                                const std::vector<int32_t> & literal) const;
 
     // ─── Decode ──────────────────────────────────────────────────────
     // Convert a single token ID to its text representation.
@@ -57,6 +65,9 @@ public:
     // chat and tool markup such as <|im_start|>, <tool_call>).
     bool is_added_token(int32_t id) const;
 
+    // True for a control token (GGUF token type control).
+    bool is_control_token(int32_t id) const;
+
 private:
     // Pre-tokenize text into pieces using Qwen3/3.5 regex pattern.
     std::vector<std::string> pre_tokenize(const std::string & text) const;
@@ -76,6 +87,12 @@ private:
     // Added special tokens (e.g. <think>, </think>) — sorted longest-first
     // for greedy matching during encode.
     std::vector<std::pair<std::string, int32_t>> added_tokens_;
+    // The same, without control tokens.
+    std::vector<std::pair<std::string, int32_t>> user_added_tokens_;
+    std::vector<int32_t> encode_matching(
+        const std::string & text,
+        const std::vector<std::pair<std::string, int32_t>> & added) const;
+    std::vector<int32_t> control_ids_;  // sorted
 
     // Special token IDs
     int32_t bos_id_ = -1;

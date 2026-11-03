@@ -78,6 +78,8 @@ nlohmann::json responses_output_items(const std::string & message_id,
 void set_responses_status(nlohmann::json & response, bool hit_output_cap);
 
 // Manages SSE streaming for a single request.
+class ChatCodec;
+
 class SseEmitter {
 public:
     SseEmitter(ApiFormat format,
@@ -104,11 +106,13 @@ public:
     // response.completed usage). Pass nullptr to suppress, matching
     // the pre-timings API for unit tests that don't exercise that
     // shape. ended_on_eos keeps EOS-at-cap completions classified as "stop"
-    // instead of "length".
+    // instead of "length". A degenerate decode (the repetition watchdog
+    // closed it) finishes as "length", the reply being unreliable.
     std::vector<std::string> emit_finish(int completion_tokens,
                                          const GenTimings * timings = nullptr,
                                          int generation_cap = -1,
-                                         bool ended_on_eos = false);
+                                         bool ended_on_eos = false,
+                                         bool degenerate = false);
 
     // Emit the selected API's terminal failure sequence. Error and success
     // terminals are mutually exclusive; repeated terminal calls are no-ops.
@@ -175,6 +179,10 @@ public:
     bool suppress_undeclared_tool_protocol_token(
         const std::string & raw_token);
 
+    // Read tool calls with the chat codec's parser (the reverse of its
+    // template) before the heuristic one. Null: the heuristic parser only.
+    void set_chat_codec(const ChatCodec * codec) { chat_codec_ = codec; }
+
     // Forget an open suppressed block before the same tokens are classified
     // again from the start (the non-streaming replay).
     void restart_tool_protocol_suppression() {
@@ -208,6 +216,7 @@ private:
     // False under tool_choice "none": tool syntax is still detected and
     // parsed against tools_, and the calls are dropped at finish.
     bool         tool_calls_allowed_;
+    const ChatCodec * chat_codec_ = nullptr;
     ToolMemory * tool_memory_;
 
     StreamMode   mode_;

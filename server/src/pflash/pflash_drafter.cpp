@@ -161,8 +161,6 @@ std::vector<int32_t> drafter_score_and_compress(
         if (experiment.query_probe) {
             if (!request_messages) {
                 experiment.request_messages_error = "no human message spans from the caller";
-            } else if (!request_messages->error.empty()) {
-                experiment.request_messages_error = request_messages->error;
             } else {
                 for (const auto & span : request_messages->human) {
                     if (span.begin < 0 || span.end < span.begin ||
@@ -185,7 +183,6 @@ std::vector<int32_t> drafter_score_and_compress(
                     experiment.request_recent.push_back(span);
                 }
                 experiment.request_recent_index = request_messages->recent_index;
-                experiment.request_recent_error = request_messages->recent_error;
             }
             // cand_v5 / stage 2 inputs: every message's role and content span (read only by a cand_v5 probe).
             if (request_messages) {

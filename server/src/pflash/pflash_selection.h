@@ -168,7 +168,7 @@ struct PFlashSelectionConfig {
     // content spans of those messages, latest first, come per request.
     bool query_probe = false;
     std::vector<luce::common::PFlashTokenSpan> request_messages;
-    // Why the server could not map the human messages ("" when it did).
+    // Why the human messages' spans are unusable ("" when they are not).
     std::string request_messages_error;
     // Candidate-rule inputs: the human messages' indices and every
     // non-system messages (spans and indices), read when the GGUF's candidate
@@ -176,7 +176,6 @@ struct PFlashSelectionConfig {
     std::vector<int> request_human_index;
     std::vector<luce::common::PFlashTokenSpan> request_recent;
     std::vector<int> request_recent_index;
-    std::string request_recent_error;
     // cand_v5 / stage 2: every normalised message (role, content span), and why the server could not map them.
     std::vector<luce::pflash::PFlashRequestMessage> request_messages_all;
     std::string request_messages_all_error;

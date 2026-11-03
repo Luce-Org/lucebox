@@ -240,6 +240,12 @@ static json find_tool_properties(const json & tools, const std::string & name) {
     return json::object();
 }
 
+std::string new_tool_call_id() { return generate_call_id(); }
+
+json tool_parameter_properties(const json & tools, const std::string & name) {
+    return find_tool_properties(tools, name);
+}
+
 // Convert a string value to its JSON-schema-typed equivalent.
 static json convert_param_value(const std::string & val, const std::string & key,
                                 const json & props) {
