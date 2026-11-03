@@ -120,14 +120,12 @@ def stream_generate(tok, bin_path: Path, target: Path, draft: Path,
                     cmd,
                     close_fds=False,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
                 )
             else:
                 proc = subprocess.Popen(
                     cmd,
                     pass_fds=(w,),
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
                 )
         except BaseException:
             try:
@@ -138,16 +136,6 @@ def stream_generate(tok, bin_path: Path, target: Path, draft: Path,
                 os.close(w)
             except OSError:
                 pass
-            cmd = [str(bin_path), str(target), str(draft), str(prompt_bin),
-                   str(n_gen), str(out_bin),
-                   "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
-                   f"--stream-fd={w}"]
-            proc = subprocess.Popen(cmd, pass_fds=(w,),
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
-        except BaseException:
-            os.close(r)
-            os.close(w)
             raise
 
         os.close(w)

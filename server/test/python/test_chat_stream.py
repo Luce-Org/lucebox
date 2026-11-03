@@ -12,9 +12,6 @@ import threading
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-import unittest
-from pathlib import Path
-from unittest.mock import patch
 
 CHAT_PATH = Path(__file__).resolve().parents[2] / "examples" / "chat.py"
 SPEC = importlib.util.spec_from_file_location("chat_example", CHAT_PATH)
@@ -24,7 +21,6 @@ SPEC.loader.exec_module(chat)
 
 def _run_with_process_group_timeout(fn, timeout_s=5.0):
     """Run fn in a dedicated worker process inside its own process group on POSIX.
-    """Run fn in a dedicated worker process inside its own process group.
 
     If fn blocks (e.g. on pipe buffer deadlock), the entire process group
     is terminated with SIGKILL and the worker process is reaped, preventing
@@ -49,7 +45,6 @@ def _run_with_process_group_timeout(fn, timeout_s=5.0):
             return "timed_out", None
         return result.get("status", "err"), result.get("payload")
 
-    """
     ctx = mp.get_context("fork")
     parent_conn, child_conn = ctx.Pipe(duplex=False)
 
@@ -125,7 +120,6 @@ class MockTokenizer:
         return "".join(f"[{tok}]" for tok in ids)
 
 
-@unittest.skipIf(sys.platform == "win32", "stream_generate uses POSIX pass_fds on main")
 class ChatStreamFdLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -136,7 +130,6 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
         # On Windows, --stream-fd is a Win32 HANDLE that is converted to a CRT fd
         # via msvcrt.open_osfhandle, matching how the C++ test_dflash consumer
         # writes directly to the passed HANDLE.
-        # Create mock child script that parses --stream-fd and writes tokens
         self.mock_script = self.root / "mock_dflash.py"
         self.mock_script.write_text(
             "import os, struct, sys, time\n"
@@ -269,19 +262,11 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
         r, w = self.allocated_pipes[0]
 
         # Read descriptor MUST be closed despite early loop break
-        # 999 is stop token; child also emits 30 afterwards
-        result = self._call_stream_generate(tokens="10,999,30", stop_ids={999})
-        self.assertEqual(result, "[10]")
-        self.assertEqual(len(self.allocated_pipes), 1)
-        r, _w = self.allocated_pipes[0]
-
-        # Verify read descriptor is closed
         with self.assertRaises(OSError) as ctx:
             os.fstat(r)
         self.assertEqual(ctx.exception.errno, errno.EBADF)
 
         # Child process must also be reaped by stream_generate
-        # Verify child process was reaped by stream_generate before any poll() call
         self.assertEqual(len(self.allocated_procs), 1)
         proc = self.allocated_procs[0]
         self.assertIsNotNone(
@@ -301,13 +286,6 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
         r, w = self.allocated_pipes[0]
 
         # Read descriptor MUST be closed despite unhandled exception
-        tok = MockTokenizer(raise_on_id=20)
-        with self.assertRaises(RuntimeError):
-            self._call_stream_generate(tok=tok, tokens="10,20,30")
-
-        self.assertEqual(len(self.allocated_pipes), 1)
-        r, _w = self.allocated_pipes[0]
-
         with self.assertRaises(OSError) as ctx:
             os.fstat(r)
         self.assertEqual(ctx.exception.errno, errno.EBADF)
@@ -347,7 +325,7 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
                 proc.returncode,
                 "Child process was not reaped by stream_generate",
             )
-            self.assertIsNone(proc.stderr, "stderr should be DEVNULL, not an open PIPE")
+            self.assertIsNone(proc.stderr, "stderr should not be an open PIPE")
 
         if has_proc_fd:
             final_fds = set(os.listdir(proc_fd_dir))
@@ -361,8 +339,6 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
     def test_child_producing_substantial_stderr_does_not_deadlock(self):
         # 128 KiB exceeds standard 64 KiB OS pipe buffers; deadlocks if stderr were an unread PIPE.
         # Run with a 5.0s timeout to guarantee bounded execution and clean teardown if a deadlock occurs.
-        # Run inside a process group with a 5.0s timeout to guarantee bounded execution and
-        # clean teardown if a deadlock were to occur.
         def run_target():
             env = os.environ.copy()
             env["MOCK_STDERR_BYTES"] = "131072"
@@ -402,7 +378,7 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(status, "ok")
         self.assertEqual(payload["result"], "[1][2][3]")
-        self.assertTrue(payload["stderr_is_none"], "stderr was not DEVNULL")
+        self.assertTrue(payload["stderr_is_none"], "stderr should not be an open PIPE")
         self.assertIsNotNone(
             payload["returncode"],
             "Child process was not reaped by stream_generate",
