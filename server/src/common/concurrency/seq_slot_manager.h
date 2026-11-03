@@ -18,11 +18,13 @@
 
 #include "common/concurrency/prefix_store.h"
 #include "common/concurrency/paged_kv_pool.h"
+#include "common/concurrency/slot_kv.h"
 #include "common/sampler.h"
 #include "common/concurrency/seq_engine.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -89,6 +91,8 @@ public:
     // `max_ctx` is the per-sequence logical bound; slot count comes from the
     // pool's max_sequences. The pool must outlive the manager.
     SeqSlotManager(PagedKvPool & pool, int max_ctx);
+    // Any allocator behind the SlotKv interface; it must outlive the manager.
+    SeqSlotManager(SlotKv & kv, int max_ctx);
     ~SeqSlotManager();
 
     SeqSlotManager(const SeqSlotManager &) = delete;
@@ -202,7 +206,8 @@ private:
     // a younger sequence may reserve capacity.
     PagedKvStatus protect_decode_headroom();
 
-    PagedKvPool & pool_;
+    std::unique_ptr<SlotKv> owned_kv_;   // set by the PagedKvPool & constructor
+    SlotKv & kv_;
     int max_ctx_ = 0;
     std::vector<SeqSlot> slots_;
 };

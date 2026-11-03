@@ -825,6 +825,7 @@ void test_model_capability_tables() {
     CHECK(!arch_supports_layer_split("qwen36"));
     CHECK(!arch_supports_remote_draft("qwen36"));
     CHECK(!arch_supports_pflash_compression("qwen36"));
+    CHECK(!arch_supports_kvflash("qwen36"));
     CHECK(!arch_supports_decode_draft("qwen36", false));
     CHECK(!arch_supports_ddtree("qwen36", false));
     CHECK(!arch_supports_verify_width("qwen36", false));
@@ -905,6 +906,31 @@ void test_feature_gate_vision_projector_by_architecture() {
     CHECK(!gate_result(args, "deepseek41", PlacementBackend::Hip).empty());
 }
 
+void test_feature_gate_kvflash_requires_reading_arch() {
+    BackendArgs args;
+    args.model_path = "/nonexistent/model.gguf";
+    BackendAdmissionContext fixed;
+    fixed.kvflash = KvFlashRequest::Fixed;
+    BackendAdmissionContext automatic;
+    automatic.kvflash = KvFlashRequest::Auto;
+
+    for (const char * arch : {"qwen35", "qwen35moe", "gemma4", "laguna"}) {
+        CHECK(gate_result(args, arch, PlacementBackend::Cuda, fixed).empty());
+        CHECK(gate_result(args, arch, PlacementBackend::Cuda, automatic).empty());
+    }
+    // These backends never read LUCE_KVFLASH; the flag would be dropped.
+    for (const char * arch : {"qwen4exp", "deepseek4", "deepseek41"}) {
+        CHECK(!gate_result(args, arch, PlacementBackend::Cuda, fixed).empty());
+        CHECK(!gate_result(args, arch, PlacementBackend::Cuda, automatic).empty());
+        CHECK(gate_result(args, arch, PlacementBackend::Cuda).empty());
+    }
+    // The refusal lists the architectures that do read it, from the table.
+    const std::string refusal =
+        gate_result(args, "deepseek41", PlacementBackend::Cuda, fixed);
+    CHECK(refusal.find("(supported: qwen35, qwen35moe, laguna, gemma4)") !=
+          std::string::npos);
+}
+
 };
 }  // namespace
 
@@ -937,4 +963,5 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_qwen4exp_mtp_options();
     test_feature_gate_vision_projector_by_architecture();
     test_deepseek41_paged_unqualified_switches();
+    test_feature_gate_kvflash_requires_reading_arch();
 }

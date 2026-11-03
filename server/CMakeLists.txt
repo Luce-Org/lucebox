@@ -1159,6 +1159,7 @@ if(LUCE_TESTS)
         test_cluster_unit
         test_platform_compat
         test_paged_kv_pool
+        test_seq_slot_kv
         test_blocking_row_pool
         test_rope_tail
         test_kernel_qualification_core
@@ -2285,6 +2286,16 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_paged_kv_pool)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_seq_slot_kv.cpp")
+        # SeqSlotManager over the SlotKv interface: host only, no model or GPU.
+        add_executable(test_seq_slot_kv
+            test/unit/test_seq_slot_kv.cpp
+            src/common/concurrency/seq_slot_manager.cpp
+            src/common/concurrency/paged_kv_pool.cpp)
+        target_include_directories(test_seq_slot_kv PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        list(APPEND _raw_unit_test_targets test_seq_slot_kv)
+    endif()
     if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_engram.cpp")
         # DeepSeek V4.1 Engram addressing and row decode: host only, no ggml or
         # GPU. The fixture writes its tables with POSIX file calls.
@@ -2919,6 +2930,7 @@ if(LUCE_TESTS)
         test_rms_norm_hip
         test_rope_tail
         test_paged_kv_pool
+        test_seq_slot_kv
         test_ds4_engram
         test_ggml_host_mailbox_cuda
         test_rocmfp3_mix_registry

@@ -54,6 +54,9 @@ struct ArchCapabilities {
                               // --collect-routing, --adaptive-experts). Note
                               // deepseek4 is mixture-of-experts but has no such
                               // path, so this is narrower than "is MoE".
+    bool kvflash;             // bounded KV residency (--kvflash, LUCE_KVFLASH).
+                              // The qwen35, laguna and gemma4 layer-split
+                              // adapters build the pool too.
 
     // Placement-dependent.
     FeatureSupport decode_draft;  // --draft
@@ -70,16 +73,16 @@ inline constexpr FeatureSupport kMono  = FeatureSupport::Monolithic;
 inline constexpr FeatureSupport kBoth  = FeatureSupport::Both;
 
 inline constexpr ArchCapabilities kArchCapabilities[] = {
-//   arch          split  rdraft pflash offload  draft  ddtree vwidth dblock fa_win dswa    paged
-    {"qwen35",     true,  true,  true,  false,   kBoth, kBoth, kNever, kMono,  kBoth, kBoth,  kMono},
-    {"qwen35moe",  false, false, false, true,    kMono, kMono, kNever, kNever, kMono, kMono,  kNever},
-    {"bailingmoe3",false, false, false, false,   kNever,kNever,kNever, kNever, kNever,kNever, kNever},
-    {"qwen4exp",   false, false, false, false,   kMono, kNever,kMono,  kNever, kNever,kNever, kNever},
-    {"laguna",     true,  false, false, true,    kMono, kMono, kMono,  kNever, kNever,kNever, kNever},
-    {"qwen3",      false, false, true,  false,   kNever, kNever, kNever, kNever, kNever,kNever, kNever},
-    {"gemma4",     true,  false, false, false,   kMono, kNever, kNever, kNever, kBoth,kNever, kNever},
-    {"deepseek4",  true,  false, true,  false,   kMono,  kNever, kNever, kNever, kNever,kNever, kMono},
-    {"deepseek41", false, false, true,  false,   kMono,  kNever, kNever, kNever, kNever,kNever, kMono},
+//   arch          split  rdraft pflash offload kvflash  draft  ddtree vwidth dblock fa_win dswa    paged
+    {"qwen35",     true,  true,  true,  false,  true,    kBoth, kBoth, kNever, kMono,  kBoth, kBoth,  kMono},
+    {"qwen35moe",  false, false, false, true,   true,    kMono, kMono, kNever, kNever, kMono, kMono,  kNever},
+    {"bailingmoe3",false, false, false, false,  false,   kNever,kNever,kNever, kNever, kNever,kNever, kNever},
+    {"qwen4exp",   false, false, false, false,  false,   kMono, kNever,kMono,  kNever, kNever,kNever, kNever},
+    {"laguna",     true,  false, false, true,   true,    kMono, kMono, kMono,  kNever, kNever,kNever, kNever},
+    {"qwen3",      false, false, true,  false,  false,   kNever, kNever, kNever, kNever, kNever,kNever, kNever},
+    {"gemma4",     true,  false, false, false,  true,    kMono, kNever, kNever, kNever, kBoth,kNever, kNever},
+    {"deepseek4",  true,  false, true,  false,  false,   kMono,  kNever, kNever, kNever, kNever,kNever, kMono},
+    {"deepseek41", false, false, true,  false,  false,   kMono,  kNever, kNever, kNever, kNever,kNever, kMono},
 };
 
 inline constexpr std::size_t kArchCount =
@@ -227,6 +230,10 @@ inline bool arch_supports_pflash_compression(const std::string & arch) {
 
 inline bool arch_has_expert_offload(const std::string & arch) {
     return detail::arch_has(arch, &ArchCapabilities::expert_offload);
+}
+
+inline bool arch_supports_kvflash(const std::string & arch) {
+    return detail::arch_has(arch, &ArchCapabilities::kvflash);
 }
 
 inline bool arch_supports_decode_draft(const std::string & arch,
