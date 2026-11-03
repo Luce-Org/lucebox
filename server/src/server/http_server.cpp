@@ -1797,6 +1797,21 @@ bool ppp_prefers_tools_boundary(bool ppp_enabled, bool has_tools) {
     return ppp_enabled && has_tools;
 }
 
+AgentTurnCacheChoice resolve_agent_turn_cache(
+        std::optional<bool> requested, bool single_sequence,
+        int prefix_cache_slots) {
+    const char * unsupported =
+        !single_sequence
+            ? "--agent-turn-cache is not yet supported with "
+              "--paged-attention or --max-concurrency"
+        : prefix_cache_slots <= 0
+            ? "--agent-turn-cache requires an enabled inline prefix cache"
+            : nullptr;
+    if (!requested) return {unsupported == nullptr, nullptr};
+    if (*requested && unsupported) return {false, unsupported};
+    return {*requested, nullptr};
+}
+
 const std::vector<int32_t> & ppp_tool_prefix_source(
         bool compressed, const std::vector<int32_t> & request_tokens,
         const std::vector<int32_t> & served_tokens) {
@@ -4390,9 +4405,9 @@ private:
 
 bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * admission,
                                        int & status, std::string & body,
-                                       SocketHandle client_fd) {
+                                       SocketHandle client_fd, bool note_pass) {
 #if defined(_WIN32)
-    (void) request; (void) admission; (void) client_fd;
+    (void) request; (void) admission; (void) client_fd; (void) note_pass;
     status = 501;
     body = json({{"error", {{"message", "tool checks need socketpair"}}}}).dump();
     return true;
@@ -4435,6 +4450,7 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
         inner.output_format = http_detail::request_output_format(request.dump());
         parse_endpoint_request("/v1/chat/completions", inner.raw_body, inner, count_only);
         inner.tool_checks_pass = true;
+        inner.tool_checks_note = note_pass;
         handle_model_request(pair[0], inner, false, admission ? &outcome : nullptr);
     } catch (const std::exception & e) {
         send_error(pair[0], 500, e.what());
@@ -4485,7 +4501,10 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         }
         int status = 0;
         std::string raw;
-        if (!inner_chat_completion(body, nullptr, status, raw, fd) || status != 200) return false;
+        if (!inner_chat_completion(body, nullptr, status, raw, fd, /*note_pass=*/true) ||
+            status != 200) {
+            return false;
+        }
         response = json::parse(raw, nullptr, false);
         return !response.is_discarded() && tc::reply_message(response) != nullptr;
     };
@@ -9390,9 +9409,14 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     // continued the same way by the next request, so its own snapshot only
     // backs an interrupted or edited turn. Take one when the deepest other
     // checkpoint lies kAgentFallbackStride tokens behind; each copy costs
-    // the whole prefix.
-    bool skip_inline = false;
-    if (cache.using_restore && !cache.disk_hit && req.ends_with_tool_result &&
+    // the whole prefix. Under tool checks a note pass may replace the reply
+    // (a replan), and the client then continues from this prompt's end:
+    // always take it there. A note pass's own prompt never comes back, so it
+    // takes none: its checkpoints would only push the client's out.
+    const bool keep_checkpoints = !req.tool_checks_note;
+    bool skip_inline = !keep_checkpoints;
+    if (keep_checkpoints && !req.tool_checks_pass &&
+        cache.using_restore && !cache.disk_hit && req.ends_with_tool_result &&
         agent_turn_cache_slots_.count(cache.cache_slot)) {
         constexpr int kAgentFallbackStride = 2048;
         const auto boundaries = find_all_boundaries(
@@ -9405,7 +9429,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     if (!skip_inline && (prefer_inline_snap || cache.using_restore)) {
         prepare_inline();
     }
-    if (!cache.using_restore && cache.snap_slot < 0) {
+    if (keep_checkpoints && !cache.using_restore && cache.snap_slot < 0) {
         prepare_full();
     }
 
@@ -10005,7 +10029,9 @@ void HttpServer::remember_agent_turn(
     for (const auto & call : emitter.tool_calls()) call_ids.push_back(call.id);
     tool_memory_.remember(call_ids, assistant_content);
 
-    if (!replay_cache || req.images) return;
+    // A tool-checks note pass renders a conversation the client never sends
+    // back: its calls' text is remembered above, its turn is not checkpointed.
+    if (!replay_cache || req.images || req.tool_checks_note) return;
     if (prefix_cache_.disabled()) return;
     // Cache only stateless-equivalent prompts. Compression and token rewrites
     // need a separate replay contract.

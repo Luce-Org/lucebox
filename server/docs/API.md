@@ -33,13 +33,15 @@ This is a server-wide optimization for single-sequence serving; request bodies
 do not change. It requires `--prefix-cache-slots` to be nonzero. Compressed or
 token-rewritten prompts fall back to ordinary prefix caching.
 
-`--agent-turn-cache` adds a fallback for turns the next request renders
-differently: the server reuses its deepest compatible prefix checkpoint,
-replays the uncached tail once while idle, and saves the canonical completed
-turn. The replay moves prefill work out of the follow-up request when tool
-execution is long enough to overlap it; it does not eliminate that work.
-Paged attention and `--max-concurrency` do not yet support shared prefix
-blocks, so they cannot be combined with `--agent-turn-cache`.
+For turns the next request renders differently, the server reuses its
+deepest compatible prefix checkpoint, replays the uncached tail once while
+idle, and saves the canonical completed turn. The replay moves prefill work
+out of the follow-up request when tool execution is long enough to overlap
+it; it does not eliminate that work. A request that arrives during a replay
+cancels it. The replay is on by default for single-sequence serving with
+prefix slots; `--no-agent-turn-cache` turns it off. Paged attention and
+`--max-concurrency` do not yet support shared prefix blocks, so the replay
+stays off there, and an explicit `--agent-turn-cache` stops the launch.
 
 The exact full-prompt cache may remain enabled for identical-request hits.
 Disable it only when benchmarking the incremental Agent Turn Cache benefit.
@@ -77,6 +79,12 @@ A request with `tool_choice: "none"` gets none of the above. If the model
 calls a tool anyway, it is asked once more with a note that tools are not
 available; if it still calls one, the calls are dropped and its text goes out
 with `finish_reason: "stop"`, so no tool call reaches the client.
+
+A pass that asks the model again renders a conversation the client never
+sends back, so it saves no prefix checkpoint of it. The first pass plans its
+prompt-end checkpoint as an ordinary request does, even when its prompt
+continues an Agent Turn Cache checkpoint: if a later pass replaces the turn,
+the client's next request continues from there.
 
 Each request logs one `[tool-checks]` line with what ran. A streaming request
 receives the checked turn as SSE events, with keep-alive comments while the
