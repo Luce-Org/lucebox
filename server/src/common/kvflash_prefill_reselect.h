@@ -119,13 +119,12 @@ inline int kvflash_preamble_reserve_tokens(int rows, int chunk_tokens) {
     return (rows + chunk_tokens - 1) / chunk_tokens * chunk_tokens;
 }
 
-// Pool capacity with the preamble reserve on top of the history budget: rounded up to the 256-token
-// stride kvflash_pool_from_env keeps (FA vec-kernel eligibility) and clamped to max_ctx like it. A pool
-// of 0 (KVFlash off) and a reserve of 0 return pool_tokens untouched.
-inline int kvflash_pool_with_preamble(int pool_tokens, int reserve_tokens, int max_ctx, int chunk_tokens) {
-    if (pool_tokens <= 0 || reserve_tokens <= 0 || chunk_tokens <= 0) return pool_tokens;
-    const int total = (pool_tokens + reserve_tokens + 255) / 256 * 256;
-    return std::min(total, std::max(pool_tokens, max_ctx / 256 * 256));
+// The preamble reserve inside a pool of `pool_tokens`: `rows` rounded up to a chunk, taken out of the pool, which
+// never grows (every decode step attends the whole pool, so --kvflash N sets the decode cost). 0 = pin off: no rows
+// asked, KVFlash off, an unusable chunk size, or a reserve that leaves no history row (reserve >= pool).
+inline int kvflash_preamble_reserve_in_pool(int pool_tokens, int rows, int chunk_tokens) {
+    const int reserve = kvflash_preamble_reserve_tokens(rows, chunk_tokens);
+    return pool_tokens <= 0 || reserve >= pool_tokens ? 0 : reserve;
 }
 
 // End of the preamble: when the prompt starts with `<|im_start|>system`, the index of the next
@@ -173,8 +172,8 @@ inline int kvflash_pin_preamble(Pager & pager, int preamble_end, int reserve_row
 inline int kvflash_recall_first_chunk(int pinned_chunks) { return std::max(kKvFlashRecallUnit, pinned_chunks); }
 
 // Chunks of exact tail window next to `recall_chunks` of recalled blocks and `reserve` chunks of room.
-// `pin_reserve_chunks` (the preamble reserve, a pool capacity added on top at load) is taken off the
-// pool first, so the history budget is the one the feature-off pool has.
+// `pin_reserve_chunks` (the preamble reserve, rows of the pool held for the pins) is taken off the
+// pool first, so the history budget is the pool minus the reserve.
 inline int kvflash_recall_tail_chunks(int n_pool_blocks, int recall_chunks, int reserve, int pin_reserve_chunks) {
     return std::max(0, n_pool_blocks - pin_reserve_chunks - 1 - recall_chunks - reserve - 1);
 }
@@ -182,7 +181,7 @@ inline int kvflash_recall_tail_chunks(int n_pool_blocks, int recall_chunks, int 
 // ---- recall budget ----
 //
 // The recall step of kvflash_prefill_apply_on, pure: how many chunks of exact tail, which blocks are picked.
-// `pin_reserve_chunks` is pool capacity LUCE_KVFLASH_PREAMBLE_ROWS added on top of the history budget (0 when off);
+// `pin_reserve_chunks` is the part of the pool LUCE_KVFLASH_PREAMBLE_ROWS reserves for the pins, off the history budget (0 when off);
 // `pinned_chunks` are the leading chunks excluded from the candidates.
 struct KvFlashRecallIn {
     int  n_pool_blocks = 0;      // the pool, with the preamble reserve
