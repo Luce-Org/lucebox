@@ -460,8 +460,8 @@ bool Qwen35Backend::init() {
     if (kvflash_tokens_ > 0) {
         kvflash_tau_ = std::max(1, env_int_or_default("LUCE_KVFLASH_TAU", 64));
     }
-    // LUCE_KVFLASH_PREAMBLE_ROWS=R: the pool grows by R rounded up to a chunk so the pinned
-    // preamble does not eat the history budget. Decided here, before the KV cache is sized.
+    // LUCE_KVFLASH_PREAMBLE_ROWS=R: R rounded up to a chunk is reserved inside the pool for the pinned preamble,
+    // so the history budget is the pool minus the reserve and the pool (the decode cost) stays what --kvflash asked.
     kvflash_preamble_reserve_ = kvflash_preamble_rows_ = 0;
     if (kvflash_tokens_ > 0) {
         int rows = luce::common::kvflash_preamble_rows_from_env();
@@ -472,17 +472,15 @@ bool Qwen35Backend::init() {
                 rows = 0;
             }
         }
-        const int ct0 = KvFlashConfig{}.chunk_tokens;
-        const int reserve = luce::common::kvflash_preamble_reserve_tokens(rows, ct0);
+        const int reserve = luce::common::kvflash_preamble_reserve_in_pool(kvflash_tokens_, rows, KvFlashConfig{}.chunk_tokens);
+        if (rows > 0 && reserve == 0)
+            std::fprintf(stderr, "[kvflash] preamble pin disabled: reserve of %d rows leaves no history in the %d-token pool\n",
+                         rows, kvflash_tokens_);
         if (reserve > 0) {
-            const int pool = luce::common::kvflash_pool_with_preamble(kvflash_tokens_, reserve,
-                                                                      cfg_.device.max_ctx, ct0);
-            std::fprintf(stderr, "[kvflash] preamble reserve: rows=%d reserve=%d pool %d -> %d tokens%s\n",
-                         rows, reserve, kvflash_tokens_, pool,
-                         pool - kvflash_tokens_ < reserve ? " (clamped by max_ctx)" : "");
-            kvflash_preamble_reserve_ = pool - kvflash_tokens_;
-            kvflash_preamble_rows_ = std::min(rows, kvflash_preamble_reserve_);
-            kvflash_tokens_ = pool;
+            std::fprintf(stderr, "[kvflash] preamble reserve: rows=%d reserve=%d of pool %d tokens, history %d\n",
+                         rows, reserve, kvflash_tokens_, kvflash_tokens_ - reserve);
+            kvflash_preamble_reserve_ = reserve;
+            kvflash_preamble_rows_ = std::min(rows, reserve);
         }
     }
     kvflash_uq_queries_ = luce::common::kvflash_uq_queries();
@@ -3425,8 +3423,8 @@ void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
     if (kvflash_recall_blocks_ > 0) {
         // budget: kKvFlashRecallUnit * k chunks, picked in units of `unit` chunks
         const int unit = kvflash_select_unit_;
-        // The pins sit in the extra capacity LUCE_KVFLASH_PREAMBLE_ROWS added (0 when off): the history budget
-        // (tail + recall + reserve) is the feature-off one, and the pinned chunks are not recall candidates.
+        // The pins sit in the rows LUCE_KVFLASH_PREAMBLE_ROWS reserves in the pool (0 when off): the history budget
+        // (tail + recall + reserve) is the pool minus them, and the pinned chunks are not recall candidates.
         luce::common::KvFlashRecallIn in;
         in.n_pool_blocks = p.n_pool_blocks();
         in.cur_chunk = p.cur_chunk();

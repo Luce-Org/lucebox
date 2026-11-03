@@ -7,6 +7,7 @@
 #include "placement/device_select.h"
 #include "common/feature_gate.h"
 #include "server/launch_profiles.h"
+#include "common/kvflash_prefill_reselect.h"
 
 #include <algorithm>
 #include <cstring>
@@ -719,6 +720,27 @@ struct LaunchPolicyFixture : CommonFixture {
         CHECK(KvflashRecallProfile::preamble_rows == 18 * 64);
     }
 
+    void test_kvflash_recall_profile_leaves_the_pool_at_the_requested_size() {
+        // --kvflash N sets the decode cost (every step attends the whole pool), so the profile's reserve comes out of N
+        // and leaves N - reserve history rows; it never grows the pool.
+        const int ct = 64, pool = 16384;
+        const int reserve = kvflash_preamble_reserve_in_pool(pool, KvflashRecallProfile::preamble_rows, ct);
+        CHECK(reserve == KvflashRecallProfile::preamble_rows);
+        CHECK(pool - reserve == 15232);
+    }
+
+    void test_kvflash_preamble_reserve_that_leaves_no_history_is_off() {
+        // Like a missing <|im_start|> id, a reserve the pool cannot hold turns the pin off (the backend logs why).
+        const int ct = 64;
+        CHECK(kvflash_preamble_reserve_in_pool(16384, 0, ct) == 0);
+        CHECK(kvflash_preamble_reserve_in_pool(0, 1152, ct) == 0);              // KVFlash off stays off
+        CHECK(kvflash_preamble_reserve_in_pool(16384, 1100, ct) == 1152);       // rounded up to a chunk
+        CHECK(kvflash_preamble_reserve_in_pool(16384, 16320, ct) == 16320);     // one chunk of history left
+        CHECK(kvflash_preamble_reserve_in_pool(16384, 16384, ct) == 0);         // reserve == pool
+        CHECK(kvflash_preamble_reserve_in_pool(16384, 20000, ct) == 0);         // reserve > pool
+        CHECK(kvflash_preamble_reserve_in_pool(16384, 1152, 0) == 0);           // unusable chunk size
+    }
+
     void test_kvflash_recall_defaults_are_the_shipped_profile() {
         // The shipped recall profile, one flag. These literals are the values the profile installed before it
         // became named constants; the ninth, LUCE_KVFLASH_SCORER_DEVICE=gpu, is now fixed in the backend.
@@ -777,6 +799,8 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_qwen_next_split_profile_fits_its_context();
     test_kvflash_recall_defaults_need_a_qwen35_target();
     test_kvflash_recall_preamble_reserve_is_18_chunks();
+    test_kvflash_recall_profile_leaves_the_pool_at_the_requested_size();
+    test_kvflash_preamble_reserve_that_leaves_no_history_is_off();
     test_kvflash_recall_defaults_are_the_shipped_profile();
     test_pflash_curve_arg_accepts_quoted_and_split_points();
     test_pflash_curve_arg_rejects_bad_points();

@@ -319,7 +319,7 @@ protected:
     std::vector<uint8_t>    kvflash_exact_buf_;              // pageable fallback for the bulk D2H copy of the pool K
     ggml_backend_buffer_t   kvflash_exact_pin_ = nullptr;    // pinned host buffer for it, reused across reselects
     bool                    kvflash_exact_pin_failed_ = false;
-    // LUCE_KVFLASH_PREAMBLE_ROWS: pool capacity added on top of LUCE_KVFLASH for the pinned
+    // LUCE_KVFLASH_PREAMBLE_ROWS: pool rows reserved inside LUCE_KVFLASH for the pinned
     // system+tools preamble (tokens, chunk multiple); kvflash_preamble_rows_ = R clamped to it. 0 = off.
     int                     kvflash_preamble_reserve_ = 0;
     int                     kvflash_preamble_rows_ = 0;
