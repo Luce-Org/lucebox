@@ -3,16 +3,22 @@
 #pragma once
 
 #include <algorithm>
+#include <exception>
 #include <thread>
 #include <vector>
 
 namespace luce::common {
 
+// n <= 0 runs nothing. Every worker finishes and is joined before the first exception (lowest worker index) is rethrown.
 template <class W> inline void run_workers(int n, W worker) {
+    if (n <= 0) return;
+    std::vector<std::exception_ptr> err((size_t)n);
+    auto run = [&](int w) { try { worker(w); } catch (...) { err[(size_t)w] = std::current_exception(); } };
     std::vector<std::thread> th;
-    for (int w = 1; w < n; w++) th.emplace_back([&, w] { worker(w); });
-    worker(0);
+    for (int w = 1; w < n; w++) th.emplace_back(run, w);
+    run(0);
     for (auto & t : th) t.join();
+    for (auto & e : err) if (e) std::rethrow_exception(e);
 }
 
 template <class F> inline void parallel_for(int n, F f) {

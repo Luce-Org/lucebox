@@ -184,6 +184,7 @@ inline bool kvflash_exact_mass_scores_fast_multi(
     outs.assign((size_t)nq, zeros);
     if (planes) planes->assign((size_t)nq, KvFlashMassPlanes{zeros, zeros});
     if (nq == 0) return true;
+    if (d.n_layers <= 0 || d.n_kv_heads <= 0 || d.n_q_heads <= 0 || d.n_q_heads % d.n_kv_heads) return false;   // no dropped query heads
     if (C <= 0 || ct <= 0 || D <= 0 || group <= 0 || !keys.seg) return false;
     if (std::find(qs.begin(), qs.end(), nullptr) != qs.end()) return false;
     const auto * tt = ggml_get_type_traits(keys.type);

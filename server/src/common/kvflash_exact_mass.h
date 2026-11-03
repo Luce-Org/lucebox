@@ -47,7 +47,7 @@ struct KvFlashMassPlanes {
     std::vector<float> max;   // the largest plane mass
 };
 
-// Thread-summed CPU time per phase (ms), filled when a non-null pointer is passed.
+// Thread-summed CPU time per phase (ns), filled when a non-null pointer is passed.
 struct KvFlashExactTiming {
     std::atomic<int64_t> dequant_ns{0}, dot_ns{0}, exp_ns{0};
 };

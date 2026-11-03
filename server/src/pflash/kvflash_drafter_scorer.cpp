@@ -140,9 +140,11 @@ bool KvFlashPFlash2Scorer::score_chunks(const std::vector<int32_t> & ids, int ch
     if (!msgs.all_error.empty()) { std::fprintf(stderr, "[kvflash] pflash2: message map: %s\n", msgs.all_error.c_str()); return false; }
     // The request path's strict selection records every candidate with its density (the attention lift);
     // the selection itself is not used.
+    const int query_end = kvflash_message_query_end(msgs);
+    if (query_end <= 0) { std::fprintf(stderr, "[kvflash] pflash2: the last message is empty, no query\n"); return false; }
     const std::vector<int32_t> kept = drafter_score_and_compress(
         *ctx_, ids, /*keep_ratio=*/1.0f, /*chunk_size=*/256, /*n_lookahead=*/128, /*pool_kernel=*/1,
-        kvflash_message_query_end(msgs), {}, /*query_suffix_candidates=*/true, {}, {-1, -1}, {}, &msgs);
+        query_end, {}, /*query_suffix_candidates=*/true, {}, {-1, -1}, {}, &msgs);
     const auto & lifts = pflash_last_candidate_lifts();
     if (kept.empty() || lifts.empty()) return false;
 

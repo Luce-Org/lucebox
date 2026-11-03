@@ -143,7 +143,10 @@ inline bool kvflash_exact_mass_scores_multi(
     const int C = keys.n_chunks, ct = keys.chunk_tokens, D = d.head_dim;
     const int group = d.n_kv_heads > 0 ? d.n_q_heads / d.n_kv_heads : 0;
     outs.assign((size_t)nq, std::vector<float>((size_t)std::max(C, 0), 0.0f));
-    if (nq == 0 || C <= 0 || ct <= 0 || D <= 0 || group <= 0 || !keys.seg) return nq == 0;
+    if (nq == 0) return true;
+    if (d.n_layers <= 0 || d.n_kv_heads <= 0 || d.n_q_heads <= 0 || d.n_q_heads % d.n_kv_heads) return false;
+    if (C <= 0 || ct <= 0 || D <= 0 || group <= 0 || !keys.seg) return false;
+    if (std::find(qs.begin(), qs.end(), nullptr) != qs.end()) return false;
     const auto * tt = ggml_get_type_traits(keys.type);
     if (keys.type != GGML_TYPE_F32 && (!tt || !tt->to_float)) return false;
 

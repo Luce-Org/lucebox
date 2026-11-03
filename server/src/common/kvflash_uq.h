@@ -113,7 +113,7 @@ inline std::vector<int> kvflash_uq_put(std::vector<KvFlashUqStore> & v, KvFlashU
     kvflash_uq_erase(v, s.hi, s.hash);
     v.insert(v.begin(), std::move(s));
     std::vector<int> evicted;
-    while (v.size() > std::max<size_t>(max, 1)) { evicted.push_back(v.back().hi); v.pop_back(); }
+    while (v.size() > max) { evicted.push_back(v.back().hi); v.pop_back(); }
     return evicted;
 }
 

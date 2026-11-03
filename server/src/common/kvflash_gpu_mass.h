@@ -152,6 +152,7 @@ public:
         const std::vector<int> chunk_of = kvflash_gpu_mass_chunk_of(block_of, NB, ev);
         if (chunk_of.empty()) return fail("block_of points outside the pool or maps two chunks to one block");
         const int E = (int)ev.size(), NBT = NB + E, T = NBT * ct;
+        if (E > 0 && !host_seg) return fail("missing host K segment callback");
         const size_t RB = ggml_row_size(kt, D), SEG = (size_t)ct * RB, QS = (size_t)L * HQ * D;
         const size_t stage_k = (size_t)L * HK * E * SEG, stage_total = stage_k + (size_t)N * QS * sizeof(float);
         const size_t out_bytes = (size_t)PL * NBT * N * sizeof(float);

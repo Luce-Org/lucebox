@@ -112,6 +112,7 @@ Outcome run(const SynthCfg & cfg, int scored) {
     CHECK(o_.sel_rel < 1e-2); \
     CHECK(o_.mean_rel < 1e-2); \
     CHECK(o_.top_rel < 1e-2); \
+    CHECK(o_.max_rel < 2e-2);   /* the largest plane is the noisiest statistic: 1.3e-2 measured on the mixed-residency cases */ \
 } while (0)
 
 TEST_CASE(KvflashGpuMassFixture, q4_0_mixed_residency_matches_cpu) { expect_parity(run(small_cfg(GGML_TYPE_Q4_0, 60, 8), 60)); }
@@ -194,6 +195,9 @@ TEST_CASE(KvflashGpuMassFixture, bad_inputs_fail_without_crashing) {
     std::vector<int> ev(30, -1);                                                                           // all evicted, host copy absent
     CHECK(!gm.score(pool_k, ev, missing, c.CT, s.dims(), s.qptrs(), o, nullptr, nullptr, &why));
     CHECK(why.find("host K") != std::string::npos);
+    why.clear();
+    CHECK(!gm.score(pool_k, ev, KvFlashKSegFn{}, c.CT, s.dims(), s.qptrs(), o, nullptr, nullptr, &why));   // evicted chunks, no host_seg
+    CHECK(why.find("host") != std::string::npos);
     CHECK(gm.score(pool_k, s.blk, host, c.CT, s.dims(), {}, o, nullptr, nullptr, &why));                  // no queries
     CHECK(o.empty());
     // A working set far over free memory is refused before anything is allocated. Batching bounds the graph, so only the

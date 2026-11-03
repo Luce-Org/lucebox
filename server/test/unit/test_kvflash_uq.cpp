@@ -128,6 +128,16 @@ TEST_CASE(KvflashUqFixture, store_lru_keeps_other_conversations_and_evicts_the_o
     kvflash_uq_put(v, mk(100, 1), 3);                                   // same key replaces, no growth
     CHECK(v.size() == 3);
 }
+TEST_CASE(KvflashUqFixture, store_lru_with_max_zero_keeps_no_store) {
+    std::vector<KvFlashUqStore> v;
+    const auto ev = kvflash_uq_put(v, mk(100, 1), 0);
+    CHECK(v.empty());
+    REQUIRE(ev.size() == 1);
+    CHECK(ev[0] == 100);
+    kvflash_uq_put(v, mk(200, 2), 1);
+    CHECK(kvflash_uq_put(v, mk(300, 3), 0) == std::vector<int>({200, 300}));
+    CHECK(v.empty());
+}
 TEST_CASE(KvflashUqFixture, cut_follows_the_question_not_the_store) {
     const KvFlashHumanTurn t{100, 300};
     CHECK(kvflash_uq_cut(t, 64, 0, 1000) == 300);

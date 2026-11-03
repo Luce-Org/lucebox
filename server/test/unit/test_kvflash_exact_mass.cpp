@@ -9,9 +9,12 @@
 #include "kvflash_query_capture.h"
 #include "scoped_env.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <random>
 #include <vector>
@@ -283,8 +286,67 @@ TEST_CASE(KvflashExactMassFixture, fast_exact_ties_keep_newer_first_and_near_tie
     // identical K gives identical logsumexp per chunk, but the softmax is over all chunks, so block 2 == block 6 in both
     CHECK(ba[2] == ba[6]);
     CHECK(bb[2] == bb[6]);
+    // No ranking helper ships in this PR (the recall pick is a later one), so assert the tie-break contract it
+    // uses on the block scores: newest first, then a stable sort by score descending. The newer of the tied blocks (6) must
+    // come out ahead of the older (2) in both scorers.
+    for (const auto & bs : {ba, bb}) {
+        std::vector<int> order;
+        for (int b = (int)bs.size() - 1; b >= 0; b--) order.push_back(b);
+        std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return bs[(size_t)x] > bs[(size_t)y]; });
+        const auto at = [&](int b) { return std::find(order.begin(), order.end(), b) - order.begin(); };
+        CHECK(at(6) < at(2));
+    }
     // gap between the two scorers on any block stays far below any realistic rank gap
     for (size_t i = 0; i < ba.size(); i++) CHECK(std::fabs(ba[i] - bb[i]) / ba[i] < 1e-4);
+}
+// ---- run_workers / bad inputs (review fixes) -----------------------------------
+TEST_CASE(KvflashExactMassFixture, run_workers_zero_or_negative_workers_run_nothing) {
+    std::atomic<int> calls{0};
+    run_workers(0, [&](int) { calls++; });
+    run_workers(-3, [&](int) { calls++; });
+    CHECK(calls == 0);
+    run_workers(1, [&](int) { calls++; });
+    CHECK(calls == 1);
+}
+TEST_CASE(KvflashExactMassFixture, run_workers_rethrows_a_spawned_worker_exception_after_joining_all) {
+    std::atomic<int> done{0};
+    bool caught = false;
+    try {
+        run_workers(4, [&](int w) { if (w == 2) throw std::runtime_error("worker 2"); done++; });
+    } catch (const std::runtime_error & e) { caught = std::string(e.what()) == "worker 2"; }
+    CHECK(caught);
+    CHECK(done == 3);   // every other worker ran to the end before the rethrow
+}
+TEST_CASE(KvflashExactMassFixture, run_workers_rethrows_a_caller_worker_exception_after_joining_all) {
+    std::atomic<int> done{0};
+    bool caught = false;
+    try {
+        run_workers(3, [&](int w) { if (w == 0) throw std::runtime_error("worker 0"); done++; });
+    } catch (const std::runtime_error & e) { caught = std::string(e.what()) == "worker 0"; }
+    CHECK(caught);
+    CHECK(done == 2);
+}
+TEST_CASE(KvflashExactMassFixture, fast_multi_refuses_dims_that_would_drop_query_heads) {
+    const auto f = make_case(GGML_TYPE_Q4_0, 2, 12, 2, 64, 6, 16, 9);
+    std::vector<float> q = f.q;
+    q.resize(q.size() * 2, 0.5f);   // room for the oversized dims below: a refusal must not read it
+    std::vector<std::vector<float>> o;
+    CHECK(kvflash_exact_mass_scores_fast_multi(f.keys(), f.d, {q.data()}, o, 2));
+    auto bad = [&](KvFlashQkDims d) { return !kvflash_exact_mass_scores_fast_multi(f.keys(), d, {q.data()}, o, 2); };
+    KvFlashQkDims d = f.d;
+    d.n_q_heads = 13; CHECK(bad(d));                      // 13 % 2: the last q head would be dropped
+    d = f.d; d.n_q_heads = 1; CHECK(bad(d));              // fewer q heads than kv heads
+    d = f.d; d.n_layers = 0; CHECK(bad(d));
+    d = f.d; d.n_layers = -1; CHECK(bad(d));
+    d = f.d; d.n_kv_heads = 0; CHECK(bad(d));
+    d = f.d; d.n_q_heads = 0; CHECK(bad(d));
+    d = f.d; d.head_dim = 0; CHECK(bad(d));
+}
+TEST_CASE(KvflashExactMassFixture, reference_and_fast_scorers_both_refuse_a_null_query) {
+    const auto f = make_case(GGML_TYPE_Q4_0, 2, 12, 2, 64, 6, 16, 9);
+    std::vector<std::vector<float>> a, b;
+    CHECK(!kvflash_exact_mass_scores_multi(f.keys(), f.d, {f.q.data(), nullptr}, a, 2));
+    CHECK(!kvflash_exact_mass_scores_fast_multi(f.keys(), f.d, {f.q.data(), nullptr}, b, 2));
 }
 TEST_CASE(KvflashExactMassFixture, fast_bench_36k_q4_0) {
     if (!std::getenv("LUCE_EXACT_BENCH")) return;

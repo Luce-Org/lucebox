@@ -5,6 +5,7 @@
 #include "pflash_types.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -94,11 +95,10 @@ inline PFlashRequestMessages kvflash_message_map(const std::vector<int32_t> & id
     return m;
 }
 
-// The query end of the request: the end of the last message's content.
+// The query end of the request: the end of the last message's content; 0 when there is none (no messages, or an
+// empty final message, whose span is {0,0}) so the caller refuses instead of querying an earlier message.
 inline int kvflash_message_query_end(const PFlashRequestMessages & m) {
-    int e = 0;
-    for (const auto & s : m.all_spans) e = std::max(e, s.end);
-    return e;
+    return m.all_spans.empty() ? 0 : m.all_spans.back().end;
 }
 
 // Mode 5 runs the PFlash release profile; "" when the environment holds it, else the first
@@ -116,7 +116,10 @@ inline std::string kvflash_pflash2_config_error(const std::function<std::string(
                    " (got " + (v.empty() ? "unset" : v) + ")";
     }
     const std::string s = get("PFLASH_DRAFTER_SESSIONS");
-    const int sessions = s.empty() ? 2 : std::atoi(s.c_str());
+    int sessions = 2;
+    const auto parsed = std::from_chars(s.data(), s.data() + s.size(), sessions);
+    if (!s.empty() && (parsed.ec != std::errc() || parsed.ptr != s.data() + s.size()))
+        return "mode 5 needs PFLASH_DRAFTER_SESSIONS to be a whole number >= " + std::to_string(slots) + " (the slot count), got " + s;
     if (sessions < slots)
         return "mode 5 needs PFLASH_DRAFTER_SESSIONS >= " + std::to_string(slots) + " (the slot count), got " + std::to_string(sessions);
     return "";

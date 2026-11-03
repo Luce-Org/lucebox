@@ -126,6 +126,24 @@ TEST_CASE(KvflashPflashMapFixture, fewer_drafter_sessions_than_slots_is_refused)
     CHECK(gate(e, 2).empty());
     CHECK(!gate(e, 3).empty());
 }
+TEST_CASE(KvflashPflashMapFixture, a_malformed_or_overflowing_drafter_session_count_is_refused) {
+    for (const char * v : {"2junk", "abc", "2 ", " 2", "2.5", "0x2", "99999999999999999999", "-"}) {
+        auto e = release_env(); e["PFLASH_DRAFTER_SESSIONS"] = v;
+        const std::string err = gate(e, 1);
+        CHECK(err.find("PFLASH_DRAFTER_SESSIONS") != std::string::npos);
+        CHECK(err.find(v) != std::string::npos);
+    }
+    auto e = release_env(); e["PFLASH_DRAFTER_SESSIONS"] = "3";
+    CHECK(gate(e, 3).empty());
+}
+TEST_CASE(KvflashPflashMapFixture, an_empty_final_message_has_no_query_end) {
+    const std::vector<int32_t> ids = {kS, kSys, kNL, 10, 11, kEnd, kNL,   // system [3,5)
+                                      kS, kU, kNL, kEnd, kNL,             // user, empty content
+                                      kS, kA, kNL};
+    const auto m = kvflash_message_map(ids, kChat);
+    REQUIRE(m.all_spans.size() == 2);
+    CHECK(kvflash_message_query_end(m) == 0);   // not the system message's end (5)
+}
 
 // A tool output may hold the literal chat markers (the server tokenizes them as the special tokens).
 TEST_CASE(KvflashPflashMapFixture, literal_chat_markers_inside_a_message_do_not_split_it) {
