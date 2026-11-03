@@ -12,6 +12,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -32,10 +33,10 @@ struct ChatMessage {
     // Optional tool_call_id for tool result messages.
     std::string tool_call_id;
     // Optional prior <think> text for assistant messages (OpenAI-compatible
-    // `reasoning_content` / `reasoning` fields on request history). Only the
-    // Jinja renderer consumes this — exposed to templates as
-    // `message.reasoning_content` so official templates (e.g. qwen4exp) can
-    // decide whether to replay it inside <think>...</think>.
+    // `reasoning_content` / `reasoning` fields on request history). Jinja
+    // templates get it as `message.reasoning_content` and decide whether to
+    // replay it inside <think>...</think> (e.g. qwen4exp); the built-in Qwen
+    // renderer replays it as the model's template does (QwenTemplateRules).
     std::string reasoning_content;
     std::vector<ChatToolCall> tool_calls;
     // On a memory hit, content is the original raw turn. Calls retain only
@@ -43,6 +44,26 @@ struct ChatMessage {
     bool tool_calls_replayed = false;
     std::string tool_name;  // Result's function name, resolved from tool_call_id.
 };
+
+// What a model's own Qwen chat template does that the built-in Qwen renderer
+// follows, probed once from the GGUF's tokenizer.chat_template by
+// qwen_template_rules(). The defaults (no template) keep thinking for the
+// turns after the last user query only and state no effort.
+struct QwenTemplateRules {
+    // Earlier assistant turns keep their thinking when the request leaves
+    // `preserve_thinking` unset (Qwen3.8 keeps them; Qwen3.5 drops them).
+    bool keeps_past_thinking = false;
+    // The template reads `preserve_thinking`, so a request can override it.
+    bool reads_preserve_thinking = false;
+    // A turn rendered with thinking but without reasoning text gets an empty
+    // thinking block (Qwen3.5 and Qwen3.8 write one; the default writes none).
+    bool empty_thinking = false;
+    // The template's system line for each effort it states ("low", "xhigh");
+    // an effort without a line (Qwen3.8's "medium") adds nothing.
+    std::map<std::string, std::string> effort_lines;
+};
+
+QwenTemplateRules qwen_template_rules(const std::string & template_src);
 
 // Chat template format.
 enum class ChatFormat {
@@ -69,13 +90,20 @@ enum class ChatFormat {
 //
 // `reasoning_effort` is the normalized model-facing effort. DeepSeek V4 uses
 // low, high, and max; high and max prepend the official encoding prefixes.
+// Qwen states it with the template's line from `qwen_rules`, only when named.
+//
+// `preserve_thinking` (Qwen) is the request's template variable, as for
+// render_chat_template_jinja: -1 unset, 0/1 false/true. With `qwen_rules`, it
+// decides whether assistant turns before the last user query keep thinking.
 std::string render_chat_template(
     const std::vector<ChatMessage> & messages,
     ChatFormat format,
     bool add_generation_prompt = true,
     bool enable_thinking = false,
     const std::string & tools_json = "",
-    const std::string & reasoning_effort = "");
+    const std::string & reasoning_effort = "",
+    int preserve_thinking = -1,
+    const QwenTemplateRules & qwen_rules = {});
 
 // Detect the appropriate chat format for an architecture.
 ChatFormat chat_format_for_arch(const std::string & arch);
@@ -126,8 +154,8 @@ std::string render_chat_template_jinja(
     const std::string & reasoning_effort = "",
     int preserve_thinking = -1);
 
-// Qwen3.8-Flash-Next's template knows the efforts low, medium and xhigh (its default); Lucebox's high, x-high and
-// max map to xhigh. Empty stays empty so the template applies its own default.
+// The Qwen3.8 and Qwen3.8-Flash-Next templates know the efforts low, medium and xhigh (their default); Lucebox's
+// high, x-high and max map to xhigh. Empty stays empty so the template applies its own default.
 std::string qwen4exp_template_effort(const std::string & effort);
 
 }  // namespace luce::common
