@@ -5941,7 +5941,7 @@ static int ggml_cuda_try_moe_route_weights_norm(ggml_backend_cuda_context & ctx,
     const ggml_tensor * ids = gr->src[1];
     if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || probs->type != GGML_TYPE_F32 ||
         ids->type != GGML_TYPE_I32 || probs->ne[0] != 1 || probs->ne[3] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
-        ids->ne[0] > 32 || probs->ne[2] != ids->ne[1] || !ggml_is_contiguous(gr)) return -1;
+        ids->ne[0] > WARP_SIZE || probs->ne[2] != ids->ne[1] || !ggml_is_contiguous(gr)) return -1;
     const int j = next(i + 1); if (j >= n) return -1;
     const int k = next(j + 1); if (k >= n) return -1;
     const int m = next(k + 1); if (m >= n) return -1;

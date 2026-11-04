@@ -163,18 +163,18 @@ void ggml_cuda_op_ds4_moe_combine(ggml_backend_cuda_context & ctx, ggml_tensor *
 
 // The renormalized weights of each token's top-k routes, [k, T] from the router probabilities [n_expert, T] and the
 // picks [k, T]: GET_ROWS, SUM_ROWS, CLAMP and DIV in one launch with their arithmetic. One thread per token; the row
-// sum follows reduce_rows_f32 on a k-wide row (lane l holds element l, then the 32-lane xor butterfly; the block's
-// second stage adds zeros only).
+// sum follows reduce_rows_f32 on a k-wide row (lane l holds element l, then block_reduce's WARP_SIZE-lane xor
+// butterfly; the block's second stage adds zeros only), so k is at most WARP_SIZE.
 static __global__ void moe_route_weights_norm_kernel(
         const char * __restrict__ probs, const size_t probs_nb1, const size_t probs_nb2,
         const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
         const int k, const int n_tokens, const float clamp_min, const float clamp_max, float * __restrict__ dst) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tokens) return;
-    float w[32];
-    float v[32];
+    float w[WARP_SIZE];
+    float v[WARP_SIZE];
 #pragma unroll
-    for (int l = 0; l < 32; ++l) {
+    for (int l = 0; l < WARP_SIZE; ++l) {
         w[l] = 0.0f;
         if (l < k) {
             const int32_t e = *(const int32_t *) (ids + (size_t) l * ids_nb0 + (size_t) t * ids_nb1);
@@ -183,12 +183,12 @@ static __global__ void moe_route_weights_norm_kernel(
         v[l] = w[l];
     }
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        float n[32];
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        float n[WARP_SIZE];
 #pragma unroll
-        for (int l = 0; l < 32; ++l) n[l] = v[l] + v[l ^ off];
+        for (int l = 0; l < WARP_SIZE; ++l) n[l] = v[l] + v[l ^ off];
 #pragma unroll
-        for (int l = 0; l < 32; ++l) v[l] = n[l];
+        for (int l = 0; l < WARP_SIZE; ++l) v[l] = n[l];
     }
     const float sum = fminf(fmaxf(v[0], clamp_min), clamp_max);   // clamp.cu's op_clamp
     for (int i = 0; i < k; ++i) {
@@ -200,7 +200,7 @@ void ggml_cuda_moe_route_weights_norm(ggml_backend_cuda_context & ctx, const ggm
                                       const ggml_tensor * ids, float clamp_min, float clamp_max, ggml_tensor * dst) {
     const int k = (int) ids->ne[0];
     const int n_tokens = (int) ids->ne[1];
-    GGML_ASSERT(k <= 32 && probs3->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(k <= WARP_SIZE && probs3->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(dst) && ggml_nelements(dst) == (int64_t) k * n_tokens);
     const int block = 64;
     moe_route_weights_norm_kernel<<<(n_tokens + block - 1) / block, block, 0, ctx.stream()>>>(
