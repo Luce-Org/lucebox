@@ -277,8 +277,10 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         plan->layer_bytes = (size_t) slots * layer;
         if (plan->required > available) return 0;   // the context fit moves on without searching smaller chunks
     }
+    const size_t min_snapshot = snapshot_budget
+        ? qwen4exp_snapshot_bytes(backend, cache, std::min(cache.max_ctx, 4096)) : 0;
     const int chunk = qwen4exp_fit_chunk(cache.max_ctx, available, fixed, chunk_workspace, snapshot_budget,
-                                         floor_rows, max_rows);
+                                         floor_rows, max_rows, min_snapshot);
     std::fprintf(stderr, "[qwen4exp] chunk-auto ctx=%d slots=%d resident=%d chunk=%d state=%zu fixed=%zu available=%zu headroom=%zu\n",
         cache.max_ctx, slots, resident_slots, chunk, state,
         fixed + (snapshot_budget ? *snapshot_budget : 0), available, available / 10);
@@ -413,7 +415,9 @@ bool Qwen4ExpBackend::load_target() {
             return false;
         }
     }
-    if (snapshot_budget_ != SIZE_MAX)
+    if (snapshot_budget_ == 0)
+        std::fprintf(stderr, "[qwen4exp] prefix snapshots disabled: memory allowance insufficient for one checkpoint\n");
+    else if (snapshot_budget_ != SIZE_MAX)
         std::fprintf(stderr, "[qwen4exp] prefix snapshot allowance=%zu bytes\n", snapshot_budget_);
     else if (snap_backend_ != backend_)
         std::fprintf(stderr, "[qwen4exp] prefix snapshots in system memory\n");

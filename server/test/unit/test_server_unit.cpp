@@ -17393,6 +17393,164 @@ TEST_CASE(ServerUnitFixture, test_auto_concurrent_prefix_budget) {
     TEST_ASSERT(auto_concurrent_prefix_budget(2 * GiB, 0, 0) == 6 * GiB);
 }
 
+struct AllowanceBackend : MockBackend {
+    size_t allowance = SIZE_MAX;
+    size_t snapshot_allowance_bytes() const override { return allowance; }
+};
+
+struct AllowancePrefixBackend : MockBackend {
+    size_t allowance = 0;
+    SchedulerPrefixEngine engine;
+    SeqEngine * seq_engine() override { return &engine; }
+    size_t snapshot_allowance_bytes() const override { return allowance; }
+};
+
+TEST_CASE(ServerUnitFixture, test_concurrent_prefix_budget_allowance_clamping) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const size_t MiB = 1024 * 1024, GiB = 1024 * MiB;
+
+    // 1. Discrete GPU: snapshot_allowance_bytes() == SIZE_MAX preserves host RAM auto budget
+    {
+        auto backend = std::make_unique<AllowanceBackend>();
+        backend->allowance = SIZE_MAX;
+        LuceEngine engine(std::move(backend));
+        ServerConfig config;
+        HttpServer server(engine, tokenizer, config);
+        const size_t auto_budget = auto_concurrent_prefix_budget(1237 * MiB, 4, budgetable_memory_bytes());
+        TEST_ASSERT(server.concurrent_prefix_budget(1237 * MiB, 4) == auto_budget);
+    }
+
+    // 2. Finite allowance on UMA: clamps when auto_budget exceeds device allowance
+    {
+        auto backend = std::make_unique<AllowanceBackend>();
+        backend->allowance = 2 * GiB;
+        LuceEngine engine(std::move(backend));
+        ServerConfig config;
+        HttpServer server(engine, tokenizer, config);
+        TEST_ASSERT(server.concurrent_prefix_budget(1237 * MiB, 4) == 2 * GiB);
+    }
+
+    // 3. Finite allowance larger than auto budget: preserves auto budget
+    {
+        auto backend = std::make_unique<AllowanceBackend>();
+        backend->allowance = 64 * GiB;
+        LuceEngine engine(std::move(backend));
+        ServerConfig config;
+        HttpServer server(engine, tokenizer, config);
+        const size_t auto_budget = auto_concurrent_prefix_budget(1237 * MiB, 4, budgetable_memory_bytes());
+        TEST_ASSERT(server.concurrent_prefix_budget(1237 * MiB, 4) == auto_budget);
+    }
+
+    // 4. Zero allowance: returns 0 bytes
+    {
+        auto backend = std::make_unique<AllowanceBackend>();
+        backend->allowance = 0;
+        LuceEngine engine(std::move(backend));
+        ServerConfig config;
+        HttpServer server(engine, tokenizer, config);
+        TEST_ASSERT(server.concurrent_prefix_budget(1237 * MiB, 4) == 0);
+    }
+
+    // 5. PrefixCache::disable() explicitly disables and clears cap, and blocks lookup/reservation
+    {
+        PrefixCache cache(16, tokenizer, 1024 * MiB);
+        TEST_ASSERT(!cache.disabled());
+        cache.disable();
+        TEST_ASSERT(cache.disabled());
+        const std::vector<int32_t> prompt = {1, 100, 3, 101, 4};
+        auto hit = cache.lookup(prompt);
+        TEST_ASSERT(hit.first == -1 && hit.second == 0);
+        auto res = cache.reserve_inline_snap(prompt);
+        TEST_ASSERT(!res.active());
+    }
+
+    // 6. Scheduler loop disables PrefixCache when backend snapshot allowance is 0
+    {
+        auto backend_owner = std::make_unique<AllowancePrefixBackend>();
+        backend_owner->allowance = 0;
+        AllowancePrefixBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.arch = "qwen35";
+        config.max_ctx = 64;
+        config.prefix_cache_cap = 8;
+        config.concurrent_prefix_cache = true;
+        config.concurrent_prefix_cache_max_bytes = ServerConfig::kPrefixCacheBudgetAuto;
+        HttpServer server(engine, tokenizer, config);
+
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        TEST_ASSERT(!cache.disabled());
+
+        std::thread worker([&] {
+            SchedulerTestHarness::run(server, backend.engine);
+        });
+        SchedulerTestHarness::stop(server);
+        worker.join();
+
+        TEST_ASSERT(cache.disabled());
+    }
+
+    // 7. Explicit configured concurrent budget (6 GiB) clamped by backend allowance (2 GiB)
+    {
+        auto backend_owner = std::make_unique<AllowancePrefixBackend>();
+        backend_owner->allowance = 2 * GiB;
+        AllowancePrefixBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.arch = "qwen35";
+        config.max_ctx = 64;
+        config.prefix_cache_cap = 8;
+        config.concurrent_prefix_cache = true;
+        config.concurrent_prefix_cache_max_bytes = 6 * GiB;
+        HttpServer server(engine, tokenizer, config);
+
+        TEST_ASSERT(resolve_prefix_cache_budget(config, backend).bytes == 2 * GiB);
+
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+
+        std::thread worker([&] {
+            SchedulerTestHarness::run(server, backend.engine);
+        });
+        SchedulerTestHarness::stop(server);
+        worker.join();
+
+        TEST_ASSERT(!cache.disabled());
+        TEST_ASSERT(cache.stats().max_resident_bytes == 2 * GiB);
+    }
+
+    // 8. Explicit configured concurrent budget disabled when backend allowance is 0
+    {
+        auto backend_owner = std::make_unique<AllowancePrefixBackend>();
+        backend_owner->allowance = 0;
+        AllowancePrefixBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.arch = "qwen35";
+        config.max_ctx = 64;
+        config.prefix_cache_cap = 8;
+        config.concurrent_prefix_cache = true;
+        config.concurrent_prefix_cache_max_bytes = 6 * GiB;
+        HttpServer server(engine, tokenizer, config);
+
+        TEST_ASSERT(resolve_prefix_cache_budget(config, backend).bytes == 0);
+
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        TEST_ASSERT(!cache.disabled());
+
+        std::thread worker([&] {
+            SchedulerTestHarness::run(server, backend.engine);
+        });
+        SchedulerTestHarness::stop(server);
+        worker.join();
+
+        TEST_ASSERT(cache.disabled());
+    }
+
+    unlink(path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_server_config_cache_defaults) {
     ServerConfig cfg;
     TEST_ASSERT(cfg.prefix_cache_cap == 32);

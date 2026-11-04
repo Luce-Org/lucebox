@@ -2211,7 +2211,8 @@ size_t auto_concurrent_prefix_budget(size_t per_checkpoint, int slots, size_t me
 }
 
 size_t HttpServer::concurrent_prefix_budget(size_t per_checkpoint, int slots) const {
-    return auto_concurrent_prefix_budget(per_checkpoint, slots, budgetable_memory_bytes());
+    const size_t auto_budget = auto_concurrent_prefix_budget(per_checkpoint, slots, budgetable_memory_bytes());
+    return std::min(auto_budget, backend_.snapshot_allowance_bytes());
 }
 
 PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
@@ -2227,6 +2228,7 @@ PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
         // (concurrent_prefix_budget below).
         out.bytes = out.automatic ? ServerConfig::kConcurrentPrefixBudgetFloor
                                   : config.concurrent_prefix_cache_max_bytes;
+        out.bytes = std::min(out.bytes, backend.snapshot_allowance_bytes());
         return out;
     }
     out.automatic =

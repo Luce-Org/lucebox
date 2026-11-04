@@ -151,6 +151,10 @@ public:
                 size_t max_resident_bytes = 0);
 
     bool disabled() const { return disabled_; }
+    void disable() {
+        disabled_ = true;
+        cap_ = 0;
+    }
 
     // Expose chat markers for cold prefix boundary detection.
     const ChatMarkers & chat_markers() const { return markers_; }
