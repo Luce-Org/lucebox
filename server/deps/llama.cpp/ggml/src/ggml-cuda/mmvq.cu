@@ -3066,15 +3066,6 @@ static bool mmvq_q8_0_rdna4_enabled() {
     return enabled;
 }
 
-// LUCE_CUDA_MMVQ_Q8_RDNA4_SHORT=0 restores the eight-virtual-wave block shape for short rows.
-static bool mmvq_q8_0_rdna4_short_rows_enabled() {
-    static const bool enabled = []() {
-        const char * e = std::getenv("LUCE_CUDA_MMVQ_Q8_RDNA4_SHORT");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
-    return enabled;
-}
-
 template <int ncols_dst, int c_rows, int c_vw, int c_row_groups, int c_nvu = 8>
 static void mul_mat_vec_q8_0_rdna4_launch_cfg(
         const void * vx, const void * vy, float * dst,
@@ -3139,9 +3130,9 @@ static void mul_mat_vec_q8_0_rdna4_launch_nc(
     // Short rows (qwen4exp's hyper-connection up projection, K = 320: 10 blocks; its shared expert's down
     // projection, K = 640: 20 blocks) leave six of the eight virtual waves without a block. One wave per row
     // group walks only the virtual waves that read, over four rows, with the same partials and sum order.
-    if (kb_off == 0 && nb <= 16 && mmvq_q8_0_rdna4_short_rows_enabled()) {
+    if (kb_off == 0 && nb <= 16) {
         Q8_RDNA4_LAUNCH(4, 1, 4, 2);
-    } else if (kb_off == 0 && nb <= 24 && mmvq_q8_0_rdna4_short_rows_enabled()) {
+    } else if (kb_off == 0 && nb <= 24) {
         Q8_RDNA4_LAUNCH(4, 1, 4, 3);
     } else if (rows <= 1024 || nb <= 64) {
         Q8_RDNA4_LAUNCH(2, 4, 2);
