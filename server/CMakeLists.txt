@@ -1573,6 +1573,12 @@ if(LUCE_TESTS)
         add_executable(bench_ds41_q8_mmvq test/bench/bench_ds41_q8_mmvq.cpp)
         target_link_libraries(bench_ds41_q8_mmvq PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_qn_moe.cpp")
+        # Benchmark, not a test: Qwen3.8-Flash-Next routed experts (gate/up + down
+        # MUL_MAT_ID) on one device at split decode and verify widths.
+        add_executable(bench_qn_moe test/bench/bench_qn_moe.cpp)
+        target_link_libraries(bench_qn_moe PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
+    endif()
     add_executable(test_rope_tail test/unit/test_rope_tail.cpp)
     target_compile_definitions(test_rope_tail PRIVATE LUCE_ROPE_TEST_GPU=1)
     target_link_libraries(test_rope_tail PRIVATE ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
