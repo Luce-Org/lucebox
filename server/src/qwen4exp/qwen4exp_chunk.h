@@ -17,9 +17,13 @@ constexpr int kQwen4ExpSplitMaxChunk = 16384;
 constexpr int kQwen4ExpPipelineStreamRows = 4096;
 // Split mode: the smallest chunk that still gives the prompt pipeline two streams.
 constexpr int kQwen4ExpSplitChunkFloor = 2 * kQwen4ExpPipelineStreamRows;
-// Split mode: the hot experts' share of the target unless LUCE_EXPERT_BUDGET_MB sets it. The rest of the target holds
-// the dense weights, the KV cache and the prompt-chunk buffers.
-constexpr uint64_t kQwen4ExpHotExpertBudget = 8ull << 30;
+// Split mode: the hot experts take the target memory the context and the largest prompt chunk leave (at most
+// LUCE_EXPERT_BUDGET_MB), less this margin for their lookup tables, the decode graphs they widen and pool growth.
+constexpr uint64_t kQwen4ExpHotExpertMargin = 512ull << 20;
+// One GPU: the prompt chunk widens up to this many rows while the prefix allowance still keeps one snapshot of the
+// full context beside it (Strix Halo at 131K context: 5,376 rows, 32K prompt 1,166 -> 1,240 tok/s; a
+// smaller context leaves room for more rows, 8192 gave 1,325).
+constexpr int kQwen4ExpPreferredChunk = 8192;
 // Concurrent serving: a prompt forward covers at most this many rows per step while other slots
 // decode, so a long prompt holds the live streams for one granule at a time.
 constexpr int kQwen4ExpConcurrentGranule = 2048;
@@ -59,6 +63,16 @@ int qwen4exp_fit_chunk(int max_ctx, size_t available, size_t fixed, Measure meas
     return 0;
 }
 
+// The rows a prefix allowance leaves the prompt chunk: floor_rows, widened up to preferred_rows while `keep` bytes of
+// snapshots still fit beside the wider chunk.
+template<class Measure>
+int qwen4exp_reserved_rows(int max_ctx, size_t available, size_t fixed, Measure measure, int floor_rows,
+                           int preferred_rows, size_t keep) {
+    if (preferred_rows <= floor_rows || keep == 0) return floor_rows;
+    return std::max(floor_rows,
+                    qwen4exp_fit_chunk(std::min(max_ctx, preferred_rows), available, fixed + keep, measure));
+}
+
 // --max-ctx auto: the next context to try after a plan at `ctx` lacks `missing` bytes, when one context position
 // takes `position_bytes` across every slot. At least one step lower, in multiples of `step`; 0 when none is left.
 inline int qwen4exp_shrink_context(int ctx, size_t missing, size_t position_bytes, int step = 4096) {
@@ -92,6 +106,8 @@ struct Qwen4ExpChunkPlan {
     size_t required = 0;        // the other slots' caches, resident graphs, a floor-sized chunk and the headroom
     size_t position_bytes = 0;  // one context position across every slot's cache on the device
     size_t layer_bytes = 0;     // one full-attention layer's rows across every slot's cache
+    int rows = 0;               // in: the chunk chunk_bytes is for (0: the fitted chunk)
+    size_t chunk_bytes = 0;     // the resident graphs, the snapshot allowance and that chunk's workspace
 };
 
 struct Qwen4ExpWeights;
@@ -100,10 +116,11 @@ struct Qwen4ExpCache;
 // Other slots are reserved arithmetically, without risking trial allocations.
 // Optional prefix allowance: remaining memory after headroom, runtime state,
 // and a 4096-row chunk, 8192 in split mode (or the fastest smaller chunk if
-// that cannot fit).
+// that cannot fit). With snapshot_keep (one full-context snapshot), the chunk
+// widens toward kQwen4ExpPreferredChunk while the allowance keeps that much.
 // The caller must enforce the returned allowance on later snapshot captures.
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     Qwen4ExpCache & cache, int slots = 1, int resident_slots = 1, size_t * snapshot_budget = nullptr,
-    Qwen4ExpChunkPlan * plan = nullptr);
+    Qwen4ExpChunkPlan * plan = nullptr, size_t snapshot_keep = 0);
 
 }  // namespace luce::common

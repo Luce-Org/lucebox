@@ -31,7 +31,7 @@
 static constexpr ggml_type k_test_types[] = {
     GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
     GGML_TYPE_Q5_K, GGML_TYPE_Q2_0_ROCMFP2, GGML_TYPE_Q3_0_ROCMFPX,
-    GGML_TYPE_Q4_0_ROCMFP4_FAST,
+    GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1,
 };
 static constexpr int k_test_widths[] = {2, 4, 8, 9, 16, 32, 48, 64};
 
@@ -763,7 +763,7 @@ static std::string child_command(
         const std::string & output_path,
         const std::string & log_path) {
 #if defined(_WIN32)
-    return "set \"LUCE_MMID_TELEMETRY=1\" && set \"LUCE_MMID_GROUPED_TYPES=15\" && "
+    return "set \"LUCE_MMID_TELEMETRY=1\" && set \"LUCE_MMID_GROUPED_TYPES=143\" && "
         "set \"LUCE_CUDA_MMVQ_MOE_FP2_PACKED32=1\" && "
         "set \"LUCE_CUDA_MMVQ_MOE_FP3_PACKED24=1\" && "
         "set \"LUCE_MMID_GROUPED=" +
@@ -771,7 +771,7 @@ static std::string child_command(
         shell_quote(executable) + " --child " + mode + " " + shell_quote(output_path) +
         " 2>" + shell_quote(log_path);
 #else
-    return "LUCE_MMID_TELEMETRY=1 LUCE_MMID_GROUPED_TYPES=15 "
+    return "LUCE_MMID_TELEMETRY=1 LUCE_MMID_GROUPED_TYPES=143 "
         "LUCE_CUDA_MMVQ_MOE_FP2_PACKED32=1 LUCE_CUDA_MMVQ_MOE_FP3_PACKED24=1 "
         "LUCE_MMID_GROUPED=" +
         std::string(std::strcmp(mode, "grouped") == 0 ? "1" : "0") + " " +
@@ -933,13 +933,13 @@ int main(int argc, char ** argv) {
             }
         }
     }
-    output_parity = output_parity && offset == legacy.size() && compared_cases == 89;
+    output_parity = output_parity && offset == legacy.size() && compared_cases == 109;
     const size_t masked_case_bytes = (size_t) 128 * 8 * 32 * sizeof(float);
     const bool masked_fused_zero = masked_fused.size() == masked_case_bytes;
     const bool pass = legacy_status == 0 && grouped_status == 0 &&
         masked_fused_status == 0 && masked_fused_zero &&
         output_parity && grouped_dispatch && legacy_grouped == 0 &&
-        grouped_grouped == 105;
+        grouped_grouped == 135;
     if (pass) {
         std::remove(legacy_path.c_str());
         std::remove(grouped_path.c_str());

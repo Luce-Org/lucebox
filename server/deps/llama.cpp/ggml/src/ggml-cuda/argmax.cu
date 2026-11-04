@@ -1,20 +1,28 @@
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 
 #include "argmax.cuh"
 #include "common.cuh"
 #include "sum.cuh"
 
+// The pick a host scan `if (x[i] > x[best]) best = i` from best = 0 makes: the lowest id of the row's maximum, -inf
+// included, with NaNs never picked unless x[0] is one (then 0). Greedy decoding on the device then emits exactly the
+// tokens the host scan would.
+static __device__ __forceinline__ bool argmax_f32_better(const float val, const int col, const float maxval, const int argmax) {
+    return val > maxval || (val == maxval && col < argmax);
+}
+
 static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols) {
     const int64_t row = blockIdx.x;
 
-    float maxval = -FLT_MAX;
-    int   argmax = -1;
+    float maxval = -INFINITY;
+    int   argmax = INT_MAX;
     const float * rowx = x + row * ncols;
 
     for (int32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
         const float val = rowx[col];
-        if (val > maxval) {
+        if (argmax_f32_better(val, col, maxval, argmax)) {
             maxval = val;
             argmax = col;
         }
@@ -24,7 +32,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
         const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
         const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
-        if (val > maxval) {
+        if (argmax_f32_better(val, col, maxval, argmax)) {
             maxval = val;
             argmax = col;
         }
@@ -53,7 +61,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
             for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
                 const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
                 const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
-                if (val > maxval) {
+                if (argmax_f32_better(val, col, maxval, argmax)) {
                     maxval = val;
                     argmax = col;
                 }
@@ -62,7 +70,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     }
 
     if (warp_id == 0 && lane_id == 0) {
-        dst[row] = argmax;
+        dst[row] = argmax == INT_MAX || isnan(rowx[0]) ? 0 : argmax;
     }
 }
 

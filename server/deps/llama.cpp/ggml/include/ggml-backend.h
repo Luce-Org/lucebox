@@ -398,6 +398,14 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_dedicated_copies(
             ggml_backend_sched_t sched, bool enabled);
 
+    // Parallel scheduler with one copy: a split-input copy whose source backend received a copy from the
+    // destination in an earlier split is allocated from that split on, instead of for the whole graph. The source
+    // backend runs that split only after the destination finished every split before it, so the copy cannot
+    // overwrite memory the destination still reads. A long graph then keeps a few copies live, not every
+    // cross-device input it has. Must be set before allocation.
+    GGML_API void                 ggml_backend_sched_set_anchored_copies(
+            ggml_backend_sched_t sched, bool enabled);
+
     //
     // Meta backend
     //

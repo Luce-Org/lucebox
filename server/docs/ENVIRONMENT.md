@@ -39,6 +39,8 @@ profile and the requirements checked at startup.
 | `LUCE_ATTN_FUSE_LEGACY` | unset | KILL SWITCH: =1 restores the separate kernels of the qwen4exp attention norm sites: RMS_NORM, MUL and ROPE (Q, K, indexer q) run as three launches instead of one, the QSA3 prefill attention and its sigmoid output gate run as two kernels, and the hc grouped norm is built with its gamma view between RMS_NORM and MUL. By default each fused form is bit-identical to the chain it replaces. |
 | `LUCE_GDN_NORM_LEGACY` | unset | KILL SWITCH: =1 restores the block-per-row gated RMS norm and the separate q/k RMS norm + scale passes of the qwen4exp gated-delta-net layers. By default one wave owns a 128-column gated-norm row and the q/k norm is folded into the conv epilogue on gfx1151 (bit-identical). |
 | `LUCE_CPY_VEC_LEGACY` | unset | KILL SWITCH: =1 keeps the one-element-per-thread kernel for strided same-type copies. By default a copy whose rows and bases are 16-byte aligned moves one 16-byte chunk per thread (the byte-identical K/V cache append on the qwen4exp graphs). |
+| `LUCE_GPU_ARGMAX` | 1 | KILL SWITCH: =0 reads every logits row back to the host. By default a greedy request without penalties or grammar (Qwen3.5/3.6 decode, Qwen3.8-Flash-Next decode and verify) takes each row's pick from a device argmax, the lowest id on ties as the host scan picks, and reads back one id per row instead of the row (a 5-row verify is 5 MB of logits); on Qwen3.8-Flash-Next a sampled request with a top_k reads each row's top candidates (32 or 64 ids and logits, from a device top-k) and draws from them the token the whole row gives, reading the row only when they cannot settle the draw, and any other request reads only the verify rows it samples, one at a time. |
+| `LUCE_QWEN4EXP_LOOKUP` | 1 | KILL SWITCH (burn-in): =0 verifies only the MTP drafter's tokens on Qwen3.8-Flash-Next. By default, beside adaptive MTP, a round verifies prompt-lookup drafts instead (the tokens that followed an earlier copy of the current suffix) when their expected tokens per millisecond beat the MTP's (`common/prompt_lookup.h`). Greedy output is the target's either way. |
 | `LUCE_PLE_FUSE_LEGACY` | unset | KILL SWITCH: =1 restores the unfused qwen4exp PLE prefill: the conv (concat, four transposed taps, mul, add, silu) runs as separate nodes instead of one fused launch, and the PLE grouped norm keeps its gamma view between RMS_NORM and MUL. By default both fused forms are bit-identical to the chain they replace. |
 | `LUCE_PREFILL_UBATCH` | backend-dependent (512 in `qwen35_backend.cpp`; 16/384 in `layer_split_daemon.cpp`; `cfg_.chunk` in `qwen35_layer_split_adapter.cpp`) | Prefill ubatch. Under pooled kvflash prefill it is rounded down to a multiple of the pager chunk (never below one chunk) and clamped to the pool, instead of being forced to one chunk per ubatch. |
 | `LUCE_FEAT_RING_CAP` | unset (= 40960 for qwen35moe only) | Memory valve for the Qwen 3.6 35B-A3B drafter feature history. Lowers its target ring and mirror together; the value is additionally clamped by `--max-ctx`. Dense Qwen 27B, Gemma, Laguna and DSpark retain their existing windows. Active draft compute remains bounded by `--draft-ctx-max` (8192 is the measured 35B-A3B sweet spot). |
@@ -53,8 +55,8 @@ profile and the requirements checked at startup.
 | `LUCE_HIP_UMA_NO_RAM_CHECK` | unset | KILL SWITCH (burn-in, to be removed once the check has soaked): set to any value, even `0`, to let a managed (unified) buffer on an integrated GPU through even when it is larger than the available RAM (MemAvailable plus the pages the GPU driver holds for reuse) minus a reserve (1/16 of RAM, 1 to 8 GiB). By default such a buffer fails up front as out of memory: a managed allocation does not fail for lack of RAM, so a shortfall would otherwise end in the OOM killer. Inside a container, the room under its cgroup memory limit bounds the available RAM. It also turns off the bound of an integrated GPU's free memory by its own VRAM left plus the available RAM: `ggml_backend_cuda_get_device_memory` and `ggml_backend_cuda_get_device_room` (the bound with the reserve kept, which DeepSeek sizes its Strix expert stack, streamed expert cache, load check and prefill from) then report the runtime's figures, and `ggml_backend_cuda_get_uma_room`, which the Strix expert stack also reads, reports nothing. |
 | `LUCE_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |
 | `LUCE_ADAPTIVE_K_DENSE` | per-model default | CSV of MoE layers kept dense under adaptive-K (DFlash capture layers). Warned-inert on families that do not thread layer indices yet. |
-| `LUCE_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. |
-| `LUCE_MMID_GROUPED_TYPES` | 71 | Grouped-kernel type mask; bit 3 (`8`) opts ROCmFP2/ROCmFP3 into the path. Bit 6 (`64`) enables Q5_0 subject to its sm_86 and projection-shape guards; `7` disables Q5_0 while retaining the previously enabled formats. |
+| `LUCE_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. Unset: on for CUDA (the `LUCE_MMID_GROUPED_TYPES` formats); on HIP only for Q5_1 experts on RDNA3.5 (the Strix Halo expert owner of Qwen3.8-Flash-Next, bit-exact, split decode up to +3%). =0 turns it off everywhere, =1 on for the mask on every eligible GPU (the arch and `LUCE_MMID_GROUPED_DEVICE` guards still apply). |
+| `LUCE_MMID_GROUPED_TYPES` | 71 | Grouped-kernel type mask; bit 3 (`8`) opts ROCmFP2/ROCmFP3 into the path. Bit 6 (`64`) enables Q5_0 subject to its sm_86 and projection-shape guards; `7` disables Q5_0 while retaining the previously enabled formats. Bit 7 (`128`) opts Q4_1/Q5_1 in (off by default). |
 | `LUCE_MMID_GROUPED_DEVICE` | -1 | Optional zero-based device restriction; unset/-1 applies to every eligible device. |
 | `LUCE_DS4_MOE_TP` / `LUCE_DS4_MOE_TP_INPROC` | unset | BURN-IN: enable DeepSeek4 route-owner expert parallelism in one process. Prefer the CLI: `--expert-device <backend:gpu>` sets both with the device and backend. |
 | `LUCE_DS4_MOE_TP_BACKEND` / `LUCE_MOE_TP_BACKEND` | peer runtime in a mixed build; compiled runtime otherwise | Select the in-process cold expert owner backend. |
@@ -95,7 +97,7 @@ profile and the requirements checked at startup.
 | `GGML_CUDA_MLA_STREAM_F32_STAGE` | enabled for maskless ratio-4 sparse prefill; unset otherwise | With F16-input streaming D512 indexed attention, convert aligned F16 pairs once while staging them in shared memory instead of repeating conversion for every head. Applies only when streaming top-k is selected automatically or through `GGML_CUDA_MLA_STREAM_TOPK` / `GGML_DS4_FA_STREAM_TOPK`. Set `0` to restore F16 staging for F16 inputs. This override does not affect the compact-order HIP F32 path. |
 | `GGML_CUDA_MLA_STREAM_FAST_EXP` | enabled for maskless ratio-4 sparse prefill; unset otherwise | With FP32-staged streaming D512 indexed attention, use the hardware exponential intrinsic for online softmax. Requires both streaming top-k selection and FP32 staging; setting this flag alone does not enable either. Set `0` to use `expf`. The compact-order HIP F32 path and other attention paths are unchanged. |
 | `GGML_CUDA_MLA_SPLIT_KV` / `GGML_DS4_FA_SPLIT_KV` | 1 on gfx1151 indexed decode; unset elsewhere | BURN-IN: =1 forces the reusable split-KV MLA schedule. Unset, empty, or =0 does not force it (the device default still applies). Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` (or legacy `GGML_DS4_FA_NO_SPLIT_KV=1`) to disable it; either kill switch overrides either force flag, while empty/=0 kill switches have no effect. |
-| `GGML_DS4_TOPK_BLOCK_RADIX` | 1 on gfx1151 | BURN-IN KILL SWITCH: =0 restores hipCUB full sort for DS4-shaped 512-row top-k selection. |
+| `GGML_DS4_TOPK_BLOCK_RADIX` | 1 on gfx1151 and RDNA4 | BURN-IN KILL SWITCH: =0 restores hipCUB full sort for every block radix top-k on HIP: the DS4-shaped k = 512 selection over 1025..32768 scores, and the tiled selection of a power-of-two k from 32 to 2048 over more than 4096 scores (the sampler's top candidates) or k = 512 over more than 32768. Both select the same ids in the same order; the full sort keeps four copies of the scores in the pool. |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | unset | DEBUG/A-B: restore the serial indexed-attention mask scan instead of the long-context HIP parallel scan. |
 | `LUCE_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
 | `LUCE_MOE_TP_*` / `LUCE_MOE_HYBRID_PREFILL_EAGER` | unset | BURN-IN: model-neutral names for common heterogeneous-MoE scheduling and kernel policy. Existing `LUCE_DS4_*` names remain compatibility aliases. |
@@ -121,6 +123,7 @@ profile and the requirements checked at startup.
 | `LUCE_ROCMFP2_ROW4` | 1 on gfx1151 for q>2; legacy two-row kernel elsewhere | BURN-IN KILL SWITCH: =0 restores two-row-per-wave ROCmFP2 verification kernels. |
 | `LUCE_MIX_DEDUP` | 1 on gfx1151 | KILL SWITCH (burn-in): =0 returns ROCmFP2/FP3 MIX verify matvecs (small DSpark verify batches on gfx1151) to the per-route kernel. By default the workgroup of an expert's first route serves every route to it, decoding each weight block once; output is bit-identical. Follows the row4 (FP2) and row3 (FP3) opt-outs. |
 | `LUCE_CUDA_MMVQ_Q8_RDNA4` | 1 on RDNA4 | KILL SWITCH (burn-in): =0 returns one-column Q8_0 matvecs on RDNA4 (and batch-invariant ones up to eight columns) to the generic eight-wave MMVQ kernel. The default kernel packs rows per wave but keeps the reference accumulation order, so output is bit-identical. |
+| `LUCE_CUDA_MMVQ_RDNA4_MOE` | 1 on RDNA4 | KILL SWITCH (burn-in): =0 returns MUL_MAT_ID with short expert rows (fewer quant blocks than the eight-wave launch reads per K step, e.g. qwen4exp's experts) to the eight-wave single-column launch. By default they run on the one-wave MoE kernel at every width, decode included, so verify batches reproduce decode bit for bit; its sum order differs from the eight-wave launch. |
 | `LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH` | 1 on gfx1151 | KILL SWITCH (burn-in): =0 returns ROCmFP2 MoE matvecs on gfx1151 to the loop without next-block prefetch; =1 turns the prefetching loop on elsewhere. Same accumulation order, bit-identical. |
 | `LUCE_MIX_DEDUP_MIN` | 3 | Smallest verify batch (tokens) that takes the dedup kernel; a whole number >= 1, anything else keeps the default. |
 | `LUCE_MULTI_MODEL_GRAPHS` | unset | =1 keeps GPU graph capture on when one process serves several model blocks (`--load-balancing`). By default the server sets `GGML_CUDA_DISABLE_GRAPHS=1` there, because concurrent captures from different model workers invalidate each other. |
@@ -181,6 +184,7 @@ profile and the requirements checked at startup.
 - `LUCE_CUDA_MMVQ_MOE_FP3_PACKED24` - deepseek4_backend.cpp, mmvq.cu
 - `LUCE_CUDA_MMVQ_MOE_KERNEL` - moe_hybrid_ffn_eval.cpp
 - `LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK` - mmvq.cu
+- `LUCE_CUDA_MMVQ_RDNA4_MOE` - mmvq.cu
 - `LUCE_DISABLE_DRAFT_ATTN` - draft_graph.cpp
 - `LUCE_DISABLE_DRAFT_ATTN_GATE` - draft_graph.cpp
 - `LUCE_DISABLE_DRAFT_AUX_NORMS` - draft_graph.cpp
@@ -249,6 +253,7 @@ profile and the requirements checked at startup.
 - `LUCE_MOE_TP_DYNAMIC_MAIN_SLOTS_X4` - moe_hybrid_ffn_eval.cpp
 - `LUCE_MOE_TP_DYNAMIC_ROUTE_BALANCE` - moe_hybrid_ffn_eval.cpp
 - `LUCE_QWEN35_ROCTX` - qwen35_roctx.cpp
+- `LUCE_QWEN4EXP_LOOKUP` - qwen4exp_backend.cpp
 - `LUCE_DS4_SEQ_VERIFY` - deepseek4_dspark_spec.cpp
 - `LUCE_ROCMFP2_ROW4` - rocmfp2_mix.cu
 - `LUCE_MIX_DEDUP` - rocmfp2_mix.cu, rocmfp3_mix.cu
@@ -267,7 +272,7 @@ profile and the requirements checked at startup.
 - `LUCE_DS4_VERIFY_FORCE_GRAPH_REPLAY` - deepseek4_fused_verify.inc
 - `LUCE_DS4_TOPK` - deepseek4_graph.cpp
 - `LUCE_DYN_CONV_FUSED` - draft_graph.cpp (=0 expands the DFlash2 dynamic convs instead of the fused kernel)
-- `LUCE_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp
+- `LUCE_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp, qwen4exp_backend.cpp (expert_budget_bytes_from_env)
 - `LUCE_EXPERT_BUDGET_PCT` - laguna_backend.cpp
 - `LUCE_FAST_ROLLBACK_THRESHOLD` - chain_rollback_policy.h
 - `LUCE_FEAT_RING_CAP` - dflash_feature_ring.h
@@ -280,7 +285,7 @@ profile and the requirements checked at startup.
 - `LUCE_G4_BSA_CHUNK` - gemma4_graph.cpp
 - `LUCE_GEMMA4_LAYER_SPLIT_UBATCH` - gemma4_layer_split_adapter.cpp
 - `LUCE_GEMMA4_NO_KVPAD` - gemma4_graph.cpp
-- `LUCE_GPU_ARGMAX` - qwen35_backend.cpp
+- `LUCE_GPU_ARGMAX` - sampler.cpp (gpu_argmax_enabled)
 - `LUCE_GPU_DRAFT_TOPK` - qwen35_dflash_target.cpp
 - `LUCE_GPU_SAMPLE` - geometric_sampler_cuda.cu
 - `LUCE_GPU_VERIFY_ARGMAX` - qwen35_dflash_target.cpp
