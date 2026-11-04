@@ -524,11 +524,13 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 // (row, token) vs mul_mat_vec_q_moe (same vec_dot sequence and reduction).
 // Model-agnostic: applies to any MoE with n_expert_used*n_tokens <= 256.
 //   LUCE_MMID_GROUPED         1 = enable, 0 = disable
-//                               (CUDA default on; HIP default off)
+//                               (CUDA default on; HIP default off except
+//                               Q5_1 on RDNA3, see mmid_grouped_selected)
 //   LUCE_MMID_GROUPED_TYPES   bitmask, 1 = Q4_K, 2 = Q6_K,
 //                               4 = Q4_0/Q8_0/Q5_K, 8 = ROCmFP2/ROCmFP3,
 //                               16 = ROCmFP4-fast, 32 = ROCmFP3 only,
 //                               64 = Q5_0 on sm_86 with batch/projection-shape guards.
+//                               128 = Q4_1/Q5_1.
 //                               Default 71; 7 disables Q5_0 while retaining
 //                               the previously enabled formats.
 //   LUCE_MMID_GROUPED_DEVICE  optional zero-based device index; unset/-1
@@ -562,7 +564,8 @@ struct mmid_gate_extra {
 static bool mmid_grouped_env() {
     // Bit-exact and measured equal-or-faster on small MoE verify batches, so
     // enabled by default on CUDA; LUCE_MMID_GROUPED=0 is the kill switch.
-    // HIP (RDNA3/RDNA4) stays opt-in and default-off. Generic quantized types
+    // HIP (RDNA3/RDNA4) stays opt-in and default-off, but for the formats
+    // mmid_grouped_selected names. Generic quantized types
     // have correctness coverage on gfx1151; ROCmFP2/ROCmFP3 are separately
     // enabled by the type mask after platform-specific qualification.
     static const bool on = []() {
@@ -588,9 +591,10 @@ static bool mmvq_env_flag(const char * name, bool default_value = false) {
 static bool mmid_grouped_type_ok(ggml_type type) {
     // bit0 = Q4_K, bit1 = Q6_K, bit2 = Q4_0/Q8_0/Q5_K,
     // bit3 = Q2_0_ROCMFP2/Q3_0_ROCMFPX, bit4 = ROCmFP4-fast,
-    // bit5 = ROCmFP3 only, bit6 = Q5_0. Q5_0 has additional architecture,
-    // batch and projection-shape guards below. LUCE_MMID_GROUPED_TYPES is an
-    // experimental override; 7 restores the policy without Q5_0.
+    // bit5 = ROCmFP3 only, bit6 = Q5_0, bit7 = Q4_1/Q5_1 (not in the default mask).
+    // Q5_0 has additional architecture, batch and projection-shape guards
+    // below. LUCE_MMID_GROUPED_TYPES is an experimental override; 7 restores
+    // the policy without Q5_0.
     static const int mask = []() {
         const char * e = std::getenv("LUCE_MMID_GROUPED_TYPES");
         if (e == nullptr || e[0] == '\0') {
@@ -601,6 +605,9 @@ static bool mmid_grouped_type_ok(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q5_0:
             return (mask & 64) != 0;
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_1:
+            return (mask & 128) != 0;
         case GGML_TYPE_Q4_K:
             return (mask & 1) != 0;
         case GGML_TYPE_Q6_K:
@@ -640,6 +647,26 @@ static bool mmid_grouped_arch_ok(int cc) {
         GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
 }
 
+// Whether the grouped kernel serves this type on this device. With
+// LUCE_MMID_GROUPED set, it decides for the types in LUCE_MMID_GROUPED_TYPES.
+// Unset, CUDA groups those types and HIP only what was measured faster there:
+// Q5_1 on RDNA3 (the gfx1151 expert owner of Qwen3.8-Flash-Next: its expert
+// down projection 24% faster, split decode up to +3%, bit-exact).
+static bool mmid_grouped_selected(ggml_type type, int cc) {
+    if (!mmid_grouped_arch_ok(cc) || !mmid_grouped_device_ok()) {
+        return false;
+    }
+    static const bool env_set = std::getenv("LUCE_MMID_GROUPED") != nullptr;
+    if (env_set) {
+        return mmid_grouped_env() && mmid_grouped_type_ok(type);
+    }
+#ifdef GGML_USE_HIP
+    return type == GGML_TYPE_Q5_1 && GGML_CUDA_CC_IS_RDNA3(cc);
+#else
+    return mmid_grouped_type_ok(type);
+#endif
+}
+
 bool ggml_cuda_mmvq_mmid_grouped_enabled(
         ggml_type type, int cc, int64_t ncols_dst, int64_t routed_pairs) {
     // This shape-independent predicate also vetoes graph fusion. Q5_0 is
@@ -649,9 +676,7 @@ bool ggml_cuda_mmvq_mmid_grouped_enabled(
         return false;
     }
     return ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_MOE_BATCH_SIZE &&
-        routed_pairs <= MMID_GROUPED_MAX_PAIRS &&
-        mmid_grouped_env() && mmid_grouped_type_ok(type) &&
-        mmid_grouped_arch_ok(cc) && mmid_grouped_device_ok();
+        routed_pairs <= MMID_GROUPED_MAX_PAIRS && mmid_grouped_selected(type, cc);
 }
 
 // Ordinary MMID admission, also used to select the invariant fallback below.
@@ -663,8 +688,7 @@ static int get_mmvq_mmid_max_batch_regular(ggml_type type, int cc) {
     // The HIP path remains opt-in until on-hardware parity and performance validation.
     // Q5_0 support is shape-specific and must not raise the MMVQ batch ceiling
     // for the shapes that still use the legacy kernel.
-    if (type != GGML_TYPE_Q5_0 && mmid_grouped_env() && mmid_grouped_type_ok(type) &&
-        mmid_grouped_arch_ok(cc) && mmid_grouped_device_ok()) {
+    if (type != GGML_TYPE_Q5_0 && mmid_grouped_selected(type, cc)) {
         return MMVQ_MAX_MOE_BATCH_SIZE;
     }
     // Dedicated multi-token MoE kernel: extend the MUL_MAT_ID ceiling to 16
@@ -2331,6 +2355,14 @@ static bool mul_mat_vec_q_grouped_dispatch(
             return true;
         case GGML_TYPE_Q4_0:
             mul_mat_vec_q_moe_grouped_launch<GGML_TYPE_Q4_0>(vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
+            return true;
+        case GGML_TYPE_Q4_1:
+            mul_mat_vec_q_moe_grouped_launch<GGML_TYPE_Q4_1>(vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
+            return true;
+        case GGML_TYPE_Q5_1:
+            mul_mat_vec_q_moe_grouped_launch<GGML_TYPE_Q5_1>(vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
                 stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
             return true;
         case GGML_TYPE_Q8_0:
@@ -4304,10 +4336,9 @@ void ggml_cuda_mul_mat_vec_q(
             const char * reason =
                 ncols_dst > MMVQ_MAX_MOE_BATCH_SIZE ? "width_gt_16" :
                 (int) (nchannels_dst*ncols_dst) > MMID_GROUPED_MAX_PAIRS ? "pairs_gt_256" :
-                !mmid_grouped_env() ? "flag_off" :
-                !mmid_grouped_type_ok(src0->type) ? "unsupported_type" :
                 !mmid_grouped_arch_ok(cc) ? "unsupported_arch" :
-                !mmid_grouped_device_ok() ? "device_filtered" : "dispatch_rejected";
+                !mmid_grouped_device_ok() ? "device_filtered" :
+                !mmid_grouped_selected(src0->type, cc) ? "not_selected" : "dispatch_rejected";
             std::fprintf(stderr,
                 "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%lld variant=%s reason=%s\n",
                 ggml_type_name(src0->type), (long long) ncols_dst,
