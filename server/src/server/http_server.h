@@ -1141,18 +1141,20 @@ private:
 
     struct GenerationCacheState {
         DiskPrefixCachePolicy disk_policy;
-        int cache_slot = -1;
+        // What the request restores from: an inline or exact-prompt
+        // checkpoint, or the disk-staging one after a disk hit.
+        Checkpoint restore;
         int prefix_len = 0;
         bool using_restore = false;
         bool disk_hit = false;
-        int full_snap_slot = -1;
+        Checkpoint full_snap;
         int full_snap_pos = 0;
         bool full_snap_prepared = false;
         // When DiffPin rewrote tokens, full-cache keys must use
         // prepared.tokens (effective), not req.prompt_tokens.
         bool full_snap_key_effective = false;
         PrefixCache::InlineReservation snap_reservation;
-        int snap_slot = -1;
+        Checkpoint snap;
         int snap_cut = 0;
         bool snap_prepared = false;
     };
@@ -1368,6 +1370,9 @@ private:
     // Between the text parts of a message's content array, as the template joins them.
     const char * text_part_separator() const { return chat_codec_ ? chat_codec_->text_part_separator() : ""; }
     PrefixCache      prefix_cache_;
+    // Every checkpoint payload the server touches goes through this store
+    // (declared before disk_cache_, which reads and adopts through it).
+    BackendCheckpoints checkpoints_;
     DiskPrefixCache  disk_cache_;
 
     // Per-session adaptive keep_ratio bandit state.

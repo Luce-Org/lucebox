@@ -198,11 +198,11 @@ struct SchedulerTestHarness {
         prepared.compressed = compressed;
         HttpServer::GenerationCacheState cache;
         cache.snap_reservation = std::move(reservation);
-        cache.snap_slot = slot;
+        cache.snap = Checkpoint::of_cache_slot(slot);
         cache.snap_cut = requested_cut;
         cache.snap_prepared = true;
         cache.using_restore = restore_slot >= 0;
-        cache.cache_slot = restore_slot;
+        cache.restore = Checkpoint::of_cache_slot(restore_slot);
         GenerateResult result;
         result.error.reset();
         server.finalize_generation_cache(
@@ -284,9 +284,9 @@ struct SchedulerTestHarness {
         HttpServer::GenerationCacheState cache;
         cache.disk_policy.mode = disk_scope;
         cache.snap_prepared = own_snapshot_slot >= 0;
-        cache.snap_slot = own_snapshot_slot;
+        cache.snap = Checkpoint::of_cache_slot(own_snapshot_slot);
         cache.using_restore = restored_slot >= 0;
-        cache.cache_slot = restored_slot;
+        cache.restore = Checkpoint::of_cache_slot(restored_slot);
         return server.save_generated_turn(prompt, generated, canonical, cache);
     }
 
@@ -333,7 +333,7 @@ struct SchedulerTestHarness {
         generate_request.prompt = prompt;
         const auto cache = server.prepare_generation_cache(
             req, prepared, generate_request);
-        return {cache.using_restore ? cache.cache_slot : -1, cache.prefix_len,
+        return {cache.using_restore ? cache.restore.cache_slot() : -1, cache.prefix_len,
                 cache.snap_prepared, generate_request.restore_points};
     }
 };
@@ -14727,8 +14727,8 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_disabled_when_no_dir) {
     TEST_ASSERT(cache.disabled());
     // Operations should be no-ops.
     std::vector<int32_t> ids = {1, 2, 3, 4, 5};
-    TEST_ASSERT(!cache.lookup(ids, 0));
-    TEST_ASSERT(!cache.save(0, ids));
+    TEST_ASSERT(!cache.lookup(ids, Checkpoint::of_cache_slot(0)));
+    TEST_ASSERT(!cache.save(Checkpoint::of_cache_slot(0), ids));
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_disables_memory_only_backend) {
@@ -14740,7 +14740,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_disables_memory_only_backend) {
 
     // A live in-memory snapshot with no SnapshotRef means this backend cannot
     // serialize or adopt disk entries. Detect it once and skip later disk work.
-    cache.learn_layout(0);
+    cache.learn_layout(Checkpoint::of_cache_slot(0));
     TEST_ASSERT(cache.disabled());
 }
 
@@ -14856,17 +14856,17 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_continued_boundary) {
 
     // Without layout known, save should fail gracefully.
     std::vector<int32_t> tokens(1500, 42);
-    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, 1000));
+    TEST_ASSERT(!cache.maybe_store_continued(Checkpoint::of_cache_slot(0), tokens, 1000));
 
     // Reset continued tracking.
     cache.reset_continued();
 
     // Below interval, no save (even if tokens available).
-    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, 500));
+    TEST_ASSERT(!cache.maybe_store_continued(Checkpoint::of_cache_slot(0), tokens, 500));
 
     // At exactly 1000 tokens — would save if layout were known.
     // But backend mock can't provide snapshots, so it fails gracefully.
-    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, 1000));
+    TEST_ASSERT(!cache.maybe_store_continued(Checkpoint::of_cache_slot(0), tokens, 1000));
 
     rm_rf(dir);
 }
@@ -14962,7 +14962,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_lookup_miss_no_layout) {
     cache.init();
 
     std::vector<int32_t> ids = {1, 2, 3, 4, 5, 6, 7, 8};
-    TEST_ASSERT(!cache.lookup(ids, 0));
+    TEST_ASSERT(!cache.lookup(ids, Checkpoint::of_cache_slot(0)));
 
     rm_rf(dir);
 }
@@ -14980,7 +14980,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_save_below_min_tokens) {
     cache.init();
 
     std::vector<int32_t> ids(50, 1);  // only 50 tokens
-    TEST_ASSERT(!cache.save(0, ids));
+    TEST_ASSERT(!cache.save(Checkpoint::of_cache_slot(0), ids));
 
     rm_rf(dir);
 }
@@ -15063,7 +15063,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_failed_init_disables_pending_writes
         std::vector<int32_t> key(40, 1);
         for (int turn = 0; turn < 2; ++turn) {
             ++key.back();
-            TEST_ASSERT(!cache.save(0, key));
+            TEST_ASSERT(!cache.save(Checkpoint::of_cache_slot(0), key));
             TEST_ASSERT(!cache.save_async(OwnedSnapshot::clone_to_host(
                 ref.ctx, ref.cur_pos, ref.last_tok), key));
         }
@@ -15089,13 +15089,13 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_rejects_snapshot_past_key) {
     {
         DiskPrefixCache cache(cfg, backend);
         TEST_ASSERT(cache.init());
-        cache.learn_layout(0);
-        TEST_ASSERT(!cache.save(0, short_key));
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(!cache.save(Checkpoint::of_cache_slot(0), short_key));
         TEST_ASSERT(cache.total_bytes() == 0);
-        TEST_ASSERT(cache.save(0, full_key));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), full_key));
         TEST_ASSERT(cache.total_bytes() > 0);
-        TEST_ASSERT(!cache.lookup(short_key, 1));
-        TEST_ASSERT(cache.lookup(full_key, 1));
+        TEST_ASSERT(!cache.lookup(short_key, Checkpoint::of_cache_slot(1)));
+        TEST_ASSERT(cache.lookup(full_key, Checkpoint::of_cache_slot(1)));
         TEST_ASSERT(backend.adopted_cur_pos_ == MockBackendWithLayout::kMaxPos);
     }  // the writer finishes and the directory lock is released
 
@@ -15126,10 +15126,10 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_rejects_snapshot_past_key) {
         }
         DiskPrefixCache reopened(cfg, backend);
         TEST_ASSERT(reopened.init());
-        reopened.learn_layout(0);
-        TEST_ASSERT(!reopened.lookup(short_key, 2));   // rejected + removed
+        reopened.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(!reopened.lookup(short_key, Checkpoint::of_cache_slot(2)));   // rejected + removed
         TEST_ASSERT(!fs::exists(forged));
-        TEST_ASSERT(reopened.lookup(full_key, 2));     // consistent file survives
+        TEST_ASSERT(reopened.lookup(full_key, Checkpoint::of_cache_slot(2)));     // consistent file survives
     }
     rm_rf(dir);
 }
@@ -15145,40 +15145,40 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_continued_keys_full_prefix) {
     cfg.continued_interval = 10;   // 32 positions -> crosses at 30
     DiskPrefixCache cache(cfg, backend);
     TEST_ASSERT(cache.init());
-    cache.learn_layout(0);
+    cache.learn_layout(Checkpoint::of_cache_slot(0));
 
     std::vector<int32_t> tokens;
     for (int i = 0; i < 60; ++i) tokens.push_back(100 + i);
     const int cur_pos = MockBackendWithLayout::kMaxPos;  // 32 -> bucket 30
     backend.cur_pos_ = cur_pos;
-    TEST_ASSERT(cache.maybe_store_continued(0, tokens, cur_pos));
+    TEST_ASSERT(cache.maybe_store_continued(Checkpoint::of_cache_slot(0), tokens, cur_pos));
     std::vector<int32_t> aligned(tokens.begin(), tokens.begin() + 30);
     std::vector<int32_t> covered(tokens.begin(), tokens.begin() + cur_pos);
-    TEST_ASSERT(!cache.lookup(aligned, 1));
-    TEST_ASSERT(cache.lookup(covered, 1));
+    TEST_ASSERT(!cache.lookup(aligned, Checkpoint::of_cache_slot(1)));
+    TEST_ASSERT(cache.lookup(covered, Checkpoint::of_cache_slot(1)));
     TEST_ASSERT(backend.adopted_cur_pos_ == cur_pos);
     const size_t bytes_after_first = cache.total_bytes();
     TEST_ASSERT(bytes_after_first > 0);
 
     // Same interval bucket: no second checkpoint.
-    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, cur_pos));
+    TEST_ASSERT(!cache.maybe_store_continued(Checkpoint::of_cache_slot(0), tokens, cur_pos));
     backend.cur_pos_ = 38;  // still bucket 30
-    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, 38));
+    TEST_ASSERT(!cache.maybe_store_continued(Checkpoint::of_cache_slot(0), tokens, 38));
     TEST_ASSERT(cache.total_bytes() == bytes_after_first);
 
     // Crossing into bucket 40 fires again, keyed by the 42 covered tokens.
     backend.cur_pos_ = 42;
-    TEST_ASSERT(cache.maybe_store_continued(0, tokens, 42));
+    TEST_ASSERT(cache.maybe_store_continued(Checkpoint::of_cache_slot(0), tokens, 42));
     TEST_ASSERT(cache.total_bytes() > bytes_after_first);
     std::vector<int32_t> bucket(tokens.begin(), tokens.begin() + 40);
     std::vector<int32_t> covered2(tokens.begin(), tokens.begin() + 42);
-    TEST_ASSERT(!cache.lookup(bucket, 2));
-    TEST_ASSERT(cache.lookup(covered2, 2));
+    TEST_ASSERT(!cache.lookup(bucket, Checkpoint::of_cache_slot(2)));
+    TEST_ASSERT(cache.lookup(covered2, Checkpoint::of_cache_slot(2)));
     TEST_ASSERT(backend.adopted_cur_pos_ == 42);
     // The earlier checkpoint is still there, and bucket 40 does not refire.
-    TEST_ASSERT(cache.lookup(covered, 3));
+    TEST_ASSERT(cache.lookup(covered, Checkpoint::of_cache_slot(3)));
     backend.cur_pos_ = 47;
-    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, 47));
+    TEST_ASSERT(!cache.maybe_store_continued(Checkpoint::of_cache_slot(0), tokens, 47));
     rm_rf(dir);
 }
 
@@ -15198,8 +15198,8 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
         DiskPrefixCache cache(cfg, backend);
         cache.set_identity_salt(salt_a);
         cache.init();
-        cache.learn_layout(0);
-        TEST_ASSERT(cache.save(0, prompt));
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), prompt));
     }
 
     // Salt B: different from A.
@@ -15213,8 +15213,8 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
         DiskPrefixCache cache(cfg, backend);
         cache.set_identity_salt(salt_b);
         cache.init();
-        cache.learn_layout(0);
-        TEST_ASSERT(cache.save(0, prompt));
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), prompt));
     }
 
     auto id_a = read_layout_id_from_cache_dir(dir_a);
@@ -15231,8 +15231,8 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
         DiskPrefixCache cache(cfg, backend);
         cache.set_identity_salt(salt_a);
         cache.init();
-        cache.learn_layout(0);
-        TEST_ASSERT(cache.save(0, prompt));
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), prompt));
     }
     auto id_a2 = read_layout_id_from_cache_dir(dir_a2);
     TEST_ASSERT(id_a == id_a2);
@@ -15256,8 +15256,8 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
         DiskPrefixCache cache(cfg, backend);
         // No set_identity_salt call — stays all-zero.
         cache.init();
-        cache.learn_layout(0);
-        TEST_ASSERT(cache.save(0, prompt));
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), prompt));
     }
 
     std::string dir2 = test_tmp_path("luce_test_salt_zero2").string();
@@ -15268,8 +15268,8 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
         std::array<uint8_t, 16> zero_salt{};
         cache.set_identity_salt(zero_salt);
         cache.init();
-        cache.learn_layout(0);
-        TEST_ASSERT(cache.save(0, prompt));
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), prompt));
     }
 
     auto id1 = read_layout_id_from_cache_dir(dir1);
@@ -15310,8 +15310,8 @@ uint64_t one_file_size(MockBackendWithAdopt & backend, const std::string & dir, 
     {
         DiskPrefixCache cache(cfg, backend);
         cache.init();
-        cache.learn_layout(0);
-        cache.save(0, disk_test_key(n));
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        cache.save(Checkpoint::of_cache_slot(0), disk_test_key(n));
         size = cache.total_bytes();
     }
     rm_rf(dir);
@@ -15334,23 +15334,23 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_ttl_expiry) {
         DiskPrefixCache cache(cfg, backend);
         cache.set_clock([&]() { return clock; });
         TEST_ASSERT(cache.init());
-        cache.learn_layout(0);
-        TEST_ASSERT(cache.save(0, a));
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), a));
         clock = 1090;
-        TEST_ASSERT(cache.lookup(a, 1));          // used at 1090
+        TEST_ASSERT(cache.lookup(a, Checkpoint::of_cache_slot(1)));          // used at 1090
         clock = 1180;
-        TEST_ASSERT(cache.lookup(a, 1));          // 90 s idle: still alive
+        TEST_ASSERT(cache.lookup(a, Checkpoint::of_cache_slot(1)));          // 90 s idle: still alive
         clock = 1281;
-        TEST_ASSERT(!cache.lookup(a, 1));         // 101 s idle: expired + deleted
+        TEST_ASSERT(!cache.lookup(a, Checkpoint::of_cache_slot(1)));         // 101 s idle: expired + deleted
         TEST_ASSERT(cache.entry_count() == 0);
         TEST_ASSERT(dkv_files(dir).empty());
 
         // Insertion sweep: saving b deletes an expired c.
-        TEST_ASSERT(cache.save(0, c));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), c));
         clock = 1400;
-        TEST_ASSERT(cache.save(0, b));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), b));
         TEST_ASSERT(cache.entry_count() == 1);
-        TEST_ASSERT(!cache.lookup(c, 1));
+        TEST_ASSERT(!cache.lookup(c, Checkpoint::of_cache_slot(1)));
     }
     {
         // Startup sweep: b expires while the server is down.
@@ -15367,10 +15367,10 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_ttl_expiry) {
         DiskPrefixCache cache(never, backend);
         cache.set_clock([&]() { return clock; });
         TEST_ASSERT(cache.init());
-        cache.learn_layout(0);
-        TEST_ASSERT(cache.save(0, a));
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), a));
         clock += 10ull * 365 * 24 * 3600;
-        TEST_ASSERT(cache.lookup(a, 1));
+        TEST_ASSERT(cache.lookup(a, Checkpoint::of_cache_slot(1)));
     }
     rm_rf(dir);
 }
@@ -15392,10 +15392,10 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_budget_lru_survives_restart) {
         DiskPrefixCache cache(cfg, backend);
         cache.set_clock([&]() { return clock; });
         TEST_ASSERT(cache.init());
-        cache.learn_layout(0);
-        clock = 1; TEST_ASSERT(cache.save(0, a));
-        clock = 2; TEST_ASSERT(cache.save(0, b));
-        clock = 3; TEST_ASSERT(cache.lookup(a, 1));  // a is now newer than b
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        clock = 1; TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), a));
+        clock = 2; TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), b));
+        clock = 3; TEST_ASSERT(cache.lookup(a, Checkpoint::of_cache_slot(1)));  // a is now newer than b
     }
     {
         // last_used came from the file: b (2) is the LRU, not a (created 1).
@@ -15403,17 +15403,17 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_budget_lru_survives_restart) {
         cache.set_clock([&]() { return clock; });
         TEST_ASSERT(cache.init());
         TEST_ASSERT(cache.entry_count() == 2);
-        cache.learn_layout(0);
-        clock = 4; TEST_ASSERT(cache.save(0, c));
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        clock = 4; TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), c));
         TEST_ASSERT(cache.total_bytes() <= cfg.budget_bytes);
         TEST_ASSERT(cache.entry_count() == 2);
-        TEST_ASSERT(!cache.lookup(b, 1));
-        clock = 5; TEST_ASSERT(cache.lookup(a, 1));
-        clock = 6; TEST_ASSERT(cache.save(0, d));   // evicts c (4)
+        TEST_ASSERT(!cache.lookup(b, Checkpoint::of_cache_slot(1)));
+        clock = 5; TEST_ASSERT(cache.lookup(a, Checkpoint::of_cache_slot(1)));
+        clock = 6; TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), d));   // evicts c (4)
         TEST_ASSERT(cache.total_bytes() <= cfg.budget_bytes);
-        TEST_ASSERT(!cache.lookup(c, 1));
-        TEST_ASSERT(cache.lookup(a, 1));
-        TEST_ASSERT(cache.lookup(d, 1));
+        TEST_ASSERT(!cache.lookup(c, Checkpoint::of_cache_slot(1)));
+        TEST_ASSERT(cache.lookup(a, Checkpoint::of_cache_slot(1)));
+        TEST_ASSERT(cache.lookup(d, Checkpoint::of_cache_slot(1)));
     }
     {
         // A smaller budget is enforced at startup, before any request.
@@ -15429,9 +15429,9 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_budget_lru_survives_restart) {
         DiskCacheConfig tiny = cfg; tiny.budget_bytes = (size_t)(one / 2);
         DiskPrefixCache t(tiny, backend);
         TEST_ASSERT(t.init());
-        t.learn_layout(0);
+        t.learn_layout(Checkpoint::of_cache_slot(0));
         TEST_ASSERT(!t.disabled());
-        TEST_ASSERT(!t.save(0, disk_test_key(40, 7000)));
+        TEST_ASSERT(!t.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 7000)));
         TEST_ASSERT(t.total_bytes() <= tiny.budget_bytes);
     }
     rm_rf(dir);
@@ -15449,12 +15449,12 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_duplicate_save_refreshes_ttl_after_
             DiskPrefixCache cache(cfg, backend);
             cache.set_clock([&] { return now; });
             TEST_ASSERT(cache.init());
-            TEST_ASSERT(cache.save(0, key));
+            TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), key));
             cache.drain();
             now += 90;
             const auto ref = backend.snapshot_ref(0);
             TEST_ASSERT(async ? cache.save_async(OwnedSnapshot::clone_to_host(
-                ref.ctx, ref.cur_pos, ref.last_tok), key) : cache.save(0, key));
+                ref.ctx, ref.cur_pos, ref.last_tok), key) : cache.save(Checkpoint::of_cache_slot(0), key));
             TEST_ASSERT(cache.stats().writes == 1);
         }
         now += 60;  // expired from creation, alive from the duplicate save
@@ -15463,7 +15463,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_duplicate_save_refreshes_ttl_after_
             cache.set_clock([&] { return now; });
             TEST_ASSERT(cache.init());
             TEST_ASSERT(cache.entry_count() == 1);
-            TEST_ASSERT(cache.lookup(key, 1));
+            TEST_ASSERT(cache.lookup(key, Checkpoint::of_cache_slot(1)));
         }
     }
     rm_rf(dir);
@@ -15481,8 +15481,8 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_restart_restores_and_rejects_other_
         DiskPrefixCache cache(cfg, backend);
         cache.set_identity_salt(q4);
         TEST_ASSERT(cache.init());
-        cache.learn_layout(0);
-        TEST_ASSERT(cache.save(0, key, "replay-text"));
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), key, "replay-text"));
     }
     {
         // Same identity after a restart: the index is rebuilt from disk and
@@ -15496,7 +15496,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_restart_restores_and_rejects_other_
         TEST_ASSERT(aux.size() == 1 && aux[0] == "replay-text");
         TEST_ASSERT(cache.longest_prefix(key).len == 40);
         backend.adopted_cur_pos_ = 0;
-        TEST_ASSERT(cache.lookup(key, 1));
+        TEST_ASSERT(cache.lookup(key, Checkpoint::of_cache_slot(1)));
         TEST_ASSERT(backend.adopted_cur_pos_ == MockBackendWithLayout::kMaxPos);
     }
     {
@@ -15510,10 +15510,10 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_restart_restores_and_rejects_other_
         cache.for_each_aux([&](const std::string &) { ++other_aux; });
         TEST_ASSERT(other_aux == 0);
         TEST_ASSERT(cache.longest_prefix(key).len == 0);
-        TEST_ASSERT(!cache.lookup(key, 1));
-        cache.learn_layout(0);
+        TEST_ASSERT(!cache.lookup(key, Checkpoint::of_cache_slot(1)));
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
         TEST_ASSERT(cache.longest_prefix(key).len == 0);
-        TEST_ASSERT(!cache.lookup(key, 1));
+        TEST_ASSERT(!cache.lookup(key, Checkpoint::of_cache_slot(1)));
         TEST_ASSERT(dkv_files(dir).size() == 1);
     }
     rm_rf(dir);
@@ -15531,10 +15531,10 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_init_deletes_corrupt_files) {
     {
         DiskPrefixCache cache(cfg, backend);
         TEST_ASSERT(cache.init());
-        cache.learn_layout(0);
-        TEST_ASSERT(cache.save(0, good));
-        TEST_ASSERT(cache.save(0, cut));
-        TEST_ASSERT(cache.save(0, old));
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), good));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), cut));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), old));
     }
     auto files = dkv_files(dir);
     TEST_ASSERT(files.size() == 3);
@@ -15566,7 +15566,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_init_deletes_corrupt_files) {
         TEST_ASSERT(cache.entry_count() == 1);
         files = dkv_files(dir);
         TEST_ASSERT(files.size() == 1 && files[0] == path_of(good));
-        TEST_ASSERT(cache.lookup(good, 1));
+        TEST_ASSERT(cache.lookup(good, Checkpoint::of_cache_slot(1)));
     }
     rm_rf(dir);
 }
@@ -15579,8 +15579,8 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_verifies_stored_tokens) {
     const auto key = disk_test_key(40);
     DiskPrefixCache cache(cfg, backend);
     TEST_ASSERT(cache.init());
-    cache.learn_layout(0);
-    TEST_ASSERT(cache.save(0, key));
+    cache.learn_layout(Checkpoint::of_cache_slot(0));
+    TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), key));
     cache.drain();
     const auto files = dkv_files(dir);
     TEST_ASSERT(files.size() == 1);
@@ -15597,7 +15597,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_verifies_stored_tokens) {
     std::fwrite(&other, 4, 1, f);
     std::fclose(f);
     // Same hash in the index, different stored tokens: rejected and deleted.
-    TEST_ASSERT(!cache.lookup(key, 1));
+    TEST_ASSERT(!cache.lookup(key, Checkpoint::of_cache_slot(1)));
     TEST_ASSERT(dkv_files(dir).empty());
     rm_rf(dir);
 }
@@ -15609,12 +15609,12 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_longest_prefix_and_prune_ancestors)
     DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
     DiskPrefixCache cache(cfg, backend);
     TEST_ASSERT(cache.init());
-    cache.learn_layout(0);
+    cache.learn_layout(Checkpoint::of_cache_slot(0));
     const auto turn3 = disk_test_key(60);
     const std::vector<int32_t> turn1(turn3.begin(), turn3.begin() + 40);
     const std::vector<int32_t> turn2(turn3.begin(), turn3.begin() + 48);
-    TEST_ASSERT(cache.save(0, turn1));
-    TEST_ASSERT(cache.save(0, turn2));
+    TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), turn1));
+    TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), turn2));
 
     // Deepest restorable prefix, without reading any file.
     auto probe = cache.longest_prefix(turn3);
@@ -15626,7 +15626,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_longest_prefix_and_prune_ancestors)
 
     // A deeper state of the session supersedes turn2, but the shared head
     // (<= keep_max) stays for other sessions.
-    TEST_ASSERT(cache.save(0, turn3));
+    TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), turn3));
     TEST_ASSERT(cache.prune_ancestors(turn3, 40) == 1);
     TEST_ASSERT(cache.entry_count() == 2);
     TEST_ASSERT(cache.longest_prefix(diverged).len == 40);
@@ -15637,7 +15637,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_longest_prefix_and_prune_ancestors)
     TEST_ASSERT(cache.longest_prefix(diverged).len == 40);
     TEST_ASSERT(cache.longest_prefix(turn3).len == 60);
     const auto turn4 = disk_test_key(70);
-    TEST_ASSERT(cache.save(0, turn4));
+    TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), turn4));
     TEST_ASSERT(cache.prune_ancestors(turn4, 0) == 1);  // turn3; turn1 stays
     TEST_ASSERT(cache.longest_prefix(diverged).len == 40);
     rm_rf(dir);
@@ -15650,8 +15650,8 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_write_failure_is_not_fatal) {
     DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
     DiskPrefixCache cache(cfg, backend);
     TEST_ASSERT(cache.init());
-    cache.learn_layout(0);
-    TEST_ASSERT(cache.save(0, disk_test_key(40)));
+    cache.learn_layout(Checkpoint::of_cache_slot(0));
+    TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40)));
     cache.drain();
     const std::string layout_dir = fs::path(dkv_files(dir)[0]).parent_path().string();
     // Block the directory with a file: a deterministic write failure on
@@ -15661,7 +15661,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_write_failure_is_not_fatal) {
     FILE * blocker = std::fopen(layout_dir.c_str(), "wb");
     TEST_ASSERT(blocker != nullptr);
     std::fclose(blocker);
-    const bool queued = cache.save(0, disk_test_key(40, 800));
+    const bool queued = cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 800));
     cache.drain();
     fs::remove(layout_dir);
     fs::rename(backup_dir, layout_dir);
@@ -15669,7 +15669,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_write_failure_is_not_fatal) {
     TEST_ASSERT(cache.stats().write_failures == 1);
     TEST_ASSERT(cache.entry_count() == 1);
     TEST_ASSERT(dkv_files(dir).size() == 1);
-    TEST_ASSERT(!cache.lookup(disk_test_key(40, 800), 1));
+    TEST_ASSERT(!cache.lookup(disk_test_key(40, 800), Checkpoint::of_cache_slot(1)));
     rm_rf(dir);
 }
 
@@ -16097,7 +16097,7 @@ TEST_CASE(ServerUnitFixture, test_qwen_disk_adopt_restores_dense_state_and_rejec
         const std::vector<int32_t> key = {1, 2, 3};
         TEST_ASSERT(disk.save_async(OwnedSnapshot(ctx, buf, 3, 3), key));
         disk.drain();
-        TEST_ASSERT(disk.lookup(key, 0));  // actual Qwen35Backend::snapshot_adopt
+        TEST_ASSERT(disk.lookup(key, Checkpoint::of_cache_slot(0)));  // actual Qwen35Backend::snapshot_adopt
         TEST_ASSERT(backend.restore(0)); // requires the adopted layout to be dense
         TEST_ASSERT(backend.cache().cur_pos == 3);
         std::vector<float> restored(values.size());
@@ -16262,11 +16262,11 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_checksum_rejects_corrupt_payload) {
     DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
     DiskPrefixCache cache(cfg, backend);
     TEST_ASSERT(cache.init());
-    cache.learn_layout(0);
+    cache.learn_layout(Checkpoint::of_cache_slot(0));
     const auto a = disk_test_key(40, 1);
     const auto b = disk_test_key(40, 500);
-    TEST_ASSERT(cache.save(0, a));
-    TEST_ASSERT(cache.save(0, b));
+    TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), a));
+    TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), b));
     cache.drain();
     const auto path_of = [&](const std::vector<int32_t> & k) {
         for (const auto & f : dkv_files(dir)) {
@@ -16292,12 +16292,12 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_checksum_rejects_corrupt_payload) {
         std::fclose(f);
     }
     const size_t adopted_before = backend.adopted_.size();
-    TEST_ASSERT(!cache.lookup(a, 1));
+    TEST_ASSERT(!cache.lookup(a, Checkpoint::of_cache_slot(1)));
     TEST_ASSERT(!fs::exists(fa));
     TEST_ASSERT(cache.stats().load_failures == 1);
     // Cut short after the index was built (no startup scan in between).
     fs::resize_file(fb, fs::file_size(fb) - 3);
-    TEST_ASSERT(!cache.lookup(b, 1));
+    TEST_ASSERT(!cache.lookup(b, Checkpoint::of_cache_slot(1)));
     TEST_ASSERT(!fs::exists(fb));
     TEST_ASSERT(backend.adopted_.size() == adopted_before);
     TEST_ASSERT(cache.entry_count() == 0);
@@ -16317,7 +16317,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_rejects_corrupt_tensor_metadata) {
             rm_rf(dir);
             auto cache = std::make_unique<DiskPrefixCache>(cfg, backend);
             TEST_ASSERT(cache->init());
-            TEST_ASSERT(cache->save(0, key));
+            TEST_ASSERT(cache->save(Checkpoint::of_cache_slot(0), key));
             cache->drain();
             const auto files = dkv_files(dir);
             TEST_ASSERT(files.size() == 1);
@@ -16345,7 +16345,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_rejects_corrupt_tensor_metadata) {
                 cache = std::make_unique<DiskPrefixCache>(cfg, backend);
                 TEST_ASSERT(cache->init());
             }
-            TEST_ASSERT(!cache->lookup(key, 1));
+            TEST_ASSERT(!cache->lookup(key, Checkpoint::of_cache_slot(1)));
             TEST_ASSERT(!fs::exists(files[0]));
             TEST_ASSERT(cache->entry_count() == 0);
             TEST_ASSERT(backend.adopted_.empty());
@@ -16370,7 +16370,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_save_async_queue_and_free_space) {
         TEST_ASSERT(cache.save_async(
             OwnedSnapshot::clone_to_host(ref.ctx, ref.cur_pos, ref.last_tok), key, "aux"));
         TEST_ASSERT(cache.total_bytes() > 0);
-        TEST_ASSERT(cache.lookup(key, 1));  // from memory or from the file
+        TEST_ASSERT(cache.lookup(key, Checkpoint::of_cache_slot(1)));  // from memory or from the file
         TEST_ASSERT(backend.adopted_cur_pos_ == ref.cur_pos);
         const auto drained = cache.drain();
         TEST_ASSERT(drained.cancelled == 0);
@@ -16392,10 +16392,10 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_save_async_queue_and_free_space) {
         TEST_ASSERT(cache.init());
         TEST_ASSERT(cache.budget_bytes() == cache.total_bytes() + (1u << 20));
         cache.set_free_space_probe([] { return (uint64_t)0; });
-        cache.learn_layout(0);
-        TEST_ASSERT(cache.save(0, disk_test_key(40, 700)));  // evicts the old one
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 700)));  // evicts the old one
         TEST_ASSERT(cache.entry_count() == 1);
-        TEST_ASSERT(!cache.lookup(key, 1));
+        TEST_ASSERT(!cache.lookup(key, Checkpoint::of_cache_slot(1)));
     }
     // A second server on the same directory leaves it alone.
     {
@@ -16681,8 +16681,8 @@ TEST_CASE(ServerUnitFixture, test_disk_session_concurrent_respects_request_scope
         auto & disk = SchedulerTestHarness::disk_cache(server);
         const std::vector<int32_t> a = {1, 100, 3, 101, 4};
         backend.slots[62] = DiskPayloadBackend::make(3);
-        disk.learn_layout(62);
-        TEST_ASSERT(disk.save(62, {1, 100, 3}));
+        disk.learn_layout(Checkpoint::of_cache_slot(62));
+        TEST_ASSERT(disk.save(Checkpoint::of_cache_slot(62), {1, 100, 3}));
         disk.drain();
         backend.drop(62);
 

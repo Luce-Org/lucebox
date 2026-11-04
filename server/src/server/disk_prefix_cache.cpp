@@ -517,8 +517,13 @@ static bool valid_tensor_metadata(uint32_t type, const int64_t ne[4], uint64_t n
 
 // ─── Construction ───────────────────────────────────────────────────────
 
+DiskPrefixCache::DiskPrefixCache(const DiskCacheConfig & cfg, CheckpointStore & store)
+    : config_(cfg), store_(store) {}
+
 DiskPrefixCache::DiskPrefixCache(const DiskCacheConfig & cfg, ModelBackend & backend)
-    : config_(cfg), backend_(backend) {}
+    : config_(cfg),
+      owned_store_(std::make_unique<BackendCheckpoints>(backend)),
+      store_(*owned_store_) {}
 
 DiskPrefixCache::~DiskPrefixCache() {
     if (writer_.joinable()) {
@@ -733,15 +738,15 @@ void DiskPrefixCache::learn_layout_from(ggml_context * ctx) {
                  hex(layout_id_.data(), 16).c_str());
 }
 
-void DiskPrefixCache::learn_layout(int slot) {
+void DiskPrefixCache::learn_layout(Checkpoint checkpoint) {
     if (disabled()) return;
     {
         std::lock_guard<std::mutex> lock(mu_);
         if (layout_known_ && !layout_from_disk_) return;
     }
-    auto ref = backend_.snapshot_ref(slot);
+    auto ref = store_.ref(checkpoint);
     if (!ref.ctx) {
-        if (backend_.snapshot_used(slot)) {
+        if (store_.used(checkpoint)) {
             backend_snapshot_unsupported_ = true;
             std::fprintf(stderr,
                          "[disk-cache] disabled: backend snapshots are "
@@ -1005,7 +1010,7 @@ OwnedSnapshot DiskPrefixCache::load(const std::vector<int32_t> & prompt_ids) {
     return out;
 }
 
-bool DiskPrefixCache::adopt(OwnedSnapshot snap, int slot) {
+bool DiskPrefixCache::adopt(OwnedSnapshot snap, Checkpoint checkpoint) {
     if (snap.empty()) return false;
     {
         // The first hit after startup confirms the layout read from disk.
@@ -1025,18 +1030,17 @@ bool DiskPrefixCache::adopt(OwnedSnapshot snap, int slot) {
             }
         }
     }
-    if (!backend_.snapshot_adopt(slot, snap.ctx(), snap.buf(), snap.cur_pos(),
-                                 snap.last_tok())) {
+    if (!store_.adopt(checkpoint, snap)) {
         return false;  // `snap` still owns and frees the payload
     }
-    snap.release();
     std::lock_guard<std::mutex> lock(mu_);
     layout_from_disk_ = false;
     return true;
 }
 
-bool DiskPrefixCache::lookup(const std::vector<int32_t> & prompt_ids, int slot) {
-    return adopt(load(prompt_ids), slot);
+bool DiskPrefixCache::lookup(const std::vector<int32_t> & prompt_ids,
+                             Checkpoint checkpoint) {
+    return adopt(load(prompt_ids), checkpoint);
 }
 
 void DiskPrefixCache::for_each_aux(
@@ -1217,13 +1221,13 @@ bool DiskPrefixCache::save_async(OwnedSnapshot snap,
     return true;
 }
 
-bool DiskPrefixCache::save(int slot, const std::vector<int32_t> & prompt_ids,
+bool DiskPrefixCache::save(Checkpoint checkpoint, const std::vector<int32_t> & prompt_ids,
                            const std::string & aux) {
     if (disabled()) return false;
-    learn_layout(slot);
+    learn_layout(checkpoint);
     if (disabled()) return false;
     if ((int)prompt_ids.size() < config_.min_tokens) return false;
-    const auto ref = backend_.snapshot_ref(slot);
+    const auto ref = store_.ref(checkpoint);
     if (!ref.ctx) return false;
     // Pooled snapshots keep KV in a pager blob that is not a ggml tensor in
     // ref.ctx; a file written from ref.ctx would restore with no KV.
@@ -1352,7 +1356,7 @@ DiskPrefixCache::DrainResult DiskPrefixCache::drain(double max_seconds) {
 
 // ─── Continued checkpoints ──────────────────────────────────────────────
 
-bool DiskPrefixCache::maybe_store_continued(int slot,
+bool DiskPrefixCache::maybe_store_continued(Checkpoint checkpoint,
                                             const std::vector<int32_t> & all_tokens,
                                             int cur_pos) {
     if (disabled()) return false;
@@ -1370,7 +1374,7 @@ bool DiskPrefixCache::maybe_store_continued(int slot,
     if (cur_pos > (int)all_tokens.size()) return false;
 
     std::vector<int32_t> prefix(all_tokens.begin(), all_tokens.begin() + cur_pos);
-    bool ok = save(slot, prefix);
+    bool ok = save(checkpoint, prefix);
     if (ok) {
         continued_last_store_pos_ = target;
         std::fprintf(stderr, "[disk-cache] continued checkpoint at %d tokens\n", cur_pos);

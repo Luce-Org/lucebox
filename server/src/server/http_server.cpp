@@ -2281,12 +2281,13 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     , chat_codec_(make_chat_codec(server_chat_codec(config)))
     , prefix_cache_(config.prefix_cache_cap, tokenizer,
           resolve_prefix_cache_budget(config, engine.backend()).bytes)
+    , checkpoints_(engine.backend())
     , disk_cache_({config.disk_cache_dir,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
                    config.disk_cache_continued_interval,
                    config.disk_cache_cold_max_tokens,
-                   disk_cache_ttl_seconds(config.disk_cache_ttl_hours)}, backend_)
+                   disk_cache_ttl_seconds(config.disk_cache_ttl_hours)}, checkpoints_)
 {
     if (!config_.chat_codec.empty() && !chat_codec_) {
         throw std::invalid_argument("unknown chat codec: " + config_.chat_codec);
@@ -4352,8 +4353,8 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
 
 namespace {
 
-// Disk-cache staging lives above both PrefixCache pools.
-constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
+// PrefixCache still hands out slot numbers; payload calls take checkpoints.
+Checkpoint checkpoint_of(int cache_slot) { return Checkpoint::of_cache_slot(cache_slot); }
 
 
 // Prompt preparation applies exactly one compression policy: FlowKV for
@@ -6306,17 +6307,18 @@ int HttpServer::ram_restorable_prefix_tokens(
     // The snapshot the generation path would restore, if any; the backend then
     // says what a restore really skips (a KVFlash live session can cover more,
     // or a pooled snapshot less, than the snapshot itself holds).
-    int snapshot_slot = -1;
+    Checkpoint snapshot;
     int snapshot_tokens = 0;
     int limit = prefix_cache_.disabled() ? 0 : (int) prompt.size();
     while (limit > 0) {
         const auto [slot, length] =
             prefix_cache_.lookup_candidate(prompt, limit);
         if (slot < 0 || length <= 0) break;
-        if (backend_.snapshot_used(slot)) {
-            const int position = backend_.snapshot_cur_pos(slot);
+        const Checkpoint candidate = checkpoint_of(slot);
+        if (checkpoints_.used(candidate)) {
+            const int position = checkpoints_.position(candidate);
             if (position > 0) {
-                snapshot_slot = slot;
+                snapshot = candidate;
                 snapshot_tokens = (std::min)(length, position);
                 break;
             }
@@ -6325,7 +6327,7 @@ int HttpServer::ram_restorable_prefix_tokens(
         // generation path invalidates it when it gets there.
         limit = length - 1;
     }
-    return backend_.restorable_prefix(prompt, snapshot_slot, snapshot_tokens);
+    return checkpoints_.restorable_prefix(prompt, snapshot, snapshot_tokens);
 }
 
 json HttpServer::pflash_failure_counters_json() const {
@@ -8235,8 +8237,8 @@ bool HttpServer::forward_upstream(
 std::vector<int> HttpServer::request_restore_points(const std::vector<int32_t> & prompt,
                                                     std::initializer_list<int> cuts) const {
     return prefix_restore_points(prompt, prefix_cache_.chat_markers(), cuts,
-        /*drop_last_boundary=*/!backend_.prefill_cuts_at_restore_points(),
-        backend_.restore_point_spacing());
+        /*drop_last_boundary=*/!checkpoints_.prefill_cuts_at_restore_points(),
+        checkpoints_.restore_point_spacing());
 }
 
 // Cache lookup and snapshot preparation form one lifecycle; confirmation is
@@ -8312,9 +8314,9 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     }
 
     GenerationCacheState cache;
-    cache.cache_slot = prepared.full_cache_hit_slot;
+    cache.restore = checkpoint_of(prepared.full_cache_hit_slot);
     cache.prefix_len = prepared.full_cache_hit_len;
-    cache.using_restore = cache.cache_slot >= 0;
+    cache.using_restore = cache.restore.valid();
     cache.disk_policy = req.disk_cache_policy;
     cache.full_snap_key_effective = ppp_rewrote;
 
@@ -8325,7 +8327,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             ppp_rewrote ? effective_prompt : req.prompt_tokens;
         auto [full_slot, full_len] = prefix_cache_.lookup_full(full_key);
         if (full_slot >= 0) {
-            cache.cache_slot = full_slot;
+            cache.restore = checkpoint_of(full_slot);
             cache.prefix_len = full_len;
             cache.using_restore = true;
             if (prepared.compressed) {
@@ -8340,14 +8342,14 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         const auto [inline_slot, inline_len] = prefix_cache_.lookup_candidate(
             effective_prompt, (int) effective_prompt.size());
         if (inline_slot < 0) break;
-        if (!backend_.snapshot_used(inline_slot)) {
+        if (!checkpoints_.used(checkpoint_of(inline_slot))) {
             forget_inline_slot_metadata(inline_slot);
             prefix_cache_.invalidate_inline_snap(inline_slot);
             continue;
         }
         prefix_cache_.record_inline_hit(
             inline_slot, inline_len, effective_prompt.size());
-        cache.cache_slot = inline_slot;
+        cache.restore = checkpoint_of(inline_slot);
         cache.prefix_len = inline_len;
         cache.using_restore = true;
     }
@@ -8453,24 +8455,24 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             std::vector<int32_t> prefix_tokens(
                 effective_prompt.begin(),
                 effective_prompt.begin() + lookup_length);
-            if (!disk_cache_.lookup(prefix_tokens, kDiskStagingSlot)) continue;
+            if (!disk_cache_.lookup(prefix_tokens, checkpoints_.staging())) continue;
 
-            const int hit_pos = backend_.snapshot_cur_pos(kDiskStagingSlot);
+            const int hit_pos = checkpoints_.position(checkpoints_.staging());
             if (hit_pos <= 0 || hit_pos > (int) effective_prompt.size()) {
                 std::fprintf(stderr,
                     "[disk-cache] ignoring invalid hit pos=%d prompt=%zu\n",
                     hit_pos, effective_prompt.size());
-                backend_.snapshot_free(kDiskStagingSlot);
+                checkpoints_.free(checkpoints_.staging());
                 continue;
             }
-            cache.cache_slot = kDiskStagingSlot;
+            cache.restore = checkpoints_.staging();
             cache.prefix_len = hit_pos;
             cache.using_restore = true;
             cache.disk_hit = true;
             std::fprintf(stderr,
                 "[disk-cache] hit policy=%s len=%d slot=%d pos=%d (RAM had %d)\n",
                 disk_prefix_cache_policy_name(cache.disk_policy).c_str(),
-                lookup_length, kDiskStagingSlot, cache.prefix_len,
+                lookup_length, checkpoints_.staging().cache_slot(), cache.prefix_len,
                 ram_prefix_len);
             break;
         }
@@ -8489,21 +8491,20 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             effective_prompt.begin(),
             effective_prompt.begin() + selected_boundary);
         scoped_request.n_gen = 0;
-        scoped_request.snap_slot = kDiskStagingSlot;
-        scoped_request.snap_pos = selected_boundary;
+        checkpoints_.bind_capture(scoped_request, checkpoints_.staging(), selected_boundary);
         scoped_request.restore_points = prefix_restore_points(
             scoped_request.prompt, prefix_cache_.chat_markers(), {forced_cut},
-            false, backend_.restore_point_spacing());
+            false, checkpoints_.restore_point_spacing());
         DaemonIO scoped_io;
         scoped_io.stream_fd = -1;
         const auto scoped_result =
             backend_.generate(scoped_request, scoped_io);
         if (scoped_result.ok() &&
-            backend_.snapshot_used(kDiskStagingSlot)) {
-            disk_cache_.learn_layout(kDiskStagingSlot);
+            checkpoints_.used(checkpoints_.staging())) {
+            disk_cache_.learn_layout(checkpoints_.staging());
             const bool saved =
-                disk_cache_.save(kDiskStagingSlot, scoped_request.prompt);
-            cache.cache_slot = kDiskStagingSlot;
+                disk_cache_.save(checkpoints_.staging(), scoped_request.prompt);
+            cache.restore = checkpoints_.staging();
             cache.prefix_len = selected_boundary;
             cache.using_restore = true;
             cache.disk_hit = true;
@@ -8511,7 +8512,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
                 "[disk-cache] scoped prefix %s, restoring from %d\n",
                 saved ? "saved" : "staged", selected_boundary);
         } else {
-            backend_.snapshot_free(kDiskStagingSlot);
+            checkpoints_.free(checkpoints_.staging());
         }
     }
 
@@ -8529,25 +8530,25 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         cache.using_restore ? pre_overwrite_prefix_len : 0;
     if (cache.using_restore) {
         const int snapshot_length =
-            backend_.snapshot_cur_pos(cache.cache_slot);
+            checkpoints_.position(cache.restore);
         if (snapshot_length <= 0 ||
             snapshot_length > (int) effective_prompt.size()) {
             std::fprintf(stderr,
                 "[pc] slot=%d invalid snapshot pos=%d prompt=%zu — treating as miss\n",
-                cache.cache_slot, snapshot_length, effective_prompt.size());
+                cache.restore.cache_slot(), snapshot_length, effective_prompt.size());
             if (cache.disk_hit) {
-                backend_.snapshot_free(kDiskStagingSlot);
+                checkpoints_.free(checkpoints_.staging());
             } else {
                 // A memory-cache key whose backend snapshot disappeared
                 // must not remain discoverable on every later request.
                 // Inline and full caches use disjoint slot ranges, so
                 // invalidating both ownership tables is unambiguous.
-                forget_inline_slot_metadata(cache.cache_slot);
-                backend_.snapshot_free(cache.cache_slot);
-                prefix_cache_.invalidate_inline_snap(cache.cache_slot);
-                prefix_cache_.abort_full_snap(cache.cache_slot);
+                forget_inline_slot_metadata(cache.restore.cache_slot());
+                checkpoints_.free(cache.restore);
+                prefix_cache_.invalidate_inline_snap(cache.restore.cache_slot());
+                prefix_cache_.abort_full_snap(cache.restore.cache_slot());
             }
-            cache.cache_slot = -1;
+            cache.restore = {};
             cache.prefix_len = 0;
             cache.using_restore = false;
             cache.disk_hit = false;
@@ -8580,22 +8581,21 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
                 effective_prompt.begin(),
                 effective_prompt.begin() + cold_boundary);
             cold_request.n_gen = 0;
-            cold_request.snap_slot = kDiskStagingSlot;
-            cold_request.snap_pos = cold_boundary;
+            checkpoints_.bind_capture(cold_request, checkpoints_.staging(), cold_boundary);
             cold_request.restore_points = prefix_restore_points(
                 cold_request.prompt, prefix_cache_.chat_markers(), {forced_cut},
-                false, backend_.restore_point_spacing());
+                false, checkpoints_.restore_point_spacing());
             DaemonIO cold_io;
             cold_io.stream_fd = -1;
             const auto cold_result = backend_.generate(cold_request, cold_io);
             if (cold_result.ok() &&
-                backend_.snapshot_used(kDiskStagingSlot)) {
-                disk_cache_.learn_layout(kDiskStagingSlot);
+                checkpoints_.used(checkpoints_.staging())) {
+                disk_cache_.learn_layout(checkpoints_.staging());
                 const std::vector<int32_t> prefix_tokens(
                     effective_prompt.begin(),
                     effective_prompt.begin() + cold_boundary);
-                disk_cache_.save(kDiskStagingSlot, prefix_tokens);
-                cache.cache_slot = kDiskStagingSlot;
+                disk_cache_.save(checkpoints_.staging(), prefix_tokens);
+                cache.restore = checkpoints_.staging();
                 cache.prefix_len = cold_boundary;
                 cache.using_restore = true;
                 cache.disk_hit = true;
@@ -8605,7 +8605,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
                     "[disk-cache] cold prefix saved, restoring from %d\n",
                     cold_boundary);
             } else {
-                backend_.snapshot_free(kDiskStagingSlot);
+                checkpoints_.free(checkpoints_.staging());
             }
         }
     }
@@ -8618,12 +8618,12 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         // from: the guard below would cancel it, pinning the restore point at
         // the deepest slot on linearly-growing conversations.
         const int restore_source_slot =
-            cache.using_restore ? cache.cache_slot : -1;
+            cache.using_restore ? cache.restore.cache_slot() : -1;
         // Prefill resumes at the backend's restored position, and a save
         // lands at least one snapshot step past it.
         const int reachable_from =
             (cache.using_restore ? cache.prefix_len : 0) +
-            backend_.snapshot_granularity();
+            checkpoints_.granularity();
         cache.snap_reservation = prefix_cache_.reserve_inline_snap(
             effective_prompt,
             cache.using_restore ? logical_prefix_len : 0,
@@ -8631,20 +8631,19 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             forced_cut,
             restore_source_slot,
             [this](int target_cut) {
-                return backend_.snapshot_bytes_estimate(target_cut);
+                return checkpoints_.estimate_bytes(target_cut);
             },
-            reachable_from, backend_.restore_point_spacing());
-        cache.snap_slot = cache.snap_reservation.slot();
+            reachable_from, checkpoints_.restore_point_spacing());
+        cache.snap = checkpoint_of(cache.snap_reservation.slot());
         cache.snap_cut = cache.snap_reservation.target_cut();
     };
     auto prepare_full = [&]() {
         const auto & full_key = cache.full_snap_key_effective
             ? effective_prompt : req.prompt_tokens;
-        cache.full_snap_slot = prefix_cache_.prepare_full_snap(full_key);
-        if (cache.full_snap_slot >= 0) {
+        cache.full_snap = checkpoint_of(prefix_cache_.prepare_full_snap(full_key));
+        if (cache.full_snap.valid()) {
             cache.full_snap_pos = (int) effective_prompt.size();
-            generate_request.snap_slot = cache.full_snap_slot;
-            generate_request.snap_pos = cache.full_snap_pos;
+            checkpoints_.bind_capture(generate_request, cache.full_snap, cache.full_snap_pos);
             cache.full_snap_prepared = true;
         }
     };
@@ -8661,7 +8660,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     bool skip_inline = !keep_checkpoints;
     if (keep_checkpoints && !req.tool_checks_pass &&
         cache.using_restore && !cache.disk_hit && req.ends_with_tool_result &&
-        agent_turn_cache_slots_.count(cache.cache_slot)) {
+        agent_turn_cache_slots_.count(cache.restore.cache_slot())) {
         constexpr int kAgentFallbackStride = 2048;
         const auto boundaries = find_all_boundaries(
             effective_prompt, prefix_cache_.chat_markers());
@@ -8673,13 +8672,13 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     if (!skip_inline && (prefer_inline_snap || cache.using_restore)) {
         prepare_inline();
     }
-    if (keep_checkpoints && !cache.using_restore && cache.snap_slot < 0) {
+    if (keep_checkpoints && !cache.using_restore && !cache.snap.valid()) {
         prepare_full();
     }
 
     // Full cache may be disabled or already contain this exact key. Fall
     // back to an inline snapshot when no target has been selected yet.
-    if (!skip_inline && !cache.full_snap_prepared && cache.snap_slot < 0) {
+    if (!skip_inline && !cache.full_snap_prepared && !cache.snap.valid()) {
         prepare_inline();
     }
 
@@ -8687,28 +8686,27 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     // one-slot cache there may be no independent destination for a deeper
     // checkpoint; preserving the current hit is better than invalidating
     // it before restore starts.
-    if (cache.using_restore && cache.snap_slot == cache.cache_slot) {
+    if (cache.using_restore && cache.snap == cache.restore) {
         cache.snap_reservation.cancel();
-        cache.snap_slot = -1;
+        cache.snap = {};
         cache.snap_cut = 0;
     }
-    cache.snap_prepared = cache.snap_slot >= 0;
+    cache.snap_prepared = cache.snap.valid();
     if (cache.snap_prepared) {
-        evict_inline_slot(cache.snap_slot);
-        backend_.snapshot_free(cache.snap_slot);
-        generate_request.snap_slot = cache.snap_slot;
-        generate_request.snap_pos = cache.snap_cut;
+        evict_inline_slot(cache.snap.cache_slot());
+        checkpoints_.free(cache.snap);
+        checkpoints_.bind_capture(generate_request, cache.snap, cache.snap_cut);
     }
     if (cache.full_snap_prepared) {
-        backend_.snapshot_free(cache.full_snap_slot);
+        checkpoints_.free(cache.full_snap);
     }
 
     if (cache.using_restore && disk_cache_digest_enabled()) {
-        backend_.snapshot_flush_deferred();
+        checkpoints_.flush_deferred();
         int n_tensors = 0;
         uint64_t n_bytes = 0;
         const uint64_t digest = snapshot_state_digest(
-            backend_.snapshot_ref(cache.cache_slot), &n_tensors, &n_bytes);
+            checkpoints_.ref(cache.restore), &n_tensors, &n_bytes);
         std::fprintf(stderr,
             "[disk-cache] digest %s source=%s pos=%d tensors=%d bytes=%llu "
             "xxh64=%016llx\n",
@@ -8722,12 +8720,12 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         "snap_slot=%d snap_pos=%d full_snap_slot=%d full_snap_pos=%d\n",
         req.response_id.c_str(),
         cache.using_restore ? "true" : "false",
-        cache.cache_slot, cache.prefix_len, effective_prompt.size(),
+        cache.restore.cache_slot(), cache.prefix_len, effective_prompt.size(),
         prepared.compressed ? "true" : "false",
         disk_prefix_cache_policy_name(cache.disk_policy).c_str(),
         cache.disk_hit ? "true" : "false",
-        cache.snap_slot, cache.snap_cut,
-        cache.full_snap_slot, cache.full_snap_pos);
+        cache.snap.cache_slot(), cache.snap_cut,
+        cache.full_snap.cache_slot(), cache.full_snap_pos);
 
     if (!prefix_cache_.disabled() || !disk_cache_.disabled()) {
         generate_request.restore_points = request_restore_points(
@@ -8756,41 +8754,41 @@ void HttpServer::finalize_generation_cache(
     // A deferred restore can be consumed, or a deeper snapshot can replace
     // its source under memory pressure. Neither entry may stay discoverable.
     if (cache.using_restore && !cache.disk_hit &&
-        !backend_.snapshot_used(cache.cache_slot)) {
-        forget_inline_slot_metadata(cache.cache_slot);
-        prefix_cache_.invalidate_inline_snap(cache.cache_slot);
+        !checkpoints_.used(cache.restore)) {
+        forget_inline_slot_metadata(cache.restore.cache_slot());
+        prefix_cache_.invalidate_inline_snap(cache.restore.cache_slot());
     }
 
     if (cache.full_snap_prepared) {
         if (generation_produced_output &&
-            backend_.snapshot_used(cache.full_snap_slot)) {
+            checkpoints_.used(cache.full_snap)) {
             const int saved_position =
-                backend_.snapshot_cur_pos(cache.full_snap_slot);
+                checkpoints_.position(cache.full_snap);
             if (saved_position > 0 &&
                 saved_position <= cache.full_snap_pos) {
                 const auto & full_key = cache.full_snap_key_effective
                     ? effective_prompt : req.prompt_tokens;
                 prefix_cache_.confirm_full_snap(
-                    cache.full_snap_slot, full_key, saved_position);
+                    cache.full_snap.cache_slot(), full_key, saved_position);
             } else {
-                backend_.snapshot_free(cache.full_snap_slot);
-                prefix_cache_.abort_full_snap(cache.full_snap_slot);
+                checkpoints_.free(cache.full_snap);
+                prefix_cache_.abort_full_snap(cache.full_snap.cache_slot());
             }
         } else {
-            backend_.snapshot_free(cache.full_snap_slot);
-            prefix_cache_.abort_full_snap(cache.full_snap_slot);
+            checkpoints_.free(cache.full_snap);
+            prefix_cache_.abort_full_snap(cache.full_snap.cache_slot());
         }
     }
 
     if (cache.snap_prepared) {
         if (generation_produced_output &&
-            backend_.snapshot_used(cache.snap_slot)) {
+            checkpoints_.used(cache.snap)) {
             const int saved_position =
-                backend_.snapshot_cur_pos(cache.snap_slot);
+                checkpoints_.position(cache.snap);
             if (saved_position > 0 && saved_position <= cache.snap_cut) {
                 std::fprintf(stderr,
                     "[pc] inline snapshot requested=%d saved=%d slot=%d\n",
-                    cache.snap_cut, saved_position, cache.snap_slot);
+                    cache.snap_cut, saved_position, cache.snap.cache_slot());
                 // Key the entry at the requested cut even when Qwen saved at
                 // an earlier chunk boundary. Matching the longer prefix still
                 // guarantees the saved rows, the restore resumes at the
@@ -8801,8 +8799,8 @@ void HttpServer::finalize_generation_cache(
                 evict_extra_victims(cache.snap_reservation);
                 cache.snap_reservation.commit(
                     effective_prompt,
-                    backend_.snapshot_bytes_estimate(saved_position));
-                trim_snapshots_after_commit(cache.snap_slot);
+                    checkpoints_.estimate_bytes(saved_position));
+                trim_snapshots_after_commit(cache.snap.cache_slot());
                 // The disk key is exact: it must not claim rows the snapshot
                 // lacks. A compressed prompt gets no key, except one served
                 // from a unified view: that view is kept on disk too, so the
@@ -8811,22 +8809,22 @@ void HttpServer::finalize_generation_cache(
                 // (evict_inline_slot) or at shutdown.
                 if ((!prepared.compressed || prepared.unified_view) &&
                     cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
-                    slot_tokens_[cache.snap_slot] = std::vector<int32_t>(
+                    slot_tokens_[cache.snap.cache_slot()] = std::vector<int32_t>(
                         effective_prompt.begin(),
                         effective_prompt.begin() + saved_position);
-                    note_session_slot(cache.snap_slot);
+                    note_session_slot(cache.snap.cache_slot());
                 }
             } else {
-                backend_.snapshot_free(cache.snap_slot);
+                checkpoints_.free(cache.snap);
                 cache.snap_reservation.abort();
             }
         } else {
-            backend_.snapshot_free(cache.snap_slot);
+            checkpoints_.free(cache.snap);
             cache.snap_reservation.abort();
         }
     }
 
-    if (cache.disk_hit) backend_.snapshot_free(kDiskStagingSlot);
+    if (cache.disk_hit) checkpoints_.free(checkpoints_.staging());
 
     // Long conversations get a continued checkpoint after crossing the
     // configured interval so a future turn can restore prompt plus output.
@@ -8842,11 +8840,11 @@ void HttpServer::finalize_generation_cache(
             std::vector<int32_t> all_tokens(effective_prompt);
             all_tokens.insert(
                 all_tokens.end(), result.tokens.begin(), result.tokens.end());
-            if (backend_.snapshot_save(kDiskStagingSlot)) {
-                disk_cache_.learn_layout(kDiskStagingSlot);
+            if (checkpoints_.save_now(checkpoints_.staging())) {
+                disk_cache_.learn_layout(checkpoints_.staging());
                 disk_cache_.maybe_store_continued(
-                    kDiskStagingSlot, all_tokens, final_position);
-                backend_.snapshot_free(kDiskStagingSlot);
+                    checkpoints_.staging(), all_tokens, final_position);
+                checkpoints_.free(checkpoints_.staging());
             }
         }
     }
@@ -8879,9 +8877,9 @@ bool HttpServer::persist_evicted_slot(int slot, bool persist, const char * reaso
     if (slot < 0 || !persist || disk_cache_.disabled()) return false;
     const auto key = slot_tokens_.find(slot);
     // No key: a compressed view, a non-`full` disk scope, or no snapshot.
-    if (key == slot_tokens_.end() || !backend_.snapshot_used(slot)) return false;
+    if (key == slot_tokens_.end() || !checkpoints_.used(checkpoint_of(slot))) return false;
     const auto aux = slot_aux_.find(slot);
-    OwnedSnapshot snap = backend_.snapshot_detach(slot);
+    OwnedSnapshot snap = checkpoints_.detach(checkpoint_of(slot));
     if (snap.empty()) return false;
     const int pos = snap.cur_pos();
     const bool queued = disk_cache_.save_async(
@@ -8908,7 +8906,7 @@ void HttpServer::evict_extra_victims(
         const PrefixCache::InlineReservation & reservation) {
     for (const int slot : reservation.extra_victim_slots()) {
         evict_inline_slot(slot);
-        backend_.snapshot_free(slot);
+        checkpoints_.free(checkpoint_of(slot));
     }
 }
 
@@ -9036,7 +9034,7 @@ void HttpServer::trim_snapshots_after_commit(int slot) {
     const auto release = [this](const std::vector<int> & slots) {
         for (const int released : slots) {
             forget_inline_slot_metadata(released);
-            backend_.snapshot_free(released);
+            checkpoints_.free(checkpoint_of(released));
         }
     };
     release(prefix_cache_.prune_superseded_ancestors(slot));
@@ -9045,7 +9043,7 @@ void HttpServer::trim_snapshots_after_commit(int slot) {
     for (size_t i = 0; i < evicted.size(); ++i) {
         persist_evicted_slot(evicted[i], persist[i], "ram eviction");
         forget_inline_slot_metadata(evicted[i]);
-        backend_.snapshot_free(evicted[i]);
+        checkpoints_.free(checkpoint_of(evicted[i]));
     }
 }
 
@@ -9071,7 +9069,7 @@ void HttpServer::publish_memory_report() {
     json slots = json::array();
     uint64_t host_bytes = 0, device_bytes = 0;
     for (const auto & snap : report.snapshots) {
-        const char * kind = snap.slot == kDiskStagingSlot ? "disk_staging"
+        const char * kind = checkpoint_of(snap.slot) == checkpoints_.staging() ? "disk_staging"
             : snap.slot >= prefix_slots ? "prefill_cache"
             : agent_turn_cache_slots_.count(snap.slot) ? "agent_turn"
             : "prefix";
@@ -9160,13 +9158,13 @@ bool HttpServer::save_generated_turn(
     // Keep this request's own checkpoints: they are the fallback when the
     // next request diverges inside the generated turn. A live restore
     // consumes its source, which leaves nothing to keep in that slot.
-    const int keep_slot = cache.snap_prepared ? cache.snap_slot
+    const int keep_slot = cache.snap_prepared ? cache.snap.cache_slot()
         : cache.using_restore && !cache.disk_hit &&
-          backend_.snapshot_used(cache.cache_slot) ? cache.cache_slot : -1;
+          checkpoints_.used(cache.restore) ? cache.restore.cache_slot() : -1;
     auto reservation = prefix_cache_.reserve_inline_snap(
         canonical, prompt_len, false, matched, keep_slot,
         [this](int target_cut) {
-            return backend_.snapshot_bytes_estimate(target_cut);
+            return checkpoints_.estimate_bytes(target_cut);
         });
     if (!reservation.active() || reservation.target_cut() != matched) {
         const auto stats = prefix_cache_.stats();
@@ -9179,29 +9177,29 @@ bool HttpServer::save_generated_turn(
     }
     const int slot = reservation.slot();
     evict_inline_slot(slot);
-    backend_.snapshot_free(slot);
+    checkpoints_.free(checkpoint_of(slot));
     // The next request usually continues this state, so the backend may
     // keep it live instead of copying it out.
-    const bool saved = backend_.snapshot_save_deferred(slot);
-    const int saved_pos = saved ? backend_.snapshot_cur_pos(slot) : 0;
+    const bool saved = checkpoints_.save_deferred(checkpoint_of(slot));
+    const int saved_pos = saved ? checkpoints_.position(checkpoint_of(slot)) : 0;
     if (saved_pos <= prompt_len || saved_pos > matched) {
         std::fprintf(stderr,
             "[agent-turn-cache] generated turn not saved: snapshot slot=%d "
             "saved=%d pos=%d outside (prompt=%d, prefix=%d]\n",
             slot, saved ? 1 : 0, saved_pos, prompt_len, matched);
-        backend_.snapshot_free(slot);
+        checkpoints_.free(checkpoint_of(slot));
         reservation.abort();
         return false;
     }
     evict_extra_victims(reservation);
     reservation.commit_at(
-        canonical, saved_pos, backend_.snapshot_bytes_estimate(saved_pos));
+        canonical, saved_pos, checkpoints_.estimate_bytes(saved_pos));
     std::vector<bool> persist;
     const auto evicted = prefix_cache_.enforce_resident_budget(slot, &persist);
     for (size_t i = 0; i < evicted.size(); ++i) {
         persist_evicted_slot(evicted[i], persist[i], "ram eviction");
         forget_inline_slot_metadata(evicted[i]);
-        backend_.snapshot_free(evicted[i]);
+        checkpoints_.free(checkpoint_of(evicted[i]));
     }
     if (cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
         slot_tokens_[slot] = std::vector<int32_t>(
@@ -9379,8 +9377,8 @@ void HttpServer::remember_agent_turn(
     int source_slot = -1;
     int source_pos = 0;
     auto consider_source = [&](int slot) {
-        if (slot < 0 || !backend_.snapshot_used(slot)) return;
-        const int pos = backend_.snapshot_cur_pos(slot);
+        if (slot < 0 || !checkpoints_.used(checkpoint_of(slot))) return;
+        const int pos = checkpoints_.position(checkpoint_of(slot));
         if (pos <= source_pos ||
             !http_detail::canonical_turn_matches_checkpoint(
                 prepared.tokens, canonical_tokens, pos)) {
@@ -9389,8 +9387,8 @@ void HttpServer::remember_agent_turn(
         source_slot = slot;
         source_pos = pos;
     };
-    if (cache.using_restore) consider_source(cache.cache_slot);
-    if (cache.snap_prepared) consider_source(cache.snap_slot);
+    if (cache.using_restore) consider_source(cache.restore.cache_slot());
+    if (cache.snap_prepared) consider_source(cache.snap.cache_slot());
     if (source_slot < 0) {
         std::fprintf(stderr,
             "[agent-turn-cache] no compatible prefix checkpoint; skipped\n");
@@ -9403,7 +9401,7 @@ void HttpServer::remember_agent_turn(
     auto reservation = prefix_cache_.reserve_inline_snap(
         canonical_tokens, source_pos, false, canonical_end, source_slot,
         [this](int target_cut) {
-            return backend_.snapshot_bytes_estimate(target_cut);
+            return checkpoints_.estimate_bytes(target_cut);
         });
     // No safe victim (only the restore source and/or protected pins remain)
     // or no useful boundary: nothing to replay into.
@@ -9416,25 +9414,24 @@ void HttpServer::remember_agent_turn(
         return;
     }
     evict_inline_slot(slot);
-    backend_.snapshot_free(slot);
+    checkpoints_.free(checkpoint_of(slot));
 
     GenerateRequest replay;
     replay.prompt = canonical_tokens;
     replay.n_gen = 0;
-    replay.snap_slot = slot;
-    replay.snap_pos = canonical_end;
+    checkpoints_.bind_capture(replay, checkpoint_of(slot), canonical_end);
     DaemonIO replay_io;
     replay_io.should_cancel = [this]() { return has_pending_jobs(); };
-    const GenerateResult replay_result = backend_.restore_and_generate(
-        source_slot, replay, replay_io);
+    const GenerateResult replay_result = checkpoints_.restore_and_generate(
+        checkpoint_of(source_slot), replay, replay_io);
     backend_.release_scratch();
-    const int saved_pos = replay_result.ok() && backend_.snapshot_used(slot)
-        ? backend_.snapshot_cur_pos(slot) : 0;
+    const int saved_pos = replay_result.ok() && checkpoints_.used(checkpoint_of(slot))
+        ? checkpoints_.position(checkpoint_of(slot)) : 0;
     if (saved_pos > source_pos && saved_pos <= canonical_end) {
         evict_extra_victims(reservation);
         reservation.commit_at(
             canonical_tokens, saved_pos,
-            backend_.snapshot_bytes_estimate(saved_pos));
+            checkpoints_.estimate_bytes(saved_pos));
         trim_snapshots_after_commit(slot);
         canonical_tokens.resize((size_t) saved_pos);
         if (cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
@@ -9448,7 +9445,7 @@ void HttpServer::remember_agent_turn(
             slot, saved_pos, source_slot, source_pos,
             canonical_end - source_pos);
     } else {
-        backend_.snapshot_free(slot);
+        checkpoints_.free(checkpoint_of(slot));
         reservation.abort();
     }
 }
@@ -9817,7 +9814,7 @@ void HttpServer::process_job(ServerJob * job) {
     GenerationCacheState cache =
         prepare_generation_cache(req, prepared, gen_req);
     const bool using_restore = cache.using_restore;
-    const int cache_slot = cache.cache_slot;
+    const Checkpoint restore_from = cache.restore;
     const int prefix_len = cache.prefix_len;
 
     DaemonIO io;
@@ -9851,7 +9848,7 @@ void HttpServer::process_job(ServerJob * job) {
 
     GenerateResult result;
     if (using_restore) {
-        result = backend_.restore_and_generate(cache_slot, gen_req, io);
+        result = checkpoints_.restore_and_generate(restore_from, gen_req, io);
     } else {
         result = backend_.generate(gen_req, io);
     }
@@ -9888,7 +9885,7 @@ void HttpServer::process_job(ServerJob * job) {
     // Finalizing may prune the restore source, and its agent-turn mark with
     // it, once a deeper snapshot lands.
     const bool restored_agent_turn =
-        agent_turn_cache_slots_.count(cache_slot) != 0;
+        agent_turn_cache_slots_.count(restore_from.cache_slot()) != 0;
     finalize_generation_cache(
         req, prepared, cache, result, completion_tokens,
         visible_output_seen, client_disconnected);
@@ -9919,7 +9916,7 @@ void HttpServer::process_job(ServerJob * job) {
             tok_s,
             finish.c_str(),
             using_restore ? "true" : "false",
-            cache_slot,
+            restore_from.cache_slot(),
             // The cut the backend actually made (live-session restore, or 0 after a
             // re-prefill of a snapshot it dropped), else the server's.
             luce::common::reported_prefix_len(using_restore, prefix_len, result),

@@ -32,6 +32,7 @@
 
 #include "prefix_cache.h"
 #include "common/model_backend.h"
+#include "server/kv/checkpoint_store.h"
 
 #include <array>
 #include <atomic>
@@ -164,6 +165,9 @@ struct DiskTensorEntry {
 
 class DiskPrefixCache {
 public:
+    // Snapshots are read from and adopted into `store`'s checkpoints.
+    DiskPrefixCache(const DiskCacheConfig & cfg, CheckpointStore & store);
+    // Over one backend's snapshot slots, with a store of its own (tests).
     DiskPrefixCache(const DiskCacheConfig & cfg, ModelBackend & backend);
     // Finishes the writes already queued (see drain()).
     ~DiskPrefixCache();
@@ -184,10 +188,10 @@ public:
     // when initialization fails; the disk cache disables itself in that case.
     bool init();
 
-    // Look up a prompt on disk. On hit, loads the snapshot into `slot`
-    // using backend.snapshot_adopt(). Returns true if loaded successfully.
-    // Equivalent to adopt(load(prompt_ids), slot).
-    bool lookup(const std::vector<int32_t> & prompt_ids, int slot);
+    // Look up a prompt on disk. On hit, adopts the snapshot into
+    // `checkpoint`. Returns true if loaded successfully.
+    // Equivalent to adopt(load(prompt_ids), checkpoint).
+    bool lookup(const std::vector<int32_t> & prompt_ids, Checkpoint checkpoint);
 
     // Read the snapshot keyed by exactly `prompt_ids` into host memory: from
     // the file (verifying key tokens and checksum; a bad file is deleted),
@@ -195,9 +199,9 @@ public:
     // not at all, so it may run on another thread. Empty on miss.
     OwnedSnapshot load(const std::vector<int32_t> & prompt_ids);
 
-    // Hand a loaded snapshot to the backend in `slot` (checks the layout
+    // Hand a loaded snapshot to the store in `checkpoint` (checks the layout
     // against the live model on the first hit after startup).
-    bool adopt(OwnedSnapshot snap, int slot);
+    bool adopt(OwnedSnapshot snap, Checkpoint checkpoint);
 
     // Take ownership of a snapshot that left RAM and write it in the
     // background, keyed by `prompt_ids`, with an optional auxiliary blob.
@@ -208,9 +212,10 @@ public:
     bool save_async(OwnedSnapshot snap, const std::vector<int32_t> & prompt_ids,
                     const std::string & aux = std::string());
 
-    // Queue a copy of the snapshot in `slot` (save_async); the slot keeps
-    // its own. Returns true on success (or when the entry already exists).
-    bool save(int slot, const std::vector<int32_t> & prompt_ids,
+    // Queue a copy of the snapshot in `checkpoint` (save_async); the
+    // checkpoint keeps its own. Returns true on success (or when the entry
+    // already exists).
+    bool save(Checkpoint checkpoint, const std::vector<int32_t> & prompt_ids,
               const std::string & aux = std::string());
 
     // Wait until every queued write is on disk, at most `max_seconds`
@@ -246,8 +251,8 @@ public:
     // Check if a continued checkpoint should be saved after generation.
     // `all_tokens` = prompt + generated tokens, `cur_pos` = final position.
     // If cur_pos crosses a continued-interval boundary since last save,
-    // saves a snapshot using `slot`. Returns true if a save occurred.
-    bool maybe_store_continued(int slot, const std::vector<int32_t> & all_tokens,
+    // saves the snapshot in `checkpoint`. Returns true if a save occurred.
+    bool maybe_store_continued(Checkpoint checkpoint, const std::vector<int32_t> & all_tokens,
                                int cur_pos);
 
     // Reset the continued-store tracking (call at start of each request).
@@ -285,7 +290,7 @@ public:
 
     // Learn the layout fingerprint from a live snapshot (call once after
     // first snapshot_save, before any disk operations).
-    void learn_layout(int slot);
+    void learn_layout(Checkpoint checkpoint);
 
     // Set a config/model identity salt prepended to the layout hash buffer
     // so that layout_id encodes model identity in addition to tensor structure.
@@ -304,7 +309,8 @@ public:
 
 private:
     DiskCacheConfig config_;
-    ModelBackend &  backend_;
+    std::unique_ptr<CheckpointStore> owned_store_;  // the ModelBackend constructor's
+    CheckpointStore & store_;
     std::function<uint64_t()> clock_;
     std::function<uint64_t()> free_space_;
     // Some backends support in-memory snapshots but deliberately do not
