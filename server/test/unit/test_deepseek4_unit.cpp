@@ -17,7 +17,7 @@
 #include "common/backend_ipc.h"
 #include "common/dspark_head.h"
 #include "common/layer_split_backend.h"
-#include "server/disk_prefix_cache.h"
+#include "server/kv/disk_prefix_cache.h"
 #include "deepseek4/deepseek4_snapshot.h"
 #include "common/layer_split_runtime.h"
 #include "common/layer_split_utils.h"

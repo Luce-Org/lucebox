@@ -752,9 +752,9 @@ add_library(luce_common STATIC
     src/server/pflash_unified.cpp
     src/server/response_error.cpp
     src/server/sse_emitter.cpp
-    src/server/prefix_cache.cpp
+    src/server/kv/prefix_cache.cpp
     src/server/pin_friendly_prompt.cpp
-    src/server/disk_prefix_cache.cpp
+    src/server/kv/disk_prefix_cache.cpp
     src/server/freeze_history.cpp
     # ── Jinja chat-template engine (vendored under deps/llama.cpp/common/) ──
     # Used by render_chat_template_jinja() to support --chat-template-file

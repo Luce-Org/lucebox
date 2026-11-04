@@ -12,7 +12,7 @@
 #include "common/concurrency/seq_engine.h"
 #include "common/output_constraint.h"
 #include "common/spec_acceptance.h"
-#include "parallel_prefix_txn.h"
+#include "server/kv/parallel_prefix_txn.h"
 #include "response_error.h"
 
 #include <algorithm>

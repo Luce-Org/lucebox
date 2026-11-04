@@ -30,7 +30,7 @@
 
 #pragma once
 
-#include "prefix_cache.h"
+#include "server/kv/prefix_cache.h"
 #include "common/model_backend.h"
 
 #include <array>

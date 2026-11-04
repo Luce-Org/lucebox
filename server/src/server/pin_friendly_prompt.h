@@ -8,7 +8,7 @@
 #pragma once
 
 #include "chat_template.h"
-#include "prefix_cache.h"  // ChatMarkers
+#include "server/kv/prefix_cache.h"  // ChatMarkers
 
 #include <cstdint>
 #include <string>

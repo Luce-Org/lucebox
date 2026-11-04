@@ -1,6 +1,6 @@
 // Prefix cache implementation.
 
-#include "prefix_cache.h"
+#include "server/kv/prefix_cache.h"
 #include "common/sha1.h"
 
 #include <algorithm>

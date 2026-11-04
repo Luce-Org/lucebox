@@ -526,8 +526,8 @@ cache holds no matching snapshot.
 
 | File | Role |
 |------|------|
-| `server/prefix_cache.{h,cpp}` | LRU logic, boundary detection, hashing |
-| `server/disk_prefix_cache.{h,cpp}` | Disk snapshots: file format, index, budget, TTL |
+| `server/kv/prefix_cache.{h,cpp}` | LRU logic, boundary detection, hashing |
+| `server/kv/disk_prefix_cache.{h,cpp}` | Disk snapshots: file format, index, budget, TTL |
 | `common/snapshot_backend.h` | Platform-aware snapshot backend selection |
 | `common/model_backend.h` | `snapshot_save/free/used/cur_pos` interface |
 | `qwen35/qwen35_target_graph.cpp` | `snapshot_target_cache()`, `restore_target_cache()` |

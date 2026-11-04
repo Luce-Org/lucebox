@@ -1,6 +1,6 @@
 // Disk-backed prefix cache implementation.
 
-#include "disk_prefix_cache.h"
+#include "server/kv/disk_prefix_cache.h"
 #include "common/sha1.h"
 
 #include "ggml.h"
