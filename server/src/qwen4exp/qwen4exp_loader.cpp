@@ -436,10 +436,10 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
                         Qwen4ExpWeights & out, const std::string & mtp_override, int mtp_vocab) {
     out.gfx1151 = ggml_backend_cuda_qwen4exp_supported(backend);
     out.qsa = ggml_backend_cuda_qsa_supported(backend);
-    // The expert device's too: there a gfx1151 takes its experts in device memory, not in the managed memory ggml
-    // gives a large allocation on an integrated GPU. Only the GPU reads those pages, so the kernel sees them as idle
-    // and swaps them out; the GPU then faults them back in mid-prompt (R9700 + Strix Halo: a 32K prompt took up to
-    // 58 s instead of 17 s, swapping 0.5 GB/s each way).
+    // The profile also covers the expert device, so a gfx1151 that holds the experts allocates them in device memory
+    // rather than the managed memory ggml gives a large allocation on an integrated GPU. Only the GPU reads those
+    // pages, so the kernel sees them as idle and swaps them out; the GPU then faults them back in mid-prompt
+    // (R9700 + Strix Halo: a 32K prompt took up to 58 s instead of 17 s, swapping 0.5 GB/s each way).
     const Qwen4ExpCudaScope profile(out.gfx1151 || out.expert_gfx1151);
     // Open every shard of the model; a single-file GGUF is a one-element list. An MTP sidecar
     // (e.g. MTP/mtp-*-shared-Q8_0.gguf) joins as one more shard: its blk.<n_layer> tensors resolve by name like the

@@ -107,7 +107,14 @@ int main(int argc, char ** argv) {
     std::vector<int> rows;
     for (std::string list = argc > 1 ? argv[1] : "1,4,8,64,4096"; !list.empty();) {
         const size_t comma = list.find(',');
-        rows.push_back(std::atoi(list.substr(0, comma).c_str()));
+        const std::string item = list.substr(0, comma);
+        char * end = nullptr;
+        const long n = std::strtol(item.c_str(), &end, 10);
+        if (item.empty() || *end != '\0' || n <= 0 || n > INT32_MAX) {
+            std::fprintf(stderr, "bad row count '%s': expected a comma list of positive integers\n", item.c_str());
+            return 1;
+        }
+        rows.push_back((int) n);
         list = comma == std::string::npos ? "" : list.substr(comma + 1);
     }
     ggml_backend_t backend = ggml_backend_cuda_init(0);
@@ -120,8 +127,13 @@ int main(int argc, char ** argv) {
         ggml_backend_cuda_set_graphs_disabled_override(true);
     constexpr int k = 512;
     const int shapes[] = {2048, 5120, 8192, 16384, 32768};
+    // The backend's reading of GGML_DS4_TOPK_BLOCK_RADIX: unset keeps the device default, empty or 0 is off,
+    // anything else on.
     const char * forced = std::getenv("GGML_DS4_TOPK_BLOCK_RADIX");
+    const char * kernel = !forced ? "default"
+                        : forced[0] != '\0' && std::strcmp(forced, "0") != 0 ? "block_radix" : "device_sort";
     bool all_ok = true;
+    int cases = 0;
 
     for (const int nrows : rows) {
         for (const int ncols : shapes) {
@@ -130,13 +142,17 @@ int main(int argc, char ** argv) {
             const int iterations = nrows * (size_t) ncols > ((size_t) 1 << 22) ? 5 : 50;
             const bool ran = compute_topk(backend, ncols, nrows, k, 3, iterations, run);
             std::printf("kernel=%s rows=%d ncols=%d k=%d ms=%.4f status=%s\n",
-                        forced ? (std::strcmp(forced, "1") == 0 ? "block_radix" : "device_sort") : "default",
-                        nrows, ncols, k, run.milliseconds, ran ? "ok" : "FAILED");
+                        kernel, nrows, ncols, k, run.milliseconds, ran ? "ok" : "FAILED");
             all_ok = all_ok && ran;
+            ++cases;
         }
     }
 
     ggml_backend_cuda_set_graphs_disabled_override(previous_graphs_disabled);
     ggml_backend_free(backend);
+    if (cases == 0) {
+        std::fprintf(stderr, "no case ran: every requested row count exceeds the 512 MB score cap\n");
+        return 1;
+    }
     return all_ok ? 0 : 1;
 }

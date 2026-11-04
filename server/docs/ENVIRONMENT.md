@@ -55,7 +55,7 @@ profile and the requirements checked at startup.
 | `LUCE_HIP_UMA_NO_RAM_CHECK` | unset | KILL SWITCH (burn-in, to be removed once the check has soaked): set to any value, even `0`, to let a managed (unified) buffer on an integrated GPU through even when it is larger than the available RAM (MemAvailable plus the pages the GPU driver holds for reuse) minus a reserve (1/16 of RAM, 1 to 8 GiB). By default such a buffer fails up front as out of memory: a managed allocation does not fail for lack of RAM, so a shortfall would otherwise end in the OOM killer. Inside a container, the room under its cgroup memory limit bounds the available RAM. It also turns off the bound of an integrated GPU's free memory by its own VRAM left plus the available RAM: `ggml_backend_cuda_get_device_memory` and `ggml_backend_cuda_get_device_room` (the bound with the reserve kept, which DeepSeek sizes its Strix expert stack, streamed expert cache, load check and prefill from) then report the runtime's figures, and `ggml_backend_cuda_get_uma_room`, which the Strix expert stack also reads, reports nothing. |
 | `LUCE_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |
 | `LUCE_ADAPTIVE_K_DENSE` | per-model default | CSV of MoE layers kept dense under adaptive-K (DFlash capture layers). Warned-inert on families that do not thread layer indices yet. |
-| `LUCE_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. Unset: on for CUDA (the `LUCE_MMID_GROUPED_TYPES` formats); on HIP only for Q5_1 experts on RDNA3.5 (the Strix Halo expert owner of Qwen3.8-Flash-Next, bit-exact, split decode up to +3%). =0 turns it off everywhere, =1 on for the mask on every GPU. |
+| `LUCE_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. Unset: on for CUDA (the `LUCE_MMID_GROUPED_TYPES` formats); on HIP only for Q5_1 experts on RDNA3.5 (the Strix Halo expert owner of Qwen3.8-Flash-Next, bit-exact, split decode up to +3%). =0 turns it off everywhere, =1 on for the mask on every eligible GPU (the arch and `LUCE_MMID_GROUPED_DEVICE` guards still apply). |
 | `LUCE_MMID_GROUPED_TYPES` | 71 | Grouped-kernel type mask; bit 3 (`8`) opts ROCmFP2/ROCmFP3 into the path. Bit 6 (`64`) enables Q5_0 subject to its sm_86 and projection-shape guards; `7` disables Q5_0 while retaining the previously enabled formats. Bit 7 (`128`) opts Q4_1/Q5_1 in (off by default). |
 | `LUCE_MMID_GROUPED_DEVICE` | -1 | Optional zero-based device restriction; unset/-1 applies to every eligible device. |
 | `LUCE_DS4_MOE_TP` / `LUCE_DS4_MOE_TP_INPROC` | unset | BURN-IN: enable DeepSeek4 route-owner expert parallelism in one process. Prefer the CLI: `--expert-device <backend:gpu>` sets both with the device and backend. |
@@ -97,7 +97,7 @@ profile and the requirements checked at startup.
 | `GGML_CUDA_MLA_STREAM_F32_STAGE` | enabled for maskless ratio-4 sparse prefill; unset otherwise | With F16-input streaming D512 indexed attention, convert aligned F16 pairs once while staging them in shared memory instead of repeating conversion for every head. Applies only when streaming top-k is selected automatically or through `GGML_CUDA_MLA_STREAM_TOPK` / `GGML_DS4_FA_STREAM_TOPK`. Set `0` to restore F16 staging for F16 inputs. This override does not affect the compact-order HIP F32 path. |
 | `GGML_CUDA_MLA_STREAM_FAST_EXP` | enabled for maskless ratio-4 sparse prefill; unset otherwise | With FP32-staged streaming D512 indexed attention, use the hardware exponential intrinsic for online softmax. Requires both streaming top-k selection and FP32 staging; setting this flag alone does not enable either. Set `0` to use `expf`. The compact-order HIP F32 path and other attention paths are unchanged. |
 | `GGML_CUDA_MLA_SPLIT_KV` / `GGML_DS4_FA_SPLIT_KV` | 1 on gfx1151 indexed decode; unset elsewhere | BURN-IN: =1 forces the reusable split-KV MLA schedule. Unset, empty, or =0 does not force it (the device default still applies). Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` (or legacy `GGML_DS4_FA_NO_SPLIT_KV=1`) to disable it; either kill switch overrides either force flag, while empty/=0 kill switches have no effect. |
-| `GGML_DS4_TOPK_BLOCK_RADIX` | 1 on gfx1151 and RDNA4 | BURN-IN KILL SWITCH: =0 restores hipCUB full sort for DS4-shaped 512-row top-k selection (the plain k = 512 top-k over 1025..32768 scores). Both select the same ids in the same order; the full sort keeps four copies of the scores in the pool. |
+| `GGML_DS4_TOPK_BLOCK_RADIX` | 1 on gfx1151 and RDNA4 | BURN-IN KILL SWITCH: =0 restores hipCUB full sort for every block radix top-k on HIP: the DS4-shaped k = 512 selection over 1025..32768 scores, and the tiled selection of a power-of-two k from 32 to 2048 over more than 4096 scores (the sampler's top candidates) or k = 512 over more than 32768. Both select the same ids in the same order; the full sort keeps four copies of the scores in the pool. |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | unset | DEBUG/A-B: restore the serial indexed-attention mask scan instead of the long-context HIP parallel scan. |
 | `LUCE_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
 | `LUCE_MOE_TP_*` / `LUCE_MOE_HYBRID_PREFILL_EAGER` | unset | BURN-IN: model-neutral names for common heterogeneous-MoE scheduling and kernel policy. Existing `LUCE_DS4_*` names remain compatibility aliases. |
@@ -184,6 +184,7 @@ profile and the requirements checked at startup.
 - `LUCE_CUDA_MMVQ_MOE_FP3_PACKED24` - deepseek4_backend.cpp, mmvq.cu
 - `LUCE_CUDA_MMVQ_MOE_KERNEL` - moe_hybrid_ffn_eval.cpp
 - `LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK` - mmvq.cu
+- `LUCE_CUDA_MMVQ_RDNA4_MOE` - mmvq.cu
 - `LUCE_DISABLE_DRAFT_ATTN` - draft_graph.cpp
 - `LUCE_DISABLE_DRAFT_ATTN_GATE` - draft_graph.cpp
 - `LUCE_DISABLE_DRAFT_AUX_NORMS` - draft_graph.cpp
@@ -252,6 +253,7 @@ profile and the requirements checked at startup.
 - `LUCE_MOE_TP_DYNAMIC_MAIN_SLOTS_X4` - moe_hybrid_ffn_eval.cpp
 - `LUCE_MOE_TP_DYNAMIC_ROUTE_BALANCE` - moe_hybrid_ffn_eval.cpp
 - `LUCE_QWEN35_ROCTX` - qwen35_roctx.cpp
+- `LUCE_QWEN4EXP_LOOKUP` - qwen4exp_backend.cpp
 - `LUCE_DS4_SEQ_VERIFY` - deepseek4_dspark_spec.cpp
 - `LUCE_ROCMFP2_ROW4` - rocmfp2_mix.cu
 - `LUCE_MIX_DEDUP` - rocmfp2_mix.cu, rocmfp3_mix.cu
@@ -270,7 +272,7 @@ profile and the requirements checked at startup.
 - `LUCE_DS4_VERIFY_FORCE_GRAPH_REPLAY` - deepseek4_fused_verify.inc
 - `LUCE_DS4_TOPK` - deepseek4_graph.cpp
 - `LUCE_DYN_CONV_FUSED` - draft_graph.cpp (=0 expands the DFlash2 dynamic convs instead of the fused kernel)
-- `LUCE_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp
+- `LUCE_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp, qwen4exp_backend.cpp (expert_budget_bytes_from_env)
 - `LUCE_EXPERT_BUDGET_PCT` - laguna_backend.cpp
 - `LUCE_FAST_ROLLBACK_THRESHOLD` - chain_rollback_policy.h
 - `LUCE_FEAT_RING_CAP` - dflash_feature_ring.h
