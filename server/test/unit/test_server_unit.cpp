@@ -212,14 +212,15 @@ struct SchedulerTestHarness {
             /*client_disconnected=*/false);
     }
 
-    static const std::vector<int32_t> & slot_tokens(
-            const HttpServer & server, int slot) {
-        return server.slot_tokens_.at(slot);
+    // The disk key of the entry in `slot` (empty when it has none).
+    static std::vector<int32_t> slot_tokens(const HttpServer & server, int slot) {
+        return server.prefix_cache_.entry(slot).disk_key;
     }
 
+    // Give the entry in `slot` a disk key: its first tokens.size() ids.
     static void set_slot_tokens(HttpServer & server, int slot,
-                                std::vector<int32_t> tokens) {
-        server.slot_tokens_[slot] = std::move(tokens);
+                                const std::vector<int32_t> & tokens) {
+        server.prefix_cache_.set_disk_key(slot, (int)tokens.size());
     }
 
     static DiskPrefixCache & disk_cache(HttpServer & server) {
@@ -236,7 +237,7 @@ struct SchedulerTestHarness {
     // What prepare_generation_cache does with a reservation's slot before
     // the new snapshot overwrites it.
     static void evict_inline_slot(HttpServer & server, int slot) {
-        server.evict_inline_slot(slot);
+        server.kv_cache_.evict(slot, "ram eviction");
         server.backend_.snapshot_free(slot);
     }
 
@@ -249,11 +250,11 @@ struct SchedulerTestHarness {
     }
 
     static void mark_agent_turn(HttpServer & server, int slot) {
-        server.agent_turn_cache_slots_.insert(slot);
+        server.prefix_cache_.mark_agent_turn(slot);
     }
 
     static bool is_agent_turn(const HttpServer & server, int slot) {
-        return server.agent_turn_cache_slots_.count(slot) != 0;
+        return server.prefix_cache_.agent_turn(slot);
     }
 
     // One HTTP request through the serving path: parsing, rendering, the
@@ -6773,7 +6774,8 @@ TEST_CASE(ServerUnitFixture, test_budget_enforced_after_shorter_commit) {
     TEST_ASSERT(cache.prune_superseded_ancestors(slot).empty());
     TEST_ASSERT(cache.stats().resident_bytes == 320);
 
-    TEST_ASSERT(cache.enforce_resident_budget(slot) == std::vector<int>({1}));
+    const auto evicted = cache.enforce_resident_budget(slot);
+    TEST_ASSERT(evicted.size() == 1 && evicted[0].slot == 1);
     TEST_ASSERT(cache.stats().resident_bytes == 170);
     TEST_ASSERT(cache.lookup(prompt).first == slot);
     // Within budget there is nothing to evict.
@@ -11687,6 +11689,9 @@ TEST_CASE(ServerUnitFixture, test_props_memory_report) {
     TEST_ASSERT(memory["snapshots"]["slots"].is_array());
     TEST_ASSERT(memory["snapshots"]["slots"].empty());
 
+    // The agent-turn mark belongs to the index entry in slot 1.
+    SchedulerTestHarness::prefix_cache(server).confirm_inline_snap(
+        1, 4, std::vector<int32_t>{1, 2, 3, 4});
     SchedulerTestHarness::mark_agent_turn(server, 1);
     SchedulerTestHarness::publish_memory_report(server);
     memory = SchedulerTestHarness::memory_json(server);
@@ -15928,6 +15933,99 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_persist_on_evict_skips_edit_backu
 
 // Single-sequence path: a snapshot the resident budget evicts is written to
 // disk in the background and a later request restores it from there.
+
+// An entry's disk key, aux blob and agent-turn mark live and die with it:
+// every way an entry leaves the index drops them, and the eviction records
+// carry them out (the disk writer needs them after the entry is gone).
+TEST_CASE(ServerUnitFixture, test_prefix_cache_entry_state_follows_the_entry) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::vector<int32_t> head = {1, 100};
+    const std::vector<int32_t> turn1 = {1, 100, 3, 101};
+    const std::vector<int32_t> turn2 = {1, 100, 3, 101, 4, 102};
+    const std::vector<int32_t> turn3 = {1, 100, 3, 101, 4, 102, 3, 103};
+    const std::vector<int32_t> other = {1, 100, 3, 105};
+    const auto mark = [](PrefixCache & cache, int slot) {
+        cache.set_disk_key(slot, 3);
+        cache.set_aux(slot, "replay");
+        cache.mark_agent_turn(slot);
+    };
+    const auto clean = [](const PrefixCache & cache, int slot) {
+        const auto e = cache.entry(slot);
+        return !cache.has_disk_key(slot) && !cache.agent_turn(slot) &&
+               e.disk_key.empty() && e.aux.empty();
+    };
+
+    PrefixCache cache(8, tokenizer, 0);
+    cache.confirm_inline_snap(0, (int)turn1.size(), turn1);
+    TEST_ASSERT(clean(cache, 0));
+    mark(cache, 0);
+    const auto e = cache.entry(0);
+    TEST_ASSERT(e.slot == 0 && e.ids == turn1 && e.aux == "replay");
+    TEST_ASSERT(e.disk_key == std::vector<int32_t>(turn1.begin(), turn1.begin() + 3));
+    TEST_ASSERT(cache.has_disk_key(0) && cache.agent_turn(0));
+    cache.set_disk_key(0, 99);  // a disk key never runs past the entry's ids
+    TEST_ASSERT(cache.entry(0).disk_key == turn1);
+    cache.mark_agent_turn(5);   // no entry there: nothing to mark
+    TEST_ASSERT(!cache.agent_turn(5) && cache.entry(5).slot == -1);
+
+    // A commit into the same slot starts the new entry clean.
+    cache.confirm_inline_snap(0, (int)other.size(), other);
+    TEST_ASSERT(clean(cache, 0));
+    // An invalidation drops it.
+    mark(cache, 0);
+    cache.invalidate_inline_snap(0);
+    TEST_ASSERT(cache.entry(0).slot == -1 && clean(cache, 0));
+
+    // The shutdown flush sees it.
+    cache.confirm_inline_snap(1, (int)turn1.size(), turn1);
+    mark(cache, 1);
+    const auto all = cache.entries_for_shutdown();
+    TEST_ASSERT(all.size() == 1 && all[0].slot == 1 && all[0].aux == "replay");
+    TEST_ASSERT(all[0].disk_key.size() == 3 && all[0].persist);
+
+    // Pruning a superseded turn drops it.
+    PrefixCache pruned(8, tokenizer, 0);
+    pruned.confirm_inline_snap(0, (int)head.size(), head);
+    pruned.confirm_inline_snap(1, (int)turn1.size(), turn1);
+    pruned.confirm_inline_snap(2, (int)turn2.size(), turn2);
+    mark(pruned, 1);
+    pruned.confirm_inline_snap(3, (int)turn3.size(), turn3);
+    TEST_ASSERT(pruned.prune_superseded_ancestors(3) == std::vector<int>({1}));
+    TEST_ASSERT(pruned.entry(1).slot == -1 && clean(pruned, 1));
+
+    // A budget eviction returns the entry as it was, then drops it.
+    PrefixCache budget(8, tokenizer, 150);
+    budget.confirm_inline_snap(0, (int)head.size(), head, false, 100);
+    mark(budget, 0);
+    budget.confirm_inline_snap(1, (int)other.size(), other, false, 100);
+    const auto evicted = budget.enforce_resident_budget(1);
+    TEST_ASSERT(evicted.size() == 1 && evicted[0].slot == 0);
+    TEST_ASSERT(evicted[0].disk_key == head && evicted[0].aux == "replay");
+    TEST_ASSERT(budget.entry(0).slot == -1 && clean(budget, 0));
+
+    // A commit that replaces an entry logs it with its state (the
+    // concurrent path writes it from that record).
+    PrefixCache recorded(8, tokenizer, 0);
+    recorded.set_record_evictions(true);
+    recorded.confirm_inline_snap(0, (int)turn1.size(), turn1);
+    mark(recorded, 0);
+    recorded.confirm_inline_snap(0, (int)other.size(), other);
+    const auto log = recorded.take_evicted();
+    TEST_ASSERT(log.size() == 1 && log[0].slot == 0 && log[0].ids == turn1);
+    TEST_ASSERT(log[0].aux == "replay" && log[0].disk_key.size() == 3);
+    TEST_ASSERT(clean(recorded, 0));
+
+    // A capture that fails after taking the slot drops the victim's state.
+    PrefixCache one(1, tokenizer, 0);
+    one.confirm_inline_snap(0, (int)turn1.size(), turn1);
+    mark(one, 0);
+    auto reservation = one.reserve_inline_snap(other, 0, false, (int)other.size());
+    TEST_ASSERT(reservation.active() && reservation.slot() == 0);
+    reservation.abort();
+    TEST_ASSERT(one.entry(0).slot == -1 && clean(one, 0));
+}
 TEST_CASE(ServerUnitFixture, test_disk_session_ram_eviction_writes_and_restores) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;

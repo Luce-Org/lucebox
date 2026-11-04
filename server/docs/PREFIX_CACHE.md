@@ -526,10 +526,11 @@ cache holds no matching snapshot.
 
 | File | Role |
 |------|------|
-| `server/prefix_cache.{h,cpp}` | LRU logic: entries, reservations, eviction, resident budget |
+| `server/prefix_cache.{h,cpp}` | LRU logic: entries and their state (disk key, aux blob, agent-turn mark), reservations, eviction, resident budget |
 | `server/kv/chat_boundaries.{h,cpp}` | Chat markers and boundary detection |
 | `server/kv/cuts.{h,cpp}` | Capture cut and restore points |
 | `server/kv/prefix_hash.{h,cpp}` | Prefix keys (truncated SHA-1 of the token ids) |
+| `server/kv/kv_cache.{h,cpp}` | `KvCache`: what happens when a checkpoint leaves RAM (written to disk when it should be kept, then freed), and the shutdown flush, for both serving paths |
 | `server/kv/checkpoint_store.{h,cpp}` | `Checkpoint` handles and the stores every request-time snapshot call goes through (`BackendCheckpoints`, `EngineCheckpoints`), including the disk-staging checkpoint |
 | `server/disk_prefix_cache.{h,cpp}` | Disk snapshots: file format, index, budget, TTL |
 | `common/snapshot_backend.h` | Platform-aware snapshot backend selection |

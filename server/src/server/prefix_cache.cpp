@@ -966,9 +966,9 @@ std::vector<int> PrefixCache::prune_superseded_ancestors(
     return pruned;
 }
 
-std::vector<int> PrefixCache::enforce_resident_budget(
-        int keep_slot, std::vector<bool> * persist) {
-    std::vector<int> evicted;
+std::vector<PrefixCache::Evicted> PrefixCache::enforce_resident_budget(
+        int keep_slot) {
+    std::vector<Evicted> evicted;
     if (disabled_ || max_resident_bytes_ == 0) return evicted;
     const size_t before = resident_bytes_;
     while (resident_bytes_ > max_resident_bytes_) {
@@ -979,9 +979,7 @@ std::vector<int> PrefixCache::enforce_resident_budget(
         // or a pinned ancestor of it.
         const int victim = pick_evict_victim(keep);
         if (victim < 0) break;
-        const int slot = entries_[(size_t)victim].slot;
-        evicted.push_back(slot);
-        if (persist) persist->push_back(persist_on_evict(slot));
+        evicted.push_back(evicted_record(entries_[(size_t)victim]));
         record_eviction(victim);
         erase_inline_entry(victim);
     }
@@ -1012,16 +1010,57 @@ std::vector<int32_t> PrefixCache::entry_tokens(int slot) const {
     return idx < 0 ? std::vector<int32_t>{} : entries_[(size_t)idx].ids;
 }
 
+PrefixCache::Evicted PrefixCache::evicted_record(const LruEntry & entry) const {
+    Evicted out;
+    out.slot = entry.slot;
+    out.ids = entry.ids;
+    out.persist = persist_on_evict(entry.slot);
+    out.disk_key.assign(entry.ids.begin(), entry.ids.begin() + entry.disk_key_len);
+    out.aux = entry.aux;
+    return out;
+}
+
+PrefixCache::Evicted PrefixCache::entry(int slot) const {
+    const int idx = find_slot_entry(slot);
+    return idx < 0 ? Evicted{} : evicted_record(entries_[(size_t)idx]);
+}
+
+void PrefixCache::set_disk_key(int slot, int tokens) {
+    const int idx = find_slot_entry(slot);
+    if (idx < 0) return;
+    auto & entry = entries_[(size_t)idx];
+    entry.disk_key_len = std::clamp(tokens, 0, (int)entry.ids.size());
+}
+
+bool PrefixCache::has_disk_key(int slot) const {
+    const int idx = find_slot_entry(slot);
+    return idx >= 0 && entries_[(size_t)idx].disk_key_len > 0;
+}
+
+void PrefixCache::set_aux(int slot, std::string aux) {
+    const int idx = find_slot_entry(slot);
+    if (idx >= 0) entries_[(size_t)idx].aux = std::move(aux);
+}
+
+void PrefixCache::mark_agent_turn(int slot) {
+    const int idx = find_slot_entry(slot);
+    if (idx >= 0) entries_[(size_t)idx].agent_turn = true;
+}
+
+bool PrefixCache::agent_turn(int slot) const {
+    const int idx = find_slot_entry(slot);
+    return idx >= 0 && entries_[(size_t)idx].agent_turn;
+}
+
 void PrefixCache::record_eviction(int idx) {
     if (!record_evictions_ || idx < 0 || idx >= (int)entries_.size()) return;
-    const auto & entry = entries_[(size_t)idx];
-    evicted_log_.push_back({entry.slot, entry.ids, persist_on_evict(entry.slot)});
+    evicted_log_.push_back(evicted_record(entries_[(size_t)idx]));
 }
 
 std::vector<PrefixCache::Evicted> PrefixCache::entries_for_shutdown() const {
     std::vector<Evicted> out;
     for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
-        out.push_back({it->slot, it->ids, persist_on_evict(it->slot)});
+        out.push_back(evicted_record(*it));
     }
     return out;
 }

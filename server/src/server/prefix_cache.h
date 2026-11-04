@@ -211,11 +211,10 @@ public:
 
     // Evicts committed entries, pins last and never `keep_slot` or a pinned
     // ancestor of it, until the resident bytes fit the budget again. Returns
-    // the evicted slots; the caller frees their snapshot payloads.
-    // `persist` (optional) gets persist_on_evict() of each evicted slot,
-    // decided before it was erased.
-    std::vector<int> enforce_resident_budget(
-        int keep_slot, std::vector<bool> * persist = nullptr);
+    // the evicted entries, as they were before they were erased; the caller
+    // writes those worth keeping to disk and frees their payloads.
+    struct Evicted;
+    std::vector<Evicted> enforce_resident_budget(int keep_slot);
 
     // ── Disk persistence of evicted entries ─────────────────────────
     // Whether the entry in `slot`, about to leave RAM, should be written to
@@ -226,11 +225,31 @@ public:
     bool persist_on_evict(int slot) const;
     // Token ids an entry in `slot` covers (empty when none).
     std::vector<int32_t> entry_tokens(int slot) const;
+    // An entry leaving the index, with what writing it to disk needs.
     struct Evicted {
         int slot = -1;
         std::vector<int32_t> ids;
-        bool persist = false;
+        bool persist = false;               // persist_on_evict(), before it left
+        std::vector<int32_t> disk_key;      // empty: never written to disk
+        std::string aux;
     };
+    // The entry in `slot` as an eviction record; slot -1 when there is none.
+    Evicted entry(int slot) const;
+
+    // ── State attached to an entry after its commit ────────────────
+    // It lives and dies with the entry: a commit into the same slot, an
+    // eviction, an invalidation or an abort drops it.
+    // The entry is written to disk under its first `tokens` ids when it
+    // leaves RAM (the backend may save a little before the entry's cut);
+    // without a key (a compressed view, a non-`full` disk scope) it is not.
+    void set_disk_key(int slot, int tokens);
+    bool has_disk_key(int slot) const;
+    // Written with that file: the session's tool-call replay text.
+    void set_aux(int slot, std::string aux);
+    // A generated agent turn (HttpServer::save_generated_turn), not a prompt
+    // prefix: the next request continues it the same way.
+    void mark_agent_turn(int slot);
+    bool agent_turn(int slot) const;
     // Opt-in log of entries a commit replaced (its reservation's victim) or
     // the resident budget evicted, for callers whose payload outlives the
     // metadata (the concurrent scheduler writes them to disk).
@@ -325,6 +344,10 @@ private:
         // Kept behind a deeper snapshot of its conversation only so an
         // edit of the last message can resume (prune_superseded_ancestors).
         bool                 edit_backup = false;
+        // See set_disk_key, set_aux and mark_agent_turn.
+        int                  disk_key_len = 0;
+        std::string          aux;
+        bool                 agent_turn = false;
     };
     std::vector<LruEntry> entries_;
     int next_slot_ = 0;
@@ -353,6 +376,7 @@ private:
     std::vector<Evicted> evicted_log_;
     // Log entries_[idx] into evicted_log_ (when recording) before an erase.
     void record_eviction(int idx);
+    Evicted evicted_record(const LruEntry & entry) const;
     size_t resident_bytes_ = 0;
 
     // Full-cache state

@@ -26,6 +26,7 @@
 #include "tool_checks.h"
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
+#include "kv/kv_cache.h"
 #include "freeze_history.h"
 #include "api_types.h"
 #include "placement/draft_residency.h"
@@ -1201,22 +1202,8 @@ private:
         const SseEmitter & emitter, int completion_tokens,
         bool visible_output_seen, bool client_disconnected,
         bool replay_cache);
-    void forget_inline_slot_metadata(int slot);
-    // Free a RAM snapshot slot for reuse, writing it to disk first when
-    // PrefixCache::persist_on_evict() says so (see persist_evicted_slot).
-    void evict_inline_slot(int slot);
-    // Just before `reservation` commits: write (when persist_on_evict says
-    // so) and free the further entries its resident-budget plan evicts
-    // (PrefixCache::InlineReservation::extra_victim_slots). The commit then
-    // drops their metadata. A capture that fails never gets here.
-    void evict_extra_victims(const PrefixCache::InlineReservation & reservation);
-    // Disk persistence (docs/PREFIX_CACHE.md): a snapshot is written only
-    // when it leaves RAM, never after every turn. Hands the payload of
-    // `slot` to the disk writer when `persist` is set and the slot has a disk
-    // key (slot_tokens_); the slot is left empty. Returns true when queued.
-    bool persist_evicted_slot(int slot, bool persist, const char * reason);
     // Slots committed during the current request get this request's
-    // tool-call replay text (slot_aux_) once its response is known.
+    // tool-call replay text (PrefixCache::set_aux) once its response is known.
     void note_session_slot(int slot);
     void record_session_aux(const ParsedRequest & req, const SseEmitter & emitter);
     // The tool-call replay text a session's prompt was rendered with
@@ -1229,9 +1216,6 @@ private:
     // conversation and the heads; not edit backups), bounded by
     // disk_cache_shutdown_flush_s.
     void flush_sessions_to_disk(const char * reason);
-    // After a commit in `slot`: free the snapshots it supersedes, then evict
-    // until committed snapshots fit the resident budget again.
-    void trim_snapshots_after_commit(int slot);
 
     struct GenerationInputs {
         GenerateRequest request;
@@ -1374,6 +1358,8 @@ private:
     // (declared before disk_cache_, which reads and adopts through it).
     BackendCheckpoints checkpoints_;
     DiskPrefixCache  disk_cache_;
+    // Writing a checkpoint out when it leaves RAM, for both serving paths.
+    KvCache          kv_cache_;
 
     // Per-session adaptive keep_ratio bandit state.
     HttpServerSessions sessions_;
@@ -1418,13 +1404,8 @@ private:
     std::string status_html_path_;
     std::string resolve_status_html();
 
-    // Disk key of each RAM snapshot slot (written on eviction/shutdown).
-    std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
-    std::unordered_set<int> agent_turn_cache_slots_;
     // Calls a tool-use final check added (tool_checks.h).
     tool_checks::CheckedCalls checked_calls_;
-    // Replay blob stored with each slot's disk snapshot.
-    std::unordered_map<int, std::string> slot_aux_;
     std::vector<int> request_session_slots_;
 
     // Memory held by the live cache and saved snapshots, rebuilt on the

@@ -755,6 +755,7 @@ add_library(luce_common STATIC
     src/server/kv/chat_boundaries.cpp
     src/server/kv/checkpoint_store.cpp
     src/server/kv/cuts.cpp
+    src/server/kv/kv_cache.cpp
     src/server/kv/prefix_hash.cpp
     src/server/prefix_cache.cpp
     src/server/pin_friendly_prompt.cpp

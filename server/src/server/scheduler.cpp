@@ -1594,57 +1594,25 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                         // plan evicted as it committed: its payload is still
                         // in its own slot. Written like the displaced one,
                         // then freed.
-                        bool queued = false;
-                        if (disk_enabled && evicted.persist && slot_tokens_.count(evicted.slot)) {
-                            const auto aux = slot_aux_.find(evicted.slot);
-                            const std::string blob =
-                                aux == slot_aux_.end() ? std::string() : aux->second;
-                            OwnedSnapshot snap = checkpoints_.detach(Checkpoint::of_cache_slot(evicted.slot));
-                            const int pos = snap.empty() ? 0 : snap.cur_pos();
-                            queued = !snap.empty() &&
-                                disk_cache_.save_async(std::move(snap), evicted.ids, blob);
-                            if (queued) {
-                                disk_cache_.prune_ancestors(
-                                    evicted.ids, config_.disk_cache_cold_max_tokens);
-                            }
-                            std::fprintf(stderr,
-                                "[disk-cache] ram eviction checkpoint=%d tokens=%zu "
-                                "pos=%d -> %s\n", (int)Checkpoint::of_cache_slot(evicted.slot).id, evicted.ids.size(),
-                                pos, queued ? "write queued" : "not written");
+                        const Checkpoint victim = Checkpoint::of_cache_slot(evicted.slot);
+                        if (disk_enabled && kv_cache_.worth_writing(evicted)) {
+                            kv_cache_.write_out(evicted, checkpoints_.detach(victim),
+                                                "ram eviction");
                         }
-                        engine_checkpoints.discard(
-                            Checkpoint::of_cache_slot(evicted.slot), (int)evicted.ids.size());
-                        forget_inline_slot_metadata(evicted.slot);
+                        engine_checkpoints.discard(victim, (int)evicted.ids.size());
                         continue;
                     }
-                    if (displaced.empty()) continue;
-                    if (evicted.persist && slot_tokens_.count(captured)) {
-                        const auto aux = slot_aux_.find(captured);
-                        const int pos = displaced.cur_pos();
-                        const bool queued = disk_cache_.save_async(
-                            std::move(displaced), evicted.ids,
-                            aux == slot_aux_.end() ? std::string() : aux->second);
-                        if (queued) {
-                            disk_cache_.prune_ancestors(
-                                evicted.ids, config_.disk_cache_cold_max_tokens);
-                        }
-                        std::fprintf(stderr,
-                            "[disk-cache] ram eviction checkpoint=%d tokens=%zu "
-                            "pos=%d -> %s\n", (int)Checkpoint::of_cache_slot(captured).id, evicted.ids.size(),
-                            pos, queued ? "write queued" : "not written");
-                    }
+                    kv_cache_.write_out(evicted, std::move(displaced), "ram eviction");
                     displaced.reset();
                 }
                 if (resolution == Resolution::saved) {
-                    // The slot holds the new checkpoint now.
-                    forget_inline_slot_metadata(captured);
+                    // The slot holds the new checkpoint now; its entry starts
+                    // with no disk key, aux or agent-turn mark.
                     if (disk_enabled && s.job->req.disk_cache_policy.mode == DiskPrefixCacheMode::Full) {
-                        const int tokens = out.prefix_store.ticket.checkpoint.tokens;
-                        const auto & prompt = s.job->req.prompt_tokens;
-                        slot_tokens_[captured] = std::vector<int32_t>(
-                            prompt.begin(), prompt.begin() + tokens);
-                        slot_aux_[captured] =
-                            session_replay_blob(s.job->req, nullptr);
+                        prefix_cache_.set_disk_key(
+                            captured, out.prefix_store.ticket.checkpoint.tokens);
+                        prefix_cache_.set_aux(
+                            captured, session_replay_blob(s.job->req, nullptr));
                     }
                     // A conversation's checkpoints are prefixes of each other;
                     // restores use only the deepest, so the ones it supersedes
@@ -1653,7 +1621,6 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     const auto pruned = prefix_cache_.prune_superseded_ancestors(
                         captured, &tokens);
                     for (size_t i = 0; i < pruned.size(); ++i) {
-                        forget_inline_slot_metadata(pruned[i]);
                         engine_checkpoints.discard(Checkpoint::of_cache_slot(pruned[i]), tokens[i]);
                     }
                 } else if (resolution == Resolution::failed) {
