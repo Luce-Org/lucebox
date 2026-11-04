@@ -2288,6 +2288,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     // allocation: the scheduler rewrote its cross-device sources, so it is never split again.
     if (use_stable_graph && stable_ws.gf && (stable_ws.qsa_blocks >= 0) == stable_qsa &&
         (stable_ws.hidden != nullptr) == (out_hidden != nullptr) &&
+        (stable_ws.greedy != nullptr) == (out_rows != nullptr) &&
         stable_ws.top_n == (out_rows ? out_rows->top_n : 0) &&
         (!split || stable_ws.sched || stable_ws.split_gen == split_owner(cache).split_short_gen) &&
         (verify ? stable_ws.row_spans == row_spans : kv_len <= stable_ws.kv_bucket && stable_ws.next_pos == pos0) &&
@@ -2414,13 +2415,14 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     }
     // Each row's greedy pick: a greedy request reads T ids instead of T vocabulary rows (5 MB for a 5-row verify).
     // A sampled request whose sampler draws from the top candidates reads T * top_n of them instead.
+    // Built only for a caller that reads them (out_rows): the others read the logits rows.
     Qwen4ExpRowTensors row_outputs;
     row_outputs.logits = logits;
-    if (reuse_ws || verify) {
+    if (out_rows && (reuse_ws || verify)) {
         row_outputs.greedy = ggml_argmax(ctx, logits);
         ggml_set_output(row_outputs.greedy);
         ggml_build_forward_expand(gf, row_outputs.greedy);
-        row_outputs.top_n = out_rows ? out_rows->top_n : 0;
+        row_outputs.top_n = out_rows->top_n;
     }
     if (row_outputs.top_n > 0) {
         row_outputs.top_ids = ggml_top_k(ctx, logits, row_outputs.top_n);
