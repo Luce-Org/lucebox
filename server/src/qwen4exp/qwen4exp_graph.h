@@ -50,6 +50,8 @@ constexpr int kQwen4ExpMaxBatchedSlots = 4;
 
 struct Qwen4ExpForwardResult {
     bool ok = false;
+    // Set when out_argmax was filled: the logits rows, still on the device until the next forward of this cache.
+    const ggml_tensor * logits = nullptr;
 };
 
 // Host-only input preparation; safe to run for the next prompt chunk while
@@ -102,6 +104,9 @@ bool qwen4exp_can_batch(const Qwen4ExpWeights & w,
 // qwen4exp_verify_rollback.
 // mtp_prefill (n_tokens > 1, contiguous prompt chunks): append K/V-only MTP
 // slices to this graph. out_hidden receives only the last pending trunk row.
+// out_argmax (T=1 decode and verify): when the graph computed each row's argmax, it receives those ids
+// instead of the rows, out_logits is cleared and the result's `logits` points at the rows on the device.
+// Otherwise out_argmax is cleared and out_logits is filled as usual.
 Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                                        const Qwen4ExpWeights & w,
                                        Qwen4ExpCache & cache,
@@ -112,7 +117,8 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                                        std::vector<float> * out_hidden = nullptr,
                                        bool verify = false,
                                        bool mtp_prefill = false,
-                                       const Qwen4ExpInputs * inputs = nullptr);
+                                       const Qwen4ExpInputs * inputs = nullptr,
+                                       std::vector<int32_t> * out_argmax = nullptr);
 
 // The cache was created with `mtp` (and a loaded sidecar).
 bool qwen4exp_verify_supported(const Qwen4ExpCache & cache);
@@ -148,6 +154,9 @@ struct Qwen4ExpMtpStep {
     int k = 0;                        // drafts verified
     Qwen4ExpMtpAcceptance decision;   // emitted[n_emitted - 1] is the next input
     bool more = true;                 // sample_row's last answer
+    // argmax_rows: rows were picked by their device argmax. `logits` then holds only the last emitted row, and only
+    // when the step ended generation (more == false); otherwise it is empty.
+    bool by_id = false;
     double draft_s = 0.0, verify_s = 0.0;
     const char * error = nullptr;
 };
@@ -158,11 +167,14 @@ struct Qwen4ExpMtpStep {
 // back to the retained rows and let the controller observe the step. `pending` (null: no draft layer) ends with
 // `token` and, on success, with the next input. `logits` receives every verified row. on_drafts (test-only) may
 // replace the drafts before verification.
+// argmax_rows (greedy sampling with no logit processing): read each row's device argmax instead of its logits. A row
+// then reaches sample_row as nullptr with the sample already holding its argmax (see Qwen4ExpMtpStep::by_id).
 bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache, int pos,
                        int32_t token, int max_k, AdaptiveSpecWidth * width, Qwen4ExpMtpPending * pending,
                        const std::function<bool(int32_t, const float *, int32_t &)> & sample_row,
                        std::vector<float> & logits, Qwen4ExpMtpStep & step,
-                       const std::function<void(std::vector<int32_t> &)> & on_drafts = {});
+                       const std::function<void(std::vector<int32_t> &)> & on_drafts = {},
+                       bool argmax_rows = false);
 
 // Decode one next token for each independent slot. `caches[s]` owns that
 // sequence's KV and recurrent state; `tokens[s]` and `positions[s]` are never

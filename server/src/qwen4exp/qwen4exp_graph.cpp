@@ -1458,7 +1458,11 @@ struct Qwen4ExpLayerBuilder {
                                                                    : ggml_cast(ctx, late_routed, GGML_TYPE_F32);
         expert_nodes.push_back(routed);
         ggml_build_forward_expand(gf, routed);
-        res_hc = hc_combine(ctx, res_hc, routed, late_inject, w.n_embd, w.n_hc, layer_T);
+        // One HC_COMBINE_NORM launch instead of hc_combine's six elementwise kernels (same formula, last-bit FMA
+        // differences); its normalized channel is not read.
+        ggml_tensor * f = hc_combine_norm(ctx, late_inject, res_hc, routed, w.output_hc_norm, w.n_embd, w.n_hc,
+                                          layer_T, w.rms_eps);
+        res_hc = hc_norm_res(ctx, f, w.n_embd, w.n_hc, layer_T);
         late_routed = late_inject = nullptr;
         return res_hc;
     }
@@ -1856,14 +1860,33 @@ static void upload_stable_inputs(Qwen4ExpStableInputs & in, const Qwen4ExpDecode
     upload_stable_qsa(in, ws);
 }
 
+// Read a decode or verify forward's result: each row's argmax when the caller asked for it and the graph has it (a
+// few bytes instead of n_vocab floats per row over the link), else the logits rows.
+static void read_logits(const ggml_tensor * logits, const ggml_tensor * argmax, std::vector<float> & out_logits,
+                        std::vector<int32_t> * out_argmax, Qwen4ExpForwardResult & res) {
+    if (out_argmax && argmax) {
+        out_argmax->resize((size_t) ggml_nelements(argmax));
+        ggml_backend_tensor_get(argmax, out_argmax->data(), 0, ggml_nbytes(argmax));
+        out_logits.clear();
+        res.logits = logits;
+        return;
+    }
+    if (out_argmax) out_argmax->clear();
+    out_logits.resize((size_t) ggml_nelements(logits));   // n_vocab, per row when verifying
+    ggml_backend_tensor_get(logits, out_logits.data(), 0, ggml_nbytes(logits));
+}
+
 // Replay a retained graph with this forward's inputs and read its logits (and hidden rows). A failed compute drops
 // the graph.
 static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace & ws, ggml_backend_sched_t short_sched,
-                             bool verify, std::vector<float> & out_logits, std::vector<float> * out_hidden) {
+                             bool verify, std::vector<float> & out_logits, std::vector<float> * out_hidden,
+                             std::vector<int32_t> * out_argmax, Qwen4ExpForwardResult & res) {
     upload_stable_inputs(in, ws);
     ggml_status status;
     {   // verify: as built, with batch-invariant matmul columns (see forward_impl)
-        ScopedCudaGraphOverrides invariant(false, 0, false, 0, /*mmvq_batch_invariant=*/verify);
+        // A single-token decode takes the same scope: its products then match a verify row's even where a
+        // kernel is invariant only inside it (LUCE_CUDA_MMVQ_MOE_ALL_WIDTHS).
+        ScopedCudaGraphOverrides invariant(false, 0, false, 0, /*mmvq_batch_invariant=*/verify || in.T == 1);
         status = in.split ? ggml_backend_sched_graph_compute(ws.sched ? ws.sched : short_sched, ws.gf)
                           : ggml_backend_graph_compute(in.backend, ws.gf);
     }
@@ -1872,8 +1895,7 @@ static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace 
         clear_qwen4exp_decode_workspace(ws);
         return false;
     }
-    out_logits.resize((size_t) ggml_nelements(ws.logits));   // n_vocab, per row when verifying
-    ggml_backend_tensor_get(ws.logits, out_logits.data(), 0, ggml_nbytes(ws.logits));
+    read_logits(ws.logits, ws.argmax, out_logits, out_argmax, res);
     if (out_hidden && ws.hidden) {
         out_hidden->resize((size_t) ggml_nelements(ws.hidden));
         ggml_backend_tensor_get(ws.hidden, out_hidden->data(), 0, ggml_nbytes(ws.hidden));
@@ -2211,7 +2233,8 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
                                        int pos0,
                                        std::vector<float> & out_logits, std::vector<float> * out_hidden,
                                        bool verify, bool mtp_prefill,
-                                       const Qwen4ExpInputs * inputs, Qwen4ExpGraphMemory * measure) {
+                                       const Qwen4ExpInputs * inputs, Qwen4ExpGraphMemory * measure,
+                                       std::vector<int32_t> * out_argmax = nullptr) {
     Qwen4ExpForwardResult res;
     if (n_tokens <= 0 || pos0 < 0 || (!tokens && !measure)) return res;
     const Qwen4ExpCudaScope profile(w.gfx1151 || w.expert_gfx1151);
@@ -2310,7 +2333,8 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         (verify ? stable_ws.row_spans == row_spans : kv_len <= stable_ws.kv_bucket && stable_ws.next_pos == pos0) &&
         (!stable_qsa || (stable_ws.kv_bucket == stable_kv_bucket &&
                         stable_ws.qsa_budget == w.indexer_top_k / 4 && cache.indexer_blocks == pos0 / 4))) {
-        if (!run_stable_graph(stable_in, stable_ws, split_owner(cache).split_sched_short, verify, out_logits, out_hidden)) {
+        if (!run_stable_graph(stable_in, stable_ws, split_owner(cache).split_sched_short, verify, out_logits, out_hidden,
+                              out_argmax, res)) {
             return res;
         }
         stable_ws.next_pos = (int) kv_len;
@@ -2437,6 +2461,13 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         ? build_mtp_prefill(ctx, gf, w, cache, hidden, emb_rows, pos0, T) : nullptr;
     for (const auto & pk : route_probe.picks) ggml_build_forward_expand(gf, pk.second);
     g_route_probe = nullptr;   // the MTP and output builders above are done; nothing else records
+    // Each row's argmax, on the logits' device: greedy decode reads these ids instead of the rows.
+    ggml_tensor * argmax = nullptr;
+    if (reuse_ws || verify) {
+        argmax = ggml_argmax(ctx, logits);
+        ggml_set_output(argmax);
+        ggml_build_forward_expand(gf, argmax);
+    }
 
     if (measure) {
         graph_memory(backend, ctx, gf, w.gfx1151, *measure);
@@ -2476,6 +2507,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         stable_ws.ple_in = ple_in;
         stable_ws.kv_row = lb.kv_row;
         stable_ws.logits = logits;
+        stable_ws.argmax = argmax;
         stable_ws.hidden = hidden;
         stable_ws.kv_bucket = stable_kv_bucket;
         stable_ws.qsa_blocks = stable_qsa ? stable_kv_bucket / 4 : -1;
@@ -2497,10 +2529,11 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     }
 
     ggml_status status;
-    {   // verify: every matmul column equals its single-token product (see ggml_backend_cuda_set_mmvq_batch_invariant)
+    {   // verify: every matmul column equals its single-token product (see ggml_backend_cuda_set_mmvq_batch_invariant);
+        // a single-token decode runs in the same scope (see run_stable_graph).
         // Split prompt chunks: no HIP graph capture (long kernels gain nothing, and
         // capture fails on allocating kernels such as the CUB segmented sort).
-        ScopedCudaGraphOverrides invariant(split && T > kSplitShortRows, 0, false, 0, /*mmvq_batch_invariant=*/verify);
+        ScopedCudaGraphOverrides invariant(split && T > kSplitShortRows, 0, false, 0, /*mmvq_batch_invariant=*/verify || T == 1);
         status = split ? ggml_backend_sched_graph_compute(split_sched, gf) : ggml_backend_graph_compute(backend, gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -2543,8 +2576,8 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         if (!stats.save_csv(qwen4exp_route_stats_path(), &err))
             std::fprintf(stderr, "[qwen4exp] routing stats: %s\n", err.c_str());
     }
-    out_logits.resize((size_t) ggml_nelements(logits));   // n_vocab, per row when verifying
-    ggml_backend_tensor_get(logits, out_logits.data(), 0, ggml_nbytes(logits));
+    // The rows stay readable after this call only while the context is retained (pool).
+    read_logits(logits, pool ? argmax : nullptr, out_logits, out_argmax, res);
     if (out_hidden && hidden) {
         out_hidden->resize((size_t) ggml_nelements(hidden));
         ggml_backend_tensor_get(hidden, out_hidden->data(), 0, ggml_nbytes(hidden));
@@ -2807,7 +2840,7 @@ bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
                        int32_t token, int max_k, AdaptiveSpecWidth * width, Qwen4ExpMtpPending * pending,
                        const std::function<bool(int32_t, const float *, int32_t &)> & sample_row,
                        std::vector<float> & logits, Qwen4ExpMtpStep & step,
-                       const std::function<void(std::vector<int32_t> &)> & on_drafts) {
+                       const std::function<void(std::vector<int32_t> &)> & on_drafts, bool argmax_rows) {
     step = {};
     const size_t hd = (size_t) w.n_embd * w.n_hc;
     auto graph_builds = [&cache] {
@@ -2842,20 +2875,32 @@ bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
     in[0] = token;
     std::copy(drafts.begin(), drafts.end(), in.begin() + 1);
     std::vector<float> hidden;
-    if (!qwen4exp_forward(backend, w, cache, in.data(), k + 1, pos, logits, pending ? &hidden : nullptr, verify).ok) {
+    std::vector<int32_t> ids;
+    const Qwen4ExpForwardResult fwd = qwen4exp_forward(backend, w, cache, in.data(), k + 1, pos, logits,
+        pending ? &hidden : nullptr, verify, false, nullptr, argmax_rows ? &ids : nullptr);
+    if (!fwd.ok) {
         step.error = "qwen4exp decode forward failed";
         return false;
     }
+    step.by_id = fwd.logits && ids.size() == (size_t) k + 1;
     step.draft_s = std::chrono::duration<double>(t_draft - t0).count();
     step.verify_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_draft).count();
     // Rows are sampled lazily, each after its own fed token: no draws for rows past a rejection.
     Qwen4ExpMtpAcceptance & decision = step.decision;
     for (int i = 0; i <= k; ++i) {
-        step.more = sample_row(in[(size_t) i], logits.data() + (size_t) i * w.n_vocab, samples[(size_t) i]);
+        if (step.by_id) samples[(size_t) i] = ids[(size_t) i];
+        step.more = sample_row(in[(size_t) i], step.by_id ? nullptr : logits.data() + (size_t) i * w.n_vocab,
+                               samples[(size_t) i]);
         decision = qwen4exp_mtp_accept(drafts.data(), k, samples.data(), i + 1);
         if (!step.more || decision.n_accepted != i + 1) break;
     }
     const int retained = decision.n_emitted;
+    // The caller keeps the last emitted row once generation ends: fetch that one row from the device.
+    if (step.by_id && !step.more) {
+        logits.resize((size_t) w.n_vocab);
+        ggml_backend_tensor_get(fwd.logits, logits.data(), (size_t) (retained - 1) * w.n_vocab * sizeof(float),
+                                (size_t) w.n_vocab * sizeof(float));
+    }
     if (verify) {
         // Replace every predicted MTP hidden/KV row with the corresponding
         // trunk pair on next catch-up, including after a partial accept.
@@ -2880,9 +2925,9 @@ bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
 Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend, const Qwen4ExpWeights & w,
         Qwen4ExpCache & cache, const int32_t * tokens, int n_tokens, int pos0,
         std::vector<float> & logits, std::vector<float> * out_hidden,
-        bool verify, bool mtp_prefill, const Qwen4ExpInputs * inputs) {
+        bool verify, bool mtp_prefill, const Qwen4ExpInputs * inputs, std::vector<int32_t> * out_argmax) {
     return forward_impl(backend, w, cache, tokens, n_tokens, pos0, logits, out_hidden,
-                        verify, mtp_prefill, inputs, nullptr);
+                        verify, mtp_prefill, inputs, nullptr, out_argmax);
 }
 
 Qwen4ExpGraphMemory qwen4exp_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,

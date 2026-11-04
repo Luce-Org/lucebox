@@ -243,11 +243,16 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::mtp_step(const StepInput & input) {
 
     // Rows are sampled as one-token decode would, each after its own fed token, up to EOS.
     const size_t history0 = slot.sample_history.size();
+    // Greedy with no logit processing reads each row's device argmax instead of the rows (row == nullptr, token
+    // already holds it).
+    const bool argmax_rows = !slot.sampler.needs_logit_processing();
     auto sample_row = [&](int32_t fed, const float * row, int32_t & token) {
         slot.sample_history.push_back(fed);
-        token = slot.sampler.needs_logit_processing()
-            ? sample_logits(row, weights_.n_vocab, slot.sampler, slot.sample_history, slot.rng)
-            : (int32_t)(std::max_element(row, row + weights_.n_vocab) - row);
+        if (row) {
+            token = slot.sampler.needs_logit_processing()
+                ? sample_logits(row, weights_.n_vocab, slot.sampler, slot.sample_history, slot.rng)
+                : (int32_t)(std::max_element(row, row + weights_.n_vocab) - row);
+        }
         return !token_is_eos(token);
     };
     mtp_.pending.tok.push_back(input.token);
@@ -255,7 +260,7 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::mtp_step(const StepInput & input) {
     Qwen4ExpMtpStep step;
     const bool ok = qwen4exp_mtp_step(backend_, weights_, cache, pos, input.token, max_context() - pos - 1,
                                       verify_width_ == 0 ? mtp_width_ : nullptr, &mtp_.pending, sample_row,
-                                      logits, step);
+                                      logits, step, {}, argmax_rows);
     slot.sample_history.resize(history0);
     if (!ok) {
         result.error = step.error;

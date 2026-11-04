@@ -177,6 +177,19 @@ int sample_logits_chain(const float * logits_in,
         if (g >= 0) return g;
     }
 #endif
+    // Greedy with no penalties is a plain argmax over the row: scan it in
+    // place instead of copying the whole vocabulary into `cand` (a 150K-row
+    // vocab is 1.2 MB of writes per sampled row, which shows up between the
+    // forwards of a speculative step). Same comparison as the max_element
+    // below, so ties still go to the lowest token id.
+    if (cfg.temp <= 0.0f && cfg.rep_pen <= 1.0f && cfg.freq_pen == 0.0f && cfg.pres_pen == 0.0f) {
+        int best = 0;
+        for (int i = 1; i < vocab; i++) {
+            if (logits_in[best] < logits_in[i]) best = i;
+        }
+        return best;
+    }
+
     const bool need_top_k = cfg.top_k > 0 && cfg.top_k < vocab;
     const bool need_top_p = cfg.top_p > 0.0f && cfg.top_p < 1.0f;
 

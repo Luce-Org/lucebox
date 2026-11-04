@@ -52,6 +52,7 @@ struct Qwen4ExpDecodeWorkspace {
     ggml_tensor * hidden_in = nullptr;   // MTP draft rank 0: the trunk hidden rows
     ggml_tensor * kv_row = nullptr;   // I32[T]: the K/V and raw indexer rows written
     ggml_tensor * logits = nullptr;
+    ggml_tensor * argmax = nullptr;   // I32[T]: each logits row's argmax (T=1 decode and verify graphs)
     ggml_tensor * hidden = nullptr;   // final HC residual, set when an MTP sidecar is loaded
     int64_t kv_bucket = 0;
     int64_t qsa_blocks = -1;  // -1 for dense; fixed score capacity otherwise

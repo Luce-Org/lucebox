@@ -726,9 +726,12 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     if (mtp) mtp_pending.tok.assign(1, next);
     // Each trunk row sampled (lazily, in qwen4exp_mtp_step) updates history and applies the budget hook exactly
     // once per emitted token. No RNG draws for unvisited verify rows.
+    // Greedy with no logit processing samples a row by its argmax, so the verify reads each row's device argmax
+    // instead of the rows (row == nullptr, tok already holds it). The decode check compares whole rows.
+    const bool argmax_rows = !req.sampler.needs_logit_processing() && !decode_check_;
     auto sample_row = [&](int32_t fed, const float * row, int32_t & tok) {
         history.push_back(fed);
-        tok = sample(row);
+        if (row) tok = sample(row);
         return commit(tok);
     };
     auto on_drafts = [&](std::vector<int32_t> & draft_tokens) {
@@ -738,7 +741,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         const int max_k = spec ? std::min(req.n_gen - (int) result.tokens.size() - 1, cache_.max_ctx - pos - 1) : 0;
         Qwen4ExpMtpStep step;
         if (!qwen4exp_mtp_step(backend_, weights_, cache_, pos, next, max_k, adaptive ? &mtp_width_ : nullptr,
-                               mtp ? &mtp_pending : nullptr, sample_row, logits, step, on_drafts)) {
+                               mtp ? &mtp_pending : nullptr, sample_row, logits, step, on_drafts, argmax_rows)) {
             result.fail(GenerateErrorCode::DecodeFailed, step.error);
             return result;
         }
@@ -750,8 +753,12 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         draft_s += step.draft_s;
         const int retained = step.decision.n_emitted;
         next = step.decision.emitted[retained - 1];
-        logits_.assign(logits.begin() + (size_t) (retained - 1) * weights_.n_vocab,
-                       logits.begin() + (size_t) retained * weights_.n_vocab);
+        if (!step.by_id) {
+            logits_.assign(logits.begin() + (size_t) (retained - 1) * weights_.n_vocab,
+                           logits.begin() + (size_t) retained * weights_.n_vocab);
+        } else if (!logits.empty()) {
+            logits_ = logits;   // the last emitted row, read when the step ended generation
+        }
         pos += retained;
         if (decode_check_) decode_check_(false, mtp_pending.tok, logits_);
     }
