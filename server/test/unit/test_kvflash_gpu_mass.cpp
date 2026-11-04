@@ -7,6 +7,7 @@
 #include "kvflash_exact_fast.h"
 #include "kvflash_gpu_mass.h"
 #include "kvflash_mass_synth.h"
+#include "kvflash_prefill_reselect.h"
 
 #include "ggml-cpu.h"
 #ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
@@ -552,4 +553,47 @@ TEST_CASE(KvflashGpuMassFixture, fused_request_on_other_k_types_scores_with_the_
     CHECK(tm.archived == 0);
     REQUIRE(w.score(plain, false, ref, pref) == 38);
     CHECK(o == ref);
+}
+
+// RC3: a chunk's score is a function of its keys and the queries, not of where the pager put it. Two runs of one
+// input can land the same chunks in different pool blocks (page-in order), and the evicted set sits at a different
+// column of the softmax row; the scores must still agree bit for bit, and so must the block picks (ties included).
+namespace {
+struct Scored { bool ok = false; std::vector<std::vector<float>> outs; std::vector<KvFlashMassPlanes> planes; };
+
+Scored score_layout(SynthCfg cfg, uint64_t layout_seed) {
+    cfg.seed = layout_seed;   // only the block permutation depends on the seed
+    Scored r;
+    Synth s;
+    s.build(cfg);
+    ggml_backend_t be = ggml_backend_cpu_init();
+    if (!be) return r;
+    ggml_init_params ip{ggml_tensor_overhead() * (size_t)(cfg.L + 4), nullptr, true};
+    ggml_context * pctx = ggml_init(ip);
+    std::vector<ggml_tensor *> pool_k;
+    for (int l = 0; l < cfg.L; l++) pool_k.push_back(ggml_new_tensor_3d(pctx, cfg.KT, cfg.D, (int64_t)cfg.NB * cfg.CT, cfg.HK));
+    ggml_backend_buffer_t pbuf = ggml_backend_alloc_ctx_tensors(pctx, be);
+    for (int l = 0; l < cfg.L; l++) ggml_backend_tensor_set(pool_k[(size_t)l], s.pool_img[(size_t)l].data(), 0, ggml_nbytes(pool_k[(size_t)l]));
+    KvFlashGpuMass gm(be);
+    r.ok = gm.score(pool_k, s.blk, [&](int c, int l, int h) { return s.host_seg(c, l, h); }, cfg.CT, s.dims(), s.qptrs(), r.outs, &r.planes);
+    ggml_backend_buffer_free(pbuf);
+    ggml_free(pctx);
+    ggml_backend_free(be);
+    return r;
+}
+}  // namespace
+
+TEST_CASE(KvflashGpuMassFixture, scores_do_not_depend_on_the_pool_block_layout) {
+    const SynthCfg cfg = small_cfg(GGML_TYPE_Q4_0, 60, 8);
+    const Scored a = score_layout(cfg, 42), b = score_layout(cfg, 7), c = score_layout(cfg, 42);
+    REQUIRE(a.ok); REQUIRE(b.ok); REQUIRE(c.ok);
+    CHECK(c.outs == a.outs);            // same layout twice: identical
+    CHECK(b.outs == a.outs);            // another layout: identical
+    bool same = true;
+    for (size_t n = 0; n < a.planes.size(); n++)
+        same = same && b.planes[n].top == a.planes[n].top && b.planes[n].max == a.planes[n].max;
+    CHECK(same);
+    const auto sa = kvflash_select_scores(a.planes), sb = kvflash_select_scores(b.planes);
+    CHECK(sa == sb);
+    CHECK(kvflash_recall_pick(sa, 50, 6, 2, 10) == kvflash_recall_pick(sb, 50, 6, 2, 10));
 }
