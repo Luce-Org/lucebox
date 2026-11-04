@@ -729,6 +729,14 @@ static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
     return attn;
 }
 
+// Q [D, Hq, 1] as flash attention's [D, 1, Hq] query. The decode kernels read Q through its strides, so for one
+// query row the permuted view replaces the copy (same values read, same bits). LUCE_QWEN4EXP_Q_CONT=1 keeps the copy.
+static ggml_tensor * qwen4exp_q_rows(ggml_context * c, ggml_tensor * q) {
+    static const bool keep = [] { const char * e = std::getenv("LUCE_QWEN4EXP_Q_CONT"); return e && e[0] == '1'; }();
+    ggml_tensor * p = ggml_permute(c, q, 0, 2, 1, 3);
+    return keep ? ggml_cont(c, p) : p;
+}
+
 // QSA block ratio of the full-attention layers (0 when the model has no indexer).
 static int64_t qsa_ratio(const Qwen4ExpWeights & w) {
     for (int il = 0; il < w.n_layer && il < (int) w.compress_ratios.size(); ++il) {
@@ -904,7 +912,8 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
             ggml_tensor * Vr = ggml_view_3d(c, v_cache, D, span, Hk, v_cache->nb[1], v_cache->nb[2], 0);
             ggml_tensor * a;
             if (row.qsa == QSA_DENSE) {
-                a = ggml_flash_attn_ext(c, ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3)), Kr, Vr, row.mask,
+                // One query row: flash attention reads Q through its strides, so the permuted view needs no copy.
+                a = ggml_flash_attn_ext(c, qwen4exp_q_rows(c, q), Kr, Vr, row.mask,
                     1.0f / std::sqrt((float) D), 0.0f, 0.0f);
                 ggml_flash_attn_ext_set_prec(a, GGML_PREC_F32);
             } else {
@@ -965,7 +974,7 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
             K_full = ggml_view_3d(c, k_cache, D, mask->ne[0], Hk, k_cache->nb[1], k_cache->nb[2], 0);
             V_full = ggml_view_3d(c, v_cache, D, mask->ne[0], Hk, v_cache->nb[1], v_cache->nb[2], 0);
         }
-        ggml_tensor * Qfa = ggml_cont(c, ggml_permute(c, Q, 0, 2, 1, 3));  // [D, T, Hq]
+        ggml_tensor * Qfa = T == 1 ? qwen4exp_q_rows(c, Q) : ggml_cont(c, ggml_permute(c, Q, 0, 2, 1, 3));  // [D, T, Hq]
         attn = ggml_flash_attn_ext(c, Qfa, K_full, V_full, mask,
             1.0f / std::sqrt((float) D), 0.0f, 0.0f);                       // [D, Hq, T, 1]
         ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);                  // match upstream's F32 acc
@@ -1454,10 +1463,16 @@ struct Qwen4ExpLayerBuilder {
         if (!late_routed) return res_hc;
         ggml_build_forward_expand(gf, attn_out);
         ggml_build_forward_expand(gf, res_hc);
-        ggml_tensor * routed = late_routed->type == GGML_TYPE_F32 ? ggml_scale(ctx, late_routed, 1.0f)
-                                                                   : ggml_cast(ctx, late_routed, GGML_TYPE_F32);
-        expert_nodes.push_back(routed);
-        ggml_build_forward_expand(gf, routed);
+        // The scheduler ends the target's split right before this join (its first expert-device input), so the
+        // routed sum crosses as it is: no extra expert-device node (another graph launch on its critical path).
+        static const bool keep_pin = [] { const char * e = std::getenv("LUCE_QWEN4EXP_LATE_PIN"); return e && e[0] == '1'; }();
+        ggml_tensor * routed = late_routed;
+        if (keep_pin || late_routed->type != GGML_TYPE_F32) {
+            routed = late_routed->type == GGML_TYPE_F32 ? ggml_scale(ctx, late_routed, 1.0f)
+                                                        : ggml_cast(ctx, late_routed, GGML_TYPE_F32);
+            expert_nodes.push_back(routed);
+            ggml_build_forward_expand(gf, routed);
+        }
         // One HC_COMBINE_NORM launch instead of hc_combine's six elementwise kernels (same formula, last-bit FMA
         // differences); its normalized channel is not read.
         ggml_tensor * f = hc_combine_norm(ctx, late_inject, res_hc, routed, w.output_hc_norm, w.n_embd, w.n_hc,
