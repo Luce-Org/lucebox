@@ -393,6 +393,63 @@ static __global__ void swiglu_ds4_q8_kernel(const float * gate, const float * up
     }
 }
 
+// SCALE (scale*x + bias) then SILU, one launch with the two kernels' roundings: the same expression as scale_f32
+// and the same op_silu. With q8 it also writes the result's q8_1 form as MMVQ's quantize_q8_1 would (rows of n
+// padded with zero blocks to n_q8; a warp's 32 consecutive elements are one block, n % QK8_1 == 0), so the next
+// quantized matmul skips its quantize launch. Threads past the k results write the padding blocks.
+static __global__ void scale_silu_kernel(const float * x, float * dst, const float scale, const float bias,
+                                         const int64_t k, const int64_t n, block_q8_1 * q8, const int64_t n_q8) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    float v = 0.0f;
+    int64_t qi = 0;  // element index in the padded q8 layout
+    if (i < k) {
+        v = op_silu(scale * x[i] + bias);
+        dst[i] = v;
+        qi = (i / n) * n_q8 + (i % n);
+    } else if (q8 != nullptr && i - k < (k / n) * (n_q8 - n)) {
+        const int64_t p = i - k;
+        const int64_t pad = n_q8 - n;
+        qi = (p / pad) * n_q8 + n + (p % pad);
+    } else {
+        return;
+    }
+    if (q8 == nullptr) {
+        return;
+    }
+    float amax = fabsf(v);
+    float sum = v;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+    q8[qi / QK8_1].qs[qi % QK8_1] = q;
+    if (qi % QK8_1 == 0) {
+        q8[qi / QK8_1].ds = make_half2(d, sum);
+    }
+}
+
+void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, const ggml_tensor * scale_node, ggml_tensor * silu_node,
+                             void * q8_out, int ncols_q8) {
+    const ggml_tensor * src = scale_node->src[0];
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && scale_node->type == GGML_TYPE_F32 && silu_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(silu_node));
+    GGML_ASSERT(ggml_nelements(src) == ggml_nelements(silu_node));
+    float scale;
+    float bias;
+    memcpy(&scale, (const float *) scale_node->op_params + 0, sizeof(float));
+    memcpy(&bias,  (const float *) scale_node->op_params + 1, sizeof(float));
+    const int64_t k = ggml_nelements(silu_node);
+    const int64_t n = silu_node->ne[0];
+    if (q8_out) {
+        GGML_ASSERT(n % QK8_1 == 0 && ncols_q8 % QK8_1 == 0 && ncols_q8 >= n);
+    }
+    const int64_t total = k + (q8_out ? ggml_nrows(silu_node) * (ncols_q8 - n) : 0);
+    const int64_t num_blocks = (total + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    scale_silu_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) src->data, (float *) silu_node->data, scale, bias, k, n,
+        (block_q8_1 *) q8_out, q8_out ? ncols_q8 : n);
+}
+
 template <typename T>
 static void swiglu_ds4_cuda(const T * gate, const T * up, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, const float limit, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;

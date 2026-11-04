@@ -5574,6 +5574,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // SCALE -> SILU (the qwen4exp hyper-connection low-rank gate): one launch, see ggml_cuda_op_scale_silu.
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY
+     && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
+        const ggml_tensor * scale = cgraph->nodes[node_idx];
+        const ggml_tensor * silu  = cgraph->nodes[node_idx + 1];
+        return ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == scale &&
+               scale->src[0]->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 &&
+               ggml_is_contiguous(scale->src[0]) && ggml_is_contiguous(silu) &&
+               ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 1 });
+    }
+
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_SCALE
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_TANH) {
         const ggml_tensor *scale  = cgraph->nodes[node_idx];
@@ -6788,6 +6799,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
                         i += 2;
                         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i], node);
+                        continue;
+                    }
+
+                    // LUCE_CUDA_FUSE_SCALE_SILU=0 keeps the two kernels and the quantize launch.
+                    static const bool fuse_scale_silu = [] { const char * e = std::getenv("LUCE_CUDA_FUSE_SCALE_SILU"); return !(e && e[0] == '0'); }();
+                    if (fuse_scale_silu && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+                        void * q8_out = nullptr;
+                        int ncols_q8 = 0;
+                        ggml_cuda_q8_memo_for_producer(*cuda_ctx, cgraph, i + 1, &q8_out, &ncols_q8);
+                        ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i+1], q8_out, ncols_q8);
+                        i++;
                         continue;
                     }
                 }
