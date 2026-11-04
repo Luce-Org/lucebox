@@ -3161,11 +3161,7 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
 
         after_target_compute(sg_, committed, 1);
 
-        // GPU argmax: read 4 bytes, skip the 970 KB logit D2H. Escape: LUCE_GPU_ARGMAX=0.
-        static const bool kGpuArgmaxAR = []() {
-            const char * v = std::getenv("LUCE_GPU_ARGMAX");
-            return v == nullptr || v[0] != '0';
-        }();
+        // GPU argmax: read 4 bytes, skip the 970 KB logit D2H (gpu_argmax_enabled).
         int32_t next_tok;
         if (sampler_.needs_logit_processing()) {
 #ifdef LUCE_HAVE_GPU_SAMPLER
@@ -3210,7 +3206,7 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
                 next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
                                           out_tokens, sampler_rng_);
             }
-        } else if (kGpuArgmaxAR && sg_.argmax_tokens) {
+        } else if (gpu_argmax_enabled() && sg_.argmax_tokens) {
             int32_t tok_i = 0;
             ggml_backend_tensor_get(sg_.argmax_tokens, &tok_i, 0, sizeof(int32_t));
             next_tok = tok_i;

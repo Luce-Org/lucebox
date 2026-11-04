@@ -525,7 +525,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 // Model-agnostic: applies to any MoE with n_expert_used*n_tokens <= 256.
 //   LUCE_MMID_GROUPED         1 = enable, 0 = disable
 //                               (CUDA default on; HIP default off except
-//                               Q5_1 on RDNA3, see mmid_grouped_selected)
+//                               Q5_1 on RDNA3.5, see mmid_grouped_selected)
 //   LUCE_MMID_GROUPED_TYPES   bitmask, 1 = Q4_K, 2 = Q6_K,
 //                               4 = Q4_0/Q8_0/Q5_K, 8 = ROCmFP2/ROCmFP3,
 //                               16 = ROCmFP4-fast, 32 = ROCmFP3 only,
@@ -650,8 +650,10 @@ static bool mmid_grouped_arch_ok(int cc) {
 // Whether the grouped kernel serves this type on this device. With
 // LUCE_MMID_GROUPED set, it decides for the types in LUCE_MMID_GROUPED_TYPES.
 // Unset, CUDA groups those types and HIP only what was measured faster there:
-// Q5_1 on RDNA3 (the gfx1151 expert owner of Qwen3.8-Flash-Next: its expert
-// down projection 24% faster, split decode up to +3%, bit-exact).
+// Q5_1 on RDNA3.5 (the gfx1151 expert owner of Qwen3.8-Flash-Next: its expert
+// down projection 24% faster, split decode up to +3%, bit-exact). RDNA3.5 runs
+// Q5_1 MMVQ with one warp per row, as the grouped kernel does, so batch-invariant
+// verify still matches decode; RDNA3.0 uses more and is left out.
 static bool mmid_grouped_selected(ggml_type type, int cc) {
     if (!mmid_grouped_arch_ok(cc) || !mmid_grouped_device_ok()) {
         return false;
@@ -661,7 +663,7 @@ static bool mmid_grouped_selected(ggml_type type, int cc) {
         return mmid_grouped_env() && mmid_grouped_type_ok(type);
     }
 #ifdef GGML_USE_HIP
-    return type == GGML_TYPE_Q5_1 && GGML_CUDA_CC_IS_RDNA3(cc);
+    return type == GGML_TYPE_Q5_1 && GGML_CUDA_CC_IS_RDNA3_5(cc);
 #else
     return mmid_grouped_type_ok(type);
 #endif
@@ -685,10 +687,14 @@ static int get_mmvq_mmid_max_batch_regular(ggml_type type, int cc) {
     // MoE batch ceiling; this also keeps CUDA graphs on for these batches.
     // RDNA3/RDNA4 (wave32) share the non-grouped kernel's wave-width warp_reduce.
     // IS_RDNA3/IS_RDNA4 are pure cc-range checks, safe above the IS_AMD guard below.
-    // The HIP path remains opt-in until on-hardware parity and performance validation.
+    // Only where the grouped kernel is switched on (CUDA's default, or
+    // LUCE_MMID_GROUPED=1): HIP's default selection keeps the arch's ceiling,
+    // since a batch the grouped path declines (more than MMID_GROUPED_MAX_PAIRS
+    // routed pairs) falls back to the MoE kernel compiled for that ceiling.
     // Q5_0 support is shape-specific and must not raise the MMVQ batch ceiling
     // for the shapes that still use the legacy kernel.
-    if (type != GGML_TYPE_Q5_0 && mmid_grouped_selected(type, cc)) {
+    if (type != GGML_TYPE_Q5_0 && mmid_grouped_env() && mmid_grouped_type_ok(type) &&
+        mmid_grouped_arch_ok(cc) && mmid_grouped_device_ok()) {
         return MMVQ_MAX_MOE_BATCH_SIZE;
     }
     // Dedicated multi-token MoE kernel: extend the MUL_MAT_ID ceiling to 16
@@ -3066,15 +3072,6 @@ static bool mmvq_q8_0_rdna4_enabled() {
     return enabled;
 }
 
-// LUCE_CUDA_MMVQ_Q8_RDNA4_SHORT=0 restores the eight-virtual-wave block shape for short rows.
-static bool mmvq_q8_0_rdna4_short_rows_enabled() {
-    static const bool enabled = []() {
-        const char * e = std::getenv("LUCE_CUDA_MMVQ_Q8_RDNA4_SHORT");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
-    return enabled;
-}
-
 template <int ncols_dst, int c_rows, int c_vw, int c_row_groups, int c_nvu = 8>
 static void mul_mat_vec_q8_0_rdna4_launch_cfg(
         const void * vx, const void * vy, float * dst,
@@ -3139,9 +3136,9 @@ static void mul_mat_vec_q8_0_rdna4_launch_nc(
     // Short rows (qwen4exp's hyper-connection up projection, K = 320: 10 blocks; its shared expert's down
     // projection, K = 640: 20 blocks) leave six of the eight virtual waves without a block. One wave per row
     // group walks only the virtual waves that read, over four rows, with the same partials and sum order.
-    if (kb_off == 0 && nb <= 16 && mmvq_q8_0_rdna4_short_rows_enabled()) {
+    if (kb_off == 0 && nb <= 16) {
         Q8_RDNA4_LAUNCH(4, 1, 4, 2);
-    } else if (kb_off == 0 && nb <= 24 && mmvq_q8_0_rdna4_short_rows_enabled()) {
+    } else if (kb_off == 0 && nb <= 24) {
         Q8_RDNA4_LAUNCH(4, 1, 4, 3);
     } else if (rows <= 1024 || nb <= 64) {
         Q8_RDNA4_LAUNCH(2, 4, 2);

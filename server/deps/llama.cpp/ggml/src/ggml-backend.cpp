@@ -1717,7 +1717,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             const struct ggml_backend_sched_split * consumer = &sched->splits[anchored[k].first];
             struct ggml_tensor * input = consumer->inputs[anchored[k].second];
             sched->node_backend_ids[graph_copy->n_nodes] = consumer->backend_id;
-            graph_copy->nodes[graph_copy->n_nodes++] = tensor_id_copy(hash_id(input), consumer->backend_id, sched->cur_copy);
+            graph_copy->nodes[graph_copy->n_nodes++] =
+                tensor_id_copy(hash_id(input), (size_t) consumer->backend_id, sched->cur_copy);
         }
 
         // add inputs to the graph copy so that they are allocated by ggml-alloc at the start of the split

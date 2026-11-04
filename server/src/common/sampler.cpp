@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -309,6 +310,14 @@ bool sample_logits_is_argmax(const SamplerCfg & cfg) {
     return greedy_scan(cfg) && !cfg.constraint;
 }
 
+bool gpu_argmax_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("LUCE_GPU_ARGMAX");
+        return e == nullptr || e[0] != '0';
+    }();
+    return on;
+}
+
 int sample_logits_top_n(const SamplerCfg & cfg, int vocab) {
     // A sampled top_k draw only (the chain's GPU paths never take a top_k), no grammar, and penalties that can only
     // lower a logit: an outside token then stays at or below the candidates' floor.
@@ -316,10 +325,12 @@ int sample_logits_top_n(const SamplerCfg & cfg, int vocab) {
         cfg.freq_pen < 0.0f || cfg.pres_pen < 0.0f) {
         return 0;
     }
-    // Penalized candidates can drop out of the top_k: keep twice as many then.
+    // Penalized candidates can drop out of the top_k: keep twice as many then. Always keep more than that: the
+    // value below the cut tells a tie at the cut from a clean one (with exactly top_k, no draw could settle).
     const bool penalized = cfg.rep_pen > 1.0f || cfg.freq_pen > 0.0f || cfg.pres_pen > 0.0f;
+    const int need = penalized ? 2 * cfg.top_k : cfg.top_k;
     int n = 32;
-    while (n < (penalized ? 2 * cfg.top_k : cfg.top_k)) n *= 2;
+    while (n <= need) n *= 2;
     return n <= 2048 && n < vocab ? n : 0;
 }
 

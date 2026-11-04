@@ -18,6 +18,7 @@
 
 #include "qwen4exp_internal.h"
 #include "qwen4exp_cache.h"
+#include "common/sampler.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -169,6 +170,13 @@ enum class Qwen4ExpRows {
               // sample; `logits` receives the last emitted row only in the step that ends generation (sample_row
               // returned false)
 };
+
+// The rows a request's verify reads: the device's picks for an argmax sampler, lazily for any other, every row
+// with LUCE_GPU_ARGMAX=0 or when the caller checks against them (read_all).
+inline Qwen4ExpRows qwen4exp_rows_for(const SamplerCfg & sampler, bool read_all = false) {
+    if (read_all || !gpu_argmax_enabled()) return Qwen4ExpRows::all;
+    return sample_logits_is_argmax(sampler) ? Qwen4ExpRows::greedy : Qwen4ExpRows::lazy;
+}
 
 // One verified row as sample_row sees it.
 struct Qwen4ExpRow {
