@@ -52,7 +52,8 @@ struct Qwen4ExpDecodeWorkspace {
     ggml_tensor * hidden_in = nullptr;   // MTP draft rank 0: the trunk hidden rows
     ggml_tensor * kv_row = nullptr;   // I32[T]: the K/V and raw indexer rows written
     ggml_tensor * logits = nullptr;
-    ggml_tensor * greedy = nullptr;   // I32[T]: each logits row's argmax, the lowest id on ties (T=1 decode, verify)
+    ggml_tensor * greedy = nullptr;   // I32[T]: each logits row's argmax, the lowest id on ties (T=1 decode, verify;
+                                      // only for a caller that reads row outputs)
     // [top_n, T]: each logits row's top_n largest logits (F32) and their ids (I32), in no order. Built for sampled
     // requests whose sampler can draw from them (sample_logits_top_n); 0 when this graph has none.
     ggml_tensor * top_ids = nullptr;
