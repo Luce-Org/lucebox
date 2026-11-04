@@ -5,16 +5,28 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
 namespace luce::common {
 
-// Sampled verify (LUCE_SAMPLED_VERIFY=1) of a deterministic chain draft. The
-// target draws each position from its own sampler; a drafted token is kept
-// while it equals the draw. Every committed token is then a single target
-// draw at its position, so the output follows autoregressive sampling
-// exactly, and the draft only decides how far one verify goes.
+// Sampled verify of a deterministic chain draft. The target draws each
+// position from its own sampler; a drafted token is kept while it equals the
+// draw. Every committed token is then a single target draw at its position,
+// so the output follows autoregressive sampling exactly, and the draft only
+// decides how far one verify goes.
+
+// LUCE_SAMPLED_VERIFY: 1 turns sampled verify on, 0 turns it off (sampled
+// requests then decode one token at a time); unset or any other value keeps
+// the backend's default, which is on where it was measured.
+inline bool sampled_verify_switch(bool default_on) {
+    const char * e = std::getenv("LUCE_SAMPLED_VERIFY");
+    if (e != nullptr && std::strcmp(e, "1") == 0) return true;
+    if (e != nullptr && std::strcmp(e, "0") == 0) return false;
+    return default_on;
+}
 
 // Whether a lane's sampler lets it join a batched chain round. A greedy lane
 // verifies by argmax; a sampled lane only with sampled verify on. A grammar

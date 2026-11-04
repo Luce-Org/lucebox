@@ -17,6 +17,7 @@
 #include "common/dflash_draft_graph.h"
 #include "common/platform_env.h"
 #include "common/prof_env.h"
+#include "common/sampled_verify.h"
 #include "kv_quant.h"
 
 #include <chrono>
@@ -109,11 +110,9 @@ static bool laguna_gpu_argmax_enabled() {
 
 }  // namespace
 
+// Opt-in here (LUCE_SAMPLED_VERIFY=1): not measured on Laguna yet.
 static bool laguna_sampled_verify_enabled(const SamplerCfg & sampler, bool do_sample) {
-    static const bool kSampledVerify = []() {
-        const char * e = std::getenv("LUCE_SAMPLED_VERIFY");
-        return e != nullptr && std::string(e) == "1";
-    }();
+    static const bool kSampledVerify = luce::common::sampled_verify_switch(false);
     return kSampledVerify && do_sample && sampler.needs_logit_processing();
 }
 

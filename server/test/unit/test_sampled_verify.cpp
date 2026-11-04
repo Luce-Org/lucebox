@@ -1,6 +1,6 @@
-// Single-chain sampled verify (Qwen35Backend::do_spec_decode with
-// LUCE_SAMPLED_VERIFY=1): the committed tokens must be distributed exactly as
-// AR sampling of the target. A fake target and drafter run the backend's
+// Single-chain sampled verify (Qwen35Backend::do_spec_decode, sampled verify
+// on): the committed tokens must be distributed exactly as AR sampling of
+// the target. A fake target and drafter run the backend's
 // step: sampled_verify_walk over the verify rows, the budget clamp, the
 // fast-rollback bonus drop, then the next seed from sampled_verify_next.
 // Under a grammar, sampled and greedy verify must also match constrained AR

@@ -44,13 +44,11 @@ std::vector<PagedKvTensor> qwen_paged_kv_planes(const TargetCache & cache,
     return planes;
 }
 
-// LUCE_SAMPLED_VERIFY=1 (the single-lane switch): sampled lanes join
-// batched chain rounds, verified by the single-lane sampled walk.
+// Sampled verify, the single-lane switch (on by default,
+// LUCE_SAMPLED_VERIFY=0 off): sampled lanes join batched chain rounds,
+// verified by the single-lane sampled walk.
 bool sampled_verify_enabled() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("LUCE_SAMPLED_VERIFY");
-        return value != nullptr && std::string(value) == "1";
-    }();
+    static const bool enabled = luce::common::sampled_verify_switch(true);
     return enabled;
 }
 } // namespace
