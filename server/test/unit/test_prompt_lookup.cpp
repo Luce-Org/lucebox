@@ -121,3 +121,18 @@ TEST_CASE(PromptLookupFixture, costs_come_from_measured_rounds) {
     policy.observe(false, 1, 0, 0, 40.0);
     CHECK(policy.model_tokens(1) == 1.0);
 }
+
+TEST_CASE(PromptLookupFixture, probes_a_confident_lookup_at_the_draft_models_width) {
+    PromptLookupPolicy policy(8);
+    // Draft-model rounds of width 8 commit 8 tokens in 80 ms. A long match's lookup of the same width borrows that
+    // cost, draft included, so on paper it never wins (6.96 tokens per 80 ms at q 0.96): it is tried a few times.
+    for (int i = 0; i < 20; ++i) policy.observe(false, 8, 7, 0, 80.0);
+    PromptLookupPolicy::Pick pick = policy.choose(8, 7, 30);
+    CHECK(pick.lookup);
+    CHECK(pick.width == 8);
+    // Measured at the same cost, it still commits fewer tokens: the probes stop and the draft model keeps the round.
+    for (int i = 0; i < 3; ++i) policy.observe(true, 8, 7, 30, 80.0);
+    pick = policy.choose(8, 7, 30);
+    CHECK(!pick.lookup);
+    CHECK(pick.width == 8);
+}

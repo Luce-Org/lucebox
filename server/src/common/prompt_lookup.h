@@ -170,9 +170,10 @@ public:
             return pick;
         }
         // A guessed cost could keep a confident lookup from ever measuring its width: try it a few times (the
-        // output is the target's either way; only that round's speed is at stake).
+        // output is the target's either way; only that round's speed is at stake). At the draft model's own width
+        // the guess is that round's cost, draft included, so the lookup is probed there too.
         const int full = k_max + 1;
-        if (full > pick.width && q >= kProbeRate && look_tried_[(size_t) full] < kProbes) {
+        if (full >= pick.width && q >= kProbeRate && look_tried_[(size_t) full] < kProbes) {
             pick.lookup = true;
             pick.width = full;
         }
