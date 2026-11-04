@@ -277,7 +277,7 @@ private:
     std::chrono::steady_clock::time_point chain_round_t0_{};
     std::vector<size_t> chain_accepted_scratch_;
     std::vector<uint8_t> chain_sampled_scratch_;
-    // Sampled chain lanes (LUCE_SAMPLED_VERIFY=1): each lane's verify rows,
+    // Sampled chain lanes (sampled verify on): each lane's verify rows,
     // copied to the host, and the pool their walks run on (made on the
     // first round with two sampled lanes).
     std::vector<float> chain_sampled_rows_;

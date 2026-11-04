@@ -273,7 +273,12 @@ bool Qwen35DFlashTarget::verify_batch(
                            /*logits_tail_rows=*/0,
                            kq_stride_pad_,
                            /*capture_moe_router=*/false,
-                           /*kvflash_mask=*/pool)) {
+                           /*kvflash_mask=*/pool,
+                           /*capture_qk=*/false, /*paged_attention=*/false,
+                           /*n_seqs=*/1, /*seq_slot=*/0, /*paged_max_kv_len=*/0,
+                           /*n_prefill_tokens=*/0, /*prefill_segments=*/nullptr,
+                           /*n_prefill_segments=*/0, /*n_logits_rows=*/0,
+                           /*compact_slots=*/false, verify_top_n_)) {
         std::fprintf(stderr, "verify_batch: build_target_step failed (base=%d n=%d)\n", base_pos, n_tokens);
         return false;
     }
@@ -374,6 +379,28 @@ bool Qwen35DFlashTarget::read_verify_logits(int n_tokens, std::vector<float> & o
     out.resize((size_t)n_tokens * (size_t)vocab);
     ggml_backend_tensor_get(sg_.logits, out.data(), 0,
                             sizeof(float) * out.size());
+    return true;
+}
+
+bool Qwen35DFlashTarget::read_verify_row(int row, std::vector<float> & out) {
+    if (!sg_.logits || row < 0 || row >= (int)sg_.logits->ne[1]) return false;
+    const int64_t vocab = sg_.logits->ne[0];
+    out.resize((size_t)vocab);
+    ggml_backend_tensor_get(sg_.logits, out.data(), (size_t)row * sg_.logits->nb[1],
+                            sizeof(float) * out.size());
+    return true;
+}
+
+bool Qwen35DFlashTarget::read_verify_top(int n_rows, std::vector<float> & vals,
+                                         std::vector<int32_t> & ids, int & top_n,
+                                         int & vocab) {
+    if (!sg_.top_ids || !sg_.top_vals || n_rows <= 0 || n_rows > (int)sg_.top_ids->ne[1]) return false;
+    top_n = (int)sg_.top_ids->ne[0];
+    vocab = (int)sg_.logits->ne[0];
+    vals.resize((size_t)n_rows * top_n);
+    ids.resize((size_t)n_rows * top_n);
+    ggml_backend_tensor_get(sg_.top_vals, vals.data(), 0, sizeof(float) * vals.size());
+    ggml_backend_tensor_get(sg_.top_ids, ids.data(), 0, sizeof(int32_t) * ids.size());
     return true;
 }
 

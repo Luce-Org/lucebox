@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -46,6 +47,30 @@ struct DFlashTarget {
     virtual bool read_verify_logits(int n_tokens, std::vector<float> & out) {
         (void)n_tokens; (void)out;
         return false;
+    }
+
+    // Sampled verify under a top_k: the following verify_batch calls also keep
+    // each row's top `top_n` candidates (sample_logits_top_n; 0 = none).
+    virtual void set_verify_top_n(int top_n) { (void)top_n; }
+
+    // Those candidates for the first n_rows rows of the latest verify,
+    // [n_rows][top_n] logits and ids, with the logits' row width in vocab.
+    // False when that verify kept none.
+    virtual bool read_verify_top(int n_rows, std::vector<float> & vals,
+                                 std::vector<int32_t> & ids, int & top_n,
+                                 int & vocab) {
+        (void)n_rows; (void)vals; (void)ids; (void)top_n; (void)vocab;
+        return false;
+    }
+
+    // Row `row` alone of those logits (vocab floats), for a walk that stops
+    // at the first mismatch and leaves the later rows on the device.
+    virtual bool read_verify_row(int row, std::vector<float> & out) {
+        std::vector<float> rows;
+        if (row < 0 || !read_verify_logits(row + 1, rows)) return false;
+        const size_t vocab = rows.size() / static_cast<size_t>(row + 1);
+        out.assign(rows.end() - static_cast<std::ptrdiff_t>(vocab), rows.end());
+        return true;
     }
 
     // ── KV state management ─────────────────────────────────────────

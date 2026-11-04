@@ -401,7 +401,7 @@ profile and the requirements checked at startup.
 - `LUCE_QWEN35_SPEC_STEP_RATIO` - qwen35_backend.cpp (adaptive policy spec/plain step-time ratio override)
 - `LUCE_ROCMFP3_WIDE_TWO_PASS` - rocmfp3_mix.cu
 - `LUCE_ROCMFP3_ROW3` - rocmfp3_mix.cu (KILL SWITCH: =0 restores two-row tiles on gfx1151)
-- `LUCE_SAMPLED_VERIFY` - laguna_backend.cpp, qwen35_backend.cpp
+- `LUCE_SAMPLED_VERIFY` - sampled_verify.h, laguna_backend.cpp, qwen35_backend.cpp, qwen35_seq_engine.cpp (KILL SWITCH: =0 sends sampled qwen35 requests back to AR decode; =1 opts Laguna in)
 - `LUCE_SHARE_DIR` - http_server.cpp
 - `LUCE_SINGLE_CHAIN_CHECKPOINT_F32` - chain_rollback_policy.h
 - `LUCE_SINGLE_CHAIN_ROLLBACK_DIAG` - chain_rollback_policy.h
