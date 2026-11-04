@@ -16,6 +16,7 @@ static __global__ void moe_fused_combine_shared_kernel_f32(
         const float4 * __restrict__ down_e,
         const float  * __restrict__ weights,
         const float4 * __restrict__ shared_out,
+        const float  * __restrict__ shared_logit,
         float4       * __restrict__ output,
         const int n_embd_vec4,
         const int n_used,
@@ -24,6 +25,7 @@ static __global__ void moe_fused_combine_shared_kernel_f32(
         const size_t down_nb2,
         const size_t weights_nb1,
         const size_t shared_nb1,
+        const size_t logit_nb1,
         const size_t out_nb1) {
 
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -63,7 +65,12 @@ static __global__ void moe_fused_combine_shared_kernel_f32(
     }
 
     if (shared_out != nullptr) {
-        const float4 sh = shared_out[h4 + t * shared_nb1];
+        float4 sh = shared_out[h4 + t * shared_nb1];
+        if (shared_logit != nullptr) {
+            // The shared expert's sigmoid gate as unary.cu's op_sigmoid, times the output as binbcast.cu's op_mul.
+            const float g = 1.0f / (1.0f + expf(-shared_logit[t * logit_nb1]));
+            sh = make_float4(__fmul_rn(sh.x, g), __fmul_rn(sh.y, g), __fmul_rn(sh.z, g), __fmul_rn(sh.w, g));
+        }
         sum0 = __fadd_rn(sh.x, sum0);
         sum1 = __fadd_rn(sh.y, sum1);
         sum2 = __fadd_rn(sh.z, sum2);
@@ -73,10 +80,15 @@ static __global__ void moe_fused_combine_shared_kernel_f32(
     output[h4 + t * out_nb1] = make_float4(sum0, sum1, sum2, sum3);
 }
 
-void ggml_cuda_op_ds4_moe_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_ds4_moe_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                  const ggml_tensor * shared_ungated, const ggml_tensor * shared_logit) {
     const ggml_tensor * down_e     = dst->src[0];
     const ggml_tensor * weights    = dst->src[1];
-    const ggml_tensor * shared_out = dst->src[2];
+    const ggml_tensor * shared_out = shared_logit ? shared_ungated : dst->src[2];
+    if (shared_logit) {
+        GGML_ASSERT(shared_out != nullptr && shared_logit->type == GGML_TYPE_F32 && shared_logit->ne[0] == 1 &&
+                    shared_logit->ne[1] == down_e->ne[2]);
+    }
 
     GGML_ASSERT(down_e->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
@@ -125,6 +137,7 @@ void ggml_cuda_op_ds4_moe_combine(ggml_backend_cuda_context & ctx, ggml_tensor *
     const size_t down_nb2 = down_e->nb[2] / sizeof(float4);
     const size_t weights_nb1 = weights->nb[1] / sizeof(float);
     const size_t shared_nb1 = shared_out ? (shared_out->nb[1] / sizeof(float4)) : 0;
+    const size_t logit_nb1 = shared_logit ? (shared_logit->nb[1] / sizeof(float)) : 0;
     const size_t out_nb1 = dst->nb[1] / sizeof(float4);
 
     cudaStream_t stream = ctx.stream();
@@ -133,6 +146,7 @@ void ggml_cuda_op_ds4_moe_combine(ggml_backend_cuda_context & ctx, ggml_tensor *
         (const float4 *) down_e->data,
         (const float *)  weights->data,
         shared_out ? (const float4 *) shared_out->data : nullptr,
+        shared_logit ? (const float *) shared_logit->data : nullptr,
         (float4 *) dst->data,
         n_embd_vec4,
         n_used,
@@ -141,7 +155,56 @@ void ggml_cuda_op_ds4_moe_combine(ggml_backend_cuda_context & ctx, ggml_tensor *
         down_nb2,
         weights_nb1,
         shared_nb1,
+        logit_nb1,
         out_nb1
     );
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// The renormalized weights of each token's top-k routes, [k, T] from the router probabilities [n_expert, T] and the
+// picks [k, T]: GET_ROWS, SUM_ROWS, CLAMP and DIV in one launch with their arithmetic. One thread per token; the row
+// sum follows reduce_rows_f32 on a k-wide row (lane l holds element l, then the 32-lane xor butterfly; the block's
+// second stage adds zeros only).
+static __global__ void moe_route_weights_norm_kernel(
+        const char * __restrict__ probs, const size_t probs_nb1, const size_t probs_nb2,
+        const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+        const int k, const int n_tokens, const float clamp_min, const float clamp_max, float * __restrict__ dst) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_tokens) return;
+    float w[32];
+    float v[32];
+#pragma unroll
+    for (int l = 0; l < 32; ++l) {
+        w[l] = 0.0f;
+        if (l < k) {
+            const int32_t e = *(const int32_t *) (ids + (size_t) l * ids_nb0 + (size_t) t * ids_nb1);
+            w[l] = *(const float *) (probs + (size_t) e * probs_nb1 + (size_t) t * probs_nb2);
+        }
+        v[l] = w[l];
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float n[32];
+#pragma unroll
+        for (int l = 0; l < 32; ++l) n[l] = v[l] + v[l ^ off];
+#pragma unroll
+        for (int l = 0; l < 32; ++l) v[l] = n[l];
+    }
+    const float sum = fminf(fmaxf(v[0], clamp_min), clamp_max);   // clamp.cu's op_clamp
+    for (int i = 0; i < k; ++i) {
+        dst[(size_t) t * k + i] = w[i] / sum;                       // binbcast.cu's op_div
+    }
+}
+
+void ggml_cuda_moe_route_weights_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * probs3,
+                                      const ggml_tensor * ids, float clamp_min, float clamp_max, ggml_tensor * dst) {
+    const int k = (int) ids->ne[0];
+    const int n_tokens = (int) ids->ne[1];
+    GGML_ASSERT(k <= 32 && probs3->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_nelements(dst) == (int64_t) k * n_tokens);
+    const int block = 64;
+    moe_route_weights_norm_kernel<<<(n_tokens + block - 1) / block, block, 0, ctx.stream()>>>(
+        (const char *) probs3->data, probs3->nb[1], probs3->nb[2], (const char *) ids->data, ids->nb[0], ids->nb[1],
+        k, n_tokens, clamp_min, clamp_max, (float *) dst->data);
     CUDA_CHECK(cudaGetLastError());
 }

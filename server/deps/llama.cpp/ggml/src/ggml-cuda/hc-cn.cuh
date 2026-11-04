@@ -20,6 +20,12 @@ struct ggml_cuda_hc_combine_norm_args {
     const ggml_tensor * moe_sh_logit = nullptr;   // [1, T]             F32
     bool                moe_down_f16 = false;     // moe_down holds F16 in place (F16-only mark)
     int8_t *            out_q8       = nullptr;   // Q8 activation tiles of xn for the W8A8 HC down (mmb-w8a8.cuh layout)
+    void *              out_q8_1     = nullptr;   // xn's q8_1 rows for an MMVQ HC down (a q8 memo buffer; not MoE mode)
+    // A combine folded in ahead of this one (not MoE mode): the residual first takes pre_block * w(pre_inject), with
+    // the folded node's constants and arithmetic, so its node does not run (see ggml_cuda_try_hc_cn_pair).
+    const ggml_tensor * pre_inject = nullptr;     // [hc, T]          F32 contiguous
+    const ggml_tensor * pre_block  = nullptr;     // [n_embd, 1, T]   F32 contiguous
+    float               pre_s1 = 0.0f, pre_b1 = 0.0f, pre_s2 = 0.0f, pre_b2 = 0.0f;
 };
 
 void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_combine_norm_args & args);
