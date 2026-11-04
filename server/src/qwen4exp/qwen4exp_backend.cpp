@@ -767,7 +767,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     // each row's pick from the device (tok already holds it, the host scan's pick); a top_k draw first tries the
     // row's top candidates, the same draw sample_logits makes from the whole row, which it reads only when the
     // candidates cannot settle the cut. Kill switch: LUCE_GPU_ARGMAX=0 reads every row back.
-    const Qwen4ExpRows rows = qwen4exp_rows_for(req.sampler, decode_check_);
+    const Qwen4ExpRows rows = qwen4exp_rows_for(req.sampler, decode_check_ != nullptr);
     const int top_n = rows == Qwen4ExpRows::lazy ? sample_logits_top_n(req.sampler, weights_.n_vocab) : 0;
     int top_rows = 0, top_misses = 0;
     auto sample_row = [&](int32_t fed, const Qwen4ExpRow & row, int32_t & tok) {
