@@ -95,6 +95,10 @@ int sample_logits(const float * logits_in,
 // tie rule instead of reading the row.
 bool sample_logits_is_argmax(const SamplerCfg & cfg);
 
+// Whether a backend may pick tokens on the device (an argmax, top candidates)
+// instead of reading logits rows back. Kill switch: LUCE_GPU_ARGMAX=0.
+bool gpu_argmax_enabled();
+
 // The candidate count sample_logits_top needs for this config (a power of two of at least 32 covering top_k, twice
 // top_k with a penalty), or 0 when it cannot decide from candidates: greedy, no top_k, a grammar, or a penalty that
 // can raise a logit.

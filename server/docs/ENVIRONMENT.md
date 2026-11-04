@@ -284,7 +284,7 @@ profile and the requirements checked at startup.
 - `LUCE_G4_BSA_CHUNK` - gemma4_graph.cpp
 - `LUCE_GEMMA4_LAYER_SPLIT_UBATCH` - gemma4_layer_split_adapter.cpp
 - `LUCE_GEMMA4_NO_KVPAD` - gemma4_graph.cpp
-- `LUCE_GPU_ARGMAX` - qwen35_backend.cpp, qwen4exp_backend.cpp, qwen4exp_seq_engine.cpp
+- `LUCE_GPU_ARGMAX` - sampler.cpp (gpu_argmax_enabled)
 - `LUCE_GPU_DRAFT_TOPK` - qwen35_dflash_target.cpp
 - `LUCE_GPU_SAMPLE` - geometric_sampler_cuda.cu
 - `LUCE_GPU_VERIFY_ARGMAX` - qwen35_dflash_target.cpp

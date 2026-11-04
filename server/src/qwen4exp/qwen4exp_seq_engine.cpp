@@ -246,12 +246,7 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::mtp_step(const StepInput & input) {
     // sampled. Greedy rows take the device's pick (token already holds it), the lowest id of the maximum as
     // max_element finds it; a top_k draw first tries the row's top candidates (sample_logits_top). Kill switch:
     // LUCE_GPU_ARGMAX=0 reads every row back.
-    static const bool gpu_argmax = [] {
-        const char * e = std::getenv("LUCE_GPU_ARGMAX");
-        return e == nullptr || e[0] != '0';
-    }();
-    const Qwen4ExpRows rows = !gpu_argmax ? Qwen4ExpRows::all
-                            : slot.sampler.needs_logit_processing() ? Qwen4ExpRows::lazy : Qwen4ExpRows::greedy;
+    const Qwen4ExpRows rows = qwen4exp_rows_for(slot.sampler);
     const int top_n = rows == Qwen4ExpRows::lazy ? sample_logits_top_n(slot.sampler, weights_.n_vocab) : 0;
     const size_t history0 = slot.sample_history.size();
     auto sample_row = [&](int32_t fed, const Qwen4ExpRow & row, int32_t & token) {

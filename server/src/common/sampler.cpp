@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -307,6 +308,14 @@ int draw_after_cut(std::vector<std::pair<float, int>> & cand, const SamplerCfg &
 
 bool sample_logits_is_argmax(const SamplerCfg & cfg) {
     return greedy_scan(cfg) && !cfg.constraint;
+}
+
+bool gpu_argmax_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("LUCE_GPU_ARGMAX");
+        return e == nullptr || e[0] != '0';
+    }();
+    return on;
 }
 
 int sample_logits_top_n(const SamplerCfg & cfg, int vocab) {
