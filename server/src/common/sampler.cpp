@@ -325,10 +325,12 @@ int sample_logits_top_n(const SamplerCfg & cfg, int vocab) {
         cfg.freq_pen < 0.0f || cfg.pres_pen < 0.0f) {
         return 0;
     }
-    // Penalized candidates can drop out of the top_k: keep twice as many then.
+    // Penalized candidates can drop out of the top_k: keep twice as many then. Always keep more than that: the
+    // value below the cut tells a tie at the cut from a clean one (with exactly top_k, no draw could settle).
     const bool penalized = cfg.rep_pen > 1.0f || cfg.freq_pen > 0.0f || cfg.pres_pen > 0.0f;
+    const int need = penalized ? 2 * cfg.top_k : cfg.top_k;
     int n = 32;
-    while (n < (penalized ? 2 * cfg.top_k : cfg.top_k)) n *= 2;
+    while (n <= need) n *= 2;
     return n <= 2048 && n < vocab ? n : 0;
 }
 
