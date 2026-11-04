@@ -1573,12 +1573,6 @@ if(LUCE_TESTS)
         add_executable(bench_ds41_q8_mmvq test/bench/bench_ds41_q8_mmvq.cpp)
         target_link_libraries(bench_ds41_q8_mmvq PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_qn_moe.cpp")
-        # Benchmark, not a test: Qwen3.8-Flash-Next routed experts (gate/up + down
-        # MUL_MAT_ID) on one device at split decode and verify widths.
-        add_executable(bench_qn_moe test/bench/bench_qn_moe.cpp)
-        target_link_libraries(bench_qn_moe PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
-    endif()
     add_executable(test_rope_tail test/unit/test_rope_tail.cpp)
     target_compile_definitions(test_rope_tail PRIVATE LUCE_ROPE_TEST_GPU=1)
     target_link_libraries(test_rope_tail PRIVATE ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
@@ -1706,6 +1700,16 @@ if(LUCE_TESTS)
                 $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda> --combine-only)
         set_tests_properties(deepseek4_mmid_grouped_cuda_combine_override
             PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_qn_split_fusions.cpp")
+        # Host-only (GGML C API): the Qwen3.8 split fusions and RDNA4 decode
+        # kernels against their unfused graphs, on every GPU.
+        add_executable(test_qn_split_fusions test/unit/test_qn_split_fusions.cpp)
+        target_include_directories(test_qn_split_fusions PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        target_link_libraries(test_qn_split_fusions PRIVATE
+            ggml ${LUCE_GGML_BACKEND_TARGET} ggml-base)
+        list(APPEND _raw_unit_test_targets test_qn_split_fusions)
     endif()
     if(LUCE_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_moe_combine_cuda.cpp")
         add_executable(test_ds4_moe_combine_cuda test/unit/test_ds4_moe_combine_cuda.cpp)

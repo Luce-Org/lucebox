@@ -6,7 +6,6 @@
 #include "qwen4exp_chunk.h"
 
 #include "common/cuda_graph_overrides.h"
-#include "common/moe_hybrid_routing_stats.h"
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
 
@@ -231,37 +230,10 @@ static int layer_index(const Qwen4ExpLayer & L, const Qwen4ExpWeights & w) {
     return il >= 0 && il < (ptrdiff_t) w.layers.size() ? (int) il : -1;
 }
 
-// LUCE_QWEN4EXP_LATE_EXPERTS=all|<a>-<b>: the layers whose routed experts join one layer late (never the last).
-static std::pair<int, int> qwen4exp_late_range() {
-    static const std::pair<int, int> range = [] {
-        const char * e = std::getenv("LUCE_QWEN4EXP_LATE_EXPERTS");
-        if (!e || !*e) return std::make_pair(1, 0);
-        int a = 0, b = 1 << 20;
-        if (std::strcmp(e, "all") != 0 && std::sscanf(e, "%d-%d", &a, &b) != 2) return std::make_pair(1, 0);
-        std::fprintf(stderr, "[qwen4exp] late experts on layers %d-%d\n", a, b);
-        return std::make_pair(a, b);
-    }();
-    return range;
-}
-static bool qwen4exp_late_layer(int il, int n_layer) {
-    const auto r = qwen4exp_late_range();
-    return il >= r.first && il <= r.second && il < n_layer - 1;
-}
-static bool qwen4exp_late_any() { return qwen4exp_late_range().first <= qwen4exp_late_range().second; }
-
 // Split mode: forwards of up to this many rows (decode, verify, short batches)
 // share one scheduler and keep F32 activations on the link; longer prompt chunks
 // cross it as F16.
 constexpr int64_t kSplitShortRows = 64;
-
-// Routing stats for --expert-placement (LUCE_QWEN4EXP_ROUTING_STATS_OUT=<csv>): every prompt chunk records each
-// trunk layer's top-k picks, and the CSV is rewritten after the chunk. Decode and verify graphs are not touched.
-struct Qwen4ExpRouteProbe { std::vector<std::pair<int, ggml_tensor *>> picks; };
-static thread_local Qwen4ExpRouteProbe * g_route_probe = nullptr;
-static const char * qwen4exp_route_stats_path() {
-    static const char * path = std::getenv("LUCE_QWEN4EXP_ROUTING_STATS_OUT");
-    return path && *path ? path : nullptr;
-}
 
 // The router: the top-k picks and their renormalized weights, [n_used, T] each.
 static void moe_router(ggml_context * c, ggml_tensor * cur, const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
@@ -270,11 +242,6 @@ static void moe_router(ggml_context * c, ggml_tensor * cur, const Qwen4ExpLayer 
     ggml_tensor * logits = mm(c, L.ffn_gate_inp, cur);      // [n_expert, T]
     ggml_tensor * probs  = ggml_soft_max(c, logits);
     *sel = ggml_argsort_top_k(c, probs, (int) w.n_expert_used);
-    if (g_route_probe && layer_index(L, w) >= 0) {
-        ggml_tensor * picks = ggml_cont(c, *sel);
-        ggml_set_output(picks);
-        g_route_probe->picks.push_back({layer_index(L, w), picks});
-    }
     ggml_tensor * probs3 = ggml_reshape_3d(c, probs, 1, w.n_expert, n_tokens);
     *wsel = ggml_reshape_2d(c, ggml_get_rows(c, probs3, *sel), w.n_expert_used, n_tokens);
     *wsel = ggml_div(c, *wsel, ggml_clamp(c, ggml_sum_rows(c, *wsel), 6.103515625e-5f, INFINITY));
@@ -729,14 +696,6 @@ static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
     return attn;
 }
 
-// Q [D, Hq, 1] as flash attention's [D, 1, Hq] query. The decode kernels read Q through its strides, so for one
-// query row the permuted view replaces the copy (same values read, same bits). LUCE_QWEN4EXP_Q_CONT=1 keeps the copy.
-static ggml_tensor * qwen4exp_q_rows(ggml_context * c, ggml_tensor * q) {
-    static const bool keep = [] { const char * e = std::getenv("LUCE_QWEN4EXP_Q_CONT"); return e && e[0] == '1'; }();
-    ggml_tensor * p = ggml_permute(c, q, 0, 2, 1, 3);
-    return keep ? ggml_cont(c, p) : p;
-}
-
 // QSA block ratio of the full-attention layers (0 when the model has no indexer).
 static int64_t qsa_ratio(const Qwen4ExpWeights & w) {
     for (int il = 0; il < w.n_layer && il < (int) w.compress_ratios.size(); ++il) {
@@ -913,7 +872,7 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
             ggml_tensor * a;
             if (row.qsa == QSA_DENSE) {
                 // One query row: flash attention reads Q through its strides, so the permuted view needs no copy.
-                a = ggml_flash_attn_ext(c, qwen4exp_q_rows(c, q), Kr, Vr, row.mask,
+                a = ggml_flash_attn_ext(c, ggml_permute(c, q, 0, 2, 1, 3), Kr, Vr, row.mask,
                     1.0f / std::sqrt((float) D), 0.0f, 0.0f);
                 ggml_flash_attn_ext_set_prec(a, GGML_PREC_F32);
             } else {
@@ -974,7 +933,8 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
             K_full = ggml_view_3d(c, k_cache, D, mask->ne[0], Hk, k_cache->nb[1], k_cache->nb[2], 0);
             V_full = ggml_view_3d(c, v_cache, D, mask->ne[0], Hk, v_cache->nb[1], v_cache->nb[2], 0);
         }
-        ggml_tensor * Qfa = T == 1 ? qwen4exp_q_rows(c, Q) : ggml_cont(c, ggml_permute(c, Q, 0, 2, 1, 3));  // [D, T, Hq]
+        // [D, T, Hq]; one query row needs no copy, as above.
+        ggml_tensor * Qfa = T == 1 ? ggml_permute(c, Q, 0, 2, 1, 3) : ggml_cont(c, ggml_permute(c, Q, 0, 2, 1, 3));
         attn = ggml_flash_attn_ext(c, Qfa, K_full, V_full, mask,
             1.0f / std::sqrt((float) D), 0.0f, 0.0f);                       // [D, Hq, T, 1]
         ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);                  // match upstream's F32 acc
@@ -1454,34 +1414,6 @@ struct Qwen4ExpLayerBuilder {
         for (size_t i = 0; i < cache.ple_layer_ids.size(); ++i)    ple_idx[cache.ple_layer_ids[i]] = (int) i;
     }
 
-    // Late experts: the previous layer's routed sum and its FFN injection, joining after this layer's attention.
-    ggml_tensor * late_routed = nullptr, * late_inject = nullptr;
-
-    // Adds the late routed sum to the residual. The attention output is queued first and a copy on the expert
-    // device closes its split, so the target runs this layer's attention before it waits for the experts.
-    ggml_tensor * join_late(ggml_tensor * res_hc, ggml_tensor * attn_out, int64_t layer_T) {
-        if (!late_routed) return res_hc;
-        ggml_build_forward_expand(gf, attn_out);
-        ggml_build_forward_expand(gf, res_hc);
-        // The scheduler ends the target's split right before this join (its first expert-device input), so the
-        // routed sum crosses as it is: no extra expert-device node (another graph launch on its critical path).
-        static const bool keep_pin = [] { const char * e = std::getenv("LUCE_QWEN4EXP_LATE_PIN"); return e && e[0] == '1'; }();
-        ggml_tensor * routed = late_routed;
-        if (keep_pin || late_routed->type != GGML_TYPE_F32) {
-            routed = late_routed->type == GGML_TYPE_F32 ? ggml_scale(ctx, late_routed, 1.0f)
-                                                        : ggml_cast(ctx, late_routed, GGML_TYPE_F32);
-            expert_nodes.push_back(routed);
-            ggml_build_forward_expand(gf, routed);
-        }
-        // One HC_COMBINE_NORM launch instead of hc_combine's six elementwise kernels (same formula, last-bit FMA
-        // differences); its normalized channel is not read.
-        ggml_tensor * f = hc_combine_norm(ctx, late_inject, res_hc, routed, w.output_hc_norm, w.n_embd, w.n_hc,
-                                          layer_T, w.rms_eps);
-        res_hc = hc_norm_res(ctx, f, w.n_embd, w.n_hc, layer_T);
-        late_routed = late_inject = nullptr;
-        return res_hc;
-    }
-
     // Layer il + 1 starts with PLE, so layer il's output cannot be fused with its attention norm.
     bool next_is_ple(int il) const { return il + 1 < w.n_layer && w.layers[il + 1].is_ple && has_ple; }
 
@@ -1586,15 +1518,6 @@ struct Qwen4ExpLayerBuilder {
         // from FMA contraction in the new kernel, covered by the long-prompt quality gate). Not at T=1: it cost ~1.7% decode.
         Qwen4ExpMoeParts moe_parts;
         const bool fold = !split && !next_is_ple(il) && ggml_backend_cuda_mmb_prefill(layer_T);
-        if (split && qwen4exp_split_layer(L, w) && qwen4exp_late_layer(il, w.n_layer)) {
-            const Qwen4ExpMoeRoute r = build_moe_route(ctx, cur, L, w);
-            ggml_tensor * routed = build_moe_routed(ctx, r, L, w, expert_nodes);
-            ggml_build_forward_expand(gf, routed);   // the experts' split queues before the target's next work
-            late_routed = routed;
-            late_inject = inject;
-            ggml_tensor * now = r.hot ? build_moe_hot(ctx, r, w.hot->layers[layer_index(L, w)], w) : r.shared;
-            return ffn_output(il, now, inject, res_hc, layer_T, xn_next);
-        }
         cur = build_moe(ctx, cur, L, w, fold ? &moe_parts : nullptr, split ? &expert_nodes : nullptr);
         if (!fold) return ffn_output(il, cur, inject, res_hc, layer_T, xn_next);
         ggml_tensor * gamma = (il + 1 < w.n_layer)
@@ -1891,6 +1814,26 @@ static void read_logits(const ggml_tensor * logits, const ggml_tensor * argmax, 
     ggml_backend_tensor_get(logits, out_logits.data(), 0, ggml_nbytes(logits));
 }
 
+// The matmul scope of a qwen4exp forward. invariant: every quantized matmul column equals its single-token product
+// (ggml_backend_cuda_set_mmvq_batch_invariant). On the split target MUL_MAT_ID also takes the one-wave MoE kernel at
+// every width (ggml_backend_cuda_set_mmvq_moe_all_widths), so its hot experts are read once per step instead of once
+// per token. A split single-token decode runs in this scope too and shares that kernel's arithmetic with verify.
+struct Qwen4ExpMatmulScope {
+    Qwen4ExpMatmulScope(bool invariant, bool split, bool disable_graphs = false)
+        : overrides(disable_graphs, 0, false, 0, invariant), all_widths(invariant && split) {
+        if (all_widths) previous = ggml_backend_cuda_set_mmvq_moe_all_widths(true);
+    }
+    ~Qwen4ExpMatmulScope() {
+        if (all_widths) ggml_backend_cuda_set_mmvq_moe_all_widths(previous);
+    }
+    Qwen4ExpMatmulScope(const Qwen4ExpMatmulScope &) = delete;
+    Qwen4ExpMatmulScope & operator=(const Qwen4ExpMatmulScope &) = delete;
+
+    ScopedCudaGraphOverrides overrides;
+    bool all_widths = false;
+    bool previous = false;
+};
+
 // Replay a retained graph with this forward's inputs and read its logits (and hidden rows). A failed compute drops
 // the graph.
 static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace & ws, ggml_backend_sched_t short_sched,
@@ -1898,10 +1841,8 @@ static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace 
                              std::vector<int32_t> * out_argmax, Qwen4ExpForwardResult & res) {
     upload_stable_inputs(in, ws);
     ggml_status status;
-    {   // verify: as built, with batch-invariant matmul columns (see forward_impl)
-        // A single-token decode takes the same scope: its products then match a verify row's even where a
-        // kernel is invariant only inside it (LUCE_CUDA_MMVQ_MOE_ALL_WIDTHS).
-        ScopedCudaGraphOverrides invariant(false, 0, false, 0, /*mmvq_batch_invariant=*/verify || in.T == 1);
+    {   // verify, and a split single-token decode: as built, with batch-invariant matmul columns (see forward_impl)
+        const Qwen4ExpMatmulScope matmuls(verify || (in.split && in.T == 1), in.split);
         status = in.split ? ggml_backend_sched_graph_compute(ws.sched ? ws.sched : short_sched, ws.gf)
                           : ggml_backend_graph_compute(in.backend, ws.gf);
     }
@@ -2307,7 +2248,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     const int64_t T = n_tokens;
     const int64_t kv_len = pos0 + n_tokens;
     // Split prompt chunks without an MTP hidden capture (see Qwen4ExpStream).
-    const bool pipeline = split && !verify && T >= 1024 && !qwen4exp_late_any();
+    const bool pipeline = split && !verify && T >= 1024;
     // Give a new stable graph at least one full 256-token generation window.
     // The fixed mask excludes its padded tail, while the stable K/V views and
     // set_rows index keep every graph pointer and property unchanged.
@@ -2368,11 +2309,6 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     std::vector<Qwen4ExpAttnRow> rows;         // verify: each row's T=1 attention inputs
     Qwen4ExpLayerBuilder lb(ctx, gf, w, cache, verify, split, has_ple, expert_nodes);
     lb.rows = verify ? &rows : nullptr;
-    Qwen4ExpRouteProbe route_probe;
-    struct ProbeScope {
-        explicit ProbeScope(Qwen4ExpRouteProbe * p) { g_route_probe = p; }
-        ~ProbeScope() { g_route_probe = nullptr; }
-    } probe_scope(!measure && !verify && !use_stable_graph && T > 1 && qwen4exp_route_stats_path() ? &route_probe : nullptr);
     lb.qsa_ws = stable_qsa ? &stable_ws : nullptr;
 
     const int64_t graph_kv_len = use_stable_graph && !verify ? stable_kv_bucket : kv_len;
@@ -2437,7 +2373,6 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         for (int il = 0; il < w.n_layer; ++il) {
             ggml_tensor * inject = nullptr;
             ggml_tensor * cur = lb.attn_half(il, layer_in, res_hc, xn_next, inject);
-            res_hc = lb.join_late(res_hc, cur, T);
             int64_t layer_T = T;
             if (!verify && il == w.n_layer - 1 && T > 1) {
                 if (out_hidden) branch = { cur, inject, res_hc };   // every row's FFN half, for the MTP hidden only
@@ -2474,8 +2409,6 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     }
     ggml_tensor * mtp_positions = mtp_prefill
         ? build_mtp_prefill(ctx, gf, w, cache, hidden, emb_rows, pos0, T) : nullptr;
-    for (const auto & pk : route_probe.picks) ggml_build_forward_expand(gf, pk.second);
-    g_route_probe = nullptr;   // the MTP and output builders above are done; nothing else records
     // Each row's argmax, on the logits' device: greedy decode reads these ids instead of the rows.
     ggml_tensor * argmax = nullptr;
     if (reuse_ws || verify) {
@@ -2544,11 +2477,10 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     }
 
     ggml_status status;
-    {   // verify: every matmul column equals its single-token product (see ggml_backend_cuda_set_mmvq_batch_invariant);
-        // a single-token decode runs in the same scope (see run_stable_graph).
-        // Split prompt chunks: no HIP graph capture (long kernels gain nothing, and
+    {   // verify: every matmul column equals its single-token product; a split single-token decode runs in the same
+        // scope (see Qwen4ExpMatmulScope). Split prompt chunks: no HIP graph capture (long kernels gain nothing, and
         // capture fails on allocating kernels such as the CUB segmented sort).
-        ScopedCudaGraphOverrides invariant(split && T > kSplitShortRows, 0, false, 0, /*mmvq_batch_invariant=*/verify || T == 1);
+        const Qwen4ExpMatmulScope matmuls(verify || (split && T == 1), split, split && T > kSplitShortRows);
         status = split ? ggml_backend_sched_graph_compute(split_sched, gf) : ggml_backend_graph_compute(backend, gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -2578,19 +2510,6 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         cache.indexer_blocks = (int) ((pos0 + T) / qsa_ratio(w));
     }
 
-    if (!route_probe.picks.empty()) {
-        static MoeHybridRoutingStats stats;
-        if (stats.counts.empty()) stats.init(w.n_layer, w.n_expert, w.n_expert_used);
-        std::vector<int32_t> ids;
-        for (const auto & pk : route_probe.picks) {
-            ids.resize((size_t) ggml_nelements(pk.second));
-            ggml_backend_tensor_get(pk.second, ids.data(), 0, ggml_nbytes(pk.second));
-            stats.observe(pk.first, ids.data(), (int) ids.size());
-        }
-        std::string err;
-        if (!stats.save_csv(qwen4exp_route_stats_path(), &err))
-            std::fprintf(stderr, "[qwen4exp] routing stats: %s\n", err.c_str());
-    }
     // The rows stay readable after this call only while the context is retained (pool).
     read_logits(logits, pool ? argmax : nullptr, out_logits, out_argmax, res);
     if (out_hidden && hidden) {
@@ -3406,7 +3325,7 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
         ggml_backend_tensor_set(workspace.qsa_positions, qsa_pos.data(), 0, qsa_pos.size() * sizeof(int32_t));
     }
     // Match solo MMVQ arithmetic regardless of the number of active slots.
-    const ScopedCudaGraphOverrides overrides(false, 0, false, 0, /*mmvq_batch_invariant=*/true);
+    const Qwen4ExpMatmulScope matmuls(true, split);
     const ggml_status status = split ? ggml_backend_sched_graph_compute(workspace.sched, workspace.gf)
                                      : ggml_backend_graph_compute(backend, workspace.gf);
     if (status != GGML_STATUS_SUCCESS) {

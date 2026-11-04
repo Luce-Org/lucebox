@@ -5,6 +5,15 @@
 #include "common.cuh"
 #include "sum.cuh"
 
+// Keep the larger of two (value, column) candidates. Ties go to the lower column, as in the CPU backend's argmax and
+// std::max_element, so greedy sampling from these ids picks the token a host scan of the row would.
+static __device__ __forceinline__ void argmax_take(float & maxval, int & argmax, const float val, const int col) {
+    if (col >= 0 && (val > maxval || (val == maxval && (argmax < 0 || col < argmax)))) {
+        maxval = val;
+        argmax = col;
+    }
+}
+
 static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols) {
     const int64_t row = blockIdx.x;
 
@@ -13,21 +22,14 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     const float * rowx = x + row * ncols;
 
     for (int32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
-        const float val = rowx[col];
-        if (val > maxval) {
-            maxval = val;
-            argmax = col;
-        }
+        argmax_take(maxval, argmax, rowx[col], col);
     }
 
 #pragma unroll
     for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
         const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
         const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
-        if (val > maxval) {
-            maxval = val;
-            argmax = col;
-        }
+        argmax_take(maxval, argmax, val, col);
     }
 
     const int n_warps = blockDim.x / WARP_SIZE;
@@ -53,10 +55,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
             for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
                 const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
                 const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
-                if (val > maxval) {
-                    maxval = val;
-                    argmax = col;
-                }
+                argmax_take(maxval, argmax, val, col);
             }
         }
     }

@@ -587,10 +587,9 @@ static bool mmvq_env_flag(const char * name, bool default_value = false) {
 
 // The RDNA4 Q8_0 gate/up pair also serves plain SwiGLU (the Qwen3.8 shared expert): silu(gate)*up is SwiGLU-DS4
 // with an infinite limit (both clamps return their input), so the pair keeps the two products' and the GLU
-// kernel's values. LUCE_CUDA_RDNA4_SWIGLU_PAIR=0 keeps the separate launches.
-static bool mmvq_rdna4_swiglu_pair_on() {
-    static const bool on = mmvq_env_flag("LUCE_CUDA_RDNA4_SWIGLU_PAIR", true);
-    return on;
+// kernel's values.
+static bool mmvq_rdna4_glu_op_ok(const ggml_glu_op op) {
+    return op == GGML_GLU_OP_SWIGLU_DS4 || op == GGML_GLU_OP_SWIGLU;
 }
 
 static bool mmid_grouped_type_ok(ggml_type type) {
@@ -3097,9 +3096,8 @@ static void mul_mat_vec_q8_0_rdna4_launch_nc(
     // Short rows over many rows (the Qwen3.8 hyper-connection up-projection, K = 320 into 10240 rows): with four
     // physical waves per row pair most of the eight virtual waves get no block. One wave walking all eight per
     // row pair (the same arithmetic) and four row pairs per block run it 1.5-3x faster at 1-8 columns.
-    // LUCE_CUDA_MMVQ_Q8_RDNA4_SMALL_K=0 keeps the old shape there.
-    static const bool small_k = mmvq_env_flag("LUCE_CUDA_MMVQ_Q8_RDNA4_SMALL_K", true);
-    if (small_k && nb <= 16 && rows > 1024) {
+    if (nb <= 16 && rows > 1024) {
+        ggml_cuda_qn_fusion_taken(GGML_CUDA_QN_Q8_SMALL_K);
         Q8_RDNA4_LAUNCH(2, 1, 4);
     } else if (rows <= 1024 || nb <= 64) {
         Q8_RDNA4_LAUNCH(2, 4, 2);
@@ -3185,9 +3183,7 @@ bool ggml_cuda_mmvq_rdna4_glu_pair(const ggml_tensor * gate, const ggml_tensor *
         return false;
     }
     if (x->ne[1] < 2 || x->ne[1] > MMVQ_Q8_RDNA4_MAX_COLS) return false;
-    if (glu->op != GGML_OP_GLU ||
-        (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_DS4 &&
-         !(ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && mmvq_rdna4_swiglu_pair_on())) ||
+    if (glu->op != GGML_OP_GLU || !mmvq_rdna4_glu_op_ok(ggml_get_glu_op(glu)) ||
         glu->src[0] != gate || glu->src[1] != up || ggml_get_op_params_i32(glu, 1) != 0 ||
         glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
         return false;
@@ -3261,17 +3257,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
     static const bool use_moe_kernel =
         mmvq_env_flag("LUCE_CUDA_MMVQ_MOE_KERNEL", true);
 
-    // LUCE_CUDA_MMVQ_MOE_ALL_WIDTHS=1 on RDNA4: the single-column table there is multi-wave, so batch-invariant
-    // MUL_MAT_ID below takes the tokenwise launch, which reads every expert once per token (hot experts on an
-    // R9700 beside a second GPU). Instead the one-wave MoE kernel serves every width, one token included: each
-    // warp walks K for one token in the same order at any width, so decode and verify share its arithmetic.
-    // A single-token forward that must match verify runs inside the batch-invariant scope too (qwen4exp
-    // decode); other single-token graphs, such as the MTP drafter, keep the faster multi-wave kernel.
-    // Its launch bounds hold the RDNA4 table's batch, so wider batches go in slices of that many tokens.
-    static const bool moe_all_widths = mmvq_env_flag("LUCE_CUDA_MMVQ_MOE_ALL_WIDTHS");
-    if (has_ids && moe_all_widths && use_moe_kernel && ggml_cuda_mmvq_batch_invariant() &&
+    // ggml_backend_cuda_set_mmvq_moe_all_widths on RDNA4: the single-column table there is multi-wave, so
+    // batch-invariant MUL_MAT_ID below takes the tokenwise launch, which reads every expert once per token (hot
+    // experts on an R9700 beside a second GPU). Instead the one-wave MoE kernel serves every width, one token
+    // included: each warp walks K for one token in the same order at any width, so decode and verify share its
+    // arithmetic. Its launch bounds hold the RDNA4 table's batch, so wider batches go in slices of that many tokens.
+    if (has_ids && ggml_cuda_mmvq_moe_all_widths() && use_moe_kernel && ggml_cuda_mmvq_batch_invariant() &&
         GGML_CUDA_CC_IS_RDNA4(cc) && !ids_tokenwise_samples && nsamples_x == 1 && nsamples_dst == 1 &&
         fusion.x_bias == nullptr && fusion.gate_bias == nullptr && get_mmvq_mmid_max_batch_rdna4(type) > 0) {
+        ggml_cuda_qn_fusion_taken(GGML_CUDA_QN_MOE_ALL_WIDTHS);
         const int slice = get_mmvq_mmid_max_batch_rdna4(type);
         for (int t0 = 0; t0 < ncols_dst; t0 += slice) {
             mul_mat_vec_q_moe_launch<type>(
@@ -3402,12 +3396,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
         // ggml_cuda_mmvq_rdna4_glu_pair) runs as one launch of this kernel.
         const bool rdna4_glu = has_fusion && fusion.gate != nullptr && fusion.x_bias == nullptr &&
             fusion.gate_bias == nullptr &&
-            (fusion.glu_op == GGML_GLU_OP_SWIGLU_DS4 || (fusion.glu_op == GGML_GLU_OP_SWIGLU && mmvq_rdna4_swiglu_pair_on())) &&
+            mmvq_rdna4_glu_op_ok(fusion.glu_op) &&
             fusion.gate_value_scale == 1.0f && fusion.x_value_scale == 1.0f && kb_off == 0;
         if (!has_ids && (!has_fusion || rdna4_glu) && (ncols_dst == 1 || width_invariant) &&
             ncols_dst <= MMVQ_Q8_RDNA4_MAX_COLS && GGML_CUDA_CC_IS_RDNA4(cc) &&
             warp_size == 32 && table_id == MMVQ_PARAMETERS_RDNA4 &&
             calc_nwarps(type, 1, table_id) == 8 && mmvq_q8_0_rdna4_enabled()) {
+            if (rdna4_glu && fusion.glu_op == GGML_GLU_OP_SWIGLU) ggml_cuda_qn_fusion_taken(GGML_CUDA_QN_SWIGLU_PAIR);
             mul_mat_vec_q8_0_rdna4_launch(
                 vx, vy, dst, ncols_dst, ncols_x, nrows_x, stride_row_x, stride_col_y,
                 stride_col_dst, nchannels_dst, channel_ratio_fd, stride_channel_x,

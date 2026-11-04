@@ -42,33 +42,23 @@ static __device__ __forceinline__ void hc_q8_1_pair(block_q8_1 * q8, const int64
     if (pos == 0) b->ds = make_half2(d, sum);
 }
 
-// The weight a stream gives the block output: w = s2 * sigmoid(s1 * inject + b1) + b2.
-static __device__ __forceinline__ float hc_cn_weight(const float inj, const float s1, const float b1, const float s2, const float b2) {
-    const float x1 = s1 * inj + b1;
-    const float x2 = q4x_sigmoid(x1);
-    return s2 * x2 + b2;
-}
-
 // two elements per thread per iteration, packed 32-bit accesses. q81: xn's q8_1 rows too ([hc * n_embd, T], the HC
-// down projection's MMVQ input; hc * n_embd a multiple of MATRIX_ROW_PADDING, so no padding blocks). pre_block: an
-// earlier combine (residual + pre_block * pre_w, its weight from pre_inject) folded in ahead of this one; its
-// residual is not stored.
+// down projection's MMVQ input; hc * n_embd a multiple of MATRIX_ROW_PADDING, so no padding blocks).
 static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b256(
         const float * inject, const float * residual,
         const float * block_out, const float * gamma,
         float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32,
         const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps, int8_t * q8,
-        block_q8_1 * q81, const float * pre_inject, const float * pre_block,
-        const float ps1, const float pb1, const float ps2, const float pb2) {
+        block_q8_1 * q81) {
     __shared__ float s_sum[32];
     const int c = blockIdx.x, t = blockIdx.y, hc = gridDim.x, tid = threadIdx.x;
-    const float w  = hc_cn_weight(inject[(int64_t) t * hc + c], s1, b1, s2, b2);
-    const float pw = pre_block ? hc_cn_weight(pre_inject[(int64_t) t * hc + c], ps1, pb1, ps2, pb2) : 0.0f;
+    const float x1 = s1 * inject[(int64_t) t * hc + c] + b1;
+    const float x2 = q4x_sigmoid(x1);
+    const float w  = s2 * x2 + b2;
     const int64_t row = (int64_t) t * hc + c;
     const float * res = residual  + row * n_embd;
     float *       dst = out_res   + row * n_embd;
     const float * blk = block_out + (int64_t) t * n_embd;
-    const float * pbk = pre_block ? pre_block + (int64_t) t * n_embd : nullptr;
     constexpr int KP = (HC_CN_MAX_EMB / 2 + HC_CN_BLOCK2 - 1) / HC_CN_BLOCK2;
     float xs[2 * KP];
     float tmp = 0.0f;
@@ -77,12 +67,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
         const int col = (tid + k * HC_CN_BLOCK2) * 2;
         xs[2 * k] = 0.0f; xs[2 * k + 1] = 0.0f;
         if (col + 1 < n_embd) {
-            float2 r = *(const float2 *)(res + col);
-            if (pbk) {
-                const float2 p = *(const float2 *)(pbk + col);
-                r.x = q4x_add_rn(r.x, q4x_mul_rn(p.x, pw));
-                r.y = q4x_add_rn(r.y, q4x_mul_rn(p.y, pw));
-            }
+            const float2 r = *(const float2 *)(res + col);
             const float2 m = *(const float2 *)(blk + col);
             const float a0 = q4x_add_rn(r.x, q4x_mul_rn(m.x, w));
             const float a1 = q4x_add_rn(r.y, q4x_mul_rn(m.y, w));
@@ -90,8 +75,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
             xs[2 * k] = a0; xs[2 * k + 1] = a1;
             tmp += a0 * a0 + a1 * a1;
         } else if (col < n_embd) {
-            const float r0 = pbk ? q4x_add_rn(res[col], q4x_mul_rn(pbk[col], pw)) : res[col];
-            const float a0 = q4x_add_rn(r0, q4x_mul_rn(blk[col], w));
+            const float a0 = q4x_add_rn(res[col], q4x_mul_rn(blk[col], w));
             dst[col] = a0;
             xs[2 * k] = a0;
             tmp += a0 * a0;
@@ -263,14 +247,11 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
     GGML_ASSERT(ggml_nelements(a.out_res) == ggml_nelements(a.out_xn) && ggml_are_same_shape(a.out_res, a.residual));
     GGML_ASSERT(ggml_nelements(a.block_out) == n_embd * n_tokens && ggml_nelements(a.gamma) == n_embd * hc &&
                 ggml_nelements(a.inject) == hc * n_tokens);
-    GGML_ASSERT(!a.pre_block || (ggml_nelements(a.pre_block) == n_embd * n_tokens && ggml_nelements(a.pre_inject) == hc * n_tokens));
 
     hc_combine_norm_f32_b256<<<dim3((unsigned) hc, (unsigned) n_tokens, 1), HC_CN_BLOCK2, 0, ctx.stream()>>>(
         (const float *) a.inject->data, (const float *) a.residual->data,
         (const float *) a.block_out->data, (const float *) a.gamma->data,
         (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,
-        (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps, a.out_q8, (block_q8_1 *) a.out_q8_1,
-        a.pre_block ? (const float *) a.pre_inject->data : nullptr, a.pre_block ? (const float *) a.pre_block->data : nullptr,
-        a.pre_s1, a.pre_b1, a.pre_s2, a.pre_b2);
+        (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps, a.out_q8, (block_q8_1 *) a.out_q8_1);
     CUDA_CHECK(cudaGetLastError());
 }
