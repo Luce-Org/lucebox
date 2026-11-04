@@ -26,6 +26,8 @@
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
 #include "common/specla_mode.h"
+#include "common/pilot_switch.h"
+#include "qwen35_roctx.h"
 #include "qwen35_tensor_parallel.h"
 #include "pflash/pflash_drafter.h"
 #include "pflash/pflash_compress.h"
@@ -287,6 +289,8 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
 // ── init() ──────────────────────────────────────────────────────────────
 
 bool Qwen35Backend::init() {
+    // Lucepilot's known-good arm key: read once, changes nothing.
+    luce::pilot::read_noop_probe();
     configure_concurrent_hipblaslt_default(cfg_);
 
     const bool use_remote_draft = cfg_.remote_draft.enabled();
@@ -2031,6 +2035,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     // Decode (speculative)
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
+        decode_counts_ = DecodeStepCounts{};
         // One controller accounts for every output candidate across spec and AR.
         bool decode_ok = false;
         int ar_n_gen = req.n_gen;
@@ -2089,6 +2094,8 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                     qwen35_empty_visible_output(result.tokens, w_);
             }
         }
+        result.decode_counts = decode_counts_;
+        result.decode_counts.reported = true;
         if (!decode_ok) {
             result.fail(GenerateErrorCode::DecodeFailed);
             return result;
@@ -2388,6 +2395,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     // Decode
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
+        decode_counts_ = DecodeStepCounts{};
         ThinkingBudget budget(req.budget_hook, req.n_gen);
         bool decode_ok = false;
         if (req.force_ar_decode) {
@@ -2415,6 +2423,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                     qwen35_empty_visible_output(result.tokens, w_);
             }
         }
+        result.decode_counts = decode_counts_;
+        result.decode_counts.reported = true;
         if (!decode_ok) {
             result.fail(GenerateErrorCode::DecodeFailed);
             return result;
@@ -2440,6 +2450,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const Qwen35ImageRows * images,
                                const std::vector<int> & restore_points,
                                const std::vector<int32_t> * full_prompt) {
+    const Qwen35RoctxScope roctx_prefill(kQwen35RoctxPrefill);
     if (images && kv_offset != 0) {
         std::fprintf(stderr, "prefill: an image prompt must start at position 0\n");
         return -1;
@@ -3158,6 +3169,9 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
 
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
+        // A plain-decode token: one step, one target forward.
+        decode_counts_.steps++;
+        decode_counts_.target_forwards++;
 
         after_target_compute(sg_, committed, 1);
 
@@ -3728,6 +3742,21 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
+    // usage.luce: the counts the [spec-decode] lines print (steps=,
+    // accepted=A/O, target_forwards=), added on every exit. An AR tail this
+    // loop hands off to adds its own forwards in do_ar_decode.
+    struct DecodeCountsGuard {
+        DecodeStepCounts & out;
+        const int & steps;
+        const SpecAcceptanceStats & acceptance;
+        const int & forwards;
+        ~DecodeCountsGuard() {
+            out.steps += steps;
+            out.draft_tokens += acceptance.offered();
+            out.accepted_tokens += acceptance.accepted();
+            out.target_forwards += forwards;
+        }
+    } decode_counts_guard{decode_counts_, n_draft_steps, acceptance, target_forwards};
     const ChainRollbackPolicy rollback_policy =
         resolve_chain_rollback_policy(cfg_.device.is_tensor_parallel(),
                                       target->exact_fast_rollback());
@@ -3744,13 +3773,18 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
     double profile_rollback_s = 0.0;
     double profile_replay_s = 0.0;
     double profile_feature_s = 0.0;
-    auto profile_start = [&]() {
+    // LUCE_QWEN35_ROCTX marks the phases this profile times, between the same
+    // start/add pairs (one cached bool when unset).
+    Qwen35RoctxPhases roctx_phases;
+    auto profile_start = [&](const char * phase) {
+        roctx_phases.open(phase);
         return tp_profile
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
     };
     auto profile_add = [&](double & total,
                            std::chrono::steady_clock::time_point start) {
+        roctx_phases.close();
         if (tp_profile) {
             total += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - start).count();
@@ -3795,6 +3829,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
     };
 
     while (budget.remaining() > 0) {
+        const Qwen35RoctxScope roctx_step(kQwen35RoctxSpecStep);
         const int need_commit_budget = budget.remaining();
         // Plain-decode step inside the spec loop: no drafter forward, verify
         // the seed token only. Features are still captured, so the drafter
@@ -3862,7 +3897,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 !use_remote_draft &&
                 draft_feature_mirror_can_view(feature_mirror_, committed, draft_ctx, mirror_slot0);
 
-            const auto profile_draft_start = profile_start();
+            const auto profile_draft_start = profile_start(kQwen35RoctxDraft);
             if (use_remote_draft) {
                 local_hidden.clear();
                 if (!remote_draft_.propose(committed, draft_ctx, noise_embed, local_hidden)) {
@@ -3993,7 +4028,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             draft_tok.assign(1, last_tok);
             v_len = 1;
         } else if (!use_tree_verify) {
-            const auto profile_project_start = profile_start();
+            const auto profile_project_start = profile_start(kQwen35RoctxProject);
             // DFlash 2 selector (top-k candidates + low-rank path score) when
             // the drafter ships it.
             bool used_dspark = false;
@@ -4150,7 +4185,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                             conditional_ok = false;
                             return false;
                         }
-                        const auto branch_draft_start = profile_start();
+                        const auto branch_draft_start = profile_start(kQwen35RoctxDraft);
                         ggml_tensor * branch_input = used_draft_kv
                             ? draft_kv_.inp_embed : draft_sg.inp_embed;
                         ggml_cgraph * branch_graph = used_draft_kv
@@ -4175,7 +4210,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                         profile_add(profile_draft_s, branch_draft_start);
                     }
 
-                    const auto branch_project_start = profile_start();
+                    const auto branch_project_start = profile_start(kQwen35RoctxProject);
                     const bool ok = target->project_hidden_to_topk(
                         row_hidden.data(), 1, K, cfg_.ddtree_temp,
                         top_lp, top_ids);
@@ -4204,7 +4239,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 bool selector_tree_ok = false;
                 if (dflash2_tree && dw_.selector.enabled && !use_remote_draft) {
                     Dflash2TreeScores sc;
-                    const auto profile_project_start = profile_start();
+                    const auto profile_project_start = profile_start(kQwen35RoctxProject);
                     if (dflash2_score_candidates(dw_, draft_backend_, *target,
                                                  local_hidden.data(), q_len, last_tok,
                                                  cfg_.ddtree_temp, sc)) {
@@ -4230,7 +4265,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 if (!selector_tree_ok) {
                 std::vector<float>   top_lp;
                 std::vector<int32_t> top_ids;
-                const auto profile_project_start = profile_start();
+                const auto profile_project_start = profile_start(kQwen35RoctxProject);
                 static const bool dspark_tree = []() {
                     const char * e = std::getenv("LUCE_QWEN35_DSPARK_TREE");
                     return !(e && e[0] == '0' && e[1] == '\0');
@@ -4284,7 +4319,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             for (int i = 0; i < tree.n_nodes; i++) flat_tokens[1 + i] = tree.token_ids[i];
 
             if (!sampled_verify) {
-                const auto profile_snapshot_start = profile_start();
+                const auto profile_snapshot_start = profile_start(kQwen35RoctxSnapshot);
                 if (!target->snapshot_kv()) {
                     step_graph_destroy(draft_sg);
                     return false;
@@ -4294,7 +4329,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
 
             std::vector<int32_t> posterior;
             std::vector<float>   node_logits;
-            const auto profile_verify_start = profile_start();
+            const auto profile_verify_start = profile_start(kQwen35RoctxVerify);
             if (!target->verify_tree(committed, tree, flat_tokens, N, posterior,
                                      sampled_verify ? &node_logits : nullptr)) {
                 std::fprintf(stderr, "spec-decode: verify_tree failed\n");
@@ -4365,7 +4400,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                     // from tree captures and defer the bonus as next step's root.
                     std::vector<int> accepted_committed(accepted.begin(),
                                                         accepted.begin() + accepted_emitted);
-                    const auto profile_rollback_start = profile_start();
+                    const auto profile_rollback_start = profile_start(kQwen35RoctxRollback);
                     if (!target->rollback_to_tree(committed, tree, accepted_committed)) {
                         std::fprintf(stderr, "spec-decode: rollback_to_tree failed\n");
                         step_graph_destroy(draft_sg);
@@ -4375,7 +4410,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                     last_tok = next_token;
 
                     if (feature_mirror_.target_feat && !draft_parked_) {
-                        const auto profile_feature_start = profile_start();
+                        const auto profile_feature_start = profile_start(kQwen35RoctxFeatureCopy);
                         if (!sync_local_draft_features(committed, accepted_emitted)) {
                             step_graph_destroy(draft_sg);
                             return false;
@@ -4410,7 +4445,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 }
                 if (can_commit_bonus) replay_batch.push_back(next_token);
 
-                const auto profile_replay_start = profile_start();
+                const auto profile_replay_start = profile_start(kQwen35RoctxReplay);
                 if (!target->restore_kv()) {
                     step_graph_destroy(draft_sg);
                     return false;
@@ -4577,7 +4612,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         //    emit-phase hook could still force a restore+replay this step.
         const bool step_has_snapshot =
             !ar_step || !budget.settled() || stall_replay_armed;
-        const auto profile_snapshot_start = profile_start();
+        const auto profile_snapshot_start = profile_start(kQwen35RoctxSnapshot);
         if (step_has_snapshot && !target->snapshot_kv()) {
             step_graph_destroy(draft_sg);
             return false;
@@ -4585,7 +4620,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         profile_add(profile_snapshot_s, profile_snapshot_start);
 
         int verify_last_tok = -1;
-        const auto profile_verify_start = profile_start();
+        const auto profile_verify_start = profile_start(kQwen35RoctxVerify);
         if (!target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok,
                                    /*capture_ssm_intermediates=*/true)) {
             std::fprintf(stderr, "spec-decode: verify failed\n");
@@ -4739,7 +4774,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             // budget (need_commit_budget), so committing accept_n would emit
             // more tokens than requested. commit_n was already clamped above.
             commit_n = std::min(accept_n, need_commit_budget);
-            const auto profile_rollback_start = profile_start();
+            const auto profile_rollback_start = profile_start(kQwen35RoctxRollback);
             const bool rolled = target->rollback_to(committed, commit_n);
             profile_add(profile_rollback_s, profile_rollback_start);
             if (rolled) {
@@ -4773,7 +4808,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             for (int i = 0; i < commit_n; i++) {
                 replay_batch[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
             }
-            const auto profile_replay_start = profile_start();
+            const auto profile_replay_start = profile_start(kQwen35RoctxReplay);
             if (!target->verify_batch(replay_batch, committed, replay_last_tok, nullptr)) {
                 std::fprintf(stderr, "spec-decode: replay failed\n");
                 step_graph_destroy(draft_sg);
@@ -4796,7 +4831,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 return false;
             }
         } else if (feature_mirror_.target_feat && cache_.target_feat) {
-            const auto profile_feature_start = profile_start();
+            const auto profile_feature_start = profile_start(kQwen35RoctxFeatureCopy);
             if (!sync_local_draft_features(committed, commit_n)) {
                 step_graph_destroy(draft_sg);
                 return false;

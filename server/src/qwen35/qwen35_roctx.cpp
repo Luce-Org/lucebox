@@ -99,6 +99,10 @@ bool qwen35_roctx_env_enabled(const char * value) {
                      equals_ignore_case(value, "yes") || equals_ignore_case(value, "on"));
 }
 
+Qwen35RoctxCallbacks qwen35_roctx_callbacks() {
+    return configured_callbacks();
+}
+
 Qwen35RoctxRange::Qwen35RoctxRange(const char * scope, const Qwen35RoctxMetadata & metadata)
     : Qwen35RoctxRange(scope, metadata, true, configured_callbacks()) {}
 

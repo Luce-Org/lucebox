@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/uma-budget.h"
+#include "ggml-cuda/luce-pilot.cuh"
 #include "ggml-cuda/vision-bias.cuh"
 #include "ggml-cuda/vision-rotary.cuh"
 #include "ggml-cuda/vision-softmax.cuh"

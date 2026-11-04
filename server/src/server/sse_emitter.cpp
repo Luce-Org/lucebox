@@ -1014,6 +1014,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             usage_body["prompt_tokens_details"] = {{"cached_tokens", timings->cached_prefix_tokens}};
             usage_body["timings"] = build_timings_json(*timings, completion_tokens);
         }
+        if (!luce_usage_.is_null()) usage_body["luce"] = luce_usage_;
         json usage = {
             {"id", request_id_}, {"object", "chat.completion.chunk"},
             {"created", created_at_}, {"model", model_name_},

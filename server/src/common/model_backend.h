@@ -435,6 +435,8 @@ struct ModelBackend {
             first.budget_forced_close || retry.budget_forced_close;
         retry.degenerate_decode_close =
             first.degenerate_decode_close || retry.degenerate_decode_close;
+        // Both attempts ran on the device: count the empty one's steps too.
+        retry.decode_counts += first.decode_counts;
         return retry;
     }
 

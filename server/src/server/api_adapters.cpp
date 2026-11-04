@@ -16,6 +16,7 @@
 
 #include "api_adapters.h"
 
+#include "pilot_usage.h"
 #include "prompt_normalize.h"
 
 #include <string_view>
@@ -511,7 +512,7 @@ json build_openai_completion_response(
     // spec_decode_ran disambiguates a real zero-acceptance speculative run
     // from an autoregressive fallback. See docs/specs/thinking-budget.md §6.3.
     const int prompt_tokens = usage_prompt_tokens(req);
-    const json usage = {
+    json usage = {
         {"prompt_tokens", prompt_tokens},
         {"completion_tokens", counts.total},
         {"total_tokens", prompt_tokens + counts.total},
@@ -525,6 +526,9 @@ json build_openai_completion_response(
         {"accept_rate", result.accept_rate},
         {"spec_decode_ran", result.spec_decode_ran},
     };
+    // usage.luce only under LUCE_PILOT_USAGE (pilot_usage.h).
+    attach_pilot_usage(usage, pilot_usage_enabled(), result.tokens,
+                       result.decode_counts);
     return {
         {"id", req.response_id},
         {"object", "chat.completion"},

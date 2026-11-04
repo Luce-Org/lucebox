@@ -97,6 +97,28 @@ struct GenerateError {
     std::string detail;
 };
 
+// Decode work behind GenerateResult::tokens, counted as the backend's
+// [spec-decode] stderr lines count it: speculative steps (steps=), verifier
+// positions offered and accepted with the seed included (accepted=A/O), and
+// target forwards (target_forwards=). A plain-decode token adds one step and
+// one target forward. LUCE_PILOT_USAGE reports it as usage.luce.
+struct DecodeStepCounts {
+    bool reported = false;  // the backend filled the counts below
+    int steps = 0;
+    int draft_tokens = 0;
+    int accepted_tokens = 0;
+    int target_forwards = 0;
+
+    DecodeStepCounts & operator+=(const DecodeStepCounts & other) {
+        reported = reported || other.reported;
+        steps += other.steps;
+        draft_tokens += other.draft_tokens;
+        accepted_tokens += other.accepted_tokens;
+        target_forwards += other.target_forwards;
+        return *this;
+    }
+};
+
 struct GenerateResult {
     // A producer must explicitly call succeed() before returning success.
     std::optional<GenerateError> error = GenerateError{};
@@ -119,6 +141,8 @@ struct GenerateResult {
     // The attempt emitted only tokens suppressed by the response layer and is
     // eligible for the same one-time retry as an empty token vector.
     bool empty_visible_output = false;
+    // Steps, drafts and forwards of the decode (not reported by every backend).
+    DecodeStepCounts decode_counts;
 
     bool ok() const {
         return !error.has_value();

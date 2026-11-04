@@ -1,6 +1,7 @@
 #include "qwen35/qwen35_roctx.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,10 @@ std::vector<std::string> events;
 
 int push(const char * message) { events.emplace_back(message); return 0; }
 int pop() { events.emplace_back("pop"); return 0; }
+int failing_push(const char * message) {
+    events.emplace_back(std::string("fail:") + message);
+    return -1;
+}
 } // namespace
 
 int main() {
@@ -58,6 +63,75 @@ int main() {
 
     events.clear();
     { Qwen35RoctxRange disabled("qwen35.graph_compute", {}, false, {push, pop}); }
+    CHECK(events.empty());
+
+    // Single-request path: unset, the markers are off (one cached check).
+    if (!std::getenv("LUCE_QWEN35_ROCTX")) {
+        CHECK(!qwen35_roctx_enabled());
+        CHECK(qwen35_roctx_callbacks().push == nullptr);
+        { Qwen35RoctxScope off(kQwen35RoctxPrefill); }
+        Qwen35RoctxPhases off;
+        off.open(kQwen35RoctxDraft);
+        CHECK(off.open_count() == 0);
+        off.close();
+    }
+
+    // A scope pushes its name, unadorned, and pops at scope exit.
+    events.clear();
+    { Qwen35RoctxScope prefill(kQwen35RoctxPrefill, true, {push, pop}); }
+    CHECK(events.size() == 2);
+    CHECK(events.size() == 2 && events[0] == "qwen35.prefill" && events[1] == "pop");
+    events.clear();
+    { Qwen35RoctxScope disabled(kQwen35RoctxPrefill, false, {push, pop}); }
+    CHECK(events.empty());
+
+    // Phases: start/add pairs inside a step, the step scope around them.
+    events.clear();
+    {
+        Qwen35RoctxPhases phases(true, {push, pop});
+        {
+            Qwen35RoctxScope step(kQwen35RoctxSpecStep, true, {push, pop});
+            phases.open(kQwen35RoctxDraft);
+            phases.close();
+            phases.open(kQwen35RoctxVerify);
+            CHECK(phases.open_count() == 1);
+            phases.close();
+            phases.close();  // nothing open: no pop
+        }
+    }
+    const std::vector<std::string> expected_step = {
+        "qwen35.spec.step", "qwen35.spec.draft", "pop",
+        "qwen35.spec.verify", "pop", "pop"};
+    CHECK(events == expected_step);
+
+    // An early return between a pair: the destructor closes what is open.
+    events.clear();
+    {
+        Qwen35RoctxPhases phases(true, {push, pop});
+        phases.open(kQwen35RoctxRollback);
+        phases.open(kQwen35RoctxReplay);
+    }
+    const std::vector<std::string> expected_drain = {
+        "qwen35.spec.rollback", "qwen35.spec.replay", "pop", "pop"};
+    CHECK(events == expected_drain);
+
+    // A failed push is not counted, so it is never popped.
+    events.clear();
+    {
+        Qwen35RoctxPhases phases(true, {failing_push, pop});
+        phases.open(kQwen35RoctxSnapshot);
+        CHECK(phases.open_count() == 0);
+        phases.close();
+    }
+    CHECK(events.size() == 1 && events[0] == "fail:qwen35.spec.snapshot");
+
+    // Disabled phases never call back.
+    events.clear();
+    {
+        Qwen35RoctxPhases phases(false, {push, pop});
+        phases.open(kQwen35RoctxFeatureCopy);
+        phases.close();
+    }
     CHECK(events.empty());
     return failures == 0 ? 0 : 1;
 }

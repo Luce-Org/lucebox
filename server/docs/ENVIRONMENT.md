@@ -87,7 +87,11 @@ profile and the requirements checked at startup.
 | `LUCE_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |
 | `LUCE_DS4_DEVICE_ROLLBACK` | 1 | KILL SWITCH (burn-in): =0 restores the per-row DS4 speculative-rollback copies (blocking host copies by default, stream-ordered with `LUCE_DS4_ASYNC_ROLLBACK=1`, pinned host staging with `LUCE_DS4_PINNED_ROLLBACK=1`). By default, when the verifier runs on a CUDA/HIP backend that holds every rollback tensor, save and apply stage in device memory with one batched copy each (`ggml_backend_cuda_copy_batch_async`), whatever the async/pinned switches say. |
 | `LUCE_DS4_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and emit semantic DS4 prefill, speculative-decode, and layer-range markers for external rocprof traces. No events, timing, or device synchronization are added. |
-| `LUCE_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
+| `LUCE_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. On the single-request path it marks `qwen35.prefill`, each speculative `qwen35.spec.step`, and inside it the `LUCE_TP_PROFILE` phases (`qwen35.spec.draft`, `.project`, `.snapshot`, `.verify`, `.rollback`, `.replay`, `.feature_copy`). Unset, each marker costs one cached check. |
+| `LUCE_PILOT_<FAMILY>_<KNOB>` | unset | Lucepilot candidate switches (families GDN, MMQ, GLUE, DRAFT, TREE, ATTN, NOOP, FAULT; `src/common/pilot_switch.h`, `ggml-cuda/luce-pilot.cuh`), each read once: unset keeps the parent path, `0` is off, any other value is on; a tuning knob takes a whole number or string and keeps the parent's value unset. When the process starts with any `LUCE_PILOT_*` variable, each switch prints `[pilot] read NAME=value` (or `=unset`) once, and `[pilot] engaged NAME detail` the first time it changes behaviour. |
+| `LUCE_PILOT_NOOP_PROBE` | unset | Lucepilot liveness key: read once at Qwen3.5 backend init, changes nothing. |
+| `LUCE_PILOT_CANDIDATE` | unset | Lucepilot candidate id. At model load the server prints one `[pilot] {json}` line on stderr (always): `schema` 1, `candidate` (this value or null), `build_sha` (`LUCE_PILOT_BUILD_SHA` from a `luce_pilot_build_info.h` in the CMake `LUCE_PILOT_BUILD_INFO_DIR`, else `"unknown"`), `pilot` (every `LUCE_PILOT_*` variable) and `env` (every other `LUCE_*`, `GGML_*`, `HIP_*`, `ROCR_*`, `DFLASH_*` variable). |
+| `LUCE_PILOT_USAGE` | unset | DEBUG: =1 adds `usage.luce` to OpenAI chat completions (the non-streaming body and the streamed usage chunk): `output_ids` (generated ids, prompt excluded) and the `[spec-decode]` counts `steps`, `draft_tokens` (verifier positions offered, seed included), `accepted_tokens` and `target_forwards`; a plain-decode token is one step and one forward. Backends that do not count (the concurrent engine) report the counts as null. Unset, the field does not exist. |
 | `LUCE_CUDA_MMVF_NARROW_F16` | enabled on qualified gfx1151 narrow F16 matmuls | BURN-IN KILL SWITCH: =0 restores the generic dispatch decision for the narrow F16 projection optimization, unless an explicit `LUCE_MMVF_MAX_NCOLS_F16` ceiling overrides it. |
 | `GGML_CUDA_MMQ_X` | unset | DEBUG: force a supported MMQ output-column tile width (8–128) for architecture tuning; invalid or over-budget values fall back to automatic selection. |
 | `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` | unset (MIX formats adapt) | On sparse-route gfx1151 grouped MoE MMQ, choose the measured output tile from routed rows per expert. Unset: only the shipped ROCmFP2/ROCmFP3 MIX expert formats adapt (tile 32). `=1` (BURN-IN): the plain ROCmFP2/3/4 formats adapt too. `=0`: none adapt. Ordinary matmuls and other devices are unchanged. |
@@ -254,6 +258,11 @@ profile and the requirements checked at startup.
 - `LUCE_MOE_TP_DYNAMIC_ROUTE_BALANCE` - moe_hybrid_ffn_eval.cpp
 - `LUCE_QWEN35_ROCTX` - qwen35_roctx.cpp
 - `LUCE_QWEN4EXP_LOOKUP` - qwen4exp_backend.cpp
+- `LUCE_PILOT_*` - pilot_switch.h (common), luce-pilot.cuh (ggml-cuda)
+- `LUCE_PILOT_NOOP_PROBE` - pilot_switch.h, read by qwen35_backend.cpp
+- `LUCE_PILOT_CANDIDATE` - pilot_boot_line.h
+- `LUCE_PILOT_USAGE` - server/pilot_usage.h
+- `LUCE_PILOT_BUILD_INFO_DIR` - server/CMakeLists.txt (BUILD OPTION, not an env var: directory of the generated `luce_pilot_build_info.h` whose `LUCE_PILOT_BUILD_SHA` the `[pilot]` boot line reports)
 - `LUCE_DS4_SEQ_VERIFY` - deepseek4_dspark_spec.cpp
 - `LUCE_ROCMFP2_ROW4` - rocmfp2_mix.cu
 - `LUCE_MIX_DEDUP` - rocmfp2_mix.cu, rocmfp3_mix.cu

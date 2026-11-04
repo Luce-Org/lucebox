@@ -31,6 +31,7 @@
 #include "tool_parser.h"
 #include "json_schema_grammar.h"
 #include "pin_friendly_prompt.h"
+#include "pilot_usage.h"
 #include "common/kv_rotation.h"
 #include "common/sha1.h"
 #include "pflash/pflash_fold.h"
@@ -10010,6 +10011,9 @@ void HttpServer::process_job(ServerJob * job) {
         (result.tokens.back() == tokenizer_.eos_id() ||
          result.tokens.back() == tokenizer_.eos_chat_id());
     if (req.stream && !client_disconnected) {
+        if (pilot_usage_enabled()) {
+            emitter.set_luce_usage(pilot_usage_json(result.tokens, result.decode_counts));
+        }
         auto final_chunks = emitter.emit_finish(
             completion_tokens, &gen_timings, n_gen_cap, is_eos, result.degenerate_decode_close);
         remember_agent_turn(

@@ -13,6 +13,7 @@
 #include "common/output_constraint.h"
 #include "common/spec_acceptance.h"
 #include "parallel_prefix_txn.h"
+#include "pilot_usage.h"
 #include "response_error.h"
 
 #include <algorithm>
@@ -405,6 +406,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         } else if (req.stream && !s.client_disconnected) {
             const bool is_eos = !s.gen_tokens.empty() &&
                 engine.token_is_eos(s.gen_tokens.back());
+            // The concurrent engine does not count steps: usage.luce carries
+            // the output ids with null counts (as send_nonstream_response).
+            if (pilot_usage_enabled()) {
+                s.emitter->set_luce_usage(
+                    pilot_usage_json(s.gen_tokens, DecodeStepCounts{}));
+            }
             auto final_chunks =
                 s.emitter->emit_finish(
                     s.completion_tokens, &gen_timings,

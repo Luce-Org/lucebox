@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace luce::common {
@@ -113,6 +114,10 @@ public:
                                          int generation_cap = -1,
                                          bool ended_on_eos = false,
                                          bool degenerate = false);
+
+    // usage.luce for the OpenAI usage chunk emit_finish() sends (see
+    // pilot_usage.h). Never set, the chunk has no such field.
+    void set_luce_usage(json luce) { luce_usage_ = std::move(luce); }
 
     // Emit the selected API's terminal failure sequence. Error and success
     // terminals are mutually exclusive; repeated terminal calls are no-ops.
@@ -260,6 +265,7 @@ private:
     int64_t      created_at_;
     std::string  finish_reason_ = "stop";
     bool         terminal_ = false;
+    json         luce_usage_;  // null unless set_luce_usage()
 
     // Responses API IDs
     std::string  msg_item_id_;

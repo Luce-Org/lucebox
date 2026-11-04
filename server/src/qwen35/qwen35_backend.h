@@ -330,6 +330,10 @@ private:
     int  live_snapshot_pos_ = 0;
     bool live_snapshot_deferred_ = false;
     bool generating_ = false;
+    // The running request's decode steps and forwards: do_ar_decode and
+    // do_spec_decode add to it, the generate paths reset it and copy it to
+    // GenerateResult::decode_counts.
+    DecodeStepCounts decode_counts_;
     // Copies a deferred live snapshot into its slot before the live state
     // changes; a no-op otherwise.
     void materialize_live_snapshot();

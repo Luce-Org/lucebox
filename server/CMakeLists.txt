@@ -1164,7 +1164,8 @@ if(LUCE_TESTS)
         test_rope_tail
         test_kernel_qualification_core
         test_cuda_copy_batch
-        test_uma_budget)
+        test_uma_budget
+        test_pilot_switch)
 
     # Standalone check of the DS4 MIX histogram fitter: reuses the converter
     # source with its main() renamed away, so it needs the converter's
@@ -1191,6 +1192,13 @@ if(LUCE_TESTS)
     # Header-only RAM check for managed allocations on integrated GPUs
     # (ggml-cuda/uma-budget.h); it needs no GPU toolkit to build or run.
     add_executable(test_uma_budget test/unit/test_uma_budget.cpp)
+
+    # Lucepilot switches (common/pilot_switch.h, ggml-cuda/luce-pilot.cuh) and
+    # the [pilot] boot line: header-only, no GPU.
+    add_executable(test_pilot_switch test/unit/test_pilot_switch.cpp)
+    target_include_directories(test_pilot_switch PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_pilot_switch PRIVATE nlohmann_json::nlohmann_json)
 
     # Header-only platform shims must remain independently buildable and
     # runnable on hosted Windows workers without a GPU.
@@ -2684,7 +2692,8 @@ if(LUCE_TESTS)
             test/unit/test_mmq_streamk_schedule.cpp
             test/unit/test_moe_hybrid_storage.cpp
             test/unit/test_meta_buffer_oom.cpp
-            test/unit/test_tensor_file_reader.cpp)
+            test/unit/test_tensor_file_reader.cpp
+            test/unit/test_pilot_usage.cpp)
         if(LUCE_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _server_unit_sources
                 test/unit/test_gpu_sampler_cuda.cpp
@@ -2768,6 +2777,11 @@ if(LUCE_TESTS)
             COMMAND test_server_unit Qwen35MaskUploadFixture)
         set_tests_properties(server_unit_qwen35_mask_full_width PROPERTIES
             ENVIRONMENT "LUCE_QWEN35_MASK_FULL_WIDTH=1" LABELS cpu)
+        # The usage.luce cases again with LUCE_PILOT_USAGE on (read once).
+        add_test(NAME server_unit_pilot_usage
+            COMMAND test_server_unit PilotUsageFixture)
+        set_tests_properties(server_unit_pilot_usage PROPERTIES
+            ENVIRONMENT "LUCE_PILOT_USAGE=1" LABELS cpu)
         unset(_server_unit_sources)
         list(APPEND _raw_unit_test_targets test_server_unit)
         list(APPEND _luce_cpu_test_targets test_server_unit)
@@ -2939,7 +2953,8 @@ if(LUCE_TESTS)
         test_rocmfp_mix_gateup_glu
         test_rocmfp_mix_glu_fusable
         test_cuda_copy_batch
-        test_uma_budget)
+        test_uma_budget
+        test_pilot_switch)
     foreach(_cppunit_target IN LISTS _new_cppunit_test_targets)
         if(TARGET ${_cppunit_target})
             target_sources(${_cppunit_target} PRIVATE test/unit/test_unit_main.cpp)
@@ -3316,6 +3331,18 @@ if(LUCE_SERVER)
             src/server/prompt_normalize.cpp
         )
         target_include_directories(luce_server PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        # Lucepilot: the build tool writes luce_pilot_build_info.h (defining
+        # LUCE_PILOT_BUILD_SHA) into this directory; server_main.cpp reports
+        # it in the [pilot] boot line, "unknown" without it.
+        set(LUCE_PILOT_BUILD_INFO_DIR "" CACHE PATH
+            "Directory holding luce_pilot_build_info.h for the [pilot] boot line")
+        if(LUCE_PILOT_BUILD_INFO_DIR)
+            target_include_directories(luce_server PRIVATE "${LUCE_PILOT_BUILD_INFO_DIR}")
+            if(EXISTS "${LUCE_PILOT_BUILD_INFO_DIR}/luce_pilot_build_info.h")
+                set_property(SOURCE src/server/server_main.cpp APPEND PROPERTY
+                    OBJECT_DEPENDS "${LUCE_PILOT_BUILD_INFO_DIR}/luce_pilot_build_info.h")
+            endif()
+        endif()
         # This script executes the server directly on the build host.
         if(LUCE_TESTS AND NOT CMAKE_CROSSCOMPILING)
             add_dependencies(check luce_server)

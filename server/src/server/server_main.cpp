@@ -45,6 +45,19 @@
 #include "moss_image/image_server.h"
 #include "moss_image/pipeline.h"
 #endif
+#include "common/pilot_boot_line.h"
+
+// The Lucepilot build tool writes luce_pilot_build_info.h (defining
+// LUCE_PILOT_BUILD_SHA) into its build tree and passes that directory as
+// -DLUCE_PILOT_BUILD_INFO_DIR; other builds report "unknown".
+#if defined(__has_include)
+#if __has_include("luce_pilot_build_info.h")
+#include "luce_pilot_build_info.h"
+#endif
+#endif
+#ifndef LUCE_PILOT_BUILD_SHA
+#define LUCE_PILOT_BUILD_SHA "unknown"
+#endif
 
 #include <filesystem>
 #include <algorithm>
@@ -1962,6 +1975,9 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     if (model.expert_device && !apply_expert_device(*model.expert_device, backend_plan)) {
         return 2;
     }
+    // Lucepilot's "[pilot] {json}" line, once per process: the environment is
+    // final here (launch profile and flag-derived variables are installed).
+    luce::pilot::emit_boot_line_once(LUCE_PILOT_BUILD_SHA);
     auto backend_owner = create_backend(backend_plan);
     if (!backend_owner) {
         std::fprintf(stderr, "[server] backend creation failed\n");
