@@ -168,7 +168,9 @@ public:
     // the slot this request restores from; it is never chosen as the
     // eviction or budget victim and the free-slot path skips it, so the new
     // snapshot lands in a different slot and the restore point can slide
-    // forward past the deepest slot. `reachable_from` is forwarded to
+    // forward past the deepest slot. A `forced_cut_learned` (the shared-prefix
+    // cut) yields to the deep-first rule below like the head does; an
+    // explicit one wins over it. `reachable_from` is forwarded to
     // select_inline_snapshot_boundary; a forced cut below it is not forced.
     // With a `restore_point_spacing` (ModelBackend::restore_point_spacing), a
     // cut other than the end of the last message moves down to the deepest
@@ -188,7 +190,8 @@ public:
         int restore_source_slot = -1,
         InlineSnapshotSize estimate_bytes = {},
         int reachable_from = 0,
-        int restore_point_spacing = 0);
+        int restore_point_spacing = 0,
+        bool forced_cut_learned = false);
 
     // Commit an already-materialized snapshot without a reservation. Used by
     // cache import/bootstrap paths and tests.
@@ -250,6 +253,28 @@ public:
     // prefix: the next request continues it the same way.
     void mark_agent_turn(int slot);
     bool agent_turn(int slot) const;
+
+    // ── Shared prefixes ─────────────────────────────────────────────
+    // The protect kind: a request's system/tools head or its shared-prefix
+    // cut. It remembers the conversation that captured it.
+    bool shared_prefix(int slot) const;
+    // `prompt` restores the shared prefix in `slot` from another
+    // conversation: it does not extend the capturing request's prompt up to
+    // that prompt's last message. A later turn of the same conversation
+    // does; a new conversation, or an edit of an earlier message, does not.
+    // Comparing the first tokens after the cut would not do: a harness
+    // opens every first user message of a project alike (Claude Code's
+    // CLAUDE.md reminder, Codex's environment context).
+    bool restored_by_another_conversation(int slot,
+                                          const std::vector<int32_t> & prompt) const;
+    void set_pinned(int slot, bool pinned);
+    bool pinned(int slot) const;
+    // Resident bytes of the pinned entries.
+    size_t pinned_bytes() const;
+    // The slots of the pinned entries.
+    std::vector<int> pinned_slots() const;
+    // The entry keyed by exactly `ids`; -1 when none.
+    int slot_of(const std::vector<int32_t> & ids) const;
     // Opt-in log of entries a commit replaced (its reservation's victim) or
     // the resident budget evicted, for callers whose payload outlives the
     // metadata (the concurrent scheduler writes them to disk).
@@ -348,6 +373,13 @@ private:
         int                  disk_key_len = 0;
         std::string          aux;
         bool                 agent_turn = false;
+        // A shared prefix (protect): the conversation that captured it, as
+        // the length and hash of its prompt up to its last message (a later
+        // turn of that conversation extends it), and whether it is pinned
+        // (kv/prefix_pins.h). capture_len 0: not known (read from disk).
+        int                  capture_len = 0;
+        PrefixHash           capture_hash{};
+        bool                 pinned = false;
     };
     std::vector<LruEntry> entries_;
     int next_slot_ = 0;

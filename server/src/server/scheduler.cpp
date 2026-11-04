@@ -141,6 +141,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // The cache plans this engine's checkpoints; whether the disk cache
     // takes part is logged there.
     kv_cache_.attach_engine(engine_checkpoints);
+    // Pins: disk marks checked against the catalog, and the pins with no KV
+    // for these settings queued to warm at idle.
+    kv_cache_.load_pins(
+        shared_prefix_ram_cap(engine_checkpoints.estimate_bytes(engine.max_context())),
+        engine.max_context());
 
     // Degenerate-run guard shared with do_ar_decode: explicit env override,
     // else 32 when the min-tokens floor is active, else off.
@@ -510,8 +515,26 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             query.request_id = req.response_id.c_str();
             query.prompt = &req.prompt_tokens;
             query.disk_policy = req.disk_cache_policy;
-            query.prefer_head = !req.tools.empty();
+            // The shared-prefix cut, as on the single-sequence path: found
+            // once, before this request's own region joins the ring (a
+            // request planned again after a disk read keeps it).
+            const auto boundaries = find_all_boundaries(
+                req.prompt_tokens, prefix_cache_.chat_markers());
+            query.prefer_head = shared_prefixes_.prefers_head(boundaries, !req.tools.empty());
             query.forced_cut = req.pin_end_token;
+            if (query.prefer_head && query.forced_cut <= 0) {
+                if (job->shared_prefix_cut < 0) {
+                    job->shared_prefix_cut = shared_prefixes_.cut(req.prompt_tokens, boundaries);
+                    if (job->shared_prefix_cut > 0) {
+                        std::fprintf(stderr, "[shared-prefix] %s cut=%d prompt=%zu\n",
+                                     req.response_id.c_str(), job->shared_prefix_cut,
+                                     req.prompt_tokens.size());
+                    }
+                    kv_cache_.remember_prefix(req.prompt_tokens, boundaries);
+                }
+                query.forced_cut = job->shared_prefix_cut;
+                query.learned_cut = query.forced_cut > 0;
+            }
             query.queued_shared_prefix = [&]() {
                 return queued_shared_prefix(req.prompt_tokens);
             };
@@ -594,7 +617,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             return AdmissionDisposition::Retired;
         }
         next_request_id++;
-        kv_cache_.restored(cache_plan, prefix, req.prompt_tokens.size());
+        kv_cache_.restored(cache_plan, prefix, req.prompt_tokens, req.client);
 
         // Commit response bytes only after admission. A busy routed request
         // can still try another model; no tokenizer/model identity is on wire.
@@ -907,8 +930,29 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     // scratch memory back and park in a blocking dequeue.
                     publish_live_count();
                     backend_.release_scratch();
-                    job = !kv_cache_.reads_to_reap() ? dequeue()
-                        : dequeue_for(std::chrono::milliseconds(5));
+                    // Prefixes pinned while busy reach disk now, and the
+                    // catalog's timed save and expiry run.
+                    kv_cache_.flush_pins();
+                    // Then the pins with no KV here are warmed, one at a
+                    // time, once the server has been idle for a moment. A
+                    // request arriving during a warm waits for its current
+                    // engine step (KvCache::warm_next_on_engine).
+                    if (kv_cache_.warm_pending() && config_.shared_prefix_warm_grace_ms > 0) {
+                        job = dequeue_for(
+                            std::chrono::milliseconds(config_.shared_prefix_warm_grace_ms));
+                    }
+                    while (!job && !stopping_.load() && kv_cache_.warm_pending() &&
+                           !has_pending_jobs() &&
+                           kv_cache_.warm_next_on_engine([this] {
+                               return has_pending_jobs() || stopping_.load();
+                           })) {
+                        backend_.release_scratch();
+                        publish_memory_report();
+                    }
+                    if (!job) {
+                        job = !kv_cache_.reads_to_reap() ? dequeue()
+                            : dequeue_for(std::chrono::milliseconds(5));
+                    }
                     woke_from_idle = job != nullptr;
                 } else {
                     // A fresh idle transition may spend its bounded batching

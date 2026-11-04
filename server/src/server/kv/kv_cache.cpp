@@ -40,6 +40,7 @@ KvLease KvCache::match(const KvMatchQuery & query) {
             continue;
         }
         index_.record_inline_hit(inline_slot, inline_len, prompt.size());
+        consider_pin(inline_slot, prompt, query.client ? *query.client : std::string());
         lease.restore = Checkpoint::of_cache_slot(inline_slot);
         lease.prefix_len = inline_len;
         lease.using_restore = true;
@@ -145,6 +146,12 @@ void KvCache::match_disk(KvLease & lease, const KvMatchQuery & query) {
                 checkpoints_.free(staging);
                 continue;
             }
+            // A pinned prefix's file: the hit keeps the pin from expiring.
+            if (shared_ && shared_->learns()) {
+                if (const auto pin = pinned_file(prefix_tokens)) {
+                    pins_->hit(pin->id, disk_.layout_name());
+                }
+            }
             lease.restore = staging;
             lease.prefix_len = hit_pos;
             lease.using_restore = true;
@@ -217,7 +224,7 @@ void KvCache::admit(KvLease & lease, const std::vector<int32_t> & prompt,
             [this](int target_cut) {
                 return checkpoints_.estimate_bytes(target_cut);
             },
-            reachable_from, checkpoints_.restore_point_spacing());
+            reachable_from, checkpoints_.restore_point_spacing(), query.learned_cut);
         lease.snap = Checkpoint::of_cache_slot(lease.snap_reservation.slot());
         lease.snap_cut = lease.snap_reservation.target_cut();
     };
@@ -422,6 +429,11 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
         read_.reset();
         const int pos = snap.cur_pos();
         if (!snap.empty() && disk_.adopt(std::move(snap), engine.staging())) {
+            // A pinned prefix's file: the hit keeps the pin from expiring.
+            if (shared_ && shared_->learns()) {
+                const std::vector<int32_t> key(prompt.begin(), prompt.begin() + probe.len);
+                if (const auto pin = pinned_file(key)) pins_->hit(pin->id, disk_.layout_name());
+            }
             out.disk_restore = true;
             out.restore_slot = -1;
             plan.restore = EngineCheckpoints::ref(engine.staging(), pos);
@@ -452,13 +464,15 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
     // forward past the deepest slot (same rule as the single-sequence
     // path's restore_source_slot).
     const int restored_len = plan.restore.valid() ? plan.restore.tokens : 0;
-    const auto reserve_capture = [&](int forced_cut) {
+    const auto reserve_capture = [&](int forced_cut, bool learned) {
         return index_.reserve_inline_snap(
             prompt, restored_len, query.prefer_head, forced_cut, out.restore_slot,
             [&engine](int target_cut) { return engine.estimate_bytes(target_cut); },
-            /*reachable_from=*/0, checkpoints_.restore_point_spacing());
+            /*reachable_from=*/0, checkpoints_.restore_point_spacing(), learned);
     };
-    PrefixCache::InlineReservation capture = reserve_capture(query.forced_cut);
+    PrefixCache::InlineReservation capture =
+        reserve_capture(query.forced_cut, query.learned_cut);
+    if (capture.active() && query.spare_pins && takes_a_pin(capture)) capture.cancel();
     // Subagents launched together: when the requests still queued share
     // more of this prompt than its own capture keeps whole (system messages
     // that differ only after the tools), it captures the shared prefix
@@ -470,7 +484,7 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
         const int shared = query.queued_shared_prefix();
         if (shared < own_cut && shared - restored_len >= wait_min) {
             capture.cancel();
-            capture = reserve_capture(shared);
+            capture = reserve_capture(shared, false);
             if (capture.active() && capture.target_cut() <= shared &&
                 capture.target_cut() - restored_len >= wait_min) {
                 std::fprintf(stderr,
@@ -479,7 +493,7 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
                     capture.target_cut(), own_cut);
             } else {
                 capture.cancel();
-                capture = reserve_capture(query.forced_cut);
+                capture = reserve_capture(query.forced_cut, query.learned_cut);
             }
         }
     }
@@ -573,9 +587,10 @@ std::string KvCache::admitted(KvPlan & plan, const PrefixStoreAdmission & prefix
 }
 
 void KvCache::restored(const KvPlan & plan, const PrefixStoreAdmission & prefix,
-                       size_t prompt_len) {
+                       const std::vector<int32_t> & prompt, const std::string & client) {
     if (prefix.restored.valid() && plan.restore_slot >= 0) {
-        index_.record_inline_hit(plan.restore_slot, prefix.restored.tokens, prompt_len);
+        index_.record_inline_hit(plan.restore_slot, prefix.restored.tokens, prompt.size());
+        consider_pin(plan.restore_slot, prompt, client);
     }
 }
 
@@ -660,6 +675,344 @@ void KvCache::join_reads() {
     drop_read();
     for (auto & read : finished_reads_) read.reader.join();
     finished_reads_.clear();
+}
+
+// ─── Shared prefixes ────────────────────────────────────────────────────
+
+void KvCache::attach_shared_prefixes(SharedPrefixes & shared, PrefixPins & pins) {
+    shared_ = &shared;
+    pins_ = &pins;
+}
+
+void KvCache::remember_prefix(const std::vector<int32_t> & prompt,
+                              const std::vector<int> & boundaries) {
+    if (!shared_) return;
+    shared_->remember(prompt, boundaries);
+    if (pins_ && shared_->learns()) pins_->set_ring(shared_->ring());
+}
+
+void KvCache::consider_pin(int slot, const std::vector<int32_t> & prompt,
+                           const std::string & client) {
+    if (!shared_ || !pins_ || !shared_->on() || slot < 0) return;
+    if (index_.pinned(slot)) {
+        const std::string id = PrefixPins::id_of(index_.entry_tokens(slot));
+        if (!pins_->has(id)) {
+            index_.set_pinned(slot, false);  // deleted (HTTP) or dropped at the caps
+        } else if (shared_->learns()) {
+            pins_->hit(id, disk_.layout_name());
+        }
+        return;
+    }
+    // Without a disk tier for this engine a pin keeps only its token ids
+    // (warmed again after a restart), so it needs a pins file that lasts.
+    const bool files = pins_have_files();
+    if (!shared_->learns() || !index_.shared_prefix(slot) ||
+        (!files && pins_->path().empty()) ||
+        !index_.restored_by_another_conversation(slot, prompt)) {
+        return;
+    }
+    PrefixCache::Evicted entry = index_.entry(slot);
+    if (!files) {
+        entry.disk_key.clear();
+    } else if (entry.disk_key.empty()) {
+        return;  // a compressed view or a scoped disk policy
+    }
+    const int cut = (int)entry.ids.size();
+    const auto boundaries = find_all_boundaries(prompt, index_.chat_markers());
+    const bool at_boundary =
+        std::find(boundaries.begin(), boundaries.end(), cut) != boundaries.end();
+    if (!at_boundary && shared_->recurrences(prompt, cut) < SharedPrefixes::kPinRecurrences) {
+        return;
+    }
+    index_.set_pinned(slot, true);
+    pending_pins_.push_back({slot, entry.ids, entry.disk_key, entry.aux, client});
+}
+
+void KvCache::unpin_files(const SharedPrefixPin & pin) {
+    for (const auto & file : pin.files) disk_.unpin_file(file.path);
+}
+
+void KvCache::drop_pinned(const SharedPrefixPin & dropped) {
+    unpin_files(dropped);
+    if (pins_->has(dropped.id)) return;  // only some of its files went
+    const int slot = index_.slot_of(dropped.tokens);
+    if (slot >= 0) index_.set_pinned(slot, false);
+    std::fprintf(stderr, "[shared-prefix] unpinned %s (%zu tokens)\n",
+                 dropped.id.c_str(), dropped.tokens.size());
+}
+
+SharedPrefixPin::File KvCache::pin_file(const std::vector<int32_t> & key) {
+    SharedPrefixPin::File file;
+    file.layout = disk_.layout_name();
+    file.disk_tokens = (int)key.size();
+    file.path = disk_.file_path(key);
+    file.bytes = estimate_bytes(file.disk_tokens);
+    return file;
+}
+
+void KvCache::flush_pins(bool force) {
+    if (!pins_ || !shared_) return;
+    for (auto & pending : pending_pins_) {
+        SharedPrefixPin::File file;
+        if (!pending.disk_key.empty()) {
+            // Written now unless the entry already left RAM, which wrote it.
+            const Checkpoint checkpoint = Checkpoint::of_cache_slot(pending.slot);
+            const bool resident = index_.entry_tokens(pending.slot) == pending.ids &&
+                checkpoints_.used(checkpoint);
+            const bool on_disk = resident
+                ? disk_.save(checkpoint, pending.disk_key, pending.aux)
+                : disk_.contains(pending.disk_key);
+            if (on_disk) file = pin_file(pending.disk_key);
+            if (file.path.empty()) {
+                if (resident) index_.set_pinned(pending.slot, false);
+                continue;
+            }
+        }
+        SharedPrefixPin pin;
+        pin.tokens = pending.ids;
+        pin.source = "learned";
+        pin.client = pending.client;
+        pin.hits = 1;
+        pin.id = PrefixPins::id_of(pin.tokens);
+        if (!file.path.empty()) pin.files.push_back(file);
+        std::fprintf(stderr,
+            "[shared-prefix] pinned %s: %zu tokens, client %s -> %s\n",
+            pin.id.c_str(), pin.tokens.size(),
+            pin.client.empty() ? "-" : pin.client.c_str(),
+            file.path.empty() ? "token ids only" : file.path.c_str());
+        const std::string id = pin.id;
+        for (const auto & d : pins_->add(std::move(pin))) drop_pinned(d);
+        if (!file.path.empty() && pins_->has(id)) disk_.pin(pending.disk_key, true);
+    }
+    pending_pins_.clear();
+    // RAM entries of pins gone from the catalog (an HTTP DELETE runs on its
+    // own thread and leaves the index to this one) are no longer pinned.
+    for (const int slot : index_.pinned_slots()) {
+        if (!pins_->has(PrefixPins::id_of(index_.entry_tokens(slot)))) {
+            index_.set_pinned(slot, false);
+        }
+    }
+    // `freeze` keeps the pin set as it is.
+    if (shared_->learns()) {
+        for (const auto & expired : pins_->expire()) drop_pinned(expired);
+    }
+    if (force || pins_->due(60)) pins_->save(force);
+}
+
+bool KvCache::unpin(const std::string & id) {
+    if (!pins_) return false;
+    const auto pin = pins_->remove(id);
+    if (!pin) return false;
+    unpin_files(*pin);
+    pins_->save(true);
+    std::fprintf(stderr, "[shared-prefix] unpinned %s on request\n", id.c_str());
+    return true;
+}
+
+size_t KvCache::estimate_bytes(int tokens) const {
+    return engine_ ? engine_->estimate_bytes(tokens) : checkpoints_.estimate_bytes(tokens);
+}
+
+bool KvCache::takes_a_pin(const PrefixCache::InlineReservation & reservation) const {
+    if (index_.pinned(reservation.slot())) return true;
+    for (const int slot : reservation.extra_victim_slots()) {
+        if (index_.pinned(slot)) return true;
+    }
+    return false;
+}
+
+std::optional<SharedPrefixPin> KvCache::pinned_file(const std::vector<int32_t> & key) const {
+    if (!pins_ || !shared_ || !shared_->on() || pins_->size() == 0) return std::nullopt;
+    return pins_->find_by_disk_key(key, disk_.layout_name());
+}
+
+void KvCache::load_pins(size_t ram_cap, int max_ctx) {
+    if (!pins_ || !shared_ || !shared_->on() || index_.disabled()) return;
+    if (engine_ && !engine_->supported()) return;
+    pin_ram_cap_ = ram_cap;
+    const bool files = pins_have_files();
+    const std::string layout = disk_.layout_name();
+    const auto pins = pins_->list();
+    int cleared = 0;
+    if (files) {
+        // A pinned mark no pin lists: a crash between the mark and the
+        // catalog's save. The file falls under the TTL and the LRU again.
+        for (const auto & path : disk_.pinned_files()) {
+            const bool listed = std::any_of(pins.begin(), pins.end(), [&](const SharedPrefixPin & p) {
+                const auto * f = p.file_for(layout);
+                return f && f->path == path;
+            });
+            if (!listed) {
+                disk_.unpin_file(path);
+                ++cleared;
+            }
+        }
+    }
+    int too_long = 0;
+    for (const auto & pin : pins) {
+        if (max_ctx > 0 && (int)pin.tokens.size() + 1 >= max_ctx) {
+            ++too_long;  // kept for settings with a longer context
+            continue;
+        }
+        // A pin with a file for these settings is served by disk hits; the
+        // concurrent path warms the others (an engine without a disk tier,
+        // or after a settings change).
+        const auto * file = files ? pin.file_for(layout) : nullptr;
+        const bool on_disk = file && disk_.contains(std::vector<int32_t>(
+            pin.tokens.begin(), pin.tokens.begin() + file->disk_tokens));
+        if (!on_disk && engine_) to_warm_.push_back(pin.id);
+    }
+    if (!pins.empty()) {
+        std::fprintf(stderr,
+            "[shared-prefix] startup: %zu pins, %zu to warm, %d longer than the context, "
+            "%d stray pinned marks cleared\n",
+            pins.size(), to_warm_.size(), too_long, cleared);
+    }
+}
+
+bool KvCache::record_warm(const SharedPrefixPin & pin, Checkpoint checkpoint, int saved,
+                          double seconds, const char * where) {
+    SharedPrefixPin::File file;
+    std::vector<int32_t> key;
+    if (pins_have_files()) {
+        key.assign(pin.tokens.begin(), pin.tokens.begin() + saved);
+        disk_.learn_layout(checkpoint);
+        if (disk_.save(checkpoint, key)) file = pin_file(key);
+    }
+    bool kept = false;
+    if (!file.path.empty()) {
+        // Only into the pin it warmed: a DELETE during the warm stands.
+        const auto dropped = pins_->attach(pin.id, file);
+        kept = dropped.has_value();
+        if (kept) {
+            for (const auto & d : *dropped) drop_pinned(d);
+            disk_.pin(key, true);
+            pins_->save();
+        }
+    } else {
+        kept = pins_->has(pin.id);
+    }
+    // Not on disk (no tier, full, or too large for the budget): it serves
+    // from RAM until it leaves, and warms again at the next start.
+    std::fprintf(stderr, "[shared-prefix] warmed %s: %d tokens in %.2fs, %s -> %s%s\n",
+                 pin.id.c_str(), saved, seconds, where,
+                 file.path.empty() ? "not written" : file.path.c_str(),
+                 kept ? "" : " (unpinned meanwhile: not kept)");
+    return kept;
+}
+
+bool KvCache::warm_next_on_engine(const CancellationProbe & cancel) {
+    if (!engine_ || !engine_->supported()) return false;
+    SeqEngine & engine = engine_->engine();
+    while (pins_ && !to_warm_.empty()) {
+        const auto pin = pins_->get(to_warm_.front());
+        if (!pin || pin->tokens.empty() || index_.slot_of(pin->tokens) >= 0) {
+            to_warm_.erase(to_warm_.begin());
+            continue;
+        }
+        const int cut = (int)pin->tokens.size();
+        // Into RAM only while the pins there fit their allowance (the engine
+        // has no staging capture to write it to disk only).
+        if (index_.pinned_bytes() + estimate_bytes(cut) > pin_ram_cap_) {
+            std::fprintf(stderr, "[shared-prefix] warm of %s skipped: the pins in RAM "
+                         "fill their allowance\n", pin->id.c_str());
+            to_warm_.erase(to_warm_.begin());
+            continue;
+        }
+        // One token past the cut: any token, the state at the cut does not
+        // depend on it, and the sequence retires before it is computed.
+        std::vector<int32_t> prompt(pin->tokens);
+        prompt.push_back(pin->tokens.back());
+        KvPlanQuery query;
+        query.owner = &to_warm_;
+        query.request_id = "warm";
+        query.prompt = &prompt;
+        query.disk_policy.mode = DiskPrefixCacheMode::Off;  // the file is what is missing
+        query.prefer_head = true;  // a shared prefix (protect), as a learned cut is
+        query.forced_cut = cut;
+        query.spare_pins = true;
+        KvPlan plan_out;
+        if (plan(query, plan_out) != PlanStatus::ready) return false;
+        if (!plan_out.capture.active()) {
+            std::fprintf(stderr, "[shared-prefix] warm of %s skipped: no room\n", pin->id.c_str());
+            to_warm_.erase(to_warm_.begin());
+            continue;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        auto admitted_result = engine.admit_with_prefix(
+            (1ull << 62) + next_warm_id_++, prompt, SamplerCfg{}, plan_out.plan);
+        const bool ok = admitted_result.status == SeqEngine::AdmitResult::Status::admitted;
+        const std::string error = admitted(plan_out, admitted_result.prefix_store, ok, "warm");
+        const int slot = admitted_result.slot;
+        if (!ok || !error.empty() || !admitted_result.prefix_store.capture.valid()) {
+            if (ok) engine.retire(slot);
+            plan_out.capture.cancel();
+            std::fprintf(stderr, "[shared-prefix] warm of %s not admitted: %s\n", pin->id.c_str(),
+                         !error.empty() ? error.c_str()
+                         : !ok ? admitted_result.error.c_str() : "no capture");
+            if (admitted_result.status == SeqEngine::AdmitResult::Status::busy) return false;
+            to_warm_.erase(to_warm_.begin());
+            continue;
+        }
+        const int step_tokens = engine.step_plan_limits(0).max_prefill_tokens_per_sequence;
+        int saved = 0;
+        bool done = false;
+        bool preempted = false;
+        while (!done) {
+            if (cancel && cancel()) {
+                preempted = true;
+                break;
+            }
+            SeqEngine::StepPlan step;
+            step.prefills.push_back({slot, step_tokens});
+            const auto result = engine.step(step);
+            if (!result.ok()) {
+                std::fprintf(stderr, "[shared-prefix] warm of %s failed: %s\n",
+                             pin->id.c_str(), result.error.c_str());
+                break;
+            }
+            for (const auto & out : result.prefills) {
+                if (out.slot != slot) continue;
+                if (out.prefix_store.attempted()) {
+                    captured(plan_out.capture, out.prefix_store, prompt,
+                             DiskPrefixCacheMode::Off, {});
+                    if (out.prefix_store.status == PrefixStoreEvent::Status::saved) {
+                        saved = out.prefix_store.ticket.checkpoint.tokens;
+                    }
+                    done = true;
+                }
+                if (out.status != SeqEngine::PrefillOutput::Status::advanced) done = true;
+            }
+        }
+        engine.retire(slot);
+        plan_out.capture.cancel();  // a no-op once captured() resolved it
+        to_warm_.erase(to_warm_.begin());
+        if (preempted) {
+            // One attempt per process: a preempted warm keeps nothing, and on
+            // a head longer than one engine step retrying at every idle could
+            // block requests again and again. The head is captured by the
+            // requests that need it, or warmed at the next start.
+            std::fprintf(stderr, "[shared-prefix] warm of %s preempted by a request; "
+                         "not retried until the next start\n", pin->id.c_str());
+            return false;
+        }
+        const int entry = index_.slot_of(pin->tokens);
+        if (saved != cut || entry < 0) {
+            std::fprintf(stderr, "[shared-prefix] warm of %s failed: no capture at %d\n",
+                         pin->id.c_str(), cut);
+            continue;
+        }
+        index_.set_pinned(entry, true);
+        if (pins_have_files()) index_.set_disk_key(entry, saved);
+        if (!record_warm(*pin, Checkpoint::of_cache_slot(entry), saved,
+                         std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0).count(),
+                         "in RAM")) {
+            index_.set_pinned(entry, false);
+        }
+        return true;
+    }
+    return false;
 }
 
 // ─── Captures outside a request's prefill ──────────────────────────────
@@ -751,6 +1104,7 @@ void KvCache::enforce_budget(int keep_slot) {
 
 void KvCache::flush(const char * reason, double limit_s,
                     std::chrono::steady_clock::time_point started) {
+    flush_pins(/*force=*/true);
     const auto elapsed = [&] {
         return std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();

@@ -499,7 +499,7 @@ std::shared_ptr<DiskStore> DiskStore::open(const DiskCacheConfig & config,
         store->scan_all();
         // Budget and TTL hold from the first moment, before any request.
         store->expire_locked();
-        store->make_room_locked(0);
+        (void)store->make_room_locked(0);  // over it with pins alone: they stay
     }
     store->writer_ = std::thread([raw = store.get()] { raw->writer_loop(); });
     registry[key] = store;
@@ -573,7 +573,8 @@ void DiskStore::scan_all() {
             std::memcpy(entry.layout_id.data(), hdr.layout_id, 16);
             entry.token_count = hdr.token_count;
             entry.cur_pos     = hdr.cur_pos;
-            entry.last_used   = hdr.last_used;
+            entry.last_used   = hdr.last_used & ~DISK_CACHE_PINNED_BIT;
+            entry.pinned      = (hdr.last_used & DISK_CACHE_PINNED_BIT) != 0;
             entry.file_size   = size;
             std::memcpy(entry.salt.data(), hdr.identity_salt, 16);
             total_bytes_ += entry.file_size;
@@ -600,14 +601,29 @@ void DiskStore::release_pending_locked(DiskEntry & e) {
     e.pending.reset();
 }
 
+// The stored last_used of `e`: the time, with the pinned bit.
+static uint64_t stored_last_used(const DiskStore::DiskEntry & e) {
+    return e.last_used | (e.pinned ? DISK_CACHE_PINNED_BIT : 0);
+}
+
+static void rewrite_last_used(const DiskStore::DiskEntry & e) {
+    // Not fsynced: a crash may age an entry, but clean restarts retain uses.
+    if (FILE * f = std::fopen(e.path.c_str(), "r+b")) {
+        if (std::fseek(f, DISK_CACHE_LAST_USED_OFFSET, SEEK_SET) == 0) write_u64(f, stored_last_used(e));
+        std::fclose(f);
+    }
+}
+
 void DiskStore::touch_locked(DiskEntry & e) {
     e.last_used = now();
     if (e.pending) return;  // the writer publishes the latest timestamp
-    // Not fsynced: a crash may age an entry, but clean restarts retain uses.
-    if (FILE * f = std::fopen(e.path.c_str(), "r+b")) {
-        if (std::fseek(f, DISK_CACHE_LAST_USED_OFFSET, SEEK_SET) == 0) write_u64(f, e.last_used);
-        std::fclose(f);
-    }
+    rewrite_last_used(e);
+}
+
+void DiskStore::set_pinned_locked(DiskEntry & e, bool on) {
+    if (e.pinned == on) return;
+    e.pinned = on;
+    if (!e.pending) rewrite_last_used(e);
 }
 
 void DiskStore::remove_entry(size_t idx, const char * why) {
@@ -634,9 +650,13 @@ void DiskStore::remove_entry(size_t idx, const char * why) {
 void DiskStore::expire_locked() {
     const uint64_t t = now();
     for (size_t i = entries_.size(); i-- > 0;) {
-        if (expired(entries_[i], t)) remove_entry(i, "ttl expired");
+        if (!pinned_locked(entries_[i]) && expired(entries_[i], t)) {
+            remove_entry(i, "ttl expired");
+        }
     }
 }
+
+
 
 uint64_t DiskStore::budget_locked() {
     uint64_t budget = config_.budget_bytes;
@@ -705,15 +725,20 @@ DiskCacheStats DiskStore::stats() const {
     return out;
 }
 
-void DiskStore::make_room_locked(uint64_t incoming) {
+bool DiskStore::make_room_locked(uint64_t incoming) {
     const uint64_t budget = budget_locked();
-    while (!entries_.empty() && (uint64_t)total_bytes_ + incoming > budget) {
-        size_t lru = 0;
-        for (size_t i = 1; i < entries_.size(); ++i) {
-            if (entries_[i].last_used < entries_[lru].last_used) lru = i;
+    while ((uint64_t)total_bytes_ + incoming > budget) {
+        size_t lru = entries_.size();
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (pinned_locked(entries_[i])) continue;
+            if (lru == entries_.size() || entries_[i].last_used < entries_[lru].last_used) {
+                lru = i;
+            }
         }
+        if (lru == entries_.size()) return false;  // the pinned files fill it
         remove_entry(lru, "budget (lru)");
     }
+    return true;
 }
 
 // ─── Writer ─────────────────────────────────────────────────────────────
@@ -729,6 +754,7 @@ void DiskStore::writer_loop() {
         if (idx < 0 || !entries_[(size_t)idx].pending) continue;
         std::shared_ptr<PendingWrite> job = entries_[(size_t)idx].pending;
         job->last_used = entries_[(size_t)idx].last_used;
+        job->pinned = entries_[(size_t)idx].pinned;
         writing_id_ = id;
         abort_write_.store(false);
         lock.unlock();
@@ -750,14 +776,9 @@ void DiskStore::writer_loop() {
         if (at >= 0) {
             DiskEntry & e = entries_[(size_t)at];
             if (ok && !abort_write_.load()) {
-                // A hit while the file was being written: record it too.
-                if (e.last_used != job->last_used) {
-                    if (FILE * f = std::fopen(e.path.c_str(), "r+b")) {
-                        if (std::fseek(f, DISK_CACHE_LAST_USED_OFFSET, SEEK_SET) == 0) {
-                            write_u64(f, e.last_used);
-                        }
-                        std::fclose(f);
-                    }
+                // A hit or a pin while the file was being written: record it too.
+                if (e.last_used != job->last_used || e.pinned != job->pinned) {
+                    rewrite_last_used(e);
                 }
                 release_pending_locked(e);
                 ++stats_.writes;
@@ -861,7 +882,7 @@ bool DiskStore::write_file(const std::string & path, const PendingWrite & job) {
     std::memcpy(hdr.token_hash, ph.data(), 16);
     hdr.payload_bytes = payload_bytes;
     hdr.created_at    = job.created_at;
-    hdr.last_used     = job.last_used;
+    hdr.last_used     = job.last_used | (job.pinned ? DISK_CACHE_PINNED_BIT : 0);
     hdr.last_tok      = job.snap.last_tok();
     std::memcpy(hdr.identity_salt, job.salt.data(), 16);
 
