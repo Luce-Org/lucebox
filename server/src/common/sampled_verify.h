@@ -42,9 +42,14 @@ struct SampledVerifyWalk {
 // cfg.constraint is at the position of tokens[0] (the commit point has not
 // kept it yet); the walk draws from a snapshot it advances over the root and
 // each kept draft, so every draw sees the grammar state decoding would.
-template <typename Stops>
-inline SampledVerifyWalk sampled_verify_walk(
-        const float * rows, int vocab, int width, const int32_t * tokens,
+//
+// draw(i, cfg, history, rng) samples row i as sample_logits would, or returns
+// -1 when the row cannot be read (the walk then returns accepted 0). The walk
+// draws a row only when it reaches it, so a caller can leave the rows after
+// the first mismatch on the device, or draw from each row's top candidates.
+template <typename Draw, typename Stops>
+inline SampledVerifyWalk sampled_verify_walk_draws(
+        Draw draw, int width, const int32_t * tokens,
         const SamplerCfg & cfg, std::vector<int32_t> & history,
         std::mt19937_64 & rng, Stops stops) {
     SampledVerifyWalk walk;
@@ -55,9 +60,8 @@ inline SampledVerifyWalk sampled_verify_walk(
     }
     history.push_back(tokens[0]);
     for (int i = 0; i + 1 < width; ++i) {
-        const int32_t token = sample_logits(
-            rows + static_cast<size_t>(i) * static_cast<size_t>(vocab), vocab,
-            round, history, rng);
+        const int32_t token = draw(i, static_cast<const SamplerCfg &>(round), history, rng);
+        if (token < 0) return SampledVerifyWalk{0, -1};
         if (token != tokens[i + 1] || stops(token, i + 1)) {
             walk.bonus = token;
             break;
@@ -67,6 +71,22 @@ inline SampledVerifyWalk sampled_verify_walk(
         ++walk.accepted;
     }
     return walk;
+}
+
+// The same walk over rows already on the host: rows[i] at rows + i * vocab.
+template <typename Stops>
+inline SampledVerifyWalk sampled_verify_walk(
+        const float * rows, int vocab, int width, const int32_t * tokens,
+        const SamplerCfg & cfg, std::vector<int32_t> & history,
+        std::mt19937_64 & rng, Stops stops) {
+    return sampled_verify_walk_draws(
+        [rows, vocab](int i, const SamplerCfg & round, std::vector<int32_t> & h,
+                      std::mt19937_64 & r) {
+            return sample_logits(
+                rows + static_cast<size_t>(i) * static_cast<size_t>(vocab),
+                vocab, round, h, r);
+        },
+        width, tokens, cfg, history, rng, stops);
 }
 
 inline SampledVerifyWalk sampled_verify_walk(

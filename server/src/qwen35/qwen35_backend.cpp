@@ -3615,6 +3615,17 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
 
     DFlashTarget * target = dflash_target();
+    // Sampled verify under a top_k: each verify also keeps every row's top
+    // candidates, and a draw reads its whole row only when they cannot settle
+    // it (sample_logits_top returns -1 before any RNG draw, so the token and
+    // the RNG stream are the ones the whole row gives).
+    const int verify_top_n =
+        sampled_verify ? sample_logits_top_n(sampler_, w_.n_vocab) : 0;
+    struct VerifyTopReset {
+        DFlashTarget * t;
+        ~VerifyTopReset() { if (t) t->set_verify_top_n(0); }
+    } verify_top_reset{verify_top_n > 0 ? target : nullptr};
+    if (verify_top_n > 0) target->set_verify_top_n(verify_top_n);
     auto finish_speculative_state = [&]() {
         if (target->finish_speculative_state()) return true;
         std::fprintf(stderr, "spec-decode: final SpecLA state flush failed\n");
@@ -3696,8 +3707,23 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
     std::vector<int32_t> noise_ids(q_len);
     std::vector<int32_t> draft_tok(q_len);
     std::vector<int32_t> target_tok(q_len);
-    std::vector<float>   verify_logits;   // sampled-verify: [q_len x vocab]
+    std::vector<float>   verify_logits;   // one verify row (vocab), or every row for LUCE_SV_DEBUG
     std::vector<int32_t> verify_history;  // sampled-verify: penalty history
+    std::vector<float>   top_vals;        // sampled verify: rows' top candidates
+    std::vector<int32_t> top_ids;
+    int top_n_read = 0, top_vocab = 0, top_draws = 0, top_misses = 0;
+    // Row `row` of the candidates last read (read_verify_top): the draw when
+    // they settle it, else -1 with no RNG draw.
+    auto draw_top = [&](int row, const SamplerCfg & cfg,
+                        const std::vector<int32_t> & hist,
+                        std::mt19937_64 & rng) -> int32_t {
+        const size_t at = (size_t)row * (size_t)top_n_read;
+        const int t = sample_logits_top(top_vals.data() + at, top_ids.data() + at,
+                                        top_n_read, top_vocab, cfg, hist, rng);
+        ++top_draws;
+        top_misses += t < 0;
+        return t;
+    };
     std::vector<int32_t> pos_q(q_len);
     std::vector<int32_t> pos_k;
     std::vector<float>   local_hidden;
@@ -4589,18 +4615,12 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         // draws seed the next round (sampled_verify_next).
         SampledVerifyWalk walk;
         if (sampled_verify) {
-            if (!target->read_verify_logits(v_len, verify_logits)) {
-                std::fprintf(stderr, "spec-decode: verify logits read failed\n");
-                if (step_has_snapshot) target->restore_kv();
-                step_graph_destroy(draft_sg);
-                return false;
-            }
-            const int vocab_v = (int)(verify_logits.size() / (size_t)v_len);
             static const bool kSvDebug = []() {
                 const char * e = std::getenv("LUCE_SV_DEBUG");
                 return e != nullptr && std::string(e) == "1";
             }();
-            if (kSvDebug) {
+            if (kSvDebug && target->read_verify_logits(v_len, verify_logits)) {
+                const int vocab_v = (int)(verify_logits.size() / (size_t)v_len);
                 // Row-alignment check: CPU argmax over each bulk-read row must
                 // equal the GPU argmax (target_tok). Divergence = misaligned
                 // or stale bulk read.
@@ -4621,11 +4641,30 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 }
             }
             // Penalty history must match AR exactly: AR's history is
-            // out_tokens; the walk adds the seed and the kept drafts.
+            // out_tokens; the walk adds the seed and the kept drafts. The walk
+            // reads each row when it reaches it: the rows after the first
+            // mismatch (most of a 16-row block) stay on the device.
             verify_history = out_tokens;
-            walk = sampled_verify_walk(verify_logits.data(), vocab_v, v_len,
-                                       draft_tok.data(), sampler_,
-                                       verify_history, sampler_rng_);
+            const bool have_top = verify_top_n > 0 &&
+                target->read_verify_top(v_len, top_vals, top_ids, top_n_read, top_vocab);
+            walk = sampled_verify_walk_draws(
+                [&](int row, const SamplerCfg & cfg,
+                    const std::vector<int32_t> & hist,
+                    std::mt19937_64 & rng) -> int32_t {
+                    const int t = have_top ? draw_top(row, cfg, hist, rng) : -1;
+                    if (t >= 0) return t;
+                    if (!target->read_verify_row(row, verify_logits)) return -1;
+                    return sample_logits(verify_logits.data(),
+                                         (int)verify_logits.size(), cfg, hist, rng);
+                },
+                v_len, draft_tok.data(), sampler_, verify_history, sampler_rng_,
+                [](int32_t, int) { return false; });
+            if (walk.accepted == 0) {
+                std::fprintf(stderr, "spec-decode: verify logits read failed\n");
+                if (step_has_snapshot) target->restore_kv();
+                step_graph_destroy(draft_sg);
+                return false;
+            }
             accept_n = walk.accepted;
             bonus_tok = walk.bonus;
             if (kSvDebug && n_draft_steps < 3) {
@@ -4643,18 +4682,12 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             // Rewrites target_tok with the grammar's choice at every row it
             // reaches, so the bonus and the fast-rollback root below are the
             // tokens constrained AR decoding commits.
-            bool rows_read = false;
-            int vocab_v = 0;
             accept_n = constrained_greedy_walk(
                 target_tok.data(), v_len, draft_tok.data(), sampler_,
                 [&](int row, int & vocab) -> const float * {
-                    if (!rows_read) {
-                        if (!target->read_verify_logits(v_len, verify_logits)) return nullptr;
-                        vocab_v = (int)(verify_logits.size() / (size_t)v_len);
-                        rows_read = true;
-                    }
-                    vocab = vocab_v;
-                    return verify_logits.data() + (size_t)row * (size_t)vocab_v;
+                    if (!target->read_verify_row(row, verify_logits)) return nullptr;
+                    vocab = (int)verify_logits.size();
+                    return verify_logits.data();
                 });
             if (accept_n == 0) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
@@ -4915,14 +4948,18 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 // Rows of the latest verify (the walk, or the replay): row r
                 // holds the logits after committed token r.
                 auto draw = [&](int row) -> int32_t {
-                    if (!target->read_verify_logits(commit_n, verify_logits)) {
+                    if (verify_top_n > 0 &&
+                        target->read_verify_top(row + 1, top_vals, top_ids,
+                                                top_n_read, top_vocab)) {
+                        const int t = draw_top(row, sampler_, out_tokens, sampler_rng_);
+                        if (t >= 0) return t;
+                    }
+                    if (!target->read_verify_row(row, verify_logits)) {
                         return replay_last_tok;
                     }
-                    const int vocab_v =
-                        (int)(verify_logits.size() / (size_t)commit_n);
-                    return sample_logits(
-                        verify_logits.data() + (size_t)row * (size_t)vocab_v,
-                        vocab_v, sampler_, out_tokens, sampler_rng_);
+                    return sample_logits(verify_logits.data(),
+                                         (int)verify_logits.size(), sampler_,
+                                         out_tokens, sampler_rng_);
                 };
                 last_tok = sampled_verify_next(walk, draft_tok.data(), commit_n,
                                                draw);
@@ -4933,15 +4970,14 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 // commit point left it, the next root's position.
                 if (constrained_greedy && commit_n > 0 &&
                     !sampler_.constraint->allows(last_tok)) {
-                    if (!target->read_verify_logits(commit_n, verify_logits)) {
+                    if (!target->read_verify_row(commit_n - 1, verify_logits)) {
                         std::fprintf(stderr, "spec-decode: verify logits read failed\n");
                         step_graph_destroy(draft_sg);
                         return false;
                     }
-                    const int vocab_v = (int)(verify_logits.size() / (size_t)commit_n);
-                    last_tok = sample_logits(
-                        verify_logits.data() + (size_t)(commit_n - 1) * (size_t)vocab_v,
-                        vocab_v, sampler_, out_tokens, sampler_rng_);
+                    last_tok = sample_logits(verify_logits.data(),
+                                             (int)verify_logits.size(), sampler_,
+                                             out_tokens, sampler_rng_);
                 }
             }
             // The target ran all commit_n tokens. After an early stop (EOS,
@@ -5090,6 +5126,10 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                  n_generated > 0 ? n_generated / decode_s : 0.0,
                  n_draft_steps, acceptance.accepted(), acceptance.offered(), accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
+    if (verify_top_n > 0) {
+        std::fprintf(stderr, "[spec-decode] top candidates: top_n=%d draws=%d misses=%d\n",
+                     verify_top_n, top_draws, top_misses);
+    }
     if (n_ar_burst_steps > 0) {
         std::fprintf(stderr, "[spec-decode] adaptive: %d of %d steps ran as plain decode "
                              "(step ratio %.2f, accept threshold %.2f drafts/step, burst %d)\n",
