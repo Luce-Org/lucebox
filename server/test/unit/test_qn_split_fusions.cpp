@@ -8,8 +8,8 @@
 //
 // The RDNA4 kernels are compared with the products they replace: the short-row Q8_0 matvec with the same rows in
 // slices of 1024 (the old shape), the Q8_0 gate/up pair with separate products and GLU, and the one-wave MoE kernel
-// at every width with each token alone. The device argmax that greedy decode reads is compared with a host scan of
-// rows full of ties.
+// at every width with each token alone. The argmax that greedy decode reads is compared with a host scan of rows
+// full of ties, on every GPU and on the CPU backend, so both backends break ties the same way.
 //
 // Exit codes: 0 pass, 1 mismatch, 77 no GPU backend.
 #include "ggml-alloc.h"
@@ -450,7 +450,7 @@ void moe_all_widths(ggml_backend_t be, ggml_type type, bool up, int T) {
     }
 }
 
-// ── The device argmax greedy decode reads: ties go to the lowest index, as a host scan's ───────────────────────
+// ── The argmax greedy decode reads: ties go to the lowest index, as a host scan's ──────────────────────────────
 void argmax_ties(ggml_backend_t be) {
     const int V = 151936, rows = 6;
     Pattern p;
@@ -486,10 +486,15 @@ void argmax_ties(ggml_backend_t be) {
 }  // namespace
 
 int main() {
+    if (ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr)) {
+        argmax_ties(cpu);
+        std::printf("CPU argmax: %s\n", g_failures == 0 ? "PASS" : "FAIL");
+        ggml_backend_free(cpu);
+    }
     const int n_dev = ggml_backend_cuda_get_device_count();
     if (n_dev <= 0) {
         std::printf("SKIP: no GPU\n");
-        return 77;
+        return g_failures == 0 ? 77 : 1;
     }
     const bool prev_graphs = ggml_backend_cuda_set_graphs_disabled_override(true);
     for (int dev = 0; dev < n_dev; ++dev) {

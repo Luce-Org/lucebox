@@ -6,7 +6,8 @@
 #include "sum.cuh"
 
 // Keep the larger of two (value, column) candidates. Ties go to the lower column, as in the CPU backend's argmax and
-// std::max_element, so greedy sampling from these ids picks the token a host scan of the row would.
+// the host greedy sampler (std::max_element order), so greedy decode from these ids picks the token a host scan of
+// the row would.
 static __device__ __forceinline__ void argmax_take(float & maxval, int & argmax, const float val, const int col) {
     if (col >= 0 && (val > maxval || (val == maxval && (argmax < 0 || col < argmax)))) {
         maxval = val;

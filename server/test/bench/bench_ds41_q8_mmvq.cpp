@@ -18,9 +18,9 @@
 #include <string>
 #include <vector>
 
-// Widths 1..kMaxCols (BENCH_MAX_COLS, default 4; Qwen3.8 MTP verifies up to 8).
+// Widths 1..kMaxCols (BENCH_MAX_COLS, default 8: DeepSeek4 verifies up to 4, Qwen3.8 MTP up to 8).
 #ifndef BENCH_MAX_COLS
-#define BENCH_MAX_COLS 4
+#define BENCH_MAX_COLS 8
 #endif
 constexpr int kMaxCols = BENCH_MAX_COLS;
 

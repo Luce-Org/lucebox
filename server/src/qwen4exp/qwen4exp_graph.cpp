@@ -2409,7 +2409,10 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     }
     ggml_tensor * mtp_positions = mtp_prefill
         ? build_mtp_prefill(ctx, gf, w, cache, hidden, emb_rows, pos0, T) : nullptr;
-    // Each row's argmax, on the logits' device: greedy decode reads these ids instead of the rows.
+    // Each row's argmax, on the logits' device: greedy decode reads these ids instead of the rows. Built for every
+    // caller, sampled ones and prefill included: a retained graph built only for callers that read the ids is rebuilt
+    // whenever a request mixes them with callers that read the rows, and a rebuild moves the graph's attention span.
+    // Tried: the text with a draft then no longer matched the text without one. The cost is one row scan per step.
     ggml_tensor * argmax = nullptr;
     if (reuse_ws || verify) {
         argmax = ggml_argmax(ctx, logits);
