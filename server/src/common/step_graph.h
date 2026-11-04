@@ -97,6 +97,10 @@ struct StepGraph {
     ggml_tensor *   logits = nullptr;
     ggml_tensor *   hidden_states = nullptr;       // draft hidden-only output
     ggml_tensor *   argmax_tokens = nullptr; // [n_tokens] i32, GPU-side argmax of logits
+    // [top_n, n_tokens] i32 ids and [1, top_n, n_tokens] f32 logits of each
+    // row's top candidates (sampled verify under a top_k); null otherwise.
+    ggml_tensor *   top_ids = nullptr;
+    ggml_tensor *   top_vals = nullptr;
     ggml_tensor *   topk_indices = nullptr;  // [K, n_tokens] i32, GPU-side top-K indices
     ggml_tensor *   ffn_residual = nullptr;  // [hidden, n_tokens] pre-FFN residual
     ggml_tensor *   ffn_post = nullptr;      // [hidden, n_tokens] post-attention norm
@@ -144,6 +148,7 @@ inline void step_graph_free(StepGraph & sg) {
     sg.logits = nullptr;
     sg.hidden_states = nullptr;
     sg.argmax_tokens = nullptr;
+    sg.top_ids = sg.top_vals = nullptr;
     sg.topk_indices = nullptr;
     sg.ffn_residual = nullptr;
     sg.ffn_post = nullptr;

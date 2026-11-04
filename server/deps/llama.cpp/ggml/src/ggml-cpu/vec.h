@@ -1580,12 +1580,12 @@ inline static void ggml_vec_norm_inv_f32(const int n, float * s, const float * x
     *s = 1.f/(*s);
 }
 
-// Ties go to the lowest index, as in the GPU backend's argmax and std::max_element.
+// The pick of the host scan the GPU argmax matches (argmax.cu): the lowest id of the row's maximum, NaNs never
+// picked unless x[0] is one.
 inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
-    float max = -INFINITY;
     int idx = 0;
-    for (int i = 0; i < n; ++i) {
-        if (x[i] > max) { max = x[i]; idx = i; }
+    for (int i = 1; i < n; ++i) {
+        if (x[i] > x[idx]) { idx = i; }
     }
     *s = idx;
 }

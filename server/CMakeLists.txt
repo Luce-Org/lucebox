@@ -2639,6 +2639,7 @@ if(LUCE_TESTS)
             test/unit/test_anchor_params.cpp
             test/unit/test_derived_scalars.cpp
             test/unit/test_adaptive_spec_width.cpp
+            test/unit/test_prompt_lookup.cpp
             test/unit/test_immutable_graph_input_pool.cpp
             test/unit/test_mmq_tile_selection.cpp
             test/unit/test_mixed_mmq_policy.cpp

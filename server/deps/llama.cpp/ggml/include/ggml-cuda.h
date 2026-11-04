@@ -175,14 +175,6 @@ GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols
 // Returns the previous setting.
 GGML_BACKEND_API bool ggml_backend_cuda_set_mmvq_batch_invariant(bool enabled);
 
-// Calling-thread refinement of batch-invariant MUL_MAT_ID, for a caller whose single-token forwards also run in the
-// batch-invariant scope (the Qwen3.8 split target): on RDNA4 the one-wave MoE kernel then serves every width, one
-// token included, so a verify column equals that single-token product without the tokenwise launch, which reads
-// every expert once per token. A single-token forward outside the scope (DeepSeek4 decode, a drafter) keeps the
-// faster multi-wave kernel, so a caller that verifies against such a forward must leave this off.
-// Returns the previous setting.
-GGML_BACKEND_API bool ggml_backend_cuda_set_mmvq_moe_all_widths(bool enabled);
-
 // A MUL_MAT node whose src0 is a column range of wider Q8_0 rows (a view with
 // the rows' stride, e.g. one rank's slice of a contraction): on the RDNA4 Q8_0
 // matvec every block keeps the lane it takes in the whole rows, so the product
@@ -304,8 +296,8 @@ enum ggml_cuda_qwen4exp_profile {
 GGML_BACKEND_API enum ggml_cuda_qwen4exp_profile ggml_backend_cuda_set_qwen4exp_profile(enum ggml_cuda_qwen4exp_profile profile);
 GGML_BACKEND_API bool ggml_backend_cuda_qwen4exp_supported(ggml_backend_t backend);
 
-// Calling-thread counts of the Qwen3.8 split fusions and RDNA4 kernel shapes taken, so their parity test
-// (test_qn_split_fusions) can tell a pattern that stopped matching from one that still fuses.
+// Calling-thread counts of the Qwen3.8 split fusions taken, so their parity test (test_qn_split_fusions) can tell a
+// pattern that stopped matching from one that still fuses.
 enum ggml_cuda_qn_fusion {
     GGML_CUDA_QN_ROUTE_NORM,     // the router's GET_ROWS, SUM_ROWS, CLAMP and DIV in one launch
     GGML_CUDA_QN_SHARED_GATE,    // the shared expert's SIGMOID and MUL folded into DS4_MOE_COMBINE
@@ -313,9 +305,6 @@ enum ggml_cuda_qn_fusion {
     GGML_CUDA_QN_HC_MIX_Q8,      // the HC mix reduce writing the next matmul's q8_1 rows
     GGML_CUDA_QN_UNARY_MUL_Q8,   // UNARY then MUL writing the next matmul's q8_1 rows
     GGML_CUDA_QN_SCALE_SILU,     // SCALE then SILU in one launch
-    GGML_CUDA_QN_SWIGLU_PAIR,    // RDNA4 Q8_0 gate/up pair serving plain SwiGLU
-    GGML_CUDA_QN_Q8_SMALL_K,     // RDNA4 Q8_0 matvec, short rows over many rows
-    GGML_CUDA_QN_MOE_ALL_WIDTHS, // RDNA4 MUL_MAT_ID on the one-wave MoE kernel (ggml_backend_cuda_set_mmvq_moe_all_widths)
     GGML_CUDA_QN_COUNT,
 };
 GGML_BACKEND_API size_t ggml_backend_cuda_get_qn_fusion_count(enum ggml_cuda_qn_fusion kind);

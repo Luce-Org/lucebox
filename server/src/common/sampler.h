@@ -89,6 +89,29 @@ int sample_logits(const float * logits_in,
                   const std::vector<int32_t> & history,
                   std::mt19937_64 & rng);
 
+// True when sample_logits with this config returns the row's argmax, the lowest
+// id on ties, whatever the history and RNG: greedy with no penalty and no
+// grammar. A backend may then take the pick from a device argmax with the same
+// tie rule instead of reading the row.
+bool sample_logits_is_argmax(const SamplerCfg & cfg);
+
+// Whether a backend may pick tokens on the device (an argmax, top candidates)
+// instead of reading logits rows back. Kill switch: LUCE_GPU_ARGMAX=0.
+bool gpu_argmax_enabled();
+
+// The candidate count sample_logits_top needs for this config (a power of two of at least 32 covering top_k, twice
+// top_k with a penalty), or 0 when it cannot decide from candidates: greedy, no top_k, a grammar, or a penalty that
+// can raise a logit.
+int sample_logits_top_n(const SamplerCfg & cfg, int vocab);
+
+// sample_logits from a row's largest logits alone: `vals`/`ids` hold n entries that include every logit above the
+// n-th largest one, in any order. Returns the token sample_logits returns for the whole row, drawing the same RNG
+// value, or -1 before any draw when the candidates cannot settle it (sample_logits_top_n is 0 or above n, a NaN, a
+// tie reaches the n-th value, or a penalty lowers enough candidates that a token outside them could enter the top_k);
+// the caller then reads the row and calls sample_logits.
+int sample_logits_top(const float * vals, const int32_t * ids, int n, int vocab, const SamplerCfg & cfg,
+                      const std::vector<int32_t> & history, std::mt19937_64 & rng);
+
 // True when sample_logits with this config runs on the host only. Otherwise
 // it may take a GPU sampler path, which uses the calling thread's current
 // device: call it from the thread that owns the model's device.

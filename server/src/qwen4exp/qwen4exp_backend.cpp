@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <future>
 #include <random>
 #include <string>
@@ -130,7 +131,8 @@ static bool move_qwen4exp_attention(Qwen4ExpWeights & w, int layers) {
 }
 
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
-        Qwen4ExpCache & cache, int slots, int resident_slots, size_t * snapshot_budget, Qwen4ExpChunkPlan * plan) {
+        Qwen4ExpCache & cache, int slots, int resident_slots, size_t * snapshot_budget, Qwen4ExpChunkPlan * plan,
+        size_t snapshot_keep) {
     if (slots < 1 || resident_slots < 1 || resident_slots > slots) return 0;
     size_t free_device = 0, total = 0, free_host = 0;
     ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device_id(backend), &free_device, &total);
@@ -223,12 +225,9 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     // The largest chunk. Concurrent serving prefills in fixed granules (see Qwen4ExpSeqEngine): on one GPU a
     // 2048-row granule halves a live stream's stall behind a long prompt for about 3% of prompt throughput; with the
     // experts on a second GPU it would cost 12%, so that placement keeps one pipeline stream's rows. Split mode: the
-    // expert device's MoE id helper bounds a chunk, and with hot experts the target keeps no slack for its matmul
-    // scratch pool, which grows over a long prompt and which the measurements below do not see, so the chunk stays
-    // at the floor (still two 4096-row pipeline streams).
+    // expert device's MoE id helper bounds a chunk (hot experts only take the memory the largest chunk leaves).
     const int max_rows = slots > 1 ? (w.expert_backend ? kQwen4ExpPipelineStreamRows : kQwen4ExpConcurrentGranule)
-                       : !w.expert_backend ? kQwen4ExpMaxChunk
-                       : w.hot ? kQwen4ExpSplitChunkFloor : kQwen4ExpSplitMaxChunk;
+                       : !w.expert_backend ? kQwen4ExpMaxChunk : kQwen4ExpSplitMaxChunk;
     struct Plan { size_t graph = 0, ring = 0, host = 0, scratch = 0; };
     std::vector<std::pair<int, Plan>> plans;   // one per probed chunk size
     auto chunk_workspace = [&](int n) {
@@ -277,8 +276,16 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         plan->layer_bytes = (size_t) slots * layer;
         if (plan->required > available) return 0;   // the context fit moves on without searching smaller chunks
     }
+    const int reserved_rows = !snapshot_budget ? floor_rows
+        : qwen4exp_reserved_rows(cache.max_ctx, available, fixed, chunk_workspace, floor_rows,
+                                 std::min(kQwen4ExpPreferredChunk, max_rows), std::min(*snapshot_budget, snapshot_keep));
     const int chunk = qwen4exp_fit_chunk(cache.max_ctx, available, fixed, chunk_workspace, snapshot_budget,
-                                         floor_rows, max_rows);
+                                         reserved_rows, max_rows);
+    if (plan && chunk > 0) {
+        const size_t workspace = chunk_workspace(plan->rows > 0 ? plan->rows : chunk);
+        plan->chunk_bytes = workspace == SIZE_MAX ? SIZE_MAX
+                          : fixed + (snapshot_budget ? *snapshot_budget : 0) + workspace;
+    }
     std::fprintf(stderr, "[qwen4exp] chunk-auto ctx=%d slots=%d resident=%d chunk=%d state=%zu fixed=%zu available=%zu headroom=%zu\n",
         cache.max_ctx, slots, resident_slots, chunk, state,
         fixed + (snapshot_budget ? *snapshot_budget : 0), available, available / 10);
@@ -352,11 +359,6 @@ bool Qwen4ExpBackend::load_target() {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
         return false;
     }
-    // Concurrent serving keeps every expert pick on the expert device, so a request
-    // computes the same alone and beside other requests: no hot copies.
-    if (!load_qwen4exp_hot_experts(backend_, weights_,
-                                   cfg_.max_concurrency > 1 ? std::string() : cfg_.expert_placement_path,
-                                   expert_budget_bytes_from_env(kQwen4ExpHotExpertBudget))) return false;
     if (remote_layers_ && !move_qwen4exp_attention(weights_, remote_layers_)) {
         std::fprintf(stderr, "[qwen4exp] moving attention to the expert device failed\n");
         return false;
@@ -413,6 +415,7 @@ bool Qwen4ExpBackend::load_target() {
             return false;
         }
     }
+    if (!load_hot_experts()) return false;
     if (snapshot_budget_ != SIZE_MAX)
         std::fprintf(stderr, "[qwen4exp] prefix snapshot allowance=%zu bytes\n", snapshot_budget_);
     else if (snap_backend_ != backend_)
@@ -426,6 +429,28 @@ bool Qwen4ExpBackend::load_target() {
         return false;
     }
     return true;
+}
+
+// Split mode, one sequence: the most-routed experts of --expert-placement also run on the target, for decode and
+// verify steps (a prompt chunk keeps every pick on the expert device). They take the memory the fitted context and
+// the prompt chunk leave, at most LUCE_EXPERT_BUDGET_MB, so they shrink neither. Concurrent serving keeps every pick
+// on the expert device, so a request computes the same alone and beside other requests: no hot copies.
+bool Qwen4ExpBackend::load_hot_experts() {
+    if (cfg_.expert_placement_path.empty() || cfg_.max_concurrency > 1 || !weights_.expert_backend || chunk_ <= 0)
+        return true;
+    Qwen4ExpChunkPlan room;
+    room.rows = chunk_;
+    plan_chunk(&room);
+    const size_t needed = room.chunk_bytes == 0 || room.chunk_bytes == SIZE_MAX ? SIZE_MAX
+                        : room.chunk_bytes + room.chunk_bytes / 9 + kQwen4ExpHotExpertMargin;   // the plan's 10%
+    const uint64_t spare = needed < room.available ? room.available - needed : 0;
+    const uint64_t budget = std::min<uint64_t>(expert_budget_bytes_from_env(UINT64_MAX), spare);
+    std::fprintf(stderr, "[qwen4exp] hot experts: %.2f GiB beside a %d-row prompt chunk (available %.2f GiB)\n",
+                 (double) budget / (1ull << 30), chunk_, (double) room.available / (1ull << 30));
+    if (budget == 0) return true;
+    if (!load_qwen4exp_hot_experts(backend_, weights_, cfg_.expert_placement_path, budget)) return false;
+    chunk_ = plan_chunk();   // the decode and verify graphs grew with the hot experts' picks
+    return chunk_ > 0;
 }
 
 // The prompt chunk, measured against free memory unless --chunk sets it (concurrent serving measures either way,
@@ -445,7 +470,8 @@ int Qwen4ExpBackend::plan_chunk(Qwen4ExpChunkPlan * plan) {
     // head, the server's concurrent prefix budget. One sequence keeps three.
     const int slots = cfg_.max_concurrency;
     const int fit = qwen4exp_select_chunk(backend_, weights_, cache_, slots, 1,
-                                          allowance(slots > 1 ? 2 * (size_t) slots + 1 : 3), plan);
+                                          allowance(slots > 1 ? 2 * (size_t) slots + 1 : 3), plan,
+                                          snapshot_bytes_estimate(cache_.max_ctx));
     return cfg_.chunk > 0 && fit > 0 ? explicit_chunk : fit;
 }
 
@@ -704,6 +730,13 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         mtp_costs_.load(mtp_width_, decode_ctx);
         mtp_width_.carry_acceptance(QWEN4EXP_MTP_CARRIED_TRIALS);
     }
+    // Prompt lookup (common/prompt_lookup.h) beside the adaptive MTP. Burn-in kill switch: LUCE_QWEN4EXP_LOOKUP=0.
+    static const bool lookup_on = [] {
+        const char * e = std::getenv("LUCE_QWEN4EXP_LOOKUP");
+        return e == nullptr || std::strcmp(e, "0") != 0;
+    }();
+    const bool use_lookup = adaptive && lookup_on;
+    long long lookup_rounds = 0, lookup_drafts = 0, lookup_accepted = 0;
     double draft_s = 0.0;
     auto verify_graphs = [&](uint64_t Qwen4ExpDecodeWorkspace::*count) {
         uint64_t n = 0;
@@ -724,14 +757,28 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     int32_t next = sample(logits.data());
     bool more = req.n_gen > 0 && commit(next);
     if (mtp) mtp_pending.tok.assign(1, next);
+    if (use_lookup) {   // the sequence so far: the prompt and the next input
+        lookup_.reset();
+        lookup_.append(history.data(), history.size());
+        lookup_.append(&next, 1);
+    }
     // Each trunk row sampled (lazily, in qwen4exp_mtp_step) updates history and applies the budget hook exactly
-    // once per emitted token. No RNG draws for unvisited verify rows.
-    // Greedy with no logit processing samples a row by its argmax, so the verify reads each row's device argmax
-    // instead of the rows (row == nullptr, tok already holds it). The decode check compares whole rows.
-    const bool argmax_rows = !req.sampler.needs_logit_processing() && !decode_check_;
-    auto sample_row = [&](int32_t fed, const float * row, int32_t & tok) {
+    // once per emitted token. No RNG draws for unvisited verify rows, and no reads of them: a greedy request takes
+    // each row's pick from the device (tok already holds it, the host scan's pick); a top_k draw first tries the
+    // row's top candidates, the same draw sample_logits makes from the whole row, which it reads only when the
+    // candidates cannot settle the cut. Kill switch: LUCE_GPU_ARGMAX=0 reads every row back.
+    const Qwen4ExpRows rows = qwen4exp_rows_for(req.sampler, decode_check_ != nullptr);
+    const int top_n = rows == Qwen4ExpRows::lazy ? sample_logits_top_n(req.sampler, weights_.n_vocab) : 0;
+    int top_rows = 0, top_misses = 0;
+    auto sample_row = [&](int32_t fed, const Qwen4ExpRow & row, int32_t & tok) {
         history.push_back(fed);
-        if (row) tok = sample(row);
+        if (!row.picked) {
+            const int t = row.top_n > 0 ? sample_logits_top(row.top_vals, row.top_ids, row.top_n, weights_.n_vocab,
+                                                            req.sampler, history, rng) : -1;
+            top_rows += row.top_n > 0;
+            top_misses += row.top_n > 0 && t < 0;
+            tok = t >= 0 ? t : sample(row.logits());
+        }
         return commit(tok);
     };
     auto on_drafts = [&](std::vector<int32_t> & draft_tokens) {
@@ -740,11 +787,32 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     while (more) {
         const int max_k = spec ? std::min(req.n_gen - (int) result.tokens.size() - 1, cache_.max_ctx - pos - 1) : 0;
         Qwen4ExpMtpStep step;
+        std::array<int32_t, QWEN4EXP_MTP_MAX_DRAFT> look{};
+        int look_match = 0;
+        PromptLookupPolicy::Pick pick;
+        if (use_lookup && max_k > 0) {
+            const int look_k = lookup_.propose(std::min(max_k, cache_.mtp_draft), look.data(), look_match);
+            if (look_k > 0) {
+                pick = lookup_policy_.choose(mtp_width_.next_width_cost_aware({}, cache_.mtp_draft + 1), look_k,
+                                             look_match);
+            }
+        }
         if (!qwen4exp_mtp_step(backend_, weights_, cache_, pos, next, max_k, adaptive ? &mtp_width_ : nullptr,
-                               mtp ? &mtp_pending : nullptr, sample_row, logits, step, on_drafts, argmax_rows)) {
+                               mtp ? &mtp_pending : nullptr, sample_row, logits, step, on_drafts,
+                               pick.lookup ? look.data() : nullptr, pick.lookup ? pick.width - 1 : 0,
+                               rows, top_n)) {
             result.fail(GenerateErrorCode::DecodeFailed, step.error);
             return result;
         }
+        if (use_lookup && step.k > 0) {
+            lookup_policy_.observe(step.lookup, step.k + 1, step.decision.n_accepted, look_match, step.round_ms);
+            if (step.lookup) {
+                ++lookup_rounds;
+                lookup_drafts += step.k;
+                lookup_accepted += step.decision.n_accepted;
+            }
+        }
+        if (use_lookup) lookup_.append(step.decision.emitted.data(), (size_t) step.decision.n_emitted);
         more = step.more;
         ++steps;
         ++width_steps[step.k];
@@ -753,11 +821,11 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         draft_s += step.draft_s;
         const int retained = step.decision.n_emitted;
         next = step.decision.emitted[retained - 1];
-        if (!step.by_id) {
+        if (rows == Qwen4ExpRows::all) {
             logits_.assign(logits.begin() + (size_t) (retained - 1) * weights_.n_vocab,
                            logits.begin() + (size_t) retained * weights_.n_vocab);
-        } else if (!logits.empty()) {
-            logits_ = logits;   // the last emitted row, read when the step ended generation
+        } else if (!step.more) {
+            logits_.swap(logits);   // the last emitted row
         }
         pos += retained;
         if (decode_check_) decode_check_(false, mtp_pending.tok, logits_);
@@ -802,7 +870,8 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         std::fprintf(stderr,
             "[qwen4exp-mtp] k=%d drafts=%lld accepted=%lld rate=%.3f tokens_per_step=%.3f draft_ms=%.2f decode=%.2f tok/s "
             "adaptive=%d steps_k1=%lld steps_k2=%lld steps_k3=%lld steps_k4=%lld steps_k5=%lld steps_k6=%lld steps_k7=%lld "
-            "verify_builds=%llu verify_replays=%llu draft_builds=%llu draft_replays=%llu width_ms=%s\n",
+            "verify_builds=%llu verify_replays=%llu draft_builds=%llu draft_replays=%llu width_ms=%s "
+            "lookup=%d lookup_rounds=%lld lookup_drafts=%lld lookup_accepted=%lld top_n=%d top_rows=%d top_misses=%d\n",
             cache_.mtp_draft, drafts, accepted, (double) accepted / (double) drafts, steps > 0 ? decoded / (double) steps : 0.0,
             1e3 * draft_s / (double) drafts, result.decode_s > 0.0 ? decoded / result.decode_s : 0.0,
             (int) adaptive, width_steps[1], width_steps[2], width_steps[3], width_steps[4],
@@ -811,7 +880,8 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
             (unsigned long long) (verify_graphs(&Qwen4ExpDecodeWorkspace::replays) - replays0),
             (unsigned long long) (draft_graphs(&Qwen4ExpDecodeWorkspace::builds) - draft_builds0),
             (unsigned long long) (draft_graphs(&Qwen4ExpDecodeWorkspace::replays) - draft_replays0),
-            width_costs.c_str());
+            width_costs.c_str(), (int) use_lookup, lookup_rounds, lookup_drafts, lookup_accepted, top_n, top_rows,
+            top_misses);
     }
 
     guard.complete = true;

@@ -1798,51 +1798,51 @@ static void upload_stable_inputs(Qwen4ExpStableInputs & in, const Qwen4ExpDecode
     upload_stable_qsa(in, ws);
 }
 
-// Read a decode or verify forward's result: each row's argmax when the caller asked for it and the graph has it (a
-// few bytes instead of n_vocab floats per row over the link), else the logits rows.
-static void read_logits(const ggml_tensor * logits, const ggml_tensor * argmax, std::vector<float> & out_logits,
-                        std::vector<int32_t> * out_argmax, Qwen4ExpForwardResult & res) {
-    if (out_argmax && argmax) {
-        out_argmax->resize((size_t) ggml_nelements(argmax));
-        ggml_backend_tensor_get(argmax, out_argmax->data(), 0, ggml_nbytes(argmax));
+// A T=1 decode or verify graph's outputs: the logits rows and what may be read in their place (Qwen4ExpRowOutputs).
+struct Qwen4ExpRowTensors {
+    ggml_tensor * logits = nullptr;
+    ggml_tensor * greedy = nullptr;   // null when the rows cannot stay on the device
+    ggml_tensor * top_ids = nullptr;
+    ggml_tensor * top_vals = nullptr;
+    int top_n = 0;
+};
+
+// With out_rows and a graph that built its row outputs (t.greedy): the rows' top candidates when asked for, their
+// greedy picks otherwise, and out_logits left empty. The logits rows otherwise.
+static void read_forward_outputs(const Qwen4ExpRowTensors & t, std::vector<float> & out_logits,
+                                 Qwen4ExpRowOutputs * out_rows) {
+    if (out_rows) {
+        out_rows->on_device = t.greedy != nullptr && t.top_n == out_rows->top_n;
+        out_rows->greedy.clear();
+        out_rows->top_vals.clear();
+        out_rows->top_ids.clear();
+    }
+    if (out_rows && out_rows->on_device) {
         out_logits.clear();
-        res.logits = logits;
+        if (t.top_n > 0) {
+            out_rows->top_vals.resize((size_t) ggml_nelements(t.top_vals));
+            out_rows->top_ids.resize((size_t) ggml_nelements(t.top_ids));
+            ggml_backend_tensor_get(t.top_vals, out_rows->top_vals.data(), 0, ggml_nbytes(t.top_vals));
+            ggml_backend_tensor_get(t.top_ids, out_rows->top_ids.data(), 0, ggml_nbytes(t.top_ids));
+        } else {
+            out_rows->greedy.resize((size_t) ggml_nelements(t.greedy));
+            ggml_backend_tensor_get(t.greedy, out_rows->greedy.data(), 0, ggml_nbytes(t.greedy));
+        }
         return;
     }
-    if (out_argmax) out_argmax->clear();
-    out_logits.resize((size_t) ggml_nelements(logits));   // n_vocab, per row when verifying
-    ggml_backend_tensor_get(logits, out_logits.data(), 0, ggml_nbytes(logits));
+    out_logits.resize((size_t) ggml_nelements(t.logits));   // n_vocab, per row when verifying
+    ggml_backend_tensor_get(t.logits, out_logits.data(), 0, ggml_nbytes(t.logits));
 }
-
-// The matmul scope of a qwen4exp forward. invariant: every quantized matmul column equals its single-token product
-// (ggml_backend_cuda_set_mmvq_batch_invariant). On the split target MUL_MAT_ID also takes the one-wave MoE kernel at
-// every width (ggml_backend_cuda_set_mmvq_moe_all_widths), so its hot experts are read once per step instead of once
-// per token. A split single-token decode runs in this scope too and shares that kernel's arithmetic with verify.
-struct Qwen4ExpMatmulScope {
-    Qwen4ExpMatmulScope(bool invariant, bool split, bool disable_graphs = false)
-        : overrides(disable_graphs, 0, false, 0, invariant), all_widths(invariant && split) {
-        if (all_widths) previous = ggml_backend_cuda_set_mmvq_moe_all_widths(true);
-    }
-    ~Qwen4ExpMatmulScope() {
-        if (all_widths) ggml_backend_cuda_set_mmvq_moe_all_widths(previous);
-    }
-    Qwen4ExpMatmulScope(const Qwen4ExpMatmulScope &) = delete;
-    Qwen4ExpMatmulScope & operator=(const Qwen4ExpMatmulScope &) = delete;
-
-    ScopedCudaGraphOverrides overrides;
-    bool all_widths = false;
-    bool previous = false;
-};
 
 // Replay a retained graph with this forward's inputs and read its logits (and hidden rows). A failed compute drops
 // the graph.
 static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace & ws, ggml_backend_sched_t short_sched,
                              bool verify, std::vector<float> & out_logits, std::vector<float> * out_hidden,
-                             std::vector<int32_t> * out_argmax, Qwen4ExpForwardResult & res) {
+                             Qwen4ExpRowOutputs * out_rows) {
     upload_stable_inputs(in, ws);
     ggml_status status;
-    {   // verify, and a split single-token decode: as built, with batch-invariant matmul columns (see forward_impl)
-        const Qwen4ExpMatmulScope matmuls(verify || (in.split && in.T == 1), in.split);
+    {   // verify: as built, with batch-invariant matmul columns (see forward_impl)
+        ScopedCudaGraphOverrides invariant(false, 0, false, 0, /*mmvq_batch_invariant=*/verify);
         status = in.split ? ggml_backend_sched_graph_compute(ws.sched ? ws.sched : short_sched, ws.gf)
                           : ggml_backend_graph_compute(in.backend, ws.gf);
     }
@@ -1851,7 +1851,7 @@ static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace 
         clear_qwen4exp_decode_workspace(ws);
         return false;
     }
-    read_logits(ws.logits, ws.argmax, out_logits, out_argmax, res);
+    read_forward_outputs({ws.logits, ws.greedy, ws.top_ids, ws.top_vals, ws.top_n}, out_logits, out_rows);
     if (out_hidden && ws.hidden) {
         out_hidden->resize((size_t) ggml_nelements(ws.hidden));
         ggml_backend_tensor_get(ws.hidden, out_hidden->data(), 0, ggml_nbytes(ws.hidden));
@@ -1932,15 +1932,20 @@ static ggml_backend_sched_t split_scheduler(ggml_backend_t backend, const Qwen4E
         // Both are parallel: per-copy events make a split wait for its
         // cross-device inputs on the GPU; a single-copy scheduler instead
         // synchronizes the receiving device from the host before every such
-        // split, which serializes the two GPUs. Split-input copies live for
-        // the whole graph, so the prompt scheduler keeps one set.
+        // split, which serializes the two GPUs.
         sched = ggml_backend_sched_new(backends, nullptr, 3, kQwen4ExpGraphNodes, true, false);
         // End a split before a node that brings in a new cross-device input,
         // so independent target work is queued before that wait and runs
         // beside the expert device: the other stream's attention in a prompt
         // chunk; the shared and hot experts in a decode or verify step.
         ggml_backend_sched_set_late_cross_input_split(sched, true);
-        if (!short_batch) ggml_backend_sched_set_n_copies(sched, 1);   // events without four copy sets
+        if (!short_batch) {
+            // The prompt scheduler keeps one copy set, and each layer's routed sum and router inputs live from the
+            // split that sent them across until their last reader, not for the whole chunk: about half of a
+            // chunk's target workspace (48 layers of [n_embd, T] per row), which the hot experts can use instead.
+            ggml_backend_sched_set_n_copies(sched, 1);
+            ggml_backend_sched_set_anchored_copies(sched, true);
+        }
     }
     return sched;
 }
@@ -2190,7 +2195,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
                                        std::vector<float> & out_logits, std::vector<float> * out_hidden,
                                        bool verify, bool mtp_prefill,
                                        const Qwen4ExpInputs * inputs, Qwen4ExpGraphMemory * measure,
-                                       std::vector<int32_t> * out_argmax = nullptr) {
+                                       Qwen4ExpRowOutputs * out_rows = nullptr) {
     Qwen4ExpForwardResult res;
     if (n_tokens <= 0 || pos0 < 0 || (!tokens && !measure)) return res;
     const Qwen4ExpCudaScope profile(w.gfx1151 || w.expert_gfx1151);
@@ -2285,14 +2290,17 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     // allocation: the scheduler rewrote its cross-device sources, so it is never split again.
     if (use_stable_graph && stable_ws.gf && (stable_ws.qsa_blocks >= 0) == stable_qsa &&
         (stable_ws.hidden != nullptr) == (out_hidden != nullptr) &&
+        (stable_ws.greedy != nullptr) == (out_rows != nullptr) &&
+        stable_ws.top_n == (out_rows ? out_rows->top_n : 0) &&
         (!split || stable_ws.sched || stable_ws.split_gen == split_owner(cache).split_short_gen) &&
         (verify ? stable_ws.row_spans == row_spans : kv_len <= stable_ws.kv_bucket && stable_ws.next_pos == pos0) &&
         (!stable_qsa || (stable_ws.kv_bucket == stable_kv_bucket &&
                         stable_ws.qsa_budget == w.indexer_top_k / 4 && cache.indexer_blocks == pos0 / 4))) {
         if (!run_stable_graph(stable_in, stable_ws, split_owner(cache).split_sched_short, verify, out_logits, out_hidden,
-                              out_argmax, res)) {
+                              out_rows)) {
             return res;
         }
+        if (out_rows && out_rows->on_device) res.logits = stable_ws.logits;
         stable_ws.next_pos = (int) kv_len;
         cache.cur_pos = (int) kv_len;
         ++stable_ws.replays;
@@ -2407,18 +2415,28 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         for (ggml_tensor * t = hidden; t; t = t->view_src) ggml_set_output(t);
         ggml_build_forward_expand(gf, hidden);
     }
+    // Each row's greedy pick: a greedy request reads T ids instead of T vocabulary rows (5 MB for a 5-row verify).
+    // A sampled request whose sampler draws from the top candidates reads T * top_n of them instead.
+    // Built only for a caller that reads them (out_rows): the others read the logits rows.
+    Qwen4ExpRowTensors row_outputs;
+    row_outputs.logits = logits;
+    if (out_rows && (reuse_ws || verify)) {
+        row_outputs.greedy = ggml_argmax(ctx, logits);
+        ggml_set_output(row_outputs.greedy);
+        ggml_build_forward_expand(gf, row_outputs.greedy);
+        row_outputs.top_n = out_rows->top_n;
+    }
+    if (row_outputs.top_n > 0) {
+        row_outputs.top_ids = ggml_top_k(ctx, logits, row_outputs.top_n);
+        row_outputs.top_vals = ggml_get_rows(ctx, ggml_reshape_3d(ctx, logits, 1, logits->ne[0], logits->ne[1]),
+                                             row_outputs.top_ids);
+        for (ggml_tensor * t : {row_outputs.top_ids, row_outputs.top_vals}) {
+            ggml_set_output(t);
+            ggml_build_forward_expand(gf, t);
+        }
+    }
     ggml_tensor * mtp_positions = mtp_prefill
         ? build_mtp_prefill(ctx, gf, w, cache, hidden, emb_rows, pos0, T) : nullptr;
-    // Each row's argmax, on the logits' device: greedy decode reads these ids instead of the rows. Built for every
-    // caller, sampled ones and prefill included: a retained graph built only for callers that read the ids is rebuilt
-    // whenever a request mixes them with callers that read the rows, and a rebuild moves the graph's attention span.
-    // Tried: the text with a draft then no longer matched the text without one. The cost is one row scan per step.
-    ggml_tensor * argmax = nullptr;
-    if (reuse_ws || verify) {
-        argmax = ggml_argmax(ctx, logits);
-        ggml_set_output(argmax);
-        ggml_build_forward_expand(gf, argmax);
-    }
 
     if (measure) {
         graph_memory(backend, ctx, gf, w.gfx1151, *measure);
@@ -2458,7 +2476,10 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         stable_ws.ple_in = ple_in;
         stable_ws.kv_row = lb.kv_row;
         stable_ws.logits = logits;
-        stable_ws.argmax = argmax;
+        stable_ws.greedy = row_outputs.greedy;
+        stable_ws.top_ids = row_outputs.top_ids;
+        stable_ws.top_vals = row_outputs.top_vals;
+        stable_ws.top_n = row_outputs.top_n;
         stable_ws.hidden = hidden;
         stable_ws.kv_bucket = stable_kv_bucket;
         stable_ws.qsa_blocks = stable_qsa ? stable_kv_bucket / 4 : -1;
@@ -2480,10 +2501,10 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     }
 
     ggml_status status;
-    {   // verify: every matmul column equals its single-token product; a split single-token decode runs in the same
-        // scope (see Qwen4ExpMatmulScope). Split prompt chunks: no HIP graph capture (long kernels gain nothing, and
+    {   // verify: every matmul column equals its single-token product (see ggml_backend_cuda_set_mmvq_batch_invariant)
+        // Split prompt chunks: no HIP graph capture (long kernels gain nothing, and
         // capture fails on allocating kernels such as the CUB segmented sort).
-        const Qwen4ExpMatmulScope matmuls(verify || (split && T == 1), split, split && T > kSplitShortRows);
+        ScopedCudaGraphOverrides invariant(split && T > kSplitShortRows, 0, false, 0, /*mmvq_batch_invariant=*/verify);
         status = split ? ggml_backend_sched_graph_compute(split_sched, gf) : ggml_backend_graph_compute(backend, gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -2513,8 +2534,10 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         cache.indexer_blocks = (int) ((pos0 + T) / qsa_ratio(w));
     }
 
-    // The rows stay readable after this call only while the context is retained (pool).
-    read_logits(logits, pool ? argmax : nullptr, out_logits, out_argmax, res);
+    // A pool (T=1 decode, verify) keeps the graph's tensors until its next forward: only then may the rows stay.
+    if (!pool) row_outputs.greedy = nullptr;
+    read_forward_outputs(row_outputs, out_logits, out_rows);
+    if (out_rows && out_rows->on_device) res.logits = logits;
     if (out_hidden && hidden) {
         out_hidden->resize((size_t) ggml_nelements(hidden));
         ggml_backend_tensor_get(hidden, out_hidden->data(), 0, ggml_nbytes(hidden));
@@ -2775,10 +2798,12 @@ bool qwen4exp_mtp_catch_up(ggml_backend_t backend, const Qwen4ExpWeights & w, Qw
 
 bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache, int pos,
                        int32_t token, int max_k, AdaptiveSpecWidth * width, Qwen4ExpMtpPending * pending,
-                       const std::function<bool(int32_t, const float *, int32_t &)> & sample_row,
+                       const std::function<bool(int32_t, const Qwen4ExpRow &, int32_t &)> & sample_row,
                        std::vector<float> & logits, Qwen4ExpMtpStep & step,
-                       const std::function<void(std::vector<int32_t> &)> & on_drafts, bool argmax_rows) {
+                       const std::function<void(std::vector<int32_t> &)> & on_drafts,
+                       const int32_t * lookup_drafts, int n_lookup, Qwen4ExpRows rows, int top_n) {
     step = {};
+    const bool lookup = pending != nullptr && lookup_drafts != nullptr && n_lookup > 0;
     const size_t hd = (size_t) w.n_embd * w.n_hc;
     auto graph_builds = [&cache] {
         uint64_t n = 0;
@@ -2787,14 +2812,21 @@ bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
         for (const auto & ws : cache.mtp_rank_workspace) n += ws.builds;
         return n;
     };
-    const int n_width = width ? width->next_width_cost_aware({}, cache.mtp_draft + 1) : cache.mtp_draft + 1;
+    // Lookup drafts set the width themselves; otherwise the adaptive controller picks it from the acceptance and step
+    // costs it has learned. The draft head's own probabilities do not help it here: a width chosen from them, with
+    // the drafts read back together, verified narrower batches for no gain (R9700 + Strix Halo: explain 8K
+    // 63.3 -> 61.7 tok/s).
+    const int n_width = lookup ? std::min(n_lookup, cache.mtp_draft) + 1
+                      : width ? width->next_width_cost_aware({}, cache.mtp_draft + 1) : cache.mtp_draft + 1;
     const int k = pending ? std::max(0, std::min(n_width - 1, max_k)) : 0;
     const bool verify = k > 0;
     step.k = k;
     const auto t0 = std::chrono::steady_clock::now();
     const uint64_t builds0 = verify ? graph_builds() : 0;
     std::vector<int32_t> drafts;
-    if (verify) {
+    if (verify && lookup) {
+        drafts.assign(lookup_drafts, lookup_drafts + k);
+    } else if (verify) {
         // After a stretch of plain decode, fold all but the last pair first: a draft catches up at most a verify's.
         if (pending->tok.size() > (size_t) cache.mtp_draft + 1 && !qwen4exp_mtp_catch_up(backend, w, cache, *pending, 1)) {
             step.error = "qwen4exp MTP catch-up failed";
@@ -2812,38 +2844,68 @@ bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
     in[0] = token;
     std::copy(drafts.begin(), drafts.end(), in.begin() + 1);
     std::vector<float> hidden;
-    std::vector<int32_t> ids;
-    const Qwen4ExpForwardResult fwd = qwen4exp_forward(backend, w, cache, in.data(), k + 1, pos, logits,
-        pending ? &hidden : nullptr, verify, false, nullptr, argmax_rows ? &ids : nullptr);
-    if (!fwd.ok) {
+    Qwen4ExpRowOutputs out;
+    out.top_n = rows == Qwen4ExpRows::lazy ? top_n : 0;
+    const Qwen4ExpForwardResult forward = qwen4exp_forward(backend, w, cache, in.data(), k + 1, pos, logits,
+        pending ? &hidden : nullptr, verify, false, nullptr, rows != Qwen4ExpRows::all ? &out : nullptr);
+    if (!forward.ok) {
         step.error = "qwen4exp decode forward failed";
         return false;
     }
-    step.by_id = fwd.logits && ids.size() == (size_t) k + 1;
+    const size_t row_bytes = (size_t) w.n_vocab * sizeof(float);
+    int read = -1;   // the row `logits` holds when the rows stayed on the device
+    auto read_row = [&](int i) {
+        if (read != i) {
+            logits.resize((size_t) w.n_vocab);
+            ggml_backend_tensor_get(forward.logits, logits.data(), (size_t) i * row_bytes, row_bytes);
+            read = i;
+        }
+        return (const float *) logits.data();
+    };
     step.draft_s = std::chrono::duration<double>(t_draft - t0).count();
     step.verify_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_draft).count();
     // Rows are sampled lazily, each after its own fed token: no draws for rows past a rejection.
     Qwen4ExpMtpAcceptance & decision = step.decision;
     for (int i = 0; i <= k; ++i) {
-        if (step.by_id) samples[(size_t) i] = ids[(size_t) i];
-        step.more = sample_row(in[(size_t) i], step.by_id ? nullptr : logits.data() + (size_t) i * w.n_vocab,
-                               samples[(size_t) i]);
+        Qwen4ExpRow row;
+        if (!out.on_device) {
+            row.read = [&logits, &w, i] { return (const float *) logits.data() + (size_t) i * w.n_vocab; };
+        } else if (rows == Qwen4ExpRows::greedy) {
+            row.picked = true;
+            samples[(size_t) i] = out.greedy[(size_t) i];
+        } else {
+            row.read = [&read_row, i] { return read_row(i); };
+            if (out.top_n > 0) {
+                row.top_n = out.top_n;
+                row.top_vals = out.top_vals.data() + (size_t) i * out.top_n;
+                row.top_ids = out.top_ids.data() + (size_t) i * out.top_n;
+            }
+        }
+        step.more = sample_row(in[(size_t) i], row, samples[(size_t) i]);
         decision = qwen4exp_mtp_accept(drafts.data(), k, samples.data(), i + 1);
         if (!step.more || decision.n_accepted != i + 1) break;
     }
     const int retained = decision.n_emitted;
-    // The caller keeps the last emitted row once generation ends: fetch that one row from the device.
-    if (step.by_id && !step.more) {
+    if (out.on_device && !step.more) {
+        read_row(retained - 1);   // generation ends: the caller keeps the last emitted row
+    } else if (!out.on_device && rows != Qwen4ExpRows::all) {
+        // A graph that read every row: keep the last emitted one, as the device paths leave it.
+        logits.erase(logits.begin(), logits.begin() + (size_t) (retained - 1) * w.n_vocab);
         logits.resize((size_t) w.n_vocab);
-        ggml_backend_tensor_get(fwd.logits, logits.data(), (size_t) (retained - 1) * w.n_vocab * sizeof(float),
-                                (size_t) w.n_vocab * sizeof(float));
     }
     if (verify) {
-        // Replace every predicted MTP hidden/KV row with the corresponding
-        // trunk pair on next catch-up, including after a partial accept.
-        pending->h.assign(hidden.begin(), hidden.begin() + (std::ptrdiff_t) ((size_t) retained * hd));
-        pending->tok.assign(decision.emitted.begin(), decision.emitted.begin() + retained);
-        pending->pos = pos;
+        if (lookup) {
+            // The draft layer did not run: its pending pairs are still owed, then the retained ones (as plain
+            // decode adds its one pair). The next MTP round catches them all up.
+            pending->h.insert(pending->h.end(), hidden.begin(), hidden.begin() + (std::ptrdiff_t) ((size_t) retained * hd));
+            pending->tok.insert(pending->tok.end(), decision.emitted.begin(), decision.emitted.begin() + retained);
+        } else {
+            // Replace every predicted MTP hidden/KV row with the corresponding
+            // trunk pair on next catch-up, including after a partial accept.
+            pending->h.assign(hidden.begin(), hidden.begin() + (std::ptrdiff_t) ((size_t) retained * hd));
+            pending->tok.assign(decision.emitted.begin(), decision.emitted.begin() + retained);
+            pending->pos = pos;
+        }
         if (!qwen4exp_verify_rollback(backend, w, cache, pos, retained)) {
             step.error = "qwen4exp verify rollback failed";
             return false;
@@ -2854,17 +2916,21 @@ bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
     }
     // Only a step that replayed its verify and draft graphs times the width; one
     // that built a graph is slower and counts for acceptance alone.
-    if (verify && width) width->observe(decision.n_accepted + 1, k + 1, graph_builds() != builds0 ? -1.0f :
-        (float) std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    step.lookup = verify && lookup;
+    if (verify) {
+        step.round_ms = graph_builds() != builds0 ? -1.0
+            : std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    if (verify && width && !step.lookup) width->observe(decision.n_accepted + 1, k + 1, (float) step.round_ms);
     return true;
 }
 
 Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend, const Qwen4ExpWeights & w,
         Qwen4ExpCache & cache, const int32_t * tokens, int n_tokens, int pos0,
         std::vector<float> & logits, std::vector<float> * out_hidden,
-        bool verify, bool mtp_prefill, const Qwen4ExpInputs * inputs, std::vector<int32_t> * out_argmax) {
+        bool verify, bool mtp_prefill, const Qwen4ExpInputs * inputs, Qwen4ExpRowOutputs * out_rows) {
     return forward_impl(backend, w, cache, tokens, n_tokens, pos0, logits, out_hidden,
-                        verify, mtp_prefill, inputs, nullptr, out_argmax);
+                        verify, mtp_prefill, inputs, nullptr, out_rows);
 }
 
 Qwen4ExpGraphMemory qwen4exp_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
@@ -3328,7 +3394,7 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
         ggml_backend_tensor_set(workspace.qsa_positions, qsa_pos.data(), 0, qsa_pos.size() * sizeof(int32_t));
     }
     // Match solo MMVQ arithmetic regardless of the number of active slots.
-    const Qwen4ExpMatmulScope matmuls(true, split);
+    const ScopedCudaGraphOverrides overrides(false, 0, false, 0, /*mmvq_batch_invariant=*/true);
     const ggml_status status = split ? ggml_backend_sched_graph_compute(workspace.sched, workspace.gf)
                                      : ggml_backend_graph_compute(backend, workspace.gf);
     if (status != GGML_STATUS_SUCCESS) {

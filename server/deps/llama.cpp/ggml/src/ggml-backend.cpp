@@ -803,6 +803,8 @@ struct ggml_backend_sched_split {
     int i_start;
     int i_end;
     struct ggml_tensor * inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
+    // the split from which an input's copy is allocated (anchored copies), -1: this split, or the whole graph
+    int input_anchor[GGML_SCHED_MAX_SPLIT_INPUTS];
     int n_inputs;
     // graph view of this split
     struct ggml_cgraph graph;
@@ -884,6 +886,7 @@ struct ggml_backend_sched {
     bool split_deferred_peer_copies;
     bool batch_split_copies;
     bool dedicated_copies;
+    bool anchored_copies;
     ggml_backend_buffer_t batch_staging_buffers[GGML_SCHED_MAX_BACKENDS];
     uint8_t * batch_staging_bases[GGML_SCHED_MAX_BACKENDS];
     size_t batch_staging_sizes[GGML_SCHED_MAX_BACKENDS];
@@ -1122,6 +1125,37 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+// Anchored copies (ggml_backend_sched_set_anchored_copies): the split whose start allocates the copy of `src`
+// (on src_backend_id) into a split of dst_backend_id that is being built at cur_split; -1 keeps the copy pinned for
+// the whole graph. The anchor is the latest earlier split on the source backend that received a copy of a computed
+// tensor from the destination: that copy runs on the destination's stream behind every destination split before
+// the anchor, and the source backend waits for it before it runs the anchor split, so everything it does later
+// (this copy included) happens after those splits finished reading their memory. Graph inputs and weights do not
+// count: their copies are not ordered behind the destination's work.
+static int ggml_backend_sched_copy_anchor(ggml_backend_sched_t sched, int cur_split, const struct ggml_tensor * src,
+                                          int src_backend_id, int dst_backend_id) {
+    if (!sched->anchored_copies || sched->n_copies != 1 || !sched->copy_events || sched->dedicated_copies ||
+        (src->flags & GGML_TENSOR_FLAG_INPUT)) {
+        return -1;
+    }
+    for (int s = cur_split - 1; s >= 0; s--) {
+        const struct ggml_backend_sched_split * split = &sched->splits[s];
+        if (split->backend_id != src_backend_id) {
+            continue;
+        }
+        for (int j = 0; j < split->n_inputs; j++) {
+            struct ggml_tensor * input = split->inputs[j];
+            const struct ggml_tensor * base = input->view_src ? input->view_src : input;
+            if (sched->hv_tensor_backend_ids[hash_id(input)] == dst_backend_id &&
+                !(input->flags & GGML_TENSOR_FLAG_INPUT) &&
+                !(base->buffer && base->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
+                return s;
+            }
+        }
+    }
+    return -1;
+}
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -1520,10 +1554,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
+                        const int anchor = ggml_backend_sched_copy_anchor(sched, i_split, src, src_backend_id, cur_backend_id);
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1 || sched->copy_events || sched->dedicated_copies) {
+                            if ((sched->n_copies > 1 || sched->copy_events || sched->dedicated_copies) && anchor < 0) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
@@ -1533,6 +1568,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         int n_inputs = split->n_inputs++;
                         GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
                         split->inputs[n_inputs] = src;
+                        split->input_anchor[n_inputs] = anchor;
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
@@ -1647,6 +1683,26 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     struct ggml_cgraph * graph_copy = &sched->graph;
 
+    // Anchored copies by anchor split: (split, input) pairs, grouped by the split whose start allocates them.
+    std::vector<int> anchored_start(sched->n_splits + 1, 0);
+    std::vector<std::pair<int, int>> anchored;
+    for (int i = 0; i < sched->n_splits; i++) {
+        for (int j = 0; j < sched->splits[i].n_inputs; j++) {
+            if (sched->splits[i].input_anchor[j] >= 0) anchored_start[sched->splits[i].input_anchor[j] + 1]++;
+        }
+    }
+    for (int i = 0; i < sched->n_splits; i++) anchored_start[i + 1] += anchored_start[i];
+    anchored.resize(anchored_start[sched->n_splits]);
+    {
+        std::vector<int> fill(anchored_start.begin(), anchored_start.end() - 1);
+        for (int i = 0; i < sched->n_splits; i++) {
+            for (int j = 0; j < sched->splits[i].n_inputs; j++) {
+                const int a = sched->splits[i].input_anchor[j];
+                if (a >= 0) anchored[fill[a]++] = {i, j};
+            }
+        }
+    }
+
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
@@ -1654,6 +1710,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // Optimize this split of the graph. This needs to happen before we make graph_copy,
         // so they are in sync.
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph);
+
+        // later splits' copies anchored here: allocated from this split on
+        for (int k = anchored_start[i]; k < anchored_start[i + 1]; k++) {
+            assert(graph_copy->size > graph_copy->n_nodes);
+            const struct ggml_backend_sched_split * consumer = &sched->splits[anchored[k].first];
+            struct ggml_tensor * input = consumer->inputs[anchored[k].second];
+            sched->node_backend_ids[graph_copy->n_nodes] = consumer->backend_id;
+            graph_copy->nodes[graph_copy->n_nodes++] =
+                tensor_id_copy(hash_id(input), (size_t) consumer->backend_id, sched->cur_copy);
+        }
 
         // add inputs to the graph copy so that they are allocated by ggml-alloc at the start of the split
         for (int j = 0; j < split->n_inputs; j++) {
@@ -1669,6 +1735,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             sched->node_backend_ids[graph_copy->n_nodes] = sched->hv_tensor_backend_ids[input_id];
             graph_copy->nodes[graph_copy->n_nodes++] = input_dep;
 
+            if (split->input_anchor[j] >= 0) {
+                continue;   // allocated at its anchor
+            }
             // add a dependency to the input copy so that it is allocated at the start of the split
             sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
             graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
@@ -1699,6 +1768,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             struct ggml_backend_sched_split * split = &sched->splits[i];
             int backend_id = split->backend_id;
             for (int j = 0; j < split->n_inputs; j++) {
+                if (split->input_anchor[j] >= 0) {
+                    continue;   // an anchored copy is allocated at its anchor split, not first
+                }
                 struct ggml_tensor * input = split->inputs[j];
                 size_t id = hash_id(input);
                 for (int c = 0; c < sched->n_copies; c++) {
@@ -2980,6 +3052,13 @@ void ggml_backend_sched_set_dedicated_copies(
     GGML_ASSERT(sched);
     GGML_ASSERT(!sched->is_alloc);
     sched->dedicated_copies = enabled;
+}
+
+void ggml_backend_sched_set_anchored_copies(
+        ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(!sched->is_alloc);
+    sched->anchored_copies = enabled;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

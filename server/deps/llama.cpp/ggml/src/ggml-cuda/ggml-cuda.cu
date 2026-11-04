@@ -129,7 +129,6 @@ static thread_local int ggml_cuda_mmvq_max_ncols_override = 0;
 static thread_local int ggml_cuda_ds4_mix_mmv_max_tokens = GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
 static thread_local bool ggml_cuda_graphs_disabled_override = false;
 static thread_local bool ggml_cuda_mmvq_batch_invariant_enabled = false;
-static thread_local bool ggml_cuda_mmvq_moe_all_widths_enabled = false;
 
 static thread_local ggml_cuda_qwen4exp_profile qwen4exp_profile = GGML_CUDA_QWEN4EXP_OFF;
 
@@ -195,16 +194,6 @@ extern "C" void ggml_backend_cuda_mul_mat_whole_row_lanes(ggml_tensor * mul_mat)
 
 bool ggml_cuda_mmvq_batch_invariant() {
     return ggml_cuda_mmvq_batch_invariant_enabled;
-}
-
-extern "C" bool ggml_backend_cuda_set_mmvq_moe_all_widths(bool enabled) {
-    const bool previous = ggml_cuda_mmvq_moe_all_widths_enabled;
-    ggml_cuda_mmvq_moe_all_widths_enabled = enabled;
-    return previous;
-}
-
-bool ggml_cuda_mmvq_moe_all_widths() {
-    return ggml_cuda_mmvq_moe_all_widths_enabled;
 }
 
 static thread_local int ggml_cuda_mmvq_invariant_rows_override_value = 0;
@@ -3309,7 +3298,7 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     }
 
     // RDNA4 Q8_0 gate/up pairs at several columns (the cluster shared expert in
-    // a verify): one launch reads both matrices and writes the SwiGLU-DS4.
+    // a verify, qwen4exp's shared expert): one launch reads both matrices and writes the SwiGLU.
     if (!ids && direct_vector_layout && src1->ne[1] <= ggml_cuda_mmvq_max_ncols() &&
         !ggml_backend_buft_is_cuda_split(src0->buffer->buft) &&
         !ggml_backend_buft_is_cuda_split(gate->src[0]->buffer->buft) &&

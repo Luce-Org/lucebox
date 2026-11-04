@@ -1,4 +1,4 @@
-// Bit parity of the Qwen3.8-Flash-Next two-GPU split fusions and RDNA4 decode kernels.
+// Bit parity of the Qwen3.8-Flash-Next two-GPU split fusions.
 //
 // Each case builds its pattern the way the qwen4exp graph does and computes it twice on every GPU: as one graph,
 // where the fusion runs, and in segments that a fusion cannot cross (node by node, or a q8_1 producer apart from the
@@ -6,10 +6,8 @@
 // (ggml_backend_cuda_get_qn_fusion_count) must show that the fusion ran in the one-graph run and not in the other,
 // so a pattern that stops matching fails here instead of silently costing launches.
 //
-// The RDNA4 kernels are compared with the products they replace: the short-row Q8_0 matvec with the same rows in
-// slices of 1024 (the old shape), the Q8_0 gate/up pair with separate products and GLU, and the one-wave MoE kernel
-// at every width with each token alone. The argmax that greedy decode reads is compared with a host scan of rows
-// full of ties, on every GPU and on the CPU backend, so both backends break ties the same way.
+// The argmax that greedy decode reads is compared with a host scan of rows full of ties, on every GPU and on the
+// CPU backend, so both backends break ties the same way.
 //
 // Exit codes: 0 pass, 1 mismatch, 77 no GPU backend.
 #include "ggml-alloc.h"
@@ -36,22 +34,17 @@ void fail(const std::string & what) {
     ++g_failures;
 }
 
-// The qwen4exp profile (its fusions), batch-invariant matmul columns and the all-widths MoE kernel, as the split
-// forwards set them, restored on scope exit.
+// The qwen4exp profile (its fusions) and batch-invariant matmul columns, as the split forwards set them, restored on
+// scope exit.
 struct Profile {
     explicit Profile(bool on) : prev(ggml_backend_cuda_set_qwen4exp_profile(on ? GGML_CUDA_QWEN4EXP_DEFAULT : GGML_CUDA_QWEN4EXP_OFF)) {}
     ~Profile() { ggml_backend_cuda_set_qwen4exp_profile(prev); }
     ggml_cuda_qwen4exp_profile prev;
 };
 struct Invariant {
-    Invariant(bool on, bool all_widths)
-        : prev(ggml_backend_cuda_set_mmvq_batch_invariant(on)),
-          prev_all(ggml_backend_cuda_set_mmvq_moe_all_widths(all_widths)) {}
-    ~Invariant() {
-        ggml_backend_cuda_set_mmvq_moe_all_widths(prev_all);
-        ggml_backend_cuda_set_mmvq_batch_invariant(prev);
-    }
-    bool prev, prev_all;
+    explicit Invariant(bool on) : prev(ggml_backend_cuda_set_mmvq_batch_invariant(on)) {}
+    ~Invariant() { ggml_backend_cuda_set_mmvq_batch_invariant(prev); }
+    bool prev;
 };
 
 // One pattern: its tensors (each with its own memory), its graph and the tensors compared.
@@ -272,7 +265,7 @@ void unary_mul_q8(ggml_backend_t be, int T) {
     p.output(mm);
     if (!p.alloc(be)) { fail(name + ": alloc"); return; }
     p.fill_rest();
-    const Invariant inv(true, false);
+    const Invariant inv(true);
     check(be, name, p, {p.index_of(mm)}, GGML_CUDA_QN_UNARY_MUL_Q8, 1);
 }
 
@@ -288,7 +281,7 @@ void scale_silu(ggml_backend_t be, int T) {
     p.output(ggml_mul_mat(p.ctx, W, s));
     if (!p.alloc(be)) { fail(name + ": alloc"); return; }
     p.fill_rest();
-    const Invariant inv(true, false);
+    const Invariant inv(true);
     check(be, name, p, {}, GGML_CUDA_QN_SCALE_SILU, 1);
 }
 
@@ -314,7 +307,7 @@ void hc_cn_q8(ggml_backend_t be, int T) {
     if (!p.alloc(be)) { fail(name + ": alloc"); return; }
     p.fill_rest();
     const Profile prof(true);
-    const Invariant inv(true, false);
+    const Invariant inv(true);
     check(be, name, p, {p.index_of(mm)}, GGML_CUDA_QN_HC_CN_Q8, 1);
 }
 
@@ -339,115 +332,8 @@ void hc_mix_q8(ggml_backend_t be, int T) {
     if (!p.alloc(be)) { fail(name + ": alloc"); return; }
     p.fill_rest();
     const Profile prof(true);
-    const Invariant inv(true, false);
+    const Invariant inv(true);
     check(be, name, p, {p.index_of(mm)}, GGML_CUDA_QN_HC_MIX_Q8, 1);
-}
-
-// ── RDNA4: Q8_0 short rows over many rows (the HC up projection) vs the same rows in slices of 1024 ────────────
-void q8_small_k(ggml_backend_t be, int T) {
-    const std::string name = "q8_small_k T=" + std::to_string(T);
-    const int K = 320, N = 10240, slice_rows = 1024;
-    Pattern p;
-    ggml_tensor * W = p.input(GGML_TYPE_Q8_0, K, N);
-    ggml_tensor * x = p.input(GGML_TYPE_F32, K, T);
-    ggml_tensor * full = ggml_mul_mat(p.ctx, W, x);
-    p.output(full);
-    std::vector<ggml_tensor *> parts;
-    for (int r = 0; r < N; r += slice_rows) {
-        ggml_tensor * Wr = ggml_view_2d(p.ctx, W, K, slice_rows, W->nb[1], (size_t) r * W->nb[1]);
-        parts.push_back(ggml_mul_mat(p.ctx, Wr, x));
-        p.output(parts.back());
-    }
-    if (!p.alloc(be)) { fail(name + ": alloc"); return; }
-    p.fill_rest();
-    const Invariant inv(true, false);
-    const size_t c0 = count(GGML_CUDA_QN_Q8_SMALL_K);
-    if (ggml_backend_graph_compute(be, p.gf) != GGML_STATUS_SUCCESS) { fail(name + ": compute"); return; }
-    if (count(GGML_CUDA_QN_Q8_SMALL_K) - c0 != 1) fail(name + ": short-row shape not taken exactly once");
-    const std::vector<uint8_t> f = read(full);
-    for (size_t k = 0; k < parts.size(); ++k) {
-        const std::vector<uint8_t> s = read(parts[k]);
-        for (int t = 0; t < T; ++t) {
-            const size_t row_bytes = (size_t) slice_rows * sizeof(float);
-            if (std::memcmp(f.data() + ((size_t) t * N + k * slice_rows) * sizeof(float),
-                            s.data() + (size_t) t * row_bytes, row_bytes) != 0) {
-                fail(name + ": rows " + std::to_string(k * slice_rows) + " token " + std::to_string(t));
-            }
-        }
-    }
-}
-
-// ── RDNA4: the Q8_0 gate/up pair serving plain SwiGLU (the shared expert) ───────────────────────────────────────
-void swiglu_pair(ggml_backend_t be, int T) {
-    const std::string name = "swiglu_pair T=" + std::to_string(T);
-    const int K = 2560, N = 640;
-    Pattern p;
-    ggml_tensor * Wg = p.input(GGML_TYPE_Q8_0, K, N);
-    ggml_tensor * Wu = p.input(GGML_TYPE_Q8_0, K, N);
-    ggml_tensor * x = p.input(GGML_TYPE_F32, K, T);
-    p.output(ggml_swiglu_split(p.ctx, ggml_mul_mat(p.ctx, Wg, x), ggml_mul_mat(p.ctx, Wu, x)));
-    if (!p.alloc(be)) { fail(name + ": alloc"); return; }
-    p.fill_rest();
-    const Invariant inv(true, false);
-    check(be, name, p, {}, GGML_CUDA_QN_SWIGLU_PAIR, 1);
-}
-
-// ── RDNA4: MUL_MAT_ID on the one-wave MoE kernel at every width vs each token alone ────────────────────────────
-// up: the gate/up form (activations [K, 1, T] shared by the routes), else the down form ([K, k, T], one per route).
-void moe_all_widths(ggml_backend_t be, ggml_type type, bool up, int T) {
-    const std::string name = std::string("moe_all_widths ") + ggml_type_name(type) + (up ? " up" : " down") +
-                             " T=" + std::to_string(T);
-    const int n_expert = 16, k = 4;
-    const int K = up ? 2560 : 512, N = up ? 512 : 2560;
-    std::mt19937 rng(77);
-    std::normal_distribution<float> nd(0.0f, 1.0f);
-    std::vector<float> hx((size_t) K * (up ? 1 : k) * T);
-    for (float & v : hx) v = nd(rng);
-    std::vector<int32_t> hids((size_t) k * T);
-    std::vector<int32_t> perm(n_expert);
-    for (int t = 0; t < T; ++t) {
-        for (int e = 0; e < n_expert; ++e) perm[e] = e;
-        std::shuffle(perm.begin(), perm.end(), rng);
-        std::copy(perm.begin(), perm.begin() + k, hids.begin() + (size_t) t * k);
-    }
-    // Same weights in every graph: quantize once.
-    std::vector<float> hw((size_t) K * N * n_expert);
-    for (float & v : hw) v = 0.05f * nd(rng);
-    std::vector<uint8_t> qw(ggml_row_size(type, K) * N * n_expert);
-    ggml_quantize_chunk(type, hw.data(), qw.data(), 0, (int64_t) N * n_expert, K, nullptr);
-
-    // Width w starting at token t0: the [N, k, w] product.
-    auto run = [&](int t0, int w, std::vector<uint8_t> & out, size_t & taken) {
-        Pattern p;
-        ggml_tensor * W = p.input(type, K, N, n_expert);
-        ggml_tensor * x = p.input(GGML_TYPE_F32, K, up ? 1 : k, w);
-        ggml_tensor * ids = p.input(GGML_TYPE_I32, k, w);
-        ggml_tensor * y = ggml_mul_mat_id(p.ctx, W, x, ids);
-        p.output(y);
-        if (!p.alloc(be)) return false;
-        ggml_backend_tensor_set(W, qw.data(), 0, qw.size());
-        p.set(x, hx.data() + (size_t) t0 * K * (up ? 1 : k));
-        p.set(ids, hids.data() + (size_t) t0 * k);
-        const Invariant inv(true, true);
-        const size_t c0 = count(GGML_CUDA_QN_MOE_ALL_WIDTHS);
-        if (ggml_backend_graph_compute(be, p.gf) != GGML_STATUS_SUCCESS) return false;
-        taken = count(GGML_CUDA_QN_MOE_ALL_WIDTHS) - c0;
-        out = read(y);
-        return true;
-    };
-    std::vector<uint8_t> all;
-    size_t taken = 0;
-    if (!run(0, T, all, taken)) { fail(name + ": compute"); return; }
-    if (taken != 1) fail(name + ": all-widths kernel not taken");
-    const size_t token_bytes = (size_t) N * k * sizeof(float);
-    for (int t = 0; t < T; ++t) {
-        std::vector<uint8_t> one;
-        if (!run(t, 1, one, taken)) { fail(name + ": compute token"); return; }
-        if (taken != 1) fail(name + ": all-widths kernel not taken at one token");
-        if (std::memcmp(all.data() + (size_t) t * token_bytes, one.data(), token_bytes) != 0) {
-            fail(name + ": token " + std::to_string(t) + " differs from its one-token product");
-        }
-    }
 }
 
 // ── The argmax greedy decode reads: ties go to the lowest index, as a host scan's ──────────────────────────────
@@ -505,9 +391,7 @@ int main() {
         }
         char desc[256] = {};
         ggml_backend_cuda_get_device_description(dev, desc, sizeof(desc));
-        // gfx1151 (qwen4exp_supported) and RDNA4 run the QSA kernels; RDNA4 is the split target.
-        const bool rdna4 = ggml_backend_cuda_qsa_supported(be) && !ggml_backend_cuda_qwen4exp_supported(be);
-        std::printf("GPU %d: %s%s\n", dev, desc, rdna4 ? " (RDNA4)" : "");
+        std::printf("GPU %d: %s\n", dev, desc);
         const int before = g_failures;
 
         for (int T : {1, 3, 8}) route_norm(be, 512, 10, T, true);
@@ -518,13 +402,6 @@ int main() {
         for (int T : {1, 2, 8}) hc_cn_q8(be, T);
         for (int T : {1, 2, 8}) hc_mix_q8(be, T);
         argmax_ties(be);
-        if (rdna4) {
-            for (int T : {1, 2, 4, 8}) q8_small_k(be, T);
-            for (int T : {2, 4, 8}) swiglu_pair(be, T);
-            for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
-                for (bool up : {true, false}) moe_all_widths(be, type, up, 8);
-            }
-        }
         std::printf("GPU %d: %s\n", dev, g_failures == before ? "PASS" : "FAIL");
         ggml_backend_free(be);
     }

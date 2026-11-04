@@ -18,12 +18,6 @@
 #include <string>
 #include <vector>
 
-// Widths 1..kMaxCols (BENCH_MAX_COLS, default 8: DeepSeek4 verifies up to 4, Qwen3.8 MTP up to 8).
-#ifndef BENCH_MAX_COLS
-#define BENCH_MAX_COLS 8
-#endif
-constexpr int kMaxCols = BENCH_MAX_COLS;
-
 struct Shape { const char * name; int K; int N; int nch; ggml_type type = GGML_TYPE_Q8_0; };
 
 static uint64_t fnv(const void * p, size_t n, uint64_t h = 1469598103934665603ull) {
@@ -45,21 +39,17 @@ int main(int argc, char ** argv) {
         {"shexp_gu",    5120,   2304, 1},
         {"shexp_down",  2304,   5120, 1},
         {"output",      5120, 129280, 1},
+        // qwen4exp (split mode's R9700): short hyper-connection and shared-expert rows, and a long one
+        {"q4x_hc_up",    320,  10240, 1},
+        {"q4x_hc_down", 10240,   320, 1},
+        {"q4x_sh_down",  640,   2560, 1},
+        {"q4x_sh_gu",   2560,    640, 1},
+        {"q4x_qkv",     2560,  10240, 1},
         // non-Q8_0 dense products of the same verify step
         {"hc_fn_f16",  20480,     24, 1, GGML_TYPE_F16},
         {"compr_f16",   5120,    512, 1, GGML_TYPE_F16},
         {"router_f32",  5120,    384, 1, GGML_TYPE_F32},
         {"engram_f16",  6144,  25600, 1, GGML_TYPE_F16},
-        // Qwen3.8-Flash-Next hyper-connection projections (n_embd 2560 x 4 streams, rank 320)
-        {"qn_hc_down", 10240,    320, 1},
-        {"qn_hc_up",     320,  10240, 1},
-        {"qn_attn_qkv",  2560,  10240, 1},
-        {"qn_attn_gate", 2560,   6144, 1},
-        {"qn_ssm_out",   6144,   2560, 1},
-        {"qn_attn_q",    2560,  12288, 1},
-        {"qn_attn_kv",   2560,    512, 1},
-        {"qn_shexp_gu",  2560,    640, 1},
-        {"qn_shexp_dn",   640,   2560, 1},
     };
     ggml_backend_t be = ggml_backend_cuda_init(dev);
     if (!be) { std::fprintf(stderr, "no cuda backend\n"); return 1; }
@@ -75,8 +65,8 @@ int main(int argc, char ** argv) {
         ggml_context * ctx = ggml_init(ip);
         std::vector<ggml_tensor *> W(layers);
         for (int l = 0; l < layers; ++l) W[l] = ggml_new_tensor_3d(ctx, s.type, s.K, s.N, s.nch);
-        ggml_tensor * X[kMaxCols + 1];
-        for (int nc = 1; nc <= kMaxCols; ++nc) X[nc] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, s.K, nc, s.nch);
+        ggml_tensor * X[5];
+        for (int nc = 1; nc <= 4; ++nc) X[nc] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, s.K, nc, s.nch);
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
         if (!buf) { std::fprintf(stderr, "alloc failed for %s\n", s.name); return 1; }
         std::mt19937 rng(1234);
@@ -108,18 +98,18 @@ int main(int argc, char ** argv) {
         }
         {
             std::normal_distribution<float> nd(0.0f, 1.0f);
-            std::vector<float> x4((size_t) s.K * kMaxCols * s.nch);
+            std::vector<float> x4((size_t) s.K * 4 * s.nch);
             for (float & v : x4) v = nd(rng);
-            for (int nc = 1; nc <= kMaxCols; ++nc) {
+            for (int nc = 1; nc <= 4; ++nc) {
                 std::vector<float> xn((size_t) s.K * nc * s.nch);
                 for (int c = 0; c < s.nch; ++c)
                     for (int j = 0; j < nc; ++j)
-                        std::memcpy(&xn[((size_t) c*nc + j) * s.K], &x4[((size_t) c*kMaxCols + j) * s.K], s.K * sizeof(float));
+                        std::memcpy(&xn[((size_t) c*nc + j) * s.K], &x4[((size_t) c*4 + j) * s.K], s.K * sizeof(float));
                 ggml_backend_tensor_set(X[nc], xn.data(), 0, xn.size() * sizeof(float));
             }
         }
-        std::vector<std::vector<float>> col1(kMaxCols);
-        for (int nc = 1; nc <= kMaxCols; ++nc) {
+        std::vector<std::vector<float>> col1(4);
+        for (int nc = 1; nc <= 4; ++nc) {
             ggml_init_params gp = { ggml_tensor_overhead() * (layers*4 + 16) + ggml_graph_overhead_custom(1024, false), nullptr, true };
             ggml_context * gctx = ggml_init(gp);
             ggml_cgraph * gf = ggml_new_graph_custom(gctx, 1024, false);
@@ -147,11 +137,11 @@ int main(int argc, char ** argv) {
             size_t ndiff = 0;
             if (nc == 1) {
                 // collect nc=1 results for all four columns: rerun with each column of X[4]
-                for (int j = 0; j < kMaxCols; ++j) {
+                for (int j = 0; j < 4; ++j) {
                     ggml_init_params cp = { ggml_tensor_overhead() * 8 + ggml_graph_overhead_custom(64, false), nullptr, true };
                     ggml_context * cctx = ggml_init(cp);
                     ggml_cgraph * cg = ggml_new_graph_custom(cctx, 64, false);
-                    ggml_tensor * xv = ggml_view_3d(cctx, X[kMaxCols], s.K, 1, s.nch, X[kMaxCols]->nb[1], X[kMaxCols]->nb[2], j * X[kMaxCols]->nb[1]);
+                    ggml_tensor * xv = ggml_view_3d(cctx, X[4], s.K, 1, s.nch, X[4]->nb[1], X[4]->nb[2], j * X[4]->nb[1]);
                     ggml_tensor * xc = ggml_cont(cctx, xv);
                     ggml_tensor * o = ggml_mul_mat(cctx, W[0], xc);
                     ggml_build_forward_expand(cg, o);

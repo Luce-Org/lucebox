@@ -2,12 +2,19 @@
 #include "ggml-cuda.h"
 #include "ggml.h"
 
-// Performance-only tile sweep. The ctest-registered test_deepseek4_unit checks
-// exact selected-set parity and padded -infinity ties across these shapes.
+// Performance-only sweep of the plain k = 512 top-k over rows and columns. The
+// ctest-registered test_deepseek4_unit checks exact selected-set parity and
+// padded -infinity ties across these shapes. The kernel is the backend's choice
+// for each shape; GGML_DS4_TOPK_BLOCK_RADIX=0/1, set before the run (the
+// backend reads it once), forces the device-wide sort or the block radix top-k.
+//
+//   bench_ds4_topk [rows,...]   (default 1,4,8,64,4096)
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -37,7 +44,6 @@ bool compute_topk(
         int ncols,
         int nrows,
         int k,
-        bool block_radix,
         int warmup,
         int iterations,
         RunResult & result) {
@@ -68,7 +74,6 @@ bool compute_topk(
     const std::vector<float> host_scores = make_scores(ncols, nrows);
     ggml_backend_tensor_set(
         scores, host_scores.data(), 0, host_scores.size() * sizeof(float));
-    setenv("GGML_DS4_TOPK_BLOCK_RADIX", block_radix ? "1" : "0", 1);
 
     bool ok = true;
     for (int i = 0; i < warmup; ++i) {
@@ -98,7 +103,20 @@ bool compute_topk(
 
 }  // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    std::vector<int> rows;
+    for (std::string list = argc > 1 ? argv[1] : "1,4,8,64,4096"; !list.empty();) {
+        const size_t comma = list.find(',');
+        const std::string item = list.substr(0, comma);
+        char * end = nullptr;
+        const long n = std::strtol(item.c_str(), &end, 10);
+        if (item.empty() || *end != '\0' || n <= 0 || n > INT32_MAX) {
+            std::fprintf(stderr, "bad row count '%s': expected a comma list of positive integers\n", item.c_str());
+            return 1;
+        }
+        rows.push_back((int) n);
+        list = comma == std::string::npos ? "" : list.substr(comma + 1);
+    }
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
         std::fprintf(stderr, "ggml_backend_cuda_init failed\n");
@@ -108,39 +126,33 @@ int main() {
     const bool previous_graphs_disabled =
         ggml_backend_cuda_set_graphs_disabled_override(true);
     constexpr int k = 512;
-    constexpr int nrows = 4;
-    const int shapes[] = {
-        5121, 8192, 8193, 12288, 12289, 16384, 28673, 30720, 32768
-    };
+    const int shapes[] = {2048, 5120, 8192, 16384, 32768};
+    // The backend's reading of GGML_DS4_TOPK_BLOCK_RADIX: unset keeps the device default, empty or 0 is off,
+    // anything else on.
+    const char * forced = std::getenv("GGML_DS4_TOPK_BLOCK_RADIX");
+    const char * kernel = !forced ? "default"
+                        : forced[0] != '\0' && std::strcmp(forced, "0") != 0 ? "block_radix" : "device_sort";
     bool all_ok = true;
+    int cases = 0;
 
-    for (const int ncols : shapes) {
-        RunResult full_sort;
-        RunResult hierarchical;
-        const int iterations = ncols == 30720 ? 100 : 5;
-        const bool ran =
-            compute_topk(
-                backend, ncols, nrows, k, false, 2, iterations, full_sort) &&
-            compute_topk(
-                backend, ncols, nrows, k, true, 2, iterations, hierarchical);
-        const double speedup = hierarchical.milliseconds > 0.0
-            ? full_sort.milliseconds / hierarchical.milliseconds
-            : 0.0;
-        std::printf(
-            "ncols=%d rows=%d k=%d full_sort=%.3f ms hierarchical=%.3f ms "
-            "speedup=%.2fx status=%s\n",
-            ncols,
-            nrows,
-            k,
-            full_sort.milliseconds,
-            hierarchical.milliseconds,
-            speedup,
-            ran ? "ok" : "FAILED");
-        all_ok = all_ok && ran;
+    for (const int nrows : rows) {
+        for (const int ncols : shapes) {
+            if ((size_t) nrows * ncols > ((size_t) 1 << 27)) continue;   // 512 MB of scores
+            RunResult run;
+            const int iterations = nrows * (size_t) ncols > ((size_t) 1 << 22) ? 5 : 50;
+            const bool ran = compute_topk(backend, ncols, nrows, k, 3, iterations, run);
+            std::printf("kernel=%s rows=%d ncols=%d k=%d ms=%.4f status=%s\n",
+                        kernel, nrows, ncols, k, run.milliseconds, ran ? "ok" : "FAILED");
+            all_ok = all_ok && ran;
+            ++cases;
+        }
     }
 
-    unsetenv("GGML_DS4_TOPK_BLOCK_RADIX");
     ggml_backend_cuda_set_graphs_disabled_override(previous_graphs_disabled);
     ggml_backend_free(backend);
+    if (cases == 0) {
+        std::fprintf(stderr, "no case ran: every requested row count exceeds the 512 MB score cap\n");
+        return 1;
+    }
     return all_ok ? 0 : 1;
 }

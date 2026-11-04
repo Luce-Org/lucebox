@@ -390,6 +390,20 @@ TEST_CASE(ChainSampledVerifyFixture, host_only_sampler_configs) {
     SamplerCfg card;
     card.temp = 1.0f; card.top_k = 20; card.top_p = 0.95f;
     CHECK(sample_logits_host_only(card, 248320));
+    // Greedy without penalties scans the host row on every build, the lowest id winning a tie.
+    SamplerCfg greedy;
+    CHECK(sample_logits_host_only(greedy, 248320));
+    std::vector<float> row(16, 0.0f);
+    row[3] = row[9] = 2.0f;
+    std::mt19937_64 rng(1);
+    CHECK(sample_logits(row.data(), (int) row.size(), greedy, {}, rng) == 3);
+    // That pick is the row's argmax whatever the history: a backend may take it from the device. Not so with a
+    // temperature, a penalty or a grammar.
+    CHECK(sample_logits_is_argmax(greedy));
+    CHECK(!sample_logits_is_argmax(card));
+    SamplerCfg penalized;
+    penalized.rep_pen = 1.1f;
+    CHECK(!sample_logits_is_argmax(penalized));
     // Without top_k, a build with the GPU sampler may sample on the GPU
     // (unless LUCE_GPU_SAMPLE=0); the engine keeps such lanes on its own
     // thread. Without the GPU sampler every config is host-only.
@@ -401,4 +415,73 @@ TEST_CASE(ChainSampledVerifyFixture, host_only_sampler_configs) {
     CHECK(sample_logits_host_only(plain, 248320));
     CHECK(sample_logits_host_only(nucleus, 248320));
 #endif
+}
+
+TEST_CASE(ChainSampledVerifyFixture, top_candidates_draw_like_the_row) {
+    // sample_logits_top draws from a row's largest logits what sample_logits draws from the whole row, with the
+    // same RNG value, or declines before drawing. The candidates take the row's top n with ties at the n-th value
+    // cut toward the higher ids (the choice a device top-k may make), in a shuffled order.
+    const int vocab = 4096;
+    SamplerCfg think;    // the card's thinking sampling
+    think.temp = 1.0f; think.top_p = 0.95f; think.top_k = 20;
+    SamplerCfg no_think; // its non-thinking sampling: a presence penalty
+    no_think.temp = 0.7f; no_think.top_p = 0.8f; no_think.top_k = 20; no_think.pres_pen = 1.5f;
+    SamplerCfg wide;
+    wide.temp = 0.6f; wide.top_k = 40; wide.rep_pen = 1.1f; wide.freq_pen = 0.3f;
+    SamplerCfg pow2;     // a power-of-two top_k: candidates beyond it, or no draw could settle
+    pow2.temp = 0.8f; pow2.top_p = 0.95f; pow2.top_k = 32;
+    CHECK(sample_logits_top_n(think, vocab) == 32);
+    CHECK(sample_logits_top_n(no_think, vocab) == 64);
+    CHECK(sample_logits_top_n(wide, vocab) == 128);
+    CHECK(sample_logits_top_n(pow2, vocab) == 64);
+    SamplerCfg greedy, no_k, raising;
+    no_k.temp = 1.0f;
+    raising.temp = 1.0f; raising.top_k = 20; raising.pres_pen = -0.5f;   // a negative penalty raises a logit
+    CHECK(sample_logits_top_n(greedy, vocab) == 0);
+    CHECK(sample_logits_top_n(no_k, vocab) == 0);
+    CHECK(sample_logits_top_n(raising, vocab) == 0);
+
+    std::mt19937 gen(5);
+    std::normal_distribution<float> logit(0.0f, 3.0f);
+    int decided = 0, declined = 0, pow2_decided = 0;
+    for (int it = 0; it < 120; ++it) {
+        std::vector<float> row((size_t) vocab);
+        for (float & x : row) x = logit(gen);
+        if (it % 3 == 1) {
+            for (int i = 0; i < vocab; i += 3) row[(size_t) i] = std::round(row[(size_t) i]);   // many ties
+        }
+        if (it % 10 == 9) std::fill(row.begin(), row.end(), 1.0f);   // one value: a tie reaches the n-th
+        std::vector<int> order((size_t) vocab);
+        for (int i = 0; i < vocab; ++i) order[(size_t) i] = i;
+        std::sort(order.begin(), order.end(), [&](int a, int b) {
+            return row[(size_t) a] > row[(size_t) b] || (row[(size_t) a] == row[(size_t) b] && a > b);
+        });
+        // Penalized tokens: some of the row's best and some others.
+        std::vector<int32_t> history;
+        for (int i = 0; i < 24; ++i) history.push_back(order[(size_t) (i * 3) % 70]);
+        for (int i = 0; i < 8; ++i) history.push_back((int32_t) (gen() % vocab));
+        for (const SamplerCfg * cfg : {&think, &no_think, &wide, &pow2}) {
+            const int n = sample_logits_top_n(*cfg, vocab);
+            std::vector<int> top(order.begin(), order.begin() + n);
+            std::shuffle(top.begin(), top.end(), gen);
+            std::vector<float> vals;
+            std::vector<int32_t> ids;
+            for (int t : top) { vals.push_back(row[(size_t) t]); ids.push_back(t); }
+            std::mt19937_64 full_rng((uint64_t) it), top_rng((uint64_t) it);
+            const int full = sample_logits(row.data(), vocab, *cfg, history, full_rng);
+            const int pick = sample_logits_top(vals.data(), ids.data(), n, vocab, *cfg, history, top_rng);
+            if (pick < 0) {
+                ++declined;
+                CHECK(top_rng == std::mt19937_64((uint64_t) it));   // no draw
+            } else {
+                ++decided;
+                if (cfg == &pow2) ++pow2_decided;
+                CHECK(pick == full);
+                CHECK(top_rng == full_rng);
+            }
+        }
+    }
+    CHECK(decided >= 300);   // the tied rows aside, the candidates settle the draw
+    CHECK(declined >= 12);   // every all-tied row declines
+    CHECK(pow2_decided >= 100);
 }

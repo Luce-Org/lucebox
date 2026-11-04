@@ -1,6 +1,6 @@
-// Single-chain sampled verify (Qwen35Backend::do_spec_decode with
-// LUCE_SAMPLED_VERIFY=1): the committed tokens must be distributed exactly as
-// AR sampling of the target. A fake target and drafter run the backend's
+// Single-chain sampled verify (Qwen35Backend::do_spec_decode, sampled verify
+// on): the committed tokens must be distributed exactly as AR sampling of
+// the target. A fake target and drafter run the backend's
 // step: sampled_verify_walk over the verify rows, the budget clamp, the
 // fast-rollback bonus drop, then the next seed from sampled_verify_next.
 // Under a grammar, sampled and greedy verify must also match constrained AR
@@ -478,6 +478,59 @@ TEST_CASE(SampledVerifyFixture, walk_keeps_drafts_while_they_match) {
                                rng, [](int32_t token, int) { return token == 4; });
     CHECK(walk.accepted == 2);
     CHECK(walk.bonus == 4);
+}
+
+TEST_CASE(SampledVerifyFixture, walk_draws_rows_only_up_to_the_first_mismatch) {
+    // Sampled rows (thinking sampler) drawn row by row give the same walk, RNG
+    // stream and history as the walk over the whole block, and the rows after
+    // the mismatch are never asked for.
+    const int width = 6;
+    std::vector<float> rows(width * kVocab);
+    std::mt19937_64 fill(5);
+    std::uniform_real_distribution<float> u(-3.0f, 3.0f);
+    for (float & x : rows) x = u(fill);
+    const SamplerCfg cfg = thinking_sampler();
+    for (uint64_t seed = 1; seed <= 64; ++seed) {
+        int32_t tokens[width] = {7};
+        std::mt19937_64 probe(seed);
+        std::vector<int32_t> probe_history = {9, 7};
+        for (int i = 0; i + 1 < width; ++i) {   // drafts equal to the draws up to row 2, then a miss
+            const int32_t t = sample_logits(rows.data() + (size_t)i * kVocab, kVocab, cfg,
+                                            probe_history, probe);
+            tokens[i + 1] = i < 2 ? t : (t + 1) % kVocab;
+            probe_history.push_back(tokens[i + 1]);
+        }
+        std::mt19937_64 rng_all(seed), rng_rows(seed);
+        std::vector<int32_t> hist_all = {9}, hist_rows = {9};
+        const SampledVerifyWalk all = sampled_verify_walk(rows.data(), kVocab, width, tokens,
+                                                          cfg, hist_all, rng_all);
+        std::vector<int> asked;
+        const SampledVerifyWalk lazy = sampled_verify_walk_draws(
+            [&](int i, const SamplerCfg & round, const std::vector<int32_t> & h,
+                std::mt19937_64 & r) {
+                asked.push_back(i);
+                return sample_logits(rows.data() + (size_t)i * kVocab, kVocab, round, h, r);
+            },
+            width, tokens, cfg, hist_rows, rng_rows, [](int32_t, int) { return false; });
+        CHECK(lazy.accepted == all.accepted);
+        CHECK(lazy.bonus == all.bonus);
+        CHECK(hist_rows == hist_all);
+        CHECK(rng_rows() == rng_all());
+        CHECK(all.accepted == 3);
+        CHECK(all.bonus >= 0);
+        CHECK((asked == std::vector<int>{0, 1, 2}));
+    }
+    // A row that cannot be read ends the walk with nothing kept.
+    std::mt19937_64 rng(1);
+    std::vector<int32_t> history = {9};
+    const int32_t tokens[] = {2, 3, 4};
+    const SampledVerifyWalk failed = sampled_verify_walk_draws(
+        [](int, const SamplerCfg &, const std::vector<int32_t> &, std::mt19937_64 &) {
+            return -1;
+        },
+        3, tokens, cfg, history, rng, [](int32_t, int) { return false; });
+    CHECK(failed.accepted == 0);
+    CHECK(failed.bonus == -1);
 }
 
 TEST_CASE(SampledVerifyFixture, next_reuses_the_draw_at_the_kept_tip) {

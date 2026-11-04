@@ -18,8 +18,6 @@ bool ggml_cuda_mmvq_mmid_grouped_enabled(
 
 // Set by ggml_backend_cuda_set_mmvq_batch_invariant (calling thread).
 bool ggml_cuda_mmvq_batch_invariant();
-// Set by ggml_backend_cuda_set_mmvq_moe_all_widths (calling thread).
-bool ggml_cuda_mmvq_moe_all_widths();
 
 bool ggml_cuda_mmvq_rdna4_glu_pair(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu);
 // Set by ggml_backend_cuda_set_mmvq_invariant_rows_override (calling thread): 0 = env / policy.
