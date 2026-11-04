@@ -335,9 +335,8 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--kv-cache-ttl <hours>` | `72` | Delete disk snapshots unused this long; `0` = never. |
 | `--kv-cache-shutdown-flush <s>` | `120` | Longest a graceful shutdown spends writing RAM snapshots to disk; `-1` = no limit. |
 | `--kv-cache-min-tokens <N>` | `512` | Minimum prefix length to persist. |
-| `--kv-cache-interval <N>` | `10240` | Continued-checkpoint interval. |
-| `--kv-cache-cold-max <N>` | `10240` | Cold-prefix limit for long prompts. |
-| `--disk-prefix-cache off\|full\|auto\|auto:N\|N` | `full` | Default disk prefix policy. |
+| `--kv-cache-cold-max <N>` | `10240` | A session's disk files keep their ancestors up to N tokens (the shared head). |
+| `--disk-prefix-cache off\|full\|N` | `full` | Default disk prefix policy (`auto` and `auto:N` are retired and read as `full`). |
 | `--disk-prefix-cache-compress` | off | Clamp FlowKV snapshots to the stable system prefix. Requires a prefill drafter. |
 
 Decode-pressure suspension defaults to `auto`. After all models load, the

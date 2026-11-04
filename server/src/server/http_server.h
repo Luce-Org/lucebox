@@ -26,6 +26,7 @@
 #include "tool_checks.h"
 #include "server/kv/prefix_cache.h"
 #include "server/kv/disk_prefix_cache.h"
+#include "kv/kv_cache.h"
 #include "freeze_history.h"
 #include "api_types.h"
 #include "placement/draft_residency.h"
@@ -284,8 +285,9 @@ struct ServerConfig {
     std::string disk_cache_dir;             // empty = disabled
     size_t      disk_cache_budget_mb = 131072; // max disk usage in MB (128 GB)
     int         disk_cache_min_tokens = 512; // only persist >= this many tokens
-    int         disk_cache_continued_interval = 10240; // continued checkpoint every N tokens
-    int         disk_cache_cold_max_tokens = 10240;    // cold prefix for prompts longer than this
+    // Disk session files keep their strict-prefix ancestors up to this many
+    // tokens: the shared system/tools head (DiskPrefixCache::prune_ancestors).
+    int         disk_cache_cold_max_tokens = 10240;
     double      disk_cache_ttl_hours = 72.0;  // delete files unused this long (0 = never)
     // Graceful shutdown writes the RAM snapshots to disk (one last
     // eviction) for at most this long; < 0 = no limit.
@@ -1139,36 +1141,12 @@ private:
     bool forward_upstream(ServerJob * job, const ParsedRequest & req,
                           const PreparedPrompt & prepared);
 
-    struct GenerationCacheState {
-        DiskPrefixCachePolicy disk_policy;
-        int cache_slot = -1;
-        int prefix_len = 0;
-        bool using_restore = false;
-        bool disk_hit = false;
-        int full_snap_slot = -1;
-        int full_snap_pos = 0;
-        bool full_snap_prepared = false;
-        // When DiffPin rewrote tokens, full-cache keys must use
-        // prepared.tokens (effective), not req.prompt_tokens.
-        bool full_snap_key_effective = false;
-        PrefixCache::InlineReservation snap_reservation;
-        int snap_slot = -1;
-        int snap_cut = 0;
-        bool snap_prepared = false;
-    };
-
-    // A request's restore points (prefix_restore_points) on both serving
-    // paths: its chat boundaries spaced for the backend, plus `cuts`. The
-    // generation prompt's own boundary, where the request's snapshot goes,
-    // stays only on a backend that cuts prefill at every restore point.
-    std::vector<int> request_restore_points(const std::vector<int32_t> & prompt,
-                                            std::initializer_list<int> cuts) const;
-    GenerationCacheState prepare_generation_cache(
+    KvLease prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,
         GenerateRequest & generate_request);
     void finalize_generation_cache(
         const ParsedRequest & req, const PreparedPrompt & prepared,
-        GenerationCacheState & cache, const GenerateResult & result,
+        KvLease & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected);
     // Save the live post-generation state as an inline checkpoint of the
@@ -1178,7 +1156,7 @@ private:
         const std::vector<int32_t> & prompt,
         const std::vector<int32_t> & generated,
         const std::vector<int32_t> & canonical,
-        const GenerationCacheState & cache);
+        const KvLease & cache);
     // Without a chat codec: remember a tool-call turn in tool memory as the
     // text of its generated `tokens`, with the text the generation prompt
     // opened it with, so the next stateless request renders the turn as it was
@@ -1195,26 +1173,12 @@ private:
                              TurnMemory * memory, ChatMessage & message);
     void remember_agent_turn(
         const ParsedRequest & req, const PreparedPrompt & prepared,
-        const GenerationCacheState & cache, const GenerateResult & result,
+        const KvLease & cache, const GenerateResult & result,
         const SseEmitter & emitter, int completion_tokens,
         bool visible_output_seen, bool client_disconnected,
         bool replay_cache);
-    void forget_inline_slot_metadata(int slot);
-    // Free a RAM snapshot slot for reuse, writing it to disk first when
-    // PrefixCache::persist_on_evict() says so (see persist_evicted_slot).
-    void evict_inline_slot(int slot);
-    // Just before `reservation` commits: write (when persist_on_evict says
-    // so) and free the further entries its resident-budget plan evicts
-    // (PrefixCache::InlineReservation::extra_victim_slots). The commit then
-    // drops their metadata. A capture that fails never gets here.
-    void evict_extra_victims(const PrefixCache::InlineReservation & reservation);
-    // Disk persistence (docs/PREFIX_CACHE.md): a snapshot is written only
-    // when it leaves RAM, never after every turn. Hands the payload of
-    // `slot` to the disk writer when `persist` is set and the slot has a disk
-    // key (slot_tokens_); the slot is left empty. Returns true when queued.
-    bool persist_evicted_slot(int slot, bool persist, const char * reason);
     // Slots committed during the current request get this request's
-    // tool-call replay text (slot_aux_) once its response is known.
+    // tool-call replay text (PrefixCache::set_aux) once its response is known.
     void note_session_slot(int slot);
     void record_session_aux(const ParsedRequest & req, const SseEmitter & emitter);
     // The tool-call replay text a session's prompt was rendered with
@@ -1227,9 +1191,6 @@ private:
     // conversation and the heads; not edit backups), bounded by
     // disk_cache_shutdown_flush_s.
     void flush_sessions_to_disk(const char * reason);
-    // After a commit in `slot`: free the snapshots it supersedes, then evict
-    // until committed snapshots fit the resident budget again.
-    void trim_snapshots_after_commit(int slot);
 
     struct GenerationInputs {
         GenerateRequest request;
@@ -1368,7 +1329,12 @@ private:
     // Between the text parts of a message's content array, as the template joins them.
     const char * text_part_separator() const { return chat_codec_ ? chat_codec_->text_part_separator() : ""; }
     PrefixCache      prefix_cache_;
+    // Every checkpoint payload the server touches goes through this store
+    // (declared before disk_cache_, which reads and adopts through it).
+    BackendCheckpoints checkpoints_;
     DiskPrefixCache  disk_cache_;
+    // Writing a checkpoint out when it leaves RAM, for both serving paths.
+    KvCache          kv_cache_;
 
     // Per-session adaptive keep_ratio bandit state.
     HttpServerSessions sessions_;
@@ -1413,13 +1379,8 @@ private:
     std::string status_html_path_;
     std::string resolve_status_html();
 
-    // Disk key of each RAM snapshot slot (written on eviction/shutdown).
-    std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
-    std::unordered_set<int> agent_turn_cache_slots_;
     // Calls a tool-use final check added (tool_checks.h).
     tool_checks::CheckedCalls checked_calls_;
-    // Replay blob stored with each slot's disk snapshot.
-    std::unordered_map<int, std::string> slot_aux_;
     std::vector<int> request_session_slots_;
 
     // Memory held by the live cache and saved snapshots, rebuilt on the
@@ -1430,7 +1391,6 @@ private:
     uint64_t memory_report_requests_ = 0;
     void publish_memory_report();
     json memory_json() const;
-    std::vector<std::vector<int32_t>> recent_disk_prompts_;
     // Recent tool-bearing prompt prefixes for PPP LCP annotate.
     std::vector<std::vector<int32_t>> recent_tool_prefixes_;
 

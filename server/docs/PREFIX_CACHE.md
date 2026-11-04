@@ -109,8 +109,7 @@ suffix. It is on by default.
 | `--kv-cache-budget <MB>` | `131072` (128 GB) | Hard cap on the bytes of all snapshot files, clamped to the free space. |
 | `--kv-cache-ttl <hours>` | `72` | Delete files unused for this long; `0` = never. |
 | `--kv-cache-shutdown-flush <s>` | `120` | Longest a graceful shutdown spends writing RAM snapshots; `-1` = no limit. |
-| `--kv-cache-cold-max <N>` | `10240` | Longest head kept when a deeper state of its session is written; cold-head checkpoints without RAM slots. |
-| `--kv-cache-interval <N>` | `10240` | Continued checkpoint pacing (fallback without RAM slots). |
+| `--kv-cache-cold-max <N>` | `10240` | Longest head kept when a deeper state of its session is written. |
 
 **When something is written.** Only when a snapshot leaves RAM, never after a
 turn:
@@ -222,16 +221,18 @@ startup, before each write, and when a lookup meets it.
   live cache (the paged restore against the page table too).
 - Each file stores the exact key token ids; a hit compares them with the
   prompt.
-- One server per directory: startup takes an exclusive lock on
-  `<dir>/.lock`; a second server on the same directory runs without a disk
-  cache and logs it.
+- One process per directory: startup takes an exclusive lock on
+  `<dir>/.lock`. The models of one process share the directory's store
+  (`DiskStore`: one index, one writer, one budget and TTL), each restoring
+  only the files its own identity wrote; a second process on the same
+  directory runs without a disk cache and logs it.
 
-**Fallbacks without RAM slots.** With `--prefix-cache-slots 0` there is
-nothing to evict, so the older per-request checkpoints remain: the cold head
-(a prompt longer than `--kv-cache-cold-max` first prefills to the last chat
-boundary at or below it) and continued checkpoints. The `fixed`/`auto` disk
-scopes (`--disk-prefix-cache`) also keep their scoped-prefix write. All of
-them go through the same asynchronous writer.
+**Without RAM slots.** With `--prefix-cache-slots 0` nothing leaves RAM, so
+nothing new is written; the entries already on disk are still served. Only
+the `fixed:N` scope (`--disk-prefix-cache N`) keeps its scoped-prefix write.
+The `auto` scope and the cold-head and continued checkpoints this mode used
+to write are retired; `auto` and `auto:N` read as `full`, and
+`--kv-cache-interval` is accepted and ignored.
 
 **Not covered.** Single-sequence `--paged-attention` keeps no snapshots, and
 the concurrent `qwen4exp` engine keeps its checkpoints outside the backend's
@@ -526,8 +527,15 @@ cache holds no matching snapshot.
 
 | File | Role |
 |------|------|
-| `server/kv/prefix_cache.{h,cpp}` | LRU logic, boundary detection, hashing |
-| `server/kv/disk_prefix_cache.{h,cpp}` | Disk snapshots: file format, index, budget, TTL |
+| `server/kv/prefix_cache.{h,cpp}` | LRU logic: entries and their state (disk key, aux blob, agent-turn mark), reservations, eviction, resident budget |
+| `server/kv/chat_boundaries.{h,cpp}` | Chat markers and boundary detection |
+| `server/kv/cuts.{h,cpp}` | Capture cut and restore points |
+| `server/kv/prefix_hash.{h,cpp}` | Prefix keys (truncated SHA-1 of the token ids) |
+| `server/kv/kv_cache.{h,cpp}` | `KvCache`, one per model: the request protocol of both serving paths (single-sequence `match`/`admit`/`release`; concurrent `plan`/`admitted`/`captured`, with the disk reader thread), what happens when a checkpoint leaves RAM (written to disk when it should be kept, then freed), and the shutdown flush |
+| `server/kv/checkpoint_store.{h,cpp}` | `Checkpoint` handles and the stores every request-time snapshot call goes through (`BackendCheckpoints`, `EngineCheckpoints`), including the disk-staging checkpoint |
+| `server/kv/disk_store.{h,cpp}` | Disk snapshots: the file format and `DiskStore`, one per directory per process (lock, index, writer, budget, TTL) |
+| `server/kv/disk_prefix_cache.{h,cpp}` | `DiskPrefixCache`, one model's view of its directory's `DiskStore` (identity salt, layout, lookups, saves), and the disk scope policies |
+| `server/kv/parallel_prefix_txn.h` | The concurrent path's capture transaction |
 | `common/snapshot_backend.h` | Platform-aware snapshot backend selection |
 | `common/model_backend.h` | `snapshot_save/free/used/cur_pos` interface |
 | `qwen35/qwen35_target_graph.cpp` | `snapshot_target_cache()`, `restore_target_cache()` |
