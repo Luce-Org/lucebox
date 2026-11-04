@@ -6,6 +6,7 @@
 #include "qwen4exp_chunk.h"
 
 #include "common/cuda_graph_overrides.h"
+#include "common/moe_hybrid_routing_stats.h"
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
 
@@ -230,10 +231,37 @@ static int layer_index(const Qwen4ExpLayer & L, const Qwen4ExpWeights & w) {
     return il >= 0 && il < (ptrdiff_t) w.layers.size() ? (int) il : -1;
 }
 
+// LUCE_QWEN4EXP_LATE_EXPERTS=all|<a>-<b>: the layers whose routed experts join one layer late (never the last).
+static std::pair<int, int> qwen4exp_late_range() {
+    static const std::pair<int, int> range = [] {
+        const char * e = std::getenv("LUCE_QWEN4EXP_LATE_EXPERTS");
+        if (!e || !*e) return std::make_pair(1, 0);
+        int a = 0, b = 1 << 20;
+        if (std::strcmp(e, "all") != 0 && std::sscanf(e, "%d-%d", &a, &b) != 2) return std::make_pair(1, 0);
+        std::fprintf(stderr, "[qwen4exp] late experts on layers %d-%d\n", a, b);
+        return std::make_pair(a, b);
+    }();
+    return range;
+}
+static bool qwen4exp_late_layer(int il, int n_layer) {
+    const auto r = qwen4exp_late_range();
+    return il >= r.first && il <= r.second && il < n_layer - 1;
+}
+static bool qwen4exp_late_any() { return qwen4exp_late_range().first <= qwen4exp_late_range().second; }
+
 // Split mode: forwards of up to this many rows (decode, verify, short batches)
 // share one scheduler and keep F32 activations on the link; longer prompt chunks
 // cross it as F16.
 constexpr int64_t kSplitShortRows = 64;
+
+// Routing stats for --expert-placement (LUCE_QWEN4EXP_ROUTING_STATS_OUT=<csv>): every prompt chunk records each
+// trunk layer's top-k picks, and the CSV is rewritten after the chunk. Decode and verify graphs are not touched.
+struct Qwen4ExpRouteProbe { std::vector<std::pair<int, ggml_tensor *>> picks; };
+static thread_local Qwen4ExpRouteProbe * g_route_probe = nullptr;
+static const char * qwen4exp_route_stats_path() {
+    static const char * path = std::getenv("LUCE_QWEN4EXP_ROUTING_STATS_OUT");
+    return path && *path ? path : nullptr;
+}
 
 // The router: the top-k picks and their renormalized weights, [n_used, T] each.
 static void moe_router(ggml_context * c, ggml_tensor * cur, const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
@@ -242,6 +270,11 @@ static void moe_router(ggml_context * c, ggml_tensor * cur, const Qwen4ExpLayer 
     ggml_tensor * logits = mm(c, L.ffn_gate_inp, cur);      // [n_expert, T]
     ggml_tensor * probs  = ggml_soft_max(c, logits);
     *sel = ggml_argsort_top_k(c, probs, (int) w.n_expert_used);
+    if (g_route_probe && layer_index(L, w) >= 0) {
+        ggml_tensor * picks = ggml_cont(c, *sel);
+        ggml_set_output(picks);
+        g_route_probe->picks.push_back({layer_index(L, w), picks});
+    }
     ggml_tensor * probs3 = ggml_reshape_3d(c, probs, 1, w.n_expert, n_tokens);
     *wsel = ggml_reshape_2d(c, ggml_get_rows(c, probs3, *sel), w.n_expert_used, n_tokens);
     *wsel = ggml_div(c, *wsel, ggml_clamp(c, ggml_sum_rows(c, *wsel), 6.103515625e-5f, INFINITY));
@@ -1412,6 +1445,24 @@ struct Qwen4ExpLayerBuilder {
         for (size_t i = 0; i < cache.ple_layer_ids.size(); ++i)    ple_idx[cache.ple_layer_ids[i]] = (int) i;
     }
 
+    // Late experts: the previous layer's routed sum and its FFN injection, joining after this layer's attention.
+    ggml_tensor * late_routed = nullptr, * late_inject = nullptr;
+
+    // Adds the late routed sum to the residual. The attention output is queued first and a copy on the expert
+    // device closes its split, so the target runs this layer's attention before it waits for the experts.
+    ggml_tensor * join_late(ggml_tensor * res_hc, ggml_tensor * attn_out, int64_t layer_T) {
+        if (!late_routed) return res_hc;
+        ggml_build_forward_expand(gf, attn_out);
+        ggml_build_forward_expand(gf, res_hc);
+        ggml_tensor * routed = late_routed->type == GGML_TYPE_F32 ? ggml_scale(ctx, late_routed, 1.0f)
+                                                                   : ggml_cast(ctx, late_routed, GGML_TYPE_F32);
+        expert_nodes.push_back(routed);
+        ggml_build_forward_expand(gf, routed);
+        res_hc = hc_combine(ctx, res_hc, routed, late_inject, w.n_embd, w.n_hc, layer_T);
+        late_routed = late_inject = nullptr;
+        return res_hc;
+    }
+
     // Layer il + 1 starts with PLE, so layer il's output cannot be fused with its attention norm.
     bool next_is_ple(int il) const { return il + 1 < w.n_layer && w.layers[il + 1].is_ple && has_ple; }
 
@@ -1516,6 +1567,15 @@ struct Qwen4ExpLayerBuilder {
         // from FMA contraction in the new kernel, covered by the long-prompt quality gate). Not at T=1: it cost ~1.7% decode.
         Qwen4ExpMoeParts moe_parts;
         const bool fold = !split && !next_is_ple(il) && ggml_backend_cuda_mmb_prefill(layer_T);
+        if (split && qwen4exp_split_layer(L, w) && qwen4exp_late_layer(il, w.n_layer)) {
+            const Qwen4ExpMoeRoute r = build_moe_route(ctx, cur, L, w);
+            ggml_tensor * routed = build_moe_routed(ctx, r, L, w, expert_nodes);
+            ggml_build_forward_expand(gf, routed);   // the experts' split queues before the target's next work
+            late_routed = routed;
+            late_inject = inject;
+            ggml_tensor * now = r.hot ? build_moe_hot(ctx, r, w.hot->layers[layer_index(L, w)], w) : r.shared;
+            return ffn_output(il, now, inject, res_hc, layer_T, xn_next);
+        }
         cur = build_moe(ctx, cur, L, w, fold ? &moe_parts : nullptr, split ? &expert_nodes : nullptr);
         if (!fold) return ffn_output(il, cur, inject, res_hc, layer_T, xn_next);
         ggml_tensor * gamma = (il + 1 < w.n_layer)
@@ -2209,7 +2269,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     const int64_t T = n_tokens;
     const int64_t kv_len = pos0 + n_tokens;
     // Split prompt chunks without an MTP hidden capture (see Qwen4ExpStream).
-    const bool pipeline = split && !verify && T >= 1024;
+    const bool pipeline = split && !verify && T >= 1024 && !qwen4exp_late_any();
     // Give a new stable graph at least one full 256-token generation window.
     // The fixed mask excludes its padded tail, while the stable K/V views and
     // set_rows index keep every graph pointer and property unchanged.
@@ -2269,6 +2329,11 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     std::vector<Qwen4ExpAttnRow> rows;         // verify: each row's T=1 attention inputs
     Qwen4ExpLayerBuilder lb(ctx, gf, w, cache, verify, split, has_ple, expert_nodes);
     lb.rows = verify ? &rows : nullptr;
+    Qwen4ExpRouteProbe route_probe;
+    struct ProbeScope {
+        explicit ProbeScope(Qwen4ExpRouteProbe * p) { g_route_probe = p; }
+        ~ProbeScope() { g_route_probe = nullptr; }
+    } probe_scope(!measure && !verify && !use_stable_graph && T > 1 && qwen4exp_route_stats_path() ? &route_probe : nullptr);
     lb.qsa_ws = stable_qsa ? &stable_ws : nullptr;
 
     const int64_t graph_kv_len = use_stable_graph && !verify ? stable_kv_bucket : kv_len;
@@ -2333,6 +2398,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         for (int il = 0; il < w.n_layer; ++il) {
             ggml_tensor * inject = nullptr;
             ggml_tensor * cur = lb.attn_half(il, layer_in, res_hc, xn_next, inject);
+            res_hc = lb.join_late(res_hc, cur, T);
             int64_t layer_T = T;
             if (!verify && il == w.n_layer - 1 && T > 1) {
                 if (out_hidden) branch = { cur, inject, res_hc };   // every row's FFN half, for the MTP hidden only
@@ -2369,6 +2435,8 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     }
     ggml_tensor * mtp_positions = mtp_prefill
         ? build_mtp_prefill(ctx, gf, w, cache, hidden, emb_rows, pos0, T) : nullptr;
+    for (const auto & pk : route_probe.picks) ggml_build_forward_expand(gf, pk.second);
+    g_route_probe = nullptr;   // the MTP and output builders above are done; nothing else records
 
     if (measure) {
         graph_memory(backend, ctx, gf, w.gfx1151, *measure);
@@ -2462,6 +2530,19 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         cache.indexer_blocks = (int) ((pos0 + T) / qsa_ratio(w));
     }
 
+    if (!route_probe.picks.empty()) {
+        static MoeHybridRoutingStats stats;
+        if (stats.counts.empty()) stats.init(w.n_layer, w.n_expert, w.n_expert_used);
+        std::vector<int32_t> ids;
+        for (const auto & pk : route_probe.picks) {
+            ids.resize((size_t) ggml_nelements(pk.second));
+            ggml_backend_tensor_get(pk.second, ids.data(), 0, ggml_nbytes(pk.second));
+            stats.observe(pk.first, ids.data(), (int) ids.size());
+        }
+        std::string err;
+        if (!stats.save_csv(qwen4exp_route_stats_path(), &err))
+            std::fprintf(stderr, "[qwen4exp] routing stats: %s\n", err.c_str());
+    }
     out_logits.resize((size_t) ggml_nelements(logits));   // n_vocab, per row when verifying
     ggml_backend_tensor_get(logits, out_logits.data(), 0, ggml_nbytes(logits));
     if (out_hidden && hidden) {
