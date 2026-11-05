@@ -9,16 +9,27 @@ set(S ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 set(J ${CMAKE_CURRENT_SOURCE_DIR}/../deps/llama.cpp/common)
 add_library(lucebox_vulkan_core STATIC
  qwen2_backend.cpp lfm2_backend.cpp
- ${S}/engine/luce_engine.cpp ${S}/common/daemon_loop.cpp ${S}/common/sampler.cpp
+ ${S}/engine/luce_engine.cpp ${S}/errors.cpp ${S}/common/daemon_loop.cpp ${S}/common/sampler.cpp
+ ${S}/common/gbnf.cpp ${S}/common/output_constraint.cpp
  ${S}/common/concurrency/paged_kv_offload.cpp
  ${S}/common/concurrency/paged_kv_pool.cpp ${S}/common/concurrency/seq_slot_manager.cpp
  ${S}/common/pflash_drafter_ipc.cpp ${S}/common/backend_ipc.cpp
- ${S}/server/http_server.cpp ${S}/server/image_input.cpp ${S}/server/scheduler.cpp ${S}/server/tokenizer.cpp
- ${S}/server/chat_template.cpp ${S}/server/tool_parser.cpp ${S}/server/tool_hint.cpp
+ ${S}/server/http_server.cpp ${S}/server/api_adapters.cpp ${S}/server/image_input.cpp
+ ${S}/server/scheduler.cpp ${S}/server/tokenizer.cpp
+ ${S}/server/chat_template.cpp ${S}/server/chat_codec.cpp ${S}/server/tool_parser.cpp
+ ${S}/server/tool_hint.cpp ${S}/server/tool_checks.cpp
  ${S}/server/tool_memory.cpp ${S}/server/response_error.cpp
  ${S}/server/sse_emitter.cpp ${S}/server/prefix_cache.cpp ${S}/server/pin_friendly_prompt.cpp
  ${S}/server/disk_prefix_cache.cpp ${S}/server/freeze_history.cpp
  ${S}/server/prompt_normalize.cpp ${S}/server/model_card.cpp
+ ${S}/server/json_schema_grammar.cpp ${S}/server/pflash_unified.cpp
+ ${S}/pflash/anchor_scan.cpp ${S}/pflash/pflash_selection.cpp ${S}/pflash/pflash_fold.cpp
+ ${S}/pflash/pflash_request_probe.cpp ${S}/pflash/pflash_request_stage2.cpp
+ ${S}/pflash/pflash_query_candidates.cpp ${S}/pflash/pflash_scoring_resume.cpp
+ ${S}/pflash/pflash_session_offload.cpp ${S}/pflash/pflash_ident_query.cpp
+ ${S}/pflash/pflash_drafter.cpp ${S}/pflash/pflash_compress.cpp
+ ${S}/pflash/qwen35_drafter.cpp ${S}/pflash/qwen35_loader.cpp
+ ${S}/pflash/kvflash_drafter_scorer.cpp
  ${J}/jinja/lexer.cpp ${J}/jinja/parser.cpp ${J}/jinja/runtime.cpp
  ${J}/jinja/value.cpp ${J}/jinja/string.cpp ${J}/jinja/caps.cpp ${J}/unicode.cpp)
 target_include_directories(lucebox_vulkan_core PUBLIC ${S} ${S}/common ${S}/server ${J} ${CMAKE_CURRENT_SOURCE_DIR}/../include ${CMAKE_CURRENT_SOURCE_DIR})

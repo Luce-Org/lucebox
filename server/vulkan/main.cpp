@@ -62,7 +62,9 @@ int main(int argc, char ** argv) {
         cfg.chat_template_src = chat_template.source;
         cfg.chat_template_path = chat_template.path;
         HttpServer http(engine, tokenizer, cfg);
-        http.set_chat_format(ChatFormat::QWEN3);
+        // Qwen/LFM use the GGUF Jinja template (cfg.chat_template_src) or a
+        // chat codec; ChatFormat::QWEN3 was removed upstream (codec-only archs).
+        http.set_chat_format(chat_format_for_arch(arch));
         server = &http;
         std::signal(SIGINT, stop); std::signal(SIGTERM, stop);
         const int result = http.run(); server = nullptr; http.shutdown();

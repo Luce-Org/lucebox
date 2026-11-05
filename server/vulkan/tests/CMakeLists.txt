@@ -28,7 +28,8 @@ set_tests_properties(vulkan_greedy_scalar PROPERTIES PASS_REGULAR_EXPRESSION "fu
 # Fault-inject only at the device boundary. Link both real constructors against
 # ggml-base; never link ggml-vulkan or initialize a real GPU in this suite.
 add_executable(test-vulkan-ownership ../test_ownership.cpp ../qwen2_backend.cpp ../lfm2_backend.cpp
-    ../../src/common/sampler.cpp ../../src/common/daemon_loop.cpp)
+    ../../src/common/sampler.cpp ../../src/common/daemon_loop.cpp
+    ../../src/common/output_constraint.cpp ../../src/common/gbnf.cpp)
 target_include_directories(test-vulkan-ownership PRIVATE .. ../../src)
 target_link_libraries(test-vulkan-ownership PRIVATE ggml-base nlohmann_json::nlohmann_json)
 target_compile_options(test-vulkan-ownership PRIVATE -ffunction-sections -fdata-sections)
