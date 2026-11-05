@@ -295,6 +295,27 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
         check(be, name, p, {p.index_of(mm)}, GGML_CUDA_QN_UNARY_MUL_Q8, 1);
     }
 
+    // ── The same gated unary where MMVQ would not read its q8_1 rows: no entry, no writes ──────────────────────────
+    // [D, H, T] rows read as [D*H, T] (the GDN gated output into ssm_out) miss MMVQ's key, and at prefill widths the
+    // matmul takes another kernel that quantizes for itself.
+    void unary_mul_unread_q8(ggml_backend_t be, int D, int H, int T) {
+        const std::string name = "unary_mul_unread_q8 D=" + std::to_string(D) + " H=" + std::to_string(H) +
+                                 " T=" + std::to_string(T);
+        const int N = 2560;
+        Pattern p;
+        ggml_tensor * x = p.input(GGML_TYPE_F32, D, H, T);
+        ggml_tensor * z = p.input(GGML_TYPE_F32, D, H, T);
+        ggml_tensor * W = p.input(GGML_TYPE_Q8_0, (int64_t) D * H, N);
+        ggml_tensor * g = ggml_mul(p.ctx, x, ggml_sigmoid(p.ctx, z));
+        p.output(g);
+        ggml_tensor * mm = ggml_mul_mat(p.ctx, W, ggml_reshape_2d(p.ctx, g, (int64_t) D * H, T));
+        p.output(mm);
+        if (!p.alloc(be)) { fail(name + ": alloc"); return; }
+        p.fill_rest();
+        const Invariant inv(true);
+        check(be, name, p, {p.index_of(mm)}, GGML_CUDA_QN_UNARY_MUL_Q8, 0);
+    }
+
     // ── SCALE then SILU (the hyper-connection low-rank gate) in one launch, writing the up projection's q8_1 rows ──
     void scale_silu(ggml_backend_t be, int T) {
         const std::string name = "scale_silu T=" + std::to_string(T);
@@ -409,6 +430,13 @@ TEST_CASE(QnSplitFusionsFixture, shared_gate) {
 
 TEST_CASE(QnSplitFusionsFixture, unary_mul_q8) {
     each_gpu([&](ggml_backend_t be) { for (int T : {1, 2, 4}) unary_mul_q8(be, T); });
+}
+
+TEST_CASE(QnSplitFusionsFixture, unary_mul_unread_q8) {
+    each_gpu([&](ggml_backend_t be) {
+        for (int T : {1, 4}) unary_mul_unread_q8(be, 128, 32, T);
+        unary_mul_unread_q8(be, 4096, 1, 64);
+    });
 }
 
 TEST_CASE(QnSplitFusionsFixture, scale_silu) {

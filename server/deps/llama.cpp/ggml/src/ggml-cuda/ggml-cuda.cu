@@ -5736,6 +5736,12 @@ static void ggml_cuda_q8_memo_for_producer(ggml_backend_cuda_context & ctx, cons
     const ggml_tensor * src1 = c->src[1];
     while (src1 && src1->op == GGML_OP_RESHAPE && src1 != t) src1 = src1->src[0];
     if (src1 != t) return;
+    // Only MMVQ reads the memo, keyed on the row length it reads: rows reshaped longer ([D, H, T] read as [D*H, T])
+    // never match, and no MUL_MAT wider than MMVQ's column limit (a prompt chunk) reads it, so neither gets an entry
+    // (it would cost the writes and hold its buffer until the evaluation ends). The width test covers every reader
+    // of the rows, not just this one: a later matmul of another weight type may still take MMVQ at decode widths.
+    if (c->src[1]->ne[0] != t->ne[0] ||
+        (c->op == GGML_OP_MUL_MAT && c->src[1]->ne[1] > ggml_cuda_mmvq_max_ncols())) return;
     const int64_t padded = GGML_PAD(t->ne[0], MATRIX_ROW_PADDING);
     const int64_t nrows = ggml_nrows(t);
     ggml_backend_cuda_context::luce_q8_memo_entry ent;
@@ -5946,6 +5952,7 @@ static int ggml_cuda_try_moe_route_weights_norm(ggml_backend_cuda_context & ctx,
         !ggml_is_contiguous(div) || ggml_nelements(div) != ggml_nelements(gr)) return -1;
     // ggml_clamp is in place: its node is a view of the sum. Neither is written here, so that view is fine.
     if (!ggml_cuda_elidable(cgraph, gr, 1) || ggml_cuda_graph_use_count(cgraph, rows) != 2 ||
+        (rows->flags & GGML_TENSOR_FLAG_OUTPUT) ||
         !ggml_cuda_elidable(cgraph, sum, 1) || (clamp->view_src && clamp->view_src != sum) ||
         (clamp->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_graph_use_count(cgraph, clamp) != 1) return -1;
     float lo = 0.0f, hi = 0.0f;
@@ -5979,6 +5986,8 @@ static int ggml_cuda_try_shared_gate_combine(ggml_backend_cuda_context & ctx, gg
         logit->ne[2] != 1 || logit->ne[3] != 1 || logit->ne[1] != shared->ne[1] ||
         shared->ne[0] != comb->ne[0] || shared->ne[2] != 1 || shared->ne[3] != 1 || shared->nb[0] != sizeof(float) ||
         !ggml_are_same_shape(mul, shared)) return -1;
+    // The combine reads its shared operand as float4 rows (ggml_cuda_op_ds4_moe_combine asserts this).
+    if (reinterpret_cast<uintptr_t>(shared->data) % 16 != 0 || shared->nb[1] % 16 != 0) return -1;
     if (!ggml_cuda_elidable(cgraph, sig, 1) || !ggml_cuda_elidable(cgraph, mul, 1)) return -1;
     ggml_cuda_op_ds4_moe_combine(ctx, comb, shared, logit);
     ggml_cuda_qn_fusion_taken(GGML_CUDA_QN_SHARED_GATE);
