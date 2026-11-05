@@ -1702,14 +1702,14 @@ if(LUCE_TESTS)
             PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_qn_split_fusions.cpp")
-        # Host-only (GGML C API): the Qwen3.8 split fusions and RDNA4 decode
-        # kernels against their unfused graphs, on every GPU.
+        # Host-only (GGML C API): the Qwen3.8 split fusions against their
+        # unfused graphs, and the argmax tie rule, on every GPU.
         add_executable(test_qn_split_fusions test/unit/test_qn_split_fusions.cpp)
         target_include_directories(test_qn_split_fusions PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
         target_link_libraries(test_qn_split_fusions PRIVATE
             ggml ${LUCE_GGML_BACKEND_TARGET} ggml-base)
-        list(APPEND _raw_unit_test_targets test_qn_split_fusions)
+        # Registered through the CppUnit list below.
     endif()
     if(LUCE_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_moe_combine_cuda.cpp")
         add_executable(test_ds4_moe_combine_cuda test/unit/test_ds4_moe_combine_cuda.cpp)
@@ -2949,6 +2949,7 @@ if(LUCE_TESTS)
         test_rocmfp_mix_gateup_glu
         test_rocmfp_mix_glu_fusable
         test_cuda_copy_batch
+        test_qn_split_fusions
         test_uma_budget)
     foreach(_cppunit_target IN LISTS _new_cppunit_test_targets)
         if(TARGET ${_cppunit_target})
