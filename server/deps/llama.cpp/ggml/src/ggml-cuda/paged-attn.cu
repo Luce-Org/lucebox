@@ -47,34 +47,16 @@ static void paged_attn_poison_scratch(cudaStream_t stream, void * p, size_t byte
     }
 }
 
-// Most partitions a launch may split the context into: each one keeps a
-// head-dim row of halves and a float2 per output row, and the context alone
-// asks for one per 1024 tokens. A 2048-row prompt chunk 118K tokens deep ran
-// the R9700 out of memory on those partials, beside the weights and the KV
-// cache. Its rows give such a chunk its parallelism, so it covers the
-// context with fewer, longer partitions instead.
-static int32_t paged_attn_partials_cap(int64_t output_rows, int32_t head_dim) {
-    const int64_t budget = PAGED_ATTN_PARTIALS_BUDGET;
-    const int64_t per_partition =
-        output_rows * ((int64_t) head_dim * (int64_t) sizeof(half) + (int64_t) sizeof(float2));
-    const int64_t cap = per_partition > 0 ? budget / per_partition : PAGED_ATTN_MAX_PARTITIONS;
-    return (int32_t) std::max<int64_t>(1, std::min<int64_t>(cap, PAGED_ATTN_MAX_PARTITIONS));
-}
-
-// Partition count for n_blocks of context: enough partitions to cover the
-// blocks and to reach min_partitions for occupancy, but never more than the
-// blocks themselves or the cap. Host and device must agree on this so the
-// launched grid matches the per-sequence active partition count.
-static __host__ __device__ __forceinline__ int32_t paged_attn_partitions(
-        int32_t n_blocks, int32_t min_partitions, int32_t cap) {
-    const int32_t context_partitions =
-        paged_attn_ceil_div(n_blocks, PAGED_ATTN_BLOCKS_PER_PARTITION);
-    const int32_t requested =
-        context_partitions > min_partitions
-            ? context_partitions
-            : min_partitions;
-    const int32_t available = n_blocks < cap ? n_blocks : cap;
-    return requested < available ? requested : available;
+// Blocks per partition for the V_DOT2 decode route: a function of the table
+// width alone (plus the tree tail), so partition p of every launch covers the
+// same absolute logical blocks [p*S, (p+1)*S) whatever the batch holds. S is
+// the smallest value >= PAGED_ATTN_BLOCKS_PER_PARTITION that covers the table
+// in at most PAGED_ATTN_MAX_PARTITIONS partitions. A row's bits depend on
+// where its context is cut, so the cut must not follow n_rows, the batch-max
+// length or the partials budget.
+static int32_t paged_attn_blocks_per_partition(int64_t table_blocks) {
+    return std::max<int32_t>(PAGED_ATTN_BLOCKS_PER_PARTITION,
+                             paged_attn_ceil_div(table_blocks, PAGED_ATTN_MAX_PARTITIONS));
 }
 
 // parent_ids is a sequence-major [tree_width, n_tree_seq] table. Parents
@@ -400,7 +382,8 @@ static __global__ void paged_attn_decode(
         int32_t pool_tokens,
         int32_t max_blocks,
         int32_t block_size,
-        int32_t min_partitions,
+        int32_t blocks_per_partition,
+        int32_t seq_base,
         int32_t tree_width,
         int32_t tree_row_offset,
         int32_t tree_scratch_base,
@@ -423,7 +406,8 @@ static __global__ void paged_attn_decode(
         warp / warps_per_group;
     const int head0 =
         kv_head * gqa_ratio + (warp % warps_per_group) * n_batch_heads;
-    const int seq       = blockIdx.y;
+    const int seq       = blockIdx.y;      // row within this launch slice
+    const int gseq      = seq_base + seq;  // row within the whole op
     const int partition = blockIdx.z;
     const int lane      = threadIdx.x;
 
@@ -432,16 +416,16 @@ static __global__ void paged_attn_decode(
 
     const bool tree_mode = parent_ids != nullptr;
     const int32_t physical_seq_raw = active_slot_ids
-        ? *(const int32_t *) (active_slot_ids + (int64_t) seq * asi_nb0)
-        : seq;
+        ? *(const int32_t *) (active_slot_ids + (int64_t) gseq * asi_nb0)
+        : gseq;
     const int32_t query_pos = query_positions
-        ? *(const int32_t *) (query_positions + (int64_t) seq * qpos_nb0)
+        ? *(const int32_t *) (query_positions + (int64_t) gseq * qpos_nb0)
         : -1;
-    const bool tree_query = tree_mode && seq >= tree_row_offset;
+    const bool tree_query = tree_mode && gseq >= tree_row_offset;
     const int32_t tree_seq = tree_query
-        ? (seq - tree_row_offset) / tree_width : 0;
+        ? (gseq - tree_row_offset) / tree_width : 0;
     const int32_t query_node = tree_query
-        ? seq - tree_row_offset - tree_seq * tree_width : -1;
+        ? gseq - tree_row_offset - tree_seq * tree_width : -1;
     const int32_t tree_size = tree_query
         ? *(const int32_t *) (
             tree_sizes + (int64_t) tree_seq * tree_size_nb0)
@@ -482,7 +466,18 @@ static __global__ void paged_attn_decode(
     const int32_t n_logical_blocks =
         paged_attn_ceil_div(virtual_tokens, block_size);
     const int32_t active_partitions =
-        paged_attn_partitions(n_logical_blocks, min_partitions, n_partitions);
+        paged_attn_ceil_div(n_logical_blocks, blocks_per_partition);
+    const bool live_partition = partition < active_partitions;
+    const int32_t logical_block_begin = live_partition
+        ? partition * blocks_per_partition
+        : 0;
+    const int32_t logical_block_end = live_partition
+        ? min((partition + 1) * blocks_per_partition, n_logical_blocks)
+        : 0;
+    const int32_t token_begin = logical_block_begin * block_size;
+    const int32_t token_end_blocks = logical_block_end * block_size;
+    const int32_t token_end =
+        virtual_tokens < token_end_blocks ? virtual_tokens : token_end_blocks;
 
     if (partition >= active_partitions) {
 #pragma unroll
@@ -495,7 +490,7 @@ static __global__ void paged_attn_decode(
                 }
             } else {
                 float * o_row =
-                    (float *) (dst + (int64_t) seq * dst_nb1 +
+                    (float *) (dst + (int64_t) gseq * dst_nb1 +
                                      (int64_t) (head0 + h) * dst_nb2);
 #pragma unroll
                 for (int i = lane; i < D; i += nthreads) {
@@ -505,16 +500,6 @@ static __global__ void paged_attn_decode(
         }
         return;
     }
-
-    const int32_t logical_block_begin =
-        ((int64_t) n_logical_blocks * partition) / active_partitions;
-    const int32_t logical_block_end =
-        ((int64_t) n_logical_blocks * (partition + 1)) /
-        active_partitions;
-    const int32_t token_begin = logical_block_begin * block_size;
-    const int32_t token_end_blocks = logical_block_end * block_size;
-    const int32_t token_end =
-        virtual_tokens < token_end_blocks ? virtual_tokens : token_end_blocks;
 
     constexpr bool quantize_q = type_K != GGML_TYPE_F16;
     constexpr int q_registers   = (D / 2) / nthreads;
@@ -553,7 +538,7 @@ static __global__ void paged_attn_decode(
 #pragma unroll
         for (int h = 0; h < n_batch_heads; ++h) {
             const float2 * q_f2 = (const float2 *)
-                (q + (int64_t) seq * q_nb1 + (int64_t) (head0 + h) * q_nb2);
+                (q + (int64_t) gseq * q_nb1 + (int64_t) (head0 + h) * q_nb2);
 #pragma unroll
             for (int i0 = 0; i0 < D / 2; i0 += nthreads * cpy_ne) {
                 const int i = i0 + lane * cpy_ne;
@@ -807,7 +792,7 @@ static __global__ void paged_attn_decode(
         const int64_t partial_row =
             output_row * n_partitions + partition;
         float * o_row =
-            (float *) (dst + (int64_t) seq * dst_nb1 +
+            (float *) (dst + (int64_t) gseq * dst_nb1 +
                              (int64_t) (head0 + h) * dst_nb2);
 #pragma unroll
         for (int segment = 0;
@@ -1077,10 +1062,8 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
 
 // Cached max resident blocks/SM for this instantiation at the given block
 // width; 0 when the device cannot launch it. Deliberately queries the
-// write_partials variant: occupancy only steers min_partitions, which is a
-// partition count for that variant. The direct variant launches solely when
-// the count collapses to one, where occupancy no longer influences the
-// topology.
+// write_partials variant: occupancy only decides whether the instantiation can
+// launch; it no longer steers the split (a launch constant of the table width).
 template<ggml_type type_K, ggml_type type_V, int n_batch_heads>
 static int paged_attn_cached_occupancy(int device, int warps_per_block) {
     // 0 means "not queried yet"; UNLAUNCHABLE records a block size this
@@ -1189,54 +1172,20 @@ static bool try_launch_paged_attn(
         (unsigned int) (warps_per_group * kv_heads_per_block),
         1);
 
-    const int64_t output_rows = q->ne[1] * q->ne[2];
-    const int64_t work_groups = q->ne[1] * head_groups;
-    const int64_t target_blocks =
-        (int64_t) ggml_cuda_info().devices[ctx.device].nsm *
-        max_blocks_per_sm;
-    int32_t min_partitions = (int32_t)
-        ((target_blocks + work_groups - 1) / work_groups);
-    if (min_partitions < 1) {
-        min_partitions = 1;
-    }
-    // Small batches need more context partitions each to expose enough work;
-    // large batches already fill the device, where extra partitions mostly
-    // repeat the per-partition fixed costs. Scale the cap so the total
-    // partition count stays roughly constant across batch sizes.
-    int32_t partition_limit =
-        PAGED_ATTN_MAX_PARTITIONS / (int32_t) q->ne[1];
-    if (partition_limit < 32) {
-        partition_limit = 32;
-    }
-    if (min_partitions > partition_limit) {
-        min_partitions = partition_limit;
-    }
-    const int32_t partition_cap = paged_attn_partials_cap(output_rows, D);
-    if (min_partitions > partition_cap) {
-        min_partitions = partition_cap;
-    }
+    // Context split: S logical blocks per partition, a function of the table
+    // width alone (see paged_attn_blocks_per_partition), so a row's cuts, and
+    // with them its bits, do not depend on the batch. The grid still shrinks
+    // with the launch length: partitions past a row's extent take the dead
+    // path and are exact zeros in fixed combine slots. The direct/partials
+    // choice is a launch constant as well.
     const int32_t tree_blocks = paged_attn_ceil_div(tree_width, block_size);
-    const int64_t partitionable_blocks =
+    const int64_t table_blocks =
         block_table->ne[0] + (parent_ids ? tree_blocks : 0);
-    if (min_partitions > partitionable_blocks) {
-        min_partitions = (int32_t) partitionable_blocks;
-    }
+    int32_t blocks_per_partition = paged_attn_blocks_per_partition(table_blocks);
 
-    // Size the launch from the live maximum committed prefix plus the virtual
-    // tree tail. Ragged/tree rows still clamp their own active partition count
-    // from device metadata.
-    const int64_t live_tokens =
-        (int64_t) max_kv_seq_len + (parent_ids ? tree_width : 0);
-    const int32_t live_blocks =
-        paged_attn_ceil_div(live_tokens, block_size);
-    int32_t n_partitions = paged_attn_partitions(
-        live_blocks, min_partitions, partition_cap);
-
-    // Test/debug override used to exercise both the direct and partials paths
-    // independently of device-specific occupancy. Values outside the valid
-    // grid range are ignored. Read once: every full-attention layer launches
-    // this on every decode token, so an environment scan per launch would sit
-    // in the decode hot path.
+    // Test/debug override: a forced partition count becomes a forced S, so it
+    // stays a launch constant. Read once: every full-attention layer launches
+    // this on every decode token.
     static const int forced_partitions = []() {
         const char * env =
             std::getenv("GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS");
@@ -1244,9 +1193,30 @@ static bool try_launch_paged_attn(
     }();
     if (forced_partitions >= 1 &&
         forced_partitions <= PAGED_ATTN_MAX_PARTITIONS &&
-        forced_partitions <= partitionable_blocks) {
-        min_partitions = forced_partitions;
-        n_partitions = forced_partitions;
+        forced_partitions <= table_blocks) {
+        blocks_per_partition = paged_attn_ceil_div(table_blocks, forced_partitions);
+    }
+    const int32_t max_partitions =
+        paged_attn_ceil_div(table_blocks, blocks_per_partition);
+    const int64_t live_tokens =
+        (int64_t) max_kv_seq_len + (parent_ids ? tree_width : 0);
+    const int32_t live_blocks =
+        paged_attn_ceil_div(live_tokens, block_size);
+    const int32_t n_partitions = std::max<int32_t>(1, std::min<int32_t>(
+        max_partitions, paged_attn_ceil_div(live_blocks, blocks_per_partition)));
+    const bool write_partials = max_partitions > 1;
+    if (n_partitions > 1) { ++g_paged_attn_partitioned_launch_count; }
+
+    // The partials of a large row count (a prompt chunk) would not fit the
+    // scratch budget, so the rows go out in slices instead of coarsening the
+    // split. A row's arithmetic does not depend on its slice-mates.
+    const int64_t n_rows_total = q->ne[1];
+    int64_t rows_per_slice = n_rows_total;
+    if (write_partials) {
+        const int64_t per_row = (int64_t) n_head * n_partitions *
+            ((int64_t) D * (int64_t) sizeof(half) + (int64_t) sizeof(float2));
+        rows_per_slice = std::max<int64_t>(1, std::min<int64_t>(
+            n_rows_total, PAGED_ATTN_PARTIALS_BUDGET / per_row));
     }
 
     constexpr bool quantize_q = type_K != GGML_TYPE_F16;
@@ -1255,92 +1225,99 @@ static bool try_launch_paged_attn(
     ggml_cuda_pool_alloc<int>    q_i32_alloc(ctx.pool());
     ggml_cuda_pool_alloc<float2> q_ds_alloc(ctx.pool());
     if (quantize_q) {
-        q_i32_glob = q_i32_alloc.alloc(output_rows * (D / sizeof(int)));
-        q_ds_glob  = q_ds_alloc.alloc(output_rows * (D / QK8_1));
-        const dim3 quantize_grid(
-            (unsigned int) q->ne[2], (unsigned int) q->ne[1], 1);
-        paged_attn_quantize_q<D>
-            <<<quantize_grid, dim3(WARP_SIZE, 1, 1), 0, ctx.stream()>>>(
-            (const char *) q->data,
-            q_i32_glob,
-            q_ds_glob,
-            q->nb[1], q->nb[2],
-            (int32_t) q->ne[1],
-            scale * PAGED_ATTN_LOG2E);
+        const int64_t slice_rows = rows_per_slice * q->ne[2];
+        q_i32_glob = q_i32_alloc.alloc(slice_rows * (D / sizeof(int)));
+        q_ds_glob  = q_ds_alloc.alloc(slice_rows * (D / QK8_1));
     }
-
-    const dim3 grid(
-        (unsigned int) head_groups,
-        (unsigned int) q->ne[1],
-        (unsigned int) n_partitions);
 
     ggml_cuda_pool_alloc<half>   acc_scratch(ctx.pool());
     ggml_cuda_pool_alloc<float2> meta_scratch(ctx.pool());
     half   * partial_acc  = nullptr;
     float2 * partial_meta = nullptr;
-    if (n_partitions > 1) {
-        const size_t partial_rows = (size_t) output_rows * n_partitions;
+    if (write_partials) {
+        const size_t partial_rows = (size_t) rows_per_slice * q->ne[2] * n_partitions;
         partial_acc  = acc_scratch.alloc(partial_rows * D);
         partial_meta = meta_scratch.alloc(partial_rows);
     }
 
-    auto * decode_kernel = n_partitions == 1
-        ? paged_attn_decode<D, type_K, type_V, n_batch_heads, false>
-        : paged_attn_decode<D, type_K, type_V, n_batch_heads, true>;
-    decode_kernel<<<grid, block, 0, ctx.stream()>>>(
-        (const char *) q->data,
-        (const char *) k->data,
-        (const char *) v->data,
-        q_i32_glob,
-        q_ds_glob,
-        (const char *) block_table->data,
-        (const char *) kv_seq_lens->data,
-        active_slot_ids ? (const char *) active_slot_ids->data : nullptr,
-        query_positions ? (const char *) query_positions->data : nullptr,
-        parent_ids ? (const char *) parent_ids->data : nullptr,
-        tree_sizes ? (const char *) tree_sizes->data : nullptr,
-        (char *) dst->data,
-        partial_acc,
-        partial_meta,
-        q->nb[1], q->nb[2],
-        k->nb[1], k->nb[2],
-        v->nb[1], v->nb[2],
-        block_table->nb[0], block_table->nb[1],
-        kv_seq_lens->nb[0],
-        active_slot_ids ? active_slot_ids->nb[0] : 0,
-        query_positions ? query_positions->nb[0] : 0,
-        parent_ids ? parent_ids->nb[0] : 0,
-        parent_ids ? parent_ids->nb[1] : 0,
-        tree_sizes ? tree_sizes->nb[0] : 0,
-        dst->nb[1], dst->nb[2],
-        (int32_t) block_table->ne[1],
-        n_head,
-        n_head_kv,
-        (int32_t) k->ne[1],
-        (int32_t) block_table->ne[0],
-        block_size,
-        min_partitions,
-        tree_width,
-        parent_ids
-            ? (int32_t)(q->ne[1] - parent_ids->ne[1] * tree_width)
-            : 0,
-        tree_scratch_base,
-        tree_scratch_stride,
-        scale);
-
-    if (n_partitions > 1) {
-        const dim3 combine_grid(
-            (unsigned int) q->ne[2],
-            (unsigned int) q->ne[1],
-            1);
-        paged_attn_combine<D>
-            <<<combine_grid, dim3(D, 1, 1), 0, ctx.stream()>>>(
+    auto * decode_kernel = write_partials
+        ? paged_attn_decode<D, type_K, type_V, n_batch_heads, true>
+        : paged_attn_decode<D, type_K, type_V, n_batch_heads, false>;
+    for (int64_t row0 = 0; row0 < n_rows_total; row0 += rows_per_slice) {
+        const int32_t slice = (int32_t) std::min<int64_t>(rows_per_slice, n_rows_total - row0);
+        if (quantize_q) {
+            const dim3 quantize_grid((unsigned int) q->ne[2], (unsigned int) slice, 1);
+            paged_attn_quantize_q<D>
+                <<<quantize_grid, dim3(WARP_SIZE, 1, 1), 0, ctx.stream()>>>(
+                (const char *) q->data + row0 * q->nb[1],
+                q_i32_glob,
+                q_ds_glob,
+                q->nb[1], q->nb[2],
+                slice,
+                scale * PAGED_ATTN_LOG2E);
+        }
+        if (write_partials) {
+            const size_t partial_rows = (size_t) slice * q->ne[2] * n_partitions;
+            paged_attn_poison_scratch(ctx.stream(), partial_acc, partial_rows * D * sizeof(half));
+            paged_attn_poison_scratch(ctx.stream(), partial_meta, partial_rows * sizeof(float2));
+        }
+        const dim3 grid(
+            (unsigned int) head_groups,
+            (unsigned int) slice,
+            (unsigned int) n_partitions);
+        decode_kernel<<<grid, block, 0, ctx.stream()>>>(
+            (const char *) q->data,
+            (const char *) k->data,
+            (const char *) v->data,
+            q_i32_glob,
+            q_ds_glob,
+            (const char *) block_table->data,
+            (const char *) kv_seq_lens->data,
+            active_slot_ids ? (const char *) active_slot_ids->data : nullptr,
+            query_positions ? (const char *) query_positions->data : nullptr,
+            parent_ids ? (const char *) parent_ids->data : nullptr,
+            tree_sizes ? (const char *) tree_sizes->data : nullptr,
+            (char *) dst->data,
             partial_acc,
             partial_meta,
-            (char *) dst->data,
-            dst->nb[1],
-            dst->nb[2],
-            n_partitions);
+            q->nb[1], q->nb[2],
+            k->nb[1], k->nb[2],
+            v->nb[1], v->nb[2],
+            block_table->nb[0], block_table->nb[1],
+            kv_seq_lens->nb[0],
+            active_slot_ids ? active_slot_ids->nb[0] : 0,
+            query_positions ? query_positions->nb[0] : 0,
+            parent_ids ? parent_ids->nb[0] : 0,
+            parent_ids ? parent_ids->nb[1] : 0,
+            tree_sizes ? tree_sizes->nb[0] : 0,
+            dst->nb[1], dst->nb[2],
+            (int32_t) block_table->ne[1],
+            n_head,
+            n_head_kv,
+            (int32_t) k->ne[1],
+            (int32_t) block_table->ne[0],
+            block_size,
+            blocks_per_partition,
+            (int32_t) row0,
+            tree_width,
+            parent_ids
+                ? (int32_t)(q->ne[1] - parent_ids->ne[1] * tree_width)
+                : 0,
+            tree_scratch_base,
+            tree_scratch_stride,
+            scale);
+
+        if (write_partials) {
+            const dim3 combine_grid((unsigned int) q->ne[2], (unsigned int) slice, 1);
+            paged_attn_combine<D>
+                <<<combine_grid, dim3(D, 1, 1), 0, ctx.stream()>>>(
+                partial_acc,
+                partial_meta,
+                (char *) dst->data + row0 * dst->nb[1],
+                dst->nb[1],
+                dst->nb[2],
+                n_partitions);
+        }
     }
     return true;
 }
