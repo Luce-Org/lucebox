@@ -255,7 +255,10 @@ tool schemas and system prompt, up to the first user turn, or up to where its
 projects differ. `--shared-prefix auto` (the default) keeps them across
 conversations, and with the disk cache on across restarts and model swaps
 (`server/kv/shared_prefixes`, `server/kv/prefix_pins`); with
-`--kv-cache-dir off` the pins and the ring live in memory only.
+`--kv-cache-dir off` the pins and the ring live in memory only. On the
+concurrent path the default is `freeze` for an engine that does not chunk at
+the restore points (`prefill_cuts_at_restore_points`); an explicit `auto`
+still learns.
 
 **The cut.** A request with tools, or whose prefix before the first user turn
 is at least 512 tokens, captures that head first, until it is restored. When

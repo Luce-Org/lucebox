@@ -20,6 +20,10 @@ bool parse_shared_prefix_mode(const std::string & value, SharedPrefixMode & out)
     return true;
 }
 
+SharedPrefixMode effective_shared_prefix_mode(bool given, SharedPrefixMode mode, bool concurrent) {
+    return !given && concurrent && mode == SharedPrefixMode::learn ? SharedPrefixMode::freeze : mode;
+}
+
 const char * shared_prefix_mode_name(SharedPrefixMode mode) {
     switch (mode) {
         case SharedPrefixMode::off: return "off";
