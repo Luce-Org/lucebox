@@ -1594,23 +1594,42 @@ int resolve_max_output_tokens(const json & body, int default_max_tokens) {
         if (it == body.end() || it->is_null()) {
             continue;
         }
-        int64_t raw_value = 0;
         if (it->is_number_unsigned()) {
             const uint64_t uval = it->get<uint64_t>();
             if (uval > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
                 return std::numeric_limits<int>::max();
             }
-            raw_value = static_cast<int64_t>(uval);
+            if (uval == 0) {
+                return default_max_tokens;
+            }
+            return static_cast<int>(uval);
+        } else if (it->is_number_float()) {
+            const double fval = it->get<double>();
+            if (!std::isfinite(fval)) {
+                throw json::type_error::create(
+                    302, "type must be finite number, but is non-finite", &(*it));
+            }
+            if (fval <= 0.0) {
+                return default_max_tokens;
+            }
+            if (fval > static_cast<double>(std::numeric_limits<int>::max())) {
+                return std::numeric_limits<int>::max();
+            }
+            if (std::floor(fval) != fval) {
+                throw json::type_error::create(
+                    302, "type must be integer, but is fractional number", &(*it));
+            }
+            return static_cast<int>(fval);
         } else {
-            raw_value = it->get<int64_t>();
+            const int64_t raw_value = it->get<int64_t>();
+            if (raw_value <= 0) {
+                return default_max_tokens;
+            }
+            if (raw_value > std::numeric_limits<int>::max()) {
+                return std::numeric_limits<int>::max();
+            }
+            return static_cast<int>(raw_value);
         }
-        if (raw_value <= 0) {
-            return default_max_tokens;
-        }
-        if (raw_value > std::numeric_limits<int>::max()) {
-            return std::numeric_limits<int>::max();
-        }
-        return static_cast<int>(raw_value);
     }
     return default_max_tokens;
 }
