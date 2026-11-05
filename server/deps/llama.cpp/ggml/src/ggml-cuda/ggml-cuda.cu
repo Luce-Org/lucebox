@@ -216,7 +216,7 @@ extern "C" int ggml_backend_cuda_set_mmvq_invariant_max_ncols(int max_ncols) {
 
 int ggml_cuda_mmvq_invariant_max_ncols() {
     return ggml_cuda_mmvq_invariant_max_ncols_value > 0 ? ggml_cuda_mmvq_invariant_max_ncols_value
-                                                        : MMVQ_MAX_BATCH_SIZE;
+                                                        : MMVQ_INVARIANT_MAX_NCOLS;
 }
 
 static thread_local int ggml_cuda_mmvq_invariant_rows_override_value = 0;
@@ -3244,7 +3244,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_MXFP8 && !bad_padding_clear &&
                              src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 &&
-                             ncols_dst <= (is_mul_mat_id ? MMVQ_MAX_MOE_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE);
+                             ncols_dst <= (is_mul_mat_id ? MMVQ_MAX_MOE_BATCH_SIZE
+                                           : ggml_cuda_mmvq_batch_invariant_enabled ? ggml_cuda_mmvq_invariant_max_ncols()
+                                                                                    : MMVQ_MAX_BATCH_SIZE);
 #ifdef ROCMFP2_AFFINE
     // The affine MMVQ dot includes the offset correction in vecdotq.cuh.
     // Keep the conservative dequantize fallback unless explicitly enabled.
@@ -3586,7 +3588,9 @@ static bool ggml_cuda_mul_mat_vec_q_eligible(const ggml_tensor * src0, const ggm
 
 // Whether a product that both MMVQ and MMQ can run takes MMQ on device cc.
 static bool ggml_cuda_mul_mat_prefers_mmq(const ggml_tensor * src0, const ggml_tensor * src1, const int cc) {
-    return src0->type == GGML_TYPE_Q4_K && GGML_CUDA_CC_IS_RDNA4(cc) && src1->ne[1] > 1 &&
+    // Batch-invariant products stay on MMVQ: MMQ quantizes the activations differently.
+    return !ggml_cuda_mmvq_batch_invariant_enabled &&
+           src0->type == GGML_TYPE_Q4_K && GGML_CUDA_CC_IS_RDNA4(cc) && src1->ne[1] > 1 &&
            src0->ne[1] >= GGML_CUDA_RDNA4_Q4_K_MMQ_MIN_ROWS;
 }
 

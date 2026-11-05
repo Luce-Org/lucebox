@@ -4,6 +4,7 @@
 // All calls come from the HTTP scheduler thread, which is also the only
 // caller of the pool, step graph, and device metadata uploads.
 
+#include "common/cuda_graph_overrides.h"
 #include "qwen35_seq_engine.h"
 
 #include "qwen35_backend.h"
@@ -1936,9 +1937,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     // unsplit sum, which a batch of concurrent requests never was. A single
     // lane keeps the unsplit kernels. The launches happen inside
     // graph_compute, so the scope closes after it.
-    ggml_backend_cuda_set_mmq_splitk_scope(spec_count >= 2);
+    // LUCE_BATCH_INVARIANT=1 keeps the unsplit kernels at every lane count.
+    ggml_backend_cuda_set_mmq_splitk_scope(spec_count >= 2 && !luce::common::batch_invariant_requested());
     const ggml_status verify_status =
-        ggml_backend_graph_compute(b_.target_backend_, graph.gf);
+        luce::common::target_graph_compute(b_.target_backend_, graph.gf);
     ggml_backend_cuda_set_mmq_splitk_scope(false);
     if (verify_status != GGML_STATUS_SUCCESS) {
         result.error = "fixed chain target compute failed";
@@ -2874,7 +2876,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     {
         const Qwen35RoctxRange roctx_compute(
             "qwen35.graph_compute", roctx_metadata);
-        st = ggml_backend_graph_compute(b_.target_backend_, sg.gf);
+        st = luce::common::target_graph_compute(b_.target_backend_, sg.gf);
     }
     if (st != GGML_STATUS_SUCCESS) {
         // The pinned embedding rows may still be in flight.

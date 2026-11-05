@@ -2822,6 +2822,17 @@ if(LUCE_TESTS)
             LABELS gpu SKIP_RETURN_CODE 77)
     endif()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_qwen35_batch_invariant_dispatch.cpp")
+        # qwen35 target graphs go through luce::common::target_graph_compute: with LUCE_BATCH_INVARIANT=1 every
+        # verify width up to the draft width is bit-equal to the one-column product (Q4_K, IQ4_XS, Q8_0).
+        add_executable(test_qwen35_batch_invariant_dispatch test/unit/test_qwen35_batch_invariant_dispatch.cpp)
+        target_include_directories(test_qwen35_batch_invariant_dispatch PRIVATE
+            ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_qwen35_batch_invariant_dispatch PRIVATE
+            luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
+        list(APPEND _raw_unit_test_targets test_qwen35_batch_invariant_dispatch)
+    endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_server_unit.cpp")
         set(_server_unit_sources
             test/unit/test_unit_main.cpp
