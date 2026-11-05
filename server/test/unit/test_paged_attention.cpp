@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <set>
 #include <utility>
 #include <vector>
@@ -1033,6 +1034,203 @@ TEST_CASE(PagedAttention, RowOutputBitsIndependentOfBatch) {
                 // LUCE_PAGED_WMMA=0) cut the context at fixed absolute blocks,
                 // so every length and batch shape must reproduce A's bits.
                 CHECK_EQUAL(0, mismatches);
+            }
+        }
+    }
+    ggml_backend_free(backend);
+}
+
+// ── Chain verify vs sequential AR ───────────────────────────────────────────
+// Spec decode must equal AR in bits. A chain verify of width k over a slot with
+// L committed tokens must give row n the bytes of the AR call at position L+n:
+// one query row, kv_seq_lens = L+n+1, the candidate rows read from the block
+// table. The chain call sees only the L committed rows through the table (the
+// rows above L hold poison there, as a rejected draft leaves them) and the
+// candidates' K/V in the scratch slab. On gfx1201 the AR call runs the WMMA
+// kernel, so a chain verify that drops to V_DOT2 differs in bits. The 3090 runs
+// V_DOT2 for both, so there this checks the layout and the scratch addressing,
+// not the route.
+namespace {
+
+struct ChainPool {
+    int committed;
+    int width;
+    int max_blocks;
+    int pool_tokens;
+    int scratch_base;
+    int scratch_stride;
+    std::vector<int32_t> table;
+    std::vector<uint8_t> k_ar, v_ar;       // candidate rows at their table positions
+    std::vector<uint8_t> k_chain, v_chain; // poison there, the candidates in the scratch slab
+};
+
+ChainPool make_chain_pool(ggml_type kv_type, int committed, int width, int max_blocks) {
+    ChainPool p;
+    p.committed = committed;
+    p.width = width;
+    p.max_blocks = max_blocks;
+    p.scratch_stride = 16;
+    const int live_blocks = (committed + width + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int pool_blocks = live_blocks + 3;
+    p.scratch_base = pool_blocks * BLOCK_SIZE;
+    p.pool_tokens = p.scratch_base + p.scratch_stride;
+    p.table.assign(max_blocks, -1);
+    int stride = 7;   // any stride coprime with the pool size maps the logical blocks to distinct shuffled ones
+    while (std::gcd(stride, pool_blocks) != 1) ++stride;
+    for (int b = 0; b < live_blocks; ++b) p.table[b] = (b * stride + 2) % pool_blocks;
+    {   // the shuffle must be a permutation of distinct blocks
+        std::set<int32_t> seen(p.table.begin(), p.table.begin() + live_blocks);
+        GGML_ASSERT((int) seen.size() == live_blocks);
+    }
+    const auto row_of = [&](int token) {
+        return p.table[token / BLOCK_SIZE] * BLOCK_SIZE + token % BLOCK_SIZE;
+    };
+    const size_t rows = (size_t) p.pool_tokens * N_HEAD_KV;
+    std::vector<float> k_src(rows * D), v_src(rows * D);
+    for (float & x : k_src) x = invariance_next() * 0.5f;
+    for (float & x : v_src) x = invariance_next() * 0.5f;
+    std::vector<float> k_poison = k_src, v_poison = v_src;
+    for (int head = 0; head < N_HEAD_KV; ++head) {
+        for (int j = 0; j < width; ++j) {
+            const size_t at = ((size_t) head * p.pool_tokens + row_of(committed + j)) * D;
+            const size_t scratch = ((size_t) head * p.pool_tokens + p.scratch_base + j) * D;
+            for (int d = 0; d < D; ++d) {
+                k_src[scratch + d] = k_src[at + d];
+                v_src[scratch + d] = v_src[at + d];
+                k_poison[at + d] = 3.0f;
+                v_poison[at + d] = 60.0f;
+            }
+        }
+    }
+    // The chain pool carries the candidates in scratch; the AR pool keeps them in the table.
+    std::vector<float> k_chain_src = k_poison, v_chain_src = v_poison;
+    for (int head = 0; head < N_HEAD_KV; ++head) {
+        for (int j = 0; j < width; ++j) {
+            const size_t scratch = ((size_t) head * p.pool_tokens + p.scratch_base + j) * D;
+            for (int d = 0; d < D; ++d) {
+                k_chain_src[scratch + d] = k_src[scratch + d];
+                v_chain_src[scratch + d] = v_src[scratch + d];
+            }
+        }
+    }
+    p.k_ar = quantize_rows(kv_type, k_src, (int64_t) rows);
+    p.v_ar = quantize_rows(kv_type, v_src, (int64_t) rows);
+    p.k_chain = quantize_rows(kv_type, k_chain_src, (int64_t) rows);
+    p.v_chain = quantize_rows(kv_type, v_chain_src, (int64_t) rows);
+    return p;
+}
+
+// n_rows == 1: the AR decode call at kv_len. n_rows == width: the chain verify.
+// q is [head][row][D]. Returns the output in the same layout, empty on failure.
+std::vector<float> run_chain_or_ar(ggml_backend_t backend, ggml_type kv_type, const ChainPool & p,
+                                   bool chain, int kv_len, int max_kv_seq_len,
+                                   const std::vector<float> & q_data, int n_rows,
+                                   size_t * wmma_launches) {
+    ggml_init_params params{};
+    params.mem_size = 8 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return {};
+    ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_rows, N_HEAD);
+    ggml_tensor * k = ggml_new_tensor_3d(ctx, kv_type, D, p.pool_tokens, N_HEAD_KV);
+    ggml_tensor * v = ggml_new_tensor_3d(ctx, kv_type, D, p.pool_tokens, N_HEAD_KV);
+    ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, p.max_blocks, 1);
+    ggml_tensor * seq_lens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * active = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_rows);
+    ggml_tensor * parents = chain ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, p.width, 1) : nullptr;
+    ggml_tensor * sizes = chain ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1) : nullptr;
+    for (ggml_tensor * t : {q, k, v, table, seq_lens, active, parents, sizes}) {
+        if (t) ggml_set_input(t);
+    }
+    const float scale = 1.0f / std::sqrt((float) D);
+    ggml_tensor * output = chain
+        ? ggml_paged_attn_ext_tree(ctx, q, k, v, table, seq_lens, active, nullptr, scale, BLOCK_SIZE,
+                                   max_kv_seq_len, parents, sizes, p.scratch_base, p.scratch_stride)
+        : ggml_paged_attn_ext(ctx, q, k, v, table, seq_lens, active, nullptr, scale, BLOCK_SIZE,
+                              max_kv_seq_len);
+    ggml_set_output(output);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    ggml_gallocr_t allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    std::vector<float> result;
+    if (ggml_gallocr_alloc_graph(allocator, graph)) {
+        const std::vector<uint8_t> & kb = chain ? p.k_chain : p.k_ar;
+        const std::vector<uint8_t> & vb = chain ? p.v_chain : p.v_ar;
+        ggml_backend_tensor_set(q, q_data.data(), 0, q_data.size() * sizeof(float));
+        ggml_backend_tensor_set(k, kb.data(), 0, kb.size());
+        ggml_backend_tensor_set(v, vb.data(), 0, vb.size());
+        ggml_backend_tensor_set(table, p.table.data(), 0, p.table.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(seq_lens, &kv_len, 0, sizeof(int32_t));
+        const std::vector<int32_t> slots(n_rows, 0);
+        ggml_backend_tensor_set(active, slots.data(), 0, slots.size() * sizeof(int32_t));
+        if (chain) {
+            std::vector<int32_t> parent_ids(p.width);
+            for (int n = 0; n < p.width; ++n) parent_ids[n] = n - 1;
+            const int32_t size = p.width;
+            ggml_backend_tensor_set(parents, parent_ids.data(), 0, parent_ids.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(sizes, &size, 0, sizeof(int32_t));
+        }
+        const size_t before = ggml_backend_cuda_get_paged_attn_wmma256_launch_count();
+        if (ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS) {
+            result.resize(ggml_nelements(output));
+            ggml_backend_tensor_get(output, result.data(), 0, ggml_nbytes(output));
+        }
+        if (wmma_launches) *wmma_launches = ggml_backend_cuda_get_paged_attn_wmma256_launch_count() - before;
+    }
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    return result;
+}
+
+// Returns the number of chain rows whose bytes differ from the AR call at the same position.
+int chain_vs_ar_mismatches(ggml_backend_t backend, ggml_type kv_type, int committed, int width,
+                           int max_blocks, bool expect_wmma) {
+    const ChainPool pool = make_chain_pool(kv_type, committed, width, max_blocks);
+    std::vector<float> q_data((size_t) D * width * N_HEAD);
+    for (float & x : q_data) x = invariance_next() * 0.5f;
+    size_t chain_launches = 0;
+    const std::vector<float> chain_out = run_chain_or_ar(
+        backend, kv_type, pool, true, committed, round_up(committed, 256), q_data, width, &chain_launches);
+    int mismatches = chain_out.empty() ? width : 0;
+    for (int n = 0; n < width && !chain_out.empty(); ++n) {
+        std::vector<float> q_row((size_t) D * N_HEAD);
+        for (int h = 0; h < N_HEAD; ++h) {
+            std::memcpy(q_row.data() + (size_t) h * D, q_data.data() + ((size_t) h * width + n) * D, D * sizeof(float));
+        }
+        size_t ar_launches = 0;
+        const std::vector<float> ar = run_chain_or_ar(
+            backend, kv_type, pool, false, committed + n + 1, round_up(committed + n + 1, 256), q_row, 1, &ar_launches);
+        bool same = ar.size() == (size_t) N_HEAD * D;
+        for (int h = 0; h < N_HEAD && same; ++h) {
+            same = std::memcmp(ar.data() + (size_t) h * D, chain_out.data() + ((size_t) h * width + n) * D,
+                               D * sizeof(float)) == 0;
+        }
+        mismatches += same ? 0 : 1;
+        if (n == 0 || !same) {
+            std::printf("paged attention chain-vs-AR K/V=%-4s L=%-5d k=%-2d row %-2d %s (AR wmma=%zu chain wmma=%zu)\n",
+                        ggml_type_name(kv_type), committed, width, n, same ? "SAME" : "DIFF",
+                        ar_launches, chain_launches);
+        }
+        // The route must be the same one: a chain that falls to V_DOT2 while AR runs WMMA is the bug.
+        if ((ar_launches > 0) != (chain_launches > 0)) ++mismatches;
+    }
+    if (expect_wmma && chain_launches == 0) ++mismatches;
+    return mismatches;
+}
+
+}  // namespace
+
+TEST_CASE(PagedAttention, ChainVerifyRowsEqualSequentialArBits) {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    for (ggml_type kv_type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        // Where the WMMA route is eligible (RDNA4, LUCE_PAGED_WMMA not 0) the chain verify must run it too.
+        const bool expect_wmma = ggml_backend_cuda_paged_attn_wmma_route(
+            0, /*tree_mode=*/false, D, N_HEAD, N_HEAD_KV, kv_type, kv_type, BLOCK_SIZE);
+        // L odd and even, on and off a block edge, one and several partitions, a 130-block table.
+        for (int committed : {33, 64, 1025, 2047}) {
+            for (int width : {16, 8}) {
+                CHECK_EQUAL(0, chain_vs_ar_mismatches(backend, kv_type, committed, width, 130, expect_wmma));
             }
         }
     }
