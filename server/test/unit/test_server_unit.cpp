@@ -5896,20 +5896,24 @@ TEST_CASE(ServerUnitFixture, test_forced_tools_pin_yields_to_deepen_after_restor
         boundaries, 100, 0, false, 110));
 }
 
-// The concurrent engines do not yet chunk at plan.restore_points, so a
-// restored shared prefix would not match a cold run: `auto` resolves to
-// `freeze` there unless the user typed it.
+// An engine that does not chunk at plan.restore_points (it does not declare
+// prefill_cuts_at_restore_points) would not match a cold run after a restored
+// shared prefix: on the concurrent path `auto` resolves to `freeze` for it
+// unless the user typed it. One that declares it keeps `auto`.
 TEST_CASE(ServerUnitFixture, test_shared_prefix_default_is_freeze_on_the_concurrent_path) {
     using M = SharedPrefixMode;
     for (const bool given : {false, true}) {
-        for (const M mode : {M::off, M::freeze, M::learn}) {
-            TEST_ASSERT(effective_shared_prefix_mode(given, mode, /*concurrent=*/false) == mode);
+        for (const bool cuts : {false, true}) {
+            for (const M mode : {M::off, M::freeze, M::learn}) {
+                TEST_ASSERT(effective_shared_prefix_mode(given, mode, /*concurrent=*/false, cuts) == mode);
+            }
         }
     }
-    TEST_ASSERT(effective_shared_prefix_mode(false, M::learn, true) == M::freeze);
-    TEST_ASSERT(effective_shared_prefix_mode(true, M::learn, true) == M::learn);
-    TEST_ASSERT(effective_shared_prefix_mode(true, M::freeze, true) == M::freeze);
-    TEST_ASSERT(effective_shared_prefix_mode(true, M::off, true) == M::off);
+    TEST_ASSERT(effective_shared_prefix_mode(false, M::learn, true, /*cuts=*/false) == M::freeze);
+    TEST_ASSERT(effective_shared_prefix_mode(false, M::learn, true, /*cuts=*/true) == M::learn);
+    TEST_ASSERT(effective_shared_prefix_mode(true, M::learn, true, false) == M::learn);
+    TEST_ASSERT(effective_shared_prefix_mode(true, M::freeze, true, false) == M::freeze);
+    TEST_ASSERT(effective_shared_prefix_mode(true, M::off, true, false) == M::off);
 }
 
 TEST_CASE(ServerUnitFixture, test_shared_prefix_mode_and_head_preference) {
