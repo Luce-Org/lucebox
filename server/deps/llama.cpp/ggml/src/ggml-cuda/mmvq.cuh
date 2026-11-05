@@ -1,6 +1,11 @@
 #include "common.cuh"
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+// Batch-invariant mode (ggml_backend_cuda_set_mmvq_batch_invariant) keeps dense
+// products on the single-column accumulation order up to this many columns, so a
+// spec-decode verify of any draft width computes each column like plain decode.
+// Widths above MMVQ_MAX_BATCH_SIZE run the single-column kernel per column.
+#define MMVQ_INVARIANT_MAX_NCOLS 32
 // Max. batch size for MUL_MAT_ID via the dedicated multi-token MoE kernel
 // (mul_mat_vec_q_moe takes ncols_dst at runtime). Staying on this path also
 // keeps CUDA-graph capture enabled ([TAG_MUL_MAT_ID_CUDA_GRAPHS]); measured
@@ -26,7 +31,7 @@ bool ggml_cuda_mmvq_mmid_grouped_for(const ggml_tensor * mul_mat_id, int cc);
 // Set by ggml_backend_cuda_set_mmvq_batch_invariant (calling thread).
 bool ggml_cuda_mmvq_batch_invariant();
 // Columns up to which batch-invariant dense products stay on the matrix-vector kernels (calling thread):
-// MMVQ_MAX_BATCH_SIZE unless ggml_backend_cuda_set_mmvq_invariant_max_ncols raised it.
+// MMVQ_INVARIANT_MAX_NCOLS unless ggml_backend_cuda_set_mmvq_invariant_max_ncols set it.
 int ggml_cuda_mmvq_invariant_max_ncols();
 
 bool ggml_cuda_mmvq_rdna4_glu_pair(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu);

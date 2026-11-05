@@ -1,5 +1,6 @@
 // Qwen35DFlashTarget — DFlashTarget adapter for qwen35 hybrid models.
 
+#include "common/cuda_graph_overrides.h"
 #include "qwen35_dflash_target.h"
 #include "delta_net_specla.h"
 #include "graph_builders.h"
@@ -564,7 +565,7 @@ bool Qwen35DFlashTarget::verify_batch(
                                          base_pos, kq_stride_pad_, win_start);
     }
 
-    auto st = ggml_backend_graph_compute(backend_, sg_.gf);
+    auto st = luce::common::target_graph_compute(backend_, sg_.gf);
     if (st != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "verify_batch: compute failed (status=%d)\n", (int)st);
         return false;
@@ -754,7 +755,7 @@ bool Qwen35DFlashTarget::verify_tree(
         ggml_backend_tensor_set(sg_.specla_m_eye,    me.data(), 0, sizeof(float) * me.size());
     }
 
-    auto st = ggml_backend_graph_compute(backend_, sg_.gf);
+    auto st = luce::common::target_graph_compute(backend_, sg_.gf);
     if (st != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "verify_tree: compute failed (status=%d)\n", (int)st);
         return false;

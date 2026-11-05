@@ -1,3 +1,4 @@
+#include "common/cuda_graph_overrides.h"
 #include "qwen35_backend.h"
 #include "qwen35_image_request.h"
 #include "concurrency/qwen35_seq_engine.h"
@@ -3005,7 +3006,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
         // Compute
         const auto t_comp0 = std::chrono::steady_clock::now();
-        auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
+        auto st = luce::common::target_graph_compute(target_backend_, sg_.gf);
         if (prefill_timing) {
             ggml_backend_synchronize(target_backend_);
             const auto t_comp1 = std::chrono::steady_clock::now();
@@ -3926,7 +3927,7 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
                 sg_.attn_mask, committed, 1, cfg_.kq_stride_pad);
         }
 
-        auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
+        auto st = luce::common::target_graph_compute(target_backend_, sg_.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
 
         after_target_compute(sg_, committed, 1);

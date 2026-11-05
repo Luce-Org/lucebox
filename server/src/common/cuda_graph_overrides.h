@@ -1,8 +1,23 @@
 #pragma once
 
+#include "ggml-backend.h"
 #include "ggml-cuda.h"
 
+#include <cstdlib>
+
 namespace luce::common {
+
+// LUCE_BATCH_INVARIANT=1 (default off) makes the qwen35 target graph compute
+// every matmul column like the single-token product (see
+// ggml_backend_cuda_set_mmvq_batch_invariant), so a spec-decode verify of any
+// draft width reproduces plain decode's bits.
+inline bool batch_invariant_from_env(const char * value) {
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+inline bool batch_invariant_requested() {
+    return batch_invariant_from_env(std::getenv("LUCE_BATCH_INVARIANT"));
+}
 
 // Thread-local CUDA/HIP graph controls used while executing a graph whose
 // topology or backend metadata requires a temporary policy override. The
@@ -90,5 +105,12 @@ private:
     int previous_ds4_mix_max_tokens_ = 0;
     int previous_invariant_width_ = 0;
 };
+
+// Computes a qwen35 target graph (plain decode, verify or prefill) under the
+// batch-invariant scope when LUCE_BATCH_INVARIANT=1.
+inline ggml_status target_graph_compute(ggml_backend_t backend, ggml_cgraph * gf) {
+    const ScopedCudaGraphOverrides invariant(false, 0, false, 0, batch_invariant_requested());
+    return ggml_backend_graph_compute(backend, gf);
+}
 
 }  // namespace luce::common
