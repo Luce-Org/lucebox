@@ -1937,15 +1937,6 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // the concurrent budget and no single-sequence superseded pruning.
     sconfig.concurrent_prefix_cache =
         backend_execution.max_concurrency > 1 && sconfig.prefix_cache_cap > 0;
-    const SharedPrefixMode shared_prefix = effective_shared_prefix_mode(
-        model.shared_prefix_given, sconfig.shared_prefix, sconfig.concurrent_prefix_cache);
-    if (shared_prefix != sconfig.shared_prefix) {
-        sconfig.shared_prefix = shared_prefix;
-        std::fprintf(stderr,
-            "[server] --shared-prefix defaults to freeze on the concurrent path "
-            "(its engines do not chunk at the restore points yet); pass auto to learn\n");
-    }
-
     const AgentTurnCacheChoice agent_turn = resolve_agent_turn_cache(
         model.agent_turn_cache,
         !backend_cache.paged_attention && backend_execution.max_concurrency <= 1,
@@ -2650,6 +2641,16 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
                 "[server] level-2 force-close DISABLED: text %.40s... "
                 "tokenizes to empty.\n", close_text.c_str());
         }
+    }
+
+    const SharedPrefixMode shared_prefix = effective_shared_prefix_mode(
+        model.shared_prefix_given, sconfig.shared_prefix, sconfig.concurrent_prefix_cache,
+        backend_owner->prefill_cuts_at_restore_points());
+    if (shared_prefix != sconfig.shared_prefix) {
+        sconfig.shared_prefix = shared_prefix;
+        std::fprintf(stderr,
+            "[server] --shared-prefix defaults to freeze on the concurrent path "
+            "(this engine does not cut prefill at the restore points); pass auto to learn\n");
     }
 
     loaded.engine =
