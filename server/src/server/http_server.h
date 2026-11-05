@@ -897,8 +897,10 @@ void apply_no_thinking_sampler_defaults(const json & body,
 // that into a 400.
 json require_messages_array(const json & body);
 
-// Resolve the supported output-token aliases in precedence order. Only the
-// selected field is parsed, so malformed lower-priority aliases are ignored.
+// Resolve the supported output-token aliases in precedence order. Explicit null
+// fields are treated as unset and fall through to lower-priority aliases or the
+// default. Only the selected non-null field is parsed, so malformed lower-priority
+// aliases are ignored.
 int resolve_max_output_tokens(const json & body, int default_max_tokens);
 
 // Apply request-level thinking controls and resolve the model-facing effort

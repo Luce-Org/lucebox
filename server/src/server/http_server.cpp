@@ -1584,18 +1584,33 @@ int resolve_max_output_tokens(const json & body, int default_max_tokens) {
     // max_completion_tokens: -1 to mean "no explicit limit"; 0 is also
     // invalid as a budget. Treat non-positive values as unset so they
     // fall back to the server default instead of yielding zero tokens.
-    auto field_or_default = [&](const char * key) {
-        const int value = body.at(key).get<int>();
-        return value > 0 ? value : default_max_tokens;
-    };
-    if (body.contains("max_tokens")) {
-        return field_or_default("max_tokens");
-    }
-    if (body.contains("max_output_tokens")) {
-        return field_or_default("max_output_tokens");
-    }
-    if (body.contains("max_completion_tokens")) {
-        return field_or_default("max_completion_tokens");
+    //
+    // Explicit JSON nulls represent unset optional fields (the OpenAI API
+    // default) and continue to lower-priority aliases or default_max_tokens.
+    // Malformed non-null types on the selected alias throw json::type_error
+    // so route_request can reject them with a 400.
+    for (const char * key : {"max_tokens", "max_output_tokens", "max_completion_tokens"}) {
+        const auto it = body.find(key);
+        if (it == body.end() || it->is_null()) {
+            continue;
+        }
+        int64_t raw_value = 0;
+        if (it->is_number_unsigned()) {
+            const uint64_t uval = it->get<uint64_t>();
+            if (uval > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+                return std::numeric_limits<int>::max();
+            }
+            raw_value = static_cast<int64_t>(uval);
+        } else {
+            raw_value = it->get<int64_t>();
+        }
+        if (raw_value <= 0) {
+            return default_max_tokens;
+        }
+        if (raw_value > std::numeric_limits<int>::max()) {
+            return std::numeric_limits<int>::max();
+        }
+        return static_cast<int>(raw_value);
     }
     return default_max_tokens;
 }
