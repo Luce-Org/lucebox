@@ -150,6 +150,11 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_fattn_wmma256_launch_count(void);
 // Calling-thread launch counter for the head-size-256 WMMA paged-attention
 // kernel (stage-1; gated by LUCE_PAGED_WMMA).
 GGML_BACKEND_API size_t ggml_backend_cuda_get_paged_attn_wmma256_launch_count(void);
+// Whether paged attention on `device` runs the WMMA route for a graph of this
+// shape (false: the V_DOT2 kernel).
+GGML_BACKEND_API bool ggml_backend_cuda_paged_attn_wmma_route(
+        int device, bool tree_mode, int head_dim, int n_head, int n_head_kv,
+        enum ggml_type k_type, enum ggml_type v_type, int block_size);
 
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);

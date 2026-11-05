@@ -44,6 +44,7 @@ struct TreeMetadata {
     std::vector<int32_t> parent_ids;
     std::vector<int32_t> tree_sizes;
     int ar_rows = 0;
+    bool chain = false;   // every tree is a chain (parent n-1): build the chain op, which the WMMA route may take
 };
 
 int clamped_seq_len(const TestCase & test_case, int seq) {
@@ -382,7 +383,7 @@ bool run_case(ggml_backend_t backend,
     const int max_kv_seq_len = *std::max_element(
         test_case.kv_seq_lens.begin(), test_case.kv_seq_lens.end());
     ggml_tensor * output = tree
-        ? ggml_paged_attn_ext_tree(
+        ? (tree->chain ? ggml_paged_attn_ext_chain : ggml_paged_attn_ext_tree)(
             ctx, q, k, v, table, kv_seq_lens, active,
             positions, scale, BLOCK_SIZE, max_kv_seq_len, parents, sizes,
             tree_scratch_base, tree->scratch_stride)
@@ -618,6 +619,15 @@ void run_tree_case() {
                    &tree_slot_ids, nullptr, &tree_metadata));
     CHECK(run_case(backend, tree_case, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
                    &tree_slot_ids, nullptr, &tree_metadata));
+    // The same chains through the chain op (the WMMA route on gfx1201).
+    TreeMetadata chain_metadata = tree_metadata;
+    chain_metadata.chain = true;
+    for (const auto & kv : {std::make_pair(GGML_TYPE_F16, GGML_TYPE_F16),
+                            std::make_pair(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0),
+                            std::make_pair(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)}) {
+        CHECK(run_case(backend, tree_case, kv.first, kv.second,
+                       &tree_slot_ids, nullptr, &chain_metadata));
+    }
     ggml_backend_free(backend);
 }
 
@@ -640,6 +650,12 @@ void run_mixed_tree_case() {
     query_positions.insert(query_positions.end(), 16, -1);
     CHECK(run_case(backend, mixed_case, GGML_TYPE_F16, GGML_TYPE_F16,
                    &query_slots, &query_positions, &tree_metadata));
+    TreeMetadata chain_metadata = tree_metadata;
+    chain_metadata.chain = true;
+    CHECK(run_case(backend, mixed_case, GGML_TYPE_F16, GGML_TYPE_F16,
+                   &query_slots, &query_positions, &chain_metadata));
+    CHECK(run_case(backend, mixed_case, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                   &query_slots, &query_positions, &chain_metadata));
     ggml_backend_free(backend);
 }
 
@@ -676,6 +692,10 @@ void run_gapped_chain_case(const TestCase & test_case, int width,
             slot_ids.push_back(s);
         }
     }
+    for (const auto & kv : kv_types) {
+        CHECK(run_case(backend, test_case, kv.first, kv.second, &slot_ids, nullptr, &meta));
+    }
+    meta.chain = true;   // the same gapped chains through the chain op
     for (const auto & kv : kv_types) {
         CHECK(run_case(backend, test_case, kv.first, kv.second, &slot_ids, nullptr, &meta));
     }
@@ -1144,8 +1164,8 @@ std::vector<float> run_chain_or_ar(ggml_backend_t backend, ggml_type kv_type, co
     }
     const float scale = 1.0f / std::sqrt((float) D);
     ggml_tensor * output = chain
-        ? ggml_paged_attn_ext_tree(ctx, q, k, v, table, seq_lens, active, nullptr, scale, BLOCK_SIZE,
-                                   max_kv_seq_len, parents, sizes, p.scratch_base, p.scratch_stride)
+        ? ggml_paged_attn_ext_chain(ctx, q, k, v, table, seq_lens, active, nullptr, scale, BLOCK_SIZE,
+                                    max_kv_seq_len, parents, sizes, p.scratch_base, p.scratch_stride)
         : ggml_paged_attn_ext(ctx, q, k, v, table, seq_lens, active, nullptr, scale, BLOCK_SIZE,
                               max_kv_seq_len);
     ggml_set_output(output);
