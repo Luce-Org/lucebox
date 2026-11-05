@@ -1101,6 +1101,7 @@ struct QwenGraphInputs {
     int  tree_width = 0;
     int  tree_scratch_base = 0;
     int  tree_scratch_stride = 0;
+    bool tree_is_chain = false;   // every tree is a chain (parent n-1): the paged op may take the AR route
     // Capture the LAST token's post-RoPE/post-rotation Q per full-attention
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.

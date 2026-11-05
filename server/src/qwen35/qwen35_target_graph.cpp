@@ -1311,7 +1311,10 @@ static ggml_tensor * build_full_attn_block(
     int tree_width = 0,
     int tree_scratch_base = 0,
     int tree_scratch_stride = 0,
-    int paged_logical_max_ctx = 0
+    int paged_logical_max_ctx = 0,
+    // The packed tree is a chain (node n's parent is n-1): the paged op may
+    // take the autoregressive attention route.
+    bool paged_tree_is_chain = false
 ) {
     const int head_dim = w.n_embd_head_k;
     const int n_head = w.n_head;
@@ -1503,7 +1506,7 @@ static ggml_tensor * build_full_attn_block(
         const int launch_len =
             (int)std::min<int64_t>(padded, logical_capacity);
         ggml_tensor * out = paged_tree
-            ? ggml_paged_attn_ext_tree(
+            ? (paged_tree_is_chain ? ggml_paged_attn_ext_chain : ggml_paged_attn_ext_tree)(
                 ctx, q, cache_k, cache_v, paged_block_table,
                 paged_kv_seq_lens, row_seq_ids, row_positions, kq_scale,
                 PAGED_BLOCK_SIZE, launch_len,
@@ -2692,7 +2695,8 @@ QwenGraphOutputs build_qwen35_graph(
                                             in.tree_width,
                                             in.tree_scratch_base,
                                             in.tree_scratch_stride,
-                                            cache.max_ctx);
+                                            cache.max_ctx,
+                                            in.tree_is_chain);
             }
             if (want_q_stage && q_fa) {
                 // Every row's query, [head_dim, n_tokens, n_head] permuted to

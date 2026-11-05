@@ -982,6 +982,7 @@ bool build_target_step_paged_tree(
     gi.tree_width = tree_width;
     gi.tree_scratch_base = tree_scratch_base;
     gi.tree_scratch_stride = tree_scratch_stride;
+    gi.tree_is_chain = true;   // the fixed-chain verify: the engine feeds parent n-1 for every node
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
