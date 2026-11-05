@@ -5896,6 +5896,22 @@ TEST_CASE(ServerUnitFixture, test_forced_tools_pin_yields_to_deepen_after_restor
         boundaries, 100, 0, false, 110));
 }
 
+// The concurrent engines do not yet chunk at plan.restore_points, so a
+// restored shared prefix would not match a cold run: `auto` resolves to
+// `freeze` there unless the user typed it.
+TEST_CASE(ServerUnitFixture, test_shared_prefix_default_is_freeze_on_the_concurrent_path) {
+    using M = SharedPrefixMode;
+    for (const bool given : {false, true}) {
+        for (const M mode : {M::off, M::freeze, M::learn}) {
+            TEST_ASSERT(effective_shared_prefix_mode(given, mode, /*concurrent=*/false) == mode);
+        }
+    }
+    TEST_ASSERT(effective_shared_prefix_mode(false, M::learn, true) == M::freeze);
+    TEST_ASSERT(effective_shared_prefix_mode(true, M::learn, true) == M::learn);
+    TEST_ASSERT(effective_shared_prefix_mode(true, M::freeze, true) == M::freeze);
+    TEST_ASSERT(effective_shared_prefix_mode(true, M::off, true) == M::off);
+}
+
 TEST_CASE(ServerUnitFixture, test_shared_prefix_mode_and_head_preference) {
     SharedPrefixMode mode = SharedPrefixMode::off;
     TEST_ASSERT(parse_shared_prefix_mode("auto", mode) && mode == SharedPrefixMode::learn);
