@@ -4426,7 +4426,6 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 
- #ifndef GGML_USE_HIP
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_TQ3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_TQ3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_TQ3_0)
@@ -4437,14 +4436,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_BF16)
-#endif // GGML_USE_HIP
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
-#ifndef GGML_USE_HIP
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_TQ3_0)
-#endif // GGML_USE_HIP
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
@@ -4588,16 +4584,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const bool tq3_any = (K->type == GGML_TYPE_TQ3_0 || V->type == GGML_TYPE_TQ3_0);
         // VEC dispatch can handle TQ3 only at SWA-shaped decode and only when
         // the actual vector-kernel constraints hold. Everything else still
-        // routes to CHUNKED.
-#ifndef GGML_USE_HIP
+        // routes to CHUNKED. The same shape gate applies on HIP: the TQ3 vec
+        // kernels are compiled there too (ggml-hip globs fattn-vec*.cu under
+        // GGML_CUDA_FA_ALL_QUANTS), so this is dispatch, not availability.
         const bool tq3_can_vec = (Q->ne[1] == 1) && (Q->ne[0] <= 256) &&
             (Q->ne[0] % 64 == 0) && (K->ne[1] % FATTN_KQ_STRIDE == 0);
-#else
-        const bool tq3_can_vec = false;
-#endif // GGML_USE_HIP
         const bool tq3_needs_chunked = tq3_any && !tq3_can_vec;
         if ((chunked_threshold > 0 && K->ne[1] > chunked_threshold) || tq3_needs_chunked) {
-            if (Q->type == GGML_TYPE_F32 && kv_supported && mask != nullptr) {
+            // On HIP TQ3 has no VEC kernel, so tq3_needs_chunked is always true
+            // and CHUNKED is the only TQ3 route. The qwen35 decode graph passes
+            // no causal mask for single-query attention, and fattn-chunked
+            // handles a null mask (mask_stride 0), so only the optional
+            // LUCE_CHUNKED_THRESHOLD route keeps the mask requirement.
+            const bool chunked_mask_ok = tq3_needs_chunked ? true : mask != nullptr;
+            if (Q->type == GGML_TYPE_F32 && kv_supported && chunked_mask_ok) {
                 return BEST_FATTN_KERNEL_CHUNKED;
             }
         }
