@@ -15434,6 +15434,7 @@ struct DiskPayloadBackend : MockBackend {
     std::vector<int> freed;
     std::vector<int> adopted;
     int live_position = 0;  // what snapshot_save() captures
+    bool pooled = false;    // report every payload as a KVFlash pager blob
 
     static Payload make(int pos) {
         ggml_init_params ip{};
@@ -15490,6 +15491,7 @@ struct DiskPayloadBackend : MockBackend {
         ref.buf = it->second.buf;
         ref.cur_pos = it->second.pos;
         ref.last_tok = 7;
+        ref.pooled = pooled;
         return ref;
     }
     bool snapshot_adopt(int slot, ggml_context * ctx, ggml_backend_buffer_t buf,
@@ -15730,6 +15732,42 @@ TEST_CASE(ServerUnitFixture, test_shared_prefix_pinned_on_restore_by_another_con
         TEST_ASSERT(SchedulerTestHarness::unpin(server, pin_id));
         TEST_ASSERT(!SchedulerTestHarness::unpin(server, pin_id));
         TEST_ASSERT(SchedulerTestHarness::pins(server).size() == 0);
+    }
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+
+// A pooled (KVFlash) payload cannot be written to disk, so another
+// conversation restoring it must not leave a pin: it would never get a file
+// and would be warmed again after every restart. A dense one still pins.
+TEST_CASE(ServerUnitFixture, test_shared_prefix_pooled_entry_is_not_pinned) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_shared_prefix_pooled").string();
+    const std::vector<int32_t> first = {1, 100, 3, 101};
+    PrefixCache markers_only(1, tokenizer, 0);
+    const int cut = find_all_boundaries({1, 100, 3, 101, 4, 102}, markers_only.chat_markers()).front();
+    for (const bool pooled : {true, false}) {
+        rm_rf(dir);
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        auto & backend = *backend_owner;
+        backend.pooled = pooled;
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, disk_session_config(dir));
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        backend.slots[0] = DiskPayloadBackend::make(cut);
+        cache.confirm_inline_snap(0, cut, first, /*protect=*/true, 64);
+        SchedulerTestHarness::set_slot_tokens(server, 0, std::vector<int32_t>(first.begin(), first.begin() + cut));
+        // Another conversation restores the shared prefix.
+        const auto other = SchedulerTestHarness::prepare_cache(server, {1, 100, 3, 201, 4, 202});
+        TEST_ASSERT(other.restore_slot == 0);
+        // Not even pending: a pooled entry is never written, so never pinned.
+        TEST_ASSERT(cache.pinned(0) == !pooled);
+        SchedulerTestHarness::flush_pins(server);
+        TEST_ASSERT(cache.pinned(0) == !pooled);
+        TEST_ASSERT(SchedulerTestHarness::pins(server).size() == (pooled ? 0u : 1u));
+        SchedulerTestHarness::flush_sessions(server);
     }
     rm_rf(dir);
     unlink(path.c_str());
