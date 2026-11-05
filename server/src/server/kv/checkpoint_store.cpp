@@ -48,6 +48,10 @@ int BackendCheckpoints::position(Checkpoint checkpoint) const {
     return checkpoint.valid() ? backend_.snapshot_cur_pos(checkpoint.cache_slot()) : 0;
 }
 
+CheckpointKind BackendCheckpoints::kind(Checkpoint checkpoint) const {
+    return ref(checkpoint).pooled ? CheckpointKind::pooled : CheckpointKind::dense;
+}
+
 void BackendCheckpoints::free(Checkpoint checkpoint) {
     if (checkpoint.valid()) backend_.snapshot_free(checkpoint.cache_slot());
 }

@@ -111,6 +111,7 @@ public:
     bool prefill_cuts_at_restore_points() const override { return false; }
     size_t estimate_bytes(int) const override { return 0; }
     bool used(Checkpoint) const override { return false; }
+    CheckpointKind kind(Checkpoint) const override { return CheckpointKind::dense; }
     int position(Checkpoint) const override { return 0; }
     void free(Checkpoint) override {}
     Checkpoint staging() const override { return {}; }
