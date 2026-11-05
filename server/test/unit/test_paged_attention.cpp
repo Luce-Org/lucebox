@@ -1027,19 +1027,11 @@ TEST_CASE(PagedAttention, RowOutputBitsIndependentOfBatch) {
     for (ggml_type kv_type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
         for (bool holes : {false, true}) {
             for (int a_len : {70000, 20480, 4096}) {
-                size_t wmma = 0;
                 const int mismatches =
-                    invariance_mismatches(backend, kv_type, a_len, holes, &wmma);
-                // The V_DOT2 decode route still cuts by its occupancy floor
-                // (min_partitions from n_rows, launch_paged_attn_v) until the
-                // context term dominates: on the 3090 every batch shape changes
-                // A's bits at 4K and 20K, none at 70K. Gated where it holds;
-                // the WMMA route must hold at every length.
-                if (wmma == 0 && a_len < 70000) {
-                    std::printf("paged attention invariance: V_DOT2 route, %d mismatches at A=%d not gated\n",
-                                mismatches, a_len);
-                    continue;
-                }
+                    invariance_mismatches(backend, kv_type, a_len, holes, nullptr);
+                // Both routes (WMMA on gfx12, V_DOT2 on the 3090 and with
+                // LUCE_PAGED_WMMA=0) cut the context at fixed absolute blocks,
+                // so every length and batch shape must reproduce A's bits.
                 CHECK_EQUAL(0, mismatches);
             }
         }
