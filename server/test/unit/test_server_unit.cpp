@@ -55,6 +55,7 @@
 #include "pflash/pflash_drafter.h"
 #include "qwen3_model.h"
 #include "pflash/pflash_compress.h"
+#include "pflash/pflash_window.h"
 #include "luce.h"
 #include "gguf.h"
 #include <nlohmann/json.hpp>
@@ -13562,6 +13563,122 @@ TEST_CASE(ServerUnitFixture, test_compress_batch_default_preserves_order) {
     TEST_ASSERT(results[0].compressed_ids == std::vector<int32_t>({11}));
     TEST_ASSERT(results[1].compressed_ids == std::vector<int32_t>({21}));
     TEST_ASSERT(results[2].compressed_ids == std::vector<int32_t>({31}));
+}
+
+// The shared PFlash window (pflash_window.h): what every backend's
+// compress_batch runs, checked through its hooks without a GPU or a drafter.
+struct PFlashWindowProbe {
+    int drains = 0, parks = 0, unparks = 0, releases = 0;
+    bool park_ok = true;
+    PFlashWindow window() {
+        PFlashWindow w;
+        w.tag = "test-pflash";
+        w.drain = [this] { ++drains; };
+        w.park = [this] { ++parks; return park_ok; };
+        w.unpark = [this] { ++unparks; return true; };
+        w.release = [this] { ++releases; };
+        return w;
+    }
+};
+
+static ModelBackend::CompressRequest pflash_window_request(const char * drafter) {
+    ModelBackend::CompressRequest request;
+    request.input_ids = {1, 2, 3};
+    request.keep_ratio = 0.5f;
+    request.drafter_path = drafter;
+    return request;
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_window_skips_unscorable_requests) {
+    PFlashWindowProbe probe;
+    DrafterContext drafter;
+    bool loaded = false;
+    ModelBackend::CompressRequest empty;
+    auto bad_ratio = pflash_window_request("/nonexistent/drafter.gguf");
+    bad_ratio.keep_ratio = std::numeric_limits<float>::quiet_NaN();
+    const auto results = pflash_compress_batch(drafter, loaded, {empty, bad_ratio}, probe.window());
+    TEST_ASSERT(results.size() == 2 && !results[0].ok && !results[1].ok);
+    TEST_ASSERT(probe.drains == 0 && probe.parks == 0 && probe.unparks == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_window_failed_park_scores_nothing) {
+    PFlashWindowProbe probe;
+    probe.park_ok = false;
+    DrafterContext drafter;
+    bool loaded = false;
+    const auto results = pflash_compress_batch(
+        drafter, loaded, {pflash_window_request("/nonexistent/drafter.gguf")}, probe.window());
+    TEST_ASSERT(results.size() == 1 && !results[0].ok);
+    TEST_ASSERT(probe.drains == 1 && probe.parks == 1 && probe.unparks == 0);
+    TEST_ASSERT(!loaded && drafter.backend == nullptr);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_window_failed_load_frees_backend_and_unparks) {
+    PFlashWindowProbe probe;
+    DrafterContext drafter;
+    // A supplied CPU backend runs the real load failure without a GPU.
+    drafter.backend = ggml_backend_cpu_init();
+    drafter.gpu = 0;
+    TEST_ASSERT(drafter.backend != nullptr);
+    bool loaded = false;
+    const auto results = pflash_compress_batch(
+        drafter, loaded, {pflash_window_request("/nonexistent/drafter.gguf")}, probe.window());
+    TEST_ASSERT(results.size() == 1 && !results[0].ok);
+    TEST_ASSERT(probe.parks == 1 && probe.unparks == 1);
+    TEST_ASSERT(!loaded && drafter.backend == nullptr && drafter.gpu == -1);
+    free_drafter(drafter);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_window_reloads_another_drafter) {
+    PFlashWindowProbe probe;
+    DrafterContext drafter;
+    // A drafter "loaded" from another file is released before this load.
+    drafter.path = "/other/drafter.gguf";
+    drafter.gpu = 0;
+    bool loaded = true;
+    auto window = probe.window();
+    window.release = [&] { ++probe.releases; free_drafter(drafter); loaded = false; };
+    auto request = pflash_window_request("/nonexistent/drafter.gguf");
+    request.skip_park = true;
+    const auto results = pflash_compress_batch(drafter, loaded, {request}, window);
+    TEST_ASSERT(results.size() == 1 && !results[0].ok);
+    TEST_ASSERT(probe.releases == 1);
+    TEST_ASSERT(probe.parks == 0 && probe.unparks == 0);
+    TEST_ASSERT(!loaded);
+    free_drafter(drafter);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_window_splits_mixed_batches) {
+    PFlashWindowProbe probe;
+    DrafterContext drafter;
+    bool loaded = false;
+    auto parked = pflash_window_request("/nonexistent/a.gguf");
+    auto beside = pflash_window_request("/nonexistent/a.gguf");
+    beside.skip_park = true;
+    const auto results = pflash_compress_batch(drafter, loaded, {parked, beside}, probe.window());
+    TEST_ASSERT(results.size() == 2 && !results[0].ok && !results[1].ok);
+    // One window each; only the first parks.
+    TEST_ASSERT(probe.drains == 2 && probe.parks == 1 && probe.unparks == 1);
+    free_drafter(drafter);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_parse_compress_line) {
+    const std::string ids_path = test_tmp_path("luce_test_pflash_parse_ids.bin").string();
+    remove_test_path(ids_path);
+    TEST_ASSERT(write_int32_file(ids_path, {7, 8, 9}));
+    ModelBackend::CompressRequest request;
+    TEST_ASSERT(pflash_parse_compress_line("compress " + ids_path + " 250 /a drafter.gguf nopark", request));
+    TEST_ASSERT(request.input_ids == std::vector<int32_t>({7, 8, 9}));
+    TEST_ASSERT(std::abs(request.keep_ratio - 0.25f) < 1e-6f);
+    TEST_ASSERT(request.drafter_path == "/a drafter.gguf" && request.skip_park);
+    TEST_ASSERT(request.drafter_gpu == 0 &&
+                request.residency_action == DraftResidencyAction::KeepLoaded);
+    TEST_ASSERT(pflash_parse_compress_line("compress " + ids_path + " 250 nopark", request));
+    TEST_ASSERT(request.drafter_path.empty() && request.skip_park);
+    TEST_ASSERT(pflash_parse_compress_line("compress " + ids_path + " 250", request));
+    TEST_ASSERT(request.drafter_path.empty() && !request.skip_park);
+    TEST_ASSERT(!pflash_parse_compress_line("compress " + ids_path, request));
+    remove_test_path(ids_path);
 }
 
 struct MockMemoryOnlySnapshotBackend : MockBackend {

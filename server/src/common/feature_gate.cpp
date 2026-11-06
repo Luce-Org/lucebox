@@ -318,6 +318,13 @@ std::string check_feature_compatibility(
         return "--max-concurrency must be at least 1";
     }
     if (args.max_concurrency > 1) {
+        // Concurrent serving compresses on the scheduler's PFlash thread,
+        // which only dense Qwen3.5 has; any other model would serve every
+        // prompt uncompressed.
+        if (admission.pflash_enabled && arch != "qwen35") {
+            return "PFlash prefill compression with --max-concurrency > 1 is "
+                   "supported only for dense Qwen3.5 (use --max-concurrency 1)";
+        }
         if (!args.paged_attention) {
             if (arch != "qwen4exp")
                 return "--max-concurrency requires --paged-attention";

@@ -16,6 +16,7 @@
 #include "qwen35/prefill_helpers.h"
 #include "pflash/pflash_drafter.h"
 #include "pflash/pflash_compress.h"
+#include "pflash/pflash_window.h"
 #include "pflash/kvflash_drafter_scorer.h"
 #include "kv_quant.h"
 
@@ -1388,38 +1389,7 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
         std::fprintf(stderr, "[target-split][compress] drafter ready\n");
     }
 
-    // score_query_end < 0 is the legacy "tail window" request value; the
-    // qwen35 scorer requires an explicit end.
-    const int score_query_end = req.score_query_end >= 0
-        ? req.score_query_end : (int)req.input_ids.size();
-    result.compressed_ids = drafter_score_and_compress(
-        pflash_drafter_, req.input_ids, req.keep_ratio,
-        /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
-        score_query_end, req.required_instruction_spans,
-        req.query_suffix_candidates, req.history_query_spans,
-            req.turn_query_span, req.extra_query_spans, &req.request_messages,
-            req.keep_query_spans);
-    result.ok = !result.compressed_ids.empty();
-    if (result.ok) result.kept_spans = pflash_last_kept_spans();
-    if (result.ok) {
-        const auto & scoring = pflash_last_scoring_stats();
-        result.scorer_resume = scoring.resume;
-        result.scorer_new_tokens = scoring.new_tokens;
-        result.scorer_forward_s = scoring.forward_s;
-        const auto & stage2 = pflash_last_stage2_outcome();
-        result.budget_widened = stage2.widened;
-        result.raw_fits = stage2.raw_fits;
-        result.stage2_budget = stage2.budget;
-        result.stage2_budget_widened = stage2.budget_widened;
-        const auto & spread = pflash_last_relevance_spread();
-        result.spread_valid = spread.valid;
-        result.spread = spread.spread;
-        result.spread_k = spread.k;
-        for (const auto & candidate : pflash_last_candidate_lifts()) {
-            result.candidate_lifts.push_back({candidate.span, candidate.lift});
-        }
-        result.probe_pins = pflash_last_probe_pins();
-    }
+    result = pflash_score(pflash_drafter_, req);
     if (result.ok) {
         std::fprintf(stderr, "[target-split][compress] %zu -> %zu tokens\n",
                      req.input_ids.size(), result.compressed_ids.size());

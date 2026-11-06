@@ -29,6 +29,7 @@
 #include "qwen35_tensor_parallel.h"
 #include "pflash/pflash_drafter.h"
 #include "pflash/pflash_compress.h"
+#include "pflash/pflash_window.h"
 #include "pflash/kvflash_drafter_scorer.h"
 
 #include "ggml-cuda.h"
@@ -1597,73 +1598,29 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
 
 std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
         const std::vector<CompressRequest> & requests) {
-    std::vector<CompressResult> results(requests.size());
-    if (requests.empty()) return results;
-
-    const CompressRequest * load_request = nullptr;
-    for (const auto & request : requests) {
-        if (request.input_ids.empty() || request.drafter_path.empty()) continue;
-        if (load_request == nullptr) {
-            load_request = &request;
-        } else if (request.drafter_path != load_request->drafter_path ||
-                   request.drafter_gpu != load_request->drafter_gpu ||
-                   request.skip_park != load_request->skip_park ||
-                   request.residency_action != load_request->residency_action) {
-            // A residency window can host only one drafter. Preserve the base
-            // API's per-request behavior for heterogeneous batches.
-            return ModelBackend::compress_batch(requests);
-        }
-    }
-    if (load_request == nullptr) return results;
-    const bool should_park = !load_request->skip_park;
-    const bool release_after_use =
-        load_request->residency_action == DraftResidencyAction::ReleaseAfterUse;
-
-    // Park target+draft to free VRAM for the drafter (unless skip_park).
-    // A request may compress several messages. Keep this residency window
-    // around the whole batch so they do not reload all three models
-    // independently.
-    const bool was_target_parked = target_parked_;
-    const bool was_draft_parked  = draft_parked_;
-    if (should_park) {
+    // Parking frees the target and draft models for the drafter. Only
+    // parking needs their queued work drained: a drafter beside resident
+    // models allocates its own memory, and concurrent serving scores on a
+    // thread of its own while the scheduler keeps the target busy.
+    bool was_target_parked = false;
+    bool was_draft_parked = false;
+    PFlashWindow window;
+    window.park = [&] {
+        was_target_parked = target_parked_;
+        was_draft_parked = draft_parked_;
         step_graph_destroy(sg_);
         if (!target_parked_) park(ParkTarget::TargetModel);
         if (!draft_parked_)  park(ParkTarget::DraftModel);
-    }
-
-    // Synchronize all backends to flush any outstanding async CUDA work
-    // before loading the drafter. Without this, pending operations on
-    // target/draft streams can corrupt the drafter's allocations. Only
-    // parking frees their memory: a drafter beside resident models
-    // allocates its own, and concurrent serving scores on a thread of its
-    // own while the scheduler keeps the target busy.
-    if (should_park) {
         ggml_backend_synchronize(target_backend_);
         if (draft_backend_) ggml_backend_synchronize(draft_backend_);
-    }
-
-    // Load drafter with its OWN backend (not target_backend_).
-    // Matches test_dflash.cpp: separate backend supports multi-GPU
-    // (drafter on GPU A, target on GPU B or CPU).
-    // The drafter stays loaded across compress calls — only the first call
-    // creates the backend + loads weights; subsequent calls reuse them.
-    if (!drafter_loaded_) {
-        // drafter_ctx_.backend == nullptr → load_drafter creates its own
-        std::fprintf(stderr, "[compress] loading drafter from %s ...\n",
-                     load_request->drafter_path.c_str());
-        if (!load_drafter(load_request->drafter_path, /*gpu_layers=*/999,
-                          load_request->drafter_gpu, drafter_ctx_)) {
-            std::fprintf(stderr, "[compress] drafter init failed: %s\n",
-                         luce_last_error());
-            if (should_park) {
-                if (!was_target_parked) unpark(ParkTarget::TargetModel);
-                if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
-            }
-            return results;
-        }
-        drafter_loaded_ = true;
-        drafter_ctx_.engine_max_ctx = cfg_.device.max_ctx;   // scoring sessions are never sized past it
-        std::fprintf(stderr, "[compress] drafter ready\n");
+        return true;
+    };
+    window.unpark = [&] {
+        if (!was_target_parked) unpark(ParkTarget::TargetModel);
+        if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
+        return true;
+    };
+    window.loaded = [this] {
         // pflash + kvflash synergy: the drafter doubles as the pool's
         // Memory Indexer (tau-step reselect). Pager stays LRU without it.
         if (kvflash_active() && !kvflash_scorer_) {
@@ -1671,106 +1628,25 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
             std::fprintf(stderr, "[kvflash] drafter scorer attached (tau=%d)\n",
                          kvflash_tau_);
         }
-    }
-
-    for (size_t index = 0; index < requests.size(); ++index) {
-        const auto & request = requests[index];
-        if (request.input_ids.empty() || request.drafter_path.empty()) continue;
-
-        auto & result = results[index];
-        // score_query_end < 0 is the legacy "tail window" request value;
-        // the qwen35 scorer requires an explicit end.
-        const int score_query_end = request.score_query_end >= 0
-            ? request.score_query_end : (int)request.input_ids.size();
-        result.compressed_ids = drafter_score_and_compress(
-            drafter_ctx_, request.input_ids, request.keep_ratio,
-            /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
-            score_query_end, request.required_instruction_spans,
-            request.query_suffix_candidates, request.history_query_spans,
-            request.turn_query_span, request.extra_query_spans,
-            &request.request_messages, request.keep_query_spans);
-        result.ok = !result.compressed_ids.empty();
-        if (result.ok) result.kept_spans = pflash_last_kept_spans();
-        if (result.ok) {
-            const auto & scoring = pflash_last_scoring_stats();
-            result.scorer_resume = scoring.resume;
-            result.scorer_new_tokens = scoring.new_tokens;
-            result.scorer_forward_s = scoring.forward_s;
-            const auto & stage2 = pflash_last_stage2_outcome();
-            result.budget_widened = stage2.widened;
-            result.raw_fits = stage2.raw_fits;
-            result.stage2_budget = stage2.budget;
-            result.stage2_budget_widened = stage2.budget_widened;
-            const auto & spread = pflash_last_relevance_spread();
-            result.spread_valid = spread.valid;
-            result.spread = spread.spread;
-            result.spread_k = spread.k;
-            for (const auto & candidate : pflash_last_candidate_lifts()) {
-                result.candidate_lifts.push_back({candidate.span, candidate.lift});
-            }
-            result.probe_pins = pflash_last_probe_pins();
-        }
-        if (result.ok) {
-            std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
-                         request.input_ids.size(), result.compressed_ids.size());
-        }
-    }
-
-    if (release_after_use) {
-        // Scoring sessions outlive the release in host RAM; the next scoring
-        // call restores them once the drafter is loaded again.
-        if (drafter_loaded_) luce::common::drafter_offload_sessions(drafter_ctx_);
-        free_drafter();
-    } else if (drafter_loaded_ && drafter_ctx_.backend &&
-               drafter_ctx_.backend != target_backend_ &&
-               drafter_ctx_.backend != draft_backend_) {
-        // A resident drafter owns its backend: on non-VMM devices that
-        // backend's pool keeps every operator temporary of the last scoring
-        // run (GiBs after a long prompt) until it is trimmed, and
-        // release_scratch() trims only the target and draft pools. Scoring
-        // sessions are tensors of their own and are unaffected.
-        const char * keep = std::getenv("PFLASH_DRAFTER_TRIM_POOL");
-        if (!(keep && std::string(keep) == "0")) {
-            const size_t trimmed = ggml_backend_cuda_trim_pool(drafter_ctx_.backend);
-            std::fprintf(stderr, "[compress] trimmed %.1f MiB from the drafter pool\n",
-                         trimmed / (1024.0 * 1024.0));
-        }
-    }
-
-    // Restore park state
-    if (should_park) {
-        if (!was_target_parked) unpark(ParkTarget::TargetModel);
-        if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
-    }
-
-    return results;
+    };
+    window.release = [this] { free_drafter(); };
+    window.shared_backends = {target_backend_, draft_backend_};
+    window.engine_max_ctx = cfg_.device.max_ctx;
+    return pflash_compress_batch(drafter_ctx_, drafter_loaded_, requests, window);
 }
 
 bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & io) {
     materialize_live_snapshot();
     live_snapshot_slot_ = -1;
-    // Check for "nopark" suffix (must be a separate token, not part of a path)
-    bool skip_park = (line.size() >= 16 &&
-                      line.compare(line.size() - 7, 7, " nopark") == 0);
-
-    // Parse: "compress <path> <keep_x1000> <drafter_gguf> [nopark]"
-    char ppath[1024];
-    int  keep_x1000 = 0;
-    char drafter_path[1024] = {0};
-    const int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s",
-                               ppath, &keep_x1000, drafter_path);
-    if (n < 2) {
+    CompressRequest req;
+    if (!pflash_parse_compress_line(line, req)) {
         std::fprintf(stderr, "[compress] bad args\n");
         io.emit(-1);
         return false;
     }
-
-    CompressRequest req;
-    req.input_ids = read_int32_file(ppath);
-    req.keep_ratio = (float)keep_x1000 / 1000.0f;
-    req.drafter_path = (n >= 3 && drafter_path[0])
-        ? drafter_path
-        : "/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf";
+    if (req.drafter_path.empty()) {
+        req.drafter_path = "/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf";
+    }
     {
         size_t total_vram = 0;
         int dev = 0;
@@ -1779,8 +1655,8 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
         if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess)
             total_vram = prop.totalGlobalMem;
         const bool allowed = luce::common::skip_park_allowed(
-            skip_park, total_vram, cfg_.device.max_ctx);
-        if (skip_park && !allowed) {
+            req.skip_park, total_vram, cfg_.device.max_ctx);
+        if (req.skip_park && !allowed) {
             std::fprintf(stderr,
                 "[server] --prefill-skip-park downgraded: <32GB GPU with max_ctx>65536"
                 " (VMM VA-fragmentation guard)\n");

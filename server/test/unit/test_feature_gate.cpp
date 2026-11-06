@@ -620,6 +620,15 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     ds4_pflash.paged_attention = true;
     ds4_pflash.max_concurrency = 2;
     CHECK(!gate_result(ds4_pflash, "deepseek4", PlacementBackend::Hip, pflash).empty());
+    // qwen4exp compresses one request at a time: its concurrent slots have no
+    // PFlash thread, so PFlash with more than one slot is refused, not skipped.
+    BackendArgs flash = dense;
+    flash.device.max_ctx = 32768;
+    flash.max_concurrency = 1;
+    CHECK(gate_result(flash, "qwen4exp", PlacementBackend::Hip, pflash).empty());
+    flash.max_concurrency = 2;
+    CHECK(gate_result(flash, "qwen4exp", PlacementBackend::Hip, pflash)
+              .find("--max-concurrency 1") != std::string::npos);
 
     BackendArgs ds4 = gate_args_hip_deepseek4();
     ds4.paged_attention = true;
@@ -819,6 +828,10 @@ void test_model_capability_tables() {
     // deepseek4 is mixture-of-experts but has no hot/cold offload path.
     CHECK(!arch_has_expert_offload("deepseek4"));
     CHECK(arch_supports_pflash_compression("deepseek4"));
+    // The drafter scores for any target: every model Lucebox serves compresses.
+    for (const char * arch : {"qwen35", "qwen3", "qwen4exp", "deepseek4", "deepseek41"}) {
+        CHECK(arch_supports_pflash_compression(arch));
+    }
 
     // Every capability predicate must be false for an architecture the
     // factory cannot build, so no rule can admit an unbuildable model.
@@ -842,7 +855,7 @@ void test_model_capability_tables() {
     CHECK(!arch_supports_paged_attention("qwen35moe", false));
     CHECK(!arch_supports_layer_split("qwen4exp"));
     CHECK(!arch_supports_remote_draft("qwen4exp"));
-    CHECK(!arch_supports_pflash_compression("qwen4exp"));
+    CHECK(arch_supports_pflash_compression("qwen4exp"));
     CHECK(arch_supports_decode_draft("qwen4exp", false));
     CHECK(arch_supports_verify_width("qwen4exp", false));
     CHECK(!arch_supports_decode_draft("qwen4exp", true));

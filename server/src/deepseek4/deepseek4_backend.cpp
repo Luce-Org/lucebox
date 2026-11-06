@@ -22,6 +22,7 @@
 #include "common/sampler.h"
 #include "common/dspark_head.h"
 #include "pflash/pflash_compress.h"
+#include "pflash/pflash_window.h"
 #include "common/moe_hybrid_expert_cache.h"
 #include "common/moe_hybrid_routing_stats.h"
 
@@ -5801,157 +5802,42 @@ ModelBackend::CompressResult DeepSeek4Backend::compress(
 
 std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
         const std::vector<CompressRequest> & requests) {
-    std::vector<CompressResult> results(requests.size());
-    if (requests.empty()) return results;
-
-    const auto valid_request = [](const CompressRequest & request) {
-        return !request.input_ids.empty() && !request.drafter_path.empty() &&
-            std::isfinite(request.keep_ratio) &&
-            request.keep_ratio >= 0.0f && request.keep_ratio <= 1.0f;
-    };
-    const CompressRequest * load_request = nullptr;
-    for (const CompressRequest & request : requests) {
-        if (!valid_request(request)) continue;
-        if (load_request == nullptr) {
-            load_request = &request;
-        } else if (request.drafter_path != load_request->drafter_path ||
-                   request.drafter_gpu != load_request->drafter_gpu ||
-                   request.skip_park != load_request->skip_park ||
-                   request.residency_action != load_request->residency_action) {
-            // A residency window can host only one drafter configuration.
-            // Process heterogeneous batches as independent windows instead of
-            // calling the virtual base fallback, which would recurse through
-            // DeepSeek4Backend::compress().
-            std::vector<CompressResult> independent(requests.size());
-            for (size_t index = 0; index < requests.size(); ++index) {
-                const auto one = compress_batch({requests[index]});
-                if (!one.empty()) independent[index] = one.front();
-            }
-            return independent;
-        }
-    }
-    if (load_request == nullptr) return results;
-
+    bool was_parked = false;
+    PFlashWindow window;
+    window.tag = "deepseek4-pflash";
     // Parking releases target/cache buffers, including the expert backend.
     // Drain their queued work before releasing any of those dependencies.
-    if (backend_) ggml_backend_synchronize(backend_);
-    if (spec_backend_) ggml_backend_synchronize(spec_backend_);
-    if (expert_backend_) ggml_backend_synchronize(expert_backend_);
-    const bool was_parked = parked_;
-    if (!load_request->skip_park && !parked_ &&
-        !park(ParkTarget::TargetModel)) {
-        return results;
-    }
-    if (pflash_drafter_loaded_ &&
-        (pflash_drafter_path_ != load_request->drafter_path ||
-         pflash_drafter_gpu_ != load_request->drafter_gpu)) {
-        release_pflash_drafter();
-    }
-    if (!pflash_drafter_loaded_) {
-        if (!load_drafter(load_request->drafter_path, 999,
-                          load_request->drafter_gpu,
-                          pflash_drafter_ctx_)) {
-            std::fprintf(stderr, "[deepseek4-pflash] load failed: %s\n",
-                         luce_last_error());
-            release_pflash_drafter();
-            if (!load_request->skip_park && !was_parked) {
-                unpark(ParkTarget::TargetModel);
-            }
-            return results;
-        }
-        pflash_drafter_loaded_ = true;
-        pflash_drafter_path_ = load_request->drafter_path;
-        pflash_drafter_gpu_ = load_request->drafter_gpu;
-    }
-
-    for (size_t index = 0; index < requests.size(); ++index) {
-        const CompressRequest & request = requests[index];
-        if (!valid_request(request)) continue;
-        CompressResult & result = results[index];
-        // score_query_end < 0 is the legacy "tail window" request value;
-        // the qwen35 scorer requires an explicit end.
-        const int score_query_end = request.score_query_end >= 0
-            ? request.score_query_end : (int)request.input_ids.size();
-        result.compressed_ids = drafter_score_and_compress(
-            pflash_drafter_ctx_, request.input_ids, request.keep_ratio,
-            /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
-            score_query_end, request.required_instruction_spans,
-            request.query_suffix_candidates, request.history_query_spans,
-            request.turn_query_span, request.extra_query_spans,
-            &request.request_messages);
-        result.ok = !result.compressed_ids.empty();
-        if (result.ok) result.kept_spans = pflash_last_kept_spans();
-        if (result.ok) {
-            const auto & scoring = pflash_last_scoring_stats();
-            result.scorer_resume = scoring.resume;
-            result.scorer_new_tokens = scoring.new_tokens;
-            result.scorer_forward_s = scoring.forward_s;
-            const auto & stage2 = pflash_last_stage2_outcome();
-            result.budget_widened = stage2.widened;
-            result.raw_fits = stage2.raw_fits;
-            result.stage2_budget = stage2.budget;
-            result.stage2_budget_widened = stage2.budget_widened;
-            const auto & spread = pflash_last_relevance_spread();
-            result.spread_valid = spread.valid;
-            result.spread = spread.spread;
-            result.spread_k = spread.k;
-            for (const auto & candidate : pflash_last_candidate_lifts()) {
-                result.candidate_lifts.push_back({candidate.span, candidate.lift});
-            }
-            result.probe_pins = pflash_last_probe_pins();
-        }
-    }
-
-    if (load_request->residency_action ==
-        DraftResidencyAction::ReleaseAfterUse) {
-        release_pflash_drafter();
-    }
-    if (!load_request->skip_park && !was_parked &&
-        !unpark(ParkTarget::TargetModel)) {
-        std::fill(results.begin(), results.end(), CompressResult{});
-    }
-    return results;
+    window.drain = [this] {
+        if (backend_) ggml_backend_synchronize(backend_);
+        if (spec_backend_) ggml_backend_synchronize(spec_backend_);
+        if (expert_backend_) ggml_backend_synchronize(expert_backend_);
+    };
+    window.park = [&] {
+        was_parked = parked_;
+        return parked_ || park(ParkTarget::TargetModel);
+    };
+    window.unpark = [&] { return was_parked || unpark(ParkTarget::TargetModel); };
+    window.release = [this] { release_pflash_drafter(); };
+    window.shared_backends = {backend_, spec_backend_, expert_backend_};
+    return pflash_compress_batch(pflash_drafter_ctx_, pflash_drafter_loaded_, requests, window);
 }
 
 bool DeepSeek4Backend::handle_compress(const std::string & line,
                                        const DaemonIO & io) {
     // Legacy wire format has no GPU/residency fields: retain backend-local
     // GPU 0 and KeepLoaded. HTTP uses the typed API for those controls.
-    std::istringstream iss(line.size() > 9 ? line.substr(9) : std::string{});
-    std::string prompt_path;
-    std::string drafter_path;
-    int keep_x1000 = 0;
-    if (!(iss >> prompt_path >> keep_x1000)) {
+    CompressRequest req;
+    if (!pflash_parse_compress_line(line, req)) {
         std::fprintf(stderr, "[deepseek4-pflash] bad compress arguments\n");
         io.emit(-1);
         return false;
     }
-
-    std::getline(iss >> std::ws, drafter_path);
-    bool skip_park = false;
-    const std::string suffix = " nopark";
-    if (drafter_path.size() > suffix.size() &&
-        drafter_path.compare(drafter_path.size() - suffix.size(),
-                             suffix.size(), suffix) == 0) {
-        skip_park = true;
-        drafter_path.resize(drafter_path.size() - suffix.size());
-    }
-
-    CompressRequest req;
-    req.input_ids = read_int32_file(prompt_path);
-    req.keep_ratio = (float) keep_x1000 / 1000.0f;
-    req.drafter_path = std::move(drafter_path);
-    req.skip_park = skip_park;
     CompressResult result = compress(req);
     if (!result.ok) {
         std::fprintf(stderr, "[deepseek4-pflash] compression failed\n");
         io.emit(-1);
         return false;
     }
-
-    std::printf("[deepseek4-pflash] %zu -> %zu tokens\n",
-                req.input_ids.size(), result.compressed_ids.size());
-    std::fflush(stdout);
     for (int32_t token : result.compressed_ids) io.emit(token);
     io.emit(-1);
     return true;
@@ -5961,8 +5847,6 @@ void DeepSeek4Backend::release_pflash_drafter() {
     // A failed load can own a backend even before the loaded flag is set.
     luce::common::free_drafter(pflash_drafter_ctx_);
     pflash_drafter_loaded_ = false;
-    pflash_drafter_path_.clear();
-    pflash_drafter_gpu_ = -1;
 }
 
 void DeepSeek4Backend::free_drafter() {

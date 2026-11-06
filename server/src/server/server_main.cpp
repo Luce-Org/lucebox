@@ -1660,6 +1660,28 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         bargs.draft_device, model.draft_device_set, bargs.device,
         model.target_device_auto);
 
+    // PFlash beside Qwen3.8-Flash (qwen4exp): the drafter scores each prompt
+    // beside the resident model, which sizes its context and prompt chunk with
+    // the drafter's room kept free on the drafter's GPU: its weights and the
+    // scoring workspace per prompt token measured for concurrent Qwen3.5 (the
+    // same drafter, whatever the target).
+    if (sconfig.pflash && inspect_gguf_model_info(bargs.model_path.c_str()).arch == "qwen4exp") {
+        std::error_code size_error;
+        const auto drafter_bytes =
+            std::filesystem::file_size(sconfig.pflash_drafter_path, size_error);
+        bargs.pflash_reserve_gpu =
+            pflash_drafter_device(bargs.draft_device, model.pflash_drafter_device).gpu;
+        bargs.pflash_reserve_bytes = size_error ? 0 : (long long) drafter_bytes;
+        bargs.pflash_reserve_bytes_per_token = kPFlashScoringBytesPerToken;
+        // Parking would drop and reload the whole model for every prompt.
+        sconfig.pflash_skip_park = true;
+        std::fprintf(stderr,
+            "[server] PFlash: the drafter scores beside the resident model (--prefill-skip-park), which keeps "
+            "%.2f GiB plus %lld KiB per context token free on gpu %d for it\n",
+            bargs.pflash_reserve_bytes / 1073741824.0, kPFlashScoringBytesPerToken / 1024,
+            bargs.pflash_reserve_gpu);
+    }
+
     // Explicit --cache-type-* overrides enter the request here; the qwen35
     // env/default resolution runs inside prepare_backend() once the model
     // architecture is known. Other families still consume their env vars.
@@ -1729,7 +1751,12 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // parallelism, ...) is admitted with PFlash off instead of refused.
     const bool pflash_auto = sconfig.pflash && !model.pflash_set;
     BackendArgs pflash_off_args;
-    if (pflash_auto) pflash_off_args = bargs;
+    if (pflash_auto) {
+        pflash_off_args = bargs;
+        pflash_off_args.pflash_reserve_gpu = -1;   // no drafter to keep room for
+        pflash_off_args.pflash_reserve_bytes = 0;
+        pflash_off_args.pflash_reserve_bytes_per_token = 0;
+    }
     BackendPreparation backend_preparation = [&]() -> BackendPreparation {
         BackendPreparation first = prepare_backend(std::move(bargs), backend_admission);
         const auto * failure = std::get_if<BackendPreparationFailure>(&first);

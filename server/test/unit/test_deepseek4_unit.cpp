@@ -3827,8 +3827,8 @@ static void test_dspark_park_all_releases_drafter() {
     backend.spec_drafter_ = std::make_unique<DSparkDrafter>();
     backend.spec_enabled_ = true;
     backend.pflash_drafter_loaded_ = true;
-    backend.pflash_drafter_path_ = "/tmp/ds4-pflash-fixture.gguf";
-    backend.pflash_drafter_gpu_ = 1;
+    backend.pflash_drafter_ctx_.path = "/tmp/ds4-pflash-fixture.gguf";
+    backend.pflash_drafter_ctx_.gpu = 1;
 
     TEST_ASSERT(backend.park(ParkTarget::All));
     TEST_ASSERT(backend.parked_);
@@ -3836,8 +3836,8 @@ static void test_dspark_park_all_releases_drafter() {
     TEST_ASSERT(!backend.spec_enabled_);
     TEST_ASSERT(backend.spec_drafter_parked_);
     TEST_ASSERT(!backend.pflash_drafter_loaded_);
-    TEST_ASSERT(backend.pflash_drafter_path_.empty());
-    TEST_ASSERT(backend.pflash_drafter_gpu_ == -1);
+    TEST_ASSERT(backend.pflash_drafter_ctx_.path.empty());
+    TEST_ASSERT(backend.pflash_drafter_ctx_.gpu == -1);
 
     backend.free_drafter();
     TEST_ASSERT(backend.spec_drafter_ == nullptr);

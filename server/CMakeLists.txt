@@ -603,6 +603,7 @@ add_library(luce_common STATIC
     src/pflash/pflash_ident_query.cpp
     src/pflash/pflash_drafter.cpp
     src/pflash/pflash_compress.cpp
+    src/pflash/pflash_window.cpp
     src/pflash/qwen35_drafter.cpp
     src/pflash/qwen35_loader.cpp
     src/pflash/kvflash_drafter_scorer.cpp
