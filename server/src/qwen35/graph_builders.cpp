@@ -383,7 +383,8 @@ bool build_target_step(
     const QwenPrefillSegment * prefill_segments,
     int n_prefill_segments,
     int n_logits_rows,
-    bool compact_slots) {
+    bool compact_slots,
+    int top_n) {
     step_graph_free(sg);
 
     // Compact n_seqs is a decode graph bucket width, not the physical
@@ -687,6 +688,19 @@ bool build_target_step(
     ggml_set_name(sg.argmax_tokens, "chain_verify_argmax");
     ggml_set_output(sg.argmax_tokens);
     ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+
+    // Each row's top candidates, for a sampled verify under a top_k: the host
+    // draws from these few logits instead of reading the whole row.
+    if (top_n > 0 && top_n < sg.logits->ne[0] && ggml_is_contiguous(sg.logits)) {
+        sg.top_ids = ggml_top_k(sg.ctx, sg.logits, top_n);
+        sg.top_vals = ggml_get_rows(sg.ctx,
+            ggml_reshape_3d(sg.ctx, sg.logits, 1, sg.logits->ne[0], sg.logits->ne[1]),
+            sg.top_ids);
+        ggml_set_output(sg.top_ids);
+        ggml_set_output(sg.top_vals);
+        ggml_build_forward_expand(sg.gf, sg.top_ids);
+        ggml_build_forward_expand(sg.gf, sg.top_vals);
+    }
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));

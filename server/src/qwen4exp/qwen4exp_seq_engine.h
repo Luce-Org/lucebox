@@ -66,6 +66,10 @@ public:
     StepResult step(const StepPlan & plan) override;
     void retire(int slot) override;
     bool token_is_eos(int32_t token) const override;
+    // A step of the MTP slot alone emits its accepted drafts and the verified token, at most the slot cache's draft
+    // cap plus one (a fixed --verify-width, or QWEN4EXP_MTP_MAX_VERIFY when adaptive), so the scheduler keeps
+    // drafting while a thinking budget is still open and hands off to single tokens only near its close.
+    int max_decode_tokens() const override { return mtp_slot_ >= 0 ? caches_[(size_t) mtp_slot_]->mtp_draft + 1 : 1; }
 
 private:
     AdmitResult admit_cold(uint64_t request_id, const std::vector<int32_t> & prompt,

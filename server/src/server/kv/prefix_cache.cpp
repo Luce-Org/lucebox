@@ -1,7 +1,6 @@
 // Prefix cache implementation.
 
-#include "prefix_cache.h"
-#include "common/sha1.h"
+#include "server/kv/prefix_cache.h"
 
 #include <algorithm>
 #include <atomic>
@@ -13,203 +12,6 @@
 #include <chrono>
 
 namespace luce::common {
-
-// ─── Chat marker resolution ────────────────────────────────────────────
-
-bool resolve_chat_markers(const Tokenizer & tok, ChatMarkers & out) {
-    out.role_starts_delimit = false;
-    // DeepSeek V4 uses full-width punctuation in its control tokens. Require
-    // each marker to encode as its exact vocabulary token so an unrelated BPE
-    // tokenizer cannot be misclassified merely because it can spell the text.
-    const auto exact_control_token = [&tok](const char * marker) -> int32_t {
-        const int32_t id = tok.token_to_id(marker);
-        if (id < 0) return -1;
-        const auto encoded = tok.encode(marker);
-        return encoded.size() == 1 && encoded[0] == id ? id : -1;
-    };
-    const int32_t ds_bos = exact_control_token("<｜begin▁of▁sentence｜>");
-    const int32_t ds_eos = exact_control_token("<｜end▁of▁sentence｜>");
-    const int32_t ds_user = exact_control_token("<｜User｜>");
-    const int32_t ds_assistant = exact_control_token("<｜Assistant｜>");
-    if (ds_bos >= 0 && ds_eos >= 0 && ds_user >= 0 && ds_assistant >= 0) {
-        out.family = "deepseek";
-        out.sys_role_prefix = {ds_bos};
-        out.end_msg_seqs = {{ds_eos}};
-        out.next_role_starts = {{ds_user}, {ds_assistant}};
-        out.role_starts_delimit = true;
-        return true;
-    }
-
-    // Try Qwen family: <|im_end|> and <|im_start|> should be single tokens.
-    auto im_end = tok.encode("<|im_end|>");
-    auto im_start = tok.encode("<|im_start|>");
-    if (im_end.size() == 1 && im_start.size() == 1) {
-        auto sys = tok.encode("system");
-        out.family = "qwen";
-        out.sys_role_prefix = {im_start[0]};
-        if (sys.size() == 1) out.sys_role_prefix.push_back(sys[0]);
-        out.end_msg_seqs = {{im_end[0]}};
-        out.next_role_starts = {{im_start[0]}};
-        return true;
-    }
-
-    // Try Gemma family: <|turn> (start) and <turn|> (end) are single tokens.
-    auto turn_start = tok.encode("<|turn>");
-    auto turn_end   = tok.encode("<turn|>");
-    if (turn_start.size() == 1 && turn_end.size() == 1) {
-        out.family = "gemma";
-        out.sys_role_prefix = {turn_start[0]};
-        out.end_msg_seqs = {{turn_end[0]}};
-        out.next_role_starts = {{turn_start[0]}};
-        return true;
-    }
-
-    // Try Laguna family: XML-style markers.
-    auto start_sys = tok.encode("<system>");
-    auto end_sys   = tok.encode("</system>");
-    auto start_usr = tok.encode("<user>");
-    auto end_usr   = tok.encode("</user>");
-    auto start_ast = tok.encode("<assistant>");
-    auto end_ast   = tok.encode("</assistant>");
-    if (!start_sys.empty() && !end_sys.empty() && !start_usr.empty() &&
-        !end_usr.empty() && !start_ast.empty() && !end_ast.empty()) {
-        out.family = "laguna";
-        out.sys_role_prefix = start_sys;
-        out.end_msg_seqs = {end_sys, end_usr, end_ast};
-        out.next_role_starts = {start_usr, start_ast, start_sys};
-        return true;
-    }
-
-    return false;
-}
-
-// ─── Boundary detection ─────────────────────────────────────────────────
-
-static bool seq_at(const std::vector<int32_t> & ids, int idx,
-                   const std::vector<int32_t> & seq) {
-    if (idx < 0 || idx + (int)seq.size() > (int)ids.size()) return false;
-    for (int k = 0; k < (int)seq.size(); k++) {
-        if (ids[idx + k] != seq[k]) return false;
-    }
-    return true;
-}
-
-static int find_first_seq(const std::vector<int32_t> & ids,
-                          const std::vector<int32_t> & seq, int start = 0) {
-    if (seq.empty()) return -1;
-    int n = (int)ids.size(), m = (int)seq.size();
-    for (int i = start; i + m <= n; i++) {
-        if (ids[i] == seq[0] && seq_at(ids, i, seq)) return i;
-    }
-    return -1;
-}
-
-static std::pair<int, int> find_first_seq_any(
-        const std::vector<int32_t> & ids,
-        const std::vector<std::vector<int32_t>> & seqs, int start = 0) {
-    int best = -1, best_len = 0;
-    for (const auto & s : seqs) {
-        int idx = find_first_seq(ids, s, start);
-        if (idx >= 0 && (best < 0 || idx < best)) {
-            best = idx;
-            best_len = (int)s.size();
-        }
-    }
-    return {best, best_len};
-}
-
-std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
-                                     const ChatMarkers & markers) {
-    std::vector<int> out;
-    // Boundaries normally start after the system role prefix. A prompt with
-    // no system message (common for API clients) still has role boundaries,
-    // so start from the first role marker instead of caching nothing. Take
-    // whichever comes first: a system prefix quoted inside a later message
-    // (literal ChatML in content) must not displace the real leading role.
-    const auto first_start = find_first_seq_any(ids, markers.next_role_starts);
-    int start_idx = find_first_seq(ids, markers.sys_role_prefix);
-    int start_len = (int)markers.sys_role_prefix.size();
-    if (first_start.first >= 0 &&
-        (start_idx < 0 || first_start.first < start_idx)) {
-        start_idx = first_start.first;
-        start_len = first_start.second;
-    }
-    if (start_idx < 0 || start_len <= 0) return out;
-
-    int cursor = start_idx + start_len;
-    if (markers.role_starts_delimit) {
-        // Each role marker opens a message and closes the previous one, so
-        // the cut after every marker is a reusable prefix: the system text
-        // before the first user marker, each completed turn, and the
-        // generation prompt itself. A marker quoted inside message content
-        // adds a candidate cut too; cuts are reuse hints and exact token
-        // matching decides every restore, so that costs at most a snapshot
-        // taken at a less useful place.
-        while (true) {
-            const auto [idx, len] =
-                find_first_seq_any(ids, markers.next_role_starts, cursor);
-            if (idx < 0) break;
-            cursor = idx + len;
-            out.push_back(cursor);
-        }
-        return out;
-    }
-    int stray_skips = 0;
-    while (true) {
-        auto [end_idx, end_len] = find_first_seq_any(ids, markers.end_msg_seqs, cursor);
-        if (end_idx < 0) break;
-        int after_end = end_idx + end_len;
-
-        int next_match = -1, next_len = 0;
-        for (int skip = 0; skip < 5; skip++) {
-            int probe = after_end + skip;
-            for (const auto & s : markers.next_role_starts) {
-                if (seq_at(ids, probe, s)) {
-                    next_match = probe;
-                    next_len = (int)s.size();
-                    goto found;
-                }
-            }
-        }
-        found:
-        if (next_match < 0) {
-            // Stray end-of-message marker with no following role start — chatml
-            // tokens embedded in message content (file dumps, terminal output,
-            // model-echoed markers). Skip this marker and keep scanning instead
-            // of truncating the whole boundary list. A lone stray previously cut
-            // the walk off here, hiding every real boundary after it; that pinned
-            // the inline-snapshot deepen target (second-to-last boundary) at the
-            // already-restored prefix length, so no snapshot was ever deepened and
-            // every turn re-prefilled the entire tail. Guard against pathological
-            // input (or a marker-family mismatch) by capping consecutive strays.
-            if (++stray_skips > 8192) break;
-            cursor = after_end;
-            continue;
-        }
-        int boundary = next_match + next_len;
-        out.push_back(boundary);
-        cursor = boundary;
-        stray_skips = 0;
-    }
-    return out;
-}
-
-// ─── Hashing ────────────────────────────────────────────────────────────
-
-PrefixHash hash_prefix(const int32_t * ids, int count) {
-    // Build hash input: [count as LE u32] + [ids as LE i32 array]
-    std::vector<uint8_t> buf(4 + count * 4);
-    uint32_t n = (uint32_t)count;
-    std::memcpy(buf.data(), &n, 4);
-    std::memcpy(buf.data() + 4, ids, count * 4);
-
-    uint8_t sha[20];
-    sha1_hash(buf.data(), buf.size(), sha);
-
-    PrefixHash h{};
-    std::memcpy(h.data(), sha, 16);
-    return h;
-}
 
 // ─── Prefix-aware eviction ──────────────────────────────────────────────
 
@@ -305,66 +107,6 @@ int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru
     ptrs.reserve(ids_lru.size());
     for (const auto & v : ids_lru) ptrs.push_back(&v);
     return select_inline_evict_victim(ptrs, protected_lru, skip_index, held_lru);
-}
-
-int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
-                                    int restored_prefix_len,
-                                    bool prefer_head,
-                                    int reachable_from) {
-    if (boundaries.empty()) return 0;
-    const auto usable = [&](int cut) {
-        return cut > restored_prefix_len && cut >= reachable_from;
-    };
-    // Save the system/tools head (first marker) before deepening into
-    // conversation turns. A head the backend cannot save is skipped: it is
-    // cheap to prefill, and waiting for it would keep the cache from ever
-    // saving a deeper cut.
-    if (prefer_head) {
-        const int head = boundaries.front();
-        if (usable(head)) return head;
-    }
-    return usable(boundaries.back()) ? boundaries.back() : 0;
-}
-
-std::vector<int> spaced_restore_points(const std::vector<int> & boundaries, int min_gap) {
-    if (min_gap <= 0) return boundaries;
-    std::vector<int> kept;
-    for (int b : boundaries) {
-        if (kept.empty() || b - kept.back() >= min_gap) kept.push_back(b);
-    }
-    return kept;
-}
-
-std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
-                                       const ChatMarkers & markers,
-                                       std::initializer_list<int> cuts,
-                                       bool drop_last_boundary,
-                                       int spacing) {
-    std::vector<int> points = find_all_boundaries(prompt, markers);
-    if (drop_last_boundary && !points.empty()) points.pop_back();
-    points = spaced_restore_points(points, spacing);
-    for (int cut : cuts) {
-        if (cut > 0 && cut < (int) prompt.size()) points.push_back(cut);
-    }
-    std::sort(points.begin(), points.end());
-    points.erase(std::unique(points.begin(), points.end()), points.end());
-    return points;
-}
-
-bool should_force_inline_snapshot_boundary(
-        const std::vector<int> & boundaries,
-        int prompt_len,
-        int restored_prefix_len,
-        bool prefer_tools_boundary,
-        int forced_cut,
-        int reachable_from) {
-    const bool tools_pin_restored =
-        prefer_tools_boundary && !boundaries.empty() &&
-        restored_prefix_len >= boundaries.front();
-    return !tools_pin_restored &&
-           forced_cut > restored_prefix_len &&
-           forced_cut >= reachable_from &&
-           forced_cut <= prompt_len;
 }
 
 // ─── PrefixCache ────────────────────────────────────────────────────────
@@ -1224,9 +966,9 @@ std::vector<int> PrefixCache::prune_superseded_ancestors(
     return pruned;
 }
 
-std::vector<int> PrefixCache::enforce_resident_budget(
-        int keep_slot, std::vector<bool> * persist) {
-    std::vector<int> evicted;
+std::vector<PrefixCache::Evicted> PrefixCache::enforce_resident_budget(
+        int keep_slot) {
+    std::vector<Evicted> evicted;
     if (disabled_ || max_resident_bytes_ == 0) return evicted;
     const size_t before = resident_bytes_;
     while (resident_bytes_ > max_resident_bytes_) {
@@ -1237,9 +979,7 @@ std::vector<int> PrefixCache::enforce_resident_budget(
         // or a pinned ancestor of it.
         const int victim = pick_evict_victim(keep);
         if (victim < 0) break;
-        const int slot = entries_[(size_t)victim].slot;
-        evicted.push_back(slot);
-        if (persist) persist->push_back(persist_on_evict(slot));
+        evicted.push_back(evicted_record(entries_[(size_t)victim]));
         record_eviction(victim);
         erase_inline_entry(victim);
     }
@@ -1270,16 +1010,57 @@ std::vector<int32_t> PrefixCache::entry_tokens(int slot) const {
     return idx < 0 ? std::vector<int32_t>{} : entries_[(size_t)idx].ids;
 }
 
+PrefixCache::Evicted PrefixCache::evicted_record(const LruEntry & entry) const {
+    Evicted out;
+    out.slot = entry.slot;
+    out.ids = entry.ids;
+    out.persist = persist_on_evict(entry.slot);
+    out.disk_key.assign(entry.ids.begin(), entry.ids.begin() + entry.disk_key_len);
+    out.aux = entry.aux;
+    return out;
+}
+
+PrefixCache::Evicted PrefixCache::entry(int slot) const {
+    const int idx = find_slot_entry(slot);
+    return idx < 0 ? Evicted{} : evicted_record(entries_[(size_t)idx]);
+}
+
+void PrefixCache::set_disk_key(int slot, int tokens) {
+    const int idx = find_slot_entry(slot);
+    if (idx < 0) return;
+    auto & entry = entries_[(size_t)idx];
+    entry.disk_key_len = std::clamp(tokens, 0, (int)entry.ids.size());
+}
+
+bool PrefixCache::has_disk_key(int slot) const {
+    const int idx = find_slot_entry(slot);
+    return idx >= 0 && entries_[(size_t)idx].disk_key_len > 0;
+}
+
+void PrefixCache::set_aux(int slot, std::string aux) {
+    const int idx = find_slot_entry(slot);
+    if (idx >= 0) entries_[(size_t)idx].aux = std::move(aux);
+}
+
+void PrefixCache::mark_agent_turn(int slot) {
+    const int idx = find_slot_entry(slot);
+    if (idx >= 0) entries_[(size_t)idx].agent_turn = true;
+}
+
+bool PrefixCache::agent_turn(int slot) const {
+    const int idx = find_slot_entry(slot);
+    return idx >= 0 && entries_[(size_t)idx].agent_turn;
+}
+
 void PrefixCache::record_eviction(int idx) {
     if (!record_evictions_ || idx < 0 || idx >= (int)entries_.size()) return;
-    const auto & entry = entries_[(size_t)idx];
-    evicted_log_.push_back({entry.slot, entry.ids, persist_on_evict(entry.slot)});
+    evicted_log_.push_back(evicted_record(entries_[(size_t)idx]));
 }
 
 std::vector<PrefixCache::Evicted> PrefixCache::entries_for_shutdown() const {
     std::vector<Evicted> out;
     for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
-        out.push_back({it->slot, it->ids, persist_on_evict(it->slot)});
+        out.push_back(evicted_record(*it));
     }
     return out;
 }
@@ -1445,8 +1226,8 @@ void PrefixCache::abort_full_snap(int slot) {
 
 PrefixCache::InlineStats PrefixCache::stats() const {
     InlineStats out{};
-    if (disabled_) return out;
-    out.capacity = cap_;
+    if (disabled_.load(std::memory_order_acquire)) return out;
+    out.capacity = cap_.load(std::memory_order_relaxed);
     out.in_use =
         (int)entries_size_count_.load(std::memory_order_relaxed);
     out.lifetime_hits = lifetime_hits_.load(std::memory_order_relaxed);

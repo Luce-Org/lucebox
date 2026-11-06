@@ -2,6 +2,7 @@
 #include "qwen4exp/qwen4exp_chunk.h"
 #include <cassert>
 using luce::common::qwen4exp_fit_chunk;
+using luce::common::qwen4exp_reserved_rows;
 using luce::common::Qwen4ExpContextFit;
 using luce::common::qwen4exp_shrink_context;
 int main() {
@@ -55,6 +56,19 @@ int main() {
     assert(qwen4exp_fit_chunk(4096, 50000, 45000, workspace, &snapshots) == 0 && snapshots == 0);
     snapshots = 100000;
     assert(qwen4exp_fit_chunk(4096, 50000, 0, [](int) { return SIZE_MAX; }, &snapshots) == 0 && snapshots == 0);
+    // A wider chunk only while one snapshot (keep) still fits beside it: budget 90000 - 20000 fixed - 30000 keep
+    // leaves 4000 rows, the floor stays when keep takes it all, and the floor holds without a preference.
+    assert(qwen4exp_reserved_rows(10000, 100000, 20000, workspace, 2048, 8192, 30000) == 3840);
+    assert(qwen4exp_reserved_rows(10000, 100000, 20000, workspace, 2048, 8192, 10000) == 5888);
+    assert(qwen4exp_reserved_rows(10000, 100000, 20000, workspace, 2048, 8192, 60000) == 2048);
+    assert(qwen4exp_reserved_rows(10000, 100000, 20000, workspace, 4096, 4096, 10000) == 4096);
+    assert(qwen4exp_reserved_rows(10000, 100000, 20000, workspace, 4096, 8192, 0) == 4096);
+    assert(qwen4exp_reserved_rows(3000, 100000, 0, workspace, 2048, 8192, 1000) == 2816);
+    // Through the allowance: the wider reservation leaves the snapshots more than keep.
+    snapshots = 100000;
+    const int rows = qwen4exp_reserved_rows(10000, 100000, 20000, workspace, 4096, 8192, 10000);
+    assert(qwen4exp_fit_chunk(10000, 100000, 20000, workspace, &snapshots, rows) == 5888);
+    assert(snapshots == 90000 - 20000 - 58880 && snapshots >= 10000);
 
     // An allowance smaller than min_snapshot is rejected so prefill chunks can use the spare memory.
     snapshots = 100000;

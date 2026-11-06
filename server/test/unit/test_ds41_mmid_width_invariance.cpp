@@ -1,5 +1,6 @@
 // DS4.1 routed-expert MUL_MAT_ID width invariance: does a T-token batch (DSpark verify, each token with its own 6
-// experts) produce bit-identical outputs to the same tokens run one at a time (single-token decode)?
+// experts) produce bit-identical outputs to the same tokens run one at a time (single-token decode)? The qwen4exp
+// expert shapes (Q5_1 down K=640, Q4_K gate/up K=2560: the short rows RDNA4 runs on the MoE kernel) are checked too.
 //
 // DSpark verification is documented as bit-identical to plain decode because its products are batch-invariant
 // (ggml_backend_cuda_set_mmvq_batch_invariant). The mmvq width-invariant launch excludes MUL_MAT_ID (has_ids), and
@@ -27,7 +28,9 @@ struct Case { ggml_type type; const char * surface; int k, n; };
 
 static void fill_blocks(std::vector<uint8_t> & w, ggml_type type, size_t n_blocks, std::mt19937 & rng) {
     const size_t bs = ggml_type_size(type);
-    if (type == GGML_TYPE_Q2_0_ROCMFP2) {                          // ue4m3 scales: tile quantized random blocks
+    // ue4m3 scales (ROCmFP2), or two fp16 scales per block (Q5_1, Q4_K) that random bytes would turn into
+    // infinities: tile quantized random blocks
+    if (type == GGML_TYPE_Q2_0_ROCMFP2 || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q4_K) {
         constexpr size_t pool = 4096;
         std::normal_distribution<float> gauss(0.0f, 0.02f);
         std::vector<float> f(pool * size_t(ggml_blck_size(type)));
@@ -217,6 +220,13 @@ int main(int argc, char ** argv) {
                     if (inv && t.contract) all = ok && all;
                 }
         }
+        // qwen4exp routed experts (n_embd 2560, expert FFN 640)
+        const Case qwen4exp[] = {{GGML_TYPE_Q5_1, "qwen4exp_down", 640, 2560}, {GGML_TYPE_Q4_K, "qwen4exp_gate_up", 2560, 640}};
+        for (const auto & c : qwen4exp)
+            for (bool inv : {false, true}) {
+                const bool ok = check(backend, dv, c, tokens, experts, inv);
+                if (inv) all = ok && all;
+            }
         // dense verify-batch products of DS4.1: BF16 output head, F16 indexer/compressor, F32 router, MXFP8 attention
         struct D { ggml_type t; const char * name; int k, n; } dense[] = {
             {GGML_TYPE_BF16, "output_head", 5120, 129280}, {GGML_TYPE_F16, "indexer_k", 5120, 2048},

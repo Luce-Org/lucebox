@@ -95,7 +95,7 @@ Untagged variables are operational tuning knobs.
 
 | Variable | Purpose |
 |---|---|
-| `LUCE_SAMPLED_VERIFY` | Use sampled verification. |
+| `LUCE_SAMPLED_VERIFY` | Speculative decoding for sampled requests (sampled verification). On by default for Qwen 3.5/3.6/3.8 targets, `0` disables it; `1` enables it for Laguna. |
 | `LUCE_VERIFY_WIDTH` | Verify batch width. |
 | `LUCE_GPU_SAMPLE` | GPU sampling path. |
 | `LUCE_GPU_ARGMAX` / `LUCE_GPU_VERIFY_ARGMAX` | GPU argmax for sampling/verification. |

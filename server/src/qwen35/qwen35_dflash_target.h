@@ -40,6 +40,11 @@ public:
                       bool capture_ssm_intermediates = false) override;
 
     bool read_verify_logits(int n_tokens, std::vector<float> & out) override;
+    bool read_verify_row(int row, std::vector<float> & out) override;
+    void set_verify_top_n(int top_n) override { verify_top_n_ = top_n; }
+    bool read_verify_top(int n_rows, std::vector<float> & vals,
+                         std::vector<int32_t> & ids, int & top_n,
+                         int & vocab) override;
 
     bool snapshot_kv() override;
     bool restore_kv() override;
@@ -105,6 +110,7 @@ private:
     StepGraph & sg_;
     int kq_stride_pad_;
     int fa_window_;
+    int verify_top_n_ = 0;   // set_verify_top_n
     KvFlashPager * pager_ = nullptr;
     bool fast_rollback_ = false;
     const int * rope_offset_ = nullptr;

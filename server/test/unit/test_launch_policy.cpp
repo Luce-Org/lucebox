@@ -635,7 +635,17 @@ struct LaunchPolicyFixture : CommonFixture {
         // The drafter swap stays opt-in: cache hits must match a full prefill.
         CHECK(env_of(profile, "LUCE_DS4_DRAFT_SWAP").empty());
         CHECK(env_of(profile, "GGML_CUDA_MLA_SPLIT_KV_COUNT") == "8");
-        CHECK(profile.env.size() == 50);
+        // The decode switches from the two-box serving profile (byte-identical here, DS41.md).
+        for (const char * name : {"LUCE_DS4_LANE_BATCH", "LUCE_DS4_SCHED_DEDICATED_COPIES", "LUCE_DS4_HC_BOUNDARY_SPLIT",
+                                  "GGML_CUDA_PEER_COPY_KERNEL", "LUCE_MMID_GROUPED", "LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH",
+                                  "LUCE_DS4_GPU_ARGMAX_VERIFY", "LUCE_DS4_DRAFT_CONTEXT_KV_CACHE", "HSA_FORCE_FINE_GRAIN_PCIE"}) {
+            CHECK(env_of(profile, name) == "1");
+        }
+        CHECK(env_of(profile, "LUCE_MMID_GROUPED_TYPES") == "79");
+        // Measured neutral on this layout: they stay off.
+        CHECK(env_of(profile, "LUCE_MOE_Q8_HANDOFF").empty());
+        CHECK(env_of(profile, "LUCE_DS4_ENGRAM_PRECOMPUTE").empty());
+        CHECK(profile.env.size() == 60);
         // A flag given on the command line replaces the profile's value.
         const std::vector<std::string> merged = launch_profile_args(profile, {"--draft-device", "hip:1"});
         CHECK(!contains_flag(merged, "--draft-device"));

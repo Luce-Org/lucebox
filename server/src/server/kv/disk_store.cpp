@@ -1,23 +1,22 @@
-// Disk-backed prefix cache implementation.
+// The files of a KV cache directory: index, budget, TTL, writer thread
+// and the .dkv format (disk_store.h).
 
-#include "disk_prefix_cache.h"
-#include "common/sha1.h"
+#include "server/kv/disk_store.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <climits>
-#include <cerrno>
-#include <cctype>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <map>
 #include <system_error>
 #include <thread>
 
@@ -39,17 +38,6 @@ namespace fs = std::filesystem;
 
 // ─── Utility ────────────────────────────────────────────────────────────
 
-static std::string hex(const uint8_t * data, int len) {
-    static const char hex_chars[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(len * 2);
-    for (int i = 0; i < len; ++i) {
-        out.push_back(hex_chars[data[i] >> 4]);
-        out.push_back(hex_chars[data[i] & 0x0f]);
-    }
-    return out;
-}
-
 static bool mkdir_p(const std::string & path) {
     std::error_code ec;
     if (fs::is_directory(path, ec)) return true;
@@ -59,147 +47,6 @@ static bool mkdir_p(const std::string & path) {
 
 static uint64_t now_unix() {
     return (uint64_t)std::time(nullptr);
-}
-
-const char * disk_prefix_cache_mode_name(DiskPrefixCacheMode mode) {
-    switch (mode) {
-        case DiskPrefixCacheMode::Off:   return "off";
-        case DiskPrefixCacheMode::Full:  return "full";
-        case DiskPrefixCacheMode::Auto:  return "auto";
-        case DiskPrefixCacheMode::Fixed: return "fixed";
-    }
-    return "full";
-}
-
-std::string disk_prefix_cache_policy_name(const DiskPrefixCachePolicy & policy) {
-    std::string base;
-    if (policy.mode == DiskPrefixCacheMode::Fixed) {
-        base = "fixed:" + std::to_string(policy.fixed_tokens);
-    } else if (policy.mode == DiskPrefixCacheMode::Auto) {
-        base = "auto:" + std::to_string(policy.auto_window);
-    } else {
-        base = disk_prefix_cache_mode_name(policy.mode);
-    }
-    if (policy.compress) base += "+compress";
-    return base;
-}
-
-bool parse_disk_prefix_cache_policy(const std::string & value,
-                                    DiskPrefixCachePolicy & out) {
-    std::string v;
-    v.reserve(value.size());
-    for (char c : value) v.push_back((char)std::tolower((unsigned char)c));
-
-    if (v == "off" || v == "none" || v == "disabled") {
-        out = {};
-        out.mode = DiskPrefixCacheMode::Off;
-        return true;
-    }
-    if (v == "full" || v == "full-prefix") {
-        out = {};
-        out.mode = DiskPrefixCacheMode::Full;
-        return true;
-    }
-    if (v == "auto") {
-        out = {};
-        out.mode = DiskPrefixCacheMode::Auto;
-        return true;
-    }
-
-    const std::string auto_prefix = "auto:";
-    if (v.rfind(auto_prefix, 0) == 0) {
-        char * end = nullptr;
-        long n = std::strtol(v.c_str() + auto_prefix.size(), &end, 10);
-        if (!end || *end != '\0' || n <= 0 || n > 1000000) return false;
-        out = {};
-        out.mode = DiskPrefixCacheMode::Auto;
-        out.auto_window = (int)n;
-        return true;
-    }
-
-    char * end = nullptr;
-    long n = std::strtol(v.c_str(), &end, 10);
-    if (end && *end == '\0' && n > 0 && n <= 1000000) {
-        out = {};
-        out.mode = DiskPrefixCacheMode::Fixed;
-        out.fixed_tokens = (int)n;
-        return true;
-    }
-    return false;
-}
-
-bool apply_request_scope_override(DiskPrefixCachePolicy & server_policy,
-                                  const std::string & scope_str) {
-    DiskPrefixCachePolicy parsed;
-    if (!parse_disk_prefix_cache_policy(scope_str, parsed)) {
-        return false;
-    }
-    // Preserve server-level flags (e.g. compress) across the scope override.
-    parsed.compress = server_policy.compress;
-    server_policy = parsed;
-    return true;
-}
-
-static bool valid_boundary(int n, int full_len) {
-    return n > 0 && n <= full_len;
-}
-
-std::vector<int> disk_prefix_cache_full_lookup_lengths(
-        int prompt_len,
-        const std::vector<int> & boundaries,
-        int min_tokens) {
-    std::vector<int> out;
-    // Nothing shorter than the persistence minimum is ever written, so such
-    // lengths are not worth a probe.
-    if (prompt_len >= min_tokens) out.push_back(prompt_len);
-    for (auto it = boundaries.rbegin(); it != boundaries.rend(); ++it) {
-        if (*it >= min_tokens && *it < prompt_len) out.push_back(*it);
-    }
-    return out;
-}
-
-int disk_prefix_cache_fixed_boundary(const DiskPrefixCachePolicy & policy,
-                                     int full_len,
-                                     int min_tokens) {
-    if (policy.mode != DiskPrefixCacheMode::Fixed) return 0;
-    if (policy.fixed_tokens < min_tokens) return 0;
-    return valid_boundary(policy.fixed_tokens, full_len) ? policy.fixed_tokens : 0;
-}
-
-static int lcp_len(const std::vector<int32_t> & a,
-                   const std::vector<int32_t> & b) {
-    const int n = std::min((int)a.size(), (int)b.size());
-    int i = 0;
-    while (i < n && a[(size_t)i] == b[(size_t)i]) i++;
-    return i;
-}
-
-static int floor_to_safe_boundary(int n, const std::vector<int> & safe_boundaries) {
-    if (n <= 0) return 0;
-    if (safe_boundaries.empty()) return n;
-
-    int best = 0;
-    for (int b : safe_boundaries) {
-        if (b > 0 && b <= n) best = std::max(best, b);
-    }
-    return best;
-}
-
-int disk_prefix_cache_auto_boundary(
-    const std::vector<int32_t> & prompt_ids,
-    const std::vector<std::vector<int32_t>> & recent_prompts,
-    int window,
-    const std::vector<int> & safe_boundaries,
-    int min_tokens) {
-    if (prompt_ids.empty() || recent_prompts.empty() || window <= 0) return 0;
-
-    const int n_recent = std::min(window, (int)recent_prompts.size());
-    int common = 0;
-    for (int i = 0; i < n_recent; ++i) {
-        common = std::max(common, lcp_len(prompt_ids, recent_prompts[(size_t)i]));
-    }
-    common = floor_to_safe_boundary(common, safe_boundaries);
-    return common >= min_tokens ? common : 0;
 }
 
 // Little-endian I/O helpers.
@@ -517,10 +364,9 @@ static bool valid_tensor_metadata(uint32_t type, const int64_t ne[4], uint64_t n
 
 // ─── Construction ───────────────────────────────────────────────────────
 
-DiskPrefixCache::DiskPrefixCache(const DiskCacheConfig & cfg, ModelBackend & backend)
-    : config_(cfg), backend_(backend) {}
+DiskStore::DiskStore(const DiskCacheConfig & config) : config_(config) {}
 
-DiskPrefixCache::~DiskPrefixCache() {
+DiskStore::~DiskStore() {
     if (writer_.joinable()) {
         drain();
         {
@@ -537,7 +383,7 @@ DiskPrefixCache::~DiskPrefixCache() {
 #endif
 }
 
-uint64_t DiskPrefixCache::now() const {
+uint64_t DiskStore::now() const {
     return clock_ ? clock_() : now_unix();
 }
 
@@ -612,16 +458,55 @@ static bool validate_snapshot_file(const std::string & path,
 
 // ─── Initialization ─────────────────────────────────────────────────────
 
-bool DiskPrefixCache::init() {
-    if (disabled()) return true;
-    if (!mkdir_p(config_.cache_dir)) {
+std::shared_ptr<DiskStore> DiskStore::open(const DiskCacheConfig & config,
+                                           std::function<uint64_t()> clock,
+                                           std::function<uint64_t()> free_space,
+                                           bool & failed) {
+    failed = false;
+    if (!mkdir_p(config.cache_dir)) {
         std::fprintf(stderr, "[disk-cache] disabled: failed to create dir: %s\n",
-                     config_.cache_dir.c_str());
-        // No writer was started. Leaving the cache enabled would queue
-        // payloads forever and block serving once backpressure is reached.
-        config_.cache_dir.clear();
-        return false;
+                     config.cache_dir.c_str());
+        failed = true;
+        return {};
     }
+    // One store per directory per process: every model of the process that
+    // uses the directory shares its lock, index, writer and budget.
+    static std::mutex registry_mu;
+    static std::map<std::string, std::weak_ptr<DiskStore>> registry;
+    std::error_code ec;
+    std::string key = fs::weakly_canonical(fs::absolute(config.cache_dir, ec), ec).string();
+    if (key.empty()) key = config.cache_dir;
+    std::lock_guard<std::mutex> registry_lock(registry_mu);
+    if (auto open = registry[key].lock()) {
+        std::fprintf(stderr,
+                     "[disk-cache] %s is already open in this process: sharing it "
+                     "(one budget and one writer for every model)\n",
+                     config.cache_dir.c_str());
+        return open;
+    }
+    std::shared_ptr<DiskStore> store(new DiskStore(config));
+    store->clock_ = std::move(clock);
+    store->free_space_ = std::move(free_space);
+    if (!store->lock_dir()) {
+        std::fprintf(stderr,
+                     "[disk-cache] disabled: cannot lock %s (in use or not writable) "
+                     "(pass --kv-cache-dir <other dir> to give this one its own)\n",
+                     config.cache_dir.c_str());
+        return {};
+    }
+    {
+        std::lock_guard<std::mutex> lock(store->mu_);
+        store->scan_all();
+        // Budget and TTL hold from the first moment, before any request.
+        store->expire_locked();
+        store->make_room_locked(0);
+    }
+    store->writer_ = std::thread([raw = store.get()] { raw->writer_loop(); });
+    registry[key] = store;
+    return store;
+}
+
+bool DiskStore::lock_dir() {
     const std::string lock_path = config_.cache_dir + "/.lock";
 #if defined(_WIN32)
     // A share-mode-zero handle excludes every other server before scanning
@@ -633,129 +518,17 @@ bool DiskPrefixCache::init() {
 #else
     lock_fd_ = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     const bool locked = lock_fd_ >= 0 && ::flock(lock_fd_, LOCK_EX | LOCK_NB) == 0;
-#endif
-    if (!locked) {
-        std::fprintf(stderr,
-                     "[disk-cache] disabled: cannot lock %s (in use or not writable) "
-                     "(pass --kv-cache-dir <other dir> to give this one its own)\n",
-                     config_.cache_dir.c_str());
-#if !defined(_WIN32)
-        if (lock_fd_ >= 0) ::close(lock_fd_);
+    if (!locked && lock_fd_ >= 0) {
+        ::close(lock_fd_);
         lock_fd_ = -1;
+    }
 #endif
-        config_.cache_dir.clear();
-        return true;
-    }
-    std::lock_guard<std::mutex> lock(mu_);
-    scan_all();
-    // Budget and TTL hold from the first moment, before any request.
-    expire_locked();
-    make_room_locked(0);
-    // Restore into the layout this identity used most recently; learn_layout
-    // confirms it against the live model before anything is written.
-    const DiskEntry * best = nullptr;
-    for (const auto & e : entries_) {
-        if (e.own_salt && (!best || e.last_used > best->last_used)) best = &e;
-    }
-    if (best) {
-        layout_id_ = best->layout_id;
-        layout_known_ = true;
-        layout_from_disk_ = true;
-        layout_dir_ = config_.cache_dir + "/" + hex(layout_id_.data(), 16);
-    }
-    std::fprintf(stderr,
-                 "[disk-cache] initialized dir=%s budget=%.1f GB (configured %.1f GB) "
-                 "ttl=%s files=%zu used=%.1f MB layout=%s\n",
-                 config_.cache_dir.c_str(),
-                 (double)effective_budget_ / (1024.0 * 1024.0 * 1024.0),
-                 (double)config_.budget_bytes / (1024.0 * 1024.0 * 1024.0),
-                 config_.ttl_seconds
-                     ? (std::to_string(config_.ttl_seconds) + "s").c_str()
-                     : "never",
-                 entries_.size(), mib(total_bytes_),
-                 layout_known_ ? hex(layout_id_.data(), 16).c_str() : "pending");
-    if (!writer_.joinable()) writer_ = std::thread([this] { writer_loop(); });
-    return true;
-}
-
-// ─── Layout fingerprint ─────────────────────────────────────────────────
-
-std::array<uint8_t, 16> DiskPrefixCache::layout_of(ggml_context * ctx) const {
-    // Collect tensor metadata sorted by name for deterministic fingerprint.
-    struct TInfo { std::string name; uint32_t type; int64_t ne[4]; };
-    std::vector<TInfo> tensors;
-    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
-        TInfo ti;
-        ti.name = t->name;
-        ti.type = (uint32_t)t->type;
-        ti.ne[0] = t->ne[0];
-        ti.ne[1] = 1;  // normalize sequence-length dimension
-        ti.ne[2] = t->ne[2];
-        ti.ne[3] = t->ne[3];
-        tensors.push_back(std::move(ti));
-    }
-    std::sort(tensors.begin(), tensors.end(), [](const TInfo & a, const TInfo & b) {
-        return a.name < b.name;
-    });
-    // Build a single buffer and hash it.
-    // Prepend identity_salt_ so that config/model differences (model file,
-    // KV types, max_ctx, chat_template) rotate the layout_id independently of
-    // tensor structure. All-zero salt (the default) is back-compatible.
-    std::vector<uint8_t> buf;
-    buf.insert(buf.end(), identity_salt_.begin(), identity_salt_.end());
-    for (const auto & ti : tensors) {
-        buf.insert(buf.end(), ti.name.begin(), ti.name.end());
-        buf.insert(buf.end(), (uint8_t *)&ti.type, (uint8_t *)&ti.type + 4);
-        buf.insert(buf.end(), (uint8_t *)ti.ne, (uint8_t *)ti.ne + 32);
-    }
-    uint8_t digest[20];
-    sha1_hash(buf.data(), buf.size(), digest);
-    std::array<uint8_t, 16> out{};
-    std::memcpy(out.data(), digest, 16);
-    return out;
-}
-
-void DiskPrefixCache::learn_layout_from(ggml_context * ctx) {
-    const auto id = layout_of(ctx);
-    std::lock_guard<std::mutex> lock(mu_);
-    if (layout_known_ && !layout_from_disk_) return;  // verified from the live model
-    if (layout_from_disk_ && id != layout_id_) {
-        // The files stay indexed (budget/TTL) but are never restored.
-        std::fprintf(stderr, "[disk-cache] layout mismatch: disk=%s model=%s — switching\n",
-                     hex(layout_id_.data(), 16).c_str(), hex(id.data(), 16).c_str());
-    }
-    layout_id_ = id;
-    layout_known_ = true;
-    layout_from_disk_ = false;
-    layout_dir_ = config_.cache_dir + "/" + hex(layout_id_.data(), 16);
-    mkdir_p(layout_dir_);
-    std::fprintf(stderr, "[disk-cache] layout learned: %s\n",
-                 hex(layout_id_.data(), 16).c_str());
-}
-
-void DiskPrefixCache::learn_layout(int slot) {
-    if (disabled()) return;
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (layout_known_ && !layout_from_disk_) return;
-    }
-    auto ref = backend_.snapshot_ref(slot);
-    if (!ref.ctx) {
-        if (backend_.snapshot_used(slot)) {
-            backend_snapshot_unsupported_ = true;
-            std::fprintf(stderr,
-                         "[disk-cache] disabled: backend snapshots are "
-                         "memory-only\n");
-        }
-        return;
-    }
-    if (ref.pooled) return;  // no dense KV tensors: would fingerprint a wrong layout
-    learn_layout_from(ref.ctx);
+    return locked;
 }
 
 // ─── Directory scanning ─────────────────────────────────────────────────
 
-void DiskPrefixCache::scan_all() {
+void DiskStore::scan_all() {
     entries_.clear();
     total_bytes_ = 0;
     size_t removed = 0;
@@ -781,8 +554,8 @@ void DiskPrefixCache::scan_all() {
             uint64_t size = 0;
             const char * why = "";
             bool ok = validate_snapshot_file(path, hdr, size, why);
-            if (ok && (hex(hdr.layout_id, 16) != base ||
-                       hex(hdr.token_hash, 16) + ".dkv" != name)) {
+            if (ok && (hex_string(hdr.layout_id, 16) != base ||
+                       hex_string(hdr.token_hash, 16) + ".dkv" != name)) {
                 ok = false;
                 why = "name does not match header";
             }
@@ -802,8 +575,7 @@ void DiskPrefixCache::scan_all() {
             entry.cur_pos     = hdr.cur_pos;
             entry.last_used   = hdr.last_used;
             entry.file_size   = size;
-            entry.own_salt    = std::memcmp(hdr.identity_salt,
-                                            identity_salt_.data(), 16) == 0;
+            std::memcpy(entry.salt.data(), hdr.identity_salt, 16);
             total_bytes_ += entry.file_size;
             entries_.push_back(std::move(entry));
             kept_any = true;
@@ -817,18 +589,18 @@ void DiskPrefixCache::scan_all() {
 
 // ─── Index maintenance ──────────────────────────────────────────────────
 
-bool DiskPrefixCache::expired(const DiskEntry & e, uint64_t t) const {
+bool DiskStore::expired(const DiskEntry & e, uint64_t t) const {
     return config_.ttl_seconds > 0 && t > e.last_used &&
            t - e.last_used > config_.ttl_seconds;
 }
 
-void DiskPrefixCache::release_pending_locked(DiskEntry & e) {
+void DiskStore::release_pending_locked(DiskEntry & e) {
     if (!e.pending) return;
     pending_bytes_ -= std::min<uint64_t>(pending_bytes_, e.file_size);
     e.pending.reset();
 }
 
-void DiskPrefixCache::touch_locked(DiskEntry & e) {
+void DiskStore::touch_locked(DiskEntry & e) {
     e.last_used = now();
     if (e.pending) return;  // the writer publishes the latest timestamp
     // Not fsynced: a crash may age an entry, but clean restarts retain uses.
@@ -838,7 +610,7 @@ void DiskPrefixCache::touch_locked(DiskEntry & e) {
     }
 }
 
-void DiskPrefixCache::remove_entry(size_t idx, const char * why) {
+void DiskStore::remove_entry(size_t idx, const char * why) {
     DiskEntry & e = entries_[idx];
     const bool queued = e.pending != nullptr;
     std::fprintf(stderr, "[disk-cache] %s: removing %s%s (%u tokens, %.1f MB)\n",
@@ -859,14 +631,14 @@ void DiskPrefixCache::remove_entry(size_t idx, const char * why) {
     done_cv_.notify_all();
 }
 
-void DiskPrefixCache::expire_locked() {
+void DiskStore::expire_locked() {
     const uint64_t t = now();
     for (size_t i = entries_.size(); i-- > 0;) {
         if (expired(entries_[i], t)) remove_entry(i, "ttl expired");
     }
 }
 
-uint64_t DiskPrefixCache::budget_locked() {
+uint64_t DiskStore::budget_locked() {
     uint64_t budget = config_.budget_bytes;
     // Never plan past the filesystem: the cache's bytes already on disk
     // plus the free space, minus a reserve for everything else.
@@ -909,31 +681,31 @@ uint64_t DiskPrefixCache::budget_locked() {
     return budget;
 }
 
-uint64_t DiskPrefixCache::budget_bytes() const {
+uint64_t DiskStore::budget_bytes() const {
     std::lock_guard<std::mutex> lock(mu_);
     return effective_budget_;
 }
 
-size_t DiskPrefixCache::total_bytes() const {
+size_t DiskStore::total_bytes() const {
     std::lock_guard<std::mutex> lock(mu_);
     return total_bytes_;
 }
 
-size_t DiskPrefixCache::entry_count() const {
+size_t DiskStore::entry_count() const {
     std::lock_guard<std::mutex> lock(mu_);
     return entries_.size();
 }
 
-DiskPrefixCache::Stats DiskPrefixCache::stats() const {
+DiskCacheStats DiskStore::stats() const {
     std::lock_guard<std::mutex> lock(mu_);
-    Stats out = stats_;
+    DiskCacheStats out = stats_;
     out.pending_bytes = pending_bytes_;
     out.pending_files = 0;
     for (const auto & e : entries_) out.pending_files += e.pending ? 1 : 0;
     return out;
 }
 
-void DiskPrefixCache::make_room_locked(uint64_t incoming) {
+void DiskStore::make_room_locked(uint64_t incoming) {
     const uint64_t budget = budget_locked();
     while (!entries_.empty() && (uint64_t)total_bytes_ + incoming > budget) {
         size_t lru = 0;
@@ -944,316 +716,9 @@ void DiskPrefixCache::make_room_locked(uint64_t incoming) {
     }
 }
 
-// ─── Lookup ─────────────────────────────────────────────────────────────
-
-OwnedSnapshot DiskPrefixCache::load(const std::vector<int32_t> & prompt_ids) {
-    if (disabled()) return {};
-    const PrefixHash hash = hash_prefix(prompt_ids.data(), (int)prompt_ids.size());
-    std::shared_ptr<PendingWrite> pending;
-    std::string path;
-    uint64_t id = 0;
-    uint32_t cur_pos = 0;
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (!layout_known_) return {};
-        const int idx = find_entry(hash);
-        if (idx < 0) return {};
-        if (expired(entries_[(size_t)idx], now())) {
-            remove_entry((size_t)idx, "ttl expired");
-            return {};
-        }
-        const DiskEntry & e = entries_[(size_t)idx];
-        id = e.id;
-        pending = e.pending;
-        path = e.path;
-        cur_pos = e.cur_pos;
-    }
-    OwnedSnapshot out;
-    const auto t_read = std::chrono::steady_clock::now();
-    if (pending) {
-        // Still queued for the writer: copy it from memory. The shared
-        // pointer keeps it alive even if the write finishes meanwhile.
-        if (pending->key != prompt_ids) return {};
-        out = OwnedSnapshot::clone_to_host(pending->snap.ctx(),
-                                           pending->snap.cur_pos(),
-                                           pending->snap.last_tok());
-        if (out.empty()) return {};
-    } else {
-        out = read_file(path, prompt_ids);
-    }
-    std::lock_guard<std::mutex> lock(mu_);
-    const int idx = find_entry_id(id);
-    if (out.empty()) {
-        ++stats_.load_failures;
-        // A corrupt, partial or mismatched file is never retried.
-        if (idx >= 0 && !entries_[(size_t)idx].pending) {
-            remove_entry((size_t)idx, "lookup failed");
-        }
-        return {};
-    }
-    std::fprintf(stderr, "[disk-cache] read %s (%u pos, %.1f MB, %.2fs)\n",
-                 pending ? "pending write" : fs::path(path).filename().string().c_str(),
-                 cur_pos, mib(out.bytes()),
-                 std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - t_read).count());
-    ++stats_.loads;
-    if (idx >= 0) {
-        // Persist last_used in the file so LRU order and the TTL survive a
-        // restart. Not fsynced: losing it in a crash only ages the entry.
-        touch_locked(entries_[(size_t)idx]);
-    }
-    return out;
-}
-
-bool DiskPrefixCache::adopt(OwnedSnapshot snap, int slot) {
-    if (snap.empty()) return false;
-    {
-        // The first hit after startup confirms the layout read from disk.
-        const auto id = layout_of(snap.ctx());
-        std::lock_guard<std::mutex> lock(mu_);
-        if (layout_from_disk_) {
-            if (id != layout_id_) {
-                std::fprintf(stderr,
-                             "[disk-cache] adopted layout mismatch: disk=%s model=%s\n",
-                             hex(layout_id_.data(), 16).c_str(),
-                             hex(id.data(), 16).c_str());
-                layout_id_ = id;
-                layout_from_disk_ = false;
-                layout_dir_ = config_.cache_dir + "/" + hex(layout_id_.data(), 16);
-                mkdir_p(layout_dir_);
-                return false;
-            }
-        }
-    }
-    if (!backend_.snapshot_adopt(slot, snap.ctx(), snap.buf(), snap.cur_pos(),
-                                 snap.last_tok())) {
-        return false;  // `snap` still owns and frees the payload
-    }
-    snap.release();
-    std::lock_guard<std::mutex> lock(mu_);
-    layout_from_disk_ = false;
-    return true;
-}
-
-bool DiskPrefixCache::lookup(const std::vector<int32_t> & prompt_ids, int slot) {
-    return adopt(load(prompt_ids), slot);
-}
-
-void DiskPrefixCache::for_each_aux(
-        const std::function<void(const std::string &)> & visit) {
-    if (disabled()) return;
-    std::vector<std::pair<uint64_t, std::string>> files;
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        for (const auto & e : entries_) {
-            if (e.own_salt && !e.pending) files.push_back({e.last_used, e.path});
-        }
-    }
-    std::sort(files.begin(), files.end());
-    for (const auto & file : files) {
-        FILE * f = std::fopen(file.second.c_str(), "rb");
-        if (!f) continue;
-        DiskCacheHeader hdr{};
-        std::string aux;
-        const bool ok = read_header(f, hdr) &&
-            read_aux_section(f, hdr.n_tensors, hdr.token_count, aux);
-        std::fclose(f);
-        if (ok && !aux.empty()) visit(aux);
-    }
-}
-
-DiskPrefixCache::PrefixProbe DiskPrefixCache::longest_prefix(
-        const std::vector<int32_t> & prompt_ids,
-        const std::vector<int> * allowed_lengths) {
-    PrefixProbe out;
-    if (disabled()) return out;
-    std::lock_guard<std::mutex> lock(mu_);
-    if (!layout_known_) return out;
-    const uint64_t t = now();
-    std::vector<uint32_t> lengths;
-    for (const auto & e : entries_) {
-        if (e.layout_id != layout_id_ || expired(e, t)) continue;
-        if (e.token_count > prompt_ids.size()) continue;
-        if ((int)e.token_count < config_.min_tokens) continue;
-        if (allowed_lengths &&
-            std::find(allowed_lengths->begin(), allowed_lengths->end(),
-                      (int)e.token_count) == allowed_lengths->end()) continue;
-        lengths.push_back(e.token_count);
-    }
-    std::sort(lengths.begin(), lengths.end(), std::greater<uint32_t>());
-    lengths.erase(std::unique(lengths.begin(), lengths.end()), lengths.end());
-    for (uint32_t len : lengths) {
-        const int idx = find_entry(hash_prefix(prompt_ids.data(), (int)len));
-        if (idx >= 0) {
-            out.len = (int)len;
-            out.cur_pos = (int)entries_[(size_t)idx].cur_pos;
-            return out;
-        }
-    }
-    return out;
-}
-
-int DiskPrefixCache::prune_ancestors(const std::vector<int32_t> & tokens,
-                                     int keep_max) {
-    if (disabled()) return 0;
-    std::lock_guard<std::mutex> lock(mu_);
-    if (!layout_known_) return 0;
-    // The session's older states on disk: strict prefixes of `tokens`.
-    std::vector<size_t> ancestors;
-    bool head_kept = false;  // one at or below keep_max: the shared head
-    size_t shallowest = SIZE_MAX;
-    for (size_t i = 0; i < entries_.size(); ++i) {
-        const DiskEntry & e = entries_[i];
-        if (e.layout_id != layout_id_ || e.token_count >= tokens.size()) continue;
-        if (hash_prefix(tokens.data(), (int)e.token_count) != e.token_hash) continue;
-        if ((int)e.token_count <= keep_max) {
-            head_kept = true;
-            continue;
-        }
-        ancestors.push_back(i);
-        if (shallowest == SIZE_MAX ||
-            e.token_count < entries_[shallowest].token_count) shallowest = i;
-    }
-    // Without a short head on disk, the shallowest ancestor stands in for
-    // it (a long system/tools head other sessions restore), as the RAM
-    // cache keeps its shallowest entry.
-    int removed = 0;
-    std::sort(ancestors.begin(), ancestors.end(), std::greater<size_t>());
-    for (const size_t i : ancestors) {
-        if (!head_kept && i == shallowest) continue;
-        remove_entry(i, "superseded by deeper session state");
-        ++removed;
-    }
-    return removed;
-}
-
-// ─── Save ───────────────────────────────────────────────────────────────
-
-bool DiskPrefixCache::save_async(OwnedSnapshot snap,
-                                 const std::vector<int32_t> & prompt_ids,
-                                 const std::string & aux) {
-    if (disabled() || snap.empty()) return false;
-    if ((int)prompt_ids.size() < config_.min_tokens) return false;
-    // A file is keyed by the hash of `prompt_ids` only, and a hit restores
-    // the whole snapshot. A snapshot that extends past its key would be
-    // restored for any prompt sharing just the key prefix, with unverified
-    // tokens in between, so such files are never written.
-    if (snap.cur_pos() > (int)prompt_ids.size() || snap.cur_pos() <= 0) {
-        std::fprintf(stderr,
-                     "[disk-cache] skip save: snapshot pos=%d does not fit a key of "
-                     "%zu tokens\n", snap.cur_pos(), prompt_ids.size());
-        return false;
-    }
-    learn_layout_from(snap.ctx());
-
-    uint64_t payload = 0;
-    size_t table_bytes = 0;
-    for (ggml_tensor * t = ggml_get_first_tensor(snap.ctx()); t;
-         t = ggml_get_next_tensor(snap.ctx(), t)) {
-        payload += ggml_nbytes(t);
-        table_bytes += 2 + std::strlen(t->name) + 4 + 32 + 8;
-    }
-    const uint64_t est_size = DISK_CACHE_HEADER_SIZE + table_bytes +
-        4ull * prompt_ids.size() + 4 + aux.size() + payload +
-        DISK_CACHE_CHECKSUM_SIZE;
-    const PrefixHash hash = hash_prefix(prompt_ids.data(), (int)prompt_ids.size());
-
-    std::unique_lock<std::mutex> lock(mu_);
-    // Snapshots waiting for the writer hold host memory: bound it.
-    if (pending_bytes_ > 0 && pending_bytes_ + est_size > config_.max_pending_bytes) {
-        ++stats_.backpressure_waits;
-        const auto t0 = std::chrono::steady_clock::now();
-        done_cv_.wait(lock, [&] {
-            return pending_bytes_ == 0 ||
-                pending_bytes_ + est_size <= config_.max_pending_bytes;
-        });
-        std::fprintf(stderr,
-                     "[disk-cache] waited %.2fs for the writer (queued writes over "
-                     "%.0f MB)\n",
-                     std::chrono::duration<double>(
-                         std::chrono::steady_clock::now() - t0).count(),
-                     mib(config_.max_pending_bytes));
-    }
-    expire_locked();
-    // Already on disk (or queued): count it as a use.
-    const int existing = find_entry(hash);
-    if (existing >= 0) {
-        touch_locked(entries_[(size_t)existing]);
-        return true;
-    }
-    // Make room first, so the budget holds while the file is being written.
-    if (est_size > budget_locked()) {
-        std::fprintf(stderr, "[disk-cache] skip save: %.1f MB exceeds budget\n",
-                     mib(est_size));
-        return false;
-    }
-    make_room_locked(est_size);
-
-    auto job = std::make_shared<PendingWrite>();
-    job->snap = std::move(snap);
-    job->key = prompt_ids;
-    job->aux = aux;
-    job->path = make_path(hash);
-    job->created_at = now();
-    job->layout_id = layout_id_;
-
-    DiskEntry entry;
-    entry.id          = next_entry_id_++;
-    entry.path        = job->path;
-    entry.token_hash  = hash;
-    entry.layout_id   = layout_id_;
-    entry.token_count = (uint32_t)prompt_ids.size();
-    entry.cur_pos     = (uint32_t)job->snap.cur_pos();
-    entry.last_used   = job->created_at;
-    entry.own_salt    = true;
-    entry.file_size   = est_size;
-    entry.pending     = job;
-    total_bytes_ += est_size;
-    pending_bytes_ += est_size;
-    queue_.push_back(entry.id);
-    entries_.push_back(std::move(entry));
-    lock.unlock();
-    writer_cv_.notify_one();
-    return true;
-}
-
-bool DiskPrefixCache::save(int slot, const std::vector<int32_t> & prompt_ids,
-                           const std::string & aux) {
-    if (disabled()) return false;
-    learn_layout(slot);
-    if (disabled()) return false;
-    if ((int)prompt_ids.size() < config_.min_tokens) return false;
-    const auto ref = backend_.snapshot_ref(slot);
-    if (!ref.ctx) return false;
-    // Pooled snapshots keep KV in a pager blob that is not a ggml tensor in
-    // ref.ctx; a file written from ref.ctx would restore with no KV.
-    if (ref.pooled) {
-        std::fprintf(stderr, "[disk-cache] skip save: pooled (KVFlash) snapshot not persistable\n");
-        return false;
-    }
-    if (ref.cur_pos > (int)prompt_ids.size()) {
-        std::fprintf(stderr,
-                     "[disk-cache] skip save: snapshot pos=%d exceeds key of "
-                     "%zu tokens\n", ref.cur_pos, prompt_ids.size());
-        return false;
-    }
-    {
-        // Already on disk: no copy needed.
-        const PrefixHash hash = hash_prefix(prompt_ids.data(), (int)prompt_ids.size());
-        std::lock_guard<std::mutex> lock(mu_);
-        const int existing = find_entry(hash);
-        if (existing >= 0) {
-            touch_locked(entries_[(size_t)existing]);
-            return true;
-        }
-    }
-    return save_async(OwnedSnapshot::clone_to_host(ref.ctx, ref.cur_pos, ref.last_tok),
-                      prompt_ids, aux);
-}
-
 // ─── Writer ─────────────────────────────────────────────────────────────
 
-void DiskPrefixCache::writer_loop() {
+void DiskStore::writer_loop() {
     std::unique_lock<std::mutex> lock(mu_);
     while (true) {
         writer_cv_.wait(lock, [&] { return stop_writer_ || !queue_.empty(); });
@@ -1317,30 +782,44 @@ void DiskPrefixCache::writer_loop() {
     }
 }
 
-DiskPrefixCache::DrainResult DiskPrefixCache::drain(double max_seconds) {
-    DrainResult out;
+DiskDrainResult DiskStore::drain(double max_seconds,
+                                 const Owner * only) {
+    DiskDrainResult out;
     if (!writer_.joinable()) return out;
     const auto t0 = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(mu_);
     const uint64_t files0 = stats_.writes;
     const uint64_t bytes0 = stats_.write_bytes;
-    const auto idle = [&] { return queue_.empty() && writing_id_ == 0; };
+    const auto mine = [&](uint64_t id) {
+        if (!only) return true;
+        const int idx = find_entry_id(id);
+        return idx >= 0 && entries_[(size_t)idx].layout_id == only->layout &&
+            entries_[(size_t)idx].salt == only->salt;
+    };
+    const auto idle = [&] {
+        for (const uint64_t id : queue_) {
+            if (mine(id)) return false;
+        }
+        return writing_id_ == 0 || !mine(writing_id_);
+    };
     if (max_seconds < 0) {
         done_cv_.wait(lock, idle);
     } else if (!done_cv_.wait_until(
                    lock, t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                        std::chrono::duration<double>(max_seconds)),
                    idle)) {
-        out.cancelled = queue_.size() + (writing_id_ != 0 ? 1 : 0);
-        while (!queue_.empty()) {
-            const int idx = find_entry_id(queue_.front());
-            if (idx >= 0) {
-                remove_entry((size_t)idx, "flush time limit");
-            } else {
-                queue_.pop_front();
-            }
+        const std::deque<uint64_t> queued = queue_;
+        for (const uint64_t id : queued) {
+            if (!mine(id)) continue;
+            ++out.cancelled;
+            const int idx = find_entry_id(id);
+            if (idx >= 0) remove_entry((size_t)idx, "flush time limit");
+            queue_.erase(std::remove(queue_.begin(), queue_.end(), id), queue_.end());
         }
-        abort_write_.store(true);
+        if (writing_id_ != 0 && mine(writing_id_)) {
+            ++out.cancelled;
+            abort_write_.store(true);
+        }
         done_cv_.wait(lock, idle);
     }
     out.files = stats_.writes - files0;
@@ -1350,75 +829,7 @@ DiskPrefixCache::DrainResult DiskPrefixCache::drain(double max_seconds) {
     return out;
 }
 
-// ─── Continued checkpoints ──────────────────────────────────────────────
-
-bool DiskPrefixCache::maybe_store_continued(int slot,
-                                            const std::vector<int32_t> & all_tokens,
-                                            int cur_pos) {
-    if (disabled()) return false;
-    if (cur_pos < config_.min_tokens) return false;
-    const int interval = config_.continued_interval;
-    if (interval <= 0) return false;
-
-    // The interval only paces the checkpoints: fire once each time cur_pos
-    // crosses a new multiple of it. The file itself is keyed by the full
-    // token prefix the snapshot covers (cur_pos tokens), so a hit can only
-    // come from a prompt that actually contains everything in the snapshot.
-    int target = (cur_pos / interval) * interval;
-    if (target <= continued_last_store_pos_) return false;
-    if (target < config_.min_tokens) return false;
-    if (cur_pos > (int)all_tokens.size()) return false;
-
-    std::vector<int32_t> prefix(all_tokens.begin(), all_tokens.begin() + cur_pos);
-    bool ok = save(slot, prefix);
-    if (ok) {
-        continued_last_store_pos_ = target;
-        std::fprintf(stderr, "[disk-cache] continued checkpoint at %d tokens\n", cur_pos);
-    }
-    return ok;
-}
-
-// ─── Cold prefix boundary ───────────────────────────────────────────────
-
-int DiskPrefixCache::cold_prefix_boundary(const std::vector<int32_t> & prompt_ids,
-                                          const std::vector<int> & boundaries) {
-    if (disabled()) return 0;
-    const int prompt_len = (int)prompt_ids.size();
-    if (prompt_len <= config_.cold_max_tokens) return 0;
-    if (boundaries.empty()) return 0;
-
-    // Find the last turn boundary <= cold_max_tokens.
-    int best = 0;
-    for (int b : boundaries) {
-        if (b <= config_.cold_max_tokens && b >= config_.min_tokens) {
-            best = b;
-        }
-    }
-    if (best == 0) return 0;
-
-    // Check if we already have a disk entry covering this prefix.
-    PrefixHash hash = hash_prefix(prompt_ids.data(), best);
-    std::lock_guard<std::mutex> lock(mu_);
-    if (!layout_known_) return 0;
-    if (find_entry(hash) >= 0) return 0;  // already cached
-    return best;
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────
-
-std::string DiskPrefixCache::make_path(const PrefixHash & hash) const {
-    return layout_dir_ + "/" + hex(hash.data(), 16) + ".dkv";
-}
-
-int DiskPrefixCache::find_entry(const PrefixHash & hash) const {
-    for (int i = 0; i < (int)entries_.size(); ++i) {
-        if (entries_[i].token_hash == hash &&
-            entries_[i].layout_id == layout_id_) return i;
-    }
-    return -1;
-}
-
-int DiskPrefixCache::find_entry_id(uint64_t id) const {
+int DiskStore::find_entry_id(uint64_t id) const {
     for (int i = 0; i < (int)entries_.size(); ++i) {
         if (entries_[(size_t)i].id == id) return i;
     }
@@ -1427,7 +838,7 @@ int DiskPrefixCache::find_entry_id(uint64_t id) const {
 
 // ─── File I/O: Write ────────────────────────────────────────────────────
 
-bool DiskPrefixCache::write_file(const std::string & path, const PendingWrite & job) {
+bool DiskStore::write_file(const std::string & path, const PendingWrite & job) {
     FILE * f = std::fopen(path.c_str(), "wb");
     if (!f) return false;
     ggml_context * ctx = job.snap.ctx();
@@ -1452,7 +863,7 @@ bool DiskPrefixCache::write_file(const std::string & path, const PendingWrite & 
     hdr.created_at    = job.created_at;
     hdr.last_used     = job.last_used;
     hdr.last_tok      = job.snap.last_tok();
-    std::memcpy(hdr.identity_salt, identity_salt_.data(), 16);
+    std::memcpy(hdr.identity_salt, job.salt.data(), 16);
 
     uint8_t raw[DISK_CACHE_HEADER_SIZE];
     serialize_header(hdr, raw);
@@ -1496,13 +907,10 @@ bool DiskPrefixCache::write_file(const std::string & path, const PendingWrite & 
 
 // ─── File I/O: Read ─────────────────────────────────────────────────────
 
-OwnedSnapshot DiskPrefixCache::read_file(const std::string & path,
-                                         const std::vector<int32_t> & prompt_ids) {
-    std::array<uint8_t, 16> layout_id{};
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        layout_id = layout_id_;
-    }
+OwnedSnapshot DiskStore::read_file(const std::string & path,
+                                   const std::vector<int32_t> & prompt_ids,
+                                   const std::array<uint8_t, 16> & layout_id,
+                                   const std::array<uint8_t, 16> & salt) {
     FILE * f = std::fopen(path.c_str(), "rb");
     if (!f) return {};
     const auto fail = [&](const char * why) {
@@ -1523,7 +931,7 @@ OwnedSnapshot DiskPrefixCache::read_file(const std::string & path,
         return fail("bad magic or version");
     }
     if (std::memcmp(hdr.layout_id, layout_id.data(), 16) != 0) return fail("layout");
-    if (std::memcmp(hdr.identity_salt, identity_salt_.data(), 16) != 0) {
+    if (std::memcmp(hdr.identity_salt, salt.data(), 16) != 0) {
         return fail("written by another model/KV type/config");
     }
     // Never restore a snapshot that extends past the tokens its key covers
@@ -1608,13 +1016,23 @@ OwnedSnapshot DiskPrefixCache::read_file(const std::string & path,
 
 // ─── Header I/O ─────────────────────────────────────────────────────────
 
-bool DiskPrefixCache::write_header(FILE * f, const DiskCacheHeader & hdr) {
+bool DiskStore::write_header(FILE * f, const DiskCacheHeader & hdr) {
     uint8_t raw[DISK_CACHE_HEADER_SIZE];
     serialize_header(hdr, raw);
     return std::fwrite(raw, 1, sizeof(raw), f) == sizeof(raw);
 }
 
-bool DiskPrefixCache::read_header(FILE * f, DiskCacheHeader & hdr) {
+bool DiskStore::read_aux(const std::string & path, std::string & aux) {
+    FILE * f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    DiskCacheHeader hdr{};
+    const bool ok = read_header(f, hdr) &&
+        read_aux_section(f, hdr.n_tensors, hdr.token_count, aux);
+    std::fclose(f);
+    return ok;
+}
+
+bool DiskStore::read_header(FILE * f, DiskCacheHeader & hdr) {
     uint8_t raw[DISK_CACHE_HEADER_SIZE];
     if (std::fread(raw, 1, sizeof(raw), f) != sizeof(raw)) return false;
     parse_header(raw, hdr);

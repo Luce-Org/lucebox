@@ -1,7 +1,7 @@
 // freeze_history — pure hash helper for FlowKV freeze-history feature.
 
 #include "server/freeze_history.h"
-#include "server/prefix_cache.h"  // hash_prefix
+#include "server/kv/prefix_cache.h"  // hash_prefix
 
 namespace luce::common {
 

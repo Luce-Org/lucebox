@@ -12,7 +12,7 @@
 #include "common/concurrency/seq_engine.h"
 #include "common/output_constraint.h"
 #include "common/spec_acceptance.h"
-#include "parallel_prefix_txn.h"
+#include "server/kv/parallel_prefix_txn.h"
 #include "response_error.h"
 
 #include <algorithm>
@@ -36,9 +36,6 @@ namespace {
 // engine slot id returned from admit(), so scheduler and engine agree on
 // which engine-owned state record a request owns. This remains the one
 // external phase: sockets stay here, prompt/KV/sampler/progress stay in Qwen.
-using PrefixCaptureTxn = BasicPrefixCaptureTxn<
-    PrefixCache::InlineReservation, SeqEngine>;
-
 struct SchedSlot {
     ServerJob * job = nullptr;
     SocketHandle fd = kInvalidSocket;
@@ -101,9 +98,12 @@ struct PflashStageQueue {
 }  // namespace
 
 void HttpServer::scheduler_loop(SeqEngine & engine) {
+    // The engine's checkpoint ids are Checkpoint ids; payloads in backend
+    // snapshot slots go through checkpoints_.
+    EngineCheckpoints engine_checkpoints(engine, checkpoints_);
     const int n_slots = engine.slot_count();
     if (config_.concurrent_prefix_cache) {
-        if (!engine.supports_prefix_store()) {
+        if (!engine_checkpoints.supported()) {
             prefix_cache_.disable();
             std::fprintf(stderr,
                 "[pc] concurrent prefix cache disabled: engine does not support prefix store\n");
@@ -112,7 +112,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             std::fprintf(stderr,
                 "[pc] concurrent prefix cache disabled: backend snapshot allowance is 0 bytes\n");
         } else if (config_.concurrent_prefix_cache_max_bytes == ServerConfig::kPrefixCacheBudgetAuto) {
-            const size_t per = engine.estimate_prefix_store_bytes(engine.max_context());
+            const size_t per = engine_checkpoints.estimate_bytes(engine.max_context());
             if (per > 0) {
                 const size_t bytes = concurrent_prefix_budget(per, n_slots);
                 if (bytes == 0) {
@@ -126,6 +126,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                         "checkpoint at %d tokens\n",
                         bytes / (1024 * 1024), n_slots, per / (1024 * 1024), engine.max_context());
                 }
+            } else {
+                prefix_cache_.disable();
+                std::fprintf(stderr,
+                    "[pc] concurrent prefix cache disabled: estimated checkpoint size is 0 bytes\n");
             }
         } else {
             const size_t configured = config_.concurrent_prefix_cache_max_bytes;
@@ -171,55 +175,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // longer prompts) releases its waiters to prefill on their own.
     constexpr auto kPrefixLeaderStall = std::chrono::seconds(30);
 
-    // Disk session cache. Checkpoints that leave RAM (a capture replacing
-    // its reservation's victim) are written by the disk writer thread; a
-    // prompt whose deepest state is on disk waits at the head of the line
-    // while a reader thread loads it, so live streams keep decoding. Only
-    // engines whose checkpoints live in the backend's snapshot slots
-    // (Qwen paged) take part.
-    const bool disk_enabled = !disk_cache_.disabled() &&
-        engine.supports_prefix_store() && !prefix_cache_.disabled() &&
-        engine.prefix_store_in_backend_snapshots();
-    if (!disk_cache_.disabled() && !disk_enabled) {
-        std::fprintf(stderr,
-            "[disk-cache] off for concurrent serving: this engine keeps no "
-            "checkpoints in backend snapshot slots\n");
-    }
-    // Recorded with the disk off too: a capture whose resident-budget plan
-    // evicts further checkpoints (PrefixCache::reserve_inline_snap) frees
-    // their payloads here.
-    prefix_cache_.set_record_evictions(true);
-    struct DiskLoad {
-        ServerJob * job = nullptr;
-        std::vector<int32_t> key;
-        struct Result {
-            std::atomic<bool> done{false};
-            OwnedSnapshot snap;
-        };
-        std::shared_ptr<Result> result;
-        std::thread reader;
-    };
-    std::optional<DiskLoad> disk_load;
-    std::vector<DiskLoad> finished_readers;
-    // Staging checkpoint for a disk restore: PrefixCache never uses it.
-    constexpr int kDiskStagingIndex = PrefixCache::MAX_CACHE_SLOTS;
-    auto drop_disk_load = [&]() {
-        if (!disk_load) return;
-        if (disk_load->reader.joinable()) {
-            finished_readers.push_back(std::move(*disk_load));
-        }
-        disk_load.reset();
-    };
-    auto reap_readers = [&]() {
-        for (auto it = finished_readers.begin(); it != finished_readers.end();) {
-            if (it->result->done.load(std::memory_order_acquire)) {
-                it->reader.join();
-                it = finished_readers.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    };
+    // The cache plans this engine's checkpoints; whether the disk cache
+    // takes part is logged there.
+    kv_cache_.attach_engine(engine_checkpoints);
 
     // Degenerate-run guard shared with do_ar_decode: explicit env override,
     // else 32 when the min-tokens floor is active, else off.
@@ -237,7 +195,6 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     int live_slots = 0;
 
     // Capture tickets are never reused during this scheduler run.
-    uint64_t next_prefix_capture_id = 1;
 
     int published_live_count = -1;
     int published_prefill_count = -1, published_parked_count = -1;
@@ -579,175 +536,31 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 req.max_output, live_slots);
         }
 
-        // PrefixCache owns token policy; SeqEngine owns checkpoint payloads.
+        // KvCache owns token policy; SeqEngine owns checkpoint payloads.
         // Unsupported engines never receive a plan, so cold fallback cannot
         // invalidate a valid entry.
-        PrefixStorePlan prefix_plan;
-        PrefixCaptureTxn prepared_capture;
-        PrefixCache::InlineReservation capture_reservation;
-        int restore_policy_slot = -1;
-        bool disk_restore = false;
-        // Tokens alone do not identify an image: image requests never touch
-        // the prefix cache.
-        const bool prefix_supported = !req.images &&
-            engine.supports_prefix_store() && !prefix_cache_.disabled();
+        KvPlan cache_plan;
+        const bool prefix_supported = kv_cache_.plans(static_cast<bool>(req.images));
         if (prefix_supported) {
-            const auto hit = prefix_cache_.lookup_candidate(
-                req.prompt_tokens,
-                (int)req.prompt_tokens.size() - 1);
-            if (hit.first >= 0 && hit.second > 0 &&
-                hit.second < (int)req.prompt_tokens.size()) {
-                restore_policy_slot = hit.first;
-                prefix_plan.restore = {
-                    (uint64_t)hit.first + 1, hit.second};
-            }
-            // A deeper state on disk (the index answers without a read):
-            // load it off this thread, then restore from the staging slot.
-            std::vector<int> scoped_lengths;
-            const auto mode = req.disk_cache_policy.mode;
-            if (mode == DiskPrefixCacheMode::Fixed) {
-                scoped_lengths.push_back(disk_prefix_cache_fixed_boundary(
-                    req.disk_cache_policy, (int)req.prompt_tokens.size(),
-                    config_.disk_cache_min_tokens));
-            } else if (mode == DiskPrefixCacheMode::Auto) {
-                scoped_lengths = find_all_boundaries(
-                    req.prompt_tokens, prefix_cache_.chat_markers());
-            }
-            const auto probe = disk_enabled && mode != DiskPrefixCacheMode::Off
-                ? disk_cache_.longest_prefix(req.prompt_tokens,
-                    mode == DiskPrefixCacheMode::Full ? nullptr : &scoped_lengths)
-                : DiskPrefixCache::PrefixProbe{};
-            if (disk_load && disk_load->job != job) drop_disk_load();
-            if (probe.cur_pos > prefix_plan.restore.tokens &&
-                probe.cur_pos == probe.len &&
-                probe.cur_pos < (int)req.prompt_tokens.size()) {
-                if (!disk_load) {
-                    disk_load.emplace();
-                    disk_load->job = job;
-                    disk_load->key.assign(req.prompt_tokens.begin(),
-                                          req.prompt_tokens.begin() + probe.len);
-                    disk_load->result = std::make_shared<DiskLoad::Result>();
-                    disk_load->reader = std::thread(
-                        [this, key = disk_load->key, out = disk_load->result]() {
-                            out->snap = disk_cache_.load(key);
-                            out->done.store(true, std::memory_order_release);
-                        });
-                    std::fprintf(stderr,
-                        "[disk-cache] %s: reading %d-token state from disk "
-                        "(RAM has %d)\n", req.response_id.c_str(), probe.len,
-                        prefix_plan.restore.tokens);
-                }
-                if (!disk_load->result->done.load(std::memory_order_acquire)) {
-                    return AdmissionDisposition::Loading;
-                }
-                disk_load->reader.join();
-                OwnedSnapshot snap = std::move(disk_load->result->snap);
-                disk_load.reset();
-                const int pos = snap.cur_pos();
-                if (!snap.empty() &&
-                    disk_cache_.adopt(std::move(snap), kDiskStagingIndex)) {
-                    disk_restore = true;
-                    restore_policy_slot = -1;
-                    prefix_plan.restore = {(uint64_t)kDiskStagingIndex + 1, pos};
-                } else {
-                    std::fprintf(stderr,
-                        "[disk-cache] %s: disk state unusable, %s\n",
-                        req.response_id.c_str(),
-                        prefix_plan.restore.valid() ? "restoring from RAM"
-                                                    : "prefilling");
-                }
-            } else if (disk_load && disk_load->job == job) {
-                drop_disk_load();
-            }
-
-            if (prefix_plan.restore.valid() && disk_cache_digest_enabled()) {
-                int n_tensors = 0;
-                uint64_t n_bytes = 0;
-                const uint64_t digest = snapshot_state_digest(
-                    backend_.snapshot_ref((int)prefix_plan.restore.id - 1),
-                    &n_tensors, &n_bytes);
-                std::fprintf(stderr,
-                    "[disk-cache] digest %s source=%s pos=%d tensors=%d "
-                    "bytes=%llu xxh64=%016llx\n",
-                    req.response_id.c_str(), disk_restore ? "ssd" : "ram",
-                    prefix_plan.restore.tokens, n_tensors,
-                    (unsigned long long)n_bytes, (unsigned long long)digest);
-            }
-
-            // The restore source is never the capture destination: the new
-            // checkpoint lands in a different slot so the restore point can
-            // slide forward past the deepest slot (same rule as the classic
-            // worker's restore_source_slot).
-            const int restored_len =
-                prefix_plan.restore.valid() ? prefix_plan.restore.tokens : 0;
-            const auto reserve_capture = [&](int forced_cut) {
-                return prefix_cache_.reserve_inline_snap(
-                    req.prompt_tokens, restored_len,
-                    /*prefer_tools_boundary=*/!req.tools.empty(),
-                    forced_cut,
-                    restore_policy_slot,
-                    [&engine](int target_cut) {
-                        return engine.estimate_prefix_store_bytes(target_cut);
-                    },
-                    /*reachable_from=*/0, backend_.restore_point_spacing());
+            KvPlanQuery query;
+            query.owner = job;
+            query.request_id = req.response_id.c_str();
+            query.prompt = &req.prompt_tokens;
+            query.disk_policy = req.disk_cache_policy;
+            query.prefer_head = !req.tools.empty();
+            query.forced_cut = req.pin_end_token;
+            query.queued_shared_prefix = [&]() {
+                return queued_shared_prefix(req.prompt_tokens);
             };
-            capture_reservation = reserve_capture(req.pin_end_token);
-            // Subagents launched together: when the requests still queued
-            // share more of this prompt than its own capture keeps whole
-            // (system messages that differ only after the tools), it
-            // captures the shared prefix instead, for them to restore.
-            const int wait_min = config_.shared_prefix_wait_min_tokens;
-            if (capture_reservation.active() && wait_min > 0 &&
-                req.pin_end_token <= restored_len) {
-                const int own_cut = capture_reservation.target_cut();
-                const int shared = queued_shared_prefix(req.prompt_tokens);
-                if (shared < own_cut && shared - restored_len >= wait_min) {
-                    capture_reservation.cancel();
-                    capture_reservation = reserve_capture(shared);
-                    if (capture_reservation.active() &&
-                        capture_reservation.target_cut() <= shared &&
-                        capture_reservation.target_cut() - restored_len >= wait_min) {
-                        std::fprintf(stderr,
-                            "[pc] %s captures the %d-token prefix it shares with "
-                            "queued requests, not %d\n", req.response_id.c_str(),
-                            capture_reservation.target_cut(), own_cut);
-                    } else {
-                        capture_reservation.cancel();
-                        capture_reservation = reserve_capture(req.pin_end_token);
-                    }
-                }
+            query.shared_prefix_min_tokens = config_.shared_prefix_wait_min_tokens;
+            if (kv_cache_.plan(query, cache_plan) == KvCache::PlanStatus::loading) {
+                return AdmissionDisposition::Loading;
             }
-            if (capture_reservation.active()) {
-                const uint64_t capture_id = next_prefix_capture_id++;
-                if (next_prefix_capture_id == 0)
-                    next_prefix_capture_id = 1;
-                prefix_plan.capture.id = capture_id;
-                prefix_plan.capture.checkpoint = {
-                    (uint64_t)capture_reservation.slot() + 1,
-                    capture_reservation.target_cut()};
-                if (prefix_plan.restore.valid() &&
-                    prefix_plan.capture.checkpoint == prefix_plan.restore) {
-                    capture_reservation.cancel();
-                    prefix_plan.capture = {};
-                }
-            }
-        }
-        if (prefix_supported) {
-            // The same cuts on hits and misses, whatever the cache holds (as the
-            // single-sequence path passes GenerateRequest::restore_points).
-            prefix_plan.restore_points = request_restore_points(
-                req.prompt_tokens,
-                {prefix_plan.restore.tokens, prefix_plan.capture.checkpoint.tokens});
-        }
-        if (prefix_plan.capture.valid()) {
-            prepared_capture = PrefixCaptureTxn(
-                std::move(capture_reservation), engine,
-                prefix_plan.capture);
         }
 
         // Admission only claims the slot and queues the prompt. Prefill
         // advances one chunk per engine step alongside live decode.
-        const PrefixStorePlan requested_plan = prefix_plan;
+        const PrefixStorePlan & requested_plan = cache_plan.plan;
         auto ar = req.images
             ? engine.admit_images(
                   next_request_id, req.prompt_tokens, req.sampler, req.images)
@@ -760,87 +573,18 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                   (std::min)(n_gen_cap, engine.max_context() -
                                             (int)req.prompt_tokens.size() + 1));
 
-        std::string prefix_protocol_error;
         const PrefixStoreAdmission & prefix = ar.prefix_store;
-        if (prefix.restore_attempted) {
-            prefix_cache_.record_restore_attempt(
-                prefix.restore_elapsed_us, prefix.restored.valid());
-        }
-        if (prefix.malformed_restore_state()) {
-            prefix_protocol_error =
-                "engine returned malformed prefix restore state";
-            // A malformed outcome does not tell us whether the engine-owned
-            // payload is still usable. Drop both sides of the requested
-            // checkpoint so a later lookup cannot retry stale metadata.
-            prepared_capture.cancel();
-            if (requested_plan.restore.valid() && restore_policy_slot >= 0) {
-                engine.discard_prefix_store(requested_plan.restore);
-                prefix_cache_.invalidate_inline_snap(restore_policy_slot);
-            }
-        }
-        if (disk_restore) {
-            // The engine copied the staging checkpoint into the sequence's
-            // pages during admission (or rejected it); it is not kept.
-            backend_.snapshot_free(kDiskStagingIndex);
-            if (prefix.restored.valid() &&
-                prefix.restored == requested_plan.restore) {
-                std::fprintf(stderr,
-                    "[disk-cache] hit %s: restored %d tokens from disk\n",
-                    req.response_id.c_str(), prefix.restored.tokens);
-            }
-        }
-        if (disk_restore && prefix.invalidated.valid() &&
-            prefix.invalidated == requested_plan.restore) {
-            // A disk state that does not fit this cache layout: the engine
-            // already admitted the prompt cold.
-            std::fprintf(stderr,
-                "[disk-cache] %s: disk state rejected by the engine, prefilling\n",
-                req.response_id.c_str());
-        } else if (prefix.invalidated.valid()) {
-            if (prefix.invalidated != requested_plan.restore ||
-                restore_policy_slot < 0) {
-                prefix_protocol_error =
-                    "engine invalidated an unrequested prefix checkpoint";
-            } else {
-                // Cancel this admission's reservation before removing the
-                // stale restore metadata. The invalidation itself must not
-                // clear a capture reservation owned by another live request.
-                // Qwen already discarded the engine-owned payload.
-                prepared_capture.cancel();
-                prefix_cache_.invalidate_inline_snap(restore_policy_slot);
-            }
-        }
-        if (prefix.restored.valid() &&
-            prefix.restored != requested_plan.restore) {
-            engine.discard_prefix_store(prefix.restored);
-            prefix_protocol_error =
-                "engine restored an unrequested prefix checkpoint";
-        }
-        if (prefix.restored.valid() && prefix.invalidated.valid()) {
-            prefix_protocol_error =
-                "engine both restored and invalidated one checkpoint";
-        }
-        if (prefix.capture.valid() &&
-            prefix.capture != requested_plan.capture) {
-            prefix_protocol_error =
-                "engine accepted an unrequested prefix capture";
-        }
-        if (ar.status != SeqEngine::AdmitResult::Status::admitted &&
-            (prefix.restored.valid() || prefix.capture.valid())) {
-            prefix_protocol_error =
-                "failed admission returned accepted prefix state";
-        }
+        const std::string prefix_protocol_error = kv_cache_.admitted(
+            cache_plan, prefix,
+            ar.status == SeqEngine::AdmitResult::Status::admitted,
+            req.response_id.c_str());
+        PrefixCaptureTxn & prepared_capture = cache_plan.capture;
         if (!prefix_protocol_error.empty()) {
-            prepared_capture.cancel();
             if (ar.status == SeqEngine::AdmitResult::Status::admitted)
                 engine.retire(ar.slot);
             ar.status = SeqEngine::AdmitResult::Status::failed;
             ar.error = "prefix admission protocol violation: " +
                 prefix_protocol_error;
-        } else if (prefix.capture != requested_plan.capture) {
-            // Rejected capture: no payload was touched, so preserve any
-            // incumbent selected by the cache's transactional eviction.
-            prepared_capture.cancel();
         }
 
 
@@ -887,11 +631,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             return AdmissionDisposition::Retired;
         }
         next_request_id++;
-        if (prefix.restored.valid() && restore_policy_slot >= 0) {
-            prefix_cache_.record_inline_hit(
-                restore_policy_slot, prefix.restored.tokens,
-                req.prompt_tokens.size());
-        }
+        kv_cache_.restored(cache_plan, prefix, req.prompt_tokens.size());
 
         // Commit response bytes only after admission. A busy routed request
         // can still try another model; no tokenizer/model identity is on wire.
@@ -962,7 +702,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         const int min_tokens = config_.shared_prefix_wait_min_tokens;
         const std::vector<int32_t> & prompt = job->req.prompt_tokens;
         if (min_tokens <= 0 || job->req.images ||
-            !engine.supports_prefix_store() || prefix_cache_.disabled()) {
+            !engine_checkpoints.supported() || prefix_cache_.disabled()) {
             return -1;
         }
         int leader = -1, best_cut = 0;
@@ -1161,7 +901,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     };
 
     while (true) {
-        reap_readers();
+        kv_cache_.reap_reads();
         // A waiter whose client left is finished now, even while every slot
         // is busy and nothing is admitted: the scheduler took it off the
         // queue, so nothing else would notice.
@@ -1204,7 +944,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     // scratch memory back and park in a blocking dequeue.
                     publish_live_count();
                     backend_.release_scratch();
-                    job = finished_readers.empty() ? dequeue()
+                    job = !kv_cache_.reads_to_reap() ? dequeue()
                         : dequeue_for(std::chrono::milliseconds(5));
                     woke_from_idle = job != nullptr;
                 } else {
@@ -1221,7 +961,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
             if (!job) break;  // queue empty: go decode what is already live
             if (job->client_disconnected.load(std::memory_order_acquire)) {
-                if (disk_load && disk_load->job == job) drop_disk_load();
+                kv_cache_.drop_read(job);
                 finish_job(job);
                 continue;
             }
@@ -1606,105 +1346,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             SchedSlot & s = slots[(size_t)out.slot];
             if (!s.job) continue;
             if (out.prefix_store.attempted()) {
-                prefix_cache_.record_capture_attempt(
-                    out.prefix_store.elapsed_us,
-                    out.prefix_store.status ==
-                        PrefixStoreEvent::Status::saved);
-                using Resolution = PrefixCaptureTxn::Resolution;
-                const Resolution resolution = s.cache_capture.resolve(
-                    out.prefix_store, s.job->req.prompt_tokens);
-                const int captured =
-                    (int)out.prefix_store.ticket.checkpoint.id - 1;
-                // The checkpoint this capture replaced in its slot (the
-                // reservation's victim) left RAM: write it to disk unless it
-                // was only an edit backup. Claimed on every outcome, and
-                // freed here when there is no disk to write it to.
-                OwnedSnapshot displaced = backend_.snapshot_take_displaced(captured);
-                for (auto & evicted : prefix_cache_.take_evicted()) {
-                    if (evicted.slot != captured) {
-                        // A further checkpoint the capture's resident-budget
-                        // plan evicted as it committed: its payload is still
-                        // in its own slot. Written like the displaced one,
-                        // then freed.
-                        bool queued = false;
-                        if (disk_enabled && evicted.persist && slot_tokens_.count(evicted.slot)) {
-                            const auto aux = slot_aux_.find(evicted.slot);
-                            const std::string blob =
-                                aux == slot_aux_.end() ? std::string() : aux->second;
-                            OwnedSnapshot snap = backend_.snapshot_detach(evicted.slot);
-                            const int pos = snap.empty() ? 0 : snap.cur_pos();
-                            queued = !snap.empty() &&
-                                disk_cache_.save_async(std::move(snap), evicted.ids, blob);
-                            if (queued) {
-                                disk_cache_.prune_ancestors(
-                                    evicted.ids, config_.disk_cache_cold_max_tokens);
-                            }
-                            std::fprintf(stderr,
-                                "[disk-cache] ram eviction checkpoint=%d tokens=%zu "
-                                "pos=%d -> %s\n", evicted.slot + 1, evicted.ids.size(),
-                                pos, queued ? "write queued" : "not written");
-                        }
-                        engine.discard_prefix_store(
-                            {(uint64_t)evicted.slot + 1, (int)evicted.ids.size()});
-                        forget_inline_slot_metadata(evicted.slot);
-                        continue;
-                    }
-                    if (displaced.empty()) continue;
-                    if (evicted.persist && slot_tokens_.count(captured)) {
-                        const auto aux = slot_aux_.find(captured);
-                        const int pos = displaced.cur_pos();
-                        const bool queued = disk_cache_.save_async(
-                            std::move(displaced), evicted.ids,
-                            aux == slot_aux_.end() ? std::string() : aux->second);
-                        if (queued) {
-                            disk_cache_.prune_ancestors(
-                                evicted.ids, config_.disk_cache_cold_max_tokens);
-                        }
-                        std::fprintf(stderr,
-                            "[disk-cache] ram eviction checkpoint=%d tokens=%zu "
-                            "pos=%d -> %s\n", captured + 1, evicted.ids.size(),
-                            pos, queued ? "write queued" : "not written");
-                    }
-                    displaced.reset();
-                }
-                if (resolution == Resolution::saved) {
-                    // The slot holds the new checkpoint now.
-                    forget_inline_slot_metadata(captured);
-                    if (disk_enabled && s.job->req.disk_cache_policy.mode == DiskPrefixCacheMode::Full) {
-                        const int tokens = out.prefix_store.ticket.checkpoint.tokens;
-                        const auto & prompt = s.job->req.prompt_tokens;
-                        slot_tokens_[captured] = std::vector<int32_t>(
-                            prompt.begin(), prompt.begin() + tokens);
-                        slot_aux_[captured] =
-                            session_replay_blob(s.job->req, nullptr);
-                    }
-                    // A conversation's checkpoints are prefixes of each other;
-                    // restores use only the deepest, so the ones it supersedes
-                    // would hold memory the other conversations need.
-                    std::vector<int> tokens;
-                    const auto pruned = prefix_cache_.prune_superseded_ancestors(
-                        captured, &tokens);
-                    for (size_t i = 0; i < pruned.size(); ++i) {
-                        forget_inline_slot_metadata(pruned[i]);
-                        engine.discard_prefix_store({(uint64_t)pruned[i] + 1, tokens[i]});
-                    }
-                } else if (resolution == Resolution::failed) {
-                    std::fprintf(stderr,
-                        "[parallel-pc] capture failed checkpoint=%llu: %s\n",
-                        (unsigned long long)
-                            out.prefix_store.ticket.checkpoint.id,
-                        out.prefix_store.error.c_str());
-                } else if (resolution == Resolution::mismatched ||
-                           resolution == Resolution::inactive) {
-                    // The transaction has already aborted only its own
-                    // destination. Never act on an event-supplied checkpoint.
-                    std::fprintf(stderr,
-                        "[parallel-pc] capture ticket mismatch id=%llu "
-                        "checkpoint=%llu\n",
-                        (unsigned long long)out.prefix_store.ticket.id,
-                        (unsigned long long)
-                            out.prefix_store.ticket.checkpoint.id);
-                }
+                const ParsedRequest & captured_req = s.job->req;
+                kv_cache_.captured(
+                    s.cache_capture, out.prefix_store, captured_req.prompt_tokens,
+                    captured_req.disk_cache_policy.mode,
+                    [&]() { return session_replay_blob(captured_req, nullptr); });
             }
             if (out.status == PrefillStatus::failed) {
                 s.error = to_response_error(
@@ -1782,9 +1428,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     }
     pflash_stage.jobs.clear();
 
-    drop_disk_load();
-    for (auto & reader : finished_readers) reader.reader.join();
-    finished_readers.clear();
+    kv_cache_.join_reads();
 
     // Shutdown: unblock every parked client thread.
     for (int i = 0; i < n_slots; i++) {

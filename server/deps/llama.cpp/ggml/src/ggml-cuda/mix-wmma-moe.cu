@@ -318,8 +318,17 @@ __launch_bounds__(kThreads) __global__ void mix_wmma_moe_kernel(
             uint8_t cb[16] = {};
 #pragma unroll
             for (int i = 0; i < F::kCodeBytes; ++i) cb[i] = rb[i];
+            // __HIP_DEVICE_COMPILE: Windows HIP clang resolves std::memcpy to
+            // the host CRT inside __global__ functions (hard error); the
+            // builtin lowers to plain load/store on the device pass. The
+            // CUDA/nvcc and host passes keep the original calls.
+#ifdef __HIP_DEVICE_COMPILE__
+            __builtin_memcpy(&lo, cb, 8);
+            __builtin_memcpy(&hi, cb + 8, 4);
+#else
             std::memcpy(&lo, cb, 8);
             std::memcpy(&hi, cb + 8, 4);
+#endif
             const uint32_t meta0 = rb[F::kCodeBytes], meta1 = rb[F::kCodeBytes + 1];
             if constexpr (mix_is_fp2<TYPE>()) {
                 mix_wmma_decode_half<TYPE>(lo & 0xFFFFFFFFull, meta0, mode, s_lut, o0);

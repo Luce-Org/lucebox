@@ -8,6 +8,12 @@
 //   same chain kept unfused: bit-identical streams and normalized input.
 // So LUCE_DS4_FUSE_ROUTER / LUCE_DS4_FUSE_COLLAPSE / the boundary fusion
 // never change a token.
+// - ggml_argmax vs the host greedy scan (`if (x[i] > x[best]) best = i`): the
+//   same pick on ties across lanes and warps, -inf rows and NaNs, so greedy
+//   decode may take its picks from the device.
+// - ggml_top_k + get_rows over vocabulary-wide rows (a sampled request's top
+//   candidates): k distinct ids with their values, holding every logit above
+//   the smallest one kept, as sample_logits_top requires.
 //
 // Exit codes: 0 pass, 1 mismatch, 77 no GPU backend.
 #include "ggml-alloc.h"
@@ -542,11 +548,13 @@ bool run_rms_norm_mix(ggml_backend_t backend, int k, int tokens, uint32_t seed) 
 }
 
 // The cluster shared expert's gate/up pair: Q8_0 row slices of wider weights
-// at several columns (batch-invariant MMVQ), fused with SwiGLU-DS4 into one
-// RDNA4 launch (ggml_cuda_mmvq_rdna4_glu_pair) vs the same products kept
-// apart (a copy between each product and the GLU breaks the pattern). One
-// column is a single-token decode step, which the generic fusion forms.
-bool run_glu_pair(ggml_backend_t backend, int n_in, int n_full, int n_ff, int ff_begin, int ncols, uint32_t seed) {
+// at several columns (batch-invariant MMVQ), fused with SwiGLU-DS4 (or plain
+// SwiGLU, qwen4exp's shared expert) into one RDNA4 launch
+// (ggml_cuda_mmvq_rdna4_glu_pair) vs the same products kept apart (a copy
+// between each product and the GLU breaks the pattern). One column is a
+// single-token decode step, which the generic fusion forms.
+bool run_glu_pair(ggml_backend_t backend, int n_in, int n_full, int n_ff, int ff_begin, int ncols, uint32_t seed,
+                  bool ds4 = true) {
     ggml_init_params params{};
     params.mem_size = ggml_tensor_overhead() * 48 + ggml_graph_overhead();
     params.no_alloc = true;
@@ -558,9 +566,11 @@ bool run_glu_pair(ggml_backend_t backend, int n_in, int n_full, int n_ff, int ff
     auto slice = [&](ggml_tensor * w) {
         return ggml_view_2d(ctx, w, n_in, n_ff, w->nb[1], (size_t) ff_begin * w->nb[1]);
     };
-    ggml_tensor * fus = ggml_swiglu_ds4_split(ctx, ggml_mul_mat(ctx, slice(gw), x), ggml_mul_mat(ctx, slice(uw), x), 7.0f);
-    ggml_tensor * ref = ggml_swiglu_ds4_split(ctx, ggml_cont(ctx, ggml_mul_mat(ctx, slice(gw), x)),
-                                              ggml_cont(ctx, ggml_mul_mat(ctx, slice(uw), x)), 7.0f);
+    auto glu = [&](ggml_tensor * g, ggml_tensor * u) {
+        return ds4 ? ggml_swiglu_ds4_split(ctx, g, u, 7.0f) : ggml_swiglu_split(ctx, g, u);
+    };
+    ggml_tensor * fus = glu(ggml_mul_mat(ctx, slice(gw), x), ggml_mul_mat(ctx, slice(uw), x));
+    ggml_tensor * ref = glu(ggml_cont(ctx, ggml_mul_mat(ctx, slice(gw), x)), ggml_cont(ctx, ggml_mul_mat(ctx, slice(uw), x)));
     for (ggml_tensor * t : {fus, ref}) ggml_set_output(t);
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, fus);
@@ -589,8 +599,8 @@ bool run_glu_pair(ggml_backend_t backend, int n_in, int n_full, int n_ff, int ff
         ggml_backend_tensor_get(fus, b.data(), 0, sizeof(float) * n);
         for (size_t i = 0; i < n; ++i) {
             if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) {
-                std::fprintf(stderr, "glu pair mismatch n_in=%d n_ff=%d begin=%d cols=%d at %zu: ref %.9g fused %.9g\n",
-                             n_in, n_ff, ff_begin, ncols, i, a[i], b[i]);
+                std::fprintf(stderr, "glu pair (%s) mismatch n_in=%d n_ff=%d begin=%d cols=%d at %zu: ref %.9g fused %.9g\n",
+                             ds4 ? "ds4" : "plain", n_in, n_ff, ff_begin, ncols, i, a[i], b[i]);
                 ok = false;
                 break;
             }
@@ -850,6 +860,134 @@ bool run_sink_mask(ggml_backend_t backend, int n_attn, int n_head, uint32_t seed
     return ok;
 }
 
+// Rows with planted ties (the maximum at two or three ids, the later ones in lane 0 or an earlier warp), an all -inf
+// row, NaNs (at id 0 the scan keeps 0) against the host scan's pick.
+bool run_argmax(ggml_backend_t backend, int ncols, uint32_t seed) {
+    const int rows = 8;
+    ggml_init_params params{};
+    params.mem_size = ggml_tensor_overhead() * 4 + ggml_graph_overhead();
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, rows);
+    ggml_set_input(x);
+    ggml_tensor * picks = ggml_argmax(ctx, x);
+    ggml_set_output(picks);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, picks);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 4.0f);
+    std::vector<float> h((size_t) ncols * rows);
+    for (float & v : h) v = normal(rng);
+    auto row = [&](int r) { return h.data() + (size_t) r * ncols; };
+    const float top = 1000.0f;
+    row(0)[std::min(ncols - 1, 37)] = top;                       // single maximum
+    row(1)[std::min(ncols - 1, 33)] = row(1)[0] = top;           // tie with id 0 (lane 0 holds the later id first)
+    row(2)[std::min(ncols - 1, 3)] = row(2)[std::min(ncols - 1, 1024)] = top;   // tie across warps/strides
+    row(3)[ncols - 1] = row(3)[ncols / 2] = row(3)[std::min(ncols - 1, 5)] = top;
+    std::fill_n(row(4), ncols, -INFINITY);                       // all -inf: the scan keeps 0
+    std::fill_n(row(5), ncols, -INFINITY);
+    row(5)[ncols - 1] = row(5)[ncols / 3] = -INFINITY;
+    row(5)[std::min(ncols - 1, ncols / 3 + 1)] = -1.0f;
+    row(6)[0] = NAN;                                             // NaN at 0: the scan never moves
+    row(6)[ncols / 2] = top;
+    row(7)[ncols / 2] = NAN;                                     // NaN elsewhere: never picked
+    row(7)[std::min(ncols - 1, ncols / 2 + 1)] = top;
+    row(7)[ncols - 1] = top;
+    ggml_backend_tensor_set(x, h.data(), 0, sizeof(float) * h.size());
+    bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    if (ok) {
+        std::vector<int32_t> got(rows);
+        ggml_backend_tensor_get(picks, got.data(), 0, sizeof(int32_t) * rows);
+        for (int r = 0; r < rows; ++r) {
+            int best = 0;
+            for (int i = 1; i < ncols; ++i) {
+                if (row(r)[i] > row(r)[best]) best = i;
+            }
+            if (got[(size_t) r] != best) {
+                std::fprintf(stderr, "argmax mismatch ncols=%d row %d: device %d host %d\n", ncols, r, got[(size_t) r], best);
+                ok = false;
+            }
+        }
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return ok;
+}
+
+// Each row's k largest logits and their values, read as the qwen4exp verify graph reads them: random rows, a tie
+// group straddling the k-th rank, a row of one value and a row of mostly -inf.
+bool run_top_candidates(ggml_backend_t backend, int ncols, int k, uint32_t seed) {
+    const int rows = 6;
+    ggml_init_params params{};
+    params.mem_size = ggml_tensor_overhead() * 6 + ggml_graph_overhead();
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, rows);
+    ggml_set_input(x);
+    ggml_tensor * ids = ggml_top_k(ctx, x, k);
+    ggml_tensor * vals = ggml_get_rows(ctx, ggml_reshape_3d(ctx, x, 1, ncols, rows), ids);
+    ggml_set_output(ids);
+    ggml_set_output(vals);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, ids);
+    ggml_build_forward_expand(gf, vals);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 4.0f);
+    std::vector<float> h((size_t) ncols * rows);
+    for (float & v : h) v = normal(rng);
+    auto row = [&](int r) { return h.data() + (size_t) r * ncols; };
+    for (int i = 0; i < k / 2; ++i) row(2)[(size_t) (i * 7919) % ncols] = 50.0f + (float) i;   // the top half
+    for (int i = 0; i < k; ++i) row(2)[(size_t) (i * 104729 + 13) % ncols] = 40.0f;            // ties across rank k
+    std::fill_n(row(3), ncols, 1.5f);
+    std::fill_n(row(4), ncols, -INFINITY);
+    for (int i = 0; i < k / 4; ++i) row(4)[(size_t) (i * 31 + 5) % ncols] = (float) i;
+    ggml_backend_tensor_set(x, h.data(), 0, sizeof(float) * h.size());
+    bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    if (ok) {
+        std::vector<int32_t> got_ids((size_t) k * rows);
+        std::vector<float> got_vals((size_t) k * rows);
+        ggml_backend_tensor_get(ids, got_ids.data(), 0, sizeof(int32_t) * got_ids.size());
+        ggml_backend_tensor_get(vals, got_vals.data(), 0, sizeof(float) * got_vals.size());
+        for (int r = 0; r < rows && ok; ++r) {
+            const int32_t * id = got_ids.data() + (size_t) r * k;
+            const float * v = got_vals.data() + (size_t) r * k;
+            std::vector<char> kept((size_t) ncols, 0);
+            float floor = INFINITY;
+            for (int i = 0; i < k; ++i) {
+                if (id[i] < 0 || id[i] >= ncols || kept[(size_t) id[i]] ||
+                    std::memcmp(&v[i], &row(r)[id[i]], sizeof(float)) != 0) {
+                    std::fprintf(stderr, "top candidates ncols=%d k=%d row %d: bad entry %d (id %d)\n", ncols, k, r, i,
+                                 id[i]);
+                    ok = false;
+                    break;
+                }
+                kept[(size_t) id[i]] = 1;
+                floor = std::min(floor, v[i]);
+            }
+            for (int j = 0; j < ncols && ok; ++j) {
+                if (!kept[(size_t) j] && row(r)[j] > floor) {
+                    std::fprintf(stderr, "top candidates ncols=%d k=%d row %d: id %d (%g) above the kept floor %g\n",
+                                 ncols, k, r, j, row(r)[j], floor);
+                    ok = false;
+                }
+            }
+        }
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return ok;
+}
+
 // Inverse tail rope of the attention context read by the grouped output
 // projection (batched Q8_0 MMVQ over a [D * hpg, T, groups] view): the rope
 // writes the view's q8_1; the reference reads a copy of the rope output.
@@ -985,6 +1123,14 @@ int main() {
     for (const auto & sc : sink_cases) {
         if (!run_sink_mask(backend, sc[0], sc[1], seed++)) ++failures;
     }
+    for (int ncols : {248320, 151936, 64000, 1025, 33, 2}) {
+        if (!run_argmax(backend, ncols, seed++)) ++failures;
+    }
+    for (int ncols : {248320, 151936, 8193}) {
+        for (int k : {32, 64, 128}) {
+            if (!run_top_candidates(backend, ncols, k, seed++)) ++failures;
+        }
+    }
     const int rope_q8_cases[][3] = {{32, 8, 5}, {32, 8, 2}, {64, 8, 3}, {16, 4, 5}};
     for (const auto & rc : rope_q8_cases) {
         if (!run_rope_q8(backend, rc[0], rc[1], rc[2], seed++)) ++failures;
@@ -1000,6 +1146,11 @@ int main() {
                                      {1024, 64, 32, 32, 1}};
         for (const auto & pc : pair_cases) {
             if (!run_glu_pair(backend, pc[0], pc[1], pc[2], pc[3], pc[4], seed++)) ++failures;
+        }
+        // Plain SwiGLU: qwen4exp's shared expert (2560 in, 640 out, whole weights) and a slice.
+        const int plain_cases[][5] = {{2560, 640, 640, 0, 1}, {2560, 640, 640, 0, 3}, {1024, 64, 32, 32, 1}};
+        for (const auto & pc : plain_cases) {
+            if (!run_glu_pair(backend, pc[0], pc[1], pc[2], pc[3], pc[4], seed++, false)) ++failures;
         }
         const int slice_cases[][5] = {{64, 2304, 0, 1152, 5}, {64, 2304, 1152, 1152, 4}, {96, 4096, 2048, 2048, 3}, {64, 2304, 1152, 1152, 1}};
         for (const auto & sc : slice_cases) {

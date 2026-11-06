@@ -752,9 +752,15 @@ add_library(luce_common STATIC
     src/server/pflash_unified.cpp
     src/server/response_error.cpp
     src/server/sse_emitter.cpp
-    src/server/prefix_cache.cpp
+    src/server/kv/chat_boundaries.cpp
+    src/server/kv/checkpoint_store.cpp
+    src/server/kv/cuts.cpp
+    src/server/kv/kv_cache.cpp
+    src/server/kv/prefix_hash.cpp
+    src/server/kv/prefix_cache.cpp
     src/server/pin_friendly_prompt.cpp
-    src/server/disk_prefix_cache.cpp
+    src/server/kv/disk_prefix_cache.cpp
+    src/server/kv/disk_store.cpp
     src/server/freeze_history.cpp
     # ── Jinja chat-template engine (vendored under deps/llama.cpp/common/) ──
     # Used by render_chat_template_jinja() to support --chat-template-file
@@ -1164,7 +1170,8 @@ if(LUCE_TESTS)
         test_rope_tail
         test_kernel_qualification_core
         test_cuda_copy_batch
-        test_uma_budget)
+        test_uma_budget
+        test_mmq_tile_twin_gate)
 
     # Standalone check of the DS4 MIX histogram fitter: reuses the converter
     # source with its main() renamed away, so it needs the converter's
@@ -1191,6 +1198,12 @@ if(LUCE_TESTS)
     # Header-only RAM check for managed allocations on integrated GPUs
     # (ggml-cuda/uma-budget.h); it needs no GPU toolkit to build or run.
     add_executable(test_uma_budget test/unit/test_uma_budget.cpp)
+
+    # RDNA4 MMQ tile-twin gate (ggml-cuda/mmq-tile-twin-gate.h): header-only,
+    # no GPU.
+    add_executable(test_mmq_tile_twin_gate test/unit/test_mmq_tile_twin_gate.cpp)
+    target_include_directories(test_mmq_tile_twin_gate PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
 
     # Header-only platform shims must remain independently buildable and
     # runnable on hosted Windows workers without a GPU.
@@ -1447,6 +1460,11 @@ if(LUCE_TESTS)
         # to a host reference on the vector-eligible shapes and on the shapes that fall back to the scalar kernel.
         luce_add_ggml_gpu_executable(test_cpy_vec_parity test/unit/test_cpy_vec_parity.cpp)
         list(APPEND _raw_unit_test_targets test_cpy_vec_parity)
+        # Guards the MMQ tile twins (ggml-cuda/mmq_tile_twins.h): each arm (twins off, one, both) runs in a child
+        # process and must hash-equal the parent tiles on every case, and launch a twin exactly where
+        # mmq-tile-twin-gate.h says. SKIP (77) without a GPU or on a GPU that is not RDNA4.
+        luce_add_ggml_gpu_executable(test_mmq_tile_twins test/unit/test_mmq_tile_twins.cpp)
+        list(APPEND _raw_unit_test_targets test_mmq_tile_twins)
         # Guards the fused PLE conv matcher (ple-conv.cu): the qwen4exp subgraph must match (no LUCE_PLE_DEBUG
         # "no match" lines) and hash-equal the unfused nodes (child process under LUCE_PLE_FUSE_LEGACY=1).
         luce_add_ggml_gpu_executable(test_ple_conv_fusion test/unit/test_ple_conv_fusion.cpp)
@@ -1700,6 +1718,16 @@ if(LUCE_TESTS)
                 $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda> --combine-only)
         set_tests_properties(deepseek4_mmid_grouped_cuda_combine_override
             PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_qn_split_fusions.cpp")
+        # Host-only (GGML C API): the Qwen3.8 split fusions against their
+        # unfused graphs, and the argmax tie rule, on every GPU.
+        add_executable(test_qn_split_fusions test/unit/test_qn_split_fusions.cpp)
+        target_include_directories(test_qn_split_fusions PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        target_link_libraries(test_qn_split_fusions PRIVATE
+            ggml ${LUCE_GGML_BACKEND_TARGET} ggml-base)
+        # Registered through the CppUnit list below.
     endif()
     if(LUCE_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_moe_combine_cuda.cpp")
         add_executable(test_ds4_moe_combine_cuda test/unit/test_ds4_moe_combine_cuda.cpp)
@@ -2629,6 +2657,7 @@ if(LUCE_TESTS)
             test/unit/test_anchor_params.cpp
             test/unit/test_derived_scalars.cpp
             test/unit/test_adaptive_spec_width.cpp
+            test/unit/test_prompt_lookup.cpp
             test/unit/test_immutable_graph_input_pool.cpp
             test/unit/test_mmq_tile_selection.cpp
             test/unit/test_mixed_mmq_policy.cpp
@@ -2938,7 +2967,9 @@ if(LUCE_TESTS)
         test_rocmfp_mix_gateup_glu
         test_rocmfp_mix_glu_fusable
         test_cuda_copy_batch
-        test_uma_budget)
+        test_qn_split_fusions
+        test_uma_budget
+        test_mmq_tile_twin_gate)
     foreach(_cppunit_target IN LISTS _new_cppunit_test_targets)
         if(TARGET ${_cppunit_target})
             target_sources(${_cppunit_target} PRIVATE test/unit/test_unit_main.cpp)

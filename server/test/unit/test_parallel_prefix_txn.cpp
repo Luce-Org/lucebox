@@ -1,4 +1,4 @@
-#include "server/parallel_prefix_txn.h"
+#include "server/kv/parallel_prefix_txn.h"
 #include "host_check.h"
 
 #include <type_traits>

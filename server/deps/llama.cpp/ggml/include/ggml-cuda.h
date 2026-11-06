@@ -89,6 +89,16 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mla_stream_topk_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count(void);
 
+// Calling-thread count of MMQ calls served by an RDNA4 tile twin with
+// `tile_rows` rows (64 or 32, mmq_tile_twins.h);
+// 0 for other values.
+// Lets the twin parity test reject a silent fallback to the parent tile.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_twin_launch_count(int tile_rows);
+
+// Tests only: turn the RDNA4 MMQ tile twins (64-row, 32-row) on or off, to
+// compare them bit for bit with the parent tiles. Both are on by default.
+GGML_BACKEND_API void ggml_backend_cuda_set_mmq_twins_override(bool rows64, bool rows32);
+
 // Calling-thread launch counters for the scalar and grouped-column GDN
 // kernels. Focused qualification tests use these to reject silent fallback.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void);
@@ -295,6 +305,19 @@ enum ggml_cuda_qwen4exp_profile {
 };
 GGML_BACKEND_API enum ggml_cuda_qwen4exp_profile ggml_backend_cuda_set_qwen4exp_profile(enum ggml_cuda_qwen4exp_profile profile);
 GGML_BACKEND_API bool ggml_backend_cuda_qwen4exp_supported(ggml_backend_t backend);
+
+// Calling-thread counts of the Qwen3.8 split fusions taken, so their parity test (test_qn_split_fusions) can tell a
+// pattern that stopped matching from one that still fuses.
+enum ggml_cuda_qn_fusion {
+    GGML_CUDA_QN_ROUTE_NORM,     // the router's GET_ROWS, SUM_ROWS, CLAMP and DIV in one launch
+    GGML_CUDA_QN_SHARED_GATE,    // the shared expert's SIGMOID and MUL folded into DS4_MOE_COMBINE
+    GGML_CUDA_QN_HC_CN_Q8,       // HC_COMBINE_NORM writing the next matmul's q8_1 rows
+    GGML_CUDA_QN_HC_MIX_Q8,      // the HC mix reduce writing the next matmul's q8_1 rows
+    GGML_CUDA_QN_UNARY_MUL_Q8,   // UNARY then MUL writing the next matmul's q8_1 rows
+    GGML_CUDA_QN_SCALE_SILU,     // SCALE then SILU in one launch
+    GGML_CUDA_QN_COUNT,
+};
+GGML_BACKEND_API size_t ggml_backend_cuda_get_qn_fusion_count(enum ggml_cuda_qn_fusion kind);
 // True when the QSA selected-attention kernels (qsa.cu) run on the backend's device: gfx1151 and RDNA4.
 GGML_BACKEND_API bool ggml_backend_cuda_qsa_supported(ggml_backend_t backend);
 

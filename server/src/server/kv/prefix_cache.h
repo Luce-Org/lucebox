@@ -12,7 +12,10 @@
 
 #pragma once
 
-#include "tokenizer.h"
+#include "server/kv/chat_boundaries.h"
+#include "server/kv/cuts.h"
+#include "server/kv/prefix_hash.h"
+#include "server/tokenizer.h"
 
 #include <array>
 #include <atomic>
@@ -24,31 +27,6 @@
 #include <vector>
 
 namespace luce::common {
-
-// ─── Chat marker detection ──────────────────────────────────────────────
-
-struct ChatMarkers {
-    std::string family;  // "deepseek", "qwen", "gemma", or "laguna"
-    // Token sequences for boundary detection
-    std::vector<int32_t> sys_role_prefix;
-    std::vector<std::vector<int32_t>> end_msg_seqs;
-    std::vector<std::vector<int32_t>> next_role_starts;
-    // The template closes only some turns with an end marker (DeepSeek: the
-    // system text and user turns end where the next role starts). Every role
-    // marker is then a boundary on its own.
-    bool role_starts_delimit = false;
-};
-
-// Resolve chat markers from the tokenizer (detects Qwen, Gemma, or Laguna family).
-bool resolve_chat_markers(const Tokenizer & tok, ChatMarkers & out);
-
-// Find all turn-boundary cut points in a token stream.
-std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
-                                     const ChatMarkers & markers);
-
-// SHA-1 hash of a prefix (truncated to 16 bytes).
-using PrefixHash = std::array<uint8_t, 16>;
-PrefixHash hash_prefix(const int32_t * ids, int count);
 
 // Prefix-aware inline eviction: given cached prefixes in LRU order (0 = oldest),
 // return the index of the oldest "leaf" — an entry that is not a strict prefix
@@ -79,54 +57,6 @@ int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru
                                int skip_index = -1,
                                const std::vector<bool> * held_lru = nullptr);
 
-// Pick the inline snapshot boundary for a request: the last marker, the end
-// of the prompt's last message and the start of the generation prompt, only
-// when it advances past an already-restored prefix. That is the point the
-// next turn extends: a person's follow-up, or an agent's next step after its
-// tool results. A person who edits that message resumes from the previous
-// turn's snapshot instead (PrefixCache::prune_superseded_ancestors keeps it).
-// When prefer_head is set (a conversation's first turn, or a tool-heavy agent
-// request), prefer the first marker (the system/tools head) until that cut is
-// already restored, so new conversations on the same head restore it.
-// Returns 0 when there is no useful new boundary.
-// Cuts below `reachable_from` (the first position the backend can save at,
-// see ModelBackend::snapshot_granularity) are skipped.
-int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
-                                    int restored_prefix_len = 0,
-                                    bool prefer_head = false,
-                                    int reachable_from = 0);
-
-// Restore points spaced at least `min_gap` tokens apart: the first boundary
-// (the system/tools head), then each boundary at least `min_gap` past the last
-// kept one. Prefix-stable: the points of a prompt are the points, up to its
-// end, of every prompt that extends it, so a checkpoint saved at one is a
-// restore point of every later turn. min_gap <= 0 keeps every boundary.
-std::vector<int> spaced_restore_points(const std::vector<int> & boundaries, int min_gap);
-
-// Every position a later request may restore `prompt`'s prefix from: its chat
-// boundaries, spaced by `spacing` (spaced_restore_points), plus the extra cuts
-// a cache may take (a PPP pin, a fixed disk scope), ascending. See
-// GenerateRequest::restore_points. `drop_last_boundary` leaves out the
-// generation prompt's own boundary: a request that does not snapshot there
-// saves no state past it, so that split would only cost a short extra prefill
-// step (a snapshot there comes back through `cuts`).
-std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
-                                       const ChatMarkers & markers,
-                                       std::initializer_list<int> cuts,
-                                       bool drop_last_boundary = false,
-                                       int spacing = 0);
-
-// Return true when a PPP forced cut should override normal boundary
-// selection. Once the tools head is already restored, forcing the pin again
-// prevents the cache from deepening into the conversation.
-bool should_force_inline_snapshot_boundary(
-    const std::vector<int> & boundaries,
-    int prompt_len,
-    int restored_prefix_len,
-    bool prefer_tools_boundary,
-    int forced_cut,
-    int reachable_from = 0);
-
 // ─── Prefix cache entry ─────────────────────────────────────────────────
 
 struct FullCacheEntry {
@@ -150,10 +80,10 @@ public:
     PrefixCache(int cap, const Tokenizer & tokenizer,
                 size_t max_resident_bytes = 0);
 
-    bool disabled() const { return disabled_; }
+    bool disabled() const { return disabled_.load(std::memory_order_acquire); }
     void disable() {
-        disabled_ = true;
-        cap_ = 0;
+        cap_.store(0, std::memory_order_relaxed);
+        disabled_.store(true, std::memory_order_release);
     }
 
     // Expose chat markers for cold prefix boundary detection.
@@ -285,11 +215,10 @@ public:
 
     // Evicts committed entries, pins last and never `keep_slot` or a pinned
     // ancestor of it, until the resident bytes fit the budget again. Returns
-    // the evicted slots; the caller frees their snapshot payloads.
-    // `persist` (optional) gets persist_on_evict() of each evicted slot,
-    // decided before it was erased.
-    std::vector<int> enforce_resident_budget(
-        int keep_slot, std::vector<bool> * persist = nullptr);
+    // the evicted entries, as they were before they were erased; the caller
+    // writes those worth keeping to disk and frees their payloads.
+    struct Evicted;
+    std::vector<Evicted> enforce_resident_budget(int keep_slot);
 
     // ── Disk persistence of evicted entries ─────────────────────────
     // Whether the entry in `slot`, about to leave RAM, should be written to
@@ -300,11 +229,31 @@ public:
     bool persist_on_evict(int slot) const;
     // Token ids an entry in `slot` covers (empty when none).
     std::vector<int32_t> entry_tokens(int slot) const;
+    // An entry leaving the index, with what writing it to disk needs.
     struct Evicted {
         int slot = -1;
         std::vector<int32_t> ids;
-        bool persist = false;
+        bool persist = false;               // persist_on_evict(), before it left
+        std::vector<int32_t> disk_key;      // empty: never written to disk
+        std::string aux;
     };
+    // The entry in `slot` as an eviction record; slot -1 when there is none.
+    Evicted entry(int slot) const;
+
+    // ── State attached to an entry after its commit ────────────────
+    // It lives and dies with the entry: a commit into the same slot, an
+    // eviction, an invalidation or an abort drops it.
+    // The entry is written to disk under its first `tokens` ids when it
+    // leaves RAM (the backend may save a little before the entry's cut);
+    // without a key (a compressed view, a non-`full` disk scope) it is not.
+    void set_disk_key(int slot, int tokens);
+    bool has_disk_key(int slot) const;
+    // Written with that file: the session's tool-call replay text.
+    void set_aux(int slot, std::string aux);
+    // A generated agent turn (HttpServer::save_generated_turn), not a prompt
+    // prefix: the next request continues it the same way.
+    void mark_agent_turn(int slot);
+    bool agent_turn(int slot) const;
     // Opt-in log of entries a commit replaced (its reservation's victim) or
     // the resident budget evicted, for callers whose payload outlives the
     // metadata (the concurrent scheduler writes them to disk).
@@ -384,8 +333,8 @@ public:
     FullStats full_stats() const;
 
 private:
-    bool disabled_ = true;
-    int cap_ = 0;
+    std::atomic<bool> disabled_{true};
+    std::atomic<int> cap_{0};
     ChatMarkers markers_;
 
     // LRU for inline prefix cache: ordered map of hash → slot.
@@ -399,6 +348,10 @@ private:
         // Kept behind a deeper snapshot of its conversation only so an
         // edit of the last message can resume (prune_superseded_ancestors).
         bool                 edit_backup = false;
+        // See set_disk_key, set_aux and mark_agent_turn.
+        int                  disk_key_len = 0;
+        std::string          aux;
+        bool                 agent_turn = false;
     };
     std::vector<LruEntry> entries_;
     int next_slot_ = 0;
@@ -427,6 +380,7 @@ private:
     std::vector<Evicted> evicted_log_;
     // Log entries_[idx] into evicted_log_ (when recording) before an erase.
     void record_eviction(int idx);
+    Evicted evicted_record(const LruEntry & entry) const;
     size_t resident_bytes_ = 0;
 
     // Full-cache state
