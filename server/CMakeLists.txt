@@ -1487,6 +1487,11 @@ if(LUCE_TESTS)
         target_link_libraries(test_fattn_mma256 PRIVATE ggml-cpu)
         list(APPEND _raw_unit_test_targets test_fattn_mma256)
 
+        # Sparse-mask flash attention (ggml_flash_attn_ext_set_sparse_mask): skipping the KV tiles every query masks
+        # out is bit-identical over the DFlash drafter's ring layouts.
+        luce_add_ggml_gpu_executable(test_fattn_sparse_mask_gpu test/unit/test_fattn_sparse_mask_gpu.cpp)
+        list(APPEND _raw_unit_test_targets test_fattn_sparse_mask_gpu)
+
         # Standalone mmb-vs-library-GEMM differential on one quantized MUL_MAT,
         # against a CPU dequant reference. See the file header.
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_mmb_cublas_diff.cpp")
