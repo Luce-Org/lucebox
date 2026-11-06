@@ -2281,12 +2281,13 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     , chat_codec_(make_chat_codec(server_chat_codec(config)))
     , prefix_cache_(config.prefix_cache_cap, tokenizer,
           resolve_prefix_cache_budget(config, engine.backend()).bytes)
+    , checkpoints_(engine.backend())
     , disk_cache_({config.disk_cache_dir,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
-                   config.disk_cache_continued_interval,
-                   config.disk_cache_cold_max_tokens,
-                   disk_cache_ttl_seconds(config.disk_cache_ttl_hours)}, backend_)
+                   disk_cache_ttl_seconds(config.disk_cache_ttl_hours)}, checkpoints_)
+    , kv_cache_(prefix_cache_, disk_cache_, checkpoints_,
+                config.disk_cache_cold_max_tokens, config.disk_cache_min_tokens)
 {
     if (!config_.chat_codec.empty() && !chat_codec_) {
         throw std::invalid_argument("unknown chat codec: " + config_.chat_codec);
@@ -2304,7 +2305,7 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     #endif
     prefix_cache_.init_full_cache(config.prefill_cache_cap);
     // Commits prune the snapshots they supersede: single-sequence serving in
-    // trim_snapshots_after_commit, the concurrent scheduler as each capture lands.
+    // KvCache::trim_after_commit, the concurrent scheduler as each capture lands.
     prefix_cache_.set_prunes_superseded(true);
     // Fold model+config identity into the layout fingerprint BEFORE init()
     // so compute_layout_id sees it on every learn/verify call. Prevents stale
@@ -2317,6 +2318,13 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     // Report the effective state after initialization failure or a directory
     // lock conflict; serving continues with the ordinary RAM cache.
     if (disk_cache_.disabled()) config_.disk_cache_dir.clear();
+    // Entries reach disk when they leave the RAM prefix cache (and at
+    // shutdown): without RAM slots nothing new is written.
+    if (!disk_cache_.disabled() && prefix_cache_.disabled()) {
+        std::fprintf(stderr,
+            "[disk-cache] no RAM prefix slots (--prefix-cache-slots 0): serving the "
+            "entries on disk, writing only fixed-scope prefixes\n");
+    }
     restore_replay_blobs();
     status_html_path_ = resolve_status_html();
 
@@ -2654,8 +2662,6 @@ void HttpServer::shutdown() {
     // newest snapshot and the heads. Safe without locking — the worker is
     // joined. A crash or kill -9 loses what was only in RAM.
     flush_sessions_to_disk("shutdown");
-    slot_tokens_.clear();
-    slot_aux_.clear();
 }
 
 bool HttpServer::start_worker() {
@@ -2869,11 +2875,9 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
         clients_cv_.wait(lk, [this]() { return active_clients_.load() == 0; });
     }
 
-    // Graceful shutdown is one last eviction (worker joined — no race on
-    // slot_tokens_).
+    // Graceful shutdown is one last eviction (worker joined: no race on the
+    // prefix cache).
     flush_sessions_to_disk("shutdown");
-    slot_tokens_.clear();
-    slot_aux_.clear();
 
 #if defined(_WIN32)
     // Status-event sockets remain owned until shutdown(). Keep Winsock alive
@@ -3368,18 +3372,8 @@ bool HttpServer::parse_common_request_fields(
             !apply_request_scope_override(
                 req.disk_cache_policy, prefix_cache["scope"].get<std::string>())) {
             send_error(fd, 400,
-                "prefix_cache.scope must be off, full, auto, auto:<window>, or a positive token count");
+                "prefix_cache.scope must be off, full or a positive token count");
             return false;
-        }
-        if (prefix_cache.contains("window") &&
-            prefix_cache["window"].is_number_integer()) {
-            const int window = prefix_cache["window"].get<int>();
-            if (window <= 0 || window > 1000000) {
-                send_error(fd, 400,
-                           "prefix_cache.window must be a positive integer");
-                return false;
-            }
-            req.disk_cache_policy.auto_window = window;
         }
     }
 
@@ -4352,8 +4346,8 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
 
 namespace {
 
-// Disk-cache staging lives above both PrefixCache pools.
-constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
+// PrefixCache still hands out slot numbers; payload calls take checkpoints.
+Checkpoint checkpoint_of(int cache_slot) { return Checkpoint::of_cache_slot(cache_slot); }
 
 
 // Prompt preparation applies exactly one compression policy: FlowKV for
@@ -6306,17 +6300,18 @@ int HttpServer::ram_restorable_prefix_tokens(
     // The snapshot the generation path would restore, if any; the backend then
     // says what a restore really skips (a KVFlash live session can cover more,
     // or a pooled snapshot less, than the snapshot itself holds).
-    int snapshot_slot = -1;
+    Checkpoint snapshot;
     int snapshot_tokens = 0;
     int limit = prefix_cache_.disabled() ? 0 : (int) prompt.size();
     while (limit > 0) {
         const auto [slot, length] =
             prefix_cache_.lookup_candidate(prompt, limit);
         if (slot < 0 || length <= 0) break;
-        if (backend_.snapshot_used(slot)) {
-            const int position = backend_.snapshot_cur_pos(slot);
+        const Checkpoint candidate = checkpoint_of(slot);
+        if (checkpoints_.used(candidate)) {
+            const int position = checkpoints_.position(candidate);
             if (position > 0) {
-                snapshot_slot = slot;
+                snapshot = candidate;
                 snapshot_tokens = (std::min)(length, position);
                 break;
             }
@@ -6325,7 +6320,7 @@ int HttpServer::ram_restorable_prefix_tokens(
         // generation path invalidates it when it gets there.
         limit = length - 1;
     }
-    return backend_.restorable_prefix(prompt, snapshot_slot, snapshot_tokens);
+    return checkpoints_.restorable_prefix(prompt, snapshot, snapshot_tokens);
 }
 
 json HttpServer::pflash_failure_counters_json() const {
@@ -8232,16 +8227,9 @@ bool HttpServer::forward_upstream(
 #endif
 }
 
-std::vector<int> HttpServer::request_restore_points(const std::vector<int32_t> & prompt,
-                                                    std::initializer_list<int> cuts) const {
-    return prefix_restore_points(prompt, prefix_cache_.chat_markers(), cuts,
-        /*drop_last_boundary=*/!backend_.prefill_cuts_at_restore_points(),
-        backend_.restore_point_spacing());
-}
-
 // Cache lookup and snapshot preparation form one lifecycle; confirmation is
 // deferred until generation proves that the snapshot contains useful output.
-HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
+KvLease HttpServer::prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,
         GenerateRequest & generate_request) {
     request_session_slots_.clear();
@@ -8311,49 +8299,9 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             config_.ppp_lcp_window);
     }
 
-    GenerationCacheState cache;
-    cache.cache_slot = prepared.full_cache_hit_slot;
-    cache.prefix_len = prepared.full_cache_hit_len;
-    cache.using_restore = cache.cache_slot >= 0;
-    cache.disk_policy = req.disk_cache_policy;
-    cache.full_snap_key_effective = ppp_rewrote;
-
-    // Exact full-prompt snapshots. After a DiffPin rewrite, key by the
-    // tokens we actually serve (effective_prompt), not the client wire form.
-    if (!cache.using_restore) {
-        const auto & full_key =
-            ppp_rewrote ? effective_prompt : req.prompt_tokens;
-        auto [full_slot, full_len] = prefix_cache_.lookup_full(full_key);
-        if (full_slot >= 0) {
-            cache.cache_slot = full_slot;
-            cache.prefix_len = full_len;
-            cache.using_restore = true;
-            if (prepared.compressed) {
-                effective_prompt.assign((size_t) full_len, 0);
-                generate_request.prompt = effective_prompt;
-            }
-        }
-    }
-    // An entry whose backend snapshot is gone is dropped and the next
-    // deepest one tried, instead of prefilling the whole prompt.
-    while (!cache.using_restore) {
-        const auto [inline_slot, inline_len] = prefix_cache_.lookup_candidate(
-            effective_prompt, (int) effective_prompt.size());
-        if (inline_slot < 0) break;
-        if (!backend_.snapshot_used(inline_slot)) {
-            forget_inline_slot_metadata(inline_slot);
-            prefix_cache_.invalidate_inline_snap(inline_slot);
-            continue;
-        }
-        prefix_cache_.record_inline_hit(
-            inline_slot, inline_len, effective_prompt.size());
-        cache.cache_slot = inline_slot;
-        cache.prefix_len = inline_len;
-        cache.using_restore = true;
-    }
-
     // FlowKV may rewrite aged messages, so only its stable system prefix is
     // safe for scoped disk reuse. Whole-prompt PFlash requires Full scope.
+    DiskPrefixCachePolicy disk_policy = req.disk_cache_policy;
     int system_end = 0;
     if (http_detail::should_clamp_flowkv_disk_cache(
             prepared.flowkv, req.disk_cache_policy)) {
@@ -8361,354 +8309,50 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             effective_prompt, prefix_cache_.chat_markers());
         system_end = boundaries.empty() ? 0 : boundaries[0];
         if (system_end >= config_.disk_cache_min_tokens) {
-            cache.disk_policy.mode = DiskPrefixCacheMode::Fixed;
-            cache.disk_policy.fixed_tokens = system_end;
+            disk_policy.mode = DiskPrefixCacheMode::Fixed;
+            disk_policy.fixed_tokens = system_end;
             std::fprintf(stderr,
                 "[flowkv] disk-clamp: boundary clamped to system_end=%d\n",
                 system_end);
         } else {
-            cache.disk_policy.mode = DiskPrefixCacheMode::Off;
+            disk_policy.mode = DiskPrefixCacheMode::Off;
             std::fprintf(stderr,
                 "[flowkv] disk-clamp: system_end=%d < min=%d — disk off\n",
                 system_end, config_.disk_cache_min_tokens);
         }
     } else if (prepared.compressed && !prepared.flowkv &&
-               cache.disk_policy.mode != DiskPrefixCacheMode::Full) {
-        cache.disk_policy.mode = DiskPrefixCacheMode::Off;
+               disk_policy.mode != DiskPrefixCacheMode::Full) {
+        disk_policy.mode = DiskPrefixCacheMode::Off;
     }
 
-    std::vector<int> safe_boundaries;
-    if (cache.disk_policy.mode == DiskPrefixCacheMode::Auto) {
-        safe_boundaries = find_all_boundaries(
-            effective_prompt, prefix_cache_.chat_markers());
-    }
+    KvMatchQuery match;
+    match.prompt = &effective_prompt;
+    match.client_prompt = &req.prompt_tokens;
+    match.key_by_served = ppp_rewrote;
+    match.disk_policy = disk_policy;
+    match.compressed = prepared.compressed;
+    match.unified_view = prepared.unified_view;
+    match.exact_hit = checkpoint_of(prepared.full_cache_hit_slot);
+    match.exact_hit_len = prepared.full_cache_hit_len;
+    match.forced_cut = forced_cut;
+    bool prompt_replaced = false;
+    KvLease cache = kv_cache_.match(match, &prompt_replaced);
+    if (prompt_replaced) generate_request.prompt = effective_prompt;
 
-    int selected_boundary = 0;
-    if (cache.disk_policy.mode == DiskPrefixCacheMode::Fixed) {
-        selected_boundary = disk_prefix_cache_fixed_boundary(
-            cache.disk_policy, (int) effective_prompt.size(),
-            config_.disk_cache_min_tokens);
-    } else if (cache.disk_policy.mode == DiskPrefixCacheMode::Auto) {
-        selected_boundary = disk_prefix_cache_auto_boundary(
-            effective_prompt, recent_disk_prompts_,
-            cache.disk_policy.auto_window, safe_boundaries,
-            config_.disk_cache_min_tokens);
-        std::fprintf(stderr,
-            "[disk-cache] auto scope: window=%d recent=%zu safe=%zu selected=%d\n",
-            cache.disk_policy.auto_window,
-            std::min(recent_disk_prompts_.size(),
-                     (size_t) cache.disk_policy.auto_window),
-            safe_boundaries.size(), selected_boundary);
-    }
-
-    std::vector<int> lookup_lengths;
-    DiskPrefixCache::PrefixProbe disk_probe;
-    if (cache.disk_policy.mode == DiskPrefixCacheMode::Full &&
-        !effective_prompt.empty()) {
-        // Probes are index lookups; only a hit reads a file. A restart then
-        // recovers any inline snapshot the previous process persisted, not
-        // just exact prompts and the short cold prefix.
-        lookup_lengths = disk_prefix_cache_full_lookup_lengths(
-            (int) effective_prompt.size(),
-            find_all_boundaries(effective_prompt, prefix_cache_.chat_markers()),
-            config_.disk_cache_min_tokens);
-        // Session states (agent turns with their generated text) are keyed
-        // past the prompt's chat boundaries; the index knows their lengths.
-        const auto probe = disk_cache_.longest_prefix(effective_prompt);
-        disk_probe = probe;
-        if (probe.len > 0 &&
-            std::find(lookup_lengths.begin(), lookup_lengths.end(), probe.len) ==
-                lookup_lengths.end()) {
-            lookup_lengths.insert(lookup_lengths.begin(), probe.len);
-            std::sort(lookup_lengths.begin(), lookup_lengths.end(),
-                      std::greater<int>());
-        }
-    } else if (selected_boundary > 0) {
-        lookup_lengths.push_back(selected_boundary);
-    } else if (cache.disk_policy.mode == DiskPrefixCacheMode::Auto) {
-        for (auto it = safe_boundaries.rbegin();
-             it != safe_boundaries.rend(); ++it) {
-            if (*it >= config_.disk_cache_min_tokens &&
-                *it <= (int) effective_prompt.size()) {
-                lookup_lengths.push_back(*it);
-            }
-        }
-    }
-
-    // A RAM hit does not end the search: a session whose deep snapshot was
-    // evicted to disk often still matches a shallow resident entry (the
-    // shared system/tools head). The deeper disk state wins; the index
-    // answers without a read, and a failed read keeps the RAM hit.
-    bool disk_lookup = !cache.using_restore;
-    const int ram_prefix_len = cache.using_restore ? cache.prefix_len : 0;
-    if (cache.using_restore && !disk_cache_.disabled() &&
-        (!prepared.compressed || prepared.unified_view) && disk_probe.len > 0 &&
-        disk_probe.cur_pos > cache.prefix_len &&
-        disk_probe.len < (int) effective_prompt.size()) {
-        lookup_lengths.assign(1, disk_probe.len);
-        disk_lookup = true;
-    }
-    if (disk_lookup && !disk_cache_.disabled()) {
-        for (int lookup_length : lookup_lengths) {
-            std::vector<int32_t> prefix_tokens(
-                effective_prompt.begin(),
-                effective_prompt.begin() + lookup_length);
-            if (!disk_cache_.lookup(prefix_tokens, kDiskStagingSlot)) continue;
-
-            const int hit_pos = backend_.snapshot_cur_pos(kDiskStagingSlot);
-            if (hit_pos <= 0 || hit_pos > (int) effective_prompt.size()) {
-                std::fprintf(stderr,
-                    "[disk-cache] ignoring invalid hit pos=%d prompt=%zu\n",
-                    hit_pos, effective_prompt.size());
-                backend_.snapshot_free(kDiskStagingSlot);
-                continue;
-            }
-            cache.cache_slot = kDiskStagingSlot;
-            cache.prefix_len = hit_pos;
-            cache.using_restore = true;
-            cache.disk_hit = true;
-            std::fprintf(stderr,
-                "[disk-cache] hit policy=%s len=%d slot=%d pos=%d (RAM had %d)\n",
-                disk_prefix_cache_policy_name(cache.disk_policy).c_str(),
-                lookup_length, kDiskStagingSlot, cache.prefix_len,
-                ram_prefix_len);
-            break;
-        }
-    }
-
-    // Scoped entries must prefill exactly to their hashed boundary before
-    // the staging snapshot can be used for the remaining prompt.
-    if (!cache.using_restore && !disk_cache_.disabled() &&
-        selected_boundary > 0) {
-        std::fprintf(stderr,
-            "[disk-cache] scoped prefix: policy=%s boundary=%d\n",
-            disk_prefix_cache_policy_name(cache.disk_policy).c_str(),
-            selected_boundary);
-        GenerateRequest scoped_request;
-        scoped_request.prompt = std::vector<int32_t>(
-            effective_prompt.begin(),
-            effective_prompt.begin() + selected_boundary);
-        scoped_request.n_gen = 0;
-        scoped_request.snap_slot = kDiskStagingSlot;
-        scoped_request.snap_pos = selected_boundary;
-        scoped_request.restore_points = prefix_restore_points(
-            scoped_request.prompt, prefix_cache_.chat_markers(), {forced_cut},
-            false, backend_.restore_point_spacing());
-        DaemonIO scoped_io;
-        scoped_io.stream_fd = -1;
-        const auto scoped_result =
-            backend_.generate(scoped_request, scoped_io);
-        if (scoped_result.ok() &&
-            backend_.snapshot_used(kDiskStagingSlot)) {
-            disk_cache_.learn_layout(kDiskStagingSlot);
-            const bool saved =
-                disk_cache_.save(kDiskStagingSlot, scoped_request.prompt);
-            cache.cache_slot = kDiskStagingSlot;
-            cache.prefix_len = selected_boundary;
-            cache.using_restore = true;
-            cache.disk_hit = true;
-            std::fprintf(stderr,
-                "[disk-cache] scoped prefix %s, restoring from %d\n",
-                saved ? "saved" : "staged", selected_boundary);
-        } else {
-            backend_.snapshot_free(kDiskStagingSlot);
-        }
-    }
-
-    // Edited or summarized histories can be shorter than the stored KV.
-    // Such snapshots cannot be diff-prefilled safely.
-    // The logical entry length (what the PrefixCache believes is cached, e.g.
-    // the tools-head pin at 3620) can exceed the chunk-aligned KV position the
-    // backend actually restored (e.g. 3584). Deepen decisions must compare
-    // against the logical length; otherwise that chunk gap keeps
-    // `forced_cut > restored` true on every tool-heavy turn, the pin branch
-    // keeps targeting the already-cached head, and the cache never deepens
-    // past the head pin (full conversation re-prefilled each turn).
-    const int pre_overwrite_prefix_len = cache.prefix_len;
-    int logical_prefix_len =
-        cache.using_restore ? pre_overwrite_prefix_len : 0;
-    if (cache.using_restore) {
-        const int snapshot_length =
-            backend_.snapshot_cur_pos(cache.cache_slot);
-        if (snapshot_length <= 0 ||
-            snapshot_length > (int) effective_prompt.size()) {
-            std::fprintf(stderr,
-                "[pc] slot=%d invalid snapshot pos=%d prompt=%zu — treating as miss\n",
-                cache.cache_slot, snapshot_length, effective_prompt.size());
-            if (cache.disk_hit) {
-                backend_.snapshot_free(kDiskStagingSlot);
-            } else {
-                // A memory-cache key whose backend snapshot disappeared
-                // must not remain discoverable on every later request.
-                // Inline and full caches use disjoint slot ranges, so
-                // invalidating both ownership tables is unambiguous.
-                forget_inline_slot_metadata(cache.cache_slot);
-                backend_.snapshot_free(cache.cache_slot);
-                prefix_cache_.invalidate_inline_snap(cache.cache_slot);
-                prefix_cache_.abort_full_snap(cache.cache_slot);
-            }
-            cache.cache_slot = -1;
-            cache.prefix_len = 0;
-            cache.using_restore = false;
-            cache.disk_hit = false;
-        } else {
-            // PrefixCache keys use safe chat boundaries. Qwen may save at an
-            // earlier chunk-aligned position to keep prefill numerically
-            // identical, so backend state is the authoritative amount of
-            // work actually reused.
-            cache.prefix_len = snapshot_length;
-        }
-    }
-
-    // A compressed prompt is not raw history: never persist a prefix of it.
-    // With RAM prefix slots the inline snapshot holds the head and reaches
-    // disk when it is evicted, so this extra prefill-and-write is only the
-    // fallback without them.
-    if (!cache.using_restore && !disk_cache_.disabled() &&
-        prefix_cache_.disabled() && !prepared.compressed &&
-        cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
-        const auto boundaries = find_all_boundaries(
-            effective_prompt, prefix_cache_.chat_markers());
-        const int cold_boundary =
-            disk_cache_.cold_prefix_boundary(effective_prompt, boundaries);
-        if (cold_boundary > 0) {
-            std::fprintf(stderr,
-                "[disk-cache] cold prefix: prefilling to boundary=%d\n",
-                cold_boundary);
-            GenerateRequest cold_request;
-            cold_request.prompt = std::vector<int32_t>(
-                effective_prompt.begin(),
-                effective_prompt.begin() + cold_boundary);
-            cold_request.n_gen = 0;
-            cold_request.snap_slot = kDiskStagingSlot;
-            cold_request.snap_pos = cold_boundary;
-            cold_request.restore_points = prefix_restore_points(
-                cold_request.prompt, prefix_cache_.chat_markers(), {forced_cut},
-                false, backend_.restore_point_spacing());
-            DaemonIO cold_io;
-            cold_io.stream_fd = -1;
-            const auto cold_result = backend_.generate(cold_request, cold_io);
-            if (cold_result.ok() &&
-                backend_.snapshot_used(kDiskStagingSlot)) {
-                disk_cache_.learn_layout(kDiskStagingSlot);
-                const std::vector<int32_t> prefix_tokens(
-                    effective_prompt.begin(),
-                    effective_prompt.begin() + cold_boundary);
-                disk_cache_.save(kDiskStagingSlot, prefix_tokens);
-                cache.cache_slot = kDiskStagingSlot;
-                cache.prefix_len = cold_boundary;
-                cache.using_restore = true;
-                cache.disk_hit = true;
-                // This restore was created after the pre-overwrite capture.
-                logical_prefix_len = cold_boundary;
-                std::fprintf(stderr,
-                    "[disk-cache] cold prefix saved, restoring from %d\n",
-                    cold_boundary);
-            } else {
-                backend_.snapshot_free(kDiskStagingSlot);
-            }
-        }
-    }
-
-    // A generation can save only one snapshot during prefill. Tool-heavy
-    // requests prefer the reusable system/tool boundary; otherwise an
-    // enabled exact full-prompt cache retains its existing priority.
-    auto prepare_inline = [&]() {
-        // Never let the new snapshot land in the slot this request restores
-        // from: the guard below would cancel it, pinning the restore point at
-        // the deepest slot on linearly-growing conversations.
-        const int restore_source_slot =
-            cache.using_restore ? cache.cache_slot : -1;
-        // Prefill resumes at the backend's restored position, and a save
-        // lands at least one snapshot step past it.
-        const int reachable_from =
-            (cache.using_restore ? cache.prefix_len : 0) +
-            backend_.snapshot_granularity();
-        cache.snap_reservation = prefix_cache_.reserve_inline_snap(
-            effective_prompt,
-            cache.using_restore ? logical_prefix_len : 0,
-            prefer_tools_boundary,
-            forced_cut,
-            restore_source_slot,
-            [this](int target_cut) {
-                return backend_.snapshot_bytes_estimate(target_cut);
-            },
-            reachable_from, backend_.restore_point_spacing());
-        cache.snap_slot = cache.snap_reservation.slot();
-        cache.snap_cut = cache.snap_reservation.target_cut();
-    };
-    auto prepare_full = [&]() {
-        const auto & full_key = cache.full_snap_key_effective
-            ? effective_prompt : req.prompt_tokens;
-        cache.full_snap_slot = prefix_cache_.prepare_full_snap(full_key);
-        if (cache.full_snap_slot >= 0) {
-            cache.full_snap_pos = (int) effective_prompt.size();
-            generate_request.snap_slot = cache.full_snap_slot;
-            generate_request.snap_pos = cache.full_snap_pos;
-            cache.full_snap_prepared = true;
-        }
-    };
-
-    // An agent turn that continues its generated-turn checkpoint is itself
-    // continued the same way by the next request, so its own snapshot only
-    // backs an interrupted or edited turn. Take one when the deepest other
-    // checkpoint lies kAgentFallbackStride tokens behind; each copy costs
-    // the whole prefix. Under tool checks a note pass may replace the reply
-    // (a replan), and the client then continues from this prompt's end:
-    // always take it there. A note pass's own prompt never comes back, so it
-    // takes none: its checkpoints would only push the client's out.
-    const bool keep_checkpoints = !req.tool_checks_note;
-    bool skip_inline = !keep_checkpoints;
-    if (keep_checkpoints && !req.tool_checks_pass &&
-        cache.using_restore && !cache.disk_hit && req.ends_with_tool_result &&
-        agent_turn_cache_slots_.count(cache.cache_slot)) {
-        constexpr int kAgentFallbackStride = 2048;
-        const auto boundaries = find_all_boundaries(
-            effective_prompt, prefix_cache_.chat_markers());
-        const int cut = boundaries.empty() ? 0 : boundaries.back();
-        const int fallback = prefix_cache_.lookup_candidate(
-            effective_prompt, logical_prefix_len - 1).second;
-        skip_inline = cut - fallback < kAgentFallbackStride;
-    }
-    if (!skip_inline && (prefer_inline_snap || cache.using_restore)) {
-        prepare_inline();
-    }
-    if (keep_checkpoints && !cache.using_restore && cache.snap_slot < 0) {
-        prepare_full();
-    }
-
-    // Full cache may be disabled or already contain this exact key. Fall
-    // back to an inline snapshot when no target has been selected yet.
-    if (!skip_inline && !cache.full_snap_prepared && cache.snap_slot < 0) {
-        prepare_inline();
-    }
-
-    // Never destroy the snapshot needed by this request's restore. With a
-    // one-slot cache there may be no independent destination for a deeper
-    // checkpoint; preserving the current hit is better than invalidating
-    // it before restore starts.
-    if (cache.using_restore && cache.snap_slot == cache.cache_slot) {
-        cache.snap_reservation.cancel();
-        cache.snap_slot = -1;
-        cache.snap_cut = 0;
-    }
-    cache.snap_prepared = cache.snap_slot >= 0;
-    if (cache.snap_prepared) {
-        evict_inline_slot(cache.snap_slot);
-        backend_.snapshot_free(cache.snap_slot);
-        generate_request.snap_slot = cache.snap_slot;
-        generate_request.snap_pos = cache.snap_cut;
-    }
-    if (cache.full_snap_prepared) {
-        backend_.snapshot_free(cache.full_snap_slot);
-    }
+    KvAdmitQuery admit;
+    admit.capture_inline = prefer_inline_snap;
+    admit.prefer_head = prefer_tools_boundary;
+    admit.forced_cut = forced_cut;
+    admit.keep_checkpoints = !req.tool_checks_note;
+    admit.agent_step = !req.tool_checks_pass && req.ends_with_tool_result;
+    kv_cache_.admit(cache, effective_prompt, req.prompt_tokens, admit, generate_request);
 
     if (cache.using_restore && disk_cache_digest_enabled()) {
-        backend_.snapshot_flush_deferred();
+        checkpoints_.flush_deferred();
         int n_tensors = 0;
         uint64_t n_bytes = 0;
         const uint64_t digest = snapshot_state_digest(
-            backend_.snapshot_ref(cache.cache_slot), &n_tensors, &n_bytes);
+            checkpoints_.ref(cache.restore), &n_tensors, &n_bytes);
         std::fprintf(stderr,
             "[disk-cache] digest %s source=%s pos=%d tensors=%d bytes=%llu "
             "xxh64=%016llx\n",
@@ -8722,17 +8366,17 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         "snap_slot=%d snap_pos=%d full_snap_slot=%d full_snap_pos=%d\n",
         req.response_id.c_str(),
         cache.using_restore ? "true" : "false",
-        cache.cache_slot, cache.prefix_len, effective_prompt.size(),
+        cache.restore.cache_slot(), cache.prefix_len, effective_prompt.size(),
         prepared.compressed ? "true" : "false",
         disk_prefix_cache_policy_name(cache.disk_policy).c_str(),
         cache.disk_hit ? "true" : "false",
-        cache.snap_slot, cache.snap_cut,
-        cache.full_snap_slot, cache.full_snap_pos);
+        cache.snap.cache_slot(), cache.snap_cut,
+        cache.full_snap.cache_slot(), cache.full_snap_pos);
 
     if (!prefix_cache_.disabled() || !disk_cache_.disabled()) {
-        generate_request.restore_points = request_restore_points(
+        generate_request.restore_points = kv_cache_.restore_points(
             effective_prompt,
-            {forced_cut, selected_boundary,
+            {forced_cut, cache.scoped_cut,
              cache.snap_prepared ? cache.snap_cut : 0});
     }
 
@@ -8745,171 +8389,18 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
 
 void HttpServer::finalize_generation_cache(
         const ParsedRequest & req, const PreparedPrompt & prepared,
-        GenerationCacheState & cache, const GenerateResult & result,
+        KvLease & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected) {
     if (req.images) return;
-    const auto & effective_prompt = prepared.tokens;
     const bool generation_produced_output = result.ok() &&
         completion_tokens > 0 && visible_output_seen && !client_disconnected;
-
-    // A deferred restore can be consumed, or a deeper snapshot can replace
-    // its source under memory pressure. Neither entry may stay discoverable.
-    if (cache.using_restore && !cache.disk_hit &&
-        !backend_.snapshot_used(cache.cache_slot)) {
-        forget_inline_slot_metadata(cache.cache_slot);
-        prefix_cache_.invalidate_inline_snap(cache.cache_slot);
-    }
-
-    if (cache.full_snap_prepared) {
-        if (generation_produced_output &&
-            backend_.snapshot_used(cache.full_snap_slot)) {
-            const int saved_position =
-                backend_.snapshot_cur_pos(cache.full_snap_slot);
-            if (saved_position > 0 &&
-                saved_position <= cache.full_snap_pos) {
-                const auto & full_key = cache.full_snap_key_effective
-                    ? effective_prompt : req.prompt_tokens;
-                prefix_cache_.confirm_full_snap(
-                    cache.full_snap_slot, full_key, saved_position);
-            } else {
-                backend_.snapshot_free(cache.full_snap_slot);
-                prefix_cache_.abort_full_snap(cache.full_snap_slot);
-            }
-        } else {
-            backend_.snapshot_free(cache.full_snap_slot);
-            prefix_cache_.abort_full_snap(cache.full_snap_slot);
-        }
-    }
-
-    if (cache.snap_prepared) {
-        if (generation_produced_output &&
-            backend_.snapshot_used(cache.snap_slot)) {
-            const int saved_position =
-                backend_.snapshot_cur_pos(cache.snap_slot);
-            if (saved_position > 0 && saved_position <= cache.snap_cut) {
-                std::fprintf(stderr,
-                    "[pc] inline snapshot requested=%d saved=%d slot=%d\n",
-                    cache.snap_cut, saved_position, cache.snap_slot);
-                // Key the entry at the requested cut even when Qwen saved at
-                // an earlier chunk boundary. Matching the longer prefix still
-                // guarantees the saved rows, the restore resumes at the
-                // backend's own position, and the next request's deepen
-                // decision sees the requested cut as covered. Keying at the
-                // saved position re-targets the same cut on every request
-                // and the restore point never moves past it.
-                evict_extra_victims(cache.snap_reservation);
-                cache.snap_reservation.commit(
-                    effective_prompt,
-                    backend_.snapshot_bytes_estimate(saved_position));
-                trim_snapshots_after_commit(cache.snap_slot);
-                // The disk key is exact: it must not claim rows the snapshot
-                // lacks. A compressed prompt gets no key, except one served
-                // from a unified view: that view is kept on disk too, so the
-                // conversation's next request serves the same tokens again.
-                // The write happens only if this snapshot is evicted from RAM
-                // (evict_inline_slot) or at shutdown.
-                if ((!prepared.compressed || prepared.unified_view) &&
-                    cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
-                    slot_tokens_[cache.snap_slot] = std::vector<int32_t>(
-                        effective_prompt.begin(),
-                        effective_prompt.begin() + saved_position);
-                    note_session_slot(cache.snap_slot);
-                }
-            } else {
-                backend_.snapshot_free(cache.snap_slot);
-                cache.snap_reservation.abort();
-            }
-        } else {
-            backend_.snapshot_free(cache.snap_slot);
-            cache.snap_reservation.abort();
-        }
-    }
-
-    if (cache.disk_hit) backend_.snapshot_free(kDiskStagingSlot);
-
-    // Long conversations get a continued checkpoint after crossing the
-    // configured interval so a future turn can restore prompt plus output.
-    // With RAM prefix slots a session's state is written when it is evicted
-    // from RAM instead; this checkpoint is the fallback without them.
-    if (!disk_cache_.disabled() && prefix_cache_.disabled() &&
-        !prepared.compressed &&
-        cache.disk_policy.mode == DiskPrefixCacheMode::Full && result.ok() &&
-        generation_produced_output) {
-        const int final_position =
-            (int) effective_prompt.size() + (int) result.tokens.size();
-        if (final_position >= disk_cache_.continued_interval()) {
-            std::vector<int32_t> all_tokens(effective_prompt);
-            all_tokens.insert(
-                all_tokens.end(), result.tokens.begin(), result.tokens.end());
-            if (backend_.snapshot_save(kDiskStagingSlot)) {
-                disk_cache_.learn_layout(kDiskStagingSlot);
-                disk_cache_.maybe_store_continued(
-                    kDiskStagingSlot, all_tokens, final_position);
-                backend_.snapshot_free(kDiskStagingSlot);
-            }
-        }
-    }
-
-    if (disk_cache_.disabled() || !result.ok()) return;
-
-    if (!prepared.compressed) {
-        recent_disk_prompts_.insert(
-            recent_disk_prompts_.begin(), effective_prompt);
-    } else if (prepared.flowkv) {
-        // FlowKV history is rewritten; retain the verbatim prompt for future
-        // Auto-boundary comparisons.
-        recent_disk_prompts_.insert(
-            recent_disk_prompts_.begin(), req.prompt_tokens);
-    }
-    static constexpr size_t kMaxRecentDiskPrompts = 256;
-    if (recent_disk_prompts_.size() > kMaxRecentDiskPrompts) {
-        recent_disk_prompts_.resize(kMaxRecentDiskPrompts);
-    }
-}
-
-void HttpServer::forget_inline_slot_metadata(int slot) {
-    if (slot < 0) return;
-    agent_turn_cache_slots_.erase(slot);
-    slot_tokens_.erase(slot);
-    slot_aux_.erase(slot);
-}
-
-bool HttpServer::persist_evicted_slot(int slot, bool persist, const char * reason) {
-    if (slot < 0 || !persist || disk_cache_.disabled()) return false;
-    const auto key = slot_tokens_.find(slot);
-    // No key: a compressed view, a non-`full` disk scope, or no snapshot.
-    if (key == slot_tokens_.end() || !backend_.snapshot_used(slot)) return false;
-    const auto aux = slot_aux_.find(slot);
-    OwnedSnapshot snap = backend_.snapshot_detach(slot);
-    if (snap.empty()) return false;
-    const int pos = snap.cur_pos();
-    const bool queued = disk_cache_.save_async(
-        std::move(snap), key->second,
-        aux == slot_aux_.end() ? std::string() : aux->second);
-    const int pruned = queued
-        ? disk_cache_.prune_ancestors(key->second, config_.disk_cache_cold_max_tokens)
-        : 0;
-    std::fprintf(stderr,
-        "[disk-cache] %s slot=%d tokens=%zu pos=%d -> %s (pruned %d older)\n",
-        reason, slot, key->second.size(), pos,
-        queued ? "write queued" : "not written", pruned);
-    return queued;
-}
-
-void HttpServer::evict_inline_slot(int slot) {
-    if (slot >= 0) {
-        persist_evicted_slot(slot, prefix_cache_.persist_on_evict(slot), "ram eviction");
-    }
-    forget_inline_slot_metadata(slot);
-}
-
-void HttpServer::evict_extra_victims(
-        const PrefixCache::InlineReservation & reservation) {
-    for (const int slot : reservation.extra_victim_slots()) {
-        evict_inline_slot(slot);
-        backend_.snapshot_free(slot);
-    }
+    // A compressed prompt gets no disk key, except one served from a
+    // unified view (kept on disk too).
+    const Checkpoint keyed = kv_cache_.release(
+        cache, prepared.tokens, req.prompt_tokens, generation_produced_output,
+        !prepared.compressed || prepared.unified_view);
+    note_session_slot(keyed.cache_slot());
 }
 
 void HttpServer::note_session_slot(int slot) {
@@ -8977,23 +8468,20 @@ void HttpServer::record_session_aux(const ParsedRequest & req,
     std::string blob;
     bool computed = false;
     for (const int slot : slots) {
-        if (!slot_tokens_.count(slot)) continue;
+        if (!prefix_cache_.has_disk_key(slot)) continue;
         if (!computed) {
             blob = session_replay_blob(req, &emitter);
             computed = true;
         }
-        slot_aux_[slot] = blob;
+        prefix_cache_.set_aux(slot, blob);
     }
 }
 
 void HttpServer::flush_sessions_to_disk(const char * reason) {
     if (disk_cache_.disabled()) return;
+    // One time limit covers the views and the snapshots.
     const auto t0 = std::chrono::steady_clock::now();
     const double limit = config_.disk_cache_shutdown_flush_s;
-    const auto elapsed = [&] {
-        return std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - t0).count();
-    };
     // The views of shortened conversations first: they are small, and a shortened conversation's KV state is only
     // reused through its view.
     if (pflash_unified_disk_views_.enabled()) {
@@ -9001,52 +8489,7 @@ void HttpServer::flush_sessions_to_disk(const char * reason) {
         for (const auto & view : pflash_unified_views_.all()) views += pflash_unified_disk_views_.save(view) ? 1 : 0;
         std::fprintf(stderr, "[pflash-unified] %s flush: %zu views written\n", reason, views);
     }
-    size_t queued = 0, backups = 0, skipped = 0;
-    const auto before = disk_cache_.stats();
-    // Graceful shutdown evicts everything: each conversation's newest
-    // snapshot and the heads, most recently used first, so the time limit
-    // drops the least valuable ones. Queuing can wait for the writer
-    // (bounded queued bytes), so the limit is checked between snapshots.
-    for (const auto & entry : prefix_cache_.entries_for_shutdown()) {
-        if (!entry.persist) {
-            ++backups;
-            continue;
-        }
-        if (limit >= 0 && elapsed() >= limit) {
-            ++skipped;
-            continue;
-        }
-        if (persist_evicted_slot(entry.slot, true, reason)) ++queued;
-        forget_inline_slot_metadata(entry.slot);
-    }
-    const auto drained = disk_cache_.drain(
-        limit < 0 ? -1.0 : (std::max)(0.0, limit - elapsed()));
-    std::fprintf(stderr,
-        "[disk-cache] %s flush: %zu snapshots queued (%zu edit backups not "
-        "written), %llu files %.1f MB written in %.2fs (limit %.0fs; %llu "
-        "writes and %zu snapshots dropped by it)\n",
-        reason, queued, backups,
-        (unsigned long long)(disk_cache_.stats().writes - before.writes),
-        (double)(disk_cache_.stats().write_bytes - before.write_bytes) / (1024.0 * 1024.0),
-        elapsed(), limit,
-        (unsigned long long)drained.cancelled, skipped);
-}
-
-void HttpServer::trim_snapshots_after_commit(int slot) {
-    const auto release = [this](const std::vector<int> & slots) {
-        for (const int released : slots) {
-            forget_inline_slot_metadata(released);
-            backend_.snapshot_free(released);
-        }
-    };
-    release(prefix_cache_.prune_superseded_ancestors(slot));
-    std::vector<bool> persist;
-    const auto evicted = prefix_cache_.enforce_resident_budget(slot, &persist);
-    for (size_t i = 0; i < evicted.size(); ++i) {
-        persist_evicted_slot(evicted[i], persist[i], "ram eviction");
-        forget_inline_slot_metadata(evicted[i]);
-        backend_.snapshot_free(evicted[i]);
-    }
+    kv_cache_.flush(reason, limit, t0);
 }
 
 void HttpServer::publish_memory_report() {
@@ -9071,9 +8514,9 @@ void HttpServer::publish_memory_report() {
     json slots = json::array();
     uint64_t host_bytes = 0, device_bytes = 0;
     for (const auto & snap : report.snapshots) {
-        const char * kind = snap.slot == kDiskStagingSlot ? "disk_staging"
+        const char * kind = checkpoint_of(snap.slot) == checkpoints_.staging() ? "disk_staging"
             : snap.slot >= prefix_slots ? "prefill_cache"
-            : agent_turn_cache_slots_.count(snap.slot) ? "agent_turn"
+            : prefix_cache_.agent_turn(snap.slot) ? "agent_turn"
             : "prefix";
         // Host-side copies are system RAM wherever the buffer lives.
         (snap.host ? host_bytes : device_bytes) += snap.bytes;
@@ -9138,7 +8581,7 @@ bool HttpServer::save_generated_turn(
         const std::vector<int32_t> & prompt,
         const std::vector<int32_t> & generated,
         const std::vector<int32_t> & canonical,
-        const GenerationCacheState & cache) {
+        const KvLease & cache) {
     // The live state after generation holds the prompt and the generated
     // tokens (the last one sampled may not be decoded yet). It is reusable
     // up to where those tokens stop matching the turn the next request
@@ -9160,13 +8603,13 @@ bool HttpServer::save_generated_turn(
     // Keep this request's own checkpoints: they are the fallback when the
     // next request diverges inside the generated turn. A live restore
     // consumes its source, which leaves nothing to keep in that slot.
-    const int keep_slot = cache.snap_prepared ? cache.snap_slot
+    const int keep_slot = cache.snap_prepared ? cache.snap.cache_slot()
         : cache.using_restore && !cache.disk_hit &&
-          backend_.snapshot_used(cache.cache_slot) ? cache.cache_slot : -1;
+          checkpoints_.used(cache.restore) ? cache.restore.cache_slot() : -1;
     auto reservation = prefix_cache_.reserve_inline_snap(
         canonical, prompt_len, false, matched, keep_slot,
         [this](int target_cut) {
-            return backend_.snapshot_bytes_estimate(target_cut);
+            return checkpoints_.estimate_bytes(target_cut);
         });
     if (!reservation.active() || reservation.target_cut() != matched) {
         const auto stats = prefix_cache_.stats();
@@ -9177,38 +8620,27 @@ bool HttpServer::save_generated_turn(
             stats.capacity);
         return false;
     }
-    const int slot = reservation.slot();
-    evict_inline_slot(slot);
-    backend_.snapshot_free(slot);
+    const int slot = kv_cache_.clear_for_capture(reservation).cache_slot();
     // The next request usually continues this state, so the backend may
     // keep it live instead of copying it out.
-    const bool saved = backend_.snapshot_save_deferred(slot);
-    const int saved_pos = saved ? backend_.snapshot_cur_pos(slot) : 0;
+    const bool saved = checkpoints_.save_deferred(checkpoint_of(slot));
+    const int saved_pos = saved ? checkpoints_.position(checkpoint_of(slot)) : 0;
     if (saved_pos <= prompt_len || saved_pos > matched) {
         std::fprintf(stderr,
             "[agent-turn-cache] generated turn not saved: snapshot slot=%d "
             "saved=%d pos=%d outside (prompt=%d, prefix=%d]\n",
             slot, saved ? 1 : 0, saved_pos, prompt_len, matched);
-        backend_.snapshot_free(slot);
+        checkpoints_.free(checkpoint_of(slot));
         reservation.abort();
         return false;
     }
-    evict_extra_victims(reservation);
-    reservation.commit_at(
-        canonical, saved_pos, backend_.snapshot_bytes_estimate(saved_pos));
-    std::vector<bool> persist;
-    const auto evicted = prefix_cache_.enforce_resident_budget(slot, &persist);
-    for (size_t i = 0; i < evicted.size(); ++i) {
-        persist_evicted_slot(evicted[i], persist[i], "ram eviction");
-        forget_inline_slot_metadata(evicted[i]);
-        backend_.snapshot_free(evicted[i]);
-    }
+    kv_cache_.commit_capture(reservation, canonical, saved_pos,
+                             /*key_at_saved=*/true, /*prune=*/false);
     if (cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
-        slot_tokens_[slot] = std::vector<int32_t>(
-            canonical.begin(), canonical.begin() + saved_pos);
+        prefix_cache_.set_disk_key(slot, saved_pos);
         note_session_slot(slot);
     }
-    agent_turn_cache_slots_.insert(slot);
+    prefix_cache_.mark_agent_turn(slot);
     std::fprintf(stderr,
         "[agent-turn-cache] saved generated turn slot=%d prefix=%d "
         "(prompt=%d generated=%zu)\n",
@@ -9304,7 +8736,7 @@ void HttpServer::remember_codec_turn(const ParsedRequest & req, const std::vecto
 
 void HttpServer::remember_agent_turn(
         const ParsedRequest & req, const PreparedPrompt & prepared,
-        const GenerationCacheState & cache, const GenerateResult & result,
+        const KvLease & cache, const GenerateResult & result,
         const SseEmitter & emitter, int completion_tokens,
         bool visible_output_seen, bool client_disconnected,
         bool replay_cache) {
@@ -9379,8 +8811,8 @@ void HttpServer::remember_agent_turn(
     int source_slot = -1;
     int source_pos = 0;
     auto consider_source = [&](int slot) {
-        if (slot < 0 || !backend_.snapshot_used(slot)) return;
-        const int pos = backend_.snapshot_cur_pos(slot);
+        if (slot < 0 || !checkpoints_.used(checkpoint_of(slot))) return;
+        const int pos = checkpoints_.position(checkpoint_of(slot));
         if (pos <= source_pos ||
             !http_detail::canonical_turn_matches_checkpoint(
                 prepared.tokens, canonical_tokens, pos)) {
@@ -9389,8 +8821,8 @@ void HttpServer::remember_agent_turn(
         source_slot = slot;
         source_pos = pos;
     };
-    if (cache.using_restore) consider_source(cache.cache_slot);
-    if (cache.snap_prepared) consider_source(cache.snap_slot);
+    if (cache.using_restore) consider_source(cache.restore.cache_slot());
+    if (cache.snap_prepared) consider_source(cache.snap.cache_slot());
     if (source_slot < 0) {
         std::fprintf(stderr,
             "[agent-turn-cache] no compatible prefix checkpoint; skipped\n");
@@ -9403,52 +8835,42 @@ void HttpServer::remember_agent_turn(
     auto reservation = prefix_cache_.reserve_inline_snap(
         canonical_tokens, source_pos, false, canonical_end, source_slot,
         [this](int target_cut) {
-            return backend_.snapshot_bytes_estimate(target_cut);
+            return checkpoints_.estimate_bytes(target_cut);
         });
     // No safe victim (only the restore source and/or protected pins remain)
     // or no useful boundary: nothing to replay into.
     if (!reservation.active() ||
         reservation.target_cut() != canonical_end) return;
 
-    const int slot = reservation.slot();
-    if (slot == source_slot) {
+    if (reservation.slot() == source_slot) {
         reservation.cancel();
         return;
     }
-    evict_inline_slot(slot);
-    backend_.snapshot_free(slot);
-
-    GenerateRequest replay;
-    replay.prompt = canonical_tokens;
-    replay.n_gen = 0;
-    replay.snap_slot = slot;
-    replay.snap_pos = canonical_end;
-    DaemonIO replay_io;
-    replay_io.should_cancel = [this]() { return has_pending_jobs(); };
-    const GenerateResult replay_result = backend_.restore_and_generate(
-        source_slot, replay, replay_io);
+    const Checkpoint capture = kv_cache_.clear_for_capture(reservation);
+    const int slot = capture.cache_slot();
+    // A prefill-only request from the source checkpoint; a queued client
+    // request preempts it.
+    const GenerateResult replay_result = checkpoints_.prefill(
+        capture, canonical_tokens, {}, checkpoint_of(source_slot),
+        [this]() { return has_pending_jobs(); });
     backend_.release_scratch();
-    const int saved_pos = replay_result.ok() && backend_.snapshot_used(slot)
-        ? backend_.snapshot_cur_pos(slot) : 0;
+    const int saved_pos = replay_result.ok() && checkpoints_.used(checkpoint_of(slot))
+        ? checkpoints_.position(checkpoint_of(slot)) : 0;
     if (saved_pos > source_pos && saved_pos <= canonical_end) {
-        evict_extra_victims(reservation);
-        reservation.commit_at(
-            canonical_tokens, saved_pos,
-            backend_.snapshot_bytes_estimate(saved_pos));
-        trim_snapshots_after_commit(slot);
-        canonical_tokens.resize((size_t) saved_pos);
+        kv_cache_.commit_capture(reservation, canonical_tokens, saved_pos,
+                                 /*key_at_saved=*/true, /*prune=*/true);
         if (cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
-            slot_tokens_[slot] = std::move(canonical_tokens);
+            prefix_cache_.set_disk_key(slot, saved_pos);
             note_session_slot(slot);
         }
-        agent_turn_cache_slots_.insert(slot);
+        prefix_cache_.mark_agent_turn(slot);
         std::fprintf(stderr,
             "[agent-turn-cache] saved slot=%d prefix=%d source=%d:%d "
             "replayed=%d\n",
             slot, saved_pos, source_slot, source_pos,
             canonical_end - source_pos);
     } else {
-        backend_.snapshot_free(slot);
+        checkpoints_.free(checkpoint_of(slot));
         reservation.abort();
     }
 }
@@ -9814,10 +9236,10 @@ void HttpServer::process_job(ServerJob * job) {
     GenerateRequest & gen_req = generation_inputs.request;
     const int n_gen_cap = generation_inputs.generation_cap;
 
-    GenerationCacheState cache =
+    KvLease cache =
         prepare_generation_cache(req, prepared, gen_req);
     const bool using_restore = cache.using_restore;
-    const int cache_slot = cache.cache_slot;
+    const Checkpoint restore_from = cache.restore;
     const int prefix_len = cache.prefix_len;
 
     DaemonIO io;
@@ -9851,7 +9273,7 @@ void HttpServer::process_job(ServerJob * job) {
 
     GenerateResult result;
     if (using_restore) {
-        result = backend_.restore_and_generate(cache_slot, gen_req, io);
+        result = checkpoints_.restore_and_generate(restore_from, gen_req, io);
     } else {
         result = backend_.generate(gen_req, io);
     }
@@ -9888,7 +9310,7 @@ void HttpServer::process_job(ServerJob * job) {
     // Finalizing may prune the restore source, and its agent-turn mark with
     // it, once a deeper snapshot lands.
     const bool restored_agent_turn =
-        agent_turn_cache_slots_.count(cache_slot) != 0;
+        prefix_cache_.agent_turn(restore_from.cache_slot());
     finalize_generation_cache(
         req, prepared, cache, result, completion_tokens,
         visible_output_seen, client_disconnected);
@@ -9919,7 +9341,7 @@ void HttpServer::process_job(ServerJob * job) {
             tok_s,
             finish.c_str(),
             using_restore ? "true" : "false",
-            cache_slot,
+            restore_from.cache_slot(),
             // The cut the backend actually made (live-session restore, or 0 after a
             // re-prefill of a snapshot it dropped), else the server's.
             luce::common::reported_prefix_len(using_restore, prefix_len, result),

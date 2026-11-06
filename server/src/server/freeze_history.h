@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include "server/prefix_cache.h"  // PrefixHash
+#include "server/kv/prefix_cache.h"  // PrefixHash
 
 #include <cstdint>
 #include <vector>

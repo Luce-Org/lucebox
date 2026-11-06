@@ -8,6 +8,7 @@
 #pragma once
 
 #include "common/concurrency/prefix_store.h"
+#include "server/kv/checkpoint.h"
 
 #include <cstdint>
 #include <utility>
@@ -45,7 +46,7 @@ public:
     bool active() const {
         return engine_ && ticket_.valid() && reservation_.active() &&
             ticket_.checkpoint == PrefixStoreRef{
-                (uint64_t)reservation_.slot() + 1,
+                Checkpoint::of_cache_slot(reservation_.slot()).id,
                 reservation_.target_cut()};
     }
 

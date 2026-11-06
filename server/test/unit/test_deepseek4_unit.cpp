@@ -17,7 +17,7 @@
 #include "common/backend_ipc.h"
 #include "common/dspark_head.h"
 #include "common/layer_split_backend.h"
-#include "server/disk_prefix_cache.h"
+#include "server/kv/disk_prefix_cache.h"
 #include "deepseek4/deepseek4_snapshot.h"
 #include "common/layer_split_runtime.h"
 #include "common/layer_split_utils.h"
@@ -4898,7 +4898,7 @@ static void test_monolithic_snapshot_disk_roundtrip() {
     TEST_ASSERT(disk.init());
     TEST_ASSERT(!disk.disabled());
     const std::vector<int32_t> prompt = {11, 12, 13, 14, 15, 16, 17};
-    TEST_ASSERT(disk.save(0, prompt));
+    TEST_ASSERT(disk.save(Checkpoint::of_cache_slot(0), prompt));
     TEST_ASSERT(!disk.disabled());
     TEST_ASSERT(disk.total_bytes() > 0);
 
@@ -4913,7 +4913,7 @@ static void test_monolithic_snapshot_disk_roundtrip() {
     backend.last_logits_pos_ = -1;
     backend.spec_feat_window_.clear();
 
-    TEST_ASSERT(disk.lookup(prompt, 1));
+    TEST_ASSERT(disk.lookup(prompt, Checkpoint::of_cache_slot(1)));
     TEST_ASSERT(backend.snapshot_used(1));
     TEST_ASSERT(backend.snapshot_cur_pos(1) == 7);
     TEST_ASSERT(backend.snapshots_[1].layers.size() == 1);
@@ -4963,10 +4963,10 @@ static void test_monolithic_snapshot_disk_roundtrip() {
     TEST_ASSERT(backend.snapshot_save(2));
     const std::vector<int32_t> prompt3 = {21, 22, 23};
     const size_t bytes_before = disk.total_bytes();
-    TEST_ASSERT(disk.save(2, prompt3));
+    TEST_ASSERT(disk.save(Checkpoint::of_cache_slot(2), prompt3));
     TEST_ASSERT(disk.total_bytes() > bytes_before);
     backend.snapshot_free(2);
-    TEST_ASSERT(disk.lookup(prompt3, 4));
+    TEST_ASSERT(disk.lookup(prompt3, Checkpoint::of_cache_slot(4)));
     TEST_ASSERT(backend.snapshot_used(4));
     TEST_ASSERT(backend.snapshot_cur_pos(4) == 3);
     TEST_ASSERT(backend.snapshots_[4].layers[0].n_comp == 0);
@@ -4978,7 +4978,7 @@ static void test_monolithic_snapshot_disk_roundtrip() {
     TEST_ASSERT(backend.cache_.cur_pos == 3);
     TEST_ASSERT(layer.n_comp == 0);
     // The first entry is still readable after the second save.
-    TEST_ASSERT(disk.lookup(prompt, 5));
+    TEST_ASSERT(disk.lookup(prompt, Checkpoint::of_cache_slot(5)));
     TEST_ASSERT(backend.snapshot_cur_pos(5) == 7);
 
     // Adopt rejects a context that is not a snapshot at all ...

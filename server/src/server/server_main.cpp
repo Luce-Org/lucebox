@@ -367,13 +367,12 @@ static void print_usage(const char * prog) {
         "  --kv-cache-shutdown-flush <s>  Max seconds a graceful shutdown spends writing\n"
         "                              RAM snapshots to disk (default: 120, -1 = no limit)\n"
         "  --kv-cache-min-tokens <N>   Min tokens to persist (default: 512)\n"
-        "  --kv-cache-interval <N>     Continued checkpoint every N tokens (default: 10240)\n"
-        "  --kv-cache-cold-max <N>     Cold prefix for prompts longer than N tokens (default: 10240)\n"
-        "  --disk-prefix-cache off|full|auto|auto:N|N\n"
+        "  --kv-cache-cold-max <N>     A session's disk files keep their ancestors up to\n"
+        "                              N tokens, the shared head (default: 10240)\n"
+        "  --disk-prefix-cache off|full|N\n"
         "                              Default disk prefix-cache policy (default: full).\n"
-        "                              auto compares recent requests to select a stable\n"
-        "                              prefix; auto:N uses the last N requests.\n"
         "                              A plain N caches the first N prompt tokens.\n"
+        "                              Needs RAM prefix slots to write new entries.\n"
         "  --disk-prefix-cache-compress Clamp FlowKV disk snapshots to the stable\n"
         "                              system prefix. Requires --prefill-drafter.\n"
         "\n"
@@ -1156,14 +1155,17 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         } else if (std::strcmp(argv[i], "--kv-cache-min-tokens") == 0 && i + 1 < argc) {
             sconfig.disk_cache_min_tokens = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--kv-cache-interval") == 0 && i + 1 < argc) {
-            sconfig.disk_cache_continued_interval = std::atoi(argv[++i]);
+            // The continued checkpoints it paced are retired: with RAM prefix
+            // slots a session reaches disk when it leaves RAM.
+            ++i;
+            std::fprintf(stderr, "[server] --kv-cache-interval is retired and has no effect\n");
         } else if (std::strcmp(argv[i], "--kv-cache-cold-max") == 0 && i + 1 < argc) {
             sconfig.disk_cache_cold_max_tokens = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--disk-prefix-cache") == 0 && i + 1 < argc) {
             DiskPrefixCachePolicy policy;
             if (!parse_disk_prefix_cache_policy(argv[++i], policy)) {
                 std::fprintf(stderr,
-                    "[server] --disk-prefix-cache must be off, full, auto, auto:<window>, or a positive token count\n");
+                    "[server] --disk-prefix-cache must be off, full or a positive token count\n");
                 return 2;
             }
             sconfig.disk_cache_policy = policy;
