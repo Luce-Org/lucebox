@@ -6986,6 +6986,7 @@ std::string HttpServer::apply_unified_view(
         int db = 0, de = 0, tb = 0, te = 0;
         pu::Lines lines;
         bool lines_ready = false;
+        std::string inline_because;   // why line units cannot page it: paged in inline units
     };
     std::vector<Candidate> newest;
     const size_t last = messages.size() - 1;
@@ -7194,13 +7195,15 @@ std::string HttpServer::apply_unified_view(
                     http_detail::pflash_span_tokens_within(pins, c.db, c.de)));
                 if (droppable < config_.pflash_threshold) why = "small";
             }
-            if (why.empty() && candidate_lines(c).count() < 5) why = "no_lines";
-            // A line over the cap can only be dropped whole, whatever it scores (one long line of prose).
-            if (why.empty()) {
+            // Content without five lines, or with a line over the cap (one long line of prose, which line units
+            // could only drop whole), is paged in inline units.
+            c.inline_because.clear();
+            if (why.empty() && candidate_lines(c).count() < 5) c.inline_because = "no_lines";
+            if (why.empty() && c.inline_because.empty()) {
                 const int longest = longest_pageable_line(c);
                 const int cap = base_cap(droppable);
                 if (longest > cap) {
-                    why = "long_line";
+                    c.inline_because = "long_line";
                     std::fprintf(stderr, "[pflash-unified] message %zu: a %d-token line is over its cap %d\n",
                                  c.message, longest, cap);
                     std::fflush(stderr);
@@ -7219,6 +7222,7 @@ std::string HttpServer::apply_unified_view(
                                  {"kind", c.kind == pu::RegionKind::ToolOutput ? "tool_output" : "user_content"},
                                  {"decision", why.empty() ? "region" : why},
                                  {"droppable", droppable}});
+            if (why.empty() && !c.inline_because.empty()) admission.back()["inline_because"] = c.inline_because;
             if (why.empty()) {
                 region_candidates.push_back(k);
             } else {
@@ -7227,9 +7231,8 @@ std::string HttpServer::apply_unified_view(
         }
 
         // A conversation the view would start: when the part it can never page -- the uncached, unpinned history
-        // before the newest turn, and newest content it cannot cut into lines that fit -- is a threshold's worth, the
-        // chat view takes the request (its cache admission compresses such a prompt) instead of a raw prefill of it.
-        // Newest content the view serves verbatim by design (unlisted tool outputs, small messages) does not count.
+        // before the newest turn -- is a threshold's worth, the chat view takes the request (its cache admission
+        // compresses such a prompt) instead of a raw prefill of it.
         if (!continues) {
             const int uncached_from = (std::min)(turn.generation_begin, (int) std::floor(
                 (double) restorable * (double) input / (double) (std::max)(1, prompt_tokens)));
@@ -7241,14 +7244,7 @@ std::string HttpServer::apply_unified_view(
             for (const auto & c : newest) {
                 if (c.located) newest_begin = (std::min)(newest_begin, c.db);
             }
-            int cannot_page = unpinned(0, newest_begin);
-            for (size_t k = 0; k < newest.size(); ++k) {
-                const std::string decision = admission[k].value("decision", "");
-                if (decision == "no_lines" || decision == "long_line") {
-                    cannot_page += unpinned(newest[k].db, newest[k].de);
-                }
-            }
-            if (target_estimate(cannot_page) >= config_.pflash_threshold) {
+            if (target_estimate(unpinned(0, newest_begin)) >= config_.pflash_threshold) {
                 // Once the chat view accepts it, the view this turn would have continued goes, with its lineage.
                 return hand_back(found_view ? "reset_uncached" : "uncached");
             }
@@ -7379,199 +7375,216 @@ std::string HttpServer::apply_unified_view(
                 verbatim_because("unscored");
                 continue;
             }
-            const pu::Lines & lines = candidate_lines(c);
-            std::vector<size_t> common;
-            {
-                const auto t0 = std::lower_bound(td.token_begin.begin(), td.token_begin.end(), lines.begin);
-                const auto t1 = std::upper_bound(td.token_begin.begin(), td.token_begin.end(), lines.end);
-                const auto d0 = std::lower_bound(dd.token_begin.begin(), dd.token_begin.end(), lines.begin);
-                const auto d1 = std::upper_bound(dd.token_begin.begin(), dd.token_begin.end(), lines.end);
-                std::set_intersection(t0, t1, d0, d1, std::back_inserter(common));
-                common.erase(std::unique(common.begin(), common.end()), common.end());
-            }
-            std::vector<size_t> proposed;
-            for (const auto & lift : lifts) {
-                if (lift.first.begin > c.db && lift.first.begin < c.de) {
-                    proposed.push_back(dd.token_begin[(size_t) lift.first.begin]);
+            // Page the message in line units, or in inline units; "" when it became a region, else why not.
+            const auto page = [&] (bool inline_units) -> std::string {
+                const pu::Lines & lines = candidate_lines(c);
+                std::vector<size_t> common;
+                {
+                    const auto t0 = std::lower_bound(td.token_begin.begin(), td.token_begin.end(), lines.begin);
+                    const auto t1 = std::upper_bound(td.token_begin.begin(), td.token_begin.end(), lines.end);
+                    const auto d0 = std::lower_bound(dd.token_begin.begin(), dd.token_begin.end(), lines.begin);
+                    const auto d1 = std::upper_bound(dd.token_begin.begin(), dd.token_begin.end(), lines.end);
+                    std::set_intersection(t0, t1, d0, d1, std::back_inserter(common));
+                    common.erase(std::unique(common.begin(), common.end()), common.end());
                 }
-            }
-            pu::Region region;
-            std::string why;
-            if (!pu::layout_region(lines, common, proposed, region.layout, why)) {
-                verbatim_because("layout");
-                continue;
-            }
-            const int units = region.layout.units();
-            std::vector<int> cut_t;
-            std::vector<int> cut_d;
-            for (size_t cut : region.layout.cuts) {
-                cut_t.push_back(token_at(td, cut));
-                cut_d.push_back(token_at(dd, cut));
-            }
-            if (std::count(cut_t.begin(), cut_t.end(), -1) || std::count(cut_d.begin(), cut_d.end(), -1)) {
-                verbatim_because("unmapped_cut");
-                continue;
-            }
-            std::vector<int> cost((size_t) units);
-            std::vector<double> score((size_t) units);
-            region.mandatory.assign((size_t) units, 0);
-            int droppable = 0;
-            for (int u = 0; u < units; ++u) {
-                region.unit_tb.push_back(cut_t[(size_t) u]);
-                region.unit_te.push_back(cut_t[(size_t) u + 1]);
-                region.unit_db.push_back(cut_d[(size_t) u]);
-                region.unit_de.push_back(cut_d[(size_t) u + 1]);
-                cost[(size_t) u] = cut_t[(size_t) u + 1] - cut_t[(size_t) u];
-                score[(size_t) u] = unit_score(cut_d[(size_t) u], cut_d[(size_t) u + 1]);
-                region.mandatory[(size_t) u] =
-                    pinned(cut_d[(size_t) u], cut_d[(size_t) u + 1]) ||
-                    probe_pinned(cut_d[(size_t) u], cut_d[(size_t) u + 1]) ? 1 : 0;
-                if (!region.mandatory[(size_t) u]) droppable += cost[(size_t) u];
-            }
-            if (droppable <= 0) {
-                verbatim_because("all_pinned");
-                continue;
-            }
-            const int unwidened = base_cap(droppable);
-            const int cap = widened_cap(unwidened, droppable);
-            std::map<std::pair<int, int>, int> marker_costs;
-            const auto marker_line = [&] (int first, int last_unit) {
-                return pu::inserted_line(text, lines, region.layout.cuts[(size_t) first],
-                                         region.layout.cuts[(size_t) last_unit + 1],
-                                         pu::marker_text(region.layout.line_count(first, last_unit)));
-            };
-            const auto marker_cost = [&] (int first, int last_unit) {
-                const auto key = std::make_pair(first, last_unit);
-                const auto it = marker_costs.find(key);
-                if (it != marker_costs.end()) return it->second;
-                const int tokens = encode_len(marker_line(first, last_unit));
-                marker_costs.emplace(key, tokens);
-                return tokens;
-            };
-            const int total_lines = (int) lines.count();
-            const auto preamble_line = [&] (int shown) {
-                return pu::inserted_line(text, lines, region.layout.head_end, region.layout.head_end,
-                                         pu::preamble_text(c.kind, shown, total_lines));
-            };
-            int fixed = encode_len(preamble_line(total_lines));
-            // A line this cap cannot take even alone (one long line of prose) could only be dropped whole, whatever
-            // it scores. The message's line check above budgets on all of its tokens, the always-kept lines too;
-            // this is the region's own cap. As there, a view this turn would start goes to the chat view, and a
-            // continued view serves the message verbatim. A cap with no room past the overheads takes no line at
-            // all: cap_below_overhead below.
-            {
-                const int base = pu::admit_paging(cost, region.mandatory, {}, fixed, cap, marker_cost).cost;
-                const int widest_marker = marker_cost(0, units - 1);  // the whole run's: the most lines not shown
-                const int room = cap - base - widest_marker;
-                int longest = 0;
-                for (int u = 0; u < units; ++u) {
-                    if (region.mandatory[(size_t) u]) continue;
-                    for (int l = region.layout.cut_line[(size_t) u]; l < region.layout.cut_line[(size_t) u + 1]; ++l) {
-                        longest = (std::max)(longest, token_from(td, lines.ends[(size_t) l]) -
-                                                          token_from(td, lines.starts[(size_t) l]));
+                std::vector<size_t> proposed;
+                for (const auto & lift : lifts) {
+                    if (lift.first.begin > c.db && lift.first.begin < c.de) {
+                        proposed.push_back(dd.token_begin[(size_t) lift.first.begin]);
                     }
                 }
-                if (room > 0 && longest > room) {
-                    std::fprintf(stderr, "[pflash-unified] message %zu: a %d-token line is over its region's cap %d\n",
-                                 c.message, longest, cap);
-                    std::fflush(stderr);
-                    if (!continues) return hand_back(found_view ? "reset_uncached" : "uncached");
-                    verbatim_because("long_line");
-                    continue;
+                pu::Region region;
+                std::string why;
+                // Inline units keep a short first or last line whole (a question under a one-line paste).
+                const int edge_limit = base_cap(admission[k].value("droppable", 0)) / 4;
+                const auto line_tokens = [&] (size_t l) {
+                    return token_from(td, lines.ends[l]) - token_from(td, lines.starts[l]);
+                };
+                const bool keep_first = lines.count() >= 2 && line_tokens(0) <= edge_limit;
+                const bool keep_last = lines.count() >= 2 && line_tokens(lines.count() - 1) <= edge_limit;
+                if (!(inline_units ? pu::layout_region_inline(text, lines, common, proposed, keep_first, keep_last,
+                                                              region.layout, why)
+                                   : pu::layout_region(lines, common, proposed, region.layout, why))) {
+                    admission[k]["layout"] = why;
+                    return std::string("layout");
                 }
-            }
-            const auto order = pu::rank_units(score, region.mandatory);
-            pu::Admission admitted;
-            std::string preamble;
-            for (int attempt = 0; attempt < 3; ++attempt) {
-                admitted = pu::admit_paging(cost, region.mandatory, order, fixed, cap, marker_cost);
-                if (!admitted.ok) break;
-                int dropped_lines = 0;
+                const int units = region.layout.units();
+                std::vector<int> cut_t;
+                std::vector<int> cut_d;
+                for (size_t cut : region.layout.cuts) {
+                    cut_t.push_back(token_at(td, cut));
+                    cut_d.push_back(token_at(dd, cut));
+                }
+                if (std::count(cut_t.begin(), cut_t.end(), -1) || std::count(cut_d.begin(), cut_d.end(), -1)) {
+                    return std::string("unmapped_cut");
+                }
+                std::vector<int> cost((size_t) units);
+                std::vector<double> score((size_t) units);
+                region.mandatory.assign((size_t) units, 0);
+                int droppable = 0;
                 for (int u = 0; u < units; ++u) {
-                    if (!admitted.admitted[(size_t) u]) dropped_lines += region.layout.line_count(u, u);
+                    region.unit_tb.push_back(cut_t[(size_t) u]);
+                    region.unit_te.push_back(cut_t[(size_t) u + 1]);
+                    region.unit_db.push_back(cut_d[(size_t) u]);
+                    region.unit_de.push_back(cut_d[(size_t) u + 1]);
+                    cost[(size_t) u] = cut_t[(size_t) u + 1] - cut_t[(size_t) u];
+                    score[(size_t) u] = unit_score(cut_d[(size_t) u], cut_d[(size_t) u + 1]);
+                    region.mandatory[(size_t) u] =
+                        pinned(cut_d[(size_t) u], cut_d[(size_t) u + 1]) ||
+                        probe_pinned(cut_d[(size_t) u], cut_d[(size_t) u + 1]) ? 1 : 0;
+                    if (!region.mandatory[(size_t) u]) droppable += cost[(size_t) u];
                 }
-                preamble = preamble_line(total_lines - dropped_lines);
-                const int actual = encode_len(preamble);
-                if (admitted.cost - fixed + actual <= cap) {
-                    admitted.cost += actual - fixed;
-                    break;
+                if (droppable <= 0) {
+                    return std::string("all_pinned");
                 }
-                fixed = actual;
-                admitted.ok = false;
-            }
-            if (!admitted.ok) {
-                verbatim_because("cap_below_overhead");
-                continue;
-            }
-            if (std::find(admitted.admitted.begin(), admitted.admitted.end(), 0) == admitted.admitted.end()) {
-                verbatim_because("nothing_dropped");
-                continue;
-            }
-            const int region_index = region_base + (int) new_regions.size();
-            Splice splice;
-            splice.begin = cut_t.front();
-            splice.end = cut_t.back();
-            const auto add = [&] (std::vector<int32_t> tokens, const char * kind) {
-                const int at = (int) splice.tokens.size();
-                splice.tokens.insert(splice.tokens.end(), tokens.begin(), tokens.end());
-                splice.pieces.push_back({at, (int) splice.tokens.size(), kind, region_index, -1});
-            };
-            add(tokenizer_.encode(preamble), "preamble");
-            int kept_tokens = 0;
-            for (int u = 0; u < units;) {
-                if (admitted.admitted[(size_t) u]) {
+                const int unwidened = base_cap(droppable);
+                const int cap = widened_cap(unwidened, droppable);
+                std::map<std::pair<int, int>, int> marker_costs;
+                const auto marker_line = [&] (int first, int last_unit) {
+                    return pu::inserted_line(text, lines, region.layout.cuts[(size_t) first],
+                                             region.layout.cuts[(size_t) last_unit + 1],
+                                             pu::unit_marker_text(region.layout, first, last_unit));
+                };
+                const auto marker_cost = [&] (int first, int last_unit) {
+                    const auto key = std::make_pair(first, last_unit);
+                    const auto it = marker_costs.find(key);
+                    if (it != marker_costs.end()) return it->second;
+                    const int tokens = encode_len(marker_line(first, last_unit));
+                    marker_costs.emplace(key, tokens);
+                    return tokens;
+                };
+                const int total_lines = (int) lines.count();
+                const auto preamble_line = [&] (int shown) {
+                    return pu::inserted_line(text, lines, region.layout.head_end, region.layout.head_end,
+                                             pu::region_preamble_text(c.kind, region.layout, shown, total_lines));
+                };
+                int fixed = encode_len(preamble_line(total_lines));
+                // A line this cap cannot take even alone (one long line of prose) could only be dropped whole, whatever
+                // it scores. The message's line check above budgets on all of its tokens, the always-kept lines too;
+                // this is the region's own cap: the message is paged in inline units instead. A cap with no room past
+                // the overheads takes no line at all: cap_below_overhead below.
+                if (!inline_units) {
+                    const int base = pu::admit_paging(cost, region.mandatory, {}, fixed, cap, marker_cost).cost;
+                    const int widest_marker = marker_cost(0, units - 1);  // the whole run's: the most lines not shown
+                    const int room = cap - base - widest_marker;
+                    int longest = 0;
+                    for (int u = 0; u < units; ++u) {
+                        if (region.mandatory[(size_t) u]) continue;
+                        for (int l = region.layout.cut_line[(size_t) u]; l < region.layout.cut_line[(size_t) u + 1]; ++l) {
+                            longest = (std::max)(longest, token_from(td, lines.ends[(size_t) l]) -
+                                                              token_from(td, lines.starts[(size_t) l]));
+                        }
+                    }
+                    if (room > 0 && longest > room) {
+                        std::fprintf(stderr, "[pflash-unified] message %zu: a %d-token line is over its region's cap %d\n",
+                                     c.message, longest, cap);
+                        std::fflush(stderr);
+                        return std::string("long_line");
+                    }
+                }
+                const auto order = pu::rank_units(score, region.mandatory);
+                pu::Admission admitted;
+                std::string preamble;
+                for (int attempt = 0; attempt < 3; ++attempt) {
+                    admitted = pu::admit_paging(cost, region.mandatory, order, fixed, cap, marker_cost);
+                    if (!admitted.ok) break;
+                    int dropped_lines = 0;
+                    for (int u = 0; u < units; ++u) {
+                        if (!admitted.admitted[(size_t) u]) dropped_lines += region.layout.line_count(u, u);
+                    }
+                    preamble = preamble_line(total_lines - dropped_lines);
+                    const int actual = encode_len(preamble);
+                    if (admitted.cost - fixed + actual <= cap) {
+                        admitted.cost += actual - fixed;
+                        break;
+                    }
+                    fixed = actual;
+                    admitted.ok = false;
+                }
+                if (!admitted.ok) {
+                    return std::string("cap_below_overhead");
+                }
+                if (std::find(admitted.admitted.begin(), admitted.admitted.end(), 0) == admitted.admitted.end()) {
+                    return std::string("nothing_dropped");
+                }
+                const int region_index = region_base + (int) new_regions.size();
+                Splice splice;
+                splice.begin = cut_t.front();
+                splice.end = cut_t.back();
+                const auto add = [&] (std::vector<int32_t> tokens, const char * kind) {
+                    const int at = (int) splice.tokens.size();
+                    splice.tokens.insert(splice.tokens.end(), tokens.begin(), tokens.end());
+                    splice.pieces.push_back({at, (int) splice.tokens.size(), kind, region_index, -1});
+                };
+                add(tokenizer_.encode(preamble), "preamble");
+                int kept_tokens = 0;
+                for (int u = 0; u < units;) {
+                    if (admitted.admitted[(size_t) u]) {
+                        int b = u;
+                        while (b + 1 < units && admitted.admitted[(size_t) b + 1]) ++b;
+                        add(std::vector<int32_t>(raw.begin() + cut_t[(size_t) u], raw.begin() + cut_t[(size_t) b + 1]),
+                            "paged_text");
+                        kept_tokens += cut_t[(size_t) b + 1] - cut_t[(size_t) u];
+                        u = b + 1;
+                        continue;
+                    }
                     int b = u;
-                    while (b + 1 < units && admitted.admitted[(size_t) b + 1]) ++b;
-                    add(std::vector<int32_t>(raw.begin() + cut_t[(size_t) u], raw.begin() + cut_t[(size_t) b + 1]),
-                        "paged_text");
-                    kept_tokens += cut_t[(size_t) b + 1] - cut_t[(size_t) u];
+                    while (b + 1 < units && !admitted.admitted[(size_t) b + 1]) ++b;
+                    add(tokenizer_.encode(marker_line(u, b)), "marker");
                     u = b + 1;
-                    continue;
                 }
-                int b = u;
-                while (b + 1 < units && !admitted.admitted[(size_t) b + 1]) ++b;
-                add(tokenizer_.encode(marker_line(u, b)), "marker");
-                u = b + 1;
+                region.kind = c.kind;
+                region.brief = c.brief;
+                region.tool_call_id = c.call_id;
+                region.content_sha = pu::sha1_hex(text.substr(c.cb, c.ce - c.cb));
+                region.cb = c.cb;
+                region.ce = c.ce;
+                region.tb = c.tb;
+                region.te = c.te;
+                region.db = c.db;
+                region.de = c.de;
+                region.lines = lines;
+                region.hashes = pu::line_hashes(text, lines);
+                region.kept = admitted.admitted;
+                region.held = admitted.admitted;
+                region.reread.assign(lines.count(), 0);
+                region.cap = unwidened;
+                region.droppable = droppable;
+                if (pflash_recall_trace_units_) {
+                    std::vector<long> cuts;
+                    for (size_t cut : region.layout.cuts) cuts.push_back((long) cut - (long) region.cb);
+                    admission[k]["trace_units"] = {{"cb", region.cb}, {"content_bytes", region.ce - region.cb},
+                                                   {"cuts", cuts}, {"kept", region.kept}};
+                }
+                admission[k]["units"] = units;
+                admission[k]["kept_units"] = (int) std::count(admitted.admitted.begin(), admitted.admitted.end(), 1);
+                admission[k]["mandatory_units"] =
+                    (int) std::count(region.mandatory.begin(), region.mandatory.end(), 1);
+                admission[k]["cap"] = cap;
+                admission[k]["unwidened_cap"] = unwidened;
+                admission[k]["optional_served"] = admitted.cost;
+                admission[k]["region_tokens"] = splice.end - splice.begin;
+                admission[k]["served_tokens"] = splice.tokens.size();
+                admission[k]["kept_tokens"] = kept_tokens;
+                admission[k]["lines"] = total_lines;
+                admission[k]["escaped_lines"] = lines.escaped;
+                if (inline_units) admission[k]["units_kind"] = "inline";
+                admission[k]["region"] = region_index;
+                count(c.kind == pu::RegionKind::ToolOutput ? "region.tool_output" : "region.user_content");
+                new_regions.push_back(std::move(region));
+                splices.push_back(std::move(splice));
+                return std::string();
+            };
+            std::string why = page(!c.inline_because.empty());
+            if (c.inline_because.empty() &&
+                (why == "layout" || why == "unmapped_cut" || why == "long_line" || why == "cap_below_overhead")) {
+                // Line units cannot page it: inline units can (one long line, no clean head or tail cut, always-kept
+                // lines that fill the cap).
+                count("inline." + why);
+                admission[k]["inline_because"] = why;
+                why = page(true);
             }
-            region.kind = c.kind;
-            region.brief = c.brief;
-            region.tool_call_id = c.call_id;
-            region.content_sha = pu::sha1_hex(text.substr(c.cb, c.ce - c.cb));
-            region.cb = c.cb;
-            region.ce = c.ce;
-            region.tb = c.tb;
-            region.te = c.te;
-            region.db = c.db;
-            region.de = c.de;
-            region.lines = lines;
-            region.hashes = pu::line_hashes(text, lines);
-            region.kept = admitted.admitted;
-            region.held = admitted.admitted;
-            region.reread.assign(lines.count(), 0);
-            region.cap = unwidened;
-            region.droppable = droppable;
-            if (pflash_recall_trace_units_) {
-                std::vector<long> cuts;
-                for (size_t cut : region.layout.cuts) cuts.push_back((long) cut - (long) region.cb);
-                admission[k]["trace_units"] = {{"cb", region.cb}, {"content_bytes", region.ce - region.cb},
-                                               {"cuts", cuts}, {"kept", region.kept}};
-            }
-            admission[k]["units"] = units;
-            admission[k]["kept_units"] = (int) std::count(admitted.admitted.begin(), admitted.admitted.end(), 1);
-            admission[k]["mandatory_units"] =
-                (int) std::count(region.mandatory.begin(), region.mandatory.end(), 1);
-            admission[k]["cap"] = cap;
-            admission[k]["unwidened_cap"] = unwidened;
-            admission[k]["optional_served"] = admitted.cost;
-            admission[k]["region_tokens"] = splice.end - splice.begin;
-            admission[k]["served_tokens"] = splice.tokens.size();
-            admission[k]["kept_tokens"] = kept_tokens;
-            admission[k]["lines"] = total_lines;
-            admission[k]["escaped_lines"] = lines.escaped;
-            admission[k]["region"] = region_index;
-            count(c.kind == pu::RegionKind::ToolOutput ? "region.tool_output" : "region.user_content");
-            new_regions.push_back(std::move(region));
-            splices.push_back(std::move(splice));
+            if (!why.empty()) verbatim_because(why);
         }
 
         // Re-reads: a newest message served verbatim (rejected above, or fallen back while paging) that repeats lines of
@@ -7589,8 +7602,8 @@ std::string HttpServer::apply_unified_view(
                 }
                 for (int u = 0; u < region.layout.units(); ++u) {
                     if (region.held[(size_t) u]) continue;
-                    if (pu::lines_covered(region.reread, match.region_informative, region.layout.first_line(u),
-                                          region.layout.cut_line[(size_t) u + 1])) {
+                    const auto unit = pu::unit_lines(region.lines, region.layout, u, u);
+                    if (pu::lines_covered(region.reread, match.region_informative, unit.first, unit.second)) {
                         region.held[(size_t) u] = 1;
                         ++covered_units;
                     }

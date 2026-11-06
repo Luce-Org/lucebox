@@ -514,9 +514,13 @@ With a strict-selection environment whose scorer gives per-candidate scores
 (the release profile, which also sets the `PFLASH_ADMISSION=cache` it needs),
 chat and agent sessions are served by one mechanism, the unified view. Only the newest turn is ever paged: the user
 messages since the last reply, or the tool results of the last tool call. A
-message there with at least `--prefill-threshold` droppable tokens that can be
-cut into lines becomes a region, and only what the drafter selection keeps of
-it is served, in whole lines, with a note saying the content was shortened.
+message there with at least `--prefill-threshold` droppable tokens becomes a
+region, and only what the drafter selection keeps of it is served, with a note
+saying the content was shortened. A region is cut into whole lines. A message
+with fewer than five lines, or with a line longer than its region's cap (a
+document on one line), is cut inside its lines instead: at the drafter's
+segment starts, on token boundaries both tokenizers share, never inside a
+UTF-8 character or a JSON escape, and each omitted range is marked inline.
 Tool outputs are paged for the tools in `PFLASH_REGION_TOOLS` (default `*`,
 every tool; a comma-separated list names tools; empty pages none). Everything
 before the newest turn is the view already served and stays cached: the
@@ -539,9 +543,7 @@ Requests the unified view does not take are handed back to the chat view
 described above, which serves them as on its own: a request without a
 messages array, a remote drafter, a turn structure or generation prompt it
 cannot read, and a conversation it would start (no stored view continues it)
-whose uncached history before the newest turn, with newest content that
-cannot be cut into lines or has a line longer than its region's cap (one long
-line of prose could only be dropped whole), reaches `--prefill-threshold`
+whose uncached history before the newest turn reaches `--prefill-threshold`
 (reason `uncached`,
 or `reset_uncached` when a stored view could not continue). A conversation
 handed back, or served raw after a PFlash failure, loses its unified views.

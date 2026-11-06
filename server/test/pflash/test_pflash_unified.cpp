@@ -438,6 +438,66 @@ TEST_CASE(PFlashUnifiedFixture, unified_view_store_finds_longest_prefix_and_keep
     REQUIRE(store.find({8, 8, 1}, {8, 8, 1}, "c", out));
 }
 
+TEST_CASE(PFlashUnifiedFixture, unified_inline_layout_cuts_inside_lines) {
+    // A document on one long line between short lines: line units cannot page it (four lines), inline units can.
+    std::string body;
+    for (int i = 0; i < 40; ++i) body += "word " + std::to_string(i) + " is here. ";
+    const std::string text = "<doc>\n" + body + "\n</doc>\nWhich?";
+    const Lines lines = detect_lines(text, 0, text.size());
+    REQUIRE(lines.count() == 4);
+    std::vector<size_t> every;
+    for (size_t i = 0; i <= text.size(); ++i) every.push_back(i);
+    std::vector<size_t> proposed;
+    for (size_t p = lines.starts[1] + 100; p < lines.ends[1]; p += 100) proposed.push_back(p);
+    Layout layout;
+    std::string why;
+    REQUIRE(!layout_region(lines, every, proposed, layout, why));
+    REQUIRE(layout_region_inline(text, lines, every, proposed, true, true, layout, why));
+    REQUIRE(layout.inline_units);
+    REQUIRE(layout.head_end == lines.starts[1]);           // "<doc>\n" kept whole
+    REQUIRE(layout.tail_begin == lines.starts[3]);         // "Which?" kept whole
+    REQUIRE(layout.cut_line[1] == 1 && layout.cut_line[2] == 1);   // cuts inside line 1
+    REQUIRE(unit_lines(lines, layout, 1, 1) == std::make_pair(1, 2));
+    std::vector<char> admitted((size_t) layout.units(), 1);
+    admitted[1] = 0;
+    const std::string served = render_region_text(text, 0, text.size(), lines, layout, admitted,
+                                                  RegionKind::UserContent);
+    REQUIRE(served.find("<doc>\n[Server note: this message was shortened; each omitted range is marked inline.]\n") ==
+            0);
+    REQUIRE(served.find(text.substr(proposed[0], 20) + "") == std::string::npos);
+    REQUIRE(served.find("\n[\xE2\x80\xA6 text not shown \xE2\x80\xA6]\n") != std::string::npos);
+    REQUIRE(served.size() > 6 && served.compare(served.size() - 6, 6, "Which?") == 0);
+    REQUIRE(unit_marker_text(layout, 0, 0) == "[\xE2\x80\xA6 text not shown \xE2\x80\xA6]");
+
+    // Without the edge lines kept, the head and tail are the first and last inline units.
+    REQUIRE(layout_region_inline(text, lines, every, proposed, false, false, layout, why));
+    REQUIRE(layout.head_end == lines.starts[1] && layout.tail_begin == lines.starts[3]);
+    REQUIRE(layout_region_inline(text, lines, every, {lines.starts[3] + 2}, false, false, layout, why));
+    REQUIRE(layout.tail_begin == lines.starts[3] + 2);
+    // Too few cuts: no layout.
+    REQUIRE(!layout_region_inline(text, lines, {}, proposed, true, true, layout, why));
+
+    // No cut inside a UTF-8 character or a JSON escape: an offset there moves to the next clean one.
+    const std::string utf = std::string(60, 'a') + "\xC3\xA9" + std::string(60, 'b') + "\nend";
+    const Lines utf_lines = detect_lines(utf, 0, utf.size());
+    std::vector<size_t> utf_every;
+    for (size_t i = 0; i <= utf.size(); ++i) utf_every.push_back(i);
+    REQUIRE(layout_region_inline(utf, utf_lines, utf_every, {10, 61, 90}, false, false, layout, why));
+    REQUIRE(std::find(layout.cuts.begin(), layout.cuts.end(), (size_t) 61) == layout.cuts.end());
+    REQUIRE(std::find(layout.cuts.begin(), layout.cuts.end(), (size_t) 62) != layout.cuts.end());
+    nlohmann::json value = {{"content", std::string(50, 'x') + "\u00e9\n" + std::string(50, 'y') + "\"q\""}};
+    const std::string json_text = value.dump(-1, ' ', true);
+    const Lines escaped = split_lines(json_text, 12, json_text.size() - 2, true);
+    REQUIRE(escaped.escaped);
+    std::vector<size_t> json_every;
+    for (size_t i = 0; i <= json_text.size(); ++i) json_every.push_back(i);
+    const size_t u = json_text.find("\\u00e9");
+    REQUIRE(u != std::string::npos);
+    REQUIRE(layout_region_inline(json_text, escaped, json_every, {20, u + 3, u + 30}, false, false, layout, why));
+    for (size_t c : layout.cuts) REQUIRE(!(c > u && c < u + 6));
+}
+
+
 // A small view with one region whose per-unit and per-line vectors agree.
 static View disk_test_view(const std::vector<int32_t> & raw, int gen, const std::string & config, uint64_t lineage) {
     View v;
@@ -523,6 +583,15 @@ TEST_CASE(PFlashUnifiedFixture, unified_view_json_round_trip_fails_closed) {
     REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["unit_te"] = {3}; }));     // past the content's tokens
     REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["unit_db"] = {2}; }));
     REQUIRE(broken([] (nlohmann::json & j) { j["raw_gen_begin"] = 1; }));            // region after the generation
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["layout"].erase("inline"); }));
+    // Inline units may cut one line several times; line units may not.
+    View in_line = v;
+    in_line.regions[0].layout.cut_line = {1, 1};
+    in_line.regions[0].layout.inline_units = true;
+    REQUIRE(view_from_json(view_to_json(in_line), back, error));
+    REQUIRE(back.regions[0].layout.inline_units);
+    in_line.regions[0].layout.inline_units = false;
+    REQUIRE(!view_from_json(view_to_json(in_line), back, error));
 }
 
 TEST_CASE(PFlashUnifiedFixture, unified_view_stores_name_the_lineages_a_prompt_continues) {

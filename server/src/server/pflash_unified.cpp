@@ -332,6 +332,87 @@ std::string json_escape(const std::string & text) {
     return out;
 }
 
+bool layout_region_inline(const std::string & text, const Lines & lines, const std::vector<size_t> & common,
+                          const std::vector<size_t> & proposed, bool keep_first_line, bool keep_last_line,
+                          Layout & out, std::string & why) {
+    out = Layout{};
+    out.inline_units = true;
+    const int n = (int) lines.count();
+    // Escaped lines: the bytes after a backslash that belong to its escape.
+    std::vector<char> in_escape;
+    if (lines.escaped && lines.end > lines.begin) {
+        in_escape.assign(lines.end - lines.begin, 0);
+        for (size_t i = lines.begin; i < lines.end;) {
+            if (text[i] != '\\' || i + 1 >= lines.end) {
+                ++i;
+                continue;
+            }
+            const size_t next = text[i + 1] == 'u' ? std::min(lines.end, i + 6) : i + 2;
+            for (size_t j = i + 1; j < next; ++j) in_escape[j - lines.begin] = 1;
+            i = next;
+        }
+    }
+    const auto usable = [&] (size_t p) {
+        return p > lines.begin && p < lines.end && ((unsigned char) text[p] & 0xC0) != 0x80 &&
+               (in_escape.empty() || !in_escape[p - lines.begin]);
+    };
+    std::vector<size_t> cuts;
+    for (int l = 1; l < n; ++l) {
+        const size_t c = line_cut(lines, common, l);
+        if (c != std::string::npos && usable(c)) cuts.push_back(c);
+    }
+    for (size_t p : proposed) {
+        auto it = std::lower_bound(common.begin(), common.end(), p);
+        while (it != common.end() && *it < lines.end && !usable(*it)) ++it;
+        if (it != common.end() && usable(*it)) cuts.push_back(*it);
+    }
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+    if (n >= 2) {
+        // An edge line kept whole: no cut before the first line's separator, none after the last line's start.
+        const size_t from = keep_first_line ? lines.ends[0] : lines.begin;
+        const size_t to = keep_last_line ? lines.starts[(size_t) n - 1] : lines.end;
+        cuts.erase(std::remove_if(cuts.begin(), cuts.end(), [&] (size_t c) { return c < from || c > to; }),
+                   cuts.end());
+    }
+    if (cuts.size() < 3) {
+        why = "fewer than three inline cuts";
+        return false;
+    }
+    for (size_t c : cuts) {
+        const int li = (int) (std::upper_bound(lines.starts.begin(), lines.starts.end(), c) - lines.starts.begin()) - 1;
+        out.cut_line.push_back((std::max)(0, li));
+    }
+    out.cuts = std::move(cuts);
+    out.head_end = out.cuts.front();
+    out.tail_begin = out.cuts.back();
+    return true;
+}
+
+std::pair<int, int> unit_lines(const Lines & lines, const Layout & layout, int first_unit, int last_unit) {
+    if (!layout.inline_units) {
+        return {layout.cut_line[(size_t) first_unit], layout.cut_line[(size_t) last_unit + 1]};
+    }
+    const size_t last_byte = layout.cuts[(size_t) last_unit + 1] - 1;
+    const int last = (int) (std::upper_bound(lines.starts.begin(), lines.starts.end(), last_byte) -
+                            lines.starts.begin()) - 1;
+    return {layout.cut_line[(size_t) first_unit], (std::max)(layout.cut_line[(size_t) first_unit], last) + 1};
+}
+
+std::string unit_marker_text(const Layout & layout, int first_unit, int last_unit) {
+    if (layout.inline_units) return "[\xE2\x80\xA6 text not shown \xE2\x80\xA6]";
+    return marker_text(layout.line_count(first_unit, last_unit));
+}
+
+std::string region_preamble_text(RegionKind kind, const Layout & layout, int shown_lines, int total_lines) {
+    if (!layout.inline_units) return preamble_text(kind, shown_lines, total_lines);
+    if (kind == RegionKind::ToolOutput) {
+        return "[Server note: this tool result was shortened; each omitted range is marked inline. "
+               "Call the tool again if you need an omitted part.]";
+    }
+    return "[Server note: this message was shortened; each omitted range is marked inline.]";
+}
+
 std::string marker_text(int lines_not_shown) {
     return "[\xE2\x80\xA6 " + std::to_string(lines_not_shown) + (lines_not_shown == 1 ? " line" : " lines") +
            " not shown \xE2\x80\xA6]";
@@ -377,7 +458,7 @@ std::string render_region_text(const std::string & text, size_t content_begin, s
     }
     std::string out = text.substr(content_begin, layout.head_end - content_begin);
     out += inserted_line(text, lines, layout.head_end, layout.head_end,
-                         preamble_text(kind, (int) lines.count() - dropped, (int) lines.count()));
+                         region_preamble_text(kind, layout, (int) lines.count() - dropped, (int) lines.count()));
     for (int u = 0; u < n;) {
         if (admitted[(size_t) u]) {
             out += text.substr(layout.cuts[(size_t) u], layout.cuts[(size_t) u + 1] - layout.cuts[(size_t) u]);
@@ -387,7 +468,7 @@ std::string render_region_text(const std::string & text, size_t content_begin, s
         int b = u;
         while (b + 1 < n && !admitted[(size_t) b + 1]) ++b;
         out += inserted_line(text, lines, layout.cuts[(size_t) u], layout.cuts[(size_t) b + 1],
-                             marker_text(layout.line_count(u, b)));
+                             unit_marker_text(layout, u, b));
         u = b + 1;
     }
     out += text.substr(layout.tail_begin, content_end - layout.tail_begin);
@@ -818,9 +899,12 @@ bool region_consistent(const Region & r, std::string & error) {
     if (r.hashes.size() != n || r.reread.size() != n) return fail("per-line vectors");
     const Layout & y = r.layout;
     if (y.cuts.size() < 2 || y.cuts.front() != y.head_end || y.cuts.back() != y.tail_begin) return fail("layout");
+    // Line units open a later line at every cut; inline units may cut one line several times.
+    const int min_line = y.inline_units ? 0 : 1;
     for (size_t i = 0; i < y.cuts.size(); ++i) {
-        if (y.cuts[i] < l.begin || y.cuts[i] > l.end || y.cut_line[i] < 1 || (size_t) y.cut_line[i] >= n ||
-            (i > 0 && (y.cuts[i] <= y.cuts[i - 1] || y.cut_line[i] <= y.cut_line[i - 1]))) {
+        if (y.cuts[i] < l.begin || y.cuts[i] > l.end || y.cut_line[i] < min_line || (size_t) y.cut_line[i] >= n ||
+            (i > 0 && (y.cuts[i] <= y.cuts[i - 1] || y.cut_line[i] < y.cut_line[i - 1] ||
+                       (!y.inline_units && y.cut_line[i] == y.cut_line[i - 1])))) {
             return fail("layout");
         }
     }
@@ -847,7 +931,8 @@ nlohmann::json view_to_json(const View & view) {
             {"lines", {{"escaped", r.lines.escaped}, {"begin", r.lines.begin}, {"end", r.lines.end},
                        {"starts", r.lines.starts}, {"ends", r.lines.ends}}},
             {"layout", {{"head_end", r.layout.head_end}, {"tail_begin", r.layout.tail_begin},
-                        {"cuts", r.layout.cuts}, {"cut_line", r.layout.cut_line}}},
+                        {"cuts", r.layout.cuts}, {"cut_line", r.layout.cut_line},
+                        {"inline", r.layout.inline_units}}},
             {"hashes", r.hashes},
             {"unit_tb", r.unit_tb}, {"unit_te", r.unit_te}, {"unit_db", r.unit_db}, {"unit_de", r.unit_de},
             {"mandatory", bits(r.mandatory)}, {"kept", bits(r.kept)}, {"held", bits(r.held)},
@@ -915,6 +1000,7 @@ bool view_from_json(const nlohmann::json & j, View & out, std::string & error) {
             r.layout.tail_begin = jy.at("tail_begin").get<size_t>();
             r.layout.cuts = jy.at("cuts").get<std::vector<size_t>>();
             r.layout.cut_line = jy.at("cut_line").get<std::vector<int>>();
+            r.layout.inline_units = jy.at("inline").get<bool>();
             r.hashes = jr.at("hashes").get<std::vector<uint64_t>>();
             r.unit_tb = jr.at("unit_tb").get<std::vector<int>>();
             r.unit_te = jr.at("unit_te").get<std::vector<int>>();
