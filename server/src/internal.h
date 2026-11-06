@@ -83,6 +83,9 @@ struct TargetLayer {
     // One GEMV each instead of two; nullptr when stacking was not possible.
     ggml_tensor * wqkv_z         = nullptr;
     ggml_tensor * ssm_ba         = nullptr;
+    // gate|up stack only: rows [0, n_ff) = w_gate,
+    // rows [n_ff, 2 n_ff) = w_up, where the two share a type (glue_fusions.h).
+    ggml_tensor * ffn_gate_up    = nullptr;
     // Fused raw-gate GDN kernel parameters: f32 [2 * dt_rank] = [dt_bias | A],
     // one small GPU tensor per DeltaNet layer (src[9] of the GDN op).
     ggml_tensor * ssm_gate_ba    = nullptr;
