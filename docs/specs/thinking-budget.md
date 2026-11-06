@@ -607,11 +607,11 @@ carries a `timings` object with per-request performance metrics:
 - `cached_prefix_tokens` — tokens in the effective prompt supplied by the
   restored snapshot. Zero on a cache miss.
 - `prefilled_tokens` — effective-prompt tokens computed on this request,
-  excluding the restored prefix. For FlowKV/PFlash requests, these two token
+  excluding the restored prefix. For PFlash requests, these two token
   counts describe the rewritten prompt seen by the backend rather than the raw
   API prompt.
 - `effective_prompt_tokens` — total tokens in that backend prompt. This can
-  differ from `usage.prompt_tokens` when FlowKV/PFlash rewrites the raw API
+  differ from `usage.prompt_tokens` when PFlash rewrites the raw API
   prompt, and equals `cached_prefix_tokens + prefilled_tokens`.
 
 These fields are emitted on every response (OpenAI Chat Completions,

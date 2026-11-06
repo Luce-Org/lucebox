@@ -306,7 +306,7 @@ nlohmann::json view_to_json(const View & view);
 bool view_from_json(const nlohmann::json & j, View & view, std::string & error);
 
 // The paging rules' version, part of a stored view's identity: a view paged under older rules is never served again.
-// 2: a line over its region's cap hands the request to the chat view (it was dropped whole).
+// 2: a line over its region's cap hands the request to the former chat view (it was dropped whole).
 // 3: content line units cannot page is paged in inline units.
 inline constexpr int kViewPagingVersion = 3;
 

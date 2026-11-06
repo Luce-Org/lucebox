@@ -337,7 +337,6 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--kv-cache-min-tokens <N>` | `512` | Minimum prefix length to persist. |
 | `--kv-cache-cold-max <N>` | `10240` | A session's disk files keep their ancestors up to N tokens (the shared head). |
 | `--disk-prefix-cache off\|full\|N` | `full` | Default disk prefix policy (`auto` and `auto:N` are retired and read as `full`). |
-| `--disk-prefix-cache-compress` | off | Clamp FlowKV snapshots to the stable system prefix. Requires a prefill drafter. |
 
 Decode-pressure suspension defaults to `auto`. After all models load, the
 server shares 25% of available host RAM across eligible models, subtracting
@@ -388,29 +387,27 @@ the whole request's device footprint. `/status/json` reports
 
 ### PFlash
 
-With a trained scoring head (`PFLASH_SCORING_HEAD_GGUF`), every PFlash setting
-left unset takes the measured release profile: threshold 16384, the curve
-`16384:0.315 32768:0.270 65536:0.270 120000:0.225`, budget selection over probe
-segments, the request-probe query and the unified view for chats and agent
-sessions (below). Without a head the built-in defaults
-below apply. The [PFlash configuration reference](docs/PFLASH_CONFIGURATION.md)
-lists both, the validated overrides and the active experiments.
+PFlash needs a trained scoring head (`PFLASH_SCORING_HEAD_GGUF`). Every PFlash
+setting left unset takes the measured release profile: threshold 16384, the
+curve `16384:0.315 32768:0.270 65536:0.270 120000:0.225`, budget selection over
+probe segments, the request-probe query and one view for chats and agent
+sessions (below). The [PFlash configuration reference](docs/PFLASH_CONFIGURATION.md)
+lists the release values, the validated overrides and the active experiments.
 
 | Option | Default | Purpose |
 |---|---|---|
 | `--pflash on\|off` | `off` | Turn PFlash prompt compression on. |
-| `--prefill-threshold <N>` | `32000` (`16384` with a head) | Prompts from this many tokens are compressed; `0` compresses every prompt. |
-| `--prefill-keep-ratio <F>` | `0.05` (the release curve with a head) | Fraction of source tokens kept. |
-| `--prefill-curve T:R [T:R ...]` | none (the release curve with a head) | Piecewise keep-ratio curve; overrides the flat ratio. |
+| `--prefill-threshold <N>` | `16384` | Prompts from this many tokens are compressed; `0` compresses every prompt. |
+| `--prefill-keep-ratio <F>` | the release curve | Fraction of source tokens kept. |
+| `--prefill-curve T:R [T:R ...]` | the release curve | Piecewise keep-ratio curve; overrides the flat ratio. |
 | `--prefill-drafter <path>` | none | PFlash drafter GGUF (Qwen3.5-0.8B). |
 | `--prefill-skip-park` | off | Keep target and decode draft resident while PFlash runs. |
 | `--prefill-drafter-device <backend:gpu>` | the `--draft-device` | Device the PFlash drafter scores on, in process: a GPU on the target's backend, with one explicit `--target-device` (not `auto` or `--target-devices`). On another GPU than the target, concurrent serving reserves nothing for it in the paged pool and a single request is not parked, so the target's GPU keeps its memory for context. |
 | `--prefill-upstream-base <URL>` | none | Enable compression-proxy mode. |
 | `--prefill-upstream-key <KEY>` | none | Bearer token for the upstream. |
 | `--prefill-upstream-model <NAME>` | none | Model name forwarded upstream. |
-| `PFLASH_SELECT_MODE=top_k` + `PFLASH_SELECT_TOPK <K>` | unset: legacy selection (`budget_only` with a head) | Rank rule: keep the K highest-scoring optional segments in score order instead of filling the keep ratio, with the keep-ratio budget still a hard ceiling (min(K segments, the budget)). Use it where the evidence is compact and sits in the first few ranks -- needle retrieval, passage QA, code -- so a small K reaches it for a fraction of the budget's tokens. Do not use it where the answer needs a whole document identified, since the evidence there spans many segments and K cuts it off. |
-| `PFLASH_SELECT_QUERY_HEAD=1` (with `PFLASH_SELECT_QUERY_PARSER=latest_user`) | off (on with a head) | The question may come before pasted material. The user's leading prose block (up to the first paste-like line: a code fence, heading, separator, record/file header, tag, JSON or table data, indented or code-shaped line) is scored as an extra query window and kept verbatim; the trailing prose block after the last paste becomes the query window instead of the fixed tail. Caps: `PFLASH_SELECT_QUERY_HEAD_TOKENS` / `PFLASH_SELECT_QUERY_TAIL_TOKENS` (256); a longer block contributes its first and last cap/2 tokens. Blocks under 16 tokens are ignored; a message with no paste structure keeps today's window, except that a short opening paragraph ending in `?` before a long plain text counts as the head. |
-| `PFLASH_SELECT_STRATEGY=fold` (with `PFLASH_SELECT_MODE=budget_only`) | `segments` | Fold selection: each of the top 20 segments (`PFLASH_SELECT_FOLD_K`) is completed to its smallest enclosing block -- a function or class in code (Python indentation or brace-matched C/C++/JS/TS/Go/Rust bodies), a numbered record such as `Document N:`, a markdown section, else a blank-line paragraph (`PFLASH_SELECT_FOLD_PARAGRAPHS=0` turns that last fallback off). A block over 1500 tokens (`PFLASH_SELECT_FOLD_CAP`) keeps its first 150 (`PFLASH_SELECT_FOLD_HEAD`) plus the segment. Code-like prompts (most non-blank lines inside functions; JSON and markdown are not) rank segments by mass (density x length), others by density. The keep-ratio budget stays the ceiling. Needs the head scorer; the drafter loads its vocabulary to read the prompt's structure. |
+| `PFLASH_SELECT_MODE=top_k` + `PFLASH_SELECT_TOPK <K>` | `budget_only` | Rank rule: keep the K highest-scoring optional segments in score order instead of filling the keep ratio, with the keep-ratio budget still a hard ceiling (min(K segments, the budget)). Use it where the evidence is compact and sits in the first few ranks -- needle retrieval, passage QA, code -- so a small K reaches it for a fraction of the budget's tokens. Do not use it where the answer needs a whole document identified, since the evidence there spans many segments and K cuts it off. |
+| `PFLASH_SELECT_QUERY_HEAD=1` (with `PFLASH_SELECT_QUERY_PARSER=latest_user`) | on | The question may come before pasted material. The user's leading prose block (up to the first paste-like line: a code fence, heading, separator, record/file header, tag, JSON or table data, indented or code-shaped line) is scored as an extra query window and kept verbatim; the trailing prose block after the last paste becomes the query window instead of the fixed tail. Caps: `PFLASH_SELECT_QUERY_HEAD_TOKENS` / `PFLASH_SELECT_QUERY_TAIL_TOKENS` (256); a longer block contributes its first and last cap/2 tokens. Blocks under 16 tokens are ignored; a message with no paste structure keeps today's window, except that a short opening paragraph ending in `?` before a long plain text counts as the head. |
 
 With compression on, `--max-ctx` is also the longest raw prompt PFlash takes,
 and a longer one is refused with HTTP 400. A prompt that fits but leaves too
@@ -428,8 +425,7 @@ With a Qwen3.5-0.8B drafter and strict budget selection
 `PFLASH_SELECT_QUERY_TOKENS`), the drafter runs only its first fifteen
 blocks and scores the context with block 15's NoPE Q/K projections as an
 attention-mass scorer. Its 262K native context covers very long inputs. `PFLASH_SCORING_HEAD_GGUF` accepts a trained block-15 head
-(schema `qwen3_5_0_8b_nope_qk_mass_v1`); `PFLASH_QWEN35_LEGACY_SCORER=1`
-restores the previous all-layer running-max scorer. The Qwen3.5 attention
+(schema `qwen3_5_0_8b_nope_qk_mass_v1`). The Qwen3.5 attention
 runs dense (`ggml_flash_attn_ext`); the block-sparse FlashPrefill kernels
 still dispatch head dimension 128 only.
 
@@ -445,118 +441,78 @@ literal strings -- an identifier, a described function -- that it does not
 carry. Strict selection keeps the generation prompt and
 the latest user turn's role header, and it runs on every turn of a
 multi-turn chat. In an agent loop the assistant and tool turns after the
-user's turn are scored like the rest of the conversation. A prompt without
-chat markers scores the tail (`PFLASH_SELECT_QUERY_TOKENS`, default 8) of
-its content.
+user's turn are scored like the rest of the conversation.
 
 The keep ratio applies to the droppable tokens only: what strict selection
 keeps anyway (system and developer messages, tool definitions, the query and
 its turn's envelope, the generation prompt) is added on top, so a long
 system prompt no longer exhausts the budget. Auto mode compares
-`--prefill-threshold` with the droppable tokens too. PFlash never compresses
-the system prompt: one that alone would not fit the context fails the
-request. Developer messages and tool definitions that would not fit lose
-their pin and are scored like any other context.
+`--prefill-threshold` with the droppable tokens too. PFlash pages only user
+content and tool outputs: system and developer messages and tool definitions
+are always served whole, and a request they alone would overflow fails with
+a context-length error.
 
-Multi-turn chats keep a view: the prompt served for a turn is remembered,
-and when the next request's prompt continues it (same tokens up to the old
-generation prompt), PFlash serves that view plus the new turns instead of a
-fresh compression, so the target restores its prefix-cache snapshot of the
-view (taken at the start of its generation prompt) and prefills only what is
-new. Segments the fresh selection keeps for the new question that the view
-lacks are recalled as excerpts at the start of the new user turn. When the
-view grows past twice the fresh prompt, or past the context, the fresh prompt
-starts a new view. `PFLASH_CHAT_VIEW=0` serves the fresh compression every
-turn.
-
-What a turn adds is appended verbatim while it is small, the way full
-prefill appends a follow-up; from `PFLASH_CHAT_COMPRESS_NEW_TOKENS` (default
-16384) tokens of new material (a pasted document, a large tool output) only
-what the fresh selection keeps of it is appended, and the view before it
-stays cached. `PFLASH_CHAT_RECALL=0` turns recall off: a small follow-up is
-then served without running the drafter at all. Recall takes what a fresh
-selection for the new question keeps that the view lacks: a question on the
-view's topic misses little and is served by appending it, and a question
-that needs more than a third of a fresh selection -- the conversation moved
-to other material -- starts a new view from that selection instead. Kept pieces that were not adjacent in the prompt are joined by a
-paragraph break when neither side has one (`PFLASH_SELECT_PARAGRAPH_JOIN=0`
-turns it off; the breaks do not count against the token ceiling).
-`PFLASH_VIEW_TRACE_PATH`
-appends each compressed request's served prompt as JSONL, for evidence
-checks in evaluations.
-
-Coding-agent sessions (with `PFLASH_ADMISSION=cache` and
-`--pflash on`): in a conversation with tool activity (the
-request defines `tools`, or its history has an assistant tool call or a tool
-result) PFlash never compresses the agent's history or any tool output. By
-default it compresses nothing in such a session: every request is served raw
-with full prefill (`pflash_fallback.reason = keep_history`), and a raw prompt
-over the context gets the context-overflow error full prefill gets.
-`PFLASH_AGENT_PASTE=1` (default off) lets PFlash compress one thing: the
-newest turn when it is a user message with at least `--prefill-threshold`
-droppable tokens (a pasted document, on the first turn too). That content
-alone is compressed, on its own keep budget, after the raw history (restored
-from the prefix cache or prefilled) or after the conversation's view. A view
-is then only continued: later turns and tool outputs are appended verbatim, a
-new big paste is compressed as a region of its own, and recall adds the
-passages of earlier pastes that the new question needs in the excerpt block
-at the start of the newest user message, after the cached view. The view is
-never rebuilt and never compressed again as a whole; when it cannot continue
-(or no longer fits the context) the raw prompt is served. The switch is off
-by default because follow-up questions after a compressed paste cost more
-than full prefill, which keeps the whole raw prompt cached: a follow-up that
-needs recall prefills the recalled passages again, and every user turn runs a
-drafter selection (up to 48 s more per follow-up in a 10-turn coding session on
-an R9700; the session took 281 s against 258 s with full prefill). Chats
-without tools are not affected.
-
-With a strict-selection environment whose scorer gives per-candidate scores
-(the release profile, which also sets the `PFLASH_ADMISSION=cache` it needs),
-chat and agent sessions are served by one mechanism, the unified view. A view
+PFlash serves every request through one view of the conversation. A view
 pages the newest turn: the user messages since the last reply, or the tool
 results of the last tool call. When a view starts in a chat without tool
 activity (its first request, a history the server has not cached after a
 restart or from a client that resends it, or a view reset at the context
 limit), the earlier user messages are candidates too; what the prefix cache
-or the disk session cache holds is never paged. An agent session's history is
-served as it is. A candidate message with at least `--prefill-threshold` droppable tokens becomes a
-region, and only what the drafter selection keeps of it is served, with a note
-saying the content was shortened. A region is cut into whole lines. A message
-with fewer than five lines, or with a line longer than its region's cap (a
-document on one line), is cut inside its lines instead: at the drafter's
-segment starts, on token boundaries both tokenizers share, never inside a
-UTF-8 character or a JSON escape, and each omitted range is marked inline.
-Tool outputs are paged for the tools in `PFLASH_REGION_TOOLS` (default `*`,
-every tool; a comma-separated list names tools; empty pages none). Everything
-before the newest turn is the view already served and stays cached: the
-served prompt only grows by appending, and is never compressed again. A new
-user question recalls, as excerpts at the start of its message, the lines of
-earlier regions it needs that the view does not hold. Recall is gated: the
-drafter scores the context for the question, and when the units the view does
-not hold carry less than `PFLASH_RECALL_GATE` of that score mass (default
-0.075, frozen from a development replay as the largest gate whose answers stay
+or the disk session cache holds is never paged. An agent session's history
+(the request defines `tools`, or its history has an assistant tool call or a
+tool result) is served as it is. A candidate message with at least
+`--prefill-threshold` droppable tokens becomes a region, and only what the
+drafter selection keeps of it is served, with a note saying the content was
+shortened. A region is cut into whole lines. A message with fewer than five
+lines, or with a line longer than its region's cap (a document on one line),
+is cut inside its lines instead: at the drafter's segment starts, on token
+boundaries both tokenizers share, never inside a UTF-8 character or a JSON
+escape, and each omitted range is marked inline. Tool outputs are paged for
+the tools in `PFLASH_REGION_TOOLS` (default `*`, every tool; a
+comma-separated list names tools; empty pages none). Everything before the
+newest turn is the view already served and stays cached: until the context
+is full, the served prompt only grows by appending, and is never compressed
+again. A new user question
+recalls, as excerpts at the start of its message, the lines of earlier
+regions it needs that the view does not hold. Recall is gated: the drafter
+scores the context for the question, and when the units the view does not
+hold carry less than `PFLASH_RECALL_GATE` of that score mass (default 0.075,
+frozen from a development replay as the largest gate whose answers stay
 within 3 of ungated recall; `off` recalls by the regions' caps alone) nothing
 is appended; otherwise the best unheld units are recalled until what stays
 unheld is below the gate. `PFLASH_RECALL=0` turns recall off. The request
-probe's pins (the question it finds and its recency pin) stay whole, as in the
-chat view. When the drafter pass fails, the newest content is served verbatim
-and the view continues; `PFLASH_FAIL_CLOSED=1` refuses the request instead. A
-re-read of a paged tool output is served verbatim. A view that would no longer fit the
-context starts over from the raw prompt.
+probe's pins (the question it finds and its recency pin) stay whole. When
+the drafter pass fails, the newest content is served verbatim and the view
+continues; `PFLASH_FAIL_CLOSED=1` refuses the request instead. A re-read of a
+paged tool output is served verbatim. A view that would no longer fit the
+context starts over from the raw prompt and pages its history again: that
+request's served prompt is new, so it reuses no cached prefix. Views
+persist on disk with the disk session cache, so a restart does not turn a
+shortened conversation cold.
 
-Requests the unified view does not take are handed back to the chat view
-described above, which serves them as on its own: a request without a
-messages array, a remote drafter, a turn structure or generation prompt it
-cannot read. A conversation handed back, or served raw after a PFlash
-failure, loses its unified views, and its next turn starts a view of its own.
-The view trace records `pflash.unified = {decision: handback, reason}` for
-these requests. Without a strict-selection environment, or with a
-selection that gives no per-candidate scores (the legacy or split scorer,
-`PFLASH_QWEN35_LEGACY_SCORER=1`, or the fold strategy), the unified view is
-off (startup says so for the scorer) and every request takes the chat view.
-`PFLASH_UNIFIED` is no longer read (startup warns when it is set).
-`PFLASH_AGENT_PASTE`, `PFLASH_ARRIVE`, `PFLASH_CHAT_RECALL` and the other
-chat-view knobs apply only to handed-back requests. `PFLASH_RECALL_SOURCE`
+A string input (the Responses API's `input` without instructions) is
+rendered as one user message and paged like one. A request whose structure
+the view cannot read is served raw with full prefill: one without messages,
+without a query, or whose turns,
+generation prompt or text it cannot map (`pflash.unified = {decision: raw,
+reason}` in the view trace). A conversation served raw after a PFlash failure
+loses its views, and its next turn starts a view of its own.
+`PFLASH_VIEW_TRACE_PATH` appends each request's served prompt as JSONL, for
+evidence checks in evaluations.
+
+`--pflash on` needs the trained scoring head and a drafter in the server's
+own process: startup refuses it without `PFLASH_SCORING_HEAD_GGUF` (or with
+`PFLASH_QWEN35_LEGACY_SCORER=1`, the legacy or split scorer, the fold
+strategy, or an IPC drafter), and for a target whose drafter pass gives no
+per-candidate scores: only the Qwen3.5 family and DeepSeek V4 give them, and
+`auto` leaves PFlash off for the others. These settings of the former chat view and FlowKV
+are no longer read, and startup says so when one is set: `PFLASH_CHAT_VIEW`,
+`PFLASH_CHAT_RECALL`, `PFLASH_CHAT_COMPRESS_NEW_TOKENS`,
+`PFLASH_CHAT_REBUILD_RATIO`, `PFLASH_CHAT_REBUILD_MIN_TOKENS`,
+`PFLASH_ARRIVE`, `PFLASH_AGENT_PASTE`, `PFLASH_SELECT_PARAGRAPH_JOIN`,
+`PFLASH_ADMISSION`, `PFLASH_FREEZE_HOT_WINDOW` and `PFLASH_UNIFIED`
+(`--disk-prefix-cache-compress` has no effect). `PFLASH_FALLBACK_SPREAD` only
+records the relevance spread in the selection trace. `PFLASH_RECALL_SOURCE`
 was removed.
 
 Every turn of a multi-turn chat keeps its role header, and user turns (the

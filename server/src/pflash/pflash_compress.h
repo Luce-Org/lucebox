@@ -129,9 +129,13 @@ struct PFlashTraceFields {
     // ``"ident_query":{...}`` (PFLASH_EVAL_REF_IDENT_QUERY only; absent otherwise).
     const luce::pflash::PFlashIdentQueryTrace * ident_query = nullptr;
     // PFLASH_FALLBACK_SPREAD on (threshold > 0): ``"spread":x,
-    // "spread_threshold":T`` close the record; absent when off.
+    // "spread_threshold":T,"spread_first_token_score":s,"spread_per_token":b``
+    // close the record (the inputs pflash_selection_spread adds to the
+    // record's chunks); absent when off.
     double spread = 0.0;
     double spread_threshold = 0.0;
+    double spread_first_token_score = 0.0;
+    bool spread_per_token = false;
 };
 
 void write_compression_trace(
@@ -213,6 +217,21 @@ PFlashRelevanceSpread pflash_relevance_spread(
         const std::vector<double> & scores,
         const std::vector<uint8_t> & selected,
         const std::vector<uint8_t> & forced);
+// The spread of a selection over its chunks, with the prompt's first token
+// scored as a unit of its own. That token is the attention sink and holds most
+// of the score; averaged into the chunk around it, the spread would depend on
+// how long that chunk is, and so on the system prompt's length once the system
+// turn is pinned whole. ``first_chunk_tokens`` is chunk 0's length,
+// ``first_token_score`` the token's own score and ``per_token`` whether chunk
+// scores are per-token means. The sink unit counts as forced, so k is the
+// selection's own. Equals pflash_relevance_spread when chunk 0 is one token.
+PFlashRelevanceSpread pflash_selection_spread(
+        const std::vector<double> & chunk_scores,
+        const std::vector<uint8_t> & selected,
+        const std::vector<uint8_t> & forced,
+        int first_chunk_tokens,
+        double first_token_score,
+        bool per_token);
 // The spread of the last traced (served) strict selection on this thread;
 // invalid when none ran. Cleared with the kept spans.
 const PFlashRelevanceSpread & pflash_last_relevance_spread();

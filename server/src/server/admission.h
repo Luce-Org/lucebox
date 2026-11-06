@@ -66,7 +66,7 @@ inline bool should_reject_oversized(int prompt_tokens, int max_output,
 
 // Post-compress gate: check whether the effective context overflows max_ctx.
 //
-// effective_tokens          — raw effective prompt size (post FlowKV / pFlash rewrite, or
+// effective_tokens          — raw effective prompt size (post PFlash rewrite, or
 //                             req.prompt_tokens when a full-cache hit skipped compression).
 // served_from_cache_tokens  — when > 0, a pFlash full-cache hit is serving this request;
 //                             use this compressed size for the budget check instead of

@@ -761,7 +761,6 @@ add_library(luce_common STATIC
     src/server/pin_friendly_prompt.cpp
     src/server/kv/disk_prefix_cache.cpp
     src/server/kv/disk_store.cpp
-    src/server/freeze_history.cpp
     # ── Jinja chat-template engine (vendored under deps/llama.cpp/common/) ──
     # Used by render_chat_template_jinja() to support --chat-template-file
     # in luce_server. Mirrors llama.cpp's common_chat_template plumbing.

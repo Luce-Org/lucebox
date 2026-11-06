@@ -1620,9 +1620,9 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
         load_request->residency_action == DraftResidencyAction::ReleaseAfterUse;
 
     // Park target+draft to free VRAM for the drafter (unless skip_park).
-    // A FlowKV request may contain many aged messages. Keep this residency
-    // window around the whole batch so those messages do not reload all three
-    // models independently.
+    // A request may compress several messages. Keep this residency window
+    // around the whole batch so they do not reload all three models
+    // independently.
     const bool was_target_parked = target_parked_;
     const bool was_draft_parked  = draft_parked_;
     if (should_park) {

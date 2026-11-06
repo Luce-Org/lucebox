@@ -68,12 +68,13 @@ benchmark.
 
 ### Tier 2: Exact Prefill Cache
 
-Caches the **entire post-compression KV state** in RAM, keyed on the raw
-(pre-compression) prompt. Hits skip both PFlash compression and prefill
-entirely -- the fastest path for repeated prompts.
+Caches the **entire prompt's KV state** in RAM, keyed on the tokens served:
+the raw prompt, or a compressed prompt's served tokens. A repeated PFlash
+request is served the same tokens by its view without a drafter pass, so a
+hit skips the prefill entirely -- the fastest path for repeated prompts.
 
 - Separate slot pool starting at `cap` (inline slots are `[0, cap)`).
-- Keyed on SHA-1 of the full raw prompt (not just a prefix).
+- Keyed on SHA-1 of the full served prompt (not just a prefix).
 
 The two flags are intentionally separate:
 
@@ -149,7 +150,7 @@ When a session's state is written, its shallower files on disk are deleted,
 except a head at or below `--kv-cache-cold-max` tokens or, without one, the
 shallowest (a longer head).
 
-Compressed prompts (PFlash, FlowKV) are not raw history and get no disk key,
+Compressed prompts are not raw history and get no disk key,
 except a prompt served from a PFlash unified view: its
 key is the tokens it served, and the view itself is kept on disk too, so the
 conversation's next request serves the same tokens again and restores them. A
@@ -168,7 +169,7 @@ model, template or context (the cache's identity salt), or under older paging
 rules (a version in the same identity), are never read. A view
 file that does not load, or whose offsets and per-line and per-unit data do not
 agree, is deleted and the request proceeds without it. A conversation served
-raw after a PFlash failure, or handed to the chat view, loses its views in RAM
+raw after a PFlash failure loses its views in RAM
 and on disk, so no later turn continues them.
 The drafter's own scoring state stays in RAM only: after a restart, the first
 question that needs recall scores the earlier messages again.
@@ -241,13 +242,11 @@ snapshot slots: both run without a disk cache (logged at startup).
 **Cache-aware admission.** PFlash's admission counts the deeper of the RAM
 prefix snapshot and the deepest disk entry for the prompt
 (`DiskPrefixCache::longest_prefix`, an index lookup that reads no file; ties
-go to RAM), in the chat view (`PFLASH_ADMISSION=cache`) and in the unified view. A conversation restored after a restart, or written out
-on eviction, is then cached history: the unified view serves it raw, from disk,
-and pages only new long content, instead of handing a cold history to the chat
-view. The disk counts only with `--kv-cache-dir` set and the request's disk
-scope `full`. With the disk cache on, the chat view's admission record carries
-`cached_source` (`ram`, `disk` or `none`) and the unified view's stats a
-`cached` object with the tokens and source.
+go to RAM). A conversation restored after a restart, or written out
+on eviction, is then cached history: the view serves it raw, from disk,
+and pages only new long content. The disk counts only with `--kv-cache-dir`
+set and the request's disk scope `full`. With the disk cache on, the view's
+stats carry a `cached` object with the tokens and source.
 
 ## Snapshot Memory Management
 

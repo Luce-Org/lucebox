@@ -92,6 +92,7 @@ public:
     DFlashTarget * dflash_target() override;
     bool supports_remote_draft() const override { return true; }
     bool supports_kvflash() const override { return kvflash_active(); }
+    bool pflash_gives_candidate_scores() const override { return true; }
     bool supports_mixed_backend_layer_split() const override {
         return use_mixed_target_split();
     }

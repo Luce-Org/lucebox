@@ -713,7 +713,7 @@ TEST_CASE(PFlashUnifiedFixture, unified_view_disk_store_restart_identity_cap_and
         REQUIRE(store.size() == 3 && view_files().size() == 3);
         REQUIRE(!store.find({1, 2, 3, 7}, {1, 2, 3, 7}, "c", 0, out));
         REQUIRE(store.find({1, 2, 3, 4, 5, 6, 7}, {1, 2, 3, 4, 5, 6, 7}, "c", 0, out));
-        // A conversation the chat view took over leaves the disk too.
+        // A conversation served raw after a failure leaves the disk too.
         store.forget_lineage(1);
         REQUIRE(store.size() == 2 && view_files().size() == 2);
         REQUIRE(!store.find({1, 2, 3, 4, 5, 6, 7}, {1, 2, 3, 4, 5, 6, 7}, "c", 0, out));

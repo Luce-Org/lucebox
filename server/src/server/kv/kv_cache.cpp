@@ -9,9 +9,8 @@ namespace luce::common {
 
 // ─── match ──────────────────────────────────────────────────────────────
 
-KvLease KvCache::match(const KvMatchQuery & query, bool * prompt_replaced) {
+KvLease KvCache::match(const KvMatchQuery & query) {
     std::vector<int32_t> & prompt = *query.prompt;
-    if (prompt_replaced) *prompt_replaced = false;
     KvLease lease;
     lease.disk_policy = query.disk_policy;
     lease.full_snap_key_effective = query.key_by_served;
@@ -28,10 +27,6 @@ KvLease KvCache::match(const KvMatchQuery & query, bool * prompt_replaced) {
             lease.restore = Checkpoint::of_cache_slot(full_slot);
             lease.prefix_len = full_len;
             lease.using_restore = true;
-            if (query.compressed) {
-                prompt.assign((size_t) full_len, 0);
-                if (prompt_replaced) *prompt_replaced = true;
-            }
         }
     }
     // An entry whose backend snapshot is gone is dropped and the next

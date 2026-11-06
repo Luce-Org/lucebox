@@ -373,8 +373,6 @@ static void print_usage(const char * prog) {
         "                              Default disk prefix-cache policy (default: full).\n"
         "                              A plain N caches the first N prompt tokens.\n"
         "                              Needs RAM prefix slots to write new entries.\n"
-        "  --disk-prefix-cache-compress Clamp FlowKV disk snapshots to the stable\n"
-        "                              system prefix. Requires --prefill-drafter.\n"
         "\n"
         "Chat template (optional, overrides the model-family renderer):\n"
         "  --chat-template-file <path>  Load a Jinja chat template file.\n"
@@ -1170,7 +1168,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             }
             sconfig.disk_cache_policy = policy;
         } else if (std::strcmp(argv[i], "--disk-prefix-cache-compress") == 0) {
-            sconfig.disk_cache_policy.compress = true;
+            std::fprintf(stderr, "[server] --disk-prefix-cache-compress is retired and has no effect\n");
         } else if (std::strcmp(argv[i], "--cache-type-k") == 0 && i + 1 < argc) {
             cache_type_k = argv[++i];
         } else if (std::strcmp(argv[i], "--cache-type-v") == 0 && i + 1 < argc) {

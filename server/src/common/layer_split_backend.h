@@ -53,6 +53,7 @@ public:
     virtual bool supports_remote_draft() const { return false; }
     virtual bool supports_kvflash() const { return false; }
     virtual bool supports_mixed_backend_layer_split() const { return false; }
+    virtual bool pflash_gives_candidate_scores() const { return false; }
 
     virtual const char * default_compress_drafter_path() const { return ""; }
     virtual ModelBackend::CompressResult
@@ -129,6 +130,9 @@ public:
     bool supports_remote_draft() const override;
     bool supports_kvflash() const override;
     bool supports_mixed_backend_layer_split() const override;
+    bool pflash_gives_candidate_scores() const override {
+        return adapter_ && adapter_->pflash_gives_candidate_scores();
+    }
 
     void shutdown() override;
 

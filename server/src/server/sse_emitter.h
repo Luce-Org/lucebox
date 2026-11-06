@@ -36,7 +36,7 @@ enum class StreamMode { REASONING, CONTENT, TOOL_BUFFER };
 // Responses). See docs/specs/thinking-budget.md §6.3.
 //
 // `prefill_s` and `decode_s` come straight from GenerateResult. Cache fields
-// describe the effective prompt seen by the backend, after any FlowKV/PFlash
+// describe the effective prompt seen by the backend, after any PFlash
 // rewrite, so benchmarks can distinguish a real prefix restore from a merely
 // fast cold prefill.
 struct GenTimings {
