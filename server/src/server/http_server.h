@@ -106,7 +106,17 @@ HeartbeatSendResult try_send_sse_heartbeat(SocketHandle fd, size_t & offset);
 }
 
 // ─── Server configuration ───────────────────────────────────────────────
+// Deadlines for reading one HTTP request (milliseconds). Fields exist so a
+// test can run them in under a second; the defaults are the production values.
+struct HttpReadLimits {
+    int first_byte_ms = 60000;     // connect -> first request byte (idle connections)
+    int header_ms     = 60000;     // first byte -> complete headers
+    int body_idle_ms  = 60000;     // no body bytes for this long
+    int body_total_ms = 600000;    // headers complete -> full body
+};
+
 struct ServerConfig {
+    HttpReadLimits http_read;
     std::string host        = "0.0.0.0";
     int         port        = 8080;
     int         max_tokens  = 4096;     // default max output tokens (legacy alias for default_max_tokens)

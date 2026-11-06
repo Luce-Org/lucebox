@@ -28,6 +28,7 @@ using luce::engine::LuceEngine;
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 struct ModelRoutingFixture {};
+HttpReadLimits g_read_limits;   // a test sets short deadlines before building RunningModels
 #define ROUTING_CHECK(expression) do { \
     if (!(expression)) throw std::runtime_error( \
         std::string("routing check at line ") + std::to_string(__LINE__) + ": " #expression); \
@@ -408,6 +409,7 @@ public:
         config.port = port;
         config.model_name = "qwen";
         config.max_ctx = 64;
+        config.http_read = g_read_limits;
         config.routing_queue_limit = queue_limit;
         config.decode_kv_offload_bytes = offload_bytes;
         config.default_max_tokens = 4;
@@ -1265,6 +1267,94 @@ TEST_CASE(ModelRoutingFixture, test_offload_budget_and_restore_errors_fail_one_r
         ROUTING_CHECK(models.first.engine.retirements == 2);
         ROUTING_CHECK(models.first.engine.kv_offload_state(1).bytes == 0);
     }
+}
+
+struct ReadLimitsGuard {
+    explicit ReadLimitsGuard(HttpReadLimits limits) { g_read_limits = limits; }
+    ~ReadLimitsGuard() { g_read_limits = HttpReadLimits{}; }
+};
+
+TEST_CASE(ModelRoutingFixture, test_connection_cap_answers_503_above_256_and_serves_the_rest) {
+    RunningModels models;
+    std::this_thread::sleep_for(150ms);   // the readiness probe's own handler has retired
+    std::vector<Socket> held;
+    for (int i = 0; i < 256; ++i) held.push_back(models.connect_client());
+    auto extra = models.connect_client();
+    const auto t0 = Clock::now();
+    const auto response = extra.read();
+    ROUTING_CHECK(Clock::now() - t0 < 1s);
+    ROUTING_CHECK(response.rfind("HTTP/1.1 503 ", 0) == 0);
+    ROUTING_CHECK(response.find("Retry-After: 1\r\n") != std::string::npos);
+    for (int i : {0, 100, 255}) {   // the 256 admitted connections are still served
+        held[i].send("GET /status/json HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        ROUTING_CHECK(held[i].read().rfind("HTTP/1.1 200 ", 0) == 0);
+    }
+}
+
+TEST_CASE(ModelRoutingFixture, test_half_a_header_is_closed_with_408_at_the_deadline) {
+    ReadLimitsGuard guard({60000, 300, 60000, 600000});
+    RunningModels models;
+    auto client = models.connect_client();
+    client.send("GET /status/json HTTP/1.1\r\nHost");
+    const auto t0 = Clock::now();
+    const auto response = client.read();
+    ROUTING_CHECK(Clock::now() - t0 < 2s);
+    ROUTING_CHECK(response.rfind("HTTP/1.1 408 ", 0) == 0);
+}
+
+TEST_CASE(ModelRoutingFixture, test_a_connection_that_never_sends_is_closed_at_the_first_byte_deadline) {
+    ReadLimitsGuard guard({300, 60000, 60000, 600000});
+    RunningModels models;
+    auto client = models.connect_client();
+    const auto t0 = Clock::now();
+    const auto response = client.read();
+    ROUTING_CHECK(Clock::now() - t0 < 2s);
+    ROUTING_CHECK(response.rfind("HTTP/1.1 408 ", 0) == 0);
+}
+
+TEST_CASE(ModelRoutingFixture, test_a_body_that_stops_mid_way_is_closed_at_the_idle_deadline) {
+    ReadLimitsGuard guard({60000, 60000, 300, 600000});
+    RunningModels models;
+    auto client = models.connect_client();
+    client.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc");
+    const auto t0 = Clock::now();
+    const auto response = client.read();
+    ROUTING_CHECK(Clock::now() - t0 < 2s);
+    ROUTING_CHECK(response.rfind("HTTP/1.1 408 ", 0) == 0);
+}
+
+TEST_CASE(ModelRoutingFixture, test_a_trickled_body_is_closed_at_the_total_deadline) {
+    ReadLimitsGuard guard({60000, 60000, 400, 600});
+    RunningModels models;
+    auto client = models.connect_client();
+    client.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n");
+    const auto t0 = Clock::now();
+    // One byte every 100 ms never trips the 400 ms idle limit; the 600 ms total limit must.
+    while (Clock::now() - t0 < 1500ms) {
+        char byte = 'a';
+        if (send(client.get(), &byte, 1, MSG_NOSIGNAL) != 1) break;
+        std::this_thread::sleep_for(100ms);
+    }
+    const auto response = client.read();
+    ROUTING_CHECK(Clock::now() - t0 < 1500ms);
+    ROUTING_CHECK(response.rfind("HTTP/1.1 408 ", 0) == 0);
+}
+
+TEST_CASE(ModelRoutingFixture, test_status_subscriber_33_gets_503_and_the_first_32_stay_open) {
+    RunningModels models;
+    std::vector<Socket> subscribers;
+    for (int i = 0; i < 32; ++i) {
+        subscribers.push_back(models.connect_client());
+        subscribers.back().send("GET /status/events HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        pollfd pfd{subscribers.back().get(), POLLIN, 0};   // headers + initial event: registered
+        ROUTING_CHECK(poll(&pfd, 1, 2000) == 1);
+    }
+    auto extra = models.connect_client();
+    extra.send("GET /status/events HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const auto response = extra.read();
+    ROUTING_CHECK(response.rfind("HTTP/1.1 503 ", 0) == 0);
+    char byte;
+    ROUTING_CHECK(recv(subscribers[0].get(), &byte, 1, MSG_PEEK) == 1);   // still open, not closed
 }
 
 #undef ROUTING_CHECK
