@@ -105,6 +105,15 @@ out="$(run_entrypoint LUCE_PFLASH=on LUCE_PREFILL_DRAFTER="$TARGET" \
 has_pair "$out" --prefill-keep-ratio 0.2 || fail "LUCE_PREFILL_KEEP not forwarded"
 has_pair "$out" --prefill-threshold 8192 || fail "LUCE_PREFILL_THRESHOLD not forwarded"
 
+# ── an explicit LUCE_PFLASH=off holds with a drafter given as an operator flag ──
+out="$(run_entrypoint LUCE_PFLASH=off -- --prefill-drafter "$TARGET")"
+has_pair "$out" --pflash off || fail "LUCE_PFLASH=off not forwarded"
+out="$(run_entrypoint --)"
+has_pair "$out" --pflash auto || fail "LUCE_PFLASH default auto not forwarded"
+out="$(run_entrypoint LUCE_PREFILL_DRAFTER=/nonexistent/drafter.gguf --)" ||
+    fail "auto with a missing drafter refused to start"
+has_flag "$out" --prefill-drafter && fail "auto forwarded a missing drafter"
+
 # ── no arguments serves, with auto device selection by default ─────────────
 out="$(run_entrypoint FAKE_PROBE="$DUAL_AMD_DS4" --)"
 grep -Fxq "ENV_LUCE_TARGET_DEVICE=auto" <<<"$out" || fail "LUCE_TARGET_DEVICE=auto not exported"

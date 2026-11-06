@@ -88,6 +88,7 @@ public:
     // ModelBackend interface
     void print_ready_banner() const override;
     bool supports_images() const override { return image_capable_ && vision_ != nullptr; }
+    bool pflash_gives_candidate_scores() const override { return true; }
     std::string image_placeholder() const override { return vision::DS4V_IMAGE_PLACEHOLDER; }
     // DeepSeek V4 and V4.1 encoding.py join a message's text blocks, image
     // placeholders included, with a blank line.

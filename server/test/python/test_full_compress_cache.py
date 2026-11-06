@@ -1,13 +1,15 @@
-"""Option 3 integration test: full-compress-result cache.
+"""Integration test: a repeated PFlash prompt hits the exact prefill cache.
 
-Sends an identical ~40K-token NIAH prompt 3 times to a server with both
-pFlash compression AND the full-compress-result cache enabled.
+Sends an identical ~40K-token NIAH prompt 3 times to a server with PFlash
+and the exact (full-prompt) prefill cache enabled.
 
 Expected behaviour:
-  - Turn 1: cold compress + cold prefill + cache registration.
-  - Turn 2: full-cache hit — skips BOTH the drafter dance AND the prefill.
+  - Turn 1: the view pages the passage (one drafter pass), cold prefill of
+            the served prompt, and an exact-cache entry keyed by it.
+  - Turn 2: the view serves the same tokens again without a drafter pass,
+            and the exact cache restores their KV: no prefill.
             Latency should be < 30% of Turn 1.
-  - Turn 3: same full-cache hit, same speedup.
+  - Turn 3: the same.
 
 Correctness: all three replies must be identical.
 
@@ -15,6 +17,7 @@ Skipped automatically if any prerequisite is missing:
   - target GGUF        (LUCE_TARGET or ~/models/qwen3.6-27b/...)
   - draft safetensors dir or GGUF            (LUCE_DRAFT)
   - Qwen3.5-0.8B-BF16 pFlash drafter GGUF     (LUCE_PREFILL_DRAFTER)
+  - PFlash scoring head (PFLASH_SCORING_HEAD_GGUF)
   - luce_server binary (--server-bin / LUCE_SERVER_BIN)
 
 Run:  pytest server/test/python/test_full_compress_cache.py -v -m server
@@ -71,7 +74,7 @@ PROMPT, ANSWER = build_long_prompt(target_tokens=40000)
 
 @pytest.fixture(scope="module")
 def compress_server(server_bin, spawn_luce_server):
-    """luce_server with pFlash compression + full-compress-result cache."""
+    """luce_server with PFlash and the exact prefill cache."""
     target = Path(os.environ.get(
         "LUCE_TARGET",
         Path.home() / "models/qwen3.6-27b/Qwen3.6-27B-UD-Q4_K_XL.gguf"))
@@ -87,11 +90,13 @@ def compress_server(server_bin, spawn_luce_server):
     ]:
         if not p.exists():
             pytest.skip(f"{label} missing at {p}")
+    # --pflash on needs the trained scoring head (startup refuses otherwise).
+    head = os.environ.get("PFLASH_SCORING_HEAD_GGUF", "")
+    if not head or not Path(head).exists():
+        pytest.skip("PFLASH_SCORING_HEAD_GGUF unset or missing")
 
-    # --prefix-cache-slots 4: prefix-cache pool (slots 0-3, unused when
-    #   compression fires because compressed tokens lack chat-template
-    #   markers).
-    # --prefill-cache-slots 4: full-cache pool (slots 4-7).
+    # --prefix-cache-slots 4: prefix-cache pool (slots 0-3).
+    # --prefill-cache-slots 4: exact-cache pool (slots 4-7).
     # Total = 8 == daemon hard cap (PREFIX_CACHE_SLOTS in test_dflash.cpp).
     handle = spawn_luce_server(
         [
@@ -126,9 +131,9 @@ def _chat(client, max_tokens: int = 16) -> tuple[float, str]:
 def test_full_cache_hit(compress_server):
     client = compress_server.client
 
-    t1, r1 = _chat(client)   # cold: compress + prefill + register
-    t2, r2 = _chat(client)   # full-cache hit
-    t3, r3 = _chat(client)   # full-cache hit again
+    t1, r1 = _chat(client)   # cold: page + prefill + register
+    t2, r2 = _chat(client)   # the same served tokens: exact-cache hit
+    t3, r3 = _chat(client)   # exact-cache hit again
 
     full_cache_hits = compress_server.read_log().count("[pc] full-cache hit")
 

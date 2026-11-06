@@ -422,21 +422,12 @@ inline std::vector<LaunchProfileEnv> pflash_release_env() {
     };
     if (!set("PFLASH_SCORING_HEAD_GGUF")) return {};
     std::vector<LaunchProfileEnv> env = {
-        // Units are taken by relevance per token until the budget is full;
-        // relevance spread too flat over a whole prompt gets full prefill.
+        // Units are taken by relevance per token until the budget is full.
         {"PFLASH_SELECT_MODE", "budget_only"},
         {"PFLASH_SELECT_SCORE", "density"},
         {"PFLASH_SELECT_CHUNK_SIZE", "256"},
         {"PFLASH_SELECT_QUERY_TOKENS", "128"},
         {"PFLASH_SELECT_QUERY_HEAD", "1"},
-        {"PFLASH_SELECT_PARAGRAPH_JOIN", "0"},
-        {"PFLASH_FALLBACK_SPREAD", "0.11"},
-        // Admission counts only tokens no cache restores, a newly arriving
-        // region is scored alone, and a drifted chat view is rebuilt only
-        // once it holds 64K tokens.
-        {"PFLASH_ADMISSION", "cache"},
-        {"PFLASH_ARRIVE", "1"},
-        {"PFLASH_CHAT_REBUILD_MIN_TOKENS", "65536"},
     };
     const bool segment_probe = set("PFLASH_SEGMENT_PROBE_GGUF");
     if (segment_probe) env.push_back({"PFLASH_SELECT_SEGMENTS", "probe"});

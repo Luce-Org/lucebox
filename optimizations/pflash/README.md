@@ -93,25 +93,24 @@ For an OpenAI-compatible server with transparent compression on long prompts, ru
 
 | Flag | Choices / type | Default | Effect |
 |---|---|:---:|---|
-| `--pflash` | `on` / `off` | `off` | Run pflash on prompts of at least `--prefill-threshold` tokens. |
-| `--prefill-threshold` | int (tokens) | `32000` | Token threshold for compression. `16384` with a trained scoring head; `0` compresses every request. |
-| `--prefill-keep-ratio` | float `(0, 1]` | `0.05` | Fraction of source tokens to keep after compression. `0.02` for 128K, `0.10` for 32K. With a trained scoring head and no ratio flag, the release curve `16384:0.315 32768:0.270 65536:0.270 120000:0.225` applies. |
-| `--prefill-drafter` | path to `.gguf` | required with `--pflash on` | Drafter weights (Qwen3.5-0.8B BF16 GGUF). |
+| `--pflash` | `auto` / `on` / `off` | `auto` | Page long messages of at least `--prefill-threshold` droppable tokens. `auto` is on when `--prefill-drafter` and `PFLASH_SCORING_HEAD_GGUF` are set; `on` refuses to start without them. |
+| `--prefill-threshold` | int (tokens) | `16384` | Droppable tokens a message needs to be paged; `0` pages every message. |
+| `--prefill-keep-ratio` | float `(0, 1]` | release curve | Fraction of source tokens to keep. Without a ratio flag the release curve `16384:0.315 32768:0.270 65536:0.270 120000:0.225` applies. |
+| `--prefill-drafter` | path to `.gguf` | required for PFlash | Drafter weights (Qwen3.5-0.8B BF16 GGUF). |
 | `--prefill-drafter-tokenizer` | HF repo id | `Qwen/Qwen3.5-0.8B` | HF tokenizer for the drafter vocab. |
 
-With `PFLASH_SCORING_HEAD_GGUF` set, every unset PFlash setting takes the measured release profile; see [PFlash configuration](../../server/docs/PFLASH_CONFIGURATION.md#release-profile).
+PFlash needs `PFLASH_SCORING_HEAD_GGUF`; the segment and request probes (`PFLASH_SEGMENT_PROBE_GGUF`, `PFLASH_REQUEST_PROBE_GGUF`) turn on their release-profile features. Every unset PFlash setting takes the measured release profile; see [PFlash configuration](../../server/docs/PFLASH_CONFIGURATION.md#release-profile).
 
 ```bash
+PFLASH_SCORING_HEAD_GGUF=server/models/pflash/head.gguf \
+PFLASH_SEGMENT_PROBE_GGUF=server/models/pflash/segment-probe.gguf \
+PFLASH_REQUEST_PROBE_GGUF=server/models/pflash/request-probe.gguf \
 ./server/build/luce_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft  server/models/draft/model.safetensors \
-  --max-ctx 8192 --fa-window 0 \
-  --pflash on \
-  --prefill-threshold 4096 \
-  --prefill-keep-ratio 0.02 \
   --prefill-drafter server/models/Qwen3.5-0.8B-BF16.gguf
 ```
 
-Below the threshold the server runs the standard target generate (no compression). Above it, the server transparently runs `compress` on the daemon, swaps the prompt for the compressed text, and continues the normal `/v1/chat/completions` flow. Tool-calling requests (`req.tools` non-empty) skip compression so JSON tool definitions stay intact.
+PFlash is on because the drafter and the head are given. A user message or tool output with fewer droppable tokens than the threshold is served as is; a longer one is paged, and the system prompt and tool definitions are always served whole. See the [server README](../../server/README.md#pflash) for how the view pages, recalls and continues a conversation.
 
 Validated end-to-end at 64K and 128K source on RTX 3090 (Qwen3.6-27B Q4_K_M target + Qwen3.5-DFlash draft + Qwen3-0.6B BF16 drafter).
 

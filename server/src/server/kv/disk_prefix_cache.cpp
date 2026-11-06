@@ -38,7 +38,6 @@ std::string disk_prefix_cache_policy_name(const DiskPrefixCachePolicy & policy) 
     } else {
         base = disk_prefix_cache_mode_name(policy.mode);
     }
-    if (policy.compress) base += "+compress";
     return base;
 }
 
@@ -98,8 +97,6 @@ bool apply_request_scope_override(DiskPrefixCachePolicy & server_policy,
     if (!parse_disk_prefix_cache_policy(scope_str, parsed)) {
         return false;
     }
-    // Preserve server-level flags (e.g. compress) across the scope override.
-    parsed.compress = server_policy.compress;
     server_policy = parsed;
     return true;
 }

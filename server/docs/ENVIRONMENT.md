@@ -462,5 +462,4 @@ profile and the requirements checked at startup.
 - `LUCE_PC_DEEP_FIRST_MIN` - prefix_cache.cpp
 - `LUCE_QK_FUSE_LAYERS` - laguna_target_graph.cpp
 - `LUCE_QK_FUSE_MODE` - laguna_target_graph.cpp
-- `PFLASH_FREEZE_HOT_WINDOW` - http_server.cpp
 - `TMPDIR` - backend_ipc.cpp, moe_expert_compute_ipc.cpp

@@ -36,8 +36,8 @@ a valid restore.
 - The cache key is the exact token prefix. Changing a tool name, description,
   parameter, system prompt, or template produces a miss; incompatible KV state
   is never reused.
-- With FlowKV enabled, the system/tool prefix and recent turns stay verbatim;
-  only aged message content is eligible for compression.
+- With PFlash on, the system/tool prefix stays verbatim; only large, uncached
+  user content and the newest turn's tool outputs are paged.
 - Client disconnects use the same C++ request lifecycle as every other request,
   so an unfinished snapshot reservation is aborted instead of being published.
 
@@ -69,7 +69,7 @@ The benchmark creates a unique, large tool schema and checks:
 2. the first request is a cache miss;
 3. every identical-tool follow-up is a cache hit;
 4. restored and prefilled token counts exactly cover each effective backend
-   prompt, including when FlowKV/PFlash rewrites the raw prompt;
+   prompt, including when PFlash rewrites the raw prompt;
 5. changing one tool forces a cache miss;
 6. cold prefill time is at least 3× the median warm prefill time by default.
 

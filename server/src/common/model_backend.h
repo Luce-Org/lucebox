@@ -628,6 +628,10 @@ struct ModelBackend {
     virtual bool supports_kvflash() const { return false; }
     virtual bool supports_mixed_backend_layer_split() const { return false; }
 
+    // compress() returns the trained head's per-candidate scores
+    // (CompressResult::candidate_lifts), which PFlash's view pages with.
+    virtual bool pflash_gives_candidate_scores() const { return false; }
+
     // ── Routing data collection ──────────────────────────────────────
     // Set an external routing collector that the backend will call for each
     // token/layer during decode (hidden state + expert IDs). Used by
