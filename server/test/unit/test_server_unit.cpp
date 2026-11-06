@@ -21193,9 +21193,10 @@ TEST_CASE(ServerUnitFixture, test_unified_raw_fallback_drops_the_conversations_v
     TEST_ASSERT(!run.prepared[1].compressed && run.prepared[1].tokens == run.ids[1]);
     const json & fallback = run.prepared[1].pflash_stats["pflash_fallback"];
     TEST_ASSERT_MSG(fallback.value("unified_lineages_forgotten", 0) == 1, run.prepared[1].pflash_stats.dump());
-    // Turn 3 does not continue turn 1's view (its history was served raw): the chat view takes it.
-    TEST_ASSERT_MSG(run.prepared[2].unified_handback == "uncached", run.prepared[2].pflash_stats.dump());
-    TEST_ASSERT(run.unified["counts"].value("serve.region", 0) == 1);
+    // Turn 3 does not continue turn 1's view (its history was served raw): a new view pages the history's paste.
+    TEST_ASSERT_MSG(run.prepared[2].unified_handback.empty() && run.prepared[2].compressed &&
+                    run.prepared[2].unified_view, run.prepared[2].pflash_stats.dump());
+    TEST_ASSERT(run.unified["counts"].value("serve.region", 0) == 2);
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_needs_candidate_scores) {
@@ -21264,31 +21265,9 @@ TEST_CASE(ServerUnitFixture, test_unified_repeat_with_a_new_pin_serves_it) {
     TEST_ASSERT(run.unified["counts"].value("repeat", 0) == 0);
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_repeat_of_an_adopted_prompt_with_a_new_pin_serves_it) {
-    // The chat view's prompt the unified view adopted keeps no record of the lines it kept: a retry that pins
-    // (pflash_required) text is compressed again, not answered with that prompt. A cold history hands it over.
-    const std::string pear = "Line 30: plain filler text here pear";
-    const json turn = json::array({
-        {{"role", "system"}, {"content", "You are helpful."}},
-        {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {30, "pear"}})}},
-        {{"role", "assistant"}, {"content", "Noted."}},
-        {{"role", "user"}, {"content", "Which line mentions KIWI?"}},
-    });
-    UnifiedOptions options;
-    options.keep_scored_only = true;
-    options.required = {{}, {pear}};
-    const auto run = run_unified_session({turn, turn}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
-                                         65536, options);
-    TEST_ASSERT_MSG(run.prepared[0].unified_handback == "uncached" && run.prepared[0].compressed,
-                    run.prepared[0].pflash_stats.dump());
-    TEST_ASSERT(run.served_text[0].find(pear) == std::string::npos);
-    TEST_ASSERT_MSG(run.served_text[1].find(pear) != std::string::npos, run.prepared[1].pflash_stats.dump());
-    TEST_ASSERT(run.unified["counts"].value("repeat", 0) == 0);
-}
-
 TEST_CASE(ServerUnitFixture, test_unified_disk_view_that_does_not_match_the_prompt_is_dropped) {
     // The restarted server finds turn 1's view on disk, but the file's region digest no longer matches the
-    // conversation's bytes: the view is deleted and the follow-up goes to the chat view as a cold history.
+    // conversation's bytes: the view is deleted and the follow-up starts a view of its own over the cold history.
     const json turn1 = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}}) + "Which line mentions KIWI?"}},
@@ -21321,7 +21300,9 @@ TEST_CASE(ServerUnitFixture, test_unified_disk_view_that_does_not_match_the_prom
                                          65536, disk);
     TEST_ASSERT(edited == 1);
     TEST_ASSERT(run.prepared[0].compressed && run.prepared[0].unified_view);
-    TEST_ASSERT_MSG(run.prepared[1].unified_handback == "uncached", run.prepared[1].pflash_stats.dump());
+    TEST_ASSERT_MSG(run.prepared[1].unified_handback.empty() && run.prepared[1].compressed &&
+                    run.prepared[1].pflash_stats["unified"].value("decision", "") == "region",
+                    run.prepared[1].pflash_stats.dump());
     TEST_ASSERT(run.unified["counts"].value("disk_view_rejected", 0) == 1);
     TEST_ASSERT(run.unified["counts"].value("disk_view", 0) == 0);
     rm_rf(dir);
@@ -21445,10 +21426,10 @@ TEST_CASE(ServerUnitFixture, test_unified_recall_user_question_only) {
     TEST_ASSERT(s3.find("short note") < block);
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_cold_history_hands_back_to_the_chat_view) {
-    // A cold transcript: a large paste in turn 1 and a large listed tool output in turn 2, the newest turn a short
-    // question. The unified view never pages anything before the newest turn and would prefill that history raw, so
-    // it hands the request to the chat view, which serves a tool session raw (keep_history): no drafter pass.
+TEST_CASE(ServerUnitFixture, test_unified_tool_session_cold_history_stays_verbatim) {
+    // A cold agent transcript: a large paste in turn 1 and a large listed tool output in turn 2, the newest turn a
+    // short question. An agent session's history is never paged: with nothing new to page the prompt is served raw,
+    // with no drafter pass.
     const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read_file"}}}}});
     const json turn = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
@@ -21460,21 +21441,32 @@ TEST_CASE(ServerUnitFixture, test_unified_cold_history_hands_back_to_the_chat_vi
         {{"role", "user"}, {"content", "Which line mentions KIWI?"}},
     });
     const auto run = run_unified_session({turn}, tools, "read_file", 64, unified_fruit_score);
-    TEST_ASSERT_MSG(run.prepared[0].unified_handback == "uncached", run.prepared[0].pflash_stats.dump());
-    TEST_ASSERT(run.prepared[0].pflash_stats.find("unified") == run.prepared[0].pflash_stats.end());
+    const json & stats = run.prepared[0].pflash_stats;
+    TEST_ASSERT_MSG(run.prepared[0].unified_handback.empty() && stats["unified"].value("decision", "") == "raw" &&
+                    stats["unified"].value("reason", "") == "no_region", stats.dump());
+    TEST_ASSERT(stats["unified"]["admission"].size() == 1);   // the newest message alone
     TEST_ASSERT(!run.prepared[0].compressed);
     TEST_ASSERT(run.prepared[0].tokens == run.ids[0]);
     TEST_ASSERT(run.calls_after[0] == 0);
-    TEST_ASSERT(run.unified["counts"].value("handback.uncached", 0) == 1);
-    TEST_ASSERT_MSG(run.view_records.size() == 1 &&
-                    run.view_records[0]["pflash"]["unified"].value("decision", "") == "handback" &&
-                    run.view_records[0]["pflash"]["unified"].value("reason", "") == "uncached",
-                    run.view_records.empty() ? "no view record" : run.view_records[0].dump());
+    TEST_ASSERT(run.unified["counts"].value("handback.uncached", 0) == 0);
+
+    // The same transcript with a new large tool output as its newest turn: that output alone is paged.
+    json fresh = turn;
+    fresh.back() = {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+        unified_tool_call("call_2", "read_file", {{"path", "more.md"}})})}};
+    fresh.push_back({{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", unified_doc(80, {{9, "kiwi"}}, "R")}});
+    const auto paged = run_unified_session({fresh}, tools, "read_file", 64, unified_fruit_score);
+    const json & admission = paged.prepared[0].pflash_stats["unified"]["admission"];
+    TEST_ASSERT_MSG(paged.prepared[0].compressed && admission.size() == 1 &&
+                    admission[0].value("kind", "") == "tool_output" && admission[0].value("decision", "") == "region",
+                    paged.prepared[0].pflash_stats.dump());
+    TEST_ASSERT(paged.served_text[0].find(unified_doc(80, {{7, "kiwi"}}) + "Summarise this.") != std::string::npos);
+    TEST_ASSERT(paged.calls_after[0] == 1);
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_cold_chat_history_is_adopted_after_the_chat_view) {
-    // A chat whose first request already holds a large earlier paste: the chat view compresses the cold history,
-    // then the unified view adopts what it served, so the follow-up continues it and reuses the served prefix.
+TEST_CASE(ServerUnitFixture, test_unified_cold_chat_history_is_paged_once_and_recallable) {
+    // A chat whose first request already holds a large earlier paste: the view that starts pages that cold history
+    // in one drafter pass; the follow-up continues the view, reuses its served prefix and recalls what it needs.
     const json turn1 = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}}) + "Summarise this."}},
@@ -21488,24 +21480,25 @@ TEST_CASE(ServerUnitFixture, test_unified_cold_chat_history_is_adopted_after_the
     selecting.keep_scored_only = true;
     const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
                                          65536, selecting);
-    UnifiedOptions chat = selecting;
-    chat.chat_view_only = true;
-    const auto base = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
-                                          65536, chat);
-    // Turn 1: the chat view's own prompt.
-    TEST_ASSERT_MSG(run.prepared[0].unified_handback == "uncached", run.prepared[0].pflash_stats.dump());
-    TEST_ASSERT(run.prepared[0].compressed && run.prepared[0].unified_view);
-    TEST_ASSERT(run.prepared[0].tokens == base.prepared[0].tokens);
-    TEST_ASSERT(run.unified["counts"].value("adopt.uncached", 0) == 1);
-    // Turn 2: the adopted view continues; turn 1's served prompt is reused token for token.
+    // Turn 1: the earlier paste is paged; the kiwi line the question needs stays.
+    const auto & p1 = run.prepared[0];
+    TEST_ASSERT_MSG(p1.unified_handback.empty() && p1.compressed && p1.unified_view &&
+                    p1.pflash_stats["unified"].value("decision", "") == "region", p1.pflash_stats.dump());
+    TEST_ASSERT(run.calls_after[0] == 1);
+    TEST_ASSERT(run.served_text[0].find("Line 7: plain filler text here kiwi\n") != std::string::npos);
+    TEST_ASSERT(run.served_text[0].find("mango") == std::string::npos);
+    TEST_ASSERT(run.served_text[0].find("A list of lines.") != std::string::npos);
+    // Turn 2: the view continues; turn 1's served prompt is reused token for token and the mango line is recalled.
     const auto & p2 = run.prepared[1];
     TEST_ASSERT_MSG(p2.unified_handback.empty() && p2.unified_view, p2.pflash_stats.dump());
     const json & stats = p2.pflash_stats["unified"];
-    TEST_ASSERT_MSG(stats.value("continued", false) && stats.value("decision", "") == "continue", stats.dump());
+    TEST_ASSERT_MSG(stats.value("continued", false) && stats.value("decision", "") == "recall", stats.dump());
     const int cut = run.prepared[0].snapshot_cut;
     TEST_ASSERT(cut > 0 && stats.value("reused_tokens", 0) == cut);
     TEST_ASSERT(std::equal(run.prepared[0].tokens.begin(), run.prepared[0].tokens.begin() + cut, p2.tokens.begin()));
-    TEST_ASSERT(run.served_text[1].find("Which line mentions MANGO?") != std::string::npos);
+    const std::string & s2 = run.served_text[1];
+    const size_t block = s2.find("[Earlier in this conversation]\n[From an earlier user message]\n");
+    TEST_ASSERT_MSG(block != std::string::npos && s2.find("mango", block) != std::string::npos, s2);
     TEST_ASSERT(run.unified.value("views", 0) >= 1);
 }
 
@@ -21643,9 +21636,9 @@ TEST_CASE(ServerUnitFixture, test_pflash_restorable_prefix_counts_disk_only_when
 
 TEST_CASE(ServerUnitFixture, test_unified_restart_resumes_a_disk_chat_and_pages_only_the_new_paste) {
     // A server restart: the chat's history (an earlier paste and its answer) is on disk, RAM is empty. The unified
-    // view counts the disk entry as cached, as the chat view's admission does: it keeps the conversation instead of
-    // handing a cold history to the chat view, serves the history as it is (the generation path restores it from
-    // disk) and pages only the new paste. Without the entry, or outside the Full disk scope, the chat view takes it.
+    // view counts the disk entry as cached: it serves the history as it is (the generation path restores it from
+    // disk) and pages only the new paste. Without the entry, or outside the Full disk scope, the history is cold and
+    // its paste is paged too.
     const json turn = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", unified_doc(80, {{7, "mango"}}) + "Summarise this."}},
@@ -21678,14 +21671,19 @@ TEST_CASE(ServerUnitFixture, test_unified_restart_resumes_a_disk_chat_and_pages_
     off.disk_mode = DiskPrefixCacheMode::Off;
     const auto scoped = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
                                             65536, off);
-    TEST_ASSERT_MSG(scoped.prepared[0].unified_handback == "uncached", scoped.prepared[0].pflash_stats.dump());
+    const auto both_paged = [] (const UnifiedRun & r) {
+        const json & a = r.prepared[0].pflash_stats["unified"]["admission"];
+        return r.prepared[0].unified_handback.empty() && r.calls_after[0] == 1 && a.size() == 2 &&
+               a[0].value("decision", "") == "region" && a[1].value("decision", "") == "region";
+    };
+    TEST_ASSERT_MSG(both_paged(scoped), scoped.prepared[0].pflash_stats.dump());
     rm_rf(dir);
-    // No disk entry: the cold history goes to the chat view, as without the disk cache.
+    // No disk entry: the history is cold, as without the disk cache.
     UnifiedOptions empty;
     empty.disk_dir = dir;
     const auto cold = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
                                           65536, empty);
-    TEST_ASSERT_MSG(cold.prepared[0].unified_handback == "uncached", cold.prepared[0].pflash_stats.dump());
+    TEST_ASSERT_MSG(both_paged(cold), cold.prepared[0].pflash_stats.dump());
     rm_rf(dir);
 }
 
@@ -21736,8 +21734,8 @@ TEST_CASE(ServerUnitFixture, test_unified_restart_serves_a_disk_chat_raw_for_a_s
 TEST_CASE(ServerUnitFixture, test_unified_shortened_chat_survives_a_restart_through_its_view_on_disk) {
     // Turn 1 pages a long paste. The server restarts (shutdown flush): its view is written to disk and read back on
     // the next turn, so the follow-up continues the shortened conversation -- the same served prefix, nothing handed
-    // back to the chat view -- instead of arriving cold. Without the disk cache the restart loses the view, and the
-    // follow-up goes to the chat view as a cold history.
+    // back -- instead of arriving cold. Without the disk cache the restart loses the view, and the follow-up starts
+    // a view of its own that pages the cold history again.
     const json turn1 = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}}) + "Which line mentions KIWI?"}},
@@ -21771,7 +21769,9 @@ TEST_CASE(ServerUnitFixture, test_unified_shortened_chat_survives_a_restart_thro
     ram.restart_at = 1;
     const auto lost = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
                                           nullptr, 65536, ram);
-    TEST_ASSERT_MSG(lost.prepared[1].unified_handback == "uncached", lost.prepared[1].pflash_stats.dump());
+    TEST_ASSERT_MSG(lost.prepared[1].unified_handback.empty() && lost.prepared[1].compressed &&
+                    !lost.prepared[1].pflash_stats["unified"].value("continued", true),
+                    lost.prepared[1].pflash_stats.dump());
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_one_line_paste_is_paged_inline) {
@@ -22385,9 +22385,9 @@ TEST_CASE(ServerUnitFixture, test_unified_reread_coverage_counts_fallen_back_mes
     TEST_ASSERT_MSG(unified_occurrences(run.served_text[1], "mango") == 1, run.served_text[1]);
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_reset_hands_back_to_the_chat_view) {
+TEST_CASE(ServerUnitFixture, test_unified_reset_pages_the_history_again) {
     // Recall overheads can grow a view past the raw prompt. A turn whose view no longer fits goes back to admission
-    // on the raw prompt; that history is uncached, so the chat view takes the turn instead of a raw prefill.
+    // on the raw prompt; that history is uncached, so a new view pages it instead of a raw prefill.
     const std::string doc = unified_doc(80, {});
     json turn = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
@@ -22408,36 +22408,33 @@ TEST_CASE(ServerUnitFixture, test_unified_reset_hands_back_to_the_chat_view) {
     const std::vector<json> session(turns.begin(), turns.begin() + (long) over + 2);
 
     // The view of turn ``over`` does not fit with a long output allowance; its raw prompt does. The next turn, with a
-    // short allowance again, must not continue the view the chat view replaced (nor an ancestor of it).
+    // short allowance again, continues the new view, not the one it replaced (nor an ancestor of it).
     UnifiedOptions options;
     options.max_outputs.assign(session.size(), 16);
     options.max_outputs[over] = 4096;
     const int fits_raw = (int) probe.ids[over].size() + 4096;
     const auto run = run_unified_session(session, nullptr, nullptr, 64, nullptr, 0, 0.3f, nullptr, fits_raw, options);
-    TEST_ASSERT_MSG(run.prepared[over].unified_handback == "reset_uncached", run.prepared[over].pflash_stats.dump());
+    const json & reset = run.prepared[over].pflash_stats["unified"];
+    TEST_ASSERT_MSG(run.prepared[over].unified_handback.empty() && run.prepared[over].compressed &&
+                    reset.value("reset", "") == "context" && reset.value("decision", "") == "region" &&
+                    !reset.value("continued", true), reset.dump());
     TEST_ASSERT(run.prepared[over].error.empty());
     TEST_ASSERT(run.unified["counts"].value("reset.context", 0) == 1);
     TEST_ASSERT(run.unified["counts"].value("raw.reset", 0) == 0);
-    // This chat view keeps every candidate, so it serves the raw history: nothing to adopt, and the next turn is
-    // uncached again (test_unified_cold_chat_history_is_adopted_after_the_chat_view covers a compressed one).
-    TEST_ASSERT(run.unified["counts"].value("adopt.reset_uncached", 0) == 0);
-    TEST_ASSERT_MSG(run.prepared[over + 1].unified_handback == "uncached", run.prepared[over + 1].pflash_stats.dump());
-    TEST_ASSERT_MSG(run.unified.value("views", -1) == 0, run.unified.dump());
+    const json & next = run.prepared[over + 1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(next.value("continued", false) && next.value("lineage", 0) == reset.value("lineage", -1) &&
+                    reset.value("lineage", 0) != run.prepared[over - 1].pflash_stats["unified"].value("lineage", 0),
+                    next.dump());
 
-    // Nothing fits (the output allowance alone is the context): the chat view answers as it does without the flag.
+    // Nothing fits (the output allowance alone is the context): the paged prompt is refused for its length.
     const int fits_view = (int) probe.prepared[over].tokens.size() + 16;
     UnifiedOptions tight;
     tight.max_outputs.assign(session.size(), 16);
     tight.max_outputs[over] = fits_view;
     tight.allow_errors = true;
     const auto again = run_unified_session(session, nullptr, nullptr, 64, nullptr, 0, 0.3f, nullptr, fits_view, tight);
-    UnifiedOptions tight_off = tight;
-    tight_off.chat_view_only = true;
-    const auto base = run_unified_session(session, nullptr, nullptr, 64, nullptr, 0, 0.3f, nullptr, fits_view,
-                                          tight_off);
-    TEST_ASSERT_MSG(again.prepared[over].unified_handback == "reset_uncached", again.prepared[over].pflash_stats.dump());
-    TEST_ASSERT_MSG(again.prepared[over].error == base.prepared[over].error, again.prepared[over].error);
-    TEST_ASSERT(again.prepared[over].tokens == base.prepared[over].tokens);
+    TEST_ASSERT_MSG(again.prepared[over].error.find("maximum context length") != std::string::npos,
+                    again.prepared[over].error);
 
     // The refused turn keeps the conversation's views: a retry with a short allowance continues the view.
     std::vector<json> retry(session.begin(), session.begin() + (long) over + 1);
@@ -22633,6 +22630,11 @@ struct PflashStageBackend : MockPflashBudgetBackend {
         scoring = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         CompressResult result = MockPflashBudgetBackend::compress(request);
+        // Per-candidate scores over 4-token chunks, so the unified view can page what it is offered.
+        const int n = (int) request.input_ids.size();
+        for (int begin = 0; begin < n; begin += 4) {
+            result.candidate_lifts.push_back({{begin, (std::min)(n, begin + 4)}, begin % 12 == 0 ? 2.0 : 1.0});
+        }
         scoring = false;
         return result;
     }
@@ -22757,12 +22759,13 @@ TEST_CASE(ServerUnitFixture, test_scheduler_pflash_decodes_while_the_drafter_sco
     TEST_ASSERT(run.admitted_sizes[1] < run.raw_tokens);
 }
 
-// Two long prompts that arrive together are both scored and served
-// compressed.
+// Two long prompts that arrive together are both served compressed. They are
+// the same prompt: the second repeats the first's view when that view is
+// stored before it is prepared, without a drafter pass of its own.
 TEST_CASE(ServerUnitFixture, test_scheduler_pflash_serves_two_long_prompts) {
     const auto run = run_pflash_stage_case(/*chats=*/0, /*long_prompts=*/2);
     TEST_ASSERT(run.done);
-    TEST_ASSERT(run.compress_calls == 2);
+    TEST_ASSERT(run.compress_calls == 1 || run.compress_calls == 2);
     TEST_ASSERT(run.admitted_sizes.size() == 2);
     TEST_ASSERT(run.admitted_sizes[0] < run.raw_tokens);
     TEST_ASSERT(run.admitted_sizes[1] < run.raw_tokens);

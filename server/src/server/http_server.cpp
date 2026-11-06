@@ -6987,6 +6987,7 @@ std::string HttpServer::apply_unified_view(
         pu::Lines lines;
         bool lines_ready = false;
         std::string inline_because;   // why line units cannot page it: paged in inline units
+        bool history = false;         // a user message before the newest turn: a candidate only on a start
     };
     std::vector<Candidate> newest;
     const size_t last = messages.size() - 1;
@@ -7031,6 +7032,22 @@ std::string HttpServer::apply_unified_view(
             }
             newest.push_back(std::move(c));
         }
+    }
+    // A chat without tool activity also offers its earlier user messages: a view that starts pages what is
+    // uncached of them by the same rule, so a history the server has not seen (a restart, a client resending it)
+    // is paged once and stays recallable. An agent session's history is served as it is.
+    if (!http_detail::pflash_has_tool_activity(req.tools, messages)) {
+        const size_t newest_first = newest.empty() ? messages.size() : newest.front().message;
+        std::vector<Candidate> history;
+        for (size_t index = 0; index < newest_first; ++index) {
+            if (messages[index].role != "user") continue;
+            Candidate c;
+            c.message = index;
+            c.history = true;
+            history.push_back(std::move(c));
+        }
+        newest.insert(newest.begin(), std::make_move_iterator(history.begin()),
+                      std::make_move_iterator(history.end()));
     }
     // Their exact content in the prompt text, where the codec rendered it.
     const bool laid_out = layout.messages.size() == messages.size() && layout.text() == text;
@@ -7175,13 +7192,21 @@ std::string HttpServer::apply_unified_view(
         return longest;
     };
 
+    // The admission record: an earlier message the view already served is not this turn's candidate.
+    const auto listed = [] (const json & admission) {
+        json out = json::array();
+        for (const auto & entry : admission) {
+            if (!(entry.value("history", false) && entry.value("decision", "") == "not_new")) out.push_back(entry);
+        }
+        return out;
+    };
     for (int pass = 0; pass < 2; ++pass) {
         const bool continues = has_view && pass == 0;
         const int new_from = continues ? view.drafter_gen_begin : 0;
         std::vector<pu::Region> held_regions = continues ? view.regions : std::vector<pu::Region>{};
 
         // Admission: eligible, new, uncached, big, not a re-read.
-        json admission = json::array();
+        json admission = json::array();   // one entry per candidate, indexed like ``newest``
         std::vector<size_t> region_candidates;
         std::vector<size_t> verbatim;
         for (size_t k = 0; k < newest.size(); ++k) {
@@ -7223,30 +7248,11 @@ std::string HttpServer::apply_unified_view(
                                  {"decision", why.empty() ? "region" : why},
                                  {"droppable", droppable}});
             if (why.empty() && !c.inline_because.empty()) admission.back()["inline_because"] = c.inline_because;
+            if (c.history) admission.back()["history"] = true;
             if (why.empty()) {
                 region_candidates.push_back(k);
             } else {
                 verbatim.push_back(k);
-            }
-        }
-
-        // A conversation the view would start: when the part it can never page -- the uncached, unpinned history
-        // before the newest turn -- is a threshold's worth, the chat view takes the request (its cache admission
-        // compresses such a prompt) instead of a raw prefill of it.
-        if (!continues) {
-            const int uncached_from = (std::min)(turn.generation_begin, (int) std::floor(
-                (double) restorable * (double) input / (double) (std::max)(1, prompt_tokens)));
-            const auto unpinned = [&] (int begin, int end) {
-                begin = (std::max)(begin, uncached_from);
-                return end > begin ? (end - begin) - http_detail::pflash_span_tokens_within(pins, begin, end) : 0;
-            };
-            int newest_begin = turn.generation_begin;
-            for (const auto & c : newest) {
-                if (c.located) newest_begin = (std::min)(newest_begin, c.db);
-            }
-            if (target_estimate(unpinned(0, newest_begin)) >= config_.pflash_threshold) {
-                // Once the chat view accepts it, the view this turn would have continued goes, with its lineage.
-                return hand_back(found_view ? "reset_uncached" : "uncached");
             }
         }
 
@@ -7592,7 +7598,8 @@ std::string HttpServer::apply_unified_view(
         int covered_units = 0;
         for (size_t k : verbatim) {
             Candidate & c = newest[k];
-            if (!c.located || c.ce <= c.cb || held_regions.empty()) continue;
+            // An earlier message is where a region came from, not a repeat of it.
+            if (c.history || !c.located || c.ce <= c.cb || held_regions.empty()) continue;
             const auto hashes = pu::line_hashes(text, candidate_lines(c));
             for (auto & region : held_regions) {
                 const auto match = pu::match_reread(hashes, region.hashes);
@@ -7918,7 +7925,7 @@ std::string HttpServer::apply_unified_view(
         // not fit either: a retry with a smaller output allowance may still continue that view.
         const bool raw_fits = config_.max_ctx <= 0 || prompt_tokens + req.max_output <= config_.max_ctx;
         if (!continues && new_regions.empty() && !(found_view && raw_fits)) {
-            stats["admission"] = admission;
+            stats["admission"] = listed(admission);
             return serve_raw(region_candidates.empty() ? "no_region" : "no_region_paged");
         }
 
@@ -7952,7 +7959,7 @@ std::string HttpServer::apply_unified_view(
         stats["reused_tokens"] = continues ? view.view_gen_begin : 0;
         stats["served_tokens"] = served.size();
         stats["over_raw"] = (int) served.size() - prompt_tokens;
-        stats["admission"] = admission;
+        stats["admission"] = listed(admission);
         stats["regions"] = next.regions.size();
         stats["reread_held_units"] = covered_units;
         if (!recall_stats.is_null()) stats["recall"] = recall_stats;
