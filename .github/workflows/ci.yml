@@ -644,6 +644,8 @@ jobs:
     name: Build Windows (ROCm HIP, server targets)
     runs-on: windows-2022
     timeout-minutes: 45
+    permissions:
+      contents: read
     env:
       ROCM_VERSION: 10.0.0
       HIP_ARCH: gfx1201
