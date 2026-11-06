@@ -542,7 +542,9 @@ messages array, a remote drafter, a turn structure or generation prompt it
 cannot read, and a conversation it would start (no stored view continues it)
 whose uncached history before the newest turn, with newest content that
 cannot be cut into lines or has a line longer than its region's cap (one long
-line of prose could only be dropped whole), reaches `--prefill-threshold`
+line of prose could only be dropped whole) or whose first two and last two
+lines, which paging always keeps, alone fill its region's cap (a document on
+one line after its opening tag), reaches `--prefill-threshold`
 (reason `uncached`,
 or `reset_uncached` when a stored view could not continue). A conversation
 handed back, or served raw after a PFlash failure, loses its unified views.

@@ -21549,6 +21549,86 @@ TEST_CASE(ServerUnitFixture, test_unified_long_line_under_the_message_cap_but_ov
     TEST_ASSERT_MSG(run.served_text[0].find("kiwi") != std::string::npos, run.served_text[0]);
 }
 
+TEST_CASE(ServerUnitFixture, test_unified_long_line_in_the_kept_head_goes_to_the_chat_view) {
+    // A document wrapped in tags is five lines: the tag, the passage on one line, the closing tag, a blank line
+    // and the question. Paging always keeps the first two and last two lines, so the passage could never be
+    // paged and the region would have nothing to drop; the chat view takes it before the drafter scores.
+    std::string filler;
+    for (int i = 0; i < 300; ++i) filler += "The grass is green. ";
+    const std::string doc = "<document>\n" + filler + "The kiwi number is 7. " + filler + "\n</document>\n\n";
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which sentence mentions KIWI?"}},
+    });
+    UnifiedOptions options;
+    options.keep_scored_only = true;
+    const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
+                                         65536, options);
+    TEST_ASSERT_MSG(run.prepared[0].unified_handback == "uncached", run.prepared[0].pflash_stats.dump());
+    TEST_ASSERT_MSG(run.prepared[0].compressed, run.prepared[0].pflash_stats.dump());
+    TEST_ASSERT_MSG(run.served_text[0].find("kiwi") != std::string::npos, run.served_text[0]);
+    TEST_ASSERT(run.unified["counts"].value("handback.uncached", 0) == 1);
+    TEST_ASSERT(run.unified["counts"].value("adopt.uncached", 0) == 1);
+    TEST_ASSERT(run.unified["counts"].value("raw.no_region_paged", 0) == 0);
+
+    // The follow-up continues the adopted prompt.
+    json turn2 = turn;
+    turn2.push_back({{"role", "assistant"}, {"content", "The kiwi number is 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "And what colour is the grass?"}});
+    const auto two = run_unified_session({turn, turn2}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
+                                         65536, options);
+    const auto & p2 = two.prepared[1];
+    TEST_ASSERT_MSG(p2.unified_handback.empty() && p2.unified_view, p2.pflash_stats.dump());
+    TEST_ASSERT(p2.pflash_stats["unified"].value("continued", false));
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_paste_just_over_the_threshold_with_a_header_is_still_paged) {
+    // The kept lines (a header, a blank line, the last two) are far below the region's cap, so a paste whose
+    // body alone is just under the threshold is still paged rather than handed to the chat view.
+    std::string doc = "Notes from the Tuesday review of the retry policy and its backoff settings\n\n";
+    for (int i = 0; i < 40; ++i) {
+        doc += i == 20 ? "The kiwi number is 7.\n" : "Line " + std::to_string(i) + ": the grass is green.\n";
+    }
+    doc += "end of notes\n";
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which sentence mentions KIWI?"}},
+    });
+    UnifiedOptions options;
+    options.keep_scored_only = true;
+    const auto probe = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
+                                           65536, options);
+    const json & probe_admission = probe.prepared[0].pflash_stats["unified"]["admission"];
+    TEST_ASSERT_MSG(probe_admission.size() == 1, probe.prepared[0].pflash_stats.dump());
+    const int droppable = probe_admission[0].value("droppable", 0);
+    TEST_ASSERT(droppable > 64);
+    const auto run = run_unified_session({turn}, nullptr, nullptr, droppable - 1, unified_fruit_score, 16, 0.3f,
+                                         nullptr, 65536, options);
+    const auto & p = run.prepared[0];
+    TEST_ASSERT_MSG(p.unified_handback.empty() && p.unified_view && p.compressed, p.pflash_stats.dump());
+    TEST_ASSERT_MSG(p.pflash_stats["unified"].value("decision", "") == "region", p.pflash_stats.dump());
+    TEST_ASSERT_MSG(run.served_text[0].find("kiwi") != std::string::npos, run.served_text[0]);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_long_line_in_the_kept_head_of_a_tool_output_is_served_whole) {
+    // The same shape as a fresh agent turn's tool output: the chat view takes it and keeps a tool session raw.
+    std::string filler;
+    for (int i = 0; i < 300; ++i) filler += "The grass is green. ";
+    const std::string output = "<file>\n" + filler + "The kiwi number is 7. " + filler + "\n</file>\n\nend\n";
+    const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read_file"}}}}});
+    const json cold = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", "Read the file. Which sentence mentions KIWI?"}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+            unified_tool_call("call_1", "read_file", {{"path", "a.txt"}})})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", output}},
+    });
+    const auto fresh = run_unified_session({cold}, tools, "read_file", 600, unified_fruit_score);
+    TEST_ASSERT_MSG(fresh.prepared[0].unified_handback == "uncached", fresh.prepared[0].pflash_stats.dump());
+    TEST_ASSERT(!fresh.prepared[0].compressed);
+    TEST_ASSERT(fresh.prepared[0].tokens == fresh.ids[0]);
+}
+
 // A tool output whose body is one line of ``filler`` around ``needle``, framed by short lines.
 static std::string unified_long_line_output(const std::string & needle) {
     std::string filler;

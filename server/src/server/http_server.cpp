@@ -7232,9 +7232,10 @@ std::string HttpServer::apply_unified_view(
         }
 
         // A conversation the view would start: when the part it can never page -- the uncached, unpinned history
-        // before the newest turn, and newest content it cannot cut into lines that fit -- is a threshold's worth, the
-        // chat view takes the request (its cache admission compresses such a prompt) instead of a raw prefill of it.
-        // Newest content the view serves verbatim by design (unlisted tool outputs, small messages) does not count.
+        // before the newest turn, newest content it cannot cut into lines that fit, and a message whose always-kept
+        // first two and last two lines alone fill its region's cap -- is a threshold's worth, the chat view takes the
+        // request (its cache admission compresses such a prompt) instead of a raw prefill of it. Newest content the
+        // view serves verbatim by design (unlisted tool outputs, small messages) does not count.
         if (!continues) {
             const int uncached_from = (std::min)(turn.generation_begin, (int) std::floor(
                 (double) restorable * (double) input / (double) (std::max)(1, prompt_tokens)));
@@ -7249,8 +7250,18 @@ std::string HttpServer::apply_unified_view(
             int cannot_page = unpinned(0, newest_begin);
             for (size_t k = 0; k < newest.size(); ++k) {
                 const std::string decision = admission[k].value("decision", "");
+                Candidate & c = newest[k];
                 if (decision == "no_lines" || decision == "long_line") {
-                    cannot_page += unpinned(newest[k].db, newest[k].de);
+                    cannot_page += unpinned(c.db, c.de);
+                } else if (decision == "region") {
+                    // Paging keeps the first two and last two lines. When they alone fill the region's cap, it
+                    // could keep nothing else and would serve the message whole, so the message counts whole.
+                    const pu::Lines & lines = candidate_lines(c);
+                    const int kept = unpinned(c.db, token_from(dd, lines.starts[2])) +
+                                     unpinned(token_from(dd, lines.starts[lines.count() - 2]), c.de);
+                    if (target_estimate(kept) >= base_cap(admission[k].value("droppable", 0))) {
+                        cannot_page += unpinned(c.db, c.de);
+                    }
                 }
             }
             if (target_estimate(cannot_page) >= config_.pflash_threshold) {
