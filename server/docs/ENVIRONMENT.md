@@ -89,7 +89,6 @@ profile and the requirements checked at startup.
 | `LUCE_DS4_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and emit semantic DS4 prefill, speculative-decode, and layer-range markers for external rocprof traces. No events, timing, or device synchronization are added. |
 | `LUCE_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
 | `LUCE_CUDA_MMVF_NARROW_F16` | enabled on qualified gfx1151 narrow F16 matmuls | BURN-IN KILL SWITCH: =0 restores the generic dispatch decision for the narrow F16 projection optimization, unless an explicit `LUCE_MMVF_MAX_NCOLS_F16` ceiling overrides it. |
-| `GGML_CUDA_MMQ_X` | unset | DEBUG: force a supported MMQ output-column tile width (8–128) for architecture tuning; invalid or over-budget values fall back to automatic selection. |
 | `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` | unset (MIX formats adapt) | On sparse-route gfx1151 grouped MoE MMQ, choose the measured output tile from routed rows per expert. Unset: only the shipped ROCmFP2/ROCmFP3 MIX expert formats adapt (tile 32). `=1` (BURN-IN): the plain ROCmFP2/3/4 formats adapt too. `=0`: none adapt. Ordinary matmuls and other devices are unchanged. |
 | `GGML_CUDA_MMQ_MOE_PERSISTENT` | unset | EXPERIMENTAL: on prefill-sized (at least 256-token) sparse grouped ROCmFP2/3/4 MMQ on gfx1151, build a compact device-side expert-tile queue and consume it with bounded persistent workers. Short batches, ordinary matmuls, unmeasured formats, and other devices are unchanged. |
 | `GGML_CUDA_MMQ_MOE_PERSISTENT_BLOCKS_PER_CU` | 32 | DEBUG: set the compact grouped-MoE worker budget per gfx1151 CU from 1–32. Invalid values use 32. |
@@ -442,7 +441,6 @@ profile and the requirements checked at startup.
 - `GGML_DS4_INDEXER_M32_CACHE_B` - ds4-indexer.cu, deepseek4_backend.cpp (gfx1151 default: cached B operand)
 - `GGML_DS4_INDEXER_M32_PREFILL` - ds4-indexer.cu (DIAGNOSTIC: m32 prefill crossover override)
 - `GGML_DS4_INDEXER_M32_DIRECT_B` - ds4-indexer.cu (DIAGNOSTIC: m32 direct-B crossover override)
-- `GGML_CUDA_MMQ_X` - ggml-cuda/mmq.cuh
 - `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` - ggml-cuda/mmq.cuh
 - `GGML_CUDA_MMQ_MOE_PERSISTENT` - ggml-cuda/mmq.cuh
 - `GGML_CUDA_MMQ_MOE_PERSISTENT_BLOCKS_PER_CU` - ggml-cuda/mmq.cuh

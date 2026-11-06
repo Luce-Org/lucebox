@@ -1164,7 +1164,8 @@ if(LUCE_TESTS)
         test_rope_tail
         test_kernel_qualification_core
         test_cuda_copy_batch
-        test_uma_budget)
+        test_uma_budget
+        test_mmq_tile_twin_gate)
 
     # Standalone check of the DS4 MIX histogram fitter: reuses the converter
     # source with its main() renamed away, so it needs the converter's
@@ -1191,6 +1192,12 @@ if(LUCE_TESTS)
     # Header-only RAM check for managed allocations on integrated GPUs
     # (ggml-cuda/uma-budget.h); it needs no GPU toolkit to build or run.
     add_executable(test_uma_budget test/unit/test_uma_budget.cpp)
+
+    # RDNA4 MMQ tile-twin gate (ggml-cuda/mmq-tile-twin-gate.h): header-only,
+    # no GPU.
+    add_executable(test_mmq_tile_twin_gate test/unit/test_mmq_tile_twin_gate.cpp)
+    target_include_directories(test_mmq_tile_twin_gate PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
 
     # Header-only platform shims must remain independently buildable and
     # runnable on hosted Windows workers without a GPU.
@@ -1447,6 +1454,11 @@ if(LUCE_TESTS)
         # to a host reference on the vector-eligible shapes and on the shapes that fall back to the scalar kernel.
         luce_add_ggml_gpu_executable(test_cpy_vec_parity test/unit/test_cpy_vec_parity.cpp)
         list(APPEND _raw_unit_test_targets test_cpy_vec_parity)
+        # Guards the MMQ tile twins (ggml-cuda/mmq_tile_twins.h): each arm (twins off, one, both) runs in a child
+        # process and must hash-equal the parent tiles on every case, and launch a twin exactly where
+        # mmq-tile-twin-gate.h says. SKIP (77) without a GPU or on a GPU that is not RDNA4.
+        luce_add_ggml_gpu_executable(test_mmq_tile_twins test/unit/test_mmq_tile_twins.cpp)
+        list(APPEND _raw_unit_test_targets test_mmq_tile_twins)
         # Guards the fused PLE conv matcher (ple-conv.cu): the qwen4exp subgraph must match (no LUCE_PLE_DEBUG
         # "no match" lines) and hash-equal the unfused nodes (child process under LUCE_PLE_FUSE_LEGACY=1).
         luce_add_ggml_gpu_executable(test_ple_conv_fusion test/unit/test_ple_conv_fusion.cpp)
@@ -2950,7 +2962,8 @@ if(LUCE_TESTS)
         test_rocmfp_mix_glu_fusable
         test_cuda_copy_batch
         test_qn_split_fusions
-        test_uma_budget)
+        test_uma_budget
+        test_mmq_tile_twin_gate)
     foreach(_cppunit_target IN LISTS _new_cppunit_test_targets)
         if(TARGET ${_cppunit_target})
             target_sources(${_cppunit_target} PRIVATE test/unit/test_unit_main.cpp)

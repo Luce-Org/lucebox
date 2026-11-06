@@ -1,15 +1,38 @@
 #include "common.cuh"
 #include "mmq.cuh"
 #include "mmq_big.h"
+#include "mmq-tile-twin-gate.h"
+#include "mmq_tile_twins.h"
+
+#include <atomic>
 #include "quantize.cuh"
 #include "mmid.cuh"
 #include "rocmfp2_mix.cuh"
 #include "rocmfp3_mix.cuh"
 
+#include <algorithm>
+
 static thread_local size_t g_mmq_launch_count = 0;
+static thread_local size_t g_mmq_twin_rows64_launch_count = 0;
+static thread_local size_t g_mmq_twin_rows32_launch_count = 0;
 
 extern "C" size_t ggml_backend_cuda_get_mmq_launch_count(void) {
     return g_mmq_launch_count;
+}
+
+// Both RDNA4 tile twins are on; tests turn them off to compare against the
+// parent tiles (ggml_backend_cuda_set_mmq_twins_override).
+static std::atomic<bool> g_mmq_twin_rows64_on{true};
+static std::atomic<bool> g_mmq_twin_rows32_on{true};
+
+extern "C" void ggml_backend_cuda_set_mmq_twins_override(bool rows64, bool rows32) {
+    g_mmq_twin_rows64_on.store(rows64, std::memory_order_relaxed);
+    g_mmq_twin_rows32_on.store(rows32, std::memory_order_relaxed);
+}
+
+extern "C" size_t ggml_backend_cuda_get_mmq_twin_launch_count(int tile_rows) {
+    return tile_rows == 64 ? g_mmq_twin_rows64_launch_count :
+           tile_rows == 32 ? g_mmq_twin_rows32_launch_count : 0;
 }
 
 namespace {
@@ -75,6 +98,65 @@ static bool lucebox_mmq_big_tile_take(const ggml_type type, const int64_t ncols_
     }
 }
 
+// MMQ tile twins: mmq-tile-twin-gate.h picks the tile, mmq_tile_twins.h
+// launches it. Calls the gate leaves to the parent (wider, other types or
+// devices) run the parent dispatch below unchanged.
+namespace {
+
+bool luce_mmq_twin_launch_rows64(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    const void * a = &args;
+    switch (args.type_x) {
+        case GGML_TYPE_IQ3_S:   return mul_mat_q_case_rows64_iq3_s  (ctx, a, stream);
+        case GGML_TYPE_IQ3_XXS: return mul_mat_q_case_rows64_iq3_xxs(ctx, a, stream);
+        default:                return false;
+    }
+}
+
+bool luce_mmq_twin_launch_rows32(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    const void * a = &args;
+    switch (args.type_x) {
+        case GGML_TYPE_IQ4_XS:  return mul_mat_q_case_rows32_iq4_xs (ctx, a, stream);
+        case GGML_TYPE_Q4_K:    return mul_mat_q_case_rows32_q4_k   (ctx, a, stream);
+        case GGML_TYPE_Q5_K:    return mul_mat_q_case_rows32_q5_k   (ctx, a, stream);
+        case GGML_TYPE_Q6_K:    return mul_mat_q_case_rows32_q6_k   (ctx, a, stream);
+        case GGML_TYPE_Q8_0:    return mul_mat_q_case_rows32_q8_0   (ctx, a, stream);
+        case GGML_TYPE_IQ3_S:   return mul_mat_q_case_rows32_iq3_s  (ctx, a, stream);
+        case GGML_TYPE_IQ3_XXS: return mul_mat_q_case_rows32_iq3_xxs(ctx, a, stream);
+        default:                return false;
+    }
+}
+
+bool luce_mmq_twin(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    const bool ud_smalltile = g_mmq_twin_rows64_on.load(std::memory_order_relaxed);
+    const bool two_warp     = g_mmq_twin_rows32_on.load(std::memory_order_relaxed);
+    if (!ud_smalltile && !two_warp) {
+        return false;
+    }
+    mmq_twins_enabled on;
+    on.ud_smalltile = ud_smalltile;
+    on.two_warp     = two_warp;
+    mmq_twin_call call;
+    call.type     = args.type_x;
+    call.nrows    = args.nrows_x;
+    call.ncols    = std::max(args.ncols_dst, args.ncols_max);
+    call.rdna4    = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+    call.routed   = args.ids_dst != nullptr || args.expert_bounds != nullptr;
+    const mmq_twin_choice choice = mmq_twin_choose(on, call);
+    if (choice.inert_why != nullptr || choice.tile == mmq_twin_tile::parent) {
+        return false;
+    }
+    const bool rows32 = choice.tile == mmq_twin_tile::rows32;
+    // A twin that cannot serve the call launches nothing; the parent runs.
+    if (!(rows32 ? luce_mmq_twin_launch_rows32(ctx, args, stream)
+                 : luce_mmq_twin_launch_rows64(ctx, args, stream))) {
+        return false;
+    }
+    ++(rows32 ? g_mmq_twin_rows32_launch_count : g_mmq_twin_rows64_launch_count);
+    return true;
+}
+
+}  // namespace
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const bool is_mix_type =
         args.type_x == GGML_TYPE_Q2_1_ROCMFP2_MIX ||
@@ -90,6 +172,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             case GGML_TYPE_Q8_0:   mul_mat_q_case_big_q8_0  (ctx, &args, stream); return;
             default: break;
         }
+    }
+    if (luce_mmq_twin(ctx, args, stream)) {
+        return;
     }
     switch (args.type_x) {
         case GGML_TYPE_Q2_0:
