@@ -871,7 +871,8 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
             ggml_tensor * Vr = ggml_view_3d(c, v_cache, D, span, Hk, v_cache->nb[1], v_cache->nb[2], 0);
             ggml_tensor * a;
             if (row.qsa == QSA_DENSE) {
-                a = ggml_flash_attn_ext(c, ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3)), Kr, Vr, row.mask,
+                // One query row: flash attention reads Q through its strides, so the permuted view needs no copy.
+                a = ggml_flash_attn_ext(c, ggml_permute(c, q, 0, 2, 1, 3), Kr, Vr, row.mask,
                     1.0f / std::sqrt((float) D), 0.0f, 0.0f);
                 ggml_flash_attn_ext_set_prec(a, GGML_PREC_F32);
             } else {
@@ -932,7 +933,8 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
             K_full = ggml_view_3d(c, k_cache, D, mask->ne[0], Hk, k_cache->nb[1], k_cache->nb[2], 0);
             V_full = ggml_view_3d(c, v_cache, D, mask->ne[0], Hk, v_cache->nb[1], v_cache->nb[2], 0);
         }
-        ggml_tensor * Qfa = ggml_cont(c, ggml_permute(c, Q, 0, 2, 1, 3));  // [D, T, Hq]
+        // [D, T, Hq]; one query row needs no copy, as above.
+        ggml_tensor * Qfa = T == 1 ? ggml_permute(c, Q, 0, 2, 1, 3) : ggml_cont(c, ggml_permute(c, Q, 0, 2, 1, 3));
         attn = ggml_flash_attn_ext(c, Qfa, K_full, V_full, mask,
             1.0f / std::sqrt((float) D), 0.0f, 0.0f);                       // [D, Hq, T, 1]
         ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);                  // match upstream's F32 acc

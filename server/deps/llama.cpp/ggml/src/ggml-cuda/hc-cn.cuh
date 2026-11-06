@@ -20,6 +20,7 @@ struct ggml_cuda_hc_combine_norm_args {
     const ggml_tensor * moe_sh_logit = nullptr;   // [1, T]             F32
     bool                moe_down_f16 = false;     // moe_down holds F16 in place (F16-only mark)
     int8_t *            out_q8       = nullptr;   // Q8 activation tiles of xn for the W8A8 HC down (mmb-w8a8.cuh layout)
+    void *              out_q8_1     = nullptr;   // xn's q8_1 rows for an MMVQ HC down (a q8 memo buffer; not MoE mode)
 };
 
 void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_combine_norm_args & args);

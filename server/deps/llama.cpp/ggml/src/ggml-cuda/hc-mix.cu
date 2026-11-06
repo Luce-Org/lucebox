@@ -26,9 +26,11 @@ static __global__ void hc_mix_reduce_f32(
     dst[index] = scale * acc + bias;
 }
 
+// q8: dst's q8_1 form too, as MMVQ's quantize_q8_1 would write it (warp 0's 32 consecutive outputs are one block).
 static __global__ void hc_mix_reduce_f32_hc4_parallel(
         const float * __restrict__ xn, const float * __restrict__ gate, float * __restrict__ dst,
-        const int64_t n_embd, const int64_t n_tokens, const float scale, const float bias) {
+        const int64_t n_embd, const int64_t n_tokens, const float scale, const float bias,
+        block_q8_1 * __restrict__ q8 = nullptr) {
     const int lane = threadIdx.x % 32;
     const int stream = threadIdx.x / 32;
     const int64_t index = int64_t(blockIdx.x) * 32 + lane;
@@ -48,7 +50,20 @@ static __global__ void hc_mix_reduce_f32_hc4_parallel(
         sum = q4x_add_rn(sum, products[1][lane]);
         sum = q4x_add_rn(sum, products[2][lane]);
         sum = q4x_add_rn(sum, products[3][lane]);
-        dst[index] = scale * sum + bias;
+        const float v = scale * sum + bias;
+        dst[index] = v;
+        if (q8 != nullptr) {
+            float amax = fabsf(v);
+            float bsum = v;
+            amax = warp_reduce_max<QK8_1>(amax);
+            bsum = warp_reduce_sum<QK8_1>(bsum);
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+            q8[index / QK8_1].qs[index % QK8_1] = q;
+            if (lane == 0) {
+                q8[index / QK8_1].ds = make_half2(d, bsum);
+            }
+        }
     }
 }
 
@@ -68,6 +83,13 @@ static bool hc_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
     const uintptr_t av = (uintptr_t) a->data;
     const uintptr_t bv = (uintptr_t) b->data;
     return av <= bv ? bv-av < ggml_nbytes(a) : av-bv < ggml_nbytes(b);
+}
+
+bool ggml_cuda_hc_mix_reduce_q8_ok(const ggml_cuda_hc_mix_args & args) {
+    const int64_t n_embd = args.dst->ne[0];
+    return args.hc == 4 && ggml_nrows(args.dst) <= 32 && n_embd % MATRIX_ROW_PADDING == 0 &&
+           !ggml_cuda_mmb_cache_lookup(args.xn) && !hc_ranges_overlap(args.dst, args.xn) &&
+           !hc_ranges_overlap(args.dst, args.gate);
 }
 
 void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_mix_args & args) {
@@ -98,8 +120,10 @@ void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx, const ggml_cuda
     } else if (args.hc == 4 && n_tokens <= 32) {
         const int blocks = (int) ((n_items + 31) / 32);
         hc_mix_reduce_f32_hc4_parallel<<<blocks, 128, 0, ctx.stream()>>>(
-            (const float *) xn->data, (const float *) gate->data, out, n_embd, n_tokens, args.scale, args.bias);
+            (const float *) xn->data, (const float *) gate->data, out, n_embd, n_tokens, args.scale, args.bias,
+            (block_q8_1 *) args.q8);
     } else {
+        GGML_ASSERT(args.q8 == nullptr && "the q8 form is written by the hc4 kernel only");
         const int threads = 256;
         const int blocks = (int) ((n_items + threads - 1) / threads);
         hc_mix_reduce_f32<<<blocks, threads, 0, ctx.stream()>>>(

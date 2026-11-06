@@ -21,12 +21,35 @@ static __device__ __forceinline__ void hc_q8_pair(int8_t * q8, const int nkb, co
     if ((threadIdx.x & 15) == 0) *(float *) (tile + 512 + tl * 4) = d;
 }
 
-// two elements per thread per iteration, packed 32-bit accesses
+// One q8_1 block of xn as MMVQ's quantize_q8_1 writes it, from the 16 lanes of a half warp holding its 32 elements in
+// pairs (v0 = element 2l, v1 = element 2l + 1). The block sum follows quantize_q8_1's 32-lane xor butterfly: its
+// offsets 16, 8, 4, 2 pair lanes 8, 4, 2, 1 apart here, and offset 1 pairs a lane's own two elements.
+static __device__ __forceinline__ void hc_q8_1_pair(block_q8_1 * q8, const int64_t kk, const float v0, const float v1) {
+    float m = fmaxf(fabsf(v0), fabsf(v1));
+    float s0 = v0, s1 = v1;
+#pragma unroll
+    for (int off = 8; off > 0; off >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off, 32));
+        s0 += __shfl_xor_sync(0xffffffff, s0, off, 32);
+        s1 += __shfl_xor_sync(0xffffffff, s1, off, 32);
+    }
+    const float sum = s0 + s1;
+    const float d = m / 127.0f;
+    block_q8_1 * b = q8 + kk / QK8_1;
+    const int pos = (int) (kk % QK8_1);
+    b->qs[pos]     = m == 0.0f ? 0 : (int8_t) roundf(v0 / d);
+    b->qs[pos + 1] = m == 0.0f ? 0 : (int8_t) roundf(v1 / d);
+    if (pos == 0) b->ds = make_half2(d, sum);
+}
+
+// two elements per thread per iteration, packed 32-bit accesses. q81: xn's q8_1 rows too ([hc * n_embd, T], the HC
+// down projection's MMVQ input; hc * n_embd a multiple of MATRIX_ROW_PADDING, so no padding blocks).
 static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b256(
         const float * inject, const float * residual,
         const float * block_out, const float * gamma,
         float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32,
-        const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps, int8_t * q8) {
+        const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps, int8_t * q8,
+        block_q8_1 * q81) {
     __shared__ float s_sum[32];
     const int c = blockIdx.x, t = blockIdx.y, hc = gridDim.x, tid = threadIdx.x;
     const float x1 = s1 * inject[(int64_t) t * hc + c] + b1;
@@ -73,6 +96,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
             if (store_xn_f32) *(float2 *)(xn + col) = make_float2(v0, v1);
             if (xh) *(uint32_t *)(xh + col) = q4x_pack2(v0, v1);
             if (q8) hc_q8_pair(q8, gridDim.x * n_embd / 32, t, c * n_embd + col, v0, v1);
+            if (q81) hc_q8_1_pair(q81, (int64_t) t * gridDim.x * n_embd + (int64_t) c * n_embd + col, v0, v1);
         } else if (col < n_embd) {
             const float v0 = scale * xs[2 * k] * g[col];
             if (store_xn_f32) xn[col] = v0;
@@ -219,6 +243,7 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
 
     // xs[] holds one row of HC_CN_MAX_EMB columns per block.
     GGML_ASSERT(n_embd <= HC_CN_MAX_EMB && a.out_res->ne[3] == 1);
+    GGML_ASSERT(!a.out_q8_1 || (a.store_xn_f32 && n_embd % 64 == 0 && (n_embd * hc) % MATRIX_ROW_PADDING == 0));
     GGML_ASSERT(ggml_nelements(a.out_res) == ggml_nelements(a.out_xn) && ggml_are_same_shape(a.out_res, a.residual));
     GGML_ASSERT(ggml_nelements(a.block_out) == n_embd * n_tokens && ggml_nelements(a.gamma) == n_embd * hc &&
                 ggml_nelements(a.inject) == hc * n_tokens);
@@ -227,6 +252,6 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
         (const float *) a.inject->data, (const float *) a.residual->data,
         (const float *) a.block_out->data, (const float *) a.gamma->data,
         (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,
-        (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps, a.out_q8);
+        (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps, a.out_q8, (block_q8_1 *) a.out_q8_1);
     CUDA_CHECK(cudaGetLastError());
 }
