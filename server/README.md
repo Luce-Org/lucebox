@@ -540,11 +540,14 @@ Requests the unified view does not take are handed back to the chat view
 described above, which serves them as on its own: a request without a
 messages array, a remote drafter, a turn structure or generation prompt it
 cannot read, and a conversation it would start (no stored view continues it)
-whose uncached history before the newest turn, with newest content that
-cannot be cut into lines or has a line longer than its region's cap (one long
-line of prose could only be dropped whole) or whose first two and last two
-lines, which paging always keeps, alone fill its region's cap (a document on
-one line after its opening tag), reaches `--prefill-threshold`
+whose uncached history before the newest turn, with newest content the view
+could not page, reaches `--prefill-threshold`: content it cannot cut into
+lines, a line longer than its region's cap (one long line of prose could only
+be dropped whole), or a region it cannot lay out or fit in its cap (a document
+on one line after its opening tag, which paging would keep whole with the
+first two lines). Admission checks this before the drafter pass with what it
+can see, and again after it with what paging did; a failed drafter pass and
+pins covering a region do not count, since the chat view could not do better
 (reason `uncached`,
 or `reset_uncached` when a stored view could not continue). A conversation
 handed back, or served raw after a PFlash failure, loses its unified views.

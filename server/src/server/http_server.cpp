@@ -7179,6 +7179,34 @@ std::string HttpServer::apply_unified_view(
         return longest;
     };
 
+    // A conversation the view would start hands the request to the chat view (its cache admission compresses such a
+    // prompt) when what the view cannot page is a threshold's worth: the uncached, unpinned history before the
+    // newest turn, and newest content it could not page -- no lines, a line over its cap, a region it could not lay
+    // out or fit in its cap. Checked before the drafter pass with what admission knows, and after it with what
+    // paging did. Not counted: content the view serves verbatim by design (unlisted tool outputs, small messages),
+    // and content the chat view cannot do better on (a failed drafter pass, pins covering the region).
+    const int uncached_from = (std::min)(turn.generation_begin, (int) std::floor(
+        (double) restorable * (double) input / (double) (std::max)(1, prompt_tokens)));
+    const auto unpinned = [&] (int begin, int end) {
+        begin = (std::max)(begin, uncached_from);
+        return end > begin ? (end - begin) - http_detail::pflash_span_tokens_within(pins, begin, end) : 0;
+    };
+    int newest_begin = turn.generation_begin;
+    for (const auto & c : newest) {
+        if (c.located) newest_begin = (std::min)(newest_begin, c.db);
+    }
+    const auto unpaged_reaches_threshold = [&] (const json & admission) {
+        int unpaged = unpinned(0, newest_begin);
+        for (size_t k = 0; k < newest.size(); ++k) {
+            const std::string decision = admission[k].value("decision", "");
+            if (decision == "no_lines" || decision == "long_line" || decision == "layout" ||
+                decision == "unmapped_cut" || decision == "cap_below_overhead" || decision == "nothing_dropped") {
+                unpaged += unpinned(newest[k].db, newest[k].de);
+            }
+        }
+        return target_estimate(unpaged) >= config_.pflash_threshold;
+    };
+
     for (int pass = 0; pass < 2; ++pass) {
         const bool continues = has_view && pass == 0;
         const int new_from = continues ? view.drafter_gen_begin : 0;
@@ -7231,43 +7259,9 @@ std::string HttpServer::apply_unified_view(
             }
         }
 
-        // A conversation the view would start: when the part it can never page -- the uncached, unpinned history
-        // before the newest turn, newest content it cannot cut into lines that fit, and a message whose always-kept
-        // first two and last two lines alone fill its region's cap -- is a threshold's worth, the chat view takes the
-        // request (its cache admission compresses such a prompt) instead of a raw prefill of it. Newest content the
-        // view serves verbatim by design (unlisted tool outputs, small messages) does not count.
-        if (!continues) {
-            const int uncached_from = (std::min)(turn.generation_begin, (int) std::floor(
-                (double) restorable * (double) input / (double) (std::max)(1, prompt_tokens)));
-            const auto unpinned = [&] (int begin, int end) {
-                begin = (std::max)(begin, uncached_from);
-                return end > begin ? (end - begin) - http_detail::pflash_span_tokens_within(pins, begin, end) : 0;
-            };
-            int newest_begin = turn.generation_begin;
-            for (const auto & c : newest) {
-                if (c.located) newest_begin = (std::min)(newest_begin, c.db);
-            }
-            int cannot_page = unpinned(0, newest_begin);
-            for (size_t k = 0; k < newest.size(); ++k) {
-                const std::string decision = admission[k].value("decision", "");
-                Candidate & c = newest[k];
-                if (decision == "no_lines" || decision == "long_line") {
-                    cannot_page += unpinned(c.db, c.de);
-                } else if (decision == "region") {
-                    // Paging keeps the first two and last two lines. When they alone fill the region's cap, it
-                    // could keep nothing else and would serve the message whole, so the message counts whole.
-                    const pu::Lines & lines = candidate_lines(c);
-                    const int kept = unpinned(c.db, token_from(dd, lines.starts[2])) +
-                                     unpinned(token_from(dd, lines.starts[lines.count() - 2]), c.de);
-                    if (target_estimate(kept) >= base_cap(admission[k].value("droppable", 0))) {
-                        cannot_page += unpinned(c.db, c.de);
-                    }
-                }
-            }
-            if (target_estimate(cannot_page) >= config_.pflash_threshold) {
-                // Once the chat view accepts it, the view this turn would have continued goes, with its lineage.
-                return hand_back(found_view ? "reset_uncached" : "uncached");
-            }
+        // Once the chat view accepts it, the view this turn would have continued goes, with its lineage.
+        if (!continues && unpaged_reaches_threshold(admission)) {
+            return hand_back(found_view ? "reset_uncached" : "uncached");
         }
 
         // Recall trigger: a new user question on a view with regions.
@@ -7491,7 +7485,6 @@ std::string HttpServer::apply_unified_view(
                     std::fprintf(stderr, "[pflash-unified] message %zu: a %d-token line is over its region's cap %d\n",
                                  c.message, longest, cap);
                     std::fflush(stderr);
-                    if (!continues) return hand_back(found_view ? "reset_uncached" : "uncached");
                     verbatim_because("long_line");
                     continue;
                 }
@@ -7588,6 +7581,9 @@ std::string HttpServer::apply_unified_view(
             count(c.kind == pu::RegionKind::ToolOutput ? "region.tool_output" : "region.user_content");
             new_regions.push_back(std::move(region));
             splices.push_back(std::move(splice));
+        }
+        if (!continues && unpaged_reaches_threshold(admission)) {
+            return hand_back(found_view ? "reset_uncached" : "uncached");
         }
 
         // Re-reads: a newest message served verbatim (rejected above, or fallen back while paging) that repeats lines of

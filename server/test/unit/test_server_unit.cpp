@@ -21552,7 +21552,7 @@ TEST_CASE(ServerUnitFixture, test_unified_long_line_under_the_message_cap_but_ov
 TEST_CASE(ServerUnitFixture, test_unified_long_line_in_the_kept_head_goes_to_the_chat_view) {
     // A document wrapped in tags is five lines: the tag, the passage on one line, the closing tag, a blank line
     // and the question. Paging always keeps the first two and last two lines, so the passage could never be
-    // paged and the region would have nothing to drop; the chat view takes it before the drafter scores.
+    // paged and the region cannot fit its kept lines in its cap; the chat view takes it after the drafter pass.
     std::string filler;
     for (int i = 0; i < 300; ++i) filler += "The grass is green. ";
     const std::string doc = "<document>\n" + filler + "The kiwi number is 7. " + filler + "\n</document>\n\n";
@@ -21570,6 +21570,7 @@ TEST_CASE(ServerUnitFixture, test_unified_long_line_in_the_kept_head_goes_to_the
     TEST_ASSERT(run.unified["counts"].value("handback.uncached", 0) == 1);
     TEST_ASSERT(run.unified["counts"].value("adopt.uncached", 0) == 1);
     TEST_ASSERT(run.unified["counts"].value("raw.no_region_paged", 0) == 0);
+    TEST_ASSERT_MSG(run.unified["counts"].value("verbatim.cap_below_overhead", 0) == 1, run.unified.dump());
 
     // The follow-up continues the adopted prompt.
     json turn2 = turn;
@@ -21580,6 +21581,28 @@ TEST_CASE(ServerUnitFixture, test_unified_long_line_in_the_kept_head_goes_to_the
     const auto & p2 = two.prepared[1];
     TEST_ASSERT_MSG(p2.unified_handback.empty() && p2.unified_view, p2.pflash_stats.dump());
     TEST_ASSERT(p2.pflash_stats["unified"].value("continued", false));
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_unpaged_message_beside_a_paged_one_goes_to_the_chat_view) {
+    // The newest turn sends two documents: one the view pages, one it cannot (its passage sits in the kept head).
+    // Serving the second raw would prefill a threshold's worth, so the chat view takes the whole request.
+    std::string filler;
+    for (int i = 0; i < 300; ++i) filler += "The grass is green. ";
+    const std::string one_line = "<document>\n" + filler + "The mango number is 8. " + filler + "\n</document>\n\n";
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", unified_doc(80, {{9, "kiwi"}}, "A")}},
+        {{"role", "user"}, {"content", one_line}},
+        {{"role", "user"}, {"content", "Which sentence mentions KIWI? And MANGO?"}},
+    });
+    UnifiedOptions options;
+    options.keep_scored_only = true;
+    const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
+                                         65536, options);
+    const auto & p = run.prepared[0];
+    TEST_ASSERT_MSG(p.unified_handback == "uncached" && p.compressed, p.pflash_stats.dump());
+    TEST_ASSERT_MSG(run.served_text[0].find("kiwi") != std::string::npos, run.served_text[0]);
+    TEST_ASSERT_MSG(run.served_text[0].find("mango") != std::string::npos, run.served_text[0]);
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_paste_just_over_the_threshold_with_a_header_is_still_paged) {
