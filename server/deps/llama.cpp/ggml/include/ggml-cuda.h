@@ -89,6 +89,16 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mla_stream_topk_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count(void);
 
+// Calling-thread count of MMQ calls served by an RDNA4 tile twin with
+// `tile_rows` rows (64 or 32, mmq_tile_twins.h);
+// 0 for other values.
+// Lets the twin parity test reject a silent fallback to the parent tile.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_twin_launch_count(int tile_rows);
+
+// Tests only: turn the RDNA4 MMQ tile twins (64-row, 32-row) on or off, to
+// compare them bit for bit with the parent tiles. Both are on by default.
+GGML_BACKEND_API void ggml_backend_cuda_set_mmq_twins_override(bool rows64, bool rows32);
+
 // Calling-thread launch counters for the scalar and grouped-column GDN
 // kernels. Focused qualification tests use these to reject silent fallback.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void);

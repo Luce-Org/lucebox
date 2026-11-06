@@ -136,6 +136,22 @@ struct tile_x_sizes {
 #else
 #define LUCEBOX_RDNA_TILE_DEVICE 0
 #endif
+// MMQ tile twins (mmq_tile_twins.h) define GGML_CUDA_MMQ_TILE_TWIN. mmq.cu
+// dispatches them on RDNA4 only, so their kernels carry no device code for
+// other targets of a multi-arch build. 0 in every other instance.
+#if defined(GGML_CUDA_MMQ_TILE_TWIN) && !defined(RDNA4)
+#define GGML_CUDA_MMQ_TILE_TWIN_NO_DEVICE 1
+#else
+#define GGML_CUDA_MMQ_TILE_TWIN_NO_DEVICE 0
+#endif
+// Row height of the GGML_CUDA_MMQ_SMALL_TILE instances: 64 unless the
+// instance sets 32 (the RDNA4 2-warp twins, mmq_tile_twins.h). The warp count
+// follows as rows / 16, because the WMMA write-back gives every warp 16 rows.
+#ifndef GGML_CUDA_MMQ_SMALL_TILE_ROWS
+#define GGML_CUDA_MMQ_SMALL_TILE_ROWS 64
+#endif
+static_assert(GGML_CUDA_MMQ_SMALL_TILE_ROWS == 64 || GGML_CUDA_MMQ_SMALL_TILE_ROWS == 32,
+              "GGML_CUDA_MMQ_SMALL_TILE_ROWS must be 64 or 32");
 
 static int get_mmq_x_max_host(const int cc) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
@@ -197,9 +213,9 @@ static int get_mmq_y_host(const int cc) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
 #if defined(GGML_CUDA_MMQ_SMALL_TILE)
 #if defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY)
-        return GGML_CUDA_CC_IS_RDNA4(cc) ? 64 : 128;
+        return GGML_CUDA_CC_IS_RDNA4(cc) ? GGML_CUDA_MMQ_SMALL_TILE_ROWS : 128;
 #else
-        return 64;
+        return GGML_CUDA_MMQ_SMALL_TILE_ROWS;
 #endif
 #elif defined(LUCEBOX_RDNA_MMQ_Y)
         return LUCEBOX_RDNA_MMQ_Y;
@@ -222,7 +238,7 @@ static constexpr __device__ int get_iter_k([[maybe_unused]] const ggml_type type
 static constexpr __device__ int get_mmq_y_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
 #if defined(GGML_CUDA_MMQ_SMALL_TILE) && (defined(RDNA4) || !defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY))
-    return 64;
+    return GGML_CUDA_MMQ_SMALL_TILE_ROWS;
 #elif defined(LUCEBOX_RDNA_MMQ_Y)
     return LUCEBOX_RDNA_MMQ_Y;
 #else
@@ -390,9 +406,9 @@ static int mmq_get_nwarps_host(const int cc, const int warp_size) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
 #if defined(GGML_CUDA_MMQ_SMALL_TILE)
 #if defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY)
-        return GGML_CUDA_CC_IS_RDNA4(cc) ? 4 : 8;
+        return GGML_CUDA_CC_IS_RDNA4(cc) ? GGML_CUDA_MMQ_SMALL_TILE_ROWS / 16 : 8;
 #else
-        return 4;
+        return GGML_CUDA_MMQ_SMALL_TILE_ROWS / 16;
 #endif
 #elif defined(LUCEBOX_RDNA_MMQ_Y)
         return 4;
@@ -411,7 +427,7 @@ static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
 static constexpr __device__ int mmq_get_nwarps_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
 #if defined(GGML_CUDA_MMQ_SMALL_TILE) && (defined(RDNA4) || !defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY))
-    return 4;
+    return GGML_CUDA_MMQ_SMALL_TILE_ROWS / 16;
 #elif defined(LUCEBOX_RDNA_MMQ_Y)
     return 4;
 #else
@@ -4520,7 +4536,8 @@ static __global__ void mul_mat_q(
         const uint3 ntx) {
 
     // Skip unused template specializations for faster compilation:
-    if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
+    if (GGML_CUDA_MMQ_TILE_TWIN_NO_DEVICE ||
+        mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
         NO_DEVICE_CODE;
         return;
     }
@@ -5153,6 +5170,14 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         return;
     }
 
+#if defined(GGML_CUDA_MMQ_TILE_TWIN)
+    // MMQ tile twins run on RDNA4 only, where use_stream_k is false, and
+    // mul_mat_q_case_x16 refuses a stream-k call. Leaving the stream-k launch
+    // out keeps mul_mat_q_stream_k_fixup from being instantiated, so a twin
+    // carries only its two mul_mat_q kernels.
+    (void) nsm;
+    GGML_ABORT("MMQ tile twin reached the stream-k launch");
+#else
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
     // On the validated SM86 path, also avoid launching more CTAs than useful MMQ iteration chunks.
@@ -5217,6 +5242,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
              ntx_fd);
     }
+#endif // defined(GGML_CUDA_MMQ_TILE_TWIN)
 }
 
 template <ggml_type type>
@@ -5230,15 +5256,6 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int mmq_x_max = get_mmq_x_max_host(cc);
     const int mmq_y = get_mmq_y_host(cc);
 
-    static const int forced_mmq_x = []() {
-        const char * raw = std::getenv("GGML_CUDA_MMQ_X");
-        if (!raw || !*raw) return 0;
-        char * end = nullptr;
-        const long parsed = std::strtol(raw, &end, 10);
-        return end && end != raw && *end == '\0' && parsed >= 8 &&
-                parsed <= 128 && parsed % 8 == 0
-            ? (int)parsed : 0;
-    }();
     // Unset: only the qualified MIX formats adapt. =1: every measured
     // format adapts. =0: none do.
     static const int adaptive_moe_x_mode = []() {
@@ -5246,7 +5263,7 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
         if (!raw || !*raw) return -1;
         return (raw[0] == '0' && raw[1] == '\0') ? 0 : 1;
     }();
-    int requested_mmq_x = forced_mmq_x;
+    int requested_mmq_x = 0;  // 0: automatic selection
     if (requested_mmq_x == 0 && adaptive_moe_x_mode != 0 &&
         cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
         args.expert_bounds != nullptr && args.nchannels_x > 0) {
@@ -5347,6 +5364,32 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
             GGML_ABORT("fatal error");
             break;
     }
+}
+
+// Entry of an RDNA4 tile twin (mmq_tile_twins.h). mmq.cu calls it only for 16 or
+// fewer columns, where every instance picks mmq_x = 16 (wave32 WMMA tiles
+// below 128 columns come in multiples of 16), so the twin compiles that one
+// x-tile and launches it through the same launch_mul_mat_q as the parent; only
+// this translation unit's tile macros (mmq_y, nwarps) differ. Returns false,
+// launching nothing, when the call is wider, asks for stream-k (never on
+// RDNA4; a twin compiles only the tiled launch) or a 16-column tile does not
+// fit.
+template <ggml_type type>
+static bool mul_mat_q_case_x16(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    constexpr int mmq_x = 16;
+    const int    id        = ggml_cuda_get_device();
+    const int    cc        = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo     = ggml_cuda_info().devices[id].smpbo;
+    const int    warp_size = ggml_cuda_info().devices[id].warp_size;
+    const int    nwarps    = mmq_get_nwarps_host(cc, warp_size);
+    const int    mmq_y     = get_mmq_y_host(cc);
+    if (args.ncols_max > mmq_x || args.use_stream_k || mmq_x > get_mmq_x_max_host(cc) ||
+        mmq_x % mmq_get_granularity_host(mmq_x, cc) != 0 ||
+        mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) {
+        return false;
+    }
+    launch_mul_mat_q<type, mmq_x>(ctx, args, stream);
+    return true;
 }
 
 #define DECL_MMQ_CASE(type)                                                        \
