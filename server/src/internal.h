@@ -912,6 +912,21 @@ void reset_recurrent_state(TargetCache & c);
 // prompt's chunked prefill advances its state in this slab directly.
 void reset_recurrent_slot(TargetCache & c, int slot);
 
+// One slot's SSM + conv slabs copied to host: a ladder rung (C1.3-04). The slab
+// is the same bytes reset_recurrent_slot zeroes; restore validates every layer
+// size before it writes anything.
+struct SlotStateSnapshot {
+    std::vector<std::vector<uint8_t>> ssm, conv;   // one entry per delta layer
+    size_t bytes() const {
+        size_t n = 0;
+        for (const auto & v : ssm) n += v.size();
+        for (const auto & v : conv) n += v.size();
+        return n;
+    }
+};
+bool snapshot_slot_state(const TargetCache & c, int slot, SlotStateSnapshot & out);
+bool restore_slot_state(TargetCache & c, int slot, const SlotStateSnapshot & snap);
+
 // Reallocate a prefill-only cache with full rollback tensors, copying all live
 // state (KV, SSM, conv, target_feat) device-to-device. Frees the old cache.
 // enable_specla is the caller's effective SpecLA decision (config-driven);
@@ -1086,6 +1101,8 @@ struct QwenGraphInputs {
     bool q_capture = false;
     // Also copy the last min(n_tokens, 64) tokens' Q into cache.q_cap_all (recall / UQ prefill only).
     bool q_capture_all = false;
+    // Packed batches: the capture window ends at this token (exclusive); 0 = n_tokens.
+    int  q_capture_end = 0;
     // Stage every row's query into cache.q_stage (spec verify under KVFlash).
     bool q_stage = false;
 

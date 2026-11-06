@@ -263,3 +263,26 @@ TEST_CASE(KvflashSlotKvFixture, release_and_acquire_clear_a_score_hook_left_by_a
     REQUIRE(w.kv->acquire_reserved(2, 256, a) == PagedKvStatus::Ok);
     CHECK(!w.s[(size_t)a.slot]->score_hook);
 }
+
+TEST_CASE(KvflashSlotKvFixture, rewind_prefill_drops_the_rows_past_the_point_in_the_allocator_and_the_pager) {
+    World w;
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    w.kv->set_next_total_tokens(700);
+    const auto r = mgr.admit(1, std::vector<int32_t>(640, 1), SamplerCfg{});
+    REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
+    REQUIRE(mgr.append_prefill(r.slot, 512).ok);
+    CHECK(mgr.slot(r.slot).cur_pos == 512);
+    CHECK(w.s[(size_t)r.slot]->n_chunks() == 8);
+    CHECK(!mgr.rewind_prefill(r.slot, 600));                       // past cur_pos
+    CHECK(mgr.rewind_prefill(r.slot, 512));                        // no-op
+    CHECK(mgr.rewind_prefill(r.slot, 300));
+    CHECK(mgr.slot(r.slot).cur_pos == 300);
+    CHECK(w.s[(size_t)r.slot]->n_chunks() == 5);                   // ceil(300/64): the chunk holding 300 keeps rows < 300
+    const auto again = mgr.append_prefill(r.slot, 340);            // the replay reaches the end
+    REQUIRE(again.ok);
+    CHECK(again.rows.size() == 340u);
+    CHECK(mgr.slot(r.slot).cur_pos == 640);
+    CHECK(w.s[(size_t)r.slot]->n_chunks() == 10);
+    mgr.commit_prefill(r.slot);
+    CHECK(!mgr.rewind_prefill(r.slot, 100));                       // decoding: not a prefill any more
+}
