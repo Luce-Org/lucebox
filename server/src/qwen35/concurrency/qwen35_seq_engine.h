@@ -26,6 +26,7 @@
 #include "common/concurrency/kvflash_slot_kv.h"
 #include "common/concurrency/paged_kv_offload.h"
 #include "common/kvflash_engine_step.h"
+#include "common/kvflash_slot_turn.h"
 #include "common/kvflash_step_driver.h"
 #include "common/dflash_draft_kv.h"
 #include "common/dflash_feature_ring.h"
@@ -268,6 +269,25 @@ private:
     void init_slots_();
     bool upload_kvflash_column(int slot, int kv_len);
     bool settle_kvflash_();
+    // C1.4: per-slot mode 4. The turn plan, the scores the pager's hook reads
+    // (stable: recall_ is sized once), the state at R and the step bookkeeping.
+    struct SlotRecall {
+        KvFlashSlotTurn turn;
+        std::vector<float> scores;
+        std::vector<float> q_tail;   // the first pass's last select_queries prompt queries across its cuts, oldest first (the serial engine's kvflash_q_tail_)
+        double score_ms = 0.0;       // mode 5: the drafter's time for `scores`
+        SlotStateSnapshot snap;
+        bool snap_ok = false;
+    };
+    std::vector<SlotRecall> recall_;
+    bool recall_on_ = false;                          // the recall profile is on for the slot engine
+    std::vector<int> pending_rewind_;                 // slots whose first pass ended this step
+    int capture_rows_ = 0;                            // query rows the graph captured this step
+    void plan_slot_turn_(int slot, const std::vector<int32_t> & prompt, int kv_offset);
+    // Mode 5: the drafter's picks of the slot's turn, applied when its prefill reaches R (no first pass, no rewind).
+    void apply_recall5_(int slot);
+    // The first pass of a slot ended this step: score, restore the R state, rewind, apply the picks; the replay follows.
+    bool rewind_slot_turn_(int slot);
     std::vector<int32_t> column_buf_;
     int64_t         scratch_row_ = 0;
     FixedChainConfig fixed_chain_;

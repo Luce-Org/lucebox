@@ -610,6 +610,42 @@ void reset_recurrent_slot(TargetCache & c, int slot) {
     for (ggml_tensor * t : c.conv_state) clear_slot(t);
 }
 
+bool snapshot_slot_state(const TargetCache & c, int slot, SlotStateSnapshot & out) {
+    if (slot < 0 || slot >= c.n_seq_slots) return false;
+    auto grab = [&](const std::vector<ggml_tensor *> & src, std::vector<std::vector<uint8_t>> & dst) {
+        dst.assign(src.size(), {});
+        for (size_t i = 0; i < src.size(); ++i) {
+            if (!src[i]) continue;
+            const size_t bytes = ggml_nbytes(src[i]) / (size_t)c.n_seq_slots;
+            dst[i].resize(bytes);
+            ggml_backend_tensor_get(src[i], dst[i].data(), (size_t)slot * bytes, bytes);
+        }
+    };
+    grab(c.ssm_state, out.ssm);
+    grab(c.conv_state, out.conv);
+    return true;
+}
+
+bool restore_slot_state(TargetCache & c, int slot, const SlotStateSnapshot & snap) {
+    if (slot < 0 || slot >= c.n_seq_slots) return false;
+    auto fits = [&](const std::vector<ggml_tensor *> & dst, const std::vector<std::vector<uint8_t>> & src) {
+        if (dst.size() != src.size()) return false;
+        for (size_t i = 0; i < dst.size(); ++i) {
+            const size_t bytes = dst[i] ? ggml_nbytes(dst[i]) / (size_t)c.n_seq_slots : 0;
+            if (src[i].size() != bytes) return false;
+        }
+        return true;
+    };
+    if (!fits(c.ssm_state, snap.ssm) || !fits(c.conv_state, snap.conv)) return false;
+    auto put = [&](const std::vector<ggml_tensor *> & dst, const std::vector<std::vector<uint8_t>> & src) {
+        for (size_t i = 0; i < dst.size(); ++i)
+            if (dst[i]) ggml_backend_tensor_set(dst[i], src[i].data(), (size_t)slot * src[i].size(), src[i].size());
+    };
+    put(c.ssm_state, snap.ssm);
+    put(c.conv_state, snap.conv);
+    return true;
+}
+
 // Attach rollback tensors to an existing prefill cache without touching the
 // base tensors (KV, SSM, conv, target_feat) that prefill already populated.
 // No D2D copies — the base tensors stay right where the graph wrote them.
@@ -2621,13 +2657,14 @@ QwenGraphOutputs build_qwen35_graph(
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, qp, qd));
             }
             if (want_q_cap && q_fa) {
+                const int qe = in.q_capture_end > 0 ? std::min(in.q_capture_end, n_tokens) : n_tokens;
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of
                 // [head_dim, n_tokens, n_head]; dst = q_cap plane fa_idx
                 // ([head_dim, n_head] viewed as [head_dim, 1, n_head]).
                 ggml_tensor * src = ggml_view_3d(ctx, q_fa,
                     q_fa->ne[0], 1, q_fa->ne[2],
                     q_fa->nb[1], q_fa->nb[2],
-                    (size_t)(n_tokens - 1) * q_fa->nb[1]);
+                    (size_t)(qe - 1) * q_fa->nb[1]);
                 src = ggml_cont(ctx, src);   // strided head axis -> packed
                 ggml_tensor * dst = ggml_view_3d(ctx, cache.q_cap,
                     cache.q_cap->ne[0], 1, cache.q_cap->ne[1],
@@ -2637,10 +2674,10 @@ QwenGraphOutputs build_qwen35_graph(
                 if (cache.q_cap_all) {
                     // The last T tokens' Q (T = min(n_tokens, capacity)),
                     // [head_dim, T, n_head] into plane fa_idx of q_cap_all.
-                    const int T = std::min<int>(n_tokens, cache.q_cap_all_tokens);
+                    const int T = std::min<int>(qe, cache.q_cap_all_tokens);
                     ggml_tensor * qs = ggml_cont(ctx, ggml_view_3d(ctx, q_fa,
                         q_fa->ne[0], T, q_fa->ne[2], q_fa->nb[1], q_fa->nb[2],
-                        (size_t)(n_tokens - T) * q_fa->nb[1]));
+                        (size_t)(qe - T) * q_fa->nb[1]));
                     ggml_tensor * qd = ggml_view_3d(ctx, cache.q_cap_all,
                         cache.q_cap_all->ne[0], T, cache.q_cap_all->ne[2],
                         cache.q_cap_all->nb[1], cache.q_cap_all->nb[2],

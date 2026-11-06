@@ -400,6 +400,76 @@ TEST_CASE(RecurrentSnapshotFixture, copied_paged_prefix_uses_fresh_pages) {
     ggml_backend_free(backend);
 }
 
+// ---- per-slot slab capture/restore (ladder rungs, C1.3-04) ----
+
+namespace {
+struct SlabCache {
+    ggml_backend_t backend = nullptr;
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    TargetCache cache;
+    ggml_tensor * ssm = nullptr;
+    ggml_tensor * conv = nullptr;
+    // 3 slots; per slot the ssm slab is 4 floats and the conv slab 6.
+    explicit SlabCache(int slots = 3) {
+        backend = ggml_backend_cpu_init();
+        ggml_init_params p{}; p.mem_size = 8 * ggml_tensor_overhead(); p.no_alloc = true;
+        ctx = ggml_init(p);
+        ssm  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, slots);
+        conv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, 2, slots);
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        cache.n_seq_slots = slots;
+        cache.ssm_state = {ssm};
+        cache.conv_state = {conv};
+    }
+    ~SlabCache() { if (buf) ggml_backend_buffer_free(buf); if (ctx) ggml_free(ctx); if (backend) ggml_backend_free(backend); }
+    void fill(float base) {
+        std::vector<float> a((size_t)ggml_nelements(ssm)), c((size_t)ggml_nelements(conv));
+        for (size_t i = 0; i < a.size(); ++i) a[i] = base + (float)i;
+        for (size_t i = 0; i < c.size(); ++i) c[i] = -base - (float)i;
+        set_tensor(ssm, a); set_tensor(conv, c);
+    }
+};
+}
+
+TEST_CASE(RecurrentSnapshotFixture, slot_state_roundtrip_restores_one_slab_and_leaves_the_others) {
+    SlabCache s;
+    if (!s.buf) SKIP("could not allocate CPU backend tensors");
+    s.fill(100);
+    const auto ssm0 = get_tensor(s.ssm), conv0 = get_tensor(s.conv);
+    luce::common::SlotStateSnapshot snap;
+    CHECK(luce::common::snapshot_slot_state(s.cache, 1, snap));
+    CHECK(snap.bytes() == (4 + 6) * sizeof(float));
+    s.fill(500);
+    const auto ssm_m = get_tensor(s.ssm), conv_m = get_tensor(s.conv);
+    CHECK(luce::common::restore_slot_state(s.cache, 1, snap));
+    const auto ssm1 = get_tensor(s.ssm), conv1 = get_tensor(s.conv);
+    for (size_t i = 0; i < ssm1.size(); ++i) CHECK(ssm1[i] == (i / 4 == 1 ? ssm0[i] : ssm_m[i]));
+    for (size_t i = 0; i < conv1.size(); ++i) CHECK(conv1[i] == (i / 6 == 1 ? conv0[i] : conv_m[i]));
+    // a rung can be restored into another slot (same slab layout)
+    CHECK(luce::common::restore_slot_state(s.cache, 2, snap));
+    const auto ssm2 = get_tensor(s.ssm);
+    for (size_t i = 8; i < 12; ++i) CHECK(ssm2[i] == ssm0[i - 4]);
+}
+
+TEST_CASE(RecurrentSnapshotFixture, slot_state_refuses_bad_slots_and_mismatched_layouts) {
+    SlabCache s;
+    if (!s.buf) SKIP("could not allocate CPU backend tensors");
+    luce::common::SlotStateSnapshot snap;
+    CHECK(!luce::common::snapshot_slot_state(s.cache, -1, snap));
+    CHECK(!luce::common::snapshot_slot_state(s.cache, 3, snap));
+    CHECK(luce::common::snapshot_slot_state(s.cache, 0, snap));
+    CHECK(!luce::common::restore_slot_state(s.cache, 3, snap));
+    luce::common::SlotStateSnapshot wrong = snap;
+    wrong.conv[0].pop_back();
+    s.fill(7);
+    const auto before = get_tensor(s.ssm);
+    CHECK(!luce::common::restore_slot_state(s.cache, 0, wrong));
+    CHECK(get_tensor(s.ssm) == before);            // validated before any write
+    wrong = snap; wrong.ssm.clear();
+    CHECK(!luce::common::restore_slot_state(s.cache, 0, wrong));
+}
+
 // A checkpoint that a deeper one extends keeps its recurrent state only and
 // restores with the deeper one's attention rows.
 TEST_CASE(RecurrentSnapshotFixture, state_only_paged_checkpoint_restores_with_deeper_rows) {

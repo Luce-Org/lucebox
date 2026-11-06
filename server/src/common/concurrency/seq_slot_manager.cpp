@@ -265,6 +265,22 @@ void SeqSlotManager::commit_prefill(int slot) {
     s.phase = SeqSlotPhase::decode;
 }
 
+bool SeqSlotManager::rewind_prefill(int slot, int pos) {
+    if (!is_prefilling(slot)) return false;
+    SeqSlot & s = slots_[(size_t)slot];
+    if (pos < 0 || pos > s.cur_pos || !s.staged_tokens.empty()) return false;
+    if (pos == s.cur_pos) return true;
+    const PagedKvStatus status = kv_.rollback_append(
+        s.handle, static_cast<uint32_t>(s.cur_pos - pos));
+    if (status != PagedKvStatus::Ok) {
+        std::fprintf(stderr, "[parallel] slot %d prefill rewind to %d failed: %s\n",
+                     slot, pos, paged_kv_status_string(status));
+        return false;
+    }
+    s.cur_pos = pos;
+    return true;
+}
+
 SeqSlotManager::StepAppend SeqSlotManager::append_tokens(
         int slot, const int32_t * fed_tokens, int n_tokens) {
     StepAppend out;

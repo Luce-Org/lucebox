@@ -131,6 +131,10 @@ public:
     PrefillChunk seed_restored_prefix(int slot, int restored_tokens);
 
     void commit_prefill(int slot);
+    // KVFlash mode 4: drop the rows of [pos, cur_pos) and continue the prefill
+    // from pos (the pager truncates). False when the slot is not prefilling or
+    // pos is past cur_pos; true and a no-op at pos == cur_pos.
+    bool rewind_prefill(int slot, int pos);
 
     struct StepAppend {
         bool ok = false;

@@ -1530,12 +1530,6 @@ static void apply_launch_profile_env(const luce::server::LaunchProfile & profile
                        paged_deepseek41 ? &luce::common::deepseek41_paged_unqualified_env : nullptr);
 }
 
-// An environment knob the operator set to something other than off.
-static bool env_set_on(const char * name) {
-    const char * v = std::getenv(name);
-    return v && *v && std::strcmp(v, "0") != 0;
-}
-
 static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_model) {
     // Cluster mode's defaults go in before a profile's, so they win over it.
     if (model.bargs.cluster.enabled()) {
@@ -1550,29 +1544,35 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
     // The shipped KVFlash recall settings come first, so an explicit
     // --kvflash-policy below still replaces the policy default.
-    // Paged attention with KVFlash is the concurrent engine: LRU only (C1.3), so
-    // the serial recall defaults stay out and an explicit recall setting is refused.
+    // Paged attention with KVFlash is the concurrent engine: per-slot recall on qwen35 (C1.4, the defaults
+    // installed here unless the operator set the full recall env or asked for LRU), LRU otherwise; uq,
+    // preamble pins and tau are refused.
     const char * env_pool = std::getenv("LUCE_KVFLASH");
     const bool concurrent_kvflash = model.bargs.paged_attention &&
         (!model.kvflash_pool.empty() || luce::common::kvflash_pool_requested(env_pool));
     if (concurrent_kvflash) {
-        luce::common::KvFlashProfileRequest rq;
-        const char * env_policy = std::getenv("LUCE_KVFLASH_POLICY");
-        rq.explicit_qk_policy = model.kvflash_policy.empty()
-            ? (env_policy && std::strcmp(env_policy, "qk") == 0)
-            : model.kvflash_policy == "qk";
-        rq.explicit_recall = env_set_on("LUCE_KVFLASH_RECALL_BLOCKS");
-        rq.explicit_uq = env_set_on("LUCE_KVFLASH_UQ_QUERIES");
-        rq.explicit_preamble_pin = env_set_on("LUCE_KVFLASH_PREAMBLE_ROWS");
-        rq.explicit_gpu_score = std::getenv("LUCE_KVFLASH_SCORER_DEVICE") && std::strcmp(std::getenv("LUCE_KVFLASH_SCORER_DEVICE"), "gpu") == 0;
-        rq.explicit_reselect = env_set_on("LUCE_KVFLASH_PREFILL_RESELECT");
+        const luce::common::KvFlashLookup env_lookup = [](const char * k) { return std::getenv(k); };
+        const std::string arch = inspect_gguf_model_info(model.bargs.model_path.c_str()).arch;
+        const luce::common::KvFlashProfileRequest rq = luce::common::kvflash_concurrent_request(
+            arch, model.kvflash_policy, !model.kvflash_tau.empty(), multi_model, env_lookup);
         const luce::common::KvFlashProfile profile = luce::common::kvflash_resolve_concurrent_profile(rq);
         if (!profile.ok) {
             std::fprintf(stderr, "[kvflash] %s\n", profile.error.c_str());
             return 2;
         }
         std::fprintf(stderr, "%s\n", profile.log_line.c_str());
-        set_environment_variable("LUCE_KVFLASH_POLICY", "lru", true);
+        std::vector<luce::server::LaunchProfileEnv> recall_env;
+        for (const auto & kv : profile.env_defaults) recall_env.push_back({kv.first.c_str(), kv.second.c_str()});
+        apply_env_defaults("KVFlash concurrent recall", recall_env);
+        if (!profile.env_defaults.empty()) {
+            const std::string bad = luce::common::kvflash_merged_profile_error(
+                arch, model.kvflash_policy, !model.kvflash_tau.empty(), multi_model, env_lookup);
+            if (!bad.empty()) {
+                std::fprintf(stderr, "[kvflash] concurrent recall defaults conflict with a set value: %s\n", bad.c_str());
+                return 2;
+            }
+        }
+        if (profile.policy == "lru-only") set_environment_variable("LUCE_KVFLASH_POLICY", "lru", true);
     } else if (!model.kvflash_pool.empty()) {
         // Mode 4 unless LUCE_KVFLASH_PREFILL_RESELECT=5 asks for mode 5 and the drafter
         // (flag or env) and its PFlash GGUFs are set.

@@ -127,6 +127,10 @@ struct Qwen35Config {
 
 // ── Backend class ───────────────────────────────────────────────────────
 
+// C1.4: the last n_wanted of the `captured` query rows in cache.q_cap_all (packed batches).
+int kvflash_read_captured_queries_tail(const TargetCache & cache, const KvFlashQkDims & d, int captured, int n_wanted,
+                                       std::vector<float> & q_all);
+
 class Qwen35Backend : public ModelBackend {
 public:
     explicit Qwen35Backend(Qwen35Config cfg);
@@ -358,6 +362,17 @@ protected:
     // Same contract as kvflash_exact_scores with planes (selector v2); false = unavailable, the CPU scorer must run.
     bool kvflash_exact_scores_gpu(int sealed, const std::vector<const float *> & qs,
                                   std::vector<std::vector<float>> & outs, std::vector<KvFlashMassPlanes> & planes);
+    // C1.4: the same scorers over any pager whose block_of() are arena ids against cache_.attn_k
+    // (a slot pager); the single-slot calls above run them on kvflash_pager_.
+    bool kvflash_exact_scores_gpu_on(KvFlashPager & p, int sealed, const std::vector<const float *> & qs,
+                                     std::vector<std::vector<float>> & outs, std::vector<KvFlashMassPlanes> & planes);
+    bool kvflash_exact_scores_on(KvFlashPager & p, int sealed, const std::vector<const float *> & qs,
+                                 std::vector<std::vector<float>> & outs, std::vector<KvFlashMassPlanes> * planes);
+    // C1.4: the per-slot recall profile is on: mode 4 (exact scorer, queries) or mode 5 (pflash2 scorer), with recall blocks.
+    bool kvflash_slot_recall_profile() const {
+        return kvflash_recall_blocks_ > 0 &&
+               ((kvflash_prefill_reselect_ == 4 && kvflash_select_queries_ > 0) || kvflash_prefill_reselect_ == 5);
+    }
     // Mode 5: chunk scores of `ids` (the whole prompt) from the drafter's PFlash 2.0 request path; loads the
     // drafter on first use. False = unavailable (the turn stays LRU).
     bool kvflash_pflash2_scores(const std::vector<int32_t> & ids, int chunk_tokens, std::vector<float> & out, double & ms);
@@ -392,6 +407,11 @@ protected:
     // The pool room kept for the rest of the prefill is derived from `end`.
     void kvflash_prefill_apply(int committed, int end, int q_tok,
                                double score_ms, const char * note);
+    // The same over any pager and score vector (which must outlive the hook installed on p).
+    // reserve_chunks < 0: derived from `end`. slot >= 0 names a slot pager in the log line and
+    // leaves the serial preamble inputs out of the recall budget.
+    void kvflash_prefill_apply_on(KvFlashPager & p, std::vector<float> & scores, int committed, int end,
+                                  int reserve_chunks, int q_tok, double score_ms, const char * note, int slot);
     // Mode 4: q_cap holds q(end-1) from the first pass over [r, end).
     // Score, restore the scratch state at r (zero state when zero_state), truncate
     // the pager to r, reselect. 1 = rewound (re-run [r, end)), 0 = nothing

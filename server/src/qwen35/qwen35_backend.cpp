@@ -3247,6 +3247,26 @@ static int kvflash_read_captured_queries(const TargetCache & cache, const KvFlas
     return n_q;
 }
 
+// C1.4: of the `captured` rows the graph wrote (the last `captured` tokens before
+// q_capture_end), the LAST n_wanted: a slot's own queries in a packed batch.
+int kvflash_read_captured_queries_tail(const TargetCache & cache, const KvFlashQkDims & d,
+                                       int captured, int n_wanted, std::vector<float> & q_all) {
+    if (!cache.q_cap_all) return 0;
+    const int T = cache.q_cap_all_tokens;
+    captured = std::min(captured, T);
+    const int n_q = std::max(0, std::min(n_wanted, captured));
+    const size_t qsize = (size_t)d.n_layers * d.n_q_heads * d.head_dim;
+    std::vector<float> raw((size_t)ggml_nelements(cache.q_cap_all));
+    ggml_backend_tensor_get(cache.q_cap_all, raw.data(), 0, raw.size() * sizeof(float));
+    q_all.resize((size_t)n_q * qsize);
+    const size_t planes = (size_t)d.n_layers * d.n_q_heads;
+    for (int t = 0; t < n_q; t++)
+        for (size_t p = 0; p < planes; p++)
+            std::memcpy(q_all.data() + (size_t)t * qsize + p * d.head_dim,
+                        raw.data() + (p * T + (size_t)(captured - n_q + t)) * d.head_dim, d.head_dim * sizeof(float));
+    return n_q;
+}
+
 void Qwen35Backend::kvflash_upload_mask(int cur_pos) {
     if (!sg_.attn_mask) return;
     kvflash_require_base_zero(kvflash_pager_, "kvflash_upload_mask");
@@ -3482,7 +3502,12 @@ KvFlashQkDims Qwen35Backend::kvflash_exact_dims() const {
 bool Qwen35Backend::kvflash_exact_scores(int sealed, const std::vector<const float *> & qs,
                                          std::vector<std::vector<float>> & outs,
                                          std::vector<luce::common::KvFlashMassPlanes> * planes) {
-    KvFlashPager & p = kvflash_pager_;
+    return kvflash_exact_scores_on(kvflash_pager_, sealed, qs, outs, planes);
+}
+
+bool Qwen35Backend::kvflash_exact_scores_on(KvFlashPager & p, int sealed, const std::vector<const float *> & qs,
+                                            std::vector<std::vector<float>> & outs,
+                                            std::vector<luce::common::KvFlashMassPlanes> * planes) {
     const int ct = p.chunk_tokens();
     p.synchronize_paging();
     const KvFlashQkDims d = kvflash_exact_dims();
@@ -3549,8 +3574,13 @@ bool Qwen35Backend::kvflash_exact_scores(int sealed, const std::vector<const flo
 bool Qwen35Backend::kvflash_exact_scores_gpu(int sealed, const std::vector<const float *> & qs,
                                              std::vector<std::vector<float>> & outs,
                                              std::vector<luce::common::KvFlashMassPlanes> & planes) {
+    return kvflash_exact_scores_gpu_on(kvflash_pager_, sealed, qs, outs, planes);
+}
+
+bool Qwen35Backend::kvflash_exact_scores_gpu_on(KvFlashPager & p, int sealed, const std::vector<const float *> & qs,
+                                                std::vector<std::vector<float>> & outs,
+                                                std::vector<luce::common::KvFlashMassPlanes> & planes) {
     if (kvflash_gpu_failed_) return false;
-    KvFlashPager & p = kvflash_pager_;
     const int ct = p.chunk_tokens();
     p.synchronize_paging();   // queued D2H page-outs and H2D page-ins must land before any host/pool read
     const KvFlashQkDims d = kvflash_exact_dims();
@@ -3677,8 +3707,11 @@ luce::common::KvFlashRecallIn Qwen35Backend::kvflash_recall_in(int committed, in
 // prefill is derived from `end`.
 void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
                                           double score_ms, const char * note) {
-    KvFlashPager & p = kvflash_pager_;
-    std::vector<float> & scores = kvflash_scores_;
+    kvflash_prefill_apply_on(kvflash_pager_, kvflash_scores_, committed, end, -1, q_tok, score_ms, note, -1);
+}
+
+void Qwen35Backend::kvflash_prefill_apply_on(KvFlashPager & p, std::vector<float> & scores, int committed, int end,
+                                             int reserve_chunks, int q_tok, double score_ms, const char * note, int slot) {
     const int ct = p.chunk_tokens();
     int tail = -1;   // the pager's configured tail unless recall derives one
     std::vector<int> picked;
@@ -3687,7 +3720,19 @@ void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
         const int unit = kvflash_select_unit_;
         // The pins sit in the rows LUCE_KVFLASH_PREAMBLE_ROWS reserves in the pool (0 when off): the history budget
         // (tail + recall + reserve) is the pool minus them, and the pinned chunks are not recall candidates.
-        luce::common::KvFlashRecallPlan plan = luce::common::kvflash_recall_plan(scores, kvflash_recall_in(committed, end));
+        luce::common::KvFlashRecallIn in;
+        in.n_pool_blocks = p.n_pool_blocks();
+        in.cur_chunk = p.cur_chunk();
+        in.recall_chunks = luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_;
+        in.unit = unit;
+        in.reserve = reserve_chunks >= 0 ? reserve_chunks : (end - committed + ct - 1) / ct + 1;
+        if (slot < 0) {   // a slot has no preamble reserve of its own
+            in.pin_reserve_chunks = kvflash_preamble_reserve_ / ct;   // the history budget never depends on k
+            in.pinned_chunks = luce::common::kvflash_pin_chunks(kvflash_preamble_end_, kvflash_preamble_rows_, ct);
+        }
+        // the serial turn plans from the input its mode-4 first window was sized with
+        if (slot < 0 && reserve_chunks < 0) in = kvflash_recall_in(committed, end);
+        luce::common::KvFlashRecallPlan plan = luce::common::kvflash_recall_plan(scores, in);
         tail = plan.tail;
         picked = std::move(plan.picked);
         for (int b : picked)
@@ -3708,8 +3753,9 @@ void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
     const int64_t ins = p.stats().page_ins - ins0;
     std::string ids;
     for (int b : picked) ids += (ids.empty() ? "" : ",") + std::to_string(b);
-    std::fprintf(stderr, "[kvflash] prefill reselect mode=%d scorer=%s k=%d tail=%d @%d (q tok %d) "
+    std::fprintf(stderr, "[kvflash]%s prefill reselect mode=%d scorer=%s k=%d tail=%d @%d (q tok %d) "
                  "picked=[%s]: %d page events; %d in (%.1f MiB H2D) (resident %d/%d blocks) scorer %.1f ms%s\n",
+                 slot >= 0 ? (" slot " + std::to_string(slot)).c_str() : "",
                  kvflash_prefill_reselect_, kvflash_prefill_reselect_ == 5 ? "pflash2" : "exact",
                  kvflash_recall_blocks_, tail, committed, q_tok, ids.c_str(), events,
                  (int)ins, (double)ins * (double)p.chunk_bytes() / 1048576.0,
