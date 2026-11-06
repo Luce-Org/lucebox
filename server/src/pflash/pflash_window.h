@@ -60,7 +60,8 @@ std::vector<ModelBackend::CompressResult> pflash_compress_batch(
 
 // The daemon's "compress <ids.bin> <keep_x1000> [<drafter.gguf>] [nopark]"
 // line as a request: backend-local GPU 0, drafter kept loaded, an empty
-// drafter path when the line gives none. False on bad arguments.
+// drafter path when the line gives none. False on bad arguments: a missing
+// field, a keep outside 0..1000, or an ids file that is empty or unreadable.
 bool pflash_parse_compress_line(const std::string & line,
                                 ModelBackend::CompressRequest & request);
 

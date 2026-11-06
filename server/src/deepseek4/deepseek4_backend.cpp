@@ -5819,6 +5819,7 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
     window.unpark = [&] { return was_parked || unpark(ParkTarget::TargetModel); };
     window.release = [this] { release_pflash_drafter(); };
     window.shared_backends = {backend_, spec_backend_, expert_backend_};
+    window.engine_max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 0;
     return pflash_compress_batch(pflash_drafter_ctx_, pflash_drafter_loaded_, requests, window);
 }
 

@@ -187,7 +187,7 @@ bool pflash_parse_compress_line(const std::string & line, CompressRequest & requ
     std::istringstream words(line.size() > 9 ? line.substr(9) : std::string{});
     std::string ids_path;
     int keep_x1000 = 0;
-    if (!(words >> ids_path >> keep_x1000)) return false;
+    if (!(words >> ids_path >> keep_x1000) || keep_x1000 < 0 || keep_x1000 > 1000) return false;
     std::string drafter_path;
     std::getline(words >> std::ws, drafter_path);
     while (!drafter_path.empty() && std::isspace((unsigned char) drafter_path.back())) {
@@ -206,6 +206,7 @@ bool pflash_parse_compress_line(const std::string & line, CompressRequest & requ
     }
     request = CompressRequest{};
     request.input_ids = read_int32_file(ids_path);
+    if (request.input_ids.empty()) return false;
     request.keep_ratio = (float) keep_x1000 / 1000.0f;
     request.drafter_path = std::move(drafter_path);
     request.skip_park = skip_park;

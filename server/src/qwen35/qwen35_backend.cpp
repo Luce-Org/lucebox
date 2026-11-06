@@ -1616,9 +1616,10 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
         return true;
     };
     window.unpark = [&] {
-        if (!was_target_parked) unpark(ParkTarget::TargetModel);
-        if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
-        return true;
+        // Both are tried; a model that did not come back drops the batch.
+        const bool target_ok = was_target_parked || unpark(ParkTarget::TargetModel);
+        const bool draft_ok = was_draft_parked || unpark(ParkTarget::DraftModel);
+        return target_ok && draft_ok;
     };
     window.loaded = [this] {
         // pflash + kvflash synergy: the drafter doubles as the pool's

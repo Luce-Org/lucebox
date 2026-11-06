@@ -13678,7 +13678,12 @@ TEST_CASE(ServerUnitFixture, test_pflash_parse_compress_line) {
     TEST_ASSERT(pflash_parse_compress_line("compress " + ids_path + " 250", request));
     TEST_ASSERT(request.drafter_path.empty() && !request.skip_park);
     TEST_ASSERT(!pflash_parse_compress_line("compress " + ids_path, request));
+    // A keep outside 0..1000 or an ids file that is missing or empty is a bad line.
+    TEST_ASSERT(!pflash_parse_compress_line("compress " + ids_path + " 1001", request));
+    TEST_ASSERT(!pflash_parse_compress_line("compress " + ids_path + " -1", request));
+    TEST_ASSERT(pflash_parse_compress_line("compress " + ids_path + " 1000", request));
     remove_test_path(ids_path);
+    TEST_ASSERT(!pflash_parse_compress_line("compress " + ids_path + " 250", request));
 }
 
 struct MockMemoryOnlySnapshotBackend : MockBackend {

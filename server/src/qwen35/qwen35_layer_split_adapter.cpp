@@ -1368,33 +1368,22 @@ const char * Qwen35LayerSplitAdapter::default_compress_drafter_path() const {
 
 ModelBackend::CompressResult
 Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
-    ModelBackend::CompressResult result;
-    if (req.input_ids.empty() || req.drafter_path.empty()) return result;
-
-    for (auto & shard : shards_) ggml_backend_synchronize(shard.backend);
-    if (draft_backend_) ggml_backend_synchronize(draft_backend_);
-
-    if (!pflash_drafter_loaded_) {
-        std::fprintf(stderr, "[target-split][compress] loading drafter from %s ...\n",
-                     req.drafter_path.c_str());
-        if (!load_drafter(req.drafter_path, /*gpu_layers=*/999,
-                          pflash_drafter_)) {
-            std::fprintf(stderr,
-                         "[target-split][compress] drafter init failed: %s\n",
-                         luce_last_error());
-            return result;
-        }
-        pflash_drafter_loaded_ = true;
-        pflash_drafter_.engine_max_ctx = cfg_.device.max_ctx;   // scoring sessions are never sized past it
-        std::fprintf(stderr, "[target-split][compress] drafter ready\n");
-    }
-
-    result = pflash_score(pflash_drafter_, req);
-    if (result.ok) {
-        std::fprintf(stderr, "[target-split][compress] %zu -> %zu tokens\n",
-                     req.input_ids.size(), result.compressed_ids.size());
-    }
-    return result;
+    // The shards stay resident: no park, the drafter loads beside them.
+    PFlashWindow window;
+    window.tag = "target-split][compress";
+    window.drain = [this] {
+        for (auto & shard : shards_) ggml_backend_synchronize(shard.backend);
+        if (draft_backend_) ggml_backend_synchronize(draft_backend_);
+    };
+    window.release = [this] {
+        luce::common::free_drafter(pflash_drafter_);
+        pflash_drafter_loaded_ = false;
+    };
+    for (auto & shard : shards_) window.shared_backends.push_back(shard.backend);
+    if (draft_backend_) window.shared_backends.push_back(draft_backend_);
+    window.engine_max_ctx = cfg_.device.max_ctx;   // scoring sessions are never sized past it
+    auto results = pflash_compress_batch(pflash_drafter_, pflash_drafter_loaded_, {req}, window);
+    return results.empty() ? ModelBackend::CompressResult{} : std::move(results.front());
 }
 
 void Qwen35LayerSplitAdapter::free_drafter() {

@@ -1975,7 +1975,7 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         // PFlash pages with the trained head's per-candidate scores, from a drafter in this process.
         if (!backend_.pflash_gives_candidate_scores()) {
             fail("--pflash on needs a target whose drafter pass returns the trained head's per-candidate scores "
-                 "(a backend that scores through pflash_window.h); this model's does not");
+                 "(Qwen3, Qwen3.5/3.6/3.8, Qwen3.8-Flash and DeepSeek V4/V4.1); this model's does not");
         }
         if (!luce::pflash::has_pflash_selection_environment()) {
             fail("--pflash on needs the trained scoring head and its selection settings (the release profile sets "

@@ -1676,10 +1676,11 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         // Parking would drop and reload the whole model for every prompt.
         sconfig.pflash_skip_park = true;
         std::fprintf(stderr,
-            "[server] PFlash: the drafter scores beside the resident model (--prefill-skip-park), which keeps "
-            "%.2f GiB plus %lld KiB per context token free on gpu %d for it\n",
-            bargs.pflash_reserve_bytes / 1073741824.0, kPFlashScoringBytesPerToken / 1024,
-            bargs.pflash_reserve_gpu);
+            "[server] PFlash: the drafter scores beside the resident model (--prefill-skip-park); where the model "
+            "plans its context on gpu %d (target or expert device) it keeps %.2f GiB plus %lld KiB per context "
+            "token free there for it\n",
+            bargs.pflash_reserve_gpu,
+            bargs.pflash_reserve_bytes / 1073741824.0, kPFlashScoringBytesPerToken / 1024);
     }
 
     // Explicit --cache-type-* overrides enter the request here; the qwen35
