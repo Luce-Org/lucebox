@@ -1178,9 +1178,16 @@ static bool try_launch_paged_attn(
     // with the launch length: partitions past a row's extent take the dead
     // path and are exact zeros in fixed combine slots. The direct/partials
     // choice is a launch constant as well.
-    const int32_t tree_blocks = paged_attn_ceil_div(tree_width, block_size);
-    const int64_t table_blocks =
-        block_table->ne[0] + (parent_ids ? tree_blocks : 0);
+    //
+    // The cuts and the direct/partials choice are those of the AR call on the
+    // same table: a chain row must give the bytes of the AR row at its
+    // position, so S comes from the table width alone, without the candidate
+    // blocks. The candidates only extend the grid (the virtual tail past the
+    // table), and a table that AR reads in one partition keeps the chain in
+    // one partition.
+    const int32_t tree_blocks = parent_ids ? paged_attn_ceil_div(tree_width, block_size) : 0;
+    const int64_t table_blocks = block_table->ne[0];
+    const int64_t extent_blocks = table_blocks + tree_blocks;
     int32_t blocks_per_partition = paged_attn_blocks_per_partition(table_blocks);
 
     // Test/debug override: a forced partition count becomes a forced S, so it
@@ -1196,14 +1203,25 @@ static bool try_launch_paged_attn(
         forced_partitions <= table_blocks) {
         blocks_per_partition = paged_attn_ceil_div(table_blocks, forced_partitions);
     }
-    const int32_t max_partitions =
-        paged_attn_ceil_div(table_blocks, blocks_per_partition);
     const int64_t live_tokens =
         (int64_t) max_kv_seq_len + (parent_ids ? tree_width : 0);
     const int32_t live_blocks =
         paged_attn_ceil_div(live_tokens, block_size);
+    if (paged_attn_ceil_div(table_blocks, blocks_per_partition) == 1) {
+        blocks_per_partition = std::max<int64_t>(blocks_per_partition, extent_blocks);
+    }
+    // Only a chain launched at the very end of a full table needs more
+    // partitions than the cap allows at AR's S; its cuts move, no AR row
+    // exists there to match.
+    while (paged_attn_ceil_div(std::min<int64_t>(extent_blocks, live_blocks), blocks_per_partition) >
+           PAGED_ATTN_MAX_PARTITIONS) {
+        ++blocks_per_partition;
+    }
+    const int32_t max_partitions =
+        paged_attn_ceil_div(extent_blocks, blocks_per_partition);
     const int32_t n_partitions = std::max<int32_t>(1, std::min<int32_t>(
-        max_partitions, paged_attn_ceil_div(live_blocks, blocks_per_partition)));
+        std::min<int32_t>(max_partitions, PAGED_ATTN_MAX_PARTITIONS),
+        paged_attn_ceil_div(live_blocks, blocks_per_partition)));
     const bool write_partials = max_partitions > 1;
     if (n_partitions > 1) { ++g_paged_attn_partitioned_launch_count; }
 
