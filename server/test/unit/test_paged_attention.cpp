@@ -1256,3 +1256,33 @@ TEST_CASE(PagedAttention, ChainVerifyRowsEqualSequentialArBits) {
     }
     ggml_backend_free(backend);
 }
+
+// The engine's shapes: committed lengths that are not multiples of the block size, one to a few
+// partitions, and block tables of every width from a few blocks (one partition, direct write) to
+// hundreds. The cut points and the direct/partials choice are launch constants of the table width, so a
+// chain whose launch sees a wider table than the AR call changes the bits of every row. The V_DOT2 route
+// runs on gfx1151 and, with LUCE_PAGED_WMMA=0, on gfx1201.
+TEST_CASE(PagedAttention, ChainVerifyRowsEqualSequentialArBitsAcrossTableWidths) {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    int total = 0, bad = 0;
+    for (ggml_type kv_type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (int max_blocks : {8, 9, 17, 130, 520, 8192}) {
+            for (int committed : {1, 5, 15, 16, 17, 100, 127, 128, 129, 130, 255, 257}) {
+                for (int width : {8, 16}) {
+                    if ((committed + width + BLOCK_SIZE - 1) / BLOCK_SIZE > max_blocks) continue;
+                    const int mismatches = chain_vs_ar_mismatches(backend, kv_type, committed, width, max_blocks, false);
+                    ++total;
+                    bad += mismatches != 0;
+                    if (mismatches != 0) {
+                        std::printf("  K/V=%-4s table=%d L=%d k=%d: %d rows differ\n",
+                                    ggml_type_name(kv_type), max_blocks, committed, width, mismatches);
+                    }
+                }
+            }
+        }
+    }
+    std::printf("paged attention chain-vs-AR table sweep: %d of %d shapes differ\n", bad, total);
+    CHECK_EQUAL(0, bad);
+    ggml_backend_free(backend);
+}
