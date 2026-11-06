@@ -512,11 +512,20 @@ without tools are not affected.
 
 With a strict-selection environment whose scorer gives per-candidate scores
 (the release profile, which also sets the `PFLASH_ADMISSION=cache` it needs),
-chat and agent sessions are served by one mechanism, the unified view. Only the newest turn is ever paged: the user
-messages since the last reply, or the tool results of the last tool call. A
-message there with at least `--prefill-threshold` droppable tokens that can be
-cut into lines becomes a region, and only what the drafter selection keeps of
-it is served, in whole lines, with a note saying the content was shortened.
+chat and agent sessions are served by one mechanism, the unified view. A view
+pages the newest turn: the user messages since the last reply, or the tool
+results of the last tool call. When a view starts in a chat without tool
+activity (its first request, a history the server has not cached after a
+restart or from a client that resends it, or a view reset at the context
+limit), the earlier user messages are candidates too; what the prefix cache
+or the disk session cache holds is never paged. An agent session's history is
+served as it is. A candidate message with at least `--prefill-threshold` droppable tokens becomes a
+region, and only what the drafter selection keeps of it is served, with a note
+saying the content was shortened. A region is cut into whole lines. A message
+with fewer than five lines, or with a line longer than its region's cap (a
+document on one line), is cut inside its lines instead: at the drafter's
+segment starts, on token boundaries both tokenizers share, never inside a
+UTF-8 character or a JSON escape, and each omitted range is marked inline.
 Tool outputs are paged for the tools in `PFLASH_REGION_TOOLS` (default `*`,
 every tool; a comma-separated list names tools; empty pages none). Everything
 before the newest turn is the view already served and stays cached: the
@@ -538,22 +547,10 @@ context starts over from the raw prompt.
 Requests the unified view does not take are handed back to the chat view
 described above, which serves them as on its own: a request without a
 messages array, a remote drafter, a turn structure or generation prompt it
-cannot read, and a conversation it would start (no stored view continues it)
-whose uncached history before the newest turn, with newest content that
-cannot be cut into lines or has a line longer than its region's cap (one long
-line of prose could only be dropped whole), reaches `--prefill-threshold`
-(reason `uncached`,
-or `reset_uncached` when a stored view could not continue). A conversation
-handed back, or served raw after a PFlash failure, loses its unified views.
-After an `uncached` or `reset_uncached` hand-back the unified view adopts what
-the chat view served as the conversation's new view (no regions: what the
-chat view left out of it cannot be recalled), so the next turn continues it
-append-only and reuses its prefix. A tool session the chat view serves whole
-is adopted the same way; after a PFlash failure served raw nothing is adopted
-and the next turn starts a view of its own. The other hand-backs recur on every
-request of their kind. The view trace records `pflash.unified = {decision:
-handback, reason}` for these requests, and the unified stats count adoptions
-(`adopt.<reason>`). Without a strict-selection environment, or with a
+cannot read. A conversation handed back, or served raw after a PFlash
+failure, loses its unified views, and its next turn starts a view of its own.
+The view trace records `pflash.unified = {decision: handback, reason}` for
+these requests. Without a strict-selection environment, or with a
 selection that gives no per-candidate scores (the legacy or split scorer,
 `PFLASH_QWEN35_LEGACY_SCORER=1`, or the fold strategy), the unified view is
 off (startup says so for the scorer) and every request takes the chat view.
