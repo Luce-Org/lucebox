@@ -10,6 +10,7 @@
 #include "scoped_env.h"
 #include <fstream>
 
+#include "server/admit_timing.h"
 #include "server/sse_emitter.h"
 #include "server/tool_parser.h"
 #include "server/tool_checks.h"
@@ -77,6 +78,8 @@
 #include <array>
 #include <mutex>
 #include <thread>
+#include <poll.h>
+#include <chrono>
 #include <tuple>
 #include <vector>
 #include <limits>
@@ -359,6 +362,15 @@ struct SchedulerTestHarness {
 struct HttpServerTestAccess {
     using PreparedPrompt = HttpServer::PreparedPrompt;
     static void handle_client(HttpServer & server, int fd) { server.handle_client(fd); }
+    static void add_sse_subscriber(HttpServer & server, int fd) {
+        std::lock_guard<std::mutex> lk(server.sse_mu_);
+        server.sse_fds_.push_back(fd);
+    }
+    static size_t sse_subscribers(HttpServer & server) {
+        std::lock_guard<std::mutex> lk(server.sse_mu_);
+        return server.sse_fds_.size();
+    }
+    static void broadcast_token(HttpServer & server, const std::string & text) { server.broadcast_token(text); }
     static bool parse_endpoint(HttpServer & server, const std::string & path, const json & body,
                                const std::string & header_lines, ParsedRequest & req) {
         req.headers = luce::common::kvflash_parse_headers(header_lines);
@@ -18338,6 +18350,30 @@ TEST_CASE(ServerUnitFixture, test_usage_timings_zero_decode_no_div_by_zero) {
     TEST_ASSERT(finish_str.find("nan") == std::string::npos);
 }
 
+// A request that waited for admission: the wait is queue_s, the prefill starts at the successful admit.
+// Before: prefill_s ran from the first attempt (265 s reported for a real 131 s prefill that waited 134 s).
+TEST_CASE(ServerUnitFixture, test_admit_timing_prefill_excludes_the_deferred_wait) {
+    using clk = std::chrono::steady_clock;
+    const clk::time_point t0{}, admitted = t0 + std::chrono::seconds(134), end = admitted + std::chrono::seconds(131);
+    const auto t = luce::common::admit_timing(t0, admitted, end);
+    TEST_ASSERT(t.queue_s == 134.0);
+    TEST_ASSERT(t.prefill_s == 131.0);
+    TEST_ASSERT(t.total_s == 265.0);
+    // admitted at the first attempt: no queue, prefill is the whole
+    const auto n = luce::common::admit_timing(t0, t0, t0 + std::chrono::seconds(7));
+    TEST_ASSERT(n.queue_s == 0.0 && n.prefill_s == 7.0 && n.total_s == 7.0);
+}
+
+TEST_CASE(ServerUnitFixture, test_usage_timings_carry_queue_ms_apart_from_prefill_ms) {
+    GenTimings t;
+    t.prefill_s = 131.0;
+    t.queue_s = 134.25;
+    json j = build_timings_json(t, /*completion_tokens=*/1);
+    TEST_ASSERT(j["prefill_ms"].get<double>() == 131000.0);
+    TEST_ASSERT(j.contains("queue_ms") && j["queue_ms"].get<double>() == 134250.0);
+    TEST_ASSERT(build_timings_json(GenTimings{}, 0)["queue_ms"].get<double>() == 0.0);
+}
+
 TEST_CASE(ServerUnitFixture, test_usage_timings_reports_prefix_cache_work) {
     GenTimings t{0.012, 0.25, true, 8192, 64, 8256, true};
     json j = build_timings_json(t, /*completion_tokens=*/10);
@@ -22278,4 +22314,51 @@ TEST_CASE(ServerUnitFixture, test_dropped_note_names_declared_tools) {
     const std::string bare_note = tool_checks::dropped_call_note(bare);
     TEST_ASSERT(!bare_note.empty());
     TEST_ASSERT(bare_note.find("The tools you can call here are") == std::string::npos);
+}
+
+// ─── HTTP edge bounds: status-event fan-out ─────────────────────────────
+
+namespace {
+struct SseRig {
+    std::string tok_path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    std::unique_ptr<LuceEngine> engine;
+    std::unique_ptr<HttpServer> server;
+    SseRig() {
+        TEST_ASSERT(tokenizer.load_from_gguf(tok_path.c_str()));
+        engine = std::make_unique<LuceEngine>(std::make_unique<MetaRecordingBackend>());
+        ServerConfig config;
+        config.arch = "qwen35";
+        config.max_ctx = 4096;
+        config.prefix_cache_cap = 0;
+        server = std::make_unique<HttpServer>(*engine, tokenizer, config);
+    }
+    ~SseRig() { server.reset(); unlink(tok_path.c_str()); }
+};
+}
+
+TEST_CASE(ServerUnitFixture, test_a_stuck_status_subscriber_does_not_block_a_broadcast_to_another) {
+    SseRig rig;
+    int stuck[2], live[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, stuck) == 0);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, live) == 0);
+    // Fill the stuck subscriber's send buffer: its peer (stuck[1]) never reads.
+    const std::string chunk(4096, 'x');
+    while (send(stuck[0], chunk.data(), chunk.size(), MSG_DONTWAIT | MSG_NOSIGNAL) > 0) {}
+    HttpServerTestAccess::add_sse_subscriber(*rig.server, stuck[0]);   // first in the list
+    HttpServerTestAccess::add_sse_subscriber(*rig.server, live[0]);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    std::thread broadcaster([&] { HttpServerTestAccess::broadcast_token(*rig.server, "hello"); });
+    pollfd pfd{live[1], POLLIN, 0};
+    const int ready = poll(&pfd, 1, 400);
+    const auto reached = std::chrono::steady_clock::now() - t0;
+    broadcaster.join();
+    const auto returned = std::chrono::steady_clock::now() - t0;
+    TEST_ASSERT(ready == 1);                                                   // the live subscriber got it within 400 ms
+    TEST_ASSERT(reached < std::chrono::milliseconds(400));
+    TEST_ASSERT(returned < std::chrono::milliseconds(400));                    // and the caller was not stalled
+    TEST_ASSERT(HttpServerTestAccess::sse_subscribers(*rig.server) == 1);      // the stuck one was dropped
+    close(stuck[1]);
+    close(live[1]);
 }
