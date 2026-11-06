@@ -34,6 +34,7 @@
 #include "bailingmoe3_graph.h"
 #include "delta_net_chunked.h"
 #include "delta_net_specla.h"
+#include "gdn_single_commit.h"
 #include "kv_quant.h"
 #include "qwen35_ops.h"
 #include "qwen35moe_ffn.h"
@@ -467,6 +468,8 @@ static void refresh_specla_state_ptrs(TargetCache & c) {
 }
 
 void free_target_cache(TargetCache & c) {
+    // SWAP_SNAPSHOT: hand each buffer back its own tensors first.
+    gdn_commit::unswap_pairs(c.ssm_state, c.ssm_state_snap, c.ssm_state_swapped);
     if (c.base_buf)     { ggml_backend_buffer_free(c.base_buf);     c.base_buf     = nullptr; }
     if (c.base_ctx)     { ggml_free(c.base_ctx);                   c.base_ctx     = nullptr; }
     if (c.rollback_buf) { ggml_backend_buffer_free(c.rollback_buf); c.rollback_buf = nullptr; }
@@ -506,6 +509,9 @@ void free_target_cache(TargetCache & c) {
 }
 
 void reset_target_cache(TargetCache & c) {
+    // SWAP_SNAPSHOT: back to the allocation layout (every tensor
+    // below is zeroed anyway).
+    gdn_commit::unswap_pairs(c.ssm_state, c.ssm_state_snap, c.ssm_state_swapped);
     c.cur_pos = 0;
     c.specla_pending_bank = 0;
     c.specla_pending_count = 0;
@@ -540,6 +546,9 @@ void reset_target_cache(TargetCache & c) {
 void reset_recurrent_state(TargetCache & c) {
     c.specla_pending_bank = 0;
     c.specla_pending_count = 0;
+    // SWAP_SNAPSHOT may have left the live SSM state in
+    // rollback_buf; put the pairs back so the base_buf clear zeroes it.
+    gdn_commit::unswap_pairs(c.ssm_state, c.ssm_state_snap, c.ssm_state_swapped);
     // Device-side clear of the whole base buffer (KV + SSM + conv): with the
     // step-invariant decode the FA span is 256-padded and mask-less, so stale
     // K/V rows from the PREVIOUS request inside the padded tail would be
@@ -1534,7 +1543,16 @@ static ggml_tensor * build_delta_net_block(
     int specla_n_boundaries       = 0,
     int specla_n_chains           = 0,
     int specla_n_waves            = 0,
-    int specla_max_parallel_chains = 0
+    int specla_max_parallel_chains = 0,
+    // KEEP_BASE (gdn_single_commit.h): skip the
+    // final-state write of a chain capture verify; ssm_state keeps its
+    // pre-verify value and rollback commits from the F32 intermediates.
+    bool keep_base_state = false,
+    // SINGLE_REPLAY (gdn_single_commit.h; needs
+    // keep_base_state): I32 [1] holding 0. The recurrence becomes a mapped
+    // verify over slab 0 that writes no intermediates and no final state and
+    // records the replay log into cap->replay_log for rollback's commit.
+    ggml_tensor * single_replay_slot_ids = nullptr
 ) {
     const int head_k_dim   = w.ssm_d_state;
     const int num_k_heads  = w.ssm_n_group;
@@ -2064,6 +2082,19 @@ static ggml_tensor * build_delta_net_block(
                                        || seg_cap->ssm_intermediate_states->type == GGML_TYPE_F16))
         ? seg_cap->ssm_intermediate_states
         : nullptr;
+    // KEEP_BASE needs the per-token states in exact F32 and the one dense
+    // chain segment whose final-state write it drops. SINGLE_REPLAY replaces
+    // those states with the replay log: build_qwen35_graph left no
+    // intermediate buffer in the capture.
+    GGML_ASSERT(!keep_base_state ||
+                ((single_replay_slot_ids
+                      ? (seg_cap && !persist_inter && !seg_cap->ssm_intermediate_states &&
+                         !seg_cap->replay_log && n_segs == 1)
+                      : (persist_inter && persist_inter->type == GGML_TYPE_F32)) &&
+                 !seg_tree && !seg_active && !seg_parent_ids && !ragged &&
+                 seg_seqs == 1 && !inplace_state &&
+                 !use_specla_factorized && !use_specla_hld));
+    GGML_ASSERT(!single_replay_slot_ids || keep_base_state);
 
     // Chunked delta-net path: chain-only (no parent_ids), no per-token
     // capture (no cap). Ported from llama.cpp
@@ -2150,7 +2181,13 @@ static ggml_tensor * build_delta_net_block(
         // straight into `s` (a view of the persistent ssm_state), so no
         // separate 3 MB copy per layer is needed. Tree mode keeps the copy.
         GGML_ASSERT(!verify_fused || !persist_inter);
-        result = verify_fused
+        // SINGLE_REPLAY: the mapped verify reads slab 0 of the one-slab state
+        // in place (s is the whole persistent tensor) and writes no state.
+        GGML_ASSERT(!single_replay_slot_ids || (!verify_fused && !persist_inter));
+        result = single_replay_slot_ids
+            ? ggml_gated_delta_net_mapped_verify(ctx, q_c, k_c, v_c, g_tensor, beta, s,
+                                                 single_replay_slot_ids)
+            : verify_fused
             ? ggml_gated_delta_net_mapped_verify(ctx, q_c, k_c, v_c, g_tensor, beta, s, seg.state_ids)
             : inplace_state
                 ? ggml_gated_delta_net_inplace(ctx, q_c, k_c, v_c, g_tensor, beta, s)
@@ -2171,6 +2208,19 @@ static ggml_tensor * build_delta_net_block(
         ggml_set_output(seg_cap->replay_log);
         ggml_build_forward_expand(gf, seg_cap->replay_log);
     }
+    if (single_replay_slot_ids) {
+        // SINGLE_REPLAY: rollback_to reads the log in place, so the compact
+        // copy capture_replay_log returns stays out of the graph; the GDN
+        // result (attention output | log) is kept alive past the compute
+        // instead. Only the view node joins the graph (it launches nothing).
+        ggml_tensor * copy = ggml_gated_delta_net_capture_replay_log(ctx, result);
+        ggml_tensor * log = copy->src[0];
+        GGML_ASSERT(copy->op == GGML_OP_DUP && log && log->view_src == result);
+        seg_cap->replay_log = log;
+        ggml_set_output(result);
+        ggml_set_output(log);
+        ggml_build_forward_expand(gf, log);
+    }
 
     // Slice output and new_state out of the packed result
     const int64_t S_v = head_v_dim;
@@ -2182,7 +2232,9 @@ static ggml_tensor * build_delta_net_block(
         S_v * H_v * r_elt,
         S_v * H_v * n_seq_tokens * r_elt,
         0);
-    if (!inplace_state && !seg_tree) {
+    // KEEP_BASE: no final-state write; the kernel still stores the same
+    // values into intermediate[n_seq_tokens - 1], which rollback commits.
+    if (!inplace_state && !seg_tree && !keep_base_state) {
         ggml_tensor * new_state = ggml_view_4d(ctx, result,
             S_v, S_v, H_v, seg_seqs,
             S_v * r_elt,
@@ -2492,7 +2544,10 @@ QwenGraphOutputs build_qwen35_graph(
                 // these tensors post-compute; their ->data pointers are always
                 // valid because they're cache-resident, not gallocr-managed.
                 if (in.capture_delta_intermediate) {
-                    cap_ptr->ssm_intermediate_states = cache.ssm_intermediate[dn_idx];
+                    // SINGLE_REPLAY: the replay log replaces the
+                    // checkpoints (the buffer stays allocated as the fallback).
+                    cap_ptr->ssm_intermediate_states = in.single_replay_slot_ids
+                        ? nullptr : cache.ssm_intermediate[dn_idx];
                     cap_ptr->conv_input              = cache.conv_input_cache[dn_idx];
                     if (!cache.factor_k.empty()) {
                         const bool pending_alt = cache.specla_pending_bank != 0;
@@ -2563,7 +2618,9 @@ QwenGraphOutputs build_qwen35_graph(
                                             in.specla_n_boundaries,
                                             in.specla_n_chains,
                                             in.specla_n_waves,
-                                             in.specla_max_parallel_chains);
+                                             in.specla_max_parallel_chains,
+                                            in.keep_base_ssm_state,
+                                            in.single_replay_slot_ids);
             }
             dn_idx++;
         }
