@@ -29,6 +29,11 @@ struct World {
         kv = std::make_unique<KvFlashSlotKv>(raw, ledger, cfg);
     }
 };
+
+SeqEngine::AdmitResult admit_tokens(SeqSlotManager & mgr, KvFlashSlotKv & kv, uint64_t id, int n, int gen = 60) {
+    kv.set_next_total_tokens(n + gen);
+    return mgr.admit(id, std::vector<int32_t>((size_t)n, 1), SamplerCfg{});
+}
 }  // namespace
 
 TEST_CASE(KvflashSlotKvFixture, acquire_gives_distinct_slots_then_exhausts_and_release_recycles) {
@@ -285,4 +290,207 @@ TEST_CASE(KvflashSlotKvFixture, rewind_prefill_drops_the_rows_past_the_point_in_
     CHECK(w.s[(size_t)r.slot]->n_chunks() == 10);
     mgr.commit_prefill(r.slot);
     CHECK(!mgr.rewind_prefill(r.slot, 100));                       // decoding: not a prefill any more
+}
+
+TEST_CASE(KvflashSlotKvFixture, park_keeps_the_pager_and_the_reservation_and_only_a_decoded_slot_parks) {
+    World w;
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    const auto r = admit_tokens(mgr, *w.kv, 1, 640);
+    REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
+    std::vector<int32_t> hist;
+    CHECK(!mgr.park(r.slot, hist));                                   // still prefilling
+    REQUIRE(mgr.append_prefill(r.slot, 640).ok);
+    mgr.commit_prefill(r.slot);
+    CHECK(mgr.park(r.slot, hist));
+    CHECK(hist.size() == 640u);
+    CHECK(!mgr.is_active(r.slot));
+    CHECK(w.kv->parked(r.slot));
+    CHECK(w.s[(size_t)r.slot]->n_chunks() == 10);                    // the KV stays
+    CHECK(w.ledger.reservation_count() == 1);                        // host backing stays charged
+    CHECK(!mgr.park(r.slot, hist));                                  // not active any more
+    w.kv->drop_parked(r.slot);
+    CHECK(!w.kv->parked(r.slot));
+    CHECK(w.s[(size_t)r.slot]->n_chunks() == 0);
+    CHECK(w.ledger.reservation_count() == 0);
+}
+
+TEST_CASE(KvflashSlotKvFixture, resume_rebinds_the_parked_slot_at_its_length_for_the_new_total) {
+    World w;
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    const auto r = admit_tokens(mgr, *w.kv, 1, 640);
+    REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
+    REQUIRE(mgr.append_prefill(r.slot, 640).ok);
+    mgr.commit_prefill(r.slot);
+    std::vector<int32_t> hist;
+    REQUIRE(mgr.park(r.slot, hist));
+    const int64_t charged = w.ledger.used_bytes();
+    // resume: the manager admits into the parked slot at cur_pos 640, the allocator keeps its rows
+    w.kv->set_next_total_tokens(800 + 60);
+    w.kv->set_next_resume(r.slot, 640);
+    const auto a = mgr.admit_at(r.slot, 2, std::vector<int32_t>(760, 1), SamplerCfg{}, 640);
+    REQUIRE(a.status == SeqEngine::AdmitResult::Status::admitted);
+    CHECK(a.slot == r.slot);
+    CHECK(mgr.slot(r.slot).cur_pos == 640);
+    CHECK(mgr.slot(r.slot).prompt_len == 760);
+    CHECK(!w.kv->parked(r.slot));
+    CHECK(w.ledger.reservation_count() == 1);
+    CHECK(w.ledger.used_bytes() > charged);                          // re-admitted for the larger total
+    CHECK(w.s[(size_t)r.slot]->n_chunks() == 10);
+    const auto more = mgr.append_prefill(r.slot, 120);              // chunks 10 and 11: the two free blocks
+    REQUIRE(more.ok);
+    CHECK(more.rows.size() == 120u);
+    CHECK(w.s[(size_t)r.slot]->n_chunks() == 12);
+    mgr.commit_prefill(r.slot);
+    mgr.retire(r.slot);
+    CHECK(w.ledger.reservation_count() == 0);
+}
+
+TEST_CASE(KvflashSlotKvFixture, a_resume_hint_that_does_not_match_the_parked_slot_is_refused_and_a_plain_acquire_skips_parked_slots) {
+    World w;
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    const auto r = admit_tokens(mgr, *w.kv, 1, 640);
+    REQUIRE(mgr.append_prefill(r.slot, 640).ok);
+    mgr.commit_prefill(r.slot);
+    std::vector<int32_t> hist;
+    REQUIRE(mgr.park(r.slot, hist));
+    PagedKvSequenceHandle h;
+    w.kv->set_next_resume(r.slot, 600);                              // wrong length
+    CHECK(w.kv->acquire_reserved(2, 700, h) == PagedKvStatus::InvalidArgument);
+    CHECK(w.kv->parked(r.slot));
+    w.kv->set_next_resume(1 - r.slot, 640);                          // not parked
+    CHECK(w.kv->acquire_reserved(2, 700, h) == PagedKvStatus::InvalidArgument);
+    CHECK(w.kv->acquire_reserved(2, 256, h) == PagedKvStatus::Ok);   // no hint: the free slot, never the parked one
+    CHECK((int)h.slot == 1 - r.slot);
+    CHECK(w.kv->acquire_reserved(3, 256, h) == PagedKvStatus::SequenceSlotsExhausted);   // parked counts as taken
+    w.kv->set_next_slot(r.slot);                                     // an explicit slot drops the parked session
+    CHECK(w.kv->acquire_reserved(3, 256, h) == PagedKvStatus::Ok);
+    CHECK((int)h.slot == r.slot);
+    CHECK(!w.kv->parked(r.slot));
+    CHECK(w.s[(size_t)r.slot]->n_chunks() == 0);
+}
+
+TEST_CASE(KvflashSlotKvFixture, a_resume_the_host_budget_refuses_leaves_the_session_parked) {
+    World w(/*host_budget=*/70000);                                   // chunks of backing at 1000 B
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    const auto r = admit_tokens(mgr, *w.kv, 1, 640, 0);              // 10 chunks
+    REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
+    REQUIRE(mgr.append_prefill(r.slot, 640).ok);
+    mgr.commit_prefill(r.slot);
+    std::vector<int32_t> hist;
+    REQUIRE(mgr.park(r.slot, hist));
+    w.kv->set_next_total_tokens(1280);                               // 20 chunks in the other slot (the allocator skips the parked one)
+    const auto other = mgr.admit_at(1 - r.slot, 5, std::vector<int32_t>(1280, 1), SamplerCfg{}, 0);
+    REQUIRE(other.status == SeqEngine::AdmitResult::Status::admitted);
+    CHECK(other.slot == 1 - r.slot);
+    const int64_t used = w.ledger.used_bytes();
+    w.kv->set_next_total_tokens(4000);                               // 63 chunks: 20 + 63 > 70 even with the 10 released
+    w.kv->set_next_resume(r.slot, 640);
+    const auto a = mgr.admit_at(r.slot, 2, std::vector<int32_t>(3900, 1), SamplerCfg{}, 640);
+    CHECK(a.status == SeqEngine::AdmitResult::Status::busy);
+    CHECK(w.kv->parked(r.slot));
+    CHECK(w.ledger.reservation_count() == 2);                        // the old reservation is back
+    CHECK(w.ledger.used_bytes() == used);
+}
+
+// RC1 N=2 HTTP 500: a sticky session grew past what the whole host budget can ever hold (the budget is sized for fewer
+// session-sized reservations than its context needs). The ledger's HostTooSmall is permanent, not busy: waiting or evicting
+// a peer cannot help. The pool must report it as capacity_exceeded (HTTP 400), keep the session parked with its old
+// reservation, and never let the engine evict the very session being admitted.
+TEST_CASE(KvflashSlotKvFixture, a_resume_whose_total_exceeds_the_whole_host_budget_is_capacity_exceeded_and_leaves_the_session_parked) {
+    World w(/*host_budget=*/50000);                                   // 50 chunks of backing at 1000 B in total
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    const auto r = admit_tokens(mgr, *w.kv, 1, 640, 0);              // 10 chunks
+    REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
+    REQUIRE(mgr.append_prefill(r.slot, 640).ok);
+    mgr.commit_prefill(r.slot);
+    std::vector<int32_t> hist;
+    REQUIRE(mgr.park(r.slot, hist));
+    const int64_t used = w.ledger.used_bytes();
+    w.kv->set_next_total_tokens(4000);                               // 63 chunks: more than the whole 50-chunk budget, nothing else parked
+    w.kv->set_next_resume(r.slot, 640);
+    const auto a = mgr.admit_at(r.slot, 2, std::vector<int32_t>(3900, 1), SamplerCfg{}, 640);
+    CHECK(a.status == SeqEngine::AdmitResult::Status::capacity_exceeded);
+    CHECK(w.kv->parked(r.slot));                                     // the session is untouched
+    CHECK(w.ledger.reservation_count() == 1);
+    CHECK(w.ledger.used_bytes() == used);
+}
+
+// Codex P2: the engine asks before it rewinds the session; the question charges nothing and moves nothing.
+TEST_CASE(KvflashSlotKvFixture, the_capacity_probe_names_a_total_above_the_whole_host_budget_and_changes_nothing) {
+    World w(/*host_budget=*/50000);
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    const auto r = admit_tokens(mgr, *w.kv, 1, 640, 0);
+    REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
+    REQUIRE(mgr.append_prefill(r.slot, 640).ok);
+    mgr.commit_prefill(r.slot);
+    std::vector<int32_t> hist;
+    REQUIRE(mgr.park(r.slot, hist));
+    const int64_t used = w.ledger.used_bytes();
+    CHECK(w.kv->exceeds_host_budget(r.slot, 4000));          // 63 chunks > 50
+    CHECK(!w.kv->exceeds_host_budget(r.slot, 3200));         // 50 chunks fit exactly
+    CHECK(w.kv->parked(r.slot));
+    CHECK(w.ledger.used_bytes() == used);
+    CHECK(w.ledger.reservation_count() == 1);
+    CHECK(w.s[(size_t)r.slot]->n_chunks() == 10);
+}
+
+// Codex re-review P2: the scheduler can hand a total of max_ctx + 1 (prompt + generation bound); admission clamps it to max_ctx and
+// charges max_ctx. The probe must see the same charge, or the session is rewound and then destroyed by the refusal.
+TEST_CASE(KvflashSlotKvFixture, the_capacity_probe_clamps_the_total_to_max_ctx_exactly_as_admission_does) {
+    World w(/*host_budget=*/50000);                           // 50 chunks; max_ctx is 64 chunks
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    const auto r = admit_tokens(mgr, *w.kv, 1, 640, 0);
+    REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
+    REQUIRE(mgr.append_prefill(r.slot, 640).ok);
+    mgr.commit_prefill(r.slot);
+    std::vector<int32_t> hist;
+    REQUIRE(mgr.park(r.slot, hist));
+    CHECK(w.kv->exceeds_host_budget(r.slot, kMaxCtx + 1));
+    CHECK(w.kv->exceeds_host_budget(r.slot, kMaxCtx));
+    w.kv->set_next_total_tokens(kMaxCtx + 1);                // admission agrees: the same refusal, not a different charge
+    w.kv->set_next_resume(r.slot, 640);
+    CHECK(mgr.admit_at(r.slot, 2, std::vector<int32_t>(1500, 1), SamplerCfg{}, 640).status == SeqEngine::AdmitResult::Status::capacity_exceeded);
+}
+
+// A prompt that really exceeds max_ctx never reaches the ledger: SeqSlotManager refuses it first, with its own message,
+// and the session stays parked untouched.
+TEST_CASE(KvflashSlotKvFixture, a_prompt_over_max_ctx_is_refused_by_the_manager_before_the_ledger_and_leaves_the_session_parked) {
+    World w;
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    const auto r = admit_tokens(mgr, *w.kv, 1, 640, 0);
+    REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
+    REQUIRE(mgr.append_prefill(r.slot, 640).ok);
+    mgr.commit_prefill(r.slot);
+    std::vector<int32_t> hist;
+    REQUIRE(mgr.park(r.slot, hist));
+    const int64_t used = w.ledger.used_bytes();
+    w.kv->set_next_total_tokens(kMaxCtx + 10);
+    w.kv->set_next_resume(r.slot, 640);
+    const auto a = mgr.admit_at(r.slot, 2, std::vector<int32_t>((size_t)kMaxCtx + 1, 1), SamplerCfg{}, 640);
+    CHECK(a.status == SeqEngine::AdmitResult::Status::capacity_exceeded);
+    CHECK(a.error == "prompt exceeds max_ctx");
+    CHECK(w.kv->parked(r.slot));
+    CHECK(w.ledger.used_bytes() == used);
+}
+
+// Codex pass 3 counterexamples: two parked 640-token peers, a new sid with a 3,900-token prompt and 100 generation tokens needs 63
+// chunks of a 50-chunk budget. The probe says so from the config alone (no bundle, no slot choice), and asking it moves nothing, so
+// the engine can refuse before evicting either peer. The disk-resume ladder bytes are the pool's configured ladder, not per bundle.
+TEST_CASE(KvflashSlotKvFixture, the_probe_refuses_a_new_sid_above_the_budget_with_two_parked_peers_untouched) {
+    World w(/*host_budget=*/50000);
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    for (uint64_t id : {1, 2}) {
+        const auto r = admit_tokens(mgr, *w.kv, id, 640, 0);
+        REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
+        REQUIRE(mgr.append_prefill(r.slot, 640).ok);
+        mgr.commit_prefill(r.slot);
+        std::vector<int32_t> hist;
+        REQUIRE(mgr.park(r.slot, hist));
+    }
+    const int64_t used = w.ledger.used_bytes();
+    CHECK(w.kv->exceeds_host_budget(0, 3900 + 100));
+    CHECK(w.kv->exceeds_host_budget(1, 3900 + 100));          // either slot: the pagers are alike
+    CHECK(w.kv->parked(0)); CHECK(w.kv->parked(1));
+    CHECK(w.ledger.used_bytes() == used);
+    CHECK(w.ledger.reservation_count() == 2);
 }

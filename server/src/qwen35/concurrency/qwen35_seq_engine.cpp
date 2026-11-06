@@ -15,6 +15,7 @@
 #include "common/concurrency/chain_spec_shapes.h"
 #include "common/dflash2_head.h"
 #include "common/kvflash_exact_fast.h"
+#include "common/kvflash_prefill_reselect.h"
 #include "common/sampled_verify.h"
 #include "common/sampler.h"
 #include "internal.h"
@@ -99,7 +100,14 @@ void Qwen35SeqEngine::init_slots_() {
     seq_lens_.assign(static_cast<size_t>(n_slots), 0);
     reserve_growth_.assign(static_cast<size_t>(n_slots), 0);
     recall_.assign(static_cast<size_t>(n_slots), SlotRecall{});
+    parked_.assign(static_cast<size_t>(n_slots), ParkedSession{});
+    book_.init(n_slots);
     recall_on_ = kvf_ && b_.kvflash_slot_recall_profile();
+    if (kvf_) {
+        const char * env = std::getenv("LUCE_KVFLASH_SLOT_STICKY");
+        sticky_on_ = !(env && env[0] == '0' && env[1] == '\0');
+        std::fprintf(stderr, "[kvflash] slot sessions: %s (LUCE_KVFLASH_SLOT_STICKY)\n", sticky_on_ ? "sticky" : "cold");
+    }
     if (kvf_)
         std::fprintf(stderr, "[kvflash] slot recall: %s (mode=%d queries=%d k=%d unit=%d)\n",
                      recall_on_ ? "on" : "off", b_.kvflash_prefill_reselect_,
@@ -564,8 +572,10 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_bounded(
         const std::vector<int32_t> & prompt,
         const SamplerCfg & sampler,
         int max_new_tokens,
-        const AdmitMeta & /*meta*/) {
-    if (kvf_kv_) kvf_kv_->set_next_total_tokens((int64_t)prompt.size() + max_new_tokens);   // host backing for the whole request (R5)
+        const AdmitMeta & meta) {
+    const int64_t total = (int64_t)prompt.size() + max_new_tokens;   // host backing for the whole request (R5)
+    if (sticky_on_) return admit_sticky_(request_id, prompt, sampler, total, meta);
+    if (kvf_kv_) kvf_kv_->set_next_total_tokens(total);
     AdmitResult result = slots_.admit(request_id, prompt, sampler);
     if (result.status == AdmitResult::Status::admitted) {
         clear_slot_images(result.slot);
@@ -574,6 +584,183 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_bounded(
         if (kvf_) plan_slot_turn_(result.slot, prompt, 0);
     }
     return result;
+}
+
+// Sticky admission: a parked session the prompt extends resumes in its slot at L (kvflash_resume_point), the whole history.
+// The session's identity: the request's, else anonymous (ownerless: resumable by content, never a stated identity's session).
+// e_role: where the preamble ends.
+SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
+        uint64_t request_id, const std::vector<int32_t> & prompt, const SamplerCfg & sampler,
+        int64_t total, const AdmitMeta & meta) {
+    AdmitMeta who = meta;
+    if (who.sid.empty()) { who.sid = "anon:" + std::to_string(request_id); who.client = "anon"; }
+    AdmitResult refused;
+    const KvFlashEarlyRefusal early = kvflash_early_refusal((int64_t)prompt.size(), slots_.max_context(), [&] { return kvf_kv_->exceeds_host_budget(0, total); });
+    if (early != KvFlashEarlyRefusal::none) {   // before any eviction or resume: no session is touched
+        refused.status = AdmitResult::Status::capacity_exceeded;
+        refused.error = early == KvFlashEarlyRefusal::prompt_over_max_ctx ? "prompt exceeds max_ctx"
+                                                                          : "request needs more host memory than the whole KVFlash host budget (LUCE_KVFLASH_HOST_MIB)";
+        std::fprintf(stderr, "[kvflash] admit %s/%s refused: %s (no session touched)\n", who.client.c_str(), who.sid.c_str(), refused.error.c_str());
+        return refused;
+    }
+    const int e_role = kvflash_preamble_end(prompt, b_.w_.im_start_id, b_.w_.system_id);
+    switch (kvflash_admit_gate(book_, {who.sid, who.client}, active_slots_())) {
+        case KvFlashAdmitVerdict::invalid_identity:   // the HTTP boundary answers 400 first; an engine caller is held to the same bound
+            refused.status = AdmitResult::Status::failed;
+            refused.error = "session id longer than " + std::to_string(kKvFlashSidMax) + " bytes";
+            return refused;
+        case KvFlashAdmitVerdict::identity_busy:      // one live owner per identity: the second request waits for the first
+            refused.status = AdmitResult::Status::busy;
+            refused.error = "session " + who.client + "/" + who.sid + " is running another request";
+            return refused;
+        case KvFlashAdmitVerdict::proceed:
+            break;
+    }
+    // The admit table: resume, or cold.
+    const std::vector<KvFlashOwnedSession> owners = parked_list_();
+    KvFlashSessionPick pick = kvflash_pick_parked_owner(owners, who.client, who.sid, prompt, e_role);
+    for (const auto & o : owners)   // a session a busy resume left waiting is picked again by the request that left it
+        if (parked_[(size_t)o.parked.slot].wait.L > 0) {
+            const KvFlashSessionPick w = kvflash_pick_with_wait(pick, o.parked.slot, (int)o.parked.history->size(), parked_[(size_t)o.parked.slot].wait, prompt, who.client, who.sid);
+            if (w.slot == o.parked.slot) pick = w;
+        }
+    KvFlashAdmitIn plan_in;
+    plan_in.e_role = e_role;   // no storage tier: a session that cannot resume is dropped
+    if (pick.exact()) {
+        const ParkedSession & ps = parked_[(size_t)pick.slot];
+        plan_in.pick_slot = pick.slot; plan_in.lcp = pick.lcp;
+        plan_in.L = kvflash_resume_point(pick.lcp, (int)ps.history.size(), -1, -1, (int)prompt.size());
+    }
+    plan_in.same_sid_slot = kvflash_same_sid_slot(owners, who.client, who.sid, pick.slot);
+    KvFlashAdmitPlan plan = kvflash_admit_plan(plan_in);
+    std::fprintf(stderr, "[kvflash] admit %s/%s row %s: slot=%d pick_lcp=%d L=%d e_role=%d prompt=%zu\n", who.client.c_str(), who.sid.c_str(),
+                 kvflash_admit_row(plan.action), plan.slot >= 0 ? plan.slot : pick.slot, pick.lcp, plan.L, e_role, prompt.size());
+    if (plan.action == KvFlashAdmitAction::resume) {
+        ParkedSession & ps = parked_[(size_t)pick.slot];
+        const int history = (int)ps.history.size();
+        const int L = plan.L;   // the whole history: the state stays in the slot
+        AdmitResult result;
+        for (;;) {
+            kvf_kv_->set_next_total_tokens(total);
+            kvf_kv_->set_next_resume(pick.slot, (uint32_t)L);
+            result = slots_.admit_at(pick.slot, request_id, prompt, sampler, L);
+            if (result.status == AdmitResult::Status::admitted) break;
+            const bool busy = result.status == AdmitResult::Status::busy;
+            bool other_parked = false;
+            for (const auto & o : parked_list_()) other_parked |= o.parked.slot != pick.slot;
+            const KvFlashResumeRefused act = kvflash_resume_refused(busy, other_parked, result.status == AdmitResult::Status::capacity_exceeded);
+            if (act == KvFlashResumeRefused::refuse) {   // the backstop of the early refusal: the session stays parked, the HTTP boundary answers 400
+                std::fprintf(stderr, "[kvflash] slot %d resume of sid=%s refused: %s (the session stays parked)\n", pick.slot, who.sid.c_str(), result.error.c_str());
+                return result;
+            }
+            if (act == KvFlashResumeRefused::evict_other_retry && evict_oldest_("host budget needed to resume a session", pick.slot) >= 0) continue;
+            if (act != KvFlashResumeRefused::drop_cold) {
+                ps.wait = kvflash_resume_wait_make(L, pick.lcp, prompt, who.client, who.sid);   // the retry resumes here
+                std::fprintf(stderr, "[kvflash] slot %d resume of sid=%s waits: %s (the session stays parked)\n", pick.slot, who.sid.c_str(), result.error.c_str());
+                return result;
+            }
+            break;
+        }
+        if (result.status == AdmitResult::Status::admitted) {
+            book_.promote_owner(result.slot, who.client, who.sid);   // a session with no sid of its own learns its client's
+            ps = ParkedSession{};
+            clear_slot_images(result.slot);
+            reset_slot_draft_kv(result.slot);
+            std::fprintf(stderr, "[kvflash] slot %d resume L=%d history=%d new=%d\n", result.slot, L, history, (int)prompt.size() - L);
+            if (begin_resume_(result.slot)) {
+                plan_slot_turn_(result.slot, prompt, L);
+                return result;
+            }
+            slots_.retire(result.slot);   // the page work failed: the session is gone, admit cold below
+            drop_session_(pick.slot, "resume page work failed");
+        } else {
+            drop_session_(pick.slot, result.error.c_str());   // the pool refused (host budget): cold below
+        }
+        plan_in.pick_slot = plan_in.same_sid_slot = -1;   // it failed and the session is gone: plan the cold admit without it
+        plan = kvflash_admit_plan(plan_in);
+    } else if (pick.exact() && plan.action != KvFlashAdmitAction::summary_cold) {
+        const ParkedSession & ps = parked_[(size_t)pick.slot];
+        std::fprintf(stderr, "[kvflash] slot %d session not resumable: lcp=%d history=%d prompt=%zu\n", pick.slot, pick.lcp, (int)ps.history.size(), prompt.size());
+    }
+    // Cold: a slot with no session, else the oldest session's slot. A summary-generation request leaves the sid's parked instance alone.
+    const int keep_slot = plan.action == KvFlashAdmitAction::summary_cold ? plan.slot : -1;
+    int slot = -1;
+    for (int i = 0; i < slots_.slot_count() && slot < 0; ++i)
+        if (!slots_.is_active(i) && !parked_[(size_t)i].valid) slot = i;
+    if (slot < 0) slot = evict_oldest_("slot needed for a new session", keep_slot);
+    if (slot >= 0 && !book_[slot].sid.empty()) drop_session_(slot, "slot reused");   // a session that left it without parking
+    AdmitResult result;
+    if (slot < 0) {   // every slot is live (a plain admit would pair a manager slot with another pager slot)
+        result.status = AdmitResult::Status::busy;
+        result.error = "all sequence slots are live";
+        return result;
+    }
+    for (;;) {
+        kvf_kv_->set_next_total_tokens(total);
+        kvf_kv_->set_next_slot(slot);
+        result = slots_.admit_at(slot, request_id, prompt, sampler, 0);
+        // Parked reservations are a cache, never a reason to refuse: the oldest go until the budget fits.
+        const int old = result.status == AdmitResult::Status::busy ? evict_oldest_("host budget needed for a new session (cold)", keep_slot) : -1;
+        if (old < 0) break;
+    }
+    if (result.status == AdmitResult::Status::admitted) {
+        book_.begin_session(result.slot, who.client, who.sid);
+        clear_slot_images(result.slot);
+        reset_recurrent_slot(b_.cache_, result.slot);
+        reset_slot_draft_kv(result.slot);
+        plan_slot_turn_(result.slot, prompt, 0);
+    }
+    return result;
+}
+
+void Qwen35SeqEngine::drop_session_(int slot, const char * why) {
+    if (slot < 0 || slot >= slots_.slot_count()) return;
+    if (parked_[(size_t)slot].valid)
+        std::fprintf(stderr, "[kvflash] slot %d session dropped: history=%zu (%s)\n",
+                     slot, parked_[(size_t)slot].history.size(), why);
+    parked_[(size_t)slot] = ParkedSession{};
+    kvf_kv_->drop_parked(slot);
+    book_.reset(slot);   // the slot's owner goes with its session
+}
+
+// With no storage tier the oldest parked session other than `keep` is dropped: its next turn prefills cold.
+int Qwen35SeqEngine::evict_oldest_(const char * why, int keep) {
+    std::vector<KvFlashParkedSession> list;
+    for (const auto & o : parked_list_()) list.push_back(o.parked);
+    const KvFlashEvicted r = kvflash_evict_oldest(list, [&](int slot) { drop_session_(slot, why); return true; }, [&](int slot) {
+        std::fprintf(stderr, "[kvflash] slot %d session dropped from host memory: its park cannot be kept, the next turn prefills cold (%s)\n", slot, why);
+        drop_session_(slot, why);   // the park was refused: the parked set is a cache and never blocks service
+    }, keep);
+    return r.slot;
+}
+
+std::vector<bool> Qwen35SeqEngine::active_slots_() const {
+    std::vector<bool> v((size_t)slots_.slot_count(), false);
+    for (int i = 0; i < slots_.slot_count(); ++i) v[(size_t)i] = slots_.is_active(i);
+    return v;
+}
+
+std::vector<KvFlashOwnedSession> Qwen35SeqEngine::parked_list_() const {
+    std::vector<KvFlashOwnedSession> v;
+    for (int slot = 0; slot < slots_.slot_count(); ++slot)
+        if (parked_[(size_t)slot].valid)
+            v.push_back({{slot, &parked_[(size_t)slot].history, parked_[(size_t)slot].tick}, book_[slot].client, book_[slot].sid});
+    return v;
+}
+
+// A resumed turn starts from the recent residency (the newest chunks), as the
+// single-slot SCORE_POOL_RECENT does, so its first pass and scores do not depend
+// on the previous turn's picks. Deferred frees are drained around the page work.
+bool Qwen35SeqEngine::begin_resume_(int slot) {
+    KvFlashSlotPager & p = kvf_kv_->pager(slot);
+    p.synchronize_paging();
+    kvf_->complete_all();
+    if (!recall_on_) return true;
+    p.set_deferred_free(false);
+    p.reselect_recent();
+    p.set_deferred_free(true);
+    p.synchronize_paging();
+    return true;
 }
 
 // C1.4: the slot's turn (kvflash_slot_turn.h). R > kv_offset snapshots at the
@@ -1946,7 +2133,11 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     const int n_slots = slots_.slot_count();
 
     auto fail_step = [&](const std::string & error) {
-        if (kvf_) kvf_->abort_step();   // D3: one exit path for a staged KVFlash step
+        if (kvf_) {
+            kvf_->abort_step();   // D3: one exit path for a staged KVFlash step
+            for (int slot = 0; slot < n_slots; ++slot)
+                if (slots_.is_active(slot)) recall_[(size_t)slot].tainted = true;   // never parked
+        }
         result.decode.clear();
         result.prefills.clear();
         result.error = error;
@@ -2547,7 +2738,18 @@ void Qwen35SeqEngine::retire(int slot) {
     clear_slot_images(slot);
     if (!slots_.is_active(slot)) return;
     reset_slot_draft_kv(slot);
-    if (kvf_) recall_[(size_t)slot] = SlotRecall{};
+    if (kvf_) {
+        const bool tainted = recall_[(size_t)slot].tainted;
+        recall_[(size_t)slot] = SlotRecall{};
+        std::vector<int32_t> history;
+        if (sticky_on_ && !tainted && slots_.park(slot, history)) {   // the KV and the recurrent state stay in the slot
+            const KvFlashSlotPager & p = kvf_kv_->pager(slot);
+            std::fprintf(stderr, "[kvflash] slot %d parked: history=%zu resident=%d/%d\n",
+                         slot, history.size(), p.resident_blocks(), p.n_pool_blocks());
+            parked_[(size_t)slot] = ParkedSession{std::move(history), ++park_tick_, true, KvFlashResumeWait{}};
+            return;
+        }
+    }
     slots_.retire(slot);
 }
 

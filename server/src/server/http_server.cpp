@@ -3134,6 +3134,7 @@ bool HttpServer::parse_endpoint_request(
         const std::string & path, const json & body, ParsedRequest & req,
         bool & count_tokens_only) {
     count_tokens_only = false;
+    req.session = kvflash_resolve_session(req.headers, parse_session_id_from_body(body));   // who the conversation is: headers first, then the body
     if (path == "/v1/chat/completions") {
         req.format = ApiFormat::OPENAI_CHAT;
         req.response_id = generate_id("chatcmpl");
@@ -3591,6 +3592,7 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
                  hr.path.c_str(), hr.body.size());
 
     ParsedRequest req;
+    req.headers = hr.headers;
     bool count_tokens_only = false;
     // "claude-cli/2.1.317 (external, cli)" -> "claude-cli".
     // The User-Agent's product token, kept to token characters (RFC 9110)
@@ -3606,6 +3608,10 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
         req.output_format = http_detail::request_output_format(hr.body);
         if (!parse_endpoint_request(
                 hr.path, req.raw_body, req, count_tokens_only)) return false;
+        if (!kvflash_identity_valid(req.session)) {   // a session id the engine could not hold
+            send_error(fd, 400, "session id is longer than " + std::to_string(kKvFlashSidMax) + " bytes");
+            return true;
+        }
         if (hr.body.find("\"tools\"") != std::string::npos) {
             // json sorts object keys; the prompt shows tools as the client wrote them.
             const auto ordered = nlohmann::ordered_json::parse(hr.body, nullptr, false);
@@ -3852,12 +3858,23 @@ bool create_socket_pair(SocketHandle pair[2]) {
 
 }  // namespace
 
+ParsedRequest HttpServer::make_inner_request(const KvFlashHeaders * headers, const json & request) {
+    ParsedRequest inner;
+    if (headers) inner.headers = *headers;   // the session identity is resolved from them
+    bool count_only = false;
+    inner.raw_body = request;
+    inner.output_format = http_detail::request_output_format(request.dump());
+    parse_endpoint_request("/v1/chat/completions", inner.raw_body, inner, count_only);
+    return inner;
+}
+
 bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * admission,
                                        int & status, std::string & body,
                                        SocketHandle client_fd, bool * dropped_tool_call,
                                        bool note_pass,
                                        const nlohmann::ordered_json * ordered_tools,
-                                       const std::string & client) {
+                                       const std::string & client,
+                                       const KvFlashHeaders * headers) {
     SocketHandle pair[2];
     if (!create_socket_pair(pair)) {
         status = 500;
@@ -3890,11 +3907,7 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
     });
     RoutingAdmission outcome = RoutingAdmission::handled;
     try {
-        ParsedRequest inner;
-        bool count_only = false;
-        inner.raw_body = request;
-        inner.output_format = http_detail::request_output_format(request.dump());
-        parse_endpoint_request("/v1/chat/completions", inner.raw_body, inner, count_only);
+        ParsedRequest inner = make_inner_request(headers, request);
         inner.client = client;
         auto dropped = std::make_shared<bool>(false);
         inner.dropped_tool_call_out = dropped;
@@ -3956,7 +3969,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         std::string raw;
         bool dropped_here = false;
         if (!inner_chat_completion(body, nullptr, status, raw, fd, &dropped_here,
-                                   /*note_pass=*/true, &req.ordered_tools, req.client) ||
+                                   /*note_pass=*/true, &req.ordered_tools, req.client, &req.headers) ||
             status != 200) {
             return false;
         }
@@ -3969,7 +3982,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
     std::string raw;
     bool dropped_call = false;
     if (!inner_chat_completion(request, admission, status, raw, fd, &dropped_call,
-                               /*note_pass=*/false, &req.ordered_tools, req.client)) {
+                               /*note_pass=*/false, &req.ordered_tools, req.client, &req.headers)) {
         return true;
     }
     json response = json::parse(raw, nullptr, false);
@@ -7677,6 +7690,7 @@ bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
         out.path = out.path.substr(0, q);
     }
     out.query = std::move(query_string);
+    out.headers = kvflash_parse_headers(std::string_view(buf).substr(line_end + 1, (size_t)hend - line_end - 1));
 
     // Find Content-Length.
     long content_length = 0;

@@ -108,6 +108,18 @@ public:
     SeqEngine::AdmitResult admit(uint64_t request_id,
                                  const std::vector<int32_t> & prompt,
                                  const SamplerCfg & sampler);
+    // Sticky sessions (KVFlash): admit into this inactive slot with the
+    // first resume_pos prompt tokens already in its KV (the pool resumes the
+    // slot; it must have been parked at that length). resume_pos 0 is a cold
+    // admission into a chosen slot.
+    SeqEngine::AdmitResult admit_at(int slot, uint64_t request_id,
+                                    const std::vector<int32_t> & prompt,
+                                    const SamplerCfg & sampler, int resume_pos);
+    // Park a decoded slot: its KV stays with the pool (SlotKv::park), its fed
+    // tokens come back as the session's history, the slot becomes inactive.
+    // False (nothing changes) unless the slot is decoding with no staged
+    // tokens and a history that matches its position.
+    bool park(int slot, std::vector<int32_t> & history);
 
     struct PrefillChunk {
         bool ok = false;
@@ -200,6 +212,9 @@ public:
     const SeqSlot & slot(int i) const { return slots_[(size_t)i]; }
 
 private:
+    SeqEngine::AdmitResult admit_in_(int slot, uint64_t request_id,
+                                     const std::vector<int32_t> & prompt,
+                                     const SamplerCfg & sampler, int resume_pos);
     // Logical extent whose block count includes the sequence's current pages
     // plus one future page, capped at max_ctx.
     uint32_t decode_headroom_capacity(int logical_tokens) const;

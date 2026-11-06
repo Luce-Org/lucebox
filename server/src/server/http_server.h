@@ -17,6 +17,7 @@
 #include "client_send_buffer.h"
 #include "common/model_backend.h"
 #include "common/concurrency/paged_kv_offload.h"
+#include "common/kvflash_session_store.h"
 #include "common/output_constraint.h"
 #include "common/spec_acceptance.h"
 #include "tokenizer.h"
@@ -641,6 +642,10 @@ struct ParsedRequest {
     std::string               session_id;
     // The client: the User-Agent's product token (e.g. "claude-cli").
     std::string               client;
+    // KVFlash 2.0 sessions: the request's lower-cased headers, and the identity they and the body
+    // (session_id) name: who the conversation is. Both empty: the request is anonymous.
+    KvFlashHeaders            headers;
+    KvFlashSessionId          session;
     std::string               pflash_query;   // explicit scorer query text (optional request field)
     // Literal strings inside the boundary message that must survive
     // compression (e.g. an answer-format directive embedded in a user
@@ -832,7 +837,11 @@ private:
                                bool * dropped_tool_call = nullptr,
                                bool note_pass = false,
                                const nlohmann::ordered_json * ordered_tools = nullptr,
-                               const std::string & client = {});
+                               const std::string & client = {},
+                               const KvFlashHeaders * headers = nullptr);
+    // An inner request of `request`: parsed as a chat completion, with the outer request's headers
+    // so it resolves the same session identity.
+    ParsedRequest make_inner_request(const KvFlashHeaders * headers, const json & request);
     json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the
@@ -1010,6 +1019,7 @@ private:
         std::string method;
         std::string path;
         std::string query;  // raw query string (after '?')
+        KvFlashHeaders headers;  // lower-cased names, first value of a duplicate
         std::string body;
         std::string user_agent;
     };

@@ -27,6 +27,9 @@ public:
     virtual PagedKvStatus rollback_append(PagedKvSequenceHandle handle, uint32_t token_count) = 0;
     virtual PagedKvStatus clear(PagedKvSequenceHandle handle) = 0;
     virtual PagedKvStatus release(PagedKvSequenceHandle handle) = 0;
+    // Sticky sessions (KVFlash): keep the sequence's KV for a later resume
+    // at the same slot. Pools without sessions release.
+    virtual PagedKvStatus park(PagedKvSequenceHandle handle) { return release(handle); }
     virtual PagedKvStatus owned_block_count(PagedKvSequenceHandle handle, uint32_t & out_count) const = 0;
 };
 

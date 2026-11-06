@@ -25,7 +25,9 @@
 #include "common/concurrency/seq_engine.h"
 #include "common/concurrency/kvflash_slot_kv.h"
 #include "common/concurrency/paged_kv_offload.h"
+#include "common/kvflash_admit_plan.h"
 #include "common/kvflash_engine_step.h"
+#include "common/kvflash_session_store.h"
 #include "common/kvflash_slot_turn.h"
 #include "common/kvflash_step_driver.h"
 #include "common/dflash_draft_kv.h"
@@ -278,9 +280,31 @@ private:
         double score_ms = 0.0;       // mode 5: the drafter's time for `scores`
         SlotStateSnapshot snap;
         bool snap_ok = false;
+        bool tainted = false;        // in a failed step cohort: never parked
     };
     std::vector<SlotRecall> recall_;
     bool recall_on_ = false;                          // the recall profile is on for the slot engine
+    // Sticky sessions (LUCE_KVFLASH_SLOT_STICKY, on by default with KVFlash slots). A retired slot keeps its KV and
+    // recurrent state parked in place; a prompt that extends its history resumes it where it parked. The state is
+    // not copied, so a session resumes only at the end of its parked history (a prompt that diverges inside it, or
+    // equals it, runs cold).
+    struct ParkedSession {
+        std::vector<int32_t> history;    // the tokens its KV holds (== its cur_pos at park)
+        uint64_t tick = 0;
+        bool valid = false;
+        KvFlashResumeWait wait;          // a resume was refused busy: the retry resumes it again
+    };
+    std::vector<ParkedSession> parked_;
+    KvFlashSessionBook book_;                         // per slot: the session in it (client, sid)
+    uint64_t park_tick_ = 0;
+    bool sticky_on_ = false;
+    AdmitResult admit_sticky_(uint64_t request_id, const std::vector<int32_t> & prompt, const SamplerCfg & sampler,
+                              int64_t total, const AdmitMeta & meta);
+    void drop_session_(int slot, const char * why);   // forget the session: its KV, its reservation and its owner
+    int evict_oldest_(const char * why, int keep = -1);   // the oldest parked session (but `keep`) that can be evicted: its slot, -1 when none
+    std::vector<bool> active_slots_() const;          // which slots decode a request now
+    std::vector<KvFlashOwnedSession> parked_list_() const;   // every parked session with its owner
+    bool begin_resume_(int slot);                     // residency to the recent state before the turn's first pass
     std::vector<int> pending_rewind_;                 // slots whose first pass ended this step
     int capture_rows_ = 0;                            // query rows the graph captured this step
     void plan_slot_turn_(int slot, const std::vector<int32_t> & prompt, int kv_offset);

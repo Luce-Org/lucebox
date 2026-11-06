@@ -598,7 +598,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             : engine.admit_bounded(
                   next_request_id, req.prompt_tokens, req.sampler,
                   (std::min)(n_gen_cap, engine.max_context() -
-                                            (int)req.prompt_tokens.size() + 1));
+                                            (int)req.prompt_tokens.size() + 1),
+                  SeqEngine::AdmitMeta{req.session.sid, req.session.client});
 
         const PrefixStoreAdmission & prefix = ar.prefix_store;
         const std::string prefix_protocol_error = kv_cache_.admitted(

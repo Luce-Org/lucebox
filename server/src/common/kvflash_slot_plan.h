@@ -156,6 +156,13 @@ public:
         }
         return v;
     }
+    // What admit() would answer for a request that holds no reservation yet, charging nothing.
+    KvFlashAdmit would_admit_new(KvFlashAdmitInput in) const {
+        in.host_budget_bytes = budget_;
+        in.transient_reserve_bytes = transient_;
+        in.host_used_bytes = used_;
+        return kvflash_admit(in);
+    }
     void release(uint64_t request_id) {   // idempotent
         const auto it = reserved_.find(request_id);
         if (it == reserved_.end()) return;
@@ -164,6 +171,7 @@ public:
     }
     int64_t used_bytes() const { return used_; }
     int64_t budget_bytes() const { return budget_; }
+    int64_t reserved_of(uint64_t request_id) const { const auto it = reserved_.find(request_id); return it == reserved_.end() ? 0 : it->second; }
 
 protected:   // the test fixture counts reservations
     int64_t budget_, transient_, used_ = 0;
