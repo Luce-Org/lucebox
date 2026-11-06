@@ -4577,7 +4577,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_BF16 ||
              V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0 ||
              V->type == GGML_TYPE_TQ3_0);
-        // Route TQ3_0 through CHUNKED except for the narrow CUDA VEC case below.
+        // Route TQ3_0 through CHUNKED except for the narrow VEC case below.
         // CHUNKED has the general TQ3 contract: dequant K/V to f32 in compressed
         // (rotated) domain, attend with graph-rotated Q, return rotated O for
         // the graph to inverse-rotate.
@@ -4591,12 +4591,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             (Q->ne[0] % 64 == 0) && (K->ne[1] % FATTN_KQ_STRIDE == 0);
         const bool tq3_needs_chunked = tq3_any && !tq3_can_vec;
         if ((chunked_threshold > 0 && K->ne[1] > chunked_threshold) || tq3_needs_chunked) {
-            // On HIP TQ3 has no VEC kernel, so tq3_needs_chunked is always true
-            // and CHUNKED is the only TQ3 route. The qwen35 decode graph passes
-            // no causal mask for single-query attention, and fattn-chunked
-            // handles a null mask (mask_stride 0), so only the optional
-            // LUCE_CHUNKED_THRESHOLD route keeps the mask requirement.
-            const bool chunked_mask_ok = tq3_needs_chunked ? true : mask != nullptr;
+            // TQ3 shapes that VEC cannot take use CHUNKED. The qwen35 decode graph
+            // passes no causal mask for a single query, and fattn-chunked reads a
+            // null mask as no masking, so a maskless single-query TQ3 call may use
+            // CHUNKED. Multi-token calls still need the mask: without it CHUNKED
+            // skips whole future KV chunks but attends all of the boundary chunk.
+            const bool chunked_mask_ok = mask != nullptr || (tq3_needs_chunked && Q->ne[1] == 1);
             if (Q->type == GGML_TYPE_F32 && kv_supported && chunked_mask_ok) {
                 return BEST_FATTN_KERNEL_CHUNKED;
             }
