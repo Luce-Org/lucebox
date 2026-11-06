@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <set>
 #include <utility>
 
 using namespace luce::common;
@@ -287,6 +289,83 @@ static void memory(ggml_backend_t backend) {
     free_qwen4exp_cache(c);
 }
 
+// KVFlash: a pooled cache's rows, masks and snapshots. While the context fits the pool the rows are the plain cache's;
+// past it, positions page out least recently used first (the sink chunk stays), a forward's own rows all stay
+// resident, masks follow the position each slot holds, and a relocated prefix publishes no snapshot while a restore
+// lands identity-mapped.
+static void kvflash(ggml_backend_t backend) {
+    constexpr int pool = 512;
+    Qwen4ExpCache c;
+    c.max_ctx = 4096;
+    c.ctx = ggml_init({16 * ggml_tensor_overhead(), nullptr, true});
+    auto kv = [&]() { return ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, 8, pool, 2); };
+    c.attn_k = {kv(), kv()}; c.attn_v = {kv(), kv()};
+    c.indexer_raw = c.indexer_k = {nullptr, nullptr};   // a pooled cache attends densely
+    c.ssm_state = {ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, 4, 4, 2)};
+    c.conv_state = {ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 3, 16)};
+    c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, backend);
+    CHECK(c.buf);
+    ggml_backend_buffer_clear(c.buf, 0);
+    KvFlashConfig cfg;
+    cfg.pool_tokens = pool;
+    c.kvflash = std::make_unique<KvFlashPager>();
+    c.kvflash->set_pinned_host_backing(false);
+    CHECK(c.kvflash->attach(cfg, c.attn_k, c.attn_v));
+
+    CHECK(qwen4exp_attn_cap(c) == pool);
+    CHECK(qwen4exp_attn_rows(c, 100) == 100 && qwen4exp_attn_rows(c, 4000) == pool);
+    CHECK(qwen4exp_max_forward_rows(c) == pool - 128);
+    CHECK(!qwen4exp_kvflash_reserve(c, 0, pool - 127));   // it would page out its own first chunk
+    // The plain cache: the K/V rows are the positions.
+    Qwen4ExpCache plain;
+    plain.max_ctx = c.max_ctx;
+    CHECK(qwen4exp_kv_row(plain, 77) == 77 && qwen4exp_attn_rows(plain, 4000) == 4000);
+    auto mask = [](const Qwen4ExpCache & cache, int64_t cols, int64_t q) {
+        std::vector<ggml_fp16_t> m((size_t) cols);
+        qwen4exp_causal_mask(cache, m.data(), cols, q);
+        return m;
+    };
+    // Identity while the context fits.
+    CHECK(qwen4exp_kvflash_reserve(c, 0, 300));
+    for (int p = 0; p < 300; ++p) CHECK(qwen4exp_kv_row(c, p) == p);
+    for (int q : {0, 63, 64, 299}) CHECK(mask(c, 300, q) == mask(plain, 300, q));
+    for (auto * t : c.attn_k) ggml_backend_tensor_memset(t, 0x3c, 0, 300 * t->nb[1]);   // F16 1.0 on head 0's rows
+    c.cur_pos = 300;
+    Qwen4ExpSnapshot s, relocated;
+    CHECK(save_qwen4exp_snapshot(backend, backend, c, s));
+    // The pooled strips stop at the pool; the snapshot sizes say so.
+    CHECK(qwen4exp_snapshot_bytes(backend, c, c.max_ctx) == qwen4exp_snapshot_bytes(backend, c, pool));
+    CHECK(qwen4exp_snapshot_bytes(backend, c, pool) > qwen4exp_snapshot_bytes(backend, c, pool - 64));
+
+    // Decode past the pool; then a 300-row forward keeps all of its rows resident at once.
+    for (int p = 300; p < 2000; ++p) CHECK(qwen4exp_kvflash_reserve(c, p, 1));
+    CHECK(qwen4exp_kvflash_reserve(c, 2000, 300));
+    c.cur_pos = 2300;
+    CHECK(c.kvflash->stats().page_outs > 0);
+    std::set<int32_t> rows;
+    for (int p = 2000; p < 2300; ++p) CHECK(qwen4exp_kv_row(c, p) >= 0 && rows.insert(qwen4exp_kv_row(c, p)).second);
+    std::set<int32_t> held;
+    for (int32_t pos : c.kvflash_slot_pos) if (pos >= 0) CHECK(held.insert(pos).second);
+    CHECK(qwen4exp_kv_row(c, 0) == 0 && qwen4exp_kv_row(c, 63) == 63);   // the sink chunk
+    CHECK(qwen4exp_kv_row(c, 64) < 0);                                    // the oldest chunk past it
+    const auto m = mask(c, qwen4exp_attn_rows(c, 2300), 2100);
+    for (size_t slot = 0; slot < m.size(); ++slot) {
+        const int32_t pos = c.kvflash_slot_pos[slot];
+        CHECK((m[slot] == ggml_fp32_to_fp16(0.0f)) == (pos >= 0 && pos <= 2100));
+    }
+    CHECK(!save_qwen4exp_snapshot(backend, backend, c, relocated));
+    CHECK(restore_qwen4exp_snapshot(backend, s, c));
+    CHECK(c.cur_pos == 300 && c.kvflash->is_identity() && c.kvflash->stats().host_bytes == 0);
+    for (int p = 0; p < 300; ++p) CHECK(qwen4exp_kv_row(c, p) == p);
+    for (auto [live, copy] : s.strips) CHECK(bytes(live) == bytes(copy));
+    reset_qwen4exp_state(backend, c);
+    CHECK(qwen4exp_kv_row(c, 0) < 0);
+    free_qwen4exp_snapshot(s);
+    free_qwen4exp_cache(c);
+    CHECK(!c.kvflash);
+    std::puts("PASS KVFlash pooled rows: identity fit, LRU paging past the pool, slot-space masks, snapshot guard");
+}
+
 // expert_gpu >= 0 runs split mode (the routed experts on that GPU), with the hot experts of `placement` if given.
 static void model(const char * path, int width, int chunk, int ctx, int expert_gpu, const char * placement) {
     Qwen4ExpBackendConfig cfg;
@@ -503,6 +582,7 @@ int main(int argc, char ** argv) {
     if (store != backend) copies(backend, store);
     free_snapshot_backend(store, backend);
     memory(backend);
+    kvflash(backend);
     ggml_backend_free(backend);
     // test_qwen4exp_prefix_cache MODEL [width] [chunk] [ctx] [expert_gpu] [placement.csv]
     if (argc > 1) model(argv[1], argc > 2 ? std::atoi(argv[2]) : 0,
