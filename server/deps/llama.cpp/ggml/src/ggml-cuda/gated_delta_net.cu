@@ -1,7 +1,9 @@
 #include "gated_delta_net.cuh"
+#include "ggml-cuda-gdn-chain.h"
 #ifndef GGML_USE_HIP
 #include <cuda_fp16.h>
 #endif
+#include <atomic>
 #include <cstdlib>
 
 static thread_local size_t g_gdn_scalar_launch_count = 0;
@@ -39,6 +41,39 @@ static bool gdn_grouped_cols_supported(int device) {
 
 extern "C" bool ggml_backend_cuda_supports_gdn_grouped_cols(int device) {
     return gdn_grouped_cols_supported(device);
+}
+
+// Tests only (ggml_backend_cuda_set_gdn_route_override): -1 lets the device
+// pick the scalar or grouped-cols kernel, 0 pins scalar, 1 pins grouped-cols.
+static std::atomic<int> g_gdn_route_override{-1};
+
+extern "C" int ggml_backend_cuda_set_gdn_route_override(int route) {
+    return g_gdn_route_override.exchange(route < 0 ? -1 : (route > 0 ? 1 : 0));
+}
+
+// The scalar/grouped-cols choice for a device of compute capability cc, where
+// the grouped-cols kernel applies: grouped-cols everywhere except Ampere,
+// where the scalar kernel is faster.
+static bool gdn_prefers_grouped_cols(int cc) {
+    const int pinned = g_gdn_route_override.load(std::memory_order_relaxed);
+    if (pinned >= 0) {
+        return pinned == 1;
+    }
+    const bool ampere_nvidia = GGML_CUDA_CC_IS_NVIDIA(cc)
+                            && cc >= GGML_CUDA_CC_AMPERE
+                            && cc <  GGML_CUDA_CC_ADA_LOVELACE;
+    return !ampere_nvidia;
+}
+
+// SINGLE_REPLAY (ggml-cuda-gdn-chain.h): the route
+// launch_gated_delta_net takes for a non-KDA, non-tree op with a replay log
+// (which rules out its RDNA3.5 prefill branch): take_grouped_cols there.
+// Keep the two in step.
+extern "C" bool ggml_backend_cuda_gdn_chain_uses_grouped_cols(int device, int64_t S_v) {
+    if (S_v != 128 || !gdn_grouped_cols_supported(device)) {
+        return false;
+    }
+    return gdn_prefers_grouped_cols(ggml_cuda_info().devices[device].cc);
 }
 
 // Tree-mode parent index sentinel: a node whose parent is the pre-block state
@@ -1152,9 +1187,6 @@ static void launch_gated_delta_net(
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
     int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const bool ampere_nvidia = GGML_CUDA_CC_IS_NVIDIA(cc)
-                            && cc >= GGML_CUDA_CC_AMPERE
-                            && cc <  GGML_CUDA_CC_ADA_LOVELACE;
     // Prefill recurrence (row-split, or tiled with LUCE_GDN_LEGACY=1): chain
     // path only, S_v=128 GDA at T>1 on RDNA3.5. Excludes tree, mapped verify,
     // intermediate capture, raw gates and multi-sequence batches, which the
@@ -1165,10 +1197,9 @@ static void launch_gated_delta_net(
         replay_log_d == nullptr && gate_bias == nullptr && gate_A == nullptr &&
         state_out_d != nullptr && n_seqs == 1 && S_v == 128 && H == 48 &&
         GGML_CUDA_CC_IS_RDNA3_5(cc) && n_tokens >= 2 && n_tokens <= 32768 &&
-        // Explicit route overrides win: the qualification test pins scalar or
-        // grouped_cols via these, so the tiled path must not shadow them.
-        getenv("LUCE_GDN_FORCE_GROUPED_COLS") == nullptr &&
-        getenv("LUCE_GDN_NO_GROUPED_COLS") == nullptr) {
+        // A pinned route wins: the qualification test pins scalar or
+        // grouped_cols, so the tiled path must not shadow them.
+        g_gdn_route_override.load(std::memory_order_relaxed) < 0) {
         static const bool legacy = getenv("LUCE_GDN_LEGACY") != nullptr;
         if (legacy) {
             ++g_gdn_tiled_launch_count;
@@ -1180,11 +1211,8 @@ static void launch_gated_delta_net(
         return;
     }
 
-    const bool force_grouped_cols = getenv("LUCE_GDN_FORCE_GROUPED_COLS") != nullptr;
-    const bool disable_grouped_cols = getenv("LUCE_GDN_NO_GROUPED_COLS") != nullptr;
-    const bool use_grouped_cols = force_grouped_cols ||
-        (!disable_grouped_cols && !ampere_nvidia);
-    const bool take_grouped_cols = S_v == 128 && !KDA && use_grouped_cols &&
+    // ggml_backend_cuda_gdn_chain_uses_grouped_cols mirrors this choice.
+    const bool take_grouped_cols = S_v == 128 && !KDA && gdn_prefers_grouped_cols(cc) &&
         gdn_grouped_cols_supported(ggml_cuda_get_device());
     if (take_grouped_cols) {
         ++g_gdn_grouped_cols_launch_count;

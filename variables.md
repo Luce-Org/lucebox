@@ -256,7 +256,6 @@ Untagged variables are operational tuning knobs.
 | `GGML_CUDA_BATCH_PEER_COPIES` | Batch ordered CUDA/HIP peer copies behind one dependency per source/destination pair. |
 | `LUCE_MMQ_FULL_BATCH_MIN` / `LUCE_MMQ_SUB_BATCH` | MMQ batch thresholds. |
 | `LUCE_CUDA_MMVQ_TOKENWISE` / `LUCE_CUDA_MMVQ_MOE_TOKENWISE` / `LUCE_CUDA_MMVQ_MOE_KERNEL` | MMVQ token-wise / MoE kernel selection. |
-| `LUCE_GDN_FORCE_GROUPED_COLS` / `LUCE_GDN_NO_GROUPED_COLS` | Gated-delta-net grouped-column control. |
 | `LUCE_NO_MASK` | 🐛 **debug** Disable attention masking (ablation). |
 
 ## Top-k kernels

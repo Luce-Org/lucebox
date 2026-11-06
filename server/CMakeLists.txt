@@ -1171,7 +1171,8 @@ if(LUCE_TESTS)
         test_kernel_qualification_core
         test_cuda_copy_batch
         test_uma_budget
-        test_mmq_tile_twin_gate)
+        test_mmq_tile_twin_gate
+        test_gdn_single_commit)
 
     # Standalone check of the DS4 MIX histogram fitter: reuses the converter
     # source with its main() renamed away, so it needs the converter's
@@ -1203,6 +1204,13 @@ if(LUCE_TESTS)
     # no GPU.
     add_executable(test_mmq_tile_twin_gate test/unit/test_mmq_tile_twin_gate.cpp)
     target_include_directories(test_mmq_tile_twin_gate PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+
+    # GDN single commit bookkeeping (qwen35/gdn_single_commit.h):
+    # header-only, no GPU (ggml.h only for the ggml_tensor layout).
+    add_executable(test_gdn_single_commit test/unit/test_gdn_single_commit.cpp)
+    target_include_directories(test_gdn_single_commit PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
 
     # Header-only platform shims must remain independently buildable and
@@ -2647,6 +2655,52 @@ if(LUCE_TESTS)
         list(APPEND _raw_unit_test_targets test_delta_net_specla)
     endif()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_gdn_single_commit_gpu.cpp")
+        # GDN single commit GPU checks (qwen35/gdn_single_commit.h): GDN final
+        # state == last F32 checkpoint, and Qwen35DFlashTarget's committed state
+        # with each set of parts on, each run checked against the off run's
+        # digest. Exits 77 (ctest SKIP) when no GPU is present.
+        add_executable(test_gdn_single_commit_gpu test/unit/test_gdn_single_commit_gpu.cpp)
+        target_include_directories(test_gdn_single_commit_gpu PRIVATE
+            ${LUCE_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_gdn_single_commit_gpu PRIVATE
+            luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
+        set(_gdn_commit_digest "${CMAKE_CURRENT_BINARY_DIR}/gdn_single_commit_gpu.digest")
+        add_test(NAME gdn_single_commit_gpu_off
+            COMMAND test_gdn_single_commit_gpu --parts off --digest-out ${_gdn_commit_digest})
+        set_tests_properties(gdn_single_commit_gpu_off PROPERTIES
+            LABELS gpu SKIP_RETURN_CODE 77
+            FIXTURES_SETUP gdn_single_commit_gpu_digest)
+        foreach(_gdn_parts k ks kr ksr)
+            add_test(NAME gdn_single_commit_gpu_${_gdn_parts}
+                COMMAND test_gdn_single_commit_gpu --parts ${_gdn_parts}
+                        --digest-expect ${_gdn_commit_digest})
+            set_tests_properties(gdn_single_commit_gpu_${_gdn_parts} PROPERTIES
+                LABELS gpu SKIP_RETURN_CODE 77
+                FIXTURES_REQUIRED gdn_single_commit_gpu_digest)
+        endforeach()
+        unset(_gdn_parts)
+        unset(_gdn_commit_digest)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_gdn_single_replay_gpu.cpp")
+        # SINGLE_REPLAY GPU check and microbench
+        # (ggml-cuda-gdn-chain.h) on the production shape (48 v-heads, S_v 128,
+        # 16 tokens): the mapped verify's attention output == the checkpoint
+        # verify's, the replay commit == intermediate[commit_n - 1] bit for bit
+        # for commit_n 1..16 (in place and out of place, 1 and 48 layers),
+        # then the commit time per layer, reported (the 40 us budget gates
+        # only with --budget). Exits 77 (ctest SKIP) without a GPU.
+        add_executable(test_gdn_single_replay_gpu test/unit/test_gdn_single_replay_gpu.cpp)
+        target_include_directories(test_gdn_single_replay_gpu PRIVATE
+            ${LUCE_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_gdn_single_replay_gpu PRIVATE
+            luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
+        add_test(NAME gdn_single_replay_gpu COMMAND test_gdn_single_replay_gpu)
+        set_tests_properties(gdn_single_replay_gpu PROPERTIES
+            LABELS gpu SKIP_RETURN_CODE 77)
+    endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_server_unit.cpp")
         set(_server_unit_sources
             test/unit/test_unit_main.cpp
@@ -2683,6 +2737,9 @@ if(LUCE_TESTS)
             test/unit/test_restore_bounds.cpp
             test/unit/test_chain_rollback_policy.cpp
             test/unit/test_qwen35_ar_input_order.cpp
+            test/unit/test_qwen35_keep_base_graph.cpp
+            test/unit/test_qwen35_swap_snapshot_cache.cpp
+            test/unit/test_qwen35_single_replay_graph.cpp
             test/unit/test_sampled_verify.cpp
             test/unit/test_ddtree_tau.cpp
             test/unit/test_anchor_transitive.cpp
@@ -2969,7 +3026,8 @@ if(LUCE_TESTS)
         test_cuda_copy_batch
         test_qn_split_fusions
         test_uma_budget
-        test_mmq_tile_twin_gate)
+        test_mmq_tile_twin_gate
+        test_gdn_single_commit)
     foreach(_cppunit_target IN LISTS _new_cppunit_test_targets)
         if(TARGET ${_cppunit_target})
             target_sources(${_cppunit_target} PRIVATE test/unit/test_unit_main.cpp)

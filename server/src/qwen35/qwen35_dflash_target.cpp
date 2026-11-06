@@ -9,12 +9,15 @@
 #include "common/geometric_draft_topk_cuda.h"
 #include "common/specla_commit_cuda.h"
 #include "ggml-backend-impl.h"
+#include "ggml-cuda.h"            // ggml_backend_cuda_get_device_id
+#include "ggml-cuda-gdn-chain.h"  // SINGLE_REPLAY commit
 // gpu_runtime_compat.h maps the raw cudaStream_t / cudaMemcpy* symbols used
 // below (rollback_to / rollback_to_tree) onto their HIP equivalents. Without
 // it the file only compiles on CUDA via a transitive <cuda_runtime.h>; HIP
 // builds (e.g. gfx1151) fail with "cudaStream_t undeclared".
 #include "common/gpu_runtime_compat.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -216,8 +219,183 @@ bool copy_meta_recurrent_state(const std::vector<ggml_tensor *> & ssm_source,
 
 }  // namespace
 
+gdn_commit::PathFacts Qwen35DFlashTarget::gdn_path_facts() const {
+    gdn_commit::PathFacts f;
+    f.fast_rollback = fast_rollback_;
+    f.kvflash = pager_ != nullptr;
+    f.specla = specla_active();
+    f.n_seq_slots = cache_.n_seq_slots;
+    f.bailingmoe3 = w_.is_bailingmoe3;
+    f.moe = w_.is_moe;
+    f.ddtree = ddtree_mode_;
+    const size_t n = cache_.ssm_state.size();
+    f.have_state = n > 0 && cache_.ssm_intermediate.size() == n;
+    f.intermediates_f32 = true;
+    for (size_t i = 0; f.have_state && i < n; ++i) {
+        const ggml_tensor * state = cache_.ssm_state[i];
+        const ggml_tensor * inter = cache_.ssm_intermediate[i];
+        if (!state || !state->buffer || !inter) {
+            f.have_state = false;
+            break;
+        }
+        if (state->type != GGML_TYPE_F32 || inter->type != GGML_TYPE_F32) {
+            f.intermediates_f32 = false;
+        }
+    }
+    f.tensor_parallel = f.have_state && is_meta_tensor(cache_.ssm_state.front());
+    return f;
+}
+
+bool Qwen35DFlashTarget::gdn_keep_base_verify(bool capture_requested,
+                                                bool do_capture,
+                                                int n_tokens) const {
+    if (!gdn_commit::parts().keep_base || !capture_requested) return false;
+    if (gdn_commit::keep_base_block_reason(gdn_path_facts())) return false;
+    return gdn_commit::keep_base_verify(true, do_capture, n_tokens);
+}
+
+void Qwen35DFlashTarget::gdn_drop_uncommitted(const char * where) {
+    if (!gdn_book_.commit_pending) return;
+    gdn_commit::drop_pending(gdn_book_);
+    static std::atomic<bool> once{false};
+    if (!once.exchange(true)) {
+        std::fprintf(stderr,
+            "[qwen35] warning: a keep-base chain verify (GDN single commit) "
+            "reached %s without rollback_to or restore_kv; its state is "
+            "dropped\n",
+            where);
+        std::fflush(stderr);
+    }
+}
+
+// The pairs (ssm_state[i], ssm_state_snap[i]) can trade storage: plain,
+// same-layout tensors in buffers of one type (the snapshot copies' layout
+// check, plus no views), and conv pairs the snapshot still copies.
+bool Qwen35DFlashTarget::gdn_pairs_exchangeable() const {
+    const size_t n = cache_.ssm_state.size();
+    if (n == 0 || cache_.ssm_state_snap.size() != n ||
+        cache_.conv_state.size() != n || cache_.conv_state_snap.size() != n) {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const ggml_tensor * s = cache_.ssm_state[i];
+        const ggml_tensor * p = cache_.ssm_state_snap[i];
+        const ggml_tensor * c = cache_.conv_state[i];
+        const ggml_tensor * cp = cache_.conv_state_snap[i];
+        if (!s || !p || !c || !cp) return false;
+        if (s->view_src || p->view_src || !s->buffer || !p->buffer ||
+            !s->data || !p->data ||
+            s->type != p->type || !ggml_are_same_shape(s, p) ||
+            !ggml_are_same_stride(s, p) ||
+            ggml_backend_buffer_get_type(s->buffer) !=
+                ggml_backend_buffer_get_type(p->buffer) ||
+            c->type != cp->type || !ggml_are_same_shape(c, cp) ||
+            !ggml_are_same_stride(c, cp)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Qwen35DFlashTarget::gdn_swap_snapshot() const {
+    if (!gdn_commit::parts().swap_snapshot) return false;
+    const bool keep_base_on = gdn_commit::parts().keep_base;
+    const gdn_commit::PathFacts facts = gdn_path_facts();
+    return gdn_commit::swap_snapshot_block_reason(
+               keep_base_on, facts,
+               keep_base_on && !gdn_commit::keep_base_block_reason(facts) &&
+                   gdn_pairs_exchangeable()) == nullptr;
+}
+
+void Qwen35DFlashTarget::gdn_materialize_snapshot() {
+    if (!gdn_book_.snapshot_deferred) return;
+    for (size_t i = 0; i < cache_.ssm_state.size(); i++) {
+        if (!cache_.ssm_state[i]) continue;
+        ggml_backend_tensor_copy_async(
+            backend_, backend_, cache_.ssm_state[i], cache_.ssm_state_snap[i]);
+    }
+    ggml_backend_synchronize(backend_);
+    gdn_commit::materialized(gdn_book_);
+}
+
+ggml_tensor * Qwen35DFlashTarget::gdn_replay_slot_map() {
+    if (gdn_slot_ids_) return gdn_slot_ids_;
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead();
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return nullptr;
+    ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_name(ids, "gdn_single_replay_slot");
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend_);
+    if (!buf) {
+        ggml_free(ctx);
+        return nullptr;
+    }
+    const int32_t slab = 0;
+    ggml_backend_tensor_set(ids, &slab, 0, sizeof(slab));
+    gdn_slot_ctx_ = ctx;
+    gdn_slot_buf_ = buf;
+    gdn_slot_ids_ = ids;
+    return ids;
+}
+
+ggml_tensor * Qwen35DFlashTarget::gdn_single_replay_ids(int n_tokens) {
+    if (!gdn_commit::parts().single_replay) return nullptr;
+    gdn_commit::ReplayFacts r;
+    r.n_tokens = n_tokens;
+    const int64_t head_v_dim = w_.ssm_dt_rank > 0 ? w_.ssm_d_inner / w_.ssm_dt_rank : 0;
+    r.grouped_cols = ggml_backend_cuda_gdn_chain_uses_grouped_cols(
+        ggml_backend_cuda_get_device_id(backend_), head_v_dim);
+    r.slot_map = r.grouped_cols && n_tokens <= gdn_commit::kSingleReplayMaxTokens &&
+                 gdn_replay_slot_map() != nullptr;
+    if (gdn_commit::single_replay_block_reason(r)) return nullptr;
+    return gdn_slot_ids_;
+}
+
+bool Qwen35DFlashTarget::gdn_prepare_replay_commit(
+        const gdn_commit::RollbackPlan & plan, int q_len,
+        int64_t & S_v, int64_t & H) {
+    const size_t n = sg_.delta_captures.size();
+    if (n == 0 || cache_.ssm_state.size() != n ||
+        (plan.into_spare && cache_.ssm_state_snap.size() != n)) {
+        return false;
+    }
+    gdn_replay_layers_.resize(n);
+    for (size_t il = 0; il < n; ++il) {
+        const DeltaNetCapture & cap = sg_.delta_captures[il];
+        const ggml_tensor * log = cap.replay_log;
+        const ggml_tensor * live = cache_.ssm_state[il];
+        ggml_tensor * dst = plan.into_spare ? cache_.ssm_state_snap[il]
+                                            : cache_.ssm_state[il];
+        if (!log || !log->data || !live || !live->data || !dst || !dst->data ||
+            !cap.conv_input) {
+            return false;
+        }
+        const int64_t s = live->ne[0];
+        const int64_t h = live->ne[2];
+        if (il == 0) { S_v = s; H = h; }
+        if (s != S_v || h != H ||
+            live->type != GGML_TYPE_F32 || live->ne[1] != s || live->ne[3] != 1 ||
+            !ggml_is_contiguous(live) ||
+            dst->type != GGML_TYPE_F32 || !ggml_are_same_shape(dst, live) ||
+            !ggml_is_contiguous(dst) ||
+            log->type != GGML_TYPE_F32 || !ggml_is_contiguous(log) ||
+            log->ne[0] != 2 * s + 1 || log->ne[1] != h || log->ne[2] != q_len ||
+            log->ne[3] != 1) {
+            return false;
+        }
+        gdn_replay_layers_[il] = {
+            (const float *) log->data, (const float *) live->data, (float *) dst->data,
+        };
+    }
+    return true;
+}
+
 Qwen35DFlashTarget::~Qwen35DFlashTarget() {
     step_graph_destroy(proj_sg_);
+    if (gdn_slot_buf_) ggml_backend_buffer_free(gdn_slot_buf_);
+    if (gdn_slot_ctx_) ggml_free(gdn_slot_ctx_);
 }
 
 Qwen35DFlashTarget::Qwen35DFlashTarget(
@@ -265,6 +443,21 @@ bool Qwen35DFlashTarget::verify_batch(
     // skip capture under the pager so --ddtree + --kvflash doesn't fail verify.
     const bool do_capture = fast_rollback_ && capture_ssm_intermediates && pager_ == nullptr;
 
+    // KEEP_BASE (gdn_single_commit.h): this verify leaves ssm_state
+    // at its pre-verify value; rollback_to commits the intermediate.
+    const bool keep_base =
+        gdn_keep_base_verify(capture_ssm_intermediates, do_capture, n_tokens);
+    // SINGLE_REPLAY: that verify records the GDN replay log instead of the
+    // F32 checkpoints; rollback_to commits it.
+    ggml_tensor * replay_slot_ids =
+        keep_base ? gdn_single_replay_ids(n_tokens) : nullptr;
+    gdn_drop_uncommitted("verify_batch");
+    // SWAP_SNAPSHOT: any other verify writes the live state, which still
+    // holds the deferred pre-step snapshot; copy it out first.
+    if (gdn_commit::must_materialize(gdn_book_, keep_base)) {
+        gdn_materialize_snapshot();
+    }
+
     if (!build_target_step(sg_, w_, cache_, backend_,
                            /*kv_start=*/base_pos, n_tokens,
                            need_mask, /*capture=*/true,
@@ -278,7 +471,9 @@ bool Qwen35DFlashTarget::verify_batch(
                            /*n_seqs=*/1, /*seq_slot=*/0, /*paged_max_kv_len=*/0,
                            /*n_prefill_tokens=*/0, /*prefill_segments=*/nullptr,
                            /*n_prefill_segments=*/0, /*n_logits_rows=*/0,
-                           /*compact_slots=*/false, verify_top_n_)) {
+                           /*compact_slots=*/false, verify_top_n_,
+                           /*keep_base_ssm_state=*/keep_base,
+                           replay_slot_ids)) {
         std::fprintf(stderr, "verify_batch: build_target_step failed (base=%d n=%d)\n", base_pos, n_tokens);
         return false;
     }
@@ -357,6 +552,9 @@ bool Qwen35DFlashTarget::verify_batch(
         std::fprintf(stderr, "verify_batch: compute failed (status=%d)\n", (int)st);
         return false;
     }
+    if (keep_base) {
+        gdn_commit::on_keep_base_verify(gdn_book_, n_tokens, replay_slot_ids != nullptr);
+    }
 
     // Read argmax results from GPU.
     std::vector<int32_t> argmax_buf(n_tokens);
@@ -420,6 +618,8 @@ bool Qwen35DFlashTarget::verify_tree(
         std::vector<int32_t> & posterior_out,
         std::vector<float> * logits_out) {
     if (!fast_rollback_) return false;
+    gdn_drop_uncommitted("verify_tree");
+    gdn_materialize_snapshot();   // the tree graph writes the live state
     const int N        = n_alloc;                 // fixed alloc width (budget+1)
     const int N_actual = 1 + tree.n_nodes;        // real tree size incl. root
     if (N_actual <= 0 || N_actual > N || (int)flat_tokens.size() < N) return false;
@@ -586,6 +786,7 @@ bool Qwen35DFlashTarget::rollback_to_tree(
         const DDTree & tree,
         const std::vector<int> & accepted_dfs) {
     if (!fast_rollback_) return false;
+    gdn_materialize_snapshot();   // the tree commit writes the live state
     const int commit_n = (int)accepted_dfs.size();
     if (commit_n <= 0) return false;
 
@@ -874,6 +1075,8 @@ bool Qwen35DFlashTarget::rollback_to_tree(
 }
 
 bool Qwen35DFlashTarget::snapshot_kv() {
+    // SWAP_SNAPSHOT (gdn_single_commit.h): read on every call.
+    const bool swap = gdn_swap_snapshot();
     // SpecLA applies only the already-committed pending path to durable state
     // during verify; current candidates remain in the factor bank. There is
     // therefore no speculative durable mutation to snapshot or undo.
@@ -883,10 +1086,25 @@ bool Qwen35DFlashTarget::snapshot_kv() {
             cache_.ssm_state, cache_.conv_state,
             cache_.ssm_state_snap, cache_.conv_state_snap, backend_);
     }
+    gdn_drop_uncommitted("snapshot_kv");
+    gdn_commit::on_snapshot(gdn_book_, swap);
+    if (swap) {
+        // The conv history is still copied; the SSM snapshot is deferred, P
+        // stays in the live tensors. No host sync: every reader and writer
+        // of these copies runs on this stream or after a later synchronize.
+        for (size_t i = 0; i < cache_.ssm_state.size(); i++) {
+            if (!cache_.ssm_state[i]) continue;
+            ggml_backend_tensor_copy_async(
+                backend_, backend_, cache_.conv_state[i], cache_.conv_state_snap[i]);
+        }
+        return true;
+    }
     return snapshot_ssm_state(cache_, backend_);
 }
 
 bool Qwen35DFlashTarget::restore_kv() {
+    // Restoring discards the last verify, keep-base or not.
+    const gdn_commit::RestoreSsm restore_ssm = gdn_commit::plan_restore(gdn_book_);
     if (specla_active()) {
         // A successful SpecLA verify has already folded the *previous*
         // accepted factors into the durable state, while the factors produced
@@ -901,6 +1119,18 @@ bool Qwen35DFlashTarget::restore_kv() {
         return copy_meta_recurrent_state(
             cache_.ssm_state_snap, cache_.conv_state_snap,
             cache_.ssm_state, cache_.conv_state, backend_);
+    }
+    if (restore_ssm == gdn_commit::RestoreSsm::kKeepLive) {
+        // SWAP_SNAPSHOT: no verify wrote the live SSM state since the
+        // deferred snapshot, so it is P. Restore conv only; the snapshot stays
+        // deferred and the replay that may follow copies it out first.
+        for (size_t i = 0; i < cache_.ssm_state.size(); i++) {
+            if (!cache_.ssm_state[i]) continue;
+            ggml_backend_tensor_copy_async(
+                backend_, backend_, cache_.conv_state_snap[i], cache_.conv_state[i]);
+        }
+        ggml_backend_synchronize(backend_);
+        return true;
     }
     return restore_ssm_state(cache_, backend_);
 }
@@ -955,19 +1185,48 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
 
     // If all tokens accepted, the SSM state after processing all q_len tokens
     // is exactly what we want — no rollback needed, just fix cur_pos.
+    // KEEP_BASE: that verify left the SSM state unwritten, so the
+    // plan commits intermediate[commit_n-1] in every case (gdn_single_commit.h).
     const int q_len = cache_.cur_pos - base_pos;
-    if (commit_n >= q_len) {
+    const gdn_commit::RollbackPlan plan =
+        gdn_commit::plan_rollback(gdn_book_, commit_n, q_len);
+    if (!plan.valid) {
+        if (kFastRollbackDiag) {
+            std::fprintf(stderr,
+                "rollback_to: refused (keep-base pending=%d over %d tokens, "
+                "snapshot deferred=%d) q_len=%d\n",
+                (int)gdn_book_.commit_pending, gdn_book_.pending_q_len,
+                (int)gdn_book_.snapshot_deferred, q_len);
+        }
+        return false;
+    }
+    if (plan.shortcut) {
         cache_.cur_pos = base_pos + commit_n;
         return true;
     }
-    const int rollback_idx = commit_n - 1;  // index into per-step intermediates
+    const int rollback_idx = plan.ssm_index;  // index into per-step intermediates
     GGML_ASSERT(!cache_.ssm_state.empty());
     const bool meta_backend = is_meta_tensor(cache_.ssm_state.front());
     cudaStream_t stream = nullptr;
 
+    // SINGLE_REPLAY (gdn_single_commit.h): the verify wrote no
+    // checkpoints. Check every replay log and state before anything is
+    // written; the commit is launched after the conv copies below.
+    int64_t replay_S_v = 0;
+    int64_t replay_H = 0;
+    if (plan.from_replay &&
+        !gdn_prepare_replay_commit(plan, q_len, replay_S_v, replay_H)) {
+        if (kFastRollbackDiag) {
+            std::fprintf(stderr,
+                "rollback_to: replay log capture does not match the state "
+                "(q_len=%d)\n", q_len);
+        }
+        return false;
+    }
+
     for (int il = 0; il < n_delta; il++) {
         const DeltaNetCapture & cap = sg_.delta_captures[il];
-        if (!cap.ssm_intermediate_states) {
+        if (!plan.from_replay && !cap.ssm_intermediate_states) {
             if (kFastRollbackDiag) {
                 std::fprintf(stderr, "rollback_to: null ssm_intermediate_states layer=%d\n",
                              il);
@@ -981,7 +1240,8 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
             }
             return false;
         }
-        if (rollback_idx >= (int)cap.ssm_intermediate_states->ne[3]) {
+        if (!plan.from_replay &&
+            rollback_idx >= (int)cap.ssm_intermediate_states->ne[3]) {
             if (kFastRollbackDiag) {
                 std::fprintf(stderr,
                              "rollback_to: rollback_idx OOB rollback_idx=%d slots=%d layer=%d\n",
@@ -991,11 +1251,16 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
         }
 
         // SSM rollback: copy intermediate[rollback_idx] → cache.ssm_state[il]
+        // (SWAP_SNAPSHOT: into ssm_state_snap[il], exchanged below).
+        ggml_tensor * ssm_dst = plan.into_spare
+            ? cache_.ssm_state_snap[il] : cache_.ssm_state[il];
         const size_t ssm_elems =
             (size_t)cache_.ssm_state[il]->ne[0] *
             (size_t)cache_.ssm_state[il]->ne[1] *
             (size_t)cache_.ssm_state[il]->ne[2];
-        if (meta_backend) {
+        if (plan.from_replay) {
+            // SINGLE_REPLAY: committed from the replay log after this loop.
+        } else if (meta_backend) {
             if (!restore_meta_ssm_state_device(cap.ssm_intermediate_states,
                                                rollback_idx,
                                                cache_.ssm_state[il], backend_)) {
@@ -1013,7 +1278,7 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
             if (cap.ssm_intermediate_states->type == GGML_TYPE_F32) {
                 const size_t ssm_bytes = ssm_elems * sizeof(float);
                 const cudaError_t ce = cudaMemcpyAsync(
-                    cache_.ssm_state[il]->data, ssm_src, ssm_bytes,
+                    ssm_dst->data, ssm_src, ssm_bytes,
                     cudaMemcpyDeviceToDevice, stream);
                 if (ce != cudaSuccess) {
                     if (kFastRollbackDiag) {
@@ -1034,10 +1299,13 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
                     }
                     return false;
                 }
-                to_fp32(ssm_src, (float *)cache_.ssm_state[il]->data,
+                to_fp32(ssm_src, (float *)ssm_dst->data,
                          (int64_t)ssm_elems, stream);
             }
         }
+
+        // KEEP_BASE all-accepted: conv_state already holds the last window.
+        if (!plan.copy_conv) continue;
 
         // Conv rollback: copy conv_input[commit_n..commit_n+K-2, :, :]
         // into cache.conv_state[il].
@@ -1085,6 +1353,20 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
             }
         }
     }
+    // SINGLE_REPLAY: the first rollback_idx + 1 transitions of every layer's
+    // replay log, from the live state (still the verify's base) into the
+    // spare or in place, in one launch on the backend stream. It reads only
+    // the live SSM state and the logs, so it does not race the conv copies.
+    if (plan.from_replay &&
+        !ggml_backend_cuda_gdn_chain_commit(backend_, gdn_replay_layers_.data(),
+                                            n_delta, replay_S_v, replay_H, q_len,
+                                            rollback_idx + 1)) {
+        if (kFastRollbackDiag) {
+            std::fprintf(stderr, "rollback_to: replay commit launch failed\n");
+        }
+        cudaStreamSynchronize(stream);   // let the conv copies land first
+        return false;
+    }
     if (meta_backend) {
         if (cache_.ssm_state.empty() ||
             !synchronize_meta_tensor_devices(cache_.ssm_state.front(), backend_)) {
@@ -1093,6 +1375,16 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
     } else {
         cudaStreamSynchronize(stream);
     }
+    // The parent's null-stream sync above covers its copies; the replay
+    // commit runs on the backend stream, so wait for it as well.
+    if (plan.from_replay) ggml_backend_synchronize(backend_);
+    if (plan.into_spare) {
+        // The spares now hold the committed state and the live tensors P:
+        // trade their storage, which leaves the parent's contents.
+        gdn_commit::exchange_pairs(cache_.ssm_state, cache_.ssm_state_snap,
+                                  cache_.ssm_state_swapped);
+    }
+    gdn_commit::finish_rollback(gdn_book_, plan);
 
     cache_.cur_pos = base_pos + commit_n;
     return true;
@@ -1172,6 +1464,8 @@ bool Qwen35DFlashTarget::rollback_to_specla(int base_pos, int commit_n) {
 }
 
 bool Qwen35DFlashTarget::finish_speculative_state() {
+    gdn_drop_uncommitted("finish_speculative_state");
+    gdn_commit::on_finish(gdn_book_);
     if (!specla_active() || cache_.specla_pending_count == 0) return true;
     if (!cache_.factor_k_all || !cache_.factor_v_new_all ||
         !cache_.factor_g_ps_all || !cache_.conv_factor_all ||

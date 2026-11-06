@@ -33,40 +33,19 @@ constexpr size_t STATE_ELEMENTS =
     (size_t) S_V*S_V*N_HEAD*N_STATE_SLOTS;
 constexpr size_t GUARD_ELEMENTS = 64;
 
-bool set_environment(const char * name, const char * value) {
-#ifdef _WIN32
-    return _putenv_s(name, value ? value : "") == 0;
-#else
-    return value ? setenv(name, value, 1) == 0 : unsetenv(name) == 0;
-#endif
-}
-
-class EnvironmentValue {
+// Pins the GDN route (ggml_backend_cuda_set_gdn_route_override) for a scope.
+class PinnedGdnRoute {
 public:
-    EnvironmentValue(const char * name, const char * value) : name_(name) {
-        const char * previous = std::getenv(name);
-        if (previous) {
-            had_previous_ = true;
-            previous_ = previous;
-        }
-        valid_ = set_environment(name, value);
-    }
+    explicit PinnedGdnRoute(bool grouped)
+        : previous_(ggml_backend_cuda_set_gdn_route_override(grouped ? 1 : 0)) {}
 
-    ~EnvironmentValue() {
-        set_environment(name_.c_str(),
-                        had_previous_ ? previous_.c_str() : nullptr);
-    }
+    ~PinnedGdnRoute() { ggml_backend_cuda_set_gdn_route_override(previous_); }
 
-    bool valid() const { return valid_; }
-
-    EnvironmentValue(const EnvironmentValue &) = delete;
-    EnvironmentValue & operator=(const EnvironmentValue &) = delete;
+    PinnedGdnRoute(const PinnedGdnRoute &) = delete;
+    PinnedGdnRoute & operator=(const PinnedGdnRoute &) = delete;
 
 private:
-    std::string name_;
-    std::string previous_;
-    bool had_previous_ = false;
-    bool valid_ = false;
+    int previous_;
 };
 
 struct StepInput {
@@ -320,15 +299,7 @@ PathRun run_path(
         const std::vector<StepInput> & inputs,
         const std::vector<float> & initial_state,
         bool grouped) {
-    EnvironmentValue force_grouped(
-        "LUCE_GDN_FORCE_GROUPED_COLS", grouped ? "1" : nullptr);
-    EnvironmentValue disable_grouped(
-        "LUCE_GDN_NO_GROUPED_COLS", grouped ? nullptr : "1");
-    if (!force_grouped.valid() || !disable_grouped.valid()) {
-        PathRun result;
-        result.reason = "failed to select GDN route";
-        return result;
-    }
+    const PinnedGdnRoute route(grouped);
 
     const size_t scalar_before =
         ggml_backend_cuda_get_gdn_scalar_launch_count();
