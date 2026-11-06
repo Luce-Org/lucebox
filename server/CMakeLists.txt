@@ -2878,6 +2878,7 @@ if(LUCE_TESTS)
             test/unit/test_kvflash_step_driver.cpp
             test/unit/test_kvflash_arena.cpp
             test/unit/test_kvflash_slot_kv.cpp
+            test/unit/test_kvflash_concurrent_gate.cpp
             test/unit/test_pooled_snapshot_blob.cpp
             test/unit/test_kvflash_placement.cpp
             test/unit/test_kvflash_pool_sizing.cpp

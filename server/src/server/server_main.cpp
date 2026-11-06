@@ -24,6 +24,7 @@
 #include "cluster/cluster_worker_main.h"
 #include "common/chain_rollback_policy.h"
 #include "common/gguf_inspect.h"
+#include "common/kvflash_concurrent_gate.h"
 #include "common/layer_split_utils.h"
 #include "common/model_capabilities.h"
 #include "common/paged_attention_config.h"
@@ -824,6 +825,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                     "[server] --max-concurrency must be an integer\n");
                 return 2;
             }
+            bargs.max_concurrency_set = true;
         } else if (std::strcmp(argv[i], "--admission-coalesce-ms") == 0 &&
                    i + 1 < argc) {
             const char * value = argv[++i];
@@ -1528,6 +1530,12 @@ static void apply_launch_profile_env(const luce::server::LaunchProfile & profile
                        paged_deepseek41 ? &luce::common::deepseek41_paged_unqualified_env : nullptr);
 }
 
+// An environment knob the operator set to something other than off.
+static bool env_set_on(const char * name) {
+    const char * v = std::getenv(name);
+    return v && *v && std::strcmp(v, "0") != 0;
+}
+
 static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_model) {
     // Cluster mode's defaults go in before a profile's, so they win over it.
     if (model.bargs.cluster.enabled()) {
@@ -1541,10 +1549,33 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     if (!model.adaptive_experts_tau.empty())
         set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
     // The shipped KVFlash recall settings come first, so an explicit
-    // --kvflash-policy below still replaces the policy default. Mode 4 unless
-    // LUCE_KVFLASH_PREFILL_RESELECT=5 asks for mode 5 and the drafter (flag or env)
-    // and its PFlash GGUFs are set.
-    if (!model.kvflash_pool.empty()) {
+    // --kvflash-policy below still replaces the policy default.
+    // Paged attention with KVFlash is the concurrent engine: LRU only (C1.3), so
+    // the serial recall defaults stay out and an explicit recall setting is refused.
+    const char * env_pool = std::getenv("LUCE_KVFLASH");
+    const bool concurrent_kvflash = model.bargs.paged_attention &&
+        (!model.kvflash_pool.empty() || luce::common::kvflash_pool_requested(env_pool));
+    if (concurrent_kvflash) {
+        luce::common::KvFlashProfileRequest rq;
+        const char * env_policy = std::getenv("LUCE_KVFLASH_POLICY");
+        rq.explicit_qk_policy = model.kvflash_policy.empty()
+            ? (env_policy && std::strcmp(env_policy, "qk") == 0)
+            : model.kvflash_policy == "qk";
+        rq.explicit_recall = env_set_on("LUCE_KVFLASH_RECALL_BLOCKS");
+        rq.explicit_uq = env_set_on("LUCE_KVFLASH_UQ_QUERIES");
+        rq.explicit_preamble_pin = env_set_on("LUCE_KVFLASH_PREAMBLE_ROWS");
+        rq.explicit_gpu_score = std::getenv("LUCE_KVFLASH_SCORER_DEVICE") && std::strcmp(std::getenv("LUCE_KVFLASH_SCORER_DEVICE"), "gpu") == 0;
+        rq.explicit_reselect = env_set_on("LUCE_KVFLASH_PREFILL_RESELECT");
+        const luce::common::KvFlashProfile profile = luce::common::kvflash_resolve_concurrent_profile(rq);
+        if (!profile.ok) {
+            std::fprintf(stderr, "[kvflash] %s\n", profile.error.c_str());
+            return 2;
+        }
+        std::fprintf(stderr, "%s\n", profile.log_line.c_str());
+        set_environment_variable("LUCE_KVFLASH_POLICY", "lru", true);
+    } else if (!model.kvflash_pool.empty()) {
+        // Mode 4 unless LUCE_KVFLASH_PREFILL_RESELECT=5 asks for mode 5 and the drafter
+        // (flag or env) and its PFlash GGUFs are set.
         const std::string drafter_flag = model.sconfig.pflash_drafter_path;
         const bool mode5 = luce::server::kvflash_mode5_requested([&](const char * k) {
             if (drafter_flag.size() && std::string_view(k) == "LUCE_KVFLASH_DRAFTER") return drafter_flag;
@@ -1773,6 +1804,12 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             cluster_cfg.timeout_ms, n_env);
     }
 
+    // PFlash compression beside the concurrent KVFlash arena is outside C1.3.
+    if (bargs.paged_attention && sconfig.pflash &&
+        (luce::common::kvflash_pool_requested(std::getenv("LUCE_KVFLASH")))) {
+        std::fprintf(stderr, "[kvflash] concurrent KVFlash cannot be combined with PFlash\n");
+        return 2;
+    }
     BackendAdmissionContext backend_admission;
     backend_admission.pflash_enabled =
         sconfig.pflash;

@@ -2,6 +2,7 @@
 
 #include "feature_gate.h"
 #include "kvflash_refusals.h"
+#include "kvflash_concurrent_gate.h"
 
 #include "model_capabilities.h"
 #include "paged_attention_config.h"
@@ -298,7 +299,7 @@ std::string check_feature_compatibility(
                    "only for concurrent dense Qwen3.5 serving "
                    "(--max-concurrency > 1)";
         }
-        if (admission.fixed_kvflash_requested()) {
+        if (admission.fixed_kvflash_requested() && !luce::common::kvflash_concurrent_test_switch()) {
             return "--paged-attention cannot be combined with KVFlash";
         }
         if (arch_is_deepseek4_family(arch)) {

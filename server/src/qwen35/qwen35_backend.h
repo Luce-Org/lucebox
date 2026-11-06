@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "common/kvflash_concurrent_gate.h"
 #include "common/model_backend.h"
 #include "common/dflash_target.h"
 #include "common/dflash_draft_ipc.h"
@@ -31,6 +32,10 @@
 #include "qwen35_vision.h"
 #include "pflash/pflash_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
 #include "kvflash_pager.h"         // bounded KV residency pool
+#include "kvflash_arena.h"         // shared page stream of the slot pagers
+#include "kvflash_slot_pager.h"    // one slice of the arena per slot
+#include "common/concurrency/kvflash_slot_kv.h"
+#include "common/kvflash_step_driver.h"
 #include "kvflash_scorer.h"        // chunk-relevance policy interface
 #include "pflash/kvflash_drafter_scorer.h"  // KvFlashPFlash2Scorer (mode 5)
 #include "kvflash_qk.h"            // target-QK scorer (pooled keys + query)
@@ -81,6 +86,7 @@ struct Qwen35Config {
     // recurrent state + one block-table column each) and serves them through
     // a Qwen35SeqEngine instead of generate().
     int          max_concurrency = 1;
+    bool         max_concurrency_set = false;  // explicit --max-concurrency, even 1
     // Total paged K/V pool size in tokens shared by all slots
     // (--kv-pool-tokens; rounded up to whole 16-token blocks).
     // 0 derives the shared physical capacity from available device memory.
@@ -238,6 +244,8 @@ protected:
     // Hook after kvflash pool sizing, before create_target_cache: a subclass
     // may disable the pool (kvflash_tokens_=0) when it is redundant. Default no-op.
     virtual bool post_kvflash_init_gate() { return true; }
+    // The architecture the concurrent KVFlash gate is decided on (arch-exact).
+    virtual const char * kvflash_arch() const { return "qwen35"; }
     virtual void after_target_compute(StepGraph &,
                                       int /*kv_start*/,
                                       int /*n_tokens*/) {}
@@ -536,6 +544,24 @@ private:
     int concurrent_slots() const {
         return cfg_.max_concurrency > 1 ? cfg_.max_concurrency : 1;
     }
+    // Whether the seq engine serves requests: N > 1 as before, or an explicit
+    // --max-concurrency (even 1) under paged attention (C1.3-02).
+    bool seq_engine_wanted() const {
+        return luce::common::seq_engine_wanted(
+            {cfg_.paged_attention, concurrent_slots(), cfg_.max_concurrency_set, kvflash_active()});
+    }
+
+    // KVFlash slots (C1.3-05): one arena of N slices, a pager per slot, the host
+    // ledger, the SlotKv over them and the step driver. Declared before the
+    // engine, which borrows them; the arena is destroyed last (its members
+    // synchronize its stream).
+    bool init_kvflash_slots(int n_slots, int quota_chunks, int max_ctx, int64_t scratch_row,
+                            int max_prefills, int mixed, int long_mixed, int long_threshold, int idle);
+    std::unique_ptr<luce::common::KvFlashArena>                       kvf_arena_;
+    std::vector<std::unique_ptr<luce::common::KvFlashSlotPager>>      kvf_pagers_;
+    std::unique_ptr<luce::common::KvFlashHostLedger>                  kvf_ledger_;
+    std::unique_ptr<luce::common::KvFlashSlotKv>                      kvf_kv_;
+    std::unique_ptr<luce::common::KvFlashStepDriver>                  kvf_driver_;
 
     // Built by init() when the backend has more than one decode slot. It
     // borrows this backend's weights, cache, step graph and paged pool —

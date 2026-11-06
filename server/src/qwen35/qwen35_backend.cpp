@@ -36,6 +36,7 @@
 #include "common/kvflash_exact_mass.h"
 #include "common/kvflash_exact_fast.h"
 #include "common/kvflash_gpu_mass.h"
+#include "common/kvflash_slot_pager.h"
 
 #include "ggml-cuda.h"
 #include "ggml-backend-impl.h"
@@ -463,7 +464,9 @@ bool Qwen35Backend::init() {
     KvFlashAutoBudget kvf_budget = make_kvflash_budget(w_, (int64_t)gpu_free);
     kvflash_tokens_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{},
                                             kvflash_scorer_expected(),
-                                            kvf_budget);
+                                            cfg_.paged_attention
+                                                ? kvflash_budget_per_slot(kvf_budget, concurrent_slots())
+                                                : kvf_budget);
     if (kvflash_tokens_ > 0) {
         kvflash_tau_ = std::max(1, env_int_or_default("LUCE_KVFLASH_TAU", 64));
     }
@@ -512,6 +515,22 @@ bool Qwen35Backend::init() {
             [](const char * k) { const char * v = std::getenv(k); return std::string(v ? v : ""); }, concurrent_slots());
         if (!why.empty()) { set_last_error("LUCE_KVFLASH_PREFILL_RESELECT=5: " + why); return false; }
     }
+    // Concurrent KVFlash (paged + KVFlash): decided on the REQUESTED combination
+    // and the exact arch, before any subclass policy below can erase it.
+    if (cfg_.paged_attention && kvflash_active()) {
+        luce::common::KvFlashConcurrentRequest rq;
+        rq.arch = kvflash_arch();
+        rq.kvflash_requested = true;
+        const char * wmma = std::getenv("LUCE_PAGED_WMMA");
+        rq.wmma_env = wmma && std::string(wmma) == "1";   // null exclusion is box-unverified until C1.3-06
+        rq.draft = cfg_.draft_path.has_value();
+        rq.tree = cfg_.ddtree_mode;
+        if (const auto why = luce::common::kvflash_concurrent_refusal(rq)) {
+            std::fprintf(stderr, "[kvflash] %s\n", why->c_str());
+            set_last_error(*why);
+            return false;
+        }
+    }
     // Subclass gate (e.g. MoE all-hot): may zero kvflash_tokens_ before the KV
     // cache is sized, so create_target_cache allocates full max_ctx KV.
     if (!post_kvflash_init_gate()) return false;
@@ -521,7 +540,10 @@ bool Qwen35Backend::init() {
         kvflash_tokens_ > 0, cfg_.fast_rollback, cfg_.fast_rollback_explicit);
     // KVFlash is resolved from env at init; this is the authoritative
     // paged×KVFlash compatibility check.
-    if (cfg_.paged_attention && kvflash_active()) {
+    if (cfg_.paged_attention && kvflash_active() && luce::common::kvflash_concurrent_test_switch()) {
+        std::fprintf(stderr, "[kvflash] TEST SWITCH LUCE_KVFLASH_CONCURRENT_TEST=1: concurrent KVFlash slots "
+                             "opened for the C1.3 GPU gates (not a supported configuration)\n");
+    } else if (cfg_.paged_attention && kvflash_active()) {
         std::fprintf(stderr,
             "[paged-attention] cannot be combined with KVFlash "
             "(resident pool %d tokens)\n", kvflash_tokens_);
@@ -580,7 +602,17 @@ bool Qwen35Backend::init() {
     // One extra scratch block is appended to the K/V tensors (outside the
     // pool's index space) as the write target of dead decode-batch rows.
     int64_t pool_tokens = 0;
-    if (n_slots > 1) {
+    const bool slot_pool = seq_engine_wanted();
+    // KVFlash slots (C1.3-05): one arena of N x Q x 64 rows plus a scratch block,
+    // no PagedKvPool; --kv-pool-tokens is derived, not a size. Unreachable until
+    // the paged x KVFlash refusal above is lifted (C1.3-06).
+    const bool kvflash_slots = slot_pool && kvflash_active();
+    KvFlashArenaSizing arena;
+    if (kvflash_slots) {
+        arena = kvflash_arena_sizing(n_slots, kvflash_quota_chunks(kvflash_tokens_), cfg_.kv_pool_tokens);
+        if (!arena.error.empty()) { std::fprintf(stderr, "[kvflash] %s\n", arena.error.c_str()); set_last_error(arena.error); return false; }
+    }
+    if (slot_pool && !kvflash_slots) {
         PagedKvAutoBudget budget;
         // TODO: Size tensor-parallel pools from each device's free memory
         // and account for fixed cache tensors mirrored by the meta backend.
@@ -643,7 +675,9 @@ bool Qwen35Backend::init() {
             return false;
         }
     }
-    const int ctx_alloc = n_slots > 1
+    const int ctx_alloc = kvflash_slots
+        ? (int)arena.rows
+        : slot_pool
         ? (int)(pool_tokens + scratch_tokens)
         : (cfg_.paged_attention
                ? paged_token_capacity(cfg_.device.max_ctx)
@@ -657,7 +691,7 @@ bool Qwen35Backend::init() {
                              /*prefill_only=*/true, ctx_alloc,
                              cfg_.paged_attention, n_slots,
                              fixed_chain.enabled, cfg_.cache_type_k, cfg_.cache_type_v,
-                             target_feat_cap)) {
+                             target_feat_cap, slot_pool)) {
         std::fprintf(stderr, "cache: %s\n", luce_last_error());
         return false;
     }
@@ -676,8 +710,15 @@ bool Qwen35Backend::init() {
                 ggml_type_name(cache_.kv_v_type));
             return false;
         }
-        try {
-            const uint32_t pool_blocks = n_slots > 1
+        if (kvflash_slots) {
+            // No PagedKvPool: the slot pagers own the arena's rows.
+            if (!init_kvflash_slots(n_slots, kvflash_quota_chunks(kvflash_tokens_), cfg_.device.max_ctx,
+                                    arena.pool_tokens, max_concurrent_prefills, mixed_prefill_tokens,
+                                    long_mixed_prefill_tokens, long_prefill_threshold, idle_prefill_tokens)) {
+                return false;
+            }
+        } else try {
+            const uint32_t pool_blocks = slot_pool
                 ? (uint32_t)(pool_tokens / PAGED_BLOCK_SIZE)
                 : (uint32_t)paged_block_count(cfg_.device.max_ctx);
             paged_kv_pool_ = std::make_unique<PagedKvPool>(
@@ -688,7 +729,11 @@ bool Qwen35Backend::init() {
                          e.what());
             return false;
         }
-        if (n_slots > 1) {
+        if (kvflash_slots) {
+            std::printf("[kvflash] %d slots x %d chunks, arena %lld rows, headroom 8, LRU only (no scoring)\n",
+                        n_slots, kvflash_quota_chunks(kvflash_tokens_), (long long)arena.rows);
+            std::fflush(stdout);
+        } else if (slot_pool) {
             fixed_chain.scratch_base = (int)pool_tokens;
             const int64_t dead_scratch_row = pool_tokens +
                 (int64_t)n_slots * fixed_chain.scratch_stride;
@@ -716,7 +761,7 @@ bool Qwen35Backend::init() {
                         paged_kv_pool_->block_size(),
                         (long long)pool_tokens, cfg_.device.max_ctx);
         }
-        std::printf("[paged-attention] %u physical blocks x %u tokens "
+        if (!kvflash_slots) std::printf("[paged-attention] %u physical blocks x %u tokens "
                     "(%llu pool tokens, per-sequence max_ctx %d)\n",
                     paged_kv_pool_->physical_block_count(),
                     paged_kv_pool_->block_size(),
@@ -725,7 +770,7 @@ bool Qwen35Backend::init() {
                     cfg_.device.max_ctx);
         std::fflush(stdout);
     }
-    if (kvflash_active()) {
+    if (kvflash_active() && !kvflash_slots) {
         KvFlashConfig pc;
         pc.pool_tokens = kvflash_tokens_;
         // LUCE_KVFLASH_VICTIM_BLOCKS: paged-out chunks keep their bytes on the device, so the turn-by-turn churn between
@@ -1453,7 +1498,7 @@ ModelBackend::MemoryReport Qwen35Backend::memory_report_for(
     report.available = true;
     report.cache.host = ggml_backend_buffer_is_host(cache.base_buf);
     report.cache.capacity_tokens = cache.max_ctx;
-    report.cache.live_tokens = cache.n_seq_slots > 1 ? -1 : cache.cur_pos;
+    report.cache.live_tokens = cache.slot_pool ? -1 : cache.cur_pos;
     for (size_t i = 0; i < cache.attn_k.size(); ++i) {
         report.cache.kv_bytes += bytes(cache.attn_k[i]) + bytes(cache.attn_v[i]);
     }
@@ -1722,6 +1767,45 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
     return true;
 }
 
+// KVFlash slots (C1.3-05): N slot pagers over one arena (slice i = rows
+// [i*Q*64, (i+1)*Q*64), a scratch block after them), their shared page stream,
+// the host reservation ledger, the SlotKv and the step driver, then the engine
+// over them. Headroom 8 blocks (D2). The host budget is LUCE_KVFLASH_HOST_MIB
+// (default 16384): reservations beyond it are refused at admission (R5).
+bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ctx, int64_t scratch_row,
+                                       int max_prefills, int mixed, int long_mixed,
+                                       int long_threshold, int idle) {
+    constexpr int kHeadroom = 8;
+    using namespace luce::common;
+    kvf_arena_ = std::make_unique<KvFlashArena>();
+    std::vector<KvFlashSlotPager *> raw;
+    for (int i = 0; i < n_slots; i++) {
+        kvf_pagers_.push_back(std::make_unique<KvFlashSlotPager>());
+        kvf_arena_->add(*kvf_pagers_.back());
+        if (!kvf_pagers_.back()->attach_slice(i, n_slots, quota_chunks, KvFlashConfig{}, cache_.attn_k, cache_.attn_v)) {
+            set_last_error("KVFlash slot " + std::to_string(i) + ": pager attach failed (quota " +
+                           std::to_string(quota_chunks) + " chunks, headroom " + std::to_string(kHeadroom) + ")");
+            return false;
+        }
+        raw.push_back(kvf_pagers_.back().get());
+    }
+    KvFlashSlotKvConfig kc;
+    kc.quota_chunks = quota_chunks;
+    kc.headroom_blocks = kHeadroom;
+    kc.max_ctx = max_ctx;
+    if (!kvflash_headroom_ok(quota_chunks, kHeadroom)) {
+        set_last_error("KVFlash quota of " + std::to_string(quota_chunks) + " chunks leaves no evictable block beside a headroom of 8");
+        return false;
+    }
+    kvf_ledger_ = std::make_unique<KvFlashHostLedger>(
+        (int64_t)env_int_or_default("LUCE_KVFLASH_HOST_MIB", 16384) << 20, /*transient_reserve_bytes=*/0);
+    kvf_kv_ = std::make_unique<KvFlashSlotKv>(raw, *kvf_ledger_, kc);
+    kvf_driver_ = std::make_unique<KvFlashStepDriver>(raw, *kvf_arena_, kHeadroom);
+    seq_engine_ = std::make_unique<Qwen35SeqEngine>(
+        *this, *kvf_kv_, *kvf_driver_, max_ctx, scratch_row, max_prefills, mixed, long_mixed, long_threshold, idle);
+    return true;
+}
+
 // ── Compress (pflash) ───────────────────────────────────────────────────
 
 ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req) {
@@ -1956,7 +2040,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     } generating_scope{generating_};
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
-    if (concurrent_slots() > 1) {
+    if (seq_engine_wanted()) {
         // begin_paged_sequence would reset the shared pool under every live
         // slot; the scheduler must use the seq_* API instead.
         result.fail(GenerateErrorCode::BackendSpecific,
