@@ -1,8 +1,11 @@
 # PFlash configuration
 
-Prefill compression needs a trained scoring head (`PFLASH_SCORING_HEAD_GGUF`)
-and the drafter in the server's own process; startup refuses `--pflash on`
-otherwise. Every setting left unset takes the measured
+Prefill compression needs a trained scoring head (`PFLASH_SCORING_HEAD_GGUF`),
+the drafter in the server's own process, and a target whose drafter pass
+returns per-candidate scores (the Qwen3.5 family and DeepSeek V4). It is on by
+default whenever all three are there and the launch combines with it
+(`--pflash auto`; otherwise startup says why it stays off); `--pflash on`
+refuses to start without them, and `--pflash off` turns it off. Every setting left unset takes the measured
 [release profile](#release-profile). Query-grid, stage-2 and oracle
 experiments remain available. With prefill compression enabled, selection,
 query and view settings are checked before model loading. Invalid settings stop startup and name the offending
@@ -20,7 +23,7 @@ allowed below. Valid integer overrides retain their existing upper clamps.
 
 | Setting | Built-in default | Release profile | Values / behavior |
 |---|---|---|---|
-| `--pflash` | `off` | | `on`, `off` |
+| `--pflash` | `auto` | | `auto` (on when `--prefill-drafter` and `PFLASH_SCORING_HEAD_GGUF` are set), `on`, `off` |
 | `--prefill-threshold` | `32000` | `16384` | Admission threshold, in droppable tokens (`0`: every prompt) |
 | `--prefill-keep-ratio` | `0.05` | curve | Flat ratio; `--prefill-curve tokens:ratio ...` overrides it. The release curve is `16384:0.315 32768:0.270 65536:0.270 120000:0.225`; either flag replaces it |
 | `--prefill-skip-park` | off | | Keep the target resident while the drafter scores; see the release profile |
@@ -108,7 +111,7 @@ export PFLASH_REQUEST_PROBE_GGUF=/path/to/request-probe.gguf
 
 luce_server /path/to/target.gguf \
   --prefill-drafter /path/to/Qwen3.5-0.8B.gguf \
-  --pflash on --prefill-skip-park
+  --prefill-skip-park
 ```
 
 The server installs the profile's environment variables at startup and logs

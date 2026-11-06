@@ -192,6 +192,9 @@ are rewritten back to the Chat Completions shape. With no upstream flags the
 server is byte-identical to local-inference mode.
 
 ```bash
+PFLASH_SCORING_HEAD_GGUF=models/pflash/head.gguf \
+PFLASH_SEGMENT_PROBE_GGUF=models/pflash/segment-probe.gguf \
+PFLASH_REQUEST_PROBE_GGUF=models/pflash/request-probe.gguf \
 ./build/luce_server models/Qwen3.6-27B-Q4_K_M.gguf \
   --pflash on --prefill-threshold 10000 \
   --prefill-drafter models/Qwen3.5-0.8B-BF16.gguf \
@@ -387,8 +390,10 @@ the whole request's device footprint. `/status/json` reports
 
 ### PFlash
 
-PFlash needs a trained scoring head (`PFLASH_SCORING_HEAD_GGUF`). Every PFlash
-setting left unset takes the measured release profile: threshold 16384, the
+PFlash is on by default whenever its files are given: the drafter
+(`--prefill-drafter`) and the trained scoring head (`PFLASH_SCORING_HEAD_GGUF`,
+with `PFLASH_SEGMENT_PROBE_GGUF` and `PFLASH_REQUEST_PROBE_GGUF`); `--pflash off`
+turns it off. Every PFlash setting left unset takes the measured release profile: threshold 16384, the
 curve `16384:0.315 32768:0.270 65536:0.270 120000:0.225`, budget selection over
 probe segments, the request-probe query and one view for chats and agent
 sessions (below). The [PFlash configuration reference](docs/PFLASH_CONFIGURATION.md)
@@ -396,7 +401,7 @@ lists the release values, the validated overrides and the active experiments.
 
 | Option | Default | Purpose |
 |---|---|---|
-| `--pflash on\|off` | `off` | Turn PFlash prompt compression on. |
+| `--pflash on\|off\|auto` | `auto` | `auto` turns PFlash on when `--prefill-drafter` and `PFLASH_SCORING_HEAD_GGUF` are set, the target supports it and the launch combines with it (startup says why it stays off otherwise); `on` refuses to start without them; `off` turns it off. |
 | `--prefill-threshold <N>` | `16384` | Prompts from this many tokens are compressed; `0` compresses every prompt. |
 | `--prefill-keep-ratio <F>` | the release curve | Fraction of source tokens kept. |
 | `--prefill-curve T:R [T:R ...]` | the release curve | Piecewise keep-ratio curve; overrides the flat ratio. |

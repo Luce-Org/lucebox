@@ -27,7 +27,8 @@
 #   LUCE_BUDGET               DDTree budget (default: 22)
 #   LUCE_LAZY                 1 = request-scoped draft (needs LUCE_PREFILL_DRAFTER)
 #   LUCE_CACHE_TYPE_K/V       KV cache types
-#   LUCE_PFLASH               on|off PFlash compression (default: off)
+#   LUCE_PFLASH               on|off|auto PFlash compression (default: auto, on
+#                             with LUCE_PREFILL_DRAFTER and PFLASH_SCORING_HEAD_GGUF)
 #   LUCE_PREFILL_KEEP, LUCE_PREFILL_THRESHOLD, LUCE_PREFILL_DRAFTER
 #   LUCE_PREFIX_CACHE_SLOTS, LUCE_PREFIX_CACHE_MAX_MIB, LUCE_PREFILL_CACHE_SLOTS
 #   LUCE_DEFAULT_MAX_TOKENS, LUCE_MODEL_NAME, LUCE_THINK_MAX, LUCE_FA_WINDOW,
@@ -325,9 +326,14 @@ fi
 : "${LUCE_PORT:=8080}"
 : "${LUCE_BUDGET:=22}"
 : "${LUCE_THINK_MAX:=15488}"   # ds4_eval.c: max_tokens(16000) - reply budget(512)
-: "${LUCE_PFLASH:=off}"
-[ -z "${LUCE_PREFILL_MODE:-}" ] || die "LUCE_PREFILL_MODE was replaced by LUCE_PFLASH=on|off"
-case "$LUCE_PFLASH" in on|off) ;; *) die "LUCE_PFLASH takes on or off, not $LUCE_PFLASH" ;; esac
+: "${LUCE_PFLASH:=auto}"
+[ -z "${LUCE_PREFILL_MODE:-}" ] || die "LUCE_PREFILL_MODE was replaced by LUCE_PFLASH=on|off|auto"
+case "$LUCE_PFLASH" in on|off|auto) ;; *) die "LUCE_PFLASH takes on, off or auto, not $LUCE_PFLASH" ;; esac
+# Under the default auto, a drafter path that does not exist leaves PFlash off; only an explicit on needs it.
+if [ "$LUCE_PFLASH" = auto ] && [ -n "${LUCE_PREFILL_DRAFTER:-}" ] && [ ! -f "$LUCE_PREFILL_DRAFTER" ]; then
+    warn "Prefill drafter not found at $LUCE_PREFILL_DRAFTER; PFlash stays off"
+    LUCE_PREFILL_DRAFTER=
+fi
 
 CMD=("$LUCE_SERVER_BIN" "$LUCE_TARGET"
      --host "$LUCE_HOST"
@@ -363,13 +369,16 @@ if [ "${LUCE_LAZY:-0}" = 1 ]; then
     fi
 fi
 
-if [ "$LUCE_PFLASH" = on ]; then
-    [ -n "${LUCE_PREFILL_DRAFTER:-}" ] || die "LUCE_PFLASH=on requires LUCE_PREFILL_DRAFTER"
+# auto: luce_server turns PFlash on when the drafter and PFLASH_SCORING_HEAD_GGUF are both set. The mode is always
+# forwarded, so an explicit off holds even when the drafter comes with the operator flags.
+if [ "$LUCE_PFLASH" = on ] && [ -z "${LUCE_PREFILL_DRAFTER:-}" ]; then
+    die "LUCE_PFLASH=on requires LUCE_PREFILL_DRAFTER"
+fi
+CMD+=(--pflash "$LUCE_PFLASH")
+if [ "$LUCE_PFLASH" != off ] && [ -n "${LUCE_PREFILL_DRAFTER:-}" ]; then
     [ -f "$LUCE_PREFILL_DRAFTER" ] || die "Prefill drafter not found at $LUCE_PREFILL_DRAFTER"
-    CMD+=(--pflash on
-          --prefill-drafter "$LUCE_PREFILL_DRAFTER")
-    # Unset, luce_server picks the ratio and threshold: the release profile
-    # with a trained scoring head, else 0.05 and 32000.
+    CMD+=(--prefill-drafter "$LUCE_PREFILL_DRAFTER")
+    # Unset, luce_server picks the ratio and threshold: the release profile.
     [ -n "${LUCE_PREFILL_KEEP:-}" ]      && CMD+=(--prefill-keep-ratio "$LUCE_PREFILL_KEEP")
     [ -n "${LUCE_PREFILL_THRESHOLD:-}" ] && CMD+=(--prefill-threshold "$LUCE_PREFILL_THRESHOLD")
 fi
