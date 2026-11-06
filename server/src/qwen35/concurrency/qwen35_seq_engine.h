@@ -285,19 +285,46 @@ private:
     std::vector<SlotRecall> recall_;
     bool recall_on_ = false;                          // the recall profile is on for the slot engine
     // Sticky sessions (LUCE_KVFLASH_SLOT_STICKY, on by default with KVFlash slots). A retired slot keeps its KV and
-    // recurrent state parked in place; a prompt that extends its history resumes it where it parked. The state is
-    // not copied, so a session resumes only at the end of its parked history (a prompt that diverges inside it, or
-    // equals it, runs cold).
+    // recurrent state parked in place; a prompt that extends its history resumes it where it parked.
+    // The recurrent state cannot be sliced back, so a prompt that diverges inside the history (the client re-renders
+    // the reply from text) resumes at a rung: a recurrent state saved at an earlier position (kvflash_slot_turn.h
+    // Rules A and B). Three rungs per session: `ckpt`, the prompt-end checkpoint (the state before the reply),
+    // `trunk` below it (the checkpoint before that: where a branch forked) and `extra` (rule v5: a pinned branch
+    // point, or the rung the ladder demoted).
+    struct SlotCkpt {
+        int pos = -1;
+        SlotStateSnapshot slab;
+        bool pinned = false;             // the third rung only: a branch point, kept until a deeper branch
+    };
     struct ParkedSession {
         std::vector<int32_t> history;    // the tokens its KV holds (== its cur_pos at park)
         uint64_t tick = 0;
         bool valid = false;
-        KvFlashResumeWait wait;          // a resume was refused busy: the retry resumes it again
+        SlotCkpt ckpt;
+        SlotCkpt trunk;
+        SlotCkpt extra;
+        KvFlashResumeWait wait;          // a resume rewound it to L and was refused busy: the retry resumes it there
     };
     std::vector<ParkedSession> parked_;
+    std::vector<SlotCkpt> ckpt_;                      // the live slot's prompt-end checkpoint, taken at commit
+    std::vector<SlotCkpt> trunk_;                     // the rung below it
+    std::vector<SlotCkpt> extra_;                     // the third rung
+    static KvFlashLadder ladder_of_(const SlotCkpt & ck, const SlotCkpt & tr, const SlotCkpt & ex) { return {ck.pos, tr.pos, ex.pos, ex.pos > 0 && ex.pinned}; }
+    // Moves the slabs of a ladder step (kvflash_ladder_resume / _ckpt) into place; a slab two rungs name is copied.
+    static void apply_ladder_(const KvFlashLadderMove & m, SlotCkpt & ck, SlotCkpt & tr, SlotCkpt & ex, SlotCkpt live);
+    int end_rung_min_ = -1;                           // LUCE_KVFLASH_END_RUNG_MIN: a recall turn's header rung when end - R reaches it; -1 off
+    void place_ckpt_(int slot, SlotCkpt nu);          // Rule A with a slab in hand (the R rung)
+    void take_ckpt_(int slot, int pos);               // Rule A with the slot's state now (the header rung)
     KvFlashSessionBook book_;                         // per slot: the session in it (client, sid)
     uint64_t park_tick_ = 0;
     bool sticky_on_ = false;
+    // G-D: park one token short (kvflash_park_point). The decode step stashes each live slot's recurrent
+    // state before it feeds the slot's token; stash_pos_[slot] is the token count that state covers (-1: none).
+    SlotStateStash stash_;
+    bool park_short_on_ = false;                      // LUCE_KVFLASH_PARK_SHORT=0 turns it off
+    bool park_decode_on_ = false;                     // LUCE_KVFLASH_PARK_DECODE=1: stash before every decode step too
+    int park_tail_ = 4;                               // LUCE_KVFLASH_PARK_TAIL: a prefill-only turn parks this many tokens short (R's replay window is 4)
+    std::vector<int> stash_pos_;
     AdmitResult admit_sticky_(uint64_t request_id, const std::vector<int32_t> & prompt, const SamplerCfg & sampler,
                               int64_t total, const AdmitMeta & meta);
     void drop_session_(int slot, const char * why);   // forget the session: its KV, its reservation and its owner

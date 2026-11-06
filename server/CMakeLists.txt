@@ -2879,6 +2879,7 @@ if(LUCE_TESTS)
             test/unit/test_kvflash_arena.cpp
             test/unit/test_kvflash_slot_kv.cpp
             test/unit/test_kvflash_concurrent_gate.cpp
+            test/unit/test_kvflash_slot_ladder.cpp
             test/unit/test_kvflash_slot_turn.cpp
             test/unit/test_kvflash_session_store.cpp
             test/unit/test_kvflash_admit_plan.cpp

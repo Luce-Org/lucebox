@@ -646,6 +646,49 @@ bool restore_slot_state(TargetCache & c, int slot, const SlotStateSnapshot & sna
     return true;
 }
 
+bool slot_state_stash_alloc(const TargetCache & c, ggml_backend_t backend, SlotStateStash & s) {
+    if (!backend || !ggml_backend_is_cuda(backend) || c.n_seq_slots <= 0) return false;
+    const size_t n = c.ssm_state.size() + c.conv_state.size();
+    ggml_init_params ip{};
+    ip.mem_size = (n + 1) * ggml_tensor_overhead();
+    ip.no_alloc = true;
+    s.ctx = ggml_init(ip);
+    if (!s.ctx) return false;
+    auto dup = [&](const std::vector<ggml_tensor *> & src, std::vector<ggml_tensor *> & dst) {
+        for (const ggml_tensor * t : src) dst.push_back(t ? ggml_dup_tensor(s.ctx, t) : nullptr);
+    };
+    dup(c.ssm_state, s.ssm);
+    dup(c.conv_state, s.conv);
+    s.buf = ggml_backend_alloc_ctx_tensors(s.ctx, backend);
+    if (!s.buf) { slot_state_stash_free(s); return false; }
+    return true;
+}
+
+void slot_state_stash_free(SlotStateStash & s) {
+    if (s.buf) ggml_backend_buffer_free(s.buf);
+    if (s.ctx) ggml_free(s.ctx);
+    s = SlotStateStash{};
+}
+
+bool slot_state_stash_copy(ggml_backend_t backend, TargetCache & c, SlotStateStash & s, int slot, bool to_stash) {
+    if (!s.buf || slot < 0 || slot >= c.n_seq_slots || s.ssm.size() != c.ssm_state.size() || s.conv.size() != c.conv_state.size()) return false;
+    std::vector<ggml_cuda_copy_desc> descs;
+    auto add = [&](const std::vector<ggml_tensor *> & live, const std::vector<ggml_tensor *> & stash) {
+        for (size_t i = 0; i < live.size(); ++i) {
+            if (!live[i] || !stash[i]) continue;
+            const size_t bytes = ggml_nbytes(live[i]) / (size_t)c.n_seq_slots;   // the slot axis is outermost: one contiguous slab
+            const size_t off = (size_t)slot * bytes;
+            uint8_t * l = (uint8_t *)live[i]->data + off;
+            uint8_t * t = (uint8_t *)stash[i]->data + off;
+            descs.push_back(to_stash ? ggml_cuda_copy_desc{l, t, bytes} : ggml_cuda_copy_desc{t, l, bytes});
+        }
+    };
+    add(c.ssm_state, s.ssm);
+    add(c.conv_state, s.conv);
+    ggml_backend_cuda_copy_batch_async(backend, descs.data(), (int)descs.size());
+    return true;
+}
+
 // Attach rollback tensors to an existing prefill cache without touching the
 // base tensors (KV, SSM, conv, target_feat) that prefill already populated.
 // No D2D copies — the base tensors stay right where the graph wrote them.

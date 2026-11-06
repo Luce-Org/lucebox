@@ -29,6 +29,7 @@ struct KvFlashSlotKvConfig {
     int quota_chunks = 0, headroom_blocks = 8;
     int64_t max_ctx = 0;
     int64_t chunk_bytes = 0;     // host backing per chunk; 0 = ask the pager
+    int64_t ladder_bytes = 0;    // per request
 };
 
 class KvFlashSlotKv final : public SlotKv {
@@ -73,6 +74,13 @@ public:
     bool exceeds_host_budget(int slot, int64_t total) const {
         if (slot < 0 || slot >= (int)slots_.size() || total <= 0) return false;
         return ledger_.would_admit_new(admit_input_(*pagers_[(size_t)slot], charged_tokens_(0, total))) == KvFlashAdmit::HostTooSmall;
+    }
+    // A parked session drops its rows past `len` (the resume at a checkpoint below its length).
+    bool truncate_parked(int slot, uint32_t len) {
+        if (!parked(slot) || len > slots_[(size_t)slot].len) return false;
+        slots_[(size_t)slot].len = len;
+        pagers_[(size_t)slot]->truncate((int64_t)len);
+        return true;
     }
 
     PagedKvStatus acquire_reserved(PagedKvRequestId id, uint32_t token_capacity, PagedKvSequenceHandle & out) override {
@@ -217,6 +225,7 @@ private:
         in.prompt_tokens = tokens; in.max_new_tokens = 0; in.max_ctx = cfg_.max_ctx;
         in.chunk_tokens = p.chunk_tokens();
         in.chunk_bytes = cfg_.chunk_bytes ? cfg_.chunk_bytes : (int64_t)p.chunk_bytes();
+        in.ladder_bytes = cfg_.ladder_bytes;
         return in;
     }
     static PagedKvStatus admit_status_(KvFlashAdmit v) {

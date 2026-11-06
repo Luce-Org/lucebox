@@ -921,6 +921,19 @@ struct SlotStateSnapshot {
 bool snapshot_slot_state(const TargetCache & c, int slot, SlotStateSnapshot & out);
 bool restore_slot_state(TargetCache & c, int slot, const SlotStateSnapshot & snap);
 
+// G-D: a device copy of every slot's recurrent slabs, same layout as the cache. The decode step copies
+// a slot's state in before it runs, so the slot can park the state before its last fed token (one token
+// short). Device to device on the backend's stream: no host traffic. CUDA/HIP backends only.
+struct SlotStateStash {
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    std::vector<ggml_tensor *> ssm, conv;   // one per cache tensor (null where the cache has none)
+};
+bool slot_state_stash_alloc(const TargetCache & c, ggml_backend_t backend, SlotStateStash & s);
+void slot_state_stash_free(SlotStateStash & s);
+// to_stash: the slot's state -> the stash; else the stash -> the slot's state.
+bool slot_state_stash_copy(ggml_backend_t backend, TargetCache & c, SlotStateStash & s, int slot, bool to_stash);
+
 // Reallocate a prefill-only cache with full rollback tensors, copying all live
 // state (KV, SSM, conv, target_feat) device-to-device. Frees the old cache.
 // enable_specla is the caller's effective SpecLA decision (config-driven);

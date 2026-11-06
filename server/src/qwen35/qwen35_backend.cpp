@@ -1813,6 +1813,17 @@ bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ct
     kc.quota_chunks = quota_chunks;
     kc.headroom_blocks = kHeadroom;
     kc.max_ctx = max_ctx;
+    {   // host memory per request beside its chunks: the R state snapshot of a recall turn and the rungs
+        // (checkpoint, trunk and the third) of a sticky session, one recurrent slab each
+        int64_t slab = 0;
+        for (const ggml_tensor * t : cache_.ssm_state)  if (t) slab += (int64_t)ggml_nbytes(t) / n_slots;
+        for (const ggml_tensor * t : cache_.conv_state) if (t) slab += (int64_t)ggml_nbytes(t) / n_slots;
+        const char * sticky = std::getenv("LUCE_KVFLASH_SLOT_STICKY");
+        const bool sticky_on = !(sticky && sticky[0] == '0' && sticky[1] == '\0');
+        kc.ladder_bytes = kvflash_ladder_bytes(slab, kvflash_slot_recall_profile() && kvflash_prefill_reselect_ != 5, sticky_on);
+        std::fprintf(stderr, "[kvflash] per-slot ladder: %d rungs x slab %lld B = %lld B (%.1f MiB)\n", sticky_on ? kKvFlashLadderRungs : 0,
+                     (long long)slab, (long long)kc.ladder_bytes, kc.ladder_bytes / 1048576.0);
+    }
     if (!kvflash_headroom_ok(quota_chunks, kHeadroom)) {
         set_last_error("KVFlash quota of " + std::to_string(quota_chunks) + " chunks leaves no evictable block beside a headroom of 8");
         return false;
