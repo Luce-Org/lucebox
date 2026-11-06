@@ -13597,6 +13597,46 @@ TEST_CASE(ServerUnitFixture, test_pflash_relevance_spread_formula) {
     TEST_ASSERT(!pflash_relevance_spread({1, INFINITY}, {1, 0}, {0, 0}).valid);
 }
 
+// The first token (the attention sink) is a unit of its own: the spread does
+// not depend on how long the pinned chunk holding it is.
+TEST_CASE(ServerUnitFixture, test_pflash_selection_spread_scores_the_first_token_alone) {
+    using luce::common::pflash_relevance_spread;
+    using luce::common::pflash_selection_spread;
+    const auto near = [](double a, double b) { return std::fabs(a - b) < 1e-12; };
+    // Token scores: the sink 9.0, then a pinned header (0.1 each), then three
+    // candidates. Pinned alone, the sink chunk is [0, 1) and the header [1, 3).
+    const auto alone = pflash_relevance_spread({9.0, 0.1, 0.4, 0.3, 0.3},
+        {1, 1, 1, 0, 1}, {1, 1, 0, 0, 0});
+    TEST_ASSERT(alone.valid && alone.k == 2);
+    // The same tokens with the sink inside one pinned chunk of 3 or 35 tokens
+    // (a system turn), as per-token means and as sums.
+    for (const int pinned : {3, 35}) {
+        const double sum = 9.0 + 0.1 * (pinned - 1);
+        auto r = pflash_selection_spread({sum / pinned, 0.4, 0.3, 0.3},
+            {1, 1, 0, 1}, {1, 0, 0, 0}, pinned, 9.0, /*per_token=*/ true);
+        TEST_ASSERT(r.valid && r.k == 2 && r.candidates == 4);
+        TEST_ASSERT_MSG(near(r.spread, alone.spread),
+                        std::to_string(r.spread) + " vs " + std::to_string(alone.spread));
+        r = pflash_selection_spread({sum, 0.4, 0.3, 0.3},
+            {1, 1, 0, 1}, {1, 0, 0, 0}, pinned, 9.0, /*per_token=*/ false);
+        const auto summed = pflash_relevance_spread({9.0, 0.1 * (pinned - 1), 0.4, 0.3, 0.3},
+            {1, 1, 1, 0, 1}, {1, 1, 0, 0, 0});
+        TEST_ASSERT(r.valid && r.k == 2 && near(r.spread, summed.spread));
+    }
+    // Averaged into its chunk instead, the sink's weight falls with the
+    // chunk's length and the spread rises: what the unit prevents.
+    TEST_ASSERT(pflash_relevance_spread({(9.0 + 3.4) / 35, 0.4, 0.3, 0.3},
+        {1, 1, 0, 1}, {1, 0, 0, 0}).spread > 2 * alone.spread);
+    // A selected candidate chunk 0 keeps counting in k; the sink does not.
+    auto r = pflash_selection_spread({(9.0 + 0.2) / 3, 0.4, 0.3, 0.3},
+        {1, 1, 0, 1}, {0, 0, 0, 0}, 3, 9.0, true);
+    TEST_ASSERT(r.valid && r.k == 3);
+    // A one-token chunk 0, or no chunk, is the plain formula.
+    r = pflash_selection_spread({9.0, 0.4, 0.3}, {1, 1, 0}, {1, 0, 0}, 1, 9.0, true);
+    TEST_ASSERT(near(r.spread, pflash_relevance_spread({9.0, 0.4, 0.3}, {1, 1, 0}, {1, 0, 0}).spread));
+    TEST_ASSERT(!pflash_selection_spread({1.0, NAN}, {1, 0}, {0, 0}, 4, 0.5, true).valid);
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_spread_decision_region_plan) {
     using luce::common::http_detail::pflash_spread_decision;
     using luce::common::http_detail::pflash_spread_fires;
@@ -13714,12 +13754,17 @@ TEST_CASE(ServerUnitFixture, test_pflash_spread_in_selection_trace) {
     std::vector<uint8_t> selected(scores.size(), 0), forced(scores.size(), 0);
     for (int i : rows[1]["selected_chunks"].get<std::vector<int>>()) selected[(size_t) i] = 1;
     for (int i : rows[1]["forced_chunks"].get<std::vector<int>>()) forced[(size_t) i] = 1;
-    const auto again = luce::common::pflash_relevance_spread(scores, selected, forced);
+    const auto again = luce::common::pflash_selection_spread(scores, selected, forced,
+        rows[1].value("chunk_size", 0), rows[1].value("spread_first_token_score", -1.0),
+        rows[1].value("spread_per_token", false));
     TEST_ASSERT(again.valid && again.spread == on.spread);
+    TEST_ASSERT(rows[1].value("spread_first_token_score", -1.0) == (double) mass[0]);
     // Everything else in the record is identical with the flag on and off.
     json a = rows[0], b = rows[1];
-    b.erase("spread");
-    b.erase("spread_threshold");
+    for (const char * key : {"spread", "spread_threshold", "spread_first_token_score",
+                             "spread_per_token"}) {
+        b.erase(key);
+    }
     TEST_ASSERT(a == b);
 }
 
