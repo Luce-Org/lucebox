@@ -111,7 +111,8 @@ private:
     int plan_chunk(Qwen4ExpChunkPlan * plan = nullptr);
     int remote_layers_for(const Qwen4ExpChunkPlan & plan, size_t missing) const;
     bool start_seq_engine(); // no-op at --max-concurrency 1
-    size_t pflash_reserve(ggml_backend_t device) const;
+    // ctx < 0: the cache's context (none before the cache exists).
+    size_t pflash_reserve(ggml_backend_t device, int ctx = -1) const;
     // Weights, caches, hot experts, the prefill chunk and the prefix allowance, then the slot engine: init and
     // unpark share it, so an unpark sizes itself for the memory free at that time. release_target() undoes it.
     bool load_target();

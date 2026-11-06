@@ -477,9 +477,9 @@ bool Qwen4ExpBackend::load_hot_experts() {
 
 // Memory the PFlash drafter needs on `device` when it scores there: its weights
 // and a workspace that grows with the prompt, which can fill the context.
-size_t Qwen4ExpBackend::pflash_reserve(ggml_backend_t device) const {
+size_t Qwen4ExpBackend::pflash_reserve(ggml_backend_t device, int ctx) const {
     if (cfg_.pflash_gpu < 0 || !device || ggml_backend_cuda_get_device_id(device) != cfg_.pflash_gpu) return 0;
-    return cfg_.pflash_bytes + (size_t) std::max(0, cache_.max_ctx) * cfg_.pflash_bytes_per_token;
+    return cfg_.pflash_bytes + (size_t) std::max(0, ctx < 0 ? cache_.max_ctx : ctx) * cfg_.pflash_bytes_per_token;
 }
 
 // The prompt chunk, measured against free memory unless --chunk sets it (concurrent serving measures either way,
@@ -537,7 +537,8 @@ void Qwen4ExpBackend::size_kvflash_pool() {
     KvFlashAutoBudget budget;
     budget.free_bytes = (int64_t) qwen4exp_free_memory(backend_);
     // The decode graphs and a prompt chunk, which the planner sizes after, and a PFlash drafter on this GPU.
-    budget.reserve_bytes = (2ll << 30) + (int64_t) pflash_reserve(backend_);
+    // No cache yet: the drafter's per-token room is counted at the configured context.
+    budget.reserve_bytes = (2ll << 30) + (int64_t) pflash_reserve(backend_, cfg_.device.max_ctx);
     budget.bytes_per_token = cfg_.max_concurrency * n_full * w.n_head_kv *
         (int64_t) (ggml_row_size(GGML_TYPE_F16, w.n_embd_head_k) + ggml_row_size(GGML_TYPE_F16, w.n_embd_head_v));
     kvflash_pool_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{}, /*scorer_expected=*/false, budget);
