@@ -635,3 +635,106 @@ jobs:
             }
             Write-Host "Built: $($binary.FullName)"
           }
+
+  build-windows-hip:
+    # The Windows build above compiles CUDA only. This one compiles the HIP backend
+    # with AMD's ROCm SDK for Windows (pip wheels), where clang resolves some calls
+    # differently than on Linux (#944: std::memcpy inside a __global__ function).
+    # Compile and link only: GitHub-hosted runners have no AMD GPU.
+    name: Build Windows (ROCm HIP, server targets)
+    runs-on: windows-2022
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      ROCM_VERSION: 10.0.0
+      HIP_ARCH: gfx1201
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up MSVC Developer Command Prompt
+        # clang targets the MSVC ABI and needs its headers, libraries and linker.
+        uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
+        with:
+          arch: x64
+
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the ROCm ${{ env.ROCM_VERSION }} SDK for ${{ env.HIP_ARCH }}
+        # AMD's install guide for Windows: rocm[libraries,devel] from the stable
+        # wheel index, then rocm-sdk init unpacks the SDK (clang, HIP headers,
+        # hipBLAS, rocBLAS) under site-packages/_rocm_sdk_devel.
+        shell: pwsh
+        run: |
+          # A short root: hipBLASLt's kernel file names run close to the Windows path limit.
+          $venv = "$env:RUNNER_TEMP\r"
+          python -m venv $venv
+          # One retry: a file write in the 4 GB unpack can fail transiently (OSError 22).
+          foreach ($attempt in 1, 2) {
+            & "$venv\Scripts\python.exe" -m pip install --no-cache-dir `
+              --index-url https://stable.repo.amd.com/rocm/whl-next/ `
+              "rocm[libraries,devel,device-$env:HIP_ARCH]==$env:ROCM_VERSION"
+            if (-not $LASTEXITCODE) { break }
+            if ($attempt -eq 2) { exit $LASTEXITCODE }
+            Write-Host "pip install failed, retrying once"
+          }
+          & "$venv\Scripts\rocm-sdk.exe" init
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $root = (& "$venv\Scripts\rocm-sdk.exe" path --root).Trim()
+          $llvm = Join-Path $root "lib\llvm"
+          if (-not (Test-Path (Join-Path $llvm "bin\clang++.exe"))) {
+            Write-Error "clang++.exe not found under $llvm\bin"
+            exit 1
+          }
+          Write-Host "ROCm SDK: $root"
+          & (Join-Path $llvm "bin\clang++.exe") --version
+          "HIP_PATH=$root" >> $env:GITHUB_ENV
+          "ROCM_PATH=$root" >> $env:GITHUB_ENV
+          "HIP_PLATFORM=amd" >> $env:GITHUB_ENV
+          "HIP_DEVICE_LIB_PATH=$llvm\amdgcn\bitcode" >> $env:GITHUB_ENV
+          "LLVM_BIN=$llvm\bin" >> $env:GITHUB_ENV
+          (Join-Path $root "bin") >> $env:GITHUB_PATH
+          "$llvm\bin" >> $env:GITHUB_PATH
+
+      - name: Configure (cmake)
+        # On Windows ggml compiles its HIP sources as C++ through hip::device, which
+        # takes its --offload-arch from GPU_TARGETS; unset, it falls back to gfx906.
+        # ggml's HIP CMake finds hip, hipBLAS and rocBLAS from ROCM_PATH. The SDK's
+        # own nlohmann_json package points at a missing nlohmann_json.natvis, so
+        # the build skips it and downloads the pinned copy it uses everywhere else.
+        shell: pwsh
+        run: |
+          $clang = "$env:LLVM_BIN\clang.exe" -replace '\\', '/'
+          $clangxx = "$env:LLVM_BIN\clang++.exe" -replace '\\', '/'
+          cmake -S server -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DLUCE_GPU_BACKEND=hip `
+            -DLUCE_HIP_ARCHITECTURES="$env:HIP_ARCH" `
+            -DGPU_TARGETS="$env:HIP_ARCH" `
+            -DLUCE_FA_ALL_QUANTS=OFF `
+            -DCMAKE_C_COMPILER="$clang" `
+            -DCMAKE_CXX_COMPILER="$clangxx" `
+            -DCMAKE_HIP_COMPILER="$clangxx" `
+            -DCMAKE_DISABLE_FIND_PACKAGE_nlohmann_json=ON
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build Windows HIP targets
+        shell: pwsh
+        run: cmake --build build --target luce_server backend_ipc_daemon pflash_daemon -j 4
+
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          foreach ($binaryName in @("luce_server.exe", "backend_ipc_daemon.exe", "pflash_daemon.exe")) {
+            $binary = Get-ChildItem build -Recurse -Filter $binaryName -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $binary) {
+              Write-Error "$binaryName not found in build output"
+              exit 1
+            }
+            Write-Host "Built: $($binary.FullName) ($([math]::Round($binary.Length / 1MB, 1)) MB)"
+          }
