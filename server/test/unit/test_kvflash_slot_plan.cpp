@@ -98,6 +98,9 @@ TEST_CASE(KvflashSlotPlanFixture, admission_host_need_counts_prompt_plus_new_tok
     CHECK(kvflash_host_need_bytes(in) == 16 * kChunkBytes);          // 1024 tokens
     in.max_new_tokens = 25;                                          // 1025 tokens -> 17 chunks
     CHECK(kvflash_host_need_bytes(in) == 17 * kChunkBytes);
+    in.ladder_bytes = 3 * 150 * kMiB;
+    CHECK(kvflash_host_need_bytes(in) == 17 * kChunkBytes + 3 * 150 * kMiB);
+    in.ladder_bytes = 0;
     // 128K prompt at q8_0: 2048 chunks = 4.25 GiB.
     in = base_admit();
     in.prompt_tokens = 131072; in.max_new_tokens = 0;
@@ -125,6 +128,22 @@ TEST_CASE(KvflashSlotPlanFixture, admission_counts_the_global_transient_reserve)
     CHECK(kvflash_admit(in) == KvFlashAdmit::HostTooSmall);          // permanent: nothing else is reserved
     in.host_used_bytes = 2; in.transient_reserve_bytes = 100; in.host_budget_bytes += 1;
     CHECK(kvflash_admit(in) == KvFlashAdmit::BusyHost);              // fits alone, waits for others
+    in = base_admit();
+    in.host_budget_bytes = 16 * kChunkBytes + 100;
+    in.ladder_bytes = 101;
+    CHECK(kvflash_admit(in) == KvFlashAdmit::HostTooSmall);          // the ladder is part of what the request alone needs
+}
+
+TEST_CASE(KvflashSlotPlanFixture, the_ladder_charge_is_one_slab_per_rung_and_one_for_a_recall_turns_snapshot) {
+    constexpr int64_t kSlab = 150 * kMiB;
+    CHECK(kvflash_ladder_bytes(kSlab, false, true) == 3 * kSlab);    // checkpoint, trunk and the third rung
+    CHECK(kvflash_ladder_bytes(kSlab, true, true) == 4 * kSlab);     // the R snapshot beside the three rungs
+    CHECK(kvflash_ladder_bytes(kSlab, true, false) == kSlab);        // not sticky: no rungs
+    CHECK(kvflash_ladder_bytes(kSlab, false, false) == 0);
+    KvFlashAdmitInput now = base_admit(), before = now;
+    now.ladder_bytes = kvflash_ladder_bytes(kSlab, false, true);
+    before.ladder_bytes = 2 * kSlab;                                 // the two-rung ladder before the third rung
+    CHECK(kvflash_host_need_bytes(now) - kvflash_host_need_bytes(before) == kSlab);
 }
 
 TEST_CASE(KvflashSlotPlanFixture, admission_refuses_busy_slot_and_overlong_prompt_with_distinct_verdicts) {
