@@ -1171,7 +1171,8 @@ if(LUCE_TESTS)
         test_kernel_qualification_core
         test_cuda_copy_batch
         test_uma_budget
-        test_mmq_tile_twin_gate)
+        test_mmq_tile_twin_gate
+        test_glue_fusions)
 
     # Standalone check of the DS4 MIX histogram fitter: reuses the converter
     # source with its main() renamed away, so it needs the converter's
@@ -1204,6 +1205,15 @@ if(LUCE_TESTS)
     add_executable(test_mmq_tile_twin_gate test/unit/test_mmq_tile_twin_gate.cpp)
     target_include_directories(test_mmq_tile_twin_gate PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+
+    # Glue fusions host logic (ggml-cuda/glue-q8-memo.h, qwen35/glue_fusions.h):
+    # no GPU; ggml-base
+    # for the tensor helpers the graph scan calls.
+    add_executable(test_glue_fusions test/unit/test_glue_fusions.cpp)
+    target_include_directories(test_glue_fusions PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+    target_link_libraries(test_glue_fusions PRIVATE ggml-base)
 
     # Header-only platform shims must remain independently buildable and
     # runnable on hosted Windows workers without a GPU.
@@ -1580,6 +1590,18 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(bench_ds4_topk PRIVATE
             ggml ggml-base ${LUCE_GGML_BACKEND_TARGET} hip::host)
+    endif()
+    # Glue fusions on the GPU (Q8 memo, strided gates, gate|up stack): each arm
+    # runs in a child process and must hash-equal the all-off arm on every output, on
+    # ggml graphs and on a synthetic two-layer qwen35 target driven through
+    # Qwen35DFlashTarget; the q8_1 memo must hit exactly where glue-q8-memo.h
+    # allows. SKIP (77) without a GPU; labelled gpu below. POSIX only: the arms
+    # run through posix_spawn and /proc/self/exe.
+    if(UNIX)
+        add_executable(test_glue_fusions_gpu test/unit/test_glue_fusions_gpu.cpp)
+        target_include_directories(test_glue_fusions_gpu PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_glue_fusions_gpu PRIVATE luce_common ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
+        list(APPEND _raw_unit_test_targets test_glue_fusions_gpu)
     endif()
     add_executable(test_qwen35_tensor_parallel test/unit/test_qwen35_tensor_parallel.cpp)
     target_include_directories(test_qwen35_tensor_parallel PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
@@ -2969,7 +2991,8 @@ if(LUCE_TESTS)
         test_cuda_copy_batch
         test_qn_split_fusions
         test_uma_budget
-        test_mmq_tile_twin_gate)
+        test_mmq_tile_twin_gate
+        test_glue_fusions)
     foreach(_cppunit_target IN LISTS _new_cppunit_test_targets)
         if(TARGET ${_cppunit_target})
             target_sources(${_cppunit_target} PRIVATE test/unit/test_unit_main.cpp)
@@ -3037,6 +3060,9 @@ if(LUCE_TESTS)
                 endif()
             endif()
         endforeach()
+        if(TARGET test_glue_fusions_gpu)
+            set_tests_properties(test_glue_fusions_gpu PROPERTIES LABELS gpu)
+        endif()
         # test_paged_attn_wmma runs one route per process (the env selects it
         # and the launch counter pins it), so the auto-registered case above
         # only ever exercises the default WMMA route. Register the V_DOT2 pass

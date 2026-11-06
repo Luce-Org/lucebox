@@ -9,12 +9,17 @@
 #include "mmid.cuh"
 #include "rocmfp2_mix.cuh"
 #include "rocmfp3_mix.cuh"
+#include "glue-q8-memo.cuh"
+#include "glue-q8-memo.h"
+
+#include <atomic>
 
 #include <algorithm>
 
 static thread_local size_t g_mmq_launch_count = 0;
 static thread_local size_t g_mmq_twin_rows64_launch_count = 0;
 static thread_local size_t g_mmq_twin_rows32_launch_count = 0;
+static thread_local size_t g_glue_q8_memo_hit_count = 0;
 
 extern "C" size_t ggml_backend_cuda_get_mmq_launch_count(void) {
     return g_mmq_launch_count;
@@ -33,6 +38,169 @@ extern "C" void ggml_backend_cuda_set_mmq_twins_override(bool rows64, bool rows3
 extern "C" size_t ggml_backend_cuda_get_mmq_twin_launch_count(int tile_rows) {
     return tile_rows == 64 ? g_mmq_twin_rows64_launch_count :
            tile_rows == 32 ? g_mmq_twin_rows32_launch_count : 0;
+}
+
+extern "C" size_t ggml_backend_cuda_get_glue_q8_memo_hit_count(void) {
+    return g_glue_q8_memo_hit_count;
+}
+
+// Q8 memo: reuse the q8_1 activation an earlier MMQ call of the same graph
+// quantized (see glue-q8-memo.h for which calls may share one and why the
+// outputs are bit-identical). Where no entry serves a call,
+// luce_glue_q8_acquire returns nothing and ggml_cuda_mul_mat_q_impl
+// allocates, quantizes and launches as before.
+namespace {
+
+// How far ahead a quantizing matmul looks for readers of its activation. One
+// layer of the Qwen3.8 verify graph spans about 60 nodes, and the readers of
+// a normalized input sit within it (attn_qkv|gate and ssm_beta|alpha around
+// the conv step, the separate attn_gate after the recurrence).
+constexpr int LUCE_GLUE_Q8_WINDOW = 192;
+
+// The q8_1 layout ggml_cuda_mul_mat_q_impl quantizes src1 to for a weight
+// type (mmq_get_q8_1_ds_layout), or -1 for a type MMQ does not serve this
+// way. MXFP4 may take the native FP4 quantizer instead, so it never shares.
+int luce_glue_q8_layout(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+        case GGML_TYPE_Q3_0_ROCMFPX:
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_Q2_0_ROCMFP2:
+        case GGML_TYPE_NVFP4:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
+            return (int) mmq_get_q8_1_ds_layout(type);
+        default:
+            return -1;
+    }
+}
+
+// Release the entries no later node can reuse: those of another graph, and
+// those whose last predicted reader is at or before node `upto`.
+void luce_glue_q8_drop(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int upto) {
+    auto & memo = ctx.luce_glue_q8;
+    for (size_t i = 0; i < memo.size();) {
+        if (memo[i].graph != graph || memo[i].last_reader <= upto) {
+            memo.erase(memo.begin() + (std::ptrdiff_t) i);  // legacy pool: any free order
+        } else {
+            ++i;
+        }
+    }
+}
+
+struct luce_glue_q8_ref {
+    char * data  = nullptr;  // the q8_1 buffer to use; null: allocate locally (parent)
+    bool   reuse = false;    // it already holds src1's q8_1: skip the quantize launch
+};
+
+// For the dense MMQ call computing `dst`: the memo entry to read (reuse), a
+// new entry to quantize into because a later matmul will read it, or nothing
+// (the parent path). `excluded` names a path the memo never serves.
+luce_glue_q8_ref luce_glue_q8_acquire(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * dst, size_t nbytes, const char * excluded) {
+    if (!ggml_cuda_glue_q8_memo_on()) {
+        return {};
+    }
+    if (excluded != nullptr) {
+        return {};
+    }
+    // VMM pool: memo entries would be freed out of allocation order.
+    if (!ctx.pool().is_legacy()) {
+        return {};
+    }
+    if (!ctx.stream_context().concurrent_events.empty() || ctx.curr_stream_no != 0) {
+        return {};
+    }
+    const ggml_cgraph * graph = ctx.luce_glue_graph;
+    const int cur = ctx.luce_glue_node;
+    // A matmul outside the plain node loop (fused group or synthetic tensor).
+    if (graph == nullptr || cur < 0 || cur >= graph->n_nodes || graph->nodes[cur] != dst) {
+        return {};
+    }
+    const int layout = luce_glue_q8_layout(src0->type);
+    if (layout < 0 || !glue_q8_keyable(src1)) {
+        return {};
+    }
+    luce_glue_q8_drop(ctx, graph, cur - 1);
+
+    const ggml_tensor * root = glue_q8_reshape_root(src1);
+    for (const auto & e : ctx.luce_glue_q8) {
+        if (e.root == (const void *) root && e.data == src1->data && e.layout == layout &&
+            e.ne[0] == src1->ne[0] && e.ne[1] == src1->ne[1] && e.ne[2] == src1->ne[2] && e.ne[3] == src1->ne[3] &&
+            e.created < cur && cur <= e.clean_until && cur <= e.last_reader && e.nbytes >= nbytes) {
+            ++g_glue_q8_memo_hit_count;
+            return {e.buf->ptr, true};
+        }
+    }
+
+    const glue_q8_plan plan = glue_q8_scan(
+        graph->nodes, graph->n_nodes, cur, src1, layout, luce_glue_q8_layout, LUCE_GLUE_Q8_WINDOW);
+    if (plan.last_reader <= cur) {
+        return {};
+    }
+    ggml_backend_cuda_context::luce_glue_q8_entry ent;
+    ent.graph = graph;
+    ent.root = (const void *) root;
+    ent.data = src1->data;
+    for (int i = 0; i < 4; ++i) {
+        ent.ne[i] = src1->ne[i];
+    }
+    ent.layout = layout;
+    ent.created = cur;
+    ent.last_reader = plan.last_reader;
+    ent.clean_until = plan.clean_until;
+    ent.nbytes = nbytes;
+    ent.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes);
+    char * data = ent.buf->ptr;
+    ctx.luce_glue_q8.push_back(std::move(ent));
+    return {data, false};
+}
+
+// After the launches of the current node: free the entries it was the last
+// predicted reader of.
+void luce_glue_q8_release(ggml_backend_cuda_context & ctx, const luce_glue_q8_ref & ref) {
+    if (ref.data == nullptr) {
+        return;
+    }
+    luce_glue_q8_drop(ctx, ctx.luce_glue_graph, ctx.luce_glue_node);
+}
+
+}  // namespace
+
+// On; tests turn it off to compare with per-call quantization.
+static std::atomic<bool> g_glue_q8_memo_on{true};
+
+extern "C" void ggml_backend_cuda_set_q8_memo_override(bool on) {
+    g_glue_q8_memo_on.store(on, std::memory_order_relaxed);
+}
+
+bool ggml_cuda_glue_q8_memo_on() {
+    return g_glue_q8_memo_on.load(std::memory_order_relaxed);
+}
+
+void ggml_cuda_glue_q8_memo_clear(ggml_backend_cuda_context & ctx) {
+    ctx.luce_glue_q8.clear();
+    ctx.luce_glue_graph = nullptr;
+    ctx.luce_glue_node = -1;
 }
 
 namespace {
@@ -402,25 +570,37 @@ static void ggml_cuda_mul_mat_q_impl(
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
             get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        // The Q8 memo: empty (allocate and quantize here, as before)
+        // unless a memo entry serves this call: then src1's q8_1 goes
+        // into, or is already in, that entry.
+        const luce_glue_q8_ref glue_q8 = luce_glue_q8_acquire(
+            ctx, src0, src1, dst, nbytes_src1_q8_1,
+            grouped_src      ? "grouped-source activation (its own quantizer)" :
+            use_native_mxfp4 ? "native FP4 activation (its own quantizer)" :
+            src0_pair        ? "paired projection (one quantize already)" : nullptr);
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+        if (glue_q8.data == nullptr) {
+            src1_q8_1.alloc(nbytes_src1_q8_1);
+        }
+        char * const src1_q8 = glue_q8.data != nullptr ? glue_q8.data : src1_q8_1.get();
 
-        {
+        if (!glue_q8.reuse) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
             if (grouped_src) {
                 quantize_mmq_q8_1_grouped_cuda(
-                    src1_d, src1_q8_1.get(), src0->type,
+                    src1_d, src1_q8, src0->type,
                     ne10, grouped_width,
                     grouped_row_stride, grouped_plane_stride,
                     ne10_padded, ne11, stream);
             } else if (use_native_mxfp4) {
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_mxfp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_mxfp4_cuda(src1_d, nullptr, src1_q8, src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -435,7 +615,7 @@ static void ggml_cuda_mul_mat_q_impl(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr,
+            src0_d, src0->type, (const int *) src1_q8, nullptr, nullptr,
             mix_codebooks, mix_modes, dst_d,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
@@ -465,6 +645,7 @@ static void ggml_cuda_mul_mat_q_impl(
             }
             ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
         }
+        luce_glue_q8_release(ctx, glue_q8);
         return;
     }
 
