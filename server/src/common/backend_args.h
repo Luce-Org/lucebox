@@ -102,6 +102,8 @@ struct BackendArgs {
     // Concurrent decode slots (--max-concurrency). > 1 requires paged_attention;
     // the backend serves that many sequences through the seq_* slot API.
     int             max_concurrency  = 1;
+    // True when --max-concurrency was given (even as 1): an explicit 1 builds the seq engine.
+    bool            max_concurrency_set = false;
     // Total paged K/V pool in tokens shared by all slots (--kv-pool-tokens;
     // model-page-rounded). 0 = derive capacity from available device memory.
     long long       kv_pool_tokens   = 0;

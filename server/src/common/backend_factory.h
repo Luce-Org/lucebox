@@ -88,6 +88,7 @@ public:
         int stream_fd = -1;
         int chunk = 512;
         int max_concurrency = 1;
+        bool max_concurrency_set = false;
 
         PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
         int expert_top_k = 0;

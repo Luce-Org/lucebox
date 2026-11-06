@@ -176,6 +176,7 @@ BackendPreparation BackendPlanBuilder::resolve(
     plan.execution_.chunk =
         plan.model_.metadata.arch == "qwen4exp" && !args.chunk_set ? 0 : args.chunk;
     plan.execution_.max_concurrency = args.max_concurrency;
+    plan.execution_.max_concurrency_set = args.max_concurrency_set;
     plan.execution_.prefill_mode = args.ds4_prefill_mode;
     plan.execution_.expert_top_k = args.ds4_expert_top_k;
     plan.execution_.fused_decode = args.ds4_fused_decode;

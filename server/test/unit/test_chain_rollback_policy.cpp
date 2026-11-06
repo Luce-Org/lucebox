@@ -282,3 +282,60 @@ TEST_CASE(ChainRollbackPolicyFixture, kvflash_default_is_exact_rollback_and_fast
     CHECK( spec_fast_rollback_enabled(/*pager_on=*/false, /*fast_rollback=*/true,  /*explicit_optin=*/false));
     CHECK(!spec_fast_rollback_enabled(/*pager_on=*/false, /*fast_rollback=*/false, /*explicit_optin=*/true));
 }
+
+// C1.3-05: an explicit slot-pool cache serves ONE slot from a pool that is not
+// one sequence's capacity (KVFlash arena at N=1, seq engine at an explicit
+// --max-concurrency 1). n_seq_slots alone cannot say so.
+TEST_CASE(ChainRollbackPolicyFixture, one_slot_pool_cache_is_sized_by_ctx_alloc_not_by_one_sequence) {
+    const luce_test::ScopedEnvVar kv_f16("LUCE_KV_F16", "1");
+    const luce_test::ScopedEnvVar kv_q4("LUCE_KV_Q4", nullptr);
+    const luce_test::ScopedEnvVar kv_tq3("LUCE_KV_TQ3", nullptr);
+    const luce_test::ScopedEnvVar kv_k("LUCE_KV_K", nullptr);
+    const luce_test::ScopedEnvVar kv_v("LUCE_KV_V", nullptr);
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    CHECK(backend != nullptr);
+    if (!backend) return;
+
+    luce::common::TargetWeights weights;
+    weights.n_layer = 2;
+    weights.full_attention_interval = 2;
+    weights.n_embd_head_k = 32;
+    weights.n_embd_head_v = 32;
+    weights.n_head = 1;
+    weights.n_head_kv = 1;
+    weights.n_embd = 32;
+    weights.n_capture_layers = 0;
+    weights.ssm_d_inner = 32;
+    weights.ssm_d_state = 1;
+    weights.ssm_dt_rank = 1;
+    weights.ssm_n_group = 1;
+    weights.ssm_d_conv = 2;
+
+    const int max_ctx = 64, pool = 64 * 5 + 64;   // a pool of 5 chunks plus the scratch block
+    luce::common::TargetCache cache;
+    const bool ok = luce::common::create_target_cache_partial(
+        weights, max_ctx, /*max_verify_tokens=*/2, backend, cache,
+        /*prefill_only=*/false, /*layer_begin=*/0, /*layer_end=*/2,
+        /*allocate_target_feat=*/false, /*ctx_alloc=*/pool,
+        /*f32_ssm_intermediates=*/false, /*paged_attention=*/true,
+        /*n_seq_slots=*/1, /*concurrent_tree=*/false,
+        GGML_TYPE_COUNT, GGML_TYPE_COUNT, /*target_feat_cap=*/4096, /*slot_pool=*/true);
+    CHECK(ok);
+    if (ok) {
+        CHECK(cache.slot_pool);
+        CHECK(cache.n_seq_slots == 1);
+        REQUIRE(cache.attn_k.size() == 1);
+        CHECK(cache.attn_k[0]->ne[1] == pool);
+        CHECK(cache.rollback_ctx == nullptr);   // slot-pool caches skip the rollback context
+    }
+    luce::common::free_target_cache(cache);
+
+    // A plain one-slot cache is unchanged: not a slot pool, rollback allocated.
+    luce::common::TargetCache plain;
+    CHECK(luce::common::create_target_cache_partial(
+        weights, max_ctx, 2, backend, plain, false, 0, 2, false, 0));
+    CHECK_FALSE(plain.slot_pool);
+    CHECK(plain.rollback_ctx != nullptr);
+    luce::common::free_target_cache(plain);
+    ggml_backend_free(backend);
+}

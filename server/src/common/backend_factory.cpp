@@ -208,6 +208,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.cache_type_v       = cache.cache_type_v;
         cfg.paged_attention    = cache.paged_attention;
         cfg.max_concurrency    = execution.max_concurrency;
+        cfg.max_concurrency_set = execution.max_concurrency_set;
         cfg.kv_pool_tokens     = cache.kv_pool_tokens;
         cfg.kv_pool_reserve_bytes = cache.kv_pool_reserve_bytes;
         cfg.kq_stride_pad      = cache.kq_stride_pad;

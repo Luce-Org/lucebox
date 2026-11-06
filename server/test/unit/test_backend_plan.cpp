@@ -118,6 +118,21 @@ void test_deepseek_options_land_in_execution() {
     CHECK(plan.execution().chunk == 512);
 }
 
+void test_explicit_max_concurrency_one_is_distinguished_from_the_default() {
+    BackendPreparation unset = resolve(plain_args(), "qwen35");
+    CHECK(std::holds_alternative<BackendPlan>(unset));
+    CHECK(std::get<BackendPlan>(unset).execution().max_concurrency == 1);
+    CHECK(!std::get<BackendPlan>(unset).execution().max_concurrency_set);
+
+    BackendArgs args = plain_args();
+    args.max_concurrency = 1;
+    args.max_concurrency_set = true;
+    BackendPreparation set = resolve(std::move(args), "qwen35");
+    CHECK(std::holds_alternative<BackendPlan>(set));
+    CHECK(std::get<BackendPlan>(set).execution().max_concurrency == 1);
+    CHECK(std::get<BackendPlan>(set).execution().max_concurrency_set);
+}
+
 void test_qwen4exp_defaults_to_auto_chunks() {
     BackendPreparation result = resolve(plain_args(), "qwen4exp");
     CHECK(std::holds_alternative<BackendPlan>(result));
@@ -279,6 +294,7 @@ void test_no_draft_target_only_disables_speculation() {
 TEST_CASE(BackendPlanFixture, backend_plan_suite) {
     test_plan_owns_the_effective_request();
     test_deepseek_options_land_in_execution();
+    test_explicit_max_concurrency_one_is_distinguished_from_the_default();
     test_qwen4exp_defaults_to_auto_chunks();
     test_qwen4exp_split_placement_lands_in_placement();
     test_specla_without_fast_rollback_falls_back();
