@@ -163,6 +163,10 @@ profile and the requirements checked at startup.
 - `LUCE_MOE_SIDE_COPY` - moe_hybrid_ffn_eval.cpp (=1: another device's owner input crosses on the producer's side stream, so the producer keeps computing; set by `--profile ds41-r9700-gorgon`)
 - `LUCE_ROCMFP2_WMMA_PREFILL` - mix-wmma-moe.cu (ggml-cuda) (=1: plain ROCmFP2 prefill batches on gfx1151 take the WMMA routed-expert GEMM; set by `--profile ds41-r9700-gorgon` and `ds41-gorgon`)
 - `GGML_CUDA_MLA_SPLIT_KV_COUNT` - fattn.cu (ggml-cuda) (4, 8 or 16 split-KV segments for the D=512 indexed decode kernel; default 4; set to 8 by `--profile ds41-r9700-gorgon`)
+- `LUCE_DS4_LANE_BATCH` - deepseek4/deepseek4_graph.cpp (=1: the single-token lanes of a tokenwise verify layer attend in one split-KV flash op instead of one op chain per lane; off unless set; set by `--profile ds41-r9700-gorgon` and cluster mode)
+- `LUCE_DS4_SCHED_DEDICATED_COPIES` - deepseek4/deepseek4_fused_verify.inc (=1: the verifier's split inputs own their storage, a few MiB, so the host never waits for a device to drain before queueing the next split; off unless set; set by `--profile ds41-r9700-gorgon` and cluster mode)
+- `LUCE_DS4_HC_BOUNDARY_SPLIT` - ds4-hc.cu (ggml-cuda) (=1: the HC mix runs over several blocks per token while they all fit resident at once, else one block per token; off unless set; set by `--profile ds41-r9700-gorgon` and cluster mode)
+- `GGML_CUDA_PEER_COPY_KERNEL` - ggml-cuda.cu (ggml-cuda) (=1: the peer copies of one handoff leave as one kernel on the producer stream instead of a runtime blit per tensor; off unless set; set by `--profile ds41-r9700-gorgon` and cluster mode)
 - `LUCE_PREFILL_UBATCH` - qwen35/prefill_helpers.h
 - `LUCE_QWEN35_MASK_FULL_WIDTH` - qwen35/prefill_helpers.h
 - `LUCE_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h
