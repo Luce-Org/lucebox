@@ -1341,7 +1341,7 @@ TEST_CASE(ModelRoutingFixture, test_a_trickled_body_is_closed_at_the_total_deadl
 }
 
 TEST_CASE(ModelRoutingFixture, test_status_subscriber_33_gets_503_and_the_first_32_stay_open) {
-    RunningModels models;
+    RunningModels models(false, false, false);   // /status/events is a single-model endpoint
     std::vector<Socket> subscribers;
     for (int i = 0; i < 32; ++i) {
         subscribers.push_back(models.connect_client());
@@ -1349,6 +1349,7 @@ TEST_CASE(ModelRoutingFixture, test_status_subscriber_33_gets_503_and_the_first_
         pollfd pfd{subscribers.back().get(), POLLIN, 0};   // headers + initial event: registered
         ROUTING_CHECK(poll(&pfd, 1, 2000) == 1);
     }
+    std::this_thread::sleep_for(200ms);   // the handlers register right after their first event
     auto extra = models.connect_client();
     extra.send("GET /status/events HTTP/1.1\r\nHost: localhost\r\n\r\n");
     const auto response = extra.read();
