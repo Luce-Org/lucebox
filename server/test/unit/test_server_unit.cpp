@@ -16658,6 +16658,44 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_rejects_corrupt_tensor_metadata) {
     rm_rf(dir);
 }
 
+// A caller that names the layout (the KVFlash pinned heads, whose payload is not the model's KV tensors)
+// writes, pins and reads back under that layout, across a restart, whatever tensors the snapshot holds.
+TEST_CASE(ServerUnitFixture, test_disk_cache_use_layout_names_the_layout_a_snapshot_is_saved_under) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_use_layout").string();
+    rm_rf(dir);
+    const auto key = disk_test_key(40, 7);
+    const auto ref = backend.snapshot_ref(0);
+    std::array<uint8_t, 16> id{};
+    for (size_t i = 0; i < id.size(); i++) id[i] = (uint8_t)(0xA0 + i);
+    std::string layout, pinned;
+    {
+        DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.use_layout(id);
+        TEST_ASSERT(cache.layout_name() == "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf");
+        TEST_ASSERT(cache.save_async(
+            OwnedSnapshot::clone_to_host(ref.ctx, ref.cur_pos, ref.last_tok), key));
+        TEST_ASSERT(cache.layout_name() == "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf");  // the snapshot did not re-learn it
+        pinned = cache.pin(key, true);
+        TEST_ASSERT(pinned.find("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf") != std::string::npos);
+        TEST_ASSERT(cache.drain().cancelled == 0);
+        TEST_ASSERT(cache.contains(key));
+    }
+    {
+        DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.use_layout(id);
+        TEST_ASSERT(cache.contains(key));
+        const OwnedSnapshot back = cache.load(key);
+        TEST_ASSERT(!back.empty() && back.cur_pos() == ref.cur_pos);
+        TEST_ASSERT(cache.pinned_files() == std::vector<std::string>{pinned});
+    }
+    rm_rf(dir);
+}
+
 // Writes are asynchronous: a queued snapshot counts against the budget and
 // is served from memory at once; the payload handed over is owned by the
 // cache; the budget is clamped to the free space.
