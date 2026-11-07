@@ -32,6 +32,10 @@
 #include "common/kvflash_bundle_digest.h"
 #include "common/kvflash_session_store.h"
 #include "common/kvflash_slot_bundle.h"
+#include "common/kvflash_head_snapshot.h"
+#include "common/kvflash_pinned_head.h"
+#include "server/kv/checkpoint_store.h"
+#include "server/kv/disk_prefix_cache.h"
 #include "server/kv/disk_store.h"
 #include "common/kvflash_slot_turn.h"
 #include "common/kvflash_step_driver.h"
@@ -46,9 +50,11 @@
 #include <chrono>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace luce::common {
@@ -310,6 +316,7 @@ private:
         SlotStateSnapshot snap;
         bool snap_ok = false;
         bool tainted = false;        // in a failed step cohort: never parked
+        std::vector<int32_t> capture_ids;   // the head's tokens while its capture cut is ahead (empty: none)
     };
     std::vector<SlotRecall> recall_;
     bool recall_on_ = false;                          // the recall profile is on for the slot engine
@@ -364,6 +371,21 @@ private:
     uint64_t tenant_id_ = 0;
     std::unique_ptr<KvFlashBundleWriter> bundle_writer_;   // the park saves, off the step thread (after bundle_failed_: it uses it)
     void init_bundles_();
+    // Pinned heads (kvflash_pinned_head.h): the shared system/tools prefix #941's cut found, rounded to the chunk grid. A
+    // slot that prefilled it pins its chunks and keeps one copy here (host memory, at most kHeadsHost); a later slot with
+    // the same head attaches that copy instead of prefilling it. With the cache directory open, each head is also a
+    // pooled file in it under a layout of its own (the execution identity), so it survives a restart.
+    KvFlashHeadBinder head_binder_{0};
+    std::unordered_map<uint64_t, KvFlashHead> heads_;   // by hash of the head's chunks
+    std::deque<uint64_t> head_order_;                   // insertion order, oldest first
+    std::unique_ptr<CheckpointStore> head_nostore_;     // the disk view's checkpoint side: heads are never backend checkpoints
+    std::unique_ptr<DiskPrefixCache> head_disk_;        // null: heads stay in host memory (sessions off or the directory not open)
+    int head_k_max_ = 0;                                // chunks a head may pin; 0: heads off
+    int head_pinned_files_ = 0;                         // head files pinned in the directory by this process
+    void init_heads_();
+    const KvFlashHead * find_head_(const std::vector<int32_t> & prompt, int k);   // host copy, else the file; null when unknown
+    const KvFlashHead * keep_head_(KvFlashHead h);
+    void capture_head_(int slot);                       // the slot holds exactly its head: keep it, bind the slot, persist it
     std::string adopt_bundle_(int slot, const std::string & key, bool * refused, bool evict_for_room = false, bool * busy = nullptr);   // load sessions/<key>/ into the slot's pager; "" or why not (refused: the bundle itself is unusable here)
     KvFlashRestore restore_from_disk_(const AdmitMeta & who, const std::vector<int32_t> & prompt, int e_role);   // a disk session of this request into a slot
     void save_bundle_(int slot, ParkedSession & ps);   // ps is unchanged on return but for the rungs' file ids
@@ -392,7 +414,7 @@ private:
     void begin_resume_(int slot);                     // residency to the recent state before the turn's first pass
     std::vector<int> pending_rewind_;                 // slots whose first pass ended this step
     int capture_rows_ = 0;                            // query rows the graph captured this step
-    void plan_slot_turn_(int slot, const std::vector<int32_t> & prompt, int kv_offset);
+    void plan_slot_turn_(int slot, const std::vector<int32_t> & prompt, int kv_offset, int capture_at = -1);
     // Mode 5: the drafter's picks of the slot's turn, applied when its prefill reaches R (no first pass, no rewind).
     void apply_recall5_(int slot);
     // The first pass of a slot ended this step: score, restore the R state, rewind, apply the picks; the replay follows.

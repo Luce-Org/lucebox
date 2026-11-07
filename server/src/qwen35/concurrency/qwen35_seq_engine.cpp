@@ -102,6 +102,26 @@ Qwen35SeqEngine::Qwen35SeqEngine(
     init_slots_();
 }
 
+namespace {
+// The head files' disk view never touches a checkpoint: a head goes in and out as host bytes (OwnedSnapshot).
+class NoCheckpoints final : public CheckpointStore {
+public:
+    int granularity() const override { return 1; }
+    int restore_point_spacing() const override { return 0; }
+    bool prefill_cuts_at_restore_points() const override { return false; }
+    size_t estimate_bytes(int) const override { return 0; }
+    bool used(Checkpoint) const override { return false; }
+    int position(Checkpoint) const override { return 0; }
+    void free(Checkpoint) override {}
+    Checkpoint staging() const override { return {}; }
+    ModelBackend::SnapshotRef ref(Checkpoint) const override { return {}; }
+    OwnedSnapshot detach(Checkpoint) override { return {}; }
+    bool adopt(Checkpoint, OwnedSnapshot &) override { return false; }
+};
+constexpr size_t kHeadsHost = 16, kHeadsPinned = 16;           // heads kept in host memory, head files pinned on disk
+constexpr uint64_t kHeadRequest = 0x4b56480000000000ULL;      // ledger ids of an attached head: no HTTP request reaches them
+}  // namespace
+
 void Qwen35SeqEngine::init_slots_() {
     const int n_slots = slots_.slot_count();
     slot_draft_kv_.resize(static_cast<size_t>(n_slots));
@@ -131,6 +151,7 @@ void Qwen35SeqEngine::init_slots_() {
         if (end_rung_min_ >= 0)
             std::fprintf(stderr, "[kvflash] slot header rung on recall turns with end - R >= %d (LUCE_KVFLASH_END_RUNG_MIN)\n", end_rung_min_);
         init_bundles_();
+        init_heads_();
     }
     if (kvf_)
         std::fprintf(stderr, "[kvflash] slot recall: %s (mode=%d queries=%d k=%d unit=%d uq=%d preamble=%d)\n",
@@ -683,6 +704,13 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
         }
     KvFlashAdmitIn plan_in;
     plan_in.e_role = e_role; plan_in.can_archive = book_.persistent(); plan_in.from_disk = restored;
+    // The pinned head: the server's cut rounded to the chunk grid (the role end when sharing is off), attached when
+    // known, captured at its cut otherwise. k depends on the prompt alone; what is known only picks attach or capture.
+    const int hct = (int)kvf_kv_->block_size();
+    if (head_k_max_ > 0)
+        plan_in.pd = kvflash_head_decide(prompt, kvflash_head_boundary(who.head_cut, e_role, hct, kKvFlashCutU), hct,
+                                         kvflash_head_unit(hct, kKvFlashCutU), head_k_max_,
+                                         [&](uint64_t, int k) { return find_head_(prompt, k) != nullptr; });
     if (pick.exact()) {
         const ParkedSession & ps = parked_[(size_t)pick.slot];
         plan_in.pick_slot = pick.slot; plan_in.lcp = pick.lcp;
@@ -795,7 +823,29 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
         result.error = "all sequence slots are live";
         return result;
     }
-    for (;;) {
+    // Rows 4 and 6: a new instance starts from the pinned head (L = k chunks) instead of prefilling it. Any failure leaves the
+    // slot free and the request cold below.
+    int attached_at = 0;
+    if ((plan.action == KvFlashAdmitAction::attach || plan.action == KvFlashAdmitAction::archive_attach) && plan.L > 0) {
+        const KvFlashHead * head = find_head_(prompt, plan.L / hct);
+        SlotStateSnapshot hs;
+        if (head && kvflash_slab_unpack(head->slab.data(), head->slab.size(), hs.ssm, hs.conv) &&
+            kvflash_head_attach(*kvf_kv_, head_binder_, slot, kHeadRequest + (uint64_t)slot, *head)) {
+            if (restore_slot_state(b_.cache_, slot, hs)) {
+                for (;;) {
+                    kvf_kv_->set_next_total_tokens(total);
+                    kvf_kv_->set_next_resume(slot, (uint32_t)plan.L);
+                    result = slots_.admit_at(slot, request_id, prompt, sampler, plan.L);
+                    const int old = result.status == AdmitResult::Status::busy ? evict_oldest_("host budget needed to attach a head", keep_slot) : -1;
+                    if (old < 0) break;
+                }
+                if (result.status == AdmitResult::Status::admitted) attached_at = plan.L;
+            }
+            if (!attached_at) { kvf_kv_->drop_parked(slot); head_binder_.unbind(slot); }
+        }
+        std::fprintf(stderr, "[kvflash] slot %d pinned head attach %s (L=%d)\n", slot, attached_at ? "ok" : "FAILED: cold", plan.L);
+    }
+    if (!attached_at) for (;;) {
         kvf_kv_->set_next_total_tokens(total);
         kvf_kv_->set_next_slot(slot);
         result = slots_.admit_at(slot, request_id, prompt, sampler, 0);
@@ -812,10 +862,17 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
         bundle_failed_[(size_t)result.slot] = false;
         book_[result.slot].resume_L = 0;
         clear_slot_images(result.slot);
+        if (attached_at) {   // KV and state are the head's; the feature ring holds the last occupant's below L, as on a resume
+            reset_slot_draft_kv(result.slot);
+            set_feat_from_(result.slot, attached_at);
+            begin_resume_(result.slot);
+            plan_slot_turn_(result.slot, prompt, attached_at);
+            return result;
+        }
         reset_recurrent_slot(b_.cache_, result.slot);
         reset_slot_draft_kv(result.slot);
         set_feat_from_(result.slot, 0);
-        plan_slot_turn_(result.slot, prompt, 0);
+        plan_slot_turn_(result.slot, prompt, 0, plan.capture_at > 0 ? plan.capture_at : -1);
     }
     return result;
 }
@@ -1154,6 +1211,7 @@ std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bo
     ps.history = book_.adopt(slot, key, std::move(l.head));
     parked_[(size_t)slot] = std::move(ps);
     bundle_failed_[(size_t)slot] = false;
+    const bool rebind = head_k_max_ > 0;   // the digest below is taken before the rebind (pins are not state)
     if (kvflash_bundle_digest_on()) {   // the installed session, re-read through the save's staging; before the pins, the rebind and any reselect
         ParkedSession & q = parked_[(size_t)slot];
         if (const std::string & fault = kvflash_digest_fault(); !fault.empty()) {   // R3 negative control (test hook): corrupt one byte of the live restored slot
@@ -1169,7 +1227,80 @@ std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bo
         if (snapshot_slot_state(b_.cache_, slot, live)) log_bundle_digest_("restore", slot, key, gen, q.history, live, q.ckpt, q.trunk, q.extra, t0);
         else std::fprintf(stderr, "[kvflash-digest] restore sid=%s gen=%u unavailable: slab snapshot failed\n", key.c_str(), gen);
     }
+    if (rebind) {   // the session pinned a head when it parked: pin it again (its history must still start with that head)
+        const KvFlashSessionEntry * me = book_.store().find_key(key);
+        if (me && !me->preamble.empty() && me->preamble_chunks > 0 &&
+            !kvflash_head_rebind(*kvf_kv_, head_binder_, slot, parked_[(size_t)slot].history, std::strtoull(me->preamble.c_str(), nullptr, 16), me->preamble_chunks))
+            std::fprintf(stderr, "[kvflash] slot %d session %s: its pinned head does not hold, the slot runs unpinned\n", slot, key.c_str());
+    }
     return "";
+}
+
+void Qwen35SeqEngine::init_heads_() {
+    const KvFlashSlotPager & p0 = kvf_kv_->pager(0);
+    head_binder_ = KvFlashHeadBinder(slots_.slot_count());
+    kvf_kv_->set_binder(&head_binder_);
+    head_k_max_ = sticky_on_ ? kvflash_head_k_max(p0.n_pool_blocks()) : 0;
+    if (head_k_max_ <= 0) { std::fprintf(stderr, "[kvflash] pinned heads: off\n"); return; }
+    if (disk_) {
+        DiskCacheConfig dc;
+        dc.cache_dir = bundle_dir_;
+        dc.min_tokens = 1;
+        head_nostore_ = std::make_unique<NoCheckpoints>();
+        auto disk = std::make_unique<DiskPrefixCache>(dc, *head_nostore_);
+        if (disk->init() && !disk->disabled()) {
+            disk->use_layout(kvflash_head_layout_id(identity_key_()));
+            head_disk_ = std::move(disk);
+        }
+    }
+    std::fprintf(stderr, "[kvflash] pinned heads: up to %d chunks per slot, %s\n", head_k_max_,
+                 head_disk_ ? "persisted in the cache directory" : "host memory only");
+}
+
+const KvFlashHead * Qwen35SeqEngine::keep_head_(KvFlashHead h) {
+    const uint64_t hash = h.hash;
+    if (heads_.emplace(hash, std::move(h)).second) head_order_.push_back(hash);
+    while (heads_.size() > kHeadsHost) { heads_.erase(head_order_.front()); head_order_.pop_front(); }   // the file, if any, stays
+    const auto it = heads_.find(hash);
+    return it == heads_.end() ? nullptr : &it->second;
+}
+
+const KvFlashHead * Qwen35SeqEngine::find_head_(const std::vector<int32_t> & prompt, int k) {
+    const int ct = (int)kvf_kv_->block_size();
+    const std::vector<uint64_t> path = kvflash_head_hashes(prompt, k, ct);
+    if (k <= 0 || (int)path.size() < k) return nullptr;
+    if (const auto it = heads_.find(path.back()); it != heads_.end()) return it->second.k == k ? &it->second : nullptr;
+    if (!head_disk_) return nullptr;
+    const std::vector<int32_t> key(prompt.begin(), prompt.begin() + (size_t)k * (size_t)ct);
+    if (!head_disk_->contains(key)) return nullptr;
+    KvFlashHead h;
+    const OwnedSnapshot snap = head_disk_->load(key);
+    if (!kvflash_head_from_snapshot(snap, key, ct, kvf_kv_->pager(0).chunk_bytes(), h) || h.hash != path.back()) return nullptr;
+    std::fprintf(stderr, "[kvflash] pinned head of %d chunks read from the cache directory\n", k);
+    return keep_head_(std::move(h));
+}
+
+// The slot's prefill stopped at the head's capture cut: it holds exactly the head's chunks and its recurrent state is the
+// head's. The head is kept once, the slot pinned to it, and the file written (pinned in the directory up to kHeadsPinned).
+void Qwen35SeqEngine::capture_head_(int slot) {
+    SlotRecall & rc = recall_[(size_t)slot];
+    const std::vector<int32_t> ids = std::move(rc.capture_ids);
+    rc.capture_ids.clear();
+    KvFlashSlotPager & p = kvf_kv_->pager(slot);
+    const int ct = p.chunk_tokens(), k = (int)ids.size() / std::max(1, ct);
+    SlotStateSnapshot snap;
+    if (!snapshot_slot_state(b_.cache_, slot, snap)) { std::fprintf(stderr, "[kvflash] slot %d head not captured: slab snapshot failed\n", slot); return; }
+    KvFlashHead h = kvflash_head_capture(head_binder_, slot, p, ids, k, head_k_max_, kvflash_slab_pack(snap.ssm, snap.conv));
+    if (h.k == 0) { std::fprintf(stderr, "[kvflash] slot %d head of %d chunks not captured (past the %d-chunk bound or the pager lacks them)\n", slot, k, head_k_max_); return; }
+    std::fprintf(stderr, "[kvflash] slot %d pinned head captured: %d chunks (%d tokens), %.1f MiB\n", slot, h.k, h.k * ct,
+                 (h.hdr.size() + h.chunks.size() + h.slab.size()) / 1048576.0);
+    if (heads_.count(h.hash)) return;   // another slot kept the same head first
+    if (head_disk_) {
+        OwnedSnapshot s = kvflash_head_to_snapshot(h, ct);
+        if (head_disk_->save_async(std::move(s), ids) && head_pinned_files_ < (int)kHeadsPinned && !head_disk_->pin(ids, true).empty())
+            ++head_pinned_files_;
+    }
+    keep_head_(std::move(h));
 }
 
 // A request whose sid names a session on disk (or a migrated one its prompt extends) brings it back
@@ -1333,6 +1464,7 @@ void Qwen35SeqEngine::save_bundle_(int slot, ParkedSession & ps) {
         st.bytes_live = live * rb + c.head.size();
         for (const auto & f : c.files) st.bytes_live += f.second.size();
         st.bytes_dead = h.log_bytes - kKvFlashLogHeader - live * rb;
+        if (const KvFlashHeadBinding hb = head_binder_.binding(slot); hb.k > 0) { st.preamble = kvflash_hex16(hb.hash); st.preamble_chunks = hb.k; }   // the head it pins
         if (!book_.publish_park(slot, st, (int64_t)std::time(nullptr))) {   // no room in the cache budget, or the session's identity is not durable
             std::fprintf(stderr, "[kvflash] slot %d bundle not saved: session %s has no room in the cache budget or its identity is not durable\n", slot, sb.key.c_str());
             return;   // publish_park marked the session `rewrite`: it is not evictable until a park lands
@@ -1361,7 +1493,7 @@ void Qwen35SeqEngine::begin_resume_(int slot) {
 // C1.4: the slot's turn (kvflash_slot_turn.h). R > kv_offset snapshots at the
 // cut ending at R; R == kv_offset snapshots the resume state now. A recall turn
 // has a sealed chunk before R (the plan), so R > 0.
-void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & prompt, int kv_offset) {
+void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & prompt, int kv_offset, int capture_at) {
     SlotRecall & rc = recall_[(size_t)slot];
     rc = SlotRecall{};
     KvFlashSlotPager & p = kvf_kv_->pager(slot);
@@ -1378,7 +1510,8 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
     const int max_turn = ct > 0 ? luce::common::kvflash_max_turn_tokens(ct, usable, b_.kvflash_preamble_reserve_ / ct,
                                                                         luce::common::kKvFlashRecallUnit * b_.kvflash_recall_blocks_) : 0;
     rc.turn = kvflash_slot_turn_plan(prompt, kv_offset, b_.w_.im_start_id, b_.w_.user_id, ct, usable, kKvFlashCutU,
-                                     b_.kvflash_select_queries_, recall_on_, end_rung_min_, b_.kvflash_prefill_reselect_ == 5, max_turn);
+                                     b_.kvflash_select_queries_, recall_on_, end_rung_min_, b_.kvflash_prefill_reselect_ == 5, max_turn, capture_at);
+    if (rc.turn.capture_at > 0) rc.capture_ids.assign(prompt.begin(), prompt.begin() + rc.turn.capture_at);
     if (uq_queries_ > 0) {
         // The latest human question: its end is a cut of every pass and its last queries join the scorer's.
         // A prefill that covers the window captures them (whatever the slot's store holds: the same request
@@ -1418,7 +1551,7 @@ void Qwen35SeqEngine::apply_recall5_(int slot) {
     kvf_->complete_all();
     p.set_deferred_free(false);
     b_.kvflash_prefill_apply_on(p, rc.scores, rc.turn.apply_at, rc.turn.end, rc.turn.reserve_chunks,
-                                rc.turn.apply_at - 1, rc.score_ms, "; pflash2", slot);
+                                rc.turn.apply_at - 1, rc.score_ms, "; pflash2", slot, head_binder_.pins(slot));
     p.set_deferred_free(true);
     rc.turn.apply_at = -1;
 }
@@ -1483,7 +1616,7 @@ bool Qwen35SeqEngine::rewind_slot_turn_(int slot) {
     const bool rewound = slots_.rewind_prefill(slot, r);
     if (rewound) set_feat_from_(slot, feature_valid_after_rewind(feat_from_of_(slot), cur_before_rewind, r, b_.cache_.target_feat_cap));
     if (rewound && scored)
-        b_.kvflash_prefill_apply_on(p, rc.scores, r, end, rc.turn.reserve_chunks, end - 1, score_ms, "; rewind", slot);
+        b_.kvflash_prefill_apply_on(p, rc.scores, r, end, rc.turn.reserve_chunks, end - 1, score_ms, "; rewind", slot, head_binder_.pins(slot));
     p.set_deferred_free(true);
     if (!rewound) {
         std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4 @%d: rewind failed\n", slot, r);
@@ -3418,6 +3551,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             if (ts.snapshot) rc.snap_ok = snapshot_slot_state(b_.cache_, slot, rc.snap);
             if (ts.capture && slot == capture_slot) pending_rewind_.push_back(slot);
             if (ts.ckpt && sticky_on_) take_ckpt_(slot, prefills[i].kv_pos + prefills[i].chunk);   // the header rung (Rule A)
+            if (ts.preamble && !rc.capture_ids.empty()) capture_head_(slot);                       // the pinned head
         }
     }
     const auto kvf_t_gr = kvf_clock::now();
