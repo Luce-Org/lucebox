@@ -591,6 +591,20 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
         }
 
+        // An engine that plans no prefix store (KVFlash slots) pins the head
+        // itself: it gets the same cut, found once, with the ring joined.
+        int head_cut = 0;
+        if (!prefix_supported && !req.images) {
+            if (job->shared_prefix_cut < 0) {
+                const auto boundaries = find_all_boundaries(
+                    req.prompt_tokens, prefix_cache_.chat_markers());
+                job->shared_prefix_cut = shared_prefixes_.head_cut(
+                    req.prompt_tokens, boundaries, !req.tools.empty());
+                kv_cache_.remember_prefix(req.prompt_tokens, boundaries);
+            }
+            head_cut = job->shared_prefix_cut;
+        }
+
         // Admission only claims the slot and queues the prompt. Prefill
         // advances one chunk per engine step alongside live decode.
         const PrefixStorePlan & requested_plan = cache_plan.plan;
@@ -605,7 +619,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                   next_request_id, req.prompt_tokens, req.sampler,
                   (std::min)(n_gen_cap, engine.max_context() -
                                             (int)req.prompt_tokens.size() + 1),
-                  SeqEngine::AdmitMeta{req.session.sid, req.session.client});
+                  SeqEngine::AdmitMeta{req.session.sid, req.session.client, head_cut});
 
         const PrefixStoreAdmission & prefix = ar.prefix_store;
         const std::string prefix_protocol_error = kv_cache_.admitted(

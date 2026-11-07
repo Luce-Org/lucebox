@@ -196,7 +196,8 @@ public:
     // capacity for the whole request. `meta` carries the request's session
     // identity (empty when the client sent none). The default ignores both.
     // Image and prefix-store admissions carry neither.
-    struct AdmitMeta { std::string sid, client; };
+    // head_cut (0 when not given): the shared system/tools head the server found (tokens); 0 none, -1 sharing is off.
+    struct AdmitMeta { std::string sid, client; int head_cut; };
     virtual AdmitResult admit_bounded(uint64_t request_id,
                                       const std::vector<int32_t> & prompt,
                                       const SamplerCfg & sampler,
