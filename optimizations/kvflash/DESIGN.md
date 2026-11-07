@@ -244,8 +244,21 @@ and masks through it. What differs per arch:
   semantics map directly onto the pool's validity rule). Measured:
   identical acceptance pooled vs full (407/3104 = 13.1%, avg_commit
   3.09, identical text).
+- **qwen4exp** (Qwen3.8-Flash-Next): pools the 12 full-attention layers on
+  the target, alone or with the experts on a second device
+  (`--expert-device`; the pool stays on the target, never in the remote
+  layers). While the context fits the pool the rows are the identity map,
+  so masks, spans and the stable decode/verify graphs are the plain
+  path's; past it every forward (prompt chunk, T=1, MTP verify, batched
+  decode) writes through `kv_row` and masks in slot space. A forward
+  writes at most pool - 128 rows, so its own chunks stay resident. QSA is
+  off under a pool (dense attention over the pool), the MTP draft layer
+  keeps one row per position, each concurrency slot has its own pager,
+  and prefix snapshots save only while identity-mapped. LRU only: no
+  residency scorer yet, so `--kvflash-policy` / `--kvflash-tau` do not
+  apply.
 
-Policy: drafter-scored residency is the default on all four archs. The
+Policy: drafter-scored residency is the default on the other four archs. The
 server probes for the Qwen3.5-0.8B next to the model (or --prefill-drafter)
 and lazy-loads it at the first reselect; `--kvflash-policy lru` opts out.
 qwen35/qwen35moe feed the drafter target ids directly; laguna/gemma4 use

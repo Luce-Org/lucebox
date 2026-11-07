@@ -294,7 +294,7 @@ profile and the requirements checked at startup.
 - `LUCE_GPU_VERIFY_ARGMAX` - qwen35_dflash_target.cpp
 - `LUCE_HIP_BACKEND_PATH` - dynamic_backend.cpp
 - `LUCE_IGNORE_EOS` - laguna_backend.cpp
-- `LUCE_KVFLASH` - gemma4_backend.cpp, gemma4_layer_split_adapter.cpp, kvflash_pager.h, laguna_backend.cpp, laguna_layer_split_adapter.cpp, qwen35_backend.cpp, qwen35_layer_split_adapter.cpp
+- `LUCE_KVFLASH` - gemma4_backend.cpp, gemma4_layer_split_adapter.cpp, kvflash_pager.h, laguna_backend.cpp, laguna_layer_split_adapter.cpp, qwen35_backend.cpp, qwen35_layer_split_adapter.cpp, qwen4exp_backend.cpp, server_main.cpp
 - `LUCE_KVFLASH_DEBUG_RESIDENT` - qwen35_backend.cpp
 - `LUCE_KVFLASH_DRAFTER` - kvflash_pager.h
 - `LUCE_KVFLASH_MAX_POOL` - kvflash_pager.h

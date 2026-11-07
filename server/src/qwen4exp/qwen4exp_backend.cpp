@@ -131,15 +131,19 @@ static bool move_qwen4exp_attention(Qwen4ExpWeights & w, int layers) {
     return true;
 }
 
+// Free memory on a device. The generic UMA query substitutes MemAvailable; retain the HIP/GTT limit too.
+static size_t qwen4exp_free_memory(ggml_backend_t backend) {
+    size_t free_device = 0, total = 0, free_host = 0;
+    ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device_id(backend), &free_device, &total);
+    ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_host, &total);
+    return std::min(free_device, free_host);
+}
+
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         Qwen4ExpCache & cache, int slots, int resident_slots, size_t * snapshot_budget, Qwen4ExpChunkPlan * plan,
         size_t snapshot_keep, size_t reserved) {
     if (slots < 1 || resident_slots < 1 || resident_slots > slots) return 0;
-    size_t free_device = 0, total = 0, free_host = 0;
-    ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device_id(backend), &free_device, &total);
-    ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_host, &total);
-    // The generic UMA query substitutes MemAvailable; retain the HIP/GTT limit too.
-    const size_t free_now = std::min(free_device, free_host);
+    const size_t free_now = qwen4exp_free_memory(backend);
     const size_t available = free_now > reserved ? free_now - reserved : 0;
     size_t shadow = 0, shadow_tmp = 0;
     if (w.gfx1151) {
@@ -208,9 +212,10 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     // shapes, every slot at the end of the dense span, and at the end of the context.
     size_t batched = 0;
     if (slots > 1) {
-        const int dense_last = (w.qsa ? dense_end : cache.max_ctx) - 1;
+        const bool qsa_rows = w.qsa && !cache.kvflash;   // a KVFlash pool attends densely
+        const int dense_last = (qsa_rows ? dense_end : cache.max_ctx) - 1;
         for (const bool qsa : {false, true}) {
-            if (qsa && !w.qsa) continue;
+            if (qsa && !qsa_rows) continue;
             const Qwen4ExpGraphMemory m = qwen4exp_batched_graph_memory(
                 backend, w, cache, slots, qsa ? cache.max_ctx - 1 : dense_last, qsa);
             size_t resident = 0;
@@ -228,8 +233,9 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     // 2048-row granule halves a live stream's stall behind a long prompt for about 3% of prompt throughput; with the
     // experts on a second GPU it would cost 12%, so that placement keeps one pipeline stream's rows. Split mode: the
     // expert device's MoE id helper bounds a chunk (hot experts only take the memory the largest chunk leaves).
-    const int max_rows = slots > 1 ? (w.expert_backend ? kQwen4ExpPipelineStreamRows : kQwen4ExpConcurrentGranule)
-                       : !w.expert_backend ? kQwen4ExpMaxChunk : kQwen4ExpSplitMaxChunk;
+    const int max_rows = std::min(qwen4exp_max_forward_rows(cache),
+        slots > 1 ? (w.expert_backend ? kQwen4ExpPipelineStreamRows : kQwen4ExpConcurrentGranule)
+                  : !w.expert_backend ? kQwen4ExpMaxChunk : kQwen4ExpSplitMaxChunk);
     struct Plan { size_t graph = 0, ring = 0, host = 0, scratch = 0; };
     std::vector<std::pair<int, Plan>> plans;   // one per probed chunk size
     auto chunk_workspace = [&](int n) {
@@ -357,6 +363,7 @@ bool Qwen4ExpBackend::load_target() {
                      luce_last_error());
         return false;
     }
+    size_kvflash_pool();
     if (!create_main_cache()) {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
         return false;
@@ -432,6 +439,17 @@ bool Qwen4ExpBackend::load_target() {
         std::fprintf(stderr, "[qwen4exp] full-cache slot allocation failed\n");
         return false;
     }
+    if (cache_.kvflash) {
+        std::printf("[kvflash] resident pool %d tokens over %zu full-attn layers per slot (logical max_ctx %d, %d "
+                    "slots, prompt forwards <= %d rows), policy=lru%s\n",
+                    cache_.kvflash->pool_tokens(), cache_.full_layer_ids.size(), cache_.max_ctx,
+                    cfg_.max_concurrency, qwen4exp_max_forward_rows(cache_),
+                    kvflash_policy_is_lru() ? "" : " (qwen4exp has no residency scorer yet)");
+    } else if (kvflash_pool_ > 0) {
+        std::printf("[kvflash] pool %d holds the whole %d-token context: one row per position\n",
+                    kvflash_pool_, cache_.max_ctx);
+    }
+    std::fflush(stdout);
     return true;
 }
 
@@ -459,9 +477,9 @@ bool Qwen4ExpBackend::load_hot_experts() {
 
 // Memory the PFlash drafter needs on `device` when it scores there: its weights
 // and a workspace that grows with the prompt, which can fill the context.
-size_t Qwen4ExpBackend::pflash_reserve(ggml_backend_t device) const {
+size_t Qwen4ExpBackend::pflash_reserve(ggml_backend_t device, int ctx) const {
     if (cfg_.pflash_gpu < 0 || !device || ggml_backend_cuda_get_device_id(device) != cfg_.pflash_gpu) return 0;
-    return cfg_.pflash_bytes + (size_t) std::max(0, cache_.max_ctx) * cfg_.pflash_bytes_per_token;
+    return cfg_.pflash_bytes + (size_t) std::max(0, ctx < 0 ? cache_.max_ctx : ctx) * cfg_.pflash_bytes_per_token;
 }
 
 // The prompt chunk, measured against free memory unless --chunk sets it (concurrent serving measures either way,
@@ -475,7 +493,8 @@ int Qwen4ExpBackend::plan_chunk(Qwen4ExpChunkPlan * plan) {
         snapshot_budget_ = snapshots * snapshot_bytes_estimate(cache_.max_ctx);
         return &snapshot_budget_;
     };
-    const int explicit_chunk = weights_.expert_backend ? std::min(cfg_.chunk, kQwen4ExpSplitMaxChunk) : cfg_.chunk;
+    const int explicit_chunk = std::min({cfg_.chunk, qwen4exp_max_forward_rows(cache_),
+                                         weights_.expert_backend ? kQwen4ExpSplitMaxChunk : cfg_.chunk});
     if (cfg_.chunk > 0 && cfg_.max_concurrency == 1 && !plan) return explicit_chunk;
     // Prefix checkpoints with concurrent slots: each slot's restore point and capture in flight plus one shared
     // head, the server's concurrent prefix budget. One sequence keeps three.
@@ -506,7 +525,28 @@ bool Qwen4ExpBackend::create_main_cache() {
         !create_qwen4exp_slot_states(backend_, weights_, cfg_.max_concurrency, slot_states_)) return false;
     return create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
         cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1),
-        slot_states_.ctx ? &slot_states_ : nullptr, 0, remote_layers_);
+        slot_states_.ctx ? &slot_states_ : nullptr, 0, remote_layers_, kvflash_pool_for(cfg_.device.max_ctx));
+}
+
+// --kvflash: each slot's pool, sized with the weights resident and no cache yet ("auto" takes a share of the free
+// memory). It holds the full-attention layers' F16 K/V; the MTP draft layer keeps one row per position.
+void Qwen4ExpBackend::size_kvflash_pool() {
+    const Qwen4ExpWeights & w = weights_;
+    int64_t n_full = 0;
+    for (int il = 0; il < w.n_layer; ++il) n_full += w.layers[il].is_full_attention;
+    KvFlashAutoBudget budget;
+    budget.free_bytes = (int64_t) qwen4exp_free_memory(backend_);
+    // The decode graphs and a prompt chunk, which the planner sizes after, and a PFlash drafter on this GPU.
+    // No cache yet: the drafter's per-token room is counted at the configured context.
+    budget.reserve_bytes = (2ll << 30) + (int64_t) pflash_reserve(backend_, cfg_.device.max_ctx);
+    budget.bytes_per_token = cfg_.max_concurrency * n_full * w.n_head_kv *
+        (int64_t) (ggml_row_size(GGML_TYPE_F16, w.n_embd_head_k) + ggml_row_size(GGML_TYPE_F16, w.n_embd_head_v));
+    kvflash_pool_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{}, /*scorer_expected=*/false, budget);
+}
+
+// A pool that holds the whole context pages nothing: such a context keeps one row per position (and QSA).
+int Qwen4ExpBackend::kvflash_pool_for(int ctx) const {
+    return kvflash_pool_ < ctx ? kvflash_pool_ : 0;
 }
 
 // --max-ctx auto in split mode: the full-attention layers to keep on the expert device so a plan that lacks
@@ -514,14 +554,13 @@ bool Qwen4ExpBackend::create_main_cache() {
 // already there).
 int Qwen4ExpBackend::remote_layers_for(const Qwen4ExpChunkPlan & plan, size_t missing) const {
     const int n_full = (int) cache_.full_layer_ids.size();
-    if (!weights_.expert_backend || !plan.layer_bytes || plan.required == SIZE_MAX || remote_layers_ >= n_full)
+    // A KVFlash pool pages one device's rows; it is small enough to stay on the target.
+    if (!weights_.expert_backend || !plan.layer_bytes || plan.required == SIZE_MAX || remote_layers_ >= n_full ||
+        cache_.kvflash)
         return remote_layers_;
     const int remote = std::min<int>(n_full, remote_layers_ + (int) ((missing + plan.layer_bytes - 1) / plan.layer_bytes));
-    size_t free_device = 0, total = 0, free_host = 0;
-    ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device_id(weights_.expert_backend), &free_device, &total);
-    ggml_backend_dev_memory(ggml_backend_get_device(weights_.expert_backend), &free_host, &total);
     const size_t reserved = pflash_reserve(weights_.expert_backend);
-    const size_t free_now = std::min(free_device, free_host) +
+    const size_t free_now = qwen4exp_free_memory(weights_.expert_backend) +
                             (cache_.remote_buf ? ggml_backend_buffer_get_size(cache_.remote_buf) : 0);
     const size_t available = free_now > reserved ? free_now - reserved : 0;
     return (size_t) remote * plan.layer_bytes <= available - available / 10 ? remote : remote_layers_;
@@ -533,7 +572,8 @@ bool Qwen4ExpBackend::start_seq_engine() {
     std::vector<Qwen4ExpCache *> caches{&cache_};
     for (Qwen4ExpCache & cache : seq_caches_) {
         if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache, false, 1,
-                                   &slot_states_, (int) caches.size(), remote_layers_)) return false;
+                                   &slot_states_, (int) caches.size(), remote_layers_,
+                                   kvflash_pool_for(cfg_.device.max_ctx))) return false;
         cache.split_owner = &cache_;
         caches.push_back(&cache);
     }
