@@ -3,6 +3,8 @@
 // the sticky checkpoints, the rung ladder and the park point. No ggml, no GPU.
 #include "CppUnitTestFramework.hpp"
 #include "kvflash_test_seams.h"
+#include "../../src/common/kvflash_slot_bundle.h"
+#include "../../src/common/kvflash_session_store.h"
 #include "../../src/common/kvflash_slot_turn.h"
 #include "../../src/common/kvflash_uq.h"
 
@@ -470,12 +472,31 @@ TEST_CASE(KvflashSlotTurnFixture, v5_the_chain_T4_P3_T5_keeps_a_rung_at_the_end_
     auto t5 = v5_turn(p3.lad, p3.len, 6900, 8500);   CHECK(t5.L == 6893);
 }
 
-TEST_CASE(KvflashSlotTurnFixture, v5_a_ckpt_never_leaves_a_duplicate_or_a_rung_at_the_prompt_end) {
+TEST_CASE(KvflashSlotTurnFixture, v5_a_ckpt_never_leaves_a_duplicate_or_a_rung_at_the_prompt_end_and_a_restored_third_is_pinned) {
     const auto m = kvflash_ladder_ckpt(L3{3000, 2000, 1000, false}, 4000);
     CHECK((m.to == L3{4000, 3000, 2000, false}));
     CHECK(m.ckpt_from == kRungLive); CHECK(m.trunk_from == kRungCkpt); CHECK(m.extra_from == kRungTrunk);   // the demotion
     CHECK((kvflash_ladder_ckpt(L3{3000, 2000, 1000, true}, 4000).to == L3{4000, 3000, 1000, true}));        // pinned: stays, the trunk below goes
     CHECK((kvflash_ladder_ckpt(L3{3671, -1, 3671, true}, 3837).to == L3{3837, -1, 3671, true}));            // the checkpoint at the pin is the pin
+    // what a save writes and a restore rebuilds: the pin is saved apart from the slab
+    auto head = [](const L3 & l) { const auto h = kvflash_ladder_to_head(l); return std::make_pair(h.extra, h.pin); };
+    CHECK((head(L3{3837, 3000, 3671, true}) == std::make_pair(3671, 3671)));        // a pinned third: its slab and its pin
+    CHECK((head(L3{3837, 3000, 3671, false}) == std::make_pair(3671, 0)));         // a demoted third: its slab, no pin
+    CHECK((head(L3{3671, -1, 3671, true}) == std::make_pair(-1, 3671)));            // the pin at the checkpoint: no second slab, the pin kept
+    CHECK((head(L3{3837, 3671, 3671, true}) == std::make_pair(-1, 3671)));          // ... or at the trunk
+    CHECK((head(L3{3837, 3000, -1, false}) == std::make_pair(-1, 0)));
+    const auto at_ck = kvflash_ladder_restored(3671, -1, -1, 3671);                // the pin names the checkpoint: the third is a copy of its slab
+    CHECK((at_ck.to == L3{3671, -1, 3671, true}));
+    CHECK((at_ck.ckpt_from == kRungCkpt && at_ck.extra_from == kRungCkpt));
+    const auto at_tr = kvflash_ladder_restored(3837, 3671, -1, 3671);
+    CHECK((at_tr.to == L3{3837, 3671, 3671, true}));
+    CHECK((at_tr.extra_from == kRungTrunk && at_tr.trunk_from == kRungTrunk));
+    CHECK((kvflash_ladder_restored(3837, 3000, 3671, 3671).to == L3{3837, 3000, 3671, true}));
+    CHECK((kvflash_ladder_restored(3837, 3000, 3671, 0).to == L3{3837, 3000, 3671, false}));   // a demoted third stays demoted
+    CHECK((kvflash_ladder_restored(3837, 3000, -1, 0).to == L3{3837, 3000, -1, false}));
+    CHECK((kvflash_ladder_restored(3837, -1, -1, 0).to == L3{3837, -1, -1, false}));
+    const auto ops = kvflash_ladder_ops(at_tr);                                      // the restore copy stays within three slabs
+    CHECK(kvflash_ladder_peak(0b011, ops, false) == 3);
 }
 
 // ---- v5: the slab ops of a ladder move never hold more than the three slabs the admission charge covers ----
@@ -604,3 +625,172 @@ TEST_CASE(KvflashSlotTurnFixture, the_window_rows_of_the_cuts_add_up_to_the_plan
         }
     }
 }
+// Codex re-review P2 (b): a session rewound to its trunk and then left parked (busy) holds rungs past its history unless they are cut at
+// the rewind; evicted, it is saved as a head the loader refuses.
+TEST_CASE(KvflashSlotTurnFixture, a_rewound_then_evicted_session_saves_a_head_the_loader_accepts) {
+    // history 1400, checkpoint 1300, trunk 1000; lcp 1152 > e_role 900 resumes at the trunk, L = 1000
+    const int L = 1000;
+    const KvFlashRungs r = kvflash_rungs_after_rewind(1300, 1000, L);
+    KvFlashSlotHead h;
+    h.identity = 7; h.gen = 1; h.log_gen = 1; h.end_gen = 2;
+    h.history.assign((size_t)L, 5);                       // the history after the rewind
+    h.pager_hdr.assign(kKvFlashPagerHdr, 0);
+    h.ckpt_pos = (uint32_t)std::max(r.ckpt, 0); h.ckpt_gen = r.ckpt > 0 ? 3 : 0;
+    h.trunk_pos = (uint32_t)std::max(r.trunk, 0); h.trunk_gen = r.trunk > 0 ? 4 : 0;
+    const std::vector<uint8_t> packed = kvflash_head_pack(h);
+    KvFlashSlotHead back;
+    CHECK(kvflash_head_unpack(packed.data(), packed.size(), 7, back));
+    CHECK(r.ckpt == 1000);
+    CHECK(r.trunk <= 0);
+    const KvFlashRungs keep = kvflash_rungs_after_rewind(1000, 800, 1000);   // rungs at or below L stay
+    CHECK(keep.ckpt == 1000);
+    CHECK(keep.trunk == 800);
+}
+
+// ── a restore whose host reservation is refused evicts and retries (eviction stage 0, step 2) ───────────
+// Before: adopt_parked answered BusyHost and the returning session went cold (0 of 18 turns resumed at 4 slots).
+
+TEST_CASE(KvflashSlotTurnFixture, restore_retries_after_each_eviction_until_the_ledger_admits) {
+    int room = 0, evictions = 0;   // the ledger admits once two sessions left
+    const auto r = kvflash_adopt_with_evict([&] { return room >= 2 ? KvFlashAdopt::Ok : KvFlashAdopt::Busy; },
+                                            [&] { ++evictions; ++room; return true; });
+    CHECK(r == KvFlashAdopt::Ok);
+    CHECK(evictions == 2);
+}
+
+TEST_CASE(KvflashSlotTurnFixture, restore_with_no_victim_left_stays_busy_and_a_refusal_never_evicts) {
+    int evictions = 0;
+    CHECK(kvflash_adopt_with_evict([] { return KvFlashAdopt::Busy; }, [&] { ++evictions; return evictions < 3; }) == KvFlashAdopt::Busy);
+    CHECK(evictions == 3);                                          // asked until nothing was left
+    evictions = 0;
+    CHECK(kvflash_adopt_with_evict([] { return KvFlashAdopt::Refused; }, [&] { ++evictions; return true; }) == KvFlashAdopt::Refused);
+    CHECK(evictions == 0);                                          // an unusable bundle is not a reason to evict
+    CHECK(kvflash_adopt_with_evict([] { return KvFlashAdopt::Ok; }, [&] { ++evictions; return true; }) == KvFlashAdopt::Ok);
+    CHECK(evictions == 0);
+}
+
+// Review P1 #2: the returning bundle's memory is freed before any victim is staged.
+TEST_CASE(KvflashSlotTurnFixture, restore_frees_the_returning_bundle_before_each_eviction_and_reloads_it) {
+    std::vector<std::string> log;
+    int room = 0;
+    const auto r = kvflash_adopt_with_evict([&] { log.push_back("try"); return room >= 1 ? KvFlashAdopt::Ok : KvFlashAdopt::Busy; },
+                                            [&] { log.push_back("release"); },
+                                            [&] { log.push_back("evict"); ++room; return true; });
+    CHECK(r == KvFlashAdopt::Ok);
+    CHECK(log == std::vector<std::string>({"try", "release", "evict", "try"}));
+    log.clear();
+    CHECK(kvflash_adopt_with_evict([&] { log.push_back("try"); return KvFlashAdopt::Refused; }, [&] { log.push_back("release"); },
+                                   [&] { log.push_back("evict"); return true; }) == KvFlashAdopt::Refused);
+    CHECK(log == std::vector<std::string>({"try"}));                  // an unusable bundle frees and evicts nothing
+}
+
+// Review P2 #4: Busy stays Busy through the restore.
+TEST_CASE(KvflashSlotTurnFixture, a_busy_adopt_is_a_busy_restore_not_a_refusal) {
+    CHECK(kvflash_restore_of(KvFlashAdopt::Busy) == KvFlashRestore::busy);
+    CHECK(kvflash_restore_of(KvFlashAdopt::Refused) == KvFlashRestore::refused);
+    CHECK(kvflash_restore_of(KvFlashAdopt::Ok) == KvFlashRestore::restored);
+}
+
+// ── the returning session's reservation is probed BEFORE its bundle is read (PFDIAG D2: 77 retries read 238 GB) ───
+// Before: adopt_bundle_ loaded the whole bundle, then the ledger answered Busy and the load was thrown away, every 1 s retry.
+
+namespace {
+struct RestoreProbe {
+    int loads = 0, evictions = 0, adopts = 0, releases = 0, room = 0, validates = 0;
+    bool load_ok = true, validate_ok = true;
+    KvFlashRestoreResult run(bool evict_for_room, int victims) {
+        return kvflash_restore_adopt(
+            [&] { return room >= 1 ? KvFlashAdopt::Ok : KvFlashAdopt::Busy; },
+            [&] { return evictions < victims; },
+            [&] { ++validates; return validate_ok; },
+            [&] { ++loads; return load_ok; },
+            [&] { ++adopts; return room >= 1 ? KvFlashAdopt::Ok : KvFlashAdopt::Busy; },
+            [&] { ++releases; },
+            [&] { if (evictions >= victims) return false; ++evictions; ++room; return true; },
+            evict_for_room);
+    }
+};
+}  // namespace
+
+TEST_CASE(KvflashSlotTurnFixture, a_busy_restore_without_evict_for_room_never_reads_the_bundle) {
+    RestoreProbe p;
+    const auto r = p.run(/*evict_for_room=*/false, /*victims=*/1);
+    CHECK(r.adopt == KvFlashAdopt::Busy);
+    CHECK(!r.load_failed);
+    CHECK(p.loads == 0);
+    CHECK(p.adopts == 0);
+    CHECK(p.evictions == 0);
+}
+
+TEST_CASE(KvflashSlotTurnFixture, a_busy_restore_with_nothing_to_evict_never_reads_the_bundle) {
+    RestoreProbe p;
+    const auto r = p.run(/*evict_for_room=*/true, /*victims=*/0);
+    CHECK(r.adopt == KvFlashAdopt::Busy);
+    CHECK(p.loads == 0);
+}
+
+TEST_CASE(KvflashSlotTurnFixture, a_busy_restore_with_evict_for_room_evicts_first_then_loads_exactly_once) {
+    RestoreProbe p;
+    const auto r = p.run(/*evict_for_room=*/true, /*victims=*/1);
+    CHECK(r.adopt == KvFlashAdopt::Ok);
+    CHECK(p.evictions == 1);
+    CHECK(p.loads == 1);
+    CHECK(p.adopts == 1);
+    CHECK(p.releases == 0);
+}
+
+TEST_CASE(KvflashSlotTurnFixture, a_fitting_restore_loads_once_and_an_unreadable_bundle_is_a_load_failure_not_busy) {
+    RestoreProbe fit;
+    fit.room = 1;
+    CHECK(fit.run(false, 0).adopt == KvFlashAdopt::Ok);
+    CHECK(fit.loads == 1);
+    RestoreProbe bad;
+    bad.room = 1; bad.load_ok = false;
+    const auto r = bad.run(false, 0);
+    CHECK(r.load_failed);
+    CHECK(r.adopt == KvFlashAdopt::Refused);
+}
+
+// Where the probe cannot decide the existing load -> refuse -> evict -> reload path still runs.
+TEST_CASE(KvflashSlotTurnFixture, when_the_probe_cannot_decide_the_load_refuse_evict_reload_path_still_runs) {
+    int loads = 0, evictions = 0, room = 0;
+    const auto r = kvflash_restore_adopt(
+        [] { return KvFlashAdopt::Refused; },                                   // cannot decide
+        [] { return true; }, [] { return true; },
+        [&] { ++loads; return true; },
+        [&] { return room >= 1 ? KvFlashAdopt::Ok : KvFlashAdopt::Busy; },     // the real adopt refuses
+        [] {},
+        [&] { ++evictions; ++room; return true; },
+        /*evict_for_room=*/true);
+    CHECK(r.adopt == KvFlashAdopt::Ok);
+    CHECK(loads == 2);
+    CHECK(evictions == 1);
+}
+
+// Codex round 2 P2: an unreadable bundle behind a Busy probe must not evict healthy sessions first (before the change
+// load() failed first and nothing was evicted). The bundle is validated once before the FIRST eviction.
+TEST_CASE(KvflashSlotTurnFixture, a_busy_restore_of_an_unreadable_bundle_evicts_nothing_and_returns_the_bundles_error) {
+    RestoreProbe p;
+    p.validate_ok = false; p.load_ok = false;
+    const auto r = p.run(/*evict_for_room=*/true, /*victims=*/2);
+    CHECK(r.load_failed);
+    CHECK(r.adopt == KvFlashAdopt::Refused);
+    CHECK(p.evictions == 0);
+}
+
+TEST_CASE(KvflashSlotTurnFixture, a_busy_restore_with_a_victim_validates_once_evicts_then_loads_once) {
+    RestoreProbe p;
+    const auto r = p.run(/*evict_for_room=*/true, /*victims=*/2);
+    CHECK(r.adopt == KvFlashAdopt::Ok);
+    CHECK(p.validates == 1);     // one streaming validation before the first eviction, however many victims leave
+    CHECK(p.evictions == 1);
+    CHECK(p.loads == 1);         // the bundle is assembled once (the old path: load, then reload)
+}
+
+TEST_CASE(KvflashSlotTurnFixture, a_busy_restore_with_no_victim_validates_nothing_and_reads_nothing) {
+    RestoreProbe p;
+    CHECK(p.run(/*evict_for_room=*/true, /*victims=*/0).adopt == KvFlashAdopt::Busy);
+    CHECK(p.validates == 0);
+    CHECK(p.loads == 0);
+}
+
