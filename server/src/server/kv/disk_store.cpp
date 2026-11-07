@@ -463,6 +463,29 @@ static bool validate_snapshot_file(const std::string & path,
 
 // ─── Initialization ─────────────────────────────────────────────────────
 
+static std::mutex registry_mu;
+static std::map<std::string, std::weak_ptr<DiskStore>> registry;
+
+static std::string registry_key(const std::string & dir) {
+    std::error_code ec;
+    std::string key = fs::weakly_canonical(fs::absolute(dir, ec), ec).string();
+    return key.empty() ? dir : key;
+}
+
+std::shared_ptr<DiskStore> DiskStore::find(const std::string & dir) {
+    std::lock_guard<std::mutex> lock(registry_mu);
+    auto it = registry.find(registry_key(dir));
+    return it == registry.end() ? nullptr : it->second.lock();
+}
+
+DiskUsage DiskStore::usage() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    DiskUsage u;
+    for (const auto & e : entries_) (e.pinned ? u.pins : u.prefix) += e.file_size;
+    u.sessions = tenant_bytes_locked();
+    return u;
+}
+
 std::shared_ptr<DiskStore> DiskStore::open(const DiskCacheConfig & config,
                                            std::function<uint64_t()> clock,
                                            std::function<uint64_t()> free_space,
@@ -476,11 +499,7 @@ std::shared_ptr<DiskStore> DiskStore::open(const DiskCacheConfig & config,
     }
     // One store per directory per process: every model of the process that
     // uses the directory shares its lock, index, writer and budget.
-    static std::mutex registry_mu;
-    static std::map<std::string, std::weak_ptr<DiskStore>> registry;
-    std::error_code ec;
-    std::string key = fs::weakly_canonical(fs::absolute(config.cache_dir, ec), ec).string();
-    if (key.empty()) key = config.cache_dir;
+    const std::string key = registry_key(config.cache_dir);
     std::lock_guard<std::mutex> registry_lock(registry_mu);
     if (auto open = registry[key].lock()) {
         std::fprintf(stderr,

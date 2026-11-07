@@ -151,6 +151,11 @@ struct DiskDrainResult {
 // budget evicts files of every layout, which is why one process owns the
 // directory. Everything below open() is the DiskPrefixCache's to use, under
 // mu_.
+struct DiskUsage {
+    uint64_t prefix = 0, pins = 0, sessions = 0;
+    uint64_t total() const { return prefix + pins + sessions; }
+};
+
 class DiskStore {
 public:
     // The store of `config.cache_dir`: the one this process already has
@@ -179,6 +184,11 @@ public:
     DiskDrainResult drain(double max_seconds = -1.0, const Owner * only = nullptr);
     uint64_t budget_bytes() const;
     size_t total_bytes() const;
+
+    // What the one budget holds, by kind: prefix files, pinned prefix files, and the tenants' (sessions).
+    DiskUsage usage() const;
+    // The store already open over `dir` in this process; null when none.
+    static std::shared_ptr<DiskStore> find(const std::string & dir);
 
     // A tenant keeps its own files under <dir>/<its subdirectory> (sessions/):
     // the store counts them in the one budget and evicts and expires them with

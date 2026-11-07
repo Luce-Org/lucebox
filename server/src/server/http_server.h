@@ -780,7 +780,12 @@ const std::vector<int32_t> & ppp_tool_prefix_source(
 // docs/specs/props-endpoint.md for the wire contract.
 json build_props_body(const ServerConfig & config,
                       const PrefixCache & prefix_cache,
-                      const ToolMemory & tool_memory);
+                      const ToolMemory & tool_memory,
+                      const DiskUsage * disk = nullptr);
+
+// The disk usage of the store behind config.disk_cache_dir, if one is open.
+uint64_t disk_cache_ttl_seconds(double hours);
+std::optional<DiskUsage> disk_usage_of(const ServerConfig & config);
 
 // ─── HTTP server ────────────────────────────────────────────────────────
 class HttpServer {
