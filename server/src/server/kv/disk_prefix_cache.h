@@ -148,6 +148,10 @@ public:
     void unpin_file(const std::string & relative);
     // This layout's pinned files, as pin() names them.
     std::vector<std::string> pinned_files();
+    // Name the layout this view saves and reads under instead of learning it
+    // from a snapshot's tensors (a payload that is not the model's KV, such as
+    // KVFlash's pinned heads). Call after init(); a no-op when the cache is off.
+    void use_layout(const std::array<uint8_t, 16> & id);
     // This model's layout, as its directory name; empty when not known.
     std::string layout_name() const;
     // A file keyed by exactly `tokens` exists (or is queued) in this layout.
