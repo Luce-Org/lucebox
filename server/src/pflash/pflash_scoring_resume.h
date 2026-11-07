@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace luce::pflash {
@@ -34,6 +35,28 @@ int pflash_scoring_exact_rows_end(int S);
 // ``shared`` leading tokens with it: the checkpoint when it is on the grid, > 0, <= shared, <= S - 64 and
 // <= ``cap``; else 0 (a fresh call).
 int pflash_scoring_resume(int checkpoint, int shared, int S, int cap);
+
+// One stored session as the resume pick sees it. ``rows_cover(r, shared)`` returns r when the stored rows the call
+// needs (query windows, probe / subunit / request rows) cover a resume at r, else 0; empty = no row condition.
+struct PFlashResumeCandidate {
+    const std::vector<int32_t> * ids = nullptr;   // prompt tokens the session covers
+    int checkpoint = 0;
+    int capacity = 0;                              // tokens the session can hold
+    bool usable = true;                            // false: skip (wrong head, nothing stored)
+    std::function<int(int r, int shared)> rows_cover;
+};
+
+struct PFlashResumePick {
+    int index = -1;          // the session to resume from, -1 = fresh call
+    int resume = 0;
+    int shared = 0;          // leading tokens it shares with the prompt
+    bool needs_grow = false; // its capacity is below the prompt rounded up to 256: grow it, do not discard it
+};
+
+// The session a call over ``ids`` resumes from: the largest resume point (pflash_scoring_resume, then rows_cover);
+// at equal points a session that fits wins. A session too small for the prompt is still a candidate (needs_grow).
+PFlashResumePick pflash_pick_resume(const std::vector<PFlashResumeCandidate> & sessions,
+                                    const std::vector<int32_t> & ids, int cap);
 
 // Token capacity of a new or regrown scoring session for an ``S``-token prompt: S + S/2 + 4096 (headroom, so later
 // turns of the conversation append without reallocating), but never past ``ctx_limit`` rounded up to 256 (the

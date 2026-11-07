@@ -646,6 +646,9 @@ void zero_recurrent_state(TargetCache & cache) {
     }
 }
 
+// Defined with the session offload helpers below.
+bool grow_scoring_session(Qwen35DrafterState & st, Qwen35ScoringSession & session, int capacity);
+
 // The session to score ``ids`` with, and the token it resumes from: a stored
 // session's checkpoint (pflash_scoring_resume: on the 8192 grid, inside the
 // shared prefix, at or before S - 64 and at or before ``resume_cap``), so the
@@ -688,54 +691,59 @@ Qwen35ScoringSession * acquire_scoring_session(
         return end <= shared &&
                session.query_windows.lookup(luce::pflash::pflash_span_tokens(begin, end), w.n_embd, rows);
     };
-    Qwen35ScoringSession * best = nullptr;
-    int best_shared = 0;
+    // An undersized session stays a candidate (pflash_pick_resume): it is grown below, not discarded.
+    std::vector<luce::pflash::PFlashResumeCandidate> candidates;
     for (auto & owned : st.sessions) {
-        Qwen35ScoringSession * session = owned.get();
-        if (limit == 0) break;
-        if (!session || session->capacity < S_padded || session->ids.empty() ||
-            session->keys_trained != st.head_loaded) {
-            continue;
+        const Qwen35ScoringSession * session = owned.get();
+        luce::pflash::PFlashResumeCandidate c;
+        c.usable = limit != 0 && session && session->keys_trained == st.head_loaded;
+        if (session) {
+            c.ids = &session->ids;
+            c.checkpoint = session->checkpoint;
+            c.capacity = session->capacity;
+            c.rows_cover = [&, session](int r, int shared) {
+                // The query window and every other window this call scores that starts before the resume point
+                // need their exact stored rows; with one snapshot per session, the call otherwise starts at 0.
+                if (r > query_start && !(query_end <= shared && row_floats > 0 &&
+                                         stored_window(*session, query_start, query_end, shared))) {
+                    return 0;
+                }
+                for (const auto & span : other_windows) {
+                    if (span.begin < 0 || span.end <= span.begin || span.begin >= r) continue;
+                    if (!stored_window(*session, span.begin, span.end, shared)) return 0;
+                }
+                if ((need_probe && (int) session->probe_raw.size() < r) ||
+                    (need_subunit && (int) session->subunit_raw.size() < r) ||
+                    (need_request && (int) session->request_raw.size() < r)) {
+                    return 0;
+                }
+                return r;
+            };
         }
-        const size_t n = std::min(session->ids.size(), ids.size());
-        const int shared = (int) (std::mismatch(session->ids.begin(),
-            session->ids.begin() + (long) n, ids.begin()).first -
-            session->ids.begin());
-        int r = luce::pflash::pflash_scoring_resume(session->checkpoint, shared, S, resume_cap);
-        // The query window and every other window this call scores that
-        // starts before the resume point need their exact stored rows; with
-        // one snapshot per session, the call otherwise starts at 0.
-        if (r > query_start && !(query_end <= shared && row_floats > 0 &&
-                                 stored_window(*session, query_start, query_end, shared))) {
-            r = 0;
-        }
-        for (const auto & span : other_windows) {
-            if (r == 0) break;
-            if (span.begin < 0 || span.end <= span.begin || span.begin >= r) continue;
-            if (!stored_window(*session, span.begin, span.end, shared)) r = 0;
-        }
-        if ((need_probe && (int) session->probe_raw.size() < r) ||
-            (need_subunit && (int) session->subunit_raw.size() < r) ||
-            (need_request && (int) session->request_raw.size() < r)) {
-            r = 0;
-        }
-        if (r > resume) {
-            resume = r;
-            best = session;
-            best_shared = shared;
-        }
+        candidates.push_back(std::move(c));
+    }
+    const luce::pflash::PFlashResumePick pick = luce::pflash::pflash_pick_resume(candidates, ids, resume_cap);
+    Qwen35ScoringSession * best = pick.index >= 0 ? st.sessions[(size_t) pick.index].get() : nullptr;
+    resume = pick.resume;
+    Qwen35ScoringSession * target = nullptr;
+    if (best && pick.needs_grow &&
+        !grow_scoring_session(st, *best, luce::pflash::pflash_session_capacity(S, st.session_ctx_limit))) {
+        // No room for a second copy: score fresh into this session, reallocated below, as before.
+        target = best;
+        best = nullptr;
+        resume = 0;
     }
     if (best) {
         if (!restore_ssm_state(best->cache, w.backend)) {
             resume = 0;
         } else {
-            shared_prefix = best_shared;
+            shared_prefix = pick.shared;
             best->host_valid = false;   // this call extends it: its host copy (if any) goes stale
             return best;
         }
     }
 
-    Qwen35ScoringSession * target = best;
+    if (!target) target = best;
     if (!target) {
         if (limit == 0) {
             scratch = std::make_unique<Qwen35ScoringSession>();
@@ -824,6 +832,52 @@ void copy_session_bookkeeping(const Qwen35ScoringSession & from, Qwen35ScoringSe
     to.query_windows = from.query_windows;
     to.query_sets = from.query_sets;
     to.last_used = from.last_used;
+}
+
+// Grows ``session`` to ``capacity`` tokens in place, keeping what a resume reads: the token-indexed tensors (attention
+// K/V along max_ctx, block-15 keys) below its checkpoint, every other tensor (recurrent state and its snapshot) whole,
+// and the bookkeeping, cache position and last token. Goes through host memory with the offload helpers. On any
+// failure the session is left as it was and false is returned.
+bool grow_scoring_session(Qwen35DrafterState & st, Qwen35ScoringSession & session, int capacity) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const int old_capacity = session.capacity;
+    Qwen35ScoringSession grown;
+    if (!allocate_scoring_session(st.weights, capacity, grown)) {
+        std::fprintf(stderr, "[qwen35-sessions] session not grown (%d -> %d): allocation failed\n", old_capacity,
+                     capacity);
+        std::fflush(stderr);
+        return false;
+    }
+    const auto old_tensors = qwen35_session_tensors(session);
+    luce::pflash::PFlashHostCopy host;
+    std::string error;
+    if (grown.cache.max_ctx < session.cache.max_ctx) {
+        error = "cache size differs";
+    } else if (luce::pflash::pflash_copy_to_host(old_tensors, qwen35_session_token_dims(session, old_tensors),
+                                                 session.checkpoint, nullptr, host, error)) {
+        luce::pflash::pflash_copy_from_host(host, qwen35_session_tensors(grown), error);
+    }
+    if (!error.empty()) {
+        free_qwen35_scoring_session(grown);
+        std::fprintf(stderr, "[qwen35-sessions] session not grown (%d -> %d): %s\n", old_capacity, capacity,
+                     error.c_str());
+        std::fflush(stderr);
+        return false;
+    }
+    ggml_backend_synchronize(st.weights.backend);
+    grown.cache.cur_pos = session.cache.cur_pos;
+    grown.cache.last_tok = session.cache.last_tok;
+    copy_session_bookkeeping(session, grown);
+    grown.host_id = session.host_id;
+    grown.host_valid = session.host_valid;
+    const int checkpoint = session.checkpoint;
+    std::swap(session, grown);          // ``grown`` now owns the old tensors
+    free_qwen35_scoring_session(grown);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "[qwen35-sessions] grew session: %d -> %d, kept checkpoint %d (%.0f ms)\n", old_capacity,
+                 capacity, checkpoint, ms);
+    std::fflush(stderr);
+    return true;
 }
 
 size_t host_store_bytes(const DrafterHostSessions & store) {

@@ -24,6 +24,28 @@ int pflash_scoring_resume(int checkpoint, int shared, int S, int cap) {
     return checkpoint;
 }
 
+PFlashResumePick pflash_pick_resume(const std::vector<PFlashResumeCandidate> & sessions,
+                                    const std::vector<int32_t> & ids, int cap) {
+    const int S = (int) ids.size();
+    const int S_padded = (S + 255) / 256 * 256;
+    PFlashResumePick best;
+    for (size_t i = 0; i < sessions.size(); ++i) {
+        const PFlashResumeCandidate & c = sessions[i];
+        if (!c.usable || !c.ids || c.ids->empty()) continue;
+        const size_t n = std::min(c.ids->size(), ids.size());
+        const int shared = (int) (std::mismatch(c.ids->begin(), c.ids->begin() + (long) n, ids.begin()).first -
+                                  c.ids->begin());
+        int r = pflash_scoring_resume(c.checkpoint, shared, S, cap);
+        if (r > 0 && c.rows_cover) r = c.rows_cover(r, shared);
+        if (r <= 0) continue;
+        const bool grow = c.capacity < S_padded;
+        if (r > best.resume || (r == best.resume && best.needs_grow && !grow)) {
+            best = {(int) i, r, shared, grow};
+        }
+    }
+    return best;
+}
+
 std::vector<int> pflash_span_tokens(int begin, int end) {
     std::vector<int> tokens;
     for (int t = begin; t < end; ++t) tokens.push_back(t);
