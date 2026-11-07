@@ -304,7 +304,6 @@ protected:
     KvFlashQkPool           kvflash_qk_pool_;
     KvFlashTargetQkScorer * kvflash_qk_scorer_ = nullptr;  // owned by kvflash_scorer_
     int                     kvflash_qk_pooled_upto_ = 0;   // chunks pooled so far
-    int                     spec_early_stop_repairs_ = 0;  // spec steps repaired after EOS/cancel inside a block
     // Pool keys for every chunk sealed before `committed` not pooled yet.
     void kvflash_qk_pool_to(int committed);
     // LUCE_KVFLASH_PREFILL_RESELECT=4|5: reselect the pool by exact attention mass (4) or the

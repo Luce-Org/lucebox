@@ -424,6 +424,25 @@ inline int kvflash_step_span_cap(size_t hist_base, size_t guard_entry, size_t ou
         chunk_tokens, chunk_allocated);
 }
 
+// What a KVFlash spec step at p0 does, decided once at the step start: the AR
+// single-token hop when the seed opens an unallocated chunk, else a spec step
+// whose verify span is at most `span` rows (the proposed block, cut at the next
+// reselect point and at the end of the resident chunks). The loop applies it
+// as v_len = min(v_len, span); span is independent of how many rows the step
+// proposes, so planning with the full block is equivalent to capping each
+// proposal.
+struct KvflashSpecStep {
+    bool ar_hop;
+    int  span;
+};
+inline KvflashSpecStep kvflash_spec_step_plan(size_t hist_base, size_t guard_entry, size_t out_size,
+                                              int p0, int block, int tau0, int chunk_tokens,
+                                              const std::function<bool(int)> & is_resident) {
+    return {kvflash_seed_takes_ar_step(p0, chunk_tokens, is_resident),
+            kvflash_step_span_cap(hist_base, guard_entry, out_size, p0, block, tau0, chunk_tokens,
+                                  is_resident)};
+}
+
 // The verify pass stages the query of each of its rows (positions
 // stage_base .. stage_base + stage_n - 1). After acceptance q_cap must hold
 // what AR holds: the query of the last consumed row, position new_committed -
