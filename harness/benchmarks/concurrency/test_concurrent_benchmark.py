@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import time
 import unittest
 from pathlib import Path
@@ -122,6 +123,31 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(record["server_native_prefilled_tokens"], 9)
         self.assertEqual(record["server_native_prefill_ms"], 30.0)
         self.assertEqual(record["server_native_prefill_tokens_per_s"], 300.0)
+
+    def test_invalid_token_usage_fails_level(self) -> None:
+        args = argparse.Namespace(
+            model="m", max_tokens=1, temperature=0.0, seed=1, ignore_eos=False,
+            api_key="", base_url="http://localhost/v1", timeout=2.0,
+        )
+        for field in ("prompt_tokens", "completion_tokens"):
+            for invalid in (True, -1):
+                with self.subTest(field=field, invalid=invalid):
+                    usage = {"prompt_tokens": 4, "completion_tokens": 1}
+                    usage[field] = invalid
+                    event = {
+                        "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+                        "usage": usage,
+                    }
+                    response = mock.MagicMock()
+                    response.__enter__.return_value = iter([
+                        f"data: {json.dumps(event)}\n".encode(), b"\n",
+                        b"data: [DONE]\n", b"\n",
+                    ])
+                    with mock.patch.object(benchmark.urllib.request, "urlopen", return_value=response):
+                        level = benchmark.run_level(1, args, ["prompt"], 0)
+                    self.assertTrue(level["requests_detail"][0]["done_received"])
+                    self.assertIsNone(level["requests_detail"][0][field])
+                    self.assertTrue(benchmark.level_failed(level, ignore_eos=False))
 
     def test_missing_prompt_usage_invalidates_fixed_workload(self) -> None:
         def fake_request(_args: argparse.Namespace, prompt: str) -> dict:
