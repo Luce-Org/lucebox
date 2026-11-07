@@ -164,6 +164,11 @@ struct DiskDrainResult {
 // their files into the index before each publish, and only it evicts files
 // of models other than this process's. Everything below open() is the
 // DiskPrefixCache's to use, under mu_.
+struct DiskUsage {
+    uint64_t prefix = 0, pins = 0, sessions = 0;
+    uint64_t total() const { return prefix + pins + sessions; }
+};
+
 class DiskStore {
 public:
     // The store of `config.cache_dir`: the one this process already has
@@ -197,6 +202,11 @@ public:
     void release_identity(const std::array<uint8_t, 16> & salt);
     uint64_t budget_bytes() const;
     size_t total_bytes() const;
+
+    // What the one budget holds, by kind: prefix files, pinned prefix files, and the tenants' (sessions).
+    DiskUsage usage() const;
+    // The store already open over `dir` in this process; null when none.
+    static std::shared_ptr<DiskStore> find(const std::string & dir);
 
     // A tenant keeps its own files under <dir>/<its subdirectory> (sessions/):
     // the store counts them in the one budget and evicts and expires them with

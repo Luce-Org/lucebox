@@ -1424,9 +1424,17 @@ static std::unique_ptr<ChatCodec> model_chat_codec(const ServerConfig & config) 
 // Build the /props response body.
 //
 // Non-static so unit tests can call it directly (declared in http_server.h).
+std::optional<DiskUsage> disk_usage_of(const ServerConfig & config) {
+    if (config.disk_cache_dir.empty()) return std::nullopt;
+    auto store = DiskStore::find(config.disk_cache_dir);
+    if (!store) return std::nullopt;
+    return store->usage();
+}
+
 json build_props_body(const ServerConfig & config,
                       const PrefixCache & prefix_cache,
-                      const ToolMemory & tool_memory) {
+                      const ToolMemory & tool_memory,
+                      const DiskUsage * disk) {
     // The Qwen and DeepSeek families reason and call tools, through their codecs.
     const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
     const auto codec = model_chat_codec(config);
@@ -1614,7 +1622,7 @@ json build_props_body(const ServerConfig & config,
             {"enabled",       pcfs.enabled},
             {"capacity",      pcfs.capacity},
             {"in_use",        pcfs.in_use},
-            {"disk_bytes",    pcfs.disk_bytes},
+            {"disk_bytes",    disk ? (int64_t) disk->total() : pcfs.disk_bytes},
             {"lifetime_hits", pcfs.lifetime_hits},
             {"disk_policy",   disk_prefix_cache_policy_name(config.disk_cache_policy)},
             {"disk_enabled",  !config.disk_cache_dir.empty()},
@@ -1646,6 +1654,8 @@ json build_props_body(const ServerConfig & config,
             {"image_input_supported", config.image_input_enabled},
         }},
     };
+    if (disk) body["full_cache"]["disk"] = {
+        {"total", disk->total()}, {"prefix", disk->prefix}, {"pins", disk->pins}, {"sessions", disk->sessions}};
     return body;
 }
 
@@ -1701,7 +1711,7 @@ static void append_file_identity(std::vector<uint8_t> & buf,
     buf.insert(buf.end(), digest, digest + 20);
 }
 
-static uint64_t disk_cache_ttl_seconds(double hours) {
+uint64_t disk_cache_ttl_seconds(double hours) {
     if (!(hours > 0.0)) return 0;  // 0 (or invalid) = never expire
     const double secs = hours * 3600.0;
     return secs < 1.0 ? 1 : (uint64_t)std::llround(secs);
@@ -2666,8 +2676,9 @@ void HttpServer::handle_client(SocketHandle fd) {
 
     if (!models_.empty() && hr.method == "GET") {
         if (hr.path == "/props" || hr.path == "/status/json") {
+            const auto du = disk_usage_of(config_);
             json body = hr.path == "/props"
-                ? build_props_body(config_, prefix_cache_, tool_memory_)
+                ? build_props_body(config_, prefix_cache_, tool_memory_, du ? &*du : nullptr)
                 : status_.to_json();
             if (hr.path == "/props") {
                 body["memory"] = memory_json();
@@ -2697,7 +2708,8 @@ void HttpServer::handle_client(SocketHandle fd) {
 
     // Introspection: server config + cache stats + arch + capabilities.
     if (hr.method == "GET" && hr.path == "/props") {
-        json body = build_props_body(config_, prefix_cache_, tool_memory_);
+        const auto du = disk_usage_of(config_);
+        json body = build_props_body(config_, prefix_cache_, tool_memory_, du ? &*du : nullptr);
         body["memory"] = memory_json();
         body["load"] = load_.to_json();
         body["shared_prefixes"] = {
@@ -2960,8 +2972,9 @@ json HttpServer::model_routing_status() {
     std::lock_guard<std::mutex> lock(routing_mu_);
     for (const auto & model : models_) {
         HttpServer & server = *model.server;
+        const auto du = disk_usage_of(server.config_);
         json props = build_props_body(
-            server.config_, server.prefix_cache_, server.tool_memory_);
+            server.config_, server.prefix_cache_, server.tool_memory_, du ? &*du : nullptr);
         props["memory"] = server.memory_json();
         props["load"] = server.load_.to_json();
         models.push_back({{"id", server.config_.model_name},
