@@ -608,6 +608,23 @@ disk total with its parts (`full_cache.disk`: prefix, pins, sessions).
 `LUCE_KVFLASH_SLOT_BUNDLE_DIR` still works for one release as an override, with a
 warning.
 
+**Pinned shared head (concurrent slots).** The KVFlash slot engine plans no prefix
+store, so the shared-prefix cut (see Shared Prefixes) reaches it with the request
+(`AdmitMeta::head_cut`: the cut, 0 for none, -1 when `--shared-prefix off`, where the
+system block's end stands in). The engine rounds the cut down to its 512-token prefill
+grid and the head is that many chunks, at most a quarter of a slot's pool. The first
+slot to prefill it stops at the cut, keeps the head once (the chunks, the pager header and
+the recurrent state at the cut), and pins those chunks in its pool: eviction and recall
+never take them, and they come off the slot's history budget. Every later slot with the
+same head attaches the stored copy and prefills only what follows. Because the cut is a
+multiple of the prefill grid, a hit runs the same chunks a cold run would. Up to 16 heads
+stay in host memory. With the cache directory open (sessions on), each head is also one
+pooled file there under a layout of its own (the execution identity: model, KV types,
+geometry, backend), pinned like a shared-prefix pin (the first 16), so a restart finds it.
+A session that parked with a pinned head records it in its `meta.json` and pins it again
+when it is restored. There is no flag: heads are on with sticky slot sessions, and
+`LUCE_KVFLASH_PREAMBLE_STORE` is not read.
+
 **Suffix-only restore.** With `LUCE_KVFLASH_RESTORE_CONSUME=1`, a pooled
 snapshot rebuilds the pager and KV pool, and the request prefills only the
 tokens after the snapshot. Without it a pooled snapshot is dropped and the
