@@ -1,4 +1,5 @@
 #include "CppUnitTestFramework.hpp"
+#include <algorithm>
 #include <functional>
 #include <string>
 #include "../../src/common/dflash_target.h"
@@ -243,8 +244,9 @@ TEST_CASE(KvflashSpecSerialFixture, terminal_seed_at_a_new_chunk_leaves_the_page
     F5Pager spec;
     spec.fill();
     remaining = 1;
-    const bool ar_hop = kvflash_seed_takes_ar_step(
-        p0, kF5Chunk, [&](int c) { return spec.pager.is_resident(c); });
+    const bool ar_hop = kvflash_spec_step_plan(
+        0, 0, 0, p0, 8, /*tau0=*/64, kF5Chunk,
+        [&](int c) { return spec.pager.is_resident(c); }).ar_hop;
     if (ar_hop) {
         remaining--;
         if (remaining <= 0) { /* ends here, as AR */ }
@@ -254,6 +256,54 @@ TEST_CASE(KvflashSpecSerialFixture, terminal_seed_at_a_new_chunk_leaves_the_page
         remaining--;
     }
     CHECK(spec.state() == ar_before);
+}
+
+// The loop's per-step decision (kvflash_spec_step_plan, the function
+// do_spec_decode calls) driven over a whole request against AR: the hop at a
+// seed that opens a chunk, otherwise a verify of min(block, span) rows of which
+// `accepted` are consumed. The plan must keep every verify row in an already
+// resident chunk, start a step at every AR reselect point, and leave the pager
+// exactly where AR's one-token steps leave it.
+TEST_CASE(KvflashSpecSerialFixture, planned_steps_reach_ars_pool_state_and_reselect_schedule) {
+    const size_t hist0 = 450;
+    const int tau = 64, block = 16, p_start = 130, p_end = 900;
+
+    F5Pager ar;
+    ar.pager.alloc_span(0, p_start);
+    for (int pos = p_start; pos < p_end; pos++) ar.alloc_row(pos);
+
+    for (int accept_mod : {1, 3, 7, 16}) {
+        F5Pager spec;
+        spec.pager.alloc_span(0, p_start);
+        int p = p_start, g0 = 0, step = 0;
+        std::vector<int> seed_g;                 // generated index of each step's seed
+        while (p < p_end) {
+            const auto plan = kvflash_spec_step_plan(
+                hist0, 0, (size_t)g0, p, block, tau, kF5Chunk,
+                [&](int c) { return spec.pager.is_resident(c); });
+            seed_g.push_back(g0 + 1);
+            int consumed;
+            if (plan.ar_hop) {
+                CHECK(spec.alloc_row(p));
+                consumed = 1;
+            } else {
+                const int n = std::min(block, plan.span);
+                CHECK(n >= 1);
+                for (int i = 0; i < n; i++)      // verify rows: no new chunk
+                    CHECK(spec.pager.is_resident((p + i) / kF5Chunk));
+                consumed = 1 + (step % accept_mod) % n;
+            }
+            consumed = std::min(consumed, p_end - p);
+            p += consumed;
+            g0 += consumed;
+            step++;
+        }
+        // AR reselects before it forwards generated token r: a step starts there.
+        for (int r : kvflash_reselect_points(hist0, 0, g0, tau))
+            if (r <= g0) CHECK(std::find(seed_g.begin(), seed_g.end(), r) != seed_g.end());
+        // Same pool: the hop allocates the chunk AR allocates at the same position.
+        CHECK(spec.state() == ar.state());
+    }
 }
 
 TEST_CASE(KvflashSpecSerialFixture, seed_takes_the_ar_step_only_where_it_opens_an_unallocated_chunk) {
