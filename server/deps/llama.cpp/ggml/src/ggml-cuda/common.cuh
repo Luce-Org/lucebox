@@ -1496,6 +1496,30 @@ struct ggml_backend_cuda_context {
     };
     std::vector<luce_q8_memo_entry> luce_q8_memo;
 
+    // Q8 memo (glue-q8-memo.h, mmq.cu): q8_1 MMQ
+    // activations that a plain node evaluation quantized and a later matmul
+    // of the same graph may reuse. Each entry is released once its last
+    // predicted reader has been enqueued, and all at the end of every
+    // evaluation, so entries are freed out of allocation order: legacy pools
+    // only. luce_glue_graph/luce_glue_node name the node the evaluation loop
+    // is computing (-1 outside a plain ggml_cuda_compute_forward). All of it
+    // stays empty while a test keeps the memo off.
+    struct luce_glue_q8_entry {
+        const ggml_cgraph * graph       = nullptr;
+        const void *        root        = nullptr;  // reshape root of src1
+        const void *        data        = nullptr;  // src1->data
+        int64_t             ne[4]       = {0, 0, 0, 0};
+        int                 layout      = -1;       // mmq_q8_1_ds_layout
+        int                 created     = -1;       // node that quantized it
+        int                 last_reader = -1;       // last node predicted to reuse it
+        int                 clean_until = -1;       // last node before src1 may be rewritten
+        size_t              nbytes      = 0;
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
+    };
+    std::vector<luce_glue_q8_entry> luce_glue_q8;
+    const ggml_cgraph * luce_glue_graph = nullptr;
+    int luce_glue_node = -1;
+
     // DS4 HC boundary launches (ds4-hc.cu) synchronize their blocks on this
     // device barrier: an arrival count and a generation.
     unsigned int * ds4_hc_barrier = nullptr;

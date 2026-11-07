@@ -7144,12 +7144,23 @@ static struct ggml_tensor * ggml_gated_delta_net_impl(
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state,
-        struct ggml_tensor  * active_slot_ids) {
+        struct ggml_tensor  * active_slot_ids,
+        bool                  shared_gates) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
-    GGML_ASSERT(ggml_is_contiguous(g));
-    GGML_ASSERT(ggml_is_contiguous(beta));
+    if (shared_gates) {
+        // ggml_gated_delta_net_shared_gates: scalar g and beta views with one
+        // layout (the CUDA kernels index both through beta's strides).
+        GGML_ASSERT(g->ne[0] == 1);
+        GGML_ASSERT(ggml_are_same_shape(g, beta));
+        GGML_ASSERT(ggml_are_same_stride(g, beta));
+        GGML_ASSERT(ggml_is_contiguous_rows(g));
+        GGML_ASSERT(ggml_is_contiguous_rows(beta));
+    } else {
+        GGML_ASSERT(ggml_is_contiguous(g));
+        GGML_ASSERT(ggml_is_contiguous(beta));
+    }
     GGML_ASSERT(ggml_is_contiguous(state));
 
     GGML_ASSERT(q->type == GGML_TYPE_F32);
@@ -7168,6 +7179,12 @@ static struct ggml_tensor * ggml_gated_delta_net_impl(
     // gate: scalar [1, H, T, B] or vector [S_v, H, T, B] (KDA)
     GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
     GGML_ASSERT(beta->ne[0] == 1);
+    if (shared_gates) {
+        // Strided views: the kernels index them by H, T and B, so their
+        // extents must match v's (ggml_nelements does not cover a view).
+        GGML_ASSERT(g->ne[1] == H && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
+        GGML_ASSERT(beta->ne[1] == H && beta->ne[2] == n_tokens && beta->ne[3] == n_seqs);
+    }
 
     GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H);
     if (active_slot_ids) {
@@ -7189,6 +7206,9 @@ static struct ggml_tensor * ggml_gated_delta_net_impl(
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs + S_v * n_tokens * n_seqs, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
     ggml_set_op_params_i32(result, 1, 0);
+    if (shared_gates) {
+        ggml_set_op_params_i32(result, 12, 1);
+    }
 
     result->op     = GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
@@ -7210,7 +7230,7 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state) {
-    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, NULL);
+    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, NULL, false);
 }
 
 struct ggml_tensor * ggml_gated_delta_net_inplace(
@@ -7237,8 +7257,24 @@ struct ggml_tensor * ggml_gated_delta_net_active_inplace(
         struct ggml_tensor  * active_slot_ids) {
     GGML_ASSERT(active_slot_ids != NULL);
     struct ggml_tensor * result = ggml_gated_delta_net_impl(
-        ctx, q, k, v, g, beta, state, active_slot_ids);
+        ctx, q, k, v, g, beta, state, active_slot_ids, false);
     ggml_set_op_params_i32(result, 1, 1);
+    return result;
+}
+
+// dflash: shared strided gates (see ggml.h). op_params[12] = 1.
+struct ggml_tensor * ggml_gated_delta_net_shared_gates(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        bool                  inplace) {
+    struct ggml_tensor * result = ggml_gated_delta_net_impl(
+        ctx, q, k, v, g, beta, state, NULL, true);
+    ggml_set_op_params_i32(result, 1, inplace ? 1 : 0);
     return result;
 }
 

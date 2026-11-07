@@ -37,6 +37,7 @@
 #include "kv_quant.h"
 #include "qwen35_ops.h"
 #include "qwen35moe_ffn.h"
+#include "glue_fusions.h"
 #include "common/chain_rollback_policy.h"
 #include "common/kv_rotation.h"
 #include "common/specla_commit_cuda.h"
@@ -45,6 +46,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1094,8 +1096,38 @@ bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend) {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
+// gate|up stack (glue_fusions.h): whether this layer's FFN
+// runs one GEMM over the loader's ffn_gate|ffn_up stack at this width.
+static bool glue_gate_up_stack(const TargetLayer & L, ggml_backend_t backend, int n_tokens) {
+    if (!luce::qwen35::glue::gate_up_stack_on()) return false;
+    luce::qwen35::glue::GateUpFacts f;
+    f.on = true;
+    f.stacked = L.ffn_gate_up != nullptr && L.w_gate != nullptr;
+    f.unit_scales = L.w_gate_s == 1.0f && L.w_up_s == 1.0f;
+    if (f.stacked) {
+        f.backend_inexact = ggml_backend_is_cuda(backend)
+            ? ggml_backend_cuda_row_stack_inexact(backend, L.ffn_gate_up, L.w_gate->ne[1], n_tokens)
+            : "not a single CUDA/HIP backend";
+    }
+    return luce::qwen35::glue::gate_up_plan(f).stack;
+}
+
 static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
-                                      const TargetLayer & L) {
+                                      const TargetLayer & L, bool stack_gate_up = false) {
+    if (stack_gate_up) {
+        // gate|up stack: one GEMM over the zero-copy
+        // ffn_gate|ffn_up alias; its rows are the members' rows, each
+        // computed as the separate GEMM would (ggml_backend_cuda_row_stack_inexact
+        // vouched for this width). The SwiGLU reads the two row slices
+        // through their stride (unary_gated_op_kernel), as it reads the
+        // separate results through theirs.
+        const int64_t n_ff = L.w_gate->ne[1];
+        ggml_tensor * gu_all = ggml_mul_mat(ctx, L.ffn_gate_up, cur);   // [2 * inter, n_tokens]
+        const size_t e = ggml_element_size(gu_all);
+        ggml_tensor * gate = ggml_view_2d(ctx, gu_all, n_ff, gu_all->ne[1], gu_all->nb[1], 0);
+        ggml_tensor * up   = ggml_view_2d(ctx, gu_all, n_ff, gu_all->ne[1], gu_all->nb[1], (size_t) n_ff * e);
+        return apply_scale2(ctx, ggml_mul_mat(ctx, L.w_down, ggml_swiglu_split(ctx, gate, up)), L.w_down_s);
+    }
     ggml_tensor * gate = ggml_mul_mat(ctx, L.w_gate, cur);   // [inter, n_tokens]
     ggml_tensor * up   = ggml_mul_mat(ctx, L.w_up, cur);
     ggml_tensor * gu;
@@ -1776,12 +1808,36 @@ static ggml_tensor * build_delta_net_block(
         !use_chunked && !use_specla_factorized && !use_specla_hld;
     const bool raw_gates = (fused_plain || verify_fused) && !use_chunked && L.ssm_gate_ba;
 
+    // strided gates (glue_fusions.h): on the dense single-sequence
+    // chain (fused sequential kernels, not chunked) the GDN kernel reads
+    // beta/alpha in place from the stacked projection, and the gated norm
+    // reads z in place from the stacked attn_gate|qkv result, instead of
+    // contiguous copies. Every other segment (tree, mapped verify, compact
+    // decode, ragged prefill, chunked, SpecLA) keeps both copies.
+    luce::qwen35::glue::StridedGdnPlan glue_plan;
+    if (luce::qwen35::glue::strided_gates_on()) {
+        luce::qwen35::glue::StridedGdnFacts f;
+        f.on = true;
+        f.stacked_ba = stacked_ba;
+        f.ba_copy = stacked_ba && beta_2d->op == GGML_OP_CONT;
+        f.fused_chain = fused_plain && !use_chunked;
+        f.raw_gates = raw_gates;
+        f.mapped_verify = verify_fused;
+        f.stacked_z = stacked_qkv_z;
+        f.z_copy = stacked_qkv_z && !ggml_is_contiguous(seg_cols(z, seg.off, seg_tokens));
+        f.cuda_backend = fused_kernel_backend;
+        f.fusion_enabled = ggml_backend_cuda_fusion_enabled();
+        glue_plan = luce::qwen35::glue::strided_gdn_plan(f);
+    }
+
     ggml_tensor * beta = nullptr;
     ggml_tensor * g_tensor = nullptr;
-    if (raw_gates && verify_fused && ba) {
+    if (raw_gates && (verify_fused || glue_plan.gates) && ba) {
         // Strided [1, H, T, S] views of the stacked (beta | alpha) projection:
         // the mapped-verify kernel reads both through one layout, so the two
-        // contiguity copies go away together with the gate ops.
+        // contiguity copies go away together with the gate ops (the chain
+        // kernel too, through ggml_gated_delta_net_shared_gates, under
+        // strided gates).
         const size_t e = ggml_element_size(ba);
         beta = ggml_view_4d(ctx, ba, 1, num_v_heads, n_seq_tokens, seg_seqs,
                             e, ba->nb[1], ba->nb[1] * n_seq_tokens,
@@ -2152,9 +2208,11 @@ static ggml_tensor * build_delta_net_block(
         GGML_ASSERT(!verify_fused || !persist_inter);
         result = verify_fused
             ? ggml_gated_delta_net_mapped_verify(ctx, q_c, k_c, v_c, g_tensor, beta, s, seg.state_ids)
-            : inplace_state
-                ? ggml_gated_delta_net_inplace(ctx, q_c, k_c, v_c, g_tensor, beta, s)
-                : ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
+            : glue_plan.gates
+                ? ggml_gated_delta_net_shared_gates(ctx, q_c, k_c, v_c, g_tensor, beta, s, inplace_state)
+                : inplace_state
+                    ? ggml_gated_delta_net_inplace(ctx, q_c, k_c, v_c, g_tensor, beta, s)
+                    : ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
         if (persist_inter) {
             result->src[7] = persist_inter;
         }
@@ -2224,13 +2282,26 @@ static ggml_tensor * build_delta_net_block(
 
 after_delta_net:
     // ── Gated output norm: rms_norm(output) * silu(z_4d)
+    ggml_tensor * output_n = nullptr;
+    if (glue_plan.z) {
+        // strided gates: z stays the strided [d_inner, T] row
+        // slice of the stacked projection. The norm is viewed as the same
+        // [d_inner, T] rows, so silu + mul (adjacent nodes) fuse into
+        // ggml_cuda_op_unary_mul, which reads z through its row stride: the
+        // same kernel on the same values as the parent's copied z.
+        output_n = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, output), w.rms_eps);
+        output_n = ggml_mul(ctx, output_n, L.ssm_norm);
+        output_n = ggml_reshape_2d(ctx, output_n, head_v_dim * num_v_heads, seg_tokens);
+        output_n = ggml_mul(ctx, output_n, ggml_silu(ctx, seg_cols(z, seg.off, seg_tokens)));
+    } else {
     ggml_tensor * z_4d = ggml_reshape_4d(ctx,
         contig(seg_cols(z, seg.off, seg_tokens)),
         head_v_dim, num_v_heads, n_seq_tokens, seg_seqs);
-    ggml_tensor * output_n = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, output), w.rms_eps);
+    output_n = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, output), w.rms_eps);
     output_n = ggml_mul(ctx, output_n, L.ssm_norm);
     ggml_tensor * z_silu  = ggml_silu(ctx, z_4d);
     output_n = ggml_mul(ctx, output_n, z_silu);
+    }
 
     // Reshape to [d_inner, seg_tokens]
     flat[si] = ggml_reshape_2d(ctx, output_n,
@@ -2332,7 +2403,7 @@ static ggml_tensor * build_single_layer(
     ggml_tensor * moe_selected = nullptr;
     ggml_tensor * ffn  = L.ffn_gate_inp
         ? build_qwen35moe_ffn(ctx, post, w, L, &moe_selected)
-        : build_swiglu_ffn(ctx, post, L);
+        : build_swiglu_ffn(ctx, post, L, glue_gate_up_stack(L, cache.backend, (int) post->ne[1]));
     if (moe_selected_out) {
         *moe_selected_out = moe_selected;
     }
@@ -2580,7 +2651,7 @@ QwenGraphOutputs build_qwen35_graph(
         ggml_tensor * ffn = L.ffn_gate_inp
             ? build_qwen35moe_ffn(ctx, post, w, L,
                                   in.capture_moe_router ? &moe_selected : nullptr)
-            : build_swiglu_ffn(ctx, post, L);
+            : build_swiglu_ffn(ctx, post, L, glue_gate_up_stack(L, cache.backend, (int) post->ne[1]));
         if (in.capture_moe_router && moe_selected) {
             ggml_set_output(moe_selected);
             og_early.moe_selected[(size_t)il] = moe_selected;

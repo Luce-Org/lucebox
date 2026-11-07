@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/uma-budget.h"
+#include "ggml-cuda/glue-q8-memo.cuh"
 #include "ggml-cuda/vision-bias.cuh"
 #include "ggml-cuda/vision-rotary.cuh"
 #include "ggml-cuda/vision-softmax.cuh"
@@ -239,6 +240,19 @@ extern "C" bool ggml_backend_cuda_set_graphs_disabled_override(bool disabled) {
     const bool previous = ggml_cuda_graphs_disabled_override;
     ggml_cuda_graphs_disabled_override = disabled;
     return previous;
+}
+
+// The graph-node fusions always run, unless a test turned them off to compare
+// the fused kernels with the unfused ops
+// (ggml_backend_cuda_set_fusion_disabled_override).
+static std::atomic<bool> ggml_cuda_fusion_disabled_override{false};
+
+extern "C" bool ggml_backend_cuda_set_fusion_disabled_override(bool disabled) {
+    return ggml_cuda_fusion_disabled_override.exchange(disabled);
+}
+
+extern "C" bool ggml_backend_cuda_fusion_enabled(void) {
+    return !ggml_cuda_fusion_disabled_override.load(std::memory_order_relaxed);
 }
 
 static bool ggml_cuda_graphs_disabled_for_device(int device) {
@@ -1109,6 +1123,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     while (!luce_q8_memo.empty()) {
         luce_q8_memo.pop_back();
     }
+    luce_glue_q8.clear();
     if (ds4_hc_barrier != nullptr) {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ds4_hc_barrier));
@@ -3457,6 +3472,55 @@ static bool ggml_cuda_mul_mat_vec_q_eligible(const ggml_tensor * src0, const ggm
 static bool ggml_cuda_mul_mat_prefers_mmq(const ggml_tensor * src0, const ggml_tensor * src1, const int cc) {
     return src0->type == GGML_TYPE_Q4_K && GGML_CUDA_CC_IS_RDNA4(cc) && src1->ne[1] > 1 &&
            src0->ne[1] >= GGML_CUDA_RDNA4_Q4_K_MMQ_MIN_ROWS;
+}
+
+// Row stacking, the Qwen3.5 gate|up stack (qwen35/glue_fusions.h): whether a
+// plain MUL_MAT of `weight` (two weights stacked by rows, the first
+// `rows_first` rows one member) with `ncols` F32 columns computes each output
+// row exactly as a MUL_MAT of its member alone would. That holds when
+// ggml_cuda_mul_mat takes MMQ on both shapes without stream-k: MMQ picks
+// mmq_x from ncols and the tile instance from the type alone, accumulates
+// every element over K in a fixed order whatever tile computes it, and with
+// both members a multiple of 128 rows no tile is bounds-checked
+// (need_check, mmq_y <= 128). Stream-k splits K by the total tile count, so
+// there the row count changes the sums. nullptr when exact, else why not.
+extern "C" const char * ggml_backend_cuda_row_stack_inexact(
+        ggml_backend_t backend, const struct ggml_tensor * weight, int64_t rows_first, int64_t ncols) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return "not a single CUDA/HIP backend";
+    }
+    if (weight == nullptr || weight->buffer == nullptr || ggml_backend_buft_is_cuda_split(weight->buffer->buft) ||
+        weight->ne[2] != 1 || weight->ne[3] != 1 || !ggml_is_contiguous(weight)) {
+        return "weight is not one contiguous 2-D device tensor";
+    }
+    const ggml_type type = weight->type;
+    if (!ggml_is_quantized(type) || type == GGML_TYPE_MXFP8 || type == GGML_TYPE_MXFP4 ||
+        type == GGML_TYPE_Q2_1_ROCMFP2_MIX || type == GGML_TYPE_Q3_1_ROCMFP3_MIX ||
+        type == GGML_TYPE_Q2_0_ROCMFP2) {
+        return "weight type outside the plain MMQ path";
+    }
+    if (ncols <= MMVQ_MAX_BATCH_SIZE || ncols <= ggml_cuda_mmvq_max_ncols()) {
+        return "MMVQ width (decode keeps its gate/up kernels)";
+    }
+    if (ggml_cuda_qwen4exp_graph()) {
+        return "qwen4exp profile (BF16 shadow and MMB routes)";
+    }
+    const int cc = ggml_cuda_info().devices[ggml_backend_cuda_get_device_id(backend)].cc;
+    if ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
+        GGML_CUDA_CC_IS_CDNA(cc)) {
+        return "stream-k MMQ (its K split depends on the row count)";
+    }
+    const int64_t rows_second = weight->ne[1] - rows_first;
+    if (rows_first <= 0 || rows_second <= 0 || rows_first % 128 != 0 || rows_second % 128 != 0) {
+        return "member rows not a multiple of 128 (bounds-checked MMQ tiles)";
+    }
+    ggml_tensor op = {};
+    op.op = GGML_OP_MUL_MAT;
+    op.src[0] = const_cast<ggml_tensor *>(weight);
+    if (!ggml_cuda_should_use_mmq(&op, cc, ncols, /*n_experts=*/0)) {
+        return "MMQ is not taken at this width";
+    }
+    return nullptr;
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -6374,8 +6438,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif // !defined(GGML_USE_MUSA)
 
                 // start of fusion operations
-                static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
-                if (!disable_fusion) {
+                if (ggml_backend_cuda_fusion_enabled()) {
                     if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU_DS4 &&
                         node->src[1] != nullptr && node->type == GGML_TYPE_F32) {
                         // A down projection reads it next: emit its q8_1 form too.
@@ -6998,7 +7061,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                // Q8 memo: an MMQ call reuses or keeps a
+                // q8_1 activation only for the node computed here, by its
+                // position in the graph (mmq.cu, glue-q8-memo.h).
+                const bool glue_q8_memo = ggml_cuda_glue_q8_memo_on();
+                if (glue_q8_memo) {
+                    cuda_ctx->luce_glue_graph = cgraph;
+                    cuda_ctx->luce_glue_node = i;
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (glue_q8_memo) {
+                    cuda_ctx->luce_glue_node = -1;
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -7009,6 +7083,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
 
+            // Q8 memo entries never outlive the evaluation that made them
+            // (unconditional: a test may turn the memo off between graphs).
+            ggml_cuda_glue_q8_memo_clear(*cuda_ctx);
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -7188,6 +7265,7 @@ extern "C" size_t ggml_backend_cuda_trim_pool(ggml_backend_t backend) {
     while (!cuda_ctx->luce_q8_memo.empty()) {
         cuda_ctx->luce_q8_memo.pop_back();
     }
+    ggml_cuda_glue_q8_memo_clear(*cuda_ctx);
 #if defined(GGML_USE_HIP)
     ggml_cuda_mmb_release_all(); // MMB caches and the bf16 weight shadows keyed by weight address
 #endif
@@ -7252,7 +7330,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         };
         // The xn, gate-mix and routed GLU marks assume the fused kernels consume or produce those tensors; with fusion
         // disabled the unfused ops would read or write them and compute_forward aborts, so skip those marks.
-        static const bool fusion_off = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr;
+        const bool fusion_off = !ggml_backend_cuda_fusion_enabled();
         for (int i = 0; i < cgraph->n_nodes && !fusion_off; ++i) {
             const ggml_tensor * op = cgraph->nodes[i];
             if (op->op != GGML_OP_HC_COMBINE_NORM) continue;
@@ -7349,6 +7427,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     while (!cuda_ctx->luce_q8_memo.empty()) {
         cuda_ctx->luce_q8_memo.pop_back();
     }
+    ggml_cuda_glue_q8_memo_clear(*cuda_ctx);
 
 #if defined(GGML_USE_HIP)
     // Pre-dequantize eligible dense weights into a bf16 shadow (outside stream capture); qwen4exp graphs only.
