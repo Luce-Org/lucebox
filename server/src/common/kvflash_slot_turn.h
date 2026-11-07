@@ -221,6 +221,14 @@ inline KvFlashRungs kvflash_rungs_after_resume(int ckpt, int trunk, int L) {
     return r;
 }
 
+// The rungs of a parked session rewound to L (slab restored, pager and history cut to L): the ones above L are gone, a trunk at or below
+// L becomes the checkpoint when the checkpoint is above it. Applied at the rewind, so a session left parked (a busy refusal) never
+// holds a rung past its history, which the bundle head refuses.
+inline KvFlashRungs kvflash_rungs_after_rewind(int ckpt, int trunk, int L) {
+    return kvflash_rungs_after_resume(ckpt, trunk, L);
+}
+
+
 // A session keeps a third rung beside ckpt and trunk. A rewind to a rung
 // below the checkpoint (a branch: the client re-rendered an earlier prompt) pins that rung in the third slot; with no
 // branch the slot holds the rung the ladder demoted, so it never costs a rung the two-rung ladder had.
@@ -300,6 +308,23 @@ inline KvFlashLadderMove kvflash_ladder_ckpt(const KvFlashLadder & in, int p) {
     return m;
 }
 
+// What a save writes of the third rung: its slab (-1: none; a third at a rung's position holds the same state, so no second file) and the pin.
+struct KvFlashHeadRungs { int extra = -1; int pin = 0; };
+inline KvFlashHeadRungs kvflash_ladder_to_head(const KvFlashLadder & in) {
+    const bool dup = in.extra > 0 && (in.extra == in.ckpt || in.extra == in.trunk);
+    return {in.extra > 0 && !dup ? in.extra : -1, in.pinned && in.extra > 0 ? in.extra : 0};
+}
+// The ladder a head restores to, as a move over the loaded slabs (0 ckpt, 1 trunk, 2 third): the pin comes back with the third, or as a copy of
+// the ckpt or trunk slab it names.
+inline KvFlashLadderMove kvflash_ladder_restored(int ckpt, int trunk, int extra, int pin) {
+    KvFlashLadderMove m;
+    m.to.ckpt = ckpt; m.ckpt_from = ckpt > 0 ? kRungCkpt : kRungNone;
+    m.to.trunk = trunk; m.trunk_from = trunk > 0 ? kRungTrunk : kRungNone;
+    if (extra > 0) { m.to.extra = extra; m.extra_from = kRungExtra; m.to.pinned = pin == extra; }
+    else if (pin > 0 && (pin == ckpt || pin == trunk)) { m.to.extra = pin; m.extra_from = pin == ckpt ? kRungCkpt : kRungTrunk; m.to.pinned = true; }
+    return m;
+}
+
 // The oldest parked session (the one to drop when a slot is needed); -1 when none.
 inline int kvflash_oldest_session(const std::vector<KvFlashParkedSession> & parked) {
     int slot = -1;
@@ -336,6 +361,53 @@ inline KvFlashResumeRefused kvflash_resume_refused(bool busy, bool other_parked,
     if (exceeds_capacity) return KvFlashResumeRefused::refuse;
     if (!busy) return KvFlashResumeRefused::drop_cold;
     return other_parked ? KvFlashResumeRefused::evict_other_retry : KvFlashResumeRefused::wait_parked;
+}
+
+// Restoring a session from disk reserves host bytes like any admit. Busy (the ledger lacks room) evicts the oldest
+// parked session and tries again; Refused (the bundle or the pager cannot take it) is final. Returns Busy only
+// when `evict()` has nothing left to free.
+enum class KvFlashAdopt { Ok, Busy, Refused };
+// `release()` runs before every eviction: the returning bundle's memory is freed (the retry re-reads it) so no allocation the
+// ledger has not charged is live while a victim is staged.
+template <class TryAdopt, class Release, class Evict>
+inline KvFlashAdopt kvflash_adopt_with_evict(TryAdopt try_adopt, Release release, Evict evict) {
+    for (;;) {
+        const KvFlashAdopt r = try_adopt();
+        if (r != KvFlashAdopt::Busy) return r;
+        release();
+        if (!evict()) return r;
+    }
+}
+template <class TryAdopt, class Evict>
+inline KvFlashAdopt kvflash_adopt_with_evict(TryAdopt try_adopt, Evict evict) {
+    return kvflash_adopt_with_evict(try_adopt, [] {}, evict);
+}
+
+// A returning session's restore from disk: `probe()` answers from the ledger alone whether the host reservation fits
+// (Busy = it does not; anything else = cannot decide or fits), `has_victim()` whether a parked session could leave,
+// `validate()` streams the bundle once without holding it (false: unreadable), `load()` reads the bundle (false: unreadable), `try_adopt`
+// reserves and installs it, `release` frees the loaded bundle before a victim is staged, `evict_one` frees the oldest
+// parked session (false: nothing left). `load_failed` says the bundle could not be read (first load or the reload).
+struct KvFlashRestoreResult { KvFlashAdopt adopt = KvFlashAdopt::Refused; bool load_failed = false; };
+template <class Probe, class HasVictim, class Validate, class Load, class TryAdopt, class Release, class EvictOne>
+inline KvFlashRestoreResult kvflash_restore_adopt(Probe probe, HasVictim has_victim, Validate validate, Load load, TryAdopt try_adopt, Release release, EvictOne evict_one, bool evict_for_room) {
+    // The ledger first: a reservation that does not fit is Busy without a read when nothing can leave. Otherwise the bundle is
+    // validated ONCE before the first eviction (an unreadable one evicts nothing and returns its own error), then one victim
+    // leaves at a time until the reservation fits.
+    if (probe() == KvFlashAdopt::Busy) {
+        if (!evict_for_room || !has_victim()) return {KvFlashAdopt::Busy, false};
+        if (!validate()) return {KvFlashAdopt::Refused, true};
+        while (probe() == KvFlashAdopt::Busy)
+            if (!evict_one()) return {KvFlashAdopt::Busy, false};
+    }
+    if (!load()) return {KvFlashAdopt::Refused, true};
+    bool reload_failed = false;
+    const KvFlashAdopt got = kvflash_adopt_with_evict(try_adopt, release, [&] {
+        if (!evict_for_room || !evict_one()) return false;
+        if (!load()) { reload_failed = true; return false; }
+        return true;
+    });
+    return {got, reload_failed};
 }
 
 }  // namespace luce::common
