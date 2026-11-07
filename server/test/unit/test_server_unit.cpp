@@ -14919,6 +14919,214 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_budget_lru_survives_restart) {
     rm_rf(dir);
 }
 
+namespace {
+
+// A DiskStore tenant over plain numbers: units of (last_used, bytes); the oldest unprotected one goes first.
+struct FakeTenant {
+    struct Unit { uint64_t last_used, bytes; bool prot; };
+    std::vector<Unit> units;
+    int evictions = 0;
+    uint64_t usage() const { uint64_t n = 0; for (const auto & u : units) n += u.bytes; return n; }
+    int oldest_index() const {
+        int at = -1;
+        for (size_t i = 0; i < units.size(); ++i)
+            if (!units[i].prot && (at < 0 || units[i].last_used < units[(size_t)at].last_used)) at = (int)i;
+        return at;
+    }
+    DiskStore::Tenant tenant() {
+        DiskStore::Tenant t;
+        t.usage = [this] { return usage(); };
+        t.oldest = [this](uint64_t & last_used) {
+            const int at = oldest_index();
+            if (at < 0) return false;
+            last_used = units[(size_t)at].last_used;
+            return true;
+        };
+        t.evict_oldest = [this]() -> uint64_t {
+            const int at = oldest_index();
+            if (at < 0) return 0;
+            const uint64_t n = units[(size_t)at].bytes;
+            units.erase(units.begin() + at);
+            ++evictions;
+            return n;
+        };
+        return t;
+    }
+};
+
+// The store a DiskPrefixCache over `cfg` already has open in this process.
+std::shared_ptr<DiskStore> shared_store(const DiskCacheConfig & cfg) {
+    bool failed = false;
+    return DiskStore::open(cfg, nullptr, nullptr, failed);
+}
+
+}  // namespace
+
+// A tenant's bytes count in the one budget: prefix files give way for them, oldest first.
+TEST_CASE(ServerUnitFixture, test_disk_tenant_usage_counts_against_the_one_budget) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tenant_usage").string();
+    const uint64_t one = one_file_size(backend, dir, 40);
+    uint64_t clock = 1;
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 0;
+    cfg.budget_bytes = (size_t)(one * 2 + one / 2);   // one tenant unit and one file; a second file does not fit
+    {
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&] { return clock; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        auto store = shared_store(cfg);
+        TEST_ASSERT(store != nullptr);
+        FakeTenant fake;
+        fake.units.push_back({1000, one, true});      // protected: only the prefix files can give way
+        const uint64_t id = store->attach_tenant(fake.tenant());
+        TEST_ASSERT(id != 0);
+        TEST_ASSERT(store->tenant_bytes() == one);
+        clock = 1; TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 1)));
+        clock = 2; TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 500)));
+        TEST_ASSERT(cache.entry_count() == 1);
+        TEST_ASSERT(!cache.lookup(disk_test_key(40, 1), Checkpoint::of_cache_slot(1)));   // the older file went
+        TEST_ASSERT(cache.lookup(disk_test_key(40, 500), Checkpoint::of_cache_slot(1)));
+        TEST_ASSERT(fake.units.size() == 1 && fake.evictions == 0);
+        TEST_ASSERT(cache.total_bytes() + store->tenant_bytes() <= cfg.budget_bytes);
+        store->detach_tenant(id);
+        TEST_ASSERT(store->tenant_bytes() == 0);
+    }
+    rm_rf(dir);
+}
+
+// One LRU across both kinds: whichever of the prefix file and the tenant unit was used least recently is evicted.
+TEST_CASE(ServerUnitFixture, test_disk_tenant_and_prefix_files_share_one_lru) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tenant_lru").string();
+    const uint64_t one = one_file_size(backend, dir, 40);
+    for (uint64_t unit_used : {5ull, 15ull}) {   // older than the first file, then newer
+        uint64_t clock = 10;
+        DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 0;
+        cfg.budget_bytes = (size_t)(one * 2 + one / 2);
+        rm_rf(dir);
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&] { return clock; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        auto store = shared_store(cfg);
+        FakeTenant fake;
+        fake.units.push_back({unit_used, one, false});
+        const uint64_t id = store->attach_tenant(fake.tenant());
+        clock = 10; TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 1)));
+        clock = 20; TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 500)));
+        if (unit_used < 10) {
+            TEST_ASSERT(fake.evictions == 1 && fake.units.empty());   // the tenant unit was the oldest
+            TEST_ASSERT(cache.entry_count() == 2);
+        } else {
+            TEST_ASSERT(fake.evictions == 0 && fake.units.size() == 1);   // the first file was
+            TEST_ASSERT(cache.entry_count() == 1);
+            TEST_ASSERT(!cache.lookup(disk_test_key(40, 1), Checkpoint::of_cache_slot(1)));
+        }
+        store->detach_tenant(id);
+    }
+    rm_rf(dir);
+}
+
+// A tenant whose units are all protected is never evicted: the save that does not fit beside them is refused.
+TEST_CASE(ServerUnitFixture, test_disk_tenant_protected_units_are_never_evicted_and_can_refuse_a_save) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tenant_protected").string();
+    const uint64_t one = one_file_size(backend, dir, 40);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 0;
+    cfg.budget_bytes = (size_t)(one * 2 + one / 2);
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        auto store = shared_store(cfg);
+        FakeTenant fake;
+        fake.units.push_back({1, one * 2, true});      // 2 of the 2.5 files of room, protected
+        const uint64_t id = store->attach_tenant(fake.tenant());
+        TEST_ASSERT(!cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 1)));   // 2 + 1 > 2.5 and nothing may give way
+        TEST_ASSERT(cache.entry_count() == 0);
+        TEST_ASSERT(fake.units.size() == 1 && fake.evictions == 0);
+        store->detach_tenant(id);
+    }
+    rm_rf(dir);
+}
+
+// reserve() makes room by the same LRU and holds the bytes until release().
+TEST_CASE(ServerUnitFixture, test_disk_tenant_reserve_evicts_by_lru_and_release_gives_the_bytes_back) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tenant_reserve").string();
+    const uint64_t one = one_file_size(backend, dir, 40);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 0;
+    cfg.budget_bytes = (size_t)(one * 2 + one / 2);
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        auto store = shared_store(cfg);
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 1)));
+        TEST_ASSERT(store->reserve(one));                 // 2 of 2.5
+        TEST_ASSERT(cache.entry_count() == 1);
+        TEST_ASSERT(store->reserve(one));                 // the file makes room
+        TEST_ASSERT(cache.entry_count() == 0);
+        TEST_ASSERT(!store->reserve(one));                // nothing left to evict: refused, and nothing is held for it
+        store->release(one);
+        TEST_ASSERT(store->reserve(one));
+        store->release(one);
+        store->release(one);
+        TEST_ASSERT(!store->reserve(one * 3));            // more than the whole budget
+        TEST_ASSERT(store->reserve(one * 2));             // and the failed one held nothing
+    }
+    rm_rf(dir);
+}
+
+// The TTL reaches a tenant's unprotected units too, and protected ones stay.
+TEST_CASE(ServerUnitFixture, test_disk_tenant_ttl_expires_unprotected_units_only) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tenant_ttl").string();
+    rm_rf(dir);
+    uint64_t clock = 1000;
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 100;
+    {
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&] { return clock; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        auto store = shared_store(cfg);
+        FakeTenant fake;
+        fake.units.push_back({1000, 10, false});
+        fake.units.push_back({1000, 20, true});
+        fake.units.push_back({1090, 40, false});
+        const uint64_t id = store->attach_tenant(fake.tenant());
+        clock = 1101;
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 1)));
+        TEST_ASSERT(fake.evictions == 1);                 // the 101 s old unprotected one
+        TEST_ASSERT(fake.usage() == 60);                  // the protected one and the 11 s old one stay
+        store->detach_tenant(id);
+    }
+    rm_rf(dir);
+}
+
+// The directories of tenants and of the pin catalog are not prefix layouts: opening the store leaves them alone.
+TEST_CASE(ServerUnitFixture, test_disk_store_scan_leaves_the_tenant_and_catalog_directories_alone) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tenant_scan").string();
+    rm_rf(dir);
+    fs::create_directories(dir + "/sessions/k1");
+    fs::create_directories(dir + "/pins");
+    { std::ofstream(dir + "/sessions/k1/head") << "x"; }
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(fs::exists(dir + "/sessions/k1/head"));
+        TEST_ASSERT(fs::exists(dir + "/pins"));
+        fs::remove_all(dir + "/sessions/k1");
+    }
+    { DiskPrefixCache again(cfg, backend); TEST_ASSERT(again.init()); }
+    TEST_ASSERT(fs::exists(dir + "/sessions"));           // an empty tenant directory is not a stray layout either
+    rm_rf(dir);
+}
+
 TEST_CASE(ServerUnitFixture, test_disk_cache_duplicate_save_refreshes_ttl_after_restart) {
     MockBackendWithAdopt backend;
     const std::string dir = test_tmp_path("luce_test_disk_duplicate_touch").string();
