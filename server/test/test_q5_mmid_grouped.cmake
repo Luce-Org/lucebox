@@ -20,7 +20,7 @@ foreach(mode IN ITEMS legacy default mask-off)
     file(REMOVE "${path}")
     execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env ${policy}
-            --unset=LUCE_MMID_GROUPED_DEVICE --unset=GGML_CUDA_DISABLE_FUSION
+            --unset=LUCE_MMID_GROUPED_DEVICE
             --unset=LUCE_MMID_BENCH_ITERS
             LUCE_CUDA_MMVQ_MOE_KERNEL=1
             LUCE_CUDA_MMVQ_MOE_TOKENWISE=0 LUCE_MMID_TELEMETRY=1

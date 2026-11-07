@@ -3349,6 +3349,24 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * active_slot_ids);
 
+    // dflash extension: ggml_gated_delta_net (inplace = false) or
+    // ggml_gated_delta_net_inplace (inplace = true) whose scalar gates g and
+    // beta may be strided [1, H, T, S] views sharing one layout (the two
+    // halves of a stacked beta|alpha projection) instead of contiguous
+    // copies. op_params[12] = 1. The CUDA/HIP kernels index g and beta
+    // through beta's strides, so they read the same values a contiguous copy
+    // would hold. Non-KDA; raw gates (ggml_gated_delta_net_set_raw_gates)
+    // allowed. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_shared_gates(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            bool                  inplace);
+
     // dflash extension: speculative verify against mapped base states.
     // `state` is the full persistent [S_v, S_v, H, n_slots] tensor and
     // `state_slot_ids` [n_seqs] names the slab each compact sequence starts

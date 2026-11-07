@@ -4,17 +4,25 @@
 #include "mmq-tile-twin-gate.h"
 #include "mmq_tile_twins.h"
 
+#include <cstdio>
+
 #include <atomic>
 #include "quantize.cuh"
 #include "mmid.cuh"
 #include "rocmfp2_mix.cuh"
 #include "rocmfp3_mix.cuh"
+#include "glue-q8-memo.cuh"
+#include "glue-q8-memo.h"
+
+#include <atomic>
 
 #include <algorithm>
 
 static thread_local size_t g_mmq_launch_count = 0;
 static thread_local size_t g_mmq_twin_rows64_launch_count = 0;
 static thread_local size_t g_mmq_twin_rows32_launch_count = 0;
+static thread_local size_t g_glue_q8_memo_hit_count = 0;
+static thread_local size_t g_glue_q8_producer_count = 0;
 
 extern "C" size_t ggml_backend_cuda_get_mmq_launch_count(void) {
     return g_mmq_launch_count;
@@ -30,9 +38,248 @@ extern "C" void ggml_backend_cuda_set_mmq_twins_override(bool rows64, bool rows3
     g_mmq_twin_rows32_on.store(rows32, std::memory_order_relaxed);
 }
 
+// Split k in the 64-row twins' prefetching kernel (ggml-cuda.h), per calling
+// thread: graph_compute dispatches on the caller's thread, so one engine's
+// scope never reaches another's calls. Inside the scope a split call aims for
+// this many workgroups (4 per CU on a 64-CU R9700).
+static thread_local bool g_mmq_splitk_scope = false;
+static constexpr int MMQ_SPLITK_GRID = 256;
+
+extern "C" void ggml_backend_cuda_set_mmq_splitk_scope(bool on) {
+    g_mmq_splitk_scope = on;
+}
+
 extern "C" size_t ggml_backend_cuda_get_mmq_twin_launch_count(int tile_rows) {
     return tile_rows == 64 ? g_mmq_twin_rows64_launch_count :
            tile_rows == 32 ? g_mmq_twin_rows32_launch_count : 0;
+}
+
+extern "C" size_t ggml_backend_cuda_get_glue_q8_memo_hit_count(void) {
+    return g_glue_q8_memo_hit_count;
+}
+
+extern "C" size_t ggml_backend_cuda_get_glue_q8_producer_count(void) {
+    return g_glue_q8_producer_count;
+}
+
+// Q8 memo: reuse the q8_1 activation an earlier MMQ call of the same graph
+// quantized (see glue-q8-memo.h for which calls may share one and why the
+// outputs are bit-identical). Where no entry serves a call,
+// luce_glue_q8_acquire returns nothing and ggml_cuda_mul_mat_q_impl
+// allocates, quantizes and launches as before.
+namespace {
+
+// How far ahead a quantizing matmul looks for readers of its activation. One
+// layer of the Qwen3.8 verify graph spans about 60 nodes, and the readers of
+// a normalized input sit within it (attn_qkv|gate and ssm_beta|alpha around
+// the conv step, the separate attn_gate after the recurrence).
+constexpr int LUCE_GLUE_Q8_WINDOW = 192;
+
+// The q8_1 layout ggml_cuda_mul_mat_q_impl quantizes src1 to for a weight
+// type (mmq_get_q8_1_ds_layout), or -1 for a type MMQ does not serve this
+// way. MXFP4 may take the native FP4 quantizer instead, so it never shares.
+int luce_glue_q8_layout(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+        case GGML_TYPE_Q3_0_ROCMFPX:
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_Q2_0_ROCMFP2:
+        case GGML_TYPE_NVFP4:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
+            return (int) mmq_get_q8_1_ds_layout(type);
+        default:
+            return -1;
+    }
+}
+
+// Release the entries no later node can reuse: those of another graph, and
+// those whose last predicted reader is at or before node `upto`.
+void luce_glue_q8_drop(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int upto) {
+    auto & memo = ctx.luce_glue_q8;
+    for (size_t i = 0; i < memo.size();) {
+        if (memo[i].graph != graph || memo[i].last_reader <= upto) {
+            memo.erase(memo.begin() + (std::ptrdiff_t) i);  // legacy pool: any free order
+        } else {
+            ++i;
+        }
+    }
+}
+
+struct luce_glue_q8_ref {
+    char * data  = nullptr;  // the q8_1 buffer to use; null: allocate locally (parent)
+    bool   reuse = false;    // it already holds src1's q8_1: skip the quantize launch
+};
+
+// For the dense MMQ call computing `dst`: the memo entry to read (reuse), a
+// new entry to quantize into because a later matmul will read it, or nothing
+// (the parent path). `excluded` names a path the memo never serves.
+luce_glue_q8_ref luce_glue_q8_acquire(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * dst, size_t nbytes, const char * excluded) {
+    if (!ggml_cuda_glue_q8_memo_on()) {
+        return {};
+    }
+    if (excluded != nullptr) {
+        return {};
+    }
+    // VMM pool: memo entries would be freed out of allocation order.
+    if (!ctx.pool().is_legacy()) {
+        return {};
+    }
+    if (!ctx.stream_context().concurrent_events.empty() || ctx.curr_stream_no != 0) {
+        return {};
+    }
+    const ggml_cgraph * graph = ctx.luce_glue_graph;
+    const int cur = ctx.luce_glue_node;
+    // A matmul outside the plain node loop (fused group or synthetic tensor).
+    if (graph == nullptr || cur < 0 || cur >= graph->n_nodes || graph->nodes[cur] != dst) {
+        return {};
+    }
+    const int layout = luce_glue_q8_layout(src0->type);
+    if (layout < 0 || !glue_q8_keyable(src1)) {
+        return {};
+    }
+    luce_glue_q8_drop(ctx, graph, cur - 1);
+
+    const ggml_tensor * root = glue_q8_reshape_root(src1);
+    for (const auto & e : ctx.luce_glue_q8) {
+        if (e.root == (const void *) root && e.data == src1->data && e.layout == layout &&
+            e.ne[0] == src1->ne[0] && e.ne[1] == src1->ne[1] && e.ne[2] == src1->ne[2] && e.ne[3] == src1->ne[3] &&
+            e.created < cur && cur <= e.clean_until && cur <= e.last_reader && e.nbytes >= nbytes) {
+            ++g_glue_q8_memo_hit_count;
+            return {e.buf->ptr, true};
+        }
+    }
+
+    const glue_q8_plan plan = glue_q8_scan(
+        graph->nodes, graph->n_nodes, cur, src1, layout, luce_glue_q8_layout, LUCE_GLUE_Q8_WINDOW);
+    if (plan.last_reader <= cur) {
+        return {};
+    }
+    ggml_backend_cuda_context::luce_glue_q8_entry ent;
+    ent.graph = graph;
+    ent.root = (const void *) root;
+    ent.data = src1->data;
+    for (int i = 0; i < 4; ++i) {
+        ent.ne[i] = src1->ne[i];
+    }
+    ent.layout = layout;
+    ent.created = cur;
+    ent.last_reader = plan.last_reader;
+    ent.clean_until = plan.clean_until;
+    ent.nbytes = nbytes;
+    ent.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes);
+    char * data = ent.buf->ptr;
+    ctx.luce_glue_q8.push_back(std::move(ent));
+    return {data, false};
+}
+
+// After the launches of the current node: free the entries it was the last
+// predicted reader of.
+void luce_glue_q8_release(ggml_backend_cuda_context & ctx, const luce_glue_q8_ref & ref) {
+    if (ref.data == nullptr) {
+        return;
+    }
+    luce_glue_q8_drop(ctx, ctx.luce_glue_graph, ctx.luce_glue_node);
+}
+
+}  // namespace
+
+// The entry a producer (RMS norm, SWIGLU) writes (glue-q8-memo.cuh). Keyed, sized and planned as luce_glue_q8_acquire keys,
+// sizes and plans the entry of a quantizing call, with src1 the producer's
+// own output: the key (reshape root, data, ne, layout) and nbytes are those
+// the reader computes for it, so its lookup matches; created is the
+// producer's node, so the reader (created < cur) reuses it as well.
+char * ggml_cuda_glue_q8_memo_produce(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int at,
+                                      ggml_cuda_glue_q8_takes_mmq_t takes_mmq, int * layout) {
+    *layout = -1;
+    // Where luce_glue_q8_acquire would serve nothing, the readers quantize.
+    if (!ggml_cuda_glue_q8_memo_on() || !ctx.pool().is_legacy() ||
+        !ctx.stream_context().concurrent_events.empty() || ctx.curr_stream_no != 0) {
+        return nullptr;
+    }
+    if (graph == nullptr || at < 0 || at >= graph->n_nodes || takes_mmq == nullptr) {
+        return nullptr;
+    }
+    const ggml_tensor * t = graph->nodes[at];
+    // One channel of contiguous rows (ne1 = t->ne[1] in the MMQ layout) that
+    // the producer reads back four floats at a time.
+    if (!glue_q8_keyable(t) || t->ne[0] % 4 != 0 || t->ne[2] != 1 || t->ne[3] != 1) {
+        return nullptr;
+    }
+    const int first = glue_q8_first_reader(
+        graph->nodes, graph->n_nodes, at, t, luce_glue_q8_layout,
+        [&](const ggml_tensor * mm) { return takes_mmq(ctx, mm); }, LUCE_GLUE_Q8_WINDOW);
+    if (first < 0) {
+        return nullptr;
+    }
+    const int lay = luce_glue_q8_layout(graph->nodes[first]->src[0]->type);
+    luce_glue_q8_drop(ctx, graph, at - 1);
+    const glue_q8_plan plan = glue_q8_scan(
+        graph->nodes, graph->n_nodes, at, t, lay, luce_glue_q8_layout, LUCE_GLUE_Q8_WINDOW);
+    if (lay < 0 || plan.last_reader < first) {
+        return nullptr;  // not reached: the scan sees the same first reader
+    }
+    // ggml_cuda_mul_mat_q_impl's nbytes_src1_q8_1 for this src1 (ne12 = ne13 = 1).
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int64_t ne10_padded = GGML_PAD(t->ne[0], MATRIX_ROW_PADDING);
+    const size_t nbytes = t->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+
+    ggml_backend_cuda_context::luce_glue_q8_entry ent;
+    ent.graph = graph;
+    ent.root = (const void *) glue_q8_reshape_root(t);
+    ent.data = t->data;
+    for (int i = 0; i < 4; ++i) {
+        ent.ne[i] = t->ne[i];
+    }
+    ent.layout = lay;
+    ent.created = at;
+    ent.last_reader = plan.last_reader;
+    ent.clean_until = plan.clean_until;
+    ent.nbytes = nbytes;
+    ent.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes);
+    char * data = ent.buf->ptr;
+    ctx.luce_glue_q8.push_back(std::move(ent));
+    ++g_glue_q8_producer_count;
+    *layout = lay;
+    return data;
+}
+
+// On; tests turn it off to compare with per-call quantization.
+static std::atomic<bool> g_glue_q8_memo_on{true};
+
+extern "C" void ggml_backend_cuda_set_q8_memo_override(bool on) {
+    g_glue_q8_memo_on.store(on, std::memory_order_relaxed);
+}
+
+bool ggml_cuda_glue_q8_memo_on() {
+    return g_glue_q8_memo_on.load(std::memory_order_relaxed);
+}
+
+void ggml_cuda_glue_q8_memo_clear(ggml_backend_cuda_context & ctx) {
+    ctx.luce_glue_q8.clear();
+    ctx.luce_glue_graph = nullptr;
+    ctx.luce_glue_node = -1;
 }
 
 namespace {
@@ -126,6 +373,60 @@ bool luce_mmq_twin_launch_rows32(ggml_backend_cuda_context & ctx, const mmq_args
     }
 }
 
+// A 64-row twin through the prefetching kernel (mul_mat_q_case_xn_pf), which
+// splits k inside the split-k scope. False when it does not take the call.
+bool luce_mmq_twin_launch_xn_pf(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream,
+                                const int mmq_x) {
+    mmq_args pf_args = args;
+    pf_args.split_k_grid = g_mmq_splitk_scope ? MMQ_SPLITK_GRID : 0;
+    const void * a = &pf_args;
+    switch (args.type_x) {
+        case GGML_TYPE_IQ3_S:   return mul_mat_q_case_rows64_iq3_s_xn_pf  (ctx, a, stream, mmq_x);
+        case GGML_TYPE_IQ3_XXS: return mul_mat_q_case_rows64_iq3_xxs_xn_pf(ctx, a, stream, mmq_x);
+        case GGML_TYPE_IQ4_XS:  return mul_mat_q_case_rows64_iq4_xs_xn_pf (ctx, a, stream, mmq_x);
+        case GGML_TYPE_Q5_K:    return mul_mat_q_case_rows64_q5_k_xn_pf   (ctx, a, stream, mmq_x);
+        case GGML_TYPE_Q3_K:    return mul_mat_q_case_rows64_q3_k_xn_pf   (ctx, a, stream, mmq_x);
+        case GGML_TYPE_IQ2_S:   return mul_mat_q_case_rows64_iq2_s_xn_pf  (ctx, a, stream, mmq_x);
+        default:                return false;
+    }
+}
+
+// A twin at x-tile 16, 32 or 48 for 17-48 columns: the 64-row ones through
+// the prefetching kernel when it takes the call, else mul_mat_q_case_xn.
+bool luce_mmq_twin_launch_xn(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream,
+                             const int rows, const int mmq_x) {
+    const void * a = &args;
+    bool launched = false;
+    if (rows == 64) {
+        if (luce_mmq_twin_launch_xn_pf(ctx, args, stream, mmq_x)) {
+            return true;
+        }
+        switch (args.type_x) {
+            case GGML_TYPE_IQ3_S:   launched = mul_mat_q_case_rows64_iq3_s_xn  (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_IQ3_XXS: launched = mul_mat_q_case_rows64_iq3_xxs_xn(ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_IQ4_XS:  launched = mul_mat_q_case_rows64_iq4_xs_xn (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q5_K:    launched = mul_mat_q_case_rows64_q5_k_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q3_K:    launched = mul_mat_q_case_rows64_q3_k_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_IQ2_S:   launched = mul_mat_q_case_rows64_iq2_s_xn  (ctx, a, stream, mmq_x); break;
+            default: break;
+        }
+    } else if (rows == 32) {
+        switch (args.type_x) {
+            case GGML_TYPE_IQ4_XS:  launched = mul_mat_q_case_rows32_iq4_xs_xn (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q4_K:    launched = mul_mat_q_case_rows32_q4_k_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q5_K:    launched = mul_mat_q_case_rows32_q5_k_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q6_K:    launched = mul_mat_q_case_rows32_q6_k_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q8_0:    launched = mul_mat_q_case_rows32_q8_0_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_IQ3_S:   launched = mul_mat_q_case_rows32_iq3_s_xn  (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_IQ3_XXS: launched = mul_mat_q_case_rows32_iq3_xxs_xn(ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q3_K:    launched = mul_mat_q_case_rows32_q3_k_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_IQ2_S:   launched = mul_mat_q_case_rows32_iq2_s_xn  (ctx, a, stream, mmq_x); break;
+            default: break;
+        }
+    }
+    return launched;
+}
+
 bool luce_mmq_twin(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const bool ud_smalltile = g_mmq_twin_rows64_on.load(std::memory_order_relaxed);
     const bool two_warp     = g_mmq_twin_rows32_on.load(std::memory_order_relaxed);
@@ -147,8 +448,11 @@ bool luce_mmq_twin(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaS
     }
     const bool rows32 = choice.tile == mmq_twin_tile::rows32;
     // A twin that cannot serve the call launches nothing; the parent runs.
-    if (!(rows32 ? luce_mmq_twin_launch_rows32(ctx, args, stream)
-                 : luce_mmq_twin_launch_rows64(ctx, args, stream))) {
+    const bool launched = call.ncols > MMQ_TWIN_MAX_COLS
+        ? luce_mmq_twin_launch_xn(ctx, args, stream, rows32 ? 32 : 64, choice.mmq_x)
+        : (rows32 ? luce_mmq_twin_launch_rows32(ctx, args, stream)
+                  : luce_mmq_twin_launch_rows64(ctx, args, stream));
+    if (!launched) {
         return false;
     }
     ++(rows32 ? g_mmq_twin_rows32_launch_count : g_mmq_twin_rows64_launch_count);
@@ -402,25 +706,37 @@ static void ggml_cuda_mul_mat_q_impl(
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
             get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        // The Q8 memo: empty (allocate and quantize here, as before)
+        // unless a memo entry serves this call: then src1's q8_1 goes
+        // into, or is already in, that entry.
+        const luce_glue_q8_ref glue_q8 = luce_glue_q8_acquire(
+            ctx, src0, src1, dst, nbytes_src1_q8_1,
+            grouped_src      ? "grouped-source activation (its own quantizer)" :
+            use_native_mxfp4 ? "native FP4 activation (its own quantizer)" :
+            src0_pair        ? "paired projection (one quantize already)" : nullptr);
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+        if (glue_q8.data == nullptr) {
+            src1_q8_1.alloc(nbytes_src1_q8_1);
+        }
+        char * const src1_q8 = glue_q8.data != nullptr ? glue_q8.data : src1_q8_1.get();
 
-        {
+        if (!glue_q8.reuse) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
             if (grouped_src) {
                 quantize_mmq_q8_1_grouped_cuda(
-                    src1_d, src1_q8_1.get(), src0->type,
+                    src1_d, src1_q8, src0->type,
                     ne10, grouped_width,
                     grouped_row_stride, grouped_plane_stride,
                     ne10_padded, ne11, stream);
             } else if (use_native_mxfp4) {
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_mxfp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_mxfp4_cuda(src1_d, nullptr, src1_q8, src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -435,7 +751,7 @@ static void ggml_cuda_mul_mat_q_impl(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr,
+            src0_d, src0->type, (const int *) src1_q8, nullptr, nullptr,
             mix_codebooks, mix_modes, dst_d,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
@@ -465,6 +781,7 @@ static void ggml_cuda_mul_mat_q_impl(
             }
             ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
         }
+        luce_glue_q8_release(ctx, glue_q8);
         return;
     }
 

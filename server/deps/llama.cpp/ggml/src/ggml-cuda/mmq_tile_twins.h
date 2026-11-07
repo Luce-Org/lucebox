@@ -36,3 +36,43 @@ bool mul_mat_q_case_rows32_q6_k   (ggml_backend_cuda_context & ctx, const void *
 bool mul_mat_q_case_rows32_q8_0   (ggml_backend_cuda_context & ctx, const void * args, cudaStream_t stream);
 bool mul_mat_q_case_rows32_iq3_s  (ggml_backend_cuda_context & ctx, const void * args, cudaStream_t stream);
 bool mul_mat_q_case_rows32_iq3_xxs(ggml_backend_cuda_context & ctx, const void * args, cudaStream_t stream);
+
+// Every twin at x-tile 16, 32 or 48
+// (mul_mat_q_case_xn), for calls wider than 16 columns. Defined next to the
+// x16 entries above; the rows64 IQ4_XS/Q5_K/Q3_K/IQ2_S and rows32 Q3_K/IQ2_S
+// twins exist only for these calls.
+#define LUCE_MMQ_TWIN_XN_DECL(rows, name) \
+    bool mul_mat_q_case_rows##rows##_##name##_xn(ggml_backend_cuda_context & ctx, const void * args, \
+                                                  cudaStream_t stream, int mmq_x)
+LUCE_MMQ_TWIN_XN_DECL(64, iq3_s);
+LUCE_MMQ_TWIN_XN_DECL(64, iq3_xxs);
+LUCE_MMQ_TWIN_XN_DECL(64, iq4_xs);
+LUCE_MMQ_TWIN_XN_DECL(64, q5_k);
+LUCE_MMQ_TWIN_XN_DECL(64, q3_k);
+LUCE_MMQ_TWIN_XN_DECL(64, iq2_s);
+LUCE_MMQ_TWIN_XN_DECL(32, iq4_xs);
+LUCE_MMQ_TWIN_XN_DECL(32, q4_k);
+LUCE_MMQ_TWIN_XN_DECL(32, q5_k);
+LUCE_MMQ_TWIN_XN_DECL(32, q6_k);
+LUCE_MMQ_TWIN_XN_DECL(32, q8_0);
+LUCE_MMQ_TWIN_XN_DECL(32, iq3_s);
+LUCE_MMQ_TWIN_XN_DECL(32, iq3_xxs);
+LUCE_MMQ_TWIN_XN_DECL(32, q3_k);
+LUCE_MMQ_TWIN_XN_DECL(32, iq2_s);
+#undef LUCE_MMQ_TWIN_XN_DECL
+
+// The 64-row twins through the prefetching kernel (mul_mat_q_case_xn_pf):
+// global loads one phase ahead of the dot products, and k split while the
+// caller holds the split-k scope (ggml_backend_cuda_set_mmq_splitk_scope).
+// False, launching nothing, for a call it does not take; mmq.cu then runs
+// the _xn entry.
+#define LUCE_MMQ_TWIN_XN_PF_DECL(rows, name) \
+    bool mul_mat_q_case_rows##rows##_##name##_xn_pf(ggml_backend_cuda_context & ctx, const void * args, \
+                                                     cudaStream_t stream, int mmq_x)
+LUCE_MMQ_TWIN_XN_PF_DECL(64, iq3_s);
+LUCE_MMQ_TWIN_XN_PF_DECL(64, iq3_xxs);
+LUCE_MMQ_TWIN_XN_PF_DECL(64, iq4_xs);
+LUCE_MMQ_TWIN_XN_PF_DECL(64, q5_k);
+LUCE_MMQ_TWIN_XN_PF_DECL(64, q3_k);
+LUCE_MMQ_TWIN_XN_PF_DECL(64, iq2_s);
+#undef LUCE_MMQ_TWIN_XN_PF_DECL

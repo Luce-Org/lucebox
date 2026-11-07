@@ -384,8 +384,28 @@ bool build_target_step(
     int n_prefill_segments,
     int n_logits_rows,
     bool compact_slots,
-    int top_n) {
+    int top_n,
+    bool keep_base_ssm_state,
+    ggml_tensor * single_replay_slot_ids) {
     step_graph_free(sg);
+
+    // KEEP_BASE: only the single-sequence chain capture verify may
+    // leave the DeltaNet state unwritten (rollback commits its intermediates).
+    if (keep_base_ssm_state &&
+        (!capture_delta_intermediate || paged_attention || compact_slots ||
+         n_seqs != 1 || n_prefill_tokens != 0 || cache.n_seq_slots != 1)) {
+        return false;
+    }
+    // SINGLE_REPLAY: a keep-base verify that records the replay log
+    // instead of the intermediates; the map names state slab 0. SpecLA caches
+    // (factor banks) take their own verify.
+    if (single_replay_slot_ids &&
+        (!keep_base_ssm_state || !cache.factor_k.empty() ||
+         single_replay_slot_ids->type != GGML_TYPE_I32 ||
+         ggml_nelements(single_replay_slot_ids) != 1 ||
+         !single_replay_slot_ids->buffer)) {
+        return false;
+    }
 
     // Compact n_seqs is a decode graph bucket width, not the physical
     // slot count. active_slot_ids maps live rows to cache columns and uses -1
@@ -676,6 +696,8 @@ bool build_target_step(
     gi.specla_n_waves             = hld_schedule.n_waves;
     gi.specla_n_boundaries        = hld_schedule.n_boundaries;
     gi.specla_max_parallel_chains = hld_schedule.max_parallel_chains;
+    gi.keep_base_ssm_state        = keep_base_ssm_state;
+    gi.single_replay_slot_ids     = single_replay_slot_ids;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;

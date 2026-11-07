@@ -26,6 +26,11 @@ void quantize_mmq_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// Parity-test entry point (quantize.cu): quantize_mmq_q8_1 for a
+// contiguous [ncols, nrows] F32 src1 of an MMQ call with weight type q8_type.
+extern "C" { GGML_BACKEND_API int ggml_cuda_test_quantize_mmq_q8_1(const float * x, void * q8, int q8_type,
+        int ncols, int nrows, void * stream); }
+
 void quantize_mmq_q8_1_grouped_cuda(
         const float * x, void * vy, ggml_type type_src0,
         int64_t ne00, int64_t group_width,

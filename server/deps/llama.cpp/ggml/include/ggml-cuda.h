@@ -76,6 +76,12 @@ GGML_BACKEND_API size_t ggml_backend_cuda_trim_pool(ggml_backend_t backend);
 // previous value so scoped callers can restore nested overrides correctly.
 GGML_BACKEND_API bool ggml_backend_cuda_set_graphs_disabled_override(bool disabled);
 
+// Tests only: turn the graph-node fusions off (process-wide), to compare the
+// fused kernels with the unfused ops. Returns the previous value.
+GGML_BACKEND_API bool ggml_backend_cuda_set_fusion_disabled_override(bool disabled);
+// Whether the graph-node fusions run: true unless a test turned them off.
+GGML_BACKEND_API bool ggml_backend_cuda_fusion_enabled(void);
+
 // Number of launches of the dense F32 dim-0 concat-transpose specialization.
 // Intended for focused correctness tests of the dispatch guard.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_concat_transpose_f32_count(void);
@@ -88,6 +94,28 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mla_stream_topk_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count(void);
+// Calling-thread count of MMQ calls that skipped their src1 quantize because
+// the Q8 memo served an earlier call's q8_1.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_glue_q8_memo_hit_count(void);
+// Calling-thread count of producer launches (RMS norm, SWIGLU) that also
+// wrote the q8_1 MMQ rows of their output into a Q8 memo entry, so that their
+// first MMQ reader skips its quantize too.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_glue_q8_producer_count(void);
+
+// Tests only: turn those producer writes on or off, to compare them bit for
+// bit with the readers quantizing the F32 output themselves. On by default.
+GGML_BACKEND_API void ggml_backend_cuda_set_glue_q8_producers_override(bool on);
+
+// Tests only: turn the Q8 memo on or off, to compare its outputs bit for bit
+// with per-call quantization. On by default.
+GGML_BACKEND_API void ggml_backend_cuda_set_q8_memo_override(bool on);
+
+// Row stacking (the Qwen3.5 gate|up stack): nullptr when a MUL_MAT of `weight`
+// (two weights stacked by rows, the first `rows_first` rows one member) with
+// `ncols` F32 columns computes every output row bit-identically to a MUL_MAT
+// of its member alone on this backend's device, else the reason it may not.
+GGML_BACKEND_API const char * ggml_backend_cuda_row_stack_inexact(
+        ggml_backend_t backend, const struct ggml_tensor * weight, int64_t rows_first, int64_t ncols);
 
 // Calling-thread count of MMQ calls served by an RDNA4 tile twin with
 // `tile_rows` rows (64 or 32, mmq_tile_twins.h);
@@ -99,11 +127,24 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_twin_launch_count(int tile_row
 // compare them bit for bit with the parent tiles. Both are on by default.
 GGML_BACKEND_API void ggml_backend_cuda_set_mmq_twins_override(bool rows64, bool rows32);
 
+// While on (for the calling thread), the RDNA4 64-row MMQ twins split k for
+// calls of 17-48 columns whose grid would leave the GPU short of workgroups,
+// splits of at least 16 k-iterations each. A split sum is not
+// bit-exact against the unsplit one, so only a caller that already accepts
+// batch-dependent results turns it on: the concurrent (C>1) batched verify,
+// around its graph. Off by default; single-request paths never set it.
+GGML_BACKEND_API void ggml_backend_cuda_set_mmq_splitk_scope(bool on);
+
 // Calling-thread launch counters for the scalar and grouped-column GDN
 // kernels. Focused qualification tests use these to reject silent fallback.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_grouped_cols_launch_count(void);
 GGML_BACKEND_API bool ggml_backend_cuda_supports_gdn_grouped_cols(int device);
+// Tests only: pin the GATED_DELTA_NET route, process-wide. -1 (the default)
+// lets the device pick, 0 pins the scalar kernel, 1 the grouped-cols kernel
+// where it applies (S_v 128, non-KDA, a supported device); a pinned route also
+// keeps the RDNA3.5 prefill recurrence off. Returns the previous value.
+GGML_BACKEND_API int ggml_backend_cuda_set_gdn_route_override(int route);
 
 // Calling-thread launch counter for the head-size-256 MMA fattn kernel.
 // Qualification tests use this to reject silent fallback to the tile kernel.
@@ -282,6 +323,33 @@ GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction(
         const struct ggml_tensor * active_slot_ids,
         int tree_scratch_base,
         int tree_scratch_stride);
+
+// ggml_backend_cuda_tree_commit_transaction validated from the caller's host
+// copies of commit_rows, accepted_prefixes, active_slot_ids and
+// feature_destination_rows (the values it uploaded), with one launch per
+// commit kind. Same fail-closed contract; same committed bits. The count is
+// the calling thread's transactions committed this way.
+GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction_host(
+        struct ggml_tensor * const * caches,
+        int n_caches,
+        const struct ggml_tensor * feature_source,
+        struct ggml_tensor * feature_destination,
+        const struct ggml_tensor * feature_destination_rows,
+        const struct ggml_tensor * const * replay_logs,
+        struct ggml_tensor * const * states,
+        const struct ggml_tensor * const * conv_inputs,
+        struct ggml_tensor * const * conv_states,
+        int n_layers,
+        const struct ggml_tensor * commit_rows,
+        const struct ggml_tensor * accepted_prefixes,
+        const struct ggml_tensor * active_slot_ids,
+        int tree_scratch_base,
+        int tree_scratch_stride,
+        const int64_t * host_commit_rows,
+        const int32_t * host_accepted,
+        const int32_t * host_slots,
+        const int32_t * host_feature_rows);
+GGML_BACKEND_API size_t ggml_backend_cuda_get_tree_commit_host_count(void);
 
 // Attach learned per-expert decode tables to a mixed-precision tensor. The
 // host variants copy the tables to the device that owns `base`. Call the
