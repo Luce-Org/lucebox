@@ -1819,7 +1819,7 @@ static json model_list(const ServerConfig & config, bool codex_schema) {
 // Memory the auto budget takes a quarter of: what is available once the
 // model has loaded (a container's cgroup v2 limit included; Windows too),
 // else total physical memory where the probe cannot read it.
-static size_t budgetable_memory_bytes() {
+size_t budgetable_memory_bytes() {
     if (const auto available = available_kv_offload_memory()) return *available;
 #if !defined(_WIN32)
     const long pages = sysconf(_SC_PHYS_PAGES);
@@ -1841,7 +1841,8 @@ size_t auto_concurrent_prefix_budget(size_t per_checkpoint, int slots, size_t me
 }
 
 size_t HttpServer::concurrent_prefix_budget(size_t per_checkpoint, int slots) const {
-    return auto_concurrent_prefix_budget(per_checkpoint, slots, budgetable_memory_bytes());
+    const size_t auto_budget = auto_concurrent_prefix_budget(per_checkpoint, slots, budgetable_memory_bytes());
+    return std::min(auto_budget, backend_.snapshot_allowance_bytes());
 }
 
 PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
@@ -1857,6 +1858,7 @@ PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
         // (concurrent_prefix_budget below).
         out.bytes = out.automatic ? ServerConfig::kConcurrentPrefixBudgetFloor
                                   : config.concurrent_prefix_cache_max_bytes;
+        out.bytes = std::min(out.bytes, backend.snapshot_allowance_bytes());
         return out;
     }
     out.automatic =

@@ -69,4 +69,36 @@ int main() {
     const int rows = qwen4exp_reserved_rows(10000, 100000, 20000, workspace, 4096, 8192, 10000);
     assert(qwen4exp_fit_chunk(10000, 100000, 20000, workspace, &snapshots, rows) == 5888);
     assert(snapshots == 90000 - 20000 - 58880 && snapshots >= 10000);
+
+    // An allowance smaller than min_snapshot is rejected so prefill chunks can use the spare memory.
+    snapshots = 100000;
+    // Insufficient positive allowance: spare (29040) < min_snapshot (30000) -> rejected to 0, chunk widens to 6912.
+    assert(qwen4exp_fit_chunk(10000, 100000, 20000, workspace, &snapshots, 4096, luce::common::kQwen4ExpMaxChunk, 30000) == 6912);
+    assert(snapshots == 0);
+    // Rejected snapshot reservation matches no-snapshot chunk sizing exactly.
+    assert(qwen4exp_fit_chunk(10000, 100000, 20000, workspace, &snapshots, 4096, luce::common::kQwen4ExpMaxChunk, 30000) ==
+           qwen4exp_fit_chunk(10000, 100000, 20000, workspace));
+    // Exactly the minimum viable allowance: spare == min_snapshot -> accepted.
+    snapshots = 100000;
+    assert(qwen4exp_fit_chunk(10000, 100000, 20000, workspace, &snapshots, 4096, luce::common::kQwen4ExpMaxChunk, 29040) == 4096);
+    assert(snapshots == 29040);
+    // Sufficient allowance: spare (29040) > min_snapshot (10000) -> accepted.
+    snapshots = 100000;
+    assert(qwen4exp_fit_chunk(10000, 100000, 20000, workspace, &snapshots, 4096, luce::common::kQwen4ExpMaxChunk, 10000) == 4096);
+    assert(snapshots == 29040);
+
+    // Requested allowance smaller than min_snapshot: spare (29040) > min_snapshot (10000), but requested (5000) < min_snapshot (10000).
+    // Resulting allowance must be zero and rejected reservation must not reduce prefill chunk capacity (fits 6912, matches no-snapshot fit).
+    snapshots = 5000;
+    assert(qwen4exp_fit_chunk(10000, 100000, 20000, workspace, &snapshots, 4096, luce::common::kQwen4ExpMaxChunk, 10000) == 6912);
+    assert(snapshots == 0);
+    assert(qwen4exp_fit_chunk(10000, 100000, 20000, workspace, &snapshots, 4096, luce::common::kQwen4ExpMaxChunk, 10000) ==
+           qwen4exp_fit_chunk(10000, 100000, 20000, workspace));
+    // Short-context boundary case (max_ctx < 4096):
+    snapshots = 100000;
+    assert(qwen4exp_fit_chunk(2048, 100000, 20000, workspace, &snapshots, 4096, luce::common::kQwen4ExpMaxChunk, 50000) == 2048);
+    assert(snapshots == 0);
+    snapshots = 100000;
+    assert(qwen4exp_fit_chunk(2048, 100000, 20000, workspace, &snapshots, 4096, luce::common::kQwen4ExpMaxChunk, 49520) == 2048);
+    assert(snapshots == 49520);
 }

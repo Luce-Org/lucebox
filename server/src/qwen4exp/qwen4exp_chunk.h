@@ -35,7 +35,7 @@ constexpr int kQwen4ExpConcurrentGranule = 2048;
 template<class Measure>
 int qwen4exp_fit_chunk(int max_ctx, size_t available, size_t fixed, Measure measure,
                      size_t * snapshot_budget = nullptr, int floor_rows = 4096,
-                     int max_rows = kQwen4ExpMaxChunk) {
+                     int max_rows = kQwen4ExpMaxChunk, size_t min_snapshot = 0) {
     const size_t budget = available - available / 10;
     floor_rows = std::min(floor_rows, max_rows);
     if (snapshot_budget) {
@@ -46,8 +46,13 @@ int qwen4exp_fit_chunk(int max_ctx, size_t available, size_t fixed, Measure meas
         // Snapshots get only the remaining safe budget.
         const int floor = qwen4exp_fit_chunk(std::min(max_ctx, floor_rows), available, fixed, measure);
         if (!floor) return 0;
-        *snapshot_budget = std::min(requested, budget - fixed - measure(floor));
-        fixed += *snapshot_budget;
+        const size_t needed = fixed + measure(floor);
+        const size_t spare = budget > needed ? budget - needed : 0;
+        const size_t allowance = std::min(requested, spare);
+        if (allowance >= min_snapshot) {
+            *snapshot_budget = allowance;
+            fixed += *snapshot_budget;
+        }
     }
     if (max_ctx <= 0 || fixed >= budget) return 0;
     int best = 0, lo = 2, hi = std::min(max_ctx, max_rows) / 256;
@@ -122,6 +127,7 @@ struct Qwen4ExpCache;
 // `reserved` is device memory kept free for something else (a PFlash drafter).
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     Qwen4ExpCache & cache, int slots = 1, int resident_slots = 1, size_t * snapshot_budget = nullptr,
-    Qwen4ExpChunkPlan * plan = nullptr, size_t snapshot_keep = 0, size_t reserved = 0);
+    Qwen4ExpChunkPlan * plan = nullptr, size_t snapshot_keep = 0, size_t reserved = 0,
+    int restore_point_spacing = 0);
 
 }  // namespace luce::common
