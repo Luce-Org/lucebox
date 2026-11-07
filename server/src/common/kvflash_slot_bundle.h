@@ -385,15 +385,6 @@ inline bool kvflash_fsync_dir(const std::string & dir) {
     return ok;
 }
 
-// One server per bundle directory: an exclusive flock on dir/.lock held while the returned fd is
-// open; -1 when another server holds it (or the directory cannot be opened).
-inline int kvflash_bundle_dir_lock(const std::string & dir) {
-    const int fd = ::open((dir + "/.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (fd < 0) return -1;
-    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) { ::close(fd); return -1; }
-    return fd;
-}
-
 // ---- a park on disk: commit, load, cleanup -----------------------------------------------------
 
 // Everything one park writes, built by the engine, executed by the writer thread.

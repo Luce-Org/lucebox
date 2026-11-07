@@ -469,7 +469,7 @@ TEST_CASE(KvflashSlotBundleFixture, compaction_copies_the_live_records_into_a_ne
     kvflash_bundle_remove(dir);
 }
 
-TEST_CASE(KvflashSlotBundleFixture, write_is_tmp_then_rename_read_has_a_cap_and_a_bundle_dir_has_one_owner) {
+TEST_CASE(KvflashSlotBundleFixture, write_is_tmp_then_rename_and_read_has_a_cap) {
     const std::string path = "kvflash_slot_bundle_unit_test.bin";
     const std::vector<uint8_t> bytes = {1, 2, 3, 4, 5};
     REQUIRE(kvflash_bundle_write(path, bytes));
