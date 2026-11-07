@@ -447,6 +447,15 @@ bool Qwen35DFlashTarget::verify_batch(
     // stage and are never read.
     const bool stage_q = pool && cache_.q_stage_on && cache_.q_stage &&
                          n_tokens <= cache_.q_stage_rows;
+    if (pool && cache_.q_stage_on && cache_.q_stage && !stage_q) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr, "[kvflash] verify of %d rows exceeds the query stage (%d rows): "
+                                 "q_cap is not refreshed, reselect scores from a stale query\n",
+                         n_tokens, cache_.q_stage_rows);
+        }
+    }
     cache_.q_stage_base = -1;
     cache_.q_stage_n = 0;
 

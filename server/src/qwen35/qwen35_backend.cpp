@@ -4222,7 +4222,12 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
     // Verify passes stage each row's query for q_cap (see reselect_before_step).
     struct QStageGuard {
         TargetCache & c;
-        QStageGuard(TargetCache & cache, bool on) : c(cache) { c.q_stage_on = on && c.q_stage; c.q_stage_n = 0; c.q_stage_base = -1; }
+        QStageGuard(TargetCache & cache, bool on) : c(cache) {
+            c.q_stage_on = on && c.q_stage; c.q_stage_n = 0; c.q_stage_base = -1;
+            if (on && !c.q_stage)
+                std::fprintf(stderr, "[kvflash] qk policy without a query stage (draft block size <= 0): "
+                                     "q_cap is not refreshed, reselect scores from a stale query\n");
+        }
         ~QStageGuard() { c.q_stage_on = false; c.q_stage_n = 0; c.q_stage_base = -1; }
     } q_stage_guard{cache_, kvflash_active() && kvflash_qk_policy_};
 
@@ -4616,7 +4621,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 if (target->verify_pool_exhausted()) {
                     std::fprintf(stderr,
                         "[kvflash] spec AR step: pool exhausted at committed=%d, "
-                        "finishing the request with AR\n", committed);
+                        "handing the request to AR (AR fails at the same row when no pool block can be evicted)\n", committed);
                     return hand_to_ar(false);
                 }
                 std::fprintf(stderr, "spec-decode: AR step forward failed\n");
