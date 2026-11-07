@@ -352,6 +352,99 @@ TEST_CASE(KvflashSlotTurnFixture, mode5_plan_applies_the_drafters_picks_at_r_wit
     CHECK(!kvflash_slot_turn_apply_due(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kQ, kU, kT, true), 5000));
 }
 
+// ---- the pinned head's capture cut ----
+
+TEST_CASE(KvflashSlotTurnFixture, an_lru_turn_stops_at_the_capture_cut_and_the_step_reports_it) {
+    const auto prompt = prompt_with_user(3000, 2900);
+    const KvFlashSlotTurn t = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, false, -1, false, 0, /*capture_at=*/1152);
+    const int none_cut = kvflash_next_cut(1152, 3000, kU) - 1152;
+    CHECK(t.capture_at == 1152);
+    CHECK(kvflash_slot_turn_next_cut(t, 0, kU) == 512);
+    CHECK(kvflash_slot_turn_next_cut(t, 1024, kU) == 128);       // 1024 + 512 would pass it: clamped
+    CHECK(kvflash_slot_turn_next_cut(t, 1152, kU) == none_cut);   // past the cut: the plain rule again
+    CHECK(kvflash_slot_turn_step(t, 1024, 128).preamble);
+    CHECK(!kvflash_slot_turn_step(t, 1024, 127).preamble);
+    CHECK(!kvflash_slot_turn_step(t, 1152, 512).preamble);
+    // without a cut the plan is what it was
+    const KvFlashSlotTurn none = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, false);
+    CHECK(none.capture_at == -1);
+    CHECK(kvflash_slot_turn_next_cut(none, 1024, kU) == 512);
+}
+
+TEST_CASE(KvflashSlotTurnFixture, the_mode_4_first_pass_has_the_capture_cut_among_its_cuts) {
+    const auto prompt = prompt_with_user(5000, 4800);            // a recall turn
+    const KvFlashSlotTurn t = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kQ, kU, kT, true, -1, false, 0, 1152);
+    REQUIRE(t.first_pass());
+    CHECK(t.capture_at == 1152);
+    CHECK(std::find(t.cuts.begin(), t.cuts.end(), 1152) != t.cuts.end());
+    CHECK(std::is_sorted(t.cuts.begin(), t.cuts.end()));
+    CHECK(std::adjacent_find(t.cuts.begin(), t.cuts.end()) == t.cuts.end());
+    CHECK(t.cuts.back() == 5000);
+    CHECK(std::find(t.cuts.begin(), t.cuts.end(), 4800) != t.cuts.end());
+    // the first pass reaches the cut exactly, so the step that runs it reports the capture
+    int pos = 0;
+    bool hit = false;
+    while (pos < t.end) {
+        const int n = kvflash_slot_turn_next_cut(t, pos, kU);
+        hit = hit || kvflash_slot_turn_step(t, pos, n).preamble;
+        pos += n;
+    }
+    CHECK(hit);
+    CHECK(kvflash_slot_turn_step(t, 0, 1152).preamble);
+}
+
+TEST_CASE(KvflashSlotTurnFixture, mode_5_stops_at_the_cut_and_at_r) {
+    const auto prompt = prompt_with_user(5000, 4800);
+    const KvFlashSlotTurn t = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kQ, kU, kT, true, -1, /*pflash2=*/true, 0, 1152);
+    CHECK(t.apply_at == 4800);
+    CHECK(t.capture_at == 1152);
+    CHECK(kvflash_slot_turn_next_cut(t, 1024, kU) == 128);
+    CHECK(kvflash_slot_turn_next_cut(t, 4608, kU) == 192);       // still stops at R
+}
+
+TEST_CASE(KvflashSlotTurnFixture, a_cut_that_is_not_before_r_or_not_inside_the_turn_is_refused) {
+    const auto prompt = prompt_with_user(5000, 4800);
+    // past R: the recall would have to be planned around the head before it is known
+    CHECK(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kQ, kU, kT, true, -1, false, 0, 4864).capture_at == -1);
+    CHECK(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kQ, kU, kT, true, -1, true, 0, 4864).capture_at == -1);
+    // at or before the resume point, or at the end
+    CHECK(kvflash_slot_turn_plan(prompt, 1200, kImStart, kUser, kCt, kQ, kU, kT, false, -1, false, 0, 1152).capture_at == -1);
+    CHECK(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kQ, kU, kT, false, -1, false, 0, 5000).capture_at == -1);
+    CHECK(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kQ, kU, kT, false, -1, false, 0, 0).capture_at == -1);
+    // an LRU turn (the prompt fits the pool): kept, there is no R to precede
+    const auto small = prompt_with_user(1500, 1400);
+    CHECK(kvflash_slot_turn_plan(small, 0, kImStart, kUser, kCt, 256, kU, kT, true, -1, false, 0, 1152).capture_at == 1152);
+}
+
+// What a hit guarantees, the schedule half: the cuts a prefill makes are the same with or without the capture, as long as
+// the capture is on the cut grid (a multiple of U). A capture off the grid adds a cut a cold run does not make, and a
+// prefill that is segmented differently rounds differently.
+namespace {
+std::vector<int> cut_ends(const KvFlashSlotTurn & t) {
+    std::vector<int> ends;
+    for (int pos = 0; pos < t.end;) { pos += kvflash_slot_turn_next_cut(t, pos, kU); ends.push_back(pos); }
+    return ends;
+}
+}  // namespace
+
+TEST_CASE(KvflashSlotTurnFixture, a_capture_on_the_cut_grid_leaves_the_schedule_of_a_prefill_unchanged) {
+    for (const int end : {3000, 4096, 5000}) {
+        const auto prompt = prompt_with_user(end, end - 100);
+        for (const int blocks : {256, (int)kQ}) {   // a pool the prompt fits (an LRU turn) and one it does not (a recall turn)
+            const std::vector<int> plain = cut_ends(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, blocks, kU, kT, true));
+            for (const int at : {1024, 1536, 2048}) {
+                const KvFlashSlotTurn t = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, blocks, kU, kT, true, -1, false, 0, at);
+                REQUIRE(t.capture_at == at);
+                CHECK(cut_ends(t) == plain);
+            }
+        }
+    }
+    // off the grid the capture adds a cut of its own: why the head boundary is rounded down to the grid first
+    const auto prompt = prompt_with_user(3000, 2900);
+    CHECK(cut_ends(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, false, -1, false, 0, 1152)) !=
+          cut_ends(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, false)));
+}
+
 TEST_CASE(KvflashSlotTurnFixture, park_cfg_tail_on_by_default_decode_stash_off_until_asked) {
     auto c = kvflash_park_cfg(true, nullptr, nullptr, nullptr);
     CHECK(c.tail_on); CHECK(!c.decode_on); CHECK(c.tail == 4); CHECK(c.any());
