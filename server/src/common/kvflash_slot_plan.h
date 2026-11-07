@@ -123,6 +123,8 @@ struct KvFlashAdmitInput {
     int     chunk_tokens = kKvFlashChunkTokens;
     int64_t chunk_bytes = 0;                 // host backing per chunk
     int64_t ladder_bytes = 0;                // rungs x live state this slot will hold
+    int64_t reserve_floor_bytes = 0;         // a resume keeps at least what the slot held while its last park is still being written
+    int64_t stage_chunk_bytes = 0;           // park staging per chunk of this request (0: ladder_bytes already holds it all)
     int64_t host_used_bytes = 0, host_budget_bytes = 0;
 };
 
@@ -133,14 +135,30 @@ struct KvFlashAdmitInput {
 inline int64_t kvflash_host_need_bytes(const KvFlashAdmitInput & in) {
     const int64_t tokens = in.prompt_tokens + in.max_new_tokens;
     const int64_t chunks = (tokens + in.chunk_tokens - 1) / in.chunk_tokens;
-    return chunks * in.chunk_bytes + in.ladder_bytes;
+    return std::max(chunks * (in.chunk_bytes + in.stage_chunk_bytes) + in.ladder_bytes, in.reserve_floor_bytes);
 }
 
-// The ladder charge of one request (KvFlashAdmitInput::ladder_bytes): the R state snapshot of a recall turn and
-// the rungs of a sticky session (checkpoint, trunk and the third, kvflash_slot_turn.h rule v5), one slab each.
-constexpr int kKvFlashLadderRungs = 3;
-inline int64_t kvflash_ladder_bytes(int64_t slab_bytes, bool recall, bool sticky) {
-    return slab_bytes * ((recall ? 1 : 0) + (sticky ? kKvFlashLadderRungs : 0));
+// The disk bundle's staging at park: the end slab snapshot and its packed file, the packed rung slabs, the records
+// of the changed chunks (at most every chunk of the session), the ledger and the head. `fixed` does not depend on
+// the session; `per_chunk` is one chunk's record, its ledger entry and its 4-byte history tokens. Reserving the
+// max_ctx bound of it (kvflash_park_staging_max_bytes) charged a 2K session ~5 GiB; reserving the session's own
+// chunks (KvFlashAdmitInput::stage_chunk_bytes) charges what the park can hold.
+struct KvFlashParkStaging { int64_t fixed_bytes = 0, per_chunk_bytes = 0; };
+constexpr int kKvFlashLadderRungs = 3;   // a sticky session's rungs: checkpoint, trunk and the third (kvflash_slot_turn.h rule v5)
+inline KvFlashParkStaging kvflash_park_staging(int64_t slab_bytes, int64_t n_slab_tensors, int64_t header_bytes,
+                                               int64_t chunk_tokens, int64_t chunk_bytes) {
+    KvFlashParkStaging s;
+    s.fixed_bytes = (2 + kKvFlashLadderRungs) * slab_bytes + 48 + 16 * n_slab_tensors + header_bytes + chunk_bytes;
+    s.per_chunk_bytes = chunk_bytes + 16 + 4 * chunk_tokens;
+    return s;
+}
+// The ladder charge of one request (KvFlashAdmitInput::ladder_bytes): the R state snapshot of a recall turn, the rungs
+// of a sticky session, and the bundle staging when sessions are kept on disk.
+inline int64_t kvflash_ladder_bytes(int64_t slab_bytes, bool recall, bool sticky, bool staged = false, const KvFlashParkStaging & staging = {}) {
+    return slab_bytes * ((recall ? 1 : 0) + (sticky ? kKvFlashLadderRungs : 0)) + (staged ? staging.fixed_bytes : 0);
+}
+inline int64_t kvflash_park_staging_max_bytes(const KvFlashParkStaging & s, int64_t max_ctx, int64_t chunk_tokens) {
+    return s.fixed_bytes + ((max_ctx + chunk_tokens - 1) / chunk_tokens) * s.per_chunk_bytes;
 }
 
 // A permanent refusal outranks a transient busy. The host bound does not
@@ -177,6 +195,11 @@ public:
             used_ += need;
         }
         return v;
+    }
+    // What admit() would answer now, charging nothing: the probe of a returning session before its bundle is read.
+    KvFlashAdmit would_admit(uint64_t request_id, KvFlashAdmitInput in) const {
+        if (reserved_.count(request_id)) return KvFlashAdmit::BusySlot;
+        return would_admit_new(std::move(in));
     }
     // What admit() would answer for a request that holds no reservation yet, charging nothing.
     KvFlashAdmit would_admit_new(KvFlashAdmitInput in) const {
