@@ -1201,6 +1201,15 @@ static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_cuda_buffer_free_buffer;
 }
 
+// gdn-replay-log.cu: the CUDA device of a tensor's buffer, or
+// -1 when the tensor is not in a CUDA buffer.
+int ggml_cuda_tensor_device(const ggml_tensor * tensor) {
+    if (tensor == nullptr) return -1;
+    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) return -1;
+    return ((ggml_backend_cuda_buffer_context *) buffer->context)->device;
+}
+
 static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     return ctx->dev_ptr;

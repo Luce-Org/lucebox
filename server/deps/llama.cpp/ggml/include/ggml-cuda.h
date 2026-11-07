@@ -324,6 +324,33 @@ GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction(
         int tree_scratch_base,
         int tree_scratch_stride);
 
+// ggml_backend_cuda_tree_commit_transaction validated from the caller's host
+// copies of commit_rows, accepted_prefixes, active_slot_ids and
+// feature_destination_rows (the values it uploaded), with one launch per
+// commit kind. Same fail-closed contract; same committed bits. The count is
+// the calling thread's transactions committed this way.
+GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction_host(
+        struct ggml_tensor * const * caches,
+        int n_caches,
+        const struct ggml_tensor * feature_source,
+        struct ggml_tensor * feature_destination,
+        const struct ggml_tensor * feature_destination_rows,
+        const struct ggml_tensor * const * replay_logs,
+        struct ggml_tensor * const * states,
+        const struct ggml_tensor * const * conv_inputs,
+        struct ggml_tensor * const * conv_states,
+        int n_layers,
+        const struct ggml_tensor * commit_rows,
+        const struct ggml_tensor * accepted_prefixes,
+        const struct ggml_tensor * active_slot_ids,
+        int tree_scratch_base,
+        int tree_scratch_stride,
+        const int64_t * host_commit_rows,
+        const int32_t * host_accepted,
+        const int32_t * host_slots,
+        const int32_t * host_feature_rows);
+GGML_BACKEND_API size_t ggml_backend_cuda_get_tree_commit_host_count(void);
+
 // Attach learned per-expert decode tables to a mixed-precision tensor. The
 // host variants copy the tables to the device that owns `base`. Call the
 // matching unregister function before releasing the tensor's backing buffer.
