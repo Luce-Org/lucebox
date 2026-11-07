@@ -106,10 +106,13 @@ private:
     bool snapshot_save_replacing(int slot, int source);
     bool snapshot_fits(int slot, int replaced = -1) const;
     bool create_main_cache();
+    void size_kvflash_pool();
+    int kvflash_pool_for(int ctx) const;
     int plan_chunk(Qwen4ExpChunkPlan * plan = nullptr);
     int remote_layers_for(const Qwen4ExpChunkPlan & plan, size_t missing) const;
     bool start_seq_engine(); // no-op at --max-concurrency 1
-    size_t pflash_reserve(ggml_backend_t device) const;
+    // ctx < 0: the cache's context (none before the cache exists).
+    size_t pflash_reserve(ggml_backend_t device, int ctx = -1) const;
     // Weights, caches, hot experts, the prefill chunk and the prefix allowance, then the slot engine: init and
     // unpark share it, so an unpark sizes itself for the memory free at that time. release_target() undoes it.
     bool load_target();
@@ -117,6 +120,7 @@ private:
     void release_target();
     ggml_backend_t snap_backend_ = nullptr; // prefix snapshot storage: the target, or system memory (see init)
     int remote_layers_ = 0;   // split mode: full-attention layers whose cache rows and attention run on the expert device
+    int kvflash_pool_ = 0;    // --kvflash: the full-attention rows each slot's cache pools (0: one per position)
     size_t snapshot_budget_ = SIZE_MAX; // with snapshots on the target, auto chunk reserves and enforces this allowance
     std::array<Qwen4ExpSnapshot, kMaxSlots> snapshots_;
     int live_slot_ = -1;
