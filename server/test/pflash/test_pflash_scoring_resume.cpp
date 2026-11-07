@@ -165,3 +165,108 @@ TEST_CASE(PFlashScoringResumeFixture, session_ctx_limit_is_the_smaller_known_con
     CHECK(pflash_session_ctx_limit(0, 0) == 0);
     CHECK(pflash_session_ctx_limit(-1, 8192) == 8192);
 }
+
+namespace {
+
+std::vector<int32_t> iota_ids(int n) {
+    std::vector<int32_t> ids((size_t) n);
+    for (int i = 0; i < n; ++i) ids[(size_t) i] = i;
+    return ids;
+}
+
+} // namespace
+
+TEST_CASE(PFlashScoringResumeFixture, an_undersized_session_still_resumes_and_needs_to_grow) {
+    // The measured case: a session of capacity 36605 holds a 21673-token prompt (checkpoint 16384); the next turn has
+    // 46124 tokens, all of the old prompt shared.
+    const std::vector<int32_t> old_ids = iota_ids(21673);
+    const std::vector<int32_t> ids = iota_ids(46124);
+    PFlashResumeCandidate c;
+    c.ids = &old_ids;
+    c.checkpoint = pflash_scoring_checkpoint(21673);
+    c.capacity = 36605;
+    const PFlashResumePick pick = pflash_pick_resume({c}, ids, 1 << 30);
+    CHECK(pick.index == 0);
+    CHECK(pick.resume == 16384);
+    CHECK(pick.shared == 21673);
+    CHECK(pick.needs_grow);
+}
+
+TEST_CASE(PFlashScoringResumeFixture, a_fitting_session_needs_no_grow) {
+    const std::vector<int32_t> old_ids = iota_ids(21673);
+    const std::vector<int32_t> ids = iota_ids(30000);
+    PFlashResumeCandidate c;
+    c.ids = &old_ids;
+    c.checkpoint = 16384;
+    c.capacity = 36605;
+    const PFlashResumePick pick = pflash_pick_resume({c}, ids, 1 << 30);
+    CHECK(pick.index == 0);
+    CHECK(pick.resume == 16384);
+    CHECK(!pick.needs_grow);
+    // Exactly S rounded up to 256 fits.
+    c.capacity = 30000 / 256 * 256 + 256;
+    CHECK(!pflash_pick_resume({c}, ids, 1 << 30).needs_grow);
+    c.capacity -= 256;
+    CHECK(pflash_pick_resume({c}, ids, 1 << 30).needs_grow);
+}
+
+TEST_CASE(PFlashScoringResumeFixture, a_mismatched_prefix_or_unusable_session_gives_fresh) {
+    std::vector<int32_t> old_ids = iota_ids(21673);
+    old_ids[100] = -1;   // diverges before the checkpoint
+    const std::vector<int32_t> ids = iota_ids(46124);
+    PFlashResumeCandidate c;
+    c.ids = &old_ids;
+    c.checkpoint = 16384;
+    c.capacity = 36605;
+    PFlashResumePick pick = pflash_pick_resume({c}, ids, 1 << 30);
+    CHECK(pick.index == -1);
+    CHECK(pick.resume == 0);
+    CHECK(!pick.needs_grow);
+    const std::vector<int32_t> good = iota_ids(21673);
+    c.ids = &good;
+    c.usable = false;
+    CHECK(pflash_pick_resume({c}, ids, 1 << 30).index == -1);
+}
+
+TEST_CASE(PFlashScoringResumeFixture, a_checkpoint_past_the_cut_gives_fresh_even_when_undersized) {
+    // S = 16384 + 63: the S - 64 cut falls before the checkpoint 16384.
+    const std::vector<int32_t> old_ids = iota_ids(20000);
+    const std::vector<int32_t> ids = iota_ids(16384 + 63);
+    PFlashResumeCandidate c;
+    c.ids = &old_ids;
+    c.checkpoint = 16384;
+    c.capacity = 100;
+    CHECK(pflash_pick_resume({c}, ids, 1 << 30).index == -1);
+    CHECK(pflash_pick_resume({c}, iota_ids(16384 + 64), 1 << 30).resume == 16384);
+    // The redo cap still applies.
+    CHECK(pflash_pick_resume({c}, iota_ids(16384 + 64), 0).index == -1);
+}
+
+TEST_CASE(PFlashScoringResumeFixture, the_best_resume_wins_and_a_fitting_session_wins_a_tie) {
+    const std::vector<int32_t> a_ids = iota_ids(30000), b_ids = iota_ids(50000);
+    const std::vector<int32_t> ids = iota_ids(60000);
+    PFlashResumeCandidate a, b;
+    a.ids = &a_ids; a.checkpoint = pflash_scoring_checkpoint(30000); a.capacity = 70000;
+    b.ids = &b_ids; b.checkpoint = pflash_scoring_checkpoint(50000); b.capacity = 51000;
+    PFlashResumePick pick = pflash_pick_resume({a, b}, ids, 1 << 30);
+    CHECK(pick.index == 1);
+    CHECK(pick.resume == 49152);
+    CHECK(pick.needs_grow);
+    b.checkpoint = a.checkpoint;   // equal resume points: the one that fits
+    pick = pflash_pick_resume({b, a}, ids, 1 << 30);
+    CHECK(pick.index == 1);
+    CHECK(!pick.needs_grow);
+}
+
+TEST_CASE(PFlashScoringResumeFixture, the_row_check_can_send_a_session_back_to_fresh) {
+    const std::vector<int32_t> old_ids = iota_ids(21673);
+    const std::vector<int32_t> ids = iota_ids(46124);
+    PFlashResumeCandidate c;
+    c.ids = &old_ids;
+    c.checkpoint = 16384;
+    c.capacity = 36605;
+    c.rows_cover = [](int, int) { return 0; };   // the stored rows do not cover the resume point
+    CHECK(pflash_pick_resume({c}, ids, 1 << 30).index == -1);
+    c.rows_cover = [](int r, int) { return r; };
+    CHECK(pflash_pick_resume({c}, ids, 1 << 30).resume == 16384);
+}
