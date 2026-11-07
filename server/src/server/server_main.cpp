@@ -25,6 +25,7 @@
 #include "common/chain_rollback_policy.h"
 #include "common/gguf_inspect.h"
 #include "common/kvflash_concurrent_gate.h"
+#include "common/kvflash_sessions_plan.h"
 #include "common/layer_split_utils.h"
 #include "common/model_capabilities.h"
 #include "common/paged_attention_config.h"
@@ -369,6 +370,9 @@ static void print_usage(const char * prog) {
         "                              ~/.cache/lucebox/kv-cache; off disables it)\n"
         "                              On Windows: %LOCALAPPDATA%/lucebox/kv-cache\n"
         "  --no-kv-cache               Same as --kv-cache-dir off\n"
+        "  --kv-sessions on|off        Park KVFlash sessions under <kv-cache-dir>/sessions/ and resume\n"
+        "                              them after a restart, inside the one cache budget\n"
+        "                              (default: on whenever --kvflash and a cache dir are on)\n"
         "  --kv-cache-budget <MB>      Max disk usage in MB, hard cap with LRU eviction,\n"
         "                              clamped to the free space (default: 131072 = 128 GB)\n"
         "  --kv-cache-ttl <hours>      Delete snapshots unused for this long (default: 72, 0 = never)\n"
@@ -486,6 +490,7 @@ struct ModelOptions {
     // Keep process-wide options inert until the selected model is loaded.
     std::string adaptive_experts_tau;
     std::string kvflash_pool, kvflash_policy, kvflash_tau;
+    luce::common::KvFlashSessionsFlag kv_sessions = luce::common::KvFlashSessionsFlag::automatic;
 
     // Track whether the operator passed the legacy --max-tokens alias.
     // When set and --default-max-tokens is NOT also passed, --max-tokens
@@ -1157,6 +1162,11 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             const std::string dir = argv[++i];
             sconfig.disk_cache_dir =
                 (dir == "off" || dir == "none" || dir.empty()) ? std::string() : dir;
+        } else if (std::strcmp(argv[i], "--kv-sessions") == 0 && i + 1 < argc) {
+            if (!luce::common::kvflash_sessions_flag_parse(argv[++i], model.kv_sessions)) {
+                std::fprintf(stderr, "--kv-sessions expects on or off, got %s\n", argv[i]);
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "--no-kv-cache") == 0) {
             sconfig.disk_cache_dir.clear();
         } else if (std::strcmp(argv[i], "--kv-cache-shutdown-flush") == 0 && i + 1 < argc) {
@@ -2113,6 +2123,30 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
     if (model.expert_device && !apply_expert_device(*model.expert_device, backend_plan)) {
         return 2;
+    }
+    // KVFlash sessions on disk: the directory's DiskStore is opened here and kept for the process; the engine
+    // finds it by directory and attaches the session store as its tenant.
+    static std::vector<std::shared_ptr<DiskStore>> sessions_disks;
+    {
+        const char * old_dir = std::getenv("LUCE_KVFLASH_SLOT_BUNDLE_DIR");
+        const auto plan = luce::common::kvflash_sessions_plan(
+            concurrent_kvflash, model.kv_sessions, sconfig.disk_cache_dir, old_dir ? old_dir : "");
+        if (!plan.note.empty()) std::fprintf(stderr, "[kvflash] %s\n", plan.note.c_str());
+        if (plan.on) {
+            DiskCacheConfig dc;
+            dc.cache_dir = plan.root;
+            dc.budget_bytes = sconfig.disk_cache_budget_mb * (size_t)(1024 * 1024);
+            dc.min_tokens = sconfig.disk_cache_min_tokens;
+            dc.ttl_seconds = disk_cache_ttl_seconds(sconfig.disk_cache_ttl_hours);
+            bool failed = false;
+            auto disk = DiskStore::open(dc, nullptr, nullptr, failed);
+            if (disk) {
+                sessions_disks.push_back(disk);
+                set_environment_variable("LUCE_KVFLASH_SESSIONS_DIR", plan.root.c_str(), true);
+            } else {
+                std::fprintf(stderr, "[kvflash] sessions stay in memory: cannot open %s\n", plan.root.c_str());
+            }
+        }
     }
     auto backend_owner = create_backend(backend_plan);
     if (!backend_owner) {

@@ -1060,6 +1060,28 @@ public:
 #endif
         }
     }
+    // R3 negative control (LUCE_KVFLASH_DIGEST_FAULT=kv): flips one byte of chunk c where it lives, the first byte read_chunk
+    // returns. After synchronize_paging(). False: the chunk holds no bytes here.
+    bool corrupt_chunk_byte(int c) {
+        if (c < 0 || (size_t)c >= chunks_.size() || !has_tensor_storage()) return false;
+        ChunkState & st = chunks_[(size_t)c];
+        if (st.block >= 0) {
+            ggml_tensor * t = attn_k_[0];
+            const size_t off = block_off_(st.block, t);
+            uint8_t b;
+            ggml_backend_tensor_get(t, &b, off, 1);
+            b ^= 1;
+            ggml_backend_tensor_set(t, &b, off, 1);
+            return true;
+        }
+        if (!st.on_host) return false;
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        ((uint8_t *)st.host_data)[0] ^= 1;
+#else
+        st.host_data[0] ^= 1;
+#endif
+        return true;
+    }
     // nc x 8 bytes: u8 was_resident, u8 materialized, 2 pad, f32 score.
     std::vector<uint8_t> ledger_blob(int max_chunks = -1) const {
         const int nc = serialized_chunks_(max_chunks);

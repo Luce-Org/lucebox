@@ -596,6 +596,18 @@ snapshot only when it leaves RAM. `take_prefix_snapshot` frees a pooled
 snapshot instead of handing it over, because an `OwnedSnapshot` cannot carry
 the pager blob. A file on disk therefore never lacks the KV it claims to hold.
 
+**KVFlash sessions on disk.** The pooled snapshot above is the prefix cache's;
+the KVFlash slot engine keeps its own sessions on disk in the same cache
+directory, under `<kv-cache-dir>/sessions/<key>/` (an append-only chunk log, slab
+files and a head). A park writes it, a restart adopts it, and a request whose
+session id names a stored session restores it into a slot. It is on by default
+whenever `--kvflash` and a disk cache directory are on (`--kv-sessions off` keeps
+sessions in memory only). The sessions count in the one `--kv-cache-budget`, go by
+the same LRU as the prefix files and expire by the same TTL; `/props` reports one
+disk total with its parts (`full_cache.disk`: prefix, pins, sessions).
+`LUCE_KVFLASH_SLOT_BUNDLE_DIR` still works for one release as an override, with a
+warning.
+
 **Suffix-only restore.** With `LUCE_KVFLASH_RESTORE_CONSUME=1`, a pooled
 snapshot rebuilds the pager and KV pool, and the request prefills only the
 tokens after the snapshot. Without it a pooled snapshot is dropped and the
