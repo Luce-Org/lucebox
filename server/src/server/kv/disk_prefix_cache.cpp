@@ -617,10 +617,14 @@ bool DiskPrefixCache::save_async(OwnedSnapshot snap,
     }
     uint64_t pinned_bytes = 0;
     for (const auto & e : disk_->entries_) pinned_bytes += disk_->pinned_locked(e) ? e.file_size : 0;
+    // What a failed local pass leaves of the tenants is protected (it took
+    // every unit that may go), and a hold is a write on its way: like the
+    // pins, no publish can make room beside them.
     if (!disk_->make_room_locked(est_size, /*local_only=*/true) &&
-        pinned_bytes + est_size > disk_->budget_locked()) {
+        pinned_bytes + disk_->tenant_bytes_locked() + disk_->reserved_bytes_ + est_size >
+            disk_->budget_locked()) {
         std::fprintf(stderr, "[disk-cache] skip save: %.1f MB does not fit beside "
-                     "the pinned files\n", mib(est_size));
+                     "the pinned files and the tenants' protected units\n", mib(est_size));
         return false;
     }
 
