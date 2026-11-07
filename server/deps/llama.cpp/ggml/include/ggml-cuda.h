@@ -150,8 +150,28 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_fattn_wmma256_launch_count(void);
 // Calling-thread launch counter for the head-size-256 WMMA paged-attention
 // kernel (stage-1; gated by LUCE_PAGED_WMMA).
 GGML_BACKEND_API size_t ggml_backend_cuda_get_paged_attn_wmma256_launch_count(void);
+
+// The WMMA route decision as a pure function of what dispatch looks at: the
+// LUCE_PAGED_WMMA decision, the device, tree mode, head dim, GQA ratio, KV types
+// and block size. The paged-attention launcher and the engine's KV identity both
+// call it, so they cannot drift. False means the V_DOT2 kernel (or, for a head
+// dim other than 256, no paged kernel at all).
+static inline bool ggml_cuda_paged_attn_wmma_route_for(
+        bool env_enabled, bool device_rdna4, bool tree_mode, int head_dim,
+        int n_head, int n_head_kv, enum ggml_type k_type, enum ggml_type v_type,
+        int block_size) {
+    const bool k_ok = k_type == GGML_TYPE_F16 || k_type == GGML_TYPE_Q8_0 || k_type == GGML_TYPE_Q4_0;
+    const bool v_ok = v_type == GGML_TYPE_F16 || v_type == GGML_TYPE_Q8_0 || v_type == GGML_TYPE_Q4_0;
+    // GQA ratio must fit the 8 head slots (ncols2).
+    const bool gqa_ok = n_head_kv > 0 && n_head % n_head_kv == 0 && n_head / n_head_kv <= 8;
+    return env_enabled && device_rdna4 && !tree_mode && head_dim == 256 &&
+           k_ok && v_ok && gqa_ok && block_size == 16;
+}
+
 // Whether paged attention on `device` runs the WMMA route for a graph of this
-// shape (false: the V_DOT2 kernel).
+// shape: the LUCE_PAGED_WMMA decision and the device's capability, then
+// ggml_cuda_paged_attn_wmma_route_for(). A saved KV is only valid under the
+// route that computed it.
 GGML_BACKEND_API bool ggml_backend_cuda_paged_attn_wmma_route(
         int device, bool tree_mode, int head_dim, int n_head, int n_head_kv,
         enum ggml_type k_type, enum ggml_type v_type, int block_size);
