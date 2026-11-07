@@ -6,6 +6,7 @@
 // kvflash_bundle_commit, no engine, no GPU.
 #include "CppUnitTestFramework.hpp"
 #include "../../src/common/kvflash_session_store.h"
+#include "../../src/common/kvflash_sessions_plan.h"
 #include "../../src/server/kv/disk_store.h"
 #include "../../src/server/kv/session_tenant.h"
 
@@ -1248,4 +1249,52 @@ TEST_CASE(KvflashSessionStoreFixture, a_park_the_one_budget_cannot_hold_is_refus
     disk->release(100);
     disk->detach_tenant(id);
     fs::remove_all(root);
+}
+
+// A restore that does not happen (no room, a refused bundle) gives its claim back: the session is on disk and the budget may take it.
+TEST_CASE(KvflashSessionStoreFixture, a_restore_that_does_not_happen_gives_its_claim_back_to_the_budget) {
+    const std::string root = fresh_root("kvflash_s10c_unclaim");
+    KvFlashSessionStore store(root);
+    const auto a = commit_session(store, "opencode", "A", {1, 2, 3}, 0x10, 100);
+    uint64_t last = 0;
+    CHECK(store.ledger()->oldest(last));                  // on disk and unclaimed: it may go
+    CHECK(store.claim(a.key));
+    CHECK(!store.ledger()->oldest(last));                 // claimed by a restore: it may not
+    store.unclaim(a.key);
+    CHECK(store.ledger()->oldest(last));
+    store.unclaim("no-such-key");                         // nothing to give back
+    CHECK(store.claim(a.key));
+    CHECK(store.adopt(a.key));                            // adopted: in a slot, the state decides, not the claim
+    store.unclaim(a.key);
+    CHECK(!store.ledger()->oldest(last));
+    fs::remove_all(root);
+}
+
+// --kv-sessions: on by default whenever KVFlash and a disk dir are on; the old bundle-dir variable stays one release, with a warning.
+TEST_CASE(KvflashSessionStoreFixture, sessions_are_on_whenever_kvflash_and_a_disk_dir_are_on_and_the_flag_can_turn_them_off) {
+    auto plan = [](bool kvflash, KvFlashSessionsFlag flag, const std::string & dir, const std::string & env = "") {
+        return kvflash_sessions_plan(kvflash, flag, dir, env);
+    };
+    const auto on = plan(true, KvFlashSessionsFlag::automatic, "/cache");
+    CHECK(on.on); CHECK(on.root == "/cache"); CHECK(on.note.empty());
+    CHECK(plan(true, KvFlashSessionsFlag::on, "/cache").on);
+    CHECK(!plan(false, KvFlashSessionsFlag::automatic, "/cache").on);              // no KVFlash: no slots to park
+    CHECK(!plan(false, KvFlashSessionsFlag::on, "/cache").on);
+    const auto off = plan(true, KvFlashSessionsFlag::off, "/cache");
+    CHECK(!off.on); CHECK(off.root.empty()); CHECK(!off.note.empty());
+    const auto nodir = plan(true, KvFlashSessionsFlag::automatic, "");
+    CHECK(!nodir.on); CHECK(nodir.note.empty());                                     // the default with no disk cache is quiet
+    const auto asked = plan(true, KvFlashSessionsFlag::on, "");
+    CHECK(!asked.on); CHECK(asked.note.find("--kv-cache-dir") != std::string::npos); // an explicit ask that cannot be met says why
+    const auto env = plan(true, KvFlashSessionsFlag::automatic, "/cache", "/old/bundles");
+    CHECK(env.on); CHECK(env.root == "/old/bundles");
+    CHECK(env.note.find("LUCE_KVFLASH_SLOT_BUNDLE_DIR") != std::string::npos);     // the warning names the variable and the way out
+    CHECK(env.note.find("--kv-cache-dir") != std::string::npos);
+    CHECK(plan(true, KvFlashSessionsFlag::automatic, "", "/old/bundles").on);       // the override needs no cache dir
+    CHECK(!plan(true, KvFlashSessionsFlag::off, "/cache", "/old/bundles").on);      // an explicit off wins over the variable
+    CHECK(!plan(false, KvFlashSessionsFlag::automatic, "/cache", "/old/bundles").on);
+    KvFlashSessionsFlag f = KvFlashSessionsFlag::automatic;
+    CHECK(kvflash_sessions_flag_parse("on", f) && f == KvFlashSessionsFlag::on);
+    CHECK(kvflash_sessions_flag_parse("off", f) && f == KvFlashSessionsFlag::off);
+    CHECK(!kvflash_sessions_flag_parse("auto", f) && f == KvFlashSessionsFlag::off);   // only on|off; a bad value leaves it
 }
