@@ -927,12 +927,12 @@ void test_feature_gate_kvflash_requires_reading_arch() {
     BackendAdmissionContext automatic;
     automatic.kvflash = KvFlashRequest::Auto;
 
-    for (const char * arch : {"qwen35", "qwen35moe", "gemma4", "laguna"}) {
+    for (const char * arch : {"qwen35", "qwen35moe", "qwen4exp", "gemma4", "laguna"}) {
         CHECK(gate_result(args, arch, PlacementBackend::Cuda, fixed).empty());
         CHECK(gate_result(args, arch, PlacementBackend::Cuda, automatic).empty());
     }
     // These backends never read LUCE_KVFLASH; the flag would be dropped.
-    for (const char * arch : {"qwen4exp", "deepseek4", "deepseek41"}) {
+    for (const char * arch : {"deepseek4", "deepseek41"}) {
         CHECK(!gate_result(args, arch, PlacementBackend::Cuda, fixed).empty());
         CHECK(!gate_result(args, arch, PlacementBackend::Cuda, automatic).empty());
         CHECK(gate_result(args, arch, PlacementBackend::Cuda).empty());
@@ -940,7 +940,7 @@ void test_feature_gate_kvflash_requires_reading_arch() {
     // The refusal lists the architectures that do read it, from the table.
     const std::string refusal =
         gate_result(args, "deepseek41", PlacementBackend::Cuda, fixed);
-    CHECK(refusal.find("(supported: qwen35, qwen35moe, laguna, gemma4)") !=
+    CHECK(refusal.find("(supported: qwen35, qwen35moe, qwen4exp, laguna, gemma4)") !=
           std::string::npos);
 }
 

@@ -8,10 +8,13 @@
 #include "qwen4exp_internal.h"
 #include "qwen4exp_mtp.h"
 
+#include "common/kvflash_pager.h"
+
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#include <memory>
 #include <vector>
 #include <utility>
 
@@ -136,9 +139,16 @@ struct Qwen4ExpCache {
     std::vector<int> full_layer_ids;    // size = 12
     std::vector<int> linear_layer_ids;  // size = 36
 
-    // Full attention: F16 [head_dim, max_ctx, n_head_kv] (flash_attn_ext layout).
+    // Full attention: F16 [head_dim, max_ctx, n_head_kv] (flash_attn_ext layout), or [head_dim, pool, n_head_kv]
+    // with KVFlash.
     std::vector<ggml_tensor *> attn_k;  // size = n_full
     std::vector<ggml_tensor *> attn_v;
+    // KVFlash (--kvflash): the full-attention rows are the pager's pool slots, which positions share as the pager
+    // maps them (an evicted chunk pages out to system memory). Null: row p holds position p. A pooled cache attends
+    // densely (no QSA indexer rows) and keeps every row on the target. `kvflash_slot_pos` is the position each slot
+    // holds (-1: none) as qwen4exp_kvflash_reserve left the map.
+    std::unique_ptr<KvFlashPager> kvflash;
+    std::vector<int32_t> kvflash_slot_pos;
     ggml_tensor * mtp_k = nullptr;      // MTP draft layer, same layout; null unless created with `mtp`
     ggml_tensor * mtp_v = nullptr;
     ggml_tensor * mtp_prev_hidden = nullptr; // one pending trunk row, for the next prefill chunk's first pair
@@ -213,11 +223,13 @@ struct Qwen4ExpCache {
 // `mtp` adds the MTP draft layer's K/V and the verify rollback state (needs a loaded sidecar).
 // `slot_states`: the recurrent state is slab `state_slot` of those (allocated by the caller).
 // `remote_layers`: the last that many full-attention layers keep their rows on w.expert_backend.
+// `kvflash_pool`: a KVFlash pool of that many full-attention rows (a 64-token chunk multiple below max_ctx, no
+// remote layers); 0 keeps one row per position.
 bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
                            int max_ctx, Qwen4ExpCache & out, bool mtp = false,
                            int mtp_draft = 1, // allocate the explicit draft cap once
                            const Qwen4ExpSlotStates * slot_states = nullptr, int state_slot = -1,
-                           int remote_layers = 0);
+                           int remote_layers = 0, int kvflash_pool = 0);
 
 void free_qwen4exp_cache(Qwen4ExpCache & c);
 
@@ -227,6 +239,27 @@ void clear_qwen4exp_batched_decode_workspace(Qwen4ExpBatchedDecodeWorkspace & wo
 // Zero the recurrent state, conv history and pooled-block prefix and reset
 // cur_pos. KV is left intact: the next sequence overwrites it from position 0.
 void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c);
+
+// The full-attention rows a forward reads and writes. Without KVFlash row p holds position p. With KVFlash a forward
+// first maps its positions to pool slots, and attention spans at most the pool, behind masks built on the position
+// each slot holds; while the context fits the pool the map is the identity, so the spans and masks match the plain
+// cache's.
+//
+// The longest span: the context, or the pool.
+int64_t qwen4exp_attn_cap(const Qwen4ExpCache & c);
+// The rows a forward over [0, kv_len) attends: kv_len, at most the pool.
+int64_t qwen4exp_attn_rows(const Qwen4ExpCache & c, int64_t kv_len);
+// The most positions one forward may write (no bound without KVFlash). A KVFlash forward keeps them all resident
+// beside the sink chunk, so none of its own chunks is evicted before the graph runs.
+int qwen4exp_max_forward_rows(const Qwen4ExpCache & c);
+// KVFlash: map positions [pos0, pos0 + n) to slots ahead of the forward that writes them, paging out the least
+// recently used chunks as needed. True without KVFlash.
+bool qwen4exp_kvflash_reserve(Qwen4ExpCache & c, int pos0, int n);
+// The row position `pos` is written to.
+int32_t qwen4exp_kv_row(const Qwen4ExpCache & c, int64_t pos);
+// The causal mask of the query at position q over the first `cols` rows: 0 where the row holds a position <= q,
+// -inf elsewhere.
+void qwen4exp_causal_mask(const Qwen4ExpCache & c, ggml_fp16_t * row, int64_t cols, int64_t q);
 
 // Prefix-sized copies, in the memory of the `store` backend they were saved to:
 // the device's own, or system memory (create_snapshot_backend). Live strip views
@@ -245,14 +278,15 @@ struct Qwen4ExpSnapshot {
 
 size_t qwen4exp_snapshot_bytes(ggml_backend_t store, const Qwen4ExpCache & c, int tokens,
                              size_t * host_bytes = nullptr);
-// Copy `c`, which lives on `backend`, into a snapshot allocated on `store`.
+// Copy `c`, which lives on `backend`, into a snapshot allocated on `store`. A KVFlash cache saves while its
+// positions still sit in their identity slots (the context fits the pool).
 bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const Qwen4ExpCache & c,
                             Qwen4ExpSnapshot & s);
 // Restore into `c`, the cache `s` was saved from or another one with the same trunk layout (a
 // concurrency slot resuming another slot's checkpoint). The MTP draft layer's state comes along
 // when both caches have the layer; a cache that has it, restored from a snapshot without it, keeps
 // no draft state (mtp_prev_pos -1), so its request decodes without drafts. False, with `c`
-// untouched, when the layouts differ otherwise.
+// untouched, when the layouts differ otherwise or a KVFlash pool cannot hold the snapshot.
 bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c);
 void free_qwen4exp_snapshot(Qwen4ExpSnapshot & s);
 
