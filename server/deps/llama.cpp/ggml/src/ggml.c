@@ -5939,6 +5939,19 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_sparse_mask(
+        struct ggml_tensor * a,
+        bool                 sparse) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_SPARSE_MASK_PARAM, sparse ? 1 : 0);
+}
+
+bool ggml_flash_attn_ext_get_sparse_mask(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(a, GGML_FLASH_ATTN_EXT_SPARSE_MASK_PARAM) != 0;
+}
+
 // ggml_flash_attn_sparse
 
 struct ggml_tensor * ggml_flash_attn_sparse(
