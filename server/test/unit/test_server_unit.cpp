@@ -5954,6 +5954,26 @@ TEST_CASE(ServerUnitFixture, test_shared_prefix_cut_against_the_ring) {
     TEST_ASSERT(none.cut(b, {8}) == 0);
 }
 
+// The head an engine that plans no prefix store captures: the ring's cut, else the first chat boundary
+// when it is far enough in (the first request has no ring yet); -1 when off, 0 when no head applies.
+TEST_CASE(ServerUnitFixture, test_shared_prefix_head_cut_for_engines_without_a_prefix_store) {
+    std::vector<bool> newline(100, false);
+    newline[10] = true;
+    const std::vector<int32_t> a = {1, 2, 3, 10, 4, 5, 6, 7, 50, 51};
+    SharedPrefixes learn(SharedPrefixMode::learn, newline, 4, 2);
+    TEST_ASSERT(learn.head_cut(a, {8}, false) == 8);          // empty ring: the first boundary
+    TEST_ASSERT(learn.head_cut(a, {3}, false) == 0);          // too short, no tools: no head
+    TEST_ASSERT(learn.head_cut(a, {3}, true) == 0);           // tools, but no ring and no boundary far enough
+    learn.remember(a, {8});
+    const std::vector<int32_t> b = {1, 2, 3, 10, 4, 5, 6, 9, 60};
+    TEST_ASSERT(learn.head_cut(b, {8}, false) == learn.cut(b, {8}));  // the ring's cut wins
+    TEST_ASSERT(learn.head_cut(b, {8}, false) == 4);
+    SharedPrefixes frozen(SharedPrefixMode::freeze, newline, 4, 2);
+    TEST_ASSERT(frozen.head_cut(a, {8}, false) == 8);         // freeze still has the first boundary
+    SharedPrefixes none(SharedPrefixMode::off, newline, 4, 2);
+    TEST_ASSERT(none.head_cut(a, {8}, true) == -1);
+}
+
 TEST_CASE(ServerUnitFixture, test_agent_turn_cache_defaults_on_where_it_can_run) {
     const std::optional<bool> unset;
     // No flag: on for one sequence with prefix slots, quietly off elsewhere.
