@@ -270,3 +270,83 @@ TEST_CASE(KvflashSlotPlanFixture, auto_budget_is_split_across_slots_and_the_rese
     KvFlashAutoBudget low; low.free_bytes = 1000; low.reserve_bytes = 2000;
     CHECK(kvflash_budget_per_slot(low, 4).free_bytes == 1000);     // nothing above the reserve: unchanged
 }
+
+// ── Eviction stage 0 (F2): the park staging reservation ────────────────
+// Qwen3.8-27B q8_0 geometry (BYTES_PER_SESSION.md): slab 156,893,184 B, chunk 2,228,224 B.
+namespace {
+constexpr int64_t kSlab = 156893184;
+constexpr int64_t kMaxCtx = 135168;
+constexpr int64_t kNSlabTensors = 96, kHeader = 4096;   // small terms; the test tolerates them
+
+// A short sticky session (2K prompt + 256 new) with a bundle dir, the reservation as init_kvflash_slots builds it.
+KvFlashAdmitInput sticky_bundle_admit(bool staged_by_size) {
+    KvFlashAdmitInput in = base_admit();
+    in.prompt_tokens = 2048; in.max_new_tokens = 256; in.max_ctx = kMaxCtx;
+    const KvFlashParkStaging st = kvflash_park_staging(kSlab, kNSlabTensors, kHeader, 64, kChunkBytes);
+    in.ladder_bytes = kvflash_ladder_bytes(kSlab, false, true, false, st);
+    if (staged_by_size) { in.ladder_bytes = kvflash_ladder_bytes(kSlab, false, true, true, st); in.stage_chunk_bytes = st.per_chunk_bytes; }
+    else                in.ladder_bytes += kvflash_park_staging_max_bytes(st, kMaxCtx, 64);
+    return in;
+}
+}
+
+TEST_CASE(KvflashSlotPlanFixture, f2_staging_at_max_ctx_is_about_5_GiB_per_session) {
+    const KvFlashParkStaging st = kvflash_park_staging(kSlab, kNSlabTensors, kHeader, 64, kChunkBytes);
+    const int64_t at_max = st.fixed_bytes + 2112 * st.per_chunk_bytes;   // nc_max = 135168 / 64
+    CHECK(kvflash_park_staging_max_bytes(st, kMaxCtx, 64) == at_max);
+    CHECK(at_max > 4900 * kMiB);                      // 4.97 GiB computed by the design note
+    CHECK(at_max < 5500 * kMiB);                      // +2 slabs (the third rung, one live and one staged pack): 5.1 GiB
+    // measured parks are 448-478 MiB (C1_4_PROGRESS.md:89): the reservation is >10x the truth
+    CHECK(at_max > 10 * 478 * kMiB);
+}
+
+TEST_CASE(KvflashSlotPlanFixture, f2_today_the_default_budget_holds_two_short_sessions) {
+    const KvFlashAdmitInput in = sticky_bundle_admit(false);
+    CHECK(kvflash_host_need_bytes(in) > 5200 * kMiB);   // ~5.3 GiB for a 2K session
+    CHECK(kvflash_host_need_bytes(in) < 5800 * kMiB);   // 5.6 GiB with the third rung
+}
+
+TEST_CASE(KvflashSlotPlanFixture, f2_staging_sized_by_the_session_fits_every_slot) {
+    const KvFlashAdmitInput in = sticky_bundle_admit(true);
+    // 2304 tokens = 36 chunks: backing + both rungs + fixed staging + 36 chunks of staging, about 0.6 GiB x 2 + slabs
+    CHECK(kvflash_host_need_bytes(in) < 1500 * kMiB);   // +2 slabs (the third rung)
+    // never below what the park really holds (a 478 MiB bundle)
+    CHECK(kvflash_host_need_bytes(in) > 478 * kMiB);
+}
+
+TEST_CASE(KvflashSlotPlanFixture, f2_staging_by_size_grows_with_the_session) {
+    KvFlashAdmitInput in = sticky_bundle_admit(true);
+    const int64_t small = kvflash_host_need_bytes(in);
+    in.prompt_tokens = 32768;
+    CHECK(kvflash_host_need_bytes(in) > small);
+    // a full max_ctx session still reserves its whole backing and staging: the bound is the session, not max_ctx for everyone
+    in.prompt_tokens = kMaxCtx; in.max_new_tokens = 0;
+    CHECK(kvflash_host_need_bytes(in) > kvflash_host_need_bytes(sticky_bundle_admit(false)));
+}
+
+// ── review P1 #1: a resume keeps the reservation while the last park is still staged ──────────────────────
+TEST_CASE(KvflashSlotPlanFixture, a_reserve_floor_holds_the_reservation_at_what_the_slot_held) {
+    KvFlashAdmitInput in = base_admit();
+    in.prompt_tokens = 128; in.max_new_tokens = 0;                    // 2 chunks
+    CHECK(kvflash_host_need_bytes(in) == 2 * kChunkBytes);
+    in.reserve_floor_bytes = 40 * kChunkBytes;                        // the 40-chunk park still being written
+    CHECK(kvflash_host_need_bytes(in) == 40 * kChunkBytes);
+    in.prompt_tokens = 64 * 60;                                       // a larger turn is charged its own size
+    CHECK(kvflash_host_need_bytes(in) == 60 * kChunkBytes);
+}
+
+// ── v5: the third rung ─────────────────────────────────────────────────
+TEST_CASE(KvflashSlotPlanFixture, v5_the_third_rung_adds_exactly_two_slabs_to_the_ladder_charge_and_the_host_need) {
+    const KvFlashParkStaging st = kvflash_park_staging(kSlab, kNSlabTensors, kHeader, 64, kChunkBytes);
+    // the two-rung charge: 2 live rungs, and a staging of 4 slabs (end snapshot, end pack, two rung packs) + the small terms
+    const int64_t small = 48 + 16 * kNSlabTensors + kHeader + kChunkBytes;
+    const int64_t two_rungs = 2 * kSlab + 4 * kSlab + small;
+    CHECK(st.fixed_bytes == 5 * kSlab + small);                                   // one more rung pack in the staging
+    CHECK(kvflash_ladder_bytes(kSlab, false, true, true, st) - two_rungs == 2 * kSlab);   // one more live rung, one more staged pack
+    KvFlashAdmitInput now = sticky_bundle_admit(true), before = now;
+    before.ladder_bytes = two_rungs;
+    CHECK(kvflash_host_need_bytes(now) - kvflash_host_need_bytes(before) == 2 * kSlab);   // the admission / host-ledger estimate
+    CHECK(kvflash_ladder_bytes(kSlab, true, true, false, st) == 4 * kSlab);       // a recall turn's snapshot beside the three rungs
+    CHECK(kvflash_ladder_bytes(kSlab, false, false, true, st) == st.fixed_bytes);  // not sticky: no rungs
+    CHECK(kvflash_ladder_bytes(kSlab, false, true, false, st) == 3 * kSlab);       // no bundle dir: no staging
+}
