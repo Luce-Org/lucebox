@@ -5,6 +5,7 @@
 #include "CppUnitTestFramework.hpp"
 #include "../../src/common/kvflash_slot_bundle.h"
 #include "../../src/common/kvflash_bundle_digest.h"
+#include "ggml-cuda.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -551,6 +552,43 @@ TEST_CASE(KvflashSlotBundleFixture, the_identity_differs_when_only_the_paged_att
     CHECK(kvflash_identity_key(a) == kvflash_identity_key(same_route));
     CHECK(kvflash_identity_key(a) != kvflash_identity_key(other_route));
     CHECK(kvflash_fnv1a(kvflash_identity_key(a)) != kvflash_fnv1a(kvflash_identity_key(other_route)));
+}
+
+// The route is what dispatch picks for the model, not what the device could run: the WMMA kernel
+// takes a GQA ratio up to 8 only, F16/Q8_0/Q4_0 KV, head dim 256, 16-token blocks and no tree, and
+// every other graph runs V_DOT2 whatever LUCE_PAGED_WMMA says.
+TEST_CASE(KvflashSlotBundleFixture, the_paged_attention_route_follows_the_models_dispatch) {
+    const auto route = [](bool env, bool rdna4, int n_head, int n_head_kv, ggml_type kt = GGML_TYPE_F16,
+                          ggml_type vt = GGML_TYPE_F16, bool tree = false, int head_dim = 256, int block = 16) {
+        return ggml_cuda_paged_attn_wmma_route_for(env, rdna4, tree, head_dim, n_head, n_head_kv, kt, vt, block);
+    };
+    CHECK(route(true, true, 16, 2));                          // GQA 8: the eligible case
+    CHECK(!route(true, true, 24, 2));                         // GQA 12 > 8: V_DOT2 on a WMMA-capable device, env unset
+    CHECK(!route(true, true, 25, 2));                         // not a multiple
+    CHECK(!route(false, true, 16, 2));                        // LUCE_PAGED_WMMA=0
+    CHECK(!route(true, false, 16, 2));                        // not RDNA4
+    CHECK(!route(true, true, 16, 2, GGML_TYPE_Q5_0));         // KV type the kernel has no instantiation for
+    CHECK(!route(true, true, 16, 2, GGML_TYPE_F16, GGML_TYPE_Q5_0));
+    CHECK(route(true, true, 16, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    CHECK(!route(true, true, 16, 2, GGML_TYPE_F16, GGML_TYPE_F16, /*tree=*/true));
+    CHECK(!route(true, true, 16, 2, GGML_TYPE_F16, GGML_TYPE_F16, false, /*head_dim=*/128));
+    CHECK(!route(true, true, 16, 2, GGML_TYPE_F16, GGML_TYPE_F16, false, 256, /*block=*/32));
+}
+
+// Both env settings dispatch V_DOT2 for a GQA-12 model, so a bundle saved under one is compatible with
+// the other; for an eligible model the two settings are different routes and different identities.
+TEST_CASE(KvflashSlotBundleFixture, the_identity_follows_the_dispatched_route_not_the_env) {
+    const auto key = [](bool env, int n_head, int n_head_kv) {
+        KvFlashIdentityParts p;
+        p.model = "model.gguf"; p.model_size = 1234; p.model_mtime = 99;
+        p.kv_k_type = (int)GGML_TYPE_F16; p.kv_v_type = (int)GGML_TYPE_F16;
+        p.chunk_tokens = 64; p.n_pool_blocks = 32; p.max_context = 8192;
+        p.paged_wmma_route = ggml_cuda_paged_attn_wmma_route_for(
+            env, /*device_rdna4=*/true, false, 256, n_head, n_head_kv, GGML_TYPE_F16, GGML_TYPE_F16, 16);
+        return kvflash_identity_key(p);
+    };
+    CHECK(key(true, 24, 2) == key(false, 24, 2));
+    CHECK(key(true, 16, 2) != key(false, 16, 2));
 }
 
 // ---- R3 digest mode: the digest of the whole saved state, per component ----------------------
