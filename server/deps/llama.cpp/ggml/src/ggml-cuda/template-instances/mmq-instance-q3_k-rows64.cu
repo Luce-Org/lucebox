@@ -42,12 +42,25 @@ bool mul_mat_q_case_rows64_q3_k_xn(ggml_backend_cuda_context & ctx, const void *
     std::memcpy(&twin_args, args, sizeof(twin_args));
     return luce_mmq_twin_rows64::mul_mat_q_case_xn<GGML_TYPE_Q3_K>(ctx, twin_args, stream, mmq_x);
 }
+
+// This twin through the prefetching kernel at x-tile 16, 32 or 48 (mmq.cu).
+bool mul_mat_q_case_rows64_q3_k_xn_pf(ggml_backend_cuda_context & ctx, const void * args, cudaStream_t stream,
+                                            int mmq_x) {
+    using twin_args_t = luce_mmq_twin_rows64::mmq_args;
+    twin_args_t twin_args;
+    std::memcpy(&twin_args, args, sizeof(twin_args));
+    return luce_mmq_twin_rows64::mul_mat_q_case_xn_pf<GGML_TYPE_Q3_K>(ctx, twin_args, stream, mmq_x);
+}
 #else
 bool mul_mat_q_case_rows64_q3_k(ggml_backend_cuda_context &, const void *, cudaStream_t) {
     return false;
 }
 
 bool mul_mat_q_case_rows64_q3_k_xn(ggml_backend_cuda_context &, const void *, cudaStream_t, int) {
+    return false;
+}
+
+bool mul_mat_q_case_rows64_q3_k_xn_pf(ggml_backend_cuda_context &, const void *, cudaStream_t, int) {
     return false;
 }
 #endif // defined(GGML_USE_HIP)

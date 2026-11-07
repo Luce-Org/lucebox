@@ -8,6 +8,8 @@
 //   ud    only the 64-row twin on
 //   2w    only the 32-row twin on
 //   both  the defaults (both on)
+//   split both on inside the split-k scope (ggml_backend_cuda_set_mmq_splitk_scope,
+//         LUCE_TEST_MMQ_SPLITK=1), as the concurrent batched verify runs
 // Every child multiplies the same deterministic weights (random blocks of each
 // type with finite scales) by the same F32 activations and prints one line per
 // case: the FNV-1a hash of the output bytes, and how many MMQ calls and twin
@@ -19,6 +21,11 @@
 // a type with a twin, or the measured 17-48 column choice) and nowhere else.
 // On a GPU that is not RDNA4 no twin may engage; the hashes are still
 // compared, then the test reports SKIP.
+//
+// The split arm may differ from base only where the 64-row twin's prefetching
+// kernel can split k (a 64-row choice, at least 32 k-iterations of 256): each
+// split adds one rounding, so those cases must match the child's own unsplit
+// run to a relative 1e-5 instead. On RDNA4 at least one case must split.
 //
 //   test_mmq_tile_twins            all arms, compare
 //   test_mmq_tile_twins --child    one arm, the environment decides
@@ -179,9 +186,11 @@ struct Result {
     size_t p64 = 0;
     size_t p32 = 0;
     bool finite = false;
+    double maxrel = 0.0;  // split arm: max |split - unsplit| / max |unsplit|
 };
 
-bool run_case(ggml_backend_t gpu, const Case & c, const std::vector<uint8_t> & weights, Result & r) {
+bool run_case(ggml_backend_t gpu, const Case & c, const std::vector<uint8_t> & weights, Result & r,
+              std::vector<float> & out) {
     ggml_init_params ip{ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true};
     ggml_context * ctx = ggml_init(ip);
     ggml_tensor * w = ggml_new_tensor_2d(ctx, c.type, c.shape.k, c.shape.m);
@@ -212,7 +221,7 @@ bool run_case(ggml_backend_t gpu, const Case & c, const std::vector<uint8_t> & w
     r.mmq = ggml_backend_cuda_get_mmq_launch_count() - mmq0;
     r.p64 = ggml_backend_cuda_get_mmq_twin_launch_count(64) - p64_0;
     r.p32 = ggml_backend_cuda_get_mmq_twin_launch_count(32) - p32_0;
-    std::vector<float> out((size_t) (c.shape.m * c.n));
+    out.assign((size_t) (c.shape.m * c.n), 0.0f);
     ggml_backend_tensor_get(y, out.data(), 0, out.size() * sizeof(float));
     r.hash = fnv1a(out.data(), out.size() * sizeof(float));
     r.finite = true;
@@ -245,6 +254,8 @@ int child_main() {
     if (twins != nullptr && std::strlen(twins) == 2) {
         ggml_backend_cuda_set_mmq_twins_override(twins[0] == '1', twins[1] == '1');
     }
+    const char * split_env = std::getenv("LUCE_TEST_MMQ_SPLITK");
+    const bool split = split_env != nullptr && std::strcmp(split_env, "1") == 0;
     std::printf("device rdna4=%d\n", device_is_rdna4() ? 1 : 0);
     int rc = 0;
     std::map<std::string, std::vector<uint8_t>> weights;
@@ -263,13 +274,32 @@ int child_main() {
             it = weights.emplace(wkey, std::move(w)).first;
         }
         Result r;
-        if (!run_case(gpu, c, it->second, r)) {
+        std::vector<float> out;
+        std::vector<float> unsplit;
+        bool ok = true;
+        if (split) {
+            Result ref;
+            ok = run_case(gpu, c, it->second, ref, unsplit);
+            ggml_backend_cuda_set_mmq_splitk_scope(true);
+        }
+        ok = ok && run_case(gpu, c, it->second, r, out);
+        ggml_backend_cuda_set_mmq_splitk_scope(false);
+        if (!ok) {
             std::printf("error %s: compute failed\n", case_key(c).c_str());
             rc = 1;
             continue;
         }
-        std::printf("case %s hash=%016llx mmq=%zu p64=%zu p32=%zu finite=%d\n", case_key(c).c_str(),
-                    (unsigned long long) r.hash, r.mmq, r.p64, r.p32, r.finite ? 1 : 0);
+        if (split) {
+            double maxabs = 0.0;
+            double maxdiff = 0.0;
+            for (size_t i = 0; i < out.size(); ++i) {
+                maxabs  = std::fmax(maxabs, std::fabs((double) unsplit[i]));
+                maxdiff = std::fmax(maxdiff, std::fabs((double) out[i] - (double) unsplit[i]));
+            }
+            r.maxrel = maxabs > 0.0 ? maxdiff / maxabs : maxdiff;
+        }
+        std::printf("case %s hash=%016llx mmq=%zu p64=%zu p32=%zu finite=%d maxrel=%.3e\n", case_key(c).c_str(),
+                    (unsigned long long) r.hash, r.mmq, r.p64, r.p32, r.finite ? 1 : 0, r.maxrel);
         std::fflush(stdout);
     }
     ggml_backend_free(gpu);
@@ -280,6 +310,7 @@ struct Arm {
     const char * name;
     std::vector<std::string> env;  // which twins this arm's child turns on
     mmq_twins_enabled on;
+    bool split = false;            // inside the split-k scope
 };
 
 struct ArmRun {
@@ -292,7 +323,8 @@ struct ArmRun {
 bool run_child(const Arm & arm, ArmRun & run) {
     std::vector<std::string> env_store;
     for (char ** e = environ; e != nullptr && *e != nullptr; ++e) {
-        if (std::strncmp(*e, "LUCE_TEST_MMQ_TWINS=", 20) != 0) {
+        if (std::strncmp(*e, "LUCE_TEST_MMQ_TWINS=", 20) != 0 &&
+            std::strncmp(*e, "LUCE_TEST_MMQ_SPLITK=", 21) != 0) {
             env_store.emplace_back(*e);
         }
     }
@@ -346,8 +378,8 @@ bool run_child(const Arm & arm, ArmRun & run) {
             unsigned long long hash = 0;
             int finite = 0;
             if (h == std::string::npos ||
-                std::sscanf(line.c_str() + h, " hash=%llx mmq=%zu p64=%zu p32=%zu finite=%d",
-                            &hash, &r.mmq, &r.p64, &r.p32, &finite) != 5) {
+                std::sscanf(line.c_str() + h, " hash=%llx mmq=%zu p64=%zu p32=%zu finite=%d maxrel=%lf",
+                            &hash, &r.mmq, &r.p64, &r.p32, &finite, &r.maxrel) != 6) {
                 run.errors.push_back("unparsed: " + line);
                 continue;
             }
@@ -384,6 +416,13 @@ int parent_main() {
         a.on.two_warp = true;
         arms.push_back(a);
     }
+    {
+        Arm a{"split", {"LUCE_TEST_MMQ_TWINS=11", "LUCE_TEST_MMQ_SPLITK=1"}, {}};
+        a.on.ud_smalltile = true;
+        a.on.two_warp = true;
+        a.split = true;
+        arms.push_back(a);
+    }
 
     std::vector<ArmRun> runs(arms.size());
     for (size_t i = 0; i < arms.size(); ++i) {
@@ -411,6 +450,7 @@ int parent_main() {
     }
     size_t compared = 0;
     size_t engaged = 0;
+    size_t split_cases = 0;
     for (const Case & c : cases()) {
         const std::string key = case_key(c);
         const auto base_it = runs[0].results.find(key);
@@ -436,21 +476,32 @@ int parent_main() {
             const mmq_twin_choice want = mmq_twin_choose(arms[i].on, call);
             const size_t want_p64 = want.tile == mmq_twin_tile::rows64 ? 1 : 0;
             const size_t want_p32 = want.tile == mmq_twin_tile::rows32 ? 1 : 0;
-            const bool pass = r.hash == base.hash && r.finite && r.mmq == 1 &&
+            // Only a 64-row 17-48 column choice with >= 32 k-iterations may split.
+            const bool may_split = arms[i].split && want.tile == mmq_twin_tile::rows64 &&
+                                   c.n > MMQ_TWIN_MAX_COLS && c.shape.k / 256 >= 32;
+            const bool split_here = may_split && r.hash != base.hash;
+            const bool same = r.hash == base.hash || (split_here && r.maxrel <= 1e-5);
+            const bool pass = same && r.finite && r.mmq == 1 &&
                               r.p64 == want_p64 && r.p32 == want_p32;
             if (!pass) {
                 std::printf("[mmq-twins] FAIL %s %s: hash=%016llx base=%016llx finite=%d mmq=%zu "
-                            "p64=%zu (want %zu) p32=%zu (want %zu)\n",
+                            "p64=%zu (want %zu) p32=%zu (want %zu) maxrel=%.3e (may split %d)\n",
                             arms[i].name, key.c_str(), (unsigned long long) r.hash,
                             (unsigned long long) base.hash, r.finite ? 1 : 0, r.mmq,
-                            r.p64, want_p64, r.p32, want_p32);
+                            r.p64, want_p64, r.p32, want_p32, r.maxrel, may_split ? 1 : 0);
                 ok = false;
             }
+            split_cases += split_here ? 1 : 0;
             compared += i > 0 ? 1 : 0;
             engaged += r.p64 + r.p32;
         }
     }
-    std::printf("[mmq-twins] %zu arm cases compared bit for bit with base, %zu ran a twin\n", compared, engaged);
+    std::printf("[mmq-twins] %zu arm cases compared with base, %zu ran a twin, %zu split k\n",
+                compared, engaged, split_cases);
+    if (rdna4 && split_cases == 0) {
+        std::printf("[mmq-twins] FAIL split: no case split k inside the split-k scope\n");
+        ok = false;
+    }
     if (!ok) {
         std::printf("[mmq-twins] FAIL\n");
         return 1;

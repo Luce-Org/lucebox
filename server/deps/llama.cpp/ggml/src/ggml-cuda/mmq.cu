@@ -37,6 +37,17 @@ extern "C" void ggml_backend_cuda_set_mmq_twins_override(bool rows64, bool rows3
     g_mmq_twin_rows32_on.store(rows32, std::memory_order_relaxed);
 }
 
+// Split k in the 64-row twins' prefetching kernel (ggml-cuda.h), per calling
+// thread: graph_compute dispatches on the caller's thread, so one engine's
+// scope never reaches another's calls. Inside the scope a split call aims for
+// this many workgroups (4 per CU on a 64-CU R9700).
+static thread_local bool g_mmq_splitk_scope = false;
+static constexpr int MMQ_SPLITK_GRID = 256;
+
+extern "C" void ggml_backend_cuda_set_mmq_splitk_scope(bool on) {
+    g_mmq_splitk_scope = on;
+}
+
 extern "C" size_t ggml_backend_cuda_get_mmq_twin_launch_count(int tile_rows) {
     return tile_rows == 64 ? g_mmq_twin_rows64_launch_count :
            tile_rows == 32 ? g_mmq_twin_rows32_launch_count : 0;
@@ -296,15 +307,38 @@ bool luce_mmq_twin_launch_rows32(ggml_backend_cuda_context & ctx, const mmq_args
     }
 }
 
-// A twin at x-tile 16, 32 or 48 (mul_mat_q_case_xn), for 17-48 columns.
+// A 64-row twin through the prefetching kernel (mul_mat_q_case_xn_pf), which
+// splits k inside the split-k scope. False when it does not take the call.
+bool luce_mmq_twin_launch_xn_pf(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream,
+                                const int mmq_x) {
+    mmq_args pf_args = args;
+    pf_args.split_k_grid = g_mmq_splitk_scope ? MMQ_SPLITK_GRID : 0;
+    const void * a = &pf_args;
+    switch (args.type_x) {
+        case GGML_TYPE_IQ3_S:   return mul_mat_q_case_rows64_iq3_s_xn_pf  (ctx, a, stream, mmq_x);
+        case GGML_TYPE_IQ3_XXS: return mul_mat_q_case_rows64_iq3_xxs_xn_pf(ctx, a, stream, mmq_x);
+        case GGML_TYPE_IQ4_XS:  return mul_mat_q_case_rows64_iq4_xs_xn_pf (ctx, a, stream, mmq_x);
+        case GGML_TYPE_Q5_K:    return mul_mat_q_case_rows64_q5_k_xn_pf   (ctx, a, stream, mmq_x);
+        case GGML_TYPE_Q3_K:    return mul_mat_q_case_rows64_q3_k_xn_pf   (ctx, a, stream, mmq_x);
+        case GGML_TYPE_IQ2_S:   return mul_mat_q_case_rows64_iq2_s_xn_pf  (ctx, a, stream, mmq_x);
+        default:                return false;
+    }
+}
+
+// A twin at x-tile 16, 32 or 48 for 17-48 columns: the 64-row ones through
+// the prefetching kernel when it takes the call, else mul_mat_q_case_xn.
 bool luce_mmq_twin_launch_xn(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream,
                              const int rows, const int mmq_x) {
     const void * a = &args;
     bool launched = false;
     if (rows == 64) {
+        if (luce_mmq_twin_launch_xn_pf(ctx, args, stream, mmq_x)) {
+            return true;
+        }
         switch (args.type_x) {
             case GGML_TYPE_IQ3_S:   launched = mul_mat_q_case_rows64_iq3_s_xn  (ctx, a, stream, mmq_x); break;
             case GGML_TYPE_IQ3_XXS: launched = mul_mat_q_case_rows64_iq3_xxs_xn(ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_IQ4_XS:  launched = mul_mat_q_case_rows64_iq4_xs_xn (ctx, a, stream, mmq_x); break;
             case GGML_TYPE_Q5_K:    launched = mul_mat_q_case_rows64_q5_k_xn   (ctx, a, stream, mmq_x); break;
             case GGML_TYPE_Q3_K:    launched = mul_mat_q_case_rows64_q3_k_xn   (ctx, a, stream, mmq_x); break;
             case GGML_TYPE_IQ2_S:   launched = mul_mat_q_case_rows64_iq2_s_xn  (ctx, a, stream, mmq_x); break;

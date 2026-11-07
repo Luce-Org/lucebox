@@ -29,7 +29,10 @@
 // and width only decide which workgroup and which warp compute an element.
 //
 // Calls of 17-48 columns take the measured choice of mmq_twin_choose_wide
-// (x-tile 16, 32 or 48), still bit-exact against the parent.
+// (x-tile 16, 32 or 48), still bit-exact against the parent. mmq.cu runs
+// their 64-row choices through the prefetching kernel
+// (mul_mat_q_case_xn_pf), bit-exact too unless the caller holds the split-k
+// scope (ggml_backend_cuda_set_mmq_splitk_scope).
 //
 // Excluded paths, which keep the parent tile with a reason (inert_why): a
 // device that is not RDNA4, and MUL_MAT_ID (expert-routed) calls of up to 48
@@ -121,8 +124,11 @@ inline bool mmq_twin_has_rows32(ggml_type type) {
 //   - Outputs of at most 1280 rows (attn k/v, the 96-row ssm_beta|alpha,
 //     drafter k/v) in Q4_K, Q5_K, Q6_K, Q8_0: 32-row x16, more workgroups for
 //     a small grid (ssm_beta|alpha 26.7 -> 17.8 us, Q5_K k/v 36.8 -> 27.5 us).
-//   - IQ4_XS and larger Q4_K / Q6_K / Q8_0 outputs: the parent (64-row x48)
-//     is best.
+//   - IQ4_XS: the parent's own shape, 64-row x48, but as the 64-row twin, so
+//     it runs the prefetching kernel (global loads one phase ahead of the dot
+//     products; at 32 columns 6-9% faster on every shape, the 5120-row
+//     ffn_down 154.7 -> 144.4 us).
+//   - Larger Q4_K / Q6_K / Q8_0 outputs: the parent (64-row x48) is best.
 // Every x-tile accumulates each element over k in the same order, so a wider
 // call stays bit-exact too; columns past the tile run as more column tiles.
 inline mmq_twin_choice mmq_twin_choose_wide(const mmq_twins_enabled & on, const mmq_twin_call & call) {
@@ -134,6 +140,7 @@ inline mmq_twin_choice mmq_twin_choose_wide(const mmq_twins_enabled & on, const 
     switch (call.type) {
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ4_XS:
             tile = mmq_twin_tile::rows64; mmq_x = 48;
             break;
         case GGML_TYPE_Q3_K:

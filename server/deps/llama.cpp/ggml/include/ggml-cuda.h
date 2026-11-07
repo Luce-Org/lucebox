@@ -119,6 +119,14 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_twin_launch_count(int tile_row
 // compare them bit for bit with the parent tiles. Both are on by default.
 GGML_BACKEND_API void ggml_backend_cuda_set_mmq_twins_override(bool rows64, bool rows32);
 
+// While on (for the calling thread), the RDNA4 64-row MMQ twins split k for
+// calls of 17-48 columns whose grid would leave the GPU short of workgroups,
+// splits of at least 16 k-iterations each. A split sum is not
+// bit-exact against the unsplit one, so only a caller that already accepts
+// batch-dependent results turns it on: the concurrent (C>1) batched verify,
+// around its graph. Off by default; single-request paths never set it.
+GGML_BACKEND_API void ggml_backend_cuda_set_mmq_splitk_scope(bool on);
+
 // Calling-thread launch counters for the scalar and grouped-column GDN
 // kernels. Focused qualification tests use these to reject silent fallback.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void);

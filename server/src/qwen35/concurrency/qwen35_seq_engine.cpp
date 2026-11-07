@@ -1330,8 +1330,21 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
         sizeof(int32_t) * seq_lens_.size());
     staged_round.device_lengths_dirty = true;
-    if (ggml_backend_graph_compute(b_.target_backend_, graph.gf) !=
-        GGML_STATUS_SUCCESS) {
+    // A batched verify of two or more lanes may split k in its MMQ calls
+    // (ggml_backend_cuda_set_mmq_splitk_scope): not bit-exact against the
+    // unsplit sum, which a batch of concurrent requests never was. A single
+    // lane keeps the unsplit kernels. The launches happen inside
+    // graph_compute, so the scope closes after it.
+    const bool splitk_scope = spec_count >= 2;
+    if (splitk_scope) {
+        ggml_backend_cuda_set_mmq_splitk_scope(true);
+    }
+    const ggml_status verify_status =
+        ggml_backend_graph_compute(b_.target_backend_, graph.gf);
+    if (splitk_scope) {
+        ggml_backend_cuda_set_mmq_splitk_scope(false);
+    }
+    if (verify_status != GGML_STATUS_SUCCESS) {
         result.error = "fixed chain target compute failed";
         return result;
     }

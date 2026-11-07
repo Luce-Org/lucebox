@@ -163,7 +163,9 @@ for type in BIG_TILE_TYPES:
 # MMQ tile twins (mmq_tile_twins.h): narrower row tiles that mmq.cu picks on
 # RDNA4 for 16 or fewer columns, and for the 17-48 column calls its measured
 # policy assigns. Only x-tiles 16, 32 and 48 and their tiled launch are
-# compiled (no stream-k fixup), with device code for RDNA4 targets only.
+# compiled (no stream-k fixup), with device code for RDNA4 targets only. The
+# 64-row twins also compile the prefetching kernel (mul_mat_q_case_xn_pf),
+# which serves their 17-48 column calls.
 TILE_TWINS = {
     # 64-row/4-warp for IQ3_S and IQ3_XXS, whose parent instances keep the
     # 128-row/8-warp RDNA tile (Q3_K, IQ2_S, IQ2_XS and Q2_K measured slower
@@ -174,7 +176,7 @@ TILE_TWINS = {
         "types": [
             "GGML_TYPE_IQ3_S", "GGML_TYPE_IQ3_XXS",
             # 17-48 column calls only (the x16 gate does not use them).
-            "GGML_TYPE_Q5_K", "GGML_TYPE_Q3_K", "GGML_TYPE_IQ2_S",
+            "GGML_TYPE_IQ4_XS", "GGML_TYPE_Q5_K", "GGML_TYPE_Q3_K", "GGML_TYPE_IQ2_S",
         ],
     },
     # 32-row/2-warp for outputs of <= 6144 rows, for the
@@ -235,7 +237,7 @@ bool mul_mat_q_case_rows{rows}_{name}_xn(ggml_backend_cuda_context & ctx, const 
     std::memcpy(&twin_args, args, sizeof(twin_args));
     return luce_mmq_twin_rows{rows}::mul_mat_q_case_xn<{type}>(ctx, twin_args, stream, mmq_x);
 }}
-#else
+{pf}#else
 bool mul_mat_q_case_rows{rows}_{name}(ggml_backend_cuda_context &, const void *, cudaStream_t) {{
     return false;
 }}
@@ -243,16 +245,36 @@ bool mul_mat_q_case_rows{rows}_{name}(ggml_backend_cuda_context &, const void *,
 bool mul_mat_q_case_rows{rows}_{name}_xn(ggml_backend_cuda_context &, const void *, cudaStream_t, int) {{
     return false;
 }}
-#endif // defined(GGML_USE_HIP)
+{pf_stub}#endif // defined(GGML_USE_HIP)
+"""
+
+SOURCE_MMQ_TWIN_PF = """
+// This twin through the prefetching kernel at x-tile 16, 32 or 48 (mmq.cu).
+bool mul_mat_q_case_rows{rows}_{name}_xn_pf(ggml_backend_cuda_context & ctx, const void * args, cudaStream_t stream,
+                                            int mmq_x) {{
+    using twin_args_t = luce_mmq_twin_rows{rows}::mmq_args;
+    twin_args_t twin_args;
+    std::memcpy(&twin_args, args, sizeof(twin_args));
+    return luce_mmq_twin_rows{rows}::mul_mat_q_case_xn_pf<{type}>(ctx, twin_args, stream, mmq_x);
+}}
+"""
+
+SOURCE_MMQ_TWIN_PF_STUB = """
+bool mul_mat_q_case_rows{rows}_{name}_xn_pf(ggml_backend_cuda_context &, const void *, cudaStream_t, int) {{
+    return false;
+}}
 """
 
 for rows, twin in TILE_TWINS.items():
     for type in twin["types"]:
         name = type.replace("GGML_TYPE_", "").lower()
         with open(f"mmq-instance-{name}-rows{rows}.cu", "w") as f:
+            fmt = dict(rows=rows, warps=rows // 16, name=name, type=type)
             f.write(SOURCE_MMQ_TWIN.format(
-                rows=rows, warps=rows // 16, name=name, type=type,
-                macros=twin["macros"]))
+                macros=twin["macros"],
+                pf=SOURCE_MMQ_TWIN_PF.format(**fmt) if rows == 64 else "",
+                pf_stub=SOURCE_MMQ_TWIN_PF_STUB.format(**fmt) if rows == 64 else "",
+                **fmt))
 
 for type in range(1, 17):
     with open(f"mmf-instance-ncols_{type}.cu", "w") as f:

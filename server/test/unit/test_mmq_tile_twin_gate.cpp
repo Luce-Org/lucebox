@@ -170,8 +170,8 @@ TEST_CASE(MmqTwinGate, wide_calls_take_the_measured_tile) {
         {GGML_TYPE_Q4_K,    1024,   24, mmq_twin_tile::rows32, 16},
         {GGML_TYPE_Q6_K,    1280,   48, mmq_twin_tile::rows32, 16},
         {GGML_TYPE_Q8_0,    5120,   32, mmq_twin_tile::parent, 16},
-        {GGML_TYPE_IQ4_XS,  5120,   32, mmq_twin_tile::parent, 16},
-        {GGML_TYPE_IQ4_XS,  17408,  48, mmq_twin_tile::parent, 16},
+        {GGML_TYPE_IQ4_XS,  5120,   32, mmq_twin_tile::rows64, 48},
+        {GGML_TYPE_IQ4_XS,  17408,  48, mmq_twin_tile::rows64, 48},
         {GGML_TYPE_IQ2_XS,  5120,   32, mmq_twin_tile::parent, 16},
     };
     for (const Want & w : wants) {
