@@ -1230,9 +1230,6 @@ int resolve_max_output_tokens(const json & body, int default_max_tokens) {
     return default_max_tokens;
 }
 
-bool ppp_prefers_tools_boundary(bool ppp_enabled, bool has_tools) {
-    return ppp_enabled && has_tools;
-}
 
 AgentTurnCacheChoice resolve_agent_turn_cache(
         std::optional<bool> requested, bool single_sequence,
@@ -1701,6 +1698,28 @@ static uint64_t disk_cache_ttl_seconds(double hours) {
     return secs < 1.0 ? 1 : (uint64_t)std::llround(secs);
 }
 
+// The token identity pins are kept under: the vocabulary and the prompt
+// format (chat template, codec). The KV salt covers the rest; a pin outlives
+// a change of it and is warmed again.
+static std::string shared_prefix_identity(const ServerConfig & cfg, const Tokenizer & tokenizer) {
+    std::string buf;
+    for (int32_t id = 0; id < tokenizer.vocab_size(); ++id) {
+        buf += tokenizer.raw_token(id);
+        buf.push_back('\0');
+    }
+    buf += "\x01template:" + cfg.chat_template_src;
+    if (const auto codec = make_chat_codec(cfg.chat_codec)) buf += "\x01codec:" + codec->id();
+    uint8_t digest[20] = {};
+    sha1_hash(buf.data(), buf.size(), digest);
+    static const char * hex = "0123456789abcdef";
+    std::string out;
+    for (int i = 0; i < 8; ++i) {
+        out.push_back(hex[digest[i] >> 4]);
+        out.push_back(hex[digest[i] & 15]);
+    }
+    return out;
+}
+
 static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg) {
     std::array<uint8_t, 16> salt{};
     if (cfg.model_path.empty()) return salt;
@@ -2089,34 +2108,58 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         std::fflush(stderr);
     }
 
-    // PPP env overrides (operator-facing; no CLI flags required).
+    // The PPP env vars: the old names of --shared-prefix and its constants
+    // are read for one release; the opt-in DiffPin rewrite keeps its own.
     auto env_truthy = [](const char * v) -> bool {
         if (!v || !*v) return false;
         return !(v[0] == '0' && v[1] == '\0') &&
                !(v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
     };
     if (const char * e = std::getenv("LUCE_PPP")) {
-        config_.ppp_enabled = env_truthy(e);
-    }
-    if (const char * e = std::getenv("LUCE_PPP_REARRANGE")) {
-        config_.ppp_rearrange = env_truthy(e);
+        if (!env_truthy(e)) config_.shared_prefix = SharedPrefixMode::off;
+        std::fprintf(stderr, "[shared-prefix] LUCE_PPP is deprecated: use --shared-prefix %s\n",
+                     shared_prefix_mode_name(config_.shared_prefix));
     }
     if (const char * e = std::getenv("LUCE_PPP_LCP_WINDOW")) {
         const int n = std::atoi(e);
-        if (n > 0) config_.ppp_lcp_window = n;
+        if (n > 0) config_.shared_prefix_ring = n;
+        std::fprintf(stderr, "[shared-prefix] LUCE_PPP_LCP_WINDOW is deprecated (ring of %d)\n",
+                     config_.shared_prefix_ring);
     }
     if (const char * e = std::getenv("LUCE_PPP_MIN_PIN_TOKENS")) {
         const int n = std::atoi(e);
-        if (n > 0) config_.ppp_min_pin_tokens = n;
+        if (n > 0) config_.shared_prefix_min_tokens = n;
+        std::fprintf(stderr, "[shared-prefix] LUCE_PPP_MIN_PIN_TOKENS is deprecated (min %d tokens)\n",
+                     config_.shared_prefix_min_tokens);
+    }
+    if (const char * e = std::getenv("LUCE_PPP_REARRANGE")) {
+        config_.ppp_rearrange = env_truthy(e);
     }
     if (const char * e = std::getenv("LUCE_PPP_MAX_EPHEMERAL")) {
         const int n = std::atoi(e);
         if (n > 0) config_.ppp_max_ephemeral_tokens = n;
     }
+    shared_prefixes_ = SharedPrefixes(
+        config_.shared_prefix, newline_token_ids(tokenizer_),
+        config_.shared_prefix_min_tokens, config_.shared_prefix_ring);
+    // The pins of this model's token identity (tokenizer and chat template),
+    // with the ring, so cuts and pins survive a restart.
+    if (shared_prefixes_.on()) {
+        const std::string pins_path = disk_cache_.disabled() ? std::string()
+            : config_.disk_cache_dir + "/pins/" + shared_prefix_identity(config_, tokenizer_) + ".json";
+        shared_prefix_pins_ = PrefixPins::open(pins_path, PrefixPins::Limits{});
+        shared_prefixes_.set_ring(shared_prefix_pins_->ring());
+        if (shared_prefix_pins_->size() > 0 || !shared_prefixes_.ring().empty()) {
+            std::fprintf(stderr, "[shared-prefix] %zu pins and %zu prefix regions from %s\n",
+                         shared_prefix_pins_->size(), shared_prefixes_.ring().size(),
+                         pins_path.c_str());
+        }
+        kv_cache_.attach_shared_prefixes(shared_prefixes_, *shared_prefix_pins_);
+    }
     std::fprintf(stderr,
-        "[ppp] enabled=%d rearrange=%d lcp_window=%d min_pin=%d max_ephemeral=%d\n",
-        (int)config_.ppp_enabled, (int)config_.ppp_rearrange,
-        config_.ppp_lcp_window, config_.ppp_min_pin_tokens,
+        "[shared-prefix] mode=%s ring=%d min=%d rearrange=%d max_ephemeral=%d\n",
+        shared_prefix_mode_name(config_.shared_prefix), shared_prefixes_.ring_size(),
+        shared_prefixes_.min_tokens(), (int)config_.ppp_rearrange,
         config_.ppp_max_ephemeral_tokens);
 }
 
@@ -2558,7 +2601,12 @@ void HttpServer::handle_client(SocketHandle fd) {
             json body = hr.path == "/props"
                 ? build_props_body(config_, prefix_cache_, tool_memory_)
                 : status_.to_json();
-            if (hr.path == "/props") body["memory"] = memory_json();
+            if (hr.path == "/props") {
+                body["memory"] = memory_json();
+                body["shared_prefixes"] = {
+                    {"mode", shared_prefix_mode_name(config_.shared_prefix)},
+                    {"pins", shared_prefix_pins_ ? shared_prefix_pins_->size() : 0}};
+            }
             if (hr.path == "/props" && body.contains("pflash") &&
                 body["pflash"].value("enabled", false)) {
                 body["pflash"]["failures"] = pflash_failure_counters_json();
@@ -2582,6 +2630,9 @@ void HttpServer::handle_client(SocketHandle fd) {
     if (hr.method == "GET" && hr.path == "/props") {
         json body = build_props_body(config_, prefix_cache_, tool_memory_);
         body["memory"] = memory_json();
+        body["shared_prefixes"] = {
+            {"mode", shared_prefix_mode_name(config_.shared_prefix)},
+            {"pins", shared_prefix_pins_ ? shared_prefix_pins_->size() : 0}};
         if (body.contains("pflash") && body["pflash"].value("enabled", false)) {
             body["pflash"]["failures"] = pflash_failure_counters_json();
             if (auto unified = pflash_unified_json(); !unified.is_null()) {
@@ -2649,6 +2700,38 @@ void HttpServer::handle_client(SocketHandle fd) {
     }
 
     // Models endpoint (including the existing Codex discovery schema).
+    // Shared prefixes (kv/prefix_pins.h): list the pins, or drop one.
+    static const std::string kSharedPrefixes = "/v1/cache/shared-prefixes";
+    if (hr.path == kSharedPrefixes && hr.method == "GET") {
+        json data = shared_prefixes_json();
+        for (const auto & routed : models_) {
+            if (routed.server == this) continue;
+            for (auto pin : routed.server->shared_prefixes_json()) {
+                pin["model"] = routed.server->config_.model_name;
+                data.push_back(std::move(pin));
+            }
+        }
+        send_response(fd, 200, "application/json",
+                      json{{"object", "list"}, {"data", data}}.dump() + "\n");
+        socket_close(fd);
+        return;
+    }
+    if (hr.method == "DELETE" && hr.path.rfind(kSharedPrefixes + "/", 0) == 0) {
+        const std::string id = hr.path.substr(kSharedPrefixes.size() + 1);
+        bool removed = kv_cache_.unpin(id);
+        for (const auto & routed : models_) {
+            if (routed.server != this) removed = routed.server->kv_cache_.unpin(id) || removed;
+        }
+        if (removed) {
+            send_response(fd, 200, "application/json",
+                          json{{"id", id}, {"object", "shared_prefix"}, {"deleted", true}}.dump() + "\n");
+        } else {
+            send_error(fd, 404, "no shared prefix " + id);
+        }
+        socket_close(fd);
+        return;
+    }
+
     if (hr.method == "GET" && hr.path == "/v1/models") {
         const bool codex_schema = hr.query.find("client_version") != std::string::npos;
         json response = model_list(config_, codex_schema);
@@ -3502,6 +3585,15 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
 
     ParsedRequest req;
     bool count_tokens_only = false;
+    // "claude-cli/2.1.317 (external, cli)" -> "claude-cli".
+    // The User-Agent's product token, kept to token characters (RFC 9110)
+    // and 64 of them: it is stored in the pin catalog and served as JSON.
+    req.client.clear();
+    for (const char ch : hr.user_agent.substr(0, hr.user_agent.find_first_of("/ "))) {
+        const unsigned char c = (unsigned char)ch;
+        if (req.client.size() >= 64) break;
+        if (std::isalnum(c) || std::strchr("!#$%&'*+-.^_`|~", c)) req.client.push_back(ch);
+    }
     try {
         req.raw_body = json::parse(hr.body);
         req.output_format = http_detail::request_output_format(hr.body);
@@ -3584,7 +3676,7 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         // PPP rearrange (optional): peel ephemeral system banners into a
         // following system message so the first chat boundary is stable.
         std::vector<ChatMessage> render_messages = chat_messages;
-        if (encoded_images.empty() && config_.ppp_enabled && config_.ppp_rearrange && !req.tools.empty()) {
+        if (encoded_images.empty() && shared_prefixes_.on() && config_.ppp_rearrange && !req.tools.empty()) {
             auto layout = PinFriendlyPrompt::rearrange(chat_messages, true);
             if (layout.rearranged) {
                 render_messages = std::move(layout.messages);
@@ -3757,7 +3849,8 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
                                        int & status, std::string & body,
                                        SocketHandle client_fd, bool * dropped_tool_call,
                                        bool note_pass,
-                                       const nlohmann::ordered_json * ordered_tools) {
+                                       const nlohmann::ordered_json * ordered_tools,
+                                       const std::string & client) {
     SocketHandle pair[2];
     if (!create_socket_pair(pair)) {
         status = 500;
@@ -3795,6 +3888,7 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
         inner.raw_body = request;
         inner.output_format = http_detail::request_output_format(request.dump());
         parse_endpoint_request("/v1/chat/completions", inner.raw_body, inner, count_only);
+        inner.client = client;
         auto dropped = std::make_shared<bool>(false);
         inner.dropped_tool_call_out = dropped;
         if (ordered_tools && ordered_tools->is_array() && inner.raw_body.contains("tools") &&
@@ -3855,7 +3949,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         std::string raw;
         bool dropped_here = false;
         if (!inner_chat_completion(body, nullptr, status, raw, fd, &dropped_here,
-                                   /*note_pass=*/true, &req.ordered_tools) ||
+                                   /*note_pass=*/true, &req.ordered_tools, req.client) ||
             status != 200) {
             return false;
         }
@@ -3868,7 +3962,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
     std::string raw;
     bool dropped_call = false;
     if (!inner_chat_completion(request, admission, status, raw, fd, &dropped_call,
-                               /*note_pass=*/false, &req.ordered_tools)) {
+                               /*note_pass=*/false, &req.ordered_tools, req.client)) {
         return true;
     }
     json response = json::parse(raw, nullptr, false);
@@ -6172,27 +6266,29 @@ KvLease HttpServer::prepare_generation_cache(
     request_session_slots_.clear();
     if (req.images) return {};
     auto & effective_prompt = prepared.tokens;
-    // Tool-heavy requests prefer the reusable system/tool boundary under eviction.
+    // Tool-heavy requests capture inline even on a miss.
     const bool prefer_inline_snap = !req.tools.empty();
+    const auto boundaries = find_all_boundaries(
+        effective_prompt, prefix_cache_.chat_markers());
+    // A request with tools or a long enough prefix before its first user
+    // turn captures that head first (shared_prefixes_).
     const bool prefer_tools_boundary =
-        ppp_prefers_tools_boundary(config_.ppp_enabled, prefer_inline_snap);
+        shared_prefixes_.prefers_head(boundaries, prefer_inline_snap);
     int forced_cut = req.pin_end_token;
     if (forced_cut <= 0) forced_cut = prepared.snapshot_cut;
 
-    // PPP runs *before* lookup. Default (rearrange=0): annotate a sticky
-    // pin_end only — never mutate tokens. Token-level DiffPin rewrite
-    // (prefix|suffix|middle float) is opt-in via LUCE_PPP_REARRANGE=1;
-    // unconstrained middle peels can scramble tool-schema JSON and yield
-    // empty post-tool completions.
+    // The shared-prefix cut runs *before* lookup and never mutates tokens.
+    // The token-level DiffPin rewrite (prefix|suffix|middle float) is opt-in
+    // via LUCE_PPP_REARRANGE=1; unconstrained middle peels can scramble
+    // tool-schema JSON and yield empty post-tool completions.
     bool ppp_rewrote = false;
-    if (config_.ppp_enabled && prefer_tools_boundary) {
-        const auto boundaries = find_all_boundaries(
-            effective_prompt, prefix_cache_.chat_markers());
+    bool learned_cut = false;
+    if (prefer_tools_boundary) {
         if (config_.ppp_rearrange) {
             auto rewrite = PinFriendlyPrompt::diff_make_pin_friendly(
-                effective_prompt, boundaries, recent_tool_prefixes_,
+                effective_prompt, boundaries, shared_prefixes_.ring(),
                 prefix_cache_.chat_markers(),
-                config_.ppp_lcp_window, config_.ppp_min_pin_tokens,
+                shared_prefixes_.ring_size(), shared_prefixes_.min_tokens(),
                 config_.ppp_max_ephemeral_tokens);
             if (rewrite.rewritten) {
                 effective_prompt = std::move(rewrite.tokens);
@@ -6211,25 +6307,19 @@ KvLease HttpServer::prepare_generation_cache(
                     forced_cut, effective_prompt.size());
             }
         } else if (forced_cut <= 0) {
-            forced_cut = PinFriendlyPrompt::annotate_pin_end(
-                effective_prompt, boundaries, recent_tool_prefixes_,
-                config_.ppp_lcp_window, config_.ppp_min_pin_tokens);
+            forced_cut = shared_prefixes_.cut(effective_prompt, boundaries);
+            learned_cut = forced_cut > 0;
             if (forced_cut > 0) {
-                std::fprintf(stderr,
-                    "[ppp] pin_end=%d (pin-only; prompt=%zu)\n",
-                    forced_cut, effective_prompt.size());
+                std::fprintf(stderr, "[shared-prefix] cut=%d prompt=%zu\n",
+                             forced_cut, effective_prompt.size());
             }
         }
         const auto & remember_ids = ppp_tool_prefix_source(
             prepared.compressed, req.prompt_tokens, effective_prompt);
-        const auto remember_bounds = find_all_boundaries(
-            remember_ids, prefix_cache_.chat_markers());
-        const int remember_n = !remember_bounds.empty()
-            ? remember_bounds.front()
-            : (int)remember_ids.size();
-        PinFriendlyPrompt::remember_tool_prefix(
-            recent_tool_prefixes_, remember_ids, remember_n,
-            config_.ppp_lcp_window);
+        kv_cache_.remember_prefix(
+            remember_ids, &remember_ids == &effective_prompt
+                ? boundaries
+                : find_all_boundaries(remember_ids, prefix_cache_.chat_markers()));
     }
 
     // A compressed prompt is not raw history: only a Full-scope policy keeps its disk entry.
@@ -6248,12 +6338,14 @@ KvLease HttpServer::prepare_generation_cache(
     match.compressed = prepared.compressed;
     match.unified_view = prepared.unified_view;
     match.forced_cut = forced_cut;
+    match.client = &req.client;
     KvLease cache = kv_cache_.match(match);
 
     KvAdmitQuery admit;
     admit.capture_inline = prefer_inline_snap;
     admit.prefer_head = prefer_tools_boundary;
     admit.forced_cut = forced_cut;
+    admit.learned_cut = learned_cut;
     admit.keep_checkpoints = !req.tool_checks_note;
     admit.agent_step = !req.tool_checks_pass && req.ends_with_tool_result;
     kv_cache_.admit(cache, effective_prompt, req.prompt_tokens, admit, generate_request);
@@ -6386,6 +6478,32 @@ void HttpServer::record_session_aux(const ParsedRequest & req,
         }
         prefix_cache_.set_aux(slot, blob);
     }
+}
+
+size_t HttpServer::shared_prefix_ram_cap(size_t full_bytes) const {
+    const size_t budget = prefix_cache_.stats().max_resident_bytes;
+    if (full_bytes == 0) return budget;
+    if (budget == 0) return full_bytes;
+    return budget > 2 * full_bytes ? std::min(full_bytes, budget - 2 * full_bytes) : 0;
+}
+
+json HttpServer::shared_prefixes_json() const {
+    json out = json::array();
+    if (!shared_prefix_pins_) return out;
+    for (const auto & pin : shared_prefix_pins_->list()) {
+        json files = json::array();
+        for (const auto & file : pin.files) {
+            files.push_back({{"layout", file.layout}, {"tokens", file.disk_tokens},
+                             {"path", file.path}, {"bytes", file.bytes},
+                             {"last_hit", file.last_hit}});
+        }
+        out.push_back({{"id", pin.id}, {"object", "shared_prefix"},
+                       {"tokens", pin.tokens.size()}, {"source", pin.source},
+                       {"client", pin.client}, {"bytes", pin.bytes()},
+                       {"hits", pin.hits}, {"created", pin.created},
+                       {"last_hit", pin.last_hit}, {"files", std::move(files)}});
+    }
+    return out;
 }
 
 void HttpServer::flush_sessions_to_disk(const char * reason) {
@@ -7005,6 +7123,9 @@ void HttpServer::send_nonstream_response(
 
 void HttpServer::worker_loop() {
     publish_memory_report();
+    // The pins' disk marks checked against the catalog; a pinned head is
+    // then served by disk hits.
+    kv_cache_.load_pins(0, config_.max_ctx);
     while (true) {
         ServerJob * job = dequeue();
         if (!job) break;  // stopping
@@ -7379,6 +7500,8 @@ void HttpServer::process_job(ServerJob * job) {
         visible_output_seen, client_disconnected,
         /*replay_cache=*/true);
     record_session_aux(req, emitter);
+    // Prefixes pinned by this request reach disk after its response.
+    kv_cache_.flush_pins();
 
     if (client_disconnected) {
         std::fprintf(stderr, "[server] client disconnected — generation aborted "
@@ -7551,6 +7674,13 @@ bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
         std::string lower_headers = headers;
         std::transform(lower_headers.begin(), lower_headers.end(),
                        lower_headers.begin(), ::tolower);
+        const size_t ua_pos = lower_headers.find("\r\nuser-agent:");
+        if (ua_pos != std::string::npos) {
+            size_t start = ua_pos + 13;
+            while (start < headers.size() && headers[start] == ' ') ++start;
+            const size_t end = headers.find("\r\n", start);
+            out.user_agent = headers.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        }
         size_t cl_pos = lower_headers.find("content-length:");
         if (cl_pos != std::string::npos) {
             size_t val_start = cl_pos + 15;

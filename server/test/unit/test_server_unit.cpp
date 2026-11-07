@@ -235,6 +235,16 @@ struct SchedulerTestHarness {
         server.flush_sessions_to_disk("shutdown");
     }
 
+    static void flush_pins(HttpServer & server) { server.kv_cache_.flush_pins(); }
+    static KvCache & kv_cache(HttpServer & server) { return server.kv_cache_; }
+    static PrefixPins & pins(HttpServer & server) { return *server.shared_prefix_pins_; }
+    static bool unpin(HttpServer & server, const std::string & id) {
+        return server.kv_cache_.unpin(id);
+    }
+    static void load_pins(HttpServer & server) {
+        server.kv_cache_.load_pins(size_t(1) << 30, server.config_.max_ctx);
+    }
+
     // What prepare_generation_cache does with a reservation's slot before
     // the new snapshot overwrites it.
     static void evict_inline_slot(HttpServer & server, int slot) {
@@ -5858,11 +5868,62 @@ TEST_CASE(ServerUnitFixture, test_forced_tools_pin_yields_to_deepen_after_restor
         boundaries, 100, 0, false, 110));
 }
 
-TEST_CASE(ServerUnitFixture, test_ppp_master_toggle_gates_tools_boundary_pinning) {
-    TEST_ASSERT(ppp_prefers_tools_boundary(true, true));
-    TEST_ASSERT(!ppp_prefers_tools_boundary(false, true));
-    TEST_ASSERT(!ppp_prefers_tools_boundary(true, false));
-    TEST_ASSERT(!ppp_prefers_tools_boundary(false, false));
+TEST_CASE(ServerUnitFixture, test_shared_prefix_mode_and_head_preference) {
+    SharedPrefixMode mode = SharedPrefixMode::off;
+    TEST_ASSERT(parse_shared_prefix_mode("auto", mode) && mode == SharedPrefixMode::learn);
+    TEST_ASSERT(parse_shared_prefix_mode("freeze", mode) && mode == SharedPrefixMode::freeze);
+    TEST_ASSERT(parse_shared_prefix_mode("off", mode) && mode == SharedPrefixMode::off);
+    TEST_ASSERT(!parse_shared_prefix_mode("maybe", mode));
+    TEST_ASSERT(std::string(shared_prefix_mode_name(SharedPrefixMode::learn)) == "auto");
+
+    const SharedPrefixes on(SharedPrefixMode::learn, {}, 4);
+    const SharedPrefixes off(SharedPrefixMode::off, {}, 4);
+    // With tools, or with a prefix before the first user turn of at least
+    // min_tokens; never when off.
+    TEST_ASSERT(on.prefers_head({2, 9}, true));
+    TEST_ASSERT(on.prefers_head({4, 9}, false));
+    TEST_ASSERT(!on.prefers_head({3, 9}, false));
+    TEST_ASSERT(!on.prefers_head({}, false));
+    TEST_ASSERT(!off.prefers_head({4, 9}, true));
+}
+
+// The cut is where a prompt agrees with a recent prefix region: at the
+// deepest chat boundary inside the agreement when it is far enough in, else
+// mid-message, backed off to the end of the last line.
+TEST_CASE(ServerUnitFixture, test_shared_prefix_cut_against_the_ring) {
+    std::vector<bool> newline(100, false);
+    newline[10] = true;  // token 10 ends a line
+    SharedPrefixes shared(SharedPrefixMode::learn, newline, 4, 2);
+    const std::vector<int32_t> a = {1, 2, 3, 10, 4, 5, 6, 7, 50, 51};
+    TEST_ASSERT(shared.cut(a, {8}) == 0);  // empty ring
+    shared.remember(a, {8});                // region a[0, 8)
+    TEST_ASSERT(shared.ring().size() == 1 && shared.ring()[0].size() == 8);
+
+    // Agrees for 7 tokens, no boundary inside: back off past the newline.
+    const std::vector<int32_t> b = {1, 2, 3, 10, 4, 5, 6, 9, 60};
+    TEST_ASSERT(shared.cut(b, {8}) == 4);
+    // A boundary inside the agreement, at least min_tokens in, wins.
+    TEST_ASSERT(shared.cut(b, {5, 8}) == 5);
+    // No newline at or past min_tokens: the raw agreement.
+    const std::vector<int32_t> c = {1, 2, 3, 11, 4, 5, 6, 9};
+    SharedPrefixes plain(SharedPrefixMode::learn, newline, 4, 2);
+    plain.remember({1, 2, 3, 11, 4, 5, 6, 7}, {});
+    TEST_ASSERT(plain.cut(c, {}) == 7);
+    // Agreeing on less than min_tokens is no cut.
+    TEST_ASSERT(shared.cut({1, 2, 3, 99}, {}) == 0);
+
+    // The ring keeps the newest regions; freeze learns nothing; off cuts nothing.
+    shared.remember({7, 7, 7, 7, 7}, {});
+    shared.remember({8, 8, 8, 8, 8}, {});
+    TEST_ASSERT(shared.ring().size() == 2 && shared.ring()[0][0] == 7);
+    SharedPrefixes frozen(SharedPrefixMode::freeze, newline, 4, 2);
+    frozen.set_ring({{1, 2, 3, 10, 4, 5, 6, 7}});
+    frozen.remember(a, {8});
+    TEST_ASSERT(frozen.ring().size() == 1);
+    TEST_ASSERT(frozen.cut(b, {8}) == 4);
+    SharedPrefixes none(SharedPrefixMode::off, newline, 4, 2);
+    none.set_ring({{1, 2, 3, 10, 4, 5, 6, 7}});
+    TEST_ASSERT(none.cut(b, {8}) == 0);
 }
 
 TEST_CASE(ServerUnitFixture, test_agent_turn_cache_defaults_on_where_it_can_run) {
@@ -14914,6 +14975,494 @@ TEST_CASE(ServerUnitFixture, test_disk_session_failed_init_keeps_ram_cache_worki
     unlink(path.c_str());
 }
 
+// "Another conversation" means the restoring prompt does not extend the
+// capturing prompt's history. Two conversations of one project open their
+// first user message alike (a harness's CLAUDE.md reminder or environment
+// context, far more than 32 tokens) and must still count as two.
+TEST_CASE(ServerUnitFixture, test_shared_prefix_another_conversation_by_extension) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(4, tokenizer, 0);
+    std::vector<int32_t> opening;  // the same first 40 tokens of every first user message
+    for (int i = 0; i < 40; ++i) opening.push_back(500 + i);
+    std::vector<int32_t> first = {1, 100, 3};
+    first.insert(first.end(), opening.begin(), opening.end());
+    std::vector<int32_t> other = first;
+    first.insert(first.end(), {600, 4});
+    other.insert(other.end(), {700, 4});
+    const auto bounds = find_all_boundaries(first, cache.chat_markers());
+    TEST_ASSERT(bounds.size() >= 2);
+    const int cut = bounds.front();
+    cache.confirm_inline_snap(0, cut, first, /*protect=*/true, 64);
+    TEST_ASSERT(cache.shared_prefix(0));
+
+    // The same conversation's next turn extends the capturing prompt.
+    std::vector<int32_t> next = first;
+    next.insert(next.end(), {800, 801, 3, 900, 4});
+    TEST_ASSERT(!cache.restored_by_another_conversation(0, next));
+    // Another conversation of the project: the same opening, then other words.
+    TEST_ASSERT(cache.restored_by_another_conversation(0, other));
+    // An edit that shortens the history counts too.
+    TEST_ASSERT(cache.restored_by_another_conversation(0, {1, 100, 3, 500, 4}));
+    // An entry that is not a shared prefix never does.
+    cache.confirm_inline_snap(1, (int)first.size(), first, /*protect=*/false, 64);
+    TEST_ASSERT(!cache.restored_by_another_conversation(1, next));
+    unlink(path.c_str());
+}
+
+// A shared prefix another conversation restores is pinned: its KV goes to
+// disk after the response, the pin is saved with the ring, a restart loads
+// it, and its file outlives the TTL. Its own conversation does not pin it.
+TEST_CASE(ServerUnitFixture, test_shared_prefix_pinned_on_restore_by_another_conversation) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_shared_prefix_pins").string();
+    rm_rf(dir);
+    const std::vector<int32_t> first = {1, 100, 3, 101};
+    // The head: up to the prompt's first chat boundary.
+    PrefixCache markers_only(1, tokenizer, 0);
+    const auto bounds = find_all_boundaries({1, 100, 3, 101, 4, 102}, markers_only.chat_markers());
+    TEST_ASSERT(!bounds.empty() && bounds.front() < 4);
+    const int cut = bounds.front();
+    const std::vector<int32_t> head(first.begin(), first.begin() + cut);
+    std::string pin_id;
+    {
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        auto & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, disk_session_config(dir));
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        // The head, captured as a shared prefix by the first conversation.
+        backend.slots[0] = DiskPayloadBackend::make(cut);
+        cache.confirm_inline_snap(0, cut, first, /*protect=*/true, 64);
+        SchedulerTestHarness::set_slot_tokens(server, 0, head);
+
+        // The same conversation's next turn restores it: no pin.
+        SchedulerTestHarness::prepare_cache(server, {1, 100, 3, 101, 4, 102});
+        SchedulerTestHarness::flush_pins(server);
+        TEST_ASSERT(SchedulerTestHarness::pins(server).size() == 0);
+        TEST_ASSERT(!cache.pinned(0));
+
+        // Another conversation restores it: pinned, written after the response.
+        const auto other = SchedulerTestHarness::prepare_cache(server, {1, 100, 3, 201, 4, 202});
+        TEST_ASSERT(other.restore_slot == 0);
+        TEST_ASSERT(cache.pinned(0));
+        SchedulerTestHarness::flush_pins(server);
+        auto & disk = SchedulerTestHarness::disk_cache(server);
+        disk.drain();
+        TEST_ASSERT(disk.contains(head));
+        const auto pins = SchedulerTestHarness::pins(server).list();
+        TEST_ASSERT(pins.size() == 1);
+        TEST_ASSERT(pins[0].tokens == head && pins[0].files.size() == 1);
+        TEST_ASSERT(pins[0].files[0].disk_tokens == cut && !pins[0].files[0].path.empty());
+        TEST_ASSERT(pins[0].files[0].layout == disk.layout_name());
+        TEST_ASSERT(pins[0].source == "learned");
+        pin_id = pins[0].id;
+        SchedulerTestHarness::flush_sessions(server);
+    }
+    {
+        // A restart reads the pin and the ring back. The pinned head is
+        // served by a disk hit, which counts as the pin's hit.
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, disk_session_config(dir));
+        TEST_ASSERT(SchedulerTestHarness::pins(server).size() == 1);
+        TEST_ASSERT(SchedulerTestHarness::pins(server).has(pin_id));
+        TEST_ASSERT(fs::exists(SchedulerTestHarness::pins(server).path()));
+        SchedulerTestHarness::load_pins(server);
+        TEST_ASSERT(SchedulerTestHarness::prefix_cache(server).slot_of(head) < 0);
+        TEST_ASSERT(!SchedulerTestHarness::kv_cache(server).warm_pending());
+        const uint64_t hits = SchedulerTestHarness::pins(server).get(pin_id)->hits;
+        const auto restored = SchedulerTestHarness::prepare_cache(server, {1, 100, 3, 301, 4, 302});
+        TEST_ASSERT(restored.restore_slot == ModelBackend::kMaxSlots - 1);  // staging
+        TEST_ASSERT(restored.prefix_len == cut);
+        TEST_ASSERT(SchedulerTestHarness::pins(server).get(pin_id)->hits == hits + 1);
+    }
+    {
+        // The pinned file outlives the TTL; the others do not.
+        MockBackendWithAdopt backend;
+        DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+        cfg.ttl_seconds = 3600;
+        DiskPrefixCache cache(cfg, backend);
+        const uint64_t later = (uint64_t)std::time(nullptr) + 30 * 24 * 3600;
+        cache.set_clock([later] { return later; });
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.entry_count() == 1);
+    }
+    {
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, disk_session_config(dir));
+        TEST_ASSERT(SchedulerTestHarness::unpin(server, pin_id));
+        TEST_ASSERT(!SchedulerTestHarness::unpin(server, pin_id));
+        TEST_ASSERT(SchedulerTestHarness::pins(server).size() == 0);
+    }
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+
+// At startup a pin longer than the context is not warmed (it stays for
+// settings that can serve it), the single-sequence path warms nothing, and a
+// pinned file of this layout no pin lists (a crash between the mark and the
+// catalog's save) is unpinned.
+TEST_CASE(ServerUnitFixture, test_shared_prefix_startup_skips_long_pins_and_stray_marks) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_shared_prefix_startup").string();
+    rm_rf(dir);
+    ServerConfig config = disk_session_config(dir);
+    config.max_ctx = 64;
+    const std::vector<int32_t> head = {1, 100, 3};
+    const std::vector<int32_t> stray = {1, 700, 3};
+    std::vector<int32_t> long_pin(100, 5);
+    long_pin[0] = 1;
+    {
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        auto & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, config);
+        auto & disk = SchedulerTestHarness::disk_cache(server);
+        backend.put(0, 3);
+        disk.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(disk.save(Checkpoint::of_cache_slot(0), head));
+        TEST_ASSERT(disk.save(Checkpoint::of_cache_slot(0), stray));
+        disk.drain();
+        SharedPrefixPin pin;
+        pin.tokens = head;
+        pin.files.push_back({disk.layout_name(), 3, disk.pin(head, true), 64, 0});
+        TEST_ASSERT(!pin.files[0].path.empty() && !disk.pin(stray, true).empty());
+        SharedPrefixPin longer;
+        longer.tokens = long_pin;
+        auto & pins = SchedulerTestHarness::pins(server);
+        TEST_ASSERT(pins.add(pin).empty() && pins.add(longer).empty());
+        TEST_ASSERT(pins.save(true));
+        TEST_ASSERT(disk.pinned_files().size() == 2);
+        SchedulerTestHarness::flush_sessions(server);
+    }
+    {
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, config);
+        auto & disk = SchedulerTestHarness::disk_cache(server);
+        SchedulerTestHarness::load_pins(server);
+        const auto marked = disk.pinned_files();
+        TEST_ASSERT(marked.size() == 1 && marked[0] == SchedulerTestHarness::pins(server)
+                        .get(PrefixPins::id_of(head))->files[0].path);
+        TEST_ASSERT(SchedulerTestHarness::prefix_cache(server).slot_of(head) < 0);
+        TEST_ASSERT(!SchedulerTestHarness::kv_cache(server).warm_pending());
+        TEST_ASSERT(SchedulerTestHarness::pins(server).has(PrefixPins::id_of(long_pin)));
+    }
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+
+// `freeze` keeps the pin set as it is: no pin expires, as none is added.
+TEST_CASE(ServerUnitFixture, test_shared_prefix_freeze_keeps_pins) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_shared_prefix_freeze").string();
+    rm_rf(dir);
+    std::string pins_path;
+    const auto serve = [&](SharedPrefixMode mode, size_t & before, size_t & after) {
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config = disk_session_config(dir);
+        config.shared_prefix = mode;
+        HttpServer server(engine, tokenizer, config);
+        pins_path = SchedulerTestHarness::pins(server).path();
+        before = SchedulerTestHarness::pins(server).size();
+        SchedulerTestHarness::flush_pins(server);
+        after = SchedulerTestHarness::pins(server).size();
+    };
+    size_t before = 0, after = 0;
+    serve(SharedPrefixMode::learn, before, after);
+    TEST_ASSERT(!pins_path.empty() && before == 0);
+    // A pin last hit long ago.
+    const auto write_old_pin = [&] {
+        fs::create_directories(fs::path(pins_path).parent_path());
+        std::ofstream(pins_path) << R"({"version":2,"ring":[],"pins":[{"tokens":[1,100,3],)"
+                                    R"("created":1,"last_hit":1,"hits":4,"files":[]}]})";
+    };
+    write_old_pin();
+    serve(SharedPrefixMode::freeze, before, after);
+    TEST_ASSERT(before == 1 && after == 1);
+    serve(SharedPrefixMode::learn, before, after);
+    TEST_ASSERT(before == 1 && after == 0);
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+
+// The pins catalog: one per path in a process (the models of one token
+// identity share it), one file per model layout, the caps, and a reload.
+TEST_CASE(ServerUnitFixture, test_prefix_pins_catalog) {
+    const std::string dir = test_tmp_path("luce_test_prefix_pins_catalog").string();
+    rm_rf(dir);
+    const std::string path = dir + "/pins/identity.json";
+    uint64_t now = 1000;
+    PrefixPins::Limits limits;
+    limits.max_pins = 2;
+    limits.max_files = 2;
+    limits.unpin_after_s = 100;
+    const auto file = [](const std::string & layout, int tokens, uint64_t bytes) {
+        SharedPrefixPin::File f;
+        f.layout = layout;
+        f.disk_tokens = tokens;
+        f.path = layout + "/x.dkv";
+        f.bytes = bytes;
+        return f;
+    };
+    const auto pin = [](std::vector<int32_t> tokens) {
+        SharedPrefixPin p;
+        p.tokens = std::move(tokens);
+        p.source = "learned";
+        return p;
+    };
+    const std::vector<int32_t> a = {1, 2, 3, 4};
+    const std::vector<int32_t> b = {1, 2, 9};
+    const std::vector<int32_t> c = {7, 7};
+    {
+        auto pins = PrefixPins::open(path, limits, [&] { return now; });
+        auto again = PrefixPins::open(dir + "/pins/../pins/identity.json", limits);
+        TEST_ASSERT(pins == again);  // one catalog per path
+
+        auto pa = pin(a);
+        pa.files.push_back(file("L1", 3, 10));
+        TEST_ASSERT(pins->add(pa).empty());
+        // The second model's file joins the same pin.
+        auto pa2 = pin(a);
+        now = 1010;
+        pa2.files.push_back(file("L2", 4, 20));
+        TEST_ASSERT(pins->add(pa2).empty());
+        TEST_ASSERT(pins->size() == 1);
+        auto got = pins->get(PrefixPins::id_of(a));
+        TEST_ASSERT(got && got->files.size() == 2 && got->bytes() == 30);
+        TEST_ASSERT(got->file_for("L1")->disk_tokens == 3 && got->file_for("L2")->disk_tokens == 4);
+        TEST_ASSERT(pins->find_by_disk_key({1, 2, 3}, "L1"));
+        TEST_ASSERT(!pins->find_by_disk_key({1, 2, 3}, "L2"));
+        TEST_ASSERT(pins->find_by_disk_key({1, 2, 3, 4}, "L2"));
+
+        // A third layout: the least recently hit file is dropped, the pin stays.
+        now = 1020;
+        pins->hit(PrefixPins::id_of(a), "L2");
+        auto pa3 = pin(a);
+        pa3.files.push_back(file("L3", 4, 5));
+        const auto dropped_file = pins->add(pa3);
+        TEST_ASSERT(dropped_file.size() == 1 && dropped_file[0].files.size() == 1);
+        TEST_ASSERT(dropped_file[0].files[0].layout == "L1");
+        TEST_ASSERT(pins->has(PrefixPins::id_of(a)));
+        TEST_ASSERT(!pins->get(PrefixPins::id_of(a))->file_for("L1"));
+
+        // Pins without a file (an engine without a disk tier) count too.
+        now = 1030;
+        TEST_ASSERT(pins->add(pin(b)).empty());
+        now = 1040;
+        const auto dropped_pin = pins->add(pin(c));  // over max_pins: a, least recently hit
+        TEST_ASSERT(dropped_pin.size() == 1 && dropped_pin[0].id == PrefixPins::id_of(a));
+        TEST_ASSERT(pins->size() == 2);
+
+        pins->set_ring({b, c});
+        TEST_ASSERT(pins->save());
+        TEST_ASSERT(!pins->due(0));
+        TEST_ASSERT(fs::exists(path));
+
+        // No hit for unpin_after seconds: dropped.
+        now = 1030 + 101;
+        const auto expired = pins->expire();
+        TEST_ASSERT(expired.size() == 1 && expired[0].id == PrefixPins::id_of(b));
+        TEST_ASSERT(pins->due(0));
+    }
+    {
+        // Closed by every model: the next open reads the file (as saved,
+        // before the expiry).
+        auto pins = PrefixPins::open(path, limits, [&] { return now; });
+        TEST_ASSERT(pins->size() == 2 && pins->has(PrefixPins::id_of(b)));
+        TEST_ASSERT(pins->ring().size() == 2 && pins->ring()[0] == b);
+        const auto list = pins->list();
+        TEST_ASSERT(list[0].id == PrefixPins::id_of(c));  // most recently hit first
+        TEST_ASSERT(pins->remove(PrefixPins::id_of(c)) && !pins->remove(PrefixPins::id_of(c)));
+    }
+    {
+        // In memory only.
+        auto mem = PrefixPins::open("", limits);
+        auto other = PrefixPins::open("", limits);
+        TEST_ASSERT(mem != other && mem->save());
+    }
+    {
+        // Two cuts saved at one chunk start share a file: dropping one pin
+        // leaves the file to the other; dropping both releases it.
+        auto pins = PrefixPins::open("", PrefixPins::Limits{}, [&] { return now; });
+        const std::vector<int32_t> p1 = {5, 6, 7, 8}, p2 = {5, 6, 7, 9};
+        auto a1 = pin(p1), a2 = pin(p2);
+        a1.files.push_back(file("L1", 3, 10));
+        a2.files.push_back(file("L1", 3, 10));
+        TEST_ASSERT(pins->add(a1).empty() && pins->add(a2).empty());
+        const auto first = pins->remove(PrefixPins::id_of(p1));
+        TEST_ASSERT(first && first->files.empty());
+        const auto second = pins->remove(PrefixPins::id_of(p2));
+        TEST_ASSERT(second && second->files.size() == 1 && second->files[0].path == "L1/x.dkv");
+
+        // A warm's file goes only into a pin still listed.
+        TEST_ASSERT(!pins->attach(PrefixPins::id_of(p1), file("L1", 3, 10)));
+        TEST_ASSERT(pins->size() == 0);
+        TEST_ASSERT(pins->add(pin(p1)).empty());
+        const auto attached = pins->attach(PrefixPins::id_of(p1), file("L1", 3, 10));
+        TEST_ASSERT(attached && attached->empty());
+        TEST_ASSERT(pins->get(PrefixPins::id_of(p1))->file_for("L1"));
+
+        // A layout's file replaced by another: the old one is released.
+        auto moved = file("L1", 2, 8);
+        moved.path = "L1/y.dkv";
+        const auto replaced = pins->attach(PrefixPins::id_of(p1), moved);
+        TEST_ASSERT(replaced && replaced->size() == 1 && replaced->front().files.size() == 1);
+        TEST_ASSERT(replaced->front().files[0].path == "L1/x.dkv");
+        TEST_ASSERT(pins->get(PrefixPins::id_of(p1))->file_for("L1")->path == "L1/y.dkv");
+    }
+    {
+        // A client string that is not UTF-8 is saved (replaced), not thrown;
+        // a malformed entry is skipped on load, not the whole catalog.
+        const std::string bad_path = dir + "/pins/bad.json";
+        {
+            auto pins = PrefixPins::open(bad_path, PrefixPins::Limits{}, [&] { return now; });
+            auto odd = pin({9, 9, 9});
+            odd.client = std::string("cli\xff\xfe");
+            TEST_ASSERT(pins->add(odd).empty());
+            TEST_ASSERT(pins->save(true));
+        }
+        {
+            auto pins = PrefixPins::open(bad_path, PrefixPins::Limits{});
+            TEST_ASSERT(pins->size() == 1 && pins->has(PrefixPins::id_of({9, 9, 9})));
+        }
+        {
+            std::ofstream out(bad_path, std::ios::trunc);
+            out << R"({"version":2,"ring":[],"pins":[{"tokens":"oops"},{"tokens":[4,5,6],"hits":2}]})";
+        }
+        auto pins = PrefixPins::open(bad_path, PrefixPins::Limits{});
+        TEST_ASSERT(pins->size() == 1 && pins->has(PrefixPins::id_of({4, 5, 6})));
+    }
+    rm_rf(dir);
+}
+
+// A pin deleted over HTTP (any thread) leaves its RAM entry unpinned at the
+// next flush_pins, run on the cache's own thread.
+TEST_CASE(ServerUnitFixture, test_shared_prefix_delete_unpins_ram_entry) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_shared_prefix_delete").string();
+    rm_rf(dir);
+    {
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        auto & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, disk_session_config(dir));
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        const std::vector<int32_t> head = {1, 100, 3};
+        backend.slots[0] = DiskPayloadBackend::make(3);
+        cache.confirm_inline_snap(0, 3, {1, 100, 3, 101}, /*protect=*/true, 64);
+        SharedPrefixPin pin;
+        pin.tokens = head;
+        TEST_ASSERT(SchedulerTestHarness::pins(server).add(pin).empty());
+        cache.set_pinned(0, true);
+        SchedulerTestHarness::flush_pins(server);
+        TEST_ASSERT(cache.pinned(0));  // still listed
+        TEST_ASSERT(SchedulerTestHarness::unpin(server, PrefixPins::id_of(head)));
+        SchedulerTestHarness::flush_pins(server);
+        TEST_ASSERT(!cache.pinned(0) && cache.slot_of(head) == 0);
+    }
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+
+// A pinned file on disk: kept by ancestor pruning and by the budget, and
+// its bit survives a restart.
+TEST_CASE(ServerUnitFixture, test_disk_pinned_files) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_pinned_files").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    const auto turn3 = disk_test_key(60);
+    const std::vector<int32_t> head(turn3.begin(), turn3.begin() + 40);
+    const std::vector<int32_t> turn2(turn3.begin(), turn3.begin() + 48);
+    std::string pinned_path;
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), head));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), turn2));
+        // Pinned while still queued: the writer writes the bit.
+        pinned_path = cache.pin(turn2, true);
+        TEST_ASSERT(!pinned_path.empty() && pinned_path.find(cache.layout_name() + "/") == 0);
+        TEST_ASSERT(cache.pin({5, 5, 5}, true).empty());  // no such file
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), turn3));
+        cache.drain();
+        // turn2 is an ancestor of turn3 above keep_max, but pinned.
+        TEST_ASSERT(cache.prune_ancestors(turn3, 40) == 0);
+        TEST_ASSERT(cache.entry_count() == 3);
+    }
+    {
+        cfg.ttl_seconds = 3600;
+        DiskPrefixCache cache(cfg, backend);
+        const uint64_t later = (uint64_t)std::time(nullptr) + 30 * 24 * 3600;
+        cache.set_clock([later] { return later; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        // Past the TTL only the pinned file is left; its bit was read back.
+        TEST_ASSERT(cache.entry_count() == 1 && cache.contains(turn2));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), head));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), turn3));
+        cache.drain();
+        TEST_ASSERT(cache.prune_ancestors(turn3, 40) == 0);
+        // Unpinned, it is an ancestor like any other.
+        cache.unpin_file(pinned_path);
+        TEST_ASSERT(cache.prune_ancestors(turn3, 40) == 1);
+        TEST_ASSERT(!cache.contains(turn2) && cache.contains(head));
+    }
+    rm_rf(dir);
+    cfg.ttl_seconds = 0;
+    // The budget evicts unpinned files only; a save that would need a
+    // pinned file's room is skipped.
+    uint64_t one = 0;
+    {
+        DiskPrefixCache sizing(cfg, backend);
+        TEST_ASSERT(sizing.init());
+        sizing.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(sizing.save(Checkpoint::of_cache_slot(0), head));
+        sizing.drain();
+        one = sizing.total_bytes();
+        TEST_ASSERT(one > 0 && !sizing.pin(head, true).empty());
+    }
+    {
+        cfg.budget_bytes = (size_t)(one + one / 2);  // the pinned file and half another
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_free_space_probe([] { return (uint64_t)1 << 40; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(cache.contains(head));
+        TEST_ASSERT(!cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 3000)));
+        TEST_ASSERT(cache.contains(head) && cache.entry_count() == 1);
+    }
+    {
+        cfg.budget_bytes = (size_t)(2 * one + one / 2);  // the pinned file and one more
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_free_space_probe([] { return (uint64_t)1 << 40; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 3000)));
+        cache.drain();
+        // The next one replaces the unpinned file, never the pinned one.
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 4000)));
+        cache.drain();
+        TEST_ASSERT(cache.contains(head) && cache.contains(disk_test_key(40, 4000)));
+        TEST_ASSERT(!cache.contains(disk_test_key(40, 3000)) && cache.entry_count() == 2);
+    }
+    rm_rf(dir);
+}
+
 // Persist-on-evict policy: every conversation's newest snapshot and the
 // shared heads are written; a previous turn kept only as an edit backup is
 // not, while its conversation's deeper snapshot is resident.
@@ -15802,6 +16351,86 @@ TEST_CASE(ServerUnitFixture, test_concurrent_capture_frees_displaced_without_dis
 
     TEST_ASSERT(abc);
     TEST_ASSERT(backend.displaced.empty());
+    unlink(path.c_str());
+}
+
+// Concurrent serving: a pin with no KV for these settings (token ids only)
+// is warmed on the engine at idle: captured into RAM at its cut, written to
+// disk and pinned, and a later request on that head restores from it.
+TEST_CASE(ServerUnitFixture, test_shared_prefix_concurrent_warm) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_shared_prefix_paged_warm").string();
+    rm_rf(dir);
+
+    auto backend_owner = std::make_unique<DiskCheckpointBackend>();
+    DiskCheckpointBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config = disk_session_config(dir);
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 2;
+    config.concurrent_prefix_cache_max_bytes = 4096;
+    config.concurrent_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    config.shared_prefix_warm_grace_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+    PrefixPins & pins = SchedulerTestHarness::pins(server);
+    const std::vector<int32_t> head = {1, 500, 3};
+    SharedPrefixPin pin;
+    pin.tokens = head;
+    TEST_ASSERT(pins.add(pin).empty());
+    const std::string id = PrefixPins::id_of(head);
+
+    std::vector<std::unique_ptr<ServerJob>> jobs;
+    std::vector<int> fds;
+    const auto run_one = [&](std::vector<int32_t> prompt, const char * rid) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        fds.push_back(sockets[0]);
+        fds.push_back(sockets[1]);
+        auto job = std::make_unique<ServerJob>();
+        job->fd = sockets[0];
+        job->req.format = ApiFormat::OPENAI_CHAT;
+        job->req.prompt_tokens = std::move(prompt);
+        job->req.max_output = 1;
+        job->req.stream = false;
+        job->req.model = "scheduler-test";
+        job->req.response_id = rid;
+        jobs.push_back(std::move(job));
+        ServerJob * j = jobs.back().get();
+        SchedulerTestHarness::enqueue(server, j);
+        std::unique_lock<std::mutex> lock(j->mu);
+        return j->cv.wait_for(lock, std::chrono::seconds(5), [&] { return j->done; });
+    };
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    // The warm runs as soon as the scheduler is idle; its file marks the end.
+    bool warmed = false;
+    for (int i = 0; i < 500 && !warmed; ++i) {
+        const auto got = pins.get(id);
+        warmed = got && got->files.size() == 1;
+        if (!warmed) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const bool e = warmed && run_one({1, 500, 3, 501, 4}, "e");
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+
+    TEST_ASSERT(warmed && e);
+    const int slot = cache.slot_of(head);
+    TEST_ASSERT(slot >= 0 && cache.pinned(slot));
+    bool restored_from_warm = false;
+    for (const auto & r : backend.engine.restores) {
+        restored_from_warm |= r == PrefixStoreRef{(uint64_t)slot + 1, 3};
+    }
+    TEST_ASSERT(restored_from_warm);
+    const auto got = pins.get(id);
+    TEST_ASSERT(got && got->hits >= 1 && got->files[0].disk_tokens == 3);
+    TEST_ASSERT(SchedulerTestHarness::disk_cache(server).contains(head));
+    TEST_ASSERT(backend.displaced.empty());
+    rm_rf(dir);
     unlink(path.c_str());
 }
 

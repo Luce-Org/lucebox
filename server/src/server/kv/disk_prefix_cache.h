@@ -137,6 +137,22 @@ public:
     // stays in its place (a longer head). Returns the number of files removed.
     int prune_ancestors(const std::vector<int32_t> & tokens, int keep_max);
 
+    // Pin (or unpin) the file keyed by `tokens` in this layout: a pinned
+    // file is exempt from the TTL, the LRU, the budget and ancestor pruning
+    // (it may not be written yet; a save that would need its room fails). Returns its path relative to the cache dir; empty
+    // when there is no such file.
+    std::string pin(const std::vector<int32_t> & tokens, bool on);
+    // The path pin() returns, the file left as it is.
+    std::string file_path(const std::vector<int32_t> & tokens);
+    // Unpin the file at `relative` (a pin's file of any model's layout).
+    void unpin_file(const std::string & relative);
+    // This layout's pinned files, as pin() names them.
+    std::vector<std::string> pinned_files();
+    // This model's layout, as its directory name; empty when not known.
+    std::string layout_name() const;
+    // A file keyed by exactly `tokens` exists (or is queued) in this layout.
+    bool contains(const std::vector<int32_t> & tokens);
+
     // Bytes on disk (every layout of every model using the directory),
     // queued writes included.
     size_t total_bytes() const;
