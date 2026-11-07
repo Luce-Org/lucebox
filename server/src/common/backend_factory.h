@@ -54,6 +54,9 @@ public:
         bool paged_attention = false;
         long long kv_pool_tokens = 0;
         long long kv_pool_reserve_bytes = 0;
+        int pflash_reserve_gpu = -1;
+        long long pflash_reserve_bytes = 0;
+        long long pflash_reserve_bytes_per_token = 0;
         ggml_type cache_type_k = GGML_TYPE_COUNT;
         ggml_type cache_type_v = GGML_TYPE_COUNT;
         int kq_stride_pad = 32;

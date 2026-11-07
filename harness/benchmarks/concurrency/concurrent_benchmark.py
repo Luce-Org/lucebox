@@ -86,6 +86,12 @@ def prompt_input_sha256(prompt: PromptInput) -> str:
     return sha256_text(json.dumps(prompt, ensure_ascii=False, separators=(",", ":")))
 
 
+def _token_count(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
 def native_prefill_values(usage: Any) -> tuple[int | None, float | None]:
     """Return exact Luce usage.timings fields, without protocol fallbacks."""
     if not isinstance(usage, dict):
@@ -93,10 +99,8 @@ def native_prefill_values(usage: Any) -> tuple[int | None, float | None]:
     timings = usage.get("timings")
     if not isinstance(timings, dict):
         return None, None
-    tokens = timings.get("prefilled_tokens")
+    tokens = _token_count(timings.get("prefilled_tokens"))
     prefill_ms = timings.get("prefill_ms")
-    if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
-        tokens = None
     if (
         isinstance(prefill_ms, bool)
         or not isinstance(prefill_ms, (int, float))
@@ -148,10 +152,12 @@ def stream_request(args: argparse.Namespace, prompt: PromptInput) -> dict[str, A
                 if isinstance(event.get("id"), str):
                     response_id = event["id"]
                 usage = event.get("usage") or {}
-                if isinstance(usage.get("completion_tokens"), int):
-                    completion_tokens = usage["completion_tokens"]
-                if isinstance(usage.get("prompt_tokens"), int):
-                    prompt_tokens = usage["prompt_tokens"]
+                event_completion_tokens = _token_count(usage.get("completion_tokens"))
+                if event_completion_tokens is not None:
+                    completion_tokens = event_completion_tokens
+                event_prompt_tokens = _token_count(usage.get("prompt_tokens"))
+                if event_prompt_tokens is not None:
+                    prompt_tokens = event_prompt_tokens
                 native_tokens, native_ms = native_prefill_values(usage)
                 if native_tokens is not None:
                     server_native_prefilled_tokens = native_tokens

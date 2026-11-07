@@ -995,16 +995,19 @@ prose 25 at q2) are measured exactly that way. Use `--chunk 8192` on the
 
 ## PFlash prompt compression
 
-DeepSeek4 supports the shared in-process Qwen3-0.6B PFlash scorer.
+DeepSeek4 supports PFlash with the in-process Qwen3.5-0.8B drafter and the
+trained scoring head. It is on whenever both are given.
 
 PFlash is supported for monolithic serving only. Layer-split and paged-serving
 configurations reject prefill compression at startup; paged serving cannot
 park a target while it owns live sequence state.
 
 ```bash
+PFLASH_SCORING_HEAD_GGUF=/path/to/head.gguf \
+PFLASH_SEGMENT_PROBE_GGUF=/path/to/segment-probe.gguf \
+PFLASH_REQUEST_PROBE_GGUF=/path/to/request-probe.gguf \
 ./server/build-hip/luce_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
-  --pflash on \
   --prefill-drafter /path/to/Qwen3.5-0.8B-BF16.gguf \
   --prefill-skip-park
 ```
@@ -1016,8 +1019,8 @@ target. Omit `--prefill-skip-park` when the target, DSpark drafter, and PFlash
 drafter do not fit together.
 
 PFlash reduces TTFT and the effective context used during generation, but it
-is lossy prompt compression. Disable it for matched true-context throughput
-or exact-retrieval comparisons.
+is lossy prompt compression. Turn it off (`--pflash off`) for matched
+true-context throughput or exact-retrieval comparisons.
 
 The legacy daemon command `compress <tokens-file> <keep-x1000> <drafter-path>
 [nopark]` retains its shared wire contract: backend-local GPU 0 and a drafter

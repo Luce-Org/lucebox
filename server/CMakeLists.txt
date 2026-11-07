@@ -603,6 +603,7 @@ add_library(luce_common STATIC
     src/pflash/pflash_ident_query.cpp
     src/pflash/pflash_drafter.cpp
     src/pflash/pflash_compress.cpp
+    src/pflash/pflash_window.cpp
     src/pflash/qwen35_drafter.cpp
     src/pflash/qwen35_loader.cpp
     src/pflash/kvflash_drafter_scorer.cpp
@@ -761,7 +762,6 @@ add_library(luce_common STATIC
     src/server/pin_friendly_prompt.cpp
     src/server/kv/disk_prefix_cache.cpp
     src/server/kv/disk_store.cpp
-    src/server/freeze_history.cpp
     # ── Jinja chat-template engine (vendored under deps/llama.cpp/common/) ──
     # Used by render_chat_template_jinja() to support --chat-template-file
     # in luce_server. Mirrors llama.cpp's common_chat_template plumbing.

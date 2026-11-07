@@ -27,7 +27,6 @@
 #include "server/kv/prefix_cache.h"
 #include "server/kv/disk_prefix_cache.h"
 #include "kv/kv_cache.h"
-#include "freeze_history.h"
 #include "api_types.h"
 #include "placement/draft_residency.h"
 #include "placement/remote_draft_config.h"
@@ -312,21 +311,14 @@ struct ServerConfig {
 
 namespace http_detail {
 
-inline constexpr int kFlowKvInertMinTokens = 512;
-
 // Small policy helpers kept outside HttpServer so model-free unit tests use
 // the same decisions as the request path.
-int flowkv_activation_threshold(const ServerConfig & config);
-bool flowkv_should_activate(const ServerConfig & config,
-                            int aged_token_estimate);
 float resolve_pflash_keep_ratio(float configured_ratio,
                                 const std::string & session_id,
                                 const HttpServerSessions & sessions);
 // Validate configured selection, query and serving flags before loading models.
 // Keeps the runtime defaults and clamping of valid integer overrides.
 bool validate_pflash_environment(std::string & error);
-bool should_clamp_flowkv_disk_cache(
-    bool flowkv, const DiskPrefixCachePolicy & policy);
 // True when the last message other than a system note is a tool result.
 // Agent clients append system notes (a context budget, reminders) after
 // the tool results; those notes are append-only history too.
@@ -389,104 +381,6 @@ int pflash_chat_skeleton_tokens() noexcept;
 // question alone.
 int pflash_chat_history_queries() noexcept;
 
-// Multi-turn follow-ups: PFLASH_CHAT_RECALL=0 turns recall off (a small
-// follow-up is then appended exactly as full prefill appends it, without
-// scoring); PFLASH_CHAT_COMPRESS_NEW_TOKENS (default 16384) is the size of
-// new material in one turn from which it is compressed instead of appended.
-bool pflash_chat_recall() noexcept;
-
-// The compressed text is rebuilt from the kept spans with a paragraph break
-// between pieces that were not adjacent in the prompt, unless one side
-// already ends or starts a paragraph (PFLASH_SELECT_PARAGRAPH_JOIN=0 turns
-// it off).
-bool pflash_paragraph_join() noexcept;
-std::string pflash_join_kept_spans(
-    const Tokenizer & tokenizer,
-    const std::vector<int32_t> & ids,
-    const std::vector<PFlashTokenSpan> & spans);
-int pflash_chat_compress_new_tokens() noexcept;
-
-
-// The parts of ``spans`` that ``minus`` does not cover. Both canonical.
-std::vector<PFlashTokenSpan> pflash_subtract_token_spans(
-    const std::vector<PFlashTokenSpan> & spans,
-    const std::vector<PFlashTokenSpan> & minus);
-
-// Text of a recalled segment made safe to quote inside a user turn: chat
-// control markers are removed, with the role-name line that follows a
-// generic role marker ("<|im_start|>assistant\n"), and the result is trimmed.
-std::string pflash_recall_excerpt(
-    const std::string & text,
-    const std::vector<std::string> & role_markers,
-    const std::vector<std::string> & end_markers,
-    bool generic_role_lines);
-
-// A multi-turn PFlash view: what was served for one turn of a conversation,
-// kept so the next turn can append to it instead of recompressing. The next
-// request continues the view when its raw prompt starts with this one's up
-// to the generation prompt, in target and drafter tokens alike.
-// One piece of a served view, in order: raw drafter tokens [begin, end) of
-// the request it was taken from (the view's prompt prefix, so the current
-// request's coordinates), served verbatim, or (recall) as a recalled excerpt
-// of that range under the [Earlier in this conversation] block.
-struct PflashViewPiece {
-    int begin = 0;
-    int end = 0;
-    bool recall = false;
-    int block = -1;       // recall pieces: the view turn whose recall block holds them
-};
-
-struct PflashChatView {
-    std::vector<int32_t> raw_tokens;       // target tokens, raw prompt
-    int raw_gen_begin = -1;                 // its generation prompt
-    std::vector<int32_t> drafter_ids;      // drafter tokens, raw prompt
-    int drafter_gen_begin = -1;
-    std::vector<int32_t> view_tokens;      // target tokens served
-    int view_gen_begin = -1;
-    std::vector<PFlashTokenSpan> spans;    // raw drafter spans in the view
-    std::vector<PflashViewPiece> pieces;   // the served view, in order (provenance)
-    int turns = 0;
-};
-
-// One scored turn that compresses only `regions` of the raw prompt (drafter
-// tokens, canonical) and serves everything else as the view holds it or raw:
-// "arrive" = a large uncached chunk; "new_content" = the newest user turn's
-// content of a tool session (PFLASH_AGENT_PASTE=1). The served
-// prompt keeps the cached view up to cut_view (raw position cut_raw) and
-// serves the rest anew. ``raw_base`` (no view): the raw prompt's own target
-// tokens [0, cut_view) stand in for the view, so the earlier conversation is
-// served token for token as full prefill would serve it.
-struct PflashRegionPlan {
-    bool active = false;
-    std::string mode;
-    std::vector<PFlashTokenSpan> regions;
-    int cut_raw = 0;
-    int cut_view = 0;
-    int tail_after = 0;
-    bool has_view = false;
-    int region_droppable = 0;
-    bool raw_base = false;
-};
-
-class PflashChatViewStore {
-public:
-    explicit PflashChatViewStore(size_t capacity = 8) : capacity_(capacity) {}
-    // The stored view the prompt continues (longest match), if any.
-    bool find(const std::vector<int32_t> & raw_tokens,
-              const std::vector<int32_t> & drafter_ids,
-              PflashChatView & out) const;
-    // Store a view, replacing the one it continues.
-    void remember(PflashChatView view);
-    // Drop every view whose raw prefix the prompt continues; return the
-    // number dropped. Raw fallback must also work when drafter parsing failed.
-    size_t forget(const std::vector<int32_t> & raw_tokens);
-    size_t size() const;
-
-private:
-    mutable std::mutex mutex_;
-    size_t capacity_;
-    std::vector<PflashChatView> views_;   // most recent last
-};
 
 // Find the last sufficiently-specific suffix of the user query inside the
 // rendered drafter-tokenized prompt. Public for model-free regression tests.
@@ -597,14 +491,9 @@ PflashChatTurnSpan pflash_chat_query_turn(
 PFlashTokenSpan pflash_char_span_tokens(
     const std::vector<size_t> & token_begin, size_t text_size, size_t begin, size_t end);
 
-// The served view's provenance pieces as [[begin, end, "raw"|"recall"], ...].
-json pflash_view_pieces_json(const std::vector<PflashViewPiece> & pieces);
-
 std::string pflash_token_fingerprint(
     const std::vector<int32_t> & ids);
 
-bool pflash_full_cache_restore_allowed(
-    bool selection_environment_present) noexcept;
 // Tokens the strict selector keeps whatever their score, counted the way it
 // charges them: every fixed chunk overlapping the query window or a kept span
 // and, with ``query_suffix_structural``, every chunk after the query. Probe
@@ -620,13 +509,6 @@ int pflash_kept_tokens(
 // (kept + keep_ratio * (input - kept) + 1) / input, capped at 1.
 double pflash_effective_keep_ratio(
     int input_tokens, int kept_tokens, double keep_ratio) noexcept;
-// The selector keep ratio for the next re-encode-overshoot retry: ``tightening`` (cumulative over the retries of
-// one request, starts at 0) grows by overflow + 1 and the ratio is requested * (ceiling - tightening) / ceiling,
-// so the ratios only tighten (defect fix 9 Oct 2026; the first retry is what it always was). <= 0: no retry.
-float pflash_ceiling_retry_keep_ratio(float requested_keep_ratio, int target_ceiling, int overflow,
-                                      int & tightening);
-int pflash_target_token_ceiling(
-    int original_target_tokens, double keep_ratio) noexcept;
 
 // PFlash failure policy (user decision D5, 9 Oct 2026). When compression of a
 // prompt fails at runtime (non-finite scores, scorer / probe / selection or
@@ -649,91 +531,18 @@ bool pflash_selection_gives_lifts(const luce::pflash::PFlashSelectionConfig & se
 // Short machine-readable reason for a PFlash error string (and the backend's
 // last error, when the drafter reported one): "nonfinite_scores",
 // "compress_failed", "ceiling_exceeded", "mapping_failed", "remote_drafter",
-// "selection_failed", "spread" (the relevance-spread fallback, not a failure),
-// "spread_unavailable" or "other".
+// "selection_failed" or "other".
 std::string pflash_failure_reason(const std::string & error,
                                   const std::string & detail);
-// PFLASH_FALLBACK_SPREAD decision: fire when the threshold is on (> 0), the
-// spread is valid and spread >= threshold.
-bool pflash_spread_fires(double threshold, bool spread_valid, double spread) noexcept;
-// The spread fallback's decision for one selection. A request compressed by a
-// region plan (arrive: a mid-chat paste on a cached history) takes no
-// decision: the threshold was calibrated on whole-prompt selections, where
-// the prompt-start candidate holds most of the score mass; a region has no
-// such candidate, so the spread there has no calibrated meaning. It is
-// still computed and recorded (fired false, skipped "region_plan").
-// Without a region plan: exactly pflash_spread_fires.
-struct PflashSpreadDecision {
-    bool fires = false;
-    const char * skipped = nullptr;   // "region_plan" when no decision was taken
-};
-PflashSpreadDecision pflash_spread_decision(double threshold, bool spread_valid,
-                                            double spread, bool region_plan) noexcept;
 bool pflash_failure_is_config_error(const std::string & error);
 PflashFallbackDecision pflash_fallback_decision(
     const std::string & error, bool fail_closed, int raw_prompt_tokens,
     int max_output, int max_ctx);
 
-// Cache-aware admission (PFLASH_ADMISSION=cache; default "length" = today's
-// rule, droppable tokens >= threshold). A conversation without a PFlash view
-// is compressed only when the reader would have to prefill at least
-// ``threshold`` droppable tokens that its restorable prefix cache does not
-// hold, and that cache holds less than ``threshold`` droppable tokens:
-// compressing never throws away a threshold's worth of reusable cache. A raw
-// prompt that does not fit the context is always compressed.
-enum class PflashAdmission {
-    Compress, UnderThreshold, WarmCache, NewContent, KeepHistory };
-const char * pflash_admission_name(PflashAdmission admission) noexcept;
-bool pflash_cache_admission_enabled() noexcept;
-PflashAdmission pflash_cache_admission(
-    int uncached_droppable, int cached_droppable, int threshold,
-    bool raw_fits = true) noexcept;
 // Tool activity: the request defines tools, or its history carries an
 // assistant tool call or a tool result (normalized messages, any API format).
 bool pflash_has_tool_activity(const json & tools,
                               const std::vector<ChatMessage> & messages) noexcept;
-// Tool sessions (cache admission, --pflash on). In a
-// conversation with tool activity (a "tool session") the agent's history and
-// tool output are never compressed. By default nothing in a tool session is:
-// it is served raw, full prefill (``KeepHistory``). PFLASH_AGENT_PASTE=1
-// (exactly "1"; anything else = off) lets PFlash compress one thing, the
-// newest turn when it is a user message whose droppable tokens reach the
-// threshold (decision ``NewContent``: a region plan over that content alone,
-// served on a raw base -- the raw prompt's own tokens before it, so a first
-// turn's system prompt and tools as well -- or on the conversation's view).
-// Everything else is served raw (``KeepHistory``, or the raw decision that
-// already applies), and a view is only continued: new turns appended
-// verbatim (a tool output of any size included), recall at the newest user
-// message, never rebuilt and never compressed again as a whole. A raw prompt
-// over the context is not compressed either: unless a big newest paste
-// brings it under (switch on), the request gets the context-overflow error
-// full prefill gets.
-bool pflash_agent_paste_enabled() noexcept;
-// The newest turn of ``turns`` when it is a user turn with content: returns
-// nullptr and sets ``newest``; otherwise what the newest turn is
-// ("no_turns", "newest_not_user": a tool output, an assistant prefill or an
-// empty user turn) and newest = -1.
-const char * pflash_keep_history_scope(
-    const std::vector<PflashChatTurn> & turns, int & newest) noexcept;
-// The decision for a tool session without a view: UnderThreshold stays;
-// newest user content of at least ``threshold`` droppable tokens turns
-// Compress and WarmCache into NewContent; otherwise (``new_droppable`` is 0
-// when the newest turn is not a user message) Compress, and WarmCache when
-// ``arrive`` would compress the uncached tail, become KeepHistory; WarmCache
-// without arrive stays (raw).
-PflashAdmission pflash_keep_history_admission(
-    PflashAdmission admission, int new_droppable, int threshold,
-    bool arrive) noexcept;
-// Target tokens of ``prompt`` that hold exactly the drafter tokens
-// ``drafter_ids``[0, drafter_cut), where drafter_cut is the role_begin of
-// ``turns``[turn] (the drafter parse): the same turn in a parse of the
-// target tokens, verified by decoding both prefixes. -1 when the parses or
-// the decoded prefixes differ (fail closed: the caller serves raw).
-int pflash_raw_base_target(
-    const Tokenizer & target, const ChatMarkers & markers,
-    const std::vector<int32_t> & prompt, const Tokenizer & drafter,
-    const std::vector<int32_t> & drafter_ids,
-    const std::vector<PflashChatTurn> & turns, int turn);
 // The restorable prefix PFlash admission counts: the RAM prefix snapshot, or
 // the deepest entry of the disk session cache when that cache is on and holds
 // more (a restarted server, or a session written out on eviction). Ties go to
@@ -748,12 +557,6 @@ PflashRestorablePrefix pflash_restorable_prefix(
 // Tokens of the canonical ``spans`` inside [begin, end).
 int pflash_span_tokens_within(
     const std::vector<PFlashTokenSpan> & spans, int begin, int end) noexcept;
-// Large-chunk arrival (PFLASH_ARRIVE=1, cache admission only) and the chat
-// view's rebuild ratio (PFLASH_CHAT_REBUILD_RATIO, default 2; 0 = rebuild only
-// at the context limit).
-double pflash_chat_rebuild_ratio() noexcept;
-int pflash_chat_rebuild_min_tokens() noexcept;
-bool pflash_arrive_enabled() noexcept;
 // [0, n) minus the canonical ``spans``.
 std::vector<PFlashTokenSpan> pflash_complement_token_spans(
     const std::vector<PFlashTokenSpan> & spans, int n);
@@ -1024,23 +827,13 @@ private:
         std::vector<int32_t> tokens;
         ImagePromptHandle images;
         bool compressed = false;
-        bool flowkv = false;
-        int full_cache_served_tokens = -1;
-        int full_cache_hit_slot = -1;
-        int full_cache_hit_len = 0;
         // Where to take this request's prefix-cache snapshot when nothing
         // else asks for one: a multi-turn PFlash view sets the start of its
         // generation prompt, where the next turn's prompt branches off.
         int snapshot_cut = -1;
         // PFlash details for usage.timings.pflash (see build_timings_json).
         nlohmann::json pflash_stats;
-        // Why the unified view handed this request to the chat view ("" = it did not).
-        std::string unified_handback;
-        // A hand-back the unified view continues from once the chat view has served it (a cold history, or newest
-        // content it cannot page): this request's drafter ids and where its generation prompt starts in them.
-        std::vector<int32_t> unified_adopt_drafter_ids;
-        int unified_adopt_drafter_gen_begin = -1;
-        // Served from a unified view (or adopted by one). A compressed one may still get a disk key (its served tokens):
+        // Served from a unified view. A compressed one may still get a disk key (its served tokens):
         // the view is kept on disk too, so a resumed conversation serves the same tokens again.
         bool unified_view = false;
         int error_status = 0;
@@ -1048,13 +841,9 @@ private:
         // The drafter's own error when compression failed in the backend
         // (luce_last_error at that moment), for the fallback record.
         std::string pflash_failure_detail;
-        // PFLASH_FALLBACK_SPREAD fired: the spread record for the fallback
-        // (null otherwise). Not a failure: PFLASH_FAIL_CLOSED does not apply.
-        nlohmann::json pflash_spread_fallback;
     };
 
-    // Prompt preparation keeps the FlowKV and whole-prompt PFlash policies
-    // out of the decode path while preserving their shared precedence rules.
+    // Prompt preparation keeps PFlash out of the decode path.
     PreparedPrompt prepare_prompt(const ParsedRequest & req);
     // Concurrent dense Qwen3.5 serving compresses on the scheduler's PFlash
     // thread (scheduler.cpp), for prompts up to --max-ctx; other engines keep
@@ -1064,60 +853,25 @@ private:
                config_.pflash &&
                drafter_tokenizer_ != nullptr;
     }
-    void apply_flowkv_compression(const ParsedRequest & req,
-                                  PreparedPrompt & prepared);
     std::string apply_pflash_compression(const ParsedRequest & req,
                                          PreparedPrompt & prepared);
-    // After the shared query and pins, when the selection gives per-candidate scores: pages the newest turn's large uncached content
-    // (a user message, or listed tool outputs), continues the conversation's view, and recalls unheld units of
-    // earlier regions at a new user question. ``request`` carries the drafter ids, the pinned spans and the
-    // learned query; ``messages`` the normalised messages the prompt was rendered from, ``layout`` the codec's
-    // render of them (where each message sits in the prompt). ``handback`` set (the
-    // reason): the view did not take the request -- ``not_ready`` non-empty, a prompt it cannot cut, or a conversation it would
-    // start while a threshold's worth of uncached, unpinned prompt lies outside its regions -- and the chat view
-    // (the release path) serves it; nothing of the unified view's state changed.
+    // After the shared query and pins: pages the newest turn's large uncached content (a user message, or listed tool
+    // outputs; on a start in a chat without tool activity, the earlier user messages too), continues the
+    // conversation's view, and recalls unheld units of earlier regions at a new user question. ``request`` carries
+    // the drafter ids, the pinned spans and the learned query; ``messages`` the normalised messages the prompt was
+    // rendered from, ``layout`` the codec's render of them (where each message sits in the prompt). ``not_ready``
+    // non-empty (the reason): the request is served raw.
     std::string apply_unified_view(const ParsedRequest & req, PreparedPrompt & prepared,
                                    const http_detail::PflashChatTurnSpan & turn,
                                    const std::vector<ChatMessage> & messages, const RenderedPrompt & layout,
                                    ModelBackend::CompressRequest request, int chunk_size,
-                                   const std::string & not_ready, std::string & handback);
-    // A conversation that left the unified view (a raw fallback, or a hand-back to the chat view) is not continued
-    // later from one of its views: drops the lineages these raw tokens would continue, in RAM and on disk. Returns
-    // how many.
+                                   const std::string & not_ready);
+    // A conversation that left the unified view (a raw fallback) is not continued later from one of its views: drops
+    // the lineages these raw tokens would continue, in RAM and on disk. Returns how many.
     size_t forget_unified_views(const std::vector<int32_t> & raw_tokens);
-    // The chat view served a request the unified view handed back with an adoption (unified_adopt_*): what it served
-    // becomes the conversation's unified view, with no regions, so the next turn continues it append-only.
-    void adopt_unified_view(const ParsedRequest & req, PreparedPrompt & prepared);
     // The generation prompt in target tokens: the drafter ids from ``generation_begin`` re-encoded.
     std::vector<int32_t> pflash_generation_tokens(const std::vector<int32_t> & drafter_ids,
                                                   int generation_begin) const;
-    // Multi-turn: serve the conversation's previous view plus this turn's
-    // new material -- verbatim below PFLASH_CHAT_COMPRESS_NEW_TOKENS, else
-    // the parts the fresh selection keeps -- with the segments the fresh
-    // selection wants that the view lacks recalled at the new user turn.
-    // Without a fresh compression (``fresh`` null) it serves only what needs
-    // no scoring: a repeated prompt, or a small follow-up with recall off;
-    // it returns false for the caller to compress. With one it always
-    // serves: a continued view, or the fresh prompt as a new view.
-    // ``keep_history`` (a tool session, PFLASH_AGENT_PASTE=1): the view
-    // only continues -- new tokens are appended verbatim (no compress-new),
-    // recalled passages are clipped to the message content that holds them,
-    // the view is never rebuilt (neither when it outgrows a fresh selection
-    // nor at the context limit), and when it cannot continue it returns false
-    // for the caller to serve the raw prompt.
-    bool serve_pflash_chat_view(
-        const ParsedRequest & req,
-        const std::vector<int32_t> & drafter_ids,
-        const http_detail::PflashChatTurnSpan & turn,
-        const std::vector<int32_t> * fresh,
-        const std::vector<PFlashTokenSpan> * kept_spans,
-        const std::vector<PFlashTokenSpan> & pins,
-        std::vector<int32_t> & served,
-        int & snapshot_cut,
-        nlohmann::json & stats,
-        bool keep_history = false);
-    // PFLASH_VIEW_TRACE_PATH: one JSONL record per compressed request with
-    // the served prompt's text, for evidence checks in evaluations.
     // Target tokens of ``prompt`` the reader can restore right now: its
     // in-memory prefix cache (a live backend snapshot, its authoritative
     // position) or, when the disk session cache is on and the request's disk
@@ -1127,17 +881,6 @@ private:
         const std::vector<int32_t> & prompt,
         const DiskPrefixCachePolicy & disk_policy);
     int ram_restorable_prefix_tokens(const std::vector<int32_t> & prompt);
-    // Serve a PflashRegionPlan turn from the selection's kept spans; false
-    // when it cannot be served (the caller serves the raw prompt).
-    bool serve_pflash_region_view(
-        const ParsedRequest & req,
-        const std::vector<int32_t> & drafter_ids,
-        const http_detail::PflashChatTurnSpan & turn,
-        const http_detail::PflashRegionPlan & plan,
-        const std::vector<PFlashTokenSpan> & kept_spans,
-        std::vector<int32_t> & served,
-        int & snapshot_cut,
-        json & stats);
     void trace_pflash_served(const ParsedRequest & req,
                              const PreparedPrompt & prepared);
     bool forward_upstream(ServerJob * job, const ParsedRequest & req,
@@ -1342,11 +1085,8 @@ private:
     HttpServerSessions sessions_;
 
     // Multi-turn PFlash views, matched by raw prompt prefix.
-    http_detail::PflashChatViewStore pflash_views_;
 
-    // Read once at construction: one view and recall mechanism for chat and agent sessions, on when the PFlash
-    // selection gives per-candidate scores. Off, none of it runs and nothing below is read.
-    bool pflash_unified_ = false;
+    // Read once at construction when PFlash is on: the one view and recall mechanism for chat and agent sessions.
     bool pflash_unified_recall_ = true;
     // PFLASH_RECALL_GATE=<theta> (default 0.075): recall only
     // while the head mass on unheld units is at least theta of the context mass; also skips the drafter pass when
@@ -1396,25 +1136,6 @@ private:
     // Recent tool-bearing prompt prefixes for PPP LCP annotate.
     std::vector<std::vector<int32_t>> recent_tool_prefixes_;
 
-    // FlowKV freeze-history: per-message compression cache.
-    // Key: SHA-1 hash of the drafter-token slice and selected keep ratio.
-    // Value: compressed content text (output of drafter_tokenizer_->decode).
-    // Bounded to kFrozenCacheMax entries; cleared on overflow (simple eviction).
-    static constexpr size_t kFrozenCacheMax = 256;
-    struct PrefixHashEqual {
-        bool operator()(const PrefixHash & a, const PrefixHash & b) const { return a == b; }
-    };
-    struct PrefixHashHasher {
-        size_t operator()(const PrefixHash & h) const {
-            size_t v = 0;
-            for (size_t i = 0; i < h.size(); ++i)
-                v ^= (size_t)h[i] << ((i % sizeof(size_t)) * 8);
-            return v;
-        }
-    };
-    std::unordered_map<PrefixHash, std::string,
-                       PrefixHashHasher, PrefixHashEqual> frozen_content_cache_;
-
     // Immutable model table after run() starts; only reservations mutate under
     // routing_mu_. A reservation spans parsing through job retirement/output
     // draining, so disconnects never make still-running engine work invisible.
@@ -1440,12 +1161,9 @@ private:
     uint64_t                        pflash_fallback_refused_ = 0;
     std::map<std::string, uint64_t> pflash_fallback_reasons_;   // served, by reason
     std::map<std::string, uint64_t> pflash_refused_reasons_;    // refused, by why
-    // Tool-session decisions, by name (/props pflash.keep_history).
-    std::map<std::string, uint64_t> pflash_keep_history_counts_;
     // Unified decisions and events, by name (/props pflash.unified).
     std::map<std::string, uint64_t> pflash_unified_counts_;
     nlohmann::json pflash_failure_counters_json() const;
-    nlohmann::json pflash_keep_history_json() const;
     nlohmann::json pflash_unified_json() const;
 
     // Active client thread tracking.

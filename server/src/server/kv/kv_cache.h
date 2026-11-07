@@ -69,16 +69,14 @@ struct KvLease {
 
 // What match needs to know about a request.
 struct KvMatchQuery {
-    // The tokens served. A compressed request that hits an exact entry is
-    // served that entry's length of placeholder tokens: match rewrites it
-    // and sets prompt_replaced.
+    // The tokens served.
     std::vector<int32_t> * prompt = nullptr;
     // The tokens the client sent (the exact-entry key without a rewrite).
     const std::vector<int32_t> * client_prompt = nullptr;
     bool key_by_served = false;
-    // The disk scope after the prompt transforms (FlowKV, PFlash).
+    // The disk scope after the prompt transforms (PFlash).
     DiskPrefixCachePolicy disk_policy;
-    // A compressed view of the prompt (PFlash, FlowKV), and whether it is
+    // A compressed view of the prompt (PFlash), and whether it is
     // served from a unified view, which is kept on disk too.
     bool compressed = false;
     bool unified_view = false;
@@ -152,9 +150,8 @@ public:
     // The deepest prefix of the prompt the cache holds. RAM entries whose
     // payload is gone are dropped on the way, and a RAM hit is counted. A
     // disk hit, or a fixed-scope prefix prefilled for it, lands in the
-    // staging checkpoint (disk_hit). Sets prompt_replaced when it rewrote
-    // the prompt (see KvMatchQuery::prompt).
-    KvLease match(const KvMatchQuery & query, bool * prompt_replaced = nullptr);
+    // staging checkpoint (disk_hit).
+    KvLease match(const KvMatchQuery & query);
     // Choose the request's capture and bind it into `request`: the payload
     // its reservation replaces is written out and freed first. Nothing is
     // captured into the checkpoint the request restores from.

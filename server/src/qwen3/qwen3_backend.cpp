@@ -7,6 +7,7 @@
 
 #include "qwen3_backend.h"
 #include "pflash/pflash_drafter.h"
+#include "pflash/pflash_window.h"
 #include "luce.h"
 #include "common/sampler.h"
 #include "common/io_utils.h"
@@ -965,98 +966,37 @@ bool Qwen3Backend::snapshot_adopt(int slot, ggml_context * ctx,
 // ── Compress ───────────────────────────────────────────────────────────
 
 ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req) {
-    CompressResult result;
-    if (req.input_ids.empty()) return result;
+    const auto results = compress_batch({req});
+    return results.empty() ? CompressResult{} : results.front();
+}
 
-    const bool was_parked = parked_;
-    if (!req.skip_park && !parked_) park(ParkTarget::TargetModel);
-
-    if (!drafter_loaded_) {
-        if (!load_drafter(req.drafter_path, 999, req.drafter_gpu, drafter_ctx_)) {
-            std::fprintf(stderr, "[compress] load failed: %s\n", luce_last_error());
-            if (!req.skip_park && !was_parked) unpark(ParkTarget::TargetModel);
-            return result;
-        }
-        drafter_loaded_ = true;
-    }
-
-    // score_query_end < 0 is the legacy "tail window" request value; the
-    // qwen35 scorer requires an explicit end.
-    const int score_query_end = req.score_query_end >= 0
-        ? req.score_query_end : (int)req.input_ids.size();
-    result = CompressResult::from_compressed_ids(drafter_score_and_compress(
-        drafter_ctx_, req.input_ids, req.keep_ratio,
-        /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
-        score_query_end, req.required_instruction_spans,
-        req.query_suffix_candidates, req.history_query_spans,
-            req.turn_query_span));
-
-    if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
-        free_drafter();
-    }
-
-    if (!req.skip_park && !was_parked) unpark(ParkTarget::TargetModel);
-    return result;
+std::vector<ModelBackend::CompressResult> Qwen3Backend::compress_batch(
+        const std::vector<CompressRequest> & requests) {
+    bool was_parked = false;
+    PFlashWindow window;
+    window.drain = [this] { ggml_backend_synchronize(backend_); };
+    window.park = [&] {
+        was_parked = parked_;
+        return park(ParkTarget::TargetModel);
+    };
+    window.unpark = [&] { return was_parked || unpark(ParkTarget::TargetModel); };
+    window.release = [this] { free_drafter(); };
+    window.shared_backends = {backend_};
+    window.engine_max_ctx = cfg_.device.max_ctx;
+    return pflash_compress_batch(drafter_ctx_, drafter_loaded_, requests, window);
 }
 
 bool Qwen3Backend::handle_compress(const std::string & line, const DaemonIO & io) {
-    std::istringstream iss(line.substr(9));
-    std::string ppath;
-    int  keep_x1000 = 0;
-    std::string drafter_path;
-    if (!(iss >> ppath >> keep_x1000)) {
+    CompressRequest req;
+    if (!pflash_parse_compress_line(line, req) || req.drafter_path.empty()) {
         std::fprintf(stderr, "[compress] bad args\n");
         io.emit(-1);
         return false;
     }
-
-    std::getline(iss >> std::ws, drafter_path);
-    bool skip_park = false;
-    const std::string suffix = " nopark";
-    if (drafter_path.size() > suffix.size() &&
-        drafter_path.compare(drafter_path.size() - suffix.size(),
-                             suffix.size(), suffix) == 0) {
-        skip_park = true;
-        drafter_path.resize(drafter_path.size() - suffix.size());
-    }
-    if (drafter_path.empty()) {
-        std::fprintf(stderr, "[compress] bad args\n");
-        io.emit(-1);
-        return false;
-    }
-
-    auto src_ids = read_int32_file(ppath);
-    if (src_ids.empty()) {
-        std::fprintf(stderr, "[compress] empty input\n");
-        io.emit(-1);
-        return false;
-    }
-
-    const bool was_parked = parked_;
-    if (!skip_park && !parked_) park(ParkTarget::TargetModel);
-
-    if (!drafter_loaded_) {
-        if (!load_drafter(drafter_path, 999, drafter_ctx_)) {
-            std::fprintf(stderr, "[compress] load failed: %s\n", luce_last_error());
-            if (!skip_park && !was_parked) unpark(ParkTarget::TargetModel);
-            io.emit(-1);
-            return false;
-        }
-        drafter_loaded_ = true;
-    }
-
-    const float keep = (float)keep_x1000 / 1000.0f;
-    auto compressed = drafter_score_and_compress(drafter_ctx_, src_ids, keep,
-        /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13,
-        (int)src_ids.size());
-    std::printf("[compress] %zu -> %zu tokens\n", src_ids.size(), compressed.size());
-    std::fflush(stdout);
-
-    if (!skip_park && !was_parked) unpark(ParkTarget::TargetModel);
-
-    for (int32_t t : compressed) io.emit(t);
+    const CompressResult result = compress(req);
+    for (int32_t t : result.compressed_ids) io.emit(t);
     io.emit(-1);
-    return !compressed.empty();
+    return result.ok;
 }
 
 void Qwen3Backend::free_drafter() {

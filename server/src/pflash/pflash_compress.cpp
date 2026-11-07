@@ -460,6 +460,14 @@ void write_compression_trace(
     if (trace_fields && trace_fields->spread_threshold > 0.0) {
         std::fprintf(file, ",\"spread\":%.17g,\"spread_threshold\":%.17g",
                      trace_fields->spread, trace_fields->spread_threshold);
+        // JSON has no NaN or infinity: a non-finite score is null.
+        std::fputs(",\"spread_first_token_score\":", file);
+        if (std::isfinite(trace_fields->spread_first_token_score)) {
+            std::fprintf(file, "%.17g", trace_fields->spread_first_token_score);
+        } else {
+            std::fputs("null", file);
+        }
+        std::fprintf(file, ",\"spread_per_token\":%s", trace_fields->spread_per_token ? "true" : "false");
     }
     std::fputs("}\n", file);
     std::fclose(file);
@@ -502,6 +510,34 @@ PFlashRelevanceSpread pflash_relevance_spread(
     out.k = k;
     out.candidates = (int) scores.size();
     out.spread = std::exp(entropy) / (double) std::max(k, 1);
+    return out;
+}
+
+PFlashRelevanceSpread pflash_selection_spread(
+        const std::vector<double> & chunk_scores,
+        const std::vector<uint8_t> & selected,
+        const std::vector<uint8_t> & forced,
+        int first_chunk_tokens,
+        double first_token_score,
+        bool per_token) {
+    if (chunk_scores.empty() || first_chunk_tokens <= 1 ||
+        selected.size() != chunk_scores.size() || forced.size() != chunk_scores.size()) {
+        return pflash_relevance_spread(chunk_scores, selected, forced);
+    }
+    const double first_chunk_sum = per_token
+        ? chunk_scores[0] * (double) first_chunk_tokens : chunk_scores[0];
+    // A non-finite sum stays non-finite, so the spread rejects it.
+    const double rest_sum = std::isfinite(first_chunk_sum)
+        ? std::max(0.0, first_chunk_sum - first_token_score) : first_chunk_sum;
+    std::vector<double> scores{first_token_score,
+        per_token ? rest_sum / (double) (first_chunk_tokens - 1) : rest_sum};
+    std::vector<uint8_t> unit_selected{0, selected[0]};
+    std::vector<uint8_t> unit_forced{1, forced[0]};
+    scores.insert(scores.end(), chunk_scores.begin() + 1, chunk_scores.end());
+    unit_selected.insert(unit_selected.end(), selected.begin() + 1, selected.end());
+    unit_forced.insert(unit_forced.end(), forced.begin() + 1, forced.end());
+    PFlashRelevanceSpread out = pflash_relevance_spread(scores, unit_selected, unit_forced);
+    out.candidates = (int) chunk_scores.size();
     return out;
 }
 
@@ -674,8 +710,11 @@ std::vector<int32_t> select_pflash_chunks(
             for (const auto & candidate : candidates) {
                 if (candidate.mandatory) mandatory_mask[candidate.ordinal] = 1;
             }
-            g_last_relevance_spread = pflash_relevance_spread(
-                exact_chunk_scores, anchor_mask, mandatory_mask);
+            g_last_relevance_spread = pflash_selection_spread(
+                exact_chunk_scores, anchor_mask, mandatory_mask,
+                candidates.empty() ? 0 : candidates[0].end - candidates[0].begin,
+                token_scores.empty() ? 0.0 : (double) token_scores[0],
+                !direct_mass || density);
             PFlashTraceFields fields{
                 &ids, query_begin, query_end, config.mode, config.query_parser,
                 selector_budget, fold.stop, fold.retained_tokens, kept_mass,
@@ -700,6 +739,9 @@ std::vector<int32_t> select_pflash_chunks(
             if (config.fallback_spread > 0.0) {
                 fields.spread = g_last_relevance_spread.spread;
                 fields.spread_threshold = config.fallback_spread;
+                fields.spread_first_token_score =
+                    token_scores.empty() ? 0.0 : (double) token_scores[0];
+                fields.spread_per_token = !direct_mass || density;
             }
             write_compression_trace(
                 input_tokens, keep_ratio, segments ? 0 : config.chunk_size, query_tokens,
@@ -784,8 +826,11 @@ std::vector<int32_t> select_pflash_chunks(
     std::fflush(stderr);
 
     if (write_trace) {
-        g_last_relevance_spread = pflash_relevance_spread(
-            exact_chunk_scores, selected_mask, mandatory_mask);
+        g_last_relevance_spread = pflash_selection_spread(
+            exact_chunk_scores, selected_mask, mandatory_mask,
+            candidates.empty() ? 0 : candidates[0].end - candidates[0].begin,
+            token_scores.empty() ? 0.0 : (double) token_scores[0],
+            !direct_mass || density);
         const int trace_chunk = segments ? 0 : config.chunk_size;
         const int n_keep_approx = segments
             ? (int) selected.ordinals.size()
@@ -809,6 +854,9 @@ std::vector<int32_t> select_pflash_chunks(
         if (config.fallback_spread > 0.0) {
             strict_fields.spread = g_last_relevance_spread.spread;
             strict_fields.spread_threshold = config.fallback_spread;
+            strict_fields.spread_first_token_score =
+                token_scores.empty() ? 0.0 : (double) token_scores[0];
+            strict_fields.spread_per_token = !direct_mass || density;
         }
         write_compression_trace(
             input_tokens, keep_ratio, trace_chunk, query_tokens,

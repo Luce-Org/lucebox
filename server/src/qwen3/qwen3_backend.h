@@ -98,9 +98,12 @@ public:
                         int32_t last_tok = -1) override;
 
     CompressResult compress(const CompressRequest & req) override;
+    std::vector<CompressResult> compress_batch(
+        const std::vector<CompressRequest> & requests) override;
     bool handle_compress(const std::string & line,
                          const DaemonIO & io) override;
     void free_drafter() override;
+    bool pflash_gives_candidate_scores() const override { return true; }
 
     bool try_handle_command(const std::string & line,
                             const DaemonIO & io) override;
