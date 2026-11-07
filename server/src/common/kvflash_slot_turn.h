@@ -31,6 +31,7 @@ struct KvFlashSlotTurn {
     bool end_rung = false;          // C1.5 F7: a recall turn whose replay stops at ckpt and checkpoints there too
     int  apply_at = -1;             // mode 5: the cut at which the drafter's picks are applied (one pass, no snapshot at R); -1: none
     int  uq_cut = -1;               // the latest human question's end inside this prefill: a cut end of every pass (kvflash_uq_cut); -1: none
+    int  capture_at = -1;           // the cut at which the head is captured (a multiple of k chunks); -1: none
     std::vector<int> cuts;          // first-pass cut ends, ascending
     bool recall() const { return phase != KvFlashTurnPhase::Lru; }
     bool first_pass() const { return phase == KvFlashTurnPhase::FirstPass; }
@@ -64,13 +65,17 @@ inline int kvflash_usable_blocks(int n_pool_blocks, int headroom_blocks) { retur
 // header when end - r reaches it; < 0: never (the R rung alone, C1.4).
 // pflash2 (mode 5): the picks come from the drafter's scores of the prompt ids, so the turn stays one
 // pass (the LRU turn's checkpoint rule) and only records where to apply them (apply_at = R).
+// capture_at: a cut the turn must stop at so the engine can capture the pinned head there; honoured inside (kv_offset, end)
+// and, in a recall turn, only before R (the recall is planned around it).
 inline KvFlashSlotTurn kvflash_slot_turn_plan(const std::vector<int32_t> & prompt, int kv_offset,
                                               int32_t im_start, int32_t user, int chunk_tokens,
                                               int n_pool_blocks, int cut_u, int n_queries, bool profile_on,
-                                              int end_rung_min = -1, bool pflash2 = false, int max_turn_tokens = 0) {
+                                              int end_rung_min = -1, bool pflash2 = false, int max_turn_tokens = 0,
+                                              int capture_at = -1) {
     KvFlashSlotTurn t;
     t.kv_offset = std::clamp(kv_offset, 0, (int)prompt.size());
     t.end = (int)prompt.size();
+    if (capture_at > t.kv_offset && capture_at < t.end) t.capture_at = capture_at;
     // The next prompt re-renders everything before the generation prompt's assistant header
     // unchanged (the reply after it is re-tokenized from text): the sticky checkpoint is taken there.
     for (int i = t.end - 1; i > t.kv_offset; --i) if (prompt[(size_t)i] == im_start) { t.ckpt = i; break; }
@@ -82,9 +87,12 @@ inline KvFlashSlotTurn kvflash_slot_turn_plan(const std::vector<int32_t> & promp
     t.reserve_chunks = (t.end - t.r + chunk_tokens - 1) / chunk_tokens + 1;
     // fits, or no sealed chunk before r to score: LRU turn
     if (kvflash_pool_fits(t.end, chunk_tokens, t.reserve_chunks, n_pool_blocks) || t.r / chunk_tokens == 0) { t.r = -1; t.reserve_chunks = 0; return t; }
+    if (t.capture_at > t.r) t.capture_at = -1;   // a recall turn: only a cut before R
     if (pflash2) { t.apply_at = t.r; return t; }
     t.phase = KvFlashTurnPhase::FirstPass;
     t.cuts = kvflash_slot_turn_cuts(t.kv_offset, t.r, t.end, cut_u, n_queries);
+    if (t.capture_at > 0 && std::find(t.cuts.begin(), t.cuts.end(), t.capture_at) == t.cuts.end())
+        t.cuts.insert(std::upper_bound(t.cuts.begin(), t.cuts.end(), t.capture_at), t.capture_at);
     t.end_rung = end_rung_min >= 0 && t.ckpt > t.r && t.end - t.r >= end_rung_min;
     return t;
 }
@@ -102,6 +110,7 @@ inline int kvflash_slot_turn_next_cut(const KvFlashSlotTurn & t, int cur_pos, in
     int n = kvflash_next_cut(cur_pos, t.end, cut_u) - cur_pos;
     if (t.apply_at > cur_pos) n = std::min(n, t.apply_at - cur_pos);
     if (t.uq_cut > cur_pos) n = std::min(n, t.uq_cut - cur_pos);
+    if (t.capture_at > cur_pos) n = std::min(n, t.capture_at - cur_pos);
     if (t.ckpt_pass() && t.ckpt > cur_pos) n = std::min(n, t.ckpt - cur_pos);
     if (tail > 0 && n > tail && cur_pos + n == t.end) n -= tail;
     return n;
@@ -126,11 +135,13 @@ struct KvFlashTurnStep {
     bool capture = false;       // build the graph with q capture ending at this slot's segment (the first pass's last cut)
     int  q_rows = 0;            // first pass: how many of this cut's last rows are among the last n_queries prompt tokens (to capture)
     bool ckpt = false;          // after the graph: the slot's recurrent state is the sticky checkpoint at the header
+    bool preamble = false;      // after the graph: the slot holds exactly the head (the capture cut)
 };
 inline KvFlashTurnStep kvflash_slot_turn_step(const KvFlashSlotTurn & t, int cur_pos, int n, int n_queries = 0) {
     KvFlashTurnStep s;
     if (n <= 0) return s;
     s.ckpt = t.ckpt_pass() && t.ckpt > 0 && cur_pos + n == t.ckpt;
+    s.preamble = t.capture_at > 0 && cur_pos + n == t.capture_at;
     if (!t.first_pass()) return s;
     s.snapshot = t.snapshot_at_r() && cur_pos + n == t.r;
     s.capture = cur_pos + n == t.end;
