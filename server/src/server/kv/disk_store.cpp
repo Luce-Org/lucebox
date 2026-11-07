@@ -36,6 +36,11 @@ namespace luce::common {
 
 namespace fs = std::filesystem;
 
+// Subdirectories of the cache directory that are not prefix layouts: the
+// sessions tenant's and the pin catalog's.
+static constexpr const char * kTenantDir = "sessions";
+static constexpr const char * kCatalogDir = "pins";
+
 // ─── Utility ────────────────────────────────────────────────────────────
 
 static bool mkdir_p(const std::string & path) {
@@ -537,6 +542,7 @@ void DiskStore::scan_all() {
         const std::string base = de.path().filename().string();
         std::error_code dec;
         if (base.empty() || base[0] == '.' || !de.is_directory(dec)) continue;
+        if (base == kTenantDir || base == kCatalogDir) continue;  // not a layout
         bool kept_any = false;
         std::error_code sec;
         for (const auto & se : fs::directory_iterator(de.path(), sec)) {
@@ -654,6 +660,15 @@ void DiskStore::expire_locked() {
             remove_entry(i, "ttl expired");
         }
     }
+    if (config_.ttl_seconds == 0) return;
+    for (auto & kv : tenants_) {
+        uint64_t last_used = 0;
+        while (kv.second.oldest(last_used) && t > last_used &&
+               t - last_used > config_.ttl_seconds && kv.second.evict_oldest() > 0) {
+            std::fprintf(stderr, "[disk-cache] ttl expired: removed a tenant unit unused for %llus\n",
+                         (unsigned long long)(t - last_used));
+        }
+    }
 }
 
 
@@ -679,7 +694,8 @@ uint64_t DiskStore::budget_locked() {
         }
     }
     if (known) {
-        const uint64_t on_disk = total_bytes_ - std::min<uint64_t>(total_bytes_, pending_bytes_);
+        const uint64_t on_disk = total_bytes_ - std::min<uint64_t>(total_bytes_, pending_bytes_) +
+                                 tenant_bytes_locked();
         const uint64_t room = available > reserve ? available - reserve : 0;
         const uint64_t limit = on_disk + room;
         if (limit < budget) budget = limit;
@@ -725,9 +741,54 @@ DiskCacheStats DiskStore::stats() const {
     return out;
 }
 
+uint64_t DiskStore::tenant_bytes_locked() const {
+    uint64_t n = 0;
+    for (const auto & kv : tenants_) n += kv.second.usage();
+    return n;
+}
+
+uint64_t DiskStore::oldest_tenant_locked(uint64_t & last_used) const {
+    uint64_t id = 0;
+    for (const auto & kv : tenants_) {
+        uint64_t lu = 0;
+        if (kv.second.oldest(lu) && (id == 0 || lu < last_used)) { id = kv.first; last_used = lu; }
+    }
+    return id;
+}
+
+uint64_t DiskStore::attach_tenant(Tenant tenant) {
+    std::lock_guard<std::mutex> lock(mu_);
+    const uint64_t id = next_tenant_id_++;
+    tenants_.emplace(id, std::move(tenant));
+    return id;
+}
+
+void DiskStore::detach_tenant(uint64_t id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    tenants_.erase(id);
+}
+
+uint64_t DiskStore::tenant_bytes() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return tenant_bytes_locked();
+}
+
+bool DiskStore::reserve(uint64_t bytes) {
+    std::lock_guard<std::mutex> lock(mu_);
+    expire_locked();
+    if (!make_room_locked(bytes)) return false;
+    reserved_bytes_ += bytes;
+    return true;
+}
+
+void DiskStore::release(uint64_t bytes) {
+    std::lock_guard<std::mutex> lock(mu_);
+    reserved_bytes_ -= std::min(reserved_bytes_, bytes);
+}
+
 bool DiskStore::make_room_locked(uint64_t incoming) {
     const uint64_t budget = budget_locked();
-    while ((uint64_t)total_bytes_ + incoming > budget) {
+    while (used_locked() + incoming > budget) {
         size_t lru = entries_.size();
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (pinned_locked(entries_[i])) continue;
@@ -735,7 +796,16 @@ bool DiskStore::make_room_locked(uint64_t incoming) {
                 lru = i;
             }
         }
-        if (lru == entries_.size()) return false;  // the pinned files fill it
+        // One LRU across the files and the tenants' units (a tie goes to the file).
+        uint64_t unit_used = 0;
+        const uint64_t tenant = oldest_tenant_locked(unit_used);
+        if (tenant != 0 && (lru == entries_.size() || unit_used < entries_[lru].last_used)) {
+            const uint64_t freed = tenants_.at(tenant).evict_oldest();
+            std::fprintf(stderr, "[disk-cache] budget (lru): removed a tenant unit (%.1f MB)\n", mib(freed));
+            if (freed == 0) return false;  // it said it could, and did not: do not spin
+            continue;
+        }
+        if (lru == entries_.size()) return false;  // the pinned files and the tenants' protected units fill it
         remove_entry(lru, "budget (lru)");
     }
     return true;
