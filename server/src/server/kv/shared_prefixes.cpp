@@ -67,6 +67,14 @@ int SharedPrefixes::cut(const std::vector<int32_t> & prompt,
     return back_off_to_line_end(prompt, common);
 }
 
+int SharedPrefixes::head_cut(const std::vector<int32_t> & prompt,
+                             const std::vector<int> & boundaries, bool has_tools) const {
+    if (!on()) return -1;
+    if (!prefers_head(boundaries, has_tools)) return 0;
+    if (const int c = cut(prompt, boundaries)) return c;
+    return !boundaries.empty() && boundaries.front() >= min_tokens_ ? boundaries.front() : 0;
+}
+
 void SharedPrefixes::remember(const std::vector<int32_t> & prompt,
                               const std::vector<int> & boundaries) {
     if (!learns() || prompt.empty()) return;
