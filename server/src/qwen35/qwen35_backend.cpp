@@ -3714,7 +3714,8 @@ void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
 }
 
 void Qwen35Backend::kvflash_prefill_apply_on(KvFlashPager & p, std::vector<float> & scores, int committed, int end,
-                                             int reserve_chunks, int q_tok, double score_ms, const char * note, int slot) {
+                                             int reserve_chunks, int q_tok, double score_ms, const char * note, int slot,
+                                             int slot_pins) {
     const int ct = p.chunk_tokens();
     int tail = -1;   // the pager's configured tail unless recall derives one
     std::vector<int> picked;
@@ -3731,8 +3732,9 @@ void Qwen35Backend::kvflash_prefill_apply_on(KvFlashPager & p, std::vector<float
         in.recall_chunks = luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_;
         in.unit = unit;
         in.reserve = reserve_chunks >= 0 ? reserve_chunks : (end - committed + ct - 1) / ct + 1;
-        in.pin_reserve_chunks = kvflash_preamble_reserve_ / ct;   // the history budget never depends on k
-        in.pinned_chunks = luce::common::kvflash_pinned_prefix(p);
+        // the history budget never depends on k; a slot's pinned head past the preamble reserve comes off its history
+        in.pin_reserve_chunks = std::max(kvflash_preamble_reserve_ / ct, slot_pins);
+        in.pinned_chunks = luce::common::kvflash_pinned_prefix(p);   // what the pager holds pinned: the preamble pin and the head
         // the serial turn plans from the input its mode-4 first window was sized with
         if (slot < 0 && reserve_chunks < 0) in = kvflash_recall_in(committed, end);
         luce::common::KvFlashRecallPlan plan = luce::common::kvflash_recall_plan(scores, in);

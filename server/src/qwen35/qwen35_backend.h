@@ -411,9 +411,11 @@ protected:
                                double score_ms, const char * note);
     // The same over any pager and score vector (which must outlive the hook installed on p).
     // reserve_chunks < 0: derived from `end`. slot >= 0 names a slot pager in the log line and
-    // leaves the serial preamble inputs out of the recall budget.
+    // reads the pins its pager holds; slot_pins is the slot's pinned head (chunks): past the preamble reserve they
+    // come off the history budget and are not recall candidates.
     void kvflash_prefill_apply_on(KvFlashPager & p, std::vector<float> & scores, int committed, int end,
-                                  int reserve_chunks, int q_tok, double score_ms, const char * note, int slot);
+                                  int reserve_chunks, int q_tok, double score_ms, const char * note, int slot,
+                                  int slot_pins = 0);
     // Mode 4: q_cap holds q(end-1) from the first pass over [r, end).
     // Score, restore the scratch state at r (zero state when zero_state), truncate
     // the pager to r, reselect. 1 = rewound (re-run [r, end)), 0 = nothing
