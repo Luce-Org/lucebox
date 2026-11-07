@@ -2260,20 +2260,17 @@ static ggml_tensor * build_delta_net_block(
     if (can_skip_gdn_intermediate) {
         ggml_gated_delta_net_set_skip_intermediate(result, true);
     }
-    if (capture_chain_commit) {
-        seg_cap->replay_log =
-            ggml_gated_delta_net_capture_replay_log(ctx, result);
-        ggml_set_output(seg_cap->replay_log);
-        ggml_build_forward_expand(gf, seg_cap->replay_log);
-    }
-    if (single_replay_slot_ids) {
-        // SINGLE_REPLAY: rollback_to reads the log in place, so the compact
-        // copy capture_replay_log returns stays out of the graph; the GDN
-        // result (attention output | log) is kept alive past the compute
-        // instead. Only the view node joins the graph (it launches nothing).
+    if (capture_chain_commit || single_replay_slot_ids) {
+        // The tree commit and SINGLE_REPLAY's rollback_to read the log in
+        // place, so the compact copy capture_replay_log returns stays out of
+        // the graph: the view already has the copy's [width, H, T, seqs]
+        // layout. The GDN result (attention output | log) is kept alive past
+        // the compute instead. Only the view node joins the graph (it
+        // launches nothing).
         ggml_tensor * copy = ggml_gated_delta_net_capture_replay_log(ctx, result);
         ggml_tensor * log = copy->src[0];
         GGML_ASSERT(copy->op == GGML_OP_DUP && log && log->view_src == result);
+        GGML_ASSERT(!capture_chain_commit || ggml_is_contiguous(log));
         seg_cap->replay_log = log;
         ggml_set_output(result);
         ggml_set_output(log);

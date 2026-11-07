@@ -355,13 +355,17 @@ TEST_CASE(StridedGdnPlanCase, nothing_to_drop_where_the_parent_copies_nothing) {
     CHECK_NULL(q.inert_why);
 }
 
-TEST_CASE(StridedGdnPlanCase, mapped_verify_keeps_its_z_copy) {
+TEST_CASE(StridedGdnPlanCase, mapped_verify_reads_z_in_place) {
     StridedGdnFacts f = chain_verify();
     f.fused_chain = false;
     f.mapped_verify = true;
-    const StridedGdnPlan p = strided_gdn_plan(f);
+    StridedGdnPlan p = strided_gdn_plan(f);
     CHECK_FALSE(p.gates);   // its own views and kernel; nothing for the fusion to do
-    CHECK_FALSE(p.z);       // not the dense chain: no A/B covers its graph
+    CHECK_TRUE(p.z);        // the same contiguous GDN output rows as the chain
+    CHECK_NULL(p.inert_why);
+    f.fusion_enabled = false;   // the unfused silu needs a contiguous input
+    p = strided_gdn_plan(f);
+    CHECK_FALSE(p.z);
     CHECK_NOT_NULL(p.inert_why);
 }
 
