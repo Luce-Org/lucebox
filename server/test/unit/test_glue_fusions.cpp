@@ -237,6 +237,61 @@ TEST_CASE(GlueQ8Memo, overlap_is_half_open) {
     CHECK_FALSE(glue_q8_overlap((void *) 0x1000, 0, (void *) 0x1000, 0x100));
 }
 
+// The first MMQ reader of a producer's output
+// (glue_q8_first_reader), whose layout the norm writes its q8_1 rows in.
+namespace {
+
+int first_reader(const FakeGraph & g, const ggml_tensor * producer, bool (*takes_mmq)(const ggml_tensor *)) {
+    return glue_q8_first_reader(g.nodes.data(), (int) g.nodes.size(), g.index_of(producer), producer, layout_of,
+                                takes_mmq, 0);
+}
+
+bool every_matmul_takes_mmq(const ggml_tensor *) { return true; }
+bool q8_0_takes_mmvq(const ggml_tensor * mm) { return mm->src[0]->type != GGML_TYPE_Q8_0; }
+
+ggml_tensor * norm_node(FakeGraph & g) {
+    ggml_tensor * rms = g.node(ggml_rms_norm(g.ctx, g.activation(), 1e-6f));
+    return g.node(ggml_mul(g.ctx, rms, g.activation()));
+}
+
+}  // namespace
+
+TEST_CASE(GlueQ8Memo, the_norm_writes_the_layout_of_its_first_mmq_reader) {
+    FakeGraph g;
+    ggml_tensor * n = norm_node(g);
+    g.node(ggml_mul_mat(g.ctx, g.weight(GGML_TYPE_F16, 512), n));                      // not quantized
+    ggml_tensor * a = g.node(ggml_mul_mat(g.ctx, g.weight(GGML_TYPE_Q8_0, 512), n));   // D4
+    ggml_tensor * b = g.node(ggml_mul_mat(g.ctx, g.weight(GGML_TYPE_Q4_K, 512), n));   // DS4
+    ggml_tensor * c = g.node(ggml_mul_mat(g.ctx, g.weight(GGML_TYPE_Q5_K, 256), n));   // DS4
+    CHECK_EQUAL(first_reader(g, n, every_matmul_takes_mmq), g.index_of(a));
+    // A reader that runs MMVQ quantizes its own form: the next one decides.
+    CHECK_EQUAL(first_reader(g, n, q8_0_takes_mmvq), g.index_of(b));
+    // Planned from the norm in that layout, the entry serves both DS4 readers.
+    const glue_q8_plan p = glue_q8_scan(g.nodes.data(), (int) g.nodes.size(), g.index_of(n), n,
+                                        layout_of(GGML_TYPE_Q4_K), layout_of, 0);
+    CHECK_EQUAL(p.last_reader, g.index_of(c));
+}
+
+TEST_CASE(GlueQ8Memo, no_norm_q8_when_its_output_is_rewritten_first) {
+    FakeGraph g;
+    ggml_tensor * n = norm_node(g);
+    g.node(ggml_scale_inplace(g.ctx, n, 2.0f));   // rewrites the norm's bytes before any reader
+    g.node(ggml_mul_mat(g.ctx, g.weight(GGML_TYPE_Q8_0, 512), n));
+    CHECK_EQUAL(first_reader(g, n, every_matmul_takes_mmq), -1);
+}
+
+TEST_CASE(GlueQ8Memo, no_norm_q8_for_a_reader_of_other_ne_or_without_a_layout) {
+    FakeGraph g;
+    ggml_tensor * n = norm_node(g);
+    ggml_tensor * split = g.node(ggml_reshape_3d(g.ctx, n, K, N / 2, 2));   // another MMQ layout of the bytes
+    g.node(ggml_mul_mat(g.ctx, g.weight(GGML_TYPE_Q8_0, 512), split));
+    g.node(ggml_mul_mat(g.ctx, g.weight(GGML_TYPE_Q4_0, 512), n));           // layout_of -1 in this table
+    CHECK_EQUAL(first_reader(g, n, every_matmul_takes_mmq), -1);
+    ggml_tensor * flat = g.node(ggml_reshape_3d(g.ctx, n, K, N, 1));        // the same ne: the same input
+    ggml_tensor * r = g.node(ggml_mul_mat(g.ctx, g.weight(GGML_TYPE_Q6_K, 512), flat));
+    CHECK_EQUAL(first_reader(g, n, every_matmul_takes_mmq), g.index_of(r));
+}
+
 // ── Strided gates ──────────────────────────────────────────
 
 namespace {

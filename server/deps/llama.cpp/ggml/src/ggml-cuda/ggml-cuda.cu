@@ -5778,6 +5778,61 @@ static bool ggml_cuda_mul_mat_takes_mmvq(const ggml_backend_cuda_context & ctx, 
              ggml_cuda_should_use_mmq(mm, cc, src1->ne[1], /*n_experts=*/0));
 }
 
+// Whether ggml_cuda_mul_mat runs this MUL_MAT node on its plain
+// single-device MMQ branch (ggml_cuda_mul_mat_q without ids), by the tests it
+// dispatches with. A norm writes q8_1 MMQ rows only for such a reader; a
+// wrong guess would cost the norm's extra writes, never bits (the reader
+// consults the memo only on that branch, and keys it by its own src1).
+static bool ggml_cuda_mul_mat_takes_mmq(const ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (mm->op != GGML_OP_MUL_MAT || src0 == nullptr || src1 == nullptr || src0->buffer == nullptr ||
+        ggml_backend_buft_is_cuda_split(src0->buffer->buft) || ggml_mul_mat_is_grouped_src(mm) ||
+        !ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_MXFP8 ||
+        src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX || src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX ||
+        ggml_cuda_src0_bad_padding_clear(src0) || src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32) {
+        return false;
+    }
+#ifdef ROCMFP2_AFFINE
+    if (src0->type == GGML_TYPE_Q2_0_ROCMFP2) {
+        return false;  // MMQ behind its own A/B switches there
+    }
+#endif // ROCMFP2_AFFINE
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_mul_mat_bf16_shadow(src0, src1, mm) != nullptr || ggml_cuda_mmb_supported_mm(src0, src1, mm)) {
+        return false;
+    }
+#endif // defined(GGML_USE_HIP)
+    if (ggml_cuda_mul_mat_takes_mmvq(ctx, mm)) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    return ggml_cuda_should_use_mmq(mm, cc, src1->ne[1], /*n_experts=*/0);
+}
+
+// Producers that write their MMQ reader's q8_1 rows (RMS norm, SWIGLU); tests
+// turn them off to compare with the readers quantizing themselves.
+static std::atomic<bool> g_glue_q8_producers_on{true};
+
+extern "C" void ggml_backend_cuda_set_glue_q8_producers_override(bool on) {
+    g_glue_q8_producers_on.store(on, std::memory_order_relaxed);
+}
+
+// When an MMQ matmul reads the F32 output of the producer at node `idx` (an
+// RMS norm: RMS_NORM + MUL, ADD + RMS_NORM + MUL; or a SWIGLU), the producer
+// also writes that reader's q8_1 MMQ rows, into a Q8 memo entry the reader
+// and the later readers of its layout reuse instead of quantizing
+// (ggml_cuda_glue_q8_memo_produce). Returns the entry's buffer and its
+// mmq_q8_1_ds_layout, or null, in which case the producer runs as before.
+static char * ggml_cuda_q8_mmq_for_producer(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int idx,
+                                            int * layout) {
+    *layout = -1;
+    if (!g_glue_q8_producers_on.load(std::memory_order_relaxed)) {
+        return nullptr;
+    }
+    return ggml_cuda_glue_q8_memo_produce(ctx, cgraph, idx, ggml_cuda_mul_mat_takes_mmq, layout);
+}
+
 // When the node at `idx` (contiguous F32 rows) is read next by a quantized
 // matmul, its producer can write the q8_1 form MMVQ would quantize it to:
 // this registers a memo entry under MMVQ's key and returns its buffer (null
@@ -6439,6 +6494,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // start of fusion operations
                 if (ggml_backend_cuda_fusion_enabled()) {
+                    // A SWIGLU read next by an MMQ matmul writes that reader's
+                    // q8_1 rows too.
+                    if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU &&
+                        ggml_cuda_op_swiglu_q8_mmq_supported(node)) {
+                        int q8_layout = -1;
+                        char * q8 = ggml_cuda_q8_mmq_for_producer(*cuda_ctx, cgraph, i, &q8_layout);
+                        if (q8 != nullptr) {
+                            ggml_cuda_op_swiglu_q8_mmq(*cuda_ctx, node, q8, q8_layout);
+                            continue;
+                        }
+                    }
                     if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU_DS4 &&
                         node->src[1] != nullptr && node->type == GGML_TYPE_F32) {
                         // A down projection reads it next: emit its q8_1 form too.
@@ -6952,7 +7018,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
 
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-                        ggml_cuda_op_add_rms_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+                        int q8_mmq_layout = -1;
+                        void * q8_mmq = ggml_cuda_q8_mmq_for_producer(*cuda_ctx, cgraph, i + 2, &q8_mmq_layout);
+                        ggml_cuda_op_add_rms_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2],
+                                                            q8_mmq, q8_mmq_layout);
                         i += 2;
                         continue;
                     }
@@ -7003,7 +7072,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         void * q8_out = nullptr;
                         int ncols_q8 = 0;
                         ggml_cuda_q8_memo_for_producer(*cuda_ctx, cgraph, i + 1, &q8_out, &ncols_q8);
-                        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i+1], q8_out, ncols_q8);
+                        // The MMVQ rows above, or else the MMQ ones.
+                        int q8_mmq_layout = -1;
+                        void * q8_mmq = q8_out == nullptr
+                            ? ggml_cuda_q8_mmq_for_producer(*cuda_ctx, cgraph, i + 1, &q8_mmq_layout) : nullptr;
+                        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i+1], q8_out, ncols_q8,
+                                                    q8_mmq, q8_mmq_layout);
                         i++;
                         continue;
                     }
