@@ -11,8 +11,8 @@
 
 namespace luce::common {
 
-// What the admit does with this prompt's preamble: attach the stored entry, or cold-admit and capture one; plain cold when the
-// preamble is too short. `k` is a count of chunks. The preamble store that decides it is a later change; until then the default is Cold.
+// What the admit does with this prompt's pinned head (kvflash_pinned_head.h): attach the stored head, or cold-admit and capture
+// it at its cut; plain cold when there is no head. `k` is a count of chunks.
 struct KvFlashPreambleDecision {
     enum Kind { Cold, Capture, Attach } kind = Cold;
     int k = 0;
@@ -36,7 +36,7 @@ struct KvFlashAdmitIn {
     int same_sid_slot = -1;                      // a parked instance of the request's explicit sid, or -1
     std::string same_sid_key;                    // its directory key ("" without persistence)
     bool can_archive = true;                     // persistence is on: an instance can leave for disk and be linked
-    KvFlashPreambleDecision pd;                  // attach / capture / cold from the preamble store
+    KvFlashPreambleDecision pd;                  // attach / capture / cold from the pinned head
     int ct = 64;                                 // chunk tokens
 };
 
