@@ -2447,13 +2447,16 @@ static __global__ void paged_attn_wmma(
         }
     }
 }
+static_assert(PAGED_ATTN_HEAD_DIM == 256, "ggml_cuda_paged_attn_wmma_route_for() assumes head dim 256");
+
 // The WMMA route for a graph of this shape on `device`: LUCE_PAGED_WMMA (on by
 // default, =0 opts out) and the device (the iter's WMMA fragment layout and mma
 // operand order are RDNA4-specific; RDNA4 is only defined in the device pass,
 // so gate on the device's capability here, or the kernel would compile and
-// silently miscompute elsewhere), then the graph gates: non-tree, head dim 256,
-// F16/Q8_0/Q4_0 KV, a GQA ratio that fits the 8 head slots (ncols2), 16-token
-// blocks. The launcher and the exported query below both decide here.
+// silently miscompute elsewhere), then the graph gates in
+// ggml_cuda_paged_attn_wmma_route_for(): non-tree, head dim 256, F16/Q8_0/Q4_0
+// KV, a GQA ratio that fits the 8 head slots (ncols2), 16-token blocks. The
+// launcher and the exported query below both decide here.
 static bool paged_attn_wmma_route(
         int device, bool tree_mode, int head_dim, int n_head, int n_head_kv,
         ggml_type k_type, ggml_type v_type, int block_size) {
@@ -2461,18 +2464,13 @@ static bool paged_attn_wmma_route(
         const char * e = getenv("LUCE_PAGED_WMMA");
         return !(e && atoi(e) == 0);
     }();
-    if (!enabled || !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc)) {
-        return false;
-    }
-    const auto kv_ok = [](ggml_type t) {
-        return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0;
-    };
-    return !tree_mode && head_dim == PAGED_ATTN_HEAD_DIM && kv_ok(k_type) && kv_ok(v_type) &&
-           n_head_kv > 0 && n_head % n_head_kv == 0 && n_head / n_head_kv <= 8 && block_size == 16;
+    return ggml_cuda_paged_attn_wmma_route_for(
+        enabled, GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc), tree_mode,
+        head_dim, n_head, n_head_kv, k_type, v_type, block_size);
 }
 
 // Whether paged attention on `device` runs the WMMA route for this shape
-// (false: V_DOT2).
+// (false: V_DOT2). A saved KV is only valid under the route that computed it.
 extern "C" bool ggml_backend_cuda_paged_attn_wmma_route(
         int device, bool tree_mode, int head_dim, int n_head, int n_head_kv,
         ggml_type k_type, ggml_type v_type, int block_size) {
