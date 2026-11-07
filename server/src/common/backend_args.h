@@ -108,6 +108,12 @@ struct BackendArgs {
     // Device memory an automatically sized pool leaves free for a model that
     // runs beside concurrent decode (the PFlash drafter). Bytes; 0 = none.
     long long       kv_pool_reserve_bytes = 0;
+    // Device memory a model that sizes itself to its GPUs (qwen4exp) leaves
+    // free for the PFlash drafter scoring beside it: on GPU pflash_reserve_gpu
+    // (-1: none), its weights plus a workspace per context position.
+    int             pflash_reserve_gpu = -1;
+    long long       pflash_reserve_bytes = 0;
+    long long       pflash_reserve_bytes_per_token = 0;
     int             kq_stride_pad    = 32;
     int             draft_block_size = 0;  // 0 = drafter metadata
     int             draft_swa_window = 0;

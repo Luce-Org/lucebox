@@ -5,6 +5,7 @@
 #include "common/peer_access.h"
 #include "common/sampler.h"
 #include "common/snapshot_backend.h"
+#include "pflash/pflash_window.h"
 
 #include "ggml-cuda.h"
 
@@ -132,13 +133,14 @@ static bool move_qwen4exp_attention(Qwen4ExpWeights & w, int layers) {
 
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         Qwen4ExpCache & cache, int slots, int resident_slots, size_t * snapshot_budget, Qwen4ExpChunkPlan * plan,
-        size_t snapshot_keep) {
+        size_t snapshot_keep, size_t reserved) {
     if (slots < 1 || resident_slots < 1 || resident_slots > slots) return 0;
     size_t free_device = 0, total = 0, free_host = 0;
     ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device_id(backend), &free_device, &total);
     ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_host, &total);
     // The generic UMA query substitutes MemAvailable; retain the HIP/GTT limit too.
-    const size_t available = std::min(free_device, free_host);
+    const size_t free_now = std::min(free_device, free_host);
+    const size_t available = free_now > reserved ? free_now - reserved : 0;
     size_t shadow = 0, shadow_tmp = 0;
     if (w.gfx1151) {
         auto count_shadow = [&](ggml_context * ctx) {
@@ -375,7 +377,9 @@ bool Qwen4ExpBackend::load_target() {
         const int ctx = cache_.max_ctx;
         const size_t snapshots = snap_backend_ == backend_
             ? (size_t) cfg_.max_concurrency * snapshot_bytes_estimate(ctx) : 0;
-        const size_t position = plan.position_bytes + snapshots / ctx;
+        // The planner kept the PFlash drafter's room free; it grows with the context too.
+        const size_t position = plan.position_bytes + snapshots / ctx +
+                                (pflash_reserve(backend_) ? cfg_.pflash_bytes_per_token : 0);
         const bool fit = plan.required <= plan.available && snapshots <= plan.available - plan.required;
         const size_t missing = fit ? 0 : plan.required == SIZE_MAX ? (size_t) ctx / 4 * position
                                                                     : plan.required + snapshots - plan.available;
@@ -453,6 +457,13 @@ bool Qwen4ExpBackend::load_hot_experts() {
     return chunk_ > 0;
 }
 
+// Memory the PFlash drafter needs on `device` when it scores there: its weights
+// and a workspace that grows with the prompt, which can fill the context.
+size_t Qwen4ExpBackend::pflash_reserve(ggml_backend_t device) const {
+    if (cfg_.pflash_gpu < 0 || !device || ggml_backend_cuda_get_device_id(device) != cfg_.pflash_gpu) return 0;
+    return cfg_.pflash_bytes + (size_t) std::max(0, cache_.max_ctx) * cfg_.pflash_bytes_per_token;
+}
+
 // The prompt chunk, measured against free memory unless --chunk sets it (concurrent serving measures either way,
 // to size the prefix allowance; so does a context fit, which reads `plan`).
 int Qwen4ExpBackend::plan_chunk(Qwen4ExpChunkPlan * plan) {
@@ -471,7 +482,7 @@ int Qwen4ExpBackend::plan_chunk(Qwen4ExpChunkPlan * plan) {
     const int slots = cfg_.max_concurrency;
     const int fit = qwen4exp_select_chunk(backend_, weights_, cache_, slots, 1,
                                           allowance(slots > 1 ? 2 * (size_t) slots + 1 : 3), plan,
-                                          snapshot_bytes_estimate(cache_.max_ctx));
+                                          snapshot_bytes_estimate(cache_.max_ctx), pflash_reserve(backend_));
     return cfg_.chunk > 0 && fit > 0 ? explicit_chunk : fit;
 }
 
@@ -509,8 +520,10 @@ int Qwen4ExpBackend::remote_layers_for(const Qwen4ExpChunkPlan & plan, size_t mi
     size_t free_device = 0, total = 0, free_host = 0;
     ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device_id(weights_.expert_backend), &free_device, &total);
     ggml_backend_dev_memory(ggml_backend_get_device(weights_.expert_backend), &free_host, &total);
-    const size_t available = std::min(free_device, free_host) +
-                             (cache_.remote_buf ? ggml_backend_buffer_get_size(cache_.remote_buf) : 0);
+    const size_t reserved = pflash_reserve(weights_.expert_backend);
+    const size_t free_now = std::min(free_device, free_host) +
+                            (cache_.remote_buf ? ggml_backend_buffer_get_size(cache_.remote_buf) : 0);
+    const size_t available = free_now > reserved ? free_now - reserved : 0;
     return (size_t) remote * plan.layer_bytes <= available - available / 10 ? remote : remote_layers_;
 }
 
@@ -1002,16 +1015,57 @@ GenerateResult Qwen4ExpBackend::restore_and_generate_impl(
     return run(req, io, pos, slot);
 }
 
-bool Qwen4ExpBackend::handle_compress(const std::string & line,
-                                      const DaemonIO & io) {
-    (void) line;
-    (void) io;
-    return false;
+ModelBackend::CompressResult Qwen4ExpBackend::compress(const CompressRequest & req) {
+    const auto results = compress_batch({req});
+    return results.empty() ? CompressResult{} : results.front();
 }
 
-void Qwen4ExpBackend::free_drafter() {}
+std::vector<ModelBackend::CompressResult> Qwen4ExpBackend::compress_batch(
+        const std::vector<CompressRequest> & requests) {
+    bool was_parked = false;
+    PFlashWindow window;
+    window.tag = "qwen4exp-pflash";
+    // Parking releases the target's and the expert device's buffers: drain
+    // their queued work first.
+    window.drain = [this] {
+        if (backend_) ggml_backend_synchronize(backend_);
+        if (weights_.expert_backend) ggml_backend_synchronize(weights_.expert_backend);
+    };
+    window.park = [&] {
+        was_parked = parked_;
+        return park(ParkTarget::TargetModel);
+    };
+    // unpark sizes the target for the memory free then, so a drafter that
+    // stays loaded is accounted for.
+    window.unpark = [&] { return was_parked || unpark(ParkTarget::TargetModel); };
+    window.release = [this] { free_drafter(); };
+    window.shared_backends = {backend_, weights_.expert_backend};
+    window.engine_max_ctx = cfg_.device.max_ctx;
+    return pflash_compress_batch(drafter_ctx_, drafter_loaded_, requests, window);
+}
+
+bool Qwen4ExpBackend::handle_compress(const std::string & line,
+                                      const DaemonIO & io) {
+    CompressRequest req;
+    if (!pflash_parse_compress_line(line, req) || req.drafter_path.empty()) {
+        std::fprintf(stderr, "[qwen4exp-pflash] bad compress arguments\n");
+        io.emit(-1);
+        return false;
+    }
+    const CompressResult result = compress(req);
+    for (int32_t token : result.compressed_ids) io.emit(token);
+    io.emit(-1);
+    return result.ok;
+}
+
+void Qwen4ExpBackend::free_drafter() {
+    if (!drafter_loaded_ && !drafter_ctx_.backend) return;
+    luce::common::free_drafter(drafter_ctx_);
+    drafter_loaded_ = false;
+}
 
 void Qwen4ExpBackend::shutdown() {
+    free_drafter();
     if (backend_) release_target();
     free_snapshot_backend(snap_backend_, backend_);
     snap_backend_ = nullptr;

@@ -77,7 +77,7 @@ inline constexpr ArchCapabilities kArchCapabilities[] = {
     {"qwen35",     true,  true,  true,  false,  true,    kBoth, kBoth, kNever, kMono,  kBoth, kBoth,  kMono},
     {"qwen35moe",  false, false, false, true,   true,    kMono, kMono, kNever, kNever, kMono, kMono,  kNever},
     {"bailingmoe3",false, false, false, false,  false,   kNever,kNever,kNever, kNever, kNever,kNever, kNever},
-    {"qwen4exp",   false, false, false, false,  false,   kMono, kNever,kMono,  kNever, kNever,kNever, kNever},
+    {"qwen4exp",   false, false, true,  false,  false,   kMono, kNever,kMono,  kNever, kNever,kNever, kNever},
     {"laguna",     true,  false, false, true,   true,    kMono, kMono, kMono,  kNever, kNever,kNever, kNever},
     {"qwen3",      false, false, true,  false,  false,   kNever, kNever, kNever, kNever, kNever,kNever, kNever},
     {"gemma4",     true,  false, false, false,  true,    kMono, kNever, kNever, kNever, kBoth,kNever, kNever},

@@ -206,6 +206,8 @@ What we built:
 
 - **Single 24 GB GPU** target (RTX 3090 reference). On 32+ GB cards, drafter + target can coexist and the park/unpark dance disappears.
 - **Qwen3.6-27B Q4_K_M target + Qwen3.5-0.8B drafter** is the validated pair. Other targets/drafters need keep-ratio re-calibration.
+- **Any target model.** The drafter scores the prompt on its own, so what it keeps does not depend on the model that serves it. A backend only says how it frees memory for the drafter and gets it back (`server/src/pflash/pflash_window.h`); loading, scoring and releasing the drafter are shared. Today: Qwen3.5/3.6 (`qwen35`, also layer-split), Qwen3 (`qwen3`), Qwen3.8-Flash (`qwen4exp`) and DeepSeek V4/V4.1 (`deepseek4`, `deepseek41`). Qwen3.8-Flash sizes its context to its GPUs, so with PFlash on it keeps the drafter's room free (its weights plus 56 KiB per context token) on whichever of its GPUs (target or expert device) the drafter shares, and never parks.
+- **Concurrent serving** (`--max-concurrency > 1`) with PFlash is dense Qwen3.5 only: its scheduler scores prompts on a thread of its own while the other slots decode. Other models compress one request at a time, and the engine refuses PFlash with more than one slot (`--pflash auto` turns PFlash off instead).
 - **NIAH single-needle** is the only retrieval task validated end-to-end. Multi-doc QA, long-form code retrieval, etc. still TBD.
 
 ## Operator notes

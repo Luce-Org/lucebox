@@ -7,6 +7,7 @@
 
 #include "common/model_backend.h"
 #include "common/prompt_lookup.h"
+#include "pflash/pflash_drafter.h"
 #include "placement/placement_config.h"
 
 #include "qwen4exp_internal.h"
@@ -37,6 +38,12 @@ struct Qwen4ExpBackendConfig {
     std::string     expert_placement_path;  // routing-stats CSV: its most-routed experts run on `device`
     int             chunk     = 0;  // auto: measured allocation budget
     int             max_concurrency = 1;
+    // PFlash: the drafter scores beside the model on GPU pflash_gpu (-1: no
+    // drafter), which keeps pflash_bytes plus pflash_bytes_per_token per
+    // context position free on that device.
+    int             pflash_gpu = -1;
+    size_t          pflash_bytes = 0;
+    size_t          pflash_bytes_per_token = 0;
 };
 
 class Qwen4ExpBackend final : public ModelBackend {
@@ -78,9 +85,15 @@ public:
                                              const GenerateRequest & req,
                                              const DaemonIO & io) override;
 
+    // PFlash: the drafter scores the prompt beside the target, or in the
+    // memory a park frees (pflash_window.h).
+    CompressResult compress(const CompressRequest & req) override;
+    std::vector<CompressResult> compress_batch(
+        const std::vector<CompressRequest> & requests) override;
     bool handle_compress(const std::string & line,
                          const DaemonIO & io) override;
     void free_drafter() override;
+    bool pflash_gives_candidate_scores() const override { return true; }
 
     void shutdown() override;
     SeqEngine * seq_engine() override { return seq_engine_.get(); }
@@ -96,6 +109,7 @@ private:
     int plan_chunk(Qwen4ExpChunkPlan * plan = nullptr);
     int remote_layers_for(const Qwen4ExpChunkPlan & plan, size_t missing) const;
     bool start_seq_engine(); // no-op at --max-concurrency 1
+    size_t pflash_reserve(ggml_backend_t device) const;
     // Weights, caches, hot experts, the prefill chunk and the prefix allowance, then the slot engine: init and
     // unpark share it, so an unpark sizes itself for the memory free at that time. release_target() undoes it.
     bool load_target();
@@ -117,6 +131,8 @@ private:
     std::vector<Qwen4ExpCache> seq_caches_;
     std::unique_ptr<Qwen4ExpSeqEngine> seq_engine_;
     bool                  parked_  = false;
+    DrafterContext        drafter_ctx_;          // PFlash drafter, loaded at the first compress
+    bool                  drafter_loaded_ = false;
     // The adaptive MTP verify width, kept across requests with its costs per context range.
     AdaptiveSpecWidth     mtp_width_ = qwen4exp_mtp_width_controller();
     SpecWidthCostMemory   mtp_costs_;

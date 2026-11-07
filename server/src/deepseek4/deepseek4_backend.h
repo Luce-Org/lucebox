@@ -253,8 +253,6 @@ private:
     std::vector<float>             spec_feat_window_;
     DrafterContext                 pflash_drafter_ctx_;
     bool                           pflash_drafter_loaded_ = false;
-    std::string                    pflash_drafter_path_;
-    int                            pflash_drafter_gpu_ = -1;
     // Once a long prompt selects the fragmentation-safe prefill shape, retain
     // it for later requests so the HIP arenas never switch back under load.
     int                            hybrid_prefill_chunk_cap_ = 0;

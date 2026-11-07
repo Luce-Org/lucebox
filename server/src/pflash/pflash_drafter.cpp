@@ -77,7 +77,9 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
         out.gpu = gpu;
     }
 
-    return load_qwen35_drafter(gguf_path, out);
+    if (!load_qwen35_drafter(gguf_path, out)) return false;
+    out.path = gguf_path;
+    return true;
 }
 
 void free_drafter(DrafterContext & ctx) {
@@ -99,6 +101,7 @@ void free_drafter_weights(DrafterContext & ctx) {
         free_qwen35_drafter_state(ctx);
     }
     ctx.loaded = false;
+    ctx.path.clear();
 }
 
 std::vector<int32_t> drafter_score_and_compress(
