@@ -1,7 +1,113 @@
 #include "norm.cuh"
+#include "mmq.cuh"  // block_q8_1_mmq, mmq_q8_1_ds_layout (the q8_1 MMQ rows below)
+#include "unary.cuh"  // ggml_cuda_op_silu_single
 #include <climits>
 #include <cmath>
 #include <cstdint>
+
+// The q8_1 MMQ rows of one finished
+// norm output row, byte for byte what quantize_mmq_q8_1<ds_layout>
+// (quantize.cu) writes for an MMQ src1 of ne1 contiguous rows in one channel
+// (no ids, no groups). `x` is the F32 row: ne00 values (a multiple of 4),
+// padded with zeros to ne0 (a multiple of MATRIX_ROW_PADDING); i1 is its row.
+//
+// The loop body is quantize_mmq_q8_1's, statement for statement:
+//   - each thread takes 4 consecutive values, and lane l of a warp takes the
+//     values 4l..4l+3 of a 128-value block, as there (block_size is a
+//     multiple of the warp, so every warp covers one whole block per
+//     iteration and, 128 dividing ne0, is all inside ne0 or all past it);
+//   - amax is the same fmaxf chain, then the same xor shuffles;
+//   - the DS4 / D2S6 sum is x+y+z+w, then the same xor shuffles in the same
+//     order;
+//   - d_inv = 127/amax, q = roundf(x*d_inv), d = 1/d_inv, stored at the same
+//     block, lane and scale slot.
+// Its early `return`s are `continue`s here (one 4-value group per
+// iteration). The caller wrote the row and synchronized the block first: the
+// values are read back from memory, as quantize_mmq_q8_1 reads them, so the
+// norm's products cannot be contracted into these sums.
+template <int block_size, mmq_q8_1_ds_layout ds_layout>
+static __device__ __forceinline__ void norm_row_q8_1_mmq(
+        const float * x, block_q8_1_mmq * y, const int64_t i1, const int64_t ne1,
+        const int64_t ne00, const int64_t ne0) {
+    static_assert(block_size % WARP_SIZE == 0, "a warp must take whole 128-value blocks");
+
+    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
+
+    const float4 * x4 = (const float4 *) x;
+
+    for (int64_t i0 = 4*(int64_t) threadIdx.x; i0 < ne0; i0 += 4*block_size) {
+        const int64_t ib  = (i0 / (4*QK8_1))*ne1 + i1; // block index in channel
+        const int64_t iqs = i0 % (4*QK8_1);            // quant index in block
+
+        // Load 4 floats per thread and calculate max. abs. value between them.
+        const float4 xi = i0 < ne00
+            ? x4[i0/4]
+            : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float amax = fabsf(xi.x);
+        amax = fmaxf(amax, fabsf(xi.y));
+        amax = fmaxf(amax, fabsf(xi.z));
+        amax = fmaxf(amax, fabsf(xi.w));
+
+        // Exchange max. abs. value between vals_per_scale/4 threads.
+#pragma unroll
+        for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+        }
+
+        float sum;
+        if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+            sum = xi.x + xi.y + xi.z + xi.w;
+
+            // Calculate sums across vals_per_sum/4 threads.
+#pragma unroll
+            for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+                sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+            }
+        }
+
+        const float d_inv = 127.0f / amax;
+        char4 q;
+        q.x = roundf(xi.x*d_inv);
+        q.y = roundf(xi.y*d_inv);
+        q.z = roundf(xi.z*d_inv);
+        q.w = roundf(xi.w*d_inv);
+
+        // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
+        char4 * yqs4 = (char4 *) y[ib].qs;
+        yqs4[iqs/4] = q;
+
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+            if (iqs % 16 != 0 || iqs >= 96) {
+                continue;
+            }
+
+            y[ib].d2s6[2 + iqs/16] = sum;
+
+            if (iqs % 64 != 0) {
+                continue;
+            }
+
+            const float d = 1.0f / d_inv;
+
+            y[ib].d2s6[iqs/64] = d;
+
+            continue;
+        }
+
+        if (iqs % 32 != 0) {
+            continue;
+        }
+
+        const float d = 1.0f / d_inv;
+
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+            y[ib].ds4[iqs/32] = make_half2(d, sum);
+        } else {
+            y[ib].d4[iqs/32]  = d;
+        }
+    }
+}
 
 #if defined(GGML_HIP_DS4V_VISION)
 bool ggml_hip_vision_norm_capable(int device) {
@@ -135,7 +241,11 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false, bool do_q8 = false>
+// q8_mmq_layout: an mmq_q8_1_ds_layout, or -1. With a layout,
+// `q8` holds block_q8_1_mmq rows (as many bytes per row as block_q8_1 rows)
+// and ncols_q8 is ncols padded to MATRIX_ROW_PADDING: the finished row is
+// also written in the form quantize_mmq_q8_1 gives it (norm_row_q8_1_mmq).
+template <int block_size, bool do_multiply = false, bool do_add = false, bool do_q8 = false, int q8_mmq_layout = -1>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -240,6 +350,16 @@ static __global__ void rms_norm_f32(const float * x,
             dst[col] = scale * x[col];
         }
     }
+
+    if constexpr (q8_mmq_layout >= 0) {
+        static_assert(do_multiply && !do_add && !do_q8, "q8_1 MMQ output is fused with rms_norm * w only");
+        // Every thread's part of the row is written: read it back whole.
+        __syncthreads();
+        const int64_t i1  = ((int64_t) sample*nchannels + channel)*nrows + row;
+        const int64_t ne1 = (int64_t) nrows*nchannels*gridDim.z;
+        norm_row_q8_1_mmq<block_size, (mmq_q8_1_ds_layout) q8_mmq_layout>(
+            dst, (block_q8_1_mmq *) q8, i1, ne1, ncols, ncols_q8);
+    }
 }
 
 // Preserve the two-op RMS_NORM -> SCALE rounding, including the intermediate
@@ -291,14 +411,19 @@ void ggml_cuda_op_rms_norm_scale(ggml_backend_cuda_context & ctx, ggml_tensor * 
 //   sum = a + b            (written to sum_out; it is the next residual)
 //   dst = rms_norm(sum) * w
 // All of a, b, sum_out, dst are contiguous [ncols, R]; w is [ncols].
-template <int block_size>
+// q8_mmq_layout: as for rms_norm_f32; with a layout, the
+// finished dst row is also written to q8 as block_q8_1_mmq rows (ncols_q8 is
+// ncols padded to MATRIX_ROW_PADDING, the R rows one channel).
+template <int block_size, int q8_mmq_layout = -1>
 static __global__ void add_rms_norm_mul_f32(const float * __restrict__ a,
                                             const float * __restrict__ b,
                                             float *       __restrict__ sum_out,
                                             float *       __restrict__ dst,
                                             const float * __restrict__ w,
                                             const int     ncols,
-                                            const float   eps) {
+                                            const float   eps,
+                                            block_q8_1_mmq * __restrict__ q8 = nullptr,
+                                            const int     ncols_q8 = 0) {
     const int64_t row = blockIdx.x;
     const int     tid = threadIdx.x;
 
@@ -323,11 +448,58 @@ static __global__ void add_rms_norm_mul_f32(const float * __restrict__ a,
     for (int col = tid; col < ncols; col += block_size) {
         dst[col] = scale * sum_out[col] * w[col];
     }
+
+    if constexpr (q8_mmq_layout >= 0) {
+        // Every thread's part of the row is written: read it back whole.
+        __syncthreads();
+        norm_row_q8_1_mmq<block_size, (mmq_q8_1_ds_layout) q8_mmq_layout>(
+            dst, q8, row, gridDim.x, ncols, ncols_q8);
+    }
 }
 
+template <int block_size>
+static void add_rms_norm_mul_q8_mmq_f32_cuda(const float * a, const float * b, float * sum_out, float * dst,
+                                             const float * w, const int ncols, const int64_t nrows,
+                                             const float eps, cudaStream_t stream,
+                                             block_q8_1_mmq * q8, const int q8_mmq_layout) {
+    const dim3 blocks_num(nrows, 1, 1);
+    const dim3 block_dims(block_size, 1, 1);
+    const int  ncols_q8 = GGML_PAD(ncols, MATRIX_ROW_PADDING);
+    switch (q8_mmq_layout) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            add_rms_norm_mul_f32<block_size, MMQ_Q8_1_DS_LAYOUT_D4><<<blocks_num, block_dims, 32 * sizeof(float), stream>>>(
+                a, b, sum_out, dst, w, ncols, eps, q8, ncols_q8);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            add_rms_norm_mul_f32<block_size, MMQ_Q8_1_DS_LAYOUT_DS4><<<blocks_num, block_dims, 32 * sizeof(float), stream>>>(
+                a, b, sum_out, dst, w, ncols, eps, q8, ncols_q8);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            add_rms_norm_mul_f32<block_size, MMQ_Q8_1_DS_LAYOUT_D2S6><<<blocks_num, block_dims, 32 * sizeof(float), stream>>>(
+                a, b, sum_out, dst, w, ncols, eps, q8, ncols_q8);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
+// q8_mmq: optional, the q8_1 MMQ rows of dst in layout
+// q8_mmq_layout (an mmq_q8_1_ds_layout); null keeps the plain kernels.
 static void add_rms_norm_mul_f32_cuda(const float * a, const float * b, float * sum_out, float * dst,
                                       const float * w, const int ncols, const int64_t nrows,
-                                      const float eps, cudaStream_t stream) {
+                                      const float eps, cudaStream_t stream,
+                                      void * q8_mmq = nullptr, const int q8_mmq_layout = -1) {
+    if (q8_mmq != nullptr) {
+        GGML_ASSERT(ncols % 4 == 0);
+        if (ncols < 1024) {
+            add_rms_norm_mul_q8_mmq_f32_cuda<256>(a, b, sum_out, dst, w, ncols, nrows, eps, stream,
+                                                  (block_q8_1_mmq *) q8_mmq, q8_mmq_layout);
+        } else {
+            add_rms_norm_mul_q8_mmq_f32_cuda<1024>(a, b, sum_out, dst, w, ncols, nrows, eps, stream,
+                                                   (block_q8_1_mmq *) q8_mmq, q8_mmq_layout);
+        }
+        return;
+    }
     const dim3 blocks_num(nrows, 1, 1);
     if (ncols < 1024) {
         const dim3 block_dims(256, 1, 1);
@@ -495,6 +667,57 @@ static void rms_norm_f32_cuda(
     }
 }
 
+// RMS_NORM * w that also writes the q8_1 MMQ rows of dst: the
+// MMQ buffer travels in rms_norm_f32's q8 argument, ncols_q8 the padded row.
+template <int block_size>
+static void rms_norm_mul_q8_mmq_f32_cuda(const dim3 &   blocks_num,
+                                         const float *  x,
+                                         const float *  mul,
+                                         float *        dst,
+                                         const int      ncols,
+                                         const int64_t  stride_row,
+                                         const int64_t  stride_channel,
+                                         const int64_t  stride_sample,
+                                         const int64_t  mul_stride_row,
+                                         const int64_t  mul_stride_channel,
+                                         const int64_t  mul_stride_sample,
+                                         const uint3    mul_ncols_packed,
+                                         const uint3    mul_nrows_packed,
+                                         const uint3    mul_nchannels_packed,
+                                         const uint3    mul_nsamples_packed,
+                                         const float    eps,
+                                         cudaStream_t   stream,
+                                         void *         q8_mmq,
+                                         const int      q8_mmq_layout) {
+    const dim3   block_dims(block_size, 1, 1);
+    const size_t smem     = block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0;
+    const uint3  z        = make_uint3(0, 0, 0);
+    const int    ncols_q8 = GGML_PAD(ncols, MATRIX_ROW_PADDING);
+    block_q8_1 * q8       = (block_q8_1 *) q8_mmq;
+    switch (q8_mmq_layout) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            rms_norm_f32<block_size, true, false, false, MMQ_Q8_1_DS_LAYOUT_D4><<<blocks_num, block_dims, smem, stream>>>(
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                nullptr, 0, 0, 0, z, z, z, z, q8, ncols_q8);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            rms_norm_f32<block_size, true, false, false, MMQ_Q8_1_DS_LAYOUT_DS4><<<blocks_num, block_dims, smem, stream>>>(
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                nullptr, 0, 0, 0, z, z, z, z, q8, ncols_q8);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            rms_norm_f32<block_size, true, false, false, MMQ_Q8_1_DS_LAYOUT_D2S6><<<blocks_num, block_dims, smem, stream>>>(
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                nullptr, 0, 0, 0, z, z, z, z, q8, ncols_q8);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
 static void rms_norm_mul_f32_cuda(const float *  x,
                                   const float *  mul,
                                   const float *  add,
@@ -523,7 +746,9 @@ static void rms_norm_mul_f32_cuda(const float *  x,
                                   const float    eps,
                                   cudaStream_t   stream,
                                   block_q8_1 *   q8 = nullptr,
-                                  const int      ncols_q8 = 0) {
+                                  const int      ncols_q8 = 0,
+                                  void *         q8_mmq = nullptr,
+                                  const int      q8_mmq_layout = -1) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (mul == nullptr) {
         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
@@ -535,6 +760,20 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
         const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
         const uint3 z = make_uint3(0, 0, 0);
+        if (q8_mmq != nullptr) {
+            // The q8_1 MMQ rows instead of the MMVQ ones.
+            GGML_ASSERT(q8 == nullptr && ncols % 4 == 0);
+            if (ncols < 1024) {
+                rms_norm_mul_q8_mmq_f32_cuda<256>(blocks_num, x, mul, dst, ncols, stride_row, stride_channel,
+                    stride_sample, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed,
+                    mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, eps, stream, q8_mmq, q8_mmq_layout);
+            } else {
+                rms_norm_mul_q8_mmq_f32_cuda<1024>(blocks_num, x, mul, dst, ncols, stride_row, stride_channel,
+                    stride_sample, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed,
+                    mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, eps, stream, q8_mmq, q8_mmq_layout);
+            }
+            return;
+        }
         if (ncols < 1024) {
             const dim3 block_dims(256, 1, 1);
             if (q8) {
@@ -679,7 +918,7 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
-                                 void * q8_out, int ncols_q8) {
+                                 void * q8_out, int ncols_q8, void * q8_mmq, int q8_mmq_layout) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
 
@@ -729,6 +968,11 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
 
+    if (q8_mmq != nullptr) {
+        // One channel of contiguous rows: the MMQ src1 the q8_1 rows are for.
+        GGML_ASSERT(q8_out == nullptr && ggml_is_contiguous(mul_tensor) && ne02 == 1 && ne03 == 1 && ne00 % 4 == 0);
+    }
+
     rms_norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
                           ne00, ne01, ne02, ne03,
                           /*s00*/ s01, s02, s03,
@@ -736,7 +980,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
-                          eps, stream, (block_q8_1 *) q8_out, ncols_q8);
+                          eps, stream, (block_q8_1 *) q8_out, ncols_q8, q8_mmq, q8_mmq_layout);
 }
 
 // dflash: ADD (residual) + RMS_NORM + MUL in one launch. `add_tensor` is the
@@ -745,7 +989,9 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
 void ggml_cuda_op_add_rms_norm_mul_fused(ggml_backend_cuda_context & ctx,
                                          ggml_tensor *               add_tensor,
                                          ggml_tensor *               rms_tensor,
-                                         ggml_tensor *               mul_tensor) {
+                                         ggml_tensor *               mul_tensor,
+                                         void *                      q8_mmq,
+                                         int                         q8_mmq_layout) {
     const ggml_tensor * a = add_tensor->src[0];
     const ggml_tensor * b = add_tensor->src[1];
     const ggml_tensor * w = (mul_tensor->src[0] == rms_tensor) ? mul_tensor->src[1] : mul_tensor->src[0];
@@ -763,10 +1009,14 @@ void ggml_cuda_op_add_rms_norm_mul_fused(ggml_backend_cuda_context & ctx,
 
     const int     ncols = (int) a->ne[0];
     const int64_t nrows = ggml_nrows(a);
+    if (q8_mmq != nullptr) {
+        // One channel of rows: the MMQ src1 the q8_1 rows are for.
+        GGML_ASSERT(mul_tensor->ne[2] == 1 && mul_tensor->ne[3] == 1 && ncols % 4 == 0);
+    }
 
     add_rms_norm_mul_f32_cuda((const float *) a->data, (const float *) b->data,
                               (float *) add_tensor->data, (float *) mul_tensor->data,
-                              (const float *) w->data, ncols, nrows, eps, ctx.stream());
+                              (const float *) w->data, ncols, nrows, eps, ctx.stream(), q8_mmq, q8_mmq_layout);
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
@@ -905,4 +1155,112 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+// Parity tests: the two norm producers on raw device pointers,
+// with (q8 non-null, the layout of weight type q8_type) or without their
+// q8_1 MMQ rows. kind 0: ADD + RMS_NORM + MUL (sum_out = a + b, dst =
+// rms_norm(sum_out) * w); kind 1: RMS_NORM + MUL (dst = rms_norm(a) * w; b
+// and sum_out unused). Rows are contiguous [ncols, nrows], w is [ncols].
+// Synchronizes `stream`; 1 on success.
+extern "C" { GGML_BACKEND_API int ggml_cuda_test_norm_q8_mmq(int kind, const float * a, const float * b,
+        float * sum_out, float * dst, const float * w, int ncols, int nrows, float eps, void * q8, int q8_type,
+        void * stream) {
+    if (!a || !dst || !w || ncols <= 0 || nrows <= 0 || ncols % 4 != 0 || (kind == 0 && (!b || !sum_out)) ||
+        (kind != 0 && kind != 1)) {
+        return 0;
+    }
+    const int layout = q8 ? (int) mmq_get_q8_1_ds_layout((ggml_type) q8_type) : -1;
+    cudaStream_t s = (cudaStream_t) stream;
+    if (kind == 0) {
+        add_rms_norm_mul_f32_cuda(a, b, sum_out, dst, w, ncols, nrows, eps, s, q8, layout);
+    } else {
+        const int64_t plane = (int64_t) ncols * nrows;
+        rms_norm_mul_f32_cuda(a, w, nullptr, dst, ncols, nrows, 1, 1,
+                              /*s00*/ ncols, plane, plane,
+                              /*mul_s00*/ ncols, ncols, ncols,
+                              /*mul ne*/ (uint32_t) ncols, 1, 1, 1,
+                              /*add_s00*/ 0, 0, 0,
+                              0, 0, 0, 0,
+                              eps, s, nullptr, 0, q8, layout);
+    }
+    if (cudaGetLastError() != cudaSuccess) {
+        return 0;
+    }
+    return cudaStreamSynchronize(s) == cudaSuccess;
+} }
+
+
+// SWIGLU rows, op_silu(x) * g as
+// unary_gated_op_kernel computes them (F32, contiguous [nc, nrows] output),
+// that also write the q8_1 MMQ rows of their first MMQ reader, in its layout
+// (norm_row_q8_1_mmq on the finished row, as the norm producers do): the reader
+// and the later readers of that layout skip their quantize. One block per row.
+template <int block_size, mmq_q8_1_ds_layout ds_layout>
+static __global__ void swiglu_q8_mmq_kernel(const float * x, const float * g, float * dst, const int64_t nc,
+                                            const int64_t o0, const int64_t o1, block_q8_1_mmq * q8,
+                                            const int64_t ncols_q8) {
+    const int64_t row = blockIdx.x;
+    const float * xr = x + row*o0;
+    const float * gr = g + row*o1;
+    float * dr = dst + row*nc;
+    for (int64_t i = threadIdx.x; i < nc; i += block_size) {
+        dr[i] = ggml_cuda_op_silu_single(xr[i]) * gr[i];
+    }
+    __syncthreads();
+    norm_row_q8_1_mmq<block_size, ds_layout>(dr, q8, row, gridDim.x, nc, ncols_q8);
+}
+
+bool ggml_cuda_op_swiglu_q8_mmq_supported(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (dst->op != GGML_OP_GLU || ggml_get_glu_op(dst) != GGML_GLU_OP_SWIGLU ||
+        dst->type != GGML_TYPE_F32 || src0 == nullptr || src0->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(dst) || !ggml_is_contiguous_1(src0) || src0->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (src1 != nullptr && (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(src1) ||
+                            src1->nb[0] != sizeof(float))) {
+        return false;
+    }
+    const int64_t nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    return dst->ne[0] == nc && nc % 4 == 0 && ggml_nrows(dst) == ggml_nrows(src0) &&
+           ggml_nrows(dst) <= INT_MAX;
+}
+
+void ggml_cuda_op_swiglu_q8_mmq(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8, const int layout) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int64_t nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int32_t swapped = ((const int32_t *) dst->op_params)[1];
+    const float * x = (const float *) src0->data;
+    const float * g = src1 ? (const float *) src1->data : (const float *) src0->data;
+    if (!src1) {
+        x += swapped ? nc : 0;
+        g += swapped ? 0 : nc;
+    }
+    const int64_t o0 = src0->nb[1] / sizeof(float);
+    const int64_t o1 = (src1 ? src1->nb[1] : src0->nb[1]) / sizeof(float);
+    const int64_t nrows = ggml_nrows(dst);
+    const int64_t ncols_q8 = GGML_PAD(nc, MATRIX_ROW_PADDING);
+    constexpr int block_size = 1024;
+    const dim3 blocks((unsigned) nrows, 1, 1);
+    cudaStream_t stream = ctx.stream();
+    block_q8_1_mmq * y = (block_q8_1_mmq *) q8;
+    switch (layout) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            swiglu_q8_mmq_kernel<block_size, MMQ_Q8_1_DS_LAYOUT_D4><<<blocks, block_size, 0, stream>>>(
+                x, g, (float *) dst->data, nc, o0, o1, y, ncols_q8);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            swiglu_q8_mmq_kernel<block_size, MMQ_Q8_1_DS_LAYOUT_DS4><<<blocks, block_size, 0, stream>>>(
+                x, g, (float *) dst->data, nc, o0, o1, y, ncols_q8);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            swiglu_q8_mmq_kernel<block_size, MMQ_Q8_1_DS_LAYOUT_D2S6><<<blocks, block_size, 0, stream>>>(
+                x, g, (float *) dst->data, nc, o0, o1, y, ncols_q8);
+            break;
+        default:
+            GGML_ABORT("swiglu q8 mmq: bad layout");
+    }
 }

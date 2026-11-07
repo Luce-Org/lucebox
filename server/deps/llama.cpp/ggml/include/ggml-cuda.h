@@ -97,6 +97,14 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count(voi
 // Calling-thread count of MMQ calls that skipped their src1 quantize because
 // the Q8 memo served an earlier call's q8_1.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_glue_q8_memo_hit_count(void);
+// Calling-thread count of producer launches (RMS norm, SWIGLU) that also
+// wrote the q8_1 MMQ rows of their output into a Q8 memo entry, so that their
+// first MMQ reader skips its quantize too.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_glue_q8_producer_count(void);
+
+// Tests only: turn those producer writes on or off, to compare them bit for
+// bit with the readers quantizing the F32 output themselves. On by default.
+GGML_BACKEND_API void ggml_backend_cuda_set_glue_q8_producers_override(bool on);
 
 // Tests only: turn the Q8 memo on or off, to compare its outputs bit for bit
 // with per-call quantization. On by default.

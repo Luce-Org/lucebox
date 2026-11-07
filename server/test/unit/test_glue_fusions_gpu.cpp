@@ -17,7 +17,10 @@
 // arm's hashes to equal base's, its MMQ counts too (less the stacked FFN
 // GEMMs of the gateup arms), base to make no memo hit, an
 // arm with the memo on to hit exactly where glue-q8-memo.h allows it (on a
-// legacy-pool device; a VMM pool keeps the memo inert), the strided arms to
+// legacy-pool device; a VMM pool keeps the memo inert), plus one hit per q8_1
+// producer write (an RMS norm or SWIGLU that wrote its first MMQ reader's
+// rows: that reader's quantize becomes a hit; the tiny target must have
+// some), the strided arms to
 // drop exactly the three copies of the tiny target's DeltaNet layer, and the
 // gateup arms exactly one GEMM per FFN of its 16-token verify graph.
 //
@@ -202,6 +205,7 @@ struct GraphRun {
     std::map<std::string, bool> checks;   // in-process pair comparisons
     size_t mmq = 0;
     size_t hits = 0;
+    size_t writes = 0;   // q8_1 producer writes (ggml_backend_cuda_get_glue_q8_producer_count)
     bool finite = true;
     int n_cont = 0;      // tiny target: CONT nodes of the first 16-token verify graph
     int n_mul_mat = 0;   // tiny target: MUL_MAT nodes of that graph
@@ -220,10 +224,12 @@ bool compute(ggml_backend_t gpu, ggml_cgraph * gf, const std::vector<std::pair<g
     }
     const size_t mmq0 = ggml_backend_cuda_get_mmq_launch_count();
     const size_t hit0 = ggml_backend_cuda_get_glue_q8_memo_hit_count();
+    const size_t wr0 = ggml_backend_cuda_get_glue_q8_producer_count();
     const bool ok = ggml_backend_graph_compute(gpu, gf) == GGML_STATUS_SUCCESS;
     ggml_backend_synchronize(gpu);
     run.mmq += ggml_backend_cuda_get_mmq_launch_count() - mmq0;
     run.hits += ggml_backend_cuda_get_glue_q8_memo_hit_count() - hit0;
+    run.writes += ggml_backend_cuda_get_glue_q8_producer_count() - wr0;
     for (const Output & o : outs) {
         std::vector<float> host((size_t) ggml_nelements(o.t));
         ggml_backend_tensor_get(o.t, host.data(), 0, host.size() * sizeof(float));
@@ -709,6 +715,7 @@ bool run_tiny_target(ggml_backend_t gpu, GraphRun & run) {
         target.set_fast_rollback(true);
         const size_t mmq0 = ggml_backend_cuda_get_mmq_launch_count();
         const size_t hit0 = ggml_backend_cuda_get_glue_q8_memo_hit_count();
+        const size_t wr0 = ggml_backend_cuda_get_glue_q8_producer_count();
         int last = -1;
         std::vector<int32_t> argmax;
         std::vector<float> logits;
@@ -747,6 +754,7 @@ bool run_tiny_target(ggml_backend_t gpu, GraphRun & run) {
         ggml_backend_synchronize(gpu);
         run.mmq += ggml_backend_cuda_get_mmq_launch_count() - mmq0;
         run.hits += ggml_backend_cuda_get_glue_q8_memo_hit_count() - hit0;
+        run.writes += ggml_backend_cuda_get_glue_q8_producer_count() - wr0;
     }
     luce::common::step_graph_destroy(sg);
     return ok;
@@ -770,8 +778,8 @@ bool count_tiny_tree_graph(ggml_backend_t gpu, GraphRun & run) {
 }
 
 void print_graph(const char * name, const GraphRun & r) {
-    std::printf("graph %s mmq=%zu hits=%zu finite=%d cont=%d mul_mat=%d\n", name, r.mmq, r.hits,
-                r.finite ? 1 : 0, r.n_cont, r.n_mul_mat);
+    std::printf("graph %s mmq=%zu hits=%zu writes=%zu finite=%d cont=%d mul_mat=%d\n", name, r.mmq, r.hits,
+                r.writes, r.finite ? 1 : 0, r.n_cont, r.n_mul_mat);
     for (const auto & [out, h] : r.hashes) {
         std::printf("out %s/%s hash=%016llx\n", name, out.c_str(), (unsigned long long) h);
     }
@@ -870,6 +878,7 @@ struct Arm {
 struct GraphStats {
     size_t mmq = 0;
     size_t hits = 0;
+    size_t writes = 0;
     bool finite = false;
     int n_cont = 0;
     int n_mul_mat = 0;
@@ -944,8 +953,8 @@ bool run_child(const Arm & arm, ArmRun & run) {
             run.legacy_pool = legacy != 0;
         } else if (std::sscanf(line.c_str(), "stack exact=%d", &exact) == 1) {
             run.stack_exact = exact != 0;
-        } else if (std::sscanf(line.c_str(), "graph %127s mmq=%zu hits=%zu finite=%d cont=%d mul_mat=%d", name,
-                               &gs.mmq, &gs.hits, &finite, &gs.n_cont, &gs.n_mul_mat) == 6) {
+        } else if (std::sscanf(line.c_str(), "graph %127s mmq=%zu hits=%zu writes=%zu finite=%d cont=%d mul_mat=%d",
+                               name, &gs.mmq, &gs.hits, &gs.writes, &finite, &gs.n_cont, &gs.n_mul_mat) == 7) {
             gs.finite = finite != 0;
             run.graphs[name] = gs;
         } else if (std::sscanf(line.c_str(), "check %127s ok=%d", name, &finite) == 2) {
@@ -1031,8 +1040,10 @@ int parent_main() {
         }
     }
     // Memo hits: none with the memo off; with it on a legacy pool, exactly
-    // kQ8MemoHits in the q8 graph and kTinyMemoHits in the tiny target; none
-    // on a VMM pool (the memo stays inert there).
+    // kQ8MemoHits in the q8 graph and kTinyMemoHits in the tiny target, plus
+    // one per producer write (none without the memo; some in the tiny
+    // target, whose norms and SWIGLU feed MMQ); none on a VMM pool (the memo
+    // stays inert there).
     // Node counts of the tiny verify graph: STRIDED_GDN drops the beta, alpha
     // and z copies of its one DeltaNet layer.
     const GraphStats & tiny_base = runs[0].graphs["tiny"];
@@ -1054,9 +1065,16 @@ int parent_main() {
                      : name == "tiny" ? (gateup_on && runs[i].stack_exact ? kTinyMemoHitsStacked : kTinyMemoHits)
                      : 0;
             }
-            if (gs.hits != want) {
+            if (!(memo_on && runs[i].legacy_pool) && gs.writes != 0) {
+                fail(arm + " graph " + name + ": " + std::to_string(gs.writes) +
+                     " q8_1 producer writes without the memo");
+            }
+            if (memo_on && runs[i].legacy_pool && name == "tiny" && gs.writes == 0) {
+                fail(arm + " graph tiny: no q8_1 producer write");
+            }
+            if (gs.hits != want + gs.writes) {
                 fail(arm + " graph " + name + ": " + std::to_string(gs.hits) + " memo hits, want " +
-                     std::to_string(want));
+                     std::to_string(want) + " + " + std::to_string(gs.writes) + " producer writes");
             }
         }
         const GraphStats & tiny = runs[i].graphs["tiny"];

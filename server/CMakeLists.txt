@@ -1610,6 +1610,14 @@ if(LUCE_TESTS)
         target_include_directories(test_glue_fusions_gpu PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(test_glue_fusions_gpu PRIVATE luce_common ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_glue_fusions_gpu)
+        # The q8_1 producers (RMS norms, SWIGLU): their q8_1 MMQ rows byte for
+        # byte against quantize_mmq_q8_1 (kernel arm), and graphs
+        # bit-identical with the producers off, on and on without the memo,
+        # the producer writes and memo hits where the rules allow them. Same
+        # child-process arms as test_glue_fusions_gpu; labelled gpu below.
+        add_executable(test_glue_norm_q8_gpu test/unit/test_glue_norm_q8_gpu.cpp)
+        target_link_libraries(test_glue_norm_q8_gpu PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
+        list(APPEND _raw_unit_test_targets test_glue_norm_q8_gpu)
     endif()
     add_executable(test_qwen35_tensor_parallel test/unit/test_qwen35_tensor_parallel.cpp)
     target_include_directories(test_qwen35_tensor_parallel PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
@@ -3120,6 +3128,9 @@ if(LUCE_TESTS)
         endforeach()
         if(TARGET test_glue_fusions_gpu)
             set_tests_properties(test_glue_fusions_gpu PROPERTIES LABELS gpu)
+        endif()
+        if(TARGET test_glue_norm_q8_gpu)
+            set_tests_properties(test_glue_norm_q8_gpu PROPERTIES LABELS gpu)
         endif()
         # test_paged_attn_wmma runs one route per process (the env selects it
         # and the launch counter pins it), so the auto-registered case above

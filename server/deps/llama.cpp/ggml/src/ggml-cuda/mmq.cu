@@ -22,6 +22,7 @@ static thread_local size_t g_mmq_launch_count = 0;
 static thread_local size_t g_mmq_twin_rows64_launch_count = 0;
 static thread_local size_t g_mmq_twin_rows32_launch_count = 0;
 static thread_local size_t g_glue_q8_memo_hit_count = 0;
+static thread_local size_t g_glue_q8_producer_count = 0;
 
 extern "C" size_t ggml_backend_cuda_get_mmq_launch_count(void) {
     return g_mmq_launch_count;
@@ -55,6 +56,10 @@ extern "C" size_t ggml_backend_cuda_get_mmq_twin_launch_count(int tile_rows) {
 
 extern "C" size_t ggml_backend_cuda_get_glue_q8_memo_hit_count(void) {
     return g_glue_q8_memo_hit_count;
+}
+
+extern "C" size_t ggml_backend_cuda_get_glue_q8_producer_count(void) {
+    return g_glue_q8_producer_count;
 }
 
 // Q8 memo: reuse the q8_1 activation an earlier MMQ call of the same graph
@@ -198,6 +203,67 @@ void luce_glue_q8_release(ggml_backend_cuda_context & ctx, const luce_glue_q8_re
 }
 
 }  // namespace
+
+// The entry a producer (RMS norm, SWIGLU) writes (glue-q8-memo.cuh). Keyed, sized and planned as luce_glue_q8_acquire keys,
+// sizes and plans the entry of a quantizing call, with src1 the producer's
+// own output: the key (reshape root, data, ne, layout) and nbytes are those
+// the reader computes for it, so its lookup matches; created is the
+// producer's node, so the reader (created < cur) reuses it as well.
+char * ggml_cuda_glue_q8_memo_produce(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int at,
+                                      ggml_cuda_glue_q8_takes_mmq_t takes_mmq, int * layout) {
+    *layout = -1;
+    // Where luce_glue_q8_acquire would serve nothing, the readers quantize.
+    if (!ggml_cuda_glue_q8_memo_on() || !ctx.pool().is_legacy() ||
+        !ctx.stream_context().concurrent_events.empty() || ctx.curr_stream_no != 0) {
+        return nullptr;
+    }
+    if (graph == nullptr || at < 0 || at >= graph->n_nodes || takes_mmq == nullptr) {
+        return nullptr;
+    }
+    const ggml_tensor * t = graph->nodes[at];
+    // One channel of contiguous rows (ne1 = t->ne[1] in the MMQ layout) that
+    // the producer reads back four floats at a time.
+    if (!glue_q8_keyable(t) || t->ne[0] % 4 != 0 || t->ne[2] != 1 || t->ne[3] != 1) {
+        return nullptr;
+    }
+    const int first = glue_q8_first_reader(
+        graph->nodes, graph->n_nodes, at, t, luce_glue_q8_layout,
+        [&](const ggml_tensor * mm) { return takes_mmq(ctx, mm); }, LUCE_GLUE_Q8_WINDOW);
+    if (first < 0) {
+        return nullptr;
+    }
+    const int lay = luce_glue_q8_layout(graph->nodes[first]->src[0]->type);
+    luce_glue_q8_drop(ctx, graph, at - 1);
+    const glue_q8_plan plan = glue_q8_scan(
+        graph->nodes, graph->n_nodes, at, t, lay, luce_glue_q8_layout, LUCE_GLUE_Q8_WINDOW);
+    if (lay < 0 || plan.last_reader < first) {
+        return nullptr;  // not reached: the scan sees the same first reader
+    }
+    // ggml_cuda_mul_mat_q_impl's nbytes_src1_q8_1 for this src1 (ne12 = ne13 = 1).
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int64_t ne10_padded = GGML_PAD(t->ne[0], MATRIX_ROW_PADDING);
+    const size_t nbytes = t->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+
+    ggml_backend_cuda_context::luce_glue_q8_entry ent;
+    ent.graph = graph;
+    ent.root = (const void *) glue_q8_reshape_root(t);
+    ent.data = t->data;
+    for (int i = 0; i < 4; ++i) {
+        ent.ne[i] = t->ne[i];
+    }
+    ent.layout = lay;
+    ent.created = at;
+    ent.last_reader = plan.last_reader;
+    ent.clean_until = plan.clean_until;
+    ent.nbytes = nbytes;
+    ent.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes);
+    char * data = ent.buf->ptr;
+    ctx.luce_glue_q8.push_back(std::move(ent));
+    ++g_glue_q8_producer_count;
+    *layout = lay;
+    return data;
+}
 
 // On; tests turn it off to compare with per-call quantization.
 static std::atomic<bool> g_glue_q8_memo_on{true};

@@ -330,6 +330,25 @@ void quantize_mmq_q8_1_cuda(
     }
 }
 
+// Parity tests: quantize_mmq_q8_1 as ggml_cuda_mul_mat_q_impl
+// runs it for a contiguous [ncols, nrows] F32 src1 and weight type q8_type
+// (no ids, one channel, rows padded to MATRIX_ROW_PADDING). Synchronizes
+// `stream`; 1 on success.
+extern "C" { GGML_BACKEND_API int ggml_cuda_test_quantize_mmq_q8_1(const float * x, void * q8, int q8_type,
+        int ncols, int nrows, void * stream) {
+    if (!x || !q8 || ncols <= 0 || nrows <= 0 || ncols % 4 != 0) {
+        return 0;
+    }
+    cudaStream_t s = (cudaStream_t) stream;
+    const int64_t plane = (int64_t) ncols * nrows;
+    quantize_mmq_q8_1_cuda(x, nullptr, q8, (ggml_type) q8_type, ncols, /*s01*/ ncols, /*s02*/ plane, /*s03*/ plane,
+                           GGML_PAD((int64_t) ncols, MATRIX_ROW_PADDING), nrows, 1, 1, s);
+    if (cudaGetLastError() != cudaSuccess) {
+        return 0;
+    }
+    return cudaStreamSynchronize(s) == cudaSuccess;
+} }
+
 void quantize_mmq_q8_1_grouped_cuda(
         const float * x, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t group_width,

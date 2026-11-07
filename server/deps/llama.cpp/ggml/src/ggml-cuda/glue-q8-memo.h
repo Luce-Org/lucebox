@@ -142,3 +142,35 @@ inline glue_q8_plan glue_q8_scan(ggml_tensor * const * nodes, int n_nodes, int a
     }
     return plan;
 }
+
+// A producer at nodes[at] (an RMS norm or a SWIGLU) may write the q8_1 MMQ form of its F32 output `t` itself, in the
+// layout of the first matmul that would quantize it. That reader is the first
+// later MUL_MAT (within `window` nodes) that reads `t` (or a reshape of it
+// with the same ne), has a weight type MMQ serves (layout_of >= 0) and runs
+// MMQ (takes_mmq), before any node may write t's bytes; -1 when none does.
+// The producer's entry is then planned with glue_q8_scan from `at` in that
+// reader's layout, as if that reader had quantized it.
+template <typename LayoutOf, typename TakesMmq>
+inline int glue_q8_first_reader(ggml_tensor * const * nodes, int n_nodes, int at, const ggml_tensor * t,
+                                LayoutOf layout_of, TakesMmq takes_mmq, int window) {
+    if (!glue_q8_keyable(t) || at < 0 || at >= n_nodes) {
+        return -1;
+    }
+    const void * data = t->data;
+    const size_t nbytes = ggml_nbytes(t);
+    const int end = (window > 0 && n_nodes - at - 1 > window) ? at + 1 + window : n_nodes;
+    for (int j = at + 1; j < end; ++j) {
+        const ggml_tensor * n = nodes[j];
+        if (glue_q8_node_launches_nothing(n)) {
+            continue;
+        }
+        if (glue_q8_may_write(n, data, nbytes)) {
+            return -1;
+        }
+        if (n->op == GGML_OP_MUL_MAT && n->src[0] != nullptr && ggml_is_quantized(n->src[0]->type) &&
+            glue_q8_same_input(n->src[1], t) && layout_of(n->src[0]->type) >= 0 && takes_mmq(n)) {
+            return j;
+        }
+    }
+    return -1;
+}
