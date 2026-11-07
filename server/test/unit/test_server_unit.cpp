@@ -14995,6 +14995,39 @@ TEST_CASE(ServerUnitFixture, test_disk_tenant_usage_counts_against_the_one_budge
     rm_rf(dir);
 }
 
+// The one disk total and its parts: prefix files, pinned files and the tenant's sessions.
+TEST_CASE(ServerUnitFixture, test_disk_usage_splits_prefix_pins_and_sessions) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_usage_split").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 0;
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        auto store = shared_store(cfg);
+        TEST_ASSERT(store != nullptr);
+        TEST_ASSERT(store->usage().total() == 0);
+        const auto loose = disk_test_key(40, 1), pinned = disk_test_key(40, 500);
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), loose));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), pinned));
+        TEST_ASSERT(!cache.pin(pinned, true).empty());
+        cache.drain();
+        FakeTenant fake;
+        fake.units.push_back({1000, 12345, true});
+        const uint64_t id = store->attach_tenant(fake.tenant());
+        const DiskUsage u = store->usage();
+        TEST_ASSERT(u.sessions == 12345);
+        TEST_ASSERT(u.prefix > 0 && u.pins > 0);
+        TEST_ASSERT(u.prefix == u.pins);                                    // two files of one size, one of them pinned
+        TEST_ASSERT(u.prefix + u.pins == store->total_bytes());             // the files, once each
+        TEST_ASSERT(u.total() == store->total_bytes() + store->tenant_bytes());
+        store->detach_tenant(id);
+        TEST_ASSERT(store->usage().sessions == 0);
+    }
+    rm_rf(dir);
+}
+
 // One LRU across both kinds: whichever of the prefix file and the tenant unit was used least recently is evicted.
 TEST_CASE(ServerUnitFixture, test_disk_tenant_and_prefix_files_share_one_lru) {
     MockBackendWithAdopt backend;
@@ -18313,6 +18346,25 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_null_on_family_fallback) {
     TEST_ASSERT(body["budget_envelope"]["model_card_source"].get<std::string>() ==
                 "family:qwen35");
     TEST_ASSERT(body["budget_envelope"]["default_max_tokens"].get<int>() == 32768);
+}
+
+// /props reports one disk total and its parts, not the prefix files alone.
+TEST_CASE(ServerUnitFixture, test_props_reports_one_disk_total_with_prefix_pins_and_sessions) {
+    ServerConfig cfg = make_props_config_with_sidecar(json());
+    cfg.disk_cache_dir = "/somewhere";
+    Tokenizer   tok;
+    PrefixCache pc(0, tok);
+    ToolMemory  tm;
+    const json none = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(!none["full_cache"].contains("disk"));                      // no disk store behind it: as before
+    DiskUsage u; u.prefix = 700; u.pins = 200; u.sessions = 100;
+    const json body = build_props_body(cfg, pc, tm, &u);
+    const json & d = body["full_cache"]["disk"];
+    TEST_ASSERT(d["total"].get<uint64_t>() == 1000);
+    TEST_ASSERT(d["prefix"].get<uint64_t>() == 700);
+    TEST_ASSERT(d["pins"].get<uint64_t>() == 200);
+    TEST_ASSERT(d["sessions"].get<uint64_t>() == 100);
+    TEST_ASSERT(body["full_cache"]["disk_bytes"].get<uint64_t>() == 1000);  // the one total
 }
 
 TEST_CASE(ServerUnitFixture, test_props_deepseek4_tool_capability) {
