@@ -36,3 +36,26 @@ bool mul_mat_q_case_rows32_q6_k   (ggml_backend_cuda_context & ctx, const void *
 bool mul_mat_q_case_rows32_q8_0   (ggml_backend_cuda_context & ctx, const void * args, cudaStream_t stream);
 bool mul_mat_q_case_rows32_iq3_s  (ggml_backend_cuda_context & ctx, const void * args, cudaStream_t stream);
 bool mul_mat_q_case_rows32_iq3_xxs(ggml_backend_cuda_context & ctx, const void * args, cudaStream_t stream);
+
+// Every twin at x-tile 16, 32 or 48
+// (mul_mat_q_case_xn), for calls wider than 16 columns. Defined next to the
+// x16 entries above; the rows64 Q5_K/Q3_K/IQ2_S and rows32 Q3_K/IQ2_S twins
+// exist only for these calls.
+#define LUCE_MMQ_TWIN_XN_DECL(rows, name) \
+    bool mul_mat_q_case_rows##rows##_##name##_xn(ggml_backend_cuda_context & ctx, const void * args, \
+                                                  cudaStream_t stream, int mmq_x)
+LUCE_MMQ_TWIN_XN_DECL(64, iq3_s);
+LUCE_MMQ_TWIN_XN_DECL(64, iq3_xxs);
+LUCE_MMQ_TWIN_XN_DECL(64, q5_k);
+LUCE_MMQ_TWIN_XN_DECL(64, q3_k);
+LUCE_MMQ_TWIN_XN_DECL(64, iq2_s);
+LUCE_MMQ_TWIN_XN_DECL(32, iq4_xs);
+LUCE_MMQ_TWIN_XN_DECL(32, q4_k);
+LUCE_MMQ_TWIN_XN_DECL(32, q5_k);
+LUCE_MMQ_TWIN_XN_DECL(32, q6_k);
+LUCE_MMQ_TWIN_XN_DECL(32, q8_0);
+LUCE_MMQ_TWIN_XN_DECL(32, iq3_s);
+LUCE_MMQ_TWIN_XN_DECL(32, iq3_xxs);
+LUCE_MMQ_TWIN_XN_DECL(32, q3_k);
+LUCE_MMQ_TWIN_XN_DECL(32, iq2_s);
+#undef LUCE_MMQ_TWIN_XN_DECL

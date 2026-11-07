@@ -24,15 +24,18 @@
 // their parent tile, and Q3_K and IQ2_S up to 50% slower on the 32-row one.
 //
 // Every tile computes every output element identically: RDNA4 MMQ never
-// uses stream-k, the x-tile stays 16 wide, each warp owns 16 rows in every
-// shape, and every element accumulates kb0 by kb0, then k01 by k01, in the
-// same order. The tile height only decides which workgroup and which warp
-// computes a row.
+// uses stream-k, each warp owns 16 rows in every shape, and every element
+// accumulates kb0 by kb0, then k01 by k01, in the same order. The tile height
+// and width only decide which workgroup and which warp compute an element.
+//
+// Calls of 17-48 columns take the measured choice of mmq_twin_choose_wide
+// (x-tile 16, 32 or 48), still bit-exact against the parent.
 //
 // Excluded paths, which keep the parent tile with a reason (inert_why): a
-// device that is not RDNA4, and MUL_MAT_ID (expert-routed) calls. Calls
-// wider than 16 columns (prefill), types without a twin and, for the 2-warp
-// twin, outputs of more than 6144 rows keep the parent tile without one.
+// device that is not RDNA4, and MUL_MAT_ID (expert-routed) calls of up to 48
+// columns. Calls wider than 48 columns (prefill), types without a twin and,
+// for the 2-warp twin, outputs of more than 6144 rows keep the parent tile
+// without one.
 
 #include "ggml.h"
 
@@ -59,11 +62,17 @@ struct mmq_twin_call {
 
 struct mmq_twin_choice {
     mmq_twin_tile tile      = mmq_twin_tile::parent;
+    int            mmq_x     = 16;       // the twin's x-tile: 16, 32 or 48
     const char *   inert_why = nullptr;  // set: an enabled twin is excluded here
 };
 
-// Widest call a twin serves: every instance picks mmq_x = 16 up to here.
+// Widest call a twin serves at x-tile 16: every instance picks mmq_x = 16 up
+// to here.
 constexpr int64_t MMQ_TWIN_MAX_COLS = 16;
+// Calls of 17 to this many columns (concurrent verify rounds, the drafter's
+// blocks, a small DDTree verify) take the measured choice of
+// mmq_twin_choose_wide.
+constexpr int64_t MMQ_TWIN_WIDE_MAX_COLS = 48;
 
 // Tallest output the 2-warp twin serves.
 constexpr int64_t MMQ_TWIN_ROWS32_MAX_ROWS = 6144;
@@ -96,6 +105,66 @@ inline bool mmq_twin_has_rows32(ggml_type type) {
     }
 }
 
+// 17-48 columns: the tile measured fastest per type and output height (R9700,
+// the real Qwen3.8-27B UD-IQ4_XS tensors, N = 24/32/48, bit-exact against the
+// parent). Per call at N=32, parent -> choice:
+//   - IQ3_S / IQ3_XXS: the 128-row parents pick x-tile 32 below 33 columns,
+//     the slow x-tile of the q8_0 dot path; the 64-row x48 twin is 7-21%
+//     faster on every shape (IQ3_S 17408-row 210 -> 177 us, 5120-row
+//     252 -> 204 us).
+//   - Q3_K / IQ2_S (q8_0_16 dot path, no x32 slowdown): to 32 columns, 32-row
+//     x32 for outputs up to 6144 rows and 64-row x32 above (Q3_K 265 -> 211
+//     us, 6144 rows 84 -> 71 us); 64-row x48 from 33 columns.
+//   - Q5_K: to 32 columns, 32-row x32 up to 6144 rows (5120-row 195 -> 162
+//     us) and 64-row x32 above (17408/34816-row up projections 169 -> 141 us,
+//     the 248320-row lm_head 2036 -> 1691 us); the parent from 33.
+//   - Outputs of at most 1280 rows (attn k/v, the 96-row ssm_beta|alpha,
+//     drafter k/v) in Q4_K, Q5_K, Q6_K, Q8_0: 32-row x16, more workgroups for
+//     a small grid (ssm_beta|alpha 26.7 -> 17.8 us, Q5_K k/v 36.8 -> 27.5 us).
+//   - IQ4_XS and larger Q4_K / Q6_K / Q8_0 outputs: the parent (64-row x48)
+//     is best.
+// Every x-tile accumulates each element over k in the same order, so a wider
+// call stays bit-exact too; columns past the tile run as more column tiles.
+inline mmq_twin_choice mmq_twin_choose_wide(const mmq_twins_enabled & on, const mmq_twin_call & call) {
+    const bool narrow = call.ncols <= 32;
+    const bool small  = call.nrows <= 1280;
+    const bool mid    = call.nrows <= MMQ_TWIN_ROWS32_MAX_ROWS;
+    mmq_twin_tile tile = mmq_twin_tile::parent;
+    int mmq_x = 16;
+    switch (call.type) {
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ3_XXS:
+            tile = mmq_twin_tile::rows64; mmq_x = 48;
+            break;
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ2_S:
+            if (!narrow)  { tile = mmq_twin_tile::rows64; mmq_x = 48; }
+            else if (mid) { tile = mmq_twin_tile::rows32; mmq_x = 32; }
+            else          { tile = mmq_twin_tile::rows64; mmq_x = 32; }
+            break;
+        case GGML_TYPE_Q5_K:
+            if (small)        { tile = mmq_twin_tile::rows32; mmq_x = 16; }
+            else if (!narrow) { tile = mmq_twin_tile::parent; }
+            else if (mid)     { tile = mmq_twin_tile::rows32; mmq_x = 32; }
+            else              { tile = mmq_twin_tile::rows64; mmq_x = 32; }
+            break;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
+            if (small) { tile = mmq_twin_tile::rows32; mmq_x = 16; }
+            break;
+        default:
+            break;
+    }
+    mmq_twin_choice choice;
+    if ((tile == mmq_twin_tile::rows64 && on.ud_smalltile) ||
+        (tile == mmq_twin_tile::rows32 && on.two_warp)) {
+        choice.tile  = tile;
+        choice.mmq_x = mmq_x;
+    }
+    return choice;
+}
+
 inline mmq_twin_choice mmq_twin_choose(const mmq_twins_enabled & on, const mmq_twin_call & call) {
     mmq_twin_choice choice;
     if (!on.ud_smalltile && !on.two_warp) {
@@ -105,12 +174,15 @@ inline mmq_twin_choice mmq_twin_choose(const mmq_twins_enabled & on, const mmq_t
         choice.inert_why = "device is not RDNA4";
         return choice;
     }
-    if (call.ncols > MMQ_TWIN_MAX_COLS) {
+    if (call.ncols > MMQ_TWIN_WIDE_MAX_COLS) {
         return choice;
     }
     if (call.routed) {
         choice.inert_why = "MUL_MAT_ID (expert-routed) MMQ";
         return choice;
+    }
+    if (call.ncols > MMQ_TWIN_MAX_COLS) {
+        return mmq_twin_choose_wide(on, call);
     }
     if (on.two_warp && call.nrows <= MMQ_TWIN_ROWS32_MAX_ROWS && mmq_twin_has_rows32(call.type)) {
         choice.tile = mmq_twin_tile::rows32;

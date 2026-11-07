@@ -5392,7 +5392,36 @@ static bool mul_mat_q_case_x16(ggml_backend_cuda_context & ctx, const mmq_args &
     return true;
 }
 
-#define DECL_MMQ_CASE(type)                                                        \
+// A tile twin at a chosen x-tile
+// (16, 32 or 48) for calls wider than 16 columns, the concurrent verify
+// widths. Columns past mmq_x run as more column tiles (grid y), as in the
+// parent. Every x-tile accumulates an output element over k in the same
+// order, so the result matches the parent bit for bit. Returns false,
+// launching nothing, when the tile does not fit or the call asks for
+// stream-k.
+template <ggml_type type>
+static bool mul_mat_q_case_xn(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream,
+                              const int mmq_x) {
+    const int    id        = ggml_cuda_get_device();
+    const int    cc        = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo     = ggml_cuda_info().devices[id].smpbo;
+    const int    warp_size = ggml_cuda_info().devices[id].warp_size;
+    const int    nwarps    = mmq_get_nwarps_host(cc, warp_size);
+    const int    mmq_y     = get_mmq_y_host(cc);
+    if (args.use_stream_k || mmq_x > get_mmq_x_max_host(cc) ||
+        mmq_x % mmq_get_granularity_host(mmq_x, cc) != 0 ||
+        mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) {
+        return false;
+    }
+    switch (mmq_x) {
+        case 16: launch_mul_mat_q<type, 16>(ctx, args, stream); return true;
+        case 32: launch_mul_mat_q<type, 32>(ctx, args, stream); return true;
+        case 48: launch_mul_mat_q<type, 48>(ctx, args, stream); return true;
+        default: return false;
+    }
+}
+
+#define DECL_MMQ_CASE(type)                                                       \
     template void mul_mat_q_case<type>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);

@@ -15,9 +15,10 @@
 //
 // The parent requires, per case: every arm's hash equals base's; every case
 // reached MMQ exactly once; base launched no twin; an arm launched the twin
-// exactly where mmq-tile-twin-gate.h says it must (RDNA4, 16 or fewer columns, a
-// type with a twin) and nowhere else. On a GPU that is not RDNA4 no twin may
-// engage; the hashes are still compared, then the test reports SKIP.
+// exactly where mmq-tile-twin-gate.h says it must (RDNA4, up to 16 columns for
+// a type with a twin, or the measured 17-48 column choice) and nowhere else.
+// On a GPU that is not RDNA4 no twin may engage; the hashes are still
+// compared, then the test reports SKIP.
 //
 //   test_mmq_tile_twins            all arms, compare
 //   test_mmq_tile_twins --child    one arm, the environment decides
@@ -63,7 +64,8 @@ struct Case {
 // over the 2-warp limit, a partial 64-row tile), 6208 (a partial 128-row
 // tile), 96 rows (partial for 64, three 32-row tiles) and 48. Every type runs
 // every shape, so each case also checks that the excluded twin and shape
-// combinations keep the parent. 8 and 16 columns may take a twin, 24 never.
+// combinations keep the parent. 8 and 16 columns may take a twin at x-tile 16;
+// 24, 32 and 48 take the measured 17-48 column choice (mmq_twin_choose_wide).
 std::vector<Case> cases() {
     const ggml_type types[] = {
         GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS,
@@ -84,7 +86,7 @@ std::vector<Case> cases() {
     std::vector<Case> out;
     for (ggml_type t : types) {
         for (const Shape & s : shapes) {
-            for (int64_t n : {8, 16, 24}) {
+            for (int64_t n : {8, 16, 24, 32, 48}) {
                 out.push_back({t, s, n});
             }
         }

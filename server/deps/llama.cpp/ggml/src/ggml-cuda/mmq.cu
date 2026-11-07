@@ -4,6 +4,8 @@
 #include "mmq-tile-twin-gate.h"
 #include "mmq_tile_twins.h"
 
+#include <cstdio>
+
 #include <atomic>
 #include "quantize.cuh"
 #include "mmid.cuh"
@@ -294,6 +296,37 @@ bool luce_mmq_twin_launch_rows32(ggml_backend_cuda_context & ctx, const mmq_args
     }
 }
 
+// A twin at x-tile 16, 32 or 48 (mul_mat_q_case_xn), for 17-48 columns.
+bool luce_mmq_twin_launch_xn(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream,
+                             const int rows, const int mmq_x) {
+    const void * a = &args;
+    bool launched = false;
+    if (rows == 64) {
+        switch (args.type_x) {
+            case GGML_TYPE_IQ3_S:   launched = mul_mat_q_case_rows64_iq3_s_xn  (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_IQ3_XXS: launched = mul_mat_q_case_rows64_iq3_xxs_xn(ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q5_K:    launched = mul_mat_q_case_rows64_q5_k_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q3_K:    launched = mul_mat_q_case_rows64_q3_k_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_IQ2_S:   launched = mul_mat_q_case_rows64_iq2_s_xn  (ctx, a, stream, mmq_x); break;
+            default: break;
+        }
+    } else if (rows == 32) {
+        switch (args.type_x) {
+            case GGML_TYPE_IQ4_XS:  launched = mul_mat_q_case_rows32_iq4_xs_xn (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q4_K:    launched = mul_mat_q_case_rows32_q4_k_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q5_K:    launched = mul_mat_q_case_rows32_q5_k_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q6_K:    launched = mul_mat_q_case_rows32_q6_k_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q8_0:    launched = mul_mat_q_case_rows32_q8_0_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_IQ3_S:   launched = mul_mat_q_case_rows32_iq3_s_xn  (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_IQ3_XXS: launched = mul_mat_q_case_rows32_iq3_xxs_xn(ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_Q3_K:    launched = mul_mat_q_case_rows32_q3_k_xn   (ctx, a, stream, mmq_x); break;
+            case GGML_TYPE_IQ2_S:   launched = mul_mat_q_case_rows32_iq2_s_xn  (ctx, a, stream, mmq_x); break;
+            default: break;
+        }
+    }
+    return launched;
+}
+
 bool luce_mmq_twin(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const bool ud_smalltile = g_mmq_twin_rows64_on.load(std::memory_order_relaxed);
     const bool two_warp     = g_mmq_twin_rows32_on.load(std::memory_order_relaxed);
@@ -315,8 +348,11 @@ bool luce_mmq_twin(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaS
     }
     const bool rows32 = choice.tile == mmq_twin_tile::rows32;
     // A twin that cannot serve the call launches nothing; the parent runs.
-    if (!(rows32 ? luce_mmq_twin_launch_rows32(ctx, args, stream)
-                 : luce_mmq_twin_launch_rows64(ctx, args, stream))) {
+    const bool launched = call.ncols > MMQ_TWIN_MAX_COLS
+        ? luce_mmq_twin_launch_xn(ctx, args, stream, rows32 ? 32 : 64, choice.mmq_x)
+        : (rows32 ? luce_mmq_twin_launch_rows32(ctx, args, stream)
+                  : luce_mmq_twin_launch_rows64(ctx, args, stream));
+    if (!launched) {
         return false;
     }
     ++(rows32 ? g_mmq_twin_rows32_launch_count : g_mmq_twin_rows64_launch_count);
