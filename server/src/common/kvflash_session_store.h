@@ -764,6 +764,9 @@ private:
 enum class KvFlashRestorePick { none, busy, load };          // what the request needs before it is admitted
 struct KvFlashRestorePlan { KvFlashRestorePick pick = KvFlashRestorePick::none; std::string key; };
 enum class KvFlashRestore { absent, restored, busy, refused };   // what bringing a session back from storage came to
+inline KvFlashRestore kvflash_restore_of(KvFlashAdopt a) {
+    return a == KvFlashAdopt::Ok ? KvFlashRestore::restored : a == KvFlashAdopt::Busy ? KvFlashRestore::busy : KvFlashRestore::refused;
+}
 
 struct KvFlashParkStats { size_t tokens = 0; uint64_t bytes_live = 0, bytes_dead = 0; std::string preamble; int preamble_chunks = 0; };
 
