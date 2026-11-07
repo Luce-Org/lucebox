@@ -19,9 +19,11 @@
 
 #include "slot_kv.h"
 #include "../kvflash_slot_pager.h"
+#include "../kvflash_slot_turn.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <functional>
 #include <vector>
 
 namespace luce::common {
@@ -31,6 +33,7 @@ struct KvFlashSlotKvConfig {
     int64_t max_ctx = 0;
     int64_t chunk_bytes = 0;     // host backing per chunk; 0 = ask the pager
     int64_t ladder_bytes = 0;    // per request
+    int64_t stage_chunk_bytes = 0;   // per request, per chunk of its tokens (the park staging)
 };
 
 class KvFlashSlotKv final : public SlotKv {
@@ -58,6 +61,8 @@ public:
     // which must be the parked length, re-admitting the ledger for the new total.
     void set_next_slot(int slot) { next_slot_ = slot; next_resume_ = -1; }
     void set_next_resume(int slot, uint32_t len) { next_slot_ = slot; next_resume_ = (int64_t)len; }
+    // Is the slot's last park still queued or being written? Its staging is part of the reservation, so a resume must not shrink it yet.
+    void set_park_in_flight(std::function<bool(int)> f) { park_in_flight_ = std::move(f); }
     const KvFlashHostLedger & ledger() const { return ledger_; }
     int64_t reserved_bytes(int slot) const { return slot >= 0 && slot < (int)slots_.size() ? ledger_.reserved_of(slots_[(size_t)slot].request) : 0; }
     bool parked(int slot) const { return slot >= 0 && slot < (int)slots_.size() && slots_[(size_t)slot].parked; }
@@ -67,6 +72,37 @@ public:
         ledger_.release(s.request);
         pagers_[(size_t)slot]->reset();
         s = Slot{};
+    }
+    // A session restored from disk parks in a free slot: `len` tokens of rows from a KvFlashPager::serialize() blob, a
+    // host reservation for them. The blob must hold exactly the chunks of `len` tokens; a refused blob leaves the slot
+    // free and the ledger untouched.
+    PagedKvStatus adopt_parked(int slot, PagedKvRequestId id, uint32_t len, const uint8_t * blob, size_t n) {
+        if (slot < 0 || slot >= (int)slots_.size() || slots_[(size_t)slot].live || slots_[(size_t)slot].parked || len == 0)
+            return PagedKvStatus::InvalidArgument;
+        settle_floors_();
+        KvFlashSlotPager & p = *pagers_[(size_t)slot];
+        const KvFlashAdmitInput in = admit_input_(p, (int64_t)len);
+        const KvFlashAdmit v = ledger_.admit(id, in);
+        if (v != KvFlashAdmit::Ok) return admit_status_(v);
+        const uint32_t blocks = (len + block_size() - 1) / block_size();
+        if (!p.deserialize(blob, n, (int)blocks)) {   // the count is checked before any state moves
+            p.reset();
+            ledger_.release(id);
+            return PagedKvStatus::InvalidArgument;
+        }
+        Slot & s = slots_[(size_t)slot];
+        s = Slot{};
+        s.parked = true; s.request = id; s.admit_in = in; s.len = len; s.capacity_blocks = blocks; s.generation = ++generation_;
+        return PagedKvStatus::Ok;
+    }
+    // What adopt_parked(slot, id, len, ...) would answer on the ledger, with nothing charged and no blob needed: the
+    // host-budget probe of a returning session before its bundle is read. InvalidArgument where adopt_parked would
+    // refuse the slot or the length, so a caller treats anything but BlocksExhausted as "cannot decide".
+    PagedKvStatus adopt_probe(int slot, PagedKvRequestId id, uint32_t len) {
+        if (slot < 0 || slot >= (int)slots_.size() || slots_[(size_t)slot].live || slots_[(size_t)slot].parked || len == 0)
+            return PagedKvStatus::InvalidArgument;
+        settle_floors_();
+        return admit_status_(ledger_.would_admit(id, admit_input_(*pagers_[(size_t)slot], (int64_t)len)));
     }
     // Does a request of `total` tokens (prompt + generation bound) alone exceed the whole host budget? Permanent: no eviction
     // makes room, and a cold admit needs the same bytes. Asked before a resume; charges and moves nothing.
@@ -84,7 +120,21 @@ public:
         return true;
     }
 
+    // A resume's reservation floor (the staging of its last park, still queued then) ends with the writer: the session is charged its own
+    // need from the next admission on, whether it is live or parked. Idempotent: a settled slot has no floor left.
+    void settle_floors_() {
+        if (!park_in_flight_) return;
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            Slot & s = slots_[i];
+            if ((!s.live && !s.parked) || s.admit_in.reserve_floor_bytes == 0 || park_in_flight_((int)i)) continue;
+            s.admit_in.reserve_floor_bytes = 0;
+            ledger_.release(s.request);
+            ledger_.admit(s.request, s.admit_in);   // never larger than what it held
+        }
+    }
+
     PagedKvStatus acquire_reserved(PagedKvRequestId id, uint32_t token_capacity, PagedKvSequenceHandle & out) override {
+        settle_floors_();
         const int64_t total = next_total_, resume = next_resume_;
         int slot = next_slot_;
         next_total_ = 0; next_slot_ = -1; next_resume_ = -1;
@@ -101,8 +151,10 @@ public:
         }
         if (slot < 0) return PagedKvStatus::SequenceSlotsExhausted;
         KvFlashSlotPager & p = *pagers_[(size_t)slot];
-        const KvFlashAdmitInput in = admit_input_(p, charged_tokens_(token_capacity, total));
+        KvFlashAdmitInput in = admit_input_(p, charged_tokens_(token_capacity, total));
         Slot & s = slots_[(size_t)slot];
+        // the slot's last park may still be queued: its staging is inside the reservation, which then does not shrink yet
+        if (resume >= 0 && park_in_flight_ && park_in_flight_(slot)) in.reserve_floor_bytes = ledger_.reserved_of(s.request);
         if (resume >= 0) ledger_.release(s.request);   // the parked reservation makes room for the new total
         const KvFlashAdmit v = ledger_.admit(id, in);
         if (v != KvFlashAdmit::Ok) {
@@ -261,6 +313,7 @@ private:
         in.chunk_tokens = p.chunk_tokens();
         in.chunk_bytes = cfg_.chunk_bytes ? cfg_.chunk_bytes : (int64_t)p.chunk_bytes();
         in.ladder_bytes = cfg_.ladder_bytes;
+        in.stage_chunk_bytes = cfg_.stage_chunk_bytes;
         return in;
     }
     static PagedKvStatus admit_status_(KvFlashAdmit v) {
@@ -281,6 +334,7 @@ private:
     const Slot * live_(PagedKvSequenceHandle h) const { return const_cast<KvFlashSlotKv *>(this)->live_(h); }
 
     std::vector<KvFlashSlotPager *> pagers_;
+    std::function<bool(int)> park_in_flight_;
     KvFlashHostLedger & ledger_;
     KvFlashSlotKvConfig cfg_;
     std::vector<Slot> slots_;
@@ -288,5 +342,10 @@ private:
     int64_t next_total_ = 0, next_resume_ = -1;
     int next_slot_ = -1;
 };
+
+// What the engine's adopt makes of the SlotKv's answer: a full host budget is Busy (the caller evicts and retries), any other refusal is final.
+inline KvFlashAdopt kvflash_adopt_of(PagedKvStatus st) {
+    return st == PagedKvStatus::Ok ? KvFlashAdopt::Ok : st == PagedKvStatus::BlocksExhausted ? KvFlashAdopt::Busy : KvFlashAdopt::Refused;
+}
 
 }  // namespace luce::common
