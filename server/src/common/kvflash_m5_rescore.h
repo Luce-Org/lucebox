@@ -22,6 +22,10 @@ struct KvFlashM5Last {
 // becomes the assistant turn.
 constexpr int kKvFlashM5TailSlack = 64;
 
+// Default LUCE_KVFLASH_M5_RESCORE_TOKENS: re-score after this many new tokens under an unchanged question
+// (2026-11-08 screen: 17 drafter calls instead of 129, P1/P2 held).
+constexpr int kKvFlashM5RescoreTokens = 16384;
+
 // Hash of ids[lo, hi): the key of the latest user question.
 inline uint64_t kvflash_m5_query_key(const std::vector<int32_t> & ids, int lo, int hi) {
     uint64_t h = kFnvBasis;

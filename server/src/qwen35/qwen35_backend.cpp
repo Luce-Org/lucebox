@@ -439,7 +439,7 @@ bool Qwen35Backend::init() {
         if (!why.empty()) std::fprintf(stderr, "[kvflash] %s; reselect off\n", why.c_str());
         kvflash_score_pool_recent_ = env_int_or_default("LUCE_KVFLASH_SCORE_POOL_RECENT", 0) == 1;
         kvflash_recall_blocks_ = std::max(0, env_int_or_default("LUCE_KVFLASH_RECALL_BLOCKS", 0));
-        kvflash_m5_rescore_tokens_ = std::max(0, env_int_or_default("LUCE_KVFLASH_M5_RESCORE_TOKENS", 0));
+        kvflash_m5_rescore_tokens_ = std::max(0, env_int_or_default("LUCE_KVFLASH_M5_RESCORE_TOKENS", luce::common::kKvFlashM5RescoreTokens));
         kvflash_select_queries_ = kvflash_prefill_reselect_ == 4 ? luce::common::kQueryCaptureTokens : 0;
         kvflash_select_unit_ = std::max(1, env_int_or_default("LUCE_KVFLASH_SELECT_UNIT", luce::common::kKvFlashRecallUnit));
     }
