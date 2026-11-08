@@ -129,6 +129,7 @@ profile and the requirements checked at startup.
 | `LUCE_PC_DEEP_FIRST_MIN` | 4096 | KILL SWITCH (burn-in): tail length, in tokens past a short system/tools head, at which a tool request's first turn is snapshotted whole instead of at the head, so the first follow-up only prefills the new turn. =0 keeps the head pin. Not applied when a forced pin is still ahead of the restored prefix or the whole prompt cannot fit the resident budget. |
 | `LUCE_PC_DEEP_FIRST_MAX_HEAD` | 2048 | Longest system/tools head (tokens) that gives up its own pin for the whole-prompt snapshot above; longer heads keep the head pin. |
 | `LUCE_KVFLASH_PREFILL_RESELECT` | 4 with `--kvflash` on qwen35, else 0 | A/B: recall mode of the serial KVFlash pool. 0 off (recency pool only), 4 reselects by the exact attention mass at the last user turn before writing it, 5 takes the PFlash drafter's scores (needs `LUCE_KVFLASH_RESELECT_SCORER=pflash2` and the drafter; no accuracy study, off unless set). Other values are off. Needs the qk policy. Off under tensor parallelism. |
+| `LUCE_KVFLASH_M5_RESCORE_TOKENS` | 0 (off) | A/B: mode 5 skips the drafter scoring (no reselect at R, the turn prefills by recency) when the latest user message is unchanged, the prompt extends the last scored prompt and grew by fewer than `n` tokens. 0 scores every turn. |
 | `LUCE_KVFLASH_RESELECT_SCORER` | `exact` with `--kvflash` on qwen35 | The scorer the recall mode needs: `exact` for mode 4, `pflash2` for mode 5. A mismatch turns recall off and logs why. |
 | `LUCE_KVFLASH_RECALL_BLOCKS` | 6 with `--kvflash` on qwen35, else 0 | A/B: number of recalled blocks of `LUCE_KVFLASH_SELECT_UNIT` chunks kept beside the newest chunks. 0 is the plain recency pool. |
 | `LUCE_KVFLASH_SELECT_UNIT` | 2 with `--kvflash` on qwen35, else 10 | A/B: chunks per recall unit; the recall budget stays 10 x `LUCE_KVFLASH_RECALL_BLOCKS` chunks. |
@@ -145,6 +146,7 @@ profile and the requirements checked at startup.
 - `LUCE_DRAFT_SWA` - server_main.cpp
 - `LUCE_KVFLASH_PREAMBLE_ROWS` - kvflash_prefill_reselect.h
 - `LUCE_KVFLASH_PREFILL_RESELECT` - qwen35_backend.cpp
+- `LUCE_KVFLASH_M5_RESCORE_TOKENS` - qwen35_backend.cpp
 - `LUCE_KVFLASH_RECALL_BLOCKS` - qwen35_backend.cpp
 - `LUCE_KVFLASH_RESELECT_SCORER` - qwen35_backend.cpp
 - `LUCE_KVFLASH_SCORE_POOL_RECENT` - qwen35_backend.cpp

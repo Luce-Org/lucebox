@@ -35,6 +35,7 @@
 #include "pflash/kvflash_drafter_scorer.h"  // KvFlashPFlash2Scorer (mode 5)
 #include "kvflash_qk.h"            // target-QK scorer (pooled keys + query)
 #include "kvflash_prefill_reselect.h"
+#include "kvflash_m5_rescore.h"
 #include "kvflash_query_capture.h" // per-token query capture counts
 #include "kvflash_uq.h"            // LUCE_KVFLASH_UQ_QUERIES store
 
@@ -313,6 +314,8 @@ protected:
     };
     std::unique_ptr<KvFlashPFlash2Scorer> kvflash_pflash2_;  // borrows drafter_ctx_
     int                     kvflash_recall_blocks_ = 0;      // LUCE_KVFLASH_RECALL_BLOCKS (R-LRU)
+    int                     kvflash_m5_rescore_tokens_ = 0;  // LUCE_KVFLASH_M5_RESCORE_TOKENS: 0 = score every turn
+    luce::common::KvFlashM5Last kvflash_m5_last_;            // last mode-5 scoring; reset when the pool changes under it or scoring is skipped for another reason
     int                     kvflash_select_queries_ = 0;     // queries kept per prefill (kQueryCaptureTokens in mode 4, else 0): selector v2, 0 = v1
     int                     kvflash_select_unit_ = luce::common::kKvFlashRecallUnit;   // LUCE_KVFLASH_SELECT_UNIT: chunks per recall unit; budget stays 10 * k chunks
     std::vector<float>      kvflash_q_tail_;                 // this prefill's last prompt queries, oldest first (selector v2)

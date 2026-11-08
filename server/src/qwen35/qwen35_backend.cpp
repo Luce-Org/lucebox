@@ -32,6 +32,7 @@
 #include "pflash/pflash_window.h"
 #include "pflash/kvflash_drafter_scorer.h"
 #include "common/kvflash_prefill_reselect.h"
+#include "common/kvflash_m5_rescore.h"
 #include "common/kvflash_exact_mass.h"
 #include "common/kvflash_exact_fast.h"
 #include "common/kvflash_gpu_mass.h"
@@ -438,6 +439,7 @@ bool Qwen35Backend::init() {
         if (!why.empty()) std::fprintf(stderr, "[kvflash] %s; reselect off\n", why.c_str());
         kvflash_score_pool_recent_ = env_int_or_default("LUCE_KVFLASH_SCORE_POOL_RECENT", 0) == 1;
         kvflash_recall_blocks_ = std::max(0, env_int_or_default("LUCE_KVFLASH_RECALL_BLOCKS", 0));
+        kvflash_m5_rescore_tokens_ = std::max(0, env_int_or_default("LUCE_KVFLASH_M5_RESCORE_TOKENS", 0));
         kvflash_select_queries_ = kvflash_prefill_reselect_ == 4 ? luce::common::kQueryCaptureTokens : 0;
         kvflash_select_unit_ = std::max(1, env_int_or_default("LUCE_KVFLASH_SELECT_UNIT", luce::common::kKvFlashRecallUnit));
     }
@@ -1213,6 +1215,7 @@ int Qwen35Backend::kvflash_live_restore(const std::vector<int32_t> & prompt) {
 
     // No clear-then-restore here: the pool rows below C are the session.
     kvflash_pager_.truncate(C);
+    kvflash_m5_last_ = {};   // the pool changed under the last drafter pick
     kvflash_apply_preamble_pin(&prompt, false);
     if (!restore_target_cache(state_ladder_[C].snap, cache_, /*skip_kv=*/true)) {
         std::fprintf(stderr, "[kvflash] live restore: state restore @%d failed; cold prefill\n", C);
@@ -3186,9 +3189,31 @@ Qwen35Backend::KvflashRecallSetup Qwen35Backend::kvflash_recall_setup(const std:
         } else if (kvflash_prefill_reselect_ == 5) {
             const char * skip = !p4.run || p4.r / ctk == 0 ? "no sealed chunk before R"
                 : fits ? "fits"
-                : (int)kvf_ids.size() != end_abs ? "prompt ids unknown"
-                : !kvflash_pflash2_scores(kvf_ids, ctk, kvflash_scores_, s.m5_ms) ? "drafter scoring failed" : nullptr;
-            if (skip) {
+                : (int)kvf_ids.size() != end_abs ? "prompt ids unknown" : nullptr;
+            // LUCE_KVFLASH_M5_RESCORE_TOKENS: the same latest user question over a prompt that extends the last scored
+            // one needs no new drafter pass; the turn prefills normally.
+            bool same_query = false;
+            if (!skip) {
+                const auto t = luce::common::kvflash_last_human_turn(kvf_ids, w_.im_start_id, w_.user_id, w_.newline_id,
+                                                                     w_.im_end_id, w_.tool_response_id);
+                const uint64_t qkey = t.valid() ? luce::common::kvflash_m5_query_key(kvf_ids, t.lo, t.hi) : 0;
+                const uint64_t ph = luce::common::kvflash_uq_hash(kvf_ids, kvflash_m5_last_.end);
+                if (t.valid() && !luce::common::kvflash_m5_should_score(kvflash_m5_last_, qkey, end_abs, ph, kvflash_m5_rescore_tokens_)) {
+                    same_query = true;
+                    std::fprintf(stderr, "[kvflash] prefill reselect mode=5: skipped (same query, %d tokens since last score)\n",
+                                 end_abs - kvflash_m5_last_.end);
+                } else if (!kvflash_pflash2_scores(kvf_ids, ctk, kvflash_scores_, s.m5_ms)) {
+                    skip = "drafter scoring failed";
+                } else if (t.valid()) {
+                    kvflash_m5_last_ = {true, qkey, end_abs, luce::common::kvflash_uq_hash(kvf_ids, end_abs)};
+                } else {
+                    kvflash_m5_last_ = {};
+                }
+            }
+            if (skip) kvflash_m5_last_ = {};
+            if (same_query) {
+                // no drafter call, no reselect at R
+            } else if (skip) {
                 std::fprintf(stderr, "[kvflash] prefill reselect mode=5: skip, %s (LRU)\n", skip);
             } else {
                 s.m5_r = p4.r;

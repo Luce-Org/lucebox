@@ -20,8 +20,9 @@ struct KvFlashM5Last {
 
 // Hash of ids[lo, hi): the key of the latest user question.
 inline uint64_t kvflash_m5_query_key(const std::vector<int32_t> & ids, int lo, int hi) {
-    (void)ids; (void)lo; (void)hi;
-    return 0;
+    uint64_t h = kFnvBasis;
+    for (int i = lo; i < hi && i < (int)ids.size(); i++) h = fnv1a_mix(h, (uint32_t)ids[(size_t)i]);
+    return fnv1a_mix(h, (uint64_t)(hi - lo));
 }
 
 // Score unless the last scoring still stands: same question, the prompt extends the scored prompt
@@ -29,8 +30,10 @@ inline uint64_t kvflash_m5_query_key(const std::vector<int32_t> & ids, int lo, i
 // new tokens. rescore_tokens <= 0 always scores.
 inline bool kvflash_m5_should_score(const KvFlashM5Last & last, uint64_t query_key, int end_tokens,
                                     uint64_t prefix_hash_at_last_end, int rescore_tokens) {
-    (void)last; (void)query_key; (void)end_tokens; (void)prefix_hash_at_last_end; (void)rescore_tokens;
-    return true;
+    if (rescore_tokens <= 0 || !last.valid) return true;
+    if (last.query_key != query_key || last.prefix_hash != prefix_hash_at_last_end) return true;
+    const int grown = end_tokens - last.end;
+    return grown < 0 || grown >= rescore_tokens;
 }
 
 }  // namespace luce::common
