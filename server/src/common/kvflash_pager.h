@@ -1269,16 +1269,17 @@ private:
                     }
                     continue;
                 }
-                for (int h = 0; h < n_head_kv_; h++) {
-                    void * host_ptr = host0 + (size_t)h * seg;
-                    void * dev_ptr  = dev0 + (size_t)h * t->nb[2];
-                    const cudaError_t err = to_host
-                        ? cudaMemcpyAsync(host_ptr, dev_ptr, seg, cudaMemcpyDeviceToHost, page_stream_)
-                        : cudaMemcpyAsync(dev_ptr, host_ptr, seg, cudaMemcpyHostToDevice, page_stream_);
-                    if (err != cudaSuccess) {
-                        std::fprintf(stderr, "[kvflash] cudaMemcpyAsync(%s) failed: %s\n",
-                                     to_host ? "D2H" : "H2D", cudaGetErrorString(err));
-                    }
+                // One strided copy per (layer, K/V): heads sit nb[2] apart on the
+                // device and seg apart in the host segment. Same bytes as one
+                // copy per head, n_head_kv times fewer launches.
+                const cudaError_t err = to_host
+                    ? cudaMemcpy2DAsync(host0, seg, dev0, t->nb[2], seg, (size_t)n_head_kv_,
+                                        cudaMemcpyDeviceToHost, page_stream_)
+                    : cudaMemcpy2DAsync(dev0, t->nb[2], host0, seg, seg, (size_t)n_head_kv_,
+                                        cudaMemcpyHostToDevice, page_stream_);
+                if (err != cudaSuccess) {
+                    std::fprintf(stderr, "[kvflash] cudaMemcpy2DAsync(%s) failed: %s\n",
+                                 to_host ? "D2H" : "H2D", cudaGetErrorString(err));
                 }
             }
         }
@@ -1317,12 +1318,10 @@ private:
                     for (int h = 0; h < n_head_kv_; h++) std::memset(dev0 + (size_t)h * t->nb[2], 0, seg);
                     continue;
                 }
-                for (int h = 0; h < n_head_kv_; h++) {
-                    const cudaError_t err = cudaMemsetAsync(dev0 + (size_t)h * t->nb[2], 0, seg, page_stream_);
-                    if (err != cudaSuccess) {
-                        std::fprintf(stderr, "[kvflash] cudaMemsetAsync failed: %s\n",
-                                     cudaGetErrorString(err));
-                    }
+                const cudaError_t err = cudaMemset2DAsync(dev0, t->nb[2], 0, seg, (size_t)n_head_kv_, page_stream_);
+                if (err != cudaSuccess) {
+                    std::fprintf(stderr, "[kvflash] cudaMemset2DAsync failed: %s\n",
+                                 cudaGetErrorString(err));
                 }
 #else
                 for (int h = 0; h < n_head_kv_; h++)
