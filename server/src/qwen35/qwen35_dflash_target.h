@@ -11,9 +11,11 @@
 #include "step_graph.h"
 #include "graph_builders.h"
 #include "kvflash_pager.h"
+#include "gdn_single_commit.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cuda-gdn-chain.h"
 
 #include <vector>
 
@@ -103,6 +105,10 @@ public:
     // offset, which every prefill sets; null means zero.
     void set_rope_offset(const int * offset) { rope_offset_ = offset; }
 
+    // DDTree servers keep the parent recurrent-state handling: the GDN single
+    // commit (gdn_single_commit.h) stays inert there.
+    void set_ddtree_mode(bool enabled) { ddtree_mode_ = enabled; }
+
 private:
     TargetWeights & w_;
     TargetCache & cache_;
@@ -113,8 +119,42 @@ private:
     int verify_top_n_ = 0;   // set_verify_top_n
     KvFlashPager * pager_ = nullptr;
     bool fast_rollback_ = false;
+    bool ddtree_mode_ = false;
     const int * rope_offset_ = nullptr;
     int rope_offset() const { return rope_offset_ ? *rope_offset_ : 0; }
+
+    // GDN single commit (gdn_single_commit.h, state machine there): where the
+    // committed and the pre-step SSM state live between snapshot_kv, verify
+    // and rollback_to / restore_kv. Untouched on the paths the parts
+    // exclude.
+    gdn_commit::StateBook gdn_book_;
+    gdn_commit::PathFacts gdn_path_facts() const;
+    // KEEP_BASE decision for one verify_batch call.
+    bool gdn_keep_base_verify(bool capture_requested, bool do_capture,
+                                int n_tokens) const;
+    // A keep-base verify reached `where` without rollback_to or restore_kv.
+    void gdn_drop_uncommitted(const char * where);
+    // SWAP_SNAPSHOT decision for one snapshot_kv call.
+    bool gdn_swap_snapshot() const;
+    bool gdn_pairs_exchangeable() const;
+    // Take a deferred SSM snapshot (spare <- live, then synchronize, as the
+    // parent's snapshot_ssm_state) before something writes the live state.
+    void gdn_materialize_snapshot();
+    // SINGLE_REPLAY decision for one keep-base verify of n_tokens: the
+    // one-slot state map when it records the replay log, else nullptr (the
+    // verify keeps the F32 checkpoints).
+    ggml_tensor * gdn_single_replay_ids(int n_tokens);
+    // The I32 [1] map holding slab 0, allocated on first use.
+    ggml_tensor * gdn_replay_slot_map();
+    // Fill gdn_replay_layers_ for a replay commit of `plan` after a verify
+    // of q_len tokens; false (nothing written) when a capture or state does
+    // not match. S_v and H out.
+    bool gdn_prepare_replay_commit(const gdn_commit::RollbackPlan & plan,
+                                     int q_len, int64_t & S_v, int64_t & H);
+    ggml_context * gdn_slot_ctx_ = nullptr;
+    ggml_backend_buffer_t gdn_slot_buf_ = nullptr;
+    ggml_tensor * gdn_slot_ids_ = nullptr;
+    std::vector<ggml_cuda_gdn_chain_commit_layer> gdn_replay_layers_;
 
     // SpecLA (docs/SPECLA.md): true when the cache was
     // migrated with factor buffers. Capture-verify then runs the

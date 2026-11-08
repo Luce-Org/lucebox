@@ -1723,6 +1723,7 @@ DFlashTarget * Qwen35Backend::dflash_target() {
             qt->set_kvflash_pager(&kvflash_pager_);
         }
         qt->set_fast_rollback(cfg_.fast_rollback);
+        qt->set_ddtree_mode(cfg_.ddtree_mode);
         qt->set_rope_offset(&rope_delta_);
     }
     return dflash_target_.get();

@@ -104,6 +104,11 @@ GGML_BACKEND_API void ggml_backend_cuda_set_mmq_twins_override(bool rows64, bool
 GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_grouped_cols_launch_count(void);
 GGML_BACKEND_API bool ggml_backend_cuda_supports_gdn_grouped_cols(int device);
+// Tests only: pin the GATED_DELTA_NET route, process-wide. -1 (the default)
+// lets the device pick, 0 pins the scalar kernel, 1 the grouped-cols kernel
+// where it applies (S_v 128, non-KDA, a supported device); a pinned route also
+// keeps the RDNA3.5 prefill recurrence off. Returns the previous value.
+GGML_BACKEND_API int ggml_backend_cuda_set_gdn_route_override(int route);
 
 // Calling-thread launch counter for the head-size-256 MMA fattn kernel.
 // Qualification tests use this to reject silent fallback to the tile kernel.

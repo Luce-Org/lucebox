@@ -503,6 +503,10 @@ struct TargetCache {
     // restored by restore_ssm_state().
     std::vector<ggml_tensor *> ssm_state_snap;
     std::vector<ggml_tensor *> conv_state_snap;
+    // SWAP_SNAPSHOT (qwen35/gdn_single_commit.h):
+    // true while each ssm_state[i] uses ssm_state_snap[i]'s original storage
+    // (rollback_buf) and vice versa. Always false when SWAP_SNAPSHOT is off.
+    bool ssm_state_swapped = false;
 
     // Per-step SSM + conv inputs captured during a verify forward when
     // QwenGraphInputs::capture_delta_intermediate is true. Populated by
@@ -1022,6 +1026,16 @@ struct QwenGraphInputs {
     int specla_n_waves = 0;
     int specla_n_boundaries = 0;
     int specla_max_parallel_chains = 0;
+
+    // KEEP_BASE (qwen35/gdn_single_commit.h): a
+    // single-sequence chain capture verify omits the DeltaNet final-state
+    // write; rollback commits from the F32 intermediates instead.
+    bool keep_base_ssm_state = false;
+    // SINGLE_REPLAY (needs keep_base_ssm_state): an
+    // I32 [1] tensor holding 0. The keep-base verify's DeltaNet ops become
+    // mapped verifies over it: no intermediates, no final state, a replay log
+    // in each DeltaNetCapture::replay_log instead.
+    ggml_tensor * single_replay_slot_ids = nullptr;
 };
 
 struct QwenGraphOutputs {

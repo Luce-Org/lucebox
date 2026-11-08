@@ -173,6 +173,14 @@ bool build_hybrid_full_layer_step(
 // input mapping every token to its slot-local feature-ring destination. This
 // keeps accepted-path replay graph-stable and leaves legacy offset capture
 // unchanged for callers that do not use paged serving.
+// `keep_base_ssm_state` (KEEP_BASE, set only by
+// Qwen35DFlashTarget::verify_batch): a single-sequence chain capture verify
+// omits the DeltaNet final-state write; requires capture_delta_intermediate.
+// `single_replay_slot_ids` (SINGLE_REPLAY, same
+// caller; needs keep_base_ssm_state): an I32 [1] tensor holding 0. Each
+// DeltaNet op becomes a mapped verify over it that writes neither
+// intermediates nor a final state and records the replay log into
+// sg.delta_captures[i].replay_log (ssm_intermediate_states stays null).
 bool build_target_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -198,7 +206,9 @@ bool build_target_step(
     int n_prefill_segments = 0,
     int n_logits_rows = 0,
     bool compact_slots = false,
-    int top_n = 0);
+    int top_n = 0,
+    bool keep_base_ssm_state = false,
+    ggml_tensor * single_replay_slot_ids = nullptr);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(
