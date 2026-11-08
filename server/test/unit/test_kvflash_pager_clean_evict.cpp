@@ -142,3 +142,24 @@ TEST_CASE(KvflashPagerCleanEvictFixture, reselect_cycles_skip_clean_evictions_an
     CHECK(p.stats().d2h_skipped > 0);
     for (int c = 0; c < 10; c++) CHECK(bytes_of(p, c) == want[(size_t)c]);
 }
+
+// A block freed by an eviction is zeroed lazily: handed to a fresh chunk it must still read as zero
+// (maskless consumers read the unwritten rows), handed to a recalled chunk it is fully overwritten.
+TEST_CASE(KvflashPagerCleanEvictFixture, eviction_block_reads_zero_for_a_fresh_chunk_and_exact_for_a_recall) {
+    Harness H; TestPager p;
+    REQUIRE(p.attach(cfg(), H.k, H.v));
+    must(p.alloc_span(0, 8 * kChunk));
+    for (int c = 0; c < 8; c++)
+        for (int i = 0; i < kChunk; i++) write_row(H, p, (int64_t)c * kChunk + i, (uint8_t)(c * 16 + 9));
+    const std::vector<uint8_t> want1 = bytes_of(p, 1);
+    REQUIRE(p.alloc_span(8 * kChunk, 1));          // fresh chunk 8 evicts an old chunk, its block is not pre-zeroed
+    p.synchronize_paging();
+    const std::vector<uint8_t> row8 = bytes_of(p, 8);
+    for (uint8_t b : row8) REQUIRE(b == 0);        // the unwritten rows of the new chunk are zero
+    p.score_hook = [](int c) { return c == 1 ? 100.0f : (float)c; };
+    p.reselect(0);                                 // recalls chunk 1 into a lazily freed block
+    p.score_hook = nullptr;
+    p.synchronize_paging();
+    CHECK(p.is_resident(1));
+    CHECK(bytes_of(p, 1) == want1);
+}

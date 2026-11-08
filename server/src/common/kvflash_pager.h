@@ -172,6 +172,7 @@ public:
         }
 
         free_blocks_.clear();
+        unzeroed_.assign((size_t)n_blocks_, 0);
         pending_free_.clear();
         for (int b = n_blocks_ - 1; b >= 0; b--) free_blocks_.push_back(b);
         chunks_.clear();
@@ -518,6 +519,11 @@ public:
             st.block = free_blocks_.back();
             free_blocks_.pop_back();
             epoch_++;
+            // A block freed without zeroing: a recall overwrites all of it, a fresh chunk needs the zeros.
+            if (!unzeroed_.empty() && unzeroed_[(size_t)st.block]) {
+                unzeroed_[(size_t)st.block] = 0;
+                if (!st.on_host) zero_block(st.block);
+            }
             st.dirty = write || !st.on_host;
             if (st.on_host) {              // recall: restore paged-out bytes
                 copy_chunk(c, st.block, /*to_host=*/false);
@@ -537,7 +543,11 @@ public:
 
     // Force a chunk out of the pool (host backing + zeroed slots). A pinned
     // chunk is refused: its rows belong to the step (or request) that pinned it.
-    bool page_out(int c) {
+    bool page_out(int c) { return page_out_(c, /*lazy_zero=*/false); }
+
+    // lazy_zero: leave the freed block unzeroed; the caller guarantees the block is
+    // handed to slot_for_() at once or flush_unzeroed_() runs before any attention read.
+    bool page_out_(int c, bool lazy_zero) {
         if (c >= (int)chunks_.size() || chunks_[c].block < 0 || is_pinned(c)) return false;
         ChunkState & st = chunks_[c];
         if (has_tensor_storage() && !st.on_host) {
@@ -550,9 +560,11 @@ public:
         }
         // A chunk recalled from host and not written since holds the bytes its host
         // copy already has (every row write goes through slot_for(), which sets dirty).
-        if (has_tensor_storage() && st.on_host && !st.dirty) stats_.d2h_skipped++;
-        else                                                  copy_chunk(c, st.block, /*to_host=*/true);
-        zero_block(st.block);
+        const bool skipped = has_tensor_storage() && st.on_host && !st.dirty;
+        if (skipped) stats_.d2h_skipped++;
+        else         copy_chunk(c, st.block, /*to_host=*/true);
+        if (lazy_zero && !deferred_free_) unzeroed_[(size_t)st.block] = 1;
+        else                              zero_block(st.block);
         st.on_host = true;
         st.dirty = false;
         if (deferred_free_) pending_free_.push_back({st.block, ++record_seq_});
@@ -560,7 +572,7 @@ public:
         st.block = -1;
         epoch_++;
         stats_.page_outs++;
-        stats_.moved_bytes += chunk_bytes_;
+        if (!skipped) stats_.moved_bytes += chunk_bytes_;
         return true;
     }
 
@@ -818,15 +830,22 @@ public:
 
         int events = 0;
         for (int c = 0; c < (int)chunks_.size(); c++) {       // out first: frees blocks
-            if (!want[c] && chunks_[c].block >= 0) { page_out(c); events++; }
+            if (!want[c] && chunks_[c].block >= 0) { page_out_(c, /*lazy_zero=*/true); events++; }
         }
         for (int c = 0; c < (int)chunks_.size(); c++) {
             if (want[c] && chunks_[c].block < 0 && chunks_[c].on_host) {
                 if (page_in(c)) events++;
             }
         }
+        flush_unzeroed_();   // blocks left free by this reselect must read as zero
         if (has_pending_page_in_) synchronize_paging();
         return events;
+    }
+
+    // Zero the free blocks a lazy page-out left unzeroed.
+    void flush_unzeroed_() {
+        for (int b : free_blocks_)
+            if (!unzeroed_.empty() && unzeroed_[(size_t)b]) { unzeroed_[(size_t)b] = 0; zero_block(b); }
     }
 
     // Resident, and not sink, tail window or pinned: what an eviction may take.
@@ -1208,7 +1227,7 @@ private:
         if (!free_blocks_.empty()) return true;
         if (!pending_free_.empty()) return false;   // a block is in flight; take no second victim
         const std::vector<int> v = lru_victims(1);
-        return !v.empty() && page_out(v[0]) && !free_blocks_.empty();
+        return !v.empty() && page_out_(v[0], /*lazy_zero=*/true) && !free_blocks_.empty();
     }
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
@@ -1490,6 +1509,7 @@ private:
     bool batch_submit_ = false;
     uint64_t generation_ = 0;
     std::vector<uint8_t> zero_buf_;   // used by zero_block() in non-CUDA builds
+    std::vector<uint8_t> unzeroed_;   // per-block: freed by a lazy page-out, bytes not zeroed yet (always free)
     std::vector<uint8_t> pinned_;     // per-chunk pin flag; empty = no pins
     KvFlashStats stats_;
     size_t k_seg_bytes_ = 0, v_seg_bytes_ = 0, chunk_bytes_ = 0;
