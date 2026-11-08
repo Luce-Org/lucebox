@@ -1215,7 +1215,6 @@ int Qwen35Backend::kvflash_live_restore(const std::vector<int32_t> & prompt) {
 
     // No clear-then-restore here: the pool rows below C are the session.
     kvflash_pager_.truncate(C);
-    kvflash_m5_last_ = {};   // the pool changed under the last drafter pick
     kvflash_apply_preamble_pin(&prompt, false);
     if (!restore_target_cache(state_ladder_[C].snap, cache_, /*skip_kv=*/true)) {
         std::fprintf(stderr, "[kvflash] live restore: state restore @%d failed; cold prefill\n", C);
