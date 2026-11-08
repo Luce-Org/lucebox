@@ -4,7 +4,8 @@
 
 namespace luce::pflash {
 
-static_assert(kScoringResumeGrid % kScoringUbatch == 0, "the resume grid must hold whole ubatches");
+static_assert(kScoringResumeGrid % kScoringUbatch == 0 && kScoringProjChunk % kScoringResumeGrid == 0,
+              "the resume grid holds whole ubatches and the projection chunk holds whole grid steps");
 
 int pflash_scoring_checkpoint(int S) {
     const int cut = S - kScoringCutBack;
@@ -12,9 +13,12 @@ int pflash_scoring_checkpoint(int S) {
     return cut / kScoringResumeGrid * kScoringResumeGrid;
 }
 
-int pflash_scoring_proj_begin(int) { return 0; }
+int pflash_scoring_proj_begin(int resume) { return resume / kScoringProjChunk * kScoringProjChunk; }
 
-bool pflash_scoring_proj_rows_cover(int, int, int) { return false; }
+bool pflash_scoring_proj_rows_cover(int resume, int rows_begin, int rows) {
+    const int begin = pflash_scoring_proj_begin(resume);
+    return resume == begin || (rows_begin == begin && rows_begin + rows >= resume);
+}
 
 int pflash_scoring_exact_rows_end(int S) {
     const int cut = S - kScoringCutBack;

@@ -31,12 +31,12 @@ std::vector<int> ubatch_starts(int r, int S) {
 
 TEST_CASE(PFlashScoringResumeFixture, checkpoint_is_the_last_grid_point_before_the_cut) {
     CHECK(pflash_scoring_checkpoint(0) == 0);
-    CHECK(pflash_scoring_checkpoint(8192) == 0);                 // cut 8128 < 8192
+    CHECK(pflash_scoring_checkpoint(1024) == 0);                 // cut 960 < 1024
     CHECK(pflash_scoring_checkpoint(8192 + 64) == 8192);
-    CHECK(pflash_scoring_checkpoint(8192 + 63) == 0);
-    CHECK(pflash_scoring_checkpoint(63565) == 57344);
+    CHECK(pflash_scoring_checkpoint(8192 + 63) == 7168);
+    CHECK(pflash_scoring_checkpoint(63565) == 63488);
     CHECK(pflash_scoring_checkpoint(65600) == 65536);
-    CHECK(pflash_scoring_checkpoint(65599) == 57344);
+    CHECK(pflash_scoring_checkpoint(65599) == 64512);
 }
 
 TEST_CASE(PFlashScoringResumeFixture, exact_rows_end_is_the_last_full_ubatch_before_the_cut) {
@@ -51,7 +51,7 @@ TEST_CASE(PFlashScoringResumeFixture, exact_rows_end_is_the_last_full_ubatch_bef
 
 TEST_CASE(PFlashScoringResumeFixture, resume_only_at_a_grid_checkpoint_inside_the_shared_prefix) {
     // A follow-up: the previous prompt's checkpoint, all of it shared.
-    CHECK(pflash_scoring_resume(57344, 63560, 63790, 1 << 30) == 57344);
+    CHECK(pflash_scoring_resume(63488, 63560, 63790, 1 << 30) == 63488);
     // Diverged before the checkpoint (an edit): fresh.
     CHECK(pflash_scoring_resume(57344, 57343, 63790, 1 << 30) == 0);
     // The checkpoint itself shared is enough.
@@ -69,7 +69,7 @@ TEST_CASE(PFlashScoringResumeFixture, resume_only_at_a_grid_checkpoint_inside_th
 }
 
 TEST_CASE(PFlashScoringResumeFixture, a_resumed_call_lands_on_the_fresh_partition) {
-    // For every resume the rule allows, the ubatches and 8192 key chunks from the resume point are exactly the
+    // For every resume the rule allows, the ubatches from the resume point are exactly the
     // fresh call's from that point on.
     for (int S : {16500, 63565, 63790, 65600, 74200, 98304 + 64}) {
         const std::vector<int> fresh = ubatch_starts(0, S);
@@ -98,7 +98,7 @@ TEST_CASE(PFlashScoringResumeFixture, checkpoint_is_on_the_ubatch_grid) {
     CHECK(pflash_scoring_checkpoint(1024 + 63) == 0);
     CHECK(pflash_scoring_checkpoint(1024 + 64) == 1024);
     CHECK(pflash_scoring_checkpoint(21673) == 21504);
-    CHECK(pflash_scoring_checkpoint(32334) == 32256);
+    CHECK(pflash_scoring_checkpoint(32334) == 31744);
     for (int S : {1100, 9000, 21673, 32334, 63565, 131072}) {
         CHECK(pflash_scoring_checkpoint(S) == pflash_scoring_exact_rows_end(S));
     }
@@ -236,7 +236,7 @@ std::vector<int32_t> iota_ids(int n) {
 } // namespace
 
 TEST_CASE(PFlashScoringResumeFixture, an_undersized_session_still_resumes_and_needs_to_grow) {
-    // The measured case: a session of capacity 36605 holds a 21673-token prompt (checkpoint 16384); the next turn has
+    // The measured case: a session of capacity 36605 holds a 21673-token prompt (checkpoint 21504); the next turn has
     // 46124 tokens, all of the old prompt shared.
     const std::vector<int32_t> old_ids = iota_ids(21673);
     const std::vector<int32_t> ids = iota_ids(46124);
@@ -246,7 +246,7 @@ TEST_CASE(PFlashScoringResumeFixture, an_undersized_session_still_resumes_and_ne
     c.capacity = 36605;
     const PFlashResumePick pick = pflash_pick_resume({c}, ids, 1 << 30);
     CHECK(pick.index == 0);
-    CHECK(pick.resume == 16384);
+    CHECK(pick.resume == 21504);
     CHECK(pick.shared == 21673);
     CHECK(pick.needs_grow);
 }

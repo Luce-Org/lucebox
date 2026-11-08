@@ -571,6 +571,7 @@ void free_qwen35_scoring_session(Qwen35ScoringSession & session) {
     session.capacity = 0;
     session.ids.clear();
     session.checkpoint = 0;
+    session.proj_rows.clear();
     session.probe_raw.clear();
     session.subunit_raw.clear();
     session.request_raw.clear();
@@ -712,6 +713,10 @@ Qwen35ScoringSession * acquire_scoring_session(
                     if (span.begin < 0 || span.end <= span.begin || span.begin >= r) continue;
                     if (!stored_window(*session, span.begin, span.end, shared)) return 0;
                 }
+                if (!luce::pflash::pflash_scoring_proj_rows_cover(
+                        r, session->proj_rows_begin, (int) (session->proj_rows.size() / (size_t) w.n_embd))) {
+                    return 0;
+                }
                 if ((need_probe && (int) session->probe_raw.size() < r) ||
                     (need_subunit && (int) session->subunit_raw.size() < r) ||
                     (need_request && (int) session->request_raw.size() < r)) {
@@ -780,6 +785,7 @@ Qwen35ScoringSession * acquire_scoring_session(
     zero_recurrent_state(target->cache);
     target->ids.clear();
     target->checkpoint = 0;
+    target->proj_rows.clear();
     target->probe_raw.clear();
     target->subunit_raw.clear();
     target->request_raw.clear();
@@ -823,6 +829,8 @@ std::vector<int> qwen35_session_token_dims(const Qwen35ScoringSession & session,
 void copy_session_bookkeeping(const Qwen35ScoringSession & from, Qwen35ScoringSession & to) {
     to.ids = from.ids;
     to.checkpoint = from.checkpoint;
+    to.proj_rows = from.proj_rows;
+    to.proj_rows_begin = from.proj_rows_begin;
     to.keys_trained = from.keys_trained;
     to.probe_raw = from.probe_raw;
     to.subunit_raw = from.subunit_raw;
@@ -1266,7 +1274,7 @@ static std::vector<int32_t> strict_score_impl(
     TargetCache & cache = session->cache;
     const int n_new = S - resume;
     // Ubatches are cut once at S - 64, exactly as in a fresh call, and the
-    // recurrent state is snapshotted at the last 8192-grid point at or before
+    // recurrent state is snapshotted at the last 1024-grid point at or before
     // that cut: the next turn (which replaces this prompt's generation prompt,
     // or repeats it) resumes there and recomputes the rest on the fresh
     // call's own partition.
@@ -1442,6 +1450,21 @@ static std::vector<int32_t> strict_score_impl(
     ggml_gallocr_free(alloc);
     auto t1 = std::chrono::steady_clock::now();
 
+    // Exact block-14 rows [proj_begin(checkpoint), checkpoint) for the next resume: this call's own activations from
+    // ``resume`` on, the session's earlier rows ahead of it (they cover [proj_begin(resume), resume)).
+    const int keep_begin = luce::pflash::pflash_scoring_proj_begin(checkpoint);
+    std::vector<float> keep_proj((size_t) hidden * (size_t) std::max(0, checkpoint - keep_begin));
+    if (!keep_proj.empty()) {
+        const int from_session = std::max(0, resume - keep_begin);
+        if (from_session > 0) {
+            std::copy_n(session->proj_rows.data() + (size_t) (keep_begin - session->proj_rows_begin) * hidden,
+                        (size_t) from_session * hidden, keep_proj.data());
+        }
+        ggml_backend_tensor_get(act_in, keep_proj.data() + (size_t) from_session * hidden,
+                                (size_t) (keep_begin + from_session - resume) * act_in->nb[1],
+                                (size_t) (checkpoint - keep_begin - from_session) * act_in->nb[1]);
+    }
+
     // Block-14 rows of each query window -- the query, then earlier
     // questions -- from this call when it computed them, else from the
     // session while they sit in the shared prefix. The query's are always
@@ -1520,11 +1543,14 @@ static std::vector<int32_t> strict_score_impl(
 
     ggml_tensor * wk_src = st.head_loaded ? st.head_wk : L.wk;
     session->keys_trained = st.head_loaded;
-    session->probe_raw.resize(use_probe ? (size_t) resume : 0);
+    // The projection chunks are the fresh call's: a resume inside one re-projects it whole from ``proj_begin``.
+    const int proj_begin = luce::pflash::pflash_scoring_proj_begin(resume);
+    const int n_proj = S - proj_begin;
+    session->probe_raw.resize(use_probe ? (size_t) proj_begin : 0);
     session->subunit_raw.resize(
-        use_probe && st.probe_sub_fc2_w ? (size_t) resume : 0);
-    session->request_raw.resize(request_probe ? (size_t) resume : 0);
-    session->stage2_cand.resize(stage2_on ? (size_t) resume * luce::pflash::kStage2Embed : 0);
+        use_probe && st.probe_sub_fc2_w ? (size_t) proj_begin : 0);
+    session->request_raw.resize(request_probe ? (size_t) proj_begin : 0);
+    session->stage2_cand.resize(stage2_on ? (size_t) proj_begin * luce::pflash::kStage2Embed : 0);
     // Stage 2: the fresh latest user message's x̂ column sums, one per key chunk it overlaps ([parts][hidden]).
     const bool stage2_latest_fresh = stage2_on && stage2_latest_span.end > stage2_latest_span.begin &&
         stage2_latest_span.begin >= resume;
@@ -1533,25 +1559,53 @@ static std::vector<int32_t> strict_score_impl(
     // Keys (and probe logits) of the new tokens, into the session. Keys are
     // projected in chunks so no intermediate tensor puts the sequence length
     // into a HIP grid y/z dimension (65,535 limit). The chunks start at the
-    // (grid) resume point, so they fall where a fresh call's do.
-    const int key_chunk = luce::pflash::kScoringResumeGrid;
-    if (n_new > 0) {
+    // chunk start before the resume point, so they fall where a fresh call's do.
+    const int key_chunk = luce::pflash::kScoringProjChunk;
+    if (n_proj > 0) {
         ggml_init_params nip{};
         nip.mem_size = (size_t)4 * ggml_tensor_overhead() + 4096;
         nip.no_alloc = true;
         ggml_context * nctx = ggml_init(nip);
-        ggml_tensor * probe_new = use_probe ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
+        ggml_tensor * probe_new = use_probe ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_proj) : nullptr;
         ggml_tensor * subunit_new = use_probe && st.probe_sub_fc2_w
-            ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
+            ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_proj) : nullptr;
         ggml_tensor * request_new = request_probe
-            ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
+            ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_proj) : nullptr;
         ggml_backend_buffer_t nbuf = use_probe || request_probe
             ? ggml_backend_alloc_ctx_tensors(nctx, w.backend) : nullptr;
         if ((use_probe || request_probe) && !nbuf) {
             ggml_free(nctx);
             return fail("qwen35 probe buffer allocation failed");
         }
-        const int n_key_chunks = (n_new + key_chunk - 1) / key_chunk;
+        // The chunk that holds the resume point: the session's rows ahead of it, then this call's activations.
+        ggml_context * hctx = nullptr;
+        ggml_backend_buffer_t hbuf = nullptr;
+        ggml_tensor * head_x = nullptr;
+        if (proj_begin < resume) {
+            const int n_head = std::min(key_chunk, n_proj);
+            ggml_init_params hip{};
+            hip.mem_size = (size_t)2 * ggml_tensor_overhead() + 4096;
+            hip.no_alloc = true;
+            hctx = ggml_init(hip);
+            head_x = hctx ? ggml_new_tensor_2d(hctx, GGML_TYPE_F32, hidden, n_head) : nullptr;
+            hbuf = head_x ? ggml_backend_alloc_ctx_tensors(hctx, w.backend) : nullptr;
+            if (!hbuf || session->proj_rows_begin != proj_begin ||
+                session->proj_rows.size() < (size_t) hidden * (size_t) (resume - proj_begin)) {
+                if (hbuf) ggml_backend_buffer_free(hbuf);
+                if (hctx) ggml_free(hctx);
+                if (nbuf) ggml_backend_buffer_free(nbuf);
+                ggml_free(nctx);
+                session->ids.clear();
+                return fail("qwen35 scorer: chunk rows ahead of the resume point unavailable");
+            }
+            std::vector<float> head_host((size_t) hidden * (size_t) n_head);
+            const size_t kept = (size_t) hidden * (size_t) (resume - proj_begin);
+            std::copy_n(session->proj_rows.data(), kept, head_host.data());
+            ggml_backend_tensor_get(act_in, head_host.data() + kept, 0,
+                                    head_host.size() * sizeof(float) - kept * sizeof(float));
+            ggml_backend_tensor_set(head_x, head_host.data(), 0, head_host.size() * sizeof(float));
+        }
+        const int n_key_chunks = (n_proj + key_chunk - 1) / key_chunk;
         // Stage 2: c(t) of the new tokens, and the fresh latest message's x̂ column sums.
         ggml_context * s2ctx = nullptr;
         ggml_backend_buffer_t s2buf = nullptr;
@@ -1559,17 +1613,17 @@ static std::vector<int32_t> strict_score_impl(
         ggml_tensor * msum_new = nullptr;
         int msum_parts = 0;
         if (stage2_on) {
-            for (int b = 0; b < n_new && stage2_latest_fresh; b += key_chunk) {
-                const int n = std::min(key_chunk, n_new - b);
-                if (std::max(stage2_latest_span.begin, resume + b) <
-                    std::min(stage2_latest_span.end, resume + b + n)) ++msum_parts;
+            for (int b = 0; b < n_proj && stage2_latest_fresh; b += key_chunk) {
+                const int n = std::min(key_chunk, n_proj - b);
+                if (std::max(stage2_latest_span.begin, proj_begin + b) <
+                    std::min(stage2_latest_span.end, proj_begin + b + n)) ++msum_parts;
             }
             ggml_init_params sip2{};
             sip2.mem_size = (size_t)4 * ggml_tensor_overhead() + 4096;
             sip2.no_alloc = true;
             s2ctx = ggml_init(sip2);
             if (s2ctx) {
-                cand_new = ggml_new_tensor_2d(s2ctx, GGML_TYPE_F32, luce::pflash::kStage2Embed, n_new);
+                cand_new = ggml_new_tensor_2d(s2ctx, GGML_TYPE_F32, luce::pflash::kStage2Embed, n_proj);
                 msum_new = ggml_new_tensor_2d(s2ctx, GGML_TYPE_F32, hidden, std::max(1, msum_parts));
                 s2buf = ggml_backend_alloc_ctx_tensors(s2ctx, w.backend);
             }
@@ -1589,16 +1643,18 @@ static std::vector<int32_t> strict_score_impl(
         kip.no_alloc = true;
         ggml_context * kctx = ggml_init(kip);
         ggml_cgraph * kgf = ggml_new_graph_custom(kctx, 4096, false);
-        for (int b = 0; b < n_new; b += key_chunk) {
-            const int n = std::min(key_chunk, n_new - b);
-            ggml_tensor * x_c = ggml_view_2d(kctx, act_in, hidden, n, act_in->nb[1],
-                                             (size_t)b * act_in->nb[1]);
+        for (int b = 0; b < n_proj; b += key_chunk) {
+            const int n = std::min(key_chunk, n_proj - b);
+            ggml_tensor * x_c = head_x && b == 0
+                ? ggml_view_2d(kctx, head_x, hidden, n, head_x->nb[1], 0)
+                : ggml_view_2d(kctx, act_in, hidden, n, act_in->nb[1],
+                               (size_t) (proj_begin + b - resume) * act_in->nb[1]);
             ggml_tensor * x_norm = ggml_mul(kctx, ggml_rms_norm(kctx, x_c, w.rms_eps), L.attn_norm);
             ggml_tensor * K = ggml_reshape_3d(kctx, ggml_mul_mat(kctx, wk_src, x_norm), D, Hk, n);
             K = ggml_mul(kctx, ggml_rms_norm(kctx, K, w.rms_eps), L.k_norm);
             ggml_tensor * k_dst = ggml_view_3d(kctx, session->keys, D, Hk, n,
                                                session->keys->nb[1], session->keys->nb[2],
-                                               (size_t)(resume + b) * session->keys->nb[2]);
+                                               (size_t)(proj_begin + b) * session->keys->nb[2]);
             ggml_build_forward_expand(kgf, ggml_cpy(kctx, K, k_dst));
             if (use_probe) {
                 // Segment probe on the same tap: LayerNorm -> fc1 -> GELU trunk,
@@ -1643,11 +1699,11 @@ static std::vector<int32_t> strict_score_impl(
                 ggml_build_forward_expand(kgf, ggml_cpy(kctx, c, c_dst));
             }
             if (msum_new) {
-                const int lo = std::max(stage2_latest_span.begin, resume + b);
-                const int hi = std::min(stage2_latest_span.end, resume + b + n);
+                const int lo = std::max(stage2_latest_span.begin, proj_begin + b);
+                const int hi = std::min(stage2_latest_span.end, proj_begin + b + n);
                 if (lo < hi) {
                     ggml_tensor * col = luce::pflash::pflash_stage2_build_column_sum(
-                        kctx, x_norm, lo - (resume + b), hi - (resume + b));
+                        kctx, x_norm, lo - (proj_begin + b), hi - (proj_begin + b));
                     const int part = (int) (stage2_msum.size() / (size_t) hidden);
                     stage2_msum.resize(stage2_msum.size() + (size_t) hidden);
                     ggml_tensor * m_dst = ggml_view_1d(kctx, msum_new, hidden, (size_t) part * msum_new->nb[1]);
@@ -1662,28 +1718,30 @@ static std::vector<int32_t> strict_score_impl(
         ggml_free(kctx);
         if (key_ok && use_probe) {
             session->probe_raw.resize((size_t) S);
-            ggml_backend_tensor_get(probe_new, session->probe_raw.data() + resume, 0,
-                                    (size_t) n_new * sizeof(float));
+            ggml_backend_tensor_get(probe_new, session->probe_raw.data() + proj_begin, 0,
+                                    (size_t) n_proj * sizeof(float));
             if (subunit_new) {
                 session->subunit_raw.resize((size_t) S);
-                ggml_backend_tensor_get(subunit_new, session->subunit_raw.data() + resume, 0,
-                                        (size_t) n_new * sizeof(float));
+                ggml_backend_tensor_get(subunit_new, session->subunit_raw.data() + proj_begin, 0,
+                                        (size_t) n_proj * sizeof(float));
             }
         }
         if (key_ok && request_new) {
             session->request_raw.resize((size_t) S);
-            ggml_backend_tensor_get(request_new, session->request_raw.data() + resume, 0,
-                                    (size_t) n_new * sizeof(float));
+            ggml_backend_tensor_get(request_new, session->request_raw.data() + proj_begin, 0,
+                                    (size_t) n_proj * sizeof(float));
         }
         if (key_ok && cand_new) {
             session->stage2_cand.resize((size_t) S * luce::pflash::kStage2Embed);
             ggml_backend_tensor_get(cand_new,
-                session->stage2_cand.data() + (size_t) resume * luce::pflash::kStage2Embed, 0,
-                (size_t) n_new * luce::pflash::kStage2Embed * sizeof(float));
+                session->stage2_cand.data() + (size_t) proj_begin * luce::pflash::kStage2Embed, 0,
+                (size_t) n_proj * luce::pflash::kStage2Embed * sizeof(float));
         }
         if (key_ok && msum_new && !stage2_msum.empty()) {
             ggml_backend_tensor_get(msum_new, stage2_msum.data(), 0, stage2_msum.size() * sizeof(float));
         }
+        if (hbuf) ggml_backend_buffer_free(hbuf);
+        if (hctx) ggml_free(hctx);
         if (s2buf) ggml_backend_buffer_free(s2buf);
         if (s2ctx) ggml_free(s2ctx);
         if (nbuf) ggml_backend_buffer_free(nbuf);
@@ -2272,6 +2330,8 @@ static std::vector<int32_t> strict_score_impl(
     // while the query stays put, reusing its rows.
     session->ids = ids;
     session->checkpoint = checkpoint;
+    session->proj_rows = std::move(keep_proj);
+    session->proj_rows_begin = keep_begin;
     // Only exact rows are kept for later prompts: those in full grid ubatches
     // (pflash_scoring_resume.h).
     for (const auto & [tokens, rows] : qrows) {

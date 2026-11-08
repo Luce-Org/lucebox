@@ -6,11 +6,15 @@
 // projects keys / probe / request logits in 8192-token chunks from token 0. A resumed call reproduces those values
 // bit for bit only when it uses the same partition for every token it recomputes and reads stored values that a
 // fresh call would also have computed in that partition:
-//   * it resumes at a multiple of kScoringResumeGrid (8192, a multiple of the 1024 ubatch), so its ubatches and key
-//     chunks fall on the fresh call's grid, and at or before S - 64, so the cut stays where the fresh call has it;
+//   * it resumes at a multiple of kScoringResumeGrid (1024 = the ubatch), so its ubatches fall on the fresh call's
+//     grid, and at or before S - 64, so the cut stays where the fresh call has it;
 //   * the session keeps one recurrent-state snapshot, at pflash_scoring_checkpoint(S) of the call that stored it;
 //   * stored block-14 rows are exact only below pflash_scoring_exact_rows_end(S) of the call that computed them
-//     (they sit in full grid ubatches there; later rows met the S - 64 cut).
+//     (they sit in full grid ubatches there; later rows met the S - 64 cut). That bound equals the checkpoint;
+//   * the projection chunks (kScoringProjChunk, 8192) stay the fresh call's: a resume inside a chunk re-projects
+//     that whole chunk from pflash_scoring_proj_begin(resume), taking the block-14 rows ahead of the resume point
+//     from the session (it keeps [proj_begin(checkpoint), checkpoint), at most one chunk) and the rest from this
+//     call. Values the old call projected in a shorter, cut-off chunk are overwritten, never reused.
 // Nothing here approximates: a value that is not exactly available sends the call back to token 0.
 
 #include <cstddef>
@@ -20,7 +24,7 @@
 
 namespace luce::pflash {
 
-constexpr int kScoringResumeGrid = 8192;
+constexpr int kScoringResumeGrid = 1024;
 constexpr int kScoringProjChunk = 8192;   // keys / probe / request logits are projected in chunks this long from 0
 constexpr int kScoringUbatch = 1024;
 constexpr int kScoringCutBack = 64;
