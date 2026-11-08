@@ -1561,6 +1561,14 @@ static std::vector<int32_t> strict_score_impl(
     // into a HIP grid y/z dimension (65,535 limit). The chunks start at the
     // chunk start before the resume point, so they fall where a fresh call's do.
     const int key_chunk = luce::pflash::kScoringProjChunk;
+    // Phase clocks of the score half (the [qwen35-scorer] line): key / probe projection, segmentations, query
+    // windows (full probabilities read back), request / candidate tiles (reduced on the device).
+    double proj_ms = 0.0, seg_ms = 0.0, win_ms = 0.0, tile_ms = 0.0;
+    int seg_calls = 0, win_calls = 0;
+    const auto ms_since = [](std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+    };
+    const auto tp0 = std::chrono::steady_clock::now();
     if (n_proj > 0) {
         ggml_init_params nip{};
         nip.mem_size = (size_t)4 * ggml_tensor_overhead() + 4096;
@@ -1748,42 +1756,42 @@ static std::vector<int32_t> strict_score_impl(
         ggml_free(nctx);
         if (!key_ok) return fail("qwen35 key graph compute failed");
     }
+    proj_ms = ms_since(tp0);
 
     const std::vector<float> & probe_raw = session->probe_raw;
     const std::vector<float> & subunit_raw = session->subunit_raw;
 
+    // The segmentation's per-call constants, computed on first use: the boundary scores (tap-count Conv1d over
+    // the raw logits plus the residual, sigmoid), the sub-unit split scores (the oversize interior argmax only)
+    // and the token line flags. Only the pins change between the segmentations of one call.
+    std::vector<float> boundary, split_scores;
+    luce::pflash::PFlashLineFlags lines;
+    bool boundary_ready = false, lines_ready = false;
+    const auto probe_boundary = [&]() {
+        if (boundary_ready) return;
+        boundary_ready = true;
+        boundary = luce::pflash::pflash_probe_boundary_scores(probe_raw, st.probe_conv_w, st.probe_conv_b);
+        if (!subunit_raw.empty()) {
+            split_scores = luce::pflash::pflash_probe_boundary_scores(subunit_raw, st.probe_sub_conv_w,
+                                                                      st.probe_sub_conv_b);
+        }
+    };
+    const auto probe_lines = [&]() {
+        if (lines_ready) return;
+        lines_ready = true;
+        std::vector<std::string> texts((size_t) S);
+        for (int t = 0; t < S; ++t) texts[(size_t) t] = st.probe_vocab->token_text(ids[(size_t) t]);
+        lines = luce::pflash::pflash_line_flags(texts);
+    };
+
     // Candidates: probe segments cut at the pinned spans' edges, or fixed
     // chunks when the probe is off or finds too few boundaries.
-    const auto segment = [&](const std::vector<PFlashTokenSpan> & pins,
-                             std::vector<PFlashTokenSpan> & segments, bool & density) {
+    const auto segment_impl = [&](const std::vector<PFlashTokenSpan> & pins,
+                                  std::vector<PFlashTokenSpan> & segments, bool & density) {
         segments.clear();
         density = experiment.candidate_score == luce::pflash::PFlashCandidateScore::Density;
         if (!use_probe) return;
-        // Tap-count smoothing over the raw logits (torch Conv1d, symmetric
-        // padding) plus the residual logit, then sigmoid: the boundary score
-        // per token.
-        const auto smooth = [&](const std::vector<float> & raw,
-                                const std::vector<float> & conv_w, float conv_b,
-                                std::vector<float> & out) {
-            const int taps = (int) conv_w.size();
-            const int radius = taps / 2;
-            out.assign((size_t) S, 0.0f);
-            for (int t = 0; t < S; ++t) {
-                float acc = raw[(size_t) t] + conv_b;
-                for (int k = 0; k < taps; ++k) {
-                    const int u = t + k - radius;
-                    if (u >= 0 && u < S) acc += conv_w[(size_t) k] * raw[(size_t) u];
-                }
-                out[(size_t) t] = 1.0f / (1.0f + std::exp(-acc));
-            }
-        };
-        std::vector<float> boundary;
-        smooth(probe_raw, st.probe_conv_w, st.probe_conv_b, boundary);
-        // Sub-unit scores feed only the oversize interior argmax below.
-        std::vector<float> split_scores;
-        if (!subunit_raw.empty()) {
-            smooth(subunit_raw, st.probe_sub_conv_w, st.probe_sub_conv_b, split_scores);
-        }
+        probe_boundary();
         const int query_end = score_query_end < 0 ? S : score_query_end;
         const int query_begin = query_end - std::min(n_lookahead, query_end);
         std::vector<int> forced{query_begin, query_end};
@@ -1803,9 +1811,7 @@ static std::vector<int32_t> strict_score_impl(
             experiment.segmentation == luce::pflash::PFlashSegmentation::Probe;
         if (boundaries_in_context >= 4 || forced_probe) {
             if (st.probe_line_aligned && st.probe_vocab) {
-                std::vector<std::string> texts((size_t) S);
-                for (int t = 0; t < S; ++t) texts[(size_t) t] = st.probe_vocab->token_text(ids[(size_t) t]);
-                const auto lines = luce::pflash::pflash_line_flags(texts);
+                probe_lines();
                 segments = luce::pflash::pflash_probe_segments(
                     boundary, S, st.probe_threshold, st.probe_min_segment,
                     st.probe_max_segment, forced, split_scores, &lines);
@@ -1832,6 +1838,13 @@ static std::vector<int32_t> strict_score_impl(
                 density ? "density" : "sum");
         }
         std::fflush(stderr);
+    };
+    const auto segment = [&](const std::vector<PFlashTokenSpan> & pins,
+                             std::vector<PFlashTokenSpan> & segments, bool & density) {
+        const auto t = std::chrono::steady_clock::now();
+        segment_impl(pins, segments, density);
+        seg_ms += ms_since(t);
+        ++seg_calls;
     };
 
     // Tokens the selector keeps whatever their score, counted the way it charges them
@@ -2354,8 +2367,8 @@ static std::vector<int32_t> strict_score_impl(
     // a single softmax. History windows share the query's key set and mix
     // into its mass at their weights.
     const int n_key_chunks = (S + key_chunk - 1) / key_chunk;
-    const auto score_window = [&](const ScoredWindow & window,
-                                  std::vector<float> & mass) -> bool {
+    const auto score_window_impl = [&](const ScoredWindow & window,
+                                       std::vector<float> & mass) -> bool {
         const int nq = window.end - window.begin;
         ggml_init_params lip{};
         lip.mem_size = (size_t)8 * ggml_tensor_overhead() + 4096;
@@ -2471,6 +2484,13 @@ static std::vector<int32_t> strict_score_impl(
         scoring_head_mean_token_mass(probs_h.data(), S, nq, H, mass);
         return true;
     };
+    const auto score_window = [&](const ScoredWindow & window, std::vector<float> & mass) -> bool {
+        const auto t = std::chrono::steady_clock::now();
+        const bool ok = score_window_impl(window, mass);
+        win_ms += ms_since(t);
+        ++win_calls;
+        return ok;
+    };
     std::vector<float> token_mass;
     // Today's windows: each scored on its own, mixed at their weights.
     const auto score_windows = [&]() -> bool {
@@ -2496,9 +2516,9 @@ static std::vector<int32_t> strict_score_impl(
     // device, so only [S] floats per tile come back.
     // The identifier query uses the same scoring with its tokens left among
     // the keys (scored, not pinned: arm viii's key mask).
-    const auto score_request_set = [&](const std::vector<int> & tokens,
-                                       const std::vector<float> & rows,
-                                       bool mask_query_tokens, int & tiles) -> bool {
+    const auto score_request_set_impl = [&](const std::vector<int> & tokens,
+                                            const std::vector<float> & rows,
+                                            bool mask_query_tokens, int & tiles) -> bool {
         constexpr int kTile = 32;
         const int nq = (int) tokens.size();
         std::vector<float> mask_row((size_t) S, -INFINITY);
@@ -2617,6 +2637,13 @@ static std::vector<int32_t> strict_score_impl(
         token_mass.assign((size_t) S, 0.0f);
         for (int j = 0; j < S; ++j) token_mass[(size_t) j] = (float) (sum[(size_t) j] / denominator);
         return true;
+    };
+    const auto score_request_set = [&](const std::vector<int> & tokens, const std::vector<float> & rows,
+                                       bool mask_query_tokens, int & tiles) -> bool {
+        const auto t = std::chrono::steady_clock::now();
+        const bool ok = score_request_set_impl(tokens, rows, mask_query_tokens, tiles);
+        tile_ms += ms_since(t);
+        return ok;
     };
     // ---------------------------------------------------------------- query step 1
     // Masses of query token sets, cached per set (one tile stream per set; tiles never mix sets).
@@ -3021,13 +3048,16 @@ static std::vector<int32_t> strict_score_impl(
     auto t2 = std::chrono::steady_clock::now();
     std::fprintf(stderr,
         "[qwen35-scorer] forward %.2fs (blocks 0-%d, S=%d, resumed at %d, "
-        "%d new) score %.2fs (%zu query windows) total %.2fs head=%s\n",
+        "%d new) score %.2fs (%zu query windows) total %.2fs head=%s "
+        "phases: proj %.0f ms, segments %d/%.0f ms, windows %d/%.0f ms, tiles %d/%.0f ms\n",
         std::chrono::duration<double>(t1 - t0).count(), kQwen35HeadBlock - 1, S,
         resume, n_new,
         std::chrono::duration<double>(t2 - t1).count(),
         qcand ? query_trace.set.candidates.size() : request_set || ident_set ? (size_t) 1 : windows.size(),
         std::chrono::duration<double>(t2 - t0).count(),
-        st.head_loaded ? "trained" : "native-block15");
+        st.head_loaded ? "trained" : "native-block15",
+        proj_ms, seg_calls, seg_ms, win_calls, win_ms,
+        qtiles + request_trace.query_tiles + ident_trace.query_tiles, tile_ms);
     std::fflush(stderr);
     pflash_set_scoring_stats({resume, n_new,
                               qcand ? (int) query_trace.set.candidates.size()
