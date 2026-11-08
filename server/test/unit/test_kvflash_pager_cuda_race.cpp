@@ -262,3 +262,133 @@ TEST_CASE(KvflashPagerCudaRaceFixture, reattach_forgets_a_destroyed_compute_stre
     }
     CHECK_EQUAL(err, std::string());
 }
+// ---- Raw-byte round trip through the pool (copy_block_ / zero_block layout) ----
+// Fills pool blocks with a known pattern in the pager's segment order (layer
+// major, K then V, head minor), pages them out, and checks the pinned host copy
+// (via serialize()), the zeroed source block, and the bytes after the page-in
+// into different blocks. Independent of how the pager issues its copies.
+namespace {
+
+std::string roundtrip_run() {
+    try {
+        CudaHarness h;
+        KvFlashPager p;
+        need(p.attach(race_cfg(), h.k, h.v), "pager attach failed");
+        p.set_block_order({5, 2, 7, 0, 3, 6});
+        const int n = 4;
+        const size_t cb = h.chunk_bytes();
+        std::vector<uint8_t> got(cb);
+        auto fill = [&](int c, int block) {
+            std::vector<uint8_t> pat(cb);
+            for (size_t i = 0; i < cb; i++) pat[i] = rpat(c, i);
+            for_segments(h, block, [&](uint8_t * dev, size_t o, size_t len) {
+                cu(cudaMemcpy(dev, pat.data() + o, len, cudaMemcpyHostToDevice), "fill");
+            });
+        };
+        auto read_block = [&](int block) {
+            for_segments(h, block, [&](uint8_t * dev, size_t o, size_t len) {
+                cu(cudaMemcpy(got.data() + o, dev, len, cudaMemcpyDeviceToHost), "readback");
+            });
+        };
+        std::vector<int> old_block(n);
+        for (int c = 0; c < n; c++) {
+            need(p.slot_for((int64_t)c * kRChunk) >= 0, "slot_for failed");
+            old_block[c] = p.block_of(c);
+            fill(c, old_block[c]);
+        }
+        need(old_block[0] == 5 && old_block[1] == 2 && old_block[2] == 7 && old_block[3] == 0,
+             "unexpected block order");
+        for (int c = 0; c < n; c++) need(p.page_out(c), "page_out failed");
+        p.synchronize_paging();
+        const std::vector<uint8_t> blob = p.serialize();
+        const size_t hdr = 8 + 9 * sizeof(uint32_t);     // KVFLASH3: the pool layout follows the ledger
+        for (int c = 0; c < n; c++) {                       // D2H landed in segment order
+            for (size_t i = 0; i < cb; i++)
+                if (blob[hdr + (size_t)c * cb + i] != rpat(c, i))
+                    return "host copy of chunk " + std::to_string(c) + " differs at byte " + std::to_string(i);
+            read_block(old_block[c]);                       // and the source block was zeroed
+            for (size_t i = 0; i < cb; i++)
+                if (got[i] != 0) return "block " + std::to_string(old_block[c]) + " not zeroed at byte " + std::to_string(i);
+        }
+        for (int c = 0; c < n; c++) {                       // H2D into other blocks (LIFO free list)
+            need(p.page_in(c), "page_in failed");
+            p.synchronize_paging();
+            if (p.block_of(c) == old_block[c]) return "page_in did not move chunk " + std::to_string(c);
+            read_block(p.block_of(c));
+            for (size_t i = 0; i < cb; i++)
+                if (got[i] != rpat(c, i))
+                    return "recalled chunk " + std::to_string(c) + " differs at byte " + std::to_string(i);
+        }
+        // Dirty a free block, then zero_free_blocks() must clear it.
+        const int fb = 6;
+        fill(1, fb);
+        p.zero_free_blocks();
+        read_block(fb);
+        for (size_t i = 0; i < cb; i++)
+            if (got[i] != 0) return "free block not zeroed at byte " + std::to_string(i);
+        return "";
+    } catch (const std::exception & e) {
+        return e.what();
+    }
+}
+
+// truncate(P) with P inside a chunk zeroes the rows >= P%chunk of that chunk
+// (zero_chunk_rows_), in the pool block or, if paged out, in the host copy.
+// Every other byte of the kept chunks must survive.
+std::string truncate_run(bool host_chunk) {
+    try {
+        CudaHarness h;
+        KvFlashPager p;
+        need(p.attach(race_cfg(), h.k, h.v), "pager attach failed");
+        p.set_block_order({5, 2, 7, 0, 3, 6});
+        const size_t cb = h.chunk_bytes();
+        for (int c = 0; c < 4; c++) {
+            need(p.slot_for((int64_t)c * kRChunk) >= 0, "slot_for failed");
+            std::vector<uint8_t> pat(cb);
+            for (size_t i = 0; i < cb; i++) pat[i] = rpat(c, i);
+            for_segments(h, p.block_of(c), [&](uint8_t * dev, size_t o, size_t len) {
+                cu(cudaMemcpy(dev, pat.data() + o, len, cudaMemcpyHostToDevice), "fill");
+            });
+        }
+        if (host_chunk) { need(p.page_out(2), "page_out failed"); p.synchronize_paging(); }
+        const int row0 = 20;
+        p.truncate((int64_t)2 * kRChunk + row0);
+        p.synchronize_paging();
+        need(p.is_resident(2) || host_chunk, "chunk 2 lost");
+        if (!p.is_resident(2)) { need(p.page_in(2), "page_in failed"); p.synchronize_paging(); }
+        need(!p.is_resident(3), "chunk 3 survived the truncate");
+        need(p.resident_blocks() == 3, "chunk 3's block did not return to the free pool");
+        const size_t row_bytes = h.k[0]->nb[1];
+        std::vector<uint8_t> got(cb);
+        for (int c = 0; c < 3; c++) {
+            for_segments(h, p.block_of(c), [&](uint8_t * dev, size_t o, size_t len) {
+                cu(cudaMemcpy(got.data() + o, dev, len, cudaMemcpyDeviceToHost), "readback");
+            });
+            for_segments(h, p.block_of(c), [&](uint8_t *, size_t o, size_t len) {
+                for (size_t j = 0; j < len; j++) {
+                    const uint8_t want = (c == 2 && j >= (size_t)row0 * row_bytes) ? 0 : rpat(c, o + j);
+                    if (got[o + j] != want) {
+                        throw std::runtime_error("chunk " + std::to_string(c) + " segment offset " + std::to_string(o) +
+                                                 " byte " + std::to_string(j) + " differs after truncate");
+                    }
+                }
+            });
+        }
+        return "";
+    } catch (const std::exception & e) {
+        return e.what();
+    }
+}
+
+} // namespace
+
+TEST_CASE(KvflashPagerCudaRaceFixture, page_out_in_roundtrip_is_byte_exact_across_blocks) {
+    if (ggml_backend_cuda_get_device_count() < 1) SKIP("no CUDA device");
+    CHECK_EQUAL(roundtrip_run(), std::string());
+}
+
+TEST_CASE(KvflashPagerCudaRaceFixture, truncate_partial_chunk_zeroes_rows_byte_exact_resident_and_host) {
+    if (ggml_backend_cuda_get_device_count() < 1) SKIP("no CUDA device");
+    for (bool host_chunk : {false, true})
+        CHECK_EQUAL(truncate_run(host_chunk), std::string());
+}

@@ -119,8 +119,9 @@ struct Qwen4ExpCache;
 // that cannot fit). With snapshot_keep (one full-context snapshot), the chunk
 // widens toward kQwen4ExpPreferredChunk while the allowance keeps that much.
 // The caller must enforce the returned allowance on later snapshot captures.
+// `reserved` is device memory kept free for something else (a PFlash drafter).
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     Qwen4ExpCache & cache, int slots = 1, int resident_slots = 1, size_t * snapshot_budget = nullptr,
-    Qwen4ExpChunkPlan * plan = nullptr, size_t snapshot_keep = 0);
+    Qwen4ExpChunkPlan * plan = nullptr, size_t snapshot_keep = 0, size_t reserved = 0);
 
 }  // namespace luce::common

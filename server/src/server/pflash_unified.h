@@ -65,14 +65,16 @@ Lines detect_lines(const std::string & text, size_t begin, size_t end);
 
 // ── Region layout ───────────────────────────────────────────────────────
 
-// A region's lines split into a pinned head (at least its first two lines), a pinned tail (at least its last two
-// lines) and units between cuts. Every cut is a line_cut(): a position that starts a token in both tokenisations
-// (``common``), at the start of the line it opens or of the separator before it.
+// A region split into a pinned head, a pinned tail and units between cuts. Line units (layout_region): the head
+// holds at least the first two lines, the tail at least the last two, and every cut is a line_cut(): a position that
+// starts a token in both tokenisations (``common``), at the start of the line it opens or of the separator before it.
+// Inline units (layout_region_inline): cuts may also fall inside a line, at the drafter's candidate starts.
 struct Layout {
     size_t head_end = 0;                 // pinned head [content begin, head_end)
     size_t tail_begin = 0;               // pinned tail [tail_begin, content end)
     std::vector<size_t> cuts;            // cuts.front() == head_end, cuts.back() == tail_begin
-    std::vector<int> cut_line;           // the line each cut opens (cut_line.back(): the tail's first line)
+    std::vector<int> cut_line;           // the line each cut opens (line units) or falls in (inline units)
+    bool inline_units = false;
     int units() const { return cuts.empty() ? 0 : (int) cuts.size() - 1; }
     int first_line(int unit) const { return cut_line[(size_t) unit]; }
     int line_count(int first_unit, int last_unit) const {
@@ -93,6 +95,19 @@ size_t line_cut(const Lines & lines, const std::vector<size_t> & common, int lin
 bool layout_region(const Lines & lines, const std::vector<size_t> & common,
                    const std::vector<size_t> & proposed, Layout & out, std::string & why);
 
+// Units for content line units cannot page (too few lines, a line longer than the cap, no clean head or tail): every
+// line_cut() and every ``proposed`` offset, moved to the first ``common`` offset at or after it, is a cut, except
+// inside a UTF-8 character or (escaped lines) inside an escape sequence. The head is the content before the first
+// cut and the tail the content from the last; ``keep_first_line`` / ``keep_last_line`` (content with at least two
+// lines) keep that line whole in the head / tail, as line units keep their edge lines. False with ``why`` when fewer
+// than three cuts remain.
+bool layout_region_inline(const std::string & text, const Lines & lines, const std::vector<size_t> & common,
+                          const std::vector<size_t> & proposed, bool keep_first_line, bool keep_last_line,
+                          Layout & out, std::string & why);
+
+// The lines [first, end) that units [first_unit, last_unit] touch.
+std::pair<int, int> unit_lines(const Lines & lines, const Layout & layout, int first_unit, int last_unit);
+
 // ── Text ────────────────────────────────────────────────────────────────
 
 enum class RegionKind { UserContent, ToolOutput };
@@ -104,6 +119,10 @@ std::string json_unescape(const std::string & text, size_t begin, size_t end);
 
 std::string marker_text(int lines_not_shown);
 std::string preamble_text(RegionKind kind, int shown_lines, int total_lines);
+// The marker of dropped units [first_unit, last_unit] and the preamble of a paged region: line units count lines,
+// inline units do not (a run may start or end inside a line).
+std::string unit_marker_text(const Layout & layout, int first_unit, int last_unit);
+std::string region_preamble_text(RegionKind kind, const Layout & layout, int shown_lines, int total_lines);
 std::string recall_label_text(RegionKind kind, const std::string & brief);
 inline const char * recall_open() { return "[Earlier in this conversation]\n"; }
 inline const char * recall_close() { return "\n[End of earlier excerpts]\n\n"; }
@@ -287,8 +306,9 @@ nlohmann::json view_to_json(const View & view);
 bool view_from_json(const nlohmann::json & j, View & view, std::string & error);
 
 // The paging rules' version, part of a stored view's identity: a view paged under older rules is never served again.
-// 2: a line over its region's cap hands the request to the chat view (it was dropped whole).
-inline constexpr int kViewPagingVersion = 2;
+// 2: a line over its region's cap hands the request to the former chat view (it was dropped whole).
+// 3: content line units cannot page is paged in inline units.
+inline constexpr int kViewPagingVersion = 3;
 
 // Views of shortened conversations kept on disk next to the KV cache, so a conversation survives a restart or the
 // RAM store's eviction: written when a view leaves the RAM store and at shutdown, read on a RAM miss. One file per

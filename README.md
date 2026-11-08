@@ -107,8 +107,10 @@ These runs use different prompts, quantizations, and inference policies. They sh
 See [Recommended server setups](server/docs/RECOMMENDED_SETUPS.md) for the model and hardware matrix, including single-GPU and mixed-GPU profiles.
 
 The DS4 guide also documents the Strix long-context sparse-verifier profile and
-Qwen3-0.6B PFlash integration. PFlash is lossy prompt compression; keep it off
-for exact-retrieval and matched true-context benchmarks.
+PFlash integration. PFlash is on by default when its drafter and trained
+scoring head are given and the target supports it (the Qwen3.5 family and
+DeepSeek V4, in a launch PFlash combines with); it is lossy prompt compression, so turn it off
+(`--pflash off`) for exact-retrieval and matched true-context benchmarks.
 
 ## Client Harnesses
 

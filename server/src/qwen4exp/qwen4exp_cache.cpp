@@ -1,8 +1,12 @@
 #include "qwen4exp_cache.h"
+#include "common/layer_split_kvflash.h"
 #include "ggml-cuda.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 namespace luce::common {
 
@@ -49,7 +53,8 @@ void free_qwen4exp_slot_states(Qwen4ExpSlotStates & s) {
 
 bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
                            int max_ctx, Qwen4ExpCache & out, bool mtp, int mtp_draft,
-                           const Qwen4ExpSlotStates * slot_states, int state_slot, int remote_layers) {
+                           const Qwen4ExpSlotStates * slot_states, int state_slot, int remote_layers,
+                           int kvflash_pool) {
     const Qwen4ExpCudaScope profile(w.gfx1151);
     // The QSA cell-id kernel is exact for positions below 2^24.
     if (max_ctx <= 0 || max_ctx >= (1 << 24)) {
@@ -59,6 +64,12 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
     }
     if (mtp_draft < 1 || mtp_draft > QWEN4EXP_MTP_MAX_DRAFT) return false;
     if (slot_states && (state_slot < 0 || state_slot >= slot_states->n_slots)) return false;
+    // The pager pages one device's rows: a pooled cache keeps every full-attention layer's on the target.
+    if (kvflash_pool < 0 || (kvflash_pool > 0 && (kvflash_pool >= max_ctx || remote_layers > 0))) {
+        std::fprintf(stderr, "[qwen4exp] cache: KVFlash pool %d needs a context above it (%d) and no remote layers (%d)\n",
+                     kvflash_pool, max_ctx, remote_layers);
+        return false;
+    }
     constexpr ggml_type kv_type = GGML_TYPE_F16;
 
     out.full_layer_ids.clear();
@@ -127,15 +138,17 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
     // logical context limit. Padding is masked by the causal cell IDs.
     const int64_t align = w.qsa ? 4 : 1;
     const int64_t kv_capacity = (static_cast<int64_t>(max_ctx) + align - 1) / align * align;
+    const int64_t attn_rows = kvflash_pool > 0 ? kvflash_pool : kv_capacity;
     for (size_t i = 0; i < n_full; ++i) {
         ggml_context * rows = out.remote((int) i) ? out.remote_ctx : out.ctx;
         out.attn_k[i] = ggml_new_tensor_3d(rows, kv_type,
-            w.n_embd_head_k, kv_capacity, w.n_head_kv);
+            w.n_embd_head_k, attn_rows, w.n_head_kv);
         out.attn_v[i] = ggml_new_tensor_3d(rows, kv_type,
-            w.n_embd_head_v, kv_capacity, w.n_head_kv);
+            w.n_embd_head_v, attn_rows, w.n_head_kv);
         const int il = out.full_layer_ids[i];
         const int ratio = il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0;
-        if (w.indexer_head_size > 0 && ratio > 0) {
+        // QSA selects blocks of positions laid out in order, which pool slots are not: a pooled cache attends densely.
+        if (w.indexer_head_size > 0 && ratio > 0 && kvflash_pool == 0) {
             const int64_t max_blocks = (static_cast<int64_t>(max_ctx) + ratio - 1) / ratio;
             out.indexer_k[i] = ggml_new_tensor_2d(rows, GGML_TYPE_F32,
                 w.indexer_head_size, max_blocks + 1);
@@ -206,6 +219,18 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
         free_qwen4exp_cache(out);
         return false;
     }
+    if (kvflash_pool > 0) {
+        // Attached right after the target's allocation, so the pager's page stream is the target's. Slots read before
+        // any write (masked) must hold zeros: a masked NaN row would still poison its query.
+        KvFlashConfig cfg;
+        cfg.pool_tokens = kvflash_pool;
+        out.kvflash = std::make_unique<KvFlashPager>();
+        if (!out.kvflash->attach(cfg, out.attn_k, out.attn_v)) {
+            free_qwen4exp_cache(out);
+            return false;
+        }
+        ggml_backend_buffer_clear(out.buf, 0);
+    }
 
     // Stable scoring converts the whole bucket, including its masked suffix.
     for (ggml_tensor * t : out.indexer_k) {
@@ -233,10 +258,14 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
         "[qwen4exp] cache: %zu full + %zu linear layers, kv=%s %.2f MiB @ ctx=%d, "
         "ssm_state %.1f MiB, conv_state %.1f MiB\n",
         n_full, n_linear, ggml_type_name(kv_type),
-        kv_bytes_per_token * static_cast<size_t>(max_ctx) / (1024.0 * 1024.0),
+        kv_bytes_per_token * static_cast<size_t>(attn_rows) / (1024.0 * 1024.0),
         max_ctx,
         n_linear * static_cast<double>(S_v * S_v * H_v * 4) / (1024.0 * 1024.0),
         n_linear * static_cast<double>((kernel - 1) * conv_channels * 4) / (1024.0 * 1024.0));
+    if (out.kvflash) {
+        std::fprintf(stderr, "[qwen4exp] cache: KVFlash pool of %d rows for a %d-token context, dense attention\n",
+                     kvflash_pool, max_ctx);
+    }
     return true;
 }
 
@@ -274,6 +303,8 @@ static void clear_position_bound_graphs(Qwen4ExpCache & c) {
 
 void free_qwen4exp_cache(Qwen4ExpCache & c) {
     clear_retained_graphs(c);
+    c.kvflash.reset();   // waits for its page work on the rows freed below
+    c.kvflash_slot_pos.clear();
     if (c.split_sched) { ggml_backend_sched_free(c.split_sched); c.split_sched = nullptr; }
     if (c.split_sched_short) { ggml_backend_sched_free(c.split_sched_short); c.split_sched_short = nullptr; }
     if (c.split_cpu) { ggml_backend_free(c.split_cpu); c.split_cpu = nullptr; }
@@ -323,6 +354,7 @@ void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c) {
     // stream; the memsets below run on another stream and must not race them.
     ggml_backend_synchronize(backend);
     clear_position_bound_graphs(c);
+    if (c.kvflash) c.kvflash->reset();
     for (ggml_tensor * t : c.ssm_state) {
         if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
     }
@@ -348,8 +380,9 @@ namespace {
 // same leading strips whether or not the cache it came from has the layer.
 template<class F>
 void snapshot_strips(const Qwen4ExpCache & c, int pos, int blocks, bool mtp, F visit) {
-    auto prefix = [&](ggml_tensor * t, int rows) {
-        if (!t || rows <= 0) return;
+    auto prefix = [&](ggml_tensor * t, int64_t rows) {
+        rows = t ? std::min(rows, t->ne[1]) : 0;   // a KVFlash pool's rows
+        if (rows <= 0) return;
         for (int64_t h = 0; h < t->ne[2]; ++h) visit(t, h * t->nb[2], rows * t->nb[1]);
     };
     for (auto * t : c.attn_k) prefix(t, pos);
@@ -393,6 +426,7 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const 
                             Qwen4ExpSnapshot & s) {
     free_qwen4exp_snapshot(s);
     if (c.cur_pos <= 0 || (c.mtp_k && c.mtp_prev_pos != c.cur_pos - 1)) return false;
+    if (c.kvflash && !c.kvflash->identity_prefix_covers(c.cur_pos)) return false;
     size_t count = 0;
     snapshot_strips(c, c.cur_pos, c.indexer_blocks, true, [&](ggml_tensor *, size_t, size_t) { ++count; });
     s.ctx = ggml_init({(2 * count + 1) * ggml_tensor_overhead(), nullptr, true});
@@ -420,6 +454,7 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const 
 
 bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c) {
     if (!s.buf || !c.buf || s.cur_pos <= 0 || s.cur_pos > c.max_ctx) return false;
+    if (c.kvflash && s.cur_pos > c.kvflash->pool_tokens()) return false;
     // The target's strips at the snapshot's position, in the order they were saved. The draft layer's come only when
     // both caches have the layer; a snapshot that has it and a target that does not leave its trailing strips out.
     const bool mtp = s.mtp && c.mtp_k;
@@ -458,7 +493,54 @@ bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & 
     c.ple_prev = s.ple_prev;
     c.spec_pos = -1;
     c.spec_tokens = 0;
+    // The restored rows sit in their identity slots; the pager maps them so.
+    if (c.kvflash && !layer_split_kvflash_sync_identity(*c.kvflash, s.cur_pos, c.kvflash->pool_tokens(), "qwen4exp")) {
+        reset_qwen4exp_state(backend, c);
+        return false;
+    }
     return true;
+}
+
+int64_t qwen4exp_attn_cap(const Qwen4ExpCache & c) {
+    return c.kvflash ? c.kvflash->pool_tokens() : c.max_ctx;
+}
+
+int64_t qwen4exp_attn_rows(const Qwen4ExpCache & c, int64_t kv_len) {
+    return std::min(kv_len, qwen4exp_attn_cap(c));
+}
+
+int qwen4exp_max_forward_rows(const Qwen4ExpCache & c) {
+    // An unaligned forward touches one chunk more than its rows fill.
+    return c.kvflash ? c.kvflash->pool_tokens() - 2 * c.kvflash->chunk_tokens() : std::numeric_limits<int>::max();
+}
+
+bool qwen4exp_kvflash_reserve(Qwen4ExpCache & c, int pos0, int n) {
+    if (!c.kvflash) return true;
+    if (n > qwen4exp_max_forward_rows(c)) {
+        std::fprintf(stderr, "[qwen4exp][kvflash] a %d-row forward exceeds the %d rows a %d-slot pool keeps resident\n",
+                     n, qwen4exp_max_forward_rows(c), c.kvflash->pool_tokens());
+        return false;
+    }
+    if (!c.kvflash->alloc_span(pos0, n)) return false;
+    c.kvflash_slot_pos.resize((size_t) c.kvflash->pool_tokens());
+    c.kvflash->fill_slot_pos(c.kvflash_slot_pos.data());
+    return true;
+}
+
+int32_t qwen4exp_kv_row(const Qwen4ExpCache & c, int64_t pos) {
+    return c.kvflash ? (int32_t) c.kvflash->slot_of(pos) : (int32_t) pos;
+}
+
+void qwen4exp_causal_mask(const Qwen4ExpCache & c, ggml_fp16_t * row, int64_t cols, int64_t q) {
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+    if (!c.kvflash) {
+        const int64_t seen = std::clamp<int64_t>(q + 1, 0, cols);
+        std::fill_n(row, seen, zero);
+        std::fill(row + seen, row + cols, ninf);
+        return;
+    }
+    const int32_t * pos = c.kvflash_slot_pos.data();
+    for (int64_t s = 0; s < cols; ++s) row[s] = pos[s] >= 0 && pos[s] <= q ? zero : ninf;
 }
 
 }  // namespace luce::common

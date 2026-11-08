@@ -582,7 +582,7 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                 int committed = -1;
                 iss >> committed;
                 bool ok = kvflash_pool_tokens > 0 && committed >= 0 &&
-                          committed <= kvflash_pool_tokens;
+                          committed <= kvflash_pool_tokens && kvflash_pager.row_base() == 0;   // identity sync is serial-only
                 if (ok) {
                     int min_cur_pos = std::numeric_limits<int>::max();
                     for (const auto & shard : shards) {

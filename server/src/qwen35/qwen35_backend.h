@@ -196,6 +196,7 @@ public:
                                       ImagePromptHandle & payload,
                                       std::string & error) const override;
     bool supports_remote_draft() const override { return true; }
+    bool pflash_gives_candidate_scores() const override { return true; }
 
     // ── Concurrent slot serving (paged AR decode over N sequences) ────
     // Non-null once init() has built the engine (--max-concurrency N with paged

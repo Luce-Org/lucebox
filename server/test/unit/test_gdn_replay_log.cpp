@@ -983,8 +983,7 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
 
 int main(int argc, char ** argv) {
     if (!test_raw_gate_protocol()) return 1;
-    setenv("LUCE_GDN_FORCE_GROUPED_COLS", "1", 1);
-    unsetenv("LUCE_GDN_NO_GROUPED_COLS");
+    ggml_backend_cuda_set_gdn_route_override(1);  // grouped-cols
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
         std::fprintf(stderr, "GPU backend unavailable\n");
@@ -1009,11 +1008,10 @@ int main(int argc, char ** argv) {
     ok = run_case(backend, false, true, "grouped") && ok;
     ok = run_case(backend, true, false, "generic") && ok;
     ok = run_grouped_chain_case(backend) && ok;
-    unsetenv("LUCE_GDN_FORCE_GROUPED_COLS");
-    setenv("LUCE_GDN_NO_GROUPED_COLS", "1", 1);
+    ggml_backend_cuda_set_gdn_route_override(0);  // scalar
     ok = run_case(backend, false, false, "scalar") && ok;
     ok = run_case(backend, false, true, "scalar") && ok;
-    unsetenv("LUCE_GDN_NO_GROUPED_COLS");
+    ggml_backend_cuda_set_gdn_route_override(-1);
     ok = test_tree_commit_preflight_is_non_mutating(backend) && ok;
     ggml_backend_free(backend);
     return ok ? 0 : 1;

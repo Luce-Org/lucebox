@@ -323,19 +323,22 @@ static void print_usage(const char * prog) {
         "  --kvflash-tau <N>             Drafter-policy reselect interval (default: 64)\n"
         "\n"
         "PFlash (speculative prefill compression):\n"
-        "  --pflash on|off             Compress prompts from --prefill-threshold\n"
-        "                              tokens (default: off)\n"
-        "  --prefill-threshold <N>     Auto threshold for a prompt or aggregate\n"
-        "                              aged history (default: 32000; 16384 with\n"
-        "                              PFLASH_SCORING_HEAD_GGUF, the release profile)\n"
-        "  --prefill-keep-ratio <F>    Fraction of tokens to keep (default: 0.05)\n"
+        "  --pflash on|off|auto        Compress prompts from --prefill-threshold\n"
+        "                              tokens (default: auto, on when\n"
+        "                              --prefill-drafter and\n"
+        "                              PFLASH_SCORING_HEAD_GGUF are set). On needs\n"
+        "                              both.\n"
+        "  --prefill-threshold <N>     Droppable tokens a message needs to be paged\n"
+        "                              (default: 16384, the release profile)\n"
+        "  --prefill-keep-ratio <F>    Fraction of tokens to keep (default: the\n"
+        "                              release curve)\n"
         "  --prefill-curve T:R [T:R ...]  Piecewise keep-ratio curve over\n"
         "                              (token,ratio) breakpoints; linear interp.\n"
         "                              Overrides --prefill-keep-ratio. Example:\n"
         "                              10000:0.5 40000:0.2 100000:0.1 (quoted\n"
         "                              as one argument works the same)\n"
-        "                              With PFLASH_SCORING_HEAD_GGUF and neither\n"
-        "                              flag: 16384:0.315 32768:0.270 65536:0.270\n"
+        "                              Neither flag: the release curve\n"
+        "                              16384:0.315 32768:0.270 65536:0.270\n"
         "                              120000:0.225\n"
         "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3.5-0.8B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
@@ -373,8 +376,6 @@ static void print_usage(const char * prog) {
         "                              Default disk prefix-cache policy (default: full).\n"
         "                              A plain N caches the first N prompt tokens.\n"
         "                              Needs RAM prefix slots to write new entries.\n"
-        "  --disk-prefix-cache-compress Clamp FlowKV disk snapshots to the stable\n"
-        "                              system prefix. Requires --prefill-drafter.\n"
         "\n"
         "Chat template (optional, overrides the model-family renderer):\n"
         "  --chat-template-file <path>  Load a Jinja chat template file.\n"
@@ -449,6 +450,7 @@ struct ModelOptions {
     bool target_device_from_env = false;  // the device came from LUCE_TARGET_DEVICE
     bool draft_device_set = false;     // --draft-device given explicitly
     std::optional<DevicePlacement> pflash_drafter_device;  // --prefill-drafter-device
+    bool pflash_set = false;           // --pflash on|off given explicitly (unset: auto)
     bool pflash_threshold_set = false; // --prefill-threshold given explicitly
     bool pflash_ratio_set = false;     // --prefill-keep-ratio or --prefill-curve given explicitly
     std::optional<DevicePlacement> expert_device;  // --expert-device
@@ -1022,10 +1024,15 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             const char * value = argv[i][8] == '=' ? argv[i] + 9 : (i + 1 < argc ? argv[++i] : "");
             if (std::strcmp(value, "on") == 0) {
                 sconfig.pflash = true;
+                model.pflash_set = true;
             } else if (std::strcmp(value, "off") == 0) {
                 sconfig.pflash = false;
+                model.pflash_set = true;
+            } else if (std::strcmp(value, "auto") == 0) {
+                sconfig.pflash = false;
+                model.pflash_set = false;
             } else {
-                std::fprintf(stderr, "[server] --pflash takes on or off, not '%s'\n", value);
+                std::fprintf(stderr, "[server] --pflash takes on, off or auto, not '%s'\n", value);
                 print_usage(argv[0]);
                 return 1;
             }
@@ -1170,7 +1177,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             }
             sconfig.disk_cache_policy = policy;
         } else if (std::strcmp(argv[i], "--disk-prefix-cache-compress") == 0) {
-            sconfig.disk_cache_policy.compress = true;
+            std::fprintf(stderr, "[server] --disk-prefix-cache-compress is retired and has no effect\n");
         } else if (std::strcmp(argv[i], "--cache-type-k") == 0 && i + 1 < argc) {
             cache_type_k = argv[++i];
         } else if (std::strcmp(argv[i], "--cache-type-v") == 0 && i + 1 < argc) {
@@ -1259,6 +1266,28 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         sconfig.decode_kv_offload_bytes != kAutoKvOffloadBytes && bargs.max_concurrency <= 1) {
         std::fprintf(stderr, "[server] --decode-kv-offload-mb requires --max-concurrency greater than 1\n");
         return 2;
+    }
+    // --pflash auto (the default): PFlash is on when its files are given -- the drafter
+    // (--prefill-drafter) and the trained scoring head (PFLASH_SCORING_HEAD_GGUF).
+    if (!model.pflash_set && !load_balancing && !sconfig.pflash_drafter_path.empty()) {
+        const char * head = std::getenv("PFLASH_SCORING_HEAD_GGUF");
+        if (head && *head) {
+            sconfig.pflash = true;
+            std::fprintf(stderr, "[server] PFlash on: --prefill-drafter and PFLASH_SCORING_HEAD_GGUF are set "
+                                 "(--pflash off turns it off)\n");
+        } else {
+            std::fprintf(stderr, "[server] PFlash off: --prefill-drafter is set but PFLASH_SCORING_HEAD_GGUF "
+                                 "is not\n");
+        }
+    }
+    if (sconfig.pflash && !sconfig.pflash_drafter_path.empty()) {
+        const char * head = std::getenv("PFLASH_SCORING_HEAD_GGUF");
+        if (!head || !*head) {
+            std::fprintf(stderr, "[server] --pflash on needs the trained scoring head: set "
+                                 "PFLASH_SCORING_HEAD_GGUF (the release profile also uses PFLASH_SEGMENT_PROBE_GGUF "
+                                 "and PFLASH_REQUEST_PROBE_GGUF), or turn PFlash off\n");
+            return 2;
+        }
     }
     if (load_balancing && (bargs.device.is_multi_device() ||
             bargs.remote_draft.enabled() || bargs.remote_target_shard.enabled() ||
@@ -1631,6 +1660,29 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         bargs.draft_device, model.draft_device_set, bargs.device,
         model.target_device_auto);
 
+    // PFlash beside Qwen3.8-Flash (qwen4exp): the drafter scores each prompt
+    // beside the resident model, which sizes its context and prompt chunk with
+    // the drafter's room kept free on the drafter's GPU: its weights and the
+    // scoring workspace per prompt token measured for concurrent Qwen3.5 (the
+    // same drafter, whatever the target).
+    if (sconfig.pflash && inspect_gguf_model_info(bargs.model_path.c_str()).arch == "qwen4exp") {
+        std::error_code size_error;
+        const auto drafter_bytes =
+            std::filesystem::file_size(sconfig.pflash_drafter_path, size_error);
+        bargs.pflash_reserve_gpu =
+            pflash_drafter_device(bargs.draft_device, model.pflash_drafter_device).gpu;
+        bargs.pflash_reserve_bytes = size_error ? 0 : (long long) drafter_bytes;
+        bargs.pflash_reserve_bytes_per_token = kPFlashScoringBytesPerToken;
+        // Parking would drop and reload the whole model for every prompt.
+        sconfig.pflash_skip_park = true;
+        std::fprintf(stderr,
+            "[server] PFlash: the drafter scores beside the resident model (--prefill-skip-park); where the model "
+            "plans its context on gpu %d (target or expert device) it keeps %.2f GiB plus %lld KiB per context "
+            "token free there for it\n",
+            bargs.pflash_reserve_gpu,
+            bargs.pflash_reserve_bytes / 1073741824.0, kPFlashScoringBytesPerToken / 1024);
+    }
+
     // Explicit --cache-type-* overrides enter the request here; the qwen35
     // env/default resolution runs inside prepare_backend() once the model
     // architecture is known. Other families still consume their env vars.
@@ -1696,8 +1748,31 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         : kvflash_pool_requested(kvflash_config)
             ? KvFlashRequest::Auto
             : KvFlashRequest::Off;
-    BackendPreparation backend_preparation =
-        prepare_backend(std::move(bargs), backend_admission);
+    // --pflash auto: a launch PFlash cannot combine with (paged attention without concurrency, tensor
+    // parallelism, ...) is admitted with PFlash off instead of refused.
+    const bool pflash_auto = sconfig.pflash && !model.pflash_set;
+    BackendArgs pflash_off_args;
+    if (pflash_auto) {
+        pflash_off_args = bargs;
+        pflash_off_args.pflash_reserve_gpu = -1;   // no drafter to keep room for
+        pflash_off_args.pflash_reserve_bytes = 0;
+        pflash_off_args.pflash_reserve_bytes_per_token = 0;
+    }
+    BackendPreparation backend_preparation = [&]() -> BackendPreparation {
+        BackendPreparation first = prepare_backend(std::move(bargs), backend_admission);
+        const auto * failure = std::get_if<BackendPreparationFailure>(&first);
+        if (!failure || !pflash_auto || failure->error != BackendPreparationError::FeatureCompatibility) {
+            return first;
+        }
+        BackendAdmissionContext pflash_off = backend_admission;
+        pflash_off.pflash_enabled = false;
+        BackendPreparation retried = prepare_backend(std::move(pflash_off_args), pflash_off);
+        if (std::holds_alternative<BackendPreparationFailure>(retried)) return first;
+        std::fprintf(stderr, "[server] PFlash off: %s\n", failure->message.c_str());
+        sconfig.pflash = false;
+        backend_admission = pflash_off;
+        return retried;
+    }();
     if (const auto * failure =
             std::get_if<BackendPreparationFailure>(&backend_preparation)) {
         for (const std::string & warning : failure->warnings) {
@@ -1990,6 +2065,11 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         backend_owner = std::move(head);
     }
     ModelBackend * backend = backend_owner.get();
+    // --pflash auto: a target whose drafter pass gives no per-candidate scores cannot run the view; PFlash stays off.
+    if (sconfig.pflash && !model.pflash_set && !backend->pflash_gives_candidate_scores()) {
+        sconfig.pflash = false;
+        std::fprintf(stderr, "[server] PFlash off: this model's drafter pass gives no per-candidate scores\n");
+    }
     // --max-ctx auto: serve the context the backend fitted to its devices.
     if (backend_placement.target.fit_ctx && backend->context_limit() > 0) {
         sconfig.max_ctx = backend->context_limit();
@@ -2455,8 +2535,13 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
 
     loaded.engine =
         std::make_unique<luce::engine::LuceEngine>(std::move(backend_owner));
-    loaded.server =
-        std::make_unique<HttpServer>(*loaded.engine, tokenizer, sconfig);
+    try {
+        loaded.server = std::make_unique<HttpServer>(*loaded.engine, tokenizer, sconfig);
+    } catch (const std::exception & e) {
+        // The server's own startup checks (PFlash settings, tool lists) already printed why.
+        std::fprintf(stderr, "[server] startup failed: %s\n", e.what());
+        return 1;
+    }
     HttpServer & server = *loaded.server;
     server.set_chat_format(chat_format_for_arch(arch));
     loaded.freq_tracking = sconfig.freq_tracking;

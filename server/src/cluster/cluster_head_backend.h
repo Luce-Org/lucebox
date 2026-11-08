@@ -106,6 +106,7 @@ public:
     void release_scratch() override;
     bool supports_remote_draft() const override;
     bool supports_kvflash() const override;
+    bool pflash_gives_candidate_scores() const override { return inner_->pflash_gives_candidate_scores(); }
     bool supports_mixed_backend_layer_split() const override;
     bool set_routing_collector(common::MoeRoutingCollector * collector) override;
     const common::MoeHybridRoutingStats * get_routing_stats() const override;

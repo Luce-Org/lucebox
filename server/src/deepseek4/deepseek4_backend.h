@@ -88,6 +88,7 @@ public:
     // ModelBackend interface
     void print_ready_banner() const override;
     bool supports_images() const override { return image_capable_ && vision_ != nullptr; }
+    bool pflash_gives_candidate_scores() const override { return true; }
     std::string image_placeholder() const override { return vision::DS4V_IMAGE_PLACEHOLDER; }
     // DeepSeek V4 and V4.1 encoding.py join a message's text blocks, image
     // placeholders included, with a blank line.
@@ -252,8 +253,6 @@ private:
     std::vector<float>             spec_feat_window_;
     DrafterContext                 pflash_drafter_ctx_;
     bool                           pflash_drafter_loaded_ = false;
-    std::string                    pflash_drafter_path_;
-    int                            pflash_drafter_gpu_ = -1;
     // Once a long prompt selects the fragmentation-safe prefill shape, retain
     // it for later requests so the HIP arenas never switch back under load.
     int                            hybrid_prefill_chunk_cap_ = 0;

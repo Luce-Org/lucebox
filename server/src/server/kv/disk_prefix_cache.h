@@ -29,9 +29,6 @@ enum class DiskPrefixCacheMode {
 struct DiskPrefixCachePolicy {
     DiskPrefixCacheMode mode = DiskPrefixCacheMode::Full;
     int fixed_tokens = 0;
-    // When true, clamp FlowKV disk snapshots to its stable system prefix.
-    // False preserves the operator-selected disk-cache scope.
-    bool compress = false;
 };
 
 const char * disk_prefix_cache_mode_name(DiskPrefixCacheMode mode);
@@ -41,8 +38,7 @@ bool parse_disk_prefix_cache_policy(const std::string & value,
                                     DiskPrefixCachePolicy & out);
 
 // Apply a request-level scope string on top of a server-level policy.
-// Parses scope_str into a new mode/window/fixed_tokens, then merges it with
-// server_policy so that server-level flags (e.g. compress) are preserved.
+// Parses scope_str into a new mode/fixed_tokens that replaces server_policy.
 // Returns false (and leaves server_policy unchanged) if scope_str is invalid.
 bool apply_request_scope_override(DiskPrefixCachePolicy & server_policy,
                                   const std::string & scope_str);

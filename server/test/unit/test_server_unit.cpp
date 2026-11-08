@@ -18,7 +18,6 @@
 #include "server/kv/prefix_cache.h"
 #include "server/pin_friendly_prompt.h"
 #include "server/kv/disk_prefix_cache.h"
-#include "server/freeze_history.h"
 #include "server/utf8_utils.h"
 #include "server/api_types.h"
 #include "server/http_server.h"
@@ -56,6 +55,7 @@
 #include "pflash/pflash_drafter.h"
 #include "qwen3_model.h"
 #include "pflash/pflash_compress.h"
+#include "pflash/pflash_window.h"
 #include "luce.h"
 #include "gguf.h"
 #include <nlohmann/json.hpp>
@@ -354,17 +354,9 @@ struct HttpServerTestAccess {
     static json pflash_failure_counters(const HttpServer & server) {
         return server.pflash_failure_counters_json();
     }
-    static json pflash_keep_history(const HttpServer & server) {
-        return server.pflash_keep_history_json();
-    }
-    static size_t pflash_view_count(const HttpServer & server) {
-        return server.pflash_views_.size();
-    }
     static json pflash_unified(const HttpServer & server) {
         return server.pflash_unified_json();
     }
-    // The chat view's own behaviour, which serves the requests the unified view hands back.
-    static void chat_view_only(HttpServer & server) { server.pflash_unified_ = false; }
     // A committed inline prefix-cache entry: ids[0, cut) restorable from
     // ``slot`` (the backend reports the snapshot).
     static void seed_prefix_cache(HttpServer & server, int slot, int cut,
@@ -1622,94 +1614,12 @@ TEST_CASE(ServerUnitFixture, test_pflash_normalizes_multipart_latest_user_for_re
     }
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_selection_cache_and_continuation_policy) {
-    TEST_ASSERT(http_detail::pflash_full_cache_restore_allowed(false));
-    TEST_ASSERT(!http_detail::pflash_full_cache_restore_allowed(true));
-}
-
 TEST_CASE(ServerUnitFixture, test_timings_json_carries_pflash_details) {
     GenTimings timings;
     TEST_ASSERT(!build_timings_json(timings, 0).contains("pflash"));
     timings.pflash = {{"compress_ms", 12.5}, {"view", {{"mode", "continue"}}}};
     const auto out = build_timings_json(timings, 0);
     TEST_ASSERT(out["pflash"]["view"]["mode"] == "continue");
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_join_kept_spans_breaks_between_pieces) {
-    const std::string text = "one fact.\ngap text.Two starts.\n\nThree.";
-    const std::string path = write_pflash_bpe_tokenizer_fixture({}, text);
-    Tokenizer tok;
-    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
-    const auto ids = tok.encode(text);
-    const auto token_at = [&] (const std::string & needle) {
-        const auto span = http_detail::pflash_decoded_text_span(
-            tok, ids, 0, (int) ids.size(), needle);
-        return span;
-    };
-    const auto one = token_at("one fact.");
-    const auto two = token_at("Two starts.");
-    const auto three = token_at("\n\nThree.");
-    // Non-adjacent pieces without a break get a paragraph break...
-    TEST_ASSERT_MSG(http_detail::pflash_join_kept_spans(tok, ids, {one, two}) ==
-                    "one fact.\n\nTwo starts.",
-                    http_detail::pflash_join_kept_spans(tok, ids, {one, two}));
-    // ...a piece that already opens a paragraph is left alone...
-    TEST_ASSERT(http_detail::pflash_join_kept_spans(tok, ids, {one, three}) ==
-                "one fact.\n\nThree.");
-    // ...and adjacent pieces are joined as they were.
-    TEST_ASSERT(http_detail::pflash_join_kept_spans(tok, ids, {{0, 3}, {3, 5}}) ==
-                tok.decode({ids.begin(), ids.begin() + 5}));
-    unlink(path.c_str());
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_subtract_token_spans) {
-    const std::vector<PFlashTokenSpan> spans{{0, 10}, {20, 30}, {40, 50}};
-    const std::vector<PFlashTokenSpan> minus{{5, 22}, {25, 26}, {40, 50}};
-    const auto out = http_detail::pflash_subtract_token_spans(spans, minus);
-    TEST_ASSERT(out.size() == 3);
-    TEST_ASSERT(out[0].begin == 0 && out[0].end == 5);
-    TEST_ASSERT(out[1].begin == 22 && out[1].end == 25);
-    TEST_ASSERT(out[2].begin == 26 && out[2].end == 30);
-    TEST_ASSERT(http_detail::pflash_subtract_token_spans(spans, {}).size() == 3);
-    TEST_ASSERT(http_detail::pflash_subtract_token_spans(spans, {{0, 60}}).empty());
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_recall_excerpt_strips_chat_markers) {
-    const std::string text =
-        "tail of a fact<|im_end|>\n<|im_start|>assistant\nSure, noted."
-        "<|im_end|>\n<|im_start|>user\n";
-    const std::string excerpt = http_detail::pflash_recall_excerpt(
-        text, {"<|im_start|>"}, {"<|im_end|>"}, /*generic_role_lines=*/true);
-    TEST_ASSERT_MSG(excerpt == "tail of a fact\n\n\nSure, noted.", excerpt);
-    TEST_ASSERT(http_detail::pflash_recall_excerpt(
-        "<|im_end|>\n", {"<|im_start|>"}, {"<|im_end|>"}, true).empty());
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_chat_view_store_matches_prompt_prefix) {
-    http_detail::PflashChatViewStore store(2);
-    http_detail::PflashChatView first;
-    first.raw_tokens = {1, 2, 3, 9, 9};
-    first.raw_gen_begin = 3;
-    first.drafter_ids = {1, 2, 3, 9, 9};
-    first.drafter_gen_begin = 3;
-    store.remember(first);
-
-    http_detail::PflashChatView found;
-    // The next turn keeps the prefix before the old generation prompt.
-    TEST_ASSERT(store.find({1, 2, 3, 4, 5, 9, 9}, {1, 2, 3, 4, 5, 9, 9}, found));
-    TEST_ASSERT(found.raw_gen_begin == 3);
-    // A different conversation does not match.
-    TEST_ASSERT(!store.find({1, 7, 3, 4}, {1, 7, 3, 4}, found));
-    // A continuation replaces the view it continues.
-    http_detail::PflashChatView second = first;
-    second.raw_tokens = {1, 2, 3, 4, 5, 9, 9};
-    second.raw_gen_begin = 5;
-    second.drafter_ids = second.raw_tokens;
-    second.drafter_gen_begin = 5;
-    store.remember(second);
-    TEST_ASSERT(store.size() == 1);
-    TEST_ASSERT(store.find({1, 2, 3, 4, 5, 6, 9}, {1, 2, 3, 4, 5, 6, 9}, found));
-    TEST_ASSERT(found.raw_gen_begin == 5);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_kept_tokens_follow_selector_chunks) {
@@ -1738,39 +1648,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_effective_keep_ratio_spends_on_droppabl
             http_detail::pflash_effective_keep_ratio(997, kept, 0.013);
         TEST_ASSERT((int) std::floor(997.0 * ratio) >= kept);
     }
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_cache_admission_never_drops_a_threshold_of_cache) {
-    using http_detail::PflashAdmission;
-    using http_detail::pflash_cache_admission;
-    const int t = 16384;
-    // Warm agent step: a small uncached tail stays raw, whatever the length.
-    TEST_ASSERT(pflash_cache_admission(2000, 90000, t) == PflashAdmission::UnderThreshold);
-    TEST_ASSERT(pflash_cache_admission(0, 0, t) == PflashAdmission::UnderThreshold);
-    TEST_ASSERT(pflash_cache_admission(t - 1, 0, t) == PflashAdmission::UnderThreshold);
-    // Cold prompt (nothing or little cached) at or past the threshold compresses.
-    TEST_ASSERT(pflash_cache_admission(t, 0, t) == PflashAdmission::Compress);
-    TEST_ASSERT(pflash_cache_admission(40000, t - 1, t) == PflashAdmission::Compress);
-    // A big new chunk on a warm session stays raw: compressing the whole
-    // prompt would throw away a threshold's worth of reusable cache.
-    TEST_ASSERT(pflash_cache_admission(t, t, t) == PflashAdmission::WarmCache);
-    TEST_ASSERT(pflash_cache_admission(30000, 50000, t) == PflashAdmission::WarmCache);
-    // A raw prompt that does not fit the context always compresses.
-    TEST_ASSERT(pflash_cache_admission(2000, 90000, t, false) == PflashAdmission::Compress);
-    TEST_ASSERT(pflash_cache_admission(30000, 50000, t, false) == PflashAdmission::Compress);
-    TEST_ASSERT(std::string(http_detail::pflash_admission_name(PflashAdmission::Compress)) == "compress");
-    TEST_ASSERT(std::string(http_detail::pflash_admission_name(PflashAdmission::UnderThreshold)) == "under_threshold");
-    TEST_ASSERT(std::string(http_detail::pflash_admission_name(PflashAdmission::WarmCache)) == "warm_cache");
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_cache_admission_flag_defaults_off) {
-    luce_unsetenv("PFLASH_ADMISSION");
-    TEST_ASSERT(!http_detail::pflash_cache_admission_enabled());
-    luce_setenv("PFLASH_ADMISSION", "length");
-    TEST_ASSERT(!http_detail::pflash_cache_admission_enabled());
-    luce_setenv("PFLASH_ADMISSION", "cache");
-    TEST_ASSERT(http_detail::pflash_cache_admission_enabled());
-    luce_unsetenv("PFLASH_ADMISSION");
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_has_tool_activity) {
@@ -1810,38 +1687,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_complement_token_spans) {
     TEST_ASSERT(http_detail::pflash_complement_token_spans(V{{0, 5}}, 5).empty());
     const auto clipped = http_detail::pflash_complement_token_spans(V{{0, 3}, {4, 99}}, 10);
     TEST_ASSERT(clipped.size() == 1 && clipped[0].begin == 3 && clipped[0].end == 4);
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_arrive_and_rebuild_ratio_flags) {
-    luce_unsetenv("PFLASH_ARRIVE");
-    luce_unsetenv("PFLASH_CHAT_REBUILD_RATIO");
-    TEST_ASSERT(!http_detail::pflash_arrive_enabled());
-    TEST_ASSERT(http_detail::pflash_chat_rebuild_ratio() == 2.0);
-    luce_setenv("PFLASH_ARRIVE", "1");
-    luce_setenv("PFLASH_CHAT_REBUILD_RATIO", "0");
-    TEST_ASSERT(http_detail::pflash_arrive_enabled());
-    TEST_ASSERT(http_detail::pflash_chat_rebuild_ratio() == 0.0);
-    luce_setenv("PFLASH_CHAT_REBUILD_RATIO", "3.5");
-    TEST_ASSERT(http_detail::pflash_chat_rebuild_ratio() == 3.5);
-    luce_setenv("PFLASH_CHAT_REBUILD_RATIO", "-1");
-    TEST_ASSERT(http_detail::pflash_chat_rebuild_ratio() == 2.0);
-    luce_setenv("PFLASH_CHAT_REBUILD_RATIO", "x");
-    TEST_ASSERT(http_detail::pflash_chat_rebuild_ratio() == 2.0);
-    luce_unsetenv("PFLASH_ARRIVE");
-    luce_unsetenv("PFLASH_CHAT_REBUILD_RATIO");
-    luce_unsetenv("PFLASH_CHAT_REBUILD_MIN_TOKENS");
-    TEST_ASSERT(http_detail::pflash_chat_rebuild_min_tokens() == 0);
-    luce_setenv("PFLASH_CHAT_REBUILD_MIN_TOKENS", "65536");
-    TEST_ASSERT(http_detail::pflash_chat_rebuild_min_tokens() == 65536);
-    luce_setenv("PFLASH_CHAT_REBUILD_MIN_TOKENS", "-5");
-    TEST_ASSERT(http_detail::pflash_chat_rebuild_min_tokens() == 0);
-    luce_unsetenv("PFLASH_CHAT_REBUILD_MIN_TOKENS");
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_target_token_ceiling_floors) {
-    TEST_ASSERT(http_detail::pflash_target_token_ceiling(7, 0.5) == 3);
-    TEST_ASSERT(http_detail::pflash_target_token_ceiling(120000, 16384.0 / 120000.0) == 16384);
-    TEST_ASSERT(http_detail::pflash_target_token_ceiling(-1, 0.5) < 0);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_rejects_weak_punctuation_match) {
@@ -9645,6 +9490,8 @@ TEST_CASE(ServerUnitFixture, test_layer_split_backend_capability_proxy) {
 // Minimal mock backend for testing (no GPU needed).
 struct MockBackend : ModelBackend {
     void print_ready_banner() const override {}
+    bool pflash_gives_candidate_scores() const override { return candidate_scores; }
+    bool candidate_scores = true;
     bool park(ParkTarget) override { return true; }
     bool unpark(ParkTarget) override { return true; }
     bool is_target_parked() const override { return false; }
@@ -12992,44 +12839,6 @@ struct MockPflashCompressBackend : MockBackend {
     }
 };
 
-TEST_CASE(ServerUnitFixture, test_pflash_default_raw_text_maps_user_query) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", nullptr};
-    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", nullptr};
-    luce_test::ScopedEnvVar query{"PFLASH_SELECT_QUERY_TOKENS", nullptr};
-    luce_test::ScopedEnvVar parser{"PFLASH_SELECT_QUERY_PARSER", nullptr};
-    luce_test::ScopedEnvVar top_p{"PFLASH_SELECT_TOP_P", nullptr};
-
-    const std::string tokenizer_path =
-        write_deepseek_marker_tokenizer_fixture();
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(tokenizer_path.c_str()));
-
-    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
-    MockPflashCompressBackend & backend = *backend_owner;
-    LuceEngine engine(std::move(backend_owner));
-    ServerConfig config;
-    config.prefix_cache_cap = 0;
-    config.prefill_cache_cap = 0;
-    {
-        HttpServer server(engine, tokenizer, config);
-        server.set_drafter_tokenizer(&tokenizer);
-
-        ParsedRequest request;
-        request.format = ApiFormat::RESPONSES;
-        request.messages = "x";
-        request.prompt_tokens = tokenizer.encode("x");
-
-        const std::string error =
-            HttpServerTestAccess::apply_pflash_compression(server, request);
-        TEST_ASSERT_MSG(error.empty(), error);
-    }
-
-    TEST_ASSERT(backend.compress_calls == 1);
-    TEST_ASSERT(backend.last_request.score_query_end == 1);
-    TEST_ASSERT(backend.last_request.score_query_tokens == 1);
-    unlink(tokenizer_path.c_str());
-}
-
 TEST_CASE(ServerUnitFixture,
         test_pflash_strict_chat_query_is_the_prompt_end) {
     luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
@@ -13055,6 +12864,7 @@ TEST_CASE(ServerUnitFixture,
     config.pflash_keep_ratio = 1.0f;
     config.prefix_cache_cap = 0;
     config.prefill_cache_cap = 0;
+    config.pflash_threshold = 0;   // every message is a candidate
     {
         HttpServer server(engine, tokenizer, config);
         server.set_drafter_tokenizer(&tokenizer);
@@ -13113,75 +12923,6 @@ TEST_CASE(ServerUnitFixture,
     unlink(path.c_str());
 }
 
-TEST_CASE(ServerUnitFixture,
-        test_pflash_strict_agent_turns_after_query_are_candidates) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
-
-    const std::vector<ChatMessage> messages{
-        {"user", "What is the answer?", ""},
-        {"assistant", "Sure.", ""},
-        {"tool", "tool output here", "call-1"},
-    };
-    const std::string rendered = codec_text("qwen3.5", messages, /*add_generation_prompt=*/true,
-        /*enable_thinking=*/true);
-    const std::string path = write_pflash_bpe_tokenizer_fixture(
-        {"What", " is", " the", " answer", "?", "user", "assistant", "\n",
-         "Sure", "."},
-        rendered);
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-
-    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
-    MockPflashCompressBackend & backend = *backend_owner;
-    LuceEngine engine(std::move(backend_owner));
-    ServerConfig config;
-    config.pflash_keep_ratio = 1.0f;
-    config.prefix_cache_cap = 0;
-    config.prefill_cache_cap = 0;
-    {
-        HttpServer server(engine, tokenizer, config);
-        server.set_drafter_tokenizer(&tokenizer);
-
-        ParsedRequest request;
-        request.format = ApiFormat::OPENAI_CHAT;
-        request.messages = json::array({
-            {{"role", "user"}, {"content", "What is the answer?"}},
-            {{"role", "assistant"}, {"content", "Sure."}},
-            {{"role", "tool"}, {"content", "tool output here"},
-             {"tool_call_id", "call-1"}},
-        });
-        request.prompt_tokens = tokenizer.encode(rendered);
-
-        const std::string error =
-            HttpServerTestAccess::apply_pflash_compression(server, request);
-        TEST_ASSERT_MSG(error.empty(), error);
-    }
-
-    TEST_ASSERT(backend.compress_calls == 1);
-    const auto & request = backend.last_request;
-    const auto & ids = request.input_ids;
-    // The query is the prompt's end, so nothing follows it: the assistant
-    // and tool turns are ordinary context.
-    TEST_ASSERT(!request.query_suffix_candidates);
-    TEST_ASSERT(request.score_query_end == (int) ids.size());
-    TEST_ASSERT(request.score_query_tokens == 1);
-    // The generation prompt is pinned, and the short assistant turn stays as
-    // part of the conversation's skeleton; the tool output between the query
-    // and the generation prompt is scored, not pinned.
-    bool generation_pinned = false;
-    for (const auto & span : request.required_instruction_spans) {
-        const std::string text = tokenizer.decode(
-            {ids.begin() + span.begin, ids.begin() + span.end});
-        TEST_ASSERT_MSG(text.find("tool output") == std::string::npos, text);
-        if (span.end == (int) ids.size() &&
-            text.find("<|im_start|>assistant\n<think>\n") != std::string::npos) {
-            generation_pinned = true;
-        }
-    }
-    TEST_ASSERT(generation_pinned);
-    unlink(path.c_str());
-}
-
 // Keeps a prefix of the input that fits the requested ratio, so the target
 // ceiling check sees a real compression.
 struct MockPflashBudgetBackend : MockBackend {
@@ -13193,9 +12934,15 @@ struct MockPflashBudgetBackend : MockBackend {
         last_request = request;
         const size_t keep = (size_t) std::max(1.0, std::floor(
             (double) request.input_ids.size() * request.keep_ratio) - 2.0);
-        return CompressResult::from_compressed_ids(std::vector<int32_t>(
+        auto result = CompressResult::from_compressed_ids(std::vector<int32_t>(
             request.input_ids.begin(),
             request.input_ids.begin() + (long) std::min(keep, request.input_ids.size())));
+        // Per-candidate scores over 4-token chunks, for the view to page with.
+        const int n = (int) request.input_ids.size();
+        for (int begin = 0; begin < n; begin += 4) {
+            result.candidate_lifts.push_back({{begin, (std::min)(n, begin + 4)}, begin % 12 == 0 ? 2.0 : 1.0});
+        }
+        return result;
     }
 };
 
@@ -13253,6 +13000,7 @@ TEST_CASE(ServerUnitFixture,
     config.pflash_keep_ratio = 0.05f;
     config.prefix_cache_cap = 0;
     config.prefill_cache_cap = 0;
+    config.pflash_threshold = 0;   // every message is a candidate
     std::string error;
     {
         HttpServer server(engine, tokenizer, config);
@@ -13283,26 +13031,26 @@ TEST_CASE(ServerUnitFixture,
     unlink(path.c_str());
 }
 
-static std::string pflash_overflowing_instruction_error(
-        const std::string & role, bool & compressed,
-        std::vector<std::string> & kept_texts) {
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_refuses_system_prompt_that_overflows_context) {
+    // The system prompt is never compressed: when it alone does not fit the
+    // context the request fails instead of losing part of it.
     luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
     luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
-    const auto prompt = pflash_long_system_prompt_case(role);
+    const auto prompt = pflash_long_system_prompt_case();
     const std::string path =
         write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
-    auto backend_owner = std::make_unique<MockPflashBudgetBackend>();
-    MockPflashBudgetBackend & backend = *backend_owner;
-    LuceEngine engine(std::move(backend_owner));
+    LuceEngine engine(std::make_unique<MockPflashBudgetBackend>());
     ServerConfig config;
+    config.pflash = true;
     config.pflash_keep_ratio = 0.3f;
-    config.max_ctx = 200;   // smaller than the instructions + max_output
+    config.pflash_threshold = 0;   // every message is a candidate
+    config.max_ctx = 200;   // smaller than the system prompt + max_output
     config.prefix_cache_cap = 0;
     config.prefill_cache_cap = 0;
-    std::string error;
     {
         HttpServer server(engine, tokenizer, config);
         server.set_drafter_tokenizer(&tokenizer);
@@ -13311,48 +13059,10 @@ static std::string pflash_overflowing_instruction_error(
         request.messages = prompt.messages;
         request.prompt_tokens = tokenizer.encode(prompt.rendered);
         request.max_output = 16;
-        error = HttpServerTestAccess::apply_pflash_compression(server, request);
-    }
-    compressed = backend.compress_calls == 1;
-    kept_texts.clear();
-    if (compressed) {
-        const auto & request = backend.last_request;
-        for (const auto & span : request.required_instruction_spans) {
-            kept_texts.push_back(tokenizer.decode(
-                {request.input_ids.begin() + span.begin,
-                 request.input_ids.begin() + span.end}));
-        }
+        const auto prepared = HttpServerTestAccess::prepare_prompt(server, request);
+        TEST_ASSERT_MSG(prepared.error.find("maximum context length") != std::string::npos, prepared.error);
     }
     unlink(path.c_str());
-    return error;
-}
-
-TEST_CASE(ServerUnitFixture,
-        test_pflash_strict_refuses_system_prompt_that_overflows_context) {
-    // The system prompt is never compressed: when it alone does not fit the
-    // context the request fails before the drafter runs.
-    bool compressed = true;
-    std::vector<std::string> kept;
-    const std::string error =
-        pflash_overflowing_instruction_error("system", compressed, kept);
-    TEST_ASSERT_MSG(error.find("system prompt alone does not fit") !=
-                        std::string::npos, error);
-    TEST_ASSERT(!compressed);
-}
-
-TEST_CASE(ServerUnitFixture,
-        test_pflash_strict_scores_developer_text_that_overflows_context) {
-    // A developer message too large for the context is data: it loses its
-    // pin and competes for the budget.
-    bool compressed = false;
-    std::vector<std::string> kept;
-    const std::string error =
-        pflash_overflowing_instruction_error("developer", compressed, kept);
-    TEST_ASSERT_MSG(error.empty(), error);
-    TEST_ASSERT(compressed);
-    for (const auto & text : kept) {
-        TEST_ASSERT_MSG(text.find("You are helpful") == std::string::npos, text);
-    }
 }
 
 TEST_CASE(ServerUnitFixture,
@@ -13446,7 +13156,6 @@ static PflashFallbackRun run_pflash_fallback_case(int max_ctx, int max_output) {
     config.prefill_cache_cap = 0;
     {
         HttpServer server(engine, tokenizer, config);
-        HttpServerTestAccess::chat_view_only(server);
         server.set_drafter_tokenizer(&tokenizer);
         ParsedRequest request;
         request.format = ApiFormat::OPENAI_CHAT;
@@ -13466,53 +13175,10 @@ static PflashFallbackRun run_pflash_fallback_case(int max_ctx, int max_output) {
     return run;
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_failure_falls_back_to_raw_prompt_with_flag) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    const auto run = run_pflash_fallback_case<MockPflashFailingBackend>(8192, 16);
-    TEST_ASSERT(run.compress_calls >= 1);
-    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
-    TEST_ASSERT(run.prepared.error_status == 0);
-    TEST_ASSERT(!run.prepared.compressed);
-    TEST_ASSERT(run.prepared.tokens == run.ids);   // the raw prompt, untouched
-    TEST_ASSERT(run.prepared.snapshot_cut == -1);
-    const json & flag = run.prepared.pflash_stats["pflash_fallback"];
-    TEST_ASSERT(flag.value("reason", "") == "nonfinite_scores");
-    TEST_ASSERT(flag.value("error", "") == "PFlash compression failed");
-    TEST_ASSERT(flag.value("detail", "").find("non-finite") != std::string::npos);
-    TEST_ASSERT(flag.value("prompt_tokens", 0) == (int) run.ids.size());
-    TEST_ASSERT(run.counters.value("fallback_served", 0) == 1);
-    TEST_ASSERT(run.counters.value("fallback_refused", 0) == 0);
-    TEST_ASSERT(run.counters["fallback_reasons"].value("nonfinite_scores", 0) == 1);
-    // One view-trace record, kind raw, carrying the flag at the top level.
-    TEST_ASSERT(run.view_records.size() == 1);
-    TEST_ASSERT(run.view_records[0].value("kind", "") == "raw");
-    TEST_ASSERT(run.view_records[0]["pflash_fallback"].value("reason", "") == "nonfinite_scores");
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_failure_fallback_refused_when_raw_prompt_does_not_fit) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    // max_ctx admits the compressed prompt but not the raw one plus the reply.
-    const auto probe = run_pflash_fallback_case<MockPflashFailingBackend>(8192, 16);
-    const int raw = (int) probe.ids.size();
-    const auto run = run_pflash_fallback_case<MockPflashFailingBackend>(raw + 15, 16);
-    TEST_ASSERT(run.prepared.error == "PFlash compression failed");
-    TEST_ASSERT(run.prepared.error_status == 500);
-    TEST_ASSERT(!run.prepared.pflash_stats.is_object() ||
-                !run.prepared.pflash_stats.contains("pflash_fallback"));
-    TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
-    TEST_ASSERT(run.counters.value("fallback_refused", 0) == 1);
-    TEST_ASSERT(run.counters["refused_reasons"].value("raw_exceeds_max_ctx", 0) == 1);
-    TEST_ASSERT(run.view_records.empty());
-    // Exactly at the limit the raw prompt is admissible.
-    const auto edge = run_pflash_fallback_case<MockPflashFailingBackend>(raw + 16, 16);
-    TEST_ASSERT_MSG(edge.prepared.error.empty(), edge.prepared.error);
-    TEST_ASSERT(edge.prepared.tokens == edge.ids);
-}
-
 TEST_CASE(ServerUnitFixture, test_pflash_fail_closed_switch_keeps_the_error) {
     luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", "1"};
     const auto run = run_pflash_fallback_case<MockPflashFailingBackend>(8192, 16);
-    TEST_ASSERT(run.prepared.error == "PFlash compression failed");
+    TEST_ASSERT_MSG(run.prepared.error == "PFlash unified view: the drafter pass gave no scores", run.prepared.error);
     TEST_ASSERT(run.prepared.error_status == 500);
     TEST_ASSERT(run.view_records.empty());
     TEST_ASSERT(run.counters.value("fail_closed", false));
@@ -13597,45 +13263,56 @@ TEST_CASE(ServerUnitFixture, test_pflash_relevance_spread_formula) {
     TEST_ASSERT(!pflash_relevance_spread({1, INFINITY}, {1, 0}, {0, 0}).valid);
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_spread_decision_region_plan) {
-    using luce::common::http_detail::pflash_spread_decision;
-    using luce::common::http_detail::pflash_spread_fires;
-    // Without a region plan the decision is exactly pflash_spread_fires.
-    std::mt19937 rng(20261011);
-    std::uniform_real_distribution<double> u(0.0, 0.4);
-    const double thresholds[] = {0.0, 0.05, 0.11, 0.3};
-    for (int i = 0; i < 2000; ++i) {
-        const double t = thresholds[i % 4];
-        const double sp = (i % 97 == 0) ? NAN : u(rng);
-        const bool valid = (i % 13) != 0;
-        const auto d = pflash_spread_decision(t, valid, sp, false);
-        TEST_ASSERT(d.fires == pflash_spread_fires(t, valid, sp));
-        TEST_ASSERT(d.skipped == nullptr);
+// The first token (the attention sink) is a unit of its own: the spread does
+// not depend on how long the pinned chunk holding it is.
+TEST_CASE(ServerUnitFixture, test_pflash_selection_spread_rejects_a_non_finite_first_chunk) {
+    // A NaN chunk-0 score is not hidden by the sink split: the spread is invalid, as for a NaN chunk.
+    const std::vector<uint8_t> selected{1, 1, 0};
+    const std::vector<uint8_t> forced{0, 0, 0};
+    for (const bool per_token : {false, true}) {
+        const auto spread = pflash_selection_spread(
+            {std::nan(""), 0.2, 0.1}, selected, forced, 4, 0.5, per_token);
+        TEST_ASSERT(!spread.valid);
     }
-    TEST_ASSERT(pflash_spread_decision(0.11, true, 0.11, false).fires);
-    // A region plan takes no decision, whatever the spread.
-    for (double sp : {0.0, 0.05, 0.11, 0.5, 5.0}) {
-        for (bool valid : {true, false}) {
-            const auto d = pflash_spread_decision(0.11, valid, sp, true);
-            TEST_ASSERT(!d.fires);
-            TEST_ASSERT(d.skipped != nullptr && std::string(d.skipped) == "region_plan");
-        }
-    }
+    TEST_ASSERT(pflash_selection_spread({1.0, 0.2, 0.1}, selected, forced, 4, 0.5, false).valid);
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_spread_threshold_boundary) {
-    using luce::common::http_detail::pflash_spread_fires;
-    TEST_ASSERT(pflash_spread_fires(0.11, true, 0.11));           // >= fires
-    TEST_ASSERT(pflash_spread_fires(0.11, true, 0.5));
-    TEST_ASSERT(!pflash_spread_fires(0.11, true, std::nextafter(0.11, 0.0)));
-    TEST_ASSERT(!pflash_spread_fires(0.0, true, 5.0));             // off
-    TEST_ASSERT(!pflash_spread_fires(0.11, false, 5.0));           // invalid spread
-    TEST_ASSERT(!pflash_spread_fires(0.11, true, NAN));
-    using luce::common::http_detail::pflash_failure_reason;
-    TEST_ASSERT(pflash_failure_reason(
-        "PFlash relevance spread fallback (spread 0.200000 >= 0.110000)", "") == "spread");
-    TEST_ASSERT(pflash_failure_reason("PFlash relevance spread unavailable", "") ==
-                "spread_unavailable");
+TEST_CASE(ServerUnitFixture, test_pflash_selection_spread_scores_the_first_token_alone) {
+    using luce::common::pflash_relevance_spread;
+    using luce::common::pflash_selection_spread;
+    const auto near = [](double a, double b) { return std::fabs(a - b) < 1e-12; };
+    // Token scores: the sink 9.0, then a pinned header (0.1 each), then three
+    // candidates. Pinned alone, the sink chunk is [0, 1) and the header [1, 3).
+    const auto alone = pflash_relevance_spread({9.0, 0.1, 0.4, 0.3, 0.3},
+        {1, 1, 1, 0, 1}, {1, 1, 0, 0, 0});
+    TEST_ASSERT(alone.valid && alone.k == 2);
+    // The same tokens with the sink inside one pinned chunk of 3 or 35 tokens
+    // (a system turn), as per-token means and as sums.
+    for (const int pinned : {3, 35}) {
+        const double sum = 9.0 + 0.1 * (pinned - 1);
+        auto r = pflash_selection_spread({sum / pinned, 0.4, 0.3, 0.3},
+            {1, 1, 0, 1}, {1, 0, 0, 0}, pinned, 9.0, /*per_token=*/ true);
+        TEST_ASSERT(r.valid && r.k == 2 && r.candidates == 4);
+        TEST_ASSERT_MSG(near(r.spread, alone.spread),
+                        std::to_string(r.spread) + " vs " + std::to_string(alone.spread));
+        r = pflash_selection_spread({sum, 0.4, 0.3, 0.3},
+            {1, 1, 0, 1}, {1, 0, 0, 0}, pinned, 9.0, /*per_token=*/ false);
+        const auto summed = pflash_relevance_spread({9.0, 0.1 * (pinned - 1), 0.4, 0.3, 0.3},
+            {1, 1, 1, 0, 1}, {1, 1, 0, 0, 0});
+        TEST_ASSERT(r.valid && r.k == 2 && near(r.spread, summed.spread));
+    }
+    // Averaged into its chunk instead, the sink's weight falls with the
+    // chunk's length and the spread rises: what the unit prevents.
+    TEST_ASSERT(pflash_relevance_spread({(9.0 + 3.4) / 35, 0.4, 0.3, 0.3},
+        {1, 1, 0, 1}, {1, 0, 0, 0}).spread > 2 * alone.spread);
+    // A selected candidate chunk 0 keeps counting in k; the sink does not.
+    auto r = pflash_selection_spread({(9.0 + 0.2) / 3, 0.4, 0.3, 0.3},
+        {1, 1, 0, 1}, {0, 0, 0, 0}, 3, 9.0, true);
+    TEST_ASSERT(r.valid && r.k == 3);
+    // A one-token chunk 0, or no chunk, is the plain formula.
+    r = pflash_selection_spread({9.0, 0.4, 0.3}, {1, 1, 0}, {1, 0, 0}, 1, 9.0, true);
+    TEST_ASSERT(near(r.spread, pflash_relevance_spread({9.0, 0.4, 0.3}, {1, 1, 0}, {1, 0, 0}).spread));
+    TEST_ASSERT(!pflash_selection_spread({1.0, NAN}, {1, 0}, {0, 0}, 4, 0.5, true).valid);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_fallback_spread_env_parse) {
@@ -13714,288 +13391,18 @@ TEST_CASE(ServerUnitFixture, test_pflash_spread_in_selection_trace) {
     std::vector<uint8_t> selected(scores.size(), 0), forced(scores.size(), 0);
     for (int i : rows[1]["selected_chunks"].get<std::vector<int>>()) selected[(size_t) i] = 1;
     for (int i : rows[1]["forced_chunks"].get<std::vector<int>>()) forced[(size_t) i] = 1;
-    const auto again = luce::common::pflash_relevance_spread(scores, selected, forced);
+    const auto again = luce::common::pflash_selection_spread(scores, selected, forced,
+        rows[1].value("chunk_size", 0), rows[1].value("spread_first_token_score", -1.0),
+        rows[1].value("spread_per_token", false));
     TEST_ASSERT(again.valid && again.spread == on.spread);
+    TEST_ASSERT(rows[1].value("spread_first_token_score", -1.0) == (double) mass[0]);
     // Everything else in the record is identical with the flag on and off.
     json a = rows[0], b = rows[1];
-    b.erase("spread");
-    b.erase("spread_threshold");
+    for (const char * key : {"spread", "spread_threshold", "spread_first_token_score",
+                             "spread_per_token"}) {
+        b.erase(key);
+    }
     TEST_ASSERT(a == b);
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_chat_view_store_forget) {
-    http_detail::PflashChatViewStore store(4);
-    http_detail::PflashChatView first;
-    first.raw_tokens = {1, 2, 3, 9, 9};
-    first.raw_gen_begin = 3;
-    first.drafter_ids = first.raw_tokens;
-    first.drafter_gen_begin = 3;
-    store.remember(first);
-    http_detail::PflashChatView other = first;
-    other.raw_tokens = {7, 7, 7, 9};
-    other.drafter_ids = other.raw_tokens;
-    store.remember(other);
-    TEST_ASSERT(store.size() == 2);
-    // A prompt continuing the first conversation drops its view only.
-    TEST_ASSERT(store.forget({1, 2, 3, 4, 5, 9}) == 1);
-    TEST_ASSERT(store.size() == 1);
-    http_detail::PflashChatView found;
-    TEST_ASSERT(!store.find({1, 2, 3, 4, 5, 9}, {1, 2, 3, 4, 5, 9}, found));
-    TEST_ASSERT(store.find({7, 7, 7, 1, 9}, {7, 7, 7, 1, 9}, found));
-    TEST_ASSERT(store.forget({5, 5}) == 0);
-}
-
-// Budget compression that reports a configurable relevance spread.
-struct MockPflashSpreadBackend : MockPflashBudgetBackend {
-    static inline bool spread_valid = true;
-    static inline double spread = 0.0;
-    CompressResult compress(const CompressRequest & request) override {
-        auto result = MockPflashBudgetBackend::compress(request);
-        result.spread_valid = spread_valid;
-        result.spread = spread;
-        result.spread_k = 3;
-        return result;
-    }
-};
-
-static PflashFallbackRun run_spread_case(const char * flag, double spread, bool valid,
-                                         int max_ctx = 8192) {
-    luce_test::ScopedEnvVar env{"PFLASH_FALLBACK_SPREAD", flag};
-    MockPflashSpreadBackend::spread = spread;
-    MockPflashSpreadBackend::spread_valid = valid;
-    return run_pflash_fallback_case<MockPflashSpreadBackend>(max_ctx, 16);
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_spread_flag_off_takes_no_decision) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    // A spread far above any threshold: with the flag off nothing changes.
-    const auto run = run_spread_case(nullptr, 5.0, true);
-    const auto base = run_pflash_fallback_case<MockPflashBudgetBackend>(8192, 16);
-    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
-    TEST_ASSERT(run.prepared.compressed);
-    TEST_ASSERT(run.prepared.tokens == base.prepared.tokens);
-    // compress_ms is a wall-clock field
-    json stats_run = run.prepared.pflash_stats;
-    json stats_base = base.prepared.pflash_stats;
-    stats_run.erase("compress_ms");
-    stats_base.erase("compress_ms");
-    TEST_ASSERT(stats_run == stats_base);
-    TEST_ASSERT(!run.prepared.pflash_stats.contains("spread"));
-    TEST_ASSERT(!run.prepared.pflash_stats.contains("pflash_fallback"));
-    TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
-    TEST_ASSERT(run.view_records.size() == 1);
-    TEST_ASSERT(run.view_records[0].value("kind", "") == "compressed");
-    // "0" is off too.
-    const auto zero = run_spread_case("0", 5.0, true);
-    TEST_ASSERT(zero.prepared.compressed && !zero.prepared.pflash_stats.contains("spread"));
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_spread_fires_full_prefill_with_flag) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    const auto run = run_spread_case("0.11", 0.11, true);   // boundary: fires
-    TEST_ASSERT(run.compress_calls >= 1);
-    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
-    TEST_ASSERT(!run.prepared.compressed);
-    TEST_ASSERT(run.prepared.tokens == run.ids);
-    TEST_ASSERT(run.prepared.snapshot_cut == -1);
-    const json & flag = run.prepared.pflash_stats["pflash_fallback"];
-    TEST_ASSERT(flag.value("reason", "") == "spread");
-    TEST_ASSERT(flag.value("spread", -1.0) == 0.11);
-    TEST_ASSERT(flag.value("spread_threshold", -1.0) == 0.11);
-    TEST_ASSERT(flag.value("fired", false));
-    TEST_ASSERT(flag.value("prompt_tokens", 0) == (int) run.ids.size());
-    TEST_ASSERT(run.counters.value("fallback_served", 0) == 1);
-    TEST_ASSERT(run.counters["fallback_reasons"].value("spread", 0) == 1);
-    TEST_ASSERT(run.view_records.size() == 1);
-    TEST_ASSERT(run.view_records[0].value("kind", "") == "raw");
-    TEST_ASSERT(run.view_records[0]["pflash_fallback"].value("reason", "") == "spread");
-    // Below the threshold: compressed, spread recorded, not fired.
-    const auto low = run_spread_case("0.11", std::nextafter(0.11, 0.0), true);
-    TEST_ASSERT_MSG(low.prepared.error.empty(), low.prepared.error);
-    TEST_ASSERT(low.prepared.compressed);
-    TEST_ASSERT(!low.prepared.pflash_stats.contains("pflash_fallback"));
-    TEST_ASSERT(!low.prepared.pflash_stats["spread"].value("fired", true));
-    TEST_ASSERT(low.counters.value("fallback_served", 0) == 0);
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_spread_fallback_is_not_refused_by_fail_closed) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", "1"};
-    const auto run = run_spread_case("0.11", 0.5, true);
-    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
-    TEST_ASSERT(run.prepared.tokens == run.ids);
-    TEST_ASSERT(run.prepared.pflash_stats["pflash_fallback"].value("reason", "") == "spread");
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_spread_raw_prompt_too_long_serves_compressed) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    const auto probe = run_pflash_fallback_case<MockPflashBudgetBackend>(8192, 16);
-    const auto run = run_spread_case("0.11", 0.5, true, (int) probe.ids.size() + 15);
-    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
-    TEST_ASSERT(run.prepared.compressed);
-    TEST_ASSERT(run.prepared.pflash_stats["spread"].value("refused", "") == "raw_exceeds_max_ctx");
-    TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_spread_unavailable_is_a_failure) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    const auto run = run_spread_case("0.11", 0.0, false);
-    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
-    TEST_ASSERT(run.prepared.tokens == run.ids);
-    TEST_ASSERT(run.prepared.pflash_stats["pflash_fallback"].value("reason", "") ==
-                "spread_unavailable");
-    // An invalid setting is a configuration error: never served.
-    const auto bad = run_spread_case("abc", 0.5, true);
-    TEST_ASSERT(bad.prepared.error_status == 500);
-    TEST_ASSERT(bad.prepared.error.find("PFLASH_FALLBACK_SPREAD") != std::string::npos);
-}
-
-// Keeps the required spans, the query window through the end, and whatever
-// ``pick`` adds; reports the kept spans like the in-process drafter does.
-struct MockPflashSpanBackend : MockBackend {
-    int compress_calls = 0;
-    CompressRequest last_request;
-    std::function<std::vector<PFlashTokenSpan>(const CompressRequest &)> pick;
-
-    CompressResult compress(const CompressRequest & request) override {
-        ++compress_calls;
-        last_request = request;
-        auto spans = request.required_instruction_spans;
-        spans.push_back({request.score_query_end - request.score_query_tokens,
-                         (int) request.input_ids.size()});
-        if (pick) {
-            const auto extra = pick(request);
-            spans.insert(spans.end(), extra.begin(), extra.end());
-        }
-        spans = http_detail::canonicalize_pflash_token_spans(std::move(spans));
-        CompressResult result;
-        for (const auto & span : spans) {
-            result.compressed_ids.insert(result.compressed_ids.end(),
-                request.input_ids.begin() + span.begin,
-                request.input_ids.begin() + span.end);
-        }
-        result.kept_spans = spans;
-        result.ok = !result.compressed_ids.empty();
-        return result;
-    }
-};
-
-TEST_CASE(ServerUnitFixture,
-        test_pflash_chat_view_appends_turns_and_recalls_missing_segments) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar view_env{"PFLASH_CHAT_VIEW", nullptr};
-    // Only turns of a few tokens stay whole, so the document turn is
-    // material the selection picks from.
-    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", "4"};
-
-    std::string system;
-    for (int i = 0; i < 20; ++i) system += "You are helpful. ";
-    const std::string document =
-        "alpha facts live here. filler filler filler. beta facts live here.";
-    const std::vector<ChatMessage> turn1{
-        {"system", system, ""},
-        {"user", document + " Question one?", ""},
-    };
-    auto turn2 = turn1;
-    turn2.push_back({"assistant", "Answer one.", ""});
-    turn2.push_back({"user", "Question two?", ""});
-    const auto render = [] (const std::vector<ChatMessage> & messages) {
-        return codec_text("qwen3.5", messages,
-                                    /*add_generation_prompt=*/true,
-                                    /*enable_thinking=*/true);
-    };
-    const auto to_json = [] (const std::vector<ChatMessage> & messages) {
-        json out = json::array();
-        for (const auto & message : messages) {
-            out.push_back({{"role", message.role}, {"content", message.content}});
-        }
-        return out;
-    };
-    const std::string path = write_pflash_bpe_tokenizer_fixture(
-        {"alpha", " facts", "beta", " live", " here", ".", " filler",
-         "Question", " one", " two", "?", "Answer", "user", "assistant",
-         "system", "\n", "You", " are", " helpful"},
-        render(turn2) +
-            "[Earlier in this conversation]\n[End of earlier excerpts]\n");
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-
-    auto backend_owner = std::make_unique<MockPflashSpanBackend>();
-    MockPflashSpanBackend & backend = *backend_owner;
-    const char * wanted = "alpha facts";
-    backend.pick = [&] (const ModelBackend::CompressRequest & request) {
-        const auto span = http_detail::pflash_decoded_text_span(
-            tokenizer, request.input_ids, 0, (int) request.input_ids.size(),
-            wanted);
-        return span.begin < 0 ? std::vector<PFlashTokenSpan>{}
-                              : std::vector<PFlashTokenSpan>{span};
-    };
-    LuceEngine engine(std::move(backend_owner));
-    ServerConfig config;
-    config.pflash = true;
-    config.pflash_threshold = 0;   // every prompt
-    config.pflash_keep_ratio = 1.0f;
-    config.max_ctx = 8192;
-    config.prefix_cache_cap = 0;
-    config.prefill_cache_cap = 0;
-    std::vector<int32_t> served1;
-    std::vector<int32_t> served2;
-    std::vector<int32_t> served3;
-    std::vector<std::string> modes;
-    {
-        HttpServer server(engine, tokenizer, config);
-        HttpServerTestAccess::chat_view_only(server);
-        server.set_drafter_tokenizer(&tokenizer);
-        const auto run = [&] (const std::vector<ChatMessage> & messages,
-                              std::vector<int32_t> & served) {
-            ParsedRequest request;
-            request.format = ApiFormat::OPENAI_CHAT;
-            request.messages = to_json(messages);
-            request.prompt_tokens = tokenizer.encode(render(messages));
-            const auto prepared =
-                HttpServerTestAccess::prepare_prompt(server, request);
-            TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
-            TEST_ASSERT(prepared.compressed);
-            served = prepared.tokens;
-            // usage.timings.pflash reports the view outcome.
-            TEST_ASSERT(prepared.pflash_stats.contains("view"));
-            modes.push_back(prepared.pflash_stats["view"].value("mode", ""));
-            TEST_ASSERT(prepared.pflash_stats["view"].value("served_tokens", 0) ==
-                        (int) served.size());
-            // The snapshot lands where the next turn's prompt branches off.
-            const auto generation =
-                tokenizer.encode("<|im_start|>assistant\n<think>\n");
-            TEST_ASSERT(prepared.snapshot_cut ==
-                        (int) (served.size() - generation.size()));
-        };
-        run(turn1, served1);
-        wanted = "beta facts";   // the new query wants what turn 1 dropped
-        run(turn2, served2);
-        run(turn2, served3);     // a retry serves the same view
-    }
-    const std::string text1 = tokenizer.decode(served1);
-    const std::string text2 = tokenizer.decode(served2);
-    TEST_ASSERT(text1.find("alpha facts") != std::string::npos);
-    TEST_ASSERT(text1.find("beta facts") == std::string::npos);
-
-    // Turn 2 extends turn 1's served prompt: everything before its
-    // generation prompt is reused token for token.
-    const auto generation = tokenizer.encode("<|im_start|>assistant\n<think>\n");
-    TEST_ASSERT(served1.size() > generation.size());
-    const size_t reused = served1.size() - generation.size();
-    TEST_ASSERT(served2.size() > reused);
-    TEST_ASSERT(std::equal(served1.begin(), served1.begin() + (long) reused,
-                           served2.begin()));
-    // The recalled segment opens the new user turn, after the answer.
-    const size_t answer = text2.find("Answer one.");
-    const size_t recall = text2.find("[Earlier in this conversation]");
-    const size_t question = text2.find("Question two?");
-    TEST_ASSERT(answer != std::string::npos);
-    TEST_ASSERT(recall != std::string::npos && recall > answer);
-    TEST_ASSERT(text2.find("beta facts", recall) != std::string::npos);
-    TEST_ASSERT(question != std::string::npos && question > recall);
-    TEST_ASSERT(served3 == served2);
-    TEST_ASSERT(modes == std::vector<std::string>({"fresh", "continue", "repeat"}));
-    unlink(path.c_str());
 }
 
 TEST_CASE(ServerUnitFixture,
@@ -14027,9 +13434,9 @@ TEST_CASE(ServerUnitFixture,
     config.pflash_keep_ratio = 1.0f;
     config.prefix_cache_cap = 0;
     config.prefill_cache_cap = 0;
+    config.pflash_threshold = 0;   // every message is a candidate
     {
         HttpServer server(engine, tokenizer, config);
-        HttpServerTestAccess::chat_view_only(server);
         server.set_drafter_tokenizer(&tokenizer);
         ParsedRequest request;
         request.format = ApiFormat::OPENAI_CHAT;
@@ -14076,336 +13483,6 @@ TEST_CASE(ServerUnitFixture,
     unlink(path.c_str());
 }
 
-// A tool session's prompt ends after tool output: the latest question's
-// history window (its reply's header) is kept for the next request, which
-// scores exactly that window once a new question arrives.
-TEST_CASE(ServerUnitFixture, test_pflash_tool_session_keeps_next_history_query) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", nullptr};
-
-    std::string material;
-    for (int i = 0; i < 80; ++i) material += "filler words here. ";
-    std::vector<ChatMessage> messages{
-        {"system", "You are helpful.", ""},
-        {"user", "What is the first answer?", ""},
-        {"assistant", "Sure.", ""},
-        {"tool", "Here is text: " + material, ""},
-    };
-    const auto run = [&] (const std::vector<ChatMessage> & chat,
-                          ModelBackend::CompressRequest & out,
-                          std::vector<int32_t> & ids_out) {
-        const std::string rendered = codec_text("qwen3.5", chat, /*add_generation_prompt=*/true,
-            /*enable_thinking=*/true);
-        const std::string path = write_pflash_bpe_tokenizer_fixture(
-            {"What", " is", " the", " answer", " first", "?", "user", "assistant",
-             "system", "tool", "\n", "Sure", ".", " filler", " words", " here",
-             "Here", " text", ":", " Next", " question"},
-            rendered);
-        Tokenizer tokenizer;
-        TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-        auto backend_owner = std::make_unique<MockPflashCompressBackend>();
-        MockPflashCompressBackend & backend = *backend_owner;
-        LuceEngine engine(std::move(backend_owner));
-        ServerConfig config;
-        config.pflash_keep_ratio = 1.0f;
-        config.prefix_cache_cap = 0;
-        config.prefill_cache_cap = 0;
-        {
-            HttpServer server(engine, tokenizer, config);
-            HttpServerTestAccess::chat_view_only(server);
-            server.set_drafter_tokenizer(&tokenizer);
-            ParsedRequest request;
-            request.format = ApiFormat::OPENAI_CHAT;
-            json wire = json::array();
-            for (const auto & message : chat) {
-                wire.push_back({{"role", message.role}, {"content", message.content}});
-            }
-            request.messages = wire;
-            request.prompt_tokens = tokenizer.encode(rendered);
-            const std::string error =
-                HttpServerTestAccess::apply_pflash_compression(server, request);
-            TEST_ASSERT_MSG(error.empty(), error);
-        }
-        TEST_ASSERT(backend.compress_calls == 1);
-        out = backend.last_request;
-        ids_out = out.input_ids;
-        unlink(path.c_str());
-    };
-    ModelBackend::CompressRequest first;
-    std::vector<int32_t> first_ids;
-    run(messages, first, first_ids);
-    TEST_ASSERT(first.history_query_spans.empty());
-    TEST_ASSERT(first.keep_query_spans.size() == 1);
-
-    messages.push_back({"assistant", "Sure.", ""});
-    messages.push_back({"user", "Next question?", ""});
-    ModelBackend::CompressRequest second;
-    std::vector<int32_t> second_ids;
-    run(messages, second, second_ids);
-    TEST_ASSERT(second.history_query_spans.size() == 1);
-    const auto kept = first.keep_query_spans[0];
-    const auto history = second.history_query_spans[0];
-    TEST_ASSERT(kept.begin == history.begin && kept.end == history.end);
-    TEST_ASSERT(std::equal(first_ids.begin(), first_ids.begin() + kept.end, second_ids.begin()));
-}
-
-// Two turns over one document through prepare_prompt; returns the served
-// prompts, the view modes and how often the compressor ran.
-struct PflashTwoTurnRun {
-    std::vector<std::vector<int32_t>> served;
-    std::vector<std::string> modes;
-    int compress_calls = 0;
-    std::string text2;
-};
-
-static PflashTwoTurnRun pflash_two_turn_run(const std::string & follow_up) {
-    std::string system;
-    for (int i = 0; i < 20; ++i) system += "You are helpful. ";
-    const std::string document =
-        "alpha facts live here. filler filler filler. beta facts live here.";
-    const std::vector<ChatMessage> turn1{
-        {"system", system, ""},
-        {"user", document + " Question one?", ""},
-    };
-    auto turn2 = turn1;
-    turn2.push_back({"assistant", "Answer one.", ""});
-    turn2.push_back({"user", follow_up + " Question two?", ""});
-    const auto render = [] (const std::vector<ChatMessage> & messages) {
-        return codec_text("qwen3.5", messages,
-                                    /*add_generation_prompt=*/true,
-                                    /*enable_thinking=*/true);
-    };
-    const std::string path = write_pflash_bpe_tokenizer_fixture(
-        {"alpha", " facts", "beta", " live", " here", ".", " filler",
-         "Question", " one", " two", "?", "Answer", "user", "assistant",
-         "system", "\n", "You", " are", " helpful", " pasted", " notes"},
-        render(turn2) +
-            "[Earlier in this conversation]\n[End of earlier excerpts]\n");
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    auto backend_owner = std::make_unique<MockPflashSpanBackend>();
-    MockPflashSpanBackend & backend = *backend_owner;
-    // The fact and the questions: a prompt-end query ranks the user's own
-    // sentences first, so the scorer keeps them.
-    backend.pick = [&] (const ModelBackend::CompressRequest & request) {
-        std::vector<PFlashTokenSpan> spans;
-        for (const char * text : {"alpha facts", "Question one?", "Question two?"}) {
-            const auto span = http_detail::pflash_decoded_text_span(
-                tokenizer, request.input_ids, 0, (int) request.input_ids.size(),
-                text);
-            if (span.begin >= 0) spans.push_back(span);
-        }
-        return spans;
-    };
-    LuceEngine engine(std::move(backend_owner));
-    ServerConfig config;
-    config.pflash = true;
-    config.pflash_threshold = 0;   // every prompt
-    config.pflash_keep_ratio = 1.0f;
-    config.max_ctx = 8192;
-    config.prefix_cache_cap = 0;
-    config.prefill_cache_cap = 0;
-    PflashTwoTurnRun run;
-    {
-        HttpServer server(engine, tokenizer, config);
-        HttpServerTestAccess::chat_view_only(server);
-        server.set_drafter_tokenizer(&tokenizer);
-        const std::vector<const std::vector<ChatMessage> *> turns{&turn1, &turn2};
-        for (const auto * messages : turns) {
-            ParsedRequest request;
-            request.format = ApiFormat::OPENAI_CHAT;
-            json wire = json::array();
-            for (const auto & message : *messages) {
-                wire.push_back({{"role", message.role}, {"content", message.content}});
-            }
-            request.messages = wire;
-            request.prompt_tokens = tokenizer.encode(render(*messages));
-            const auto prepared = HttpServerTestAccess::prepare_prompt(server, request);
-            TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
-            run.served.push_back(prepared.tokens);
-            run.modes.push_back(prepared.pflash_stats["view"].value("mode", ""));
-        }
-    }
-    run.compress_calls = backend.compress_calls;
-    run.text2 = tokenizer.decode(run.served[1]);
-    unlink(path.c_str());
-    return run;
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_raw_fallback_forgets_previous_chat_view) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar recall{"PFLASH_CHAT_RECALL", "1"};
-    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", "4"};
-    struct FailingViewBackend : MockPflashSpanBackend {
-        bool fail = false;
-        CompressResult compress(const CompressRequest & request) override {
-            if (!fail) return MockPflashSpanBackend::compress(request);
-            ++compress_calls;
-            luce::common::set_last_error("non-finite Qwen3.5 scoring-head scores");
-            return {};
-        }
-    };
-    const auto render = [](const std::vector<ChatMessage> & messages) {
-        return codec_text("qwen3.5", messages, true, true);
-    };
-    std::vector<ChatMessage> messages{
-        {"system", "You are helpful.", ""},
-        {"user", "alpha facts live here. filler filler filler. beta facts live here. Question one?", ""},
-    };
-    const std::string path = write_pflash_bpe_tokenizer_fixture(
-        {"alpha", " facts", "beta", " live", " here", ".", " filler",
-         "Question", " one", " two", "?", "Answer", "user", "assistant",
-         "system", "\n", "You", " are", " helpful"},
-        render(messages) + "</think>Answer one. Question two?");
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    for (bool fail_closed : {false, true}) {
-        luce_test::ScopedEnvVar fail_policy{"PFLASH_FAIL_CLOSED", fail_closed ? "1" : "0"};
-        auto backend_owner = std::make_unique<FailingViewBackend>();
-        auto & backend = *backend_owner;
-        LuceEngine engine(std::move(backend_owner));
-        ServerConfig config;
-        config.pflash = true;
-        config.pflash_threshold = 0;   // every prompt
-        config.pflash_keep_ratio = 1.0f;
-        config.max_ctx = 8192;
-        config.prefix_cache_cap = 0;
-        config.prefill_cache_cap = 0;
-        HttpServer server(engine, tokenizer, config);
-        HttpServerTestAccess::chat_view_only(server);
-        server.set_drafter_tokenizer(&tokenizer);
-        const auto request_for = [&](const std::vector<ChatMessage> & turns) {
-            ParsedRequest request;
-            request.format = ApiFormat::OPENAI_CHAT;
-            request.messages = json::array();
-            for (const auto & m : turns) request.messages.push_back({{"role", m.role}, {"content", m.content}});
-            request.prompt_tokens = tokenizer.encode(render(turns));
-            request.thinking_enabled = true;
-            return request;
-        };
-        const auto first = HttpServerTestAccess::prepare_prompt(server, request_for(messages));
-        TEST_ASSERT_MSG(first.error.empty(), first.error);
-        TEST_ASSERT(first.compressed);
-        TEST_ASSERT(HttpServerTestAccess::pflash_view_count(server) == 1);
-        auto follow_up = messages;
-        follow_up.push_back({"assistant", "Answer one.", ""});
-        follow_up.push_back({"user", "Question two?", ""});
-        const auto request = request_for(follow_up);
-        backend.fail = true;
-        const auto failed = HttpServerTestAccess::prepare_prompt(server, request);
-        if (fail_closed) {
-            TEST_ASSERT(!failed.error.empty());
-            TEST_ASSERT(HttpServerTestAccess::pflash_view_count(server) == 1);
-        } else {
-            TEST_ASSERT_MSG(failed.error.empty(), failed.error);
-            TEST_ASSERT(!failed.compressed && failed.tokens == request.prompt_tokens);
-            TEST_ASSERT(HttpServerTestAccess::pflash_view_count(server) == 0);
-            TEST_ASSERT(failed.pflash_stats["pflash_fallback"].value("views_forgotten", 0) == 1);
-            backend.fail = false;
-            const auto retry = HttpServerTestAccess::prepare_prompt(server, request);
-            TEST_ASSERT_MSG(retry.error.empty(), retry.error);
-            TEST_ASSERT(retry.pflash_stats["view"].value("mode", "") == "fresh");
-        }
-    }
-    unlink(path.c_str());
-}
-
-TEST_CASE(ServerUnitFixture,
-        test_pflash_chat_view_small_follow_up_without_recall_skips_the_drafter) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar recall{"PFLASH_CHAT_RECALL", "0"};
-    const auto run = pflash_two_turn_run("");
-    // Turn 2 is appended exactly as full prefill appends it: no scoring.
-    TEST_ASSERT(run.compress_calls == 1);
-    TEST_ASSERT(run.modes == std::vector<std::string>({"fresh", "continue"}));
-    TEST_ASSERT(run.text2.find("[Earlier in this conversation]") == std::string::npos);
-    TEST_ASSERT(run.text2.find("Answer one.") != std::string::npos);
-    TEST_ASSERT(run.text2.find("Question two?") != std::string::npos);
-}
-
-TEST_CASE(ServerUnitFixture,
-        test_pflash_chat_view_compresses_large_follow_ups_only) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar threshold{"PFLASH_CHAT_COMPRESS_NEW_TOKENS", "40"};
-    // The pasted turn is material, not a short turn kept whole.
-    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", "8"};
-    std::string pasted;
-    for (int i = 0; i < 12; ++i) pasted += " pasted notes filler.";
-    const auto run = pflash_two_turn_run(pasted);
-    TEST_ASSERT(run.compress_calls == 2);
-    TEST_ASSERT(run.modes == std::vector<std::string>({"fresh", "continue-compressed"}));
-    // The view before the new material is reused token for token...
-    const auto & first = run.served[0];
-    const auto & second = run.served[1];
-    TEST_ASSERT(second.size() > 0 && first.size() > 16);
-    const size_t prefix = first.size() - 8;
-    TEST_ASSERT(std::equal(first.begin(), first.begin() + (long) (prefix - 8),
-                           second.begin()));
-    // ...and the pasted material is compressed: only what the selection
-    // keeps (the question) survives, not the whole paste.
-    TEST_ASSERT_MSG(run.text2.find("Question two?") != std::string::npos, run.text2);
-    TEST_ASSERT(run.text2.find(pasted) == std::string::npos);
-}
-
-TEST_CASE(ServerUnitFixture,
-        test_pflash_legacy_chat_query_uses_last_user_turn) {
-    // No strict-selection environment: the legacy selector derives the same
-    // query, and a trailing tool result does not replace the user's turn.
-    const std::vector<ChatMessage> messages{
-        {"user", "What is the answer?", ""},
-        {"assistant", "Sure.", ""},
-        {"tool", "tool output here", "call-1"},
-    };
-    const std::string rendered = codec_text("qwen3.5", messages, /*add_generation_prompt=*/true,
-        /*enable_thinking=*/false);
-    const std::string path = write_pflash_bpe_tokenizer_fixture(
-        {"What", " is", " the", " answer", "?", "user", "assistant", "\n",
-         "Sure", "."},
-        rendered);
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-
-    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
-    MockPflashCompressBackend & backend = *backend_owner;
-    LuceEngine engine(std::move(backend_owner));
-    ServerConfig config;
-    config.prefix_cache_cap = 0;
-    config.prefill_cache_cap = 0;
-    {
-        HttpServer server(engine, tokenizer, config);
-        HttpServerTestAccess::chat_view_only(server);
-        server.set_drafter_tokenizer(&tokenizer);
-
-        ParsedRequest request;
-        request.format = ApiFormat::OPENAI_CHAT;
-        request.messages = json::array({
-            {{"role", "user"}, {"content", "What is the answer?"}},
-            {{"role", "assistant"}, {"content", "Sure."}},
-            {{"role", "tool"}, {"content", "tool output here"},
-             {"tool_call_id", "call-1"}},
-        });
-        request.prompt_tokens = tokenizer.encode(rendered);
-
-        const std::string error =
-            HttpServerTestAccess::apply_pflash_compression(server, request);
-        TEST_ASSERT_MSG(error.empty(), error);
-    }
-
-    TEST_ASSERT(backend.compress_calls == 1);
-    const auto & ids = backend.last_request.input_ids;
-    const int query_end = backend.last_request.score_query_end;
-    const int query_begin = query_end - backend.last_request.score_query_tokens;
-    TEST_ASSERT(query_begin >= 0);
-    TEST_ASSERT(backend.last_request.score_query_tokens <= 8);
-    const std::string query = tokenizer.decode(
-        {ids.begin() + query_begin, ids.begin() + query_end});
-    TEST_ASSERT_MSG(std::string("What is the answer?").size() >= query.size() &&
-                    std::string("What is the answer?").compare(
-                        19 - query.size(), query.size(), query) == 0,
-                    query);
-    unlink(path.c_str());
-}
-
 TEST_CASE(ServerUnitFixture,
         test_pflash_strict_selection_owns_chat_continuations) {
     luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
@@ -14435,7 +13512,6 @@ TEST_CASE(ServerUnitFixture,
     config.prefill_cache_cap = 0;
     {
         HttpServer server(engine, tokenizer, config);
-        HttpServerTestAccess::chat_view_only(server);
         server.set_drafter_tokenizer(&tokenizer);
 
         ParsedRequest request;
@@ -14451,63 +13527,14 @@ TEST_CASE(ServerUnitFixture,
         const auto prepared =
             HttpServerTestAccess::prepare_prompt(server, request);
         TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
-        TEST_ASSERT(prepared.compressed);
-        TEST_ASSERT(!prepared.flowkv);
     }
 
-    // Whole-prompt PFlash ran on the multi-turn prompt and scored against
-    // the prompt's last token.
+    // PFlash's view ran on the multi-turn prompt and scored
+    // against the prompt's last token.
     TEST_ASSERT(backend.compress_calls == 1);
     const auto & ids = backend.last_request.input_ids;
     TEST_ASSERT(backend.last_request.score_query_end == (int) ids.size());
     TEST_ASSERT(backend.last_request.score_query_tokens == 1);
-    unlink(path.c_str());
-}
-
-TEST_CASE(ServerUnitFixture,
-        test_pflash_default_continuation_stays_on_flowkv) {
-    const std::string rendered =
-        "<|im_start|>user\nfirst<|im_end|>\n"
-        "<|im_start|>assistant\nSure.<|im_end|>\n"
-        "<|im_start|>user\nsecond<|im_end|>\n"
-        "<|im_start|>assistant\n";
-    const std::string path = write_pflash_bpe_tokenizer_fixture(
-        {"first", "second", "user", "assistant", "\n", "Sure", "."},
-        rendered);
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-
-    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
-    MockPflashCompressBackend & backend = *backend_owner;
-    LuceEngine engine(std::move(backend_owner));
-    ServerConfig config;
-    config.pflash = true;
-    config.pflash_threshold = 0;   // every prompt
-    config.max_ctx = 8192;
-    config.prefix_cache_cap = 0;
-    config.prefill_cache_cap = 0;
-    {
-        HttpServer server(engine, tokenizer, config);
-        HttpServerTestAccess::chat_view_only(server);
-        server.set_drafter_tokenizer(&tokenizer);
-
-        ParsedRequest request;
-        request.format = ApiFormat::OPENAI_CHAT;
-        request.messages = json::array({
-            {{"role", "user"}, {"content", "first"}},
-            {{"role", "assistant"}, {"content", "Sure."}},
-            {{"role", "user"}, {"content", "second"}},
-        });
-        request.prompt_tokens = tokenizer.encode(rendered);
-
-        const auto prepared =
-            HttpServerTestAccess::prepare_prompt(server, request);
-        TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
-    }
-
-    // Without a strict-selection environment FlowKV keeps owning
-    // continuations; whole-prompt PFlash never ran.
-    TEST_ASSERT(backend.compress_calls == 0);
     unlink(path.c_str());
 }
 
@@ -14536,6 +13563,127 @@ TEST_CASE(ServerUnitFixture, test_compress_batch_default_preserves_order) {
     TEST_ASSERT(results[0].compressed_ids == std::vector<int32_t>({11}));
     TEST_ASSERT(results[1].compressed_ids == std::vector<int32_t>({21}));
     TEST_ASSERT(results[2].compressed_ids == std::vector<int32_t>({31}));
+}
+
+// The shared PFlash window (pflash_window.h): what every backend's
+// compress_batch runs, checked through its hooks without a GPU or a drafter.
+struct PFlashWindowProbe {
+    int drains = 0, parks = 0, unparks = 0, releases = 0;
+    bool park_ok = true;
+    PFlashWindow window() {
+        PFlashWindow w;
+        w.tag = "test-pflash";
+        w.drain = [this] { ++drains; };
+        w.park = [this] { ++parks; return park_ok; };
+        w.unpark = [this] { ++unparks; return true; };
+        w.release = [this] { ++releases; };
+        return w;
+    }
+};
+
+static ModelBackend::CompressRequest pflash_window_request(const char * drafter) {
+    ModelBackend::CompressRequest request;
+    request.input_ids = {1, 2, 3};
+    request.keep_ratio = 0.5f;
+    request.drafter_path = drafter;
+    return request;
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_window_skips_unscorable_requests) {
+    PFlashWindowProbe probe;
+    DrafterContext drafter;
+    bool loaded = false;
+    ModelBackend::CompressRequest empty;
+    auto bad_ratio = pflash_window_request("/nonexistent/drafter.gguf");
+    bad_ratio.keep_ratio = std::numeric_limits<float>::quiet_NaN();
+    const auto results = pflash_compress_batch(drafter, loaded, {empty, bad_ratio}, probe.window());
+    TEST_ASSERT(results.size() == 2 && !results[0].ok && !results[1].ok);
+    TEST_ASSERT(probe.drains == 0 && probe.parks == 0 && probe.unparks == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_window_failed_park_scores_nothing) {
+    PFlashWindowProbe probe;
+    probe.park_ok = false;
+    DrafterContext drafter;
+    bool loaded = false;
+    const auto results = pflash_compress_batch(
+        drafter, loaded, {pflash_window_request("/nonexistent/drafter.gguf")}, probe.window());
+    TEST_ASSERT(results.size() == 1 && !results[0].ok);
+    TEST_ASSERT(probe.drains == 1 && probe.parks == 1 && probe.unparks == 0);
+    TEST_ASSERT(!loaded && drafter.backend == nullptr);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_window_failed_load_frees_backend_and_unparks) {
+    PFlashWindowProbe probe;
+    DrafterContext drafter;
+    // A supplied CPU backend runs the real load failure without a GPU.
+    drafter.backend = ggml_backend_cpu_init();
+    drafter.gpu = 0;
+    TEST_ASSERT(drafter.backend != nullptr);
+    bool loaded = false;
+    const auto results = pflash_compress_batch(
+        drafter, loaded, {pflash_window_request("/nonexistent/drafter.gguf")}, probe.window());
+    TEST_ASSERT(results.size() == 1 && !results[0].ok);
+    TEST_ASSERT(probe.parks == 1 && probe.unparks == 1);
+    TEST_ASSERT(!loaded && drafter.backend == nullptr && drafter.gpu == -1);
+    free_drafter(drafter);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_window_reloads_another_drafter) {
+    PFlashWindowProbe probe;
+    DrafterContext drafter;
+    // A drafter "loaded" from another file is released before this load.
+    drafter.path = "/other/drafter.gguf";
+    drafter.gpu = 0;
+    bool loaded = true;
+    auto window = probe.window();
+    window.release = [&] { ++probe.releases; free_drafter(drafter); loaded = false; };
+    auto request = pflash_window_request("/nonexistent/drafter.gguf");
+    request.skip_park = true;
+    const auto results = pflash_compress_batch(drafter, loaded, {request}, window);
+    TEST_ASSERT(results.size() == 1 && !results[0].ok);
+    TEST_ASSERT(probe.releases == 1);
+    TEST_ASSERT(probe.parks == 0 && probe.unparks == 0);
+    TEST_ASSERT(!loaded);
+    free_drafter(drafter);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_window_splits_mixed_batches) {
+    PFlashWindowProbe probe;
+    DrafterContext drafter;
+    bool loaded = false;
+    auto parked = pflash_window_request("/nonexistent/a.gguf");
+    auto beside = pflash_window_request("/nonexistent/a.gguf");
+    beside.skip_park = true;
+    const auto results = pflash_compress_batch(drafter, loaded, {parked, beside}, probe.window());
+    TEST_ASSERT(results.size() == 2 && !results[0].ok && !results[1].ok);
+    // One window each; only the first parks.
+    TEST_ASSERT(probe.drains == 2 && probe.parks == 1 && probe.unparks == 1);
+    free_drafter(drafter);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_parse_compress_line) {
+    const std::string ids_path = test_tmp_path("luce_test_pflash_parse_ids.bin").string();
+    remove_test_path(ids_path);
+    TEST_ASSERT(write_int32_file(ids_path, {7, 8, 9}));
+    ModelBackend::CompressRequest request;
+    TEST_ASSERT(pflash_parse_compress_line("compress " + ids_path + " 250 /a drafter.gguf nopark", request));
+    TEST_ASSERT(request.input_ids == std::vector<int32_t>({7, 8, 9}));
+    TEST_ASSERT(std::abs(request.keep_ratio - 0.25f) < 1e-6f);
+    TEST_ASSERT(request.drafter_path == "/a drafter.gguf" && request.skip_park);
+    TEST_ASSERT(request.drafter_gpu == 0 &&
+                request.residency_action == DraftResidencyAction::KeepLoaded);
+    TEST_ASSERT(pflash_parse_compress_line("compress " + ids_path + " 250 nopark", request));
+    TEST_ASSERT(request.drafter_path.empty() && request.skip_park);
+    TEST_ASSERT(pflash_parse_compress_line("compress " + ids_path + " 250", request));
+    TEST_ASSERT(request.drafter_path.empty() && !request.skip_park);
+    TEST_ASSERT(!pflash_parse_compress_line("compress " + ids_path, request));
+    // A keep outside 0..1000 or an ids file that is missing or empty is a bad line.
+    TEST_ASSERT(!pflash_parse_compress_line("compress " + ids_path + " 1001", request));
+    TEST_ASSERT(!pflash_parse_compress_line("compress " + ids_path + " -1", request));
+    TEST_ASSERT(pflash_parse_compress_line("compress " + ids_path + " 1000", request));
+    remove_test_path(ids_path);
+    TEST_ASSERT(!pflash_parse_compress_line("compress " + ids_path + " 250", request));
 }
 
 struct MockMemoryOnlySnapshotBackend : MockBackend {
@@ -14638,47 +13786,19 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_policy_parse) {
     TEST_ASSERT(!parse_disk_prefix_cache_policy("auto:0", policy));
 }
 
-// BUG-A: apply_request_scope_override must preserve server-level compress flag.
-// A request-level scope override (e.g. "off") must NOT clear compress=true
-// that was set by the server configuration.
-TEST_CASE(ServerUnitFixture, test_scope_override_preserves_compress) {
-    // Server policy: compress=true, mode=Full.
+// A request-level scope replaces the server policy; an invalid one leaves it unchanged.
+TEST_CASE(ServerUnitFixture, test_scope_override_replaces_the_server_policy) {
     DiskPrefixCachePolicy server;
-    server.mode = DiskPrefixCacheMode::Full;
-    server.compress = true;
-
-    // Request sends the retired scope="auto": it reads as full and keeps compress.
     server.mode = DiskPrefixCacheMode::Off;
-    TEST_ASSERT(apply_request_scope_override(server, "auto"));
+    TEST_ASSERT(apply_request_scope_override(server, "auto"));  // retired: reads as full
     TEST_ASSERT(server.mode == DiskPrefixCacheMode::Full);
-    TEST_ASSERT_MSG(server.compress,
-        "BUG-A: scope override dropped server-level compress=true");
-
-    // Same with a fixed-token scope.
-    DiskPrefixCachePolicy server2;
-    server2.mode = DiskPrefixCacheMode::Full;
-    server2.compress = true;
-    TEST_ASSERT(apply_request_scope_override(server2, "1000"));
-    TEST_ASSERT(server2.mode == DiskPrefixCacheMode::Fixed);
-    TEST_ASSERT(server2.fixed_tokens == 1000);
-    TEST_ASSERT_MSG(server2.compress,
-        "BUG-A: fixed-token scope override dropped server-level compress=true");
-
-    // scope="off" must also preserve compress flag.
-    DiskPrefixCachePolicy server3;
-    server3.compress = true;
-    TEST_ASSERT(apply_request_scope_override(server3, "off"));
-    TEST_ASSERT(server3.mode == DiskPrefixCacheMode::Off);
-    TEST_ASSERT_MSG(server3.compress,
-        "BUG-A: off scope override dropped server-level compress=true");
-
-    // Invalid scope string must return false and leave policy unchanged.
-    DiskPrefixCachePolicy server4;
-    server4.compress = true;
-    server4.mode = DiskPrefixCacheMode::Full;
-    TEST_ASSERT(!apply_request_scope_override(server4, "core"));
-    TEST_ASSERT(server4.compress);
-    TEST_ASSERT(server4.mode == DiskPrefixCacheMode::Full);
+    TEST_ASSERT(apply_request_scope_override(server, "1000"));
+    TEST_ASSERT(server.mode == DiskPrefixCacheMode::Fixed);
+    TEST_ASSERT(server.fixed_tokens == 1000);
+    TEST_ASSERT(apply_request_scope_override(server, "off"));
+    TEST_ASSERT(server.mode == DiskPrefixCacheMode::Off);
+    TEST_ASSERT(!apply_request_scope_override(server, "core"));
+    TEST_ASSERT(server.mode == DiskPrefixCacheMode::Off);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_fixed_boundary) {
@@ -18293,184 +17413,8 @@ TEST_CASE(ServerUnitFixture, test_prefix_key_stable_across_header_change) {
     TEST_ASSERT(norm_a.find("senior engineer") != std::string::npos);
 }
 
-// FlowKV + disk-cache compose tests (T1–T7)
-
-// T4 (compress=false): policy name has no "+compress" suffix.
-TEST_CASE(ServerUnitFixture, test_flowkv_T4_compress_false_policy_name_no_suffix) {
-    DiskPrefixCachePolicy p;
-    p.mode = DiskPrefixCacheMode::Full;
-    p.compress = false;
-    std::string name = disk_prefix_cache_policy_name(p);
-    TEST_ASSERT_MSG(name.find("+compress") == std::string::npos,
-                    "compress=false: name must not contain +compress");
-}
-
-// T4 (compress=true): policy name has "+compress" suffix.
-TEST_CASE(ServerUnitFixture, test_flowkv_T4_compress_true_policy_name_has_suffix) {
-    DiskPrefixCachePolicy p;
-    p.mode = DiskPrefixCacheMode::Full;
-    p.compress = true;
-    std::string name = disk_prefix_cache_policy_name(p);
-    TEST_ASSERT_MSG(name.find("+compress") != std::string::npos,
-                    "compress=true: name must contain +compress");
-    // fixed+compress
-    p.mode = DiskPrefixCacheMode::Fixed;
-    p.fixed_tokens = 512;
-    name = disk_prefix_cache_policy_name(p);
-    TEST_ASSERT(name.find("+compress") != std::string::npos);
-}
-
-// T4: compression-aware disk clamping remains opt-in.
-TEST_CASE(ServerUnitFixture, test_flowkv_T4_default_no_compress) {
-    DiskPrefixCachePolicy p;
-    TEST_ASSERT_MSG(!p.compress, "FlowKV disk clamping must default to off");
-    TEST_ASSERT(!http_detail::should_clamp_flowkv_disk_cache(true, p));
-
-    p.compress = true;
-    TEST_ASSERT(http_detail::should_clamp_flowkv_disk_cache(true, p));
-    TEST_ASSERT(!http_detail::should_clamp_flowkv_disk_cache(false, p));
-}
-
-// T6: frozen_block_key is deterministic — same tokens → same hash.
-TEST_CASE(ServerUnitFixture, test_flowkv_T6_frozen_block_key_deterministic) {
-    std::vector<int32_t> ids = {10, 20, 30, 40, 50};
-    PrefixHash k1 = frozen_block_key(ids.data(), 0, (int)ids.size());
-    PrefixHash k2 = frozen_block_key(ids.data(), 0, (int)ids.size());
-    TEST_ASSERT_MSG(k1 == k2, "frozen_block_key must be deterministic");
-}
-
-// T6: frozen_block_key returns zero hash on empty slice.
-TEST_CASE(ServerUnitFixture, test_flowkv_T6_frozen_block_key_zero_on_empty) {
-    std::vector<int32_t> ids = {10, 20, 30};
-    PrefixHash k = frozen_block_key(ids.data(), 2, 2);  // begin == end
-    PrefixHash zero{};
-    TEST_ASSERT_MSG(k == zero, "empty slice must return zero hash");
-    PrefixHash k2 = frozen_block_key(ids.data(), 5, 3);  // begin > end
-    TEST_ASSERT(k2 == zero);
-}
-
-// T6: distinct token content → distinct hashes.
-TEST_CASE(ServerUnitFixture, test_flowkv_T6_frozen_block_key_distinct_content) {
-    std::vector<int32_t> a = {1, 2, 3};
-    std::vector<int32_t> b = {1, 2, 4};
-    PrefixHash ka = frozen_block_key(a.data(), 0, 3);
-    PrefixHash kb = frozen_block_key(b.data(), 0, 3);
-    TEST_ASSERT_MSG(ka != kb, "different token content must produce different hashes");
-}
-
-// T7: disk clamp — with compress=true, boundary should use system_end (first
-// safe boundary), not the full prompt.  Tested via the fixed-boundary logic.
-TEST_CASE(ServerUnitFixture, test_flowkv_T7_disk_clamp_system_end_boundary) {
-    // Simulate: effective_prompt has a system_end at token 300.
-    // The FlowKV disk-clamp should set fixed_tokens = system_end.
-    // We test this by constructing a DiskPrefixCachePolicy and verifying that
-    // disk_prefix_cache_fixed_boundary returns system_end when fixed_tokens = system_end.
-    const int system_end = 300;
-    DiskPrefixCachePolicy p;
-    p.mode = DiskPrefixCacheMode::Fixed;
-    p.fixed_tokens = system_end;
-    p.compress = true;
-
-    // full_len larger than system_end → boundary = system_end
-    int b = disk_prefix_cache_fixed_boundary(p, 1200, /*min_tokens=*/128);
-    TEST_ASSERT_MSG(b == system_end,
-                    "disk clamp must return system_end as boundary");
-
-    // full_len smaller than system_end → no boundary (prompt shorter than system)
-    int b2 = disk_prefix_cache_fixed_boundary(p, 100, /*min_tokens=*/128);
-    TEST_ASSERT_MSG(b2 == 0, "boundary 0 when prompt shorter than system_end");
-
-    // system_end below min_tokens → no boundary
-    DiskPrefixCachePolicy p2;
-    p2.mode = DiskPrefixCacheMode::Fixed;
-    p2.fixed_tokens = 50;
-    p2.compress = true;
-    int b3 = disk_prefix_cache_fixed_boundary(p2, 1000, /*min_tokens=*/512);
-    TEST_ASSERT_MSG(b3 == 0, "boundary 0 when system_end < min_tokens");
-}
-
-// T3 (WS1): non-continuation messages JSON has no assistant role.
-// This tests the JSON shape that the is_continuation check reads.
-TEST_CASE(ServerUnitFixture, test_flowkv_T3_ws1_continuation_json_shape) {
-    // Single user message: NOT a continuation.
-    json msgs = json::array({
-        {{"role", "system"}, {"content", "You are an assistant."}},
-        {{"role", "user"},   {"content", "Hello!"}}
-    });
-    bool is_continuation = false;
-    for (const auto & m : msgs) {
-        if (!m.is_object()) continue;
-        const std::string role = m.value("role", "");
-        if (role == "assistant") { is_continuation = true; break; }
-        if (m.contains("tool_calls")) {
-            const auto & tc = m["tool_calls"];
-            if (tc.is_array() && !tc.empty()) { is_continuation = true; break; }
-        }
-    }
-    TEST_ASSERT_MSG(!is_continuation, "user-only messages are NOT a continuation");
-
-    // With assistant turn: IS a continuation.
-    json msgs2 = json::array({
-        {{"role", "system"},    {"content", "You are an assistant."}},
-        {{"role", "user"},      {"content", "Hello!"}},
-        {{"role", "assistant"}, {"content", "Hi there!"}}
-    });
-    bool is_cont2 = false;
-    for (const auto & m : msgs2) {
-        if (!m.is_object()) continue;
-        const std::string role = m.value("role", "");
-        if (role == "assistant") { is_cont2 = true; break; }
-    }
-    TEST_ASSERT_MSG(is_cont2, "messages with assistant turn ARE a continuation");
-}
-
-// T1 (head-verbatim): system_end is the FIRST boundary (boundary[0]).
-// Verifies the disk-clamp invariant: system_end = find_all_boundaries()[0].
-// Tests the boundary function returns a sane first boundary on a chat prompt.
-TEST_CASE(ServerUnitFixture, test_flowkv_T1_system_end_boundary_first) {
-    // Construct a synthetic token stream where chat markers appear at known
-    // positions. find_all_boundaries uses prefix_cache_.chat_markers() which
-    // are model-specific; test the boundary API directly.
-    // The load-bearing invariant is: when compress=true + pflash_compressed,
-    // disk_policy.fixed_tokens == system_end == find_all_boundaries()[0].
-    // We test that find_all_boundaries returns a sorted ascending list and
-    // that [0] is strictly less than [1] (system before later turns).
-
-    // Boundary logic from disk_prefix_cache.cpp: uses marker token IDs to find
-    // chat turn boundaries. We can test via a simple synthetic case.
-    std::vector<int> boundaries = {100, 250, 500};
-    // system_end would be boundaries[0] = 100.
-    int system_end = boundaries.empty() ? 0 : boundaries[0];
-    TEST_ASSERT_MSG(system_end == 100, "first boundary is system_end");
-    // All later boundaries are after system_end.
-    for (size_t i = 1; i < boundaries.size(); ++i) {
-        TEST_ASSERT(boundaries[i] > system_end);
-    }
-}
-
-// T5: exercise the production FlowKV activation decision and defaults.
-TEST_CASE(ServerUnitFixture, test_flowkv_T5_aggregate_activation_threshold) {
-    ServerConfig config;
-    config.pflash = true;
-
-    TEST_ASSERT(http_detail::flowkv_activation_threshold(config) == 32000);
-    TEST_ASSERT(!http_detail::flowkv_should_activate(config, 13000));
-    TEST_ASSERT(http_detail::flowkv_should_activate(config, 32000));
-
-    config.pflash_threshold = 12000;
-    TEST_ASSERT(!http_detail::flowkv_should_activate(config, 11999));
-    TEST_ASSERT(http_detail::flowkv_should_activate(config, 13000));
-
-    config.pflash_threshold = 0;   // every prompt
-    TEST_ASSERT(http_detail::flowkv_activation_threshold(config) ==
-                http_detail::kFlowKvInertMinTokens);
-    TEST_ASSERT(http_detail::flowkv_should_activate(
-        config, http_detail::kFlowKvInertMinTokens));
-}
-
-// Session feedback overrides the static/curve ratio for both whole-prompt
-// PFlash and FlowKV.
-TEST_CASE(ServerUnitFixture, test_flowkv_session_keep_ratio_override) {
+// Session feedback overrides the static/curve ratio.
+TEST_CASE(ServerUnitFixture, test_pflash_session_keep_ratio_override) {
     HttpServerSessions sessions;
     sessions.update("adaptive", 0.95f);
 
@@ -19772,85 +18716,7 @@ static json pflash_tool_session_tools() {
 
 // system + task + (assistant tool call + long tool result) + assistant tool
 // call + a short new tool result.
-// ─── Tool sessions (PFLASH_AGENT_PASTE) ───────────────────────────────────
-
-TEST_CASE(ServerUnitFixture, test_pflash_agent_paste_flag_defaults_off) {
-    luce_unsetenv("PFLASH_AGENT_PASTE");
-    TEST_ASSERT(!http_detail::pflash_agent_paste_enabled());
-    // Only "1" turns it on; anything else leaves tool sessions raw.
-    for (const char * off : {"", "0", "on", "true", "keep", "1 ", "01"}) {
-        luce_setenv("PFLASH_AGENT_PASTE", off);
-        TEST_ASSERT_MSG(!http_detail::pflash_agent_paste_enabled(), off);
-    }
-    luce_setenv("PFLASH_AGENT_PASTE", "1");
-    TEST_ASSERT(http_detail::pflash_agent_paste_enabled());
-    luce_unsetenv("PFLASH_AGENT_PASTE");
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_decision) {
-    using http_detail::PflashAdmission;
-    using http_detail::pflash_keep_history_admission;
-    const int t = 16384;
-    // Large new user content: only it is compressed, whatever today's
-    // decision for the whole prompt (warm or compress).
-    for (auto admission : {PflashAdmission::Compress, PflashAdmission::WarmCache}) {
-        TEST_ASSERT(pflash_keep_history_admission(admission, t, t, true) ==
-                    PflashAdmission::NewContent);
-        TEST_ASSERT(pflash_keep_history_admission(admission, t, t, false) ==
-                    PflashAdmission::NewContent);
-    }
-    // Small new content: raw instead of compressing the history.
-    TEST_ASSERT(pflash_keep_history_admission(PflashAdmission::Compress, t - 1, t, false) ==
-                PflashAdmission::KeepHistory);
-    TEST_ASSERT(pflash_keep_history_admission(PflashAdmission::WarmCache, t - 1, t, true) ==
-                PflashAdmission::KeepHistory);
-    // Already raw: unchanged.
-    TEST_ASSERT(pflash_keep_history_admission(PflashAdmission::WarmCache, t - 1, t, false) ==
-                PflashAdmission::WarmCache);
-    TEST_ASSERT(pflash_keep_history_admission(PflashAdmission::UnderThreshold, 3 * t, t, true) ==
-                PflashAdmission::UnderThreshold);
-    TEST_ASSERT(std::string(http_detail::pflash_admission_name(
-        PflashAdmission::NewContent)) == "new_content");
-    TEST_ASSERT(std::string(http_detail::pflash_admission_name(
-        PflashAdmission::KeepHistory)) == "keep_history");
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_scope) {
-    using http_detail::PflashChatTurn;
-    const auto turn = [] (const char * role, int begin) {
-        PflashChatTurn out;
-        out.role = role;
-        out.role_begin = begin;
-        out.content_begin = begin + 2;
-        out.content_end = begin + 8;
-        out.turn_end = begin + 10;
-        return out;
-    };
-    int newest = 7;
-    TEST_ASSERT(std::string(http_detail::pflash_keep_history_scope({}, newest)) == "no_turns");
-    TEST_ASSERT(newest == -1);
-    // First turn: the preamble and the user's message. The newest user
-    // message is the one thing a tool session may compress.
-    TEST_ASSERT(http_detail::pflash_keep_history_scope(
-        {turn("system", 0), turn("user", 10)}, newest) == nullptr);
-    TEST_ASSERT(newest == 1);
-    // Newest turn a tool output (or an assistant prefill): nothing to compress.
-    TEST_ASSERT(std::string(http_detail::pflash_keep_history_scope(
-        {turn("system", 0), turn("user", 10), turn("assistant", 20), turn("tool", 30)},
-        newest)) == "newest_not_user");
-    TEST_ASSERT(std::string(http_detail::pflash_keep_history_scope(
-        {turn("user", 0), turn("assistant", 10)}, newest)) == "newest_not_user");
-    // A user turn after the agent's turns: in scope, newest is its index.
-    TEST_ASSERT(http_detail::pflash_keep_history_scope(
-        {turn("system", 0), turn("user", 10), turn("assistant", 20), turn("tool", 30),
-         turn("assistant", 40), turn("user", 50)}, newest) == nullptr);
-    TEST_ASSERT(newest == 5);
-    // An empty user turn has nothing to compress or keep apart.
-    auto empty = turn("user", 50);
-    empty.content_end = empty.content_begin;
-    TEST_ASSERT(std::string(http_detail::pflash_keep_history_scope(
-        {turn("user", 0), turn("assistant", 10), empty}, newest)) == "newest_not_user");
-}
+// ─── Tool sessions ─────────────────────────────────────────────────────────
 
 static std::string pflash_keep_filler(const char * line, int count) {
     std::string out;
@@ -19882,12 +18748,6 @@ static json pflash_keep_agent_history(int tool_lines) {
     });
 }
 
-static const char * const kPflashKeepPasteLine = "The manual says many things.\n";
-
-static std::string pflash_keep_paste(int lines, const char * question) {
-    return pflash_keep_filler(kPflashKeepPasteLine, lines) + question;
-}
-
 static json pflash_keep_with(json messages, const json & message) {
     messages.push_back(message);
     return messages;
@@ -19897,821 +18757,7 @@ static json pflash_keep_user(const std::string & content) {
     return {{"role", "user"}, {"content", content}};
 }
 
-struct MockPflashWarmSpanBackend : MockPflashSpanBackend {
-    int warm_pos = 0;   // slot 0 holds a snapshot at this position
-    bool snapshot_used(int slot) const override { return slot == 0 && warm_pos > 0; }
-    int snapshot_cur_pos(int slot) const override {
-        return snapshot_used(slot) ? warm_pos : 0;
-    }
-};
-
-struct PflashKeepHistoryRun {
-    std::vector<HttpServerTestAccess::PreparedPrompt> prepared;
-    std::vector<std::vector<int32_t>> ids;
-    std::vector<std::string> served_text;
-    // Target tokens before the last "<|im_start|>user" of each prompt.
-    std::vector<int> user_cut;
-    json counters;
-    json keep;
-    int compress_calls = 0;
-    std::vector<int> calls_after;   // backend compress calls after each turn
-    std::vector<std::string> cut_text;   // served text up to the snapshot cut
-    std::vector<json> view_records;
-};
-
-// Extra passages the mock selector keeps: {trigger, passage} keeps the
-// passage's span whenever the prompt contains the trigger text (a question
-// that needs it), so a later question can recall what a paste turn dropped.
-using PflashKeepRecallPairs = std::vector<std::pair<std::string, std::string>>;
-
-// One server, the given turns in order (cache-aware admission, arrive on,
-// fixture tokenizer as target and drafter). ``flag``: PFLASH_AGENT_PASTE
-// (nullptr = unset, the default). ``warm_history``: before the
-// first turn, the prefix cache holds its prompt up to the newest user turn.
-static PflashKeepHistoryRun run_keep_history_session(
-        const std::vector<json> & turns, const json & tools, const char * flag,
-        int threshold, bool warm_history = false,
-        int max_ctx = 16384, const char * arrive_flag = "1",
-        const PflashKeepRecallPairs & recall_pairs = {}) {
-    const int max_output = 16;
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
-    luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "cache"};
-    luce_test::ScopedEnvVar arrive{"PFLASH_ARRIVE", arrive_flag};
-    luce_test::ScopedEnvVar paste{"PFLASH_AGENT_PASTE", flag};
-    char trace_path[] = "/tmp/pflash_keep_history_view_XXXXXX";
-    const int trace_fd = mkstemp(trace_path);
-    TEST_ASSERT(trace_fd >= 0);
-    close(trace_fd);
-    luce_test::ScopedEnvVar view_trace{"PFLASH_VIEW_TRACE_PATH", trace_path};
-    std::vector<std::string> rendered;
-    std::string cover;
-    for (const auto & messages : turns) {
-        ToolMemory tool_memory;
-        const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory);
-        rendered.push_back(codec_text("qwen3.5", chat, /*add_generation_prompt=*/true,
-            /*enable_thinking=*/true,
-            tools.is_array() && !tools.empty() ? tools.dump() : ""));
-        cover += rendered.back();
-    }
-    cover += "[]";  // the excerpt block's markers
-    const std::string path = write_pflash_bpe_tokenizer_fixture(
-        {"user", "assistant", "system", "\n", "tool"}, cover);
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    PflashKeepHistoryRun run;
-    for (const auto & text : rendered) {
-        run.ids.push_back(tokenizer.encode(text));
-        const size_t at = text.rfind("<|im_start|>user");
-        run.user_cut.push_back(at == std::string::npos ? -1
-            : (int) tokenizer.encode(text.substr(0, at)).size());
-    }
-    auto backend_owner = std::make_unique<MockPflashWarmSpanBackend>();
-    MockPflashWarmSpanBackend & backend = *backend_owner;
-    // The selector keeps the user's questions (a prompt-end query ranks
-    // them first), nothing else of a paste.
-    backend.pick = [&] (const ModelBackend::CompressRequest & request) {
-        std::vector<PFlashTokenSpan> spans;
-        for (const char * text : {"What does the manual say about exit codes?",
-                                  "And what about signals?", "Which page covers traps?"}) {
-            const auto span = http_detail::pflash_decoded_text_span(
-                tokenizer, request.input_ids, 0, (int) request.input_ids.size(), text);
-            if (span.begin >= 0) spans.push_back(span);
-        }
-        for (const auto & [trigger, passage] : recall_pairs) {
-            const int n = (int) request.input_ids.size();
-            if (http_detail::pflash_decoded_text_span(
-                    tokenizer, request.input_ids, 0, n, trigger).begin < 0) {
-                continue;
-            }
-            const auto span = http_detail::pflash_decoded_text_span(
-                tokenizer, request.input_ids, 0, n, passage);
-            if (span.begin >= 0) spans.push_back(span);
-        }
-        return spans;
-    };
-    LuceEngine engine(std::move(backend_owner));
-    ServerConfig config;
-    config.pflash = true;
-    config.pflash_threshold = threshold;
-    config.pflash_keep_ratio = 0.3f;
-    config.max_ctx = max_ctx;
-    config.prefix_cache_cap = warm_history ? 4 : 0;
-    config.prefill_cache_cap = 0;
-    {
-        HttpServer server(engine, tokenizer, config);
-        HttpServerTestAccess::chat_view_only(server);
-        server.set_drafter_tokenizer(&tokenizer);
-        if (warm_history) {
-            TEST_ASSERT(run.user_cut[0] > 0);
-            backend.warm_pos = run.user_cut[0];
-            HttpServerTestAccess::seed_prefix_cache(server, 0, run.user_cut[0], run.ids[0]);
-        }
-        for (size_t index = 0; index < turns.size(); ++index) {
-            ParsedRequest request;
-            request.format = ApiFormat::OPENAI_CHAT;
-            request.messages = turns[index];
-            if (tools.is_array() && !tools.empty()) request.tools = tools;
-            request.prompt_tokens = run.ids[index];
-            request.max_output = max_output;
-            run.prepared.push_back(HttpServerTestAccess::prepare_prompt(server, request));
-            run.served_text.push_back(tokenizer.decode(run.prepared.back().tokens));
-            run.calls_after.push_back(backend.compress_calls);
-            const auto & prepared = run.prepared.back();
-            run.cut_text.push_back(prepared.snapshot_cut > 0
-                ? tokenizer.decode(std::vector<int32_t>(
-                      prepared.tokens.begin(), prepared.tokens.begin() + prepared.snapshot_cut))
-                : std::string());
-        }
-        run.counters = HttpServerTestAccess::pflash_failure_counters(server);
-        run.keep = HttpServerTestAccess::pflash_keep_history(server);
-    }
-    run.compress_calls = backend.compress_calls;
-    std::ifstream in(trace_path);
-    for (std::string line; std::getline(in, line);) {
-        if (!line.empty()) run.view_records.push_back(json::parse(line));
-    }
-    unlink(trace_path);
-    unlink(path.c_str());
-    return run;
-}
-
-static bool pflash_keep_prefix_is(const std::vector<int32_t> & served,
-                                  const std::vector<int32_t> & ids, int cut) {
-    return cut > 0 && (int) served.size() >= cut && (int) ids.size() >= cut &&
-        std::equal(ids.begin(), ids.begin() + cut, served.begin());
-}
-
-// PFLASH_AGENT_PASTE off (the default): every turn of a tool session is
-// served raw, full prefill, without a drafter pass (decision keep_history,
-// the record says the switch is off).
-static void pflash_keep_assert_paste_off_raw(const PflashKeepHistoryRun & run) {
-    TEST_ASSERT(run.compress_calls == 0);
-    for (size_t turn = 0; turn < run.prepared.size(); ++turn) {
-        const auto & prepared = run.prepared[turn];
-        TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
-        TEST_ASSERT_MSG(!prepared.compressed && prepared.tokens == run.ids[turn],
-                        std::to_string(turn));
-        const json & admission = prepared.pflash_stats["admission"];
-        TEST_ASSERT_MSG(admission.value("decision", "") == "keep_history", admission.dump());
-        TEST_ASSERT(admission["keep_history"].value("in_scope", false));
-        TEST_ASSERT(!admission["keep_history"].value("paste", true));
-        TEST_ASSERT(prepared.pflash_stats["pflash_fallback"].value("reason", "") ==
-                    "keep_history");
-    }
-    TEST_ASSERT(!run.keep.value("paste", true));
-    TEST_ASSERT(run.keep["decisions"].value("keep_history", 0) == (int) run.prepared.size());
-    TEST_ASSERT(run.counters["fallback_reasons"].value("keep_history", 0) ==
-                (int) run.prepared.size());
-    TEST_ASSERT(run.view_records.size() == run.prepared.size());
-    for (const auto & record : run.view_records) {
-        TEST_ASSERT(record.value("kind", "") == "raw");
-    }
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_small_history_big_paste) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    // Case 4: a small agent history (under the threshold) and a large paste
-    // as the new user turn. By default the tool session is served raw; with
-    // PFLASH_AGENT_PASTE=1 the history is served raw and only the paste is
-    // compressed.
-    const json turn = pflash_keep_with(pflash_keep_agent_history(6),
-        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
-    const auto off = run_keep_history_session({turn}, pflash_tool_session_tools(), nullptr,
-                                              400);
-    const auto on = run_keep_history_session({turn}, pflash_tool_session_tools(), "1",
-                                             400);
-    pflash_keep_assert_paste_off_raw(off);
-    TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
-    // With the switch: one compression, the history token for token, the
-    // paste compressed, the question kept.
-    TEST_ASSERT(on.compress_calls == 1);
-    TEST_ASSERT(on.prepared[0].compressed);
-    const json & admission = on.prepared[0].pflash_stats["admission"];
-    TEST_ASSERT_MSG(admission.value("decision", "") == "new_content", admission.dump());
-    const json & keep = admission["keep_history"];
-    TEST_ASSERT(keep.value("in_scope", false) && keep.value("fired", false));
-    TEST_ASSERT(keep.value("decision_before", "") == "compress");
-    TEST_ASSERT(keep.value("new_droppable", 0) >= 400);
-    TEST_ASSERT(keep.value("base", "") == "raw");
-    TEST_ASSERT(keep.value("raw_base_tokens", -1) == on.user_cut[0]);
-    TEST_ASSERT(admission["region"].value("mode", "") == "new_content");
-    TEST_ASSERT(pflash_keep_prefix_is(on.prepared[0].tokens, on.ids[0], on.user_cut[0]));
-    TEST_ASSERT(pflash_keep_count(on.served_text[0], "def parse(x)") == 6);
-    TEST_ASSERT(pflash_keep_count(on.served_text[0], "The manual says many things.") < 30);
-    TEST_ASSERT(on.served_text[0].find("exit codes?") != std::string::npos);
-    TEST_ASSERT(on.prepared[0].tokens.size() < on.ids[0].size());
-    const json & view = on.prepared[0].pflash_stats["view"];
-    TEST_ASSERT(view.value("mode", "") == "new_content");
-    TEST_ASSERT(view.value("raw_base_tokens", -1) == on.user_cut[0]);
-    TEST_ASSERT(on.view_records.size() == 1);
-    TEST_ASSERT(on.view_records[0]["pflash"]["view"].value("mode", "") == "new_content");
-    TEST_ASSERT(on.keep["decisions"].value("new_content", 0) == 1);
-    TEST_ASSERT(on.counters.value("fallback_served", 0) == 0);
-    TEST_ASSERT(on.keep.value("paste", false));
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_big_history_big_paste) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    // Case 3: an uncached history over the threshold and a large paste. By
-    // default everything is served raw; with PFLASH_AGENT_PASTE=1 the
-    // history is still raw and only the paste is compressed.
-    const json turn = pflash_keep_with(pflash_keep_agent_history(60),
-        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
-    const auto off = run_keep_history_session({turn}, pflash_tool_session_tools(), nullptr,
-                                              400);
-    const auto on = run_keep_history_session({turn}, pflash_tool_session_tools(), "1",
-                                             400);
-    pflash_keep_assert_paste_off_raw(off);
-    TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
-    const json & admission = on.prepared[0].pflash_stats["admission"];
-    TEST_ASSERT_MSG(admission.value("decision", "") == "new_content", admission.dump());
-    TEST_ASSERT(admission["keep_history"].value("decision_before", "") == "compress");
-    TEST_ASSERT(!admission.contains("cold_history"));
-    TEST_ASSERT(on.prepared[0].compressed && on.compress_calls == 1);
-    TEST_ASSERT(pflash_keep_prefix_is(on.prepared[0].tokens, on.ids[0], on.user_cut[0]));
-    TEST_ASSERT(pflash_keep_count(on.served_text[0], "def parse(x)") == 60);
-    TEST_ASSERT(pflash_keep_count(on.served_text[0], "The manual says many things.") < 30);
-    TEST_ASSERT(on.counters.value("fallback_served", 0) == 0);
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_small_new_turn_serves_raw) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", "1"};
-    // An uncached history over the threshold and a short new question: the
-    // history is never compressed. The raw prompt is served (keep_history),
-    // with the switch on or off. Never refused.
-    const json turn = pflash_keep_with(pflash_keep_agent_history(60),
-        pflash_keep_user("Why does it strip?"));
-    const auto off = run_keep_history_session({turn}, pflash_tool_session_tools(), nullptr,
-                                              400);
-    pflash_keep_assert_paste_off_raw(off);
-    const auto on = run_keep_history_session({turn}, pflash_tool_session_tools(), "1",
-                                             400);
-    TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
-    TEST_ASSERT(!on.prepared[0].compressed && on.compress_calls == 0);
-    TEST_ASSERT(on.prepared[0].tokens == on.ids[0]);
-    const json & admission = on.prepared[0].pflash_stats["admission"];
-    TEST_ASSERT_MSG(admission.value("decision", "") == "keep_history", admission.dump());
-    TEST_ASSERT(admission["keep_history"].value("fired", false));
-    TEST_ASSERT(admission["keep_history"].value("decision_before", "") == "compress");
-    TEST_ASSERT(admission["keep_history"].value("new_droppable", 999) < 400);
-    TEST_ASSERT(on.prepared[0].pflash_stats["pflash_fallback"].value("reason", "") ==
-                "keep_history");
-    TEST_ASSERT(on.counters.value("fallback_served", 0) == 1);
-    TEST_ASSERT(on.counters["fallback_reasons"].value("keep_history", 0) == 1);
-    TEST_ASSERT(on.keep["decisions"].value("keep_history", 0) == 1);
-    TEST_ASSERT(on.view_records.size() == 1);
-    TEST_ASSERT(on.view_records[0].value("kind", "") == "raw");
-    TEST_ASSERT(on.view_records[0]["pflash_fallback"].value("reason", "") == "keep_history");
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_warm_cache_big_paste) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    // Case 2: the prefix cache holds the history; a large paste arrives.
-    // By default it is served raw; with PFLASH_AGENT_PASTE=1 the served
-    // prompt starts with the raw history tokens the cache restores and only
-    // the paste is compressed (never arrive's re-encoded uncached tail).
-    const json turn = pflash_keep_with(pflash_keep_agent_history(60),
-        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
-    const auto off = run_keep_history_session({turn}, pflash_tool_session_tools(), nullptr,
-                                              400, /*warm_history=*/true);
-    const auto on = run_keep_history_session({turn}, pflash_tool_session_tools(), "1",
-                                             400, /*warm_history=*/true);
-    pflash_keep_assert_paste_off_raw(off);
-    TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
-    const json & admission = on.prepared[0].pflash_stats["admission"];
-    TEST_ASSERT_MSG(admission.value("decision", "") == "new_content", admission.dump());
-    TEST_ASSERT(admission["keep_history"].value("decision_before", "") == "warm_cache");
-    TEST_ASSERT(admission.value("cached_tokens", 0) == on.user_cut[0]);
-    TEST_ASSERT(pflash_keep_prefix_is(on.prepared[0].tokens, on.ids[0], on.user_cut[0]));
-    TEST_ASSERT(pflash_keep_count(on.served_text[0], "def parse(x)") == 60);
-    TEST_ASSERT(pflash_keep_count(on.served_text[0], "The manual says many things.") < 30);
-    // Without arrive: the switch off serves it raw, the switch on still
-    // compresses only the paste, on the same raw base.
-    const auto off_raw = run_keep_history_session({turn}, pflash_tool_session_tools(), nullptr,
-                                                  400, true, 16384, nullptr);
-    pflash_keep_assert_paste_off_raw(off_raw);
-    const auto on_raw = run_keep_history_session({turn}, pflash_tool_session_tools(), "1",
-                                                 400, true, 16384, nullptr);
-    TEST_ASSERT(on_raw.prepared[0].pflash_stats["admission"].value("decision", "") ==
-                "new_content");
-    TEST_ASSERT(on_raw.prepared[0].tokens == on.prepared[0].tokens);
-}
-
-// The served prompt minus the generation prompt equals the raw prompt
-// minus its own, token for token (nothing compressed).
-static bool pflash_keep_all_raw(const PflashKeepHistoryRun & run, size_t turn) {
-    return run.prepared[turn].tokens == run.ids[turn] && !run.prepared[turn].compressed;
-}
-
-// A first-turn tool request (no assistant turn yet): only the newest user
-// message is compressible. A big one is compressed as its own region on a
-// raw base (system prompt and tools verbatim); earlier turns stay raw; a
-// small one leaves nothing to compress.
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_first_turn_paste_with_tools) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    const json first = json::array({
-        {{"role", "system"}, {"content", "You are a coding agent."}},
-        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")),
-    });
-    {
-        const auto off = run_keep_history_session({first}, pflash_tool_session_tools(), nullptr,
-                                                  400);
-        const auto on = run_keep_history_session({first}, pflash_tool_session_tools(), "1",
-                                                 400);
-        pflash_keep_assert_paste_off_raw(off);
-        TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
-        TEST_ASSERT(on.prepared[0].compressed && on.compress_calls == 1);
-        const json & admission = on.prepared[0].pflash_stats["admission"];
-        TEST_ASSERT_MSG(admission.value("decision", "") == "new_content", admission.dump());
-        TEST_ASSERT(admission["keep_history"].value("newest", "") == "user");
-        TEST_ASSERT(admission["keep_history"].value("base", "") == "raw");
-        TEST_ASSERT(admission["region"].value("mode", "") == "new_content");
-        // System prompt and tool definitions: the raw prompt's own tokens.
-        TEST_ASSERT(pflash_keep_prefix_is(on.prepared[0].tokens, on.ids[0], on.user_cut[0]));
-        TEST_ASSERT(on.served_text[0].find("read_file") != std::string::npos);
-        TEST_ASSERT(pflash_keep_count(on.served_text[0], "The manual says many things.") < 30);
-        TEST_ASSERT(on.served_text[0].find("exit codes?") != std::string::npos);
-        TEST_ASSERT(on.keep["decisions"].value("new_content", 0) == 1);
-    }
-    // An earlier user message before the newest (no assistant turn): it is
-    // served verbatim, only the paste is compressed (switch off: all raw).
-    const json two_users = json::array({
-        {{"role", "system"}, {"content", "You are a coding agent."}},
-        pflash_keep_user(pflash_keep_filler("Earlier note line.\n", 30)),
-        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")),
-    });
-    const auto off2 = run_keep_history_session({two_users}, pflash_tool_session_tools(), nullptr,
-                                               400);
-    pflash_keep_assert_paste_off_raw(off2);
-    const auto on2 = run_keep_history_session({two_users}, pflash_tool_session_tools(), "1",
-                                              400);
-    TEST_ASSERT(on2.prepared[0].pflash_stats["admission"].value("decision", "") == "new_content");
-    TEST_ASSERT(pflash_keep_count(on2.served_text[0], "Earlier note line.") == 30);
-    TEST_ASSERT(pflash_keep_prefix_is(on2.prepared[0].tokens, on2.ids[0], on2.user_cut[0]));
-    TEST_ASSERT(pflash_keep_count(on2.served_text[0], "The manual says many things.") < 30);
-    // The same with a short newest message: nothing to compress (raw,
-    // keep_history), switch on or off.
-    const json small_newest = json::array({
-        {{"role", "system"}, {"content", "You are a coding agent."}},
-        pflash_keep_user(pflash_keep_filler("Earlier note line.\n", 30)),
-        pflash_keep_user("Fix the bug in parser.py."),
-    });
-    const auto off3 = run_keep_history_session({small_newest}, pflash_tool_session_tools(),
-                                               nullptr, 400);
-    pflash_keep_assert_paste_off_raw(off3);
-    const auto on3 = run_keep_history_session({small_newest}, pflash_tool_session_tools(),
-                                              "1", 400);
-    TEST_ASSERT_MSG(on3.prepared[0].error.empty(), on3.prepared[0].error);
-    TEST_ASSERT(pflash_keep_all_raw(on3, 0) && on3.compress_calls == 0);
-    TEST_ASSERT(on3.prepared[0].pflash_stats["admission"].value("decision", "") == "keep_history");
-    TEST_ASSERT(on3.prepared[0].pflash_stats["pflash_fallback"].value("reason", "") ==
-                "keep_history");
-}
-
-// A newest tool output of any size with no view: served raw, with the paste
-// switch off (before any other rule) or on (whatever the cache admission
-// would decide: whole-prompt compress, or arrive over the uncached tail).
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_tool_output_no_view_served_raw) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", "1"};   // never refused
-    const auto with_tool_output = [] (int history_lines) {
-        json messages = pflash_keep_agent_history(history_lines);
-        messages.erase(messages.size() - 1);
-        messages.push_back({{"role", "assistant"}, {"content", ""},
-            {"tool_calls", json::array({{{"id", "call-2"}, {"type", "function"},
-                {"function", {{"name", "read_file"},
-                              {"arguments", "{\"path\":\"manual.txt\"}"}}}}})}});
-        // Over the threshold on its own (30 lines, ~900 fixture tokens).
-        messages.push_back({{"role", "tool"}, {"tool_call_id", "call-2"},
-                            {"content", pflash_keep_filler(kPflashKeepPasteLine, 30)}});
-        return messages;
-    };
-    const json small_history = with_tool_output(6);
-    {
-        // Small uncached history: the admission would compress the whole
-        // prompt (history and tool output).
-        const auto off = run_keep_history_session({small_history}, pflash_tool_session_tools(),
-                                                  nullptr, 400);
-        pflash_keep_assert_paste_off_raw(off);
-        const auto on = run_keep_history_session({small_history}, pflash_tool_session_tools(),
-                                                 "1", 400);
-        TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
-        TEST_ASSERT(pflash_keep_all_raw(on, 0) && on.compress_calls == 0);
-        const json & admission = on.prepared[0].pflash_stats["admission"];
-        TEST_ASSERT_MSG(admission.value("decision", "") == "keep_history", admission.dump());
-        TEST_ASSERT(admission["keep_history"].value("newest", "") == "newest_not_user");
-        TEST_ASSERT(admission["keep_history"].value("decision_before", "") == "compress");
-        TEST_ASSERT(admission["keep_history"].value("new_droppable", -1) == 0);
-        TEST_ASSERT(on.prepared[0].pflash_stats["pflash_fallback"].value("reason", "") ==
-                    "keep_history");
-        TEST_ASSERT(on.counters["fallback_reasons"].value("keep_history", 0) == 1);
-        TEST_ASSERT(on.counters.value("fallback_refused", 0) == 0);
-    }
-    // Warm history (cached up to the tool output): arrive would compress the
-    // uncached tool output; it is served raw.
-    const json big_history = with_tool_output(60);
-    const auto off_warm = run_keep_history_session({big_history}, pflash_tool_session_tools(),
-                                                   nullptr, 400, /*warm_history=*/true);
-    pflash_keep_assert_paste_off_raw(off_warm);
-    const auto on_warm = run_keep_history_session({big_history}, pflash_tool_session_tools(),
-                                                  "1", 400, /*warm_history=*/true);
-    TEST_ASSERT(pflash_keep_all_raw(on_warm, 0) && on_warm.compress_calls == 0);
-    TEST_ASSERT(on_warm.prepared[0].pflash_stats["admission"].value("decision", "") ==
-                "keep_history");
-    TEST_ASSERT(on_warm.prepared[0].pflash_stats["admission"]["keep_history"]
-                    .value("decision_before", "") == "warm_cache");
-    // Uncached big history: served raw as well (keep_history).
-    const auto on_cold = run_keep_history_session({big_history}, pflash_tool_session_tools(),
-                                                  "1", 400);
-    TEST_ASSERT(pflash_keep_all_raw(on_cold, 0) && on_cold.compress_calls == 0);
-    TEST_ASSERT(on_cold.prepared[0].pflash_stats["admission"].value("decision", "") ==
-                "keep_history");
-    TEST_ASSERT(on_cold.prepared[0].pflash_stats["admission"]["keep_history"]
-                    .value("decision_before", "") == "compress");
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_chat_without_tools_unchanged) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    // A plain chat (no tools anywhere) with a paste after an answer: out of
-    // scope, served, traced and counted the same with the switch on or off.
-    const json turn = json::array({
-        {{"role", "system"}, {"content", "You are helpful."}},
-        pflash_keep_user("Hello there."),
-        {{"role", "assistant"}, {"content", "Hi."}},
-        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")),
-    });
-    const auto off = run_keep_history_session({turn}, json(), nullptr, 400);
-    const auto on = run_keep_history_session({turn}, json(), "1", 400);
-    TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
-    TEST_ASSERT(on.prepared[0].compressed && on.compress_calls == 1);
-    TEST_ASSERT(on.prepared[0].tokens == off.prepared[0].tokens);
-    json stats_on = on.prepared[0].pflash_stats;
-    json stats_off = off.prepared[0].pflash_stats;
-    stats_on.erase("compress_ms");
-    stats_off.erase("compress_ms");
-    TEST_ASSERT_MSG(stats_on == stats_off, stats_on.dump() + " vs " + stats_off.dump());
-    TEST_ASSERT(!stats_on["admission"].contains("keep_history"));
-    TEST_ASSERT(on.counters == off.counters);
-    TEST_ASSERT(on.keep["decisions"].empty());
-}
-
-// A raw prompt over the context in a tool session is not compressed as a
-// whole: with PFLASH_AGENT_PASTE=1 a big newest paste is compressed on its
-// own (the region view fits); anything else, and everything with the switch
-// off, gets the context-overflow error full prefill gets.
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_raw_over_max_ctx) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    const json paste = pflash_keep_with(pflash_keep_agent_history(6),
-        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
-    const auto probe = run_keep_history_session({paste}, pflash_tool_session_tools(), "1",
-                                                400);
-    const int max_ctx = (int) probe.ids[0].size() + 15;   // raw + 16 output > max_ctx
-    const auto off = run_keep_history_session({paste}, pflash_tool_session_tools(), nullptr,
-                                              400, false, max_ctx);
-    TEST_ASSERT(off.compress_calls == 0 && !off.prepared[0].compressed);
-    TEST_ASSERT_MSG(off.prepared[0].error_status == 400, off.prepared[0].error);
-    TEST_ASSERT(off.prepared[0].error.find("maximum context length") != std::string::npos);
-    const auto on = run_keep_history_session({paste}, pflash_tool_session_tools(), "1",
-                                             400, false, max_ctx);
-    TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
-    TEST_ASSERT(on.prepared[0].compressed);
-    const json & admission = on.prepared[0].pflash_stats["admission"];
-    TEST_ASSERT_MSG(admission.value("decision", "") == "new_content", admission.dump());
-    TEST_ASSERT(!admission.value("raw_fits", true));
-    TEST_ASSERT(pflash_keep_prefix_is(on.prepared[0].tokens, on.ids[0], on.user_cut[0]));
-    TEST_ASSERT(pflash_keep_count(on.served_text[0], "def parse(x)") == 6);
-    // A short newest message on a history over the context: nothing may be
-    // compressed, so the request gets the overflow error (as full prefill).
-    json history = pflash_keep_agent_history(60);
-    const json small = pflash_keep_with(history, pflash_keep_user("Why does it strip?"));
-    const auto probe2 = run_keep_history_session({small}, pflash_tool_session_tools(), "1",
-                                                 400);
-    const int max_ctx2 = (int) probe2.ids[0].size() + 15;
-    const auto off2 = run_keep_history_session({small}, pflash_tool_session_tools(), nullptr,
-                                               400, false, max_ctx2);
-    TEST_ASSERT(off2.compress_calls == 0 && !off2.prepared[0].compressed);
-    TEST_ASSERT_MSG(off2.prepared[0].error_status == 400, off2.prepared[0].error);
-    const auto on2 = run_keep_history_session({small}, pflash_tool_session_tools(), "1",
-                                              400, false, max_ctx2);
-    TEST_ASSERT(on2.compress_calls == 0 && !on2.prepared[0].compressed);
-    TEST_ASSERT_MSG(on2.prepared[0].error_status == 400, on2.prepared[0].error);
-    TEST_ASSERT(on2.prepared[0].error.find("maximum context length") != std::string::npos);
-    // The same with a newest tool output.
-    history.erase(history.size() - 1);
-    history.push_back({{"role", "assistant"}, {"content", ""},
-        {"tool_calls", json::array({{{"id", "call-2"}, {"type", "function"},
-            {"function", {{"name", "read_file"}, {"arguments", "{\"path\":\"a.txt\"}"}}}}})}});
-    history.push_back({{"role", "tool"}, {"tool_call_id", "call-2"},
-                       {"content", pflash_keep_filler(kPflashKeepPasteLine, 30)}});
-    const auto probe3 = run_keep_history_session({history}, pflash_tool_session_tools(), "1",
-                                                 400);
-    const int max_ctx3 = (int) probe3.ids[0].size() + 15;
-    const auto on3 = run_keep_history_session({history}, pflash_tool_session_tools(), "1",
-                                              400, false, max_ctx3);
-    TEST_ASSERT(on3.compress_calls == 0 && !on3.prepared[0].compressed);
-    TEST_ASSERT_MSG(on3.prepared[0].error_status == 400, on3.prepared[0].error);
-}
-
-// Nine turns of an agent session: a paste, follow-up questions (one needs a
-// passage the paste turn dropped: recall), a small and a large tool output
-// as the newest turn, a second paste. Every turn continues the view: the
-// history and every tool output stay verbatim, recall comes after the
-// cached view and ahead of the newest message, nothing is ever rebuilt
-// (rebuild ratio 1.1 with no minimum: the plain-chat rule would rebuild).
-// With the switch off the same nine turns are all served raw.
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_follow_up_turns) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    luce_test::ScopedEnvVar recall{"PFLASH_CHAT_RECALL", nullptr};       // default: on
-    luce_test::ScopedEnvVar ratio{"PFLASH_CHAT_REBUILD_RATIO", "1.1"};
-    luce_test::ScopedEnvVar min_tokens{"PFLASH_CHAT_REBUILD_MIN_TOKENS", nullptr};
-    const std::string sigint = "SIGINT is signal number two.";
-    const std::string sig_q = "Which signal number is SIGINT?";
-    const std::string paste1 = pflash_keep_filler(kPflashKeepPasteLine, 15) + sigint + "\n" +
-        pflash_keep_filler(kPflashKeepPasteLine, 15) + "What does the manual say about exit codes?";
-    const auto call = [] (const char * id, const char * path) {
-        return json{{"role", "assistant"}, {"content", ""},
-            {"tool_calls", json::array({{{"id", id}, {"type", "function"},
-                {"function", {{"name", "read_file"},
-                              {"arguments", std::string("{\"path\":\"") + path + "\"}"}}}}})}};
-    };
-    std::vector<json> turns;
-    json m = pflash_keep_with(pflash_keep_agent_history(6), pflash_keep_user(paste1));
-    turns.push_back(m);                                                         // 0 paste
-    m = pflash_keep_with(m, {{"role", "assistant"}, {"content", "Exit codes are listed."}});
-    turns.push_back(m = pflash_keep_with(m, pflash_keep_user(sig_q)));          // 1 recall
-    m = pflash_keep_with(m, call("call-2", "traps.txt"));
-    turns.push_back(m = pflash_keep_with(m, {{"role", "tool"}, {"tool_call_id", "call-2"},
-        {"content", pflash_keep_filler("trap handlers run on signals.\n", 30)}}));  // 2 big tool
-    m = pflash_keep_with(m, call("call-3", "ok.txt"));
-    turns.push_back(m = pflash_keep_with(m, {{"role", "tool"}, {"tool_call_id", "call-3"},
-        {"content", "ok"}}));                                                   // 3 small tool
-    m = pflash_keep_with(m, {{"role", "assistant"}, {"content", "Traps are handled."}});
-    turns.push_back(m = pflash_keep_with(m, pflash_keep_user("And what about signals?")));  // 4
-    m = pflash_keep_with(m, {{"role", "assistant"}, {"content", "Signals are covered."}});
-    turns.push_back(m = pflash_keep_with(m, pflash_keep_user(
-        pflash_keep_filler("Another page of the manual.\n", 30) + "Which page covers traps?")));  // 5
-    m = pflash_keep_with(m, {{"role", "assistant"}, {"content", "Page two."}});
-    turns.push_back(m = pflash_keep_with(m, pflash_keep_user("Thanks, and the exit codes again?")));  // 6
-    m = pflash_keep_with(m, call("call-4", "more.txt"));
-    turns.push_back(m = pflash_keep_with(m, {{"role", "tool"}, {"tool_call_id", "call-4"},
-        {"content", pflash_keep_filler("more trap notes here.\n", 30)}}));    // 7 big tool
-    m = pflash_keep_with(m, {{"role", "assistant"}, {"content", "Done reading."}});
-    turns.push_back(m = pflash_keep_with(m, pflash_keep_user("Summarize the traps.")));      // 8
-    const auto run = run_keep_history_session(turns, pflash_tool_session_tools(), "1",
-                                              400, false, 16384, "1",
-                                              {{sig_q, sigint}});
-    const auto mode = [&] (size_t turn) {
-        return run.prepared[turn].pflash_stats["view"].value("mode", "");
-    };
-    for (size_t turn = 0; turn < turns.size(); ++turn) {
-        const auto & prepared = run.prepared[turn];
-        TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
-        TEST_ASSERT_MSG(prepared.compressed, std::to_string(turn));
-        const std::string m_name = mode(turn);
-        TEST_ASSERT_MSG(m_name == "new_content" || m_name == "continue",
-                        std::to_string(turn) + " " + prepared.pflash_stats.dump());
-        TEST_ASSERT(!prepared.pflash_stats.contains("pflash_fallback"));
-        // The history verbatim, every turn: the raw prompt's own tokens up
-        // to the paste turn, and all six tool-output lines.
-        TEST_ASSERT_MSG(pflash_keep_prefix_is(prepared.tokens, run.ids[0], run.user_cut[0]),
-                        std::to_string(turn));
-        TEST_ASSERT(pflash_keep_count(run.served_text[turn], "def parse(x)") == 6);
-        TEST_ASSERT(prepared.snapshot_cut > 0 &&
-                    prepared.snapshot_cut < (int) prepared.tokens.size());
-        if (turn > 0) {
-            // Each turn continues the previous served prompt.
-            const int reused = prepared.pflash_stats["view"].value("reused_tokens", -1);
-            TEST_ASSERT_MSG(reused == run.prepared[turn - 1].snapshot_cut,
-                            std::to_string(turn) + " " + prepared.pflash_stats["view"].dump());
-            TEST_ASSERT(std::equal(run.prepared[turn - 1].tokens.begin(),
-                                   run.prepared[turn - 1].tokens.begin() + reused,
-                                   prepared.tokens.begin()));
-        }
-    }
-    // Turn 0: the paste on a raw base, the SIGINT line dropped.
-    TEST_ASSERT(mode(0) == "new_content");
-    TEST_ASSERT(run.served_text[0].find(sigint) == std::string::npos);
-    // Turn 1: recall brings the line back, in an excerpt block after the
-    // cached view and ahead of the newest message's text; no history or
-    // newest-turn text inside the block.
-    const json & view1 = run.prepared[1].pflash_stats["view"];
-    TEST_ASSERT_MSG(view1.value("recalled_tokens", 0) > 0, view1.dump());
-    TEST_ASSERT(view1.value("keep_history", false));
-    const std::string & s1 = run.served_text[1];
-    const std::string & cached1 = run.cut_text[0];
-    TEST_ASSERT(!cached1.empty());
-    const size_t block = s1.find("[Earlier in this conversation]");
-    const size_t block_end = s1.find("[End of earlier excerpts]");
-    TEST_ASSERT_MSG(block != std::string::npos && block_end != std::string::npos, s1.substr(cached1.size()));
-    TEST_ASSERT(s1.compare(0, cached1.size(), cached1) == 0 && block >= cached1.size());
-    TEST_ASSERT(block > s1.rfind("Exit codes are listed."));
-    TEST_ASSERT(block_end < s1.rfind(sig_q));
-    const std::string excerpt = s1.substr(block, block_end - block);
-    TEST_ASSERT(excerpt.find(sigint) != std::string::npos);
-    TEST_ASSERT(excerpt.find(sig_q) == std::string::npos);
-    TEST_ASSERT(excerpt.find("def parse") == std::string::npos);
-    TEST_ASSERT(excerpt.find("Exit codes are listed.") == std::string::npos);
-    TEST_ASSERT(pflash_keep_count(s1, sig_q) == 1);
-    // Turns 2 and 3: tool outputs (large, small) appended verbatim from the
-    // view, no drafter pass.
-    TEST_ASSERT(run.calls_after[2] == run.calls_after[1]);
-    TEST_ASSERT(run.calls_after[3] == run.calls_after[2]);
-    TEST_ASSERT(pflash_keep_count(run.served_text[2], "trap handlers run on signals.") == 30);
-    TEST_ASSERT(run.prepared[2].pflash_stats["admission"]["keep_history"].value("newest", "") ==
-                "newest_not_user");
-    TEST_ASSERT(run.prepared[2].pflash_stats["admission"]["keep_history"].value("decision", "") ==
-                "view");
-    // Over the old rebuild rule but not rebuilt.
-    const json & view2 = run.prepared[2].pflash_stats["view"];
-    TEST_ASSERT(view2.value("keep_history", false));
-    // Turn 5: the second paste compressed on its own after the view.
-    TEST_ASSERT(mode(5) == "new_content");
-    TEST_ASSERT(pflash_keep_count(run.served_text[5], "Another page of the manual.") < 30);
-    // Turn 7: another large tool output, verbatim; turn 8 keeps everything.
-    TEST_ASSERT(run.calls_after[7] == run.calls_after[6]);
-    for (size_t turn = 2; turn < turns.size(); ++turn) {
-        TEST_ASSERT(pflash_keep_count(run.served_text[turn], "trap handlers run on signals.") == 30);
-    }
-    TEST_ASSERT(pflash_keep_count(run.served_text[8], "more trap notes here.") == 30);
-    TEST_ASSERT(pflash_keep_count(run.served_text[8], sigint) == 1);   // recalled once
-    TEST_ASSERT(run.keep["decisions"].value("new_content", 0) == 2);
-    TEST_ASSERT(run.keep["decisions"].value("view", 0) == 7);
-    TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
-    // PFLASH_AGENT_PASTE off: both pastes, both big tool outputs and every
-    // follow-up served raw, without a drafter pass.
-    const auto off = run_keep_history_session(turns, pflash_tool_session_tools(), nullptr,
-                                              400, false, 16384, "1",
-                                              {{sig_q, sigint}});
-    pflash_keep_assert_paste_off_raw(off);
-    TEST_ASSERT(pflash_keep_count(off.served_text[0], "The manual says many things.") == 30);
-    TEST_ASSERT(pflash_keep_count(off.served_text[5], "Another page of the manual.") == 30);
-    TEST_ASSERT(pflash_keep_count(off.served_text[8], "trap handlers run on signals.") == 30);
-    TEST_ASSERT(pflash_keep_count(off.served_text[8], "more trap notes here.") == 30);
-    TEST_ASSERT(off.served_text[8].find("[Earlier in this conversation]") == std::string::npos);
-    TEST_ASSERT(off.prepared[2].pflash_stats["admission"]["keep_history"].value("newest", "") ==
-                "newest_not_user");
-    TEST_ASSERT(off.prepared[5].pflash_stats["admission"]["keep_history"].value("newest", "") ==
-                "user");
-}
-
-// A keep view whose continuation no longer fits the context is never
-// rebuilt: the raw prompt is served, and here it does not fit either, so
-// the request gets the overflow error full prefill gets.
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_view_over_context_not_rebuilt) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    luce_test::ScopedEnvVar recall{"PFLASH_CHAT_RECALL", "0"};
-    const json t1 = pflash_keep_with(pflash_keep_agent_history(6),
-        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
-    json t2 = pflash_keep_with(t1, {{"role", "assistant"}, {"content", ""},
-        {"tool_calls", json::array({{{"id", "call-2"}, {"type", "function"},
-            {"function", {{"name", "read_file"}, {"arguments", "{\"path\":\"a.txt\"}"}}}}})}});
-    t2 = pflash_keep_with(t2, {{"role", "tool"}, {"tool_call_id", "call-2"},
-        {"content", pflash_keep_filler("trap handlers run on signals.\n", 30)}});
-    const auto probe = run_keep_history_session({t1, t2}, pflash_tool_session_tools(), "1",
-                                                400);
-    TEST_ASSERT(probe.prepared[1].compressed);
-    // The context holds turn 1's view but not turn 2's continuation.
-    const int max_ctx = (int) probe.prepared[1].tokens.size() + 15;
-    // Switch off: never compressed; each raw prompt is served, or gets the
-    // overflow error when it does not fit.
-    const auto off = run_keep_history_session({t1, t2}, pflash_tool_session_tools(), nullptr,
-                                              400, false, max_ctx);
-    TEST_ASSERT(off.compress_calls == 0);
-    for (size_t turn = 0; turn < 2; ++turn) {
-        TEST_ASSERT(!off.prepared[turn].compressed);
-        if ((int) off.ids[turn].size() + 16 > max_ctx) {
-            TEST_ASSERT_MSG(off.prepared[turn].error_status == 400, off.prepared[turn].error);
-        } else {
-            TEST_ASSERT_MSG(off.prepared[turn].error.empty(), off.prepared[turn].error);
-            TEST_ASSERT(off.prepared[turn].tokens == off.ids[turn]);
-        }
-    }
-    const auto on = run_keep_history_session({t1, t2}, pflash_tool_session_tools(), "1",
-                                             400, false, max_ctx);
-    TEST_ASSERT(on.prepared[0].compressed);
-    TEST_ASSERT(!on.prepared[1].compressed);
-    TEST_ASSERT_MSG(on.prepared[1].error_status == 400, on.prepared[1].error);
-}
-
-// A plain chat (no tools) over several turns -- a paste, a follow-up that
-// recalls, a second paste -- is served, traced and counted the same with
-// the switch on or off.
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_plain_chat_turns_unchanged) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    luce_test::ScopedEnvVar recall{"PFLASH_CHAT_RECALL", nullptr};
-    const std::string sigint = "SIGINT is signal number two.";
-    const std::string sig_q = "Which signal number is SIGINT?";
-    json m = json::array({
-        {{"role", "system"}, {"content", "You are helpful."}},
-        pflash_keep_user(pflash_keep_filler(kPflashKeepPasteLine, 15) + sigint + "\n" +
-            pflash_keep_filler(kPflashKeepPasteLine, 15) +
-            "What does the manual say about exit codes?"),
-    });
-    std::vector<json> turns{m};
-    m = pflash_keep_with(m, {{"role", "assistant"}, {"content", "Exit codes are listed."}});
-    turns.push_back(m = pflash_keep_with(m, pflash_keep_user(sig_q)));
-    m = pflash_keep_with(m, {{"role", "assistant"}, {"content", "Two."}});
-    turns.push_back(m = pflash_keep_with(m, pflash_keep_user(
-        pflash_keep_filler("Another page of the manual.\n", 30) + "Which page covers traps?")));
-    {
-        const auto off = run_keep_history_session(turns, json(), nullptr, 400, false,
-                                                  16384, "1", {{sig_q, sigint}});
-        const auto on = run_keep_history_session(turns, json(), "1", 400, false,
-                                                 16384, "1", {{sig_q, sigint}});
-        TEST_ASSERT(off.prepared[1].pflash_stats["view"].value("recalled_tokens", 0) > 0);
-        for (size_t turn = 0; turn < turns.size(); ++turn) {
-            TEST_ASSERT_MSG(on.prepared[turn].error.empty(), on.prepared[turn].error);
-            TEST_ASSERT(on.prepared[turn].tokens == off.prepared[turn].tokens);
-            TEST_ASSERT(on.prepared[turn].compressed == off.prepared[turn].compressed);
-            TEST_ASSERT(on.prepared[turn].snapshot_cut == off.prepared[turn].snapshot_cut);
-            json a = on.prepared[turn].pflash_stats;
-            json b = off.prepared[turn].pflash_stats;
-            a.erase("compress_ms");
-            b.erase("compress_ms");
-            TEST_ASSERT_MSG(a == b, a.dump() + " vs " + b.dump());
-        }
-        TEST_ASSERT(on.calls_after == off.calls_after);
-        TEST_ASSERT(on.counters == off.counters);
-        TEST_ASSERT(on.keep["decisions"].empty());
-        TEST_ASSERT(on.view_records.size() == off.view_records.size());
-        for (size_t i = 0; i < on.view_records.size(); ++i) {
-            json a = on.view_records[i];
-            json b = off.view_records[i];
-            a.erase("request_id");
-            b.erase("request_id");
-            a["pflash"].erase("compress_ms");
-            b["pflash"].erase("compress_ms");
-            TEST_ASSERT(a == b);
-        }
-    }
-}
-
-// A tool session whose turns cannot be located (no messages array): no
-// history can be told apart, so nothing is compressed, switch on or off.
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_unparsed_tool_session_raw) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
-    luce_test::ScopedEnvVar admission_env{"PFLASH_ADMISSION", "cache"};
-    const json messages = pflash_keep_with(pflash_keep_agent_history(60),
-        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
-    ToolMemory tool_memory;
-    const std::string rendered = codec_text("qwen3.5",
-        normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory),
-        /*add_generation_prompt=*/true, /*enable_thinking=*/true,
-        pflash_tool_session_tools().dump());
-    // A Responses input string: one user message, rendered by the template.
-    const std::string prompt = codec_text("qwen3.5", {{"user", rendered, ""}},
-        /*add_generation_prompt=*/true, /*enable_thinking=*/true, pflash_tool_session_tools().dump());
-    const std::string path = write_pflash_bpe_tokenizer_fixture(
-        {"user", "assistant", "system", "\n", "tool"}, prompt);
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    const auto ids = tokenizer.encode(prompt);
-    const auto serve = [&] (const char * flag, int & calls) {
-        luce_test::ScopedEnvVar paste{"PFLASH_AGENT_PASTE", flag};
-        auto backend_owner = std::make_unique<MockPflashSpanBackend>();
-        MockPflashSpanBackend & backend = *backend_owner;
-        LuceEngine engine(std::move(backend_owner));
-        ServerConfig config;
-        config.pflash = true;
-        config.pflash_threshold = 400;
-        config.pflash_keep_ratio = 0.3f;
-        config.max_ctx = 16384;
-        config.prefix_cache_cap = 0;
-        config.prefill_cache_cap = 0;
-        HttpServer server(engine, tokenizer, config);
-        server.set_drafter_tokenizer(&tokenizer);
-        ParsedRequest request;
-        request.format = ApiFormat::OPENAI_CHAT;
-        request.messages = rendered;   // raw text: no messages array
-        request.tools = pflash_tool_session_tools();
-        request.prompt_tokens = ids;
-        request.max_output = 16;
-        auto prepared = HttpServerTestAccess::prepare_prompt(server, request);
-        calls = backend.compress_calls;
-        return prepared;
-    };
-    int calls_on = 0;
-    const auto on = serve("1", calls_on);
-    TEST_ASSERT_MSG(on.error.empty(), on.error);
-    TEST_ASSERT(!on.compressed && on.tokens == ids && calls_on == 0);
-    const json & admission = on.pflash_stats["admission"];
-    TEST_ASSERT_MSG(admission.value("decision", "") == "keep_history", on.pflash_stats.dump());
-    TEST_ASSERT(admission["keep_history"].value("newest", "") == "unparsed");
-    TEST_ASSERT(on.pflash_stats["pflash_fallback"].value("reason", "") == "keep_history");
-    int calls_off = 0;
-    const auto off = serve(nullptr, calls_off);
-    TEST_ASSERT_MSG(off.error.empty(), off.error);
-    TEST_ASSERT(!off.compressed && off.tokens == ids && calls_off == 0);
-    TEST_ASSERT(off.pflash_stats["admission"].value("decision", "") == "keep_history");
-    TEST_ASSERT(off.pflash_stats["admission"]["keep_history"].value("newest", "") == "unparsed");
-    TEST_ASSERT(!off.pflash_stats["admission"]["keep_history"].value("paste", true));
-    unlink(path.c_str());
-}
-
-// The prefix-cache snapshot of a tool session's PFlash view (a paste turn,
-// PFLASH_AGENT_PASTE=1), with the system/tools head already restored: the
+// The prefix-cache snapshot of a tool session's PFlash view (a paste turn), with the system/tools head already restored: the
 // view asks for its cut (the start of its generation prompt), a tool request
 // drops that forced cut, and #835's rule saves the end of the prompt's last
 // message instead -- one token past the cut, the generation prompt's role
@@ -20753,42 +18799,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_tool_view_snapshot_at_last_message_end)
         server, ids, pflash_tool_session_tools(), cut);
     TEST_ASSERT_MSG(snap == cut + 1 && snap == bounds.back(),
                     std::to_string(snap) + " vs cut " + std::to_string(cut));
-    unlink(path.c_str());
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_raw_base_target_fails_closed) {
-    const json messages = pflash_keep_with(pflash_keep_agent_history(2),
-        pflash_keep_user("What now?"));
-    ToolMemory tool_memory;
-    const std::string rendered = codec_text("qwen3.5",
-        normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory),
-        /*add_generation_prompt=*/true, /*enable_thinking=*/true,
-        pflash_tool_session_tools().dump());
-    const std::string path = write_pflash_bpe_tokenizer_fixture(
-        {"user", "assistant", "system", "\n", "tool"}, rendered);
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    ChatMarkers markers;
-    TEST_ASSERT(resolve_chat_markers(tokenizer, markers));
-    const auto ids = tokenizer.encode(rendered);
-    const auto parsed = http_detail::pflash_chat_query_turn(tokenizer, markers, tokenizer, ids);
-    int newest = -1;
-    TEST_ASSERT(http_detail::pflash_keep_history_scope(parsed.turns, newest) == nullptr);
-    const int cut = http_detail::pflash_raw_base_target(
-        tokenizer, markers, ids, tokenizer, ids, parsed.turns, newest);
-    TEST_ASSERT(cut == (int) tokenizer.encode(rendered.substr(0, rendered.rfind("<|im_start|>user"))).size());
-    // Drafter tokens that do not decode to the same history: -1.
-    auto other = ids;
-    other[3] = other[4];
-    TEST_ASSERT(http_detail::pflash_raw_base_target(
-        tokenizer, markers, ids, tokenizer, other, parsed.turns, newest) == -1);
-    // A turn list that does not match the target parse: -1.
-    auto fewer = parsed.turns;
-    fewer.erase(fewer.begin());
-    TEST_ASSERT(http_detail::pflash_raw_base_target(
-        tokenizer, markers, ids, tokenizer, ids, fewer, (int) fewer.size() - 1) == -1);
-    TEST_ASSERT(http_detail::pflash_raw_base_target(
-        tokenizer, markers, ids, tokenizer, ids, parsed.turns, 99) == -1);
     unlink(path.c_str());
 }
 
@@ -20897,7 +18907,6 @@ struct UnifiedOptions {
     const char * recall_gate = "off";           // PFLASH_RECALL_GATE (nullptr: unset, the 0.075 default)
     const char * trace_units = nullptr;         // PFLASH_RECALL_TRACE_UNITS
     bool keep_scored_only = false;              // the drafter selection keeps only candidates scored above 1
-    bool chat_view_only = false;                // the chat view serves every turn (its behaviour, as a baseline)
     std::string disk_dir;                       // non-empty: the disk session cache in this directory
     bool disk_seed_history = false;             // first, a server restart: turn 0 up to its newest user message on disk
     DiskPrefixCacheMode disk_mode = DiskPrefixCacheMode::Full;   // the disk scope of the requests
@@ -20910,7 +18919,7 @@ struct UnifiedOptions {
     std::function<void(size_t)> before_turn;    // runs before each turn (after a restart)
 };
 
-// One server with the unified view (off when ``options.chat_view_only``), the turns in order. By default one fixture tokenizer is target and drafter, so
+// One server with the unified view, the turns in order. By default one fixture tokenizer is target and drafter, so
 // every token boundary is shared; ``distinct_drafter`` gives the drafter its own merges. ``region_tools`` nullptr
 // lists no tool (PFLASH_REGION_TOOLS set empty; unset would be the "*" default).
 static UnifiedRun run_unified_session(const std::vector<json> & turns, const json & tools, const char * region_tools,
@@ -20922,7 +18931,6 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     luce_test::ScopedEnvVar recall_gate{"PFLASH_RECALL_GATE", options.recall_gate};
     luce_test::ScopedEnvVar trace_units{"PFLASH_RECALL_TRACE_UNITS", options.trace_units};
     luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", options.select_mode};
-    luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "cache"};
     luce_test::ScopedEnvVar scorer{"PFLASH_SELECT_SCORER", options.scorer};
     luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", options.fail_closed};
     char trace_path[] = "/tmp/pflash_unified_view_XXXXXX";
@@ -21026,7 +19034,6 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
         auto start = [&] {
             auto server = std::make_unique<HttpServer>(engine, tokenizer, config);
             server->set_drafter_tokenizer(&drafter);
-            if (options.chat_view_only) HttpServerTestAccess::chat_view_only(*server);
             return server;
         };
         auto owned = start();
@@ -21193,9 +19200,101 @@ TEST_CASE(ServerUnitFixture, test_unified_raw_fallback_drops_the_conversations_v
     TEST_ASSERT(!run.prepared[1].compressed && run.prepared[1].tokens == run.ids[1]);
     const json & fallback = run.prepared[1].pflash_stats["pflash_fallback"];
     TEST_ASSERT_MSG(fallback.value("unified_lineages_forgotten", 0) == 1, run.prepared[1].pflash_stats.dump());
-    // Turn 3 does not continue turn 1's view (its history was served raw): the chat view takes it.
-    TEST_ASSERT_MSG(run.prepared[2].unified_handback == "uncached", run.prepared[2].pflash_stats.dump());
-    TEST_ASSERT(run.unified["counts"].value("serve.region", 0) == 1);
+    // Turn 3 does not continue turn 1's view (its history was served raw): a new view pages the history's paste.
+    TEST_ASSERT_MSG(run.prepared[2].compressed &&
+                    run.prepared[2].unified_view, run.prepared[2].pflash_stats.dump());
+    TEST_ASSERT(run.unified["counts"].value("serve.region", 0) == 2);
+}
+
+// The error HttpServer's constructor throws with --pflash on (empty: it started), under the caller's environment.
+static std::string pflash_startup_error(bool remote_drafter, bool candidate_scores = true) {
+    Tokenizer tokenizer;
+    auto backend = std::make_unique<MockBackend>();
+    backend->candidate_scores = candidate_scores;
+    LuceEngine engine(std::move(backend));
+    ServerConfig config;
+    config.pflash = true;
+    config.pflash_remote_drafter = remote_drafter;
+    try {
+        HttpServer server(engine, tokenizer, config);
+    } catch (const std::runtime_error & e) {
+        return e.what();
+    }
+    return "";
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_string_input_is_one_user_message) {
+    // A string input (the Responses API's ``input`` without instructions) is rendered as one user message: the
+    // view pages it exactly as it pages that message sent in a messages array.
+    const std::string content = unified_doc(80, {{7, "kiwi"}, {60, "mango"}}) + "Which line mentions KIWI?";
+    const auto text = run_unified_session({json(content)}, nullptr, nullptr, 64, unified_fruit_score);
+    const auto array = run_unified_session({json::array({{{"role", "user"}, {"content", content}}})}, nullptr,
+                                           nullptr, 64, unified_fruit_score);
+    TEST_ASSERT_MSG(text.prepared[0].compressed, text.prepared[0].pflash_stats.dump());
+    TEST_ASSERT(text.served_text[0] == array.served_text[0]);
+    TEST_ASSERT(text.served_text[0].find("Line 7: plain filler text here kiwi") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_latest_user_parser_pages_and_continues) {
+    // The benchmark's latest_user query parser does not read the chat markers itself; the view still does, so the
+    // paste is paged and the follow-up continues the view as under the default parser.
+    luce_test::ScopedEnvVar parser{"PFLASH_SELECT_QUERY_PARSER", "latest_user"};
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score);
+    for (size_t turn = 0; turn < 2; ++turn) {
+        TEST_ASSERT_MSG(run.prepared[turn].compressed && run.prepared[turn].unified_view,
+                        run.prepared[turn].pflash_stats.dump());
+    }
+    TEST_ASSERT_MSG(run.prepared[0].pflash_stats["unified"].value("decision", "") == "region",
+                    run.prepared[0].pflash_stats.dump());
+    TEST_ASSERT(run.served_text[0].find("Line 7: plain filler text here kiwi") != std::string::npos);
+    // The follow-up reuses turn 1's served prompt token for token and recalls the mango line.
+    const int vg1 = run.prepared[0].snapshot_cut;
+    TEST_ASSERT(vg1 > 0);
+    TEST_ASSERT(std::equal(run.prepared[0].tokens.begin(), run.prepared[0].tokens.begin() + vg1,
+                           run.prepared[1].tokens.begin()));
+    TEST_ASSERT_MSG(run.prepared[1].pflash_stats["unified"].value("decision", "") == "recall",
+                    run.prepared[1].pflash_stats.dump());
+
+    // An agent turn: the tool output after the user's question is context, not a kept suffix, so it is paged.
+    const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read_file"}}}}});
+    const json agent = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", "Read the file. Which line mentions KIWI?"}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+            unified_tool_call("call_1", "read_file", {{"path", "a.md"}})})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", unified_doc(80, {{9, "kiwi"}}, "A")}},
+    });
+    const auto tool_run = run_unified_session({agent}, tools, "read_file", 64, unified_fruit_score);
+    const auto & tool_prepared = tool_run.prepared[0];
+    TEST_ASSERT_MSG(tool_prepared.compressed && tool_prepared.unified_view, tool_prepared.pflash_stats.dump());
+    const json & admission = tool_prepared.pflash_stats["unified"]["admission"];
+    TEST_ASSERT_MSG(admission.size() == 1 && admission[0].value("kind", "") == "tool_output" &&
+                    admission[0].value("decision", "") == "region", admission.dump());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_retired_settings_are_named_at_startup) {
+    // The former chat view's settings start the server and are named as no longer read; the spread only records.
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chat_view{"PFLASH_CHAT_VIEW", "1"};
+    luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "cache"};
+    luce_test::ScopedEnvVar arrive{"PFLASH_ARRIVE", "1"};
+    luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", "0.11"};
+    StderrCapture capture;
+    const std::string error = pflash_startup_error(false);
+    const std::string log = capture.str();
+    TEST_ASSERT_MSG(error.empty(), error);
+    for (const char * name : {"PFLASH_CHAT_VIEW", "PFLASH_ADMISSION", "PFLASH_ARRIVE"}) {
+        TEST_ASSERT_MSG(log.find(std::string(name) + " is no longer read") != std::string::npos, log);
+    }
+    TEST_ASSERT_MSG(log.find("PFLASH_FALLBACK_SPREAD only records") != std::string::npos, log);
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_needs_candidate_scores) {
@@ -21221,15 +19320,13 @@ TEST_CASE(ServerUnitFixture, test_unified_needs_candidate_scores) {
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
     });
-    // A scorer that gives no candidate scores: the unified view is off and the chat view serves the request.
-    UnifiedOptions legacy;
-    legacy.scorer = "legacy";
-    const auto handed = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
-                                            65536, legacy);
-    TEST_ASSERT_MSG(handed.prepared[0].unified_handback.empty() &&
-                    handed.prepared[0].pflash_stats.find("unified") == handed.prepared[0].pflash_stats.end(),
-                    handed.prepared[0].pflash_stats.dump());
-    TEST_ASSERT(handed.unified.is_null());
+    // A scorer that gives no candidate scores cannot drive the view: startup refuses it.
+    {
+        luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+        luce_test::ScopedEnvVar scorer{"PFLASH_SELECT_SCORER", "legacy"};
+        const std::string error = pflash_startup_error(false);
+        TEST_ASSERT_MSG(error.find("--pflash on") != std::string::npos, error);
+    }
     // A failed drafter pass: the newest content is served verbatim, or with PFLASH_FAIL_CLOSED=1 refused.
     UnifiedOptions failing;
     failing.drafter_fails = true;
@@ -21264,33 +19361,9 @@ TEST_CASE(ServerUnitFixture, test_unified_repeat_with_a_new_pin_serves_it) {
     TEST_ASSERT(run.unified["counts"].value("repeat", 0) == 0);
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_repeat_of_an_adopted_prompt_with_a_new_pin_serves_it) {
-    // The chat view's prompt the unified view adopted keeps no record of the lines it kept: a retry that pins
-    // (pflash_required) text is compressed again, not answered with that prompt.
-    std::string filler;
-    for (int i = 0; i < 300; ++i) filler += "The grass is green. ";
-    const std::string pear = "The pear number is 3.";
-    const std::string doc = "Below is a long passage.\n\n" + filler + pear + " " + filler + "The kiwi number is 7. " +
-                            filler + "\n\nQuestion: what is the kiwi number?\n";
-    const json turn = json::array({
-        {{"role", "system"}, {"content", "You are helpful."}},
-        {{"role", "user"}, {"content", doc + "Which sentence mentions KIWI?"}},
-    });
-    UnifiedOptions options;
-    options.keep_scored_only = true;
-    options.required = {{}, {pear}};
-    const auto run = run_unified_session({turn, turn}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
-                                         65536, options);
-    TEST_ASSERT_MSG(run.prepared[0].unified_handback == "uncached" && run.prepared[0].compressed,
-                    run.prepared[0].pflash_stats.dump());
-    TEST_ASSERT(run.served_text[0].find(pear) == std::string::npos);
-    TEST_ASSERT_MSG(run.served_text[1].find(pear) != std::string::npos, run.prepared[1].pflash_stats.dump());
-    TEST_ASSERT(run.unified["counts"].value("repeat", 0) == 0);
-}
-
 TEST_CASE(ServerUnitFixture, test_unified_disk_view_that_does_not_match_the_prompt_is_dropped) {
     // The restarted server finds turn 1's view on disk, but the file's region digest no longer matches the
-    // conversation's bytes: the view is deleted and the follow-up goes to the chat view as a cold history.
+    // conversation's bytes: the view is deleted and the follow-up starts a view of its own over the cold history.
     const json turn1 = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}}) + "Which line mentions KIWI?"}},
@@ -21323,7 +19396,9 @@ TEST_CASE(ServerUnitFixture, test_unified_disk_view_that_does_not_match_the_prom
                                          65536, disk);
     TEST_ASSERT(edited == 1);
     TEST_ASSERT(run.prepared[0].compressed && run.prepared[0].unified_view);
-    TEST_ASSERT_MSG(run.prepared[1].unified_handback == "uncached", run.prepared[1].pflash_stats.dump());
+    TEST_ASSERT_MSG(run.prepared[1].compressed &&
+                    run.prepared[1].pflash_stats["unified"].value("decision", "") == "region",
+                    run.prepared[1].pflash_stats.dump());
     TEST_ASSERT(run.unified["counts"].value("disk_view_rejected", 0) == 1);
     TEST_ASSERT(run.unified["counts"].value("disk_view", 0) == 0);
     rm_rf(dir);
@@ -21347,8 +19422,8 @@ TEST_CASE(ServerUnitFixture, test_unified_tool_output_needs_listing) {
         {{"role", "tool"}, {"tool_call_id", "call_3"}, {"content", unified_doc(1, {}, "C")}},
     });
     // The fixture tokenizer has one token per character, so the history before the tool results (the question and
-    // three calls, ~350 tokens) would already be a 64-token threshold's worth of uncached history and the request
-    // would go to the chat view; 600 keeps it a fresh agent turn whose 80-line outputs are still large.
+    // three calls, ~350 tokens) would be a 64-token threshold's worth on its own; 600 keeps the question a short
+    // message while the 80-line outputs are still large.
     const int threshold = 600;
     const auto listed = run_unified_session({turn}, tools, "read_file", threshold, unified_fruit_score);
     const json & admission = listed.prepared[0].pflash_stats["unified"]["admission"];
@@ -21447,10 +19522,10 @@ TEST_CASE(ServerUnitFixture, test_unified_recall_user_question_only) {
     TEST_ASSERT(s3.find("short note") < block);
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_cold_history_hands_back_to_the_chat_view) {
-    // A cold transcript: a large paste in turn 1 and a large listed tool output in turn 2, the newest turn a short
-    // question. The unified view never pages anything before the newest turn and would prefill that history raw, so
-    // it hands the request to the chat view, which serves a tool session raw (keep_history): no drafter pass.
+TEST_CASE(ServerUnitFixture, test_unified_tool_session_cold_history_stays_verbatim) {
+    // A cold agent transcript: a large paste in turn 1 and a large listed tool output in turn 2, the newest turn a
+    // short question. An agent session's history is never paged: with nothing new to page the prompt is served raw,
+    // with no drafter pass.
     const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read_file"}}}}});
     const json turn = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
@@ -21462,21 +19537,31 @@ TEST_CASE(ServerUnitFixture, test_unified_cold_history_hands_back_to_the_chat_vi
         {{"role", "user"}, {"content", "Which line mentions KIWI?"}},
     });
     const auto run = run_unified_session({turn}, tools, "read_file", 64, unified_fruit_score);
-    TEST_ASSERT_MSG(run.prepared[0].unified_handback == "uncached", run.prepared[0].pflash_stats.dump());
-    TEST_ASSERT(run.prepared[0].pflash_stats.find("unified") == run.prepared[0].pflash_stats.end());
+    const json & stats = run.prepared[0].pflash_stats;
+    TEST_ASSERT_MSG(stats["unified"].value("decision", "") == "raw" &&
+                    stats["unified"].value("reason", "") == "no_region", stats.dump());
+    TEST_ASSERT(stats["unified"]["admission"].size() == 1);   // the newest message alone
     TEST_ASSERT(!run.prepared[0].compressed);
     TEST_ASSERT(run.prepared[0].tokens == run.ids[0]);
     TEST_ASSERT(run.calls_after[0] == 0);
-    TEST_ASSERT(run.unified["counts"].value("handback.uncached", 0) == 1);
-    TEST_ASSERT_MSG(run.view_records.size() == 1 &&
-                    run.view_records[0]["pflash"]["unified"].value("decision", "") == "handback" &&
-                    run.view_records[0]["pflash"]["unified"].value("reason", "") == "uncached",
-                    run.view_records.empty() ? "no view record" : run.view_records[0].dump());
+
+    // The same transcript with a new large tool output as its newest turn: that output alone is paged.
+    json fresh = turn;
+    fresh.back() = {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+        unified_tool_call("call_2", "read_file", {{"path", "more.md"}})})}};
+    fresh.push_back({{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", unified_doc(80, {{9, "kiwi"}}, "R")}});
+    const auto paged = run_unified_session({fresh}, tools, "read_file", 64, unified_fruit_score);
+    const json & admission = paged.prepared[0].pflash_stats["unified"]["admission"];
+    TEST_ASSERT_MSG(paged.prepared[0].compressed && admission.size() == 1 &&
+                    admission[0].value("kind", "") == "tool_output" && admission[0].value("decision", "") == "region",
+                    paged.prepared[0].pflash_stats.dump());
+    TEST_ASSERT(paged.served_text[0].find(unified_doc(80, {{7, "kiwi"}}) + "Summarise this.") != std::string::npos);
+    TEST_ASSERT(paged.calls_after[0] == 1);
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_cold_chat_history_is_adopted_after_the_chat_view) {
-    // A chat whose first request already holds a large earlier paste: the chat view compresses the cold history,
-    // then the unified view adopts what it served, so the follow-up continues it and reuses the served prefix.
+TEST_CASE(ServerUnitFixture, test_unified_cold_chat_history_is_paged_once_and_recallable) {
+    // A chat whose first request already holds a large earlier paste: the view that starts pages that cold history
+    // in one drafter pass; the follow-up continues the view, reuses its served prefix and recalls what it needs.
     const json turn1 = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}}) + "Summarise this."}},
@@ -21490,56 +19575,61 @@ TEST_CASE(ServerUnitFixture, test_unified_cold_chat_history_is_adopted_after_the
     selecting.keep_scored_only = true;
     const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
                                          65536, selecting);
-    UnifiedOptions chat = selecting;
-    chat.chat_view_only = true;
-    const auto base = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
-                                          65536, chat);
-    // Turn 1: the chat view's own prompt.
-    TEST_ASSERT_MSG(run.prepared[0].unified_handback == "uncached", run.prepared[0].pflash_stats.dump());
-    TEST_ASSERT(run.prepared[0].compressed && run.prepared[0].unified_view);
-    TEST_ASSERT(run.prepared[0].tokens == base.prepared[0].tokens);
-    TEST_ASSERT(run.unified["counts"].value("adopt.uncached", 0) == 1);
-    // Turn 2: the adopted view continues; turn 1's served prompt is reused token for token.
+    // Turn 1: the earlier paste is paged; the kiwi line the question needs stays.
+    const auto & p1 = run.prepared[0];
+    TEST_ASSERT_MSG(p1.compressed && p1.unified_view &&
+                    p1.pflash_stats["unified"].value("decision", "") == "region", p1.pflash_stats.dump());
+    TEST_ASSERT(run.calls_after[0] == 1);
+    TEST_ASSERT(run.served_text[0].find("Line 7: plain filler text here kiwi\n") != std::string::npos);
+    TEST_ASSERT(run.served_text[0].find("mango") == std::string::npos);
+    TEST_ASSERT(run.served_text[0].find("A list of lines.") != std::string::npos);
+    // Turn 2: the view continues; turn 1's served prompt is reused token for token and the mango line is recalled.
     const auto & p2 = run.prepared[1];
-    TEST_ASSERT_MSG(p2.unified_handback.empty() && p2.unified_view, p2.pflash_stats.dump());
+    TEST_ASSERT_MSG(p2.unified_view, p2.pflash_stats.dump());
     const json & stats = p2.pflash_stats["unified"];
-    TEST_ASSERT_MSG(stats.value("continued", false) && stats.value("decision", "") == "continue", stats.dump());
+    TEST_ASSERT_MSG(stats.value("continued", false) && stats.value("decision", "") == "recall", stats.dump());
     const int cut = run.prepared[0].snapshot_cut;
     TEST_ASSERT(cut > 0 && stats.value("reused_tokens", 0) == cut);
     TEST_ASSERT(std::equal(run.prepared[0].tokens.begin(), run.prepared[0].tokens.begin() + cut, p2.tokens.begin()));
-    TEST_ASSERT(run.served_text[1].find("Which line mentions MANGO?") != std::string::npos);
+    const std::string & s2 = run.served_text[1];
+    const size_t block = s2.find("[Earlier in this conversation]\n[From an earlier user message]\n");
+    TEST_ASSERT_MSG(block != std::string::npos && s2.find("mango", block) != std::string::npos, s2);
     TEST_ASSERT(run.unified.value("views", 0) >= 1);
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_long_line_paste_goes_to_the_chat_view) {
-    // A needle-in-a-haystack paste: the whole passage is one line, longer than the region's cap. Paging could only
-    // drop that line whole, the kiwi sentence with it; the chat view selects inside the line instead.
+TEST_CASE(ServerUnitFixture, test_unified_long_line_paste_is_paged_inline) {
+    // A needle-in-a-haystack paste: the whole passage is one line, longer than the region's cap. Line units could
+    // only drop that line whole, the kiwi sentence with it: the view pages it in inline units, in one drafter pass.
     std::string filler;
     for (int i = 0; i < 300; ++i) filler += "The grass is green. ";
-    const std::string doc = "Below is a long passage.\n\n" + filler + "The kiwi number is 7. " + filler +
-                            "\n\nQuestion: what is the kiwi number?\n";
+    // Two copies, so that a 16-token stub segment always holds one whole word for the fixture's scorer.
+    const std::string doc = "Below is a long passage.\n\n" + filler + "The kiwi kiwi number is 7. " + filler +
+                            "\n\nQuestion: what is the number?\n";
     const json turn = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", doc + "Which sentence mentions KIWI?"}},
     });
-    UnifiedOptions options;
-    options.keep_scored_only = true;
-    const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
-                                         65536, options);
-    TEST_ASSERT_MSG(run.prepared[0].unified_handback == "uncached", run.prepared[0].pflash_stats.dump());
-    TEST_ASSERT_MSG(run.prepared[0].compressed, run.prepared[0].pflash_stats.dump());
+    const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 16);
+    const auto & p1 = run.prepared[0];
+    TEST_ASSERT_MSG(p1.unified_view && p1.compressed, p1.pflash_stats.dump());
+    const json & admission = p1.pflash_stats["unified"]["admission"];
+    TEST_ASSERT_MSG(admission.size() == 1 && admission[0].value("decision", "") == "region" &&
+                    admission[0].value("units_kind", "") == "inline" &&
+                    admission[0].value("inline_because", "") == "long_line", admission.dump());
     TEST_ASSERT_MSG(run.served_text[0].find("kiwi") != std::string::npos, run.served_text[0]);
-    TEST_ASSERT(run.unified["counts"].value("handback.uncached", 0) == 1);
-    TEST_ASSERT(run.unified["counts"].value("adopt.uncached", 0) == 1);
+    TEST_ASSERT(run.served_text[0].find("Which sentence mentions KIWI?") != std::string::npos);
+    TEST_ASSERT(run.served_text[0].find("each omitted range is marked inline") != std::string::npos);
+    TEST_ASSERT(run.served_text[0].find("text not shown") != std::string::npos);
+    TEST_ASSERT(run.served_text[0].find("You are helpful.") != std::string::npos);
+    TEST_ASSERT(run.calls_after[0] == 1);
 
-    // The follow-up stays with the unified view: it continues the adopted prompt.
+    // The follow-up continues the view.
     json turn2 = turn;
     turn2.push_back({{"role", "assistant"}, {"content", "The kiwi number is 7."}});
     turn2.push_back({{"role", "user"}, {"content", "And what colour is the grass?"}});
-    const auto two = run_unified_session({turn, turn2}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
-                                         65536, options);
+    const auto two = run_unified_session({turn, turn2}, nullptr, nullptr, 64, unified_fruit_score, 16);
     const auto & p2 = two.prepared[1];
-    TEST_ASSERT_MSG(p2.unified_handback.empty() && p2.unified_view, p2.pflash_stats.dump());
+    TEST_ASSERT_MSG(p2.unified_view, p2.pflash_stats.dump());
     TEST_ASSERT(p2.pflash_stats["unified"].value("continued", false));
     const int cut = two.prepared[0].snapshot_cut;
     TEST_ASSERT(cut > 0 && std::equal(two.prepared[0].tokens.begin(), two.prepared[0].tokens.begin() + cut,
@@ -21548,25 +19638,57 @@ TEST_CASE(ServerUnitFixture, test_unified_long_line_paste_goes_to_the_chat_view)
 
 TEST_CASE(ServerUnitFixture, test_unified_long_line_under_the_message_cap_but_over_the_region_cap) {
     // The first two lines are always kept and are long, so the message's cap holds the kiwi line but the region's
-    // cap, on the pageable lines alone, does not: paging would drop the line whole, so the chat view takes it.
+    // cap, on the pageable lines alone, does not: line units would drop the line whole, so inline units page it.
     const auto repeat = [](const std::string & s, int n) {
         std::string out;
         for (int i = 0; i < n; ++i) out += s;
         return out;
     };
     const std::string doc = repeat("The sky is blue. ", 250) + "\n" + repeat("The sea is deep. ", 250) + "\n" +
-                            repeat("The grass is green. ", 80) + "The kiwi number is 7. " +
+                            repeat("The grass is green. ", 80) + "The kiwi kiwi number is 7. " +
                             repeat("The grass is green. ", 80) + "\nshort a\nshort b\nshort c\nshort d\nend\n";
     const json turn = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", doc + "Which sentence mentions KIWI?"}},
     });
-    UnifiedOptions options;
-    options.keep_scored_only = true;
-    const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
-                                         65536, options);
-    TEST_ASSERT_MSG(run.prepared[0].unified_handback == "uncached", run.prepared[0].pflash_stats.dump());
+    const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 16);
+    const auto & p1 = run.prepared[0];
+    TEST_ASSERT_MSG(p1.compressed, p1.pflash_stats.dump());
+    const json & admission = p1.pflash_stats["unified"]["admission"];
+    TEST_ASSERT_MSG(admission[0].value("units_kind", "") == "inline", admission.dump());
     TEST_ASSERT_MSG(run.served_text[0].find("kiwi") != std::string::npos, run.served_text[0]);
+    TEST_ASSERT(run.calls_after[0] == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_oversized_edge_line_is_paged_inline) {
+    // Line units keep the first two and last two lines whole. An enormous one of them (with many short lines around
+    // it) would stay whole: the message is paged in inline units, so the long line is cut too.
+    std::string big;
+    for (int i = 0; i < 250; ++i) big += "The sky is blue. ";
+    std::vector<std::string> lines;
+    for (int i = 1; i <= 40; ++i) {
+        lines.push_back("Line " + std::to_string(i) + ": plain filler text here" + (i == 20 ? " kiwi" : ""));
+    }
+    for (size_t at : {(size_t) 0, (size_t) 1, lines.size() - 1, lines.size()}) {
+        std::vector<std::string> with = lines;
+        with.insert(with.begin() + (std::ptrdiff_t) at, big);
+        std::string content;
+        for (size_t i = 0; i < with.size(); ++i) content += (i ? "\n" : "") + with[i];
+        const json turn = json::array({
+            {{"role", "system"}, {"content", "Which line mentions KIWI?"}},
+            {{"role", "user"}, {"content", content}},
+        });
+        const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 16);
+        const auto & p1 = run.prepared[0];
+        const std::string where = "big line at " + std::to_string(at) + ": " + p1.pflash_stats.dump();
+        TEST_ASSERT_MSG(p1.compressed, where);
+        const json & admission = p1.pflash_stats["unified"]["admission"];
+        TEST_ASSERT_MSG(admission.size() == 1 && admission[0].value("units_kind", "") == "inline" &&
+                        admission[0].value("inline_because", "") == "long_line", where);
+        TEST_ASSERT_MSG(unified_occurrences(run.served_text[0], "The sky is blue.") < 250, where);
+        TEST_ASSERT_MSG(run.served_text[0].find("kiwi") != std::string::npos, where);
+        TEST_ASSERT(run.calls_after[0] == 1);
+    }
 }
 
 // A tool output whose body is one line of ``filler`` around ``needle``, framed by short lines.
@@ -21576,9 +19698,9 @@ static std::string unified_long_line_output(const std::string & needle) {
     return "Header\n\n" + filler + needle + " " + filler + "\n\nfooter\nend\n";
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_long_line_tool_output_is_served_whole) {
+TEST_CASE(ServerUnitFixture, test_unified_long_line_tool_output_is_paged_inline) {
     const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read_file"}}}}});
-    const std::string kiwi_output = unified_long_line_output("The kiwi number is 7.");
+    const std::string kiwi_output = unified_long_line_output("The kiwi kiwi number is 7.");
     const json cold = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", "Read the file. Which sentence mentions KIWI?"}},
@@ -21586,25 +19708,16 @@ TEST_CASE(ServerUnitFixture, test_unified_long_line_tool_output_is_served_whole)
             unified_tool_call("call_1", "read_file", {{"path", "a.txt"}})})}},
         {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", kiwi_output}},
     });
-    // A fresh agent turn: the chat view takes it and serves a tool session raw (keep_history), the line whole.
-    const auto fresh = run_unified_session({cold}, tools, "read_file", 600, unified_fruit_score);
-    TEST_ASSERT_MSG(fresh.prepared[0].unified_handback == "uncached", fresh.prepared[0].pflash_stats.dump());
-    TEST_ASSERT(!fresh.prepared[0].compressed);
-    TEST_ASSERT(fresh.prepared[0].tokens == fresh.ids[0]);
-    // The agent's next call: the adopted raw prompt continues, and the next output is paged.
-    json next = cold;
-    next.push_back({{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
-        unified_tool_call("call_2", "read_file", {{"path", "b.md"}})})}});
-    next.push_back({{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", unified_doc(80, {{9, "kiwi"}}, "B")}});
-    const auto agent = run_unified_session({cold, next}, tools, "read_file", 600, unified_fruit_score);
-    TEST_ASSERT(agent.unified["counts"].value("adopt.uncached", 0) == 1);
-    const auto & a2 = agent.prepared[1];
-    TEST_ASSERT_MSG(a2.unified_handback.empty() && a2.unified_view && a2.compressed, a2.pflash_stats.dump());
-    TEST_ASSERT_MSG(a2.pflash_stats["unified"].value("decision", "") == "region", a2.pflash_stats.dump());
-    TEST_ASSERT(std::equal(agent.ids[0].begin(), agent.ids[0].begin() + agent.prepared[0].snapshot_cut,
-                           a2.tokens.begin()));
+    // A fresh agent turn: the one-line output is paged in inline units, the tool-result note asks for a re-call.
+    const auto fresh = run_unified_session({cold}, tools, "read_file", 600, unified_fruit_score, 16);
+    const auto & p1 = fresh.prepared[0];
+    TEST_ASSERT_MSG(p1.unified_view && p1.compressed, p1.pflash_stats.dump());
+    TEST_ASSERT_MSG(fresh.served_text[0].find("kiwi") != std::string::npos, p1.pflash_stats.dump());
+    TEST_ASSERT(fresh.served_text[0].find("this tool result was shortened; each omitted range is marked inline") !=
+                std::string::npos);
 
-    // A view that continues: turn 1 pages an ordinary output; turn 2's one-line output is appended verbatim.
+    // A view that continues: turn 1 pages an ordinary output; turn 2's one-line output is paged inline too, after
+    // the cached view.
     const json turn1 = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", "Read both files. Which sentences mention KIWI and MANGO?"}},
@@ -21615,17 +19728,17 @@ TEST_CASE(ServerUnitFixture, test_unified_long_line_tool_output_is_served_whole)
     json turn2 = turn1;
     turn2.push_back({{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
         unified_tool_call("call_2", "read_file", {{"path", "b.txt"}})})}});
-    const std::string mango_output = unified_long_line_output("The mango number is 8.");
+    const std::string mango_output = unified_long_line_output("The mango mango number is 8.");
     turn2.push_back({{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", mango_output}});
-    const auto run = run_unified_session({turn1, turn2}, tools, "read_file", 600, unified_fruit_score);
+    const auto run = run_unified_session({turn1, turn2}, tools, "read_file", 600, unified_fruit_score, 16);
     TEST_ASSERT_MSG(run.prepared[0].compressed && run.prepared[0].unified_view, run.prepared[0].pflash_stats.dump());
     const auto & p2 = run.prepared[1];
-    TEST_ASSERT_MSG(p2.unified_handback.empty() && p2.unified_view, p2.pflash_stats.dump());
+    TEST_ASSERT_MSG(p2.unified_view, p2.pflash_stats.dump());
     const json & admission = p2.pflash_stats["unified"]["admission"];
-    TEST_ASSERT_MSG(admission.size() == 1 && admission[0].value("decision", "") == "long_line", admission.dump());
+    TEST_ASSERT_MSG(admission.size() == 1 && admission[0].value("units_kind", "") == "inline", admission.dump());
     const int vg1 = run.prepared[0].snapshot_cut;
     TEST_ASSERT(std::equal(run.prepared[0].tokens.begin(), run.prepared[0].tokens.begin() + vg1, p2.tokens.begin()));
-    TEST_ASSERT(run.served_text[1].find(mango_output) != std::string::npos);
+    TEST_ASSERT(run.served_text[1].find("mango") != std::string::npos);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_restorable_prefix_counts_disk_only_when_on) {
@@ -21648,9 +19761,9 @@ TEST_CASE(ServerUnitFixture, test_pflash_restorable_prefix_counts_disk_only_when
 
 TEST_CASE(ServerUnitFixture, test_unified_restart_resumes_a_disk_chat_and_pages_only_the_new_paste) {
     // A server restart: the chat's history (an earlier paste and its answer) is on disk, RAM is empty. The unified
-    // view counts the disk entry as cached, as the chat view's admission does: it keeps the conversation instead of
-    // handing a cold history to the chat view, serves the history as it is (the generation path restores it from
-    // disk) and pages only the new paste. Without the entry, or outside the Full disk scope, the chat view takes it.
+    // view counts the disk entry as cached: it serves the history as it is (the generation path restores it from
+    // disk) and pages only the new paste. Without the entry, or outside the Full disk scope, the history is cold and
+    // its paste is paged too.
     const json turn = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", unified_doc(80, {{7, "mango"}}) + "Summarise this."}},
@@ -21665,7 +19778,6 @@ TEST_CASE(ServerUnitFixture, test_unified_restart_resumes_a_disk_chat_and_pages_
     const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr, 65536,
                                          disk);
     const auto & stats = run.prepared[0].pflash_stats;
-    TEST_ASSERT_MSG(run.prepared[0].unified_handback.empty(), stats.dump());
     TEST_ASSERT_MSG(stats.contains("unified") && stats["unified"].contains("cached") &&
                     stats["unified"]["cached"].value("source", "") == "disk" &&
                     stats["unified"]["cached"].value("tokens", 0) > 0, stats.dump());
@@ -21674,7 +19786,6 @@ TEST_CASE(ServerUnitFixture, test_unified_restart_resumes_a_disk_chat_and_pages_
     TEST_ASSERT(run.served_text[0].find(unified_doc(80, {{7, "mango"}}) + "Summarise this.") != std::string::npos);
     TEST_ASSERT(run.served_text[0].find("Row 33: plain filler text here kiwi") != std::string::npos);
     TEST_ASSERT(run.served_text[0].size() < run.raw_text[0].size());
-    TEST_ASSERT(run.unified["counts"].value("handback.uncached", 0) == 0);
 
     // The disk is looked up only in the Full scope, so only there does it count. (A fresh directory: the first run's
     // shutdown wrote its view there, and a view on disk continues the conversation whatever the scope.)
@@ -21683,21 +19794,26 @@ TEST_CASE(ServerUnitFixture, test_unified_restart_resumes_a_disk_chat_and_pages_
     off.disk_mode = DiskPrefixCacheMode::Off;
     const auto scoped = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
                                             65536, off);
-    TEST_ASSERT_MSG(scoped.prepared[0].unified_handback == "uncached", scoped.prepared[0].pflash_stats.dump());
+    const auto both_paged = [] (const UnifiedRun & r) {
+        const json & a = r.prepared[0].pflash_stats["unified"]["admission"];
+        return r.calls_after[0] == 1 && a.size() == 2 &&
+               a[0].value("decision", "") == "region" && a[1].value("decision", "") == "region";
+    };
+    TEST_ASSERT_MSG(both_paged(scoped), scoped.prepared[0].pflash_stats.dump());
     rm_rf(dir);
-    // No disk entry: the cold history goes to the chat view, as without the disk cache.
+    // No disk entry: the history is cold, as without the disk cache.
     UnifiedOptions empty;
     empty.disk_dir = dir;
     const auto cold = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
                                           65536, empty);
-    TEST_ASSERT_MSG(cold.prepared[0].unified_handback == "uncached", cold.prepared[0].pflash_stats.dump());
+    TEST_ASSERT_MSG(both_paged(cold), cold.prepared[0].pflash_stats.dump());
     rm_rf(dir);
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_restart_serves_a_disk_chat_raw_for_a_short_question) {
     // The same restart with a short follow-up question: nothing new to page, so the whole prompt is served raw for
-    // the disk restore -- no drafter pass and no compression of the history. Without the disk cache the chat view
-    // compresses the cold history (test_unified_cold_chat_history_goes_to_the_chat_view).
+    // the disk restore -- no drafter pass and no compression of the history. Without the disk cache the view pages
+    // the cold history (test_unified_cold_chat_history_is_paged_once_and_recallable).
     const json turn = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}}) + "Summarise this."}},
@@ -21711,38 +19827,18 @@ TEST_CASE(ServerUnitFixture, test_unified_restart_serves_a_disk_chat_raw_for_a_s
     disk.disk_seed_history = true;
     const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr, 65536,
                                          disk);
-    TEST_ASSERT_MSG(run.prepared[0].unified_handback.empty(), run.prepared[0].pflash_stats.dump());
     TEST_ASSERT(!run.prepared[0].compressed);
     TEST_ASSERT(run.prepared[0].tokens == run.ids[0]);
     TEST_ASSERT(run.calls_after[0] == 0);
 
-    // The chat view alone counts the disk the same way: its cache admission keeps the
-    // history raw instead of compressing it, and records where the cached prefix is.
-    UnifiedOptions chat = disk;
-    chat.chat_view_only = true;
-    const auto warm = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr, 65536,
-                                          chat);
-    TEST_ASSERT(warm.calls_after[0] == 0);
-    TEST_ASSERT(!warm.prepared[0].compressed);
-    TEST_ASSERT(warm.prepared[0].tokens == warm.ids[0]);
-    const json warm_admission = warm.prepared[0].pflash_stats.value("admission", json::object());
-    TEST_ASSERT_MSG(warm_admission.value("cached_source", "") == "disk", warm.prepared[0].pflash_stats.dump());
     rm_rf(dir);
-    // Disk cache off: the admission compresses the cold history, and nothing records a source.
-    UnifiedOptions plain;
-    plain.chat_view_only = true;
-    const auto cold = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr, 65536,
-                                          plain);
-    TEST_ASSERT(cold.calls_after[0] == 1);
-    TEST_ASSERT_MSG(cold.prepared[0].pflash_stats.dump().find("cached_source") == std::string::npos,
-                    cold.prepared[0].pflash_stats.dump());
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_shortened_chat_survives_a_restart_through_its_view_on_disk) {
     // Turn 1 pages a long paste. The server restarts (shutdown flush): its view is written to disk and read back on
     // the next turn, so the follow-up continues the shortened conversation -- the same served prefix, nothing handed
-    // back to the chat view -- instead of arriving cold. Without the disk cache the restart loses the view, and the
-    // follow-up goes to the chat view as a cold history.
+    // back -- instead of arriving cold. Without the disk cache the restart loses the view, and the follow-up starts
+    // a view of its own that pages the cold history again.
     const json turn1 = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}}) + "Which line mentions KIWI?"}},
@@ -21759,7 +19855,7 @@ TEST_CASE(ServerUnitFixture, test_unified_shortened_chat_survives_a_restart_thro
                                          65536, disk);
     TEST_ASSERT_MSG(run.prepared[0].compressed && run.prepared[0].unified_view, run.prepared[0].pflash_stats.dump());
     const auto & stats = run.prepared[1].pflash_stats;
-    TEST_ASSERT_MSG(run.prepared[1].unified_handback.empty() && stats.contains("unified") &&
+    TEST_ASSERT_MSG(stats.contains("unified") &&
                     stats["unified"].value("disk_view", false), stats.dump());
     TEST_ASSERT(run.prepared[1].compressed && run.prepared[1].unified_view);
     TEST_ASSERT(run.unified["counts"].value("disk_view", 0) == 1);
@@ -21776,26 +19872,32 @@ TEST_CASE(ServerUnitFixture, test_unified_shortened_chat_survives_a_restart_thro
     ram.restart_at = 1;
     const auto lost = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
                                           nullptr, 65536, ram);
-    TEST_ASSERT_MSG(lost.prepared[1].unified_handback == "uncached", lost.prepared[1].pflash_stats.dump());
+    TEST_ASSERT_MSG(lost.prepared[1].compressed &&
+                    !lost.prepared[1].pflash_stats["unified"].value("continued", true),
+                    lost.prepared[1].pflash_stats.dump());
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_unsplittable_paste_goes_to_the_chat_view) {
-    // A large paste the view cannot cut into lines (one long line) would be prefilled raw: the chat view takes it.
+TEST_CASE(ServerUnitFixture, test_unified_one_line_paste_is_paged_inline) {
+    // A large paste on one line: inline units at the drafter's candidate starts page it.
     std::string paste;
     for (int i = 0; i < 300; ++i) paste += "word" + std::to_string(i % 10) + " ";
     const json turn = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
-        {{"role", "user"}, {"content", paste + "\nWhat is this?"}},
+        {{"role", "user"}, {"content", paste + "kiwi kiwi " + paste + "\nWhich word is KIWI?"}},
     });
-    const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score);
-    UnifiedOptions off;
-    off.chat_view_only = true;
-    const auto base = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr, 65536,
-                                          off);
-    TEST_ASSERT_MSG(run.prepared[0].unified_handback == "uncached", run.prepared[0].pflash_stats.dump());
-    TEST_ASSERT(run.prepared[0].tokens == base.prepared[0].tokens);
-    TEST_ASSERT(run.calls_after == base.calls_after);
-    TEST_ASSERT(run.unified["counts"].value("handback.uncached", 0) == 1);
+    const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 16);
+    const auto & p1 = run.prepared[0];
+    TEST_ASSERT_MSG(p1.compressed, p1.pflash_stats.dump());
+    const json & admission = p1.pflash_stats["unified"]["admission"];
+    TEST_ASSERT_MSG(admission[0].value("inline_because", "") == "no_lines" &&
+                    admission[0].value("units_kind", "") == "inline", admission.dump());
+    TEST_ASSERT(run.served_text[0].find("kiwi") != std::string::npos);
+    TEST_ASSERT(run.served_text[0].find("Which word is KIWI?") != std::string::npos);
+
+    // A drafter that proposes no cut inside the line leaves no unit: the paste is served whole.
+    const auto whole = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score);
+    const json & a = whole.prepared[0].pflash_stats["unified"]["admission"];
+    TEST_ASSERT_MSG(!whole.prepared[0].compressed && a[0].value("decision", "") == "layout", a.dump());
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_reread_never_paged_and_holds_units) {
@@ -22299,33 +20401,23 @@ static std::string unified_rendered_content(const std::string & text, const std:
     return end == std::string::npos ? "" : text.substr(begin, end - begin);
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_off_without_selection_env) {
-    // Without a strict-selection environment the unified view cannot score: it is off (no stats) and the chat view
-    // serves every turn exactly as on its own (a continuation takes the FlowKV path there).
-    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
-    const json turn1 = json::array({
-        {{"role", "system"}, {"content", "You are helpful."}},
-        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
-    });
-    json turn2 = turn1;
-    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
-    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
-    UnifiedOptions options;
-    options.select_mode = nullptr;
-    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
-                                         nullptr, 65536, options);
-    UnifiedOptions off = options;
-    off.chat_view_only = true;
-    const auto base = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
-                                          nullptr, 65536, off);
-    for (size_t turn = 0; turn < 2; ++turn) {
-        TEST_ASSERT_MSG(run.prepared[turn].pflash_stats.find("unified") == run.prepared[turn].pflash_stats.end(),
-                        run.prepared[turn].pflash_stats.dump());
-        TEST_ASSERT(run.prepared[turn].tokens == base.prepared[turn].tokens);
-        TEST_ASSERT(run.prepared[turn].compressed == base.prepared[turn].compressed);
+TEST_CASE(ServerUnitFixture, test_pflash_on_refuses_to_start_without_the_head_or_with_an_ipc_drafter) {
+    // PFlash pages with the trained head's per-candidate scores from a drafter in this process. Without a selection
+    // environment, with an IPC drafter, or with a target whose drafter pass gives no candidate scores (Qwen3,
+    // Laguna, Gemma 4), startup fails instead of serving a different mode.
+    {
+        luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", nullptr};
+        const std::string error = pflash_startup_error(false);
+        TEST_ASSERT_MSG(error.find("trained scoring head") != std::string::npos, error);
     }
-    TEST_ASSERT(run.calls_after == base.calls_after);
-    TEST_ASSERT_MSG(run.unified.is_null(), run.unified.dump());
+    {
+        luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+        const std::string error = pflash_startup_error(true);
+        TEST_ASSERT_MSG(error.find("drafter in this process") != std::string::npos, error);
+        TEST_ASSERT_MSG(pflash_startup_error(false).empty(), pflash_startup_error(false));
+        const std::string unscored = pflash_startup_error(false, /*candidate_scores=*/false);
+        TEST_ASSERT_MSG(unscored.find("per-candidate scores") != std::string::npos, unscored);
+    }
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_reread_holds_unit_ending_in_blank_line) {
@@ -22385,9 +20477,9 @@ TEST_CASE(ServerUnitFixture, test_unified_reread_coverage_counts_fallen_back_mes
     TEST_ASSERT_MSG(unified_occurrences(run.served_text[1], "mango") == 1, run.served_text[1]);
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_reset_hands_back_to_the_chat_view) {
+TEST_CASE(ServerUnitFixture, test_unified_reset_pages_the_history_again) {
     // Recall overheads can grow a view past the raw prompt. A turn whose view no longer fits goes back to admission
-    // on the raw prompt; that history is uncached, so the chat view takes the turn instead of a raw prefill.
+    // on the raw prompt; that history is uncached, so a new view pages it instead of a raw prefill.
     const std::string doc = unified_doc(80, {});
     json turn = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
@@ -22408,43 +20500,40 @@ TEST_CASE(ServerUnitFixture, test_unified_reset_hands_back_to_the_chat_view) {
     const std::vector<json> session(turns.begin(), turns.begin() + (long) over + 2);
 
     // The view of turn ``over`` does not fit with a long output allowance; its raw prompt does. The next turn, with a
-    // short allowance again, must not continue the view the chat view replaced (nor an ancestor of it).
+    // short allowance again, continues the new view, not the one it replaced (nor an ancestor of it).
     UnifiedOptions options;
     options.max_outputs.assign(session.size(), 16);
     options.max_outputs[over] = 4096;
     const int fits_raw = (int) probe.ids[over].size() + 4096;
     const auto run = run_unified_session(session, nullptr, nullptr, 64, nullptr, 0, 0.3f, nullptr, fits_raw, options);
-    TEST_ASSERT_MSG(run.prepared[over].unified_handback == "reset_uncached", run.prepared[over].pflash_stats.dump());
+    const json & reset = run.prepared[over].pflash_stats["unified"];
+    TEST_ASSERT_MSG(run.prepared[over].compressed &&
+                    reset.value("reset", "") == "context" && reset.value("decision", "") == "region" &&
+                    !reset.value("continued", true), reset.dump());
     TEST_ASSERT(run.prepared[over].error.empty());
     TEST_ASSERT(run.unified["counts"].value("reset.context", 0) == 1);
     TEST_ASSERT(run.unified["counts"].value("raw.reset", 0) == 0);
-    // This chat view keeps every candidate, so it serves the raw history: nothing to adopt, and the next turn is
-    // uncached again (test_unified_cold_chat_history_is_adopted_after_the_chat_view covers a compressed one).
-    TEST_ASSERT(run.unified["counts"].value("adopt.reset_uncached", 0) == 0);
-    TEST_ASSERT_MSG(run.prepared[over + 1].unified_handback == "uncached", run.prepared[over + 1].pflash_stats.dump());
-    TEST_ASSERT_MSG(run.unified.value("views", -1) == 0, run.unified.dump());
+    const json & next = run.prepared[over + 1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(next.value("continued", false) && next.value("lineage", 0) == reset.value("lineage", -1) &&
+                    reset.value("lineage", 0) != run.prepared[over - 1].pflash_stats["unified"].value("lineage", 0),
+                    next.dump());
 
-    // Nothing fits (the output allowance alone is the context): the chat view answers as it does without the flag.
+    // Nothing fits (the output allowance alone is the context): the paged prompt is refused for its length.
     const int fits_view = (int) probe.prepared[over].tokens.size() + 16;
     UnifiedOptions tight;
     tight.max_outputs.assign(session.size(), 16);
     tight.max_outputs[over] = fits_view;
     tight.allow_errors = true;
     const auto again = run_unified_session(session, nullptr, nullptr, 64, nullptr, 0, 0.3f, nullptr, fits_view, tight);
-    UnifiedOptions tight_off = tight;
-    tight_off.chat_view_only = true;
-    const auto base = run_unified_session(session, nullptr, nullptr, 64, nullptr, 0, 0.3f, nullptr, fits_view,
-                                          tight_off);
-    TEST_ASSERT_MSG(again.prepared[over].unified_handback == "reset_uncached", again.prepared[over].pflash_stats.dump());
-    TEST_ASSERT_MSG(again.prepared[over].error == base.prepared[over].error, again.prepared[over].error);
-    TEST_ASSERT(again.prepared[over].tokens == base.prepared[over].tokens);
+    TEST_ASSERT_MSG(again.prepared[over].error.find("maximum context length") != std::string::npos,
+                    again.prepared[over].error);
 
     // The refused turn keeps the conversation's views: a retry with a short allowance continues the view.
     std::vector<json> retry(session.begin(), session.begin() + (long) over + 1);
     retry.push_back(session[over]);
     const auto retried = run_unified_session(retry, nullptr, nullptr, 64, nullptr, 0, 0.3f, nullptr, fits_view, tight);
     TEST_ASSERT(!retried.prepared[over].error.empty());
-    TEST_ASSERT_MSG(retried.prepared[over + 1].unified_handback.empty() && retried.prepared[over + 1].unified_view,
+    TEST_ASSERT_MSG(retried.prepared[over + 1].unified_view,
                     retried.prepared[over + 1].pflash_stats.dump());
 }
 
@@ -22633,6 +20722,11 @@ struct PflashStageBackend : MockPflashBudgetBackend {
         scoring = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         CompressResult result = MockPflashBudgetBackend::compress(request);
+        // Per-candidate scores over 4-token chunks, so the unified view can page what it is offered.
+        const int n = (int) request.input_ids.size();
+        for (int begin = 0; begin < n; begin += 4) {
+            result.candidate_lifts.push_back({{begin, (std::min)(n, begin + 4)}, begin % 12 == 0 ? 2.0 : 1.0});
+        }
         scoring = false;
         return result;
     }
@@ -22757,12 +20851,13 @@ TEST_CASE(ServerUnitFixture, test_scheduler_pflash_decodes_while_the_drafter_sco
     TEST_ASSERT(run.admitted_sizes[1] < run.raw_tokens);
 }
 
-// Two long prompts that arrive together are both scored and served
-// compressed.
+// Two long prompts that arrive together are both served compressed. They are
+// the same prompt: the second repeats the first's view when that view is
+// stored before it is prepared, without a drafter pass of its own.
 TEST_CASE(ServerUnitFixture, test_scheduler_pflash_serves_two_long_prompts) {
     const auto run = run_pflash_stage_case(/*chats=*/0, /*long_prompts=*/2);
     TEST_ASSERT(run.done);
-    TEST_ASSERT(run.compress_calls == 2);
+    TEST_ASSERT(run.compress_calls == 1 || run.compress_calls == 2);
     TEST_ASSERT(run.admitted_sizes.size() == 2);
     TEST_ASSERT(run.admitted_sizes[0] < run.raw_tokens);
     TEST_ASSERT(run.admitted_sizes[1] < run.raw_tokens);

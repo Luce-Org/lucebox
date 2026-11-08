@@ -285,6 +285,9 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.expert_placement_path = execution.expert_placement;
         cfg.chunk = execution.chunk;
         cfg.max_concurrency = execution.max_concurrency;
+        cfg.pflash_gpu = cache.pflash_reserve_gpu;
+        cfg.pflash_bytes = (size_t) std::max(0LL, cache.pflash_reserve_bytes);
+        cfg.pflash_bytes_per_token = (size_t) std::max(0LL, cache.pflash_reserve_bytes_per_token);
 
         auto backend = std::make_unique<Qwen4ExpBackend>(std::move(cfg));
         if (!backend->init()) {

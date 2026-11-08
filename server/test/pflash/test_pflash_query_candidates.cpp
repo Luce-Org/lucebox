@@ -96,11 +96,7 @@ TEST_CASE(PFlashQueryCandidatesFixture, startup_validation_preserves_defaults_an
     using namespace luce::common::http_detail;
     std::string error;
     REQUIRE(validate_pflash_environment(error));
-    REQUIRE(pflash_chat_compress_new_tokens() == 16384);
     REQUIRE(pflash_chat_skeleton_tokens() == 256 && pflash_chat_history_queries() == 3);
-    REQUIRE(pflash_chat_rebuild_ratio() == 2.0 && pflash_chat_rebuild_min_tokens() == 0);
-    REQUIRE(pflash_chat_recall() && pflash_paragraph_join());
-    REQUIRE(!pflash_arrive_enabled() && !pflash_agent_paste_enabled() && !pflash_cache_admission_enabled());
     REQUIRE(!pflash_fail_closed_from_env());
     PFlashSelectionConfig selection;
     REQUIRE(resolve_pflash_selection(65536, 32, selection, error));
@@ -113,11 +109,9 @@ TEST_CASE(PFlashQueryCandidatesFixture, startup_validation_preserves_defaults_an
             {"PFLASH_SELECT_MODE", "budget_only"}, {"PFLASH_SELECT_SEGMENTS", "probe"},
             {"PFLASH_SELECT_SCORE", "density"}, {"PFLASH_SELECT_QUERY_TOKENS", "128"},
             {"PFLASH_SELECT_CHUNK_SIZE", "256"}, {"PFLASH_SELECT_QUERY_HEAD", "1"},
-            {"PFLASH_SELECT_PARAGRAPH_JOIN", "0"}, {"PFLASH_SELECT_QUERY_PROBE", "1"},
+            {"PFLASH_SELECT_QUERY_PROBE", "1"},
             {"PFLASH_SEGMENT_PROBE_GGUF", "segment.gguf"}, {"PFLASH_QUERY_CANDIDATES", "1"},
-            {"PFLASH_QUERY_PIN", "512"}, {"PFLASH_ADMISSION", "cache"}, {"PFLASH_ARRIVE", "1"},
-            {"PFLASH_CHAT_RECALL", "1"}, {"PFLASH_CHAT_REBUILD_RATIO", "2"},
-            {"PFLASH_CHAT_REBUILD_MIN_TOKENS", "65536"}, {"PFLASH_FALLBACK_SPREAD", "0.11"}}) {
+            {"PFLASH_QUERY_PIN", "512"}, {"PFLASH_FALLBACK_SPREAD", "0.11"}}) {
         release.push_back(std::make_unique<luce_test::ScopedEnvVar>(flag.first, flag.second));
     }
     REQUIRE(validate_pflash_environment(error));
@@ -126,7 +120,6 @@ TEST_CASE(PFlashQueryCandidatesFixture, startup_validation_preserves_defaults_an
     REQUIRE(selection.query.candidates == 1 && selection.query.pin_tokens == 512);
     REQUIRE(selection.query.tw_share == 0.5f && selection.query.end_share == 0.25f);
     REQUIRE(selection.query.extent_gap && selection.query.pin_gap && selection.fallback_spread == 0.11);
-    REQUIRE(pflash_chat_rebuild_min_tokens() == 65536 && pflash_arrive_enabled());
     // Valid large overrides retain the existing caps.
     luce_test::ScopedEnvVar history{"PFLASH_CHAT_HISTORY_QUERIES", "32"};
     REQUIRE(validate_pflash_environment(error));
@@ -179,21 +172,14 @@ TEST_CASE(PFlashQueryCandidatesFixture, release_profile_is_the_default_with_a_tr
         REQUIRE(selection.segmentation == PFlashSegmentation::Probe &&
                 selection.candidate_score == PFlashCandidateScore::Density);
         REQUIRE(selection.chunk_size == 256 && selection.query_tokens == 128);
-        REQUIRE(selection.query_head && selection.query_probe && selection.fallback_spread == 0.11);
+        REQUIRE(selection.query_head && selection.query_probe && selection.fallback_spread == 0.0);
         REQUIRE(selection.query.candidates == 1 && selection.query.pin_tokens == 512);
         REQUIRE(has_pflash_selection_environment() && pflash_query_probe_requested());
-        REQUIRE(pflash_cache_admission_enabled() && pflash_arrive_enabled() && !pflash_paragraph_join());
-        REQUIRE(pflash_chat_rebuild_min_tokens() == 65536 && pflash_chat_rebuild_ratio() == 2.0);
-        REQUIRE(pflash_chat_recall());
-    }
-    {
-        luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", "off"};
-        luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "length"};
-        Vars vars;
-        install(vars);
-        REQUIRE(validate_pflash_environment(error));
-        REQUIRE(resolve_pflash_selection(65536, 32, selection, error));
-        REQUIRE(selection.fallback_spread == 0.0 && !pflash_cache_admission_enabled());
+        // The former chat view's settings and the spread fallback are not part of it.
+        for (const char * retired : {"PFLASH_FALLBACK_SPREAD", "PFLASH_ADMISSION", "PFLASH_ARRIVE",
+                                     "PFLASH_CHAT_REBUILD_MIN_TOKENS", "PFLASH_SELECT_PARAGRAPH_JOIN"}) {
+            REQUIRE(!has(retired));
+        }
     }
     // Arms that replace the request-probe query or exclude its candidates still start.
     for (const auto & arm : std::vector<std::pair<const char *, const char *>>{
@@ -219,12 +205,9 @@ TEST_CASE(PFlashQueryCandidatesFixture, startup_validation_rejects_invalid_and_i
     std::string error;
     for (const auto & bad : std::vector<std::pair<const char *, const char *>>{
             {"PFLASH_SELECT_MODE", "budget"}, {"PFLASH_SELECT_QUERY_PROBE", "true"},
-            {"PFLASH_ADMISSION", "cached"}, {"PFLASH_CHAT_RECALL", "false"},
-            {"PFLASH_FAIL_CLOSED", "yes"}, {"PFLASH_AGENT_PASTE", "on"},
-            {"PFLASH_CHAT_COMPRESS_NEW_TOKENS", "0"}, {"PFLASH_DRAFTER_SESSIONS", "-1"},
+            {"PFLASH_FAIL_CLOSED", "yes"}, {"PFLASH_DRAFTER_SESSIONS", "-1"},
             {"PFLASH_CHAT_SKELETON_TOKENS", "9999999999999999999999999"},
-            {"PFLASH_CHAT_HISTORY_QUERIES", "3oops"}, {"PFLASH_CHAT_REBUILD_RATIO", "nan"},
-            {"PFLASH_CHAT_REBUILD_RATIO", "1e-9999"}}) {
+            {"PFLASH_CHAT_HISTORY_QUERIES", "3oops"}}) {
         luce_test::ScopedEnvVar flag{bad.first, bad.second};
         REQUIRE(!validate_pflash_environment(error));
         REQUIRE(error.find(bad.first) != std::string::npos);
@@ -607,22 +590,7 @@ TEST_CASE(PFlashQueryCandidatesFixture, fingerprint_matches_the_server) {
     REQUIRE(pflash_ids_fingerprint({}) == "cbf29ce484222325");
 }
 
-// ---------------------------------------------------------------- defect (a): ceiling retry
-
-TEST_CASE(PFlashQueryCandidatesFixture, ceiling_retry_only_tightens) {
-    // The E-gate failure: ceiling 11567, overflows 17 then 1. The old retry restarted from the requested ratio
-    // (0.337334 then 0.337801: looser); the cumulative one tightens.
-    const float requested = 0.33787f;
-    int tightening = 0;
-    const float r1 = luce::common::http_detail::pflash_ceiling_retry_keep_ratio(requested, 11567, 17, tightening);
-    REQUIRE(tightening == 18);
-    REQUIRE(std::fabs(r1 - requested * 11549.0f / 11567.0f) < 1e-7f);   // the first retry is unchanged
-    const float r2 = luce::common::http_detail::pflash_ceiling_retry_keep_ratio(requested, 11567, 1, tightening);
-    REQUIRE(tightening == 20);
-    REQUIRE(r2 < r1);
-    int t = 0;
-    REQUIRE(luce::common::http_detail::pflash_ceiling_retry_keep_ratio(requested, 10, 12, t) <= 0.0f);
-}
+// ---------------------------------------------------------------- gap rule
 
 TEST_CASE(PFlashQueryCandidatesFixture, gap_rule_cuts_at_the_largest_drop) {
     // Units scoring 9, 8.6, 8.2 (a specification) then paste at 2..3: the largest drop is after the third unit.

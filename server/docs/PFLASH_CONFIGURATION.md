@@ -1,11 +1,14 @@
 # PFlash configuration
 
-With a trained scoring head (`PFLASH_SCORING_HEAD_GGUF`) and prefill
-compression on, every setting left unset takes the measured
-[release profile](#release-profile); without a head the built-in defaults
-apply. Fold, query-grid, stage-2 and oracle experiments remain available.
-With prefill compression enabled, selection, query, admission and chat
-settings are checked before model loading. Invalid settings stop startup and name the offending
+Prefill compression needs a trained scoring head (`PFLASH_SCORING_HEAD_GGUF`),
+the drafter in the server's own process, and a target whose drafter pass
+returns per-candidate scores (the Qwen3.5 family and DeepSeek V4). It is on by
+default whenever all three are there and the launch combines with it
+(`--pflash auto`; otherwise startup says why it stays off); `--pflash on`
+refuses to start without them, and `--pflash off` turns it off. Every setting left unset takes the measured
+[release profile](#release-profile). Query-grid, stage-2 and oracle
+experiments remain available. With prefill compression enabled, selection,
+query and view settings are checked before model loading. Invalid settings stop startup and name the offending
 variable. Model schemas and replay files receive their loader checks.
 
 The [development tools](../scripts/pflash/README.md) document request-probe
@@ -20,25 +23,17 @@ allowed below. Valid integer overrides retain their existing upper clamps.
 
 | Setting | Built-in default | Release profile | Values / behavior |
 |---|---|---|---|
-| `--pflash` | `off` | | `on`, `off` |
+| `--pflash` | `auto` | | `auto` (on when `--prefill-drafter` and `PFLASH_SCORING_HEAD_GGUF` are set), `on`, `off` |
 | `--prefill-threshold` | `32000` | `16384` | Admission threshold, in droppable tokens (`0`: every prompt) |
 | `--prefill-keep-ratio` | `0.05` | curve | Flat ratio; `--prefill-curve tokens:ratio ...` overrides it. The release curve is `16384:0.315 32768:0.270 65536:0.270 120000:0.225`; either flag replaces it |
 | `--prefill-skip-park` | off | | Keep the target resident while the drafter scores; see the release profile |
 | `--prefill-drafter-device` | the `--draft-device` | | `backend:gpu` the drafter scores on, in process (the target's backend, one explicit `--target-device`); on another GPU than the target nothing is reserved or parked on the target's |
-| `PFLASH_ADMISSION` | `length` | `cache` | `length` or `cache`; cache admission accounts for restorable target KV |
-| `PFLASH_REGION_TOOLS` | `*` | | Under the unified view (on whenever the selection gives per-candidate scores; the chat-view settings below apply only to the requests it hands back, see the [server README](../README.md#pflash)): tools whose outputs may be paged; a comma-separated list names tools, empty pages none |
-| `PFLASH_RECALL`, `PFLASH_RECALL_GATE` | `1`, `0.075` | | Under the unified view: recall for a new question, and the share of score mass outside the view below which nothing is recalled (`off` recalls up to the regions' caps) |
-| `PFLASH_AGENT_PASTE` | `0` | | With cache admission, `1` permits a large newest user paste in a tool session; earlier history stays raw |
-| `PFLASH_CHAT_VIEW`, `PFLASH_CHAT_RECALL` | `1`, `1` | | Continue the served view; recall omitted material for a new question |
-| `PFLASH_CHAT_COMPRESS_NEW_TOKENS` | `16384` | | Integer >= 1; smaller additions stay verbatim; capped at 2^30 |
+| `PFLASH_REGION_TOOLS` | `*` | | Tools whose outputs the view may page (see the [server README](../README.md#pflash)); a comma-separated list names tools, empty pages none |
+| `PFLASH_RECALL`, `PFLASH_RECALL_GATE` | `1`, `0.075` | | Recall for a new question, and the share of score mass outside the view below which nothing is recalled (`off` recalls up to the regions' caps) |
 | `PFLASH_CHAT_SKELETON_TOKENS` | `256` | | Integer >= 0; capped at 2^20 |
 | `PFLASH_CHAT_HISTORY_QUERIES` | `3` | | Integer >= 0; capped at 8 earlier user turns |
-| `PFLASH_CHAT_REBUILD_RATIO` | `2` | | Finite number >= 0; `0` rebuilds only at the context limit |
-| `PFLASH_CHAT_REBUILD_MIN_TOKENS` | `0` | `65536` | Integer >= 0; smallest view eligible for drift rebuild; capped at 2^30 |
-| `PFLASH_ARRIVE` | `0` | `1` | Score only a large newly arriving region |
-| `PFLASH_SELECT_PARAGRAPH_JOIN` | `1` | `0` | Insert paragraph breaks between nonadjacent kept spans |
-| `PFLASH_FALLBACK_SPREAD` | off | `0.11` | Positive finite threshold; unset, empty, `0` or `off` disables it. Applies to whole-prompt selections, not region plans |
-| `PFLASH_FAIL_CLOSED` | `0` | | `0` serves raw after compression failure when it fits; `1` returns the error. Keep-history admission still serves raw |
+| `PFLASH_FALLBACK_SPREAD` | off | | Positive finite threshold; set, the selection trace records the relevance spread. It no longer decides how a request is served |
+| `PFLASH_FAIL_CLOSED` | `0` | | `0` serves the newest content verbatim after a failed drafter pass; `1` returns the error |
 | `PFLASH_DRAFTER_SESSIONS` | `2` | | Integer >= 0; capped at 16; `0` scores from scratch. Stage 2 uses its own rows and ignores this setting |
 | `PFLASH_DRAFTER_TRIM_POOL` | `1` | | Release cached temporary allocations from a resident drafter's pool |
 | `PFLASH_SESSION_OFFLOAD_PINNED` | `0` | | Plain host memory; `1` opts into pinned host allocations |
@@ -47,10 +42,10 @@ allowed below. Valid integer overrides retain their existing upper clamps.
 
 | Variable | Built-in default | Release profile | Values / requirements |
 |---|---|---|---|
-| `PFLASH_SCORING_HEAD_GGUF` | unset | | Trained head file; otherwise built-in attention-mass scorer. Setting it selects the release profile |
+| `PFLASH_SCORING_HEAD_GGUF` | unset | | Trained head file, required by `--pflash on`. Setting it selects the release profile |
 | `PFLASH_SEGMENT_PROBE_GGUF` | unset | | Segment probe file; otherwise fixed chunks |
 | `PFLASH_REQUEST_PROBE_GGUF` | unset | | Request probe file; required for query-probe selection outside the test stub |
-| `PFLASH_SELECT_MODE` | unset: legacy | `budget_only` | `budget_only`, `top_p`, `top_k`; setting a mode enables strict selection |
+| `PFLASH_SELECT_MODE` | unset (refused) | `budget_only` | `budget_only`, `top_p`, `top_k`; the view needs strict selection, so it must be set (the release profile sets it) |
 | `PFLASH_SELECT_CHUNK_SIZE` | scheduled in strict mode | `256` | Positive integer; 128 below 500 input tokens, 512 below 3000, otherwise 1024 |
 | `PFLASH_SELECT_QUERY_TOKENS` | `8` | `128` | Integer in [1, 512] |
 | `PFLASH_SELECT_QUERY_PARSER` | `arbitrary_tail` | | `arbitrary_tail` or `latest_user`; default uses the latest user turn in chat |
@@ -59,11 +54,8 @@ allowed below. Valid integer overrides retain their existing upper clamps.
 | `PFLASH_SELECT_QUERY_PROBE` | `0` | `1` with the request probe | `1` replaces scoring windows with request-probe query tokens; needs strict head selection |
 | `PFLASH_SELECT_SEGMENTS` | `auto` | `probe` with the segment probe | `auto`, `fixed`, `probe`; auto uses probe segments when loaded and the probe finds at least 4 boundaries; probe always does |
 | `PFLASH_SELECT_SCORE` | `auto` | `density` | `auto`, `sum`, `density`; auto uses density for probe segments, sum for fixed chunks |
-| `PFLASH_SELECT_SCORER`, `PFLASH_SELECT_SPLIT` | `head`, `0.5` | | `head`, `legacy`, `split`; split fraction finite and in (0, 1) |
+| `PFLASH_SELECT_SCORER` | `head` | | `head`; `legacy` and `split` give no per-candidate scores and are refused at startup |
 | `PFLASH_SELECT_TOP_P`, `PFLASH_SELECT_TOPK` | `0.95`, unset | Top-p finite in (0, 1]; top-k positive integer, required in `top_k` mode |
-| `PFLASH_SELECT_STRATEGY` | `segments` | `segments` or `fold`; fold needs `budget_only` and the head scorer |
-| `PFLASH_SELECT_FOLD_K`, `PFLASH_SELECT_FOLD_CAP`, `PFLASH_SELECT_FOLD_HEAD` | `20`, `1500`, `150` | K and cap >= 1, head >= 0; with fold, head cannot exceed cap |
-| `PFLASH_SELECT_FOLD_PARAGRAPHS` | `1` | Paragraph completion as fold's last fallback |
 
 Query-probe, identifier and spread switches modify selection; they do not
 enable strict selection on their own.
@@ -82,10 +74,8 @@ enable strict selection on their own.
 | `PFLASH_EVAL_REF_IDENT_QUERY` | `off` | `off` or `heur`; heuristic evaluation arm needs strict head selection and excludes query-probe selection |
 | `PFLASH_QUERY_GRID`, `PFLASH_QUERY_GRID_OUT` | unset | Replay input and append-only result file; grid needs query-probe selection and an output path |
 | `PFLASH_QUERY_ORACLE_DIR` | unset | Oracle evaluation output during grid replay |
-| `PFLASH_QWEN35_LEGACY_SCORER` | `0` | Force the original Qwen3.5 scorer |
 | `PFLASH_SELECT_QUERY_PROBE_STUB` | `0` | Test-only request-probe stub |
 | `PFLASH_COMPRESS_ANCHOR_RADIUS`, `PFLASH_COMPRESS_MAX_ANCHOR_HITS` | tier default | Legacy anchor controls |
-| `PFLASH_FREEZE_HOT_WINDOW` | `2` | FlowKV's recent uncompressed message window |
 
 Query tuning overrides require positive candidates or pinning. TW/END blend
 overrides additionally require candidates. Candidates, pinning and grid replay
@@ -94,6 +84,18 @@ need the segment probe and cannot combine with request stage 2.
 `PFLASH_TRACE_PATH` and `PFLASH_VIEW_TRACE_PATH` append selection and served-view
 JSONL. `PFLASH_TRACE_REQUEST_FEATURES`, `PFLASH_TRACE_REQUEST_LOGITS` and
 `PFLASH_TRACE_STAGE2_FEATURES` retain the feature/logit diagnostics.
+
+## Retired settings
+
+These settings of the former chat view and FlowKV are no longer read; with
+PFlash on, startup prints a line when one is set (for `PFLASH_UNIFIED`,
+always): `PFLASH_CHAT_VIEW`, `PFLASH_CHAT_RECALL`,
+`PFLASH_CHAT_COMPRESS_NEW_TOKENS`, `PFLASH_CHAT_REBUILD_RATIO`,
+`PFLASH_CHAT_REBUILD_MIN_TOKENS`, `PFLASH_ARRIVE`, `PFLASH_AGENT_PASTE`,
+`PFLASH_SELECT_PARAGRAPH_JOIN`, `PFLASH_ADMISSION`, `PFLASH_FREEZE_HOT_WINDOW`
+and `PFLASH_UNIFIED`. `--disk-prefix-cache-compress` has no effect.
+`PFLASH_SELECT_STRATEGY=fold` and `PFLASH_QWEN35_LEGACY_SCORER=1` give no
+per-candidate scores and are refused at startup.
 
 ## Release profile
 
@@ -109,7 +111,7 @@ export PFLASH_REQUEST_PROBE_GGUF=/path/to/request-probe.gguf
 
 luce_server /path/to/target.gguf \
   --prefill-drafter /path/to/Qwen3.5-0.8B.gguf \
-  --pflash on --prefill-skip-park
+  --prefill-skip-park
 ```
 
 The server installs the profile's environment variables at startup and logs
@@ -119,13 +121,8 @@ that is already set keeps its value, and `--prefill-threshold`,
 profile's threshold or curve. `PFLASH_SELECT_QUERY_PROBE=1` needs the request
 probe, and the query candidates and pin need both probes. They also yield to
 the experiment arms they cannot combine with: another scorer, the identifier
-query, request stage 2, or `PFLASH_SELECT_QUERY_PROBE=0`. Without a head the
-built-in defaults apply, as before.
+query, request stage 2, or `PFLASH_SELECT_QUERY_PROBE=0`.
 
 `--prefill-skip-park` stays opt-in. It keeps the target resident while the
 drafter scores, which the measurements used on a 32 GB card at
 `--max-ctx 139264`; on smaller cards the two may not fit together.
-
-The obsolete `PFLASH_COLD_HISTORY` and `PFLASH_AGENT_HISTORY` names have been
-removed: cache admission keeps tool history raw, with paste compression behind
-`PFLASH_AGENT_PASTE`. The active experimental families above remain intact.

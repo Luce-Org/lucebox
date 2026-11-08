@@ -144,10 +144,10 @@ Untagged variables are operational tuning knobs.
 | `LUCE_FP_USE_BSA` | Gemma 4 sliding-window prefill: dispatch the FlashPrefill sparse forward through the BSA launcher (CUTLASS on CUDA, rocWMMA on HIP). Enabled by presence; on by default with PFlash. The PFlash scorer does not read it. |
 | `LUCE_FP_HIP_ROW` | HIP row-kernel path for flash prefill. |
 | `LUCE_FP_PROFILE` / `LUCE_FP_DUMP_COUNTS` | 🐛 **debug** FlashPrefill profiling/debug. |
-| `LUCE_PFLASH` | Docker entrypoint: `on` passes `--pflash on`. |
+| `LUCE_PFLASH` | Docker entrypoint: `auto` (default), `on` or `off`, passed as `--pflash`. With `auto`, PFlash is on for supported targets when `LUCE_PREFILL_DRAFTER` (an existing file) and `PFLASH_SCORING_HEAD_GGUF` are set. |
 | `LUCE_PREFILL_THRESHOLD` | Prefill length threshold. |
-| `LUCE_PREFILL_DRAFTER` | Drafter participation during prefill. |
-| `LUCE_PREFILL_KEEP` | Keep prefill cache across requests. |
+| `LUCE_PREFILL_DRAFTER` | Docker entrypoint: the PFlash drafter GGUF (Qwen3.5-0.8B), passed as `--prefill-drafter` when `LUCE_PFLASH` is not `off`. |
+| `LUCE_PREFILL_KEEP` | Docker entrypoint: fraction of source tokens PFlash keeps, passed as `--prefill-keep-ratio`. |
 | `LUCE_PREFILL_CACHE_SLOTS` / `LUCE_PREFIX_CACHE_SLOTS` | Optional prefill/prefix cache slot override. When unset, the container preserves the native server defaults (prefix: 32; exact prefill: 0). Set either value to `0` for an explicit opt-out. |
 | `LUCE_PREFIX_CACHE_MAX_MIB` | Container-entrypoint equivalent of `--prefix-cache-max-mib`; the native `luce_server` binary does not read it. When unset, the server default `auto` applies. |
 | `LUCE_PREFILL_POOL_TRIM_TOKENS` | 🔀 **kill-switch** Interval (default 8192 tokens, `0` = off) for trimming cached legacy CUDA/HIP pool allocations between completed Qwen3.5 prefill chunks, so a single long prefill does not exhaust VRAM before request cleanup. |
@@ -256,7 +256,6 @@ Untagged variables are operational tuning knobs.
 | `GGML_CUDA_BATCH_PEER_COPIES` | Batch ordered CUDA/HIP peer copies behind one dependency per source/destination pair. |
 | `LUCE_MMQ_FULL_BATCH_MIN` / `LUCE_MMQ_SUB_BATCH` | MMQ batch thresholds. |
 | `LUCE_CUDA_MMVQ_TOKENWISE` / `LUCE_CUDA_MMVQ_MOE_TOKENWISE` / `LUCE_CUDA_MMVQ_MOE_KERNEL` | MMVQ token-wise / MoE kernel selection. |
-| `LUCE_GDN_FORCE_GROUPED_COLS` / `LUCE_GDN_NO_GROUPED_COLS` | Gated-delta-net grouped-column control. |
 | `LUCE_NO_MASK` | 🐛 **debug** Disable attention masking (ablation). |
 
 ## Top-k kernels
