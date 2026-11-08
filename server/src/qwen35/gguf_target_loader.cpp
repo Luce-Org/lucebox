@@ -51,6 +51,7 @@
 #include "common/gguf_mmap.h"
 #include "common/tensor_file_reader.h"
 #include "common/gguf_bounds.h"
+#include "glue_fusions.h"
 
 #include <cinttypes>
 #include <cstdint>
@@ -713,6 +714,9 @@ bool load_target_gguf_partial(const std::string & path,
     // first tensor's byte size keeps the second one aligned.
     const bool can_stack = !plan.metadata_only && !ggml_backend_buft_is_meta(buft) &&
                            std::getenv("LUCE_QWEN35_NO_STACK") == nullptr;
+    // gate|up stack (glue_fusions.h): also place ffn_gate|ffn_up
+    // back to back and alias them as one stacked weight.
+    const bool gate_up_stack = luce::qwen35::glue::gate_up_stack_on() && can_stack;
     if (can_stack) {
         auto find_alloc = [&](const std::string & name) -> int {
             for (size_t i = 0; i < allocs.size(); i++) {
@@ -726,7 +730,9 @@ bool load_target_gguf_partial(const std::string & path,
         static const char * const kPairs[][2] = {
             { ".attn_gate.weight", ".attn_qkv.weight"  },
             { ".ssm_beta.weight",  ".ssm_alpha.weight" },
+            { ".ffn_gate.weight",  ".ffn_up.weight"    },   // gate|up stack only
         };
+        const size_t n_pairs = gate_up_stack ? 3 : 2;
         std::vector<TargetTensorAlloc> ordered;
         ordered.reserve(allocs.size());
         std::vector<bool> taken(allocs.size(), false);
@@ -735,7 +741,8 @@ bool load_target_gguf_partial(const std::string & path,
             const std::string name = allocs[i].tensor->name;
             int first = -1, second = -1;
             if (name.rfind("blk.", 0) == 0) {
-                for (const auto & pr : kPairs) {
+                for (size_t pi = 0; pi < n_pairs; ++pi) {
+                    const auto & pr = kPairs[pi];
                     for (int m = 0; m < 2; m++) {
                         // Exact-suffix match only: a suffix-superset name
                         // (e.g. ".attn_qkv.weight.scale") must not trigger
@@ -879,11 +886,12 @@ bool load_target_gguf_partial(const std::string & path,
             // Alias tensors over adjacent pairs. They read the same bytes as
             // the two source tensors (no copy, no extra VRAM).
             ggml_init_params sip{};
-            sip.mem_size   = (2 * n_layer + 8) * ggml_tensor_overhead();
+            sip.mem_size   = ((gate_up_stack ? 3 : 2) * n_layer + 8) * ggml_tensor_overhead();
             sip.mem_buffer = nullptr;
             sip.no_alloc   = true;
             out.stack_ctx = ggml_init(sip);
             int n_stacked = 0;
+            int n_gate_up = 0;
             auto make_stack = [&](ggml_tensor * first, ggml_tensor * second,
                                   const char * name) -> ggml_tensor * {
                 if (!first || !second || !out.stack_ctx) return nullptr;
@@ -911,9 +919,20 @@ bool load_target_gguf_partial(const std::string & path,
                 L.wqkv_z = make_stack(L.wqkv_gate, L.wqkv, nm);
                 std::snprintf(nm, sizeof(nm), "blk.%d.ssm_beta_alpha.stacked", il);
                 L.ssm_ba = make_stack(L.ssm_beta, L.ssm_alpha, nm);
+                // build_swiglu_ffn splits the stack at w_gate's row count,
+                // so the two halves must have the same rows.
+                if (gate_up_stack && L.w_gate && L.w_up && L.w_gate->ne[1] == L.w_up->ne[1]) {
+                    std::snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_up.stacked", il);
+                    L.ffn_gate_up = make_stack(L.w_gate, L.w_up, nm);
+                    n_gate_up += L.ffn_gate_up != nullptr;
+                }
             }
             if (n_stacked > 0) {
                 std::fprintf(stderr, "[loader] stacked %d projection pairs (zero-copy aliases)\n", n_stacked);
+            }
+            if (gate_up_stack) {
+                std::fprintf(stderr, "[loader] gate|up stack: %d of %d layers have a "
+                             "stacked ffn_gate|ffn_up\n", n_gate_up, (int) n_layer);
             }
         }
     }

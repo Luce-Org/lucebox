@@ -353,21 +353,13 @@ static int run_child(const char * mode, const char * output_path) {
         std::printf("[mmid-grouped-test] SKIP: no supported GPU for grouped MMID\n");
         return 77;
     }
+    // The legacy arm runs the unfused ops.
+    ggml_backend_cuda_set_fusion_disabled_override(!grouped && !masked_fused && !direct);
 #if defined(_WIN32)
-    if (!grouped && !masked_fused && !direct) {
-        _putenv_s("GGML_CUDA_DISABLE_FUSION", "1");
-    } else {
-        _putenv_s("GGML_CUDA_DISABLE_FUSION", "");
-    }
     if (direct) {
         _putenv_s("LUCE_MMID_GROUPED", "0");
     }
 #else
-    if (!grouped && !masked_fused && !direct) {
-        setenv("GGML_CUDA_DISABLE_FUSION", "1", 1);
-    } else {
-        unsetenv("GGML_CUDA_DISABLE_FUSION");
-    }
     if (direct) {
         setenv("LUCE_MMID_GROUPED", "0", 1);
     }

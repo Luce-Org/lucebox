@@ -76,6 +76,12 @@ GGML_BACKEND_API size_t ggml_backend_cuda_trim_pool(ggml_backend_t backend);
 // previous value so scoped callers can restore nested overrides correctly.
 GGML_BACKEND_API bool ggml_backend_cuda_set_graphs_disabled_override(bool disabled);
 
+// Tests only: turn the graph-node fusions off (process-wide), to compare the
+// fused kernels with the unfused ops. Returns the previous value.
+GGML_BACKEND_API bool ggml_backend_cuda_set_fusion_disabled_override(bool disabled);
+// Whether the graph-node fusions run: true unless a test turned them off.
+GGML_BACKEND_API bool ggml_backend_cuda_fusion_enabled(void);
+
 // Number of launches of the dense F32 dim-0 concat-transpose specialization.
 // Intended for focused correctness tests of the dispatch guard.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_concat_transpose_f32_count(void);
@@ -88,6 +94,20 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mla_stream_topk_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count(void);
+// Calling-thread count of MMQ calls that skipped their src1 quantize because
+// the Q8 memo served an earlier call's q8_1.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_glue_q8_memo_hit_count(void);
+
+// Tests only: turn the Q8 memo on or off, to compare its outputs bit for bit
+// with per-call quantization. On by default.
+GGML_BACKEND_API void ggml_backend_cuda_set_q8_memo_override(bool on);
+
+// Row stacking (the Qwen3.5 gate|up stack): nullptr when a MUL_MAT of `weight`
+// (two weights stacked by rows, the first `rows_first` rows one member) with
+// `ncols` F32 columns computes every output row bit-identically to a MUL_MAT
+// of its member alone on this backend's device, else the reason it may not.
+GGML_BACKEND_API const char * ggml_backend_cuda_row_stack_inexact(
+        ggml_backend_t backend, const struct ggml_tensor * weight, int64_t rows_first, int64_t ncols);
 
 // Calling-thread count of MMQ calls served by an RDNA4 tile twin with
 // `tile_rows` rows (64 or 32, mmq_tile_twins.h);

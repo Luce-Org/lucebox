@@ -1584,9 +1584,16 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
     GGML_ASSERT(ggml_are_same_stride(src_q, src_k));
     GGML_ASSERT(src_g->ne[0] == 1 || kda);
+    // ggml_gated_delta_net_shared_gates (op_params[12]): scalar g and beta may
+    // be strided views with one layout, as in the mapped verify. Every kernel
+    // below reads both at sequence*sb3 + t*sb2 + h*sb1 (beta's strides).
+    const bool    shared_gates = ggml_get_op_params_i32(dst, 12) != 0;
+    GGML_ASSERT(!shared_gates || !kda);
     GGML_ASSERT(ggml_is_contiguous(src_g) ||
-                (verify_readonly && ggml_is_contiguous_rows(src_g) && ggml_are_same_stride(src_g, src_beta)));
-    GGML_ASSERT(ggml_is_contiguous(src_beta) || (verify_readonly && ggml_is_contiguous_rows(src_beta)));
+                ((verify_readonly || shared_gates) && ggml_is_contiguous_rows(src_g) &&
+                 ggml_are_same_stride(src_g, src_beta)));
+    GGML_ASSERT(ggml_is_contiguous(src_beta) ||
+                ((verify_readonly || shared_gates) && ggml_is_contiguous_rows(src_beta)));
     GGML_ASSERT(ggml_is_contiguous(src_state));
     if (src_parent) {
         GGML_ASSERT(src_parent->type == GGML_TYPE_I32);
