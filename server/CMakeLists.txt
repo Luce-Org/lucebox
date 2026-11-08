@@ -2865,6 +2865,7 @@ if(LUCE_TESTS)
             test/unit/test_kvflash_pager_clean_evict.cpp
             test/unit/test_kvflash_prefill_reselect.cpp
             test/unit/test_kvflash_m5_rescore.cpp
+            test/unit/test_pflash_probe_boundary.cpp
             test/unit/test_kvflash_pin_preamble.cpp
             test/unit/test_qwen35moe_routing_stats.cpp
             test/unit/test_qwen35moe_expert_placement.cpp
