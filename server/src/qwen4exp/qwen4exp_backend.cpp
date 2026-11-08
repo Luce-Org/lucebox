@@ -141,7 +141,7 @@ static size_t qwen4exp_free_memory(ggml_backend_t backend) {
 
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         Qwen4ExpCache & cache, int slots, int resident_slots, size_t * snapshot_budget, Qwen4ExpChunkPlan * plan,
-        size_t snapshot_keep, size_t reserved) {
+        size_t snapshot_keep, size_t reserved, int restore_spacing) {
     if (slots < 1 || resident_slots < 1 || resident_slots > slots) return 0;
     const size_t free_now = qwen4exp_free_memory(backend);
     const size_t available = free_now > reserved ? free_now - reserved : 0;
@@ -284,11 +284,17 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         plan->layer_bytes = (size_t) slots * layer;
         if (plan->required > available) return 0;   // the context fit moves on without searching smaller chunks
     }
+    const auto restore_point_spacing = [restore_spacing] { return restore_spacing; };
+    const size_t min_snapshot = snapshot_budget
+        ? qwen4exp_snapshot_bytes(
+              backend, cache,
+              std::min(cache.max_ctx, restore_point_spacing()))
+        : 0;
     const int reserved_rows = !snapshot_budget ? floor_rows
         : qwen4exp_reserved_rows(cache.max_ctx, available, fixed, chunk_workspace, floor_rows,
                                  std::min(kQwen4ExpPreferredChunk, max_rows), std::min(*snapshot_budget, snapshot_keep));
     const int chunk = qwen4exp_fit_chunk(cache.max_ctx, available, fixed, chunk_workspace, snapshot_budget,
-                                         reserved_rows, max_rows);
+                                         reserved_rows, max_rows, min_snapshot);
     if (plan && chunk > 0) {
         const size_t workspace = chunk_workspace(plan->rows > 0 ? plan->rows : chunk);
         plan->chunk_bytes = workspace == SIZE_MAX ? SIZE_MAX
@@ -427,7 +433,9 @@ bool Qwen4ExpBackend::load_target() {
         }
     }
     if (!load_hot_experts()) return false;
-    if (snapshot_budget_ != SIZE_MAX)
+    if (snapshot_budget_ == 0)
+        std::fprintf(stderr, "[qwen4exp] prefix snapshots disabled: memory allowance insufficient for one checkpoint\n");
+    else if (snapshot_budget_ != SIZE_MAX)
         std::fprintf(stderr, "[qwen4exp] prefix snapshot allowance=%zu bytes\n", snapshot_budget_);
     else if (snap_backend_ != backend_)
         std::fprintf(stderr, "[qwen4exp] prefix snapshots in system memory\n");
@@ -501,7 +509,9 @@ int Qwen4ExpBackend::plan_chunk(Qwen4ExpChunkPlan * plan) {
     const int slots = cfg_.max_concurrency;
     const int fit = qwen4exp_select_chunk(backend_, weights_, cache_, slots, 1,
                                           allowance(slots > 1 ? 2 * (size_t) slots + 1 : 3), plan,
-                                          snapshot_bytes_estimate(cache_.max_ctx), pflash_reserve(backend_));
+                                          snapshot_bytes_estimate(cache_.max_ctx),
+                                          pflash_reserve(backend_),
+                                          restore_point_spacing());
     return cfg_.chunk > 0 && fit > 0 ? explicit_chunk : fit;
 }
 

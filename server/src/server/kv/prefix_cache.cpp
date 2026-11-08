@@ -131,10 +131,10 @@ PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer,
     disabled_ = false;
     if (max_resident_bytes_ > 0) {
         std::fprintf(stderr, "[pc] enabled: cap=%d family=%s resident_budget=%zu MiB\n",
-                     cap_, markers_.family.c_str(), max_resident_bytes_ / (1024 * 1024));
+                     cap_.load(std::memory_order_relaxed), markers_.family.c_str(), max_resident_bytes_ / (1024 * 1024));
     } else {
         std::fprintf(stderr, "[pc] enabled: cap=%d family=%s\n",
-                     cap_, markers_.family.c_str());
+                     cap_.load(std::memory_order_relaxed), markers_.family.c_str());
     }
 }
 
@@ -527,7 +527,8 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         std::fprintf(stderr,
             "[pc] inline snap skipped, %s: entries=%zu protected=%d "
             "in_flight=%zu cap=%d restore_slot=%d cut=%d\n",
-            reason, entries_.size(), pins, active_reservations_.size(), cap_,
+            reason, entries_.size(), pins, active_reservations_.size(),
+            cap_.load(std::memory_order_relaxed),
             restore_source_slot, target_cut);
     };
     if ((int)entries_.size() + reserved_free_slots >= cap_) {
@@ -1226,8 +1227,8 @@ void PrefixCache::abort_full_snap(int slot) {
 
 PrefixCache::InlineStats PrefixCache::stats() const {
     InlineStats out{};
-    if (disabled_) return out;
-    out.capacity = cap_;
+    if (disabled_.load(std::memory_order_acquire)) return out;
+    out.capacity = cap_.load(std::memory_order_relaxed);
     out.in_use =
         (int)entries_size_count_.load(std::memory_order_relaxed);
     out.lifetime_hits = lifetime_hits_.load(std::memory_order_relaxed);

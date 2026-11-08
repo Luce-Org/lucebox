@@ -80,7 +80,11 @@ public:
     PrefixCache(int cap, const Tokenizer & tokenizer,
                 size_t max_resident_bytes = 0);
 
-    bool disabled() const { return disabled_; }
+    bool disabled() const { return disabled_.load(std::memory_order_acquire); }
+    void disable() {
+        cap_.store(0, std::memory_order_relaxed);
+        disabled_.store(true, std::memory_order_release);
+    }
 
     // Expose chat markers for cold prefix boundary detection.
     const ChatMarkers & chat_markers() const { return markers_; }
@@ -329,8 +333,8 @@ public:
     FullStats full_stats() const;
 
 private:
-    bool disabled_ = true;
-    int cap_ = 0;
+    std::atomic<bool> disabled_{true};
+    std::atomic<int> cap_{0};
     ChatMarkers markers_;
 
     // LRU for inline prefix cache: ordered map of hash → slot.

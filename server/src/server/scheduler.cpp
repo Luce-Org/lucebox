@@ -102,16 +102,53 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // snapshot slots go through checkpoints_.
     EngineCheckpoints engine_checkpoints(engine, checkpoints_);
     const int n_slots = engine.slot_count();
-    if (config_.concurrent_prefix_cache &&
-        config_.concurrent_prefix_cache_max_bytes == ServerConfig::kPrefixCacheBudgetAuto) {
-        const size_t per = engine_checkpoints.estimate_bytes(engine.max_context());
-        if (per > 0) {
-            const size_t bytes = concurrent_prefix_budget(per, n_slots);
-            prefix_cache_.set_max_resident_bytes(bytes);
+    if (config_.concurrent_prefix_cache) {
+        if (!engine_checkpoints.supported()) {
+            prefix_cache_.disable();
             std::fprintf(stderr,
-                "[pc] concurrent prefix budget (auto): %zu MiB = %d slots, %zu MiB per "
-                "checkpoint at %d tokens\n",
-                bytes / (1024 * 1024), n_slots, per / (1024 * 1024), engine.max_context());
+                "[pc] concurrent prefix cache disabled: engine does not support prefix store\n");
+        } else if (backend_.snapshot_allowance_bytes() == 0) {
+            prefix_cache_.disable();
+            std::fprintf(stderr,
+                "[pc] concurrent prefix cache disabled: backend snapshot allowance is 0 bytes\n");
+        } else if (config_.concurrent_prefix_cache_max_bytes == ServerConfig::kPrefixCacheBudgetAuto) {
+            const size_t per = engine_checkpoints.estimate_bytes(engine.max_context());
+            if (per > 0) {
+                const size_t bytes = concurrent_prefix_budget(per, n_slots);
+                if (bytes == 0) {
+                    prefix_cache_.disable();
+                    std::fprintf(stderr,
+                        "[pc] concurrent prefix cache disabled: concurrent prefix budget is 0 bytes\n");
+                } else {
+                    prefix_cache_.set_max_resident_bytes(bytes);
+                    std::fprintf(stderr,
+                        "[pc] concurrent prefix budget (auto): %zu MiB = %d slots, %zu MiB per "
+                        "checkpoint at %d tokens\n",
+                        bytes / (1024 * 1024), n_slots, per / (1024 * 1024), engine.max_context());
+                }
+            } else {
+                prefix_cache_.disable();
+                std::fprintf(stderr,
+                    "[pc] concurrent prefix cache disabled: estimated checkpoint size is 0 bytes\n");
+            }
+        } else {
+            const size_t configured = config_.concurrent_prefix_cache_max_bytes;
+            const size_t allowance = backend_.snapshot_allowance_bytes();
+            const size_t bytes = std::min(configured, allowance);
+            if (bytes == 0) {
+                prefix_cache_.disable();
+                std::fprintf(stderr,
+                    "[pc] concurrent prefix cache disabled: %s\n",
+                    allowance == 0 ? "backend snapshot allowance is 0 bytes"
+                                   : "configured budget is 0 bytes");
+            } else {
+                if (bytes < configured) {
+                    std::fprintf(stderr,
+                        "[pc] concurrent prefix budget clamped to backend allowance: %zu MiB (configured %zu MiB)\n",
+                        bytes / (1024 * 1024), configured / (1024 * 1024));
+                }
+                prefix_cache_.set_max_resident_bytes(bytes);
+            }
         }
     }
     std::vector<SchedSlot> slots((size_t)n_slots);

@@ -673,6 +673,8 @@ struct PrefixCacheBudget {
 // and, above that, at most memory / 4 when memory is known (non-zero).
 size_t auto_concurrent_prefix_budget(size_t per_checkpoint, int slots, size_t memory);
 
+size_t budgetable_memory_bytes();
+
 PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
                                               const ModelBackend & backend);
 
