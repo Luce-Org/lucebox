@@ -44,3 +44,14 @@ TEST_CASE(KvflashM5RescoreFixture, query_key_hashes_the_span_only) {
     CHECK(kvflash_m5_query_key(a, 2, 5) != kvflash_m5_query_key(a, 2, 6));
     CHECK(kvflash_m5_query_key(a, 1, 5) != kvflash_m5_query_key(a, 2, 5));
 }
+
+TEST_CASE(KvflashM5RescoreFixture, reused_scores_pad_new_chunks_with_the_lowest_score) {
+    const std::vector<float> last = {0.5f, -2.0f, 3.0f};
+    const std::vector<float> r = luce::common::kvflash_m5_reuse_scores(last, 5);
+    CHECK_EQUAL(5, (int)r.size());
+    CHECK_EQUAL(3.0f, r[2]);
+    CHECK_EQUAL(-2.0f, r[3]);
+    CHECK_EQUAL(-2.0f, r[4]);
+    CHECK_EQUAL(2, (int)luce::common::kvflash_m5_reuse_scores(last, 2).size());
+    CHECK_EQUAL(0, (int)luce::common::kvflash_m5_reuse_scores({}, 4).size());
+}
