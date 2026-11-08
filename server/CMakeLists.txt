@@ -1288,6 +1288,19 @@ if(LUCE_TESTS)
     endif()
 
     if(LUCE_GPU_BACKEND STREQUAL "cuda"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_kvflash_page.cpp")
+        add_executable(bench_kvflash_page test/bench/bench_kvflash_page.cpp)
+        target_compile_definitions(bench_kvflash_page PRIVATE LUCE_BACKEND_CUDA=1)
+        target_include_directories(bench_kvflash_page PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(bench_kvflash_page PRIVATE
+            ${LUCE_GGML_BACKEND_TARGET} ggml ggml-base CUDA::cudart)
+    endif()
+
+    if(LUCE_GPU_BACKEND STREQUAL "cuda"
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_cuda_comm_api.cpp")
         add_executable(test_cuda_comm_api test/unit/test_cuda_comm_api.cpp)
         target_include_directories(test_cuda_comm_api PRIVATE
