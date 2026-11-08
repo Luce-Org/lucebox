@@ -56,6 +56,16 @@ def approx_token_count(text: str) -> int:
     return max(1, len(re.findall(r"\S+", text)))
 
 
+def _token_count(value: Any) -> int | None:
+    """Return a usage token count, or None if the server sent a bad value.
+
+    bool is a subclass of int, so `True` would otherwise pass as 1 token.
+    """
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
 def _extract_numeric_answer(text: str) -> str | None:
     """Extract a numeric answer from model output for GSM-style problems."""
     think_end = text.rfind("</think>")
@@ -215,13 +225,15 @@ def run_case(
         )
         elapsed = time.perf_counter() - start
         text = extract_text(response)
-        usage = response.get("usage") or {}
-        completion_tokens = usage.get("completion_tokens")
+        usage = response.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+        completion_tokens = _token_count(usage.get("completion_tokens"))
         token_source = "usage"
-        if not isinstance(completion_tokens, int) or completion_tokens <= 0:
+        if completion_tokens is None or completion_tokens == 0:
             completion_tokens = approx_token_count(text)
             token_source = "approx_words"
-        prompt_tokens = usage.get("prompt_tokens")
+        prompt_tokens = _token_count(usage.get("prompt_tokens"))
         pass_expected, failures = expected_pass(case, text)
         gold_correct, gold_detail = score_gold_answer(case, text)
         runs.append(
