@@ -109,6 +109,7 @@ struct KvFlashStats {
     int64_t page_ins   = 0;
     int64_t host_bytes = 0;   // backing store currently held on host
     int64_t moved_bytes = 0;  // cumulative D2H+H2D traffic
+    int64_t d2h_skipped = 0;  // page-outs whose D2H was skipped: host copy already equal to the block
 };
 
 class KvFlashPager {
@@ -351,6 +352,7 @@ public:
             ChunkState & st = chunks_[(size_t)c];
             if (st.block >= 0 || !st.on_host) continue;
             st.block = c;
+            st.dirty = false;
             copy_chunk(c, c, /*to_host=*/false);
             stats_.page_ins++;
             stats_.moved_bytes += chunk_bytes_;
@@ -491,7 +493,13 @@ public:
     // Physical pool slot for logical position `pos`. Allocates (and, when
     // the pool is full, evicts) at chunk granularity. Call once per
     // appended token, in logical order.
-    int slot_for(int64_t pos) {
+    // A slot_for() is a row write request: the chunk's host copy (if any) is stale
+    // from here on, so the next page_out copies.
+    int slot_for(int64_t pos) { return slot_for_(pos, /*write=*/true); }
+
+    // `write` false is a pure recall (page_in, deserialize): a chunk restored from
+    // host stays clean, so page_out can skip the D2H while no row is written.
+    int slot_for_(int64_t pos, bool write) {
         const int c = (int)(pos / cfg_.chunk_tokens);
         // cur_chunk_ tracks the append head only; a page_in of an older
         // chunk must not shrink the protected tail window. It must advance
@@ -510,6 +518,7 @@ public:
             st.block = free_blocks_.back();
             free_blocks_.pop_back();
             epoch_++;
+            st.dirty = write || !st.on_host;
             if (st.on_host) {              // recall: restore paged-out bytes
                 copy_chunk(c, st.block, /*to_host=*/false);
                 stats_.page_ins++;
@@ -521,6 +530,7 @@ public:
             // The caller uses this block on the compute stream next.
             fence_page_work_();
         }
+        else if (write) st.dirty = true;
         st.last_use = ++clock_;
         return row_base_ + st.block * cfg_.chunk_tokens + (int)(pos % cfg_.chunk_tokens);
     }
@@ -538,9 +548,13 @@ public:
 #endif
             stats_.host_bytes += (int64_t)chunk_bytes_;
         }
-        copy_chunk(c, st.block, /*to_host=*/true);
+        // A chunk recalled from host and not written since holds the bytes its host
+        // copy already has (every row write goes through slot_for(), which sets dirty).
+        if (has_tensor_storage() && st.on_host && !st.dirty) stats_.d2h_skipped++;
+        else                                                  copy_chunk(c, st.block, /*to_host=*/true);
         zero_block(st.block);
         st.on_host = true;
+        st.dirty = false;
         if (deferred_free_) pending_free_.push_back({st.block, ++record_seq_});
         else                free_blocks_.push_back(st.block);
         st.block = -1;
@@ -590,7 +604,7 @@ public:
     // Recall a chunk into the pool (used by reselect / tests).
     bool page_in(int c) {
         if (c >= (int)chunks_.size() || !chunks_[c].on_host || chunks_[c].block >= 0) return false;
-        return slot_for((int64_t)c * cfg_.chunk_tokens) >= 0;
+        return slot_for_((int64_t)c * cfg_.chunk_tokens, /*write=*/false) >= 0;
     }
 
     // Optional fast path (CUDA). The stream that consumes the pool (the
@@ -1118,7 +1132,7 @@ public:
             std::memcpy(&st.score, lp + c * kLedgerEntry + 4, 4);
             if (exact) continue;
             // slot_for()'s recall branch copies host_data into the new block.
-            if (lp[c * kLedgerEntry] != 0) slot_for((int64_t)c * cfg_.chunk_tokens);
+            if (lp[c * kLedgerEntry] != 0) slot_for_((int64_t)c * cfg_.chunk_tokens, /*write=*/false);
         }
         if (exact) {
             free_blocks_.resize(n_free);
@@ -1131,6 +1145,7 @@ public:
                 if (b < 0) continue;
                 st.block = b;
                 if (st.on_host) {   // recall into the saved block, as slot_for() would
+                    st.dirty = false;
                     copy_chunk((int)c, b, /*to_host=*/false);
                     stats_.page_ins++;
                     stats_.moved_bytes += chunk_bytes_;
@@ -1178,6 +1193,7 @@ private:
     struct ChunkState {
         int      block    = -1;       // pool block index, -1 = not resident
         bool     on_host  = false;    // backing store holds valid bytes
+        bool     dirty    = true;     // resident block may differ from its host copy (a row write, or no copy yet)
         uint64_t last_use = 0;
         float    score    = -std::numeric_limits<float>::infinity();  // QK ledger
 #ifdef KVFLASH_HAS_ASYNC_DMA
@@ -1408,6 +1424,7 @@ private:
                 const size_t n = seg - (size_t)row0 * row;
                 for (int h = 0; h < n_head_kv_; h++) {
                     if (st.block >= 0) {
+                        st.dirty = true;   // device rows change; the host copy no longer equals the block
                         const size_t off = block_off_(st.block, t) +
                                            (size_t)h * t->nb[2] + (size_t)row0 * row;
 #ifdef KVFLASH_HAS_ASYNC_DMA
