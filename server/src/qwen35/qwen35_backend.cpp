@@ -3191,29 +3191,27 @@ Qwen35Backend::KvflashRecallSetup Qwen35Backend::kvflash_recall_setup(const std:
                 : fits ? "fits"
                 : (int)kvf_ids.size() != end_abs ? "prompt ids unknown" : nullptr;
             // LUCE_KVFLASH_M5_RESCORE_TOKENS: the same latest user question over a prompt that extends the last scored
-            // one needs no new drafter pass; the turn prefills normally.
-            bool same_query = false;
+            // one needs no new drafter pass; the turn reselects at R from the last drafter scores.
             if (!skip) {
                 const auto t = luce::common::kvflash_last_human_turn(kvf_ids, w_.im_start_id, w_.user_id, w_.newline_id,
                                                                      w_.im_end_id, w_.tool_response_id);
                 const uint64_t qkey = t.valid() ? luce::common::kvflash_m5_query_key(kvf_ids, t.lo, t.hi) : 0;
                 const uint64_t ph = luce::common::kvflash_uq_hash(kvf_ids, kvflash_m5_last_.end);
                 if (t.valid() && !luce::common::kvflash_m5_should_score(kvflash_m5_last_, qkey, end_abs, ph, kvflash_m5_rescore_tokens_)) {
-                    same_query = true;
-                    std::fprintf(stderr, "[kvflash] prefill reselect mode=5: skipped (same query, %d tokens since last score)\n",
+                    kvflash_scores_ = luce::common::kvflash_m5_reuse_scores(kvflash_m5_scores_, (end_abs + ctk - 1) / ctk);
+                    std::fprintf(stderr, "[kvflash] prefill reselect mode=5: drafter skipped (same query, %d tokens since last score), last scores reused\n",
                                  end_abs - kvflash_m5_last_.end);
                 } else if (!kvflash_pflash2_scores(kvf_ids, ctk, kvflash_scores_, s.m5_ms)) {
                     skip = "drafter scoring failed";
                 } else if (t.valid()) {
                     kvflash_m5_last_ = {true, qkey, end_abs, luce::common::kvflash_uq_hash(kvf_ids, end_abs)};
+                    kvflash_m5_scores_ = kvflash_scores_;
                 } else {
                     kvflash_m5_last_ = {};
                 }
             }
             if (skip) kvflash_m5_last_ = {};
-            if (same_query) {
-                // no drafter call, no reselect at R
-            } else if (skip) {
+            if (skip) {
                 std::fprintf(stderr, "[kvflash] prefill reselect mode=5: skip, %s (LRU)\n", skip);
             } else {
                 s.m5_r = p4.r;

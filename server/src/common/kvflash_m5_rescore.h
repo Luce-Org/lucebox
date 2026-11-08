@@ -5,6 +5,8 @@
 
 #include "fnv.h"
 
+#include <algorithm>
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -34,6 +36,15 @@ inline bool kvflash_m5_should_score(const KvFlashM5Last & last, uint64_t query_k
     if (last.query_key != query_key || last.prefix_hash != prefix_hash_at_last_end) return true;
     const int grown = end_tokens - last.end;
     return grown < 0 || grown >= rescore_tokens;
+}
+
+// The chunk scores a skipped turn applies: the last drafter scores over ``n_chunks`` chunks; chunks it never saw get
+// its lowest score (the recency window keeps them, recall never prefers them over a scored chunk).
+inline std::vector<float> kvflash_m5_reuse_scores(const std::vector<float> & last, int n_chunks) {
+    if (last.empty() || n_chunks <= 0) return {};
+    std::vector<float> r(last.begin(), last.begin() + std::min(last.size(), (size_t)n_chunks));
+    r.resize((size_t)n_chunks, *std::min_element(last.begin(), last.end()));
+    return r;
 }
 
 }  // namespace luce::common
