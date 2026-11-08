@@ -12,6 +12,10 @@ int pflash_scoring_checkpoint(int S) {
     return cut / kScoringResumeGrid * kScoringResumeGrid;
 }
 
+int pflash_scoring_proj_begin(int) { return 0; }
+
+bool pflash_scoring_proj_rows_cover(int, int, int) { return false; }
+
 int pflash_scoring_exact_rows_end(int S) {
     const int cut = S - kScoringCutBack;
     if (cut < kScoringUbatch) return 0;

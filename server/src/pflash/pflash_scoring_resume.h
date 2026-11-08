@@ -21,12 +21,20 @@
 namespace luce::pflash {
 
 constexpr int kScoringResumeGrid = 8192;
+constexpr int kScoringProjChunk = 8192;   // keys / probe / request logits are projected in chunks this long from 0
 constexpr int kScoringUbatch = 1024;
 constexpr int kScoringCutBack = 64;
 
 // The snapshot position a call over ``S`` tokens keeps: the last multiple of the grid at or before S - 64 (0 when
 // there is none: nothing to resume from).
 int pflash_scoring_checkpoint(int S);
+
+// Start of the projection chunk that holds a resume at ``resume`` (a multiple of kScoringProjChunk, <= resume).
+int pflash_scoring_proj_begin(int resume);
+
+// True when the block-14 rows [rows_begin, rows_begin + rows) a session kept cover what a resume at ``resume``
+// re-projects ahead of the resume point: exactly [pflash_scoring_proj_begin(resume), resume).
+bool pflash_scoring_proj_rows_cover(int resume, int rows_begin, int rows);
 
 // Rows this call computes at positions below this are exact for any later prompt that shares them.
 int pflash_scoring_exact_rows_end(int S);

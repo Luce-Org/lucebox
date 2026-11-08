@@ -90,6 +90,65 @@ TEST_CASE(PFlashScoringResumeFixture, a_resumed_call_lands_on_the_fresh_partitio
     }
 }
 
+// The 1024 grid: a call resumes close to where the previous one ended; the 8192 projection chunk that holds the
+// resume point is re-projected whole from the rows the session kept.
+TEST_CASE(PFlashScoringResumeFixture, checkpoint_is_on_the_ubatch_grid) {
+    CHECK(kScoringResumeGrid == kScoringUbatch);
+    CHECK(kScoringProjChunk == 8192);
+    CHECK(pflash_scoring_checkpoint(1024 + 63) == 0);
+    CHECK(pflash_scoring_checkpoint(1024 + 64) == 1024);
+    CHECK(pflash_scoring_checkpoint(21673) == 21504);
+    CHECK(pflash_scoring_checkpoint(32334) == 32256);
+    for (int S : {1100, 9000, 21673, 32334, 63565, 131072}) {
+        CHECK(pflash_scoring_checkpoint(S) == pflash_scoring_exact_rows_end(S));
+    }
+}
+
+TEST_CASE(PFlashScoringResumeFixture, a_longer_prompt_resumes_at_the_previous_calls_checkpoint) {
+    // S=21673 then S=32334 (the lucebox4 night run): resume at 21504, not 16384.
+    const int cp = pflash_scoring_checkpoint(21673);
+    CHECK(cp == 21504);
+    CHECK(pflash_scoring_resume(cp, 21673, 32334, 1 << 30) == 21504);
+    CHECK(pflash_scoring_resume(cp, 21503, 32334, 1 << 30) == 0);       // diverged before it
+    CHECK(pflash_scoring_resume(21505, 32000, 32334, 1 << 30) == 0);    // off the grid
+}
+
+TEST_CASE(PFlashScoringResumeFixture, projection_chunk_start_and_stored_rows) {
+    CHECK(pflash_scoring_proj_begin(0) == 0);
+    CHECK(pflash_scoring_proj_begin(8191) == 0);
+    CHECK(pflash_scoring_proj_begin(8192) == 8192);
+    CHECK(pflash_scoring_proj_begin(21504) == 16384);
+    // Rows [16384, 21504) cover a resume at 21504; fewer, a wrong start, or none do not.
+    CHECK(pflash_scoring_proj_rows_cover(21504, 16384, 21504 - 16384));
+    CHECK(pflash_scoring_proj_rows_cover(21504, 16384, 21504 - 16384 + 1024));
+    CHECK(!pflash_scoring_proj_rows_cover(21504, 16384, 21504 - 16384 - 1));
+    CHECK(!pflash_scoring_proj_rows_cover(21504, 8192, 21504 - 8192));
+    // A resume on a chunk start needs no rows.
+    CHECK(pflash_scoring_proj_rows_cover(16384, 16384, 0));
+    CHECK(pflash_scoring_proj_rows_cover(16384, 0, 0));
+    CHECK(pflash_scoring_proj_rows_cover(0, 0, 0));
+}
+
+TEST_CASE(PFlashScoringResumeFixture, resumed_projection_chunks_are_the_fresh_chunks) {
+    // From proj_begin(r) in steps of 8192 (the last cut at S) the chunk starts are the fresh call's from there on.
+    for (int S : {21673, 32334, 63565, 65600}) {
+        std::vector<int> fresh;
+        for (int b = 0; b < S; b += kScoringProjChunk) fresh.push_back(b);
+        for (int prev : {9000, 21673, 40000, 63565}) {
+            const int r = pflash_scoring_resume(pflash_scoring_checkpoint(prev), std::min(prev, S), S, 1 << 30);
+            if (r == 0) continue;
+            const int pb = pflash_scoring_proj_begin(r);
+            CHECK(pb % kScoringProjChunk == 0);
+            CHECK(pb <= r);
+            CHECK(r - pb < kScoringProjChunk);
+            std::vector<int> mine;
+            for (int b = pflash_scoring_proj_begin(r); b < S; b += kScoringProjChunk) mine.push_back(b);
+            CHECK(mine == std::vector<int>(std::find(fresh.begin(), fresh.end(), pflash_scoring_proj_begin(r)),
+                                           fresh.end()));
+        }
+    }
+}
+
 TEST_CASE(PFlashScoringResumeFixture, query_sets_store_exact_rows_only) {
     PFlashExactRowSets sets(2);
     const int hidden = 2;
