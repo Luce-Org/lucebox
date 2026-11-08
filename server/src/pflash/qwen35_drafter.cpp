@@ -2453,15 +2453,26 @@ static std::vector<int32_t> strict_score_impl(
         }
         ggml_tensor * probs = ggml_soft_max_ext(sctx, logits, mask,
                                                 1.0f / std::sqrt((float)D), 0.0f);
-        ggml_set_output(probs);
-        ggml_build_forward_expand(sgf, probs);
+        // Default: sum over (query, head) per key on device, read back S floats.
+        // PFLASH_TW_HOST_REDUCE=1 keeps the old full-probability readback.
+        static const bool host_reduce = []{
+            const char * e = std::getenv("PFLASH_TW_HOST_REDUCE");
+            return e && e[0] == '1';
+        }();
+        ggml_tensor * out_t = probs;
+        if (!host_reduce) {
+            out_t = ggml_sum_rows(sctx, ggml_cont(sctx,
+                ggml_transpose(sctx, ggml_reshape_2d(sctx, probs, S, (int64_t) nq * H))));
+        }
+        ggml_set_output(out_t);
+        ggml_build_forward_expand(sgf, out_t);
         ggml_gallocr_t salloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
         const bool ok = ggml_gallocr_alloc_graph(salloc, sgf) &&
             ggml_backend_graph_compute(w.backend, sgf) == GGML_STATUS_SUCCESS;
         std::vector<float> probs_h;
         if (ok) {
-            probs_h.resize((size_t)S * nq * H);
-            ggml_backend_tensor_get(probs, probs_h.data(), 0, probs_h.size() * sizeof(float));
+            probs_h.resize(host_reduce ? (size_t)S * nq * H : (size_t)S);
+            ggml_backend_tensor_get(out_t, probs_h.data(), 0, probs_h.size() * sizeof(float));
         }
         ggml_gallocr_free(salloc);
         ggml_free(sctx);
@@ -2481,7 +2492,13 @@ static std::vector<int32_t> strict_score_impl(
             set_last_error(message);
             return false;
         }
-        scoring_head_mean_token_mass(probs_h.data(), S, nq, H, mass);
+        if (host_reduce) {
+            scoring_head_mean_token_mass(probs_h.data(), S, nq, H, mass);
+        } else {
+            const double denominator = (double) H * (double) nq;
+            mass.assign((size_t) S, 0.0f);
+            for (int j = 0; j < S; ++j) mass[(size_t) j] = (float) (probs_h[(size_t) j] / denominator);
+        }
         return true;
     };
     const auto score_window = [&](const ScoredWindow & window, std::vector<float> & mass) -> bool {
