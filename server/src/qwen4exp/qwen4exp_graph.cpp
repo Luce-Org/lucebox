@@ -450,8 +450,9 @@ ggml_tensor * build_moe(ggml_context * c, ggml_tensor * cur,
         return moe_join(c, routed, target);
     }
     ggml_tensor * sel = nullptr, * wsel = nullptr;
-    moe_router(c, cur, L, w, &sel, &wsel, gf != nullptr);
-    if (gf) ggml_build_forward_expand(gf, wsel);
+    // One device: the router keeps its place in the graph. Queued ahead of the experts, steps on gfx1151 alone lose
+    // their bits from run to run (smoke_qwen4exp_forward --mtp, rollback cases).
+    moe_router(c, cur, L, w, &sel, &wsel);
     ggml_tensor * cur3 = ggml_reshape_3d(c, cur, w.n_embd, 1, cur->ne[1]);
     ggml_tensor * down = moe_experts(c, L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps, cur3, sel);
     ggml_tensor * shared = nullptr, * shared_logit = nullptr;
@@ -2871,7 +2872,7 @@ bool qwen4exp_verify_rollback(ggml_backend_t backend, const Qwen4ExpWeights & w,
         // the ~70 state copies (113 MiB on Qwen3.8-Flash-Next) instead of one blit each, ~15 us of launch gap apiece.
         std::vector<ggml_cuda_copy_desc> batch;
         const bool cuda = ggml_backend_is_cuda(backend);
-        ggml_backend_buffer_type_t device_buft = ggml_backend_get_default_buffer_type(backend);
+        ggml_backend_buffer_type_t device_buft = cuda ? ggml_backend_get_default_buffer_type(backend) : nullptr;
         auto on_device = [&](const ggml_tensor * t) {
             return t->buffer && ggml_backend_buffer_get_type(t->buffer) == device_buft;
         };
