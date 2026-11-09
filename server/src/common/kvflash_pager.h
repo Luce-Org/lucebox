@@ -110,6 +110,7 @@ struct KvFlashStats {
     int64_t host_bytes = 0;   // backing store currently held on host
     int64_t moved_bytes = 0;  // cumulative D2H+H2D traffic
     int64_t d2h_skipped = 0;  // page-outs whose D2H was skipped: host copy already equal to the block
+    int64_t fence_points = 0; // block hand-outs that fenced the page stream (a host wait each on HIP when work is queued)
 };
 
 class KvFlashPager {
@@ -832,11 +833,16 @@ public:
         for (int c = 0; c < (int)chunks_.size(); c++) {       // out first: frees blocks
             if (!want[c] && chunks_[c].block >= 0) { page_out_(c, /*lazy_zero=*/true); events++; }
         }
+        // The recalls are one batch on page_stream_ (the block each one reuses was freed on the same stream, so
+        // its page-out orders before its page-in), and no graph runs until the wait below: fencing each hand-out
+        // would be one host wait per chunk on HIP for nothing.
+        defer_fence_ = true;
         for (int c = 0; c < (int)chunks_.size(); c++) {
             if (want[c] && chunks_[c].block < 0 && chunks_[c].on_host) {
                 if (page_in(c)) events++;
             }
         }
+        defer_fence_ = false;
         flush_unzeroed_();   // blocks left free by this reselect must read as zero
         if (has_pending_page_in_) synchronize_paging();
         return events;
@@ -1404,8 +1410,10 @@ private:
     // ponytail: without a registered compute stream this is a host wait, one
     // stall per new chunk after a page-out; registering the stream removes it.
     void fence_page_work_() {
+        if (defer_fence_ || batch_submit_) return;   // reselect() waits once for its whole batch; the arena's step Fence orders its
+        stats_.fence_points++;
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        if (!page_work_queued_ || batch_submit_) return;
+        if (!page_work_queued_) return;
 #ifdef KVFLASH_EVENT_FENCE
         if (compute_stream_ && page_event_) {
             check_(cudaEventRecord(page_event_, page_stream_), "cudaEventRecord(page)");
@@ -1507,6 +1515,7 @@ private:
     uint64_t record_seq_ = 0;
     bool deferred_free_ = false;
     bool batch_submit_ = false;
+    bool defer_fence_ = false;        // inside reselect()'s recall loop: no per-hand-out fence, one wait at its end
     uint64_t generation_ = 0;
     std::vector<uint8_t> zero_buf_;   // used by zero_block() in non-CUDA builds
     std::vector<uint8_t> unzeroed_;   // per-block: freed by a lazy page-out, bytes not zeroed yet (always free)

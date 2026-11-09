@@ -2584,11 +2584,13 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     // every restore path and before the rw.run decision.
     if (kvf_paged && kvflash_score_pool_recent_) {
         const int64_t ins0 = kvflash_pager_.stats().page_ins;
+        const auto t_rr = std::chrono::steady_clock::now();
         const int events = kvflash_pager_.reselect_recent();
+        const double rr_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_rr).count();
         const int64_t ins = kvflash_pager_.stats().page_ins - ins0;
         std::fprintf(stderr, "[kvflash] prefill reselect recent-pool @%d: %d page events; "
-                     "%d in (%.1f MiB H2D)\n", kv_offset, events, (int)ins,
-                     (double)ins * (double)kvflash_pager_.chunk_bytes() / 1048576.0);
+                     "%d in (%.1f MiB H2D) %.1f ms\n", kv_offset, events, (int)ins,
+                     (double)ins * (double)kvflash_pager_.chunk_bytes() / 1048576.0, rr_ms);
     }
     const KvflashRecallSetup recall = kvflash_recall_setup(tokens, kvf_ids, kv_offset, prompt_len, kvf_reselect, images);
     const auto & rw = recall.rw;
@@ -3468,7 +3470,9 @@ void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
         return c < (int)scores.size() ? scores[c] : 1e30f;
     };
     const int64_t ins0 = p.stats().page_ins;
+    const auto t_rs = std::chrono::steady_clock::now();
     const int events = p.reselect(tail);
+    const double paging_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_rs).count();
     const int64_t ins = p.stats().page_ins - ins0;
     std::string ids;
     for (int b : picked) ids += (ids.empty() ? "" : ",") + std::to_string(b);
@@ -3480,6 +3484,8 @@ void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
                  p.resident_blocks(), p.n_pool_blocks(), score_ms, note);
     if (kvflash_select_unit_ != luce::common::kKvFlashRecallUnit)
         std::fprintf(stderr, "[kvflash] prefill reselect picked units of %d chunks\n", kvflash_select_unit_);
+    // Its own line: the pick line above is diffed across builds with only "N ms" masked.
+    std::fprintf(stderr, "[kvflash] prefill reselect paging @%d: %d page events in %.1f ms\n", committed, events, paging_ms);
 }
 
 // Rewind of the pass over [r, end) (mode 4). Everything that can fail
