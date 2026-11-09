@@ -3147,6 +3147,12 @@ void clear_kv_rows_from(TargetCache & cache, int pos) {
             }
         }
     }
+    if (cache.target_feat && pos < cache.target_feat->ne[1]) {
+        const size_t rows = (size_t)(cache.target_feat->ne[1] - pos);
+        ggml_backend_tensor_memset(
+            cache.target_feat, 0, (size_t)pos * cache.target_feat->nb[1],
+            rows * cache.target_feat->nb[1]);
+    }
 }
 
 bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
@@ -3241,6 +3247,10 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
     if (cache.target_feat && snap.target_feat_snap) {
         const size_t feat_nbytes = ggml_nbytes(snap.target_feat_snap);
         ggml_backend_tensor_set(cache.target_feat, snap.target_feat_snap->data, 0, feat_nbytes);
+    }
+
+    if (!skip_kv) {
+        clear_kv_rows_from(cache, snap_pos);
     }
 
     cache.cur_pos  = snap.cur_pos;

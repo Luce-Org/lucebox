@@ -3180,6 +3180,7 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
     std::fprintf(stderr, "[ar-decode] tokens=%d time=%.3f s speed=%.2f tok/s\n",
                  ar_tokens, ar_decode_s,
                  ar_tokens > 0 && ar_decode_s > 0 ? ar_tokens / ar_decode_s : 0.0);
+    cache_.last_tok = out_tokens.empty() ? cache_.last_tok : out_tokens.back();
     return true;
 }
 
@@ -3670,6 +3671,11 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
     double t_spec_step_ema = 0.0;
     double t_ar_step_ema   = 0.0;
     auto live_step_ratio = [&]() {
+        if (sampler_.temp <= 0.0f) {
+            // Under greedy decoding (temp=0), avoid wall-clock timing jitter
+            // altering speculative vs AR burst decisions across runs.
+            return adaptive.step_ratio;
+        }
         return (t_spec_step_ema > 0.0 && t_ar_step_ema > 0.0)
             ? (float)(t_spec_step_ema / t_ar_step_ema) : adaptive.step_ratio;
     };
@@ -5026,6 +5032,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                      100.0 * (double)n_hint_accepted / (double)n_hint_proposed);
     }
 
+    cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
     io.emit(-1);
     return true;
 }
