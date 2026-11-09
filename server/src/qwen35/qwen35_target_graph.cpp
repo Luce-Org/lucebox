@@ -3251,6 +3251,11 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
 
     if (!skip_kv) {
         clear_kv_rows_from(cache, snap_pos);
+    } else if (cache.target_feat && snap_pos < cache.target_feat->ne[1]) {
+        const size_t rows = (size_t)(cache.target_feat->ne[1] - snap_pos);
+        ggml_backend_tensor_memset(
+            cache.target_feat, 0, (size_t)snap_pos * cache.target_feat->nb[1],
+            rows * cache.target_feat->nb[1]);
     }
 
     cache.cur_pos  = snap.cur_pos;

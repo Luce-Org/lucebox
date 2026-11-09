@@ -2971,7 +2971,10 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
         out_tokens.push_back(first_tok);
         io.emit(first_tok);
         if (kvflash_active()) kvflash_history_.push_back(first_tok);
-        if (io.is_cancelled() || IS_EOS_TOK(first_tok, w_)) return true;
+        if (io.is_cancelled() || IS_EOS_TOK(first_tok, w_)) {
+            cache_.last_tok = first_tok;
+            return true;
+        }
         // The first token is pending: the prefill logits produced it, but its
         // K/V row has not been written yet. The first loop iteration below
         // forwards it at `committed`; only that compute may advance the cache.
@@ -5032,7 +5035,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                      100.0 * (double)n_hint_accepted / (double)n_hint_proposed);
     }
 
-    cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
+    cache_.last_tok = last_tok;
     io.emit(-1);
     return true;
 }
