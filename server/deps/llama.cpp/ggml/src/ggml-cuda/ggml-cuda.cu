@@ -1134,6 +1134,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaFree(ds4_hc_split_scratch));
         ds4_hc_split_scratch = nullptr;
     }
+    if (mmq_splitk_counters != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(mmq_splitk_counters));
+    }
 
 #if defined(GGML_HIP_DS4V_VISION)
     if (vision_bias_workspace) {
