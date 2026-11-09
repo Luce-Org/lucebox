@@ -1,7 +1,9 @@
-// The pager's victim tier (CPU ggml backend, no GPU): a paged-out chunk's bytes are kept in a tier beside the pool
-// (device memory on GPU builds) and a recall of a chunk still there copies from the tier instead of the host copy.
-// Residency, page counts and the bytes a recall lands are unchanged; only where they come from differs. The tier
-// is FIFO by page-out, a chunk written after a recall loses its stale tier copy, and truncate drops the dropped.
+// The pager's victim tier: a paged-out chunk's bytes are kept in a tier beside the pool (device memory on GPU
+// builds) and a recall of a chunk still there copies from the tier instead of the host copy. Residency, page counts
+// and the bytes a recall lands are unchanged; only where they come from differs. The tier is FIFO by page-out, a
+// chunk written after a recall loses its stale tier copy, and truncate drops the dropped.
+// GPU builds run the cases on device tensors (the tier is device memory and only engages for them; skipped without
+// a device); CPU builds run them on CPU tensors with the tier in host memory.
 
 #include "CppUnitTestFramework.hpp"
 
@@ -10,6 +12,9 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#ifdef KVFLASH_HAS_ASYNC_DMA
+#include "ggml-cuda.h"
+#endif
 
 #include <cstdint>
 #include <stdexcept>
@@ -26,8 +31,17 @@ struct Harness {
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_t buf = nullptr;
     std::vector<ggml_tensor *> k, v;
-    Harness() {
-        backend = ggml_backend_cpu_init();
+    // on_device: the tensors the tier pairs with on GPU builds (ignored on CPU builds, where only the CPU exists).
+    explicit Harness(bool on_device = true) {
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        if (on_device) {
+            backend = ggml_backend_cuda_init(0);
+            if (!backend) SKIP("no GPU device: the victim tier pairs with device tensors");
+        }
+#else
+        (void)on_device;
+#endif
+        if (!backend) backend = ggml_backend_cpu_init();
         ggml_init_params ip{};
         ip.mem_size = 16 * ggml_tensor_overhead();
         ip.no_alloc = true;
@@ -37,12 +51,15 @@ struct Harness {
             v.push_back(ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 4, kPool, 2));
         }
         buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (!buf) throw std::runtime_error("ggml_backend_alloc_ctx_tensors failed");
     }
     ~Harness() {
         if (buf) ggml_backend_buffer_free(buf);
         if (ctx) ggml_free(ctx);
         if (backend) ggml_backend_free(backend);
     }
+    Harness(const Harness &) = delete;
+    Harness & operator=(const Harness &) = delete;
 };
 KvFlashConfig cfg(int victim_blocks) {
     KvFlashConfig c;
@@ -60,6 +77,7 @@ void tag_k_rows(const Harness & h, const KvFlashPager & p, int c, uint8_t tag) {
     std::vector<uint8_t> v((size_t)kChunk * h.k[0]->nb[1], tag);
     ggml_backend_tensor_set(h.k[0], v.data(), (size_t)p.block_of(c) * kChunk * h.k[0]->nb[1], v.size());
 }
+std::vector<uint8_t> tagged(const Harness & h, uint8_t tag) { return std::vector<uint8_t>((size_t)kChunk * h.k[0]->nb[1], tag); }
 // 14 chunks, each tagged while resident, so chunks 1..9 reach the host (and the tier) with known bytes.
 void fill_tagged(Harness & h, KvFlashPager & p) {
     for (int c = 0; c < 14; c++) {
@@ -80,6 +98,7 @@ TEST_CASE(KvflashPagerVictimTierFixture, recalls_come_from_the_tier_with_identic
     Harness A, B;
     KvFlashPager p, plain;
     REQUIRE(p.attach(cfg(16), A.k, A.v));
+    REQUIRE(p.victim_blocks() == 16);                    // the tier engaged for these tensors
     REQUIRE(plain.attach(cfg(0), B.k, B.v));
     fill_tagged(A, p);
     fill_tagged(B, plain);
@@ -93,7 +112,7 @@ TEST_CASE(KvflashPagerVictimTierFixture, recalls_come_from_the_tier_with_identic
     CHECK(plain.stats().victim_hits == 0);
     CHECK(plain.stats().victim_misses == 3);
     for (int c = 1; c <= 3; c++) {
-        CHECK(k_rows(A, p, c) == std::vector<uint8_t>((size_t)kChunk * A.k[0]->nb[1], (uint8_t)(c + 1)));
+        CHECK(k_rows(A, p, c) == tagged(A, (uint8_t)(c + 1)));
         CHECK(k_rows(A, p, c) == k_rows(B, plain, c));
     }
 }
@@ -104,6 +123,7 @@ TEST_CASE(KvflashPagerVictimTierFixture, a_full_tier_drops_the_oldest_page_out_f
     Harness A;
     KvFlashPager p;
     REQUIRE(p.attach(cfg(4), A.k, A.v));
+    REQUIRE(p.victim_blocks() == 4);
     fill_tagged(A, p);                                   // page-outs 1..6 in order; the tier ends holding 3,4,5,6
     p.score_hook = [](int c) { return c >= 1 && c <= 3 ? 100.0f : (float)c; };
     CHECK(p.reselect(0) == 6);                           // out 7,8,9 (tier: 6,7,8,9), in 1,2,3 from the host
@@ -113,8 +133,7 @@ TEST_CASE(KvflashPagerVictimTierFixture, a_full_tier_drops_the_oldest_page_out_f
     CHECK(p.reselect_recent() == 6);                     // out 1,2,3 (tier: 9,1,2,3), back in 7,8,9: only 9 hits
     CHECK(p.stats().victim_hits == 1);
     CHECK(p.stats().victim_misses == 5);
-    for (int c = 7; c <= 9; c++)
-        CHECK(k_rows(A, p, c) == std::vector<uint8_t>((size_t)kChunk * A.k[0]->nb[1], (uint8_t)(c + 1)));
+    for (int c = 7; c <= 9; c++) CHECK(k_rows(A, p, c) == tagged(A, (uint8_t)(c + 1)));
 }
 
 // A recalled chunk keeps its tier copy while clean, so paging it out again copies nothing; a row write makes the
@@ -123,6 +142,7 @@ TEST_CASE(KvflashPagerVictimTierFixture, a_write_after_a_recall_invalidates_the_
     Harness A;
     KvFlashPager p;
     REQUIRE(p.attach(cfg(16), A.k, A.v));
+    REQUIRE(p.victim_blocks() == 16);
     fill_tagged(A, p);
     p.score_hook = [](int c) { return c == 2 ? 100.0f : (float)c; };
     CHECK(p.reselect(0) == 2);                           // 2 in (tier hit), 9 out
@@ -134,14 +154,16 @@ TEST_CASE(KvflashPagerVictimTierFixture, a_write_after_a_recall_invalidates_the_
     p.score_hook = [](int c) { return c == 2 ? 100.0f : (float)c; };
     CHECK(p.reselect(0) == 2);                           // 2 back from the tier, with the written bytes
     CHECK(p.stats().victim_hits == 3);
-    CHECK(k_rows(A, p, 2) == std::vector<uint8_t>((size_t)kChunk * A.k[0]->nb[1], 0xAB));
+    CHECK(k_rows(A, p, 2) == tagged(A, 0xAB));
 }
 
-// truncate drops the tier copies of the dropped chunks: a later chunk at the same ids recalls from the host.
+// truncate drops the tier copies of the dropped chunks: the chunks written at the same ids afterwards recall their
+// own bytes.
 TEST_CASE(KvflashPagerVictimTierFixture, truncate_drops_tier_copies_of_dropped_chunks) {
     Harness A;
     KvFlashPager p;
     REQUIRE(p.attach(cfg(16), A.k, A.v));
+    REQUIRE(p.victim_blocks() == 16);
     fill_tagged(A, p);
     p.truncate(5 * kChunk);                              // chunks 5..13 gone, 0..4 fit: no tier copy may survive for 5+
     for (int c = 5; c < 14; c++) {
@@ -150,6 +172,24 @@ TEST_CASE(KvflashPagerVictimTierFixture, truncate_drops_tier_copies_of_dropped_c
     }
     p.score_hook = [](int c) { return c >= 5 && c <= 7 ? 100.0f : (float)c; };
     CHECK(p.reselect(0) == 4);                           // 7 is still resident: out 8,9, in 5,6
-    for (int c = 5; c <= 7; c++)
-        CHECK(k_rows(A, p, c) == std::vector<uint8_t>((size_t)kChunk * A.k[0]->nb[1], (uint8_t)(c + 101)));
+    for (int c = 5; c <= 7; c++) CHECK(k_rows(A, p, c) == tagged(A, (uint8_t)(c + 101)));
+}
+
+// CPU-backend tensors are paged by memcpy; on a GPU build they get no device tier (there is no device peer for
+// them), and the pager says so. On a CPU build the tier is host memory and engages.
+TEST_CASE(KvflashPagerVictimTierFixture, host_tensors_on_a_gpu_build_get_no_device_tier) {
+    Harness A(/*on_device=*/false);
+    KvFlashPager p;
+    REQUIRE(p.attach(cfg(16), A.k, A.v));
+#ifdef KVFLASH_HAS_ASYNC_DMA
+    CHECK(p.victim_blocks() == 0);
+    fill_tagged(A, p);
+    p.score_hook = [](int c) { return c >= 1 && c <= 3 ? 100.0f : (float)c; };
+    CHECK(p.reselect(0) == 6);                           // recalls still land, from the host copy
+    CHECK(p.stats().victim_hits == 0);
+    CHECK(p.stats().victim_misses == 3);
+    for (int c = 1; c <= 3; c++) CHECK(k_rows(A, p, c) == tagged(A, (uint8_t)(c + 1)));
+#else
+    CHECK(p.victim_blocks() == 16);
+#endif
 }
