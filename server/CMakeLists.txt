@@ -2854,6 +2854,7 @@ if(LUCE_TESTS)
             test/unit/test_kvflash_gpu_mass.cpp
             test/unit/test_kvflash_uq.cpp
             test/unit/test_kvflash_pager_recall.cpp
+            test/unit/test_kvflash_pager_reselect_fence.cpp
             test/unit/test_kvflash_pager_clean_evict.cpp
             test/unit/test_kvflash_prefill_reselect.cpp
             test/unit/test_kvflash_pin_preamble.cpp
