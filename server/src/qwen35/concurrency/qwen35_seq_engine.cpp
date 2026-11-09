@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -372,6 +373,11 @@ Qwen35SeqEngine::prepare_chain_drafts(
         static_cast<size_t>(draft_width), b_.w_.mask_token_id);
     std::vector<float> noise_embed(
         static_cast<size_t>(hidden) * draft_width);
+    // Every lane's inputs are queued through chain_stage_ on the draft
+    // backend's stream; the select at the end waits for that stream once,
+    // and every other exit waits here.
+    ggml_backend_t backend = b_.draft_backend_;
+    BackendDrain drain(backend);
 
     auto reset_lanes = [&]() {
         for (const Lane & lane : lanes) {
@@ -396,10 +402,20 @@ Qwen35SeqEngine::prepare_chain_drafts(
             reset_lanes();
             return std::nullopt;
         }
+        if (lanes.empty()) {
+            // Room for the bucket's lanes, dummies included; nothing from
+            // the last phase is in flight here.
+            chain_stage_.reserve(
+                backend,
+                static_cast<size_t>(chain_draft_bucket_width(lane_count)) *
+                    draft_kv_step_upload_bytes(*state));
+            chain_stage_.reset();
+        }
         lanes.push_back({i, input.slot, input.token, state, mirror});
-        if (!draft_kv_begin_step(
-                *state, dw, b_.draft_backend_, *mirror,
-                slots_.slot(input.slot).cur_pos, draft_width)) {
+        if (!draft_kv_begin_step_async(
+                *state, dw, backend, *mirror,
+                slots_.slot(input.slot).cur_pos, draft_width,
+                chain_stage_)) {
             reset_lanes();
             return std::nullopt;
         }
@@ -411,8 +427,8 @@ Qwen35SeqEngine::prepare_chain_drafts(
             reset_lanes();
             return std::nullopt;
         }
-        ggml_backend_tensor_set(
-            state->inp_embed, noise_embed.data(), 0,
+        chain_stage_.set(
+            backend, state->inp_embed, noise_embed.data(), 0,
             sizeof(float) * noise_embed.size());
     }
     if (lanes.empty()) return round;
@@ -451,37 +467,36 @@ Qwen35SeqEngine::prepare_chain_drafts(
     for (int i = 0; i < dummy_count; ++i) {
         DraftKvState * dummy =
             dummies[static_cast<size_t>(i)].get();
-        if (!draft_kv_begin_step(
-                *dummy, dw, b_.draft_backend_,
-                *lanes.front().mirror, 1, draft_width)) {
+        if (!draft_kv_begin_step_async(
+                *dummy, dw, backend,
+                *lanes.front().mirror, 1, draft_width, chain_stage_)) {
             reset_lanes();
             return std::nullopt;
         }
-        ggml_backend_tensor_set(
-            dummy->inp_embed, noise_embed.data(), 0,
+        chain_stage_.set(
+            backend, dummy->inp_embed, noise_embed.data(), 0,
             sizeof(float) * noise_embed.size());
         batch_states.push_back(dummy);
         roots.push_back(lanes.front().root);
     }
 
-    std::vector<std::vector<float>> hidden_blocks;
+    // The lane hidden blocks stay on the device: the select copies their
+    // rows into its own inputs on the same stream.
     std::vector<std::vector<int32_t>> proposals;
-    if (!draft_kv_batch_compute(
-            draft_graph, dw, b_.draft_backend_,
-            batch_states, hidden_blocks, draft_width) ||
-        hidden_blocks.size() != batch_states.size()) {
+    if (!draft_kv_batch_compute_async(
+            draft_graph, dw, backend, batch_states, draft_width) ||
+        draft_graph.hidden_by_lane.size() != batch_states.size()) {
         reset_lanes();
         return std::nullopt;
     }
-    std::vector<const float *> hidden_by_lane;
-    hidden_by_lane.reserve(hidden_blocks.size());
-    for (const std::vector<float> & block : hidden_blocks) {
-        hidden_by_lane.push_back(block.data());
-    }
-    if (!dflash2_select_chains_batched(
-            dw, b_.draft_backend_, b_.w_.output, hidden_by_lane,
-            draft_width, roots, proposals) ||
-        proposals.size() != batch_states.size()) {
+    const std::vector<const ggml_tensor *> hidden_by_lane(
+        draft_graph.hidden_by_lane.begin(), draft_graph.hidden_by_lane.end());
+    const bool selected_ok = dflash2_select_chains_batched(
+        dw, backend, b_.w_.output, hidden_by_lane, draft_width, roots,
+        proposals);
+    // The select waited for the backend on every exit.
+    drain.disarm();
+    if (!selected_ok || proposals.size() != batch_states.size()) {
         reset_lanes();
         return std::nullopt;
     }
@@ -746,7 +761,8 @@ int32_t Qwen35SeqEngine::sample_graph_row(
 }
 
 bool Qwen35SeqEngine::upload_block_table_delta(
-        int slot, int first_block, const int32_t * blocks, size_t count) {
+        int slot, int first_block, const int32_t * blocks, size_t count,
+        PinnedStage * stage) {
     if (count == 0) return true;
     ggml_tensor * table = b_.cache_.paged_block_table;
     if (!table || slot < 0 || slot >= table->ne[1] || first_block < 0 ||
@@ -755,12 +771,17 @@ bool Qwen35SeqEngine::upload_block_table_delta(
     }
     // `blocks` commonly points into a temporary PrefillChunk vector or a
     // stack-local StepAppend. Keep this tiny metadata write synchronous so
-    // the backend never observes a source whose lifetime has ended.
-    ggml_backend_tensor_set(
-        table, blocks,
-        (size_t)slot * table->nb[1] +
-            (size_t)first_block * sizeof(int32_t),
-        count * sizeof(int32_t));
+    // the backend never observes a source whose lifetime has ended. A stage
+    // copies the source into its pinned slice before queueing, which ends
+    // the same way.
+    const size_t offset = (size_t)slot * table->nb[1] +
+        (size_t)first_block * sizeof(int32_t);
+    if (stage) {
+        stage->set(b_.target_backend_, table, blocks, offset,
+                   count * sizeof(int32_t));
+    } else {
+        ggml_backend_tensor_set(table, blocks, offset, count * sizeof(int32_t));
+    }
     return true;
 }
 
@@ -835,6 +856,32 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
 }
 
 namespace {
+// Pinned stage bytes one fixed chain round takes: the verify inputs and the
+// argmax readback, the commit indices, the length writes, a few block-table
+// entries per lane and the 64-byte alignment of every slice.
+size_t chain_round_stage_bytes(int hidden, int n_head_kv, int n_slots,
+                               int spec_count, int ar_count, int width) {
+    const size_t bucket =
+        static_cast<size_t>(chain_decode_bucket_width(spec_count));
+    const size_t tree_rows = bucket * static_cast<size_t>(width);
+    const size_t rows = static_cast<size_t>(ar_count) + tree_rows;
+    const size_t lanes = static_cast<size_t>(ar_count) + bucket;
+    const size_t data =
+        sizeof(float) * static_cast<size_t>(hidden) * rows +  // embeddings
+        sizeof(int32_t) * 4 * rows +                           // positions
+        sizeof(int32_t) * (tree_rows + bucket) +               // tree shape
+        sizeof(int32_t) * 2 * lanes +                          // slot maps
+        sizeof(int32_t) * 2 * rows +                           // query maps
+        sizeof(int64_t) * static_cast<size_t>(n_head_kv) * rows +
+        sizeof(int32_t) * 2 * static_cast<size_t>(n_slots) +   // lengths x2
+        sizeof(int32_t) * rows +                               // argmax
+        sizeof(int32_t) * 2 * bucket +                         // commit lanes
+        sizeof(int64_t) * tree_rows +                          // commit rows
+        sizeof(int32_t) * rows;                                // feature rows
+    const size_t slices = 32 + 2 * lanes;
+    return data + slices * (64 + 64 * sizeof(int32_t));
+}
+
 // Offers per width before the controller decides for a new lane count.
 // Rounds that rebuild their graph are not cost samples.
 constexpr int kChainWidthCalibrationSamples = 2;
@@ -1149,6 +1196,20 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         slots_, seq_lens_, b_.cache_.paged_kv_seq_lens,
         inputs.size());
 
+    // Uploads and readbacks of the round go through chain_stage_ on the
+    // target backend's stream: one wait for the verify, one at the end of
+    // the round. Declared after staged_round so that an early exit waits for
+    // the queued copies before the rollback rewrites the lengths.
+    ggml_backend_t backend = b_.target_backend_;
+    BackendDrain drain(backend);
+    chain_stage_.reserve(
+        backend, chain_round_stage_bytes(
+                     hidden, n_head_kv, n_slots,
+                     static_cast<int>(proposals.size()),
+                     static_cast<int>(ar_lanes.size()),
+                     prepared_round.width));
+    chain_stage_.reset();
+
     // AR peers write their ordinary rows in the same target forward. Host
     // history and positions remain staged until every promotion succeeds.
     for (ArLane & lane : ar_lanes) {
@@ -1164,7 +1225,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         if (append.new_block >= 0 &&
             !upload_block_table_delta(
                 lane.slot, append.new_block_index,
-                &append.new_block, 1)) {
+                &append.new_block, 1, &chain_stage_)) {
             result.error = "compact AR block-table update failed";
             return result;
         }
@@ -1295,42 +1356,26 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         result.error = "fixed chain embedding failed";
         return result;
     }
-    ggml_backend_tensor_set(
-        graph.inp_embed, embeddings.data(), 0,
-        sizeof(float) * embeddings.size());
-    ggml_backend_tensor_set(
-        graph.positions, positions.data(), 0,
-        sizeof(int32_t) * positions.size());
-    ggml_backend_tensor_set(
-        graph.parent_ids, parents.data(), 0,
-        sizeof(int32_t) * parents.size());
-    ggml_backend_tensor_set(
-        graph.tree_sizes, tree_sizes.data(), 0,
-        sizeof(int32_t) * tree_sizes.size());
+    const auto upload = [&](ggml_tensor * tensor, const auto & values) {
+        chain_stage_.set(backend, tensor, values.data(), 0,
+                         sizeof(values[0]) * values.size());
+    };
+    upload(graph.inp_embed, embeddings);
+    upload(graph.positions, positions);
+    upload(graph.parent_ids, parents);
+    upload(graph.tree_sizes, tree_sizes);
     if (detail::target_paged_tree_active_slots_need_upload(graph)) {
-        ggml_backend_tensor_set(
-            graph.active_slot_ids, mapped_slots.data(), 0,
-            sizeof(int32_t) * mapped_slots.size());
+        upload(graph.active_slot_ids, mapped_slots);
     }
-    ggml_backend_tensor_set(
-        graph.state_slot_ids, state_slots.data(), 0,
-        sizeof(int32_t) * state_slots.size());
-    ggml_backend_tensor_set(
-        graph.paged_query_seq_ids, query_slots.data(), 0,
-        sizeof(int32_t) * query_slots.size());
+    upload(graph.state_slot_ids, state_slots);
+    upload(graph.paged_query_seq_ids, query_slots);
     if (graph.paged_query_positions) {
-        ggml_backend_tensor_set(
-            graph.paged_query_positions, query_positions.data(), 0,
-            sizeof(int32_t) * query_positions.size());
+        upload(graph.paged_query_positions, query_positions);
     }
-    ggml_backend_tensor_set(
-        graph.kv_write_rows, write_rows.data(), 0,
-        sizeof(int64_t) * write_rows.size());
-    ggml_backend_tensor_set(
-        b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
-        sizeof(int32_t) * seq_lens_.size());
+    upload(graph.kv_write_rows, write_rows);
+    upload(b_.cache_.paged_kv_seq_lens, seq_lens_);
     staged_round.device_lengths_dirty = true;
-    if (ggml_backend_graph_compute(b_.target_backend_, graph.gf) !=
+    if (ggml_backend_graph_compute_async(backend, graph.gf) !=
         GGML_STATUS_SUCCESS) {
         result.error = "fixed chain target compute failed";
         return result;
@@ -1338,9 +1383,18 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
 
     std::vector<int32_t> posterior(
         static_cast<size_t>(total_rows), -1);
-    ggml_backend_tensor_get(
-        graph.argmax_tokens, posterior.data(), 0,
+    const void * posterior_slice = chain_stage_.get(
+        backend, graph.argmax_tokens, 0,
         sizeof(int32_t) * posterior.size());
+    ggml_backend_synchronize(backend);
+    if (posterior_slice) {
+        std::memcpy(posterior.data(), posterior_slice,
+                    sizeof(int32_t) * posterior.size());
+    } else {
+        ggml_backend_tensor_get(
+            graph.argmax_tokens, posterior.data(), 0,
+            sizeof(int32_t) * posterior.size());
+    }
 
     // Sampled lanes verify by the single-lane sampled walk over their own
     // rows (sampled_verify.h); greedy lanes keep the argmax prefix.
@@ -1515,18 +1569,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             append.position + static_cast<int>(proposal.accepted);
     }
 
-    ggml_backend_tensor_set(
-        graph.accepted_prefixes, accepted_prefixes.data(), 0,
-        sizeof(int32_t) * accepted_prefixes.size());
-    ggml_backend_tensor_set(
-        graph.commit_slot_ids, commit_slots.data(), 0,
-        sizeof(int32_t) * commit_slots.size());
-    ggml_backend_tensor_set(
-        graph.commit_rows, commit_rows.data(), 0,
-        sizeof(int64_t) * commit_rows.size());
-    ggml_backend_tensor_set(
-        graph.feature_commit_rows, feature_commit_rows.data(), 0,
-        sizeof(int32_t) * feature_commit_rows.size());
+    upload(graph.accepted_prefixes, accepted_prefixes);
+    upload(graph.commit_slot_ids, commit_slots);
+    upload(graph.commit_rows, commit_rows);
+    upload(graph.feature_commit_rows, feature_commit_rows);
 
     const size_t n_delta = b_.cache_.ssm_state.size();
     if (n_delta == 0 || graph.delta_captures.size() != n_delta ||
@@ -1570,7 +1616,15 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         return result;
     }
 
-    if (!ggml_backend_cuda_tree_commit_transaction(
+    // Queued behind the verify and the index uploads on the same stream; the
+    // preflight runs on the host's copy of the indices, so nothing is read
+    // back. The drain at the end of the round waits for it.
+    const ggml_cuda_tree_commit_host_maps commit_maps{
+        commit_rows.data(), accepted_prefixes.data(), commit_slots.data(),
+        feature_commit_rows.data(),
+    };
+    if (!ggml_backend_cuda_tree_commit_transaction_async(
+            backend,
             caches.data(), static_cast<int>(caches.size()),
             graph.tree_features, b_.cache_.target_feat,
             graph.feature_commit_rows,
@@ -1578,7 +1632,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             conv_states.data(), static_cast<int>(n_delta),
             graph.commit_rows, graph.accepted_prefixes,
             graph.commit_slot_ids,
-            fixed_chain_.scratch_base, fixed_chain_.scratch_stride)) {
+            fixed_chain_.scratch_base, fixed_chain_.scratch_stride,
+            &commit_maps)) {
         result.error = "fixed chain commit preflight failed";
         return result;
     }
@@ -1587,16 +1642,14 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         if (!upload_block_table_delta(
                 proposal.slot, proposal.append.first_new_block,
                 proposal.append.new_blocks.data(),
-                proposal.append.new_blocks.size())) {
+                proposal.append.new_blocks.size(), &chain_stage_)) {
             std::fprintf(stderr,
                 "[parallel] validated chain block-table upload failed\n");
             std::abort();
         }
         seq_lens_[static_cast<size_t>(proposal.slot)] = proposal.seq_len;
     }
-    ggml_backend_tensor_set(
-        b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
-        sizeof(int32_t) * seq_lens_.size());
+    upload(b_.cache_.paged_kv_seq_lens, seq_lens_);
 
     for (const StepInput & input : inputs) {
         slots_.commit_step(input.slot);
@@ -1643,6 +1696,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             return result;
         }
     }
+    // The commit and the last uploads land before the round ends (and before
+    // its time is taken), as when the commit synchronized itself.
+    drain.now();
 
     if (adaptive_chain_width_) {
         std::vector<size_t> & accepted = chain_accepted_scratch_;

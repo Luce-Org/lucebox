@@ -1749,6 +1749,16 @@ if(LUCE_TESTS)
         set_tests_properties(deepseek4_mmid_grouped_cuda_combine_override
             PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_tree_commit_async.cpp")
+        # Host-only (GGML C API): the stream-ordered fixed chain commit
+        # against the synchronous one, byte for byte, on every GPU.
+        add_executable(test_tree_commit_async test/unit/test_tree_commit_async.cpp)
+        target_include_directories(test_tree_commit_async PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_tree_commit_async PRIVATE
+            ggml ${LUCE_GGML_BACKEND_TARGET} ggml-base)
+        # Registered through the CppUnit list below.
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_qn_split_fusions.cpp")
         # Host-only (GGML C API): the Qwen3.8 split fusions against their
         # unfused graphs, and the argmax tie rule, on every GPU.
@@ -3047,6 +3057,7 @@ if(LUCE_TESTS)
         test_rocmfp_mix_glu_fusable
         test_cuda_copy_batch
         test_qn_split_fusions
+        test_tree_commit_async
         test_uma_budget
         test_mmq_tile_twin_gate
         test_gdn_single_commit

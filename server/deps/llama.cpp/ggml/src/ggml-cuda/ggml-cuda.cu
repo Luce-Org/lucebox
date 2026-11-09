@@ -9216,6 +9216,16 @@ void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
     return (void *) cuda_ctx->stream();
 }
 
+void * ggml_backend_cuda_enter_stream(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_backend_entry(cuda_ctx);
+    return (void *) cuda_ctx->stream();
+}
+
 int ggml_backend_cuda_get_device_id(ggml_backend_t backend) {
     if (!ggml_backend_is_cuda(backend)) {
         return -1;

@@ -26,6 +26,7 @@
 #include "common/concurrency/paged_kv_offload.h"
 #include "common/dflash_draft_kv.h"
 #include "common/dflash_feature_ring.h"
+#include "common/pinned_stage.h"
 #include "qwen35_slot_manager.h"
 #include "../qwen35_image_request.h"
 
@@ -187,8 +188,11 @@ private:
     int idle_prefill_tokens_;
     int prefill_quantum_;
 
+    // stage: queue the write through a pinned slice on the target backend's
+    // stream instead of blocking (the caller synchronizes that backend).
     bool upload_block_table_delta(int slot, int first_block,
-                                  const int32_t * blocks, size_t count);
+                                  const int32_t * blocks, size_t count,
+                                  PinnedStage * stage = nullptr);
     void fail_prefill(int slot, std::vector<PrefillOutput> & outputs,
                               const char * log_message,
                               const char * client_message);
@@ -282,6 +286,10 @@ private:
     // first round with two sampled lanes).
     std::vector<float> chain_sampled_rows_;
     std::unique_ptr<BlockingRowPool> chain_sampled_pool_;
+    // Pinned staging for a chain round's small uploads and readbacks (the
+    // draft inputs, then the verify inputs and the commit indices). Each
+    // phase resets it only after the backend ran every copy of the last one.
+    PinnedStage chain_stage_;
     ggml_context *  feature_view_ctx_ = nullptr;
     std::vector<DraftFeatureMirror> slot_feature_mirrors_;
     std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;

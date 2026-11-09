@@ -4,6 +4,7 @@
 #include "peer_access.h"
 
 #include "ggml.h"
+#include "ggml-cuda.h"
 
 // ggml_get_to_fp32_cuda is not in any public header — it lives in
 // ggml-cuda/convert.cuh. Declare the typedef + extern here so we can link
@@ -602,8 +603,11 @@ bool copy_feature_ring_range_to_tensor(
             if (!to_f32) return false;
             cudaError_t err = cudaSetDevice(feature_ring.device);
             if (feature_cuda_failed("cudaSetDevice", err)) return false;
+            // On the copy stream, so the sync below waits for it (the legacy
+            // default stream would not be covered by that sync).
             to_f32(src_base, (float *)dst_base,
-                   (int64_t)run * (int64_t)fc_in, nullptr);
+                   (int64_t)run * (int64_t)fc_in,
+                   luce_copy_stream(feature_ring.device));
             err = cudaGetLastError();
             if (feature_cuda_failed("to_fp32_cuda", err)) return false;
         } else {
@@ -623,6 +627,55 @@ bool copy_feature_ring_range_to_tensor(
     if (!luce_copy_stream_sync(feature_ring.device)) {
         std::fprintf(stderr, "[dflash-feature] copy stream sync failed\n");
         return false;
+    }
+    return true;
+}
+
+bool copy_feature_ring_range_to_tensor_async(
+    const DraftFeatureMirror & feature_ring,
+    ggml_tensor * dst,
+    int start_pos,
+    int n_tokens,
+    ggml_backend_t backend) {
+    if (!feature_ring.target_feat || !dst || feature_ring.cap <= 0) return false;
+    if (n_tokens <= 0 || n_tokens > feature_ring.cap) return false;
+
+    const int fc_in = feature_ring.n_target_layers * feature_ring.hidden_size;
+    const size_t row_bytes = (size_t)fc_in * sizeof(float);
+    const size_t src_stride = feature_ring.target_feat->nb[1];
+    const size_t dst_stride = dst->nb[1];
+    if (!backend || dst_stride != row_bytes ||
+        ggml_backend_cuda_get_device_id(backend) != feature_ring.device) {
+        return copy_feature_ring_range_to_tensor(
+            feature_ring, dst, start_pos, n_tokens);
+    }
+    // Also makes the ring's device current.
+    cudaStream_t stream =
+        static_cast<cudaStream_t>(ggml_backend_cuda_enter_stream(backend));
+    if (!stream) return false;
+
+    cudaError_t err = cudaSuccess;
+    // The two contiguous branches of the synchronous copy, on `stream`.
+    int done = 0;
+    while (done < n_tokens) {
+        const int slot = (start_pos + done) % feature_ring.cap;
+        const int run = std::min(n_tokens - done, feature_ring.cap - slot);
+        const char * src_base =
+            (const char *)feature_ring.target_feat->data + (size_t)slot * src_stride;
+        char * dst_base = (char *)dst->data + (size_t)done * dst_stride;
+        if (feature_ring.storage_type == GGML_TYPE_F32 && src_stride == row_bytes) {
+            err = cudaMemcpyAsync(dst_base, src_base, row_bytes * (size_t)run,
+                                  cudaMemcpyDeviceToDevice, stream);
+            if (feature_cuda_failed("cudaMemcpyAsync", err)) return false;
+        } else {
+            auto to_f32 = ggml_get_to_fp32_cuda(feature_ring.storage_type);
+            if (!to_f32) return false;
+            to_f32(src_base, (float *)dst_base,
+                   (int64_t)run * (int64_t)fc_in, stream);
+            err = cudaGetLastError();
+            if (feature_cuda_failed("to_fp32_cuda", err)) return false;
+        }
+        done += run;
     }
     return true;
 }
