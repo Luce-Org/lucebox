@@ -671,13 +671,16 @@ static __global__ void __launch_bounds__(256) rope_multi_rows_norm(const float *
 }
 
 // The fused kernels run on HIP for every q/k-norm M-RoPE graph (qwen4exp, and the Qwen3.5 family's interleaved
-// M-RoPE), on every device: per-token blocks where the unfused rope takes them (the qwen4exp Strix's prompt chunks),
-// per-row blocks otherwise. Each gives the bits of the separate kernels it replaces. CUDA builds keep those kernels.
-bool ggml_cuda_norm_rope_enabled() {
+// M-RoPE): per-token blocks where the unfused rope takes them (the qwen4exp Strix's prompt chunks), per-row blocks
+// otherwise. They rotate with explicit fmaf, which is how the compiler contracts the separate rope's a*c - b*s on the
+// RDNA3.5 and RDNA4 targets the tests compare bit for bit; other devices and CUDA builds keep the separate kernels.
+bool ggml_cuda_norm_rope_enabled(int device) {
 #if defined(GGML_USE_HIP)
     static const bool enabled = [] { const char * e = getenv("LUCE_ATTN_FUSE_LEGACY"); return !(e && atoi(e)); }();
-    return enabled;
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return enabled && (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
 #else
+    GGML_UNUSED(device);
     return false;
 #endif
 }

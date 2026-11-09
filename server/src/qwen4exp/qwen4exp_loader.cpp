@@ -426,6 +426,7 @@ static void build_qwen4exp_gate_ba(Qwen4ExpWeights & w, ggml_backend_t backend) 
 // block and a block size set by the column count, so every row is the sum its own product forms. Views only, no
 // memory; a layer whose projections are apart keeps the two matmuls.
 static void build_qwen4exp_alpha_beta(Qwen4ExpWeights & w) {
+#if defined(GGML_USE_HIP)
     std::vector<Qwen4ExpLayer *> linear;
     for (Qwen4ExpLayer & L : w.layers) {
         const ggml_tensor * a = L.ssm_alpha, * b = L.ssm_beta;
@@ -445,6 +446,10 @@ static void build_qwen4exp_alpha_beta(Qwen4ExpWeights & w) {
             L->ssm_alpha_beta = ab;
         }
     }
+#else
+    // HIP only: CUDA routes the two 48-row products and the stacked 96-row one to different kernels at 4+ columns.
+    (void) w;
+#endif
 }
 
 // QSA scores weigh every indexer head by 1.0: one ones tensor serves every layer and row count up to 128, instead of

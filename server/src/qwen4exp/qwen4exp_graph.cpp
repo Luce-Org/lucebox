@@ -3730,6 +3730,9 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
             qsa_pos[(size_t) 4 * s] = qsa_pos[(size_t) 4 * s + 1] = qsa_pos[(size_t) 4 * s + 2] = positions[s];
         }
         ggml_backend_tensor_set(workspace.qsa_positions, qsa_pos.data(), 0, qsa_pos.size() * sizeof(int32_t));
+        // Split mode queues those uploads on the target stream, and the scheduler's copy of an input to the expert
+        // device (the attention layers placed there) does not wait for it (Qwen4ExpStableInputs::finish).
+        for (Qwen4ExpStableInputs & in : qsa_inputs) in.finish();
     }
     // Match solo MMVQ arithmetic regardless of the number of active slots.
     const ScopedCudaGraphOverrides overrides(false, 0, false, 0, /*mmvq_batch_invariant=*/true);

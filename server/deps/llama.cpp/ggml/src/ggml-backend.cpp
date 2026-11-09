@@ -1476,9 +1476,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // the picks, cost a second hop per MoE layer that way). Deferred
             // peer copies publish at their producer split instead, so they keep
             // the plain rule.
-            const bool split_late_cross_input =
-                sched->late_cross_input_split ||
+            const bool registered_late_cross_input =
                 ggml_backend_sched_is_late_cross_input_split_node(sched, node);
+            const bool split_late_cross_input =
+                sched->late_cross_input_split || registered_late_cross_input;
             if (split_late_cross_input &&
                 node_backend_id == cur_backend_id &&
                 split_has_compute && !need_new_split) {
@@ -1495,7 +1496,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         tensor_id_copy(src_id, cur_backend_id, 0) == NULL &&
                         !supported) {
                         bool waits_already = false;
-                        if (!sched->split_deferred_peer_copies && !(src->flags & GGML_TENSOR_FLAG_INPUT)) {
+                        if (!sched->split_deferred_peer_copies && !registered_late_cross_input &&
+                            !(src->flags & GGML_TENSOR_FLAG_INPUT)) {
                             for (int k = 0; k < split->n_inputs && !waits_already; k++) {
                                 struct ggml_tensor * input = split->inputs[k];
                                 waits_already = !(input->flags & GGML_TENSOR_FLAG_INPUT) &&

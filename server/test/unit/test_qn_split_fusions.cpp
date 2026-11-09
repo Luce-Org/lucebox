@@ -303,7 +303,8 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
         ggml_tensor * wsel = ggml_reshape_2d(p.ctx, ggml_get_rows(p.ctx, probs3, sel), k, T);
         wsel = ggml_div(p.ctx, wsel, ggml_clamp(p.ctx, ggml_sum_rows(p.ctx, wsel), 6.103515625e-5f, INFINITY));
         if (n_lut > 0) {
-            ggml_tensor * flat = ggml_reshape_1d(p.ctx, ggml_is_contiguous(sel) ? sel : ggml_cont(p.ctx, sel), k * T);
+            ggml_tensor * flat =
+                ggml_reshape_1d(p.ctx, ggml_is_contiguous(sel) ? sel : ggml_cont(p.ctx, sel), (int64_t) k * T);
             for (int l = 0; l < n_lut; ++l) p.output(ggml_reshape_2d(p.ctx, ggml_get_rows(p.ctx, tables[l], flat), k, T));
             p.output(wsel);
         } else {

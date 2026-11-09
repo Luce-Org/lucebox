@@ -26,6 +26,6 @@ void ggml_cuda_op_rope_permuted(ggml_backend_cuda_context & ctx, ggml_tensor * r
 
 // RMS_NORM -> MUL -> ROPE (multi-section, F32, per-token path) [-> PERMUTE -> CONT] in one kernel, bit-identical to
 // the separate kernels (qwen4exp attention Q/K and indexer q). cont may be null. LUCE_ATTN_FUSE_LEGACY=1 disables.
-bool ggml_cuda_norm_rope_enabled();
+bool ggml_cuda_norm_rope_enabled(int device);
 void ggml_cuda_op_norm_rope(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * rope,
                             ggml_tensor * cont);

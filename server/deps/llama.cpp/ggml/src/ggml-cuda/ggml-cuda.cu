@@ -1132,6 +1132,38 @@ static std::atomic<int> ggml_cuda_lock_counter;
 
 #if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH)
 static void ggml_cuda_tail_realize(ggml_backend_cuda_context * ctx, const ggml_cuda_copy_desc * descs, int n);
+// Contexts whose capture stays open for a tail (ggml_cuda_graph_evaluate_and_capture), with the thread that opened it.
+// The capture holds ggml_cuda_lock_counter until it ends, so a context destroyed on that thread ends them first instead
+// of waiting on itself (a forward that failed between the evaluation and its hop leaves one open). One list for every
+// thread, so a context freed on another thread than its opener's still leaves it.
+struct ggml_cuda_tail_open_entry {
+    ggml_backend_cuda_context * ctx;
+    std::thread::id opener;
+};
+static std::mutex ggml_cuda_tail_open_mutex;
+static std::vector<ggml_cuda_tail_open_entry> ggml_cuda_tail_open;
+
+static void ggml_cuda_tail_open_add(ggml_backend_cuda_context * ctx) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_tail_open_mutex);
+    ggml_cuda_tail_open.push_back({ ctx, std::this_thread::get_id() });
+}
+
+static void ggml_cuda_tail_open_remove(ggml_backend_cuda_context * ctx) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_tail_open_mutex);
+    ggml_cuda_tail_open.erase(std::remove_if(ggml_cuda_tail_open.begin(), ggml_cuda_tail_open.end(),
+                                             [ctx](const ggml_cuda_tail_open_entry & e) { return e.ctx == ctx; }),
+                              ggml_cuda_tail_open.end());
+}
+
+// The contexts this thread opened, newest first.
+static std::vector<ggml_backend_cuda_context *> ggml_cuda_tail_open_mine() {
+    std::lock_guard<std::mutex> lock(ggml_cuda_tail_open_mutex);
+    std::vector<ggml_backend_cuda_context *> mine;
+    for (auto it = ggml_cuda_tail_open.rbegin(); it != ggml_cuda_tail_open.rend(); ++it) {
+        if (it->opener == std::this_thread::get_id()) mine.push_back(it->ctx);
+    }
+    return mine;
+}
 #endif
 
 // Raises the idle hold's flag (pinned host memory its kernel polls; ggml_backend_cuda_hold) after the host's earlier
@@ -1143,15 +1175,20 @@ static void ggml_cuda_hold_store(int * flag, int value) {
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 #if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH)
+    for (ggml_backend_cuda_context * open : ggml_cuda_tail_open_mine()) {
+        ggml_cuda_tail_realize(open, nullptr, 0);
+    }
     ggml_cuda_tail_realize(this, nullptr, 0);
-    if (!tail_retired.empty()) {
+    ggml_cuda_tail_open_remove(this);
+    if (tail_event != nullptr || !tail_retired.empty()) {
+        // A launched graph may still record tail_event, and a retired instance may still be queued.
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaStreamSynchronize(stream()));
-        for (cudaGraphExec_t e : tail_retired) {
-            CUDA_CHECK(cudaGraphExecDestroy(e));
-        }
-        tail_retired.clear();
     }
+    for (cudaGraphExec_t e : tail_retired) {
+        CUDA_CHECK(cudaGraphExecDestroy(e));
+    }
+    tail_retired.clear();
     if (tail_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(tail_event));
     }
@@ -4584,10 +4621,15 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
     return cuda_ctx->name.c_str();
 }
 
+#if defined(GGML_USE_HIP)
+static void ggml_cuda_flush_peer_copies_of(const ggml_backend_cuda_context * ctx);
+#endif
+
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
 #if defined(GGML_USE_HIP)
+    ggml_cuda_flush_peer_copies_of(cuda_ctx);
     // release cached BF16 conversions before the pool is destroyed (pool leak assert)
     ggml_cuda_mmb_release_all();
 #endif
@@ -4709,8 +4751,12 @@ static void ggml_cuda_tail_realize(ggml_backend_cuda_context * ctx, const ggml_c
     ctx->tail_graph     = nullptr;
     ggml_cuda_set_device(ctx->device);
     if (capturing) {
+        ggml_cuda_tail_open_remove(ctx);
         ggml_cuda_tail_end_capture(ctx, graph, descs, n);
     } else if (n != graph->tail_n || (n > 0 && memcmp(graph->tail_descs, descs, n * sizeof(*descs)) != 0)) {
+        // The instance's last launch may still be queued. Its tail recorded tail_event, which only later launches on
+        // this stream record again, so once the event is done that launch is too (the copies change rarely).
+        CUDA_CHECK(cudaEventSynchronize(ctx->tail_event));
         ggml_cuda_copy_tail_storage storage;   // must outlive the SetParams call below
         cudaKernelNodeParams kp;
         ggml_cuda_copy_tail_set(descs, n, &storage, &kp);
@@ -4882,6 +4928,14 @@ static bool ggml_cuda_batch_peer_copies_enabled() {
         return value && *value && strcmp(value, "0") != 0;
     }();
     return enabled || ggml_cuda_qwen4exp_graph();
+}
+
+// A pending batch (thread-local, published lazily) that names a context about to be freed is published first.
+static void ggml_cuda_flush_peer_copies_of(const ggml_backend_cuda_context * ctx) {
+    const auto & batch = ggml_cuda_pending_peer_copies;
+    if (batch.copies > 0 && (batch.src == ctx || batch.dst == ctx)) {
+        ggml_cuda_flush_peer_copy_batch("backend-free");
+    }
 }
 
 static void ggml_cuda_flush_peer_copy_batch(const char * reason) {
@@ -5620,6 +5674,14 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 }
 
 // returns whether the write (out) nodes overwrite the read nodes in operation
+// Integer addresses: relational comparison of pointers into different
+// allocations is unspecified in C++.
+static bool ggml_cuda_byte_ranges_overlap(const void * a, size_t an, const void * b, size_t bn) {
+    const uintptr_t pa = (uintptr_t) a;
+    const uintptr_t pb = (uintptr_t) b;
+    return pa < pb + bn && pb < pa + an;
+}
+
 static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_idx,
                                                  const int           node_count,
@@ -5820,6 +5882,15 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             const ggml_tensor * cont = cgraph->nodes[node_idx + 4];
             ok = perm->src[0] == rope && ggml_get_op_params_i32(perm, 0) == 0 &&
                 cont->src[0] == perm && cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont);
+        }
+        // Every block reads the positions (and its rows of x and gamma) while other blocks write the output, and the
+        // allocator may give the output a leaf input's memory after the input's unfused last use, which the range
+        // check below skips outside qwen4exp graphs: no overlap with these at all.
+        const ggml_tensor * out = cgraph->nodes[last];
+        const ggml_tensor * pos = rope->src[1];
+        for (const ggml_tensor * in : { x, gamma, pos }) {
+            ok = ok && (in == nullptr || in->data == nullptr ||
+                        !ggml_cuda_byte_ranges_overlap(out->data, ggml_nbytes(out), in->data, ggml_nbytes(in)));
         }
         return ok && ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), outputs, 1);
     }
@@ -6032,14 +6103,6 @@ static bool ggml_cuda_cpy_is_plain_copy(const ggml_tensor * node, int device) {
         ggml_cuda_tensor_on_device_buffer(dst, device) &&
         ggml_is_contiguous(src) && ggml_is_contiguous(dst) &&
         ggml_nbytes(src) == ggml_nbytes(dst) && ggml_nbytes(src) > 0;
-}
-
-// Integer addresses: relational comparison of pointers into different
-// allocations is unspecified in C++.
-static bool ggml_cuda_byte_ranges_overlap(const void * a, size_t an, const void * b, size_t bn) {
-    const uintptr_t pa = (uintptr_t) a;
-    const uintptr_t pb = (uintptr_t) b;
-    return pa < pb + bn && pb < pa + an;
 }
 
 // Nodes the evaluation loops skip; a copy run may step over them.
@@ -7844,7 +7907,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     // RMS_NORM -> MUL -> ROPE [-> PERMUTE -> CONT] in one kernel (qwen4exp attention Q/K and indexer q,
                     // Qwen3.5 attention Q/K);
                     // ahead of the RMS_NORM + MUL pair below, which would otherwise claim the first two nodes.
-                    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_norm_rope_enabled()) {
+                    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_norm_rope_enabled(cuda_ctx->device)) {
                         if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_PERMUTE, GGML_OP_CONT }, {})) {
                             ggml_cuda_op_norm_rope(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2], cgraph->nodes[i+4]);
                             i += 4;
@@ -7987,6 +8050,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // The capture stays open for the tail (ggml_cuda_tail_realize ends it and launches).
                 cuda_ctx->tail_deferred = true;
                 cuda_ctx->tail_capturing = true;
+                ggml_cuda_tail_open_add(cuda_ctx);
                 cuda_ctx->tail_graph = graph;
                 graph_evaluated_or_captured = true;
                 continue;
@@ -8989,6 +9053,10 @@ void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
         return nullptr;
     }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    // The caller queues its own work on the stream: what the backend still holds back (a peer copy batch, a graph
+    // waiting for its copy tail, a side copy to join) goes first, as for an event record.
+    GGML_CUDA_FLUSH_PEER_COPIES("get-stream", cuda_ctx->device);
+    ggml_cuda_backend_entry(cuda_ctx);
     return (void *) cuda_ctx->stream();
 }
 

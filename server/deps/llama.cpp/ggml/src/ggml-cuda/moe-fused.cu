@@ -502,7 +502,7 @@ static __global__ void moe_prefetch_kernel(const moe_prefetch_ranges r, uint32_t
             acc ^= a.x ^ a.y ^ a.z ^ a.w;
         }
     }
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
+    if (acc == 0x9e3779b9u) {   // every thread's loads stay live; the store almost never runs
         sink[0] = acc;
     }
 }
