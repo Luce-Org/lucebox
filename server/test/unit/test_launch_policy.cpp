@@ -741,20 +741,8 @@ struct LaunchPolicyFixture : CommonFixture {
         CHECK(kvflash_preamble_reserve_in_pool(16384, 1152, 0) == 0);           // unusable chunk size
     }
 
-    void test_kvflash_recall_defaults_are_the_shipped_profile() {
-        // The shipped recall profile, one flag. These literals are the values the profile installed before it
-        // became named constants; the ninth, LUCE_KVFLASH_SCORER_DEVICE=gpu, is now fixed in the backend.
-        const std::vector<std::pair<std::string, std::string>> expected = {
-            {"LUCE_KVFLASH_POLICY", "qk"},
-            {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
-            {"LUCE_KVFLASH_RESELECT_SCORER", "exact"},
-            {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
-            {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"},
-            {"LUCE_KVFLASH_SELECT_UNIT", "2"},
-            {"LUCE_KVFLASH_PREAMBLE_ROWS", "1152"},
-            {"LUCE_KVFLASH_UQ_QUERIES", "64"},
-        };
-        const std::vector<LaunchProfileEnv> env = kvflash_recall_env("qwen35");
+    void check_env(const std::vector<LaunchProfileEnv> & env,
+                   const std::vector<std::pair<std::string, std::string>> & expected) {
         CHECK(env.size() == expected.size());
         std::set<std::string> names;
         for (const LaunchProfileEnv & entry : env) {
@@ -763,6 +751,61 @@ struct LaunchPolicyFixture : CommonFixture {
                 [&](const auto & e) { return e.first == entry.name; });
             CHECK(hit != expected.end());
             if (hit != expected.end()) CHECK(hit->second == entry.value);
+        }
+    }
+
+    void test_kvflash_recall_defaults_are_the_shipped_profile() {
+        // With a drafter and its three PFlash GGUFs: mode 5, the PFlash 2.0 scorer, exactly the settings the
+        // K2/K3 LiveCode nights measured (P1 27/40, P2 29/40 on 14 sessions).
+        check_env(kvflash_recall_env("qwen35", true), {
+            {"LUCE_KVFLASH_POLICY", "qk"},
+            {"LUCE_KVFLASH_PREFILL_RESELECT", "5"},
+            {"LUCE_KVFLASH_RESELECT_SCORER", "pflash2"},
+            {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
+            {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"},
+            {"LUCE_KVFLASH_SELECT_UNIT", "2"},
+            {"LUCE_KVFLASH_PREAMBLE_ROWS", "1152"},
+            {"LUCE_KVFLASH_UQ_QUERIES", "0"},
+            {"LUCE_KVFLASH_SELECT_QUERIES", "0"},
+            {"PFLASH_SELECT_MODE", "budget_only"},
+            {"PFLASH_SELECT_SCORE", "density"},
+            {"PFLASH_SELECT_SEGMENTS", "probe"},
+            {"PFLASH_SELECT_CHUNK_SIZE", "256"},
+            {"PFLASH_SELECT_QUERY_TOKENS", "128"},
+            {"PFLASH_SELECT_QUERY_HEAD", "1"},
+            {"PFLASH_SELECT_PARAGRAPH_JOIN", "0"},
+            {"PFLASH_SELECT_QUERY_PARSER", "latest_user"},
+            {"PFLASH_SELECT_QUERY_PROBE", "1"},
+            {"PFLASH_QUERY_CANDIDATES", "1"},
+            {"PFLASH_QUERY_PIN", "512"},
+            {"PFLASH_DRAFTER_SESSIONS", "2"},
+        });
+        // Without one: mode 4, the exact scorer, the values the profile installed before it became named constants.
+        check_env(kvflash_recall_env("qwen35", false), {
+            {"LUCE_KVFLASH_POLICY", "qk"},
+            {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
+            {"LUCE_KVFLASH_RESELECT_SCORER", "exact"},
+            {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
+            {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"},
+            {"LUCE_KVFLASH_SELECT_UNIT", "2"},
+            {"LUCE_KVFLASH_PREAMBLE_ROWS", "1152"},
+            {"LUCE_KVFLASH_UQ_QUERIES", "64"},
+        });
+        CHECK(kvflash_recall_env("qwen3", true).empty());
+    }
+
+    void test_kvflash_drafter_ready_needs_the_drafter_and_its_three_ggufs() {
+        std::map<std::string, std::string> env = {
+            {"LUCE_KVFLASH_DRAFTER", "d.gguf"}, {"PFLASH_SCORING_HEAD_GGUF", "h.gguf"},
+            {"PFLASH_SEGMENT_PROBE_GGUF", "s.gguf"}, {"PFLASH_REQUEST_PROBE_GGUF", "r.gguf"}};
+        const auto get = [&](const char * k) { const auto it = env.find(k); return it == env.end() ? std::string() : it->second; };
+        CHECK(kvflash_drafter_ready(get));
+        for (const char * k : {"LUCE_KVFLASH_DRAFTER", "PFLASH_SCORING_HEAD_GGUF", "PFLASH_SEGMENT_PROBE_GGUF",
+                               "PFLASH_REQUEST_PROBE_GGUF"}) {
+            const std::string keep = env[k];
+            env[k] = "";
+            CHECK(!kvflash_drafter_ready(get));
+            env[k] = keep;
         }
     }
 };
@@ -802,6 +845,7 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_kvflash_recall_profile_leaves_the_pool_at_the_requested_size();
     test_kvflash_preamble_reserve_that_leaves_no_history_is_off();
     test_kvflash_recall_defaults_are_the_shipped_profile();
+    test_kvflash_drafter_ready_needs_the_drafter_and_its_three_ggufs();
     test_pflash_curve_arg_accepts_quoted_and_split_points();
     test_pflash_curve_arg_rejects_bad_points();
 }
