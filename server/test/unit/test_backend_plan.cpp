@@ -256,6 +256,21 @@ void test_supported_specla_requires_a_draft() {
     CHECK(failure.message == "Qwen3.6 SpecLA requires --draft <path>");
 }
 
+void test_no_draft_target_only_disables_speculation() {
+    BackendArgs args = plain_args();
+    args.draft_path = std::nullopt;
+    args.fast_rollback = false;
+    args.ddtree_budget = 0;
+
+    BackendPreparation result = resolve(std::move(args), "qwen35");
+    CHECK(std::holds_alternative<BackendPlan>(result));
+    const BackendPlan & plan = std::get<BackendPlan>(result);
+    CHECK(!plan.speculation().draft_path.has_value());
+    CHECK(!plan.speculation().fast_rollback);
+    CHECK(!plan.speculation().specla_mode);
+    CHECK(plan.speculation().ddtree_budget == 0);
+}
+
 };
 
 }  // namespace
@@ -273,4 +288,5 @@ TEST_CASE(BackendPlanFixture, backend_plan_suite) {
     test_unsupported_specla_falls_back_without_hidden_tau();
     test_unsupported_specla_preserves_explicit_ddtree_options();
     test_supported_specla_requires_a_draft();
+    test_no_draft_target_only_disables_speculation();
 }
