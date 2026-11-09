@@ -258,6 +258,15 @@ static __device__ __forceinline__ void mul_mat_vec_q_moe_fp2_prefetch(
     }
 }
 
+// a * b + c rounded once: clang's builtin on HIP, the CUDA intrinsic elsewhere (nvcc with MSVC has no builtin).
+static __device__ __forceinline__ float mmvq_fma_rn(const float a, const float b, const float c) {
+#if defined(GGML_USE_HIP)
+    return __builtin_fmaf(a, b, c);
+#else
+    return __fmaf_rn(a, b, c);
+#endif
+}
+
 // acc + vec_dot_q4_K_q8_1 on operands that are already in registers: the two qs words, the 12 scale bytes as three
 // words, dm, and the activation words and scales of the two q8_1 blocks. Same scale unpacking and the same terms as
 // vec_dot_q4_K_q8_1_impl_vmmq, with every rounding written out and contraction off: sd and sm as fma chains, then
@@ -295,11 +304,11 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_regs_acc(
         const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0));
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0));
         const float d8 = __low2float(ds8[i]);
-        sd = __builtin_fmaf(d8, (float) (dot1 * sc[i]), sd);
-        sm = __builtin_fmaf(d8, (float) (dot2 * m[i]), sm);
+        sd = mmvq_fma_rn(d8, (float) (dot1 * sc[i]), sd);
+        sm = mmvq_fma_rn(d8, (float) (dot2 * m[i]), sm);
     }
     const float2 dm = __half22float2(dm4);
-    return acc + __builtin_fmaf(dm.x, sd, -(dm.y * sm));
+    return acc + mmvq_fma_rn(dm.x, sd, -(dm.y * sm));
 }
 
 // Q4_K MoE rows are latency bound in the generic MMVQ loop on gfx1151 the
