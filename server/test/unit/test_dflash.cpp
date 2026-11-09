@@ -839,6 +839,7 @@ int main(int argc, char ** argv) {
             if (ddtree_budget <= 0) {
                 ddtree_budget = 0;
                 ddtree_mode = false;
+                specla_mode = false;
                 fast_rollback = false;
             }
         }

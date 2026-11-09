@@ -268,6 +268,7 @@ void test_no_draft_target_only_disables_speculation() {
     CHECK(!plan.speculation().draft_path.has_value());
     CHECK(!plan.speculation().fast_rollback);
     CHECK(!plan.speculation().specla_mode);
+    CHECK(!plan.speculation().ddtree_mode);
     CHECK(plan.speculation().ddtree_budget == 0);
 }
 

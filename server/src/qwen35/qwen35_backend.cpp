@@ -2427,8 +2427,13 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     // clobber the restored state. Also skip when speculative decode cannot run
     // or fast rollback is disabled (saving ~1.5-5 GB VRAM on 24 GB GPUs).
     const bool can_spec = cfg_.draft_path.has_value()
-        && !cfg_.remote_draft.enabled()
-        && !cfg_.device.is_tensor_parallel();
+        && !cfg_.paged_attention
+        && !draft_parked_
+        && (cfg_.remote_draft.enabled()
+            ? remote_draft_.active()
+            : feature_mirror_.target_feat != nullptr)
+        && !cfg_.device.is_tensor_parallel()
+        && !sampler_.needs_logit_processing();
     if (kv_offset == 0 && can_spec && (cfg_.fast_rollback || cfg_.ddtree_mode)) {
         const int max_verify_tokens = cfg_.ddtree_mode
             ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
