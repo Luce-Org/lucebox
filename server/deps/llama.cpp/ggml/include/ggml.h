@@ -3444,8 +3444,8 @@ extern "C" {
     // `g` then carries alpha_raw and `beta` carries beta_raw (both [1,H,T,S]);
     // gate_ba is a contiguous f32 [2*H] tensor holding [dt_bias | A]
     // (src[9], op_params[10] = 1). Only for the non-tree, non-KDA,
-    // non-SpecLA CUDA/HIP path; the compact-decode variant is excluded,
-    // the mapped-verify variant is allowed.
+    // non-SpecLA CUDA/HIP path; the compact-batch in-place and mapped-verify
+    // variants are allowed.
     GGML_API void ggml_gated_delta_net_set_raw_gates(
             struct ggml_tensor * tensor,
             struct ggml_tensor * gate_ba);

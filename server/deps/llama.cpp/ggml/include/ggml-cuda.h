@@ -381,6 +381,7 @@ enum ggml_cuda_qn_fusion {
     GGML_CUDA_QN_HC_MIX_RDNA4,   // the HC down product, SCALE, SILU, up product and mix reduce in two launches
     GGML_CUDA_QN_HC_CN_ADD,      // the layer output's ADD (split hot + cold experts) folded into the next HC_COMBINE_NORM
     GGML_CUDA_QN_MMVF_TWIN,      // two F32-weight products (the GDN step's HC inject and alpha/beta gates) in one launch
+    GGML_CUDA_QN_GDN_CONV_SLOTS, // the batched decode's GDN conv (history gather and write-back by slot id) in one launch
     GGML_CUDA_QN_COUNT,
 };
 GGML_BACKEND_API size_t ggml_backend_cuda_get_qn_fusion_count(enum ggml_cuda_qn_fusion kind);

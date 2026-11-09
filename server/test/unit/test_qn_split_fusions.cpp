@@ -672,6 +672,131 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
         check(be, name, p, {}, Expect{{GGML_CUDA_QN_GDN_CONV, fused}}, reset);
     }
 
+    // ── The batched decode's GDN conv as build_linear_attn_slots builds it: the slots' histories gathered from the
+    // stacked conv states, concat, the new histories written back by slot id, SSM_CONV, SILU and the q/k RMS_NORM +
+    // SCALE, in one launch ────────────────────────────────────────────────────────────────────────────────────────────
+    void gdn_conv_step_slots(ggml_backend_t be, const std::vector<int32_t> & slots, int n_slabs, bool norm,
+                             bool concat_read, size_t fused) {
+        const int S = (int) slots.size();
+        std::string name = "gdn_conv_step_slots S=" + std::to_string(S) + " slots";
+        for (int32_t id : slots) name += " " + std::to_string(id);
+        name += (norm ? "" : " no-norm") + std::string(concat_read ? " concat-read" : "");
+        const int D = 128, Hk = 16, d_in = 6144, C = 2 * Hk * D + d_in, K = 4;
+        const float eps = 1e-6f;
+        Pattern p;
+        ggml_tensor * qkv = p.input(GGML_TYPE_F32, C, S);
+        ggml_tensor * conv_states = p.input(GGML_TYPE_F32, K - 1, C, n_slabs);
+        ggml_tensor * slot_ids = p.input(GGML_TYPE_I32, S);
+        ggml_tensor * conv1d = p.input(GGML_TYPE_F32, K, C);
+        ggml_context * c = p.ctx;
+        ggml_build_forward_expand(p.gf, qkv);
+        const int64_t slab = (K - 1) * C;
+        ggml_tensor * conv_all = ggml_reshape_2d(c, conv_states, slab, n_slabs);
+        ggml_tensor * hist = ggml_reshape_3d(c, ggml_get_rows(c, conv_all, slot_ids), K - 1, C, S);
+        ggml_tensor * qkv_t = ggml_transpose(c, ggml_reshape_3d(c, qkv, C, 1, S));
+        ggml_tensor * conv_input = ggml_concat(c, hist, qkv_t, 0);
+        ggml_tensor * new_hist = ggml_cont(c, ggml_view_3d(c, conv_input, K - 1, C, S, conv_input->nb[1],
+                                                             conv_input->nb[2], conv_input->nb[0]));
+        ggml_build_forward_expand(p.gf, ggml_set_rows(c, conv_all, ggml_reshape_2d(c, new_hist, slab, S), slot_ids));
+        ggml_tensor * conv_op = ggml_ssm_conv(c, conv_input, conv1d);
+        conv_op->src[3] = qkv_t;
+        ggml_tensor * conv = ggml_silu(c, conv_op);
+        if (norm) {
+            ggml_tensor * qk = ggml_scale(c, ggml_rms_norm(c, ggml_view_4d(c, conv, D, 2 * Hk, 1, S, D * sizeof(float),
+                conv->nb[1], conv->nb[2], 0), eps / (float) D), 1.0f / sqrtf((float) D));
+            qk->src[1] = qkv_t;
+            p.output(qk);
+        }
+        p.output(conv);
+        if (concat_read) p.output(conv_input);
+        p.outs.push_back(conv_states);
+        if (!p.alloc(be)) { fail(name + ": alloc"); return; }
+        p.set(slot_ids, slots.data());
+        p.fill_rest();
+        // The step rewrites the slots' histories in place: both runs start from the same values.
+        const std::vector<uint8_t> state0 = read(conv_states);
+        auto reset = [&] { ggml_backend_tensor_set(conv_states, state0.data(), 0, state0.size()); };
+        const Profile prof(true);
+        check(be, name, p, {}, Expect{{GGML_CUDA_QN_GDN_CONV_SLOTS, fused}}, reset);
+    }
+
+    // ── The batched decode's recurrence with raw gates (the kernel applies sigmoid(beta) and softplus(alpha + dt_bias)
+    // * A, as a T=1 step does) against the gate ops: the same attention rows and states, bit for bit. `strided`: the
+    // raw arm reads q and k as views of one [D, 2 Hk] norm output and v as a view of the conv output, as
+    // build_linear_attn_slots passes them, the ops arm contiguous copies ─────────────────────────────────────────────
+    void gdn_raw_gates_slots(ggml_backend_t be, const std::vector<int32_t> & slots, int n_slabs, bool strided) {
+        const int S = (int) slots.size();
+        const std::string name = "gdn_raw_gates_slots S=" + std::to_string(S) + (strided ? " strided" : "");
+        const int D = 128, Hk = 16, Hv = 48;
+        Pattern p;
+        ggml_context * c = p.ctx;
+        ggml_tensor * q, * k, * v, * qr, * kr, * vr;
+        if (strided) {
+            ggml_tensor * qk = p.input(GGML_TYPE_F32, D, 2 * Hk, S);
+            ggml_tensor * conv = p.input(GGML_TYPE_F32, 2 * Hk * D + Hv * D, 1, S);
+            qr = ggml_view_4d(c, qk, D, Hk, 1, S, qk->nb[1], qk->nb[2], qk->nb[2], 0);
+            kr = ggml_view_4d(c, qk, D, Hk, 1, S, qk->nb[1], qk->nb[2], qk->nb[2], Hk * qk->nb[1]);
+            vr = ggml_view_4d(c, conv, D, Hv, 1, S, D * sizeof(float), conv->nb[1], conv->nb[2],
+                              2 * D * Hk * sizeof(float));
+            q = ggml_cont(c, qr);
+            k = ggml_cont(c, kr);
+            v = ggml_cont(c, vr);
+        } else {
+            q = p.input(GGML_TYPE_F32, D, Hk, S);
+            k = p.input(GGML_TYPE_F32, D, Hk, S);
+            v = p.input(GGML_TYPE_F32, D, Hv, S);
+        }
+        ggml_tensor * alpha = p.input(GGML_TYPE_F32, Hv, S);
+        ggml_tensor * beta = p.input(GGML_TYPE_F32, Hv, S);
+        ggml_tensor * dt_bias = p.input(GGML_TYPE_F32, Hv);
+        ggml_tensor * A = p.input(GGML_TYPE_F32, Hv);
+        ggml_tensor * gate_ba = p.input(GGML_TYPE_F32, 2 * Hv);
+        ggml_tensor * st_ops = p.input(GGML_TYPE_F32, D * D, Hv, n_slabs);
+        ggml_tensor * st_raw = p.input(GGML_TYPE_F32, D * D, Hv, n_slabs);
+        ggml_tensor * ids = p.input(GGML_TYPE_I32, S);
+        ggml_tensor * q4 = ggml_reshape_4d(c, q, D, Hk, 1, S);
+        ggml_tensor * k4 = ggml_reshape_4d(c, k, D, Hk, 1, S);
+        ggml_tensor * v4 = ggml_reshape_4d(c, v, D, Hv, 1, S);
+        if (!strided) {
+            qr = q4;
+            kr = k4;
+            vr = v4;
+        }
+        // As build_linear_attn_slots builds the two.
+        ggml_tensor * b = ggml_sigmoid(c, ggml_reshape_4d(c, beta, 1, Hv, 1, S));
+        ggml_tensor * a = ggml_softplus(c, ggml_add(c, ggml_reshape_3d(c, alpha, Hv, 1, S), dt_bias));
+        ggml_tensor * g = ggml_reshape_4d(c, ggml_mul(c, a, A), 1, Hv, 1, S);
+        ggml_tensor * ops = ggml_gated_delta_net_active_inplace(c, q4, k4, v4, g, b,
+            ggml_reshape_4d(c, st_ops, D, D, Hv, n_slabs), ids);
+        ggml_gated_delta_net_set_skip_intermediate(ops, true);
+        ggml_tensor * raw = ggml_gated_delta_net_active_inplace(c, qr, kr, vr, ggml_reshape_4d(c, alpha, 1, Hv, 1, S),
+            ggml_reshape_4d(c, beta, 1, Hv, 1, S), ggml_reshape_4d(c, st_raw, D, D, Hv, n_slabs), ids);
+        ggml_gated_delta_net_set_raw_gates(raw, gate_ba);
+        ggml_gated_delta_net_set_skip_intermediate(raw, true);
+        p.output(ops);
+        p.output(raw);
+        if (!p.alloc(be)) { fail(name + ": alloc"); return; }
+        p.set(ids, slots.data());
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<float> bias((size_t) Hv), decay((size_t) Hv), ba;
+        for (float & x : bias) x = nd(p.rng);
+        for (float & x : decay) x = -std::exp(0.5f * nd(p.rng));   // A < 0, as the model's -exp(A_log)
+        ba = bias;
+        ba.insert(ba.end(), decay.begin(), decay.end());
+        p.set(dt_bias, bias.data());
+        p.set(A, decay.data());
+        p.set(gate_ba, ba.data());
+        p.fill_f32(st_ops, 0.1f);
+        const std::vector<uint8_t> st0 = read(st_ops);
+        p.set(st_raw, st0.data());
+        p.fill_rest();
+        const Profile prof(true);
+        if (ggml_backend_graph_compute(be, p.gf) != GGML_STATUS_SUCCESS) { fail(name + ": compute"); return; }
+        if (read(ops) != read(raw)) fail(name + ": attention rows differ");
+        if (read(st_ops) != read(st_raw)) fail(name + ": states differ");
+        if (read(st_ops) == st0) fail(name + ": the states were not updated");
+    }
+
     // ── The GDN output gate (RMS_NORM, MUL, SIGMOID, MUL) in one launch, writing ssm_out's q8_1 rows ───────────────
     void gated_norm(ggml_backend_t be, int T, bool profile) {
         const std::string name = "gated_norm T=" + std::to_string(T) + (profile ? "" : " (no profile)");
@@ -1141,6 +1266,30 @@ TEST_CASE(QnSplitFusionsFixture, gdn_conv_step) {
     if (!ran) SKIP("the conv step fusion is HIP-only");
 }
 
+TEST_CASE(QnSplitFusionsFixture, gdn_conv_step_slots) {
+    bool ran = false;
+    each_gpu([&](ggml_backend_t be) {
+        if (!hc_supported(be)) return;
+        ran = true;
+        gdn_conv_step_slots(be, {0}, 2, true, false, 1);            // a split group of one slot
+        gdn_conv_step_slots(be, {3, 1}, 5, true, false, 1);         // a split group of two
+        gdn_conv_step_slots(be, {2, 0, 3, 1}, 4, true, false, 1);   // four slots on one GPU
+        gdn_conv_step_slots(be, {1, 4, 0}, 6, false, false, 1);     // no q/k norm after the conv
+        gdn_conv_step_slots(be, {0, 1}, 2, true, true, 0);          // the concat is read elsewhere
+    });
+    if (!ran) SKIP("the conv step fusion is HIP-only");
+}
+
+TEST_CASE(QnSplitFusionsFixture, gdn_raw_gates_slots) {
+    each_gpu([&](ggml_backend_t be) {
+        gdn_raw_gates_slots(be, {0}, 2, false);
+        gdn_raw_gates_slots(be, {3, 1}, 5, false);
+        gdn_raw_gates_slots(be, {2, 0, 3, 1}, 4, false);
+        gdn_raw_gates_slots(be, {1}, 2, true);
+        gdn_raw_gates_slots(be, {2, 0, 3, 1}, 4, true);
+    });
+}
+
 TEST_CASE(QnSplitFusionsFixture, gated_norm) {
     each_gpu([&](ggml_backend_t be) {
         for (int T = 1; T <= 8; ++T) gated_norm(be, T, true);
@@ -1264,6 +1413,66 @@ TEST_CASE(QnSplitFusionsFixture, stacked_rows) {
 
 TEST_CASE(QnSplitFusionsFixture, gdn_shared_gates) {
     each_gpu([&](ggml_backend_t be) { for (int T : {1, 2, 3, 8}) gdn_shared_gates(be, T); });
+}
+
+// Expert picks across GPUs. A routed expert pick computed on the target (a hot expert) must give the bytes the
+// expert device gives for it (a cold expert), or moving a pick between the devices changes the text. Q4_K gate/up
+// with the SwiGLU, Q5_1 down and the weighted sum, at decode and verify widths, with the batch-invariant scope on
+// and off. Prints how many outputs differ from GPU 0's; a probe for placement that never changes the text.
+TEST_CASE(QnSplitFusionsFixture, expert_parity) {
+    if (ggml_backend_cuda_get_device_count() < 2) SKIP("one GPU");
+    const GraphsOff graphs;
+    const Profile profile(true);
+    const int n_embd = 2560, n_ff = 640, n_exp = 16, n_used = 10;
+    for (const bool inv : {true, false}) {
+        const Invariant invariant(inv);
+        for (int T : {1, 2, 3, 4}) {
+            std::vector<int32_t> ids(n_used * T);
+            for (int t = 0; t < T; ++t) {
+                for (int k = 0; k < n_used; ++k) ids[t * n_used + k] = (t * 3 + k * 5) % n_exp;
+            }
+            std::vector<std::vector<uint8_t>> ref;
+            for (int dev = 0; dev < 2; ++dev) {
+                ggml_backend_ptr be(ggml_backend_cuda_init(dev));
+                REQUIRE(be != nullptr);
+                Pattern p;   // the same seed: both GPUs get the same inputs
+                ggml_tensor * gate = p.input(GGML_TYPE_Q4_K, n_embd, n_ff, n_exp);
+                ggml_tensor * up = p.input(GGML_TYPE_Q4_K, n_embd, n_ff, n_exp);
+                ggml_tensor * down = p.input(GGML_TYPE_Q5_1, n_ff, n_embd, n_exp);
+                ggml_tensor * x = p.input(GGML_TYPE_F32, n_embd, 1, T);
+                ggml_tensor * sel = p.input(GGML_TYPE_I32, n_used, T);
+                ggml_tensor * wsel = p.input(GGML_TYPE_F32, n_used, T);
+                ggml_tensor * gu = ggml_swiglu_split(p.ctx, ggml_mul_mat_id(p.ctx, gate, x, sel),
+                                                     ggml_mul_mat_id(p.ctx, up, x, sel));   // [n_ff, n_used, T]
+                ggml_tensor * dn = ggml_mul_mat_id(p.ctx, down, gu, sel);                     // [n_embd, n_used, T]
+                ggml_tensor * routed = ggml_ds4_moe_fused_combine_shared(p.ctx, dn, wsel, nullptr);
+                for (ggml_tensor * t : {gu, dn, routed}) p.output(t);
+                REQUIRE(p.alloc(be.get()));
+                p.set(sel, ids.data());
+                p.fill_rest();
+                REQUIRE(ggml_backend_graph_compute(be.get(), p.gf) == GGML_STATUS_SUCCESS);
+                std::vector<std::vector<uint8_t>> got;
+                for (ggml_tensor * t : p.outs) got.push_back(read(t));
+                if (dev == 0) { ref = got; continue; }
+                const char * names[3] = {"gate/up+swiglu", "down", "weighted sum"};
+                for (size_t o = 0; o < got.size(); ++o) {
+                    size_t n = 0;
+                    float worst = 0.0f;
+                    for (size_t i = 0; i + sizeof(float) <= got[o].size(); i += sizeof(float)) {
+                        float a, b;
+                        std::memcpy(&a, &ref[o][i], sizeof(float));
+                        std::memcpy(&b, &got[o][i], sizeof(float));
+                        if (std::memcmp(&a, &b, sizeof(float)) != 0) {
+                            ++n;
+                            worst = std::max(worst, std::fabs(a - b) / std::max(1e-30f, std::fabs(a)));
+                        }
+                    }
+                    std::printf("[expert-parity] invariant=%d T=%d %s: %zu of %zu outputs differ (max rel %.3g)\n",
+                                (int) inv, T, names[o], n, got[o].size() / sizeof(float), (double) worst);
+                }
+            }
+        }
+    }
 }
 
 // The LM head row split (qwen4exp_graph.cpp, build_lm_head). On every GPU that runs the RDNA4 Q8_0 matvec for a

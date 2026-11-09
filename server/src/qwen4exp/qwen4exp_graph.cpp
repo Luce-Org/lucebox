@@ -1261,10 +1261,22 @@ static ggml_tensor * build_linear_attn_slots(ggml_context * c, ggml_cgraph * gf,
     const int64_t conv_channels = 2 * Hk * D + d_in;
     const int64_t S = qkv->ne[1];
     const float eps = w.rms_eps;
+    // In the graph first, so the conv's nodes below are consecutive: the HIP backend runs them as one launch
+    // (GGML_CUDA_QN_GDN_CONV_SLOTS).
+    ggml_build_forward_expand(gf, qkv);
 
-    beta = ggml_sigmoid(c, ggml_reshape_4d(c, beta, 1, Hv, 1, S));
-    alpha = ggml_softplus(c, ggml_add(c, ggml_reshape_3d(c, alpha, Hv, 1, S), L.ssm_dt_bias));
-    ggml_tensor * gate = ggml_reshape_4d(c, ggml_mul(c, alpha, L.ssm_a), 1, Hv, 1, S);
+    // As in a T=1 step, the recurrence applies sigmoid(beta) and softplus(alpha + dt_bias) * A to the raw projections
+    // when the loader built [dt_bias | A] (the same expressions as the ops).
+    const bool raw_gates = L.ssm_gate_ba != nullptr;
+    ggml_tensor * gate;
+    if (raw_gates) {
+        beta = ggml_reshape_4d(c, beta, 1, Hv, 1, S);
+        gate = ggml_reshape_4d(c, alpha, 1, Hv, 1, S);
+    } else {
+        beta = ggml_sigmoid(c, ggml_reshape_4d(c, beta, 1, Hv, 1, S));
+        alpha = ggml_softplus(c, ggml_add(c, ggml_reshape_3d(c, alpha, Hv, 1, S), L.ssm_dt_bias));
+        gate = ggml_reshape_4d(c, ggml_mul(c, alpha, L.ssm_a), 1, Hv, 1, S);
+    }
 
     const int64_t slab = (kernel - 1) * conv_channels;
     ggml_tensor * conv_all = ggml_reshape_2d(c, conv_states, slab, conv_states->ne[2]);
@@ -1275,14 +1287,22 @@ static ggml_tensor * build_linear_attn_slots(ggml_context * c, ggml_cgraph * gf,
         conv_input->nb[1], conv_input->nb[2], conv_input->nb[0]));
     ggml_build_forward_expand(gf, ggml_set_rows(c, conv_all, ggml_reshape_2d(c, new_hist, slab, S), slot_ids));
 
-    ggml_tensor * conv = ggml_silu(c, ggml_ssm_conv(c, conv_input, L.ssm_conv1d));   // [C, 1, S]
+    ggml_tensor * conv_op = ggml_ssm_conv(c, conv_input, L.ssm_conv1d);
+    // The fused launch reads qkv until it writes the conv and the norm: SSM_CONV and SCALE ignore these sources, so
+    // they are the allocator's lifetime edges for that read.
+    conv_op->src[3] = qkv_t;
+    ggml_tensor * conv = ggml_silu(c, conv_op);   // [C, 1, S]
     const size_t esz = ggml_element_size(conv);
-    ggml_tensor * q_raw = ggml_view_4d(c, conv, D, Hk, 1, S, D * esz, conv->nb[1], conv->nb[2], 0);
-    ggml_tensor * k_raw = ggml_view_4d(c, conv, D, Hk, 1, S, D * esz, conv->nb[1], conv->nb[2], D * Hk * esz);
+    // q and k are adjacent in the conv output: one norm and one scale over both, the same per-row math.
+    ggml_tensor * qk_c = ggml_scale(c, ggml_rms_norm(c, ggml_view_4d(c, conv, D, 2 * Hk, 1, S, D * esz, conv->nb[1],
+        conv->nb[2], 0), eps / (float) D), 1.0f / sqrtf((float) D));
+    qk_c->src[1] = qkv_t;
+    ggml_build_forward_expand(gf, qk_c);
+    ggml_tensor * q_c = ggml_view_4d(c, qk_c, D, Hk, 1, S, qk_c->nb[1], qk_c->nb[2], qk_c->nb[3], 0);
+    ggml_tensor * k_c = ggml_view_4d(c, qk_c, D, Hk, 1, S, qk_c->nb[1], qk_c->nb[2], qk_c->nb[3], Hk * qk_c->nb[1]);
     ggml_tensor * v_c = ggml_view_4d(c, conv, D, Hv, 1, S, D * esz, conv->nb[1], conv->nb[2], 2 * D * Hk * esz);
-    ggml_tensor * q_c = ggml_scale(c, ggml_rms_norm(c, q_raw, eps / (float) D), 1.0f / sqrtf((float) D));
-    ggml_tensor * k_c = ggml_scale(c, ggml_rms_norm(c, k_raw, eps / (float) D), 1.0f / sqrtf((float) D));
     ggml_tensor * gdn = ggml_gated_delta_net_active_inplace(c, q_c, k_c, v_c, gate, beta, ssm_states, slot_ids);
+    if (raw_gates) ggml_gated_delta_net_set_raw_gates(gdn, L.ssm_gate_ba);
     ggml_gated_delta_net_set_skip_intermediate(gdn, true);
     ggml_build_forward_expand(gf, gdn);
     ggml_tensor * attn = ggml_view_4d(c, gdn, D, Hv, 1, S,

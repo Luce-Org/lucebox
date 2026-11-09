@@ -6777,6 +6777,153 @@ static int ggml_cuda_try_gdn_conv_step(ggml_backend_cuda_context & ctx, ggml_cgr
     ggml_cuda_qn_fusion_taken(GGML_CUDA_QN_GDN_CONV);
     return last;
 }
+
+// The batched decode's GDN conv as build_linear_attn_slots orders it: GET_ROWS of every slot's history from the stacked
+// conv states, CONCAT with the slots' inputs, the CONT of the new histories and their SET_ROWS back by slot id,
+// SSM_CONV, SILU, then the RMS_NORM + SCALE of the q/k heads at the front of the output. One launch
+// (ggml_cuda_gdn_conv_step with slot ids) writes what these nodes write that is read outside them. Returns the last
+// node, or -1.
+static int ggml_cuda_try_gdn_conv_step_slots(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    const int n = cgraph->n_nodes;
+    auto next = [&](int j) {
+        while (j < n && ggml_cuda_node_is_noop(cgraph->nodes[j])) ++j;
+        return j;
+    };
+    ggml_tensor * gr = cgraph->nodes[i];
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || !ctx.stream_context().concurrent_events.empty()) {
+        return -1;
+    }
+    const ggml_tensor * all = gr->src[0];   // [3 * C, slabs]: every slot's history
+    const ggml_tensor * ids = gr->src[1];   // [S]
+    if (!all || !ids || all->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(all) ||
+        !ggml_is_contiguous(ids) || all->ne[2] != 1 || all->ne[3] != 1 || ggml_nrows(ids) != 1 ||
+        !ggml_is_contiguous(gr) || gr->ne[0] != all->ne[0] || gr->ne[1] != ids->ne[0] || gr->ne[2] != 1 ||
+        !ggml_cuda_elidable(cgraph, gr, 1)) {
+        return -1;
+    }
+    const int64_t S = ids->ne[0], slab = all->ne[0];
+    int j = next(i + 1);
+    ggml_tensor * cc = j < n ? cgraph->nodes[j] : nullptr;
+    if (!cc || cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cc, 0) != 0) return -1;
+    const ggml_tensor * hist = cc->src[0];
+    const ggml_tensor * tr = cc->src[1];
+    if (!hist || hist->op != GGML_OP_RESHAPE || hist->src[0] != gr || ggml_cuda_graph_use_count(cgraph, hist) != 1 ||
+        !tr || tr->op != GGML_OP_TRANSPOSE || !tr->view_src || tr->view_offs != 0) {
+        return -1;
+    }
+    const ggml_tensor * x = tr->view_src;   // [C, S]
+    const int64_t C = x->ne[0];
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[1] != S || x->ne[2] != 1 || x->ne[3] != 1 ||
+        C % 128 != 0 || S > 65535 || slab != 3 * C ||
+        hist->ne[0] != 3 || hist->ne[1] != C || hist->ne[2] != S || hist->ne[3] != 1 ||
+        tr->ne[0] != 1 || tr->ne[1] != C || tr->ne[2] != S || tr->ne[3] != 1 ||
+        tr->nb[1] != sizeof(float) || tr->nb[2] != x->nb[1] ||
+        cc->ne[0] != 4 || cc->ne[1] != C || cc->ne[2] != S || cc->ne[3] != 1 || !ggml_is_contiguous(cc) ||
+        (cc->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_graph_use_count(cgraph, cc) != 2) {
+        return -1;
+    }
+    // The new histories (concat columns 1..3), written back over the gathered rows.
+    j = next(j + 1);
+    ggml_tensor * ct = j < n ? cgraph->nodes[j] : nullptr;
+    if (!ct || ct->op != GGML_OP_CONT || ct->type != GGML_TYPE_F32 || !ggml_cuda_elidable(cgraph, ct, 1)) return -1;
+    const ggml_tensor * cv = ct->src[0];
+    if (!cv || cv->op != GGML_OP_VIEW || cv->src[0] != cc || cv->view_src != cc || cv->view_offs != sizeof(float) ||
+        cv->ne[0] != 3 || cv->ne[1] != C || cv->ne[2] != S || cv->ne[3] != 1 ||
+        cv->nb[1] != cc->nb[1] || cv->nb[2] != cc->nb[2] || ggml_cuda_graph_use_count(cgraph, cv) != 1) {
+        return -1;
+    }
+    j = next(j + 1);
+    ggml_tensor * sr = j < n ? cgraph->nodes[j] : nullptr;   // SET_ROWS: src[0] the rows, src[1] the ids, src[2] the target
+    const ggml_tensor * rows = sr ? sr->src[0] : nullptr;
+    if (!sr || sr->op != GGML_OP_SET_ROWS || sr->src[1] != ids || !sr->src[2] || sr->src[2]->data != all->data ||
+        !ggml_are_same_layout(sr->src[2], all) || !rows || rows->op != GGML_OP_RESHAPE || rows->src[0] != ct ||
+        rows->ne[0] != slab || rows->ne[1] != S || ggml_cuda_graph_use_count(cgraph, rows) != 1) {
+        return -1;
+    }
+    j = next(j + 1);
+    ggml_tensor * conv = j < n ? cgraph->nodes[j] : nullptr;
+    if (!conv || conv->op != GGML_OP_SSM_CONV || conv->src[0] != cc || conv->src[2] || conv->type != GGML_TYPE_F32 ||
+        ggml_get_op_params_i32(conv, 0) != 0 || ggml_get_op_params_i32(conv, 1) != 0) {
+        return -1;
+    }
+    const ggml_tensor * w = conv->src[1];
+    if (!w || w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != C || w->ne[2] != 1 || !ggml_is_contiguous(w) ||
+        conv->ne[0] != C || conv->ne[1] != 1 || conv->ne[2] != S || !ggml_cuda_elidable(cgraph, conv, 1)) {
+        return -1;
+    }
+    j = next(j + 1);
+    ggml_tensor * silu = j < n ? cgraph->nodes[j] : nullptr;
+    if (!silu || silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != conv ||
+        silu->type != GGML_TYPE_F32 || !ggml_is_contiguous(silu) || !ggml_are_same_shape(silu, conv)) {
+        return -1;
+    }
+    int last = j;
+    // The q/k norm: RMS_NORM of a [128, heads, 1, S] view at the front of the SILU output, then SCALE.
+    ggml_tensor * scale = nullptr;
+    float eps = 0.0f, post_scale = 1.0f, bias = 0.0f;
+    int qk_channels = 0;
+    const int k1 = next(j + 1);
+    ggml_tensor * norm = k1 < n ? cgraph->nodes[k1] : nullptr;
+    const int k2 = norm ? next(k1 + 1) : n;
+    ggml_tensor * sc = k2 < n ? cgraph->nodes[k2] : nullptr;
+    if (norm && sc && norm->op == GGML_OP_RMS_NORM && norm->type == GGML_TYPE_F32 && sc->op == GGML_OP_SCALE &&
+        sc->src[0] == norm && sc->type == GGML_TYPE_F32 && ggml_is_contiguous(sc) && ggml_are_same_shape(sc, norm) &&
+        ggml_cuda_elidable(cgraph, norm, 1)) {
+        const ggml_tensor * v = norm->src[0];
+        if (v && v->op == GGML_OP_VIEW && v->src[0] == silu && v->view_src == silu && v->view_offs == 0 &&
+            v->ne[0] == 128 && v->ne[1] * 128 <= C && v->ne[2] == 1 && v->ne[3] == S &&
+            v->nb[0] == sizeof(float) && v->nb[1] == 128 * sizeof(float) && v->nb[2] == silu->nb[1] &&
+            v->nb[3] == silu->nb[2]) {
+            memcpy(&eps, norm->op_params, sizeof(float));
+            memcpy(&post_scale, (const float *) sc->op_params + 0, sizeof(float));
+            memcpy(&bias, (const float *) sc->op_params + 1, sizeof(float));
+            qk_channels = (int) (v->ne[1] * 128);
+            scale = sc;
+            last = k2;
+        }
+    }
+    // Nothing written may overlap what is read, or another write; the histories are rewritten in place (each thread
+    // reads its own three values first, and the slots' rows are distinct).
+    struct range { const void * p; size_t nb; };
+    const range reads[] = { { all->data, ggml_nbytes(all) }, { x->data, ggml_nbytes(x) }, { w->data, ggml_nbytes(w) },
+                            { ids->data, ggml_nbytes(ids) } };
+    range writes[2];
+    int n_writes = 0;
+    writes[n_writes++] = { silu->data, ggml_nbytes(silu) };
+    if (scale) writes[n_writes++] = { scale->data, ggml_nbytes(scale) };
+    for (int a = 0; a < n_writes; ++a) {
+        for (const range & r : reads) {
+            if (ggml_cuda_byte_ranges_overlap(writes[a].p, writes[a].nb, r.p, r.nb)) return -1;
+        }
+        for (int b = 0; b < a; ++b) {
+            if (ggml_cuda_byte_ranges_overlap(writes[a].p, writes[a].nb, writes[b].p, writes[b].nb)) return -1;
+        }
+    }
+    ggml_cuda_gdn_conv_step_args a;
+    a.hist = (const float *) all->data;
+    a.state = (float *) all->data;
+    a.x = (const float *) x->data;
+    a.w = (const float *) w->data;
+    a.y = (float *) silu->data;
+    a.qk = scale ? (float *) scale->data : nullptr;
+    a.x_stride = C;
+    a.y_stride = (int64_t) (silu->nb[1] / sizeof(float));
+    a.C = (int) C;
+    a.T = 1;
+    a.qk_channels = qk_channels;
+    a.eps = eps;
+    a.post_scale = post_scale;
+    a.bias = bias;
+    a.slot_ids = (const int32_t *) ids->data;
+    a.slab = slab;
+    a.x_slot = (int64_t) (x->nb[1] / sizeof(float));
+    a.y_slot = (int64_t) (silu->nb[2] / sizeof(float));
+    a.qk_slot = scale ? (int64_t) (scale->nb[3] / sizeof(float)) : 0;
+    a.S = (int) S;
+    ggml_cuda_gdn_conv_step(ctx, a);
+    ggml_cuda_qn_fusion_taken(GGML_CUDA_QN_GDN_CONV_SLOTS);
+    return last;
+}
 #endif // defined(GGML_USE_HIP)
 
 #if defined(GGML_USE_HIP)
@@ -7413,6 +7560,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             }
 #endif // defined(GGML_USE_HIP)
                         }
+#if defined(GGML_USE_HIP)
+                        if (node->op == GGML_OP_GET_ROWS) {
+                            const int last = ggml_cuda_try_gdn_conv_step_slots(*cuda_ctx, cgraph, i);
+                            if (last > i) {
+                                i = last;
+                                continue;
+                            }
+                        }
+#endif // defined(GGML_USE_HIP)
                         if (node->op == GGML_OP_RMS_NORM) {
                             const int last = ggml_cuda_try_gated_rms_norm(*cuda_ctx, cgraph, i);
                             if (last > i) {

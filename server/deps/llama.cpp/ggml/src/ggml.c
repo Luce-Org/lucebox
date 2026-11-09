@@ -7441,10 +7441,13 @@ void ggml_gated_delta_net_set_raw_gates(
     const struct ggml_tensor * v = tensor->src[2];
     GGML_ASSERT(ggml_nelements(gate_ba) == 2*v->ne[1]);
     // scalar gate only (no KDA), no tree mode, no SpecLA / compact decode;
-    // the mapped-verify variant (op_params[11]) carries src[8] read-only.
+    // src[8] maps the sequences to state slabs in the mapped-verify variant
+    // (op_params[11], read-only) and the active-slot in-place decode
+    // (ggml_gated_delta_net_active_inplace, op_params[1]).
     GGML_ASSERT(tensor->src[3]->ne[0] == 1);
     GGML_ASSERT(tensor->src[6] == NULL);
-    GGML_ASSERT(tensor->src[8] == NULL || ggml_get_op_params_i32(tensor, 11) != 0);
+    GGML_ASSERT(tensor->src[8] == NULL || ggml_get_op_params_i32(tensor, 11) != 0 ||
+                ggml_get_op_params_i32(tensor, 1) != 0);
     GGML_ASSERT(ggml_get_op_params_i32(tensor, 2) == 0);
     tensor->src[9] = gate_ba;
     ggml_set_op_params_i32(tensor, 10, 1);
