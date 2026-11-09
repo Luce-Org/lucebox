@@ -1134,6 +1134,13 @@ static std::atomic<int> ggml_cuda_lock_counter;
 static void ggml_cuda_tail_realize(ggml_backend_cuda_context * ctx, const ggml_cuda_copy_desc * descs, int n);
 #endif
 
+// Raises the idle hold's flag (pinned host memory its kernel polls; ggml_backend_cuda_hold) after the host's earlier
+// writes: a release fence and a volatile store, which every host compiler takes (MSVC has no __atomic builtins).
+static void ggml_cuda_hold_store(int * flag, int value) {
+    std::atomic_thread_fence(std::memory_order_release);
+    *(volatile int *) flag = value;
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 #if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH)
     ggml_cuda_tail_realize(this, nullptr, 0);
@@ -1186,7 +1193,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
     if (hold_flag != nullptr) {
         ggml_cuda_set_device(device);
-        __atomic_store_n(hold_flag, hold_issued, __ATOMIC_RELEASE);
+        ggml_cuda_hold_store(hold_flag, hold_issued);
         CUDA_CHECK(cudaStreamSynchronize(stream()));
         CUDA_CHECK(cudaFreeHost(hold_flag));
         CUDA_CHECK(cudaEventDestroy(hold_event));
@@ -4610,7 +4617,7 @@ void ggml_cuda_side_stream_init(ggml_backend_cuda_context * ctx) {
 
 static void ggml_cuda_release_hold(ggml_backend_cuda_context * ctx) {
     if (ctx->hold_active) {
-        __atomic_store_n(ctx->hold_flag, ctx->hold_issued, __ATOMIC_RELEASE);
+        ggml_cuda_hold_store(ctx->hold_flag, ctx->hold_issued);
         ctx->hold_active = false;
     }
 }
