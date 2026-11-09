@@ -709,9 +709,9 @@ struct LaunchPolicyFixture : CommonFixture {
 
     void test_kvflash_recall_defaults_need_a_qwen35_target() {
         // On another architecture nothing is installed (the caller only asks when --kvflash was given).
-        CHECK(kvflash_recall_env("deepseek41").empty());
-        CHECK(kvflash_recall_env("qwen35moe").empty());
-        CHECK(kvflash_recall_env("").empty());
+        CHECK(kvflash_recall_env("deepseek41", true).empty());
+        CHECK(kvflash_recall_env("qwen35moe", true).empty());
+        CHECK(kvflash_recall_env("", true).empty());
     }
 
     void test_kvflash_recall_preamble_reserve_is_18_chunks() {
