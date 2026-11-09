@@ -1248,6 +1248,7 @@ static ggml_tensor * build_moe_owner_join(
         ggml_build_forward_expand(schedule_graph, secondary);
         if (primary) {
             ggml_build_forward_expand(schedule_graph, primary);
+            for (ggml_tensor * t : out.wait_work) ggml_build_forward_expand(schedule_graph, t);
             build_moe_main_owner_prefetch(ctx, schedule_graph, primary, out);
         }
         if (out.external_join && primary) {

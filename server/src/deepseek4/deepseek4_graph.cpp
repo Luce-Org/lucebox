@@ -6778,7 +6778,10 @@ struct DeepSeek4FusedDecodeCache {
 // decoded, so the host never blocks on the table reads (preads that mostly
 // miss the page cache, on the rank that holds the tables, while every other
 // rank waits for its broadcast). The first consumer is the
-// Engram broadcast after layer 0's attention, which hides the read.
+// Engram broadcast after layer 0's attention, which hides the read. A split
+// verify on one box queues the upload from an in-graph node right ahead of
+// layer 1's Engram (upload_node), so the read also overlaps the input fill,
+// the launch and layer 0.
 class Ds4EngramAsync {
 public:
     Ds4EngramAsync() = default;
@@ -6828,6 +6831,28 @@ public:
         if (!stream || !dst || bytes > job_floats_ * sizeof(float)) return false;
         return flag_.enqueue_wait(stream, seq_) &&
                HostStreamFlag::copy_to_device(stream, dst, job_dst_, bytes);
+    }
+
+    // The in-graph upload: a ggml_cluster_allreduce_inplace callback over the
+    // keys input. Armed for a launch, it queues that launch's upload where the
+    // node sits in the stream; unarmed, the keys the host set stay.
+    void arm_upload() {
+        upload_armed_ = true;
+        upload_failed_ = false;
+    }
+    static void upload_node(void * user, void * data, size_t n, void * stream) {
+        Ds4EngramAsync * self = static_cast<Ds4EngramAsync *>(user);
+        if (!self->upload_armed_) return;
+        self->upload_armed_ = false;
+        if (!self->enqueue_raw(stream, data, n * sizeof(float))) self->upload_failed_ = true;
+    }
+    // True when the armed upload failed or never ran (the step's keys are
+    // then invalid); disarms.
+    bool take_upload_failure() {
+        const bool failed = upload_armed_ || upload_failed_;
+        upload_armed_ = false;
+        upload_failed_ = false;
+        return failed;
     }
 
     // Waits for the worker. False when the table read failed (the word was
@@ -6885,6 +6910,8 @@ private:
     bool done_ = true;
     bool stopping_ = false;
     bool ok_ = true;
+    bool upload_armed_ = false;
+    bool upload_failed_ = false;
     std::string err_;
     uint64_t read_us_ = 0;
     uint32_t seq_ = 0;
@@ -6940,6 +6967,7 @@ struct Ds4FusedVerifyCache {
         ggml_tensor * pos_q = nullptr;    // i32 [q]
         ggml_tensor * neg_q = nullptr;    // i32 [q]
         ggml_tensor * engram_keys = nullptr; // f32 [cols*key_len, q, n_engram_layers]
+        bool engram_upload = false;          // the keys arrive through Ds4EngramAsync::upload_node
         ggml_tensor * rawrows = nullptr;  // i64 [1,q]
         ggml_tensor * saved_rawrows = nullptr; // i32 [q], gather before ring writes
         ggml_tensor * pos_rows = nullptr;      // i64 [q], kv_start + i: a ratio-1 lane batch's rows
@@ -6982,6 +7010,8 @@ struct Ds4FusedVerifyCache {
         int64_t paged_i64_n = 0;
         int64_t paged_gather_n = 0;
         int q = 0;
+        // Per layer: the fewest padded compressed rows a lane of the slot's shape spans (ds4_try_fused_verify_step).
+        std::vector<int> min_padded;
 
         void reset() { *this = Extra{}; }
     };

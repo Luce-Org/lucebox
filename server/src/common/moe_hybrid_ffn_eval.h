@@ -181,6 +181,10 @@ struct MoeHybridGraphInputs {
     // (ggml_moe_fused_prefetch). Nothing the graph reads changes.
     std::vector<ggml_tensor *> prefetch_next;
     size_t prefetch_bytes = 0;
+    // Input, set by the caller before building (split steps with a device join): main-owner nodes that need none of
+    // this layer's results, queued right after its own experts and ahead of the prefetch read, so they run in the
+    // same wait without evicting what that read loaded.
+    std::vector<ggml_tensor *> wait_work;
     // Backend-affinity hints consumed after the multi-backend scheduler is
     // created. Keeping every intermediate of a routed branch on its weight
     // backend avoids gate/up -> activation -> down ping-pong copies.

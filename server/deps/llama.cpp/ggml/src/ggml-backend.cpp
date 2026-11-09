@@ -916,6 +916,8 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    bool replan = false;   // ggml_backend_sched_replan
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1821,7 +1823,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
-    bool backend_ids_changed = false;
+    bool backend_ids_changed = sched->replan;
+    sched->replan = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
             sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
@@ -2836,6 +2839,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph.nodes);
     free(sched->graph.leafs);
     free(sched);
+}
+
+void ggml_backend_sched_replan(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    sched->replan = true;
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
