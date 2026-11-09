@@ -719,10 +719,15 @@ bool Qwen35Backend::init() {
     if (kvflash_active()) {
         KvFlashConfig pc;
         pc.pool_tokens = kvflash_tokens_;
+        // LUCE_KVFLASH_VICTIM_BLOCKS: paged-out chunks keep their bytes on the device, so the turn-by-turn churn between
+        // the recency pool and the drafter's picks recalls D2D instead of over the host link. Default: twice the pool.
+        pc.victim_blocks = std::max(0, env_int_or_default("LUCE_KVFLASH_VICTIM_BLOCKS", 2 * (kvflash_tokens_ / pc.chunk_tokens)));
         if (!kvflash_pager_.attach(pc, cache_.attn_k, cache_.attn_v)) {
             std::fprintf(stderr, "kvflash: pager attach failed (pool=%d)\n", kvflash_tokens_);
             return false;
         }
+        std::printf("[kvflash] victim tier: %d blocks (%.0f MiB device; asked %d)\n", kvflash_pager_.victim_blocks(),
+                    (double)kvflash_pager_.victim_blocks() * (double)kvflash_pager_.chunk_bytes() / 1048576.0, pc.victim_blocks);
         // Page-out and recall run on the pager's own stream; make the compute
         // stream wait for them on the device before it touches a reused slot
         // (without this, slot_for() waits on the host instead).
@@ -2583,14 +2588,14 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     // request's recalled blocks: recency-reselect on every pooled request, after
     // every restore path and before the rw.run decision.
     if (kvf_paged && kvflash_score_pool_recent_) {
-        const int64_t ins0 = kvflash_pager_.stats().page_ins;
+        const int64_t ins0 = kvflash_pager_.stats().page_ins, hits0 = kvflash_pager_.stats().victim_hits;
         const auto t_rr = std::chrono::steady_clock::now();
         const int events = kvflash_pager_.reselect_recent();
         const double rr_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_rr).count();
-        const int64_t ins = kvflash_pager_.stats().page_ins - ins0;
+        const int64_t ins = kvflash_pager_.stats().page_ins - ins0, hits = kvflash_pager_.stats().victim_hits - hits0;
         std::fprintf(stderr, "[kvflash] prefill reselect recent-pool @%d: %d page events; "
-                     "%d in (%.1f MiB H2D) %.1f ms\n", kv_offset, events, (int)ins,
-                     (double)ins * (double)kvflash_pager_.chunk_bytes() / 1048576.0, rr_ms);
+                     "%d in (%.1f MiB H2D) %.1f ms (%lld tier hits)\n", kv_offset, events, (int)ins,
+                     (double)(ins - hits) * (double)kvflash_pager_.chunk_bytes() / 1048576.0, rr_ms, (long long)hits);
     }
     const KvflashRecallSetup recall = kvflash_recall_setup(tokens, kvf_ids, kv_offset, prompt_len, kvf_reselect, images);
     const auto & rw = recall.rw;
@@ -3469,7 +3474,7 @@ void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
     p.score_hook = [&scores](int c) {
         return c < (int)scores.size() ? scores[c] : 1e30f;
     };
-    const int64_t ins0 = p.stats().page_ins;
+    const int64_t ins0 = p.stats().page_ins, hits0 = p.stats().victim_hits;
     const auto t_rs = std::chrono::steady_clock::now();
     const int events = p.reselect(tail);
     const double paging_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_rs).count();
@@ -3485,7 +3490,8 @@ void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
     if (kvflash_select_unit_ != luce::common::kKvFlashRecallUnit)
         std::fprintf(stderr, "[kvflash] prefill reselect picked units of %d chunks\n", kvflash_select_unit_);
     // Its own line: the pick line above is diffed across builds with only "N ms" masked.
-    std::fprintf(stderr, "[kvflash] prefill reselect paging @%d: %d page events in %.1f ms\n", committed, events, paging_ms);
+    std::fprintf(stderr, "[kvflash] prefill reselect paging @%d: %d page events in %.1f ms (%lld tier hits)\n", committed, events,
+                 paging_ms, (long long)(p.stats().victim_hits - hits0));
 }
 
 // Rewind of the pass over [r, end) (mode 4). Everything that can fail

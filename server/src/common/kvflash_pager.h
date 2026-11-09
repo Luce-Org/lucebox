@@ -60,6 +60,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <string>
@@ -102,6 +103,8 @@ struct KvFlashConfig {
     int sink_chunks        = 1;   // leading chunks never evicted (attention sinks)
     int tail_window_chunks = 4;   // trailing chunks never evicted (local window)
     int row_base           = 0;   // first row of this pool inside a shared KV allocation (slot slice)
+    int victim_blocks      = 0;   // victim tier beside the pool (0 = off): paged-out chunks keep their bytes there, on the
+                                  // device on GPU builds, so a recall of a chunk still in it is a D2D copy, not an H2D
 };
 
 struct KvFlashStats {
@@ -111,6 +114,8 @@ struct KvFlashStats {
     int64_t moved_bytes = 0;  // cumulative D2H+H2D traffic
     int64_t d2h_skipped = 0;  // page-outs whose D2H was skipped: host copy already equal to the block
     int64_t fence_points = 0; // block hand-outs that fenced the page stream (a host wait each on HIP when work is queued)
+    int64_t victim_hits = 0;  // recalls copied from the victim tier (D2D on GPU builds)
+    int64_t victim_misses = 0;// recalls copied from the host copy (H2D over the host link)
 };
 
 class KvFlashPager {
@@ -171,6 +176,7 @@ public:
             chunk_bytes_ = 0;
             zero_buf_.clear();
         }
+        victim_attach_(cfg.victim_blocks);
 
         free_blocks_.clear();
         unzeroed_.assign((size_t)n_blocks_, 0);
@@ -234,6 +240,7 @@ public:
         for (auto & st : chunks_) free_host_buffer_(st);
 #endif
         chunks_.clear();
+        victim_clear_();
         free_blocks_.clear();
         pending_free_.clear();
         generation_++;   // ops planned against the previous request are stale
@@ -276,7 +283,10 @@ public:
                 release_host_(st);
                 stats_.host_bytes -= (int64_t)chunk_bytes_;
             }
+            if (st.victim >= 0) victim_drop_(st);
         }
+        if (keep > 0 && P % cfg_.chunk_tokens != 0 && chunks_[(size_t)keep - 1].victim >= 0)
+            victim_drop_(chunks_[(size_t)keep - 1]);   // rows >= P are zeroed below: the tier copy is stale
         chunks_.resize((size_t)keep);
         if (pinned_.size() > (size_t)keep) pinned_.resize((size_t)keep);
         if (keep > 0 && P % cfg_.chunk_tokens != 0) {
@@ -526,8 +536,14 @@ public:
                 if (!st.on_host) zero_block(st.block);
             }
             st.dirty = write || !st.on_host;
-            if (st.on_host) {              // recall: restore paged-out bytes
-                copy_chunk(c, st.block, /*to_host=*/false);
+            if (st.on_host) {              // recall: restore paged-out bytes, from the tier when it still holds them
+                if (st.victim >= 0) {
+                    copy_block_(st.block, victim_ptr_(st.victim), /*to_host=*/false, /*peer_on_device=*/kVictimOnDevice);
+                    stats_.victim_hits++;
+                } else {
+                    copy_chunk(c, st.block, /*to_host=*/false);
+                    stats_.victim_misses++;
+                }
                 stats_.page_ins++;
                 stats_.moved_bytes += chunk_bytes_;
 #ifdef KVFLASH_HAS_ASYNC_DMA
@@ -538,6 +554,7 @@ public:
             fence_page_work_();
         }
         else if (write) st.dirty = true;
+        if (write && st.victim >= 0) victim_drop_(st);   // the rows change: the tier copy is stale
         st.last_use = ++clock_;
         return row_base_ + st.block * cfg_.chunk_tokens + (int)(pos % cfg_.chunk_tokens);
     }
@@ -564,6 +581,14 @@ public:
         const bool skipped = has_tensor_storage() && st.on_host && !st.dirty;
         if (skipped) stats_.d2h_skipped++;
         else         copy_chunk(c, st.block, /*to_host=*/true);
+        if (n_victim_ > 0 && st.victim < 0) {
+            const int vs = victim_take_();
+            if (vs >= 0) {
+                st.victim = vs;
+                victim_fifo_.push_back({c, vs});
+                copy_block_(st.block, victim_ptr_(vs), /*to_host=*/true, /*peer_on_device=*/kVictimOnDevice);
+            }
+        }
         if (lazy_zero && !deferred_free_) unzeroed_[(size_t)st.block] = 1;
         else                              zero_block(st.block);
         st.on_host = true;
@@ -750,6 +775,7 @@ public:
     int n_chunks() const { return (int)chunks_.size(); }
     int cur_chunk() const { return cur_chunk_; }
     int n_pool_blocks() const { return n_blocks_; }
+    int victim_blocks() const { return n_victim_; }
     // Bytes of one (layer, kv_head) K segment: chunk_tokens contiguous rows.
     size_t k_seg_bytes() const { return k_seg_bytes_; }
     // Host copy of chunk c's K rows for (layer, kv_head), or nullptr when the
@@ -1220,6 +1246,7 @@ private:
         bool     on_host  = false;    // backing store holds valid bytes
         bool     dirty    = true;     // resident block may differ from its host copy (a row write, or no copy yet)
         uint64_t last_use = 0;
+        int      victim   = -1;       // victim-tier slot holding this chunk's bytes (kept while the chunk is clean)
         float    score    = -std::numeric_limits<float>::infinity();  // QK ledger
 #ifdef KVFLASH_HAS_ASYNC_DMA
         void *   host_data = nullptr; // pinned (cudaMallocHost) unless host_pinned is false
@@ -1290,9 +1317,11 @@ private:
 
     // One pool block <-> a chunk_bytes_ host buffer (same layout as a chunk's
     // host copy). `host` must stay valid until synchronize_paging().
-    void copy_block_(int block, uint8_t * host, bool to_host) {
+    void copy_block_(int block, uint8_t * host, bool to_host, bool peer_on_device = false) {
         if (!has_tensor_storage()) return;
 #ifdef KVFLASH_HAS_ASYNC_DMA
+        const cudaMemcpyKind kind = peer_on_device ? cudaMemcpyDeviceToDevice
+                                  : to_host       ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
         size_t host_off = 0;
         for (size_t l = 0; l < attn_k_.size(); l++) {
             for (int kv = 0; kv < 2; kv++) {
@@ -1314,10 +1343,8 @@ private:
                 // device and seg apart in the host segment. Same bytes as one
                 // copy per head, n_head_kv times fewer launches.
                 const cudaError_t err = to_host
-                    ? cudaMemcpy2DAsync(host0, seg, dev0, t->nb[2], seg, (size_t)n_head_kv_,
-                                        cudaMemcpyDeviceToHost, page_stream_)
-                    : cudaMemcpy2DAsync(dev0, t->nb[2], host0, seg, seg, (size_t)n_head_kv_,
-                                        cudaMemcpyHostToDevice, page_stream_);
+                    ? cudaMemcpy2DAsync(host0, seg, dev0, t->nb[2], seg, (size_t)n_head_kv_, kind, page_stream_)
+                    : cudaMemcpy2DAsync(dev0, t->nb[2], host0, seg, seg, (size_t)n_head_kv_, kind, page_stream_);
                 if (err != cudaSuccess) {
                     std::fprintf(stderr, "[kvflash] cudaMemcpy2DAsync(%s) failed: %s\n",
                                  to_host ? "D2H" : "H2D", cudaGetErrorString(err));
@@ -1326,6 +1353,7 @@ private:
         }
         page_work_queued_ = true;
 #else
+        (void)peer_on_device;   // the tier is host memory here: the same tensor get/set path
         uint8_t * p = host;
         for (size_t l = 0; l < attn_k_.size(); l++) {
             for (int kv = 0; kv < 2; kv++) {
@@ -1480,6 +1508,7 @@ private:
     void cleanup_() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
         cudaStreamSynchronize(page_stream_);  // real stream, or default stream if create failed
+        if (victim_buf_) cudaFree(victim_buf_);
         if (page_stream_ && page_stream_ != ext_page_stream_) cudaStreamDestroy(page_stream_);
         page_stream_ = nullptr;
 #ifdef KVFLASH_EVENT_FENCE
@@ -1495,6 +1524,52 @@ private:
         for (auto & st : chunks_) free_host_buffer_(st);
 #endif
         has_pending_page_in_ = false;
+        victim_buf_ = nullptr;
+        victim_host_.clear();
+        n_victim_ = 0;
+        victim_clear_();
+    }
+
+    // Victim tier: n chunk-sized slots beside the pool. GPU builds put it on the device (D2D recalls); CPU builds
+    // keep it in host memory, which only keeps the logic testable. Needs every tensor on the device, else off.
+    void victim_attach_(int n) {
+        n_victim_ = 0;
+        victim_clear_();
+        if (n <= 0 || !has_tensor_storage()) return;
+        const size_t bytes = (size_t)n * chunk_bytes_;
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        for (size_t l = 0; l < attn_k_.size(); l++)
+            if (is_host_tensor_(attn_k_[l]) || is_host_tensor_(attn_v_[l])) return;
+        void * d = nullptr;
+        if (cudaMalloc(&d, bytes) != cudaSuccess) {
+            (void)cudaGetLastError();
+            std::fprintf(stderr, "[kvflash] victim tier: %zu MiB device allocation failed; recalls stay H2D\n", bytes >> 20);
+            return;
+        }
+        victim_buf_ = (uint8_t *)d;
+#else
+        victim_host_.assign(bytes, 0);
+        victim_buf_ = victim_host_.data();
+#endif
+        n_victim_ = n;
+        for (int sl = n - 1; sl >= 0; sl--) victim_free_.push_back(sl);
+    }
+    void victim_clear_() {
+        victim_free_.clear();
+        victim_fifo_.clear();
+        for (int sl = n_victim_ - 1; sl >= 0; sl--) victim_free_.push_back(sl);
+    }
+    uint8_t * victim_ptr_(int sl) const { return victim_buf_ + (size_t)sl * chunk_bytes_; }
+    void victim_drop_(ChunkState & st) { victim_free_.push_back(st.victim); st.victim = -1; }
+    // A free slot, else the oldest live page-out's (stale fifo entries, whose slot was dropped or reassigned since, are skipped).
+    int victim_take_() {
+        if (!victim_free_.empty()) { const int sl = victim_free_.back(); victim_free_.pop_back(); return sl; }
+        while (!victim_fifo_.empty()) {
+            const auto [c, sl] = victim_fifo_.front();
+            victim_fifo_.pop_front();
+            if (c < (int)chunks_.size() && chunks_[(size_t)c].victim == sl) { chunks_[(size_t)c].victim = -1; return sl; }
+        }
+        return -1;
     }
 
     // Byte offset of pool-local `block` in tensor t: the pool may be a slice
@@ -1516,6 +1591,16 @@ private:
     bool deferred_free_ = false;
     bool batch_submit_ = false;
     bool defer_fence_ = false;        // inside reselect()'s recall loop: no per-hand-out fence, one wait at its end
+    uint8_t * victim_buf_ = nullptr;  // victim tier: n_victim_ * chunk_bytes_, device memory on GPU builds
+    std::vector<uint8_t> victim_host_;            // CPU builds: the tier's storage
+    std::vector<int> victim_free_;
+    std::deque<std::pair<int, int>> victim_fifo_; // (chunk, slot) in page-out order; live iff chunks_[chunk].victim == slot
+    int n_victim_ = 0;
+#ifdef KVFLASH_HAS_ASYNC_DMA
+    static constexpr bool kVictimOnDevice = true;
+#else
+    static constexpr bool kVictimOnDevice = false;
+#endif
     uint64_t generation_ = 0;
     std::vector<uint8_t> zero_buf_;   // used by zero_block() in non-CUDA builds
     std::vector<uint8_t> unzeroed_;   // per-block: freed by a lazy page-out, bytes not zeroed yet (always free)
