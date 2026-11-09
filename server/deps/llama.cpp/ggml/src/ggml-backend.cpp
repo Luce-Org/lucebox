@@ -1466,6 +1466,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // split immediately before that join instead. Existing copies do
             // not require a new split because their dependency was already
             // established by an earlier split.
+            //
+            // Nor does a foreign input from a backend the split already copies
+            // from: each copy is queued on its source backend's stream when
+            // the split is reached, so the split already waits for everything
+            // that backend was given before it, this input included. Splitting
+            // there would only add a copy batch, its event and a graph launch
+            // (the expert device's route weights, which the router writes with
+            // the picks, cost a second hop per MoE layer that way). Deferred
+            // peer copies publish at their producer split instead, so they keep
+            // the plain rule.
             const bool split_late_cross_input =
                 sched->late_cross_input_split ||
                 ggml_backend_sched_is_late_cross_input_split_node(sched, node);
@@ -1484,6 +1494,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (src_backend_id != cur_backend_id &&
                         tensor_id_copy(src_id, cur_backend_id, 0) == NULL &&
                         !supported) {
+                        bool waits_already = false;
+                        if (!sched->split_deferred_peer_copies && !(src->flags & GGML_TENSOR_FLAG_INPUT)) {
+                            for (int k = 0; k < split->n_inputs && !waits_already; k++) {
+                                struct ggml_tensor * input = split->inputs[k];
+                                waits_already = !(input->flags & GGML_TENSOR_FLAG_INPUT) &&
+                                    sched->hv_tensor_backend_ids[hash_id(input)] == src_backend_id;
+                            }
+                        }
+                        if (waits_already) {
+                            continue;
+                        }
                         need_new_split = true;
                         break;
                     }
@@ -2198,6 +2219,8 @@ struct ggml_backend_sched_split_copy_state {
     bool staging_arena_reusable;
     bool destination_generation_ready;
     size_t * staging_cursors;
+    // The split events whose record is deferred (ggml_backend_sched_compute_splits), recorded before a host wait.
+    ggml_backend_event_t * pending_split_events;
     bool destination_host_ready = false;
     ggml_backend_t synchronized_sources[GGML_SCHED_MAX_BACKENDS] = {};
     int n_synchronized_sources = 0;
@@ -2319,8 +2342,16 @@ struct ggml_backend_sched_split_copy_state {
             layout, source_offset, destination_offset};
     }
 
+    void record_pending_split_event(int backend_id) {
+        if (pending_split_events[backend_id]) {
+            ggml_backend_event_record(pending_split_events[backend_id], sched->backends[backend_id]);
+            pending_split_events[backend_id] = nullptr;
+        }
+    }
+
     void prepare_blocking_copy() {
         if (sched->events[destination_backend_id][sched->cur_copy]) {
+            record_pending_split_event(destination_backend_id);
             ggml_backend_event_synchronize(
                 sched->events[destination_backend_id][sched->cur_copy]);
             destination_host_ready = true;
@@ -2400,6 +2431,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     bool copy_destinations_ready[GGML_SCHED_MAX_BACKENDS] = {};
     std::fill_n(copy_destinations_ready, sched->n_backends,
                 sched->backends_synchronized);
+    // A split's event (sched->events[backend][cur_copy]) marks the backend's progress for the next use of this copy
+    // generation and for host waits before an input copy is overwritten. Recorded right after the split, its marker
+    // sits between the split's graph and the copies that feed the next split on another backend, which are queued on
+    // this backend's stream only when that split is reached, so a split decode across two GPUs pays the marker on
+    // every hop before the copy can start. So the record is deferred until the copies this backend feeds a later split are
+    // queued (the end of that split), a host wait on the event, or the end of the splits. A later record on the same
+    // stream only covers more work: every wait on these events sees at least what it did.
+    ggml_backend_event_t pending_split_events[GGML_SCHED_MAX_BACKENDS] = {};
+    const auto record_pending_split_events = [&]() {
+        for (int b = 0; b < sched->n_backends; ++b) {
+            if (pending_split_events[b]) {
+                ggml_backend_event_record(pending_split_events[b], sched->backends[b]);
+                pending_split_events[b] = nullptr;
+            }
+        }
+    };
     // From this point onward an early return must remain conservative: a
     // backend may have accepted work even if a later split fails.
     sched->backends_synchronized = false;
@@ -2423,7 +2470,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             sched, split_backend_id, split_backend,
             staging_arena_reusable,
             copy_destinations_ready[split_backend_id],
-            batch_staging_cursors};
+            batch_staging_cursors, pending_split_events};
+        bool copied_from[GGML_SCHED_MAX_BACKENDS] = {};   // backends whose streams this split's input copies use
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -2434,6 +2482,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                    copy_state.record_pending_split_event(split_backend_id);
                     ggml_backend_event_synchronize(
                         sched->events[split_backend_id][sched->cur_copy]);
                 } else {
@@ -2442,6 +2491,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 copy_state.mark_destination_ready();
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
+                const int source_backend_id = ggml_backend_sched_backend_id(sched, input_backend);
+                if (source_backend_id >= 0) {
+                    copied_from[source_backend_id] = true;
+                }
                 // wait for the split backend to finish using the input before overwriting it
                 // (a dedicated copy is not shared with anything the backend still reads,
                 // and the previous evaluation ended with every backend synchronized)
@@ -2584,6 +2637,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_sched_profile_clock::now());
             }
             if (ec != GGML_STATUS_SUCCESS) {
+                record_pending_split_events();
                 return ec;
             }
         } else {
@@ -2606,6 +2660,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    record_pending_split_events();
                     return ec;
                 }
 
@@ -2634,13 +2689,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // Record the event of this copy generation.
+        // The event of this copy generation, recorded later (see pending_split_events). The copies this split takes
+        // from other backends are queued on their streams by now, so their deferred events go in after them.
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+                pending_split_events[split_backend_id] = sched->events[split_backend_id][sched->cur_copy];
+            }
+        }
+        for (int b = 0; b < sched->n_backends; ++b) {
+            if (copied_from[b] && b != split_backend_id) {
+                copy_state.record_pending_split_event(b);
             }
         }
     }
+    record_pending_split_events();
 
     if (sched->profile.active) {
         sched->profile.loop_us = ggml_backend_sched_elapsed_us(

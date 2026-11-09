@@ -2712,6 +2712,9 @@ extern "C" {
         GGML_MOE_FUSED_HOST_WAIT          = -9,
         GGML_MOE_FUSED_PROTECTED_ROUTES   = -10,
         GGML_MOE_FUSED_COMBINE_MASKED     = -11,
+        GGML_MOE_FUSED_PREFETCH           = -12,
+        GGML_MOE_FUSED_PREFETCH_ROWS      = -13,
+        GGML_MOE_FUSED_WAKE_HOLD          = -14,
     };
 
     // Word offsets in ggml_tensor::op_params for the host mailbox pair. All
@@ -2896,6 +2899,40 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_ds4_deferred_peer_copy(
             struct ggml_context * ctx,
             struct ggml_tensor  * src);
+
+    // Read up to max_bytes of the n_srcs tensors srcs (in that order) after `after`, so the device's last-level cache
+    // holds them for the nodes that follow; a device that waits for another one can run it in that wait. Nothing the
+    // graph reads changes: the result is one F32 element that no node needs to read.
+    GGML_API struct ggml_tensor * ggml_moe_fused_prefetch(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * after,
+            struct ggml_tensor ** srcs,
+            int                   n_srcs,
+            size_t                max_bytes);
+
+    // Reads the expert slices (ne[2] index) of the n_stacks stacks that `picks` names, so the device's last-level
+    // cache holds them for the expert kernels that follow. picks: I32 [k, rows...], each row a token's picks, best
+    // first; map (may be NULL): I32 [n], pick -> expert; a pick or expert out of range reads nothing. Rank order (every
+    // row's first pick, then every row's second, ...), each expert once, at most max_experts of them (CUDA: up to
+    // 64). Nothing the graph reads changes: the result is one F32 element that no node needs to read.
+    GGML_API struct ggml_tensor * ggml_moe_fused_prefetch_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * picks,
+            struct ggml_tensor  * map,
+            struct ggml_tensor ** stacks,
+            int                   n_stacks,
+            int                   max_experts);
+
+    // After `after`, one wave of the device sleeps between polls of a word in pinned host memory until another
+    // device's router posts layer `slot` (1..64), or max_us pass, so the device is awake when that layer's inputs
+    // arrive (an idle integrated GPU wakes slowly). The router posts when its weights node (a DIV, the fused router's
+    // last output) carries the slot in op_params[0]. Nothing the graph reads changes: the result is one F32 element
+    // that no node needs to read.
+    GGML_API struct ggml_tensor * ggml_moe_fused_wake_hold(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * after,
+            int                   slot,
+            int                   max_us);
 
     // Fused DeepSeek4 hyper-connection helpers. The first dimension is the
     // per-token payload; an optional second dimension batches independent

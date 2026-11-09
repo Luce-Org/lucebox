@@ -24,7 +24,7 @@
 #include <random>
 #include <vector>
 
-struct Case { ggml_type type; const char * surface; int k, n; };
+struct Case { ggml_type type; const char * surface; int k, n, used = 6; };
 
 static void fill_blocks(std::vector<uint8_t> & w, ggml_type type, size_t n_blocks, std::mt19937 & rng) {
     const size_t bs = ggml_type_size(type);
@@ -56,38 +56,47 @@ static void fill_blocks(std::vector<uint8_t> & w, ggml_type type, size_t n_block
     }
 }
 
-static bool check(ggml_backend_t backend, int device, const Case & c, int tokens, int experts, bool invariant) {
-    const int used = 6;
+// masked: every other route is -1, as in a split step where the other device owns those picks (only live routes are
+// compared). glu: gate and up products with SwiGLU, the pair the backend fuses into one expert kernel.
+static bool check(ggml_backend_t backend, int device, const Case & c, int tokens, int experts, bool invariant,
+                  bool masked = false, bool glu = false) {
+    const int used = c.used;
     const size_t row = ggml_row_size(c.type, c.k);
     std::mt19937 rng(20260930u + unsigned(c.type) * 7919u + unsigned(c.k));
-    std::vector<uint8_t> w(row * size_t(c.n) * experts);
+    std::vector<uint8_t> w(row * size_t(c.n) * experts), w2(glu ? w.size() : 0);
     fill_blocks(w, c.type, w.size() / ggml_type_size(c.type), rng);
+    if (glu) fill_blocks(w2, c.type, w2.size() / ggml_type_size(c.type), rng);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     std::vector<float> x(size_t(c.k) * tokens);
     for (auto & v : x) v = gauss(rng);
     std::vector<int32_t> ids(size_t(used) * tokens);
     for (int t = 0; t < tokens; ++t)                               // distinct and partly shared experts across tokens
-        for (int j = 0; j < used; ++j) ids[size_t(t) * used + j] = (t * 3 + j * 5) % experts;
+        for (int j = 0; j < used; ++j) ids[size_t(t) * used + j] = masked && (j + t) % 2 ? -1 : (t * 3 + j * 5) % experts;
 
     ggml_init_params params{};
     params.mem_size = size_t(8 * tokens + 16) * ggml_tensor_overhead() + 2 * ggml_graph_overhead_custom(8 * tokens + 16, false);
     params.no_alloc = true;
     auto ctx = ggml_init(params);
     auto a = ggml_new_tensor_3d(ctx, c.type, c.k, c.n, experts);
+    auto a2 = glu ? ggml_new_tensor_3d(ctx, c.type, c.k, c.n, experts) : nullptr;
+    auto product = [&](ggml_tensor * b, ggml_tensor * id) {
+        return glu ? ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, a2, b, id), ggml_mul_mat_id(ctx, a, b, id))
+                   : ggml_mul_mat_id(ctx, a, b, id);
+    };
     // decode: one MUL_MAT_ID per token
     std::vector<ggml_tensor *> xs, is, ys;
     auto g1 = ggml_new_graph_custom(ctx, 8 * tokens + 16, false);
     for (int t = 0; t < tokens; ++t) {
         auto b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.k, 1, 1);
         auto id = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, 1);
-        auto y = ggml_mul_mat_id(ctx, a, b, id);
+        auto y = product(b, id);
         xs.push_back(b); is.push_back(id); ys.push_back(y);
         ggml_build_forward_expand(g1, y);
     }
     // verify: one MUL_MAT_ID over all tokens
     auto bb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.k, 1, tokens);
     auto ib = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, tokens);
-    auto yb = ggml_mul_mat_id(ctx, a, bb, ib);
+    auto yb = product(bb, ib);
     auto g2 = ggml_new_graph_custom(ctx, 8 * tokens + 16, false);
     ggml_build_forward_expand(g2, yb);
     if (!ggml_backend_supports_op(backend, yb) || !ggml_backend_supports_op(backend, ys[0])) {
@@ -98,6 +107,7 @@ static bool check(ggml_backend_t backend, int device, const Case & c, int tokens
     }
     auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     ggml_backend_tensor_set(a, w.data(), 0, w.size());
+    if (glu) ggml_backend_tensor_set(a2, w2.data(), 0, w2.size());
     for (int t = 0; t < tokens; ++t) {
         ggml_backend_tensor_set(xs[t], x.data() + size_t(t) * c.k, 0, size_t(c.k) * sizeof(float));
         ggml_backend_tensor_set(is[t], ids.data() + size_t(t) * used, 0, size_t(used) * sizeof(int32_t));
@@ -120,6 +130,12 @@ static bool check(ggml_backend_t backend, int device, const Case & c, int tokens
     for (int t = 0; t < tokens && ok; ++t) {
         ggml_backend_tensor_get(ys[t], single.data(), 0, per_token * sizeof(float));
         const float * bt = batch.data() + size_t(t) * per_token;
+        if (masked)   // a masked route's row is not part of the result
+            for (int j = 0; j < used; ++j)
+                if (ids[size_t(t) * used + j] < 0) {
+                    std::memset(single.data() + size_t(j) * c.n, 0, size_t(c.n) * sizeof(float));
+                    std::memset(const_cast<float *>(bt) + size_t(j) * c.n, 0, size_t(c.n) * sizeof(float));
+                }
         if (std::memcmp(single.data(), bt, per_token * sizeof(float)) != 0) {
             ++diff_tokens;
             for (size_t i = 0; i < per_token; ++i)
@@ -131,9 +147,9 @@ static bool check(ggml_backend_t backend, int device, const Case & c, int tokens
         }
     }
     std::printf("{\"device\":%d,\"name\":\"%s\",\"type\":\"%s\",\"surface\":\"%s\",\"k\":%d,\"n\":%d,\"tokens\":%d,"
-                "\"batch_invariant\":%s,\"identical\":%s,\"diff_tokens\":%d,\"diff_values\":%zu,\"max_abs\":%.3g,\"ok\":%s}\n",
+                "\"batch_invariant\":%s,\"masked\":%s,\"glu\":%s,\"identical\":%s,\"diff_tokens\":%d,\"diff_values\":%zu,\"max_abs\":%.3g,\"ok\":%s}\n",
                 device, ggml_backend_name(backend), ggml_type_name(c.type), c.surface, c.k, c.n, tokens,
-                invariant ? "true" : "false", diff_tokens == 0 ? "true" : "false", diff_tokens, diff_values, max_abs,
+                invariant ? "true" : "false", masked ? "true" : "false", glu ? "true" : "false", diff_tokens == 0 ? "true" : "false", diff_tokens, diff_values, max_abs,
                 ok ? "true" : "false");
     std::fflush(stdout);
     ggml_backend_buffer_free(buffer);
@@ -227,6 +243,17 @@ int main(int argc, char ** argv) {
                 const bool ok = check(backend, dv, c, tokens, experts, inv);
                 if (inv) all = ok && all;
             }
+        // The split step's expert products (Qwen3.8-Flash on the Strix Halo, 10 routes a token): every verify width,
+        // half the routes masked to the other device, gate/up fused with SwiGLU and the Q5_1 / Q8_0 down products.
+        const Case qwen4exp_split[] = {{GGML_TYPE_Q4_K, "qwen4exp_gate_up", 2560, 640, 10},
+                                       {GGML_TYPE_Q5_1, "qwen4exp_down", 640, 2560, 10},
+                                       {GGML_TYPE_Q8_0, "qwen4exp_down_q8", 640, 2560, 10}};
+        for (int w = 2; w <= tokens; ++w)
+            for (const auto & c : qwen4exp_split)
+                for (bool masked : {false, true}) {
+                    const bool glu = c.type == GGML_TYPE_Q4_K;
+                    all = check(backend, dv, c, w, experts, true, masked, glu) && all;
+                }
         // dense verify-batch products of DS4.1: BF16 output head, F16 indexer/compressor, F32 router, MXFP8 attention
         struct D { ggml_type t; const char * name; int k, n; } dense[] = {
             {GGML_TYPE_BF16, "output_head", 5120, 129280}, {GGML_TYPE_F16, "indexer_k", 5120, 2048},

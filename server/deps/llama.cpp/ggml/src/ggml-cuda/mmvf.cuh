@@ -15,3 +15,10 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
 
 // The block size MMVF launches with for this shape (see mmvf.cu).
 int ggml_cuda_mmvf_block_size(int device, int64_t ncols, int64_t nrows, int64_t ncols_dst, bool f16_half_acc);
+
+// Two products of F32 weights with F32 activations in one launch (HIP; the GDN step's HC inject and its stacked
+// alpha/beta gates): each row keeps the bits of its own mul_mat_vec_f launch. The two may read different activations
+// and row lengths; ggml_cuda_mmvf_twin_ok says whether a pair qualifies (shapes, strides, the same width and the same
+// MMVF block size). The caller makes sure neither reads the other's output.
+bool ggml_cuda_mmvf_twin_ok(int device, const ggml_tensor * a, const ggml_tensor * b);
+void ggml_cuda_mul_mat_vec_f_twin(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_tensor * b);

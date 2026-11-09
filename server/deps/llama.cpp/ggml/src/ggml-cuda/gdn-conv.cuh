@@ -22,3 +22,19 @@ bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int i, ggml_
 bool ggml_cuda_gdn_conv_match_at_conv(const ggml_cgraph * cgraph, int j, ggml_cuda_gdn_conv_match & m);
 void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
+
+#if defined(GGML_USE_HIP)
+// A decode or verify step's conv in one launch (see ggml_cuda_try_gdn_conv_step): reads the [3, C] history, the [C, T]
+// input (row stride x_stride) and the [4, C] weights; writes the concat (ci, null when nothing reads it), the new
+// history, every token's window (win, null when absent), SILU(conv) and, for channels [0, qk_channels), the q/k
+// RMS_NORM + SCALE (qk). state may be hist itself.
+constexpr int GGML_CUDA_GDN_CONV_STEP_MAX_T = 8;
+struct ggml_cuda_gdn_conv_step_args {
+    const float * hist = nullptr; const float * x = nullptr; const float * w = nullptr;
+    float * ci = nullptr; float * state = nullptr; float * win = nullptr; float * y = nullptr; float * qk = nullptr;
+    int64_t x_stride = 0, win_s1 = 0, win_s2 = 0, y_stride = 0, qk_stride = 0;   // in floats
+    int C = 0, T = 0, qk_channels = 0;
+    float eps = 0.0f, post_scale = 1.0f, bias = 0.0f;
+};
+void ggml_cuda_gdn_conv_step(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_step_args & a);
+#endif // defined(GGML_USE_HIP)

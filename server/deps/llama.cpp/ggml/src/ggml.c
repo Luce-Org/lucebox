@@ -9464,6 +9464,71 @@ struct ggml_tensor * ggml_ds4_deferred_peer_copy(
     return result;
 }
 
+struct ggml_tensor * ggml_moe_fused_prefetch(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * after,
+        struct ggml_tensor ** srcs,
+        int                   n_srcs,
+        size_t                max_bytes) {
+    GGML_ASSERT(after != NULL);
+    GGML_ASSERT(n_srcs >= 1 && n_srcs < GGML_MAX_SRC);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = after;
+    for (int i = 0; i < n_srcs; ++i) {
+        GGML_ASSERT(srcs[i] != NULL && ggml_is_contiguous(srcs[i]));
+        result->src[1 + i] = srcs[i];
+    }
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_PREFETCH);
+    const uint64_t bytes = max_bytes;
+    memcpy(&result->op_params[2], &bytes, sizeof(bytes));
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_fused_prefetch_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * picks,
+        struct ggml_tensor  * map,
+        struct ggml_tensor ** stacks,
+        int                   n_stacks,
+        int                   max_experts) {
+    GGML_ASSERT(picks != NULL && picks->type == GGML_TYPE_I32 && picks->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(map == NULL || (map->type == GGML_TYPE_I32 && ggml_is_contiguous(map)));
+    GGML_ASSERT(n_stacks >= 1 && n_stacks <= GGML_MAX_SRC - 2 && max_experts >= 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = picks;
+    result->src[1] = map;
+    for (int i = 0; i < n_stacks; ++i) {
+        GGML_ASSERT(stacks[i] != NULL && ggml_is_contiguous(stacks[i]) && stacks[i]->ne[3] == 1);
+        result->src[2 + i] = stacks[i];
+    }
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_PREFETCH_ROWS);
+    ggml_set_op_params_i32(result, 1, max_experts);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_fused_wake_hold(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * after,
+        int                   slot,
+        int                   max_us) {
+    GGML_ASSERT(after != NULL && slot >= 1 && slot <= 64 && max_us > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = after;
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_WAKE_HOLD);
+    ggml_set_op_params_i32(result, 1, slot);
+    ggml_set_op_params_i32(result, 2, max_us);
+
+    return result;
+}
+
 static struct ggml_tensor * ggml_cluster_allreduce_impl(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a,

@@ -210,6 +210,18 @@ GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols
 // Returns the previous setting.
 GGML_BACKEND_API bool ggml_backend_cuda_set_mmvq_batch_invariant(bool enabled);
 
+// Benchmarks only: the RDNA4 Q8_0 matvec block shape for every product (0..14), -1 for the shape table. Every shape
+// gives the same bits. Returns the previous setting.
+GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_q8_rdna4_shape(int shape);
+
+// Rows of one Q8_0 matrix split between an RDNA4 and an RDNA3.5 GPU. A Q8_0 MUL_MAT node flagged here runs the RDNA4
+// Q8_0 matvec on RDNA3.5 too (wave32 on both: the same partials, summed in the same order), so each output row has
+// the bits the RDNA4 device gives it, at one column or up to eight batch-invariant ones. RDNA4 runs that kernel for
+// every such product; other devices and products ignore the flag.
+GGML_BACKEND_API void ggml_backend_cuda_mul_mat_rdna4_rows(struct ggml_tensor * mul_mat);
+// Whether `device` gives a flagged Q8_0 product the RDNA4 matvec's bits.
+GGML_BACKEND_API bool ggml_backend_cuda_rdna4_rows_device(int device);
+
 // A MUL_MAT node whose src0 is a column range of wider Q8_0 rows (a view with
 // the rows' stride, e.g. one rank's slice of a contraction): on the RDNA4 Q8_0
 // matvec every block keeps the lane it takes in the whole rows, so the product
@@ -223,6 +235,11 @@ GGML_BACKEND_API void ggml_backend_cuda_mul_mat_whole_row_lanes(struct ggml_tens
 // K traversal, per-lane accumulation and warp reduction; a wave only shares
 // the activation loads across its rows. Returns the previous setting.
 GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_invariant_rows_override(int rows);
+
+// Calling-thread override of the weight rows per wave in the gfx1151 Q4_K MoE prefetching loop (mmvq.cu
+// mul_mat_vec_q_moe_q4k_prefetch): 0 = the default (2), 1 / 2 / 4 = forced. Every count gives the same bits; tests
+// compare them. Returns the previous setting.
+GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_moe_prefetch_rows_override(int rows);
 
 // Calling-thread override of the LDS activation staging on the same launch
 // (mmvq.cu c_invariant_lds_waves): -1 = LUCE_MMVQ_INVARIANT_LDS / the default
@@ -247,9 +264,24 @@ struct ggml_cuda_copy_desc {
 GGML_BACKEND_API void ggml_backend_cuda_copy_batch_async(ggml_backend_t backend,
                                                          const struct ggml_cuda_copy_desc * descs,
                                                          int n);
+// The same copies on the backend's side stream, after the work queued so far on its compute stream, on a few
+// blocks so kernels queued meanwhile keep most of the GPU. The compute stream waits for them at its next use (a
+// graph, an async tensor copy, an event) unless ggml_backend_cuda_set_side_overlap is on; ggml_backend_synchronize
+// waits for them too. Work that overlaps them must not touch their sources or destinations.
+GGML_BACKEND_API void ggml_backend_cuda_copy_batch_side(ggml_backend_t backend,
+                                                        const struct ggml_cuda_copy_desc * descs,
+                                                        int n);
+// While on, the backend's graphs and async tensor copies run beside its pending side copy batches.
+GGML_BACKEND_API void ggml_backend_cuda_set_side_overlap(ggml_backend_t backend, bool on);
+// Keeps an idle device's clocks up (HIP; a no-op elsewhere): one wave spins on the backend stream until the next use
+// of the backend or for at most max_us, so the work after an idle stretch starts at full clock.
+GGML_BACKEND_API void ggml_backend_cuda_hold(ggml_backend_t backend, int max_us);
 // Graph copy runs issued as one batched launch on the calling thread (see
 // GGML_CUDA_DISABLE_COPY_BATCH); for tests and profiling.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_copy_batch_run_count(void);
+// Hops whose peer copies ran as the tail of the producer's captured graph (HIP; 0 elsewhere), process-wide; for
+// tests.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_copy_tail_count(void);
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
@@ -340,11 +372,22 @@ enum ggml_cuda_qn_fusion {
     GGML_CUDA_QN_HC_MIX_Q8,      // the HC mix reduce writing the next matmul's q8_1 rows
     GGML_CUDA_QN_UNARY_MUL_Q8,   // UNARY then MUL writing the next matmul's q8_1 rows
     GGML_CUDA_QN_SCALE_SILU,     // SCALE then SILU in one launch
+    GGML_CUDA_QN_GDN_CONV,       // a GDN step's conv history copies, conv, SILU and q/k norm in one launch
+    GGML_CUDA_QN_GATED_NORM,     // the GDN output gate: RMS_NORM, MUL, SIGMOID and MUL in one launch
+    GGML_CUDA_QN_GATED_NORM_Q8,  // that launch also writing the next matmul's q8_1 rows
+    GGML_CUDA_QN_RMS_NORM_SCALE, // RMS_NORM then SCALE (the GDN q/k norm) in one launch
+    GGML_CUDA_QN_MMVQ_TWIN,      // two Q8_0 products of the same activations (the GDN qkv and z) in one launch
+    GGML_CUDA_QN_ROUTER_TOPK,    // the router after its logits: SOFT_MAX, ARGSORT top-k, table gathers, weights
+    GGML_CUDA_QN_HC_MIX_RDNA4,   // the HC down product, SCALE, SILU, up product and mix reduce in two launches
+    GGML_CUDA_QN_HC_CN_ADD,      // the layer output's ADD (split hot + cold experts) folded into the next HC_COMBINE_NORM
+    GGML_CUDA_QN_MMVF_TWIN,      // two F32-weight products (the GDN step's HC inject and alpha/beta gates) in one launch
     GGML_CUDA_QN_COUNT,
 };
 GGML_BACKEND_API size_t ggml_backend_cuda_get_qn_fusion_count(enum ggml_cuda_qn_fusion kind);
 // True when the QSA selected-attention kernels (qsa.cu) run on the backend's device: gfx1151 and RDNA4.
 GGML_BACKEND_API bool ggml_backend_cuda_qsa_supported(ggml_backend_t backend);
+// True when the backend's device runs GGML_CUDA_QN_MMVQ_TWIN (RDNA4).
+GGML_BACKEND_API bool ggml_backend_cuda_mmvq_twin_supported(ggml_backend_t backend);
 
 // True when a matmul with weight w over n_tokens rows can take an F16 activation (HIP MMB Q8_0 -> F16 route).
 GGML_BACKEND_API bool ggml_backend_cuda_mmb_f16_input_ok(const struct ggml_tensor * w, int64_t n_tokens);

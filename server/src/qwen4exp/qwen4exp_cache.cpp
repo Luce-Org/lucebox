@@ -276,6 +276,11 @@ void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace) {
     }
     if (workspace.sched) ggml_backend_sched_free(workspace.sched);
     if (workspace.alloc) ggml_gallocr_free(workspace.alloc);
+    if (workspace.host_in || workspace.host_out) {
+        if (workspace.backend) ggml_backend_synchronize(workspace.backend);   // its transfers may be in flight
+        if (workspace.host_in) ggml_backend_buffer_free(workspace.host_in);
+        if (workspace.host_out) ggml_backend_buffer_free(workspace.host_out);
+    }
     if (workspace.ctx) ggml_free(workspace.ctx);
     workspace = {};
 }
@@ -328,6 +333,7 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
     c.mtp_k = c.mtp_v = nullptr;
     c.mtp_prev_hidden = nullptr;
     c.mtp_chain_hidden = c.mtp_chain_ids = nullptr;
+    if (c.mtp_ids_host) { ggml_backend_buffer_free(c.mtp_ids_host); c.mtp_ids_host = nullptr; }
     c.mtp_prev_pos = -1;
     c.spec_ssm.clear();
     c.spec_ssm_rows.clear();

@@ -1,4 +1,5 @@
 #include "concat.cuh"
+#include "copy-batch.cuh"
 
 #include <atomic>
 
@@ -304,6 +305,37 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// Contiguous concatenations up to this size copy in one kernel launch: inside a captured graph every runtime copy is
+// a node of its own with its own launch gap, which costs more than the bytes (a verify's attention rows, 24 KB, joined
+// in four copies per layer). Larger ones keep the runtime's copies.
+static constexpr size_t kConcatOneLaunchMaxBytes = (size_t) 1 << 20;
+
+// src0's bytes then src1's in each of n_samples samples of contiguous operands: a concatenation along the last
+// dimension that is not 1 below the samples.
+static void concat_as_copies(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int64_t n_samples,
+                             cudaStream_t stream) {
+    const size_t size0 = ggml_nbytes(src0) / (size_t) n_samples;
+    const size_t size1 = ggml_nbytes(src1) / (size_t) n_samples;
+    const char * s0 = (const char *) src0->data;
+    const char * s1 = (const char *) src1->data;
+    char * d = (char *) dst->data;
+    if (ggml_nbytes(dst) <= kConcatOneLaunchMaxBytes && 2 * n_samples <= ggml_cuda_copy_batch_max) {
+        ggml_cuda_copy_desc descs[ggml_cuda_copy_batch_max];
+        int n = 0;
+        for (int64_t i = 0; i < n_samples; ++i) {
+            descs[n++] = { s0 + i * size0, d + i * (size0 + size1), size0 };
+            descs[n++] = { s1 + i * size1, d + i * (size0 + size1) + size0, size1 };
+        }
+        ggml_cuda_copy_batch(descs, n, stream);
+        return;
+    }
+    for (int64_t i = 0; i < n_samples; ++i) {
+        CUDA_CHECK(cudaMemcpyAsync(d + i * (size0 + size1), s0 + i * size0, size0, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d + i * (size0 + size1) + size0, s1 + i * size1, size1, cudaMemcpyDeviceToDevice,
+                                   stream));
+    }
+}
+
 template <typename T>
 static void concat_cuda_typed(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim) {
     cudaStream_t stream = ctx.stream();
@@ -319,15 +351,7 @@ static void concat_cuda_typed(ggml_backend_cuda_context & ctx, const ggml_tensor
         // off the kernel below, whose grid.y is ne1 (at most 65535).
         const bool outer_ones = dim == 2 || (dim == 1 && dst->ne[2] == 1);
         if (dim != 3 && outer_ones) {
-            const size_t size0 = ggml_nbytes(src0) / (size_t) dst->ne[3];
-            const size_t size1 = ggml_nbytes(src1) / (size_t) dst->ne[3];
-            for (int i3 = 0; i3 < dst->ne[3]; i3++) {
-                char * d = (char *) dst_d + i3 * dst->nb[3];
-                CUDA_CHECK(cudaMemcpyAsync(d, (const char *) src0_d + i3 * src0->nb[3], size0,
-                                           cudaMemcpyDeviceToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(d + size0, (const char *) src1_d + i3 * src1->nb[3], size1,
-                                           cudaMemcpyDeviceToDevice, stream));
-            }
+            concat_as_copies(src0, src1, dst, dst->ne[3], stream);
         } else if (dim != 3) {
             GGML_ASSERT(dst->ne[1] <= 65535 && dst->ne[2] <= 65535);
             for (int i3 = 0; i3 < dst->ne[3]; i3++) {
@@ -339,11 +363,7 @@ static void concat_cuda_typed(ggml_backend_cuda_context & ctx, const ggml_tensor
                         dst->ne[0],  dst->ne[1],  dst->ne[2], dim, stream);
             }
         } else {
-            const size_t size0 = ggml_nbytes(src0);
-            const size_t size1 = ggml_nbytes(src1);
-
-            CUDA_CHECK(cudaMemcpyAsync(dst_d,                         src0_d, size0, cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync((char *)dst_d + size0,         src1_d, size1, cudaMemcpyDeviceToDevice, stream));
+            concat_as_copies(src0, src1, dst, 1, stream);
         }
     } else {
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);

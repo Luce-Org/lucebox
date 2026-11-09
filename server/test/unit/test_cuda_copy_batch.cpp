@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -251,4 +252,184 @@ TEST_CASE(CudaCopyBatchFixture, cross_device_tensor_copy) {
         ggml_backend_free(gpus[i]);
     }
     for (int i = 0; i < 4; ++i) REQUIRE(got[i] == rows[i]);
+}
+
+// Contiguous concatenations that are plain copies (concat.cu concat_as_copies): along dim 2 chained as a verify's
+// attention rows are, along dim 1 over three samples (ne2 == 1), along dim 3, and one past the one-launch size (the
+// runtime's copies). Every output element must be its operand's, bit for bit.
+TEST_CASE(CudaCopyBatchFixture, concat_copies) {
+    if (ggml_backend_cuda_get_device_count() <= 0) {
+        SKIP("CUDA/HIP device unavailable");
+    }
+    ggml_backend_t gpu = ggml_backend_cuda_init(0);
+    REQUIRE(gpu != nullptr);
+    ggml_init_params gp{};
+    gp.mem_size = 32 * ggml_tensor_overhead() + ggml_graph_overhead();
+    gp.no_alloc = true;
+    ggml_context * gctx = ggml_init(gp);
+    REQUIRE(gctx != nullptr);
+    struct Concat { ggml_tensor * a, * b, * out; int dim; };
+    std::vector<Concat> cases;
+    auto concat = [&](ggml_tensor * a, ggml_tensor * b, int dim) {
+        ggml_tensor * out = ggml_concat(gctx, a, b, dim);
+        cases.push_back({ a, b, out, dim });
+        return out;
+    };
+    ggml_tensor * rows[3];
+    for (ggml_tensor *& r : rows) r = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, 256, 24, 1);
+    auto t4 = [&](ggml_type type, int64_t n0, int64_t n1, int64_t n2, int64_t n3) {
+        return ggml_new_tensor_4d(gctx, type, n0, n1, n2, n3);
+    };
+    concat(concat(rows[0], rows[1], 2), rows[2], 2);
+    concat(t4(GGML_TYPE_I32, 33, 5, 1, 3), t4(GGML_TYPE_I32, 33, 7, 1, 3), 1);
+    concat(t4(GGML_TYPE_F32, 100, 3, 2, 1), t4(GGML_TYPE_F32, 100, 3, 2, 2), 3);
+    concat(t4(GGML_TYPE_F32, 1024, 256, 1, 1), t4(GGML_TYPE_F32, 1024, 256, 1, 1), 2);   // 2 MiB: runtime copies
+    ggml_cgraph * gf = ggml_new_graph(gctx);
+    for (const Concat & c : cases) ggml_build_forward_expand(gf, c.out);
+    ggml_backend_buffer_t gbuf = ggml_backend_alloc_ctx_tensors(gctx, gpu);
+    REQUIRE(gbuf != nullptr);
+
+    // Every operand gets its own 32-bit pattern; the chained rows' middle result is checked as an output too.
+    std::vector<std::vector<uint32_t>> host(cases.size() * 2);
+    uint32_t seed = 11u;
+    auto fill = [&](ggml_tensor * t, std::vector<uint32_t> & v) {
+        if (!v.empty()) return;
+        v.resize((size_t) ggml_nelements(t));
+        for (uint32_t & x : v) { seed = seed * 1664525u + 1013904223u; x = seed >> 4; }
+        ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+    };
+    for (size_t i = 0; i < cases.size(); ++i) {
+        if (cases[i].a->op == GGML_OP_NONE) fill(cases[i].a, host[2 * i]);
+        fill(cases[i].b, host[2 * i + 1]);
+    }
+    const bool computed = ggml_backend_graph_compute(gpu, gf) == GGML_STATUS_SUCCESS;
+
+    int64_t bad = 0;
+    std::vector<std::vector<uint32_t>> got(cases.size());
+    for (size_t i = 0; i < cases.size(); ++i) {
+        const Concat & c = cases[i];
+        got[i].resize((size_t) ggml_nelements(c.out));
+        ggml_backend_tensor_get(c.out, got[i].data(), 0, ggml_nbytes(c.out));
+        // The first operand's values: its pattern, or the previous case's output when chained.
+        const std::vector<uint32_t> & va = c.a->op == GGML_OP_NONE ? host[2 * i] : got[i - 1];
+        const std::vector<uint32_t> & vb = host[2 * i + 1];
+        const int64_t * ne = c.out->ne;
+        for (int64_t i3 = 0; i3 < ne[3]; ++i3) for (int64_t i2 = 0; i2 < ne[2]; ++i2)
+        for (int64_t i1 = 0; i1 < ne[1]; ++i1) for (int64_t i0 = 0; i0 < ne[0]; ++i0) {
+            int64_t idx[4] = { i0, i1, i2, i3 };
+            const bool first = idx[c.dim] < c.a->ne[c.dim];
+            const ggml_tensor * src = first ? c.a : c.b;
+            if (!first) idx[c.dim] -= c.a->ne[c.dim];
+            const int64_t at = ((idx[3] * src->ne[2] + idx[2]) * src->ne[1] + idx[1]) * src->ne[0] + idx[0];
+            const int64_t out_at = ((i3 * ne[2] + i2) * ne[1] + i1) * ne[0] + i0;
+            bad += got[i][(size_t) out_at] != (first ? va : vb)[(size_t) at];
+        }
+    }
+    ggml_backend_buffer_free(gbuf);
+    ggml_free(gctx);
+    ggml_backend_free(gpu);
+    std::printf("[cuda-copy-batch] concat copies: %lld mismatched values in %zu concatenations\n", (long long) bad,
+                cases.size());
+    REQUIRE(computed);
+    REQUIRE(bad == 0);
+}
+
+// A graph split over two devices by the scheduler and computed again with new inputs each step, as split decode runs
+// (parallel copies, captured graphs replayed): once a producer's graph has been seen right before a flush of its hop
+// copies, the copies and the hop's event record ride at the end of that graph (ggml_cuda_tail_realize). Every step
+// must read that step's values on both devices, and on ROCm the tail must have carried copies. Hop copies take the
+// peer copy kernel (the only path a tail can carry) under the Qwen3.8 split profile, so the test runs in it.
+TEST_CASE(CudaCopyBatchFixture, split_graph_tail_copies) {
+    if (ggml_backend_cuda_get_device_count() < 2) {
+        SKIP("needs two CUDA/HIP devices");
+    }
+    const ggml_cuda_qwen4exp_profile profile_before =
+        ggml_backend_cuda_set_qwen4exp_profile(GGML_CUDA_QWEN4EXP_DEFAULT);
+    ggml_backend_t gpus[2] = { ggml_backend_cuda_init(0), ggml_backend_cuda_init(1) };
+    REQUIRE(gpus[0] != nullptr);
+    REQUIRE(gpus[1] != nullptr);
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);   // the scheduler's last
+    REQUIRE(cpu != nullptr);
+
+    // Two chains cross between the devices at every hop (two copies per hop), with exact float arithmetic:
+    // a' = 2a + b, b' = b + 1 on device hop % 2.
+    constexpr int64_t n     = 1536;
+    constexpr int     kHops = 6;
+    constexpr int     kSteps = 24;
+    ggml_init_params ip{};
+    ip.mem_size = 128 * ggml_tensor_overhead() + ggml_graph_overhead();
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    REQUIRE(ctx != nullptr);
+    ggml_tensor * a0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    ggml_tensor * b0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    ggml_set_input(a0);
+    ggml_set_input(b0);
+    ggml_tensor * a = a0;
+    ggml_tensor * b = b0;
+    std::vector<std::pair<ggml_tensor *, int>> placed;
+    for (int h = 0; h < kHops; ++h) {
+        ggml_tensor * a2 = ggml_scale(ctx, a, 2.0f);
+        ggml_tensor * an = ggml_add(ctx, a2, b);
+        ggml_tensor * bn = ggml_scale_bias(ctx, b, 1.0f, 1.0f);
+        for (ggml_tensor * t : { a2, an, bn }) placed.push_back({ t, h % 2 });
+        a = an;
+        b = bn;
+    }
+    ggml_tensor * out = ggml_add(ctx, a, b);
+    placed.push_back({ out, 0 });
+    ggml_set_output(out);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_t backends[3] = { gpus[0], gpus[1], cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 3, 256, true, false);
+    REQUIRE(sched != nullptr);
+    ggml_backend_sched_set_tensor_backend(sched, a0, gpus[0]);
+    ggml_backend_sched_set_tensor_backend(sched, b0, gpus[0]);
+    for (const auto & [t, dev] : placed) ggml_backend_sched_set_tensor_backend(sched, t, gpus[dev]);
+    REQUIRE(ggml_backend_sched_alloc_graph(sched, gf));
+
+    const size_t tails_before = ggml_backend_cuda_get_copy_tail_count();
+    std::vector<float> va(n), vb(n), got(n);
+    int64_t bad = 0;
+    int     bad_step = -1;
+    bool    computed = true;
+    for (int step = 0; step < kSteps && computed; ++step) {
+        for (int64_t i = 0; i < n; ++i) {
+            va[i] = (float) ((i * 7 + step * 13) % 1000);
+            vb[i] = (float) ((i * 3 + step * 5) % 500);
+        }
+        ggml_backend_tensor_set(a0, va.data(), 0, sizeof(float) * n);
+        ggml_backend_tensor_set(b0, vb.data(), 0, sizeof(float) * n);
+        computed = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+        ggml_backend_tensor_get(out, got.data(), 0, sizeof(float) * n);
+        for (int64_t i = 0; i < n; ++i) {
+            float x = va[i], y = vb[i];
+            for (int h = 0; h < kHops; ++h) {
+                x = 2.0f * x + y;
+                y = y + 1.0f;
+            }
+            if (got[i] != x + y) {
+                ++bad;
+                if (bad_step < 0) bad_step = step;
+            }
+        }
+    }
+    const size_t tails = ggml_backend_cuda_get_copy_tail_count() - tails_before;
+    const bool rocm = std::string(ggml_backend_name(gpus[0])).rfind("ROCm", 0) == 0;
+    std::printf("[cuda-copy-batch] split graph: %lld mismatched values (first at step %d), %zu tail launches%s\n",
+                (long long) bad, bad_step, tails, rocm ? " (ROCm)" : "");
+
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    ggml_backend_free(cpu);
+    ggml_backend_free(gpus[0]);
+    ggml_backend_free(gpus[1]);
+    ggml_backend_cuda_set_qwen4exp_profile(profile_before);
+    REQUIRE(computed);
+    REQUIRE(bad == 0);
+    if (rocm) {
+        REQUIRE(tails > 0);
+    }
 }

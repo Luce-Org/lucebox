@@ -6,6 +6,7 @@
 #include "convert.cuh"
 
 #include <algorithm>
+#include <climits>
 #include <cstdlib>
 
 // On HIP the K loops below are unrolled (the "K-loop unroll" pragmas) so the
@@ -1089,3 +1090,140 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             return false;
     }
 }
+
+#if defined(GGML_USE_HIP)
+struct mmvf_twin_args {
+    const float * x;      // the weights' first row
+    const float * y;      // the activations' first column
+    float *       dst;
+    int ncols2;           // row length / 2
+    int stride_row;       // floats
+    int stride_col_y2;    // float2s
+    int stride_col_dst;   // floats
+};
+
+// Blocks [0, nrows_a) compute a's rows, the rest b's. The body is mul_mat_vec_f's F32 path for one channel and one
+// sample without fusion: the same per-thread order over K, warp sums and cross-warp stage, so every row has the bits
+// of its own launch (test_qn_split_fusions mmvf_twin compares them).
+template <int ncols_dst, int block_size>
+static __global__ void mul_mat_vec_f_twin(const mmvf_twin_args a, const mmvf_twin_args b, const int nrows_a) {
+    const bool second = (int) blockIdx.x >= nrows_a;
+    const int  row    = second ? (int) blockIdx.x - nrows_a : (int) blockIdx.x;
+    const mmvf_twin_args p = second ? b : a;
+    const int  tid    = threadIdx.x;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    __shared__ float buf_iw[warp_size];
+
+    const float2 * x2 = (const float2 *) (p.x + row*p.stride_row);
+    const float2 * y2 = (const float2 *) p.y;
+
+    if (block_size > warp_size) {
+        if (tid < warp_size) {
+            buf_iw[tid] = 0.0f;
+        }
+        __syncthreads();
+    }
+
+    float sumf[ncols_dst] = {0.0f};
+#pragma unroll 8
+    for (int col2 = tid; col2 < p.ncols2; col2 += block_size) {
+        const float2 tmpx = x2[col2];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float2 tmpy = y2[j*p.stride_col_y2 + col2];
+            ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
+            ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+        if (block_size > warp_size) {
+            buf_iw[tid/warp_size] = sumf[j];
+            __syncthreads();
+            if (tid < warp_size) {
+                sumf[j] = buf_iw[tid];
+                sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+            }
+            if (j < ncols_dst) {
+                __syncthreads();
+            }
+        }
+    }
+
+    if (tid >= ncols_dst) {
+        return;
+    }
+    p.dst[tid*p.stride_col_dst + row] = sumf[tid];
+}
+
+template <int ncols_dst>
+static void mul_mat_vec_f_twin_launch(const mmvf_twin_args & a, const mmvf_twin_args & b, int nrows_a, int nrows,
+                                      int block_size, cudaStream_t stream) {
+    const dim3 grid(nrows, 1, 1);
+    switch (block_size) {
+        case  32: mul_mat_vec_f_twin<ncols_dst,  32><<<grid,  32, 0, stream>>>(a, b, nrows_a); break;
+        case  64: mul_mat_vec_f_twin<ncols_dst,  64><<<grid,  64, 0, stream>>>(a, b, nrows_a); break;
+        case  96: mul_mat_vec_f_twin<ncols_dst,  96><<<grid,  96, 0, stream>>>(a, b, nrows_a); break;
+        case 128: mul_mat_vec_f_twin<ncols_dst, 128><<<grid, 128, 0, stream>>>(a, b, nrows_a); break;
+        case 160: mul_mat_vec_f_twin<ncols_dst, 160><<<grid, 160, 0, stream>>>(a, b, nrows_a); break;
+        case 192: mul_mat_vec_f_twin<ncols_dst, 192><<<grid, 192, 0, stream>>>(a, b, nrows_a); break;
+        case 224: mul_mat_vec_f_twin<ncols_dst, 224><<<grid, 224, 0, stream>>>(a, b, nrows_a); break;
+        case 256: mul_mat_vec_f_twin<ncols_dst, 256><<<grid, 256, 0, stream>>>(a, b, nrows_a); break;
+        default: GGML_ABORT("mmvf twin: block size %d", block_size);
+    }
+}
+
+static mmvf_twin_args mmvf_twin_args_of(const ggml_tensor * mm) {
+    mmvf_twin_args r;
+    r.x              = (const float *) mm->src[0]->data;
+    r.y              = (const float *) mm->src[1]->data;
+    r.dst            = (float *) mm->data;
+    r.ncols2         = (int) (mm->src[0]->ne[0] / 2);
+    r.stride_row     = (int) (mm->src[0]->nb[1] / sizeof(float));
+    r.stride_col_y2  = (int) (mm->src[1]->nb[1] / sizeof(float) / 2);
+    r.stride_col_dst = (int) (mm->nb[1] / sizeof(float));
+    return r;
+}
+
+bool ggml_cuda_mmvf_twin_ok(int device, const ggml_tensor * a, const ggml_tensor * b) {
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const int64_t T = a->src[1]->ne[1];
+    if (T < 1 || T > 4 || b->src[1]->ne[1] != T) return false;
+    for (const ggml_tensor * mm : {a, b}) {
+        const ggml_tensor * w = mm->src[0];
+        const ggml_tensor * y = mm->src[1];
+        if (mm->op != GGML_OP_MUL_MAT || w->type != GGML_TYPE_F32 || y->type != GGML_TYPE_F32 ||
+            mm->type != GGML_TYPE_F32 || w->ne[2] != 1 || w->ne[3] != 1 || y->ne[2] != 1 || y->ne[3] != 1 ||
+            mm->ne[2] != 1 || mm->ne[3] != 1 || y->ne[0] != w->ne[0] || mm->ne[0] != w->ne[1] ||
+            y->nb[0] != sizeof(float) || mm->nb[0] != sizeof(float) || y->nb[1] % (2*sizeof(float)) != 0 ||
+            w->ne[1] > INT_MAX / 2 || (int64_t) (w->nb[1] / sizeof(float)) * w->ne[1] > INT_MAX ||
+            !ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, T)) {
+            return false;
+        }
+    }
+    return ggml_cuda_mmvf_block_size(device, a->src[0]->ne[0], a->src[0]->ne[1], T, false) ==
+           ggml_cuda_mmvf_block_size(device, b->src[0]->ne[0], b->src[0]->ne[1], T, false);
+}
+
+void ggml_cuda_mul_mat_vec_f_twin(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_tensor * b) {
+    GGML_ASSERT(ggml_cuda_mmvf_twin_ok(ctx.device, a, b));
+    const int T = (int) a->src[1]->ne[1];
+    const int nrows_a = (int) a->src[0]->ne[1];
+    const int nrows = nrows_a + (int) b->src[0]->ne[1];
+    const int bs = ggml_cuda_mmvf_block_size(ctx.device, a->src[0]->ne[0], a->src[0]->ne[1], T, false);
+    const mmvf_twin_args pa = mmvf_twin_args_of(a), pb = mmvf_twin_args_of(b);
+    switch (T) {
+        case 1: mul_mat_vec_f_twin_launch<1>(pa, pb, nrows_a, nrows, bs, ctx.stream()); break;
+        case 2: mul_mat_vec_f_twin_launch<2>(pa, pb, nrows_a, nrows, bs, ctx.stream()); break;
+        case 3: mul_mat_vec_f_twin_launch<3>(pa, pb, nrows_a, nrows, bs, ctx.stream()); break;
+        case 4: mul_mat_vec_f_twin_launch<4>(pa, pb, nrows_a, nrows, bs, ctx.stream()); break;
+        default: GGML_ABORT("mmvf twin: %d columns", T);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+#else
+bool ggml_cuda_mmvf_twin_ok(int, const ggml_tensor *, const ggml_tensor *) { return false; }
+void ggml_cuda_mul_mat_vec_f_twin(ggml_backend_cuda_context &, ggml_tensor *, ggml_tensor *) { GGML_ABORT("HIP only"); }
+#endif // defined(GGML_USE_HIP)

@@ -4,7 +4,8 @@
 // reshape_2d([hc*n_embd, T]) of the 3-D grouped-norm output, which the matcher once rejected (ne[2] != 1 on the
 // 3-D root), silently leaving ~85 ms/request of unfused copies at p4096. The fused arm must (a) match on every
 // compute (no "[ple-conv] no match" under LUCE_PLE_DEBUG=1) and (b) hash-equal the legacy arm (child process)
-// on the silu output and the updated conv state. SKIP (77) without a GPU.
+// on the silu output and the updated conv state. Verify widths (T <= 8) also write each token's conv history into a
+// spec state, as build_ple does for speculative rollback. SKIP (77) without a GPU.
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
@@ -33,6 +34,7 @@ uint64_t run(ggml_backend_t gpu, int T) {
     ggml_tensor * gated = ggml_new_tensor_2d(c, GGML_TYPE_F32, C, T);
     ggml_tensor * nw    = ggml_new_tensor_1d(c, GGML_TYPE_F32, C);
     ggml_tensor * state = ggml_new_tensor_1d(c, GGML_TYPE_F32, hist * C);
+    ggml_tensor * spec  = T <= 8 ? ggml_new_tensor_3d(c, GGML_TYPE_F32, hist, C, T) : nullptr;
     // The conv weight must be a weight (its views sit inside the fused subgraph with an external view_src, which
     // ggml_can_fuse_subgraph_ext only allows for constant tensors): own context, buffer usage WEIGHTS.
     ggml_context * cw = ggml_init(ip);
@@ -51,6 +53,11 @@ uint64_t run(ggml_backend_t gpu, int T) {
     ggml_build_forward_expand(gf, ggml_cpy(c,
         ggml_cont(c, ggml_view_3d(c, padded, hist, C, 1, padded->nb[1], padded->nb[2], (size_t) T * padded->nb[0])),
         ggml_reshape_3d(c, state, hist, C, 1)));
+    for (int64_t t = 0; spec && t < T; ++t) {
+        ggml_build_forward_expand(gf, ggml_cpy(c,
+            ggml_cont(c, ggml_view_3d(c, padded, hist, C, 1, padded->nb[1], padded->nb[2], (t + 1) * padded->nb[0])),
+            ggml_view_3d(c, spec, hist, C, 1, spec->nb[1], spec->nb[2], t * spec->nb[2])));
+    }
     ggml_tensor * conv_out = nullptr;
     for (int64_t k = 0; k < kern; ++k) {
         const int64_t start = hist - (kern - 1 - k) * dil;
@@ -84,7 +91,8 @@ uint64_t run(ggml_backend_t gpu, int T) {
     uint64_t h = 1469598103934665603ull;
     for (int pass = 0; pass < 2; ++pass) {   // pass 1 reads the state pass 0 wrote back
         if (ggml_backend_graph_compute(gpu, gf) != GGML_STATUS_SUCCESS) { ggml_backend_buffer_free(buf); ggml_backend_buffer_free(bufw); ggml_free(cw); ggml_free(c); return 0; }
-        for (ggml_tensor * t : { out, state }) {
+        for (ggml_tensor * t : { out, state, spec }) {
+            if (!t) continue;
             std::vector<float> v(ggml_nelements(t));
             ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
             h = fnv(v.data(), v.size() * sizeof(float), h);
@@ -99,7 +107,7 @@ uint64_t run(ggml_backend_t gpu, int T) {
 
 uint64_t run_all(ggml_backend_t gpu, bool & ok) {
     uint64_t h = 1469598103934665603ull;
-    for (int T : { 1028, 300 }) {
+    for (int T : { 1028, 300, 3, 2, 1 }) {
         const uint64_t ht = run(gpu, T);
         if (!ht) { std::printf("[ple-conv-fusion] FAIL: compute T=%d\n", T); ok = false; }
         h = fnv(&ht, sizeof ht, h);

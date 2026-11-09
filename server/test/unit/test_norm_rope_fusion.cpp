@@ -1,11 +1,13 @@
-// Parity + match test for the fused RMS_NORM -> MUL -> ROPE [-> PERMUTE -> CONT] kernel (rope.cu
-// rope_multi_heads_norm, default on the HIP per-token path; LUCE_ATTN_FUSE_LEGACY=1 keeps the separate kernels).
+// Parity + match test for the fused RMS_NORM -> MUL -> ROPE [-> PERMUTE -> CONT] kernels (rope.cu
+// rope_multi_heads_norm for the Strix's prompt chunks of 64+ tokens, rope_multi_rows_norm for every other row; default
+// on HIP for the qwen4exp graph; LUCE_ATTN_FUSE_LEGACY=1 keeps the separate kernels).
 // Rebuilds the qwen4exp attention chains: Q from the strided [q | gate] projection view [256,24,T] -> norm -> gamma
 // -> M-RoPE (n_dims 64) -> permute -> cont (the 5-op chain), K [256,2,T] and the indexer q [128,4,T] without the
-// permute (the 3-op chain). The fused arm must match on every chain (LUCE_NORM_ROPE_DEBUG=1 "[norm-rope] fused"
-// lines, 3 per compute) and hash-equal the legacy arm (child process). Without the qwen4exp profile (a Qwen3.5-style
-// q/k-norm M-RoPE graph) nothing may fuse: the switch must change neither the output nor the kernels. SKIP (77)
-// without a GPU.
+// permute (the 3-op chain), at prompt sizes and step sizes (8, 3, 1 tokens), on every device (in split mode the
+// R9700 runs the attention, the Strix alone otherwise). The fused arm must match on every chain
+// (LUCE_NORM_ROPE_DEBUG=1 "[norm-rope] fused" lines, 3 per compute) and hash-equal the legacy arm (child process).
+// Without the qwen4exp profile (a Qwen3.5-style q/k-norm M-RoPE graph) nothing may fuse: the switch must change
+// neither the output nor the kernels. SKIP (77) without a GPU.
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
@@ -77,7 +79,7 @@ uint64_t run(ggml_backend_t gpu, int T) {
 
 uint64_t run_all(ggml_backend_t gpu, bool & ok) {
     uint64_t h = 1469598103934665603ull;
-    for (int T : { 1028, 300, 64 }) {
+    for (int T : { 1028, 300, 64, 8, 3, 1 }) {
         const uint64_t ht = run(gpu, T);
         if (!ht) { std::printf("[norm-rope-fusion] FAIL: compute T=%d\n", T); ok = false; }
         h = fnv(&ht, sizeof ht, h);
@@ -85,10 +87,10 @@ uint64_t run_all(ggml_backend_t gpu, bool & ok) {
     return h;
 }
 
-// Child: this binary with `mode` (--hash, or --hash-off without the qwen4exp profile), stdout+stderr merged.
-// Returns the hash line; counts "[norm-rope] fused" lines.
-bool child(const char * self, const char * env, const char * mode, uint64_t & hash, int & fused) {
-    const std::string cmd = std::string(env) + " '" + self + "' " + mode + " 2>&1";
+// Child: this binary with `mode` (--hash, or --hash-off without the qwen4exp profile) on device `dev`, stdout+stderr
+// merged. Returns the hash line; counts "[norm-rope] fused" lines.
+bool child(const char * self, const char * env, const char * mode, int dev, uint64_t & hash, int & fused) {
+    const std::string cmd = std::string(env) + " '" + self + "' " + mode + " " + std::to_string(dev) + " 2>&1";
     FILE * f = popen(cmd.c_str(), "r");
     if (!f) return false;
     char line[256]; bool got = false; fused = 0;
@@ -100,11 +102,28 @@ bool child(const char * self, const char * env, const char * mode, uint64_t & ha
     return got;
 }
 
+// The four arms on one device: qwen4exp fused / legacy, profile off fused / legacy.
+bool check_device(const char * self, int dev) {
+    uint64_t hf = 0, hl = 0; int nf = 0, nl = 0;
+    uint64_t of = 0, ol = 0; int nof = 0, nol = 0;
+    const bool gf = child(self, "LUCE_NORM_ROPE_DEBUG=1 LUCE_ATTN_FUSE_LEGACY=0", "--hash", dev, hf, nf);
+    const bool gl = child(self, "LUCE_ATTN_FUSE_LEGACY=1", "--hash", dev, hl, nl);
+    const bool go = child(self, "LUCE_NORM_ROPE_DEBUG=1 LUCE_ATTN_FUSE_LEGACY=0", "--hash-off", dev, of, nof);
+    const bool gol = child(self, "LUCE_NORM_ROPE_DEBUG=1 LUCE_ATTN_FUSE_LEGACY=1", "--hash-off", dev, ol, nol);
+    // qwen4exp: 3 chains x 6 sizes fused, none on the legacy arm. Profile off: none fused, same output either way.
+    const bool ok = gf && gl && hf == hl && nf == 18 && nl == 0 && go && gol && of == ol && nof == 0 && nol == 0;
+    std::printf("[norm-rope-fusion] device %d: fused %llx (fused lines %d, want 18) legacy %llx (fused lines %d); "
+                "profile off %s %llx (fused lines %d, want 0) legacy %llx %s\n",
+                dev, (unsigned long long) hf, nf, (unsigned long long) hl, nl, go ? "ran" : "CRASHED",
+                (unsigned long long) of, nof, (unsigned long long) ol, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
-    if (argc > 1 && (!std::strcmp(argv[1], "--hash") || !std::strcmp(argv[1], "--hash-off"))) {
-        ggml_backend_t gpu = ggml_backend_cuda_init(0);
+    if (argc > 2 && (!std::strcmp(argv[1], "--hash") || !std::strcmp(argv[1], "--hash-off"))) {
+        ggml_backend_t gpu = ggml_backend_cuda_init(std::atoi(argv[2]));
         if (!gpu) return 77;
         if (!std::strcmp(argv[1], "--hash")) {
             ggml_backend_cuda_set_qwen4exp_profile(GGML_CUDA_QWEN4EXP_DEFAULT);   // the fusions are gated on the qwen4exp profile
@@ -115,22 +134,9 @@ int main(int argc, char ** argv) {
         std::printf("hash %llx\n", (unsigned long long) h);
         return ok ? 0 : 1;
     }
-    {
-        ggml_backend_t gpu = ggml_backend_cuda_init(0);
-        if (!gpu) { std::printf("[norm-rope-fusion] SKIP: no GPU\n"); return 77; }
-        ggml_backend_free(gpu);
-    }
-    uint64_t hf = 0, hl = 0; int nf = 0, nl = 0;
-    uint64_t of = 0, ol = 0; int nof = 0, nol = 0;
-    const bool gf = child(argv[0], "LUCE_NORM_ROPE_DEBUG=1 LUCE_ATTN_FUSE_LEGACY=0", "--hash", hf, nf);
-    const bool gl = child(argv[0], "LUCE_ATTN_FUSE_LEGACY=1", "--hash", hl, nl);
-    const bool go = child(argv[0], "LUCE_NORM_ROPE_DEBUG=1 LUCE_ATTN_FUSE_LEGACY=0", "--hash-off", of, nof);
-    const bool gol = child(argv[0], "LUCE_NORM_ROPE_DEBUG=1 LUCE_ATTN_FUSE_LEGACY=1", "--hash-off", ol, nol);
-    // qwen4exp: 3 chains x 3 sizes fused, none on the legacy arm. Profile off: none fused, same output either way.
-    const bool ok = gf && gl && hf == hl && nf == 9 && nl == 0 && go && gol && of == ol && nof == 0 && nol == 0;
-    std::printf("[norm-rope-fusion] fused %llx (fused lines %d, want 9) legacy %llx (fused lines %d); "
-                "profile off %s %llx (fused lines %d, want 0) legacy %llx %s\n",
-                (unsigned long long) hf, nf, (unsigned long long) hl, nl, go ? "ran" : "CRASHED",
-                (unsigned long long) of, nof, (unsigned long long) ol, ok ? "PASS" : "FAIL");
+    const int n_dev = ggml_backend_cuda_get_device_count();
+    if (n_dev <= 0) { std::printf("[norm-rope-fusion] SKIP: no GPU\n"); return 77; }
+    bool ok = true;
+    for (int dev = 0; dev < n_dev; ++dev) ok = check_device(argv[0], dev) && ok;
     return ok ? 0 : 1;
 }
