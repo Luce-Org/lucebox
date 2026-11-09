@@ -5780,9 +5780,10 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, 3, outputs, 1);
     }
 
-    // RMS_NORM -> MUL -> ROPE (multi-section, F32) [-> PERMUTE -> CONT]: rope.cu rope_multi_heads_norm (the Strix's
-    // prompt chunks of 64+ tokens) or rope_multi_rows_norm (every other row), for the qwen4exp attention Q/K and
-    // indexer q. Rows <= 256, gamma [ne0] or [ne0, heads], no frequency factors. Bit-identical to the separate kernels.
+    // RMS_NORM -> MUL -> ROPE (multi-section or interleaved, F32) [-> PERMUTE -> CONT]: rope.cu rope_multi_heads_norm
+    // (the qwen4exp Strix's prompt chunks of 64+ tokens) or rope_multi_rows_norm (every other row), for the qwen4exp
+    // attention Q/K and indexer q and the Qwen3.5 attention Q/K. Rows <= 256, gamma [ne0] or [ne0, heads], no frequency
+    // factors. Bit-identical to the separate kernels.
     if ((ops.size() == 3 || ops.size() == 5) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL &&
         ops.begin()[2] == GGML_OP_ROPE &&
         (ops.size() == 3 || (ops.begin()[3] == GGML_OP_PERMUTE && ops.begin()[4] == GGML_OP_CONT))) {
@@ -7833,7 +7834,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;
                     }
 
-                    // RMS_NORM -> MUL -> ROPE [-> PERMUTE -> CONT] in one kernel (qwen4exp attention Q/K, indexer q);
+                    // RMS_NORM -> MUL -> ROPE [-> PERMUTE -> CONT] in one kernel (qwen4exp attention Q/K and indexer q,
+                    // Qwen3.5 attention Q/K);
                     // ahead of the RMS_NORM + MUL pair below, which would otherwise claim the first two nodes.
                     if (node->op == GGML_OP_RMS_NORM && ggml_cuda_norm_rope_enabled()) {
                         if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_PERMUTE, GGML_OP_CONT }, {})) {

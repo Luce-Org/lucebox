@@ -670,13 +670,13 @@ static __global__ void __launch_bounds__(256) rope_multi_rows_norm(const float *
         pair, rot, cos_theta, sin_theta, s_sum, row);
 }
 
-// The fused kernels run for the qwen4exp graph on HIP, on every device (the Strix alone, or the R9700 and the Strix
-// in split mode): per-token blocks where the unfused rope takes them (the Strix's prompt chunks), per-row blocks
-// otherwise. Other q/k-norm M-RoPE graphs (Qwen3.5, CUDA builds) keep the separate kernels.
+// The fused kernels run on HIP for every q/k-norm M-RoPE graph (qwen4exp, and the Qwen3.5 family's interleaved
+// M-RoPE), on every device: per-token blocks where the unfused rope takes them (the qwen4exp Strix's prompt chunks),
+// per-row blocks otherwise. Each gives the bits of the separate kernels it replaces. CUDA builds keep those kernels.
 bool ggml_cuda_norm_rope_enabled() {
 #if defined(GGML_USE_HIP)
     static const bool enabled = [] { const char * e = getenv("LUCE_ATTN_FUSE_LEGACY"); return !(e && atoi(e)); }();
-    return enabled && ggml_cuda_qwen4exp_graph();
+    return enabled;
 #else
     return false;
 #endif

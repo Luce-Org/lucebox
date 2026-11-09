@@ -175,6 +175,12 @@ struct MoeHybridGraphInputs {
     // itself -- the cluster hybrid exchange adds them on the secondary owner.
     bool external_join = false;
     ggml_tensor * peer_raw = nullptr;
+    // Input, set by the caller before building (split steps with a device join): weights the main owner reads next,
+    // in the order it reads them. Right after its own experts the main owner reads up to prefetch_bytes of them, in its
+    // wait for the secondary owner's sum, so its last-level cache holds them when they are used
+    // (ggml_moe_fused_prefetch). Nothing the graph reads changes.
+    std::vector<ggml_tensor *> prefetch_next;
+    size_t prefetch_bytes = 0;
     // Backend-affinity hints consumed after the multi-backend scheduler is
     // created. Keeping every intermediate of a routed branch on its weight
     // backend avoids gate/up -> activation -> down ping-pong copies.

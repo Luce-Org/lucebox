@@ -1,13 +1,14 @@
 // Parity + match test for the fused RMS_NORM -> MUL -> ROPE [-> PERMUTE -> CONT] kernels (rope.cu
-// rope_multi_heads_norm for the Strix's prompt chunks of 64+ tokens, rope_multi_rows_norm for every other row; default
-// on HIP for the qwen4exp graph; LUCE_ATTN_FUSE_LEGACY=1 keeps the separate kernels).
+// rope_multi_heads_norm for the qwen4exp Strix's prompt chunks of 64+ tokens, rope_multi_rows_norm for every other
+// row; default on HIP; LUCE_ATTN_FUSE_LEGACY=1 keeps the separate kernels).
 // Rebuilds the qwen4exp attention chains: Q from the strided [q | gate] projection view [256,24,T] -> norm -> gamma
 // -> M-RoPE (n_dims 64) -> permute -> cont (the 5-op chain), K [256,2,T] and the indexer q [128,4,T] without the
-// permute (the 3-op chain), at prompt sizes and step sizes (8, 3, 1 tokens), on every device (in split mode the
-// R9700 runs the attention, the Strix alone otherwise). The fused arm must match on every chain
-// (LUCE_NORM_ROPE_DEBUG=1 "[norm-rope] fused" lines, 3 per compute) and hash-equal the legacy arm (child process).
-// Without the qwen4exp profile (a Qwen3.5-style q/k-norm M-RoPE graph) nothing may fuse: the switch must change
-// neither the output nor the kernels. SKIP (77) without a GPU.
+// permute (the 3-op chain); and the Qwen3.5 / 3.8 dense ones with interleaved M-RoPE: Q [256,24,T] from its
+// [q | gate] view and K [256,4,T], both permuted and made contiguous (for flash attention and the K cache). At
+// prompt sizes and step sizes (8, 3, 1 tokens), on every device (in split mode the R9700 runs the attention, the
+// Strix alone otherwise), with and without the qwen4exp profile (Qwen3.5 graphs run without it). The fused arm must
+// match on every chain (LUCE_NORM_ROPE_DEBUG=1 "[norm-rope] fused" lines, 5 per compute) and hash-equal the legacy
+// arm (child process). SKIP (77) without a GPU.
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
@@ -28,18 +29,19 @@ uint64_t fnv(const void * p, size_t n, uint64_t h = 1469598103934665603ull) {
 }
 
 uint64_t run(ggml_backend_t gpu, int T) {
-    const int D = 256, Hq = 24, Hk = 2, Di = 128, Hi = 4, n_dims = 64;
+    const int D = 256, Hq = 24, Hk = 2, Hk2 = 4, Di = 128, Hi = 4, n_dims = 64;
     int sections[4] = { 11, 11, 10, 0 };
     ggml_init_params ip{ 64 * 1024 * 1024, nullptr, true };
     ggml_context * c = ggml_init(ip);
     ggml_tensor * qfull = ggml_new_tensor_2d(c, GGML_TYPE_F32, 2 * D * Hq, T);
     ggml_tensor * kraw  = ggml_new_tensor_2d(c, GGML_TYPE_F32, D * Hk, T);
     ggml_tensor * iraw  = ggml_new_tensor_2d(c, GGML_TYPE_F32, Di * Hi, T);
+    ggml_tensor * k2raw = ggml_new_tensor_2d(c, GGML_TYPE_F32, D * Hk2, T);
     ggml_tensor * gq    = ggml_new_tensor_1d(c, GGML_TYPE_F32, D);
     ggml_tensor * gk    = ggml_new_tensor_1d(c, GGML_TYPE_F32, D);
     ggml_tensor * gi    = ggml_new_tensor_2d(c, GGML_TYPE_F32, Di, Hi);   // per-head gamma
     ggml_tensor * pos   = ggml_new_tensor_1d(c, GGML_TYPE_I32, 4 * T);
-    for (ggml_tensor * t : { qfull, kraw, iraw, gq, gk, gi, pos }) ggml_set_input(t);
+    for (ggml_tensor * t : { qfull, kraw, iraw, k2raw, gq, gk, gi, pos }) ggml_set_input(t);
     const float eps = 1e-6f;
     const size_t qe = sizeof(float);
     ggml_tensor * Q = ggml_rms_norm(c, ggml_view_3d(c, qfull, D, Hq, T, 2 * D * qe, 2 * D * Hq * qe, 0), eps);
@@ -52,12 +54,21 @@ uint64_t run(ggml_backend_t gpu, int T) {
     ggml_tensor * I = ggml_rms_norm(c, ggml_reshape_3d(c, iraw, Di, Hi, T), eps);
     I = ggml_mul(c, I, gi);
     I = ggml_rope_multi(c, I, pos, nullptr, n_dims, sections, GGML_ROPE_TYPE_MROPE, 0, 1e7f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    // Qwen3.5 / 3.8 dense (qwen35_target_graph.cpp): interleaved M-RoPE, Q and K both permuted for flash attention.
+    ggml_tensor * Q2 = ggml_rms_norm(c, ggml_view_3d(c, qfull, D, Hq, T, 2 * D * qe, 2 * D * Hq * qe, D * qe), eps);
+    Q2 = ggml_mul(c, Q2, gk);
+    Q2 = ggml_rope_multi(c, Q2, pos, nullptr, n_dims, sections, GGML_ROPE_TYPE_IMROPE, 0, 1e7f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    Q2 = ggml_cont(c, ggml_permute(c, Q2, 0, 2, 1, 3));
+    ggml_tensor * K2 = ggml_rms_norm(c, ggml_reshape_3d(c, k2raw, D, Hk2, T), eps);
+    K2 = ggml_mul(c, K2, gq);
+    K2 = ggml_rope_multi(c, K2, pos, nullptr, n_dims, sections, GGML_ROPE_TYPE_IMROPE, 0, 1e7f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    K2 = ggml_cont(c, ggml_permute(c, K2, 0, 2, 1, 3));
     ggml_cgraph * gf = ggml_new_graph(c);
-    for (ggml_tensor * o : { Q, K, I }) { ggml_set_output(o); ggml_build_forward_expand(gf, o); }
+    for (ggml_tensor * o : { Q, K, I, Q2, K2 }) { ggml_set_output(o); ggml_build_forward_expand(gf, o); }
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(c, gpu);
     if (!buf) { ggml_free(c); return 0; }
     uint32_t r = 7u;
-    for (ggml_tensor * t : { qfull, kraw, iraw, gq, gk, gi }) {
+    for (ggml_tensor * t : { qfull, kraw, iraw, k2raw, gq, gk, gi }) {
         std::vector<float> v(ggml_nelements(t));
         for (float & x : v) { r = r * 1664525u + 1013904223u; x = 2.0f * (((r >> 8) & 0xFFFF) / 32768.0f - 1.0f); }
         ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
@@ -67,7 +78,7 @@ uint64_t run(ggml_backend_t gpu, int T) {
     ggml_backend_tensor_set(pos, p.data(), 0, ggml_nbytes(pos));
     uint64_t h = 1469598103934665603ull;
     if (ggml_backend_graph_compute(gpu, gf) != GGML_STATUS_SUCCESS) { ggml_backend_buffer_free(buf); ggml_free(c); return 0; }
-    for (ggml_tensor * t : { Q, K, I }) {
+    for (ggml_tensor * t : { Q, K, I, Q2, K2 }) {
         std::vector<float> v(ggml_nelements(t));
         ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
         h = fnv(v.data(), v.size() * sizeof(float), h);
@@ -110,10 +121,10 @@ bool check_device(const char * self, int dev) {
     const bool gl = child(self, "LUCE_ATTN_FUSE_LEGACY=1", "--hash", dev, hl, nl);
     const bool go = child(self, "LUCE_NORM_ROPE_DEBUG=1 LUCE_ATTN_FUSE_LEGACY=0", "--hash-off", dev, of, nof);
     const bool gol = child(self, "LUCE_NORM_ROPE_DEBUG=1 LUCE_ATTN_FUSE_LEGACY=1", "--hash-off", dev, ol, nol);
-    // qwen4exp: 3 chains x 6 sizes fused, none on the legacy arm. Profile off: none fused, same output either way.
-    const bool ok = gf && gl && hf == hl && nf == 18 && nl == 0 && go && gol && of == ol && nof == 0 && nol == 0;
-    std::printf("[norm-rope-fusion] device %d: fused %llx (fused lines %d, want 18) legacy %llx (fused lines %d); "
-                "profile off %s %llx (fused lines %d, want 0) legacy %llx %s\n",
+    // 5 chains x 6 sizes fused with or without the profile, none on the legacy arms, each fused arm equal to its legacy.
+    const bool ok = gf && gl && hf == hl && nf == 30 && nl == 0 && go && gol && of == ol && nof == 30 && nol == 0;
+    std::printf("[norm-rope-fusion] device %d: fused %llx (fused lines %d, want 30) legacy %llx (fused lines %d); "
+                "profile off %s %llx (fused lines %d, want 30) legacy %llx %s\n",
                 dev, (unsigned long long) hf, nf, (unsigned long long) hl, nl, go ? "ran" : "CRASHED",
                 (unsigned long long) of, nof, (unsigned long long) ol, ok ? "PASS" : "FAIL");
     return ok;

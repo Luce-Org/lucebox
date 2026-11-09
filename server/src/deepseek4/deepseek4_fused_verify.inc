@@ -440,6 +440,34 @@ static ggml_tensor * ds4_fused_weights_for_selected(
     return weights;
 }
 
+// Split verify: in every MoE layer the target waits for the expert device's cold-expert sum once its hot and shared
+// experts are done. In that wait it reads the weights the next layer starts with (Q down, Q up, KV, the compressor and
+// indexer projections, then the output projections; the output head after the last layer), up to
+// kDs4SplitPrefetchBytes, so its last-level cache holds them when that layer starts (the R9700's Infinity Cache is
+// 64 MB). Only the target's own device weights: one elsewhere would be read across the link. Measured on an R9700 +
+// Ryzen AI Max+ PRO 495 (ds41-r9700-gorgon, same text): a decode step 2.1% shorter on a short prompt, 3.1% at 2K and
+// 1.7% at 26K tokens than without the read; 40 MiB gains less and 72 MiB, past the cache, loses.
+static constexpr size_t kDs4SplitPrefetchBytes = (size_t) 56 << 20;
+
+static std::vector<ggml_tensor *> ds4_split_prefetch_weights(const DeepSeek4Weights & w, int il,
+                                                             ggml_backend_t target) {
+    std::vector<ggml_tensor *> next;
+    if (il + 1 < w.n_layer) {
+        const DeepSeek4Layer & N = w.layers[(size_t) il + 1];
+        next = {N.attn_q_a, N.attn_q_b, N.attn_kv, N.attn_compressor_kv, N.attn_compressor_gate,
+                N.indexer_attn_q_b, N.indexer_proj, N.attn_output_a, N.attn_output_b};
+    } else {
+        next = {w.output};
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(target);
+    std::vector<ggml_tensor *> own;
+    for (ggml_tensor * t : next) {
+        if (t && t->buffer && !ggml_backend_buffer_is_host(t->buffer) &&
+            ggml_backend_buffer_get_type(t->buffer) == buft && ggml_is_contiguous(t)) own.push_back(t);
+    }
+    return own;
+}
+
 static bool ds4_build_fused_verify_graph(
         DeepSeek4FusedDecodeCache & mc,          // fn mirrors (shared with AR fused)
         DeepSeek4FusedDecodeGraph & fg,
@@ -1507,6 +1535,12 @@ static bool ds4_build_fused_verify_graph(
                 streamed = &streamed_owner;
             }
             inputs.router_nodes = router_nodes;
+            inputs.prefetch_next.clear();
+            inputs.prefetch_bytes = 0;
+            if (same_gpu_runtime && !cluster_hybrid && !streamed) {
+                inputs.prefetch_next = ds4_split_prefetch_weights(w, il, backend);
+                inputs.prefetch_bytes = kDs4SplitPrefetchBytes;
+            }
             const MoeHybridLayerStorage & hybrid_layer =
                 hybrid->layers[(size_t) il];
             const bool has_hot_routed =
@@ -1558,6 +1592,7 @@ static bool ds4_build_fused_verify_graph(
                 }
                 ffn_out = inputs.output;
 
+                inputs.prefetch_bytes = 0;   // the head's join already read them
                 hybrid_cfg.n_expert_used = 2;
                 if (!build_moe_hybrid_ffn_graph(
                         ctx,
