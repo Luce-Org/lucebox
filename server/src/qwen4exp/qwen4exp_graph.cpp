@@ -368,11 +368,13 @@ static void prefetch_next_weights(ggml_context * c, ggml_cgraph * gf, ggml_tenso
     ggml_tensor * srcs[GGML_MAX_SRC - 1];
     int n = 0;
     size_t bytes = 0;
+    ggml_backend_buffer_type_t target_buft = w.buf ? ggml_backend_buffer_get_type(w.buf) : nullptr;
     for (ggml_tensor * t : next) {
-        // Only the target's own VRAM weights: a tensor on the expert device would be copied across, a host one read
-        // over the link.
-        if (!t || !t->buffer || t->buffer == w.expert_buf || ggml_backend_buffer_is_host(t->buffer) ||
-            !ggml_is_contiguous(t)) continue;
+        // Only the target's own VRAM weights (its buffer type): the experts, and the attention weights of layers
+        // whose KV cache lives on the expert device (move_qwen4exp_attention), are elsewhere, and one src off the
+        // target would move the read off it (the scheduler placed it on the CPU).
+        if (!t || !t->buffer || ggml_backend_buffer_get_type(t->buffer) != target_buft || !ggml_is_contiguous(t))
+            continue;
         if (n == GGML_MAX_SRC - 1 || bytes >= budget) break;
         srcs[n++] = t;
         bytes += ggml_nbytes(t);
