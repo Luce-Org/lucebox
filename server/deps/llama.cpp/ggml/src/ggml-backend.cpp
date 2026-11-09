@@ -2429,7 +2429,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
     size_t batch_staging_cursors[GGML_SCHED_MAX_BACKENDS] = {};
-    const bool staging_arena_reusable = sched->backends_synchronized;
+    const bool staging_arena_reusable = sched->backends_synchronized;   // every backend idle at the start
     bool copy_destinations_ready[GGML_SCHED_MAX_BACKENDS] = {};
     std::fill_n(copy_destinations_ready, sched->n_backends,
                 sched->backends_synchronized);
@@ -2483,14 +2483,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    copy_state.record_pending_split_event(split_backend_id);
-                    ggml_backend_event_synchronize(
-                        sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                // The blocking copy is not ordered with the split backend's stream, so that backend must be done with
+                // every earlier read of the copy. A copy flagged input and output has memory of its own for the whole
+                // graph (allocated first, never freed) and is written here, before its first use. So when every backend
+                // was idle at the start there is nothing to wait for, and the split backend is not drained mid-graph
+                // (as it was for layers placed on another GPU, which read the positions and masks the target owns).
+                const bool own_memory = (input_cpy->flags & GGML_TENSOR_FLAG_INPUT) &&
+                                        (input_cpy->flags & GGML_TENSOR_FLAG_OUTPUT);
+                if (!(staging_arena_reusable && own_memory)) {
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        copy_state.record_pending_split_event(split_backend_id);
+                        ggml_backend_event_synchronize(
+                            sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    copy_state.mark_destination_ready();
                 }
-                copy_state.mark_destination_ready();
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 const int source_backend_id = ggml_backend_sched_backend_id(sched, input_backend);
