@@ -610,10 +610,13 @@ static bool ds4_build_fused_verify_graph(
     const int n_lanes = paged_mode ? 1 : ds4_fused_attention_lanes(w, q);
     const int attn_lane_q = q / n_lanes;
     // Tokenwise lanes keep the six routed experts in one owner graph (see the
-    // routed FFN below); LUCE_DS4_TP_HEAD4_TAIL2=1 restores the 4 + 2
+    // routed FFN below), and so does a paged step at every width: its q=1
+    // step sums the six routes in one combine, so splitting them 4 + 2 once
+    // a second sequence joins would make a sequence's row depend on how many
+    // others share its step. LUCE_DS4_TP_HEAD4_TAIL2=1 restores the 4 + 2
     // decomposition for bisection.
     static const bool legacy_head4_tail2 = ds4_env_flag("LUCE_DS4_TP_HEAD4_TAIL2");
-    const bool whole_routes_for_lanes = n_lanes > 1 && !legacy_head4_tail2;
+    const bool whole_routes_for_lanes = (n_lanes > 1 || paged_mode) && !legacy_head4_tail2;
     const int64_t comp_slots = 2 * (int64_t) w.n_layer * n_lanes;
     fg.i32_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, comp_slots);
     ggml_set_input(fg.i32_bundle);

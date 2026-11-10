@@ -3018,8 +3018,12 @@ static ggml_tensor * build_mla_attention_lane_core(
         kv_attn = raw_kv_view(0, n_raw);
     }
     // LUCE_DS4_F16_KV_LANES=1: single-token lanes keep F16 K/V too.
+    // Not for a gathered (paged) lane: its rows are already staged in
+    // chronological order with the current row (kv_attn above), and its
+    // raw_kv_source is the flat pool of every slot's ring, so reading that
+    // pool from row 0 would attend slot 0's ring instead of this lane's.
     static const bool f16_kv_lanes = ds4_env_flag("LUCE_DS4_F16_KV_LANES");
-    const bool fused_verify_f16_kv = w.fused_verify_f16_kv &&
+    const bool fused_verify_f16_kv = w.fused_verify_f16_kv && !gathered_history &&
         masked_kv && (n_tokens > 1 || f16_kv_lanes) &&
         kv_attn->type == GGML_TYPE_F32 &&
         raw_kv_source->type == GGML_TYPE_F16 &&
