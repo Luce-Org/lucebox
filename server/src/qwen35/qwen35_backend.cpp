@@ -465,8 +465,6 @@ bool Qwen35Backend::init() {
     if (kvflash_tokens_ > 0) {
         kvflash_tau_ = std::max(1, env_int_or_default("LUCE_KVFLASH_TAU", 64));
     }
-    cfg_.fast_rollback = luce::common::spec_fast_rollback_enabled(
-        kvflash_tokens_ > 0, cfg_.fast_rollback, cfg_.fast_rollback_explicit);
     // LUCE_KVFLASH_PREAMBLE_ROWS=R: R rounded up to a chunk is reserved inside the pool for the pinned preamble,
     // so the history budget is the pool minus the reserve and the pool (the decode cost) stays what --kvflash asked.
     kvflash_preamble_reserve_ = kvflash_preamble_rows_ = 0;
@@ -517,6 +515,10 @@ bool Qwen35Backend::init() {
     if (!post_kvflash_init_gate()) return false;
     // KVFlash is resolved from env at init; this is the authoritative
     // paged×KVFlash compatibility check.
+    // After the gate: a subclass that zeroed the pool leaves no pager, and fast
+    // rollback stays on.
+    cfg_.fast_rollback = luce::common::spec_fast_rollback_enabled(
+        kvflash_tokens_ > 0, cfg_.fast_rollback, cfg_.fast_rollback_explicit);
     if (cfg_.paged_attention && kvflash_active()) {
         std::fprintf(stderr,
             "[paged-attention] cannot be combined with KVFlash "
