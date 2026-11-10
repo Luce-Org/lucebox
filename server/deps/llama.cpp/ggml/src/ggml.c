@@ -9520,7 +9520,7 @@ struct ggml_tensor * ggml_moe_fused_wake_hold(
         struct ggml_tensor  * after,
         int                   slot,
         int                   max_us) {
-    GGML_ASSERT(after != NULL && slot >= 1 && slot <= 64 && max_us > 0);
+    GGML_ASSERT(after != NULL && slot >= 1 && slot <= GGML_MOE_FUSED_WAKE_SLOTS && max_us > 0);
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
     result->op = GGML_OP_MOE_FUSED;

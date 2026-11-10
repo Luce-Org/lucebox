@@ -7,7 +7,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -334,102 +336,224 @@ TEST_CASE(CudaCopyBatchFixture, concat_copies) {
     REQUIRE(bad == 0);
 }
 
+namespace {
+// GGML_CUDA_PEER_COPY_KERNEL=0 or GGML_(CUDA_)BATCH_PEER_COPIES=0: hop copies take no peer copy kernel, whatever the
+// graph, so none is collected for a later flush and no graph carries a tail.
+bool hop_copy_kernel_off_by_env() {
+    const auto zero = [](const char * v) { return v != nullptr && std::strcmp(v, "0") == 0; };
+    const char * batch = std::getenv("GGML_BATCH_PEER_COPIES");
+    if (batch == nullptr || *batch == '\0') {
+        batch = std::getenv("GGML_CUDA_BATCH_PEER_COPIES");
+    }
+    return zero(std::getenv("GGML_CUDA_PEER_COPY_KERNEL")) || zero(batch);
+}
+
+bool is_rocm(ggml_backend_t backend) {
+    return std::string(ggml_backend_name(backend)).rfind("ROCm", 0) == 0;
+}
+
+struct SplitRun {
+    int64_t bad      = 0;
+    int     bad_step = -1;
+    bool    computed = true;
+    size_t  tails    = 0;
+    bool    rocm     = false;
+};
+}  // namespace
+
 // A graph split over two devices by the scheduler and computed again with new inputs each step, as split decode runs
-// (parallel copies, captured graphs replayed): once a producer's graph has been seen right before a flush of its hop
-// copies, the copies and the hop's event record ride at the end of that graph (ggml_cuda_tail_realize). Every step
-// must read that step's values on both devices, and on ROCm the tail must have carried copies. Hop copies take the
-// peer copy kernel (the only path a tail can carry) under the Qwen3.8 split profile, so the test runs in it.
+// (parallel copies, captured graphs replayed). With the copy tail on for both backends
+// (ggml_backend_cuda_set_copy_tail), once a producer's graph has been seen right before a flush of its hop copies, the
+// copies and the hop's event record ride at the end of that graph (ggml_cuda_tail_realize); with it off, as for every
+// backend that does not set it, no graph carries them. Every step must read that step's values on both devices either
+// way. Hop copies take the peer copy kernel (the only path a tail can carry) under the Qwen3.8 split profile, so the
+// test runs in it: on ROCm the tail must have carried copies when on, unless the environment turned the kernel or the
+// batching off (=0), which must hold under that profile too.
 TEST_CASE(CudaCopyBatchFixture, split_graph_tail_copies) {
     if (ggml_backend_cuda_get_device_count() < 2) {
         SKIP("needs two CUDA/HIP devices");
     }
+    // Two chains cross between devices 0 and 1 at every hop (two copies per hop), with exact float arithmetic:
+    // a' = 2a + b, b' = b + 1 on device hop % 2. The scheduler computes the same graph with new inputs each step.
+    auto run_split_graph = [&](bool copy_tail) {
+        ggml_backend_t gpus[2] = { ggml_backend_cuda_init(0), ggml_backend_cuda_init(1) };
+        REQUIRE(gpus[0] != nullptr);
+        REQUIRE(gpus[1] != nullptr);
+        ggml_backend_cuda_set_copy_tail(gpus[0], copy_tail);
+        ggml_backend_cuda_set_copy_tail(gpus[1], copy_tail);
+        ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);   // the scheduler's last
+        REQUIRE(cpu != nullptr);
+
+        constexpr int64_t n     = 1536;
+        constexpr int     kHops = 6;
+        constexpr int     kSteps = 24;
+        ggml_init_params ip{};
+        ip.mem_size = 128 * ggml_tensor_overhead() + ggml_graph_overhead();
+        ip.no_alloc = true;
+        ggml_context * ctx = ggml_init(ip);
+        REQUIRE(ctx != nullptr);
+        ggml_tensor * a0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_tensor * b0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_input(a0);
+        ggml_set_input(b0);
+        ggml_tensor * a = a0;
+        ggml_tensor * b = b0;
+        std::vector<std::pair<ggml_tensor *, int>> placed;
+        for (int h = 0; h < kHops; ++h) {
+            ggml_tensor * a2 = ggml_scale(ctx, a, 2.0f);
+            ggml_tensor * an = ggml_add(ctx, a2, b);
+            ggml_tensor * bn = ggml_scale_bias(ctx, b, 1.0f, 1.0f);
+            for (ggml_tensor * t : { a2, an, bn }) placed.push_back({ t, h % 2 });
+            a = an;
+            b = bn;
+        }
+        ggml_tensor * out = ggml_add(ctx, a, b);
+        placed.push_back({ out, 0 });
+        ggml_set_output(out);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, out);
+
+        ggml_backend_t backends[3] = { gpus[0], gpus[1], cpu };
+        ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 3, 256, true, false);
+        REQUIRE(sched != nullptr);
+        ggml_backend_sched_set_tensor_backend(sched, a0, gpus[0]);
+        ggml_backend_sched_set_tensor_backend(sched, b0, gpus[0]);
+        for (const auto & [t, dev] : placed) ggml_backend_sched_set_tensor_backend(sched, t, gpus[dev]);
+        REQUIRE(ggml_backend_sched_alloc_graph(sched, gf));
+
+        SplitRun r;
+        const size_t tails_before = ggml_backend_cuda_get_copy_tail_count();
+        std::vector<float> va(n), vb(n), got(n);
+        for (int step = 0; step < kSteps && r.computed; ++step) {
+            for (int64_t i = 0; i < n; ++i) {
+                va[i] = (float) ((i * 7 + step * 13) % 1000);
+                vb[i] = (float) ((i * 3 + step * 5) % 500);
+            }
+            ggml_backend_tensor_set(a0, va.data(), 0, sizeof(float) * n);
+            ggml_backend_tensor_set(b0, vb.data(), 0, sizeof(float) * n);
+            r.computed = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+            ggml_backend_tensor_get(out, got.data(), 0, sizeof(float) * n);
+            for (int64_t i = 0; i < n; ++i) {
+                float x = va[i], y = vb[i];
+                for (int h = 0; h < kHops; ++h) {
+                    x = 2.0f * x + y;
+                    y = y + 1.0f;
+                }
+                if (got[i] != x + y) {
+                    ++r.bad;
+                    if (r.bad_step < 0) r.bad_step = step;
+                }
+            }
+        }
+        r.tails = ggml_backend_cuda_get_copy_tail_count() - tails_before;
+        r.rocm = is_rocm(gpus[0]);
+
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        ggml_backend_free(cpu);
+        ggml_backend_free(gpus[0]);
+        ggml_backend_free(gpus[1]);
+        return r;
+    };
+
     const ggml_cuda_qwen4exp_profile profile_before =
         ggml_backend_cuda_set_qwen4exp_profile(GGML_CUDA_QWEN4EXP_DEFAULT);
+    const SplitRun off = run_split_graph(false);
+    const SplitRun on  = run_split_graph(true);
+    ggml_backend_cuda_set_qwen4exp_profile(profile_before);
+    const bool kernel_off = hop_copy_kernel_off_by_env();
+    for (const SplitRun * r : { &off, &on }) {
+        std::printf("[cuda-copy-batch] split graph, copy tail %s: %lld mismatched values (first at step %d), "
+                    "%zu tail launches%s%s\n", r == &on ? "on" : "off", (long long) r->bad, r->bad_step, r->tails,
+                    r->rocm ? " (ROCm)" : "", kernel_off ? " (hop copy kernel off by env)" : "");
+    }
+    REQUIRE(off.computed);
+    REQUIRE(on.computed);
+    REQUIRE(off.bad == 0);
+    REQUIRE(on.bad == 0);
+    REQUIRE(off.tails == 0);
+    if (on.rocm && !kernel_off) {
+        REQUIRE(on.tails > 0);
+    } else {
+        REQUIRE(on.tails == 0);
+    }
+}
+
+// A hop copy collected for a later flush (batched kernel copies, as under the Qwen3.8 split profile) is published by
+// ggml_backend_cuda_enter_stream, which settles the stream for work queued on it directly, and not by
+// ggml_backend_cuda_get_stream, which only looks the stream up. The collected copies belong to the calling thread, so
+// another thread waits for both devices without publishing them: the destination then holds the source only if the
+// copy was published.
+TEST_CASE(CudaCopyBatchFixture, enter_stream_publishes_peer_copies) {
+    if (ggml_backend_cuda_get_device_count() < 2) {
+        SKIP("needs two CUDA/HIP devices");
+    }
+    if (hop_copy_kernel_off_by_env()) {
+        SKIP("hop copies are not collected with the peer copy kernel or the batching off");
+    }
     ggml_backend_t gpus[2] = { ggml_backend_cuda_init(0), ggml_backend_cuda_init(1) };
     REQUIRE(gpus[0] != nullptr);
     REQUIRE(gpus[1] != nullptr);
-    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);   // the scheduler's last
-    REQUIRE(cpu != nullptr);
-
-    // Two chains cross between the devices at every hop (two copies per hop), with exact float arithmetic:
-    // a' = 2a + b, b' = b + 1 on device hop % 2.
-    constexpr int64_t n     = 1536;
-    constexpr int     kHops = 6;
-    constexpr int     kSteps = 24;
+    if (!is_rocm(gpus[0])) {
+        ggml_backend_free(gpus[0]);
+        ggml_backend_free(gpus[1]);
+        SKIP("hop copies are collected on ROCm only");
+    }
+    const ggml_cuda_qwen4exp_profile profile_before =
+        ggml_backend_cuda_set_qwen4exp_profile(GGML_CUDA_QWEN4EXP_DEFAULT);
+    constexpr int64_t n = 4099;
     ggml_init_params ip{};
-    ip.mem_size = 128 * ggml_tensor_overhead() + ggml_graph_overhead();
+    ip.mem_size = ggml_tensor_overhead();
     ip.no_alloc = true;
-    ggml_context * ctx = ggml_init(ip);
-    REQUIRE(ctx != nullptr);
-    ggml_tensor * a0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
-    ggml_tensor * b0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
-    ggml_set_input(a0);
-    ggml_set_input(b0);
-    ggml_tensor * a = a0;
-    ggml_tensor * b = b0;
-    std::vector<std::pair<ggml_tensor *, int>> placed;
-    for (int h = 0; h < kHops; ++h) {
-        ggml_tensor * a2 = ggml_scale(ctx, a, 2.0f);
-        ggml_tensor * an = ggml_add(ctx, a2, b);
-        ggml_tensor * bn = ggml_scale_bias(ctx, b, 1.0f, 1.0f);
-        for (ggml_tensor * t : { a2, an, bn }) placed.push_back({ t, h % 2 });
-        a = an;
-        b = bn;
+    ggml_context * ctx[2] = { ggml_init(ip), ggml_init(ip) };
+    ggml_tensor * src = ggml_new_tensor_1d(ctx[0], GGML_TYPE_I32, n);
+    ggml_tensor * dst = ggml_new_tensor_1d(ctx[1], GGML_TYPE_I32, n);
+    ggml_backend_buffer_t buf[2] = { ggml_backend_alloc_ctx_tensors(ctx[0], gpus[0]),
+                                     ggml_backend_alloc_ctx_tensors(ctx[1], gpus[1]) };
+    REQUIRE(buf[0] != nullptr);
+    REQUIRE(buf[1] != nullptr);
+
+    std::vector<int32_t> rows(n), zero(n, 0), got(n);
+    // Fresh source rows and a zeroed destination (blocking writes), then the hop copy, collected and not launched.
+    auto collect = [&](int32_t base) {
+        for (int64_t i = 0; i < n; ++i) rows[i] = base + (int32_t) i;
+        ggml_backend_tensor_set(src, rows.data(), 0, ggml_nbytes(src));
+        ggml_backend_tensor_set(dst, zero.data(), 0, ggml_nbytes(dst));
+        ggml_backend_tensor_copy_async(gpus[0], gpus[1], src, dst);
+    };
+    auto copied_after_other_thread_waits = [&] {
+        std::thread([&] {
+            ggml_backend_synchronize(gpus[0]);
+            ggml_backend_synchronize(gpus[1]);
+        }).join();
+        ggml_backend_tensor_get(dst, got.data(), 0, ggml_nbytes(dst));
+        return got == rows;
+    };
+
+    collect(100);
+    const bool got_stream = ggml_backend_cuda_get_stream(gpus[1]) != nullptr;
+    const bool after_get = copied_after_other_thread_waits();
+    ggml_backend_synchronize(gpus[1]);   // publishes the copy and waits for it
+    ggml_backend_tensor_get(dst, got.data(), 0, ggml_nbytes(dst));
+    const bool after_sync = got == rows;
+
+    collect(7000);
+    const bool entered_stream = ggml_backend_cuda_enter_stream(gpus[1]) != nullptr;
+    const bool after_enter = copied_after_other_thread_waits();
+
+    ggml_backend_synchronize(gpus[0]);
+    ggml_backend_synchronize(gpus[1]);
+    for (int i = 0; i < 2; ++i) {
+        ggml_backend_buffer_free(buf[i]);
+        ggml_free(ctx[i]);
+        ggml_backend_free(gpus[i]);
     }
-    ggml_tensor * out = ggml_add(ctx, a, b);
-    placed.push_back({ out, 0 });
-    ggml_set_output(out);
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, out);
-
-    ggml_backend_t backends[3] = { gpus[0], gpus[1], cpu };
-    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 3, 256, true, false);
-    REQUIRE(sched != nullptr);
-    ggml_backend_sched_set_tensor_backend(sched, a0, gpus[0]);
-    ggml_backend_sched_set_tensor_backend(sched, b0, gpus[0]);
-    for (const auto & [t, dev] : placed) ggml_backend_sched_set_tensor_backend(sched, t, gpus[dev]);
-    REQUIRE(ggml_backend_sched_alloc_graph(sched, gf));
-
-    const size_t tails_before = ggml_backend_cuda_get_copy_tail_count();
-    std::vector<float> va(n), vb(n), got(n);
-    int64_t bad = 0;
-    int     bad_step = -1;
-    bool    computed = true;
-    for (int step = 0; step < kSteps && computed; ++step) {
-        for (int64_t i = 0; i < n; ++i) {
-            va[i] = (float) ((i * 7 + step * 13) % 1000);
-            vb[i] = (float) ((i * 3 + step * 5) % 500);
-        }
-        ggml_backend_tensor_set(a0, va.data(), 0, sizeof(float) * n);
-        ggml_backend_tensor_set(b0, vb.data(), 0, sizeof(float) * n);
-        computed = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
-        ggml_backend_tensor_get(out, got.data(), 0, sizeof(float) * n);
-        for (int64_t i = 0; i < n; ++i) {
-            float x = va[i], y = vb[i];
-            for (int h = 0; h < kHops; ++h) {
-                x = 2.0f * x + y;
-                y = y + 1.0f;
-            }
-            if (got[i] != x + y) {
-                ++bad;
-                if (bad_step < 0) bad_step = step;
-            }
-        }
-    }
-    const size_t tails = ggml_backend_cuda_get_copy_tail_count() - tails_before;
-    const bool rocm = std::string(ggml_backend_name(gpus[0])).rfind("ROCm", 0) == 0;
-    std::printf("[cuda-copy-batch] split graph: %lld mismatched values (first at step %d), %zu tail launches%s\n",
-                (long long) bad, bad_step, tails, rocm ? " (ROCm)" : "");
-
-    ggml_backend_sched_free(sched);
-    ggml_free(ctx);
-    ggml_backend_free(cpu);
-    ggml_backend_free(gpus[0]);
-    ggml_backend_free(gpus[1]);
     ggml_backend_cuda_set_qwen4exp_profile(profile_before);
-    REQUIRE(computed);
-    REQUIRE(bad == 0);
-    if (rocm) {
-        REQUIRE(tails > 0);
-    }
+    std::printf("[cuda-copy-batch] collected hop copy: published by get_stream %d, by synchronize %d, "
+                "by enter_stream %d\n", after_get, after_sync, after_enter);
+    REQUIRE(got_stream);
+    REQUIRE(entered_stream);
+    REQUIRE(!after_get);
+    REQUIRE(after_sync);
+    REQUIRE(after_enter);
 }

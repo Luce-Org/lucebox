@@ -431,8 +431,9 @@ ggml_tensor * build_moe(ggml_context * c, ggml_tensor * cur,
             // (ggml_moe_fused_wake_hold), so the device is awake when the layer's inputs land: an idle Strix wakes
             // slowly (+0.64% split decode). Bounded by kWakeHoldUs in case the post never comes.
             if (r.wsel && r.wsel->op == GGML_OP_DIV && cur->ne[1] <= QWEN4EXP_MTP_MAX_VERIFY) {
-                const int slot = il % 64 + 1;   // one post word per layer; layers 64 apart never overlap in time
-                ((int32_t *) r.wsel->op_params)[0] = slot;
+                // One post word per layer; layers GGML_MOE_FUSED_WAKE_SLOTS apart never overlap in time.
+                const int slot = il % GGML_MOE_FUSED_WAKE_SLOTS + 1;
+                ggml_backend_cuda_div_wake_post(r.wsel, slot);
                 ggml_tensor * hold = ggml_moe_fused_wake_hold(c, pf, slot, kWakeHoldUs);
                 expert_nodes->push_back(hold);
                 ggml_build_forward_expand(gf, hold);
@@ -1522,7 +1523,7 @@ static void qwen4exp_pin_split(ggml_backend_sched_t sched, ggml_cgraph * gf, ggm
 // or batch-invariant ones, as every verify and batched decode runs. Wider products take other kernels per device.
 static ggml_tensor * build_lm_head(ggml_context * ctx, ggml_cgraph * gf, const Qwen4ExpWeights & w, ggml_tensor * x,
                                    std::vector<ggml_tensor *> * expert_nodes) {
-    constexpr int64_t kMatvecCols = 8;   // MMVQ_MAX_BATCH_SIZE
+    constexpr int64_t kMatvecCols = 8;   // MMVQ_Q8_RDNA4_MAX_COLS (mmvq.cu): the RDNA4 Q8_0 matvec's widest product
     if (!expert_nodes || !w.output_tail || x->ne[1] > kMatvecCols || ggml_nrows(x) != x->ne[1]) {
         return ggml_mul_mat(ctx, w.output, x);
     }
@@ -2104,6 +2105,10 @@ struct Qwen4ExpPinnedReads {
     }
 };
 
+// The longest an expert device's idle hold after a split forward lasts (ggml_backend_cuda_hold). The next forward's
+// first use of the device ends it, about 5 ms later (below); the bound only ends a hold that no forward soon follows.
+constexpr int kIdleHoldUs = 8000;
+
 // Replay a retained graph with this forward's inputs and read its logits (and hidden rows). A failed compute drops
 // the graph.
 static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace & ws, ggml_backend_sched_t short_sched,
@@ -2137,7 +2142,7 @@ static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace 
             if (status == GGML_STATUS_SUCCESS) {
                 for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
                     ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
-                    if (b != in.backend && ggml_backend_is_cuda(b)) ggml_backend_cuda_hold(b, 8000);
+                    if (b != in.backend && ggml_backend_is_cuda(b)) ggml_backend_cuda_hold(b, kIdleHoldUs);
                 }
             }
             ggml_backend_sched_synchronize(sched);
@@ -2236,6 +2241,10 @@ static ggml_backend_sched_t split_scheduler(ggml_backend_t backend, const Qwen4E
         // beside the expert device: the other stream's attention in a prompt
         // chunk; the shared and hot experts in a decode or verify step.
         ggml_backend_sched_set_late_cross_input_split(sched, true);
+        // A hop's batched peer copies run as the tail of its producer's captured graph, so the consumer starts on
+        // them sooner (ggml_backend_cuda_set_copy_tail).
+        ggml_backend_cuda_set_copy_tail(backend, true);
+        ggml_backend_cuda_set_copy_tail(w.expert_backend, true);
         if (!short_batch) {
             // The prompt scheduler keeps one copy set, and each layer's routed sum and router inputs live from the
             // split that sent them across until their last reader, not for the whole chunk: about half of a
@@ -2939,10 +2948,11 @@ bool mtp_forward_batch(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
         ggml_backend_buffer_type_t device_buft = ggml_backend_get_default_buffer_type(backend);
         size_t off = 0;
         auto put = [&](ggml_tensor * t, const void * data) {
-            const size_t bytes = ggml_nbytes(t);
-            if (staging && t->buffer && ggml_backend_buffer_get_type(t->buffer) == device_buft) {
+            const size_t bytes = ggml_nbytes(t), room = qwen4exp_stage_bytes(bytes);
+            if (staging && off + room <= in_bytes && t->buffer &&
+                ggml_backend_buffer_get_type(t->buffer) == device_buft) {
                 char * p = staging + off;
-                off += qwen4exp_stage_bytes(bytes);
+                off += room;
                 std::memcpy(p, data, bytes);
                 ggml_backend_tensor_set_async(backend, t, p, 0, bytes);
             } else {

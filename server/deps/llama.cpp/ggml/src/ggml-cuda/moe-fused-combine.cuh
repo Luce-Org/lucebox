@@ -39,10 +39,11 @@ struct ggml_cuda_moe_router_topk_args {
     float * weights = nullptr;
     uint32_t * post = nullptr;   // a wake-hold word: block 0 adds 1 at its end (ggml_moe_fused_wake_hold)
 };
-// The wake-hold words in pinned host memory, visible to every device: [0, 64) the routers' posts per layer slot,
-// [64, 128) the counts the holds have seen (ggml_moe_fused_wake_hold).
+// The wake-hold words in pinned host memory, visible to every device: GGML_MOE_FUSED_WAKE_SLOTS posts of the routers,
+// one per slot, then as many counts the holds have seen (ggml_moe_fused_wake_hold).
 uint32_t * ggml_cuda_wake_flags();
-// The post word of a router weights node that carries a wake-hold slot in op_params[0], else nullptr.
+// The post word of a router weights node marked with a wake-hold slot (ggml_backend_cuda_div_wake_post: op_params[0]),
+// else nullptr.
 uint32_t * ggml_cuda_wake_post_word(const ggml_tensor * weights);
 // For the router's unfused and partly fused paths: a one-lane launch that posts after the weights node.
 void ggml_cuda_wake_post(ggml_backend_cuda_context & ctx, const ggml_tensor * weights);

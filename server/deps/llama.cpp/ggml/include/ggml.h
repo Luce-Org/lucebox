@@ -2923,11 +2923,14 @@ extern "C" {
             int                   n_stacks,
             int                   max_experts);
 
+    // The wake-hold slots: a hold and the router post that ends it name one in 1..GGML_MOE_FUSED_WAKE_SLOTS.
+    #define GGML_MOE_FUSED_WAKE_SLOTS 64
+
     // After `after`, one wave of the device sleeps between polls of a word in pinned host memory until another
-    // device's router posts layer `slot` (1..64), or max_us pass, so the device is awake when that layer's inputs
-    // arrive (an idle integrated GPU wakes slowly). The router posts when its weights node (a DIV, the fused router's
-    // last output) carries the slot in op_params[0]. Nothing the graph reads changes: the result is one F32 element
-    // that no node needs to read.
+    // device's router posts layer `slot`, or max_us pass, so the device is awake when that layer's inputs arrive (an
+    // idle integrated GPU wakes slowly). The router posts when its weights node (a DIV, the fused router's last
+    // output) is marked with the slot (ggml_backend_cuda_div_wake_post). Nothing the graph reads changes: the result
+    // is one F32 element that no node needs to read.
     GGML_API struct ggml_tensor * ggml_moe_fused_wake_hold(
             struct ggml_context * ctx,
             struct ggml_tensor  * after,

@@ -1501,6 +1501,7 @@ struct ggml_backend_cuda_context {
     bool hold_active = false;
     long long hold_ticks_per_us = 0;
     cudaEvent_t hold_event = nullptr;   // recorded before the latest hold
+    bool copy_tail = false;   // hops from this context may join its captured graphs (ggml_backend_cuda_set_copy_tail)
     // A captured graph whose launch (and, while capturing, whose end of capture)
     // waits for the next flush of copies from this context, so the copies and the event record join the graph.
     bool tail_deferred = false;
@@ -1735,6 +1736,10 @@ struct ggml_backend_cuda_context {
 // Called at every use of the backend's compute stream: releases an idle hold, and orders the stream after its
 // pending side copy batches unless side overlap is on (ggml-cuda.cu).
 void ggml_cuda_backend_entry(ggml_backend_cuda_context * ctx);
+// The compute stream for work queued on it outside a graph evaluation (a launch, a copy, an event record): it first
+// publishes the peer copies collected so far (HIP), makes the backend's device current and runs
+// ggml_cuda_backend_entry, so the work neither waits behind an idle hold nor joins an open graph capture.
+cudaStream_t ggml_cuda_enter_stream(ggml_backend_cuda_context * ctx);
 // Creates the side copy stream and its two events on first use.
 void ggml_cuda_side_stream_init(ggml_backend_cuda_context * ctx);
 

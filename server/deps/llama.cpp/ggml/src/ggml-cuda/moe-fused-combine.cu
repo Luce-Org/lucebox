@@ -370,12 +370,13 @@ uint32_t * ggml_cuda_wake_flags() {
     static uint32_t * flags = [] {
         uint32_t * p = nullptr;
 #if defined(GGML_USE_HIP)
-        CUDA_CHECK(hipHostMalloc((void **) &p, 128 * sizeof(uint32_t),
+        CUDA_CHECK(hipHostMalloc((void **) &p, 2 * GGML_MOE_FUSED_WAKE_SLOTS * sizeof(uint32_t),
                                  hipHostMallocCoherent | hipHostMallocMapped | hipHostMallocPortable));
 #else
-        CUDA_CHECK(cudaHostAlloc((void **) &p, 128 * sizeof(uint32_t), cudaHostAllocPortable | cudaHostAllocMapped));
+        CUDA_CHECK(cudaHostAlloc((void **) &p, 2 * GGML_MOE_FUSED_WAKE_SLOTS * sizeof(uint32_t),
+                                 cudaHostAllocPortable | cudaHostAllocMapped));
 #endif
-        memset(p, 0, 128 * sizeof(uint32_t));
+        memset(p, 0, 2 * GGML_MOE_FUSED_WAKE_SLOTS * sizeof(uint32_t));
         return p;
     }();
     return flags;
@@ -383,7 +384,12 @@ uint32_t * ggml_cuda_wake_flags() {
 
 uint32_t * ggml_cuda_wake_post_word(const ggml_tensor * weights) {
     const int slot = weights ? ggml_get_op_params_i32(weights, 0) : 0;
-    return slot >= 1 && slot <= 64 ? ggml_cuda_wake_flags() + (slot - 1) : nullptr;
+    return slot >= 1 && slot <= GGML_MOE_FUSED_WAKE_SLOTS ? ggml_cuda_wake_flags() + (slot - 1) : nullptr;
+}
+
+extern "C" void ggml_backend_cuda_div_wake_post(ggml_tensor * div, int slot) {
+    GGML_ASSERT(div != nullptr && div->op == GGML_OP_DIV && slot >= 1 && slot <= GGML_MOE_FUSED_WAKE_SLOTS);
+    ggml_set_op_params_i32(div, 0, slot);
 }
 
 static __global__ void k_wake_post(uint32_t * post) {

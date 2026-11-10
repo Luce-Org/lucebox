@@ -1273,9 +1273,7 @@ extern "C" bool ggml_backend_cuda_tree_commit_transaction_async(
 
     // No recoverable error may escape after the first launch: the caller
     // could not run its fallback from a half-committed state.
-    ggml_cuda_set_device(ctx->device);
-    ggml_cuda_backend_entry(ctx);
-    cudaStream_t stream = ctx->stream();
+    cudaStream_t stream = ggml_cuda_enter_stream(ctx);
     (void) cudaGetLastError();
     launch_tree_cache_commit(
         caches, n_caches, commit_rows, active_slot_ids, cache_rows,

@@ -4640,13 +4640,11 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 
 #if defined(GGML_USE_HIP)
 // Publishes peer copies collected for a later consumer (below). Everything else that puts work on a stream or records
-// an event publishes them first, so nothing on the producer or the consumer can run ahead of a collected copy. A stream
-// wait does not: it only delays that stream. The scheduler waits on the consumer's own event before each of a split's
-// inputs, and publishing there would leave one copy launch per input instead of one per hop (-0.4% split decode).
+// an event publishes them first (ggml_cuda_enter_stream), so nothing on the producer or the consumer can run ahead of a
+// collected copy. A stream wait does not: it only delays that stream. The scheduler waits on the consumer's own event
+// before each of a split's inputs, and publishing there would leave one copy launch per input instead of one per hop
+// (-0.4% split decode).
 static void ggml_cuda_flush_peer_copy_batch(const char * reason);
-#define GGML_CUDA_FLUSH_PEER_COPIES(reason, dev) do { ggml_cuda_flush_peer_copy_batch(reason); ggml_cuda_set_device(dev); } while (0)
-#else
-#define GGML_CUDA_FLUSH_PEER_COPIES(reason, dev) do { } while (0)
 #endif
 
 void ggml_cuda_side_stream_init(ggml_backend_cuda_context * ctx) {
@@ -4671,7 +4669,8 @@ static void ggml_cuda_release_hold(ggml_backend_cuda_context * ctx) {
 // R9700 + Strix split). A graph whose evaluation was followed directly by a flush of copies one tail launch can carry
 // (tail_seen) keeps its capture, or its replay, open after the evaluation; the flush closes it with those copies, or
 // anything else that uses the context first closes it with none (ggml_cuda_backend_entry). The copies are the same
-// bytes in the same stream order as the batch launch they replace.
+// bytes in the same stream order as the batch launch they replace. Only a context with the tail on
+// (ggml_backend_cuda_set_copy_tail) marks its graphs so (tail_clean_key).
 static std::atomic<size_t> g_copy_tail_count{0};
 static_assert(sizeof(ggml_cuda_graph::tail_descs) / sizeof(ggml_cuda_copy_desc) == ggml_cuda_copy_batch_max,
               "a graph's tail holds one copy batch launch");
@@ -4783,6 +4782,15 @@ void ggml_cuda_backend_entry(ggml_backend_cuda_context * ctx) {
     }
 }
 
+cudaStream_t ggml_cuda_enter_stream(ggml_backend_cuda_context * ctx) {
+#if defined(GGML_USE_HIP)
+    ggml_cuda_flush_peer_copy_batch("enter-stream");
+#endif
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_backend_entry(ctx);
+    return ctx->stream();
+}
+
 // The entry for the source of a batched peer copy, which queues nothing on the source's stream: an open tail and
 // the evaluation it follows stay open for the flush (ggml_cuda_tail_realize). Otherwise the usual entry.
 static void ggml_cuda_backend_entry_keep_tail(ggml_backend_cuda_context * ctx) {
@@ -4793,6 +4801,13 @@ static void ggml_cuda_backend_entry_keep_tail(ggml_backend_cuda_context * ctx) {
     }
 #endif
     ggml_cuda_backend_entry(ctx);
+}
+
+void ggml_backend_cuda_set_copy_tail(ggml_backend_t backend, bool on) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ((ggml_backend_cuda_context *) backend->context)->copy_tail = on;
 }
 
 #if defined(GGML_USE_HIP)
@@ -4815,8 +4830,7 @@ void ggml_backend_cuda_hold(ggml_backend_t backend, int max_us) {
         return;
     }
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_cuda_set_device(ctx->device);
-    ggml_cuda_backend_entry(ctx);
+    const cudaStream_t stream = ggml_cuda_enter_stream(ctx);
     if (!ctx->hold_flag) {
         CUDA_CHECK(hipHostMalloc((void **) &ctx->hold_flag, sizeof(int), hipHostMallocCoherent));
         *ctx->hold_flag = 0;
@@ -4825,9 +4839,9 @@ void ggml_backend_cuda_hold(ggml_backend_t backend, int max_us) {
         ctx->hold_ticks_per_us = khz >= 1000 ? khz / 1000 : 100;
         CUDA_CHECK(cudaEventCreateWithFlags(&ctx->hold_event, cudaEventDisableTiming));
     }
-    CUDA_CHECK(cudaEventRecord(ctx->hold_event, ctx->stream()));
+    CUDA_CHECK(cudaEventRecord(ctx->hold_event, stream));
     ++ctx->hold_issued;
-    k_idle_hold<<<1, 32, 0, ctx->stream()>>>(ctx->hold_flag, ctx->hold_issued, (long long) max_us * ctx->hold_ticks_per_us);
+    k_idle_hold<<<1, 32, 0, stream>>>(ctx->hold_flag, ctx->hold_issued, (long long) max_us * ctx->hold_ticks_per_us);
     CUDA_CHECK(cudaGetLastError());
     ctx->hold_active = true;
 #else
@@ -4840,10 +4854,9 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
-    GGML_CUDA_FLUSH_PEER_COPIES("set-async", cuda_ctx->device);
-    ggml_cuda_backend_entry(cuda_ctx);
+    const cudaStream_t stream = ggml_cuda_enter_stream(cuda_ctx);
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, stream));
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -4851,10 +4864,9 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
-    GGML_CUDA_FLUSH_PEER_COPIES("get-async", cuda_ctx->device);
-    ggml_cuda_backend_entry(cuda_ctx);
+    const cudaStream_t stream = ggml_cuda_enter_stream(cuda_ctx);
 
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, stream));
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -4863,11 +4875,10 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
-    GGML_CUDA_FLUSH_PEER_COPIES("set-2d-async", cuda_ctx->device);
-    ggml_cuda_backend_entry(cuda_ctx);
+    const cudaStream_t stream = ggml_cuda_enter_stream(cuda_ctx);
 
     CUDA_CHECK(cudaMemcpy2DAsync(
-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, stream));
 }
 
 static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
@@ -4876,11 +4887,10 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
-    GGML_CUDA_FLUSH_PEER_COPIES("get-2d-async", cuda_ctx->device);
-    ggml_cuda_backend_entry(cuda_ctx);
+    const cudaStream_t stream = ggml_cuda_enter_stream(cuda_ctx);
 
     CUDA_CHECK(cudaMemcpy2DAsync(
-        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, stream));
 }
 
 #if defined(GGML_USE_HIP)
@@ -4892,42 +4902,46 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 //
 // It changes synchronization granularity only: tensor placement, copy
 // direction, and the bytes copied remain identical. Opt-in by env for other
-// models; always on for qwen4exp graphs, where batched copies and the one copy
-// kernel per hop measured +1.1% split decode with the same text.
+// models; on by default for qwen4exp graphs, where batched copies and the one
+// copy kernel per hop measured +1.1% split decode with the same text.
 struct ggml_cuda_pending_peer_copy_batch {
     ggml_backend_cuda_context * src = nullptr;
     ggml_backend_cuda_context * dst = nullptr;
     size_t bytes = 0;
     int copies = 0;
-    // GGML_CUDA_PEER_COPY_KERNEL=1: the copies are collected here and leave
-    // as one kernel on the producer stream at the flush (one launch instead
-    // of a runtime blit per tensor, the per-layer MoE handoff carries three).
+    // With the peer copy kernel on (GGML_CUDA_PEER_COPY_KERNEL): the copies are
+    // collected here and leave as one kernel on the producer stream at the flush
+    // (one launch instead of a runtime blit per tensor, the per-layer MoE
+    // handoff carries three).
     int n_descs = 0;
     ggml_cuda_copy_desc descs[ggml_cuda_copy_batch_max];
 };
 
+// A peer copy variable's setting: -1 when unset or empty (the default: on for
+// qwen4exp graphs, off for others), 0 for "0" (off for every graph), else 1.
+static int ggml_cuda_peer_copy_setting(const char * value) {
+    return value && *value ? strcmp(value, "0") != 0 : -1;
+}
+
 static bool ggml_cuda_peer_copy_kernel_enabled() {
-    static const bool enabled = [] {
-        const char * value = getenv("GGML_CUDA_PEER_COPY_KERNEL");
-        return value && *value && strcmp(value, "0") != 0;
-    }();
-    return enabled || ggml_cuda_qwen4exp_graph();
+    static const int setting = ggml_cuda_peer_copy_setting(getenv("GGML_CUDA_PEER_COPY_KERNEL"));
+    return setting < 0 ? ggml_cuda_qwen4exp_graph() : setting != 0;
 }
 
 static thread_local ggml_cuda_pending_peer_copy_batch
     ggml_cuda_pending_peer_copies;
 
 static bool ggml_cuda_batch_peer_copies_enabled() {
-    static const bool enabled = [] {
+    static const int setting = [] {
         const char * value = getenv("GGML_BATCH_PEER_COPIES");
         if (!value || !*value) {
             // Compatibility with profiles created before the policy became
             // runtime-neutral.
             value = getenv("GGML_CUDA_BATCH_PEER_COPIES");
         }
-        return value && *value && strcmp(value, "0") != 0;
+        return ggml_cuda_peer_copy_setting(value);
     }();
-    return enabled || ggml_cuda_qwen4exp_graph();
+    return setting < 0 ? ggml_cuda_qwen4exp_graph() : setting != 0;
 }
 
 // A pending batch (thread-local, published lazily) that names a context about to be freed is published first.
@@ -8735,7 +8749,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 #if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH)
-    cuda_ctx->tail_clean_key = use_cuda_graph ? graph_key : nullptr;
+    cuda_ctx->tail_clean_key = use_cuda_graph && cuda_ctx->copy_tail ? graph_key : nullptr;
 #endif
 
     return GGML_STATUS_SUCCESS;
@@ -8743,11 +8757,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
-    GGML_CUDA_FLUSH_PEER_COPIES("event-record", cuda_ctx->device);
-    ggml_cuda_backend_entry(cuda_ctx);
+    const cudaStream_t stream = ggml_cuda_enter_stream(cuda_ctx);
 
     CUDA_CHECK(cudaEventRecord(
-        (cudaEvent_t) event->context, cuda_ctx->stream()));
+        (cudaEvent_t) event->context, stream));
 }
 
 static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -9209,10 +9222,6 @@ void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
         return nullptr;
     }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    // The caller queues its own work on the stream: what the backend still holds back (a peer copy batch, a graph
-    // waiting for its copy tail, a side copy to join) goes first, as for an event record.
-    GGML_CUDA_FLUSH_PEER_COPIES("get-stream", cuda_ctx->device);
-    ggml_cuda_backend_entry(cuda_ctx);
     return (void *) cuda_ctx->stream();
 }
 
@@ -9220,10 +9229,7 @@ void * ggml_backend_cuda_enter_stream(ggml_backend_t backend) {
     if (!ggml_backend_is_cuda(backend)) {
         return nullptr;
     }
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_cuda_set_device(cuda_ctx->device);
-    ggml_cuda_backend_entry(cuda_ctx);
-    return (void *) cuda_ctx->stream();
+    return (void *) ggml_cuda_enter_stream((ggml_backend_cuda_context *) backend->context);
 }
 
 int ggml_backend_cuda_get_device_id(ggml_backend_t backend) {

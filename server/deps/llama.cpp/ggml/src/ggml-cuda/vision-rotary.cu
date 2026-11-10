@@ -84,8 +84,7 @@ bool ggml_hip_vision_rotary(ggml_backend_cuda_context & ctx, int64_t height, int
     }
     const size_t bytes = fixed_bytes + rows*bytes_per_row;
     const int count = static_cast<int>(rows*32);
-    ggml_cuda_set_device(ctx.device);
-    const auto stream = ctx.stream();
+    const auto stream = ggml_cuda_enter_stream(&ctx);
     cudaStreamCaptureStatus capture;
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
     if (capture != cudaStreamCaptureStatusNone) {

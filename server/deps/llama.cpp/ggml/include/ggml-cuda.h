@@ -188,14 +188,15 @@ GGML_BACKEND_API bool ggml_backend_cuda_get_uma_room(int device, size_t * room);
 // Current compute stream of a CUDA/HIP backend (cudaStream_t / hipStream_t
 // returned as an opaque pointer), so work submitted outside ggml can be
 // enqueued stream-ordered with the kernels of the same backend instead of
-// synchronizing the host. The stream is created lazily on first use.
-// Returns NULL for non-CUDA/HIP backends.
+// synchronizing the host. The stream is created lazily on first use. A lookup
+// only: it settles nothing the backend still holds back (see
+// ggml_backend_cuda_enter_stream). Returns NULL for non-CUDA/HIP backends.
 GGML_BACKEND_API void * ggml_backend_cuda_get_stream(ggml_backend_t backend);
 
-// ggml_backend_cuda_get_stream for work about to be queued on the stream
-// directly: it first settles what the backend's own launches settle (pending
-// side copies, a held clock wave, a deferred graph tail) and makes the
-// backend's device current. Returns NULL for non-CUDA/HIP backends.
+// The same stream, for work about to be queued on it directly: it first
+// settles what the backend's own launches settle (collected peer copies, an
+// open graph tail, an idle hold, pending side copies) and makes the backend's
+// device current. Returns NULL for non-CUDA/HIP backends.
 GGML_BACKEND_API void * ggml_backend_cuda_enter_stream(ggml_backend_t backend);
 
 // Device ordinal the backend was created for, or -1 for non-CUDA/HIP backends.
@@ -230,6 +231,11 @@ GGML_BACKEND_API bool ggml_backend_cuda_rdna4_rows_device(int device);
 // is bit-identical to the whole rows times src1 zero-padded outside the range,
 // at the range's reads. Other kernels compute the range's product as usual.
 GGML_BACKEND_API void ggml_backend_cuda_mul_mat_whole_row_lanes(struct ggml_tensor * mul_mat);
+
+// A router's weights node (the DIV that ends the router) marked here posts wake-hold slot `slot`
+// (1..GGML_MOE_FUSED_WAKE_SLOTS) once it is computed, which ends a ggml_moe_fused_wake_hold of that slot on another
+// device. What the node computes does not change.
+GGML_BACKEND_API void ggml_backend_cuda_div_wake_post(struct ggml_tensor * div, int slot);
 
 // Calling-thread override of the weight rows per wave on the batch-invariant
 // Q8_0 multi-column launch (mmvq.cu c_invariant_rpb): 0 = LUCE_MMVQ_INVARIANT_ROWS
@@ -278,6 +284,11 @@ GGML_BACKEND_API void ggml_backend_cuda_set_side_overlap(ggml_backend_t backend,
 // Keeps an idle device's clocks up (HIP; a no-op elsewhere): one wave spins on the backend stream until the next use
 // of the backend or for at most max_us, so the work after an idle stretch starts at full clock.
 GGML_BACKEND_API void ggml_backend_cuda_hold(ggml_backend_t backend, int max_us);
+// While on, the peer copies of a hop this backend produces can run as the tail of its captured graph (HIP graphs; a
+// no-op elsewhere): a graph evaluated right before a flush of batched kernel copies (GGML_CUDA_PEER_COPY_KERNEL with
+// batched peer copies) is captured again with the copies and the hop's event record as its last nodes, and later
+// replays carry each hop's copies. Off by default; a graph that already has a tail keeps it.
+GGML_BACKEND_API void ggml_backend_cuda_set_copy_tail(ggml_backend_t backend, bool on);
 // Graph copy runs issued as one batched launch on the calling thread (see
 // GGML_CUDA_DISABLE_COPY_BATCH); for tests and profiling.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_copy_batch_run_count(void);

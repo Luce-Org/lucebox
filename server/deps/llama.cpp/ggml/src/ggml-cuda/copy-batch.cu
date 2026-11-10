@@ -211,9 +211,7 @@ void ggml_backend_cuda_copy_batch_async(ggml_backend_t backend,
     }
     GGML_ASSERT(ggml_backend_is_cuda(backend));
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_cuda_set_device(ctx->device);
-    ggml_cuda_backend_entry(ctx);
-    ggml_cuda_copy_batch(descs, n, ctx->stream());
+    ggml_cuda_copy_batch(descs, n, ggml_cuda_enter_stream(ctx));
 }
 
 void ggml_backend_cuda_copy_batch_side(ggml_backend_t backend,
@@ -224,10 +222,9 @@ void ggml_backend_cuda_copy_batch_side(ggml_backend_t backend,
     }
     GGML_ASSERT(ggml_backend_is_cuda(backend));
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_cuda_set_device(ctx->device);
-    ggml_cuda_backend_entry(ctx);
+    const cudaStream_t stream = ggml_cuda_enter_stream(ctx);
     ggml_cuda_side_stream_init(ctx);
-    CUDA_CHECK(cudaEventRecord(ctx->side_copy_ready, ctx->stream()));
+    CUDA_CHECK(cudaEventRecord(ctx->side_copy_ready, stream));
     CUDA_CHECK(cudaStreamWaitEvent(ctx->side_copy_stream, ctx->side_copy_ready, 0));
     // 8 blocks of 256 threads stream the verify rollback (113 MiB) beside the first draft step's kernels. At 32
     // blocks the copy took ~530 GB/s and those kernels ran 3-5x slower; 8 spreads it thinner and still lands

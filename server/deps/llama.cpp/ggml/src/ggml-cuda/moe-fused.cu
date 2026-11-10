@@ -1152,10 +1152,10 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                     wc >= 1000 ? wc : 100000;
         }
         const int slot = ggml_get_op_params_i32(dst, 1) - 1;
-        GGML_ASSERT(slot >= 0 && slot < 64);
+        GGML_ASSERT(slot >= 0 && slot < GGML_MOE_FUSED_WAKE_SLOTS);
         const long long ticks = (long long) ggml_get_op_params_i32(dst, 2) * (khz[ctx.device] / 1000);
         uint32_t * f = ggml_cuda_wake_flags();
-        k_wake_hold<<<1, 32, 0, ctx.stream()>>>(f + slot, f + 64 + slot, ticks);
+        k_wake_hold<<<1, 32, 0, ctx.stream()>>>(f + slot, f + GGML_MOE_FUSED_WAKE_SLOTS + slot, ticks);
         CUDA_CHECK(cudaGetLastError());
 #endif // defined(GGML_USE_HIP)
         return;
