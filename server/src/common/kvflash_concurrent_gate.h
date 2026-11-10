@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -18,15 +19,16 @@ namespace luce::common {
 
 // ── When is the seq engine built? ──────────────────────────────────────
 // Paged attention only. N > 1 as before; an EXPLICIT --max-concurrency 1
-// (the C0 R6 reference arm) and a KVFlash arena also build it.
+// (the C0 R6 reference arm, behind the test switch until the public lift) and a KVFlash arena also build it.
 struct SeqRouteInput {
     bool paged = false;
     int  n_slots = 1;
     bool max_concurrency_set = false;
     bool kvflash_arena = false;
+    bool test_switch = false;   // LUCE_KVFLASH_CONCURRENT_TEST: the explicit-1 routing is not public yet
 };
 inline bool seq_engine_wanted(const SeqRouteInput & in) {
-    return in.paged && (in.n_slots > 1 || in.max_concurrency_set || in.kvflash_arena);
+    return in.paged && (in.n_slots > 1 || (in.max_concurrency_set && in.test_switch) || in.kvflash_arena);
 }
 
 // ── Test-only opening of the slot path ─────────────────────────────────
@@ -43,10 +45,27 @@ struct KvFlashConcurrentRequest {
     std::string arch;
     bool kvflash_requested = false, kvflash_auto = false;
     bool pool_would_be_disabled_by_placement = false;  // the MoE all-hot case; must NOT erase the refusal
-    bool wmma_env = false;                             // LUCE_PAGED_WMMA
+    bool wmma_env = false;                             // the WMMA kernel is active (kvflash_paged_wmma_active)
     bool wmma_null_exclusion_ready = false;            // true once the kernel excludes null blocks (-04, gate lift)
     bool draft = false, tree = false, pflash = false, images = false;
 };
+
+// Whether the paged WMMA launcher runs its kernel: on unless LUCE_PAGED_WMMA parses to 0
+// (paged-attn.cu try_launch_paged_attn_wmma), and only on an RDNA4 device (gfx1200/gfx1201).
+// `env` is the raw getenv value, nullptr when unset.
+inline bool kvflash_paged_wmma_active(const char * env, bool device_rdna4) {
+    return device_rdna4 && !(env && std::atoi(env) == 0);
+}
+
+// LUCE_KVFLASH_HOST_MIB: the host budget for paged-out state, 16384 MiB when unset or empty.
+// nullopt when the value is not a positive integer.
+inline std::optional<int64_t> kvflash_parse_host_mib(const char * env) {
+    if (!env || !*env) return 16384;
+    char * end = nullptr;
+    const long long v = std::strtoll(env, &end, 10);
+    if (*end != '\0' || v <= 0) return std::nullopt;
+    return (int64_t)v;
+}
 
 // First reason the combination is refused, nullopt if it may run.
 // Architecture-exact (qwen35 only) and decided on the REQUESTED combination,
@@ -55,7 +74,7 @@ inline std::optional<std::string> kvflash_concurrent_refusal(const KvFlashConcur
     if (r.arch != "qwen35")
         return "concurrent KVFlash supports only dense arch qwen35 (got '" + r.arch + "')";
     if (r.wmma_env && !r.wmma_null_exclusion_ready)
-        return "LUCE_PAGED_WMMA=1 cannot run with KVFlash until the WMMA kernel excludes null blocks";
+        return "the paged WMMA kernel is active (the default on RDNA4) and cannot run with KVFlash until it excludes null blocks; set LUCE_PAGED_WMMA=0";
     if (r.draft) return "concurrent KVFlash does not support a draft model or DFlash2 chains";
     if (r.tree)  return "concurrent KVFlash does not support tree verification";
     if (r.pflash) return "concurrent KVFlash does not combine with PFlash";
