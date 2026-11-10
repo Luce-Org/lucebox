@@ -4,6 +4,7 @@
 // replaces the serial recall defaults. No GPU, no startup.
 #include "CppUnitTestFramework.hpp"
 #include "../../src/common/kvflash_concurrent_gate.h"
+#include "../../src/common/kvflash_arena.h"
 #include <map>
 #include <utility>
 #include <vector>
@@ -20,8 +21,11 @@ TEST_CASE(KvflashConcurrentGateFixture, seq_engine_is_wanted_for_n_gt_1_explicit
     CHECK(!seq_engine_wanted(in));                       // default N=1: the single-sequence path, as before
     in.n_slots = 2;
     CHECK(seq_engine_wanted(in));
-    in.n_slots = 1; in.max_concurrency_set = true;       // explicit --max-concurrency 1
+    in.n_slots = 1; in.max_concurrency_set = true;       // explicit --max-concurrency 1: public routing unchanged without the switch
+    CHECK(!seq_engine_wanted(in));
+    in.test_switch = true;
     CHECK(seq_engine_wanted(in));
+    in.test_switch = false;
     in.max_concurrency_set = false; in.kvflash_arena = true;
     CHECK(seq_engine_wanted(in));
     in.paged = false;                                    // never without paged attention
@@ -316,4 +320,36 @@ TEST_CASE(KvflashConcurrentGateFixture, test_switch_opens_only_on_exactly_1) {
     setenv("LUCE_KVFLASH_CONCURRENT_TEST", "1", 1);
     CHECK(luce::common::kvflash_concurrent_test_switch());
     if (old) setenv("LUCE_KVFLASH_CONCURRENT_TEST", old, 1); else unsetenv("LUCE_KVFLASH_CONCURRENT_TEST");
+}
+
+TEST_CASE(KvflashConcurrentGateFixture, wmma_is_active_when_the_launcher_would_run_it_not_only_for_a_literal_1) {
+    // The launcher: on unless LUCE_PAGED_WMMA parses to 0, and only on an RDNA4 device.
+    CHECK(kvflash_paged_wmma_active(nullptr, true));     // unset: the kernel is on by default
+    CHECK(kvflash_paged_wmma_active("1", true));
+    CHECK(kvflash_paged_wmma_active("2", true));
+    CHECK(!kvflash_paged_wmma_active("", true));         // atoi("") == 0: the launcher reads it as off
+    CHECK(!kvflash_paged_wmma_active("0", true));        // the opt-out
+    CHECK(!kvflash_paged_wmma_active(nullptr, false));   // gfx1151 and NVIDIA never take the kernel
+    CHECK(!kvflash_paged_wmma_active("1", false));
+    KvFlashConcurrentRequest r; r.arch = "qwen35";
+    r.wmma_env = kvflash_paged_wmma_active(nullptr, true);
+    const auto m = kvflash_concurrent_refusal(r);
+    REQUIRE(m.has_value());
+    CHECK(m->find("LUCE_PAGED_WMMA=0") != std::string::npos);   // the message names the way out
+}
+
+TEST_CASE(KvflashConcurrentGateFixture, the_page_stream_must_exist_on_an_async_dma_build) {
+    CHECK(kvflash_arena_stream_usable(true, true));
+    CHECK(!kvflash_arena_stream_usable(true, false));    // a failed cudaStreamCreate would drop the completion wait
+    CHECK(kvflash_arena_stream_usable(false, false));    // no async DMA: nothing to wait for
+}
+
+TEST_CASE(KvflashConcurrentGateFixture, host_mib_is_validated_not_used_as_read) {
+    CHECK(kvflash_parse_host_mib(nullptr) == std::optional<int64_t>(16384));
+    CHECK(kvflash_parse_host_mib("") == std::optional<int64_t>(16384));
+    CHECK(kvflash_parse_host_mib("2048") == std::optional<int64_t>(2048));
+    CHECK(!kvflash_parse_host_mib("0").has_value());
+    CHECK(!kvflash_parse_host_mib("-5").has_value());
+    CHECK(!kvflash_parse_host_mib("abc").has_value());
+    CHECK(!kvflash_parse_host_mib("12x").has_value());
 }

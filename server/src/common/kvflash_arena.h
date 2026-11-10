@@ -17,6 +17,10 @@
 
 namespace luce::common {
 
+// The arena's page stream: without one each pager makes a private stream and complete_all()
+// waits on nothing, so a freed block could be reused under a running copy. Required on async-DMA builds.
+inline bool kvflash_arena_stream_usable(bool async_dma, bool have_stream) { return !async_dma || have_stream; }
+
 class KvFlashArena {
 public:
     KvFlashArena() {
@@ -39,6 +43,15 @@ public:
         return stream_;
 #else
         return nullptr;
+#endif
+    }
+
+    // False when an async-DMA build has no page stream (cudaStreamCreate failed): the arena must not be used.
+    bool stream_usable() const {
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        return kvflash_arena_stream_usable(true, stream_ != nullptr);
+#else
+        return true;
 #endif
     }
 

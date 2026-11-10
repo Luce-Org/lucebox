@@ -105,6 +105,17 @@ static bool tokens_have_recent_any(const std::vector<int32_t> & tokens,
     return false;
 }
 
+// RDNA4 (gfx1200/gfx1201): the only device the paged WMMA kernel launches on. HIP builds only; false elsewhere.
+static bool device_is_rdna4(int gpu) {
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
+    cudaDeviceProp prop{};
+    return cudaGetDeviceProperties(&prop, gpu) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx12", 5) == 0;
+#else
+    (void) gpu;
+    return false;
+#endif
+}
+
 static int env_int_or_default(const char * name, int fallback) {
     if (const char * raw = std::getenv(name)) {
         if (*raw) return std::atoi(raw);
@@ -521,8 +532,7 @@ bool Qwen35Backend::init() {
         luce::common::KvFlashConcurrentRequest rq;
         rq.arch = kvflash_arch();
         rq.kvflash_requested = true;
-        const char * wmma = std::getenv("LUCE_PAGED_WMMA");
-        rq.wmma_env = wmma && std::string(wmma) == "1";   // null exclusion is box-unverified until C1.3-06
+        rq.wmma_env = luce::common::kvflash_paged_wmma_active(std::getenv("LUCE_PAGED_WMMA"), device_is_rdna4(cfg_.device.gpu));
         rq.draft = cfg_.draft_path.has_value();
         rq.tree = cfg_.ddtree_mode;
         if (const auto why = luce::common::kvflash_concurrent_refusal(rq)) {
@@ -604,8 +614,8 @@ bool Qwen35Backend::init() {
     int64_t pool_tokens = 0;
     const bool slot_pool = seq_engine_wanted();
     // KVFlash slots (C1.3-05): one arena of N x Q x 64 rows plus a scratch block,
-    // no PagedKvPool; --kv-pool-tokens is derived, not a size. Unreachable until
-    // the paged x KVFlash refusal above is lifted (C1.3-06).
+    // no PagedKvPool; --kv-pool-tokens is derived, not a size. Reachable only
+    // behind LUCE_KVFLASH_CONCURRENT_TEST until the paged x KVFlash refusal is lifted.
     const bool kvflash_slots = slot_pool && kvflash_active();
     KvFlashArenaSizing arena;
     if (kvflash_slots) {
@@ -730,8 +740,9 @@ bool Qwen35Backend::init() {
             return false;
         }
         if (kvflash_slots) {
-            std::printf("[kvflash] %d slots x %d chunks, arena %lld rows, headroom 8, LRU only (no scoring)\n",
-                        n_slots, kvflash_quota_chunks(kvflash_tokens_), (long long)arena.rows);
+            std::printf("[kvflash] %d slots x %d chunks, arena %lld rows, headroom 8, scoring %s\n",
+                        n_slots, kvflash_quota_chunks(kvflash_tokens_), (long long)arena.rows,
+                        kvflash_prefill_reselect_ > 0 ? "per-slot recall" : "none (LRU)");
             std::fflush(stdout);
         } else if (slot_pool) {
             fixed_chain.scratch_base = (int)pool_tokens;
@@ -1778,10 +1789,19 @@ bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ct
     constexpr int kHeadroom = 8;
     using namespace luce::common;
     kvf_arena_ = std::make_unique<KvFlashArena>();
+    if (!kvf_arena_->stream_usable()) {
+        set_last_error("KVFlash: the page stream could not be created");
+        return false;
+    }
+    const auto host_mib = kvflash_parse_host_mib(std::getenv("LUCE_KVFLASH_HOST_MIB"));
+    if (!host_mib) {
+        set_last_error("LUCE_KVFLASH_HOST_MIB must be a positive integer (MiB)");
+        return false;
+    }
     std::vector<KvFlashSlotPager *> raw;
     for (int i = 0; i < n_slots; i++) {
         kvf_pagers_.push_back(std::make_unique<KvFlashSlotPager>());
-        kvf_arena_->add(*kvf_pagers_.back());
+        if (!kvf_arena_->add(*kvf_pagers_.back())) { set_last_error("KVFlash slot " + std::to_string(i) + ": arena add failed"); return false; }
         if (!kvf_pagers_.back()->attach_slice(i, n_slots, quota_chunks, KvFlashConfig{}, cache_.attn_k, cache_.attn_v)) {
             set_last_error("KVFlash slot " + std::to_string(i) + ": pager attach failed (quota " +
                            std::to_string(quota_chunks) + " chunks, headroom " + std::to_string(kHeadroom) + ")");
@@ -1798,7 +1818,7 @@ bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ct
         return false;
     }
     kvf_ledger_ = std::make_unique<KvFlashHostLedger>(
-        (int64_t)env_int_or_default("LUCE_KVFLASH_HOST_MIB", 16384) << 20, /*transient_reserve_bytes=*/0);
+        *host_mib << 20, /*transient_reserve_bytes=*/0);
     kvf_kv_ = std::make_unique<KvFlashSlotKv>(raw, *kvf_ledger_, kc);
     kvf_driver_ = std::make_unique<KvFlashStepDriver>(raw, *kvf_arena_, kHeadroom);
     seq_engine_ = std::make_unique<Qwen35SeqEngine>(
@@ -3721,7 +3741,9 @@ void Qwen35Backend::kvflash_prefill_apply_on(KvFlashPager & p, std::vector<float
         // The pins sit in the rows LUCE_KVFLASH_PREAMBLE_ROWS reserves in the pool (0 when off): the history budget
         // (tail + recall + reserve) is the pool minus them, and the pinned chunks are not recall candidates.
         luce::common::KvFlashRecallIn in;
-        in.n_pool_blocks = p.n_pool_blocks();
+        // a live slot is settled to the pool minus the step headroom, so that is its budget
+        in.n_pool_blocks = slot >= 0 ? luce::common::kvflash_usable_blocks(p.n_pool_blocks(), kvf_driver_->headroom())
+                                     : p.n_pool_blocks();
         in.cur_chunk = p.cur_chunk();
         in.recall_chunks = luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_;
         in.unit = unit;
