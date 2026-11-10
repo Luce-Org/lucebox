@@ -88,7 +88,10 @@ because `main` cannot expose the restored-token counts.
 When volatile text (for example a session clock) sits *inside* the first system
 message, the first chat boundary cannot exclude it. **DiffPin** can diff the
 head, float that volatility after the stable block, and pin the contiguous
-prefix. See [PIN_FRIENDLY_PROMPT.md](./PIN_FRIENDLY_PROMPT.md). `LUCE_PPP`
-(on by default) enables LCP pin-end annotation + sticky protect;
-`LUCE_PPP_REARRANGE=1` opts into the token-level float rewrite (off by
-default — unconstrained peels can scramble tool JSON).
+prefix. See [PIN_FRIENDLY_PROMPT.md](./PIN_FRIENDLY_PROMPT.md). The LCP
+pin-end annotation is now the shared-prefix cut (`--shared-prefix`, on by
+default, for every request whose prefix is long enough; see
+[PREFIX_CACHE.md](./PREFIX_CACHE.md#shared-prefixes)); `LUCE_PPP=0` still
+turns it off for one release, with a warning. `LUCE_PPP_REARRANGE=1` opts
+into the token-level float rewrite (off by default — unconstrained peels can
+scramble tool JSON).

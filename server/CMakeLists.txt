@@ -757,6 +757,8 @@ add_library(luce_common STATIC
     src/server/kv/checkpoint_store.cpp
     src/server/kv/cuts.cpp
     src/server/kv/kv_cache.cpp
+    src/server/kv/shared_prefixes.cpp
+    src/server/kv/prefix_pins.cpp
     src/server/kv/prefix_hash.cpp
     src/server/kv/prefix_cache.cpp
     src/server/pin_friendly_prompt.cpp
@@ -3373,6 +3375,17 @@ if(LUCE_TESTS)
             COMMAND test_gdn_replay_log --preflight-only)
         if(TARGET check)
             add_dependencies(check test_gdn_replay_log)
+        endif()
+    endif()
+    if((LUCE_GPU_BACKEND STREQUAL "cuda" OR
+        LUCE_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_gdn_scalar_replay_bits.cpp")
+        luce_add_ggml_gpu_executable(
+            test_gdn_scalar_replay_bits
+            test/unit/test_gdn_scalar_replay_bits.cpp)
+        add_test(NAME gdn_scalar_replay_bits COMMAND test_gdn_scalar_replay_bits)
+        if(TARGET check)
+            add_dependencies(check test_gdn_scalar_replay_bits)
         endif()
     endif()
     if((LUCE_GPU_BACKEND STREQUAL "cuda" OR
