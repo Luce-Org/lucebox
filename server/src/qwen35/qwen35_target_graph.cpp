@@ -47,10 +47,6 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 
-#if defined(__linux__)
-#include <sys/mman.h>
-#endif
-
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -3525,19 +3521,6 @@ bool snapshot_paged_target_cache(
             free_prefix_snapshot(snap);
             return false;
         }
-#if defined(MADV_HUGEPAGE)
-        // The checkpoint's pages are fresh and first touched by the copies
-        // below (gigabytes at a long context): ask for transparent huge pages
-        // so the copy does not fault once per 4 KiB. Advice only.
-        {
-            const uintptr_t huge = (uintptr_t) 2 << 20;
-            const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(snap.buf);
-            const uintptr_t first = (base + huge - 1) & ~(huge - 1);
-            const uintptr_t last =
-                (base + ggml_backend_buffer_get_size(snap.buf)) & ~(huge - 1);
-            if (last > first) madvise((void *) first, last - first, MADV_HUGEPAGE);
-        }
-#endif
     }
 
     if (!paged_snapshot_matches(
