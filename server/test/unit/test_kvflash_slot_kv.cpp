@@ -116,6 +116,18 @@ TEST_CASE(KvflashSlotKvFixture, append_beyond_the_reserved_capacity_is_refused) 
     CHECK(w.kv->reserve_capacity(a, 3 * kChunk + 1) == PagedKvStatus::BlocksExhausted);
 }
 
+TEST_CASE(KvflashSlotKvFixture, append_room_is_the_reserved_rows_left_so_a_chain_never_overshoots_the_last_block) {
+    World w;
+    PagedKvSequenceHandle a;
+    REQUIRE(w.kv->acquire_reserved(1, 100, a) == PagedKvStatus::Ok);   // 2 blocks = 128 rows
+    CHECK(w.kv->append_room((int)a.slot) == 2 * kChunk);
+    CHECK(w.kv->append(a, 90));
+    CHECK(w.kv->append_room((int)a.slot) == 2 * kChunk - 90);
+    CHECK(w.kv->append_room(-1) == 0);                                // no such slot
+    CHECK(w.kv->release(a) == PagedKvStatus::Ok);
+    CHECK(w.kv->append_room((int)a.slot) == 0);                       // not live
+}
+
 TEST_CASE(KvflashSlotKvFixture, rollback_and_clear_rewind_the_pager) {
     World w;
     PagedKvSequenceHandle a;
