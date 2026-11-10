@@ -113,6 +113,7 @@ TEST_CASE(KvflashPinPreambleFixture, pin_preamble_truncate_below_then_repin) {
     KvFlashConfig cfg;
     cfg.pool_tokens = 512; cfg.chunk_tokens = 64; cfg.sink_chunks = 1; cfg.tail_window_chunks = 4;
     KvFlashPager p;
+    p.set_pinned_host_backing(false);  // CPU tensors: pageable staging, no cudaMallocHost (stub-driver CI)
     must(p.attach(cfg, h.k, h.v));
     must(p.alloc_span(0, 6 * 64));
     // chunk 0 is also the sink; a 64-row reserve pins exactly one chunk.
@@ -137,6 +138,7 @@ TEST_CASE(KvflashPinPreambleFixture, pin_survives_the_dense_reset_path) {
     KvFlashConfig cfg;
     cfg.pool_tokens = 512; cfg.chunk_tokens = 64; cfg.sink_chunks = 1; cfg.tail_window_chunks = 4;
     KvFlashPager p;
+    p.set_pinned_host_backing(false);  // CPU tensors: pageable staging, no cudaMallocHost (stub-driver CI)
     must(p.attach(cfg, h.k, h.v));
     must(p.alloc_span(0, 3 * 64));
     kvflash_pin_preamble(p, 300, 64);
