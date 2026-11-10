@@ -614,9 +614,9 @@ static bool ds4_build_fused_verify_graph(
     // step sums the six routes in one combine, so splitting them 4 + 2 once
     // a second sequence joins would make a sequence's row depend on how many
     // others share its step. LUCE_DS4_TP_HEAD4_TAIL2=1 restores the 4 + 2
-    // decomposition for bisection.
+    // decomposition for verify lanes, for bisection; paged steps ignore it.
     static const bool legacy_head4_tail2 = ds4_env_flag("LUCE_DS4_TP_HEAD4_TAIL2");
-    const bool whole_routes_for_lanes = (n_lanes > 1 || paged_mode) && !legacy_head4_tail2;
+    const bool whole_routes_for_lanes = paged_mode || (n_lanes > 1 && !legacy_head4_tail2);
     const int64_t comp_slots = 2 * (int64_t) w.n_layer * n_lanes;
     fg.i32_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, comp_slots);
     ggml_set_input(fg.i32_bundle);
@@ -1526,13 +1526,25 @@ static bool ds4_build_fused_verify_graph(
             // head-plus-tail reduction order without padding the two-route
             // tail with duplicate zero-weight expert paths.
             // A streamed layer posts its routes once, so it keeps them whole.
-            // Tokenwise verify lanes keep them whole as well: the q=1 graph
-            // sums all six routes in one combine, and the 4 + 2 decomposition
-            // sums them in another order, so a batched verify built with it
-            // differs from decode by rounding (H200, DS4.1-Flash: the first
-            // differing cache bytes appear at layer 1 of the first verify;
-            // with whole routes the q=3 verify and q=1 decode are bit-identical).
-            // LUCE_DS4_TP_HEAD4_TAIL2=1 restores the decomposition for bisection.
+            // Tokenwise verify lanes and paged steps keep them whole as well:
+            // the q=1 graph sums all six routes in one combine, and the 4 + 2
+            // decomposition sums them in another order, so a batched verify
+            // built with it differs from decode by rounding (H200,
+            // DS4.1-Flash: the first differing cache bytes appear at layer 1
+            // of the first verify; with whole routes the q=3 verify and q=1
+            // decode are bit-identical), and a paged sequence's row would
+            // depend on how many rows share its step.
+            // So a paged step runs what LUCE_DS4_TP_NATIVE_ROUTE_WIDTH
+            // selects, whatever that switch says. That adds no expert kernel a
+            // one-row step does not run: paged serving refuses grouped MMVQ,
+            // so ROCmFP2 owners run each row as its own one-row chain
+            // (moe_owner_branch_tokenwise), and only the route remap, the row
+            // concat and the owner join see the whole step, as they did in
+            // the 4 + 2 form. Paged steps also never balance routes
+            // dynamically: that balance applies up to five rows only, so it
+            // would make a row depend on its company again.
+            // LUCE_DS4_TP_HEAD4_TAIL2=1 restores the decomposition for verify
+            // lanes, for bisection.
             const bool native_route_width =
                 cluster_hybrid || !same_gpu_runtime ||
                 mixed_policy.native_route_width || streamed ||
@@ -1590,8 +1602,9 @@ static bool ds4_build_fused_verify_graph(
                         lane_q, inputs, /*include_shared=*/!cluster_hybrid,
                         allow_fused_combine,
                         join_mode,
-                        (streamed || cluster_hybrid) ? MoeHybridRouteBalance::Disabled
-                                                     : MoeHybridRouteBalance::Allowed,
+                        (streamed || cluster_hybrid || paged_mode)
+                            ? MoeHybridRouteBalance::Disabled
+                            : MoeHybridRouteBalance::Allowed,
                         streamed)) {
                     return false;
                 }

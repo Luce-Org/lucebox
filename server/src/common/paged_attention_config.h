@@ -25,10 +25,12 @@ inline constexpr int DEEPSEEK4_MAX_MOE_ROWS_PER_PART = 8;
 // Expert-owner switches paged DeepSeek V4.1 serving is not qualified with:
 // with them it has faulted the GPU (server/docs/DS41.md). Under
 // --paged-attention a launch profile's default for one of them is left out;
-// one the operator sets is refused by the backend.
+// one the operator sets is refused by the backend. LUCE_DS4_TP_NATIVE_ROUTE_WIDTH
+// is not listed: every paged step runs what it selects (see the routed FFN in
+// deepseek4_fused_verify.inc), so it changes nothing there.
 inline constexpr const char * DEEPSEEK41_PAGED_UNQUALIFIED_ENV[] = {
     "LUCE_DS4_TP_GROUPED_MMVQ", "LUCE_MOE_TP_GROUPED_MMVQ", "LUCE_MMID_GROUPED",
-    "LUCE_DS4_TP_NATIVE_ROUTE_WIDTH", "LUCE_DS4_TP_MASKED_ROUTES",
+    "LUCE_DS4_TP_MASKED_ROUTES",
     "LUCE_DS4_TP_BATCH_SPLIT_COPIES", "GGML_CUDA_BATCH_PEER_COPIES", "GGML_BATCH_PEER_COPIES",
     "LUCE_DS4_TP_DEVICE_JOIN", "LUCE_MOE_TP_DEVICE_JOIN", "LUCE_DS4_TP_DEVICE_JOIN_SPLIT",
     "LUCE_DS4_TP_FUSED_HC_JOIN", "LUCE_DS4_TP_ROUTE_PREFORK", "LUCE_MOE_TP_ROUTE_PREFORK",
