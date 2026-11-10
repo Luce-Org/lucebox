@@ -11842,6 +11842,13 @@ TEST_CASE(ServerUnitFixture,
     bool freed_turn2 = false;
     for (const auto & ref : backend.engine.discarded) freed_turn2 |= ref.tokens == 10;
     TEST_ASSERT(freed_turn2);
+    // /status says which requests resumed from the cache, and when each finished.
+    const json perf = SchedulerTestHarness::status_json(server)["perf_history"];
+    TEST_ASSERT(perf.size() == 5);
+    for (size_t i = 0; i < perf.size(); ++i) {
+        TEST_ASSERT(perf[i]["cache_hit"] == (i >= 2));
+        TEST_ASSERT(perf[i]["unix_ms"].get<long long>() > 1700000000000LL);
+    }
 }
 
 // Subagents launched together share their head: the first one admitted saves

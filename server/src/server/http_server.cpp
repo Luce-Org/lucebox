@@ -7331,7 +7331,6 @@ void HttpServer::process_job(ServerJob * job) {
     perf.cache_hit = cache_hit;
     perf.pflash = pflash_compressed;
     perf.spec_decode = result.spec_decode_ran;
-    perf.timestamp = std::chrono::steady_clock::now();
     status_.record_perf(perf);
     status_.update_completion_tokens(completion_tokens);
     broadcast_status();
