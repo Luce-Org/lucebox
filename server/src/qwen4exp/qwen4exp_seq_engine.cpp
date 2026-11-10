@@ -46,7 +46,7 @@ Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
                 qwen4exp_verify_supported(*caches_[0]) ? 0 : -1),
       verify_width_(verify_width),
       mtp_(caches_.size()),
-      mode_rates_((size_t)kQwen4ExpMaxBatchedSlots + 1),
+      mode_rates_(((size_t)kQwen4ExpMaxBatchedSlots + 1) * ((size_t)kQwen4ExpMaxBatchedSlots + 1)),
       mtp_width_(mtp_width ? mtp_width : &own_mtp_width_),
       mtp_costs_(mtp_costs ? mtp_costs : &own_mtp_costs_),
       lookup_policy_(verify_width == 0 ? lookup_policy : nullptr) {}
@@ -368,20 +368,32 @@ constexpr double kModeDecay = 0.9;
 constexpr long long kExploreSteps = 32;
 // Batched verify steps before the plain mode's first measurement (verify usually pays, so it is measured first).
 constexpr long long kVerifyFirstSteps = 4;
+
+// The slots of a batched verify's rows (batched_verify_shape) that verify drafts.
+int drafting_slots(const std::vector<int> & rows) {
+    return (int)std::count_if(rows.begin(), rows.end(), [](int r) { return r > 1; });
+}
 }  // namespace
 
-bool Qwen4ExpSeqEngine::verify_pays(int n) const {
-    if (n < 0 || n >= (int)mode_rates_.size()) return false;
-    const ModeRates & r = mode_rates_[(size_t)n];
+int Qwen4ExpSeqEngine::mode_index(int n, int drafting) const {
+    const int side = kQwen4ExpMaxBatchedSlots + 1;
+    return n < 0 || n >= side || drafting < 0 || drafting > n ? -1 : n * side + drafting;
+}
+
+bool Qwen4ExpSeqEngine::verify_pays(int n, int drafting) const {
+    const int mode = mode_index(n, drafting);
+    if (mode < 0) return false;
+    const ModeRates & r = mode_rates_[(size_t)mode];
     if (r.verify_steps < kVerifyFirstSteps) return true;
     if (r.plain_steps == 0) return false;
     const bool better = r.verify_tokens * r.plain_s >= r.plain_tokens * r.verify_s;
     return better != (r.steps % kExploreSteps == kExploreSteps - 1);
 }
 
-void Qwen4ExpSeqEngine::record_mode(int n, bool verify, double tokens, double seconds) {
-    if (n < 0 || n >= (int)mode_rates_.size() || seconds <= 0.0) return;
-    ModeRates & r = mode_rates_[(size_t)n];
+void Qwen4ExpSeqEngine::record_mode(int n, int drafting, bool verify, double tokens, double seconds) {
+    const int mode = mode_index(n, drafting);
+    if (mode < 0 || seconds <= 0.0) return;
+    ModeRates & r = mode_rates_[(size_t)mode];
     double & t = verify ? r.verify_tokens : r.plain_tokens;
     double & s = verify ? r.verify_s : r.plain_s;
     t = t * kModeDecay + tokens;
@@ -390,42 +402,49 @@ void Qwen4ExpSeqEngine::record_mode(int n, bool verify, double tokens, double se
     ++r.steps;
 }
 
-int Qwen4ExpSeqEngine::batched_verify_rows(const StepPlan & plan) const {
-    if (decode_mode_ == DecodeMode::plain) return 0;
-    const int rows = batched_verify_width(plan);
-    return rows > 0 && (decode_mode_ == DecodeMode::verify || verify_pays((int)plan.decode.size())) ? rows : 0;
+std::vector<int> Qwen4ExpSeqEngine::batched_verify_rows(const StepPlan & plan) const {
+    std::vector<int> rows;
+    if (decode_mode_ == DecodeMode::plain) return rows;
+    rows = batched_verify_shape(plan);
+    if (decode_mode_ != DecodeMode::verify && !rows.empty() &&
+        !verify_pays((int)plan.decode.size(), drafting_slots(rows))) rows.clear();
+    return rows;
 }
 
-int Qwen4ExpSeqEngine::batched_verify_width(const StepPlan & plan) const {
-    if (!plan.prefills.empty() || plan.decode.empty() || mtp_eligible(plan)) return 0;
-    int rows = kQwen4ExpBatchedVerifyRows;
+std::vector<int> Qwen4ExpSeqEngine::batched_verify_shape(const StepPlan & plan) const {
+    if (!plan.prefills.empty() || plan.decode.empty() || mtp_eligible(plan)) return {};
+    std::vector<int> rows;
     std::vector<Qwen4ExpCache *> caches;
     std::vector<int32_t> positions;
     for (const StepInput & input : plan.decode) {
         const SeqSlot & slot = slots_.slot(input.slot);
-        if (!mtp_[(size_t)input.slot].live || !input.allow_speculation) return 0;
+        const bool drafts = mtp_[(size_t)input.slot].live && input.allow_speculation;
         // Each cache's rollback rows bound its verify (a fixed --verify-width of 2 or 3 leaves 2 or 3).
-        rows = std::min({rows, max_context() - slot.cur_pos, caches_[(size_t)input.slot]->mtp_draft + 1});
+        rows.push_back(!drafts ? 1 : std::max(1, std::min({kQwen4ExpBatchedVerifyRows, max_context() - slot.cur_pos,
+                                                           caches_[(size_t)input.slot]->mtp_draft + 1})));
         caches.push_back(caches_[(size_t)input.slot]);
         positions.push_back(slot.cur_pos);
     }
-    if (rows < 2 || !qwen4exp_verify_batched_supported(backend_, weights_, caches.data(), positions.data(),
-                                                       (int)caches.size(), rows)) return 0;
+    if (drafting_slots(rows) == 0 || !qwen4exp_verify_batched_supported(backend_, weights_, caches.data(),
+                                                                        positions.data(), rows.data(), (int)rows.size()))
+        return {};
     return rows;
 }
 
-// Every decoding slot drafts rows - 1 tokens from its pending pairs and the graph verifies all of them at once. Each
-// slot then keeps its accepted prefix as its solo verify would (the accepted drafts and the verified token, the
-// trunk rows as pending pairs, the rollback to the last kept row).
-SeqEngine::StepResult Qwen4ExpSeqEngine::batched_verify_step(const StepPlan & plan, int rows) {
+// Every decoding slot's rows in one graph (`rows`: batched_verify_shape). A drafting slot drafts its rows - 1 tokens
+// from its pending pairs, the graph verifies them and the slot keeps its accepted prefix as its solo verify would (the
+// accepted drafts and the verified token, the trunk rows as pending pairs, the rollback to the last kept row). A
+// one-row slot decodes its token as a plain step does: a T=1 decode's row, sampled as that step samples it, and for a
+// live draft state the same pending pair.
+SeqEngine::StepResult Qwen4ExpSeqEngine::batched_verify_step(const StepPlan & plan, const std::vector<int> & rows) {
     StepResult result;
     const auto t0 = std::chrono::steady_clock::now();
     const int n = (int)plan.decode.size();
-    const int k = rows - 1;
     const size_t hd = (size_t)weights_.n_embd * weights_.n_hc;
     std::vector<Qwen4ExpCache *> caches((size_t)n);
-    std::vector<int32_t> tokens((size_t)n * rows), positions((size_t)n);
-    std::vector<std::vector<int32_t>> drafts;
+    std::vector<int32_t> tokens, positions((size_t)n);
+    std::vector<int> first((size_t)n);   // each slot's first row
+    std::vector<std::vector<int32_t>> drafts((size_t)n);
     std::vector<const int32_t *> draft_tok((size_t)n);
     std::vector<const float *> draft_h((size_t)n);
     std::vector<int> draft_n((size_t)n), draft_pos((size_t)n);
@@ -435,6 +454,10 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::batched_verify_step(const StepPlan & pl
         Qwen4ExpMtpPending & pending = mtp_[(size_t)input.slot].pending;
         caches[(size_t)s] = &cache;
         positions[(size_t)s] = slots_.slot(input.slot).cur_pos;
+        first[(size_t)s] = (int)tokens.size();
+        tokens.push_back(input.token);
+        tokens.resize(tokens.size() + (size_t)rows[(size_t)s] - 1);
+        if (rows[(size_t)s] == 1) continue;
         pending.tok.push_back(input.token);
         // After a stretch of plain decode, fold all but the last pair first: a draft catches up at most a verify's.
         if (pending.tok.size() > (size_t)cache.mtp_draft + 1 &&
@@ -447,16 +470,35 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::batched_verify_step(const StepPlan & pl
         draft_n[(size_t)s] = (int)pending.tok.size();
         draft_pos[(size_t)s] = pending.pos;
     }
-    // Every slot's drafts: each slot's first rank, then each later rank once for all slots.
-    if (draft_workspace_.size() < (size_t)k) draft_workspace_.resize((size_t)k);
-    if (!qwen4exp_mtp_draft_slots(backend_, weights_, caches.data(), draft_tok.data(), draft_h.data(), draft_n.data(),
-                                  draft_pos.data(), n, k, draft_workspace_, drafts)) {
-        result.error = "qwen4exp MTP draft failed";
-        return result;
-    }
-    for (int s = 0; s < n; ++s) {
-        tokens[(size_t)s * rows] = plan.decode[(size_t)s].token;
-        std::copy(drafts[(size_t)s].begin(), drafts[(size_t)s].end(), tokens.begin() + (std::ptrdiff_t)s * rows + 1);
+    // The drafts of the drafting slots of each width (one width, unless a cap or the context's end narrows a slot):
+    // each slot's first rank, then each later rank once for those slots.
+    for (int k = kQwen4ExpBatchedVerifyRows - 1; k >= 1; --k) {
+        std::vector<int> width;   // its slots
+        for (int s = 0; s < n; ++s) if (rows[(size_t)s] == k + 1) width.push_back(s);
+        if (width.empty()) continue;
+        std::vector<Qwen4ExpCache *> c;
+        std::vector<const int32_t *> tok;
+        std::vector<const float *> h;
+        std::vector<int> count, pos;
+        for (const int s : width) {
+            c.push_back(caches[(size_t)s]);
+            tok.push_back(draft_tok[(size_t)s]);
+            h.push_back(draft_h[(size_t)s]);
+            count.push_back(draft_n[(size_t)s]);
+            pos.push_back(draft_pos[(size_t)s]);
+        }
+        std::vector<std::vector<int32_t>> out;
+        if (draft_workspace_.size() < (size_t)k) draft_workspace_.resize((size_t)k);
+        if (!qwen4exp_mtp_draft_slots(backend_, weights_, c.data(), tok.data(), h.data(), count.data(), pos.data(),
+                                      (int)width.size(), k, draft_workspace_, out) || out.size() != width.size()) {
+            result.error = "qwen4exp MTP draft failed";
+            return result;
+        }
+        for (size_t i = 0; i < width.size(); ++i) {
+            const int s = width[i];
+            drafts[(size_t)s] = std::move(out[i]);
+            std::copy(drafts[(size_t)s].begin(), drafts[(size_t)s].end(), tokens.begin() + first[(size_t)s] + 1);
+        }
     }
     const auto t_draft = std::chrono::steady_clock::now();
     // Rows reach each slot's sampler as its solo verify hands them over (Qwen4ExpRows): the device's picks for an
@@ -468,45 +510,72 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::batched_verify_step(const StepPlan & pl
     for (int s = 0; s < n; ++s) {
         const SamplerCfg & sampler = slots_.slot(plan.decode[(size_t)s].slot).sampler;
         how[(size_t)s] = qwen4exp_rows_for(sampler);
-        if (how[(size_t)s] == Qwen4ExpRows::lazy)
+        if (how[(size_t)s] == Qwen4ExpRows::lazy && rows[(size_t)s] > 1)
             out.top_n = std::max(out.top_n, sample_logits_top_n(sampler, weights_.n_vocab));
     }
     std::vector<float> hidden;
-    if (!qwen4exp_verify_batched(backend_, weights_, caches.data(), tokens.data(), positions.data(), n, rows,
+    if (!qwen4exp_verify_batched(backend_, weights_, caches.data(), tokens.data(), positions.data(), rows.data(), n,
                                  verify_workspace_, out, hidden).ok ||
-        out.greedy.size() != (size_t)n * rows || hidden.size() != hd * n * rows) {
+        out.greedy.size() != tokens.size() || hidden.size() != hd * tokens.size()) {
         result.error = "qwen4exp batched verify failed";
         return result;
     }
     std::vector<float> row_logits;
     int row_read = -1;   // the row row_logits holds
+    bool read_ok = true;
+    auto read_row = [&](int r) {
+        if (row_read != r) {
+            read_ok = read_ok && qwen4exp_verify_batched_row(verify_workspace_, weights_, r, row_logits);
+            row_read = r;
+        }
+        return (const float *)row_logits.data();
+    };
     const auto t_verify = std::chrono::steady_clock::now();
     long long emitted_total = 0;
     for (int s = 0; s < n; ++s) {
         const StepInput & input = plan.decode[(size_t)s];
         const int id = input.slot;
         const int pos = positions[(size_t)s];
+        const int k = rows[(size_t)s] - 1;
         Qwen4ExpCache & cache = *caches[(size_t)s];
         MtpState & m = mtp_[(size_t)id];
         SeqSlot & slot = slots_.slot(id);
+        if (k == 0) {
+            // The slot's plain decode step: its token joins the history and its row is sampled as that step samples
+            // it (its verify keeps its one row).
+            const int r = first[(size_t)s];
+            const auto appended = slots_.append_token(id, input.token);
+            if (!appended.ok || appended.position != pos || !qwen4exp_verify_rollback(backend_, weights_, cache, pos, 1)) {
+                result.error = "qwen4exp batched verify one-row step failed";
+                return result;
+            }
+            slots_.commit_step(id);
+            DecodeOutput output;
+            output.slot = id;
+            output.token = out.greedy[(size_t)r];
+            if (slot.sampler.needs_logit_processing()) {
+                const float * logits = read_row(r);
+                if (!read_ok) {
+                    result.error = "qwen4exp batched verify row read failed";
+                    return result;
+                }
+                output.token = sample_logits(logits, weights_.n_vocab, slot.sampler, slot.sample_history, slot.rng);
+            }
+            ++emitted_total;
+            result.decode.push_back(std::move(output));
+            continue;
+        }
         const size_t history0 = slot.sample_history.size();
         std::array<int32_t, QWEN4EXP_MTP_MAX_VERIFY> samples{};
         Qwen4ExpMtpAcceptance decision;
-        bool read_ok = true;
-        for (int i = 0; i < rows; ++i) {
-            const int r = s * rows + i;
+        for (int i = 0; i <= k; ++i) {
+            const int r = first[(size_t)s] + i;
             Qwen4ExpRow row;
             if (how[(size_t)s] == Qwen4ExpRows::greedy) {
                 row.picked = true;
                 samples[(size_t)i] = out.greedy[(size_t)r];
             } else {
-                row.read = [&, r] {
-                    if (row_read != r) {
-                        read_ok = read_ok && qwen4exp_verify_batched_row(verify_workspace_, weights_, r, row_logits);
-                        row_read = r;
-                    }
-                    return (const float *)row_logits.data();
-                };
+                row.read = [&read_row, r] { return read_row(r); };
                 if (how[(size_t)s] == Qwen4ExpRows::lazy && out.top_n > 0) {
                     row.top_n = out.top_n;
                     row.top_vals = out.top_vals.data() + (size_t)r * out.top_n;
@@ -525,7 +594,7 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::batched_verify_step(const StepPlan & pl
         const int retained = decision.n_emitted;
         // The trunk rows of the kept tokens become the pending pairs, as after a solo verify; the last emitted token
         // is the scheduler's to feed back.
-        const float * h = hidden.data() + (size_t)s * rows * hd;
+        const float * h = hidden.data() + (size_t)first[(size_t)s] * hd;
         m.pending.h.assign(h, h + (size_t)retained * hd);
         m.pending.tok.assign(decision.emitted.begin(), decision.emitted.begin() + retained);
         m.pending.pos = pos;
@@ -556,15 +625,29 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::batched_verify_step(const StepPlan & pl
         output.spec_accepted = decision.n_accepted;
         result.decode.push_back(std::move(output));
     }
+    // A one-row slot's live draft state takes its trunk row as a pending pair, as after a plain step, once every row is
+    // read (a catch-up runs a graph).
+    for (int s = 0; s < n; ++s) {
+        MtpState & m = mtp_[(size_t)plan.decode[(size_t)s].slot];
+        if (rows[(size_t)s] > 1 || !m.live) continue;
+        const float * h = hidden.data() + (size_t)first[(size_t)s] * hd;
+        m.pending.tok.push_back(plan.decode[(size_t)s].token);
+        m.pending.h.insert(m.pending.h.end(), h, h + hd);
+        if (m.pending.tok.size() >= kMtpPendingPairs &&
+            !qwen4exp_mtp_catch_up(backend_, weights_, *caches[(size_t)s], m.pending, 0)) {
+            result.error = "qwen4exp MTP catch-up failed";
+            return result;
+        }
+    }
     ggml_backend_synchronize(backend_);
     const auto t1 = std::chrono::steady_clock::now();
     const double step_s = std::chrono::duration<double>(t1 - t0).count();
-    for (const StepInput & input : plan.decode) mtp_[(size_t)input.slot].decode_s += step_s;
+    for (int s = 0; s < n; ++s) if (rows[(size_t)s] > 1) mtp_[(size_t)plan.decode[(size_t)s].slot].decode_s += step_s;
     ++batched_.steps;
     batched_.slots += n;
     batched_.tokens += emitted_total;
     batched_.step_s += step_s;
-    record_mode(n, true, (double)emitted_total, step_s);
+    record_mode(n, drafting_slots(rows), true, (double)emitted_total, step_s);
     batched_.draft_s += std::chrono::duration<double>(t_draft - t0).count();
     batched_.verify_s += std::chrono::duration<double>(t_verify - t_draft).count();
     return result;
@@ -662,8 +745,9 @@ bool Qwen4ExpSeqEngine::reserve_decode(const StepPlan & plan) {
         const int slot = plan.decode[0].slot;
         growth[(size_t)slot] = std::max(1, std::min(caches_[(size_t)slot]->mtp_draft + 1,
                                                     max_context() - slots_.slot(slot).cur_pos));
-    } else if (const int rows = batched_verify_rows(plan)) {
-        for (const StepInput & input : plan.decode) growth[(size_t)input.slot] = rows;
+    } else {
+        const std::vector<int> rows = batched_verify_rows(plan);
+        for (size_t i = 0; i < rows.size(); ++i) growth[(size_t)plan.decode[i].slot] = rows[i];
     }
     const StepPlanLimits limits = step_plan_limits((int)plan.decode.size());
     if (plan.prefills.size() > (size_t)limits.max_prefill_sequences) return false;
@@ -726,9 +810,10 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     }
     if (plan.decode.empty() && plan.prefills.empty()) return result;
     if (mtp_eligible(plan)) return mtp_step(plan.decode[0]);
-    if (const int rows = batched_verify_rows(plan)) return batched_verify_step(plan, rows);
+    const std::vector<int> verify_rows = batched_verify_rows(plan);
+    if (!verify_rows.empty()) return batched_verify_step(plan, verify_rows);
     // A step that could have verified drafts: its time and tokens rate the plain mode (verify_pays), once it succeeded.
-    const bool rate_plain = batched_verify_width(plan) > 0;
+    const int rate_drafting = drafting_slots(batched_verify_shape(plan));
     const auto plain_t0 = std::chrono::steady_clock::now();
 
     struct PendingPrefill {
@@ -879,10 +964,10 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
         }
         result.prefills.push_back(std::move(output));
     }
-    if (rate_plain) {
+    if (rate_drafting > 0) {
         ggml_backend_synchronize(backend_);
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - plain_t0).count();
-        record_mode((int)plan.decode.size(), false, (double)plan.decode.size(), s);
+        record_mode((int)plan.decode.size(), rate_drafting, false, (double)plan.decode.size(), s);
         ++batched_.plain_steps;
     }
     return result;
@@ -921,12 +1006,15 @@ void Qwen4ExpSeqEngine::retire(int slot) {
             1e3 * batched_.draft_s / (double)batched_.steps, 1e3 * batched_.verify_s / (double)batched_.steps,
             (unsigned long long)verify_workspace_.builds, (unsigned long long)verify_workspace_.replays,
             batched_.plain_steps);
-        for (int k = 2; k < (int)mode_rates_.size(); ++k) {
-            const ModeRates & r = mode_rates_[(size_t)k];
-            if (r.steps == 0) continue;
-            std::fprintf(stderr, "[qwen4exp-mtp] %d at once: verify %.1f tok/s (%lld steps), plain %.1f tok/s (%lld)\n",
-                k, r.verify_s > 0 ? r.verify_tokens / r.verify_s : 0.0, r.verify_steps,
-                r.plain_s > 0 ? r.plain_tokens / r.plain_s : 0.0, r.plain_steps);
+        for (int k = 2; k <= kQwen4ExpMaxBatchedSlots; ++k) {
+            for (int d = 1; d <= k; ++d) {
+                const ModeRates & r = mode_rates_[(size_t)mode_index(k, d)];
+                if (r.steps == 0) continue;
+                std::fprintf(stderr,
+                    "[qwen4exp-mtp] %d at once, %d drafting: verify %.1f tok/s (%lld steps), plain %.1f tok/s (%lld)\n",
+                    k, d, r.verify_s > 0 ? r.verify_tokens / r.verify_s : 0.0, r.verify_steps,
+                    r.plain_s > 0 ? r.plain_tokens / r.plain_s : 0.0, r.plain_steps);
+            }
         }
     }
     if (last) batched_ = {};

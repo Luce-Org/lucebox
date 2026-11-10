@@ -48,8 +48,8 @@ int64_t qwen4exp_kv_bucket(int64_t max_ctx, int64_t kv_len, bool qsa);
 
 // The multi-slot decode graph's row ceiling: RDNA3 MMID supports at most four batch-invariant decode rows.
 constexpr int kQwen4ExpMaxBatchedSlots = 4;
-// The rows per slot of a batched verify (qwen4exp_verify_batched): a pending token and three drafts. Two slots fill one
-// batch-invariant product (8 rows).
+// The rows of a drafting slot in a batched verify (qwen4exp_verify_batched): a pending token and three drafts. Two
+// such slots fill one batch-invariant product (8 rows).
 constexpr int kQwen4ExpBatchedVerifyRows = 4;
 
 // What a T=1 decode or verify forward reads back in place of its logits rows (n_vocab floats each: a 5-row verify
@@ -262,22 +262,24 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
 // dense or QSA as a T=1 decode at each row's position is.
 Qwen4ExpGraphMemory qwen4exp_batched_verify_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
     Qwen4ExpCache & cache, int n_slots, int rows, int pos);
-// Every decoding slot's MTP verify in one graph: slot s feeds `rows` tokens (its pending token, then rows - 1 drafts),
-// slot-major in `tokens`, at positions[s] onward. Each row computes what a T=1 decode at its position computes (the
-// slot groups' batch-invariant products, each row's own T=1 attention, each slot's recurrence over its rows), and every
-// slot keeps what its rollback needs as a solo verify does (qwen4exp_verify_rollback). A row past the QSA boundary
-// attends as a stable verify graph's QSA row; slots and rows of both kinds mix freely. Needs every cache with the MTP
+// Every decoding slot's MTP verify in one graph: slot s feeds rows[s] tokens (its pending token, then rows[s] - 1
+// drafts; one row for a slot that drafted nothing), slot-major in `tokens`, at positions[s] onward. Each row computes
+// what a T=1 decode at its position computes (the slot groups' batch-invariant products, each row's own T=1 attention,
+// each slot's recurrence over its rows), and every slot keeps what its rollback needs as a solo verify does
+// (qwen4exp_verify_rollback, which a one-row slot takes too, keeping its row). A row past the QSA boundary attends as a
+// stable verify graph's QSA row; slots and rows of both kinds mix freely. Needs every cache with the MTP
 // rollback state (qwen4exp_verify_supported) and no KVFlash pool, and for QSA rows a backend that serves them in a
 // retained graph (as a multi-slot decode step needs). False: not run (the caller decodes the step plainly). `out`
 // (Qwen4ExpRowOutputs, top_n in) receives each row's argmax and, with top_n > 0, its top_n candidates; the logits rows
 // stay on the device until the next call (qwen4exp_verify_batched_row). hidden: each row's final HC residual
 // (n_embd * n_hc floats), slot-major.
 bool qwen4exp_verify_batched_supported(ggml_backend_t backend, const Qwen4ExpWeights & w,
-                                       Qwen4ExpCache * const * caches, const int32_t * positions, int n_slots,
-                                       int rows);
+                                       Qwen4ExpCache * const * caches, const int32_t * positions, const int * rows,
+                                       int n_slots);
 Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen4ExpWeights & w,
-        Qwen4ExpCache * const * caches, const int32_t * tokens, const int32_t * positions, int n_slots, int rows,
-        Qwen4ExpBatchedDecodeWorkspace & workspace, Qwen4ExpRowOutputs & out, std::vector<float> & hidden);
+        Qwen4ExpCache * const * caches, const int32_t * tokens, const int32_t * positions, const int * rows,
+        int n_slots, Qwen4ExpBatchedDecodeWorkspace & workspace, Qwen4ExpRowOutputs & out,
+        std::vector<float> & hidden);
 // Row `row` (slot-major) of the last qwen4exp_verify_batched's logits, n_vocab floats, into `out`.
 bool qwen4exp_verify_batched_row(const Qwen4ExpBatchedDecodeWorkspace & workspace, const Qwen4ExpWeights & w, int row,
                                  std::vector<float> & out);

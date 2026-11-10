@@ -38,11 +38,13 @@ struct Qwen4ExpRow;
 // loop while it is the only decoder with nothing prefilling, returning accepted drafts as committed tokens (with an
 // adaptive width, prompt-lookup drafts are verified there too). Requests decoding together (or one alone on another
 // slot), greedy or sampled, either draft rows - 1 tokens each and verify them all in one multi-slot graph
-// (qwen4exp_verify_batched; rows is kQwen4ExpBatchedVerifyRows, or fewer when the caches' draft cap is lower), so the
-// experts a step reads serve every slot's drafts, or decode one token each in the batched graph, which still returns
-// each slot's final HC residual, so the draft layers stay caught up and drafting resumes. The step takes the mode
-// that has committed more tokens per second at that many slots (verify_pays), unless a test forces one
-// (set_decode_mode). Every pick is computed where the multi-slot rows compute it, so a request's text does not depend
+// (qwen4exp_verify_batched; rows is kQwen4ExpBatchedVerifyRows, or fewer when the caches' draft cap or the context's
+// end is lower), so the experts a step reads serve every slot's drafts, or decode one token each in the batched graph,
+// which still returns each slot's final HC residual, so the draft layers stay caught up and drafting resumes. A
+// request that cannot draft this step (a grammar, a thinking budget about to close: the plan's allow_speculation; or
+// no live draft state) decodes its one token as a one-row slot of that verify graph, so it does not hold the others'
+// drafts back. The step takes the mode that has committed more tokens per second for that many slots and drafting
+// slots (verify_pays), unless a test forces one (set_decode_mode). Every pick is computed where the multi-slot rows compute it, so a request's text does not depend
 // on the other requests or the mode. The draft layer's state sits in the cache (K/V, mtp_prev_hidden at
 // mtp_prev_pos) at every prompt-chunk boundary, where prefix snapshots capture it.
 class Qwen4ExpSeqEngine final : public SeqEngine {
@@ -113,16 +115,19 @@ private:
     // Sample a verified row as one-token decode samples it after `fed` (pushed to the slot's history): the device's
     // pick for an argmax sampler, the row's top candidates when they settle the draw, else the whole row. False: EOS.
     bool sample_verify_row(SeqSlot & slot, int32_t fed, const Qwen4ExpRow & row, int32_t & token);
-    // The rows per slot a batched verify of this plan could run (every decoding slot drafts, nothing prefills, and
-    // the graph serves their rows), else 0.
-    int batched_verify_width(const StepPlan & plan) const;
-    // That width when the batched verify is this step's mode (verify_pays), else 0.
-    int batched_verify_rows(const StepPlan & plan) const;
-    StepResult batched_verify_step(const StepPlan & plan, int rows);
-    // Whether n decoding slots verify their drafts this step or decode a token each: the mode with more tokens per
-    // second so far at n slots, the other one every kExploreSteps steps so its rate stays current.
-    bool verify_pays(int n) const;
-    void record_mode(int n, bool verify, double tokens, double seconds);
+    // The rows each decoding slot (in plan.decode order) takes in a batched verify of this plan: a slot that drafts
+    // this step (live draft state, speculation allowed) its pending token and drafts, kQwen4ExpBatchedVerifyRows rows
+    // or as many as its draft cap and context allow; any other slot one row, its plain decode. Empty when no slot
+    // drafts, a prompt prefills, or the graph does not serve these rows.
+    std::vector<int> batched_verify_shape(const StepPlan & plan) const;
+    // That shape when the batched verify is this step's mode (verify_pays), else empty.
+    std::vector<int> batched_verify_rows(const StepPlan & plan) const;
+    StepResult batched_verify_step(const StepPlan & plan, const std::vector<int> & rows);
+    // Whether n decoding slots, `drafting` of them with drafts, verify this step or decode a token each: the mode with
+    // more tokens per second so far for that mix, the other one every kExploreSteps steps so its rate stays current.
+    bool verify_pays(int n, int drafting) const;
+    void record_mode(int n, int drafting, bool verify, double tokens, double seconds);
+    int mode_index(int n, int drafting) const;   // into mode_rates_, -1 out of range
 
     ggml_backend_t backend_;
     ggml_backend_t store_;   // checkpoint memory: snapshot_store, else the backend
@@ -144,12 +149,13 @@ private:
         long long steps = 0, slots = 0, tokens = 0, plain_steps = 0;
         double step_s = 0.0, draft_s = 0.0, verify_s = 0.0;
     } batched_;
-    // Per count of decoding slots: each mode's decayed tokens and seconds, and the steps that chose between them.
+    // Per count of decoding slots and of drafting ones among them: each mode's decayed tokens and seconds, and the
+    // steps that chose between them.
     struct ModeRates {
         double verify_tokens = 0.0, verify_s = 0.0, plain_tokens = 0.0, plain_s = 0.0;
         long long verify_steps = 0, plain_steps = 0, steps = 0;
     };
-    std::vector<ModeRates> mode_rates_;   // [0, kQwen4ExpMaxBatchedSlots]
+    std::vector<ModeRates> mode_rates_;   // [decoding slots][drafting slots], each in [0, kQwen4ExpMaxBatchedSlots]
     DecodeMode decode_mode_ = DecodeMode::measured;
     // The adaptive verify width and its costs per context range: the single-slot
     // loop's when the backend passes them (else this engine's own).

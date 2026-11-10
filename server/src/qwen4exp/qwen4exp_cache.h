@@ -107,7 +107,7 @@ struct Qwen4ExpBatchedDecodeWorkspace : Qwen4ExpDecodeWorkspace {
         ggml_tensor * logits = nullptr, * greedy = nullptr, * top_ids = nullptr, * top_vals = nullptr;
     };
     std::vector<GroupInput> groups;
-    int rows = 1;   // per slot: 1 for a decode step, the verify width for a batched verify (qwen4exp_verify_batched)
+    std::vector<int> rows;   // a batched verify (qwen4exp_verify_batched): each slot's rows
     ggml_tensor * slot_ids = nullptr;            // I32 [n]: each slot's slab of Qwen4ExpSlotStates
     // Per slot: attention mask (dense slots) and I32 [1] K/V row. A batched verify: per group, F16 [max span, rows]
     // with a column per row (null when every row is QSA), and per slot its I32 [rows] K/V rows.

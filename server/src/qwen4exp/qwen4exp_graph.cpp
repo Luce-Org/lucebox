@@ -3685,25 +3685,26 @@ static int64_t batched_span(const Qwen4ExpCache & cache, int32_t pos, bool qsa) 
                : qwen4exp_kv_bucket(qwen4exp_attn_cap(cache), kv_len + 256, false);
 }
 
-// The QSA slots of a multi-slot graph with R rows per slot (`spans`: one per row). A slot's rows only move away from
-// the dense prefix, so it has QSA rows when its last row does, and they share that row's K/V bucket. Each such slot
-// reads what a stable graph of its R rows reads (Qwen4ExpDecodeWorkspace::qsa_params, qsa_visibility) and its rows'
-// M-RoPE positions through views of `params` (I32 [10 * rows]), `visibility` (F32, each QSA slot's [blocks, R] in
-// turn) and `positions` (I32 [4 * rows]). A slot's positions are section-major over its R rows when they are all
-// QSA (they attend in one pass), else one [4] group per row. The other slots keep qsa_blocks < 0.
+// The QSA slots of a multi-slot graph with rows[s] rows for slot s (`spans`: one per row, slot-major). A slot's rows
+// only move away from the dense prefix, so it has QSA rows when its last row does, and they share that row's K/V
+// bucket. Each such slot reads what a stable graph of its R rows reads (Qwen4ExpDecodeWorkspace::qsa_params,
+// qsa_visibility) and its rows' M-RoPE positions through views of `params` (I32 [10 * rows]), `visibility` (F32, each
+// QSA slot's [blocks, R] in turn) and `positions` (I32 [4 * rows]). A slot's positions are section-major over its R
+// rows when they are all QSA (they attend in one pass), else one [4] group per row. The other slots keep
+// qsa_blocks < 0.
 static std::vector<Qwen4ExpDecodeWorkspace> slot_qsa_views(ggml_context * ctx, const std::vector<int64_t> & spans,
-        int R, ggml_tensor * params, ggml_tensor * visibility, ggml_tensor * positions) {
-    std::vector<Qwen4ExpDecodeWorkspace> slots(spans.size() / (size_t) R);
-    int64_t offset = 0;
-    for (size_t s = 0; s < slots.size(); ++s) {
-        const int64_t span = spans[s * R + R - 1];
+        const std::vector<int> & rows, ggml_tensor * params, ggml_tensor * visibility, ggml_tensor * positions) {
+    std::vector<Qwen4ExpDecodeWorkspace> slots(rows.size());
+    int64_t offset = 0, r0 = 0;
+    for (size_t s = 0; s < slots.size(); r0 += rows[s++]) {
+        const int64_t R = rows[s], span = spans[(size_t) (r0 + R - 1)];
         if (span >= 0) continue;
         Qwen4ExpDecodeWorkspace & slot = slots[s];
         slot.kv_bucket = -span;
         slot.qsa_blocks = slot.kv_bucket / 4;
-        slot.qsa_params = ggml_view_1d(ctx, params, 10 * R, (size_t) 10 * s * R * sizeof(int32_t));
+        slot.qsa_params = ggml_view_1d(ctx, params, 10 * R, (size_t) (10 * r0) * sizeof(int32_t));
         slot.qsa_visibility = ggml_view_1d(ctx, visibility, slot.qsa_blocks * R, (size_t) offset * sizeof(float));
-        slot.positions = ggml_view_1d(ctx, positions, 4 * R, (size_t) 4 * s * R * sizeof(int32_t));
+        slot.positions = ggml_view_1d(ctx, positions, 4 * R, (size_t) (4 * r0) * sizeof(int32_t));
         offset += slot.qsa_blocks * R;
     }
     return slots;
@@ -3711,13 +3712,16 @@ static std::vector<Qwen4ExpDecodeWorkspace> slot_qsa_views(ggml_context * ctx, c
 
 // The graph's QSA inputs and each slot's views of them (slot_qsa_views) in `ws`: three shared inputs, so a split
 // scheduler still sees few graph inputs. No inputs when no row is QSA.
-static void build_slot_qsa(ggml_context * ctx, const std::vector<int64_t> & spans, int R,
+static void build_slot_qsa(ggml_context * ctx, const std::vector<int64_t> & spans, const std::vector<int> & rows,
                            Qwen4ExpBatchedDecodeWorkspace & ws) {
     const int64_t T = (int64_t) spans.size();
     int64_t cells = 0;   // every QSA slot's [blocks, R] visibility
-    for (int64_t r = R - 1; r < T; r += R) if (spans[(size_t) r] < 0) cells += -spans[(size_t) r] / 4 * R;
+    for (size_t s = 0, r = 0; s < rows.size(); ++s) {
+        r += (size_t) rows[s];   // past the slot's last row
+        if (spans[r - 1] < 0) cells += -spans[r - 1] / 4 * rows[s];
+    }
     ws.qsa_params = ws.qsa_visibility = ws.qsa_positions = nullptr;
-    ws.slot_qsa.assign((size_t) (T / R), {});
+    ws.slot_qsa.assign(rows.size(), {});
     if (cells == 0) return;
     ws.qsa_params = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 10 * T);
     ws.qsa_visibility = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cells);
@@ -3725,34 +3729,35 @@ static void build_slot_qsa(ggml_context * ctx, const std::vector<int64_t> & span
     ggml_set_input(ws.qsa_params);
     ggml_set_input(ws.qsa_visibility);
     ggml_set_input(ws.qsa_positions);
-    ws.slot_qsa = slot_qsa_views(ctx, spans, R, ws.qsa_params, ws.qsa_visibility, ws.qsa_positions);
+    ws.slot_qsa = slot_qsa_views(ctx, spans, rows, ws.qsa_params, ws.qsa_visibility, ws.qsa_positions);
 }
 
-// The graph's QSA inputs: each QSA slot's for its R rows from positions[s], as its stable graph has them
+// The graph's QSA inputs: each QSA slot's for its rows[s] rows from positions[s], as its stable graph has them
 // (fill_stable_qsa), and its rows' M-RoPE positions (slot_qsa_views). The inputs are written whole: a slot's views of
 // them need not be in the graph. `in` keeps the host copies, which outlive the uploads.
 static void upload_slot_qsa(ggml_backend_t backend, bool split, Qwen4ExpCache * const * caches,
-                            const int32_t * positions, const std::vector<int64_t> & spans, int R,
-                            const Qwen4ExpBatchedDecodeWorkspace & ws, Qwen4ExpStableInputs & in) {
+                            const int32_t * positions, const std::vector<int64_t> & spans,
+                            const std::vector<int> & rows, const Qwen4ExpBatchedDecodeWorkspace & ws,
+                            Qwen4ExpStableInputs & in) {
     if (!ws.qsa_params) return;
     const size_t n_slots = ws.slot_qsa.size();
     in.backend = backend;
     in.split = split;
-    in.qsa_params.assign((size_t) 10 * R * n_slots, 0);
-    in.i32.assign((size_t) 4 * R * n_slots, 0);
+    in.qsa_params.assign((size_t) 10 * spans.size(), 0);
+    in.i32.assign((size_t) 4 * spans.size(), 0);
     Qwen4ExpStableInputs slot;
-    slot.T = R;
-    for (size_t s = 0; s < n_slots; ++s) {
+    for (size_t s = 0, r0 = 0; s < n_slots; r0 += (size_t) rows[s++]) {
         if (ws.slot_qsa[s].qsa_blocks < 0) continue;
+        const int R = rows[s];
+        slot.T = R;
         slot.pos0 = positions[s];
         slot.kv_len = (int64_t) positions[s] + R;
         slot.max_ctx = caches[s]->max_ctx;
         fill_stable_qsa(slot, ws.slot_qsa[s].qsa_blocks);
         in.qsa_visibility.insert(in.qsa_visibility.end(), slot.qsa_visibility.begin(), slot.qsa_visibility.end());
-        std::copy(slot.qsa_params.begin(), slot.qsa_params.end(),
-                  in.qsa_params.begin() + (std::ptrdiff_t) (10 * R * s));
-        const bool at_once = spans[s * R] < 0;
-        int32_t * p = in.i32.data() + 4 * R * s;
+        std::copy(slot.qsa_params.begin(), slot.qsa_params.end(), in.qsa_params.begin() + (std::ptrdiff_t) (10 * r0));
+        const bool at_once = spans[r0] < 0;
+        int32_t * p = in.i32.data() + 4 * r0;
         for (int j = 0; j < R; ++j) {
             for (int section = 0; section < 3; ++section)
                 p[at_once ? section * R + j : 4 * j + section] = positions[s] + j;
@@ -3796,7 +3801,7 @@ static bool build_batched_decode_nodes(ggml_context * ctx, const Qwen4ExpWeights
         ggml_set_input(ws.slot_ids);
     }
     // QSA slots: each one's runtime inputs (a stable T=1 graph's) and M-RoPE position.
-    build_slot_qsa(ctx, spans, 1, ws);
+    build_slot_qsa(ctx, spans, std::vector<int>((size_t) n_slots, 1), ws);
 
     // Split mode: the slots form two groups whose layers interleave in the graph like a prompt chunk's streams (see
     // interleave_layers). The matmuls are batch-invariant, so a row computes the same in either group.
@@ -4127,7 +4132,8 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
         ggml_backend_tensor_set(workspace.masks[s], mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
     Qwen4ExpStableInputs qsa_inputs;
-    upload_slot_qsa(backend, split, caches, positions, spans, 1, workspace, qsa_inputs);
+    upload_slot_qsa(backend, split, caches, positions, spans, std::vector<int>((size_t) n_slots, 1), workspace,
+                    qsa_inputs);
     // Match solo MMVQ arithmetic regardless of the number of active slots.
     const ScopedCudaGraphOverrides overrides(false, 0, false, 0, /*mmvq_batch_invariant=*/true);
     if (split && w.hot) w.hot->tick(backend, w);
@@ -4189,15 +4195,16 @@ int verify_group_rows(bool split) { return split ? kVerifyGroupRows : kVerifyWid
 // cover (sample_logits_top_n), 64 for the cards' top_k 20.
 constexpr int kPlanTopN = 64;
 
-// A group's full attention for its slots' verify rows (slot-major, `R` per slot): every slot writes its rows' K/V (and
-// raw indexer keys) at once, then each row attends as a T=1 decode at its position does. A dense row (spans[r] > 0)
-// attends over its own span behind its own mask (column r of `mask`, F16 [max span, rows]), which hides the slot's
-// later rows. A QSA row (spans[r] < 0) attends as a solo verify's does, through its slot's stable inputs (`qsa[s]`,
-// see build_slot_qsa), whose visibility hides the blocks the later rows complete.
+// A group's full attention for its slots' verify rows (slot-major, rows[s] for slot s): every slot writes its rows'
+// K/V (and raw indexer keys) at once, then each row attends as a T=1 decode at its position does. A dense row
+// (spans[r] > 0) attends over its own span behind its own mask (column r of `mask`, F16 [max span, rows]), which hides
+// the slot's later rows. A QSA row (spans[r] < 0) attends as a solo verify's does, through its slot's stable inputs
+// (`qsa[s]`, see build_slot_qsa), whose visibility hides the blocks the later rows complete. A slot of one row (it
+// drafted nothing) attends as a multi-slot decode step's slot does (build_full_attn_slots).
 ggml_tensor * build_full_attn_verify(ggml_context * c, ggml_cgraph * gf, ggml_tensor * qfull, ggml_tensor * kraw,
         ggml_tensor * vraw, ggml_tensor * cur, ggml_tensor * positions, ggml_tensor * mask,
         ggml_tensor * const * kv_rows, const int64_t * spans, const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
-        Qwen4ExpCache * const * caches, int n_slots, int R, int fi, bool indexer,
+        Qwen4ExpCache * const * caches, int n_slots, const int * slot_rows, int fi, bool indexer,
         const Qwen4ExpDecodeWorkspace * qsa) {
     const int64_t D = w.n_embd_head_k, Hq = w.n_head, Hk = w.n_head_kv;
     ggml_tensor * keys = indexer && caches[0]->indexer_raw[(size_t) fi] ? mm(c, L.indexer_k_proj, cur) : nullptr;
@@ -4205,19 +4212,22 @@ ggml_tensor * build_full_attn_verify(ggml_context * c, ggml_cgraph * gf, ggml_te
     ggml_tensor * q = qkv.q, * gate = qkv.gate, * k = qkv.k, * v = qkv.v;
     ggml_tensor * qfa = ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));   // [D, rows, Hq]
     ggml_tensor * rows = nullptr;
-    for (int s = 0; s < n_slots; ++s) {
+    for (int s = 0, r0 = 0; s < n_slots; r0 += slot_rows[s++]) {
+        const int R = slot_rows[s];
         const Qwen4ExpCache & cache = *caches[s];
         ggml_tensor * k_cache = cache.attn_k[(size_t) fi];
         ggml_tensor * v_cache = cache.attn_v[(size_t) fi];
         ggml_tensor * raw = !keys ? nullptr : ggml_set_rows(c, cache.indexer_raw[(size_t) fi],
-            ggml_view_2d(c, keys, keys->ne[0], R, keys->nb[1], (size_t) s * R * keys->nb[1]), kv_rows[s]);
+            ggml_view_2d(c, keys, keys->ne[0], R, keys->nb[1], (size_t) r0 * keys->nb[1]), kv_rows[s]);
         if (raw) ggml_build_forward_expand(gf, raw);
-        auto slot_rows = [&](ggml_tensor * x) {   // [D, Hk, R] -> [D, R, Hk], the cache rows' layout
-            return ggml_cont(c, ggml_permute(c,
-                ggml_view_3d(c, x, D, Hk, R, x->nb[1], x->nb[2], (size_t) s * R * x->nb[2]), 0, 2, 1, 3));
+        // [D, Hk, R] -> [D, R, Hk], the cache rows' layout, which one row's [D, Hk] already is.
+        auto cache_rows = [&](ggml_tensor * x) {
+            const size_t offset = (size_t) r0 * x->nb[2];
+            return R == 1 ? ggml_reshape_3d(c, ggml_view_2d(c, x, D, Hk, x->nb[1], offset), D, 1, Hk)
+                : ggml_cont(c, ggml_permute(c, ggml_view_3d(c, x, D, Hk, R, x->nb[1], x->nb[2], offset), 0, 2, 1, 3));
         };
-        ggml_tensor * kw = ggml_set_rows(c, k_cache, slot_rows(k), kv_rows[s]);
-        ggml_tensor * vw = ggml_set_rows(c, v_cache, slot_rows(v), kv_rows[s]);
+        ggml_tensor * kw = ggml_set_rows(c, k_cache, cache_rows(k), kv_rows[s]);
+        ggml_tensor * vw = ggml_set_rows(c, v_cache, cache_rows(v), kv_rows[s]);
         ggml_build_forward_expand(gf, kw);
         ggml_build_forward_expand(gf, vw);
         // The slot's QSA rows, as the stable verify graph has them: the writes are the attention's and the pooling's
@@ -4230,20 +4240,20 @@ ggml_tensor * build_full_attn_verify(ggml_context * c, ggml_cgraph * gf, ggml_te
             kqsa = ggml_view_3d(c, kw, D, sq.kv_bucket, Hk, kw->nb[1], kw->nb[2], 0);
             vqsa = ggml_view_3d(c, vw, D, sq.kv_bucket, Hk, vw->nb[1], vw->nb[2], 0);
         }
-        if (spans[s * R] < 0) {
+        if (R > 1 && spans[r0] < 0) {
             // Every row of the slot is QSA: one pass scores, selects and attends for them all, each with its T=1
             // arithmetic (see build_full_attn).
             const Qwen4ExpQsaRow in = qsa_rows_all(c, sq, R);
             ggml_tensor * attn = build_qsa_attn(c,
-                ggml_view_2d(c, cur, cur->ne[0], R, cur->nb[1], (size_t) s * R * cur->nb[1]),
-                ggml_view_3d(c, q, D, Hq, R, q->nb[1], q->nb[2], (size_t) s * R * q->nb[2]),
+                ggml_view_2d(c, cur, cur->ne[0], R, cur->nb[1], (size_t) r0 * cur->nb[1]),
+                ggml_view_3d(c, q, D, Hq, R, q->nb[1], q->nb[2], (size_t) r0 * q->nb[2]),
                 kqsa, vqsa, L, w, qsa_ratio(w), sq.positions, 0, pooled, sq.qsa_blocks, false, &in);
             attn = ggml_reshape_2d(c, attn, D * Hq, R);
             rows = rows ? ggml_concat(c, rows, attn, 1) : attn;
             continue;
         }
         for (int j = 0; j < R; ++j) {
-            const int r = s * R + j;
+            const int r = r0 + j;
             const int64_t span = spans[r];
             ggml_tensor * attn;
             if (span < 0) {
@@ -4268,16 +4278,83 @@ ggml_tensor * build_full_attn_verify(ggml_context * c, ggml_cgraph * gf, ggml_te
     return ggml_mul(c, rows, ggml_sigmoid(c, gate));
 }
 
-// The batched verify graph's nodes and inputs, in `ctx` and `ws`; nothing is allocated. The slots form groups of
-// whole slots of at most kVerifyGroupRows rows (two or more in split mode, whose layers interleave as a multi-slot
-// decode step's do); each group runs a solo verify's layer pieces over its rows, with each slot's attention rows,
-// recurrence and PLE convolution against the slot's own cache. `spans`: each row's (verify_row_spans). top_n > 0 adds
-// each row's top_n candidates.
+// Each slot's first row in the slot-major layout of rows[s] rows for slot s, and at [n_slots] the row count.
+std::vector<int> verify_row_offsets(const int * rows, int n_slots) {
+    std::vector<int> row0((size_t) n_slots + 1, 0);
+    for (int s = 0; s < n_slots; ++s) row0[(size_t) s + 1] = row0[(size_t) s] + rows[s];
+    return row0;
+}
+
+// The slots as groups of whole slots, in order, of at most verify_group_rows rows each: as few groups as hold them
+// (two or more in split mode, whose layers interleave as a multi-slot decode step's do), filled evenly (the lowest
+// row limit that keeps that count). Returns each group's first slot, then n_slots.
+std::vector<int> verify_groups(const int * rows, int n_slots, bool split) {
+    const int most = verify_group_rows(split);
+    auto pack = [&](int limit) {
+        std::vector<int> first{0};
+        for (int s = 0, n = 0; s < n_slots; n += rows[s++]) {
+            if (n + rows[s] <= limit) continue;
+            first.push_back(s);
+            n = 0;
+        }
+        first.push_back(n_slots);
+        return first;
+    };
+    const std::vector<int> fewest = pack(most);
+    const size_t n_groups = std::max(fewest.size() - 1, (size_t) (split && n_slots >= 2 ? 2 : 1));
+    for (int limit = *std::max_element(rows, rows + n_slots); limit < most; ++limit) {
+        std::vector<int> even = pack(limit);
+        if (even.size() - 1 <= n_groups) return even;
+    }
+    return fewest;
+}
+
+// A batched verify group's PLE layer (its pi-th) over the slots' rows, back to back in `hidden` [n_embd, n_hc, T] and
+// `ple_in` [ple dim, T]: each slot's convolution over its own rows and history (writing each row's history to its
+// rollback rows), as its solo verify runs it.
+ggml_tensor * build_ple_verify(ggml_context * c, ggml_cgraph * gf, ggml_tensor * hidden, ggml_tensor * ple_in,
+        const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, Qwen4ExpCache * const * caches, int n_slots,
+        const int * rows, int pi) {
+    ggml_tensor * out = nullptr;
+    for (int s = 0, r0 = 0; s < n_slots; r0 += rows[s++]) {
+        ggml_tensor * h = ggml_view_3d(c, hidden, hidden->ne[0], hidden->ne[1], rows[s], hidden->nb[1],
+                                       hidden->nb[2], (size_t) r0 * hidden->nb[2]);
+        ggml_tensor * e = ggml_view_2d(c, ple_in, ple_in->ne[0], rows[s], ple_in->nb[1], (size_t) r0 * ple_in->nb[1]);
+        ggml_tensor * row = build_ple(c, gf, h, e, L, w, caches[s]->ple_conv_state[(size_t) pi], caches[s]->spec_ple);
+        out = out ? ggml_concat(c, out, row, 2) : row;
+    }
+    return out;
+}
+
+// A batched verify group's linear attention layer (its li-th) over the slots' rows, back to back in `cur`: the input
+// projections and ssm_out run once over all rows (a solo verify's rows take ssm_out's F32 path too: the fused F16 one
+// starts at 512 rows); each slot's conv and recurrence over its own rows and state, writing every row's state to its
+// rollback rows and its replay log to spec_log[s * log_stride], as its solo verify runs them.
+ggml_tensor * build_linear_attn_verify(ggml_context * c, ggml_cgraph * gf, ggml_tensor * cur, const Qwen4ExpLayer & L,
+        const Qwen4ExpWeights & w, Qwen4ExpCache * const * caches, int n_slots, const int * rows, int li,
+        ggml_tensor ** spec_log, size_t log_stride) {
+    const Qwen4ExpLinearProj p = linear_attn_proj(c, gf, cur, L, /*step_rows=*/true);
+    ggml_tensor * out = nullptr;
+    for (int s = 0, r0 = 0; s < n_slots; r0 += rows[s++]) {
+        Qwen4ExpCache & cache = *caches[s];
+        ggml_tensor * row = linear_attn_rows(c, gf, linear_attn_proj_rows(c, p, r0, rows[s]), L, w,
+            cache.ssm_state[(size_t) li], cache.conv_state[(size_t) li], cache.spec_slot0,
+            &spec_log[(size_t) s * log_stride], cache.spec_conv[(size_t) li], /*project=*/false);
+        out = out ? ggml_concat(c, out, row, 1) : row;
+    }
+    return ggml_reshape_2d(c, mm(c, L.ssm_out, out), w.n_embd, cur->ne[1]);
+}
+
+// The batched verify graph's nodes and inputs, in `ctx` and `ws`; nothing is allocated. Slot s has rows[s] rows: its
+// pending token and its drafts, or one row when it drafted nothing. The slots form groups (verify_groups); each group
+// runs a solo verify's layer pieces over its rows, with each slot's attention rows, recurrence and PLE convolution
+// against the slot's own cache. `spans`: each row's (verify_row_spans). top_n > 0 adds each row's top_n candidates.
 bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Qwen4ExpCache * const * caches,
-        int n_slots, int R, bool has_ple, const std::vector<int64_t> & spans, int top_n,
+        int n_slots, const int * rows, bool has_ple, const std::vector<int64_t> & spans, int top_n,
         Qwen4ExpBatchedDecodeWorkspace & ws) {
     const bool split = w.expert_backend != nullptr;
-    const int64_t T = (int64_t) n_slots * R;
+    const std::vector<int> row0 = verify_row_offsets(rows, n_slots);
+    const int64_t T = row0[(size_t) n_slots];
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, kQwen4ExpGraphNodes, false);
     if (!gf) return false;
     ws.expert_nodes.clear();
@@ -4294,17 +4371,19 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
     const size_t n_linear = caches[0]->linear_layer_ids.size();
     ws.spec_log.assign((size_t) n_slots * n_linear, nullptr);
     for (int s = 0; s < n_slots; ++s) {
-        ws.kv_rows.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_I32, R));
+        ws.kv_rows.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rows[s]));
         ggml_set_input(ws.kv_rows.back());
     }
     ws.slot_ids = nullptr;
-    // QSA slots: each one's runtime inputs (a stable verify graph's of R rows) and M-RoPE positions, and their views
-    // of the inputs' copy on the expert device for the layers that run there (as a group's masks).
-    build_slot_qsa(ctx, spans, R, ws);
+    // QSA slots: each one's runtime inputs (a stable verify graph's of its rows) and M-RoPE positions, and their
+    // views of the inputs' copy on the expert device for the layers that run there (as a group's masks).
+    const std::vector<int> slot_rows(rows, rows + n_slots);
+    build_slot_qsa(ctx, spans, slot_rows, ws);
     std::vector<Qwen4ExpDecodeWorkspace> slot_qsa_remote;
 
     struct SlotGroup {
         int s0 = 0, ns = 0;   // its slots
+        int r0 = 0, n = 0;    // its rows
         ggml_tensor * res_hc = nullptr, * xn_next = nullptr, * inject = nullptr;
         ggml_tensor * positions = nullptr, * routed = nullptr;
         // Its dense rows' masks (one input; null when every row is QSA), and their copy on the expert device for the
@@ -4312,45 +4391,35 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
         ggml_tensor * mask = nullptr, * mask_remote = nullptr;
         Qwen4ExpMoeRoute route;
     };
-    const int per_group = std::max(1, verify_group_rows(split) / R);
-    int n_groups = (n_slots + per_group - 1) / per_group;
-    if (split && n_groups < 2 && n_slots >= 2) n_groups = 2;
+    const std::vector<int> first = verify_groups(rows, n_slots, split);
+    const int n_groups = (int) first.size() - 1;
     std::vector<SlotGroup> groups((size_t) n_groups);
-    for (int g = 0, s0 = 0; g < n_groups; ++g) {
+    for (int g = 0; g < n_groups; ++g) {
         SlotGroup & G = groups[(size_t) g];
-        G.s0 = s0;
-        G.ns = n_slots / n_groups + (g < n_slots % n_groups ? 1 : 0);
-        s0 += G.ns;
-        const int64_t n = (int64_t) G.ns * R;
+        G.s0 = first[(size_t) g];
+        G.ns = first[(size_t) g + 1] - G.s0;
+        G.r0 = row0[(size_t) G.s0];
+        G.n = row0[(size_t) (G.s0 + G.ns)] - G.r0;
+        const int64_t n = G.n;
         int64_t span = 0;
-        for (int64_t r = (int64_t) G.s0 * R; r < (int64_t) (G.s0 + G.ns) * R; ++r)
-            span = std::max(span, spans[(size_t) r]);
+        for (int r = G.r0; r < G.r0 + G.n; ++r) span = std::max(span, spans[(size_t) r]);
         if (span > 0) {
             G.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, span, n);
             ggml_set_input(G.mask);
         }
         ws.masks.push_back(G.mask);
         ggml_tensor * emb = ggml_view_2d(ctx, ws.inp_emb, w.n_embd, n, ws.inp_emb->nb[1],
-                                         (size_t) G.s0 * R * ws.inp_emb->nb[1]);
+                                         (size_t) G.r0 * ws.inp_emb->nb[1]);
         G.res_hc = repeat_dim1(ctx, ggml_reshape_3d(ctx, emb, w.n_embd, 1, n), w.n_hc);
     }
 
     auto stage_r = [&](SlotGroup & G, int il) {
         const Qwen4ExpLayer & L = w.layers[il];
-        const int64_t n = (int64_t) G.ns * R;
+        const int64_t n = G.n;
         Qwen4ExpCache * const * gc = caches + G.s0;
         if (L.is_ple && has_ple) {
-            ggml_tensor * rows = nullptr;
-            for (int j = 0; j < G.ns; ++j) {
-                ggml_tensor * hidden = ggml_view_3d(ctx, G.res_hc, w.n_embd, w.n_hc, R,
-                    G.res_hc->nb[1], G.res_hc->nb[2], (size_t) j * R * G.res_hc->nb[2]);
-                ggml_tensor * ple = ggml_view_2d(ctx, ws.ple_in, ws.ple_in->ne[0], R, ws.ple_in->nb[1],
-                    (size_t) (G.s0 + j) * R * ws.ple_in->nb[1]);
-                ggml_tensor * row = build_ple(ctx, gf, hidden, ple, L, w,
-                    gc[j]->ple_conv_state[(size_t) lb.ple_idx[il]], gc[j]->spec_ple);
-                rows = rows ? ggml_concat(ctx, rows, row, 2) : row;
-            }
-            G.res_hc = rows;
+            G.res_hc = build_ple_verify(ctx, gf, G.res_hc, ggml_view_2d(ctx, ws.ple_in, ws.ple_in->ne[0], n,
+                ws.ple_in->nb[1], (size_t) G.r0 * ws.ple_in->nb[1]), L, w, gc, G.ns, rows + G.s0, lb.ple_idx[il]);
             G.xn_next = nullptr;
         }
         ggml_tensor * cur = lb.attn_input(il, G.res_hc, G.xn_next, G.inject);
@@ -4370,7 +4439,7 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
                     if (G.mask && !G.mask_remote) G.mask_remote = ggml_cont(ctx, G.mask);
                     mask = G.mask_remote;
                     if (ws.qsa_params && slot_qsa_remote.empty()) {
-                        slot_qsa_remote = slot_qsa_views(ctx, spans, R, ggml_cont(ctx, ws.qsa_params),
+                        slot_qsa_remote = slot_qsa_views(ctx, spans, slot_rows, ggml_cont(ctx, ws.qsa_params),
                             ggml_cont(ctx, ws.qsa_visibility), ggml_cont(ctx, ws.qsa_positions));
                     }
                     if (ws.qsa_params) qsa = slot_qsa_remote.data();
@@ -4379,25 +4448,13 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
                 ggml_tensor * kraw = mm(ctx, L.wk, cur);
                 ggml_tensor * vraw = mm(ctx, L.wv, cur);
                 return mm(ctx, L.wo, build_full_attn_verify(ctx, gf, qfull, kraw, vraw, cur, G.positions, mask,
-                    ws.kv_rows.data() + G.s0, spans.data() + (size_t) G.s0 * R, L, w, gc, G.ns, R, fi, w.qsa,
+                    ws.kv_rows.data() + G.s0, spans.data() + G.r0, L, w, gc, G.ns, rows + G.s0, fi, w.qsa,
                     qsa + G.s0));
             });
         } else {
-            // The input projections run over the group's rows; each slot's conv and recurrence over its own rows and
-            // state (writing every row's state to its rollback rows), as its solo verify runs them.
             const int li = lb.lin_idx[il];
-            const Qwen4ExpLinearProj p = linear_attn_proj(ctx, gf, cur, L, /*step_rows=*/true);
-            // ssm_out runs once over the group's gated-norm rows (a solo verify's R rows take its F32 path too: the
-            // fused F16 one starts at 512 rows).
-            ggml_tensor * rows = nullptr;
-            for (int j = 0; j < G.ns; ++j) {
-                ggml_tensor * row = linear_attn_rows(ctx, gf, linear_attn_proj_rows(ctx, p, (int64_t) j * R, R), L, w,
-                    gc[j]->ssm_state[(size_t) li], gc[j]->conv_state[(size_t) li], gc[j]->spec_slot0,
-                    &ws.spec_log[(size_t) (G.s0 + j) * n_linear + (size_t) li], gc[j]->spec_conv[(size_t) li],
-                    /*project=*/false);
-                rows = rows ? ggml_concat(ctx, rows, row, 1) : row;
-            }
-            cur = ggml_reshape_2d(ctx, mm(ctx, L.ssm_out, rows), w.n_embd, n);
+            cur = build_linear_attn_verify(ctx, gf, cur, L, w, gc, G.ns, rows + G.s0, li,
+                &ws.spec_log[(size_t) G.s0 * n_linear + (size_t) li], n_linear);
         }
         if (!split || !qwen4exp_split_layer(L, w)) {
             G.res_hc = lb.ffn_half(il, cur, G.inject, G.res_hc, n, G.xn_next);
@@ -4416,8 +4473,7 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
     };
     auto stage_c = [&](SlotGroup & G, int il) {
         if (!G.route.sel) return;
-        G.res_hc = lb.ffn_output(il, moe_join(ctx, G.routed, G.route.shared), G.inject, G.res_hc,
-                                 (int64_t) G.ns * R, G.xn_next);
+        G.res_hc = lb.ffn_output(il, moe_join(ctx, G.routed, G.route.shared), G.inject, G.res_hc, G.n, G.xn_next);
         G.route = {};
         if (G.xn_next) ggml_build_forward_expand(gf, G.xn_next);
         ggml_build_forward_expand(gf, G.res_hc);
@@ -4437,7 +4493,7 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
     ws.groups.clear();
     ggml_tensor * res_hc = nullptr;
     for (SlotGroup & G : groups) {
-        Qwen4ExpBatchedDecodeWorkspace::GroupInput out{G.positions, G.s0 * R, G.ns * R};
+        Qwen4ExpBatchedDecodeWorkspace::GroupInput out{G.positions, G.r0, G.n};
         out.logits = build_lm_head(ctx, gf, w, lb.output_mix(G.res_hc, G.xn_next), split ? &ws.expert_nodes : nullptr);
         out.greedy = ggml_argmax(ctx, out.logits);
         if (top_n > 0) {
@@ -4459,7 +4515,7 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
     ggml_set_output(ws.hidden);
     ggml_build_forward_expand(gf, ws.hidden);
     ws.gf = gf;
-    ws.rows = R;
+    ws.rows = slot_rows;
     ws.top_n = top_n;
     return true;
 }
@@ -4467,12 +4523,12 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
 // A verify row's span: a T=1 decode's at that position in the multi-slot graph (batched_span), dense or QSA as that
 // decode is. A slot's QSA rows share the K/V bucket of its last row, as its solo verify's do.
 std::vector<int64_t> verify_row_spans(const Qwen4ExpWeights & w, Qwen4ExpCache * const * caches,
-                                      const int32_t * positions, int n_slots, int R) {
+                                      const int32_t * positions, const int * rows, int n_slots) {
     std::vector<int64_t> spans;
     for (int s = 0; s < n_slots; ++s) {
-        for (int j = 0; j < R; ++j) {
+        for (int j = 0; j < rows[s]; ++j) {
             const bool qsa = qsa_mode(w, *caches[s], 1, positions[s] + j, w.qsa) != QSA_DENSE;
-            spans.push_back(batched_span(*caches[s], positions[s] + (qsa ? R - 1 : j), qsa));
+            spans.push_back(batched_span(*caches[s], positions[s] + (qsa ? rows[s] - 1 : j), qsa));
         }
     }
     return spans;
@@ -4492,10 +4548,11 @@ Qwen4ExpGraphMemory qwen4exp_batched_verify_graph_memory(ggml_backend_t backend,
     // An allocation plan only: the slots share one cache and nothing runs.
     std::vector<Qwen4ExpCache *> caches((size_t) n_slots, &cache);
     std::vector<int32_t> positions((size_t) n_slots, pos);
+    const std::vector<int> slot_rows((size_t) n_slots, rows);
     Qwen4ExpBatchedDecodeWorkspace plan;
-    if (build_batched_verify_nodes(ctx, w, caches.data(), n_slots, rows,
+    if (build_batched_verify_nodes(ctx, w, caches.data(), n_slots, slot_rows.data(),
             w.ple_reader.available() && !cache.ple_layer_ids.empty(),
-            verify_row_spans(w, caches.data(), positions.data(), n_slots, rows), kPlanTopN, plan)) {
+            verify_row_spans(w, caches.data(), positions.data(), slot_rows.data(), n_slots), kPlanTopN, plan)) {
         memory.graph = 0;
         graph_memory(backend, ctx, plan.gf, w.gfx1151, memory);
     }
@@ -4504,11 +4561,13 @@ Qwen4ExpGraphMemory qwen4exp_batched_verify_graph_memory(ggml_backend_t backend,
 }
 
 bool qwen4exp_verify_batched_supported(ggml_backend_t backend, const Qwen4ExpWeights & w,
-                                       Qwen4ExpCache * const * caches, const int32_t * positions, int n_slots,
-                                       int rows) {
-    if (n_slots < 1 || n_slots > kQwen4ExpMaxBatchedSlots || rows < 2 || rows > kVerifyGroupRows) return false;
+                                       Qwen4ExpCache * const * caches, const int32_t * positions, const int * slot_rows,
+                                       int n_slots) {
+    if (n_slots < 1 || n_slots > kQwen4ExpMaxBatchedSlots || !slot_rows) return false;
     for (int s = 0; s < n_slots; ++s) {
         const Qwen4ExpCache * c = caches[s];
+        const int rows = slot_rows[s];
+        if (rows < 1 || rows > kVerifyGroupRows) return false;
         if (!c || !qwen4exp_verify_supported(*c) || rows > c->mtp_draft + 1 || c->kvflash ||
             positions[s] < 0 || positions[s] + rows > c->max_ctx ||
             c->linear_layer_ids != caches[0]->linear_layer_ids || c->full_layer_ids != caches[0]->full_layer_ids ||
@@ -4522,8 +4581,8 @@ bool qwen4exp_verify_batched_supported(ggml_backend_t backend, const Qwen4ExpWei
 }
 
 Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen4ExpWeights & w,
-        Qwen4ExpCache * const * caches, const int32_t * tokens, const int32_t * positions, int n_slots, int R,
-        Qwen4ExpBatchedDecodeWorkspace & ws, Qwen4ExpRowOutputs & out, std::vector<float> & hidden) {
+        Qwen4ExpCache * const * caches, const int32_t * tokens, const int32_t * positions, const int * rows,
+        int n_slots, Qwen4ExpBatchedDecodeWorkspace & ws, Qwen4ExpRowOutputs & out, std::vector<float> & hidden) {
     Qwen4ExpForwardResult result;
     const int top_n = std::max(0, out.top_n);
     out.on_device = false;
@@ -4532,11 +4591,21 @@ Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen
     out.top_ids.clear();
     hidden.clear();
     if (!backend || !caches || !tokens || !positions ||
-        !qwen4exp_verify_batched_supported(backend, w, caches, positions, n_slots, R)) return result;
+        !qwen4exp_verify_batched_supported(backend, w, caches, positions, rows, n_slots)) return result;
     const bool split = w.expert_backend != nullptr;
     const Qwen4ExpCudaScope profile(w.gfx1151 || w.expert_gfx1151);
     const bool has_ple = w.ple_reader.available() && !caches[0]->ple_layer_ids.empty();
-    const int64_t T = (int64_t) n_slots * R;
+    const std::vector<int> slot_rows(rows, rows + n_slots), row0 = verify_row_offsets(rows, n_slots);
+    const int64_t T = row0[(size_t) n_slots];
+    // Each row's slot and position.
+    std::vector<int> row_slot((size_t) T);
+    std::vector<int32_t> row_pos((size_t) T);
+    for (int s = 0; s < n_slots; ++s) {
+        for (int j = 0; j < rows[s]; ++j) {
+            row_slot[(size_t) (row0[(size_t) s] + j)] = s;
+            row_pos[(size_t) (row0[(size_t) s] + j)] = positions[s] + j;
+        }
+    }
 
     // Each slot's embeddings and PLE rows (as its solo verify prepares them), and its rows' PLE n-gram tails for the
     // rollback to keep.
@@ -4544,7 +4613,8 @@ Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen
     emb.reserve((size_t) w.n_embd * T);
     for (int s = 0; s < n_slots; ++s) {
         Qwen4ExpCache & cache = *caches[s];
-        const int32_t * tok = tokens + (size_t) s * R;
+        const int R = rows[s];
+        const int32_t * tok = tokens + row0[(size_t) s];
         const Qwen4ExpInputs in = qwen4exp_prepare_inputs(w, tok, R, cache.ple_prev);
         if (!in.ok || in.emb.size() != (size_t) w.n_embd * R) return result;
         emb.insert(emb.end(), in.emb.begin(), in.emb.end());
@@ -4561,18 +4631,18 @@ Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen
     }
     if (has_ple && ple.size() != (size_t) w.ple_head_dim * w.ple_n_heads * T) return result;
 
-    const std::vector<int64_t> spans = verify_row_spans(w, caches, positions, n_slots, R);
+    const std::vector<int64_t> spans = verify_row_spans(w, caches, positions, rows, n_slots);
     for (int s = 0; s < n_slots; ++s) {
         // A slot with QSA rows pools as its graph goes, from the already-pooled prefix.
-        if (spans[(size_t) s * R + R - 1] < 0 && caches[s]->indexer_blocks < positions[s] / 4 &&
+        if (spans[(size_t) row0[(size_t) s + 1] - 1] < 0 && caches[s]->indexer_blocks < positions[s] / 4 &&
             !bootstrap_qsa_prefix(backend, w, *caches[s], positions[s])) return result;
     }
-    const bool replay = ws.gf && ws.rows == R && ws.top_n == top_n &&
+    const bool replay = ws.gf && ws.rows == slot_rows && ws.top_n == top_n &&
         !stable_workspace_stale(ws, backend, w, caches[0]->max_ctx) &&
         ws.spans == spans && ws.caches == std::vector<const Qwen4ExpCache *>(caches, caches + n_slots);
     if (!replay) {
         ggml_context * ctx = graph_context(&ws, backend, w, caches[0]->max_ctx, /*verify=*/true);
-        if (!ctx || !build_batched_verify_nodes(ctx, w, caches, n_slots, R, has_ple, spans, top_n, ws)) {
+        if (!ctx || !build_batched_verify_nodes(ctx, w, caches, n_slots, rows, has_ple, spans, top_n, ws)) {
             clear_qwen4exp_batched_decode_workspace(ws);
             return result;
         }
@@ -4596,15 +4666,14 @@ Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen
         if (!G.positions) continue;
         std::vector<int32_t> p((size_t) 4 * G.n, 0);
         for (int j = 0; j < G.n; ++j) {
-            const int r = G.s0 + j;
-            for (int section = 0; section < 3; ++section) p[(size_t) section * G.n + j] = positions[r / R] + r % R;
+            for (int section = 0; section < 3; ++section) p[(size_t) section * G.n + j] = row_pos[(size_t) (G.s0 + j)];
         }
         ggml_backend_tensor_set(G.positions, p.data(), 0, p.size() * sizeof(int32_t));
     }
     for (int s = 0; s < n_slots; ++s) {
-        std::vector<int32_t> rows((size_t) R);
-        for (int j = 0; j < R; ++j) rows[(size_t) j] = qwen4exp_kv_row(*caches[s], positions[s] + j);
-        ggml_backend_tensor_set(ws.kv_rows[(size_t) s], rows.data(), 0, rows.size() * sizeof(int32_t));
+        std::vector<int32_t> kv((size_t) rows[s]);
+        for (int j = 0; j < rows[s]; ++j) kv[(size_t) j] = qwen4exp_kv_row(*caches[s], positions[s] + j);
+        ggml_backend_tensor_set(ws.kv_rows[(size_t) s], kv.data(), 0, kv.size() * sizeof(int32_t));
     }
     for (size_t g = 0; g < ws.groups.size(); ++g) {
         // Column j: dense row G.s0 + j's causal mask over its span; past the span, and for a QSA row, nothing reads.
@@ -4616,13 +4685,13 @@ Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen
         for (int j = 0; j < G.n; ++j) {
             const int r = G.s0 + j;
             if (spans[(size_t) r] < 0) continue;
-            qwen4exp_causal_mask(*caches[r / R], mask.data() + (size_t) j * cols, spans[(size_t) r],
-                                 positions[r / R] + r % R);
+            qwen4exp_causal_mask(*caches[row_slot[(size_t) r]], mask.data() + (size_t) j * cols, spans[(size_t) r],
+                                 row_pos[(size_t) r]);
         }
         ggml_backend_tensor_set(m, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
     Qwen4ExpStableInputs qsa_inputs;
-    upload_slot_qsa(backend, split, caches, positions, spans, R, ws, qsa_inputs);
+    upload_slot_qsa(backend, split, caches, positions, spans, slot_rows, ws, qsa_inputs);
     const ScopedCudaGraphOverrides overrides(false, 0, false, 0, /*mmvq_batch_invariant=*/true,
                                              /*mmvq_invariant_max_ncols=*/verify_group_rows(split));
     if (split && w.hot) w.hot->tick(backend, w);
@@ -4651,7 +4720,8 @@ Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen
     ggml_backend_tensor_get(ws.hidden, hidden.data(), 0, hidden.size() * sizeof(float));
     const size_t n_linear = caches[0]->linear_layer_ids.size();
     for (int s = 0; s < n_slots; ++s) {
-        if (spans[(size_t) s * R + R - 1] < 0) caches[s]->indexer_blocks = (positions[s] + R) / 4;
+        const int R = rows[s];
+        if (spans[(size_t) row0[(size_t) s + 1] - 1] < 0) caches[s]->indexer_blocks = (positions[s] + R) / 4;
         caches[s]->spec_pos = positions[s];
         caches[s]->spec_tokens = R;
         caches[s]->spec_log.assign(ws.spec_log.begin() + (std::ptrdiff_t) (s * n_linear),
