@@ -86,6 +86,9 @@ Qwen4ExpGraphMemory qwen4exp_graph_memory(ggml_backend_t backend, const Qwen4Exp
     Qwen4ExpCache & cache, int n_tokens, int pos0, bool verify = false);
 Qwen4ExpGraphMemory qwen4exp_mtp_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
     Qwen4ExpCache & cache, int n_tokens, int pos0);
+// One later rank's graph of qwen4exp_mtp_draft_slots: n_slots draft rows at `pos` (the cache stands in for each).
+Qwen4ExpGraphMemory qwen4exp_mtp_rank_slots_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
+    Qwen4ExpCache & cache, int n_slots, int pos);
 // The multi-slot decode graph of n_slots rows, each at `pos` (dense, or as QSA rows).
 Qwen4ExpGraphMemory qwen4exp_batched_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
     Qwen4ExpCache & cache, int n_slots, int pos, bool qsa);

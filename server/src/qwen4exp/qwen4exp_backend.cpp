@@ -291,6 +291,15 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
             batched_verify = std::max(batched_verify, resident);
         }
         batched += batched_verify;
+        // And the batched draft's later ranks (qwen4exp_mtp_draft_slots: ranks 1 .. verify_rows - 2), each a graph of
+        // every slot's row, attending over the widest draft K/V span.
+        if (mtp && verify_rows > 2) {
+            const Qwen4ExpGraphMemory m = qwen4exp_mtp_rank_slots_graph_memory(backend, w, cache, slots,
+                                                                                cache.max_ctx - 1);
+            size_t resident = 0;
+            if (!retain(m, resident)) return 0;
+            batched += (size_t) (verify_rows - 2) * resident;
+        }
     }
     // The decode workspaces stay resident while the next prompt prefills.
     const size_t fixed = (slots - resident_slots) * slot_state + (slots - 1) * slot_draft + shadow + shadow_tmp +

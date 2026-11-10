@@ -3244,6 +3244,81 @@ bool mtp_draft_read(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpC
     return true;
 }
 
+// The metadata a rank graph needs (tensors, graph, a margin).
+size_t mtp_rank_graph_bytes() {
+    return ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false) + (1u << 16);
+}
+
+// The nodes of rank `rank`'s graph over n slots (mtp_rank_slots) in ctx, slot s attending over spans[s] draft keys;
+// ws.positions, ws.kv_row and ws.mask are its inputs.
+ggml_cgraph * build_mtp_rank_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Qwen4ExpCache * const * caches,
+                                   const std::vector<int64_t> & spans, int n, int rank,
+                                   Qwen4ExpBatchedDecodeWorkspace & ws) {
+    const int64_t H = w.n_embd, hc = w.n_hc, D = w.n_embd_head_k, Hq = w.n_head, Hk = w.n_head_kv;
+    const int64_t max_span = *std::max_element(spans.begin(), spans.end());
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
+    ws.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
+    ws.kv_row = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+    ws.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, max_span, n);
+    for (ggml_tensor * t : {ws.positions, ws.kv_row, ws.mask}) ggml_set_input(t);
+    ggml_tensor * emb = nullptr, * hid = nullptr;
+    for (int s = 0; s < n; ++s) {
+        ggml_tensor * e = ggml_get_rows(ctx, w.mtp_embd,
+            ggml_view_1d(ctx, caches[s]->mtp_chain_ids, 1, (rank - 1) * sizeof(int32_t)));
+        emb = emb ? ggml_concat(ctx, emb, e, 1) : e;
+        hid = hid ? ggml_concat(ctx, hid, caches[s]->mtp_chain_hidden, 1) : caches[s]->mtp_chain_hidden;
+    }
+    ggml_tensor * res = mtp_input(ctx, w, emb, hid);
+    const Qwen4ExpLayer & L = w.mtp;
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * cur = hc_mix(ctx, gf, res, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject,
+                               &inject, H, hc, w.rms_eps);
+    // The draft layer's attention: one row per slot against its own draft K/V (as its stable rank graph attends).
+    ggml_tensor * qfull = mm(ctx, L.wq, cur);
+    const Qwen4ExpAttnQkv qkv = attn_qkv(ctx, L, w, qfull, mm(ctx, L.wk, cur), mm(ctx, L.wv, cur), ws.positions);
+    ggml_tensor * rows = nullptr;
+    for (int s = 0; s < n; ++s) {
+        ggml_tensor * k_cache = caches[s]->mtp_k, * v_cache = caches[s]->mtp_v;
+        ggml_tensor * kv_row = ggml_view_1d(ctx, ws.kv_row, 1, (size_t) s * sizeof(int32_t));
+        ggml_tensor * krow = ggml_reshape_3d(ctx, ggml_view_2d(ctx, qkv.k, D, Hk, qkv.k->nb[1], s * qkv.k->nb[2]),
+                                             D, 1, Hk);
+        ggml_tensor * vrow = ggml_reshape_3d(ctx, ggml_view_2d(ctx, qkv.v, D, Hk, qkv.v->nb[1], s * qkv.v->nb[2]),
+                                             D, 1, Hk);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_cache, krow, kv_row));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_cache, vrow, kv_row));
+        const int64_t span = spans[(size_t) s];
+        ggml_tensor * kfull = ggml_view_3d(ctx, k_cache, D, span, Hk, k_cache->nb[1], k_cache->nb[2], 0);
+        ggml_tensor * vfull = ggml_view_3d(ctx, v_cache, D, span, Hk, v_cache->nb[1], v_cache->nb[2], 0);
+        // One query row: flash attention reads Q through its strides (as the slot's own rank graph does).
+        ggml_tensor * qs = ggml_permute(ctx, ggml_view_3d(ctx, qkv.q, D, Hq, 1, qkv.q->nb[1], qkv.q->nb[2],
+                                                          (size_t) s * qkv.q->nb[2]), 0, 2, 1, 3);
+        ggml_tensor * mr = ggml_view_2d(ctx, ws.mask, span, 1, ws.mask->nb[1], (size_t) s * ws.mask->nb[1]);
+        ggml_tensor * attn = ggml_flash_attn_ext(ctx, qs, kfull, vfull, mr, 1.0f / sqrtf((float) D), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        attn = ggml_reshape_2d(ctx, attn, D * Hq, 1);
+        rows = rows ? ggml_concat(ctx, rows, attn, 1) : attn;
+    }
+    cur = mm(ctx, L.wo, ggml_mul(ctx, rows, ggml_sigmoid(ctx, qkv.gate)));
+    res = hc_combine(ctx, res, cur, inject, H, hc, n);
+    cur = hc_mix(ctx, gf, res, L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, &inject, H, hc,
+                 w.rms_eps);
+    res = hc_combine(ctx, res, build_moe(ctx, cur, L, w, nullptr, nullptr, gf), inject, H, hc, n);
+    ggml_tensor * head = hc_mix(ctx, gf, res, w.mtp_head_norm, w.mtp_head_down, w.mtp_head_up, nullptr, nullptr,
+                                H, hc, w.rms_eps);
+    ggml_tensor * best = ggml_argmax(ctx, ggml_mul_mat(ctx, w.mtp_output, head));   // [n]
+    for (int s = 0; s < n; ++s) {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_view_1d(ctx, best, 1, (size_t) s * sizeof(int32_t)),
+            ggml_view_1d(ctx, caches[s]->mtp_chain_ids, 1, rank * sizeof(int32_t))));
+    }
+    // All readers of the preceding rank's residuals precede these copies.
+    for (int s = 0; s < n; ++s) {
+        ggml_tensor * last = ggml_view_3d(ctx, res, H, hc, 1, res->nb[1], res->nb[2], (size_t) s * res->nb[2]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_2d(ctx, last, H * hc, 1),
+                                               caches[s]->mtp_chain_hidden));
+    }
+    return gf;
+}
+
 // Draft rank `rank` (>= 1) of every slot in one graph, queued on the stream: slot s's row embeds its previous rank's
 // argmax and carries its HC residual (its chain tensors), attends at pos[s] over its own draft K/V (a 256-token bucket
 // behind column s of the mask), and writes its argmax and residual back. The projections, the MoE and the head run
@@ -3252,7 +3327,6 @@ bool mtp_draft_read(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpC
 bool mtp_rank_slots(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache * const * caches,
                     const int * pos, int n, int rank, Qwen4ExpBatchedDecodeWorkspace & ws) {
     const Qwen4ExpCudaScope profile(w.gfx1151 || w.expert_gfx1151);
-    const int64_t H = w.n_embd, hc = w.n_hc, D = w.n_embd_head_k, Hq = w.n_head, Hk = w.n_head_kv;
     std::vector<int64_t> spans((size_t) n);
     int64_t max_span = 0;
     for (int s = 0; s < n; ++s) {
@@ -3265,7 +3339,7 @@ bool mtp_rank_slots(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpC
     if (!same) {
         if (ws.ctx == nullptr) {
             ggml_init_params ip{};
-            ip.mem_size = ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false) + (1u << 16);
+            ip.mem_size = mtp_rank_graph_bytes();
             ip.no_alloc = true;
             ws.ctx = ggml_init(ip);
             if (!ws.ctx) return false;
@@ -3282,67 +3356,7 @@ bool mtp_rank_slots(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpC
         ws.gf = nullptr;
         ws.backend = backend;
         ws.model = &w;
-        ggml_context * ctx = ws.ctx;
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
-        ws.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
-        ws.kv_row = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
-        ws.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, max_span, n);
-        for (ggml_tensor * t : {ws.positions, ws.kv_row, ws.mask}) ggml_set_input(t);
-        ggml_tensor * emb = nullptr, * hid = nullptr;
-        for (int s = 0; s < n; ++s) {
-            ggml_tensor * e = ggml_get_rows(ctx, w.mtp_embd,
-                ggml_view_1d(ctx, caches[s]->mtp_chain_ids, 1, (rank - 1) * sizeof(int32_t)));
-            emb = emb ? ggml_concat(ctx, emb, e, 1) : e;
-            hid = hid ? ggml_concat(ctx, hid, caches[s]->mtp_chain_hidden, 1) : caches[s]->mtp_chain_hidden;
-        }
-        ggml_tensor * res = mtp_input(ctx, w, emb, hid);
-        const Qwen4ExpLayer & L = w.mtp;
-        ggml_tensor * inject = nullptr;
-        ggml_tensor * cur = hc_mix(ctx, gf, res, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject,
-                                   &inject, H, hc, w.rms_eps);
-        // The draft layer's attention: one row per slot against its own draft K/V (as its stable rank graph attends).
-        ggml_tensor * qfull = mm(ctx, L.wq, cur);
-        const Qwen4ExpAttnQkv qkv = attn_qkv(ctx, L, w, qfull, mm(ctx, L.wk, cur), mm(ctx, L.wv, cur), ws.positions);
-        ggml_tensor * rows = nullptr;
-        for (int s = 0; s < n; ++s) {
-            ggml_tensor * k_cache = caches[s]->mtp_k, * v_cache = caches[s]->mtp_v;
-            ggml_tensor * kv_row = ggml_view_1d(ctx, ws.kv_row, 1, (size_t) s * sizeof(int32_t));
-            ggml_tensor * krow = ggml_reshape_3d(ctx, ggml_view_2d(ctx, qkv.k, D, Hk, qkv.k->nb[1], s * qkv.k->nb[2]),
-                                                 D, 1, Hk);
-            ggml_tensor * vrow = ggml_reshape_3d(ctx, ggml_view_2d(ctx, qkv.v, D, Hk, qkv.v->nb[1], s * qkv.v->nb[2]),
-                                                 D, 1, Hk);
-            ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_cache, krow, kv_row));
-            ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_cache, vrow, kv_row));
-            const int64_t span = spans[(size_t) s];
-            ggml_tensor * kfull = ggml_view_3d(ctx, k_cache, D, span, Hk, k_cache->nb[1], k_cache->nb[2], 0);
-            ggml_tensor * vfull = ggml_view_3d(ctx, v_cache, D, span, Hk, v_cache->nb[1], v_cache->nb[2], 0);
-            // One query row: flash attention reads Q through its strides (as the slot's own rank graph does).
-            ggml_tensor * qs = ggml_permute(ctx, ggml_view_3d(ctx, qkv.q, D, Hq, 1, qkv.q->nb[1], qkv.q->nb[2],
-                                                              (size_t) s * qkv.q->nb[2]), 0, 2, 1, 3);
-            ggml_tensor * mr = ggml_view_2d(ctx, ws.mask, span, 1, ws.mask->nb[1], (size_t) s * ws.mask->nb[1]);
-            ggml_tensor * attn = ggml_flash_attn_ext(ctx, qs, kfull, vfull, mr, 1.0f / sqrtf((float) D), 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
-            attn = ggml_reshape_2d(ctx, attn, D * Hq, 1);
-            rows = rows ? ggml_concat(ctx, rows, attn, 1) : attn;
-        }
-        cur = mm(ctx, L.wo, ggml_mul(ctx, rows, ggml_sigmoid(ctx, qkv.gate)));
-        res = hc_combine(ctx, res, cur, inject, H, hc, n);
-        cur = hc_mix(ctx, gf, res, L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, &inject, H, hc,
-                     w.rms_eps);
-        res = hc_combine(ctx, res, build_moe(ctx, cur, L, w, nullptr, nullptr, gf), inject, H, hc, n);
-        ggml_tensor * head = hc_mix(ctx, gf, res, w.mtp_head_norm, w.mtp_head_down, w.mtp_head_up, nullptr, nullptr,
-                                    H, hc, w.rms_eps);
-        ggml_tensor * best = ggml_argmax(ctx, ggml_mul_mat(ctx, w.mtp_output, head));   // [n]
-        for (int s = 0; s < n; ++s) {
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_view_1d(ctx, best, 1, (size_t) s * sizeof(int32_t)),
-                ggml_view_1d(ctx, caches[s]->mtp_chain_ids, 1, rank * sizeof(int32_t))));
-        }
-        // All readers of the preceding rank's residuals precede these copies.
-        for (int s = 0; s < n; ++s) {
-            ggml_tensor * last = ggml_view_3d(ctx, res, H, hc, 1, res->nb[1], res->nb[2], (size_t) s * res->nb[2]);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_2d(ctx, last, H * hc, 1),
-                                                   caches[s]->mtp_chain_hidden));
-        }
+        ggml_cgraph * gf = build_mtp_rank_nodes(ws.ctx, w, caches, spans, n, rank, ws);
         if (ws.alloc == nullptr) ws.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         const bool ok = ws.alloc && (!ws.planned || ggml_gallocr_reserve(ws.alloc, gf)) &&
                         ggml_gallocr_alloc_graph(ws.alloc, gf);
@@ -3600,6 +3614,29 @@ Qwen4ExpGraphMemory qwen4exp_mtp_graph_memory(ggml_backend_t backend, const Qwen
     std::vector<float> unused;
     if (!mtp_forward_batch(backend, w, cache, nullptr, nullptr, n_tokens, pos0,
                            unused, nullptr, false, true, 0, &memory)) memory.graph = SIZE_MAX;
+    return memory;
+}
+
+Qwen4ExpGraphMemory qwen4exp_mtp_rank_slots_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
+        Qwen4ExpCache & cache, int n_slots, int pos) {
+    Qwen4ExpGraphMemory memory;
+    memory.graph = SIZE_MAX;
+    if (n_slots < 1 || n_slots > kQwen4ExpMaxBatchedSlots || !qwen4exp_verify_supported(cache) || !cache.mtp_k ||
+        pos < 0 || pos >= cache.max_ctx) return memory;
+    const Qwen4ExpCudaScope profile(w.gfx1151 || w.expert_gfx1151);
+    ggml_init_params ip{};
+    ip.mem_size = mtp_rank_graph_bytes();
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return memory;
+    // An allocation plan only: the slots share one cache and nothing runs.
+    std::vector<Qwen4ExpCache *> caches((size_t) n_slots, &cache);
+    const std::vector<int64_t> spans((size_t) n_slots, qwen4exp_kv_bucket(cache.max_ctx, (int64_t) pos + 1, false));
+    Qwen4ExpBatchedDecodeWorkspace plan;
+    ggml_cgraph * gf = build_mtp_rank_nodes(ctx, w, caches.data(), spans, n_slots, 1, plan);
+    memory.graph = 0;
+    graph_memory(backend, ctx, gf, w.gfx1151, memory);
+    ggml_free(ctx);
     return memory;
 }
 
