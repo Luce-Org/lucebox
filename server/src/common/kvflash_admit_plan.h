@@ -63,4 +63,13 @@ inline int kvflash_same_sid_slot(const std::vector<KvFlashOwnedSession> & parked
     return best;
 }
 
+// The oldest parked session other than `keep`, for a cold admit. A summary-cold request keeps its sid's parked slot, but when that is
+// the only evictable one and nothing is live, no retry can change the answer: the keep is given up rather than answered busy forever.
+// evict(keep) returns the freed slot or -1.
+template <class Evict>
+inline int kvflash_evict_for_cold(Evict evict, int keep, bool any_live) {
+    const int slot = evict(keep);
+    return slot < 0 && keep >= 0 && !any_live ? evict(-1) : slot;
+}
+
 }  // namespace luce::common

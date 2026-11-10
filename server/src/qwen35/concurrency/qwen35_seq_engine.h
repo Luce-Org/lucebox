@@ -328,6 +328,7 @@ private:
     AdmitResult admit_sticky_(uint64_t request_id, const std::vector<int32_t> & prompt, const SamplerCfg & sampler,
                               int64_t total, const AdmitMeta & meta);
     void drop_session_(int slot, const char * why);   // forget the session: its KV, its reservation and its owner
+    bool any_slot_live_() const;
     int evict_oldest_(const char * why, int keep = -1);   // the oldest parked session (but `keep`) that can be evicted: its slot, -1 when none
     std::vector<bool> active_slots_() const;          // which slots decode a request now
     std::vector<KvFlashOwnedSession> parked_list_() const;   // every parked session with its owner

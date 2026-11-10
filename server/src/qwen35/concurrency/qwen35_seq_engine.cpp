@@ -731,7 +731,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
     int slot = -1;
     for (int i = 0; i < slots_.slot_count() && slot < 0; ++i)
         if (!slots_.is_active(i) && !parked_[(size_t)i].valid) slot = i;
-    if (slot < 0) slot = evict_oldest_("slot needed for a new session", keep_slot);
+    if (slot < 0) slot = kvflash_evict_for_cold([&](int keep) { return evict_oldest_("slot needed for a new session", keep); }, keep_slot, any_slot_live_());
     if (slot >= 0 && !book_[slot].sid.empty()) drop_session_(slot, "slot reused");   // a session that left it without parking
     AdmitResult result;
     if (slot < 0) {   // every slot is live (a plain admit would pair a manager slot with another pager slot)
@@ -744,7 +744,8 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
         kvf_kv_->set_next_slot(slot);
         result = slots_.admit_at(slot, request_id, prompt, sampler, 0);
         // Parked reservations are a cache, never a reason to refuse: the oldest go until the budget fits.
-        const int old = result.status == AdmitResult::Status::busy ? evict_oldest_("host budget needed for a new session (cold)", keep_slot) : -1;
+        const int old = result.status == AdmitResult::Status::busy
+            ? kvflash_evict_for_cold([&](int keep) { return evict_oldest_("host budget needed for a new session (cold)", keep); }, keep_slot, any_slot_live_()) : -1;
         if (old < 0) break;
     }
     if (result.status == AdmitResult::Status::admitted) {
@@ -779,6 +780,11 @@ int Qwen35SeqEngine::evict_oldest_(const char * why, int keep) {
         drop_session_(slot, why);   // the park was refused: the parked set is a cache and never blocks service
     }, keep);
     return r.slot;
+}
+
+bool Qwen35SeqEngine::any_slot_live_() const {
+    for (int i = 0; i < slots_.slot_count(); ++i) if (slots_.is_active(i)) return true;
+    return false;
 }
 
 std::vector<bool> Qwen35SeqEngine::active_slots_() const {
