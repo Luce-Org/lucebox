@@ -753,6 +753,7 @@ add_library(luce_common STATIC
     src/server/pflash_unified.cpp
     src/server/response_error.cpp
     src/server/sse_emitter.cpp
+    src/server/crash_record.cpp
     src/server/kv/chat_boundaries.cpp
     src/server/kv/checkpoint_store.cpp
     src/server/kv/cuts.cpp

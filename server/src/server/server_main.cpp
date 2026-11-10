@@ -14,6 +14,7 @@
 //                                 [--port 8080]
 
 #include "http_server.h"
+#include "crash_record.h"
 #include "admission.h"
 #include "chat_template.h"
 #include "launch_profiles.h"
@@ -2898,6 +2899,10 @@ int main(int argc, char ** argv) {
     }
     if (argc >= 2 && argv[1][0] != '-' && inspect_gguf_model_info(argv[1]).arch == "moss-image") {
         return run_moss_image(argc, argv);
+    }
+    // A fatal signal from here on, model loading included, leaves a crash record (crash_record.h).
+    if (install_crash_record(std::getenv("LUCE_CRASH_DIR"), "")) {
+        std::fprintf(stderr, "[server] crash records go to %s\n", std::getenv("LUCE_CRASH_DIR"));
     }
 
     // Reuse the existing per-model CLI and loader. Argument strings belong to
