@@ -75,6 +75,41 @@ inline bool kvflash_pool_fits(int end, int chunk_tokens, int reserve_chunks, int
     return (end + chunk_tokens - 1) / chunk_tokens + reserve_chunks <= n_pool_blocks;
 }
 
+// The score the pager's eviction hook reads for chunk `c`. The ledger can cover the whole prompt (mode 5 scores it
+// before the 27B runs), but only the first `committed_chunks` are written; the others belong to the batch being
+// allocated and must never be picked as victims, so they rank as pinned.
+inline float kvflash_hook_score(const std::vector<float> & scores, int committed_chunks, int c) {
+    return c < std::min((int)scores.size(), committed_chunks) ? scores[(size_t)c] : 1e30f;
+}
+
+// Why a request's recall (mode 4 rewind or mode 5 drafter pick) does not run.
+enum class KvFlashRecallSkip { None, NoSealedChunk, Fits, PoolTooSmall };
+struct KvFlashRecallGate { KvFlashRecallSkip skip = KvFlashRecallSkip::None; int reserve = 0; };
+
+// `r` is the absolute start of the last user turn, `end` the prompt end. Recall needs a sealed chunk before the turn,
+// a prompt that does not already fit the pool (the turn counted once: chunks(r) + the turn's reserve), and a pool that
+// holds the preamble pins, the recall and the turn's room beside at least one tail and one victim chunk.
+inline KvFlashRecallGate kvflash_recall_gate(bool turn_found, int r, int end, int chunk_tokens, int n_pool_blocks,
+                                             int pin_reserve_chunks, int recall_chunks) {
+    KvFlashRecallGate g;
+    if (!turn_found || chunk_tokens <= 0 || r / chunk_tokens == 0) { g.skip = KvFlashRecallSkip::NoSealedChunk; return g; }
+    g.reserve = (end - r + chunk_tokens - 1) / chunk_tokens + 1;
+    if (kvflash_pool_fits(r, chunk_tokens, g.reserve, n_pool_blocks)) g.skip = KvFlashRecallSkip::Fits;
+    else if (pin_reserve_chunks + recall_chunks + g.reserve + 2 > n_pool_blocks) g.skip = KvFlashRecallSkip::PoolTooSmall;
+    return g;
+}
+
+// A GPU-scorer refusal that says nothing about the scorer (nothing sealed yet, a transient free-VRAM shortfall) must
+// not send every later request to the CPU scorer.
+inline bool kvflash_gpu_failure_latches(const std::string & why) {
+    return why != "no sealed chunks" && why.rfind("needs ", 0) != 0;
+}
+
+// Victim tier (paged-out chunks kept on the device): only mode 5 recalls enough to pay for it.
+inline int kvflash_victim_blocks_default(int reselect_mode, int pool_blocks) { return reselect_mode == 5 ? 2 * pool_blocks : 0; }
+// Device bytes per pool token the auto pool budget must reserve: the pool plus its victim tier.
+inline int kvflash_pool_density_factor(int reselect_mode) { return 1 + kvflash_victim_blocks_default(reselect_mode, 1); }
+
 // Sorted copy of `cuts` with r inserted; unchanged if r < 0 or already present.
 inline std::vector<int> kvflash_cuts_with(const std::vector<int> & cuts, int r) {
     std::vector<int> out = cuts;
@@ -180,7 +215,7 @@ inline int kvflash_recall_tail_chunks(int n_pool_blocks, int recall_chunks, int 
 
 // ---- recall budget ----
 //
-// The recall step of kvflash_prefill_apply_on, pure: how many chunks of exact tail, which blocks are picked.
+// The recall step of kvflash_prefill_apply, pure: how many chunks of exact tail, which blocks are picked.
 // `pin_reserve_chunks` is the part of the pool LUCE_KVFLASH_PREAMBLE_ROWS reserves for the pins, off the history budget (0 when off);
 // `pinned_chunks` are the leading chunks excluded from the candidates.
 struct KvFlashRecallIn {

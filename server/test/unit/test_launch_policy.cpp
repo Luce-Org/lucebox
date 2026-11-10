@@ -766,15 +766,12 @@ struct LaunchPolicyFixture : CommonFixture {
             {"LUCE_KVFLASH_SELECT_UNIT", "2"},
             {"LUCE_KVFLASH_PREAMBLE_ROWS", "1152"},
             {"LUCE_KVFLASH_UQ_QUERIES", "0"},
-            {"LUCE_KVFLASH_SELECT_QUERIES", "0"},
             {"PFLASH_SELECT_MODE", "budget_only"},
             {"PFLASH_SELECT_SCORE", "density"},
             {"PFLASH_SELECT_SEGMENTS", "probe"},
             {"PFLASH_SELECT_CHUNK_SIZE", "256"},
             {"PFLASH_SELECT_QUERY_TOKENS", "128"},
             {"PFLASH_SELECT_QUERY_HEAD", "1"},
-            {"PFLASH_SELECT_PARAGRAPH_JOIN", "0"},
-            {"PFLASH_SELECT_QUERY_PARSER", "latest_user"},
             {"PFLASH_SELECT_QUERY_PROBE", "1"},
             {"PFLASH_QUERY_CANDIDATES", "1"},
             {"PFLASH_QUERY_PIN", "512"},
@@ -792,6 +789,13 @@ struct LaunchPolicyFixture : CommonFixture {
             {"LUCE_KVFLASH_UQ_QUERIES", "64"},
         });
         CHECK(kvflash_recall_env("qwen3", true).empty());
+        // Nothing here changes what PFlash prefill compression selects on: the parser stays the release
+        // default, and the retired paragraph join and the hard-coded selector-query count are not exported.
+        for (const auto & e : kvflash_recall_env("qwen35", true)) {
+            CHECK(e.name != "PFLASH_SELECT_QUERY_PARSER");
+            CHECK(e.name != "PFLASH_SELECT_PARAGRAPH_JOIN");
+            CHECK(e.name != "LUCE_KVFLASH_SELECT_QUERIES");
+        }
     }
 
     void test_kvflash_drafter_ready_needs_the_drafter_and_its_three_ggufs() {

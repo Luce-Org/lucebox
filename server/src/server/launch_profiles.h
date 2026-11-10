@@ -369,7 +369,7 @@ inline const std::vector<LaunchProfileEnv> & cluster_launch_env() {
 }
 
 // KVFlash recall profile. `--kvflash` on a qwen35 target installs it as defaults, so a launcher
-// passes one flag. With a drafter (LUCE_KVFLASH_DRAFTER or --pflash-drafter) and its three PFlash
+// passes one flag. With a drafter (LUCE_KVFLASH_DRAFTER or --prefill-drafter) and its three PFlash
 // GGUFs it is KVFlash 2.0: mode 5, the PFlash drafter scores the prompt and the picks apply when
 // the prefill reaches the cut, with the PFlash release selection the K2/K3 LiveCode nights measured.
 // Without them it is mode 4: selector v2 with the exact attention-mass scorer on the recency pool
@@ -416,15 +416,12 @@ inline std::vector<LaunchProfileEnv> kvflash_recall_env(std::string_view arch, b
         {"LUCE_KVFLASH_PREFILL_RESELECT", "5"},
         {"LUCE_KVFLASH_RESELECT_SCORER", "pflash2"},
         {"LUCE_KVFLASH_UQ_QUERIES", "0"},
-        {"LUCE_KVFLASH_SELECT_QUERIES", "0"},
         {"PFLASH_SELECT_MODE", "budget_only"},
         {"PFLASH_SELECT_SCORE", "density"},
         {"PFLASH_SELECT_SEGMENTS", "probe"},
         {"PFLASH_SELECT_CHUNK_SIZE", "256"},
         {"PFLASH_SELECT_QUERY_TOKENS", "128"},
         {"PFLASH_SELECT_QUERY_HEAD", "1"},
-        {"PFLASH_SELECT_PARAGRAPH_JOIN", "0"},
-        {"PFLASH_SELECT_QUERY_PARSER", "latest_user"},
         {"PFLASH_SELECT_QUERY_PROBE", "1"},
         {"PFLASH_QUERY_CANDIDATES", "1"},
         {"PFLASH_QUERY_PIN", "512"},

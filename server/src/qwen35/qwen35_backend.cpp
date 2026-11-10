@@ -284,7 +284,8 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
     // Single source of truth with the qwen35moe placement path — see kv_quant.h.
     b.bytes_per_token = (int64_t)luce::kv_reservation_bytes_per_token(
         w.n_layer, w.full_attention_interval, w.n_head_kv,
-        kv_k, w.n_embd_head_k, kv_v, w.n_embd_head_v);
+        kv_k, w.n_embd_head_k, kv_v, w.n_embd_head_v) *
+        luce::common::kvflash_pool_density_factor(kvflash_prefill_reselect_);   // the victim tier is device memory too
     b.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
         (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
     return b;
@@ -720,8 +721,8 @@ bool Qwen35Backend::init() {
         KvFlashConfig pc;
         pc.pool_tokens = kvflash_tokens_;
         // LUCE_KVFLASH_VICTIM_BLOCKS: paged-out chunks keep their bytes on the device, so the turn-by-turn churn between
-        // the recency pool and the drafter's picks recalls D2D instead of over the host link. Default: twice the pool.
-        pc.victim_blocks = std::max(0, env_int_or_default("LUCE_KVFLASH_VICTIM_BLOCKS", 2 * (kvflash_tokens_ / pc.chunk_tokens)));
+        // the recency pool and the drafter's picks recalls D2D instead of over the host link. Default: twice the pool in mode 5, off otherwise.
+        pc.victim_blocks = std::max(0, env_int_or_default("LUCE_KVFLASH_VICTIM_BLOCKS", luce::common::kvflash_victim_blocks_default(kvflash_prefill_reselect_, kvflash_tokens_ / pc.chunk_tokens)));
         if (!kvflash_pager_.attach(pc, cache_.attn_k, cache_.attn_v)) {
             std::fprintf(stderr, "kvflash: pager attach failed (pool=%d)\n", kvflash_tokens_);
             return false;
@@ -3181,20 +3182,26 @@ Qwen35Backend::KvflashRecallSetup Qwen35Backend::kvflash_recall_setup(const std:
     const int end_abs = kv_offset + prompt_len, ctk = kvflash_pager_.chunk_tokens();
     if (kvf_reselect) {
         const auto p4 = luce::common::kvflash_mode4_plan(tokens, kv_offset, w_.im_start_id, w_.user_id);
-        const int reserve = (end_abs - p4.r + ctk - 1) / ctk + 1;
-        const bool fits = p4.run && luce::common::kvflash_pool_fits(end_abs, ctk, reserve, kvflash_pager_.n_pool_blocks());
+        const auto gate = luce::common::kvflash_recall_gate(
+            p4.run, p4.r, end_abs, ctk, kvflash_pager_.n_pool_blocks(), kvflash_preamble_reserve_ / ctk,
+            luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_);
+        using Skip = luce::common::KvFlashRecallSkip;
         if (kvflash_prefill_reselect_ == 4 && p4.run) {
-            if (fits) {
+            if (gate.skip == Skip::Fits) {
                 std::fprintf(stderr, "[kvflash] prefill reselect mode=%d: skip, fits (%d chunks + %d reserve <= %d blocks)\n",
-                             kvflash_prefill_reselect_, (end_abs + ctk - 1) / ctk, reserve, kvflash_pager_.n_pool_blocks());
+                             kvflash_prefill_reselect_, (p4.r + ctk - 1) / ctk, gate.reserve, kvflash_pager_.n_pool_blocks());
+            } else if (gate.skip != Skip::None) {
+                std::fprintf(stderr, "[kvflash] prefill reselect mode=4: skip, %s (LRU)\n",
+                             gate.skip == Skip::NoSealedChunk ? "no sealed chunk before R" : "pool too small for the recall plan");
             } else {
                 s.rw = p4;
                 std::fprintf(stderr, "[kvflash] prefill reselect mode=4: R4=%d (end %d, re-prefill %d tokens)\n",
                              p4.r, end_abs, end_abs - p4.r);
             }
         } else if (kvflash_prefill_reselect_ == 5) {
-            const char * skip = !p4.run || p4.r / ctk == 0 ? "no sealed chunk before R"
-                : fits ? "fits"
+            const char * skip = gate.skip == Skip::NoSealedChunk ? "no sealed chunk before R"
+                : gate.skip == Skip::Fits ? "fits"
+                : gate.skip == Skip::PoolTooSmall ? "pool too small for the recall plan"
                 : (int)kvf_ids.size() != end_abs ? "prompt ids unknown" : nullptr;
             // LUCE_KVFLASH_M5_RESCORE_TOKENS: the same latest user question over a prompt that extends the last scored
             // one needs no new drafter pass; the turn reselects at R from the last drafter scores.
@@ -3347,7 +3354,8 @@ bool Qwen35Backend::kvflash_exact_scores_gpu(int sealed, const std::vector<const
     p.synchronize_paging();   // queued D2H page-outs and H2D page-ins must land before any host/pool read
     const KvFlashQkDims d = kvflash_exact_dims();
     std::string why;
-    if (ct <= 0 || sealed <= 0 || d.n_layers <= 0 || cache_.attn_k.empty() || !target_backend_) why = "no pooled K";
+    if (sealed <= 0) return false;   // nothing sealed yet: the CPU scorer answers this call, the GPU scorer stays available
+    if (ct <= 0 || d.n_layers <= 0 || cache_.attn_k.empty() || !target_backend_) why = "no pooled K";
     else {
         if (!kvflash_gpu_mass_) kvflash_gpu_mass_ = std::make_unique<luce::common::KvFlashGpuMass>(target_backend_);
         const KvFlashResidency res = kvflash_residency(p, sealed);
@@ -3362,8 +3370,9 @@ bool Qwen35Backend::kvflash_exact_scores_gpu(int sealed, const std::vector<const
             return true;
         }
     }
-    kvflash_gpu_failed_ = true;
-    std::fprintf(stderr, "[kvflash] gpu scorer unavailable: %s; using the CPU scorer\n", why.c_str());
+    if (luce::common::kvflash_gpu_failure_latches(why)) kvflash_gpu_failed_ = true;
+    std::fprintf(stderr, "[kvflash] gpu scorer unavailable: %s; using the CPU scorer%s\n", why.c_str(),
+                 kvflash_gpu_failed_ ? "" : " for this call");
     return false;
 }
 
@@ -3471,8 +3480,9 @@ void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
         for (int c = std::max(0, plan.first_window); c < (int)scores.size(); c++)
             scores[(size_t)c] = 1e30f;
     }
-    p.score_hook = [&scores](int c) {
-        return c < (int)scores.size() ? scores[c] : 1e30f;
+    // Chunks at or past `committed` are the batch being allocated: never victims, whatever the ledger holds.
+    p.score_hook = [&scores, committed_chunks = committed / ct](int c) {
+        return luce::common::kvflash_hook_score(scores, committed_chunks, c);
     };
     const int64_t ins0 = p.stats().page_ins, hits0 = p.stats().victim_hits;
     const auto t_rs = std::chrono::steady_clock::now();
