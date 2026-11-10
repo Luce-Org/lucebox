@@ -831,9 +831,17 @@ int main(int argc, char ** argv) {
             specla_top_k_set = true;
         }
         else if (std::strcmp(argv[i], "--ddtree") == 0)        { ddtree_mode = true; fast_rollback = true; }
-        else if (std::strncmp(argv[i], "--ddtree-budget=", 16) == 0) {
-            ddtree_budget = std::atoi(argv[i] + 16);
-            if (ddtree_budget <= 0) ddtree_budget = 64;
+        else if (std::strncmp(argv[i], "--ddtree-budget=", 16) == 0 ||
+                 std::strncmp(argv[i], "--budget=", 9) == 0) {
+            const char * val = std::strncmp(argv[i], "--ddtree-budget=", 16) == 0
+                ? argv[i] + 16 : argv[i] + 9;
+            ddtree_budget = std::atoi(val);
+            if (ddtree_budget <= 0) {
+                ddtree_budget = 0;
+                ddtree_mode = false;
+                specla_mode = false;
+                fast_rollback = false;
+            }
         }
         else if (std::strncmp(argv[i], "--ddtree-tau=", 13) == 0) {
             const char * tau_str = argv[i] + 13;
