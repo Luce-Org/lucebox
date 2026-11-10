@@ -1266,11 +1266,14 @@ void Qwen35SeqEngine::trim_unaccepted_chunks_() {
 
 // After the readback: queue the page-outs that return every live slot to its
 // usable quota, so the next step finds its blocks free (no-op without KVFlash).
-bool Qwen35SeqEngine::settle_kvflash_() {
+bool Qwen35SeqEngine::settle_kvflash_(std::vector<PrefillOutput> & prefill_outputs) {
     if (!kvf_) return true;
     kvf_->finish_step();   // the step pins end here, after the readback
     for (int slot : pending_rewind_) {
-        if (!rewind_slot_turn_(slot)) { pending_rewind_.clear(); return false; }
+        if (rewind_slot_turn_(slot)) continue;
+        // That slot's turn is lost and its session is never parked; the other slots keep their step.
+        recall_[(size_t)slot].tainted = true;
+        fail_prefill_output(prefill_outputs, slot, "KVFlash recall could not rewind the turn (state snapshot, restore or rewind failed)");
     }
     pending_rewind_.clear();
     trim_unaccepted_chunks_();
@@ -2397,7 +2400,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                 StepResult chain = step_chain_spec(plan, chain_lanes, std::move(*prepared), kvf_ ? &kvf_plan : nullptr);
                 if (kvf_) {
                     if (!chain.error.empty()) return fail_step(chain.error);   // abort_step, the live slots are never parked
-                    if (!settle_kvflash_()) return fail_step("KVFlash page-out failed");   // (d): after the readback; also rewinds
+                    if (!settle_kvflash_(chain.prefills)) return fail_step("KVFlash page-out failed");   // (d): after the readback; also rewinds
                     log_kvflash_chain_round_(chain, chain_lanes);
                 }
                 return chain;
@@ -2546,7 +2549,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
 
     const int live_count = (int)live_tokens_.size();
     if (kvf_ && live_count == 0 && prefills.empty()) {   // every slot idled
-        if (!settle_kvflash_()) return fail_step("KVFlash page-out failed");
+        if (!settle_kvflash_(prefill_outputs)) return fail_step("KVFlash page-out failed");
         return result;
     }
     const bool with_decode = live_count > 0;
@@ -2884,7 +2887,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         }
     }
     const auto kvf_t_gr = kvf_clock::now();
-    if (!settle_kvflash_()) return fail_step("KVFlash page-out failed");
+    if (!settle_kvflash_(prefill_outputs)) return fail_step("KVFlash page-out failed");
     if (kvf_) {   // LUCE_KVFLASH_STEP_TRACE=1: where a step's host time goes (ms), summed over 64 steps
         static const bool trace = std::getenv("LUCE_KVFLASH_STEP_TRACE") != nullptr;
         thread_local double sum[5] = {0, 0, 0, 0, 0}; thread_local int n = 0, ups = 0, dec = 0, pre = 0;   // per scheduler thread

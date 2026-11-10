@@ -288,7 +288,7 @@ private:
     KvFlashStepDriver * kvf_ = nullptr;
     void init_slots_();
     bool upload_kvflash_column(int slot, int kv_len);
-    bool settle_kvflash_();
+    bool settle_kvflash_(std::vector<PrefillOutput> & prefill_outputs);
     // C1.4: per-slot mode 4. The turn plan, the scores the pager's hook reads
     // (stable: recall_ is sized once), the state at R and the step bookkeeping.
     struct SlotRecall {

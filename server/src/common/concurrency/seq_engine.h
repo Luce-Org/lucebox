@@ -400,6 +400,17 @@ public:
     virtual int max_decode_tokens() const { return 0; }
 };
 
+// Fails `slot`'s prefill of this step with `error`: its output is replaced (no token, no prefix capture), or added
+// when the step has none for it. The other slots' outputs stay.
+inline void fail_prefill_output(std::vector<SeqEngine::PrefillOutput> & outputs, int slot, std::string error) {
+    auto it = std::find_if(outputs.begin(), outputs.end(), [slot](const SeqEngine::PrefillOutput & o) { return o.slot == slot; });
+    if (it == outputs.end()) it = outputs.emplace(outputs.end());
+    *it = SeqEngine::PrefillOutput{};
+    it->slot = slot;
+    it->status = SeqEngine::PrefillOutput::Status::failed;
+    it->error = std::move(error);
+}
+
 template <typename Advance>
 inline bool consume_decode_output_tokens(
         const SeqEngine::DecodeOutput & output, Advance advance) {
