@@ -1013,6 +1013,8 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             // OpenAI's field for the prompt tokens a cache served.
             usage_body["prompt_tokens_details"] = {{"cached_tokens", timings->cached_prefix_tokens}};
             usage_body["timings"] = build_timings_json(*timings, completion_tokens);
+            usage_body["accept_rate"] = timings->accept_rate;
+            usage_body["spec_decode_ran"] = timings->spec_decode_ran;
         }
         json usage = {
             {"id", request_id_}, {"object", "chat.completion.chunk"},
@@ -1047,6 +1049,8 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         json anth_usage = {{"output_tokens", completion_tokens}};
         if (timings) {
             anth_usage["timings"] = build_timings_json(*timings, completion_tokens);
+            anth_usage["accept_rate"] = timings->accept_rate;
+            anth_usage["spec_decode_ran"] = timings->spec_decode_ran;
         }
         json msg_delta = {
             {"type", "message_delta"},
@@ -1118,6 +1122,8 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         if (timings) {
             resp_usage["input_tokens_details"] = {{"cached_tokens", timings->cached_prefix_tokens}};
             resp_usage["timings"] = build_timings_json(*timings, completion_tokens);
+            resp_usage["accept_rate"] = timings->accept_rate;
+            resp_usage["spec_decode_ran"] = timings->spec_decode_ran;
         }
         json shell = {
             {"id", request_id_}, {"object", "response"},
