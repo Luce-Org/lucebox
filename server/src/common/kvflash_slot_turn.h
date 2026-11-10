@@ -28,6 +28,7 @@ struct KvFlashSlotTurn {
     int  reserve_chunks = 0;        // pool room kept for the replay (single-slot rule)
     int  ckpt = -1;                 // the prompt-end checkpoint: the last <|im_start|> (the assistant header)
     bool end_rung = false;          // C1.5 F7: a recall turn whose replay stops at ckpt and checkpoints there too
+    int  uq_cut = -1;               // the latest human question's end inside this prefill: a cut end of every pass (kvflash_uq_cut); -1: none
     std::vector<int> cuts;          // first-pass cut ends, ascending
     bool recall() const { return phase != KvFlashTurnPhase::Lru; }
     bool first_pass() const { return phase == KvFlashTurnPhase::FirstPass; }
@@ -94,9 +95,18 @@ inline int kvflash_slot_turn_next_cut(const KvFlashSlotTurn & t, int cur_pos, in
     if (t.first_pass())
         for (int c : t.cuts) if (c > cur_pos) return c - cur_pos;
     int n = kvflash_next_cut(cur_pos, t.end, cut_u) - cur_pos;
+    if (t.uq_cut > cur_pos) n = std::min(n, t.uq_cut - cur_pos);
     if (t.ckpt_pass() && t.ckpt > cur_pos) n = std::min(n, t.ckpt - cur_pos);
     if (tail > 0 && n > tail && cur_pos + n == t.end) n -= tail;
     return n;
+}
+
+// LUCE_KVFLASH_UQ_QUERIES: the question's end `cut` (kvflash_uq_cut, -1: none) becomes a cut end of every pass
+// of the turn, so the question's last queries are the last rows of the cuts that hold them.
+inline void kvflash_slot_turn_force_cut(KvFlashSlotTurn & t, int cut) {
+    t.uq_cut = cut;
+    const auto at = std::lower_bound(t.cuts.begin(), t.cuts.end(), cut);
+    if (cut >= 0 && t.first_pass() && (at == t.cuts.end() || *at != cut)) t.cuts.insert(at, cut);
 }
 
 // What the step that runs the cut [cur_pos, cur_pos + n) must do for this slot.
