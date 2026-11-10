@@ -351,7 +351,8 @@ protected:
     int                     kvflash_preamble_rows_ = 0;
     int                     kvflash_preamble_end_ = 0;       // preamble end of the current request's prompt
     // Pins the preamble chunks (ids: the full prompt, null = reuse the last end). Returns the chunks pinned.
-    void kvflash_uq_append(std::vector<const float *> & qs, int sealed, size_t qsize, size_t n_v2);
+    void kvflash_uq_append(luce::common::KvFlashPager & p, const luce::common::KvFlashUqStore * st, const char * miss,
+                           std::vector<const float *> & qs, int sealed, size_t qsize, size_t n_v2);
     int  kvflash_apply_preamble_pin(const std::vector<int32_t> * ids, bool log);
     // LUCE_KVFLASH_UQ_QUERIES: the latest human question's last N queries, kept next to kvflash_history_.
     int                     kvflash_uq_queries_ = 0;

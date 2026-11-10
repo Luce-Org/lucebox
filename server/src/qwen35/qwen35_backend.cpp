@@ -3651,23 +3651,23 @@ bool Qwen35Backend::kvflash_exact_scores_gpu_on(KvFlashPager & p, int sealed, co
     return false;
 }
 
-// LUCE_KVFLASH_UQ_QUERIES: append the stored rows of the latest human question to the selector's queries
-// when the store's key matches this prompt (and, on the GPU scorer, the call still fits in VRAM).
-// Logs one hit or miss line per reselect.
-void Qwen35Backend::kvflash_uq_append(std::vector<const float *> & qs, int sealed, size_t qsize, size_t n_v2) {
-    const int found = luce::common::kvflash_uq_find(kvflash_uq_stores_, kvflash_uq_req_hi_, kvflash_uq_req_hash_);
+// LUCE_KVFLASH_UQ_QUERIES: append the rows of the latest human question (`store`: the one holding this
+// request's question, null when there is none and `miss` says why) to the queries of pager `p`'s scorer
+// call, when the call still fits in VRAM on the GPU scorer. Logs one hit or miss line per reselect.
+void Qwen35Backend::kvflash_uq_append(luce::common::KvFlashPager & p, const luce::common::KvFlashUqStore * store, const char * miss,
+                                      std::vector<const float *> & qs, int sealed, size_t qsize, size_t n_v2) {
     static const luce::common::KvFlashUqStore kNone;
-    const auto & st = found >= 0 ? kvflash_uq_stores_[(size_t)found] : kNone;
+    const auto & st = store ? *store : kNone;
     const char * why = nullptr;
     std::string reason;
     if (n_v2 == 0) why = "no-v2-selector";
-    else if (kvflash_uq_req_hi_ <= 0 || st.empty() || st.rows.size() != (size_t)st.n * qsize)
-        why = kvflash_uq_miss_.empty() ? "no-store" : kvflash_uq_miss_.c_str();
+    else if (st.empty() || st.rows.size() != (size_t)st.n * qsize)
+        why = *miss ? miss : "no-store";
     else if (!kvflash_gpu_failed_ && target_backend_ && !cache_.attn_k.empty()) {
         if (!kvflash_gpu_mass_) kvflash_gpu_mass_ = std::make_unique<luce::common::KvFlashGpuMass>(target_backend_);
-        const int ct = kvflash_pager_.chunk_tokens();
+        const int ct = p.chunk_tokens();
         const ggml_tensor * k0 = cache_.attn_k[0];
-        const int n_ev = sealed - kvflash_residency(kvflash_pager_, sealed).n_resident;
+        const int n_ev = sealed - kvflash_residency(p, sealed).n_resident;
         size_t need = 0;
         if (!kvflash_gpu_mass_->fits_now(kvflash_exact_dims(), k0->type, ct, (int)(k0->ne[1] / ct), n_ev,
                                          (int)qs.size() + st.n, &need)) {
@@ -3706,7 +3706,10 @@ bool Qwen35Backend::kvflash_prefill_score(int sealed_tokens, double & score_ms) 
         for (size_t o = kvflash_q_tail_.size() - n_v2 * qsize; o < kvflash_q_tail_.size(); o += qsize)
             qs.push_back(kvflash_q_tail_.data() + o);
     }
-    if (kvflash_uq_queries_ > 0) kvflash_uq_append(qs, sealed, qsize, n_v2);
+    if (kvflash_uq_queries_ > 0) {
+        const int found = luce::common::kvflash_uq_find(kvflash_uq_stores_, kvflash_uq_req_hi_, kvflash_uq_req_hash_);
+        kvflash_uq_append(kvflash_pager_, found >= 0 ? &kvflash_uq_stores_[(size_t)found] : nullptr, kvflash_uq_miss_.c_str(), qs, sealed, qsize, n_v2);
+    }
     std::vector<std::vector<float>> o;
     std::vector<luce::common::KvFlashMassPlanes> planes;
     gpu_scored = n_v2 > 0 && kvflash_exact_scores_gpu(sealed, qs, o, planes);

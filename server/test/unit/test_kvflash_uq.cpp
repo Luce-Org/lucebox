@@ -148,6 +148,24 @@ TEST_CASE(KvflashUqFixture, cut_follows_the_question_not_the_store) {
     CHECK(kvflash_uq_cut(t, 0, 0, 1000) == -1);           // off
     CHECK(kvflash_uq_cut(KvFlashHumanTurn{}, 64, 0, 1000) == -1);
 }
+TEST_CASE(KvflashUqFixture, a_store_holds_a_question_by_its_end_and_prefix_hash) {
+    const KvFlashUqStore st = mk(300, 7);
+    CHECK(kvflash_uq_holds(st, 300, 7));
+    CHECK(!kvflash_uq_holds(st, 300, 8));                  // another prompt prefix
+    CHECK(!kvflash_uq_holds(st, 364, 7));                  // another question
+    CHECK(!kvflash_uq_holds(KvFlashUqStore{}, -1, 0));     // nothing stored, no question
+}
+TEST_CASE(KvflashUqFixture, cut_rows_are_the_cuts_last_rows_inside_the_window) {
+    auto p = kvflash_uq_plan(KvFlashHumanTurn{1000, 1100}, 64, 0, 5000);   // window [1036, 1100)
+    CHECK(kvflash_uq_cut_rows(p, 512, 512) == 0);          // [512, 1024): before the window
+    CHECK(kvflash_uq_cut_rows(p, 1024, 76) == 64);         // [1024, 1100): the whole window
+    CHECK(kvflash_uq_cut_rows(p, 1024, 30) == 18);         // [1024, 1054): its first 18 rows
+    CHECK(kvflash_uq_cut_rows(p, 1054, 46) == 46);         // [1054, 1100): the rest
+    CHECK(kvflash_uq_cut_rows(p, 1100, 512) == 0);         // behind it
+    CHECK(kvflash_uq_cut_rows(p, 1024, 512) == 0);         // a cut over the question's end: its last rows are not the window
+    p.capture = false;                                     // stored, or not in this prefill
+    CHECK(kvflash_uq_cut_rows(p, 1024, 76) == 0);
+}
 TEST_CASE(KvflashUqFixture, rewind_below_the_window_recaptures) {
     const auto p = kvflash_uq_plan(KvFlashHumanTurn{100, 300}, 64, 0, 1000);   // window [236, 300)
     CHECK(kvflash_uq_rewind_recaptures(p, 97));            // start of the human turn

@@ -120,8 +120,8 @@ struct KvFlashProfile {
 inline KvFlashProfile kvflash_resolve_concurrent_profile(const KvFlashProfileRequest & r) {
     KvFlashProfile p;
     // C1.4: the recall profile (QK policy, mode-4 reselect, recall blocks) runs per slot
-    // when every piece of it is asked for explicitly; uq, preamble pins and tau stay C2.
-    const char * what = r.explicit_uq ? "uq" : r.explicit_preamble_pin ? "preamble pins" : r.explicit_tau ? "tau" : nullptr;
+    // when every piece of it is asked for explicitly; preamble pins and tau stay C2.
+    const char * what = r.explicit_preamble_pin ? "preamble pins" : r.explicit_tau ? "tau" : nullptr;
     if (what) {
         p.ok = false;
         p.error = std::string("concurrent KVFlash is LRU or per-slot recall; ") + what + " is C2 and not supported yet";
@@ -154,6 +154,11 @@ inline KvFlashProfile kvflash_resolve_concurrent_profile(const KvFlashProfileReq
         };
         p.log_line = "[kvflash] concurrent profile: per-slot recall (C1.4 defaults installed; "
                      "LUCE_KVFLASH_POLICY=lru keeps LRU only)";
+        return p;
+    }
+    if (r.explicit_uq) {   // the question's queries feed the per-slot scorer: without it the setting would do nothing
+        p.ok = false;
+        p.error = "LUCE_KVFLASH_UQ_QUERIES needs per-slot recall; concurrent KVFlash is LRU only here";
         return p;
     }
     p.log_line = (r.arch == "qwen35" && r.multi_model && !r.explicit_lru_policy)

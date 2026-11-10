@@ -75,6 +75,12 @@ inline KvFlashUqTake kvflash_uq_batch_take(int batch_start, int batch_tokens, in
     return t;
 }
 
+// The slot engine captures per cut: how many rows of the cut [pos, pos + n) are inside the window while the
+// plan still captures. No cut spans p.cut (the forced cut), so they are the cut's last rows.
+inline int kvflash_uq_cut_rows(const KvFlashUqPlan & p, int pos, int n) {
+    return p.capture && pos + n <= p.cut ? std::max(0, pos + n - std::max(pos, p.win_lo)) : 0;
+}
+
 // The captured rows of one session, keyed by {hi, hash of ids[0, hi)}. Not persisted into snapshots.
 struct KvFlashUqStore {
     int lo = -1, hi = -1, n = 0;    // the n rows are the queries of positions [hi - n, hi)
@@ -93,11 +99,14 @@ inline uint64_t kvflash_uq_hash(const std::vector<int32_t> & ids, int upto) {
 // Up to this many sessions keep a store (host memory: n rows * layers * q heads * head dim floats each).
 constexpr size_t kKvFlashUqMaxStores = 8;
 
+// The store holds the rows of the question that ends at hi after the prompt prefix with this hash.
+inline bool kvflash_uq_holds(const KvFlashUqStore & s, int hi, uint64_t hash) { return !s.empty() && s.hi == hi && s.hash == hash; }
+
 // LRU of stores, most recent first, keyed by {hi, hash of ids[0, hi)}: the key is the content of the
 // prompt prefix, so a store stays valid whatever the pager or history did since.
 inline int kvflash_uq_find(const std::vector<KvFlashUqStore> & v, int hi, uint64_t hash) {
     for (size_t i = 0; i < v.size(); i++)
-        if (!v[i].empty() && v[i].hi == hi && v[i].hash == hash) return (int)i;
+        if (kvflash_uq_holds(v[i], hi, hash)) return (int)i;
     return -1;
 }
 // Moves entry i to the front (a hit).

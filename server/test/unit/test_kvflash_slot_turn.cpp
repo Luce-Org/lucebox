@@ -4,6 +4,7 @@
 #include "CppUnitTestFramework.hpp"
 #include "kvflash_test_seams.h"
 #include "../../src/common/kvflash_slot_turn.h"
+#include "../../src/common/kvflash_uq.h"
 
 #include <array>
 #include <vector>
@@ -507,6 +508,85 @@ TEST_CASE(KvflashSlotTurnFixture, v5_no_ladder_move_of_the_reachable_states_hold
             CHECK(got[0] == (m.to.ckpt > 0 ? m.ckpt_from : -1)); CHECK(got[1] == (m.to.trunk > 0 ? m.trunk_from : -1)); CHECK(got[2] == (m.to.extra > 0 ? m.extra_from : -1));
             const KvFlashLadderMove c = kvflash_ladder_ckpt(m.to, len + 100);       // then the next checkpoint: the snapshot is taken after the frees
             CHECK(kvflash_ladder_peak(held_mask(m.to, false), kvflash_ladder_ops(c), true) <= 3);
+        }
+    }
+}
+
+// ---- LUCE_KVFLASH_UQ_QUERIES in the slot engine: the question's end is a cut, its last rows are captured ----
+namespace {
+// Cut ends of the pass from `from` to the prompt end.
+std::vector<int> pass_ends(const KvFlashSlotTurn & t, int from) {
+    std::vector<int> e;
+    for (int p = from; p < t.end;) {
+        const int n = kvflash_slot_turn_next_cut(t, p, kU);
+        if (n <= 0) break;
+        e.push_back(p += n);
+    }
+    return e;
+}
+}  // namespace
+
+TEST_CASE(KvflashSlotTurnFixture, the_questions_end_is_a_cut_end_of_the_first_pass_the_replay_and_an_lru_turn) {
+    KvFlashSlotTurn t = kvflash_slot_turn_plan(prompt_with_user(5000, 4800), 0, kImStart, kUser, kCt, kQ, kU, kT, true);
+    REQUIRE(t.first_pass());
+    const std::vector<int> grid = pass_ends(t, 0);
+    CHECK(std::find(grid.begin(), grid.end(), 4990) == grid.end());
+    kvflash_slot_turn_force_cut(t, 4990);                       // the question ends 10 tokens before the prompt end
+    std::vector<int> want = grid;
+    want.insert(want.end() - 1, 4990);
+    CHECK(pass_ends(t, 0) == want);
+    // the last 64 prompt queries still add up over the two cuts the question's end made of the last one
+    CHECK(kvflash_slot_turn_step(t, 4800, 190, kT).q_rows == 54);
+    CHECK(kvflash_slot_turn_step(t, 4990, 10, kT).q_rows == 10);
+    CHECK(kvflash_slot_turn_step(t, 4990, 10, kT).capture);
+    CHECK(kvflash_slot_turn_step(t, 4608, 192, kT).snapshot);   // R is still a cut end
+    t.phase = KvFlashTurnPhase::Replay;
+    CHECK((pass_ends(t, 4800) == std::vector<int>{4990, 5000}));
+    // a cut end already there is not doubled; -1 (no question inside the prefill) changes nothing
+    KvFlashSlotTurn same = kvflash_slot_turn_plan(prompt_with_user(5000, 4800), 0, kImStart, kUser, kCt, kQ, kU, kT, true);
+    kvflash_slot_turn_force_cut(same, 4800);
+    CHECK(pass_ends(same, 0) == grid);
+    kvflash_slot_turn_force_cut(same, -1);
+    CHECK(pass_ends(same, 0) == grid);
+    // an LRU turn: the U grid, the checkpoint at the last <|im_start|>, the question's end, the prompt end
+    KvFlashSlotTurn lru = kvflash_slot_turn_plan(prompt_with_user(1280, 1100), 0, kImStart, kUser, kCt, kQ, kU, kT, true);
+    REQUIRE(!lru.recall());
+    kvflash_slot_turn_force_cut(lru, 1200);
+    CHECK((pass_ends(lru, 0) == std::vector<int>{512, 1024, 1100, 1200, 1280}));
+    CHECK((pass_ends(lru, 1200) == std::vector<int>{1280}));    // resumed at the cut: it is behind
+}
+
+TEST_CASE(KvflashSlotTurnFixture, the_window_rows_of_the_cuts_add_up_to_the_plan_in_every_pass) {
+    struct Case { int n_prompt, user_at, kv_offset, q_lo, q_hi; };
+    for (const Case & c : std::vector<Case>{
+             {5000, 4800, 0, 4803, 4990},      // the question is the last user turn (a first request that does not fit)
+             {5000, 4800, 0, 900, 1030},       // far back, its window [966, 1030) straddles the U grid at 1024
+             {5000, 4800, 0, 1000, 1020},      // 20 tokens: the window is the whole question
+             {1280, 1100, 0, 1103, 1270},      // an LRU turn (the prompt fits)
+             {9000, 8800, 4096, 5000, 5200},   // resumed below the question
+         }) {
+        const KvFlashHumanTurn q{c.q_lo, c.q_hi};
+        KvFlashSlotTurn t = kvflash_slot_turn_plan(prompt_with_user(c.n_prompt, c.user_at), c.kv_offset, kImStart, kUser, kCt, kQ, kU, kT, true);
+        kvflash_slot_turn_force_cut(t, kvflash_uq_cut(q, 64, c.kv_offset, t.end));
+        KvFlashUqPlan up = kvflash_uq_plan(q, 64, c.kv_offset, t.end);
+        REQUIRE(up.capture);
+        auto rows_over = [&](int from) {
+            int rows = 0, pos = from;
+            for (int e : pass_ends(t, from)) { rows += kvflash_uq_cut_rows(up, pos, e - pos); pos = e; }
+            return rows;
+        };
+        CHECK(rows_over(c.kv_offset) == up.n);
+        const std::vector<int> ends = pass_ends(t, c.kv_offset);
+        CHECK(std::find(ends.begin(), ends.end(), c.q_hi) != ends.end());
+        if (t.first_pass()) {
+            int q_rows = 0, pos = c.kv_offset;
+            for (int e : ends) { q_rows += kvflash_slot_turn_step(t, pos, e - pos, kT).q_rows; pos = e; }
+            CHECK(q_rows == kT);
+            // the replay recaptures a window it reaches back over, and only then
+            const bool again = kvflash_uq_rewind_recaptures(up, t.r);
+            CHECK(again == (c.q_lo > t.r));
+            t.phase = KvFlashTurnPhase::Replay;
+            CHECK(rows_over(t.r) == (again ? up.n : 0));
         }
     }
 }
