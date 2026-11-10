@@ -41,9 +41,9 @@ struct Qwen4ExpRow;
 // (qwen4exp_verify_batched; rows is kQwen4ExpBatchedVerifyRows, or fewer when the caches' draft cap or the context's
 // end is lower), so the experts a step reads serve every slot's drafts, or decode one token each in the batched graph,
 // which still returns each slot's final HC residual, so the draft layers stay caught up and drafting resumes. A
-// request that cannot draft this step (a grammar, a thinking budget about to close: the plan's allow_speculation; or
-// no live draft state) decodes its one token as a one-row slot of that verify graph, so it does not hold the others'
-// drafts back. The step takes the mode that has committed more tokens per second for that many slots and drafting
+// request that cannot draft for its whole reply (a grammar, or no live draft state) decodes its one token as a one-row
+// slot of that verify graph, so it does not hold the others' drafts back; one that only pauses its drafts (the plan's
+// allow_speculation, cleared near a thinking budget's close) sends the step to plain. The step takes the mode that has committed more tokens per second for that many slots and drafting
 // slots (verify_pays), unless a test forces one (set_decode_mode). Every pick is computed where the multi-slot rows compute it, so a request's text does not depend
 // on the other requests or the mode. The draft layer's state sits in the cache (K/V, mtp_prev_hidden at
 // mtp_prev_pos) at every prompt-chunk boundary, where prefix snapshots capture it.

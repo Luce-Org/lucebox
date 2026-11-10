@@ -1,6 +1,6 @@
 // GPU adapter contract and lifecycle soak for the full-cache engine, and with every slot's cache carrying the MTP draft
 // layer (as the server makes them): prefix checkpoints across slots, and every request of a concurrent run producing
-// its alone stream token for token, with the batched verify forced on and off, and with requests that may not draft
+// its alone stream token for token, with the batched verify forced on and off, and with requests under a grammar
 // (one-row slots of the verify) beside drafting ones.
 // Usage: test_qwen4exp_seq_engine <shard1.gguf> [ctx=32768] (the MTP sidecar is found beside the model, as the server
 // finds it)
@@ -8,6 +8,8 @@
 #include "qwen4exp_graph.h"
 #include "qwen4exp_internal.h"
 #include "common/concurrency/seq_engine.h"
+#include "common/gbnf.h"
+#include "common/output_constraint.h"
 #include "common/prompt_lookup.h"
 #include "seq_engine_contract.h"
 #include "common/sampler.h"
@@ -476,9 +478,21 @@ static bool run_prefix_cuts(Qwen4ExpSeqEngine & engine, const Qwen4ExpWeights & 
     return ok;
 }
 
-// Whether a request may draft (the plan's allow_speculation, which the scheduler clears for a grammar or a thinking
-// budget about to close): always, never, or in turns of four tokens of its stream.
+// Whether a request may draft (the plan's allow_speculation): always; never, under a grammar (the scheduler clears it
+// for one), so it cannot draft for its whole reply; or in turns of four tokens of its stream, as near a thinking
+// budget's close, so it pauses.
 enum class Drafts { always, never, turns };
+
+// A grammar every token keeps to (each token reads "a"): a request under it samples as it would without one, and the
+// engine sees a request that cannot draft.
+static std::shared_ptr<OutputConstraint> any_text(int n_vocab) {
+    std::string error;
+    std::unique_ptr<gbnf::Matcher> matcher = gbnf::Matcher::compile("root ::= \"a\"*", "root", error);
+    if (!matcher) std::fprintf(stderr, "[alone-vs-together] grammar: %s\n", error.c_str());
+    return std::make_shared<OutputConstraint>(
+        ConstraintVocab::build(std::vector<std::string>((size_t) n_vocab, "a"), {}), std::move(matcher),
+        OutputConstraint::Options{});
+}
 
 // One request of a run: its prompt, sampler and token limit (the prompt's sampled token included).
 struct Request {
@@ -502,7 +516,7 @@ struct RunResult {
     int early_stops = 0;   // stops while another request still runs
     int mixed_steps = 0;   // verify steps with one-row slots (no drafts) beside drafting ones
     int lone_steps = 0;    // ... with exactly one drafting slot
-    int switched = 0;      // requests with both a one-row and a drafting output in mixed steps
+    int paused = 0;        // steps where a drafting request paused (each slot decodes one token)
     int one_row_dense = 0; // one-row outputs of mixed steps before the first QSA position
     int one_row_qsa = 0;   // ... at or past it
 };
@@ -558,7 +572,6 @@ static RunResult run_requests(Qwen4ExpSeqEngine & engine, const std::vector<Requ
         const Drafts d = reqs[(size_t) i].drafts;
         return d == Drafts::always || (d == Drafts::turns && r.streams[(size_t) i].size() / 4 % 2 == 0);
     };
-    std::vector<int> as_one((size_t) n, 0), as_drafting((size_t) n, 0);
     for (int guard = 0; guard < 4096; ++guard) {
         SeqEngine::StepPlan plan;
         for (int i = 0; i < n; ++i)
@@ -579,12 +592,15 @@ static RunResult run_requests(Qwen4ExpSeqEngine & engine, const std::vector<Requ
             [](const SeqEngine::DecodeOutput & o) { return o.spec_offered > 0; });
         const bool mixed = drafting > 0 && drafting < (int) result.decode.size();
         r.mixed_steps += mixed;
+        r.paused += drafting == 0 && std::any_of(plan.decode.begin(), plan.decode.end(), [&](const SeqEngine::StepInput & in) {
+            const int i = request_at(in.slot);
+            return i >= 0 && !in.allow_speculation && reqs[(size_t) i].drafts == Drafts::turns;
+        });
         r.lone_steps += mixed && drafting == 1;
         for (const auto & output : result.decode) {
             if (beside) ++(output.spec_offered > 0 ? r.verify_rows : r.plain_rows);
             const int i = request_at(output.slot);
             if (mixed && i >= 0) {
-                ++(output.spec_offered > 0 ? as_drafting : as_one)[(size_t) i];
                 // The position this step decoded the request's token at.
                 const int pos = (int) (reqs[(size_t) i].prompt.size() + r.streams[(size_t) i].size()) - 1;
                 if (output.spec_offered == 0) ++(pos < kQsaFirst ? r.one_row_dense : r.one_row_qsa);
@@ -597,8 +613,6 @@ static RunResult run_requests(Qwen4ExpSeqEngine & engine, const std::vector<Requ
             if (output.status == SeqEngine::PrefillOutput::Status::completed) take(request_at(output.slot), {output.token});
         }
         if (!r.ok) break;
-        r.switched = 0;
-        for (int i = 0; i < n; ++i) r.switched += as_one[(size_t) i] > 0 && as_drafting[(size_t) i] > 0;
     }
     r.ok = false;
     for (int i = 0; i < n; ++i) if (state[(size_t) i] != 2) engine.retire(r.slots[(size_t) i]);
@@ -611,10 +625,10 @@ static RunResult run_requests(Qwen4ExpSeqEngine & engine, const std::vector<Requ
 // two at once, and the longest ends alone on a slot past 0 (a one-slot batched verify). One request stops at EOS:
 // eos_chat_id is set to a token its alone stream reaches mid-reply (the engine reads EOS from the weights, on the host
 // only; `eos` keeps the pick across draft caps). The limits and that EOS must cut a verified block somewhere.
-// The same run where some requests may not draft (Drafts): a one-row slot beside drafting ones, one that switches in
-// turns, the sampled request as a one-row slot beside exactly one drafting slot, and none drafting (the plain step,
-// whatever the mode); and four requests whose replies cross the QSA boundary, the sampled one as a one-row slot
-// crossing it beside drafting ones.
+// The same run where some requests may not draft (Drafts): one under a grammar as a one-row slot beside drafting
+// ones while another pauses in turns (the plain step), the sampled request as a one-row slot beside exactly one
+// drafting slot, and none drafting (the plain step, whatever the mode); and four requests whose replies cross the QSA
+// boundary, the sampled one as a one-row slot crossing it beside drafting ones.
 static bool run_alone_vs_together(ggml_backend_t backend, Qwen4ExpWeights & w, const std::vector<Qwen4ExpCache *> & caches,
                                   int ctx, int verify_width, const char * model_path, int32_t & eos) {
     Tokenizer tokenizer;
@@ -672,11 +686,19 @@ static bool run_alone_vs_together(ggml_backend_t backend, Qwen4ExpWeights & w, c
         }
         return streams;
     };
-    // `set` together with each request's Drafts, in both modes, against its alone streams; `covered` judges the
-    // verify mode's run (the plain mode's must verify nothing).
+    // `set` together with each request's Drafts (never: under any_text), in both modes, against its alone streams
+    // (`drafting`: those of the requests as they are in `set`); `covered` judges the verify mode's run (the plain
+    // mode's must verify nothing).
+    const std::shared_ptr<OutputConstraint> grammar = any_text(w.n_vocab);
     auto together = [&](const char * name, std::vector<Request> set, const std::vector<Drafts> & drafts,
-                        const std::vector<std::vector<int32_t>> & alone, auto && covered) {
-        for (size_t i = 0; i < set.size(); ++i) set[i].drafts = drafts[i];
+                        const std::vector<std::vector<int32_t>> & drafting, auto && covered) {
+        std::vector<std::vector<int32_t>> alone = drafting;
+        for (size_t i = 0; i < set.size(); ++i) {
+            set[i].drafts = drafts[i];
+            if (drafts[i] == Drafts::always) continue;
+            if (drafts[i] == Drafts::never) set[i].sampler.constraint = grammar;
+            alone[i] = alone_streams({set[i]})[0];
+        }
         for (const auto mode : {Qwen4ExpSeqEngine::DecodeMode::verify, Qwen4ExpSeqEngine::DecodeMode::plain}) {
             if (!ok) break;
             const bool verify = mode == Qwen4ExpSeqEngine::DecodeMode::verify;
@@ -698,10 +720,10 @@ static bool run_alone_vs_together(ggml_backend_t backend, Qwen4ExpWeights & w, c
             }
             const bool run_covered = verify ? covered(r) : r.verify_rows == 0 && r.plain_rows > 0;
             std::printf("[alone-vs-together] %s draft=%d/%d mode=%s verify_rows=%d plain_rows=%d cut_limit=%d "
-                        "cut_eos=%d early_stops=%d mixed_steps=%d lone_steps=%d switched=%d one_row_dense=%d "
+                        "cut_eos=%d early_stops=%d mixed_steps=%d lone_steps=%d paused=%d one_row_dense=%d "
                         "one_row_qsa=%d covered=%d\n", name, caps, caches[1]->mtp_draft, verify ? "verify" : "plain",
                         r.verify_rows, r.plain_rows, r.cut_limit, r.cut_eos, r.early_stops, r.mixed_steps,
-                        r.lone_steps, r.switched, r.one_row_dense, r.one_row_qsa, (int) run_covered);
+                        r.lone_steps, r.paused, r.one_row_dense, r.one_row_qsa, (int) run_covered);
             ok = ok && run_covered;
         }
     };
@@ -712,19 +734,20 @@ static bool run_alone_vs_together(ggml_backend_t backend, Qwen4ExpWeights & w, c
     together("all", reqs, {A, A, A, A}, alone, [](const RunResult & r) {
         return r.early_stops > 0 && r.verify_rows > 0 && r.cut_limit + r.cut_eos > 0;
     });
-    // Slot 0's request never drafts and one switches in turns: one-row slots beside drafting ones, and a request
-    // that is both.
+    // Slot 0's request is under a grammar and one pauses its drafts in turns: one-row slots beside drafting ones,
+    // and plain steps while a request pauses.
     together("mixed", reqs, {N, A, T, A}, alone, [](const RunResult & r) {
-        return r.early_stops > 0 && r.mixed_steps > 0 && r.switched > 0;
+        return r.early_stops > 0 && r.mixed_steps > 0 && r.paused > 0;
     });
-    // Only the longest request drafts: exactly one drafting slot beside one-row slots, the sampled one among them.
+    // Only the longest request drafts: exactly one drafting slot beside one-row slots (under the grammar), the sampled
+    // one among them.
     together("one", reqs, {N, N, N, A}, alone, [](const RunResult & r) { return r.lone_steps > 0; });
-    // No request drafts: no verify step at all, in either mode (each step is the plain one).
+    // No request drafts (all under the grammar): no verify step at all, in either mode (each step is the plain one).
     together("none", reqs, {N, N, N, N}, alone, [](const RunResult & r) {
         return r.verify_rows == 0 && r.plain_rows > 0 && r.mixed_steps == 0;
     });
-    // Replies that start just before the QSA boundary: the sampled request (from 2037) as a one-row slot that crosses
-    // it beside drafting ones, the longest (from 2051, its limit raised to outlive the sampled one) drafting QSA rows
+    // Replies that start just before the QSA boundary: the sampled request (from 2037, under the grammar) as a one-row
+    // slot that crosses it beside drafting ones, the longest (from 2051, its limit raised to outlive the sampled one) drafting QSA rows
     // beside it.
     std::vector<Request> qsa = reqs;
     for (size_t i = 0; i < qsa.size(); ++i) {

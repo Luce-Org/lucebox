@@ -418,7 +418,11 @@ std::vector<int> Qwen4ExpSeqEngine::batched_verify_shape(const StepPlan & plan) 
     std::vector<int32_t> positions;
     for (const StepInput & input : plan.decode) {
         const SeqSlot & slot = slots_.slot(input.slot);
-        const bool drafts = mtp_[(size_t)input.slot].live && input.allow_speculation;
+        const bool live = mtp_[(size_t)input.slot].live;
+        const bool drafts = live && input.allow_speculation;
+        // A request that pauses its drafts for a few tokens (a thinking budget about to close) takes the plain step,
+        // as before; one that cannot draft for its whole reply (a grammar, no live draft state) takes one row.
+        if (!drafts && live && !slot.sampler.constraint) return {};
         // Each cache's rollback rows bound its verify (a fixed --verify-width of 2 or 3 leaves 2 or 3).
         rows.push_back(!drafts ? 1 : std::max(1, std::min({kQwen4ExpBatchedVerifyRows, max_context() - slot.cur_pos,
                                                            caches_[(size_t)input.slot]->mtp_draft + 1})));
