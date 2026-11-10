@@ -404,7 +404,7 @@ int Qwen4ExpSeqEngine::batched_verify_width(const StepPlan & plan) const {
         caches.push_back(caches_[(size_t)input.slot]);
         positions.push_back(slot.cur_pos);
     }
-    if (rows < 2 || !qwen4exp_verify_batched_supported(weights_, caches.data(), positions.data(),
+    if (rows < 2 || !qwen4exp_verify_batched_supported(backend_, weights_, caches.data(), positions.data(),
                                                        (int)caches.size(), rows)) return 0;
     return rows;
 }

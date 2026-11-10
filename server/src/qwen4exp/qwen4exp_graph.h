@@ -255,19 +255,23 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
                                        std::vector<int32_t> * out_greedy = nullptr,
                                        const uint8_t * logits_rows = nullptr);
 
-// Allocation plan of the batched verify graph: n_slots slots of `rows` rows at `pos` (the cache stands in for each).
+// Allocation plan of the batched verify graph: n_slots slots of `rows` rows at `pos` (the cache stands in for each),
+// dense or QSA as a T=1 decode at each row's position is.
 Qwen4ExpGraphMemory qwen4exp_batched_verify_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
     Qwen4ExpCache & cache, int n_slots, int rows, int pos);
 // Every decoding slot's MTP verify in one graph: slot s feeds `rows` tokens (its pending token, then rows - 1 drafts),
 // slot-major in `tokens`, at positions[s] onward. Each row computes what a T=1 decode at its position computes (the
 // slot groups' batch-invariant products, each row's own T=1 attention, each slot's recurrence over its rows), and every
-// slot keeps what its rollback needs as a solo verify does (qwen4exp_verify_rollback). Needs every cache with the
-// MTP rollback state (qwen4exp_verify_supported), dense attention for every row and no KVFlash pool. False: not run
-// (the caller decodes the step plainly). `out` (Qwen4ExpRowOutputs, top_n in) receives each row's argmax and, with
-// top_n > 0, its top_n candidates; the logits rows stay on the device until the next call
-// (qwen4exp_verify_batched_row). hidden: each row's final HC residual (n_embd * n_hc floats), slot-major.
-bool qwen4exp_verify_batched_supported(const Qwen4ExpWeights & w, Qwen4ExpCache * const * caches,
-                                       const int32_t * positions, int n_slots, int rows);
+// slot keeps what its rollback needs as a solo verify does (qwen4exp_verify_rollback). A row past the QSA boundary
+// attends as a stable verify graph's QSA row; slots and rows of both kinds mix freely. Needs every cache with the MTP
+// rollback state (qwen4exp_verify_supported) and no KVFlash pool, and for QSA rows a backend that serves them in a
+// retained graph (as a multi-slot decode step needs). False: not run (the caller decodes the step plainly). `out`
+// (Qwen4ExpRowOutputs, top_n in) receives each row's argmax and, with top_n > 0, its top_n candidates; the logits rows
+// stay on the device until the next call (qwen4exp_verify_batched_row). hidden: each row's final HC residual
+// (n_embd * n_hc floats), slot-major.
+bool qwen4exp_verify_batched_supported(ggml_backend_t backend, const Qwen4ExpWeights & w,
+                                       Qwen4ExpCache * const * caches, const int32_t * positions, int n_slots,
+                                       int rows);
 Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen4ExpWeights & w,
         Qwen4ExpCache * const * caches, const int32_t * tokens, const int32_t * positions, int n_slots, int rows,
         Qwen4ExpBatchedDecodeWorkspace & workspace, Qwen4ExpRowOutputs & out, std::vector<float> & hidden);

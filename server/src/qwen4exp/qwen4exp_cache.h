@@ -110,10 +110,11 @@ struct Qwen4ExpBatchedDecodeWorkspace : Qwen4ExpDecodeWorkspace {
     int rows = 1;   // per slot: 1 for a decode step, the verify width for a batched verify (qwen4exp_verify_batched)
     ggml_tensor * slot_ids = nullptr;            // I32 [n]: each slot's slab of Qwen4ExpSlotStates
     // Per slot: attention mask (dense slots) and I32 [1] K/V row. A batched verify: per group, F16 [max span, rows]
-    // with a column per row, and per slot its I32 [rows] K/V rows.
+    // with a column per row (null when every row is QSA), and per slot its I32 [rows] K/V rows.
     std::vector<ggml_tensor *> masks, kv_rows;
-    // QSA slots: each one's runtime inputs and [4] M-RoPE positions as its stable T=1 graph has them, views of
-    // qsa_params (I32 [10 * n]), qsa_visibility (each QSA slot's blocks in turn) and qsa_positions (I32 [4 * n]).
+    // QSA slots (qsa_blocks >= 0): each one's runtime inputs and M-RoPE positions as a stable graph of its `rows` rows
+    // has them, views of qsa_params (I32 [10 * rows] per slot), qsa_visibility (each QSA slot's blocks per row in
+    // turn) and qsa_positions (I32 [4 * rows] per slot).
     std::vector<Qwen4ExpDecodeWorkspace> slot_qsa;
     ggml_tensor * qsa_positions = nullptr;
     std::vector<const Qwen4ExpCache *> caches;   // the slots the graph was built for, in order

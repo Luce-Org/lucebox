@@ -279,14 +279,18 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
             if (!retain(m, resident)) return 0;
             batched = std::max(batched, resident);
         }
-        // And the batched verify graph, at the end of the dense span (its rows attend densely).
-        if (mtp) {
+        // And the batched verify graph, at the same two shapes.
+        size_t batched_verify = 0;
+        for (const bool qsa : {false, true}) {
+            if (!mtp || (qsa && !qsa_rows)) continue;
+            const int end = qsa ? cache.max_ctx : dense_last + 1;
             const Qwen4ExpGraphMemory m = qwen4exp_batched_verify_graph_memory(
-                backend, w, cache, slots, verify_rows, std::max(0, dense_last + 1 - verify_rows));
+                backend, w, cache, slots, verify_rows, std::max(0, end - verify_rows));
             size_t resident = 0;
             if (!retain(m, resident)) return 0;
-            batched += resident;
+            batched_verify = std::max(batched_verify, resident);
         }
+        batched += batched_verify;
     }
     // The decode workspaces stay resident while the next prompt prefills.
     const size_t fixed = (slots - resident_slots) * slot_state + (slots - 1) * slot_draft + shadow + shadow_tmp +
