@@ -727,8 +727,9 @@ bool Qwen35Backend::init() {
         }
         if (kvflash_slots) {
             // No PagedKvPool: the slot pagers own the arena's rows.
+            fixed_chain.scratch_base = (int)arena.scratch_base;   // chain scratch rows sit beyond the slices
             if (!init_kvflash_slots(n_slots, kvflash_quota_chunks(kvflash_tokens_), cfg_.device.max_ctx,
-                                    arena.pool_tokens, max_concurrent_prefills, mixed_prefill_tokens,
+                                    arena.dead_row, fixed_chain, max_concurrent_prefills, mixed_prefill_tokens,
                                     long_mixed_prefill_tokens, long_prefill_threshold, idle_prefill_tokens)) {
                 return false;
             }
@@ -748,6 +749,10 @@ bool Qwen35Backend::init() {
             std::printf("[kvflash] %d slots x %d chunks, arena %lld rows, headroom 8, scoring %s\n",
                         n_slots, kvflash_quota_chunks(kvflash_tokens_), (long long)arena.rows,
                         kvflash_prefill_reselect_ > 0 ? "per-slot recall" : "none (LRU)");
+            if (fixed_chain.enabled)
+                std::fprintf(stderr, "[parallel-chain] KVFlash fixed DFlash2 width=%d, scratch_base=%d stride=%d dead_row=%lld "
+                                     "(LUCE_KVFLASH_CHAIN_SPEC=1, test-only)\n",
+                             fixed_chain.width, fixed_chain.scratch_base, fixed_chain.scratch_stride, (long long)arena.dead_row);
             std::fflush(stdout);
         } else if (slot_pool) {
             fixed_chain.scratch_base = (int)pool_tokens;
@@ -1785,7 +1790,7 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
 // over them. Headroom 8 blocks (D2). The host budget is LUCE_KVFLASH_HOST_MIB
 // (default 16384): reservations beyond it are refused at admission (R5).
 bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ctx, int64_t scratch_row,
-                                       int max_prefills, int mixed, int long_mixed,
+                                       FixedChainConfig fixed_chain, int max_prefills, int mixed, int long_mixed,
                                        int long_threshold, int idle) {
     constexpr int kHeadroom = 8;
     using namespace luce::common;
@@ -1834,7 +1839,7 @@ bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ct
     kvf_kv_ = std::make_unique<KvFlashSlotKv>(raw, *kvf_ledger_, kc);
     kvf_driver_ = std::make_unique<KvFlashStepDriver>(raw, *kvf_arena_, kHeadroom);
     seq_engine_ = std::make_unique<Qwen35SeqEngine>(
-        *this, *kvf_kv_, *kvf_driver_, max_ctx, scratch_row, max_prefills, mixed, long_mixed, long_threshold, idle);
+        *this, *kvf_kv_, *kvf_driver_, max_ctx, scratch_row, fixed_chain, max_prefills, mixed, long_mixed, long_threshold, idle);
     return true;
 }
 

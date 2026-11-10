@@ -80,7 +80,7 @@ Qwen35SeqEngine::Qwen35SeqEngine(
 
 Qwen35SeqEngine::Qwen35SeqEngine(
         Qwen35Backend & backend, KvFlashSlotKv & kv, KvFlashStepDriver & driver,
-        int max_ctx, int64_t scratch_row, int max_prefills,
+        int max_ctx, int64_t scratch_row, FixedChainConfig fixed_chain, int max_prefills,
         int mixed_prefill_tokens, int long_mixed_prefill_tokens,
         int long_prefill_threshold, int idle_prefill_tokens)
     : max_prefills_(std::max(1, max_prefills)),
@@ -90,7 +90,8 @@ Qwen35SeqEngine::Qwen35SeqEngine(
       idle_prefill_tokens_(std::max(1, idle_prefill_tokens)),
       prefill_quantum_(kKvFlashCutU),
       b_(backend), slots_(kv, max_ctx), kvf_kv_(&kv), kvf_(&driver),
-      scratch_row_(scratch_row) {
+      scratch_row_(scratch_row),
+      fixed_chain_(fixed_chain) {
     init_slots_();
 }
 
@@ -143,11 +144,9 @@ void Qwen35SeqEngine::init_slots_() {
         embed_rows_ = embed_rows_pageable_.data();
     }
 
-    fixed_chain_ready_ = fixed_chain_.enabled && fixed_chain_.width > 1 &&
-        fixed_chain_.width <= 16 &&
-        fixed_chain_.width == b_.dw_.block_size &&
-        fixed_chain_.scratch_stride >= fixed_chain_.width &&
-        b_.cache_.target_feat && b_.cache_.target_feat_cap > 0;
+    fixed_chain_ready_ = chain_config_ready(
+        fixed_chain_.enabled, fixed_chain_.width, b_.dw_.block_size, fixed_chain_.scratch_stride,
+        b_.cache_.target_feat && b_.cache_.target_feat_cap > 0);
     if (!fixed_chain_ready_) return;
 
     // Candidate verify widths: a few shapes keep graph builds and captures

@@ -7,6 +7,14 @@
 
 namespace luce::common {
 
+// A fixed DFlash2 chain can run only when the engine was handed an enabled chain
+// config whose width is the drafter's block (2..16), each slot's scratch stride
+// holds a whole chain, and the target feature ring exists.
+inline bool chain_config_ready(bool enabled, int width, int draft_block, int scratch_stride, bool feat_ring_ok) {
+    return enabled && width > 1 && width <= 16 && width == draft_block &&
+           scratch_stride >= width && feat_ring_ok;
+}
+
 inline int chain_decode_bucket_width(int lanes) {
     static constexpr int buckets[] = {
         1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64,

@@ -580,7 +580,7 @@ private:
     // engine, which borrows them; the arena is destroyed last (its members
     // synchronize its stream).
     bool init_kvflash_slots(int n_slots, int quota_chunks, int max_ctx, int64_t scratch_row,
-                            int max_prefills, int mixed, int long_mixed, int long_threshold, int idle);
+                            FixedChainConfig fixed_chain, int max_prefills, int mixed, int long_mixed, int long_threshold, int idle);
     std::unique_ptr<luce::common::KvFlashArena>                       kvf_arena_;
     std::vector<std::unique_ptr<luce::common::KvFlashSlotPager>>      kvf_pagers_;
     std::unique_ptr<luce::common::KvFlashHostLedger>                  kvf_ledger_;
