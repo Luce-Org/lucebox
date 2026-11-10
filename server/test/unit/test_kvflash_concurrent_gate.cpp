@@ -5,6 +5,7 @@
 #include "CppUnitTestFramework.hpp"
 #include "../../src/common/kvflash_concurrent_gate.h"
 #include "../../src/common/kvflash_arena.h"
+#include <cstdlib>
 #include <map>
 #include <utility>
 #include <vector>
@@ -60,6 +61,54 @@ TEST_CASE(KvflashConcurrentGateFixture, wmma_draft_chain_tree_and_pflash_are_ref
     { auto r = base(); r.tree = true;   const auto m = kvflash_concurrent_refusal(r); REQUIRE(m.has_value()); CHECK(m->find("tree") != std::string::npos); }
     { auto r = base(); r.pflash = true; const auto m = kvflash_concurrent_refusal(r); REQUIRE(m.has_value()); CHECK(m->find("PFlash") != std::string::npos); }
     { auto r = base(); r.images = true; const auto m = kvflash_concurrent_refusal(r); REQUIRE(m.has_value()); CHECK(m->find("image") != std::string::npos); }
+}
+
+namespace {
+// A DFlash2 chain request that satisfies every C-0 condition; each test below breaks one.
+KvFlashConcurrentRequest chain_request() {
+    KvFlashConcurrentRequest r;
+    r.arch = "qwen35";
+    r.draft = true;
+    r.chain_spec_switch = true;
+    r.draft_local_same_device = true;
+    r.draft_block = 16;
+    r.fa_window = 0;
+    return r;
+}
+}  // namespace
+
+TEST_CASE(KvflashConcurrentGateFixture, a_dflash2_chain_is_allowed_only_with_the_chain_spec_switch_and_every_chain_condition) {
+    CHECK(!kvflash_concurrent_refusal(chain_request()).has_value());
+    for (int b : {2, 4, 8, 16}) { auto r = chain_request(); r.draft_block = b; CHECK(!kvflash_concurrent_refusal(r).has_value()); }
+    auto refused = [&](KvFlashConcurrentRequest r, const char * what) {
+        const auto m = kvflash_concurrent_refusal(r);
+        REQUIRE(m.has_value());
+        CHECK(m->find(what) != std::string::npos);
+    };
+    { auto r = chain_request(); r.chain_spec_switch = false;       refused(r, "LUCE_KVFLASH_CHAIN_SPEC"); }
+    { auto r = chain_request(); r.tree = true;                     refused(r, "tree"); }
+    { auto r = chain_request(); r.draft_local_same_device = false; refused(r, "draft"); }
+    { auto r = chain_request(); r.draft_block = 17;                refused(r, "draft"); }
+    { auto r = chain_request(); r.draft_block = 1;                 refused(r, "draft"); }
+    { auto r = chain_request(); r.draft_block = 0;                 refused(r, "draft"); }
+    { auto r = chain_request(); r.fa_window = 4096;                refused(r, "draft"); }
+    { auto r = chain_request(); r.arch = "qwen35moe";              refused(r, "qwen35"); }
+    { auto r = chain_request(); r.pflash = true;                   refused(r, "PFlash"); }
+    { auto r = chain_request(); r.images = true;                   refused(r, "image"); }
+    { auto r = chain_request(); r.wmma_env = true;                 refused(r, "PAGED_WMMA"); }
+    // the switch without a draft changes nothing
+    { KvFlashConcurrentRequest r; r.arch = "qwen35"; r.chain_spec_switch = true; CHECK(!kvflash_concurrent_refusal(r).has_value()); }
+}
+
+TEST_CASE(KvflashConcurrentGateFixture, the_chain_spec_switch_reads_exactly_LUCE_KVFLASH_CHAIN_SPEC_equals_1) {
+    const char * old = std::getenv("LUCE_KVFLASH_CHAIN_SPEC");
+    const std::string saved = old ? old : "";
+    unsetenv("LUCE_KVFLASH_CHAIN_SPEC");
+    CHECK(!kvflash_chain_spec_switch());
+    setenv("LUCE_KVFLASH_CHAIN_SPEC", "0", 1);  CHECK(!kvflash_chain_spec_switch());
+    setenv("LUCE_KVFLASH_CHAIN_SPEC", "true", 1); CHECK(!kvflash_chain_spec_switch());
+    setenv("LUCE_KVFLASH_CHAIN_SPEC", "1", 1);  CHECK(kvflash_chain_spec_switch());
+    if (old) setenv("LUCE_KVFLASH_CHAIN_SPEC", saved.c_str(), 1); else unsetenv("LUCE_KVFLASH_CHAIN_SPEC");
 }
 
 TEST_CASE(KvflashConcurrentGateFixture, the_moe_check_runs_before_a_subclass_can_erase_the_request) {

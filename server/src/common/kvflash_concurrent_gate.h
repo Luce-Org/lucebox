@@ -40,6 +40,13 @@ inline bool kvflash_concurrent_test_switch() {
     return v && std::strcmp(v, "1") == 0;
 }
 
+// ── Opt-in for DFlash2 chain verify beside the KVFlash arena (Stage C) ──
+// Exactly LUCE_KVFLASH_CHAIN_SPEC=1, on top of LUCE_KVFLASH_CONCURRENT_TEST=1.
+inline bool kvflash_chain_spec_switch() {
+    const char * v = std::getenv("LUCE_KVFLASH_CHAIN_SPEC");
+    return v && std::strcmp(v, "1") == 0;
+}
+
 // ── What may run the concurrent KVFlash arena? ─────────────────────────
 struct KvFlashConcurrentRequest {
     std::string arch;
@@ -48,6 +55,11 @@ struct KvFlashConcurrentRequest {
     bool wmma_env = false;                             // the WMMA kernel is active (kvflash_paged_wmma_active)
     bool wmma_null_exclusion_ready = false;            // true once the kernel excludes null blocks (-04, gate lift)
     bool draft = false, tree = false, pflash = false, images = false;
+    // Stage C: a draft model is admitted only as a DFlash2 chain, behind the switch.
+    bool chain_spec_switch = false;          // LUCE_KVFLASH_CHAIN_SPEC=1
+    bool draft_local_same_device = false;    // in-process draft on the target's device, no split/TP/remote
+    int  draft_block = 0;                    // the drafter's block size; a chain needs 2..16
+    int  fa_window = 0;                      // the chain path needs full attention
 };
 
 // Whether the paged WMMA launcher runs its kernel: on unless LUCE_PAGED_WMMA parses to 0
@@ -75,7 +87,14 @@ inline std::optional<std::string> kvflash_concurrent_refusal(const KvFlashConcur
         return "concurrent KVFlash supports only dense arch qwen35 (got '" + r.arch + "')";
     if (r.wmma_env && !r.wmma_null_exclusion_ready)
         return "the paged WMMA kernel is active (the default on RDNA4) and cannot run with KVFlash until it excludes null blocks; set LUCE_PAGED_WMMA=0";
-    if (r.draft) return "concurrent KVFlash does not support a draft model or DFlash2 chains";
+    if (r.draft) {
+        if (!r.chain_spec_switch)
+            return "concurrent KVFlash does not support a draft model unless LUCE_KVFLASH_CHAIN_SPEC=1 "
+                   "(DFlash2 chain verify, test-only)";
+        if (!r.draft_local_same_device || r.draft_block < 2 || r.draft_block > 16 || r.fa_window != 0)
+            return "concurrent KVFlash admits a draft model only as a local same-device DFlash2 chain "
+                   "(block size 2..16, --fa-window 0)";
+    }
     if (r.tree)  return "concurrent KVFlash does not support tree verification";
     if (r.pflash) return "concurrent KVFlash does not combine with PFlash";
     if (r.images) return "concurrent KVFlash does not serve image requests";

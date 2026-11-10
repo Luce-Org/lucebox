@@ -534,6 +534,11 @@ bool Qwen35Backend::init() {
         rq.wmma_env = luce::common::kvflash_paged_wmma_active(std::getenv("LUCE_PAGED_WMMA"), device_is_rdna4(cfg_.device.gpu));
         rq.draft = cfg_.draft_path.has_value();
         rq.tree = cfg_.ddtree_mode;
+        rq.chain_spec_switch = luce::common::kvflash_chain_spec_switch();
+        rq.draft_local_same_device = !use_remote_draft && !tensor_parallel && !split_gpus_ &&
+            target_backend_ == draft_backend_ && cfg_.device.gpu == cfg_.draft_gpu;
+        rq.draft_block = dw_.block_size;
+        rq.fa_window = cfg_.fa_window;
         if (const auto why = luce::common::kvflash_concurrent_refusal(rq)) {
             std::fprintf(stderr, "[kvflash] %s\n", why->c_str());
             set_last_error(*why);

@@ -302,6 +302,12 @@ std::string check_feature_compatibility(
         if (admission.fixed_kvflash_requested() && !luce::common::kvflash_concurrent_test_switch()) {
             return "--paged-attention cannot be combined with KVFlash";
         }
+        // Stage C: a draft beside the concurrent KVFlash arena is the DFlash2 chain slice, opt-in.
+        if (admission.fixed_kvflash_requested() && args.draft_path.has_value() &&
+            !luce::common::kvflash_chain_spec_switch()) {
+            return "--paged-attention with KVFlash and a draft model requires LUCE_KVFLASH_CHAIN_SPEC=1 "
+                   "(concurrent DFlash2 chain verify, test-only)";
+        }
         if (arch_is_deepseek4_family(arch)) {
             if (target_backend != PlacementBackend::Hip) {
                 return "DeepSeek4 paged attention requires a local HIP target";
