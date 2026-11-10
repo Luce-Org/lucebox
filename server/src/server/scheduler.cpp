@@ -360,6 +360,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             /*effective_prompt_tokens=*/prompt_tokens,
         };
         gen_timings.pflash = s.job->pflash_stats;
+        gen_timings.accept_rate = s.acceptance.rate();
+        gen_timings.spec_decode_ran = s.acceptance.offered() > 0;
 
         if (!s.error) {
             PerfRecord perf;

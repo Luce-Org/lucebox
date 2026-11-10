@@ -7312,6 +7312,8 @@ void HttpServer::process_job(ServerJob * job) {
         effective_prompt_tokens,
         agent_turn_cache_hit,
         prepared.pflash_stats,
+        result.accept_rate,
+        result.spec_decode_ran,
     };
 
     // Record performance for /status page.

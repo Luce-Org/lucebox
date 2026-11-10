@@ -50,6 +50,11 @@ struct GenTimings {
     // PFlash compression details (compress time, kept/served tokens, the
     // multi-turn view and drafter-session outcome); null when not compressed.
     nlohmann::json pflash;
+    // Speculative decoding: whether it drafted, and the share of drafted
+    // tokens accepted. The final streamed usage carries them beside timings,
+    // as the non-streamed body does.
+    float  accept_rate          = 0.0f;
+    bool   spec_decode_ran      = false;
 };
 
 // Build the `timings` sub-object emitted under `usage`.

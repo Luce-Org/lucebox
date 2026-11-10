@@ -12623,9 +12623,9 @@ struct SpecRoundBackend : MockBackend {
 };
 
 // A request the parallel scheduler decoded with drafted rounds reports, in
-// its response usage and its /status perf record, that it speculated and
-// the rounds' acceptance.
-TEST_CASE(ServerUnitFixture, test_scheduler_perf_record_reports_speculative_rounds) {
+// its response usage (streamed or not) and its /status perf record, that it
+// speculated and the rounds' acceptance.
+static void check_scheduler_reports_speculative_rounds(bool stream) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
@@ -12646,7 +12646,7 @@ TEST_CASE(ServerUnitFixture, test_scheduler_perf_record_reports_speculative_roun
     job.req.format = ApiFormat::OPENAI_CHAT;
     job.req.prompt_tokens.assign(4, 100);
     job.req.max_output = 9;  // the prefill's token, then two rounds of 4
-    job.req.stream = false;
+    job.req.stream = stream;
     job.req.model = "scheduler-test";
     job.req.response_id = "spec";
     SchedulerTestHarness::enqueue(server, &job);
@@ -12669,10 +12669,19 @@ TEST_CASE(ServerUnitFixture, test_scheduler_perf_record_reports_speculative_roun
     TEST_ASSERT(done);
     TEST_ASSERT(backend.engine.rounds == 2);
 
-    // The response's usage reports the same speculation as /status.
-    const size_t body = reply.find("\r\n\r\n");
-    TEST_ASSERT(body != std::string::npos);
-    const json usage = json::parse(reply.substr(body + 4))["usage"];
+    // The response's usage reports the same speculation as /status: the
+    // body's, or the last streamed chunk's.
+    json usage;
+    if (stream) {
+        const size_t at = reply.rfind("data: {");
+        TEST_ASSERT(at != std::string::npos);
+        const size_t line_end = reply.find('\n', at);
+        usage = json::parse(reply.substr(at + 6, line_end - at - 6))["usage"];
+    } else {
+        const size_t body = reply.find("\r\n\r\n");
+        TEST_ASSERT(body != std::string::npos);
+        usage = json::parse(reply.substr(body + 4))["usage"];
+    }
     TEST_ASSERT(usage["spec_decode_ran"] == true);
     TEST_ASSERT(std::abs(usage["accept_rate"].get<double>() - 6.0 / 12.0) < 1e-6);
 
@@ -12683,6 +12692,11 @@ TEST_CASE(ServerUnitFixture, test_scheduler_perf_record_reports_speculative_roun
     // The second round had room for 4 of its 8 positions, as single-lane
     // decode counts a round that reaches the output budget.
     TEST_ASSERT(std::abs(perf[0]["accept_rate"].get<double>() - 6.0 / 12.0) < 1e-6);
+}
+
+TEST_CASE(ServerUnitFixture, test_scheduler_perf_record_reports_speculative_rounds) {
+    check_scheduler_reports_speculative_rounds(/*stream=*/false);
+    check_scheduler_reports_speculative_rounds(/*stream=*/true);
 }
 
 TEST_CASE(ServerUnitFixture,
