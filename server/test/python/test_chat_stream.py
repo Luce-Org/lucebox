@@ -8,9 +8,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 CHAT_PATH = Path(__file__).resolve().parents[2] / "examples" / "chat.py"
 SPEC = importlib.util.spec_from_file_location("chat_example", CHAT_PATH)
@@ -19,12 +20,31 @@ SPEC.loader.exec_module(chat)
 
 
 def _run_with_process_group_timeout(fn, timeout_s=5.0):
-    """Run fn in a dedicated worker process inside its own process group.
+    """Run fn in a dedicated worker process inside its own process group on POSIX.
 
     If fn blocks (e.g. on pipe buffer deadlock), the entire process group
     is terminated with SIGKILL and the worker process is reaped, preventing
     deadlocks from hanging test runs while ensuring no orphaned processes remain.
+    On Windows, runs fn with timeout monitoring in a thread.
     """
+    if sys.platform == "win32":
+        result = {}
+
+        def _worker():
+            try:
+                result["payload"] = fn()
+                result["status"] = "ok"
+            except BaseException as e:
+                result["status"] = "err"
+                result["payload"] = e
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        t.join(timeout=timeout_s)
+        if t.is_alive():
+            return "timed_out", None
+        return result.get("status", "err"), result.get("payload")
+
     ctx = mp.get_context("fork")
     parent_conn, child_conn = ctx.Pipe(duplex=False)
 
@@ -100,14 +120,16 @@ class MockTokenizer:
         return "".join(f"[{tok}]" for tok in ids)
 
 
-@unittest.skipIf(sys.platform == "win32", "stream_generate uses POSIX pass_fds on main")
 class ChatStreamFdLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.root = Path(self.temp_dir.name)
 
-        # Create mock child script that parses --stream-fd and writes tokens
+        # Create mock child script that parses --stream-fd and writes tokens.
+        # On Windows, --stream-fd is a Win32 HANDLE that is converted to a CRT fd
+        # via msvcrt.open_osfhandle, matching how the C++ test_dflash consumer
+        # writes directly to the passed HANDLE.
         self.mock_script = self.root / "mock_dflash.py"
         self.mock_script.write_text(
             "import os, struct, sys, time\n"
@@ -115,6 +137,9 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
             "for arg in sys.argv:\n"
             "    if arg.startswith('--stream-fd='):\n"
             "        fd = int(arg.split('=', 1)[1])\n"
+            "if sys.platform == 'win32' and fd is not None:\n"
+            "    import msvcrt\n"
+            "    fd = msvcrt.open_osfhandle(fd, os.O_WRONLY)\n"
             "stderr_bytes = int(os.environ.get('MOCK_STDERR_BYTES', '0'))\n"
             "if stderr_bytes > 0:\n"
             "    sys.stderr.write('E' * stderr_bytes)\n"
@@ -136,6 +161,7 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
         # Track all pipe descriptors and subprocesses allocated during tests
         self.allocated_pipes = []
         self.allocated_procs = []
+        self.popen_calls = []
         self._orig_pipe = os.pipe
         self._orig_popen = subprocess.Popen
 
@@ -167,6 +193,7 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
                 and f.f_code.co_filename.endswith("chat.py")
             ):
                 self.allocated_procs.append(proc)
+                self.popen_calls.append((args, kwargs, proc))
             return proc
 
         self.pipe_patcher = patch.object(os, "pipe", side_effect=tracked_pipe)
@@ -226,18 +253,20 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
         )
 
     def test_early_termination_on_stop_token_closes_read_descriptor(self):
-        # 999 is stop token; child also emits 30 afterwards
-        result = self._call_stream_generate(tokens="10,999,30", stop_ids={999})
-        self.assertEqual(result, "[10]")
+        result = self._call_stream_generate(
+            tokens="1,2,99,4,5",
+            stop_ids={99},
+        )
+        self.assertEqual(result, "[1][2]")
         self.assertEqual(len(self.allocated_pipes), 1)
-        r, _w = self.allocated_pipes[0]
+        r, w = self.allocated_pipes[0]
 
-        # Verify read descriptor is closed
+        # Read descriptor MUST be closed despite early loop break
         with self.assertRaises(OSError) as ctx:
             os.fstat(r)
         self.assertEqual(ctx.exception.errno, errno.EBADF)
 
-        # Verify child process was reaped by stream_generate before any poll() call
+        # Child process must also be reaped by stream_generate
         self.assertEqual(len(self.allocated_procs), 1)
         proc = self.allocated_procs[0]
         self.assertIsNotNone(
@@ -246,13 +275,17 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
         )
 
     def test_exception_during_reading_closes_read_descriptor(self):
-        tok = MockTokenizer(raise_on_id=20)
+        failing_tok = MockTokenizer(raise_on_id=2)
         with self.assertRaises(RuntimeError):
-            self._call_stream_generate(tok=tok, tokens="10,20,30")
+            self._call_stream_generate(
+                tok=failing_tok,
+                tokens="1,2,3",
+            )
 
         self.assertEqual(len(self.allocated_pipes), 1)
-        r, _w = self.allocated_pipes[0]
+        r, w = self.allocated_pipes[0]
 
+        # Read descriptor MUST be closed despite unhandled exception
         with self.assertRaises(OSError) as ctx:
             os.fstat(r)
         self.assertEqual(ctx.exception.errno, errno.EBADF)
@@ -292,7 +325,7 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
                 proc.returncode,
                 "Child process was not reaped by stream_generate",
             )
-            self.assertIsNone(proc.stderr, "stderr should be DEVNULL, not an open PIPE")
+            self.assertIsNone(proc.stderr, "stderr should not be an open PIPE")
 
         if has_proc_fd:
             final_fds = set(os.listdir(proc_fd_dir))
@@ -305,8 +338,7 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
 
     def test_child_producing_substantial_stderr_does_not_deadlock(self):
         # 128 KiB exceeds standard 64 KiB OS pipe buffers; deadlocks if stderr were an unread PIPE.
-        # Run inside a process group with a 5.0s timeout to guarantee bounded execution and
-        # clean teardown if a deadlock were to occur.
+        # Run with a 5.0s timeout to guarantee bounded execution and clean teardown if a deadlock occurs.
         def run_target():
             env = os.environ.copy()
             env["MOCK_STDERR_BYTES"] = "131072"
@@ -346,7 +378,7 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(status, "ok")
         self.assertEqual(payload["result"], "[1][2][3]")
-        self.assertTrue(payload["stderr_is_none"], "stderr was not DEVNULL")
+        self.assertTrue(payload["stderr_is_none"], "stderr should not be an open PIPE")
         self.assertIsNotNone(
             payload["returncode"],
             "Child process was not reaped by stream_generate",
@@ -374,3 +406,139 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
         with self.assertRaises(OSError) as ctx_w:
             os.fstat(w)
         self.assertEqual(ctx_w.exception.errno, errno.EBADF)
+
+    def test_process_launch_failure_closes_second_descriptor_if_first_close_raises(self):
+        """Verify process-launch failure closes w even if closing r raises OSError, and preserves original error."""
+        nonexistent_bin = self.root / "nonexistent_binary_xyz"
+        orig_close = os.close
+        first_r_closed = []
+
+        def faulty_close(fd):
+            if self.allocated_pipes and fd == self.allocated_pipes[0][0]:
+                first_r_closed.append(fd)
+                raise OSError(errno.EIO, "Simulated I/O error on closing read descriptor")
+            orig_close(fd)
+
+        with patch.object(os, "close", side_effect=faulty_close):
+            with self.assertRaises(FileNotFoundError):
+                chat.stream_generate(
+                    tok=MockTokenizer(),
+                    bin_path=nonexistent_bin,
+                    target=self.mock_script,
+                    draft=self.draft,
+                    prompt_bin=self.prompt_bin,
+                    n_gen=10,
+                    budget=16,
+                    stop_ids=set(),
+                )
+
+        self.assertEqual(len(self.allocated_pipes), 1)
+        r, w = self.allocated_pipes[0]
+        self.assertEqual(first_r_closed, [r])
+        with self.assertRaises(OSError) as ctx_w:
+            os.fstat(w)
+        self.assertEqual(ctx_w.exception.errno, errno.EBADF)
+
+    def test_platform_subprocess_configuration_and_arguments(self):
+        """Verify platform-specific Popen configuration and --stream-fd argument."""
+        result = self._call_stream_generate(tokens="1,2")
+        self.assertEqual(result, "[1][2]")
+        self.assertEqual(len(self.allocated_pipes), 1)
+        r, w = self.allocated_pipes[0]
+
+        self.assertEqual(len(self.popen_calls), 1)
+        args, kwargs, proc = self.popen_calls[0]
+        cmd = args[0] if args else kwargs.get("args")
+
+        stream_fd_arg = next((arg for arg in cmd if arg.startswith("--stream-fd=")), None)
+        self.assertIsNotNone(stream_fd_arg, "Missing --stream-fd argument in cmd")
+        stream_fd_val = int(stream_fd_arg.split("=", 1)[1])
+
+        if sys.platform == "win32":
+            self.assertNotIn("pass_fds", kwargs, "pass_fds must not be passed on Windows")
+            self.assertEqual(kwargs.get("close_fds"), False, "close_fds must be False on Windows")
+            self.assertGreater(stream_fd_val, 0, "Win32 handle value must be positive")
+        else:
+            self.assertIn("pass_fds", kwargs, "pass_fds must be passed on POSIX")
+            self.assertEqual(
+                kwargs["pass_fds"], (w,), "pass_fds must contain pipe write descriptor"
+            )
+            self.assertEqual(stream_fd_val, w, "--stream-fd must receive write descriptor on POSIX")
+
+    def test_simulated_windows_invocation(self):
+        """Verify Windows branch semantics under simulation regardless of host OS."""
+        mock_msvcrt = MagicMock()
+        mock_msvcrt.get_osfhandle.return_value = 123456
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.wait.return_value = 0
+        mock_proc.returncode = 0
+        mock_proc.stderr = None
+
+        captured_calls = []
+
+        def fake_popen(cmd, **kwargs):
+            captured_calls.append((cmd, kwargs))
+            return mock_proc
+
+        with patch("sys.platform", "win32"):
+            with patch.dict(sys.modules, {"msvcrt": mock_msvcrt}):
+                with patch.object(os, "set_inheritable") as mock_set_inheritable:
+                    with patch.object(os, "read", side_effect=[b""]):
+                        with patch.object(subprocess, "Popen", side_effect=fake_popen):
+                            res = chat.stream_generate(
+                                tok=MockTokenizer(),
+                                bin_path=Path(sys.executable),
+                                target=self.mock_script,
+                                draft=self.draft,
+                                prompt_bin=self.prompt_bin,
+                                n_gen=10,
+                                budget=16,
+                                stop_ids=set(),
+                            )
+
+        self.assertEqual(res, "")
+        mock_set_inheritable.assert_called_once()
+        mock_msvcrt.get_osfhandle.assert_called_once()
+
+        self.assertEqual(len(captured_calls), 1)
+        cmd, kwargs = captured_calls[0]
+        self.assertNotIn("pass_fds", kwargs)
+        self.assertEqual(kwargs.get("close_fds"), False)
+        self.assertIn("--stream-fd=123456", cmd)
+
+    def test_simulated_posix_invocation(self):
+        """Verify POSIX branch semantics under simulation regardless of host OS."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.wait.return_value = 0
+        mock_proc.returncode = 0
+        mock_proc.stderr = None
+
+        captured_calls = []
+
+        def fake_popen(cmd, **kwargs):
+            captured_calls.append((cmd, kwargs))
+            return mock_proc
+
+        with patch("sys.platform", "linux"):
+            with patch.object(os, "read", side_effect=[b""]):
+                with patch.object(subprocess, "Popen", side_effect=fake_popen):
+                    res = chat.stream_generate(
+                        tok=MockTokenizer(),
+                        bin_path=Path(sys.executable),
+                        target=self.mock_script,
+                        draft=self.draft,
+                        prompt_bin=self.prompt_bin,
+                        n_gen=10,
+                        budget=16,
+                        stop_ids=set(),
+                    )
+
+        self.assertEqual(res, "")
+        self.assertEqual(len(captured_calls), 1)
+        cmd, kwargs = captured_calls[0]
+        self.assertIn("pass_fds", kwargs)
+        write_fd = kwargs["pass_fds"][0]
+        self.assertIn(f"--stream-fd={write_fd}", cmd)
