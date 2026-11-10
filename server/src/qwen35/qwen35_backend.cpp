@@ -3765,10 +3765,8 @@ void Qwen35Backend::kvflash_prefill_apply_on(KvFlashPager & p, std::vector<float
         in.recall_chunks = luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_;
         in.unit = unit;
         in.reserve = reserve_chunks >= 0 ? reserve_chunks : (end - committed + ct - 1) / ct + 1;
-        if (slot < 0) {   // a slot has no preamble reserve of its own
-            in.pin_reserve_chunks = kvflash_preamble_reserve_ / ct;   // the history budget never depends on k
-            in.pinned_chunks = luce::common::kvflash_pin_chunks(kvflash_preamble_end_, kvflash_preamble_rows_, ct);
-        }
+        in.pin_reserve_chunks = kvflash_preamble_reserve_ / ct;   // the history budget never depends on k
+        in.pinned_chunks = luce::common::kvflash_pinned_prefix(p);
         // the serial turn plans from the input its mode-4 first window was sized with
         if (slot < 0 && reserve_chunks < 0) in = kvflash_recall_in(committed, end);
         luce::common::KvFlashRecallPlan plan = luce::common::kvflash_recall_plan(scores, in);

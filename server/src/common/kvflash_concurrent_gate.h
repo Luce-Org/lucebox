@@ -103,7 +103,7 @@ struct KvFlashProfileRequest {
     std::string arch;
     bool explicit_lru_policy = false;   // LUCE_KVFLASH_POLICY=lru or --kvflash-policy lru: the opt-out
     bool explicit_qk_policy = false, explicit_recall = false, explicit_uq = false;
-    bool explicit_preamble_pin = false, explicit_tau = false;   // the preamble pins stay refused until the slot engine pins
+    bool explicit_tau = false;       // the decode-time reselect: refused, the slot engine has none
     int  reselect_mode = 0;          // LUCE_KVFLASH_PREFILL_RESELECT as parsed
     bool exact_scorer = false;       // LUCE_KVFLASH_RESELECT_SCORER=exact
     bool pflash2_scorer = false;     // LUCE_KVFLASH_RESELECT_SCORER=pflash2 (mode 5)
@@ -120,11 +120,10 @@ struct KvFlashProfile {
 inline KvFlashProfile kvflash_resolve_concurrent_profile(const KvFlashProfileRequest & r) {
     KvFlashProfile p;
     // C1.4: the recall profile (QK policy, mode-4 reselect, recall blocks) runs per slot
-    // when every piece of it is asked for explicitly; preamble pins and tau stay C2.
-    const char * what = r.explicit_preamble_pin ? "preamble pins" : r.explicit_tau ? "tau" : nullptr;
-    if (what) {
+    // when every piece of it is asked for explicitly; tau stays refused.
+    if (r.explicit_tau) {
         p.ok = false;
-        p.error = std::string("concurrent KVFlash is LRU or per-slot recall; ") + what + " is C2 and not supported yet";
+        p.error = "concurrent KVFlash is LRU or per-slot recall; tau (the decode-time reselect) is not supported there";
         return p;
     }
     const bool any = r.explicit_qk_policy || r.explicit_recall || r.reselect_mode != 0 || r.exact_scorer || r.pflash2_scorer;
@@ -180,7 +179,6 @@ inline KvFlashProfileRequest kvflash_concurrent_request(const std::string & arch
     r.explicit_lru_policy = cli_policy.empty() ? is("LUCE_KVFLASH_POLICY", "lru") : cli_policy == "lru";
     r.explicit_recall = on("LUCE_KVFLASH_RECALL_BLOCKS");
     r.explicit_uq = on("LUCE_KVFLASH_UQ_QUERIES");
-    r.explicit_preamble_pin = on("LUCE_KVFLASH_PREAMBLE_ROWS");
     const char * rs = lookup("LUCE_KVFLASH_PREFILL_RESELECT");
     r.reselect_mode = rs ? std::atoi(rs) : 0;
     r.exact_scorer = is("LUCE_KVFLASH_RESELECT_SCORER", "exact");

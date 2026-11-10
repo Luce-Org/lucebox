@@ -125,9 +125,9 @@ void Qwen35SeqEngine::init_slots_() {
             std::fprintf(stderr, "[kvflash] slot header rung on recall turns with end - R >= %d (LUCE_KVFLASH_END_RUNG_MIN)\n", end_rung_min_);
     }
     if (kvf_)
-        std::fprintf(stderr, "[kvflash] slot recall: %s (mode=%d queries=%d k=%d unit=%d uq=%d)\n",
+        std::fprintf(stderr, "[kvflash] slot recall: %s (mode=%d queries=%d k=%d unit=%d uq=%d preamble=%d)\n",
                      recall_on_ ? "on" : "off", b_.kvflash_prefill_reselect_,
-                     b_.kvflash_select_queries_, b_.kvflash_recall_blocks_, b_.kvflash_select_unit_, uq_queries_);
+                     b_.kvflash_select_queries_, b_.kvflash_recall_blocks_, b_.kvflash_select_unit_, uq_queries_, b_.kvflash_preamble_rows_);
 
     embed_rows_cap_ = static_cast<size_t>(
         std::min(max_prefills_ * kIdlePrefillChunk,
@@ -885,6 +885,13 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
     rc = SlotRecall{};
     KvFlashSlotPager & p = kvf_kv_->pager(slot);
     p.score_hook = nullptr;
+    if (b_.kvflash_preamble_rows_ > 0) {
+        // LUCE_KVFLASH_PREAMBLE_ROWS: the slot's system+tools preamble is never a victim and never a recall candidate.
+        // Every turn: a new session's pager starts without pins.
+        const int e = kvflash_preamble_end(prompt, b_.w_.im_start_id, b_.w_.system_id);
+        std::fprintf(stderr, "[kvflash] slot %d preamble pin end=%d pinned_chunks=%d reserve=%d\n",
+                     slot, e, kvflash_pin_preamble(p, e, b_.kvflash_preamble_rows_), b_.kvflash_preamble_rows_);
+    }
     rc.turn = kvflash_slot_turn_plan(prompt, kv_offset, b_.w_.im_start_id, b_.w_.user_id, p.chunk_tokens(),
                                      luce::common::kvflash_usable_blocks(p.n_pool_blocks(), kvf_->headroom()), kKvFlashCutU, b_.kvflash_select_queries_, recall_on_, end_rung_min_,
                                      b_.kvflash_prefill_reselect_ == 5);

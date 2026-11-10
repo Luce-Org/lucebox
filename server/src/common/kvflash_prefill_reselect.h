@@ -209,6 +209,14 @@ inline int kvflash_pin_preamble(Pager & pager, int preamble_end, int reserve_row
     return n;
 }
 
+// The leading chunks `pager` holds pinned: the preamble pin as the pager accepted it.
+template <class Pager>
+inline int kvflash_pinned_prefix(const Pager & pager) {
+    int n = 0;
+    while (pager.is_pinned(n)) n++;
+    return n;
+}
+
 // Recall eligibility floor (chunks): v1's 10-chunk sink block, or past the pinned preamble.
 inline int kvflash_recall_first_chunk(int pinned_chunks) { return std::max(kKvFlashRecallUnit, pinned_chunks); }
 
