@@ -175,11 +175,11 @@ struct MoeHybridGraphInputs {
     // itself -- the cluster hybrid exchange adds them on the secondary owner.
     bool external_join = false;
     ggml_tensor * peer_raw = nullptr;
-    // Input, set by the caller before building: both owners are GPUs of one runtime and, without a device join, the
-    // step is a split step (moe_split_step.h): given a schedule graph, the secondary owner's sum is queued right after
-    // the routes, then the main owner's work, then the join, where the caller's scheduler ends the main owner's split
-    // (moe_split_sched_init).
-    bool split_join = false;
+    // Input, set by the caller before building, with a schedule graph: the owners overlap (moe_overlap.h). The secondary
+    // owner's sum is queued right after the routes, then the main owner's routed experts and shared expert, then the
+    // join; every node of the main owner's shared expert is listed in hot_nodes. The caller marks each join_nodes entry
+    // with moe_overlap_mark_join.
+    bool overlap_owners = false;
     // Backend-affinity hints consumed after the multi-backend scheduler is
     // created. Keeping every intermediate of a routed branch on its weight
     // backend avoids gate/up -> activation -> down ping-pong copies.

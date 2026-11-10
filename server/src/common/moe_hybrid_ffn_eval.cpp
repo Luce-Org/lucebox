@@ -1,5 +1,5 @@
 #include "moe_hybrid_ffn_eval.h"
-#include "moe_split_step.h"
+#include "moe_overlap.h"
 #include "cuda_graph_overrides.h"
 #include "moe_input_ready.h"
 
@@ -771,7 +771,8 @@ static bool build_batched_routed_graph(
     bool force_fused_combine = false,
     bool defer_route_reduction = false,
     ggml_tensor * combine_valid = nullptr,
-    ggml_tensor * combine_ids = nullptr)
+    ggml_tensor * combine_ids = nullptr,
+    bool input_on_owner = false)
 {
     const auto track = [&](ggml_tensor * t) -> ggml_tensor * {
         if (backend_nodes && t) backend_nodes->push_back(t);
@@ -779,17 +780,16 @@ static bool build_batched_routed_graph(
     };
     if (tokenwise && n_tokens > 1) {
         // A token's input, routes and weights are column views: a column of a
-        // dense tensor is dense, so it needs no copy of its own. The input is
-        // gathered on this owner in one copy first, since views of a tensor
-        // on another device cross to it one by one. Every node is the
-        // owner's: an unplaced copy would follow its graph neighbour, the
-        // other owner's last node in a split step, and make this owner wait
-        // for that one.
+        // dense tensor is dense, so it needs no copy of its own. An input on
+        // another device is gathered on this owner in one copy first, since
+        // views of it would cross one by one. Every node is the owner's: an
+        // unplaced copy would follow its graph neighbour, the other owner's
+        // last node when the owners overlap, and make this owner wait for it.
         const auto column = [&](ggml_tensor * m, int64_t rows, int t) {
             ggml_tensor * col = ggml_view_2d(ctx, m, rows, 1, m->nb[1], (size_t) t * m->nb[1]);
             return ggml_is_contiguous(col) ? col : track(ggml_cont(ctx, col));
         };
-        ggml_tensor * inp_owner = track(ggml_cont(ctx, inp));
+        ggml_tensor * inp_owner = input_on_owner ? inp : track(ggml_cont(ctx, inp));
         ggml_tensor * joined = nullptr;
         for (int t = 0; t < n_tokens; ++t) {
             ggml_tensor * inp_col = column(inp_owner, n_embd, t);
@@ -1108,7 +1108,8 @@ static bool build_moe_owner_branch(
         int n_tokens,
         bool canonical_route_join,
         bool allow_fused_combine,
-        MoeOwnerGraphSpec & owner) {
+        MoeOwnerGraphSpec & owner,
+        bool input_on_owner = false) {
     if (!owner.available()) {
         return true;
     }
@@ -1127,7 +1128,7 @@ static bool build_moe_owner_branch(
         cfg.swiglu_clamp, cfg.mixed_mmq_policy, &owner.output, tokenwise,
         owner.branch_nodes, allow_fused_combine,
         /*force_fused_combine=*/false, canonical_route_join,
-        owner.combine_valid, owner.combine_ids);
+        owner.combine_valid, owner.combine_ids, input_on_owner);
 }
 
 ggml_tensor * build_moe_routed_experts(
@@ -1205,7 +1206,23 @@ static ggml_tensor * build_moe_owner_join(
         ? build_shared_expert_subgraph(ctx, desc, inp, cfg.swiglu_clamp)
         : nullptr;
     if (shared) {
+        if (out.overlap_owners) {
+            // The shared expert is the main owner's: place each of its nodes
+            // there, so none follows a neighbour onto the secondary owner.
+            std::vector<ggml_tensor *> stack{shared};
+            while (!stack.empty()) {
+                ggml_tensor * t = stack.back();
+                stack.pop_back();
+                if (!t || t == inp || t->op == GGML_OP_NONE ||
+                    std::find(out.hot_nodes.begin(), out.hot_nodes.end(), t) != out.hot_nodes.end()) {
+                    continue;
+                }
+                out.hot_nodes.push_back(t);
+                for (ggml_tensor * src : t->src) stack.push_back(src);
+            }
+        }
         primary = primary ? ggml_add(ctx, primary, shared) : shared;
+        if (out.overlap_owners) out.hot_nodes.push_back(primary);
     }
 
     const MoeHybridGraphPolicy & policy = moe_hybrid_graph_policy();
@@ -1260,15 +1277,15 @@ static ggml_tensor * build_moe_owner_join(
                        : secondary_ready;
     }
 
-    if (schedule_graph && secondary && (out.split_join || policy.targeted_join_split)) {
-        // A split step (moe_split_step.h): the secondary owner's sum right
+    if (schedule_graph && secondary && (out.overlap_owners || policy.targeted_join_split)) {
+        // Overlapping owners (moe_overlap.h): the secondary owner's sum right
         // after the routes, then the main owner's experts and shared expert,
         // then the join, where the caller's scheduler ends the main owner's
         // split.
-        moe_split_queue_expert(schedule_graph, secondary);
+        moe_overlap_queue_expert(schedule_graph, secondary);
         if (primary) ggml_build_forward_expand(schedule_graph, primary);
         ggml_tensor * combined = primary
-            ? moe_split_join(ctx, secondary, primary) : secondary;
+            ? moe_overlap_join(ctx, secondary, primary) : secondary;
         if (primary) {
             out.join_nodes.push_back(combined);
         }
@@ -1491,9 +1508,10 @@ bool build_moe_hybrid_ffn_graph(
         out.hot_remap_nodes.push_back(inp_secondary);
         ggml_build_forward_expand(schedule_graph, inp_secondary);
     }
+    // The layer's input is the main owner's.
     if (!build_moe_owner_branch(
             ctx, cfg, desc, inp, n_tokens, canonical_route_join,
-            allow_fused_combine, primary_owner) ||
+            allow_fused_combine, primary_owner, /*input_on_owner=*/true) ||
         !build_moe_owner_branch(
             ctx, cfg, desc, inp_secondary, n_tokens, canonical_route_join,
             allow_fused_combine, secondary_owner) ||
