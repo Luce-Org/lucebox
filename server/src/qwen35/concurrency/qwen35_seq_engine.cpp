@@ -585,7 +585,7 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
     KvFlashSlotPager & p = kvf_kv_->pager(slot);
     p.score_hook = nullptr;
     rc.turn = kvflash_slot_turn_plan(prompt, kv_offset, b_.w_.im_start_id, b_.w_.user_id, p.chunk_tokens(),
-                                     p.n_pool_blocks(), kKvFlashCutU, b_.kvflash_select_queries_, recall_on_,
+                                     luce::common::kvflash_usable_blocks(p.n_pool_blocks(), kvf_->headroom()), kKvFlashCutU, b_.kvflash_select_queries_, recall_on_,
                                      b_.kvflash_prefill_reselect_ == 5);
     if (rc.turn.apply_at >= 0) {
         // Mode 5: score the prompt ids with the drafter's session now; an unavailable drafter leaves an LRU turn.

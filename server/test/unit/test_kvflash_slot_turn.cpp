@@ -178,3 +178,14 @@ TEST_CASE(KvflashSlotTurnFixture, the_query_tail_accumulates_the_last_64_prompt_
     tail.clear(); kvflash_q_tail_push(tail, one.data(), 100, 2, 64);
     CHECK(tail.size() == 128); CHECK(tail[0] == 36.0f); CHECK(tail.back() == 99.0f);
 }
+
+TEST_CASE(KvflashSlotTurnFixture, the_plan_budgets_the_usable_quota_not_the_full_slice) {
+    // settle() holds a live slot at Q - headroom resident, so a prompt that fits Q but not Q - headroom must recall.
+    constexpr int kHeadroom = 8;
+    CHECK(kvflash_usable_blocks(kQ, kHeadroom) == kQ - kHeadroom);
+    CHECK(kvflash_usable_blocks(4, kHeadroom) == 0);     // never negative
+    const int end = (kQ - 6) * kCt;                      // 26 chunks + 4 reserve: fits 32, not 24
+    const auto prompt = prompt_with_user(end, end - 200);
+    CHECK(!kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kQ, kU, kT, true).first_pass());
+    CHECK(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kvflash_usable_blocks(kQ, kHeadroom), kU, kT, true).first_pass());
+}

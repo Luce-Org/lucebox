@@ -52,6 +52,9 @@ inline std::vector<int> kvflash_slot_turn_cuts(int kv_offset, int r, int end, in
 // pool (kvflash_pool_fits, the single-slot rule); otherwise the slot stays LRU.
 // pflash2 (mode 5): the picks come from the drafter's scores of the prompt ids, so the turn stays one
 // pass and only records where to apply them (apply_at = R).
+// Blocks a live slot keeps resident: settle() holds it at the pool minus the step headroom.
+inline int kvflash_usable_blocks(int n_pool_blocks, int headroom_blocks) { return std::max(0, n_pool_blocks - headroom_blocks); }
+
 inline KvFlashSlotTurn kvflash_slot_turn_plan(const std::vector<int32_t> & prompt, int kv_offset,
                                               int32_t im_start, int32_t user, int chunk_tokens,
                                               int n_pool_blocks, int cut_u, int n_queries, bool profile_on,
