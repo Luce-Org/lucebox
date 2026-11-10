@@ -1478,11 +1478,12 @@ TEST_CASE(QnSplitFusionsFixture, expert_parity) {
 // Hot lanes (qwen4exp_graph.cpp, build_moe_route): the target runs a token's first hot picks in lanes from its copies
 // of those experts, the expert device runs the other picks, and ggml_moe_combine_lanes sums every pick in route order.
 // The routed sum must be the expert device's own sum over every pick (MUL_MAT_ID on all of them, then
-// DS4_MOE_COMBINE) bit for bit, for any hot set and lane count, at every width that takes lanes (1 to
-// QWEN4EXP_MTP_MAX_VERIFY rows: decode, verify groups and short prompt chunks), with the batch-invariant scope on
-// (decode and verify steps) and off (prompt chunks), for each expert quant mix of the shipped UD-Q4_K_XL GGUF
-// (read from its header: gate/up Q4_K with down Q5_1 in 43 layers, Q4_K with Q8_0 in 4, Q5_K with Q8_0 in 1). Then
-// the text does not depend on which experts are hot. Each GPU takes each role.
+// DS4_MOE_COMBINE) bit for bit, for any hot set and lane count, at every width that takes lanes: a single token, and
+// 1 to QWEN4EXP_MTP_MAX_VERIFY rows under the batch-invariant scope (verify, batched verify groups, multi-slot
+// decode), for each expert quant mix of the shipped UD-Q4_K_XL GGUF (read from its header: gate/up Q4_K with down
+// Q5_1 in 43 layers, Q4_K with Q8_0 in 4, Q5_K with Q8_0 in 1). Then the text does not depend on which experts are
+// hot. Each GPU takes each role. Rows outside that scope (a prompt chunk) take no lanes (build_moe_route): they run
+// too and are counted apart, since there 5 and 8 rows differ.
 TEST_CASE(QnSplitFusionsFixture, hot_lanes) {
     if (ggml_backend_cuda_get_device_count() < 2) SKIP("one GPU");
     const GraphsOff graphs;
@@ -1509,7 +1510,7 @@ TEST_CASE(QnSplitFusionsFixture, hot_lanes) {
         {}, {3}, {0, 5, 9}, {1, 2, 4, 6, 8, 11, 13, 15}, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}};
     ggml_backend_ptr gpus[2] = {ggml_backend_ptr(ggml_backend_cuda_init(0)), ggml_backend_ptr(ggml_backend_cuda_init(1))};
     REQUIRE(gpus[0] != nullptr && gpus[1] != nullptr);
-    size_t checked = 0, failed = 0;
+    size_t checked = 0, failed = 0, chunk_cases = 0, chunk_differ = 0;
     for (const Mix & mix : mixes) {
         const std::vector<uint8_t> gate = quant(mix.gate_up, n_embd, n_ff, n_exp);
         const std::vector<uint8_t> up = quant(mix.gate_up, n_embd, n_ff, n_exp);
@@ -1635,8 +1636,16 @@ TEST_CASE(QnSplitFusionsFixture, hot_lanes) {
                                 ggml_type_name(mix.down) + " target=" + std::to_string(target) + " invariant=" +
                                 std::to_string((int) inv) + " T=" + std::to_string(T) + " hot=" +
                                 std::to_string(hot.size()) + " lanes=" + std::to_string(lanes);
-                            std::printf("[hot-lanes] %s: %d of %d picks in lanes, %zu of %zu outputs differ\n",
-                                        name.c_str(), n_lane_picks, n_used * T, n, got.size() / sizeof(float));
+                            // A prompt chunk's rows (no batch-invariant scope, more than one): no lanes are taken.
+                            const bool lane_case = inv || T == 1;
+                            std::printf("[hot-lanes] %s: %d of %d picks in lanes, %zu of %zu outputs differ%s\n",
+                                        name.c_str(), n_lane_picks, n_used * T, n, got.size() / sizeof(float),
+                                        lane_case ? "" : " (prompt-chunk scope, no lanes taken)");
+                            if (!lane_case) {
+                                ++chunk_cases;
+                                chunk_differ += n != 0;
+                                continue;
+                            }
                             if (n) {
                                 ++failed;
                                 fail("hot lanes: " + name + " differs");
@@ -1648,7 +1657,8 @@ TEST_CASE(QnSplitFusionsFixture, hot_lanes) {
             }
         }
     }
-    std::printf("[hot-lanes] %zu cases, %zu differ\n", checked, failed);
+    std::printf("[hot-lanes] %zu cases, %zu differ; prompt-chunk scope (no lanes): %zu cases, %zu differ\n", checked,
+                failed, chunk_cases, chunk_differ);
 }
 
 // The LM head row split (qwen4exp_graph.cpp, build_lm_head). On every GPU that runs the RDNA4 Q8_0 matvec for a

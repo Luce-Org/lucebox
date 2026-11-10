@@ -275,9 +275,10 @@ static ggml_tensor * moe_experts(ggml_context * c, ggml_tensor * gate_exps, ggml
 
 // gf (decode and verify steps): the router's outputs enter the graph right after its logits, so the CUDA backend runs
 // the router in one launch (ggml_cuda_try_moe_router_topk) and the expert device gets sel and wsel together.
+// step_rows: the rows are decode or verify rows, a single token or rows computed under the batch-invariant scope.
 static Qwen4ExpMoeRoute build_moe_route(ggml_context * c, ggml_tensor * cur,
                                         const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
-                                        ggml_cgraph * gf = nullptr) {
+                                        ggml_cgraph * gf = nullptr, bool step_rows = false) {
     const int64_t n_tokens = cur->ne[1];
     Qwen4ExpMoeRoute r;
     const int il = layer_index(L, w);
@@ -291,9 +292,10 @@ static Qwen4ExpMoeRoute build_moe_route(ggml_context * c, ggml_tensor * cur,
     // the target, each in a lane, the others on the expert device, masked on the other one. The target computes a
     // lane with the expert device's bits for that pick (test_qn_split_fusions hot_lanes), and the expert device sums
     // every pick in route order (ggml_moe_combine_lanes), so the text does not depend on which experts are hot: the
-    // same as with none, alone or beside other requests. Prompt chunks keep every pick on the expert device: only the
-    // matvec kernels take masked ids on gfx1151 (MMQ faults on them).
-    if (n_tokens <= QWEN4EXP_MTP_MAX_VERIFY && il >= 0 && w.hot && w.hot->lut[(size_t) il]) {
+    // same as with none, alone or beside other requests. Prompt chunks keep every pick on the expert device, however
+    // short: outside the batch-invariant scope a 5- or 8-row MUL_MAT_ID takes other kernels on the two GPUs, and the
+    // lanes' bits differ from the expert device's (hot_lanes).
+    if (step_rows && n_tokens <= QWEN4EXP_MTP_MAX_VERIFY && il >= 0 && w.hot && w.hot->lut[(size_t) il]) {
         // The counts steer which experts the slots hold (Qwen4ExpHotSet::tick).
         r.hot = ggml_moe_hot_routes(c, r.sel, w.hot->lut[(size_t) il], nullptr, w.hot->lanes, true);
         r.sel = ggml_moe_hot_routes(c, r.sel, w.hot->lut[(size_t) il], w.hot->hist[(size_t) il], w.hot->lanes, false);
@@ -410,14 +412,14 @@ static ggml_tensor * moe_join(ggml_context * c, ggml_tensor * routed, ggml_tenso
     return ggml_add(c, routed->type == GGML_TYPE_F32 ? routed : ggml_cast(c, routed, GGML_TYPE_F32), shared);
 }
 
-// gf: as for build_moe_route, given for decode and verify steps.
+// gf, step_rows: as for build_moe_route.
 ggml_tensor * build_moe(ggml_context * c, ggml_tensor * cur,
                         const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
                         Qwen4ExpMoeParts * parts = nullptr,
                         std::vector<ggml_tensor *> * expert_nodes = nullptr,
-                        ggml_cgraph * gf = nullptr, Qwen4ExpReadAhead * ahead = nullptr) {
+                        ggml_cgraph * gf = nullptr, Qwen4ExpReadAhead * ahead = nullptr, bool step_rows = false) {
     if (expert_nodes && qwen4exp_split_layer(L, w)) {
-        const Qwen4ExpMoeRoute r = build_moe_route(c, cur, L, w, gf);
+        const Qwen4ExpMoeRoute r = build_moe_route(c, cur, L, w, gf, step_rows);
         // The read-ahead (kReadAheadPicks): its nodes come after the target's router, so the scheduler queues them
         // on the expert device behind the previous layer's routed sum and before the wait for this layer's inputs.
         const int il = layer_index(L, w);
@@ -1757,7 +1759,7 @@ struct Qwen4ExpLayerBuilder {
         Qwen4ExpMoeParts moe_parts;
         const bool fold = !split && !next_is_ple(il) && ggml_backend_cuda_mmb_prefill(layer_T);
         cur = build_moe(ctx, cur, L, w, fold ? &moe_parts : nullptr, split ? &expert_nodes : nullptr,
-                        layer_T <= QWEN4EXP_MTP_MAX_VERIFY ? gf : nullptr, &read_ahead);
+                        layer_T <= QWEN4EXP_MTP_MAX_VERIFY ? gf : nullptr, &read_ahead, verify || layer_T == 1);
         if (!fold) return ffn_output(il, cur, inject, res_hc, layer_T, xn_next);
         ggml_tensor * gamma = (il + 1 < w.n_layer)
             ? w.layers[il + 1].hc_attn_norm : w.output_hc_norm;
@@ -1870,7 +1872,7 @@ static int build_pipelined_layers(Qwen4ExpLayerBuilder & lb, int64_t pos0, int64
         }
         st.inject = inject;
         cur = lb.ffn_input(il, cur, st.inject, st.res_hc, st.layer_T);
-        st.route = build_moe_route(ctx, cur, w.layers[il], w);
+        st.route = build_moe_route(ctx, cur, w.layers[il], w, nullptr, lb.verify || st.layer_T == 1);
         for (ggml_tensor * t : { st.route.xin, st.route.sel, st.route.wsel, st.route.shared, st.inject, st.res_hc }) {
             ggml_build_forward_expand(gf, t);
         }
@@ -3893,7 +3895,7 @@ static bool build_batched_decode_nodes(ggml_context * ctx, const Qwen4ExpWeights
             return;
         }
         cur = lb.ffn_input(il, cur, G.inject, G.res_hc, n);
-        G.route = build_moe_route(ctx, cur, L, w);
+        G.route = build_moe_route(ctx, cur, L, w, nullptr, /*step_rows=*/true);
         for (ggml_tensor * t : { G.route.xin, G.route.sel, G.route.wsel, G.route.shared, G.inject, G.res_hc }) {
             ggml_build_forward_expand(gf, t);
         }
@@ -4402,7 +4404,7 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
             return;
         }
         cur = lb.ffn_input(il, cur, G.inject, G.res_hc, n);
-        G.route = build_moe_route(ctx, cur, L, w);
+        G.route = build_moe_route(ctx, cur, L, w, nullptr, /*step_rows=*/true);
         for (ggml_tensor * t : { G.route.xin, G.route.sel, G.route.wsel, G.route.shared, G.inject, G.res_hc }) {
             ggml_build_forward_expand(gf, t);
         }
