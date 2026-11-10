@@ -7,6 +7,11 @@
 
 namespace luce::common {
 
+// A per-slot value the current mode may never have sized (the pool path has no KVFlash vectors): the fallback, not a read past the end.
+inline int slot_value_or(const std::vector<int> & v, int slot, int fallback) {
+    return slot >= 0 && (size_t)slot < v.size() ? v[(size_t)slot] : fallback;
+}
+
 // The scheduler's per-lane switch for a speculative burst: the budget is settled, no grammar masks the
 // position, and the request did not ask for AR decode (`luce_force_ar_decode`, the C-O2 oracle's T2).
 inline bool step_allows_speculation(bool budget_settled, bool constrained, bool force_ar) {

@@ -75,6 +75,12 @@ int main() {
     CHECK(!step_allows_speculation(true, true, false));     // a grammar masks one position at a time
     CHECK(!step_allows_speculation(true, false, true));     // force_ar_decode
 
+    // The pool path (no KVFlash) never sizes the per-slot probe vector: reading it must give the default, not null-deref.
+    CHECK(slot_value_or(std::vector<int>{}, 0, 0) == 0);
+    CHECK(slot_value_or(std::vector<int>{5, 6}, 1, 0) == 6);
+    CHECK(slot_value_or(std::vector<int>{5, 6}, 2, 0) == 0);
+    CHECK(slot_value_or(std::vector<int>{5, 6}, -1, 7) == 7);
+
     std::printf("chain spec shape tests passed: %d checks\n", g_checks);
     return 0;
 }
