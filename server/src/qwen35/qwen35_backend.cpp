@@ -1832,8 +1832,7 @@ bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ct
         set_last_error("KVFlash quota of " + std::to_string(quota_chunks) + " chunks leaves no evictable block beside a headroom of 8");
         return false;
     }
-    kvf_ledger_ = std::make_unique<KvFlashHostLedger>(
-        *host_mib << 20, /*transient_reserve_bytes=*/0);
+    kvf_ledger_ = std::make_unique<KvFlashHostLedger>(*host_mib << 20);
     kvf_kv_ = std::make_unique<KvFlashSlotKv>(raw, *kvf_ledger_, kc);
     kvf_driver_ = std::make_unique<KvFlashStepDriver>(raw, *kvf_arena_, kHeadroom);
     seq_engine_ = std::make_unique<Qwen35SeqEngine>(

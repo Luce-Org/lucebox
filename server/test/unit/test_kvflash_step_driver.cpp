@@ -221,7 +221,7 @@ TEST_CASE(KvflashStepDriverFixture, page_out_checked_refuses_stale_generations_a
 TEST_CASE(KvflashStepDriverFixture, engine_loop_prefills_in_whole_cuts_decodes_past_the_quota_without_idling_and_releases_everything) {
     World w(4);                                                       // quota 12, usable 8
     std::vector<KvFlashSlotPager *> raw{w.s[0].get(), w.s[1].get()};
-    KvFlashHostLedger ledger(int64_t(1) << 30, 0);
+    KvFlashHostLedger ledger(int64_t(1) << 30);
     KvFlashSlotKvConfig kc; kc.quota_chunks = kQ; kc.headroom_blocks = 4; kc.max_ctx = 4096; kc.chunk_bytes = 1000;
     KvFlashSlotKv kv(raw, ledger, kc);
     SeqSlotManager slots(kv, 4096);
