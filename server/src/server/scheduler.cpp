@@ -366,6 +366,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             perf.prompt_tokens = (int)req.prompt_tokens.size();
             perf.pflash = req.client_prompt_tokens >= 0;
             perf.completion_tokens = s.completion_tokens;
+            perf.cache_hit = s.cached_prefix_tokens > 0;
             const int computed_prompt_tokens =
                 prompt_tokens - s.cached_prefix_tokens;
             perf.prefill_tok_s = s.prefill_s > 0.0

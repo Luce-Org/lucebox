@@ -28,7 +28,8 @@ struct PerfRecord {
     bool   cache_hit        = false;
     bool   pflash           = false;
     bool   spec_decode      = false;
-    std::chrono::steady_clock::time_point timestamp;
+    // When the request finished, set by record_perf on every path.
+    std::chrono::system_clock::time_point timestamp;
 };
 
 // Live inference phase.
@@ -147,7 +148,8 @@ public:
         draft_tokens_.clear();
     }
 
-    void record_perf(const PerfRecord & rec) {
+    void record_perf(PerfRecord rec) {
+        rec.timestamp = std::chrono::system_clock::now();
         std::lock_guard<std::mutex> lk(mu_);
         if ((int)perf_history_.size() >= kMaxHistory) {
             perf_history_.erase(perf_history_.begin());
@@ -240,6 +242,8 @@ public:
                 {"cache_hit", r.cache_hit},
                 {"pflash", r.pflash},
                 {"spec_decode", r.spec_decode},
+                {"unix_ms", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    r.timestamp.time_since_epoch()).count()},
             });
         }
         j["perf_history"] = perf;
