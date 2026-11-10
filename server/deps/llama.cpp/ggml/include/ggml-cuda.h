@@ -217,6 +217,13 @@ GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols
 // Returns the previous setting.
 GGML_BACKEND_API bool ggml_backend_cuda_set_mmvq_batch_invariant(bool enabled);
 
+// Calling-thread column ceiling of those batch-invariant products: 0 = eight (the default), 8..16 = that many.
+// Above eight columns Q8_0 still reads each weight row once for all columns where the device runs the generic
+// single-column kernel (the RDNA4 Q8_0 matvec takes eight columns per launch), F32/F16/BF16 run eight columns per
+// launch and other types one column per block; every column keeps its single-column bits. MUL_MAT_ID is not
+// affected (its batch-invariant path takes up to sixteen tokens already). Returns the previous setting.
+GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_invariant_max_ncols(int max_ncols);
+
 // Rows of one Q8_0 matrix split between an RDNA4 and an RDNA3.5 GPU. A Q8_0 MUL_MAT node flagged here runs the RDNA4
 // Q8_0 matvec on RDNA3.5 too (wave32 on both: the same partials, summed in the same order), so each output row has
 // the bits the RDNA4 device gives it, at one column or up to eight batch-invariant ones. RDNA4 runs that kernel for

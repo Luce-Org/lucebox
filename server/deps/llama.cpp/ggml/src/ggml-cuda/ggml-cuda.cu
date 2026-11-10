@@ -130,6 +130,7 @@ static thread_local int ggml_cuda_mmvq_max_ncols_override = 0;
 static thread_local int ggml_cuda_ds4_mix_mmv_max_tokens = GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
 static thread_local bool ggml_cuda_graphs_disabled_override = false;
 static thread_local bool ggml_cuda_mmvq_batch_invariant_enabled = false;
+static thread_local int ggml_cuda_mmvq_invariant_max_ncols_value = 0;
 
 static thread_local ggml_cuda_qwen4exp_profile qwen4exp_profile = GGML_CUDA_QWEN4EXP_OFF;
 
@@ -199,6 +200,18 @@ extern "C" void ggml_backend_cuda_mul_mat_whole_row_lanes(ggml_tensor * mul_mat)
 
 bool ggml_cuda_mmvq_batch_invariant() {
     return ggml_cuda_mmvq_batch_invariant_enabled;
+}
+
+extern "C" int ggml_backend_cuda_set_mmvq_invariant_max_ncols(int max_ncols) {
+    GGML_ASSERT(max_ncols == 0 || (max_ncols >= MMVQ_MAX_BATCH_SIZE && max_ncols <= MMVQ_INVARIANT_MAX_BATCH_SIZE));
+    const int previous = ggml_cuda_mmvq_invariant_max_ncols_value;
+    ggml_cuda_mmvq_invariant_max_ncols_value = max_ncols;
+    return previous;
+}
+
+int ggml_cuda_mmvq_invariant_max_ncols() {
+    return ggml_cuda_mmvq_invariant_max_ncols_value > 0 ? ggml_cuda_mmvq_invariant_max_ncols_value
+                                                        : MMVQ_MAX_BATCH_SIZE;
 }
 
 static thread_local int ggml_cuda_mmvq_invariant_rows_override_value = 0;
@@ -3151,7 +3164,7 @@ static int ggml_cuda_mmvq_max_ncols() {
         return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
     }();
     if (ggml_cuda_mmvq_batch_invariant_enabled) {
-        return MMVQ_MAX_BATCH_SIZE;
+        return ggml_cuda_mmvq_invariant_max_ncols();
     }
     return ggml_cuda_mmvq_max_ncols_override > 0
         ? ggml_cuda_mmvq_max_ncols_override : configured;

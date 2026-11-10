@@ -4137,6 +4137,12 @@ namespace {
 
 // Rows per product: the matvec batch (MMVQ_MAX_BATCH_SIZE) whose per-row arithmetic is the one-row product's.
 constexpr int kVerifyGroupRows = 8;
+// One device takes groups of up to sixteen rows (ggml_backend_cuda_set_mmvq_invariant_max_ncols, the same per-row
+// arithmetic): each group reads the dense weights once and the union of its rows' experts once, so four slots of
+// four rows read them once a step instead of twice. Split mode keeps groups of kVerifyGroupRows, at least two,
+// whose layers interleave across the two devices.
+constexpr int kVerifyWideGroupRows = 16;   // MMVQ_INVARIANT_MAX_BATCH_SIZE
+int verify_group_rows(bool split) { return split ? kVerifyGroupRows : kVerifyWideGroupRows; }
 // The candidates the memory plan reserves per row: a top_k sampler with a penalty asks for twice its power-of-two
 // cover (sample_logits_top_n), 64 for the cards' top_k 20.
 constexpr int kPlanTopN = 64;
@@ -4264,7 +4270,7 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
         ggml_tensor * mask = nullptr, * mask_remote = nullptr;
         Qwen4ExpMoeRoute route;
     };
-    const int per_group = std::max(1, kVerifyGroupRows / R);
+    const int per_group = std::max(1, verify_group_rows(split) / R);
     int n_groups = (n_slots + per_group - 1) / per_group;
     if (split && n_groups < 2 && n_slots >= 2) n_groups = 2;
     std::vector<SlotGroup> groups((size_t) n_groups);
@@ -4384,7 +4390,7 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
         }
     }
 
-    // Each group's output head (at most kVerifyGroupRows rows: the one-row product's arithmetic), greedy picks and,
+    // Each group's output head (at most verify_group_rows rows: the one-row product's arithmetic), greedy picks and,
     // for sampled slots, top candidates; the rows stay on the device for a sampler that needs a whole row.
     ws.groups.clear();
     ggml_tensor * res_hc = nullptr;
@@ -4575,7 +4581,8 @@ Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen
     }
     Qwen4ExpStableInputs qsa_inputs;
     upload_slot_qsa(backend, split, caches, positions, spans, R, ws, qsa_inputs);
-    const ScopedCudaGraphOverrides overrides(false, 0, false, 0, /*mmvq_batch_invariant=*/true);
+    const ScopedCudaGraphOverrides overrides(false, 0, false, 0, /*mmvq_batch_invariant=*/true,
+                                             /*mmvq_invariant_max_ncols=*/verify_group_rows(split));
     if (split && w.hot) w.hot->tick(backend, w);
     const ggml_status status = split ? ggml_backend_sched_graph_compute(ws.sched, ws.gf)
                                      : ggml_backend_graph_compute(backend, ws.gf);
