@@ -182,3 +182,17 @@ TEST_CASE(KvflashSessionStoreFixture, a_waiting_resume_is_picked_again_by_the_re
     CHECK(!kvflash_pick_with_wait({}, 0, (int)history.size(), wait, prompt, "anon", "anon:1").exact());
     CHECK(!kvflash_pick_with_wait({}, 0, (int)history.size(), wait, {1, 2, 9, 4, 5}, who.client, who.sid).exact());
 }
+
+// A second request under a running identity must not become the scheduler's deferred head of line: it admits as its own anonymous session.
+TEST_CASE(KvflashSessionStoreFixture, a_busy_identity_admits_the_second_request_as_anonymous) {
+    KvFlashSessionBook book;
+    book.init(2);
+    book.begin_session(0, "claude", "S");
+    const std::vector<bool> active{true, false};
+    const KvFlashSessionId same = kvflash_admit_identity(book, {"S", "claude"}, active, 42);
+    CHECK(same.client == "anon");
+    CHECK(same.sid == "anon:42");
+    CHECK(kvflash_admit_identity(book, {"other", "claude"}, active, 43).sid == "other");   // not busy: unchanged
+    CHECK(kvflash_admit_identity(book, {"S", "claude"}, {false, false}, 44).sid == "S");   // parked: it resumes
+    CHECK(kvflash_admit_identity(book, {std::string(kKvFlashSidMax + 1, 'x'), "body"}, active, 45).sid.size() == kKvFlashSidMax + 1);   // the gate still refuses it
+}

@@ -185,4 +185,11 @@ inline KvFlashAdmitVerdict kvflash_admit_gate(const KvFlashSessionBook & book, c
     return KvFlashAdmitVerdict::proceed;
 }
 
+// The identity a request is admitted under. An identity that is running another request does not make this one wait (the scheduler
+// would hold the head of the line and stall unrelated sessions beside free slots): it admits as its own anonymous session.
+inline KvFlashSessionId kvflash_admit_identity(const KvFlashSessionBook & book, const KvFlashSessionId & who, const std::vector<bool> & active, uint64_t request_id) {
+    if (kvflash_admit_gate(book, who, active) != KvFlashAdmitVerdict::identity_busy) return who;
+    return {"anon:" + std::to_string(request_id), "anon"};
+}
+
 }  // namespace luce::common

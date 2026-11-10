@@ -620,17 +620,14 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
         return refused;
     }
     const int e_role = kvflash_preamble_end(prompt, b_.w_.im_start_id, b_.w_.system_id);
-    switch (kvflash_admit_gate(book_, {who.sid, who.client}, active_slots_())) {
-        case KvFlashAdmitVerdict::invalid_identity:   // the HTTP boundary answers 400 first; an engine caller is held to the same bound
-            refused.status = AdmitResult::Status::failed;
-            refused.error = "session id longer than " + std::to_string(kKvFlashSidMax) + " bytes";
-            return refused;
-        case KvFlashAdmitVerdict::identity_busy:      // one live owner per identity: the second request waits for the first
-            refused.status = AdmitResult::Status::busy;
-            refused.error = "session " + who.client + "/" + who.sid + " is running another request";
-            return refused;
-        case KvFlashAdmitVerdict::proceed:
-            break;
+    {   // a second request under a running identity admits as its own anonymous session, not as a busy retry that holds the line
+        const KvFlashSessionId id = kvflash_admit_identity(book_, {who.sid, who.client}, active_slots_(), request_id);
+        who.sid = id.sid; who.client = id.client;
+    }
+    if (kvflash_admit_gate(book_, {who.sid, who.client}, active_slots_()) == KvFlashAdmitVerdict::invalid_identity) {   // the HTTP boundary answers 400 first; an engine caller is held to the same bound
+        refused.status = AdmitResult::Status::failed;
+        refused.error = "session id longer than " + std::to_string(kKvFlashSidMax) + " bytes";
+        return refused;
     }
     // The admit table: resume, or cold.
     const std::vector<KvFlashOwnedSession> owners = parked_list_();
