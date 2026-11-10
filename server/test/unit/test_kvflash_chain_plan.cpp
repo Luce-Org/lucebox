@@ -83,13 +83,13 @@ TEST_CASE(KvflashChainPlanFixture, a_column_covering_the_plan_names_the_chunk_th
     // accepted tokens) finds chunk 1 already resident, so the epoch does not move and table_stale stays
     // false: the column written now must already name chunk 1.
     PagerWorld w;
-    REQUIRE(w.drv->run_step({{0, 0, 60}}, nullptr).ok);
+    REQUIRE(w.drv->run_step({{0, 0, 60}}).ok);
     w.drv->finish_step();
     int32_t col[kQ * 4];
     w.drv->write_table(0, col, 1, 16);
 
     const ChainTablePlan plan = chain_table_plan({{0, 60, true, 16}}, kMaxCtx);
-    const auto ran = w.drv->run_step(plan.work, nullptr);
+    const auto ran = w.drv->run_step(plan.work);
     REQUIRE(ran.ok);
     CHECK(chain_round_verdict(plan, ran.ran) == ChainRoundVerdict::Chain);
     CHECK(w.drv->table_stale(0));
@@ -104,7 +104,7 @@ TEST_CASE(KvflashChainPlanFixture, a_column_covering_the_plan_names_the_chunk_th
     CHECK(full[4] >= 0);
 
     // the accepted tokens now extend into chunk 1 and an AR round plans one row there: no new chunk, no stale table
-    REQUIRE(w.drv->run_step({{0, 70, 1}}, nullptr).ok);
+    REQUIRE(w.drv->run_step({{0, 70, 1}}).ok);
     w.drv->finish_step();
     CHECK(!w.drv->table_stale(0));
 
@@ -112,9 +112,9 @@ TEST_CASE(KvflashChainPlanFixture, a_column_covering_the_plan_names_the_chunk_th
     int32_t narrow[kQ * 4];
     std::fill(narrow, narrow + kQ * 4, -7);
     PagerWorld v;
-    REQUIRE(v.drv->run_step({{0, 0, 60}}, nullptr).ok);
+    REQUIRE(v.drv->run_step({{0, 0, 60}}).ok);
     v.drv->finish_step();
-    REQUIRE(v.drv->run_step(plan.work, nullptr).ok);
+    REQUIRE(v.drv->run_step(plan.work).ok);
     v.drv->write_table(0, narrow, (60 + kChunk - 1) / kChunk, 16);   // cover = committed length: the bug this plan avoids
     v.drv->finish_step();
     CHECK(narrow[4] == -7);

@@ -2377,10 +2377,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                 kvf_plan = chain_table_plan(lanes, slots_.max_context());
                 verdict = ChainRoundVerdict::FallbackAr;
                 if (kvf_plan.valid) {
-                    void * compute_stream = ggml_backend_is_cuda(b_.target_backend_)
-                        ? (void *)ggml_backend_cuda_get_stream(b_.target_backend_) : nullptr;
-                    const KvFlashStepDriver::Result ran = kvf_->run_step(kvf_plan.work, compute_stream);
-                    if (!ran.ok) return fail_step("KVFlash step failed (page-out, page-in or allocation)");
+                    const KvFlashStepDriver::Result ran = kvf_->run_step(kvf_plan.work);
+                    if (!ran.ok) return fail_step("KVFlash step failed (page-out or allocation)");
                     verdict = chain_round_verdict(kvf_plan, ran.ran);
                     if (verdict == ChainRoundVerdict::FallbackAr) { kvf_->finish_step(); trim_unaccepted_chunks_(); }   // the AR step plans its own rows; a lane's planned width must not leave a chunk
                 }
@@ -2438,10 +2436,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             cut[(size_t)slice.slot] = c;
             if (c > 0 && c <= slice.max_tokens) work.push_back({slice.slot, seq.cur_pos, c});
         }
-        void * compute_stream = ggml_backend_is_cuda(b_.target_backend_)
-            ? (void *)ggml_backend_cuda_get_stream(b_.target_backend_) : nullptr;
-        const KvFlashStepDriver::Result ran = kvf_->run_step(work, compute_stream);
-        if (!ran.ok) return fail_step("KVFlash step failed (page-out, page-in or allocation)");
+        const KvFlashStepDriver::Result ran = kvf_->run_step(work);
+        if (!ran.ok) return fail_step("KVFlash step failed (page-out or allocation)");
         kvf_t_run = kvf_clock::now();
         kvf_ran.assign((size_t)n_slots, 0);
         for (int slot : ran.ran) kvf_ran[(size_t)slot] = 1;

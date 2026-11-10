@@ -1,8 +1,8 @@
 // KvFlashArena: the page stream and the completion point
 // shared by every slot pager of one engine. Members only queue copies
-// (batch submit, no hidden waits); the step plan's single Fence orders the
-// compute stream, and complete_all() is the one host wait after which their
-// paged-out blocks become allocatable again.
+// (batch submit, no hidden waits); complete_all() is the one host wait after
+// which their paged-out blocks become allocatable again, so a block is never
+// handed out with a copy or a zeroing still queued on it.
 //
 // The arena must outlive its members: a member's destructor synchronizes the
 // shared stream.
@@ -32,7 +32,6 @@ public:
     ~KvFlashArena() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
         if (stream_) { cudaStreamSynchronize(stream_); cudaStreamDestroy(stream_); }
-        if (event_) cudaEventDestroy(event_);
 #endif
     }
     KvFlashArena(const KvFlashArena &) = delete;
@@ -80,28 +79,9 @@ public:
         return true;
     }
 
-    // The step's one compute-stream join (the plan's Fence): later compute work
-    // runs after every queued copy and zero, with no host stall.
-    void join_compute(void * compute_stream) {
-#ifdef KVFLASH_HAS_ASYNC_DMA
-        if (!stream_ || !event_ready_()) { if (host_wait_) host_wait_(); return; }
-        cudaEventRecord(event_, stream_);
-        cudaStreamWaitEvent((cudaStream_t)compute_stream, event_, 0);
-#else
-        (void)compute_stream;
-#endif
-    }
-
 protected:   // the test fixture swaps host_wait_
 #ifdef KVFLASH_HAS_ASYNC_DMA
-    bool event_ready_() {
-        if (!event_ && cudaEventCreateWithFlags(&event_, cudaEventDisableTiming) != cudaSuccess) {
-            event_ = nullptr; (void)cudaGetLastError();
-        }
-        return event_ != nullptr;
-    }
     cudaStream_t stream_ = nullptr;
-    cudaEvent_t  event_ = nullptr;
 #endif
     std::function<void()> host_wait_;
     std::vector<KvFlashPager *> members_;

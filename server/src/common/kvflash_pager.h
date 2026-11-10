@@ -483,7 +483,7 @@ public:
                 return false;
             }
         }
-        if (has_pending_page_in_ && !batch_submit_) synchronize_paging();   // batch: the step's one Fence waits
+        if (has_pending_page_in_) synchronize_paging();
         return true;
     }
 
@@ -606,9 +606,9 @@ public:
         generation_++;   // page-outs planned before the abort are stale
     }
 
-    // Arena mode (KvFlashArena): copies are only queued. slot_for/alloc_span do
-    // not wait or fence; the step plan's one Fence orders the compute stream
-    // after them, and arena completion reclaims the blocks.
+    // Arena mode (KvFlashArena): page-outs are only queued and their blocks are
+    // reclaimed by the arena's completion (one host wait), so slot_for hands out
+    // blocks with no page work queued on them and does not fence.
     void set_batch_submit(bool on) { batch_submit_ = on; }
     void * page_stream() const {
 #ifdef KVFLASH_HAS_ASYNC_DMA
@@ -1433,7 +1433,7 @@ private:
     // ponytail: without a registered compute stream this is a host wait, one
     // stall per new chunk after a page-out; registering the stream removes it.
     void fence_page_work_() {
-        if (defer_fence_ || batch_submit_) return;   // reselect() waits once for its whole batch; the arena's step Fence orders its
+        if (defer_fence_ || batch_submit_) return;   // reselect() waits once for its whole batch; an arena member's free blocks have no page work queued
         stats_.fence_points++;
 #ifdef KVFLASH_HAS_ASYNC_DMA
         if (!page_work_queued_) return;
