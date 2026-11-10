@@ -8,21 +8,23 @@ extern "C" size_t ggml_backend_cuda_get_concat_transpose_f32_count(void) {
     return g_concat_transpose_f32_count.load(std::memory_order_relaxed);
 }
 
-// Fast path for concatenating a short contiguous prefix with a dense
-// dim-0/dim-1 transpose.  The motivating layout is the SSM convolution input:
+// Fast path for concatenating a short contiguous prefix with a dim-0/dim-1
+// transpose.  The motivating layout is the SSM convolution input:
 //
 //   src0 [prefix, channels, sequences] (contiguous)
 //   src1 [tokens, channels, sequences]  (the transpose of a
-//                                         [channels, tokens, sequences] view
-//                                         whose channels are contiguous; its
-//                                         token rows may be wider than
-//                                         `channels`, as in a column slice of
-//                                         a stacked projection)
+//                                         [channels, tokens, sequences] view:
+//                                         channels contiguous, any token and
+//                                         sequence stride that is a multiple
+//                                         of 4 bytes, so a token row may be
+//                                         wider than `channels`, as in a
+//                                         column slice of a stacked projection,
+//                                         and sequences may be padded)
 //   dst  [prefix + tokens, channels, sequences] (contiguous)
 //
 // concat_non_cont assigns one block to each channel and has the threads in a
-// wave read adjacent logical tokens.  For src1 those reads are `channels`
-// elements apart.  Transpose a 32x32 tile through shared memory instead so
+// wave read adjacent logical tokens.  For src1 those reads are a token row
+// apart.  Transpose a 32x32 tile through shared memory instead so
 // both the source reads and destination writes are coalesced.  Copy the small
 // prefix in the token-tile-zero blocks to avoid a second launch.
 constexpr int CUDA_CONCAT_TRANSPOSE_TILE = 32;
@@ -109,9 +111,10 @@ static bool concat_dim0_dense_transpose_f32_cuda(
     const int64_t channels  = dst->ne[1];
     const int64_t sequences = dst->ne[2];
 
-    // Keep this a strict layout specialization.  Anything padded, permuted in
-    // more than the first two dimensions, unusually large, or non-F32 falls
-    // through to the existing fully general implementation.
+    // src0 and dst must be contiguous; src1 must have contiguous channels and
+    // may have any token and sequence stride that is a multiple of 4 bytes.
+    // Anything else (other permutations, a 4th dimension, unusually large
+    // shapes, non-F32) falls through to the fully general implementation.
     const bool supported =
         dim == 0 &&
         src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
