@@ -180,6 +180,7 @@ TEST_CASE(KvflashPagerVictimTierFixture, truncate_drops_tier_copies_of_dropped_c
 TEST_CASE(KvflashPagerVictimTierFixture, host_tensors_on_a_gpu_build_get_no_device_tier) {
     Harness A(/*on_device=*/false);
     KvFlashPager p;
+    p.set_pinned_host_backing(false);  // CPU tensors: pageable staging, no cudaMallocHost (stub-driver CI)
     REQUIRE(p.attach(cfg(16), A.k, A.v));
 #ifdef KVFLASH_HAS_ASYNC_DMA
     CHECK(p.victim_blocks() == 0);

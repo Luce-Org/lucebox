@@ -59,6 +59,7 @@ std::vector<bool> resident_set(const KvFlashPager & p, int n) {
 TEST_CASE(KvflashPagerReselectFenceFixture, reselect_page_ins_fence_once_at_the_end) {
     Harness A;
     KvFlashPager p;
+    p.set_pinned_host_backing(false);  // CPU tensors: pageable staging, no cudaMallocHost (stub-driver CI)
     REQUIRE(p.attach(cfg(), A.k, A.v));
     REQUIRE(p.alloc_span(0, 14 * kChunk));
     const int64_t fences0 = p.stats().fence_points, ins0 = p.stats().page_ins;
@@ -78,6 +79,7 @@ TEST_CASE(KvflashPagerReselectFenceFixture, reselect_page_ins_fence_once_at_the_
 TEST_CASE(KvflashPagerReselectFenceFixture, reselect_recent_batches_and_keeps_the_recency_set) {
     Harness A;
     KvFlashPager p;
+    p.set_pinned_host_backing(false);  // CPU tensors: pageable staging, no cudaMallocHost (stub-driver CI)
     REQUIRE(p.attach(cfg(), A.k, A.v));
     REQUIRE(p.alloc_span(0, 14 * kChunk));
     p.score_hook = [](int c) { return c >= 1 && c <= 3 ? 100.0f : (float)c; };
@@ -85,6 +87,7 @@ TEST_CASE(KvflashPagerReselectFenceFixture, reselect_recent_batches_and_keeps_th
     p.score_hook = nullptr;
     Harness B;
     KvFlashPager fresh;
+    fresh.set_pinned_host_backing(false);  // CPU tensors: pageable staging, no cudaMallocHost (stub-driver CI)
     REQUIRE(fresh.attach(cfg(), B.k, B.v));
     REQUIRE(fresh.alloc_span(0, 14 * kChunk));
     const int64_t fences0 = p.stats().fence_points;
