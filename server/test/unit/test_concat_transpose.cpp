@@ -31,6 +31,7 @@ struct ConcatCase {
     bool expect_fast_path;
     int row_width = 0;      // elements per token row of the source; 0 = channels
     int column_offset = 0;  // first source column of the slice
+    int sequence_pad = 0;   // unused token rows between source sequences
 };
 
 float tagged_value(uint32_t tag, size_t index) {
@@ -54,8 +55,9 @@ bool run_case(ggml_backend_t backend, const ConcatCase & tc) {
     ggml_tensor * history = ggml_new_tensor_3d(
         ctx, GGML_TYPE_F32, tc.prefix, tc.channels, tc.sequences);
     const int row_width = tc.row_width > 0 ? tc.row_width : tc.channels;
+    const int rows_per_sequence = tc.tokens + tc.sequence_pad;
     ggml_tensor * rows = ggml_new_tensor_3d(
-        ctx, GGML_TYPE_F32, row_width, tc.tokens, tc.sequences);
+        ctx, GGML_TYPE_F32, row_width, rows_per_sequence, tc.sequences);
     ggml_set_input(history);
     ggml_set_input(rows);
     ggml_tensor * qkv = ggml_view_3d(
@@ -80,7 +82,7 @@ bool run_case(ggml_backend_t backend, const ConcatCase & tc) {
     const size_t history_elements =
         (size_t) tc.prefix * tc.channels * tc.sequences;
     const size_t qkv_elements =
-        (size_t) row_width * tc.tokens * tc.sequences;
+        (size_t) row_width * rows_per_sequence * tc.sequences;
     const size_t output_elements =
         (size_t) (tc.prefix + tc.tokens) * tc.channels * tc.sequences;
     std::vector<float> history_data(history_elements);
@@ -106,7 +108,7 @@ bool run_case(ggml_backend_t backend, const ConcatCase & tc) {
             }
             for (int t = 0; t < tc.tokens; ++t) {
                 const size_t qkv_index =
-                    ((size_t) s * tc.tokens + t) * row_width +
+                    ((size_t) s * rows_per_sequence + t) * row_width +
                     tc.column_offset + c;
                 expected[output_row + tc.prefix + t] = qkv_data[qkv_index];
             }
@@ -192,6 +194,8 @@ int main() {
         {"stacked_tails",     3,  33,    65, 3, true,   100,    7},
         {"stacked_decode",    3,   1,    65, 2, true,    80,   15},
         {"stacked_qwen",      3, 2048, 10240, 1, true, 16384, 6144},
+        // ... and sequences that are not tokens x row width apart
+        {"padded_sequences",  3,  33,    65, 3, true,   100,    7, 5},
         {"prefix_fallback",  33,  17,    35, 2, false},
     };
 
