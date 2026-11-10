@@ -4644,7 +4644,22 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 last_tok = sample_logits(verify_logits.data(), (int)verify_logits.size(),
                                          sampler_, out_tokens, sampler_rng_);
             } else {
-                last_tok = target_tok[0];
+                // The grammar sits after the hop token (emitted above): a root
+                // it rejects would be committed and end the constraint.
+                last_tok = constrained_greedy
+                    ? luce::common::constrained_next_root(
+                          target_tok[0], sampler_, out_tokens, sampler_rng_,
+                          [&](int & vocab) -> const float * {
+                              if (!target->read_verify_row(0, verify_logits)) return nullptr;
+                              vocab = (int)verify_logits.size();
+                              return verify_logits.data();
+                          })
+                    : target_tok[0];
+                if (last_tok < 0) {
+                    std::fprintf(stderr, "spec-decode: AR step logits read failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
             }
             committed += 1;
             cache_.cur_pos = committed;
@@ -5797,16 +5812,19 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 // The replay's argmax, or a walk row the budget hook changed
                 // the token before: checked against the grammar where the
                 // commit point left it, the next root's position.
-                if (constrained_greedy && commit_n > 0 &&
-                    !sampler_.constraint->allows(last_tok)) {
-                    if (!target->read_verify_row(commit_n - 1, verify_logits)) {
+                if (constrained_greedy && commit_n > 0) {
+                    last_tok = luce::common::constrained_next_root(
+                        last_tok, sampler_, out_tokens, sampler_rng_,
+                        [&](int & vocab) -> const float * {
+                            if (!target->read_verify_row(commit_n - 1, verify_logits)) return nullptr;
+                            vocab = (int)verify_logits.size();
+                            return verify_logits.data();
+                        });
+                    if (last_tok < 0) {
                         std::fprintf(stderr, "spec-decode: verify logits read failed\n");
                         step_graph_destroy(draft_sg);
                         return false;
                     }
-                    last_tok = sample_logits(verify_logits.data(),
-                                             (int)verify_logits.size(), sampler_,
-                                             out_tokens, sampler_rng_);
                 }
             }
             // The target ran all commit_n tokens. After an early stop (EOS,
