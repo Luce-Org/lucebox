@@ -400,7 +400,8 @@ int Qwen4ExpSeqEngine::batched_verify_width(const StepPlan & plan) const {
     for (const StepInput & input : plan.decode) {
         const SeqSlot & slot = slots_.slot(input.slot);
         if (!mtp_[(size_t)input.slot].live || !input.allow_speculation) return 0;
-        rows = std::min(rows, max_context() - slot.cur_pos);
+        // Each cache's rollback rows bound its verify (a fixed --verify-width of 2 or 3 leaves 2 or 3).
+        rows = std::min({rows, max_context() - slot.cur_pos, caches_[(size_t)input.slot]->mtp_draft + 1});
         caches.push_back(caches_[(size_t)input.slot]);
         positions.push_back(slot.cur_pos);
     }
