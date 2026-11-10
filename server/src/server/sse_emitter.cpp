@@ -89,8 +89,19 @@ json build_timings_json(const GenTimings & t, int completion_tokens) {
         {"effective_prompt_tokens", t.effective_prompt_tokens},
         {"agent_turn_cache_hit",  t.agent_turn_cache_hit}
     };
+    if (t.queue_s >= 0.0) out["queue_ms"] = round1(t.queue_s * 1000.0);
+    if (t.first_token_s >= 0.0) out["first_token_ms"] = round1(t.first_token_s * 1000.0);
+    if (t.slot >= 0) out["slot"] = t.slot;
+    if (t.active_at_admission >= 0) out["active_at_admission"] = t.active_at_admission;
     if (!t.pflash.is_null()) out["pflash"] = t.pflash;
     return out;
+}
+
+double seconds_since(std::chrono::steady_clock::time_point from,
+                     std::chrono::steady_clock::time_point to) {
+    const std::chrono::steady_clock::time_point unset{};
+    if (from == unset || to == unset || to < from) return -1.0;
+    return std::chrono::duration<double>(to - from).count();
 }
 
 json responses_output_items(const std::string & message_id,

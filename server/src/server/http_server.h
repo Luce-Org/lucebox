@@ -944,6 +944,7 @@ private:
 
     struct GenerationOutputState {
         int completion_tokens = 0;
+        std::chrono::steady_clock::time_point first_token_at{};
         bool visible_output_seen = false;
         bool client_disconnected = false;
     };
@@ -1200,6 +1201,9 @@ struct ServerJob {
     // First concurrent-scheduler attempt; retained across busy deferrals so
     // server-side prefill/elapsed telemetry does not erase queueing delay.
     std::chrono::steady_clock::time_point parallel_started_at{};
+    // When the request joined the serving queue (enqueue): usage.timings'
+    // queue_ms and first_token_ms count from here on both paths.
+    std::chrono::steady_clock::time_point enqueued_at{};
     // Concurrent PFlash (scheduler.cpp): the job came back from the
     // compression thread. When it was compressed, req.prompt_tokens holds the
     // served prompt and req.client_prompt_tokens the client prompt's size.
