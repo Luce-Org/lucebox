@@ -530,7 +530,6 @@ bool Qwen35Backend::init() {
     if (cfg_.paged_attention && kvflash_active()) {
         luce::common::KvFlashConcurrentRequest rq;
         rq.arch = kvflash_arch();
-        rq.kvflash_requested = true;
         rq.wmma_env = luce::common::kvflash_paged_wmma_active(std::getenv("LUCE_PAGED_WMMA"), device_is_rdna4(cfg_.device.gpu));
         rq.draft = cfg_.draft_path.has_value();
         rq.tree = cfg_.ddtree_mode;

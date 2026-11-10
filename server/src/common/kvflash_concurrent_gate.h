@@ -50,11 +50,9 @@ inline bool kvflash_chain_spec_switch() {
 // ── What may run the concurrent KVFlash arena? ─────────────────────────
 struct KvFlashConcurrentRequest {
     std::string arch;
-    bool kvflash_requested = false, kvflash_auto = false;
-    bool pool_would_be_disabled_by_placement = false;  // the MoE all-hot case; must NOT erase the refusal
     bool wmma_env = false;                             // the WMMA kernel is active (kvflash_paged_wmma_active)
     bool wmma_null_exclusion_ready = false;            // true once the kernel excludes null blocks (-04, gate lift)
-    bool draft = false, tree = false, pflash = false, images = false;
+    bool draft = false, tree = false;
     // Stage C: a draft model is admitted only as a DFlash2 chain, behind the switch.
     bool chain_spec_switch = false;          // LUCE_KVFLASH_CHAIN_SPEC=1
     bool draft_local_same_device = false;    // in-process draft on the target's device, no split/TP/remote
@@ -82,6 +80,7 @@ inline std::optional<int64_t> kvflash_parse_host_mib(const char * env) {
 // First reason the combination is refused, nullopt if it may run.
 // Architecture-exact (qwen35 only) and decided on the REQUESTED combination,
 // before any subclass policy (Qwen35MoeBackend::post_kvflash_init_gate) runs.
+// PFlash compression is refused at launch (server_main) and an image request by the engine (supports_images).
 inline std::optional<std::string> kvflash_concurrent_refusal(const KvFlashConcurrentRequest & r) {
     if (r.arch != "qwen35")
         return "concurrent KVFlash supports only dense arch qwen35 (got '" + r.arch + "')";
@@ -96,8 +95,6 @@ inline std::optional<std::string> kvflash_concurrent_refusal(const KvFlashConcur
                    "(block size 2..16, --fa-window 0)";
     }
     if (r.tree)  return "concurrent KVFlash does not support tree verification";
-    if (r.pflash) return "concurrent KVFlash does not combine with PFlash";
-    if (r.images) return "concurrent KVFlash does not serve image requests";
     return std::nullopt;
 }
 

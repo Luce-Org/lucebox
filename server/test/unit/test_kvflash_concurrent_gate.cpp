@@ -47,7 +47,7 @@ TEST_CASE(KvflashConcurrentGateFixture, only_dense_qwen35_may_run_the_concurrent
     }
 }
 
-TEST_CASE(KvflashConcurrentGateFixture, wmma_draft_chain_tree_and_pflash_are_refused_with_a_message_each) {
+TEST_CASE(KvflashConcurrentGateFixture, wmma_a_draft_and_tree_verification_are_refused_with_a_message_each) {
     auto base = [] { KvFlashConcurrentRequest r; r.arch = "qwen35"; return r; };
     {
         auto r = base(); r.wmma_env = true;               // until the kernel excludes null blocks
@@ -59,8 +59,6 @@ TEST_CASE(KvflashConcurrentGateFixture, wmma_draft_chain_tree_and_pflash_are_ref
     }
     { auto r = base(); r.draft = true;  const auto m = kvflash_concurrent_refusal(r); REQUIRE(m.has_value()); CHECK(m->find("draft") != std::string::npos); }
     { auto r = base(); r.tree = true;   const auto m = kvflash_concurrent_refusal(r); REQUIRE(m.has_value()); CHECK(m->find("tree") != std::string::npos); }
-    { auto r = base(); r.pflash = true; const auto m = kvflash_concurrent_refusal(r); REQUIRE(m.has_value()); CHECK(m->find("PFlash") != std::string::npos); }
-    { auto r = base(); r.images = true; const auto m = kvflash_concurrent_refusal(r); REQUIRE(m.has_value()); CHECK(m->find("image") != std::string::npos); }
 }
 
 namespace {
@@ -93,8 +91,6 @@ TEST_CASE(KvflashConcurrentGateFixture, a_dflash2_chain_is_allowed_only_with_the
     { auto r = chain_request(); r.draft_block = 0;                 refused(r, "draft"); }
     { auto r = chain_request(); r.fa_window = 4096;                refused(r, "draft"); }
     { auto r = chain_request(); r.arch = "qwen35moe";              refused(r, "qwen35"); }
-    { auto r = chain_request(); r.pflash = true;                   refused(r, "PFlash"); }
-    { auto r = chain_request(); r.images = true;                   refused(r, "image"); }
     { auto r = chain_request(); r.wmma_env = true;                 refused(r, "PAGED_WMMA"); }
     // the switch without a draft changes nothing
     { KvFlashConcurrentRequest r; r.arch = "qwen35"; r.chain_spec_switch = true; CHECK(!kvflash_concurrent_refusal(r).has_value()); }
@@ -109,20 +105,6 @@ TEST_CASE(KvflashConcurrentGateFixture, the_chain_spec_switch_reads_exactly_LUCE
     setenv("LUCE_KVFLASH_CHAIN_SPEC", "true", 1); CHECK(!kvflash_chain_spec_switch());
     setenv("LUCE_KVFLASH_CHAIN_SPEC", "1", 1);  CHECK(kvflash_chain_spec_switch());
     if (old) setenv("LUCE_KVFLASH_CHAIN_SPEC", saved.c_str(), 1); else unsetenv("LUCE_KVFLASH_CHAIN_SPEC");
-}
-
-TEST_CASE(KvflashConcurrentGateFixture, the_moe_check_runs_before_a_subclass_can_erase_the_request) {
-    // Qwen35MoeBackend::post_kvflash_init_gate may disable the pool and return true.
-    // The request-level refusal looks at the REQUESTED combination, so an all-hot
-    // placement that would drop the pool still refuses.
-    KvFlashConcurrentRequest r;
-    r.arch = "qwen35moe";
-    r.kvflash_requested = true;
-    r.pool_would_be_disabled_by_placement = true;
-    const auto m = kvflash_concurrent_refusal(r);
-    REQUIRE(m.has_value());
-    r.kvflash_auto = true;                                // auto request, same verdict
-    CHECK(kvflash_concurrent_refusal(r).has_value());
 }
 
 TEST_CASE(KvflashConcurrentGateFixture, the_concurrent_profile_is_lru_only_by_default_and_rejects_c2_requests) {
