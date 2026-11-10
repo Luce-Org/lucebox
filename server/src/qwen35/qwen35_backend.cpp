@@ -4206,11 +4206,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
     // - greedy decoding (no logit processing) — spec decode uses argmax verification
     // - sampled-verify enabled — allows spec decode with active sampling
     // - kvflash: verify_batch is slot-mapped (Qwen35DFlashTarget pooled
-    //   path), and that covers --ddtree too: in the daemon, ddtree_mode
-    //   configures larger verify intermediates + fast_rollback, whose
-    //   snapshot_kv/restore_kv only touch DeltaNet/conv state (pool-
-    //   neutral); generation runs this same chain loop either way. The
-    //   tree-verify graphs exist only in the test harness (test_dflash).
+    //   path); --ddtree with KVFlash is refused at startup.
     const bool can_spec = cfg_.draft_path
         && !draft_parked_
         && (cfg_.remote_draft.enabled()
@@ -4233,9 +4229,6 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         TargetCache & c;
         QStageGuard(TargetCache & cache, bool on) : c(cache) {
             c.q_stage_on = on && c.q_stage; c.q_stage_n = 0; c.q_stage_base = -1;
-            if (on && !c.q_stage)
-                std::fprintf(stderr, "[kvflash] qk policy without a query stage (draft block size <= 0): "
-                                     "q_cap is not refreshed, reselect scores from a stale query\n");
         }
         ~QStageGuard() { c.q_stage_on = false; c.q_stage_n = 0; c.q_stage_base = -1; }
     } q_stage_guard{cache_, kvflash_active() && kvflash_qk_policy_};

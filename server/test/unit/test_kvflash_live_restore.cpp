@@ -196,9 +196,9 @@ TEST_CASE(KvflashLiveRestoreFixture, turn_rung_catches_the_final_answer_rerender
     CHECK(e.C == 4608);
 }
 
-// ---- Stage S: spec step commit, settle, gen rung, QK pooling ----
+// ---- Spec step commit, settle, generation-end rung, QK pooling ----
 
-// S-U1: the budget clamp of one spec step (production: spec loop, step 5).
+// The budget clamp of one spec step.
 TEST_CASE(KvflashLiveRestoreFixture, spec_commit_n_bonus_is_clamped_by_the_budget) {
     CHECK(spec_commit_n(5, true, 100) == 6);   // 5 accepted + bonus
     CHECK(spec_commit_n(5, true, 5) == 5);     // bonus dropped
@@ -244,7 +244,7 @@ TEST_CASE(KvflashLiveRestoreFixture, spec_settle_budget_close_leaves_the_close_t
     CHECK(only.new_committed == 1000);
 }
 
-// S-U2: generation-end rung G. A spec turn and an AR turn that emit the same
+// Generation-end rung. A spec turn and an AR turn that emit the same
 // tokens end in the same state: last token pending, history one longer than
 // cur_pos. Their checkpoints must be equal.
 TEST_CASE(KvflashLiveRestoreFixture, gen_rung_spec_equals_ar) {
@@ -308,7 +308,7 @@ TEST_CASE(KvflashLiveRestoreFixture, reselect_points_a_step_crossing_a_boundary_
     CHECK(kvflash_reselect_points(100, 0, 10, 0).empty());                        // tau <= 0: off
 }
 
-// S-U3: QK pooling happens at the settled position only.
+// QK pooling happens at the settled position only.
 TEST_CASE(KvflashLiveRestoreFixture, qk_pool_range_covers_sealed_chunks_only) {
     auto r = kvflash_qk_pool_range(3, 64 * 5 + 10, 64);
     CHECK(r.from == 3);
