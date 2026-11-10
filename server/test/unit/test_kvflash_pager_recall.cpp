@@ -69,12 +69,14 @@ TEST_CASE(KvflashPagerRecallFixture, recent_pool_after_truncate_equals_a_fresh_l
     const int C = 10 * kChunk;   // 10 chunks > 8 blocks
     Harness F;
     KvFlashPager fresh;
+    fresh.set_pinned_host_backing(false);  // CPU tensors: pageable staging, no cudaMallocHost (stub-driver CI)
     REQUIRE(fresh.attach(cfg(), F.k, F.v));
     REQUIRE(fresh.alloc_span(0, C));
     const std::vector<bool> want = resident_set(fresh, 10);
 
     Harness A;
     KvFlashPager stale;
+    stale.set_pinned_host_backing(false);  // CPU tensors: pageable staging, no cudaMallocHost (stub-driver CI)
     REQUIRE(stale.attach(cfg(), A.k, A.v));
     leave_stale_pick(stale);
     stale.truncate(C);
@@ -90,6 +92,7 @@ TEST_CASE(KvflashPagerRecallFixture, recent_pool_after_truncate_equals_a_fresh_l
 TEST_CASE(KvflashPagerRecallFixture, reselect_recent_on_a_fitting_prefix_is_a_noop) {
     Harness A;
     KvFlashPager p;
+    p.set_pinned_host_backing(false);  // CPU tensors: pageable staging, no cudaMallocHost (stub-driver CI)
     REQUIRE(p.attach(cfg(), A.k, A.v));
     leave_stale_pick(p);
     p.truncate(6 * kChunk);                            // 6 chunks <= 8 blocks
@@ -104,6 +107,7 @@ TEST_CASE(KvflashPagerRecallFixture, reselect_recent_on_a_fitting_prefix_is_a_no
 TEST_CASE(KvflashPagerRecallFixture, slot_mask_hides_rows_above_the_decode_position) {
     Harness A;
     KvFlashPager p;
+    p.set_pinned_host_backing(false);  // CPU tensors: pageable staging, no cudaMallocHost (stub-driver CI)
     REQUIRE(p.attach(cfg(), A.k, A.v));
     REQUIRE(p.alloc_span(0, 3 * kChunk));              // chunks 0..2 resident
     const int cur_pos = 2 * kChunk + 10;               // inside the tail chunk
