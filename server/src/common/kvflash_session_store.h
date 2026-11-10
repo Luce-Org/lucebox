@@ -78,8 +78,16 @@ inline KvFlashSessionId kvflash_resolve_session(const KvFlashHeaders & headers, 
     return {};
 }
 
-// An identity within the bound on a session id (the HTTP boundary answers 400 otherwise).
+// An identity within the bound on a session id (the HTTP boundary drops an over-long one, see kvflash_bound_identity).
 inline bool kvflash_identity_valid(const KvFlashSessionId & id) { return id.sid.size() <= kKvFlashSidMax; }
+
+// The identity as the HTTP boundary keeps it: an id that is too long, or holds control characters (it is printed in the server log),
+// is no identity at all and the request is served like any other without a session.
+inline KvFlashSessionId kvflash_bound_identity(KvFlashSessionId id) {
+    bool ok = kvflash_identity_valid(id);
+    for (const unsigned char c : id.sid) ok &= c >= 0x20 && c != 0x7f;
+    return ok ? id : KvFlashSessionId{};
+}
 
 // A client that named its session, as against one that sent nothing (anon): an anonymous
 // session is ownerless, resumable by content alone.
