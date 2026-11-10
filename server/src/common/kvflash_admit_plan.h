@@ -1,7 +1,7 @@
 // KVFlash 2.0 sessions: the admit decision table, pure. The engine computes the resume pick, the resume point and which parked
 // instance (if any) is the request's own sid; this turns them into one action. There is no storage tier or preamble store yet:
-// a session that cannot resume is dropped by the engine and the request admits cold. Rows that need them (archive, attach, capture)
-// come back with that change.
+// a request that cannot resume admits cold, and its own session that it replaced is the first to leave. Rows that need them
+// (archive, attach, capture) come back with that change.
 #pragma once
 
 #include "kvflash_session_store.h"
@@ -25,7 +25,7 @@ struct KvFlashAdmitIn {
 
 struct KvFlashAdmitPlan {
     KvFlashAdmitAction action = KvFlashAdmitAction::cold;
-    int slot = -1;                // resume: the slot; summary_cold: the slot to keep
+    int slot = -1;                // resume: the slot; summary_cold: the slot to keep; cold: the request's own session it replaced, or -1
     int L = 0;                    // resume point
 };
 
@@ -36,6 +36,10 @@ inline KvFlashAdmitPlan kvflash_admit_plan(const KvFlashAdmitIn & in) {
         p.action = A::resume; p.slot = in.pick_slot; p.L = in.L;
     } else if (in.same_sid_slot >= 0 && in.e_role == 0) {
         p.action = A::summary_cold; p.slot = in.same_sid_slot;
+    } else if (in.pick_slot >= 0 && in.pick_slot == in.same_sid_slot && in.lcp >= in.e_role) {
+        // The same system block under the same sid, and no resume: a compaction or an edit. That history will not be extended
+        // again. Another system block (lcp < e_role) is a side call: the session stays as it is.
+        p.slot = in.pick_slot;
     }
     return p;
 }

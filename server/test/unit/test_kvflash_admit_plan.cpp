@@ -70,8 +70,29 @@ TEST_CASE(KvflashAdmitPlanFixture, a_parked_sid_that_cannot_resume_and_no_parked
     const auto prompt = cat(cat(preamble(), turn(USR, 7000, 20)), turn(AST, 7100, 600));
     const KvFlashAdmitPlan p = plan_of(parked, "opencode", "ses_a", prompt);
     CHECK(p.action == A::cold);
-    CHECK(p.slot == -1);
+    CHECK(p.slot == 0);   // the parked instance is the one this request replaced
     CHECK(plan_of({}, "opencode", "ses_a", prompt).action == A::cold);
+}
+
+TEST_CASE(KvflashAdmitPlanFixture, a_cold_request_names_the_parked_session_it_replaced_only_when_it_is_its_own_under_the_same_system_block) {
+    const std::vector<Parked> parked = {{parked_history(), "opencode", "ses_a", 1, (int)parked_history().size() - 340}};
+    // a side call of the same sid under another system block is not a new history of that session
+    const auto side = cat(cat({IM, SYS}, run(900, 300)), turn(USR, 7000, 20));
+    REQUIRE(kvflash_preamble_end(side, IM, SYS) == 302);
+    const KvFlashAdmitPlan p = plan_of(parked, "opencode", "ses_a", side);
+    CHECK(p.action == A::cold);
+    CHECK(p.slot == -1);
+    // an edit inside the conversation with no resume point at or before it replaces the session
+    KvFlashAdmitIn in;
+    in.e_role = E_ROLE; in.pick_slot = 0; in.same_sid_slot = 0; in.lcp = E_ROLE + 500; in.L = -1;
+    CHECK(kvflash_admit_plan(in).action == A::cold);
+    CHECK(kvflash_admit_plan(in).slot == 0);
+    // an ownerless session picked by content is not the requester's to replace
+    in.same_sid_slot = -1;
+    CHECK(kvflash_admit_plan(in).slot == -1);
+    // nor is another instance of the sid than the one the prompt was matched against
+    in.same_sid_slot = 1;
+    CHECK(kvflash_admit_plan(in).slot == -1);
 }
 
 // ── edges of the rows ───────────────────────────────────────────────────────────────────────
@@ -163,7 +184,7 @@ TEST_CASE(KvflashAdmitPlanFixture, the_two_opencode_compaction_requests_resolve_
     CHECK(kvflash_preamble_end(post_req, IM, SYS) == E_ROLE);
     const KvFlashAdmitPlan q = plan_of(parked, who.client, who.sid, post_req);
     CHECK(q.action == A::cold);
-    CHECK(q.slot == -1);
+    CHECK(q.slot == 0);   // the pre-compaction instance is replaced: the first to leave
 }
 
 // A summary-cold request keeps its sid's parked slot; with nothing live to wait for, a refusal there can never clear, so the keep is given up.
