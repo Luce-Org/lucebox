@@ -193,3 +193,17 @@ TEST_CASE(KvflashPagerVictimTierFixture, host_tensors_on_a_gpu_build_get_no_devi
     CHECK(p.victim_blocks() == 16);
 #endif
 }
+
+// Every page-out queues a FIFO entry; entries whose slot was dropped or reassigned are dead. Thousands of
+// page-out/recall cycles must not grow the queue past a small multiple of the tier.
+TEST_CASE(KvflashPagerVictimTierFixture, the_fifo_does_not_grow_with_the_number_of_page_out_recall_cycles) {
+    Harness A;
+    KvFlashPager p;
+    REQUIRE(p.attach(cfg(16), A.k, A.v));
+    for (int c = 0; c < 8; c++) REQUIRE(p.alloc_span(c * kChunk, kChunk));
+    for (int i = 0; i < 2000; i++) {
+        p.page_out(1);              // takes a tier slot and queues an entry
+        p.slot_for(kChunk);         // recall plus a row write: the slot is freed, the entry is dead
+    }
+    CHECK(p.victim_fifo_size() <= 3 * p.victim_blocks());
+}

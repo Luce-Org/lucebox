@@ -586,6 +586,7 @@ public:
             if (vs >= 0) {
                 st.victim = vs;
                 victim_fifo_.push_back({c, vs});
+                victim_fifo_compact_();
                 copy_block_(st.block, victim_ptr_(vs), /*to_host=*/true, /*peer_on_device=*/kVictimOnDevice);
             }
         }
@@ -776,6 +777,7 @@ public:
     int cur_chunk() const { return cur_chunk_; }
     int n_pool_blocks() const { return n_blocks_; }
     int victim_blocks() const { return n_victim_; }
+    size_t victim_fifo_size() const { return victim_fifo_.size(); }   // queue length incl. dead entries (test hook)
     // Bytes of one (layer, kv_head) K segment: chunk_tokens contiguous rows.
     size_t k_seg_bytes() const { return k_seg_bytes_; }
     // Host copy of chunk c's K rows for (layer, kv_head), or nullptr when the
@@ -1558,6 +1560,19 @@ private:
         victim_free_.clear();
         victim_fifo_.clear();
         for (int sl = n_victim_ - 1; sl >= 0; sl--) victim_free_.push_back(sl);
+    }
+    // Dead entries (slot dropped by a write or truncate, or reassigned) are only popped when a slot is needed; sweep
+    // them once the queue passes twice the tier so page-out/recall cycles on a tier with free slots cannot grow it.
+    // A freed slot is handed out again, so an old entry can name the same (chunk, slot) as the live one: keep the newest.
+    void victim_fifo_compact_() {
+        if ((int)victim_fifo_.size() <= 2 * n_victim_ + 8) return;
+        std::deque<std::pair<int, int>> keep;
+        std::vector<char> seen(chunks_.size(), 0);
+        for (auto it = victim_fifo_.rbegin(); it != victim_fifo_.rend(); ++it) {
+            const auto [c, sl] = *it;
+            if (c < (int)chunks_.size() && chunks_[(size_t)c].victim == sl && !seen[(size_t)c]) { seen[(size_t)c] = 1; keep.push_front(*it); }
+        }
+        victim_fifo_.swap(keep);
     }
     uint8_t * victim_ptr_(int sl) const { return victim_buf_ + (size_t)sl * chunk_bytes_; }
     void victim_drop_(ChunkState & st) { victim_free_.push_back(st.victim); st.victim = -1; }

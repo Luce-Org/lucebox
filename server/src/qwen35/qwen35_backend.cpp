@@ -2502,7 +2502,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     if (kvf_paged) {
         // Chunk-aligned but not one-chunk ubatches; see kvflash_pooled_ubatch.
         const int kvf_chunk = kvflash_pager_.chunk_tokens();
-        prefill_ubatch = kvflash_pooled_ubatch(prefill_ubatch, kvf_chunk, kvflash_tokens_);
+        prefill_ubatch = kvflash_pooled_ubatch(prefill_ubatch, kvf_chunk, kvflash_tokens_, kvflash_preamble_reserve_);
         if (!kvf_consume) {   // a consuming restore keeps the restored pager
             kvflash_pager_.reset();
             if (kvflash_qk_policy_) {
