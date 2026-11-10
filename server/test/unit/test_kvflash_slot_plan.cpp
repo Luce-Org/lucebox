@@ -1,6 +1,5 @@
-// Pure unit tests for the slot-pager arithmetic (kvflash_slot_pager.h):
-// slice geometry, host-budget admission and the step
-// plan (out before in, one fence per step). No ggml, no GPU.
+// Pure unit tests for the slot-pager arithmetic (kvflash_slot_plan.h):
+// slice geometry and host-budget admission. No ggml, no GPU.
 #include "CppUnitTestFramework.hpp"
 #include "kvflash_test_seams.h"
 #include "../../src/common/kvflash_slot_plan.h"
@@ -31,18 +30,6 @@ KvFlashAdmitInput base_admit() {
     in.host_used_bytes = 0;
     in.host_budget_bytes = 16 * kChunkBytes;
     return in;
-}
-
-int count_kind(const std::vector<KvFlashOp> & ops, KvFlashOpKind k) {
-    return (int)std::count_if(ops.begin(), ops.end(), [&](const KvFlashOp & o) { return o.kind == k; });
-}
-int last_index(const std::vector<KvFlashOp> & ops, KvFlashOpKind k) {
-    for (int i = (int)ops.size() - 1; i >= 0; i--) if (ops[(size_t)i].kind == k) return i;
-    return -1;
-}
-int first_index(const std::vector<KvFlashOp> & ops, KvFlashOpKind k) {
-    for (int i = 0; i < (int)ops.size(); i++) if (ops[(size_t)i].kind == k) return i;
-    return -1;
 }
 }  // namespace
 
@@ -200,61 +187,6 @@ TEST_CASE(KvflashSlotPlanFixture, admission_refuses_busy_slot_and_overlong_promp
     CHECK(kvflash_admit(in) == KvFlashAdmit::PromptTooLong);
 }
 
-TEST_CASE(KvflashSlotPlanFixture, step_plan_puts_every_out_before_every_in_with_one_fence) {
-    std::vector<KvFlashStepSlot> st(2);
-    st[0].slot = 0; st[0].page_out = {5, 6}; st[0].page_in = {1}; st[0].alloc_tokens = 512;
-    st[1].slot = 1; st[1].page_out = {9};    st[1].page_in = {2, 3}; st[1].alloc_tokens = 1;
-    const auto ops = kvflash_plan_step(st);
-    CHECK(count_kind(ops, KvFlashOpKind::PageOut) == 3);
-    CHECK(count_kind(ops, KvFlashOpKind::PageIn) == 3);
-    CHECK(count_kind(ops, KvFlashOpKind::Fence) == 1);
-    CHECK(last_index(ops, KvFlashOpKind::PageOut) < first_index(ops, KvFlashOpKind::PageIn));
-    CHECK(last_index(ops, KvFlashOpKind::PageIn) < first_index(ops, KvFlashOpKind::AllocSpan));
-    CHECK(last_index(ops, KvFlashOpKind::AllocSpan) < first_index(ops, KvFlashOpKind::Fence));
-    CHECK(ops.back().kind == KvFlashOpKind::Fence);                  // the graph runs after the fence
-    // No free block: the page-ins reuse blocks the page-outs free, so one
-    // completion phase sits between the last out and the first in.
-    REQUIRE(count_kind(ops, KvFlashOpKind::CompleteOut) == 1);
-    CHECK(last_index(ops, KvFlashOpKind::PageOut) < first_index(ops, KvFlashOpKind::CompleteOut));
-    CHECK(first_index(ops, KvFlashOpKind::CompleteOut) < first_index(ops, KvFlashOpKind::PageIn));
-}
-
-TEST_CASE(KvflashSlotPlanFixture, step_plan_pins_step_chunks_before_any_alloc) {
-    std::vector<KvFlashStepSlot> st(2);
-    st[0].slot = 0; st[0].pin_chunks = {7, 8}; st[0].alloc_tokens = 128;
-    st[1].slot = 1; st[1].pin_chunks = {3};    st[1].alloc_tokens = 1;
-    const auto ops = kvflash_plan_step(st);
-    CHECK(count_kind(ops, KvFlashOpKind::Pin) == 3);
-    CHECK(last_index(ops, KvFlashOpKind::Pin) < first_index(ops, KvFlashOpKind::AllocSpan));
-    // pins precede the page work too, or an in-flight chunk could be a victim.
-    std::vector<KvFlashStepSlot> st2(1);
-    st2[0].slot = 0; st2[0].pin_chunks = {4}; st2[0].page_out = {1}; st2[0].alloc_tokens = 1;
-    const auto ops2 = kvflash_plan_step(st2);
-    CHECK(last_index(ops2, KvFlashOpKind::Pin) < first_index(ops2, KvFlashOpKind::PageOut));
-}
-
-TEST_CASE(KvflashSlotPlanFixture, step_plan_without_page_work_has_no_fence) {
-    std::vector<KvFlashStepSlot> st(2);
-    st[0].slot = 0; st[0].alloc_tokens = 1; st[0].free_blocks = 1;   // decode row into a free block: no paging
-    st[1].slot = 1; st[1].alloc_tokens = 1; st[1].free_blocks = 1;
-    const auto ops = kvflash_plan_step(st);
-    CHECK(count_kind(ops, KvFlashOpKind::Fence) == 0);
-    CHECK(count_kind(ops, KvFlashOpKind::AllocSpan) == 2);
-    CHECK(kvflash_plan_step({}).empty());                            // an idle step plans nothing
-}
-
-TEST_CASE(KvflashSlotPlanFixture, step_plan_orders_by_slot_and_skips_idle_slots) {
-    std::vector<KvFlashStepSlot> st(3);
-    st[0].slot = 2; st[0].alloc_tokens = 1;
-    st[1].slot = 0; st[1].alloc_tokens = 1;
-    st[2].slot = 1;                                                  // nothing to do
-    const auto ops = kvflash_plan_step(st);
-    std::vector<int> alloc_slots;
-    for (const auto & o : ops) if (o.kind == KvFlashOpKind::AllocSpan) alloc_slots.push_back(o.slot);
-    CHECK((alloc_slots == std::vector<int>{0, 2}));
-    for (const auto & o : ops) CHECK(o.slot != 1);
-}
-
 TEST_CASE(KvflashSlotPlanFixture, headroom_shrinks_the_usable_quota_and_keeps_the_pager_floor) {
     KvFlashConfig cfg;                                               // floor 7 chunks
     CHECK(kvflash_headroom_ok(352, 8, cfg));
@@ -277,71 +209,6 @@ TEST_CASE(KvflashSlotPlanFixture, admission_with_headroom_refuses_a_quota_below_
     const int64_t need = kvflash_host_need_bytes(in);
     in.headroom_blocks = 0;
     CHECK(kvflash_host_need_bytes(in) == need);
-}
-
-// ── Review follow-ups: fence decision, completion phase, pin conflict ────────
-
-TEST_CASE(KvflashSlotPlanFixture, allocation_that_must_page_gets_a_fence_with_empty_page_lists) {
-    // A full slice appends a chunk: alloc_span pages a victim out by itself.
-    KvFlashStepSlot full; full.slot = 0; full.alloc_tokens = 64; full.free_blocks = 0; full.alloc_new_chunks = 1;
-    CHECK(count_kind(kvflash_plan_step({full}), KvFlashOpKind::Fence) == 1);
-    // The same step with a free block does not page.
-    KvFlashStepSlot room = full; room.free_blocks = 1;
-    CHECK(count_kind(kvflash_plan_step({room}), KvFlashOpKind::Fence) == 0);
-    // A prefill ubatch of 512 rows spans at most 9 chunks; 8 free blocks are not enough, 9 are.
-    KvFlashStepSlot big; big.slot = 0; big.alloc_tokens = 512; big.free_blocks = 8;
-    CHECK(count_kind(kvflash_plan_step({big}), KvFlashOpKind::Fence) == 1);
-    big.free_blocks = 9;
-    CHECK(count_kind(kvflash_plan_step({big}), KvFlashOpKind::Fence) == 0);
-    // A caller that says nothing gets the safe side: a fence.
-    KvFlashStepSlot silent; silent.slot = 0; silent.alloc_tokens = 1;
-    CHECK(count_kind(kvflash_plan_step({silent}), KvFlashOpKind::Fence) == 1);
-    // A page-in takes a block too: it can page out inside the call.
-    KvFlashStepSlot in; in.slot = 0; in.page_in = {3}; in.free_blocks = 0;
-    CHECK(count_kind(kvflash_plan_step({in}), KvFlashOpKind::Fence) == 1);
-    // Two slots: one pages inside alloc, the other does not; still ONE fence.
-    KvFlashStepSlot other = room; other.slot = 1;
-    CHECK(count_kind(kvflash_plan_step({full, other}), KvFlashOpKind::Fence) == 1);
-}
-
-TEST_CASE(KvflashSlotPlanFixture, out_then_in_in_deferred_mode_gets_one_completion_phase_between) {
-    // Full slice: page a victim out, page an old chunk back in, append a row.
-    KvFlashStepSlot s; s.slot = 0; s.page_out = {5}; s.page_in = {2}; s.alloc_tokens = 1;
-    s.free_blocks = 0; s.alloc_new_chunks = 0;
-    const auto ops = kvflash_plan_step({s});
-    REQUIRE(count_kind(ops, KvFlashOpKind::CompleteOut) == 1);
-    CHECK(count_kind(ops, KvFlashOpKind::Fence) == 1);               // CompleteOut is not a second fence
-    CHECK(last_index(ops, KvFlashOpKind::PageOut) < first_index(ops, KvFlashOpKind::CompleteOut));
-    CHECK(first_index(ops, KvFlashOpKind::CompleteOut) < first_index(ops, KvFlashOpKind::PageIn));
-    // Enough free blocks: nothing reuses a block the outs free, no completion phase.
-    s.free_blocks = 1;
-    CHECK(count_kind(kvflash_plan_step({s}), KvFlashOpKind::CompleteOut) == 0);
-    // No page-out this step: nothing to complete.
-    KvFlashStepSlot only_in; only_in.slot = 0; only_in.page_in = {2}; only_in.free_blocks = 0;
-    CHECK(count_kind(kvflash_plan_step({only_in}), KvFlashOpKind::CompleteOut) == 0);
-    // A cross-slot case: slot 1 pages out, slot 0 needs a block: completion still precedes every page-in.
-    KvFlashStepSlot a; a.slot = 0; a.page_in = {1}; a.free_blocks = 0;
-    KvFlashStepSlot b; b.slot = 1; b.page_out = {9}; b.free_blocks = 5;
-    const auto ops2 = kvflash_plan_step({a, b});
-    CHECK(count_kind(ops2, KvFlashOpKind::CompleteOut) == 0);        // slices are private: slot 1's out frees nothing for slot 0
-}
-
-TEST_CASE(KvflashSlotPlanFixture, a_page_out_of_a_chunk_pinned_this_step_is_never_emitted) {
-    KvFlashStepSlot s; s.slot = 0; s.pin_chunks = {2}; s.page_out = {2, 3}; s.free_blocks = 4;
-    const auto ops = kvflash_plan_step({s});
-    std::vector<int> outs;
-    for (const auto & o : ops) if (o.kind == KvFlashOpKind::PageOut) outs.push_back(o.arg);
-    CHECK((outs == std::vector<int>{3}));
-    // A pin on another slot's chunk 2 does not block this slot.
-    KvFlashStepSlot t; t.slot = 1; t.page_out = {2}; t.free_blocks = 4;
-    CHECK(count_kind(kvflash_plan_step({s, t}), KvFlashOpKind::PageOut) == 2);
-}
-
-TEST_CASE(KvflashSlotPlanFixture, a_page_out_op_carries_the_generation_its_slot_was_planned_at) {
-    KvFlashStepSlot a; a.slot = 0; a.page_out = {1}; a.generation = 7; a.free_blocks = 4;
-    KvFlashStepSlot b; b.slot = 1; b.page_out = {2}; b.generation = 9; b.free_blocks = 4;
-    for (const auto & o : kvflash_plan_step({b, a}))
-        if (o.kind == KvFlashOpKind::PageOut) CHECK(o.gen == (o.slot == 0 ? 7u : 9u));
 }
 
 // ── the host reservation ledger and the permanent refusal ─────────

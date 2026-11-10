@@ -1,4 +1,4 @@
-// KvFlashStepDriver: preflight + plan + executor over real slot pagers
+// KvFlashStepDriver: preflight and the step's pins and allocations over real slot pagers
 // (no-tensor path, CPU). The test plays the engine: per step it names the rows
 // each slot appends, then reads the table columns the graph would be given.
 #include "CppUnitTestFramework.hpp"
@@ -30,9 +30,9 @@ struct World {
     }
 };
 
-// The engine's step: plan and page work, then (after the graph and readback) the pins end.
+// The engine's step: pins and allocations, then (after the graph and readback) the pins end.
 KvFlashStepDriver::Result run(World & w, const std::vector<KvFlashStepWork> & work) {
-    auto r = w.drv->run_step(work, nullptr);
+    auto r = w.drv->run_step(work);
     w.drv->finish_step();
     return r;
 }
@@ -41,7 +41,7 @@ KvFlashStepDriver::Result run(World & w, const std::vector<KvFlashStepWork> & wo
 TEST_CASE(KvflashStepDriverFixture, fitting_slots_run_pins_expire_and_the_table_is_stale_only_when_the_epoch_moved) {
     World w(0);                                                       // no headroom: nothing is over quota
     int32_t col[kQ * 4];
-    auto r = w.drv->run_step({{0, 0, 8 * kChunk}, {1, 0, 8 * kChunk}}, nullptr);   // two aligned 512 cuts
+    auto r = w.drv->run_step({{0, 0, 8 * kChunk}, {1, 0, 8 * kChunk}});   // two aligned 512 cuts
     CHECK(w.s[0]->is_pinned(0));                                  // pins outlive the plan: the graph still reads these chunks
     w.drv->finish_step();
     CHECK(r.ok);
@@ -102,6 +102,33 @@ TEST_CASE(KvflashStepDriverFixture, a_run_past_the_quota_evicts_and_decodes) {
         for (int i : r.ran) pos[i] += work[(size_t)i].tokens;
     }
     CHECK(pos[0] > kQ * kChunk);                                  // it ran past the quota: eviction happened
+}
+
+// A step has no fence: a slot that runs takes free blocks whose page-out has completed, so its allocation queues no
+// copy and no zeroing. The page-outs are queued by settle and by an idle slot, a step ahead.
+TEST_CASE(KvflashStepDriverFixture, a_slot_that_runs_allocates_free_blocks_and_queues_no_page_work) {
+    World w(4);
+    int64_t pos = 0;
+    int ran = 0, idled = 0;
+    for (int step = 0; step < 60; step++) {
+        const KvFlashStats before = w.s[0]->stats();
+        const auto r = w.drv->run_step({{0, pos, 3 * kChunk}});
+        REQUIRE(r.ok);
+        if (r.ran.empty()) {
+            idled++;
+        } else {
+            ran++;
+            pos += 3 * kChunk;
+            CHECK(w.s[0]->stats().page_outs == before.page_outs);
+            CHECK(w.s[0]->stats().page_ins == before.page_ins);
+            CHECK(w.s[0]->pending_free_blocks() == 0);
+        }
+        w.drv->finish_step();
+        if (step % 2) REQUIRE(w.drv->settle({0}) >= 0);            // every other step skips settle: the slot must idle, not page in the call
+    }
+    CHECK(pos > 4 * kQ * kChunk);                                  // far past the quota
+    CHECK(ran > 0);
+    CHECK(idled > 0);
 }
 
 TEST_CASE(KvflashStepDriverFixture, preflight_keeps_slots_with_enough_completed_blocks_in_order) {
@@ -190,19 +217,6 @@ TEST_CASE(KvflashStepDriverFixture, page_out_checked_refuses_stale_generations_a
     CHECK(p.generation() != g2);
 }
 
-// A PageOut op carries the generation captured when it was planned; the driver passes that, not the pager's current one.
-TEST_CASE(KvflashStepDriverFixture, a_planned_page_out_runs_with_its_plan_time_generation_and_is_refused_once_the_pager_moved_on) {
-    World w;
-    REQUIRE(run(w, {{0, 0, 8 * kChunk}}).ok);
-    KvFlashSlotPager & p = *w.s[0];
-    const KvFlashOp fresh{KvFlashOpKind::PageOut, 0, 2, p.generation()};
-    CHECK(w.drv->run(fresh));                                      // planned against the current state
-    const KvFlashOp stale{KvFlashOpKind::PageOut, 0, 3, p.generation()};
-    p.truncate(6 * kChunk);                                        // the plan went stale after it was made
-    CHECK(!w.drv->run(stale));
-    CHECK(!w.drv->run({KvFlashOpKind::PageOut, 0, 3}));            // an op with no captured generation is stale too
-}
-
 // The engine's step() on the CPU: SeqSlotManager over KvFlashSlotKv, the driver around it.
 TEST_CASE(KvflashStepDriverFixture, engine_loop_prefills_in_whole_cuts_decodes_past_the_quota_without_idling_and_releases_everything) {
     World w(4);                                                       // quota 12, usable 8
@@ -234,7 +248,7 @@ TEST_CASE(KvflashStepDriverFixture, engine_loop_prefills_in_whole_cuts_decodes_p
         std::vector<int> growth(2, 0);
         for (int i = 0; i < 2; i++) growth[i] = slots.slot(i).decoding() ? 1 : 0;
         if (growth[0] + growth[1] > 0) CHECK(slots.reserve_decode(growth));   // evicted history is still owned: no extra blocks
-        const auto r = w.drv->run_step(work, nullptr);
+        const auto r = w.drv->run_step(work);
         REQUIRE(r.ok);
         for (const auto & wk : work) {
             const bool ran = std::find(r.ran.begin(), r.ran.end(), wk.slot) != r.ran.end();
