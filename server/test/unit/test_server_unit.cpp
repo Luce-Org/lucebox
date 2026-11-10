@@ -35,6 +35,7 @@
 #include "common/backend_ipc.h"
 #include "common/pflash_drafter_ipc.h"
 #include "common/moe_hybrid_ffn_eval.h"
+#include "common/moe_overlap.h"
 #include "common/moe_hybrid_placement.h"
 #include "placement/pflash_placement.h"
 #include "common/io_utils.h"
@@ -16841,11 +16842,15 @@ TEST_CASE(ServerUnitFixture, test_moe_hybrid_canonical_rocmfp2_q2_is_tokenwise) 
     ggml_free(ctx);
 }
 
-TEST_CASE(ServerUnitFixture, test_moe_hybrid_overlap_owners_order_and_placement) {
-    // Overlapping owners (moe_overlap.h) at 2 rows with token-by-token ROCmFP2
-    // owners and a shared expert: every node has an owner, the secondary
-    // owner's nodes come before the main owner's in graph order, the join is
-    // last, and the input crosses to the secondary owner once, not per token.
+// Overlapping owners (moe_overlap.h) with ROCmFP2 owners and a shared expert:
+// every node has an owner, the secondary owner's nodes come before the main
+// owner's in graph order, and the join is last. Token by token, the input
+// crosses to the secondary owner once, not per token, and each owner runs three
+// products per token. With batch-invariant rows (moe_overlap.h, 3), each owner
+// runs one grouped product per projection over all rows instead, with no
+// per-row concat. check = false (one row) only builds. Returns the graph's
+// nodes, op by op, with their placement.
+static std::string check_moe_hybrid_overlap_owners(int n_tokens, bool batch_invariant_rows, bool check = true) {
     luce_unsetenv("LUCE_MOE_TP_GROUPED_MMVQ");
     luce_unsetenv("LUCE_DS4_TP_GROUPED_MMVQ");
 
@@ -16859,7 +16864,6 @@ TEST_CASE(ServerUnitFixture, test_moe_hybrid_overlap_owners_order_and_placement)
     constexpr int n_ff = 32;
     constexpr int n_expert = 4;
     constexpr int n_used = 2;
-    constexpr int n_tokens = 2;
 
     MoeHybridConfig cfg;
     cfg.n_embd = n_embd;
@@ -16892,6 +16896,7 @@ TEST_CASE(ServerUnitFixture, test_moe_hybrid_overlap_owners_order_and_placement)
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4096, false);
     MoeHybridGraphInputs out;
     out.overlap_owners = true;
+    out.batch_invariant_rows = batch_invariant_rows;
     const bool built = build_moe_hybrid_ffn_graph(
         ctx, gf, cfg, desc, storage, input, ids, weights, n_tokens,
         out, /*include_shared=*/true, /*allow_fused_combine=*/false,
@@ -16904,6 +16909,25 @@ TEST_CASE(ServerUnitFixture, test_moe_hybrid_overlap_owners_order_and_placement)
     const auto in = [](const std::vector<ggml_tensor *> & list, const ggml_tensor * t) {
         return std::find(list.begin(), list.end(), t) != list.end();
     };
+    std::string nodes;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * t = ggml_graph_node(gf, i);
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "%s:%s:%lld,%lld,%lld,%lld:%c%c%c", ggml_op_name(t->op), ggml_type_name(t->type),
+                      (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                      in(out.hot_nodes, t) || in(out.hot_remap_nodes, t) ? 'h' : '-',
+                      in(out.cold_nodes, t) || in(out.cold_remap_nodes, t) ? 'c' : '-',
+                      in(out.join_nodes, t) ? 'j' : '-');
+        nodes += buf;
+        for (size_t k = 0; k < sizeof(t->op_params) / sizeof(t->op_params[0]); ++k) {
+            nodes += ":" + std::to_string(t->op_params[k]);
+        }
+        nodes += "\n";
+    }
+    if (!check) {
+        ggml_free(ctx);
+        return nodes;
+    }
     const auto is_view = [](const ggml_tensor * t) {
         return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
                t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
@@ -16970,14 +16994,56 @@ TEST_CASE(ServerUnitFixture, test_moe_hybrid_overlap_owners_order_and_placement)
         }
         return count;
     };
-    TEST_ASSERT(count_cont_of_input(out.cold_nodes) == 1);
+    // (Shared rows: the owners' products read the input as it is, one copy to
+    // the secondary owner from the scheduler.)
+    TEST_ASSERT(count_cont_of_input(out.cold_nodes) == (batch_invariant_rows ? 0 : 1));
     TEST_ASSERT(count_cont_of_input(out.hot_nodes) == 0);
     TEST_ASSERT(count_op(out.cold_nodes, GGML_OP_CONT) <= 1);
     TEST_ASSERT(count_op(out.hot_nodes, GGML_OP_CONT) == 0);
-    TEST_ASSERT(count_op(out.hot_nodes, GGML_OP_MUL_MAT_ID) == 3 * n_tokens);
-    TEST_ASSERT(count_op(out.cold_nodes, GGML_OP_MUL_MAT_ID) == 3 * n_tokens);
+
+    // Products: three per token, or with shared rows one grouped product per
+    // projection over all rows (gate, up, down), whose rows share each expert's
+    // reads, and no per-row concat.
+    ggml_tensor * marked = moe_overlap_expert_product(
+        ctx, storage.gate_hot, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens), ids);
+    const auto count_grouped = [&](const std::vector<ggml_tensor *> & list) {
+        int count = 0;
+        for (const ggml_tensor * node : list) {
+            if (node && node->op == GGML_OP_MUL_MAT_ID && node->op_params[1] == marked->op_params[1]) {
+                TEST_ASSERT(node->ne[2] == n_tokens);
+                ++count;
+            }
+        }
+        return count;
+    };
+    const int products = batch_invariant_rows ? 3 : 3 * n_tokens;
+    TEST_ASSERT(count_op(out.hot_nodes, GGML_OP_MUL_MAT_ID) == products);
+    TEST_ASSERT(count_op(out.cold_nodes, GGML_OP_MUL_MAT_ID) == products);
+    TEST_ASSERT(count_grouped(out.hot_nodes) == (batch_invariant_rows ? 3 : 0));
+    TEST_ASSERT(count_grouped(out.cold_nodes) == (batch_invariant_rows ? 3 : 0));
+    if (batch_invariant_rows) {
+        TEST_ASSERT(count_op(out.hot_nodes, GGML_OP_CONCAT) == 0);
+        TEST_ASSERT(count_op(out.cold_nodes, GGML_OP_CONCAT) == 0);
+    }
 
     ggml_free(ctx);
+    return nodes;
+}
+
+TEST_CASE(ServerUnitFixture, test_moe_hybrid_overlap_owners_order_and_placement) {
+    check_moe_hybrid_overlap_owners(/*n_tokens=*/2, /*batch_invariant_rows=*/false);
+}
+
+TEST_CASE(ServerUnitFixture, test_moe_hybrid_overlap_owners_shared_rows) {
+    for (int n_tokens : {2, 4, 6, 8}) {
+        check_moe_hybrid_overlap_owners(n_tokens, /*batch_invariant_rows=*/true);
+    }
+    // One row: the same graph, node for node, whether or not the rows run
+    // batch-invariant products (a one-row step has nothing to share).
+    const std::string plain = check_moe_hybrid_overlap_owners(1, false, /*check=*/false);
+    const std::string invariant = check_moe_hybrid_overlap_owners(1, true, /*check=*/false);
+    TEST_ASSERT(!plain.empty());
+    TEST_ASSERT(plain == invariant);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

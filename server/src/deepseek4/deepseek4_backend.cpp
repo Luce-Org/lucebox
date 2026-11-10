@@ -2024,8 +2024,9 @@ bool DeepSeek4Backend::validate_model_features() const {
         return false;
     }
     // Paged V4.1 serving is qualified with the default expert-owner kernels
-    // only: with these switches it has faulted the GPU (see DS41.md, known
-    // limits), so refuse them until that is understood.
+    // only: these switches were on when paged serving faulted the GPU in
+    // September (the fault the record explains is in DS41.md, Reliability),
+    // so they stay refused.
     if (cfg_.paged_attention) {
         for (const char * name : DEEPSEEK41_PAGED_UNQUALIFIED_ENV) {
             if (env_flag_enabled(name)) {

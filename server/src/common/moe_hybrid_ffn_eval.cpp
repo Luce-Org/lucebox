@@ -772,11 +772,19 @@ static bool build_batched_routed_graph(
     bool defer_route_reduction = false,
     ggml_tensor * combine_valid = nullptr,
     ggml_tensor * combine_ids = nullptr,
-    bool input_on_owner = false)
+    bool input_on_owner = false,
+    bool shared_rows = false)
 {
     const auto track = [&](ggml_tensor * t) -> ggml_tensor * {
         if (backend_nodes && t) backend_nodes->push_back(t);
         return t;
+    };
+    // An expert projection over every token's routes. The rows of overlapping
+    // owners share each routed expert's weight reads (moe_overlap.h, 3).
+    const auto expert_product = [&](ggml_tensor * experts, ggml_tensor * rows) {
+        return mixed_mmq(shared_rows ? moe_overlap_expert_product(ctx, experts, rows, sel)
+                                     : ggml_mul_mat_id(ctx, experts, rows, sel),
+                         mixed_mmq_policy);
     };
     if (tokenwise && n_tokens > 1) {
         // A token's input, routes and weights are column views: a column of a
@@ -875,15 +883,15 @@ static bool build_batched_routed_graph(
             gate_up_tensor->nb[1], gate_up_tensor->nb[2],
             (size_t) n_ff_exp * gate_up_tensor->nb[1]);
         ggml_tensor * gate_e = track(
-            mixed_mmq(ggml_mul_mat_id(ctx, gate_w, cur_3d, sel), mixed_mmq_policy));
+            expert_product(gate_w, cur_3d));
         ggml_tensor * up_e = track(
-            mixed_mmq(ggml_mul_mat_id(ctx, up_w, cur_3d, sel), mixed_mmq_policy));
+            expert_product(up_w, cur_3d));
         gu = track(swiglu_clamp > 1.0e-6f
             ? ggml_swiglu_ds4_split(ctx, gate_e, up_e, swiglu_clamp)
             : ggml_swiglu_split(ctx, gate_e, up_e));
     } else if (gate_up_tensor) {
         ggml_tensor * gate_up_e = track(apply_scale2(ctx,
-            mixed_mmq(ggml_mul_mat_id(ctx, gate_up_tensor, cur_3d, sel), mixed_mmq_policy), gate_up_scale));
+            expert_product(gate_up_tensor, cur_3d), gate_up_scale));
         ggml_tensor * gate_e = ggml_view_3d(ctx, gate_up_e,
             n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
             gate_up_e->nb[1], gate_up_e->nb[2], 0);
@@ -896,14 +904,14 @@ static bool build_batched_routed_graph(
         gu = track(swiglu_maybe_clamped(ctx, gate_e, up_e, swiglu_clamp));
     } else {
         ggml_tensor * gate_e = track(apply_scale2(ctx,
-            mixed_mmq(ggml_mul_mat_id(ctx, gate_tensor, cur_3d, sel), mixed_mmq_policy), gate_scale));
+            expert_product(gate_tensor, cur_3d), gate_scale));
         ggml_tensor * up_e = track(apply_scale2(ctx,
-            mixed_mmq(ggml_mul_mat_id(ctx, up_tensor, cur_3d, sel), mixed_mmq_policy), up_scale));
+            expert_product(up_tensor, cur_3d), up_scale));
         gu = track(swiglu_maybe_clamped(ctx, gate_e, up_e, swiglu_clamp));
     }
 
     ggml_tensor * experts = track(apply_scale2(ctx,
-        mixed_mmq(ggml_mul_mat_id(ctx, down_tensor, gu, sel), mixed_mmq_policy), down_scale));
+        expert_product(down_tensor, gu), down_scale));
 
     // The owner's route mask, weights and route sum in one launch (wts are the
     // unmasked router weights then; see build_moe_owner_remap).
@@ -1100,6 +1108,9 @@ static void align_moe_owner_routes(
     }
 }
 
+// shared_rows: the rows of overlapping owners with batch-invariant products
+// (moe_overlap.h, 3): the one-row branch over all rows, one product per
+// projection instead of one per row.
 static bool build_moe_owner_branch(
         ggml_context * ctx,
         const MoeHybridConfig & cfg,
@@ -1109,16 +1120,12 @@ static bool build_moe_owner_branch(
         bool canonical_route_join,
         bool allow_fused_combine,
         MoeOwnerGraphSpec & owner,
-        bool input_on_owner = false) {
+        bool input_on_owner = false,
+        bool shared_rows = false) {
     if (!owner.available()) {
         return true;
     }
-    const MoeHybridGraphPolicy & policy = moe_hybrid_graph_policy();
-    const ggml_tensor * dispatch_weights = owner.gate_up
-        ? owner.gate_up : owner.gate;
-    const bool tokenwise =
-        dispatch_weights->type == GGML_TYPE_Q2_0_ROCMFP2 &&
-        !(n_tokens > 1 && policy.grouped_mmvq);
+    const bool tokenwise = !shared_rows && moe_owner_branch_tokenwise(owner, n_tokens);
     return build_batched_routed_graph(
         ctx, owner.gate, owner.up, owner.down, owner.gate_up,
         desc.ffn_gate_exps_s, desc.ffn_up_exps_s,
@@ -1128,7 +1135,7 @@ static bool build_moe_owner_branch(
         cfg.swiglu_clamp, cfg.mixed_mmq_policy, &owner.output, tokenwise,
         owner.branch_nodes, allow_fused_combine,
         /*force_fused_combine=*/false, canonical_route_join,
-        owner.combine_valid, owner.combine_ids, input_on_owner);
+        owner.combine_valid, owner.combine_ids, input_on_owner, shared_rows);
 }
 
 ggml_tensor * build_moe_routed_experts(
@@ -1487,12 +1494,17 @@ bool build_moe_hybrid_ffn_graph(
 
     // Keep graph construction order stable: both remaps, then both optional ID
     // alignments, then both expert branches.
+    // The rows of overlapping owners with batch-invariant products share their
+    // expert products (moe_overlap.h, 3): each owner builds the one-row
+    // branch over all rows, so each row gets the bytes it gets alone.
+    const bool shared_rows = out.overlap_owners && out.batch_invariant_rows && n_tokens > 1;
+    const int branch_rows = shared_rows ? 1 : n_tokens;
     // The route mask rides in the owner's combine on the GPU owners (where
     // the fused combine is allowed) when the branch reduces its own routes.
     const auto mask_in_combine = [&](const MoeOwnerGraphSpec & owner) {
         return allow_fused_combine &&
                !canonical_route_join && dynamic_main_slots_x4 == 0 &&
-               !moe_owner_branch_tokenwise(owner, n_tokens) &&
+               !moe_owner_branch_tokenwise(owner, branch_rows) &&
                !moe_owner_takes_coarse_op(owner, desc);
     };
     if (!prepare_moe_owner_branch(
@@ -1506,9 +1518,14 @@ bool build_moe_hybrid_ffn_graph(
             /*dynamic_main_slots_x4=*/0, false, streamed_owner)) {
         return false;
     }
-    align_moe_owner_routes(ctx, n_tokens, primary_owner);
-    align_moe_owner_routes(ctx, n_tokens, secondary_owner);
-    align_moe_owner_routes(ctx, n_tokens, streamed_owner);
+    // Shared rows keep their owners' ids as they are: the grouped products sort
+    // the routes by expert themselves, and only the per-expert MoE kernel reads
+    // the aligned encoding (LUCE_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS).
+    if (!shared_rows) {
+        align_moe_owner_routes(ctx, n_tokens, primary_owner);
+        align_moe_owner_routes(ctx, n_tokens, secondary_owner);
+        align_moe_owner_routes(ctx, n_tokens, streamed_owner);
+    }
     // LUCE_MOE_Q8_HANDOFF=1 (secondary owner on a GPU): the secondary owner gets
     // its input as the q8_1 rows its quantized matvecs read anyway, quantized
     // once on the main owner. 5,120 floats become 160 blocks of 36 bytes per
@@ -1530,13 +1547,13 @@ bool build_moe_hybrid_ffn_graph(
     // The layer's input is the main owner's.
     if (!build_moe_owner_branch(
             ctx, cfg, desc, inp, n_tokens, canonical_route_join,
-            allow_fused_combine, primary_owner, /*input_on_owner=*/true) ||
+            allow_fused_combine, primary_owner, /*input_on_owner=*/true, shared_rows) ||
         !build_moe_owner_branch(
             ctx, cfg, desc, inp_secondary, n_tokens, canonical_route_join,
-            allow_fused_combine, secondary_owner) ||
+            allow_fused_combine, secondary_owner, /*input_on_owner=*/false, shared_rows) ||
         !build_moe_owner_branch(
             ctx, cfg, desc, inp, n_tokens, canonical_route_join,
-            allow_fused_combine, streamed_owner)) {
+            allow_fused_combine, streamed_owner, /*input_on_owner=*/false, shared_rows)) {
         return false;
     }
     // Streamed routes join the secondary partial on the device that holds
