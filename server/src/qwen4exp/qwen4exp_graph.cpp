@@ -476,8 +476,9 @@ struct Qwen4ExpLinearProj {
     ggml_tensor * qkv = nullptr, * z = nullptr, * ab = nullptr, * alpha = nullptr, * beta = nullptr;
 };
 
+// step_rows: the rows are decode or verify rows (each computed as a T=1 forward computes it), whatever their count.
 static Qwen4ExpLinearProj linear_attn_proj(ggml_context * c, ggml_cgraph * gf, ggml_tensor * cur,
-                                           const Qwen4ExpLayer & L) {
+                                           const Qwen4ExpLayer & L, bool step_rows = false) {
     Qwen4ExpLinearProj p;
     p.qkv = mm(c, L.attn_qkv, cur);
     p.z   = mm(c, L.attn_gate, cur);
@@ -486,8 +487,10 @@ static Qwen4ExpLinearProj linear_attn_proj(ggml_context * c, ggml_cgraph * gf, g
     ggml_build_forward_expand(gf, p.qkv);
     ggml_build_forward_expand(gf, p.z);
     // Steps whose alpha and beta projections the loader stacked (L.ssm_alpha_beta) run them as one matmul, the same
-    // per-row sums, and the recurrence reads the two strided halves through one layout.
-    if (cur->ne[1] <= QWEN4EXP_MTP_MAX_VERIFY && L.ssm_gate_ba && L.ssm_alpha_beta) {
+    // per-row sums, and the recurrence reads the two strided halves through one layout. Every decode and verify row
+    // takes the stacked product, so a row's alpha and beta do not depend on how many rows share its graph (a solo
+    // step's T <= QWEN4EXP_MTP_MAX_VERIFY, a batched verify group's up to 16).
+    if ((step_rows || cur->ne[1] <= QWEN4EXP_MTP_MAX_VERIFY) && L.ssm_gate_ba && L.ssm_alpha_beta) {
         p.ab = mm(c, L.ssm_alpha_beta, cur);
     } else {
         p.beta  = mm(c, L.ssm_beta, cur);
@@ -4344,18 +4347,18 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
             // The input projections run over the group's rows; each slot's conv and recurrence over its own rows and
             // state (writing every row's state to its rollback rows), as its solo verify runs them.
             const int li = lb.lin_idx[il];
-            const Qwen4ExpLinearProj p = linear_attn_proj(ctx, gf, cur, L);
-            // The Gorgon's fused gated norm feeds ssm_out from F16 rows: each slot keeps its solo verify's product.
-            const bool per_slot_out = w.gfx1151;
+            const Qwen4ExpLinearProj p = linear_attn_proj(ctx, gf, cur, L, /*step_rows=*/true);
+            // ssm_out runs once over the group's gated-norm rows (a solo verify's R rows take its F32 path too: the
+            // fused F16 one starts at 512 rows).
             ggml_tensor * rows = nullptr;
             for (int j = 0; j < G.ns; ++j) {
                 ggml_tensor * row = linear_attn_rows(ctx, gf, linear_attn_proj_rows(ctx, p, (int64_t) j * R, R), L, w,
                     gc[j]->ssm_state[(size_t) li], gc[j]->conv_state[(size_t) li], gc[j]->spec_slot0,
                     &ws.spec_log[(size_t) (G.s0 + j) * n_linear + (size_t) li], gc[j]->spec_conv[(size_t) li],
-                    per_slot_out);
+                    /*project=*/false);
                 rows = rows ? ggml_concat(ctx, rows, row, 1) : row;
             }
-            cur = per_slot_out ? rows : ggml_reshape_2d(ctx, mm(ctx, L.ssm_out, rows), w.n_embd, n);
+            cur = ggml_reshape_2d(ctx, mm(ctx, L.ssm_out, rows), w.n_embd, n);
         }
         if (!split || !qwen4exp_split_layer(L, w)) {
             G.res_hc = lb.ffn_half(il, cur, G.inject, G.res_hc, n, G.xn_next);
