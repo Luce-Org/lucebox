@@ -23,4 +23,9 @@ inline AdmitTiming admit_timing(std::chrono::steady_clock::time_point first_atte
     return t;
 }
 
+// The prompt tokens an admitted request does not prefill: the prefix cache's restored tokens, or the point a parked session resumed at.
+inline int admit_cached_tokens(int prefix_restored, int engine_resumed) {
+    return prefix_restored > engine_resumed ? prefix_restored : engine_resumed;
+}
+
 }  // namespace luce::common

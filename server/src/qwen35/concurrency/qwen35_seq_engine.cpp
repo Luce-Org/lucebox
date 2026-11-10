@@ -706,6 +706,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
                              result.slot, L, history, (int)prompt.size() - L, rr.ckpt, rr.trunk, extra_[(size_t)result.slot].pos);
                 if (begin_resume_(result.slot)) {
                     plan_slot_turn_(result.slot, prompt, L);
+                    result.resumed_tokens = L;
                     return result;
                 }
                 slots_.retire(result.slot);   // the page work failed: the session is gone, admit cold below

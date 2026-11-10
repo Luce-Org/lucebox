@@ -18364,6 +18364,15 @@ TEST_CASE(ServerUnitFixture, test_admit_timing_prefill_excludes_the_deferred_wai
     TEST_ASSERT(n.queue_s == 0.0 && n.prefill_s == 7.0 && n.total_s == 7.0);
 }
 
+// A sticky resume at L prefills only the tokens past L: the usage timings, the perf record and the step planner count them as cached.
+TEST_CASE(ServerUnitFixture, test_admit_cached_tokens_counts_a_sticky_resume) {
+    using luce::common::admit_cached_tokens;
+    TEST_ASSERT(admit_cached_tokens(0, 49700) == 49700);   // a 50000-token session resumed at 49700: 300 prefilled
+    TEST_ASSERT(admit_cached_tokens(8192, 0) == 8192);     // a prefix-cache restore, no resume
+    TEST_ASSERT(admit_cached_tokens(0, 0) == 0);           // cold
+    TEST_ASSERT(admit_cached_tokens(4096, 1024) == 4096);  // never less than either source
+}
+
 TEST_CASE(ServerUnitFixture, test_usage_timings_carry_queue_ms_apart_from_prefill_ms) {
     GenTimings t;
     t.prefill_s = 131.0;

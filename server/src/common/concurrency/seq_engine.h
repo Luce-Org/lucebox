@@ -173,6 +173,7 @@ public:
         int slot = -1;
         std::string error;
         PrefixStoreAdmission prefix_store;
+        int resumed_tokens = 0;   // a parked session resumed at this point: the prompt before it is not prefilled again
     };
 
     // Admit one request into a free slot and queue its prompt for chunked
