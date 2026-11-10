@@ -1660,7 +1660,7 @@ static __global__ void paged_attn_wmma(
         } else {
             float * o_row = (float *) (dst + (int64_t) row * dst_nb1 + (int64_t) head * dst_nb2);
 #pragma unroll
-            for (int i = threadIdx.x; i < DKQ; i += nwarps * warp_size) {
+            for (int i = threadIdx.x + threadIdx.y * warp_size; i < DKQ; i += nwarps * warp_size) {
                 o_row[i] = 0.0f;
             }
         }
