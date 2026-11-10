@@ -38,24 +38,4 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
                              int32_t * out_token_ids,
                              float temperature);
 
-// The device that owns `d_logits` when it is device memory (the condition
-// under which geometric_extract_draft_topk_cuda runs on the GPU), else -1.
-// A caller can check a stable buffer once instead of on every call.
-int geometric_draft_topk_cuda_device(const void * d_logits);
-
-// geometric_extract_draft_topk_cuda queued on `stream` (a cudaStream_t of
-// `device`, passed as void *): the same split and kernels, so the same
-// results, with the token ids written to the device buffer d_out_token_ids
-// and the log-probs copied to out_log_probs (host memory; pinned keeps the
-// copy asynchronous). Nothing is synchronized: read the outputs only after
-// the stream ran. Returns false, and the caller takes the CPU path, where
-// the synchronous call would (K, scratch, or a launch error).
-bool geometric_extract_draft_topk_cuda_async(const void * d_logits,
-                             int device,
-                             int n_positions, int vocab, int K,
-                             float temperature,
-                             void * stream,
-                             int32_t * d_out_token_ids,
-                             float * out_log_probs);
-
 }  // namespace luce::common

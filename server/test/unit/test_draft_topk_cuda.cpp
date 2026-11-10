@@ -27,14 +27,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <random>
 #include <vector>
 
 using luce::common::extract_draft_topk;
 using luce::common::geometric_extract_draft_topk_cuda;
-using luce::common::geometric_extract_draft_topk_cuda_async;
-using luce::common::geometric_draft_topk_cuda_device;
 using luce::common::geometric_draft_topk_cuda_supports_k;
 
 namespace {
@@ -251,88 +248,4 @@ TEST_CASE(DraftTopkCudaFixture, draft_topk_concurrent_workers_and_device_changes
     b.join(); // Worker-owned GPU scratch is destroyed here.
     CHECK(ok[0]);
     CHECK(ok[1]);
-}
-
-// The stream-ordered top-k (ids into a device buffer, log-probs into pinned
-// host memory, no wait) against the synchronous call: the same bytes, case by
-// case, with a few back-to-back calls queued on one stream before one wait.
-TEST_CASE(DraftTopkCudaFixture, draft_topk_cuda_async_matches_sync) {
-    int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
-        printf("SKIP: no CUDA device available\n");
-        return;
-    }
-    REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaStream_t stream = nullptr;
-    REQUIRE(cudaStreamCreate(&stream) == cudaSuccess);
-
-    const Case cases[] = {
-        {56, 248320, 8, 1.0f},   // 8 lanes x 7 positions, Qwen vocab
-        {7, 248320, 8, 1.0f},
-        {12, 32000, 4, 0.7f},
-        {3, 4099, 16, 1.0f},     // vocab not a multiple of 4: scalar loads
-        {1, 4096, 1, 1.0f},
-    };
-    std::vector<float> host_probe(4, 0.0f);
-    CHECK(geometric_draft_topk_cuda_device(host_probe.data()) == -1);
-    CHECK(geometric_draft_topk_cuda_device(nullptr) == -1);
-
-    unsigned seed = 77;
-    for (const Case & c : cases) {
-        const size_t n_logits = (size_t)c.n * c.vocab;
-        const size_t n_out = (size_t)c.n * c.K;
-        std::vector<float> h_logits(n_logits);
-        std::mt19937 rng(seed++);
-        std::normal_distribution<float> dist(0.f, 4.f);
-        for (auto & x : h_logits) x = dist(rng);
-
-        float * d_logits = nullptr;
-        int32_t * d_ids = nullptr;
-        float * pinned_lp = nullptr;
-        REQUIRE(cudaMalloc(&d_logits, n_logits * sizeof(float)) == cudaSuccess);
-        REQUIRE(cudaMalloc(&d_ids, n_out * sizeof(int32_t)) == cudaSuccess);
-        REQUIRE(cudaMallocHost(&pinned_lp, n_out * sizeof(float)) == cudaSuccess);
-        REQUIRE(cudaMemcpy(d_logits, h_logits.data(), n_logits * sizeof(float),
-                           cudaMemcpyHostToDevice) == cudaSuccess);
-
-        std::vector<float> sync_lp(n_out);
-        std::vector<int32_t> sync_ids(n_out);
-        REQUIRE(geometric_extract_draft_topk_cuda(
-            d_logits, c.n, c.vocab, c.K, sync_lp.data(), sync_ids.data(),
-            c.temp));
-
-        const int device = geometric_draft_topk_cuda_device(d_logits);
-        CHECK(device == 0);
-        // Three calls queued back to back, as a stream would see them across
-        // rounds; the last one's outputs are compared.
-        bool queued = true;
-        for (int round = 0; round < 3; ++round) {
-            queued = geometric_extract_draft_topk_cuda_async(
-                d_logits, device, c.n, c.vocab, c.K, c.temp, stream,
-                d_ids, pinned_lp) && queued;
-        }
-        CHECK(queued);
-        REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
-        std::vector<int32_t> async_ids(n_out);
-        REQUIRE(cudaMemcpy(async_ids.data(), d_ids, n_out * sizeof(int32_t),
-                           cudaMemcpyDeviceToHost) == cudaSuccess);
-
-        const bool same_lp =
-            std::memcmp(sync_lp.data(), pinned_lp, n_out * sizeof(float)) == 0;
-        const bool same_ids = async_ids == sync_ids;
-        printf("  [%s] async n=%d vocab=%d K=%d\n",
-               same_lp && same_ids ? "PASS" : "FAIL", c.n, c.vocab, c.K);
-        CHECK(same_lp);
-        CHECK(same_ids);
-
-        // An uninstantiated K is refused before anything is queued.
-        CHECK(!geometric_extract_draft_topk_cuda_async(
-            d_logits, device, c.n, c.vocab, 9, c.temp, stream, d_ids,
-            pinned_lp));
-
-        cudaFreeHost(pinned_lp);
-        cudaFree(d_ids);
-        cudaFree(d_logits);
-    }
-    cudaStreamDestroy(stream);
 }

@@ -1,7 +1,5 @@
 #include "dflash_draft_kv.h"
 
-#include "pinned_stage.h"
-
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -246,20 +244,12 @@ static bool draft_kv_bulk_append(DraftKvState & st,
     return true;
 }
 
-// With a stage, every input upload and the feature copy are queued on
-// `backend`'s stream and the caller synchronizes once; without one each
-// upload blocks, as before. The bytes uploaded are the same either way.
-static bool draft_kv_begin_step_impl(DraftKvState & st,
-                                     const DraftWeights & dw,
-                                     ggml_backend_t backend,
-                                     const DraftFeatureMirror & ring,
-                                     int committed,
-                                     int width,
-                                     PinnedStage * stage) {
-    const auto upload = [&](ggml_tensor * t, const void * data, size_t bytes) {
-        if (stage) stage->set(backend, t, data, 0, bytes);
-        else       ggml_backend_tensor_set(t, data, 0, bytes);
-    };
+bool draft_kv_begin_step(DraftKvState & st,
+                         const DraftWeights & dw,
+                         ggml_backend_t backend,
+                         const DraftFeatureMirror & ring,
+                         int committed,
+                         int width) {
     if (!st.mem_buf || st.built_for != static_cast<const void *>(&dw) ||
         committed <= 0 || width < 0 || width > st.q_len) return false;
     const int noise_width = width > 0 ? width : st.q_len;
@@ -295,23 +285,19 @@ static bool draft_kv_begin_step_impl(DraftKvState & st,
             ap_rows[i] = st.trash_slot;
         }
     }
-    if (n_new > 0) {
-        const bool copied = stage
-            ? copy_feature_ring_range_to_tensor_async(ring, st.ap_feat, (int)start, n_new, backend)
-            : copy_feature_ring_range_to_tensor(ring, st.ap_feat, (int)start, n_new);
-        if (!copied) {
-            std::fprintf(stderr, "[draft-kv] feature copy failed\n");
-            return false;
-        }
+    if (n_new > 0 &&
+        !copy_feature_ring_range_to_tensor(ring, st.ap_feat, (int)start, n_new)) {
+        std::fprintf(stderr, "[draft-kv] feature copy failed\n");
+        return false;
     }
-    upload(st.ap_pos, ap_pos, sizeof(int32_t) * (size_t)st.a_step);
-    upload(st.ap_rows, ap_rows, sizeof(int32_t) * (size_t)st.a_step);
+    ggml_backend_tensor_set(st.ap_pos, ap_pos, 0, sizeof(int32_t) * (size_t)st.a_step);
+    ggml_backend_tensor_set(st.ap_rows, ap_rows, 0, sizeof(int32_t) * (size_t)st.a_step);
     st.next_pos = committed;
 
     // noise positions (absolute)
     std::vector<int32_t> pq((size_t)st.q_len);
     for (int i = 0; i < st.q_len; i++) pq[(size_t)i] = committed + i;
-    upload(st.pos_q, pq.data(), sizeof(int32_t) * pq.size());
+    ggml_backend_tensor_set(st.pos_q, pq.data(), 0, sizeof(int32_t) * pq.size());
 
     // masks: ctx columns share one row template; noise columns differ only
     // in causality (full = block-visible, SWA = causal).
@@ -327,7 +313,8 @@ static bool draft_kv_begin_step_impl(DraftKvState & st,
         for (int q = 1; q < st.q_len; q++)
             std::memcpy(st.mask_hbuf.data() + (size_t)q * st.kv_total,
                         st.mask_hbuf.data(), sizeof(uint16_t) * (size_t)st.kv_total);
-        upload(st.mask_full, st.mask_hbuf.data(), sizeof(uint16_t) * mask_elems);
+        ggml_backend_tensor_set(st.mask_full, st.mask_hbuf.data(), 0,
+                                sizeof(uint16_t) * mask_elems);
     }
     if (st.mask_swa) {
         // The window is anchored at `committed` for ALL noise rows on purpose:
@@ -349,38 +336,10 @@ static bool draft_kv_begin_step_impl(DraftKvState & st,
         for (int q = 0; q < st.q_len; q++)
             for (int j = 0; j <= q; j++)
                 st.mask_hbuf[(size_t)q * st.kv_total + (size_t)(st.cap + j)] = F16_ZERO;
-        upload(st.mask_swa, st.mask_hbuf.data(), sizeof(uint16_t) * mask_elems);
+        ggml_backend_tensor_set(st.mask_swa, st.mask_hbuf.data(), 0,
+                                sizeof(uint16_t) * mask_elems);
     }
     return true;
-}
-
-bool draft_kv_begin_step(DraftKvState & st,
-                         const DraftWeights & dw,
-                         ggml_backend_t backend,
-                         const DraftFeatureMirror & ring,
-                         int committed,
-                         int width) {
-    return draft_kv_begin_step_impl(st, dw, backend, ring, committed, width, nullptr);
-}
-
-bool draft_kv_begin_step_async(DraftKvState & st,
-                               const DraftWeights & dw,
-                               ggml_backend_t backend,
-                               const DraftFeatureMirror & ring,
-                               int committed,
-                               int width,
-                               PinnedStage & stage) {
-    return draft_kv_begin_step_impl(st, dw, backend, ring, committed, width, &stage);
-}
-
-size_t draft_kv_step_upload_bytes(const DraftKvState & st) {
-    // One 64-byte alignment pad per slice.
-    size_t bytes = 0;
-    for (const ggml_tensor * t : {st.inp_embed, st.pos_q, st.ap_pos, st.ap_rows,
-                                  st.mask_full, st.mask_swa}) {
-        if (t) bytes += ggml_nbytes(t) + 64;
-    }
-    return bytes;
 }
 
 void draft_kv_batch_free(DraftKvBatchGraph & batch) {
@@ -542,37 +501,6 @@ static bool draft_kv_batch_build(
     return true;
 }
 
-bool draft_kv_batch_compute_async(
-        DraftKvBatchGraph & batch,
-        const DraftWeights & dw,
-        ggml_backend_t backend,
-        const std::vector<DraftKvState *> & lane_states,
-        int width) {
-    if (lane_states.empty()) return false;
-    const int q_len = width > 0 ? width : dw.block_size;
-
-    const bool reusable =
-        batch.gf && batch.built_for == static_cast<const void *>(&dw) &&
-        batch.backend == backend && batch.lane_states == lane_states &&
-        batch.q_len == q_len;
-    // A rebuild frees the old compute buffer; drain the stream first so no
-    // queued launch still uses it.
-    if (!reusable) ggml_backend_synchronize(backend);
-    if (!reusable &&
-        !draft_kv_batch_build(
-            batch, dw, backend, lane_states, q_len)) {
-        return false;
-    }
-    if (ggml_backend_graph_compute_async(backend, batch.gf) !=
-        GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr,
-            "[draft-kv-batch] graph compute failed lanes=%d\n",
-            batch.n_lanes);
-        return false;
-    }
-    return true;
-}
-
 bool draft_kv_batch_compute(
         DraftKvBatchGraph & batch,
         const DraftWeights & dw,
@@ -581,8 +509,23 @@ bool draft_kv_batch_compute(
         std::vector<std::vector<float>> & hidden_by_lane,
         int width) {
     hidden_by_lane.clear();
-    if (!draft_kv_batch_compute_async(batch, dw, backend, lane_states, width)) {
-        ggml_backend_synchronize(backend);
+    if (lane_states.empty()) return false;
+    const int q_len = width > 0 ? width : dw.block_size;
+
+    const bool reusable =
+        batch.gf && batch.built_for == static_cast<const void *>(&dw) &&
+        batch.backend == backend && batch.lane_states == lane_states &&
+        batch.q_len == q_len;
+    if (!reusable &&
+        !draft_kv_batch_build(
+            batch, dw, backend, lane_states, q_len)) {
+        return false;
+    }
+    if (ggml_backend_graph_compute(backend, batch.gf) !=
+        GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr,
+            "[draft-kv-batch] graph compute failed lanes=%d\n",
+            batch.n_lanes);
         return false;
     }
 

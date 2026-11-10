@@ -3,15 +3,12 @@
 #include "dflash2_selector_validation.h"
 #include "ddtree.h"
 #include "geometric_draft_topk_cuda.h"
-#include "pinned_stage.h"
 #include "ggml-alloc.h"
-#include "ggml-cuda.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <initializer_list>
 #include <limits>
 #include <vector>
 
@@ -30,10 +27,6 @@ struct ProjectionGraph {
     ggml_gallocr_t galloc = nullptr;
     ggml_tensor * inp_hidden = nullptr;
     ggml_tensor * logits = nullptr;
-    // Device of `logits` for the GPU top-k (-1: not device memory), looked
-    // up once per graph.
-    bool topk_checked = false;
-    int topk_device = -1;
 
     ~ProjectionGraph() {
         if (galloc) {
@@ -223,116 +216,17 @@ bool ensure_selector_graph(
     return true;
 }
 
-// One pinned stage per thread, like the graphs. Every select call waits for
-// its copies before returning, so the next call may reuse it.
-PinnedStage & selector_stage() {
-    static thread_local PinnedStage stage;
-    return stage;
-}
-
-// True when `t` holds f32 rows of `row_floats` packed back to back in the
-// device memory `backend` computes in, where a kernel copy can reach it.
-bool packed_device_rows(ggml_backend_t backend, const ggml_tensor * t,
-                        int64_t row_floats) {
-    if (!t || !t->data || t->type != GGML_TYPE_F32 ||
-        t->ne[0] != row_floats || t->nb[0] != sizeof(float) ||
-        t->nb[1] != sizeof(float) * (size_t) row_floats) {
-        return false;
-    }
-    const ggml_backend_buffer_t buffer =
-        t->view_src ? t->view_src->buffer : t->buffer;
-    return buffer && !ggml_backend_buffer_is_host(buffer) &&
-        ggml_backend_buffer_get_type(buffer) ==
-            ggml_backend_get_default_buffer_type(backend);
-}
-
-// Queues, on the backend stream, the copy of drafted rows 1..n_cand of every
-// lane block into each destination [hdim, n_lanes * n_cand] (lane-major, the
-// layout the old host gather built). One kernel launch for up to 48 copies.
-// False, with nothing queued, when a tensor is not packed device rows.
-bool copy_candidate_rows_async(
-        ggml_backend_t backend,
-        const std::vector<const ggml_tensor *> & blocks, int q_len,
-        int hdim, std::initializer_list<ggml_tensor *> destinations) {
-    const int n_lanes = static_cast<int>(blocks.size());
-    const int n_cand = q_len - 1;
-    if (ggml_backend_cuda_get_device_id(backend) < 0) return false;
-    for (const ggml_tensor * block : blocks) {
-        if (!packed_device_rows(backend, block, hdim) || block->ne[1] < q_len) {
-            return false;
-        }
-    }
-    for (const ggml_tensor * destination : destinations) {
-        if (!packed_device_rows(backend, destination, hdim) ||
-            destination->ne[1] != (int64_t) n_lanes * n_cand) {
-            return false;
-        }
-    }
-    const size_t row_bytes = sizeof(float) * (size_t) hdim;
-    const size_t lane_bytes = row_bytes * (size_t) n_cand;
-    // Each block is read once per destination; only destinations must not
-    // overlap, and they are disjoint graph inputs.
-    std::vector<ggml_cuda_copy_desc> copies;
-    copies.reserve(blocks.size() * destinations.size());
-    for (ggml_tensor * destination : destinations) {
-        for (int lane = 0; lane < n_lanes; ++lane) {
-            ggml_cuda_copy_desc copy{};
-            copy.src = static_cast<const char *>(blocks[(size_t) lane]->data) +
-                row_bytes;
-            copy.dst = static_cast<char *>(destination->data) +
-                (size_t) lane * lane_bytes;
-            copy.nbytes = lane_bytes;
-            copies.push_back(copy);
-        }
-    }
-    ggml_backend_cuda_copy_batch_async(
-        backend, copies.data(), static_cast<int>(copies.size()));
-    return true;
-}
-
-// The host gather of the same rows, for blocks a kernel copy cannot reach.
-// Reads each block with a blocking get, so the caller synchronized first.
-std::vector<float> gather_candidate_rows(
-        const std::vector<const ggml_tensor *> & blocks, int q_len,
-        int hdim) {
-    const int n_cand = q_len - 1;
-    const size_t row_floats = (size_t) hdim;
-    std::vector<float> rows(
-        row_floats * (size_t) n_cand * blocks.size());
-    for (size_t lane = 0; lane < blocks.size(); ++lane) {
-        ggml_backend_tensor_get(
-            blocks[lane], rows.data() + lane * (size_t) n_cand * row_floats,
-            sizeof(float) * row_floats,
-            sizeof(float) * row_floats * (size_t) n_cand);
-    }
-    return rows;
-}
-
-// Points at a readback slice once the backend synchronized, or reads the
-// tensor with a blocking get into `fallback` when the stage had no room.
-template <typename T>
-const T * staged_or_read(const void * slice, const ggml_tensor * t,
-                         size_t count, std::vector<T> & fallback) {
-    if (slice) return static_cast<const T *>(slice);
-    fallback.resize(count);
-    ggml_backend_tensor_get(t, fallback.data(), 0, sizeof(T) * count);
-    return fallback.data();
-}
-
 }  // namespace
 
 bool dflash2_select_chains_batched(
         const DraftWeights & dw,
         ggml_backend_t backend,
         ggml_tensor * lm_head,
-        const std::vector<const ggml_tensor *> & hidden_by_lane,
+        const std::vector<const float *> & hidden_by_lane,
         int q_len,
         const std::vector<int32_t> & last_tokens,
         std::vector<std::vector<int32_t>> & draft_tokens) {
     draft_tokens.clear();
-    // Every exit waits for the copies queued here: the stage and the lane
-    // blocks stay untouched until then.
-    BackendDrain drain(backend);
     const DraftSelectorWeights & selector = dw.selector;
     const int n_lanes = static_cast<int>(hidden_by_lane.size());
     const int n_cand = q_len - 1;
@@ -361,11 +255,8 @@ bool dflash2_select_chains_batched(
                      selector_error.c_str());
         return false;
     }
-    for (const ggml_tensor * hidden : hidden_by_lane) {
-        if (!hidden || hidden->type != GGML_TYPE_F32 ||
-            hidden->ne[0] != hdim || hidden->ne[1] < q_len) {
-            return false;
-        }
+    for (const float * hidden : hidden_by_lane) {
+        if (!hidden) return false;
     }
     for (size_t lane = 0; lane < last_tokens.size(); ++lane) {
         const int32_t token = last_tokens[lane];
@@ -379,154 +270,104 @@ bool dflash2_select_chains_batched(
         }
     }
 
-    // Both graphs exist before anything is queued: a rebuild frees a
-    // compute buffer, which must not happen under queued work.
     const int n_positions = n_lanes * n_cand;
+    std::vector<float> candidate_hidden(
+        (size_t) hdim * (size_t) n_positions);
+    for (int lane = 0; lane < n_lanes; ++lane) {
+        for (int depth = 0; depth < n_cand; ++depth) {
+            const int position = lane * n_cand + depth;
+            const float * source = hidden_by_lane[(size_t) lane] +
+                (size_t) (depth + 1) * (size_t) hdim;
+            std::memcpy(
+                candidate_hidden.data() +
+                    (size_t) position * (size_t) hdim,
+                source, sizeof(float) * (size_t) hdim);
+        }
+    }
+
     ProjectionGraph & projection = projection_graph();
     if (!ensure_projection_graph(
             projection, dw, backend, lm_head, n_positions)) {
         return false;
     }
-    BatchedSelectorGraph & graph = batched_selector_graph();
-    if (!ensure_selector_graph(
-            graph, dw, backend, n_lanes, n_cand, K)) {
-        return false;
-    }
-
-    const int vocab = static_cast<int>(lm_head->ne[1]);
-    const size_t n_candidates = (size_t) n_positions * (size_t) K;
-    const size_t n_pred_rows = (size_t) n_lanes + n_candidates;
-    PinnedStage & stage = selector_stage();
-    const size_t stage_bytes =
-        sizeof(int32_t) * (size_t) n_lanes +          // seed rows of inp_pred
-        sizeof(float) * n_candidates +                 // top-k log-probs
-        sizeof(int32_t) * n_candidates +               // top-k ids
-        sizeof(float) * (size_t) rank * ((size_t) n_positions +
-                                         n_candidates + n_pred_rows) +
-        64 * 8;
-    stage.reserve(backend, stage_bytes);
-    stage.reset();
-
-    // Drafted rows 1..q_len-1 of every lane into both graphs' hidden input,
-    // device to device. A block a kernel copy cannot reach is gathered on
-    // the host and uploaded, as before.
-    if (!copy_candidate_rows_async(
-            backend, hidden_by_lane, q_len, hdim,
-            {projection.inp_hidden, graph.inp_hidden})) {
-        ggml_backend_synchronize(backend);
-        const std::vector<float> rows =
-            gather_candidate_rows(hidden_by_lane, q_len, hdim);
-        for (ggml_tensor * input : {projection.inp_hidden, graph.inp_hidden}) {
-            stage.set(backend, input, rows.data(), 0,
-                      sizeof(float) * rows.size());
-        }
-    }
-    if (ggml_backend_graph_compute_async(backend, projection.gf) !=
+    ggml_backend_tensor_set(
+        projection.inp_hidden, candidate_hidden.data(), 0,
+        sizeof(float) * candidate_hidden.size());
+    if (ggml_backend_graph_compute(backend, projection.gf) !=
         GGML_STATUS_SUCCESS) {
         std::fprintf(stderr,
             "dflash2_select_chains_batched: projection compute failed\n");
         return false;
     }
 
-    // Top-k on the backend stream: the ids land in the selector's successor
-    // input and the log-probs in a pinned slice. When the GPU path is not
-    // available the logits are read back and reduced on the host, as before.
-    const float * candidate_log_probs = nullptr;
-    const void * ids_slice = nullptr;
-    std::vector<float> host_log_probs;
-    std::vector<int32_t> host_ids;
+    const int vocab = static_cast<int>(lm_head->ne[1]);
+    std::vector<float> candidate_log_probs(
+        (size_t) n_positions * (size_t) K);
+    std::vector<int32_t> candidate_ids(
+        (size_t) n_positions * (size_t) K);
     bool have_top_k = false;
 #ifdef LUCE_HAVE_DRAFT_TOPK
-    if (!projection.topk_checked) {
-        projection.topk_device = projection.logits
-            ? geometric_draft_topk_cuda_device(projection.logits->data)
-            : -1;
-        projection.topk_checked = true;
-    }
-    if (projection.topk_device >= 0 &&
-        projection.topk_device == ggml_backend_cuda_get_device_id(backend) &&
-        geometric_draft_topk_cuda_supports_k(K)) {
-        void * lp_slice = stage.take(sizeof(float) * n_candidates);
-        if (!lp_slice) host_log_probs.resize(n_candidates);
-        float * lp_out = lp_slice ? static_cast<float *>(lp_slice)
-                                  : host_log_probs.data();
-        have_top_k = geometric_extract_draft_topk_cuda_async(
-            projection.logits->data, projection.topk_device, n_positions,
-            vocab, K, 1.0f, ggml_backend_cuda_enter_stream(backend),
-            static_cast<int32_t *>(graph.inp_succ->data), lp_out);
-        if (have_top_k) {
-            candidate_log_probs = lp_out;
-            // The ids also follow the seeds in the predecessor input.
-            ggml_cuda_copy_desc copy{};
-            copy.src = graph.inp_succ->data;
-            copy.dst = static_cast<char *>(graph.inp_pred->data) +
-                sizeof(int32_t) * (size_t) n_lanes;
-            copy.nbytes = sizeof(int32_t) * n_candidates;
-            ggml_backend_cuda_copy_batch_async(backend, &copy, 1);
-            // Read the ids before the selector graph runs: its allocator
-            // may reuse an input's memory once the input was consumed.
-            ids_slice = stage.get(backend, graph.inp_succ, 0,
-                                  sizeof(int32_t) * n_candidates);
-            if (!ids_slice) {
-                ggml_backend_synchronize(backend);
-                host_ids.resize(n_candidates);
-                ggml_backend_tensor_get(graph.inp_succ, host_ids.data(), 0,
-                                        sizeof(int32_t) * n_candidates);
-            }
-        }
+    if (projection.logits && projection.logits->data) {
+        have_top_k = geometric_extract_draft_topk_cuda(
+            projection.logits->data, n_positions, vocab, K,
+            candidate_log_probs.data(), candidate_ids.data(), 1.0f);
     }
 #endif
     if (!have_top_k) {
-        ggml_backend_synchronize(backend);
         std::vector<float> logits(
             (size_t) vocab * (size_t) n_positions);
         ggml_backend_tensor_get(
             projection.logits, logits.data(), 0,
             sizeof(float) * logits.size());
-        host_log_probs.resize(n_candidates);
-        host_ids.resize(n_candidates);
         extract_draft_topk(
             logits.data(), n_positions, vocab, K,
-            host_log_probs.data(), host_ids.data(), 1.0f);
-        candidate_log_probs = host_log_probs.data();
-        stage.set(backend, graph.inp_succ, host_ids.data(), 0,
-                  sizeof(int32_t) * n_candidates);
-        stage.set(backend, graph.inp_pred, host_ids.data(),
-                  sizeof(int32_t) * (size_t) n_lanes,
-                  sizeof(int32_t) * n_candidates);
+            candidate_log_probs.data(), candidate_ids.data(), 1.0f);
     }
-    stage.set(backend, graph.inp_pred, last_tokens.data(), 0,
-              sizeof(int32_t) * (size_t) n_lanes);
-    if (ggml_backend_graph_compute_async(backend, graph.gf) !=
+
+    BatchedSelectorGraph & graph = batched_selector_graph();
+    if (!ensure_selector_graph(
+            graph, dw, backend, n_lanes, n_cand, K)) {
+        return false;
+    }
+    std::vector<int32_t> predecessor_ids(
+        (size_t) n_lanes + candidate_ids.size());
+    std::copy(
+        last_tokens.begin(), last_tokens.end(), predecessor_ids.begin());
+    std::copy(
+        candidate_ids.begin(), candidate_ids.end(),
+        predecessor_ids.begin() + n_lanes);
+    ggml_backend_tensor_set(
+        graph.inp_hidden, candidate_hidden.data(), 0,
+        sizeof(float) * candidate_hidden.size());
+    ggml_backend_tensor_set(
+        graph.inp_succ, candidate_ids.data(), 0,
+        sizeof(int32_t) * candidate_ids.size());
+    ggml_backend_tensor_set(
+        graph.inp_pred, predecessor_ids.data(), 0,
+        sizeof(int32_t) * predecessor_ids.size());
+    if (ggml_backend_graph_compute(backend, graph.gf) !=
         GGML_STATUS_SUCCESS) {
         std::fprintf(stderr,
             "dflash2_select_chains_batched: selector compute failed\n");
         return false;
     }
 
-    // One wait for every readback.
-    const size_t hproj_count = (size_t) rank * (size_t) n_positions;
-    const size_t succ_count = (size_t) rank * n_candidates;
-    const size_t pred_count = (size_t) rank * n_pred_rows;
-    const void * hproj_slice = stage.get(
-        backend, graph.hproj, 0, sizeof(float) * hproj_count);
-    const void * succ_slice = stage.get(
-        backend, graph.succ, 0, sizeof(float) * succ_count);
-    const void * pred_slice = stage.get(
-        backend, graph.pred, 0, sizeof(float) * pred_count);
-    drain.now();
-    std::vector<float> hproj_fallback;
-    std::vector<float> succ_fallback;
-    std::vector<float> pred_fallback;
-    const float * projected_hidden = staged_or_read(
-        hproj_slice, graph.hproj, hproj_count, hproj_fallback);
-    const float * successor_codes = staged_or_read(
-        succ_slice, graph.succ, succ_count, succ_fallback);
-    const float * predecessor_codes = staged_or_read(
-        pred_slice, graph.pred, pred_count, pred_fallback);
-    const int32_t * candidate_ids = host_ids.empty()
-        ? static_cast<const int32_t *>(ids_slice)
-        : host_ids.data();
+    std::vector<float> projected_hidden(
+        (size_t) rank * (size_t) n_positions);
+    std::vector<float> successor_codes(
+        (size_t) rank * candidate_ids.size());
+    std::vector<float> predecessor_codes(
+        (size_t) rank * predecessor_ids.size());
+    ggml_backend_tensor_get_async(
+        backend, graph.hproj, projected_hidden.data(), 0,
+        sizeof(float) * projected_hidden.size());
+    ggml_backend_tensor_get_async(
+        backend, graph.succ, successor_codes.data(), 0,
+        sizeof(float) * successor_codes.size());
+    ggml_backend_tensor_get_async(
+        backend, graph.pred, predecessor_codes.data(), 0,
+        sizeof(float) * predecessor_codes.size());
+    ggml_backend_synchronize(backend);
 
     draft_tokens.assign(
         (size_t) n_lanes,
@@ -536,15 +377,15 @@ bool dflash2_select_chains_batched(
         int predecessor_row = lane;
         for (int depth = 0; depth < n_cand; ++depth) {
             const int position = lane * n_cand + depth;
-            const float * predecessor = predecessor_codes +
+            const float * predecessor = predecessor_codes.data() +
                 (size_t) predecessor_row * (size_t) rank;
-            const float * hidden = projected_hidden +
+            const float * hidden = projected_hidden.data() +
                 (size_t) position * (size_t) rank;
             float best_score = -INFINITY;
             int best_candidate = 0;
             for (int candidate = 0; candidate < K; ++candidate) {
                 const int candidate_row = position * K + candidate;
-                const float * successor = successor_codes +
+                const float * successor = successor_codes.data() +
                     (size_t) candidate_row * (size_t) rank;
                 float correction = 0.0f;
                 for (int r = 0; r < rank; ++r) {

@@ -353,43 +353,6 @@ GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction(
         int tree_scratch_base,
         int tree_scratch_stride);
 
-// The host's own copy of a tree commit's index tensors: the bytes the device
-// tensors hold when the commit kernels read them.
-struct ggml_cuda_tree_commit_host_maps {
-    const int64_t * commit_rows;        // ggml_nelements(commit_rows)
-    const int32_t * accepted_prefixes;  // ggml_nelements(accepted_prefixes)
-    const int32_t * active_slot_ids;    // ggml_nelements(active_slot_ids)
-    const int32_t * feature_rows;       // ggml_nelements(feature_destination_rows)
-};
-
-// ggml_backend_cuda_tree_commit_transaction, stream-ordered on `backend`.
-// It runs the same preflight on `host` instead of reading the index tensors
-// back, checks device placement once per set of tensor addresses, commits
-// every cache, the feature rows and every layer in a few launches (the same
-// per-element copies and recurrences) on the backend's stream, and returns
-// without synchronizing. Write the index tensors on the backend's stream or
-// before the call. Synchronize the backend before the host or another stream
-// reads or writes a committed tensor. Every tensor must live on the
-// backend's device.
-GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction_async(
-        ggml_backend_t backend,
-        struct ggml_tensor * const * caches,
-        int n_caches,
-        const struct ggml_tensor * feature_source,
-        struct ggml_tensor * feature_destination,
-        const struct ggml_tensor * feature_destination_rows,
-        const struct ggml_tensor * const * replay_logs,
-        struct ggml_tensor * const * states,
-        const struct ggml_tensor * const * conv_inputs,
-        struct ggml_tensor * const * conv_states,
-        int n_layers,
-        const struct ggml_tensor * commit_rows,
-        const struct ggml_tensor * accepted_prefixes,
-        const struct ggml_tensor * active_slot_ids,
-        int tree_scratch_base,
-        int tree_scratch_stride,
-        const struct ggml_cuda_tree_commit_host_maps * host);
-
 // Attach learned per-expert decode tables to a mixed-precision tensor. The
 // host variants copy the tables to the device that owns `base`. Call the
 // matching unregister function before releasing the tensor's backing buffer.

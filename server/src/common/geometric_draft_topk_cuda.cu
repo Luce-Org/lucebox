@@ -340,43 +340,6 @@ int pick_split(int vocab, int n_positions) {
     return split;
 }
 
-// Queues the partial and combine kernels on `stream` (0 is the legacy default
-// stream the synchronous entry point uses). False when K has no instantiated
-// kernel, so the caller falls back to the CPU path.
-bool launch_topk(const float * lp_in, int n_positions, int vocab, int K,
-                 float inv_t, int split, float * out_lp, int32_t * out_ids,
-                 cudaStream_t stream) {
-    const dim3 grid1(n_positions, split);
-    const int  comb_block = pow2_ceil(split);
-    // float4 loads are safe only when every row base is 16-byte aligned:
-    // the tensor base aligned and a vocab stride that is a multiple of 4.
-    const bool use_vec = (vocab % 4 == 0) &&
-                         (reinterpret_cast<uintptr_t>(lp_in) % 16 == 0);
-#define LUCE_TOPK_LAUNCH(KV, VEC)                                                             \
-            geometric_draft_topk_partial<KV, VEC><<<grid1, kBlock, 0, stream>>>(                          \
-                lp_in, vocab, inv_t, split,                                                     \
-                scratch.d_pmax, scratch.d_psum, scratch.d_pv, scratch.d_pi);           \
-            geometric_draft_topk_combine<KV><<<n_positions, comb_block, 0, stream>>>(                     \
-                scratch.d_pmax, scratch.d_psum, scratch.d_pv, scratch.d_pi,            \
-                split, out_lp, out_ids);
-#define LUCE_TOPK_CASE(KV)                                                                    \
-            case KV:                                                                            \
-                if (use_vec) { LUCE_TOPK_LAUNCH(KV, true) }                                   \
-                else         { LUCE_TOPK_LAUNCH(KV, false) }                                  \
-                return true;
-    // K values without an instantiated kernel must fail loud so the caller
-    // falls back to the CPU path; the old silent default returned success
-    // with uninitialized scratch as token ids.
-    switch (K) {
-        LUCE_TOPK_CASE(1) LUCE_TOPK_CASE(2) LUCE_TOPK_CASE(3) LUCE_TOPK_CASE(4)
-        LUCE_TOPK_CASE(5) LUCE_TOPK_CASE(6) LUCE_TOPK_CASE(7) LUCE_TOPK_CASE(8)
-        LUCE_TOPK_CASE(12) LUCE_TOPK_CASE(16)
-        default: return false;
-    }
-#undef LUCE_TOPK_CASE
-#undef LUCE_TOPK_LAUNCH
-}
-
 }  // namespace
 
 bool geometric_extract_draft_topk_cuda(const void * d_logits,
@@ -411,9 +374,37 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
         cudaEvent_t e_k0, e_k1, e_c1;
         if (kProfile) { cudaEventCreate(&e_k0); cudaEventCreate(&e_k1); cudaEventCreate(&e_c1); cudaEventRecord(e_k0); }
 
+        const dim3 grid1(n_positions, split);
+        const int  comb_block = pow2_ceil(split);
         const float * lp_in = static_cast<const float *>(d_logits);
-        const bool launched = launch_topk(lp_in, n_positions, vocab, K, inv_t, split,
-                                          scratch.d_lp, scratch.d_ids, 0);
+        // float4 loads are safe only when every row base is 16-byte aligned:
+        // the tensor base aligned and a vocab stride that is a multiple of 4.
+        const bool use_vec = (vocab % 4 == 0) &&
+                             (reinterpret_cast<uintptr_t>(lp_in) % 16 == 0);
+#define LUCE_TOPK_LAUNCH(KV, VEC)                                                             \
+            geometric_draft_topk_partial<KV, VEC><<<grid1, kBlock>>>(                                     \
+                lp_in, vocab, inv_t, split,                                                     \
+                scratch.d_pmax, scratch.d_psum, scratch.d_pv, scratch.d_pi);           \
+            geometric_draft_topk_combine<KV><<<n_positions, comb_block>>>(                                \
+                scratch.d_pmax, scratch.d_psum, scratch.d_pv, scratch.d_pi,            \
+                split, scratch.d_lp, scratch.d_ids);
+#define LUCE_TOPK_CASE(KV)                                                                    \
+            case KV:                                                                            \
+                if (use_vec) { LUCE_TOPK_LAUNCH(KV, true) }                                   \
+                else         { LUCE_TOPK_LAUNCH(KV, false) }                                  \
+                break;
+        // K values without an instantiated kernel must fail loud so the
+        // caller falls back to the CPU path; the old silent default returned
+        // success with uninitialized scratch as token ids.
+        bool launched = true;
+        switch (K) {
+            LUCE_TOPK_CASE(1) LUCE_TOPK_CASE(2) LUCE_TOPK_CASE(3) LUCE_TOPK_CASE(4)
+            LUCE_TOPK_CASE(5) LUCE_TOPK_CASE(6) LUCE_TOPK_CASE(7) LUCE_TOPK_CASE(8)
+            LUCE_TOPK_CASE(12) LUCE_TOPK_CASE(16)
+            default: launched = false; break;
+        }
+#undef LUCE_TOPK_CASE
+#undef LUCE_TOPK_LAUNCH
 
         if (kProfile) cudaEventRecord(e_k1);
         if (launched && cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess) {
@@ -435,53 +426,6 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
     }
     if (!ok) cudaGetLastError();
     if (dev != prev) cudaSetDevice(prev);
-    return ok;
-}
-
-int geometric_draft_topk_cuda_device(const void * d_logits) {
-    if (!d_logits) return -1;
-    cudaPointerAttributes attr{};
-    if (cudaPointerGetAttributes(&attr, d_logits) != cudaSuccess) {
-        cudaGetLastError();  // clear the error so we don't poison the next CUDA call
-        return -1;
-    }
-    return attr.type == cudaMemoryTypeDevice ? attr.device : -1;
-}
-
-bool geometric_extract_draft_topk_cuda_async(const void * d_logits,
-                             int device,
-                             int n_positions, int vocab, int K,
-                             float temperature,
-                             void * stream,
-                             int32_t * d_out_token_ids,
-                             float * out_log_probs) {
-    if (!d_logits || !d_out_token_ids || !out_log_probs || !stream || device < 0 ||
-        n_positions <= 0 || vocab <= 0 || K > vocab ||
-        !geometric_draft_topk_cuda_supports_k(K)) {
-        return false;
-    }
-
-    int prev = 0;
-    cudaGetDevice(&prev);
-    if (device != prev) cudaSetDevice(device);
-
-    bool ok = false;
-    const int    split   = pick_split(vocab, n_positions);
-    const size_t n       = (size_t)n_positions * K;
-    const size_t n_parts = (size_t)n_positions * split;
-    // The scratch is per thread and the caller waits for the stream before
-    // its next call, so no queued kernel still uses it when it is regrown.
-    if (ensure_scratch(device, n, n_parts)) {
-        const float inv_t = 1.0f / fmaxf(1e-3f, temperature);
-        cudaStream_t s = static_cast<cudaStream_t>(stream);
-        ok = launch_topk(static_cast<const float *>(d_logits), n_positions, vocab, K,
-                         inv_t, split, scratch.d_lp, d_out_token_ids, s) &&
-             cudaGetLastError() == cudaSuccess &&
-             cudaMemcpyAsync(out_log_probs, scratch.d_lp, n * sizeof(float),
-                             cudaMemcpyDeviceToHost, s) == cudaSuccess;
-    }
-    if (!ok) cudaGetLastError();
-    if (device != prev) cudaSetDevice(prev);
     return ok;
 }
 
