@@ -129,6 +129,14 @@ public:
                                                                                       : PagedKvStatus::BlocksExhausted;
     }
 
+    // Rows a live slot may still append inside its reservation (0 for a slot that is free, parked or out of range).
+    // A chain round accepts up to its width, which can pass the last reserved block when the request is nearly done.
+    int64_t append_room(int slot) const {
+        if (slot < 0 || slot >= (int)slots_.size() || !slots_[(size_t)slot].live) return 0;
+        const Slot & s = slots_[(size_t)slot];
+        return (int64_t)s.capacity_blocks * block_size() - (int64_t)s.len;
+    }
+
     PagedKvAppendResult append(PagedKvSequenceHandle h, uint32_t n, bool only_first_last = false) override {
         PagedKvAppendResult r;
         Slot * s = live_(h);
