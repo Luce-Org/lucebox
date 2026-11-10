@@ -211,7 +211,7 @@ inline KvFlashRungs kvflash_rungs_after_resume(int ckpt, int trunk, int L) {
     return r;
 }
 
-// C1.5 F4 (rule v5, trackc/b4_replay/RULES.md): a session keeps a third rung beside ckpt and trunk. A rewind to a rung
+// A session keeps a third rung beside ckpt and trunk. A rewind to a rung
 // below the checkpoint (a branch: the client re-rendered an earlier prompt) pins that rung in the third slot; with no
 // branch the slot holds the rung the ladder demoted, so it never costs a rung the two-rung ladder had.
 struct KvFlashLadder { int ckpt = -1, trunk = -1, extra = -1; bool pinned = false; };

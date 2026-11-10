@@ -2222,8 +2222,6 @@ std::string HttpServer::resolve_status_html() {
     return {};
 }
 
-// Send data to an SSE client fd with a short (1s) timeout to avoid stalling
-// the inference worker. Returns false if the send fails or times out.
 // ponytail: ceilings of the HTTP edge. One handler thread per live connection,
 // 256 at most; a /status/events subscriber holds a descriptor but no thread, so
 // it is capped on its own at 32 and does not count against the 256.
