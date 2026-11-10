@@ -755,8 +755,8 @@ struct LaunchPolicyFixture : CommonFixture {
     }
 
     void test_kvflash_recall_defaults_are_the_shipped_profile() {
-        // With a drafter and its three PFlash GGUFs: mode 5, the PFlash 2.0 scorer, exactly the settings the
-        // K2/K3 LiveCode nights measured (P1 27/40, P2 29/40 on 14 sessions).
+        // Mode 5 asked for (LUCE_KVFLASH_PREFILL_RESELECT=5) with a drafter and its three PFlash GGUFs: the PFlash 2.0
+        // scorer, exactly the settings the K2/K3 LiveCode nights measured (P1 27/40, P2 29/40 on 14 sessions).
         check_env(kvflash_recall_env("qwen35", true), {
             {"LUCE_KVFLASH_POLICY", "qk"},
             {"LUCE_KVFLASH_PREFILL_RESELECT", "5"},
@@ -777,7 +777,7 @@ struct LaunchPolicyFixture : CommonFixture {
             {"PFLASH_QUERY_PIN", "512"},
             {"PFLASH_DRAFTER_SESSIONS", "2"},
         });
-        // Without one: mode 4, the exact scorer, the values the profile installed before it became named constants.
+        // Otherwise, drafter or not: mode 4, the exact scorer, the values the profile installed before it became named constants.
         check_env(kvflash_recall_env("qwen35", false), {
             {"LUCE_KVFLASH_POLICY", "qk"},
             {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
@@ -798,19 +798,23 @@ struct LaunchPolicyFixture : CommonFixture {
         }
     }
 
-    void test_kvflash_drafter_ready_needs_the_drafter_and_its_three_ggufs() {
+    void test_kvflash_mode5_needs_the_opt_in_the_drafter_and_its_three_ggufs() {
+        // Mode 4 is the default even with a drafter (ruling 2026-11-10: mode 4 kept the needle in 10/10 replayed
+        // agent sessions, mode 5 in 0/10); mode 5 needs LUCE_KVFLASH_PREFILL_RESELECT=5 and everything its scorer loads.
         std::map<std::string, std::string> env = {
-            {"LUCE_KVFLASH_DRAFTER", "d.gguf"}, {"PFLASH_SCORING_HEAD_GGUF", "h.gguf"},
+            {"LUCE_KVFLASH_PREFILL_RESELECT", "5"}, {"LUCE_KVFLASH_DRAFTER", "d.gguf"}, {"PFLASH_SCORING_HEAD_GGUF", "h.gguf"},
             {"PFLASH_SEGMENT_PROBE_GGUF", "s.gguf"}, {"PFLASH_REQUEST_PROBE_GGUF", "r.gguf"}};
         const auto get = [&](const char * k) { const auto it = env.find(k); return it == env.end() ? std::string() : it->second; };
-        CHECK(kvflash_drafter_ready(get));
-        for (const char * k : {"LUCE_KVFLASH_DRAFTER", "PFLASH_SCORING_HEAD_GGUF", "PFLASH_SEGMENT_PROBE_GGUF",
-                               "PFLASH_REQUEST_PROBE_GGUF"}) {
+        CHECK(kvflash_mode5_requested(get));
+        for (const char * k : {"LUCE_KVFLASH_PREFILL_RESELECT", "LUCE_KVFLASH_DRAFTER", "PFLASH_SCORING_HEAD_GGUF",
+                               "PFLASH_SEGMENT_PROBE_GGUF", "PFLASH_REQUEST_PROBE_GGUF"}) {
             const std::string keep = env[k];
             env[k] = "";
-            CHECK(!kvflash_drafter_ready(get));
+            CHECK(!kvflash_mode5_requested(get));
             env[k] = keep;
         }
+        env["LUCE_KVFLASH_PREFILL_RESELECT"] = "4";
+        CHECK(!kvflash_mode5_requested(get));
     }
 };
 
@@ -849,7 +853,7 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_kvflash_recall_profile_leaves_the_pool_at_the_requested_size();
     test_kvflash_preamble_reserve_that_leaves_no_history_is_off();
     test_kvflash_recall_defaults_are_the_shipped_profile();
-    test_kvflash_drafter_ready_needs_the_drafter_and_its_three_ggufs();
+    test_kvflash_mode5_needs_the_opt_in_the_drafter_and_its_three_ggufs();
     test_pflash_curve_arg_accepts_quoted_and_split_points();
     test_pflash_curve_arg_rejects_bad_points();
 }
