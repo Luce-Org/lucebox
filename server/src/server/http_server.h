@@ -594,6 +594,7 @@ struct ParsedRequest {
     bool                      max_output_from_client = false;  // else the card's default
     bool                      stream       = true;
     SamplerCfg                sampler;
+    bool                      force_ar_decode = false;   // body "luce_force_ar_decode": no speculative burst (the C-O2 oracle)
     std::string               model;
     // Tool definitions (stored as JSON for response formatting)
     json                      tools;

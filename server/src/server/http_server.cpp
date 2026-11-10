@@ -3098,6 +3098,7 @@ bool HttpServer::parse_common_request_fields(
     }
 
     req.sampler = parse_request_sampler(body, config_.sampler_defaults);
+    req.force_ar_decode = body.value("luce_force_ar_decode", false);
     if (body.contains("tools")) req.tools = body["tools"];
     // Tool choice constraint for hint generation.
     if (body.contains("tool_choice")) req.tool_choice = body["tool_choice"];
@@ -6961,7 +6962,7 @@ void HttpServer::prepare_generation_inputs(
     // A grammar masks one position at a time: backends that do not check
     // drafts against it decode autoregressively.
     inputs.request.force_ar_decode =
-        req.sampler.constraint != nullptr && !backend_.speculates_under_constraint();
+        (req.sampler.constraint != nullptr && !backend_.speculates_under_constraint()) || req.force_ar_decode;
     inputs.request.ignore_eos = request_ignores_eos(req);
     // Tokens are delivered through DaemonIO so all API formats share the
     // same disconnect and streaming state machine.

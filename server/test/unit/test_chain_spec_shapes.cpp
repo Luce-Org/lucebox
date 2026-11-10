@@ -69,6 +69,12 @@ int main() {
     CHECK(!chain_config_ready(true, 16, 16, 15, true));     // a slot's scratch stride must hold a whole chain
     CHECK(!chain_config_ready(true, 16, 16, 16, false));    // no target_feat ring, no chain
 
+    // C-O2: a request that asks for AR decode (the oracle's T2) never gets a speculative burst.
+    CHECK(step_allows_speculation(true, false, false));
+    CHECK(!step_allows_speculation(false, false, false));   // budget not settled
+    CHECK(!step_allows_speculation(true, true, false));     // a grammar masks one position at a time
+    CHECK(!step_allows_speculation(true, false, true));     // force_ar_decode
+
     std::printf("chain spec shape tests passed: %d checks\n", g_checks);
     return 0;
 }

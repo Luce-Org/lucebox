@@ -11,6 +11,7 @@
 #include "admit_timing.h"
 #include "http_server.h"
 #include "common/concurrency/seq_engine.h"
+#include "common/concurrency/chain_spec_shapes.h"
 #include "common/output_constraint.h"
 #include "common/spec_acceptance.h"
 #include "server/kv/parallel_prefix_txn.h"
@@ -1222,7 +1223,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     if (!budget_clear) arm_loop_close(i);
                     step_plan.decode.push_back(
                         {i, s.pending_tok,
-                         budget_clear && !s.job->req.sampler.constraint});
+                         luce::common::step_allows_speculation(
+                             budget_clear, s.job->req.sampler.constraint != nullptr, s.job->req.force_ar_decode)});
                 } else {
                     prefill_candidates.push_back({i, s.admission_order});
                 }
