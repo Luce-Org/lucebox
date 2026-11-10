@@ -54,6 +54,7 @@ struct Qwen4ExpLayer {
     ggml_tensor * ssm_conv1d     = nullptr;  // depthwise causal conv
     ggml_tensor * ssm_alpha      = nullptr;  // per-token alpha input projection
     ggml_tensor * ssm_beta       = nullptr;  // per-token beta input projection
+    ggml_tensor * ssm_alpha_beta = nullptr;  // [n_embd, 2*H_v] f32 view over alpha|beta (adjacent): one step matmul
     ggml_tensor * ssm_a          = nullptr;  // per-head -A parameter
     ggml_tensor * ssm_dt_bias    = nullptr;  // alpha bias
     ggml_tensor * ssm_gate_ba    = nullptr;  // [dt_bias | A] f32 [2*H_v]: steps let the recurrence apply the gates
@@ -135,7 +136,7 @@ private:
 
 // Small target-resident constants derived from the weights: the raw-gate parameters, QSA's head weights and the
 // hot-expert lookup tables. Each group opens a no-alloc context, creates its tensors and commits them as one weights
-// buffer; free() releases every group.
+// buffer; a group of views into the weight buffer is opened and never committed. free() releases every group.
 class Qwen4ExpDerived {
 public:
     ggml_context * open(size_t n_tensors);
@@ -164,7 +165,13 @@ struct Qwen4ExpWeights {
     std::vector<ggml_tensor *> hot_lut;    // per layer [1, n_expert] i32: hot slot, -1 if cold (null: no hot experts)
     std::vector<ggml_tensor *> cold_lut;   // per layer [1, n_expert] i32: the expert, -1 if hot
     ggml_tensor *              qsa_ones = nullptr;   // [indexer_n_head, 128] f32 ones: QSA's uniform head weights
-    Qwen4ExpDerived            derived;   // owns hot_lut/cold_lut, qsa_ones and the layers' ssm_gate_ba
+    // Split mode, per layer, on the expert device: the cold experts' router rows as Q8_0 [n_embd, n_cold] and their
+    // expert ids [n_cold], for the expert device's read-ahead of the layer's picks (qwen4exp_graph.cpp; null: none).
+    std::vector<ggml_tensor *> ahead_router, ahead_ids;
+    // Split mode, on the expert device: the LM head's last rows (`output`'s rows from output->ne[1] - ne[1] on), whose
+    // logits that device computes beside the target's (qwen4exp_graph.cpp, build_lm_head; null: the target's all).
+    ggml_tensor *              output_tail = nullptr;
+    Qwen4ExpDerived            derived;   // owns the LUTs, ahead_*, output_tail, qsa_ones, ssm_gate_ba and their views
 
     CpuEmbedder           embedder;
 

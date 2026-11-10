@@ -51,7 +51,9 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
     const int64_t C = x->ne[0], T = x->ne[1], H = st->ne[0];
     if (H != 9 || st->ne[1] != C || st->ne[2] != 1 || !ggml_is_contiguous(st)) PLE_FAIL;
     if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) PLE_FAIL;
-    if (cc->ne[0] != T + H || cc->ne[1] != C || cc->ne[2] != 1 || !ggml_is_contiguous(cc) || T < 256 || C % 256 != 0) PLE_FAIL;
+    // Any T: the kernel forms each output with the unfused graph's roundings (mul, add, silu), so verify steps
+    // (T = 1..8, with their per-token history copies) get the same bits as the four taps they replace.
+    if (cc->ne[0] != T + H || cc->ne[1] != C || cc->ne[2] != 1 || !ggml_is_contiguous(cc) || C % 256 != 0) PLE_FAIL;
     if (cgraph->nodes[i + 1]->op != GGML_OP_VIEW || cgraph->nodes[i + 1]->view_src != cc) PLE_FAIL;
     int64_t tail_from = T + H; int first_tap = -1, ntaps = 0; const ggml_tensor * wroot = nullptr; const ggml_tensor * chain = nullptr; int silu = -1;
     const ggml_tensor * tap_out[4] = {nullptr,nullptr,nullptr,nullptr};

@@ -1313,6 +1313,14 @@ struct ggml_cuda_graph {
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
     };
     std::vector<node_properties> node_props;
+    // A hop's copies can ride at the end of this graph. tail_seen: an evaluation of
+    // this key was followed directly by a flush of copies from its context that one tail launch can carry, so the
+    // next capture appends the tail (a copy kernel node and an external event record node); tail_node is that copy
+    // node in the graph the instance was made from, tail_descs / tail_n what it copies now.
+    bool tail_seen = false;
+    cudaGraphNode_t tail_node = nullptr;
+    int tail_n = -1;
+    ggml_cuda_copy_desc tail_descs[48];   // ggml_cuda_copy_batch_max descriptors (checked in ggml-cuda.cu)
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
@@ -1482,6 +1490,26 @@ struct ggml_backend_cuda_context {
     cudaStream_t side_copy_stream = nullptr;
     cudaEvent_t side_copy_ready = nullptr;
     cudaEvent_t side_copy_done = nullptr;
+    // Side-stream copy batches (ggml_backend_cuda_copy_batch_side) the compute stream has not waited for yet, and
+    // whether its work may run beside them (ggml_backend_cuda_set_side_overlap).
+    bool side_batch_pending = false;
+    bool side_overlap = false;
+    // The idle hold (ggml_backend_cuda_hold): its kernel spins until *hold_flag (pinned host memory) reaches the
+    // hold's count. hold_issued counts holds; the next use of the backend stores it.
+    int * hold_flag = nullptr;
+    int hold_issued = 0;
+    bool hold_active = false;
+    long long hold_ticks_per_us = 0;
+    cudaEvent_t hold_event = nullptr;   // recorded before the latest hold
+    bool copy_tail = false;   // hops from this context may join its captured graphs (ggml_backend_cuda_set_copy_tail)
+    // A captured graph whose launch (and, while capturing, whose end of capture)
+    // waits for the next flush of copies from this context, so the copies and the event record join the graph.
+    bool tail_deferred = false;
+    bool tail_capturing = false;
+    ggml_cuda_graph * tail_graph = nullptr;
+    std::vector<cudaGraphExec_t> tail_retired;   // replaced instances, destroyed after the next synchronize
+    const void * tail_clean_key = nullptr;   // the last graph evaluated, while nothing else used the context since
+    cudaEvent_t tail_event = nullptr;
 
     // Memoize q8_1-quantized src1 activations across the
     // quantized matmuls of ONE graph evaluation (Q/K/V/gate/router/shexp all
@@ -1707,6 +1735,16 @@ struct ggml_backend_cuda_context {
     }
 };
 
+// Called at every use of the backend's compute stream: releases an idle hold, and orders the stream after its
+// pending side copy batches unless side overlap is on (ggml-cuda.cu).
+void ggml_cuda_backend_entry(ggml_backend_cuda_context * ctx);
+// The compute stream for work queued on it outside a graph evaluation (a launch, a copy, an event record): it first
+// publishes the peer copies collected so far (HIP), makes the backend's device current and runs
+// ggml_cuda_backend_entry, so the work neither waits behind an idle hold nor joins an open graph capture.
+cudaStream_t ggml_cuda_enter_stream(ggml_backend_cuda_context * ctx);
+// Creates the side copy stream and its two events on first use.
+void ggml_cuda_side_stream_init(ggml_backend_cuda_context * ctx);
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
@@ -1716,6 +1754,10 @@ struct ggml_cuda_mm_fusion_args_host {
     float glu_param1 = 0.0f;
     float gate_value_scale = 1.0f;
     float x_value_scale = 1.0f;
+    // A second product of the same activations in the same launch (ggml_cuda_mmvq_rdna4_twin): its weights and
+    // its output, written as its own MUL_MAT writes it.
+    const ggml_tensor * twin_x = nullptr;
+    ggml_tensor * twin_dst = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1726,4 +1768,8 @@ struct ggml_cuda_mm_fusion_args_device {
     float glu_param1 = 0.0f;
     float gate_value_scale = 1.0f;
     float x_value_scale = 1.0f;
+    const void * twin_x = nullptr;
+    float * twin_dst = nullptr;
+    int twin_nrows = 0;
+    int twin_stride_col_dst = 0;
 };

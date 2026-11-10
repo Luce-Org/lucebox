@@ -1644,7 +1644,7 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     if (raw_gates) {
         GGML_ASSERT(dst->src[9] && dst->src[9]->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_nelements(dst->src[9]) == 2*H);
-        GGML_ASSERT(!kda && !tree_mode && (active_slot_ids_d == nullptr || verify_readonly));
+        GGML_ASSERT(!kda && !tree_mode);   // every kernel below applies them, with or without slot ids
         gate_bias_d = (const float *) dst->src[9]->data;
         gate_A_d    = gate_bias_d + H;
     }

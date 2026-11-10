@@ -81,7 +81,7 @@ profile and the requirements checked at startup.
 | `LUCE_CUDA_MMVQ_FP4_Q5_X4_PLUS1` | 1 for monolithic DS4 `gfx1151` paged serving and opt-in DS4 q=5 verification on `gfx1201`; unset otherwise | Enable dense five-column x4+1 dispatch when `LUCE_CUDA_MMVQ_FP4_X4=1`. Set `0` to restore the generic five-column kernel. |
 | `LUCE_CUDA_MMVQ_MOE_FP3_PACKED24` | 1 for monolithic DS4 `gfx1151` paged serving; unset otherwise | Enable packed 24-bit ROCmFP3 expert dispatch. Set `0` to restore generic expert dispatch. |
 | `LUCE_DS4_TP_BATCH_SPLIT_COPIES` | unset | OPT-IN: establish destination readiness once per DS4 scheduler split while retaining each backend copy's dependency publication. The qualified dual-ROCm launcher enables it. |
-| `GGML_BATCH_PEER_COPIES` | unset | BURN-IN: additionally combine HIP peer-copy dependency publication. `GGML_CUDA_BATCH_PEER_COPIES` remains a compatibility alias. Keep these event-batching variables unset for the exact qualified profile. |
+| `GGML_BATCH_PEER_COPIES` | unset (on for qwen4exp graphs) | BURN-IN: additionally combine HIP peer-copy dependency publication. `GGML_CUDA_BATCH_PEER_COPIES` remains a compatibility alias. Unset, it is on for Qwen3.8-Flash-Next (qwen4exp) graphs and off for the others; `0` turns it off for every model. Keep these event-batching variables unset for the exact qualified profile. |
 | `GGML_SCHED_PROFILE` / `GGML_SCHED_PROFILE_MIN_SPLITS` | unset / 1 | DEBUG: report scheduler splits, copy volume, submission time, and source/destination synchronization time. |
 | `LUCE_DS4_TP_FUSED_CACHE_SLOTS` | 8, 24 with `LUCE_DS4_Q5_VERIFY` | BURN-IN: number of heterogeneous verifier schedulers retained; higher values retain substantially more scratch on both GPUs. |
 | `LUCE_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |
@@ -165,7 +165,7 @@ profile and the requirements checked at startup.
 - `LUCE_DS4_LANE_BATCH` - deepseek4/deepseek4_graph.cpp (=1: the single-token lanes of a tokenwise verify layer attend in one split-KV flash op instead of one op chain per lane; off unless set; set by `--profile ds41-r9700-gorgon` and cluster mode)
 - `LUCE_DS4_SCHED_DEDICATED_COPIES` - deepseek4/deepseek4_fused_verify.inc (=1: the verifier's split inputs own their storage, a few MiB, so the host never waits for a device to drain before queueing the next split; off unless set; set by `--profile ds41-r9700-gorgon` and cluster mode)
 - `LUCE_DS4_HC_BOUNDARY_SPLIT` - ds4-hc.cu (ggml-cuda) (=1: the HC mix runs over several blocks per token while they all fit resident at once, else one block per token; off unless set; set by `--profile ds41-r9700-gorgon` and cluster mode)
-- `GGML_CUDA_PEER_COPY_KERNEL` - ggml-cuda.cu (ggml-cuda) (=1: the peer copies of one handoff leave as one kernel on the producer stream instead of a runtime blit per tensor; off unless set; set by `--profile ds41-r9700-gorgon` and cluster mode)
+- `GGML_CUDA_PEER_COPY_KERNEL` - ggml-cuda.cu (ggml-cuda) (=1: the peer copies of one handoff leave as one kernel on the producer stream instead of a runtime blit per tensor; unset: on for qwen4exp graphs, off for the others; =0: off for every model; set by `--profile ds41-r9700-gorgon` and cluster mode)
 - `LUCE_PREFILL_UBATCH` - qwen35/prefill_helpers.h
 - `LUCE_QWEN35_MASK_FULL_WIDTH` - qwen35/prefill_helpers.h
 - `LUCE_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h

@@ -133,8 +133,7 @@ extern "C" bool ggml_backend_cuda_gdn_chain_commit(
         }
     }
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_cuda_set_device(ctx->device);
-    cudaStream_t stream = ctx->stream();
+    cudaStream_t stream = ggml_cuda_enter_stream(ctx);
     (void) cudaGetLastError();
     for (int first = 0; first < n_layers; first += kMaxLayers) {
         const int n = std::min(kMaxLayers, n_layers - first);

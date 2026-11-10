@@ -84,6 +84,11 @@ struct Qwen4ExpDecodeWorkspace {
     // A retained graph is never split again: the scheduler rewrites sources.
     std::vector<ggml_tensor *> expert_nodes;
     uint64_t split_gen = 0;
+    // Pinned staging for this graph's asynchronous uploads (sized from its previous forward: host_in_need) and
+    // output reads; each transfer through them ends at the forward's wait.
+    ggml_backend_buffer_t host_in = nullptr;
+    size_t host_in_need = 0;
+    ggml_backend_buffer_t host_out = nullptr;
 };
 
 struct Qwen4ExpCache;
@@ -155,6 +160,7 @@ struct Qwen4ExpCache {
     int mtp_prev_pos = -1;
     ggml_tensor * mtp_chain_hidden = nullptr; // draft HC residual, never read back between ranks
     ggml_tensor * mtp_chain_ids = nullptr;    // local subset indices; one readback after the chain
+    ggml_backend_buffer_t mtp_ids_host = nullptr;   // pinned destination of that readback
     int mtp_window = 0;                      // smoke/session-only draft attention window; 0=full
 
     // QSA indexer. indexer_raw holds every token's raw (pre-pool) key, [indexer_head_size, max_ctx] f32;

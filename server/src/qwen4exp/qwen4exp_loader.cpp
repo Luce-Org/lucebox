@@ -380,10 +380,13 @@ void Qwen4ExpDerived::free() {
 }
 
 void free_qwen4exp_derived(Qwen4ExpWeights & w) {
-    for (Qwen4ExpLayer & L : w.layers) L.ssm_gate_ba = nullptr;
+    for (Qwen4ExpLayer & L : w.layers) L.ssm_gate_ba = L.ssm_alpha_beta = nullptr;
     w.qsa_ones = nullptr;
     w.hot_lut.clear();
     w.cold_lut.clear();
+    w.ahead_router.clear();
+    w.ahead_ids.clear();
+    w.output_tail = nullptr;
     w.derived.free();
 }
 
@@ -416,6 +419,37 @@ static void build_qwen4exp_gate_ba(Qwen4ExpWeights & w, ggml_backend_t backend) 
         ggml_backend_tensor_get(L->ssm_a, ba.data() + H, 0, H * sizeof(float));
         ggml_backend_tensor_set(L->ssm_gate_ba, ba.data(), 0, 2 * H * sizeof(float));
     }
+}
+
+// One [n_embd, 2*H_v] view over ssm_alpha and ssm_beta per linear layer, when the weight buffer holds them back to back
+// (GGUF table order, alpha first): decode and verify steps project both with one matmul. Each MMVF row has its own
+// block and a block size set by the column count, so every row is the sum its own product forms. Views only, no
+// memory; a layer whose projections are apart keeps the two matmuls.
+static void build_qwen4exp_alpha_beta(Qwen4ExpWeights & w) {
+#if defined(GGML_USE_HIP)
+    std::vector<Qwen4ExpLayer *> linear;
+    for (Qwen4ExpLayer & L : w.layers) {
+        const ggml_tensor * a = L.ssm_alpha, * b = L.ssm_beta;
+        if (L.is_full_attention || !a || !b || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(a, b) || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || a->ne[2] != 1 ||
+            a->ne[3] != 1 || !a->buffer || a->buffer != b->buffer || a->view_src || b->view_src ||
+            (const char *) b->data != (const char *) a->data + ggml_nbytes(a)) continue;
+        linear.push_back(&L);
+    }
+    if (linear.empty()) return;
+    ggml_context * ctx = w.derived.open(linear.size());
+    if (!ctx) return;
+    for (Qwen4ExpLayer * L : linear) {
+        ggml_tensor * ab = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, L->ssm_alpha->ne[0], 2 * L->ssm_alpha->ne[1]);
+        ggml_format_name(ab, "%s|beta", L->ssm_alpha->name);
+        if (ggml_backend_tensor_alloc(L->ssm_alpha->buffer, ab, L->ssm_alpha->data) == GGML_STATUS_SUCCESS) {
+            L->ssm_alpha_beta = ab;
+        }
+    }
+#else
+    // HIP only: CUDA routes the two 48-row products and the stacked 96-row one to different kernels at 4+ columns.
+    (void) w;
+#endif
 }
 
 // QSA scores weigh every indexer head by 1.0: one ones tensor serves every layer and row count up to 128, instead of
@@ -989,6 +1023,7 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     }
 
     build_qwen4exp_gate_ba(out, backend);
+    build_qwen4exp_alpha_beta(out);
     build_qwen4exp_qsa_ones(out, backend);
 
     // The PLE lookup table is served lazily from whichever shard holds it

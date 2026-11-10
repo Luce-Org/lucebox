@@ -142,6 +142,12 @@ static __global__ void soft_max_f32(
         }
     }
 
+    if (block_size > WARP_SIZE) {
+        // The max reduction above read buf_iw after its barrier; without this one a warp that is ahead writes its
+        // partial sum there while another warp still reads the maxima (upstream #26385). On the R9700 with other
+        // work on the GPU that gave a different router softmax in up to 80% of launches.
+        __syncthreads();
+    }
     // find the sum of exps in the block
     tmp = block_reduce<block_reduce_method::SUM, block_size_template>(tmp, buf_iw);
 
@@ -183,7 +189,9 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
     float     local_vals[n_elem_per_thread] = { -INFINITY, -INFINITY, -INFINITY, -INFINITY };
     float     local_max                     = -INFINITY;
     const int step_size                     = gridDim.x * blockDim.x;
-    __shared__ float shared_vals[32];
+    // Separate max and sum buffers: back-to-back block reductions must not share one (upstream #26385).
+    __shared__ float shared_vals_max[32];
+    __shared__ float shared_vals_sum[32];
 
     // Compute thread-local max
     for (int col = col_start; col < p.ncols;) {
@@ -200,7 +208,7 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
     }
 
     // Compute CTA-level max
-    local_max = block_reduce<block_reduce_method::MAX>(local_max, shared_vals);
+    local_max = block_reduce<block_reduce_method::MAX>(local_max, shared_vals_max);
 
     // Store CTA-level max to GMEM
     if (tid == 0) {
@@ -215,7 +223,7 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
     } else {
         local_max = -INFINITY;
     }
-    local_max = block_reduce<block_reduce_method::MAX>(local_max, shared_vals);
+    local_max = block_reduce<block_reduce_method::MAX>(local_max, shared_vals_max);
 
     // Compute softmax dividends, accumulate divisor
     float tmp_expf = 0.0f;
@@ -238,7 +246,7 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
     }
 
     // Reduce divisor within CTA
-    tmp_expf = block_reduce<block_reduce_method::SUM>(tmp_expf, shared_vals);
+    tmp_expf = block_reduce<block_reduce_method::SUM>(tmp_expf, shared_vals_sum);
 
     // Store CTA-level sum to GMEM
     if (tid == 0) {
@@ -252,7 +260,7 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
     } else {
         tmp_expf = 0.0f;
     }
-    tmp_expf = block_reduce<block_reduce_method::SUM>(tmp_expf, shared_vals);
+    tmp_expf = block_reduce<block_reduce_method::SUM>(tmp_expf, shared_vals_sum);
 
     // Divide dividend by global sum + store data
     for (int col = col_start; col < p.ncols;) {

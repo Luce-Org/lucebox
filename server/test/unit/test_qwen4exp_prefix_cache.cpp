@@ -31,6 +31,8 @@ static void rollback_reset() {
     Queue pending;
     ggml_backend delayed{};
     delayed.context = &pending;
+    static ggml_guid queued_guid = {};   // not the CUDA backend: the rollback queues its copies here
+    delayed.guid = &queued_guid;
     delayed.iface.cpy_tensor_async = [](ggml_backend_t, ggml_backend_t dst, const ggml_tensor * a, ggml_tensor * b) {
         static_cast<Queue *>(dst->context)->emplace_back(a, b);
         return true;

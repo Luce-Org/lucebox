@@ -85,16 +85,22 @@ static const Ds4MixedMoePolicy & ds4_mixed_moe_policy() {
 }
 
 template <typename T>
-static void ds4_fv_set_repeated_rows(
-        ggml_tensor * tensor,
-        const std::vector<T> & row) {
-    if (!tensor || row.empty()) return;
+static std::vector<T> ds4_repeat_rows(const ggml_tensor * tensor, const std::vector<T> & row) {
     const size_t elements = (size_t) ggml_nelements(tensor);
-    GGML_ASSERT(elements % row.size() == 0);
+    GGML_ASSERT(!row.empty() && elements % row.size() == 0);
     std::vector<T> repeated(elements);
     for (size_t offset = 0; offset < elements; offset += row.size()) {
         std::copy(row.begin(), row.end(), repeated.begin() + offset);
     }
+    return repeated;
+}
+
+template <typename T>
+static void ds4_fv_set_repeated_rows(
+        ggml_tensor * tensor,
+        const std::vector<T> & row) {
+    if (!tensor || row.empty()) return;
+    const std::vector<T> repeated = ds4_repeat_rows(tensor, row);
     ds4_fv_set(tensor, repeated.data(), repeated.size() * sizeof(T));
 }
 static bool ds4_fused_verify_enabled() {
@@ -189,8 +195,33 @@ static void ds4_fused_verify_refresh_hybrid_luts(
         const DeepSeek4Weights & w,
         MoeHybridStorage * hybrid,
         DeepSeek4FusedDecodeGraph & fg,
-        bool force_masked_routes = false) {
+        bool force_masked_routes = false,
+        PinnedStage * stage = nullptr) {
     if (!hybrid) return;
+    // With a pinned stage the LUTs (four per MoE layer, on both devices) go
+    // out as asynchronous copies and one wait per device instead of one
+    // blocking copy each.
+    if (!fg.sched) stage = nullptr;
+    if (stage) {
+        size_t bytes = 0;
+        for (const MoeHybridGraphInputs & inputs : fg.hybrid_inputs) {
+            for (const ggml_tensor * t : {inputs.hot_local_lut, inputs.hot_valid_lut,
+                                          inputs.cold_local_lut, inputs.cold_valid_lut}) {
+                if (t) bytes += ggml_nbytes(t) + 64;
+            }
+        }
+        if (stage->reserve(ggml_backend_sched_get_backend(fg.sched, 0), bytes)) stage->reset();
+        else stage = nullptr;
+    }
+    const auto set_lut = [&](ggml_tensor * tensor, const auto & row) {
+        ggml_backend_t owner = stage && tensor ? ggml_backend_sched_get_tensor_backend(fg.sched, tensor) : nullptr;
+        if (!owner) {
+            ds4_fv_set_repeated_rows(tensor, row);
+            return;
+        }
+        const auto repeated = ds4_repeat_rows(tensor, row);
+        stage->set(owner, tensor, repeated.data(), 0, repeated.size() * sizeof(repeated[0]));
+    };
     // A route this owner does not hold is either sent to local slot 0 and
     // multiplied by a zero weight (correct, but it pays the full expert
     // matmul) or given id -1, which the MMVQ kernels retire early with an
@@ -234,10 +265,13 @@ static void ds4_fused_verify_refresh_hybrid_luts(
                     : (hot < 0 ? 1.0f : 0.0f);
             }
         }
-        ds4_fv_set_repeated_rows(inputs.hot_local_lut, hot_lut);
-        ds4_fv_set_repeated_rows(inputs.hot_valid_lut, hot_valid);
-        ds4_fv_set_repeated_rows(inputs.cold_local_lut, cold_lut);
-        ds4_fv_set_repeated_rows(inputs.cold_valid_lut, cold_valid);
+        set_lut(inputs.hot_local_lut, hot_lut);
+        set_lut(inputs.hot_valid_lut, hot_valid);
+        set_lut(inputs.cold_local_lut, cold_lut);
+        set_lut(inputs.cold_valid_lut, cold_valid);
+    }
+    for (int i = 0; stage && i < ggml_backend_sched_get_n_backends(fg.sched); ++i) {
+        ggml_backend_synchronize(ggml_backend_sched_get_backend(fg.sched, i));
     }
 }
 
@@ -440,6 +474,40 @@ static ggml_tensor * ds4_fused_weights_for_selected(
     return weights;
 }
 
+// Split verify: in every MoE layer the target waits for the expert device's cold-expert sum once its hot and shared
+// experts are done. In that wait it reads the weights the next layer starts with (Q down, Q up, KV, the compressor and
+// indexer projections, then the output projections; the output head after the last layer), up to
+// kDs4SplitPrefetchBytes, so its last-level cache holds them when that layer starts (the R9700's Infinity Cache is
+// 64 MB). Only the target's own device weights: one elsewhere would be read across the link. Measured on an R9700 +
+// Ryzen AI Max+ PRO 495 (ds41-r9700-gorgon, same text): a decode step 2.1% shorter on a short prompt, 3.1% at 2K and
+// 1.7% at 26K tokens than without the read; 40 MiB gains less and 72 MiB, past the cache, loses.
+static constexpr size_t kDs4SplitPrefetchBytes = (size_t) 56 << 20;
+
+// Split verify: an Engram projection (engram_wkv, F16 [6144 -> 25600], about 0.5 ms on the R9700) runs in the MoE
+// waits of the layers before its Engram layer, this many rows (about 50 us) in each, ahead of the next-layer read.
+// Measured over 256 tokens, same text: 2560 rows 5.05 s on a short prompt and 5.75 s at 2K, no chunks 5.14 / 5.93 s,
+// 5120 rows 5.33 / 6.07 s (a chunk longer than the wait delays the layer).
+static constexpr int64_t kDs4SplitEngramChunkRows = 2560;
+
+static std::vector<ggml_tensor *> ds4_split_prefetch_weights(const DeepSeek4Weights & w, int il,
+                                                             ggml_backend_t target) {
+    std::vector<ggml_tensor *> next;
+    if (il + 1 < w.n_layer) {
+        const DeepSeek4Layer & N = w.layers[(size_t) il + 1];
+        next = {N.attn_q_a, N.attn_q_b, N.attn_kv, N.attn_compressor_kv, N.attn_compressor_gate,
+                N.indexer_attn_q_b, N.indexer_proj, N.attn_output_a, N.attn_output_b};
+    } else {
+        next = {w.output};
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(target);
+    std::vector<ggml_tensor *> own;
+    for (ggml_tensor * t : next) {
+        if (t && t->buffer && !ggml_backend_buffer_is_host(t->buffer) &&
+            ggml_backend_buffer_get_type(t->buffer) == buft && ggml_is_contiguous(t)) own.push_back(t);
+    }
+    return own;
+}
+
 static bool ds4_build_fused_verify_graph(
         DeepSeek4FusedDecodeCache & mc,          // fn mirrors (shared with AR fused)
         DeepSeek4FusedDecodeGraph & fg,
@@ -461,7 +529,13 @@ static bool ds4_build_fused_verify_graph(
         std::vector<int64_t> && shape_key,
         DeepSeek4PagedCache * paged_cache = nullptr,
         const std::vector<std::vector<DeepSeek4GatheredLaneRows>> * paged_rows = nullptr,
-        bool paged_history_buckets = false) {
+        bool paged_history_buckets = false,
+        // Split verify on one box: the Engram reader whose in-graph node
+        // uploads the keys (Ds4EngramAsync::upload_node).
+        Ds4EngramAsync * engram_upload = nullptr,
+        // Pinned staging for the expert LUT uploads; nullptr copies them one
+        // blocking set at a time.
+        PinnedStage * lut_stage = nullptr) {
     const bool report_build_timing =
         ds4_env_flag("LUCE_DS4_VERIFY_BUILD_TIMING");
     const auto build_t0 = Ds4TimingClock::now();
@@ -582,10 +656,21 @@ static bool ds4_build_fused_verify_graph(
     }
     // Engram tables live on rank 0; its decoded rows reach the other ranks.
     ggml_tensor * engram_keys_all = ex.engram_keys;
+    // Split verify nodes the scheduler keeps on the target: the keys upload and
+    // the Engram projection chunks.
+    std::vector<ggml_tensor *> target_nodes;
     if (cluster_hybrid && engram_keys_all) {
         engram_keys_all = ds4_cluster_broadcast_node(ctx, ex.engram_keys, *cluster_rt);
         if (!engram_keys_all) return false;
         cluster_nodes.push_back(engram_keys_all);
+    } else if (hybrid && engram_upload && engram_keys_all) {
+        // One box: the keys arrive through a node the graph meets right ahead
+        // of layer 1's Engram, its first consumer, so the table read overlaps
+        // the input fill, the launch and layer 0.
+        engram_keys_all = ggml_cluster_allreduce_inplace(ctx, ex.engram_keys, &Ds4EngramAsync::upload_node,
+                                                         engram_upload);
+        target_nodes.push_back(engram_keys_all);
+        ex.engram_upload = true;
     }
     ex.q = q;
     ex.pos_q = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);  ggml_set_input(ex.pos_q);
@@ -726,35 +811,50 @@ static bool ds4_build_fused_verify_graph(
     Ds4LaneBatchSelections lane_batch_selections;
     ggml_tensor * lane_batch_carrier = nullptr;
 
-    // LUCE_DS4_ENGRAM_PRECOMPUTE=<rows> (hybrid exchange): an Engram layer's
-    // projection engram_wkv @ keys depends only on the step's tokens, so it is
-    // computed in row chunks of that many rows, one after each of the
-    // preceding layers' FFN exports, where the dGPU waits for the iGPU's sum;
-    // the Engram layer computes whatever rows remain and joins them. Each row
-    // is the same MMVF product as in the whole projection.
+    // An Engram layer's projection engram_wkv @ keys depends only on the
+    // step's tokens, so it is computed ahead in row chunks, one in each of the
+    // preceding layers where the dGPU waits for the iGPU's sum; the Engram
+    // layer computes whatever rows remain and joins them. Each row is the same
+    // MMVF product as in the whole projection, so the joined rows keep its
+    // bits. Split verify: kDs4SplitEngramChunkRows rows in each MoE layer's
+    // wait, ahead of the next-layer read. Hybrid exchange:
+    // LUCE_DS4_ENGRAM_PRECOMPUTE=<rows>, after each layer's FFN export.
     static const int engram_chunk_rows = [] {
         const char * v = std::getenv("LUCE_DS4_ENGRAM_PRECOMPUTE");
         return v && *v ? std::max(0, std::atoi(v)) : 0;
     }();
-    std::vector<std::vector<ggml_tensor *>> engram_kv_parts(engram ? (size_t) engram->n_layers() : 0u);
-    std::vector<int64_t> engram_kv_done(engram_kv_parts.size(), 0);
-    // The chunk (Engram layer index, first row) queued after layer il's export.
-    auto engram_chunk_for = [&](int il, int & e_out, int64_t & r0_out) -> bool {
-        if (!engram || engram_chunk_rows <= 0 || !engram_keys_all) return false;
+    // Per Engram layer: the rows computed ahead so far, joined in order.
+    std::vector<ggml_tensor *> engram_kv_pre(engram ? (size_t) engram->n_layers() : 0u, nullptr);
+    std::vector<int64_t> engram_kv_done(engram_kv_pre.size(), 0);
+    // The chunk of `chunk_rows` rows due in layer il, or nullptr. Appends it to
+    // its Engram layer's rows (`joined`: the rows so far, this chunk included).
+    auto engram_chunk = [&](int il, int64_t chunk_rows, ggml_tensor ** joined) -> ggml_tensor * {
+        if (!engram || chunk_rows <= 0 || !engram_keys_all) return nullptr;
         for (int e = 0; e < engram->n_layers(); ++e) {
             const int il_e = engram->layer_id(e);
-            const int64_t rows = w.layers[(size_t) il_e].engram_wkv
-                ? w.layers[(size_t) il_e].engram_wkv->ne[1] : 0;
-            const int n_chunks = (int) ((rows + engram_chunk_rows - 1) / engram_chunk_rows);
+            const DeepSeek4Layer & Le = w.layers[(size_t) il_e];
+            const int64_t rows = Le.engram_wkv ? Le.engram_wkv->ne[1] : 0;
+            const int n_chunks = (int) ((rows + chunk_rows - 1) / chunk_rows);
             // Chunks fill the layers just before il_e, the last chunk last.
             const int first = std::max(0, il_e - n_chunks);
             if (il < first || il >= il_e) continue;
-            const int64_t r0 = (int64_t) (il - (il_e - n_chunks)) * engram_chunk_rows;
+            const int64_t r0 = (int64_t) (il - (il_e - n_chunks)) * chunk_rows;
             if (r0 < 0 || r0 >= rows || r0 != engram_kv_done[(size_t) e]) continue;
-            e_out = e; r0_out = r0;
-            return true;
+            const int64_t n = std::min<int64_t>(chunk_rows, rows - r0);
+            ggml_tensor * keys_e = ggml_view_2d(ctx, engram_keys_all, engram_keys_all->ne[0], q,
+                                                engram_keys_all->nb[1], (size_t) e * engram_keys_all->nb[2]);
+            ggml_tensor * part = ggml_mul_mat(ctx,
+                ggml_view_2d(ctx, Le.engram_wkv, Le.engram_wkv->ne[0], n,
+                             Le.engram_wkv->nb[1], (size_t) r0 * Le.engram_wkv->nb[1]),
+                keys_e);
+            ggml_mul_mat_set_prec(part, GGML_PREC_F32);
+            ggml_tensor *& pre = engram_kv_pre[(size_t) e];
+            pre = pre ? ggml_concat(ctx, pre, part, 0) : part;
+            engram_kv_done[(size_t) e] = r0 + n;
+            if (joined) *joined = pre;
+            return part;
         }
-        return false;
+        return nullptr;
     };
 
     for (int il = 0; il < w.n_layer; ++il) {
@@ -776,13 +876,10 @@ static bool ds4_build_fused_verify_graph(
             ggml_tensor * keys = ggml_view_2d(ctx, engram_keys_all, engram_keys_all->ne[0], q,
                                               engram_keys_all->nb[1], (size_t) e * engram_keys_all->nb[2]);
             ggml_tensor * h3 = ggml_reshape_3d(ctx, ggml_cont(ctx, hc_cur), n_embd, n_hc, q);
-            ggml_tensor * kv_pre = nullptr;
-            if (!engram_kv_parts[(size_t) e].empty()) {
+            ggml_tensor * kv_pre = engram_kv_pre[(size_t) e];
+            if (kv_pre) {
                 const int64_t rows = L.engram_wkv->ne[1];
                 const int64_t done = engram_kv_done[(size_t) e];
-                for (ggml_tensor * part : engram_kv_parts[(size_t) e]) {
-                    kv_pre = kv_pre ? ggml_concat(ctx, kv_pre, part, 0) : part;
-                }
                 if (done < rows) {
                     ggml_tensor * rest = ggml_mul_mat(ctx,
                         ggml_view_2d(ctx, L.engram_wkv, L.engram_wkv->ne[0], rows - done,
@@ -1507,6 +1604,21 @@ static bool ds4_build_fused_verify_graph(
                 streamed = &streamed_owner;
             }
             inputs.router_nodes = router_nodes;
+            inputs.prefetch_next.clear();
+            inputs.prefetch_bytes = 0;
+            inputs.wait_work.clear();
+            if (same_gpu_runtime && !cluster_hybrid && !streamed) {
+                inputs.prefetch_next = ds4_split_prefetch_weights(w, il, backend);
+                inputs.prefetch_bytes = kDs4SplitPrefetchBytes;
+                // The next rows of an upcoming Engram projection, joined to
+                // the rows before them, in the same wait.
+                ggml_tensor * joined = nullptr;
+                if (ggml_tensor * part = engram_chunk(il, kDs4SplitEngramChunkRows, &joined)) {
+                    inputs.wait_work.push_back(joined);
+                    target_nodes.push_back(part);
+                    target_nodes.push_back(joined);
+                }
+            }
             const MoeHybridLayerStorage & hybrid_layer =
                 hybrid->layers[(size_t) il];
             const bool has_hot_routed =
@@ -1558,6 +1670,7 @@ static bool ds4_build_fused_verify_graph(
                 }
                 ffn_out = inputs.output;
 
+                inputs.prefetch_bytes = 0;   // the head's join already read them
                 hybrid_cfg.n_expert_used = 2;
                 if (!build_moe_hybrid_ffn_graph(
                         ctx,
@@ -1650,23 +1763,9 @@ static bool ds4_build_fused_verify_graph(
                     hyb_ex_inputs->cold_nodes.push_back(combine);
                     // An upcoming Engram layer's projection chunk, in the wait
                     // for the iGPU's sum (ahead of the import in the stream).
-                    int engram_e = -1;
-                    int64_t engram_r0 = 0;
-                    if (engram_chunk_for(il, engram_e, engram_r0)) {
-                        const DeepSeek4Layer & Le = w.layers[(size_t) engram->layer_id(engram_e)];
-                        const int64_t rows = std::min<int64_t>(engram_chunk_rows, Le.engram_wkv->ne[1] - engram_r0);
-                        ggml_tensor * keys_e = ggml_view_2d(ctx, engram_keys_all, engram_keys_all->ne[0], q,
-                                                            engram_keys_all->nb[1],
-                                                            (size_t) engram_e * engram_keys_all->nb[2]);
-                        ggml_tensor * part = ggml_mul_mat(ctx,
-                            ggml_view_2d(ctx, Le.engram_wkv, Le.engram_wkv->ne[0], rows,
-                                         Le.engram_wkv->nb[1], (size_t) engram_r0 * Le.engram_wkv->nb[1]),
-                            keys_e);
-                        ggml_mul_mat_set_prec(part, GGML_PREC_F32);
+                    if (ggml_tensor * part = engram_chunk(il, engram_chunk_rows, nullptr)) {
                         ggml_build_forward_expand(gf, part);
                         cluster_nodes.push_back(part);
-                        engram_kv_parts[(size_t) engram_e].push_back(part);
-                        engram_kv_done[(size_t) engram_e] = engram_r0 + rows;
                     }
                     cluster_nodes.push_back(sum);
                     ffn_out = sum;
@@ -1849,8 +1948,12 @@ static bool ds4_build_fused_verify_graph(
         }
         if (reuse_sched) {
             // Drop prior tensor assignments and deferred events while keeping
-            // the scheduler-owned pinned staging allocations alive.
+            // the scheduler-owned pinned staging allocations alive. The new key
+            // may give the old graph's node and leaf counts with another
+            // topology (which layers flush a compressed row), so the
+            // allocation is planned afresh instead of reused by node index.
             ggml_backend_sched_reset(fg.sched);
+            ggml_backend_sched_replan(fg.sched);
         } else {
             ggml_backend_t backends[3] = {
                 backend, peer, hybrid->cpu_backend};
@@ -1904,6 +2007,7 @@ static bool ds4_build_fused_verify_graph(
         // The communicator lives on the primary GPU (ROCm 7.2.4's RCCL has
         // no gfx1151 kernels): every collective node runs on its stream.
         for (ggml_tensor * node : cluster_nodes) pin_main(node);
+        for (ggml_tensor * node : target_nodes) pin_main(node);
         pin_main(fg.inp_embed);
         pin_main(ex.engram_keys);
         pin_main(ex.pos_q);
@@ -2024,11 +2128,16 @@ static bool ds4_build_fused_verify_graph(
         }
 
         ds4_fused_verify_refresh_hybrid_luts(w, hybrid, fg,
-                                             /*force_masked_routes=*/cluster_hybrid);
+                                             /*force_masked_routes=*/cluster_hybrid, lut_stage);
     } else {
         if (!fg.sg.alloc) {
             fg.sg.alloc = ggml_gallocr_new(
                 ggml_backend_get_default_buffer_type(backend));
+        } else if (!ggml_gallocr_reserve(fg.sg.alloc, fg.sg.gf)) {
+            // A kept allocator plans the new graph afresh (as the scheduler
+            // above), keeping its buffers when they are large enough.
+            std::fprintf(stderr, "[ds4-fused-verify] graph alloc failed\n");
+            return false;
         }
         if (!fg.sg.alloc || !ggml_gallocr_alloc_graph(fg.sg.alloc, fg.sg.gf)) {
             std::fprintf(stderr, "[ds4-fused-verify] graph alloc failed\n");
@@ -2191,13 +2300,21 @@ static int ds4_try_fused_verify_step(
     key.push_back(vocab_split ? 1 : 0);
     const int n_lanes = ds4_fused_attention_lanes(w, q);
     const int attn_lane_q = q / n_lanes;
+    // Per layer: the fewest padded compressed rows a lane of this shape spans, and the fewest any later verify of
+    // this generation can span. Later verifies start at kv_start or after it and a lane spans at least the rows
+    // complete through its first token (the committed row count may move back on a rollback, the position never
+    // does), so a slot built with fewer rows than that in some layer is never hit again.
+    std::vector<int> key_min_padded((size_t) w.n_layer, 0);
+    std::vector<int> live_min_padded((size_t) w.n_layer, 0);
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) w.compress_ratios[il];
         DeepSeek4LayerCache & lc = ds4_comp_cache(cache, w, il);
+        int lane_min = std::numeric_limits<int>::max();
         for (int lane = 0; lane < n_lanes; ++lane) {
             const int lane_kv_start = kv_start + lane * attn_lane_q;
             const int padded = ds4_fused_lane_padded(
                 w, lc, il, lane_kv_start + attn_lane_q - 1);
+            lane_min = std::min(lane_min, padded);
             int b_idx = -1;
             if (ratio > 0) {
                 for (int t = 0; t < attn_lane_q; ++t) {
@@ -2206,6 +2323,11 @@ static int ds4_try_fused_verify_step(
             }
             key.push_back(
                 ((int64_t) padded << 4) | (int64_t) (b_idx + 1));
+        }
+        key_min_padded[(size_t) il] = lane_min;
+        if (ratio > 0 && lc.comp_kv) {
+            const int cap = (int) lc.comp_kv->ne[1];
+            live_min_padded[(size_t) il] = ds4_padded_comp_rows(std::min((kv_start + 1) / ratio, cap), cap);
         }
     }
 
@@ -2224,6 +2346,15 @@ static int ds4_try_fused_verify_step(
                      capture_cache ? "capture" : "verify", slot_limit);
         reported_slot_limit = true;
     }
+    // A split verify on one box uploads the Engram keys from an in-graph node
+    // (Ds4EngramAsync::upload_node); the cluster sends them with its broadcast.
+    Ds4ClusterRuntime * engram_rt = hybrid && cache.cluster_rt && cache.cluster_rt->size() > 1
+        ? cache.cluster_rt : nullptr;
+    Ds4EngramAsync * engram_upload = nullptr;
+    if (hybrid && !engram_rt && w.engram_runtime) {
+        if (!vc.engram_async) vc.engram_async = std::make_unique<Ds4EngramAsync>();
+        engram_upload = vc.engram_async.get();
+    }
     DeepSeek4FusedDecodeGraph * fg = nullptr;
     Ds4FusedVerifyCache::Extra * ex = nullptr;
     for (size_t i = 0; i < slot_limit; ++i) {
@@ -2233,19 +2364,36 @@ static int ds4_try_fused_verify_step(
     }
     if (!fg) {
         ds4_fused_cache_make_room(vc, slot_limit, backend);
-        size_t pick = 0;
+        // A slot built for an earlier stretch of the context goes first: a never-built slot creates its scheduler,
+        // pinned staging, allocator buffers and metadata arena from scratch, which a rebuild over a used slot keeps.
+        const auto outlived = [&](size_t i) {
+            const std::vector<int> & built_min = vc.extra[i].min_padded;
+            if (built_min.size() != live_min_padded.size()) return false;
+            for (size_t il = 0; il < built_min.size(); ++il) {
+                if (built_min[il] < live_min_padded[il]) return true;
+            }
+            return false;
+        };
+        size_t pick = slot_limit;
         for (size_t i = 0; i < slot_limit; ++i) {
-            if (!vc.slots[i].built()) { pick = i; break; }
-            if (vc.slots[i].last_use < vc.slots[pick].last_use) pick = i;
+            if (vc.slots[i].built() && outlived(i) &&
+                (pick == slot_limit || vc.slots[i].last_use < vc.slots[pick].last_use)) {
+                pick = i;
+            }
+        }
+        if (pick == slot_limit) {
+            pick = 0;
+            for (size_t i = 0; i < slot_limit; ++i) {
+                if (!vc.slots[i].built()) { pick = i; break; }
+                if (vc.slots[i].last_use < vc.slots[pick].last_use) pick = i;
+            }
         }
         fg = &vc.slots[pick]; ex = &vc.extra[pick];
 
-        // A cache miss may select an occupied LRU slot.  Tear the previous
-        // graph down before rebuilding it: its scheduler owns backend scratch
-        // buffers and HIP graph replay state still refers to those addresses.
-        // Reinitializing the ggml context over the same metadata arena while
-        // that state is live can replay kernels against stale allocations.
-        fg->destroy(vc.backend, vc.peer_backend);
+        // The previous graph's native executables are retired first (their keys point into the metadata arena, and
+        // the scheduler's buffers may move); the scheduler and the arena stay for the rebuild, as in the paged
+        // verifier's cache.
+        fg->release_for_rebuild(vc.backend, vc.peer_backend);
         ex->reset();
 
         const auto build_t0 = Ds4TimingClock::now();
@@ -2253,12 +2401,14 @@ static int ds4_try_fused_verify_step(
                                           hc_weights, hc_out_weights, hash_tables,
                                           kv_start, q, token_ids != nullptr,
                                           *hooks->capture_layer_ids, hybrid, vocab_split,
-                                          std::move(key))) {
+                                          std::move(key), nullptr, nullptr, false, engram_upload,
+                                          &vc.stage)) {
             fg->destroy(vc.backend, vc.peer_backend);
             ex->reset();
             vc.disabled = true;
             return 0;
         }
+        ex->min_padded = std::move(key_min_padded);
         if (telemetry) telemetry->full_graph_build_us += ds4_elapsed_us(build_t0, Ds4TimingClock::now());
     }
     fg->last_use = vc.counter;
@@ -2270,15 +2420,19 @@ static int ds4_try_fused_verify_step(
     const bool pinned_io =
         vc.stage.reserve(backend, ds4_fused_stage_bytes(w, *fg, *ex, q, hooks));
     vc.stage.reset();
+    // Pinned step inputs are asynchronous copies; the one wait below covers
+    // them all.
+    const auto set_input = [&](ggml_tensor * t, const void * data, size_t bytes) {
+        if (pinned_io) vc.stage.set(backend, t, data, 0, bytes);
+        else ds4_fv_set(t, data, bytes);
+    };
     // The async read needs a place in the stream right before its consumer:
-    // the cluster's Engram broadcast callback (after layer 0's attention),
-    // which the graph has only when it was built for the hybrid cluster path.
-    Ds4ClusterRuntime * engram_rt = hybrid && cache.cluster_rt && cache.cluster_rt->size() > 1
-        ? cache.cluster_rt : nullptr;
+    // the cluster's Engram broadcast callback (after layer 0's attention) or
+    // the split verify's upload node (ahead of layer 1's Engram).
     bool engram_async = false;
     if (ex->engram_keys) {
         const DeepSeek4EngramRuntime * engram = w.engram_runtime.get();
-        if (pinned_io && engram_rt && engram && token_ids && ex->engram_keys->buffer) {
+        if (pinned_io && (engram_rt || ex->engram_upload) && engram && token_ids && ex->engram_keys->buffer) {
             if (!vc.engram_async) vc.engram_async = std::make_unique<Ds4EngramAsync>();
             engram_async = vc.engram_async->start(
                 backend, w, cache.engram_tokens, token_ids, kv_start, q,
@@ -2289,7 +2443,7 @@ static int ds4_try_fused_verify_step(
             if (!ds4_engram_read_keys(w, cache.engram_tokens, token_ids, kv_start, q, keys, telemetry)) {
                 return -1;
             }
-            ds4_fv_set(ex->engram_keys, keys.data(), sizeof(float) * keys.size());
+            set_input(ex->engram_keys, keys.data(), sizeof(float) * keys.size());
         }
     }
     // A started read must be waited for on every exit, or the worker could
@@ -2309,28 +2463,28 @@ static int ds4_try_fused_verify_step(
         ~EngramJoin() { finish(); }
     } engram_join{engram_async ? vc.engram_async.get() : nullptr, telemetry};
     const auto set_t0 = Ds4TimingClock::now();
-    ds4_fv_set(fg->inp_embed, embed, sizeof(float) * (size_t) w.n_embd * q);
+    set_input(fg->inp_embed, embed, sizeof(float) * (size_t) w.n_embd * q);
     std::vector<int32_t> iv(q);
     std::vector<int64_t> lv(q);
     for (int i = 0; i < q; ++i) iv[(size_t) i] = kv_start + i;
-    ds4_fv_set(ex->pos_q, iv.data(), sizeof(int32_t) * q);
+    set_input(ex->pos_q, iv.data(), sizeof(int32_t) * q);
     for (int i = 0; i < q; ++i) iv[(size_t) i] = -(kv_start + i);
-    ds4_fv_set(ex->neg_q, iv.data(), sizeof(int32_t) * q);
+    set_input(ex->neg_q, iv.data(), sizeof(int32_t) * q);
     for (int i = 0; i < q; ++i) lv[(size_t) i] = (kv_start + i) % w.n_swa;
-    ds4_fv_set(ex->rawrows, lv.data(), sizeof(int64_t) * q);
+    set_input(ex->rawrows, lv.data(), sizeof(int64_t) * q);
     for (int i = 0; i < q; ++i) iv[(size_t) i] = (int32_t) lv[(size_t) i];
-    ds4_fv_set(ex->saved_rawrows, iv.data(), sizeof(int32_t) * q);
+    set_input(ex->saved_rawrows, iv.data(), sizeof(int32_t) * q);
     if (ex->pos_rows && ex->pos_rows->buffer) {
         for (int i = 0; i < q; ++i) lv[(size_t) i] = kv_start + i;
-        ds4_fv_set(ex->pos_rows, lv.data(), sizeof(int64_t) * q);
+        set_input(ex->pos_rows, lv.data(), sizeof(int64_t) * q);
     }
     for (const auto & rows : ex->ratio_rows) {
         for (int i = 0; i < q; ++i) iv[(size_t) i] = (kv_start + i) % rows.ratio;
-        ds4_fv_set(rows.ape, iv.data(), sizeof(int32_t) * q);
+        set_input(rows.ape, iv.data(), sizeof(int32_t) * q);
         for (int i = 0; i < q; ++i) {
             lv[(size_t) i] = ds4_compressor_state_row(rows.ratio, kv_start + i);
         }
-        ds4_fv_set(rows.state, lv.data(), sizeof(int64_t) * q);
+        set_input(rows.state, lv.data(), sizeof(int64_t) * q);
     }
 
     std::vector<int32_t> i32v((size_t) w.n_layer * n_lanes * 2, 0);
@@ -2359,16 +2513,16 @@ static int ds4_try_fused_verify_step(
             }
         }
     }
-    ds4_fv_set(fg->i32_bundle, i32v.data(), sizeof(int32_t) * i32v.size());
+    set_input(fg->i32_bundle, i32v.data(), sizeof(int32_t) * i32v.size());
     if (fg->identity_rows) {
         static thread_local std::vector<int32_t> identity;
         if (identity.size() != (size_t) fg->identity_rows->ne[0]) {
             identity.resize((size_t) fg->identity_rows->ne[0]);
             for (size_t i = 0; i < identity.size(); ++i) identity[i] = (int32_t) i;
         }
-        ds4_fv_set(fg->identity_rows, identity.data(), sizeof(int32_t) * identity.size());
+        set_input(fg->identity_rows, identity.data(), sizeof(int32_t) * identity.size());
     }
-    ds4_fv_set(fg->i64_bundle, i64v.data(), sizeof(int64_t) * i64v.size());
+    set_input(fg->i64_bundle, i64v.data(), sizeof(int64_t) * i64v.size());
 
     // Causal mask values.  At long context this tensor is multi-megabyte,
     // while only the ring slots overwritten by this q-wide batch and the
@@ -2464,7 +2618,7 @@ static int ds4_try_fused_verify_step(
                 std::fill(maskv.begin() + range.first,
                           maskv.begin() + range.second, -1.0e30f);
             }
-            ds4_fv_set(fg->mask_bundle, maskv.data(),
+            set_input(fg->mask_bundle, maskv.data(),
                        sizeof(float) * maskv.size());
         } else {
             if (maskv.size() != mask_count) maskv.resize(mask_count);
@@ -2501,7 +2655,7 @@ static int ds4_try_fused_verify_step(
                             row,
                             (size_t) n_used * sizeof(int32_t));
             }
-            ds4_fv_set(hids, hash_scratch.data(), sizeof(int32_t) * (size_t) n_used * q);
+            set_input(hids, hash_scratch.data(), sizeof(int32_t) * (size_t) n_used * q);
         }
     }
     // One wait for every pinned upload: the scheduler copies some inputs to
@@ -2517,7 +2671,9 @@ static int ds4_try_fused_verify_step(
         Ds4ClusterRuntime * rt;
         ~BroadcastHook() { if (rt) rt->before_broadcast = nullptr; }
     } broadcast_hook{nullptr};
-    if (engram_async) {
+    // One box: the graph's upload node queues the upload behind the word.
+    if (engram_async && ex->engram_upload) vc.engram_async->arm_upload();
+    if (engram_async && engram_rt) {
         Ds4EngramAsync * reader = vc.engram_async.get();
         const int rank = engram_rt->rank();
         const size_t key_bytes = ggml_nbytes(ex->engram_keys);
@@ -2567,7 +2723,13 @@ static int ds4_try_fused_verify_step(
         broadcast_hook.rt->before_broadcast = nullptr;
         broadcast_hook.rt = nullptr;
     }
+    const bool engram_upload_failed =
+        engram_async && ex->engram_upload && vc.engram_async->take_upload_failure();
     if (!engram_join.finish()) return -1;
+    if (engram_upload_failed) {
+        std::fprintf(stderr, "[ds4-fused-verify] in-graph engram upload failed\n");
+        return -1;
+    }
     if (compute_status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[ds4-fused-verify] compute failed\n");
         return -1;

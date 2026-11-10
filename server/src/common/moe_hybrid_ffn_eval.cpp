@@ -1151,6 +1151,23 @@ ggml_tensor * build_moe_routed_experts(
     return stack.output;
 }
 
+// The main owner's read of the weights it needs next (MoeHybridGraphInputs::prefetch_next), queued after `after`
+// (its last expert node) so it runs while the main owner waits for the secondary owner's sum.
+static void build_moe_main_owner_prefetch(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * after,
+                                          const MoeHybridGraphInputs & out) {
+    if (!gf || !after || out.prefetch_bytes == 0) return;
+    ggml_tensor * srcs[GGML_MAX_SRC - 1];
+    int n = 0;
+    size_t bytes = 0;
+    for (ggml_tensor * t : out.prefetch_next) {
+        if (n == GGML_MAX_SRC - 1 || bytes >= out.prefetch_bytes) break;
+        if (!t || !ggml_is_contiguous(t)) continue;
+        srcs[n++] = t;
+        bytes += ggml_nbytes(t);
+    }
+    if (n > 0) ggml_build_forward_expand(gf, ggml_moe_fused_prefetch(ctx, after, srcs, n, out.prefetch_bytes));
+}
+
 static ggml_tensor * build_moe_owner_join(
         ggml_context * ctx,
         ggml_cgraph * schedule_graph,
@@ -1231,6 +1248,8 @@ static ggml_tensor * build_moe_owner_join(
         ggml_build_forward_expand(schedule_graph, secondary);
         if (primary) {
             ggml_build_forward_expand(schedule_graph, primary);
+            for (ggml_tensor * t : out.wait_work) ggml_build_forward_expand(schedule_graph, t);
+            build_moe_main_owner_prefetch(ctx, schedule_graph, primary, out);
         }
         if (out.external_join && primary) {
             out.main_output = primary;

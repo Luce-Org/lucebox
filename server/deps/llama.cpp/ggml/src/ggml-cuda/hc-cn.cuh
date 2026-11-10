@@ -5,6 +5,7 @@ struct ggml_cuda_hc_combine_norm_args {
     const ggml_tensor * inject;     // [hc, T]  F32 contiguous (pre-scale/sigmoid)
     const ggml_tensor * residual;   // [n_embd, hc, T] F32 contiguous
     const ggml_tensor * block_out;  // [n_embd, 1, T]  F32 contiguous
+    const ggml_tensor * block_out2 = nullptr;   // set: the block output is block_out + block_out2 (an ADD's sources)
     const ggml_tensor * gamma;
     ggml_tensor *       out_res;
     ggml_tensor *       out_xn;     // [n_embd, hc, T]

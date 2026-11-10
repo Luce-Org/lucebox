@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "unary.cuh"
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -126,7 +127,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
         tmp += xi * xi;
     }
 
-    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum + 32);   // own slots: the mean's reduction may still be reading s_sum (upstream #26385)
 
     const float variance = tmp / group_size;
     const float scale = rsqrtf(variance + eps);
@@ -135,7 +136,9 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false, bool do_q8 = false>
+// do_gate: the product is then multiplied by sigmoid(gate) (the GDN output gate, one multiply as in
+// unary_gated_op_kernel); gate has x's shape and its own strides.
+template <int block_size, bool do_multiply = false, bool do_add = false, bool do_q8 = false, bool do_gate = false>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -160,7 +163,11 @@ static __global__ void rms_norm_f32(const float * x,
                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
                                     const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
                                     block_q8_1 *  q8                   = nullptr,
-                                    const int     ncols_q8             = 0) {
+                                    const int     ncols_q8             = 0,
+                                    const float * gate                 = nullptr,
+                                    const int64_t gate_stride_row      = 0,
+                                    const int64_t gate_stride_channel  = 0,
+                                    const int64_t gate_stride_sample   = 0) {
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
 
@@ -170,6 +177,7 @@ static __global__ void rms_norm_f32(const float * x,
     const int tid       = threadIdx.x;
 
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+    static_assert(!do_gate || (do_multiply && !do_add), "the gate is fused with rms_norm * w only");
 
     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
@@ -179,6 +187,10 @@ static __global__ void rms_norm_f32(const float * x,
         const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
         const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
         mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+    }
+
+    if constexpr (do_gate) {
+        gate += sample*gate_stride_sample + channel*gate_stride_channel + row*gate_stride_row;
     }
 
     if constexpr (do_add) {
@@ -213,6 +225,9 @@ static __global__ void rms_norm_f32(const float * x,
             if (col < ncols) {
                 const int mul_col = fastmodulo(col, mul_ncols_packed);
                 v                 = scale * x[col] * mul[mul_col];
+                if constexpr (do_gate) {
+                    v = ggml_cuda_op_sigmoid_single(gate[col]) * v;
+                }
                 dst[col]          = v;
             }
             float amax = fabsf(v);
@@ -233,6 +248,10 @@ static __global__ void rms_norm_f32(const float * x,
             const int mul_col = fastmodulo(col, mul_ncols_packed);
             const int add_col = fastmodulo(col, add_ncols_packed);
             dst[col]          = scale * x[col] * mul[mul_col] + add[add_col];
+        } else if constexpr (do_gate) {
+            const int mul_col = fastmodulo(col, mul_ncols_packed);
+            const float v     = scale * x[col] * mul[mul_col];
+            dst[col]          = ggml_cuda_op_sigmoid_single(gate[col]) * v;
         } else if constexpr (do_multiply) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
             dst[col]          = scale * x[col] * mul[mul_col];
@@ -478,7 +497,7 @@ static void group_norm_f32_cuda(
         group_norm_f32<WARP_SIZE><<<num_groups, block_dims, 0, stream>>>(x, dst, group_size, ne_elements, eps);
     } else {
         const dim3 block_dims(1024, 1, 1);
-        group_norm_f32<1024><<<num_groups, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(x, dst, group_size, ne_elements, eps);
+        group_norm_f32<1024><<<num_groups, block_dims, block_dims.x > WARP_SIZE ? 2 * 32 * sizeof(float): 0, stream>>>(x, dst, group_size, ne_elements, eps);
     }
 }
 
@@ -737,6 +756,63 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
                           eps, stream, (block_q8_1 *) q8_out, ncols_q8);
+}
+
+template <int block_size>
+static void rms_norm_gated_f32_cuda(const float * x, const float * mul, const float * gate, float * dst,
+                                    const int ncols, const dim3 blocks_num,
+                                    const int64_t s01, const int64_t s02, const int64_t s03,
+                                    const int64_t mul_s01, const int64_t mul_s02, const int64_t mul_s03,
+                                    const uint3 mul_ncols, const uint3 mul_nrows, const uint3 mul_nchannels,
+                                    const uint3 mul_nsamples,
+                                    const int64_t gate_s01, const int64_t gate_s02, const int64_t gate_s03,
+                                    const float eps, block_q8_1 * q8, const int ncols_q8, cudaStream_t stream) {
+    const dim3 block_dims(block_size, 1, 1);
+    const size_t smem = block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0;
+    const uint3 z = make_uint3(0, 0, 0);
+    if (q8) {
+        rms_norm_f32<block_size, true, false, true, true><<<blocks_num, block_dims, smem, stream>>>(
+            x, dst, ncols, s01, s02, s03, eps, mul, mul_s01, mul_s02, mul_s03, mul_ncols, mul_nrows, mul_nchannels,
+            mul_nsamples, nullptr, 0, 0, 0, z, z, z, z, q8, ncols_q8, gate, gate_s01, gate_s02, gate_s03);
+    } else {
+        rms_norm_f32<block_size, true, false, false, true><<<blocks_num, block_dims, smem, stream>>>(
+            x, dst, ncols, s01, s02, s03, eps, mul, mul_s01, mul_s02, mul_s03, mul_ncols, mul_nrows, mul_nchannels,
+            mul_nsamples, nullptr, 0, 0, 0, z, z, z, z, nullptr, 0, gate, gate_s01, gate_s02, gate_s03);
+    }
+}
+
+void ggml_cuda_op_rms_norm_gated(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul_tensor,
+                                 ggml_tensor * sig, ggml_tensor * gated, void * q8_out, int ncols_q8) {
+    const ggml_tensor * x    = norm->src[0];
+    const ggml_tensor * w    = mul_tensor->src[0] == norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    const ggml_tensor * gate = sig->src[0];
+    float eps = 0.0f;
+    memcpy(&eps, norm->op_params, sizeof(float));
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(gated->type == GGML_TYPE_F32 && ggml_is_contiguous(gated));
+    GGML_ASSERT(x->nb[0] == sizeof(float) && w->nb[0] == sizeof(float) && gate->nb[0] == sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int ncols = x->ne[0];
+    const dim3 blocks_num(x->ne[1], x->ne[2], x->ne[3]);
+    const size_t ts = sizeof(float);
+    const uint3 mul_ncols     = init_fastdiv_values(w->ne[0]);
+    const uint3 mul_nrows     = init_fastdiv_values(w->ne[1]);
+    const uint3 mul_nchannels = init_fastdiv_values(w->ne[2]);
+    const uint3 mul_nsamples  = init_fastdiv_values(w->ne[3]);
+    // the same block size rms_norm_mul_f32_cuda picks, so the reduction matches the unfused norm
+    if (ncols < 1024) {
+        rms_norm_gated_f32_cuda<256>((const float *) x->data, (const float *) w->data, (const float *) gate->data,
+            (float *) gated->data, ncols, blocks_num, x->nb[1]/ts, x->nb[2]/ts, x->nb[3]/ts,
+            w->nb[1]/ts, w->nb[2]/ts, w->nb[3]/ts, mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+            gate->nb[1]/ts, gate->nb[2]/ts, gate->nb[3]/ts, eps, (block_q8_1 *) q8_out, ncols_q8, ctx.stream());
+    } else {
+        rms_norm_gated_f32_cuda<1024>((const float *) x->data, (const float *) w->data, (const float *) gate->data,
+            (float *) gated->data, ncols, blocks_num, x->nb[1]/ts, x->nb[2]/ts, x->nb[3]/ts,
+            w->nb[1]/ts, w->nb[2]/ts, w->nb[3]/ts, mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+            gate->nb[1]/ts, gate->nb[2]/ts, gate->nb[3]/ts, eps, (block_q8_1 *) q8_out, ncols_q8, ctx.stream());
+    }
 }
 
 // dflash: ADD (residual) + RMS_NORM + MUL in one launch. `add_tensor` is the
