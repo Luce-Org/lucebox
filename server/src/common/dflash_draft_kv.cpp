@@ -1,4 +1,5 @@
 #include "dflash_draft_kv.h"
+#include "concurrency/chain_spec_shapes.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -249,7 +250,8 @@ bool draft_kv_begin_step(DraftKvState & st,
                          ggml_backend_t backend,
                          const DraftFeatureMirror & ring,
                          int committed,
-                         int width) {
+                         int width,
+                         int valid_from) {
     if (!st.mem_buf || st.built_for != static_cast<const void *>(&dw) ||
         committed <= 0 || width < 0 || width > st.q_len) return false;
     const int noise_width = width > 0 ? width : st.q_len;
@@ -257,8 +259,8 @@ bool draft_kv_begin_step(DraftKvState & st,
     // shadow live window positions, so rebuild from scratch.
     if (st.next_pos > committed) draft_kv_reset(st);
 
-    const int win = std::min(committed, st.cap);
-    const int lo  = committed - win;
+    const int lo  = draft_window_lo(committed, st.cap, valid_from);
+    const int win = committed - lo;
     int64_t start = std::max<int64_t>(st.next_pos, lo);
     int n_new = (int)(committed - start);
     if (n_new > st.a_step) {
