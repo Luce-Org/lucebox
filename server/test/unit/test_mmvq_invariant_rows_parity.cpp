@@ -2,9 +2,10 @@
 // c_invariant_rpb, ggml_backend_cuda_set_mmvq_invariant_rows_override; LUCE_MMVQ_INVARIANT_ROWS=1 keeps one row per
 // wave). The batch-invariant contract is that every column of a T-column product is byte-identical to the one-column
 // product of that column (the MTP verify rows must reproduce T=1 decode); handing a wave 2 or 4 rows must not change
-// that. Every qwen4exp dense Q8_0 shape (K x M) is run at T = 2, 3, 4, 5, 8 and, under
-// ggml_backend_cuda_set_mmvq_invariant_max_ncols(16), T = 9, 13, 16 (one Q8_0 launch on the generic kernel, eight
-// columns per launch on the RDNA4 matvec), with 1 / 2 / 4 rows per wave, on every GPU, and each
+// that. Every qwen4exp dense Q8_0 shape (K x M) is run at every T from 2 to 8 and, under
+// ggml_backend_cuda_set_mmvq_invariant_max_ncols(16), from 9 to 16 (one Q8_0 launch on the generic kernel, eight
+// columns per launch on the RDNA4 matvec): a batched verify group holds whole slots of 1 to 4 rows, so any of these
+// widths occurs. With 1 / 2 / 4 rows per wave, on every GPU, each
 // column is memcmp-compared with its own single-column MUL_MAT (the ordinary T=1 kernel, batch-invariance off).
 // Row counts that are not multiples of 4 (or 2) must fall back to one row per wave; 40960 rows take the non-persistent
 // grid of the LDS path (one block per 16 row groups, as the 248320-row lm head does). The LDS activation staging
@@ -40,7 +41,7 @@ const Shape k_shapes[] = {
     { 2560, 1, "shexp_gate", GGML_TYPE_F32 },   { 10240, 4, "hc_inject", GGML_TYPE_F32 },
     { 2560, 512, "idx_q", GGML_TYPE_BF16 },     { 2560, 128, "idx_k", GGML_TYPE_BF16 },
 };
-const int k_widths[] = { 2, 3, 4, 5, 8, 9, 13, 16 };
+const int k_widths[] = { 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
 const int k_rows[] = { 1, 2, 4 };
 const int k_lds[] = { 0, 4, 8, 16, 32 };
 

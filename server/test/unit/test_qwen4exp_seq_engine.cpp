@@ -1,6 +1,7 @@
 // GPU adapter contract and lifecycle soak for the full-cache engine, and with every slot's cache carrying the MTP draft
 // layer (as the server makes them): prefix checkpoints across slots, and every request of a concurrent run producing
-// its alone stream token for token, with the batched verify forced on and off.
+// its alone stream token for token, with the batched verify forced on and off, and with requests that may not draft
+// (one-row slots of the verify) beside drafting ones.
 // Usage: test_qwen4exp_seq_engine <shard1.gguf> [ctx=32768] (the MTP sidecar is found beside the model, as the server
 // finds it)
 #include "qwen4exp_seq_engine.h"
@@ -475,11 +476,16 @@ static bool run_prefix_cuts(Qwen4ExpSeqEngine & engine, const Qwen4ExpWeights & 
     return ok;
 }
 
+// Whether a request may draft (the plan's allow_speculation, which the scheduler clears for a grammar or a thinking
+// budget about to close): always, never, or in turns of four tokens of its stream.
+enum class Drafts { always, never, turns };
+
 // One request of a run: its prompt, sampler and token limit (the prompt's sampled token included).
 struct Request {
     std::vector<int32_t> prompt;
     SamplerCfg sampler;
     int limit = 0;
+    Drafts drafts = Drafts::always;
 };
 
 // A run of requests admitted together and driven as the scheduler drives the engine: every request's tokens (its
@@ -494,7 +500,15 @@ struct RunResult {
     int cut_limit = 0;     // stops at the limit before an output's last token: inside a verified block
     int cut_eos = 0;       // stops at EOS after an output's accepted drafts
     int early_stops = 0;   // stops while another request still runs
+    int mixed_steps = 0;   // verify steps with one-row slots (no drafts) beside drafting ones
+    int lone_steps = 0;    // ... with exactly one drafting slot
+    int switched = 0;      // requests with both a one-row and a drafting output in mixed steps
+    int one_row_dense = 0; // one-row outputs of mixed steps before the first QSA position
+    int one_row_qsa = 0;   // ... at or past it
 };
+
+// The first position a QSA layer attends sparsely (513 complete blocks of 4).
+constexpr int kQsaFirst = 2051;
 
 static RunResult run_requests(Qwen4ExpSeqEngine & engine, const std::vector<Request> & reqs) {
     RunResult r;
@@ -540,10 +554,15 @@ static RunResult run_requests(Qwen4ExpSeqEngine & engine, const std::vector<Requ
         next[(size_t) i] = tokens.back();
         state[(size_t) i] = 1;
     };
+    auto may_draft = [&](int i) {
+        const Drafts d = reqs[(size_t) i].drafts;
+        return d == Drafts::always || (d == Drafts::turns && r.streams[(size_t) i].size() / 4 % 2 == 0);
+    };
+    std::vector<int> as_one((size_t) n, 0), as_drafting((size_t) n, 0);
     for (int guard = 0; guard < 4096; ++guard) {
         SeqEngine::StepPlan plan;
         for (int i = 0; i < n; ++i)
-            if (state[(size_t) i] == 1) plan.decode.push_back({r.slots[(size_t) i], next[(size_t) i]});
+            if (state[(size_t) i] == 1) plan.decode.push_back({r.slots[(size_t) i], next[(size_t) i], may_draft(i)});
         const StepPlanLimits limits = engine.step_plan_limits((int) plan.decode.size());
         for (int i = 0; i < n && (int) plan.prefills.size() < limits.max_prefill_sequences; ++i)
             if (state[(size_t) i] == 0) plan.prefills.push_back({r.slots[(size_t) i], limits.max_prefill_tokens_per_sequence});
@@ -556,8 +575,20 @@ static RunResult run_requests(Qwen4ExpSeqEngine & engine, const std::vector<Requ
             break;
         }
         const bool beside = plan.decode.size() > 1 || (plan.decode.size() == 1 && plan.decode[0].slot != 0);
+        const int drafting = (int) std::count_if(result.decode.begin(), result.decode.end(),
+            [](const SeqEngine::DecodeOutput & o) { return o.spec_offered > 0; });
+        const bool mixed = drafting > 0 && drafting < (int) result.decode.size();
+        r.mixed_steps += mixed;
+        r.lone_steps += mixed && drafting == 1;
         for (const auto & output : result.decode) {
             if (beside) ++(output.spec_offered > 0 ? r.verify_rows : r.plain_rows);
+            const int i = request_at(output.slot);
+            if (mixed && i >= 0) {
+                ++(output.spec_offered > 0 ? as_drafting : as_one)[(size_t) i];
+                // The position this step decoded the request's token at.
+                const int pos = (int) (reqs[(size_t) i].prompt.size() + r.streams[(size_t) i].size()) - 1;
+                if (output.spec_offered == 0) ++(pos < kQsaFirst ? r.one_row_dense : r.one_row_qsa);
+            }
             std::vector<int32_t> tokens = output.committed_tokens;
             tokens.push_back(output.token);
             take(request_at(output.slot), tokens);
@@ -566,6 +597,8 @@ static RunResult run_requests(Qwen4ExpSeqEngine & engine, const std::vector<Requ
             if (output.status == SeqEngine::PrefillOutput::Status::completed) take(request_at(output.slot), {output.token});
         }
         if (!r.ok) break;
+        r.switched = 0;
+        for (int i = 0; i < n; ++i) r.switched += as_one[(size_t) i] > 0 && as_drafting[(size_t) i] > 0;
     }
     r.ok = false;
     for (int i = 0; i < n; ++i) if (state[(size_t) i] != 2) engine.retire(r.slots[(size_t) i]);
@@ -578,6 +611,10 @@ static RunResult run_requests(Qwen4ExpSeqEngine & engine, const std::vector<Requ
 // two at once, and the longest ends alone on a slot past 0 (a one-slot batched verify). One request stops at EOS:
 // eos_chat_id is set to a token its alone stream reaches mid-reply (the engine reads EOS from the weights, on the host
 // only; `eos` keeps the pick across draft caps). The limits and that EOS must cut a verified block somewhere.
+// The same run where some requests may not draft (Drafts): a one-row slot beside drafting ones, one that switches in
+// turns, the sampled request as a one-row slot beside exactly one drafting slot, and none drafting (the plain step,
+// whatever the mode); and four requests whose replies cross the QSA boundary, the sampled one as a one-row slot
+// crossing it beside drafting ones.
 static bool run_alone_vs_together(ggml_backend_t backend, Qwen4ExpWeights & w, const std::vector<Qwen4ExpCache *> & caches,
                                   int ctx, int verify_width, const char * model_path, int32_t & eos) {
     Tokenizer tokenizer;
@@ -625,39 +662,81 @@ static bool run_alone_vs_together(ggml_backend_t backend, Qwen4ExpWeights & w, c
     w.eos_chat_id = eos;
     const int caps = caches[0]->mtp_draft;
     bool ok = true;
-    std::vector<std::vector<int32_t>> alone(reqs.size());
-    for (size_t i = 0; i < reqs.size() && ok; ++i) {
-        const RunResult r = run_requests(engine, {reqs[i]});
-        ok = r.ok && r.slots[0] == 0;
-        if (!ok) std::fprintf(stderr, "[alone-vs-together] request %zu alone failed (slot %d)\n", i, r.slots[0]);
-        alone[i] = r.ok ? r.streams[0] : std::vector<int32_t>{};
-    }
-    for (const auto mode : {Qwen4ExpSeqEngine::DecodeMode::verify, Qwen4ExpSeqEngine::DecodeMode::plain}) {
-        if (!ok) break;
-        const bool verify = mode == Qwen4ExpSeqEngine::DecodeMode::verify;
-        engine.set_decode_mode(mode);
-        const RunResult r = run_requests(engine, reqs);
-        ok = r.ok;
-        for (size_t i = 0; ok && i < reqs.size(); ++i) {
-            const bool same = r.streams[i] == alone[i];
-            size_t first = 0;
-            while (first < r.streams[i].size() && first < alone[i].size() && r.streams[i][first] == alone[i][first]) ++first;
-            std::printf("[alone-vs-together] draft=%d/%d mode=%s request=%zu slot=%d %s tokens=%zu alone=%zu %s",
-                        caps, caches[1]->mtp_draft, verify ? "verify" : "plain", i, r.slots[i],
-                        reqs[i].sampler.temp > 0.0f ? "sampled" : "greedy", r.streams[i].size(), alone[i].size(),
-                        same ? "identical\n" : "DIFFER");
-            if (!same) std::printf(" at token %zu\n", first);
-            ok = ok && same;
+    auto alone_streams = [&](const std::vector<Request> & set) {
+        std::vector<std::vector<int32_t>> streams(set.size());
+        for (size_t i = 0; i < set.size() && ok; ++i) {
+            const RunResult r = run_requests(engine, {set[i]});
+            ok = r.ok && r.slots[0] == 0;
+            if (!ok) std::fprintf(stderr, "[alone-vs-together] request %zu alone failed (slot %d)\n", i, r.slots[0]);
+            streams[i] = r.ok ? r.streams[0] : std::vector<int32_t>{};
         }
-        // The run covers what it claims: verified blocks beside other decoders in the verify mode (none in the plain
-        // one), a request stopping while others go on, and a stop inside a verified block.
-        const bool covered = r.early_stops > 0 && (verify ? r.verify_rows > 0 && r.cut_limit + r.cut_eos > 0
-                                                          : r.verify_rows == 0 && r.plain_rows > 0);
-        std::printf("[alone-vs-together] draft=%d/%d mode=%s verify_rows=%d plain_rows=%d cut_limit=%d cut_eos=%d "
-                    "early_stops=%d covered=%d\n", caps, caches[1]->mtp_draft, verify ? "verify" : "plain",
-                    r.verify_rows, r.plain_rows, r.cut_limit, r.cut_eos, r.early_stops, (int) covered);
-        ok = ok && covered;
+        return streams;
+    };
+    // `set` together with each request's Drafts, in both modes, against its alone streams; `covered` judges the
+    // verify mode's run (the plain mode's must verify nothing).
+    auto together = [&](const char * name, std::vector<Request> set, const std::vector<Drafts> & drafts,
+                        const std::vector<std::vector<int32_t>> & alone, auto && covered) {
+        for (size_t i = 0; i < set.size(); ++i) set[i].drafts = drafts[i];
+        for (const auto mode : {Qwen4ExpSeqEngine::DecodeMode::verify, Qwen4ExpSeqEngine::DecodeMode::plain}) {
+            if (!ok) break;
+            const bool verify = mode == Qwen4ExpSeqEngine::DecodeMode::verify;
+            engine.set_decode_mode(mode);
+            const RunResult r = run_requests(engine, set);
+            ok = r.ok;
+            for (size_t i = 0; ok && i < set.size(); ++i) {
+                const bool same = r.streams[i] == alone[i];
+                size_t first = 0;
+                while (first < r.streams[i].size() && first < alone[i].size() && r.streams[i][first] == alone[i][first])
+                    ++first;
+                std::printf("[alone-vs-together] %s draft=%d/%d mode=%s request=%zu slot=%d %s drafts=%s tokens=%zu "
+                            "alone=%zu %s", name, caps, caches[1]->mtp_draft, verify ? "verify" : "plain", i,
+                            r.slots[i], set[i].sampler.temp > 0.0f ? "sampled" : "greedy",
+                            drafts[i] == Drafts::always ? "always" : drafts[i] == Drafts::never ? "never" : "turns",
+                            r.streams[i].size(), alone[i].size(), same ? "identical\n" : "DIFFER");
+                if (!same) std::printf(" at token %zu\n", first);
+                ok = ok && same;
+            }
+            const bool run_covered = verify ? covered(r) : r.verify_rows == 0 && r.plain_rows > 0;
+            std::printf("[alone-vs-together] %s draft=%d/%d mode=%s verify_rows=%d plain_rows=%d cut_limit=%d "
+                        "cut_eos=%d early_stops=%d mixed_steps=%d lone_steps=%d switched=%d one_row_dense=%d "
+                        "one_row_qsa=%d covered=%d\n", name, caps, caches[1]->mtp_draft, verify ? "verify" : "plain",
+                        r.verify_rows, r.plain_rows, r.cut_limit, r.cut_eos, r.early_stops, r.mixed_steps,
+                        r.lone_steps, r.switched, r.one_row_dense, r.one_row_qsa, (int) run_covered);
+            ok = ok && run_covered;
+        }
+    };
+    const std::vector<std::vector<int32_t>> alone = alone_streams(reqs);
+    const Drafts A = Drafts::always, N = Drafts::never, T = Drafts::turns;
+    // Every request drafts: verified blocks beside other decoders, a request stopping while others go on, and a stop
+    // inside a verified block.
+    together("all", reqs, {A, A, A, A}, alone, [](const RunResult & r) {
+        return r.early_stops > 0 && r.verify_rows > 0 && r.cut_limit + r.cut_eos > 0;
+    });
+    // Slot 0's request never drafts and one switches in turns: one-row slots beside drafting ones, and a request
+    // that is both.
+    together("mixed", reqs, {N, A, T, A}, alone, [](const RunResult & r) {
+        return r.early_stops > 0 && r.mixed_steps > 0 && r.switched > 0;
+    });
+    // Only the longest request drafts: exactly one drafting slot beside one-row slots, the sampled one among them.
+    together("one", reqs, {N, N, N, A}, alone, [](const RunResult & r) { return r.lone_steps > 0; });
+    // No request drafts: no verify step at all, in either mode (each step is the plain one).
+    together("none", reqs, {N, N, N, N}, alone, [](const RunResult & r) {
+        return r.verify_rows == 0 && r.plain_rows > 0 && r.mixed_steps == 0;
+    });
+    // Replies that start just before the QSA boundary: the sampled request (from 2037) as a one-row slot that crosses
+    // it beside drafting ones, the longest (from 2051, its limit raised to outlive the sampled one) drafting QSA rows
+    // beside it.
+    std::vector<Request> qsa = reqs;
+    for (size_t i = 0; i < qsa.size(); ++i) {
+        qsa[i].prompt.resize(2030 + 7 * i);
+        for (size_t t = 0; t < qsa[i].prompt.size(); ++t)
+            qsa[i].prompt[t] = (int32_t) ((t * 7919 + 13 + i * 104729) % (size_t) w.n_vocab);
     }
+    qsa[3].limit = 96;
+    const std::vector<std::vector<int32_t>> qsa_alone = alone_streams(qsa);
+    together("qsa", qsa, {A, N, A, A}, qsa_alone, [](const RunResult & r) {
+        return r.mixed_steps > 0 && r.one_row_dense > 0 && r.one_row_qsa > 0;
+    });
     engine.set_decode_mode(Qwen4ExpSeqEngine::DecodeMode::measured);
     w.eos_chat_id = chat_eos;
     return ok;
