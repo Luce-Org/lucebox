@@ -2,8 +2,11 @@
 // DeltaNet convolution staging:
 //
 //   contiguous [prefix, channels, sequences]
-//     + transpose(contiguous [channels, tokens, sequences])
+//     + transpose([channels, tokens, sequences], channels contiguous)
 //     -> contiguous [prefix + tokens, channels, sequences].
+//
+// The [channels, tokens, sequences] operand is either contiguous or a column
+// slice of wider rows (the qkv part of a stacked gate|qkv projection).
 //
 // The operation is a copy, so every output bit must match the host reference.
 #include "ggml-alloc.h"
@@ -26,6 +29,9 @@ struct ConcatCase {
     int channels;
     int sequences;
     bool expect_fast_path;
+    int row_width = 0;      // elements per token row of the source; 0 = channels
+    int column_offset = 0;  // first source column of the slice
+    int sequence_pad = 0;   // unused token rows between source sequences
 };
 
 float tagged_value(uint32_t tag, size_t index) {
@@ -48,10 +54,15 @@ bool run_case(ggml_backend_t backend, const ConcatCase & tc) {
 
     ggml_tensor * history = ggml_new_tensor_3d(
         ctx, GGML_TYPE_F32, tc.prefix, tc.channels, tc.sequences);
-    ggml_tensor * qkv = ggml_new_tensor_3d(
-        ctx, GGML_TYPE_F32, tc.channels, tc.tokens, tc.sequences);
+    const int row_width = tc.row_width > 0 ? tc.row_width : tc.channels;
+    const int rows_per_sequence = tc.tokens + tc.sequence_pad;
+    ggml_tensor * rows = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, row_width, rows_per_sequence, tc.sequences);
     ggml_set_input(history);
-    ggml_set_input(qkv);
+    ggml_set_input(rows);
+    ggml_tensor * qkv = ggml_view_3d(
+        ctx, rows, tc.channels, tc.tokens, tc.sequences,
+        rows->nb[1], rows->nb[2], (size_t) tc.column_offset * sizeof(float));
 
     ggml_tensor * qkv_transposed = ggml_transpose(ctx, qkv);
     ggml_tensor * output = ggml_concat(ctx, history, qkv_transposed, 0);
@@ -71,7 +82,7 @@ bool run_case(ggml_backend_t backend, const ConcatCase & tc) {
     const size_t history_elements =
         (size_t) tc.prefix * tc.channels * tc.sequences;
     const size_t qkv_elements =
-        (size_t) tc.channels * tc.tokens * tc.sequences;
+        (size_t) row_width * rows_per_sequence * tc.sequences;
     const size_t output_elements =
         (size_t) (tc.prefix + tc.tokens) * tc.channels * tc.sequences;
     std::vector<float> history_data(history_elements);
@@ -97,7 +108,8 @@ bool run_case(ggml_backend_t backend, const ConcatCase & tc) {
             }
             for (int t = 0; t < tc.tokens; ++t) {
                 const size_t qkv_index =
-                    ((size_t) s * tc.tokens + t) * tc.channels + c;
+                    ((size_t) s * rows_per_sequence + t) * row_width +
+                    tc.column_offset + c;
                 expected[output_row + tc.prefix + t] = qkv_data[qkv_index];
             }
         }
@@ -107,7 +119,7 @@ bool run_case(ggml_backend_t backend, const ConcatCase & tc) {
         ggml_backend_tensor_set(
             history, history_data.data(), 0, history_data.size() * sizeof(float));
         ggml_backend_tensor_set(
-            qkv, qkv_data.data(), 0, qkv_data.size() * sizeof(float));
+            rows, qkv_data.data(), 0, qkv_data.size() * sizeof(float));
         ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
         const size_t fast_path_after =
             ggml_backend_cuda_get_concat_transpose_f32_count();
@@ -146,8 +158,9 @@ bool run_case(ggml_backend_t backend, const ConcatCase & tc) {
         std::fprintf(stderr, "%s: unexpected concat dispatch path\n", tc.name);
     } else {
         std::printf(
-            "concat transpose %-20s P=%d T=%d C=%d S=%d PASS\n",
-            tc.name, tc.prefix, tc.tokens, tc.channels, tc.sequences);
+            "concat transpose %-20s P=%d T=%d C=%d S=%d row=%d off=%d PASS\n",
+            tc.name, tc.prefix, tc.tokens, tc.channels, tc.sequences,
+            row_width, tc.column_offset);
     }
 
     if (allocator) {
@@ -177,6 +190,12 @@ int main() {
         {"wide_tail",         3, 511,   130, 1, true},
         {"max_prefix",       32, 513,   129, 1, true},
         {"qwen_prefill",      3, 512, 10240, 1, true},
+        // qkv columns of a stacked gate|qkv projection (strided token rows)
+        {"stacked_tails",     3,  33,    65, 3, true,   100,    7},
+        {"stacked_decode",    3,   1,    65, 2, true,    80,   15},
+        {"stacked_qwen",      3, 2048, 10240, 1, true, 16384, 6144},
+        // ... and sequences that are not tokens x row width apart
+        {"padded_sequences",  3,  33,    65, 3, true,   100,    7, 5},
         {"prefix_fallback",  33,  17,    35, 2, false},
     };
 
