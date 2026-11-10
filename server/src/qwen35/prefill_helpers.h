@@ -86,10 +86,13 @@ inline int qwen35_prefill_ubatch(int fallback) {
 // own earlier, not-yet-computed chunks. One chunk is the floor, which wins over
 // the pool clamp if the pool itself were smaller than a chunk (the pager's pool
 // is always a positive chunk multiple, so that precedence is only a contract).
-inline int kvflash_pooled_ubatch(int prefill_ubatch, int chunk_tokens, int pool_tokens) {
+// `pinned_tokens` (the preamble pins' rows) come off the pool first, with one chunk the pager keeps free: a batch
+// larger than the unpinned capacity would evict its own earlier chunks too.
+inline int kvflash_pooled_ubatch(int prefill_ubatch, int chunk_tokens, int pool_tokens, int pinned_tokens = 0) {
     if (chunk_tokens <= 0) return prefill_ubatch;
     int ub = std::max(prefill_ubatch, chunk_tokens);
     ub = (ub / chunk_tokens) * chunk_tokens;
+    if (pool_tokens > 0 && pinned_tokens > 0) pool_tokens = std::max(chunk_tokens, pool_tokens - pinned_tokens - chunk_tokens);
     if (pool_tokens > 0 && ub > pool_tokens) {
         ub = std::max(chunk_tokens, (pool_tokens / chunk_tokens) * chunk_tokens);
     }
