@@ -52,6 +52,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "fnv.h"
+#include "kvflash_pool_flag.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1505,13 +1506,6 @@ struct KvFlashAutoBudget {
     // the full cache at 128-256K. Override: LUCE_KVFLASH_MAX_POOL.
     int     speed_cap_tokens = 16384;
 };
-
-// Whether the operator requested any KVFlash pool. "auto" is a real request
-// even though its final size is not known until the backend measures VRAM.
-inline bool kvflash_pool_requested(const char * value) {
-    return value != nullptr &&
-           (std::strcmp(value, "auto") == 0 || std::atoi(value) > 0);
-}
 
 // The compatibility gate can reject a fixed KVFlash pool before model setup.
 // "auto" is deliberately excluded: only the backend's VRAM-aware sizing can
