@@ -1252,6 +1252,31 @@ if(LUCE_TESTS)
         list(APPEND _raw_unit_test_targets test_cuda_pool_shutdown)
     endif()
 
+    # Guards the warp exchanges, packed Q8_0 dequantization and transposed V
+    # staging of the paged attention kernels (ggml-cuda/paged-attn-common.cuh):
+    # bit-identical to the plain shuffles, the float dequantization and the
+    # row-major staging. SKIP (77) without a GPU.
+    if((LUCE_GPU_BACKEND STREQUAL "hip" OR
+        LUCE_GPU_BACKEND STREQUAL "cuda")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_paged_attn_lanes.cu")
+        add_executable(test_paged_attn_lanes test/unit/test_paged_attn_lanes.cu)
+        if(LUCE_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/unit/test_paged_attn_lanes.cu PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_paged_attn_lanes PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
+            target_compile_definitions(test_paged_attn_lanes PRIVATE GGML_USE_HIP)
+            target_link_libraries(test_paged_attn_lanes PRIVATE hip::host)
+        else()
+            find_package(CUDAToolkit REQUIRED)
+            set_target_properties(test_paged_attn_lanes PROPERTIES CUDA_ARCHITECTURES "${_luce_archs}")
+            target_link_libraries(test_paged_attn_lanes PRIVATE CUDA::cudart)
+        endif()
+        target_include_directories(test_paged_attn_lanes PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        list(APPEND _raw_unit_test_targets test_paged_attn_lanes)
+    endif()
+
     if(LUCE_GPU_BACKEND STREQUAL "cuda"
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_cuda_comm_api.cpp")
         add_executable(test_cuda_comm_api test/unit/test_cuda_comm_api.cpp)
