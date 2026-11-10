@@ -2800,6 +2800,7 @@ if(LUCE_TESTS)
             test/unit/test_qwen35_swap_snapshot_cache.cpp
             test/unit/test_qwen35_single_replay_graph.cpp
             test/unit/test_sampled_verify.cpp
+            test/unit/test_kvflash_q_stage.cpp
             test/unit/test_ddtree_tau.cpp
             test/pflash/test_pflash_drafter_ipc.cpp
             test/pflash/test_pflash_selection.cpp

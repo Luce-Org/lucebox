@@ -596,8 +596,8 @@ struct TargetCache {
     ggml_tensor * q_cap_all = nullptr;
     int q_cap_all_tokens = 0;
     // Spec verify query stage (KVFlash only): the query of each verify row,
-    // F32 [head_dim, n_head, n_fa, q_stage_rows]; row r is one contiguous
-    // q_cap-shaped block. After acceptance the backend copies the last
+    // F32 [head_dim, n_head, q_stage_rows, n_fa]; row r of layer l is one
+    // contiguous q_cap plane (see kvflash_q_stage_view). After acceptance the backend copies the last
     // accepted row into q_cap, so q_cap holds what AR holds. q_stage_base/n
     // are the position and row count of the last staged pass.
     ggml_tensor * q_stage = nullptr;
