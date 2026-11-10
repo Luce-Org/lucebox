@@ -48,6 +48,10 @@ struct SchedSlot {
     int prompt_left = 0;
     int prompt_new = 0;
     uint64_t admission_order = 0;
+    // When it took the slot, and the requests in progress then (itself
+    // included): usage.timings queue_ms and active_at_admission.
+    std::chrono::steady_clock::time_point admitted_at{};
+    int active_at_admission = 0;
     std::chrono::steady_clock::time_point started_at{};
     std::chrono::steady_clock::time_point decode_started_at{};
     double prefill_s = 0.0;
@@ -362,6 +366,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         gen_timings.pflash = s.job->pflash_stats;
         gen_timings.accept_rate = s.acceptance.rate();
         gen_timings.spec_decode_ran = s.acceptance.offered() > 0;
+        gen_timings.queue_s = seconds_since(s.job->enqueued_at, s.admitted_at);
+        gen_timings.first_token_s = s.gen_tokens.empty()
+            ? -1.0 : seconds_since(s.job->enqueued_at, s.decode_started_at);
+        gen_timings.slot = idx;
+        gen_timings.active_at_admission = s.active_at_admission;
 
         if (!s.error) {
             PerfRecord perf;
@@ -691,6 +700,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
         s.budget = luce::common::ThinkingBudget(s.hook, s.n_gen_cap);
         live_slots++;
+        s.admitted_at = std::chrono::steady_clock::now();
+        s.active_at_admission = live_slots;
         publish_live_count();
         return AdmissionDisposition::Admitted;
     };

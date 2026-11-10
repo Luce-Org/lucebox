@@ -11,6 +11,7 @@
 #include "response_error.h"
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -55,7 +56,20 @@ struct GenTimings {
     // as the non-streamed body does.
     float  accept_rate          = 0.0f;
     bool   spec_decode_ran      = false;
+    // From the moment the request joined the serving queue: until it was
+    // admitted (given a slot, or taken by the serial worker), and until its
+    // first generated token. -1 when not measured.
+    double queue_s              = -1.0;
+    double first_token_s        = -1.0;
+    // The slot it ran in and the requests in progress once it was admitted,
+    // itself included; -1 when not known.
+    int    slot                 = -1;
+    int    active_at_admission  = -1;
 };
+
+// Seconds from `from` to `to`, -1 when either was never set or `to` is first.
+double seconds_since(std::chrono::steady_clock::time_point from,
+                     std::chrono::steady_clock::time_point to);
 
 // Build the `timings` sub-object emitted under `usage`.
 //   prefill_ms              = prefill_s * 1000.0  (1 decimal)

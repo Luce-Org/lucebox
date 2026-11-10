@@ -6897,6 +6897,7 @@ void HttpServer::configure_generation_io(
         ++output.completion_tokens;
 
         if (output.completion_tokens == 1) {
+            output.first_token_at = std::chrono::steady_clock::now();
             // Prefill is over: the first generated token marks the decode phase.
             // The count goes with it, so the transition a client sees is not
             // "decode with nothing generated" — the counter otherwise only
@@ -7315,6 +7316,11 @@ void HttpServer::process_job(ServerJob * job) {
         result.accept_rate,
         result.spec_decode_ran,
     };
+    // Serial path: one request at a time, from the moment process_job took it.
+    gen_timings.queue_s = seconds_since(job->enqueued_at, started_at);
+    gen_timings.first_token_s = seconds_since(job->enqueued_at, output.first_token_at);
+    gen_timings.slot = 0;
+    gen_timings.active_at_admission = 1;
 
     // Record performance for /status page.
     PerfRecord perf;
@@ -7408,6 +7414,9 @@ void HttpServer::enqueue(ServerJob * job) {
         return;
     }
     job->next = nullptr;
+    if (job->enqueued_at == std::chrono::steady_clock::time_point{}) {
+        job->enqueued_at = std::chrono::steady_clock::now();
+    }
     if (queue_tail_) queue_tail_->next = job;
     else queue_head_ = job;
     queue_tail_ = job;

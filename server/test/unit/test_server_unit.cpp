@@ -1619,6 +1619,26 @@ TEST_CASE(ServerUnitFixture, test_pflash_normalizes_multipart_latest_user_for_re
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_timings_json_reports_queue_and_first_token_only_when_measured) {
+    GenTimings timings;
+    json out = build_timings_json(timings, 0);
+    for (const char * key : {"queue_ms", "first_token_ms", "slot", "active_at_admission"}) {
+        TEST_ASSERT(!out.contains(key));
+    }
+    timings.queue_s = 0.01234;
+    timings.first_token_s = 0.5;
+    timings.slot = 2;
+    timings.active_at_admission = 3;
+    out = build_timings_json(timings, 0);
+    TEST_ASSERT(out["queue_ms"] == 12.3);
+    TEST_ASSERT(out["first_token_ms"] == 500.0);
+    TEST_ASSERT(out["slot"] == 2 && out["active_at_admission"] == 3);
+    const auto t0 = std::chrono::steady_clock::now();
+    TEST_ASSERT(seconds_since({}, t0) == -1.0);
+    TEST_ASSERT(seconds_since(t0 + std::chrono::seconds(1), t0) == -1.0);
+    TEST_ASSERT(seconds_since(t0, t0 + std::chrono::milliseconds(250)) == 0.25);
+}
+
 TEST_CASE(ServerUnitFixture, test_timings_json_carries_pflash_details) {
     GenTimings timings;
     TEST_ASSERT(!build_timings_json(timings, 0).contains("pflash"));
@@ -12684,6 +12704,11 @@ static void check_scheduler_reports_speculative_rounds(bool stream) {
     }
     TEST_ASSERT(usage["spec_decode_ran"] == true);
     TEST_ASSERT(std::abs(usage["accept_rate"].get<double>() - 6.0 / 12.0) < 1e-6);
+    // Alone in slot 0, queued for a moment, its first token after that.
+    const json & timings = usage["timings"];
+    TEST_ASSERT(timings["slot"] == 0 && timings["active_at_admission"] == 1);
+    TEST_ASSERT(timings["queue_ms"].get<double>() >= 0.0);
+    TEST_ASSERT(timings["first_token_ms"].get<double>() >= timings["queue_ms"].get<double>());
 
     const json perf = SchedulerTestHarness::status_json(server)["perf_history"];
     TEST_ASSERT(perf.size() == 1);
