@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <utility>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -137,10 +138,20 @@ inline bool kvflash_uq_rewind_recaptures(const KvFlashUqPlan & p, int r) { retur
 // under the new pool while the stored rows keep the old pool's, so R moves to the window's end: the window is not replayed.
 inline int kvflash_uq_snap_rewind(const KvFlashUqPlan & p, int r) { return p.n > 0 && r > p.win_lo && r < p.cut ? p.cut : r; }
 
-// Append the stored rows to the scorer's query list (no-op for an empty store).
-inline void kvflash_uq_append_queries(std::vector<const float *> & qs, const KvFlashUqStore & s, size_t qsize) {
-    if (s.empty() || qsize == 0 || s.rows.size() != (size_t)s.n * qsize) return;
-    for (int i = 0; i < s.n; i++) qs.push_back(s.rows.data() + (size_t)i * qsize);
+// LUCE_KVFLASH_UQ_QUERIES: the rows of the latest human question join the scorer's queries, one hit or miss line per
+// reselect. `st` is the store holding this request's question; null or unusable, `miss` says why. The store and the
+// selector decide alone: a call too large for the GPU scorer runs on the CPU scorer with the same queries.
+// Returns the miss reason, nullptr on a hit.
+inline const char * kvflash_uq_join(std::vector<const float *> & qs, const KvFlashUqStore * st, const char * miss, size_t qsize, size_t n_v2) {
+    const char * why = n_v2 == 0 ? "no-v2-selector"
+        : !st || st->empty() || qsize == 0 || st->rows.size() != (size_t)st->n * qsize ? (miss && *miss ? miss : "no-store") : nullptr;
+    if (why) {
+        std::fprintf(stderr, "[kvflash] uq miss reason=%s\n", why);
+        return why;
+    }
+    for (int i = 0; i < st->n; i++) qs.push_back(st->rows.data() + (size_t)i * qsize);
+    std::fprintf(stderr, "[kvflash] uq hit lo=%d hi=%d n=%d\n", st->lo, st->hi, st->n);
+    return nullptr;
 }
 
 // Why the feature must stay off for the process ("" = ids present, on). Tool results can only be told
