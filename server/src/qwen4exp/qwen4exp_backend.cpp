@@ -539,14 +539,17 @@ bool Qwen4ExpBackend::load_target() {
     return true;
 }
 
-// Split mode: hot expert slots on the target for decode and verify steps (a prompt chunk keeps every pick on the
-// expert device), started from --expert-placement when one is given and then following the served picks
-// (Qwen4ExpHotSet). They take the memory the fitted context and the prompt chunk leave, at most LUCE_EXPERT_BUDGET_MB,
-// so they shrink neither. A request computes the same with or without them, alone or beside other requests
-// (build_moe_route). The expert device's read-ahead is built either way.
+// Split mode, one sequence, with --expert-placement: hot expert slots on the target for decode and verify steps (a
+// prompt chunk keeps every pick on the expert device), started from the placement and then following the served
+// picks (Qwen4ExpHotSet). They take the memory the fitted context and the prompt chunk leave, at most
+// LUCE_EXPERT_BUDGET_MB, so they shrink neither. Concurrent serving keeps every pick on the expert device, so a
+// request computes the same alone and beside other requests: no hot copies. The expert device's read-ahead (no
+// effect on the output) is built either way.
 bool Qwen4ExpBackend::load_hot_experts() {
     if (!weights_.expert_backend || chunk_ <= 0)
         return true;
+    if (cfg_.expert_placement_path.empty() || cfg_.max_concurrency > 1)
+        return load_qwen4exp_hot_experts(backend_, weights_, std::string(), 0);
     Qwen4ExpChunkPlan room;
     room.rows = chunk_;
     plan_chunk(&room);
