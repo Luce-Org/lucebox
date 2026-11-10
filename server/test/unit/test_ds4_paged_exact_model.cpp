@@ -1,16 +1,11 @@
 // Optional full-model regression for paged DeepSeek V4.1 serving on the
-// ds41-r9700-gorgon profile (R9700 target, Gorgon Halo expert device). With
-// --paged-attention, a sequence's output must not depend on the sequences
-// beside it: not on their text, their number, its slot or the order of the
-// lanes in a step. Two faults broke that on this profile, which sets both
-// fused F16 verify K/V flags (LUCE_DS4_HYBRID_F16_VERIFY_KV and
-// LUCE_DS4_F16_KV_LANES):
-//   - the F16 K/V attention read the flat pool of every slot's raw ring from
-//     row 0, so every paged lane attended slot 0's raw rows at layer 0 and at
-//     compressed layers before their first compressed row;
-//   - a step with more than one row summed the six routed experts as 4 + 2
-//     instead of in one combine, so a row depended on how many rows shared
-//     its step.
+// ds41-r9700-gorgon profile (R9700 target, Gorgon Halo expert device).
+//
+// Invariant: with --paged-attention, a sequence's output depends only on its
+// own prompt. Not on the text or number of the sequences beside it, not on its
+// slot, not on the order of the lanes in a step, and not on whether it shares
+// a step at all.
+//
 // The engine reports tokens, not logits, so the check is greedy decoding:
 // every sequence's first kTokens tokens, in every case below, must equal the
 // same prompt decoded alone in an otherwise idle engine. As in serving, prompt
@@ -18,12 +13,17 @@
 // four and six lanes (the paged cap), both lane orders, slot 0 inside its
 // first raw ring pass and slot 0 past it, a sequence alone in slot 3 while the
 // other slots hold different text, and prompts that arrive while others
-// decode. The hybrid tier runs one row per sequence, so a step holds at most
-// six rows.
+// decode; each case checks that its sequences hold the slots it names. The
+// hybrid tier runs one row per sequence, so a step holds at most six rows.
+//
+// The launch is the server's (server_main.cpp: the profile's environment with
+// paged V4.1's leave-out list, the profile's device flags, --expert-device's
+// environment), restated here because those helpers are local to the server.
 //
 // Needs the model and the expert placement and router bias the launcher
 // passes for the box (the hotness table is optional); skips (77) without them
-// or without two GPUs. Not registered in ordinary CI.
+// or when the visible GPUs are not the profile's. Not registered in ordinary
+// CI.
 //   test_ds4_paged_exact_model target.gguf placement.json router_bias.bin [hotness.csv]
 #include "common/backend_factory.h"
 #include "common/model_backend.h"
@@ -58,6 +58,7 @@ constexpr int kTokens = 64;            // greedy tokens compared per sequence
 constexpr int kReferenceTokens = 80;   // a lane can decode past kTokens while others prefill
 constexpr long long kPoolTokens = 16384;
 constexpr int kMaxSteps = 2048;
+constexpr int kRawRing = 128;          // V4.1's sliding window: raw ring rows per slot
 
 using Prompts = std::vector<std::vector<int32_t>>;
 
@@ -66,13 +67,14 @@ bool is_file(const std::string & path) {
     return !path.empty() && std::filesystem::is_regular_file(path, ec);
 }
 
-int gpu_count() {
-    int n = 0;
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        const auto type = ggml_backend_dev_type(ggml_backend_dev_get(i));
-        n += type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
-    }
-    return n;
+// Whether the visible GPUs are the profile's, as the server matches a profile.
+bool profile_gpus_present(const luce::server::LaunchProfile & profile) {
+    const char * hip = std::getenv("HIP_VISIBLE_DEVICES");
+    if (!hip || !*hip) hip = std::getenv("CUDA_VISIBLE_DEVICES");
+    std::vector<luce::server::VisibleGpu> gpus;
+    return luce::common::detail::kfd_visible_gpus("/sys/class/kfd/kfd/topology/nodes", "/dev/dri",
+                                                  std::getenv("ROCR_VISIBLE_DEVICES"), hip, gpus) &&
+           luce::server::profile_gpus_match(profile, gpus);
 }
 
 // The profile's environment as the server applies it with paged attention:
@@ -173,8 +175,8 @@ std::unique_ptr<ModelBackend> load_backend(const luce::server::LaunchProfile & p
 }
 
 // Six prompts with different text, code and prose. Prompt 0 is short, so in
-// slot 0 it stays inside the slot's first raw ring pass (128 rows); the others
-// pass it, prompt 3 several times.
+// slot 0 it stays inside the slot's first raw ring pass (kRawRing rows); the
+// others pass it, prompt 3 several times.
 Prompts make_prompts(const Tokenizer & tokenizer) {
     static const char * const kNotes[] = {
         "The cache keeps a map from keys to nodes and a list in use order.",
@@ -239,10 +241,16 @@ public:
         }
     }
 
-    int admit(int p) {
+    // Admit prompt p; with want_slot >= 0 the case needs it in that slot.
+    int admit(int p, int want_slot = -1) {
         const auto a = engine_.admit(next_id_++, prompts_[(size_t) p], SamplerCfg{});
         if (a.status != SeqEngine::AdmitResult::Status::admitted) {
             throw std::runtime_error("admit failed: " + a.error);
+        }
+        if (want_slot >= 0 && a.slot != want_slot) {
+            engine_.retire(a.slot);
+            throw std::runtime_error("prompt " + std::to_string(p) + " went to slot " + std::to_string(a.slot) +
+                                     ", the case needs slot " + std::to_string(want_slot));
         }
         seqs_.push_back({p, a.slot, -1, {}, true});
         return (int) seqs_.size() - 1;
@@ -318,46 +326,49 @@ struct Case {
 const Case kCases[] = {
     {"one lane in slot 3, the other slots holding different text",
      [](Run & r) {
-         for (int p : {1, 2, 3, 0}) r.admit(p);
+         r.admit(1, 0);
+         r.admit(2, 1);
+         r.admit(3, 2);
+         r.admit(0, 3);
          r.run({0, 1, 2}, 4);  // prompt 0 waits
          for (int s : {0, 1, 2}) r.retire(s);
          r.run({3}, kTokens);
      }},
     {"two lanes, slot 0 inside its first ring pass, slot order",
      [](Run & r) {
-         r.admit(0);
-         r.admit(1);
+         r.admit(0, 0);
+         r.admit(1, 1);
          r.run({0, 1}, kTokens);
      }},
     {"two lanes, slot 0 past its first ring pass, reversed order",
      [](Run & r) {
-         r.admit(1);
-         r.admit(0);
+         r.admit(1, 0);
+         r.admit(0, 1);
          r.run({1, 0}, kTokens);
      }},
     {"four lanes, slot order",
      [](Run & r) {
-         for (int p : {0, 1, 2, 3}) r.admit(p);
+         for (int p : {0, 1, 2, 3}) r.admit(p, p);
          r.run({0, 1, 2, 3}, kTokens);
      }},
     {"four lanes, reversed order",
      [](Run & r) {
-         for (int p : {3, 2, 1, 0}) r.admit(p);
+         for (int p : {3, 2, 1, 0}) r.admit(p, 3 - p);
          r.run({3, 2, 1, 0}, kTokens);
      }},
     {"six lanes, mixed order",
      [](Run & r) {
-         for (int p : {0, 1, 2, 3, 4, 5}) r.admit(p);
+         for (int p : {0, 1, 2, 3, 4, 5}) r.admit(p, p);
          r.run({5, 0, 4, 1, 3, 2}, kTokens);
      }},
     {"prompts arriving while others decode",
      [](Run & r) {
-         r.admit(4);
-         r.admit(0);
+         r.admit(4, 0);
+         r.admit(0, 1);
          r.run({0, 1}, 16);
-         r.admit(5);
+         r.admit(5, 2);
          r.run({2, 0, 1}, 16);
-         r.admit(2);
+         r.admit(2, 3);
          r.run({3, 1, 0, 2}, kTokens);
      }},
 };
@@ -380,11 +391,11 @@ int main(int argc, char ** argv) {
     luce::server::CardProfiles card;
     const luce::server::LaunchProfile * profile = apply_profile_env(card);
     if (!profile) return 1;
-    if (argc == 5) set_environment_variable("LUCE_DS4_HOTNESS_CSV", argv[4], true);
-    if (gpu_count() < 2) {
-        std::printf("SKIP: the %s profile needs two GPUs\n", kProfile);
+    if (!profile_gpus_present(*profile)) {
+        std::printf("SKIP: the visible GPUs are not the %s profile's\n", kProfile);
         return 77;
     }
+    if (argc == 5) set_environment_variable("LUCE_DS4_HOTNESS_CSV", argv[4], true);
 
     std::unique_ptr<ModelBackend> backend = load_backend(*profile, argv[1], argv[2], argv[3]);
     SeqEngine * engine = backend ? backend->seq_engine() : nullptr;
@@ -402,6 +413,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const Prompts prompts = make_prompts(tokenizer);
+    // The slot 0 cases need prompt 0 inside the ring's first pass to its last
+    // compared token, and prompt 1 past it.
+    if (prompts[0].size() + kReferenceTokens >= (size_t) kRawRing || prompts[1].size() <= (size_t) kRawRing) {
+        std::printf("FAIL setup: prompt lengths %zu and %zu do not straddle the %d-row ring\n",
+                    prompts[0].size(), prompts[1].size(), kRawRing);
+        return 1;
+    }
 
     int failures = 0, checked = 0;
     try {
