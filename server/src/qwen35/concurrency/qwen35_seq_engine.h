@@ -26,6 +26,7 @@
 #include "common/concurrency/paged_kv_offload.h"
 #include "common/dflash_draft_kv.h"
 #include "common/dflash_feature_ring.h"
+#include "common/pinned_stage.h"
 #include "qwen35_slot_manager.h"
 #include "../qwen35_image_request.h"
 
@@ -98,7 +99,7 @@ public:
     // their own, with them.
     StepPlanLimits step_plan_limits(int decode_rows) const override {
         const bool mixed = decode_rows > 0;
-        const int per_sequence = mixed ? 512 : 2048;
+        const int per_sequence = mixed ? 512 : kIdlePrefillChunk;
         int total_cap = idle_prefill_tokens_;
         if (mixed) {
             total_cap = mixed_prefill_tokens_;
@@ -147,7 +148,6 @@ private:
         int chunk = 0;
         bool commit = false;
         std::vector<int64_t> rows;
-        std::vector<float> embeddings;
         // Axis-major [4 x chunk] rotary positions when the slot holds images;
         // empty means the plain kv_pos + i positions.
         std::vector<int32_t> positions;
@@ -180,6 +180,9 @@ private:
         int width = 0;  // verify width, chosen once before drafting
     };
 
+    // The widest prompt chunk of one sequence in a step (idle steps; mixed
+    // steps take 512).
+    static constexpr int kIdlePrefillChunk = 2048;
     int max_prefills_;
     int mixed_prefill_tokens_;
     int long_mixed_prefill_tokens_;
@@ -192,7 +195,8 @@ private:
     void fail_prefill(int slot, std::vector<PrefillOutput> & outputs,
                               const char * log_message,
                               const char * client_message);
-    PrefillStage stage_prefill_chunk(int slot, int max_tokens,
+    // Stages one prompt chunk; its input embeddings go to `embeddings`.
+    PrefillStage stage_prefill_chunk(int slot, int max_tokens, float * embeddings,
                                      std::vector<PrefillOutput> & outputs);
     int32_t sample_graph_row(int slot, int logits_row,
                              const int32_t * cached_argmax = nullptr,
@@ -321,7 +325,17 @@ private:
     std::vector<int32_t>     query_positions_;
     std::vector<int32_t>     logits_rows_;
     std::vector<int32_t>     feature_rows_;
-    std::vector<float>       embed_buf_;
+    // The packed step's input embeddings, `embed_rows_cap_` rows of n_embd
+    // floats, reserved once at construction: the most prompt rows any
+    // step_plan_limits() allows in one step (idle, mixed or long mixed),
+    // plus the decode bucket of every slot. Pinned host memory, so prompt
+    // chunks are dequantized straight into it and copied to the device by
+    // DMA; pageable memory if pinned memory is unavailable. Every step
+    // synchronizes before it returns, so the next step may overwrite it.
+    PinnedStage              embed_stage_;
+    std::vector<float>       embed_rows_pageable_;
+    float *                  embed_rows_ = nullptr;
+    size_t                   embed_rows_cap_ = 0;
     std::vector<int32_t>     pos_buf_;
     std::vector<int64_t>     rows_buf_;
     std::vector<int32_t>     argmax_buf_;

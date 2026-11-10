@@ -9,17 +9,23 @@ extern "C" size_t ggml_backend_cuda_get_concat_transpose_f32_count(void) {
     return g_concat_transpose_f32_count.load(std::memory_order_relaxed);
 }
 
-// Fast path for concatenating a short contiguous prefix with a dense
-// dim-0/dim-1 transpose.  The motivating layout is the SSM convolution input:
+// Fast path for concatenating a short contiguous prefix with a dim-0/dim-1
+// transpose.  The motivating layout is the SSM convolution input:
 //
 //   src0 [prefix, channels, sequences] (contiguous)
-//   src1 [tokens, channels, sequences]  (a view of contiguous
-//                                         [channels, tokens, sequences])
+//   src1 [tokens, channels, sequences]  (the transpose of a
+//                                         [channels, tokens, sequences] view:
+//                                         channels contiguous, any token and
+//                                         sequence stride that is a multiple
+//                                         of 4 bytes, so a token row may be
+//                                         wider than `channels`, as in a
+//                                         column slice of a stacked projection,
+//                                         and sequences may be padded)
 //   dst  [prefix + tokens, channels, sequences] (contiguous)
 //
 // concat_non_cont assigns one block to each channel and has the threads in a
-// wave read adjacent logical tokens.  For src1 those reads are `channels`
-// elements apart.  Transpose a 32x32 tile through shared memory instead so
+// wave read adjacent logical tokens.  For src1 those reads are a token row
+// apart.  Transpose a 32x32 tile through shared memory instead so
 // both the source reads and destination writes are coalesced.  Copy the small
 // prefix in the token-tile-zero blocks to avoid a second launch.
 constexpr int CUDA_CONCAT_TRANSPOSE_TILE = 32;
@@ -32,7 +38,9 @@ concat_dim0_dense_transpose_f32(
               float * __restrict__ dst,
         int64_t prefix,
         int64_t tokens,
-        int64_t channels) {
+        int64_t channels,
+        int64_t src1_token_stride,
+        int64_t src1_sequence_stride) {
     __shared__ float tile[CUDA_CONCAT_TRANSPOSE_TILE][CUDA_CONCAT_TRANSPOSE_TILE + 1];
 
     const int64_t channel_base = (int64_t) blockIdx.x * CUDA_CONCAT_TRANSPOSE_TILE;
@@ -41,7 +49,6 @@ concat_dim0_dense_transpose_f32(
     const int64_t channel      = channel_base + threadIdx.x;
 
     const int64_t src0_sequence_stride = prefix * channels;
-    const int64_t src1_sequence_stride = tokens * channels;
     const int64_t dst_sequence_stride  = (prefix + tokens) * channels;
 
     const float * src0_sequence = src0 + sequence * src0_sequence_stride;
@@ -73,7 +80,7 @@ concat_dim0_dense_transpose_f32(
         const int64_t token = token_base + local_token;
         if (channel < channels && token < tokens) {
             tile[local_token][threadIdx.x] =
-                src1_sequence[token * channels + channel];
+                src1_sequence[token * src1_token_stride + channel];
         }
     }
     __syncthreads();
@@ -105,9 +112,10 @@ static bool concat_dim0_dense_transpose_f32_cuda(
     const int64_t channels  = dst->ne[1];
     const int64_t sequences = dst->ne[2];
 
-    // Keep this a strict layout specialization.  Anything padded, permuted in
-    // more than the first two dimensions, unusually large, or non-F32 falls
-    // through to the existing fully general implementation.
+    // src0 and dst must be contiguous; src1 must have contiguous channels and
+    // may have any token and sequence stride that is a multiple of 4 bytes.
+    // Anything else (other permutations, a 4th dimension, unusually large
+    // shapes, non-F32) falls through to the fully general implementation.
     const bool supported =
         dim == 0 &&
         src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
@@ -124,8 +132,9 @@ static bool concat_dim0_dense_transpose_f32_cuda(
         src0->nb[1] == (size_t) prefix * element_size &&
         src0->nb[2] == (size_t) prefix * channels * element_size &&
         src1->nb[1] == element_size &&
-        src1->nb[0] == (size_t) channels * element_size &&
-        src1->nb[2] == (size_t) tokens * channels * element_size &&
+        src1->nb[0] >= (size_t) channels * element_size &&
+        src1->nb[0] % element_size == 0 &&
+        src1->nb[2] % element_size == 0 &&
         dst->nb[0] == element_size &&
         dst->nb[1] == (size_t) (prefix + tokens) * element_size &&
         dst->nb[2] == (size_t) (prefix + tokens) * channels * element_size;
@@ -143,7 +152,9 @@ static bool concat_dim0_dense_transpose_f32_cuda(
         (const float *) src0->data,
         (const float *) src1->data,
         (float *) dst->data,
-        prefix, tokens, channels);
+        prefix, tokens, channels,
+        (int64_t) (src1->nb[0] / element_size),
+        (int64_t) (src1->nb[2] / element_size));
     g_concat_transpose_f32_count.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
