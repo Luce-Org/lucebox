@@ -56,6 +56,7 @@ Qwen4ExpSeqEngine::~Qwen4ExpSeqEngine() {
     for (Qwen4ExpSnapshot & checkpoint : checkpoints_) free_qwen4exp_snapshot(checkpoint);
     clear_qwen4exp_batched_decode_workspace(decode_workspace_);
     clear_qwen4exp_batched_decode_workspace(verify_workspace_);
+    for (auto & ws : draft_workspace_) clear_qwen4exp_batched_decode_workspace(ws);
 }
 
 bool Qwen4ExpSeqEngine::mtp_capable(int slot) const {
@@ -419,7 +420,10 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::batched_verify_step(const StepPlan & pl
     const size_t hd = (size_t)weights_.n_embd * weights_.n_hc;
     std::vector<Qwen4ExpCache *> caches((size_t)n);
     std::vector<int32_t> tokens((size_t)n * rows), positions((size_t)n);
-    std::vector<std::vector<int32_t>> drafts((size_t)n);
+    std::vector<std::vector<int32_t>> drafts;
+    std::vector<const int32_t *> draft_tok((size_t)n);
+    std::vector<const float *> draft_h((size_t)n);
+    std::vector<int> draft_n((size_t)n), draft_pos((size_t)n);
     for (int s = 0; s < n; ++s) {
         const StepInput & input = plan.decode[(size_t)s];
         Qwen4ExpCache & cache = *caches_[(size_t)input.slot];
@@ -433,12 +437,20 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::batched_verify_step(const StepPlan & pl
             result.error = "qwen4exp MTP catch-up failed";
             return result;
         }
-        if (!qwen4exp_mtp_draft(backend_, weights_, cache, pending.tok.data(), pending.h.data(),
-                                (int)pending.tok.size(), pending.pos, k, drafts[(size_t)s])) {
-            result.error = "qwen4exp MTP draft failed";
-            return result;
-        }
-        tokens[(size_t)s * rows] = input.token;
+        draft_tok[(size_t)s] = pending.tok.data();
+        draft_h[(size_t)s] = pending.h.data();
+        draft_n[(size_t)s] = (int)pending.tok.size();
+        draft_pos[(size_t)s] = pending.pos;
+    }
+    // Every slot's drafts: each slot's first rank, then each later rank once for all slots.
+    if (draft_workspace_.size() < (size_t)k) draft_workspace_.resize((size_t)k);
+    if (!qwen4exp_mtp_draft_slots(backend_, weights_, caches.data(), draft_tok.data(), draft_h.data(), draft_n.data(),
+                                  draft_pos.data(), n, k, draft_workspace_, drafts)) {
+        result.error = "qwen4exp MTP draft failed";
+        return result;
+    }
+    for (int s = 0; s < n; ++s) {
+        tokens[(size_t)s * rows] = plan.decode[(size_t)s].token;
         std::copy(drafts[(size_t)s].begin(), drafts[(size_t)s].end(), tokens.begin() + (std::ptrdiff_t)s * rows + 1);
     }
     const auto t_draft = std::chrono::steady_clock::now();

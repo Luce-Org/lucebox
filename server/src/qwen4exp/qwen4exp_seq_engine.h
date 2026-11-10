@@ -132,6 +132,7 @@ private:
     int verify_width_ = 1;
     std::vector<MtpState> mtp_;   // per slot
     Qwen4ExpBatchedDecodeWorkspace verify_workspace_;
+    std::vector<Qwen4ExpBatchedDecodeWorkspace> draft_workspace_;   // per draft rank: the slots' batched rank graph
     struct BatchedStats {
         long long steps = 0, slots = 0, tokens = 0, plain_steps = 0;
         double step_s = 0.0, draft_s = 0.0, verify_s = 0.0;

@@ -159,6 +159,13 @@ bool qwen4exp_mtp_forward(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwe
 bool qwen4exp_mtp_draft(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
                         const int32_t * tokens, const float * hidden, int n, int pos0, int k,
                         std::vector<int32_t> & drafts);
+// qwen4exp_mtp_draft for several slots (slot s: tokens[s], hidden[s], n[s] pending pairs from pos0[s]): each slot's
+// first rank on its own, then every later rank once for all slots (the draft layer's weights read once for a row per
+// slot, each slot attending over its own draft K/V), and one wait for every slot's k drafts. ranks[r] keeps rank r's
+// retained graph (k entries). Drafts only propose; the verify decides every token.
+bool qwen4exp_mtp_draft_slots(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache * const * caches,
+        const int32_t * const * tokens, const float * const * hidden, const int * n, const int * pos0, int n_slots,
+        int k, std::vector<Qwen4ExpBatchedDecodeWorkspace> & ranks, std::vector<std::vector<int32_t>> & drafts);
 
 // Run all but `keep` pending pairs through the draft layer (K/V only), at most max_rows per forward.
 bool qwen4exp_mtp_catch_up(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
