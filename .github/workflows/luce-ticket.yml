@@ -1,0 +1,31 @@
+name: Luce ticket
+
+# Labels the pull requests a Lucebox raises: the fix agent on a box sends them
+# from its owner's fork, on a branch named box-fix/<fix id>, and a fork cannot
+# set labels on this repository. The `luce-ticket` label lets maintainers find
+# them; each one's body ends with its ticket ("luce-ticket: <key>"), which boxes
+# search before they send, so one error gets one pull request.
+#
+# It reads only the branch name of the pull request; it checks out and runs
+# none of its code.
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions: {}
+
+jobs:
+  label:
+    if: startsWith(github.event.pull_request.head.ref, 'box-fix/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Label the pull request luce-ticket
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$NUMBER" --repo "$REPO" --add-label luce-ticket
