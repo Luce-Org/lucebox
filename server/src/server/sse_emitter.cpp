@@ -2,6 +2,7 @@
 
 #include "sse_emitter.h"
 #include "chat_codec.h"
+#include "common/fnv.h"
 #include "utf8_utils.h"
 
 #include <algorithm>
@@ -65,6 +66,20 @@ std::string escape_for_logging(const std::string & s) {
         }
     }
     return out;
+}
+
+// Tool text is model output, often the owner's code or files, and stderr goes to
+// the journal. It is logged only when LUCE_LOG_TOOL_CALLS is set.
+static bool log_tool_text() {
+    static const bool on = []() {
+        const char * e = std::getenv("LUCE_LOG_TOOL_CALLS");
+        if (!e || !*e) return false;
+        std::string v(e);
+        std::transform(v.begin(), v.end(), v.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return v != "0" && v != "false" && v != "no" && v != "off";
+    }();
+    return on;
 }
 
 // Round `x` to 1 decimal place. JSON serialization of doubles can emit
@@ -858,15 +873,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         if (drop_calls) {
             emit_tool_buffer_text(out, parsed.cleaned_text);
         } else if (!tool_calls_.empty()) {
-            static const bool log_tools = []() {
-                const char * e = std::getenv("LUCE_LOG_TOOL_CALLS");
-                if (!e || !*e) return false;
-                std::string v(e);
-                std::transform(v.begin(), v.end(), v.begin(),
-                               [](unsigned char c) { return (char)std::tolower(c); });
-                return v != "0" && v != "false" && v != "no" && v != "off";
-            }();
-            if (log_tools) {
+            if (log_tool_text()) {
                 std::string escaped_buf = escape_for_logging(tool_buffer_);
                 std::fprintf(stderr,
                     "[server] [tool_call] request_id=%s count=%zu bytes=%zu raw='%s'\n",
@@ -966,12 +973,19 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         } else {
             // Tool syntax was detected but no valid call parsed. Do not leak
             // malformed/incomplete XML back to the user or reasoning channel.
-            std::string escaped = escape_for_logging(tool_buffer_);
+            const uint64_t digest = fnv1a_bytes(
+                kFnvBasis, reinterpret_cast<const uint8_t *>(tool_buffer_.data()),
+                tool_buffer_.size());
             std::fprintf(stderr,
                 "[server] tool_call parse failed; suppressing buffered tool text "
-                "request_id=%s format=%d bytes=%zu text='%s'\n",
+                "request_id=%s format=%d bytes=%zu fnv1a64=%016llx\n",
                 request_id_.c_str(), (int)format_, tool_buffer_.size(),
-                escaped.c_str());
+                (unsigned long long)digest);
+            if (log_tool_text()) {
+                std::string escaped = escape_for_logging(tool_buffer_);
+                std::fprintf(stderr, "[server] [tool_call] unparsed request_id=%s raw='%s'\n",
+                             request_id_.c_str(), escaped.c_str());
+            }
             // Any call that failed to parse is a lost turn: the text is not
             // sent and nothing runs, whatever the reason the parser rejected it.
             dropped_tool_call_ = true;

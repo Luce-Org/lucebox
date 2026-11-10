@@ -18579,7 +18579,10 @@ TEST_CASE(ServerUnitFixture, test_emitter_suppresses_malformed_multiline_tool_bu
     TEST_ASSERT(em.tool_calls().empty());
     TEST_ASSERT(em.accumulated_text().empty());
     TEST_ASSERT(captured.find("[server] tool_call parse failed; suppressing buffered tool text") != std::string::npos);
-    TEST_ASSERT(captured.find("text='<function_call>\\n  <invoke name=\"read\">\\n    malformed prose body with\\nnew lines and \\t tabs\\n'") != std::string::npos);
+    TEST_ASSERT(captured.find(" bytes=90 fnv1a64=") != std::string::npos);
+    // The buffer is model output and the log goes to the journal: no text in it.
+    TEST_ASSERT(captured.find("malformed prose body") == std::string::npos);
+    TEST_ASSERT(captured.find("invoke name") == std::string::npos);
 }
 
 TEST_CASE(ServerUnitFixture,
