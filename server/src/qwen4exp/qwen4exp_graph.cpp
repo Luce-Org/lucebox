@@ -4286,7 +4286,7 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
     ggml_set_input(ws.inp_emb);
     ws.ple_in = nullptr;
     if (has_ple) {
-        ws.ple_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.ple_head_dim * w.ple_n_heads, T);
+        ws.ple_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) w.ple_head_dim * w.ple_n_heads, T);
         ggml_set_input(ws.ple_in);
     }
     ws.masks.clear();
